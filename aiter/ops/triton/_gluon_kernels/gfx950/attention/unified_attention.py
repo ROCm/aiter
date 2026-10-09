@@ -1811,11 +1811,15 @@ def _unified_attention_gluon_kernel(
             query_start_len_ptr, q_block_global_idx, num_seqs, cfg.BLOCK_Q
         )
 
-        cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx)
+        cur_batch_in_all_start_index = gl.load(query_start_len_ptr + seq_idx).to(
+            gl.int32
+        )
         q_block_start_idx = cur_batch_in_all_start_index // cfg.BLOCK_Q + seq_idx
         q_block_local_idx = q_block_global_idx - q_block_start_idx
 
-        cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1)
+        cur_batch_in_all_stop_index = gl.load(query_start_len_ptr + seq_idx + 1).to(
+            gl.int32
+        )
         cur_batch_query_len = cur_batch_in_all_stop_index - cur_batch_in_all_start_index
 
         # Not needed when num programs is computed precisely
@@ -1855,7 +1859,7 @@ def _unified_attention_gluon_kernel(
         cache=cfg.Q_CACHE_MODIFIER,
     )
 
-    seq_len = gl.load(seq_lens_ptr + seq_idx)
+    seq_len = gl.load(seq_lens_ptr + seq_idx).to(gl.int32)
     context_len = seq_len - cur_batch_query_len
     block_tables_ptr_shifted = block_tables_ptr + seq_idx * block_table_stride
     if CAUSAL:

@@ -19,6 +19,7 @@ from ..tensor_shim import (
     buf_copy_load,
     ptr_buf_tensor,
 )
+from . import envs
 from .dispatch import (
     DispatchSlot,
     emit_direct_fixed_slot_finalize,
@@ -209,7 +210,20 @@ def compile_mega_moe_stage1(
     class SharedStorage:
         pool: fx.Array[fx.Int8, lds_pool_bytes, 16]
         A_scale: fx.Array[fx.Int8, n_scale_bytes, 16]
+        # Block-wide broadcast slots. They must not alias ``pool``: the A tile's
+        # LDS DMA and the GEMM1 C tile reuse pool while slower waves may still
+        # be reading a broadcast value (a lagging wave then read A bytes as its
+        # tile index and loaded weights from a garbage expert).
+        bc_ticket: fx.Array[fx.Int8, 16, 16]
+        bc_work: fx.Array[fx.Int8, 16, 16]
+        bc_sched: fx.Array[fx.Int8, 16, 16]
 
+    # Compact producers keep two rows in flight (emit_dispatch_payload).
+    FAST_COPY = compact_dispatch and envs.AITER_MEGA_DISPATCH_FAST_COPY
+    # Paired GEMM1 K loop for fixed-slot tiles with LDS-DMA A copies; compact
+    # prefill is slower with it (its 8-wave tiles already hide the latency).
+    PAIR_K = fixed_slot_dispatch and async_a_copy and envs.AITER_MEGA_S1_FIXED_KPAIR
+    EPI_EVEC = envs.AITER_MEGA_S1_EPI_EVEC
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
     WORK_BATCH = 1
@@ -222,9 +236,12 @@ def compile_mega_moe_stage1(
         f"_tr{int(use_tile_resource)}wpe{waves_per_eu_hint}_bnt{b_cache_modifier}_ws{WORK_SHARDS}"
         f"_pc{payload_chunk_rows}"
         f"_tss{tile_state_stride}"
-        f"_rc31_wb{WORK_BATCH}_adaptive"
+        f"_rc31_wb{WORK_BATCH}_adaptive_bc"
         f"_ix{int(indexed_payload)}"
         f"{swiglu_suffix}"
+        f"_ev{EPI_EVEC}b"
+        f"{'_fc' if FAST_COPY else ''}"
+        f"{'_kp2' if PAIR_K else ''}"
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[TOTAL_THREADS, 1, 1])
@@ -273,7 +290,7 @@ def compile_mega_moe_stage1(
             ticket = fx.block_idx.x
             generation = fx.Int64(0)
         else:
-            ticket_scratch = fx.recast_iter(fx.Int64, a_buf.ptr)
+            ticket_scratch = fx.recast_iter(fx.Int64, lds.bc_ticket.ptr)
             ticket_view = fx.make_view(ticket_scratch, fx.make_layout(1, 1))
             if tid == fx.Int32(0):
                 ticket64 = fx.Int64(
@@ -414,6 +431,7 @@ def compile_mega_moe_stage1(
                     chunks_per_destination=chunks_per_destination,
                     tile_state_stride=tile_state_stride,
                     indexed_payload=indexed_payload,
+                    fast_copy=FAST_COPY,
                 )
         if const_expr(fixed_slot_dispatch):
             if is_owner:
@@ -445,9 +463,15 @@ def compile_mega_moe_stage1(
             out_rsrc = None
         else:
             out_nbytes = tokens * fx.Int32(inter_dim)
-            out_rsrc = ptr_buf_tensor(
-                fx.get_iter(out), fx.Int16, num_records_bytes=out_nbytes
-            )
+            # In the element width of the epilogue's stores (see SiluQuantEpilogue).
+            if const_expr(EPI_EVEC == 8):
+                out_rsrc = ptr_buf_tensor(
+                    fx.get_iter(out), fx.Int32, unit_elems=2, num_records_bytes=out_nbytes
+                )
+            else:
+                out_rsrc = ptr_buf_tensor(
+                    fx.get_iter(out), fx.Int16, num_records_bytes=out_nbytes
+                )
         os_rsrc = ptr_buf_tensor(
             fx.get_iter(out_scale), fx.Int8, num_records_bytes=os_nbytes
         )
@@ -465,6 +489,7 @@ def compile_mega_moe_stage1(
             n_tiles=N_TILES, expert_offset=fz_rank * fz_epr, b_cache_modifier=b_cache_modifier,
             swizzle_a=swizzle_a, pipe_weights=pipe_weights, mfma_amajor=mfma_amajor,
             async_a_copy=async_a_copy, use_tile_resource=use_tile_resource,
+            pair_k=PAIR_K, evec=EPI_EVEC,
             indirect_input=compact_dispatch and not indexed_payload,
             indexed_input=indexed_payload,
             row_map_rsrc=srcmap_rsrc,
@@ -517,8 +542,12 @@ def compile_mega_moe_stage1(
         consumer_active = (consumer_ticket >= consumer_base) & (
             consumer_id < total_work
         )
-        work_scratch = fx.recast_iter(fx.Int32, a_buf.ptr)
+        work_scratch = fx.recast_iter(fx.Int32, lds.bc_work.ptr)
         work_scratch_view = fx.make_view(work_scratch, fx.make_layout(1, 1))
+        # scheduled_first gets its own slot: tid 0 writes it while other waves
+        # may not have read first_work yet.
+        sched_scratch = fx.recast_iter(fx.Int32, lds.bc_sched.ptr)
+        sched_scratch_view = fx.make_view(sched_scratch, fx.make_layout(1, 1))
         work_shard = consumer_id & fx.Int32(WORK_SHARDS - 1)
         work_batch = WORK_BATCH
         assert N_TILES % work_batch == 0
@@ -578,6 +607,9 @@ def compile_mega_moe_stage1(
                 fx.ptr_store(
                     Vec.from_elements([first_work], fx.Int32), work_scratch
                 )
+                fx.ptr_store(
+                    Vec.from_elements([first_work], fx.Int32), sched_scratch
+                )
             fx.barrier()
             first_work = Vec(work_scratch_view.load())[0]
             if (  # noqa: SIM102 - preserve DSL staging
@@ -602,10 +634,10 @@ def compile_mega_moe_stage1(
                         )
                         fx.ptr_store(
                             Vec.from_elements([scheduled_first], fx.Int32),
-                            work_scratch,
+                            sched_scratch,
                         )
                     fx.barrier()
-            scheduled_first = Vec(work_scratch_view.load())[0]
+            scheduled_first = Vec(sched_scratch_view.load())[0]
             if const_expr(compact_dispatch):  # noqa: SIM102 - preserve DSL staging
                 if use_ready_order:
                     comm_ops.fence_system_acquire()
@@ -618,6 +650,9 @@ def compile_mega_moe_stage1(
     if _return_kernel_spec:
         return spec
 
+    # Close over the kernel and the launch ints themselves, not ``spec``: FlyDSL
+    # keys a launcher on closed-over kernels and scalars but not on an opaque
+    # object, so every Stage1 config would otherwise share one cached launcher.
     @flyc.jit
     def launch(
         out: fx.Tensor, x: fx.Tensor, w: fx.Tensor, scale_x: fx.Tensor, scale_w: fx.Tensor,
@@ -626,16 +661,16 @@ def compile_mega_moe_stage1(
         addr_in_idx: fx.Int64, addr_in_wts: fx.Int64, addr_in_sc: fx.Int64, addr_parity: fx.Int64,
         addr_expected: fx.Int64, stream: fx.Stream,
     ):
-        spec.kernel(
+        kernel(
             out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale, tokens,
             addr_disp, i32_cur_tok, addr_in_tok, addr_in_idx, addr_in_wts, addr_in_sc, addr_parity, addr_expected,
             value_attrs={
-                "rocdl.waves_per_eu": spec.waves_per_eu_hint,
-                "rocdl.flat_work_group_size": f"{spec.block_x},{spec.block_x}",
+                "rocdl.waves_per_eu": waves_per_eu_hint,
+                "rocdl.flat_work_group_size": f"{TOTAL_THREADS},{TOTAL_THREADS}",
             },
         ).launch(
-            grid=(spec.grid_x, 1, 1),
-            block=(spec.block_x, 1, 1),
+            grid=(launch_grid_x, 1, 1),
+            block=(TOTAL_THREADS, 1, 1),
             stream=stream,
         )
 
