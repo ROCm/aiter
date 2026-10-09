@@ -2,7 +2,6 @@ import itertools
 
 import pytest
 import torch
-import triton
 
 from aiter.ops.triton.rope.fused_qkv_split_qk_norm_rope_cache import (
     fused_qkv_split_qk_norm_rope_cache,
