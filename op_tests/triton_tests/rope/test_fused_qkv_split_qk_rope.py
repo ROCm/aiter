@@ -508,8 +508,7 @@ def test_fused_qkv_split_qk_rope_with_cache(
 
 
 @pytest.mark.parametrize("tokens", [1, 64])
-@pytest.mark.parametrize("preallocated_outputs", [False, True])
-def test_muse_weightless_qk_norm_query_scale_and_cache(tokens, preallocated_outputs):
+def test_muse_weightless_qk_norm_query_scale_and_cache(tokens):
     """Muse applies its query scale after BF16 weightless QK RMSNorm."""
     torch.manual_seed(1064)
     qh, kvh, head_dim = 32, 2, 128
@@ -533,22 +532,6 @@ def test_muse_weightless_qk_norm_query_scale_and_cache(tokens, preallocated_outp
         blocks, block_size, kvh, head_dim, device="cuda", dtype=qkv.dtype
     )
     value_cache = torch.zeros_like(key_cache)
-    q_out = (
-        torch.empty(tokens, qh, head_dim, device="cuda", dtype=qkv.dtype)
-        if preallocated_outputs
-        else None
-    )
-    k_out = (
-        torch.empty(tokens, kvh, head_dim, device="cuda", dtype=qkv.dtype)
-        if preallocated_outputs
-        else None
-    )
-    v_out = (
-        torch.empty(tokens, kvh, head_dim, device="cuda", dtype=qkv.dtype)
-        if preallocated_outputs
-        else None
-    )
-
     q, k, v = fused_qkv_split_qk_norm_rope_cache(
         qkv,
         weights,
@@ -567,12 +550,7 @@ def test_muse_weightless_qk_norm_query_scale_and_cache(tokens, preallocated_outp
         eps=eps,
         q_scale=q_scale,
         kv_cache_layout="NHD",
-        q_out=q_out,
-        k_out=k_out,
-        v_out=v_out,
     )
-    if preallocated_outputs:
-        assert q is q_out and k is k_out and v is v_out
 
     rq, rk, rv = qkv.split((qh * head_dim, kvh * head_dim, kvh * head_dim), -1)
     rq = rq.view(tokens, qh, head_dim)

@@ -56,9 +56,6 @@ def fused_qkv_split_qk_norm_rope_cache(
     kv_cache_layout: str = "HND",
     q_scale: float = 1.0,
     block_t: int | None = None,
-    q_out: torch.Tensor | None = None,
-    k_out: torch.Tensor | None = None,
-    v_out: torch.Tensor | None = None,
 ):
     """Split packed ``qkv``, RMSNorm Q and K, apply RoPE, write K/V into paged caches.
 
@@ -158,21 +155,9 @@ def fused_qkv_split_qk_norm_rope_cache(
     total_num_kv_cache_tokens = num_blocks * block_size
 
     assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
-    q = (
-        q_out
-        if q_out is not None
-        else torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
-    )
-    k = (
-        k_out
-        if k_out is not None
-        else torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
-    )
-    v = (
-        v_out
-        if v_out is not None
-        else torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
-    )
+    q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
+    k = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
+    v = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
 
     if attn_output_gate:
         gate = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
