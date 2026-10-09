@@ -2,8 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Direct generated-sort correctness and perf for MXMOE retune shapes."""
 
+from __future__ import annotations
+
 import argparse
 import itertools
+from typing import Any
 
 import pandas as pd
 import torch
@@ -23,7 +26,9 @@ MODEL_SHAPES = [
 SUPPORTED_GFX = ["gfx950"]
 
 
-def run_torch(topk_ids, topk_weights, expert, block_m):
+def run_torch(
+    topk_ids: torch.Tensor, topk_weights: torch.Tensor, expert: int, block_m: int
+) -> dict[str, torch.Tensor]:
     token, topk = topk_ids.shape
     device = topk_ids.device
     counts = torch.bincount(topk_ids.flatten().long(), minlength=expert)
@@ -44,7 +49,14 @@ def run_torch(topk_ids, topk_weights, expert, block_m):
 
 
 @benchmark()
-def test_mxfp4_moe_aux(dtype, token, expert, model_dim, inter_dim, topk):
+def test_mxfp4_moe_aux(
+    dtype: torch.dtype,
+    token: int,
+    expert: int,
+    model_dim: int,
+    inter_dim: int,
+    topk: int,
+) -> dict[str, Any]:
     block_m = 16
     device = "cuda"
     token_ids = torch.arange(token, device=device, dtype=dtypes.i32).unsqueeze(1)
@@ -77,7 +89,7 @@ def test_mxfp4_moe_aux(dtype, token, expert, model_dim, inter_dim, topk):
     empty_bf16 = torch.empty(0, dtype=dtype, device=device)
     empty_i32 = torch.empty(0, dtype=dtypes.i32, device=device)
 
-    def launch(output):
+    def launch(output: torch.Tensor) -> None:
         mxfp4_moe_sort(
             topk_ids=topk_ids,
             topk_weight=topk_weights,
@@ -99,8 +111,8 @@ def test_mxfp4_moe_aux(dtype, token, expert, model_dim, inter_dim, topk):
             prologue=0,
         )
 
-    def check_outputs(name, zero_init):
-        def compare(expected, actual, label):
+    def check_outputs(name: str, zero_init: bool) -> None:
+        def compare(expected: torch.Tensor, actual: torch.Tensor, label: str) -> float:
             if not expected.is_floating_point():
                 # FP32 cannot represent the low token bits of every encoded
                 # top-k ID. Require exact integer equality before the metric.
@@ -185,7 +197,7 @@ def test_mxfp4_moe_aux(dtype, token, expert, model_dim, inter_dim, topk):
     return ret
 
 
-def main():
+def main() -> None:
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
             "generated MXMOE auxiliary unsupported on %s; skipping", get_gfx()

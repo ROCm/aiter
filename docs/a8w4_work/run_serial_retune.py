@@ -3,6 +3,8 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Prepare model shape unions and run one A8W4 retune at a time."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 import ctypes
@@ -18,9 +20,11 @@ import re
 import subprocess
 import sys
 import time
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 SHAPE_FIELDS = (
     "token",
@@ -43,7 +47,7 @@ MODELS = (
 )
 
 
-def read_csv(path):
+def read_csv(path: str | Path) -> list[dict[str, str]]:
     with Path(path).open(newline="") as source:
         return [
             {str(key).strip(): str(value or "").strip() for key, value in row.items()}
@@ -51,23 +55,25 @@ def read_csv(path):
         ]
 
 
-def csv_fields(path):
+def csv_fields(path: str | Path) -> tuple[str, ...]:
     with Path(path).open(newline="") as source:
         return tuple(field.strip() for field in next(csv.reader(source)))
 
 
-def write_json(path, value):
+def write_json(path: str | Path, value: Any) -> None:
     path = Path(path)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
     temporary.replace(path)
 
 
-def file_hash(path):
+def file_hash(path: str | Path) -> str:
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def shape_key(row, fields=SHAPE_FIELDS):
+def shape_key(
+    row: dict[str, Any], fields: Sequence[str] = SHAPE_FIELDS
+) -> tuple[str, ...]:
     values = []
     for field in fields:
         value = str(row[field]).strip()
@@ -82,7 +88,7 @@ def shape_key(row, fields=SHAPE_FIELDS):
     return tuple(values)
 
 
-def lookup_token(token):
+def lookup_token(token: int | str) -> int:
     # Public fused_moe get_padded_M uses these lookup tiers. Input M is kept.
     token = int(token)
     if token < 32768:
@@ -90,7 +96,9 @@ def lookup_token(token):
     return 131072 if token >= 131072 else 32768
 
 
-def prepare_model(name, untuned, tuned, output_dir):
+def prepare_model(
+    name: str, untuned: str | Path, tuned: str | Path, output_dir: str | Path
+) -> dict[str, Any]:
     """Snapshot source bytes and save each unique execution shape once."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -147,7 +155,7 @@ def prepare_model(name, untuned, tuned, output_dir):
     return record
 
 
-def prepare_inputs(repo, output_dir):
+def prepare_inputs(repo: str | Path, output_dir: str | Path) -> list[dict[str, Any]]:
     repo, output_dir = Path(repo), Path(output_dir)
     source_dir = repo / "aiter/configs/model_configs"
     records = []
@@ -167,11 +175,11 @@ def prepare_inputs(repo, output_dir):
     return records
 
 
-def utc_now():
+def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def python_entry(argv):
+def python_entry(argv: list[str]) -> tuple[str, str] | None:
     """Return the executed Python entry, ignoring tool input file arguments."""
     if not argv or not re.fullmatch(r"python(?:\d+(?:\.\d+)*)?", Path(argv[0]).name):
         return None
@@ -191,7 +199,7 @@ def python_entry(argv):
     return None
 
 
-def processes():
+def processes() -> list[dict[str, Any]]:
     rows = []
     for path in Path("/proc").iterdir():
         if not path.name.isdigit():
@@ -218,7 +226,7 @@ class LaunchSystem:
     """The scheduler's OS boundary: locks, process ownership and idle samples."""
 
     @contextmanager
-    def locks(self, gpus):
+    def locks(self, gpus: list[int]) -> Iterator[None]:
         descriptors = []
         try:
             paths = ["/tmp/aiter-independent-tune.lock"] + [
@@ -239,7 +247,7 @@ class LaunchSystem:
             for fd in descriptors:
                 os.close(fd)
 
-    def tune_processes(self):
+    def tune_processes(self) -> list[dict[str, Any]]:
         found = []
         for row in processes():
             if row["pid"] == os.getpid() or row["state"] == "Z":
@@ -257,10 +265,10 @@ class LaunchSystem:
                 found.append(dict(row, entry=name))
         return found
 
-    def source_state(self, repo):
+    def source_state(self, repo: str | Path) -> dict[str, Any]:
         return source_state(repo)
 
-    def gpu_snapshot(self, gpus):
+    def gpu_snapshot(self, gpus: list[int]) -> list[dict[str, Any]]:
         # Direct SMI/PCI probes avoid importing aiter, allocating tensors or
         # changing clocks. Match handles by BDF, never by SMI enumeration index.
         binding_dir = "/opt/rocm/share/amd_smi"
@@ -377,12 +385,12 @@ class LaunchSystem:
         finally:
             smi.amdsmi_shut_down()
 
-    def launch(self, command, **kwargs):
+    def launch(self, command: list[str], **kwargs: Any) -> subprocess.Popen:
         return subprocess.Popen(
             command, pass_fds=self.descriptors, start_new_session=True, **kwargs
         )
 
-    def drain_group(self, process):
+    def drain_group(self, process: subprocess.Popen) -> None:
         # No deadline, reset or kill. A live worker below Python must actually
         # finish before another model can start on any device.
         while True:
@@ -400,10 +408,10 @@ class LaunchSystem:
             time.sleep(5)
 
 
-def source_state(repo):
+def source_state(repo: str | Path) -> dict[str, Any]:
     repo = Path(repo)
 
-    def git(*args):
+    def git(*args: str) -> bytes:
         return subprocess.check_output(["git", *args], cwd=repo)
 
     files = [
@@ -430,7 +438,12 @@ def source_state(repo):
     }
 
 
-def check_coverage(input_path, tuned_path, failure_path, profile_path):
+def check_coverage(
+    input_path: str | Path,
+    tuned_path: str | Path,
+    failure_path: str | Path,
+    profile_path: str | Path,
+) -> dict[str, Any]:
     fields = csv_fields(input_path)
     expected = {shape_key(row, fields) for row in read_csv(input_path)}
     winners = read_csv(tuned_path) if Path(tuned_path).is_file() else []
@@ -520,7 +533,14 @@ def check_coverage(input_path, tuned_path, failure_path, profile_path):
     }
 
 
-def run_models(records, repo, output_dir, gpus, system=None, batch=4):
+def run_models(
+    records: list[dict[str, Any]],
+    repo: str | Path,
+    output_dir: str | Path,
+    gpus: list[int],
+    system: LaunchSystem | None = None,
+    batch: int = 4,
+) -> dict[str, Any]:
     """Run the fixed model sequence, with one leader and drained workers."""
     if batch <= 0:
         raise ValueError("batch must be positive")
@@ -675,7 +695,7 @@ def run_models(records, repo, output_dir, gpus, system=None, batch=4):
     return report
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--repo", type=Path, default=Path(__file__).resolve().parents[2]
