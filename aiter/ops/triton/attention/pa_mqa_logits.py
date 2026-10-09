@@ -551,9 +551,7 @@ def deepgemm_fp8_paged_mqa_logits(
 
     VarCtxOpt = VarCtxSchedule is not None
     # buffer_load uses 32-bit offsets; the packed cache span covers K and scales.
-    use_buffer_load = (
-        max_addressable_bytes(kv_cache) < 2**31 - 1 if VarCtxOpt else True
-    )
+    use_buffer_load = max_addressable_bytes(kv_cache) < 2**31 - 1 if VarCtxOpt else True
     if VarCtxOpt:
         grid = (TotalCuCount * WavePerEU, 1, 1)
     else:

@@ -424,8 +424,7 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
                 not args.kv_preshuffle
                 and kv_cache_fp8.shape[0] * kv_cache_fp8.stride(0) >= 2**31
             ) or (
-                EnableVarCtxOpt
-                and max_addressable_bytes(kv_cache_fp8) >= 2**31 - 1
+                EnableVarCtxOpt and max_addressable_bytes(kv_cache_fp8) >= 2**31 - 1
             ):
                 aot_name += "_kv64"
 
