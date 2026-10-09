@@ -23,36 +23,50 @@ kernel1 push 端不发 flag，kernel2 开头用一次全 rank barrier 同步；r
 
 ## 跑一个用例
 
-两个节点各跑一次，node_rank 分别是 0 和 1，master 是 node0：
+两个节点各跑一次，node_rank 分别是 0 和 1，master 是 node0；同一个网络的所有
+(TPR, fixture) case 在一个进程里跑完（只建一次链，权重只生成一次）：
 
 ```bash
-# node0
-bash scripts/megamoe_tile/run_case_relaxed.sh 0 <port> candidate <TPR> <tag>
-# node1
-bash scripts/megamoe_tile/run_case_relaxed.sh 1 <port> candidate <TPR> <tag>
+# node0 / node1
+bash scripts/megamoe_tile/run_internode_test.sh 0 <master_ip> <port> <tag> -- \
+  --network kimi_k3 --tpr-list 128,256,512,1024 --fixtures eplb,random
+bash scripts/megamoe_tile/run_internode_test.sh 1 <master_ip> <port> <tag> -- <同上>
 ```
 
-结果落在 `trace_data/stage2_graph_20260909/<tag>/node<r>/summary.json`。
+每个 case 依次做：fused 的 eager 输出对 MORI A4W4 参照（同一份权重）的 relL2，
+graph replay 对 eager（中间改输入、换路由各验一次），然后计时。选项：
 
-必须的环境变量（两端一致）：
+* `--timing total,breakdown`（默认两者）：`total` 是总耗时，`breakdown` 是分段，
+  `none` 只验精度；
+* `--paths fused,smallop`（默认两者）：fused 算子和/或小算子基线
+  （quant + MORI dispatch + 调过的 fused_moe + MORI combine；DSV4 是 a8w4）；
+* `--no-check` 跳过参照和 replay 检查。
 
-```bash
-export MEGAMOE_TWO_KERNEL=1        # 走两 kernel Stage2
-export MEGAMOE_TK_EXPERT_MAJOR=1   # 目的端 expert-major 排布
-export MEGAMOE_TK_ARRIVAL=1        # 到达标志协议
-export MEGAMOE_TK_RAIL=1           # 跨节点 rail
-export MEGAMOE_TK_COMM_QUANT_RAIL=fp8   # 可选:rail fp8 通信量化
-```
+最后打印一张 `[SUMMARY]` 表（每个 case 一行：relL2、fused / 小算子总耗时、加速比、
+fused 的 stage1 / stage2 分段）。
 
-`MEGAMOE_TK_QP` / `MEGAMOE_TK_CHUNK` **不要设** —— 不设时按 shape 查
-`aiter/configs/megamoe_tile_stage2_tuned.csv`；设了就固定覆盖查表结果，
-只在做单变量实验时用。kernel 名里的 `qp8_c64` 后缀是查表是否生效的唯一可信证据。
+日志在 `trace_data/internode/<tag>/node<r>.log`，结果（rank 0）在
+`trace_data/internode/<tag>/results.json`。
+
+配置不走环境变量：算子里写死的是实测最优配置，按 shape 变的参数查两张表
+（`aiter/configs/megamoe_tile_stage1_tuned.csv`：tile_group / split_local /
+fanout_shards；`megamoe_tile_stage2_tuned.csv`：return_chunk_tokens / gemm2_bn /
+gemm2_cu），查不到时按 `stage1_tune.py` / `stage2_tune.py` 里的规则推。扫参时把
+`AITER_CONFIG_MEGAMOE_TILE_STAGE1` / `AITER_CONFIG_MEGAMOE_TILE_STAGE2` 指向自己的表。
+跨节点 rail 段的 fp8 通信量化是构造参数 `comm_quant_rail="fp8"`（测试默认开，
+`--no-rail-fp8` 关）。kernel 名里的 `_tg` / `_fos` / `_slg` / `_qr8` 等后缀是实际配置
+的唯一可信证据。
 
 ## 测量口径
 
-cudagraph 计时，warmup 10、iterations 40、**取后 20 轮**，16 个 rank 池化成
-320 个样本，报 min / mean / p95。跨 harness 比较**必须先对齐统计量**：
+和 `op_tests/multigpu_tests/bench_mega_moe.py` 一样：一个 graph 里是一次完整
+forward，warmup 10 次后计时 40 次，每次 replay 后 synchronize、用 host 墙钟计时。
+总耗时报每个 rank 的 min / median 再对 16 个 rank 取平均。分段在计时之后另跑
+torch.profiler：20 次 replay，取最后 5 次，每行是每个 rank 的最小值再取平均；
+profiler 偶尔丢事件，所以它不进总耗时。跨 harness 比较**必须先对齐统计量**：
 `pooled_min` 会藏住 rank 间离散度。
+
+下面的基线是旧口径（profiler span、后 20 轮池化），墙钟要高 ~10 µs，不能直接比。
 
 ## 基线（本仓实测，待回填）
 
@@ -63,8 +77,7 @@ cudagraph 计时，warmup 10、iterations 40、**取后 20 轮**，16 个 rank �
 
 16 rank 池化 320 样本 (16 × 后 20 轮)。kernel 名
 `megamoe_k2_h3584_t512_k16_qp8_c64_w4_aw1_qr8` —— `qp8_c64` 是查表生效的证据,
-`qr8` 是 rail fp8 生效的证据。**summary.json 里的 `candidate_return_chunk_tokens`
-和 `candidate_rail_quant_type` 是 harness CLI 层字段,不是算子实际用的值,别拿它当证据。**
+`qr8` 是 rail fp8 生效的证据。
 
 ## 环境前提
 
@@ -121,10 +134,5 @@ bf16 六个点全部逐位一致,所以偏差 100% 来自 fp8。fp8 误差跨 32
 不等于端到端精度。`test_wide_ep_moe.py`(13 shape / 阈值 0.15)走的是上游
 MORI dispatch + fused_moe,没有接本算子的钩子,所以两者无法直接叠加测量。
 
-13 个 Kimi shape 里只有这 6 个能在本 harness 上跑,其余是硬约束:
-token ≤ 256(TPR < 32)被 node-reduce 的 `2*tokens % (4*node_reduce_blocks)` 挡住;
-token 32768 撞 RDMA MR 注册上限(2.32 GB/rank,errno 12,16 rank 一致失败);
-token 131072 超 `stage1_abi.py` 的 `MAX_FUSED_TOKENS_PER_RANK = 4096`。
-
-TPR=32 需要额外传 `--candidate-rank-push-batch-size 32`(默认 batch=64 时
-`32 % 64 != 0` 会被 rank-push batch invariants 拒绝)。
+13 个 Kimi shape 里当时只测了这 6 个。token 32768 曾撞 RDMA MR 注册上限(之后改成只注册
+RDMA 前缀);token 131072 超 `stage1_abi.py` 的 `MAX_FUSED_TOKENS_PER_RANK = 4096`。

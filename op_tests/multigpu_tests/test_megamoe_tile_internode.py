@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""EP16 inter-node MegaMoE tile test: single-op, functional and performance modes.
+"""EP16 inter-node MegaMoE tile test: accuracy and performance in one pass.
 
 Launch one torchrun per node (2 nodes x 8 GPUs); see
-scripts/megamoe_tile/run_internode_test.sh.
+scripts/megamoe_tile/run_internode_test.sh.  Every (TPR, fixture) case of one
+network runs in this process, largest TPR first:
 
-  --mode op    the fused operator alone, one route fixture
-               (--part full: eager check vs MORI + CUDA-graph timing,
-                --part stage1: fused Stage1 only, graph-timed)
-  --mode func  correctness and CUDA-graph replay checks over route fixtures
-  --mode perf  fused operator vs small-op baseline (quant + MORI dispatch +
-               tuned fused_moe + MORI combine), both captured and profiled
-               in this process, per TPR
+  check      fused eager output vs the MORI A4W4 reference built on the same
+             weights (relL2), then CUDA-graph replays vs eager, with changed
+             inputs and swapped routing in between (--no-check skips all)
+  total      bench_mega_moe.py timing: each replay is synchronized and timed
+             with the host clock; per-rank min/median, mean over ranks
+  breakdown  torch.profiler over --prof-replays more replays; per-kernel rows
+             from the last --prof-tail of them
 
-Shapes come from --network presets or explicit overrides; nothing assumes a
-particular hidden size, expert count or topk.  The graph protocol (warmup,
-replay checks, torch.profiler capture, rank statistics) is the existing
-megamoe_stage2_graph.run_graph_profile, driven once per path.
+--timing picks total and/or breakdown; --paths picks the fused operator and/or
+the small-op baseline (quant + MORI dispatch + tuned fused_moe + MORI combine).
+
+  --network kimi_k3 --tpr-list 128,256,512,1024 --fixtures eplb,random
+  --network dsv4 --tpr-list 512 --paths smallop --timing total
+  --network kimi_k3 --tpr-list 128,512 --fixtures permuted --timing none
 """
 
 from __future__ import annotations
@@ -26,8 +29,10 @@ import gc
 import json
 import logging
 import os
+import re
 import statistics
 import sys
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -44,74 +49,133 @@ NETWORKS = {
         fmoe_csv="aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv",
     ),
 }
+EP_SIZE, GPUS_PER_NODE = 16, 8
 
-# Best-known fused configuration (single-kernel Stage1 + two-kernel Stage2).
-# Every entry is required; a missing one silently compiles a different kernel.
-FUSED_BEST_ENV = {
-    "MEGAMOE_TWO_KERNEL": "1",
-    "MEGAMOE_TK_ARRIVAL": "1",
-    "MEGAMOE_TK_RAIL": "1",
-    "MEGAMOE_TK_WAIT_REMOTE": "1",
-    "MEGAMOE_TK_EXPERT_MAJOR": "1",
-    "MEGAMOE_TK_K1_TIME": "0",
-    "MEGAMOE_TK_K2_TIME": "0",
-    "MEGAMOE_TK_H1_PHYS": "1",
-    "MEGAMOE_TK_S1_SPLIT_LOCAL": "1",
-    "MEGAMOE_TK_S1_ROUTE_GBATCH": "1",
-    "MEGAMOE_TK_S1_ASCALE_GATHER": "1",
-    "MEGAMOE_TK_S1_RAIL_SOA": "1",
-    "MEGAMOE_TK_S1_RAIL_QPS": "4",
-    "MEGAMOE_TK_S1_T0_NOFAN": "1",
-    "MEGAMOE_TK_S1_FAN1_DIRECT": "1",
-    "MEGAMOE_TK_S1_FANOUT_SHARDS": "32",
-    "MEGAMOE_TK_S1_WIDE_WAIT": "1",
-    "MEGAMOE_TK_S1_WIDE_FANOUT_WAIT": "1",
-    "MEGAMOE_TK_S1_DEFER_RECV": "1",
-    "MEGAMOE_TK_S1_HOIST_WAIT": "1",
-    "MEGAMOE_TK_S1_RAIL_POST_OFFT0": "1",
-    "MEGAMOE_TK_S1_SORTCOPY_K2": "1",
-    "MEGAMOE_TK_S1_GB_P3": "2",
-    "MEGAMOE_TK_S1_META_OPT": "1",
-    "MEGAMOE_TK_S1_RAIL_POST_CTAS": "1",
-    "MEGAMOE_TK_S1_CREDIT_ASYNC": "1",
-    "MEGAMOE_TK_S1_KERNEL_SPLIT": "0",
-    "MEGAMOE_TK_S1_GATE_SLEEP": "127",
-    "MEGAMOE_TK_S1_EARLY_LOCAL_GMM": "1",
-    "MEGAMOE_TK_S1_FAN2_SHARDS": "16",
-    "MEGAMOE_TK_S1_PUB_RELAXED": "1",
-    "MEGAMOE_TK_S1_CLAIM_RELAXED": "1",
-    "MEGAMOE_TK_S1_SPIN_RELAXED": "1",
-    "MEGAMOE_TK_S1_EXTRA_CONSUMERS": "1",
-    "MEGAMOE_TK_S1_LAZY_PAD": "1",
-    "MEGAMOE_TK_GMM1_LDS_SCOPES": "1",
-    "MEGAMOE_TK_GMM1_EPI_SWZ": "1",
-    "MEGAMOE_TK_GMM1_NOFENCE_BAR": "1",
-    "MEGAMOE_TK_GMM1_NEXT_CLAIM": "1",
-    "MEGAMOE_TK_S1_POST_NOFAN": "1",
+# Per-shape knobs come from the tune tables (megamoe_tile_stage{1,2}_tuned.csv,
+# else the built-in rule).  A sweep passes --set <key>=<its own table>; the
+# guard resolves the same table, so it stays on for those.
+TILE_ENV_KEYS = ("AITER_CONFIG_MEGAMOE_TILE_STAGE1", "AITER_CONFIG_MEGAMOE_TILE_STAGE2")
+
+SMALLOP_ENV = {
+    "a4w4": {"AITER_SITUV2_A4W4": "1", "AITER_SITUV2_A8W4": "0"},
+    # Otherwise Silu+interleave picks a bf16 activation for small M.
+    "a8w4": {"AITER_BF16_FP8_MOE_BOUND": "0", "ATOM_MOE_GU_ITLV": "1"},
 }
-# Kernel-name fragments the best configuration must produce.
-FUSED_BEST_STAGE1_FRAGMENTS = (
-    "_widewait", "_widefan", "_f1d", "_t0nf", "_cra", "_soa4", "_pcta",
-    "_gb", "_asg", "_pofft0", "_sck2", "_gp2", "_mo1", "_slg", "_h1p",
-    "_gs127", "_elg", "_f2s16", "_expertmajor", "_fos32", "_defrecv",
-    "_hoistwait", "_lsc_nfb", "_esw", "_nxc2", "_pnf", "_lp", "_prx", "_crx", "_xc", "_srx",
-)
 
-# Per-shape knobs are not in FUSED_BEST_ENV: Stage1 tile_group / gmm1_bn /
-# compute_first come from stage1_tune (env > megamoe_tile_stage1_tuned.csv >
-# default) and the Stage2 GEMM2 BN / grid from stage2_tune.  An env pin here
-# would override the tables for every TPR -- TILE_GROUP=4 and COMPUTE_FIRST=8
-# used to.  The guard derives the expected _tg/_gbn/_cf and t32x{BN}/p1cu{N}
-# fragments from the same resolvers.
-TILE_ENV_KEYS = ("MEGAMOE_TK_S1_TILE_GROUP", "MEGAMOE_TK_S1_GMM1_BN",
-                 "MEGAMOE_TK_S1_COMPUTE_FIRST", "MEGAMOE_TK_BN", "MEGAMOE_TK_K1_CU")
+# MORI launch geometry of the two small-op paths (dispatch blocks, RDMA blocks).
+MORI_BLOCKS = {"a4w4": (96, 64), "a8w4": (256, 128)}
 
+
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--network", choices=sorted(NETWORKS), default="kimi_k3")
+    p.add_argument("--model-dim", type=int)
+    p.add_argument("--inter-dim", type=int)
+    p.add_argument("--experts", type=int)
+    p.add_argument("--topk", type=int)
+    p.add_argument("--activation", choices=("silu", "situv2"))
+    p.add_argument("--tpr-list", default="512", help="tokens per rank, comma separated")
+    p.add_argument("--fixtures", default="eplb,random",
+                   help="route fixtures, comma separated: eplb, random, permuted")
+    p.add_argument("--paths", default="fused,smallop",
+                   help="fused and/or smallop, comma separated")
+    p.add_argument("--timing", default="total,breakdown",
+                   help="total and/or breakdown, comma separated; none = accuracy only")
+    p.add_argument("--check", dest="check", action="store_true", default=True)
+    p.add_argument("--no-check", dest="check", action="store_false",
+                   help="skip the eager reference and the replay checks")
+    p.add_argument("--rel-l2-threshold", type=float, default=5e-2)
+    p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--iters", type=int, default=40)
+    p.add_argument("--prof-replays", type=int, default=20,
+                   help="replays recorded by torch.profiler for the breakdown")
+    p.add_argument("--prof-tail", type=int, default=5,
+                   help="last profiled replays used for the breakdown statistics")
+    p.add_argument("--rail-fp8", dest="rail_fp8", action="store_true", default=True)
+    p.add_argument("--no-rail-fp8", dest="rail_fp8", action="store_false")
+    p.add_argument("--smallop-quant", choices=("a4w4", "a8w4"))
+    p.add_argument("--fmoe-csv", help="fused_moe tune table for the small-op baseline")
+    p.add_argument("--allow-tune-miss", action="store_true",
+                   help="do not fail when the small-op fused_moe misses its tune table")
+    p.add_argument("--set", dest="env_set", action="append", default=[], metavar="KEY=VALUE",
+                   help="env override (repeatable); anything but a tile tune table "
+                        "disables the kernel-name guard")
+    p.add_argument("--seed", type=int, default=123)
+    p.add_argument("--out-dir", default="trace_data/internode")
+    p.add_argument("--tag", default="run")
+    args = p.parse_args(argv)
+    args.paths = split_choices(p, "--paths", args.paths, ("fused", "smallop"))
+    args.timing = split_choices(p, "--timing", args.timing, ("total", "breakdown", "none"))
+    args.timing.discard("none")
+    fixtures = split_choices(p, "--fixtures", args.fixtures, ("eplb", "random", "permuted"))
+    # The CCO symmetric memory is pooled and only grows, so the largest window
+    # goes first: TPR descending, and eplb (route cap 1) last within a TPR.
+    args.fixtures = sorted(fixtures, key=lambda f: (f == "eplb", f))
+    args.tprs = sorted({int(v) for v in args.tpr_list.split(",") if v}, reverse=True)
+    if not args.tprs:
+        p.error("--tpr-list is empty")
+    if not 1 <= args.prof_tail <= args.prof_replays or args.iters < 1:
+        p.error("need iters >= 1 and 1 <= prof-tail <= prof-replays")
+    return args
+
+
+def split_choices(parser, flag, value, allowed):
+    items = {v for v in value.split(",") if v}
+    if not items or items - set(allowed):
+        parser.error(f"{flag} takes a comma separated subset of {allowed}, got {value!r}")
+    return items
+
+
+def resolve_network(args):
+    net = dict(NETWORKS[args.network])
+    for key in ("model_dim", "inter_dim", "experts", "topk", "activation"):
+        if getattr(args, key) is not None:
+            net[key] = getattr(args, key)
+    if args.smallop_quant:
+        net["smallop_quant"] = args.smallop_quant
+    if args.fmoe_csv:
+        net["fmoe_csv"] = args.fmoe_csv
+    return net
+
+
+def apply_env(args, net):
+    """Must run before any aiter import: some flags are read at import."""
+    # A table path left in the caller's shell would silently replace the tuned
+    # tables; sweeps pass theirs through --set.
+    for key in TILE_ENV_KEYS:
+        os.environ.pop(key, None)
+    for item in args.env_set:
+        key, sep, value = item.partition("=")
+        if not sep:
+            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
+        os.environ[key] = value
+    csv = Path(net["fmoe_csv"])
+    os.environ["AITER_CONFIG_FMOE"] = str(csv if csv.is_absolute() else REPO_ROOT / csv)
+    os.environ.update(SMALLOP_ENV[net["smallop_quant"]])
+    os.environ.setdefault("AITER_LOG_LEVEL", "INFO")
+
+
+def fixture_route(fixture, topk):
+    """Map a fixture name to the input route pattern and the route cap per rank."""
+    if fixture == "eplb":
+        return ("cross_node" if topk == EP_SIZE else "eplb-balanced"), 1
+    if fixture == "permuted":
+        if topk != 16:
+            raise ValueError("the permuted fixture tables are defined for topk=16 only")
+        return "permuted-arbitrary-topk", 4
+    return "rank-balanced-hot", topk
+
+
+# --------------------------------------------------------------------------
+# Tile configuration and the kernel-name guard
+# --------------------------------------------------------------------------
 
 def stage1_tile(net, tpr):
     from aiter.ops.flydsl.kernels.megamoe_tile.stage1_tune import resolve_stage1_tile
 
     return resolve_stage1_tile(token=tpr * net["topk"], model_dim=net["model_dim"],
-                               inter_dim=net["inter_dim"], expert=net["experts"] // 16,
+                               inter_dim=net["inter_dim"], expert=net["experts"] // EP_SIZE,
                                topk=net["topk"])
 
 
@@ -123,187 +187,52 @@ def stage2_tile(net, tpr):
 
     tuned = lookup_stage2_tune(gfx=get_gfx_runtime(), cu_num=get_cu_num(),
                                token=tpr * net["topk"], model_dim=net["model_dim"],
-                               inter_dim=net["inter_dim"], expert=net["experts"] // 16,
+                               inter_dim=net["inter_dim"], expert=net["experts"] // EP_SIZE,
                                topk=net["topk"])
     bn, bn_source = resolve_gemm2_bn(tuned)
     cu, cu_source = resolve_gemm2_cu(tuned)
     source = bn_source if bn_source == cu_source else f"gemm2_bn={bn_source},gemm2_cu={cu_source}"
-    # 0 means the operator launches worker_blocks CTAs (the --stage2-workers arg).
-    grid = cu or int(CANDIDATE_ARGS[CANDIDATE_ARGS.index("--stage2-workers") + 1])
-    return {"gemm2_bn": bn, "gemm2_cu": cu, "grid": grid, "source": source}
+    # 0 means kernel1 launches the operator's worker_blocks (256) CTAs.
+    return {"gemm2_bn": bn, "gemm2_cu": cu, "grid": cu or 256, "source": source}
 
 
 def tile_fragments(tile):
     """(must contain, must not contain) kernel-name fragments for a tile config."""
-    g, bn, cf = tile["tile_group"], tile["gmm1_bn"], tile["compute_first"]
-    has = ([f"_tg{g}"] if g != 1 else []) + (["_gbn128"] if bn == 128 else [])
-    lacks = ([] if g != 1 else ["_tg"]) + ([] if bn == 128 else ["_gbn"])
-    # The kernel clamps compute_first to its essential CTAs; the tables only
-    # hold values below that clamp, so the name carries the value itself.
-    if cf >= 0:
-        has.append(f"_cf{cf}")
-    else:
-        lacks.append("_cf")
+    g = tile["tile_group"]
+    # gmm1_bn (256) and compute_first (8) are constants: no _gbn, always _cf8.
+    # _slg / _nsl stands for split_local together with its companion switches.
+    has = ([f"_tg{g}"] if g != 1 else []) + [
+        f"_cf{tile['compute_first']}", f"_fos{tile['fanout_shards']}",
+        "_slg" if tile["split_local"] else "_nsl"]
+    lacks = ([] if g != 1 else ["_tg"]) + ["_gbn", "_nsl" if tile["split_local"] else "_slg"]
     return has, lacks
 
 
-SMALLOP_ENV = {
-    "a4w4": {"AITER_SITUV2_A4W4": "1", "AITER_SITUV2_A8W4": "0"},
-    # Otherwise Silu+interleave picks a bf16 activation for small M.
-    "a8w4": {"AITER_BF16_FP8_MOE_BOUND": "0", "ATOM_MOE_GU_ITLV": "1"},
-}
-
-# Production candidate knobs (run_case_relaxed.sh + run_stage2_graph_ep16.sh).
-CANDIDATE_ARGS = [
-    "--candidate-mode", "full", "--mori-mode", "gmm2_combine",
-    "--stage1-workers", "256", "--stage2-workers", "256",
-    "--candidate-node-accumulation-mode", "rank_local",
-    "--candidate-rank-accumulation-mode", "reduce_push",
-    "--candidate-rank-reduce-blocks", "56",
-    "--candidate-node-reduce-vec-bytes", "16",
-    "--candidate-node-reduce-load-schedule", "load_first",
-    "--candidate-gmm-work-swizzle", "n_major_window",
-    "--candidate-window-n-groups", "1",
-    "--candidate-ready-granularity", "group",
-    "--candidate-final-combine-blocks", "14",
-    "--candidate-node-reduce-blocks", "16",
-    "--candidate-node-reduce-token-owner-fastpath",
-    "--candidate-rank-push-batch-invariants",
-    "--candidate-rank-push-acquire-cohort", "2",
-    "--candidate-rank-epilogue-barrier", "per_row",
-    "--graph-comparison-statistic", "pooled_min",
-]
-
-TIMING_KEYS = (
-    "input_quant_us", "fused_stage1_us", "fused_stage2_us", "dispatch_us",
-    "sorting_us", "gemm1_us", "gemm2_us", "combine_us", "stage2_span_us",
-    "pipeline_span_us",
-)
-
-
-def parse_args(argv=None):
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--mode", choices=("op", "func", "perf"), required=True)
-    p.add_argument("--network", choices=sorted(NETWORKS), default="kimi_k3")
-    p.add_argument("--model-dim", type=int)
-    p.add_argument("--inter-dim", type=int)
-    p.add_argument("--experts", type=int)
-    p.add_argument("--topk", type=int)
-    p.add_argument("--activation", choices=("silu", "situv2"))
-    p.add_argument("--tpr-list", default="512", help="tokens per rank, comma separated")
-    p.add_argument("--fixtures", default="eplb,permuted",
-                   help="func mode route fixtures: eplb, permuted, random")
-    p.add_argument("--fixture", default="eplb", help="op/perf mode route fixture")
-    p.add_argument("--part", choices=("full", "stage1"), default="full",
-                   help="op mode: whole fused op, or fused Stage1 only")
-    p.add_argument("--config", choices=("best", "env"), default="best",
-                   help="best: force the best-known fused env; env: use the caller's env")
-    p.add_argument("--set", dest="env_set", action="append", default=[], metavar="KEY=VALUE",
-                   help="env override applied after --config best (repeatable); disables the "
-                        "kernel-name guard, since the variant is deliberately not the best config")
-    p.add_argument("--rail-fp8", dest="rail_fp8", action="store_true", default=True)
-    p.add_argument("--no-rail-fp8", dest="rail_fp8", action="store_false")
-    p.add_argument("--smallop-quant", choices=("a4w4", "a8w4"))
-    p.add_argument("--fmoe-csv", help="fused_moe tune table for the small-op baseline")
-    p.add_argument("--allow-tune-miss", action="store_true",
-                   help="do not fail perf mode when fused_moe misses its tune table")
-    p.add_argument("--skip-fused", action="store_true", help="perf mode: small-op only")
-    p.add_argument("--skip-smallop", action="store_true", help="perf mode: fused only")
-    p.add_argument("--warmup", type=int, default=10)
-    p.add_argument("--iters", type=int, default=40)
-    p.add_argument("--tail-iters", type=int, default=20)
-    p.add_argument("--seed", type=int, default=123)
-    p.add_argument("--rel-l2-threshold", type=float,
-                   help="relL2 gate vs MORI; default 5e-2 in func mode, 1.0 (production) otherwise")
-    p.add_argument("--out-dir", default="trace_data/internode")
-    p.add_argument("--tag", default="run")
-    return p.parse_args(argv)
-
-
-def resolve_network(args):
-    net = dict(NETWORKS[args.network])
-    for key, attr in (("model_dim", "model_dim"), ("inter_dim", "inter_dim"),
-                      ("experts", "experts"), ("topk", "topk"),
-                      ("activation", "activation")):
-        value = getattr(args, attr)
-        if value is not None:
-            net[key] = value
-    if args.smallop_quant:
-        net["smallop_quant"] = args.smallop_quant
-    if args.fmoe_csv:
-        net["fmoe_csv"] = args.fmoe_csv
-    return net
-
-
-def apply_env(args, net):
-    """Must run before any aiter/operator import: some flags are read at import."""
-    if args.config == "best":
-        os.environ.update(FUSED_BEST_ENV)
-        # A caller-shell pin would silently override the tune table; tiling
-        # sweeps go through --set (which also disables the guard).
-        for key in TILE_ENV_KEYS:
-            os.environ.pop(key, None)
-        if args.rail_fp8:
-            os.environ["MEGAMOE_TK_COMM_QUANT_RAIL"] = "fp8"
-        else:
-            os.environ.pop("MEGAMOE_TK_COMM_QUANT_RAIL", None)
-    for item in args.env_set:
-        key, sep, value = item.partition("=")
-        if not sep:
-            raise ValueError(f"--set expects KEY=VALUE, got {item!r}")
-        os.environ[key] = value
-    os.environ["MEGAMOE_EXPERTS"] = str(net["experts"])
-    os.environ["MEGAMOE_TOPK"] = str(net["topk"])
-    os.environ["MEGAMOE_INTER"] = str(net["inter_dim"])
-    os.environ["MEGAMOE_EP_SIZE"] = "16"
-    # silu clamp (DSV4 10.0); read by the fused operator and its MORI A4W4 reference.
-    os.environ["MEGAMOE_SWIGLU_LIMIT"] = str(float(net["swiglu_limit"]))
-    csv = Path(net["fmoe_csv"])
-    os.environ["AITER_CONFIG_FMOE"] = str(csv if csv.is_absolute() else REPO_ROOT / csv)
-    os.environ.update(SMALLOP_ENV[net["smallop_quant"]])
-    os.environ.setdefault("AITER_LOG_LEVEL", "INFO")
-
-
-def set_tpr_env(args, tpr):
-    if args.config == "best":
-        # One dispatch chunk per rank (k1 -9%); never below one record per QP.
-        os.environ["MEGAMOE_TK_S1_RECORDS_PER_CHUNK"] = str(max(4, tpr))
-
-
-def fixture_route(fixture, topk, ep_size):
-    """Map a generic fixture name to the harness route pattern and route cap."""
-    if fixture == "eplb":
-        return ("cross_node" if topk == ep_size else "eplb-balanced"), 1
-    if fixture == "permuted":
-        if topk != 16:
-            raise ValueError("the permuted fixture tables are defined for topk=16 only")
-        return "permuted-arbitrary-topk", 4
-    if fixture == "random":
-        return "rank-balanced-hot", topk
-    raise ValueError(f"unknown fixture {fixture!r}")
-
-
-def harness_argv(args, net, *, path, tpr, fixture, trace_dir, replay_checks):
-    route, cap = fixture_route(fixture, net["topk"], 16)
-    argv = [
-        "--path", path, "--cuda-graph",
-        "--hidden", str(net["model_dim"]), "--activation", net["activation"],
-        "--tokens", str(tpr), "--seed", str(args.seed),
-        "--warmup", str(args.warmup), "--iters", str(args.iters),
-        "--tail-iters", str(args.tail_iters),
-        "--route-pattern", route, "--max-routes-per-token-per-rank", str(cap),
-        "--graph-rel-l2-threshold", str(args.rel_l2_threshold),
-        "--torch-profiler-dir", str(trace_dir),
-        *CANDIDATE_ARGS,
-        # The batch invariant needs whole source-token batches.
-        "--candidate-rank-push-batch-size", str(min(64, tpr)),
-    ]
-    if replay_checks:
-        argv.append("--graph-check-routing-replay")
-    if fixture == "permuted" and path == "candidate":
-        argv.append("--graph-coalesce-reference-duplicates")
-    return argv
+def check_fused_config(stage1_name, stage2_names, rail_fp8, tile, s2tile):
+    """Kernel-name guard.  stage2_names come from the profiler (None without it)."""
+    problems = []
+    has, lacks = tile_fragments(tile)
+    missing = [f for f in has if f not in stage1_name]
+    if missing:
+        problems.append(f"fused_stage1 missing {missing}")
+    extra = [f for f in lacks if f in stage1_name]
+    if extra:
+        problems.append(f"fused_stage1 has {extra}, tile config {tile}")
+    if stage2_names is None:
+        return problems
+    k2 = [n for n in stage2_names if n.startswith("megamoe_k2")]
+    if len(k2) != 1:
+        problems.append(f"expected one megamoe_k2 kernel, got {k2}")
+    elif ("_qr8" in k2[0]) != rail_fp8:
+        problems.append(f"k2 rail fp8 mismatch: {k2[0]}")
+    k1 = [n for n in stage2_names if n.startswith("megamoe_stage2_compact")]
+    want = (f"_t32x{s2tile['gemm2_bn']}x256_", f"_p1cu{s2tile['grid']}s")
+    if len(k1) != 1:
+        problems.append(f"expected one megamoe_stage2_compact kernel, got {k1}")
+    elif any(w not in k1[0] for w in want):
+        problems.append(f"kernel1 missing {[w for w in want if w not in k1[0]]} "
+                        f"(stage2 tile {s2tile}): {k1[0][:90]}")
+    return problems
 
 
 class TuneLog(logging.Handler):
@@ -318,425 +247,678 @@ class TuneLog(logging.Handler):
         if "using 2stage" in msg:
             self.lines.append(msg)
 
-    def verdict(self, q_dtype_a=None):
-        # The fused path's MORI A4W4 reference also calls fused_moe (FP4
-        # activations); only lookups with the small-op's activation dtype count.
-        lines = [m for m in self.lines if q_dtype_a is None or f"'{q_dtype_a}', 'torch.float4_e2m1fn_x2'" in m]
-        hits = [m for m in lines if "using 2stage default" not in m]
+    def take(self, q_dtype_a):
+        # The MORI A4W4 reference also calls fused_moe (FP4 activations); only
+        # lookups with the small-op's activation dtype count.
+        lines = [m for m in self.lines if f"'{q_dtype_a}', 'torch.float4_e2m1fn_x2'" in m]
+        self.lines = []
         misses = [m for m in lines if "using 2stage default" in m]
-        return {"hits": len(hits), "misses": len(misses),
-                "example": (misses or hits or [""])[0][:300]}
+        return {"hits": len(lines) - len(misses), "misses": len(misses),
+                "example": (misses or lines or [""])[0][:300]}
 
 
-class MoriA8W4Baseline:
-    """Quant(MXFP8) + MORI InterNodeV1LL dispatch + A8W4 fused_moe + MORI combine.
+# --------------------------------------------------------------------------
+# Paths: the fused operator and the MORI small-op baselines
+# --------------------------------------------------------------------------
 
-    Same structure as MoriFusedMoeBaselinePath (the A4W4 small-op), with the
-    DSV4 A8W4 settings of test_wide_ep_moe.py: FP8 activations, gate/up
-    interleaved FP4 weights from its _quantize_local_weights, SiLU and the
-    model swiglu_limit.  Unlike TestWideEpMoe no fake expert slot is appended:
-    fused_moe keys its tune table on topk_ids.shape[1], and the EP16 rows of
-    the model tables use the real TopK.
+# The CCO Communicator is per process: every operator of the run borrows it and
+# only creates/frees its own window.  Rebuilding it per case hangs the second
+# case on the GPU.  Its symmetric memory is pooled too: after ccoMemFree a new
+# ccoMemAlloc runs out of VMM after about two TPR512 windows, so the pool keeps
+# one block and only replaces it with a larger one.
+class _BorrowedMemory:
+    def __init__(self, memory):
+        self._memory = memory
+
+    @property
+    def ptr(self):
+        return self._memory.ptr
+
+    @property
+    def size(self):
+        return self._memory.size
+
+    def close(self):
+        pass
+
+
+class PooledCommunicator:
+    def __init__(self, rank, world):
+        import torch.distributed as dist
+        from mori.cco import Communicator, UniqueId
+
+        payload = [bytes(Communicator.get_unique_id()) if rank == 0 else None]
+        dist.broadcast_object_list(payload, src=0)
+        self._comm = Communicator.init(world, rank, UniqueId.from_bytes(payload[0]),
+                                       per_rank_vmm=16 * 1024**3)
+        self._memory = None
+
+    def __getattr__(self, name):
+        return getattr(self._comm, name)
+
+    def alloc_mem(self, size):
+        if self._memory is None or self._memory.size < int(size):
+            if self._memory is not None:
+                self._memory.close()
+            self._memory = self._comm.alloc_mem(int(size))
+        return _BorrowedMemory(self._memory)
+
+    def destroy(self):
+        if self._memory is not None:
+            self._memory.close()
+            self._memory = None
+        self._comm.destroy()
+
+
+class MoriSmallOp:
+    """Quant + MORI InterNodeV1LL dispatch + fused_moe + MORI combine.
+
+    a4w4: FP4 activations on the fused operator's own weights; it is also the
+    accuracy reference of the fused path.  a8w4 (DSV4): FP8 activations and
+    the gate/up interleaved FP4 weights of test_wide_ep_moe.py.  No fake expert
+    slot is appended: fused_moe keys its tune table on topk_ids.shape[1], and
+    the EP16 rows of the model tables use the real TopK.
     """
 
-    name = "quant_mori_a8_dispatch_fused_moe_combine"
-    stage_names = ("quant_dispatch_fused_moe_combine",)
-    full_stage_field = stage_names[0]
-
-    def __init__(self, shape, shared, rank, world, *, swiglu_limit, seed):
+    def __init__(self, quant, shape, shared, rank, *, swiglu_limit, a8w4_weights=None):
         import aiter
         import mori
+        import torch
         from aiter.fused_moe import fused_moe
-        from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
         from aiter.ops.flydsl.moe_common import GateMode
-        from op_tests.multigpu_tests.test_wide_ep_moe import _quantize_local_weights
 
-        device = shared.x.device
-        (self.w1, self.w1_scale, self.w2, self.w2_scale), _ = _quantize_local_weights(
-            shape.hidden, shape.inter, shape.local_experts, rank, seed, device, quant="a8w4")
-        self.torch = __import__("torch")
-        self.torch.cuda.empty_cache()
+        self.torch, self.quant, self.shape, self.shared = torch, quant, shape, shared
+        self.blocks, self.rdma_blocks = MORI_BLOCKS[quant]
+        if quant == "a4w4":
+            from aiter.ops.quant import dynamic_per_group_scaled_quant
+
+            self._quant_op = dynamic_per_group_scaled_quant
+            w = shared.prepared_weights
+            self.weights = (w.w1, w.w1_scale, w.w2, w.w2_scale)
+            data_type = shared.a_quant.dtype
+            self.activation = (aiter.ActivationType.Situv2 if shape.activation == "situv2"
+                               else aiter.ActivationType.Silu)
+            self.gate_mode = GateMode.SEPARATED.value
+        else:
+            from aiter.ops.flydsl.kernels.mega_moe.quant import per_1x32_mx_quant
+
+            self._quant_op = per_1x32_mx_quant
+            self.weights = a8w4_weights
+            data_type = torch.float8_e4m3fn
+            self.activation = aiter.ActivationType.Silu
+            self.gate_mode = GateMode.INTERLEAVE.value
+        self.swiglu_limit = float(swiglu_limit)
+        self._fused_moe = fused_moe
         config = mori.ops.EpDispatchCombineConfig(
-            data_type=self.torch.float8_e4m3fn, rank=rank, world_size=world,
+            data_type=data_type, rank=rank, world_size=EP_SIZE,
             hidden_dim=shape.hidden, scale_dim=shape.hidden // 32, scale_type_size=1,
-            max_token_type_size=self.torch.bfloat16.itemsize,
+            max_token_type_size=torch.bfloat16.itemsize,
             max_num_inp_token_per_rank=shape.tokens, max_total_recv_tokens=0,
             num_experts_per_rank=shape.local_experts, num_experts_per_token=shape.topk,
             kernel_type=mori.ops.EpDispatchCombineKernelType.InterNodeV1LL,
-            warp_num_per_block=8, block_num=256, rdma_block_num=128,
-            gpu_per_node=shape.gpus_per_node, quant_type="none",
+            warp_num_per_block=8, block_num=self.blocks, rdma_block_num=self.rdma_blocks,
+            gpu_per_node=GPUS_PER_NODE, quant_type="none",
         )
-        self.shape, self.shared, self.rank = shape, shared, rank
         self.op = mori.ops.EpDispatchCombineOp(config)
-        self._fused_moe = fused_moe
-        self._quant = per_1x32_mx_quant
-        self._activation = aiter.ActivationType.Silu
-        self._quant_type = aiter.QuantType.per_1x32
-        self._gate_mode = GateMode.INTERLEAVE.value
-        self._swiglu_limit = float(swiglu_limit)
 
-    def _forward(self, *, validate_recv=False, debug_sync=False,
-                 reference_coalesce_duplicates=False):
-        if reference_coalesce_duplicates:
-            raise ValueError("the A8W4 small-op is a timing path, not a coalesced oracle")
-        route_ids, route_weights = self.shared.topk_ids, self.shared.route_weights
-        x_q, x_scale = self._quant(self.shared.x, quant_mode="fp8")
+    def forward(self, *, coalesce_duplicates=False):
+        torch, shared = self.torch, self.shared
+        route_ids, route_weights = shared.topk_ids, shared.route_weights
+        if coalesce_duplicates:
+            # The reference sorter keeps one slot per (token, expert), so repeated
+            # expert IDs lose contributions; the eager reference sums their
+            # weights instead (valid since doweight_stage1=False).  The candidate
+            # keeps the original slots.
+            from op_tests.multigpu_tests.megamoe_tile_ep16_inputs import (
+                coalesce_reference_routes)
+
+            ids, weights = coalesce_reference_routes(
+                route_ids.cpu().tolist(), route_weights.cpu().tolist(),
+                experts_per_rank=self.shape.local_experts, num_experts=self.shape.experts)
+            route_ids = torch.tensor(ids, dtype=route_ids.dtype, device=route_ids.device)
+            route_weights = torch.tensor(weights, dtype=route_weights.dtype,
+                                         device=route_weights.device)
+        if self.quant == "a4w4":
+            self._quant_op(shared.a_quant, shared.x, shared.a_scale, 32, shuffle_scale=False)
+            x_q, x_scale = shared.a_quant, shared.a_scale
+        else:
+            x_q, x_scale = self._quant_op(shared.x, quant_mode="fp8")
         dispatched, recv_weights, recv_scales, recv_ids, recv_tokens = self.op.dispatch(
             x_q, route_weights, x_scale, route_ids,
-            block_num=256, rdma_block_num=128, warp_per_block=8,
-        )
+            block_num=self.blocks, rdma_block_num=self.rdma_blocks, warp_per_block=8)
+        w1, w1_scale, w2, w2_scale = self.weights
+        import aiter
+
         local_out = self._fused_moe(
-            dispatched, self.w1, self.w2, recv_weights, recv_ids,
-            self.shared.local_expert_mask,
-            activation=self._activation, quant_type=self._quant_type,
-            doweight_stage1=False, w1_scale=self.w1_scale, w2_scale=self.w2_scale,
-            a1_scale=recv_scales, num_local_tokens=recv_tokens,
-            dtype=self.torch.bfloat16, swiglu_limit=self._swiglu_limit,
-            gate_mode=self._gate_mode,
-        )
-        result = self.op.combine(local_out, None, route_ids,
-                                 block_num=256, rdma_block_num=128, warp_per_block=4)
+            dispatched, w1, w2, recv_weights, recv_ids, shared.local_expert_mask,
+            activation=self.activation, quant_type=aiter.QuantType.per_1x32,
+            doweight_stage1=False, w1_scale=w1_scale, w2_scale=w2_scale,
+            a1_scale=recv_scales, num_local_tokens=recv_tokens, dtype=torch.bfloat16,
+            swiglu_limit=self.swiglu_limit, gate_mode=self.gate_mode)
+        result = self.op.combine(local_out, None, route_ids, block_num=self.blocks,
+                                 rdma_block_num=self.rdma_blocks, warp_per_block=4)
         return result[0] if isinstance(result, tuple) else result
 
 
-class SmallOpPath:
-    """The graph driver only touches .baseline on the MORI path."""
+# --------------------------------------------------------------------------
+# Graph capture, timing and the profiler breakdown
+# --------------------------------------------------------------------------
 
-    def __init__(self, baseline):
-        self.baseline = baseline
+def capture_graph(torch, dist, fn, device):
+    """One forward per replay, captured on a side stream after three warm calls."""
+    stream = torch.cuda.Stream(device=device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    with torch.cuda.stream(stream):
+        for _ in range(3):
+            fn()
+    stream.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        output = fn()
+    return graph, output
 
-    def close(self):
-        return None
+
+def time_replays(torch, dist, graph, device, warmup, iters):
+    """bench_mega_moe.py: one sample = replay + synchronize, host wall clock (us)."""
+    for _ in range(warmup):
+        graph.replay()
+    torch.cuda.synchronize(device)
+    dist.barrier()
+    samples = []
+    for _ in range(iters):
+        t0 = time.perf_counter()
+        graph.replay()
+        torch.cuda.synchronize(device)
+        samples.append((time.perf_counter() - t0) * 1e6)
+    dist.barrier()
+    return samples
 
 
-def split_fused_stage2(trace_file, tail):
-    """Per-rank minimum of the two Stage2 kernels and Stage1 over the tail."""
+def kernel_class(name):
+    if "megamoe_tile_ep16_stage1" in name:
+        return "stage1"
+    if name.startswith("megamoe_stage2_"):        # fused kernel1: GEMM2 + push
+        return "gemm2"
+    if name.startswith("megamoe_k2"):             # fused kernel2: node reduce + rail + combine
+        return "k2"
+    if name.startswith("EpDispatch"):
+        return "dispatch"
+    if "moe_sorting" in name or "mxfp4_moe_sort" in name:
+        return "sorting"
+    if name.startswith("mfma_moe1") or "moe1_" in name:
+        return "gemm1"
+    if name.startswith("gemm2_") or "moe2_" in name:
+        return "gemm2"
+    if name.startswith("EpCombine"):
+        return "combine"
+    if "quant" in name:
+        return "quant"
+    return "other"
+
+
+REPLAY_MARK = re.compile(r"megamoe_replay(\d+)$")
+
+
+def profile_breakdown(torch, graph, device, replays, tail, trace_file):
+    """Per-rank minimum of each row over the last ``tail`` profiled replays.
+
+    Returns (rows, kernel names) or (None, error) when the profiler recorded
+    none of those replays; it drops one now and then, so a partial window is used.
+    """
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        for i in range(replays):
+            with record_function(f"megamoe_replay{i}"):
+                graph.replay()
+        torch.cuda.synchronize(device)
+    prof.export_chrome_trace(str(trace_file))
     events = json.loads(Path(trace_file).read_text())["traceEvents"]
-    kernels = [e for e in events if e.get("ph") == "X"
-               and e.get("cat") in ("kernel", "gpu_op", "Kernel")]
-    classes = {"gemm2": ("megamoe_stage2_compact", "megamoe_stage2_fixedslot"),
-               "k2": ("megamoe_k2",), "stage1": ("megamoe_tile_ep16_stage1",)}
-    out = {}
-    for key, prefixes in classes.items():
-        hits = sorted((e for e in kernels if e["name"].startswith(prefixes)),
-                      key=lambda e: e["ts"])[-tail:]
-        out[key] = min(e["dur"] for e in hits) if hits else None
-    return out
+    windows = []
+    for e in events:
+        m = REPLAY_MARK.match(e.get("name", ""))
+        if (m and e.get("cat") == "gpu_user_annotation" and e.get("ph") == "X"
+                and int(m.group(1)) >= replays - tail):
+            windows.append((float(e["ts"]), float(e["ts"]) + float(e["dur"])))
+    if not windows:
+        return None, f"profiler recorded none of replays {replays - tail}..{replays - 1}"
+    kernels = [e for e in events if e.get("ph") == "X" and e.get("cat") == "kernel"]
+    samples, names = [], set()
+    for begin, end in windows:
+        active = [e for e in kernels if begin <= float(e["ts"]) < end]
+        if not active:
+            continue
+        row = {}
+        for e in active:
+            key = kernel_class(e["name"])
+            row[key] = row.get(key, 0.0) + float(e["dur"])
+            names.add(e["name"])
+        ends = [float(e["ts"]) + float(e["dur"]) for e in active]
+        row["span"] = max(ends) - min(float(e["ts"]) for e in active)
+        # Stage2 = first GEMM2 start to last k2/combine end, gaps included.
+        first = [float(e["ts"]) for e in active if kernel_class(e["name"]) == "gemm2"]
+        last = [float(e["ts"]) + float(e["dur"]) for e in active
+                if kernel_class(e["name"]) in ("k2", "combine")]
+        if first and last:
+            row["stage2"] = max(last) - min(first)
+        if "stage1" not in row and all(k in row for k in ("dispatch", "sorting", "gemm1")):
+            row["stage1"] = row["dispatch"] + row["sorting"] + row["gemm1"]
+        samples.append(row)
+    if not samples:
+        return None, "no kernels inside the profiled replays"
+    keys = set.intersection(*(set(s) for s in samples))
+    return {k: min(s[k] for s in samples) for k in keys}, sorted(names)
 
 
-def kernel_names(trace_dir, rank):
-    samples = json.loads((Path(trace_dir) / f"rank{rank}.samples.json").read_text())["samples"]
-    names = {}
-    for sample in samples:
-        for key, values in sample.get("kernel_names", {}).items():
-            names.setdefault(key, set()).update(values)
-    return {k: sorted(v) for k, v in names.items()}
+def wall_stats(rank_samples):
+    mins = [min(s) for s in rank_samples]
+    medians = [sorted(s)[len(s) // 2] for s in rank_samples]
+    return {"min": statistics.mean(mins), "median": statistics.mean(medians),
+            "pooled_min": min(mins), "worst_median": max(medians)}
 
 
-def check_fused_config(names, args, tile, s2tile):
-    """Kernel-name guard for --config best (rank 0 only)."""
-    problems = []
-    # Tiling overrides keep the guard: the resolver sees the same env, so the
-    # expected _tg/_gbn follow the sweep point and everything else stays checked.
-    if args.config != "best" or any(
-            item.partition("=")[0] not in TILE_ENV_KEYS for item in args.env_set):
-        return problems
-    stage1 = names.get("fused_stage1", [])
-    if len(stage1) != 1:
-        problems.append(f"expected one fused_stage1 kernel, got {stage1}")
-    else:
-        has, lacks = tile_fragments(tile)
-        missing = [f for f in FUSED_BEST_STAGE1_FRAGMENTS + tuple(has) if f not in stage1[0]]
-        if missing:
-            problems.append(f"fused_stage1 missing {missing}")
-        extra = [f for f in lacks if f in stage1[0]]
-        if extra:
-            problems.append(f"fused_stage1 has {extra}, tile config {tile}")
-    k2 = [n for n in names.get("fused_stage2", []) if n.startswith("megamoe_k2")]
-    if len(k2) != 1:
-        problems.append(f"expected one megamoe_k2 kernel, got {k2}")
-    elif ("_qr8" in k2[0]) != args.rail_fp8:
-        problems.append(f"k2 rail fp8 mismatch: {k2[0]}")
-    k1 = [n for n in names.get("fused_stage2", []) if n.startswith("megamoe_stage2_compact")]
-    want = (f"_t32x{s2tile['gemm2_bn']}x256_", f"_p1cu{s2tile['grid']}s")
-    if len(k1) != 1:
-        problems.append(f"expected one megamoe_stage2_compact kernel, got {k1}")
-    else:
-        missing = [w for w in want if w not in k1[0]]
-        if missing:
-            problems.append(f"kernel1 missing {missing} (stage2 tile {s2tile}): {k1[0][:90]}")
-    return problems
-
-
-def metric_table(summary):
-    metrics = summary["timing"]["metrics"]
-    table = {}
-    for key in TIMING_KEYS:
-        m = metrics.get(key)
-        if m and m.get("rank_mean_of_min", 0) > 0:
-            table[key] = {"rmm": m["rank_mean_of_min"], "pm": m["pooled_min"],
-                          "cv": m["rank_mean_cv"]}
-    return table
-
+# --------------------------------------------------------------------------
+# Runner
+# --------------------------------------------------------------------------
 
 class Runner:
     def __init__(self, args, net):
         import torch
         import torch.distributed as dist
-        from op_tests.multigpu_tests import bench_megamoe_tile_ep16_stage2_breakdown as bd
-        from op_tests.multigpu_tests.bench_megamoe_tile_ep16_dual_path import (
-            _setup_dist, _shared_inputs,
-        )
-        from op_tests.multigpu_tests.megamoe_stage2_graph import run_graph_profile
+        from op_tests.multigpu_tests import megamoe_tile_ep16_inputs as inputs
 
-        self.torch, self.dist, self.bd = torch, dist, bd
-        self.args, self.net = args, net
-        self._shared_inputs = _shared_inputs
-        self._run_graph_profile = run_graph_profile
+        self.torch, self.dist, self.args, self.net = torch, dist, args, net
+        self.inputs = inputs
         self.out_root = Path(args.out_dir) / args.tag
         self.out_root.mkdir(parents=True, exist_ok=True)
-        self.rank, self.world, _local, self.device = _setup_dist(
-            needs_mori=True, gpu_preflight_dir=str(self.out_root / "preflight"))
-        if self.world != 16:
-            raise ValueError(f"EP16 needs 16 ranks, got {self.world}")
+        self.rank, world, self.device = inputs.setup_dist(str(self.out_root / "preflight"))
+        if world != EP_SIZE:
+            raise ValueError(f"EP16 needs {EP_SIZE} ranks, got {world}")
         self.tune_log = TuneLog()
         logging.getLogger("aiter").addHandler(self.tune_log)
+        self.guard = all(item.partition("=")[0] in TILE_ENV_KEYS for item in args.env_set)
+        self.comm = None          # created by the first fused case
+        # Weights depend on the shape only: prepare them once for every case.
+        self.weights = inputs.prepare_weights(self.shape(1), self.rank, self.device,
+                                              seed=args.seed)
+        self.a8w4_weights = None
+        if "smallop" in args.paths and net["smallop_quant"] == "a8w4":
+            from op_tests.multigpu_tests.test_wide_ep_moe import _quantize_local_weights
+
+            self.a8w4_weights, _ = _quantize_local_weights(
+                net["model_dim"], net["inter_dim"], net["experts"] // EP_SIZE,
+                self.rank, args.seed, self.device, quant="a8w4")
         self.results = []
+
+    def shape(self, tpr):
+        net = self.net
+        shape = self.inputs.Shape(
+            tokens=tpr, hidden=net["model_dim"], inter=net["inter_dim"],
+            experts=net["experts"], topk=net["topk"], ep_size=EP_SIZE,
+            gpus_per_node=GPUS_PER_NODE, activation=net["activation"])
+        shape.validate()
+        return shape
 
     def log(self, msg):
         if self.rank == 0:
             print(msg, flush=True)
 
     def gather(self, obj):
-        rows = [None] * self.world
+        rows = [None] * EP_SIZE
         self.dist.all_gather_object(rows, obj)
         return rows
 
-    def _prepare(self, path, tpr, fixture, name, replay_checks):
-        trace_dir = self.out_root / name
-        argv = harness_argv(self.args, self.net, path=path, tpr=tpr, fixture=fixture,
-                            trace_dir=trace_dir, replay_checks=replay_checks)
-        bargs = self.bd.build_parser().parse_args(argv)
-        shape, contract = self.bd.prepare_run(bargs)
-        return bargs, shape, contract, trace_dir
+    def rel_l2(self, label, reference, actual, threshold):
+        """Rank-max relL2; every rank gets the same value, so the same verdict."""
+        torch = self.torch
+        ref, out = reference.float(), actual.float()
+        value = float((out - ref).norm() / ref.norm().clamp_min(1e-12))
+        if not (torch.isfinite(ref).all() and torch.isfinite(out).all()):
+            value = float("inf")
+        worst = torch.tensor(value, dtype=torch.float64)
+        self.dist.all_reduce(worst, op=self.dist.ReduceOp.MAX)
+        value = float(worst.item())
+        return {"label": label, "rel_l2": value, "threshold": threshold,
+                "ok": value < threshold}
 
-    def _shared(self, bargs, shape):
-        return self._shared_inputs(shape, self.rank, self.world, self.device,
-                                   route_pattern=bargs.route_pattern, seed=bargs.seed)
+    def check_routes(self, shape, shared, fixture, cap):
+        torch, epr = self.torch, shape.local_experts
+        owners = torch.div(shared.topk_ids.long(), epr, rounding_mode="floor")
+        per_rank = torch.zeros((shape.tokens, EP_SIZE), dtype=torch.int64, device=owners.device)
+        per_rank.scatter_add_(1, owners, torch.ones_like(owners))
+        if int(per_rank.max()) > cap:
+            raise ValueError(f"{fixture}: {int(per_rank.max())} routes to one rank, cap {cap}")
+        if fixture == "eplb":
+            counts = torch.bincount(shared.topk_ids.flatten().long(), minlength=shape.experts).cpu()
+            self.dist.all_reduce(counts)
+            per_rank = counts.view(EP_SIZE, epr)
+            padded = (per_rank + 31) // 32 * 32
+            if (len(set(per_rank.sum(1).tolist())) != 1 or len(set(padded.sum(1).tolist())) != 1
+                    or len({tuple(sorted(r)) for r in per_rank.tolist()}) != 1):
+                raise AssertionError("eplb inputs are not balanced across ranks")
 
-    def _profile(self, path, shared, shape, bargs, contract):
-        """Run the graph protocol; returns (summary or None, error or None) on rank 0."""
-        error = None
-        try:
-            self._run_graph_profile(path, shared, shape, bargs, contract,
-                                    self.rank, self.world, self.device)
-        except AssertionError as exc:  # numerical checks fail on every rank together
-            error = str(exc)
-        summary = None
-        summary_file = Path(bargs.torch_profiler_dir) / "summary.json"
-        if self.rank == 0 and error is None and summary_file.exists():
-            summary = json.loads(summary_file.read_text())
-        return summary, error
+    # ---- one case ---------------------------------------------------------
 
-    def run_fused(self, tpr, fixture, name, *, replay_checks, stage1_only=False):
-        set_tpr_env(self.args, tpr)
-        if stage1_only:
-            os.environ["MEGAMOE_TK_S1_ONLY"] = "1"
-            os.environ.setdefault("MEGAMOE_TK_S1_ONLY_REPLAYS", str(self.args.iters))
-        else:
-            os.environ.pop("MEGAMOE_TK_S1_ONLY", None)
-        bargs, shape, contract, trace_dir = self._prepare(
-            "candidate", tpr, fixture, name, replay_checks)
-        shared = self._shared(bargs, shape)
-        path = self.bd.build_path(bargs, shape, shared, self.rank, self.world, self.device)
-        try:
-            summary, error = self._profile(path, shared, shape, bargs, contract)
-        finally:
-            self.dist.barrier()
-            path.close()
-            os.environ.pop("MEGAMOE_TK_S1_ONLY", None)
-        record = {"path": "fused", "tpr": tpr, "fixture": fixture, "name": name,
-                  "error": error}
-        if stage1_only:
-            record["note"] = "stage1-only: see MEGAMOE_S1_ONLY line in the log"
-            return record
-        split = None
-        if error is None:
-            local = split_fused_stage2(trace_dir / f"rank{self.rank}.json",
-                                       self.args.tail_iters)
-            rows = self.gather(local)
-            split = {k: statistics.mean(r[k] for r in rows if r[k] is not None)
-                     for k in ("gemm2", "k2", "stage1") if all(r[k] is not None for r in rows)}
-            split.update({f"{k}_pm": min(r[k] for r in rows)
-                          for k in ("gemm2", "k2") if all(r[k] is not None for r in rows)})
-        if self.rank == 0 and summary is not None:
-            record["timing"] = metric_table(summary)
-            record["correctness"] = summary.get("correctness", [])
-            names = kernel_names(trace_dir, 0)
-            record["kernel_names"] = names
-            tile = stage1_tile(self.net, tpr)
-            s2tile = stage2_tile(self.net, tpr)
-            record["stage1_tile"] = tile
-            record["stage2_tile"] = s2tile
-            record["config_problems"] = check_fused_config(names, self.args, tile, s2tile)
-            record["split"] = split
-        del shared
+    def run_case(self, tpr, fixture):
+        args, net = self.args, self.net
+        shape = self.shape(tpr)
+        route, cap = fixture_route(fixture, shape.topk)
+        shared = self.inputs.shared_inputs(shape, self.rank, self.device,
+                                           route_pattern=route, seed=args.seed,
+                                           prepared_weights=self.weights)
+        self.check_routes(shape, shared, fixture, cap)
+        rec = {"tpr": tpr, "fixture": fixture}
+        quant = net["smallop_quant"]
+        reference = None
+        if (args.check and "fused" in args.paths) or (quant == "a4w4" and "smallop" in args.paths):
+            reference = MoriSmallOp("a4w4", shape, shared, self.rank,
+                                    swiglu_limit=net["swiglu_limit"])
+        if "fused" in args.paths:
+            rec["fused"] = self.run_fused(shape, shared, cap, reference, fixture)
+        if "smallop" in args.paths:
+            small = reference if quant == "a4w4" else MoriSmallOp(
+                "a8w4", shape, shared, self.rank, swiglu_limit=net["swiglu_limit"],
+                a8w4_weights=self.a8w4_weights)
+            rec["smallop"] = self.run_smallop(shape, small, fixture)
+            del small
+        del reference, shared
+        self.tune_log.lines.clear()
         gc.collect()
         self.torch.cuda.empty_cache()
-        return record
+        return rec
 
-    def run_smallop(self, tpr, fixture, name):
-        bargs, shape, contract, trace_dir = self._prepare("mori", tpr, fixture, name, False)
-        shared = self._shared(bargs, shape)
-        quant = self.net["smallop_quant"]
-        if quant == "a4w4":
-            path = self.bd.build_path(bargs, shape, shared, self.rank, self.world, self.device)
-        else:
-            baseline = MoriA8W4Baseline(shape, shared, self.rank, self.world,
-                                        swiglu_limit=self.net["swiglu_limit"],
-                                        seed=self.args.seed)
-            path = SmallOpPath(baseline)
+    def run_fused(self, shape, shared, cap, reference, fixture):
+        from aiter.ops.flydsl.kernels.megamoe_tile import MegaMoETileA4W4
+
+        torch, dist, args, device = self.torch, self.dist, self.args, self.device
+        tokens = shape.tokens
+        w = shared.prepared_weights
+        if self.comm is None:
+            self.comm = PooledCommunicator(self.rank, EP_SIZE)
+        op = MegaMoETileA4W4(
+            communicator=self.comm, rank=self.rank, world_size=EP_SIZE,
+            model_dim=shape.hidden, inter_dim=shape.inter, experts=shape.experts,
+            topk=shape.topk, quant="a4w4", w1=w.w1, w1_scale=w.w1_scale, w2=w.w2,
+            w2_scale=w.w2_scale, max_tok_per_rank=tokens,
+            max_routes_per_token_per_rank=cap, mega_scheme="hierarchical",
+            swiglu_limit=self.net["swiglu_limit"], activation=shape.activation,
+            device_generation=True, comm_quant_rail="fp8" if args.rail_fp8 else "none")
+        res = {"stage1_kernel": op.stage1_kernel_name,
+               "stage1_tile": stage1_tile(self.net, tokens),
+               "stage2_tile": stage2_tile(self.net, tokens), "checks": []}
+        coalesce = fixture == "permuted"
+        graph = None
         try:
-            summary, error = self._profile(path, shared, shape, bargs, contract)
-            op = path.baseline.op
-            launch = {"mode": getattr(op, "launch_config_mode", None),
-                      "dispatch": str(getattr(op, "_cached_dispatch_launch", None)),
-                      "combine": str(getattr(op, "_cached_combine_launch", None))}
-            q_a = "torch.float8_e4m3fn" if quant == "a8w4" else "torch.float4_e2m1fn_x2"
-            tune = self.gather(self.tune_log.verdict(q_a))
-        finally:
-            self.dist.barrier()
-            path.close()
-        record = {"path": f"smallop_{quant}", "tpr": tpr, "fixture": fixture,
-                  "name": name, "error": error}
-        if self.rank == 0:
-            record["mori_launch"] = launch
-            record["tune"] = {"hits": sum(t["hits"] for t in tune),
-                              "misses": sum(t["misses"] for t in tune),
-                              "example": tune[0]["example"]}
-            if summary is not None:
-                record["timing"] = metric_table(summary)
-                record["kernel_names"] = kernel_names(trace_dir, 0)
-        del path, shared
-        gc.collect()
-        self.torch.cuda.empty_cache()
-        return record
+            call = lambda: op.forward(shared.x, shared.route_weights, shared.topk_ids)
 
-    def finish(self):
-        self.log("")
+            def ref_forward():
+                out = reference.forward(coalesce_duplicates=coalesce)[:tokens].clone()
+                torch.cuda.synchronize(device)
+                dist.barrier()
+                return out
+
+            checks = res["checks"]
+            thr = args.rel_l2_threshold
+            if args.check:
+                expected = ref_forward()
+            eager = call()[:tokens].clone()
+            torch.cuda.synchronize(device)
+            if args.check:
+                checks.append(self.rel_l2("eager_vs_mori", expected, eager, thr))
+            graph, out = capture_graph(torch, dist, call, device)
+
+            def replay_vs(label, ref, threshold):
+                graph.replay()
+                torch.cuda.synchronize(device)
+                checks.append(self.rel_l2(label, ref, out[:tokens], threshold))
+
+            if args.check:
+                # Single replays alternate the generation parity, so a stage that
+                # froze its parity at capture shows up as last generation's output.
+                replay_vs("replay_vs_eager", eager, 1e-2)
+                original = shared.x.clone()
+                shared.x.mul_(-0.75)
+                replay_vs("changed_input", ref_forward(), thr)
+                shared.x.copy_(original)
+                replay_vs("restored_input", eager, 1e-2)
+                # Swapping the two expert nodes keeps each token's per-rank route
+                # count; local-only routes become remote and stale payload must clear.
+                original_ids = shared.topk_ids.clone()
+                shared.topk_ids.copy_((original_ids + shape.experts // 2) % shape.experts)
+                replay_vs("swapped_routing", ref_forward(), thr)
+                shared.topk_ids.copy_(original_ids)
+                replay_vs("restored_routing", eager, 1e-2)
+            ok = all(c["ok"] for c in checks)
+            if ok:
+                self.time_path(res, graph, f"fused_t{tokens}_{fixture}")
+                if args.check:
+                    replay_vs("after_timing", eager, 1e-2)
+                    ok = checks[-1]["ok"]
+            res["ok"] = ok
+            if self.rank == 0 and self.guard:
+                res["config_problems"] = check_fused_config(
+                    op.stage1_kernel_name, res.get("kernel_names"), args.rail_fp8,
+                    res["stage1_tile"], res["stage2_tile"])
+        finally:
+            graph = None      # free the graph before the operator's window
+            torch.cuda.synchronize(device)
+            dist.barrier()
+            op.close()
+        return res
+
+    def run_smallop(self, shape, path, fixture):
+        res = {"quant": path.quant}
+        if self.args.timing:
+            graph, _ = capture_graph(self.torch, self.dist, path.forward, self.device)
+            self.time_path(res, graph, f"smallop_t{shape.tokens}_{fixture}")
+            del graph
+        else:  # still look the config up in the fused_moe tune table
+            path.forward()
+            self.torch.cuda.synchronize(self.device)
+        q_a = "torch.float8_e4m3fn" if path.quant == "a8w4" else "torch.float4_e2m1fn_x2"
+        tune = self.gather(self.tune_log.take(q_a))
+        res["tune"] = {"hits": sum(t["hits"] for t in tune),
+                       "misses": sum(t["misses"] for t in tune), "example": tune[0]["example"]}
+        res["ok"] = bool(res["tune"]["misses"] == 0 or self.args.allow_tune_miss)
+        return res
+
+    def time_path(self, res, graph, case):
+        args = self.args
+        if "total" in args.timing:
+            samples = time_replays(self.torch, self.dist, graph, self.device,
+                                   args.warmup, args.iters)
+            res["total"] = wall_stats(self.gather(samples))
+        if "breakdown" in args.timing:
+            trace = self.out_root / f"{case}_rank{self.rank}.json"
+            rows, names = profile_breakdown(self.torch, graph, self.device,
+                                            args.prof_replays, args.prof_tail, trace)
+            gathered = self.gather(rows)
+            if all(gathered):
+                keys = set.intersection(*(set(r) for r in gathered))
+                res["breakdown"] = {k: statistics.mean(r[k] for r in gathered) for k in keys}
+                res["kernel_names"] = names
+            else:
+                res["breakdown_error"] = names if rows is None else "missing on some ranks"
+
+    def run(self):
+        failed = False
+        for tpr in self.args.tprs:
+            for fixture in self.args.fixtures:
+                rec = self.run_case(tpr, fixture)
+                rec["compare"] = compare(rec)
+                self.results.append(rec)
+                if self.rank == 0:
+                    failed |= print_case(self.net, self.args, rec)
         if self.rank == 0:
+            print_summary(self.args, self.results)
             out = self.out_root / "results.json"
-            out.write_text(json.dumps({"args": vars(self.args), "network": self.net,
-                                       "results": self.results}, indent=2) + "\n")
-            self.log(f"[RESULTS] {out}")
+            out.write_text(json.dumps({"args": {k: sorted(v) if isinstance(v, set) else v
+                                                for k, v in vars(self.args).items()},
+                                       "network": self.net, "results": self.results},
+                                      indent=2) + "\n")
+            print(f"[RESULTS] {out}", flush=True)
+        return failed
+
+    def close(self):
         self.dist.barrier()
+        if self.comm is not None:
+            self.comm.destroy()
         self.dist.destroy_process_group()
 
+
+# --------------------------------------------------------------------------
+# Report (rank 0)
+# --------------------------------------------------------------------------
 
 def fmt(value):
     return "-" if value is None else f"{value:.1f}"
 
 
-def tile_str(tile):
-    return (f"G={tile['tile_group']} (BM={32 * tile['tile_group']}) "
-            f"BN={tile['gmm1_bn']} compute_first={tile['compute_first']} [{tile['source']}]")
+def overlap_rate(compute, comm, fused):
+    """bench_mega_moe.py's overlap rate: the share of the shorter of the small-op's
+    back-to-back compute and communication kernels the fused kernels hide
+    (1.0 = fully hidden, 0.0 = none, < 0 = fused is slower than not overlapping)."""
+    if None in (compute, comm, fused) or min(compute, comm) <= 0:
+        return None
+    return (compute + comm - fused) / min(compute, comm)
 
 
-def print_perf(runner, tpr, fused, small):
-    if runner.rank != 0:
-        return
-    ft, st = fused.get("timing", {}), small.get("timing", {})
-    sp = fused.get("split") or {}
-    get = lambda t, k: (t.get(k) or {}).get("rmm")
-    s1_small = None
-    if all(get(st, k) for k in ("dispatch_us", "sorting_us", "gemm1_us")):
-        s1_small = sum(get(st, k) for k in ("dispatch_us", "sorting_us", "gemm1_us"))
-    pipe_f, pipe_s = get(ft, "pipeline_span_us"), get(st, "pipeline_span_us")
-    speed = f"{pipe_s / pipe_f:.2f}x" if pipe_f and pipe_s else "-"
-    print(f"[PERF] TPR={tpr} (rank_mean_of_min, us)  fused | small-op", flush=True)
-    print(f"  stage1            {fmt(get(ft, 'fused_stage1_us')):>8} | {fmt(s1_small):>8}"
-          f"  (dispatch {fmt(get(st, 'dispatch_us'))} + sorting {fmt(get(st, 'sorting_us'))}"
-          f" + gemm1 {fmt(get(st, 'gemm1_us'))})", flush=True)
-    print(f"  stage2 GEMM2      {fmt(sp.get('gemm2')):>8} | {fmt(get(st, 'gemm2_us')):>8}", flush=True)
-    print(f"  stage2 k2/combine {fmt(sp.get('k2')):>8} | {fmt(get(st, 'combine_us')):>8}", flush=True)
-    print(f"  stage2 total      {fmt(get(ft, 'fused_stage2_us')):>8} | {fmt(get(st, 'stage2_span_us')):>8}", flush=True)
-    print(f"  pipeline          {fmt(pipe_f):>8} | {fmt(pipe_s):>8}  speedup {speed}", flush=True)
-    if "stage1_tile" in fused:
-        print(f"  stage1 tile       {tile_str(fused['stage1_tile'])}", flush=True)
-    if "stage2_tile" in fused:
-        t = fused["stage2_tile"]
-        print(f"  stage2 tile       BM=32 BN={t['gemm2_bn']} grid={t['grid']} [{t['source']}]", flush=True)
-    for rec in (fused, small):
-        if rec.get("error"):
-            print(f"  ERROR {rec['path']}: {rec['error']}", flush=True)
-    for problem in fused.get("config_problems", []):
-        print(f"  CONFIG-GUARD FAIL: {problem}", flush=True)
-    if "tune" in small:
+def compare(rec):
+    """Speedups (small-op / fused) and overlap rates of one case."""
+    fused, small = rec.get("fused") or {}, rec.get("smallop") or {}
+    ft, st = (fused.get("total") or {}).get("min"), (small.get("total") or {}).get("min")
+    fb, sb = fused.get("breakdown") or {}, small.get("breakdown") or {}
+    ratio = lambda a, b: a / b if a and b else None
+    add = lambda *v: None if None in v else sum(v)
+    s1 = (add(sb.get("sorting"), sb.get("gemm1")), sb.get("dispatch"), fb.get("stage1"))
+    s2 = (sb.get("gemm2"), sb.get("combine"), add(fb.get("gemm2"), fb.get("k2")))
+    return {
+        "speedup": ratio(st, ft),
+        "speedup_stage1": ratio(sb.get("stage1"), fb.get("stage1")),
+        "speedup_stage2": ratio(sb.get("stage2"), fb.get("stage2")),
+        "overlap_stage1": overlap_rate(*s1),
+        "overlap_stage2": overlap_rate(*s2),
+        "overlap": overlap_rate(*(add(a, b) for a, b in zip(s1, s2))),
+    }
+
+
+def fmt_x(value):
+    return "-" if value is None else f"{value:.2f}x"
+
+
+def fmt_pct(value):
+    return "-" if value is None else f"{100 * value:.0f}%"
+
+
+def print_case(net, args, rec):
+    fused, small = rec.get("fused"), rec.get("smallop")
+    p = lambda msg: print(msg, flush=True)
+    p(f"[CASE] TPR={rec['tpr']} fixture={rec['fixture']}")
+    failed = False
+    if fused:
+        t1, t2 = fused["stage1_tile"], fused["stage2_tile"]
+        p(f"  tile      stage1 G={t1['tile_group']} (BM={32 * t1['tile_group']}) "
+          f"split_local={t1['split_local']} fanout_shards={t1['fanout_shards']} [{t1['source']}]"
+          f" | stage2 BN={t2['gemm2_bn']} grid={t2['grid']} [{t2['source']}]")
+        p(f"  kernel    {fused['stage1_kernel']}")
+        if fused["checks"]:
+            state = "PASS" if all(c["ok"] for c in fused["checks"]) else "FAIL"
+            p(f"  check     {state} " + "  ".join(
+                f"{c['label']}={c['rel_l2']:.4g}" + ("" if c["ok"] else f"(>={c['threshold']})")
+                for c in fused["checks"]))
+        for problem in fused.get("config_problems", []):
+            p(f"  GUARD FAIL {problem}")
+        failed |= not fused["ok"] or bool(fused.get("config_problems"))
+    ft = (fused or {}).get("total")
+    st = (small or {}).get("total")
+    if ft or st:
+        speed = f"  speedup {fmt_x(rec['compare']['speedup'])}" if ft and st else ""
+        p(f"  total     (us, per-rank min / median, mean over ranks)  "
+          f"fused {fmt((ft or {}).get('min'))} / {fmt((ft or {}).get('median'))}"
+          f"  | small-op {fmt((st or {}).get('min'))} / {fmt((st or {}).get('median'))}{speed}")
+    fb = (fused or {}).get("breakdown")
+    sb = (small or {}).get("breakdown")
+    for name, r in (("fused", fused), ("small-op", small)):
+        if r and r.get("breakdown_error"):
+            p(f"  breakdown {name} unavailable: {r['breakdown_error']}")
+    if fb or sb:
+        fb, sb = fb or {}, sb or {}
+        p(f"  breakdown (us, per-rank min over profiled replays "
+          f"{args.prof_replays - args.prof_tail}..{args.prof_replays - 1}, mean over ranks)"
+          f"   fused | small-op")
+        rows = (("quant", "quant", "quant"),
+                ("stage1", "stage1", "stage1"),
+                ("  dispatch/sorting/gemm1", None, None),
+                ("GEMM2", "gemm2", "gemm2"),
+                ("k2 / combine", "k2", "combine"),
+                ("stage2", "stage2", "stage2"),
+                ("replay span", "span", "span"))
+        for label, fk, sk in rows:
+            if fk is None:
+                if all(k in sb for k in ("dispatch", "sorting", "gemm1")):
+                    p(f"    {label:<24} {'':>8} | {fmt(sb['dispatch'])} + {fmt(sb['sorting'])}"
+                      f" + {fmt(sb['gemm1'])}")
+                continue
+            p(f"    {label:<24} {fmt(fb.get(fk)):>8} | {fmt(sb.get(sk)):>8}"
+              + (f"  {fmt_x(sb[sk] / fb[fk])}" if fb.get(fk) and sb.get(sk) else ""))
+        c = rec["compare"]
+        p(f"  overlap   (bench_mega_moe: (compute + comm - fused) / min(compute, comm))  "
+          f"stage1 {fmt_pct(c['overlap_stage1'])} (dispatch vs sorting+gemm1)  "
+          f"stage2 {fmt_pct(c['overlap_stage2'])} (combine vs gemm2)  "
+          f"all {fmt_pct(c['overlap'])}")
+    if small:
         t = small["tune"]
-        state = "HIT" if t["misses"] == 0 and t["hits"] > 0 else "MISS"
-        print(f"  small-op fused_moe tune: {state} (hits={t['hits']} misses={t['misses']}) "
-              f"csv={os.environ.get('AITER_CONFIG_FMOE')}", flush=True)
+        # fused_moe logs a lookup only the first time it sees a shape; a later
+        # case of the same TPR reuses that (already checked) selection.
+        state = "MISS" if t["misses"] else "HIT" if t["hits"] else "HIT (cached)"
+        p(f"  small-op  {small['quant']} fused_moe tune {state} (hits={t['hits']} "
+          f"misses={t['misses']}) csv={os.environ.get('AITER_CONFIG_FMOE')}")
         if state == "MISS":
-            print(f"    {t['example']}", flush=True)
-    if "mori_launch" in small:
-        print(f"  MORI launch: {small['mori_launch']}", flush=True)
+            p(f"    {t['example']}")
+        failed |= not small["ok"]
+    return failed
+
+
+def print_summary(args, results):
+    print(f"[SUMMARY] network={args.network} (us; total = per-rank min, mean over ranks)",
+          flush=True)
+    print("  speedup = small-op / fused; s1/s2 from the breakdown rows; overlap = "
+          "bench_mega_moe.py's rate, (compute + comm - fused) / min(compute, comm) of the "
+          "small-op kernels; > 100% = fused beats a perfect overlap of them", flush=True)
+    print(f"  {'TPR':>5} {'fixture':<9} {'check':<5} {'relL2':>8} {'fused':>8} "
+          f"{'small-op':>9} {'speedup':>8} {'f.stage1':>9} {'f.stage2':>9} "
+          f"{'s1 x':>6} {'s2 x':>6} {'ovl s1':>7} {'ovl s2':>7} {'ovl':>5}", flush=True)
+    for rec in results:
+        fused, small = rec.get("fused") or {}, rec.get("smallop") or {}
+        checks = fused.get("checks") or []
+        state = ("-" if not checks else
+                 "PASS" if all(c["ok"] for c in checks) and not fused.get("config_problems")
+                 else "FAIL")
+        rel = next((c["rel_l2"] for c in checks if c["label"] == "eager_vs_mori"), None)
+        ft, st = (fused.get("total") or {}).get("min"), (small.get("total") or {}).get("min")
+        fb, c = fused.get("breakdown") or {}, rec["compare"]
+        print(f"  {rec['tpr']:>5} {rec['fixture']:<9} {state:<5} "
+              f"{'-' if rel is None else f'{rel:.5f}':>8} {fmt(ft):>8} {fmt(st):>9} "
+              f"{fmt_x(c['speedup']):>8} {fmt(fb.get('stage1')):>9} {fmt(fb.get('stage2')):>9} "
+              f"{fmt_x(c['speedup_stage1']):>6} {fmt_x(c['speedup_stage2']):>6} "
+              f"{fmt_pct(c['overlap_stage1']):>7} {fmt_pct(c['overlap_stage2']):>7} "
+              f"{fmt_pct(c['overlap']):>5}", flush=True)
 
 
 def main(argv=None):
     args = parse_args(argv)
-    if args.rel_l2_threshold is None:
-        args.rel_l2_threshold = 5e-2 if args.mode == "func" else 1.0
     net = resolve_network(args)
     apply_env(args, net)
-    tprs = [int(v) for v in args.tpr_list.split(",") if v]
     runner = Runner(args, net)
-    runner.log(f"[CONFIG] mode={args.mode} network={args.network} shape={net} "
-               f"config={args.config} rail_fp8={args.rail_fp8} tpr={tprs} set={args.env_set}")
-    failed = False
+    runner.log(f"[CONFIG] network={args.network} shape={net} tpr={args.tprs} "
+               f"fixtures={args.fixtures} paths={sorted(args.paths)} "
+               f"timing={sorted(args.timing) or 'none'} check={args.check} "
+               f"rail_fp8={args.rail_fp8} set={args.env_set}")
     try:
-        for tpr in tprs:
-            if args.mode == "op":
-                rec = runner.run_fused(tpr, args.fixture, f"op_{args.part}_t{tpr}",
-                                       replay_checks=False,
-                                       stage1_only=args.part == "stage1")
-                runner.results.append(rec)
-                if runner.rank == 0:
-                    print(f"[OP] TPR={tpr} part={args.part} "
-                          + json.dumps({k: rec.get(k) for k in
-                                        ("error", "timing", "split", "correctness",
-                                         "config_problems")}), flush=True)
-                failed |= bool(rec.get("error") or rec.get("config_problems"))
-            elif args.mode == "func":
-                for fixture in [f for f in args.fixtures.split(",") if f]:
-                    rec = runner.run_fused(tpr, fixture, f"func_{fixture}_t{tpr}",
-                                           replay_checks=True)
-                    runner.results.append(rec)
-                    if runner.rank == 0:
-                        state = "FAIL" if rec.get("error") else "PASS"
-                        tile = rec.get("stage1_tile")
-                        print(f"[FUNC] {state} TPR={tpr} fixture={fixture}"
-                              + (f" tile {tile_str(tile)}" if tile else ""), flush=True)
-                        for problem in rec.get("config_problems", []):
-                            print(f"    CONFIG-GUARD FAIL: {problem}", flush=True)
-                        for check in rec.get("correctness", []):
-                            print(f"    {check['label']}: {check['rank_max_rel_l2']:.6g}"
-                                  f" (threshold {check['threshold']})", flush=True)
-                        if rec.get("error"):
-                            print(f"    {rec['error']}", flush=True)
-                    failed |= bool(rec.get("error"))
-            else:
-                fused = {} if args.skip_fused else runner.run_fused(
-                    tpr, args.fixture, f"perf_fused_t{tpr}", replay_checks=False)
-                small = {} if args.skip_smallop else runner.run_smallop(
-                    tpr, args.fixture, f"perf_small_t{tpr}")
-                runner.results += [r for r in (fused, small) if r]
-                print_perf(runner, tpr, fused, small)
-                failed |= bool(fused.get("error") or small.get("error")
-                               or fused.get("config_problems"))
-                if runner.rank == 0 and small.get("tune", {}).get("misses") and not args.allow_tune_miss:
-                    failed = True
+        failed = runner.run()
     finally:
-        runner.finish()
+        runner.close()
     return 1 if failed else 0
 
 

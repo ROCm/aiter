@@ -1,22 +1,23 @@
 # SPDX-License-Identifier: MIT
 """Per-shape tune table for the two-kernel Stage2 transport and GEMM2 knobs.
 
-``num_qp`` and ``return_chunk_tokens`` are genuinely shape-dependent: CHUNK sets
-the rail packet size (32 beat 16 by 8.8us at token=8192) and the optimum moves
-with the token count, so a single process-wide environment variable cannot hold
-the right answer for every shape.
+``return_chunk_tokens`` is genuinely shape-dependent: CHUNK sets the rail packet
+size (32 beat 16 by 8.8us at token=8192) and the optimum moves with the token
+count, so a single process-wide setting cannot hold the right answer for every
+shape.  The rail queue count was 8 on every measured shape and is the constant
+``NUM_QP``.
 
 The key follows the convention ``aiter/fused_moe.py`` already uses for its own
 tuned tables (``fused_moe.py:2192``), with ``token`` meaning the GEMM row count
 -- ``max_tok_per_rank * topk`` under the EP16 one-route-per-rank routing, *not*
 the per-rank token count.  A miss returns ``None``; the caller keeps its built-in
-default, so an absent or partial table never breaks a run.
+default, so an absent table never breaks a run.  There is no per-field env
+override: a sweep points ``AITER_CONFIG_MEGAMOE_TILE_STAGE2`` at its own copy of
+the table.
 
-``gemm2_bn`` (kernel1's GEMM2 N tile, 128 or 256) and ``gemm2_cu`` (kernel1's
-persistent grid; 0 = the operator's worker_blocks) are *optional* columns: a
-table without them, or a row with the cell left empty, falls back to the
-built-in default, so older tables keep loading.  BM stays 32: kernel1 requires
-``SBM % BM == 0`` and the arena tile (SBM) is 32 rows.
+``gemm2_bn`` is kernel1's GEMM2 N tile (128 or 256) and ``gemm2_cu`` kernel1's
+persistent grid (0 = the operator's worker_blocks).  BM stays 32: kernel1
+requires ``SBM % BM == 0`` and the arena tile (SBM) is 32 rows.
 """
 from __future__ import annotations
 
@@ -29,13 +30,11 @@ _DEFAULT_NAME = "megamoe_tile_stage2_tuned.csv"
 
 _KEY_FIELDS = ("gfx", "cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
 _INT_KEYS = ("cu_num", "token", "model_dim", "inter_dim", "expert", "topk")
-_VALUE_FIELDS = ("num_qp", "return_chunk_tokens")
-_OPTIONAL_FIELDS = ("gemm2_bn", "gemm2_cu")
+_VALUE_FIELDS = ("return_chunk_tokens", "gemm2_bn", "gemm2_cu")
 
-ENV_GEMM2_BN = "MEGAMOE_TK_BN"
+NUM_QP = 8
 GEMM2_BNS = (128, 256)
 DEFAULT_GEMM2_BN = 128
-ENV_GEMM2_CU = "MEGAMOE_TK_K1_CU"
 DEFAULT_GEMM2_CU = 0
 GEMM2_CU_MAX = 2048
 
@@ -58,23 +57,18 @@ def _validate(row: dict, path: str, lineno: int) -> None:
     # Reject out-of-domain values at load time rather than letting them reach
     # compile_stage2_node_combine, whose error message says nothing about which
     # CSV row produced it.
-    num_qp = row["num_qp"]
     chunk = row["return_chunk_tokens"]
-    if num_qp not in (1, 2, 4, 8):
-        raise ValueError(
-            f"{path}:{lineno}: num_qp must be one of 1,2,4,8 (got {num_qp})"
-        )
     if chunk < 4:
         raise ValueError(
             f"{path}:{lineno}: return_chunk_tokens must be >= 4 (got {chunk})"
         )
-    bn = row.get("gemm2_bn")
-    if bn is not None and bn not in GEMM2_BNS:
+    bn = row["gemm2_bn"]
+    if bn not in GEMM2_BNS:
         raise ValueError(
             f"{path}:{lineno}: gemm2_bn must be one of {GEMM2_BNS} (got {bn})"
         )
-    cu = row.get("gemm2_cu")
-    if cu is not None and not 0 <= cu <= GEMM2_CU_MAX:
+    cu = row["gemm2_cu"]
+    if not 0 <= cu <= GEMM2_CU_MAX:
         raise ValueError(
             f"{path}:{lineno}: gemm2_cu must be in [0, {GEMM2_CU_MAX}] (got {cu})"
         )
@@ -97,10 +91,6 @@ def _load(path: str) -> dict:
                 for f in _KEY_FIELDS
             )
             row = {f: int(raw[f]) for f in _VALUE_FIELDS}
-            for f in _OPTIONAL_FIELDS:
-                cell = (raw.get(f) or "").strip()
-                if cell:
-                    row[f] = int(cell)
             _validate(row, path, lineno)
             table[key] = row
     return table
@@ -134,7 +124,7 @@ def lookup_stage2_tune(
     expert: int,
     topk: int,
 ) -> dict | None:
-    """Return ``{"num_qp", "return_chunk_tokens"[, "gemm2_bn", "gemm2_cu"]}`` or ``None``.
+    """Return ``{"return_chunk_tokens", "gemm2_bn", "gemm2_cu"}`` or ``None``.
 
     ``expert`` is the per-rank routed-expert count and ``inter_dim`` the global
     one, matching ``kimik3_a4w4_tuned_fmoe.csv``.
@@ -152,15 +142,12 @@ def lookup_stage2_tune(
 
 
 def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
-    """GEMM2 N tile and its source: env > table > default.
+    """GEMM2 N tile and its source: table > default.
 
     ``tuned`` is the ``lookup_stage2_tune`` result (``None`` on a miss); the
     caller already has it, so this does not look the table up again.
     """
-    raw = os.environ.get(ENV_GEMM2_BN, "")
-    if raw:
-        bn, source = int(raw), "env"
-    elif tuned and tuned.get("gemm2_bn") is not None:
+    if tuned:
         bn, source = int(tuned["gemm2_bn"]), "table"
     else:
         bn, source = DEFAULT_GEMM2_BN, "default"
@@ -170,14 +157,11 @@ def resolve_gemm2_bn(tuned: dict | None) -> tuple[int, str]:
 
 
 def resolve_gemm2_cu(tuned: dict | None) -> tuple[int, str]:
-    """GEMM2 (kernel1) persistent grid and its source: env > table > 0.
+    """GEMM2 (kernel1) persistent grid and its source: table > 0.
 
     0 keeps the operator's behaviour of launching ``worker_blocks`` CTAs.
     """
-    raw = os.environ.get(ENV_GEMM2_CU, "")
-    if raw:
-        cu, source = int(raw), "env"
-    elif tuned and tuned.get("gemm2_cu") is not None:
+    if tuned:
         cu, source = int(tuned["gemm2_cu"]), "table"
     else:
         cu, source = DEFAULT_GEMM2_CU, "default"

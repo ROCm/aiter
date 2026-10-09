@@ -38,7 +38,7 @@ from . import comm_ops
 from .stage2_gemm_push import _fp8_scale_for_leader
 # 跨节点 rail 段用的三个 GDA 原语。MORI 公开绑定给不了(team 写死 WORLD、
 # GDA 不透传 optFlags),见 gda_rail.py 顶部;其余 CCO 用法都是直连公开 API。
-from .gda_rail import release as _rail
+from .gda_rail import release as _rail, ccqe_enabled as _rail_ccqe
 
 TEAM_RAIL = "rail"
 
@@ -352,6 +352,8 @@ def compile_stage2_node_combine(
         f"megamoe_k2_h{HIDDEN}_t{MAX_TOKENS}_k{TOPK}"
         f"_qp{NUM_QP}_c{CHUNK}_w{WAVES}"
         + ("" if enable_rail else "_norail")
+        # rail 的 CQ 轮询按 CCQE 模式编译,模式必须进 kernel 名(= flydsl 缓存键)
+        + ("_ccqe" if enable_rail and _rail_ccqe() else "")
         + ("" if wait_remote else "_nowait")
         + ("_aw1" if arrival_wait else "")
         + ("_qi8" if INBOX_FP8 else "")

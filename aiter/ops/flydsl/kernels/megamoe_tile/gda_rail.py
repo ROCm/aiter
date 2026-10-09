@@ -57,6 +57,22 @@ def _sdma_enabled() -> bool:
         return False
 
 
+def ccqe_enabled() -> bool:
+    """Whether MORI creates this host's ionic CQs in CCQE (collapsed) mode.
+
+    The shim's CQ poll is compiled two ways (``-DIONIC_CCQE``) and MORI picks
+    the CQ mode at runtime from the NIC firmware (>= 1.117.5-a-58). A bitcode or
+    kernel cached under the other mode polls the wrong CQ layout: it keeps
+    working for a while and then hangs on a completion it misreads. So the mode
+    has to be part of every cache key that ends up containing the poll.
+    """
+    try:
+        from mori.jit.core import is_ccqe_enabled
+    except ImportError:
+        return False
+    return bool(is_ccqe_enabled())
+
+
 def get_bitcode_path(cov: int = 6, *, ndebug: bool = False) -> str:
     """JIT ``gda_rail.cpp`` for the active arch/NIC, once per process."""
     key = (int(cov), bool(ndebug))
@@ -92,6 +108,7 @@ def get_bitcode_path(cov: int = 6, *, ndebug: bool = False) -> str:
         ],
         detect_nic_type(),
         cov=cov,
+        ccqe=ccqe_enabled(),
     )
     cache = cache / f"megamoe_gda_rail_{'ndebug_' if ndebug else ''}sdma{int(sdma)}"
     cache.mkdir(parents=True, exist_ok=True)

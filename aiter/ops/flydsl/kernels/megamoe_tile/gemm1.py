@@ -266,7 +266,7 @@ def _gemm1_body_sc2(
     assert BN in (128, 256), f"GMM1 BN must be 128 or 256, got {BN}"
     assert BN == 256 or not (interleave or inline_quant), "BN=128 needs the non-interleave, non-inline path"
 
-    # next_claim(MEGAMOE_TK_GMM1_NEXT_CLAIM,stage1 early_local_gmm 专用):在本 job 的第
+    # next_claim(stage1 early_local_gmm 专用):在本 job 的第
     # K_TILES_TOTAL-lead 步开头由 tx0 发下一个 job 的领位原子(arg_nc_head),结果留在 VGPR
     # 里跨过最后 lead 步;K 循环后的 barrier 之后查组表 arg_nc_list,epilogue 末尾把映射好的
     # 物理 job 号(越界 = -1)写进 LDS 信箱 dword next_claim_lds_dw。调用方在 job 后的 barrier
@@ -345,11 +345,7 @@ def _gemm1_body_sc2(
     # LLVM 在任何 LDS 读写前,对没有 alias.scope 的访问保守地等全部在途的 LDS DMA,
     # 于是每步 A 的 ds_read 前被插 vmcnt(0)(ATT:GMM1 41% 周期),A 两步预取形同虚设。
     # 每个 A 槽一个 scope、A-scale 区一个 scope,读写都带上,LLVM 只等同槽的 DMA。
-    _lds_scoped = (
-        ascale_gather
-        and not inline_quant
-        and __import__("os").environ.get("MEGAMOE_TK_GMM1_LDS_SCOPES", "1") != "0"
-    )
+    _lds_scoped = ascale_gather and not inline_quant
     if const_expr(_lds_scoped):
         from flydsl._mlir import ir as _ir
 
@@ -838,16 +834,13 @@ def _gemm1_body_sc2(
     # 每个 K 步 B 发出的 vmem 条数:4 个 j x 2 个 half 的 dwordx4 + 2 条 B-scale。
     _B_VMEM_PER_STEP = NJ * 2 + 2
 
-    # 裸 s_barrier(MEGAMOE_TK_GMM1_NOFENCE_BAR=1,仅 scoped 路径)。gpu.barrier() 降成
+    # 裸 s_barrier(仅 scoped 路径)。gpu.barrier() 降成
     # fence release(workgroup, LDS) + s_barrier + fence acquire;SIMemoryLegalizer 在该
     # release fence 上发 S_WAITCNT_lds_direct,SIInsertWaitcnts 把它换成「等全部在途 LDS DMA」
     # (通用 LDS 槽,不看 alias scope),并入前面那条显式 s_waitcnt:vmcnt(24) 被收紧成
     # vmcnt(10),即 A(kt+2) 被迫提前一步落地(ISA 28 处全是 vmcnt(10) lgkmcnt(0))。
     # 这里跨 wave 可见性已由显式 vmcnt(N)+lgkmcnt(0) 保证,fence 不提供额外必需的顺序。
-    _nofence_bar = (
-        _lds_scoped
-        and __import__("os").environ.get("MEGAMOE_TK_GMM1_NOFENCE_BAR", "1") != "0"
-    )
+    _nofence_bar = _lds_scoped
 
     def _wait_lds_barrier(vmcnt):
         # 同 mega_moe/gemm_util.wait_lds_barrier:lgkmcnt(0) 等本 wave 的 ds_read 读完,
@@ -1248,7 +1241,7 @@ def _gemm1_body_sc2(
 _gemm1_body = _gemm1_body_sc2
 
 
-# 尾声 f32 累加器的 LDS 去 bank 冲突排布(MEGAMOE_TK_GMM1_EPI_SWZ=1,默认开,=0 关;只作用于 BN=256)。
+# 尾声 f32 累加器的 LDS 去 bank 冲突排布(只作用于 BN=256)。
 # 旧排布 (BM,BN):(BN,1):写(每 lane 1 个 f32,16 列 x 4 行、行距 4)四行同 bank -> 64 bank 下 4 路;
 # 读(ds_read_b128)按 CDNA4 文档的 4 相位(每相位 16 lane:T0-3,T12-15,T20-23,T24-27 等,
 # 即两行 m、各两个 wave_grp)-> 2 路。
@@ -1274,7 +1267,7 @@ _B128_PHASES_CDNA3 = tuple(
 
 
 def _epi_swz_on(BN):
-    return BN == 256 and __import__("os").environ.get("MEGAMOE_TK_GMM1_EPI_SWZ", "1") != "0"
+    return BN == 256
 
 
 _EPI_SWZ_CHECKED = set()

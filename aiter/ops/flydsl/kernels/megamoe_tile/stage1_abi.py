@@ -86,6 +86,7 @@ class Stage1DispatchWire:
     record_alignment: int = 256
     world_size: int = 16
     num_qp: int = 4
+    max_tokens: int = 0
 
     def __post_init__(self) -> None:
         if self.hidden <= 0 or self.hidden % 128:
@@ -145,22 +146,12 @@ class Stage1DispatchWire:
 
     @property
     def records_per_chunk(self) -> int:
-        capacity = (64 * 1024) // self.record_bytes
-        # 诊断:把每 chunk 的记录数压小,使 dispatch_chunks 变成合数,
-        # 从而能用 cco_chunks_per_flush 做「门铃次数」的单变量扫描。
-        # H3584 下 record_bytes=2304 ⇒ capacity=28 ⇒ dispatch_chunks=19(质数),
-        # cco_chunks_per_flush 除了 1 无合法值。cap=16 ⇒ chunks=32。
-        import os as _os_rpc
-        # 64KB 不是任何缓冲区的上限 —— dispatch_staging / remote_dispatch_rx
-        # 都按 MAX_TOKENS 条记录整块注册,chunk 只是**信令粒度**。把它调大
-        # 就是直接减少 WQE 数与门铃数(chunks=19 ⇒ 88 WQE/76 门铃;chunks=1
-        # ⇒ 8 WQE/4 门铃),所以这个环境变量既能压小也能放大。
-        _cap = int(_os_rpc.environ.get("MEGAMOE_TK_S1_RECORDS_PER_CHUNK", "0") or 0)
-        if _cap > 0:
-            capacity = _cap
-        # Every CCO QP owns the same contiguous number of records. Round the
-        # group down instead of relying on the two historical record sizes to
-        # happen to divide evenly across four QPs.
+        # chunk 是信令粒度不是缓冲上限:staging/rx 都按 max_tokens 整块注册。
+        # 一个 rank 一个 chunk 时 WQE/门铃数最少(k1 -9%)。
+        if self.max_tokens > 0:
+            capacity = max(self.num_qp, self.max_tokens)
+        else:
+            capacity = (64 * 1024) // self.record_bytes
         return capacity - capacity % self.num_qp
 
 
@@ -271,6 +262,7 @@ class Stage1ArenaLayout:
             topk=self.topk,
             world_size=self.world_size,
             num_qp=self.num_qp,
+            max_tokens=self.max_tokens,
         )
 
     @classmethod
@@ -291,6 +283,7 @@ class Stage1ArenaLayout:
         dispatch_plan: bool = False,
         parity_depth: int = 2,
         num_qp: int = 4,
+        embed_stage2_bytes: int = 0,
     ) -> "Stage1ArenaLayout":
         hidden = int(hidden)
         inter = int(inter)
@@ -390,6 +383,7 @@ class Stage1ArenaLayout:
             topk=topk,
             world_size=world_size,
             num_qp=num_qp,
+            max_tokens=max_tokens,
         )
         chunks = (max_tokens + wire.records_per_chunk - 1) // wire.records_per_chunk
         input_scale_bytes = hidden // 32
@@ -586,6 +580,22 @@ class Stage1ArenaLayout:
                 ("rail_count_inbox_ready", (parity_depth,), torch.int64, 64),
             ])
 
+        # 被 RDMA(rail GDA)读写的 region 排在窗口最前,其后预留 stage2 整块(embed_stage2_bytes),
+        # 再放其余(LSA/本地,按 max_route_rows 放大的大块都在这里)。CCO 的 GDA 把整窗注册成一个
+        # iova=0 的 MR、raddr=窗口偏移;ionic 单 MR 有效范围有限(实测 rail 目标落在 ~1.07GiB 之后的写
+        # 全部不落地,10-08 TPR1024 random 挂死)。这样 RDMA 偏移只随 tokens 增长,与路由上限无关。
+        # 所有 kernel/host 都按名字取偏移,顺序可以随意调;stage1 仍从窗口偏移 0 开始。
+        _rdma_first = (
+            "dispatch_staging", "remote_dispatch_rx", "remote_chunk_ready",
+            "remote_chunk_credit", "sparse_remote_qp_ready", "sparse_remote_credit",
+            "plan_local_hist", "rail_count_inbox", "rail_count_inbox_ready",
+        )
+        _head = [sp for sp in specs if sp[0] in _rdma_first]
+        _tail = [sp for sp in specs if sp[0] not in _rdma_first]
+        if int(embed_stage2_bytes) > 0:
+            _head.append(("stage2_embed", (int(embed_stage2_bytes),), torch.uint8, 4096))
+        specs = _head + _tail
+
         offset = 0
         regions: list[Stage1ArenaRegion] = []
         for name, shape, dtype, alignment in specs:
@@ -664,6 +674,12 @@ class TwoKernelArenaLayout:
     ) -> "TwoKernelArenaLayout":
         if not hasattr(stage2, "total_bytes"):
             raise TypeError("stage2 layout must expose total_bytes")
+        if any(r.name == "stage2_embed" for r in stage1.regions):
+            # stage2 嵌在 stage1 的 RDMA 前缀之后(见 Stage1ArenaLayout.create 的 embed_stage2_bytes)。
+            slot = stage1.region("stage2_embed")
+            if slot.nbytes < int(stage2.total_bytes) or slot.offset % alignment:
+                raise ValueError("stage2_embed slot is smaller than stage2 or misaligned")
+            return cls(stage1, stage2, slot.offset, _align_up(stage1.total_bytes, alignment))
         stage2_offset = _align_up(stage1.total_bytes, alignment)
         total_bytes = _align_up(stage2_offset + int(stage2.total_bytes), alignment)
         return cls(stage1, stage2, stage2_offset, total_bytes)

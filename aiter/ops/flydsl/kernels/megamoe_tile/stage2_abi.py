@@ -960,6 +960,12 @@ class Stage2ArenaLayout:
                 )
             )
 
+        # rail(RDMA)读写的 region 排在 stage2 最前(源 node_accumulator、目标 remote_partial_rx/
+        # return_group_ready/return_consumed),原因见 Stage1ArenaLayout.create 的说明。
+        _rdma_first = ("node_accumulator", "remote_partial_rx", "return_group_ready", "return_consumed")
+        specs = ([sp for sp in specs if sp[0] in _rdma_first]
+                 + [sp for sp in specs if sp[0] not in _rdma_first])
+
         offset = 0
         regions: list[Stage2ArenaRegion] = []
         for name, shape, dtype, alignment in specs:

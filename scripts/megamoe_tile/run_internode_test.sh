@@ -7,10 +7,9 @@
 # trace_data/internode/TAG/node<NODE_RANK>.log and the exit code to
 # node<NODE_RANK>.status; results (rank 0) to trace_data/internode/TAG/results.json.
 # Examples (test args):
-#   --mode perf --network kimi_k3 --tpr-list 128,256,512,1024
-#   --mode perf --network dsv4 --skip-fused --tpr-list 512
-#   --mode func --network kimi_k3 --tpr-list 128,512 --fixtures eplb,permuted
-#   --mode op   --network kimi_k3 --tpr-list 512 --part stage1
+#   --network kimi_k3 --tpr-list 128,256,512,1024 --fixtures eplb,random
+#   --network dsv4 --tpr-list 512 --paths smallop --timing total
+#   --network kimi_k3 --tpr-list 128,512 --fixtures permuted --timing none
 # ATT_WRAP=<wrapper script>: torchrun --no-python wrapper (e.g. one that runs
 # rocprofv3 --att on a single rank); the test script path and args follow it.
 set -euo pipefail
@@ -47,7 +46,6 @@ export MORI_EP_LAUNCH_CONFIG_MODE=AUTO
 export AITER_MOE_EXPERT_BALANCE=true
 export AMD_SERIALIZE_KERNEL=0
 export FLYDSL_RUNTIME_ENABLE_CACHE=1
-export MEGAMOE_TILE_PROFILE_REGIONS=0
 export MEGAMOE_MASTER_ADDR="${master_addr}"
 
 set +e
