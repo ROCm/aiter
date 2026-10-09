@@ -233,6 +233,7 @@ def validate_and_update_archs():
         "gfx942",
         "gfx950",
         "gfx1151",
+        "gfx1250",
     ]
 
     # Validate if each element in archs is in allowed_archs
