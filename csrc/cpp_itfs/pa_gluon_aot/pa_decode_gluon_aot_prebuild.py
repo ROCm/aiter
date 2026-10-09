@@ -780,6 +780,8 @@ def run_multi_pa_gluon_test(
                                                                         ql,  # query_seq_len
                                                                         query_group_size,  # one_query_group_size
                                                                         head_size_pow2,
+                                                                        head_size
+                                                                        != head_size_pow2,
                                                                         bs,  # kv_block_size
                                                                         context_partition_size,
                                                                         query_quant_mode,

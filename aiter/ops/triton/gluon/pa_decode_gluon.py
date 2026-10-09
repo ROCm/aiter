@@ -77,6 +77,13 @@ except ImportError:
 
 
 @gluon.jit
+def _load_kv(ptrs, mask, MASKED: gl.constexpr, cache_modifier: gl.constexpr = ""):
+    if MASKED:
+        return gl.load(ptrs, mask=mask, other=0.0, cache_modifier=cache_modifier)
+    return gl.load(ptrs, cache_modifier=cache_modifier)
+
+
+@gluon.jit
 def _fused_max_combine(a1, a2, b1, b2):
     return tl.maximum(a1, b1), tl.maximum(a2, b2)
 
@@ -293,6 +300,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
     SLIDING_WINDOW: gl.constexpr = 0,
 ):
     """
@@ -787,8 +796,8 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
             + contiguous_kv_elements_offsets[None, None, :]
             < head_size
         )
-        key_block = gl.load(
-            key_cache_ptr + key_block_offsets, mask=key_head_mask, other=0.0
+        key_block = _load_kv(
+            key_cache_ptr + key_block_offsets, key_head_mask, KEY_HEAD_PADDED
         )
         # Reshape key block to [HEAD_SIZE_POW2, KV_COMPUTE_BLOCK_SIZE]
         key_block = gl.permute(key_block, [0, 2, 1])
@@ -825,10 +834,10 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 + value_dim2_offsets[None, None, :]
             )
             value_head_mask = value_dim1_offsets[None, :, None] < head_size
-            value_block = gl.load(
+            value_block = _load_kv(
                 value_cache_ptr + value_block_offsets,
-                mask=value_head_mask,
-                other=0.0,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
             )
             # Reshape to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [0, 2, 1])
@@ -844,10 +853,10 @@ def paged_attention_decode_v2_gluon_large_block_dot_kernel(
                 + (current_page_offset + value_dim1_offsets)[None, :]
             )
             value_head_mask = value_dim0_offsets[:, None] < head_size
-            value_block = gl.load(
+            value_block = _load_kv(
                 value_cache_ptr + value_block_offsets,
-                mask=value_head_mask,
-                other=0.0,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
             )
             # Transpose to [KV_COMPUTE_BLOCK_SIZE, HEAD_SIZE_POW2]
             value_block = gl.permute(value_block, [1, 0])
@@ -1072,12 +1081,13 @@ def paged_attention_decode_sliding_window_head_1(
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
-    value_head_size: int,
     COMPUTE_TYPE: gl.constexpr,
     QUERY_SEQ_LEN_POW2: gl.constexpr,
     ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr,
     HEAD_SIZE_POW2: gl.constexpr,
     VALUE_HEAD_SIZE_POW2: gl.constexpr,
+    VALUE_HEAD_SIZE: gl.constexpr,
+    KEY_HEAD_SIZE: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     CONTEXT_PARTITION_SIZE: gl.constexpr,
     QUERY_QUANT_MODE: gl.constexpr,
@@ -1088,6 +1098,8 @@ def paged_attention_decode_sliding_window_head_1(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -1118,6 +1130,13 @@ def paged_attention_decode_sliding_window_head_1(
     """
     # ==================== VALIDATION CHECKS ====================
     # Data type validation
+    # Share the existing Q/K bound for symmetric unpadded heads. The physical
+    # V width is otherwise a compile-time value, like its padded layout width.
+    if not KEY_HEAD_PADDED and VALUE_HEAD_SIZE == HEAD_SIZE_POW2:
+        value_head_size = head_size
+    else:
+        value_head_size = VALUE_HEAD_SIZE
+
     gl.static_assert(
         query_ptr.dtype.is_fp8()
         or query_ptr.dtype.element_ty == gl.bfloat16
@@ -1729,10 +1748,10 @@ def paged_attention_decode_sliding_window_head_1(
     key_head_mask = (
         head_size_split_offsets[None, :, None, None] * KV_16B_ELEMENT_COUNT
         + contiguous_kv_element_offsets[None, None, None, :]
-        < head_size
+        < KEY_HEAD_SIZE
     )
-    key_tensor = gl.load(
-        key_cache_ptr + key_block_offsets, mask=key_head_mask, other=0.0
+    key_tensor = _load_kv(
+        key_cache_ptr + key_block_offsets, key_head_mask, KEY_HEAD_PADDED
     )
     query_converted = query_shared.load(qk_lhs_operand_layout)
     for sequence_partition_idx in range(
@@ -1818,10 +1837,10 @@ def paged_attention_decode_sliding_window_head_1(
                     + value_dim3_offsets[None, None, None, :]
                 )
             value_head_mask = value_dim2_offsets[None, None, :, None] < value_head_size
-            value_tensor = gl.load(
+            value_tensor = _load_kv(
                 value_cache_ptr + value_block_offsets,
-                mask=value_head_mask,
-                other=0.0,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
             )
 
             # Permute and reshape for matrix multiplication
@@ -1848,10 +1867,10 @@ def paged_attention_decode_sliding_window_head_1(
 
             # Schedule: Start value VMEM load, then QK MFMA
             value_head_mask = value_dim1_offsets[None, :, None] < value_head_size
-            value_tensor = gl.load(
+            value_tensor = _load_kv(
                 value_cache_ptr + value_block_offsets,
-                mask=value_head_mask,
-                other=0.0,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
             )
 
             # Permute and resape for matrix multiplication
@@ -2098,10 +2117,8 @@ def paged_attention_decode_sliding_window_head_1(
         )
         probs_converted = probs_shared.load(pv_lhs_operand_layout)
         key_block_offsets2 = _amd_iglp_sched_barrier(key_block_offsets2, 0x0)
-        key_tensor2 = gl.load(
-            key_cache_ptr + key_block_offsets2,
-            mask=key_head_mask,
-            other=0.0,
+        key_tensor2 = _load_kv(
+            key_cache_ptr + key_block_offsets2, key_head_mask, KEY_HEAD_PADDED
         )
 
         attention_output = gl.amd.cdna3.mfma(
@@ -2266,12 +2283,10 @@ def paged_attention_decode_sliding_window(
     query_seq_len: int,
     query_group_size: int,
     head_size: int,
-    value_head_size: int,
     COMPUTE_TYPE: gl.constexpr,
     QUERY_SEQ_LEN_POW2: gl.constexpr,
     ONE_QUERY_GROUP_SIZE_POW2: gl.constexpr,
     HEAD_SIZE_POW2: gl.constexpr,
-    VALUE_HEAD_SIZE_POW2: gl.constexpr,
     KV_BLOCK_SIZE: gl.constexpr,
     CONTEXT_PARTITION_SIZE: gl.constexpr,
     QUERY_QUANT_MODE: gl.constexpr,
@@ -2282,6 +2297,8 @@ def paged_attention_decode_sliding_window(
     SLIDING_WINDOW: gl.constexpr = 0,
     CDNA_VERSION: gl.constexpr = 3,
     ONE_SHOT: gl.constexpr = False,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
 ):
     """
     Paged Attention Decode Kernel with FP8/BF16 support for AMD GPUs.
@@ -2327,8 +2344,6 @@ def paged_attention_decode_sliding_window(
         or value_cache_ptr.dtype.element_ty == gl.bfloat16
         or value_cache_ptr.dtype.element_ty == gl.float16
     )
-    gl.static_assert(VALUE_HEAD_SIZE_POW2 == HEAD_SIZE_POW2)
-
     if QUERY_QUANT_MODE >= 0:
         gl.static_assert(query_scale.dtype.element_ty == gl.float32)
     if KV_QUANT_MODE >= 0:
@@ -2809,10 +2824,10 @@ def paged_attention_decode_sliding_window(
         + contiguous_kv_element_offsets[None, None, None, :]
         < head_size
     )
-    key_tensor = gl.load(
+    key_tensor = _load_kv(
         key_cache_ptr + key_block_offsets,
-        mask=key_head_mask,
-        other=0.0,
+        key_head_mask,
+        KEY_HEAD_PADDED,
         cache_modifier=".cg",
     )
     query_converted = query_shared.load(qk_lhs_operand_layout)
@@ -2942,18 +2957,19 @@ def paged_attention_decode_sliding_window(
                 value_in_window_mask = value_token_global >= sequence_start_idx
 
                 value_head_mask = value_dim2_offsets[None, None, :, None] < head_size
-                value_tensor = gl.load(
+                value_tensor = _load_kv(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_head_mask & value_in_window_mask,
-                    other=0.0,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
                     cache_modifier=".cg",
                 )
+                value_tensor = gl.where(value_in_window_mask, value_tensor, 0.0)
             else:
                 value_head_mask = value_dim2_offsets[None, None, :, None] < head_size
-                value_tensor = gl.load(
+                value_tensor = _load_kv(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_head_mask,
-                    other=0.0,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
                     cache_modifier=".cg",
                 )
 
@@ -2980,18 +2996,21 @@ def paged_attention_decode_sliding_window(
                 )
                 value_in_window_mask = value_token_global >= sequence_start_idx
                 value_head_mask = value_dim1_offsets[None, :, None] < head_size
-                value_tensor = gl.load(
+                value_tensor = _load_kv(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_head_mask & value_in_window_mask[None, None, :],
-                    other=0.0,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
                     cache_modifier=".cg",
+                )
+                value_tensor = gl.where(
+                    value_in_window_mask[None, None, :], value_tensor, 0.0
                 )
             else:
                 value_head_mask = value_dim1_offsets[None, :, None] < head_size
-                value_tensor = gl.load(
+                value_tensor = _load_kv(
                     value_cache_ptr + value_block_offsets,
-                    mask=value_head_mask,
-                    other=0.0,
+                    value_head_mask,
+                    VALUE_HEAD_PADDED,
                     cache_modifier=".cg",
                 )
 
@@ -3132,17 +3151,20 @@ def paged_attention_decode_sliding_window(
             )
             kv_in_window_mask2 = kv_token_global2 >= sequence_start_idx
 
+            kv_mask2 = kv_in_window_mask2[None, None, :, None]
+            if KEY_HEAD_PADDED:
+                kv_mask2 = kv_mask2 & key_head_mask
             key_tensor2 = gl.load(
                 key_cache_ptr + key_block_offsets2,
-                mask=key_head_mask & kv_in_window_mask2[None, None, :, None],
+                mask=kv_mask2,
                 other=0.0,
                 cache_modifier=".cg",
             )
         else:
-            key_tensor2 = gl.load(
+            key_tensor2 = _load_kv(
                 key_cache_ptr + key_block_offsets2,
-                mask=key_head_mask,
-                other=0.0,
+                key_head_mask,
+                KEY_HEAD_PADDED,
                 cache_modifier=".cg",
             )
 
@@ -3286,6 +3308,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
     VALUE_TRANSPOSED: gl.constexpr,  # [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
     IS_CAUSAL: gl.constexpr,
     CDNA_VERSION: gl.constexpr = 3,
+    KEY_HEAD_PADDED: gl.constexpr = False,
+    VALUE_HEAD_PADDED: gl.constexpr = False,
     SLIDING_WINDOW: gl.constexpr = 0,
 ):
     """
@@ -3792,8 +3816,8 @@ def paged_attention_decode_v2_gluon_dot_kernel(
             + contiguous_kv_element_offsets[None, None, None, :]
             < head_size
         )
-        key_tensor = gl.load(
-            key_cache_ptr + key_block_offsets, mask=key_head_mask, other=0.0
+        key_tensor = _load_kv(
+            key_cache_ptr + key_block_offsets, key_head_mask, KEY_HEAD_PADDED
         )
 
         # Load key quantization scales if needed
@@ -3862,10 +3886,10 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 + value_dim3_offsets[None, None, None, :]
             )
             value_head_mask = value_dim2_offsets[None, None, :, None] < head_size
-            value_tensor = gl.load(
+            value_tensor = _load_kv(
                 value_cache_ptr + value_block_offsets,
-                mask=value_head_mask,
-                other=0.0,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
             )
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 1, 3, 2])
@@ -3885,10 +3909,10 @@ def paged_attention_decode_v2_gluon_dot_kernel(
                 + value_dim2_offsets[None, None, :]
             )
             value_head_mask = value_dim1_offsets[None, :, None] < head_size
-            value_tensor = gl.load(
+            value_tensor = _load_kv(
                 value_cache_ptr + value_block_offsets,
-                mask=value_head_mask,
-                other=0.0,
+                value_head_mask,
+                VALUE_HEAD_PADDED,
             )
             # Permute and reshape for matrix multiplication
             value_tensor = gl.permute(value_tensor, [0, 2, 1])
@@ -4169,6 +4193,7 @@ def paged_attention_decode_v2_reduce_kernel(
     OUTPUT_SEQ_LEN: tl.constexpr,
     ONE_OUTPUT_GROUP_SIZE: tl.constexpr,
     HEAD_SIZE_POW2: tl.constexpr,
+    VALUE_HEAD_PADDED: tl.constexpr,
     CONTEXT_PARTITION_SIZE: tl.constexpr,
     USE_SINKS: tl.constexpr,
 ):
@@ -4335,10 +4360,11 @@ def paged_attention_decode_v2_reduce_kernel(
             + head_size_offsets[None, None, :]
         )
         logits_mask = (
-            (partition_offsets[:, None, None] < context_partition_num)
-            & query_group_mask[None, :, None]
-            & (head_size_offsets[None, None, :] < head_size)
-        )
+            (partition_offsets[:, None] < context_partition_num)
+            & query_group_mask[None, :]
+        )[:, :, None]
+        if VALUE_HEAD_PADDED:
+            logits_mask = logits_mask & (head_size_offsets[None, None, :] < head_size)
 
         # Load partial logits from current chunk of partitions
         partial_logits = tl.load(
@@ -4449,6 +4475,8 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
     num_sequences, num_kv_heads, num_splits = grid
     HEAD_SIZE_POW2 = triton.next_power_of_2(HEAD_SIZE)
     VALUE_HEAD_SIZE_POW2 = triton.next_power_of_2(VALUE_HEAD_SIZE)
+    KEY_HEAD_PADDED = HEAD_SIZE != HEAD_SIZE_POW2
+    VALUE_HEAD_PADDED = VALUE_HEAD_SIZE != VALUE_HEAD_SIZE_POW2
     QUERY_SEQ_LEN_POW2 = triton.next_power_of_2(query_seq_len)
     ONE_QUERY_GROUP_SIZE_POW2 = triton.next_power_of_2(query_group_size)
     KV_COMPUTE_BLOCK_SIZE = CONTEXT_PARTITION_SIZE
@@ -4460,6 +4488,12 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         ONE_SHOT = num_splits <= 1
         if num_kv_heads == 1:
             paged_attention_kernel = paged_attention_decode_sliding_window_head_1
+            # Only this kernel supports independent physical K/V widths.
+            head_size_kwargs = {
+                "KEY_HEAD_SIZE": HEAD_SIZE,
+                "VALUE_HEAD_SIZE": VALUE_HEAD_SIZE,
+                "VALUE_HEAD_SIZE_POW2": VALUE_HEAD_SIZE_POW2,
+            }
             if ONE_QUERY_GROUP_SIZE_POW2 >= 16:
                 grid = (num_sequences, query_seq_len * num_kv_heads, num_splits)
                 QUERY_SEQ_LEN_POW2 = 1
@@ -4472,6 +4506,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
                 QUERY_SEQ_LEN_POW2 = triton.cdiv(QUERY_SEQ_LEN_POW2, mtp_splits)
         else:
             paged_attention_kernel = paged_attention_decode_sliding_window
+            head_size_kwargs = {}
         paged_attention_kernel[grid](
             exp_sums_ptr,
             max_logits_ptr,
@@ -4515,12 +4550,12 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             query_seq_len=query_seq_len,
             query_group_size=query_group_size,
             head_size=HEAD_SIZE,
-            value_head_size=VALUE_HEAD_SIZE,
             COMPUTE_TYPE=COMPUTE_TYPE,
             QUERY_SEQ_LEN_POW2=QUERY_SEQ_LEN_POW2,
             ONE_QUERY_GROUP_SIZE_POW2=ONE_QUERY_GROUP_SIZE_POW2,
             HEAD_SIZE_POW2=HEAD_SIZE_POW2,
-            VALUE_HEAD_SIZE_POW2=VALUE_HEAD_SIZE_POW2,
+            KEY_HEAD_PADDED=KEY_HEAD_PADDED,
+            VALUE_HEAD_PADDED=VALUE_HEAD_PADDED,
             KV_BLOCK_SIZE=KV_BLOCK_SIZE,
             CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
             QUERY_QUANT_MODE=QUERY_QUANT_MODE,
@@ -4531,6 +4566,7 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
             SLIDING_WINDOW=SLIDING_WINDOW,
             CDNA_VERSION=CDNA_VERSION,
             ONE_SHOT=ONE_SHOT,
+            **head_size_kwargs,
         )
         return
 
@@ -4588,6 +4624,8 @@ def _paged_attention_decode_v2_with_dot_kernel_reshape_wrapper(
         QUERY_SEQ_LEN=query_seq_len,
         ONE_QUERY_GROUP_SIZE=query_group_size,
         HEAD_SIZE_POW2=HEAD_SIZE_POW2,
+        KEY_HEAD_PADDED=KEY_HEAD_PADDED,
+        VALUE_HEAD_PADDED=VALUE_HEAD_PADDED,
         KV_BLOCK_SIZE=KV_BLOCK_SIZE,
         CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
         KV_COMPUTE_BLOCK_SIZE=KV_COMPUTE_BLOCK_SIZE,
@@ -4757,6 +4795,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
             OUTPUT_SEQ_LEN=query_seq_len,
             ONE_OUTPUT_GROUP_SIZE=query_group_size,
             HEAD_SIZE_POW2=triton.next_power_of_2(head_size),
+            VALUE_HEAD_PADDED=head_size != triton.next_power_of_2(head_size),
             CONTEXT_PARTITION_SIZE=CONTEXT_PARTITION_SIZE,
             USE_SINKS=sink_token_ptr is not None,
         )
