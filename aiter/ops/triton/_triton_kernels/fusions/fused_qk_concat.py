@@ -61,6 +61,7 @@ _qk_cat_kernel_repr = make_kernel_repr(
         "QH_PER_KH",
         "BLOCK_D1",
         "BLOCK_D2",
+        "NUM_WARPS",
     ],
 )
 
@@ -94,6 +95,7 @@ def _qk_cat_kernel(
     QH_PER_KH: tl.constexpr,
     BLOCK_D1: tl.constexpr,
     BLOCK_D2: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_hq = tl.program_id(1)
@@ -204,6 +206,7 @@ _qk_rope_cat_kernel_repr = make_kernel_repr(
         "BLOCK_D_HALF_pe",
         "REUSE_FREQS_FRONT_PART",
         "IS_NEOX",
+        "NUM_WARPS",
     ],
 )
 
@@ -246,6 +249,7 @@ def _qk_rope_cat_kernel(
     BLOCK_D_nope: tl.constexpr,
     BLOCK_D_pe: tl.constexpr,
     BLOCK_D_HALF_pe: tl.constexpr,
+    NUM_WARPS: tl.constexpr,
 ):
     pid_b = tl.program_id(0)
     pid_hq = tl.program_id(1)

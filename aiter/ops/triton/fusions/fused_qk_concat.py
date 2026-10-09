@@ -55,6 +55,7 @@ def fused_qk_cat(
     k_out = torch.empty((b, kh, d1 + d2), dtype=q1.dtype, device=q1.device)
 
     grid = (b, qh, 1)
+    config = _get_config("FUSED_QK_CAT", b * qh)
 
     _qk_cat_kernel[grid](
         q1,
@@ -72,7 +73,9 @@ def fused_qk_cat(
         QH_PER_KH=qh // kh,
         BLOCK_D1=d1,
         BLOCK_D2=d2,
-        **_get_config("FUSED_QK_CAT", b * qh),
+        # When config sets to NONE, Triton default is 4
+        NUM_WARPS=config.get("num_warps", 4),
+        **config,
     )
 
     return q_out, k_out
@@ -140,6 +143,7 @@ def fused_qk_rope_cat(
     )
 
     grid = (b, qh, 1)
+    config = _get_config("FUSED_QK_ROPE_CAT", b * qh)
 
     _qk_rope_cat_kernel[grid](
         q_nope,
@@ -166,7 +170,9 @@ def fused_qk_rope_cat(
         BLOCK_D_nope=d_nope,
         BLOCK_D_pe=d_pe,
         BLOCK_D_HALF_pe=d_pe // 2,
-        **_get_config("FUSED_QK_ROPE_CAT", b * qh),
+        # When config sets to NONE, Triton default is 4
+        NUM_WARPS=config.get("num_warps", 4),
+        **config,
     )
 
     return q_out, k_out
