@@ -1057,6 +1057,8 @@ def _run_moe_reduction(
     topk_weights=None,
     fp8_scale_blk=None,
     fp8_pitch_align=None,
+    *,
+    streaming_loads=False,
 ):
     """Topk reduction epilogue for stage2 reduce mode."""
     use_mask = expert_mask is not None
@@ -1132,6 +1134,7 @@ def _run_moe_reduction(
         use_weight=use_weight,
         scale_blk=fp8_scale_blk if is_fp8 else None,
         pitch_align=fp8_pitch_align if is_fp8 else None,
+        streaming_loads=streaming_loads,
     )
     _run_compiled(
         reduce_exe,
