@@ -12,4 +12,16 @@
 # `<rule-id>: { ignore: [file.yml:line:col] }`, which keeps a suppression
 # reviewable in one place rather than scattered as inline comments
 # across workflows.
-rules: {}
+rules:
+  dangerous-triggers:
+    ignore:
+      # Metadata-only PR automation; these workflows don't checkout or run PR code.
+      - aiter-triton-board.yaml:24
+      - pr-title-tags.yaml:30
+      - pr-welcome-comment.yaml:3
+  github-app:
+    ignore:
+      # Scoped GitHub App tokens are required for project board, release, and split-test PR automation.
+      - aiter-triton-board.yaml:51
+      - release-automation.yaml:60
+      - update-split-tests.yaml:75
