@@ -64,6 +64,26 @@ y = conv2d(
 )
 ```
 
+### Inference tensors
+
+Convolution weights created inside `torch.inference_mode()` are inference
+tensors and do not have a version counter. AITER therefore repacks those
+weights on every convolution call rather than placing them in the pack cache:
+an in-place update inside inference mode would otherwise reuse stale packed
+data. Merely running a convolution inside `torch.inference_mode()` does not
+disable caching for a normal weight created outside that context.
+
+For repeated inference, create and load long-lived model weights before
+entering inference mode. Such weights remain normal versioned tensors and use
+the existing pack cache even while the forward executes in inference mode:
+
+```python
+w = load_weight()
+
+with torch.inference_mode():
+    y = conv2d(x, w, padding=1)
+```
+
 ### Conv3D
 
 ```python

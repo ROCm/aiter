@@ -1476,7 +1476,8 @@ namespace py = pybind11;
           py::arg("tokens"),                           \
           py::arg("num_experts"),                      \
           py::arg("topk"),                             \
-          py::arg("dispatch_policy") = 0);             \
+          py::arg("dispatch_policy") = 0,              \
+          py::arg("device_id")       = -1);            \
     m.def("moe_sorting_opus_fwd",                      \
           &moe_sorting_opus_fwd,                       \
           py::arg("topk_ids"),                         \
@@ -1695,7 +1696,8 @@ namespace py = pybind11;
           py::arg("group_size")      = 32,                               \
           py::arg("shuffle_scale")   = true,                             \
           py::arg("num_rows")        = std::nullopt,                     \
-          py::arg("num_rows_factor") = 1);                               \
+          py::arg("num_rows_factor") = 1,                                \
+          py::arg("scale_layout_m32k4") = false);                        \
     m.def("dynamic_per_group_scaled_quant_fp4",                          \
           &aiter::dynamic_per_group_scaled_quant_fp4,                    \
           py::arg("out"),                                                \
@@ -1819,7 +1821,8 @@ namespace py = pybind11;
           py::arg("rope_dim"),                                                               \
           py::arg("group_size")    = 32,                                                     \
           py::arg("shuffle_scale") = true,                                                   \
-          py::arg("do_rotate_act") = true);                                                  \
+          py::arg("do_rotate_act") = true,                                                   \
+          py::arg("round_rope")    = false);                                                 \
     m.def("rope_rotate_activation",                                                          \
           &aiter::rope_rotate_activation,                                                    \
           py::arg("out"),                                                                    \
@@ -2510,7 +2513,8 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
-          py::arg("gemma_norm") = false);    \
+          py::arg("gemma_norm") = false,     \
+          py::arg("scale_layout_m32k4") = false); \
     m.def("add_rmsnorm",                     \
           &aiter::add_rmsnorm,               \
           py::arg("out"),                    \
@@ -2529,7 +2533,8 @@ namespace py = pybind11;
           py::arg("epsilon"),                \
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
-          py::arg("gemma_norm") = false);    \
+          py::arg("gemma_norm") = false,     \
+          py::arg("scale_layout_m32k4") = false); \
     m.def("rmsnorm",                         \
           &aiter::rmsnorm,                   \
           py::arg("out"),                    \
@@ -2558,6 +2563,7 @@ namespace py = pybind11;
           py::arg("z"),                                    \
           py::arg("weight"),                               \
           py::arg("epsilon"),                              \
+          py::arg("use_sigmoid") = false,                  \
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                                \

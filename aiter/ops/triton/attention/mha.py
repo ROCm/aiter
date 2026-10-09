@@ -486,6 +486,7 @@ def _gluon_flash_attn_forward(
         RETURN_SCORES=return_softmax,
         HEAD_STRIDE_ALIGN=head_stride_align,
         **config,
+        enable_fp_fusion=True,
     )
 
     return o, softmax_lse, s_dmask
@@ -684,7 +685,14 @@ def _flash_attn_forward(
     else:
         if config is None:
             config = _get_config(
-                enable_dropout, q.dtype, has_pe=pe_head_dim > 0, head_dim_v=v_head_dim
+                enable_dropout,
+                q.dtype,
+                has_pe=pe_head_dim > 0,
+                head_dim_v=v_head_dim,
+                causal=bool(causal),
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
+                batch_heads=batch * num_q_heads,
             )
 
         use_int64_strides = _USE_INT64_STRIDES
@@ -779,6 +787,7 @@ def _flash_attn_forward(
                 and v_strides[1] % 8 == 0
             ),
             **config,
+            enable_fp_fusion=True,
         )
 
     return o, softmax_lse, s_dmask, philox_seed, philox_offset

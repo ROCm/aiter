@@ -18,7 +18,7 @@ both that file and this README in the same PR, so the two stay current.
 ```text
 aiter/ops/triton/
 ├── __init__.py            # public API + _BACKWARD_COMPAT_MAP (legacy flat imports)
-├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/
+├── gemm/                  # GEMM wrappers: basic/, batched/, feed_forward/, fused/, grouped/
 ├── attention/             # MHA, MLA, lean attention, unified attention, ...
 ├── moe/                   # Mixture-of-experts ops
 ├── normalization/         # RMSNorm / LayerNorm and fused add+norm variants
@@ -40,7 +40,9 @@ Public wrapper modules live in the categorized folders; the kernel bodies live
 in `_triton_kernels/` at the same relative category path, or in
 `_gluon_kernels/<arch>/` at the same relative category path when the Gluon
 implementation is architecture-specific.
-Tests mirror the same categories under `op_tests/triton_tests/<category>/`.
+Tests mirror the wrapper folders under `op_tests/triton_tests/`, including
+nested wrapper subpackages (for example,
+`moe/moe_routing/test_moe_routing.py`).
 Kernel bodies are internal: tests, benchmarks, and external code call the
 public wrappers only — never `_triton_kernels/` / `_gluon_kernels/` directly.
 
@@ -91,7 +93,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 #        gfx1250  gluon     moe   a8w4
 ```
 
-`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`.
+`<op>` is one of `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant`.
 The flat, arch-prefixed directories (`configs/gemm/`, `configs/moe/`,
 `configs/conv/`, the loose files at the top of `configs/`) and the fallback
 code that reached them are gone.
@@ -108,11 +110,11 @@ Rules that follow from the layout:
   instead of silently resolving somewhere else.
 - Moves and renames go in a pure `git mv` commit (100% rename similarity),
   with content changes in a follow-up.
-- `kpack` is deprecated on CDNA4: the Triton AMD backend warns and
-  force-overrides `kpack = 1` on gfx950, and the parameter is slated for
-  removal. No gfx950 config carries it and none should; gfx942 configs still
-  may. Existing `kpack` entries in the RDNA trees predate the rule — do not
-  add new ones.
+- `kpack` belongs in gfx942 configs only. The Triton AMD backend deprecates it
+  on CDNA4 — it warns and force-overrides `kpack = 1` on gfx950, and the
+  parameter is slated for removal — gfx1250 does not support it, and on the
+  RDNA targets (gfx11xx, gfx120x) it is a no-op. No other arch's tree carries
+  it; do not add it to one.
 
 All of it is built by one function in `utils/config_utils.py`:
 
@@ -141,10 +143,21 @@ module on top of it, and every function has exactly one home:
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config` |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` — the only MOE config fetcher |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config` |
+| `utils/quant_config_utils.py` | `get_quant_config` — Gluon quant launch configs |
 
 Attention and GMM kernels read their single `DEFAULT.json` straight off the
 core (`resolve_config_dir()` + `load_config_json()`); a family module earns
 its place once a family grows real selection logic.
+
+GMM's `get_config()` (`_triton_kernels/gmm.py`) supports an optional
+`"dispatch"` list per variant: each rule is
+`{"config": <name>, "min_K": int, "min_N": int, "min_avg_rows_per_group": int}`
+(omitted thresholds are 0), and the first rule with `K >= min_K`,
+`N >= min_N` and `M >= min_avg_rows_per_group * G` returns the named config
+from the same variant section. Rows are averaged (`M / G`) because the actual
+`group_sizes` stay on the device. Rules are skipped when `accumulate=True`;
+with no match, or no `"dispatch"` key, the variant's `"default"` (or
+`"accumulate"`) config is used.
 
 ### How GEMM configs resolve — `get_gemm_config()`
 
@@ -236,7 +249,9 @@ place the layout is encoded, and it goes stale silently.
 Flat dispatch tables whose keys mean “value less than or equal to this upper
 bound” use `select_leq_config(configs, value, prefix="N_LEQ_")`. It selects
 the smallest matching numeric bound and falls back to `any`, returning a copy
-that the caller may consume. Do not duplicate this selection loop in wrappers.
+that the caller may consume. Tables keyed on several axes use
+`select_leq_config(table, axes=("M", "N"), M=m, N=n)` with keys such as
+`M_LEQ_32.N_LEQ_1024`. Do not duplicate this selection loop in wrappers.
 
 Kernels that carry a Python autotune search space (opt-in tuning) pin their
 single default tile per arch via
@@ -445,8 +460,8 @@ never call `logging.basicConfig(...)` from library code.
 
 ## Tests
 
-Tests live under `op_tests/triton_tests/<category>/`, mirroring this
-directory's categories:
+Tests live under `op_tests/triton_tests/`, mirroring the wrapper folder
+structure in this directory, including nested wrapper subpackages:
 
 ```bash
 pytest op_tests/triton_tests/              # everything
@@ -477,3 +492,47 @@ pytest op_tests/triton_tests/gemm/basic/   # one subset
 - Unit test under `op_tests/triton_tests/<category>/` and a benchmark script
   under `op_tests/op_benchmarks/triton/bench_<op>.py` — a kernel ships as
   kernel + wrapper + test + benchmark.
+
+## PR Checklist
+
+- The PR must have a clear description covering the following topics:
+  - **Motivation:** What's the purpose of the PR? Are you fixing something that is broken? Why are
+    you adding a new feature? Are you shipping an optimization?
+  - **Technical details:** Describe the implementation details in prose since the diff hunk already
+    has the code changes. You can include important code snippets, but please be brief. It's nice to
+    document edge cases and uncovered scenarios. Focus on the hard parts of the code and provide
+    guidance to the reviewers (what's the trickiest part, what to pay attention to). Add performance
+    data for optimizations, as well as documentation of the benchmark procedures.
+  - **Test plan:** How can you guarantee that the proposed changes are correct, both in terms of
+    functionality and performance? Does everything that worked before still work? Pay attention to
+    GPU architectures other than your target.
+  - **Test results:** Share the outcome of your test plan.
+- Be responsible for your PR:
+  - You, as the PR author, should be listed in the **Assignees** field. Add someone else from your
+    team if you're going to be absent (vacation, PTO, extended holidays) and hand over to them the
+    responsibility for moving the PR forward
+  - Be a responsive collaborator. Answer questions asked by reviewers and address the suggestions
+    that make sense. Code owners can, and will, close the PR if it's stale for a long time.
+  - Do not let your coding agents open a PR and leave it rotting. Please follow along.
+- Add labels:
+  - The **Triton/Gluon** label is added automatically based on the changed files, making related PRs
+    easy for maintainers to find. Please double check if **Triton/Gluon** label is automatically
+    added and do it manually if it's absent.
+  - **gfx942** Triton CI is now opt-in, add **ci:triton-300x** label if you are touching anything
+    **gfx942**-related.
+- PR size:
+  - Do not blindly submit a giant AI-slop mess. Code owners will close the PR if they judge it
+    unreviewable.
+  - Prefer many small PRs over a single giant PR. Structure your code changes in a logical way,
+    starting from the foundations. You can use a series of stacked PRs to build the final desired
+    outcome incrementally.
+- Perform an initial self-review to catch basic mistakes before requesting a review from someone
+  else. Reviewer time is precious in the age of agentic coding tools.
+- Sometimes, as the PR evolves, its title and description get outdated. Please double check if the
+  PR information is up to date before merging.
+- Open the PR from [AITER ROCm fork](https://github.com/ROCm/aiter). Open the PR from your own fork
+  only if you don't have access to AITER ROCm fork.
+- Strip the **Co-authored-by: AI agent** part of your commits before merging.
+
+**Warning:** PRs that don't comply with the checklist won't be reviewed or merged. Please be a good
+AITER citizen and follow best practices.
