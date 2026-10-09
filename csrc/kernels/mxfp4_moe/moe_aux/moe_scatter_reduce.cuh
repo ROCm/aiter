@@ -37,6 +37,7 @@ __global__ void scatter_reduce_kernel_impl(
     #pragma unroll
     for (int i = 0; i < TOPK; i++) {
         int sorted_pos = reverse_sorted[token * TOPK + i];
+        if (sorted_pos < 0) continue; // EP: route to a remote expert
         const float w = sorted_weights[sorted_pos];
 
         #pragma unroll
@@ -124,6 +125,7 @@ __global__ void scatter_reduce_mxfp4_kernel(
     #pragma unroll
     for (int i = 0; i < TOPK; i++) {
         const int sorted_pos = reverse_sorted[token * TOPK + i];
+        if (sorted_pos < 0) continue; // EP: route to a remote expert
         const float w = sorted_weights[sorted_pos];
         const uint32_t sw = *reinterpret_cast<const uint32_t*>(
             &flat_out_scale[(long long)sorted_pos * SCOLS + (blk & ~3)]);
