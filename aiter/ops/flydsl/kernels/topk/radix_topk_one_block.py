@@ -221,30 +221,21 @@ def build_radix_topk_one_block_module(
         scan: block_scan.SharedStorage
         metadata: fx.Array[fx.Int32, _METADATA_SIZE, 16]
 
-    @flyc.kernel(
-        name=(
-            f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
-            f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
-            f"_v{int(write_values)}_s{int(stable)}_m{int(map_indices)}"
-            f"_p{int(partial)}_ds{int(decode_split)}"
-            f"_dv{int(write_direct_values)}_skip{int(skip_empty)}"
-        ),
-        known_block_size=[block_threads, 1, 1],
-    )
-    def radix_topk_one_block_kernel(
+    @flyc.jit
+    def run_one_block_body(
         input: fx.Tensor,
-        row_starts: fx.Tensor,
-        row_ends: fx.Tensor,
         indices: fx.Tensor,
         value_output: fx.Tensor,
         index_labels: fx.Tensor,
         direct_indices: fx.Tensor,
         direct_value_output: fx.Tensor,
-        width: fx.Int32,
-        next_n: fx.Int32,
-        num_parts: fx.Int32,
+        row,
+        part,
+        row_start,
+        row_end,
+        output_base,
+        direct_row,
     ):
-        block = fx.Int32(fx.block_idx.x)
         tid = fx.thread_idx.x
         lane = tid % wave_size
 
@@ -254,42 +245,6 @@ def build_radix_topk_one_block_module(
         block_size = fx.Int32(block_threads)
         top_k = fx.Int32(k)
         sign_bit = fx.Int32(-2147483648)
-        active = True
-
-        # Row bounds
-        if const_expr(decode_split):
-            (
-                row,
-                part,
-                row_start,
-                row_end,
-                output_base,
-                active,
-                direct_row,
-            ) = decode_geometry(
-                block,
-                tid,
-                row_ends,
-                index_labels,
-                width,
-                next_n,
-                num_parts,
-            )
-        elif const_expr(is_decode):
-            row = block
-            part = zero
-            full_len = _row_length(row, row_ends, width, next_n)
-            direct_row = False
-            row_start = zero
-            row_end = full_len
-            output_base = zero
-        else:
-            row = block
-            part = zero
-            direct_row = False
-            row_start = row_starts[row]
-            row_end = row_ends[row]
-            output_base = zero
         row_len = row_end - row_start
         full_vector_count = row_len // vec_width
 
@@ -1441,44 +1396,118 @@ def build_radix_topk_one_block_module(
             else:
                 write_direct_vector(row_indices, row_values)
 
-        # Kernel control flow
-        if active:
-            if row_len <= top_k:
-                if const_expr(skip_empty):
-                    if row_len > zero:
-                        write_direct_output(row_indices, row_values)
-                else:
-                    write_direct_output(row_indices, row_values)
+        # Body control flow
+        if row_len <= top_k:
+            write_direct_output(row_indices, row_values)
 
-            if row_len > top_k:
-                if tid < _METADATA_SIZE:
-                    metadata[tid] = zero
-                gpu.barrier()
+        if row_len > top_k:
+            if tid < _METADATA_SIZE:
+                metadata[tid] = zero
+            gpu.barrier()
 
-                if const_expr(short_rows):
+            if const_expr(short_rows):
+                run_cached_path(short_histograms)
+            else:
+                if row_len <= fx.Int32(_COMPACT_CAPACITY):
                     run_cached_path(short_histograms)
                 else:
-                    if row_len <= fx.Int32(_COMPACT_CAPACITY):
-                        run_cached_path(short_histograms)
-                    else:
-                        run_streaming_path(
-                            long_histograms,
-                            histogram,
-                            candidate_ordered_keys,
-                            candidate_local_indices,
-                            staged_local_indices,
-                        )
+                    run_streaming_path(
+                        long_histograms,
+                        histogram,
+                        candidate_ordered_keys,
+                        candidate_local_indices,
+                        staged_local_indices,
+                    )
 
-            if const_expr(decode_split):
-                direct_epilogue(
-                    part,
-                    direct_row,
-                    tid,
-                    row_indices,
-                    row_values,
-                    row_direct_indices,
-                    row_direct_values,
-                )
+        if const_expr(decode_split):
+            direct_epilogue(
+                part,
+                direct_row,
+                tid,
+                row_indices,
+                row_values,
+                row_direct_indices,
+                row_direct_values,
+            )
+
+    @flyc.kernel(
+        name=(
+            f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
+            f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
+            f"_v{int(write_values)}_s{int(stable)}_m{int(map_indices)}"
+            f"_p{int(partial)}_ds{int(decode_split)}"
+            f"_dv{int(write_direct_values)}_skip{int(skip_empty)}"
+        ),
+        known_block_size=[block_threads, 1, 1],
+    )
+    def radix_topk_one_block_kernel(
+        input: fx.Tensor,
+        row_starts: fx.Tensor,
+        row_ends: fx.Tensor,
+        indices: fx.Tensor,
+        value_output: fx.Tensor,
+        index_labels: fx.Tensor,
+        direct_indices: fx.Tensor,
+        direct_value_output: fx.Tensor,
+        width: fx.Int32,
+        next_n: fx.Int32,
+        num_parts: fx.Int32,
+    ):
+        block = fx.Int32(fx.block_idx.x)
+        active = True
+
+        if const_expr(decode_split):
+            (
+                row,
+                part,
+                row_start,
+                row_end,
+                output_base,
+                active,
+                direct_row,
+            ) = decode_geometry(
+                block,
+                fx.thread_idx.x,
+                row_ends,
+                index_labels,
+                width,
+                next_n,
+                num_parts,
+            )
+        elif const_expr(is_decode):
+            row = block
+            part = fx.Int32(0)
+            direct_row = False
+            row_start = fx.Int32(0)
+            row_end = _row_length(row, row_ends, width, next_n)
+            output_base = fx.Int32(0)
+        else:
+            row = block
+            part = fx.Int32(0)
+            direct_row = False
+            row_start = row_starts[row]
+            row_end = row_ends[row]
+            output_base = fx.Int32(0)
+
+        if const_expr(skip_empty):
+            active = active & ((row_end - row_start) > fx.Int32(0))
+
+        # The guard is CTA-uniform: it depends only on block geometry and row bounds.
+        if active:
+            run_one_block_body(
+                input,
+                indices,
+                value_output,
+                index_labels,
+                direct_indices,
+                direct_value_output,
+                row,
+                part,
+                row_start,
+                row_end,
+                output_base,
+                direct_row,
+            )
 
     @flyc.jit
     def launch_radix_topk_one_block(
