@@ -261,4 +261,4 @@ def make_moonep_weight_prefetch_fast_jit(
     return launch
 
 
-__all__ = ["make_moonep_weight_prefetch_fast_jit", "DEFAULT_LOADS_IN_FLIGHT"]
+__all__ = ["DEFAULT_LOADS_IN_FLIGHT", "make_moonep_weight_prefetch_fast_jit"]

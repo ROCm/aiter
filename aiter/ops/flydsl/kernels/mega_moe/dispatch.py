@@ -1401,16 +1401,16 @@ def emit_dispatch_plan(
     fx.rocdl.s_waitcnt(0)
     fx.barrier()
 
-    plan_args = dict(
-        a_se=a_se, a_trb=a_trb, a_tib=a_tib, a_sm=a_sm, a_nv=a_nv, a_bc=a_bc,
-        a_tile_ready=a_tile_ready, a_tile_expected=a_tile_expected,
-        a_expert_tile_end=a_expert_tile_end, a_max_expert_tiles=a_max_expert_tiles,
-        p_plan_ready=p_plan_ready, addr_pair_config=addr_pair_config,
-        parity=parity, expected=expected, lane=lane,
-        fz_npes=fz_npes, fz_epr=fz_epr, fz_mtpr=fz_mtpr, fz_rank=fz_rank,
-        fz_tile_m=fz_tile_m, fz_total_experts=fz_total_experts,
-        count_stride=count_stride, payload_chunk_rows=payload_chunk_rows,
-    )
+    plan_args = {
+        "a_se": a_se, "a_trb": a_trb, "a_tib": a_tib, "a_sm": a_sm, "a_nv": a_nv, "a_bc": a_bc,
+        "a_tile_ready": a_tile_ready, "a_tile_expected": a_tile_expected,
+        "a_expert_tile_end": a_expert_tile_end, "a_max_expert_tiles": a_max_expert_tiles,
+        "p_plan_ready": p_plan_ready, "addr_pair_config": addr_pair_config,
+        "parity": parity, "expected": expected, "lane": lane,
+        "fz_npes": fz_npes, "fz_epr": fz_epr, "fz_mtpr": fz_mtpr, "fz_rank": fz_rank,
+        "fz_tile_m": fz_tile_m, "fz_total_experts": fz_total_experts,
+        "count_stride": count_stride, "payload_chunk_rows": payload_chunk_rows,
+    }
     if const_expr(not moonep):
         # Warp 0 plans local experts after all source matrices arrive.
         if warp == fx.Int32(0):
