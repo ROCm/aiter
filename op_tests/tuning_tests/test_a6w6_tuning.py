@@ -249,7 +249,7 @@ class TestA6W6Manifest(unittest.TestCase):
         self.assertTrue({"exact_M", "exact_N", "exact_K"}.issubset(configs.columns))
         exact_columns = ["exact_M", "exact_N", "exact_K"]
         specialized = configs[(configs[exact_columns] > 0).all(axis=1)]
-        self.assertEqual(len(specialized), 3)
+        self.assertEqual(len(specialized), 30)
         generic = configs[(configs[exact_columns] == 0).all(axis=1)]
         self.assertEqual(len(specialized) + len(generic), len(configs))
         self.assertTrue((generic[exact_columns] == 0).all().all())
