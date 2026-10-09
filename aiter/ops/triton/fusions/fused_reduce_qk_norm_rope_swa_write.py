@@ -7,8 +7,8 @@ import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_reduce_qk_norm_rope_swa_write import (
     _fused_reduce_qk_norm_rope_swa_write_kernel,
+    _get_config,
 )
-from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -22,6 +22,10 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     grids (large ``num_local_heads``) amortize per-program constant work
     (cos/sin offset prep, etc.) better with larger BM; small head grids need
     more M-tiles for occupancy, which favors smaller BM.
+
+    Arches with a ``fused_reduce_qk_norm_rope_swa_write`` config (gfx950) take the
+    target BM, ``num_warps`` and ``waves_per_eu`` from it; the split-K cap and the
+    shrink to M below still apply.
     """
     # Register-pressure cap from the splitk fp32 q-tile.
     if num_splitk >= 4:
@@ -31,14 +35,20 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     else:
         cap = 16
 
-    is_gfx950 = arch_info.get_arch() == "gfx950"
-
-    if num_local_heads >= 64:
-        target = 8 if is_gfx950 else 16
-    elif num_local_heads >= 16:
-        target = 8
+    config = _get_config(num_local_heads)
+    if config is None:
+        if num_local_heads >= 64:
+            target = 16
+        elif num_local_heads >= 16:
+            target = 8
+        else:
+            target = 4
+        num_warps = 4
+        waves_per_eu = 1
     else:
-        target = 4
+        target = config["BLOCK_SIZE_M"]
+        num_warps = config["num_warps"]
+        waves_per_eu = config["waves_per_eu"]
 
     bm = min(target, cap)
 
@@ -46,10 +56,6 @@ def _pick_block_size_m(M: int, num_local_heads: int, num_splitk: int) -> int:
     # masking overhead for the whole tile.
     while bm > 1 and bm > M:
         bm //= 2
-
-    num_warps = 4
-    # Tuned on gfx950 only, other archs keep 1.
-    waves_per_eu = 0 if is_gfx950 else 1
 
     return bm, num_warps, waves_per_eu
 
