@@ -2,7 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Fused TP MegaMoE kernel (a4w4, gfx950): the fused tail norm, the wave roles, the
 kernel entry and its launcher. The device code is built per instance by the build_*
-parts (comm, gemm, schedule) over one shared KernelCtx."""
+parts (communication, gemm, schedule) over one shared KernelCtx."""
 
 from __future__ import annotations
 
@@ -15,7 +15,6 @@ from flydsl.expr import gpu, range_constexpr
 from flydsl.expr import math as fmath
 
 from ..kernels_common import ceildiv
-from .comm import build_comm
 from .common import (
     AUX_SYS,
     MAX_TP,
@@ -39,6 +38,7 @@ from .common import (
     wait_vm,
     wave_red,
 )
+from .communication import build_communication
 from .gemm import build_gemm
 from .mega_moe_tp_config import (
     C_EPOCH,
@@ -115,7 +115,7 @@ def compile_mega_moe_tp(
         rank into qall / sall; tn 2: the bf16 normed rows too (qall after the FP8 rows).
     """
     kc = kernel_config(**locals())
-    kc.add(build_comm(kc))
+    kc.add(build_communication(kc))
     kc.add(build_gemm(kc))
     kc.add(build_schedule(kc))
     AG8, ARLL, DLL, L_CTL, L_RING, LBPF = kc.get("AG8 ARLL DLL L_CTL L_RING LBPF")

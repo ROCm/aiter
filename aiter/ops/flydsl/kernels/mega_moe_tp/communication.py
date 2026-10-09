@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Per-instance device helpers (ctrl / peer addressing, LL packets, barriers, route
-gather) and the communication: input all-gather (dispatch) and the ReduceScatter /
-all-reduce of the GEMM2 partials (combine), comm wave roles, per-launch init / finish.
-"""
+"""Per-instance device helpers (ctrl / peer addressing, LL packets, barriers, error
+reports, route gather) and the communication: the input all-gather, and the
+ReduceScatter of the GEMM2 partials (ar: plus the all-gather of the sums) with its
+final sums, LL packets, comm wave roles and the per-launch init / finish."""
 
 from __future__ import annotations
 
@@ -120,8 +120,8 @@ from .mega_moe_tp_config import (
 )
 
 
-def build_comm(kc: KernelCtx) -> dict:
-    """The comm device functions of one instance (added to kc)."""
+def build_communication(kc: KernelCtx) -> dict:
+    """The communication device functions of one instance (added to kc)."""
     ACB, AG8, ARLL, CW, DLL, E, H, I = kc.get("ACB AG8 ARLL CW DLL E H I")
     L_CTL, L_DCNT, L_DPRE, L_DYN = kc.get("L_CTL L_DCNT L_DPRE L_DYN")
     L_INTER, L_INTERS, L_RIX, L_WT, MLL = kc.get("L_INTER L_INTERS L_RIX L_WT MLL")
