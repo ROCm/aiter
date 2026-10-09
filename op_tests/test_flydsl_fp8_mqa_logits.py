@@ -597,7 +597,7 @@ Case = namedtuple(
 )
 
 
-def _log_speedup(ratios):
+def _log_speedup(ratios, output_file=None):
     """Headline FlyDSL-over-reference figure for a bench sweep.
 
     Geometric mean, because these are ratios: an arithmetic mean over a sweep
@@ -617,6 +617,12 @@ def _log_speedup(ratios):
         r.max(),
         int(r.gt(1).sum()),
     )
+    with open(output_file, "a") as file:
+        line = (
+            f"\n\nfp8_mqa_logits bench: FlyDSL speedup over {REF_IMPL} on {len(r)} of {len(ratios)} cases: "  
+            f"geomean={float(np.exp(np.log(r).mean())):.2f} min={r.min():.2f} max={r.max():.2f}, FlyDSL faster on {int(r.gt(1).sum())} (>1 is faster)"
+        )
+        file.write(line)
 
 
 def _cp_eligible(s_q, s_k):
@@ -899,6 +905,12 @@ def main():
         default=["causal", "cp", "misaligned", "empty", "past_end"],
         choices=["causal", "cp", "misaligned", "empty", "past_end", "batch_causal"],
     )
+    parser.add_argument(
+        "-o",
+        "--output",
+        type=str,
+        default=None,
+    )
     args = parser.parse_args()
 
     if args.shapes_csv:
@@ -977,8 +989,21 @@ def main():
             scenario,
             df.to_markdown(index=False),
         )
+
+        # Write optionally the data frame to a file.
+        if args.output is not None:
+            from pathlib import Path
+            path = Path(args.output)
+            base_dir = path.parent
+            if not Path.exists(base_dir):
+                Path.mkdir(base_dir, parents=True)
+            with open(args.output, "w") as file:
+                table = f"fp8_mqa_logits {scenario} summary:\n{df.to_markdown(index=False)}"
+                file.write(table)
+
         if "speedup" in df:
-            _log_speedup(df["speedup"])
+            _log_speedup(df["speedup"], args.output)
+
 
     if failures:
         aiter.logger.error(
