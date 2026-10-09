@@ -988,7 +988,7 @@ def run_candidates(inp, cu, rb, ls, le, batch, n_logits, seed, local_starts=True
         ret[f"{v.name} ctas"] = plan.num_ctas
         for k, val in score(ours, inp, rb, ls, le, total_q, n_logits, seed).items():
             ret[f"{v.name} {k}"] = val
-        del plan, out, buffers
+        del ours, plan, out, buffers
         torch.cuda.empty_cache()
     return ret
 
@@ -1192,9 +1192,12 @@ def main():
                 )
     if "fresh" in modes:
         for b, q in itertools.product(args.batch, args.total_q):
-            if q < b:
-                parser.error(f"--total-q {q} gives fewer than one row per --batch {b}")
-    if "decode" in modes and any(f < 0 or f > 1 for f in args.long_frac):
+            if q % b:
+                parser.error(
+                    f"fresh prefill splits --total-q evenly: {q} is not a multiple of "
+                    f"--batch {b}"
+                )
+    if "decode" in modes and any(not 0 <= f <= 1 for f in args.long_frac):
         parser.error("--long-frac values must be in [0, 1]")
     if any(
         v < 1
