@@ -40,7 +40,7 @@ KEYS = [
 ]
 
 
-def shape_row(**changes: dict[str, Any]) -> dict[str, Any]:
+def shape_row(**changes: Any) -> dict[str, Any]:
     row = {
         "gfx": "gfx950",
         "cu_num": 256,

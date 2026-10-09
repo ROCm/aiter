@@ -59,6 +59,7 @@ from aiter.ops.flydsl.moe_common import (
     get_flydsl_activation_name,
 )
 from aiter.ops.flydsl.moe_kernels import (
+    build_flydslv2_gemm2_name,
     flydsl_moe_stage1,
     flydsl_moe_stage2,
     get_flydsl_stage1_kernels,
@@ -6536,6 +6537,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return valid
 
     def _valid_saved_pair(self, row: "dict[str, Any] | pd.Series") -> "bool":
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
+        from aiter.ops.flydsl.mxfp4_gemm2_kernels import (
+            _assert_supported as _assert_native_g2_supported,
+        )
+        from aiter.ops.flydsl.mxfp4_kname import native_scale_layout_for
+        from aiter.ops.moe_mxfp4_aux import is_mxfp4_moe_scatter_supported
+
         try:
             self._validate_row(row)
             if any(
@@ -6550,20 +6558,88 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 or g1["out_dtype"] != precision
                 or g1["act"] != self._row_act(row)
                 or float(row["block_m"]) != g1["BM"]
+                or g1["splitk"]
+                or g1["enable_bias"]
             ):
                 return False
+            _assert_supported(
+                D_HIDDEN=int(row["model_dim"]),
+                D_INTER=int(row["inter_dim"]),
+                BM=g1["BM"],
+                BN=g1["BN"],
+                BK=g1["BK"],
+                use_nt=g1["use_nt"],
+                inline_quant=g1["inline_quant"],
+                prefetch_hidden=g1["prefetch_hidden"],
+                a_dtype=g1["a_dtype"],
+                out_dtype=g1["out_dtype"],
+                act=g1["act"],
+                situ_beta=DEFAULT_SITUV2_BETA,
+                situ_linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
+                num_waves=g1["num_waves"],
+                k_wave=g1["k_wave"],
+                native_scale_layout=native_scale_layout_for(g1["BM"], precision),
+            )
             g2 = parse_flydsl_v2_gemm2_kernel(row["kernelName2"])
             if g2 is not None:
+                if g2["bf16_lds"] is not None or g2["spart"] is not None:
+                    return False
+                canonical_g2 = build_flydslv2_gemm2_name(
+                    g2["a_dtype"],
+                    g2["b_dtype"],
+                    g2["out_dtype"],
+                    tm=g2["tile_m"],
+                    tn=g2["tile_n"],
+                    tk=g2["tile_k"],
+                    epilog=g2["epilog"],
+                    persist=g2["persist"],
+                    use_nt=g2["use_nt"],
+                    sbm=g2["sort_block_m"] or g2["tile_m"],
+                )
+                supported_g2 = get_flydsl_stage2_v2_kernels(
+                    precision,
+                    "fp4",
+                    "bf16",
+                    g1["BM"],
+                    model_dim=int(row["model_dim"]),
+                    inter_dim=int(row["inter_dim"]),
+                )
                 return (
                     (g2["a_dtype"], g2["b_dtype"], g2["out_dtype"])
                     == (precision, "fp4", "bf16")
                     and g1["BM"] == g2["tile_m"]
                     and g1["BM"] == (g2["sort_block_m"] or g2["tile_m"])
+                    and canonical_g2 in supported_g2
+                    and (
+                        g2["epilog"] != "scatter"
+                        or is_mxfp4_moe_scatter_supported(
+                            int(row["model_dim"]), int(row["topk"])
+                        )
+                    )
                 )
             # Native legacy GEMM2 names encode the original FP4 A/W contract.
             g2_native = parse_g2_kname_any(row["kernelName2"])
-            return precision == "fp4" and g1["BM"] == g2_native["BM"]
-        except (ArgumentTypeError, KeyError, TypeError, ValueError):
+            if precision != "fp4" or g1["BM"] != g2_native["BM"]:
+                return False
+            _assert_native_g2_supported(
+                NE=int(row["expert"]),
+                D_HIDDEN=int(row["model_dim"]),
+                D_INTER=int(row["inter_dim"]),
+                topk=int(row["topk"]),
+                BM=g2_native["BM"],
+                use_nt=g2_native["use_nt"],
+                atomic=g2_native["atomic"],
+                mxfp4out=g2_native["mxfp4out"],
+                cshuffle=g2_native["cshuffle"],
+            )
+            return True
+        except (
+            ArgumentTypeError,
+            KeyError,
+            NotImplementedError,
+            TypeError,
+            ValueError,
+        ):
             return False
 
     @staticmethod
