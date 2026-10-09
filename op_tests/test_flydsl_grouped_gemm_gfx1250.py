@@ -32,6 +32,9 @@ import os
 import sys
 from contextlib import nullcontext
 
+# Prefer the sources beside this test over an installed AITER checkout.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pytest
 import torch
 
@@ -238,6 +241,114 @@ def _torch_moe_ref(
 # ---------------------------------------------------------------------------
 # Mock data builders
 # ---------------------------------------------------------------------------
+
+
+def _decode_scale(raw, scale_format):
+    if scale_format == 0:
+        return fp4_utils.e8m0_to_f32(raw)
+    if scale_format == 2:
+        return raw.view(torch.float8_e4m3fn).float()
+    bias = 15
+    raw = raw.to(torch.int32)
+    exponent, mantissa = raw >> 3, raw & 7
+    return torch.where(
+        exponent == 0,
+        mantissa.float() * 2.0 ** (1 - bias - 3),
+        (1.0 + mantissa.float() / 8) * torch.exp2((exponent - bias).float()),
+    )
+
+
+def _encode_scale(value, scale_format):
+    if scale_format == 0:
+        return fp4_utils.fp4_f32_to_e8m0_scale(value * 6).view(torch.uint8)
+    if scale_format == 2:
+        return value.clamp(0, 448).to(torch.float8_e4m3fn).view(torch.uint8)
+    bias = 15
+    value = value.clamp(0, 114688.0 if scale_format == 1 else 448.0).contiguous()
+    bits = value.view(torch.int32)
+    normal = ((bits + 0x7FFFF + ((bits >> 20) & 1)) >> 20) - ((127 - bias) << 3)
+    denorm = torch.round(value * 2.0 ** (bias + 2)).int()
+    return (
+        torch.where(value < 2.0 ** (1 - bias), denorm, normal)
+        .clamp(0, 254 if scale_format == 1 else 126)
+        .to(torch.uint8)
+    )
+
+
+def _quant_dequant_fp4(x, block_size, scale_format, global_scale):
+    shape = x.shape
+    blocks = x.float().reshape(-1, block_size)
+    raw = _encode_scale(blocks.abs().amax(-1) / (6 * global_scale), scale_format)
+    scale = _decode_scale(raw, scale_format) * global_scale
+    divisor = torch.where(raw == 0, torch.ones_like(scale), scale)
+    normalized = blocks * torch.reciprocal(divisor[:, None])
+    packed = fp4_utils.f32_to_mxfp4(normalized)
+    return (fp4_utils.mxfp4_to_f32(packed) * scale[:, None]).reshape(shape)
+
+
+def _torch_moe_ref_scaled(
+    hidden,
+    w1,
+    s1,
+    b1,
+    w2,
+    s2,
+    b2,
+    topk_w,
+    topk_id,
+    *,
+    block_size,
+    format_a,
+    format_b,
+    globals_,
+    activation,
+    limit,
+    situ_beta,
+    situ_linear_beta,
+):
+    T, topk = topk_id.shape
+    E, K, ip = w2.shape
+    inter = ip * 2
+    ga1, ga2, gw1, gw2 = globals_
+    h = _quant_dequant_fp4(hidden, block_size, format_a, ga1)
+    mid = torch.zeros((T, topk, inter), dtype=torch.bfloat16)
+    for e in range(E):
+        mask = topk_id == e
+        if not mask.any():
+            continue
+        tokens = mask.nonzero()[:, 0]
+        weight = fp4_utils.mxfp4_to_f32(w1[e]).reshape(2 * inter, -1, block_size)
+        weight = (weight * (_decode_scale(s1[e], format_b) * gw1)[:, :, None]).reshape(
+            2 * inter, K
+        )
+        gu = h[tokens] @ weight.T + b1[e]
+        g, u = gu.chunk(2, -1)
+        if activation == ActivationType.Situv2:
+            from aiter.fused_moe import situv2
+
+            value = situv2(g, u, beta=situ_beta, linear_beta=situ_linear_beta)
+        else:
+            g, u = g.clamp(max=limit), u.clamp(-limit, limit)
+            value = (
+                g * torch.sigmoid(g * 1.702) * (u + 1)
+                if activation == ActivationType.Swiglu
+                else torch.nn.functional.silu(g) * u
+            )
+        mid[mask] = value.to(torch.bfloat16)
+    mid = _quant_dequant_fp4(mid, block_size, format_a, ga2)
+    routes = torch.zeros((T, topk, K), dtype=torch.bfloat16)
+    for e in range(E):
+        mask = topk_id == e
+        if not mask.any():
+            continue
+        weight = fp4_utils.mxfp4_to_f32(w2[e]).reshape(K, -1, block_size)
+        weight = (weight * (_decode_scale(s2[e], format_b) * gw2)[:, :, None]).reshape(
+            K, inter
+        )
+        routes[mask] = (mid[mask] @ weight.T + b2[e]).to(torch.bfloat16)
+    return (routes.float() * topk_w.float()[:, :, None]).sum(1).to(torch.bfloat16)
+
+
 def _pattern_packed(
     experts: int, rows: int, k_pack: int, *, const_init: float | None = None
 ) -> torch.Tensor:
@@ -333,6 +444,13 @@ def _run_grouped_via_fused_moe(
     warmup: int = 5,
     iters: int = 101,
     const_init: float | None = None,
+    scale_block_size: int = 32,
+    scale_format_a: int = 0,
+    scale_format_b: int = 0,
+    global_scale_a1: float = 1.0,
+    global_scale_a2: float = 1.0,
+    global_scale_w1: float = 1.0,
+    global_scale_w2: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor, float | None, dict | None]:
     """Build mxfp4 weights + routing, dispatch through ``fused_moe``.
 
@@ -363,11 +481,23 @@ def _run_grouped_via_fused_moe(
     w1_logical = _pattern_packed(experts, 2 * inter, K_pack, const_init=const_init)
     w2_logical = _pattern_packed(experts, K, inter_pack, const_init=const_init)
     w1_scale_raw = init_weight_scales(
-        experts, 2 * inter, K // SCALE_BLOCK, const_init=const_init
+        experts, 2 * inter, K // scale_block_size, const_init=const_init
     )
     w2_scale_raw = init_weight_scales(
-        experts, K, inter // SCALE_BLOCK, const_init=const_init
+        experts, K, inter // scale_block_size, const_init=const_init
     )
+    if scale_format_b and const_init is None:
+        # Exercise mantissa bits as well as different adjacent K16 scales.
+        w1_scale_raw = _encode_scale(
+            fp4_utils.e8m0_to_f32(w1_scale_raw)
+            * (0.75 + torch.rand(w1_scale_raw.shape) * 0.5),
+            scale_format_b,
+        )
+        w2_scale_raw = _encode_scale(
+            fp4_utils.e8m0_to_f32(w2_scale_raw)
+            * (0.75 + torch.rand(w2_scale_raw.shape) * 0.5),
+            scale_format_b,
+        )
     if use_bias:
         if const_init is not None:
             bias1 = torch.full((experts, 2 * inter), float(const_init))
@@ -412,8 +542,13 @@ def _run_grouped_via_fused_moe(
         experts_cnt=experts,
         is_guinterleave=True,
         gate_up=True,
+        scale_block_size=scale_block_size,
     )
-    w2_scale = moe_shuffle_scale(w2_scale_raw.contiguous(), experts_cnt=experts)
+    w2_scale = moe_shuffle_scale(
+        w2_scale_raw.contiguous(),
+        experts_cnt=experts,
+        scale_block_size=scale_block_size,
+    )
 
     if data_format == "a4w4":
         w1_arg = w1_grouped.view(dtypes.fp4x2)
@@ -440,6 +575,13 @@ def _run_grouped_via_fused_moe(
             swiglu_limit=swiglu_limit,
             beta=situ_beta,
             linear_beta=situ_linear_beta,
+            fp4_scale_block_size=scale_block_size,
+            fp4_scale_format_a=scale_format_a,
+            fp4_scale_format_b=scale_format_b,
+            fp4_global_scale_a1=global_scale_a1,
+            fp4_global_scale_a2=global_scale_a2,
+            fp4_global_scale_w1=global_scale_w1,
+            fp4_global_scale_w2=global_scale_w2,
         )
 
     torch.cuda.synchronize()
@@ -468,8 +610,7 @@ def _run_grouped_via_fused_moe(
             )
             kernel_us[_name] = _us
     elif bench:
-        # Bench: validate + time the CUDA-graph (production) path. The returned
-        # data is the graph-captured output.
+        # Bench: validate + time the eager end-to-end kernel sequence.
         from aiter.test_common import run_perftest
 
         out, us = run_perftest(
@@ -482,22 +623,61 @@ def _run_grouped_via_fused_moe(
 
     # Reference always uses GGUU logical inputs (layouts are numerically
     # equivalent; only physical packing differs).
-    ref = _torch_moe_ref(
-        hidden,
-        w1_logical,
-        w1_scale_raw,
-        bias1,
-        w2_logical,
-        w2_scale_raw,
-        bias2,
-        topk_w,
-        topk_id,
-        data_format=data_format,
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    ).to(out.dtype)
+    if (
+        scale_block_size != 32
+        or scale_format_a
+        or scale_format_b
+        or any(
+            x != 1.0
+            for x in (
+                global_scale_a1,
+                global_scale_a2,
+                global_scale_w1,
+                global_scale_w2,
+            )
+        )
+    ):
+        ref = _torch_moe_ref_scaled(
+            hidden,
+            w1_logical,
+            w1_scale_raw,
+            bias1,
+            w2_logical,
+            w2_scale_raw,
+            bias2,
+            topk_w,
+            topk_id,
+            block_size=scale_block_size,
+            format_a=scale_format_a,
+            format_b=scale_format_b,
+            globals_=(
+                global_scale_a1,
+                global_scale_a2,
+                global_scale_w1,
+                global_scale_w2,
+            ),
+            activation=activation,
+            limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        )
+    else:
+        ref = _torch_moe_ref(
+            hidden,
+            w1_logical,
+            w1_scale_raw,
+            bias1,
+            w2_logical,
+            w2_scale_raw,
+            bias2,
+            topk_w,
+            topk_id,
+            data_format=data_format,
+            activation=activation,
+            swiglu_limit=swiglu_limit,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+        ).to(out.dtype)
     return out, ref, us, kernel_us
 
 
@@ -545,10 +725,16 @@ def run_moe(
     iters: int = 101,
     const_init: float | None = None,
     check_aot_cache: bool = True,
+    scale_block_size: int = 32,
+    scale_format_a: int = 0,
+    scale_format_b: int = 0,
+    global_scale_a1: float = 1.0,
+    global_scale_a2: float = 1.0,
+    global_scale_w1: float = 1.0,
+    global_scale_w2: float = 1.0,
 ) -> dict:
-    """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` selects the
-    validated path: bench checks (and times) the CUDA-graph production path;
-    verify checks the eager path.
+    """Compare grouped FlyDSL MoE vs a PyTorch fp32 ref. ``bench`` checks and
+    times the eager end-to-end path; verify checks it without timing.
 
     Correctness gate: production-consistent logits_diff < LOGITS_DIFF_TOL
     (op_tests/test_moe_2stage.py).  rel_l2 (~= sqrt(2*logits_diff)) is printed
@@ -562,7 +748,7 @@ def run_moe(
     }[activation]
     tag = f"{data_format} {act}"
 
-    # --- grouped FlyDSL vs PyTorch fp32 ref (graph path if bench, else eager) ---
+    # --- grouped FlyDSL vs PyTorch fp32 ref ---
     run_only = run_only_env() if check_aot_cache else nullcontext()
     with run_only:
         out, ref, us, kernel_us = _run_grouped_via_fused_moe(
@@ -582,8 +768,15 @@ def run_moe(
             warmup=warmup,
             iters=iters,
             const_init=const_init,
+            scale_block_size=scale_block_size,
+            scale_format_a=scale_format_a,
+            scale_format_b=scale_format_b,
+            global_scale_a1=global_scale_a1,
+            global_scale_a2=global_scale_a2,
+            global_scale_w1=global_scale_w1,
+            global_scale_w2=global_scale_w2,
         )
-    mode = "kernel" if kernel_bench else ("graph" if bench else "eager")
+    mode = "kernel" if kernel_bench else ("bench" if bench else "eager")
     ld = _logits_diff(out, ref)
     rel = _rel_l2(out, ref)
     print(
@@ -607,7 +800,7 @@ def run_moe(
     # --- perf (bench only): timed end-to-end inside _run_grouped_via_fused_moe ---
     if bench:
         print(
-            f"[bench {tag}] fused_moe end-to-end us = {us:.2f} (graph=True)",
+            f"[bench {tag}] fused_moe end-to-end us = {us:.2f} (graph=False)",
             flush=True,
         )
         metrics["us"] = us
@@ -636,6 +829,117 @@ def run_moe(
 
 # model_dim=512 (not the 256 default): the grouped kernel needs
 # num_k_tiles = (K // split_k) // tile_k >= 2, i.e. K >= 2*tile_k = 512.
+@pytest.mark.parametrize("block_size", [16, 32])
+@pytest.mark.parametrize("format_a,format_b", [(0, 0), (0, 2), (1, 2), (2, 1), (2, 2)])
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_grouped_fp4_block_scales(block_size, format_a, format_b, use_bias):
+    run_moe(
+        "a4w4",
+        scale_block_size=block_size,
+        scale_format_a=format_a,
+        scale_format_b=format_b,
+        global_scale_a1=0.7,
+        global_scale_a2=1.3,
+        global_scale_w1=0.8,
+        global_scale_w2=1.1,
+        activation=ActivationType.Silu,
+        use_bias=use_bias,
+        check_aot_cache=False,
+    )
+
+
+@pytest.mark.parametrize(
+    "block_size,scale_format", [(16, 0), (16, 1), (16, 2), (32, 2)]
+)
+def test_fp4_quantization_uses_real_block_scales(block_size, scale_format):
+    _require_gfx1250()
+    from aiter.ops.flydsl.moe_kernels import flydsl_moe_fused_quant_preshuffle
+
+    torch.manual_seed(31)
+    x = torch.randn((1, 64, 512), dtype=torch.bfloat16) * 0.5
+    x[:, 0] = 0
+    x[:, 1] *= 0.001
+    payload, shuffled = flydsl_moe_fused_quant_preshuffle(
+        x,
+        1,
+        64,
+        wmma_rep=4,
+        scale_block_size=block_size,
+        scale_format=scale_format,
+        global_scale=0.7,
+    )
+    torch.testing.assert_close(payload[:, 0], torch.zeros_like(payload[:, 0]))
+    group_bytes = 128 // block_size
+    raw = (
+        shuffled.reshape(1, 1, 4, 4, 16, group_bytes)
+        .permute(0, 1, 3, 4, 2, 5)
+        .reshape(1, 64, 512 // block_size)
+    )
+    expected_scale = _encode_scale(
+        x.float().reshape(-1, block_size).abs().amax(-1) / (6 * 0.7), scale_format
+    ).reshape(raw.shape)
+    torch.testing.assert_close(raw, expected_scale, rtol=0, atol=0)
+    scale = _decode_scale(raw, scale_format) * 0.7
+    actual = (
+        fp4_utils.mxfp4_to_f32(payload).reshape(1, 64, -1, block_size)
+        * scale[..., None]
+    )
+    expected = _quant_dequant_fp4(x, block_size, scale_format, 0.7).reshape(
+        actual.shape
+    )
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+def test_scale16_repeated_scale32_matches():
+    """Same FP4 values/scales: real i64 SCALE16 must match i32 SCALE32."""
+    _require_gfx1250()
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.shuffle import shuffle_scale_n32k4, shuffle_weight
+
+    torch.manual_seed(17)
+    M, N, K, rep = 64, 256, 512, 4
+    a = torch.randint(0, 256, (1, M, K // 2), dtype=torch.uint8)
+    b = torch.randint(0, 256, (1, N, K // 2), dtype=torch.uint8)
+    b = shuffle_weight(b.reshape(N, K // 2), layout=(16, 16))
+    sa = torch.randint(124, 128, (1, M, K // 32), dtype=torch.uint8)
+    sb = torch.randint(124, 128, (1, N, K // 32), dtype=torch.uint8)
+    psum = torch.tensor([M], dtype=torch.int32)
+    outputs = []
+    for block in (32, 16):
+        scale_bytes = 128 // block
+        raw_a = sa if block == 32 else sa.repeat_interleave(2, -1)
+        raw_b = sb if block == 32 else sb.repeat_interleave(2, -1)
+        shuffled_a = (
+            raw_a.reshape(1, M // (rep * 16), rep, 16, K // 128, scale_bytes)
+            .permute(0, 1, 4, 2, 3, 5)
+            .contiguous()
+        )
+        shuffled_b = shuffle_scale_n32k4(raw_b, scale_block_size=block)
+        out = torch.empty((1, M, N), dtype=torch.bfloat16)
+        flydsl_grouped_gemm_a8w4_masked(
+            out,
+            a,
+            b,
+            shuffled_a,
+            shuffled_b,
+            psum,
+            n_experts=1,
+            contiguous_m=M,
+            N=N,
+            K=K,
+            tile_m=M,
+            tile_n=N,
+            tile_k=256,
+            m_warp=1,
+            n_warp=4,
+            a_is_fp4=1,
+            num_buffers=2,
+            scale_block_size=block,
+        )
+        outputs.append(out)
+    torch.testing.assert_close(outputs[0], outputs[1], rtol=0, atol=0)
+
+
 def test_grouped_a4w4_silu_matches_torch_ref():
     run_moe(
         "a4w4",
@@ -908,7 +1212,7 @@ def run_csv_scenario(args) -> None:
     tuned config is looked up from the same CSV by the kernel via the problem
     shape, so simply running each shape exercises its tuned setting.
 
-    Each row is benched (CUDA-graph end-to-end timing, production path) and its
+    Each row is benched (eager end-to-end timing) and its
     correctness checked; one out-of-gate row is recorded rather than aborting
     the sweep.
     """
@@ -984,6 +1288,15 @@ def run_csv_scenario(args) -> None:
                 warmup=args.warmup,
                 iters=args.iters,
                 const_init=args.const_init,
+                scale_block_size=int(
+                    rec.get("scale_block_size") or args.scale_block_size
+                ),
+                scale_format_a=int(rec.get("scale_format_a") or args.scale_format_a),
+                scale_format_b=int(rec.get("scale_format_b") or args.scale_format_b),
+                global_scale_a1=args.global_scale_a1,
+                global_scale_a2=args.global_scale_a2,
+                global_scale_w1=args.global_scale_w1,
+                global_scale_w2=args.global_scale_w2,
             )
         except Exception as exc:  # noqa: BLE001 - record, keep sweeping
             print(f"[csv] row {idx}: ERROR {exc!r}", flush=True)
@@ -1056,7 +1369,7 @@ def main() -> None:
         "--scenario",
         choices=("bench", "verify", "kernel", "csv"),
         default="bench",
-        help="bench: time fused_moe end-to-end (CUDA graph). verify: eager "
+        help="bench: time fused_moe end-to-end (eager). verify: eager "
         "correctness only. kernel: time the gemm1 and gemm2 kernels in "
         "isolation (loop each launch alone). csv: sweep every setting in "
         "--csv-path (one run_moe case per row).",
@@ -1068,6 +1381,20 @@ def main() -> None:
         f"(default: {DEFAULT_CSV_PATH}). Each row is one case.",
     )
     parser.add_argument("--data-format", choices=("a4w4", "a8w4"), default="a8w4")
+    parser.add_argument("--scale-block-size", type=int, choices=(16, 32), default=32)
+    parser.add_argument(
+        "--scale-format-a", choices=("e8m0", "e5m3", "e4m3"), default="e8m0"
+    )
+    parser.add_argument(
+        "--scale-format-b", choices=("e8m0", "e5m3", "e4m3"), default="e8m0"
+    )
+    parser.add_argument(
+        "--nvfp4",
+        action="store_true",
+        help="per-16 E4M3 A/B scales with tensor float scales",
+    )
+    for stage in ("a1", "a2", "w1", "w2"):
+        parser.add_argument(f"--global-scale-{stage}", type=float, default=1.0)
     parser.add_argument("--experts", type=int, default=256)
     parser.add_argument(
         "--tokens",
@@ -1140,6 +1467,19 @@ def main() -> None:
         "miss raises. Pass this flag to allow runtime JIT compilation.",
     )
     args = parser.parse_args()
+    if args.nvfp4:
+        args.scale_block_size = 16
+        args.scale_format_a = args.scale_format_b = "e4m3"
+    if args.data_format != "a4w4" and (
+        args.scale_block_size != 32
+        or args.scale_format_a != "e8m0"
+        or args.scale_format_b != "e8m0"
+    ):
+        parser.error("custom block scales require --data-format a4w4")
+    formats = {"e8m0": 0, "e5m3": 1, "e4m3": 2}
+    args.scale_format_a = formats[args.scale_format_a]
+    args.scale_format_b = formats[args.scale_format_b]
+
     if not args.real_gemm:
         _mock_grouped_gemm()
 
@@ -1194,9 +1534,19 @@ def main() -> None:
             warmup=args.warmup,
             iters=args.iters,
             const_init=args.const_init,
+            scale_block_size=args.scale_block_size,
+            scale_format_a=args.scale_format_a,
+            scale_format_b=args.scale_format_b,
+            global_scale_a1=args.global_scale_a1,
+            global_scale_a2=args.global_scale_a2,
+            global_scale_w1=args.global_scale_w1,
+            global_scale_w2=args.global_scale_w2,
         )
         rows.append(
             {
+                "scale_block": args.scale_block_size,
+                "scale_a": args.scale_format_a,
+                "scale_b": args.scale_format_b,
                 "data_format": args.data_format,
                 "act": args.act,
                 "init": "random" if args.const_init is None else "const",

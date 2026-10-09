@@ -2949,6 +2949,9 @@ def _get_compiled_fused_quant_preshuffle(
     wmma_rep: int,
     quant_mode: str = "fp4",
     skip_padding: bool = False,
+    scale_block_size: int = 32,
+    scale_format: int = 0,
+    global_scale: float = 1.0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_module,
@@ -2959,6 +2962,9 @@ def _get_compiled_fused_quant_preshuffle(
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
         skip_padding=skip_padding,
+        scale_block_size=scale_block_size,
+        scale_format=scale_format,
+        global_scale=global_scale,
     )
 
 
@@ -2975,6 +2981,9 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     ksplit: bool = True,
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
+    scale_block_size: int = 32,
+    scale_format: int = 0,
+    global_scale: float = 1.0,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -2989,6 +2998,9 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         ksplit=ksplit,
         prequantized=prequantized,
         src_scale_bytes_per_row=src_scale_bytes_per_row,
+        scale_block_size=scale_block_size,
+        scale_format=scale_format,
+        global_scale=global_scale,
     )
 
 
@@ -3012,6 +3024,9 @@ def flydsl_moe_fused_quant_preshuffle(
     # ``quant_mode``: the sender already quantized, so the kernel only scatters
     # + preshuffles.
     prequantized_scale: torch.Tensor | None = None,
+    scale_block_size: int = 32,
+    scale_format: int = 0,
+    global_scale: float = 1.0,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle in one kernel pass.
 
@@ -3022,6 +3037,12 @@ def flydsl_moe_fused_quant_preshuffle(
             f"flydsl_moe_fused_quant_preshuffle: quant_mode={quant_mode!r} "
             "unsupported (expected 'fp4' or 'fp8')."
         )
+    if scale_block_size not in (16, 32) or scale_format not in (0, 1, 2):
+        raise ValueError("expected scale block 16/32 and format 0=E8M0, 1=E5M3, 2=E4M3")
+    if quant_mode != "fp4" and (
+        scale_block_size != 32 or scale_format or global_scale != 1.0
+    ):
+        raise ValueError("custom block scales require FP4 quantization")
     # A quantizing EP dispatch (fp8 or fp4) already put the payload and its e8m0
     # row on the wire: nothing left to convert, only scatter + preshuffle.
     prequantized = prequantized_scale is not None
@@ -3067,7 +3088,7 @@ def flydsl_moe_fused_quant_preshuffle(
 
     n_rows = E * max_m
     Pb = feat_dim if quant_mode == "fp8" else feat_dim // 2
-    Ws = feat_dim // 32
+    Ws = feat_dim // scale_block_size
     if out_payload is None:
         out_payload = torch.empty((E, max_m, Pb), dtype=torch.uint8, device=device)
     if out_scale is None:
@@ -3113,6 +3134,9 @@ def flydsl_moe_fused_quant_preshuffle(
             remap_rows=remap_rows,
             ksplit=use_ksplit,
             prequantized=prequantized,
+            scale_block_size=scale_block_size,
+            scale_format=scale_format,
+            global_scale=global_scale,
             src_scale_bytes_per_row=(
                 int(prequantized_scale.shape[-1]) if prequantized else 0
             ),
@@ -3153,6 +3177,9 @@ def flydsl_moe_fused_quant_preshuffle(
         wmma_rep=wmma_rep,
         quant_mode=quant_mode,
         skip_padding=skip_padding,
+        scale_block_size=scale_block_size,
+        scale_format=scale_format,
+        global_scale=global_scale,
     )
     launch(
         ptr_arg(grouped_in.contiguous().view(-1)),

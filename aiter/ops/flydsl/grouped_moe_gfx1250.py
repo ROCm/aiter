@@ -447,6 +447,13 @@ def _grouped_a8w4_tdm_moe(
     situ_beta=1.0,
     situ_linear_beta=1.0,
     a1_scale=None,
+    fp4_scale_block_size=32,
+    fp4_scale_format_a=0,
+    fp4_scale_format_b=0,
+    fp4_global_scale_a1=1.0,
+    fp4_global_scale_a2=1.0,
+    fp4_global_scale_w1=1.0,
+    fp4_global_scale_w2=1.0,
 ):
     import functools
 
@@ -458,6 +465,19 @@ def _grouped_a8w4_tdm_moe(
         flydsl_moe_topids_to_rows,
     )
 
+    _scale_kw = {
+        "scale_block_size": fp4_scale_block_size,
+        "scale_format_a": fp4_scale_format_a,
+        "scale_format_b": fp4_scale_format_b,
+    }
+    _scale_kw1 = dict(
+        **_scale_kw,
+        global_scale=fp4_global_scale_a1 * fp4_global_scale_w1,
+        quant_global_scale=fp4_global_scale_a2,
+    )
+    _scale_kw2 = dict(
+        **_scale_kw, global_scale=fp4_global_scale_a2 * fp4_global_scale_w2
+    )
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
@@ -644,6 +664,9 @@ def _grouped_a8w4_tdm_moe(
         source_topk=topk,
         num_valid_routes=_ep_nvr,
         prequantized_scale=src_a1_scale if _prequantized else None,
+        scale_block_size=fp4_scale_block_size,
+        scale_format=fp4_scale_format_a,
+        global_scale=fp4_global_scale_a1,
     )
 
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
@@ -657,7 +680,7 @@ def _grouped_a8w4_tdm_moe(
         # Pre-allocate MX payload + preshuffled e8m0 scale for gemm1 output.
         # These are written directly by the kernel's fused quant epilogue.
         payload_bytes = inter_dim // 2 if _is_fp4 else inter_dim
-        scale_bytes = inter_dim // 32  # one e8m0 byte per 32-element MX block
+        scale_bytes = inter_dim // fp4_scale_block_size
         a2_payload = torch.empty(
             (1, contiguous_m, payload_bytes), dtype=torch.uint8, device=device
         )
@@ -698,6 +721,7 @@ def _grouped_a8w4_tdm_moe(
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             **_situ_kw,
+            **_scale_kw1,
         )
     else:
         # Original path: bf16 intermediate + separate quant kernel.
@@ -728,6 +752,7 @@ def _grouped_a8w4_tdm_moe(
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             **_situ_kw,
+            **_scale_kw1,
         )
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
             y,
@@ -737,6 +762,9 @@ def _grouped_a8w4_tdm_moe(
             quant_mode=_quant_mode,
             masked_m=None,
             topids_to_rows=None,
+            scale_block_size=fp4_scale_block_size,
+            scale_format=fp4_scale_format_a,
+            global_scale=fp4_global_scale_a2,
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
@@ -767,6 +795,7 @@ def _grouped_a8w4_tdm_moe(
         waves_per_tensor_tdm=waves_per_tensor_tdm,
         next_stage_prefetch=next_stage_prefetch,
         **_ep_gemm2_kwargs,
+        **_scale_kw2,
     )
 
     if kernel_bench_callable is not None:
@@ -804,6 +833,7 @@ def _grouped_a8w4_tdm_moe(
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         **_situ_kw,
+                        **_scale_kw1,
                     ),
                 )
             )
@@ -838,6 +868,7 @@ def _grouped_a8w4_tdm_moe(
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         **_situ_kw,
+                        **_scale_kw1,
                     ),
                 )
             )
@@ -869,6 +900,7 @@ def _grouped_a8w4_tdm_moe(
                     cluster_n=cluster_n,
                     waves_per_tensor_tdm=waves_per_tensor_tdm,
                     next_stage_prefetch=next_stage_prefetch,
+                    **_scale_kw2,
                 ),
             )
         )
@@ -932,6 +964,13 @@ def grouped_gemm_gfx1250_a8w4(
     situ_linear_beta: float = 1.0,
     stage2_scatter: Stage2ScatterContext | None = None,
     a1_scale: torch.Tensor | None = None,
+    fp4_scale_block_size=32,
+    fp4_scale_format_a=0,
+    fp4_scale_format_b=0,
+    fp4_global_scale_a1=1.0,
+    fp4_global_scale_a2=1.0,
+    fp4_global_scale_w1=1.0,
+    fp4_global_scale_w2=1.0,
 ):
     """Grouped a8w4/a4w4 MoE on the TDM batched GEMM (gfx1250).
 
@@ -1034,6 +1073,15 @@ def grouped_gemm_gfx1250_a8w4(
     _grouped_dbg(f"eligible data_format={data_format}")
     if w1_scale is None or w2_scale is None:
         return None
+    for scale, rows, k, label in (
+        (w1_scale, 2 * inter_dim, model_dim, "w1_scale"),
+        (w2_scale, model_dim, inter_dim, "w2_scale"),
+    ):
+        expected_bytes = E * rows * (k // fp4_scale_block_size)
+        if scale.numel() * scale.element_size() != expected_bytes:
+            raise ValueError(
+                f"{label} requires {expected_bytes} bytes for per-{fp4_scale_block_size} scales"
+            )
     _gfx_env = ";".join(
         str(os.environ.get(k, "")).lower()
         for k in ("GPU_ARCHS", "TARGET_ARCH", "AITER_GPU_ARCHS")
@@ -1200,6 +1248,13 @@ def grouped_gemm_gfx1250_a8w4(
             situ_beta=situ_beta,
             situ_linear_beta=situ_linear_beta,
             a1_scale=a1_scale,
+            fp4_scale_block_size=fp4_scale_block_size,
+            fp4_scale_format_a=fp4_scale_format_a,
+            fp4_scale_format_b=fp4_scale_format_b,
+            fp4_global_scale_a1=fp4_global_scale_a1,
+            fp4_global_scale_a2=fp4_global_scale_a2,
+            fp4_global_scale_w1=fp4_global_scale_w1,
+            fp4_global_scale_w2=fp4_global_scale_w2,
             **_tdm_kw,
         )
 

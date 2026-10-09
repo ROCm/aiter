@@ -315,3 +315,10 @@ def emit_cvt_scalef32_pk8_fp4_bf16(src_v8bf16, scale_f32, *, i32_ty):
         _raw(src_v8bf16),
         _raw(scale_f32),
     )
+
+
+def emit_cvt_scalef32_pk8_fp4_f32(src_v8f32, scale_f32):
+    """Native FP4 pack retaining f32 precision for NVFP4 normalization."""
+    from flydsl._mlir.dialects import rocdl as rocdl_ops
+
+    return rocdl_ops.cvt_scalef32_pk8_fp4_f32(T.i32, _raw(src_v8f32), _raw(scale_f32))

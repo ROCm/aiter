@@ -121,8 +121,11 @@ def parse_csv(csv_path: str):
                 "token_num": token_num,
                 "topk": topk,
                 "tile_m": tile_m,
-                "tile_n": n_warp * _WARP_TILE_N,
-                "tile_k": _TILE_K,
+                "tile_n": int(row.get("tile_n") or n_warp * _WARP_TILE_N),
+                "tile_k": int(row.get("tile_k") or _TILE_K),
+                "scale_block_size": int(row.get("scale_block_size") or 32),
+                "scale_format_a": int(row.get("scale_format_a") or 0),
+                "scale_format_b": int(row.get("scale_format_b") or 0),
                 "m_warp": m_warp,
                 "n_warp": n_warp,
                 "num_buffers": int(row.get("num_buffers") or 2),
@@ -199,6 +202,8 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
                 source_topk=source_topk,
                 remap_rows=False,
                 ksplit=ks,
+                scale_block_size=job.get("scale_block_size", 32),
+                scale_format=job.get("scale_format_a", 0),
             )
             launch(
                 ptr_arg(torch.empty(0, dtype=bf16, device=dev)),
@@ -224,6 +229,8 @@ def _compile_grouped_moe_aux_kernels(job, *, dtype, quant_mode, wmma_rep, contig
             wmma_rep=wmma_rep,
             quant_mode=quant_mode,
             skip_padding=skip_padding,
+            scale_block_size=job.get("scale_block_size", 32),
+            scale_format=job.get("scale_format_a", 0),
         )
         n_rows = out_e * out_m
         launch(

@@ -96,10 +96,27 @@ def flydsl_grouped_gemm_a8w4_masked(
     ep_row_map=None,
     situ_beta=1.0,
     situ_linear_beta=1.0,
+    scale_block_size=32,
+    scale_format_a=0,
+    scale_format_b=0,
+    global_scale=1.0,
+    quant_global_scale=1.0,
 ):
     """Launches a contiguous-M grouped a8w4 GEMM on the TDM kernel."""
     from .kernels.mxfp4_preshuffle_gfx1250_tdm import launch_gemm_a8w4_tdm
 
+    if scale_block_size not in (16, 32):
+        raise ValueError("scale_block_size must be 16 or 32")
+    if scale_format_a not in (0, 1, 2) or scale_format_b not in (0, 1, 2):
+        raise ValueError("scale formats must be 0=E8M0, 1=E5M3, 2=E4M3")
+    if not a_is_fp4 and (
+        scale_block_size != 32
+        or scale_format_a
+        or scale_format_b
+        or global_scale != 1.0
+        or quant_global_scale != 1.0
+    ):
+        raise ValueError("non-default block scales currently require a4w4")
     if stream is None:
         stream = torch.cuda.current_stream()
     if stage1_act == 3:
@@ -164,5 +181,11 @@ def flydsl_grouped_gemm_a8w4_masked(
         arg_ep_row_map=ep_row_map_tensor,
         f32_situ_beta=float(situ_beta),
         f32_situ_linear_beta=float(situ_linear_beta),
+        scale_block_size=scale_block_size,
+        scale_format_a=scale_format_a,
+        scale_format_b=scale_format_b,
+        has_global_scale=int(global_scale != 1.0),
+        f32_global_scale=float(global_scale),
+        quant_global_scale=float(quant_global_scale),
     )
     return out

@@ -71,9 +71,14 @@ from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops, vector
+from aiter.ops.flydsl.kernels.fp4_scale import emit_fp4_block_scale
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name, get_warp_size
 from aiter.ops.flydsl.kernels.moe_route_maps import DROPPED_ROUTE_ROW
-from aiter.ops.flydsl.kernels.quant_utils import emit_f32_to_e2m1, emit_mx_e8m0_scale
+from aiter.ops.flydsl.kernels.quant_utils import (
+    emit_cvt_scalef32_pk8_fp4_f32,
+    emit_f32_to_e2m1,
+    emit_mx_e8m0_scale,
+)
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -155,7 +160,9 @@ def _arch_has_native_scaled_cvt(arch: str) -> bool:
     return arch.startswith(_NATIVE_SCALED_CVT_ARCHS)
 
 
-def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamespace:
+def _quant_layout(
+    feat_dim: int, quant_mode: str, wmma_rep: int, scale_block_size: int = 32
+) -> SimpleNamespace:
     """Shared per-block quant + e8m0 scale-preshuffle geometry.
 
     ``feat_dim`` is the activation feature dim being quantized along K
@@ -180,19 +187,19 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     # SW/pk2 paths use.
     use_pk8 = _arch_has_pk8(arch)
     elems_per_lane = 8 if use_pk8 else ELEMS_PER_LANE
-    lanes_per_mx_block = 32 // elems_per_lane
+    lanes_per_mx_block = scale_block_size // elems_per_lane
 
     if is_fp8:
         mx_dtype = (
             _MxDtype.FP8_E4M3_FNUZ if arch.startswith("gfx942") else _MxDtype.FP8_E4M3
         )
         payload_bytes_per_row = feat_dim
-        payload_bytes_per_block = 32
+        payload_bytes_per_block = scale_block_size
         payload_bytes_per_lane = elems_per_lane
     else:
         mx_dtype = _MxDtype.FP4_E2M1
         payload_bytes_per_row = feat_dim // 2
-        payload_bytes_per_block = 16
+        payload_bytes_per_block = scale_block_size // 2
         payload_bytes_per_lane = elems_per_lane // 2
 
     wave_size = get_warp_size()
@@ -200,7 +207,7 @@ def _quant_layout(feat_dim: int, quant_mode: str, wmma_rep: int) -> SimpleNamesp
     warps_per_block = BLOCK_THREADS // wave_size
     mx_blocks_per_wave_iter = wave_size // lanes_per_mx_block
 
-    mx_blocks_per_row = feat_dim // 32  # == scale_bytes_per_row (1 e8m0/block)
+    mx_blocks_per_row = feat_dim // scale_block_size  # one encoded byte per block
     scale_bytes_per_row = mx_blocks_per_row
     assert (
         scale_bytes_per_row % 4 == 0
@@ -272,6 +279,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     """
     i32 = c.i32
     f32 = c.f32
+    custom_scale = (
+        getattr(c, "scale_format", 0) or getattr(c, "global_scale", 1.0) != 1.0
+    )
     mx_group_base = getattr(c, "mx_group_base", None)
     if mx_group_base is None:
         mx_group_base = arith.constant(0, type=i32)
@@ -346,7 +356,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             # gfx1250 native pk8: 8 contiguous bf16 cols this lane.
             # col_base = mx_block*32 + lane_in_block*8.
             col_base = (
-                mx_block * arith.constant(32, type=i32)
+                mx_block * arith.constant(getattr(c, "scale_block_size", 32), type=i32)
                 + c.lane_in_block * c.c_elems_per_lane
             )
             # 2 bf16/dword -> 4 dwords; one aligned dwordx4 = 8 bf16.
@@ -372,16 +382,33 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
                 )
                 block_amax = arith.maximumf(block_amax, peer_amax)
 
-            e8m0_scale = emit_mx_e8m0_scale(
-                block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
-            )
+            if const_expr(custom_scale):
+                block_scale_f32, scale_byte = emit_fp4_block_scale(
+                    block_amax, c.scale_format, c.global_scale
+                )
+                e8m0_scale = arith.extui(i32, scale_byte)
+                # A zero scale byte must not produce an overflowing reciprocal
+                # when the E8M0 decoded scale is subnormal.
+                divisor = block_scale_f32 * c.global_scale
+                divisor = (e8m0_scale == 0).select(fx.Float32(1.0), divisor)
+                f32x8 = f32x8 * (fx.Float32(1.0) / divisor)
+            else:
+                e8m0_scale = emit_mx_e8m0_scale(
+                    block_amax, mode=_ROUND_MODE, dtype=c.mx_dtype
+                )
             # scale 2^(e8m0-127); the HW divides each input by its exponent
             # and RNE-packs the 8 outputs (fp4: i32 / fp8: v2i32).
-            block_scale_f32 = (ArithValue(e8m0_scale) << c.c23_i32).bitcast(f32)
+            block_scale_f32 = (
+                arith.constant(1.0, type=f32)
+                if const_expr(custom_scale)
+                else (ArithValue(e8m0_scale) << c.c23_i32).bitcast(f32)
+            )
             if const_expr(c.is_fp8):
                 payload_val = _cvt_scalef32_pk8_fp8_bf16(
                     bf16x8, block_scale_f32, v2i32_ty=T.vec(2, i32)
                 )  # v2i32 = 8 fp8 e4m3 bytes
+            elif const_expr(custom_scale):
+                payload_val = emit_cvt_scalef32_pk8_fp4_f32(f32x8, block_scale_f32)
             else:
                 payload_val = _cvt_scalef32_pk8_fp4_bf16(
                     bf16x8, block_scale_f32, i32_ty=i32
@@ -389,7 +416,7 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
         else:
             # two contiguous bf16 columns: col_base = mx_block*32 + lane_in_block*2
             col_base = (
-                mx_block * arith.constant(32, type=i32)
+                mx_block * arith.constant(getattr(c, "scale_block_size", 32), type=i32)
                 + c.lane_in_block * c.c_elems_per_lane
             )
             hidden_dword = (feat_elem_base + col_base) >> c.c1_i32  # 2 bf16/dword
@@ -472,8 +499,9 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
     # row in ``c.dests``; current kernels pass one.
     for mx_block, payload_val, e8m0_scale in quant_results:
         # The block-scale's dword/byte position depends only on ``mx_block``.
-        scale_dword = fx.Uint32(mx_block) // fx.Uint32(c.c4_i32)
-        byte_in_dword = mx_block - scale_dword * c.c4_i32
+        scale_bytes = 128 // getattr(c, "scale_block_size", 32)
+        scale_group = fx.Uint32(mx_block) // scale_bytes
+        byte_in_group = mx_block - scale_group * scale_bytes
         e8m0_byte = arith.trunci(T.i8, e8m0_scale)
         for di, dst in enumerate(c.dests):
             payload_rsrc = dst_payload[di]
@@ -488,10 +516,11 @@ def _emit_quant_block_loop(c: SimpleNamespace) -> None:
             # one e8m0 byte per block, written by the block's lead lane.
             _if_lead = scf.IfOp(_raw(c.is_block_lead))
             with ir.InsertionPoint(_if_lead.then_block):
-                dst_scale_dword = (
-                    dst.scale_row_dword_base + scale_dword * c.c_wmma_rep * 16
+                dst_scale_byte = (
+                    dst.scale_row_dword_base * c.c4_i32
+                    + scale_group * c.c_wmma_rep * 16 * scale_bytes
+                    + byte_in_group
                 )
-                dst_scale_byte = dst_scale_dword * c.c4_i32 + byte_in_dword
                 buffer_ops.buffer_store(e8m0_byte, c.scale_rsrc, dst_scale_byte)
                 scf.YieldOp([])
 
@@ -1100,6 +1129,9 @@ def build_moe_fused_quant_preshuffle_module(
     wmma_rep: int,
     quant_mode: str = "fp4",
     skip_padding: bool = False,
+    scale_block_size: int = 32,
+    scale_format: int = 0,
+    global_scale: float = 1.0,
 ):
     """Return a JIT launcher for the fused (grouped) quant + scale-preshuffle kernel.
 
@@ -1137,7 +1169,7 @@ def build_moe_fused_quant_preshuffle_module(
       n_rows          : E*max_m  (padding rows skipped iff skip_padding)
       max_m           : per-expert row capacity (for expert = row // max_m)
     """
-    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep, scale_block_size)
     # Unpack into locals so the @kernel closure captures the quant_mode-derived
     # scalars (is_fp8, payload geometry, ...). The JIT disk cache keys on the
     # launch function's source + scalar closure values; if these stayed hidden
@@ -1168,7 +1200,7 @@ def build_moe_fused_quant_preshuffle_module(
     skip_tag = "skip" if skip_padding else "all"
     module_name = (
         f"moe_fused_quant_preshuffle_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{skip_tag}"
+        f"_s{scale_block_size}f{scale_format}g{global_scale}_v2_{quant_mode}_{L.native_tag}_{skip_tag}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1227,8 +1259,8 @@ def build_moe_fused_quant_preshuffle_module(
                 scale_row_dword_base = (
                     expert * (m * c_scale_dwords_per_row)
                     + scale_tile * c_dst_scale_dwords_per_row * c16_i32
-                    + wmma_row * c16_i32
-                    + row_lane16
+                    + wmma_row * c16_i32 * (32 // scale_block_size)
+                    + row_lane16 * (32 // scale_block_size)
                 )
 
                 payload_base = fx.Int64(ptrtoint(grouped_payload))
@@ -1240,6 +1272,9 @@ def build_moe_fused_quant_preshuffle_module(
                 is_block_lead = lane_in_block == c0_i32
 
                 c = SimpleNamespace(
+                    scale_block_size=scale_block_size,
+                    scale_format=scale_format,
+                    global_scale=global_scale,
                     i32=i32,
                     f32=f32,
                     block_iters=block_iters,
@@ -1304,6 +1339,8 @@ def build_moe_fused_quant_preshuffle_module(
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        # Capture the versioned kernel name in the launcher's disk-cache key.
+        _ = module_name
         grid_x = arith.index_cast(T.index, grid_blocks)
         fused_kernel(
             grouped_in,
@@ -1337,6 +1374,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     ksplit: bool = True,
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
+    scale_block_size: int = 32,
+    scale_format: int = 0,
+    global_scale: float = 1.0,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1355,7 +1395,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     to the sender, because its destination is a function of the grouped row THIS
     rank assigns, which no sender knows.
     """
-    L = _quant_layout(feat_dim, quant_mode, wmma_rep)
+    L = _quant_layout(feat_dim, quant_mode, wmma_rep, scale_block_size)
     if not L.use_pk8:
         raise NotImplementedError(
             "route-indexed K-split is currently enabled only for gfx1250 pk8"
@@ -1405,7 +1445,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
-        f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
+        f"_s{scale_block_size}f{scale_format}g{global_scale}_v2_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{ksplit_tag}"
         f"{prequant_tag}"
     )
 
@@ -1516,8 +1556,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             row_lane16 = row_in_tile - wmma_row * c16_i32
             scale_row_dword_base = (
                 scale_tile * c_dst_scale_dwords_per_row * c16_i32
-                + wmma_row * c16_i32
-                + row_lane16
+                + wmma_row * c16_i32 * (32 // scale_block_size)
+                + row_lane16 * (32 // scale_block_size)
             )
 
             if const_expr(source_topk > 0):
@@ -1538,6 +1578,9 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
             is_block_lead = lane_in_block == c0_i32
 
             qc = SimpleNamespace(
+                scale_block_size=scale_block_size,
+                scale_format=scale_format,
+                global_scale=global_scale,
                 i32=i32,
                 f32=f32,
                 block_iters=1 if ksplit else block_iters,
@@ -1601,6 +1644,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
+        # Capture the versioned kernel name in the launcher's disk-cache key.
+        _ = module_name
         grid_x = arith.index_cast(T.index, grid_route_blocks)
         grid_y = arith.index_cast(T.index, arith.constant(_grid_y_dim, type=T.i32))
         fused_kernel(

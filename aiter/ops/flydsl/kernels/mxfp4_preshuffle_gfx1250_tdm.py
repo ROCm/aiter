@@ -15,6 +15,7 @@ from flydsl.expr.typing import Vector as Vec
 from aiter.ops.flydsl.kernels import vector
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
+from .fp4_scale import emit_fp4_block_scale, wmma_fp4
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
@@ -32,6 +33,7 @@ from .mega_moe_gfx1250.tdm_gather_shim import (
 from .quant_utils import (
     emit_amax_e8m0_native_scale,
     emit_cvt_scalef32_pk8_fp4_bf16,
+    emit_cvt_scalef32_pk8_fp4_f32,
     emit_cvt_scalef32_pk8_fp8_f32,
 )
 from .tensor_shim import (
@@ -83,6 +85,12 @@ def launch_gemm_a8w4_tdm(
     arg_ep_row_map: fx.Tensor = None,
     f32_situ_beta: fx.Float32 = 1.0,
     f32_situ_linear_beta: fx.Float32 = 1.0,
+    scale_block_size: Constexpr[int] = 32,
+    scale_format_a: Constexpr[int] = 0,
+    scale_format_b: Constexpr[int] = 0,
+    has_global_scale: Constexpr[int] = 0,
+    f32_global_scale: fx.Float32 = 1.0,
+    quant_global_scale: Constexpr[float] = 1.0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -112,6 +120,9 @@ def launch_gemm_a8w4_tdm(
        check -- so the callers that choose cluster_n enforce it
        (batched_gemm_mxfp4._pick_cluster_n and its assert).
     """
+    SCALE_DWORDS = 32 // scale_block_size
+    SCALE_BYTES = 128 // scale_block_size
+    SCALE_CLS = fx.Int64 if scale_block_size == 16 else fx.Int32
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
@@ -135,6 +146,11 @@ def launch_gemm_a8w4_tdm(
         stage1_act,
         has_bias,
         TDM_DESCRIPTOR_VERSION,
+        scale_block_size,
+        scale_format_a,
+        scale_format_b,
+        has_global_scale,
+        quant_global_scale,
         stage1_quant_out,
         quant_wmma_rep,
         cluster_n,
@@ -174,13 +190,13 @@ def launch_gemm_a8w4_tdm(
     STAGE_A = ((tile_m * A_LDS_ROW + 15) // 16) * 16
     STAGE_B = (((tile_n // 16) * B_LDS_ROW + 15) // 16) * 16
 
-    SC_INNER = tile_k // 4
+    SC_INNER = tile_k // 4 * SCALE_DWORDS
     _SA_SUPERS, SB_SUPERS = tile_m // 32, tile_n // 32
     AS_KSTEPS = tile_k // 128
-    AS_INNER = AS_KSTEPS * wmma_m_rep * 16
+    AS_INNER = AS_KSTEPS * wmma_m_rep * 16 * SCALE_DWORDS
     AS_SUPERS = m_warp
     # One outer row is one wave's M tile. Its inner (k128, wm, lane16)
-    # layout gives each WMMA scale operand a contiguous 16-dword block.
+    # layout gives each WMMA scale operand contiguous per-row scale bytes.
     STAGE_SA = ((AS_SUPERS * AS_INNER * 4 + 15) // 16) * 16
     STAGE_SB = ((SB_SUPERS * SC_INNER * 4 + 15) // 16) * 16
     SA_OFF = STAGE_A + STAGE_B
@@ -205,9 +221,9 @@ def launch_gemm_a8w4_tdm(
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
-    # Each wn subtile produces 8 output cols (4 per kgrp) after silu/swiglu;
-    # 4 wn subtiles = 32 output cols = 1 MX block for per-32 scaling.
-    WN_PER_MX_BLOCK = 4
+    # Each N16 subtile produces eight activated columns, split across kgrp.
+    # Two/four subtiles share one per-16/per-32 block scale.
+    WN_PER_MX_BLOCK = scale_block_size // 8
     if stage1_quant_out and stage1_act:
         assert (
             output_n_rep % WN_PER_MX_BLOCK == 0
@@ -230,6 +246,7 @@ def launch_gemm_a8w4_tdm(
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_next_stage}{_waves_per_tensor}{_ep}"
+        f"_s{scale_block_size}f{scale_format_a}{scale_format_b}g{has_global_scale}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -243,18 +260,19 @@ def launch_gemm_a8w4_tdm(
         arg_bias: fx.Pointer,
         arg_quant_scale: fx.Tensor,
         arg_ep_row_map: fx.Tensor,
+        f32_global_scale: fx.Float32,
         i32_m: fx.Int32,
         i32_n: fx.Int32,
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
     ):
-        # rocdl.disable_xdl_arb_stall()
+        rocdl.disable_xdl_arb_stall()
 
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
         Kp16 = (K // 2) * 16
-        K4 = K // 4
+        K4 = K // 4 * SCALE_DWORDS
 
         tid = fx.thread_idx.x
         bid_x = fx.block_idx.x
@@ -310,7 +328,7 @@ def launch_gemm_a8w4_tdm(
         eb64 = fx.Int64(expert)
         B_BATCH_ROWS = n64 // 16
         N_SUPERS = (n64 + 31) // 32
-        AS_ROW = (K // 128) * wmma_m_rep * 16
+        AS_ROW = (K // 128) * wmma_m_rep * 16 * SCALE_DWORDS
 
         c_outer_off, c_inner_off, c_stride = blk_m64, blk_n64, i32_n
         SB_OUTER_STRIDE = K4
@@ -348,7 +366,7 @@ def launch_gemm_a8w4_tdm(
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
         lds_load_b32, lds_store_b32 = make_lds_copy_ops(32)
-        _, lds_store_b64 = make_lds_copy_ops(64)
+        lds_load_b64, lds_store_b64 = make_lds_copy_ops(64)
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
 
         def make_tdm_store(gt, outer, stride):
@@ -567,11 +585,11 @@ def launch_gemm_a8w4_tdm(
         lds_b_lane_off = STAGE_A + (wnb // 16) * B_LDS_ROW + kgrp * 256 + lane16 * 16
         assert wmma_m_rep == 1 or wmma_m_rep % 2 == 0
         sa_lane = lane16 if wmma_m_rep == 1 else lane
-        lds_sa_lane_off = SA_OFF + wave_m * (AS_INNER * 4) + sa_lane * 4
+        lds_sa_lane_off = SA_OFF + wave_m * (AS_INNER * 4) + sa_lane * SCALE_BYTES
         # One full-wave load covers both 16-column halves of an N32 scale
         # super-row. WMMA opsel_a selects lane 0:15 or 16:31 for each wn.
         assert warp_tile_n % 32 == 0, "load_sb split requires a 32-aligned wnb"
-        lds_sb_lane_off = SB_OFF + ((wnb // 32) * SC_INNER + lane) * 4
+        lds_sb_lane_off = SB_OFF + ((wnb // 32) * SC_INNER + lane * SCALE_DWORDS) * 4
 
         def lds_a_base(buf):
             return buf + fx.index_cast(T.index, lds_a_lane_off)
@@ -625,11 +643,19 @@ def launch_gemm_a8w4_tdm(
             return load_half(wn)
 
         def load_sa(buf, sm, ksl):
-            off = (ksl * wmma_m_rep + sm * 2) * 16 * 4
+            off = (ksl * wmma_m_rep + sm * 2) * 16 * SCALE_BYTES
+            if const_expr(scale_block_size == 16):
+                return lds_load_b64(lds_sa_base(buf), fx.Int32(off)).bitcast(fx.Int64)[
+                    0
+                ]
             return lds_load_b32(lds_sa_base(buf), fx.Int32(off))[0]
 
         def load_sb(buf, sn, ksl):
-            off = (sn * SC_INNER + ksl * 32) * 4
+            off = (sn * SC_INNER + ksl * 32 * SCALE_DWORDS) * 4
+            if const_expr(scale_block_size == 16):
+                return lds_load_b64(lds_sb_base(buf), fx.Int32(off)).bitcast(fx.Int64)[
+                    0
+                ]
             return lds_load_b32(lds_sb_base(buf), fx.Int32(off))[0]
 
         wmma_atoms = (
@@ -681,15 +707,16 @@ def launch_gemm_a8w4_tdm(
                     idx = wm * wmma_n_rep + wn
                     if const_expr(a_is_fp4):
                         c_frags[idx].store(
-                            rocdl.wmma_scale_f32_32x16x128_f4(
-                                T.vec(16, T.f32),
+                            wmma_fp4(
                                 wt[wn].load().ir_value(),
                                 act[i].load().ir_value(),
                                 c_frags[idx].load().ir_value(),
                                 sb_k[wn],
                                 sa_k[wm // 2],
-                                scaleAType=0,
-                                scaleBType=wm % 2,
+                                block_size=scale_block_size,
+                                format_a=scale_format_b,
+                                format_b=scale_format_a,
+                                row_b=wm % 2,
                             )
                         )
                     else:
@@ -730,8 +757,8 @@ def launch_gemm_a8w4_tdm(
                     fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                     for _ in range_constexpr(wmma_n_rep)
                 ],
-                sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
-                sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
+                sa=fx.make_rmem_tensor(SA_WIDTH, SCALE_CLS),
+                sb=fx.make_rmem_tensor(SB_WIDTH, SCALE_CLS),
             )
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
@@ -816,7 +843,7 @@ def launch_gemm_a8w4_tdm(
                 mma_total = n_acc - tail_mfma
                 # K256 needs grouping to limit VGPR-bank switches without
                 # turning the complete A/B/scale prefetch into long LDS bursts.
-                mma_group = min(MMA_GROUP, mma_total) if KWS > 1 else 1
+                mma_group = max(1, min(MMA_GROUP, mma_total)) if KWS > 1 else 1
                 schedule_slots = mma_total // mma_group
                 future_schedule = spread(STATE_DS if has_next else 0, schedule_slots)
                 # Spread the tail issue's TDMs over the WMMA groups: one burst
@@ -1040,6 +1067,8 @@ def launch_gemm_a8w4_tdm(
             output_fragments_per_acc = WMMA_N // 16
             for idx in range_constexpr(n_acc):
                 acc = Vec(c_frags[idx].load())
+                if const_expr(has_global_scale):
+                    acc = acc * f32_global_scale
                 for fragment in range_constexpr(output_fragments_per_acc):
                     accs.append(
                         Vec.from_elements(
@@ -1138,17 +1167,32 @@ def launch_gemm_a8w4_tdm(
                                     range_constexpr=range_constexpr,
                                 )
 
-                            scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
-                                all_vals,
-                                wave_size=WAVE,
-                                dtype=(
-                                    MxDtype.FP4_E2M1
-                                    if is_fp4_quant
-                                    else MxDtype.FP8_E4M3
-                                ),
-                            )
+                            if const_expr(scale_format_a or quant_global_scale != 1.0):
+                                amax = fx.Float32(0.0)
+                                for value in all_vals:
+                                    amax = arith.maxnumf(
+                                        amax,
+                                        (
+                                            fx.Float32(value).bitcast(fx.Int32)
+                                            & 0x7FFFFFFF
+                                        ).bitcast(fx.Float32),
+                                    )
+                                amax = arith.maxnumf(amax, amax.shuffle_xor(16, WAVE))
+                                scale_f32, e8m0_byte = emit_fp4_block_scale(
+                                    amax, scale_format_a, quant_global_scale
+                                )
+                            else:
+                                scale_f32, e8m0_byte = emit_amax_e8m0_native_scale(
+                                    all_vals,
+                                    wave_size=WAVE,
+                                    dtype=(
+                                        MxDtype.FP4_E2M1
+                                        if is_fp4_quant
+                                        else MxDtype.FP8_E4M3
+                                    ),
+                                )
                             mx_col = blk_n + wnb + mx_blk * WN_PER_MX_BLOCK * 16
-                            mx_blk_i = fx.Int32(mx_col) >> 6
+                            mx_blk_i = fx.Int32(mx_col) // (scale_block_size * 2)
                             e8m0_bytes.append(e8m0_byte)
                             mx_blk_is.append(mx_blk_i)
 
@@ -1163,11 +1207,22 @@ def launch_gemm_a8w4_tdm(
                                     src = Vec.from_elements(
                                         local_vals + peer_vals, fx.Float32
                                     )
-                                    packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
-                                        src.to(fx.BFloat16).ir_value(),
-                                        scale_f32,
-                                        i32_ty=T.i32,
-                                    )
+                                    if const_expr(
+                                        scale_format_a or quant_global_scale != 1.0
+                                    ):
+                                        src = src * (
+                                            fx.Float32(1.0)
+                                            / (scale_f32 * quant_global_scale)
+                                        )
+                                        packed_i32 = emit_cvt_scalef32_pk8_fp4_f32(
+                                            src.ir_value(), fx.Float32(1.0)
+                                        )
+                                    else:
+                                        packed_i32 = emit_cvt_scalef32_pk8_fp4_bf16(
+                                            src.to(fx.BFloat16).ir_value(),
+                                            scale_f32,
+                                            i32_ty=T.i32,
+                                        )
                                     if kgrp == 0:
                                         col_fp4 = (wnb + wn * 16) // 4
                                         lds_store_b32(
@@ -1205,17 +1260,17 @@ def launch_gemm_a8w4_tdm(
                         # Preshuffled e8m0 scale: one branch per wm (not per mx_blk).
                         if row_rel < mn_oob and is_kgrp0:
                             for mx_blk in range_constexpr(N_MX_BLKS):
-                                scale_dw = mx_blk_is[mx_blk] >> 2
-                                byte_in_dw = mx_blk_is[mx_blk] & 3
+                                scale_group = mx_blk_is[mx_blk] // SCALE_BYTES
+                                byte_in_group = mx_blk_is[mx_blk] % SCALE_BYTES
                                 dst_byte = (
                                     (
-                                        (scale_tile * q_dst_scale_dwpr + scale_dw)
+                                        (scale_tile * q_dst_scale_dwpr + scale_group)
                                         * quant_wmma_rep
                                         + wmma_row
                                     )
                                     * 16
                                     + scale_lane
-                                ) * 4 + byte_in_dw
+                                ) * SCALE_BYTES + byte_in_group
                                 fx.ptr_store(e8m0_bytes[mx_blk], scale_ptr + dst_byte)
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
@@ -1434,6 +1489,7 @@ def launch_gemm_a8w4_tdm(
         arg_bias,
         arg_quant_scale,
         arg_ep_row_map,
+        f32_global_scale,
         i32_m,
         N,
         f32_swiglu_limit,

@@ -231,16 +231,16 @@ def shuffle_scale_n32k4(
     experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
+    scale_block_size: int = 32,
 ) -> torch.Tensor:
-    """Shuffle a raw per-expert e8m0 weight (B) scale into the n32k4 layout.
+    """Shuffle per-expert block-scale bytes into the gfx1250 WMMA layout.
 
-    Input: ``(E, N, K//32)`` (3D) or ``(E*N, K//32)`` (2D, needs ``experts_cnt``).
-    Output: ``(E, N//32, (K//32)*32)`` uint8.
+    Input: ``(E, N, K//scale_block_size)`` or flattened ``(E*N, K//scale_block_size)``.
+    Output: ``(E, N//32, (K//scale_block_size)*32)`` uint8.
 
-    Within a 32-row super-row the column is ``remain_k*128 + row32*4 + r`` so each
-    lane reads its full WMMA scaleB operand (4 e8m0 of one WMMA-K=128 step) with
-    one contiguous ds_load_b32.  Consumed by the gfx1250 grouped MoE GEMM
-    (see flydsl/batched_gemm_mxfp4.py).
+    Each K128 group stores 32 rows of four bytes (per-32) or eight bytes
+    (per-16), so one LDS b32/b64 load supplies a WMMA scale operand. Scale
+    encoding is preserved (E8M0, E5M3, or E4M3).
 
     ``is_guinterleave`` selects the stage1 gate/up packing (``N == 2*inter_dim``):
 
@@ -252,6 +252,9 @@ def shuffle_scale_n32k4(
 
     Only the fused stage1 gate_up scale interleaves: gated on ``gate_up=True``.
     """
+    if scale_block_size not in (16, 32):
+        raise ValueError("scale_block_size must be 16 or 32")
+    scale_bytes = 128 // scale_block_size
     s = src.view(torch.uint8).contiguous()
     if s.ndim == 2:
         if experts_cnt is None:
@@ -271,11 +274,15 @@ def shuffle_scale_n32k4(
         s = s.view(E, 2, N // 2, k_scale).permute(0, 2, 1, 3).reshape(E, N, k_scale)
     if N % 32 != 0:
         raise ValueError(f"B-scale rows must be divisible by 32, got {N}")
-    if k_scale % 4 != 0:
+    if k_scale % scale_bytes != 0:
         raise ValueError(
-            f"B-scale K//32 must be divisible by 4 (K%128==0), got {k_scale}"
+            f"B-scale rows need complete K128 groups of {scale_bytes} bytes, got {k_scale}"
         )
-    g = s.view(E, N // 32, 32, k_scale // 4, 4).permute(0, 1, 3, 2, 4).contiguous()
+    g = (
+        s.view(E, N // 32, 32, k_scale // scale_bytes, scale_bytes)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
     return g.reshape(E, N // 32, k_scale * 32)
 
 
@@ -405,6 +412,7 @@ def moe_shuffle_scale(
     experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
+    scale_block_size: int = 32,
 ) -> torch.Tensor:
     """Arch-aware MoE weight (B) scale shuffle."""
 
@@ -416,7 +424,10 @@ def moe_shuffle_scale(
             experts_cnt,
             is_guinterleave=is_guinterleave,
             gate_up=gate_up,
+            scale_block_size=scale_block_size,
         )
+    if scale_block_size != 32:
+        raise ValueError("per-16 MoE scale shuffle requires gfx1250")
     return shuffle_scale(
         src, experts_cnt=experts_cnt, is_guinterleave=is_guinterleave, gate_up=gate_up
     )

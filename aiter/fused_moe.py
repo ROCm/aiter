@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 from collections.abc import Callable
@@ -527,6 +528,15 @@ def get_inter_dim(w1_shape, w2_shape):
     return E, model_dim, inter_dim
 
 
+def _has_custom_fp4_scales(block_size, format_a, format_b, *global_scales):
+    return (
+        block_size != 32
+        or format_a != 0
+        or format_b != 0
+        or any(scale != 1.0 for scale in global_scales)
+    )
+
+
 def fused_moe(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -567,7 +577,46 @@ def fused_moe(
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
     output: torch.Tensor | None = None,
+    # gfx1250 grouped FP4: elements per K block, ISA formats (0=E8M0,
+    # 1=E5M3, 2=E4M3), and tensor float scales applied before activation.
+    fp4_scale_block_size: int = 32,
+    fp4_scale_format_a: int = 0,
+    fp4_scale_format_b: int = 0,
+    fp4_global_scale_a1: float = 1.0,
+    fp4_global_scale_a2: float = 1.0,
+    fp4_global_scale_w1: float = 1.0,
+    fp4_global_scale_w2: float = 1.0,
 ):
+    fp4_custom_scale = _has_custom_fp4_scales(
+        fp4_scale_block_size,
+        fp4_scale_format_a,
+        fp4_scale_format_b,
+        fp4_global_scale_a1,
+        fp4_global_scale_a2,
+        fp4_global_scale_w1,
+        fp4_global_scale_w2,
+    )
+    if fp4_scale_block_size not in (16, 32):
+        raise ValueError("fp4_scale_block_size must be 16 or 32")
+    if fp4_scale_format_a not in (0, 1, 2) or fp4_scale_format_b not in (0, 1, 2):
+        raise ValueError("FP4 scale formats must be 0=E8M0, 1=E5M3, 2=E4M3")
+    if any(
+        not math.isfinite(x) or x <= 0.0
+        for x in (
+            fp4_global_scale_a1,
+            fp4_global_scale_a2,
+            fp4_global_scale_w1,
+            fp4_global_scale_w2,
+        )
+    ):
+        raise ValueError("FP4 global scales must be finite and positive")
+    if fp4_custom_scale and (
+        get_gfx() != "gfx1250"
+        or gate_mode not in (GateMode.INTERLEAVE, GateMode.INTERLEAVE.value)
+    ):
+        raise ValueError(
+            "custom FP4 block scales require gfx1250 grouped INTERLEAVE MoE"
+        )
     if (
         any(
             tensor is not None
@@ -575,6 +624,8 @@ def fused_moe(
         )
         or shared_expert_id != -1
     ):
+        if fp4_custom_scale:
+            raise ValueError("custom FP4 block scales do not support shared experts")
         from aiter.fhmoe import _fhmoe
 
         return _fhmoe(
@@ -651,6 +702,13 @@ def fused_moe(
         ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
         ep_source_token_map=scatter_source_map,
         output=output,
+        fp4_scale_block_size=fp4_scale_block_size,
+        fp4_scale_format_a=fp4_scale_format_a,
+        fp4_scale_format_b=fp4_scale_format_b,
+        fp4_global_scale_a1=fp4_global_scale_a1,
+        fp4_global_scale_a2=fp4_global_scale_a2,
+        fp4_global_scale_w1=fp4_global_scale_w1,
+        fp4_global_scale_w2=fp4_global_scale_w2,
     )
 
 
@@ -689,6 +747,13 @@ def fused_moe_fake(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    fp4_scale_block_size: int = 32,
+    fp4_scale_format_a: int = 0,
+    fp4_scale_format_b: int = 0,
+    fp4_global_scale_a1: float = 1.0,
+    fp4_global_scale_a2: float = 1.0,
+    fp4_global_scale_w1: float = 1.0,
+    fp4_global_scale_w2: float = 1.0,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -746,6 +811,13 @@ def fused_moe_(
     ep_world_size: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
     output: torch.Tensor | None = None,
+    fp4_scale_block_size: int = 32,
+    fp4_scale_format_a: int = 0,
+    fp4_scale_format_b: int = 0,
+    fp4_global_scale_a1: float = 1.0,
+    fp4_global_scale_a2: float = 1.0,
+    fp4_global_scale_w1: float = 1.0,
+    fp4_global_scale_w2: float = 1.0,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -785,6 +857,13 @@ def fused_moe_(
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
         output=output,
+        fp4_scale_block_size=fp4_scale_block_size,
+        fp4_scale_format_a=fp4_scale_format_a,
+        fp4_scale_format_b=fp4_scale_format_b,
+        fp4_global_scale_a1=fp4_global_scale_a1,
+        fp4_global_scale_a2=fp4_global_scale_a2,
+        fp4_global_scale_w1=fp4_global_scale_w1,
+        fp4_global_scale_w2=fp4_global_scale_w2,
     )
 
 
@@ -822,7 +901,23 @@ def _fused_moe_impl(
     _metadata_config_file: str | None = None,
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
+    fp4_scale_block_size: int = 32,
+    fp4_scale_format_a: int = 0,
+    fp4_scale_format_b: int = 0,
+    fp4_global_scale_a1: float = 1.0,
+    fp4_global_scale_a2: float = 1.0,
+    fp4_global_scale_w1: float = 1.0,
+    fp4_global_scale_w2: float = 1.0,
 ) -> torch.Tensor:
+    fp4_custom_scale = _has_custom_fp4_scales(
+        fp4_scale_block_size,
+        fp4_scale_format_a,
+        fp4_scale_format_b,
+        fp4_global_scale_a1,
+        fp4_global_scale_a2,
+        fp4_global_scale_w1,
+        fp4_global_scale_w2,
+    )
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
@@ -953,8 +1048,19 @@ def _fused_moe_impl(
             situ_beta=1.0 if beta is None else float(beta),
             situ_linear_beta=1.0 if linear_beta is None else float(linear_beta),
             stage2_scatter=stage2_scatter,
+            fp4_scale_block_size=fp4_scale_block_size,
+            fp4_scale_format_a=fp4_scale_format_a,
+            fp4_scale_format_b=fp4_scale_format_b,
+            fp4_global_scale_a1=fp4_global_scale_a1,
+            fp4_global_scale_a2=fp4_global_scale_a2,
+            fp4_global_scale_w1=fp4_global_scale_w1,
+            fp4_global_scale_w2=fp4_global_scale_w2,
         )
 
+    if fp4_custom_scale and grouped_a8w4_out is None:
+        raise ValueError(
+            "custom FP4 block scales are unsupported for this MoE configuration"
+        )
     if grouped_a8w4_out is not None:
         return _return_output(grouped_a8w4_out, output)
 
