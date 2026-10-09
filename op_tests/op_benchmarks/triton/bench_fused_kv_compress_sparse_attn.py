@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Benchmark the DeepSeek-V4 fused KV compressor.
 
 Drives the public launcher, aiter.ops.triton.quant.fused_mxfp8_quant

@@ -1070,7 +1070,10 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     rot = tl.reshape(rot, (TRITON_BLOCK_SIZE,))
     result = normed * cos_v + rot * sin_v
     if SANITIZE_CACHE_NANS:
-        result = tl.where(result == result, result, 0.0)
+        # `x == x` is false only for NaN, so this scrubs NaNs to 0 and leaves
+        # every other value alone. Not a typo: ruff flags the self-comparison,
+        # but it is the NaN test, and tl.where takes (keep_cond, keep, replace).
+        result = tl.where(result == result, result, 0.0)  # noqa: PLR0124
 
     # Store rotated rope portion as bf16 into the cache's bf16 area.
     bf16_ptr = (fp8_ptr + ROPE_IN_REC).to(tl.pointer_type(tl.bfloat16))
@@ -1289,7 +1292,10 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     rot = tl.reshape(rot, (TRITON_BLOCK_SIZE,))
     result = normed * cos_v + rot * sin_v
     if SANITIZE_CACHE_NANS:
-        result = tl.where(result == result, result, 0.0)
+        # `x == x` is false only for NaN, so this scrubs NaNs to 0 and leaves
+        # every other value alone. Not a typo: ruff flags the self-comparison,
+        # but it is the NaN test, and tl.where takes (keep_cond, keep, replace).
+        result = tl.where(result == result, result, 0.0)  # noqa: PLR0124
     bf16_ptr = (fp8_ptr + ROPE_IN_REC).to(tl.pointer_type(tl.bfloat16))
     rope_local = block - NOPE_HEAD_DIM
     is_rope = (block >= NOPE_HEAD_DIM) & mask
