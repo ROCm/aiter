@@ -624,8 +624,6 @@ template <int Q_TILE_SIZE_  = 32,
           bool CAUSAL_      = false,
           bool LARGE_KV_    = false,
           int KV_SLOTS_     = 3,
-          int K_DEPTH_      = 2,
-          int V_DEPTH_      = 4,
           bool SPLIT_DMA_   = true>
 struct opus_mla_decode_fp8_32mx4_64nx1_traits
 {
@@ -680,14 +678,15 @@ struct opus_mla_decode_fp8_32mx4_64nx1_traits
     static constexpr int O_VGPR_TILES = GEMM1_E_M - O_AGPR_TILES; // 9
 
     // K and V share one register ring: K_DEPTH GEMM0 k-steps (16 registers each, both token
-    // tiles) during QK, V_DEPTH d-tiles (8 each) during PV.
-    static constexpr int K_DEPTH = K_DEPTH_;
-    static constexpr int V_DEPTH = V_DEPTH_;
-    static_assert(K_DEPTH >= 2 && K_DEPTH < GEMM0_E_K);
+    // tiles) during QK, V_DEPTH d-tiles (8 each) during PV, so V entry dt overlays K entry
+    // dt / 2 exactly.
+    static constexpr int K_DEPTH = 2;
+    static constexpr int V_DEPTH = 4;
+    static_assert(V_DEPTH * W_M * W_K == K_DEPTH * GEMM0_E_N * W_N * W_K,
+                  "the V ring must fold exactly onto the K ring");
     // Release a KV slot a chunk at a time (see SPLIT_DMA in the kernel). Pays on long work
     // items; on a handful of tiles its extra barrier per phase costs more than it hides.
     static constexpr bool SPLIT_DMA = SPLIT_DMA_;
-    static_assert(V_DEPTH >= 2 && V_DEPTH < GEMM1_E_M);
 
     static constexpr int VEC_Q    = 16; // fp8 dwordx4
     static constexpr int VEC_KV   = 16;

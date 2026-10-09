@@ -20,8 +20,6 @@ using mla32mx4_traits_t = opus_mla_decode_fp8_32mx4_64nx1_traits<32,
                                                                  CAUSAL,
                                                                  LARGE_KV,
                                                                  3,
-                                                                 2,
-                                                                 4,
                                                                  SPLIT_DMA>;
 
 #if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx950__)
