@@ -38,6 +38,8 @@ from __future__ import annotations
 import argparse
 import itertools
 import math
+import os
+import sys
 
 import pandas as pd
 import torch
@@ -70,6 +72,9 @@ from aiter.ops.triton.attention.qsa_vllm_amd import (
     qsa_sparse_paged_attention,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from op_tests.qsa_shapes import (
     FAMILY_A_GQA,
     FAMILY_A_INDEXER,
