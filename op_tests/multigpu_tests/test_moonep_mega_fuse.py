@@ -1,13 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-"""8-GPU check: MegaMoEV2 with MoonEP placement fused into prepare.
+"""EP8/EP4 check: MegaMoEV2 with MoonEP placement fused into prepare.
 
 Runs the same skewed routing through a plain MegaMoEV2 and through a
 ``moonep_slots=B`` instance whose weight window is ``[EPR home | B slots]``.
 The slots are filled in ``after_prepare`` from the ``placed`` table prepare
 wrote, the way a production weight pool would.  Outputs must match.
 
-    torchrun --nproc-per-node 8 op_tests/multigpu_tests/test_moonep_mega_fuse.py
+    torchrun --nproc-per-node 8|4 op_tests/multigpu_tests/test_moonep_mega_fuse.py
 """
 
 import argparse

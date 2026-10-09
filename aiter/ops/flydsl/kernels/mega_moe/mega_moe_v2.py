@@ -68,6 +68,10 @@ class MegaMoEV2:
         if self.moonep_slots:
             if fanout_masks:
                 raise ValueError("MoonEP placement requires fanout pairs disabled")
+            if self.world_size not in (4, 8):
+                raise ValueError(
+                    f"MoonEP placement supports EP4 and EP8, got {self.world_size}"
+                )
             # The placement settles one destination's slots per 64-lane wave.
             if not 0 < self.moonep_slots < self.epr or self.moonep_slots > 64:
                 raise ValueError(

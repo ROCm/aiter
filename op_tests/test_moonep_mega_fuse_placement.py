@@ -392,8 +392,8 @@ def main() -> int:
     parser.add_argument("--quick", action="store_true")
     # 48 > 32 exercises a slot bitmap wider than 32 bits.
     parser.add_argument("--slots", default="8,48")
-    # Fewer ranks than the 8 prepare waves (EP4/EP2) leave waves idle per rank.
-    parser.add_argument("--world", default="8,4,2")
+    # EP4 leaves half of the 8 prepare waves idle per rank.
+    parser.add_argument("--world", default="8,4")
     args = parser.parse_args()
     cases = [
         (0, 1.2, 1, False, True),
