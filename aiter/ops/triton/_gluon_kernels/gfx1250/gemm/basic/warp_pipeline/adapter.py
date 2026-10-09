@@ -19,9 +19,9 @@ from triton.experimental.gluon.language.amd.cdna5 import PartitionedSharedLayout
 
 
 def _example():
-    from . import mcontiguous_row_padded
+    from .. import gemm_warp_pipeline_cdna5
 
-    return mcontiguous_row_padded
+    return gemm_warp_pipeline_cdna5
 
 
 @dataclass

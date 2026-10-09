@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-# Native K128 A-scale preshuffle with 64-bit LDS loads, derived from Triton CDNA5 examples.
+# Native K128 M-contiguous scales and padded two-buffer output, derived from Triton CDNA5 examples.
 import triton
 import triton.experimental.gluon.language as gl
 from triton.experimental import gluon
 from triton.experimental.gluon.language.amd.cdna5 import tdm
 
-from .helpers import chiplet_transform
+from .warp_pipeline.helpers import chiplet_transform
 
 
 @gluon.jit
