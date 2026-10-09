@@ -1456,11 +1456,14 @@ class OManager16bV2:
     GQA-packed 3-D ``[num_seq, gqa, v_hdim]`` descriptor, degenerating to ``[rows,1,v_hdim]``
     at gqa==1; ``num_warps=1`` keeps each wave in its own LDS region, so no cross-wave sync.
 
-    NOTE: the LDS staging is CONTIGUOUS, no pad. A TDM store IGNORES LDS padding on the
-    LDS->memory direction (Shader Programming Guide 4.10.2: "there is no de-padding operation;
-    padding is ignored"), so a padded tile would be read misaligned and only row 0 would land.
-    The unpadded ``ds_store_b128`` therefore takes a bank conflict, negligible for a one-time
-    epilogue."""
+    The LDS staging IS padded. A TDM store ignores LDS padding on the LDS->memory direction
+    (Shader Programming Guide 4.10.2: "there is no de-padding operation; padding is ignored"),
+    so the pad cannot be declared as pad -- it is declared as DATA instead: the tile is
+    ``v_hdim + _O_PAD_ELEMS`` wide, which is what the LDS walk advances per row, while the
+    tensor extent stays ``v_hdim``. The pad columns then sit past the tensor's dim-0 end, and
+    4.10.2 drops those: "writes to those portions of the tile are dropped". Same mechanism as
+    the row extent that drops seq >= q_len, just on the other axis. tile_dim0 has no
+    power-of-two constraint -- that applies to pad_interval, which is load-side only."""
 
     def __init__(
         self,
@@ -1483,7 +1486,7 @@ class OManager16bV2:
         self.d_tiles = v_hdim // _WMMA_M
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave  # 32
         self.block_m = self.rows_per_warp * num_waves  # 256
-        self.row_elems = v_hdim  # CONTIGUOUS (TDM store ignores pad)
+        self.row_elems = v_hdim + _O_PAD_ELEMS  # padded; the pad rides as dropped columns
         self.row_bytes = self.row_elems * _BF16_BYTES
 
     def get_lds_size_in_byte(self):
@@ -1565,16 +1568,19 @@ class OManager16bV2:
             gbase = fx.add_offset(fx.get_iter(ptr_O), off)
             g_view = fx.Tensor(
                 fx.make_view(
-                    gbase, fx.make_layout((_WMMA_M, self.v_hdim), (self.v_hdim, 1))
+                    gbase, fx.make_layout((_WMMA_M, self.row_elems), (self.row_elems, 1))
                 )
             )
             atom = fx.rocdl.make_tdm_atom(
-                g_view, [num_seq_valid, None], strides=[stride_o_seq, None], num_warps=1
+                g_view,
+                [num_seq_valid, self.v_hdim],
+                strides=[stride_o_seq, None],
+                num_warps=1,
             )
             lds_view = fx.Tensor(
                 fx.make_view(
                     lds_iter,
-                    fx.make_layout((_WMMA_M, self.v_hdim), (self.row_elems, 1)),
+                    fx.make_layout((_WMMA_M, self.row_elems), (self.row_elems, 1)),
                 )
             )
         else:
@@ -1590,13 +1596,14 @@ class OManager16bV2:
                 fx.make_view(
                     gbase,
                     fx.make_layout(
-                        (num_seq, gqa, self.v_hdim), (gqa * self.v_hdim, self.v_hdim, 1)
+                        (num_seq, gqa, self.row_elems),
+                        (gqa * self.row_elems, self.row_elems, 1),
                     ),
                 )
             )
             atom = fx.rocdl.make_tdm_atom(
                 g_view,
-                [num_seq_valid, None, None],
+                [num_seq_valid, None, self.v_hdim],
                 strides=[stride_o_seq, stride_o_head, None],
                 num_warps=1,
             )
@@ -1604,7 +1611,7 @@ class OManager16bV2:
                 fx.make_view(
                     lds_iter,
                     fx.make_layout(
-                        (num_seq, gqa, self.v_hdim),
+                        (num_seq, gqa, self.row_elems),
                         (gqa * self.row_elems, self.row_elems, 1),
                     ),
                 )

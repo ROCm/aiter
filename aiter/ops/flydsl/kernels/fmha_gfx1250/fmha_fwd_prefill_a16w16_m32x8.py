@@ -226,7 +226,7 @@ KV_PRODUCER_WARPS = NUM_WAVES // 2
 # O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
 # far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
 # global_store_async_from_lds_b128.
-O_VARIANT = "v3"
+O_VARIANT = "v2"
 
 # LDS->VGPR ring for the fused PV+QK WMMA stream (``_pv_qk_gemm``). Bursting every
 # ds_load of the resident KV tile into VGPRs before the first wmma makes the live cost
