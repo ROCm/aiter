@@ -100,22 +100,6 @@ def create_layouts(
     return wmma, op_a, op_b, smem_x, smem_res, smem_fn, smem_nres, smem_red, smem_red2
 
 
-@gluon.jit
-def _wait_after_load(
-    i, EXTRA: gl.constexpr, NUM_STAGES: gl.constexpr, K_LOOP: gl.constexpr
-):
-    """Wait for k-step i's loads, i a loop variable. Each wave may leave the TDM ops
-    it issued after them in flight: the stores of the previous NUM_STAGES-1 steps
-    and the loads of each later stage (x, res, fn: 3 per stage). That count is the
-    wait for step i's fn; its x and res, issued one op earlier, allow one more op
-    (EXTRA=1). s_wait_tensorcnt takes an immediate, so the count is picked from a
-    ladder of uniform branches."""
-    n = gl.minimum(i, NUM_STAGES - 1) + 3 * gl.minimum(NUM_STAGES - 1, K_LOOP - 1 - i)
-    for v in gl.static_range(4 * (NUM_STAGES - 1) + 1):
-        if n == v:
-            gl.amd.gfx1250.tdm.async_wait(v + EXTRA)
-
-
 @gluon.constexpr_function
 def _fn_read_layout(HC, N_PAD, KS):
     """[HC, N_PAD, KS/16, 32] view of the packed fn tile (the same bytes as the
@@ -200,6 +184,59 @@ def _issue_loads(
         )
     else:
         gl.amd.gfx1250.tdm.async_load(fn_desc, [0, 0, kb * KS], fn_smem.index(slot))
+
+
+@gluon.jit
+def _wait_next_stage(i, NUM_STAGES: gl.constexpr, K_LOOP: gl.constexpr):
+    """K-step i waits for stage i+1's loads (after its WMMAs, before its own
+    next_residual store and refill). Each wave may leave in flight the TDM ops it
+    issued after them: the stores of up to NUM_STAGES-2 earlier k-steps and the loads
+    of the later stages (x, res, fn: 3 per stage). s_wait_tensorcnt takes an
+    immediate, so the count is picked from a ladder of uniform branches."""
+    n = gl.minimum(i, NUM_STAGES - 2) + 3 * gl.minimum(
+        NUM_STAGES - 2, K_LOOP - 2 - i
+    )
+    for v in gl.static_range(4 * (NUM_STAGES - 2) + 1):
+        if n == v:
+            gl.amd.gfx1250.tdm.async_wait(v)
+
+
+@gluon.jit
+def _read_stage(
+    x_smem,
+    res_smem,
+    fn_smem,
+    fn_rd,
+    slot,
+    HC: gl.constexpr,
+    N_PAD: gl.constexpr,
+    KS: gl.constexpr,
+    W_PRESHUFFLED: gl.constexpr,
+    OP_A: gl.constexpr,
+    OP_B: gl.constexpr,
+):
+    """One ring stage, LDS -> registers: x and each residual head as
+    [1, BLOCK_M, KS] in the A-operand layout (replicated over the head warps), and
+    the fn B operands (hi, lo)."""
+    X_TILE: gl.constexpr = gl.SliceLayout(0, OP_A)
+    x_t = gl.expand_dims(
+        gl.amd.cdna4.async_copy.load_shared_relaxed(x_smem.index(slot), X_TILE), 0
+    )
+    r_buf = res_smem.index(slot)
+    r0 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(0, 1), OP_A)
+    r1 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(1, 1), OP_A)
+    r2 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(2, 1), OP_A)
+    r3 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(3, 1), OP_A)
+    if W_PRESHUFFLED:
+        b_hi = _load_fn_plane(fn_rd, slot, 0, HC, N_PAD, KS, OP_B)
+        b_lo = _load_fn_plane(fn_rd, slot, 1, HC, N_PAD, KS, OP_B)
+    else:
+        f = gl.amd.cdna4.async_copy.load_shared_relaxed(
+            fn_smem.index(slot).permute([0, 2, 1]), OP_B
+        )
+        b_hi = f.to(x_smem.dtype)
+        b_lo = (f - b_hi.to(gl.float32)).to(x_smem.dtype)
+    return x_t, r0, r1, r2, r3, b_hi, b_lo
 
 
 @gluon.jit(repr=_mhc_post_pre_gemm_sqrsum_repr)
@@ -336,6 +373,7 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
         fn_smem = gl.allocate_shared_memory(
             fn_ptr.type.element_ty, [NUM_STAGES, HC, N_PAD, KS], SMEM_FN
         )
+        fn_rd = fn_smem
 
     # ---- prologue: the first stages' TDM loads (the coefficient loads above are
     # already in flight; vector-memory and TDM traffic overlap) ----
@@ -358,31 +396,19 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
             )
 
     acc = gl.zeros([HC, BLOCK_M, N_PAD], dtype=gl.float32, layout=WMMA)
-    X_TILE: gl.constexpr = gl.SliceLayout(0, OP_A)  # [BLOCK_M, KS]
     sq = gl.zeros([HC, BLOCK_M, KS], dtype=gl.float32, layout=OP_A)
 
-    # ---- main loop, rolled: the code size does not grow with K_LOOP (unrolled, the
-    # kernel misses the instruction cache whenever other kernels ran before it) ----
+    # ---- main loop, rolled (code size independent of K_LOOP: unrolled, the kernel
+    # misses the instruction cache whenever other kernels ran before it). Stage i+1's
+    # operands are read into registers during k-step i, right after its WMMAs, so
+    # the LDS reads overlap the math; one barrier per k-step. ----
+    gl.amd.gfx1250.tdm.async_wait(3 * min(NUM_STAGES - 1, K_LOOP - 1))
+    gl.barrier()
+    x_t, r0, r1, r2, r3, b_hi, b_lo = _read_stage(
+        x_smem, res_smem, fn_smem, fn_rd, 0, HC, N_PAD, KS, W_PRESHUFFLED, OP_A, OP_B
+    )
     for i in range(K_LOOP):
-        # Wait for x and res only (TDM completes in issue order: x, res, fn); fn, the
-        # largest tile, is waited for right before its reads below, so the post mix
-        # runs while it lands.
-        _wait_after_load(i, 1, NUM_STAGES, K_LOOP)
-        gl.barrier()
-
-        # x and each residual head as [1, BLOCK_M, KS] in the A-operand layout
-        # (replicated over the head warps), broadcast against [HC, BLOCK_M, 1]
-        # coefficients.
         slot = i % NUM_STAGES
-        x_t = gl.expand_dims(
-            gl.amd.cdna4.async_copy.load_shared_relaxed(x_smem.index(slot), X_TILE), 0
-        )
-        r_buf = res_smem.index(slot)
-        r0 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(0, 1), OP_A)
-        r1 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(1, 1), OP_A)
-        r2 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(2, 1), OP_A)
-        r3 = gl.amd.cdna4.async_copy.load_shared_relaxed(r_buf.slice(3, 1), OP_A)
-
         # Same contraction order as the HIP kernel: round comb0*res0, FMA x*post
         # into it, then FMA the remaining heads (keeps sqrsum bit-compatible).
         a = gl.expand_dims(comb0_c, 2) * r0.to(gl.float32)
@@ -390,55 +416,62 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
         a = gl.expand_dims(comb1_c, 2) * r1.to(gl.float32) + a
         a = gl.expand_dims(comb2_c, 2) * r2.to(gl.float32) + a
         a = gl.expand_dims(comb3_c, 2) * r3.to(gl.float32) + a
-
         a_bf = a.to(nres_ptr.type.element_ty)
-
-        _wait_after_load(i, 0, NUM_STAGES, K_LOOP)
-        gl.barrier()
-        if W_PRESHUFFLED:
-            b_hi = _load_fn_plane(fn_rd, slot, 0, HC, N_PAD, KS, OP_B)
-            b_lo = _load_fn_plane(fn_rd, slot, 1, HC, N_PAD, KS, OP_B)
-        else:
-            # Same split as mhc_shuffle_fn: hi = bf16(fn), lo = bf16(fn - hi).
-            f = gl.amd.cdna4.async_copy.load_shared_relaxed(
-                fn_smem.index(slot).permute([0, 2, 1]), OP_B
-            )
-            b_hi = f.to(dt)
-            b_lo = (f - b_hi.to(gl.float32)).to(dt)
+        # Stage next_residual now; the next barrier publishes it.
+        nres_smem.index(slot).store(a_bf)
         acc = gl.amd.gfx1250.wmma(a_bf, b_hi, acc)
         acc = gl.amd.gfx1250.wmma(a_bf, b_lo, acc)
         sq = a * a + sq
-        if i == K_LOOP - 1:
-            # Deposit the head partials now: the barrier below (before the last
-            # next_residual TDM store) publishes them, and they land before that
-            # store starts reading LDS.
-            red_smem.store(acc)
-            sq_smem.store(gl.sum(sq, axis=2))
-
-        # Stage next_residual in LDS; the barrier also marks every read of this
-        # ring slot done, so the slot can be refilled right after.
-        nres_smem.index(slot).store(a_bf)
-        gl.barrier()
-        gl.amd.gfx1250.tdm.async_store(
-            nres_desc,
-            _res_offsets(row0, kb0 + i, HC, KS, RES_SHUFFLED),
-            nres_smem.index(slot),
-        )
-        if i + NUM_STAGES < K_LOOP:
-            _issue_loads(
-                x_desc,
-                res_desc,
-                fn_desc,
+        if i + 1 < K_LOOP:
+            _wait_next_stage(i, NUM_STAGES, K_LOOP)
+            # One barrier: next_residual tile i is published, ring slot i is free
+            # (its operands were read in the previous k-step) and stage i+1 is
+            # visible.
+            gl.barrier()
+            gl.amd.gfx1250.tdm.async_store(
+                nres_desc,
+                _res_offsets(row0, kb0 + i, HC, KS, RES_SHUFFLED),
+                nres_smem.index(slot),
+            )
+            if i + NUM_STAGES < K_LOOP:
+                _issue_loads(
+                    x_desc,
+                    res_desc,
+                    fn_desc,
+                    x_smem,
+                    res_smem,
+                    fn_smem,
+                    row0,
+                    kb0 + i + NUM_STAGES,
+                    slot,
+                    HC,
+                    KS,
+                    RES_SHUFFLED,
+                    W_PRESHUFFLED,
+                )
+            x_t, r0, r1, r2, r3, b_hi, b_lo = _read_stage(
                 x_smem,
                 res_smem,
                 fn_smem,
-                row0,
-                kb0 + i + NUM_STAGES,
-                slot,
+                fn_rd,
+                (i + 1) % NUM_STAGES,
                 HC,
+                N_PAD,
                 KS,
-                RES_SHUFFLED,
                 W_PRESHUFFLED,
+                OP_A,
+                OP_B,
+            )
+        if i == K_LOOP - 1:
+            # Last k-step: deposit the head partials; the barrier publishes them
+            # with the last next_residual tile, before its TDM store reads LDS.
+            red_smem.store(acc)
+            sq_smem.store(gl.sum(sq, axis=2))
+            gl.barrier()
+            gl.amd.gfx1250.tdm.async_store(
+                nres_desc,
+                _res_offsets(row0, kb0 + i, HC, KS, RES_SHUFFLED),
+                nres_smem.index(slot),
             )
 
     # ---- epilogue: reduce over heads through LDS with a single barrier ----
