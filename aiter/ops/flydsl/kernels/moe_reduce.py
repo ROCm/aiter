@@ -48,6 +48,7 @@ def _moe_reduction_body(
     scale_blk: fx.Constexpr[int],
     fp8_row_stride: fx.Constexpr[int],
     NTHREADS: fx.Constexpr[int],
+    streaming_loads: fx.Constexpr[bool],
 ):
     # One tiled-copy reduce for every dtype. Dense (f16/bf16/f32) loads V elems
     # and extends to f32; fp8 route-out loads 8 fp8 bytes + their e8m0 microscale
@@ -55,11 +56,12 @@ def _moe_reduction_body(
     # (uniform soffset = k*row_stride) and truncating store. row_stride differs:
     # an fp8 row is padded with its scale bytes ([N fp8 | N/scale_blk e8m0]).
     is_fp8 = dtype_str == "fp8"
+    load_cache = 2 if streaming_loads else 0
     if const_expr(is_fp8):
         in_elem, in_bytes, V = fx.Int8, 1, FP8_VEC
         row_stride = fp8_row_stride
         out_numeric = fx.Float16 if (out_dtype_str or "bf16") == "f16" else fx.BFloat16
-        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), fx.Int8)
+        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy64b(load_cache), fx.Int8)
     else:
         in_elem = (
             fx.Float32
@@ -69,7 +71,7 @@ def _moe_reduction_body(
         in_bytes = 4 if dtype_str == "f32" else 2
         row_stride, out_numeric = model_dim, in_elem
         V = 128 // (8 * in_bytes)  # 4 (f32), 8 (16b)
-        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_elem)
+        load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(load_cache), in_elem)
     out_bytes = out_numeric.width // 8
     TILE = NTHREADS * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
@@ -211,13 +213,15 @@ def compile_moe_reduction(
     use_weight: bool = False,
     scale_blk: int | None = None,
     pitch_align: int | None = None,
+    streaming_loads: bool = False,
 ):
     """Compile the topk-reduce launcher for one Constexpr set (cached per shape).
 
     Returns a ``@flyc.jit`` taking ``(X, Y, expert_mask, topk_ids, topk_weights,
     i32_m_tokens, stream)``; dispatch it through ``moe_kernels._run_compiled``. The
     launcher is a distinct object per shape, so the shim's per-exe ``_cf`` cache
-    stays correct.
+    stays correct. streaming_loads opts into nontemporal contribution loads
+    for buffers consumed once; the default retains the existing cache policy.
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     block = _pick_reduce_block(model_dim, V)
@@ -239,6 +243,9 @@ def compile_moe_reduction(
         f"_m{int(use_mask)}e{num_experts if use_mask else 0}"
         f"_w{int(use_weight)}_s{scale_blk}_r{fp8_row_stride}_b{block}"
     )
+
+    if streaming_loads:
+        kernel_name += "_nt"
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def reduction_kernel(
@@ -266,6 +273,7 @@ def compile_moe_reduction(
             scale_blk,
             fp8_row_stride,
             block,
+            streaming_loads,
         )
 
     @flyc.jit

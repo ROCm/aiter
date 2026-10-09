@@ -28,6 +28,10 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     "Q256 requires contiguous tensors on the same GPU");
     const int64_t tokens = out->size(0), model = out->size(1);
     const int64_t experts = gate->size(0), capacity = sorted_ids->numel();
+    const bool compact_routes = partials->dim() == 3;
+    AITER_CHECK(!compact_routes || (partials->size(0) == tokens &&
+                partials->size(1) == topk && partials->size(2) == model),
+                "Q256 compact contributions must be [tokens, topk, model]");
     AITER_CHECK(tokens > 0 && tokens < (1 << 24) && model >= 512 && model % 256 == 0 &&
                 topk > 0 && topk <= 127 && topk <= experts && capacity > 0 && capacity % 256 == 0,
                 "Unsupported Q256 geometry");
@@ -41,7 +45,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(input->numel() == tokens * model / 2 &&
                 gate->size(1) == 512 && gate->size(2) == model / 2 &&
                 down->size(0) == experts && down->size(1) == model && down->size(2) == 128 &&
-                partials->numel() == capacity * model && sorted_weights->numel() == capacity &&
+                partials->numel() == (compact_routes ? tokens * topk : capacity) * model && sorted_weights->numel() == capacity &&
                 sorted_experts->numel() >= capacity / 256 && counts->numel() == 2 &&
                 reverse_sorted->numel() == tokens * topk &&
                 input_scale->numel() >= capacity * model / 32 &&
@@ -81,9 +85,19 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     args.top_k = topk;
     args.total_workgroups = 256;
     args.hidden_tiles = 1;
-    static AiterAsmKernel producer(
-        "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate",
-        "fmoe/silu/fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate.co");
+    const auto select_producer = [compact_routes]() -> AiterAsmKernel& {
+        if(compact_routes) {
+            static AiterAsmKernel compact_producer(
+                "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route",
+                "fmoe/silu/fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate_route.co");
+            return compact_producer;
+        }
+        static AiterAsmKernel sorted_producer(
+            "fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate",
+            "fmoe/silu/fused_moe_mxfp4_prefill_1tg_4w_256mx1_128nx1_ps_fp32gate.co");
+        return sorted_producer;
+    };
     size_t arg_size = sizeof(args);
+    auto& producer = select_producer();
     producer.launch_kernel({&args, &arg_size, 256, 1, 1, 256, 1, 1, stream});
 }

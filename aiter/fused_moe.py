@@ -1737,7 +1737,7 @@ def fused_moe_1stage(
             from aiter.ops.moe_op import fmoe_q256
 
             partials = torch.empty(
-                (sorted_ids.numel(), model_dim), dtype=dtypes.bf16, device=a1.device
+                (token_num, topk, model_dim), dtype=dtypes.bf16, device=a1.device
             )
             fmoe_q256(
                 moe_buf,

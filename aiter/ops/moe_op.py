@@ -723,6 +723,15 @@ def fmoe_q256(
         topk,
     )
     tokens, model = out.shape
+    if partials.ndim == 3:
+        from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
+
+        # Producer contributions already include the routing weights.
+        _run_moe_reduction(
+            partials, out, tokens, topk, model,
+            streaming_loads=(model, topk) == (8192, 11),
+        )
+        return
     _reduce_q256_routes[(tokens, (model + 8191) // 8192)](
         partials,
         reverse_sorted,
