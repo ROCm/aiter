@@ -37,6 +37,8 @@ from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
 
 fm = importlib.import_module("aiter.fused_moe")
 SUPPORTED_GFX = ("gfx950",)
+# Shape parameters are supplied by main(), not pytest fixtures.
+__test__ = False
 
 
 def run_torch(
