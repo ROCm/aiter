@@ -52,6 +52,7 @@ import math
 import os
 import shutil
 import socket
+import struct
 import tempfile
 
 import torch
@@ -285,12 +286,12 @@ class MoonEPVmmPool:
         # ours after the exchange.  Close them all now; a deep model keeps
         # several pools per layer alive for its whole lifetime.
         try:
-            peer_fds = _exchange_fds(self.rank, self.world_size, fd.value, self._group)
+            peer_fds, devs = _exchange_fds(
+                self.rank, self.world_size, fd.value, dev, self._group
+            )
         finally:
             os.close(fd.value)
         try:
-            devs = [0] * self.world_size
-            dist.all_gather_object(devs, dev, group=self._group)
             for pe in range(self.world_size):
                 if pe == self.rank:
                     continue
@@ -410,8 +411,8 @@ def _enable_peer(peer_dev: int, my_dev: int) -> None:
         raise RuntimeError(f"hipDeviceEnablePeerAccess({peer_dev}) -> hipError {err}")
 
 
-def _exchange_fds(rank, world, fd, group) -> list[int]:
-    """All-gather one shareable fd per rank over unix sockets + SCM_RIGHTS.
+def _exchange_fds(rank, world, fd, dev, group) -> tuple[list[int], list[int]]:
+    """All-gather each rank's shareable fd and device over unix sockets + SCM_RIGHTS.
 
     fds cannot travel through torch.distributed; mori solves the same problem
     with LocalBootstrapNetwork ("Use cases: VMM shareable handle (file
@@ -454,21 +455,23 @@ def _exchange_fds(rank, world, fd, group) -> list[int]:
         for _ in range(world - 1):
             conn, _addr = srv.accept()
             try:
-                socket.send_fds(conn, [b"x"], [fd])
+                socket.send_fds(conn, [struct.pack("<i", dev)], [fd])
             finally:
                 conn.close()
 
         out = [-1] * world
-        out[rank] = fd
+        devs = [-1] * world
+        out[rank], devs[rank] = fd, dev
         for peer, c in clients.items():
             try:
-                _msg, fds, _flags, _addr = socket.recv_fds(c, 1, 1)
-                if len(fds) != 1:
-                    raise RuntimeError(f"rank {rank}: no fd from peer {peer}")
+                msg, fds, _flags, _addr = socket.recv_fds(c, 4, 1)
+                if len(fds) != 1 or len(msg) != 4:
+                    raise RuntimeError(f"rank {rank}: no fd/device from peer {peer}")
                 out[peer] = fds[0]
+                (devs[peer],) = struct.unpack("<i", msg)
             finally:
                 c.close()
-        return out
+        return out, devs
     finally:
         srv.close()
         dist.barrier(group=group)
