@@ -625,6 +625,84 @@ def _build_kv_kernel(
             v_out_pair_view = fx.composition(v_out, pair_tile_3d)
             k_out_lane_pairs = fx.slice(k_out_pair_view, (None, None, lane_coord))
             v_out_lane_pairs = fx.slice(v_out_pair_view, (None, None, lane_coord))
+
+        def compute_token(tok, token_local):
+            if const_expr(emit_flat_kv):
+                flat_slot_valid = slot_mapping[tok] >= 0
+            sumsq_local = fx.Float32(0.0)
+            # D=64 uses one row per 32-lane half; larger heads use
+            # one row per native wave and broadcast the lower half's
+            # reduction result.
+            if pair_lane < RMS_GROUP:
+                rms_tile = fx.slice(
+                    qkv_rms_view,
+                    (tok, H_Q + head, (pair_lane, None)),
+                )
+                sumsq_local = load_rms_sumsq(rms_tile)
+            sumsq = rms_reduce_add(
+                sumsq_local,
+                pair_lane,
+                broadcast_half=pair_lanes > RMS_GROUP,
+            )
+            rstd = fx.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
+
+            k_pairs = fx.slice(qkv_lane_pairs, (tok, H_Q + head, None))
+            v_pairs = fx.slice(qkv_lane_pairs, (tok, H_Q + H_KV + head, None))
+            k_lds_pairs = fx.slice(k_lds_lane_pairs, (token_local, None))
+            v_lds_pairs = fx.slice(v_lds_lane_pairs, (token_local, None))
+
+            k_out_pairs = (
+                fx.slice(k_out_lane_pairs, (tok, head, None))
+                if const_expr(emit_flat_kv)
+                else None
+            )
+            v_out_pairs = (
+                fx.slice(v_out_lane_pairs, (tok, head, None))
+                if const_expr(emit_flat_kv)
+                else None
+            )
+            for p in range_constexpr(pairs_per_lane):
+                k0 = fx.Float32(k_pairs[p, 0])
+                k1 = fx.Float32(k_pairs[p, 1])
+
+                xn0 = k0 * rstd * w0s[p]
+                xn1 = k1 * rstd * w1s[p]
+
+                cos_v, sin_v = mrope_cos_sin(
+                    pair_cols[p],
+                    tok,
+                    positions,
+                    cos_t,
+                    sin_t,
+                    mrope_section,
+                    is_interleaved,
+                )
+                o0 = xn0 * cos_v - xn1 * sin_v
+                o1 = xn1 * cos_v + xn0 * sin_v
+                if const_expr(cache_is_fp8):
+                    kb0, kb1 = quant_pair_fp8(o0, o1, k_scale_value)
+                else:
+                    kb0 = o0.to(fx.BFloat16)
+                    kb1 = o1.to(fx.BFloat16)
+                k_lds_pairs[p, 0] = kb0
+                k_lds_pairs[p, 1] = kb1
+                if const_expr(emit_flat_kv) and flat_slot_valid:
+                    k_out_pairs[p, 0] = kb0
+                    k_out_pairs[p, 1] = kb1
+
+                v0 = fx.Float32(v_pairs[p, 0])
+                v1 = fx.Float32(v_pairs[p, 1])
+                if const_expr(cache_is_fp8):
+                    vb0, vb1 = quant_pair_fp8(v0, v1, v_scale_value)
+                else:
+                    vb0 = v0.to(fx.BFloat16)
+                    vb1 = v1.to(fx.BFloat16)
+                v_lds_pairs[p, 0] = vb0
+                v_lds_pairs[p, 1] = vb1
+                if const_expr(emit_flat_kv) and flat_slot_valid:
+                    v_out_pairs[p, 0] = vb0
+                    v_out_pairs[p, 1] = vb1
+
         for it in range_constexpr(layout_phase1_token_tv.shape[1].unpack()):
             token_local = fx.crd2idx(
                 (compute_group, it), layout_phase1_token_tv
@@ -632,81 +710,7 @@ def _build_kv_kernel(
             if token_local < block_size:
                 tok = tok0 + token_local
                 if tok < num_tokens:
-                    if const_expr(emit_flat_kv):
-                        flat_slot_valid = slot_mapping[tok] >= 0
-                    sumsq_local = fx.Float32(0.0)
-                    # D=64 uses one row per 32-lane half; larger heads use
-                    # one row per native wave and broadcast the lower half's
-                    # reduction result.
-                    if pair_lane < RMS_GROUP:
-                        rms_tile = fx.slice(
-                            qkv_rms_view,
-                            (tok, H_Q + head, (pair_lane, None)),
-                        )
-                        sumsq_local = load_rms_sumsq(rms_tile)
-                    sumsq = rms_reduce_add(
-                        sumsq_local,
-                        pair_lane,
-                        broadcast_half=pair_lanes > RMS_GROUP,
-                    )
-                    rstd = fx.rsqrt(sumsq * (1.0 / D) + eps, fastmath=fm_fast)
-
-                    k_pairs = fx.slice(qkv_lane_pairs, (tok, H_Q + head, None))
-                    v_pairs = fx.slice(qkv_lane_pairs, (tok, H_Q + H_KV + head, None))
-                    k_lds_pairs = fx.slice(k_lds_lane_pairs, (token_local, None))
-                    v_lds_pairs = fx.slice(v_lds_lane_pairs, (token_local, None))
-
-                    k_out_pairs = (
-                        fx.slice(k_out_lane_pairs, (tok, head, None))
-                        if const_expr(emit_flat_kv)
-                        else None
-                    )
-                    v_out_pairs = (
-                        fx.slice(v_out_lane_pairs, (tok, head, None))
-                        if const_expr(emit_flat_kv)
-                        else None
-                    )
-                    for p in range_constexpr(pairs_per_lane):
-                        k0 = fx.Float32(k_pairs[p, 0])
-                        k1 = fx.Float32(k_pairs[p, 1])
-
-                        xn0 = k0 * rstd * w0s[p]
-                        xn1 = k1 * rstd * w1s[p]
-
-                        cos_v, sin_v = mrope_cos_sin(
-                            pair_cols[p],
-                            tok,
-                            positions,
-                            cos_t,
-                            sin_t,
-                            mrope_section,
-                            is_interleaved,
-                        )
-                        o0 = xn0 * cos_v - xn1 * sin_v
-                        o1 = xn1 * cos_v + xn0 * sin_v
-                        if const_expr(cache_is_fp8):
-                            kb0, kb1 = quant_pair_fp8(o0, o1, k_scale_value)
-                        else:
-                            kb0 = o0.to(fx.BFloat16)
-                            kb1 = o1.to(fx.BFloat16)
-                        k_lds_pairs[p, 0] = kb0
-                        k_lds_pairs[p, 1] = kb1
-                        if const_expr(emit_flat_kv) and flat_slot_valid:
-                            k_out_pairs[p, 0] = kb0
-                            k_out_pairs[p, 1] = kb1
-
-                        v0 = fx.Float32(v_pairs[p, 0])
-                        v1 = fx.Float32(v_pairs[p, 1])
-                        if const_expr(cache_is_fp8):
-                            vb0, vb1 = quant_pair_fp8(v0, v1, v_scale_value)
-                        else:
-                            vb0 = v0.to(fx.BFloat16)
-                            vb1 = v1.to(fx.BFloat16)
-                        v_lds_pairs[p, 0] = vb0
-                        v_lds_pairs[p, 1] = vb1
-                        if const_expr(emit_flat_kv) and flat_slot_valid:
-                            v_out_pairs[p, 0] = vb0
-                            v_out_pairs[p, 1] = vb1
+                    compute_token(tok, token_local)
 
         # Wave 0 checks whether the whole logical page maps to one aligned
         # physical page. Other mappings use the scatter path.
