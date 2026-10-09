@@ -31,6 +31,16 @@ def _row_length(row, row_ends, width, next_n):
     return (row_len > width).select(width, row_len)
 
 
+def _row_view(input, row_starts, row_ends, row, width, next_n, packed):
+    """Return a regular row or its packed slice from the input's first row."""
+    if const_expr(packed):
+        return fx.make_view(
+            fx.add_offset(fx.get_iter(input), row_starts[row]),
+            fx.make_layout((_row_length(row, row_ends, width, next_n),), (1,)),
+        )
+    return fx.slice(input, (row, None))
+
+
 def _load_f32x4(tensor, vec_idx, cache_modifier=0):
     src = fx.slice(tensor, (None, vec_idx))
     fragment = fx.make_fragment_like(src)

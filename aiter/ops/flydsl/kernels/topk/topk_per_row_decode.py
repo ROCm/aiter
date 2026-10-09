@@ -15,12 +15,15 @@ from functools import cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-from ..communication_ops_utils import fence_agent_acquire, fence_agent_release
-from ..kernels_common import atomic_add_i32
+from ..communication_ops_utils import (
+    atomic_add_agent,
+    fence_agent_acquire,
+    fence_agent_release,
+)
 from .radix_topk_one_block import (
     _MAX_ROW_ELEMENTS,
     _VEC,
@@ -147,25 +150,50 @@ def build_topk_per_row_decode_module(
 
         def run_first_trip():
             # A direct row writes the final output; a part writes candidates.
-            part_offset = part * fx.Int32(k)
-            index_iter = direct_row.select(
-                fx.get_iter(final_indices),
-                fx.add_offset(fx.get_iter(part_indices), part_offset),
+            # Do not select between fly.ptrs: arith.select on !fly.ptr leaves an
+            # unrealized_conversion_cast to !llvm.ptr beside llvm.gep uses.
+            input_iter = fx.add_offset(
+                fx.get_iter(logits_row), packed_start + row_start
             )
-            value_iter = fx.add_offset(fx.get_iter(part_values), part_offset)
-            write_row_values = ~direct_row
-            if const_expr(write_values):
-                value_iter = direct_row.select(fx.get_iter(final_values), value_iter)
-                write_row_values = True
-            run_one_block_body(
-                storage,
-                fx.add_offset(fx.get_iter(logits_row), packed_start + row_start),
-                row_end - row_start,
-                fx.make_view(index_iter, part_indices.layout),
-                fx.make_view(value_iter, part_values.layout),
-                row_start,
-                write_row_values=write_row_values,
-            )
+            seg_len = row_end - row_start
+            if direct_row:
+                if const_expr(write_values):
+                    run_one_block_body(
+                        storage,
+                        input_iter,
+                        seg_len,
+                        final_indices,
+                        final_values,
+                        row_start,
+                        write_row_values=True,
+                    )
+                else:
+                    run_one_block_body(
+                        storage,
+                        input_iter,
+                        seg_len,
+                        final_indices,
+                        part_values,
+                        row_start,
+                        write_row_values=False,
+                    )
+            else:
+                part_offset = part * fx.Int32(k)
+                run_one_block_body(
+                    storage,
+                    input_iter,
+                    seg_len,
+                    fx.make_view(
+                        fx.add_offset(fx.get_iter(part_indices), part_offset),
+                        part_indices.layout,
+                    ),
+                    fx.make_view(
+                        fx.add_offset(fx.get_iter(part_values), part_offset),
+                        part_values.layout,
+                    ),
+                    row_start,
+                    write_row_values=True,
+                )
 
         def arrive(last_part):
             # Every wave drains its stores before lane 0 publishes the CTA.
@@ -173,11 +201,14 @@ def build_topk_per_row_decode_module(
             gpu.barrier()
             if tid == 0:
                 fence_agent_release()
-                arrived = atomic_add_i32(counters, one, row, "agent")
+                counter_addr = fx.Int64(ptrtoint(fx.get_iter(counters))) + fx.Int64(
+                    row
+                ) * fx.Int64(4)
+                arrived = fx.Int32(atomic_add_agent(counter_addr, one))
                 is_last = arrived == active_parts - one
                 if is_last:
                     # Every part has counted in: rearm for the next launch.
-                    atomic_add_i32(counters, zero - active_parts, row, "agent")
+                    atomic_add_agent(counter_addr, zero - active_parts)
                     fence_agent_acquire()
                 last_part[0] = is_last.select(one, zero)
             gpu.barrier()
