@@ -6559,7 +6559,6 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 or g1["act"] != self._row_act(row)
                 or float(row["block_m"]) != g1["BM"]
                 or g1["splitk"]
-                or g1["enable_bias"]
             ):
                 return False
             _assert_supported(
