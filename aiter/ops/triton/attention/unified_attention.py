@@ -161,10 +161,19 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
 
+    gate = params.target_num_prgms
+    if DEVICE_ARCH == "gfx1100":
+        # On gfx1100 the 3D split-KV kernel only pays off while the 2D launch
+        # is too small to fill the machine; past that the extra segment traffic
+        # and the reduce pass cost more than the added parallelism. The
+        # measured crossover is cu_count / 4, and target_num_prgms is
+        # cu_count * 4, hence the // 16.
+        gate = params.target_num_prgms // 16
+
     return (
         (params.sliding_window > 0)
         or (params.max_seqlen_k <= 512)
-        or (params.num_2d_prgms > params.target_num_prgms)
+        or (params.num_2d_prgms > gate)
     )
 
 
@@ -255,12 +264,22 @@ def unified_attention(
             "Unified Attention with pre-shuffled KV cache requires a power-of-2 "
             f"page, got block_size={block_size}"
         )
+        # The shuffled kernels lay V out with HEAD_SIZE, and a shuffled v does not
+        # expose its head size as the last dim, so compare per-page element counts.
+        assert k.shape[1:].numel() == v.shape[1:].numel(), (
+            "Unified Attention with pre-shuffled KV cache requires the value head "
+            "size to match the query/key head size"
+        )
 
     num_seqs = len(seqused_k)
     num_queries_per_kv = num_query_heads // num_kv_heads
     # only the plain layout exposes v's head size as its last dimension; a
     # shuffled value cache carries the vectorization width there instead.
     head_size_v = head_size if shuffled_kv_cache else v.shape[-1]
+    assert out.shape[-1] == head_size_v, (
+        f"out last dim must be the value head size {head_size_v}, "
+        f"got {out.shape[-1]}"
+    )
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -366,7 +385,7 @@ def unified_attention(
                 q.shape[0],
                 num_query_heads,
                 NUM_SEGMENTS,
-                triton.next_power_of_2(head_size),
+                triton.next_power_of_2(head_size_v),
                 dtype=torch.float32,
                 device=q.device,
             )
@@ -468,6 +487,7 @@ def is_2d_gluon_available(params: _UAParams, backend: str):
             and params.q_dtype != torch.uint8
             and params.kv_cache_dtype != torch.uint8
             and params.q_dtype == params.kv_cache_dtype
+            and params.head_size_v == params.head_size
         )
     elif DEVICE_ARCH == "gfx950":
         use_gluon_arch = _gfx950_gluon_supported(params)
@@ -506,6 +526,7 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
             and NUM_SEGMENTS <= _GLUON_REDUCE_MAX_SEGMENTS
             and head_size_padded % 32 == 0
             and params.num_query_heads % gluon_num_warps == 0
+            and params.head_size_v == params.head_size
         )
 
     return use_gluon and use_gluon_arch
@@ -570,6 +591,8 @@ def _unified_attention_2d_triton(params: _UAParams):
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
+        V_HEAD_SIZE=params.head_size_v,
+        V_HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size_v),
         USE_ALIBI_SLOPES=params.use_alibi_slopes,
         USE_QQ_BIAS=params.use_qq_bias,
         USE_SOFTCAP=(params.softcap > 0),
@@ -589,6 +612,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -646,6 +670,8 @@ def _unified_attention_3d_triton(
         BLOCK_SIZE=params.block_size,
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size),
+        V_HEAD_SIZE=params.head_size_v,
+        V_HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size_v),
         USE_ALIBI_SLOPES=params.use_alibi_slopes,
         USE_QQ_BIAS=params.use_qq_bias,
         USE_SOFTCAP=(params.softcap > 0),
@@ -669,6 +695,7 @@ def _unified_attention_3d_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -697,11 +724,14 @@ def _reduce_segments_triton(
         block_table_stride=params.block_table.stride(0),
         HEAD_SIZE=params.head_size,
         HEAD_SIZE_PADDED=head_size_padded,
+        V_HEAD_SIZE=params.head_size_v,
+        V_HEAD_SIZE_PADDED=triton.next_power_of_2(params.head_size_v),
         query_start_len_ptr=params.cu_seqlens_q,
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -826,6 +856,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=config["NUM_BUFFERS"],
         LOOP_VARIANT=loop_variant,
+        enable_fp_fusion=True,
     )
 
 
@@ -920,6 +951,7 @@ def _unified_attention_3d_gfx1250(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -956,6 +988,7 @@ def _reduce_segments_gfx1250(
         NUM_WARPS=gluon_num_warps,
         num_warps=gluon_num_warps,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -1069,6 +1102,7 @@ def _unified_attention_gfx950(
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,
         partial_acc_ptr=partial_acc,
+        enable_fp_fusion=True,
     )
 
 

@@ -72,6 +72,7 @@ def _ref_decode(
     buf_g=None,
     write_pos=None,
     slot_idx=None,
+    full_spec_sequence=False,
 ):
     T = mixed_qkv.shape[0]
     K = V = D
@@ -113,6 +114,17 @@ def _ref_decode(
             s_idx = state_indices[n, i_start].item()
             conv_slot_idx = conv_state_indices[n].item()
             b_h = state[s_idx].clone().float()
+            if full_spec_sequence:
+                spec_conv_history = conv_state[
+                    conv_slot_idx, :, i_start : i_start + W - 1
+                ].clone()
+                spec_next_conv_state = torch.cat(
+                    (
+                        spec_conv_history[:, 1:],
+                        mixed_qkv[bos:eos].transpose(0, 1),
+                    ),
+                    dim=1,
+                )
         else:
             s_idx = state_indices[n].item()
             conv_slot_idx = s_idx
@@ -121,7 +133,14 @@ def _ref_decode(
         for t in range(eos - bos):
             tok = bos + t
             qkv_out = _ref_conv1d_step(
-                mixed_qkv[tok], conv_state[conv_slot_idx], conv_weight, state_len
+                mixed_qkv[tok],
+                (
+                    spec_conv_history
+                    if is_spec and full_spec_sequence
+                    else conv_state[conv_slot_idx]
+                ),
+                conv_weight,
+                W - 1 if is_spec and full_spec_sequence else state_len,
             )
             q = qkv_out[:lp].reshape(H, K)
             k = qkv_out[lp : 2 * lp].reshape(H, K)
@@ -166,6 +185,10 @@ def _ref_decode(
                 out[tok, hh * V : (hh + 1) * V] = (
                     o_bf16 * rstd * w * torch.sigmoid(og)
                 ).bfloat16()
+
+        if is_spec and full_spec_sequence:
+            written = spec_next_conv_state.shape[1]
+            conv_state[conv_slot_idx, :, :written] = spec_next_conv_state
 
     return out
 

@@ -1476,7 +1476,8 @@ namespace py = pybind11;
           py::arg("tokens"),                           \
           py::arg("num_experts"),                      \
           py::arg("topk"),                             \
-          py::arg("dispatch_policy") = 0);             \
+          py::arg("dispatch_policy") = 0,              \
+          py::arg("device_id")       = -1);            \
     m.def("moe_sorting_opus_fwd",                      \
           &moe_sorting_opus_fwd,                       \
           py::arg("topk_ids"),                         \
@@ -2562,6 +2563,7 @@ namespace py = pybind11;
           py::arg("z"),                                    \
           py::arg("weight"),                               \
           py::arg("epsilon"),                              \
+          py::arg("use_sigmoid") = false,                  \
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                                \
