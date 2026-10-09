@@ -728,7 +728,11 @@ def fmoe_q256(
 
         # Producer contributions already include the routing weights.
         _run_moe_reduction(
-            partials, out, tokens, topk, model,
+            partials,
+            out,
+            tokens,
+            topk,
+            model,
             streaming_loads=(model, topk) == (8192, 11),
         )
         return
