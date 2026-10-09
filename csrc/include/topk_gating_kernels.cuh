@@ -902,6 +902,11 @@ __global__ void topk_gating_kernel(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
+    // The top-k selection below scans whole vectors only, so experts past the
+    // last full vector would never be picked. topk_gating_launch chooses f32vec
+    // so that vec_size divides num_experts; stop loudly if a caller does not.
+    if(num_experts % vec_size != 0)
+        __builtin_trap();
 
     // Step 1: load + score function
     // For softmax, bias is NOT added here -- it's added AFTER normalization
@@ -1076,6 +1081,11 @@ __global__ void topk_gating_kernel_smem_n(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
+    // The top-k selection below scans whole vectors only, so experts past the
+    // last full vector would never be picked. topk_gating_launch chooses f32vec
+    // so that vec_size divides num_experts; stop loudly if a caller does not.
+    if(num_experts % vec_size != 0)
+        __builtin_trap();
 
     // Guard: trailing tokens of the last block may be out of range.
     const bool valid      = token_idx < num_tokens;
