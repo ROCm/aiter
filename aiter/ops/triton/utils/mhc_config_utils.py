@@ -214,13 +214,13 @@ def get_mhc_post_pre_gluon_gfx1250_config(M: int) -> dict:
     from another arch, so there is no gfx942 fallback.
 
     Keys: ``SPLIT_BLOCK_M`` / ``SPLIT_NUM_WARPS`` (1, 2 or 4) / ``SPLIT_NUM_STAGES``
-    for the post + split-K GEMM/sqrsum kernel, which uses the deeper
-    ``SPLIT_DEEP_NUM_STAGES`` ring instead when its grid still fits in one round at
-    ``SPLIT_DEEP_MAX_CTAS_PER_CU`` workgroups per CU (see
-    ``_gluon_split_num_stages``); ``RA_NORM_NUM_WARPS`` (fused
+    for the post + split-K GEMM/sqrsum kernel; ``SPLIT_MAX_CTAS_PER_CU``, its LDS
+    residency (workgroups per CU), caps the split-K count to one round (see
+    ``_mhc_post_pre_gluon_split_k``) and gates the deeper ``SPLIT_DEEP_NUM_STAGES``
+    ring (see ``_gluon_split_num_stages``); ``RA_NORM_NUM_WARPS`` (fused
     RMSNorm) and ``RA_ROWS`` / ``RA_NUM_WARPS`` / ``RA_CTAS_PER_CU`` (without it)
     for the pre reduce/apply kernel. The split-K count is not here: it follows
-    the HIP ``get_mhc_fused_post_pre_config`` policy.
+    the HIP ``get_mhc_fused_post_pre_config`` policy, capped as above.
 
     The returned dict is cached and shared -- read-only.
     """

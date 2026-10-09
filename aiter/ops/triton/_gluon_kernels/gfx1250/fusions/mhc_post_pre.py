@@ -695,6 +695,7 @@ class _RAConfig:
     SK: gl.constexpr
     SMEM_MIX: gl.constexpr
     SMEM_RES: gl.constexpr
+    RES_KS: gl.constexpr
 
     @gluon.constexpr_function
     def __init__(
@@ -716,6 +717,7 @@ class _RAConfig:
         SK,
         SMEM_MIX,
         SMEM_RES,
+        RES_KS=32,
     ):
         self.C = gl.constexpr(C)
         self.HC = gl.constexpr(HC)
@@ -734,6 +736,13 @@ class _RAConfig:
         self.SK = gl.constexpr(SK)
         self.SMEM_MIX = gl.constexpr(SMEM_MIX)
         self.SMEM_RES = gl.constexpr(SMEM_RES)
+        self.RES_KS = gl.constexpr(RES_KS)
+
+
+@gluon.constexpr_function
+def _res5_layout():
+    """EXPERIMENT: rank-5 twin of the reduce kernel's SMEM_RES (no swizzle)."""
+    return gl.SwizzledSharedLayout(1, 1, 1, [4, 3, 2, 1, 0])
 
 
 @gluon.jit
@@ -773,6 +782,7 @@ def _reduce_apply_main(
     SK: gl.constexpr = K.SK
     SMEM_MIX: gl.constexpr = K.SMEM_MIX
     SMEM_RES: gl.constexpr = K.SMEM_RES
+    RES_KS: gl.constexpr = K.RES_KS
     pid_m = gl.program_id(0)
     pid_k = gl.program_id(1)
     row0 = pid_m * ROWS
@@ -846,22 +856,44 @@ def _reduce_apply_main(
     # are viewed as (M, HC, C/32, 32): plain strides (HC*C, C, 32, 1), shuffled
     # [C/32][HC][M][32] strides (32, M*32, HC*M*32, 1). Rows past M and columns
     # past C are zero-filled. ----
-    if RES_SHUFFLED:
-        res_strides = (32, M * 32, HC * M * 32, 1)
-    else:
-        res_strides = (HC * C, C, 32, 1)
-    res_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
-        base=res_ptr,
-        shape=(M, HC, C // 32, 32),
-        strides=res_strides,
-        block_shape=(ROWS, HC, KBC, 32),
-        layout=SMEM_RES,
-    )
-    res_smem = gl.allocate_shared_memory(dt, [N_CHUNKS, ROWS, HC, KBC, 32], SMEM_RES)
-    for j in gl.static_range(N_CHUNKS):
-        gl.amd.gfx1250.tdm.async_load(
-            res_desc, [row0, 0, (c0 + j * CHUNK) // 32, 0], res_smem.index(j)
+    if RES_SHUFFLED and RES_KS != 32:
+        # EXPERIMENT: shuffled in RES_KS-column blocks, [C/RES_KS][HC][M][RES_KS],
+        # viewed as (M, HC, C/RES_KS, RES_KS/32, 32); a block lands in LDS as the
+        # same bytes as the [ROWS, HC, KBC, 32] tile read below.
+        gl.static_assert(CHUNK % RES_KS == 0, "CHUNK must be a multiple of RES_KS")
+        RB: gl.constexpr = RES_KS // 32
+        res_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=res_ptr,
+            shape=(M, HC, C // RES_KS, RB, 32),
+            strides=(RES_KS, M * RES_KS, HC * M * RES_KS, 32, 1),
+            block_shape=(ROWS, HC, KBC // RB, RB, 32),
+            layout=_res5_layout(),
         )
+        res_tdm = gl.allocate_shared_memory(
+            dt, [N_CHUNKS, ROWS, HC, KBC // RB, RB, 32], _res5_layout()
+        )
+        res_smem = res_tdm.reinterpret(dt, [N_CHUNKS, ROWS, HC, KBC, 32], SMEM_RES)
+        for j in gl.static_range(N_CHUNKS):
+            gl.amd.gfx1250.tdm.async_load(
+                res_desc, [row0, 0, (c0 + j * CHUNK) // RES_KS, 0, 0], res_tdm.index(j)
+            )
+    else:
+        if RES_SHUFFLED:
+            res_strides = (32, M * 32, HC * M * 32, 1)
+        else:
+            res_strides = (HC * C, C, 32, 1)
+        res_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+            base=res_ptr,
+            shape=(M, HC, C // 32, 32),
+            strides=res_strides,
+            block_shape=(ROWS, HC, KBC, 32),
+            layout=SMEM_RES,
+        )
+        res_smem = gl.allocate_shared_memory(dt, [N_CHUNKS, ROWS, HC, KBC, 32], SMEM_RES)
+        for j in gl.static_range(N_CHUNKS):
+            gl.amd.gfx1250.tdm.async_load(
+                res_desc, [row0, 0, (c0 + j * CHUNK) // 32, 0], res_smem.index(j)
+            )
     acc_pre, sqa = _fold_splits(_pin(acc_pre), _pin(sqa), S, RED4)
     if not WS:
         acc_post, _u0 = _fold_splits(_pin(acc_post), _u0, S, RED4)
@@ -1082,6 +1114,7 @@ def _mhc_pre_reduce_apply_gfx1250_kernel(
     SK: gl.constexpr,
     SMEM_MIX: gl.constexpr,
     SMEM_RES: gl.constexpr,
+    RES_KS: gl.constexpr = 32,
 ):
     WS: gl.constexpr = FUSE_RMSNORM  # whole rows per CTA, one K-block
     main_args = (
@@ -1120,6 +1153,7 @@ def _mhc_pre_reduce_apply_gfx1250_kernel(
         SK,
         SMEM_MIX,
         SMEM_RES,
+            RES_KS,
     )
     if WS:
         gl.warp_specialize(

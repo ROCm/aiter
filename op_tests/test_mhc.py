@@ -869,6 +869,7 @@ def test_mhc_post_pre(
         hip_kwargs["norm_weight"] = norm_weight
 
     from aiter.ops.mhc import (
+        MHC_RES_KS_GLUON,
         mhc_res_shuffle,
         mhc_res_shuffle_enabled,
         mhc_res_unshuffle,
@@ -974,7 +975,12 @@ def test_mhc_post_pre(
         # HIP-layout fn (fp32, or the mhc_shuffle_fn packing), no copy.
         if triton_hip_layouts:
             phi = fn_gemm.T
-            triton_residual_in = residual_in_fused
+            # The Gluon path has its own shuffle block (MHC_RES_KS_GLUON).
+            triton_residual_in = (
+                mhc_res_shuffle(residual_in, MHC_RES_KS_GLUON)
+                if shuffled
+                else residual_in
+            )
             triton_kwargs = {
                 "w_preshuffle_bf16": bool(packed),
                 "res_preshuffle": bool(res_preshuffle),
@@ -1007,7 +1013,7 @@ def test_mhc_post_pre(
             **triton_kwargs,
         )
         if triton_hip_layouts and shuffled:
-            residual_out_t = mhc_res_unshuffle(residual_out_t)
+            residual_out_t = mhc_res_unshuffle(residual_out_t, MHC_RES_KS_GLUON)
         h_post_t = h_post_t.to(post_mix_ref.dtype)
         h_res_t = h_res_t.to(comb_mix_ref.dtype)
         layer_input_t = layer_input_t.to(layer_input_ref.dtype)

@@ -624,30 +624,37 @@ def _gluon_split_num_stages(
 ) -> int:
     """Ring depth of the gfx1250 Gluon split kernel.
 
-    A deeper ring hides more of the per-stage TDM wait, but each stage adds ~40 KB of
-    LDS (BLOCK_M=32: 97 KB at 2 stages, 138 KB at 3, of 320 KB per CU), so 3 stages
-    fit 2 workgroups per CU instead of 3. Use it only when the grid still runs in one
-    round at that residency and the loop has a stage to fill: M=512/C=7168 split
-    kernel 12.72 -> 12.13 us; at M=768 (768 workgroups) it would cost a second round
-    (+0.8 / +1.4 us at C=4096 / 7168). Measured with packed (bf16 hi/lo) weights only.
+    A deeper ring hides more of the per-stage TDM wait. Use it only when the grid
+    runs in one round at SPLIT_MAX_CTAS_PER_CU workgroups per CU and the loop has a
+    stage to fill. With 64-wide k-steps one workgroup fits per CU at either depth
+    (BLOCK_M=32: 165 KB at 2 stages, 240 KB at 3, of 320 KB). Measured with packed
+    (bf16 hi/lo) weights only.
     """
     base = config["SPLIT_NUM_STAGES"]
     deep = config.get("SPLIT_DEEP_NUM_STAGES", base)
-    max_ctas = config.get("SPLIT_DEEP_MAX_CTAS_PER_CU", 0)
+    max_ctas = config.get("SPLIT_MAX_CTAS_PER_CU", 0)
     if w_preshuffled and k_loop >= deep and grid <= max_ctas * cu_num:
         return deep
     return base
 
 
-def _mhc_post_pre_gluon_split_k(M: int, C: int, res_shuffled: bool, ks: int) -> int:
-    """K-splits for the Gluon split kernel: the tuned HIP decode policy (same
-    workgroup grid as the HIP kernel), reduced until C splits into ks-wide
-    k-steps."""
+def _mhc_post_pre_gluon_split_k(
+    M: int, C: int, res_shuffled: bool, ks: int, config: dict, cu_num: int
+) -> int:
+    """K-splits for the Gluon split kernel: the tuned HIP decode policy, capped so
+    the grid runs in one round at SPLIT_MAX_CTAS_PER_CU workgroups per CU (the HIP
+    policy assumes the 32-wide k-step footprint), then reduced until C splits into
+    ks-wide k-steps. M=512/C=7168: 28 x 4 k-steps (448 workgroups, two rounds)
+    -> 16 x 7 (256), split kernel 11.48 -> 9.99 us."""
     from aiter.ops.mhc import get_mhc_fused_post_pre_config
 
     split_k = get_mhc_fused_post_pre_config(
         M, C, w_preshuffle_bf16=True, res_preshuffle=res_shuffled
     )[0]
+    max_ctas = config.get("SPLIT_MAX_CTAS_PER_CU", 0)
+    if max_ctas:
+        m_blocks = triton.cdiv(M, config["SPLIT_BLOCK_M"])
+        split_k = min(split_k, max(1, max_ctas * cu_num // m_blocks))
     while C % (split_k * ks) != 0:
         split_k -= 1
     return split_k
@@ -718,14 +725,16 @@ def _mhc_post_pre_gluon_gfx1250(
     ``get_mhc_post_pre_gluon_gfx1250_config(M)``.
     """
     from aiter.jit.utils.chip_info import get_cu_num
-    from aiter.ops.mhc import mhc_res_shuffle_enabled
+    from aiter.ops.mhc import MHC_RES_KS_GLUON, mhc_res_shuffle_enabled
     from aiter.ops.triton._gluon_kernels.gfx1250.fusions.mhc_post_pre import (
         _mhc_post_pre_gemm_sqrsum_gfx1250_kernel,
         _mhc_pre_reduce_apply_gfx1250_kernel,
     )
 
     # Layout constants of the Gluon kernels (not tunable).
-    KS = 32  # k-step width; also the shuffled-residual block (mhc_res_ks)
+    # k-step width; also the block of the shuffled residual this path reads and
+    # writes (shuffle it with ks=MHC_RES_KS_GLUON; HIP keeps MHC_RES_KS)
+    KS = MHC_RES_KS_GLUON
     N_PAD = 32  # gemm_out row width: N = 2n + n^2 padded to the WMMA N tile
     RA_CHUNK = 256  # reduce/apply column granule (8 bf16 x 32 lanes)
 
@@ -745,8 +754,9 @@ def _mhc_post_pre_gluon_gfx1250(
     # shuffled layout is in use (mhc_res_repeat / mhc_res_shuffle apply the same
     # per-M check), otherwise the caller already holds the plain layout.
     res_shuffled = bool(res_preshuffle) and mhc_res_shuffle_enabled(M)
-    split_k = _mhc_post_pre_gluon_split_k(M, C, res_shuffled, KS)
     config = get_mhc_post_pre_gluon_gfx1250_config(M)
+    split_k = _mhc_post_pre_gluon_split_k(M, C, res_shuffled, KS, config, get_cu_num())
+    assert C % (split_k * KS) == 0, (C, split_k, KS)
 
     # (split_k, M, N) fp32 split-K partials in 32-padded rows (the split kernel
     # writes all N_PAD columns).
@@ -868,6 +878,7 @@ def _mhc_post_pre_gluon_gfx1250(
         N_CHUNKS=triton.cdiv(c_cta, chunk),
         SINKHORN_REPEAT=sinkhorn_iters,
         RES_SHUFFLED=res_shuffled,
+        RES_KS=KS,
         FUSE_RMSNORM=fuse_norm,
         APPLY=apply_l,
         RED4=red4,
