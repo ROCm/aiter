@@ -147,7 +147,7 @@ def main():
 
             fout.write("}\n")
         if not get_at_least_one_config:
-            os.popen(f"rm {config_json_file_prefix}-N={n}-K={k}.json").read()
+            os.remove(f"{config_json_file_prefix}-N={n}-K={k}.json")
             print("No file is created")
         else:
             print(f"{config_json_file_prefix}-N={n}-K={k}.json is created")
