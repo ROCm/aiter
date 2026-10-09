@@ -137,8 +137,7 @@ for file in "${sharded_files[@]}"; do
                         exit 0
                     fi
                     exec torchrun --standalone --nproc_per_node=4 "$test_file" \
-                        --models m3 glm5 --tokens 256 512 1024 2048 \
-                        --max-local-tokens 512 --seeds 2
+                        --models m3 glm5 --tokens 256 512 1024 2048
                 '
                 _ "$file"
             )

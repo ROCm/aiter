@@ -1,35 +1,46 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness test of the fused TP MegaMoE layer (a4w4, MXFP4, gfx950)::
+"""Fused TP MegaMoE layer (a4w4, MXFP4, gfx950) vs torch: accuracy + perf sweep, feature
+cases and SpRsNorm, each ending in a markdown summary table::
 
-    torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py --models glm5
-    torchrun --nproc_per_node=8 op_tests/multigpu_tests/test_mega_moe_TP.py --tokens 8 64
+    torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py \\
+        --models m3 glm5 -t 256 512 1024 2048
 
-Run with plain ``python3`` (as CI does) it relaunches itself under torchrun on up to 8
-GPUs, or skips without >= 2 gfx950 GPUs.
+Run with plain ``python3`` it relaunches itself under torchrun on up to 8 GPUs, or
+skips without >= 2 gfx950 GPUs. Exits 1 if any case failed.
 """
 
 from __future__ import annotations
 
 import argparse
 import gc
+import itertools
 import os
 import subprocess
 import sys
 import traceback
 from dataclasses import dataclass
 
+import pandas as pd
 import torch
 import torch.distributed as dist
 
 import aiter
 from aiter import dtypes
 from aiter.fused_moe import torch_moe_stage1, torch_moe_stage2
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.mega_moe_tp.sp_rs_norm import SpRsNorm
 from aiter.ops.flydsl.mega_moe_tp import MegaMoeTP, MegaMoeTPConfig
 from aiter.ops.flydsl.moe_common import DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
+
+SUPPORTED_GFX = ("gfx950",)
+SEED = 123
+# rel_l2 gate vs the torch reference: fp8 / bf16 comm, MXFP8 all-reduce second hop
+RTOL = {"fp8": 0.045, "bf16": 0.01, "ag8": 0.05}
+GRAPH_CALLS, PERF_ITERS, PERF_WARMUP = 10, 20, 3
 
 QUANT_TYPE = aiter.QuantType.per_1x32
 FP4 = dtypes.fp4x2
@@ -213,6 +224,7 @@ class Case:
     w: torch.Tensor
     ids: torch.Tensor
     ref: torch.Tensor
+    ids_all: torch.Tensor | None = None
 
 
 def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
@@ -253,10 +265,12 @@ def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
         full = torch_partial(shape, wt, *parts)
         dist.all_reduce(full)
         ref = full[ctx.rank * m : (ctx.rank + 1) * m]
+        ids_all = parts[2]
     else:
         ref = torch_partial(shape, wt, x, w_ref, ids_ref)
         dist.all_reduce(ref)
-    return Case(x.contiguous(), w, ids, ref)
+        ids_all = ids_ref
+    return Case(x.contiguous(), w, ids, ref, ids_all)
 
 
 class CaseFailure(AssertionError):
@@ -315,56 +329,32 @@ def check(y, c: Case, rtol, what="fused vs torch"):
     return e
 
 
-def rtol_of(args, comm_dtype, ar_gather="bf16"):
-    if ar_gather == "fp8":
-        return args.rtol_ag8
-    return args.rtol if comm_dtype == "fp8" else args.rtol_bf16
-
-
-def case_accuracy(
-    shape, wt, ctx, args, mode, tokens, kind, comm_dtype="fp8", ar_gather="bf16"
-):
-    layer = new_layer(
-        shape, wt, ctx, mode, args.max_local_tokens, comm_dtype, ar_gather
-    )
+def case_varying_m(shape, wt, ctx, S, mode):
+    layer = new_layer(shape, wt, ctx, mode, S.max_local)
     worst = 0.0
-    for s in range(args.seeds if kind != "balanced" else 1):
-        c = make_case(shape, wt, ctx, mode, tokens, kind, args.seed + 1000 * s + tokens)
-        y = call(layer, c).clone()
-        worst = max(worst, check(y, c, rtol_of(args, comm_dtype, ar_gather)))
-        if mode == "ar" and not identical_across_ranks(y):
-            raise CaseFailure("all-reduce output differs across ranks")
+    for m in (8, 1, 32, 1, min(64, S.max_local), 8):
+        c = make_case(shape, wt, ctx, mode, m * ctx.world, "random", SEED + m)
+        worst = max(worst, check(call(layer, c).clone(), c, RTOL["fp8"], f"m={m}"))
     return worst
 
 
-def case_varying_m(shape, wt, ctx, args, mode):
-    layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
-    worst = 0.0
-    for m in (8, 1, 32, 1, min(64, args.max_local_tokens), 8):
-        c = make_case(shape, wt, ctx, mode, m * ctx.world, "random", args.seed + m)
-        worst = max(worst, check(call(layer, c).clone(), c, args.rtol, f"m={m}"))
-    return worst
-
-
-def case_layers(shape, wt, ctx, args, mode):
-    layers = [new_layer(shape, wt, ctx, mode, args.max_local_tokens) for _ in range(3)]
+def case_layers(shape, wt, ctx, S, mode):
+    layers = [new_layer(shape, wt, ctx, mode, S.max_local) for _ in range(3)]
     worst = 0.0
     for rnd in range(2):
         for i, layer in enumerate(layers):
             c = make_case(shape, wt, ctx, mode, 8 * ctx.world, "random", 100 * rnd + i)
             worst = max(
-                worst, check(call(layer, c).clone(), c, args.rtol, f"layer {i}")
+                worst, check(call(layer, c).clone(), c, RTOL["fp8"], f"layer {i}")
             )
         del layers[:2]
         gc.collect()
-        layers += [
-            new_layer(shape, wt, ctx, mode, args.max_local_tokens) for _ in range(2)
-        ]
+        layers += [new_layer(shape, wt, ctx, mode, S.max_local) for _ in range(2)]
     return worst
 
 
-def case_out(shape, wt, ctx, args, mode):
-    layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
+def case_out(shape, wt, ctx, S, mode):
+    layer = new_layer(shape, wt, ctx, mode, S.max_local)
     tokens = 16 * ctx.world
     c1 = make_case(shape, wt, ctx, mode, tokens, "random", 1)
     c2 = make_case(shape, wt, ctx, mode, tokens, "random", 2)
@@ -376,11 +366,11 @@ def case_out(shape, wt, ctx, args, mode):
     call(layer, c2)
     if not ctx.all_ok(torch.equal(out, keep)):
         raise CaseFailure("out= of call N changed by call N+1")
-    return check(keep, c1, args.rtol)
+    return check(keep, c1, RTOL["fp8"])
 
 
-def case_graph(shape, wt, ctx, args, mode):
-    layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
+def case_graph(shape, wt, ctx, S, mode):
+    layer = new_layer(shape, wt, ctx, mode, S.max_local)
     cases = [
         make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", s) for s in (3, 4, 5)
     ]
@@ -414,21 +404,21 @@ def case_graph(shape, wt, ctx, args, mode):
         raise CaseFailure("graph replay != eager")
 
 
-def case_dynamic(shape, wt, ctx, args, mode, lb):
+def case_dynamic(shape, wt, ctx, S, mode, lb):
     # the dynamic schedule up to 256 tokens (lb: the large-batch one from 1 token up, at
     # its smallest row tile, which takes the mixed GEMM2 split); odd local token
     # counts and a narrow routing
     kw = {"lb_min": 1, "lb_mt": 3, "lb_mt_small": 3, "lb_npp": 2, "lb_q": 3}
     layer = new_layer(
-        shape, wt, ctx, mode, args.max_local_tokens, **(kw if lb else {"lb_min": 0})
+        shape, wt, ctx, mode, S.max_local, **(kw if lb else {"lb_min": 0})
     )
     worst = 0.0
-    tokens = sorted({ctx.world, 3 * ctx.world, 33 * ctx.world, args.tokens[-1]})
-    for t in (t for t in tokens if t <= args.max_local_tokens * ctx.world):
+    tokens = sorted({ctx.world, 3 * ctx.world, 33 * ctx.world, S.max_tokens})
+    for t in (t for t in tokens if t <= S.max_local * ctx.world):
         for kind in ("random", "subset"):
-            c = make_case(shape, wt, ctx, mode, t, kind, args.seed + 3 * t)
+            c = make_case(shape, wt, ctx, mode, t, kind, SEED + 3 * t)
             y = call(layer, c).clone()
-            worst = max(worst, check(y, c, args.rtol, f"M={t} {kind}"))
+            worst = max(worst, check(y, c, RTOL["fp8"], f"M={t} {kind}"))
     return worst
 
 
@@ -440,11 +430,11 @@ def ref_tail(y, res, nw, eps):
     return r.to(dtypes.bf16), xn, scale
 
 
-def case_tail(shape, wt, ctx, args):
+def case_tail(shape, wt, ctx, S):
     # fused tail, in place as ATOM calls it: tail=(res, res, w)
-    layer = new_layer(shape, wt, ctx, "ag_rs", args.max_local_tokens, lb_min=1)
+    layer = new_layer(shape, wt, ctx, "ag_rs", S.max_local, lb_min=1)
     eng = layer.engine
-    t = args.tokens[-1]
+    t = S.max_tokens
     if not layer.tail_ok(t // ctx.world):
         return "skipped (no tail at this size)"
     c = make_case(shape, wt, ctx, "ag_rs", t, "random", 21)
@@ -486,12 +476,12 @@ def case_tail(shape, wt, ctx, args):
     return e_q
 
 
-def case_sp_rs_norm(ctx, args):
+def case_sp_rs_norm(ctx, S):
     """SpRsNorm (+ the fused router) vs torch, twice back to back on new inputs."""
     H, eps = 6144, 1e-6
     E, K, scale, shared_w = 128, 4, 2.0, 0.5
     op = SpRsNorm(
-        H, args.tokens[-1], eps, device=ctx.device, router=(E, K, scale, shared_w)
+        H, S.max_tokens, eps, device=ctx.device, router=(E, K, scale, shared_w)
     )
     gen = torch.Generator(device=ctx.device).manual_seed(7)
     wg = (torch.randn((E, H), generator=gen, device=ctx.device) * H**-0.5 * 3).to(
@@ -500,8 +490,8 @@ def case_sp_rs_norm(ctx, args):
     bias = (0.05 * torch.randn((E,), generator=gen, device=ctx.device)).float()
     w = (0.1 * torch.randn((H,), generator=gen, device=ctx.device)).to(dtypes.bf16)
     worst = 0.0
-    routed = args.tokens[-1] // (16 * ctx.world) * 16 * ctx.world
-    for tokens, rt in ((routed, True), (args.tokens[-1], False)) * 2:
+    routed = S.max_tokens // (16 * ctx.world) * 16 * ctx.world
+    for tokens, rt in ((routed, True), (S.max_tokens, False)) * 2:
         m = tokens // ctx.world
         g = torch.Generator(device=ctx.device).manual_seed(1000 + ctx.rank + tokens)
         part = torch.randn((tokens, H), generator=g, device=ctx.device).to(dtypes.bf16)
@@ -542,22 +532,22 @@ def case_sp_rs_norm(ctx, args):
     return worst
 
 
-def case_masked(shape, wt, ctx, args, mode):
-    layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
+def case_masked(shape, wt, ctx, S, mode):
+    layer = new_layer(shape, wt, ctx, mode, S.max_local)
     c = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 11, mask=0.2)
-    e = check(call(layer, c).clone(), c, args.rtol, "masked ids")
+    e = check(call(layer, c).clone(), c, RTOL["fp8"], "masked ids")
     c2 = make_case(shape, wt, ctx, mode, 16 * ctx.world, "random", 12)
-    check(call(layer, c2).clone(), c2, args.rtol, "next clean call")
+    check(call(layer, c2).clone(), c2, RTOL["fp8"], "next clean call")
     return e
 
 
-def case_empty(shape, wt, ctx, args, mode):
-    layer = new_layer(shape, wt, ctx, mode, args.max_local_tokens)
+def case_empty(shape, wt, ctx, S, mode):
+    layer = new_layer(shape, wt, ctx, mode, S.max_local)
     c = make_case(shape, wt, ctx, mode, 4 * ctx.world, "random", 13)
     y = call(layer, Case(c.x[:0], c.w[:0], c.ids[:0], c.ref[:0]))
     if tuple(y.shape) != (0, shape.model_dim):
         raise CaseFailure(f"m=0 returned shape {tuple(y.shape)}")
-    check(call(layer, c).clone(), c, args.rtol, "call after m=0")
+    check(call(layer, c).clone(), c, RTOL["fp8"], "call after m=0")
 
 
 def expect_raise(fn, what, errors=(ValueError, TypeError)):
@@ -573,11 +563,11 @@ def expect_raise(fn, what, errors=(ValueError, TypeError)):
         raise CaseFailure(f"{what} was accepted (expected a host-side error)")
 
 
-def case_validation(shape, wt, ctx, args):
+def case_validation(shape, wt, ctx, S):
     expect_raise(
         lambda: new_layer(shape, wt, ctx, "ag_rs", 4096), "max_local_tokens=4096"
     )
-    layer = new_layer(shape, wt, ctx, "ag_rs", args.max_local_tokens)
+    layer = new_layer(shape, wt, ctx, "ag_rs", S.max_local)
     c = make_case(shape, wt, ctx, "ag_rs", 8 * ctx.world, "random", 5)
     x, w, ids = c.x, c.w, c.ids
     expect_raise(lambda: layer(x.float(), w, ids), "fp32 hidden states")
@@ -594,14 +584,14 @@ def case_validation(shape, wt, ctx, args):
     )
 
 
-def case_checked(shape, wt, ctx, args):
+def case_checked(shape, wt, ctx, S):
     os.environ["AITER_MEGAMOE_TP_CHECK"] = "1"
     try:
-        layer = new_layer(shape, wt, ctx, "ag_rs", args.max_local_tokens)
+        layer = new_layer(shape, wt, ctx, "ag_rs", S.max_local)
         m = 16 if ctx.rank == 0 else 8
         c = make_case(shape, wt, ctx, "ag_rs", 16 * ctx.world, "random", 14)
         expect_raise(lambda: layer(c.x[:m], c.w[:m], c.ids[:m]), "ag_rs with uneven m")
-        layer = new_layer(shape, wt, ctx, "ar", args.max_local_tokens)
+        layer = new_layer(shape, wt, ctx, "ar", S.max_local)
         c = make_case(shape, wt, ctx, "ar", 8 * ctx.world, "random", 15)
         ids = c.ids.clone()
         if ctx.rank == 1:
@@ -609,115 +599,291 @@ def case_checked(shape, wt, ctx, args):
         expect_raise(
             lambda: layer(c.x, c.w, ids), "ar with routing that differs across ranks"
         )
-        check(call(layer, c).clone(), c, args.rtol, "checked call")
+        check(call(layer, c).clone(), c, RTOL["fp8"], "checked call")
     finally:
         os.environ.pop("AITER_MEGAMOE_TP_CHECK", None)
 
 
-def run(name, ctx, results, fn, *fargs):
-    ok, info = True, ""
+# Distributed state lives here, out of the @benchmark signatures, so the summary
+# tables hold only the sweep axes.
+@dataclass
+class Session:
+    ctx: Ctx
+    max_local: int
+    max_tokens: int
+    weights: dict
+    layers: dict
+
+
+S: Session | None = None
+
+
+def _rank_max(v: float) -> float:
+    t = torch.tensor([float(v)], device=S.ctx.device)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return float(t.item())
+
+
+def _layer(model: str, mode: str, comm_dtype: str, ar_gather: str):
+    key = (model, mode, comm_dtype, ar_gather)
+    if key not in S.layers:
+        S.layers[key] = new_layer(
+            MODELS[model],
+            S.weights[model],
+            S.ctx,
+            mode,
+            S.max_local,
+            comm_dtype,
+            ar_gather,
+        )
+    return S.layers[key]
+
+
+def _graph_us(layer, c: Case, out) -> float:
+    """us per call of GRAPH_CALLS back-to-back calls replayed in one CUDA graph (the
+    way ATOM runs it), the slowest rank's time."""
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            layer(c.x, c.w, c.ids, out=out)
+    torch.cuda.current_stream().wait_stream(s)
+    torch.cuda.synchronize()
+    dist.barrier()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        for _ in range(GRAPH_CALLS):
+            layer(c.x, c.w, c.ids, out=out)
+    torch.cuda.synchronize()
+    dist.barrier()
+    _, us = run_perftest(
+        g.replay, num_iters=PERF_ITERS, num_warmup=PERF_WARMUP, use_cuda_event=True
+    )
+    dist.barrier()
+    return _rank_max(us / GRAPH_CALLS)
+
+
+def _work(shape, wt, c: Case, tokens: int) -> tuple[int, int]:
+    """Cluster-wide GEMM FLOPs and algorithmic bytes (input, the active experts' MXFP4
+    weights, routing, output) of one layer call."""
+    world, H, I, K = S.ctx.world, shape.model_dim, wt.inter, shape.topk
+    flops = 6 * tokens * K * H * I * world
+    ids = c.ids_all.flatten()
+    active = int(torch.unique(ids[(ids >= 0) & (ids < shape.experts)]).numel())
+    per_rank = (
+        c.x.numel() * 2
+        + active * (2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32))
+        + c.ids.numel() * 8
+        + c.ref.numel() * 2
+    )
+    return flops, per_rank * world
+
+
+@benchmark()
+def test_mega_moe_tp(model: str, mode: str, tokens: int, route: str, seed: int):
+    """MegaMoE TP vs the torch reference (not timed): rel_l2 gate, checkAllclose err,
+    CUDA-graph latency and roofline numbers per candidate."""
+    ctx, shape, wt = S.ctx, MODELS[model], S.weights[model]
+    c = make_case(shape, wt, ctx, mode, tokens, route, SEED + 1000 * seed + tokens)
+    # name -> (comm_dtype, ar_gather, rel_l2 gate)
+    candidates = {
+        "megamoe_tp": ("fp8", "bf16", RTOL["fp8"]),
+        "megamoe_tp bf16comm": ("bf16", "bf16", RTOL["bf16"]),
+    }
+    if mode == "ar":  # the MXFP8 all-gather second hop exists only for ar
+        candidates["megamoe_tp ag8"] = ("fp8", "fp8", RTOL["ag8"])
+    flops, nbytes = _work(shape, wt, c, tokens)
+    ret = {"gfx": get_gfx()}
+    for name, (comm, agather, rtol) in candidates.items():
+        layer = _layer(model, mode, comm, agather)
+        out = torch.empty_like(c.ref, dtype=dtypes.bf16)
+        y = call(layer, c, out=out).clone()
+        e = rel_l2(y, c.ref)
+        ref = c.ref.to(dtypes.fp32)
+        err = _rank_max(
+            checkAllclose(
+                ref,
+                y.to(dtypes.fp32),
+                rtol=0.1,
+                atol=0.1 * float(ref.pow(2).mean().sqrt()),
+                msg=f"{name}: ",
+                printLog=ctx.rank == 0,
+            )
+        )
+        if not e < rtol:
+            raise CaseFailure(f"{name}: rel_l2={e:.4f} >= {rtol}")
+        if mode == "ar" and not identical_across_ranks(y):
+            raise CaseFailure(f"{name}: all-reduce output differs across ranks")
+        us = _graph_us(layer, c, out)
+        cfg = layer.launch_config(tokens // ctx.world)
+        ret[f"{name} cfg"] = (
+            f"mt{cfg.mt}{' lb' if cfg.lb else ''}{' ll' if cfg.ll else ''}"
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+        ret[f"{name} rel_l2"] = e
+    return ret
+
+
+CASES = {
+    "varying m": case_varying_m,
+    "new / freed layers": case_layers,
+    "out=": case_out,
+    "cuda graph": case_graph,
+    "dynamic": lambda *a: case_dynamic(*a, lb=False),
+    "dynamic LB": lambda *a: case_dynamic(*a, lb=True),
+    "masked ids": case_masked,
+    "m=0": case_empty,
+}
+# model-level cases (fused tail: ag_rs only; the others build their own layers)
+MODEL_CASES = {
+    "fused tail": case_tail,
+    "host validation": case_validation,
+    "cross-rank checks": case_checked,
+}
+
+
+@benchmark()
+def test_mega_moe_tp_case(model: str, mode: str, case: str):
+    """One feature case (varying m, graph replay on new inputs, LB, masked ids, ...)."""
+    shape, wt = MODELS[model], S.weights[model]
+    if case in CASES:
+        out = CASES[case](shape, wt, S.ctx, S, mode)
+    else:
+        out = MODEL_CASES[case](shape, wt, S.ctx, S)
+    return {
+        "gfx": get_gfx(),
+        "rel_l2": out if isinstance(out, float) else None,
+        "note": out if isinstance(out, str) else "",
+    }
+
+
+@benchmark()
+def test_sp_rs_norm(hidden: int, tokens: int):
+    """SpRsNorm (+ the fused router) vs torch, twice back to back on new inputs."""
+    return {"gfx": get_gfx(), "rel_l2": case_sp_rs_norm(S.ctx, S)}
+
+
+def _run(fn, *args) -> dict:
+    """fn (a @benchmark test); a failure on any rank is recorded in the row's status."""
+    ok, msg, row = True, "", None
     try:
-        out = fn(*fargs)
-        info = f"{out:.4f}" if isinstance(out, float) else (out or "")
+        row = fn(*args)
     except CaseFailure as exc:
-        ok, info = False, str(exc)
+        ok, msg = False, str(exc)
     except Exception as exc:  # noqa: BLE001
-        ok, info = False, f"{type(exc).__name__}: {exc}"
-        if ctx.rank == 0:
+        ok, msg = False, f"{type(exc).__name__}: {exc}"
+        if S.ctx.rank == 0:
             traceback.print_exc()
-    ok = ctx.all_ok(ok)
-    results.append((name, ok, info))
-    ctx.log(f"[{'PASS' if ok else 'FAIL'}] {name} {info}")
+    ok = S.ctx.all_ok(ok)
+    row = row if row is not None else {"case": fn.__name__, "args": args}
+    row["status"] = "PASS" if ok else f"FAIL {msg}".strip()
+    return row
 
 
-def run_model(name, ctx, args, results):
-    shape = MODELS[name]
-    ctx.log(
-        f"\n=== {name} tp{ctx.world} h{shape.model_dim} i{shape.inter_dim}/{ctx.world} "
-        f"e{shape.experts} k{shape.topk} ==="
-    )
-    wt = build_weights(shape, ctx, args.seed)
-    common = (shape, wt, ctx, args)
-    for mode in args.modes:
-        acc = (ctx, results, case_accuracy, *common, mode)
-        for tokens in args.tokens:
-            for kind in args.routes:
-                run(f"{name} {mode} M={tokens} {kind}", *acc, tokens, kind)
-        tokens = args.tokens[-1]
-        pre = f"{name} {mode} M={tokens} random"
-        for cd in args.comm_dtypes:
-            if cd != "fp8":
-                run(f"{pre} comm {cd}", *acc, tokens, "random", cd)
-        if mode == "ar":
-            run(f"{pre} ar_gather fp8", *acc, tokens, "random", "fp8", "fp8")
-        for what, fn in (
-            ("varying m", case_varying_m),
-            ("new / freed layers", case_layers),
-            ("out=", case_out),
-            ("cuda graph", case_graph),
-            ("dynamic", lambda *a: case_dynamic(*a, lb=False)),
-            ("dynamic LB", lambda *a: case_dynamic(*a, lb=True)),
-            ("masked ids", case_masked),
-            ("m=0", case_empty),
-        ):
-            run(f"{name} {mode} {what}", ctx, results, fn, *common, mode)
-    if "ag_rs" in args.modes:
-        run(f"{name} ag_rs fused tail", ctx, results, case_tail, *common)
-    run(f"{name} host validation", ctx, results, case_validation, *common)
-    run(f"{name} cross-rank checks", ctx, results, case_checked, *common)
-
-
-def main(argv=None) -> int:
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    p.add_argument("--models", nargs="*", default=["glm5", "m3"], choices=list(MODELS))
-    p.add_argument("--modes", nargs="*", default=list(MODES), choices=list(MODES))
-    p.add_argument(
-        "--tokens", type=int, nargs="*", default=[8, 64, 256], help="global tokens"
-    )
-    p.add_argument("--routes", nargs="*", default=["balanced", "random", "hot"])
-    p.add_argument("--seeds", type=int, default=3, help="seeds per random / hot case")
-    p.add_argument("--comm-dtypes", nargs="*", default=["fp8", "bf16"])
-    p.add_argument("--max-local-tokens", type=int, default=128)
-    p.add_argument("--rtol", type=float, default=0.045, help="fp8 comm: fused vs torch")
-    p.add_argument(
-        "--rtol-bf16", type=float, default=0.01, help="bf16 comm: fused vs torch"
-    )
-    p.add_argument(
-        "--rtol-ag8", type=float, default=0.05, help="ar_gather fp8: fused vs torch"
-    )
-    p.add_argument("--seed", type=int, default=123)
-    args = p.parse_args(argv)
-
-    ctx = Ctx()
-    from aiter.jit.utils.chip_info import get_gfx
-
-    if get_gfx() != "gfx950":
-        ctx.log(f"[SKIP] needs gfx950, found {get_gfx()}")
-        dist.destroy_process_group()
-        return 0
-    bad = [
-        t
-        for t in args.tokens
-        if t % ctx.world or t // ctx.world > args.max_local_tokens
-    ]
-    if bad:
-        raise ValueError(
-            f"tokens {bad} must be multiples of tp, <= max_local_tokens * tp"
+def _summary(name: str, rows: list) -> None:
+    if rows and S.ctx.rank == 0:
+        aiter.logger.info(
+            "%s summary (markdown):\n%s",
+            name,
+            pd.DataFrame(rows)
+            .pipe(lambda df: df[[c for c in df.columns if c != "status"] + ["status"]])
+            .to_markdown(index=False),
         )
 
-    results: list = []
-    for name in args.models:
-        run_model(name, ctx, args, results)
+
+def main() -> int:
+    global S
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter, description=__doc__
+    )
+    parser.add_argument(
+        "--models",
+        nargs="*",
+        default=["m3", "glm5"],
+        choices=list(MODELS),
+        help="Models.\n    e.g.: --models m3",
+    )
+    parser.add_argument(
+        "--modes",
+        nargs="*",
+        default=list(MODES),
+        choices=list(MODES),
+        help="comm_mode.\n    e.g.: --modes ag_rs",
+    )
+    parser.add_argument(
+        "-t",
+        "--tokens",
+        type=int,
+        nargs="*",
+        default=[8, 64, 256],
+        help="GLOBAL tokens per forward (multiples of tp).\n    e.g.: -t 256 2048",
+    )
+    parser.add_argument(
+        "-r",
+        "--routes",
+        nargs="*",
+        default=["balanced", "random", "hot"],
+        choices=["balanced", "random", "hot", "subset"],
+        help="Routing distributions.\n    e.g.: -r random",
+    )
+    parser.add_argument(
+        "-s",
+        "--seeds",
+        type=int,
+        nargs="*",
+        default=[0, 1],
+        help="Input / routing seeds.\n    e.g.: -s 0",
+    )
+    args = parser.parse_args()
+
+    if get_gfx() not in SUPPORTED_GFX:
+        if int(os.environ.get("RANK", "0")) == 0:
+            aiter.logger.warning("MegaMoE TP unsupported on %s; skipping", get_gfx())
+        return 0
+    ctx = Ctx()
+    if ctx.rank != 0:
+        aiter.logger.setLevel("WARNING")
+    bad = [t for t in args.tokens if t <= 0 or t % ctx.world]
+    if bad:
+        raise ValueError(f"tokens {bad} must be positive multiples of tp={ctx.world}")
+    max_tokens = max(args.tokens)
+    S = Session(ctx, max(max_tokens // ctx.world, 128), max_tokens, {}, {})
+
+    rows = {"accuracy + perf": [], "feature cases": [], "SpRsNorm": []}
+    for model in args.models:
+        S.weights = {model: build_weights(MODELS[model], ctx, SEED)}
+        for mode, tokens, route, seed in itertools.product(
+            args.modes, args.tokens, args.routes, args.seeds
+        ):
+            rows["accuracy + perf"].append(
+                _run(test_mega_moe_tp, model, mode, tokens, route, seed)
+            )
+        for mode, case in itertools.product(args.modes, CASES):
+            rows["feature cases"].append(_run(test_mega_moe_tp_case, model, mode, case))
+        for case in MODEL_CASES:
+            if case != "fused tail" or "ag_rs" in args.modes:
+                rows["feature cases"].append(
+                    _run(test_mega_moe_tp_case, model, "ag_rs", case)
+                )
+        S.layers, S.weights = {}, {}
         gc.collect()
         torch.cuda.empty_cache()
-    run("SpRsNorm (+ router)", ctx, results, case_sp_rs_norm, ctx, args)
+        dist.barrier()
+    rows["SpRsNorm"].append(_run(test_sp_rs_norm, 6144, max_tokens))
 
-    failed = [r for r in results if not r[1]]
-    ctx.log(f"\n{len(results) - len(failed)}/{len(results)} passed")
-    for n, _, info in failed:
-        ctx.log(f"  FAIL {n}: {info}")
+    for name, r in rows.items():
+        _summary(f"MegaMoE TP tp{ctx.world} {name}", r)
+    failed = [r for rs in rows.values() for r in rs if r["status"] != "PASS"]
+    total = sum(len(rs) for rs in rows.values())
+    if ctx.rank == 0:
+        aiter.logger.info("MegaMoE TP: %d/%d passed", total - len(failed), total)
+        for r in failed:
+            aiter.logger.error(
+                "FAIL %s", {k: v for k, v in r.items() if " " not in k and k != "gfx"}
+            )
     dist.barrier()
     dist.destroy_process_group()
     return 1 if failed else 0
@@ -732,9 +898,8 @@ def _relaunch() -> int:
         print("test_mega_moe_TP: skipped (needs >= 2 gfx950 GPUs)", flush=True)
         return 0
     n = 8 if n >= 8 else 4 if n >= 4 else 2
-    argv = sys.argv[1:] or ["--seeds", "2"]
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone"]
-    cmd += [f"--nproc_per_node={n}", os.path.abspath(__file__), *argv]
+    cmd += [f"--nproc_per_node={n}", os.path.abspath(__file__), *sys.argv[1:]]
     return subprocess.call(cmd)
 
 

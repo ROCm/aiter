@@ -16,7 +16,7 @@ import torch.distributed as dist
 from ...quick_allreduce_int4_ipc import UncachedIpcHeap as _Ipc
 from ..kernels_common import ceildiv
 from ..tensor_shim import _preload_compiled, _run_compiled
-from .mega_moe_tp_kernel import (
+from .mega_moe_tp_config import (
     CTRL_ERR,
     CTRL_INTS,
     DYN_MAX,
@@ -31,12 +31,12 @@ from .mega_moe_tp_kernel import (
     NCTA_MAX,
     NMETA_CAP,
     TN_MAX,
-    compile_mega_moe_tp,
     gemm2_chunk_groups,
     gemm2_group_step,
     mega_moe_tp_consts,
     mega_moe_tp_shape_supported,
 )
+from .mega_moe_tp_kernel import compile_mega_moe_tp
 
 __all__ = [
     "LaunchCfg",
