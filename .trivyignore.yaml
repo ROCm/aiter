@@ -1,0 +1,7 @@
+misconfigurations:
+  - id: AVD-DS-0002
+    paths:
+      - docs/examples/isa_optimization/Dockerfile
+    statement: >
+      This Dockerfile is an interactive ISA optimization tooling image for the
+      documentation examples, not a long-running service image.
