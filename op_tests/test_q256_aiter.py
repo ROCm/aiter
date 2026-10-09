@@ -4,9 +4,9 @@
 import argparse
 import json
 import os
-from pathlib import Path
 import runpy
 import sys
+from pathlib import Path
 
 
 def main():
@@ -16,8 +16,11 @@ def main():
     parser.add_argument("--tokens", type=int, choices=(8192, 32768), default=8192)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--compare-producer", action="store_true",
-                        help="Compare compact contributions exactly with the installed sorted producer")
+    parser.add_argument(
+        "--compare-producer",
+        action="store_true",
+        help="Compare compact contributions exactly with the installed sorted producer",
+    )
     args = parser.parse_args()
     root = args.aiter_root.resolve()
     harness = root / "op_tests/test_moe_q256_prefill.py"
@@ -34,8 +37,9 @@ def main():
     sys.path.insert(0, str(root))
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
-    import aiter
     import torch
+
+    import aiter
     from aiter.ops import moe_op
 
     if Path(aiter.__file__).resolve().parent != root / "aiter":
@@ -48,9 +52,7 @@ def main():
         out, partials, _, _, _, sorted_ids = native_args[:6]
         tokens, model = out.shape
         topk = native_args[-1]
-        assert (tokens, model, topk) == (args.tokens, 8192, 11), (
-            tokens, model, topk
-        )
+        assert (tokens, model, topk) == (args.tokens, 8192, 11), (tokens, model, topk)
         expected = (
             (tokens, topk, model)
             if args.layout == "compact"
@@ -76,7 +78,9 @@ def main():
         result = native(*native_args, **native_kwargs)
         if first_call and args.compare_producer:
             sorted_partials = torch.empty(
-                (sorted_ids.numel(), model), dtype=partials.dtype, device=partials.device
+                (sorted_ids.numel(), model),
+                dtype=partials.dtype,
+                device=partials.device,
             )
             baseline_args = list(native_args)
             baseline_args[0] = torch.empty_like(out)
@@ -96,9 +100,9 @@ def main():
                 logical = token[valid] * topk + (packed[valid] >> 24)
                 expected_values = sorted_partials[start:stop][valid]
                 actual_values = route_rows[logical]
-                assert torch.equal(expected_values, actual_values), (
-                    f"Compact producer contributions differ from hybrid at sorted rows {start}"
-                )
+                assert torch.equal(
+                    expected_values, actual_values
+                ), f"Compact producer contributions differ from hybrid at sorted rows {start}"
             assert bool(torch.isfinite(partials).all())
             storage["exact_hybrid_contributions_equal"] = True
             print("Q256_EXACT_HYBRID_CONTRIBUTIONS_PASS", flush=True)
@@ -107,8 +111,14 @@ def main():
     moe_op.fmoe_q256 = verify_q256
     previous_argv = sys.argv
     sys.argv = [
-        str(harness), "--tokens", str(args.tokens), "--model", "8192",
-        "--reference", "--output", str(args.output),
+        str(harness),
+        "--tokens",
+        str(args.tokens),
+        "--model",
+        "8192",
+        "--reference",
+        "--output",
+        str(args.output),
     ]
     if args.profile:
         sys.argv.append("--profile")
