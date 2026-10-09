@@ -345,17 +345,29 @@ def test_top_k_per_row_decode(
     flydsl: bool = False,
     stable: bool = False,
     write_values: bool = False,
+    ragged: bool = False,
 ) -> dict:
     """
     Test top_k_per_row_decode with seq_lens tensor.
+
+    ragged gives the requests different lengths in one buffer, so a launch
+    mixes rows that one CTA finishes with rows split across CTAs.
     """
     torch.set_default_device("cuda:0")
     ret = {}
     # Create test data
     num_rows = batch_size * next_n
-    seq_lens = torch.empty(batch_size, dtype=torch.int32, device="cuda").fill_(
-        context_len
-    )
+    if ragged:
+        lengths = [context_len, context_len // 8, context_len // 64, context_len // 2]
+        seq_lens = torch.tensor(
+            [max(next_n, lengths[i % len(lengths)]) for i in range(batch_size)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+    else:
+        seq_lens = torch.empty(batch_size, dtype=torch.int32, device="cuda").fill_(
+            context_len
+        )
     row_starts = torch.zeros(num_rows, dtype=torch.int32, device="cuda")
     row_indices = torch.arange(num_rows, device="cuda") // next_n
     next_n_offset = torch.arange(num_rows, device="cuda") % next_n
@@ -420,6 +432,99 @@ def test_top_k_per_row_decode(
     ret["us"] = us
     ret["fast"] = fast
     return ret
+
+
+def _decode_reference(logits, row_ends, top_k):
+    ref = logits.topk(min(top_k, int(max(row_ends))), dim=-1)[1]
+    mask = (ref >= 0) & ((ref - row_ends[:, None]) < 0)
+    return ref.masked_fill(~mask, -1)
+
+
+def test_flydsl_decode_split_reuse():
+    """Long rows split across CTAs and merge in the same launch.
+
+    The per-row arrival counters rearm themselves; this drives repeated eager
+    calls, CUDA graph replays and two streams, stable and not, over a buffer
+    that mixes split rows with rows one CTA finishes.
+    """
+    if get_gfx() not in _FLYDSL_TOPK_DECODE_GATES:
+        print("[flydsl_decode_split_reuse] FlyDSL decode not served here; skipping")
+        return
+    torch.set_default_device("cuda:0")
+    num_rows, width, top_k = 16, 1 << 19, 2048
+    seq_lens = torch.tensor(
+        [[width, 4096, 300_001, 70_003][i % 4] for i in range(num_rows)],
+        dtype=torch.int32,
+    )
+    row_starts = torch.zeros(num_rows, dtype=torch.int32)
+
+    def run(logits, indices, stable):
+        aiter.flydsl_top_k_per_row_decode(
+            logits, 1, seq_lens, indices, num_rows, width, 1, top_k, stable
+        )
+
+    def check(logits, indices, stable, what):
+        ref = _decode_reference(logits, seq_lens, top_k)
+        assert compare_topk_results(
+            logits, indices, ref, row_starts, seq_lens, top_k, stable=stable
+        ), f"flydsl decode split mismatch: {what}"
+
+    def new_logits(seed):
+        return create_random_logits(
+            row_starts, seq_lens, torch.float32, seed, physical_width=width
+        )
+
+    for stable in (False, True):
+        for call_idx, seed in enumerate((11, 22, 33)):
+            logits = new_logits(seed)
+            indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+            run(logits, indices, stable)
+            check(logits, indices, stable, f"eager call #{call_idx} stable={stable}")
+
+    graphs, buffers = [], []
+    for seed in (44, 55):
+        logits = new_logits(seed)
+        indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+        run(logits, indices, False)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            for _ in range(3):
+                run(logits, indices, False)
+        graphs.append(graph)
+        buffers.append((logits, indices))
+    for replay in range(20):
+        for graph, (logits, indices) in zip(graphs, buffers):
+            logits.copy_(new_logits(100 + replay))
+            graph.replay()
+            check(logits, indices, False, f"graph replay #{replay}")
+
+    # A caller may capture without an eager warmup. This records one defensive
+    # counter zero-fill in the graph instead of rejecting the capture.
+    logits = new_logits(58)
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(logits, indices, False)
+    graph.replay()
+    check(logits, indices, False, "capture without warmup")
+
+    streams = [torch.cuda.Stream() for _ in range(2)]
+    outs = []
+    for seed, stream in zip((66, 77), streams):
+        logits = new_logits(seed)
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            calls = [
+                torch.empty((num_rows, top_k), dtype=torch.int32) for _ in range(10)
+            ]
+            for indices in calls:
+                run(logits, indices, False)
+        outs.append((logits, calls))
+    torch.cuda.synchronize()
+    for logits, calls in outs:
+        for indices in calls:
+            check(logits, indices, False, "concurrent streams")
+    print("[flydsl_decode_split_reuse] PASS: eager, graph replay and streams")
 
 
 def test_mb_workspace_reuse():
@@ -535,6 +640,7 @@ args = parser.parse_args()
 
 # Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
 test_mb_workspace_reuse()
+test_flydsl_decode_split_reuse()
 
 
 # Ask each path which arches it serves rather than keeping a second copy
@@ -592,17 +698,23 @@ for data_generation in args.data_generation:
                             )
                             df.append(ret)
                             if flydsl_decode_available:
-                                ret = test_top_k_per_row_decode(
-                                    m,
-                                    ctx,
-                                    k,
-                                    n,
-                                    data_generation,
-                                    flydsl=True,
-                                    stable=stable,
-                                    write_values=write_values,
-                                )
-                                df.append(ret)
+                                # Ragged lengths only matter once some rows
+                                # are long enough to be split.
+                                for ragged in (
+                                    (False, True) if ctx >= 65536 else (False,)
+                                ):
+                                    ret = test_top_k_per_row_decode(
+                                        m,
+                                        ctx,
+                                        k,
+                                        n,
+                                        data_generation,
+                                        flydsl=True,
+                                        stable=stable,
+                                        write_values=write_values,
+                                        ragged=ragged,
+                                    )
+                                    df.append(ret)
                         # `_fast` ASM kernel hardcodes k=2048 and is not stable.
                         if get_gfx() == "gfx942" and k == 2048 and not stable:
                             ret = test_top_k_per_row_decode(
