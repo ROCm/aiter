@@ -144,6 +144,7 @@ _fused_qkv_split_qk_norm_rope_cache_kernel_repr = make_kernel_repr(
         "BLOCKED_GATED_LAYOUT",
         "HAVE_K_SCALE",
         "HAVE_V_SCALE",
+        "Q_SCALE",
     ],
 )
 
