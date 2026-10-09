@@ -44,7 +44,7 @@ jobs:
     steps:
       - name: Authorize (trigger + allowlist) before any self-hosted checkout
         id: gate
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         env:
           AITER_REVIEW_AUTHORIZED: ${{ vars.AITER_REVIEW_AUTHORIZED }}   # optional; empty -> authorized.txt
         with:
@@ -89,7 +89,7 @@ jobs:
       REVIEW_AUTO_VALIDATE: '0'   # kernel validation off by default (self-hosted + public repo)
     steps:
       - name: Checkout tooling (base/main, trusted)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0                 # full history: fetch.sh needs the PR + merge-target refs
           persist-credentials: false
