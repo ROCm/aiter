@@ -1,7 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (c) 2025 FlyDSL Project Contributors
 
-"""Grouped contiguous-M A8W4 preshuffle MoE GEMM for gfx1250 (TDM pipeline)."""
+"""Grouped contiguous-M A8W4/A4W4 MoE GEMM for gfx1250 (TDM pipeline).
+
+AITER_FLYDSL_MOE_WMMA_SCALE_BLOCK=16 selects scale16 WMMA for A4W4.
+Each K32 E8M0 scale is repeated for two K16 blocks in registers, preserving
+the input quantization and packed scale layouts. The default is scale32 WMMA.
+"""
 
 import math
 import os
@@ -9,6 +14,7 @@ from collections import namedtuple
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
 from flydsl.expr.arith import _to_raw as _raw
@@ -54,6 +60,7 @@ def is_fx_set_register_available():
 
 
 TDM_DESCRIPTOR_VERSION = 1
+WMMA_SCALE_BLOCK = int(os.environ.get("AITER_FLYDSL_MOE_WMMA_SCALE_BLOCK", "32"))
 MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
 MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
 DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
@@ -67,6 +74,8 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
+if WMMA_SCALE_BLOCK not in (16, 32):
+    raise ValueError("AITER_FLYDSL_MOE_WMMA_SCALE_BLOCK must be 16 or 32")
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
 if DS_FIRST_N < 0:
@@ -113,6 +122,13 @@ def _pack_bytes_i32(byte_vals):
             w = w << fx.Int32(8 * n)
         packed = w if packed is None else packed | w
     return packed
+
+
+def _expand_scale32_to_scale16(scale):
+    """Repeat each E8M0 byte for two K16 blocks, preserving K32 quantization."""
+    lo = rocdl.perm_b32(scale, scale, fx.Int32(0x01010000))
+    hi = rocdl.perm_b32(scale, scale, fx.Int32(0x03030202))
+    return Vec.from_elements([lo, hi]).bitcast(fx.Int64)[0]
 
 
 # The staging loop emits one e8m0 per WN_PER_MX_BLOCK_EP subtiles of 16 columns
@@ -213,6 +229,7 @@ def launch_gemm_a8w4_tdm(
     WMMA_M = 16
     WMMA_N = 32 if a_is_fp4 else 16
     WMMA_K = 128
+    use_scale16 = a_is_fp4 and WMMA_SCALE_BLOCK == 16
     WAVE = 32
     PACK_TK = tile_k // 2
     KWS = tile_k // WMMA_K
@@ -261,6 +278,7 @@ def launch_gemm_a8w4_tdm(
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
         ep_quant_bits,
+        use_scale16,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -401,6 +419,7 @@ def launch_gemm_a8w4_tdm(
         ), "stage1 quant requires complete four-WMMA N groups"
 
     _afp = "fp4" if a_is_fp4 else "fp8"
+    _scale16 = "_scale16" if use_scale16 else ""
     _act = f"_act{stage1_act}" if stage1_act else ""
     _qout = f"_q{stage1_quant_out}r{quant_wmma_rep}" if stage1_quant_out else ""
     _bias = "_bias" if has_bias else ""
@@ -426,7 +445,7 @@ def launch_gemm_a8w4_tdm(
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _kname = (
-        f"a8w4_tdm_{_afp}"
+        f"a8w4_tdm_{_afp}{_scale16}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
         f"_b{num_buffers}_K{K}"
         f"{_grouped}{_act}{_bias}{_qout}{_cl}{_cluster_sync}"
@@ -1057,6 +1076,10 @@ def launch_gemm_a8w4_tdm(
                 for sb_sel in range_constexpr(2)
             ]
         )
+        scale_row_attrs = [
+            ir.Attribute.parse(f"#rocdl<wmma_matrix_scale row{row}>")
+            for row in range_constexpr(2)
+        ]
         WMMA_VECTOR_DWORDS = WMMA_N // 2
         c_frags = [
             fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
@@ -1094,18 +1117,25 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(a_is_fp4):
                         wt_value = wt[wn].load()
                         act_value = act[i].load()
-                        c_frags[idx].store(
-                            rocdl.wmma_scale_f32_32x16x128_f4(
-                                T.vec(16, T.f32),
-                                wt_value.ir_value(),
-                                act_value.ir_value(),
-                                c_frags[idx].load().ir_value(),
-                                scale_a,
-                                scale_b,
-                                scaleAType=0,
-                                scaleBType=wm % 2,
-                            )
+                        wmma_op = (
+                            rocdl.wmma_scale16_f32_32x16x128_f4
+                            if use_scale16
+                            else rocdl.wmma_scale_f32_32x16x128_f4
                         )
+                        if const_expr(use_scale16):
+                            scale_a = _expand_scale32_to_scale16(scale_a)
+                            scale_b = _expand_scale32_to_scale16(scale_b)
+                        result = wmma_op(
+                            T.vec(16, T.f32),
+                            wt_value.ir_value(),
+                            act_value.ir_value(),
+                            c_frags[idx].load().ir_value(),
+                            _raw(scale_a),
+                            _raw(scale_b),
+                            scaleAType=scale_row_attrs[0],
+                            scaleBType=scale_row_attrs[wm % 2],
+                        )
+                        c_frags[idx].store(result.result if use_scale16 else result)
                     else:
                         fx.gemm(
                             wmma_atoms[wn % 2][wm % 2],
