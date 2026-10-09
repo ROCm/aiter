@@ -16,7 +16,9 @@ from ..jit.core import (
 )
 from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.flydsl_guard import is_flydsl_available
 from ..jit.utils.mha_recipes import (
+    _ck_targets_flag,
     compose_mha_fwd_variant_suffix_and_filter,
     get_mha_varlen_prebuild_variants_by_names,
 )
@@ -117,7 +119,8 @@ def cmdGenFunc_mha_fwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
-        "--receipt 100 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 100 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
     ]
     return {
         "md_name": md_name,
@@ -946,10 +949,12 @@ def cmdGenFunc_mha_varlen_fwd(
         blob_gen_cmd = [
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd "
             "--receipt 200 --filter {} --output_dir {{}}".format('" "')
+            + _ck_targets_flag()
         ]
         blob_gen_cmd.append(
             f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d fwd_splitkv "
             "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd_splitkv)
+            + _ck_targets_flag()
         )
     return {
         "md_name": md_name,
@@ -1237,13 +1242,14 @@ def cmdGenFunc_mha_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 300 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 300 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1495,13 +1501,14 @@ def cmdGenFunc_mha_varlen_bwd(
 
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d bwd "
-        "--receipt 400 --filter {} --output_dir {{}}".format(filter),
+        "--receipt 400 --filter {} --output_dir {{}}".format(filter)
+        + _ck_targets_flag(),
         f"{AITER_META_DIR}/hsa/codegen.py -m fmha_v3_bwd --output_dir {{}}",
     ]
     return {
         "md_name": md_name,
         "blob_gen_cmd": blob_gen_cmd,
-        "flags_extra_cc": ["'-DONLY_FAV3=0'"],
+        "flags_extra_cc": ["-DONLY_FAV3=0"],
     }
 
 
@@ -1617,6 +1624,7 @@ def cmdGenFunc_mha_batch_prefill(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
+        + _ck_targets_flag()
     ]
     return {
         "md_name": md_name,
@@ -2838,7 +2846,8 @@ def flash_attn_func(
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
     if (
-        cu_seqlens_q is None
+        is_flydsl_available()
+        and cu_seqlens_q is None
         and cu_seqlens_kv is None
         and num_splits <= 1
         and (len(window_size) < 3 or window_size[2] == 0)
@@ -3353,7 +3362,7 @@ def _flash_attn_varlen_backward(
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
     # Evaluated after maybe_contiguous: the gate checks contiguity.
-    can_impl_fmha_bwd_flydsl_ = can_impl_fmha_bwd_flydsl()
+    can_impl_fmha_bwd_flydsl_ = can_impl_fmha_bwd_flydsl() and is_flydsl_available()
 
     if can_impl_fmha_bwd_flydsl_:
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
@@ -3845,7 +3854,11 @@ def flash_attn_varlen_func(
     # the path so a sink-token request is never silently dropped.
     # FlyDSL also does not consume precomputed Q/K/V descales, so keep
     # prequantized FP8 attention on the CK path.
-    if not has_all_descales and (len(window_size) < 3 or window_size[2] == 0):
+    if (
+        is_flydsl_available()
+        and not has_all_descales
+        and (len(window_size) < 3 or window_size[2] == 0)
+    ):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(
