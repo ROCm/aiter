@@ -344,33 +344,58 @@ __global__ void add_rmsnorm_n64_kernel(
     int out_stride)
 {
     const int tid = threadIdx.x;
-    int row = blockIdx.x * NumRows;
+    const int base = blockIdx.x * NumRows;
+    if (base >= m)
+    {
+        return;
+    }
     const float weight_value =
         static_cast<float>(weight[tid]) + (gemma_norm ? 1.0f : 0.0f);
     auto sum_f = [](float a, float b) { return a + b; };
 
-    #pragma nounroll
-    for(int r = 0; r < NumRows && row < m; ++r, ++row)
-    {
-        const int64_t input_offset =
-            row * static_cast<int64_t>(input_stride) + tid;
-        const int64_t residual_in_offset =
-            row * static_cast<int64_t>(residual_in_stride) + tid;
-        const int64_t residual_out_offset =
-            row * static_cast<int64_t>(residual_out_stride) + tid;
-        const int64_t out_offset =
-            row * static_cast<int64_t>(out_stride) + tid;
-
-        const float value = static_cast<float>(input[input_offset]) +
-                            static_cast<float>(residual_in[residual_in_offset]);
-        residual_out[residual_out_offset] = static_cast<DTYPE_I>(value);
-
+    auto consume_row = [&](int row, float in_value, float residual_value) {
+        const float value = in_value + residual_value;
+        residual_out[row * static_cast<int64_t>(residual_out_stride) + tid] =
+            static_cast<DTYPE_I>(value);
         const float square_sum =
             block_reduce<float, decltype(sum_f), WARP_SIZE, true>(
                 value * value, sum_f);
         const float inv_rms = rsqrtf(square_sum / 64.0f + epsilon);
-        out[out_offset] =
+        out[row * static_cast<int64_t>(out_stride) + tid] =
             static_cast<DTYPE_I>(value * inv_rms * weight_value);
+    };
+
+    // Rows are independent. Load every row owned by this block before the
+    // first reduction so those reads are in flight together.
+    if (base + NumRows <= m)
+    {
+        float in_values[NumRows];
+        float residual_values[NumRows];
+        #pragma unroll
+        for (int r = 0; r < NumRows; ++r)
+        {
+            const int row = base + r;
+            in_values[r] = static_cast<float>(
+                input[row * static_cast<int64_t>(input_stride) + tid]);
+            residual_values[r] = static_cast<float>(
+                residual_in[row * static_cast<int64_t>(residual_in_stride) + tid]);
+        }
+        #pragma unroll
+        for (int r = 0; r < NumRows; ++r)
+        {
+            consume_row(base + r, in_values[r], residual_values[r]);
+        }
+    }
+    else
+    {
+        for (int row = base; row < m; ++row)
+        {
+            const float in_value = static_cast<float>(
+                input[row * static_cast<int64_t>(input_stride) + tid]);
+            const float residual_value = static_cast<float>(
+                residual_in[row * static_cast<int64_t>(residual_in_stride) + tid]);
+            consume_row(row, in_value, residual_value);
+        }
     }
 }
 
