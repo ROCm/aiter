@@ -161,10 +161,19 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
 
+    gate = params.target_num_prgms
+    if DEVICE_ARCH == "gfx1100":
+        # On gfx1100 the 3D split-KV kernel only pays off while the 2D launch
+        # is too small to fill the machine; past that the extra segment traffic
+        # and the reduce pass cost more than the added parallelism. The
+        # measured crossover is cu_count / 4, and target_num_prgms is
+        # cu_count * 4, hence the // 16.
+        gate = params.target_num_prgms // 16
+
     return (
         (params.sliding_window > 0)
         or (params.max_seqlen_k <= 512)
-        or (params.num_2d_prgms > params.target_num_prgms)
+        or (params.num_2d_prgms > gate)
     )
 
 
@@ -597,6 +606,7 @@ def _unified_attention_2d_triton(params: _UAParams):
         SHUFFLED_KV_CACHE=params.shuffled_kv_cache,
         K_WIDTH=params.k_width,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -678,6 +688,7 @@ def _unified_attention_3d_triton(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -713,6 +724,7 @@ def _reduce_segments_triton(
         TILE_SIZE=TILE_SIZE,
         BLOCK_Q=None,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -837,6 +849,7 @@ def _unified_attention_2d_gfx1250(params: _UAParams):
         REMOVE_INDIRECT_ACCESS=False,
         NUM_BUFFERS=config["NUM_BUFFERS"],
         LOOP_VARIANT=loop_variant,
+        enable_fp_fusion=True,
     )
 
 
@@ -931,6 +944,7 @@ def _unified_attention_3d_gfx1250(
         NUM_SEGMENTS_PER_SEQ=NUM_SEGMENTS,
         TILE_SIZE=TILE_SIZE,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -967,6 +981,7 @@ def _reduce_segments_gfx1250(
         NUM_WARPS=gluon_num_warps,
         num_warps=gluon_num_warps,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -1080,6 +1095,7 @@ def _unified_attention_gfx950(
         partial_m_ptr=partial_m,
         partial_l_ptr=partial_l,
         partial_acc_ptr=partial_acc,
+        enable_fp_fusion=True,
     )
 
 
