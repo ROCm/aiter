@@ -29,6 +29,72 @@ def device(monkeypatch):
     return torch.device("cuda")
 
 
+@pytest.mark.parametrize(
+    "batch,max_parts,budget,window,query_length",
+    [
+        (1, 1, 1, 0, 1),
+        (6, 7, 160, 257, 4),
+        (63, 7, 160, 0, 1),
+        (65, 7, 512, 1, 4),
+        (257, None, 4096, 8193, 4),
+        (4096, None, 8192, 0, 1),
+    ],
+)
+def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
+    """Packed tasks cover every visible tile and remain valid after graph refresh."""
+    from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
+
+    def check(plan, lengths):
+        info = plan.reduce_info.cpu().tolist()
+        work = plan.work_info.cpu().tolist()
+        cursor = 0
+        for seq, (ctx, (start, count)) in enumerate(zip(lengths, info)):
+            assert start == cursor
+            first = (
+                max(max(ctx, 0) - query_length + 1 - window, 0) // 256 if window else 0
+            )
+            last = (max(ctx, 0) + 255) // 256
+            assert 0 <= count <= min(last - first, plan.max_partitions)
+            assert (count > 0) == (last > first)
+            tile = first
+            for record in work[start : start + count]:
+                row, begin, end, original_length = record
+                assert row == seq and original_length == ctx
+                assert begin == tile and begin < end <= last
+                tile = end
+            assert tile == last
+            cursor += count
+        assert cursor <= plan.capacity
+        assert all(record == [0, 0, 0, 0] for record in work[cursor:])
+
+    pattern = (-1, 0, 1, 255, 256, 257, 65537, 2**31 - 1)
+    lengths = [pattern[i % len(pattern)] for i in range(batch)]
+    context = torch.tensor(lengths, dtype=torch.int32, device=device)
+    plan = plan_pa_decode(
+        context,
+        2,
+        max_partitions=max_parts,
+        workgroup_budget=budget,
+        sliding_window=window,
+        query_length=query_length,
+    )
+    check(plan, lengths)
+    pointers = (plan.work_info.data_ptr(), plan.reduce_info.data_ptr())
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        refreshed = plan_pa_decode(
+            context, 2, sliding_window=window, query_length=query_length, plan=plan
+        )
+    assert refreshed is plan
+    # All-empty replay must erase old active records, then mixed lengths must
+    # rebuild them using the same buffers without stale padding or readback.
+    for values in ([0] * batch, list(reversed(lengths))):
+        context.copy_(torch.tensor(values, dtype=torch.int32, device=device))
+        graph.replay()
+        check(plan, values)
+        assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()
