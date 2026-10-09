@@ -2,11 +2,14 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Validate the same coupled MXMOE candidate boundary used by the tuner."""
 
+from __future__ import annotations
+
 import argparse
 import functools
 import itertools
 import math
 import os
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -43,13 +46,27 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def run_torch(data, topk, dtype, activation, swiglu_limit=None):
+def run_torch(
+    data: dict[str, Any],
+    topk: int,
+    dtype: torch.dtype,
+    activation: ActivationType,
+    swiglu_limit: float | None = None,
+) -> torch.Tensor:
     return Mxfp4FlydslTuner._torch_ref(
         data, topk, dtype, activation, swiglu_limit=swiglu_limit
     )
 
 
-def check_mxfp8_input(data, token, model_dim, expert, topk, block_m, dtype):
+def check_mxfp8_input(
+    data: dict[str, Any],
+    token: int,
+    model_dim: int,
+    expert: int,
+    topk: int,
+    block_m: int,
+    dtype: torch.dtype,
+) -> None:
     """Check payload and valid sorted scales against the public torch quantizer."""
     ref_q, ref_s = per_1x32_f8_scale_f8_quant(
         data["input"], scale_type=dtypes.fp8_e8m0, shuffle=False
@@ -141,17 +158,17 @@ def check_mxfp8_input(data, token, model_dim, expert, topk, block_m, dtype):
 
 @benchmark()
 def test_coupled_mxmoe(
-    token,
-    model_dim,
-    inter_dim,
-    expert,
-    topk,
-    dtype,
-    precision,
-    activation,
-    block_m,
-    tile_k,
-):
+    token: int,
+    model_dim: int,
+    inter_dim: int,
+    expert: int,
+    topk: int,
+    dtype: torch.dtype,
+    precision: str,
+    activation: str,
+    block_m: int,
+    tile_k: int,
+) -> dict[str, Any]:
     a_dtype = "fp8" if precision == "A8W4" else "fp4"
     data = Mxfp4FlydslTuner._prepare_case(
         token, model_dim, inter_dim, expert, topk, dtype, a_dtype=a_dtype
@@ -267,7 +284,9 @@ def test_coupled_mxmoe(
 test_coupled_mxmoe.__test__ = False  # The CLI owns the perf sweep axes.
 
 
-def decode_bm16_intermediate(payload, scale, inter_dim, *, native):
+def decode_bm16_intermediate(
+    payload: torch.Tensor, scale: torch.Tensor, inter_dim: int, *, native: bool
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Read the valid E8M0 addresses consumed by the SBM16 GEMM2 reader."""
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
 
@@ -295,8 +314,14 @@ def decode_bm16_intermediate(payload, scale, inter_dim, *, native):
 
 @benchmark()
 def test_bm16_scale_pipeline(
-    token, model_dim, inter_dim, dtype, precision, activation, tile_k
-):
+    token: int,
+    model_dim: int,
+    inter_dim: int,
+    dtype: torch.dtype,
+    precision: str,
+    activation: str,
+    tile_k: int,
+) -> dict[str, Any]:
     """Multiple expert blocks with different magnitudes and a partial tail."""
     expert, topk, bm = 2, 2, 16
     a_dtype = "fp8" if precision == "A8W4" else "fp4"
@@ -442,7 +467,9 @@ def test_bm16_scale_pipeline(
         g2 = f"flydsl_moe2_layout_a{a_dtype}_wfp4_bf16_t16x128x{tile_k}_{mode}_sbm16"
         output = torch.full((token, model_dim), float("nan"), dtype=dtype)
 
-        def pipeline(g2=g2, output=output, mode=mode):
+        def pipeline(
+            g2: str = g2, output: torch.Tensor = output, mode: str = mode
+        ) -> torch.Tensor:
             # Atomic sort clears this buffer in the real coupled pipeline.
             if mode == "atomic":
                 output.zero_()
@@ -532,7 +559,9 @@ test_bm16_scale_pipeline.__test__ = False
 @pytest.mark.parametrize("activation", ["Silu", "Situv2", "Swiglu"])
 @pytest.mark.parametrize("token", [32, 33])
 @pytest.mark.parametrize("inter_dim,tile_k", [(384, 128), (512, 256)])
-def test_bm16_producer_consumer(precision, activation, token, inter_dim, tile_k):
+def test_bm16_producer_consumer(
+    precision: str, activation: str, token: int, inter_dim: int, tile_k: int
+) -> None:
     with torch.device("cuda"):
         result = test_bm16_scale_pipeline(
             token, 512, inter_dim, dtypes.bf16, precision, activation, tile_k
@@ -547,7 +576,9 @@ def test_bm16_producer_consumer(precision, activation, token, inter_dim, tile_k)
 @pytest.mark.parametrize("activation", ["Silu", "Situv2", "Swiglu"])
 @pytest.mark.parametrize("block_m", [16, 32, 64, 128])
 @pytest.mark.parametrize("inter_dim,tile_k", [(384, 128), (512, 256)])
-def test_coupled_candidate_numerics(precision, activation, block_m, inter_dim, tile_k):
+def test_coupled_candidate_numerics(
+    precision: str, activation: str, block_m: int, inter_dim: int, tile_k: int
+) -> None:
     with torch.device("cuda"):
         result = test_coupled_mxmoe(
             64,
@@ -567,7 +598,7 @@ def test_coupled_candidate_numerics(precision, activation, block_m, inter_dim, t
     )
 
 
-def main():
+def main() -> None:
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("Coupled MXMOE is unsupported on %s; skipping", get_gfx())
         return
