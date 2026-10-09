@@ -18,9 +18,10 @@ from ..kernels.topk.radix_topk_one_block import (
 )
 from ..kernels.topk.topk_per_row_decode import (
     ONE_CTA_MAX_ROW_LENGTH,
-    build_topk_per_row_decode_module,
-    topk_per_row_decode_chunks,
-    topk_per_row_decode_workspace_shapes,
+    launch_topk_per_row_decode_split,
+)
+from ..kernels.topk.topk_per_row_decode import (
+    clear_topk_per_row_decode_workspace_cache as _clear_decode_workspace_cache,
 )
 from ..kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
@@ -29,39 +30,8 @@ from ..kernels.topk.topk_per_row_decode_persistent import (
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 
-@lru_cache(maxsize=16)
-def _get_cached_workspace(
-    device: torch.device,
-    stream_id: int,
-    hist_shape: tuple[int, ...],
-    state_shape: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep scratch isolated by device, stream, and exact kernel layout."""
-    return (
-        torch.empty(hist_shape, device=device, dtype=torch.int32),
-        # Rendezvous counters start at zero; the kernel rearms them after use.
-        torch.zeros(state_shape, device=device, dtype=torch.int32),
-    )
-
-
-def _get_topk_workspace(
-    device: torch.device,
-    stream_id: int,
-    hist_shape: tuple[int, ...],
-    state_shape: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Do not let graph-pool allocations escape through the process cache.
-    if torch.cuda.is_current_stream_capturing():
-        return (
-            torch.empty(hist_shape, device=device, dtype=torch.int32),
-            # Each captured workspace needs zeroed rendezvous counters.
-            torch.zeros(state_shape, device=device, dtype=torch.int32),
-        )
-    return _get_cached_workspace(device, stream_id, hist_shape, state_shape)
-
-
 def clear_topk_per_row_decode_workspace_cache() -> None:
-    _get_cached_workspace.cache_clear()
+    _clear_decode_workspace_cache()
 
 
 @lru_cache(maxsize=128)
@@ -381,7 +351,7 @@ def flydsl_top_k_per_row_decode(
 
     rows, width = logits.shape
     properties = torch.cuda.get_device_properties(logits.device)
-    arch = properties.gcnArchName
+    arch = properties.gcnArchName.split(":", 1)[0]
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     # Allocated width bounds every row: at or below the one-CTA limit no row
@@ -406,33 +376,21 @@ def flydsl_top_k_per_row_decode(
 
     if rows == 0:
         return
-    # One row is `chunks` blocks, sized so the grid fits one block per CU.
-    chunks = topk_per_row_decode_chunks(rows, width, properties.multi_processor_count)
-    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable, chunks)
-    partial_hist, state = _get_topk_workspace(
-        logits.device, stream.cuda_stream, hist_shape, state_shape
-    )
-
-    launcher = build_topk_per_row_decode_module(
-        k,
-        stable,
-        wave_size=wave_size,
-        write_values=values is not None,
-        chunks_per_row=chunks,
-    )
-    _run_compiled(
-        launcher,
+    launch_topk_per_row_decode_split(
         logits,
+        next_n,
         seq_lens,
         indices,
-        values if values is not None else logits,
-        partial_hist,
-        state,
-        width,
-        next_n,
         rows,
+        k,
+        stable,
+        values,
+        arch,
+        wave_size,
+        properties.multi_processor_count,
         stream,
     )
+    return
 
 
 def flydsl_radix_topk_one_block(
@@ -496,8 +454,12 @@ def flydsl_radix_topk_one_block(
         row_ends,
         indices,
         values if values is not None else logits,
+        indices,
+        indices,
+        values if values is not None else logits,
         width,
         next_n,
+        1,
         num_rows,
         stream,
     )
