@@ -40,7 +40,6 @@ from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import ReductionOp, T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 from flydsl.runtime.device import get_rocm_arch
 
 from . import buffer_ops, dpp_utils
@@ -55,7 +54,7 @@ WAVE = 64
 MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
-NT_LOAD = 2
+NT_LOAD = 2  # gfx950 buffer-load aux bit 1: nontemporal cache policy.
 # Key by selected specialization, not batch/head/CU scheduling inputs.
 _PA_DECODE_TILE_CACHE = {}
 
@@ -68,15 +67,40 @@ def d256_m1_shape(
     query_length: int,
     query_group_size: int,
 ) -> bool:
-    """Head 256, page 64/128, plain V, per-tensor scales, query_length 1, one M-tile."""
+    """Head 256, page 64, plain V, per-tensor scales, query_length 1, one M-tile."""
     rows = query_length * query_group_size
     return (
         head_dim == 256
-        and block_size in (64, 128)
+        and block_size == 64
         and not trans_v
         and not per_token_kv
         and query_length == 1
         and (rows + MFMA_MNK - 1) // MFMA_MNK == 1
+    )
+
+
+def d256_m1_pipe(
+    arch: str,
+    use_work_plan: bool,
+    head_dim: int,
+    block_size: int,
+    trans_v: bool,
+    per_token_kv: bool,
+    query_length: int,
+    query_group_size: int,
+) -> bool:
+    """Static gfx950 page-64 pipe: nontemporal K, staged page ids, prefetched V."""
+    return (
+        arch == "gfx950"
+        and not use_work_plan
+        and d256_m1_shape(
+            head_dim,
+            block_size,
+            trans_v,
+            per_token_kv,
+            query_length,
+            query_group_size,
+        )
     )
 
 
@@ -200,19 +224,17 @@ def compile_pa_decode_tile(
     # evicting V, which is still being merged in L2. V prefetch only stays
     # live if the page-id load is not on the same in-order vmcnt chain, so
     # the host-sized page list is staged in LDS before the tile loop.
-    D256_M1_PIPE = (
-        is_gfx950
-        and not use_work_plan
-        and d256_m1_shape(
-            head_dim,
-            block_size,
-            trans_v,
-            per_token_kv,
-            query_length,
-            query_group_size,
-        )
+    D256_M1_PIPE = d256_m1_pipe(
+        "gfx950" if is_gfx950 else "",
+        use_work_plan,
+        head_dim,
+        block_size,
+        trans_v,
+        per_token_kv,
+        query_length,
+        query_group_size,
     )
-    if nhd_layout and not (D256_M1_PIPE and block_size == 64 and is_gfx950):
+    if nhd_layout and not D256_M1_PIPE:
         raise NotImplementedError(
             "NHD pa_decode is the gfx950 head-256 page-64 per-tensor decode path"
         )
@@ -563,8 +585,9 @@ def compile_pa_decode_tile(
             return _load
 
         def _make_nt_k_loader(tensor_ptr):
-            # Flat global_load_dwordx4 with !nontemporal. Buffer-nt loads and
-            # nontemporal V both measured slower; V stays on the cached copy.
+            # K on this pipe is a flat global_load_dwordx4 with !nontemporal.
+            # Packed V stays on the cached copy; NHD V uses a nontemporal LDS
+            # DMA (see _nhd_v_dma).
             base = buf_base_i64(tensor_ptr)
             ptr_ty = fx.PointerType.get(
                 fx.Int32.ir_type,
@@ -720,7 +743,7 @@ def compile_pa_decode_tile(
             if const_expr(nhd_layout):
                 raw = llvm_d.load(
                     T.vec(n, elem_ty.ir_type),
-                    as_mlir_value(fx.to_llvm_ptr(_lds_ptr(byte_off, elem_ty))),
+                    fx.as_ir_value(fx.to_llvm_ptr(_lds_ptr(byte_off, elem_ty))),
                     alignment=dsl_size_of(elem_ty),
                     **other_lds_scopes,
                 )
@@ -732,8 +755,8 @@ def compile_pa_decode_tile(
         def _lds_store(byte_off, elem_ty, vec):
             if const_expr(nhd_layout):
                 llvm_d.store(
-                    as_mlir_value(vec),
-                    as_mlir_value(fx.to_llvm_ptr(_lds_ptr(byte_off, elem_ty))),
+                    fx.as_ir_value(vec),
+                    fx.as_ir_value(fx.to_llvm_ptr(_lds_ptr(byte_off, elem_ty))),
                     alignment=dsl_size_of(elem_ty),
                     **other_lds_scopes,
                 )
@@ -1235,9 +1258,9 @@ def compile_pa_decode_tile(
             # LDS, staged a tile earlier; reading it from the block table here
             # would make the descriptor wait on a global load and drain the K
             # prefetch with it.
-            warp_u = fx.Int32(rocdl.readfirstlane(T.i32, as_mlir_value(warp)))
+            warp_u = fx.Int32(rocdl.readfirstlane(T.i32, fx.as_ir_value(warp)))
             page = fx.Int32(
-                rocdl.readfirstlane(T.i32, as_mlir_value(_k_page_read_warp()[0]))
+                rocdl.readfirstlane(T.i32, fx.as_ir_value(_k_page_read_warp()[0]))
             )
             # Bound the page by the live context so hardware zero-fills the
             # tail. Unwritten tails and block-0 padding can hold FP8 NaN, and
@@ -1249,7 +1272,7 @@ def compile_pa_decode_tile(
             live = (live > fx.Int32(0)).select(live, fx.Int32(0))
             live = (live < fx.Int32(block_size)).select(live, fx.Int32(block_size))
             n_records = fx.Int32(
-                rocdl.readfirstlane(T.i32, as_mlir_value(live * stride_v_token))
+                rocdl.readfirstlane(T.i32, fx.as_ir_value(live * stride_v_token))
             )
             v_head_off = (
                 fx.Int64(kv_h) * fx.Int64(stride_v_head)
@@ -1268,11 +1291,11 @@ def compile_pa_decode_tile(
                 band = lane & 15
                 rocdl.raw_ptr_buffer_load_lds(
                     v_page,
-                    as_mlir_value(
+                    fx.as_ir_value(
                         fx.to_llvm_ptr(_lds_ptr(region + i * (WAVE * 16), fx.Int32))
                     ),
                     size=16,
-                    voffset=as_mlir_value(
+                    voffset=fx.as_ir_value(
                         tok * stride_v_token + _nhd_band_slot(warp_u, tok, band)
                     ),
                     soffset=0,
@@ -1320,7 +1343,7 @@ def compile_pa_decode_tile(
                     # Constant row stride per pack: a DS offset immediate.
                     raw = rocdl.ds_read_tr8_b64(
                         T.vec(2, T.i32),
-                        as_mlir_value(
+                        fx.as_ir_value(
                             fx.to_llvm_ptr(
                                 _lds_ptr(base + pack * (8 * head_dim), fx.Int32)
                             )

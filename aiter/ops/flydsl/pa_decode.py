@@ -8,6 +8,8 @@ OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
 MFMA specialization details.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
@@ -17,7 +19,7 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .kernels.pa_decode_kernel import (
     KV_COMPUTE_BLOCK,
     compile_pa_decode_tile,
-    d256_m1_shape,
+    d256_m1_pipe,
 )
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -40,6 +42,42 @@ def _view_span(view: torch.Tensor) -> int:
     )
 
 
+# 4096 int32 page ids are 16 KiB of LDS. A page-64 table of 16384 columns is
+# 1,048,576 tokens and needs exactly this many ids at 4 partitions, fewer
+# with more partitions.
+_PAGE_ID_LIMIT = 4096
+
+
+@functools.lru_cache(maxsize=32)
+def _warn_unstaged_page_ids(
+    max_blocks: int, block_size: int, num_partitions: int, pages: int
+) -> None:
+    from aiter import logger
+
+    logger.warning(
+        "pa_decode is reading page ids inside the tile loop: block table "
+        "width %d, page %d, %d partitions needs %d page ids, above the "
+        "%d-id LDS limit. Increase num_partitions or pass a narrower table "
+        "to stage them first.",
+        max_blocks,
+        block_size,
+        num_partitions,
+        pages,
+        _PAGE_ID_LIMIT,
+    )
+
+
+def _stage_page_capacity(max_blocks: int, block_size: int, num_partitions: int) -> int:
+    """Page ids staged per CTA. Zero leaves the block-table load in the tile loop."""
+    max_tiles = (max_blocks * block_size + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+    tiles_per_part = (max_tiles + num_partitions - 1) // num_partitions
+    pages = tiles_per_part * (KV_COMPUTE_BLOCK // block_size)
+    if pages <= _PAGE_ID_LIMIT:
+        return pages
+    _warn_unstaged_page_ids(max_blocks, block_size, num_partitions, pages)
+    return 0
+
+
 def get_recommended_splits(
     num_sequences: int,
     num_kv_heads: int,
@@ -53,8 +91,10 @@ def get_recommended_splits(
 
     Without ``max_context_length``, the default cap is eight. A host length
     hint targets ``ctas_per_cu`` CTAs per CU, bounded by 256-token tiles and
-    the reducer limit. The default is two. Pass one for gfx950 shapes that
-    satisfy ``d256_m1_shape`` (nontemporal K, staged page ids, prefetched V).
+    the reducer limit. The default is two. Pass one only when
+    ``d256_m1_pipe`` is true: a static gfx950 call with head 256, page 64,
+    plain V, per-tensor scales, query length 1, and one query M-tile.
+    A work plan and every other shape keep two.
     Short contexts and large grids retain the legacy recommendation.
     ``max_partitions`` caps either mode. Allocate scratch and call
     ``pa_decode`` with the returned count for every sequence; no GPU lengths
@@ -62,6 +102,12 @@ def get_recommended_splits(
     """
     if max_context_length is not None and max_context_length < 0:
         raise ValueError("max_context_length must be non-negative")
+    if (
+        not isinstance(ctas_per_cu, int)
+        or isinstance(ctas_per_cu, bool)
+        or ctas_per_cu <= 0
+    ):
+        raise ValueError(f"ctas_per_cu must be a positive int, got {ctas_per_cu!r}")
     if max_partitions is None:
         max_partitions = 8 if max_context_length is None else MAX_CONTEXT_PARTITIONS
     if not 4 <= max_partitions <= MAX_CONTEXT_PARTITIONS:
@@ -627,25 +673,20 @@ def pa_decode(
 
     stride_k_block = stride_k_token = stride_k_head = 0
     stride_v_block = stride_v_token = stride_v_head = 0
-    if nhd_layout:
-        if arch != "gfx950" or work_plan is not None or per_token_kv:
-            raise NotImplementedError(
-                "NHD pa_decode requires gfx950, per-tensor scales, and no work plan"
-            )
-        if (
-            not d256_m1_shape(
-                head_dim,
-                block_size,
-                trans_v,
-                per_token_kv,
-                query_length,
-                query_group_size,
-            )
-            or block_size != 64
-        ):
-            raise NotImplementedError(
-                "NHD pa_decode requires head 256, page 64, and one query M-tile"
-            )
+    if nhd_layout and not d256_m1_pipe(
+        arch,
+        work_plan is not None,
+        head_dim,
+        block_size,
+        trans_v,
+        per_token_kv,
+        query_length,
+        query_group_size,
+    ):
+        raise NotImplementedError(
+            "NHD pa_decode requires gfx950, head 256, page 64, query_length 1, "
+            "one query M-tile, per-tensor scales, and no work plan"
+        )
         stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
         stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)
         # Strides are i32 kernel arguments, and the in-page offset and V tail
@@ -671,26 +712,21 @@ def pa_decode(
 
     # Bound page-id LDS by the block table, not the live lengths, so capture
     # and replay keep the same specialization. Past 16 KiB, leave the table
-    # load in the tile loop.
+    # load in the tile loop and warn once for that width.
     stage_page_capacity = 0
-    if (
-        work_plan is None
-        and arch == "gfx950"
-        and d256_m1_shape(
-            head_dim,
-            block_size,
-            trans_v,
-            per_token_kv,
-            query_length,
-            query_group_size,
-        )
+    if d256_m1_pipe(
+        arch,
+        work_plan is not None,
+        head_dim,
+        block_size,
+        trans_v,
+        per_token_kv,
+        query_length,
+        query_group_size,
     ):
-        max_blocks = block_tables.shape[1]
-        max_tiles = (max_blocks * block_size + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
-        tiles_per_part = (max_tiles + num_partitions - 1) // num_partitions
-        pages = tiles_per_part * (KV_COMPUTE_BLOCK // block_size)
-        if 0 < pages <= 4096:
-            stage_page_capacity = pages
+        stage_page_capacity = _stage_page_capacity(
+            block_tables.shape[1], int(block_size), num_partitions
+        )
 
     # Add sinks once: here for static NP=1, otherwise in reduction.
     use_direct_sinks = sinks is not None and num_partitions == 1 and work_plan is None

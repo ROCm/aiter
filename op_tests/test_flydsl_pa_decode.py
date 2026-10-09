@@ -11,6 +11,8 @@
 Contexts include MTP tokens. Positive windows require a plan; 0/-1 allow both
 static and planned decoding. Plan caps default to device CU count; explicit
 partitions override static recommendations. CLI timing includes the reducer.
+``--layout nhd`` times only gfx950, head 256, page 64, plain V, per-tensor
+scales, and query length 1. Other shapes stay on the packed sweep.
 """
 
 import argparse
@@ -31,14 +33,17 @@ from aiter.test_common import benchmark, run_perftest
 try:
     from aiter.ops.flydsl.pa_decode import (
         MAX_CONTEXT_PARTITIONS,
-        d256_m1_shape,
+        _stage_page_capacity,
+        d256_m1_pipe,
         get_recommended_splits,
         pa_decode,
         plan_pa_decode,
     )
 except (ImportError, AttributeError, RuntimeError, OSError):
     MAX_CONTEXT_PARTITIONS = 256
-    get_recommended_splits = d256_m1_shape = pa_decode = plan_pa_decode = None
+    get_recommended_splits = d256_m1_pipe = None
+    pa_decode = plan_pa_decode = None
+    _stage_page_capacity = None
 
 SUPPORTED_GFX = ("gfx942", "gfx950")
 KV_COMPUTE_BLOCK = 256
@@ -99,9 +104,9 @@ class DecodeCase:
     nhd: bool = False
     # NHD storage with KV heads outermost: the head stride spans the pool.
     nhd_head_major: bool = False
-    # Zero K and V one-hot in head channel tile % head_dim: each partition
-    # owns distinct output channels, so dropping or misweighting any one
-    # partial exceeds the tolerance.
+    # Zero K and V one-hot in head channel tile % head_dim. Channels repeat
+    # every head_dim tiles. A dropped or misweighted partial still exceeds
+    # the tolerance.
     one_hot_v: bool = False
 
 
@@ -320,8 +325,9 @@ def _make_inputs(case, planned=False):
     if parts is None and not planned:
         ctas_per_cu = (
             1
-            if get_gfx_runtime() == "gfx950"
-            and d256_m1_shape(
+            if d256_m1_pipe(
+                get_gfx_runtime(),
+                planned,
                 case.head_dim,
                 page,
                 case.trans_v,
@@ -1011,8 +1017,32 @@ CASES = [
 ]
 
 
+def test_d256_m1_pipe_is_static_gfx950_page64():
+    """ctas_per_cu=1 follows this predicate, including the no-work-plan condition."""
+    if d256_m1_pipe is None:
+        pytest.skip("FlyDSL pa_decode is not available")
+    assert d256_m1_pipe("gfx950", False, 256, 64, False, False, 1, 8)
+    assert not d256_m1_pipe("gfx950", True, 256, 64, False, False, 1, 8)
+    assert not d256_m1_pipe("gfx942", False, 256, 64, False, False, 1, 8)
+    assert not d256_m1_pipe("gfx950", False, 256, 128, False, False, 1, 8)
+
+
+def test_stage_page_capacity_stays_on_for_a_1m_table():
+    """A page-64 table of 1,048,576 tokens stages at 4 partitions and not below that."""
+    if _stage_page_capacity is None:
+        pytest.skip("FlyDSL pa_decode is not available")
+    # 16384 columns * page 64. Four partitions is exactly 4096 ids.
+    assert _stage_page_capacity(16384, 64, 4) == 4096
+    assert _stage_page_capacity(16384, 64, 8) == 2048
+    assert _stage_page_capacity(16384, 64, 3) == 0
+    assert _stage_page_capacity(16385, 64, 4) == 0
+
+
 def test_recommended_splits_ctas_per_cu():
     """Length-aware splits follow ctas_per_cu; the default stays at two."""
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="ctas_per_cu"):
+            get_recommended_splits(1, 1, 4, max_context_length=8192, ctas_per_cu=bad)
     _require_gpu()
     assert get_recommended_splits(
         1, 1, 4, max_context_length=8192, ctas_per_cu=1
@@ -1171,6 +1201,7 @@ def run_pa_decode_tile_case(
     per_token=False,
     query_length=1,
     num_partitions=None,
+    layout="packed",
 ):
     if min(batch_size, context_length, query_length, num_query_heads, num_kv_heads) < 1:
         raise ValueError(
@@ -1182,6 +1213,25 @@ def run_pa_decode_tile_case(
         raise ValueError("pa_decode only supports fp16/bf16")
     if num_partitions is not None and not 1 <= num_partitions <= MAX_CONTEXT_PARTITIONS:
         raise ValueError(f"num_partitions must be in [1, {MAX_CONTEXT_PARTITIONS}]")
+    if layout not in ("packed", "nhd"):
+        raise ValueError(f"layout must be packed or nhd, got {layout}")
+    if layout == "nhd" and (
+        d256_m1_pipe is None
+        or not d256_m1_pipe(
+            get_gfx_runtime(),
+            False,
+            head_dim,
+            block_size,
+            trans_v,
+            per_token,
+            query_length,
+            num_query_heads // num_kv_heads,
+        )
+    ):
+        raise ValueError(
+            "NHD timing requires gfx950, head 256, page 64, plain V, "
+            "per-tensor scales, query length 1, and one query M-tile"
+        )
     case = DecodeCase(
         lengths=(context_length,) * batch_size,
         query_length=query_length,
@@ -1195,6 +1245,7 @@ def run_pa_decode_tile_case(
         max_partitions=max_partitions,
         per_token=per_token,
         sparse=False,
+        nhd=layout == "nhd",
     )
     args, options, reference_call = _make_inputs(case)
     reference = reference_call()
@@ -1302,6 +1353,17 @@ def _parse_args(argv=None):
         default=[None],
         help="Exact split counts (1..256), overriding --max-partitions.",
     )
+    parser.add_argument(
+        "-l",
+        "--layout",
+        nargs="*",
+        choices=("packed", "nhd"),
+        default=["packed", "nhd"],
+        help=(
+            "KV cache layout. nhd times only head 256, page 64, plain V, "
+            "per-tensor scales, and query length 1 on gfx950."
+        ),
+    )
     args = parser.parse_args(argv)
     if (
         args.max_partitions is not None
@@ -1329,33 +1391,98 @@ def main():
         return
     torch.set_default_device("cuda")
     rows = []
-    for dtype, batch, shape, page, trans_v, per_token, ql, parts in itertools.product(
-        args.dtype,
-        args.batch,
-        args.shapes,
-        args.block_size,
-        args.trans_v,
-        args.per_token,
-        args.query_length,
-        args.num_partitions,
-    ):
-        heads, kv_heads, dim, context = shape
-        rows.append(
-            run_pa_decode_tile_case(
-                batch,
-                heads,
-                kv_heads,
-                dim,
-                context,
-                page,
-                dtype,
-                bool(trans_v),
-                args.max_partitions,
-                bool(per_token),
-                query_length=ql,
-                num_partitions=parts,
+    if "packed" in args.layout:
+        for (
+            dtype,
+            batch,
+            shape,
+            page,
+            trans_v,
+            per_token,
+            ql,
+            parts,
+        ) in itertools.product(
+            args.dtype,
+            args.batch,
+            args.shapes,
+            args.block_size,
+            args.trans_v,
+            args.per_token,
+            args.query_length,
+            args.num_partitions,
+        ):
+            heads, kv_heads, dim, context = shape
+            rows.append(
+                run_pa_decode_tile_case(
+                    batch,
+                    heads,
+                    kv_heads,
+                    dim,
+                    context,
+                    page,
+                    dtype,
+                    bool(trans_v),
+                    args.max_partitions,
+                    bool(per_token),
+                    query_length=ql,
+                    num_partitions=parts,
+                    layout="packed",
+                )
             )
-        )
+    if "nhd" in args.layout:
+        # NHD is the page-64 head-256 contract. Do not cross it with the
+        # packed sweep's other heads, pages, or V layouts.
+        if get_gfx_runtime() != "gfx950":
+            aiter.logger.warning(
+                "NHD pa_decode timing is gfx950-only; skipping on %s",
+                get_gfx_runtime(),
+            )
+        else:
+            nhd_rows = 0
+            for dtype, batch, shape, ql, parts in itertools.product(
+                args.dtype,
+                args.batch,
+                args.shapes,
+                args.query_length,
+                args.num_partitions,
+            ):
+                heads, kv_heads, dim, context = shape
+                if kv_heads < 1 or heads % kv_heads:
+                    continue
+                if not d256_m1_pipe(
+                    get_gfx_runtime(),
+                    False,
+                    dim,
+                    64,
+                    False,
+                    False,
+                    ql,
+                    heads // kv_heads,
+                ):
+                    continue
+                nhd_rows += 1
+                rows.append(
+                    run_pa_decode_tile_case(
+                        batch,
+                        heads,
+                        kv_heads,
+                        dim,
+                        context,
+                        64,
+                        dtype,
+                        False,
+                        args.max_partitions,
+                        False,
+                        query_length=ql,
+                        num_partitions=parts,
+                        layout="nhd",
+                    )
+                )
+            if nhd_rows == 0:
+                aiter.logger.warning(
+                    "no NHD rows: use head 256, query length 1, and at most "
+                    "16 query heads per KV head"
+                )
     aiter.logger.info(
         "pa_decode summary (markdown):\n%s", pd.DataFrame(rows).to_markdown(index=False)
     )
