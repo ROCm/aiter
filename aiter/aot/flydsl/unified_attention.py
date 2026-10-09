@@ -34,10 +34,9 @@ from aiter.aot.flydsl.common import (
 
 AOT_ARCH = "gfx942"
 # Layer shapes per model: (num_heads, num_kv_heads, head_dim, window keys or
-# None), heads per rank.
+# None).
 DEFAULT_SHAPES = {
     "gemma4_31b_tp1": [(32, 4, 512, None), (32, 16, 256, 1024)],
-    "gemma4_31b_tp4": [(8, 1, 512, None), (8, 4, 256, 1024)],
 }
 LAYOUTS = ("plain", "vllm")
 # The adapter builds decode-only batches (max_seqlen_q == 1) separately.

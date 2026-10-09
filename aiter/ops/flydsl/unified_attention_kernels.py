@@ -7,9 +7,9 @@ Adapts ``kernels/unified_attention_fp8_gfx942.py`` to ``unified_attention``'s ca
 convention. Dispatch returns ``None`` for configs it can't serve or cedes, and
 the caller falls through to Triton unchanged.
 
-Served: causal paged attention, head dim 256 or 512, GQA group dividing 16,
-full or left-only sliding window, plain (unshuffled) FP8 E4M3FNUZ K/V with
-page 32/64/128, per-tensor fp32 descales, bf16 output: both Gemma-4 layers.
+Served: Gemma-4's full and sliding layer shapes at TP1, causal paged
+attention, plain (unshuffled) FP8 E4M3FNUZ K/V with page 32/64,
+per-tensor fp32 descales and bf16 output.
 
 One launch serves a varlen batch: multi-token sequences run as prefill tiles,
 one-token sequences as KV splits merged by a combine launch. All-decode
@@ -38,9 +38,13 @@ __all__ = ["flydsl_unified_attention"]
 
 _FP8_DTYPE = torch.float8_e4m3fnuz
 _HEAD_DIMS = (256, 512)
-# vLLM pages Gemma-4's head-512 layers at twice the head-256 block size (equal
-# page bytes), so block size 64 gives them page 128.
-_PAGE_SIZES = (32, 64, 128)
+_PAGE_SIZES = (32, 64)
+# (query heads, KV heads, head dim, inclusive window keys). Keep automatic
+# dispatch on the shapes covered by correctness, performance and AOT evidence.
+_GEMMA4_SHAPES = {
+    (32, 4, 512, None),
+    (32, 16, 256, 1024),
+}
 
 
 @lru_cache(maxsize=1)
@@ -118,8 +122,8 @@ def _devices_ok(q, *tensors) -> bool:
 
 
 def _as_1d_descale(d):
-    """FlyDSL's from_dlpack rejects a 0-dim tensor; reshape is a view."""
-    return d.reshape(1) if d.ndim == 0 else d
+    """FlyDSL's from_dlpack needs the singleton descale to be rank one."""
+    return d.reshape(1)
 
 
 def _geometry_ok(
@@ -136,7 +140,14 @@ def _geometry_ok(
 ) -> bool:
     """Head dim the kernel is built for; the GQA group divides the 16 MFMA
     rows a wave owns; cu_seqlens covers every sequence."""
-    if q.dim() != 3 or k.dim() != 4 or v.shape != k.shape or out.shape != q.shape:
+    if (
+        q.dim() != 3
+        or k.dim() != 4
+        or v.shape != k.shape
+        or out.shape != q.shape
+        or cu_seqlens_q.dim() != 1
+        or block_table.dim() != 2
+    ):
         return False
     _, num_query_heads, head_size = q.shape
     return (
@@ -151,17 +162,31 @@ def _geometry_ok(
     )
 
 
-def _strides_ok(q, k, v, out, block_table) -> bool:
+def _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table) -> bool:
     """Contiguous Q and O. K and V may be strided views of one cache (vLLM)
-    with a unit head-dim stride; their other strides are compiled in."""
+    with a unit head-dim stride; their other strides are compiled in. The
+    kernel's vector loads promise 16-byte alignment to LLVM."""
     return (
         q.is_contiguous()
         and out.is_contiguous()
+        and cu_seqlens_q.is_contiguous()
+        and seqused_k.dim() == 1
+        and seqused_k.is_contiguous()
         and k.stride(3) == 1
         and v.stride(3) == 1
-        and block_table.dim() == 2
+        and all(stride % 16 == 0 for stride in k.stride()[:3])
+        and all(stride % 16 == 0 for stride in v.stride()[:3])
         and block_table.stride(1) == 1
+        and all(t.data_ptr() % 16 == 0 for t in (q, k, v))
+        and out.data_ptr() % 8 == 0
+        and all(t.data_ptr() % 4 == 0 for t in (cu_seqlens_q, seqused_k, block_table))
     )
+
+
+def _gemma4_shape_ok(q, num_kv_heads, window_size) -> bool:
+    """Only route the Gemma-4 TP1 shapes covered by this ticket."""
+    window = _window_keys(window_size)
+    return (q.shape[1], num_kv_heads, q.shape[2], window) in _GEMMA4_SHAPES
 
 
 def _no_unsupported_features(
@@ -228,6 +253,7 @@ def _supported(
         and _page_geometry_ok(block_size)
         and _dtypes_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
         and _descales_ok(q_descale, k_descale, v_descale)
+        and _gemma4_shape_ok(q, num_kv_heads, window_size)
         and _geometry_ok(
             q,
             k,
@@ -243,7 +269,7 @@ def _supported(
         and _no_unsupported_features(
             softcap, alibi_slopes, qq_bias, q_scales, output_scale, sinks
         )
-        and _strides_ok(q, k, v, out, block_table)
+        and _strides_ok(q, k, v, out, cu_seqlens_q, seqused_k, block_table)
     )
 
 
@@ -268,7 +294,7 @@ def _cede_to_triton(
     if num_seqs == 1:
         # A lone chunk over at least four cached tiles splits its KV range and
         # wins. A short fresh prefill is latency bound: Triton's lighter
-        # prologue wins through 256 tokens at head 512, 384 at head 256.
+        # prologue wins through 256 tokens at head 512 and 384 at head 256.
         prefix = max_seqlen_k - max_seqlen_q
         if window is not None:
             prefix = min(prefix, window - 1)
@@ -318,7 +344,10 @@ def _launch(
     or None; num_kv_splits and num_prefill_splits force the decode and the
     lone-sequence KV split counts."""
     num_tokens, num_query_heads, head_size = q.shape
-    decode_only = max_seqlen_q == 1
+    # max_seqlen_q is an upper bound under graph capture. For a lone sequence
+    # the packed token count reveals an actual one-token decode without a
+    # device read; otherwise treating it as a prefill leaves its row unwritten.
+    decode_only = max_seqlen_q == 1 or (num_seqs == 1 and num_tokens == 1)
     # A lone multi-token sequence has no decode slots or decode combine, and
     # may split its KV range instead.
     lone_prefill = not decode_only and num_seqs == 1
@@ -479,6 +508,10 @@ def flydsl_unified_attention(
     ):
         return None
     window = _window_keys(window_size)
+    # A graph-capture bound may exceed the lone sequence's actual query length.
+    # Normalize the only host-observable case so routing and launch agree.
+    if num_seqs == 1 and q.shape[0] == 1:
+        max_seqlen_q = 1
     if _cede_to_triton(
         q.shape[-1],
         max_seqlen_q,

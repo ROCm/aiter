@@ -14,9 +14,8 @@ decode at context 32K with batch 1/16/64/128, a q256 prefix chunk at 16K and
 two mixed prompt-or-chunk + decode steps, on random and sink-like data;
 ``stress`` is a broad matrix; ``quick`` a short random-data check. --isl,
 --prefix-query, --prefix-ctx, --batch and --ctx replace a suite's lists.
-Physical pages default to 32 and 64; ``--block-size`` is an optional
-runtime-layout check outside the page geomean. K/V are views of one vLLM
-cache; softmax scale is 1.0.
+Physical pages default to 32 and 64. K/V are views of one vLLM cache; softmax
+scale is 1.0.
 
 Timing: inputs rotate over ~320 MiB of attended bytes (at most 64 sets). Each
 candidate is captured once into a HIP graph; replays alternate, each sample at
@@ -70,7 +69,7 @@ from aiter.ops.triton.attention.unified_attention import (
     unified_attention as triton_unified_attention,
 )
 from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
-from op_tests.test_unified_attention import SHAPES_BY_TP
+from op_tests.test_unified_attention import SHAPES
 
 FP8 = torch.float8_e4m3fnuz
 # N(0, 1) values are scaled into FNUZ range (max 240); the descale undoes it.
@@ -83,12 +82,8 @@ SAMPLES = 9
 # Gemma-4 31B: 10 full layers and 50 sliding layers per step.
 MODEL_LAYERS = {"full": 10, "sliding": 50}
 MODEL_ID = "RedHatAI/gemma-4-31B-it-FP8-block"
-TARGET_SHAPES_BY_TP = {
-    1: {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)},
-    4: {"full": (512, 8, 1, None), "sliding": (256, 8, 4, 1024)},
-}
-for _tp, _shapes in TARGET_SHAPES_BY_TP.items():
-    assert SHAPES_BY_TP[_tp] == _shapes, "op test no longer matches Gemma-4-31B"
+TARGET_SHAPES = {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)}
+assert SHAPES == TARGET_SHAPES, "op test no longer matches Gemma-4-31B"
 
 # Per suite: prefill ISLs; prefix-chunk queries and contexts; decode batches
 # and contexts; mixed steps as (queries, chunk context or None for a fresh
@@ -556,26 +551,12 @@ def parse_args():
         "--shape", choices=["full", "sliding"], nargs="+", default=["full", "sliding"]
     )
     parser.add_argument(
-        "--tp",
-        type=int,
-        choices=sorted(SHAPES_BY_TP),
-        default=1,
-        help="tensor-parallel degree: each rank's heads",
-    )
-    pages = parser.add_mutually_exclusive_group()
-    pages.add_argument(
         "--page",
         type=int,
-        choices=[32, 64, 128],
+        choices=[32, 64],
         nargs="+",
         default=[32, 64],
-        help="physical pages to run instead of vLLM cache blocks",
-    )
-    pages.add_argument(
-        "--block-size",
-        type=int,
-        choices=[32, 64],
-        help="optional vLLM layout check: full page=2*block, sliding page=block",
+        help="physical pages to run",
     )
     parser.add_argument(
         "--layout",
@@ -657,22 +638,18 @@ def main():
             setattr(args, key, suite[key])
     if args.data is None:
         args.data = suite["data"]
-    if args.block_size is not None:
-        # Optional runtime-layout check; ticket acceptance uses --page 32 64.
-        runs = [(f"vLLM block {args.block_size}", None, args.block_size)]
-    else:
-        runs = [(str(page), page, None) for page in args.page]
+    runs = [(str(page), page) for page in args.page]
     baselines = triton_baselines(args.triton_config)
     names = [bname for bname, _path in baselines]
     name = names[0]
-    layers = SHAPES_BY_TP[args.tp]
+    layers = SHAPES
     cells = grid(args)
     if not cells:
         raise ValueError("selected suite and --cases produce no benchmark cells")
 
     device = torch.cuda.current_device()
     props = torch.cuda.get_device_properties(device)
-    print(f"- Target: {MODEL_ID}; TP{args.tp}; softmax scale 1.0; BF16 output")
+    print(f"- Target: {MODEL_ID}; TP1; softmax scale 1.0; BF16 output")
     print(
         f"- Device: {torch.cuda.get_device_name(device)}; {props.gcnArchName}; "
         f"{props.multi_processor_count} CUs; host {platform.node()}"
@@ -689,7 +666,7 @@ def main():
         origin = " (this tree)" if path is None else ""
         print(f"  - {bname} = {shown}{origin}; sha256 {sha256(shown)}")
     print(
-        f"- Pages: {', '.join(label for label, _, _ in runs)}; "
+        f"- Pages: {', '.join(label for label, _ in runs)}; "
         + f"{args.layout} K/V, {'custom' if custom else args.suite} suite, "
         f"data={','.join(args.data)}. "
         "FlyDSL is forced past the dispatch cede rule; no fallback is used. "
@@ -703,13 +680,11 @@ def main():
             "'sink' is a sharp-softmax data pattern, not the attention-sinks API.\n"
         )
     groups = []
-    for label, page, block in runs:
-        heading = label if block is not None else f"Page {label}"
-        print(f"## {heading}\n", flush=True)
+    for label, page in runs:
+        print(f"## Page {label}\n", flush=True)
         print(md_header(names), flush=True)
         rows = []
         for data, shape in itertools.product(args.data, args.shape):
-            cell_page = page or block * (2 if shape == "full" else 1)
             for kind, case, specs in cells:
                 row = bench_cell(
                     kind,
@@ -717,7 +692,7 @@ def main():
                     specs,
                     shape,
                     layers[shape],
-                    cell_page,
+                    page,
                     data,
                     args,
                     baselines,
@@ -732,11 +707,7 @@ def main():
     rows = [row for _, page_rows in groups for row in page_rows]
     path = args.o
     if path is None:
-        geometry = (
-            f"b{args.block_size}"
-            if args.block_size is not None
-            else "-".join(f"p{page}" for page in args.page)
-        )
+        geometry = "-".join(f"p{page}" for page in args.page)
         shapes = "" if len(args.shape) == 2 else "-" + "-".join(args.shape)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = Path("aiter_logs") / (

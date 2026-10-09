@@ -5,7 +5,7 @@
 
 Shapes: Gemma-4's head 512 (GQA 8:1, full) and head 256 (GQA 2:1, sliding
 window). FP8 E4M3FNUZ Q/K/V with per-tensor FP32 descales, BF16 output.
-Pages of 32, 64 or 128 tokens; K/V may be strided views of one cache (vLLM).
+Pages of 32 or 64 tokens; K/V may be strided views of one cache (vLLM).
 
 Grid y has two regions:
 - Tile slots use Triton's q-block map (sequence s owns slots from
@@ -231,8 +231,8 @@ def build_unified_attention_fp8_gfx942_module(
     tile slots, for all-decode batches: a small batch then spreads over four
     times as many CUs.
     """
-    if dim not in (256, 512) or page_size not in (32, 64, 128):
-        raise ValueError("dim must be 256 or 512 and page size 32, 64 or 128")
+    if dim not in (256, 512) or page_size not in (32, 64):
+        raise ValueError("dim must be 256 or 512 and page size 32 or 64")
     group = num_q_heads // num_kv_heads
     if group * num_kv_heads != num_q_heads or 16 % group:
         raise ValueError("GQA ratio must divide 16")
@@ -353,7 +353,11 @@ def build_unified_attention_fp8_gfx942_module(
                 pklen = _sload(usedk, pseq)
                 log_scale, vscale = descales()
                 ptile = yy - (pq0 // tokens + pseq)
-                if (pqlen > 1) & (ptile * tokens < pqlen):
+                # One-token sequences normally use decode slots. A lone
+                # sequence with an overestimated host max can reach this
+                # unified build instead, including with padded Q storage.
+                single_lone = (num_seqs == 1) & (pqlen == 1)
+                if ((pqlen > 1) | single_lone) & (ptile * tokens < pqlen):
                     pqbase = pklen - pqlen
                     plast = (ptile * tokens + tokens < pqlen).select(
                         ptile * tokens + tokens, pqlen

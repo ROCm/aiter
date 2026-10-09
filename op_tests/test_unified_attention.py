@@ -32,11 +32,7 @@ from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 PAGE = 64
 # Gemma-4-31B layers: (head dim, query heads, KV heads, sliding window in keys).
-SHAPES_BY_TP = {
-    1: {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)},
-    4: {"full": (512, 8, 1, None), "sliding": (256, 8, 4, 1024)},
-}
-SHAPES = SHAPES_BY_TP[1]
+SHAPES = {"full": (512, 32, 4, None), "sliding": (256, 32, 16, 1024)}
 # Max |err| against the oracle, as a fraction of max |ref|.
 TOLERANCE = 0.04
 # One-token sequences at the decode boundaries, plus a (0, 0) padding entry.
@@ -125,8 +121,8 @@ def ref_paged_attn(
     return out.to(out_dtype)
 
 
-def make_case(query_lens, kv_lens, shape, page=PAGE, seed=3, tp=1):
-    head_dim, num_heads, num_kv_heads, window = SHAPES_BY_TP[tp][shape]
+def make_case(query_lens, kv_lens, shape, page=PAGE, seed=3):
+    head_dim, num_heads, num_kv_heads, window = SHAPES[shape]
     g = torch.Generator(device="cuda").manual_seed(seed)
 
     def randn(*size):
@@ -349,24 +345,104 @@ def test_mixed_batch(shape, page, scale):
 
 
 @benchmark()
-def test_tp4_mixed_batch(shape):
-    """Gemma-4 TP4 local heads through the unified prefill/decode grid."""
-    query_lens = [768, 17, 1, 1]
-    kv_lens = [768, 1024, 513, 4097]
-    case = make_case(query_lens, kv_lens, shape, page=64, tp=4)
-    case["softmax_scale"] = 1.0
-    want = reference(case, query_lens, kv_lens)
-    case["k"], case["v"] = interleave_kv(case["k"], case["v"])
-    candidates = {"flydsl_tp4": partial(ua.unified_attention, **case, backend="flydsl")}
-    return measure(candidates, case, want, query_lens, kv_lens)
-
-
-@benchmark()
 def test_cross_attention_mask(shape, query_len, kv_len):
     case = make_case([query_len], [kv_len], shape)
     want = reference(case, [query_len], [kv_len])
     candidates = {"flydsl": flydsl_candidate(case, [kv_len])}
     return measure(candidates, case, want, [query_len], [kv_len])
+
+
+@benchmark()
+def test_overestimated_max_seqlen_q(shape):
+    """A graph-capture upper bound must not misclassify a lone decode as a
+    prefill and leave its output row unwritten."""
+    query_lens, kv_lens = [1], [4096]
+    case = make_case(query_lens, kv_lens, shape)
+    case["max_seqlen_q"] = 16
+    # Singleton rank is not part of the public per-tensor descale contract.
+    for name in ("q_descale", "k_descale", "v_descale"):
+        case[name] = case[name].reshape(1, 1)
+    want = reference(case, query_lens, kv_lens)
+    candidates = {
+        "flydsl_overestimated_q": partial(
+            ua.unified_attention, **case, backend="flydsl"
+        )
+    }
+    ret = measure(candidates, case, want, query_lens, kv_lens)
+
+    # Exercise _launch's unified-build fallback too. Public vLLM calls slice Q
+    # to real tokens, but padded storage must not resurrect the unwritten-row
+    # bug for another caller.
+    padding = torch.zeros(
+        (3,) + tuple(case["q"].shape[1:]),
+        device=case["q"].device,
+        dtype=case["q"].dtype,
+    )
+    case["q"] = torch.cat((case["q"], padding))
+    case["out"] = torch.full(
+        case["q"].shape, float("nan"), device="cuda", dtype=dtypes.bf16
+    )
+    got = direct_candidate(case, kv_lens)()
+    compare(want, got[:1], TOLERANCE * want.abs().max().item(), "padded direct launch")
+    assert torch.isnan(got[1:]).all(), "padded query rows were written"
+    ret["padded direct max err / max ref"] = (
+        (got[:1].float() - want.float()).abs().max() / want.abs().max()
+    ).item()
+    return ret
+
+
+@benchmark()
+def test_window_boundary():
+    """The key at pos-window is excluded; pos-window+1 is included."""
+    values = {}
+    for name, key, expected in (
+        ("excluded", 0, 0.0),
+        ("included", 1, 1.0),
+    ):
+        query_lens, kv_lens = [1], [1025]
+        case = make_case(query_lens, kv_lens, "sliding")
+        case["q"].fill_(4)
+        case["k"].zero_()
+        case["v"].zero_()
+        case["q_descale"].fill_(1)
+        case["k_descale"].fill_(1)
+        case["v_descale"].fill_(1)
+        case["softmax_scale"] = 1.0
+        page = case["k"].shape[1]
+        physical_page = int(case["block_table"][0, key // page])
+        case["k"][physical_page, key % page].fill_(4)
+        case["v"][physical_page, key % page].fill_(1)
+        want = reference(case, query_lens, kv_lens)
+        got = ua.unified_attention(**case, backend="flydsl")
+        compare(want, got, 0.01, f"window boundary {name}")
+        observed = got.float().mean().item()
+        assert abs(observed - expected) < 0.01, (name, observed)
+        values[name] = observed
+
+    # Prefill positions 1024..1027 have left edges 1..4. A dominant key at 1
+    # must affect only the first query, including through prefill KV splits.
+    query_lens, kv_lens = [4], [1028]
+    case = make_case(query_lens, kv_lens, "sliding")
+    case["q"].fill_(4)
+    case["k"].zero_()
+    case["v"].zero_()
+    case["q_descale"].fill_(1)
+    case["k_descale"].fill_(1)
+    case["v_descale"].fill_(1)
+    case["softmax_scale"] = 1.0
+    page = case["k"].shape[1]
+    physical_page = int(case["block_table"][0, 1 // page])
+    case["k"][physical_page, 1 % page].fill_(4)
+    case["v"][physical_page, 1 % page].fill_(1)
+    want = reference(case, query_lens, kv_lens)
+    got = ua.unified_attention(**case, backend="flydsl")
+    compare(want, got, 0.01, "window boundary prefill")
+    first = got[0].float().mean().item()
+    rest = got[1:].float().abs().max().item()
+    assert abs(first - 1.0) < 0.01 and rest < 0.01, (first, rest)
+    values["prefill first"] = first
+    values["prefill rest max"] = rest
+    return {"gfx": get_gfx_runtime(), **values}
 
 
 def nan_workspace(device, numel):
@@ -465,6 +541,12 @@ def test_routing_backend_gate(config):
     elif config == "page32 sliding decode":
         query_lens, kv_lens = [1] * 48, [32] * 48
         case = make_case(query_lens, kv_lens, "sliding", page=32)
+    elif config == "untuned shape":
+        query_lens, kv_lens = [768, 1], [768, 700]
+        case = make_case(query_lens, kv_lens, "sliding")
+        # The generic kernel can build this shape, but automatic dispatch is
+        # intentionally limited to Gemma-4's validated layer/window tuples.
+        case["window_size"] = (-1, -1)
     else:
         query_lens, kv_lens = [768, 1], [768, 700]
         case = make_case(query_lens, kv_lens, "sliding")
@@ -508,14 +590,14 @@ def test_cede_policy():
     from aiter.ops.flydsl.unified_attention_kernels import _cede_to_triton
 
     # Lone sequences: short fresh prefills cede (through 256 tokens at head
-    # 512, 384 at head 256); longer ones and chunks over 4+ cached tiles are
+    # 512 or 384 at head 256). Longer ones and chunks over 4+ cached tiles are
     # served.
     assert _cede_to_triton(512, 256, 1, 256, 64, None)
     assert _cede_to_triton(256, 32, 1, 32, 32, 1024)
     assert _cede_to_triton(256, 200, 1, 300, 64, 1024)
     assert _cede_to_triton(256, 384, 1, 384, 32, 1024)
     assert not _cede_to_triton(256, 512, 1, 512, 32, 1024)
-    assert not _cede_to_triton(512, 384, 1, 384, 128, None)
+    assert not _cede_to_triton(512, 384, 1, 384, 64, None)
     assert not _cede_to_triton(512, 16, 1, 4096, 64, None)
     assert not _cede_to_triton(256, 16, 1, 16384, 32, 1024)
     assert not _cede_to_triton(256, 4096, 1, 4096, 32, 1024)
@@ -543,7 +625,6 @@ def test_cede_policy():
     assert _cede_to_triton(512, 1, 384, 4096, 64, None)
     assert not _cede_to_triton(512, 1, 32, 32768, 32, None)
     assert not _cede_to_triton(512, 1, 512, 4096, 32, None)
-    assert not _cede_to_triton(512, 1, 64, 4096, 128, None)
     assert not _cede_to_triton(256, 1, 38, 1024, 32, 1024)
     assert _cede_to_triton(256, 1, 39, 1024, 32, 1024)
     assert _cede_to_triton(256, 1, 128, 32768, 32, 1024)
@@ -574,14 +655,14 @@ def test_warm_cache_run_only(shape, path):
 
 
 @benchmark()
-def test_aot_matrix(shape, tp, page, layout, path):
-    """Exercise every attention AOT key for TP1/TP4 under run-only mode."""
+def test_aot_matrix(shape, page, layout, path):
+    """Exercise every TP1 attention AOT key under run-only mode."""
     if path == "prefill":
         # A prefix chunk: the unified build, and its KV splits' combine.
         query_lens, kv_lens = [64], [1024]
     else:
         query_lens, kv_lens = [1] * 4, [1024] * 4
-    case = make_case(query_lens, kv_lens, shape, page=page, seed=23, tp=tp)
+    case = make_case(query_lens, kv_lens, shape, page=page, seed=23)
     want = reference(case, query_lens, kv_lens)
     if layout == "vllm":
         case["k"], case["v"] = interleave_kv(case["k"], case["v"])
@@ -609,7 +690,7 @@ def main():
         "--shape", choices=list(SHAPES), nargs="+", default=list(SHAPES)
     )
     parser.add_argument(
-        "--page", type=int, choices=[32, 64, 128], nargs="+", default=[32, 64, 128]
+        "--page", type=int, choices=[32, 64], nargs="+", default=[32, 64]
     )
     parser.add_argument(
         "--layout", choices=["plain", "vllm"], nargs="+", default=["plain", "vllm"]
@@ -619,7 +700,7 @@ def main():
     parser.add_argument(
         "--aot-matrix",
         action="store_true",
-        help="exercise every TP1/TP4 page/layout/mode AOT key",
+        help="exercise every TP1 page/layout/mode AOT key",
     )
     args = parser.parse_args()
     sweeps = [
@@ -634,12 +715,17 @@ def main():
             test_mixed_batch,
             itertools.product(args.shape, args.page, ["1/sqrt(d)", "1 (Gemma-4)"]),
         ),
-        ("TP4 mixed batch", test_tp4_mixed_batch, itertools.product(args.shape)),
         (
             "cross-attention mask",
             test_cross_attention_mask,
             itertools.product(args.shape, [320], [1024, 2000]),
         ),
+        (
+            "overestimated max query length",
+            test_overestimated_max_seqlen_q,
+            itertools.product(args.shape),
+        ),
+        ("window boundary", test_window_boundary, [()]),
         (
             "split-K combine",
             test_splitk_combine,
@@ -671,6 +757,7 @@ def main():
                     "ceded decode",
                     "short prefill",
                     "page32 sliding decode",
+                    "untuned shape",
                 ]
             ),
         ),
@@ -684,11 +771,10 @@ def main():
     if args.aot_matrix:
         sweeps.append(
             (
-                "TP1/TP4 AOT matrix",
+                "TP1 AOT matrix",
                 test_aot_matrix,
                 itertools.product(
                     args.shape,
-                    [1, 4],
                     args.page,
                     args.layout,
                     ["prefill", "decode"],
