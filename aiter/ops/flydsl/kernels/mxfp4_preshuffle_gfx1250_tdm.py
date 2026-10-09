@@ -731,7 +731,8 @@ def launch_gemm_a8w4_tdm(
                         )
 
         DS_A = 2 if a_is_fp4 else 4
-        DS_B = 2
+        # FP4 combines two N16 halves, each issuing two b128 weight reads.
+        DS_B = 4 if a_is_fp4 else 2
         sb_pairs = output_n_rep // 2
         sa_pairs = (wmma_m_rep + 1) // 2
         BS_DS = wmma_n_rep * DS_B + sb_pairs + sa_pairs
