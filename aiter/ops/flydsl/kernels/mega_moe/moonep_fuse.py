@@ -87,6 +87,54 @@ def moonep_lds_fields(*, npes: int, experts: int, slots: int) -> dict:
 
 
 @flyc.jit
+def _resolve_quota_round(
+    p_alloc,
+    p_rem,
+    p_quota,
+    home,
+    rem_base,
+    lane,
+    *,
+    npes,
+    experts_per_rank,
+    lanes_per_home,
+):
+    """One greedy round for one home wave: largest quota, largest remaining expert."""
+    R = npes
+    epn = experts_per_rank
+    q_in_range = lane < fx.Int32(R)
+    q_val = q_in_range.select(
+        _lds_load(p_quota, home * fx.Int32(R) + q_in_range.select(lane, fx.Int32(0))),
+        fx.Int32(_INT_MIN),
+    )
+    q_idx = q_in_range.select(lane, fx.Int32(1 << 30))
+    quota, dest = _wave_argmax(q_val, q_idx, lane)
+    best_v = fx.Int32(_INT_MIN)
+    best_i = fx.Int32(1 << 30)
+    for c in range_constexpr(lanes_per_home):
+        slot = fx.Int32(c * WAVE_SIZE) + lane
+        v = _lds_load(p_rem, rem_base + slot)
+        take = (v > best_v) | ((v == best_v) & (slot < best_i))
+        best_v = take.select(v, best_v)
+        best_i = take.select(slot, best_i)
+    remaining, local_e = _wave_argmax(best_v, best_i, lane)
+    active = quota > fx.Int32(0)
+    move = (remaining < quota).select(remaining, quota)
+    move = active.select(move, fx.Int32(0))
+    if lane == fx.Int32(0):
+        expert = home * fx.Int32(epn) + local_e
+        d_slot = expert * fx.Int32(R) + dest
+        h_slot = expert * fx.Int32(R) + home
+        _lds_store(p_alloc, _lds_load(p_alloc, d_slot) + move, d_slot)
+        _lds_store(p_alloc, _lds_load(p_alloc, h_slot) - move, h_slot)
+        _lds_store(
+            p_rem, _lds_load(p_rem, rem_base + local_e) - move, rem_base + local_e
+        )
+        q_slot = home * fx.Int32(R) + dest
+        _lds_store(p_quota, _lds_load(p_quota, q_slot) - move, q_slot)
+
+
+@flyc.jit
 def _emit_home_placement(
     addr_count,
     addr_alloc_cumsum,
@@ -225,7 +273,10 @@ def _emit_balanced_placement(
     lpl = (epn + WAVE_SIZE - 1) // WAVE_SIZE
     rem_stride = lpl * WAVE_SIZE
     epl = (E + WAVE_SIZE - 1) // WAVE_SIZE
-    assert R == num_waves, "one wave per destination rank"
+    # Prepare keeps 8 waves whatever the EP size, like the native offset
+    # derivation: wave d owns rank d in the per-rank phases, waves >= R only
+    # take part in the CTA-wide work and the barriers.
+    assert R <= num_waves, "one wave per destination rank"
     assert B <= WAVE_SIZE
 
     count = ptr_buf_tensor(addr_count, fx.Int32)
@@ -298,52 +349,36 @@ def _emit_balanced_placement(
             _lds_store(p_bal, active.select(fx.Int32(0), worst_v), worst_u)
     fx.barrier()
 
-    # Wave h resolves home h's quotas into per-expert moves.
-    home = wave
+    # Wave h resolves home h's quotas into per-expert moves.  Waves without
+    # a rank read rank 0's rows and store nothing.
+    rank_wave = wave < fx.Int32(R)
+    owned = rank_wave.select(wave, fx.Int32(0))
+    home = owned
     rem_base = home * fx.Int32(rem_stride)
     for c in range_constexpr(lpl):
         local_e = fx.Int32(c * WAVE_SIZE) + lane
         in_range = local_e < fx.Int32(epn)
         safe_e = in_range.select(local_e, fx.Int32(0))
         v = _lds_load(p_ecount, home * fx.Int32(epn) + safe_e)
-        _lds_store(
-            p_rem,
-            in_range.select(v, fx.Int32(_INT_MIN)),
-            rem_base + fx.Int32(c * WAVE_SIZE) + lane,
-        )
-    for _round in range(fx.Int32(0), fx.Int32(epn + R), 1):
-        q_in_range = lane < fx.Int32(R)
-        q_val = q_in_range.select(
-            _lds_load(
-                p_quota, home * fx.Int32(R) + q_in_range.select(lane, fx.Int32(0))
-            ),
-            fx.Int32(_INT_MIN),
-        )
-        q_idx = q_in_range.select(lane, fx.Int32(1 << 30))
-        quota, dest = _wave_argmax(q_val, q_idx, lane)
-        best_v = fx.Int32(_INT_MIN)
-        best_i = fx.Int32(1 << 30)
-        for c in range_constexpr(lpl):
-            slot = fx.Int32(c * WAVE_SIZE) + lane
-            v = _lds_load(p_rem, rem_base + slot)
-            take = (v > best_v) | ((v == best_v) & (slot < best_i))
-            best_v = take.select(v, best_v)
-            best_i = take.select(slot, best_i)
-        remaining, local_e = _wave_argmax(best_v, best_i, lane)
-        active = quota > fx.Int32(0)
-        move = (remaining < quota).select(remaining, quota)
-        move = active.select(move, fx.Int32(0))
-        if lane == fx.Int32(0):
-            expert = home * fx.Int32(epn) + local_e
-            d_slot = expert * fx.Int32(R) + dest
-            h_slot = expert * fx.Int32(R) + home
-            _lds_store(p_alloc, _lds_load(p_alloc, d_slot) + move, d_slot)
-            _lds_store(p_alloc, _lds_load(p_alloc, h_slot) - move, h_slot)
+        if rank_wave:
             _lds_store(
-                p_rem, _lds_load(p_rem, rem_base + local_e) - move, rem_base + local_e
+                p_rem,
+                in_range.select(v, fx.Int32(_INT_MIN)),
+                rem_base + fx.Int32(c * WAVE_SIZE) + lane,
             )
-            q_slot = home * fx.Int32(R) + dest
-            _lds_store(p_quota, _lds_load(p_quota, q_slot) - move, q_slot)
+    for _round in range(fx.Int32(0), fx.Int32(epn + R), 1):
+        if rank_wave:
+            _resolve_quota_round(
+                p_alloc,
+                p_rem,
+                p_quota,
+                home,
+                rem_base,
+                lane,
+                npes=R,
+                experts_per_rank=epn,
+                lanes_per_home=lpl,
+            )
         fx.barrier()
     fx.barrier()
 
@@ -368,7 +403,7 @@ def _emit_balanced_placement(
     fx.barrier()
 
     # Top-B by (alloc, expert) descending, wave d owns destination d.
-    dest_rank = wave
+    dest_rank = owned
     key_base = dest_rank * fx.Int32(E + 1)
     cand_vals = []
     cand_ids = []
@@ -386,7 +421,7 @@ def _emit_balanced_placement(
             ranks[c] = ranks[c] + outranks.select(fx.Int32(1), fx.Int32(0))
     for c in range_constexpr(epl):
         selected = (cand_vals[c] > fx.Int32(0)) & (ranks[c] < fx.Int32(B))
-        if selected:
+        if selected & rank_wave:
             _lds_store(p_etc, cand_ids[c], dest_rank * fx.Int32(B) + ranks[c])
             _lds_store(p_key, fx.Int32(_KEY_SELECTED), key_base + cand_ids[c])
     fx.barrier()
@@ -410,7 +445,7 @@ def _emit_balanced_placement(
     # Sticky settle, wave d settles destination d (every lane computes, lane
     # 0 stores): a wanted expert the row already holds keeps its slot; the
     # others fill the free slots in order.
-    row = wave * fx.Int32(B)
+    row = owned * fx.Int32(B)
     want = []
     held = []
     for s in range_constexpr(B):
@@ -449,7 +484,7 @@ def _emit_balanced_placement(
         placed.append(chosen)
     fx.barrier()
     for t in range_constexpr(B):
-        if lane == fx.Int32(0):
+        if (lane == fx.Int32(0)) & rank_wave:
             slot_prev[row + fx.Int32(t)] = held[t]
             slot_placed[row + fx.Int32(t)] = placed[t]
             slot_held[row + fx.Int32(t)] = (placed[t] >= fx.Int32(0)).select(

@@ -18,6 +18,7 @@ import torch
 from aiter.ops.flydsl.kernels.mega_moe.moonep_fuse import (
     emit_moonep_placement,
     emit_moonep_virtual_counts,
+    moonep_lds_fields,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
@@ -32,23 +33,31 @@ _LAUNCHERS = {}
 
 
 def _launcher(rank: int, balance: bool):
-    key = (rank, balance, B)
+    key = (rank, balance, B, R)
     if key in _LAUNCHERS:
         return _LAUNCHERS[key]
 
+    sizes = moonep_lds_fields(npes=R, experts=E, slots=B)
+    n_alloc, n_key, n_ecount, n_rem, n_quota, n_bal, n_etc, n_target = (
+        sizes[f"mp_{k}"] for k in (
+            "alloc", "key", "ecount", "rem", "quota", "bal", "etc", "target"
+        )
+    )
+
     @fx.struct
     class Lds:
-        alloc: fx.Array[fx.Int32, E * R, 16]
-        key: fx.Array[fx.Int32, R * (E + 1), 16]
-        ecount: fx.Array[fx.Int32, E, 16]
-        rem: fx.Array[fx.Int32, R * 64, 16]
-        quota: fx.Array[fx.Int32, R * R, 16]
-        bal: fx.Array[fx.Int32, R, 16]
-        etc: fx.Array[fx.Int32, R * B, 16]
-        target: fx.Array[fx.Int32, R * B, 16]
+        # Sized like the prepare kernel's SharedStorage.
+        alloc: fx.Array[fx.Int32, n_alloc, 16]
+        key: fx.Array[fx.Int32, n_key, 16]
+        ecount: fx.Array[fx.Int32, n_ecount, 16]
+        rem: fx.Array[fx.Int32, n_rem, 16]
+        quota: fx.Array[fx.Int32, n_quota, 16]
+        bal: fx.Array[fx.Int32, n_bal, 16]
+        etc: fx.Array[fx.Int32, n_etc, 16]
+        target: fx.Array[fx.Int32, n_target, 16]
 
     @flyc.kernel(
-        name=f"test_moonep_fuse_r{rank}_b{int(balance)}_s{B}",
+        name=f"test_moonep_fuse_w{R}_r{rank}_b{int(balance)}_s{B}",
         known_block_size=[WAVES * 64, 1, 1],
     )
     def kernel(
@@ -287,16 +296,20 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
     moved = int((ref_alloc.sum(1) - torch.tensor([int(tpe[:, d * EPN:(d + 1) * EPN].sum()) for d in range(R)])).abs().sum())
     bad = [k for k, ok in checks.items() if not ok]
     if os.environ.get("MOONEP_TEST_DUMP"):
-        print("placed", g_placed.view(R, B).cpu().tolist()[:2])
-        print("ref   ", ref_placed.tolist()[:2])
-    print(f"B={B} rank={rank} skew={skew} seed={seed} sticky={sticky_held} balance={balance} "
+        print("per-dest routes got", got_alloc.sum(1).tolist(), "ref", ref_alloc.sum(1).tolist())
+        print("etc got", g_placed.view(R, B).cpu().tolist())
+        print("etc ref", ref_etc.tolist())
+    print(f"R={R} B={B} rank={rank} skew={skew} seed={seed} sticky={sticky_held} balance={balance} "
           f"moved={moved} prefetch={int((ref_etc >= 0).sum())} -> {'OK' if not bad else 'FAIL ' + ','.join(bad)}")
     return not bad
 
 
-def _set_slots(slots: int) -> None:
-    global B, VS, VIRTUAL_STRIDE
-    B, VS = slots, EPN + slots
+def _set_geometry(world: int, slots: int) -> None:
+    global R, EPN, B, VS, COUNT_STRIDE, VIRTUAL_STRIDE
+    R, B = world, slots
+    EPN = E // R
+    VS = EPN + B
+    COUNT_STRIDE = E + R
     VIRTUAL_STRIDE = R * VS + R
 
 
@@ -305,6 +318,8 @@ def main() -> int:
     parser.add_argument("--quick", action="store_true")
     # 48 > 32 exercises a slot bitmap wider than 32 bits.
     parser.add_argument("--slots", default="8,48")
+    # Fewer ranks than the 8 prepare waves (EP4/EP2) leave waves idle per rank.
+    parser.add_argument("--world", default="8,4,2")
     args = parser.parse_args()
     cases = [(0, 1.2, 1, False, True), (3, 1.2, 2, True, True), (7, 0.0, 3, False, True),
              (5, 0.8, 4, True, True), (2, 1.2, 5, True, False),
@@ -313,12 +328,13 @@ def main() -> int:
     if args.quick:
         cases = cases[:1]
     results = []
-    for slots in (int(v) for v in args.slots.split(",")):
-        _set_slots(slots)
-        results += [
-            run_case(r, s, seed, sticky_held=st, balance=bal)
-            for r, s, seed, st, bal in cases
-        ]
+    for world in (int(v) for v in args.world.split(",")):
+        for slots in (int(v) for v in args.slots.split(",")):
+            _set_geometry(world, slots)
+            results += [
+                run_case(r % world, s, seed, sticky_held=st, balance=bal)
+                for r, s, seed, st, bal in cases
+            ]
     ok = all(results)
     print("ALL_OK" if ok else "SOME_FAILED")
     return 0 if ok else 1

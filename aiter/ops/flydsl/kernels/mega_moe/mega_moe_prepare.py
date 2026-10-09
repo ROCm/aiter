@@ -77,7 +77,7 @@ def compile_mega_moe_prepare(
     assert tile_state_stride > 0
 
     if moonep_slots:
-        assert npes == num_waves, "MoonEP placement runs one wave per rank"
+        assert npes <= num_waves, "MoonEP placement runs one wave per rank"
         lds_sizes = moonep_lds_fields(
             npes=npes, experts=route_experts, slots=moonep_slots
         )

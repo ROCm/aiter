@@ -74,6 +74,13 @@ class MegaMoEV2:
                     f"moonep_slots={moonep_slots} must be in [1, 64] and below "
                     f"experts per rank ({self.epr})"
                 )
+        # GEMM1/GEMM2 address each weight window with 32-bit buffer offsets.
+        for name, w in (("w1", w1), ("w2", w2)):
+            if w.numel() * w.element_size() > 1 << 32:
+                raise ValueError(
+                    f"{name} window of {self.epr} experts per rank exceeds 4 GiB; "
+                    "use more ranks or fewer moonep_slots"
+                )
         self.topk = int(topk)
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
