@@ -393,7 +393,11 @@ def run_input_generator(gen: Callable[[], tuple], fields: Sequence[str]) -> dict
 
 def generate_rotating_buffers_pool(gen: Callable, out_vals_keys: tuple, target_mb: int, min_pool_len: int):
     kwargs = run_input_generator(gen, out_vals_keys)
-    per_set_bytes = sum([kwargs[a].numel() * kwargs[a].element_size() for a in out_vals_keys if a != "_"])
+    per_set_bytes = sum(
+        v.numel() * v.element_size()
+        for v in kwargs.values()
+        if isinstance(v, torch.Tensor)
+    )
 
     pool_len = max(min_pool_len, math.ceil(target_mb *1024 * 1024 / per_set_bytes))
     pool = []
@@ -401,7 +405,6 @@ def generate_rotating_buffers_pool(gen: Callable, out_vals_keys: tuple, target_m
         pool.append(run_input_generator(gen, out_vals_keys))
 
     return pool
-
 
 def do_bench_aiter_triton(fn: Callable, 
                           rot_bufs: List[dict[str, torch.Tensor]], 
