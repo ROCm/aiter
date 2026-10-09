@@ -292,9 +292,15 @@ def _fused_flatten_mxfp8_quant_kernel(
 
 @triton.jit
 def _fused_deepseek_v4_mxfp8_quant_q_pack_kernel(
-    q_ptr, packed_ptr, rope_ptr, fp8_max,
-    NOPE: tl.constexpr, ROPE: tl.constexpr, QK: tl.constexpr,
-    GROUP: tl.constexpr, NUM_TILES: tl.constexpr,
+    q_ptr,
+    packed_ptr,
+    rope_ptr,
+    fp8_max,
+    NOPE: tl.constexpr,
+    ROPE: tl.constexpr,
+    QK: tl.constexpr,
+    GROUP: tl.constexpr,
+    NUM_TILES: tl.constexpr,
 ):
     """One program per (token, head) row of Q.
 
@@ -341,8 +347,9 @@ def _fused_deepseek_v4_mxfp8_quant_q_pack_kernel(
 
     # [462, 512): zero, so no stale byte reaches the MMA
     tail = tl.arange(0, QK)
-    tl.store(dst + tail, tl.zeros((QK,), dtype=tl.uint8),
-             mask=tail >= NOPE + 2 * NUM_TILES)
+    tl.store(
+        dst + tail, tl.zeros((QK,), dtype=tl.uint8), mask=tail >= NOPE + 2 * NUM_TILES
+    )
 
     r = tl.arange(0, ROPE)
     tl.store(rope_ptr + row * ROPE + r, tl.load(src + NOPE + r))
@@ -694,9 +701,7 @@ def _fused_deepseek_v4_quantize_and_insert_k_kernel(
             # During dequant: scale = 2^(stored_value - 127)
             encoded_scale = exponent + 127.0
             encoded_scale = tl.maximum(tl.minimum(encoded_scale, 255.0), 0.0)
-            tl.store(
-                token_scale_ptr + qblock_idx * sc_step, encoded_scale.to(tl.uint8)
-            )
+            tl.store(token_scale_ptr + qblock_idx * sc_step, encoded_scale.to(tl.uint8))
             if sc_step == 2:
                 tl.store(
                     token_scale_ptr + qblock_idx * sc_step + 1,
@@ -734,6 +739,7 @@ def _fused_deepseek_v4_quantize_and_insert_k_kernel(
 # module for the geometry constants.
 # ---------------------------------------------------------------------------
 
+
 @triton.jit
 def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
     out_ptr,
@@ -767,7 +773,7 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
     num_workers = tl.num_programs(1)
 
     seq_len = tl.load(seq_lens_ptr + batch_idx)
-    if gather_lens_ptr is not None:  # noqa: SIM108
+    if gather_lens_ptr is not None:
         gather_len = tl.load(gather_lens_ptr + batch_idx)
     else:
         # Gather all tokens
@@ -788,9 +794,7 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
 
         # int64: physical_block_idx * block_stride can exceed 2^31 with many
         # KV-cache blocks (e.g. >= 57K at block_stride ~37K).
-        cache_block_ptr = (
-            k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
-        )
+        cache_block_ptr = k_cache_ptr + physical_block_idx.to(tl.int64) * block_stride
 
         # see the writer: sc_in_rec > 0 means the scales are inside the
         # record rather than in a per-block region
@@ -810,9 +814,7 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
         token_bf16_ptr = token_data_ptr + rope_in_rec
 
         # Output pointer for this token (flattened)
-        output_row_ptr = (
-            out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
-        )
+        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
 
         # ========== Dequantize FP8 portion using UE8M0 ==========
         for qblock_idx in tl.static_range(n_quant_blocks):
@@ -836,9 +838,7 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
 
                 # Load and decode UE8M0 scale
                 # UE8M0: scale = 2^(stored_value - 127)
-                encoded_scale = tl.load(
-                    token_scale_ptr + qblock_idx * sc_step
-                )
+                encoded_scale = tl.load(token_scale_ptr + qblock_idx * sc_step)
                 exponent = encoded_scale.to(tl.float32) - 127.0
                 scale = tl.exp2(exponent)
 
@@ -846,9 +846,7 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
                 x_dequant = x_float * scale
 
                 # Store as bf16
-                tl.store(
-                    output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask
-                )
+                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
@@ -986,9 +984,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
     # SC_IN_REC > 0: interleaved -- each token's scales live inside its own
     # record. 0: packed -- the scales are grouped after the block's token data.
     if SC_IN_REC > 0:
-        scale_ptr = (
-            cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
-        )
+        scale_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
     else:
         scale_ptr = (
             cache_block_ptr
@@ -1094,6 +1090,7 @@ def _fused_kv_compress_norm_rope_insert_sparse_attn(
 # Currently only tested and validated on ROCm gfx950
 # =============================================================================
 
+
 @triton.jit
 def _compress_gather_split_sparse_attn(
     state_cache_ptr,
@@ -1158,6 +1155,7 @@ def _compress_gather_split_sparse_attn(
     compressed = tl.sum(kv * score, axis=0)  # [HEAD_TILE] fp32
     tl.store(scratch_ptr + token_idx * scratch_stride + col, compressed)
 
+
 @triton.jit
 def _finalize_norm_rope_quant_store_sparse_attn(
     scratch_ptr,
@@ -1217,9 +1215,7 @@ def _finalize_norm_rope_quant_store_sparse_attn(
     # SC_IN_REC > 0: interleaved -- each token's scales live inside its own
     # record. 0: packed -- the scales are grouped after the block's token data.
     if SC_IN_REC > 0:
-        scale_ptr = (
-            cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
-        )
+        scale_ptr = cache_block_ptr + kv_pos_in_block * TOKEN_STRIDE + SC_IN_REC
     else:
         scale_ptr = (
             cache_block_ptr

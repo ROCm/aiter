@@ -17,6 +17,14 @@ worth it -- the question VLLM_DSV4_QPACK_FUSION exists to answer:
 ``--no-write-q`` measures the pure-decode shortcut, where the bf16 Q is never
 read back and the producer may skip writing it.
 """
+
+# The timing closures below capture the shape loop's variables by
+# reference. Every one is built and consumed inside its own iteration
+# (do_bench runs before the loop advances), so late binding cannot bite.
+# File-scoped rather than per-line: a trailing suppression comment sits
+# on a line black then rewraps, which moves it off the line ruff reports.
+# ruff: noqa: B023
+
 import argparse
 import sys
 
@@ -66,15 +74,31 @@ def main():
     )
     p.add_argument("--tokens", type=int, nargs="+", default=[1, 64, 256, 1024])
     p.add_argument("--heads", type=int, default=16, help="local Q heads")
-    p.add_argument("--padded-heads", type=int, default=16,
-                   help="head count the attention kernel wants; >= --heads")
+    p.add_argument(
+        "--padded-heads",
+        type=int,
+        default=16,
+        help="head count the attention kernel wants; >= --heads",
+    )
     p.add_argument("--block", type=int, default=64, help="paged cache block size")
-    p.add_argument("--no-q-norm", dest="q_norm", action="store_false",
-                   help="skip the per-head RMSNorm on Q")
-    p.add_argument("--no-write-q", dest="write_q", action="store_false",
-                   help="do not write the bf16 Q (pure-decode shortcut)")
-    p.add_argument("--rep", type=int, default=20,
-                   help="do_bench_cudagraph measurement target, in ms")
+    p.add_argument(
+        "--no-q-norm",
+        dest="q_norm",
+        action="store_false",
+        help="skip the per-head RMSNorm on Q",
+    )
+    p.add_argument(
+        "--no-write-q",
+        dest="write_q",
+        action="store_false",
+        help="do not write the bf16 Q (pure-decode shortcut)",
+    )
+    p.add_argument(
+        "--rep",
+        type=int,
+        default=20,
+        help="do_bench_cudagraph measurement target, in ms",
+    )
     a = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -82,17 +106,20 @@ def main():
     if a.padded_heads < a.heads:
         sys.exit("--padded-heads must be >= --heads")
 
-    print("dsv4 producer  heads=%d padded=%d block=%d q_norm=%s write_q=%s"
-          % (a.heads, a.padded_heads, a.block, a.q_norm, a.write_q))
-    print("%-8s %-11s %-11s %-11s %-11s %s"
-          % ("tokens", "pack=on us", "pack=off us", "q_pack us",
-             "fused GB/s", "fused vs split"))
+    print(
+        f"dsv4 producer  heads={a.heads} padded={a.padded_heads} "
+        f"block={a.block} q_norm={a.q_norm} write_q={a.write_q}"
+    )
+    print(
+        f"{'tokens':<8} {'pack=on us':<11} {'pack=off us':<11} "
+        f"{'q_pack us':<11} {'fused GB/s':<11} fused vs split"
+    )
 
     for t in a.tokens:
         nb = max(1, (t + a.block - 1) // a.block * 2)
         q, kv, cache, slot, pos, cs = build(t, a.heads, a.padded_heads, nb, a.block)
         args = (q, kv, cache, slot, pos, cs, a.block, 1e-6, a.padded_heads)
-        kw = dict(apply_q_norm=a.q_norm, write_q=a.write_q)
+        kw = {"apply_q_norm": a.q_norm, "write_q": a.write_q}
 
         def fused():
             fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(*args, pack_q=True, **kw)
@@ -114,9 +141,15 @@ def main():
         f = triton.testing.do_bench_cudagraph(fused, rep=a.rep) * 1e3
         u = triton.testing.do_bench_cudagraph(unfused, rep=a.rep) * 1e3
         k = triton.testing.do_bench_cudagraph(only_pack, rep=a.rep) * 1e3
-        gbs = producer_bytes(t, a.heads, a.padded_heads, True, a.write_q) / (f * 1e-6) / 1e9
-        print("%-8d %-11.2f %-11.2f %-11.2f %-11.1f %.2fx"
-              % (t, f, u, k, gbs, (u + k) / f))
+        gbs = (
+            producer_bytes(t, a.heads, a.padded_heads, True, a.write_q)
+            / (f * 1e-6)
+            / 1e9
+        )
+        print(
+            f"{t:<8d} {f:<11.2f} {u:<11.2f} {k:<11.2f} "
+            f"{gbs:<11.1f} {(u + k) / f:.2f}x"
+        )
 
 
 if __name__ == "__main__":

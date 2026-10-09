@@ -6,9 +6,9 @@ import triton
 
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _fused_deepseek_v4_dequant_gather_k_cache_kernel,
-    _fused_deepseek_v4_quantize_and_insert_k_kernel,
-    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel,
     _fused_deepseek_v4_mxfp8_quant_q_pack_kernel,
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel,
+    _fused_deepseek_v4_quantize_and_insert_k_kernel,
     _fused_dual_rmsnorm_mxfp8_quant_kernel,
     _fused_flatten_mxfp8_quant_kernel,
     _fused_rms_mxfp8_kernel,
@@ -18,9 +18,9 @@ __all__ = [
     "fused_deepseek_v4_compress_norm_rope_store",
     "fused_deepseek_v4_compress_norm_rope_store_two_stage",
     "fused_deepseek_v4_dequantize_and_gather_k_cache",
+    "fused_deepseek_v4_mxfp8_quant_q_pack",
     "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert",
     "fused_deepseek_v4_quantize_and_insert_k_cache",
-    "fused_deepseek_v4_mxfp8_quant_q_pack",
     "fused_dual_rmsnorm_mxfp8_quant",
     "fused_flatten_mxfp8_quant",
     "fused_rms_mxfp8_quant",
@@ -36,8 +36,6 @@ _V4_DIM_ROPE = 64
 _V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE
 _FP8_GROUP_SIZE = 64
 _V4_NUM_TILES = _V4_DIM_NOPE // _FP8_GROUP_SIZE
-
-
 
 
 def fused_rms_mxfp8_quant(
@@ -263,8 +261,15 @@ def fused_deepseek_v4_mxfp8_quant_q_pack(q: torch.Tensor):
     packed = torch.empty((*lead, _V4_DIM_QK), dtype=torch.uint8, device=q.device)
     rope = torch.empty((*lead, _V4_DIM_ROPE), dtype=q.dtype, device=q.device)
     _fused_deepseek_v4_mxfp8_quant_q_pack_kernel[(rows,)](
-        q, packed, rope, float(torch.finfo(torch.float8_e4m3fn).max),
-        _V4_DIM_NOPE, _V4_DIM_ROPE, _V4_DIM_QK, _FP8_GROUP_SIZE, _V4_NUM_TILES,
+        q,
+        packed,
+        rope,
+        float(torch.finfo(torch.float8_e4m3fn).max),
+        _V4_DIM_NOPE,
+        _V4_DIM_ROPE,
+        _V4_DIM_QK,
+        _FP8_GROUP_SIZE,
+        _V4_NUM_TILES,
         num_warps=4,
     )
     return packed.view(torch.float8_e4m3fn), rope
@@ -326,9 +331,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     if padded_heads < h:
         raise RuntimeError(f"padded_heads {padded_heads} < H {h}")
     if kv.dim() != 2 or kv.shape != (t, _V4_DIM_QK):
-        raise RuntimeError(
-            f"kv must be [{t}, {_V4_DIM_QK}], got {tuple(kv.shape)}"
-        )
+        raise RuntimeError(f"kv must be [{t}, {_V4_DIM_QK}], got {tuple(kv.shape)}")
     if kv_cache.shape[-1] != _V4_REC_ALIGNED:
         raise RuntimeError(
             f"kv_cache records must be {_V4_REC_ALIGNED} B, got "
@@ -370,9 +373,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
 
     fp8_max = 224.0 if use_fnuz else float(torch.finfo(torch.float8_e4m3fn).max)
     # One extra slot along dim 1 carries the KV row for the token.
-    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[
-        (t, padded_heads + 1)
-    ](
+    _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[(t, padded_heads + 1)](
         q,
         q_out,
         q_packed,
@@ -450,9 +451,9 @@ def fused_deepseek_v4_quantize_and_insert_k_cache(
     platforms whose FP8 format is FNUZ. ``use_fnuz=False`` selects OCP E4M3,
     which is used by OCP-encoded caches even on gfx942.
     """
-    assert k.dim() == 2 and k.shape[1] == 512, (
-        f"K must be [num_tokens, 512], got {k.shape}"
-    )
+    assert (
+        k.dim() == 2 and k.shape[1] == 512
+    ), f"K must be [num_tokens, 512], got {k.shape}"
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
     assert is_ue8m0, "Only support ue8m0 quantization."
 
@@ -561,20 +562,21 @@ def fused_deepseek_v4_dequantize_and_gather_k_cache(
 # ---------------------------------------------------------------------------
 # DSv4 KV compressor launchers (ported from vLLM)
 # ---------------------------------------------------------------------------
-from functools import lru_cache  # noqa: E402
-from typing import Any  # noqa: E402
+from functools import lru_cache
+from typing import Any
 
-from aiter.ops.triton.utils._triton import arch_info  # noqa: E402
+from aiter.ops.triton.utils._triton import arch_info
 
 # The compressor sanitises cache NaNs only where the decode path needs it;
 # vLLM gated this on its own _ON_GFX950, so resolve the same thing from aiter.
 _ON_GFX950 = arch_info.get_arch() == "gfx950"
 
-from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (  # noqa: E402
+from aiter.ops.triton._triton_kernels.quant.fused_mxfp8_quant import (
     _compress_gather_split_sparse_attn,
     _finalize_norm_rope_quant_store_sparse_attn,
     _fused_kv_compress_norm_rope_insert_sparse_attn,
 )
+
 
 def fused_deepseek_v4_compress_norm_rope_store(
     state_cache: torch.Tensor,
@@ -665,9 +667,11 @@ def fused_deepseek_v4_compress_norm_rope_store(
 # DeepseekV4 Attention path (head=512, nope=448 FP8 + rope=64 bf16)
 # =============================================================================
 
+
 @lru_cache(maxsize=1)
 def _n_cu() -> int:
     return torch.cuda.get_device_properties(0).multi_processor_count
+
 
 def _pick_compress_num_splits(
     num_actual: int, compress_ratio: int, head_dim: int
@@ -685,6 +689,7 @@ def _pick_compress_num_splits(
     while ns * 2 <= min(target, max_splits) and head_dim % (ns * 2) == 0:
         ns *= 2
     return ns
+
 
 def _launch_two_stage_sparse_attn_compressor(
     state_cache: torch.Tensor,
@@ -755,6 +760,7 @@ def _launch_two_stage_sparse_attn_compressor(
         KV_BLOCK_STRIDE=kv_cache.stride(0),
         SANITIZE_CACHE_NANS=_ON_GFX950,
     )
+
 
 def fused_deepseek_v4_compress_norm_rope_store_two_stage(
     state_cache: torch.Tensor,

@@ -7,11 +7,10 @@ indices.
 TODO: add details once API has settled
 """
 
+import functools
 import math
 
 import torch
-import functools
-import os
 import triton
 
 from aiter.ops.triton._gluon_kernels.gfx950.attention.sparse_mla import (
@@ -74,6 +73,7 @@ def _check_out(out, q, dtype):
     assert out.dtype == dtype, f"out dtype {out.dtype} != {dtype}"
     assert out.device == q.device
     return out
+
 
 # ---------------------------------------------------------------------------
 # DSv4 "2buff" packed-fp8 KV layout, byte-identical to what the gfx1250 MLA-v4
@@ -349,9 +349,7 @@ def pa_decode_sparse(
                 out_mxfp8=out_mxfp8,
             )
 
-    assert (
-        extra_cache is None and extra_indices is None and extra_indptr is None
-    ), (
+    assert extra_cache is None and extra_indices is None and extra_indptr is None, (
         "extra_cache/extra_indices/extra_indptr need the gfx950 packed path or "
         "the gfx1250 fp8_ds_mla path"
     )
@@ -1172,8 +1170,7 @@ def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
     return rows, blk_stride // row_stride, block_size, nb * block_size
 
 
-
-@functools.lru_cache(maxsize=None)
+@functools.cache
 def _v4_decode_partials(t_cap, kv_splits, h_padded, d, device_index):
     """Persistent fp32 partials for the split-K decode path.
 
@@ -1186,9 +1183,7 @@ def _v4_decode_partials(t_cap, kv_splits, h_padded, d, device_index):
     dev = torch.device("cuda", device_index)
     m = torch.empty((t_cap, kv_splits, h_padded), dtype=torch.float32, device=dev)
     l = torch.empty_like(m)
-    acc = torch.empty(
-        (t_cap, kv_splits, h_padded, d), dtype=torch.float32, device=dev
-    )
+    acc = torch.empty((t_cap, kv_splits, h_padded, d), dtype=torch.float32, device=dev)
     return m, l, acc
 
 
@@ -1300,9 +1295,9 @@ def _pa_decode_sparse_v4_2buff(
         )
     T, H, D = q.shape
     assert D == _V4_DIM_QK, f"2buff path is fixed to D={_V4_DIM_QK}, got {D}"
-    assert q.dtype in _V4_PACKED_FP8_DTYPES, (
-        f"q must be the packed fp8 [N, H, {_V4_DIM_QK}] tensor, got {q.dtype}"
-    )
+    assert (
+        q.dtype in _V4_PACKED_FP8_DTYPES
+    ), f"q must be the packed fp8 [N, H, {_V4_DIM_QK}] tensor, got {q.dtype}"
     assert q_rope.shape == (T, H, _V4_DIM_ROPE) and q_rope.dtype == torch.bfloat16
     assert q_rope.is_contiguous()
 
@@ -1405,9 +1400,7 @@ def _pa_decode_sparse_v4_2buff(
         # ONE token has. kv_indices.shape[0] is every token's indices together,
         # so the ceiling never bound and splits were made with no work in them
         # -- and a dead split still costs the reduce a slab row.
-        total_idx = kv_indices.shape[0] + (
-            extra_indices.shape[0] if has_extra else 0
-        )
+        total_idx = kv_indices.shape[0] + (extra_indices.shape[0] if has_extra else 0)
         avg_kv_len = max(1, total_idx // max(1, T))
         max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))

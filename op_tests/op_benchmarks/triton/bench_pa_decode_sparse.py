@@ -323,9 +323,19 @@ def build_slot_indices(T, lens, npages, page, device, gen):
 _INPUT_CACHE = {}
 
 
-def build_inputs(T, H, D, kv_len, var_len=False, seed=0, device="cuda",
-                 page=DEFAULT_PAGE, extra_len=0, extra_page=DEFAULT_PAGE,
-                 pool="paged"):
+def build_inputs(
+    T,
+    H,
+    D,
+    kv_len,
+    var_len=False,
+    seed=0,
+    device="cuda",
+    page=DEFAULT_PAGE,
+    extra_len=0,
+    extra_page=DEFAULT_PAGE,
+    pool="paged",
+):
     """Inputs for one shape, memoized.
 
     perf_report calls the bench fn once per (shape, provider), so without the
@@ -333,8 +343,18 @@ def build_inputs(T, H, D, kv_len, var_len=False, seed=0, device="cuda",
     times -- at T=512, kv_len=384 that is ~100M elements quantized three
     different ways per provider, which dominated the sweep's wall clock.
     """
-    key = (T, H, D, kv_len, bool(var_len), seed, str(device), page,
-           extra_len, extra_page)
+    key = (
+        T,
+        H,
+        D,
+        kv_len,
+        bool(var_len),
+        seed,
+        str(device),
+        page,
+        extra_len,
+        extra_page,
+    )
     if key in _INPUT_CACHE:
         return _INPUT_CACHE[key]
     torch.manual_seed(seed)
@@ -384,9 +404,7 @@ def build_inputs(T, H, D, kv_len, var_len=False, seed=0, device="cuda",
             "indices": build_topk_indices(
                 T, extra_len, x_npages, extra_page, device, gen
             ),
-            "indptr": (
-                torch.arange(T + 1, device=device) * extra_len
-            ).to(torch.int32),
+            "indptr": (torch.arange(T + 1, device=device) * extra_len).to(torch.int32),
             "n_idx": T * extra_len,
         }
 
@@ -468,8 +486,14 @@ def _make_fn(provider, inp, T, H, D):
         kv_row = HEAD_DIM * 1 + ROPE_DIM * 2
         if inp.get("pool", "paged") == "flat":
             fn = lambda: pa_decode_sparse(
-                inp["q_packed"], inp["kv_packed"], ind, iptr, sink, scale,
-                has_invalid=False, unified_kv_rope=inp["kv_rope"],
+                inp["q_packed"],
+                inp["kv_packed"],
+                ind,
+                iptr,
+                sink,
+                scale,
+                has_invalid=False,
+                unified_kv_rope=inp["kv_rope"],
                 q_rope=inp["q_rope"],
             )
             return fn, n_idx * kv_row + T * H * kv_row + out_bytes
@@ -485,8 +509,15 @@ def _make_fn(provider, inp, T, H, D):
             else {}
         )
         fn = lambda: pa_decode_sparse(
-            inp["q_packed"], inp["unified"], ind, iptr, sink, scale,
-            q_rope=inp["q_rope"], has_invalid=False, **kw,
+            inp["q_packed"],
+            inp["unified"],
+            ind,
+            iptr,
+            sink,
+            scale,
+            q_rope=inp["q_rope"],
+            has_invalid=False,
+            **kw,
         )
         keys = n_idx + (x["n_idx"] if x is not None else 0)
         return fn, keys * kv_row + T * H * kv_row + out_bytes
@@ -527,13 +558,36 @@ def _device_ms(fn, provider, iters=50):
     return total / iters * 1e-3  # us -> ms, to match do_bench's unit
 
 
-def bench_fn(T, H, D, kv_len, provider, metric, var_len, cudagraph, rep,
-             profile_dir=None, page=DEFAULT_PAGE, block_k=None, timer="wall",
-             extra_len=0, extra_page=DEFAULT_PAGE, main_is_window=False,
-             pool="paged"):
-    inp = build_inputs(T, H, D, kv_len, var_len=var_len, page=page,
-                       extra_len=extra_len, extra_page=extra_page,
-                       pool=pool)
+def bench_fn(
+    T,
+    H,
+    D,
+    kv_len,
+    provider,
+    metric,
+    var_len,
+    cudagraph,
+    rep,
+    profile_dir=None,
+    page=DEFAULT_PAGE,
+    block_k=None,
+    timer="wall",
+    extra_len=0,
+    extra_page=DEFAULT_PAGE,
+    main_is_window=False,
+    pool="paged",
+):
+    inp = build_inputs(
+        T,
+        H,
+        D,
+        kv_len,
+        var_len=var_len,
+        page=page,
+        extra_len=extra_len,
+        extra_page=extra_page,
+        pool=pool,
+    )
     inp["block_k"] = block_k
     inp["main_is_window"] = main_is_window
     made = _make_fn(provider, inp, T, H, D)
@@ -570,9 +624,7 @@ def bench_fn(T, H, D, kv_len, provider, metric, var_len, cudagraph, rep,
             torch.cuda.synchronize()
         tag = f"{provider}_T{T}_H{H}_kv{kv_len}"
         prof.export_chrome_trace(os.path.join(profile_dir, f"{tag}.json"))
-        top = prof.key_averages().table(
-            sort_by="self_device_time_total", row_limit=8
-        )
+        top = prof.key_averages().table(sort_by="self_device_time_total", row_limit=8)
         print(f"\n--- {tag} ---\n{top}", file=sys.stderr)
 
     if timer == "profiler":
@@ -670,6 +722,7 @@ def run_benchmark(args):
         )
 
     _bench.run(save_path="." if args.o else None, print_data=True)
+
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(

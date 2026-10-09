@@ -15,6 +15,14 @@ placed and that changes the access pattern:
 
     python bench_fused_deepseek_v4_k_cache.py --seqs 1024 --reqs 8
 """
+
+# The timing closures below capture the shape loop's variables by
+# reference. Every one is built and consumed inside its own iteration
+# (do_bench runs before the loop advances), so late binding cannot bite.
+# File-scoped rather than per-line: a trailing suppression comment sits
+# on a line black then rewraps, which moves it off the line ruff reports.
+# ruff: noqa: B023
+
 import argparse
 import sys
 
@@ -66,22 +74,38 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--reqs", type=int, default=8, help="requests per launch")
-    p.add_argument("--seqs", type=int, nargs="+", default=[256, 1024, 4096],
-                   help="sequence length per request")
-    p.add_argument("--rec", type=int, nargs="+", default=[_ALIGNED_REC],
-                   choices=[_PACKED_REC, _ALIGNED_REC],
-                   help="record layout in bytes")
+    p.add_argument(
+        "--seqs",
+        type=int,
+        nargs="+",
+        default=[256, 1024, 4096],
+        help="sequence length per request",
+    )
+    p.add_argument(
+        "--rec",
+        type=int,
+        nargs="+",
+        default=[_ALIGNED_REC],
+        choices=[_PACKED_REC, _ALIGNED_REC],
+        help="record layout in bytes",
+    )
     p.add_argument("--block", type=int, default=64, help="paged cache block size")
-    p.add_argument("--rep", type=int, default=20,
-                   help="do_bench_cudagraph measurement target, in ms")
+    p.add_argument(
+        "--rep",
+        type=int,
+        default=20,
+        help="do_bench_cudagraph measurement target, in ms",
+    )
     a = p.parse_args()
 
     if not torch.cuda.is_available():
         sys.exit("needs a GPU")
 
-    print("dsv4 k-cache  reqs=%d block=%d" % (a.reqs, a.block))
-    print("%-8s %-7s %-10s %-12s %-10s %-12s"
-          % ("rec", "seq", "write(us)", "write(GB/s)", "read(us)", "read(GB/s)"))
+    print(f"dsv4 k-cache  reqs={a.reqs} block={a.block}")
+    print(
+        f"{'rec':<8} {'seq':<7} {'write(us)':<10} "
+        f"{'write(GB/s)':<12} {'read(us)':<10} {'read(GB/s)':<12}"
+    )
 
     for rec in a.rec:
         for seq in a.seqs:
@@ -96,16 +120,18 @@ def main():
                     out, cache, seq_lens, None, bt, a.block, 0
                 )
 
-            do_write()          # compile outside the timed region
+            do_write()  # compile outside the timed region
             do_read()
             torch.cuda.synchronize()
             wms = triton.testing.do_bench_cudagraph(do_write, rep=a.rep)
             rms = triton.testing.do_bench_cudagraph(do_read, rep=a.rep)
 
-            print("%-8d %-7d %-10.2f %-12.1f %-10.2f %-12.1f"
-                  % (rec, seq,
-                     wms * 1e3, write_bytes(ntok) / (wms * 1e-3) / 1e9,
-                     rms * 1e3, read_bytes(ntok) / (rms * 1e-3) / 1e9))
+            print(
+                f"{rec:<8d} {seq:<7d} {wms * 1e3:<10.2f} "
+                f"{write_bytes(ntok) / (wms * 1e-3) / 1e9:<12.1f} "
+                f"{rms * 1e3:<10.2f} "
+                f"{read_bytes(ntok) / (rms * 1e-3) / 1e9:<12.1f}"
+            )
 
 
 if __name__ == "__main__":

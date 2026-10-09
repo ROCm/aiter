@@ -1069,23 +1069,43 @@ def _v4_qk_mx_split_regs(
     acc = gl.zeros([BLOCK_H, BLOCK_K], dtype=gl.float32, layout=qk_wmma_layout)
     k0 = kv_buf.slice(0 * MXK, MXK, dim=1).permute([1, 0]).load(dot_k_layout)
     acc = gl.amd.gfx1250.wmma_scaled(
-        q0, s0, "e4m3", k0,
-        scale_buf.slice(0 * NSC, NSC, dim=1).load(k_sc_layout), "e4m3", acc,
+        q0,
+        s0,
+        "e4m3",
+        k0,
+        scale_buf.slice(0 * NSC, NSC, dim=1).load(k_sc_layout),
+        "e4m3",
+        acc,
     )
     k1 = kv_buf.slice(1 * MXK, MXK, dim=1).permute([1, 0]).load(dot_k_layout)
     acc = gl.amd.gfx1250.wmma_scaled(
-        q1, s1, "e4m3", k1,
-        scale_buf.slice(1 * NSC, NSC, dim=1).load(k_sc_layout), "e4m3", acc,
+        q1,
+        s1,
+        "e4m3",
+        k1,
+        scale_buf.slice(1 * NSC, NSC, dim=1).load(k_sc_layout),
+        "e4m3",
+        acc,
     )
     k2 = kv_buf.slice(2 * MXK, MXK, dim=1).permute([1, 0]).load(dot_k_layout)
     acc = gl.amd.gfx1250.wmma_scaled(
-        q2, s2, "e4m3", k2,
-        scale_buf.slice(2 * NSC, NSC, dim=1).load(k_sc_layout), "e4m3", acc,
+        q2,
+        s2,
+        "e4m3",
+        k2,
+        scale_buf.slice(2 * NSC, NSC, dim=1).load(k_sc_layout),
+        "e4m3",
+        acc,
     )
     k3 = kv_buf.slice(3 * MXK, MXK, dim=1).permute([1, 0]).load(dot_k_layout)
     acc = gl.amd.gfx1250.wmma_scaled(
-        q3, s3, "e4m3", k3,
-        scale_buf.slice(3 * NSC, NSC, dim=1).load(k_sc_layout), "e4m3", acc,
+        q3,
+        s3,
+        "e4m3",
+        k3,
+        scale_buf.slice(3 * NSC, NSC, dim=1).load(k_sc_layout),
+        "e4m3",
+        acc,
     )
     return acc
 
@@ -1264,13 +1284,22 @@ def _v4_2buff_row(slot, blk_rows, BS: gl.constexpr):
 
 @gluon.jit
 def _v4_2buff_gather(
-    main_kv_ptr, main_u8_ptr, main_rope_ptr,
-    extra_kv_ptr, extra_u8_ptr, extra_rope_ptr,
-    main_rows, extra_rows,
+    main_kv_ptr,
+    main_u8_ptr,
+    main_rope_ptr,
+    extra_kv_ptr,
+    extra_u8_ptr,
+    extra_rope_ptr,
+    main_rows,
+    extra_rows,
     is_main,
     row,
-    kv_desc, rope_desc, mxs_desc,
-    kv_buf, rope_buf, sc_buf,
+    kv_desc,
+    rope_desc,
+    mxs_desc,
+    kv_buf,
+    rope_buf,
+    sc_buf,
     kv_packed_shared: gl.constexpr,
     rope_shared: gl.constexpr,
     mxs_shared: gl.constexpr,
@@ -1862,31 +1891,79 @@ def _pa_decode_sparse_v4_2buff(
                 q_smem, qs_smem, dot_q_layout, q_sc_chunk_layout, BLOCK_D, MXK
             )
     _v4_2buff_fetch_slots(
-        slot_desc, main_slot_base, extra_slot_base, kv_len, extra_len,
-        tile_start, main_tiles, slot_bufs.index(0), slot_shared, BLOCK_K,
+        slot_desc,
+        main_slot_base,
+        extra_slot_base,
+        kv_len,
+        extra_len,
+        tile_start,
+        main_tiles,
+        slot_bufs.index(0),
+        slot_shared,
+        BLOCK_K,
         HAS_EXTRA,
     )
     _v4_2buff_fetch_slots(
-        slot_desc, main_slot_base, extra_slot_base, kv_len, extra_len,
-        tile_start + 1, main_tiles, slot_bufs.index(1), slot_shared, BLOCK_K,
+        slot_desc,
+        main_slot_base,
+        extra_slot_base,
+        kv_len,
+        extra_len,
+        tile_start + 1,
+        main_tiles,
+        slot_bufs.index(1),
+        slot_shared,
+        BLOCK_K,
         HAS_EXTRA,
     )
     gl.amd.gfx1250.tdm.async_wait(1)
     cur_row, cur_is_main, cur_valid = _v4_2buff_tile(
-        slot_bufs.index(0), tile_start, main_tiles, kv_len, extra_len,
-        main_blk_rows, extra_blk_rows, main_slots, extra_slots,
-        SLOT_BLOCKED_LAYOUT, valid_col_mma,
-        BLOCK_K, MAIN_BLOCK_SIZE, EXTRA_BLOCK_SIZE, HAS_INVALID, HAS_EXTRA,
+        slot_bufs.index(0),
+        tile_start,
+        main_tiles,
+        kv_len,
+        extra_len,
+        main_blk_rows,
+        extra_blk_rows,
+        main_slots,
+        extra_slots,
+        SLOT_BLOCKED_LAYOUT,
+        valid_col_mma,
+        BLOCK_K,
+        MAIN_BLOCK_SIZE,
+        EXTRA_BLOCK_SIZE,
+        HAS_INVALID,
+        HAS_EXTRA,
     )
     _v4_2buff_gather(
-        unified_kv_ptr, kv_u8_ptr, kv_rope_ptr,
-        extra_kv_ptr, extra_kv_u8_ptr, extra_rope_ptr,
-        total_pages, extra_total_pages, cur_is_main, cur_row,
-        kv_desc, rope_desc, mxs_desc,
-        kv_bufs.index(0), rope_bufs.index(0), scale_bufs.index(0),
-        kv_packed_shared, rope_shared, mxs_shared,
-        kv_stride_n, kvr_stride_n, NOPE_DIM, ROPE_DIM,
-        REAL_MX_BLOCKS, NUM_MX_BLOCKS, BLOCK_K, BLOCK_D, HAS_EXTRA,
+        unified_kv_ptr,
+        kv_u8_ptr,
+        kv_rope_ptr,
+        extra_kv_ptr,
+        extra_kv_u8_ptr,
+        extra_rope_ptr,
+        total_pages,
+        extra_total_pages,
+        cur_is_main,
+        cur_row,
+        kv_desc,
+        rope_desc,
+        mxs_desc,
+        kv_bufs.index(0),
+        rope_bufs.index(0),
+        scale_bufs.index(0),
+        kv_packed_shared,
+        rope_shared,
+        mxs_shared,
+        kv_stride_n,
+        kvr_stride_n,
+        NOPE_DIM,
+        ROPE_DIM,
+        REAL_MX_BLOCKS,
+        NUM_MX_BLOCKS,
+        BLOCK_K,
+        BLOCK_D,
+        HAS_EXTRA,
     )
     # Two-deep, like the asm kernel: tile i+1 is gathered while tile i is
     # consumed, so only two KV ring slots and ONE dequant staging tile are
@@ -1906,28 +1983,64 @@ def _pa_decode_sparse_v4_2buff(
         gl.amd.gfx1250.tdm.async_wait(3)
         next_row, next_is_main, next_valid = _v4_2buff_tile(
             slot_bufs.index((i + 1) % NUM_SLOT_BUFFERS),
-            tile_start + i + 1, main_tiles, kv_len, extra_len,
-            main_blk_rows, extra_blk_rows, main_slots, extra_slots,
-            SLOT_BLOCKED_LAYOUT, valid_col_mma,
-            BLOCK_K, MAIN_BLOCK_SIZE, EXTRA_BLOCK_SIZE, HAS_INVALID, HAS_EXTRA,
+            tile_start + i + 1,
+            main_tiles,
+            kv_len,
+            extra_len,
+            main_blk_rows,
+            extra_blk_rows,
+            main_slots,
+            extra_slots,
+            SLOT_BLOCKED_LAYOUT,
+            valid_col_mma,
+            BLOCK_K,
+            MAIN_BLOCK_SIZE,
+            EXTRA_BLOCK_SIZE,
+            HAS_INVALID,
+            HAS_EXTRA,
         )
         _v4_2buff_fetch_slots(
-            slot_desc, main_slot_base, extra_slot_base, kv_len, extra_len,
-            tile_start + i + 2, main_tiles,
+            slot_desc,
+            main_slot_base,
+            extra_slot_base,
+            kv_len,
+            extra_len,
+            tile_start + i + 2,
+            main_tiles,
             slot_bufs.index((i + 2) % NUM_SLOT_BUFFERS),
-            slot_shared, BLOCK_K, HAS_EXTRA,
+            slot_shared,
+            BLOCK_K,
+            HAS_EXTRA,
         )
         _v4_2buff_gather(
-            unified_kv_ptr, kv_u8_ptr, kv_rope_ptr,
-            extra_kv_ptr, extra_kv_u8_ptr, extra_rope_ptr,
-            total_pages, extra_total_pages, next_is_main, next_row,
-            kv_desc, rope_desc, mxs_desc,
+            unified_kv_ptr,
+            kv_u8_ptr,
+            kv_rope_ptr,
+            extra_kv_ptr,
+            extra_kv_u8_ptr,
+            extra_rope_ptr,
+            total_pages,
+            extra_total_pages,
+            next_is_main,
+            next_row,
+            kv_desc,
+            rope_desc,
+            mxs_desc,
             kv_bufs.index((i + 1) % NUM_BUFFERS),
             rope_bufs.index((i + 1) % NUM_BUFFERS),
             scale_bufs.index((i + 1) % NUM_BUFFERS),
-            kv_packed_shared, rope_shared, mxs_shared,
-            kv_stride_n, kvr_stride_n, NOPE_DIM, ROPE_DIM,
-            REAL_MX_BLOCKS, NUM_MX_BLOCKS, BLOCK_K, BLOCK_D, HAS_EXTRA,
+            kv_packed_shared,
+            rope_shared,
+            mxs_shared,
+            kv_stride_n,
+            kvr_stride_n,
+            NOPE_DIM,
+            ROPE_DIM,
+            REAL_MX_BLOCKS,
+            NUM_MX_BLOCKS,
+            BLOCK_K,
+            BLOCK_D,
+            HAS_EXTRA,
         )
 
         # 2. retire KV/RoPE/MXS(i), gathered one iteration ago
@@ -1944,7 +2057,14 @@ def _pa_decode_sparse_v4_2buff(
         if Q_TDM:
             if Q_IN_VGPR:
                 scores = _v4_qk_mx_split_regs(
-                    qv0, qv1, qv2, qv3, qsv0, qsv1, qsv2, qsv3,
+                    qv0,
+                    qv1,
+                    qv2,
+                    qv3,
+                    qsv0,
+                    qsv1,
+                    qsv2,
+                    qsv3,
                     kv_bufs.index(i % NUM_BUFFERS),
                     scale_bufs.index(i % NUM_BUFFERS),
                     dot_k_layout,
@@ -2020,14 +2140,10 @@ def _pa_decode_sparse_v4_2buff(
             # of range) leaves m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf)
             # = NaN, and with l_i/acc still 0 it survives as 0*NaN and poisons the
             # whole row. Treat such a tile as a no-op, as the gfx950 kernel does.
-            alpha = gl.where(
-                m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new)
-            )
+            alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new))
             p = gl.exp2(scores - m_new[:, None])
         else:
-            alpha = gl.where(
-                m_new == float("-inf"), 1.0, gl.exp(m_i - m_new)
-            )
+            alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp(m_i - m_new))
             p = gl.exp(scores - m_new[:, None])
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
@@ -2069,7 +2185,14 @@ def _pa_decode_sparse_v4_2buff(
     if Q_TDM:
         if Q_IN_VGPR:
             scores = _v4_qk_mx_split_regs(
-                qv0, qv1, qv2, qv3, qsv0, qsv1, qsv2, qsv3,
+                qv0,
+                qv1,
+                qv2,
+                qv3,
+                qsv0,
+                qsv1,
+                qsv2,
+                qsv3,
                 kv_bufs.index(final_idx),
                 scale_bufs.index(final_idx),
                 dot_k_layout,
@@ -2146,15 +2269,11 @@ def _pa_decode_sparse_v4_2buff(
         # of range) leaves m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf)
         # = NaN, and with l_i/acc still 0 it survives as 0*NaN and poisons the
         # whole row. Treat such a tile as a no-op, as the gfx950 kernel does.
-        alpha = gl.where(
-            m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new)
-        )
+        alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new))
         p = gl.exp2(scores - m_new[:, None])
         p = gl.where(valid_col[None, :], p, 0.0)
     else:
-        alpha = gl.where(
-            m_new == float("-inf"), 1.0, gl.exp(m_i - m_new)
-        )
+        alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp(m_i - m_new))
         p = gl.exp(scores - m_new[:, None])
     l_new = l_i * alpha + gl.sum(p, axis=1)
 

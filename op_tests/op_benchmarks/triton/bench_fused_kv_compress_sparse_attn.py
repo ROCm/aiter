@@ -23,6 +23,14 @@ bench_moe_gemm_a4w4_cudagraph.py; --rep is the measurement target in ms.
 For register pressure / ISA rather than timing, compile the kernel under a
 dedicated TRITON_CACHE_DIR and read the .amdgcn instead.
 """
+
+# The timing closures below capture the shape loop's variables by
+# reference. Every one is built and consumed inside its own iteration
+# (do_bench runs before the loop advances), so late binding cannot bite.
+# File-scoped rather than per-line: a trailing suppression comment sits
+# on a line black then rewraps, which moves it off the line ruff reports.
+# ruff: noqa: B023
+
 import argparse
 import sys
 from types import SimpleNamespace
@@ -57,18 +65,32 @@ def emitting_positions(a, device="cuda"):
     assert valid, "no emitting position fits the block table"
     return torch.tensor(
         [valid[i % len(valid)] for i in range(a.tokens)],
-        dtype=torch.int64, device=device,
+        dtype=torch.int64,
+        device=device,
     )
+
 
 # DeepSeek-V4-Pro tp4, captured from a live run. --variant picks the layer
 # group; everything here is overridable from the command line.
 VARIANTS = {
-    "cr128": dict(state_width=512, compress_ratio=128, overlap=False,
-                  block_size=8, state_mid=8, kv_page=2,
-                  block_table_width=4096),
-    "cr4": dict(state_width=1024, compress_ratio=4, overlap=True,
-                block_size=4, state_mid=4, kv_page=64,
-                block_table_width=8192),
+    "cr128": {
+        "state_width": 512,
+        "compress_ratio": 128,
+        "overlap": False,
+        "block_size": 8,
+        "state_mid": 8,
+        "kv_page": 2,
+        "block_table_width": 4096,
+    },
+    "cr4": {
+        "state_width": 1024,
+        "compress_ratio": 4,
+        "overlap": True,
+        "block_size": 4,
+        "state_mid": 4,
+        "kv_page": 64,
+        "block_table_width": 8192,
+    },
 }
 
 
@@ -88,7 +110,10 @@ def build(a, device="cuda"):
     state_cache[..., : a.state_width] = 1.0
 
     kv_backing = torch.zeros(
-        a.tokens, a.rows_per_block, a.token_stride, dtype=torch.uint8,
+        a.tokens,
+        a.rows_per_block,
+        a.token_stride,
+        dtype=torch.uint8,
         device=device,
     )
     kv_cache = kv_backing[:, : a.kv_page, :]
@@ -103,38 +128,41 @@ def build(a, device="cuda"):
     # Pointing every token at slot 0, as this used to, makes the stores
     # collide on one line and understates the write cost.
     slot_mapping = torch.arange(a.tokens, dtype=torch.int64, device=device)
-    return dict(
-        state_cache=state_cache,
-        num_actual=a.tokens,
-        token_to_req_indices=torch.zeros(a.tokens, dtype=torch.int32,
-                                         device=device),
-        positions=emitting_positions(a, device),
-        slot_mapping=slot_mapping,
+    return {
+        "state_cache": state_cache,
+        "num_actual": a.tokens,
+        "token_to_req_indices": torch.zeros(a.tokens, dtype=torch.int32, device=device),
+        "positions": emitting_positions(a, device),
+        "slot_mapping": slot_mapping,
         # Spread over the state cache rather than pointing every gather at
         # row 0: an emitting token reads (1 + overlap) * compress_ratio rows,
         # and with one shared row they all come from cache, which flatters
         # the bandwidth. Entries stay below state_cache.shape[0], which is
         # what bounds the index.
-        block_table=torch.randint(0, a.tokens, (a.tokens, a.block_table_width),
-                                  dtype=torch.int32, device=device),
-        block_size=a.block_size,
-        state_width=a.state_width,
-        cos_sin_cache=cos_sin_cache,
-        kv_cache=kv_cache,
-        k_cache_metadata=SimpleNamespace(slot_mapping=slot_mapping),
-        pdl_kwargs={},
-        head_dim=a.head_dim,
-        rope_head_dim=a.rope_dim,
-        compress_ratio=a.compress_ratio,
-        overlap=a.overlap,
-        use_fp4_cache=False,
-        rms_norm_weight=torch.ones(a.head_dim, dtype=torch.bfloat16,
-                                   device=device),
-        rms_norm_eps=a.rms_eps,
-        quant_block=a.quant_block,
-        token_stride=a.token_stride,
-        scale_dim=a.scale_dim,
-    )
+        "block_table": torch.randint(
+            0,
+            a.tokens,
+            (a.tokens, a.block_table_width),
+            dtype=torch.int32,
+            device=device,
+        ),
+        "block_size": a.block_size,
+        "state_width": a.state_width,
+        "cos_sin_cache": cos_sin_cache,
+        "kv_cache": kv_cache,
+        "k_cache_metadata": SimpleNamespace(slot_mapping=slot_mapping),
+        "pdl_kwargs": {},
+        "head_dim": a.head_dim,
+        "rope_head_dim": a.rope_dim,
+        "compress_ratio": a.compress_ratio,
+        "overlap": a.overlap,
+        "use_fp4_cache": False,
+        "rms_norm_weight": torch.ones(a.head_dim, dtype=torch.bfloat16, device=device),
+        "rms_norm_eps": a.rms_eps,
+        "quant_block": a.quant_block,
+        "token_stride": a.token_stride,
+        "scale_dim": a.scale_dim,
+    }
 
 
 def counted_bytes(a):
@@ -162,25 +190,51 @@ def counted_bytes(a):
 def main():
     p = argparse.ArgumentParser(
         description="Benchmark the DeepSeek-V4 fused KV compressor",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("--variant", choices=sorted(VARIANTS), default="cr128",
-                   help="which layer group's specialization to measure")
-    p.add_argument("--tokens", type=int, nargs="+", default=[256],
-                   help="grid size, i.e. tokens per launch (live run: 256)")
-    p.add_argument("--rep", type=int, default=20,
-                   help="do_bench_cudagraph measurement target, in ms")
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    p.add_argument(
+        "--variant",
+        choices=sorted(VARIANTS),
+        default="cr128",
+        help="which layer group's specialization to measure",
+    )
+    p.add_argument(
+        "--tokens",
+        type=int,
+        nargs="+",
+        default=[256],
+        help="grid size, i.e. tokens per launch (live run: 256)",
+    )
+    p.add_argument(
+        "--rep",
+        type=int,
+        default=20,
+        help="do_bench_cudagraph measurement target, in ms",
+    )
 
     g = p.add_argument_group("shape (defaults are DeepSeek-V4-Pro tp4)")
     g.add_argument("--head-dim", type=int, default=512)
     g.add_argument("--rope-dim", type=int, default=64)
     g.add_argument("--quant-block", type=int, default=64)
-    g.add_argument("--token-stride", type=int, default=640,
-                   help="640 = aligned record, 576 = packed")
+    g.add_argument(
+        "--token-stride",
+        type=int,
+        default=640,
+        help="640 = aligned record, 576 = packed",
+    )
     g.add_argument("--scale-dim", type=int, default=8)
-    g.add_argument("--rows-per-block", type=int, default=2387,
-                   help="KV rows per block in the backing allocation")
-    g.add_argument("--state-stride0", type=int, default=381920,
-                   help="state_cache stride(0) in the live run")
+    g.add_argument(
+        "--rows-per-block",
+        type=int,
+        default=2387,
+        help="KV rows per block in the backing allocation",
+    )
+    g.add_argument(
+        "--state-stride0",
+        type=int,
+        default=381920,
+        help="state_cache stride(0) in the live run",
+    )
     g.add_argument("--cos-sin-rows", type=int, default=1048576)
     g.add_argument("--rms-eps", type=float, default=1e-6)
 
@@ -203,13 +257,16 @@ def main():
     if not torch.cuda.is_available():
         sys.exit("needs a GPU")
 
-    print("compressor  variant=%s head_dim=%d rope_dim=%d token_stride=%d "
-          "state_width=%d compress_ratio=%d overlap=%s"
-          % (a.variant, a.head_dim, a.rope_dim, a.token_stride,
-             a.state_width, a.compress_ratio, a.overlap))
-    print("%-10s %-12s %-12s %-12s %-10s %s"
-          % ("tokens", "single(us)", "2stage(us)", "single GB/s", "us/token",
-             "2stage speedup"))
+    print(
+        f"compressor  variant={a.variant} head_dim={a.head_dim} "
+        f"rope_dim={a.rope_dim} token_stride={a.token_stride} "
+        f"state_width={a.state_width} compress_ratio={a.compress_ratio} "
+        f"overlap={a.overlap}"
+    )
+    print(
+        f"{'tokens':<10} {'single(us)':<12} {'2stage(us)':<12} "
+        f"{'single GB/s':<12} {'us/token':<10} 2stage speedup"
+    )
 
     all_tokens = a.tokens
     for n in all_tokens:
@@ -223,16 +280,14 @@ def main():
         # per token cannot fill them, so it is only interesting against the
         # single-pass launcher at the same shape. num_decode_tokens=0 sends
         # every token down the split rather than falling back.
-        scratch = torch.zeros(
-            a.tokens, a.head_dim, dtype=torch.float32, device="cuda"
-        )
+        scratch = torch.zeros(a.tokens, a.head_dim, dtype=torch.float32, device="cuda")
 
         def run_two_stage():
             fused_deepseek_v4_compress_norm_rope_store_two_stage(
                 **kwargs, num_decode_tokens=0, compress_scratch=scratch
             )
 
-        run()                     # compile outside the timed region
+        run()  # compile outside the timed region
         run_two_stage()
         torch.cuda.synchronize()
         ms = triton.testing.do_bench_cudagraph(run, rep=a.rep)
@@ -240,8 +295,10 @@ def main():
 
         us, us2 = ms * 1e3, ms2 * 1e3
         gbs = counted_bytes(a) / (ms * 1e-3) / 1e9
-        print("%-10d %-12.2f %-12.2f %-12.1f %-10.4f %.2fx"
-              % (n, us, us2, gbs, us / n, us / us2))
+        print(
+            f"{n:<10d} {us:<12.2f} {us2:<12.2f} {gbs:<12.1f} "
+            f"{us / n:<10.4f} {us / us2:.2f}x"
+        )
     a.tokens = all_tokens
 
 

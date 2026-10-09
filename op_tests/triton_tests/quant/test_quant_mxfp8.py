@@ -488,8 +488,8 @@ _REC, _SC_IN_REC, _ROPE_IN_REC = 640, 448, 512
 # One ULP of bf16 is a relative 2**-8; the bound is 2**-7 to cover a rounding
 # that crosses a binade, with an absolute floor so values near zero are not
 # judged on a relative scale.
-_ULP = dict(rtol=2**-7, atol=1e-5)
-_EXACT = dict(rtol=0, atol=0)
+_ULP = {"rtol": 2**-7, "atol": 1e-5}
+_EXACT = {"rtol": 0, "atol": 0}
 
 
 def _skip_without_fp8():
@@ -630,9 +630,7 @@ def test_fused_deepseek_v4_mxfp8_quant_q_pack_contract():
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("T,H,padded", [(1, 16, 16), (8, 16, 32), (37, 128, 128)])
 @pytest.mark.parametrize("apply_norm", [False, True])
-def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-    T, H, padded, apply_norm
-):
+def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(T, H, padded, apply_norm):
     """Q, its pack, and the KV record, against per-side references.
 
     With the norm OFF both sides do the identical arithmetic, so everything the
@@ -653,10 +651,8 @@ def test_fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
     # (odd indices, so the T=1 case still exercises a real insert)
     before = cache.clone()
 
-    q_out, q_packed, q_rope = (
-        fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            q, kv, cache, slot, pos, cs, 64, 1e-6, padded, apply_q_norm=apply_norm
-        )
+    q_out, q_packed, q_rope = fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q, kv, cache, slot, pos, cs, 64, 1e-6, padded, apply_q_norm=apply_norm
     )
 
     want_f32 = torch_qnorm_rope_ref(q, pos, cs, 1e-6, padded, apply_norm)
@@ -826,7 +822,9 @@ def _gather_reference(decoded, seq_lens, slot, gather_lens, offset, out_shape):
     return want
 
 
-@pytest.mark.parametrize("rec_bytes", [_PACKED_REC, _REC], ids=["packed584", "aligned640"])
+@pytest.mark.parametrize(
+    "rec_bytes", [_PACKED_REC, _REC], ids=["packed584", "aligned640"]
+)
 @pytest.mark.parametrize(
     "seq_lens,gather_lens,offset",
     [
@@ -857,9 +855,11 @@ def test_fused_deepseek_v4_k_cache_roundtrip(rec_bytes, seq_lens, gather_lens, o
         got,
         cache,
         torch.tensor(seq_lens, dtype=torch.int32, device="cuda"),
-        None
-        if gather_lens is None
-        else torch.tensor(gather_lens, dtype=torch.int32, device="cuda"),
+        (
+            None
+            if gather_lens is None
+            else torch.tensor(gather_lens, dtype=torch.int32, device="cuda")
+        ),
         block_table,
         block,
         offset,
@@ -942,20 +942,6 @@ def test_fused_deepseek_v4_k_cache_contract():
 # them. A/B rather than a reference: the two routes agreeing bit for bit
 # pins the rotation, the normalisation and the record layout at once.
 #
-# The index pattern (positions, block_table, token_to_req_indices) is the
-# benchmark's, which is known in-bounds; only the DATA is randomised, plus
-# distinct slots so the tokens do not race for one record. Varying positions
-# would need the compress gather's addressing pinned down first, and an
-# out-of-bounds read here costs a GPU reset, so that is left alone.
-_CR128 = dict(
-    head_dim=512, rope_dim=64, quant_block=64, token_stride=_REC, scale_dim=8,
-    state_width=512, compress_ratio=128, overlap=False,
-    block_size=8, state_mid=8, kv_page=2, rows_per_block=64,
-    block_table_width=64, cos_sin_rows=4096, rms_eps=1e-6,
-)
-
-
-
 def _emitting_positions(tokens, cfg, dev):
     """Positions that actually produce a record, and stay in bounds doing it.
 
@@ -972,8 +958,10 @@ def _emitting_positions(tokens, cfg, dev):
     assert valid, "no emitting position fits the block table"
     return torch.tensor(
         [valid[i % len(valid)] for i in range(tokens)],
-        dtype=torch.int64, device=dev,
+        dtype=torch.int64,
+        device=dev,
     )
+
 
 def _compressor_inputs(tokens, cfg, seed=0):
     from types import SimpleNamespace
@@ -986,8 +974,11 @@ def _compressor_inputs(tokens, cfg, seed=0):
         tokens, cfg["state_mid"], 2 * sw, dtype=torch.float32, device=dev
     )
     kv_backing = torch.zeros(
-        tokens, cfg["rows_per_block"], cfg["token_stride"],
-        dtype=torch.uint8, device=dev,
+        tokens,
+        cfg["rows_per_block"],
+        cfg["token_stride"],
+        dtype=torch.uint8,
+        device=dev,
     )
     kv_cache = kv_backing[:, : cfg["kv_page"], :]
 
@@ -1031,7 +1022,29 @@ def _compressor_inputs(tokens, cfg, seed=0):
 def test_compress_norm_rope_store_two_stage_matches_single_pass(tokens):
     """The split compressor must write exactly what the single-pass one does."""
     _skip_without_fp8()
-    cfg = _CR128
+    # DeepSeek-V4-Pro cr=128. The index pattern (positions, block_table,
+    # token_to_req_indices) is the benchmark's, which is known in-bounds; only
+    # the DATA is randomised, plus distinct slots so the tokens do not race for
+    # one record. Varying positions would need the compress gather's addressing
+    # pinned down first, and an out-of-bounds read here costs a GPU reset, so
+    # that is left alone.
+    cfg = {
+        "head_dim": 512,
+        "rope_dim": 64,
+        "quant_block": 64,
+        "token_stride": _REC,
+        "scale_dim": 8,
+        "state_width": 512,
+        "compress_ratio": 128,
+        "overlap": False,
+        "block_size": 8,
+        "state_mid": 8,
+        "kv_page": 2,
+        "rows_per_block": 64,
+        "block_table_width": 64,
+        "cos_sin_rows": 4096,
+        "rms_eps": 1e-6,
+    }
 
     backing_a, a = _compressor_inputs(tokens, cfg)
     fused_deepseek_v4_compress_norm_rope_store(**vars(a))
@@ -1058,8 +1071,13 @@ def test_compress_norm_rope_store_two_stage_matches_single_pass(tokens):
         torch.testing.assert_close(rb[i], ra[i], **_EXACT)
 
     # and something was actually written, so an all-zero pass cannot "agree"
-    assert ra[[divmod(s, cfg["kv_page"])[0] * cfg["rows_per_block"]
-               + divmod(s, cfg["kv_page"])[1] for s in live]].any()
+    assert ra[
+        [
+            divmod(s, cfg["kv_page"])[0] * cfg["rows_per_block"]
+            + divmod(s, cfg["kv_page"])[1]
+            for s in live
+        ]
+    ].any()
 
 
 @pytest.mark.parametrize("M, K", [(1, 3072), (40, 4096), (4100, 4096)])

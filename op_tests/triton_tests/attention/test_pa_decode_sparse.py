@@ -593,7 +593,7 @@ def v4_pack_unified(packed_2buff, rope, block_size):
 
     rec = torch.cat(
         [
-            u8[:, : _V4_DIM_QK],
+            u8[:, :_V4_DIM_QK],
             rope.reshape(p, _V4_DIM_ROPE)
             .view(torch.uint8)
             .reshape(p, 2 * _V4_DIM_ROPE),
@@ -633,12 +633,25 @@ def test_pa_decode_sparse_v4_unified_vs_2buff(T, H, kv_len, block_size):
     unified = v4_pack_unified(kv_packed, kv_rope, block_size)
 
     out_unified = pa_decode_sparse(
-        q_packed, unified, indices, indptr, sink, scale,
-        has_invalid=False, q_rope=q_rope,
+        q_packed,
+        unified,
+        indices,
+        indptr,
+        sink,
+        scale,
+        has_invalid=False,
+        q_rope=q_rope,
     )
     out_2buff = pa_decode_sparse(
-        q_packed, kv_packed, indices, indptr, sink, scale,
-        has_invalid=False, unified_kv_rope=kv_rope, q_rope=q_rope,
+        q_packed,
+        kv_packed,
+        indices,
+        indptr,
+        sink,
+        scale,
+        has_invalid=False,
+        unified_kv_rope=kv_rope,
+        q_rope=q_rope,
     )
     torch.testing.assert_close(out_unified, out_2buff, atol=0, rtol=0)
 
@@ -662,6 +675,8 @@ def test_pa_decode_sparse_v4_unified_vs_2buff(T, H, kv_len, block_size):
         )
         <= tol_err_ratio
     )
+
+
 @pytest.mark.parametrize("T", [1, 32])
 @pytest.mark.parametrize("H", [16])
 @pytest.mark.parametrize("D", [512])
@@ -824,8 +839,9 @@ def two_loop_reference(
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("strided_cache", [False, True])
 @pytest.mark.parametrize("page_size", [64, 256])
-def test_pa_decode_sparse_with_extra(T, H, D, main_len, extra_len, dtype,
-                                    strided_cache, page_size):
+def test_pa_decode_sparse_with_extra(
+    T, H, D, main_len, extra_len, dtype, strided_cache, page_size
+):
     """SWA (main) + top-k (extra) attended in one pass, on gfx950 and gfx1250.
 
     Both backends read the SAME cache -- ``[nb, block, 640]`` uint8, 448 B fp8
