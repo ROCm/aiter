@@ -1,56 +1,44 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""A/B benchmark: the FlyDSL gfx942 fp8 unified attention against Triton.
+"""A/B benchmark: FlyDSL gfx942 fp8 unified attention against Triton.
 
-Times the FlyDSL kernel directly, past the dispatch cede rule, against aiter's
-Triton ``unified_attention`` on Gemma-4's two layer shapes. It never invokes
-the production router or Triton fallback for the FlyDSL candidate. Triton reads
-this tree's tuned table, or any other ``DEFAULT.json`` given with
-``--triton-config`` (ROCm/aiter #5650's, say), so a run compares with one fixed
-bar.
+Times the FlyDSL kernel directly (past the dispatch cede rule; never the router
+or Triton fallback) against aiter's Triton ``unified_attention`` on Gemma-4's
+two layer shapes. Triton reads this tree's table, or a ``DEFAULT.json`` given
+with ``--triton-config`` (e.g. ROCm/aiter #5650's), so a run has one fixed bar.
 
-``--suite acceptance`` (the default) is the focused PR performance evidence:
-prefill at 1K/4K/16K/32K and decode at context 32K with batch 1/16/64/128,
-one prefix chunk (q256/context 16K), and two mixed prompt-or-prefix plus decode
-steps, using random and sink-like data. ``--suite stress`` retains the broad
-matrix; exhaustive correctness belongs to ``op_tests/test_unified_attention.py``.
-``--suite quick`` is a short random-data check. --isl, --prefix-query,
---prefix-ctx, --batch and --ctx replace a suite's lists. Physical pages default
-to the ticket's 32 and 64 for both layer shapes. K/V are views of one vLLM
-cache; softmax scale is 1.0. ``--block-size`` is an optional runtime-layout
-check and is not part of the ticket-page geomean.
+Suites: ``acceptance`` (default, the PR evidence) runs prefill at 1K-32K,
+decode at context 32K with batch 1/16/64/128, a q256 prefix chunk at 16K and
+two mixed prompt-or-chunk + decode steps, on random and sink-like data;
+``stress`` is a broad matrix; ``quick`` a short random-data check. --isl,
+--prefix-query, --prefix-ctx, --batch and --ctx replace a suite's lists.
+Physical pages default to 32 and 64; ``--block-size`` is an optional
+runtime-layout check outside the page geomean. K/V are views of one vLLM
+cache; softmax scale is 1.0.
 
-Timing: inputs rotate over a target 320 MiB of bytes actually attended, capped
-at 64 sets for tiny calls. Each candidate is captured once into a HIP graph of
-rotated calls; the candidates' replays then alternate, each sample at least
-2 ms, and each reports its median per-call time. Host launch overhead is
-excluded, as in vLLM's graph-captured decode.
+Timing: inputs rotate over ~320 MiB of attended bytes (at most 64 sets). Each
+candidate is captured once into a HIP graph; replays alternate, each sample at
+least 2 ms, and the median per-call time is reported, without host launch
+overhead (as in vLLM's graph-captured decode).
 
-Gates, per physical page: FlyDSL must agree with Triton within --tolerance in
-every cell (a NaN fails), and FlyDSL time / Triton time must be within
---margin. --enforce-bar exits nonzero when either gate fails. Triton is the
-large-case reference; run op_tests/test_unified_attention.py first for the
-independent fp32 oracle. This operator benchmark does not replace model E2E.
+Gates per page: FlyDSL agrees with Triton within --tolerance (NaN fails) and
+FlyDSL / Triton time is within --margin, in every cell; --enforce-bar exits
+nonzero on a miss. The independent fp32 oracle is
+op_tests/test_unified_attention.py; this does not replace model E2E.
 
-The report is markdown on stdout, so ``| tee report.md`` keeps it: a table per
-physical page, rows printed as they finish, then Gemma-4 step geomeans and gates.
-Every cell also goes to a CSV (-o, default under aiter_logs/).
+Output: markdown on stdout (a table per page, rows as they finish, then step
+geomeans and gates) and a CSV of every cell (-o, default under aiter_logs/).
 
-Usage -- run from the repo root, which has to be on ``sys.path`` for the
-``op_tests`` import below to resolve (``-m`` does that):
+Usage, from the repo root (``-m`` puts it on sys.path for ``op_tests``):
 
-    # The acceptance grid against #5650's table, failing on any FlyDSL miss
+    # Acceptance grid against #5650's table, failing on any FlyDSL miss
     python -m op_tests.op_benchmarks.flydsl.bench_unified_attention \\
         --triton-config pr5650/DEFAULT.json --enforce-bar | tee report.md
 
-    # Physical page 64 decode only, against this tree's table
+    # Page 64 decode only, against this tree's table
     python -m op_tests.op_benchmarks.flydsl.bench_unified_attention \\
         --page 64 --cases decode
-
-    # Gemma-4 at the ticket's physical pages (also the default)
-    python -m op_tests.op_benchmarks.flydsl.bench_unified_attention \\
-        --page 32 64
 """
 
 from __future__ import annotations
@@ -101,9 +89,9 @@ TARGET_SHAPES_BY_TP = {
 for _tp, _shapes in TARGET_SHAPES_BY_TP.items():
     assert SHAPES_BY_TP[_tp] == _shapes, "op test no longer matches Gemma-4-31B"
 
-# Per suite: prefill ISLs, prefix-chunk queries and contexts, decode batches
-# and contexts, mixed steps as (queries, context of the chunk or None for a
-# fresh prompt, decodes, their context), and the default data patterns.
+# Per suite: prefill ISLs; prefix-chunk queries and contexts; decode batches
+# and contexts; mixed steps as (queries, chunk context or None for a fresh
+# prompt, decodes, decode context); default data patterns.
 SUITES = {
     "acceptance": {
         "cases": ["prefill", "prefix", "decode", "mixed"],

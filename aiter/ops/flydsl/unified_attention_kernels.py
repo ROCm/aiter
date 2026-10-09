@@ -3,21 +3,19 @@
 
 """FlyDSL fp8 unified-attention backend for gfx942.
 
-Adapts ``kernels/flash_attn_fp8_gfx942.py`` to the ``unified_attention``
-calling convention, so a supported gfx942 fp8 paged call routes here instead
-of Triton. Dispatch is a pure predicate returning ``None`` when it can't serve
-the config, falling through to Triton unchanged.
+Adapts ``kernels/unified_attention_fp8_gfx942.py`` to ``unified_attention``'s calling
+convention. Dispatch returns ``None`` for configs it can't serve or cedes, and
+the caller falls through to Triton unchanged.
 
-Served: causal paged attention with head dim 256 or 512, a GQA group dividing
-16, full attention or a left-only sliding window, plain (unshuffled) FP8
-E4M3FNUZ K/V with page 32, 64 or 128, per-tensor fp32 descales, and bf16
-output. That covers both Gemma-4 layer types. One launch serves a whole varlen
-batch: multi-token sequences run as prefill tiles, one-token sequences as KV
-splits that a second launch combines. A batch of only one-token sequences runs
-a decode-only build of the same kernel, which writes the output itself when a
-sequence needs one split. A lone multi-token sequence has no
-decode combine; when its tiles cannot fill the GPU it splits their KV range,
-and a prefill combine merges the splits.
+Served: causal paged attention, head dim 256 or 512, GQA group dividing 16,
+full or left-only sliding window, plain (unshuffled) FP8 E4M3FNUZ K/V with
+page 32/64/128, per-tensor fp32 descales, bf16 output: both Gemma-4 layers.
+
+One launch serves a varlen batch: multi-token sequences run as prefill tiles,
+one-token sequences as KV splits merged by a combine launch. All-decode
+batches use a decode-only build, which writes the output itself at one split.
+A lone multi-token sequence that cannot fill the GPU splits its KV range,
+merged by a prefill combine.
 """
 
 from __future__ import annotations
@@ -27,9 +25,9 @@ from functools import cache, lru_cache
 
 import torch
 
-from .kernels.flash_attn_fp8_gfx942 import (
-    build_flash_attn_fp8_gfx942_combine_module,
-    build_flash_attn_fp8_gfx942_module,
+from .kernels.unified_attention_fp8_gfx942 import (
+    build_unified_attention_fp8_gfx942_combine_module,
+    build_unified_attention_fp8_gfx942_module,
     plan_num_kv_splits,
     plan_prefill_splits,
     prefill_block_k,
@@ -40,8 +38,8 @@ __all__ = ["flydsl_unified_attention"]
 
 _FP8_DTYPE = torch.float8_e4m3fnuz
 _HEAD_DIMS = (256, 512)
-# vLLM pages Gemma-4's head-512 layers at twice the block size of its head-256
-# layers (equal page bytes), so block size 64 gives them page 128.
+# vLLM pages Gemma-4's head-512 layers at twice the head-256 block size (equal
+# page bytes), so block size 64 gives them page 128.
 _PAGE_SIZES = (32, 64, 128)
 
 
@@ -74,8 +72,8 @@ def _window_keys(window_size):
 
 
 def _dispatch_mode_ok(causal, window_size, block_table, shuffled_kv_cache, skip_reduce):
-    """Causal and paged, plain KV layout, no right window. The reduce flag
-    belongs to a Triton layout this kernel does not write."""
+    """Causal, paged, plain KV layout, no right window; skip_reduce asks for a
+    Triton output layout this kernel does not write."""
     return (
         bool(causal)
         and _window_keys(window_size) is not False
@@ -112,7 +110,7 @@ def _descales_ok(q_descale, k_descale, v_descale) -> bool:
 
 
 def _devices_ok(q, *tensors) -> bool:
-    """All pointers consumed by the kernel must be CUDA tensors on Q's device."""
+    """Every kernel input is a CUDA tensor on Q's device."""
     return q.is_cuda and all(
         isinstance(t, torch.Tensor) and t.is_cuda and t.device == q.device
         for t in tensors
@@ -154,9 +152,8 @@ def _geometry_ok(
 
 
 def _strides_ok(q, k, v, out, block_table) -> bool:
-    """Contiguous Q and O. K and V may be strided views (vLLM splits one cache
-    tensor into them); the kernel is built for their page, token, and head
-    strides and needs a unit head-dim stride."""
+    """Contiguous Q and O. K and V may be strided views of one cache (vLLM)
+    with a unit head-dim stride; their other strides are compiled in."""
     return (
         q.is_contiguous()
         and out.is_contiguous()
@@ -261,27 +258,25 @@ def _cede_to_triton(
     """Keep measured FlyDSL loss regions on the tuned Triton implementation."""
     if max_seqlen_q == 1:
         if head_size == 512:
-            # Tiny decode is launch-latency bound, and page 64 has no
-            # measured margin past 256 sequences.
+            # Tiny decode is launch-latency bound; page 64 has no measured
+            # margin past 256 sequences.
             return num_seqs * max_seqlen_k <= 2048 or (
                 block_size == 64 and num_seqs > 256
             )
-        # Triton's page-32 sliding decode is as fast or faster past 38
-        # sequences.
+        # Triton's page-32 sliding decode is as fast or faster past 38 sequences.
         return window is not None and block_size == 32 and num_seqs > 38
     if num_seqs == 1:
-        # A lone sequence: a prefix chunk over a cached prefix of at least
-        # four tiles splits its KV range and wins. A short fresh prefill is
-        # latency bound, and Triton's lighter prologue wins through 256 tokens
-        # at head 512 and 384 at head 256 (page 32).
+        # A lone chunk over at least four cached tiles splits its KV range and
+        # wins. A short fresh prefill is latency bound: Triton's lighter
+        # prologue wins through 256 tokens at head 512, 384 at head 256.
         prefix = max_seqlen_k - max_seqlen_q
         if window is not None:
             prefix = min(prefix, window - 1)
         short = 384 if head_size == 256 else 256
         return max_seqlen_q <= short and prefix < 4 * prefill_block_k(head_size)
-    # Mixed batches cannot split a chunk's KV range, so a short chunk walks
-    # its prefix alone. Triton is as fast or faster through 128 queries at
-    # head 512, and at head 256 through 512 queries on page 32 and 256 above.
+    # A mixed batch cannot split a chunk's KV range, so a short chunk walks its
+    # prefix alone. Triton is as fast or faster through 128 queries at head
+    # 512, and at head 256 through 512 on page 32 and 256 on larger pages.
     if head_size == 512:
         return max_seqlen_q <= 128
     return max_seqlen_q <= (512 if block_size == 32 else 256)
@@ -293,9 +288,8 @@ def _as_i8(t: torch.Tensor) -> torch.Tensor:
 
 
 def _workspace(device, numel):
-    """fp32 split partials, allocated per call: a shared buffer replaced when a
-    later call needs more would leave graphs captured earlier holding a freed
-    pointer."""
+    """fp32 split partials, allocated per call: a shared buffer regrown later
+    would leave earlier captured graphs with a freed pointer."""
     return torch.empty(numel, device=device, dtype=torch.float32)
 
 
@@ -320,13 +314,13 @@ def _launch(
     num_kv_splits=None,
     num_prefill_splits=None,
 ):
-    """Launch for a call that passed _supported. window is the inclusive key
-    count or None; num_kv_splits forces the decode split count, and
-    num_prefill_splits the KV split count of a lone multi-token sequence."""
+    """Launch a call that passed _supported. window is the inclusive key count
+    or None; num_kv_splits and num_prefill_splits force the decode and the
+    lone-sequence KV split counts."""
     num_tokens, num_query_heads, head_size = q.shape
     decode_only = max_seqlen_q == 1
-    # A lone multi-token sequence (a prefill or a prefix chunk) has no decode
-    # slots, so it needs no decode combine; it may split its KV range instead.
+    # A lone multi-token sequence has no decode slots or decode combine, and
+    # may split its KV range instead.
     lone_prefill = not decode_only and num_seqs == 1
     # Triton's q-block count: an upper bound on any batch's prefill tiles.
     tile_slots = (
@@ -370,7 +364,7 @@ def _launch(
         partials = num_seqs * num_query_heads * groups * waves
     workspace = _workspace(q.device, max(4, partials * (head_size + 4)))
     with torch.cuda.device(q.device):
-        kernel = build_flash_attn_fp8_gfx942_module(
+        kernel = build_unified_attention_fp8_gfx942_module(
             head_size,
             num_query_heads,
             num_kv_heads,
@@ -403,12 +397,12 @@ def _launch(
             stream=stream,
         )
         if psplits > 1:
-            combine = build_flash_attn_fp8_gfx942_combine_module(
+            combine = build_unified_attention_fp8_gfx942_combine_module(
                 head_size, num_query_heads, prefill=True
             )
             combine(workspace, out, cu_seqlens_q, num_tokens, psplits, stream=stream)
         elif not lone_prefill and not direct:
-            combine = build_flash_attn_fp8_gfx942_combine_module(
+            combine = build_unified_attention_fp8_gfx942_combine_module(
                 head_size, num_query_heads
             )
             combine(
@@ -434,11 +428,6 @@ def flydsl_unified_attention(
     q_descale,
     k_descale,
     v_descale,
-    *,
-    num_kv_heads,
-    block_size,
-    num_queries_per_kv,
-    num_seqs,
     q_scales=None,
     alibi_slopes=None,
     output_scale=None,
@@ -449,14 +438,19 @@ def flydsl_unified_attention(
 ):
     """Run unified attention on the FlyDSL fp8 gfx942 kernel.
 
-    The positional parameters mirror ``unified_attention`` exactly;
-    max_seqlen_q and max_seqlen_k are host integers that must bound every
-    sequence. The keyword-only block is quantities the caller has already
-    derived.
-
-    Returns ``out`` (written in place) if this configuration is supported, or
-    ``None`` so the caller falls through to Triton.
+    Parameters mirror ``unified_attention``; max_seqlen_q and max_seqlen_k are
+    host integers bounding every sequence. Returns ``out`` (written in place),
+    or ``None`` to fall through to Triton.
     """
+    # Only the plain [blocks, page, kv_heads, head_dim] cache is served.
+    if shuffled_kv_cache or q.dim() != 3 or k.dim() != 4:
+        return None
+    _, block_size, num_kv_heads, _ = k.shape
+    num_query_heads = q.shape[1]
+    if num_kv_heads <= 0 or num_query_heads % num_kv_heads:
+        return None
+    num_queries_per_kv = num_query_heads // num_kv_heads
+    num_seqs = len(seqused_k)
     if not _supported(
         q,
         k,

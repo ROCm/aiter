@@ -5,16 +5,14 @@
 
 """AOT pre-compilation for the gfx942 FlyDSL fp8 unified-attention kernels.
 
-Unified attention has no tuning CSV. Its builder is keyed by the layer shape,
-the page size, the K/V strides, and whether the batch is decode-only, so the
-set a model can reach is finite: per shape in ``DEFAULT_SHAPES``, every page
-size the adapter serves times two K/V layouts (separate contiguous caches, and
-vLLM's views of one ``[blocks, kv_heads, page, 2 * head_dim]`` cache) times
-the unified and decode-only builds, plus two combine kernels per (head dim,
-query heads): one merges decode splits, the other a lone prefix chunk's KV
-splits. Each job takes its launcher from the builders the adapter calls,
-with the same arguments, and invokes it under ``FakeTensorMode`` +
-``COMPILE_ONLY=1`` on fake tensors whose dtypes, ranks, and strides match the
+No tuning CSV: the builder is keyed by layer shape, page size, K/V strides and
+decode-only, so the reachable set is finite. Per shape in ``DEFAULT_SHAPES``:
+every served page size x two K/V layouts (separate contiguous caches; vLLM's
+views of one ``[blocks, kv_heads, page, 2 * head_dim]`` cache) x the unified
+and decode-only builds, plus two combine kernels per (head dim, query heads),
+for decode splits and for a lone chunk's KV splits. Each job calls the
+adapter's builders with its arguments under ``FakeTensorMode`` +
+``COMPILE_ONLY=1``, on fake tensors whose dtypes, ranks and strides match the
 runtime call.
 
 Usage:
@@ -35,8 +33,8 @@ from aiter.aot.flydsl.common import (
 )
 
 AOT_ARCH = "gfx942"
-# Layer shapes to pre-compile, per model: (num_heads, num_kv_heads, head_dim,
-# sliding window in keys or None), with the head counts per rank.
+# Layer shapes per model: (num_heads, num_kv_heads, head_dim, window keys or
+# None), heads per rank.
 DEFAULT_SHAPES = {
     "gemma4_31b_tp1": [(32, 4, 512, None), (32, 16, 256, 1024)],
     "gemma4_31b_tp4": [(8, 1, 512, None), (8, 4, 256, 1024)],
@@ -44,8 +42,7 @@ DEFAULT_SHAPES = {
 LAYOUTS = ("plain", "vllm")
 # The adapter builds decode-only batches (max_seqlen_q == 1) separately.
 MODES = ("unified", "decode")
-# Fake geometry: sizes never reach the compile key, only dtypes, ranks, and
-# strides do.
+# Fake geometry: only dtypes, ranks and strides reach the compile key.
 _FAKE_SEQS = 4
 _FAKE_TOKENS = 16
 _FAKE_BLOCKS = 8
@@ -126,12 +123,12 @@ def _compile_attention(
 ):
     import torch
 
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
-        build_flash_attn_fp8_gfx942_module,
+    from aiter.ops.flydsl.kernels.unified_attention_fp8_gfx942 import (
+        build_unified_attention_fp8_gfx942_module,
     )
 
     k, v = _fake_kv(layout, page_size, num_kv_heads, head_dim)
-    launch = build_flash_attn_fp8_gfx942_module(
+    launch = build_unified_attention_fp8_gfx942_module(
         head_dim,
         num_heads,
         num_kv_heads,
@@ -172,11 +169,11 @@ def _compile_attention(
 def _compile_combine(num_heads, head_dim, prefill):
     import torch
 
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
-        build_flash_attn_fp8_gfx942_combine_module,
+    from aiter.ops.flydsl.kernels.unified_attention_fp8_gfx942 import (
+        build_unified_attention_fp8_gfx942_combine_module,
     )
 
-    combine = build_flash_attn_fp8_gfx942_combine_module(
+    combine = build_unified_attention_fp8_gfx942_combine_module(
         head_dim, num_heads, prefill=prefill
     )
     combine(

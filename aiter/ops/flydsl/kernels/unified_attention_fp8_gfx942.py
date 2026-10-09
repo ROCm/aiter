@@ -3,29 +3,27 @@
 
 """Gfx942 FP8 paged unified attention, one varlen launch per call.
 
-Covers Gemma-4's layer shapes: head 512 with GQA 8:1 and no window, and head
-256 with GQA 2:1 and a sliding window. Q/K/V are FP8 E4M3FNUZ with per-tensor
-FP32 descales; the output is BF16. K and V are paged with page 32, 64 or 128
-and may be strided views (vLLM hands K and V as views of one cache tensor).
+Shapes: Gemma-4's head 512 (GQA 8:1, full) and head 256 (GQA 2:1, sliding
+window). FP8 E4M3FNUZ Q/K/V with per-tensor FP32 descales, BF16 output.
+Pages of 32, 64 or 128 tokens; K/V may be strided views of one cache (vLLM).
 
-Grid y has two regions. Tile slots follow Triton's q-block mapping (sequence
-s owns slots from cu_q[s] // tokens + s, found by binary search, heaviest
-first); each runs the prefill body over 64 // GQA query tokens of a
-multi-token sequence with four waves, so prefix-cached chunks are prefill
-tiles with q_len < k_len. A tile's page ids are looked up a tile ahead of its
-K/V loads. A lone multi-token sequence may split each tile's KV range over
-psplits adjacent slots, which write fp32 partials for a prefill combine.
-Decode slots give each wave one split of a one-token sequence, running a
-32-key decode body entirely in registers: K loads straight into MFMA
-operands, and V is byte-transposed in place, so decode waves need no LDS and
-no barriers. A combine launch merges the splits; a decode-only launch with one
-split writes the output itself.
+Grid y has two regions:
+- Tile slots use Triton's q-block map (sequence s owns slots from
+  cu_q[s] // tokens + s; binary search, heaviest first). Four waves run the
+  prefill body on 64 // GQA query tokens; a prefix chunk is a tile with
+  q_len < k_len. Pages are looked up a tile ahead. A lone multi-token
+  sequence may split each tile's KV range over psplits adjacent slots that
+  write fp32 partials for a prefill combine.
+- Decode slots: each wave runs one split of a one-token sequence, 32 keys per
+  step, in registers only (K loads into MFMA operands, V byte-transposes in
+  place): no LDS, no barriers. A combine launch merges the splits; a
+  one-split decode-only launch writes the output itself.
 
-Both GEMMs use mfma_f32_16x16x32_fp8_fp8 in transposed form (S^T = K Q^T,
+Both GEMMs use mfma_f32_16x16x32_fp8_fp8 transposed (S^T = K Q^T,
 O^T += V^T P^T), so P needs no cross-lane moves. P is scaled by 240 before
-FNUZ packing and the epilogue undoes it. Prefill LDS reads and V-transpose
-shuffles are issued in groups of eight behind sched_barriers: without them
-the compiler waits out each one before its consumer.
+FNUZ packing; the epilogue undoes it. Prefill LDS reads and V-transpose
+shuffles issue in groups of eight behind sched_barriers, else the compiler
+waits out each one before its consumer.
 """
 
 from functools import lru_cache
@@ -96,8 +94,8 @@ def _k_offset(key, d, dim):
 
 
 def _vt_offset(depth, key4, keys):
-    # V^T in 32-depth x `keys`-key chunks, one dword per (depth, 4 keys). The
-    # XOR terms keep the transpose stores and the PV reads at 2-way banks.
+    # V^T in 32-depth x `keys`-key chunks, one dword per (depth, 4 keys); the
+    # XOR keeps transpose stores and PV reads at 2-way bank conflicts.
     bank = (depth % 32) ^ ((depth // 32) % 8 * 4) ^ (key4 % 4 * 8)
     return (depth // 32) * (32 * keys) + key4 * 128 + bank * 4
 
@@ -127,11 +125,12 @@ def plan_num_kv_splits(
     decode_only=False,
     num_cus=304,
 ):
-    """Decode split count, fitted to MI325X sweeps (batch 1-256, context
-    0.5K-32K): about 128K / head_dim split waves in all, and at least
-    head_dim / 128 tiles per split, since each split's partial costs a
-    query group's worth of head_dim floats. Below 128 waves the GPU is nearly
-    idle, and half that many tiles per split is faster."""
+    """Decode split count, fitted on MI325X (batch 1-256, 0.5K-32K keys).
+
+    Aims for about 128K / head_dim split waves in total and at least
+    head_dim / 128 tiles per split (each partial costs head_dim floats per
+    query head); under 128 waves, half as many tiles per split.
+    """
     keys = max_seqlen_k if window is None else min(max_seqlen_k, window)
     tiles = max(1, (keys + NK - 1) // NK)
     units = num_seqs * num_kv_heads
@@ -139,10 +138,10 @@ def plan_num_kv_splits(
     splits = min(want, tiles * 128 // head_dim)
     if splits * units < 128:
         splits = min(want, tiles * 256 // head_dim)
-    # Head-512 decode slows when its waves spill just past a whole number of
-    # rounds over the CUs. For 64-511 sequence-heads at 4K+ keys, take the
-    # count with one to four waves per CU whose waves fill their rounds best,
-    # the fewer splits on a tie; mixed batches keep the conservative model.
+    # Head-512 decode slows when its waves just overflow a whole number of CU
+    # rounds. For 64-511 sequence-heads at 4K+ keys, pick the count (1-4 waves
+    # per CU) that fills its rounds best, fewer splits on ties. Mixed batches
+    # keep the base model.
     if (
         decode_only
         and window is None
@@ -172,8 +171,8 @@ def prefill_block_k(head_dim):
     return 64 if head_dim == 256 else 32
 
 
-# Prefill splits keep at least this many cached-prefix tiles each, and their
-# fp32 partials stay under this many bytes.
+# Each prefill split keeps at least this many prefix tiles; all splits' fp32
+# partials stay under this many bytes.
 PREFILL_SPLIT_MIN_TILES = 2
 PREFILL_SPLIT_MAX_BYTES = 64 << 20
 
@@ -188,14 +187,13 @@ def plan_prefill_splits(
     head_dim,
     num_cus,
 ):
-    """KV splits for a lone multi-token sequence: a prefill or a prefix chunk,
-    whose max_seqlen_q and max_seqlen_k are then its own lengths.
+    """KV splits for a lone multi-token sequence (prefill or prefix chunk), so
+    max_seqlen_q/k are its own lengths.
 
-    A short chunk over a long cached prefix has too few query tiles to fill
-    the GPU, so each tile walks the prefix alone. Fitted on MI325X (page 64,
-    chunks of 16-1024 queries over 1K-16K keys): about one workgroup per CU
-    is best, with at least two prefix tiles per split. A fresh prefill never
-    gains, since its causal ramp already spreads the keys over its tiles.
+    A short chunk over a long prefix has too few query tiles to fill the GPU.
+    Fitted on MI325X (page 64, 16-1024 queries over 1K-16K keys): about one
+    workgroup per CU, at least two prefix tiles per split. A fresh prefill
+    never gains: its causal ramp already spreads keys over its tiles.
     """
     tiles = -(-max_seqlen_q // prefill_block_q(num_q_heads, num_kv_heads))
     prefix = max_seqlen_k - max_seqlen_q
@@ -210,7 +208,7 @@ def plan_prefill_splits(
 
 
 @lru_cache(maxsize=32)
-def build_flash_attn_fp8_gfx942_module(
+def build_unified_attention_fp8_gfx942_module(
     dim,
     num_q_heads,
     num_kv_heads,
@@ -220,18 +218,18 @@ def build_flash_attn_fp8_gfx942_module(
     prefill_keys=None,
     decode_only=False,
 ):
-    """Return the attention launcher for one layer shape and KV layout.
+    """Attention launcher for one layer shape and KV layout.
 
-    dim is 256 or 512, the GQA ratio must divide 16, and window is None or the
-    inclusive key count. kv_strides holds K's then V's (page, token, head)
-    element strides. They are compiled in: runtime strides made head-512
-    decode up to 45% slower, and a cache layout fixes them, so each layout
-    compiles once. Prefill tiles are 64 keys at head 256 and 32 at head 512; LDS
-    holds one tile of K and V^T, 2 * keys * dim bytes. Decode uses no LDS.
+    dim is 256 or 512; the GQA ratio must divide 16; window is None or the
+    inclusive key count. kv_strides are K's then V's (page, token, head)
+    element strides, compiled in: runtime strides made head-512 decode up to
+    45% slower, and a cache layout fixes them. Prefill tiles hold 64 keys at
+    head 256 and 32 at head 512; LDS holds one tile of K and V^T
+    (2 * keys * dim bytes). Decode uses no LDS.
 
-    decode_only builds the decode role alone, one wave per workgroup, for
-    batches whose sequences all have one query token: a small batch then
-    spreads over four times as many CUs. Such a launch has no tile slots.
+    decode_only builds only the decode role, one wave per workgroup and no
+    tile slots, for all-decode batches: a small batch then spreads over four
+    times as many CUs.
     """
     if dim not in (256, 512) or page_size not in (32, 64, 128):
         raise ValueError("dim must be 256 or 512 and page size 32, 64 or 128")
@@ -335,8 +333,8 @@ def build_flash_attn_fp8_gfx942_module(
         if const_expr(not decode_only):  # noqa: SIM102 - constexpr guard
             if y < tile_slots * psplits:
                 # ---- prefill role ----
-                # Scalar loads: these sit on every tile's critical path, and a
-                # vector load would wait out the whole vmcnt queue.
+                # Scalar loads: they are on every tile's critical path, and a
+                # vector load would wait out the vmcnt queue.
                 cuq = buffer_ops.create_buffer_resource(CuQ, max_size=True)
                 usedk = buffer_ops.create_buffer_resource(UsedK, max_size=True)
                 # Heaviest tiles first; the KV splits of a tile are adjacent.
@@ -385,10 +383,10 @@ def build_flash_attn_fp8_gfx942_module(
                         return (block < pend).select(block, pend - 1)
 
                     def p_pages(block):
-                        """Block-table entries of the pages a valid tile spans,
-                        clamped to the sequence's last page. Uniform vector
-                        loads: they queue behind the K/V loads in flight, so
-                        waiting for those never waits for these."""
+                        """Block-table entries of a tile's pages, clamped to the
+                        last page. Uniform vector loads queue behind the K/V
+                        loads in flight, so waiting on those never waits on
+                        these."""
                         first = block * pn // page_size
                         return [
                             _load(
@@ -549,8 +547,8 @@ def build_flash_attn_fp8_gfx942_module(
                         p_commit(state[2 + dblocks : 2 + dblocks + nchunks])
                         gpu.barrier()
                         # The next tile's loads stay in flight through this tile's
-                        # MFMAs. Its pages were looked up a tile earlier, so the
-                        # loads issue without waiting on the block table.
+                        # MFMAs; its pages were looked up a tile earlier, so they
+                        # issue without waiting on the block table.
                         p_ahead = p_fetch_guarded(
                             block + psplits, list(state[2 + dblocks + nchunks :])
                         )
@@ -741,14 +739,13 @@ def build_flash_attn_fp8_gfx942_module(
                     return (block < dend).select(block, dlast)
 
                 def d_page(block):
-                    # NK divides the page, so one wave-uniform lookup serves a
-                    # tile. A scalar load: a vector one would join the in-order
-                    # vmcnt queue behind the K/V loads.
+                    # NK divides the page, so one uniform lookup serves a tile.
+                    # Scalar: a vector load would queue behind the K/V loads.
                     return fx.Int32(fx.memref_load(BT, (dseq, block * NK // page_size)))
 
-                # Decode-only launches load K and V non-temporal: each key is read
-                # once, and the hint lifts decode bandwidth. In a unified launch
-                # the hint measured slower beside the prefill tiles.
+                # Decode-only launches load K and V non-temporal (each key is
+                # read once); in a unified launch the hint measured slower
+                # beside the prefill tiles.
                 def d_load_k(block, page):
                     # Lane (c, g) holds keys c and 16 + c.
                     base = fx.Int64(page) * k_strides[0] + fx.Int64(kvh) * k_strides[2]
@@ -881,11 +878,11 @@ def build_flash_attn_fp8_gfx942_module(
                                 )
                     return d_m, l_old * d_corr + d_psum, o_new
 
-                # Each buffer is refilled for the next tile as soon as this tile
-                # is done with it: K after QK, V after PV. So the loop carries no
-                # register copies, which would wait out the in-flight loads, and
-                # at most one tile's loads are outstanding (vmcnt holds 63). The
-                # page lookup runs a tile ahead of the loads.
+                # Each buffer is refilled for the next tile once this tile is
+                # done with it (K after QK, V after PV): the loop carries no
+                # register copies, which would wait out in-flight loads, and at
+                # most one tile's loads are outstanding (vmcnt holds 63). Pages
+                # are looked up a tile ahead.
                 d_b0 = d_clamp(dstart)
                 d_p0 = d_page(d_b0)
                 d_p1 = d_page(d_clamp(dstart + splits))
@@ -1036,16 +1033,14 @@ def build_flash_attn_fp8_gfx942_module(
 
 
 @lru_cache(maxsize=8)
-def build_flash_attn_fp8_gfx942_combine_module(dim, num_q_heads, prefill=False):
-    """Return the launcher that merges split partials.
+def build_unified_attention_fp8_gfx942_combine_module(dim, num_q_heads, prefill=False):
+    """Launcher that merges split partials.
 
-    Part holds dim floats (scaled by V's descale), then m and l, per (row,
-    head, split), padded to dim + 4 floats. By default grid y is the sequence
-    and a row is a one-token sequence; multi-token sequences are skipped.
-    prefill merges the KV splits of a lone multi-token sequence instead: grid y
-    is the query token, and tokens past the sequence are skipped. Splits merge
-    eight at a time, all eight loaded before any is merged: the merge is cheap
-    and the load latency is not.
+    Part holds, per (row, head, split), dim floats scaled by V's descale, then
+    m and l, padded to dim + 4. By default grid y is a sequence; only
+    one-token sequences are merged. With prefill, grid y is a query token of a
+    lone multi-token sequence (tokens past it are skipped). Splits merge eight
+    at a time, all eight loaded first: load latency, not the merge, dominates.
     """
     stride = dim + 4
     vecs = dim // 256

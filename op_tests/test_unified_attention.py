@@ -512,15 +512,15 @@ def test_routing_backend_gate(config):
 
 
 def test_cede_policy():
-    from aiter.ops.flydsl.kernels.flash_attn_fp8_gfx942 import (
+    from aiter.ops.flydsl.kernels.unified_attention_fp8_gfx942 import (
         plan_num_kv_splits,
         plan_prefill_splits,
     )
     from aiter.ops.flydsl.unified_attention_kernels import _cede_to_triton
 
     # Lone sequences: short fresh prefills cede (through 256 tokens at head
-    # 512, 384 at head 256); longer ones, and prefix chunks over at least four
-    # tiles of cached prefix, are served.
+    # 512, 384 at head 256); longer ones and chunks over 4+ cached tiles are
+    # served.
     assert _cede_to_triton(512, 256, 1, 256, 64, None)
     assert _cede_to_triton(256, 32, 1, 32, 32, 1024)
     assert _cede_to_triton(256, 200, 1, 300, 64, 1024)
