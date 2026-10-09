@@ -71,7 +71,7 @@ echo "ENABLE_CK=$ENABLE_CK"
 echo "AITER_FORCE_GFX1250=$AITER_FORCE_GFX1250"
 echo ""
 
-echo "=== Running 9 ubench suites ==="
+echo "=== Running 10 ubench suites ==="
 echo ""
 
 echo "# DSV4-Pro kernel ubench summary — run $RUN_NUMBER" > $SUMMARY
@@ -81,7 +81,7 @@ echo "# Date: $(date)" >> $SUMMARY
 echo "" >> $SUMMARY
 
 # 1. MoE prefill/decode (flydsl, a8w4) — single GPU
-echo "=== [1/9] MoE prefill/decode (flydsl, a8w4) ==="
+echo "=== [1/10] MoE prefill/decode (flydsl, a8w4) ==="
 HIP_VISIBLE_DEVICES=0 \
 AITER_MOE_EXPERT_BALANCE=true \
 AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1 \
@@ -95,53 +95,53 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1 \
     --inter-dim 3072 \
     --tokens 1 16 64 256 1024 4096 16384 \
   2>&1 | tee $LOGDIR/01_moe_flydsl_a8w4.log || true
-echo "[1/9] exit=$?" >> $SUMMARY
+echo "[1/10] exit=$?" >> $SUMMARY
 echo ""
 
 # 2. MoE decode (Gluon, a4w4) — single GPU
-echo "=== [2/9] MoE decode (Gluon, a4w4) ==="
+echo "=== [2/10] MoE decode (Gluon, a4w4) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/op_benchmarks/triton/bench_moe_gemm_a4w4_cudagraph.py \
     --backend gluon \
     --shape 2880 5760 \
     --experts 128 4 \
   2>&1 | tee $LOGDIR/02_moe_gluon_a4w4.log || true
-echo "[2/9] exit=$?" >> $SUMMARY
+echo "[2/10] exit=$?" >> $SUMMARY
 echo ""
 
 # 3. MLA-v4 sparse prefill (asm, fp8) — single GPU
-echo "=== [3/9] MLA-v4 sparse prefill (asm, fp8) ==="
+echo "=== [3/10] MLA-v4 sparse prefill (asm, fp8) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/test_pa_sparse_prefill.py \
     --prec fp8 \
     --backend asm \
     --h_q 128 \
   2>&1 | tee $LOGDIR/03_mla_v4_sparse_prefill_asm.log || true
-echo "[3/9] exit=$?" >> $SUMMARY
+echo "[3/10] exit=$?" >> $SUMMARY
 echo ""
 
 # 4. MLA-v3 decode (asm, fp8) — single GPU
-echo "=== [4/9] MLA-v3 decode (asm, fp8) ==="
+echo "=== [4/10] MLA-v3 decode (asm, fp8) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/test_mla_decode_pagesize64.py \
     -n 128,1 \
     -b 1 16 64 512 \
     -c 1024 8192 \
   2>&1 | tee $LOGDIR/04_mla_v3_decode_asm.log || true
-echo "[4/9] exit=$?" >> $SUMMARY
+echo "[4/10] exit=$?" >> $SUMMARY
 echo ""
 
 # 5. MLA-v4 decode (Gluon, bf16) — single GPU
-echo "=== [5/9] MLA-v4 decode (Gluon, bf16) ==="
+echo "=== [5/10] MLA-v4 decode (Gluon, bf16) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/bench_gfx1250_combo.py \
     --dsv4 --ops mla_v4_decode \
   2>&1 | tee $LOGDIR/05_mla_v4_decode_gluon.log || true
-echo "[5/9] exit=$?" >> $SUMMARY
+echo "[5/10] exit=$?" >> $SUMMARY
 echo ""
 
 # 6. MQA indexer (Gluon, bf16) — single GPU
-echo "=== [6/9] MQA indexer (Gluon, bf16) ==="
+echo "=== [6/10] MQA indexer (Gluon, bf16) ==="
 for kv in 384 4608 10240; do
   echo "--- kv_length=$kv ---"
   HIP_VISIBLE_DEVICES=0 \
@@ -154,20 +154,20 @@ for kv in 384 4608 10240; do
       --kv_preshuffle \
       --blocksize 64 || true
 done 2>&1 | tee $LOGDIR/06_mqa_indexer_gluon.log
-echo "[6/9] done" >> $SUMMARY
+echo "[6/10] done" >> $SUMMARY
 echo ""
 
 # 7. HCA compressed attention (flydsl, bf16) — single GPU
-echo "=== [7/9] HCA compressed attention (flydsl, bf16) ==="
+echo "=== [7/10] HCA compressed attention (flydsl, bf16) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/test_flydsl_compress_attn.py \
     -s hca_main \
   2>&1 | tee $LOGDIR/07_hca_flydsl.log || true
-echo "[7/9] exit=$?" >> $SUMMARY
+echo "[7/10] exit=$?" >> $SUMMARY
 echo ""
 
 # 8. BMM bf16 (Gluon) — single GPU
-echo "=== [8/9] BMM bf16 (Gluon) ==="
+echo "=== [8/10] BMM bf16 (Gluon) ==="
 for b in 4 8 16; do
   for m in 1 16 64 256 1024 4096 16384; do
     HIP_VISIBLE_DEVICES=0 \
@@ -176,11 +176,35 @@ for b in 4 8 16; do
         --metric time || true
   done
 done 2>&1 | tee $LOGDIR/08_bmm_gluon.log
-echo "[8/9] done" >> $SUMMARY
+echo "[8/10] done" >> $SUMMARY
 echo ""
 
-# 9. EP dispatch/combine (hip, 4 GPUs) — requires mori + torchrun
-echo "=== [9/9] EP dispatch/combine (hip, 4 GPUs) ==="
+# 9. BMM a8w8 (flydsl, fp8 x fp8) — single GPU
+echo "=== [9/10] BMM a8w8 (flydsl, fp8 x fp8) ==="
+(
+  failed=0
+  for b in 4 8 16; do
+    for m in 1 16 64 256 1024 4096 16384; do
+      HIP_VISIBLE_DEVICES=0 \
+        python op_tests/test_flydsl_batched_gemm.py \
+          -b $b \
+          -s $m,1024,4096 \
+          -d bf16 \
+          -l mbn
+      case_exit=$?
+      if [ "$case_exit" -ne 0 ]; then
+        echo "FAIL B=$b M=$m exit=$case_exit"
+        failed=1
+      fi
+    done
+  done
+  exit "$failed"
+) 2>&1 | tee $LOGDIR/09_bmm_flydsl_a8w8.log
+echo "[9/10] exit=${PIPESTATUS[0]}" >> $SUMMARY
+echo ""
+
+# 10. EP dispatch/combine (hip, 4 GPUs) — requires mori + torchrun
+echo "=== [10/10] EP dispatch/combine (hip, 4 GPUs) ==="
 if [ -d "$MORI_DIR" ]; then
   cd $MORI_DIR
   MORI_SOCKET_IFNAME=lo \
@@ -200,12 +224,12 @@ if [ -d "$MORI_DIR" ]; then
   DISP=fp4 \
     torchrun --standalone --nproc_per_node=$NUM_GPUS \
       tests/python/ops/dispatch_combine_v2/bench_ep.py \
-    2>&1 | tee $LOGDIR/09_ep_dispatch_combine.log || true
-  echo "[9/9] exit=$?" >> $SUMMARY
+    2>&1 | tee $LOGDIR/10_ep_dispatch_combine.log || true
+  echo "[10/10] exit=$?" >> $SUMMARY
   cd $AITER_DIR
 else
   echo "SKIP: $MORI_DIR not found"
-  echo "[9/9] SKIP" >> $SUMMARY
+  echo "[10/10] SKIP" >> $SUMMARY
 fi
 echo ""
 
