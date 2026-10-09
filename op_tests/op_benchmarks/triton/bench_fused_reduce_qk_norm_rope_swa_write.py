@@ -14,6 +14,7 @@ import triton
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
+from aiter.ops.triton.utils.types import str_to_torch_dtype
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -21,11 +22,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
 from op_tests.triton_tests.fusions.test_fused_reduce_qk_norm_rope_swa_write import (
     _build_cos_sin,
 )
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-}
 
 
 def get_benchmark_shapes(args):
@@ -46,7 +42,10 @@ def get_benchmark_shapes(args):
 
 
 def _positive_int(value):
-    n = int(value)
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"must be an integer, got {value}")
     if n < 1:
         raise argparse.ArgumentTypeError(f"must be >= 1, got {n}")
     return n
@@ -56,11 +55,12 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
     head_dim = 512
     rope_dim = 64
     win = 128
-    max_seq = 32768  # >= the largest M (16384), so every token gets its own position
-    dtype = arg_to_torch_dtype[args.dtype]
+    max_seq = max(32768, M)  # Ensure every requested token has a valid position.
+    dtype = str_to_torch_dtype[args.dtype]
     device = torch.device("cuda")
     N = heads * head_dim
     q_shape = (M, N) if splitk == 1 else (splitk, M, N)
+    torch.manual_seed(0)
     q = torch.randn(q_shape, dtype=dtype, device=device)
     kv = torch.randn(M, head_dim, dtype=dtype, device=device)
     q_out = torch.empty(M, heads, head_dim, dtype=dtype, device=device)
@@ -97,7 +97,7 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
 
     ms = triton.testing.do_bench(fn, warmup=args.warmup, rep=args.rep)
     if metric == "time":
-        return ms * 1000  # us
+        return ms
 
     # q_in read + q_out write + kv read/write (+ SWA row write); cos/sin are tiny.
     elem = torch.tensor([], dtype=dtype).element_size()
@@ -110,15 +110,15 @@ def bench_fused_reduce_qk_norm_rope_swa_write_fn(M, heads, splitk, metric, args)
 
 
 def run_benchmark(args):
-    metrics = ("time", "bandwidth") if args.metric == "all" else (args.metric,)
+    units = {"time": "ms", "bandwidth": "GB/s"}
     benchmark = triton.testing.Benchmark(
         x_names=["M", "heads", "splitk"],
         x_vals=get_benchmark_shapes(args),
         line_arg="metric",
-        line_vals=list(metrics),
-        line_names=[f"{m} ({'us' if m == 'time' else 'GB/s'})" for m in metrics],
-        styles=[("red", "-"), ("blue", "-")][: len(metrics)],
-        ylabel="",
+        line_vals=[args.metric],
+        line_names=[args.metric],
+        styles=[("red", "-")],
+        ylabel=units[args.metric],
         plot_name=get_caller_name_no_ext() + f"_{args.dtype}",
         args={},
     )
@@ -129,10 +129,12 @@ def run_benchmark(args):
             M, heads, splitk, metric, args
         )
 
-    bench_fn.run(save_path="." if args.o else None, print_data=True)
+    df = bench_fn.run(print_data=True, return_df=True)[0]
+    if args.o:
+        df.to_csv(f"{benchmark.plot_name}.csv", index=False)
 
 
-def parse_args():
+def parse_args(args: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="Benchmark fused_reduce_qk_norm_rope_swa_write",
         description="Benchmark the Triton fused split-K reduce + Q/KV RMSNorm + RoPE "
@@ -179,15 +181,15 @@ def parse_args():
         "--dtype",
         type=str,
         default="bf16",
-        choices=list(arg_to_torch_dtype),
+        choices=["bf16", "fp16"],
         help="Input/output dtype (default: bf16)",
     )
     parser.add_argument(
         "--metric",
         type=str,
-        default="all",
-        choices=["all", "time", "bandwidth"],
-        help="Metric to report (default: all)",
+        default="time",
+        choices=["time", "bandwidth"],
+        help="Metric to report (default: time)",
     )
     parser.add_argument(
         "--warmup", type=int, default=25, help="do_bench warmup budget in ms"
@@ -205,20 +207,20 @@ def parse_args():
         "-o",
         action="store_true",
         default=False,
-        help="Write CSV/PNG/HTML results to the current directory",
+        help="Write performance results to CSV file",
     )
-    return parser.parse_args()
+    return parser.parse_args(args=args)
 
 
-def main():
-    args = parse_args()
-    if args.print_vgpr:
+def main(args: list[str] | None = None) -> None:
+    parsed_args = parse_args(args=args)
+    if parsed_args.print_vgpr:
         print(
             "Retrieving VGPR usage for fused_reduce_qk_norm_rope_swa_write kernels..."
         )
-        print_vgpr(lambda: run_benchmark(args), get_caller_name_no_ext())
+        print_vgpr(lambda: run_benchmark(parsed_args), get_caller_name_no_ext())
         return
-    run_benchmark(args)
+    run_benchmark(parsed_args)
 
 
 if __name__ == "__main__":
