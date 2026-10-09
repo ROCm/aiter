@@ -17,17 +17,3 @@ def chiplet_transform(pid, num_workgroups, num_xcds: ttgl.constexpr):
     extra_sms = num_workgroups % num_xcds
     offset = xcd * min_per_xcd + min(xcd, extra_sms)
     return offset + pos_in_xcd
-
-
-def pack_scale(x):
-    if x is None:
-        return x
-    NON_K, K_SCALE = x.shape
-    preshuffle_factor = 128
-    num_chunk_m = NON_K // preshuffle_factor
-    SCALE_KWIDTH = min(4, K_SCALE)
-    num_chunk_k = K_SCALE // SCALE_KWIDTH
-
-    x = x.view(num_chunk_m, 4, preshuffle_factor // 4, num_chunk_k, SCALE_KWIDTH)
-    x = x.permute(0, 3, 2, 1, 4).contiguous()
-    return x.view(NON_K // preshuffle_factor, K_SCALE * preshuffle_factor)

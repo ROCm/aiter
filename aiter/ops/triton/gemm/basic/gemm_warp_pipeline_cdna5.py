@@ -3,7 +3,7 @@
 
 Requires upstream Triton with CDNA5 warp-pipeline support. Preparation accepts
 canonical scales, or old Gluon/FlyDSL scale buffers with
-``a_scales_transposed=True``. Set ``scale_layout="b64"`` for packed-word loads.
+``a_scales_transposed=True``. Output uses two padded strip buffers.
 """
 
 from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.warp_pipeline import (

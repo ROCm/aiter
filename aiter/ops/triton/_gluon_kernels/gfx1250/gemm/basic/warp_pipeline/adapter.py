@@ -5,8 +5,7 @@
 Inputs are contiguous E4M3 A[M,K], W[N,K], and row-major uint8 E8M0
 scales A[M,K/128], W[N/128,K/128]. Prepare once outside graph timing.
 Native K128 A scales are compactly preshuffled without duplication; W scales are used directly.
-Set native_scale128=False to retain the expanded/packed comparison path.
-That legacy path owns copies and must be recreated when input scales change.
+Only M-contiguous K128 scales and padded two-buffer output stores are supported.
 """
 
 from dataclasses import dataclass
@@ -18,13 +17,11 @@ import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental.gluon.language.amd.cdna5 import PartitionedSharedLayout
 
-from .helpers import pack_scale
-
 
 def _example():
-    from . import mcontiguous_base
+    from . import mcontiguous_row_padded
 
-    return mcontiguous_base
+    return mcontiguous_row_padded
 
 
 @dataclass
@@ -49,8 +46,6 @@ def prepare_gemm_warp_pipeline(
     tile="256x256x256",
     cluster="2x2",
     flat_pipeline=False,
-    output_buffers=1,
-    native_scale128=True,
     out=None,
     a_scales_transposed=False,
 ):
@@ -81,9 +76,7 @@ def prepare_gemm_warp_pipeline(
     tile, block_k, cluster = example.validate_gemm_shape(
         "mxfp8", m, n, k, tile, cluster
     )
-    if output_buffers not in (1, 2):
-        raise ValueError("output_buffers must be 1 or 2")
-    args = SimpleNamespace(M=m, N=n, K=k, mxfp8_output_buffers=output_buffers)
+    args = SimpleNamespace(M=m, N=n, K=k, mxfp8_output_buffers=2)
     bk256_kernel = (
         example.mxfp8_gemm_warp_pipeline_flat
         if flat_pipeline
@@ -102,19 +95,10 @@ def prepare_gemm_warp_pipeline(
         )
     block_m = block_n = tile * cluster
     a_d, b_d = a, w
-    if native_scale128:
-        min(tile, 128)
-        as_d = (
-            a_scales.view(k // 128, m)
-            if a_scales_transposed
-            else a_scales.T.contiguous()
-        )
-        bs_d = w_scales
-    else:
-        as_d = a_scales.repeat_interleave(4, dim=1)
-        bs_d = w_scales.repeat_interleave(128, dim=0).repeat_interleave(4, dim=1)
-        if block_k == 256:
-            as_d, bs_d = pack_scale(as_d), pack_scale(bs_d)
+    as_d = (
+        a_scales.view(k // 128, m) if a_scales_transposed else a_scales.T.contiguous()
+    )
+    bs_d = w_scales
     c_d = (
         torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
         if out is None
@@ -245,17 +229,15 @@ def prepare_gemm_warp_pipeline(
         shared_bs = gl.PaddedSharedLayout.with_identity_for(
             [[16, 8]], [block_n, block_k // 32], [1, 0], cga_b
         )
-    if native_scale128:
-        # A scales are per row; B scales are shared by 128 adjacent rows.
-        mcontiguous_b_cga = tuple(
-            (basis[0] // max(1, 128 // tile), basis[1]) for basis in cga_b
-        )
-        shared_as = gl.PaddedSharedLayout.with_identity_for(
-            [[64, 8]], [block_m, block_k // 128], [1, 0], cga_a
-        )
-        shared_bs = gl.PaddedSharedLayout.with_identity_for(
-            [[64, 8]], [block_n // 128, block_k // 128], [1, 0], mcontiguous_b_cga
-        )
+    mcontiguous_b_cga = tuple(
+        (basis[0] // max(1, 128 // tile), basis[1]) for basis in cga_b
+    )
+    shared_as = gl.PaddedSharedLayout.with_identity_for(
+        [[64, 8]], [block_m, block_k // 128], [1, 0], cga_a
+    )
+    shared_bs = gl.PaddedSharedLayout.with_identity_for(
+        [[64, 8]], [block_n // 128, block_k // 128], [1, 0], mcontiguous_b_cga
+    )
     grid = (triton.cdiv(args.M, block_m) * triton.cdiv(args.N, block_n), 1)
 
     def launch(a_d=a_d, b_d=b_d, c_d=c_d, as_d=as_d, bs_d=bs_d):
@@ -286,8 +268,6 @@ def prepare_gemm_warp_pipeline(
                 BLOCK_M=block_m,
                 BLOCK_N=block_n,
                 CLUSTER=cluster,
-                NATIVE_SCALE128=native_scale128,
-                TWO_BUFFER_OUTPUT=args.mxfp8_output_buffers == 2,
                 num_warps=8,
                 num_ctas=cluster * cluster,
                 waves_per_eu=2,
@@ -325,8 +305,6 @@ def prepare_gemm_warp_pipeline(
             num_warps=8,
             waves_per_eu=2,
             num_ctas=cluster * cluster,
-            NATIVE_SCALE128=native_scale128,
-            TWO_BUFFER_OUTPUT=args.mxfp8_output_buffers == 2,
         )
 
     return PreparedWarpPipeline(

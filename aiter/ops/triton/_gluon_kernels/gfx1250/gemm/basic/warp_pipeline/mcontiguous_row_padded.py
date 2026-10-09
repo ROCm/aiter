@@ -38,39 +38,6 @@ def _cluster_sync():
     gl.amd.cdna5.cluster.wait()
 
 
-@gluon.jit
-def _tdm_store_full_tile(
-    c_ptr,
-    pid_m,
-    pid_n,
-    stride_cm,
-    stride_cn,
-    M,
-    N,
-    acc,
-    STORE_LAYOUT: gl.constexpr,
-    BLOCK_M: gl.constexpr,
-    BLOCK_N: gl.constexpr,
-    CTA_N: gl.constexpr,
-):
-    c_shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[BLOCK_N // CTA_N, 8]], [BLOCK_M, BLOCK_N], [1, 0], STORE_LAYOUT.cga_layout
-    )
-    c_shared = gl.allocate_shared_memory(
-        c_ptr.type.element_ty, [BLOCK_M, BLOCK_N], c_shared_layout
-    )
-    c_shared.store(acc.to(c_ptr.type.element_ty))
-    c_desc = tdm.make_tensor_descriptor(
-        base=c_ptr,
-        shape=(M, N),
-        strides=(stride_cm, stride_cn),
-        block_shape=(BLOCK_M, BLOCK_N),
-        layout=c_shared_layout,
-    )
-    tdm.async_store(c_desc, [pid_m * BLOCK_M, pid_n * BLOCK_N], c_shared)
-    tdm.async_wait(0)
-
-
 @triton.constexpr_function
 def _output_cga_layout(cga):
     return tuple(tuple(b) + (0, 0) for b in cga)
@@ -222,72 +189,33 @@ def _tdm_store_split_n2(
     OUTPUT_CGA_LAYOUT: gl.constexpr,
     CTA_M: gl.constexpr,
     CTA_N: gl.constexpr,
-    TWO_BUFFERS: gl.constexpr = False,
 ):
-    if TWO_BUFFERS:
-        o0 = (
-            acc0.to(c_ptr.type.element_ty)
-            .reshape((CTA_M, 256, CTA_N, 128))
-            .permute((0, 2, 1, 3))
-        )
-        o1 = (
-            acc1.to(c_ptr.type.element_ty)
-            .reshape((CTA_M, 256, CTA_N, 128))
-            .permute((0, 2, 1, 3))
-        )
-        output = (
-            gl.join(o0, o1).permute((0, 1, 2, 4, 3)).reshape((CTA_M, CTA_N, 256, 256))
-        )
-        _tdm_store_row_grid(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            output,
-            OUTPUT_CGA_LAYOUT,
-            CTA_M,
-            CTA_N,
-            256,
-            256,
-        )
-        return
-    cta_m: gl.constexpr = 256
-    cta_n: gl.constexpr = 256
-    half_n: gl.constexpr = 128
-    shared_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
-        [[half_n, 8]], [CTA_M, CTA_N, cta_m, half_n], [3, 2, 1, 0], OUTPUT_CGA_LAYOUT
+    o0 = (
+        acc0.to(c_ptr.type.element_ty)
+        .reshape((CTA_M, 256, CTA_N, 128))
+        .permute((0, 2, 1, 3))
     )
-    shared = gl.allocate_shared_memory(
-        c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout
+    o1 = (
+        acc1.to(c_ptr.type.element_ty)
+        .reshape((CTA_M, 256, CTA_N, 128))
+        .permute((0, 2, 1, 3))
     )
-    if TWO_BUFFERS:
-        shared1 = gl.allocate_shared_memory(
-            c_ptr.type.element_ty, [CTA_M, CTA_N, cta_m, half_n], shared_layout
-        )
-    output0 = acc0.reshape((CTA_M, cta_m, CTA_N, half_n)).permute((0, 2, 1, 3))
-    output1 = acc1.reshape((CTA_M, cta_m, CTA_N, half_n)).permute((0, 2, 1, 3))
-    desc = tdm.make_tensor_descriptor(
-        base=c_ptr,
-        shape=(M // cta_m, N // cta_n, cta_m, cta_n),
-        strides=(cta_m * stride_cm, cta_n * stride_cn, stride_cm, stride_cn),
-        block_shape=(CTA_M, CTA_N, cta_m, half_n),
-        layout=shared_layout,
+    output = gl.join(o0, o1).permute((0, 1, 2, 4, 3)).reshape((CTA_M, CTA_N, 256, 256))
+    _tdm_store_row_grid(
+        c_ptr,
+        pid_m,
+        pid_n,
+        stride_cm,
+        stride_cn,
+        M,
+        N,
+        output,
+        OUTPUT_CGA_LAYOUT,
+        CTA_M,
+        CTA_N,
+        256,
+        256,
     )
-    base_m = pid_m * CTA_M
-    base_n = pid_n * CTA_N
-    shared.store(output0.to(c_ptr.type.element_ty))
-    tdm.async_store(desc, [base_m, base_n, 0, 0], shared)
-    if TWO_BUFFERS:
-        shared1.store(output1.to(c_ptr.type.element_ty))
-        tdm.async_store(desc, [base_m, base_n, 0, half_n], shared1)
-    else:
-        tdm.async_wait(0)
-        shared.store(output1.to(c_ptr.type.element_ty))
-        tdm.async_store(desc, [base_m, base_n, 0, half_n], shared)
-    tdm.async_wait(0)
 
 
 @triton.constexpr_function
@@ -708,8 +636,6 @@ def mxfp8_gemm_warp_pipeline(
     BLOCK_N: gl.constexpr,
     CTA_M: gl.constexpr,
     CTA_N: gl.constexpr,
-    TWO_BUFFER_OUTPUT: gl.constexpr = False,
-    NATIVE_SCALE128: gl.constexpr = False,
 ):
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
     pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
@@ -747,49 +673,23 @@ def mxfp8_gemm_warp_pipeline(
         block_shape=(CTA_N, 256, 256),
         layout=SHARED_LAYOUT_B2,
     )
-    if NATIVE_SCALE128:
-        as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
-            a_scale_ptr,
-            b_scale_ptr,
-            M,
-            N,
-            K,
-            stride_scale_a,
-            stride_scale_b,
-            pid_m,
-            pid_n,
-            BLOCK_M,
-            BLOCK_N,
-            256,
-            scale_slots,
-            SHARED_SCALE_A,
-            SHARED_SCALE_B,
-        )
-    else:
-        as_buf = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty,
-            [scale_slots, BLOCK_M // 128, 1024],
-            SHARED_SCALE_A,
-        )
-        bs_buf = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty,
-            [scale_slots, BLOCK_N // 128, 1024],
-            SHARED_SCALE_B,
-        )
-        as_desc = tdm.make_tensor_descriptor(
-            base=a_scale_ptr + pid_m * BLOCK_M // 128 * stride_scale_a,
-            shape=(M // 128, K // 32 * 128),
-            strides=(stride_scale_a, 1),
-            block_shape=(BLOCK_M // 128, 1024),
-            layout=SHARED_SCALE_A,
-        )
-        bs_desc = tdm.make_tensor_descriptor(
-            base=b_scale_ptr + pid_n * BLOCK_N // 128 * stride_scale_b,
-            shape=(N // 128, K // 32 * 128),
-            strides=(stride_scale_b, 1),
-            block_shape=(BLOCK_N // 128, 1024),
-            layout=SHARED_SCALE_B,
-        )
+    as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_scale_a,
+        stride_scale_b,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        256,
+        scale_slots,
+        SHARED_SCALE_A,
+        SHARED_SCALE_B,
+    )
     as_desc, bs_desc = _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, 0)
     a_desc, b_desc = _mxfp8_issue_b2_parent_data(a_desc, b_desc, a_buf, b_buf, 0)
     as_desc, bs_desc = _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, 1)
@@ -801,116 +701,17 @@ def mxfp8_gemm_warp_pipeline(
     gl.assume(iter_max >= 4)
     gl.assume(iter_max % 2 == 0)
     data_scale_waitcnt: gl.constexpr = 4
-    if NATIVE_SCALE128:
-        # Six tiles cover both data-slot (2) and scale-slot (3) cycles.
-        # Keep scale loads local to each memory stage instead of carrying pairs.
-        for _ in range((iter_max - 4) // 6):
-            for inner in gl.static_range(6):
-                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
-                    _mxfp8_bk256_b2_consume_and_refill(
-                        a_buf,
-                        b_buf,
-                        as_buf,
-                        bs_buf,
-                        inner % 2,
-                        inner % 3,
-                        inner % 3,
-                        a_desc,
-                        b_desc,
-                        as_desc,
-                        bs_desc,
-                        acc0,
-                        acc1,
-                        dot_a,
-                        dot_b,
-                        B2_LOAD_LAYOUT,
-                        scale_a_layout,
-                        scale_a_layout,
-                        scale_b_layout,
-                        scale_b_load,
-                        BLOCK_M,
-                        BLOCK_N,
-                        CTA_N,
-                        True,
-                        data_scale_waitcnt,
-                    )
-                )
+    for _ in range((iter_max - 4) // 6):
         for inner in gl.static_range(6):
-            if inner < (iter_max - 4) % 6:
-                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
-                    _mxfp8_bk256_b2_consume_and_refill(
-                        a_buf,
-                        b_buf,
-                        as_buf,
-                        bs_buf,
-                        inner % 2,
-                        inner % 3,
-                        inner % 3,
-                        a_desc,
-                        b_desc,
-                        as_desc,
-                        bs_desc,
-                        acc0,
-                        acc1,
-                        dot_a,
-                        dot_b,
-                        B2_LOAD_LAYOUT,
-                        scale_a_layout,
-                        scale_a_layout,
-                        scale_b_layout,
-                        scale_b_load,
-                        BLOCK_M,
-                        BLOCK_N,
-                        CTA_N,
-                        True,
-                        data_scale_waitcnt,
-                    )
-                )
-    else:
-        for _ in range((iter_max - 4) // 6):
-            for inner in gl.static_range(6):
-                a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
-                    _mxfp8_bk256_b2_consume_and_refill(
-                        a_buf,
-                        b_buf,
-                        as_buf,
-                        bs_buf,
-                        inner % 2,
-                        inner % 3,
-                        inner % 3,
-                        a_desc,
-                        b_desc,
-                        as_desc,
-                        bs_desc,
-                        acc0,
-                        acc1,
-                        dot_a,
-                        dot_b,
-                        B2_LOAD_LAYOUT,
-                        scale_a_layout,
-                        scale_a_layout,
-                        scale_b_layout,
-                        scale_b_load,
-                        BLOCK_M,
-                        BLOCK_N,
-                        CTA_N,
-                        True,
-                        data_scale_waitcnt,
-                    )
-                )
-        for cleanup_pair in range((iter_max - 4) % 6 // 2):
-            cleanup_tile = cleanup_pair * 2
-            s0 = cleanup_tile % 3
-            s1 = (cleanup_tile + 1) % 3
             a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
                 _mxfp8_bk256_b2_consume_and_refill(
                     a_buf,
                     b_buf,
                     as_buf,
                     bs_buf,
-                    0,
-                    s0,
-                    s0,
+                    inner % 2,
+                    inner % 3,
+                    inner % 3,
                     a_desc,
                     b_desc,
                     as_desc,
@@ -931,15 +732,17 @@ def mxfp8_gemm_warp_pipeline(
                     data_scale_waitcnt,
                 )
             )
+    for inner in gl.static_range(6):
+        if inner < (iter_max - 4) % 6:
             a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
                 _mxfp8_bk256_b2_consume_and_refill(
                     a_buf,
                     b_buf,
                     as_buf,
                     bs_buf,
-                    1,
-                    s1,
-                    s1,
+                    inner % 2,
+                    inner % 3,
+                    inner % 3,
                     a_desc,
                     b_desc,
                     as_desc,
@@ -1077,7 +880,6 @@ def mxfp8_gemm_warp_pipeline(
         OUTPUT_CGA_LAYOUT,
         CTA_M,
         CTA_N,
-        TWO_BUFFER_OUTPUT,
     )
 
 
@@ -1112,8 +914,6 @@ def mxfp8_gemm_warp_pipeline_flat(
     BLOCK_N: gl.constexpr,
     CTA_M: gl.constexpr,
     CTA_N: gl.constexpr,
-    TWO_BUFFER_OUTPUT: gl.constexpr = False,
-    NATIVE_SCALE128: gl.constexpr = False,
 ):
     gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
     pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
@@ -1151,49 +951,23 @@ def mxfp8_gemm_warp_pipeline_flat(
         block_shape=(CTA_N, 256, 256),
         layout=SHARED_LAYOUT_B2,
     )
-    if NATIVE_SCALE128:
-        as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
-            a_scale_ptr,
-            b_scale_ptr,
-            M,
-            N,
-            K,
-            stride_scale_a,
-            stride_scale_b,
-            pid_m,
-            pid_n,
-            BLOCK_M,
-            BLOCK_N,
-            256,
-            scale_slots,
-            SHARED_SCALE_A,
-            SHARED_SCALE_B,
-        )
-    else:
-        as_buf = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty,
-            [scale_slots, BLOCK_M // 128, 1024],
-            SHARED_SCALE_A,
-        )
-        bs_buf = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty,
-            [scale_slots, BLOCK_N // 128, 1024],
-            SHARED_SCALE_B,
-        )
-        as_desc = tdm.make_tensor_descriptor(
-            base=a_scale_ptr + pid_m * BLOCK_M // 128 * stride_scale_a,
-            shape=(M // 128, K // 32 * 128),
-            strides=(stride_scale_a, 1),
-            block_shape=(BLOCK_M // 128, 1024),
-            layout=SHARED_SCALE_A,
-        )
-        bs_desc = tdm.make_tensor_descriptor(
-            base=b_scale_ptr + pid_n * BLOCK_N // 128 * stride_scale_b,
-            shape=(N // 128, K // 32 * 128),
-            strides=(stride_scale_b, 1),
-            block_shape=(BLOCK_N // 128, 1024),
-            layout=SHARED_SCALE_B,
-        )
+    as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_scale_a,
+        stride_scale_b,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        256,
+        scale_slots,
+        SHARED_SCALE_A,
+        SHARED_SCALE_B,
+    )
     as_desc, bs_desc = _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, 0)
     a_desc, b_desc = _mxfp8_issue_b2_parent_data(a_desc, b_desc, a_buf, b_buf, 0)
     as_desc, bs_desc = _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, 1)
@@ -1352,7 +1126,6 @@ def mxfp8_gemm_warp_pipeline_flat(
         OUTPUT_CGA_LAYOUT,
         CTA_M,
         CTA_N,
-        TWO_BUFFER_OUTPUT,
     )
 
 
@@ -1534,8 +1307,6 @@ def mxfp8_gemm_warp_pipeline_bk512(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     CLUSTER: gl.constexpr,
-    TWO_BUFFER_OUTPUT: gl.constexpr = False,
-    NATIVE_SCALE128: gl.constexpr = False,
 ):
     gl.static_assert(gl.num_ctas() == CLUSTER * CLUSTER)
     pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
@@ -1567,45 +1338,23 @@ def mxfp8_gemm_warp_pipeline_bk512(
         block_shape=(BLOCK_N, 512),
         layout=SHARED_B,
     )
-    if NATIVE_SCALE128:
-        as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
-            a_scale_ptr,
-            b_scale_ptr,
-            M,
-            N,
-            K,
-            stride_as,
-            stride_bs,
-            pid_m,
-            pid_n,
-            BLOCK_M,
-            BLOCK_N,
-            512,
-            2,
-            SHARED_AS,
-            SHARED_BS,
-        )
-    else:
-        as_buf = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [2, BLOCK_M, 16], SHARED_AS
-        )
-        bs_buf = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [2, BLOCK_N, 16], SHARED_BS
-        )
-        as_desc = tdm.make_tensor_descriptor(
-            base=a_scale_ptr + pid_m * BLOCK_M * stride_as,
-            shape=(M, K // 32),
-            strides=(stride_as, 1),
-            block_shape=(BLOCK_M, 16),
-            layout=SHARED_AS,
-        )
-        bs_desc = tdm.make_tensor_descriptor(
-            base=b_scale_ptr + pid_n * BLOCK_N * stride_bs,
-            shape=(N, K // 32),
-            strides=(stride_bs, 1),
-            block_shape=(BLOCK_N, 16),
-            layout=SHARED_BS,
-        )
+    as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_as,
+        stride_bs,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        512,
+        2,
+        SHARED_AS,
+        SHARED_BS,
+    )
     for slot in gl.static_range(2):
         a_desc, b_desc, as_desc, bs_desc = _mxfp8_tiled_issue_refill(
             a_desc,
@@ -1691,36 +1440,20 @@ def mxfp8_gemm_warp_pipeline_bk512(
     b_buf._keep_alive()
     as_buf._keep_alive()
     bs_buf._keep_alive()
-    if TWO_BUFFER_OUTPUT:
-        _tdm_store_tiled_two_buffers(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
-    else:
-        _tdm_store_full_tile(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
+    _tdm_store_tiled_two_buffers(
+        c_ptr,
+        pid_m,
+        pid_n,
+        stride_cm,
+        stride_cn,
+        M,
+        N,
+        acc,
+        WMMA,
+        BLOCK_M,
+        BLOCK_N,
+        CLUSTER,
+    )
 
 
 @gluon.jit
@@ -1750,8 +1483,6 @@ def mxfp8_gemm_warp_pipeline_bk512_flat(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     CLUSTER: gl.constexpr,
-    TWO_BUFFER_OUTPUT: gl.constexpr = False,
-    NATIVE_SCALE128: gl.constexpr = False,
 ):
     gl.static_assert(gl.num_ctas() == CLUSTER * CLUSTER)
     pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
@@ -1783,45 +1514,23 @@ def mxfp8_gemm_warp_pipeline_bk512_flat(
         block_shape=(BLOCK_N, 512),
         layout=SHARED_B,
     )
-    if NATIVE_SCALE128:
-        as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
-            a_scale_ptr,
-            b_scale_ptr,
-            M,
-            N,
-            K,
-            stride_as,
-            stride_bs,
-            pid_m,
-            pid_n,
-            BLOCK_M,
-            BLOCK_N,
-            512,
-            2,
-            SHARED_AS,
-            SHARED_BS,
-        )
-    else:
-        as_buf = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [2, BLOCK_M, 16], SHARED_AS
-        )
-        bs_buf = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [2, BLOCK_N, 16], SHARED_BS
-        )
-        as_desc = tdm.make_tensor_descriptor(
-            base=a_scale_ptr + pid_m * BLOCK_M * stride_as,
-            shape=(M, K // 32),
-            strides=(stride_as, 1),
-            block_shape=(BLOCK_M, 16),
-            layout=SHARED_AS,
-        )
-        bs_desc = tdm.make_tensor_descriptor(
-            base=b_scale_ptr + pid_n * BLOCK_N * stride_bs,
-            shape=(N, K // 32),
-            strides=(stride_bs, 1),
-            block_shape=(BLOCK_N, 16),
-            layout=SHARED_BS,
-        )
+    as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_as,
+        stride_bs,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        512,
+        2,
+        SHARED_AS,
+        SHARED_BS,
+    )
     for slot in gl.static_range(2):
         a_desc, b_desc, as_desc, bs_desc = _mxfp8_tiled_issue_refill(
             a_desc,
@@ -1889,36 +1598,20 @@ def mxfp8_gemm_warp_pipeline_bk512_flat(
     b_buf._keep_alive()
     as_buf._keep_alive()
     bs_buf._keep_alive()
-    if TWO_BUFFER_OUTPUT:
-        _tdm_store_tiled_two_buffers(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
-    else:
-        _tdm_store_full_tile(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
+    _tdm_store_tiled_two_buffers(
+        c_ptr,
+        pid_m,
+        pid_n,
+        stride_cm,
+        stride_cn,
+        M,
+        N,
+        acc,
+        WMMA,
+        BLOCK_M,
+        BLOCK_N,
+        CLUSTER,
+    )
 
 
 @gluon.jit
@@ -2068,8 +1761,6 @@ def mxfp8_gemm_warp_pipeline_bk1024(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     CLUSTER: gl.constexpr,
-    TWO_BUFFER_OUTPUT: gl.constexpr = False,
-    NATIVE_SCALE128: gl.constexpr = False,
 ):
     gl.static_assert(gl.num_ctas() == CLUSTER * CLUSTER)
     pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
@@ -2101,45 +1792,23 @@ def mxfp8_gemm_warp_pipeline_bk1024(
         block_shape=(BLOCK_N, 1024),
         layout=SHARED_B,
     )
-    if NATIVE_SCALE128:
-        as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
-            a_scale_ptr,
-            b_scale_ptr,
-            M,
-            N,
-            K,
-            stride_as,
-            stride_bs,
-            pid_m,
-            pid_n,
-            BLOCK_M,
-            BLOCK_N,
-            1024,
-            2,
-            SHARED_AS,
-            SHARED_BS,
-        )
-    else:
-        as_buf = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [2, BLOCK_M, 32], SHARED_AS
-        )
-        bs_buf = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [2, BLOCK_N, 32], SHARED_BS
-        )
-        as_desc = tdm.make_tensor_descriptor(
-            base=a_scale_ptr + pid_m * BLOCK_M * stride_as,
-            shape=(M, K // 32),
-            strides=(stride_as, 1),
-            block_shape=(BLOCK_M, 32),
-            layout=SHARED_AS,
-        )
-        bs_desc = tdm.make_tensor_descriptor(
-            base=b_scale_ptr + pid_n * BLOCK_N * stride_bs,
-            shape=(N, K // 32),
-            strides=(stride_bs, 1),
-            block_shape=(BLOCK_N, 32),
-            layout=SHARED_BS,
-        )
+    as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_as,
+        stride_bs,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        1024,
+        2,
+        SHARED_AS,
+        SHARED_BS,
+    )
     for slot in gl.static_range(2):
         a_desc, b_desc, as_desc, bs_desc = _mxfp8_tiled_issue_refill(
             a_desc,
@@ -2225,36 +1894,20 @@ def mxfp8_gemm_warp_pipeline_bk1024(
     b_buf._keep_alive()
     as_buf._keep_alive()
     bs_buf._keep_alive()
-    if TWO_BUFFER_OUTPUT:
-        _tdm_store_tiled_two_buffers(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
-    else:
-        _tdm_store_full_tile(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
+    _tdm_store_tiled_two_buffers(
+        c_ptr,
+        pid_m,
+        pid_n,
+        stride_cm,
+        stride_cn,
+        M,
+        N,
+        acc,
+        WMMA,
+        BLOCK_M,
+        BLOCK_N,
+        CLUSTER,
+    )
 
 
 @gluon.jit
@@ -2284,8 +1937,6 @@ def mxfp8_gemm_warp_pipeline_bk1024_flat(
     BLOCK_M: gl.constexpr,
     BLOCK_N: gl.constexpr,
     CLUSTER: gl.constexpr,
-    TWO_BUFFER_OUTPUT: gl.constexpr = False,
-    NATIVE_SCALE128: gl.constexpr = False,
 ):
     gl.static_assert(gl.num_ctas() == CLUSTER * CLUSTER)
     pid_m, pid_n = _get_xcd_swizzled_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, 8, 4)
@@ -2317,45 +1968,23 @@ def mxfp8_gemm_warp_pipeline_bk1024_flat(
         block_shape=(BLOCK_N, 1024),
         layout=SHARED_B,
     )
-    if NATIVE_SCALE128:
-        as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
-            a_scale_ptr,
-            b_scale_ptr,
-            M,
-            N,
-            K,
-            stride_as,
-            stride_bs,
-            pid_m,
-            pid_n,
-            BLOCK_M,
-            BLOCK_N,
-            1024,
-            2,
-            SHARED_AS,
-            SHARED_BS,
-        )
-    else:
-        as_buf = gl.allocate_shared_memory(
-            a_scale_ptr.type.element_ty, [2, BLOCK_M, 32], SHARED_AS
-        )
-        bs_buf = gl.allocate_shared_memory(
-            b_scale_ptr.type.element_ty, [2, BLOCK_N, 32], SHARED_BS
-        )
-        as_desc = tdm.make_tensor_descriptor(
-            base=a_scale_ptr + pid_m * BLOCK_M * stride_as,
-            shape=(M, K // 32),
-            strides=(stride_as, 1),
-            block_shape=(BLOCK_M, 32),
-            layout=SHARED_AS,
-        )
-        bs_desc = tdm.make_tensor_descriptor(
-            base=b_scale_ptr + pid_n * BLOCK_N * stride_bs,
-            shape=(N, K // 32),
-            strides=(stride_bs, 1),
-            block_shape=(BLOCK_N, 32),
-            layout=SHARED_BS,
-        )
+    as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_as,
+        stride_bs,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        1024,
+        2,
+        SHARED_AS,
+        SHARED_BS,
+    )
     for slot in gl.static_range(2):
         a_desc, b_desc, as_desc, bs_desc = _mxfp8_tiled_issue_refill(
             a_desc,
@@ -2423,36 +2052,20 @@ def mxfp8_gemm_warp_pipeline_bk1024_flat(
     b_buf._keep_alive()
     as_buf._keep_alive()
     bs_buf._keep_alive()
-    if TWO_BUFFER_OUTPUT:
-        _tdm_store_tiled_two_buffers(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
-    else:
-        _tdm_store_full_tile(
-            c_ptr,
-            pid_m,
-            pid_n,
-            stride_cm,
-            stride_cn,
-            M,
-            N,
-            acc,
-            WMMA,
-            BLOCK_M,
-            BLOCK_N,
-            CLUSTER,
-        )
+    _tdm_store_tiled_two_buffers(
+        c_ptr,
+        pid_m,
+        pid_n,
+        stride_cm,
+        stride_cn,
+        M,
+        N,
+        acc,
+        WMMA,
+        BLOCK_M,
+        BLOCK_N,
+        CLUSTER,
+    )
 
 
 def validate_gemm_shape(dtype, M, N, K, tile=None, cluster=None):

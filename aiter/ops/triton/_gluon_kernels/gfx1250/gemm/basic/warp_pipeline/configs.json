@@ -7,7 +7,7 @@
     "native_scale128": true,
     "scale_mode": "mcontiguous",
     "register_split_output": true,
-    "output_padding": false,
+    "output_padding": true,
     "num_warps": 8
   },
   "512,6144,7168": {
@@ -40,18 +40,18 @@
     "native_scale128": true,
     "scale_mode": "mcontiguous",
     "register_split_output": true,
-    "output_padding": false,
+    "output_padding": true,
     "num_warps": 8
   },
   "512,8192,1536": {
     "tile": "128x128x512",
     "cluster": "4x4",
     "flat_pipeline": true,
-    "output_buffers": 1,
+    "output_buffers": 2,
     "native_scale128": true,
     "scale_mode": "mcontiguous",
-    "register_split_output": false,
-    "output_padding": false,
+    "register_split_output": true,
+    "output_padding": true,
     "num_warps": 8
   },
   "512,65536,1536": {
@@ -61,8 +61,8 @@
     "output_buffers": 2,
     "native_scale128": true,
     "scale_mode": "mcontiguous",
-    "register_split_output": false,
-    "output_padding": false,
+    "register_split_output": true,
+    "output_padding": true,
     "num_warps": 8
   },
   "16384,2048,7168": {
@@ -83,8 +83,8 @@
     "output_buffers": 2,
     "native_scale128": true,
     "scale_mode": "mcontiguous",
-    "register_split_output": false,
-    "output_padding": false,
+    "register_split_output": true,
+    "output_padding": true,
     "num_warps": 8
   },
   "16384,7168,3072": {

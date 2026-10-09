@@ -7,7 +7,6 @@ import torch
 
 from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.warp_pipeline import (
     CONFIGS,
-    _adapter,
     prepare_gemm_warp_pipeline,
 )
 
@@ -17,9 +16,6 @@ def main():
     p.add_argument("--shape", nargs=3, type=int, required=True, metavar=("M", "N", "K"))
     p.add_argument("--repeats", type=int, default=100)
     p.add_argument("--warmup", type=int, default=20)
-    p.add_argument(
-        "--scale-layout", choices=["mcontiguous", "b64"], default="mcontiguous"
-    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--check", action="store_true")
     p.add_argument("--verify-only", action="store_true")
@@ -37,29 +33,38 @@ def main():
     torch.manual_seed(args.seed)
     a, w, _, sa, _, sw = generate_inputs(m, n, k, False, 128, (128, 128), False)
     data = (a, w, sa, sw)
-    warm = prepare_gemm_warp_pipeline(*data, scale_layout=args.scale_layout)
+    warm = prepare_gemm_warp_pipeline(*data)
     compiled = warm.launch()
     torch.cuda.synchronize()
     assert [t.numel() for t in warm.inputs[3:]] == [sa.numel(), sw.numel()]
     if args.check or args.verify_only:
-        cfg = dict(CONFIGS[key])
-        split = cfg.pop("register_split_output")
-        padded = cfg.pop("output_padding")
-        for x in ["scale_mode", "num_warps"]:
-            cfg.pop(x, None)
-        cfg["native_scale128"] = False
-        reference = _adapter(split, padded, "b64").prepare_gemm_warp_pipeline(
-            *data, **cfg
-        )
-        reference()
-        torch.cuda.synchronize()
-        assert torch.equal(warm.output, reference.output), (
-            "Mismatch against expanded reference"
+        # Independent FP64 reference with the stock benchmark's BF16 tolerances.
+        # Chunk N to bound temporary storage for large shapes.
+        scaled_a = a.double() * torch.exp2(sa.double() - 127).repeat_interleave(128, 1)
+        max_expected = 0.0
+        max_excess_error = 0.0
+        for n0 in range(0, n, 1024):
+            n1 = min(n0 + 1024, n)
+            scales = sw[n0 // 128 : n1 // 128]
+            scaled_w = w[n0:n1].double() * torch.exp2(
+                scales.double() - 127
+            ).repeat_interleave(128, 0).repeat_interleave(128, 1)
+            expected = scaled_a @ scaled_w.T
+            rounded = expected.to(torch.bfloat16).double()
+            error = (warm.output[:, n0:n1].double() - rounded).abs()
+            max_expected = max(max_expected, expected.abs().max().item())
+            max_excess_error = max(
+                max_excess_error, (error - 0.016 * rounded.abs()).max().item()
+            )
+            assert torch.isfinite(error).all().item(), "Nonfinite output or reference"
+        # Match the stock harness: tolerance uses the maximum over the full output.
+        assert max_excess_error <= 5e-5 * max_expected, (
+            f"Reference mismatch: excess error {max_excess_error}, atol {5e-5 * max_expected}"
         )
         print("Verification passed", flush=True)
     result = {
         "shape": args.shape,
-        "config": dict(CONFIGS[key], scale_mode=args.scale_layout),
+        "config": dict(CONFIGS[key]),
         "vgprs": compiled.n_regs,
         "spills": compiled.n_spills,
     }
@@ -67,9 +72,7 @@ def main():
         for _ in range(args.warmup):
             warm()
         runs = [
-            prepare_gemm_warp_pipeline(
-                *(t.clone() for t in data), scale_layout=args.scale_layout
-            )
+            prepare_gemm_warp_pipeline(*(t.clone() for t in data))
             for _ in range(args.repeats)
         ]
         assert len({t.data_ptr() for fn in runs for t in fn.inputs}) == 5 * args.repeats
