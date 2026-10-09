@@ -30,7 +30,9 @@ sweep ends in a markdown table:
 * ``test_quick_allreduce_relay`` -- the TP2 mesh with relay devices set, checked
   against a direct engine on the same inputs. A default run adds these rows
   only on xGMI, when four GPUs are visible and this arch has relay defaults.
-  The direct TP2 rows always run. Relay rows are eager.
+  The direct TP2 rows always run. Relay rows run eager; a block-512 and a
+  block-256 shape also run captured into a CUDA graph, replayed with the inputs
+  refilled between replays.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes, the full ``block``/``skip_self`` sweep, the fp16 transport over a
@@ -264,6 +266,9 @@ RELAY_CASES = (
     (8191, 5120, "fp16"),
     (1024, 5120, "int6"),
 )
+# The default relay rows that also run under CUDA-graph replay: 80 MiB is on
+# the block-512 rung (from 4 MiB), 2.5 MiB on the block-256 rung.
+RELAY_GRAPH_CASES = ((8192, 5120, "int4"), (256, 5120, "int4"))
 # (tokens, hidden, codec, relay_fraction, super_tile), ``--extended`` only.
 EXTENDED_RELAY_CASES = (
     (8192, 5120, "int4", (1, 4), None),
@@ -653,51 +658,88 @@ def _time_eager(eng, inp: torch.Tensor, out: torch.Tensor, group) -> float:
 
 
 def _run_relay_case(fly, direct, case: tuple, *, rank: int, device, group, window):
-    """One case on a relay engine and its direct twin, on the same inputs."""
+    """One case on a relay engine and its direct twin, on the same inputs.
+
+    Under *graph*, the relay engine's *calls* all-reduces are captured into one
+    graph. Each replay runs on inputs refilled in place; the direct engine's
+    eager output on the same inputs is what it is compared with.
+    """
     import torch.distributed as dist
 
     ntok, hidden, fill, graph, time_it, calls = case
-    if graph:
-        raise ValueError("relay rows are eager only")
-    inps = [
-        _make_inp(ntok, hidden, fill, rank=rank, device=device, call=c)
-        for c in range(calls)
-    ]
-    refs = []
-    for inp in inps:
-        ref = inp.to(torch.float32)
-        dist.all_reduce(ref, group=group)
-        refs.append(ref)
-    dist.barrier()
 
+    def draw(replay):
+        return [
+            _make_inp(
+                ntok, hidden, fill, rank=rank, device=device, call=replay * calls + c
+            )
+            for c in range(calls)
+        ]
+
+    inps = draw(0)
+    relay_outs = [torch.zeros_like(inp) for inp in inps]
+    direct_outs = [torch.zeros_like(inp) for inp in inps]
     nbytes = int(inps[0].numel()) * int(inps[0].element_size())
     cfg_used, _ = fly._pick_cfg(nbytes)
     tile_bytes = _tile_bytes(cfg_used[1])
 
-    # Back to back with no sync between calls, so each call's flags and colour
-    # follow the previous one on the wire; then the direct engine on the same
-    # inputs.
-    relay_outs = [torch.zeros_like(inp) for inp in inps]
-    for inp, out in zip(inps, relay_outs):
-        fly.allreduce(inp, out)
-    torch.cuda.synchronize()
-    dist.barrier()
-    direct_outs = [torch.zeros_like(inp) for inp in inps]
-    for inp, out in zip(inps, direct_outs):
-        direct.allreduce(inp, out)
-    torch.cuda.synchronize()
-    dist.barrier()
+    def run_all(eng, outs):
+        for inp, out in zip(inps, outs):
+            eng.allreduce(inp, out)
+
+    relay_graph = direct_graph = None
+    if graph:
+        # Captured on the current stream, which allreduce() launches on when it
+        # is given none, after one eager pass per engine.
+        for eng, outs in ((fly, relay_outs), (direct, direct_outs)):
+            run_all(eng, outs)
+            torch.cuda.synchronize()
+            dist.barrier()
+        relay_graph, direct_graph = torch.cuda.CUDAGraph(), torch.cuda.CUDAGraph()
+        for g, eng, outs in (
+            (relay_graph, fly, relay_outs),
+            (direct_graph, direct, direct_outs),
+        ):
+            with torch.cuda.graph(g):
+                run_all(eng, outs)
 
     m = d = None
     differing = 0
-    for ref, r_out, d_out in zip(refs, relay_outs, direct_outs):
-        mi = _metrics(r_out, ref, rank, tile_bytes, group)
-        di = _metrics(d_out, ref, rank, tile_bytes, group)
-        m = mi if m is None else _worst(m, mi)
-        d = di if d is None else _worst(d, di)
-        differing = max(
-            differing, int((r_out.view(torch.int16) != d_out.view(torch.int16)).sum())
-        )
+    for replay in range(GRAPH_REPLAYS if graph else 1):
+        if replay:
+            for inp, new in zip(inps, draw(replay)):
+                inp.copy_(new)
+        refs = []
+        for inp in inps:
+            ref = inp.to(torch.float32)
+            dist.all_reduce(ref, group=group)
+            refs.append(ref)
+        for out in relay_outs + direct_outs:
+            out.zero_()
+        dist.barrier()
+
+        # Back to back with no sync between calls, so each call's flags and
+        # colour follow the previous one on the wire; then the direct engine
+        # on the same inputs, eager.
+        if graph:
+            relay_graph.replay()
+        else:
+            run_all(fly, relay_outs)
+        torch.cuda.synchronize()
+        dist.barrier()
+        run_all(direct, direct_outs)
+        torch.cuda.synchronize()
+        dist.barrier()
+
+        for ref, r_out, d_out in zip(refs, relay_outs, direct_outs):
+            mi = _metrics(r_out, ref, rank, tile_bytes, group)
+            di = _metrics(d_out, ref, rank, tile_bytes, group)
+            m = mi if m is None else _worst(m, mi)
+            d = di if d is None else _worst(d, di)
+            differing = max(
+                differing,
+                int((r_out.view(torch.int16) != d_out.view(torch.int16)).sum()),
+            )
 
     row = _engine_row(
         fly,
@@ -719,8 +761,16 @@ def _run_relay_case(fly, direct, case: tuple, *, rank: int, device, group, windo
         }
     )
     if time_it:
-        row["us"] = _time_eager(fly, inps[0], relay_outs[0], group)
-        row["direct_us"] = _time_eager(direct, inps[0], direct_outs[0], group)
+        if graph:
+            # Per call, from a replay of *calls* of them.
+            for key, g in (("us", relay_graph), ("direct_us", direct_graph)):
+                dist.barrier(group=group)
+                torch.cuda.synchronize()
+                _, us = run_perftest(g.replay, use_cuda_event=True)
+                row[key] = float(us) / calls
+        else:
+            row["us"] = _time_eager(fly, inps[0], relay_outs[0], group)
+            row["direct_us"] = _time_eager(direct, inps[0], direct_outs[0], group)
     return row
 
 
@@ -1213,14 +1263,18 @@ def _relay_key(
 
 
 def _relay_case(
-    tokens: int, hidden: int, codec: str, calls: int = RELAY_CALLS
+    tokens: int,
+    hidden: int,
+    codec: str,
+    calls: int = RELAY_CALLS,
+    graph: bool = False,
 ) -> tuple:
     exact = codec == "fp16"
     return (
         tokens,
         hidden,
         "exact" if exact else "normal",
-        False,
+        graph,
         not exact,
         calls,
     )
@@ -1239,6 +1293,7 @@ def test_quick_allreduce_relay(
     expect_relay=True,
     min_bytes=0,
     calls=RELAY_CALLS,
+    graph=False,
 ):
     """TP2 relay against its direct twin on the same inputs.
 
@@ -1246,7 +1301,8 @@ def test_quick_allreduce_relay(
     where the relay's output differs from the direct engine's on any of the
     back-to-back calls, and the relay engine running exactly when
     *expect_relay* says so. The lossless wire must also match the fp32
-    reference exactly. Latencies are reported, never asserted.
+    reference exactly. Latencies are reported, never asserted; under *graph*
+    they are per call.
     """
     exact = codec == "fp16"
     rows = _result(
@@ -1259,12 +1315,12 @@ def test_quick_allreduce_relay(
             grid_cap,
             min_bytes,
         ),
-        _relay_case(tokens, hidden, codec, calls),
+        _relay_case(tokens, hidden, codec, calls, graph),
     )
     nbytes = tokens * hidden * 2
     label = (
         f"tp={tp} relay={tuple(relay_devices)} f={tuple(relay_fraction)} {codec} "
-        f"{tokens}x{hidden} st={super_tile} grid_cap={grid_cap}"
+        f"{tokens}x{hidden} st={super_tile} grid_cap={grid_cap} graph={graph}"
     )
     expected_st = super_tile or _shipping_st(rows, nbytes, "mesh", tp)
     if exact:
@@ -1624,6 +1680,20 @@ def main():
                     else [(t, h) for t, h, c in RELAY_CASES if c == codec]
                 )
             ]
+            # The graph rows are the graph shapes, or the first shape of each
+            # codec when ``-s`` picks them.
+            if args.mnk is None:
+                graph_cases = [
+                    (t, h, c) for t, h, c in RELAY_GRAPH_CASES if c in args.relay_codec
+                ]
+            else:
+                graph_cases = [
+                    next(c for c in cases if c[2] == codec)
+                    for codec in dict.fromkeys(args.relay_codec)
+                ]
+            relay_cases = [(*c, False) for c in cases] + [
+                (*c, True) for c in graph_cases
+            ]
             relay += [
                 (
                     tokens,
@@ -1637,8 +1707,9 @@ def main():
                     True,
                     0,
                     RELAY_CALLS,
+                    graph,
                 )
-                for tokens, hidden, codec in cases
+                for tokens, hidden, codec, graph in relay_cases
                 for fraction in args.relay_fraction
                 for grid_cap in args.grid_cap
             ]
@@ -1656,6 +1727,7 @@ def main():
                         True,
                         0,
                         RELAY_CALLS,
+                        False,
                     )
                     for tokens, hidden, codec, fraction, st in EXTENDED_RELAY_CASES
                 ]
@@ -1688,6 +1760,7 @@ def main():
                             used,
                             None,
                             calls,
+                            False,
                         )
                         for tokens, used, calls in (
                             (at - 1, False, RELAY_CALLS),
@@ -1709,10 +1782,11 @@ def main():
         expect,
         floor,
         calls,
+        graph,
     ) in relay:
         _register(
             _relay_key(tp, pair, fraction, codec, st, grid_cap, floor),
-            _relay_case(tokens, hidden, codec, calls),
+            _relay_case(tokens, hidden, codec, calls, graph),
         )
 
     def _int4_rows(cases):
