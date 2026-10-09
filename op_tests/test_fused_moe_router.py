@@ -226,6 +226,7 @@ def _call_fused(
     shared_w=1.0,
     ep_rank=0,
     ep_size=1,
+    group_size=GROUP_SIZE,
 ):
     fused_moe_router_impl(
         g,
@@ -242,7 +243,7 @@ def _call_fused(
         E,
         topk,
         unit_size,
-        GROUP_SIZE,
+        group_size,
         need_renorm,
         rsf,
         get_fused_moe_router_workspace(g.device, max(g.shape[0], WORKSPACE_MAX_TOKENS)),
@@ -646,6 +647,45 @@ def check_rejects_bad_shapes(E=320, topk=8, unit_size=16):
             ),
             name,
         )
+
+    bad += _expect_raises(
+        lambda: _call_fused(
+            g, b, h[: M - 1], got, E, topk, unit_size, True, 1.0, None, None
+        ),
+        "hidden with fewer tokens than gating",
+    )
+    bad += _expect_raises(
+        lambda: _call_fused(
+            g, b, h, got, E, topk, unit_size, True, 1.0, None, None, group_size=0
+        ),
+        "group_size=0",
+    )
+
+    # Phase 3 writes through num_valid, so outputs must hold the worst case;
+    # one element short of it must be refused.
+    rows = M * topk + E * unit_size - topk
+    scale_n_pad = (COLS // GROUP_SIZE + 7) // 8 * 8
+    need = {
+        "sw": rows,
+        "osc": (got["sids"].numel() + 31) // 32 * 32 * scale_n_pad,
+    }
+    for key, n in need.items():
+        short = dict(got)
+        short[key] = got[key].reshape(-1)[: n - 1]
+        bad += _expect_raises(
+            lambda short=short: _call_fused(
+                g, b, h, short, E, topk, unit_size, True, 1.0, None, None
+            ),
+            f"undersized {key}",
+        )
+
+    # A foreign pointer passes every dtype check, so the device must be checked.
+    bad += _expect_raises(
+        lambda: _call_fused(
+            g, b.cpu(), h, got, E, topk, unit_size, True, 1.0, None, None
+        ),
+        "CPU correction bias",
+    )
     return bad
 
 
@@ -764,6 +804,66 @@ def test_fp16_out_dtype_unsupported():
         activation=ActivationType.Silu.value,
         dtype=dtypes.fp16,
     )
+
+
+# fused_moe_router hands fused_moe_2stages both _metadata and a1_prequant, so
+# main's own A-preparation is skipped; configs that need anything other than
+# sorted MXFP4 A must be declined.
+def test_metadata_gate_rejects_non_prequant_stage1():
+    import functools
+    from dataclasses import replace
+
+    from aiter.fused_moe import (
+        AUX_SORT_OPUS,
+        MOEMetadata,
+        _fused_moe_router_tuned_cfg_supported,
+        _mxfp4_a4w4_stage1_fw,
+    )
+
+    ok = MOEMetadata(stage1=None, stage2=None, block_m=32, ksplit=0)
+    assert _fused_moe_router_tuned_cfg_supported(ok, is_shuffled=True)
+    for name, md, shuffled in (
+        ("run_1stage", replace(ok, run_1stage=True), True),
+        ("flat", replace(ok, flat=True), True),
+        ("output_aux", replace(ok, output_aux=AUX_SORT_OPUS), True),
+        ("no prequant", replace(ok, prequant=False), True),
+        ("shuffled ksplit", replace(ok, ksplit=2), True),
+    ):
+        assert not _fused_moe_router_tuned_cfg_supported(md, shuffled), name
+    # ksplit only takes bf16 A on the shuffled path.
+    assert _fused_moe_router_tuned_cfg_supported(
+        replace(ok, ksplit=2), is_shuffled=False
+    )
+
+    a4w4 = replace(ok, stage1=functools.partial(_mxfp4_a4w4_stage1_fw))
+    assert _fused_moe_router_tuned_cfg_supported(a4w4, True)
+    assert not _fused_moe_router_tuned_cfg_supported(replace(a4w4, block_m=16), True)
+
+
+def test_router_entry_rejects_bad_inputs():
+    from aiter import ActivationType, QuantType
+    from aiter.fused_moe import fused_moe_router
+
+    M, E, topk = 16, 320, 8
+    h = torch.randn(M, COLS, dtype=dtypes.bf16)
+    g = torch.randn(M, E, dtype=dtypes.bf16)
+    b = torch.randn(E, dtype=dtypes.bf16)
+    w1 = torch.empty(E, 512, COLS // 2, dtype=dtypes.fp4x2)
+    w2 = torch.empty(E, COLS, 128, dtype=dtypes.fp4x2)
+    call = lambda gg, bb: fused_moe_router(
+        h,
+        gg,
+        bb,
+        w1,
+        w2,
+        topk,
+        quant_type=QuantType.per_1x32.value,
+        activation=ActivationType.Silu.value,
+    )
+    with pytest.raises(AssertionError, match="tokens"):
+        call(g[: M - 1], b)
+    with pytest.raises(AssertionError, match="correction_bias"):
+        call(g, None)
 
 
 # ---------------------------------------------------------------------------
