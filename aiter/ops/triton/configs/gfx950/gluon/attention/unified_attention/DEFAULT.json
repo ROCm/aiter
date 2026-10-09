@@ -12,9 +12,6 @@
       "DT"
     ],
     "kv_split": [
-      "D",
-      "Q",
-      "BS",
       "SW",
       "DT"
     ]
@@ -139,17 +136,6 @@
     }
   },
   "kv_split": {
-    "D_LEQ_128.Q_LEQ_1.BS_LEQ_16.SW.DT_bf16_bf16": {
-      "SEGMENTS_PER_CU": 2,
-      "MFMA_DIM": 16,
-      "MAX_SEGMENTS": 4,
-      "SPLIT_MIN_TILES": 3,
-      "SPLIT_MIN_SHARE": 3,
-      "SEGMENT_TILE_MIN": 256,
-      "SEGMENT_TILE_MAX": 256,
-      "TILE_SIZE_MIN": 64,
-      "TILE_SIZE_MAX": 64
-    },
     "SW": {
       "SEGMENTS_PER_CU": 2,
       "MFMA_DIM": 16,
