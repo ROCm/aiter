@@ -593,3 +593,85 @@ def test_paged_attn_per_token_quant(
     logger.debug("torch_output=%s", torch_output)
 
     torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)
+
+
+# With multiple partitions, a KV block size that does not divide the
+# 1024-token partition size puts blocks across partition boundaries. Each
+# token must be counted in exactly one partition: none twice, none dropped.
+# B * H_Q <= 512 and SEQ_LEN > 1024, so the dispatcher picks the V2 kernels.
+# A few double-counted or dropped tokens out of thousands move the output by
+# only ~1e-3, below the 1e-2 bf16 tolerance of the single-partition test
+# above, so this test runs in fp32.
+@pytest.mark.parametrize(
+    "B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, NUM_BLK",
+    [
+        (1, 1, 1, 48, 2048, 32),  # one block straddles the partition boundary
+        (2, 16, 16, 48, 4096, 32),
+        (2, 32, 8, 3, 4096, 128),
+        (2, 32, 8, 48, 4096, 32),
+        (2, 32, 8, 24, 8192, 64),
+    ],
+)
+@pytest.mark.parametrize("per_token_quant", [False, True])
+def test_paged_attn_v2_non_pow2_blk_sz(
+    B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, NUM_BLK, per_token_quant, monkeypatch
+):
+    v2_calls = []
+    for name in ("paged_attn_decode_v2", "paged_attn_decode_v2_per_token_quant"):
+        fn = paged_attention_decode.__globals__[name]
+
+        def spy(*args, _fn=fn, **kwargs):
+            v2_calls.append(True)
+            return _fn(*args, **kwargs)
+
+        monkeypatch.setitem(paged_attention_decode.__globals__, name, spy)
+
+    head_size = 128
+    dtype = torch.float32
+    compute_type = tl.float32
+
+    (
+        query,
+        triton_output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        max_context_len,
+    ) = input_helper(
+        B, H_Q, H_KV, head_size, KV_BLK_SZ, SEQ_LEN, dtype, dtype, dtype, NUM_BLK
+    )
+
+    # An fp32 cache with unit per-token scales runs the per-token-quant kernels
+    # without quantization error, so both paths share one tolerance.
+    if per_token_quant:
+        k_scale = torch.ones(
+            NUM_BLK, H_KV, KV_BLK_SZ, dtype=torch.float32, device="cuda"
+        )
+    else:
+        k_scale = torch.tensor([1.0])
+    v_scale = torch.ones_like(k_scale)
+
+    paged_attention_decode(
+        triton_output,
+        query,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        1.0 / (head_size**0.5),
+        max_context_len,
+        compute_type,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    assert v2_calls, "expected dispatch to the V2 kernels"
+
+    torch_output = torch.zeros(B, H_Q, head_size, dtype=dtype, device="cuda")
+    paged_attention_decode_ref(
+        torch_output, query, key_cache, value_cache, block_tables, context_lens
+    )
+
+    torch.testing.assert_close(triton_output, torch_output, rtol=0, atol=1e-03)
