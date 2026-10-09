@@ -14,11 +14,12 @@ rows x 4 heads per MFMA instead. The indexer head count is 4 or 8, each a
 separate compile.
 
 ``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
-selected token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and
-an LSE merge; gfx942 widens that tile to four waves when the grid fits in
-the CUs. Prefill runs BLOCK_N=32 two waves and writes output directly once
-the grid alone fills the machine. Softmax is online in log2 space and the
-split partials are FP32. Expand+tail and the sigmoid gate stay unfused.
+selected token ids. ``n_sel`` is the packed live prefix; the default walks the
+allocated row. Decode runs a BLOCK_N=16 two-wave tile with split-K and an LSE
+merge; gfx942 widens that tile to four waves when the grid fits in the CUs.
+Prefill runs BLOCK_N=32 two waves and writes output directly once the grid
+alone fills the machine. Softmax is online in log2 space and the split
+partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
 The fp32 reference, the paged-cache fixtures, and the concrete shapes
 live in ``op_tests/qsa_ref.py``.
@@ -864,12 +865,18 @@ def qsa_sparse_gqa(
     out: torch.Tensor | None = None,
     softmax_scale: float | None = None,
     workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
+    n_sel: int | None = None,
 ) -> torch.Tensor:
     """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
 
     ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
     ``None`` allocates that pair. A one-split launch writes ``out``
     directly and does not read ``workspace``.
+
+    ``n_sel`` is the packed live prefix of ``indices``. ``None`` walks
+    every allocated column. A shorter prefix is the split count and the
+    gather width, so a ``-1`` suffix is not scanned and does not launch
+    an empty workgroup. A live token at or past ``n_sel`` is not read.
     """
     reason = qsa_sparse_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
@@ -896,7 +903,14 @@ def qsa_sparse_gqa(
     arch = _qsa_arch()
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
-    if not rows or not indices.shape[1]:
+    width = int(indices.shape[1])
+    if n_sel is None:
+        n_sel = width
+    elif isinstance(n_sel, bool) or not isinstance(n_sel, int):
+        raise TypeError(f"n_sel must be a host int, got {type(n_sel).__name__}")
+    elif n_sel < 0 or n_sel > width:
+        raise ValueError(f"n_sel must be in 0..{width}, got {n_sel}")
+    if not rows or n_sel == 0:
         return out.zero_()
     # Nothing to gather. Clamping the index to 0 would still load, including
     # a table that has columns but no request row for safe_req.
@@ -914,7 +928,6 @@ def qsa_sparse_gqa(
     kv_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
-    n_sel = int(indices.shape[1])
     # gfx950 keeps the fitted 128-split tiny band. On gfx942, 129 BN16
     # tiles at 64 splits leave one workgroup with 3 tiles, and that group
     # sets M=1. 65 splits caps every group at 2. The merge widens to 256
