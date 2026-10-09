@@ -740,6 +740,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             aiter.logger.warning("Skipping FlyDSL FP32 blockscale tuning: %s", exc)
             return []
 
+        # preshuffle B would pass tranposed x_scale_t to kernel
+        # plain B would pass x_scale to kernel and kernel would tranposed it to needed format.
         gemm_keys = (
             ["x", "weight_shuffle", "x_scale_t", "w_scale", "out"]
             if preshuffleB

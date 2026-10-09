@@ -34,7 +34,7 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @benchmark()
-def test_gemm(m, n, k, dtype, layout, scale_layout):
+def test_gemm(m, n, k, dtype, layout, scale_layout, data_init):
     from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_blockscale_common import (
         kernel_fits_shape,
         kernels_list,
@@ -43,8 +43,12 @@ def test_gemm(m, n, k, dtype, layout, scale_layout):
     preshuffle_b = layout == "preshuffle"
     gfx = get_gfx()
     torch.manual_seed(0)
-    x = (torch.rand((m, k), device="cuda") / 10).to(torch.float8_e4m3fn)
-    weight = (torch.rand((n, k), device="cuda") / 10).to(torch.float8_e4m3fn)
+    if data_init == "signed":
+        x = (torch.randn((m, k), device="cuda") / 10).to(torch.float8_e4m3fn)
+        weight = (torch.randn((n, k), device="cuda") / 10).to(torch.float8_e4m3fn)
+    else:
+        x = (torch.rand((m, k), device="cuda") / 10).to(torch.float8_e4m3fn)
+        weight = (torch.rand((n, k), device="cuda") / 10).to(torch.float8_e4m3fn)
     # Vary scales by both row and K block; all-ones scales miss layout errors.
     x_scale = torch.rand((m, k // 128), device="cuda") + 0.1
     w_scale = torch.rand(((n + 127) // 128, k // 128), device="cuda") + 0.1
@@ -83,7 +87,7 @@ def test_gemm(m, n, k, dtype, layout, scale_layout):
                 fn = lambda: aiter.gemm_a8w8_blockscale(
                     x, gemm_weight, gemm_scale, w_scale, dtype=dtype
                 )
-            result, us = run_perftest(fn, num_iters=21)
+            result, us = run_perftest(fn, num_iters=50, num_warmup=50)
         if preshuffle_b:
             assert result.data_ptr() == out.data_ptr(), "out= must be honored"
         assert bool(torch.isfinite(result).all()), name
@@ -153,15 +157,22 @@ def main():
         choices=["non-transposed", "transposed"],
         default=["non-transposed", "transposed"],
     )
+
+    parser.add_argument(
+        "--data-init",
+        nargs="+",
+        choices=["uniform", "signed"],
+        default=["uniform", "signed"],
+    )
     args = parser.parse_args()
     rows = []
-    for dtype, (m, n, k), layout, scale_layout in itertools.product(
-        args.dtype, args.mnk, args.layout, args.scale_layout
+    for dtype, (m, n, k), layout, scale_layout, data_init in itertools.product(
+        args.dtype, args.mnk, args.layout, args.scale_layout, args.data_init
     ):
         # The preshuffle API requires transposed activation scales.
         if layout == "preshuffle" and scale_layout == "non-transposed":
             continue
-        rows.append(test_gemm(m, n, k, dtype, layout, scale_layout))
+        rows.append(test_gemm(m, n, k, dtype, layout, scale_layout, data_init))
     aiter.logger.info(
         "FlyDSL blockscale summary:\n%s", pd.DataFrame(rows).to_markdown(index=False)
     )
