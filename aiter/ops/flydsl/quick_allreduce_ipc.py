@@ -225,6 +225,12 @@ class UncachedIpcHeap:
         cls._hip_check(err, what="hipFree")
 
     @staticmethod
+    def rank_failures(errors) -> str | None:
+        """The per-rank errors of one exchange as a message naming each rank."""
+        failed = [f"rank {r}: {e}" for r, e in enumerate(errors) if e]
+        return "; ".join(failed) or None
+
+    @staticmethod
     def gather_object_list_via_broadcast(group, shard_data):
         """All-gather Python objects over ``group``.
 

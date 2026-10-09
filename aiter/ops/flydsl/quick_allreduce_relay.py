@@ -57,7 +57,10 @@ class RelayProvider(Protocol):
         relay_in: int,
         nbytes: int,
     ) -> RelayBounce:
-        """Collective over *group*; every rank calls it in the same order."""
+        """Collective over *group*; every rank calls it in the same order.
+
+        Raises on every rank or on none.
+        """
 
 
 class InGroupRelayProvider:
@@ -95,10 +98,10 @@ class InGroupRelayProvider:
         # or allocation failure on one rank would otherwise leave the other
         # waiting in the broadcast.
         metas = heap.gather_object_list_via_broadcast(group, (err, handle, 0))
-        failures = [item[0] for item in metas if item[0]]
+        failures = heap.rank_failures([item[0] for item in metas])
         if failures:
             self._release(heap, own, None)
-            raise RuntimeError(failures[0])
+            raise RuntimeError(failures)
 
         opened = None
         err = None
@@ -112,12 +115,12 @@ class InGroupRelayProvider:
         # Same agreement after the peer mapping. The rank that opened its
         # handle must close it before the caller moves on to the inbox
         # exchange, or the successful rank waits there alone.
-        open_failures = [
-            item for item in heap.gather_object_list_via_broadcast(group, err) if item
-        ]
+        open_failures = heap.rank_failures(
+            heap.gather_object_list_via_broadcast(group, err)
+        )
         if open_failures:
             self._release(heap, own, opened)
-            raise RuntimeError(open_failures[0])
+            raise RuntimeError(open_failures)
 
         def close():
             self._release(heap, own, opened)
