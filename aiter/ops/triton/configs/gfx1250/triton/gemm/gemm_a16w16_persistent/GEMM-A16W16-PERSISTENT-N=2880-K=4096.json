@@ -7,9 +7,7 @@
         "GROUP_SIZE_M": 4,
         "num_stages": 3,
         "waves_per_eu": 2,
-        "NUM_KSPLIT": 1,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": null
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_256": {
         "BLOCK_SIZE_M": 128,
@@ -19,9 +17,7 @@
         "GROUP_SIZE_M": 1,
         "num_stages": 3,
         "waves_per_eu": 2,
-        "NUM_KSPLIT": 1,
-        "matrix_instr_nonkdim": 32,
-        "cache_modifier": null
+        "NUM_KSPLIT": 1
     },
     "any": {
         "BLOCK_SIZE_M": 128,
@@ -31,8 +27,6 @@
         "GROUP_SIZE_M": 4,
         "num_stages": 3,
         "waves_per_eu": 1,
-        "NUM_KSPLIT": 1,
-        "matrix_instr_nonkdim": 32,
-        "cache_modifier": null
+        "NUM_KSPLIT": 1
     }
 }

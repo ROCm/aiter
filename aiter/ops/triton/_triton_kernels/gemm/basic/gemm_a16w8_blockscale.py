@@ -78,8 +78,8 @@ def _gemm_a16w8_blockscale_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr = 0,  # gfx1250 configs omit it
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function
@@ -277,8 +277,8 @@ def _gemm_a16w8_blockscale_preshuffle_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr = 0,  # gfx1250 configs omit it
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function

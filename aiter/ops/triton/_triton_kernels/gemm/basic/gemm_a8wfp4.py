@@ -65,7 +65,7 @@ def _gemm_a8wfp4_kernel(
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
     RAW_MASKED_LOADS: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """
     Kernel for computing the matmul C = A x B.

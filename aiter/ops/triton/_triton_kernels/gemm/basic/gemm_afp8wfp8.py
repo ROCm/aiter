@@ -542,8 +542,8 @@ def _gemm_afp8wfp8_preshuffle_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr = 0,  # gfx1250 configs omit it
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """
     Preshuffle variant of _gemm_afp8wfp8_kernel. Weight tensor has been shuffled

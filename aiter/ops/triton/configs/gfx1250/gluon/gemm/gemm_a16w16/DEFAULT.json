@@ -5,7 +5,6 @@
      "BLOCK_K": 64,
      "NUM_BUFFERS": 5,
      "num_warps": 2,
-     "kernel_type": "bandwidth_bound",
-     "persistent": false
+     "kernel_type": "bandwidth_bound"
  }
 }

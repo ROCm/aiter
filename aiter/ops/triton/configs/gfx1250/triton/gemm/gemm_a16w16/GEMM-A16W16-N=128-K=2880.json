@@ -5,8 +5,7 @@
         "BLOCK_SIZE_K": 256,
         "num_warps": 2,
         "GROUP_SIZE_M": 1,
-        "NUM_KSPLIT": 1,
-        "cache_modifier": null
+        "NUM_KSPLIT": 1
     },
     "any": {
         "BLOCK_SIZE_M": 64,
@@ -14,7 +13,6 @@
         "BLOCK_SIZE_K": 64,
         "num_warps": 2,
         "GROUP_SIZE_M": 1,
-        "NUM_KSPLIT": 1,
-        "cache_modifier": null
+        "NUM_KSPLIT": 1
     }
 }
