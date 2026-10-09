@@ -9,12 +9,16 @@ MFMA specialization details. Native BF16 uses unscaled, 8-element vectorized
 K/V caches and BF16 queries.
 """
 
+from contextlib import contextmanager
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl.autotune import Config, autotune
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
+from .kernels.pa_decode import implementation_cache_tag
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
@@ -179,10 +183,10 @@ def pa_decode(
     position; 0 and -1 disable it.
 
     ``work_plan`` is required and must be built with ``plan_pa_decode`` before
-    calling decode. Use ``pa_decode_tuning.get_cached_budget`` to read an
-    offline-tuned budget from FlyDSL's cache when creating a plan. Cache lookup
-    returns twice the device CU count on a miss and never benchmarks. Build the
-    plan before graph capture; decode does not access the tuning cache. Set its
+    calling decode. ``prepare_pa_decode_plan`` uses native FlyDSL autotune to
+    select its budget before graph capture. A cache miss uses twice the device
+    CU count; ``FLYDSL_AUTOTUNE=1`` forces a search during preparation. Decode
+    and graph replay use the explicit plan without accessing autotune. Set its
     partition cap with ``plan_pa_decode(max_partitions=...)``; even a cap of one
     uses packed scratch and reduction.
 
@@ -698,4 +702,282 @@ def pa_decode(
             context_partition_num=reduce_partitions,
             stream=s,
             reduce_info=work_plan.reduce_info,
+        )
+
+
+class _PADecodeAutotuneResources:
+    """Prepare candidate plans and graphs outside FlyDSL's timed replay."""
+
+    def __init__(self, query, args, options, max_partitions):
+        self.query = query
+        self.args = args
+        self.options = options
+        self.max_partitions = max_partitions
+        self.outputs = {}
+        self.graphs = {}
+        self.plans = {}
+        self.workspaces = {}
+        self.reference = None
+
+    def prepare(self, workgroup_budget):
+        if workgroup_budget in self.graphs:
+            return
+        key, value, lengths, table, scale, query_length = self.args
+        if key.dtype != torch.bfloat16:
+            if (self.options["key_scale"] is None) != (
+                self.options["value_scale"] is None
+            ):
+                raise ValueError(
+                    "key_scale and value_scale must either both be provided or both be None"
+                )
+            for name in ("key_scale", "value_scale"):
+                kv_scale = self.options[name]
+                if not isinstance(kv_scale, torch.Tensor):
+                    # Scalar host-to-device copies must precede graph capture.
+                    self.options[name] = torch.tensor(
+                        [1.0 if kv_scale is None else float(kv_scale)],
+                        dtype=torch.float32,
+                        device=self.query.device,
+                    )
+        plan = plan_pa_decode(
+            lengths,
+            key.shape[1],
+            max_partitions=self.max_partitions,
+            workgroup_budget=workgroup_budget,
+            sliding_window=self.options["sliding_window"],
+            query_length=query_length,
+        )
+        rows = query_length * self.query.shape[1] // key.shape[1]
+        scalar_shape = (key.shape[1], plan.capacity, rows)
+        output = torch.full_like(
+            self.query, float("nan"), memory_format=torch.contiguous_format
+        )
+        workspace = {
+            "exp_sums": torch.empty(
+                scalar_shape, dtype=torch.float32, device=output.device
+            ),
+            "max_logits": torch.empty(
+                scalar_shape, dtype=torch.float32, device=output.device
+            ),
+            "temporary_output": torch.empty(
+                (*scalar_shape, self.query.shape[-1]),
+                dtype=output.dtype,
+                device=output.device,
+            ),
+        }
+
+        def launch():
+            pa_decode(
+                output,
+                self.query,
+                key,
+                value,
+                lengths,
+                table,
+                scale,
+                query_length,
+                work_plan=plan,
+                **self.options,
+                **workspace,
+            )
+
+        # Eager compilation and graph capture precede native autotune timing.
+        stream = torch.cuda.current_stream()
+        capture_stream = torch.cuda.Stream(device=output.device)
+        capture_stream.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(capture_stream):
+            launch()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                launch()
+        stream.wait_stream(capture_stream)
+        graph.replay()
+        stream.synchronize()
+        if not torch.isfinite(output).all().item():
+            raise ArithmeticError("PA autotune candidate produced nonfinite output")
+        self.outputs[workgroup_budget] = output
+        self.graphs[workgroup_budget] = graph
+        # Graph replay uses the original pointers, so retain all backing tensors.
+        self.plans[workgroup_budget] = plan
+        self.workspaces[workgroup_budget] = workspace
+        if self.reference is None:
+            self.reference = output.clone()
+        else:
+            torch.testing.assert_close(output, self.reference, atol=5e-3, rtol=5e-3)
+
+
+def _pa_decode_configs(*args, resources, num_cu, **kwargs):
+    # Keep a validated 2*CU baseline; deduplicate identical plan capacities.
+    baseline = 2 * num_cu
+    resources.prepare(baseline)
+    batch = resources.args[2].numel()
+    kv_heads = resources.args[0].shape[1]
+    capacities = {}
+    for budget in [baseline, 128, 256, 512, 1024, 2048, 4096]:
+        capacity = min(
+            batch * resources.max_partitions,
+            max(batch, (budget + kv_heads - 1) // kv_heads),
+        )
+        capacities.setdefault(capacity, Config(workgroup_budget=budget))
+    return list(capacities.values())
+
+
+def _pa_decode_default(*args, num_cu, **kwargs):
+    return Config(workgroup_budget=2 * num_cu)
+
+
+@contextmanager
+def _validate_pa_decode_config(arguments):
+    resources = arguments["resources"]
+    budget = arguments["workgroup_budget"]
+    resources.prepare(budget)
+    resources.outputs[budget].fill_(float("nan"))
+    yield
+    torch.cuda.current_stream().synchronize()
+    torch.testing.assert_close(
+        resources.outputs[budget], resources.reference, atol=5e-3, rtol=5e-3
+    )
+
+
+@autotune(
+    configs=_pa_decode_configs,
+    key=["attention_key", "num_cu", "implementation"],
+    default=_pa_decode_default,
+    validate_hook=_validate_pa_decode_config,
+)
+def _pa_decode_autotuner(
+    attention_key, num_cu, implementation, resources, *, workgroup_budget
+):
+    resources.graphs[workgroup_budget].replay()
+
+
+def prepare_pa_decode_plan(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    query_length: int,
+    *,
+    compute_type: torch.dtype = torch.bfloat16,
+    key_scale: torch.Tensor | float | None = None,
+    value_scale: torch.Tensor | float | None = None,
+    sinks: torch.Tensor | None = None,
+    sliding_window: int = 0,
+    max_partitions: int | None = None,
+    max_context_length: int | None = None,
+) -> PADecodePlan:
+    """Select a work budget using native FlyDSL autotune, then build a plan.
+
+    Call outside graph capture with the actual decode tensors/options. Native
+    cache hits and misses with the 2*CU default do not launch candidates.
+    Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
+    FlyDSL's default benchmark and fastest-config selection. Candidates must
+    agree with the 2*CU baseline; independent FP32 accuracy is covered by tests.
+    Set FLYDSL_AUTOTUNE_CACHE_DIR before importing this module to choose the
+    native cache directory.
+
+    Retain the returned plan for decode/graph replay. Refresh it with
+    plan_pa_decode(..., plan=plan) when context lengths change; decode never
+    invokes autotune. Workspace sizes follow the returned plan.capacity.
+    """
+    with torch.cuda.device(query.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("prepare_pa_decode_plan must run before graph capture")
+        num_cu = torch.cuda.get_device_properties(query.device).multi_processor_count
+        limit = num_cu if max_partitions is None else max_partitions
+        # Validate plan geometry even when native autotune takes the default.
+        default_plan = plan_pa_decode(
+            context_lengths,
+            key_cache.shape[1],
+            max_partitions=limit,
+            sliding_window=sliding_window,
+            query_length=query_length,
+        )
+        options = {
+            "compute_type": compute_type,
+            "key_scale": key_scale,
+            "value_scale": value_scale,
+            "sinks": sinks,
+            "sliding_window": default_plan.sliding_window,
+            "max_context_length": max_context_length,
+        }
+        resources = _PADecodeAutotuneResources(
+            query,
+            (
+                key_cache,
+                value_cache,
+                context_lengths,
+                block_tables,
+                softmax_scale,
+                query_length,
+            ),
+            options,
+            limit,
+        )
+
+        def tensor_key(tensor):
+            if tensor is None:
+                return None
+            if not isinstance(tensor, torch.Tensor):
+                return float(tensor)
+            # Decode squeezes trailing singleton per-token scales.
+            if tensor is key_scale or tensor is value_scale:
+                if tensor.numel() == 1:
+                    return (str(tensor.dtype), (1,), (1,))
+                if tensor.ndim == 4 and tensor.shape[-1] == 1:
+                    tensor = tensor.squeeze(-1)
+            return (str(tensor.dtype), tuple(tensor.shape), tuple(tensor.stride()))
+
+        attention_key = (
+            tuple(
+                tensor_key(tensor)
+                for tensor in (
+                    query,
+                    key_cache,
+                    value_cache,
+                    context_lengths,
+                    block_tables,
+                    key_scale,
+                    value_scale,
+                    sinks,
+                )
+            ),
+            softmax_scale,
+            query_length,
+            str(compute_type),
+            default_plan.sliding_window,
+            limit,
+            max_context_length,
+            max(
+                key_cache.numel() * key_cache.element_size(),
+                value_cache.numel() * value_cache.element_size(),
+            )
+            >= 2**31,
+        )
+        config = _pa_decode_autotuner.resolve_config(
+            attention_key=attention_key,
+            num_cu=num_cu,
+            implementation=implementation_cache_tag(),
+            resources=resources,
+        )
+        budget = config.kwargs.get("workgroup_budget")
+        if (
+            set(config.all_kwargs()) != {"workgroup_budget"}
+            or type(budget) is not int
+            or budget < 1
+            or config.compiler_opts()
+            or config.pre_hook is not None
+        ):
+            raise ValueError("Invalid PA workgroup budget in FlyDSL autotune cache")
+        if budget == 2 * num_cu:
+            return default_plan
+        return plan_pa_decode(
+            context_lengths,
+            key_cache.shape[1],
+            max_partitions=limit,
+            workgroup_budget=budget,
+            sliding_window=default_plan.sliding_window,
+            query_length=query_length,
         )
