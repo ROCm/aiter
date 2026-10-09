@@ -9,7 +9,13 @@ import triton.language as tl
 
 import aiter.ops.triton.attention.pa_decode as pa_decode_mod
 from aiter import logger, pertoken_quant
-from aiter.ops.triton.attention.pa_decode import paged_attention_decode
+from aiter.ops.triton.attention.pa_decode import (
+    paged_attention_decode,
+    paged_attn_decode_v1,
+    paged_attn_decode_v1_per_token_quant,
+    paged_attn_decode_v2,
+    paged_attn_decode_v2_per_token_quant,
+)
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
@@ -295,6 +301,94 @@ def test_paged_attn_v2(
         output_type=output_type,
     )
     assert v2_calls, "SEQ_LEN=4096 was expected to dispatch to the V2 kernels"
+
+
+# The kernels pad the KV block axis to next_power_of_2(KV_BLK_SZ). The padding
+# lanes of every non-last block have a token index below seq_len, so they must
+# be masked out of the softmax explicitly; otherwise each one adds exp(0 - max)
+# to the denominator and shrinks the output. The other tests only use
+# power-of-two block sizes, which have no padding lanes.
+# The V2 wrappers are called directly with a single partition: the public
+# dispatcher only picks V2 for multi-partition sequences, and the GQA V1
+# wrappers pass KV_BLK_SZ_POW2=KV_BLK_SZ, so they only accept power-of-two
+# block sizes and are not covered here.
+@pytest.mark.parametrize(
+    "B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, NUM_BLK, version",
+    [
+        (1, 1, 1, 3, 6, 2, "v1"),  # minimal: two full blocks of 3 tokens
+        (4, 16, 16, 3, 1000, 64, "v1"),
+        (4, 16, 16, 5, 1000, 64, "v1"),
+        (4, 16, 16, 48, 1000, 32, "v1"),
+        (4, 16, 16, 3, 1000, 64, "v2"),
+        (4, 16, 16, 48, 1000, 32, "v2"),
+        (4, 32, 8, 3, 1000, 64, "v2"),
+        (4, 32, 8, 48, 1000, 32, "v2"),
+    ],
+)
+@pytest.mark.parametrize("per_token_quant", [False, True])
+def test_paged_attn_non_pow2_blk_sz(
+    B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, NUM_BLK, version, per_token_quant
+):
+    head_size = 128
+    dtype = torch.bfloat16
+    compute_type = tl.bfloat16
+
+    (
+        query,
+        triton_output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        max_context_len,
+    ) = input_helper(
+        B, H_Q, H_KV, head_size, KV_BLK_SZ, SEQ_LEN, dtype, dtype, dtype, NUM_BLK
+    )
+    attn_scale = 1.0 / (head_size**0.5)
+
+    # A bf16 cache with unit per-token scales runs the per-token-quant kernels
+    # without quantization error, so both paths share one tolerance.
+    if per_token_quant:
+        k_scale = torch.ones(
+            NUM_BLK, H_KV, KV_BLK_SZ, dtype=torch.float32, device="cuda"
+        )
+        v_scale = torch.ones_like(k_scale)
+        decode_v1 = paged_attn_decode_v1_per_token_quant
+        decode_v2 = paged_attn_decode_v2_per_token_quant
+    else:
+        k_scale = v_scale = 1.0
+        decode_v1 = paged_attn_decode_v1
+        decode_v2 = paged_attn_decode_v2
+
+    args = (
+        triton_output,
+        query,
+        key_cache_tri,
+        value_cache_tri,
+        block_tables,
+        context_lens,
+        max_context_len,
+        compute_type,
+        H_KV,
+        attn_scale,
+        None,  # alibi_slopes
+        k_scale,
+        v_scale,
+    )
+    if version == "v1":
+        decode_v1(*args)
+    else:
+        assert SEQ_LEN <= 1024, "single-partition V2 case"
+        decode_v2(*args, 1)  # max_num_partitions
+
+    torch_output = torch.zeros(B, H_Q, head_size, dtype=dtype, device="cuda")
+    paged_attention_decode_ref(
+        torch_output, query, key_cache, value_cache, block_tables, context_lens
+    )
+
+    torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
 @pytest.mark.parametrize("B, H_Q, H_KV", [(1, 8, 1), (4, 16, 16), (64, 16, 16)])
