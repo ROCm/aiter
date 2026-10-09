@@ -26,13 +26,14 @@
 #include <hip/hip_runtime.h>
 #include <hip/hip_bf16.h>
 #include "aiter_hip_common.h"
+#include "aiter_opus_plus.h" // load_vector_nbytes, store_vector
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include "fused_moe_router.h"
+#include "hip_reduce.h"     // multithread_reduce
+#include "mx_quant_utils.h" // fp4_f32_to_e8m0_scale, mx_scale_shuffle_idx
 #include "opus/opus.hpp"
 #include "warp_sort.h" // aiter::mov_dpp_
-#include "quant_kernels.cu" // device helpers: scaled_quant_vgpr_impl, load_vector_nbytes,
-                            // multithread_reduce, fp4_f32_to_e8m0_scale, mx_scale_shuffle_idx
 
 namespace aiter {
 namespace fmr {
@@ -358,9 +359,8 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
     vec_i vin =
         load_vector_nbytes<DTYPE_I, TD, (sizeof(DTYPE_I) * TD % 16 == 0 ? 16 : 8), /*aux=*/0>(
             buffer_input, threadIdx.x * TD);
-    vec_f  vin_f32;
-    float* vin_f32_ptr = reinterpret_cast<float*>(&vin_f32);
-    float  absMax      = 1e-10f;
+    vec_f vin_f32;
+    float absMax = 1e-10f;
 #pragma unroll
     for(int j = 0; j < TD; ++j)
     {
@@ -374,8 +374,14 @@ __device__ __forceinline__ void phase1_quant_token(opus::fp4_t* __restrict__ out
         tok_scale[(int64_t)token * scaleN_pad + scale_k] =
             (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF;
 
-    scaled_quant_vgpr_impl<float, opus::fp4_t, TD>(out, vin_f32_ptr, &row_scale, cols,
-                                                   (int64_t)token * cols);
+    // fp4 takes the e8m0 scale as-is (no reciprocal); two values per byte.
+    static constexpr int32_t ooba_o = 4 / sizeof(opus::fp4_t);
+    const int32_t oob_o             = (cols + ooba_o - 1) / ooba_o * ooba_o;
+    auto* ptr_o     = reinterpret_cast<uint8_t*>(out + (int64_t)token * cols / 2);
+    auto buffer_out = opus::make_gmem<uint8_t>(ptr_o, oob_o * sizeof(uint8_t));
+    if(threadIdx.x < (cols + TD - 1) / TD)
+        store_vector<uint8_t, float, TD, RT, false, WARP_SIZE, 1, opus::fp4_t>(
+            buffer_out, vin_f32, threadIdx.x * (TD / 2), row_scale);
 }
 
 // One token of phase 1: load, quant, select (see phase1_topk_load for why that
@@ -937,6 +943,9 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                 "fused_moe_router_impl: need 0 <= ep_rank < ep_size, got ep_rank=",
                 ep_rank, " ep_size=", ep_size);
     AITER_CHECK(cols == BlockSize * TD, "fused_moe_router_impl: cols must be ", BlockSize * TD);
+    AITER_CHECK(hidden.size(0) == M,
+                "fused_moe_router_impl: gating has ", M, " tokens but hidden has ",
+                hidden.size(0));
     const bool ep    = expert_mask.has_value();
     const int  E_tot = expert_slots(E, n_shared, ep);
     // Without a mask there is no slot to park the non-owner shared row on, so
@@ -950,8 +959,8 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                 "fused_moe_router_impl: num_experts must be <= ", 2 * BlockSize,
                 ", got ", E);
     // A partial group would make the abs-max reduction span the wrong lanes.
-    AITER_CHECK(group_size % TD == 0,
-                "fused_moe_router_impl: group_size must be a multiple of ", TD,
+    AITER_CHECK(group_size > 0 && group_size % TD == 0,
+                "fused_moe_router_impl: group_size must be a positive multiple of ", TD,
                 ", got ", group_size);
     // Phase 3's hoisted swizzle table is only complete on an aligned column
     // span; a partial span leaves trailing scale columns holding stale
@@ -1046,8 +1055,17 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                          std::make_pair(&sorted_weights, "sorted_weights"),
                          std::make_pair(&sorted_expert_ids, "sorted_expert_ids"),
                          std::make_pair(&num_valid_ids, "num_valid_ids")})
+    {
         AITER_CHECK(p.first->is_contiguous(),
                     "fused_moe_router_impl: ", p.second, " must be contiguous");
+        AITER_CHECK(p.first->device_id == gating.device_id,
+                    "fused_moe_router_impl: ", p.second, " is on device ",
+                    p.first->device_id, " but gating is on ", gating.device_id);
+    }
+    if(moe_buf_ptr != nullptr)
+        AITER_CHECK(moe_buf->device_id == gating.device_id,
+                    "fused_moe_router_impl: moe_buf is on device ", moe_buf->device_id,
+                    " but gating is on ", gating.device_id);
     // The shared rows extend each token's stride, and the kernel indexes these
     // with the widened stride; a caller that sized them [M, topk] would have
     // every token past the first write out of bounds.
@@ -1057,6 +1075,28 @@ void fused_moe_router_impl(aiter_tensor_t& gating,
                     "fused_moe_router_impl: ", p.second, " has ", p.first->numel(),
                     " elements, need M * (topk + fused shared) = ",
                     (int64_t)M * topk_total);
+    // Phase 3 writes through num_valid, not through these lengths, so an
+    // undersized output is an out-of-bounds device write.
+    const int64_t need_rows =
+        (int64_t)M * topk_total + (int64_t)E_tot * unit_size - topk_total;
+    const int64_t need_blocks = (need_rows + unit_size - 1) / unit_size;
+    const int64_t scaleN_pad  = ((cols + group_size - 1) / group_size + kScalesPerThread - 1) /
+                               kScalesPerThread * kScalesPerThread;
+    const int64_t out_rows    = ((int64_t)sorted_ids.numel() + 31) / 32 * 32;
+    auto check_min = [](const aiter_tensor_t& t, const char* name, int64_t need, bool bytes) {
+        const int64_t have =
+            (int64_t)t.numel() * (bytes ? (int64_t)t.element_size() : 1);
+        AITER_CHECK(have >= need, "fused_moe_router_impl: ", name, " has ", have,
+                    bytes ? " B" : " elements", ", need at least ", need);
+    };
+    check_min(sorted_ids, "sorted_ids", need_rows, false);
+    check_min(sorted_weights, "sorted_weights", need_rows, false);
+    check_min(sorted_expert_ids, "sorted_expert_ids", need_blocks, false);
+    check_min(num_valid_ids, "num_valid_ids", 2, false);
+    check_min(out_fp4, "out_fp4", (int64_t)M * cols / 2, true);
+    check_min(out_scale, "out_scale", out_rows * scaleN_pad, true);
+    if(moe_buf_ptr != nullptr)
+        check_min(*moe_buf, "moe_buf", (int64_t)M * cols, false);
 
     const opus::bf16_t* g = typed_ptr<const opus::bf16_t>(gating, AITER_DTYPE_bf16, "gating");
     const opus::bf16_t* h = typed_ptr<const opus::bf16_t>(hidden, AITER_DTYPE_bf16, "hidden");
