@@ -115,11 +115,14 @@ _CASES = {
 }
 
 
+@pytest.mark.parametrize("disable_recompute", [False, True], ids=["recompute", "saved"])
 @pytest.mark.parametrize("case", list(_CASES))
-def test_backward(case):
+def test_backward(case, disable_recompute):
     """Gradients of every input match autograd through the fp32 recurrence."""
     B, T, H, HV, K, V, varlen, state, opts = _CASES[case]
     opts = dict(opts, state_v_first=state == "h0_vfirst")
+    if disable_recompute:
+        opts["disable_recompute"] = True
     x, cu = _inputs(
         B,
         T,
@@ -171,6 +174,32 @@ def test_backward_flash_matches_default(monkeypatch):
         grads.append({n: t.grad for n, t in leaves.items()})
     for n in x:
         assert _err_ratio(grads[1][n], grads[0][n]) < _ERR_RATIO, n
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+def test_saved_matches_recompute(monkeypatch, varlen):
+    """Saving the intermediates changes nothing when both run the same forward.
+
+    Pinned to the default pipeline at chunk 64, the recompute repeats the
+    forward's arithmetic (its own copy of the state recurrence included), so
+    the gradients are bitwise identical.
+    """
+    monkeypatch.setattr(chunk_fwd, "AITER_FDA_ENABLE", False)
+    x, cu = _inputs(3, 300, 2, 2, 128, 128, varlen, "h0", precomputed_gate=False)
+    grads = []
+    for disable_recompute in (False, True):
+        leaves = {n: t.detach().clone().requires_grad_(True) for n, t in x.items()}
+        o, s = chunk_kimi_delta_attn(
+            **leaves,
+            cu_seqlens=cu,
+            output_final_state=True,
+            disable_recompute=disable_recompute,
+            **dict(_FLASH, chunk_size=64),
+        )
+        (o.float().square().sum() + s.float().sum()).backward()
+        grads.append({n: t.grad for n, t in leaves.items()})
+    for n in x:
+        assert torch.equal(grads[0][n], grads[1][n]), n
 
 
 def test_backward_partial_requires_grad():

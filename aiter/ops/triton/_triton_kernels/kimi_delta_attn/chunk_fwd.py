@@ -101,7 +101,9 @@ def chunk_delta_attn_fwd(
         use_gate_in_kernel: If True, fuse A_log / dt_bias into the gate cumsum.
         A_log:              Per-head log-scale ``[HV]`` (needed when use_gate_in_kernel).
         dt_bias:            Per-head dt bias ``[HV * K]`` (optional).
-        disable_recompute:  If True, store QG/KG/W/U for reuse (not freed early).
+        disable_recompute:  If True, return every intermediate the backward
+                            reads (``chunk_delta_attn_bwd(saved=...)``) instead
+                            of freeing them.
         use_qk_l2norm_in_kernel: If True, apply L2 normalization to q and k.
         use_beta_sigmoid_in_kernel: If True, apply sigmoid to beta.
         state_v_first:      Store the recurrent state V-first (``[V, K]``) instead
@@ -112,13 +114,15 @@ def chunk_delta_attn_fwd(
         state_cache:        Optional paged fp32 V-first cache. FlashKDA-only.
 
     Returns:
-        (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg)
+        (o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, qn, kn, bn)
           o           ``[B, T, HV, V]``
           final_state ``[N, HV, K, V]`` (or ``[N, HV, V, K]``) or None
           g_cumsum    ``[B, T, HV, K]`` (gate in log2 space)
           Aqk         ``[B, T, HV, BT]``
           Akk         ``[B, T, HV, BT]``
-          w, u, qg, kg or None depending on disable_recompute
+          w, u, qg, kg, v_new, h (``[B, NT, HV, K, V]``) and the activated
+          q / k / beta (``qn`` / ``kn`` / ``bn``) with ``disable_recompute``,
+          else None
     """
     # ------------------------------------------------------------------
     # Fast path — two-kernel FlashKDA split
@@ -190,7 +194,7 @@ def chunk_delta_attn_fwd(
             state_indices=state_indices,
             has_initial_state=has_initial_state,
         )
-        return o, final_state, None, None, None, None, None, None, None
+        return (o, final_state) + (None,) * 12
 
     # ------------------------------------------------------------------
     # Step 0 — Optional QK L2 normalization (matches FLA API)
@@ -282,6 +286,6 @@ def chunk_delta_attn_fwd(
 
     if not disable_recompute:
         w, u, qg, kg, v_new = None, None, None, None, None
-        h = None
+        h = q = k = beta = None
 
-    return o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg
+    return o, final_state, g_cumsum, Aqk, Akk, w, u, qg, kg, v_new, h, q, k, beta

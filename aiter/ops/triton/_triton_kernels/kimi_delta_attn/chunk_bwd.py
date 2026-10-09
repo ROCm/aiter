@@ -5,12 +5,12 @@
 """
 Backward pass for chunk_delta_attn.
 
-The backward saves only the forward's inputs and recomputes the default
-pipeline's intermediates (``g`` cumsum in log2 space, ``Aqk``, ``Akk``,
-``w``/``u``/``qg``/``kg``, ``h``, ``v_new``), as fla does with
-``disable_recompute=False``. The gradient is that of the default pipeline,
-whichever path ran the forward: FlashKDA computes the same function up to
-rounding. Stages:
+The backward works on the default pipeline's intermediates (``g`` cumsum in
+log2 space, ``Aqk``, ``Akk``, ``w``/``u``/``qg``/``kg``, ``h``, ``v_new``).
+By default it recomputes them from the forward's inputs, so the forward keeps
+only its inputs and may take the FlashKDA path, which computes the same
+function up to rounding. A forward run with ``disable_recompute=True`` returns
+them instead, and the backward reads them as given (``saved``). Stages:
 
 1. ``dAqk = do @ v_new^T * scale``, ``dv = Aqk^T @ do``
    (``chunk_delta_attn_bwd_kernel_dav``).
@@ -1764,16 +1764,21 @@ def chunk_delta_attn_bwd(
     use_qk_l2norm_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     state_v_first: bool = False,
+    saved: tuple | None = None,
 ) -> tuple:
     """
-    Backward pass for chunk_delta_attn, recomputing the forward's intermediates.
+    Backward pass for chunk_delta_attn.
 
     Args:
-        do:   Gradient of the output ``[B, T, HV, V]``.
-        dht:  Gradient of the final state, laid out like ``initial_state``, or None.
+        do:    Gradient of the output ``[B, T, HV, V]``.
+        dht:   Gradient of the final state, laid out like ``initial_state``, or None.
+        saved: The forward's intermediates ``(g_cumsum, Aqk, Akk, w, u, qg, kg,
+               v_new, h, qn, kn, bn)``, as ``chunk_delta_attn_fwd`` returns them
+               with ``disable_recompute=True``. None recomputes them from the
+               inputs (``chunk_size`` 32 or 64, whatever the forward ran with);
+               otherwise ``chunk_size`` must be the forward's.
         The rest are the forward's inputs, contiguous, as ``chunk_delta_attn_fwd``
-        takes them. ``chunk_size`` is the default pipeline's (32 or 64), whatever
-        the forward ran with.
+        takes them.
 
     Returns:
         ``(dq, dk, dv, dg, dbeta, dA_log, ddt_bias, dh0)``, each in the dtype of
@@ -1797,31 +1802,40 @@ def chunk_delta_attn_bwd(
         chunk_offsets = None
         NT = triton.cdiv(T, BT)
     num_cus = _num_cus(q.device.index or 0)
-    rec_cfg = _fused_recurrences_config(N * HV, V, num_cus)
-
-    qn, kn, bn, gc, Aqk, Akk, w, u, qg, kg, h, v_new = _recompute_fwd(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        scale=scale,
-        initial_state=initial_state,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-        chunk_size=BT,
-        safe_gate=safe_gate,
-        lower_bound=lower_bound,
-        use_gate_in_kernel=use_gate_in_kernel,
-        A_log=A_log,
-        dt_bias=dt_bias,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-        use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-        state_v_first=state_v_first,
-        run_fwd_h=rec_cfg is None,
-        num_cus=num_cus,
-    )
+    if saved is not None:
+        # The forward already ran fwd_h: nothing to share dhu's launch with.
+        rec_cfg = None
+        gc, Aqk, Akk, w, u, qg, kg, v_new, h, qn, kn, bn = saved
+        if Aqk.shape[-1] != BT:
+            raise ValueError(
+                f"`chunk_size` {BT} does not match the saved intermediates' "
+                f"{Aqk.shape[-1]}."
+            )
+    else:
+        rec_cfg = _fused_recurrences_config(N * HV, V, num_cus)
+        qn, kn, bn, gc, Aqk, Akk, w, u, qg, kg, h, v_new = _recompute_fwd(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            chunk_size=BT,
+            safe_gate=safe_gate,
+            lower_bound=lower_bound,
+            use_gate_in_kernel=use_gate_in_kernel,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+            use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
+            state_v_first=state_v_first,
+            run_fwd_h=rec_cfg is None,
+            num_cus=num_cus,
+        )
     do = do.contiguous()
     dht = dht.contiguous() if dht is not None else None
 

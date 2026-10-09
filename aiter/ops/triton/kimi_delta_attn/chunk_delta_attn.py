@@ -10,18 +10,19 @@ signature mirrors ``fla.ops.kda.chunk_kda`` so serving stacks can swap the two
 backends without reshaping tensors or re-deriving the gate.
 
 When any tensor input requires grad, the call runs under an autograd function
-whose backward is ``chunk_delta_attn_bwd``. It saves only the inputs and
-recomputes the default pipeline's intermediates, as fla does with
-``disable_recompute=False``.
+whose backward is ``chunk_delta_attn_bwd``. By default it saves only the inputs
+and the backward recomputes the default pipeline's intermediates; with
+``disable_recompute=True`` the forward keeps them for the backward instead.
 
 Notes on the fla-compatible surface:
     * ``state_v_first`` is spelled as fla spells it from 0.5.1 onward. fla's
       pre-0.5.1 name ``transpose_state_layout`` is deliberately not accepted, so
       a shared argument dict requires fla >= 0.5.1 on the other side.
-    * ``disable_recompute`` is accepted for signature parity but has no effect.
-      In fla, ``True`` keeps the forward's intermediates alive for the backward
-      to reuse. Here the backward always recomputes them from the inputs, which
-      also lets the forward take the FlashKDA path, which materializes none.
+    * ``disable_recompute=False`` recomputes more than fla's does: fla saves the
+      activated q/k/beta, ``Aqk`` and ``Akk`` and recomputes the rest, while
+      here only the inputs are saved, which also lets the forward take the
+      FlashKDA path. ``True`` matches fla: every intermediate is saved, and the
+      forward runs the default pipeline.
     * ``allow_neg_eigval`` / ``return_intermediate_states`` / ``cp_context`` /
       ``cu_seqlens_cpu`` have no counterpart yet and are rejected rather than
       silently ignored.
@@ -47,11 +48,17 @@ _BWD_DEFAULT_CHUNK_SIZE = 64
 
 
 class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
-    """Runs ``chunk_delta_attn_fwd``, saving only its inputs, and ``chunk_delta_attn_bwd``."""
+    """Runs ``chunk_delta_attn_fwd`` and ``chunk_delta_attn_bwd``.
+
+    With ``disable_recompute`` the forward's intermediates are saved for the
+    backward; otherwise only the inputs are, and the backward recomputes the rest.
+    """
 
     @staticmethod
-    def forward(ctx, q, k, v, g, beta, A_log, dt_bias, initial_state, kwargs):
-        o, final_state, *_ = chunk_delta_attn_fwd(
+    def forward(
+        ctx, q, k, v, g, beta, A_log, dt_bias, initial_state, disable_recompute, kwargs
+    ):
+        o, final_state, *saved = chunk_delta_attn_fwd(
             q=q,
             k=k,
             v=v,
@@ -60,11 +67,22 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
             A_log=A_log,
             dt_bias=dt_bias,
             initial_state=initial_state,
-            disable_recompute=False,
+            disable_recompute=disable_recompute,
             **kwargs,
         )
+        if not disable_recompute:
+            saved = []
         ctx.save_for_backward(
-            q, k, v, g, beta, A_log, dt_bias, initial_state, kwargs["cu_seqlens"]
+            q,
+            k,
+            v,
+            g,
+            beta,
+            A_log,
+            dt_bias,
+            initial_state,
+            kwargs["cu_seqlens"],
+            *saved,
         )
         ctx.kwargs = {
             key: val
@@ -75,11 +93,17 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do, dht):
-        q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens = ctx.saved_tensors
+        q, k, v, g, beta, A_log, dt_bias, initial_state, cu_seqlens, *saved = (
+            ctx.saved_tensors
+        )
         kwargs = dict(ctx.kwargs)
-        if kwargs["chunk_size"] is None:
+        if saved:
+            # Aqk's last dim is the chunk size the forward resolved to.
+            kwargs["chunk_size"] = saved[1].shape[-1]
+        elif kwargs["chunk_size"] is None:
             kwargs["chunk_size"] = _BWD_DEFAULT_CHUNK_SIZE
         grads = chunk_delta_attn_bwd(
+            saved=tuple(saved) if saved else None,
             do=do,
             dht=dht,
             q=q,
@@ -93,7 +117,7 @@ class _ChunkKimiDeltaAttnFunction(torch.autograd.Function):
             cu_seqlens=cu_seqlens,
             **kwargs,
         )
-        return (*grads, None)
+        return (*grads, None, None)
 
 
 def chunk_kimi_delta_attn(
@@ -180,9 +204,11 @@ def chunk_kimi_delta_attn(
         state_v_first (bool):
             Store the recurrent state V-first (`[V, K]`) instead of `[K, V]`.
         disable_recompute (bool):
-            Ignored. In fla this keeps the forward's intermediates alive for
-            the backward pass; here the backward always recomputes them, so
-            the flag is accepted for signature parity only.
+            Only matters when an input requires grad. `True` keeps the
+            forward's intermediates (about `T * HV * (4K + 2V + 2BT)` elements
+            plus `h`) for the backward instead of recomputing them; the forward
+            then runs the default pipeline even where FlashKDA could serve it.
+            Default: `False`.
         chunk_size (int, optional):
             Chunk size, either 32 or 64. Default: `None`, which lets the
             library choose. fla has no counterpart and pins 64 internally, so
@@ -344,6 +370,7 @@ def chunk_kimi_delta_attn(
             )
         o, final_state = _ChunkKimiDeltaAttnFunction.apply(
             *tensors,
+            disable_recompute,
             {
                 "scale": scale,
                 "output_final_state": output_final_state,
@@ -375,8 +402,7 @@ def chunk_kimi_delta_attn(
         use_gate_in_kernel=use_gate_in_kernel,
         A_log=A_log,
         dt_bias=dt_bias,
-        # Pinned off: it would only materialize `qg` for a backward, which
-        # recomputes it anyway, and the scratch is discarded below either way.
+        # Pinned off: without grad nothing reads the intermediates it would keep.
         disable_recompute=False,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
