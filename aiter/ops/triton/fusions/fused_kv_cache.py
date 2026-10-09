@@ -211,6 +211,9 @@ def fused_qk_rope_cat_and_cache_mla(
     assert (
         num_decode_toks_for_zeros >= 0
     ), "num_decode_toks_for_zeros must be non-negative to avoid invalid tensor creation"
+    assert (
+        num_decode_toks_for_zeros <= b
+    ), "num_decode_toks_for_zeros must not exceed the number of q tokens (b)"
     if isinstance(k_scale, torch.Tensor):
         assert k_scale.numel() == 1, "k_scale should be a single-element torch.Tensor"
     reuse_freqs_front_part = d_freq == d_pe // 2
