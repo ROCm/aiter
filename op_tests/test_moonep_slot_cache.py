@@ -3,8 +3,10 @@
 
 """Multi-rank test for MoonEPWeightPool.prefetch with a resident table.
 
-Asserts:
-  1. without ``resident`` every live slot is a byte copy of its owner's home
+The pool holds two parts per expert, a bf16 weight and a 48-byte block that
+leaves the segment off the VMM granularity.  Asserts:
+  1. without ``resident`` every live slot is a byte copy of its owner's home,
+     in every part
   2. with ``resident`` naming what a slot holds, that slot is not touched
      (proved by corrupting it first)
   3. a slot whose resident entry names another expert is refreshed
@@ -21,12 +23,24 @@ import sys
 import torch
 import torch.distributed as dist
 
-EPN, B, ROW = 4, 3, (256, 1024)
+EPN, B = 4, 3
+PARTS = [((256, 1024), torch.bfloat16), ((48,), torch.uint8)]
 
 
-def expert_w(e, dev):
+def expert_parts(e, dev):
     g = torch.Generator(device="cpu").manual_seed(500 + e)
-    return (torch.randn(*ROW, generator=g) * 0.05).to(torch.bfloat16).to(dev)
+    w = (torch.randn(*PARTS[0][0], generator=g) * 0.05).to(torch.bfloat16)
+    s = torch.randint(0, 256, PARTS[1][0], generator=g, dtype=torch.uint8)
+    return [w.to(dev), s.to(dev)]
+
+
+def home_of(pool_rank, base, dev):
+    return [
+        torch.stack(t)
+        for t in zip(
+            *(expert_parts(base + pool_rank * EPN + k, dev) for k in range(EPN))
+        )
+    ]
 
 
 def main() -> int:
@@ -48,32 +62,35 @@ def main() -> int:
         world_size=world,
         experts_per_rank=EPN,
         prefetch_slots=B,
-        weight_shape=ROW,
-        dtype=torch.bfloat16,
+        parts=PARTS,
         block_num=256,
     )
-    pool.stage_home(torch.stack([expert_w(rank * EPN + k, dev) for k in range(EPN)]))
+    pool.stage_home(home_of(rank, 0, dev))
 
     nxt, far = (rank + 1) % world, (rank + 3) % world
     sel = torch.tensor([nxt * EPN, -1, far * EPN + 2], dtype=torch.int32, device=dev)
     failures = []
 
-    def check(tag, slot, expected):
-        got = pool.prefetched[slot]
-        if not torch.equal(got, expected):
-            failures.append(f"rank{rank} {tag}: slot {slot} mismatch")
+    def check(tag, slot, expected, target=pool):
+        for i, want in enumerate(expected):
+            if not torch.equal(target.prefetched[i][slot], want):
+                failures.append(f"rank{rank} {tag}: slot {slot} part {i} mismatch")
 
     # 1. no resident table: plain copy.
     pool.prefetch(sel)
     torch.cuda.synchronize()
-    check("plain", 0, expert_w(nxt * EPN, dev))
-    check("plain", 2, expert_w(far * EPN + 2, dev))
+    check("plain", 0, expert_parts(nxt * EPN, dev))
+    check("plain", 2, expert_parts(far * EPN + 2, dev))
 
     # 2. resident names exactly what was selected: nothing may move.
     resident = sel.clone()
-    poison = torch.full(ROW, 7.0, dtype=torch.bfloat16, device=dev)
-    pool.prefetched[0].copy_(poison)
-    pool.prefetched[2].copy_(poison)
+    poison = [
+        torch.full(PARTS[0][0], 7.0, dtype=torch.bfloat16, device=dev),
+        torch.full(PARTS[1][0], 7, dtype=torch.uint8, device=dev),
+    ]
+    for slot in (0, 2):
+        for i, p in enumerate(poison):
+            pool.prefetched[i][slot].copy_(p)
     pool.prefetch(sel, resident)
     torch.cuda.synchronize()
     check("hit", 0, poison)
@@ -84,7 +101,7 @@ def main() -> int:
     pool.prefetch(sel, resident)
     torch.cuda.synchronize()
     check("partial", 0, poison)
-    check("partial", 2, expert_w(far * EPN + 2, dev))
+    check("partial", 2, expert_parts(far * EPN + 2, dev))
 
     # 4. two EP groups: positions are group-local, experts never cross groups.
     half = world // 2
@@ -101,16 +118,11 @@ def main() -> int:
             world_size=half,
             experts_per_rank=EPN,
             prefetch_slots=B,
-            weight_shape=ROW,
-            dtype=torch.bfloat16,
+            parts=PARTS,
             block_num=256,
             group=groups[gid],
         )
-        sub_pool.stage_home(
-            torch.stack(
-                [expert_w(1000 * gid + local * EPN + k, dev) for k in range(EPN)]
-            )
-        )
+        sub_pool.stage_home(home_of(local, 1000 * gid, dev))
         sub_pools.append(sub_pool)
     fds_grown = len(os.listdir("/proc/self/fd")) - fds_before
     if fds_grown > len(sub_pools):
@@ -119,10 +131,7 @@ def main() -> int:
     sel = torch.tensor([peer * EPN + 1, -1, -1], dtype=torch.int32, device=dev)
     sub_pools[-1].prefetch(sel)
     torch.cuda.synchronize()
-    if not torch.equal(
-        sub_pools[-1].prefetched[0], expert_w(1000 * gid + peer * EPN + 1, dev)
-    ):
-        failures.append(f"rank{rank} groups: slot 0 is not group {gid}'s expert")
+    check("groups", 0, expert_parts(1000 * gid + peer * EPN + 1, dev), sub_pools[-1])
     for sub_pool in sub_pools:
         sub_pool.close()
 

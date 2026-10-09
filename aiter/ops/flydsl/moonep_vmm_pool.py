@@ -1,36 +1,31 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Row-contiguous ``[R * stride, ...]`` expert-weight pool over HIP VMM.
+"""Expert-weight pool over HIP VMM: every rank's segment in one virtual range.
 
-Every rank owns one segment of ``stride`` rows holding its resident experts
-followed by its own prefetch slots, and the segments of all ranks are stitched
-into one contiguous virtual range::
+A pool holds several tensors ("parts", e.g. w1, its scale, w2 and its scale)
+with one ``[epn + B]`` window each.  Every rank owns one segment with its
+parts back to back, each part's home experts followed by its prefetch slots::
 
-    segment pe      rows [pe * stride, pe * stride + epn)          home experts
-                    rows [pe * stride + epn, pe * stride + epn + B) prefetch slots
+    segment pe = base + pe * segment_bytes
+        part i at  segment + part_offsets[i]
+            rows [0, epn)        home experts
+            rows [epn, epn + B)  prefetch slots
 
-``stride`` is ``epn + B`` rounded up to the VMM granularity, which on gfx950
-means ``stride == epn + B``.  The segment layout is the MoRI/EPLB virtual-id
-layout ``physical_id = dest * (epn + B) + slot``, so this rank's
-``[epn + B]`` window is exactly the weight tensor a single ``fused_moe`` call
-needs under a virtual-id ``expert_mask``, and its ``[epn]`` prefix is the
-ordinary owner-only weight tensor.
+so each part's window is an ordinary contiguous ``[epn + B, ...]`` tensor and
+its ``[epn]`` prefix the owner-only one.  ``segment_bytes`` is the parts' bytes
+rounded up to the VMM granularity; the padding sits at the segment's end.
 
 Other ranks' segments are *their* physical memory, mapped here over XGMI, so a
-prefetch kernel reaches any expert by row arithmetic on one base pointer.  Only
-``stride`` rows per rank are actually resident.
+prefetch kernel reaches any expert by offset arithmetic on one base pointer.
+One pool per layer means one allocation, one fd exchange and one prefetch
+launch for all of its parts.
 
 Modelled on mori's CCO (``src/cco/cco_init.cpp``: one ``hipMemAddressReserve``,
 then ``mapPeer`` maps each imported peer handle at ``flatBase + pe * stride``).
 CCO itself is unusable here because it rounds its per-rank stride up to 4 GiB so
 the device side can pack it into ``stride >> 32``, which leaves 4 GiB holes
-between peers; our stride is exactly one segment, so rows stay contiguous
-across the seam.
-
-Verified on gfx950 (8x MI355X): granularity is 4 KiB, so every real weight and
-scale row is already aligned; a stitched pool feeds mxfp4 a8w4 2-stage
-``fused_moe`` bit-identically to a fully local reference.
+between peers; our stride is exactly one segment.
 
 Two constraints from mori's own experience with these APIs:
 
@@ -144,21 +139,6 @@ def vmm_granularity(dev: int) -> int:
     return g.value
 
 
-def pad_experts(rows: int, row_bytes: int, granularity: int) -> int:
-    """Smallest ``padded >= rows`` whose segment is a whole granularity multiple.
-
-    The segment is the unit we map, so it must be granularity-aligned, and it
-    must hold a whole number of rows or the next peer's segment starts mid-row
-    and ``row = pe * stride + k`` stops being true.  Rows *inside* a segment
-    need no alignment of their own, which is why this is far weaker than it
-    looks: at the measured 4 KiB granularity every real weight/scale row
-    divides it exactly and no padding is added.
-    """
-
-    step = granularity // math.gcd(row_bytes, granularity)
-    return ((rows + step - 1) // step) * step
-
-
 class _RawBuf:
     """Adopt a raw device pointer into torch, the way mori wraps shmem tensors."""
 
@@ -173,55 +153,49 @@ class _RawBuf:
 
 
 class MoonEPVmmPool:
-    """One row-contiguous ``[R * stride]`` range of per-rank ``[epn | B]`` segments."""
+    """Per-rank segments of ``[epn | B]`` part windows in one virtual range."""
 
     def __init__(
         self,
         *,
-        row_bytes: int,
+        part_row_bytes: tuple[int, ...],
         experts_per_rank: int,
         prefetch_slots: int,
         rank: int,
         world_size: int,
         device: torch.device | None = None,
         group: dist.ProcessGroup | None = None,
-        max_pad_ratio: int = 4,
     ) -> None:
-        if row_bytes <= 0 or row_bytes % 16:
+        if not part_row_bytes or any(b <= 0 or b % 16 for b in part_row_bytes):
             raise ValueError(
-                f"row_bytes must be a positive multiple of 16, got {row_bytes}"
+                f"every part row must be a positive multiple of 16 bytes, "
+                f"got {part_row_bytes}"
+            )
+        if experts_per_rank <= 0 or prefetch_slots < 0:
+            raise ValueError(
+                "experts_per_rank must be positive and prefetch_slots non-negative"
             )
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         dev = self.device.index
         self.rank, self.world_size = rank, world_size
         self.experts_per_rank = experts_per_rank
         self.prefetch_slots = prefetch_slots
-        self.row_bytes = row_bytes
+        self.part_row_bytes = tuple(part_row_bytes)
         self._group = group
         self._closed = False
 
-        if experts_per_rank <= 0 or prefetch_slots < 0:
-            raise ValueError(
-                "experts_per_rank must be positive and prefetch_slots non-negative"
-            )
-
+        window = experts_per_rank + prefetch_slots
+        offsets, used = [], 0
+        for row_bytes in self.part_row_bytes:
+            offsets.append(used)
+            used += window * row_bytes
+        self.part_offsets = tuple(offsets)
         gran = vmm_granularity(dev)
         self.granularity = gran
-        segment_rows = experts_per_rank + prefetch_slots
-        self.stride = pad_experts(segment_rows, row_bytes, gran)
-        if self.stride > max_pad_ratio * segment_rows:
-            raise ValueError(
-                f"row_bytes={row_bytes} is nearly coprime with the VMM "
-                f"granularity {gran} (gcd={math.gcd(row_bytes, gran)}), so a "
-                f"whole-row segment would need {self.stride} rows for "
-                f"{segment_rows} rows of experts and prefetch slots. Pad each "
-                f"row up to a divisor of the granularity before pooling it."
-            )
-
-        self.segment_bytes = self.stride * row_bytes
-        self.rows = world_size * self.stride
+        # The segment is the unit we map, so it must be granularity-aligned;
+        # the parts need no alignment beyond their 16-byte rows.
+        self.segment_bytes = -(-used // gran) * gran
         self.total_bytes = world_size * self.segment_bytes
-        self.tensor_bytes = self.total_bytes
 
         self._handles: list[ctypes.c_void_p] = []
         self._base = _P(0)
@@ -326,54 +300,36 @@ class MoonEPVmmPool:
                 if pe != self.rank and peer_fd >= 0:
                     os.close(peer_fd)
 
-    # ------------------------------------------------------------ row indices
-
-    def global_row(self, expert: int) -> int:
-        """Pool row holding global expert ``expert``, on every rank alike."""
-        epn = self.experts_per_rank
-        return (expert // epn) * self.stride + (expert % epn)
-
-    def prefetch_row(self, slot: int) -> int:
-        """Pool row of this rank's prefetch slot ``slot``, right after its home rows."""
-        if not 0 <= slot < self.prefetch_slots:
-            raise IndexError(f"prefetch slot {slot} out of range")
-        return self.rank * self.stride + self.experts_per_rank + slot
-
-    @property
-    def home_row_begin(self) -> int:
-        return self.rank * self.stride
-
     # ---------------------------------------------------------------- tensors
 
-    def tensor(self, dtype: torch.dtype, row_shape: tuple[int, ...]) -> torch.Tensor:
-        """View the whole range as ``[rows, *row_shape]``.
+    @property
+    def base(self) -> int:
+        """Address of rank 0's segment; rank ``pe``'s is ``pe * segment_bytes`` on."""
+        return self._base.value
 
-        The result does **not** inherit ``is_shuffled``: ``fused_moe`` reads that
-        off the tensor object (``aiter/fused_moe.py:758``) and a freshly adopted
-        pointer has no attributes.  Callers holding pre-shuffled weights must set
-        it, or the kernel raises.  See ``mark_shuffled``.
+    @property
+    def local_segment(self) -> torch.Tensor:
+        """This rank's whole segment as bytes."""
+        start = self._base.value + self.rank * self.segment_bytes
+        return torch.as_tensor(_RawBuf(start, self.segment_bytes), device=self.device)
+
+    def part(self, index: int, dtype: torch.dtype, row_shape: tuple[int, ...]):
+        """This rank's ``[epn + B, *row_shape]`` window of part ``index``.
+
+        The result does **not** inherit ``is_shuffled``: a freshly adopted
+        pointer has no attributes, so callers holding pre-shuffled weights set it.
         """
-
-        want = (
-            self.rows
-            * math.prod(row_shape)
-            * torch.empty(0, dtype=dtype).element_size()
-        )
-        if want != self.tensor_bytes:
+        row_bytes = self.part_row_bytes[index]
+        want = math.prod(row_shape) * torch.empty(0, dtype=dtype).element_size()
+        if want != row_bytes:
             raise ValueError(
-                f"row_shape {row_shape} of {dtype} spans {want} B but the pool "
-                f"holds {self.tensor_bytes} B ({self.rows} rows x {self.row_bytes} B)"
+                f"row_shape {row_shape} of {dtype} spans {want} B but part "
+                f"{index} rows hold {row_bytes} B"
             )
-        flat = torch.as_tensor(
-            _RawBuf(self._base.value, self.tensor_bytes), device=self.device
-        )
-        return flat.view(dtype).view(self.rows, *row_shape)
-
-    @staticmethod
-    def mark_shuffled(*tensors: torch.Tensor) -> None:
-        """Restore the flag ``shuffle_weight`` sets and pointer adoption drops."""
-        for t in tensors:
-            t.is_shuffled = True
+        window = self.experts_per_rank + self.prefetch_slots
+        start = self.part_offsets[index]
+        raw = self.local_segment[start : start + window * row_bytes]
+        return raw.view(dtype).view(window, *row_shape)
 
     # ---------------------------------------------------------------- teardown
 
@@ -479,4 +435,4 @@ def _exchange_fds(rank, world, fd, dev, group) -> tuple[list[int], list[int]]:
             shutil.rmtree(sockdir, ignore_errors=True)
 
 
-__all__ = ["MoonEPVmmPool", "pad_experts", "vmm_granularity"]
+__all__ = ["MoonEPVmmPool", "vmm_granularity"]

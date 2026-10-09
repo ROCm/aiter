@@ -3,9 +3,9 @@
 
 """Latency-tuned MoonEP remote weight prefetch.
 
-Drop-in replacement for ``moonep_weight_prefetch``: identical launch ABI and
-byte-identical output (it is a pure copy), so the two can be A/B'd against the
-same buffers.  The reference version stays untouched.
+A pure byte copy of the selected remote experts into this rank's prefetch
+slots, for every part of a ``MoonEPVmmPool`` (e.g. w1, w1 scale, w2, w2 scale)
+in one launch.
 
 Why
 ---
@@ -66,7 +66,7 @@ stays under one batch.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import T, range_constexpr
+from flydsl.expr import T, const_expr, range_constexpr
 from flydsl.expr.typing import Stream
 
 from aiter.ops.flydsl.kernels.buffer_ops import (
@@ -85,84 +85,60 @@ def make_moonep_weight_prefetch_fast_jit(
     *,
     experts_per_rank: int,
     prefetch_slots: int,
-    weight_numel: int,
-    elem_bytes: int = 2,
+    part_row_bytes: tuple[int, ...],
+    part_offsets: tuple[int, ...],
+    segment_bytes: int,
     block_num: int = 128,
     block_threads: int = 256,
     loads_in_flight: int = DEFAULT_LOADS_IN_FLIGHT,
-    row_stride: int | None = None,
     track_resident: bool = False,
 ):
-    """Build the tuned prefetch launcher.
+    """Build the tuned prefetch launcher for one ``MoonEPVmmPool`` layout.
 
-    The copy is untyped -- only ``weight_numel * elem_bytes`` matters -- so fp8
-    weights and their scale blocks go through unchanged.
+    The copy is untyped, so fp4/fp8 weights and their scale blocks go through
+    unchanged.  Rank ``pe``'s segment starts at ``pool_base + pe * segment_bytes``
+    and holds each part ``i`` at ``part_offsets[i]`` as ``[epn + B]`` rows of
+    ``part_row_bytes[i]``; global expert ``e`` is row ``e % epn`` of its owner
+    ``e // epn``, so a peer's weight is reached by arithmetic instead of a
+    per-owner pointer table.
 
-    The source is one **row-contiguous** pool base spanning every rank's
-    ``[epn | B]`` segment (``moonep_vmm_pool.MoonEPVmmPool``): global expert
-    ``e`` sits at row ``(e // epn) * row_stride + e % epn``, so a peer's weight
-    is reached by arithmetic instead of a per-owner pointer table.
-    ``row_stride`` defaults to ``experts_per_rank + prefetch_slots`` -- the case
-    on gfx950, where the 4 KiB VMM granularity leaves every real row aligned.
-
-    With ``track_resident`` the launcher takes a fourth pointer, an int32
-    ``[B]`` table naming the expert each slot already holds; such slots are
-    skipped.  Inference weights never change, so a hit needs no copy.
+    With ``track_resident`` the launcher reads an int32 ``[B]`` table naming
+    the expert each slot already holds; such slots are skipped.  Inference
+    weights never change, so a hit needs no copy.
     """
-
-    if row_stride is None:
-        row_stride = experts_per_rank + prefetch_slots
-    if row_stride < experts_per_rank:
-        raise ValueError("row stride cannot be smaller than the experts per rank")
 
     if experts_per_rank <= 0 or prefetch_slots <= 0:
         raise ValueError("expert and slot counts must be positive")
-    if weight_numel <= 0 or elem_bytes <= 0:
-        raise ValueError("weight size and element size must be positive")
-    weight_bytes = weight_numel * elem_bytes
-    if weight_bytes % 16 != 0:
-        raise ValueError(
-            f"expert weight must be 16-byte aligned, got {weight_bytes} bytes"
-        )
+    if not part_row_bytes or len(part_row_bytes) != len(part_offsets):
+        raise ValueError("need one offset per part")
+    if any(b <= 0 or b % 16 for b in part_row_bytes):
+        raise ValueError(f"part rows must be 16-byte multiples, got {part_row_bytes}")
     if block_num <= 0 or block_threads <= 0 or block_threads % 64 != 0:
         raise ValueError("launch geometry must be positive and wave-aligned")
     if loads_in_flight <= 0:
         raise ValueError("loads_in_flight must be positive")
 
-    weight_i32 = weight_bytes // 4
     stride = block_num * block_threads * VEC_I32
-    # One grid pass covers ``stride`` dwords, so a weight needs this many passes.
-    passes = (weight_i32 + stride - 1) // stride
-    batch = min(loads_in_flight, passes)
-    span = stride * batch
-    # The ``seg`` marker and ``rs`` stride are part of the cache key on purpose:
-    # the row formula changed between pool layouts while the argument list did
-    # not, so a stale JIT artefact would otherwise read the wrong rows silently.
+    parts = []
+    for row_bytes, offset in zip(part_row_bytes, part_offsets):
+        row_i32 = row_bytes // 4
+        # One grid pass covers ``stride`` dwords, so a row needs this many passes.
+        passes = (row_i32 + stride - 1) // stride
+        batch = min(loads_in_flight, passes)
+        parts.append((row_bytes, offset, row_i32, batch, stride * batch))
+    # The layout is part of the cache key: the kernel arguments are only addresses.
+    layout = "_".join(f"{b}o{o}" for b, o in zip(part_row_bytes, part_offsets))
     name = (
-        f"moonep_weight_prefetch_fast_seg_{'rc' if track_resident else 'r0'}"
-        f"_epr{experts_per_rank}"
-        f"rs{row_stride}_b{prefetch_slots}"
-        f"_n{weight_numel}x{elem_bytes}_g{block_num}_t{block_threads}_f{batch}"
+        f"moonep_weight_prefetch_parts_{'rc' if track_resident else 'r0'}"
+        f"_epr{experts_per_rank}_b{prefetch_slots}_s{segment_bytes}_p{layout}"
+        f"_g{block_num}_t{block_threads}_f{loads_in_flight}"
     )
-
-    def slot_limit(addr_resident, slot, expert):
-        # Trace-time helper: an empty range skips a slot that already holds
-        # the expert, so no new branch enters the kernel body.
-        if not track_resident:
-            return fx.Int32(weight_i32)
-        held = buffer_load(
-            create_buffer_resource_from_addr(addr_resident),
-            slot,
-            vec_width=1,
-            dtype=T.i32,
-        )
-        return (held != expert).select(fx.Int32(weight_i32), fx.Int32(0))
 
     @flyc.kernel(name=name, known_block_size=[block_threads, 1, 1])
     def prefetch_kernel(
         addr_experts_to_copy: fx.Int64,  # INT32 [B], global expert ids, -1 = idle
-        addr_pool_base: fx.Int64,  # row-contiguous [R * row_stride] pool base
-        addr_prefetched_weights: fx.Int64,  # [B, weight_numel] prefetch slots
+        addr_pool_base: fx.Int64,  # rank 0's segment
+        addr_local_segment: fx.Int64,  # this rank's segment
         addr_resident: fx.Int64,  # INT32 [B] or 0 without track_resident
     ):
         tid = fx.Int32(fx.thread_idx.x)
@@ -177,86 +153,76 @@ def make_moonep_weight_prefetch_fast_jit(
             # Depends only on the slot, so this is block-uniform and compiles to
             # a scalar branch -- an idle slot issues no memory traffic at all.
             if expert >= fx.Int32(0):
-                # The pool is row-contiguous across ranks, so the owner drops out
-                # of the addressing: it only picks which padded group the row
-                # falls in. No pointer-table load, no per-owner view.
                 owner = expert // fx.Int32(experts_per_rank)
                 local_expert = expert % fx.Int32(experts_per_rank)
-                row = owner * fx.Int32(row_stride) + local_expert
-                # num_records bounds both sides to one weight, so the final
-                # batch's out-of-range lanes are dropped in hardware and no tail
-                # predicate is needed.
-                src_rsrc = create_buffer_resource_from_addr(
-                    addr_pool_base + fx.Int64(row) * weight_bytes,
-                    num_records_bytes=weight_bytes,
+                owner_segment = addr_pool_base + fx.Int64(owner) * fx.Int64(
+                    segment_bytes
                 )
-                dst_rsrc = create_buffer_resource_from_addr(
-                    addr_prefetched_weights + fx.Int64(slot) * weight_bytes,
-                    num_records_bytes=weight_bytes,
-                )
-                limit = slot_limit(addr_resident, slot, expert)
-                for base in range(lane_base, limit, span):
-                    # Issue the whole batch before consuming any of it: this is
-                    # the register-resident equivalent of upstream's
-                    # producer/consumer warp split through shared memory.
-                    values = []
-                    for j in range_constexpr(batch):
-                        values.append(
-                            buffer_load(
-                                src_rsrc,
-                                base + fx.Int32(j * stride),
-                                vec_width=VEC_I32,
-                                dtype=T.i32,
+                copy = fx.Int32(1)
+                if const_expr(track_resident):
+                    held = buffer_load(
+                        create_buffer_resource_from_addr(addr_resident),
+                        slot,
+                        vec_width=1,
+                        dtype=T.i32,
+                    )
+                    # An empty range skips a slot that already holds the expert.
+                    copy = (held != expert).select(fx.Int32(1), fx.Int32(0))
+                for p in range_constexpr(len(parts)):
+                    row_bytes, offset, row_i32, batch, span = parts[p]
+                    # num_records bounds both sides to one row, so the final
+                    # batch's out-of-range lanes are dropped in hardware and no
+                    # tail predicate is needed.
+                    src_rsrc = create_buffer_resource_from_addr(
+                        owner_segment
+                        + fx.Int64(offset)
+                        + fx.Int64(local_expert) * fx.Int64(row_bytes),
+                        num_records_bytes=row_bytes,
+                    )
+                    dst_rsrc = create_buffer_resource_from_addr(
+                        addr_local_segment
+                        + fx.Int64(offset)
+                        + fx.Int64(fx.Int32(experts_per_rank) + slot)
+                        * fx.Int64(row_bytes),
+                        num_records_bytes=row_bytes,
+                    )
+                    limit = copy * fx.Int32(row_i32)
+                    for base in range(lane_base, limit, span):
+                        # Issue the whole batch before consuming any of it: the
+                        # register-resident equivalent of upstream's
+                        # producer/consumer warp split through shared memory.
+                        values = []
+                        for j in range_constexpr(batch):
+                            values.append(
+                                buffer_load(
+                                    src_rsrc,
+                                    base + fx.Int32(j * stride),
+                                    vec_width=VEC_I32,
+                                    dtype=T.i32,
+                                )
                             )
-                        )
-                    for j in range_constexpr(batch):
-                        buffer_store(
-                            values[j],
-                            dst_rsrc,
-                            base + fx.Int32(j * stride),
-                        )
+                        for j in range_constexpr(batch):
+                            buffer_store(
+                                values[j],
+                                dst_rsrc,
+                                base + fx.Int32(j * stride),
+                            )
 
-    def _launch(experts, pool, prefetched, resident, stream):
-        prefetch_kernel(experts, pool, prefetched, resident).launch(
+    @flyc.jit
+    def launch(
+        addr_experts_to_copy: fx.Int64,
+        addr_pool_base: fx.Int64,
+        addr_local_segment: fx.Int64,
+        addr_resident: fx.Int64,
+        stream: Stream = Stream(None),  # noqa: B008
+    ):
+        prefetch_kernel(
+            addr_experts_to_copy, addr_pool_base, addr_local_segment, addr_resident
+        ).launch(
             grid=(block_num, 1, 1),
             block=(block_threads, 1, 1),
             stream=stream,
         )
-
-    if track_resident:
-
-        @flyc.jit
-        def launch(
-            addr_experts_to_copy: fx.Int64,
-            addr_pool_base: fx.Int64,
-            addr_prefetched_weights: fx.Int64,
-            addr_resident: fx.Int64,
-            stream: Stream = Stream(None),  # noqa: B008
-        ):
-            _launch(
-                addr_experts_to_copy,
-                addr_pool_base,
-                addr_prefetched_weights,
-                addr_resident,
-                stream,
-            )
-
-    else:
-
-        @flyc.jit
-        def launch(
-            addr_experts_to_copy: fx.Int64,
-            addr_pool_base: fx.Int64,
-            addr_prefetched_weights: fx.Int64,
-            stream: Stream = Stream(None),  # noqa: B008
-        ):
-            _launch(
-                addr_experts_to_copy,
-                addr_pool_base,
-                addr_prefetched_weights,
-                fx.Int64(0),
-                stream,
-            )
 
     return launch
 
