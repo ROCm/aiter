@@ -57,9 +57,7 @@ def bench_gemm_fn(
     mem = mem_read + mem_write
     if preshuffle:
         ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4_preshuffle(
-                x, w, x_scale, w_scale, c_dtype, y, use_aot=True
-            ),
+            lambda: gemm_afp4wfp4_preshuffle(x, w, x_scale, w_scale, c_dtype, y),
             warmup=25,
             rep=100,
         )

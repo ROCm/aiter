@@ -18,8 +18,14 @@ import aiter
 from aiter import benchmark_data_init as bench_init
 from aiter import dtypes
 from aiter.benchmark_reporting import print_json_table
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_blockscale_ck, gemm_a8w8_blockscale_cktile
-from aiter.ops.shuffle import shuffle_weight
+from aiter.ops.shuffle import (
+    shuffle_mxfp8fp4_a,
+    shuffle_scale_blockscale_a,
+    shuffle_scale_blockscale_b,
+    shuffle_weight,
+)
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
 
@@ -69,6 +75,15 @@ def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
 
 
 @perftest(num_iters=TEST_NUM_ITERS)
+def run_gemm_abpreshuffle(
+    x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16
+):
+    return aiter.gemm_a8w8_blockscale_abpreshuffle(
+        x_shuffled, weightshuffle, x_scale, w_scale, dtype
+    )
+
+
+@perftest(num_iters=TEST_NUM_ITERS)
 def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=None):
     # Direct call into the triton preshuffle kernel, mirroring the dispatch in
     # gemm_a8w8_blockscale_bpreshuffle: reshape the (n, k) preshuffled weight to
@@ -99,6 +114,7 @@ def test_gemm(
     data_init="uniform",
     scale_init="auto",
     seed=0,
+    apre=False,
 ):
     ret = {}
     block_shape_n, block_shape_k = block_shape
@@ -140,13 +156,21 @@ def test_gemm(
     a, _ = run_torch(x, weight, x_scale, w_scale, dtype)
 
     x_scale_t = x_scale.transpose(0, 1).contiguous().view(*x_scale.shape)
-    gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
     gemm_weight = shuffle_weight(weight, layout=(16, 16)) if ck_preshuffle else weight
+    if use_flydsl_fp8_scale and get_gfx() == "gfx950":
+        gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
+        gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
+    elif use_flydsl_fp8_scale:
+        gemm_x_scale = x_scale
+        gemm_w_scale = w_scale
+    else:
+        gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
+        gemm_w_scale = w_scale
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, w_scale, dtype)
+    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, gemm_w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
-    if ck_preshuffle:
+    if ck_preshuffle and not use_flydsl_fp8_scale:
         x_scale_strided = x_scale.transpose(0, 1).contiguous().transpose(0, 1)
         b_strided = aiter.gemm_a8w8_blockscale_bpreshuffle(
             x, gemm_weight, x_scale_strided, w_scale, dtype
@@ -157,10 +181,28 @@ def test_gemm(
             msg="ck strided x_scale",
             catastrophic_check=True,
         )
+    ret["gfx"] = get_gfx()
     ret["ck us"] = avg_b
     ret["ck TFLOPS"] = m * n * k * 2 / avg_b / 1e6
     ret["ck TB/s"] = (x.nbytes + weight.nbytes) / avg_b / 1e6
     ret["ck err"] = err_ck
+
+    if apre and use_flydsl_fp8_scale:
+        # A-preshuffle packs adjacent A row pairs, so an odd M needs A -- and only
+        # A -- padded to M+1 rows; x_scale and the result keep the true M.
+        if m % 2:
+            x_apre = torch.zeros((m + 1, k), dtype=x.dtype, device=x.device)
+            x_apre[:m] = x
+        else:
+            x_apre = x
+        e, avg_e = run_gemm_abpreshuffle(
+            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype
+        )
+        ret["apre us"] = avg_e
+        ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
+        ret["apre TB/s"] = (x_apre.nbytes + weight.nbytes) / avg_e / 1e6
+        ret["apre err"] = checkAllclose(a, e, msg="apre", catastrophic_check=True)
+        ret["apre/ck"] = avg_e / avg_b
 
     if not use_flydsl_fp8_scale:
         tag = "asm"
@@ -268,6 +310,10 @@ def test_splitk_correctness(m=4, n=2112, k=7168, dtype=dtypes.bf16, splitK=1):
         f"test_splitk_correctness(m={m}, n={n}, k={k}, splitK={splitK}): "
         f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
     )
+    assert ck_err < 0.05 and cktile_err < 0.05, (
+        f"split-K mismatch (m={m}, n={n}, k={k}, splitK={splitK}): "
+        f"ck_err={ck_err:.4g}, cktile_err={cktile_err:.4g}"
+    )
 
 
 parser = argparse.ArgumentParser(
@@ -362,7 +408,7 @@ parser.add_argument(
     "--ck_preshuffle",
     type=dtypes.str2bool,
     nargs="*",
-    default=[True, False],
+    default=None,
     help="""weight ck_preshuffle or not.
     e.g.: --ck_preshuffle True
         or --ck_preshuffle False
@@ -374,11 +420,28 @@ parser.add_argument(
     help="use flydsl fp8 e8m0 scale path (requires --ck_preshuffle True)",
 )
 parser.add_argument(
+    "--apre",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[False],
+    help="""also measure the FlyDSL A-preshuffle candidate (requires --flydsl
+    --ck_preshuffle True). Odd M is padded to M+1 rows for A only.
+    Sweeps like --ck_preshuffle.
+    e.g.: --apre True
+        or --apre True False""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
     help="""CSV file containing M, N, K columns (one shape per row).
     e.g.: --csv shapes.csv""",
+)
+parser.add_argument(
+    "--table",
+    action="store_true",
+    help="""Also print the summary as a human-readable table.
+    The default output is the single-line JSON record.""",
 )
 parser.add_argument(
     "-o",
@@ -411,9 +474,12 @@ if len(data_init_list) != len(scale_init_list):
     )
 init_pairs = list(zip(data_init_list, scale_init_list))
 
+if args.ck_preshuffle is None:
+    args.ck_preshuffle = [True] if args.flydsl else [True, False]
 l_preshuffle = (
     args.ck_preshuffle if isinstance(args.ck_preshuffle, list) else [args.ck_preshuffle]
 )
+l_apre = args.apre if isinstance(args.apre, list) else [args.apre]
 
 df = []
 if args.csv is not None:
@@ -424,44 +490,58 @@ if args.csv is not None:
     for dtype in args.dtype:
         for preshuffle in l_preshuffle:
             for data_init, scale_init in init_pairs:
-                for _, row in shapes_df.iterrows():
-                    ret = test_gemm(
-                        dtype,
-                        int(row["M"]),
-                        int(row["N"]),
-                        int(row["K"]),
-                        ck_preshuffle=preshuffle,
-                        use_flydsl=args.flydsl,
-                        data_init=data_init,
-                        scale_init=scale_init,
-                        seed=args.seed,
-                    )
-                    df.append(ret)
+                for apre in l_apre:
+                    for _, row in shapes_df.iterrows():
+                        ret = test_gemm(
+                            dtype,
+                            int(row["M"]),
+                            int(row["N"]),
+                            int(row["K"]),
+                            ck_preshuffle=preshuffle,
+                            use_flydsl=args.flydsl,
+                            data_init=data_init,
+                            scale_init=scale_init,
+                            seed=args.seed,
+                            apre=apre,
+                        )
+                        df.append(ret)
 else:
     for dtype in args.dtype:
         for m in args.m:
             for n, k in args.nk:
                 for ck_p in l_preshuffle:
-                    for data_init, scale_init in init_pairs:
-                        ret = test_gemm(
-                            dtype,
-                            m,
-                            n,
-                            k,
-                            ck_preshuffle=ck_p,
-                            use_flydsl=args.flydsl,
-                            data_init=data_init,
-                            scale_init=scale_init,
-                            seed=args.seed,
-                        )
-                        df.append(ret)
+                    for apre in l_apre:
+                        for data_init, scale_init in init_pairs:
+                            ret = test_gemm(
+                                dtype,
+                                m,
+                                n,
+                                k,
+                                ck_preshuffle=ck_p,
+                                use_flydsl=args.flydsl,
+                                data_init=data_init,
+                                scale_init=scale_init,
+                                seed=args.seed,
+                                apre=apre,
+                            )
+                            df.append(ret)
 
+df = pd.DataFrame([row for row in df if row is not None])
 print_json_table("gemm_a8w8_blockscale summary", df)
+if args.table and not df.empty:
+    print("\n" + "=" * 150)
+    print("COMPLETE PERFORMANCE SUMMARY (All Columns)")
+    print("=" * 150)
+    print(df.to_string(index=False))
+    print("=" * 150)
 
 # Correctness check: verify split-K produces matching results
 print("\nRunning split-K correctness checks ...")
 for splitK in [1, 2]:
     test_splitk_correctness(m=4, n=512, k=16384, splitK=splitK)
+# Two K loops per split for the default CK-Tile tile, the shortest split it runs.
+for m, n, k, splitK in [(8, 256, 512, 1), (8, 256, 1024, 2), (32, 512, 2048, 3)]:
+    test_splitk_correctness(m=m, n=n, k=k, splitK=splitK)
 
 # Save results from benchmarks
 if args.output:

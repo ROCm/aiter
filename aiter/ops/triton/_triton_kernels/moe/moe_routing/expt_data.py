@@ -71,24 +71,21 @@ def _expt_data_compute_stage2(
     expt_id = pid
 
     n_tokens = tl.load(Hist + expt_id)
-    if n_tokens == 0:
-        return
-    BLOCK: tl.constexpr = 8
-    n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
-    TileInfo += tile_start
+    if n_tokens != 0:
+        BLOCK: tl.constexpr = 8
+        n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
+        tile_info = TileInfo + tile_start
 
-    n_blocks = _cdiv_pow2(n_tokens, tile_dim_log2)
-    block_offs = tl.arange(0, BLOCK)
-    for i in range(0, n_blocks, BLOCK):
-        data = (block_offs << 16) + expt_id
-        tl.store(TileInfo + block_offs, data, mask=block_offs < n_blocks)
-        block_offs += BLOCK
+        block_offs = tl.arange(0, BLOCK)
+        for i in range(0, n_blocks, BLOCK):
+            data = (block_offs << 16) + expt_id
+            tl.store(tile_info + block_offs, data, mask=block_offs < n_blocks)
+            block_offs += BLOCK
 
 
 @triton.jit
 def _expt_data_compute_stage2_fused(expt_id, Hist, tile_start, TileInfo):
     n_tokens = tl.load(Hist + expt_id)
-    if n_tokens == 0:
-        return
-    TileInfo += tile_start
-    tl.store(TileInfo, expt_id)
+    if n_tokens != 0:
+        tile_info = TileInfo + tile_start
+        tl.store(tile_info, expt_id)

@@ -23,6 +23,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
+from .kernels_common import ceildiv
 from .mxfp4_gemm_common import FP8OUT_PITCH_ALIGN, fp8out_row_bytes, fp8out_scale_blk
 
 BLOCK = 256
@@ -70,13 +71,11 @@ def _moe_reduction_body(
         V = 128 // (8 * in_bytes)  # 4 (f32), 8 (16b)
         load_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), in_elem)
     out_bytes = out_numeric.width // 8
-    is_16b = out_numeric.width < 32
     TILE = NTHREADS * V
     store_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), out_numeric)
 
     token, tile, tid = gpu.block_id("x"), gpu.block_id("y"), gpu.thread_id("x")
     tok64 = fx.Int64(token)
-    vec_f32, vec_out = T.vec(V, T.f32), T.vec(V, out_numeric.ir_type)
 
     def _view(elem, ptr_i64, ncols, nbytes):  # 2D [1, ncols] V# buffer descriptor
         pt = fx.PointerType.get(
@@ -167,8 +166,7 @@ def _moe_reduction_body(
             if const_expr(is_fp8):
                 vk = _decode_fp8(frags[k], scales[k])
             else:
-                vk = fx.Vector(fx.memref_load_vec(frags[k]))
-                vk = vk.extf(vec_f32) if is_16b else vk
+                vk = fx.Vector(fx.memref_load_vec(frags[k])).to(fx.Float32)
             if const_expr(use_weight):
                 wk = tw_ptr[k]
                 vk = fx.Vector.from_elements(
@@ -180,7 +178,7 @@ def _moe_reduction_body(
                 )
             acc = acc + vk
         ofrag = fx.make_fragment_like(p_dst)
-        fx.memref_store_vec(acc.truncf(vec_out) if is_16b else acc, ofrag)
+        fx.memref_store_vec(acc.to(out_numeric), ofrag)
         fx.copy(store_atom, ofrag, p_dst)
 
     # Skip column groups beyond model_dim.
@@ -194,7 +192,7 @@ def _moe_reduction_body(
 
 
 def _pick_reduce_block(model_dim: int, V: int) -> int:
-    need = -(-model_dim // V)
+    need = ceildiv(model_dim, V)
     block = BLOCK
     while block < need and block < 1024:
         block *= 2
@@ -223,7 +221,7 @@ def compile_moe_reduction(
     """
     V = FP8_VEC if dtype_str == "fp8" else 128 // (32 if dtype_str == "f32" else 16)
     block = _pick_reduce_block(model_dim, V)
-    gy = (model_dim + block * V - 1) // (block * V)
+    gy = ceildiv(model_dim, block * V)
     out_tag = out_dtype_str or dtype_str
     if dtype_str == "fp8":
         scale_blk = fp8out_scale_blk(model_dim) if scale_blk is None else int(scale_blk)

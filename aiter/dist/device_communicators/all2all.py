@@ -1,4 +1,5 @@
 import importlib.util
+import os
 from functools import cache
 
 import torch
@@ -58,23 +59,39 @@ class MoriAll2AllManager(All2AllManagerBase):
         num_experts_per_token: int,
         gpu_per_node: int,
         quant_type: str = "none",
+        low_latency: bool = False,
     ):
         import mori  # type: ignore[import-not-found]
 
-        if not self.internode:
-            # single node
-            kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
-            warp_num_per_block = 16
-            block_num = 80
-            rdma_block_num = 0
-        else:
+        # `low_latency` is the caller's ask; `self.internode` is measured from
+        # the process group, never inferred from world size -- 2 nodes x 4 GPUs
+        # would read as intra-node and pick kernels that assume P2P.
+        num_qp_per_pe = None
+        if low_latency:
+            if self.internode:
+                kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1LL
+            else:
+                # AsyncLL has no RDMA path.
+                kernel_type = mori.ops.EpDispatchCombineKernelType.AsyncLL
+            # Wide-EP reference values; overridable, neither has been swept.
+            warp_num_per_block = int(os.environ.get("MORI_EP_WARP_PER_BLOCK", "8"))
+            block_num = int(os.environ.get("MORI_EP_BLOCK_NUM", "96"))
+            rdma_block_num = int(os.environ.get("MORI_EP_RDMA_BLOCK_NUM", "64"))
+            num_qp_per_pe = 2
+        elif self.internode:
             # multi node
             kernel_type = mori.ops.EpDispatchCombineKernelType.InterNodeV1
             warp_num_per_block = 16
             block_num = 32
             rdma_block_num = 16
+        else:
+            # single node
+            kernel_type = mori.ops.EpDispatchCombineKernelType.IntraNode
+            warp_num_per_block = 16
+            block_num = 80
+            rdma_block_num = 0
 
-        return {
+        kwargs = {
             "rank": rank,
             "world_size": num_ep_ranks,
             "data_type": quant_dtype,
@@ -94,6 +111,11 @@ class MoriAll2AllManager(All2AllManagerBase):
             # "fp8_blockwise" picks the EpCombineIntraNodeKernel_*_fp8bwq_* kernels.
             "quant_type": quant_type,
         }
+        if num_qp_per_pe is not None:
+            # Omitted otherwise, so the other kernels keep the handle_cache key
+            # and MoRI config they have always had.
+            kwargs["num_qp_per_pe"] = num_qp_per_pe
+        return kwargs
 
     def _make_handle(self, **kwargs):
         import mori  # type: ignore[import-not-found]
@@ -102,15 +124,18 @@ class MoriAll2AllManager(All2AllManagerBase):
         handle = mori.ops.EpDispatchCombineOp(mori_config)
         return handle
 
-    def get_handle(self, kwargs):
-        import mori  # type: ignore[import-not-found]
+    def get_handle(self, kwargs, index: int = 0):
+        """Cached op for one config and ``index``. Always a single handle.
 
+        ``index=0`` (default) is the shared singleton. Callers with several
+        operations in flight use a distinct index for each concurrent slot.
+        All indexes use ``handle_cache``.
+        """
         mori_kwargs = self._make_all2all_kwargs(**kwargs)
-        logger.debug("MoRI all2all args %s", mori_kwargs)
-        handle: mori.ops.EpDispatchCombineOp = self.handle_cache.get_or_create(
-            mori_kwargs, self._make_handle
+        logger.debug("MoRI all2all index=%d args %s", index, mori_kwargs)
+        return self.handle_cache.get_or_create(
+            mori_kwargs, self._make_handle, index=index
         )
-        return handle
 
 
 class FlyDSLAll2AllManager(All2AllManagerBase):
@@ -121,8 +146,8 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
     must be installed alongside flydsl. The dispatch/combine *kernels* however
     are entirely FlyDSL-generated, replacing mori's comm primitives.
 
-    TBO multi-instance ops are created via ``create_handle`` (non-cached) so
-    the two ubatch ops are guaranteed to be distinct, independent objects.
+    TBO multi-instance ops use ``get_handle(..., index=)`` so ubatches get
+    distinct cached ops. ``create_handle`` remains for a one-off uncached op.
     """
 
     @staticmethod
@@ -209,18 +234,18 @@ class FlyDSLAll2AllManager(All2AllManagerBase):
         cfg = self._flydsl_dispatch_config_cls(**kwargs)
         return self._flydsl_dispatch_op_cls(cfg)
 
-    def get_handle(self, kwargs):
+    def get_handle(self, kwargs, index: int = 0):
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
-        logger.debug("FlyDSL all2all args %s", flydsl_kwargs)
-        return self.handle_cache.get_or_create(flydsl_kwargs, self._make_handle)
+        logger.debug("FlyDSL all2all index=%d args %s", index, flydsl_kwargs)
+        return self.handle_cache.get_or_create(
+            flydsl_kwargs, self._make_handle, index=index
+        )
 
     def create_handle(self, kwargs):
         """Create a fresh, uncached FlyDSL op instance.
 
-        Unlike ``get_handle`` (which caches one op per config), every call
-        returns a new independent op. Callers that need multiple distinct ops
-        for the same config (e.g. ATOM for TBO ubatches) should call this
-        and manage the instances themselves.
+        Prefer ``get_handle(kwargs, index=)`` when the op should be reused.
+        Use this only if you need a throwaway instance that is not cached.
         """
         flydsl_kwargs = self._make_all2all_kwargs(**kwargs)
         logger.debug("FlyDSL all2all (uncached) args %s", flydsl_kwargs)

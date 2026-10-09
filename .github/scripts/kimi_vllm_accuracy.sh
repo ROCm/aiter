@@ -39,10 +39,10 @@ vllm serve "$MODEL" \
     --async-scheduling \
     --tensor-parallel-size "$TP" \
     --trust-remote-code \
-    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --kv-cache-dtype fp8 \
-    --max-num-batched-tokens 16384 \
-    --max-model-len 16384 \
+    --gpu-memory-utilization 0.80 \
+    --max-num-batched-tokens 4096 \
+    --max-model-len 4096 \
     --no-enable-prefix-caching \
     > "$SLOG" 2>&1 &
 SVPID=$!

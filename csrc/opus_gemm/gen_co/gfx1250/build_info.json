@@ -9644,6 +9644,78 @@
       "traits_args": "128, 32, 64, 256, 3, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 1, 4",
       "vgpr_count": 304,
       "vgpr_spill_count": 0
+    },
+    {
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4869,
+      "dis_va_vdst0": 60,
+      "dis_wmma": 1024,
+      "dis_wmma_dst_hi": 512,
+      "group_segment_fixed_size": 294912,
+      "kernarg_segment_size": 64,
+      "kid": 21316,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 4,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wlr_co_128x256x256x64_4x1_16x16x32_0x0x0_w4x1_c4x4_p4_v1024w1",
+      "tile": [
+        256,
+        256,
+        64
+      ],
+      "traits_args": "128, 256, 256, 64, 4, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 4, 1",
+      "vgpr_count": 896,
+      "vgpr_spill_count": 0
+    },
+    {
+      "cluster": [
+        4,
+        4
+      ],
+      "device_flags": [
+        "-mllvm",
+        "-enable-post-misched=1",
+        "-mllvm",
+        "-amdgpu-expert-scheduling-mode"
+      ],
+      "dis_lines": 4310,
+      "dis_va_vdst0": 46,
+      "dis_wmma": 1024,
+      "dis_wmma_dst_hi": 512,
+      "group_segment_fixed_size": 294912,
+      "kernarg_segment_size": 64,
+      "kid": 21317,
+      "launch_bounds": [
+        128,
+        1
+      ],
+      "num_slots": 4,
+      "num_vgpr_requested": 1024,
+      "sgpr_count": 68,
+      "sgpr_spill_count": 0,
+      "symbol": "opus_gemm_gfx1250_4wave_wlr_co_128x256x256x64_4x1_16x16x32_0x0x0_w2x2_c4x4_p4_v1024w1",
+      "tile": [
+        256,
+        256,
+        64
+      ],
+      "traits_args": "128, 256, 256, 64, 4, bf16_t, bf16_t, bf16_t, fp32_t, 4, 4, 2, 2",
+      "vgpr_count": 960,
+      "vgpr_spill_count": 0
     }
   ]
 }

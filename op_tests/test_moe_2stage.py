@@ -35,6 +35,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import fp4_utils
@@ -721,6 +722,15 @@ parser.add_argument(
     e.g.: -hip 0,0""",
 )
 parser.add_argument(
+    "--stage2-bias",
+    type=dtypes.str2bool,
+    nargs="*",
+    default=[True],
+    help="""Whether CLI-generated cases include a random per-expert stage-2
+    bias. Default is [True] for backward compatibility. Use
+    --stage2-bias f for bias-free models, or --stage2-bias t f to test both.""",
+)
+parser.add_argument(
     "--no-flydsl-csv",
     action="store_true",
     help="Skip validating FlyDSL/Opus shapes from tuned fmoe CSVs.",
@@ -968,7 +978,11 @@ def _situv2_beta_kwargs(quant_type, aq_dtype, wq_dtype, act_type):
 
 
 def _effective_swiglu_limit(quant_type, aq_dtype, wq_dtype, swiglu_limit):
-    if (quant_type, aq_dtype, wq_dtype) in (_PER1X32_BF16_FP4, _PER1X32_FP8_FP4):
+    if (quant_type, aq_dtype, wq_dtype) in (
+        _PER1X32_BF16_FP4,
+        _PER1X32_FP8_FP4,
+        _PER1X32_FP4_FP4,
+    ):
         return swiglu_limit
     return None
 
@@ -1121,7 +1135,14 @@ def _iter_legacy_cases():
         (quant_type, aq_dtype, wq_dtype),
         (model_dim, inter_dim),
         doweight_stage1,
-    ) in itertools.product(args.dtype, l_quant, args.dim, args.doweight_stage1):
+        stage2_bias,
+    ) in itertools.product(
+        args.dtype,
+        l_quant,
+        args.dim,
+        args.doweight_stage1,
+        args.stage2_bias,
+    ):
         triple = (quant_type, aq_dtype, wq_dtype)
 
         if triple == _PER1X32_BF16_FP4:
@@ -1139,6 +1160,7 @@ def _iter_legacy_cases():
                         aiter.ActivationType.Swiglu,
                         hidden_pad=hidden_pad,
                         intermediate_pad=intermediate_pad,
+                        disable_stage2_bias=not stage2_bias,
                     ), extras
         elif triple == _PER1X32_FP8_FP4:
             for hidden_pad, intermediate_pad in args.hidden_intermediate_pad:
@@ -1156,6 +1178,7 @@ def _iter_legacy_cases():
                             act_type,
                             hidden_pad=hidden_pad,
                             intermediate_pad=intermediate_pad,
+                            disable_stage2_bias=not stage2_bias,
                             **_situv2_beta_kwargs(
                                 quant_type, aq_dtype, wq_dtype, act_type
                             ),
@@ -1177,6 +1200,7 @@ def _iter_legacy_cases():
                             preshuffle=preshuffle,
                             hidden_pad=0,
                             intermediate_pad=0,
+                            disable_stage2_bias=not stage2_bias,
                             **_situv2_beta_kwargs(
                                 quant_type, aq_dtype, wq_dtype, act_type
                             ),
@@ -1193,6 +1217,7 @@ def _iter_legacy_cases():
                     wq_dtype,
                     doweight_stage1,
                     aiter.ActivationType.Silu,
+                    disable_stage2_bias=not stage2_bias,
                 ), extras
         else:
             for act_type in args.act:
@@ -1214,8 +1239,38 @@ def _iter_legacy_cases():
                         wq_dtype,
                         doweight_stage1,
                         act_type,
+                        disable_stage2_bias=not stage2_bias,
                         **_situv2_beta_kwargs(quant_type, aq_dtype, wq_dtype, act_type),
                     ), extras
+
+
+def test_route_workspace_token_capacity():
+    cases = (
+        (1, 1),
+        (247, 256),
+        (256, 256),
+        (257, 512),
+        (32768, 32768),
+        (32769, 65536),
+        (65536, 65536),
+        (65537, 131072),
+        (117626, 131072),
+        (128332, 131072),
+        (131072, 131072),
+        (131073, 262144),
+    )
+    for token_num, expected_capacity in cases:
+        assert _route_workspace_token_capacity(token_num) == expected_capacity
+
+    for token_num in (0, -1):
+        try:
+            _route_workspace_token_capacity(token_num)
+        except ValueError as error:
+            assert "must be positive" in str(error)
+        else:
+            raise AssertionError(f"expected ValueError for token_num={token_num}")
+
+    aiter.logger.info("moe_2stage: route workspace capacity passed")
 
 
 def test_bm16_tiled_scale_boundary():
@@ -1412,11 +1467,13 @@ def _iter_with_env(case_iter, **env_overrides):
 
 
 _case_iters = []
+test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
-    if not args.no_flydsl_csv:
+    # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
+    if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
             _iter_with_env(
                 _iter_csv_cases(),

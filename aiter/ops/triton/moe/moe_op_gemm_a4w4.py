@@ -12,10 +12,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.moe.moe_op_gemm_a4w4 import (
     get_moe_a4w4_layouts_decode,
     get_moe_a4w4_layouts_prefill,
 )
-from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import (
-    _moe_gemm_a4w4,
-    _mxfp4_quant_kernel,
-)
+from aiter.ops.triton._triton_kernels.moe.moe_op_gemm_a4w4 import _moe_gemm_a4w4
 from aiter.ops.triton.moe.moe_routing.routing import RoutingData
 from aiter.ops.triton.moe.reduce import (
     EpCombineScatter,
@@ -23,6 +20,7 @@ from aiter.ops.triton.moe.reduce import (
     scatter_grouped,
     validate_reduce_out,
 )
+from aiter.ops.triton.quant.quant import dynamic_mxfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_num_stages
@@ -247,52 +245,22 @@ MXFP4_QUANT_BLOCK_SIZE = 32
 
 def mxfp4_quant(
     x: torch.Tensor,
-    block_size_m: int = 16,
-    block_size_n: int = 256,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Quantize a 2D tensor `x` of shape [M, K] (bf16/fp16/fp32) to MXFP4 (E2M1) format
-    quantized along the K dimension.
-
     Returns:
     - A packed MXFP4 tensor `x_fp4` of shape [M, N // 2] (stored as uint8), where
         each byte stores two 4-bit values.
     - A block-scale tensor `x_scale` of shape [M, N / 32], where each entry
-        corresponds to one MXFP4 quantization block of 32 elements along the K dimension.
+        corresponds to one MXFP4 quantization block of 32 elements along the N dimension.
     """
     M, N = x.shape
     assert N % MXFP4_QUANT_BLOCK_SIZE == 0
-    assert block_size_n % MXFP4_QUANT_BLOCK_SIZE == 0
 
     x_fp4 = torch.empty((M, N // 2), dtype=torch.uint8, device=x.device)
     x_scale = torch.empty(
         (M, N // MXFP4_QUANT_BLOCK_SIZE), dtype=torch.uint8, device=x.device
     )
-
-    grid = (
-        triton.cdiv(M, block_size_m),
-        triton.cdiv(N, block_size_n),
-    )
-
-    _mxfp4_quant_kernel[grid](
-        x,
-        x_fp4,
-        x_scale,
-        x.stride(0),
-        x.stride(1),
-        x_fp4.stride(0),
-        x_fp4.stride(1),
-        x_scale.stride(0),
-        x_scale.stride(1),
-        M,
-        N,
-        BLOCK_SIZE_M=block_size_m,
-        BLOCK_SIZE_N=block_size_n,
-        MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        EVEN_M_N=(M % block_size_m == 0) and (N % block_size_n == 0),
-    )
-
-    return x_fp4, x_scale
+    return dynamic_mxfp4_quant(x, x_fp4=x_fp4, blockscale_e8m0=x_scale)
 
 
 def moe_gemm_a4w4(

@@ -5,7 +5,7 @@ import csv
 import logging
 import math
 import re
-from dataclasses import MISSING, dataclass, fields
+from dataclasses import MISSING, dataclass, fields, replace
 from functools import cache
 from pathlib import Path
 
@@ -407,6 +407,14 @@ def _barrier(tensor, flat_base, ready_offset, tp_size, stream) -> None:
     )
 
 
+def _bind_inter_layout(runner, ordinary_stage2) -> None:
+    keywords = getattr(ordinary_stage2, "keywords", None) or {}
+    name = keywords.get("kernelName") or keywords.get("kernelName2") or ""
+    sorted_input = "_moe2_layout_" in str(name)
+    if runner.config.sorted_input != sorted_input:
+        runner.config = replace(runner.config, sorted_input=sorted_input)
+
+
 def _stage2_args(args, kwargs, config):
     inter_states, w2 = args[0], args[2]
     sorted_token_ids, sorted_expert_ids, num_valid_ids = args[3:6]
@@ -587,7 +595,7 @@ class _MegakernelRunner:
         shared_partial,
         ordinary_stage2,
     ):
-        del ordinary_stage2
+        _bind_inter_layout(self, ordinary_stage2)
         stream = torch.cuda.current_stream(self.device)
         if (
             self.config.shared_bf16_partials
@@ -743,6 +751,7 @@ class _WindowRunner:
         ordinary_stage2,
     ):
         k = window
+        _bind_inter_layout(self, ordinary_stage2)
         config = self.config
         stream = torch.cuda.current_stream(self.device)
         common = _stage2_args(stage2_args, stage2_kwargs, config)

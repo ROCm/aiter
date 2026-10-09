@@ -246,6 +246,8 @@ def _pattern_packed(
     generator: torch.Generator,
 ) -> torch.Tensor:
     """Build packed MXFP4 weights with the shared benchmark initializer."""
+    if data_init == "zero":
+        return torch.zeros((experts, rows, k_pack), dtype=torch.uint8)
     if data_init == "constant":
         return torch.full((experts, rows, k_pack), 0x11, dtype=torch.uint8)
     packed = bench_init.fill_fp4((experts * rows, k_pack * 2), data_init, generator)
@@ -261,6 +263,8 @@ def init_weight_scales(
     generator: torch.Generator,
 ) -> torch.Tensor:
     """Build E8M0 weight scales with the shared benchmark initializer."""
+    if scale_init == "zero":
+        return torch.zeros((experts, rows, n_blocks), dtype=torch.uint8)
     if scale_init == "constant":
         return torch.full(
             (experts, rows, n_blocks), DEFAULT_SCALE_BYTE, dtype=torch.uint8
@@ -275,6 +279,8 @@ def _init_hidden(
     generator: torch.Generator,
 ) -> torch.Tensor:
     """Build BF16 activations using the selected low-precision data model."""
+    if data_init == "zero":
+        return torch.zeros(shape, dtype=torch.bfloat16)
     if data_init == "constant":
         return torch.full(shape, 0.5, dtype=torch.bfloat16)
     if data_format == "a4w4":
@@ -575,12 +581,14 @@ def _gemm_work_metrics(
     inter_dim: int,
     data_format: str,
 ) -> dict[str, tuple[float, float]]:
-    """Return conventional GEMM FLOPs and effective bytes for both stages.
+    """Return conventional GEMM FLOPs and effective fused-MoE bytes.
 
     The byte model matches the grouped-MoE tuner: logical quantized inputs and
-    weights plus BF16 outputs. It excludes routing, quantization, scales, bias,
-    and other fused-MoE auxiliary traffic, so the reported bandwidth is an
-    effective GEMM bandwidth rather than measured HBM transactions.
+    weights, their E8M0 block scales, and BF16 outputs. GEMM1 counts the
+    post-activation output, whose width is ``inter_dim``; GEMM2 counts its
+    per-route output before gather-reduce. The model excludes routing,
+    quantization, bias, and other fused-MoE auxiliary traffic, so the reported
+    bandwidth is effective bandwidth rather than measured HBM traffic.
     """
     input_bytes = 0.5 if data_format == "a4w4" else 1.0
     weight_bytes = 0.5
@@ -591,14 +599,18 @@ def _gemm_work_metrics(
     gemm1_flops = routed_rows * stage1_n * model_dim * 2
     gemm1_bytes = (
         routed_rows * model_dim * input_bytes
-        + routed_rows * stage1_n * output_bytes
+        + routed_rows * model_dim // SCALE_BLOCK
+        + routed_rows * inter_dim * output_bytes
         + experts * model_dim * stage1_n * weight_bytes
+        + experts * model_dim * stage1_n // SCALE_BLOCK
     )
     gemm2_flops = tokens * topk * model_dim * inter_dim * 2
     gemm2_bytes = (
         tokens * topk * inter_dim * input_bytes
-        + tokens * model_dim * output_bytes
+        + routed_rows * inter_dim // SCALE_BLOCK
+        + routed_rows * model_dim * output_bytes
         + experts * inter_dim * model_dim * weight_bytes
+        + experts * inter_dim * model_dim // SCALE_BLOCK
     )
     return {
         "gemm1": (gemm1_flops, gemm1_bytes),
@@ -1235,7 +1247,7 @@ def main() -> None:
         "--data-init",
         dest="data_init",
         nargs="+",
-        choices=bench_init.DATA_DISTS,
+        choices=("zero", *bench_init.DATA_DISTS),
         default=None,
         help="DATA initialization distribution(s), paired position-wise with "
         "--scale-init (length-1 broadcasts). Default: constant uniform",
@@ -1279,7 +1291,7 @@ def main() -> None:
         "--scale-init",
         dest="scale_init",
         nargs="+",
-        choices=bench_init.E8M0_SCALE_DISTS,
+        choices=("zero", *bench_init.E8M0_SCALE_DISTS),
         default=None,
         help="E8M0 SCALE initialization distribution(s), paired position-wise "
         "with --data-init (length-1 broadcasts). Default: constant auto",

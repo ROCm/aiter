@@ -330,6 +330,16 @@ def _collect_sample(handle) -> dict:
         sample["vram_used_mb"] = mem / 1024 / 1024
     except Exception:
         pass
+    try:
+        fclk = amdsmi.amdsmi_get_clk_freq(handle, amdsmi.AmdSmiClkType.DF)
+        freq = fclk.get("frequency", None)
+        freq_idx = fclk.get("current", -1)
+        if freq is None or freq_idx < 0 or freq_idx >= len(freq):
+            sample["fclk_mhz"] = None
+        else:
+            sample["fclk_mhz"] = freq[freq_idx] / 1000000
+    except Exception:
+        pass
     return sample
 
 
