@@ -573,9 +573,9 @@ def test_flydsl_compress_attn_strided(shape_label, bs, mtp, path):
         )
         max_err = 0.05
     else:
-        assert not torch.isnan(str_inp["kv_cache"].to(dtypes.fp32)).any(), (
-            f"{msg}: NaN in kv_cache (read from stride padding)"
-        )
+        assert not torch.isnan(
+            str_inp["kv_cache"].to(dtypes.fp32)
+        ).any(), f"{msg}: NaN in kv_cache (read from stride padding)"
         err = checkAllclose(
             str_inp["kv_cache"].to(dtypes.fp32),
             ref_inp["kv_cache"].to(dtypes.fp32),
