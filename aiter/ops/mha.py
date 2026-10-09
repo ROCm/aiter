@@ -4227,7 +4227,9 @@ def flash_attn_fp8_pertensor_func(
         ret = ret and (q.shape[2] % k.shape[2] == 0)
         ret = ret and (k.shape[-1] == q.shape[-1])
         if ret:
-            from .triton.attention.mha import gluon_forward_unsupported_reason
+            from aiter.ops.triton.attention.mha import (
+                gluon_forward_unsupported_reason,
+            )
 
             ret = (
                 gluon_forward_unsupported_reason(
@@ -4238,7 +4240,9 @@ def flash_attn_fp8_pertensor_func(
         return ret
 
     if can_impl_fmha_fwd_gfx1250_gluon_fp8():
-        from .triton.attention.mha import flash_attn_func as triton_flash_attn_func
+        from aiter.ops.triton.attention.mha import (
+            flash_attn_func as triton_flash_attn_func,
+        )
 
         return triton_flash_attn_func(
             q,

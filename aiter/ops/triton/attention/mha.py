@@ -307,15 +307,16 @@ def _gluon_flash_attn_forward(
         return_softmax: also write out the per-block softmax probabilities.
         max_seqlen_q/max_seqlen_k: max sequence lengths in the batch (varlen).
         o: optional preallocated output, shaped like q but with V's head dim.
-            Defaults to a fresh tensor (fp32 for fp8).
+            Defaults to a fresh tensor (fp32 for fp8; bf16 for fp8 on gfx1250).
         cu_seqlens_q/cu_seqlens_k: (batch + 1,) int32 cumulative lengths (varlen).
         descale_q: (batch, num_q_heads) fp32 dequant scalars for q (fp8 only).
         descale_k/descale_v: (batch, num_k_heads) fp32 dequant scalars for k/v (fp8 only).
         sink: (num_q_heads,) attention sink logits, or None. Each one acts as an
             extra softmax column with no value vector.
     Return:
-        o: same layout as q. Dtype is fp32 for fp8 inputs unless the caller passed
-            an ``o`` of a different dtype, in which case that dtype is returned.
+        o: same layout as q. Dtype is fp32 for fp8 inputs (bf16 on gfx1250) unless
+            the caller passed an ``o`` of a different dtype, in which case that
+            dtype is returned.
         softmax_lse: fp32 log-sum-exp, shaped (batch, num_q_heads, max_seqlen_q)
             for bshd and (total_q, num_q_heads) for varlen, or None when
             ``return_lse`` is False.
