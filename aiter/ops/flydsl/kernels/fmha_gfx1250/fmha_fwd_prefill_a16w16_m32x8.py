@@ -1293,6 +1293,31 @@ def _prologue_attention(
     }
 
 
+def _o_pack(o_list):
+    """Fold the per-d-tile O accumulators into ONE vector value.
+
+    Eight separate <8 x f32> loop-carried values are eight independent live ranges the
+    allocator may place anywhere, including astride the Lo256/Hi256 bank boundary; one
+    <64 x f32> is a single aligned tuple it cannot scatter. The shuffles are constant
+    index tuples, so they lower to REG_SEQUENCE / EXTRACT_SUBREG, not to moves."""
+    cur = list(o_list)
+    while len(cur) > 1:
+        width = cur[0].numel
+        cur = [
+            cur[i].shuffle(cur[i + 1], list(range(2 * width)))
+            for i in range(0, len(cur), 2)
+        ]
+    return cur[0]
+
+
+def _o_unpack(wide, num_tiles):
+    width = wide.numel // num_tiles
+    return [
+        wide.shuffle(wide, list(range(i * width, (i + 1) * width)))
+        for i in range(num_tiles)
+    ]
+
+
 def _core_attention_multi_kv_tiles(
     *,
     qk_hdim,
@@ -1416,11 +1441,13 @@ def _core_attention_multi_kv_tiles(
     d_tiles = v_hdim // WMMA_M
     R = num_q_tiles_per_wave
     NKV = n_block // WMMA_N
-    # Per-q-tile carried state: [m, d, O_0 .. O_{d_tiles-1}, P_0 .. P_{NKV-1}]. P is the
-    # software pipeline -- body u's PV consumes the P body u-1's softmax produced. The HI
-    # half runs softmax(u-1) before gemm(u), so its last NKV slots hold the f32 s_acc the
-    # next body's softmax consumes instead of the bf16 P; the slot count is the same.
-    _QS = 2 + d_tiles + NKV
+    # Per-q-tile carried state: [m, d, O, P_0 .. P_{NKV-1}]. P is the software pipeline --
+    # body u's PV consumes the P body u-1's softmax produced. The HI half runs softmax(u-1)
+    # before gemm(u), so its last NKV slots hold the f32 s_acc the next body's softmax
+    # consumes instead of the bf16 P; the slot count is the same. O is ONE wide vector:
+    # the d_tiles accumulators travel the back edge as a single tuple (see _o_pack), which
+    # the P slots do NOT, because the gemm ring produces and consumes them one at a time.
+    _QS = 2 + 1 + NKV
     _lag_sm = not warp_type.is_lo
     if _lag_sm:
         # Rotating the drain to the body tail shifts this half's barrier stream by one:
@@ -1447,7 +1474,7 @@ def _core_attention_multi_kv_tiles(
                 _raw(m_init[qt]),
                 _raw(d_init[qt]),
             ]
-            + [_raw(fx.Vector.filled(8, 0.0, fx.Float32)) for _ in range(d_tiles)]
+            + [_raw(fx.Vector.filled(8 * d_tiles, 0.0, fx.Float32))]
             + [
                 _raw(
                     fx.Vector.filled(8, float("-inf"), fx.Float32)
@@ -1531,13 +1558,12 @@ def _core_attention_multi_kv_tiles(
         m_prev = [fx.Float32(state[qt * _QS + 0]) for qt in range(R)]
         d_prev = [fx.Float32(state[qt * _QS + 1]) for qt in range(R)]
         o_acc = [
-            [fx.Vector(state[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
-            for qt in range(R)
+            _o_unpack(fx.Vector(state[qt * _QS + 2]), d_tiles) for qt in range(R)
         ]
         # Carried gemm/softmax hand-off: P(u-1) on the leading half, S(u-1) on the
         # lagging one (same slot count, different element type).
         carry_prev = [
-            [fx.Vector(state[qt * _QS + 2 + d_tiles + kvt]) for kvt in range(NKV)]
+            [fx.Vector(state[qt * _QS + 3 + kvt]) for kvt in range(NKV)]
             for qt in range(R)
         ]
         k_slots = [
@@ -1774,7 +1800,7 @@ def _core_attention_multi_kv_tiles(
         for qt in range(R):
             out += (
                 [_raw(m_new_list[qt]), _raw(d_new_list[qt])]
-                + [_raw(o) for o in o_out[qt]]
+                + [_raw(_o_pack(o_out[qt]))]
                 + [_raw(cv) for cv in carry_next[qt]]
             )
         rot = list(range(1, N_KV_PP)) + [0]
@@ -1891,10 +1917,7 @@ def _core_attention_multi_kv_tiles(
     return _epi_state(
         m_list=[fx.Float32(final[qt * _QS + 0]) for qt in range(R)],
         d_list=[fx.Float32(final[qt * _QS + 1]) for qt in range(R)],
-        o_list=[
-            [fx.Vector(final[qt * _QS + 2 + dt]) for dt in range(d_tiles)]
-            for qt in range(R)
-        ],
+        o_list=[_o_unpack(fx.Vector(final[qt * _QS + 2]), d_tiles) for qt in range(R)],
         o_lds_warp=o_lds_warp,
     )
 
