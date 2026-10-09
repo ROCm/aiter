@@ -33,10 +33,11 @@ from aiter.utility import dtypes as aiter_dtypes
 from .kernels_common import ceildiv, get_warp_size
 from .tensor_shim import _run_compiled
 
-# RMSNorm uses 32-lane logical groups on both wave32 and wave64 targets.
+
 WAVE = get_warp_size()
 _LOG2_WAVE = int(math.log2(WAVE))
 
+# RMSNorm uses 32-lane logical groups on both wave32 and wave64 targets.
 RMS_GROUP = 32
 _LOG2_RMS_GROUP = int(math.log2(RMS_GROUP))
 
@@ -655,7 +656,6 @@ def _build_kv_kernel(
                     k_lds_pairs = fx.slice(k_lds_lane_pairs, (token_local, None))
                     v_lds_pairs = fx.slice(v_lds_lane_pairs, (token_local, None))
 
-                    # Define these outside the compile-time branch for tracing.
                     k_out_pairs = (
                         fx.slice(k_out_lane_pairs, (tok, head, None))
                         if const_expr(emit_flat_kv)
