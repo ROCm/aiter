@@ -5,10 +5,12 @@ import argparse
 import itertools
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.mx_scale_layout import from_mx_scale_layout
 from aiter.ops.quant import per_1x32_f4_quant, quant_mxfp4_hip
 from aiter.ops.shuffle import (
     shuffle_scale,
@@ -17,6 +19,7 @@ from aiter.ops.shuffle import (
     shuffle_weight_a16w4,
 )
 from aiter.test_common import benchmark
+from aiter.utility.mx_types import MXScaleLayoutInt
 
 torch.set_default_device("cuda")
 
@@ -25,6 +28,27 @@ F32_MIN_NORMAL = 2.0 ** (-126)
 
 # E8M0 stores a biased exponent, so the encoding of 2^0 is the bias itself.
 E8M0_ONE = 0x7F
+
+
+@pytest.mark.parametrize("m", [1, 5, 16, 31, 32, 33, 255, 256, 257])
+@pytest.mark.parametrize("n", [128, 256])
+def test_quant_mxfp4_explicit_scale_layouts(m, n):
+    x = torch.randn((m, n), dtype=torch.bfloat16)
+    row_q, row_scale = quant_mxfp4_hip(x, scale_layout=MXScaleLayoutInt.ROW_MAJOR)
+
+    for layout in (MXScaleLayoutInt.AITER_E8M0, MXScaleLayoutInt.OPUS_F4):
+        q, scale = quant_mxfp4_hip(x, scale_layout=layout)
+        assert torch.equal(q.view(torch.uint8), row_q.view(torch.uint8))
+        assert torch.equal(
+            from_mx_scale_layout(scale, m, n // 32, layout).view(torch.uint8),
+            row_scale.view(torch.uint8),
+        )
+
+
+def test_pack_dim0_rejects_non_row_scale_layout():
+    x = torch.randn((128, 16), dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="pack_dim=0"):
+        per_1x32_f4_quant(x, pack_dim=0, scale_layout=MXScaleLayoutInt.AITER_E8M0)
 
 
 def _finalize_scale(scaled: torch.Tensor, zero_mask: torch.Tensor) -> torch.Tensor:

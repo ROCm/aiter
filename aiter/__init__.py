@@ -57,6 +57,20 @@ def getLogger():
 
 
 logger = getLogger()
+
+
+def __getattr__(name):
+    if name == "MXScaleLayout":
+        from .utility import mx_types
+
+        # Public callers only need stable integer layout tags. Keep this usable
+        # in Triton-only/AOT environments where module_aiter_core is not built.
+        value = mx_types.MXScaleLayoutInt
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 AITER_AOT_IMPORT = os.getenv("AITER_AOT_IMPORT", "0") == "1"
 # Triton-only: expose only the Triton ops, skipping the C++/CK/HIP ops and their
 # JIT build. Opt in via the env var, e.g. Triton-backend users with no C++

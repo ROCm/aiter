@@ -15,11 +15,7 @@
 
 namespace aiter {
 
-// scale_m32k4: fp8 + e8m0 + group_size 32 only. The scale goes straight into the gfx1250
-// MXFP8 ASM GEMM A-scale layout (shuffle_mxfp8fp4_scale bytes),
-//     scale[(row / 32) * n + (g / 4) * 128 + (row % 32) * 4 + g % 4],
-// and the grid is padded to a multiple of 32 rows whose blocks only write the pad scales (0x7F).
-template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1, bool scale_m32k4 = false>
+template <typename DTYPE_I, typename DTYPE_O, int BlockSize, int thread_data_size, bool ADD_RESIDUAL=true, bool FUSE_QUANT=true, bool interleave = false, int num_row = 1>
 __global__ void add_rmsnorm_quant_kernel(
     DTYPE_O* out,
     DTYPE_I* residual_out,
@@ -37,7 +33,8 @@ __global__ void add_rmsnorm_quant_kernel(
     int out_stride,
     int group_size,
     bool shuffle_scale=false,
-    bool emit_e8m0_scale=false)
+    bool emit_e8m0_scale=false,
+    int scale_layout=static_cast<int>(MXScaleLayout::ROW_MAJOR))
     {
         static constexpr int32_t load_chunk_bytes = sizeof(DTYPE_I) * thread_data_size % 16 == 0 ? 16 : 8;
         static_assert(thread_data_size * sizeof(DTYPE_I) % load_chunk_bytes == 0, "thread_data_size * sizeof(DTYPE_I) must be a multiple of load_chunk_bytes");
@@ -45,17 +42,46 @@ __global__ void add_rmsnorm_quant_kernel(
         static constexpr int32_t num_load_inst = thread_data_size / load_vec_size;
         static constexpr int32_t load_aux = (num_load_inst > 1 && !interleave) ? RT : GROUP_NT;
         int64_t idx = blockIdx.x * num_row;
+        int tid = threadIdx.x;
         if (idx >= m)
         {
-            if constexpr(scale_m32k4)
+            if(emit_e8m0_scale && scale_layout != static_cast<int>(MXScaleLayout::ROW_MAJOR))
             {
                 auto* tmp = reinterpret_cast<uint8_t*>(scale);
-                for(int y = threadIdx.x; y < n / 32; y += BlockSize)
-                    tmp[(idx / 32) * n + (y / 4) * 128 + (idx % 32) * 4 + y % 4] = 0x7F;
+                const int scaleN = n / group_size;
+                const int scaleN_pad =
+                    scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0)
+                        ? (scaleN + 7) / 8 * 8
+                        : (scaleN + 3) / 4 * 4;
+                for(int y = tid; y < scaleN_pad; y += BlockSize)
+                {
+                    const int64_t dst =
+                        scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0)
+                            ? aiter::mx_scale_shuffle_idx(scaleN_pad, idx, y)
+                            : aiter::mx_scale_opus_f4_idx(scaleN_pad, idx, y);
+                    tmp[dst] = 0x7F;
+                }
             }
             return;
         }
-        int tid = threadIdx.x;
+        if(emit_e8m0_scale && scale_layout != static_cast<int>(MXScaleLayout::ROW_MAJOR))
+        {
+            auto* tmp = reinterpret_cast<uint8_t*>(scale);
+            const int scaleN = n / group_size;
+            const int scaleN_pad =
+                scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0)
+                    ? (scaleN + 7) / 8 * 8
+                    : (scaleN + 3) / 4 * 4;
+            for(int y = scaleN + tid; y < scaleN_pad; y += BlockSize)
+            {
+                const int64_t dst =
+                    scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0)
+                        ? aiter::mx_scale_shuffle_idx(scaleN_pad, idx, y)
+                        : aiter::mx_scale_opus_f4_idx(scaleN_pad, idx, y);
+                tmp[dst] =
+                    scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0) ? 0x7F : 0;
+            }
+        }
         using vec_i = opus::vector_t<DTYPE_I, thread_data_size>;
         static constexpr int32_t vec_size_o =
             std::is_same_v<DTYPE_O, opus::fp4_t> ? thread_data_size / 2 : thread_data_size;
@@ -277,21 +303,19 @@ __global__ void add_rmsnorm_quant_kernel(
                             auto* tmp        = reinterpret_cast<uint8_t*>(scale);
                             uint8_t exponent = (__builtin_bit_cast(uint32_t, quant_scale) >> 23) & 0b11111111;
                             int scaleN = n / group_size;
-                            if constexpr(scale_m32k4)
+                            if(scale_layout == static_cast<int>(MXScaleLayout::OPUS_F4))
                             {
-                                x = (x / 32) * n + (y / 4) * 128 + (x % 32) * 4 + y % 4;
+                                const int scaleN_pad = (scaleN + 3) / 4 * 4;
+                                x = aiter::mx_scale_opus_f4_idx(scaleN_pad, x, y);
+                            }
+                            else if(scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0))
+                            {
+                                const int scaleN_pad = (scaleN + 7) / 8 * 8;
+                                x = aiter::mx_scale_shuffle_idx(scaleN_pad, x, y);
                             }
                             else if(shuffle_scale)
                             {
-                                if(group_size == 32)
-                                {
-                                    int scaleN_pad = (scaleN + 7) / 8 * 8;
-                                    x = aiter::mx_scale_shuffle_idx(scaleN_pad, x, y);
-                                }
-                                else
-                                {
-                                    x = y * m + x;
-                                }
+                                x = y * m + x;
                             }
                             else
                             {
@@ -342,9 +366,9 @@ __global__ void add_rmsnorm_quant_kernel(
     }
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL_(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave) \
-    ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, false)
+    ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave)
 
-#define ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, SCALE_M32K4) \
+#define ADD_RMSNORM_QUANT_KERNEL_IMPL_M(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave) \
     AITER_DISPATCH_FLOATING16_TYPES_rmTorch(input.dtype(), "quant_kernel", [&] {                    \
     using DTYPE_I = typename hip2opus<scalar_t>::type;                                        \
     using DTYPE_OO = std::conditional_t<FUSE_QUANT, DTYPE_O, DTYPE_I>; \
@@ -352,16 +376,17 @@ __global__ void add_rmsnorm_quant_kernel(
     int reduce_thread_size = group_size / thread_data_size; \
     AITER_CHECK(group_size == 0 || (reduce_thread_size & (reduce_thread_size - 1)) == 0, __func__, " reduce_thread_size is not power of 2"); \
     const int num_row_per_block = 1; \
-    const int grid_rows = SCALE_M32K4 ? (m + 31) / 32 * 32 : m; \
+    /* Only the legacy MXFP8 m32k4 path requires initialized padding rows. */ \
+    const int grid_rows = fill_scale_padding_rows ? (m + 31) / 32 * 32 : m; \
     dim3 grid((grid_rows + num_row_per_block - 1) / num_row_per_block); \
     dim3 block(BlockSize); \
-    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block, SCALE_M32K4><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
+    add_rmsnorm_quant_kernel<DTYPE_I, DTYPE_OO, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT, interleave, num_row_per_block><<<grid, block, 0, stream>>>(reinterpret_cast<DTYPE_OO*>(out.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_out.data_ptr()), \
                                                                                                      reinterpret_cast<float*>(scale.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(input.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(residual_in.data_ptr()), \
                                                                                                      reinterpret_cast<DTYPE_I*>(weight.data_ptr()), \
-                                                                                                     epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale, emit_e8m0_scale); \
+                                                                                                     epsilon, gemma_norm, m, n, input_stride, residual_in_stride, residual_out_stride, out_stride, group_size, shuffle_scale, emit_e8m0_scale, scale_layout); \
                                                                                                      });
 
 #define ADD_RMSNORM_QUANT_KERNEL_IMPL(DTYPE_O, BlockSize, thread_data_size, ADD_RESIDUAL, FUSE_QUANT) \
@@ -420,7 +445,7 @@ __global__ void add_rmsnorm_quant_kernel(
 // m32k4 scale layout: fp8 + e8m0 + group_size 32. Same width buckets as the grouped
 // dispatch above; 32 % thread_data_size == 0 holds for every bucket used here.
 #define RMSNORM_QUANT_M32K4_IMPL(BlockSize, thread_data_size, ADD_RESIDUAL) \
-    ADD_RMSNORM_QUANT_KERNEL_IMPL_M(opus::fp8_t, BlockSize, thread_data_size, ADD_RESIDUAL, true, (thread_data_size <= 8), true)
+    ADD_RMSNORM_QUANT_KERNEL_IMPL_M(opus::fp8_t, BlockSize, thread_data_size, ADD_RESIDUAL, true, (thread_data_size <= 8))
 
 #define RMSNORM_QUANT_M32K4_DISPATCH(ADD_RESIDUAL) \
     if (n <= 512) { \
@@ -443,19 +468,57 @@ __global__ void add_rmsnorm_quant_kernel(
         AITER_CHECK(false, __func__, " not support n: ", n); \
     }
 
-    static inline void check_scale_m32k4(const aiter_tensor_t& out, const aiter_tensor_t& scale,
-                                         int group_size, int m, int n, bool emit_e8m0_scale)
+    static inline int resolve_scale_layout(bool shuffle_scale,
+                                           bool scale_layout_m32k4,
+                                           int explicit_layout,
+                                           bool emit_e8m0_scale)
     {
-        AITER_CHECK(out.dtype() == AITER_DTYPE_fp8, "scale_layout_m32k4 needs fp8 output, got ",
-                    AiterDtype_to_str(out.dtype()));
+        AITER_CHECK(explicit_layout >= -1 &&
+                        explicit_layout <= static_cast<int>(MXScaleLayout::OPUS_F4),
+                    "invalid MX scale layout ", explicit_layout);
+        AITER_CHECK(explicit_layout == -1 || (!shuffle_scale && !scale_layout_m32k4),
+                    "scale_layout conflicts with legacy shuffle_scale/scale_layout_m32k4");
+        if(!emit_e8m0_scale)
+        {
+            AITER_CHECK(explicit_layout == -1 ||
+                            explicit_layout == static_cast<int>(MXScaleLayout::ROW_MAJOR),
+                        "explicit non-row MX scale layout requires an e8m0 byte scale");
+            return static_cast<int>(MXScaleLayout::ROW_MAJOR);
+        }
+        if(explicit_layout != -1)
+            return explicit_layout;
+        if(scale_layout_m32k4)
+            return static_cast<int>(MXScaleLayout::OPUS_F4);
+        if(shuffle_scale)
+            return static_cast<int>(MXScaleLayout::AITER_E8M0);
+        return static_cast<int>(MXScaleLayout::ROW_MAJOR);
+    }
+
+    static inline void check_scale_layout(const aiter_tensor_t& scale,
+                                          int group_size,
+                                          int m,
+                                          int n,
+                                          bool emit_e8m0_scale,
+                                          int scale_layout)
+    {
+        if(scale_layout == static_cast<int>(MXScaleLayout::ROW_MAJOR))
+            return;
         AITER_CHECK(emit_e8m0_scale && group_size == 32,
-                    "scale_layout_m32k4 needs an e8m0 scale and group_size 32, got group_size ",
+                    "non-row MX scale layout needs an e8m0 scale and group_size 32, got ",
                     group_size);
-        AITER_CHECK(n % 128 == 0, "scale_layout_m32k4 needs n % 128 == 0, got ", n);
-        const int64_t m_pad = (static_cast<int64_t>(m) + 31) / 32 * 32;
-        AITER_CHECK(scale.is_contiguous() && scale.numel() >= m_pad * (n / 32),
-                    "scale_layout_m32k4 needs a contiguous (pad32(m), n/32) = (", m_pad, ", ",
-                    n / 32, ") scale, got numel ", scale.numel());
+        AITER_CHECK(n % 32 == 0, "MX scale layout needs n % 32 == 0, got ", n);
+        const int64_t scale_n = n / 32;
+        const int64_t m_pad =
+            scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0)
+                ? (static_cast<int64_t>(m) + 255) / 256 * 256
+                : (static_cast<int64_t>(m) + 31) / 32 * 32;
+        const int64_t scale_n_pad =
+            scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0)
+                ? (scale_n + 7) / 8 * 8
+                : (scale_n + 3) / 4 * 4;
+        AITER_CHECK(scale.is_contiguous() && scale.numel() >= m_pad * scale_n_pad,
+                    "MX scale layout needs ", m_pad * scale_n_pad,
+                    " contiguous bytes, got ", scale.numel());
     }
 
     // A zero-element placeholder for optional operands (residual / scale) that a
@@ -486,7 +549,8 @@ __global__ void add_rmsnorm_quant_kernel(
         int group_size = 0,
         bool shuffle_scale = false,
         bool gemma_norm = false,
-        bool scale_layout_m32k4 = false
+        bool scale_layout_m32k4 = false,
+        int explicit_scale_layout = -1
     )
     {
         int n = input.size(1);
@@ -503,9 +567,26 @@ __global__ void add_rmsnorm_quant_kernel(
         const bool emit_e8m0_scale = scale.element_size() == 1;
         AITER_CHECK(!emit_e8m0_scale || group_size != 0, __func__,
                     " e8m0 byte scale requires group_size != 0");
+        int scale_layout = resolve_scale_layout(
+            shuffle_scale, scale_layout_m32k4, explicit_scale_layout, emit_e8m0_scale);
+        const bool fill_scale_padding_rows = scale_layout_m32k4;
+        if(explicit_scale_layout == -1 && !scale_layout_m32k4 && shuffle_scale &&
+           group_size != 32)
+            scale_layout = static_cast<int>(MXScaleLayout::ROW_MAJOR);
         if(scale_layout_m32k4)
         {
-            check_scale_m32k4(out, scale, group_size, m, n, emit_e8m0_scale);
+            AITER_CHECK(out.dtype() == AITER_DTYPE_fp8,
+                        "legacy scale_layout_m32k4 needs fp8 output, got ",
+                        AiterDtype_to_str(out.dtype()));
+            AITER_CHECK(emit_e8m0_scale && group_size == 32,
+                        "legacy scale_layout_m32k4 needs an e8m0 scale and group_size 32");
+            AITER_CHECK(n % 128 == 0,
+                        "legacy scale_layout_m32k4 needs n % 128 == 0, got ", n);
+        }
+        check_scale_layout(scale, group_size, m, n, emit_e8m0_scale, scale_layout);
+        if(scale_layout == static_cast<int>(MXScaleLayout::OPUS_F4) &&
+           out.dtype() == AITER_DTYPE_fp8)
+        {
             RMSNORM_QUANT_M32K4_DISPATCH(true);
             return;
         }
@@ -566,7 +647,8 @@ __global__ void add_rmsnorm_quant_kernel(
         int group_size = 0,
         bool shuffle_scale = false,
         bool gemma_norm = false,
-        bool scale_layout_m32k4 = false
+        bool scale_layout_m32k4 = false,
+        int explicit_scale_layout = -1
     )
     {
         aiter_tensor_t residual_in = empty_placeholder(input.dtype(), input.device_id);
@@ -586,9 +668,26 @@ __global__ void add_rmsnorm_quant_kernel(
         const bool emit_e8m0_scale = scale.element_size() == 1;
         AITER_CHECK(!emit_e8m0_scale || group_size != 0, __func__,
                     " e8m0 byte scale requires group_size != 0");
+        int scale_layout = resolve_scale_layout(
+            shuffle_scale, scale_layout_m32k4, explicit_scale_layout, emit_e8m0_scale);
+        const bool fill_scale_padding_rows = scale_layout_m32k4;
+        if(explicit_scale_layout == -1 && !scale_layout_m32k4 && shuffle_scale &&
+           group_size != 32)
+            scale_layout = static_cast<int>(MXScaleLayout::ROW_MAJOR);
         if(scale_layout_m32k4)
         {
-            check_scale_m32k4(out, scale, group_size, m, n, emit_e8m0_scale);
+            AITER_CHECK(out.dtype() == AITER_DTYPE_fp8,
+                        "legacy scale_layout_m32k4 needs fp8 output, got ",
+                        AiterDtype_to_str(out.dtype()));
+            AITER_CHECK(emit_e8m0_scale && group_size == 32,
+                        "legacy scale_layout_m32k4 needs an e8m0 scale and group_size 32");
+            AITER_CHECK(n % 128 == 0,
+                        "legacy scale_layout_m32k4 needs n % 128 == 0, got ", n);
+        }
+        check_scale_layout(scale, group_size, m, n, emit_e8m0_scale, scale_layout);
+        if(scale_layout == static_cast<int>(MXScaleLayout::OPUS_F4) &&
+           out.dtype() == AITER_DTYPE_fp8)
+        {
             RMSNORM_QUANT_M32K4_DISPATCH(false);
             return;
         }
@@ -654,6 +753,8 @@ __global__ void add_rmsnorm_quant_kernel(
         int group_size = 0;
         bool shuffle_scale = false;
         const bool emit_e8m0_scale = false;
+        const int scale_layout = static_cast<int>(MXScaleLayout::ROW_MAJOR);
+        const bool fill_scale_padding_rows = false;
 
         const HipDeviceGuard device_guard(input.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();
@@ -711,6 +812,8 @@ __global__ void add_rmsnorm_quant_kernel(
         int group_size = 0;
         bool shuffle_scale = false;
         const bool emit_e8m0_scale = false;
+        const int scale_layout = static_cast<int>(MXScaleLayout::ROW_MAJOR);
+        const bool fill_scale_padding_rows = false;
 
         const HipDeviceGuard device_guard(input.device_id);
         const hipStream_t stream = aiter::getCurrentHIPStream();

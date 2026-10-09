@@ -45,6 +45,7 @@ from aiter.test_common import (
     run_perftest,
 )
 from aiter.utility import fp4_utils
+from aiter.utility.mx_types import MXScaleLayoutInt
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -485,6 +486,11 @@ def test_gemm(
                 a4_kwargs.update(
                     global_A_scale=torch.tensor(inp["gA"], device=inp["A"].device),
                     global_B_scale=torch.tensor(inp["gB"], device=inp["A"].device),
+                )
+            else:
+                a4_kwargs.update(
+                    a_scale_layout=MXScaleLayoutInt.OPUS_F4,
+                    b_scale_layout=MXScaleLayoutInt.OPUS_F4,
                 )
             args = (inp["A"], inp["B"], inp["sA"], inp["sB"])
             if out_fp8:

@@ -147,7 +147,8 @@ void quant_mxfp4(const aiter_tensor_t& inp,
                  bool e8m0_shuffle       = false,
                  bool a16w4_shuffle      = false,
                  bool gate_up            = false,
-                 bool shuffle_weight     = false);
+                 bool shuffle_weight     = false,
+                 int scale_layout        = -1);
 void quant_mxfp6_gemm_hip(const aiter_tensor_t& input,
                           aiter_tensor_t& packed,
                           aiter_tensor_t& packed_scale);

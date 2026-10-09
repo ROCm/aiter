@@ -71,6 +71,7 @@ NONE_WRAPPED_OP = [
     "_MlaVersion",
     "_MxScaleRoundMode",
     "_MxDtype",
+    "_MXScaleLayout",
     # "dispose",
     # "meta_size",
     # "get_padded_m",

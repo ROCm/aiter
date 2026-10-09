@@ -142,6 +142,7 @@ _gluon_fused_rms_mxfp4_quant_repr = make_kernel_repr(
         "SCALE_N",
         "SCALE_M_PAD",
         "SCALE_N_PAD",
+        "SCALE_LAYOUT",
         "SHUFFLE",
         "SHUFFLE_PAD",
         "EVEN_M_N",
@@ -193,6 +194,7 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
     SCALE_N: gl.constexpr,
     SCALE_M_PAD: gl.constexpr,
     SCALE_N_PAD: gl.constexpr,
+    SCALE_LAYOUT: gl.constexpr,
     SHUFFLE: gl.constexpr,
     SHUFFLE_PAD: gl.constexpr,
     EVEN_M_N: gl.constexpr,
@@ -373,7 +375,17 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
         bs_offs_m_i = row_abs + gl.arange(0, BLOCK_SIZE_M)
 
         # Blockscale offset computation.
-        if SHUFFLE:
+        if SCALE_LAYOUT == 2:
+            bs_offs_i = (
+                (bs_offs_m_i[:, None] // 32 * SCALE_N_PAD) * 32
+                + (bs_offs_n[None, :] // 4) * 128
+                + (bs_offs_m_i[:, None] % 32) * 4
+                + bs_offs_n[None, :] % 4
+            )
+            bs_mask_127_i = (bs_offs_m_i < M)[:, None] & (bs_offs_n < num_bs_cols)[
+                None, :
+            ]
+        elif SHUFFLE:
             bs_offs_0 = bs_offs_m_i[:, None] >> 5
             bs_offs_1 = bs_offs_m_i[:, None] & 31
             bs_offs_2 = bs_offs_1 & 15
@@ -433,7 +445,10 @@ def _gluon_fused_rms_mxfp4_quant_kernel(
             norm1, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
         )
 
-        if SHUFFLE:
+        if SCALE_LAYOUT == 2:
+            # OPUS_F4 column padding is zero; padding rows are never launched.
+            bs_e8m0 = gl.where(bs_mask_127_i, bs_e8m0, 0)
+        elif SCALE_LAYOUT != 0:
             bs_e8m0 = gl.where(bs_mask_127_i, bs_e8m0, 127)
 
         # Store the quantized and blockscale values

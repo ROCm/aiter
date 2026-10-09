@@ -15,7 +15,12 @@ from ..jit.utils.asm_guard import require_gfx1250_asm
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
+from ..ops.mx_scale_layout import (
+    normalize_mx_scale_layout,
+    validate_mx_scale_buffer,
+)
 from ..utility import dtypes
+from ..utility.mx_types import MXScaleLayoutInt
 
 
 @functools.lru_cache(maxsize=1024)
@@ -79,6 +84,39 @@ def get_GEMM_config(M: int, N: int, K: int):
     return config
 
 
+def _validate_explicit_mx_layouts(
+    a_scale_layout: int | None,
+    b_scale_layout: int | None,
+    *,
+    is_nvfp4: bool,
+) -> None:
+    layouts = {"activation": a_scale_layout, "weight": b_scale_layout}
+    if is_nvfp4 and any(layout is not None for layout in layouts.values()):
+        raise NotImplementedError("explicit MXScaleLayout is only supported for MXFP4")
+    for layout in layouts.values():
+        if layout is not None:
+            normalize_mx_scale_layout(layout)
+
+
+def _validate_explicit_f4_layouts(
+    a_scale_layout: int | None,
+    b_scale_layout: int | None,
+    *,
+    is_nvfp4: bool,
+) -> None:
+    _validate_explicit_mx_layouts(a_scale_layout, b_scale_layout, is_nvfp4=is_nvfp4)
+    layouts = {"activation": a_scale_layout, "weight": b_scale_layout}
+    for name, layout in layouts.items():
+        if (
+            layout is not None
+            and normalize_mx_scale_layout(layout) != MXScaleLayoutInt.OPUS_F4
+        ):
+            raise ValueError(
+                f"gfx1250 F4GEMM requires explicit {name} scale layout OPUS_F4, "
+                f"got {int(layout)}"
+            )
+
+
 def _f4gemm_asm_dispatch(
     A: Tensor,
     B: Tensor,
@@ -92,6 +130,8 @@ def _f4gemm_asm_dispatch(
     bias: Tensor | None,
     alpha: float | None,
     beta: float | None,
+    a_scale_layout: int | None,
+    b_scale_layout: int | None,
 ):
     """Shared gfx1250 F4GEMM dispatch: MXFP4 vs NVFP4 by global-scale presence.
     Returns the raw asm result (single Tensor, or (data, scale) tuple for mxfp8).
@@ -111,6 +151,15 @@ def _f4gemm_asm_dispatch(
     is_nvfp4 = global_A_scale is not None or global_B_scale is not None
     N = B.shape[0]
     K = A.shape[-1] * 2  # A is packed fp4x2 -> 2 values per column
+    _validate_explicit_f4_layouts(a_scale_layout, b_scale_layout, is_nvfp4=is_nvfp4)
+    if a_scale_layout is not None:
+        validate_mx_scale_buffer(
+            A_scale, m, K // 32, MXScaleLayoutInt.OPUS_F4, exact_shape=False
+        )
+    if b_scale_layout is not None:
+        validate_mx_scale_buffer(
+            B_scale, N, K // 32, MXScaleLayoutInt.OPUS_F4, exact_shape=False
+        )
     if dtype not in (dtypes.bf16, dtypes.fp8):
         raise NotImplementedError(f"gfx1250 F4GEMM: unsupported output dtype {dtype}")
     if K % 32 != 0:  # B 16x16 preshuffle
@@ -133,7 +182,14 @@ def _f4gemm_asm_dispatch(
             a_preshuffle=bool(apreshuffle),
         )
     return gemm_mxfp4_asm(
-        A2, B, A_scale, B_scale, dtype=dtype, a_preshuffle=bool(apreshuffle)
+        A2,
+        B,
+        A_scale,
+        B_scale,
+        dtype=dtype,
+        a_preshuffle=bool(apreshuffle),
+        a_scale_layout=a_scale_layout,
+        b_scale_layout=b_scale_layout,
     )
 
 
@@ -150,7 +206,14 @@ def gemm_a4w4_fake(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+    a_scale_layout: int | None = None,
+    b_scale_layout: int | None = None,
 ) -> torch.Tensor:
+    _validate_explicit_mx_layouts(
+        a_scale_layout,
+        b_scale_layout,
+        is_nvfp4=global_A_scale is not None or global_B_scale is not None,
+    )
     if dtype == dtypes.fp8:
         raise NotImplementedError(
             "gemm_a4w4 returns one plain-dtype tensor; use gemm_a4w4o8"
@@ -173,6 +236,8 @@ def gemm_a4w4(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+    a_scale_layout: int | None = None,
+    b_scale_layout: int | None = None,
 ) -> torch.Tensor:
     """A4W4 GEMM (4-bit quantized matmul) returning one plain-dtype tensor.
 
@@ -205,8 +270,24 @@ def gemm_a4w4(
             bias=bias,
             alpha=alpha,
             beta=beta,
+            a_scale_layout=a_scale_layout,
+            b_scale_layout=b_scale_layout,
         )
         return out.view(*A.shape[:-1], out.shape[-1])
+    for name, layout, scale, rows in (
+        ("activation", a_scale_layout, A_scale, m),
+        ("weight", b_scale_layout, B_scale, n),
+    ):
+        if layout is None:
+            continue
+        if normalize_mx_scale_layout(layout) != MXScaleLayoutInt.AITER_E8M0:
+            raise ValueError(
+                f"{gfx_arch} A4W4 GEMM requires explicit {name} scale layout "
+                f"AITER_E8M0, got {int(layout)}"
+            )
+        validate_mx_scale_buffer(
+            scale, rows, k // 32, MXScaleLayoutInt.AITER_E8M0, exact_shape=False
+        )
     out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
     if gfx_arch in ["gfx942"]:
         raise RuntimeError(
@@ -389,6 +470,8 @@ def gemm_mxfp4_asm(
     dtype: torch.dtype = dtypes.bf16,  # output dtype: bf16 or fp8 (mxfp8)
     a_preshuffle: bool = True,
     kernelName: str = "",
+    a_scale_layout: int | None = None,
+    b_scale_layout: int | None = None,
 ) -> Tensor | tuple[Tensor, Tensor]:
     """MXFP4 GEMM (preload SGPR mode). D = A * B with e8m0 scales. ``dtype``:
     bf16 ``[M,N]`` or mxfp8 (``dtypes.fp8``) returning
@@ -398,6 +481,20 @@ def gemm_mxfp4_asm(
     require_gfx1250_asm("gemm_mxfp4_asm")
     M = A.shape[0]
     N = B.shape[0]
+    K = A.shape[1] * 2
+    for name, scale, rows, layout in (
+        ("activation", ScaleA, M, a_scale_layout),
+        ("weight", ScaleB, N, b_scale_layout),
+    ):
+        if layout is None:
+            continue
+        layout = normalize_mx_scale_layout(layout)
+        if layout != MXScaleLayoutInt.OPUS_F4:
+            raise ValueError(
+                f"gfx1250 F4GEMM requires explicit {name} scale layout OPUS_F4, "
+                f"got {layout}"
+            )
+        validate_mx_scale_buffer(scale, rows, K // 32, layout, exact_shape=False)
     out = _alloc_f4gemm_out(M, N, dtype, A.device)
     out_scale = _alloc_f4gemm_out_scale(M, N, dtype, A.device)
     _mxfp4_gemm_asm(
@@ -473,7 +570,14 @@ def gemm_a4w4o8_fake(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,
     global_B_scale: Tensor | None = None,
+    a_scale_layout: int | None = None,
+    b_scale_layout: int | None = None,
 ) -> tuple[Tensor, Tensor]:
+    _validate_explicit_f4_layouts(
+        a_scale_layout,
+        b_scale_layout,
+        is_nvfp4=global_A_scale is not None or global_B_scale is not None,
+    )
     m = A.numel() // A.shape[-1]
     n = B.shape[0]
     lead = A.shape[:-1]
@@ -497,6 +601,8 @@ def gemm_a4w4o8(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
+    a_scale_layout: int | None = None,
+    b_scale_layout: int | None = None,
 ) -> tuple[Tensor, Tensor]:
     """A4W4 GEMM with mxfp8 output: returns ``(fp8 e4m3 data [*lead, N], E8M0
     scale)``. The scale is in the PACKED ``(M/64, N//128, 16, 4)`` layout --
@@ -518,6 +624,8 @@ def gemm_a4w4o8(
         bias=bias,
         alpha=alpha,
         beta=beta,
+        a_scale_layout=a_scale_layout,
+        b_scale_layout=b_scale_layout,
     )
     lead = A.shape[:-1]
     # s is the packed [Mpad, scaleN] scale buffer; return as-is (see o8_fake).

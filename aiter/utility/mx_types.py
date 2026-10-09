@@ -6,12 +6,13 @@
 Two parallel views of the same C++ enums (``csrc/include/mx_quant_utils.h``)
 are exported:
 
-* :class:`MxScaleRoundModeInt` / :class:`MxDtypeInt` -- plain Python
+* ``*Int`` classes -- plain Python
   classes whose attributes are bare ``int`` constants. Importing them is
   free (no JIT, no extra deps), so they are safe to use from build-time
   code paths such as FlyDSL AOT during wheel ``PREBUILD_KERNELS`` --
   ``module_aiter_core`` has not been built yet at that point.
-* :class:`MxScaleRoundMode` / :class:`MxDtype` -- the pybind11 enum
+* :class:`MxScaleRoundMode`, :class:`MxDtype`, and :class:`MXScaleLayout`
+  -- the pybind11 enum
   classes exported from ``csrc/include/rocm_ops.hpp::AITER_CORE_PYBIND``.
   These are loaded **lazily** on first attribute access (``__getattr__``);
   that access triggers ``module_aiter_core`` JIT build/import, so they
@@ -54,6 +55,14 @@ class MxDtypeInt:
     FP8_E4M3_FNUZ = 2
 
 
+class MXScaleLayoutInt:
+    """Bare-int mirror of C++ ``MXScaleLayout`` (mx_quant_utils.h)."""
+
+    ROW_MAJOR = 0
+    AITER_E8M0 = 1
+    OPUS_F4 = 2
+
+
 # --------------------------------------------------------------------------
 # Project-wide default round mode (Python single source of truth).
 # Must match ``kDefaultMxScaleRoundMode`` in ``mx_quant_utils.h``; the
@@ -80,9 +89,14 @@ def _MxScaleRoundMode(dummy): ...
 def _MxDtype(dummy): ...
 
 
+@compile_ops("module_aiter_core", "MXScaleLayout")
+def _MXScaleLayout(dummy): ...
+
+
 _PYBIND_FACTORIES = {
     "MxScaleRoundMode": (_MxScaleRoundMode, MxScaleRoundModeInt),
     "MxDtype": (_MxDtype, MxDtypeInt),
+    "MXScaleLayout": (_MXScaleLayout, MXScaleLayoutInt),
 }
 
 

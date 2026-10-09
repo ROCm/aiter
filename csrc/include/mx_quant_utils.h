@@ -6,6 +6,14 @@
 
 namespace aiter {
 
+// Public MX scale-buffer layouts. Values must stay 1:1 with
+// ``aiter.utility.mx_types.MXScaleLayoutInt`` and the pybind enum.
+enum class MXScaleLayout : int {
+    ROW_MAJOR  = 0,
+    AITER_E8M0 = 1, // 256x8-padded layout used by mx_scale_shuffle_idx.
+    OPUS_F4    = 2, // 32x4-padded layout used by gfx1250 F4GEMM.
+};
+
 // E8M0 block-scale rounding modes for the whole MX format family
 // (mxfp4 / mxfp6 / mxfp8 / mxint8) -- the four formulas FLOOR / RCEIL /
 // CEIL / EVEN are dtype-agnostic, only ``max_pos`` / ``max_pow2`` constants
@@ -241,6 +249,14 @@ __device__ __forceinline__ int mx_scale_shuffle_idx(int scaleN_pad, int x, int y
 __device__ __forceinline__ int fp4_scale_shuffle_idx(int scaleN_pad, int x, int y)
 {
     return mx_scale_shuffle_idx(scaleN_pad, x, y);
+}
+
+// Compute the swizzled E8M0 scale index for the gfx1250 F4GEMM 32x4 tile
+// layout. ``scaleN_pad`` is the number of K groups rounded up to a multiple
+// of four.
+__device__ __forceinline__ int mx_scale_opus_f4_idx(int scaleN_pad, int x, int y)
+{
+    return (x / 32 * scaleN_pad) * 32 + (y / 4) * 128 + (x % 32) * 4 + y % 4;
 }
 
 } // namespace aiter

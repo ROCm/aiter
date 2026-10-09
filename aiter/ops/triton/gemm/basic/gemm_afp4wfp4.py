@@ -6,6 +6,10 @@ import torch
 import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.mx_scale_layout import (
+    mx_scale_buffer_shape,
+    normalize_mx_scale_layout,
+)
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
@@ -24,6 +28,7 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_afp4wfp4 import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.logger import AiterTritonLogger
+from aiter.utility.mx_types import MXScaleLayoutInt
 
 _LOGGER = AiterTritonLogger()
 
@@ -32,6 +37,24 @@ _USE_GEMM_SPLITK_BF16 = False
 _GLUON_SUPPORTED_ARCHS = ("gfx950",)
 _GLUON_PRESHUFFLE_ARCHS = ("gfx1250",)
 _GLUON_DEFAULT_ARCHS = ("gfx1250",)
+
+
+def _aiter_scale_stripe_view(
+    scale: torch.Tensor, rows: int, k_groups: int, name: str
+) -> torch.Tensor:
+    """Normalize canonical/stripe AITER_E8M0 storage to the GEMM stripe view."""
+    if scale.element_size() != 1 or not scale.is_contiguous():
+        raise ValueError(f"{name} AITER_E8M0 scale must be contiguous bytes")
+    physical = mx_scale_buffer_shape(rows, k_groups, MXScaleLayoutInt.AITER_E8M0)
+    stripe = (physical[0] // 32, physical[1] * 32)
+    if tuple(scale.shape) == physical:
+        return scale.view(stripe)
+    if tuple(scale.shape) == stripe:
+        return scale
+    raise ValueError(
+        f"{name} AITER_E8M0 scale must have canonical shape {physical} "
+        f"or stripe view {stripe}, got {tuple(scale.shape)}"
+    )
 
 
 def set_use_gemm_splitk_bf16(value: bool):
@@ -494,6 +517,8 @@ def gemm_afp4wfp4_preshuffle(
     y: torch.Tensor | None = None,
     config: dict | None = None,
     skip_reduce: bool | None = False,
+    x_scale_layout: int | None = None,
+    w_scale_layout: int | None = None,
 ) -> torch.Tensor:
     """
     Computes matrix multiplication Y = X @ W^T with FP4 activations and FP4 weights.
@@ -506,7 +531,9 @@ def gemm_afp4wfp4_preshuffle(
             equivalently shuffle_weight(layout=(16, 16)) reshaped to
             (N//16, K*16) — both produce the same bytes). Internally transposed.
         x_scales (torch.Tensor): E8M0 per-group scale for x, one scale per 32
-            elements in K. For M >= 32: preshuffled via
+            elements in K. With explicit ``x_scale_layout=AITER_E8M0``, use
+            that preshuffled layout for every M. Legacy ``None`` keeps the
+            historical rule: for M >= 32, preshuffled via
             aiter.ops.shuffle.shuffle_scale (identical layout on gfx950 and
             gfx1250), then viewed as one row per 32-row stripe, i.e.
             (M_pad//32, (K//32)*32) where M_pad = M rounded up to a multiple
@@ -535,6 +562,27 @@ def gemm_afp4wfp4_preshuffle(
     n16, _ = w_preshuf.shape
     N = n16 * 16
     K_elems = 2 * K_bytes
+    for name, layout in (
+        ("activation", x_scale_layout),
+        ("weight", w_scale_layout),
+    ):
+        if (
+            layout is not None
+            and normalize_mx_scale_layout(layout) != MXScaleLayoutInt.AITER_E8M0
+        ):
+            raise ValueError(
+                f"gemm_afp4wfp4_preshuffle requires explicit {name} scale "
+                f"layout AITER_E8M0, got {int(layout)}"
+            )
+    a_scale_layout = (
+        normalize_mx_scale_layout(x_scale_layout)
+        if x_scale_layout is not None
+        else (MXScaleLayoutInt.ROW_MAJOR if M < 32 else MXScaleLayoutInt.AITER_E8M0)
+    )
+    if x_scale_layout is not None:
+        x_scales = _aiter_scale_stripe_view(x_scales, M, K_elems // 32, "activation")
+    if w_scale_layout is not None:
+        w_scales = _aiter_scale_stripe_view(w_scales, N, K_elems // 32, "weight")
 
     if config is None:
         # _get_config doubles K itself (logical K = 2 * K_bytes) — pass bytes,
@@ -549,11 +597,11 @@ def gemm_afp4wfp4_preshuffle(
     if M < 32:
         assert (
             config["BLOCK_SIZE_M"] <= 16
-        ), "for M < 32, BLOCK_SIZE_M must be 16 or less as x_scale are assumed to be un-shuffled"
+        ), "for M < 32, BLOCK_SIZE_M must be 16 or less"
     else:
         assert (
             config["BLOCK_SIZE_M"] >= 32
-        ), "for M >= 32, BLOCK_SIZE_M must be 32 or more as x_scale are assumed to be preshuffled"
+        ), "for M >= 32, BLOCK_SIZE_M must be 32 or more"
 
     # shuffle_scale pads K//32 up to a multiple of 8 (its k-chunk), but the
     # kernels bound the scale reads at (K//32)*32 columns per stripe row. A
@@ -630,6 +678,7 @@ def gemm_afp4wfp4_preshuffle(
             x_scales.stride(1),
             w_scales.stride(0),
             w_scales.stride(1),
+            A_SCALE_LAYOUT=a_scale_layout,
             **config,
             **layouts,
         )
@@ -698,6 +747,7 @@ def gemm_afp4wfp4_preshuffle(
         x_scales.stride(1),
         w_scales.stride(0),
         w_scales.stride(1),
+        A_SCALE_LAYOUT=a_scale_layout,
         **config,
     )
 

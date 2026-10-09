@@ -60,12 +60,6 @@ __device__ __forceinline__ uint8_t even_round_e2m1(float val) {
 }
 #endif
 
-__device__ __forceinline__ int fp4_scale_shuffle_id(int scaleN_pad, int x, int y) {
-    return (x / 32 * scaleN_pad) * 32 +
-           (y / 8) * 256 + (y % 4) * 64 + (x % 16) * 4 +
-           (y % 8) / 4 * 2 + (x % 32) / 16;
-}
-
 __device__ __forceinline__ int a16w4_shuffle_scale_id(
     int scaleN, int ori_rows, int x, int y, bool gate_up
 ) {
@@ -90,7 +84,7 @@ __device__ __forceinline__ int a16w4_shuffle_scale_id(
            K_Pack_idx * 2 + N_Pack_idx;
 }
 
-template <typename float_type, MxScaleRoundMode rmode, bool e8m0_shuffle, bool a16w4_shuffle, bool shuffle_weight>
+template <typename float_type, MxScaleRoundMode rmode, bool e8m0_shuffle, bool opus_f4_shuffle, bool a16w4_shuffle, bool shuffle_weight>
 __global__ __launch_bounds__(kBlockThreads)
 void quant_mxfp4_kernel(
     const float_type* __restrict__ inp,
@@ -100,10 +94,26 @@ void quant_mxfp4_kernel(
     int32_t scaleN, int32_t scaleN_pad, bool gate_up
 ) {
     int64_t gid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t rows_pad =
+        e8m0_shuffle ? ((ori_rows + 255) / 256) * 256
+                     : opus_f4_shuffle ? ((ori_rows + 31) / 32) * 32 : ori_rows;
+    if (gid >= rows_pad * (int64_t)scaleN_pad) return;
     int64_t x   = gid / scaleN_pad;
     int32_t y   = gid % scaleN_pad;
 
-    if (x >= ori_rows || y >= scaleN) return;
+    if (x >= ori_rows || y >= scaleN) {
+        int64_t scale_idx;
+        if constexpr (e8m0_shuffle) {
+            scale_idx = aiter::mx_scale_shuffle_idx(scaleN_pad, (int)x, y);
+        } else if constexpr (opus_f4_shuffle) {
+            scale_idx = aiter::mx_scale_opus_f4_idx(scaleN_pad, (int)x, y);
+        } else {
+            return;
+        }
+        reinterpret_cast<uint8_t*>(out_scale)[scale_idx] =
+            (x >= ori_rows || e8m0_shuffle) ? 0x7F : 0;
+        return;
+    }
 
     const packed_u16x8_t* vp = reinterpret_cast<const packed_u16x8_t*>(
         inp + x * ori_cols + y * kGroupSize
@@ -207,7 +217,9 @@ void quant_mxfp4_kernel(
 
     int scale_idx;
     if constexpr (e8m0_shuffle) {
-        scale_idx = fp4_scale_shuffle_id(scaleN_pad, (int)x, y);
+        scale_idx = aiter::mx_scale_shuffle_idx(scaleN_pad, (int)x, y);
+    } else if constexpr (opus_f4_shuffle) {
+        scale_idx = aiter::mx_scale_opus_f4_idx(scaleN_pad, (int)x, y);
     } else if constexpr (a16w4_shuffle) {
         scale_idx = a16w4_shuffle_scale_id(scaleN, (int)ori_rows, (int)x, y, gate_up);
     } else {
@@ -216,8 +228,8 @@ void quant_mxfp4_kernel(
     reinterpret_cast<uint8_t*>(out_scale)[scale_idx] = biased_exp;
 }
 
-#define MXFP4_LAUNCH(ftype, rmode, ss, a16, sw)                              \
-    quant_mxfp4_kernel<ftype, rmode, ss, a16, sw>                            \
+#define MXFP4_LAUNCH(ftype, rmode, ss, opus, a16, sw)                        \
+    quant_mxfp4_kernel<ftype, rmode, ss, opus, a16, sw>                      \
         <<<(int)grid_size, kBlockThreads, 0, stream>>>(                      \
             reinterpret_cast<const ftype*>(inp.data_ptr()),                   \
             reinterpret_cast<uint8_t*>(out_packed.data_ptr()),               \
@@ -225,14 +237,16 @@ void quant_mxfp4_kernel(
             ori_rows, ori_cols, scaleN, scaleN_pad, gate_up)
 
 #define MXFP4_DISPATCH(ftype, rmode)                                         \
-    if (e8m0_shuffle) {                                                      \
-        if (shuffle_weight) { MXFP4_LAUNCH(ftype, rmode, true, false, true); }  \
-        else                { MXFP4_LAUNCH(ftype, rmode, true, false, false); } \
+    if (use_aiter_layout) {                                                  \
+        if (shuffle_weight) { MXFP4_LAUNCH(ftype, rmode, true, false, false, true); }  \
+        else                { MXFP4_LAUNCH(ftype, rmode, true, false, false, false); } \
+    } else if (use_opus_layout) {                                            \
+        MXFP4_LAUNCH(ftype, rmode, false, true, false, false);               \
     } else if (a16w4_shuffle) {                                              \
-        if (shuffle_weight) { MXFP4_LAUNCH(ftype, rmode, false, true, true); }  \
-        else                { MXFP4_LAUNCH(ftype, rmode, false, true, false); } \
+        if (shuffle_weight) { MXFP4_LAUNCH(ftype, rmode, false, false, true, true); }  \
+        else                { MXFP4_LAUNCH(ftype, rmode, false, false, true, false); } \
     } else {                                                                 \
-        MXFP4_LAUNCH(ftype, rmode, false, false, false);                     \
+        MXFP4_LAUNCH(ftype, rmode, false, false, false, false);              \
     }
 
 void quant_mxfp4(
@@ -244,7 +258,8 @@ void quant_mxfp4(
     bool e8m0_shuffle,
     bool a16w4_shuffle,
     bool gate_up,
-    bool shuffle_weight
+    bool shuffle_weight,
+    int explicit_scale_layout
 ) {
     AITER_CHECK(inp.is_contiguous(), __func__, " expected input to be contiguous");
     AITER_CHECK(inp.dim() == 2, __func__, " expected 2D input");
@@ -258,15 +273,41 @@ void quant_mxfp4(
                 "3 (Ceil / torchao CEIL)");
     AITER_CHECK(!(e8m0_shuffle && a16w4_shuffle),
                 __func__, " e8m0_shuffle and a16w4_shuffle are mutually exclusive");
-    AITER_CHECK(!shuffle_weight || e8m0_shuffle || a16w4_shuffle,
+    AITER_CHECK(explicit_scale_layout >= -1 &&
+                    explicit_scale_layout <= static_cast<int>(MXScaleLayout::OPUS_F4),
+                __func__, " invalid scale_layout ", explicit_scale_layout);
+    AITER_CHECK(explicit_scale_layout == -1 || !e8m0_shuffle,
+                __func__, " scale_layout conflicts with legacy e8m0_shuffle");
+    AITER_CHECK(explicit_scale_layout == -1 || !a16w4_shuffle,
+                __func__, " explicit MX scale layout is not supported with a16w4_shuffle");
+    const int scale_layout =
+        explicit_scale_layout != -1
+            ? explicit_scale_layout
+            : (e8m0_shuffle ? static_cast<int>(MXScaleLayout::AITER_E8M0)
+                            : static_cast<int>(MXScaleLayout::ROW_MAJOR));
+    const bool use_aiter_layout =
+        scale_layout == static_cast<int>(MXScaleLayout::AITER_E8M0);
+    const bool use_opus_layout =
+        scale_layout == static_cast<int>(MXScaleLayout::OPUS_F4);
+    AITER_CHECK(!shuffle_weight || use_aiter_layout || a16w4_shuffle,
                 __func__, " shuffle_weight requires e8m0_shuffle or a16w4_shuffle");
+    AITER_CHECK(!use_opus_layout || !shuffle_weight,
+                __func__, " OPUS_F4 scale layout does not imply a weight shuffle");
 
     const int64_t ori_rows = inp.size(0);
     const int32_t ori_cols = inp.size(1);
     AITER_CHECK(ori_cols % group_size == 0, __func__, " cols must be divisible by group_size");
 
-    const int32_t scaleN     = ori_cols / group_size;
-    const int32_t scaleN_pad = e8m0_shuffle ? ((scaleN + 7) / 8) * 8 : scaleN;
+    const int32_t scaleN = ori_cols / group_size;
+    const int32_t scaleN_pad =
+        use_aiter_layout ? ((scaleN + 7) / 8) * 8
+                         : use_opus_layout ? ((scaleN + 3) / 4) * 4 : scaleN;
+    const int64_t rows_pad =
+        use_aiter_layout ? ((ori_rows + 255) / 256) * 256
+                         : use_opus_layout ? ((ori_rows + 31) / 32) * 32 : ori_rows;
+    AITER_CHECK(out_scale.numel() >= rows_pad * static_cast<int64_t>(scaleN_pad),
+                __func__, " out_scale needs ", rows_pad * static_cast<int64_t>(scaleN_pad),
+                " bytes, got ", out_scale.numel());
 
     if (a16w4_shuffle) {
         AITER_CHECK(ori_rows % 32 == 0, __func__, " a16w4 scale shuffle requires rows % 32 == 0");
@@ -275,14 +316,14 @@ void quant_mxfp4(
     if (shuffle_weight) {
         AITER_CHECK(ori_rows % 16 == 0, __func__, " shuffle_weight requires rows % 16 == 0");
         int K_pk = ori_cols / 2;
-        if (e8m0_shuffle) {
+        if (use_aiter_layout) {
             AITER_CHECK(K_pk % 32 == 0, __func__, " e8m0 weight shuffle requires K_pk % 32 == 0");
         } else {
             AITER_CHECK(K_pk % 64 == 0, __func__, " a16w4 weight shuffle requires K_pk % 64 == 0");
         }
     }
 
-    const int64_t total_groups = ori_rows * (int64_t)scaleN_pad;
+    const int64_t total_groups = rows_pad * (int64_t)scaleN_pad;
     const int64_t grid_size    = (total_groups + kBlockThreads - 1) / kBlockThreads;
     AITER_CHECK(grid_size <= 2147483647LL, __func__, " grid size exceeds maximum");
 

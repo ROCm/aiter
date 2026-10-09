@@ -512,12 +512,13 @@ def rmsnorm2d_fwd_with_dynamicquant(
     use_model_sensitive_rmsnorm: int = 0,
     group_size: int = 0,
     shuffle_scale: bool = False,
+    scale_layout: int | None = None,
 ) -> None:
     # e8m0 (1-byte) block scale is only produced by the HIP module_rmsnorm_quant
     # kernel; the opus dynamicquant backend only emits fp32 per-token scale, so an
     # e8m0 scale must be routed to rmsnorm_quant regardless of group_size.
     is_e8m0 = yscale.element_size() == 1
-    if group_size == 0 and not shuffle_scale and not is_e8m0:
+    if group_size == 0 and not shuffle_scale and scale_layout is None and not is_e8m0:
         if _use_hip_common(input, use_model_sensitive_rmsnorm):
             rmsnorm_quant(out, input, yscale, weight, epsilon)  # fast HIP
         else:
@@ -529,7 +530,16 @@ def rmsnorm2d_fwd_with_dynamicquant(
         assert (
             input.shape[-1] <= 8192
         ), "grouped/shuffle rmsnorm dynamicquant supports hidden<=8192"
-        rmsnorm_quant(out, input, yscale, weight, epsilon, group_size, shuffle_scale)
+        rmsnorm_quant(
+            out,
+            input,
+            yscale,
+            weight,
+            epsilon,
+            group_size,
+            shuffle_scale,
+            scale_layout=-1 if scale_layout is None else int(scale_layout),
+        )
 
 
 def rmsnorm2d_fwd_with_add_dynamicquant(
@@ -543,12 +553,13 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
     use_model_sensitive_rmsnorm: int = 0,
     group_size: int = 0,
     shuffle_scale: bool = False,
+    scale_layout: int | None = None,
 ) -> None:
     # e8m0 (1-byte) block scale is only produced by the HIP module_rmsnorm_quant
     # kernel; the opus dynamicquant backend only emits fp32 per-token scale, so an
     # e8m0 scale must be routed to add_rmsnorm_quant regardless of group_size.
     is_e8m0 = yscale.element_size() == 1
-    if group_size == 0 and not shuffle_scale and not is_e8m0:
+    if group_size == 0 and not shuffle_scale and scale_layout is None and not is_e8m0:
         if _use_hip_common(input, use_model_sensitive_rmsnorm):
             add_rmsnorm_quant(  # fast HIP
                 out, input, residual_in, residual_out, yscale, weight, epsilon
@@ -579,6 +590,7 @@ def rmsnorm2d_fwd_with_add_dynamicquant(
             epsilon,
             group_size,
             shuffle_scale,
+            scale_layout=-1 if scale_layout is None else int(scale_layout),
         )
 
 
@@ -595,6 +607,7 @@ def add_rmsnorm_quant(
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
     scale_layout_m32k4: bool = False,
+    scale_layout: int = -1,
 ) -> None: ...
 
 
@@ -621,14 +634,13 @@ def rmsnorm_quant(
     shuffle_scale: bool = False,
     gemma_norm: bool = False,
     scale_layout_m32k4: bool = False,
+    scale_layout: int = -1,
 ) -> None:
     """Fused RMSNorm + quant.
 
-    ``scale_layout_m32k4=True`` (fp8 ``out``, e8m0 ``scale``, ``group_size == 32``)
-    writes the scale directly in the gfx1250 MXFP8 ASM GEMM A-scale layout, i.e.
-    the bytes of :func:`aiter.ops.shuffle.shuffle_mxfp8fp4_scale`. ``scale`` must
-    be a contiguous ``(pad32(M), N // 32)`` byte tensor; the kernel writes the pad
-    rows as 0x7F. ``shuffle_scale`` is ignored.
+    ``scale_layout`` accepts :class:`aiter.utility.mx_types.MXScaleLayout`.
+    ``shuffle_scale=True`` remains a legacy alias for ``AITER_E8M0``;
+    ``scale_layout_m32k4=True`` remains a legacy alias for ``OPUS_F4``.
     """
 
 

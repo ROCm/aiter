@@ -7,13 +7,16 @@ import argparse
 from functools import partial
 
 import pandas as pd
+import pytest
 import torch
 import torch.nn.functional as F
 
 import aiter
 from aiter import QuantType, dtypes, get_gfx, get_torch_quant
+from aiter.ops.mx_scale_layout import from_mx_scale_layout, mx_scale_buffer_shape
 from aiter.test_common import benchmark, checkAllclose, perftest
 from aiter.utility import fp4_utils
+from aiter.utility.mx_types import MXScaleLayoutInt
 
 torch.set_default_device("cuda")
 
@@ -290,6 +293,54 @@ def test_rmsnorm(
         )
 
     return ret
+
+
+@pytest.mark.parametrize("m", [1, 5, 16, 31, 32, 33, 128, 255, 256, 257])
+@pytest.mark.parametrize("add_residual", [False, True])
+def test_rmsnorm_quant_explicit_mx_scale_layouts(m, add_residual):
+    if get_gfx() not in ("gfx950", "gfx1250"):
+        pytest.skip("MXFP4 fused RMSNorm quant is not supported on this GPU")
+
+    n = 256
+    x = torch.randn((m, n), dtype=torch.bfloat16)
+    weight = torch.randn((n,), dtype=torch.bfloat16)
+    residual = torch.randn_like(x) if add_residual else None
+
+    def run(layout):
+        out = torch.empty((m, n // 2), dtype=dtypes.fp4x2)
+        scale = torch.empty(
+            mx_scale_buffer_shape(m, n // 32, layout), dtype=dtypes.fp8_e8m0
+        )
+        if residual is None:
+            aiter.rmsnorm_quant(
+                out,
+                x,
+                scale,
+                weight,
+                1e-5,
+                32,
+                scale_layout=layout,
+            )
+        else:
+            residual_out = torch.empty_like(x)
+            aiter.add_rmsnorm_quant(
+                out,
+                x,
+                residual,
+                residual_out,
+                scale,
+                weight,
+                1e-5,
+                32,
+                scale_layout=layout,
+            )
+        return out, from_mx_scale_layout(scale, m, n // 32, layout)
+
+    row_out, row_scale = run(MXScaleLayoutInt.ROW_MAJOR)
+    for layout in (MXScaleLayoutInt.AITER_E8M0, MXScaleLayoutInt.OPUS_F4):
+        out, scale = run(layout)
+        assert torch.equal(out.view(torch.uint8), row_out.view(torch.uint8))
+        assert torch.equal(scale.view(torch.uint8), row_scale.view(torch.uint8))
 
 
 if __name__ == "__main__":

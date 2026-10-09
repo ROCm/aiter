@@ -33,6 +33,7 @@ _fused_rms_mxfp4_quant_repr = make_kernel_repr(
         "SCALE_N",
         "SCALE_M_PAD",
         "SCALE_N_PAD",
+        "SCALE_LAYOUT",
         "SHUFFLE",
         "SHUFFLE_PAD",
         "EVEN_M_N",
@@ -87,6 +88,7 @@ def _fused_rms_mxfp4_quant_kernel(
     SCALE_N: tl.constexpr,
     SCALE_M_PAD: tl.constexpr,
     SCALE_N_PAD: tl.constexpr,
+    SCALE_LAYOUT: tl.constexpr,
     SHUFFLE: tl.constexpr,
     SHUFFLE_PAD: tl.constexpr,
     EVEN_M_N: tl.constexpr,
@@ -199,7 +201,17 @@ def _fused_rms_mxfp4_quant_kernel(
     bs_offs_m = pid * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
     bs_offs_n = tl.arange(0, NUM_QUANT_BLOCKS)
     num_bs_cols = (N1 + MXFP4_QUANT_BLOCK_SIZE - 1) // MXFP4_QUANT_BLOCK_SIZE
-    if SHUFFLE:
+    if SCALE_LAYOUT == 2:
+        bs_offs = (
+            (bs_offs_m[:, None] // 32 * SCALE_N_PAD) * 32
+            + (bs_offs_n[None, :] // 4) * 128
+            + (bs_offs_m[:, None] % 32) * 4
+            + bs_offs_n[None, :] % 4
+        )
+        bs_mask_127 = (bs_offs_m < M)[:, None] & (bs_offs_n < num_bs_cols)[None, :]
+        # OPUS_F4 column padding is zero; padding rows are never launched.
+        bs_e8m0 = tl.where(bs_mask_127, bs_e8m0, 0)
+    elif SHUFFLE:
         bs_offs_0 = bs_offs_m[:, None] // 32
         bs_offs_1 = bs_offs_m[:, None] % 32
         bs_offs_2 = bs_offs_1 % 16
