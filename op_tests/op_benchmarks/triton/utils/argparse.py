@@ -37,6 +37,13 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         default="throughput",
         help="metric to plot",
     )
+    parser.add_argument(
+        "--backend",
+        type=str,
+        choices=["triton", "gluon", "auto"],
+        default="auto",
+        help="kernel backend to use",
+    )
     return parser
 
 

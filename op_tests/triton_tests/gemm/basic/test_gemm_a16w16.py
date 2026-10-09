@@ -49,7 +49,7 @@ def generate_gemm_a16w16_inputs(M, N, K, dtype, layout="TN", output=True, bias=F
     y = None
     if output:
         y = torch.empty((M, N), dtype=dtype, device="cuda")
-        out_dtype = (None,)
+        out_dtype = None
     else:
         out_dtype = dtype
 

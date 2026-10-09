@@ -2,7 +2,6 @@ import functools
 import math
 import sys
 from collections.abc import Callable
-from typing import Sequence, Any
 
 import torch
 from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
@@ -23,7 +22,6 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
-    run_input_generator,
     generate_rotating_buffers_pool,
     do_bench_aiter_triton
 )
@@ -53,7 +51,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: boo
     #Kernel FLOPS and Mem Accesses(bytes)
     flops = 2.0 * M * N * K
     mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0]["w"].element_size()
-    mem_write = (M * N) * rot_bufs[0]["bias"].element_size()
+    mem_write = (M * N) * rot_bufs[0]["y"].element_size()
     mem = mem_read + mem_write
 
     ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
