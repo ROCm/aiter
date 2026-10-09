@@ -148,7 +148,7 @@ N_BLOCK_CHOICES = (32, 64, 128, 256)
 #   V[2][0] 130..156 seg 2      V[2][1] 286..312  seg 4
 #
 # Q and O own no LDS of their own -- they time-share KV chunks (see _q_wave_base /
-# _o_wave_base). Slot pp owns [52*pp, +52) low and [156 + 52*pp, +52) high.
+# _o_wave_base). Slot slot_idx owns [52*slot_idx, +52) low and [156 + 52*slot_idx, +52) high.
 LDS_CHUNK_BYTES = 26 * 1024
 KV_LDS_SPLITS = 2  # halves one K (or V) tile is split into along n_block
 # Per-wave Q / O region inside a chunk pair. 17 KB covers 32 rows x 256 hdim + pad.
@@ -163,12 +163,12 @@ N_BLOCK_PREF = (128, 64)
 N_BLOCK_WIDE_MAX_QK_HDIM = 128
 
 # K|V LDS slots the main loop rotates through. 3 is the exact minimum for the
-# software-pipelined body: it reads V(u-1) from slot 0 and K(u) from slot 1 while the
-# copy for tile u+1 is written into slot 2.
+# software-pipelined body: it reads V(tile_idx-1) from slot 0 and K(tile_idx) from slot 1 while the
+# copy for tile tile_idx+1 is written into slot 2.
 N_KV_PP = 3
-# K runs one tile ahead of V. Body u reads K from slot 1 and V from slot 0, so landing
+# K runs one tile ahead of V. Body tile_idx reads K from slot 1 and V from slot 0, so landing
 # both copies in slot 2 would leave K one body of latency cover against V's two. LO
-# instead writes K(u+2) into slot 0 -- a chunk whose K half died at body u-1 and whose V
+# instead writes K(tile_idx+2) into slot 0 -- a chunk whose K half died at body tile_idx-1 and whose V
 # half this body reads (the 12-chunk layout keeps them disjoint) -- which buys K the same
 # two bodies, for one extra prologue copy (K(start+1) into slot 2).
 #
@@ -180,7 +180,7 @@ N_KV_PP = 3
 # (S' = S * softmax_scale * LOG2E), so the inner loop is a plain exp2(S' - m) and m/LSE
 # live in the log2 domain. LOG2E is folded into Q by the bf16 multiply the Q loader
 # already does -- free, but it rounds the scale to bf16's 8 mantissa bits. The exact
-# alternative is to scale the f32 QK accumulator instead, at R*NKV*8 VALU per tile.
+# alternative is to scale the f32 QK accumulator instead, at num_q_tiles*num_kv_frags*8 VALU per tile.
 
 # Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling O by
 # corr = exp(m_prev - m_new) is a full-width VALU pass every tile, but corr == 1 when the
@@ -214,8 +214,8 @@ KV_PRODUCER_WARPS = NUM_WAVES // 2
 
 # LO/HI anti-phase (FA3 ping-pong). Both halves run the same tile stream and the same
 # number of bodies and barriers; the HI half runs its two phases in the opposite order,
-#   LO body u:  gemm(u)                 | BAR | softmax(u)
-#   HI body u:  softmax(u-1) + rescale  | BAR | gemm(u)
+#   LO body tile_idx:  gemm(tile_idx)                 | BAR | softmax(tile_idx)
+#   HI body tile_idx:  softmax(tile_idx-1) + rescale  | BAR | gemm(tile_idx)
 # so each barrier window has one half in the WMMA stream and the other in the softmax
 # VALU stream. HI carries s_acc across the back edge instead of P (and needs no carried
 # ring head -- its head hides under the softmax that opens its own body). Its dead
@@ -230,7 +230,7 @@ O_VARIANT = "v2"
 
 # LDS->VGPR ring for the fused PV+QK WMMA stream (``_pv_qk_gemm``). Bursting every
 # ds_load of the resident KV tile into VGPRs before the first wmma makes the live cost
-# scale with hdim; the ring instead holds only RING loads live at 4 VGPR each, NP =
+# scale with hdim; the ring instead holds only RING loads live at 4 VGPR each, num_prefetch =
 # RING - 2*LAG in flight. Spanning both operand streams lets its refills pull K loads
 # while the PV wmma stream is still running. Keep RING a multiple of 4 -- an odd wrap
 # flips slot parity, costing a cycle on half the wmma. LAG=0 with RING >= num_ds_loads
@@ -239,7 +239,7 @@ PVQK_RING = 24
 PVQK_LAG = 2
 # Ring-head loads issued at the END of a body (under the softmax VALU) and carried across
 # the back edge as iter_args, instead of at the top of the body that consumes them. The V
-# they read is tile u, already resident in the slot this body used for K. Clamped to NP;
+# they read is tile tile_idx, already resident in the slot this body used for K. Clamped to num_prefetch;
 # 0 restores the un-carried head. Costs 4 VGPR per carried load.
 PVQK_HEAD_CARRY = 20
 
@@ -334,21 +334,21 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
     """Map this lane's rows in the packed ``(seq, q_head_in_group)`` tile to global
-    indices: ``(kv_head, q_head_idx, seq_idx)``, the latter two length-R lists (one per
-    q-WMMA-tile this wave owns, R = num_q_tiles_per_wave).
+    indices: ``(kv_head, q_head_idx, seq_idx)``, the latter two length-num_q_tiles lists (one per
+    q-WMMA-tile this wave owns, num_q_tiles = num_q_tiles_per_wave).
 
     block_id y is the kv_head; block_id x tiles that head's ``(seq, q_head_in_group)``
     plane, with ``q_head_in_group`` the fast axis so the ``% / //`` use the small (often
-    power-of-two) ``gqa_ratio``. The R tiles a wave owns are contiguous.
+    power-of-two) ``gqa_ratio``. The num_q_tiles tiles a wave owns are contiguous.
     """
     kv_head = fx.Int32(gpu.block_id("y"))
-    warp_row0 = _m_tile_idx() * _block_m(
-        num_q_tiles_per_wave
-    ) + warp_idx * (num_q_tiles_per_wave * WMMA_M)
+    warp_row0 = _m_tile_idx() * _block_m(num_q_tiles_per_wave) + warp_idx * (
+        num_q_tiles_per_wave * WMMA_M
+    )
     q_head_idx = []
     seq_idx = []
-    for qt in range(num_q_tiles_per_wave):
-        row_idx = warp_row0 + qt * WMMA_M + lane_idx % WMMA_M
+    for q_tile_idx in range(num_q_tiles_per_wave):
+        row_idx = warp_row0 + q_tile_idx * WMMA_M + lane_idx % WMMA_M
         q_head_idx.append(kv_head * gqa_ratio + row_idx % gqa_ratio)
         seq_idx.append(row_idx // gqa_ratio)
     return kv_head, q_head_idx, seq_idx
@@ -385,7 +385,7 @@ def _p_to_elem(p_list, elem_dtype):
     caller can place it AFTER the next gemm's ring head -- nothing in the head depends on
     P, so the ds_loads issue first and the v_cvt batch fills their shadow. Costs P a wider
     live range (f32, not narrowed) across the head."""
-    return [[pv.to(elem_dtype) for pv in pt] for pt in p_list]
+    return [[p_vec.to(elem_dtype) for p_vec in pt] for pt in p_list]
 
 
 def _keepalive(vals):
@@ -400,14 +400,14 @@ def _keepalive(vals):
     )
 
 
-def _ring_num_prefetch(num_frag, ring, lag):
+def _ring_num_prefetch(num_frag, ring, ring_lag):
     """In-flight ds_load depth (NP) of a ``_ring_drive`` with this geometry. A tile that
     fits in the ring never wraps, so nothing is refilled and the WAR lag buys nothing --
     prefetch it whole. Only a wrapping ring pays for lag."""
     num_ld = 2 * num_frag
     if num_ld <= ring:
         return num_ld
-    return ring - 2 * lag
+    return ring - 2 * ring_lag
 
 
 def _emit_ld(emit, j):
@@ -419,7 +419,7 @@ def _emit_ld(emit, j):
     return v
 
 
-def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None, dies=None):
+def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None):
     """Drive a fully-unrolled LDS->VGPR ring feeding a WMMA stream.
 
     ``emit(j)`` emits ds_load ``j`` (2 per WMMA fragment); ``consume(i, lo, hi)`` emits
@@ -440,9 +440,11 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None, dies=None):
     at a WAR distance of one VALU, instead of the ``2*rel`` the ring pairs enjoy.
     """
     num_ld = 2 * num_frag
-    NP = _ring_num_prefetch(num_frag, ring, lag)
+    num_prefetch = _ring_num_prefetch(num_frag, ring, ring_lag)
     ring = min(ring, num_ld)
-    assert NP > 0, f"ring={ring} too small for lag={lag} (NP={NP})"
+    assert (
+        num_prefetch > 0
+    ), f"ring={ring} too small for lag={ring_lag} (NP={num_prefetch})"
 
     def _waitn(n):
         rocdl.sched_barrier(0)
@@ -451,23 +453,25 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None, dies=None):
 
     a = [None] * ring
     if head is not None:
-        assert len(head) == NP, f"head has {len(head)} loads, expected NP={NP}"
+        assert (
+            len(head) == num_prefetch
+        ), f"head has {len(head)} loads, expected NP={num_prefetch}"
         for i, v in enumerate(head):
             a[i] = v
     else:
-        for i in range(NP):
+        for i in range(num_prefetch):
             a[i] = _emit_ld(emit, i)
-        rocdl.sched_barrier(0)  # pin the NP-deep burst above the stream
+        rocdl.sched_barrier(0)  # pin the num_prefetch-deep burst above the stream
 
-    steady = num_frag - NP // 2
+    steady = num_frag - num_prefetch // 2
     held = []  # held[i] = the pair fragment i read; released rel fragments later
     rel = (
-        lag + 1
+        ring_lag + 1
     )  # refill is hoisted, so hold one fragment PAST the refill of that slot
 
     def _refill(i):
         for k in range(2):
-            j = 2 * i + NP + k
+            j = 2 * i + num_prefetch + k
             if j < num_ld:
                 a[j % ring] = _emit_ld(emit, j)
 
@@ -489,16 +493,16 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None, dies=None):
         held.append(tuple(vals) if vals else None)
 
     for i in range(steady):
-        _waitn(NP - 2)
+        _waitn(num_prefetch - 2)
         _release(i)
         _refill(i)
         lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
         rocdl.sched_barrier(0)
         consume(i, lo, hi)
         rocdl.sched_barrier(0)
-        _record(i, (lo, hi) if lag else None)
+        _record(i, (lo, hi) if ring_lag else None)
     for i in range(steady, num_frag):
-        _waitn(NP - 2 * (i - steady + 1))
+        _waitn(num_prefetch - 2 * (i - steady + 1))
         _release(i)
         lo, hi = a[(2 * i) % ring], a[(2 * i + 1) % ring]
         rocdl.sched_barrier(0)
@@ -510,11 +514,11 @@ def _ring_drive(*, num_frag, emit, consume, ring, lag, head=None, dies=None):
             _keepalive(p)
 
 
-def _tree_reduce_multi(lists, op3, op2):
-    """Balanced 3-way tree reduction of R independent lists in lockstep, one result each.
+def _tree_reduce_multi(lists, combine3, combine2):
+    """Balanced 3-way tree reduction of num_q_tiles independent lists in lockstep, one result each.
     Critical path ~ceil(log3(N)) vs N-1 for a left-fold, and op3 = nested op2 so the
     backend fuses it (v_max3_f32 for max). Layers are emitted POSITION-MAJOR across the
-    lists, putting the R independent ops adjacent in the IR so the backend can dual-issue
+    lists, putting the num_q_tiles independent ops adjacent in the IR so the backend can dual-issue
     them and hide one row's cross-lane latency behind the other's work."""
     curs = [list(v) for v in lists]
     while max(len(c) for c in curs) > 1:
@@ -526,10 +530,10 @@ def _tree_reduce_multi(lists, op3, op2):
                 if i >= n:
                     continue
                 if n - i >= 3:
-                    nxts[k].append(op3(cur[i], cur[i + 1], cur[i + 2]))
+                    nxts[k].append(combine3(cur[i], cur[i + 1], cur[i + 2]))
                     idxs[k] += 3
                 elif n - i == 2:
-                    nxts[k].append(op2(cur[i], cur[i + 1]))
+                    nxts[k].append(combine2(cur[i], cur[i + 1]))
                     idxs[k] += 2
                 else:
                     nxts[k].append(cur[i])
@@ -551,39 +555,39 @@ def _softmax(
     q_min_list=None,
     kv_len=None,
 ):
-    """Online-softmax update for one KV tile, for ALL R q-WMMA-tiles this wave owns.
+    """Online-softmax update for one KV tile, for ALL num_q_tiles q-WMMA-tiles this wave owns.
 
-    Every ``*_list`` argument and return is length R (= num_q_tiles_per_wave). The R rows are
+    Every ``*_list`` argument and return is length num_q_tiles (= num_q_tiles_per_wave). The num_q_tiles rows are
     independent (each owns its S, running m/d and mask bounds) but share the tile's K/V,
     so processing them together lets ``_tree_reduce_multi`` interleave their max/sum trees
     and dual-issue the combines, hiding each other's permlanex16 latency. ``s_list`` is
     already in log2 units (the loader folds softmax_scale*LOG2E into Q), so exp is exp2.
 
-    Layout (from ``_pv_qk_gemm``): ``s_list[r]`` is ``NKV = n_block//WMMA_N`` v8-f32
-    accumulators; this lane owns query ``q = warp*16 + l%16`` and, in tile ``kvt``, kv rows
-    ``kvt*16 + (l//16)*8 + [0..8)``. The peer lane ``l^16`` holds the other 8-row half of
-    the same q, so rows reduce locally over (kvt, i) then across ``shuffle_xor(16)``.
+    Layout (from ``_pv_qk_gemm``): ``s_list[r]`` is ``num_kv_frags = n_block//WMMA_N`` v8-f32
+    accumulators; this lane owns query ``q = warp*16 + l%16`` and, in tile ``kv_frag_idx``, kv rows
+    ``kv_frag_idx*16 + (l//16)*8 + [0..8)``. The peer lane ``l^16`` holds the other 8-row half of
+    the same q, so rows reduce locally over (kv_frag_idx, i) then across ``shuffle_xor(16)``.
 
     ``kv_swap_delta`` corrects the swapped half-order read: when the wave takes the tile's
-    two halves in the other order, slot ``kvt`` holds physical kv-tile ``kvt ^ (NKV/2)``,
+    two halves in the other order, slot ``kv_frag_idx`` holds physical kv-tile ``kv_frag_idx ^ (num_kv_frags/2)``,
     so its absolute offset moves by +/- ``n_block/2``. A runtime Int32 (0 on even SIMDs)
-    folded into two per-body mask bases rather than into the NKV per-slot constants.
+    folded into two per-body mask bases rather than into the num_kv_frags per-slot constants.
 
-    Masking (per element, sequence-relative ``kv_pos = kv_pos_base + (l//16)*8 + kvt*16 +
+    Masking (per element, sequence-relative ``kv_pos = kv_pos_base + (l//16)*8 + kv_frag_idx*16 +
     i``; a None bound is skipped): ``q_max_list[r]`` masks ``kv_pos > q_max`` (band upper
     edge ``q_seq + (kv_len-q_len) + window_right``, clamped to ``kv_len-1`` on the last
     tile to fold the tail); ``q_min_list[r]`` masks ``kv_pos < q_min`` (lower edge, minus
     ``window_left``); ``kv_len`` masks ``kv_pos >= kv_len`` and applies only when q_max is
     None (the standalone non-causal tail).
 
-    Returns ``(p, m_new, d_new, corr)`` plus ``rescale_masks``. p is NKV v8 **f32** P^T =
+    Returns ``(p, m_new, d_new, corr)`` plus ``rescale_masks``. p is num_kv_frags v8 **f32** P^T =
     exp(S^T - m_new), NOT narrowed to the wmma element type -- the caller places that with
     ``_p_to_elem``. m_new is STALE (== m_prev) when that row's ballot did not fire (FAv4
-    §9.1.1), with corr == 1 and d_new = corr*d_prev + rowsum(p). ``rescale_masks`` is the R
+    §9.1.1), with corr == 1 and d_new = corr*d_prev + rowsum(p). ``rescale_masks`` is the num_q_tiles
     raw ballots (None when deferral is compiled out), for the caller to fold into its one
     branch condition at the use site.
     """
-    NKV = n_block // WMMA_N
+    num_kv_frags = n_block // WMMA_N
     f32 = T.f32
     fast = arith.FastMathFlags.fast
     neg_inf = fx.Float32(float("-inf"))
@@ -597,8 +601,15 @@ def _softmax(
 
     # fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the
     # sum tree back into a serial chain (max survives — Reassociate ignores maxnum).
-    _FF = arith.FastMathFlags
-    _no_reassoc = _FF.nnan | _FF.ninf | _FF.nsz | _FF.arcp | _FF.contract | _FF.afn
+    _fast_math = arith.FastMathFlags
+    _no_reassoc = (
+        _fast_math.nnan
+        | _fast_math.ninf
+        | _fast_math.nsz
+        | _fast_math.arcp
+        | _fast_math.contract
+        | _fast_math.afn
+    )
 
     def fadd_t(a, b):
         return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=_no_reassoc))
@@ -631,32 +642,39 @@ def _softmax(
             )
         )
 
-    khalf = lane_idx // fx.Int32(WMMA_M)  # 0/1: which 8-row kv half this lane owns
+    kv_half_idx = lane_idx // fx.Int32(
+        WMMA_M
+    )  # 0/1: which 8-row kv half this lane owns
 
-    # Mask base: swapped reads move the low NKV/2 slots up by n_block/2 and the high slots
+    # Mask base: swapped reads move the low num_kv_frags/2 slots up by n_block/2 and the high slots
     # down, so one base per half absorbs the whole correction and the per-slot term stays
-    # the compile-time kvt*WMMA_N + i.
+    # the compile-time kv_frag_idx*WMMA_N + i.
     if kv_pos_base is not None:
-        _pos0 = kv_pos_base + khalf * fx.Int32(8)
-        _pos_half = [_pos0 + kv_swap_delta, _pos0 - kv_swap_delta]
+        _kv_pos_half_base = kv_pos_base + kv_half_idx * fx.Int32(8)
+        _kv_pos_halves = [
+            _kv_pos_half_base + kv_swap_delta,
+            _kv_pos_half_base - kv_swap_delta,
+        ]
 
-    R = len(s_list)
-    q_max_list = q_max_list if q_max_list is not None else [None] * R
-    q_min_list = q_min_list if q_min_list is not None else [None] * R
+    num_q_tiles = len(s_list)
+    q_max_list = q_max_list if q_max_list is not None else [None] * num_q_tiles
+    q_min_list = q_min_list if q_min_list is not None else [None] * num_q_tiles
 
-    # ---- Pass 1: masked S, flattened (kvt, i) order. Built for every row first so the
+    # ---- Pass 1: masked S, flattened (kv_frag_idx, i) order. Built for every row first so the
     # max-trees below emit INTERLEAVED. ----
     s_masked_list = []
-    for r in range(R):
+    for r in range(num_q_tiles):
         s = s_list[r]
         q_max, q_min = q_max_list[r], q_min_list[r]
         s_masked = []
-        for kvt in range(NKV):
-            svec = fx.Vector(_ir(s[kvt]))
+        for kv_frag_idx in range(num_kv_frags):
+            svec = fx.Vector(_ir(s[kv_frag_idx]))
             for i in range(8):
                 sval = fx.Float32(svec[i])
                 if q_max is not None or q_min is not None or kv_len is not None:
-                    kv_pos = _pos_half[kvt >= NKV // 2] + fx.Int32(kvt * WMMA_N + i)
+                    kv_pos = _kv_pos_halves[
+                        kv_frag_idx >= num_kv_frags // 2
+                    ] + fx.Int32(kv_frag_idx * WMMA_N + i)
                     if q_max is not None:
                         ubound = (
                             q_max
@@ -678,7 +696,7 @@ def _softmax(
     # ---- Per row: peer reduce + deferred-rescale decision + corr. ----
     m_new_list, corr_list = [], []
     rescale_masks = None if not _defer else []
-    for r in range(R):
+    for r in range(num_q_tiles):
         m_prev, q_min = m_prev_list[r], q_min_list[r]
         row_max = fmax(local_max_list[r], peer(local_max_list[r]))
         m_full = fmax(m_prev, row_max)
@@ -711,15 +729,18 @@ def _softmax(
     # TRANS -- the coexecution hazard is TRANS followed by non-TRANS VALU, so an
     # uninterrupted run needs none of the v_nop padding an interleaved one does. ----
     diff_list = [
-        [fsub_inf(sv, m_new_list[r]) for sv in s_masked_list[r]] for r in range(R)
+        [fsub_inf(sv, m_new_list[r]) for sv in s_masked_list[r]]
+        for r in range(num_q_tiles)
     ]
     p_flat_list = [[exp2(d) for d in diff] for diff in diff_list]
     p_list = [
         [
-            fx.Vector.from_elements(pf[kvt * 8 : (kvt + 1) * 8], fx.Float32)
-            for kvt in range(NKV)
+            fx.Vector.from_elements(
+                p_flat[kv_frag_idx * 8 : (kv_frag_idx + 1) * 8], fx.Float32
+            )
+            for kv_frag_idx in range(num_kv_frags)
         ]
-        for pf in p_flat_list
+        for p_flat in p_flat_list
     ]
 
     # ---- Row sum: interleaved balanced sum-trees. fadd_t drops reassoc so LLVM's
@@ -728,7 +749,7 @@ def _softmax(
     local_sum_list = _tree_reduce_multi(p_flat_list, add3, fadd_t)
 
     d_new_list = []
-    for r in range(R):
+    for r in range(num_q_tiles):
         d_new_list.append(
             fadd(
                 fmul(corr_list[r], d_prev_list[r]),
@@ -750,108 +771,120 @@ def _pv_qk_gemm(
     o_acc_list=None,
     head=None,
     ring=PVQK_RING,
-    lag=PVQK_LAG,
+    ring_lag=PVQK_LAG,
     phase="pvqk",
 ):
     """GEMM2(u-1) then GEMM1(u) driven by ONE ring over the concatenated V-then-K
-    fragment streams, for all R q-WMMA-tiles this wave owns.
+    fragment streams, for all num_q_tiles q-WMMA-tiles this wave owns.
 
     V and K are shared across the q-tiles, so each fragment is shuffled once and fed into
-    R independent WMMA chains. Consumption stays strictly sequential -- a full PV pass
+    num_q_tiles independent WMMA chains. Consumption stays strictly sequential -- a full PV pass
     then a full QK pass -- so P dies before the first QK wmma and the two accumulator sets
     are never co-live. What the single ring buys is the refill window: the K loads for
     QK(u) issue ~NP/2 fragments before the transition, while PV's wmma stream still runs.
 
     GEMM2, O^T = V^T @ P^T, D[M=d, N=q]: **A = V^T** (src_a, transpose-loaded via
     ds_load_tr16_b128, two V-tiles (kv, kv+16) shuffled) and **B = P^T** (src_b, two
-    softmax tiles p[2kt], p[2kt+1]). Contracts kv in ``nkt = n_block//WMMA_K`` tiles and
+    softmax tiles p[2*k_tile_idx], p[2*k_tile_idx+1]). Contracts kv in ``num_contract_tiles = n_block//WMMA_K`` tiles and
     produces ``d_tiles = v_hdim//WMMA_M`` d-tiles on the M axis. Lane ``l`` element ``si``
-    of tile ``dt`` holds O[q = l%16, d = dt*WMMA_M + (l//16)*8 + si] -- the OManager16b
+    of tile ``d_tile_idx`` holds O[q = l%16, d = d_tile_idx*WMMA_M + (l//16)*8 + si] -- the OManager16b
     fragment layout.
 
     GEMM1, S^T = K @ Q^T: **K = A-operand**, **Q = B-operand**. Contracts d in
-    ``NDT = qk_hdim//WMMA_K`` tiles and produces ``NKV = n_block//WMMA_N`` kv-tiles. Lane
+    ``num_k_tiles = qk_hdim//WMMA_K`` tiles and produces ``num_kv_frags = n_block//WMMA_N`` kv-tiles. Lane
     ``l`` element ``si`` holds S^T[kv = kv_tile*WMMA_N + (l//16)*8 + si, q = l%16] (kv on
     the C-row / M axis, q on the C-col / N axis; GPU-verified). Each K fragment is the two
     16-col halves of a d-tile shuffled into a v16 matching the Q frag layout.
 
-    ``p_list``/``q_frags_list``/``o_acc_list`` are length-R lists: per q-tile its bf16 P^T
-    B-operands, its NDT v16-bf16 Q fragments, and (or None) its running ``d_tiles`` v8-f32
+    ``p_list``/``q_frags_list``/``o_acc_list`` are length-num_q_tiles lists: per q-tile its bf16 P^T
+    B-operands, its num_k_tiles v16-bf16 Q fragments, and (or None) its running ``d_tiles`` v8-f32
     O accumulator, already rescaled by ``corr``, which PV accumulates onto online.
     ``v_emit(j)``/``k_emit(j)`` emit the j-th V transpose-load / K ds_load of the resident
-    block in flat ``(dt, kt, half)`` and ``(kv, dt, half)`` order; ``_ring_drive`` calls
+    block in flat ``(d_tile_idx, k_tile_idx, half)`` and ``(kv, d_tile_idx, half)`` order; ``_ring_drive`` calls
     them on demand. ``head`` adopts the NP-deep prefetch the caller issued before softmax,
     so that latency still hides under the softmax VALU.
 
-    Returns ``(out_list, s_acc_list)``: the updated O accumulators, and per q-tile NKV
+    Returns ``(out_list, s_acc_list)``: the updated O accumulators, and per q-tile num_kv_frags
     v8-f32 S^T accumulators.
     """
-    R = len(p_list)
+    num_q_tiles = len(p_list)
     d_tiles = v_hdim // WMMA_M
-    nkt = n_block // WMMA_K
-    NKV = n_block // WMMA_N
-    NDT = len(q_frags_list[0])
+    num_contract_tiles = n_block // WMMA_K
+    num_kv_frags = n_block // WMMA_N
+    num_k_tiles = len(q_frags_list[0])
 
     # ``phase`` drops one half of the stream when the caller knows it is dead (the
     # single-KV-tile core runs QK and PV as separate passes around softmax).
     do_pv = phase != "qk"
     do_qk = phase != "pv"
-    num_vfrag = d_tiles * nkt if do_pv else 0
-    num_kfrag = NKV * NDT if do_qk else 0
-    num_vld = 2 * num_vfrag
+    num_v_frags = d_tiles * num_contract_tiles if do_pv else 0
+    num_k_frags = num_kv_frags * num_k_tiles if do_qk else 0
+    num_vld = 2 * num_v_frags
 
-    out_list = [[None] * d_tiles for _ in range(R)]
+    out_list = [[None] * d_tiles for _ in range(num_q_tiles)]
     if not do_pv:
         out_list = [list(row) for row in o_acc_list]
-    s_acc_list = [[None] * NKV for _ in range(R)]
-    p_frags = {}  # (qt, kt) -> B operand, handed to _ring_drive on its last fragment
+    s_acc_list = [[None] * num_kv_frags for _ in range(num_q_tiles)]
+    p_frags = (
+        {}
+    )  # (q_tile_idx, k_tile_idx) -> B operand, handed to _ring_drive on its last fragment
 
     def emit(j):
         return v_emit(j) if j < num_vld else k_emit(j - num_vld)
 
     def consume(i, lo, hi):
-        if i < num_vfrag:
-            dt, kt = divmod(i, nkt)
+        if i < num_v_frags:
+            d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
             v_frag = lo.shuffle(hi, list(range(16)))
-            for qt in range(R):
-                acc = out_list[qt][dt]
+            for q_tile_idx in range(num_q_tiles):
+                acc = out_list[q_tile_idx][d_tile_idx]
                 if acc is None:
                     acc = (
-                        o_acc_list[qt][dt]
+                        o_acc_list[q_tile_idx][d_tile_idx]
                         if o_acc_list is not None
                         else fx.Vector.filled(8, 0.0, fx.Float32)
                     )
-                p = p_list[qt]
-                p_frag = p[2 * kt].shuffle(p[2 * kt + 1], list(range(16)))
-                p_frags[(qt, kt)] = p_frag
-                out_list[qt][dt] = _wmma(v_frag, p_frag, acc)
+                p = p_list[q_tile_idx]
+                p_frag = p[2 * k_tile_idx].shuffle(
+                    p[2 * k_tile_idx + 1], list(range(16))
+                )
+                p_frags[(q_tile_idx, k_tile_idx)] = p_frag
+                out_list[q_tile_idx][d_tile_idx] = _wmma(v_frag, p_frag, acc)
             return
-        kv, dt = divmod(i - num_vfrag, NDT)
+        kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
         k_frag = lo.shuffle(hi, list(range(16)))
-        for qt in range(R):
-            acc = s_acc_list[qt][kv] if dt > 0 else fx.Vector.filled(8, 0.0, fx.Float32)
-            s_acc_list[qt][kv] = _wmma(k_frag, q_frags_list[qt][dt], acc)
+        for q_tile_idx in range(num_q_tiles):
+            acc = (
+                s_acc_list[q_tile_idx][kv]
+                if d_tile_idx > 0
+                else fx.Vector.filled(8, 0.0, fx.Float32)
+            )
+            s_acc_list[q_tile_idx][kv] = _wmma(
+                k_frag, q_frags_list[q_tile_idx][d_tile_idx], acc
+            )
 
     def dies(i):
         # The PV half's B operands die on the final d-tile row, which is where the ring is
         # already refilling for QK. Release them through the ring so the refill sees one
         # WAR distance, not two.
-        if i >= num_vfrag:
+        if i >= num_v_frags:
             return ()
-        dt, kt = divmod(i, nkt)
-        if dt != d_tiles - 1:
+        d_tile_idx, k_tile_idx = divmod(i, num_contract_tiles)
+        if d_tile_idx != d_tiles - 1:
             return ()
-        return [p_frags.pop((qt, kt)) for qt in range(R)]
+        return [
+            p_frags.pop((q_tile_idx, k_tile_idx)) for q_tile_idx in range(num_q_tiles)
+        ]
 
     # Raise wave priority for the whole WMMA stream: under anti-phase the other half is
     # in its softmax VALU here, and the gemm half must win issue arbitration.
     rocdl.s_setprio(2)
     _ring_drive(
-        num_frag=num_vfrag + num_kfrag,
+        num_frag=num_v_frags + num_k_frags,
         emit=emit,
         consume=consume,
         ring=ring,
-        lag=lag,
+        ring_lag=ring_lag,
         head=head,
         dies=dies,
     )
@@ -867,26 +900,26 @@ def _pv_qk_gemm(
 def _wg_kv_span(
     *, n_block, mask_right, gqa_ratio, num_q_tiles_per_wave, q_len, kv_len, window_right
 ):
-    """This WG's KV band: (block_x, causal_off, kv_len_wg, num_tiles).
+    """This WG's KV band: (m_tile_idx, causal_off, kv_len_wg, num_tiles).
 
     A query at seq s attends [s+causal_off-window_left, s+causal_off+window_right] with
     causal_off = kv_len-q_len; mask_right clips kv_len_wg to the WG's max query's
     attend-limit so no tile runs fully past the band. num_tiles is also the one-KV-tile
     dispatch predicate, so it is computed here once and shared with the kernel entry."""
     BLOCK_M = _block_m(num_q_tiles_per_wave)
-    block_x = _m_tile_idx()
+    m_tile_idx = _m_tile_idx()
     causal_off = kv_len - q_len
     if mask_right:
-        wg_max_seq = (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)) // fx.Int32(
-            gqa_ratio
-        )
+        wg_max_seq = (
+            m_tile_idx * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1)
+        ) // fx.Int32(gqa_ratio)
         wg_max_seq = fx.min(wg_max_seq, q_len - fx.Int32(1))
         kv_len_wg = wg_max_seq + causal_off + window_right + fx.Int32(1)
         kv_len_wg = fx.min(kv_len_wg, kv_len)
         kv_len_wg = fx.max(kv_len_wg, fx.Int32(1))
     else:
         kv_len_wg = kv_len
-    return block_x, causal_off, kv_len_wg, fx.ceildiv(kv_len_wg, fx.Int32(n_block))
+    return m_tile_idx, causal_off, kv_len_wg, fx.ceildiv(kv_len_wg, fx.Int32(n_block))
 
 
 def _alloc_lds():
@@ -898,7 +931,7 @@ def _alloc_lds():
 
 
 # Keys ``_prologue_attention`` shares with the compute cores' kwarg dict.
-_PRO_KEYS = (
+_PROLOGUE_KEYS = (
     "qk_hdim",
     "v_hdim",
     "n_block",
@@ -1012,13 +1045,13 @@ def _prologue_attention(
     k_blk_bytes = k_mgr.get_lds_size_in_byte()
     v_blk_bytes = v_mgr.get_lds_size_in_byte()
     assert k_blk_bytes % KV_LDS_SPLITS == 0 and v_blk_bytes % KV_LDS_SPLITS == 0
-    # Chunk stride between a tile's two n_block halves (K[pp][0] -> K[pp][1]) and between
-    # consecutive slots. Slot pp occupies chunks 2pp, 2pp+1 low and 2pp+6, 2pp+7 high.
+    # Chunk stride between a tile's two n_block halves (K[slot_idx][0] -> K[slot_idx][1]) and between
+    # consecutive slots. Slot slot_idx occupies chunks 2pp, 2pp+1 low and 2pp+6, 2pp+7 high.
     _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES  # 156 KB
     slot_bytes = 2 * LDS_CHUNK_BYTES  # 52 KB: one slot's K|V pair in one half
-    for _who, _b in (("K", k_blk_bytes), ("V", v_blk_bytes)):
-        assert _b // KV_LDS_SPLITS <= LDS_CHUNK_BYTES, (
-            f"{_who} split {_b // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
+    for _label, _bytes in (("K", k_blk_bytes), ("V", v_blk_bytes)):
+        assert _bytes // KV_LDS_SPLITS <= LDS_CHUNK_BYTES, (
+            f"{_label} split {_bytes // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
             f"(qk_hdim={qk_hdim}, v_hdim={v_hdim}, n_block={n_block})"
         )
     assert 2 * N_KV_PP * slot_bytes <= get_lds_capacity_bytes(
@@ -1026,19 +1059,19 @@ def _prologue_attention(
     ), "12-chunk K|V layout over LDS capacity"
 
     def _k_lds_buf(
-        pp,
-    ):  # slot ``pp``'s low-half base == K[pp][0] (int or fx.Int32; folds when const)
-        if isinstance(pp, int):
-            pp = fx.Int32(pp)
-        return lds_base + pp * fx.Int32(slot_bytes)
+        slot_idx,
+    ):  # slot ``pp``'s low-half base == K[slot_idx][0] (int or fx.Int32; folds when const)
+        if isinstance(slot_idx, int):
+            slot_idx = fx.Int32(slot_idx)
+        return lds_base + slot_idx * fx.Int32(slot_bytes)
 
-    def _v_lds_buf(pp):  # V[pp][0] == the slot base one chunk in
-        return _k_lds_buf(pp) + fx.Int32(LDS_CHUNK_BYTES)
+    def _v_lds_buf(slot_idx):  # V[slot_idx][0] == the slot base one chunk in
+        return _k_lds_buf(slot_idx) + fx.Int32(LDS_CHUNK_BYTES)
 
     # Logical slot -> physical chunk pair. Q covers all of physical slot 1 and the low
     # 17 KB of slot 2's K chunks, so physical slot 0 is the only Q-disjoint one; putting
     # the first tile (logical slot 1) there lets the prologue issue it before Q is read.
-    _PSLOT = [2, 0, 1]
+    _PHYSICAL_SLOT = [2, 0, 1]
 
     def _k_bufs_at(
         slot,
@@ -1046,43 +1079,43 @@ def _prologue_attention(
         return [slot, slot + fx.Int32(_SPLIT_STRIDE)]
 
     def _v_bufs_at(slot):
-        v0 = slot + fx.Int32(LDS_CHUNK_BYTES)
-        return [v0, v0 + fx.Int32(_SPLIT_STRIDE)]
+        v_start_desc = slot + fx.Int32(LDS_CHUNK_BYTES)
+        return [v_start_desc, v_start_desc + fx.Int32(_SPLIT_STRIDE)]
 
     # READ side only -- the producer keeps writing split s to chunk s. Odd SIMDs take the
     # two bases in the other order, so the parities are never in the same 64 KB segment
     # set at the same point of a gemm. _split_bufs runs only in the prologue and its
     # results are carried as ds pointers, so this costs a few adds and nothing in-loop.
     assert KV_LDS_SPLITS == 2, "parity order needs a 2-way split"
-    _odd = warp_idx & fx.Int32(1)
-    _rd0 = _odd * fx.Int32(_SPLIT_STRIDE)
-    _rd = [_rd0, fx.Int32(_SPLIT_STRIDE) - _rd0]
-    # Slot kvt then holds physical kv-tile kvt ^ (NKV/2); the mask is the only consumer
+    _is_odd_warp = warp_idx & fx.Int32(1)
+    _read_order_lo = _is_odd_warp * fx.Int32(_SPLIT_STRIDE)
+    _read_order = [_read_order_lo, fx.Int32(_SPLIT_STRIDE) - _read_order_lo]
+    # Slot kv_frag_idx then holds physical kv-tile kv_frag_idx ^ (num_kv_frags/2); the mask is the only consumer
     # of the absolute index, and it takes the correction as +/- this delta.
-    _kv_swap_delta = _odd * fx.Int32(n_block // 2)
+    _kv_swap_delta = _is_odd_warp * fx.Int32(n_block // 2)
 
     def _split_bufs(b):
-        return [b + o for o in _rd]
+        return [b + o for o in _read_order]
 
-    def _k_lds_bufs(pp):
-        return _split_bufs(_k_lds_buf(pp))
+    def _k_lds_bufs(slot_idx):
+        return _split_bufs(_k_lds_buf(slot_idx))
 
-    def _v_lds_bufs(pp):
-        return _split_bufs(_v_lds_buf(pp))
+    def _v_lds_bufs(slot_idx):
+        return _split_bufs(_v_lds_buf(slot_idx))
 
     # ---- Q and O own no LDS: both time-share KV chunks in LDS_QO_BYTES per-wave slices.
     # Q sits in the K[1][0] / K[1][1] chunk pairs (52 KB and 208 KB, 4 waves x 17 KB each);
     # it is drained into VGPR and dead before the prologue issues a tile into slot 1 or 2
     # (s_wait_dscnt + barrier below). Wave w -> chunk B iff (w&1) ^ ((w>>2)&1), so the two
     # waves sharing a SIMD (w and w+4) always land in different chunks. ----
-    for _who, _b in (("Q", q_mgr.warp_lds_size_in_byte()),):
+    for _label, _bytes in (("Q", q_mgr.warp_lds_size_in_byte()),):
         assert (
-            _b <= LDS_QO_BYTES
-        ), f"{_who} per-wave {_b}B over the {LDS_QO_BYTES}B slice"
-    _q_chunk_b = (warp_idx & fx.Int32(1)) ^ ((warp_idx >> fx.Int32(2)) & fx.Int32(1))
+            _bytes <= LDS_QO_BYTES
+        ), f"{_label} per-wave {_bytes}B over the {LDS_QO_BYTES}B slice"
+    _q_chunk_sel = (warp_idx & fx.Int32(1)) ^ ((warp_idx >> fx.Int32(2)) & fx.Int32(1))
     q_lds_warp = (
         _k_lds_buf(1)
-        + _q_chunk_b * fx.Int32(_SPLIT_STRIDE)
+        + _q_chunk_sel * fx.Int32(_SPLIT_STRIDE)
         + (warp_idx >> fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
     )
 
@@ -1099,11 +1132,11 @@ def _prologue_attention(
         ptr_lds_warp=q_lds_warp,
     )
 
-    # ---- This WG's KV tiles span relative kv [start_tile*n_block, kv_len_wg); mask_left
-    # moves start_tile past whole tiles before the WG's min query's band start. The
-    # defensive min() keeps start_tile a valid buffer index even for an over-launched WG
+    # ---- This WG's KV tiles span relative kv [start_tile_idx*n_block, kv_len_wg); mask_left
+    # moves start_tile_idx past whole tiles before the WG's min query's band start. The
+    # defensive min() keeps start_tile_idx a valid buffer index even for an over-launched WG
     # whose whole band is empty (its per-element masks zero the work anyway).
-    block_x, causal_off, kv_len_wg, num_tiles = _wg_kv_span(
+    m_tile_idx, causal_off, kv_len_wg, num_tiles = _wg_kv_span(
         n_block=n_block,
         mask_right=mask_right,
         gqa_ratio=gqa_ratio,
@@ -1112,40 +1145,40 @@ def _prologue_attention(
         kv_len=kv_len,
         window_right=window_right,
     )
-    last_tile = num_tiles - fx.Int32(1)  # always carries the kv_len tail
+    last_tile_idx = num_tiles - fx.Int32(1)  # always carries the kv_len tail
     if mask_left:
-        wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
+        wg_min_seq = (m_tile_idx * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
         kv_lo = fx.max(wg_min_seq + causal_off - window_left, fx.Int32(0))
-        start_tile = kv_lo // fx.Int32(n_block)
-        start_tile = fx.min(start_tile, last_tile)
+        start_tile_idx = kv_lo // fx.Int32(n_block)
+        start_tile_idx = fx.min(start_tile_idx, last_tile_idx)
     else:
-        start_tile = fx.Int32(0)
+        start_tile_idx = fx.Int32(0)
 
     def _tile_row0(t):  # clamped to the last tile, never guarded off the end
-        return fx.min(t, last_tile) * fx.Int32(n_block)
+        return fx.min(t, last_tile_idx) * fx.Int32(n_block)
 
     # How many rows of tile t are in-bounds: n_block for every tile but the last, whose
-    # tail is loop-invariant. Tiles past last_tile read as the last one, matching
+    # tail is loop-invariant. Tiles past last_tile_idx read as the last one, matching
     # _tile_row0's clamp. A scalar select keeps this out of the VALU -- the min/max form
     # folds to v_med3_i32, which has no scalar counterpart, so a uniform value would go
     # out to a VGPR and come back through v_readfirstlane_b32 on every body.
-    tail_valid = kv_len_wg - last_tile * fx.Int32(n_block)
+    tail_valid = kv_len_wg - last_tile_idx * fx.Int32(n_block)
 
     def _kv_valid(t):
-        return (t < last_tile).select(fx.Int32(n_block), tail_valid)
+        return (t < last_tile_idx).select(fx.Int32(n_block), tail_valid)
 
     # ---- Prologue. All K/V address arithmetic is pure (no memory op until
     # ``.async_load()``), so it is hoisted into the Q global-load shadow and the copies
     # themselves issue last, leaving nothing between them and the prologue barrier.
     #
-    # Slot rotation is LOCAL to this WG's tile stream: the prologue puts start_tile into
+    # Slot rotation is LOCAL to this WG's tile stream: the prologue puts start_tile_idx into
     # slot 1 and the loop carries the slot bases as iter_args (rotated in the yield), so
-    # start_tile is irrelevant to the placement and no runtime "% N_KV_PP" is evaluated.
-    # Body u reads K from slot 1 and V from slot 0, so the first body needs tile
-    # start_tile's K AND V in slot 1 (K for QK(start_tile), V for the next body's PV) and
+    # start_tile_idx is irrelevant to the placement and no runtime "% N_KV_PP" is evaluated.
+    # Body tile_idx reads K from slot 1 and V from slot 0, so the first body needs tile
+    # start_tile_idx's K AND V in slot 1 (K for QK(start_tile_idx), V for the next body's PV) and
     # only FINITE data in slot 0's V region -- its PV is the dead leading one, p == 0, and
-    # 0 * NaN would poison O. Loading start_tile's V there is the cheapest such filler.
-    start_row0 = start_tile * fx.Int32(n_block)
+    # 0 * NaN would poison O. Loading start_tile_idx's V there is the cheapest such filler.
+    start_row0 = start_tile_idx * fx.Int32(n_block)
     # This wave's slot among its half's producers; it owns one dense
     # n_block/KV_PRODUCER_WARPS row band and copies it alone.
     _producer_warp = warp_idx % fx.Int32(KV_PRODUCER_WARPS)
@@ -1154,6 +1187,7 @@ def _prologue_attention(
         num_producer_warps=KV_PRODUCER_WARPS,
         lane_idx=lane_idx,
     )
+
     def _k_desc(slot, row0, valid):
         """K descriptor for one tile, addressed off the slot's low-half base. Pure until
         ``.async_load()``; which transport it carries (async vs TDM) is the manager's
@@ -1186,10 +1220,10 @@ def _prologue_attention(
     # body start issues K(start+1) itself. Built here because the address math is pure and
     # sits in Q's global-load shadow either way; only the ``.async_load()``s go under the
     # warp-type branch.
-    _start_valid = _kv_valid(start_tile)
-    k0 = _k_desc(_k_lds_buf(_PSLOT[1]), start_row0, _start_valid)
-    v0 = _v_desc(_k_lds_buf(_PSLOT[1]), start_row0, _start_valid)
-    v_fill = _v_desc(_k_lds_buf(_PSLOT[0]), start_row0, _start_valid)
+    _start_valid = _kv_valid(start_tile_idx)
+    k_start_desc = _k_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
+    v_start_desc = _v_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
+    v_dummy_desc = _v_desc(_k_lds_buf(_PHYSICAL_SLOT[0]), start_row0, _start_valid)
 
     # Per-half counter usage, straight off the descriptors' declared counts. A counter a
     # half's copies never touch gets -1 ("do not wait on it at all"), NOT 0. The one it
@@ -1197,8 +1231,8 @@ def _prologue_attention(
     # steady-state fence names to leave the newest tile in flight. The two bands differ
     # whenever qk_hdim != v_hdim, so the core takes the pair and picks its own.
     kv_counts = {
-        WarpType.LO: (k0.tensorcnt or -1, k0.asynccnt or -1),
-        WarpType.HI: (v0.tensorcnt or -1, v0.asynccnt or -1),
+        WarpType.LO: (k_start_desc.tensorcnt or -1, k_start_desc.asynccnt or -1),
+        WarpType.HI: (v_start_desc.tensorcnt or -1, v_start_desc.asynccnt or -1),
     }
     _drains = {w: _kv_drain_depths(*c) for w, c in kv_counts.items()}
     # Fully-drained depths name only WHICH counters are live, and both bands live on the
@@ -1214,11 +1248,14 @@ def _prologue_attention(
     # ALONE, so a tile copy issued first would corrupt the count. Everything goes after
     # the barrier, and after part2, which ends at depth 0.
     if USE_TDM_LOADER:
-        _early = {WarpType.LO: [k0], WarpType.HI: [v0, v_fill]}
+        _early = {
+            WarpType.LO: [k_start_desc],
+            WarpType.HI: [v_start_desc, v_dummy_desc],
+        }
         _late = {WarpType.LO: [], WarpType.HI: []}
     else:
         _early = {WarpType.LO: [], WarpType.HI: []}
-        _late = {WarpType.LO: [k0], WarpType.HI: [v0, v_fill]}
+        _late = {WarpType.LO: [k_start_desc], WarpType.HI: [v_start_desc, v_dummy_desc]}
 
     _is_lo = warp_idx < fx.Int32(NUM_WAVES // 2)
     if USE_TDM_LOADER:
@@ -1227,12 +1264,12 @@ def _prologue_attention(
         @flyc.jit
         def _issue_early(is_lo):
             if is_lo:
-                for _d in _early[WarpType.LO]:
-                    _d.async_load()
+                for _desc in _early[WarpType.LO]:
+                    _desc.async_load()
                 tdm_ops.tensor_wait(sum(d.tensorcnt for d in _early[WarpType.LO]))
             else:
-                for _d in _early[WarpType.HI]:
-                    _d.async_load()
+                for _desc in _early[WarpType.HI]:
+                    _desc.async_load()
                 tdm_ops.tensor_wait(sum(d.tensorcnt for d in _early[WarpType.HI]))
 
         _issue_early(_is_lo)
@@ -1246,15 +1283,15 @@ def _prologue_attention(
     @flyc.jit
     def _issue_late(is_lo):
         if is_lo:
-            for _d in _late[WarpType.LO]:
-                _d.async_load()
+            for _desc in _late[WarpType.LO]:
+                _desc.async_load()
         else:
             # HI enters its resting priority at the first point both halves have reached:
             # from here on the lagging half must not lose arbitration to its SIMD-mate,
             # and _pv_qk_gemm's exit restores this same level after every gemm.
             rocdl.s_setprio(1)
-            for _d in _late[WarpType.HI]:
-                _d.async_load()
+            for _desc in _late[WarpType.HI]:
+                _desc.async_load()
 
     _issue_late(_is_lo)
     rocdl.sched_barrier(0)
@@ -1275,12 +1312,12 @@ def _prologue_attention(
         "v_lds_bufs": _v_lds_bufs,
         "kv_swap_delta": _kv_swap_delta,
         "split_stride": _SPLIT_STRIDE,
-        "pslot": _PSLOT,
-        "block_x": block_x,
+        "physical_slot": _PHYSICAL_SLOT,
+        "m_tile_idx": m_tile_idx,
         "causal_off": causal_off,
         "num_tiles": num_tiles,
-        "last_tile": last_tile,
-        "start_tile": start_tile,
+        "last_tile_idx": last_tile_idx,
+        "start_tile_idx": start_tile_idx,
         "tile_row0": _tile_row0,
         "kv_valid": _kv_valid,
         "kv_counts": kv_counts,
@@ -1358,7 +1395,7 @@ def _core_attention_multi_kv_tiles(
     warp_idx,  # runtime fx.Int32 wave index
     warp_type,  # compile-time WarpType (LO/HI x SIMD parity)
     lds_base,  # LDS base (fx.Int32), allocated once by the caller (_alloc_lds)
-    pro,  # dict from _prologue_attention: managers, LDS map, KV span, Q fragments
+    prologue,  # dict from _prologue_attention: managers, LDS map, KV span, Q fragments
     elem_dtype,  # compile-time fx.BFloat16 / fx.Float16 for Q/K/V/P/O fragments
 ):
     """Layout-agnostic m32x8 compute, shared by the THD and BSHD kernel entries.
@@ -1370,30 +1407,30 @@ def _core_attention_multi_kv_tiles(
     K load, HI shadows it), which is why only this middle part is duplicated.
     """
     BLOCK_M = _block_m(num_q_tiles_per_wave)
-    lane_idx = pro["lane_idx"]
-    kv_head = pro["kv_head"]
-    q_head_idx = pro["q_head_idx"]
-    seq_idx = pro["seq_idx"]
-    k_mgr = pro["k_mgr"]
-    v_mgr = pro["v_mgr"]
-    _kv_ctx = pro["kv_ctx"]
-    _k_lds_buf = pro["k_lds_buf"]
-    _k_bufs_at = pro["k_bufs_at"]
-    _v_bufs_at = pro["v_bufs_at"]
-    _k_lds_bufs = pro["k_lds_bufs"]
-    _v_lds_bufs = pro["v_lds_bufs"]
-    _kv_swap_delta = pro["kv_swap_delta"]
-    _SPLIT_STRIDE = pro["split_stride"]
-    _PSLOT = pro["pslot"]
-    block_x = pro["block_x"]
-    causal_off = pro["causal_off"]
-    num_tiles = pro["num_tiles"]
-    last_tile = pro["last_tile"]
-    start_tile = pro["start_tile"]
-    _tile_row0 = pro["tile_row0"]
-    _kv_valid = pro["kv_valid"]
-    _kv_drain = pro["kv_drain"]
-    q_frags = pro["q_frags"]
+    lane_idx = prologue["lane_idx"]
+    kv_head = prologue["kv_head"]
+    q_head_idx = prologue["q_head_idx"]
+    seq_idx = prologue["seq_idx"]
+    k_mgr = prologue["k_mgr"]
+    v_mgr = prologue["v_mgr"]
+    _kv_ctx = prologue["kv_ctx"]
+    _k_lds_buf = prologue["k_lds_buf"]
+    _k_bufs_at = prologue["k_bufs_at"]
+    _v_bufs_at = prologue["v_bufs_at"]
+    _k_lds_bufs = prologue["k_lds_bufs"]
+    _v_lds_bufs = prologue["v_lds_bufs"]
+    _kv_swap_delta = prologue["kv_swap_delta"]
+    _SPLIT_STRIDE = prologue["split_stride"]
+    _PHYSICAL_SLOT = prologue["physical_slot"]
+    m_tile_idx = prologue["m_tile_idx"]
+    causal_off = prologue["causal_off"]
+    num_tiles = prologue["num_tiles"]
+    last_tile_idx = prologue["last_tile_idx"]
+    start_tile_idx = prologue["start_tile_idx"]
+    _tile_row0 = prologue["tile_row0"]
+    _kv_valid = prologue["kv_valid"]
+    _kv_drain = prologue["kv_drain"]
+    q_frags = prologue["q_frags"]
 
     def _get_kv_desc(slot, row0, valid):
         """This half's BufferOpDescriptor for one tile: LO issues every K copy, HI every
@@ -1432,17 +1469,17 @@ def _core_attention_multi_kv_tiles(
     # Without a sink the first tile's corr zeroes the d seed, so d=1 would equal d=0 --
     # the no-sink path keeps d=0 to stay byte-for-byte.
     d_tiles = v_hdim // WMMA_M
-    R = num_q_tiles_per_wave
-    NKV = n_block // WMMA_N
-    # Per-q-tile carried state: [m, d, O, P_0 .. P_{NKV-1}]. P is the software pipeline --
-    # body u's PV consumes the P body u-1's softmax produced. The HI half runs softmax(u-1)
-    # before gemm(u), so its last NKV slots hold the f32 s_acc the next body's softmax
+    num_q_tiles = num_q_tiles_per_wave
+    num_kv_frags = n_block // WMMA_N
+    # Per-q-tile carried state: [m, d, O, P_0 .. P_{num_kv_frags-1}]. P is the software pipeline --
+    # body tile_idx's PV consumes the P body tile_idx-1's softmax produced. The HI half runs softmax(tile_idx-1)
+    # before gemm(tile_idx), so its last num_kv_frags slots hold the f32 s_acc the next body's softmax
     # consumes instead of the bf16 P; the slot count is the same. O is ONE wide vector:
     # the d_tiles accumulators travel the back edge as a single tuple (see _o_pack), which
     # the P slots do NOT, because the gemm ring produces and consumes them one at a time.
-    _QS = 2 + 1 + NKV
-    _lag_sm = not warp_type.is_lo
-    if _lag_sm:
+    _q_state_slots = 2 + 1 + num_kv_frags
+    _is_lagging_softmax = not warp_type.is_lo
+    if _is_lagging_softmax:
         # Rotating the drain to the body tail shifts this half's barrier stream by one:
         # it now opens with the phase barrier and closes with the drain. One filler here
         # (and its partner after the loop on the leading half) re-pairs the two streams
@@ -1451,30 +1488,31 @@ def _core_attention_multi_kv_tiles(
     if has_sink:
         num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
         m_init = [
-            _load_sink_logit(ptr_sink, q_head_idx[qt], num_heads_q) * fx.Float32(LOG2E)
-            for qt in range(R)
+            _load_sink_logit(ptr_sink, q_head_idx[q_tile_idx], num_heads_q)
+            * fx.Float32(LOG2E)
+            for q_tile_idx in range(num_q_tiles)
         ]
-        d_init = [fx.Float32(1.0) for _ in range(R)]
+        d_init = [fx.Float32(1.0) for _ in range(num_q_tiles)]
     else:
-        m_init = [fx.Float32(BIG_NEG) for _ in range(R)]
-        d_init = [fx.Float32(0.0) for _ in range(R)]
+        m_init = [fx.Float32(BIG_NEG) for _ in range(num_q_tiles)]
+        d_init = [fx.Float32(0.0) for _ in range(num_q_tiles)]
     # P == 0 makes the first body's PV the dead leading one (0 * V onto the zero O), so
     # no prologue QK/softmax trace is needed.
     _init = []
-    for qt in range(R):
+    for q_tile_idx in range(num_q_tiles):
         _init += (
             [
-                _raw(m_init[qt]),
-                _raw(d_init[qt]),
+                _raw(m_init[q_tile_idx]),
+                _raw(d_init[q_tile_idx]),
             ]
             + [_raw(fx.Vector.filled(8 * d_tiles, 0.0, fx.Float32))]
             + [
                 _raw(
                     fx.Vector.filled(8, float("-inf"), fx.Float32)
-                    if _lag_sm
+                    if _is_lagging_softmax
                     else fx.Vector.filled(8, 0.0, fx.Float32).to(elem_dtype)
                 )
-                for _ in range(NKV)
+                for _ in range(num_kv_frags)
             ]
         )
 
@@ -1483,36 +1521,36 @@ def _core_attention_multi_kv_tiles(
     # writes tile i+2 at byte base 2. Rotation is pure register renaming, so no runtime
     # "% N_KV_PP" is ever evaluated. The per-manager base count is carried generically. ----
     k_lds_ld = [
-        k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(_PSLOT[i]), lane_idx=lane_idx)
+        k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(_PHYSICAL_SLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
     ]
     v_lds_ld = [
-        v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(_PSLOT[i]), lane_idx=lane_idx)
+        v_mgr.ds_load_ptrs(ptr_lds=_v_lds_bufs(_PHYSICAL_SLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
     ]
-    _NKB = len(k_lds_ld[0])  # ds bases per K buffer (one per LDS split)
-    _NVB = len(v_lds_ld[0])
-    _PTR_BASE = len(_init)
+    _num_k_bases = len(k_lds_ld[0])  # ds bases per K buffer (one per LDS split)
+    _num_v_bases = len(v_lds_ld[0])
+    _k_bases_idx = len(_init)
     for i in range(N_KV_PP):
         _init = _init + k_lds_ld[i]
-    _VB0 = len(_init)
+    _v_bases_idx = len(_init)
     for i in range(N_KV_PP):
         _init = _init + v_lds_ld[i]
-    _SLOT_BASE = len(_init)
-    _init = _init + [_raw(_k_lds_buf(_PSLOT[i])) for i in range(N_KV_PP)]
+    _slot_bases_idx = len(_init)
+    _init = _init + [_raw(_k_lds_buf(_PHYSICAL_SLOT[i])) for i in range(N_KV_PP)]
 
-    # Carried ring head: _NH of the first body's V loads, issued here (slot 0 is resident
+    # Carried ring head: _num_head_carry of the first body's V loads, issued here (slot 0 is resident
     # -- the prologue fence just drained it) and thereafter at the end of each body.
-    _num_kfrag = k_mgr.num_ds_loads() // 2
-    _num_vfrag = v_mgr.num_ds_loads() // 2
-    _NP = _ring_num_prefetch(_num_vfrag + _num_kfrag, PVQK_RING, PVQK_LAG)
+    _num_k_frags = k_mgr.num_ds_loads() // 2
+    _num_v_frags = v_mgr.num_ds_loads() // 2
+    _num_prefetch = _ring_num_prefetch(_num_v_frags + _num_k_frags, PVQK_RING, PVQK_LAG)
     # The lagging half opens its body with softmax, so its ring head is issued there and
     # consumed after the barrier -- within one body, nothing to carry.
-    _NH = 0 if _lag_sm else min(PVQK_HEAD_CARRY, _NP)
-    assert _NH <= 2 * _num_vfrag, "carried head must be V loads only"
-    _HEAD_BASE = len(_init)
+    _num_head_carry = 0 if _is_lagging_softmax else min(PVQK_HEAD_CARRY, _num_prefetch)
+    assert _num_head_carry <= 2 * _num_v_frags, "carried head must be V loads only"
+    _head_carry_idx = len(_init)
     _seed_head = []
-    for j in range(_NH):
+    for j in range(_num_head_carry):
         # Same per-pair pin as ``_issue_head`` in the body.
         _seed_head.append(_raw(v_mgr.load_one_to_reg(v_lds_ld[0], j)))
         if len(_seed_head) % 2 == 0:
@@ -1521,96 +1559,116 @@ def _core_attention_multi_kv_tiles(
 
     # ========================================================================
     # Main KV loop -- SOFTWARE-PIPELINED by one tile. The loop variable ``u`` is the
-    # SOFTMAX tile, and body u runs
+    # SOFTMAX tile, and body tile_idx runs
     #
-    #     PV(u-1)  ->  QK(u)  ->  softmax(u)  ->  rescale O by corr(u)
+    #     PV(tile_idx-1)  ->  QK(tile_idx)  ->  softmax(tile_idx)  ->  rescale O by corr(tile_idx)
     #
     # carrying P across the back edge. That puts the two gemms back to back (a shared
-    # ring feeds both) and leaves exactly three live slots: V(u-1) in slot 0, K(u) in
-    # slot 1, tile u+1's copy landing in slot 2. Slots are selected by the carried ds
+    # ring feeds both) and leaves exactly three live slots: V(tile_idx-1) in slot 0, K(tile_idx) in
+    # slot 1, tile tile_idx+1's copy landing in slot 2. Slots are selected by the carried ds
     # pointers / bases, left-rotated at the end of each `main_loop`.
     #
-    # u runs [start_tile, num_tiles] -- ONE body more than there are tiles. Both extra
+    # tile_idx runs [start_tile_idx, num_tiles] -- ONE body more than there are tiles. Both extra
     # half-bodies are dead rather than peeled, an extra trace costing far more than an
-    # extra iteration: body start_tile's PV multiplies the seeded P == 0, and body
+    # extra iteration: body start_tile_idx's PV multiplies the seeded P == 0, and body
     # num_tiles' QK/softmax sits at kv_pos_base >= kv_len so every element masks to -inf
     # (m unchanged, corr == 1, P == 0, d unchanged).
     # ========================================================================
-    def main_loop(u, state, *, mask_left, mask_right, kv_len):
+    def main_loop(tile_idx, state, *, mask_left, mask_right, kv_len):
         # mask_left/mask_right/kv_len shadow the closure flags: the caller splits the
         # tile stream into a mask-free clean region + boundary loops and passes None for
         # any edge this sub-loop provably doesn't cross. The split points are already
         # expressed in SOFTMAX tiles, so they carry over unchanged. The lagging half runs
-        # softmax one tile behind its gemm, hence u-1.
-        sm_tile = u - fx.Int32(1) if _lag_sm else u
-        kv_tile_start = sm_tile * fx.Int32(
+        # softmax one tile behind its gemm, hence tile_idx-1.
+        softmax_tile_idx = tile_idx - fx.Int32(1) if _is_lagging_softmax else tile_idx
+        kv_tile_start = softmax_tile_idx * fx.Int32(
             n_block
         )  # softmax tile's first (batch-relative) kv row
 
-        # Unpack: R independent per-q-tile (m, d, O, P) groups, then the shared ds state.
-        m_prev = [fx.Float32(state[qt * _QS + 0]) for qt in range(R)]
-        d_prev = [fx.Float32(state[qt * _QS + 1]) for qt in range(R)]
-        o_acc = [
-            _o_unpack(fx.Vector(state[qt * _QS + 2]), d_tiles) for qt in range(R)
+        # Unpack: num_q_tiles independent per-q-tile (m, d, O, P) groups, then the shared ds state.
+        m_prev = [
+            fx.Float32(state[q_tile_idx * _q_state_slots + 0])
+            for q_tile_idx in range(num_q_tiles)
         ]
-        # Carried gemm/softmax hand-off: P(u-1) on the leading half, S(u-1) on the
+        d_prev = [
+            fx.Float32(state[q_tile_idx * _q_state_slots + 1])
+            for q_tile_idx in range(num_q_tiles)
+        ]
+        o_acc = [
+            _o_unpack(fx.Vector(state[q_tile_idx * _q_state_slots + 2]), d_tiles)
+            for q_tile_idx in range(num_q_tiles)
+        ]
+        # Carried gemm/softmax hand-off: P(tile_idx-1) on the leading half, S(tile_idx-1) on the
         # lagging one (same slot count, different element type).
         carry_prev = [
-            [fx.Vector(state[qt * _QS + 3 + kvt]) for kvt in range(NKV)]
-            for qt in range(R)
+            [
+                fx.Vector(state[q_tile_idx * _q_state_slots + 3 + kv_frag_idx])
+                for kv_frag_idx in range(num_kv_frags)
+            ]
+            for q_tile_idx in range(num_q_tiles)
         ]
         k_slots = [
-            list(state[_PTR_BASE + i * _NKB : _PTR_BASE + (i + 1) * _NKB])
+            list(
+                state[
+                    _k_bases_idx
+                    + i * _num_k_bases : _k_bases_idx
+                    + (i + 1) * _num_k_bases
+                ]
+            )
             for i in range(N_KV_PP)
         ]
         v_slots = [
-            list(state[_VB0 + i * _NVB : _VB0 + (i + 1) * _NVB]) for i in range(N_KV_PP)
+            list(
+                state[
+                    _v_bases_idx
+                    + i * _num_v_bases : _v_bases_idx
+                    + (i + 1) * _num_v_bases
+                ]
+            )
+            for i in range(N_KV_PP)
         ]
-        slot_of = [fx.Int32(state[_SLOT_BASE + i]) for i in range(N_KV_PP)]
-        head_carry = [fx.Vector(state[_HEAD_BASE + i]) for i in range(_NH)]
-        v_curr = v_slots[0]  # tile u-1: this body's PV
-        k_curr = k_slots[1]  # tile u:   this body's QK
+        slot_of = [fx.Int32(state[_slot_bases_idx + i]) for i in range(N_KV_PP)]
+        head_carry = [
+            fx.Vector(state[_head_carry_idx + i]) for i in range(_num_head_carry)
+        ]
+        v_curr = v_slots[0]  # tile tile_idx-1: this body's PV
+        k_curr = k_slots[1]  # tile tile_idx:   this body's QK
 
         # Tile prefetched by this body, CLAMPED to the last tile rather than guarded off
         # past the end. Every body then issues exactly one tile's copies, so the fence
         # count is uniform and the last iteration needs no peel -- cheaper than the extra
         # trace a peel costs, against ~2 dead L2-resident tile loads per workgroup. The
         # clamped re-load lands in the slot body num_tiles reads as its dead K, and O
-        # stages past all the slots. Both halves copy tile u+1 into slot 2 -- K and V
-        # occupy disjoint chunks of it, and the slot last held tile u-2, dead since body
-        # u-2 -- so the distance is the same on both and the slot arithmetic has no half
+        # stages past all the slots. Both halves copy tile tile_idx+1 into slot 2 -- K and V
+        # occupy disjoint chunks of it, and the slot last held tile tile_idx-2, dead since body
+        # tile_idx-2 -- so the distance is the same on both and the slot arithmetic has no half
         # to branch on.
-        wr_slot = slot_of[N_KV_PP - 1]
-        pf_tile = u + fx.Int32(1)
-        pf_row0 = _tile_row0(pf_tile)
-        pf_valid = _kv_valid(pf_tile)
+        write_slot = slot_of[N_KV_PP - 1]
+        prefetch_tile_idx = tile_idx + fx.Int32(1)
+        prefetch_row0 = _tile_row0(prefetch_tile_idx)
+        prefetch_valid = _kv_valid(prefetch_tile_idx)
 
         def _drain_barrier():
             # Both halves have exactly one copy outstanding and the next body reads it, so
             # both drain to 0: there is nothing older to leave in flight.
             #
-            # dscnt is drained only to _NH: the leading half issues its ring head at the
+            # dscnt is drained only to _num_head_carry: the leading half issues its ring head at the
             # tail of the previous body, so a full drain here would retire it right before
             # the gemm that wants it in flight. The gemm's own last ring fragment already
             # took dscnt to 0, so every read older than the head is retired regardless --
             # the WAR wall for the slot about to be written still holds.
-            _kv_fence(*_kv_drain, num_dscnt=_NH)
+            _kv_fence(*_kv_drain, num_dscnt=_num_head_carry)
 
         # This half's descriptor for tile ``pf``'s K (LO) or V (HI) into the oldest slot.
         # Built up front: pure, so its address VALU overlaps the drain; only the copy
         # itself must stay after the barrier.
-        pf_desc = _get_kv_desc(wr_slot, pf_row0, pf_valid)
-        num_kfrag = k_mgr.num_ds_loads() // 2
-        num_vfrag = v_mgr.num_ds_loads() // 2
+        prefetch_desc = _get_kv_desc(write_slot, prefetch_row0, prefetch_valid)
 
         def _k_emit(j):
             return k_mgr.load_one_to_reg(k_curr, j)
 
         def _v_emit(j):
             return v_mgr.load_one_to_reg(v_curr, j)
-
-        def _pvqk_emit(j):
-            return _v_emit(j) if j < 2 * num_vfrag else _k_emit(j - 2 * num_vfrag)
 
         def _issue_head(emit, first, last, carried=()):
             # Pin every fragment's load PAIR in place. The ring consumes loads 2i and
@@ -1626,23 +1684,23 @@ def _core_attention_multi_kv_tiles(
             return out
 
         def _pvqk_head():
-            # The first _NH loads came from the previous body (issued under its softmax);
+            # The first _num_head_carry loads came from the previous body (issued under its softmax);
             # only the remainder is issued here.
-            return _issue_head(_v_emit, _NH, _NP, head_carry)
+            return _issue_head(_v_emit, _num_head_carry, _num_prefetch, head_carry)
 
         def _softmax_phase(s_in, o_in):
-            # This lane's query (tile qt) attends [q_min, q_max] in batch-relative kv.
+            # This lane's query (tile q_tile_idx) attends [q_min, q_max] in batch-relative kv.
             # None bounds are skipped, so a clean-region tile passes all-None and does
             # zero per-element masking. kv_len is passed only on the right-boundary
-            # sub-loop, which is also what neutralizes the dead trailing softmax. All R
+            # sub-loop, which is also what neutralizes the dead trailing softmax. All num_q_tiles
             # q-tiles go in ONE call so their tree reductions emit interleaved.
             q_max_list = [
-                seq_idx[qt] + causal_off + window_right if mask_right else None
-                for qt in range(R)
+                seq_idx[q_tile_idx] + causal_off + window_right if mask_right else None
+                for q_tile_idx in range(num_q_tiles)
             ]
             q_min_list = [
-                seq_idx[qt] + causal_off - window_left if mask_left else None
-                for qt in range(R)
+                seq_idx[q_tile_idx] + causal_off - window_left if mask_left else None
+                for q_tile_idx in range(num_q_tiles)
             ]
             p_list, m_new_list, d_new_list, corr_list, rescale_masks = _softmax(
                 s_list=s_in,
@@ -1661,30 +1719,36 @@ def _core_attention_multi_kv_tiles(
             # rescales at the END of the body and the next body's PV accumulates onto the
             # result; the lagging half rescales before its own PV. Same product either way.
             # Under deferral the wide multiply is gated behind a non-divergent scf.if that
-            # fires only when a running max actually moved, with ONE branch covering all R
+            # fires only when a running max actually moved, with ONE branch covering all num_q_tiles
             # rows -- neither row moves in the common case, so the steady state is a single
             # not-taken s_cbranch_vccz, and a row that stayed stale has corr == 1 exactly,
             # making its rescale inside the taken branch the identity.
             corr_vecs = [
-                fx.Vector.from_elements([corr_list[qt]], fx.Float32).broadcast_to(8)
-                for qt in range(R)
+                fx.Vector.from_elements(
+                    [corr_list[q_tile_idx]], fx.Float32
+                ).broadcast_to(8)
+                for q_tile_idx in range(num_q_tiles)
             ]
             o_vecs = [
-                [fx.Vector(_ir(o_in[qt][dt])) for dt in range(d_tiles)]
-                for qt in range(R)
+                [
+                    fx.Vector(_ir(o_in[q_tile_idx][d_tile_idx]))
+                    for d_tile_idx in range(d_tiles)
+                ]
+                for q_tile_idx in range(num_q_tiles)
             ]
             if rescale_masks is None:
                 o_resc_list = [
-                    [ov * corr_vecs[qt] for ov in o_vecs[qt]] for qt in range(R)
+                    [ov * corr_vecs[q_tile_idx] for ov in o_vecs[q_tile_idx]]
+                    for q_tile_idx in range(num_q_tiles)
                 ]
             else:
                 # Folded HERE, not in _softmax: the ballots are VALU-produced SGPRs, so
                 # keeping the s_or/s_cmp at the use site leaves the whole row-max chain
                 # between the v_cmp and the turnaround. OR the raw masks, not the per-row
-                # booleans -- one s_or_b32 covers all R rows.
+                # booleans -- one s_or_b32 covers all num_q_tiles rows.
                 mask_any = rescale_masks[0]
-                for _m in rescale_masks[1:]:
-                    mask_any = mask_any | _m
+                for _mask in rescale_masks[1:]:
+                    mask_any = mask_any | _mask
 
                 @flyc.jit
                 def _maybe_rescale_all(o_flat_in, corr_flat, do_rescale):
@@ -1693,17 +1757,22 @@ def _core_attention_multi_kv_tiles(
                         result = [ov * cv for ov, cv in zip(o_flat_in, corr_flat)]
                     return result
 
-                # One flat list: the R rows share the folded condition, so they rescale
+                # One flat list: the num_q_tiles rows share the folded condition, so they rescale
                 # (or pass through) together.
                 o_flat = list(
                     _maybe_rescale_all(
                         [v for row in o_vecs for v in row],
-                        [corr_vecs[qt] for qt in range(R) for _ in range(d_tiles)],
+                        [
+                            corr_vecs[q_tile_idx]
+                            for q_tile_idx in range(num_q_tiles)
+                            for _ in range(d_tiles)
+                        ],
                         mask_any != fx.Int32(0),
                     )
                 )
                 o_resc_list = [
-                    o_flat[qt * d_tiles : (qt + 1) * d_tiles] for qt in range(R)
+                    o_flat[q_tile_idx * d_tiles : (q_tile_idx + 1) * d_tiles]
+                    for q_tile_idx in range(num_q_tiles)
                 ]
             return p_list, m_new_list, d_new_list, o_resc_list
 
@@ -1721,11 +1790,11 @@ def _core_attention_multi_kv_tiles(
                 _bare_barrier()
             rocdl.sched_barrier(0)
 
-        # GEMM2(u-1) then GEMM1(u) on one ring: O += P^T(u-1) @ V(u-1), then
-        # S^T = K(u) @ Q^T. sched_barrier fences the ring head out of the WMMA stream
+        # GEMM2(tile_idx-1) then GEMM1(tile_idx) on one ring: O += P^T(tile_idx-1) @ V(tile_idx-1), then
+        # S^T = K(tile_idx) @ Q^T. sched_barrier fences the ring head out of the WMMA stream
         # (no wmma<-ds_load bubble); the ring itself issues the per-fragment s_wait_dscnt.
-        if _lag_sm:
-            pf_desc.async_load()
+        if _is_lagging_softmax:
+            prefetch_desc.async_load()
             p_f32, m_new_list, d_new_list, o_resc = _softmax_phase(carry_prev, o_acc)
             # Head out BEFORE P is narrowed: it is ds_loads with no dependence on P, so
             # issuing it first puts the conversion in its shadow rather than behind it.
@@ -1755,7 +1824,7 @@ def _core_attention_multi_kv_tiles(
         else:
             _drain_barrier()
             pvqk_head = _pvqk_head()
-            pf_desc.async_load()
+            prefetch_desc.async_load()
             rocdl.sched_barrier(0)
             o_acc, s_list = _pv_qk_gemm(
                 v_emit=_v_emit,
@@ -1770,78 +1839,76 @@ def _core_attention_multi_kv_tiles(
             )
             _phase_barrier()
             carry_f32, m_new_list, d_new_list, o_out = _softmax_phase(s_list, o_acc)
-            # Next body's ring head: V(u) from the slot this body read K from, resident
+            # Next body's ring head: V(tile_idx) from the slot this body read K from, resident
             # and already fenced. Mirrors the lagging half -- both issue the head just
             # before the barrier preceding the gemm that consumes it, ahead of the
             # narrowing for the same reason.
             rocdl.sched_barrier(0)
             head_next = _issue_head(
-                lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _NH
+                lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _num_head_carry
             )
             rocdl.sched_barrier(0)
             carry_next = _p_to_elem(carry_f32, elem_dtype)
 
-        # Yield: R updated (m, d, O, P) groups, then the ds pointers and slot bases
-        # left-rotated by one so slot 0 holds tile u (next body's PV) and the oldest
+        # Yield: num_q_tiles updated (m, d, O, P) groups, then the ds pointers and slot bases
+        # left-rotated by one so slot 0 holds tile tile_idx (next body's PV) and the oldest
         # rotates into the write position.
         out = []
-        for qt in range(R):
+        for q_tile_idx in range(num_q_tiles):
             out += (
-                [_raw(m_new_list[qt]), _raw(d_new_list[qt])]
-                + [_raw(_o_pack(o_out[qt]))]
-                + [_raw(cv) for cv in carry_next[qt]]
+                [_raw(m_new_list[q_tile_idx]), _raw(d_new_list[q_tile_idx])]
+                + [_raw(_o_pack(o_out[q_tile_idx]))]
+                + [_raw(cv) for cv in carry_next[q_tile_idx]]
             )
-        rot = list(range(1, N_KV_PP)) + [0]
-        for i in rot:
+        rotation = list(range(1, N_KV_PP)) + [0]
+        for i in rotation:
             out += k_slots[i]
-        for i in rot:
+        for i in rotation:
             out += v_slots[i]
-        out += [_raw(slot_of[i]) for i in rot]
+        out += [_raw(slot_of[i]) for i in rotation]
         out += [_raw(h) for h in head_next]
         return out
 
-    # ---- Stream softmax tiles [start_tile, num_tiles] through 3 sub-loops split by the
-    # attention band, so interior tiles fully inside the band skip masking. clean_lo /
-    # clean_hi are runtime split points, but each sub-loop's mask on/off is COMPILE-TIME.
+    # ---- Stream softmax tiles [start_tile_idx, num_tiles] through 3 sub-loops split by the
+    # attention band, so interior tiles fully inside the band skip masking. clean_lo_idx /
+    # clean_hi_idx are runtime split points, but each sub-loop's mask on/off is COMPILE-TIME.
     # The rotation state threads continuously through all three, leaving the slot
     # assignment intact, and the bounds are already softmax-tile indices, so the pipeline
     # shift only extends the last loop by one body (the dead-QK one).
-    #   [start_tile, clean_lo)    left boundary   (emitted only when mask_left)
-    #   [clean_lo,   clean_hi)    clean, no mask
-    #   [clean_hi,   num_tiles+1) right boundary + kv_len tail + the dead trailing body
-    num_iter = fx.Int32(num_tiles) - start_tile
-
-    # clean_hi = first tile that could need RIGHT masking = the WG's earliest query's
-    # diagonal tile ((min q_max + 1)//n_block). Kept <= last_tile so the tail tile stays in
-    # the right loop, and >= start_tile for a valid partition.
+    #   [start_tile_idx, clean_lo_idx)    left boundary   (emitted only when mask_left)
+    #   [clean_lo_idx,   clean_hi_idx)    clean, no mask
+    #   [clean_hi_idx,   num_tiles+1) right boundary + kv_len tail + the dead trailing body
+    # clean_hi_idx = first tile that could need RIGHT masking = the WG's earliest query's
+    # diagonal tile ((min q_max + 1)//n_block). Kept <= last_tile_idx so the tail tile stays in
+    # the right loop, and >= start_tile_idx for a valid partition.
     if mask_right:
-        wg_min_seq = (block_x * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
+        wg_min_seq = (m_tile_idx * fx.Int32(BLOCK_M)) // fx.Int32(gqa_ratio)
         qmax_min = fx.max(wg_min_seq + causal_off + window_right, fx.Int32(0))
-        clean_hi = (qmax_min + fx.Int32(1)) // fx.Int32(n_block)
+        clean_hi_idx = (qmax_min + fx.Int32(1)) // fx.Int32(n_block)
     else:
-        clean_hi = fx.Int32(num_tiles)
-    clean_hi = fx.max(fx.min(clean_hi, last_tile), start_tile)
+        clean_hi_idx = fx.Int32(num_tiles)
+    clean_hi_idx = fx.max(fx.min(clean_hi_idx, last_tile_idx), start_tile_idx)
 
-    # clean_lo = first tile fully at/above the WG's latest query's window start
-    # (ceildiv(max q_min, n_block)); clamped into [start_tile, clean_hi].
+    # clean_lo_idx = first tile fully at/above the WG's latest query's window start
+    # (ceildiv(max q_min, n_block)); clamped into [start_tile_idx, clean_hi_idx].
     if mask_left:
         wg_max_seq = fx.min(
-            (block_x * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1))
+            (m_tile_idx * fx.Int32(BLOCK_M) + fx.Int32(BLOCK_M - 1))
             // fx.Int32(gqa_ratio),
             q_len - fx.Int32(1),
         )
         qmin_max = fx.max(wg_max_seq + causal_off - window_left, fx.Int32(0))
-        clean_lo = (qmin_max + fx.Int32(n_block - 1)) // fx.Int32(n_block)
+        clean_lo_idx = (qmin_max + fx.Int32(n_block - 1)) // fx.Int32(n_block)
     else:
-        clean_lo = start_tile
-    clean_lo = fx.min(fx.max(clean_lo, start_tile), clean_hi)
+        clean_lo_idx = start_tile_idx
+    clean_lo_idx = fx.min(fx.max(clean_lo_idx, start_tile_idx), clean_hi_idx)
     if mask_left:
-        # The lagging half's softmax tile is u-1, so the clean loop must start one body
-        # later or tile clean_lo-1 would cross the left edge unmasked. The left loop
+        # The lagging half's softmax tile is tile_idx-1, so the clean loop must start one body
+        # later or tile clean_lo_idx-1 would cross the left edge unmasked. The left loop
         # absorbs the extra body; over-masking a clean tile is a no-op. Only needed when
-        # a left loop exists at all -- with mask_left off, clean_lo == start_tile and
+        # a left loop exists at all -- with mask_left off, clean_lo_idx == start_tile_idx and
         # shifting would drop the first body entirely.
-        clean_lo = fx.min(clean_lo + fx.Int32(1), clean_hi)
+        clean_lo_idx = fx.min(clean_lo_idx + fx.Int32(1), clean_hi_idx)
 
     @flyc.jit
     def _run_tiles(state, lo_i32, hi_i32, *, mask_left, mask_right, kv_len):
@@ -1861,25 +1928,25 @@ def _core_attention_multi_kv_tiles(
     if mask_left:
         state = _run_tiles(
             state,
-            start_tile,
-            clean_lo,
+            start_tile_idx,
+            clean_lo_idx,
             mask_left=mask_left,
             mask_right=mask_right,
             kv_len=None,
         )
     state = _run_tiles(
-        state, clean_lo, clean_hi, mask_left=None, mask_right=None, kv_len=None
+        state, clean_lo_idx, clean_hi_idx, mask_left=None, mask_right=None, kv_len=None
     )
     state = _run_tiles(
         state,
-        clean_hi,
+        clean_hi_idx,
         fx.Int32(num_tiles) + fx.Int32(1),
         mask_left=mask_left,
         mask_right=mask_right,
         kv_len=kv_len,
     )
     final = state
-    if not _lag_sm:
+    if not _is_lagging_softmax:
         # Partner for the lagging half's prologue filler -- without it the two halves
         # disagree on the barrier count. It also orders this half's O stores against its
         # OWN last K reads: this half's last in-loop barrier is the PHASE one, which sits
@@ -1887,12 +1954,14 @@ def _core_attention_multi_kv_tiles(
         # wave 0 is still reading K out of it.
         _bare_barrier()
 
-    _o_free = [
-        fx.Int32(final[_SLOT_BASE + 2]),
-        fx.Int32(final[_SLOT_BASE + 0]),
+    _o_free_slots = [
+        fx.Int32(final[_slot_bases_idx + 2]),
+        fx.Int32(final[_slot_bases_idx + 0]),
     ]
     o_lds_warp = (
-        ((warp_idx & fx.Int32(1)) > fx.Int32(0)).select(_o_free[1], _o_free[0])
+        ((warp_idx & fx.Int32(1)) > fx.Int32(0)).select(
+            _o_free_slots[1], _o_free_slots[0]
+        )
         + ((warp_idx >> fx.Int32(1)) & fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
         + (warp_idx >> fx.Int32(2)) * fx.Int32(_SPLIT_STRIDE)
     )
@@ -1903,9 +1972,18 @@ def _core_attention_multi_kv_tiles(
     # chunk halves are shared by wave pairs.
     _kv_wait(*_kv_drain)
     return _epi_state(
-        m_list=[fx.Float32(final[qt * _QS + 0]) for qt in range(R)],
-        d_list=[fx.Float32(final[qt * _QS + 1]) for qt in range(R)],
-        o_list=[_o_unpack(fx.Vector(final[qt * _QS + 2]), d_tiles) for qt in range(R)],
+        m_list=[
+            fx.Float32(final[q_tile_idx * _q_state_slots + 0])
+            for q_tile_idx in range(num_q_tiles)
+        ],
+        d_list=[
+            fx.Float32(final[q_tile_idx * _q_state_slots + 1])
+            for q_tile_idx in range(num_q_tiles)
+        ],
+        o_list=[
+            _o_unpack(fx.Vector(final[q_tile_idx * _q_state_slots + 2]), d_tiles)
+            for q_tile_idx in range(num_q_tiles)
+        ],
         o_lds_warp=o_lds_warp,
     )
 
@@ -1969,15 +2047,14 @@ def _core_attention_one_kv_tile(
         gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave
     )
     _q_scale = softmax_scale * fx.Float32(LOG2E)
-    R = num_q_tiles_per_wave
-    d_tiles = v_hdim // WMMA_M
+    num_q_tiles = num_q_tiles_per_wave
 
     if USE_TDM_LOADER:
         q_mgr = QManager16bV2(
             qk_hdim=qk_hdim,
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
-            q_tiles_per_wave=R,
+            q_tiles_per_wave=num_q_tiles,
             elem_dtype=elem_dtype,
         )
         k_mgr = KManager16bV2(
@@ -1994,7 +2071,7 @@ def _core_attention_one_kv_tile(
             qk_hdim=qk_hdim,
             gqa_ratio=gqa_ratio,
             num_waves=NUM_WAVES,
-            q_tiles_per_wave=R,
+            q_tiles_per_wave=num_q_tiles,
             elem_dtype=elem_dtype,
         )
         k_mgr = KManager16bV1(
@@ -2008,9 +2085,14 @@ def _core_attention_one_kv_tile(
         )
     _SPLIT_STRIDE = 6 * LDS_CHUNK_BYTES
     slot_bytes = 2 * LDS_CHUNK_BYTES
-    for _who, _b in (("K", k_mgr.get_lds_size_in_byte()), ("V", v_mgr.get_lds_size_in_byte())):
-        assert _b % KV_LDS_SPLITS == 0 and _b // KV_LDS_SPLITS <= LDS_CHUNK_BYTES, (
-            f"{_who} split {_b // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
+    for _label, _bytes in (
+        ("K", k_mgr.get_lds_size_in_byte()),
+        ("V", v_mgr.get_lds_size_in_byte()),
+    ):
+        assert (
+            _bytes % KV_LDS_SPLITS == 0 and _bytes // KV_LDS_SPLITS <= LDS_CHUNK_BYTES
+        ), (
+            f"{_label} split {_bytes // KV_LDS_SPLITS}B exceeds the {LDS_CHUNK_BYTES}B chunk "
             f"(qk_hdim={qk_hdim}, v_hdim={v_hdim}, n_block={n_block})"
         )
     assert q_mgr.warp_lds_size_in_byte() <= LDS_QO_BYTES
@@ -2019,19 +2101,19 @@ def _core_attention_one_kv_tile(
     k_buf = lds_base
     v_buf = lds_base + fx.Int32(LDS_CHUNK_BYTES)
     assert KV_LDS_SPLITS == 2, "parity order needs a 2-way split"
-    _odd = warp_idx & fx.Int32(1)
-    _rd0 = _odd * fx.Int32(_SPLIT_STRIDE)
-    _rd = [_rd0, fx.Int32(_SPLIT_STRIDE) - _rd0]
-    _kv_swap_delta = _odd * fx.Int32(n_block // 2)
+    _is_odd_warp = warp_idx & fx.Int32(1)
+    _read_order_lo = _is_odd_warp * fx.Int32(_SPLIT_STRIDE)
+    _read_order = [_read_order_lo, fx.Int32(_SPLIT_STRIDE) - _read_order_lo]
+    _kv_swap_delta = _is_odd_warp * fx.Int32(n_block // 2)
 
     def _split_bufs(b):
-        return [b + o for o in _rd]
+        return [b + o for o in _read_order]
 
-    _q_chunk_b = (warp_idx & fx.Int32(1)) ^ ((warp_idx >> fx.Int32(2)) & fx.Int32(1))
+    _q_chunk_sel = (warp_idx & fx.Int32(1)) ^ ((warp_idx >> fx.Int32(2)) & fx.Int32(1))
     q_lds_warp = (
         lds_base
         + fx.Int32(slot_bytes)
-        + _q_chunk_b * fx.Int32(_SPLIT_STRIDE)
+        + _q_chunk_sel * fx.Int32(_SPLIT_STRIDE)
         + (warp_idx >> fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
     )
     q_mgr.load_q_to_vgpr_part1(
@@ -2047,11 +2129,11 @@ def _core_attention_one_kv_tile(
         ptr_lds_warp=q_lds_warp,
     )
 
-    block_x, causal_off, kv_len_wg, _ = _wg_kv_span(
+    _, causal_off, kv_len_wg, _ = _wg_kv_span(
         n_block=n_block,
         mask_right=mask_right,
         gqa_ratio=gqa_ratio,
-        num_q_tiles_per_wave=R,
+        num_q_tiles_per_wave=num_q_tiles,
         q_len=q_len,
         kv_len=kv_len,
         window_right=window_right,
@@ -2092,8 +2174,8 @@ def _core_attention_one_kv_tile(
             v_desc.async_load()
 
     _is_lo = warp_idx < fx.Int32(NUM_WAVES // 2)
-    _num_tdm = max(k_desc.tensorcnt, v_desc.tensorcnt) or -1
-    _num_async = max(k_desc.asynccnt, v_desc.asynccnt) or -1
+    _num_tdm_copies = max(k_desc.tensorcnt, v_desc.tensorcnt) or -1
+    _num_async_copies = max(k_desc.asynccnt, v_desc.asynccnt) or -1
     if USE_TDM_LOADER:
         # The tile misses Q's chunks entirely, so it goes out before Q is read and its
         # global latency overlaps Q's. Waves differ in how many copies they issued, so
@@ -2107,7 +2189,7 @@ def _core_attention_one_kv_tile(
         _issue_kv(_is_lo)
     # The only barrier in the body: a wave's counters bound its own copies, so this is
     # what publishes the tile to the other seven.
-    _kv_fence(*_kv_drain_depths(_num_tdm, _num_async))
+    _kv_fence(*_kv_drain_depths(_num_tdm_copies, _num_async_copies))
 
     k_lds = k_mgr.ds_load_ptrs(ptr_lds=_split_bufs(k_buf), lane_idx=lane_idx)
     v_lds = v_mgr.ds_load_ptrs(ptr_lds=_split_bufs(v_buf), lane_idx=lane_idx)
@@ -2121,20 +2203,20 @@ def _core_attention_one_kv_tile(
     _, s_list = _pv_qk_gemm(
         v_emit=None,
         k_emit=_k_emit,
-        p_list=[[] for _ in range(R)],
+        p_list=[[] for _ in range(num_q_tiles)],
         q_frags_list=q_frags,
         v_hdim=v_hdim,
         n_block=n_block,
         warp_type=WarpType.LO,
-        o_acc_list=[[] for _ in range(R)],
+        o_acc_list=[[] for _ in range(num_q_tiles)],
         phase="qk",
     )
 
     # PV's ring head goes out before softmax so its LDS latency hides under the VALU.
-    _NP = _ring_num_prefetch(v_mgr.num_ds_loads() // 2, PVQK_RING, PVQK_LAG)
+    _num_prefetch = _ring_num_prefetch(v_mgr.num_ds_loads() // 2, PVQK_RING, PVQK_LAG)
     rocdl.sched_barrier(0)
     pv_head = []
-    for j in range(_NP):
+    for j in range(_num_prefetch):
         pv_head.append(_v_emit(j))
         if len(pv_head) % 2 == 0:
             rocdl.sched_barrier(0)
@@ -2143,13 +2225,14 @@ def _core_attention_one_kv_tile(
     if has_sink:
         num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
         m_prev = [
-            _load_sink_logit(ptr_sink, q_head_idx[qt], num_heads_q) * fx.Float32(LOG2E)
-            for qt in range(R)
+            _load_sink_logit(ptr_sink, q_head_idx[q_tile_idx], num_heads_q)
+            * fx.Float32(LOG2E)
+            for q_tile_idx in range(num_q_tiles)
         ]
-        d_prev = [fx.Float32(1.0) for _ in range(R)]
+        d_prev = [fx.Float32(1.0) for _ in range(num_q_tiles)]
     else:
-        m_prev = [fx.Float32(BIG_NEG) for _ in range(R)]
-        d_prev = [fx.Float32(0.0) for _ in range(R)]
+        m_prev = [fx.Float32(BIG_NEG) for _ in range(num_q_tiles)]
+        d_prev = [fx.Float32(0.0) for _ in range(num_q_tiles)]
     # This tile is both the first and the last, so it always carries the kv_len tail and
     # O needs no rescale: the seed is 0 and corr*0 == 0 whatever the running max does.
     p_f32, m_new_list, d_new_list, _corr, _masks = _softmax(
@@ -2161,12 +2244,12 @@ def _core_attention_one_kv_tile(
         kv_pos_base=fx.Int32(0),
         kv_swap_delta=_kv_swap_delta,
         q_max_list=[
-            seq_idx[qt] + causal_off + window_right if mask_right else None
-            for qt in range(R)
+            seq_idx[q_tile_idx] + causal_off + window_right if mask_right else None
+            for q_tile_idx in range(num_q_tiles)
         ],
         q_min_list=[
-            seq_idx[qt] + causal_off - window_left if mask_left else None
-            for qt in range(R)
+            seq_idx[q_tile_idx] + causal_off - window_left if mask_left else None
+            for q_tile_idx in range(num_q_tiles)
         ],
         kv_len=kv_len,
     )
@@ -2189,7 +2272,7 @@ def _core_attention_one_kv_tile(
     # never touched by the tile in slot 0. Nothing is in flight and no wave can still be
     # reading them, so the epilogue needs neither a drain nor a rendezvous.
     o_lds_warp = (
-        (_odd > fx.Int32(0)).select(
+        (_is_odd_warp > fx.Int32(0)).select(
             lds_base + fx.Int32(2 * slot_bytes), lds_base + fx.Int32(slot_bytes)
         )
         + ((warp_idx >> fx.Int32(1)) & fx.Int32(1)) * fx.Int32(LDS_QO_BYTES)
@@ -2206,8 +2289,10 @@ def _o_manager(*, v_hdim, gqa_ratio, num_q_tiles_per_wave, elem_dtype):
     Two waves share a chunk at 0 and LDS_QO_BYTES, and the upper one must stop short of
     the next chunk -- that clearance is what keeps O off the V rows a dead carried ring
     head may still be reading."""
-    _OMgr = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[O_VARIANT]
-    o_mgr = _OMgr(
+    _o_manager_cls = {"v1": OManager16bV1, "v2": OManager16bV2, "v3": OManager16bV3}[
+        O_VARIANT
+    ]
+    o_mgr = _o_manager_cls(
         v_hdim=v_hdim,
         gqa_ratio=gqa_ratio,
         num_waves=NUM_WAVES,
@@ -2228,14 +2313,14 @@ def _store_o_lse(
     d_list,
     o_list,
     d_tiles,
-    R,
+    num_q_tiles,
     ptr_O,
     stride_o_seq,
     stride_o_head,
     q_start,
     q_len,
     kv_head,
-    block_x,
+    m_tile_idx,
     warp_idx,
     lane_idx,
     o_lds_warp,
@@ -2248,24 +2333,24 @@ def _store_o_lse(
     stride_lse_seq,
     stride_lse_head,
 ):
-    """Normalize, stage and store O (and optionally LSE) for this wave's R q-tiles.
+    """Normalize, stage and store O (and optionally LSE) for this wave's num_q_tiles q-tiles.
 
     Shared tail of both compute cores; ``o_lds_warp`` is the caller's choice of which
     finished KV chunk this wave stages through."""
-    for qt in range(R):
+    for q_tile_idx in range(num_q_tiles):
         # Normalize this q-tile's O by its running denom d, then reshape+store to VRAM.
-        # o_final[dt] lane l elem si = sum_kv P[q,kv] V[kv, dt*16+(l//16)*8+si]
+        # o_final[d_tile_idx] lane l elem si = sum_kv P[q,kv] V[kv, d_tile_idx*16+(l//16)*8+si]
         # (unnormalized); divide by the per-query denom d (peer-consistent across the
         # lane pair) to finish softmax. OManager16b masks rows with seq >= q_len.
-        d_final = d_list[qt]
-        o_final = o_list[qt]
+        d_final = d_list[q_tile_idx]
+        o_final = o_list[q_tile_idx]
         # Fully-masked row (d_final==0): 1/0=inf, o_final=0, 0*inf=NaN -> guard to O=0.
-        inv = (d_final > fx.Float32(0.0)).select(
+        inv_denom = (d_final > fx.Float32(0.0)).select(
             fx.Float32(1.0) / d_final, fx.Float32(0.0)
         )
-        inv_vec = fx.Vector.from_elements([inv], fx.Float32).broadcast_to(8)
-        o_norm = [o_final[dt] * inv_vec for dt in range(d_tiles)]
-        if qt > 0:
+        inv_denom_vec = fx.Vector.from_elements([inv_denom], fx.Float32).broadcast_to(8)
+        o_norm = [o_final[d_tile_idx] * inv_denom_vec for d_tile_idx in range(d_tiles)]
+        if q_tile_idx > 0:
             rocdl.s_wait_dscnt(0)  # drain prev q-tile's O ring/DS ops before reuse
         o_mgr.store_o_to_vram(
             ptr_O=ptr_O,
@@ -2275,34 +2360,34 @@ def _store_o_lse(
             q_start=q_start,
             q_len=q_len,
             kv_head=kv_head,
-            block_x=block_x,
+            block_x=m_tile_idx,
             warp_idx=warp_idx,
             lane_idx=lane_idx,
             ptr_lds_warp=o_lds_warp,
             o_frags=o_norm,
-            qtile=qt,
+            qtile=q_tile_idx,
         )
 
     # ---- LSE store (optional). LSE = (m_final + log2(d_final)) / LOG2E: m is carried in
     # log2 units of the scaled score and d is domain-free, so one multiply converts both,
     # matching torch.logsumexp(scale * Q @ K^T, dim=kv). The lane pair (l, l^16) holds
-    # each query identically, so store once from the khalf==0 lanes, masked by
+    # each query identically, so store once from the kv_half_idx==0 lanes, masked by
     # seq < q_len; buffer_store redirects mask-drops to byte 0x7FFFFFFF.
     if return_lse:
         khalf0 = (lane_idx // fx.Int32(WMMA_M)) == fx.Int32(0)
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
-        for qt in range(R):
-            m_final = m_list[qt]
-            d_final = d_list[qt]
+        for q_tile_idx in range(num_q_tiles):
+            m_final = m_list[q_tile_idx]
+            d_final = d_list[q_tile_idx]
             # fx.log2 lowers to the HW v_log_f32 (base-2), matching m's log2 domain.
             lse_val = (m_final + fx.log2(d_final)) * fx.Float32(1.0 / LOG2E)
-            lse_mask = khalf0 & (seq_idx[qt] < q_len)
+            lse_mask = khalf0 & (seq_idx[q_tile_idx] < q_len)
             lse_off_el = (
                 lse_base_elems
-                + seq_idx[qt] * stride_lse_seq
-                + q_head_idx[qt] * stride_lse_head
+                + seq_idx[q_tile_idx] * stride_lse_seq
+                + q_head_idx[q_tile_idx] * stride_lse_head
             )
             # Pre-mask the offset (OOB rows -> 0x7fffffff) and pass mask=None so the
             # store maps 1:1 to a single buffer_store with masking already SSA-visible.
@@ -2315,7 +2400,7 @@ def _store_o_lse(
 
 
 # Keys ``_epilogue_attention`` shares with the compute cores' kwarg dict.
-_EPI_KEYS = (
+_EPILOGUE_KEYS = (
     "v_hdim",
     "gqa_ratio",
     "num_q_tiles_per_wave",
@@ -2337,8 +2422,10 @@ _EPI_KEYS = (
 def _epi_state(*, m_list, d_list, o_list, o_lds_warp):
     """Flatten a core's finished softmax/O state into scf.if-yieldable raw values."""
     out = []
-    for qt in range(len(m_list)):
-        out += [_raw(m_list[qt]), _raw(d_list[qt])] + [_raw(v) for v in o_list[qt]]
+    for q_tile_idx in range(len(m_list)):
+        out += [_raw(m_list[q_tile_idx]), _raw(d_list[q_tile_idx])] + [
+            _raw(v) for v in o_list[q_tile_idx]
+        ]
     return out + [_raw(o_lds_warp)]
 
 
@@ -2346,13 +2433,13 @@ def _epi_state_zeros(*, num_q_tiles_per_wave, v_hdim):
     """Type exemplar for the warp-type scf.if. Both branches overwrite it, so the
     constants are dead; the rewriter needs the names bound before the branch."""
     d_tiles = v_hdim // WMMA_M
-    R = num_q_tiles_per_wave
+    num_q_tiles = num_q_tiles_per_wave
     return _epi_state(
-        m_list=[fx.Float32(0.0) for _ in range(R)],
-        d_list=[fx.Float32(0.0) for _ in range(R)],
+        m_list=[fx.Float32(0.0) for _ in range(num_q_tiles)],
+        d_list=[fx.Float32(0.0) for _ in range(num_q_tiles)],
         o_list=[
             [fx.Vector.filled(8, 0.0, fx.Float32) for _ in range(d_tiles)]
-            for _ in range(R)
+            for _ in range(num_q_tiles)
         ],
         o_lds_warp=fx.Int32(0),
     )
@@ -2385,11 +2472,11 @@ def _epilogue_attention(
     plus the LDS chunk this wave stages O through -- and everything else here is a pure
     function of the launch, so the warp-type scf.if can close before it."""
     d_tiles = v_hdim // WMMA_M
-    R = num_q_tiles_per_wave
-    _QE = 2 + d_tiles
+    num_q_tiles = num_q_tiles_per_wave
+    _q_epi_slots = 2 + d_tiles
     lane_idx = _lane_id()
     kv_head, q_head_idx, seq_idx = _packed_tile_indices(
-        gqa_ratio, warp_idx, lane_idx, R
+        gqa_ratio, warp_idx, lane_idx, num_q_tiles
     )
     if rendezvous:
         # O's chunk halves are shared by wave pairs and still hold the trailing dead KV
@@ -2399,27 +2486,36 @@ def _epilogue_attention(
         o_mgr=_o_manager(
             v_hdim=v_hdim,
             gqa_ratio=gqa_ratio,
-            num_q_tiles_per_wave=R,
+            num_q_tiles_per_wave=num_q_tiles,
             elem_dtype=elem_dtype,
         ),
-        m_list=[fx.Float32(epi_state[qt * _QE + 0]) for qt in range(R)],
-        d_list=[fx.Float32(epi_state[qt * _QE + 1]) for qt in range(R)],
+        m_list=[
+            fx.Float32(epi_state[q_tile_idx * _q_epi_slots + 0])
+            for q_tile_idx in range(num_q_tiles)
+        ],
+        d_list=[
+            fx.Float32(epi_state[q_tile_idx * _q_epi_slots + 1])
+            for q_tile_idx in range(num_q_tiles)
+        ],
         o_list=[
-            [fx.Vector(epi_state[qt * _QE + 2 + dt]) for dt in range(d_tiles)]
-            for qt in range(R)
+            [
+                fx.Vector(epi_state[q_tile_idx * _q_epi_slots + 2 + d_tile_idx])
+                for d_tile_idx in range(d_tiles)
+            ]
+            for q_tile_idx in range(num_q_tiles)
         ],
         d_tiles=d_tiles,
-        R=R,
+        num_q_tiles=num_q_tiles,
         ptr_O=ptr_O,
         stride_o_seq=stride_o_seq,
         stride_o_head=stride_o_head,
         q_start=q_start,
         q_len=q_len,
         kv_head=kv_head,
-        block_x=_m_tile_idx(),
+        m_tile_idx=_m_tile_idx(),
         warp_idx=warp_idx,
         lane_idx=lane_idx,
-        o_lds_warp=fx.Int32(epi_state[R * _QE]),
+        o_lds_warp=fx.Int32(epi_state[num_q_tiles * _q_epi_slots]),
         seq_idx=seq_idx,
         q_head_idx=q_head_idx,
         return_lse=return_lse,
@@ -2454,12 +2550,12 @@ def _zero_fill_attention(
     this WG's valid query rows and LSE=-inf -- or LSE=sink[head] with a sink, exp(sink)
     being the only surviving term. Flat coalesced b128 write, no WMMA layout."""
     BLOCK_M = _block_m(num_q_tiles_per_wave)
-    tid = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
+    thread_idx = _warp_id() * fx.Int32(WAVE_SIZE) + _lane_id()
     kv_head = fx.Int32(gpu.block_id("y"))
     row0 = _m_tile_idx() * fx.Int32(BLOCK_M)
     g = fx.Int32(gqa_ratio)
-    _CH = 8  # bf16 per b128 store
-    cpr = v_hdim // _CH  # b128 chunks per O row
+    _chunk_elems = 8  # bf16 per b128 store
+    num_chunks_per_row = v_hdim // _chunk_elems  # b128 chunks per O row
 
     # i64: an i32 product (large total_q * stride) can overflow negative, then the
     # descriptor sign-extends it to a huge bound, defeating the 0x7FFFFFFF OOB drop.
@@ -2469,13 +2565,15 @@ def _zero_fill_attention(
     o_rsrc = buffer_ops.create_buffer_resource(
         ptr_O, num_records_bytes=o_num_records_bytes
     )
-    zero_o = fx.Vector.filled(_CH, 0.0, elem_dtype)
-    for r in range(BLOCK_M * cpr // BLOCK_SIZE):
-        cix = fx.Int32(r * BLOCK_SIZE) + tid  # flat b128-chunk index this round
-        prow = row0 + cix // fx.Int32(cpr)
-        d = (cix % fx.Int32(cpr)) * fx.Int32(_CH)
-        seq = prow // g
-        head = kv_head * g + prow % g
+    zero_o = fx.Vector.filled(_chunk_elems, 0.0, elem_dtype)
+    for r in range(BLOCK_M * num_chunks_per_row // BLOCK_SIZE):
+        chunk_idx = (
+            fx.Int32(r * BLOCK_SIZE) + thread_idx
+        )  # flat b128-chunk index this round
+        packed_row_idx = row0 + chunk_idx // fx.Int32(num_chunks_per_row)
+        d = (chunk_idx % fx.Int32(num_chunks_per_row)) * fx.Int32(_chunk_elems)
+        seq = packed_row_idx // g
+        head = kv_head * g + packed_row_idx % g
         off = (q_start + seq) * stride_o_seq + head * stride_o_head + d
         off_masked = (seq < q_len).select(off * fx.Int32(2), fx.Int32(0x7FFFFFFF))
         buffer_ops.buffer_store(
@@ -2486,9 +2584,9 @@ def _zero_fill_attention(
         lse_rsrc = buffer_ops.create_buffer_resource(
             ptr_LSE, num_records_bytes=lse_num_records_bytes
         )
-        prow = row0 + tid  # one LSE per packed row, one row per thread
-        seq = prow // g
-        head = kv_head * g + prow % g
+        packed_row_idx = row0 + thread_idx  # one LSE per packed row, one row per thread
+        seq = packed_row_idx // g
+        head = kv_head * g + packed_row_idx % g
         if has_sink:
             num_heads_q = gpu.grid_dim.y * g
             lse_val = _load_sink_logit(ptr_sink, head, num_heads_q)
@@ -2497,7 +2595,7 @@ def _zero_fill_attention(
         off = (q_start + seq) * stride_lse_seq + head * stride_lse_head
         off_masked = (seq < q_len).select(off * fx.Int32(4), fx.Int32(0x7FFFFFFF))
         if BLOCK_M < BLOCK_SIZE:
-            off_masked = (tid < fx.Int32(BLOCK_M)).select(
+            off_masked = (thread_idx < fx.Int32(BLOCK_M)).select(
                 off_masked, fx.Int32(0x7FFFFFFF)
             )
         buffer_ops.buffer_store(
@@ -2532,11 +2630,14 @@ def pick_n_block(qk_hdim, v_hdim, elem_dtype):
     """Widest n_block from N_BLOCK_PREF whose split K and V tiles each still fit one
     LDS_CHUNK_BYTES chunk and whose hdim is within N_BLOCK_WIDE_MAX_QK_HDIM. At bf16 that
     is 128 for qk_hdim 128 and 64 for 192/256."""
-    for nb in N_BLOCK_PREF:
-        if nb > DEFAULT_N_BLOCK and qk_hdim > N_BLOCK_WIDE_MAX_QK_HDIM:
+    for candidate_n_block in N_BLOCK_PREF:
+        if candidate_n_block > DEFAULT_N_BLOCK and qk_hdim > N_BLOCK_WIDE_MAX_QK_HDIM:
             continue
-        if max(kv_split_bytes(qk_hdim, v_hdim, nb, elem_dtype)) <= LDS_CHUNK_BYTES:
-            return nb
+        if (
+            max(kv_split_bytes(qk_hdim, v_hdim, candidate_n_block, elem_dtype))
+            <= LDS_CHUNK_BYTES
+        ):
+            return candidate_n_block
     raise ValueError(
         f"no n_block in {N_BLOCK_PREF} fits the {LDS_CHUNK_BYTES}B chunk "
         f"(qk_hdim={qk_hdim}, v_hdim={v_hdim})"
@@ -2645,7 +2746,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             # at 0 and the epilogue would write O/0 = NaN to that batch's query rows,
             # while q_len==0 has no rows to write at all.
             if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
-                _ca_kw = {
+                _core_kwargs = {
                     "qk_hdim": QK_HDIM,
                     "v_hdim": V_HDIM,
                     "n_block": N_BLOCK,
@@ -2687,44 +2788,44 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                 lds_base = _alloc_lds()
                 warp_idx = _warp_id()
 
-                _epi = _epi_state_zeros(
+                _epi_state_out = _epi_state_zeros(
                     num_q_tiles_per_wave=NUM_Q_TILES, v_hdim=V_HDIM
                 )
                 if ONE_KV_TILE:
-                    _epi = _core_attention_one_kv_tile(
-                        warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
+                    _epi_state_out = _core_attention_one_kv_tile(
+                        warp_idx=warp_idx, lds_base=lds_base, **_core_kwargs
                     )
                 else:
                     # One traced copy of Q's load and the first KV tiles, outside the
                     # warp-type branch; the two halves differ only under its own branches.
-                    _pro = _prologue_attention(
+                    _prologue = _prologue_attention(
                         warp_idx=warp_idx,
                         lds_base=lds_base,
-                        **{k: _ca_kw[k] for k in _PRO_KEYS},
+                        **{k: _core_kwargs[k] for k in _PROLOGUE_KEYS},
                     )
                     # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
                     if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-                        _epi = _core_attention_multi_kv_tiles(
+                        _epi_state_out = _core_attention_multi_kv_tiles(
                             warp_idx=warp_idx,
                             warp_type=WarpType.LO,
                             lds_base=lds_base,
-                            pro=_pro,
-                            **_ca_kw,
+                            prologue=_prologue,
+                            **_core_kwargs,
                         )
                     else:
-                        _epi = _core_attention_multi_kv_tiles(
+                        _epi_state_out = _core_attention_multi_kv_tiles(
                             warp_idx=warp_idx,
                             warp_type=WarpType.HI,
                             lds_base=lds_base,
-                            pro=_pro,
-                            **_ca_kw,
+                            prologue=_prologue,
+                            **_core_kwargs,
                         )
                 # One traced copy of the O/LSE tail, outside the warp-type branch.
                 _epilogue_attention(
-                    epi_state=_epi,
+                    epi_state=_epi_state_out,
                     rendezvous=not ONE_KV_TILE,
                     warp_idx=warp_idx,
-                    **{k: _ca_kw[k] for k in _EPI_KEYS},
+                    **{k: _core_kwargs[k] for k in _EPILOGUE_KEYS},
                 )
             elif q_len > fx.Int32(0):
                 # Cross-attention tail: q_len>0 but kv_len==0 -> O=0, LSE=-inf (or sink).
@@ -2786,7 +2887,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
             4
         )
 
-        _ca_kw = {
+        _core_kwargs = {
             "qk_hdim": QK_HDIM,
             "v_hdim": V_HDIM,
             "n_block": N_BLOCK,
@@ -2828,44 +2929,44 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
         lds_base = _alloc_lds()
         warp_idx = _warp_id()
 
-        _epi = _epi_state_zeros(
+        _epi_state_out = _epi_state_zeros(
             num_q_tiles_per_wave=NUM_Q_TILES, v_hdim=V_HDIM
         )
         if ONE_KV_TILE:
-            _epi = _core_attention_one_kv_tile(
-                warp_idx=warp_idx, lds_base=lds_base, **_ca_kw
+            _epi_state_out = _core_attention_one_kv_tile(
+                warp_idx=warp_idx, lds_base=lds_base, **_core_kwargs
             )
         else:
             # One traced copy of Q's load and the first KV tiles, outside the
             # warp-type branch; the two halves differ only under its own branches.
-            _pro = _prologue_attention(
+            _prologue = _prologue_attention(
                 warp_idx=warp_idx,
                 lds_base=lds_base,
-                **{k: _ca_kw[k] for k in _PRO_KEYS},
+                **{k: _core_kwargs[k] for k in _PROLOGUE_KEYS},
             )
             # Warp specialization: LO (waves 0..N/2-1) vs HI (N/2..N-1).
             if warp_idx // fx.Int32(NUM_WAVES // 2) == fx.Int32(0):
-                _epi = _core_attention_multi_kv_tiles(
+                _epi_state_out = _core_attention_multi_kv_tiles(
                     warp_idx=warp_idx,
                     warp_type=WarpType.LO,
                     lds_base=lds_base,
-                    pro=_pro,
-                    **_ca_kw,
+                    prologue=_prologue,
+                    **_core_kwargs,
                 )
             else:
-                _epi = _core_attention_multi_kv_tiles(
+                _epi_state_out = _core_attention_multi_kv_tiles(
                     warp_idx=warp_idx,
                     warp_type=WarpType.HI,
                     lds_base=lds_base,
-                    pro=_pro,
-                    **_ca_kw,
+                    prologue=_prologue,
+                    **_core_kwargs,
                 )
         # One traced copy of the O/LSE tail, outside the warp-type branch.
         _epilogue_attention(
-            epi_state=_epi,
+            epi_state=_epi_state_out,
             rendezvous=not ONE_KV_TILE,
             warp_idx=warp_idx,
-            **{k: _ca_kw[k] for k in _EPI_KEYS},
+            **{k: _core_kwargs[k] for k in _EPILOGUE_KEYS},
         )
 
     return kn_fmha_fwd_prefill_a16w16_m32x8_bshd

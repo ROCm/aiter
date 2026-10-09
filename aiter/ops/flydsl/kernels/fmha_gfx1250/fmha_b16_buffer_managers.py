@@ -26,7 +26,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import rocdl
-from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -1486,7 +1485,9 @@ class OManager16bV2:
         self.d_tiles = v_hdim // _WMMA_M
         self.rows_per_warp = _WMMA_M * q_tiles_per_wave  # 32
         self.block_m = self.rows_per_warp * num_waves  # 256
-        self.row_elems = v_hdim + _O_PAD_ELEMS  # padded; the pad rides as dropped columns
+        self.row_elems = (
+            v_hdim + _O_PAD_ELEMS
+        )  # padded; the pad rides as dropped columns
         self.row_bytes = self.row_elems * _BF16_BYTES
 
     def get_lds_size_in_byte(self):
@@ -1568,7 +1569,8 @@ class OManager16bV2:
             gbase = fx.add_offset(fx.get_iter(ptr_O), off)
             g_view = fx.Tensor(
                 fx.make_view(
-                    gbase, fx.make_layout((_WMMA_M, self.row_elems), (self.row_elems, 1))
+                    gbase,
+                    fx.make_layout((_WMMA_M, self.row_elems), (self.row_elems, 1)),
                 )
             )
             atom = fx.rocdl.make_tdm_atom(
