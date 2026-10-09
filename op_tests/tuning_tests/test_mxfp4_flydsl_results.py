@@ -481,6 +481,37 @@ class TestCoupledTuningResults(unittest.TestCase):
         failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
         self.assertEqual(failures["token"].tolist(), [1])
 
+    def test_write_back_keeps_rows_of_shapes_outside_this_run(self) -> None:
+        ck_pair = _input_row(token=2)
+        ck_pair.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        ck_pair.update(
+            us=21.0,
+            us1=13.0,
+            block_m=32,
+            kernelName1="flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w3_kw4",
+            kernelName2="moe_ck2stages_gemm2_256x32x128x128_1x4",
+            err1="0.0%",
+            err2="1.4%",
+        )
+        other_gfx = _input_row(token=3)
+        other_gfx.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        other_gfx.update(
+            gfx="gfx942",
+            us=9.0,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        self.run_csv([_input_row()], existing_rows=[ck_pair, other_gfx])
+
+        tuned = pd.read_csv(self.output_file).sort_values("token")
+        self.assertEqual(tuned["token"].tolist(), [1, 2, 3])
+        self.assertEqual(tuned["us"].tolist(), [7.0, 21.0, 9.0])
+        self.assertEqual(
+            tuned["kernelName2"].tolist()[1], "moe_ck2stages_gemm2_256x32x128x128_1x4"
+        )
+
     def test_fully_covered_resume_refreshes_stale_failure_manifest(self) -> None:
         failure_file = self.output_file.with_suffix(".failed_shapes.csv")
         failed = _input_row()

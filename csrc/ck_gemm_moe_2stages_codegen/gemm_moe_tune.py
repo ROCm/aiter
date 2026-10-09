@@ -7461,18 +7461,30 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        old_tunedf = old_tunedf[
-            self._valid_tuned_mask(
-                old_tunedf,
-                getattr(self, "_mxfp4_err_ratio", self.ARG_DEFAULTS["errRatio"]),
-            )
-        ].copy()
         for col in self.columns:
             if col not in old_tunedf.columns:
                 if col == "gfx" and "cu_num" in old_tunedf.columns:
                     old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
                 else:
                     old_tunedf[col] = ""
+        # Like the base tuner, keep every saved row. Only an invalid saved winner
+        # for a shape retuned in this run is dropped, so a failed retune cannot
+        # leave it behind; rows of other shapes and kernel families are untouched.
+        if not old_tunedf.empty and not results.empty:
+            retuned_keys = set(results[self.keys].astype(str).apply(tuple, axis=1))
+            retuned = (
+                old_tunedf[self.keys]
+                .astype(str)
+                .apply(tuple, axis=1)
+                .isin(retuned_keys)
+            )
+            if retuned.any():
+                valid_saved = self._valid_tuned_mask(
+                    old_tunedf[retuned],
+                    getattr(self, "_mxfp4_err_ratio", self.ARG_DEFAULTS["errRatio"]),
+                )
+                stale = valid_saved.index[~valid_saved]
+                old_tunedf = old_tunedf.drop(index=stale).copy()
         times = pd.to_numeric(results["us"], errors="coerce")
         valid_mask = times.map(math.isfinite) & times.gt(0) & results["status"].eq("ok")
         valid = results.loc[valid_mask, self.columns].copy()
