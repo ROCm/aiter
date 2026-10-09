@@ -1230,6 +1230,28 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             offsets=store_cols,
             mask=(store_cols >= split_context_start) & (store_cols < max_model_len),
         )
+        if not PERSISTENT:
+            # The window ends on a page boundary, so an MTP row can end in the
+            # final chunk's first stage, which was stored unmasked. Rewrite it
+            # with that store's lane mapping: each column must be overwritten
+            # by the lane that stored it, or the two stores are unordered.
+            fix_cols = context_idx + gl.arange(
+                0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout)
+            )
+            gl.amd.cdna3.buffer_store(
+                gl.full(
+                    [ChunkKPerStage],
+                    float("-inf"),
+                    tl.float32,
+                    layout=gl.SliceLayout(0, mfma_layout),
+                ),
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=fix_cols,
+                mask=(fix_cols > context_length - next_n + pid_next_n)
+                & (fix_cols >= split_context_start)
+                & (fix_cols < max_model_len),
+            )
     else:
         context_idx = split_context_start
         current_chunk_rank = context_idx // ChunkKPerStage % ChunkKStagePerContextBlock
@@ -1606,6 +1628,31 @@ def _gluon_deepgemm_fp8_paged_mqa_logits_preshuffle(
             )
             < max_model_len,
         )
+        if not PERSISTENT:
+            # The window ends on a chunk boundary, so an MTP row can end in the
+            # previous chunk's second stage, which the loop stored unmasked.
+            # Rewrite it with that store's lane mapping: each column must be
+            # overwritten by the lane that stored it, or the two stores are
+            # unordered.
+            fix_cols = (
+                context_idx
+                - ChunkKPerStage
+                + gl.arange(0, ChunkKPerStage, layout=gl.SliceLayout(0, mfma_layout))
+            )
+            gl.amd.cdna3.buffer_store(
+                gl.full(
+                    [ChunkKPerStage],
+                    float("-inf"),
+                    tl.float32,
+                    layout=gl.SliceLayout(0, mfma_layout),
+                ),
+                ptr=OutLogits_buffer
+                + (pid_batch * next_n + pid_next_n).to(tl.int64) * stride_out_batch,
+                offsets=fix_cols,
+                mask=(fix_cols > context_length - next_n + pid_next_n)
+                & (fix_cols >= split_context_start)
+                & (fix_cols < max_model_len),
+            )
 
 
 @gluon.jit
