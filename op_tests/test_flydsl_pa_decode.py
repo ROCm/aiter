@@ -701,6 +701,65 @@ def test_prepare_pa_decode_plan_native_autotune(
         cached_plan.reduce_info, plan.reduce_info, atol=0, rtol=0
     )
 
+    # Reuse the native cache across query strides, KV page counts, scale views,
+    # block-table padding, and scheduling bounds for the same attention geometry.
+    padded_query = torch.empty(
+        (*query.shape[:-1], head_dim + 16), dtype=query.dtype, device=device
+    )
+    strided_query = padded_query[..., :head_dim]
+    strided_query.copy_(query)
+    extended_key = torch.cat((key_cache, key_cache[:1]))
+    extended_value = torch.cat((value_cache, value_cache[:1]))
+    extended_table = torch.cat((table, torch.zeros_like(table[:, :1])), dim=1)
+    extended_options = dict(options)
+    extended_options["max_context_length"] = table.shape[1] * page_size + 1
+    for name, scale in (("key_scale", key_scale), ("value_scale", value_scale)):
+        if scale is not None:
+            extended_options[name] = (
+                torch.cat((scale, scale[:1])).squeeze(-1)
+                if per_token
+                else scale.reshape(1, 1)
+            )
+
+    def forbidden_default(*_, **__):
+        pytest.fail("equivalent attention geometry missed the native tuning cache")
+
+    with monkeypatch.context() as cached_only:
+        cached_only.setattr(reloaded, "default", forbidden_default)
+        reused_plan = pa.prepare_pa_decode_plan(
+            strided_query,
+            extended_key,
+            extended_value,
+            context,
+            extended_table,
+            head_dim**-0.5,
+            query_length,
+            **extended_options,
+        )
+    assert len(reloaded.cache) == 1
+    assert reused_plan.capacity == cached_plan.capacity
+    torch.testing.assert_close(
+        reused_plan.work_info, cached_plan.work_info, atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        reused_plan.reduce_info, cached_plan.reduce_info, atol=0, rtol=0
+    )
+    reused_output = torch.full_like(query, float("nan"))
+    pa.pa_decode(
+        reused_output,
+        strided_query,
+        extended_key,
+        extended_value,
+        context,
+        extended_table,
+        head_dim**-0.5,
+        query_length,
+        work_plan=reused_plan,
+        **extended_options,
+    )
+    assert torch.isfinite(reused_output).all()
+    torch.testing.assert_close(reused_output.float(), reference, atol=5e-3, rtol=5e-3)
+
     # A fresh native-cache miss uses 2*CU without preparing or timing graphs.
     miss = _isolated_pa_decode_autotuner(pa, tmp_path / "empty.json")
     monkeypatch.setattr(pa, "_pa_decode_autotuner", miss)

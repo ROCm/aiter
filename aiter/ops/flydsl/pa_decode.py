@@ -841,12 +841,45 @@ def _validate_pa_decode_config(arguments):
 
 @autotune(
     configs=_pa_decode_configs,
-    key=["attention_key", "num_cu", "implementation"],
+    key=[
+        "num_seqs",
+        "num_kv_heads",
+        "query_group_size",
+        "head_dim",
+        "block_size",
+        "query_length",
+        "query_dtype",
+        "kv_dtype",
+        "per_token_kv",
+        "trans_v",
+        "sink_dtype",
+        "sliding_window",
+        "max_partitions",
+        "num_cu",
+        "implementation",
+    ],
     default=_pa_decode_default,
     validate_hook=_validate_pa_decode_config,
 )
 def _pa_decode_autotuner(
-    attention_key, num_cu, implementation, resources, *, workgroup_budget
+    num_seqs,
+    num_kv_heads,
+    query_group_size,
+    head_dim,
+    block_size,
+    query_length,
+    query_dtype,
+    kv_dtype,
+    per_token_kv,
+    trans_v,
+    sink_dtype,
+    sliding_window,
+    max_partitions,
+    num_cu,
+    implementation,
+    resources,
+    *,
+    workgroup_budget,
 ):
     resources.graphs[workgroup_budget].replay()
 
@@ -877,6 +910,10 @@ def prepare_pa_decode_plan(
     agree with the 2*CU baseline; independent FP32 accuracy is covered by tests.
     Set FLYDSL_AUTOTUNE_CACHE_DIR before importing this module to choose the
     native cache directory.
+
+    Cache by attention geometry and execution modes. Tensor strides, total KV
+    cache pages, block-table padding, and max_context_length do not partition
+    the tuning cache; max_context_length still bounds kernel scheduling.
 
     Retain the returned plan for decode/graph replay. Refresh it with
     plan_pa_decode(..., plan=plan) when context lengths change; decode never
@@ -917,42 +954,22 @@ def prepare_pa_decode_plan(
             limit,
         )
 
-        def tensor_key(tensor):
-            if tensor is None:
-                return None
-            if not isinstance(tensor, torch.Tensor):
-                return float(tensor)
-            # Decode squeezes trailing singleton per-token scales.
-            if tensor is key_scale or tensor is value_scale:
-                if tensor.numel() == 1:
-                    return (str(tensor.dtype), (1,), (1,))
-                if tensor.ndim == 4 and tensor.shape[-1] == 1:
-                    tensor = tensor.squeeze(-1)
-            return (str(tensor.dtype), tuple(tensor.shape), tuple(tensor.stride()))
-
-        attention_key = (
-            tuple(
-                tensor_key(tensor)
-                for tensor in (
-                    query,
-                    key_cache,
-                    value_cache,
-                    context_lengths,
-                    block_tables,
-                    key_scale,
-                    value_scale,
-                    sinks,
-                )
-            ),
-            softmax_scale,
-            query_length,
-            str(compute_type),
-            default_plan.sliding_window,
-            limit,
-            max_context_length,
-        )
         config = _pa_decode_autotuner.resolve_config(
-            attention_key=attention_key,
+            num_seqs=context_lengths.numel(),
+            num_kv_heads=key_cache.shape[1],
+            query_group_size=query.shape[1] // key_cache.shape[1],
+            head_dim=query.shape[-1],
+            block_size=key_cache.shape[3],
+            query_length=query_length,
+            query_dtype=str(query.dtype),
+            kv_dtype=str(key_cache.dtype),
+            per_token_kv=(
+                isinstance(key_scale, torch.Tensor) and key_scale.numel() > 1
+            ),
+            trans_v=value_cache.ndim == 5,
+            sink_dtype=None if sinks is None else str(sinks.dtype),
+            sliding_window=default_plan.sliding_window,
+            max_partitions=limit,
             num_cu=num_cu,
             implementation=implementation_cache_tag(),
             resources=resources,
