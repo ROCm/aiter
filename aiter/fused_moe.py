@@ -1768,7 +1768,9 @@ def get_block_size_M(token, topk, expert, inter_dim):
         m_tiles = (max_num_tokens + el - 1) // el
         tg_num = tgN * m_tiles
         rnd = (tg_num + cu_num - 1) // cu_num
-        empty = cu_num - tg_num % cu_num
+        # Idle CUs in the last round: 0 when tg_num fills it exactly (the
+        # former `cu_num - tg_num % cu_num` counted that as a whole idle round).
+        empty = (-tg_num) % cu_num
         # `rnd` counts rounds of tiles, but a tile of `el` rows costs about `el`
         # units of MFMA work, so rounds are not comparable across block sizes.
         # Ranking on `rnd` alone prices a 64-row tile like a 32-row one and so

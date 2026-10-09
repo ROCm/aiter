@@ -4,11 +4,13 @@
 """Regression for get_block_size_M ranking tile heights by rounds alone.
 
 When no tuned config exists, get_2stage_cfgs takes block_m from
-get_block_size_M. A decode-sized call has only a few real rows per expert, so
-most of a large M tile is padding. Ranking candidates by rounds of tiles prices
-a 64-row tile like a 32-row one, and the idle-CU tiebreak then picks the larger,
+get_block_size_M (in fused_moe and in fused_moe_dp_shared_expert, which share
+one helper). A decode-sized call has only a few real rows per expert, so most
+of a large M tile is padding. Ranking candidates by rounds of tiles prices a
+64-row tile like a 32-row one, and the idle-CU tiebreak then picks the larger,
 mostly empty block: 32 tokens x top-8 over 32 experts schedule 2304 rows for 256
-real ones at block_m=64, against 1280 at block_m=32.
+real ones at block_m=64, against 1280 at block_m=32. The tiebreak also counted a
+last round that the tiles fill exactly as a whole idle round.
 
 The choice depends only on the shape and the CU count, so these tests pin the
 CU count and need no GPU.
@@ -16,7 +18,7 @@ CU count and need no GPU.
 
 import pytest
 
-import aiter.fused_moe as fused_moe
+from aiter import fused_moe, fused_moe_dp_shared_expert
 from aiter.fused_moe import get_block_size_M
 
 CU_NUM = 256
@@ -54,6 +56,25 @@ def test_decode_shape_triggers_mostly_padding_block():
     assert padded_rows(*shape[:3], 64) == 2304
     assert padded_rows(*shape[:3], 32) == 1280
     assert get_block_size_M(*shape) == 32
+
+
+def test_exact_wave_counts_no_idle_cu():
+    # At block_m=32 the tiles fill the last round exactly (8960 = 35 x 256), and
+    # 32 and 64 tie on weighted rounds; that full round must count 0 idle CUs.
+    shape = (382, 8, 64, 7168)
+    tg_n = (shape[3] + 127) // 128
+    assert tg_n * padded_rows(*shape[:3], 32) // 32 == 35 * CU_NUM
+    assert padded_rows(*shape[:3], 32) < padded_rows(*shape[:3], 64)
+    assert get_block_size_M(*shape) == 32
+
+
+def test_dp_shared_expert_uses_the_same_ranking():
+    # fused_moe_dp_shared_expert's untuned fallback kept its own copy of the
+    # rounds-only ranking; it now shares this helper.
+    assert fused_moe_dp_shared_expert.get_block_size_M is get_block_size_M
+    shape = (32, 8, 8, 2048)
+    assert previous_choice(*shape) == 64
+    assert fused_moe_dp_shared_expert.get_block_size_M(*shape) == 32
 
 
 @pytest.mark.parametrize(
