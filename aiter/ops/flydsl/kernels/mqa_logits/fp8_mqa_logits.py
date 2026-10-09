@@ -201,7 +201,9 @@ def _store_rs_group(ctx, j, out_row_t, col0, g, parts, rs_scale):
     After the reduce-scatter lane ``l`` owns the group's column ``l``
     (tile-major), so all 64 lanes store one contiguous run.
     """
-    col_sum = warp_reduce_scatter_strided(parts, fx.ReductionOp.ADD, stride=ctx.mfma.MFMA_N)
+    col_sum = warp_reduce_scatter_strided(
+        parts, fx.ReductionOp.ADD, stride=ctx.mfma.MFMA_N
+    )
     if rs_scale is not None:
         col_sum = col_sum * rs_scale
     col = col0 + fx.Int32(g * 64) + ctx.lane
@@ -904,6 +906,7 @@ def _build_kernel_mfma_lds_pipe(
         rows ``[w*RPW, (w+1)*RPW)``). KV reuse factor becomes ``RPW * WPB``.
 
     A-frags are loaded from global memory to registers; B-frags are read from LDS.
+    Both loads are tiled copies partitioned by the atom's tiled MMA.
     The epilogue is identical to the direct-load builder, unless ``rs_head``:
     then the ``64 // MFMA_N`` n-tiles of a group are head-reduced together by
     ``warp_reduce_scatter_strided`` and stored by all 64 lanes as one contiguous
@@ -1004,7 +1007,7 @@ def _build_kernel_mfma_lds_pipe(
     )
 
     # XOR swizzle (bank-conflict avoidance) of the [BKV, D] fp8 tile, as a
-    # SwizzleType over the slot's i32 dword offsets. The DMA writes LDS
+    # SwizzleType over the slot's byte (fp8 element) offsets. The DMA writes LDS
     # lane-linearly, so the swizzle is applied on the global source side (the
     # self-inverse XOR maps each physical dword to the logical dword stored
     # there) and on the read view.
@@ -1021,27 +1024,27 @@ def _build_kernel_mfma_lds_pipe(
     # reads of a fragment then need separate addresses, which costs the
     # 128-VGPR _rs route a wave per SIMD; measured slower.)
     #
-    # Chunks stay whole (base = log2 of a fragment's dwords), so every 16-byte
-    # DMA write and both ds_read_b128 of a fragment stay contiguous.
-    DW_PER_COL = D // 4  # i32 dwords per KV column (head dim)
+    # Chunks stay whole (base = log2 frag_bytes), so every 16-byte DMA write
+    # and both ds_read_b128 of a fragment stay contiguous.
     NC = D // mfma.frag_bytes  # B-fragment chunks per column
-    _BANK_LINE_DW = 64  # dwords per LDS bank line (64 banks x 4 B)
-    _FRAG_DW_LOG2 = (mfma.frag_bytes // 4).bit_length() - 1
+    _BANK_LINE_BYTES = 256  # 64 banks x 4 B
+    _FRAG_LOG2 = mfma.frag_bytes.bit_length() - 1
     LDS_SWZ = (
         NC.bit_length() - 1,
-        _FRAG_DW_LOG2,
-        _BANK_LINE_DW.bit_length() - 1 - _FRAG_DW_LOG2,
+        _FRAG_LOG2,
+        _BANK_LINE_BYTES.bit_length() - 1 - _FRAG_LOG2,
     )
 
-    FRAG_DW = mfma.frag_bytes // 4
     # The B-fragment reads view one n-tile (MFMA_N KV columns) at a time, with
     # the n-tile's offset applied to the base pointer rather than through the
     # swizzle. That is exact only if the offset is a multiple of the swizzle
     # period, and it lets every n-tile share the lane's read addresses
-    # (immediate offsets), as the hand-written addressing did.
-    NTILE_DW = mfma.MFMA_N * DW_PER_COL
-    assert NTILE_DW % (1 << sum(LDS_SWZ)) == 0, (
-        f"n-tile ({NTILE_DW} dwords) must be a multiple of the swizzle period"
+    # (immediate offsets). Swizzling the full tile offset instead makes the
+    # compiler recompute the XOR per n-tile, which costs the 128-VGPR _rs route
+    # a wave per SIMD.
+    NTILE_BYTES = mfma.MFMA_N * D
+    assert NTILE_BYTES % (1 << sum(LDS_SWZ)) == 0, (
+        f"n-tile ({NTILE_BYTES} bytes) must be a multiple of the swizzle period"
     )
 
     # The global->LDS DMA requires its destination LDS address to be at
@@ -1091,15 +1094,36 @@ def _build_kernel_mfma_lds_pipe(
         lane = tid % fx.Int32(64)
         lane_div_N = lane // fx.Int32(mfma.MFMA_N)
         lane_mod_N = lane % fx.Int32(mfma.MFMA_N)
-        lane_frag_off = lane_div_N * fx.Int32(mfma.frag_bytes)
         cp_4xfp32, tc_c_w = _make_weight_copy(mma, lane)
+
+        # One wave's tiled MMA: it owns the lane -> (row, K) mapping of the A
+        # (Q heads x head dim) and B (KV columns x head dim) fragments, and the
+        # tiled copies below derive every fragment load from it. fx.gemm is
+        # still called on the bare atom per (mi, ni, kk) slice: the identity
+        # scales are atom state a TiledMma cannot carry, and the epilogues
+        # schedule the per-tile MFMAs themselves.
+        tiled_mma = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
+        thr_mma = tiled_mma.thr_slice(lane)
+        # Q: one lane's 32-byte fragment is two 16-byte buffer loads.
+        q_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 8)
+        tc_q = fx.make_tiled_copy_A(q_copy, tiled_mma).get_slice(lane)
+        # KV: one lane's 32-byte fragment is one LDS load (a ds_read_b128 pair).
+        kv_copy = fx.make_copy_atom(fx.UniversalCopy(mfma.frag_bytes * 8), 8)
+        tc_kv = fx.make_tiled_copy_B(kv_copy, tiled_mma).get_slice(lane)
 
         wave_s = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, wave.ir_value()))
 
         # First row owned by this wave.
         wave_row0 = block_row0 + wave * fx.Int32(RPW)
 
-        q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
+        # [row, head, head dim] fp8.
+        q_buf = fx.rocdl.make_buffer_tensor(
+            fx.Tensor(
+                fx.make_view(
+                    fx.get_iter(Q), fx.make_layout((seq_len, H, D), (H * D, D, 1))
+                )
+            )
+        )
         cs_t = fx.rocdl.make_buffer_tensor(cu_starts)
         ce_t = fx.rocdl.make_buffer_tensor(cu_ends)
         _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
@@ -1107,21 +1131,27 @@ def _build_kernel_mfma_lds_pipe(
         # ---- LDS region: one flat i32 array of NUM_BUFFERS slots ----
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().slots.ptr
         lds_f32 = fx.recast_iter(fx.Float32, lds_ptr)
+        kv_elem = fx.get_iter(KV).element_type
+        lds_kv = fx.recast_iter(kv_elem, lds_ptr)
         swz = fx.static(fx.SwizzleType.get(*LDS_SWZ))
-        # Read view of one staged n-tile: [KV column within the n-tile, dword
-        # of a B-fragment chunk, chunk]; one (n, None, c) slice is one lane's
-        # fragment (a ds_read_b128 pair off one address).
+        # Read view of one staged n-tile, [KV column, head dim]. The n-tile's
+        # offset is applied to the base pointer, outside the swizzle (see
+        # NTILE_BYTES), so every n-tile reuses the lane's read addresses.
         kv_read_layout = fx.make_composed_layout(
-            swz,
-            fx.make_layout((mfma.MFMA_N, FRAG_DW, NC), (DW_PER_COL, 1, FRAG_DW)),
+            swz, fx.make_layout((mfma.MFMA_N, D), (D, 1))
         )
-        lds_copy = fx.make_copy_atom(fx.UniversalCopy(FRAG_DW * 32), fx.Int32)
 
-        def _lds_read_frag(s_kv, n, c):
-            """B-fragment chunk ``c`` of KV column ``n`` of a staged n-tile."""
-            t = fx.make_rmem_tensor(FRAG_DW, fx.Int32)
-            fx.copy(lds_copy, fx.slice(s_kv, (n, None, c)), t)
-            return t.load()
+        def _read_b_frags(slot_byte, ni):
+            """All K-steps of n-tile ``ni``'s B-fragments out of a staged tile."""
+            s_kv = fx.Tensor(
+                fx.make_view(
+                    fx.add_offset(lds_kv, slot_byte + fx.Int32(ni * NTILE_BYTES)),
+                    kv_read_layout,
+                )
+            )
+            frag = thr_mma.make_fragment_B(s_kv)  # (V, 1, K_STEPS)
+            fx.copy(kv_copy, tc_kv.partition_S(s_kv), tc_kv.retile(frag))
+            return [frag[None, 0, kk] for kk in range_constexpr(K_STEPS)]
 
         # Global->LDS DMA atoms: 16 bytes of KV / one f32 kv_scale per lane.
         # The LDS destination is wave-uniform; the instruction fans the
@@ -1149,16 +1179,10 @@ def _build_kernel_mfma_lds_pipe(
                 num_records_bytes=fx.Int64(rem_cols * fx.Int32(col_elems * elem_bytes)),
             )
 
-        # KV as dwords (the fp8 tensor arg only carries byte alignment).
-        kv_i32 = fx.inttoptr(
-            fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4),
-            fx.ptrtoint(fx.get_iter(KV)),
-        )
-
         def _kv_tile(col0_i32):
-            """KV tile in dwords, through the LDS swizzle: element ``p`` is the
-            logical dword the swizzled slot stores at physical dword ``p``."""
-            return _tile_view(kv_i32, col0_i32, DW_PER_COL, 4, swizzle=swz)
+            """KV tile through the LDS swizzle: element ``p`` is the logical
+            byte the swizzled slot stores at physical byte ``p``."""
+            return _tile_view(fx.get_iter(KV), col0_i32, D, 1, swizzle=swz)
 
         def _scale_tile(col0_i32):
             return _tile_view(fx.get_iter(kv_scales), col0_i32, 1, 4)
@@ -1167,22 +1191,20 @@ def _build_kernel_mfma_lds_pipe(
             """Cooperatively async-copy KV[col0:col0+BKV, :] into LDS slot.
 
             All MR_BLOCK_THREADS threads participate; thread ``tid`` at load ``i``
-            writes slot dword ``(i*MR_BLOCK_THREADS + tid)*4``, reading the
-            logical dwords the swizzle maps there.
+            writes slot byte ``(i*MR_BLOCK_THREADS + tid)*DMA_BYTES``, reading
+            the logical bytes the swizzle maps there.
             """
             lds_dst = fx.add_offset(
-                lds_ptr, slot_dword + wave_s * fx.Int32(64 * DMA_BYTES // 4)
+                lds_kv, slot_dword * fx.Int32(4) + wave_s * fx.Int32(64 * DMA_BYTES)
             )
             kv_src = fx.logical_divide(_kv_tile(col0_i32), fx.make_layout(1, 1))
             for i in range_constexpr(NUM_KV_DMAS):
                 if const_expr(i > 0):
-                    lds_dst = fx.add_offset(lds_dst, MR_BLOCK_THREADS * DMA_BYTES // 4)
-                phys_dword = (tid + fx.Int32(i * MR_BLOCK_THREADS)) * fx.Int32(
-                    DMA_BYTES // 4
-                )
+                    lds_dst = fx.add_offset(lds_dst, MR_BLOCK_THREADS * DMA_BYTES)
+                phys_byte = (tid + fx.Int32(i * MR_BLOCK_THREADS)) * fx.Int32(DMA_BYTES)
                 fx.copy(
                     kv_dma,
-                    fx.slice(kv_src, (None, phys_dword)),
+                    fx.slice(kv_src, (None, phys_byte)),
                     fx.make_view(lds_dst, fx.make_layout(1, 1)),
                 )
 
@@ -1191,7 +1213,9 @@ def _build_kernel_mfma_lds_pipe(
             if const_expr(SCALE_DMAS > 0):
                 sc_src = fx.logical_divide(_scale_tile(col0_i32), fx.make_layout(1, 1))
             for s in range_constexpr(SCALE_DMAS):
-                sc_dst = fx.add_offset(lds_f32, slot_dword + fx.Int32(SCALE_DW + s * 64))
+                sc_dst = fx.add_offset(
+                    lds_f32, slot_dword + fx.Int32(SCALE_DW + s * 64)
+                )
                 fx.copy(
                     sc_dma,
                     fx.slice(sc_src, (None, fx.Int32(s * 64) + lane)),
@@ -1232,25 +1256,15 @@ def _build_kernel_mfma_lds_pipe(
                 )
             )
 
-            # Load A-frags:
-            # Q[
-            #   row,
-            #   h = mi*MFMA_M + lane%MFMA_N,
-            #   d = kk*MFMA_K + (lane//MFMA_N)*8 + 0..7
-            #  ]
-            row_a_frag = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
-            for mi in range_constexpr(M_TILES):
-                h_a = fx.Int32(mi * mfma.MFMA_M) + lane_mod_N
-                row_h = h_a + row_ld * fx.Int32(H)
-                base_a = row_h * fx.Int32(D)
-                for kk in range_constexpr(K_STEPS):
-                    row_a_frag[mi][kk] = mfma.make_frag(
-                        _load_pack_i32x8(
-                            q_i32,
-                            base_a + fx.Int32(kk * mfma.MFMA_K) + lane_frag_off,
-                        )
-                    )
-            a_packs[j] = row_a_frag
+            # A-fragments: the row's [H, D] Q tile, partitioned by the tiled MMA
+            # into (V, M_TILES, K_STEPS).
+            q_row = fx.slice(q_buf, (row_ld, None, None))
+            frag_a = thr_mma.make_fragment_A(q_row)
+            fx.copy(q_copy, tc_q.partition_S(q_row), tc_q.retile(frag_a))
+            a_packs[j] = [
+                [frag_a[None, mi, kk] for kk in range_constexpr(K_STEPS)]
+                for mi in range_constexpr(M_TILES)
+            ]
 
             w_frag[j] = _load_row_weights(
                 weights, H, cp_4xfp32, tc_c_w, M_TILES, mfma.MFMA_N, row_ld
@@ -1367,7 +1381,7 @@ def _build_kernel_mfma_lds_pipe(
             # Read all B-frags for this tile from LDS into registers. Hoisting
             # every (ni,kk) read ahead of the compute nest lets the compiler
             # batch the LDS loads and hide their lgkmcnt latency behind the MFMA work.
-            b_packs = [[None] * K_STEPS for _ in range_constexpr(N_TILES)]
+            b_packs = [None] * N_TILES
             cols = [None] * N_TILES
             # kv_scales_tile[ni]: this lane's column scale, applied before the
             # head reduce. lds_scales + rs_head instead scales once after the
@@ -1389,21 +1403,9 @@ def _build_kernel_mfma_lds_pipe(
                         sc_tile[fx.Int32(ni * mfma.MFMA_N) + lane_mod_N]
                     )
                 col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
-                s_kv = fx.Tensor(
-                    fx.make_view(
-                        fx.add_offset(lds_ptr, slot_dword + fx.Int32(ni * NTILE_DW)),
-                        kv_read_layout,
-                    )
-                )
                 if const_expr(lds_scales and not rs_head):
                     kv_scales_tile[ni] = fx.Float32(sc_lds[col_local])
-                for kk in range_constexpr(K_STEPS):
-                    # K-step kk spans chunks [kk*MFMA_K/frag_bytes, ...); lane
-                    # group lane_div_N takes one of them.
-                    c = fx.Int32(kk * mfma.MFMA_K // mfma.frag_bytes) + lane_div_N
-                    b_packs[ni][kk] = mfma.make_frag(
-                        _lds_read_frag(s_kv, lane_mod_N, c)
-                    )
+                b_packs[ni] = _read_b_frags(slot_dword * fx.Int32(4), ni)
             if const_expr(lds_scales and rs_head):
                 for g in range_constexpr(N_TILES // RS_GROUP):
                     rs_scales[g] = fx.Float32(sc_lds[fx.Int32(g * 64) + lane])
