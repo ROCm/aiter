@@ -545,7 +545,11 @@ def _should_use_flydsl_topk_decode(
     k: int,
     stable: bool,
     values: torch.Tensor | None = None,
+    *,
+    width: int | None = None,
 ) -> bool:
+    """Whether the call goes to the FlyDSL decode top-k: gated by the row
+    width -- the logits' own, or the plane ``width`` packed rows stand for."""
     if (
         _FLYDSL_TOPK_DECODE_DISABLED
         or not isinstance(logits, torch.Tensor)
@@ -560,7 +564,7 @@ def _should_use_flydsl_topk_decode(
     if not _flydsl_topk_decode_shape_supported(
         arch,
         stable,
-        logits.shape[1],
+        logits.shape[1] if width is None else width,
         num_rows,
         k,
     ):
@@ -621,6 +625,9 @@ def top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    *,
+    row_starts: torch.Tensor | None = None,
+    plane_width: int | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel; the scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
@@ -633,7 +640,18 @@ def top_k_per_row_decode(
     When `values` is given (float32, same shape as `indices`), each selected
     index's logit is written alongside it. Rows shorter than k pad the index
     with -1 and the score with -inf, so the padding sorts below every real
-    candidate and a consumer that ranks these scores needs no extra mask."""
+    candidate and a consumer that ranks these scores needs no extra mask.
+
+    Packed rows: ``logits`` is a flat buffer, row r's scores at element
+    ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the
+    indices relative to that start. ``plane_width`` is the width of the plane
+    the rows stand for: it bounds every row and picks the kernel exactly as
+    that plane would, so a packed call runs what its plane call runs."""
+    if row_starts is not None:
+        return _top_k_per_row_decode_packed(
+            logits, next_n, seqLens, indices, numRows, k, stable, values,
+            row_starts, plane_width,
+        )  # fmt: skip
     if _should_use_flydsl_topk_decode(
         logits,
         next_n,
@@ -722,6 +740,48 @@ def top_k_per_row_decode(
         stable,
         values,
     )
+
+
+def _top_k_per_row_decode_packed(
+    flat: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    k: int,
+    stable: bool,
+    values: torch.Tensor | None,
+    row_starts: torch.Tensor,
+    plane_width: int | None,
+) -> None:
+    """`top_k_per_row_decode` on packed rows: the FlyDSL kernel a
+    ``plane_width`` plane would get, reading each row at its start. The HIP
+    kernels address rows by stride, so there is no fallback to them."""
+    if plane_width is None:
+        raise ValueError("packed rows need the plane width they stand for")
+    if flat.dim() != 1 or not flat.is_contiguous():
+        raise ValueError("packed logits must be a contiguous flat buffer")
+    if row_starts.dtype != torch.int32 or row_starts.shape != (num_rows,):
+        raise ValueError("row_starts must be int32 [num_rows]")
+    if _FLYDSL_TOPK_DECODE_DISABLED:
+        raise ValueError("packed rows need the FlyDSL decode top-k")
+    from .flydsl.topk import topk_per_row as flydsl_topk
+
+    # The kernels take their input as [rows, width] and validate it so; every
+    # row of this view is the buffer itself, a row's start added in-kernel.
+    view = flat.as_strided((num_rows, flat.numel()), (0, 1))
+    if _should_use_flydsl_topk_decode(
+        view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+        width=plane_width,
+    ):  # fmt: skip
+        return flydsl_topk.flydsl_top_k_per_row_decode(
+            view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+            row_starts=row_starts, plane_width=plane_width,
+        )  # fmt: skip
+    return flydsl_topk.flydsl_radix_topk_one_block(
+        view, row_starts, seq_lens, indices, values, num_rows, 0, 1, k, stable,
+        is_decode=True, next_n=next_n, plane_width=plane_width, packed_rows=True,
+    )  # fmt: skip
 
 
 def flydsl_dcp_topk_merge(
