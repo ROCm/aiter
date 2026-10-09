@@ -104,7 +104,8 @@ def create_layouts(
 def _tdm_ops_after_load(i, num_stages, k_loop):
     """TDM ops a wave issues after the loads of step i and before step i's wait:
     the stores of the previous num_stages-1 steps and the loads of each later
-    stage already in flight (x, res, fn: 3 per stage)."""
+    stage already in flight (x, res, fn: 3 per stage). This is the wait for step
+    i's fn; its x and res, issued one op earlier, allow one more op (+1)."""
     return min(i, num_stages - 1) + 3 * min(num_stages - 1, k_loop - 1 - i)
 
 
@@ -355,8 +356,11 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
 
     # ---- main loop, fully unrolled so every ring slot and wait count is static ----
     for i in gl.static_range(K_LOOP):
+        # Wait for x and res only (TDM completes in issue order: x, res, fn); fn, the
+        # largest tile, is waited for right before its reads below, so the post mix
+        # runs while it lands.
         gl.amd.gfx1250.tdm.async_wait(
-            _tdm_ops_after_load(i, NUM_STAGES, K_LOOP)
+            _tdm_ops_after_load(i, NUM_STAGES, K_LOOP) + 1
         )
         gl.barrier()
 
@@ -383,6 +387,8 @@ def _mhc_post_pre_gemm_sqrsum_gfx1250_kernel(
 
         a_bf = a.to(nres_ptr.type.element_ty)
 
+        gl.amd.gfx1250.tdm.async_wait(_tdm_ops_after_load(i, NUM_STAGES, K_LOOP))
+        gl.barrier()
         if W_PRESHUFFLED:
             b_hi = _load_fn_plane(fn_rd, slot, 0, HC, N_PAD, KS, OP_B)
             b_lo = _load_fn_plane(fn_rd, slot, 1, HC, N_PAD, KS, OP_B)
