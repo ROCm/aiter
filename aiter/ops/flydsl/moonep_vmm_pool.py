@@ -45,6 +45,7 @@ Two constraints from mori's own experience with these APIs:
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import itertools
 import math
@@ -182,11 +183,13 @@ class MoonEPVmmPool:
         rank: int,
         world_size: int,
         device: torch.device | None = None,
-        group: "dist.ProcessGroup | None" = None,
+        group: dist.ProcessGroup | None = None,
         max_pad_ratio: int = 4,
     ) -> None:
         if row_bytes <= 0 or row_bytes % 16:
-            raise ValueError(f"row_bytes must be a positive multiple of 16, got {row_bytes}")
+            raise ValueError(
+                f"row_bytes must be a positive multiple of 16, got {row_bytes}"
+            )
         self.device = device or torch.device("cuda", torch.cuda.current_device())
         dev = self.device.index
         self.rank, self.world_size = rank, world_size
@@ -197,7 +200,9 @@ class MoonEPVmmPool:
         self._closed = False
 
         if experts_per_rank <= 0 or prefetch_slots < 0:
-            raise ValueError("experts_per_rank must be positive and prefetch_slots non-negative")
+            raise ValueError(
+                "experts_per_rank must be positive and prefetch_slots non-negative"
+            )
 
         gran = vmm_granularity(dev)
         self.granularity = gran
@@ -257,7 +262,10 @@ class MoonEPVmmPool:
         _check(
             _hip.hipMemMap(
                 _P(self._base.value + self.rank * self.segment_bytes),
-                self.segment_bytes, 0, h, 0,
+                self.segment_bytes,
+                0,
+                h,
+                0,
             ),
             "hipMemMap (local)",
         )
@@ -277,9 +285,7 @@ class MoonEPVmmPool:
         # ours after the exchange.  Close them all now; a deep model keeps
         # several pools per layer alive for its whole lifetime.
         try:
-            peer_fds = _exchange_fds(
-                self.rank, self.world_size, fd.value, self._group
-            )
+            peer_fds = _exchange_fds(self.rank, self.world_size, fd.value, self._group)
         finally:
             os.close(fd.value)
         try:
@@ -307,7 +313,10 @@ class MoonEPVmmPool:
                 _check(
                     _hip.hipMemMap(
                         _P(self._base.value + pe * self.segment_bytes),
-                        self.segment_bytes, 0, h, 0,
+                        self.segment_bytes,
+                        0,
+                        h,
+                        0,
                     ),
                     f"hipMemMap (peer {pe})",
                 )
@@ -344,13 +353,19 @@ class MoonEPVmmPool:
         it, or the kernel raises.  See ``mark_shuffled``.
         """
 
-        want = self.rows * math.prod(row_shape) * torch.empty(0, dtype=dtype).element_size()
+        want = (
+            self.rows
+            * math.prod(row_shape)
+            * torch.empty(0, dtype=dtype).element_size()
+        )
         if want != self.tensor_bytes:
             raise ValueError(
                 f"row_shape {row_shape} of {dtype} spans {want} B but the pool "
                 f"holds {self.tensor_bytes} B ({self.rows} rows x {self.row_bytes} B)"
             )
-        flat = torch.as_tensor(_RawBuf(self._base.value, self.tensor_bytes), device=self.device)
+        flat = torch.as_tensor(
+            _RawBuf(self._base.value, self.tensor_bytes), device=self.device
+        )
         return flat.view(dtype).view(self.rows, *row_shape)
 
     @staticmethod
@@ -375,10 +390,8 @@ class MoonEPVmmPool:
             self._base = _P(0)
 
     def __del__(self):  # best effort; explicit close() is the contract
-        try:
+        with contextlib.suppress(Exception):
             self.close()
-        except Exception:
-            pass
 
 
 # ------------------------------------------------------------------ internals

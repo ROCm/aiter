@@ -39,9 +39,8 @@ def _launcher(rank: int, balance: bool):
 
     sizes = moonep_lds_fields(npes=R, experts=E, slots=B)
     n_alloc, n_key, n_ecount, n_rem, n_quota, n_bal, n_etc, n_target = (
-        sizes[f"mp_{k}"] for k in (
-            "alloc", "key", "ecount", "rem", "quota", "bal", "etc", "target"
-        )
+        sizes[f"mp_{k}"]
+        for k in ("alloc", "key", "ecount", "rem", "quota", "bal", "etc", "target")
     )
 
     @fx.struct
@@ -74,29 +73,69 @@ def _launcher(rank: int, balance: bool):
     ):
         lds = fx.SharedAllocator().allocate(Lds).peek()
         emit_moonep_placement(
-            count, alloc_cumsum, expert_to_slot, slot_held, slot_prev, slot_placed,
-            lds.alloc.ptr, lds.key.ptr, lds.ecount.ptr, lds.rem.ptr,
-            lds.quota.ptr, lds.bal.ptr, lds.etc.ptr, lds.target.ptr,
-            num_waves=WAVES, npes=R, experts=E, slots=B,
-            count_stride=COUNT_STRIDE, balance=balance,
+            count,
+            alloc_cumsum,
+            expert_to_slot,
+            slot_held,
+            slot_prev,
+            slot_placed,
+            lds.alloc.ptr,
+            lds.key.ptr,
+            lds.ecount.ptr,
+            lds.rem.ptr,
+            lds.quota.ptr,
+            lds.bal.ptr,
+            lds.etc.ptr,
+            lds.target.ptr,
+            num_waves=WAVES,
+            npes=R,
+            experts=E,
+            slots=B,
+            count_stride=COUNT_STRIDE,
+            balance=balance,
         )
         emit_moonep_virtual_counts(
-            count, alloc_cumsum, expert_to_slot, logical_pair_base,
-            virtual_count, virtual_hist, virtual_pair_base,
-            num_waves=WAVES, npes=R, experts=E, slots=B, rank=rank,
-            count_stride=COUNT_STRIDE, virtual_stride=VIRTUAL_STRIDE,
+            count,
+            alloc_cumsum,
+            expert_to_slot,
+            logical_pair_base,
+            virtual_count,
+            virtual_hist,
+            virtual_pair_base,
+            num_waves=WAVES,
+            npes=R,
+            experts=E,
+            slots=B,
+            rank=rank,
+            count_stride=COUNT_STRIDE,
+            virtual_stride=VIRTUAL_STRIDE,
         )
 
     @flyc.jit
     def launch(
-        count: fx.Int64, alloc_cumsum: fx.Int64, expert_to_slot: fx.Int64,
-        slot_held: fx.Int64, slot_prev: fx.Int64, slot_placed: fx.Int64,
-        logical_pair_base: fx.Int64, virtual_count: fx.Int64,
-        virtual_hist: fx.Int64, virtual_pair_base: fx.Int64, stream: fx.Stream,
+        count: fx.Int64,
+        alloc_cumsum: fx.Int64,
+        expert_to_slot: fx.Int64,
+        slot_held: fx.Int64,
+        slot_prev: fx.Int64,
+        slot_placed: fx.Int64,
+        logical_pair_base: fx.Int64,
+        virtual_count: fx.Int64,
+        virtual_hist: fx.Int64,
+        virtual_pair_base: fx.Int64,
+        stream: fx.Stream,
     ):
         kernel(
-            count, alloc_cumsum, expert_to_slot, slot_held, slot_prev, slot_placed,
-            logical_pair_base, virtual_count, virtual_hist, virtual_pair_base,
+            count,
+            alloc_cumsum,
+            expert_to_slot,
+            slot_held,
+            slot_prev,
+            slot_placed,
+            logical_pair_base,
+            virtual_count,
+            virtual_hist,
+            virtual_pair_base,
         ).launch(grid=(1, 1, 1), block=(WAVES * 64, 1, 1), stream=stream)
 
     _LAUNCHERS[key] = launch
@@ -147,7 +186,7 @@ def _placement_reference(tpe):
         balance[home] += balance[dest]
         balance[dest] = 0
     for home in range(R):
-        remaining = count[home * EPN:(home + 1) * EPN].clone()
+        remaining = count[home * EPN : (home + 1) * EPN].clone()
         while int(quotas[home].max()) > 0:
             dest = int(quotas[home].argmax())
             local = int(remaining.argmax())
@@ -159,7 +198,7 @@ def _placement_reference(tpe):
     experts_to_copy = torch.full((R, B), -1, dtype=torch.int64)
     expert_to_slot = torch.full((R, E), -1, dtype=torch.int64)
     for dest in range(R):
-        expert_to_slot[dest, dest * EPN:(dest + 1) * EPN] = torch.arange(EPN)
+        expert_to_slot[dest, dest * EPN : (dest + 1) * EPN] = torch.arange(EPN)
         remote = [e for e in range(E) if alloc[e, dest] > 0 and e // EPN != dest]
         remote.sort(key=lambda e: (int(alloc[e, dest]), e), reverse=True)
         for slot, e in enumerate(remote[:B]):
@@ -220,7 +259,9 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
     dev = torch.device("cuda")
     tokens = 2048
     ids = _routing(tokens, skew, seed)
-    tpe = torch.stack([torch.bincount(ids[r].flatten().long(), minlength=E) for r in range(R)])
+    tpe = torch.stack(
+        [torch.bincount(ids[r].flatten().long(), minlength=E) for r in range(R)]
+    )
     count = torch.zeros(R, COUNT_STRIDE, dtype=torch.int32)
     count[:, :E] = tpe.to(torch.int32)
     logical_pair_base = torch.zeros(COUNT_STRIDE, dtype=torch.int32)
@@ -234,7 +275,7 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
         ref_etc = torch.full((R, B), -1, dtype=torch.int64)
         ref_slot = torch.full((R, E), -1, dtype=torch.int64)
         for d in range(R):
-            ref_slot[d, d * EPN:(d + 1) * EPN] = torch.arange(EPN)
+            ref_slot[d, d * EPN : (d + 1) * EPN] = torch.arange(EPN)
 
     held = torch.full((R, B), -1, dtype=torch.int64)
     if sticky_held:
@@ -242,7 +283,9 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
         for d in range(R):
             pool = [e for e in range(E) if e // EPN != d]
             wanted = [int(x) for x in ref_etc[d] if x >= 0]
-            picks = wanted[: B // 2] + [pool[int(i)] for i in torch.randperm(len(pool), generator=gen)[:B]]
+            picks = wanted[: B // 2] + [
+                pool[int(i)] for i in torch.randperm(len(pool), generator=gen)[:B]
+            ]
             uniq = []
             for e in picks:
                 if e not in uniq:
@@ -256,9 +299,11 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
         for s in range(B):
             if ref_etc[d, s] >= 0:
                 ref_slot_settled[d, ref_etc[d, s]] = EPN + int(target[d, s])
-    ref_vcount, ref_vbase = _virtual_reference(tpe, ref_alloc, ref_slot_settled, rank, logical_pair_base)
+    ref_vcount, ref_vbase = _virtual_reference(
+        tpe, ref_alloc, ref_slot_settled, rank, logical_pair_base
+    )
 
-    t = lambda x: x.to(dev, torch.int32).contiguous()  # noqa: E731
+    t = lambda x: x.to(dev, torch.int32).contiguous()
     g_count = t(count)
     g_cumsum = torch.zeros(E * R, dtype=torch.int32, device=dev)
     g_slot = torch.zeros(R * E, dtype=torch.int32, device=dev)
@@ -269,9 +314,21 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
     g_vcount = torch.full((R * VIRTUAL_STRIDE,), 77, dtype=torch.int32, device=dev)
     g_vhist = torch.full((VIRTUAL_STRIDE,), 77, dtype=torch.int32, device=dev)
     g_vbase = torch.full((VIRTUAL_STRIDE,), 77, dtype=torch.int32, device=dev)
-    args = [g_count, g_cumsum, g_slot, g_held, g_prev, g_placed, g_pair_base, g_vcount, g_vhist, g_vbase]
+    args = [
+        g_count,
+        g_cumsum,
+        g_slot,
+        g_held,
+        g_prev,
+        g_placed,
+        g_pair_base,
+        g_vcount,
+        g_vhist,
+        g_vbase,
+    ]
     _run_compiled(
-        _launcher(rank, balance), *[fx.Int64(a.data_ptr()) for a in args],
+        _launcher(rank, balance),
+        *[fx.Int64(a.data_ptr()) for a in args],
         fx.Stream(torch.cuda.current_stream().cuda_stream),
     )
     torch.cuda.synchronize()
@@ -290,17 +347,34 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
         "virtual_pair_base": torch.equal(
             torch.where(ref_vcount[rank] > 0, g_vbase.cpu().long(), 0), ref_vbase
         ),
-        "conservation": torch.equal(vcount.sum(0).view(-1)[: R * VS].view(R, VS).sum(1),
-                                    ref_alloc.sum(1)),
+        "conservation": torch.equal(
+            vcount.sum(0).view(-1)[: R * VS].view(R, VS).sum(1), ref_alloc.sum(1)
+        ),
     }
-    moved = int((ref_alloc.sum(1) - torch.tensor([int(tpe[:, d * EPN:(d + 1) * EPN].sum()) for d in range(R)])).abs().sum())
+    moved = int(
+        (
+            ref_alloc.sum(1)
+            - torch.tensor(
+                [int(tpe[:, d * EPN : (d + 1) * EPN].sum()) for d in range(R)]
+            )
+        )
+        .abs()
+        .sum()
+    )
     bad = [k for k, ok in checks.items() if not ok]
     if os.environ.get("MOONEP_TEST_DUMP"):
-        print("per-dest routes got", got_alloc.sum(1).tolist(), "ref", ref_alloc.sum(1).tolist())
+        print(
+            "per-dest routes got",
+            got_alloc.sum(1).tolist(),
+            "ref",
+            ref_alloc.sum(1).tolist(),
+        )
         print("etc got", g_placed.view(R, B).cpu().tolist())
         print("etc ref", ref_etc.tolist())
-    print(f"R={R} B={B} rank={rank} skew={skew} seed={seed} sticky={sticky_held} balance={balance} "
-          f"moved={moved} prefetch={int((ref_etc >= 0).sum())} -> {'OK' if not bad else 'FAIL ' + ','.join(bad)}")
+    print(
+        f"R={R} B={B} rank={rank} skew={skew} seed={seed} sticky={sticky_held} balance={balance} "
+        f"moved={moved} prefetch={int((ref_etc >= 0).sum())} -> {'OK' if not bad else 'FAIL ' + ','.join(bad)}"
+    )
     return not bad
 
 
@@ -321,10 +395,18 @@ def main() -> int:
     # Fewer ranks than the 8 prepare waves (EP4/EP2) leave waves idle per rank.
     parser.add_argument("--world", default="8,4,2")
     args = parser.parse_args()
-    cases = [(0, 1.2, 1, False, True), (3, 1.2, 2, True, True), (7, 0.0, 3, False, True),
-             (5, 0.8, 4, True, True), (2, 1.2, 5, True, False),
-             (1, -6.0, 6, False, True), (4, -6.0, 7, True, True), (6, -3.0, 8, True, True),
-             (0, -100.0, 9, False, True), (7, -100.0, 10, True, True)]
+    cases = [
+        (0, 1.2, 1, False, True),
+        (3, 1.2, 2, True, True),
+        (7, 0.0, 3, False, True),
+        (5, 0.8, 4, True, True),
+        (2, 1.2, 5, True, False),
+        (1, -6.0, 6, False, True),
+        (4, -6.0, 7, True, True),
+        (6, -3.0, 8, True, True),
+        (0, -100.0, 9, False, True),
+        (7, -100.0, 10, True, True),
+    ]
     if args.quick:
         cases = cases[:1]
     results = []

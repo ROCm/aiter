@@ -171,9 +171,9 @@ def _emit_home_placement(
             )
         home = e // fx.Int32(epn)
         for d in range_constexpr(R):
-            alloc_cumsum[e * fx.Int32(R) + fx.Int32(d)] = (
-                fx.Int32(d) >= home
-            ).select(total, fx.Int32(0))
+            alloc_cumsum[e * fx.Int32(R) + fx.Int32(d)] = (fx.Int32(d) >= home).select(
+                total, fx.Int32(0)
+            )
     for i in range(tid, fx.Int32(R * E), block):
         dest = i // fx.Int32(E)
         expert = i - dest * fx.Int32(E)
@@ -224,17 +224,32 @@ def emit_moonep_placement(
     """
 
     tables = (
-        addr_count, addr_alloc_cumsum, addr_expert_to_slot,
-        addr_slot_held, addr_slot_prev, addr_slot_placed,
+        addr_count,
+        addr_alloc_cumsum,
+        addr_expert_to_slot,
+        addr_slot_held,
+        addr_slot_prev,
+        addr_slot_placed,
     )
-    shape = dict(
-        num_waves=num_waves, npes=npes, experts=experts, slots=slots,
-        count_stride=count_stride,
-    )
+    shape = {
+        "num_waves": num_waves,
+        "npes": npes,
+        "experts": experts,
+        "slots": slots,
+        "count_stride": count_stride,
+    }
     if const_expr(balance):
         _emit_balanced_placement(
-            *tables, p_alloc, p_key, p_ecount, p_rem, p_quota, p_bal, p_etc,
-            p_target, **shape,
+            *tables,
+            p_alloc,
+            p_key,
+            p_ecount,
+            p_rem,
+            p_quota,
+            p_bal,
+            p_etc,
+            p_target,
+            **shape,
         )
     else:
         _emit_home_placement(*tables, **shape)
@@ -312,16 +327,12 @@ def _emit_balanced_placement(
         rank_target = routes_total // fx.Int32(R) + (
             tid < routes_total % fx.Int32(R)
         ).select(fx.Int32(1), fx.Int32(0))
-        _lds_store(
-            p_bal, group_total - rank_target, tid
-        )
+        _lds_store(p_bal, group_total - rank_target, tid)
     for i in range(tid, fx.Int32(E * R), block):
         e = i // fx.Int32(R)
         d = i - e * fx.Int32(R)
         home = e // fx.Int32(epn)
-        _lds_store(
-            p_alloc, (d == home).select(_lds_load(p_ecount, e), fx.Int32(0)), i
-        )
+        _lds_store(p_alloc, (d == home).select(_lds_load(p_ecount, e), fx.Int32(0)), i)
     fx.barrier()
 
     # Receiver quotas: most overloaded home to the roomiest destination.
@@ -342,9 +353,7 @@ def _emit_balanced_placement(
             active = best_v > fx.Int32(0)
             move = active.select(fx.Int32(0) - worst_v, fx.Int32(0))
             q_slot = best_h * fx.Int32(R) + worst_u
-            _lds_store(
-                p_quota, active.select(move, _lds_load(p_quota, q_slot)), q_slot
-            )
+            _lds_store(p_quota, active.select(move, _lds_load(p_quota, q_slot)), q_slot)
             _lds_store(p_bal, best_v - move, best_h)
             _lds_store(p_bal, active.select(fx.Int32(0), worst_v), worst_u)
     fx.barrier()
@@ -397,7 +406,9 @@ def _emit_balanced_placement(
             d * fx.Int32(E + 1) + e,
         )
     for d in range(tid, fx.Int32(R), block):
-        _lds_store(p_key, fx.Int32(_KEY_NOT_CANDIDATE), d * fx.Int32(E + 1) + fx.Int32(E))
+        _lds_store(
+            p_key, fx.Int32(_KEY_NOT_CANDIDATE), d * fx.Int32(E + 1) + fx.Int32(E)
+        )
     for i in range(tid, fx.Int32(R * B), block):
         _lds_store(p_etc, fx.Int32(-1), i)
     fx.barrier()
@@ -417,7 +428,9 @@ def _emit_balanced_placement(
     for other in range(fx.Int32(0), fx.Int32(E), 1):
         a = _lds_load(p_key, key_base + other)
         for c in range_constexpr(epl):
-            outranks = (a > cand_vals[c]) | ((a == cand_vals[c]) & (other > cand_ids[c]))
+            outranks = (a > cand_vals[c]) | (
+                (a == cand_vals[c]) & (other > cand_ids[c])
+            )
             ranks[c] = ranks[c] + outranks.select(fx.Int32(1), fx.Int32(0))
     for c in range_constexpr(epl):
         selected = (cand_vals[c] > fx.Int32(0)) & (ranks[c] < fx.Int32(B))
@@ -574,7 +587,9 @@ def emit_moonep_virtual_counts(
             slot = expert_to_slot[fx.Int32(d * E) + e]
             lows.append(previous)
             highs.append(cumulative)
-            columns.append(fx.Int32(d * vs) + (slot >= fx.Int32(0)).select(slot, fx.Int32(0)))
+            columns.append(
+                fx.Int32(d * vs) + (slot >= fx.Int32(0)).select(slot, fx.Int32(0))
+            )
             previous = cumulative
         source_begin = fx.Int32(0)
         base = logical_pair_base[e]
@@ -586,7 +601,9 @@ def emit_moonep_virtual_counts(
                 begin = (source_begin > lows[d]).select(source_begin, lows[d])
                 end = (source_end < highs[d]).select(source_end, highs[d])
                 if end > begin:
-                    virtual_count[fx.Int32(s * virtual_stride) + columns[d]] = end - begin
+                    virtual_count[fx.Int32(s * virtual_stride) + columns[d]] = (
+                        end - begin
+                    )
                     if const_expr(s == rank):
                         virtual_hist[columns[d]] = end - begin
                         virtual_pair_base[columns[d]] = base + begin - source_begin

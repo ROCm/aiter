@@ -15,13 +15,17 @@ import os
 
 os.environ.setdefault("MORI_SHMEM_HEAP_SIZE", "40G")
 
-import mori.shmem as ms  # noqa: E402
-import torch  # noqa: E402
-import torch.distributed as dist  # noqa: E402
+import mori.shmem  # noqa: F401
+import torch
+import torch.distributed as dist
+from test_mega_moe_v2 import (
+    _barrier,
+    _cleanup,
+    _quantize_weights,
+    _setup_dist,
+)
 
-from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2  # noqa: E402
-
-from test_mega_moe_v2 import _barrier, _cleanup, _quantize_weights, _setup_dist  # noqa: E402
+from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
 
 MODEL_DIM, INTER_DIM, EXPERTS, TOPK, SWIGLU = 7168, 3072, 384, 6, 10.0
 
@@ -34,10 +38,12 @@ def _routing(tokens, rank, step, device, *, hot):
         bias = torch.zeros(EXPERTS, device=device)
         hot_ranks = [(step % 8), (step + 3) % 8]
         for h in hot_ranks:
-            bias[h * 48:(h + 1) * 48] = 1.5
+            bias[h * 48 : (h + 1) * 48] = 1.5
         scores = scores + bias
     values, ids = torch.topk(scores, TOPK, dim=-1)
-    x = torch.randn((tokens, MODEL_DIM), dtype=torch.bfloat16, device=device, generator=gen)
+    x = torch.randn(
+        (tokens, MODEL_DIM), dtype=torch.bfloat16, device=device, generator=gen
+    )
     return x, values.softmax(-1).contiguous(), ids.to(torch.int32).contiguous()
 
 
@@ -46,19 +52,39 @@ def main():
     parser.add_argument("--tokens", type=int, default=4096)
     parser.add_argument("--slots", type=int, default=8)
     parser.add_argument("--steps", type=int, default=4)
-    parser.add_argument("--layers", type=int, default=2,
-                        help="weight windows sharing one instance, like model layers")
-    parser.add_argument("--skip-prefetch", action="store_true",
-                        help="negative control: leave the slots stale")
-    parser.add_argument("--shared-state", action="store_true",
-                        help="negative control: all layers share one slot state")
-    parser.add_argument("--mtpr", type=int, default=0,
-                        help="instance capacity (default: --tokens), e.g. decode batches "
-                             "far below a prefill-sized instance")
-    parser.add_argument("--stream", action="store_true",
-                        help="pass an explicit side stream to forward()")
-    parser.add_argument("--graph", action="store_true",
-                        help="run the fused instance from one CUDA graph per layer")
+    parser.add_argument(
+        "--layers",
+        type=int,
+        default=2,
+        help="weight windows sharing one instance, like model layers",
+    )
+    parser.add_argument(
+        "--skip-prefetch",
+        action="store_true",
+        help="negative control: leave the slots stale",
+    )
+    parser.add_argument(
+        "--shared-state",
+        action="store_true",
+        help="negative control: all layers share one slot state",
+    )
+    parser.add_argument(
+        "--mtpr",
+        type=int,
+        default=0,
+        help="instance capacity (default: --tokens), e.g. decode batches "
+        "far below a prefill-sized instance",
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="pass an explicit side stream to forward()",
+    )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="run the fused instance from one CUDA graph per layer",
+    )
     args = parser.parse_args()
     rank, world, device = _setup_dist()
     epr = EXPERTS // world
@@ -71,18 +97,24 @@ def main():
         layers = []
         for layer in range(args.layers):
             everyone = [
-                _quantize_weights(MODEL_DIM, INTER_DIM, epr, r, 7 + 31 * layer, device)[:4]
+                _quantize_weights(MODEL_DIM, INTER_DIM, epr, r, 7 + 31 * layer, device)[
+                    :4
+                ]
                 for r in range(world)
             ]
             home = everyone[rank]
             # All experts, flattened per expert, in global order.
             bank = [torch.cat([per_expert(e[i]) for e in everyone]) for i in range(4)]
             windows = [
-                torch.cat([per_expert(t), torch.zeros_like(per_expert(t)[:B])]).contiguous()
+                torch.cat(
+                    [per_expert(t), torch.zeros_like(per_expert(t)[:B])]
+                ).contiguous()
                 for t in home
             ]
             views = [win.view(t.dtype) for win, t in zip(windows, home)]
-            layers.append(dict(home=home, bank=bank, windows=windows, views=views))
+            layers.append(
+                {"home": home, "bank": bank, "windows": windows, "views": views}
+            )
             del everyone
 
         def bind_plain(moe, layer):
@@ -98,21 +130,41 @@ def main():
 
         first = layers[0]
         plain = MegaMoEV2(
-            rank=rank, world_size=world, model_dim=MODEL_DIM, inter_dim=INTER_DIM,
-            experts=EXPERTS, topk=TOPK, quant="a8w4", w1=first["home"][0],
-            w1_scale=first["home"][1], w2=first["home"][2], w2_scale=first["home"][3],
-            max_tok_per_rank=args.mtpr or args.tokens, swiglu_limit=SWIGLU,
+            rank=rank,
+            world_size=world,
+            model_dim=MODEL_DIM,
+            inter_dim=INTER_DIM,
+            experts=EXPERTS,
+            topk=TOPK,
+            quant="a8w4",
+            w1=first["home"][0],
+            w1_scale=first["home"][1],
+            w2=first["home"][2],
+            w2_scale=first["home"][3],
+            max_tok_per_rank=args.mtpr or args.tokens,
+            swiglu_limit=SWIGLU,
         )
         fused = MegaMoEV2(
-            rank=rank, world_size=world, model_dim=MODEL_DIM, inter_dim=INTER_DIM,
-            experts=world * (epr + B), topk=TOPK, quant="a8w4",
-            w1=first["views"][0], w1_scale=first["views"][1], w2=first["views"][2],
-            w2_scale=first["views"][3], max_tok_per_rank=args.mtpr or args.tokens,
-            swiglu_limit=SWIGLU, moonep_slots=B,
+            rank=rank,
+            world_size=world,
+            model_dim=MODEL_DIM,
+            inter_dim=INTER_DIM,
+            experts=world * (epr + B),
+            topk=TOPK,
+            quant="a8w4",
+            w1=first["views"][0],
+            w1_scale=first["views"][1],
+            w2=first["views"][2],
+            w2_scale=first["views"][3],
+            max_tok_per_rank=args.mtpr or args.tokens,
+            swiglu_limit=SWIGLU,
+            moonep_slots=B,
         )
         shared = fused.new_moonep_slot_state()
         for layer in layers:
-            layer["state"] = shared if args.shared_state else fused.new_moonep_slot_state()
+            layer["state"] = (
+                shared if args.shared_state else fused.new_moonep_slot_state()
+            )
 
         def prefetch(layer):
             if args.skip_prefetch:
@@ -123,7 +175,9 @@ def main():
             src = want.clamp(min=0)
             for win, all_experts in zip(layer["windows"], layer["bank"]):
                 rows = win[epr:]
-                rows.copy_(torch.where(copy[:, None], all_experts.index_select(0, src), rows))
+                rows.copy_(
+                    torch.where(copy[:, None], all_experts.index_select(0, src), rows)
+                )
 
         graphs = {}
         side = torch.cuda.Stream()
@@ -135,7 +189,9 @@ def main():
 
                 def run():
                     return fused.forward(
-                        static["x"], static["wts"], static["ids"],
+                        static["x"],
+                        static["wts"],
+                        static["ids"],
                         after_prepare=lambda: prefetch(layer),
                     )
 
@@ -155,9 +211,13 @@ def main():
         ok = True
         for step in range(args.steps):
             for index, layer in enumerate(layers):
-                for balance in ((True, False) if step == 0 and not args.graph else (True,)):
+                for balance in (
+                    (True, False) if step == 0 and not args.graph else (True,)
+                ):
                     # Layers see different hot experts, so their slots diverge.
-                    x, wts, ids = _routing(args.tokens, rank, step + 5 * index, device, hot=step % 2 == 0)
+                    x, wts, ids = _routing(
+                        args.tokens, rank, step + 5 * index, device, hot=step % 2 == 0
+                    )
                     bind_plain(plain, layer)
                     ref = plain.forward(x, wts, ids).clone()
                     _barrier()
@@ -168,14 +228,21 @@ def main():
                         # The slot fill must follow prepare onto this stream.
                         side.wait_stream(torch.cuda.current_stream())
                         out = fused.forward(
-                            x, wts, ids, stream=side, moonep_balance=balance,
+                            x,
+                            wts,
+                            ids,
+                            stream=side,
+                            moonep_balance=balance,
                             after_prepare=lambda layer=layer: prefetch(layer),
                         )
                         torch.cuda.current_stream().wait_stream(side)
                         out = out.clone()
                     else:
                         out = fused.forward(
-                            x, wts, ids, moonep_balance=balance,
+                            x,
+                            wts,
+                            ids,
+                            moonep_balance=balance,
                             after_prepare=lambda layer=layer: prefetch(layer),
                         ).clone()
                     _barrier()
@@ -186,7 +253,9 @@ def main():
                     placed, prev = fused.moonep_slot_tables()
                     prefetched = int((placed >= 0).sum())
                     kept = int(((placed >= 0) & (placed == prev)).sum())
-                    stats = torch.tensor([max_rel, float(exact), prefetched, kept], device=device)
+                    stats = torch.tensor(
+                        [max_rel, float(exact), prefetched, kept], device=device
+                    )
                     gathered = [torch.zeros_like(stats) for _ in range(world)]
                     dist.all_gather(gathered, stats)
                     if rank == 0:
@@ -194,10 +263,13 @@ def main():
                         exacts = sum(int(g[1]) for g in gathered)
                         step_ok = max(rels) < 2e-2
                         ok &= step_ok
-                        print(f"step={step} layer={index} balance={balance} hot={step % 2 == 0} "
-                              f"placed={int(gathered[0][2])} kept={int(gathered[0][3])} "
-                              f"exact_ranks={exacts}/{world} max_rel={max(rels):.3e} "
-                              f"-> {'OK' if step_ok else 'FAIL'}", flush=True)
+                        print(
+                            f"step={step} layer={index} balance={balance} hot={step % 2 == 0} "
+                            f"placed={int(gathered[0][2])} kept={int(gathered[0][3])} "
+                            f"exact_ranks={exacts}/{world} max_rel={max(rels):.3e} "
+                            f"-> {'OK' if step_ok else 'FAIL'}",
+                            flush=True,
+                        )
         if rank == 0:
             print("ALL_OK" if ok else "SOME_FAILED", flush=True)
     finally:

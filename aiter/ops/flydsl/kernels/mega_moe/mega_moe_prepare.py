@@ -81,19 +81,32 @@ def compile_mega_moe_prepare(
         lds_sizes = moonep_lds_fields(
             npes=npes, experts=route_experts, slots=moonep_slots
         )
+        mp = {k[3:]: v for k, v in lds_sizes.items()}
+        n_alloc, n_key, n_ecount, n_rem = (
+            mp["alloc"],
+            mp["key"],
+            mp["ecount"],
+            mp["rem"],
+        )
+        n_quota, n_bal, n_etc, n_target = (
+            mp["quota"],
+            mp["bal"],
+            mp["etc"],
+            mp["target"],
+        )
 
         @fx.struct
         class SharedStorage:
             ticket: fx.Array[fx.Int64, 1, 8]
             count_scratch: fx.Array[fx.Int32, total_segments, 16]
-            mp_alloc: fx.Array[fx.Int32, lds_sizes["mp_alloc"], 16]
-            mp_key: fx.Array[fx.Int32, lds_sizes["mp_key"], 16]
-            mp_ecount: fx.Array[fx.Int32, lds_sizes["mp_ecount"], 16]
-            mp_rem: fx.Array[fx.Int32, lds_sizes["mp_rem"], 16]
-            mp_quota: fx.Array[fx.Int32, lds_sizes["mp_quota"], 16]
-            mp_bal: fx.Array[fx.Int32, lds_sizes["mp_bal"], 16]
-            mp_etc: fx.Array[fx.Int32, lds_sizes["mp_etc"], 16]
-            mp_target: fx.Array[fx.Int32, lds_sizes["mp_target"], 16]
+            mp_alloc: fx.Array[fx.Int32, n_alloc, 16]
+            mp_key: fx.Array[fx.Int32, n_key, 16]
+            mp_ecount: fx.Array[fx.Int32, n_ecount, 16]
+            mp_rem: fx.Array[fx.Int32, n_rem, 16]
+            mp_quota: fx.Array[fx.Int32, n_quota, 16]
+            mp_bal: fx.Array[fx.Int32, n_bal, 16]
+            mp_etc: fx.Array[fx.Int32, n_etc, 16]
+            mp_target: fx.Array[fx.Int32, n_target, 16]
 
     else:
 
@@ -234,8 +247,14 @@ def compile_mega_moe_prepare(
             moonep_lds = ()
             if const_expr(moonep_slots > 0):
                 moonep_lds = (
-                    lds.mp_alloc.ptr, lds.mp_key.ptr, lds.mp_ecount.ptr, lds.mp_rem.ptr,
-                    lds.mp_quota.ptr, lds.mp_bal.ptr, lds.mp_etc.ptr, lds.mp_target.ptr,
+                    lds.mp_alloc.ptr,
+                    lds.mp_key.ptr,
+                    lds.mp_ecount.ptr,
+                    lds.mp_rem.ptr,
+                    lds.mp_quota.ptr,
+                    lds.mp_bal.ptr,
+                    lds.mp_etc.ptr,
+                    lds.mp_target.ptr,
                 )
             if owner:
                 emit_dispatch_plan(

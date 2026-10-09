@@ -52,14 +52,10 @@ def main() -> int:
         dtype=torch.bfloat16,
         block_num=256,
     )
-    pool.stage_home(
-        torch.stack([expert_w(rank * EPN + k, dev) for k in range(EPN)])
-    )
+    pool.stage_home(torch.stack([expert_w(rank * EPN + k, dev) for k in range(EPN)]))
 
     nxt, far = (rank + 1) % world, (rank + 3) % world
-    sel = torch.tensor(
-        [nxt * EPN, -1, far * EPN + 2], dtype=torch.int32, device=dev
-    )
+    sel = torch.tensor([nxt * EPN, -1, far * EPN + 2], dtype=torch.int32, device=dev)
     failures = []
 
     def check(tag, slot, expected):
@@ -111,7 +107,9 @@ def main() -> int:
             group=groups[gid],
         )
         sub_pool.stage_home(
-            torch.stack([expert_w(1000 * gid + local * EPN + k, dev) for k in range(EPN)])
+            torch.stack(
+                [expert_w(1000 * gid + local * EPN + k, dev) for k in range(EPN)]
+            )
         )
         sub_pools.append(sub_pool)
     fds_grown = len(os.listdir("/proc/self/fd")) - fds_before
