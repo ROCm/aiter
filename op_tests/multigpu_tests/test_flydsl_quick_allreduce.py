@@ -264,6 +264,7 @@ RELAY_CASES = (
     (12288, 5120, "int4"),
     (1024, 5120, "fp16"),
     (8191, 5120, "fp16"),
+    (1024, 5120, "int5"),
     (1024, 5120, "int6"),
 )
 # The default relay rows that also run under CUDA-graph replay: 80 MiB is on
@@ -1512,7 +1513,7 @@ def main():
         "--relay-codec",
         nargs="*",
         default=["int4", "fp16"],
-        choices=("int4", "fp16", "int6"),
+        choices=("int4", "int5", "int6", "fp16"),
         help="Wire formats of the relay rows; fp16 is the lossless one.",
     )
     parser.add_argument(
@@ -1541,7 +1542,6 @@ def main():
         else:
             tps.append(tp)
     algos = args.algorithm
-    sweep_tps = tps
     dts = [d for d in args.dtype if d == dtypes.bf16]
     if len(dts) != len(args.dtype):
         aiter.logger.warning("FlyQuickAllReduce payload is bf16; skipping others")
@@ -1554,7 +1554,7 @@ def main():
     # Payloads, and the production window when there is one, per schedule.
     plans = {
         (tp, algorithm): _ship_payloads(tp, algorithm, link)
-        for tp, algorithm in itertools.product(sweep_tps, algos)
+        for tp, algorithm in itertools.product(tps, algos)
     }
     # Engines exactly as production builds them: only these are checked for
     # kernel coverage.
@@ -1609,7 +1609,7 @@ def main():
             for tp, algorithm, tokens, hidden, block, skip_self in (
                 KNOB_CASES + (EXTENDED_KNOB_CASES if args.extended else ())
             )
-            if tp in sweep_tps and algorithm in algos
+            if tp in tps and algorithm in algos
         ]
     if dts:
         for tokens, hidden, tp, algorithm, grid_cap, graph, block, ss in ship + knobs:
@@ -1617,16 +1617,14 @@ def main():
                 _ship_key(tp, algorithm, grid_cap, block, ss),
                 (tokens, hidden, "normal", graph, True, 1),
             )
-    edge = [c for c in EDGE_CASES if c[0] in sweep_tps and c[1] in algos]
+    edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, tokens, hidden, fill in edge:
         _register(
             _ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False, 1)
         )
     pinned = []
     if args.extended:
-        pinned = [
-            c for c in PINNED_CODEC_CASES if c[0] in sweep_tps and "ring" in algos
-        ]
+        pinned = [c for c in PINNED_CODEC_CASES if c[0] in tps and "ring" in algos]
     for tp, tokens, hidden, rs, ag in pinned:
         _register(
             _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
@@ -1641,7 +1639,7 @@ def main():
         for shape in [SUB_TILE_SHAPE] + [(n // _ROW_BYTES, HIDDEN) for n in payloads]
     ]
     if args.extended:
-        transport += [c for c in TRANSPORT_CASES if c[0] in sweep_tps and c[1] in algos]
+        transport += [c for c in TRANSPORT_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, tokens, hidden, st, block, ss in transport:
         _register(
             _transport_key(tp, algorithm, st, block, ss),
@@ -1659,14 +1657,26 @@ def main():
     if relay_pairs is None:
         has_default = (link, 2, ARCH) in MESH_RELAY_DEFAULTS
         relay_pairs = [DEFAULT_RELAY] if n_gpu >= 4 and has_default else []
-    relay_pairs = [tuple(p) for p in relay_pairs if isinstance(p, tuple)]
+    malformed = [p for p in relay_pairs if not isinstance(p, tuple)]
+    if malformed:
+        aiter.logger.warning(
+            "--relay expects device,device pairs; skipping %s", malformed
+        )
+    relay_pairs = [p for p in relay_pairs if isinstance(p, tuple)]
     relay = []
     threshold_added = False
     if 2 in tps and "mesh" in algos and dts:
         for pair in relay_pairs:
-            if len(pair) != 2 or max(pair) >= n_gpu or {0, 1} & set(pair):
+            if (
+                len(pair) != 2
+                or len(set(pair)) != 2
+                or min(pair) < 0
+                or max(pair) >= n_gpu
+                or {0, 1} & set(pair)
+            ):
                 aiter.logger.warning(
-                    "relay %s needs two devices outside 0,1 and below %s; skipping",
+                    "relay %s needs two distinct devices outside 0,1 and below %s; "
+                    "skipping",
                     pair,
                     n_gpu,
                 )

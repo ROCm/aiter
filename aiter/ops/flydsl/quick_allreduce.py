@@ -399,6 +399,14 @@ class FlyQuickAllReduce:
             raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
         if block is not None and block not in SUPPORTED_BLOCKS:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
+        if relay_devices is None and (
+            relay_fraction is not None
+            or relay_min_bytes is not None
+            or relay_provider is not None
+        ):
+            raise ValueError(
+                "relay_fraction, relay_min_bytes and relay_provider need relay_devices"
+            )
         if skip_self and not algo.supports_skip_self:
             raise ValueError(
                 f"skip_self does not apply to algorithm={algorithm!r}: it never "
@@ -686,22 +694,25 @@ class FlyQuickAllReduce:
         views = UncachedIpcHeap.gather_object_list_via_broadcast(
             self.group, (err, mine)
         )
-        for rank_err, _ in views:
-            if rank_err is not None:
-                raise ValueError(rank_err)
+        failures = UncachedIpcHeap.rank_failures([v[0] for v in views])
+        if failures:
+            raise RuntimeError(failures)
         (_, a), (_, b) = views
-        if a[1:] != b[1:]:
-            raise ValueError(
+        # Device ordinals are per process; the bus ids are what the ranks share.
+        if (a[1], a[3], a[4]) != (b[1], b[3], b[4]):
+            raise RuntimeError(
                 "ranks disagree on the relay setup: "
-                f"(relay buses, devices, fraction, min_bytes) {a[1:]} vs {b[1:]}"
+                f"(relay buses, fraction, min_bytes) {(a[1], a[3], a[4])} vs "
+                f"{(b[1], b[3], b[4])}"
             )
         if a[0] == b[0] or {a[0], b[0]} & set(a[1]):
-            raise ValueError(
+            raise RuntimeError(
                 f"relay buses {a[1]} must differ from the TP devices {(a[0], b[0])}"
             )
-        self.relay_devices = a[2]
-        self.relay_fraction = a[3]
-        self.relay_min_bytes = a[4]
+        own = views[self.rank][1]
+        self.relay_devices = own[2]
+        self.relay_fraction = own[3]
+        self.relay_min_bytes = own[4]
 
     @property
     def inbox_bytes(self) -> int:
@@ -815,7 +826,7 @@ class FlyQuickAllReduce:
         if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
             raise ValueError("FlyQuickAllReduce requires 16-byte-aligned input/output")
         live_bytes = int(inp.numel()) * int(inp.element_size())
-        if live_bytes > 0xFFFFFFFF:
+        if live_bytes > _MAX_PAYLOAD:
             raise ValueError(
                 "FlyQuickAllReduce payload must not exceed the 4 GiB buffer window"
             )

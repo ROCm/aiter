@@ -245,10 +245,10 @@ def _buffer_store(ptr, elem_off, vec, cache_modifier=0):
     fx.copy(atom, reg, fx.make_view(ptr + elem_off, fx.make_layout(vec.numel, 1)))
 
 
-def _load_peers(peer_ptrs, world_size):
-    """The ``world_size`` inbox base addresses from the device-side peer table."""
+def _load_peers(peer_ptrs, n):
+    """The first ``n`` addresses of the device-side peer table."""
     table = _buffer_ptr(peer_ptrs, T.i64, 8)
-    return [_buffer_load(table, i, 1, fx.Int64)[0] for i in range(world_size)]
+    return [_buffer_load(table, i, 1, fx.Int64)[0] for i in range(n)]
 
 
 def _color_io(colors_ptr, bid):

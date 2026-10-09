@@ -20,21 +20,6 @@ import torch
 
 from .quick_allreduce_ipc import UncachedIpcHeap
 
-# ``(first GPU, second GPU)`` of each xGMI pair on an 8-GPU node.
-_PAIRS = ((0, 1), (2, 3), (4, 5), (6, 7))
-
-
-def tp2_relays(pair_index: int) -> tuple[int, int]:
-    """``(relay for rank0→rank1, relay for rank1→rank0)`` of an ``_PAIRS`` pair.
-
-    Each direction bounces through the same slot of the next pair, so no relay
-    is a member of the pair and no GPU relays for two pairs in one direction.
-    """
-    if not 0 <= pair_index < len(_PAIRS):
-        raise ValueError(f"pair_index must be in [0, {len(_PAIRS)}), got {pair_index}")
-    first, second = _PAIRS[(pair_index + 1) % len(_PAIRS)]
-    return first, second
-
 
 @dataclass
 class RelayBounce:
@@ -131,7 +116,9 @@ class InGroupRelayProvider:
 
     @staticmethod
     def _release(heap, own, opened) -> None:
-        if opened is not None:
-            heap.close_mem_handle(opened)
-        if own is not None:
-            heap.free_device_mem(own)
+        try:
+            if opened is not None:
+                heap.close_mem_handle(opened)
+        finally:
+            if own is not None:
+                heap.free_device_mem(own)

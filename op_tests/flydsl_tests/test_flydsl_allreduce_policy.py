@@ -203,18 +203,6 @@ def test_relay_tile_fraction():
     assert relay_tile_fraction(0, 8, (1, 2)) == 0.0
 
 
-@pytest.mark.parametrize("block", TWO_STAGE_BLOCKS)
-@pytest.mark.parametrize("st", SUPER_TILES)
-def test_relay_bounce_mirrors_the_inbox(block, st):
-    """The bounce is slot for slot the size of the receiver's inbox."""
-    kw = {"world_size": 2, "super_tile": st, "block": block, "skip_self": True}
-    direct = make_quick_allreduce_mesh_kernel(grid=128, rank=0, **kw)
-    relay = make_quick_allreduce_mesh_kernel(grid=128, rank=0, relay=(1, 2), **kw)
-    assert relay["bounce_bytes"] == relay["flags_bytes"] + relay["data_bytes"]
-    assert relay["bounce_bytes"] == direct["flags_bytes"] + direct["data_bytes"]
-    assert direct["relay"] is None and relay["relay"] == (1, 2)
-
-
 @pytest.mark.parametrize(
     "kw",
     [

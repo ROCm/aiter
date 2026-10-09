@@ -195,7 +195,9 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
 
 
 # ``(link, world_size, arch) -> (relay_min_bytes, (num, den))``. Used only when
-# the caller passes ``relay_devices``; production dispatch does not. From which
+# the caller passes ``relay_devices``; production dispatch does not, because the
+# relay GPUs may host other work, and the per-process VRAM and context cost on
+# them, with all four pairs relaying at once, is unmeasured. From which
 # payload those engines relay, and the share of blocks they relay. Measured
 # under CUDA-graph replay on an idle node with the 4-bit wire at hidden size
 # 5120, as the speedup over the direct engine: 3/8 gives about 1.4x from 20 to
@@ -847,10 +849,12 @@ def make_quick_allreduce_mesh_kernel(
         quick_allreduce_mesh.func.__name__ = f"quick_allreduce_mesh_{tag}"
     except AttributeError:
         pass
+    flags_bytes = flags_i32 * 4
+    data_bytes = PHASES * grid * world_size * wire_tile_bytes
     return {
         "launch": launch_quick_allreduce_mesh,
-        "flags_bytes": flags_i32 * 4,
-        "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
+        "flags_bytes": flags_bytes,
+        "data_bytes": data_bytes,
         "lds_bytes": lds_bytes,
         "tile_bytes": tile_bytes,
         "tile_fp16": tile_bytes // 2,
@@ -869,5 +873,5 @@ def make_quick_allreduce_mesh_kernel(
         "skip_self": skip_self,
         "relay": relay,
         # The bounce mirrors the receiver's inbox slot for slot.
-        "bounce_bytes": flags_i32 * 4 + PHASES * grid * world_size * wire_tile_bytes,
+        "bounce_bytes": flags_bytes + data_bytes,
     }
