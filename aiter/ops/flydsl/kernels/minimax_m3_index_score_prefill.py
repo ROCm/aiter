@@ -350,7 +350,18 @@ def resolve_config(
     """
     cfg = cfg or PrefillScoreConfig()
     if cfg.fp8_mfma < 0:
-        cfg = replace(cfg, fp8_mfma=1)
+        # CDNA4 only. The fp8 operand path is built around gfx950's fp8 traits
+        # -- one staged slot is one k-step (q_per_load 1, lane_k 8) -- and
+        # gfx942's fp8 traits are 8 k-steps over 4 Q loads with lane_k 4, so
+        # `q_operand` read four slots past the staged Q (verified by forcing
+        # the arch and compiling: "ks=4 j=4 q_loads=4").
+        #
+        # Demoted rather than remapped: an fp8 cache on gfx942 is widened to
+        # bf16 and takes the generic path, which this module's bf16 arm already
+        # exercises. Remapping the fragments would be a numerics change nobody
+        # can validate without the part. Costs fp8 MFMA throughput on gfx942,
+        # which has no measured baseline here anyway.
+        cfg = replace(cfg, fp8_mfma=1 if arch == _CDNA4 else 0)
     if not cfg.waves:
         # Before tile_q, which it decides. Only on the k_lds path: the register
         # path gives every wave every feature tile, so a wider CTA buys no
@@ -574,6 +585,15 @@ def build_prefill_score(fp8: bool, cfg: PrefillScoreConfig, arch: str = DEFAULT_
     # Feed the fp8 MFMA directly instead of widening K to bf16. Only reachable
     # on an fp8 cache; a bf16 cache has nothing to round down.
     FP8_MFMA = fp8 and cfg.fp8_mfma > 0
+    if FP8_MFMA and arch != _CDNA4:
+        # The operand path assumes gfx950's fp8 traits; see the demotion in
+        # `resolve_config`. Auto never selects this here, so reaching it means
+        # an explicit `fp8_mfma=1`, which is a request to build a kernel that
+        # reads past its staged Q rather than a slower one.
+        raise ValueError(
+            f"fp8_mfma needs {_CDNA4}'s fp8 fragment layout, not {arch}; "
+            "leave it on auto to widen the cache to bf16 instead"
+        )
     # gfx942's fp8 is e4m3FNUZ, gfx950's is e4m3fn, and they differ in exponent
     # bias -- binding one as the other reads every value at the wrong scale.
     # See `_fp8_t` in the decode scorer, which this shares.
@@ -2177,6 +2197,13 @@ def score_prefill_flydsl(
     _validate_tensor(cu_seqlens_q, "cu_seqlens_q", (torch.int32,), 1, dev)
     _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, dev)
     _validate_tensor(prefix_lens, "prefix_lens", (torch.int32,), 1, dev)
+    # `cache` is validated unbounded because the whole tensor is addressed
+    # page by page, not as one span -- but each page descriptor's
+    # `num_records_bytes` is narrowed to int32 (see `k_unit`), so one page's
+    # byte stride still has to fit. A padded cache past that truncates the
+    # bound and reads the wrong K. Same check the decode scorer carries.
+    if cache.stride(0) * cache.element_size() > 0x7FFFFFFF:
+        raise ValueError("cache: a single page span exceeds int32")
     fp8 = cache.dtype != torch.bfloat16
     # Q's dtype is read off the tensor, never guessed: bound as bfloat16
     # unconditionally, an fp8 Q -- which is what aiter's own prefill op takes

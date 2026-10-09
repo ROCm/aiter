@@ -33,6 +33,8 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import shuffle_cache
 from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    _WIDE_CTA_TILE_Q,
+    TILE_Q_CHOICES,
     PrefillScoreConfig,
     alloc_score,
     resolve_config,
@@ -287,16 +289,114 @@ def test_cdna4_only_knobs_are_arch_gated():
         arch="gfx942",
     )
     assert (off.k128, off.m32, off.k_lds) == (0, 0, 0)
+    # fp8_mfma goes with them: the fp8 operand path assumes gfx950's fragment
+    # traits, so an fp8 cache is widened to bf16 here instead.
+    assert off.fp8_mfma == 0
     # The wide CTA rides on k_lds; taking it without one gives a wave every
-    # feature tile and spills.
-    assert off.waves == 4 and off.tile_q == 128
+    # feature tile and spills. tile_q is whatever the bf16 register bound
+    # allows -- not pinned, since demoting fp8_mfma changes that budget -- but
+    # it must not be the wide-CTA geometry.
+    assert off.waves == 4
+    assert off.tile_q in TILE_Q_CHOICES and off.tile_q != _WIDE_CTA_TILE_Q
 
+    # m32 alone still names MFMA_Scale; k128 cannot be reached without
+    # fp8_mfma, which gfx942 now refuses first and separately.
     with pytest.raises(ValueError, match="MFMA_Scale"):
+        build_prefill_score(True, PrefillScoreConfig(shuffled=True, m32=1), "gfx942")
+    with pytest.raises(ValueError, match="fp8 fragment layout"):
         build_prefill_score(
             True,
             PrefillScoreConfig(shuffled=True, k128=1, k_lds=1, fp8_mfma=1),
             "gfx942",
         )
+
+
+def test_rejects_cache_page_span_past_int32():
+    """Each page descriptor narrows `num_records_bytes` to int32, so one page's
+    byte stride has to fit even though the cache is addressed page by page.
+
+    Only reachable on a bf16 cache: `_validate_tensor` already rejects any
+    stride above 0x7FFFFFFF, which covers fp8 at one byte per element, but a
+    bf16 stride half that size is legal there and still doubles past the
+    descriptor bound. Checked with a one-page strided view so nothing of that
+    size is allocated, and the assertion is the rejection -- never a launch.
+    """
+    batch, q_len, ctx = 1, 128, 128
+    dev = "cuda"
+    mb = ctx // PAGE
+    seq = torch.full((batch,), ctx, dtype=torch.int32, device=dev)
+    prefix = torch.full((batch,), ctx - q_len, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=dev)
+    q = (torch.randn(batch * q_len, 1, HEAD_DIM, device=dev) / 4).bfloat16()
+    cache = (torch.randn(batch * mb, PAGE, HEAD_DIM, device=dev) / 4).bfloat16()
+    bt = torch.zeros((batch, mb), dtype=torch.int32, device=dev)
+    assert cache.shape[0] == 1 and cache.element_size() == 2
+
+    big = 0x40000000  # 16-aligned, under _validate_tensor's bound, 2 GB in bytes
+    wide = torch.as_strided(cache, cache.shape, (big, HEAD_DIM, 1))
+    assert big <= 0x7FFFFFFF < big * cache.element_size()
+
+    with pytest.raises(ValueError, match="page span exceeds int32"):
+        score_prefill_flydsl(q, wide, bt, cu, seq, prefix, q_len, ctx, 1.0 / LOG2E)
+    # The ordinary cache is nowhere near the bound and still runs.
+    score_prefill_flydsl(q, cache, bt, cu, seq, prefix, q_len, ctx, 1.0 / LOG2E)
+
+
+def test_gfx942_fp8_cache_is_widened_not_fp8_mfma():
+    """gfx942 must not take the fp8 operand path, and must still be correct.
+
+    The fp8 fragment layout here is gfx950's: one staged slot is one k-step
+    (q_per_load 1, lane_k 8). gfx942's fp8 traits are 8 k-steps over 4 Q loads,
+    so `q_operand` indexed four slots past the staged Q -- `ks=4 j=4
+    q_loads=4`, reading the next feature tile. Nothing caught it because the
+    gfx942 prefill path had never been COMPILED by this suite, only built
+    lazily; that is what forcing the arch below fixes.
+    """
+    import types
+
+    dev = torch.device("cuda")
+    assert (
+        resolve_config(
+            4096, 1, 1, 1024, cfg=PrefillScoreConfig(), device=dev, arch="gfx942"
+        ).fp8_mfma
+        == 0
+    )
+    assert (
+        resolve_config(
+            4096, 1, 1, 1024, cfg=PrefillScoreConfig(), device=dev, arch="gfx950"
+        ).fp8_mfma
+        == 1
+    )
+    # Explicit is refused rather than quietly built.
+    from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+        build_prefill_score,
+    )
+
+    with pytest.raises(ValueError, match="fp8 fragment layout"):
+        build_prefill_score(True, PrefillScoreConfig(fp8_mfma=1), "gfx942")
+
+    # And the demoted path actually compiles and scores. Report gfx942 while
+    # executing here: enough to compile that path, which is where the overrun
+    # lived. Widening rounds differently from the fp8 MFMA, so this is a
+    # tolerance check against aiter, not the bit-exact one the fp8 arms get.
+    c = make_case(1, 256, 2048)
+    ref, live = reference(c)
+    real = torch.cuda.get_device_properties
+
+    def fake(d):
+        p = real(d)
+        return types.SimpleNamespace(
+            gcnArchName="gfx942", multi_processor_count=p.multi_processor_count
+        )
+
+    torch.cuda.get_device_properties = fake
+    try:
+        got = run(c, c["cache"])
+    finally:
+        torch.cuda.get_device_properties = real
+    assert int((live & (got == SENTINEL)).sum()) == 0, "live slots left unwritten"
+    diff = (got[live] - ref[live]).abs().max().item()
+    assert diff < 1e-3, f"gfx942 widened path: max abs diff {diff}"
 
 
 def test_rejects_malformed_tensors():
