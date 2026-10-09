@@ -10,14 +10,14 @@ from harness import kernel_name
 
 
 def echo_to_file(msg: str, filename: str, clear: bool = False):
-    if clear:
-        os.popen(f"echo '{msg}' > {filename}").read()
-    else:
-        os.popen(f"echo '{msg}' >> {filename}").read()
+    mode = "w" if clear else "a"
+    with open(filename, mode, encoding="utf-8") as f:
+        f.write(f"{msg}\n")
 
 
 def date_to_file(filename: str):
-    os.popen(f"date >> {filename}").read()
+    with open(filename, "a", encoding="utf-8") as f:
+        subprocess.run(["date"], stdout=f, text=True, check=True)
 
 
 def parse_args():

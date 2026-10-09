@@ -3,6 +3,7 @@
 
 import functools
 import os
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -447,8 +448,23 @@ def get_2stage_cfgs(
                 f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
             )
         logger.info("\033[34m Start tuning fmoe")
-        os.system(
-            f"{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
+        subprocess.run(
+            [
+                PY,
+                os.path.join(
+                    AITER_CSRC_DIR,
+                    "ck_gemm_moe_2stages_codegen",
+                    "gemm_moe_tune.py",
+                ),
+                "-i",
+                untune_file,
+                "-o",
+                tune_file,
+                "-o2",
+                profile_file,
+                "--last",
+            ],
+            check=False,
         )
 
     def FinalFunc():

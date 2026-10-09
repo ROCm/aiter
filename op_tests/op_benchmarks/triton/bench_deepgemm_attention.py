@@ -4,6 +4,7 @@
 import argparse
 import os
 import random
+import shutil
 
 import torch
 import triton
@@ -428,11 +429,19 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
             src = os.path.join(triton_cache_dir, cache_key)
             dst = os.path.join(aot_kernel_dir, aot_name)
             if os.path.exists(dst):
-                os.system(f"rm -rf {dst}")
-            os.system(f"mv {src} {dst}")
+                if os.path.isdir(dst):
+                    shutil.rmtree(dst)
+                else:
+                    os.remove(dst)
+            shutil.move(src, dst)
             print(f"Moved cache from {src} to {dst}")
 
-            os.system("zip -r paged_mqa_logits_aot_kernel paged_mqa_logits")
+            shutil.make_archive(
+                "paged_mqa_logits_aot_kernel",
+                "zip",
+                root_dir=".",
+                base_dir="paged_mqa_logits",
+            )
 
         rows.append(
             {
