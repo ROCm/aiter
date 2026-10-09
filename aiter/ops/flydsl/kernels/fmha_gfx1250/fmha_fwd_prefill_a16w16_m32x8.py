@@ -1261,6 +1261,7 @@ def _prologue_attention(
                 _d.async_load()
 
     _issue_late(_is_lo)
+    rocdl.sched_barrier(0)
     _kv_fence(*_kv_drain)
 
     return {
