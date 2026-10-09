@@ -315,6 +315,7 @@ RELAY_CASES = (
     (12288, 5120, "int4"),
     (1024, 5120, "fp16"),
     (8191, 5120, "fp16"),
+    (1024, 5120, "int5"),
     (1024, 5120, "int6"),
 )
 # The default relay rows that also run under CUDA-graph replay: 80 MiB is on
@@ -2243,7 +2244,7 @@ def main():
         "--relay-codec",
         nargs="*",
         default=["int4", "fp16"],
-        choices=("int4", "fp16", "int6"),
+        choices=("int4", "int5", "int6", "fp16"),
         help="Wire formats of the relay rows; fp16 is the lossless one.",
     )
     parser.add_argument(
@@ -2294,7 +2295,7 @@ def main():
             os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
             aiter.qr_max_size()
             _bench(args, tps, algos, link)
-    elif not args.relay_only:
+    else:
         _verify(args, tps, algos, dts, link)
 
     # TP2 mesh relay rows. Each distinct (fraction, codec, super-tile) is an
@@ -2308,14 +2309,26 @@ def main():
     if relay_pairs is None:
         has_default = (link, 2, ARCH) in MESH_RELAY_DEFAULTS
         relay_pairs = [DEFAULT_RELAY] if n_gpu >= 4 and has_default else []
-    relay_pairs = [tuple(p) for p in relay_pairs if isinstance(p, tuple)]
+    malformed = [p for p in relay_pairs if not isinstance(p, tuple)]
+    if malformed:
+        aiter.logger.warning(
+            "--relay expects device,device pairs; skipping %s", malformed
+        )
+    relay_pairs = [p for p in relay_pairs if isinstance(p, tuple)]
     relay = []
     threshold_added = False
     if args.scenario == "verify" and 2 in tps and "mesh" in algos and dts:
         for pair in relay_pairs:
-            if len(pair) != 2 or max(pair) >= n_gpu or {0, 1} & set(pair):
+            if (
+                len(pair) != 2
+                or len(set(pair)) != 2
+                or min(pair) < 0
+                or max(pair) >= n_gpu
+                or {0, 1} & set(pair)
+            ):
                 aiter.logger.warning(
-                    "relay %s needs two devices outside 0,1 and below %s; skipping",
+                    "relay %s needs two distinct devices outside 0,1 and below %s; "
+                    "skipping",
                     pair,
                     n_gpu,
                 )
