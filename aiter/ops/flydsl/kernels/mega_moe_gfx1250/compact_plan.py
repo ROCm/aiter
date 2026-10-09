@@ -90,7 +90,10 @@ def compact_hist_layout(*, npes: int, experts_per_rank: int, max_routes: int):
     max_routes = max(1, int(max_routes))
     sparse_cap = min(segs, _align32(max_routes))
     use_sparse = sparse_cap < segs and segs % 32 != 0
-    row_dwords = _align32(1 + sparse_cap) if use_sparse else segs
+    # Dense rows are padded to 32 dwords as well: the publish and the matrix
+    # read both have a TDM bulk path gated on a 32-aligned row, and the
+    # scalar fallback costs ~8us per layer at EP4 x 65 experts (segs=260).
+    row_dwords = _align32(1 + sparse_cap) if use_sparse else _align32(segs)
     return row_dwords, sparse_cap, use_sparse
 
 
@@ -272,10 +275,10 @@ def compile_tdm_compact_plan(
         rsrc_bar = create_buffer_resource_from_addr(addr_barrier)
 
         smem = fx.SharedAllocator(static=False)
-        hist_ptr = smem.allocate(segs * 4, 128)._ptr
+        hist_ptr = smem.allocate(row_dwords * 4, 128)._ptr
         total_ptr = smem.allocate(segs * 4, 16)._ptr
         pref_ptr = smem.allocate(segs * 4, 16)._ptr
-        matrix_ptr = smem.allocate(npes * segs * 4, 128)._ptr
+        matrix_ptr = smem.allocate(npes * row_dwords * 4, 128)._ptr
         lds_hist = fx.Int64(fx.ptrtoint(hist_ptr))
         lds_total = fx.Int64(fx.ptrtoint(total_ptr))
         lds_pref = fx.Int64(fx.ptrtoint(pref_ptr))
@@ -295,7 +298,8 @@ def compile_tdm_compact_plan(
         # only once all have arrived.
         gen = buffer_load(rsrc_bar, 2, vec_width=1, dtype=T.i32) + arith.constant(1)
 
-        for s in range(tid, segs, plan_threads):
+        # row_dwords, not segs: the pad tail ships with the row.
+        for s in range(tid, row_dwords, plan_threads):
             comm_ops.store_i32_lds(
                 lds_hist + fx.Int64(s) * fx.Int64(4), arith.constant(0)
             )
@@ -429,9 +433,10 @@ def compile_tdm_compact_plan(
                     )
                 fx.barrier()
                 TDM.tdm_wait(0)
-            elif const_expr(segs % 32 == 0):
+            elif const_expr(row_dwords % 32 == 0):
                 if const_expr(use_tag):
-                    for s in range(tid, segs, plan_threads):
+                    # Pad slots carry the tag too, or the reader spins forever.
+                    for s in range(tid, row_dwords, plan_threads):
                         slot_addr = lds_hist + fx.Int64(s) * fx.Int64(4)
                         comm_ops.store_i32_lds(
                             slot_addr, comm_ops.load_i32_lds(slot_addr) | tag
@@ -439,13 +444,13 @@ def compile_tdm_compact_plan(
                     fx.barrier()
                 if warp < npes:
                     peer_hist = fx.Int64(window.lsa_ptr(warp, hist_off)) + fx.Int64(
-                        rank * segs * 4
+                        rank * row_dwords * 4
                     )
                     TDM.tdm_store(
                         TDM.tdm_group0(
                             arith.trunci(T.i32, arith.unwrap(lds_hist)), peer_hist
                         ),
-                        TDM.tdm_group1(32, segs // 32, 4),
+                        TDM.tdm_group1(32, row_dwords // 32, 4),
                     )
                 if const_expr(not use_tag):
                     fx.barrier()
@@ -505,7 +510,7 @@ def compile_tdm_compact_plan(
                         TDM.tdm_group1(32, tdm_rows, 4),
                     )
                     TDM.tdm_wait(0)
-                for s in range(tid, npes * segs, plan_threads):
+                for s in range(tid, npes * row_dwords, plan_threads):
                     comm_ops.store_i32_lds(
                         lds_matrix + fx.Int64(s) * fx.Int64(4), arith.constant(0)
                     )
@@ -523,13 +528,13 @@ def compile_tdm_compact_plan(
                         cnt = packed >> arith.constant(16)
                         comm_ops.store_i32_lds(
                             lds_matrix
-                            + fx.Int64(src * segs) * fx.Int64(4)
+                            + fx.Int64(src * row_dwords) * fx.Int64(4)
                             + fx.Int64(seg) * fx.Int64(4),
                             cnt,
                         )
                 fx.barrier()
             else:
-                matrix_n = npes * segs
+                matrix_n = npes * row_dwords
                 if const_expr(use_tag):
                     # Every dword carries its writer's generation, so a slot is
                     # final once its tag matches: no separate arrival counter.
@@ -573,7 +578,8 @@ def compile_tdm_compact_plan(
                 for src in range_constexpr(npes):
                     cnt = comm_ops.load_i32_lds(
                         lds_matrix
-                        + fx.Int64(src * segs + dest * fx.Int32(epr) + e) * fx.Int64(4)
+                        + fx.Int64(src * row_dwords + dest * fx.Int32(epr) + e)
+                        * fx.Int64(4)
                     )
                     if src == rank:
                         my_prefix = total
