@@ -19,30 +19,25 @@ from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from .topk_common import _row_length
 
 _VEC = 4
-_DPP_ROW_MASK = 0xF
-_DPP_BANK_MASK = 0xF
-_MAX_CHUNKS_PER_ROW = 32
+_MAX_PARTS = 16
 _DECODE_SPLIT_PART_ELEMENTS = 32_768
 _DECODE_SPLIT_STABLE_PART_ELEMENTS = 65_536
 ONE_CTA_MAX_ROW_LENGTH = 24_576
 
 
-def topk_per_row_decode_chunks(rows: int, width: int, num_cus: int) -> int:
-    vectors = (width + _VEC - 1) // _VEC
-    chunks = min(
-        1 << max(0, max(1, num_cus // max(1, rows)).bit_length() - 1),
-        1 << max(0, max(1, vectors // 4096).bit_length() - 1),
-    )
-    return max(1, min(chunks, _MAX_CHUNKS_PER_ROW))
-
-
-def topk_per_row_decode_split_parts(max_parts: int, width: int, stable: bool) -> int:
+def topk_per_row_decode_parts(
+    rows: int,
+    width: int,
+    num_cus: int,
+    stable: bool,
+) -> int:
     part_elements = (
         _DECODE_SPLIT_STABLE_PART_ELEMENTS if stable else _DECODE_SPLIT_PART_ELEMENTS
     )
+    cu_parts = 1 << max(0, max(1, num_cus // max(1, rows)).bit_length() - 1)
     width_parts = max(1, width // part_elements)
     width_parts = 1 << (width_parts.bit_length() - 1)
-    return min(max_parts, width_parts)
+    return min(_MAX_PARTS, cu_parts, width_parts)
 
 
 @cache
@@ -63,7 +58,6 @@ def build_topk_per_row_decode_split_modules(
         stable=stable,
         short_rows=False,
         is_decode=True,
-        partial=True,
         decode_split=True,
         write_direct_values=write_values,
         wave_size=wave_size,
@@ -77,7 +71,6 @@ def build_topk_per_row_decode_split_modules(
         short_rows=parts * k <= 4096,
         is_decode=True,
         map_indices=True,
-        skip_empty=True,
         wave_size=wave_size,
         arch=arch,
     )
@@ -176,7 +169,7 @@ def _get_cached_workspace(
     return (
         torch.empty(candidate_shape, device=device, dtype=torch.float32),
         torch.empty(candidate_shape, device=device, dtype=torch.int32),
-        torch.zeros((rows,), device=device, dtype=torch.int32),
+        torch.empty((rows,), device=device, dtype=torch.int32),
     )
 
 
@@ -185,7 +178,7 @@ def _get_workspace(device, stream_id, candidate_shape, rows):
         return (
             torch.empty(candidate_shape, device=device, dtype=torch.float32),
             torch.empty(candidate_shape, device=device, dtype=torch.int32),
-            torch.zeros((rows,), device=device, dtype=torch.int32),
+            torch.empty((rows,), device=device, dtype=torch.int32),
         )
     return _get_cached_workspace(device, stream_id, candidate_shape, rows)
 
@@ -209,8 +202,7 @@ def launch_topk_per_row_decode_split(
     stream: torch.cuda.Stream,
 ) -> None:
     width = logits.shape[1]
-    max_parts = topk_per_row_decode_chunks(rows, width, num_cus)
-    parts = topk_per_row_decode_split_parts(max_parts, width, stable)
+    parts = topk_per_row_decode_parts(rows, width, num_cus, stable)
     local_launcher, merge_launcher = build_topk_per_row_decode_split_modules(
         k, wave_size, arch, stable, values is not None, parts
     )

@@ -89,9 +89,7 @@ def build_radix_topk_one_block_module(
     short_rows: bool = False,
     is_decode: bool = False,
     map_indices: bool = False,
-    partial: bool = False,
     decode_split: bool = False,
-    skip_empty: bool = False,
     write_direct_values: bool = False,
     *,
     wave_size: int,
@@ -113,8 +111,8 @@ def build_radix_topk_one_block_module(
         raise ValueError("wave_size must be 32 or 64")
     if block_threads * _VEC > _PACKED_COUNT_MASK:
         raise ValueError("one scan tile exceeds the packed count range")
-    if decode_split and not (partial and is_decode):
-        raise ValueError("decode_split requires partial decode mode")
+    if decode_split and not is_decode:
+        raise ValueError("decode_split requires decode mode")
     if write_direct_values and not (decode_split and write_values):
         raise ValueError("direct values require a value-writing decode split")
     if decode_split:
@@ -1378,7 +1376,7 @@ def build_radix_topk_one_block_module(
                     )
 
         def write_direct_output(row_indices, row_values):
-            if const_expr(map_indices or partial):
+            if const_expr(map_indices or decode_split):
                 for step in range_constexpr((k + block_threads - 1) // block_threads):
                     col = step * block_threads + tid
                     if col < k:
@@ -1435,8 +1433,7 @@ def build_radix_topk_one_block_module(
             f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
             f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
             f"_v{int(write_values)}_s{int(stable)}_m{int(map_indices)}"
-            f"_p{int(partial)}_ds{int(decode_split)}"
-            f"_dv{int(write_direct_values)}_skip{int(skip_empty)}"
+            f"_ds{int(decode_split)}_dv{int(write_direct_values)}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -1489,7 +1486,7 @@ def build_radix_topk_one_block_module(
             row_end = row_ends[row]
             output_base = fx.Int32(0)
 
-        if const_expr(skip_empty):
+        if const_expr(map_indices):
             active = active & ((row_end - row_start) > fx.Int32(0))
 
         # The guard is CTA-uniform: it depends only on block geometry and row bounds.
