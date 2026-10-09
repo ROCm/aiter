@@ -6,13 +6,13 @@
 Covers the FlyDSL gfx942 backend on Gemma-4's two layer shapes against an
 independent fp32 paged-attention oracle. Timings use warm, fixed buffers;
 TB/s is logical traffic, not measured HBM bandwidth. The run-only check
-covers warm JIT-cache reuse, not wheel AOT packaging.
+covers warm JIT-cache reuse, not wheel AOT packaging. Performance against
+Triton is op_tests/op_benchmarks/flydsl/bench_unified_attention.py.
 """
 
 import argparse
 import importlib.util
 import itertools
-import math
 import os
 import sys
 from functools import partial
@@ -39,20 +39,9 @@ SHAPES_BY_TP = {
 SHAPES = SHAPES_BY_TP[1]
 # Max |err| against the oracle, as a fraction of max |ref|.
 TOLERANCE = 0.04
-# Speed-vs-Triton column: FlyDSL time over Triton time, below 1.0 is faster.
-RATIO = "flydsl / triton"
 # One-token sequences at the decode boundaries, plus a (0, 0) padding entry.
 DECODE_QUERY_LENS = [1] * 8 + [0]
 DECODE_KV_LENS = [1, 65, 1023, 1024, 1025, 2047, 4097, 8192, 0]
-# Serving-size batches for the opt-in Triton comparison: (query lens, KV lens).
-SERVING = {
-    "prefill 16K": ([16384], [16384]),
-    "decode b1 1K": ([1], [1024]),
-    "decode b4 1K": ([1] * 4, [1024] * 4),
-    "decode b16 16K": ([1] * 16, [16384] * 16),
-    "decode b64 4K": ([1] * 64, [4096] * 64),
-    "1K prompt + 32 decodes 16K": ([1024] + [1] * 32, [1024] + [16384] * 32),
-}
 
 
 def q8(x):
@@ -600,42 +589,6 @@ def test_aot_matrix(shape, tp, page, layout, path):
     return measure({"aot_run_only": call}, case, want, query_lens, kv_lens)
 
 
-@benchmark()
-def test_speed_vs_triton(shape, workload):
-    query_lens, kv_lens = SERVING[workload]
-    case = make_case(query_lens, kv_lens, shape)
-    triton = partial(ua.unified_attention, **case, backend="triton")
-    # The oracle is too slow at serving sizes, so Triton is the reference.
-    want = triton().clone()
-    candidates = {"triton": triton, "flydsl": flydsl_candidate(case, kv_lens)}
-    ret = measure(
-        candidates,
-        case,
-        want,
-        query_lens,
-        kv_lens,
-        atol=2 * TOLERANCE * want.abs().max().item(),
-    )
-    ret[RATIO] = ret["flydsl us"] / ret["triton us"]
-    return ret
-
-
-def with_geomean(df):
-    """Append the geometric-mean time ratio per shape and over every row."""
-
-    def geomean(ratios):
-        return math.exp(ratios.map(math.log).mean())
-
-    means = [
-        {"shape": shape, "workload": "geomean", RATIO: geomean(rows[RATIO])}
-        for shape, rows in df.groupby("shape", sort=False)
-    ]
-    means.append({"shape": "all", "workload": "geomean", RATIO: geomean(df[RATIO])})
-    df = pd.concat([df, pd.DataFrame(means)], ignore_index=True)
-    # None, unlike NaN, prints as an empty cell.
-    return df.astype(object).where(df.notna(), None)
-
-
 def main():
     arch = get_gfx_runtime()
     if get_gfx() != "gfx942" or arch != "gfx942":
@@ -663,11 +616,6 @@ def main():
     )
     parser.add_argument("--splits", type=int, nargs="+", default=[1, 5, 16, 64])
     parser.add_argument("--boundary-gib", type=int, nargs="+", default=[2, 4])
-    parser.add_argument(
-        "--perf",
-        action="store_true",
-        help="also time FlyDSL against Triton on serving-size batches",
-    )
     parser.add_argument(
         "--aot-matrix",
         action="store_true",
@@ -733,14 +681,6 @@ def main():
             itertools.product(args.shape, ["prefill", "decode"]),
         ),
     ]
-    if args.perf:
-        sweeps.append(
-            (
-                "speed vs Triton",
-                test_speed_vs_triton,
-                itertools.product(args.shape, SERVING),
-            )
-        )
     if args.aot_matrix:
         sweeps.append(
             (
@@ -758,8 +698,6 @@ def main():
     for name, fn, parameters in sweeps:
         rows = [fn(*values) for values in parameters]
         df = pd.DataFrame(rows)
-        if RATIO in df:
-            df = with_geomean(df)
         aiter.logger.info(
             "%s summary (markdown):\n%s",
             name,

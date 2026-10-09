@@ -6,7 +6,8 @@
 Times the FlyDSL kernel directly (past the dispatch cede rule; never the router
 or Triton fallback) against aiter's Triton ``unified_attention`` on Gemma-4's
 two layer shapes. Triton reads this tree's table, or a ``DEFAULT.json`` given
-with ``--triton-config`` (e.g. ROCm/aiter #5650's), so a run has one fixed bar.
+with ``--triton-config`` (e.g. ROCm/aiter #5650's). That flag also times this
+tree's table and reports it as ``triton``. The gate stays on the given table.
 
 Suites: ``acceptance`` (default, the PR evidence) runs prefill at 1K-32K,
 decode at context 32K with batch 1/16/64/128, a q256 prefix chunk at 16K and
@@ -68,7 +69,7 @@ from aiter.ops.flydsl.unified_attention_kernels import _launch, is_flydsl_availa
 from aiter.ops.triton.attention.unified_attention import (
     unified_attention as triton_unified_attention,
 )
-from aiter.ops.triton.utils.config_utils import load_config_json
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from op_tests.test_unified_attention import SHAPES_BY_TP
 
 FP8 = torch.float8_e4m3fnuz
@@ -272,6 +273,28 @@ def triton_table(path):
             _clear_config_caches()
 
 
+def tree_triton_json():
+    """This tree's unified-attention DEFAULT.json for the running arch."""
+    cfg_dir = resolve_config_dir("attention", ua_configs._CONFIG_NAME, backend="triton")
+    return str(Path(cfg_dir) / "DEFAULT.json")
+
+
+def triton_baselines(config_path):
+    """``(label, DEFAULT.json or None)``. None keeps this tree's table.
+
+    The first entry is the gate. When ``--triton-config`` points at another
+    file, a second entry times this tree's table as ``triton``.
+    """
+    if config_path is None:
+        return [("tree", None)]
+    name = Path(config_path).resolve().parent.name
+    baselines = [(name, config_path)]
+    same = Path(config_path).resolve() == Path(tree_triton_json()).resolve()
+    if not same:
+        baselines.append(("tree" if name == "triton" else "triton", None))
+    return baselines
+
+
 def capture(fn, sets, iters):
     """A HIP graph of `iters` rotated calls, after warm-up on a side stream."""
     for i in range(3):
@@ -333,7 +356,9 @@ def diff_vs(got, want):
     return ((got - want).abs().max() / want.abs().max()).item()
 
 
-def bench_cell(kind, label, specs, shape, layer, page, data, args, name):
+def bench_cell(kind, label, specs, shape, layer, page, data, args, baselines):
+    """Time FlyDSL and each Triton baseline. ``baselines`` is
+    ``(label, config path or None)``; numerical diff is against the first."""
     first = make_set(specs, layer, page, args.layout, 0, data)
     count = max(1, min(MAX_ROTATIONS, -(-ROTATE_BYTES // first["read_bytes"])))
     sets = [first] + [
@@ -343,28 +368,26 @@ def bench_cell(kind, label, specs, shape, layer, page, data, args, name):
     out_f = torch.empty(first["q"].shape, device="cuda", dtype=torch.bfloat16)
     out_t = torch.empty_like(out_f)
     run_flydsl(first, out_f, layer, page)
-    with triton_table(args.triton_config):
+    with triton_table(baselines[0][1]):
         run_triton(first, out_t, layer)
     torch.cuda.synchronize()
     diff = diff_vs(out_f, out_t)
-    times = time_round_robin(
-        {
-            "flydsl": (
-                contextlib.nullcontext,
-                partial(run_flydsl, out=out_f, layer=layer, page=page),
-            ),
-            "triton": (
-                partial(triton_table, args.triton_config),
-                partial(run_triton, out=out_t, layer=layer),
-            ),
-        },
-        sets,
-        max(len(sets), 10),
-    )
+    fns = {
+        "flydsl": (
+            contextlib.nullcontext,
+            partial(run_flydsl, out=out_f, layer=layer, page=page),
+        ),
+    }
+    for bname, path in baselines:
+        fns[bname] = (
+            partial(triton_table, path),
+            partial(run_triton, out=out_t, layer=layer),
+        )
+    times = time_round_robin(fns, sets, max(len(sets), 10))
     rotated_mib = count * first["read_bytes"] / (1 << 20)
     del sets, first, out_f, out_t
     torch.cuda.empty_cache()
-    return {
+    row = {
         "shape": shape,
         "kind": kind,
         "case": label,
@@ -374,38 +397,46 @@ def bench_cell(kind, label, specs, shape, layer, page, data, args, name):
         "rotations": count,
         "rotated_mib": rotated_mib,
         "flydsl_us": times["flydsl"],
-        f"triton_{name}_us": times["triton"],
-        f"ratio_{name}": times["flydsl"] / times["triton"],
-        "max_diff_vs_triton": diff,
     }
+    for bname, _path in baselines:
+        row[f"triton_{bname}_us"] = times[bname]
+        row[f"ratio_{bname}"] = times["flydsl"] / times[bname]
+    row["max_diff_vs_triton"] = diff
+    return row
 
 
 def _md_line(cells):
     return "| " + " | ".join(cells) + " |"
 
 
-def md_header(name):
+def _column_names(names):
+    """In-tree Triton first, then the extra table: triton, then pr5650."""
+    return sorted(names, key=lambda name: name not in ("triton", "tree"))
+
+
+def md_header(names):
     """Header and alignment lines of the per-case markdown table."""
-    header = ["Shape", "Kind", "Case", "Data", "Page", "FlyDSL µs", f"{name} µs"]
-    header += [f"FlyDSL vs {name}", "max diff"]
+    names = _column_names(names)
+    header = ["Shape", "Kind", "Case", "Data", "Page", "FlyDSL µs"]
+    header += [f"{name} µs" for name in names]
+    header += [f"FlyDSL vs {name}" for name in names]
     align = [":---", ":---", ":---", ":---"] + ["---:"] * (len(header) - 4)
     return _md_line(header) + "\n|" + "|".join(align) + "|"
 
 
-def md_row(row, name):
-    return _md_line(
-        [
-            row["shape"],
-            row["kind"],
-            row["case"],
-            row["data"],
-            str(row["page"]),
-            f"{row['flydsl_us']:.1f}",
-            f"{row[f'triton_{name}_us']:.1f}",
-            f"{1 / row[f'ratio_{name}']:.2f}",
-            f"{row['max_diff_vs_triton']:.4f}",
-        ]
-    )
+def md_row(row, names):
+    names = _column_names(names)
+    cells = [
+        row["shape"],
+        row["kind"],
+        row["case"],
+        row["data"],
+        str(row["page"]),
+        f"{row['flydsl_us']:.1f}",
+    ]
+    cells += [f"{row[f'triton_{name}_us']:.1f}" for name in names]
+    cells += [f"{1 / row[f'ratio_{name}']:.2f}" for name in names]
+    return _md_line(cells)
 
 
 def kind_geomeans(rows, name):
@@ -429,27 +460,38 @@ def kind_geomeans(rows, name):
     ]
 
 
-def md_geomean(groups, name):
-    """One row per kind and one speedup column per physical page."""
-    by_page = [(label, dict(kind_geomeans(rows, name))) for label, rows in groups]
-    kinds = [kind for kind in KINDS if all(kind in means for _, means in by_page)]
+def md_geomean(groups, names):
+    """One row per kind. Each page gets one speedup column per Triton baseline."""
+    by_page = [
+        (label, {name: dict(kind_geomeans(rows, name)) for name in names})
+        for label, rows in groups
+    ]
+    kinds = [
+        kind
+        for kind in KINDS
+        if all(kind in means[name] for _, means in by_page for name in names)
+    ]
     if not kinds:
         return None
+    names = _column_names(names)
+    headers = ["Kind"]
+    for label, _means in by_page:
+        headers += [f"FlyDSL vs {name} (Page={label})" for name in names]
     lines = [
         (
             "Gemma-4 5:1 step: 10 full layers + 50 sliding layers, "
             "geomean speedup per physical page and kind."
         ),
         "",
-        _md_line(
-            ["Kind"] + [f"FlyDSL vs {name} (Page={label})" for label, _ in by_page]
-        ),
-        "|:---|" + "---:|" * len(by_page),
+        _md_line(headers),
+        "|:---|" + "---:|" * (len(headers) - 1),
     ]
-    means = [
-        _md_line([kind] + [f"{page_means[kind]:.2f}" for _, page_means in by_page])
-        for kind in kinds
-    ]
+    means = []
+    for kind in kinds:
+        cells = [kind]
+        for _label, page_means in by_page:
+            cells += [f"{page_means[name][kind]:.2f}" for name in names]
+        means.append(_md_line(cells))
     return "\n".join(lines + means)
 
 
@@ -507,8 +549,8 @@ def parse_args():
     parser.add_argument(
         "--triton-config",
         metavar="DEFAULT.json",
-        help="Triton table to compare against instead of this tree's,"
-        "\ne.g. ROCm/aiter #5650's DEFAULT.json",
+        help="Extra Triton table to compare against, besides this tree's,"
+        "\ne.g. ROCm/aiter #5650's DEFAULT.json. The gate uses this table.",
     )
     parser.add_argument(
         "--shape", choices=["full", "sliding"], nargs="+", default=["full", "sliding"]
@@ -620,9 +662,9 @@ def main():
         runs = [(f"vLLM block {args.block_size}", None, args.block_size)]
     else:
         runs = [(str(page), page, None) for page in args.page]
-    name = (
-        Path(args.triton_config).resolve().parent.name if args.triton_config else "tree"
-    )
+    baselines = triton_baselines(args.triton_config)
+    names = [bname for bname, _path in baselines]
+    name = names[0]
     layers = SHAPES_BY_TP[args.tp]
     cells = grid(args)
     if not cells:
@@ -641,16 +683,17 @@ def main():
     )
     print(f"- aiter {source_version(aiter)}")
     print(f"- FlyDSL {flydsl.__version__}; {source_version(flydsl)}")
-    table = args.triton_config or "this tree"
-    digest = f"; sha256 {sha256(args.triton_config)}" if args.triton_config else ""
-    print(f"- Triton table: {name} = {table}{digest}")
+    print("- Triton tables:")
+    for bname, path in baselines:
+        shown = tree_triton_json() if path is None else path
+        origin = " (this tree)" if path is None else ""
+        print(f"  - {bname} = {shown}{origin}; sha256 {sha256(shown)}")
     print(
         f"- Pages: {', '.join(label for label, _, _ in runs)}; "
         + f"{args.layout} K/V, {'custom' if custom else args.suite} suite, "
         f"data={','.join(args.data)}. "
         "FlyDSL is forced past the dispatch cede rule; no fallback is used. "
-        "Speedup is Triton time / FlyDSL time; above 1 is faster. "
-        f"Max diff is over Triton's ({name}) max |out|.\n"
+        "Speedup is Triton time / FlyDSL time; above 1 is faster.\n"
     )
     if args.suite == "acceptance" and not custom:
         print(
@@ -663,7 +706,7 @@ def main():
     for label, page, block in runs:
         heading = label if block is not None else f"Page {label}"
         print(f"## {heading}\n", flush=True)
-        print(md_header(name), flush=True)
+        print(md_header(names), flush=True)
         rows = []
         for data, shape in itertools.product(args.data, args.shape):
             cell_page = page or block * (2 if shape == "full" else 1)
@@ -677,13 +720,13 @@ def main():
                     cell_page,
                     data,
                     args,
-                    name,
+                    baselines,
                 )
-                print(md_row(row, name), flush=True)
+                print(md_row(row, names), flush=True)
                 rows.append(row)
         groups.append((label, rows))
 
-    geomean = md_geomean(groups, name)
+    geomean = md_geomean(groups, names)
     if geomean:
         print("\n## Geomean\n\n" + geomean)
     rows = [row for _, page_rows in groups for row in page_rows]
