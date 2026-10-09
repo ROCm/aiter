@@ -211,7 +211,7 @@ def _store_rs_group(ctx, j, out_row_t, col0, g, parts, rs_scale):
     ctx.store_if(in_window, out_row_t, col, col_sum)
 
 
-def _epilogue_per_tile(ctx, tile):
+def _mfma_and_epilogue_per_tile(ctx, tile):
     """Per n-tile shuffle head-reduce; MFMA_N writer lanes per n-tile."""
     for j in range_constexpr(len(ctx.a_packs)):
         for ni in range_constexpr(len(tile.b_packs)):
@@ -228,7 +228,7 @@ def _epilogue_per_tile(ctx, tile):
             _store_tile_cols(ctx, j, tile.out_row_ts[j], tile.cols[ni], col_sum)
 
 
-def _epilogue_reduce_scatter(ctx, tile):
+def _mfma_and_reduce_scatter_epilogue(ctx, tile):
     """``rs_head``: the n-tiles of a group are head-reduced together by
     ``warp_reduce_scatter_strided`` and stored by all 64 lanes."""
     rs_group = 64 // ctx.mfma.MFMA_N
@@ -253,7 +253,7 @@ def _epilogue_reduce_scatter(ctx, tile):
             )
 
 
-def _epilogue_sw_pipe(ctx, tile, rs_head):
+def _mfma_and_epilogue_pipelined(ctx, tile, rs_head):
     """Depth-2 software pipeline over the flattened (row, n-tile) items.
 
     Issues item k+1's MFMAs before consuming item k's accumulators, so the
@@ -899,8 +899,8 @@ def _build_kernel_mfma_lds_pipe(
     ``s_waitcnt`` + prefetch(i+PD) + compute).
 
     Work partition:
-      * All ``WPB`` waves cooperatively load ONE ``BKV``-wide K-tile into LDS and
-        all read it. Each wave owns a disjoint group of ``RPW`` query ROWS and
+      * All ``WPB`` waves cooperatively load one ``BKV``-wide K-tile into LDS and
+        all read it. Each wave owns a disjoint group of ``RPW`` query rows and
         iterates over all ``N_TILES`` columns of the shared LDS tile.
       * A block owns ``ROWS_PER_BLOCK = RPW * WPB`` query rows (wave ``w`` owns
         rows ``[w*RPW, (w+1)*RPW)``). KV reuse factor becomes ``RPW * WPB``.
@@ -913,7 +913,7 @@ def _build_kernel_mfma_lds_pipe(
     run, instead of one shuffle butterfly and one MFMA_N-lane store per n-tile.
     ``lds_scales`` stages the tile's kv_scales into the LDS slot with the same
     async DMA as the KV bytes, instead of a blocking per-n-tile global load
-    every wave repeats.
+    that every wave repeats.
     """
     H = num_heads
     D = head_size
@@ -954,11 +954,11 @@ def _build_kernel_mfma_lds_pipe(
         f"64 // MFMA_N ({RS_GROUP})"
     )
     if sw_pipe:
-        _epilogue = lambda ctx, tile: _epilogue_sw_pipe(ctx, tile, rs_head)  # noqa: E731
+        _mfma_and_epilogue = lambda ctx, tile: _mfma_and_epilogue_pipelined(ctx, tile, rs_head)  # noqa: E731
     elif rs_head:
-        _epilogue = _epilogue_reduce_scatter
+        _mfma_and_epilogue = _mfma_and_reduce_scatter_epilogue
     else:
-        _epilogue = _epilogue_per_tile
+        _mfma_and_epilogue = _mfma_and_epilogue_per_tile
 
     # LDS multi-buffer: NUM_BUFFERS slots of [BKV, D] fp8 (row-major, row == KV
     # column index). Addressed as i32 dwords for the vector reads.
@@ -1008,21 +1008,15 @@ def _build_kernel_mfma_lds_pipe(
 
     # XOR swizzle (bank-conflict avoidance) of the [BKV, D] fp8 tile, as a
     # SwizzleType over the slot's byte (fp8 element) offsets. The DMA writes LDS
-    # lane-linearly, so the swizzle is applied on the global source side (the
-    # self-inverse XOR maps each physical dword to the logical dword stored
-    # there) and on the read view.
+    # lane-linearly, so the swizzle is applied on the global source side 
+    # and on the read view.
     #
     # gfx950 LDS is 64 banks x 4 B, and a ds_read_b128 serves 16 lanes per
     # pass, i.e. one 256-byte bank line. The 16 lanes of a B-fragment read take
     # 16 consecutive KV columns n at the same head-dim chunk, so with rows of
     # D bytes they cover only the 256/D distinct row positions within a bank
-    # line. XOR-ing the 32-byte chunk index with the row bits ABOVE the bank
-    # line (n >> log2(256/D)) spreads them over the NC chunk positions too:
-    # 2-way instead of 4-way at D=128 and D=64. Keying on the low row bits, as
-    # the hand-written swizzle did, collides with the bank-line position and
-    # left a 4-way conflict. (16-byte granules would reach 1-way, but the two
-    # reads of a fragment then need separate addresses, which costs the
-    # 128-VGPR _rs route a wave per SIMD; measured slower.)
+    # line. XOR-ing the 32-byte chunk index with the row bits above the bank
+    # line (n >> log2(256/D)) spreads them over the NC chunk positions too.
     #
     # Chunks stay whole (base = log2 frag_bytes), so every 16-byte DMA write
     # and both ds_read_b128 of a fragment stay contiguous.
@@ -1039,23 +1033,18 @@ def _build_kernel_mfma_lds_pipe(
     # the n-tile's offset applied to the base pointer rather than through the
     # swizzle. That is exact only if the offset is a multiple of the swizzle
     # period, and it lets every n-tile share the lane's read addresses
-    # (immediate offsets). Swizzling the full tile offset instead makes the
-    # compiler recompute the XOR per n-tile, which costs the 128-VGPR _rs route
-    # a wave per SIMD.
+    # (immediate offsets).
     NTILE_BYTES = mfma.MFMA_N * D
     assert NTILE_BYTES % (1 << sum(LDS_SWZ)) == 0, (
         f"n-tile ({NTILE_BYTES} bytes) must be a multiple of the swizzle period"
     )
 
     # The global->LDS DMA requires its destination LDS address to be at
-    # least 128-byte aligned; the third fx.Array parameter is that alignment and
-    # propagates to the emitted LDS global. It has to live on the array type --
-    # SharedAllocator.allocate(alignment=) is bookkeeping-only on the static path.
+    # least 128-byte aligned
     @fx.struct
     class SharedStorage:
         slots: fx.Array[fx.Int32, NUM_BUFFERS * SLOT_I32, 128]
 
-    # As in the direct-load builder: only the non-default clean_logits is tagged.
     _cl_tag = "" if clean_logits else "_nocl"
     _pd_tag = "" if PREFETCH_DEPTH == 2 else f"_pd{PREFETCH_DEPTH}"
     _kname = (
@@ -1086,7 +1075,7 @@ def _build_kernel_mfma_lds_pipe(
         tid = fx.thread_idx.x
         bid = fx.block_idx.x
 
-        # Reverse row order -- see the direct-load builder for the rationale.
+        # Reverse row order.
         n_blocks = fx.Int32(ceildiv(fx.Uint32(seq_len), fx.Uint32(ROWS_PER_BLOCK)))
         block_row0 = fx.Int32((n_blocks - bid - fx.Int32(1)) * fx.Int32(ROWS_PER_BLOCK))
 
@@ -1098,10 +1087,7 @@ def _build_kernel_mfma_lds_pipe(
 
         # One wave's tiled MMA: it owns the lane -> (row, K) mapping of the A
         # (Q heads x head dim) and B (KV columns x head dim) fragments, and the
-        # tiled copies below derive every fragment load from it. fx.gemm is
-        # still called on the bare atom per (mi, ni, kk) slice: the identity
-        # scales are atom state a TiledMma cannot carry, and the epilogues
-        # schedule the per-tile MFMAs themselves.
+        # tiled copies below derive every fragment load from it.
         tiled_mma = fx.make_tiled_mma(mma, fx.make_layout((1, 1, 1), (0, 0, 0)))
         thr_mma = tiled_mma.thr_slice(lane)
         # Q: one lane's 32-byte fragment is two 16-byte buffer loads.
@@ -1154,8 +1140,6 @@ def _build_kernel_mfma_lds_pipe(
             return [frag[None, 0, kk] for kk in range_constexpr(K_STEPS)]
 
         # Global->LDS DMA atoms: 16 bytes of KV / one f32 kv_scale per lane.
-        # The LDS destination is wave-uniform; the instruction fans the
-        # wave's lanes out from it lane-contiguously.
         kv_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
         sc_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
 
@@ -1370,11 +1354,7 @@ def _build_kernel_mfma_lds_pipe(
 
             # Wait until only the (PREFETCH_DEPTH-1) newer tiles remain in flight,
             # i.e. the current tile is complete; then sync so every wave sees the
-            # full LDS tile. Must be the keyword form: the positional argument is
-            # a raw gfx9 bitfield in which vmcnt is split across bits [3:0] and
-            # [15:14], so passing the count directly silently degrades to
-            # vmcnt(0) (plus a stray expcnt) once it reaches 16 -- which is
-            # exactly what the bkv256 variants hit, disabling their pipeline.
+            # full LDS tile.
             rocdl.s_waitcnt(vmcnt=_WAIT_VMCNT)
             gpu.barrier()
 
@@ -1385,8 +1365,7 @@ def _build_kernel_mfma_lds_pipe(
             cols = [None] * N_TILES
             # kv_scales_tile[ni]: this lane's column scale, applied before the
             # head reduce. lds_scales + rs_head instead scales once after the
-            # reduce-scatter, with the scale of the column the lane then owns
-            # (rs_scales[g]) -- one multiply per group instead of per n-tile.
+            # reduce-scatter.
             kv_scales_tile = [None] * N_TILES
             rs_scales = [None] * (N_TILES // RS_GROUP)
             if const_expr(not lds_scales):
@@ -1433,7 +1412,7 @@ def _build_kernel_mfma_lds_pipe(
                 for j in range_constexpr(RPW)
             ]
 
-            _epilogue(
+            _mfma_and_epilogue(
                 ep_ctx,
                 _TileOperands(
                     col0=col0,
@@ -1445,6 +1424,7 @@ def _build_kernel_mfma_lds_pipe(
                 ),
             )
 
+        # Run the loop over KV tiles either unrolled or rolled fashion.
         if const_expr(UNROLL_KV_TILE_LOOP):
             # Unrolled by NUM_BUFFERS so every slot offset is a constant (tile
             # t lives in slot t % NUM_BUFFERS).

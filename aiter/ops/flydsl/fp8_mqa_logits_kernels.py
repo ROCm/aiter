@@ -435,7 +435,7 @@ if _ARCH == "gfx950":
             ),
             # -- reduce-scatter head reduce (_rs): the 64 // MFMA_N n-tiles of
             #    a group are head-reduced with permlane swaps and stored by all
-            #    64 lanes at once (see warp_reduce_scatter_strided) --
+            #    64 lanes at once --
             "mfma32x32x64_bkv64_r2_w4_lds3_rs": _mk_builder(
                 2, 4, mfma=_K64, bkv=64, lds=3, rs_head=True
             ),
@@ -568,32 +568,16 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         tiles per wave when M and N are both large, else WPB=4 for more
         wavefronts on small-M / short-window shapes.
 
-    gfx950 H>=128: mfma32x32x64 at r=1 always -- ample compute, more blocks.
-
-    gfx950 H<=32: mfma32x32x64 r=2 with WPB=4 everywhere except streaming
-        shapes, which keep WPB=2.
-        K64 gives M_TILES=1 at H=32 -- half the compute of H=64 -- so the
-        smaller tile grid benefits from extra wavefronts per block (WPB=4)
-        rather than more blocks (WPB=2), which keeps the SIMD units busier
-        when the row grid alone under-saturates the device.
-
-    gfx950 H in (32, 128): mfma32x32x64 with r=2 for streaming / large-square
-        shapes (KV pressure high), r=1 otherwise.
-
-    gfx950 epilogue (graph replay, LLC flush; vs the previous ``_swp`` / plain
-        ``_lds3`` routes):
-        H<=32 streaming takes ``_rs`` (permlane reduce-scatter head reduce, no
-        ``_swp``): with clean_logits it fits 128 VGPRs, i.e. 4 waves/SIMD where
-        ``_swp``/``_swp_rs`` need ~148 (3), and the streaming split count scales
-        with that occupancy. SILOTIGER-1134 shapes: 1.099 geomean with
-        clean_logits, 1.063 without (where it ties ``_swp_rs_ls``).
-        H<=32 non-streaming takes ``_swp_rs``: small grids (~1 block/CU) are
-        latency- not occupancy-bound and keep the pipelined accumulator reads;
-        squares 2048..16384: 1.051 geomean vs ``_swp`` (``_rs`` 1.042, and
-        0.976 at 2048^2). ``_ls`` measured neutral at H32.
-        H64/H128 take ``_swp_rs_ls`` (+ kv_scales staged in LDS): vs the plain
-        ``_lds3`` route, H64 1.045 / H128 1.020 with clean_logits, 1.041 /
-        1.026 without.
+    gfx950: always mfma32x32x64, bkv64, triple-buffered LDS (``_lds3``) with
+        the reduce-scatter head reduce (``_rs``). "Streaming" means
+        ``seq_len_kv > 2 * seq_len``.
+        H>=128: r1_w2 ``_swp_rs_ls`` -- ample compute per row, more blocks.
+        H<=32: r2_w4 (M_TILES=1, so more waves per block keep the SIMDs busy);
+            streaming takes plain ``_rs``, which fits 128 VGPRs (4 waves/SIMD,
+            vs 3 with ``_swp``); otherwise ``_swp_rs``, as small grids are
+            latency- rather than occupancy-bound.
+        32<H<128: w2 ``_swp_rs_ls``, r2 for streaming or large-square
+            (seq_len >= 8192) shapes, where KV reuse matters, else r1.
     """
     if _ARCH == "gfx942":
         rpb2_min_elems = 2**19
