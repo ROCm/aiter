@@ -229,14 +229,18 @@ class Gfx1250Memory:
         fx.copy_atom_call(atom, src, dst)
 
     @flyc.jit
-    def stage_tdm(self, token_base, kv_off):
+    def stage_tdm(self, token_base, kv_off, full_tile=False):
         ctx, t = self.ctx, self.t
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         # Explicit wave slices keep the hardware padding local to each copy.
         # Collective rank-3 atoms cannot apply row padding to their wave offset
         # with the installed lowering, so each wave owns a single-wave atom.
         absolute = token_base + ctx.warp * 16
-        safe_token = (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        safe_token = (
+            absolute
+            if full_tile
+            else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
+        )
         page = fx.Int32(
             table[ctx.planned_seq * ctx.max_blocks_per_seq + safe_token // t.block_size]
         )
@@ -251,7 +255,7 @@ class Gfx1250Memory:
             kv_off + ctx.warp * 16 * t.q_stride,
             (16, t.head_dim // t.chunk, t.chunk),
             (t.chunk, t.block_size * t.chunk, 1),
-            (valid, None, None),
+            (None if full_tile else valid, None, None),
             t.head_dim,
             t.q_stride // t.elem_bytes,
         )
@@ -285,7 +289,7 @@ class Gfx1250Memory:
                 kv_off + t.k_bytes + v_dst,
                 (v_rows, v_tokens // t.chunk, t.chunk),
                 (t.chunk, t.head_dim * t.chunk, 1),
-                (None, (valid + t.chunk - 1) // t.chunk, None),
+                (None, None if full_tile else (valid + t.chunk - 1) // t.chunk, None),
                 v_tokens,
                 t.v_stride // t.elem_bytes,
             )
@@ -296,7 +300,7 @@ class Gfx1250Memory:
                 kv_off + t.k_bytes + v_dst,
                 (v_rows, v_tokens),
                 (t.block_size, 1),
-                (None, valid),
+                (None, None if full_tile else valid),
                 v_tokens,
                 t.v_stride // t.elem_bytes,
             )
@@ -358,11 +362,20 @@ class Gfx1250Memory:
 
     @flyc.jit
     def stage_kv(self, token_base, buffer):
+        # Constant full-tile extents keep the hot TDM descriptor path scalar.
+        # The tail retains clamped extents and safe owned-page addresses.
+        if token_base + self.t.TOKENS <= self.ctx.planned_context:
+            self.stage_kv_impl(token_base, buffer, True)
+        else:
+            self.stage_kv_impl(token_base, buffer, False)
+
+    @flyc.jit
+    def stage_kv_impl(self, token_base, buffer, full_tile):
         ctx, t = self.ctx, self.t
         kv_off = t.q_bytes + buffer * t.kv_stride
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         if const_expr(t.use_tdm):
-            self.stage_tdm(token_base, kv_off)
+            self.stage_tdm(token_base, kv_off, full_tile)
         else:
             self.stage_vector_dma(token_base, kv_off)
 
@@ -371,27 +384,51 @@ class Gfx1250Memory:
             vs = fx.recast_iter(fx.Float32, ctx.value_scale_ptr)
             if ctx.tid < t.TOKENS:
                 absolute = token_base + ctx.tid
-                safe_token = (absolute < ctx.planned_context).select(
-                    absolute, fx.Int32(0)
+                safe_token = (
+                    absolute
+                    if full_tile
+                    else (absolute < ctx.planned_context).select(absolute, fx.Int32(0))
                 )
-                page = fx.Int32(
-                    table[
-                        ctx.planned_seq * ctx.max_blocks_per_seq
-                        + safe_token // t.block_size
-                    ]
-                )
-                scale_idx = (
-                    fx.Int64(page) * ctx.stride_ks_block
-                    + ctx.kv_h * ctx.stride_ks_head
-                    + safe_token % t.block_size
-                )
+                if const_expr(t.block_size >= t.TOKENS):
+                    page_start = (
+                        token_base
+                        if full_tile
+                        else (token_base < ctx.planned_context).select(
+                            token_base, fx.Int32(0)
+                        )
+                    )
+                    page = fx.Int32(
+                        table[
+                            ctx.planned_seq * ctx.max_blocks_per_seq
+                            + page_start // t.block_size
+                        ]
+                    )
+                    scale_idx = (
+                        fx.Int64(page) * ctx.stride_ks_block
+                        + ctx.kv_h * ctx.stride_ks_head
+                        + page_start % t.block_size
+                        + ctx.tid
+                    )
+                else:
+                    page = fx.Int32(
+                        table[
+                            ctx.planned_seq * ctx.max_blocks_per_seq
+                            + safe_token // t.block_size
+                        ]
+                    )
+                    scale_idx = (
+                        fx.Int64(page) * ctx.stride_ks_block
+                        + ctx.kv_h * ctx.stride_ks_head
+                        + safe_token % t.block_size
+                    )
                 kscale = fx.Float32(ks[scale_idx])
                 vscale = fx.Float32(vs[scale_idx])
-                kscale = (absolute < ctx.planned_context).select(
-                    kscale, fx.Float32(0.0)
-                )
+                if const_expr(not full_tile):
+                    kscale = (absolute < ctx.planned_context).select(
+                        kscale, fx.Float32(0.0)
+                    )
                 # Normalize over the MTP window union, independently of the row.
-                visible = absolute < ctx.planned_context
+                visible = fx.Int32(1) if full_tile else absolute < ctx.planned_context
                 if const_expr(t.sliding_window > 0):
                     visible = visible & (
                         absolute
@@ -533,6 +570,13 @@ class Gfx1250Pipeline:
                 ]
             )
         state_stride = 2 + vh_count
+        resident_q = not t.bf16 and t.head_dim == 128 and t.m_tiles == 1
+        if const_expr(resident_q):
+            gpu.barrier()
+            q_operand = self.mem.operand(0, t.q_stride, 128, ctx.lane16, ctx.half)
+            q_scale = fx.Float32(
+                self.mem.load(ctx.lane16 * t.q_stride + t.head_dim, fx.Float32)[0]
+            )
         for token_i, state in range(begin, end, t.TOKENS, init=initial):
             token_base = fx.Int32(token_i)
             buffer = ((token_base - begin) // t.TOKENS) % t.buffers
@@ -548,24 +592,16 @@ class Gfx1250Pipeline:
             vnorm = fx.Float32(1.0)
             vfactor = fx.Float32(1.0 if t.bf16 else 1.0 / t.FP8_MAX)
             if const_expr(t.per_token_kv):
-                vmax = fx.Float32(0.0)
-                if ctx.tid < t.TOKENS:
-                    vmax = fx.Float32(
-                        self.mem.load(
-                            kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + ctx.tid) * 4,
-                            fx.Float32,
-                        )[0]
-                    )
+                # Every wave reduces the same 64 scales, avoiding a CTA barrier.
+                scale_base = kv_off + t.k_bytes + t.v_bytes + t.TOKENS * 4
+                vmax = fx.maxnumf(
+                    fx.Float32(self.mem.load(scale_base + ctx.lane * 4, fx.Float32)[0]),
+                    fx.Float32(
+                        self.mem.load(scale_base + (ctx.lane + 32) * 4, fx.Float32)[0]
+                    ),
+                )
                 for shift in (16, 8, 4, 2, 1):
                     vmax = fx.maxnumf(vmax, vmax.shuffle_xor(shift, t.WAVE))
-                if ctx.lane == 0:
-                    self.mem.store(
-                        t.stats_offset + 512 + ctx.warp * 4, vmax, fx.Float32
-                    )
-                gpu.barrier()
-                vmax = self.mem.load(t.stats_offset + 512, fx.Float32, t.NWARP).reduce(
-                    ReductionOp.MAX
-                )
                 vfactor = vmax * fx.Float32(1.0 / t.FP8_MAX)
                 vnorm = fx.Float32(rcp_f32(fx.maxnumf(vfactor, fx.Float32(1e-20))))
             elif const_expr(not t.bf16):
@@ -579,7 +615,9 @@ class Gfx1250Pipeline:
                 q_tile = m if t.q_tiles == t.m_tiles else 0
                 row = m * 16 + ctx.lane16
                 qscale = fx.Float32(1.0)
-                if const_expr(not t.bf16):
+                if const_expr(resident_q):
+                    qscale = q_scale
+                elif const_expr(not t.bf16):
                     qscale = fx.Float32(
                         self.mem.load(
                             (q_tile * 16 + ctx.lane16) * t.q_stride + t.head_dim,
@@ -600,27 +638,38 @@ class Gfx1250Pipeline:
                         ctx.lane16,
                         ctx.half,
                     )
-                    b = self.mem.operand(
-                        q_tile * 16 * t.q_stride + d * qk_k * t.elem_bytes,
-                        t.q_stride,
-                        qk_k,
-                        ctx.lane16,
-                        ctx.half,
-                    )
+                    if const_expr(resident_q):
+                        b = q_operand
+                    else:
+                        b = self.mem.operand(
+                            q_tile * 16 * t.q_stride + d * qk_k * t.elem_bytes,
+                            t.q_stride,
+                            qk_k,
+                            ctx.lane16,
+                            ctx.half,
+                        )
                     scores = Gfx1250Gemm.mma(a, b, scores, qk_k, t.bf16)
                 upper = (
                     ctx.planned_context - t.query_length + row // t.query_group_size + 1
                 )
+                if const_expr(t.per_token_kv):
+                    scale_token = ctx.warp * 16 + ctx.half * 8
+                    kscales = self.mem.load(
+                        kv_off + t.k_bytes + t.v_bytes + scale_token * 4,
+                        fx.Float32,
+                        8,
+                    )
+                    vscales = self.mem.load(
+                        kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + scale_token) * 4,
+                        fx.Float32,
+                        8,
+                    )
                 masked = []
                 for r in range_constexpr(8):
                     token = ctx.warp * 16 + ctx.half * 8 + r
                     value = scores[r] * scale
                     if const_expr(t.per_token_kv):
-                        value = value * fx.Float32(
-                            self.mem.load(
-                                kv_off + t.k_bytes + t.v_bytes + token * 4, fx.Float32
-                            )[0]
-                        )
+                        value = value * fx.Float32(kscales[r])
                     visible = (token_base + token < upper) & (row < t.rows)
                     if const_expr(t.sliding_window > 0):
                         visible = visible & (
@@ -659,13 +708,7 @@ class Gfx1250Pipeline:
                 pscale = []
                 for r in range_constexpr(8):
                     if const_expr(t.per_token_kv):
-                        token = ctx.warp * 16 + ctx.half * 8 + r
-                        vs = fx.Float32(
-                            self.mem.load(
-                                kv_off + t.k_bytes + t.v_bytes + (t.TOKENS + token) * 4,
-                                fx.Float32,
-                            )[0]
-                        )
+                        vs = fx.Float32(vscales[r])
                         pscale.append(probs[r] * vs * vnorm)
                     else:
                         pscale.append(
@@ -702,10 +745,10 @@ class Gfx1250Pipeline:
                     )
                     for d in range_constexpr(t.TOKENS // pv_k)
                 ]
-                for vh in range_constexpr(vh_count):
-                    out = fx.Vector.filled(8, 0.0, fx.Float32)
-                    for d in range_constexpr(t.TOKENS // pv_k):
-                        v_operand = self.mem.operand(
+                # Issue independent LDS operand loads before the PV MMAs.
+                v_operands = [
+                    [
+                        self.mem.operand(
                             kv_off
                             + t.k_bytes
                             + (vh * 64 + ctx.warp * 16) * t.v_stride
@@ -715,8 +758,15 @@ class Gfx1250Pipeline:
                             ctx.lane16,
                             ctx.half,
                         )
+                        for d in range_constexpr(t.TOKENS // pv_k)
+                    ]
+                    for vh in range_constexpr(vh_count)
+                ]
+                for vh in range_constexpr(vh_count):
+                    out = fx.Vector.filled(8, 0.0, fx.Float32)
+                    for d in range_constexpr(t.TOKENS // pv_k):
                         out = Gfx1250Gemm.mma(
-                            v_operand, p_operands[d], out, pv_k, t.bf16
+                            v_operands[vh][d], p_operands[d], out, pv_k, t.bf16
                         )
                     next_state.append(
                         state[m * state_stride + 2 + vh]
@@ -728,9 +778,11 @@ class Gfx1250Pipeline:
                             [fx.Float32(vfactor)], dtype=fx.Float32
                         ).broadcast_to(8)
                     )
-                # Retire P/stat reads before the next M-tile overwrites them;
-                # all K/V reads retire before a ring buffer is reused.
-                gpu.barrier()
+                # The next iteration's barrier retires the final M-tile reads
+                # before a double buffer is reused. Intra-iteration reuse and
+                # the single-buffer staging path still need an explicit barrier.
+                if const_expr(m + 1 < t.m_tiles or t.buffers == 1):
+                    gpu.barrier()
             if const_expr(t.buffers == 1):  # noqa: SIM102
                 if token_base + t.TOKENS < end:
                     self.mem.stage_kv(token_base + t.TOKENS, fx.Int32(0))

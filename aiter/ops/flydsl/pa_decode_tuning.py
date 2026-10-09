@@ -1124,7 +1124,12 @@ def main(argv=None):
             info = {"architecture": args.architecture, "num_cu": args.num_cu}
         else:
             torch, pa, info = _load_gpu(args)
-        candidates = args.budgets or list(DEFAULT_BUDGETS)
+        default_budgets = DEFAULT_BUDGETS
+        if info["architecture"] == "gfx1250":
+            # Streaming PA needs more independent tasks than the small-batch
+            # defaults; these remain offline candidates, not launch defaults.
+            default_budgets += (8192, 16384)
+        candidates = args.budgets or list(default_budgets)
         if args.budget_cu is not None:
             scaled = [x * info["num_cu"] for x in args.budget_cu]
             if any(not _finite_positive(x) or not x.is_integer() for x in scaled):
