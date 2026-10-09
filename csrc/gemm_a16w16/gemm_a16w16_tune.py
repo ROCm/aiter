@@ -26,8 +26,10 @@ from aiter.jit.core import AITER_CONFIG_GEMM_BF16, get_asm_dir
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.gemm_a16w16_policy import (
     get_flydsl_a16w16_configs,
+    get_flydsl_a16w16_decode_configs,
 )
 from aiter.ops.flydsl.gemm_kernels import (
+    flydsl_decode_gemm,
     flydsl_hgemm,
     flydsl_hgemm_kernel_name,
 )
@@ -316,6 +318,10 @@ def run_flydsl_gemm_bf16(
     return out
 
 
+def run_flydsl_decode_gemm_bf16(input, weight, out, bias=None, kernel_name=None):
+    return flydsl_decode_gemm(input, weight, kernel_name, bias=bias, out=out)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -469,6 +475,13 @@ class GemmA16W16Tuner(GemmCommonTuner):
             dest="with_hipblaslt",
             help="Include hipblaslt in tuning (disabled by default). "
             "hipblaslt tuning is also available standalone via gradlib/gradlib/gemm_tuner.py.",
+        )
+        self.parser.add_argument(
+            "--candidate-policy",
+            choices=("bounded", "deep"),
+            default="bounded",
+            help="FlyDSL decode (M = 1..5) candidate breadth: 'bounded' times a "
+            "small sample, 'deep' times the full catalog.",
         )
 
     def _clear_op_caches(self):
@@ -738,6 +751,33 @@ class GemmA16W16Tuner(GemmCommonTuner):
         rtol, atol = _default_tol(outdtype)
         flydsl_catalog = get_flydsl_bf16_catalog(M, N, K, outdtype, has_bias)
         tasks = []
+        for solidx, kernel_name, config in get_flydsl_a16w16_decode_configs(
+            M, N, K, outdtype, has_bias, getattr(self, "candidate_policy", "bounded")
+        ):
+            info = (info_keys, solidx, 0, kernel_name, "flydsl", is_shuffle)
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
+                    run_flydsl_decode_gemm_bf16,
+                    (["inp", "weights", "out_asm", "bias"], kernel_name),
+                    dict(run_kwargs),
+                    get_gemm_ref,
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        indtype,
+                        outdtype,
+                    ),
+                    {},
+                    None,
+                    rtol,
+                    atol,
+                    None,
+                    None,
+                    ("out_asm",),
+                )
+            )
         for solidx, kernel_name, config in flydsl_catalog:
             info = (
                 info_keys,
@@ -915,6 +955,7 @@ class GemmA16W16Tuner(GemmCommonTuner):
     def tune(self, untunedf, tunedf, args):
         libtype = args.libtype
         with_hipblaslt = getattr(args, "with_hipblaslt", False)
+        self.candidate_policy = getattr(args, "candidate_policy", "bounded")
         gfx = self.get_gfx()
         cu_num = self.get_cu_num()
         run_kwargs = {"num_warmup": 10, "num_iters": 101}
