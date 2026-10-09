@@ -914,14 +914,14 @@ def _build_kernel_mfma_lds_pipe(
         lane_frag_off = lane_div_N * fx.Int32(mfma.frag_bytes)
         cp_4xfp32, tc_c_w = _make_weight_copy(mma, lane)
 
+        # Wave-uniform copy of the wave index, so the per-tile DMA LDS base
+        # is computed on the SALU instead of a readfirstlane every tile.
+        wave_s = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, wave.ir_value()))
+
         # First row owned by this wave.
         wave_row0 = block_row0 + wave * fx.Int32(RPW)
 
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
-        kv_i32 = GTensor(KV, dtype=T.i32, shape=(-1,))
-        kv_rsrc = kv_i32.rsrc
-        sc_t = GTensor(kv_scales, dtype=T.f32, shape=(-1,))
-        sc_rsrc = sc_t.rsrc
         cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
         ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
         _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
@@ -941,24 +941,43 @@ def _build_kernel_mfma_lds_pipe(
             """One lane's 32-byte B-fragment out of the staged LDS tile."""
             return fx.ptr_load(lds_ptr + dword_idx, result_type=_frag_ty)
 
+        def _tile_rsrcs(col0_i32):
+            """KV / kv_scales descriptors based at column ``col0``, bounded at
+            ``seq_len_kv`` (num_records shrinks with col0)."""
+            rem_cols = fx.max(seq_len_kv - col0_i32, fx.Int32(0))
+            kv_t = buffer_ops.create_buffer_resource(
+                KV,
+                base_byte_offset=col0_i32 * fx.Int32(D),
+                num_records_bytes=rem_cols * fx.Int32(D),
+            )
+            sc_t_rsrc = buffer_ops.create_buffer_resource(
+                kv_scales,
+                base_byte_offset=col0_i32 * fx.Int32(4),
+                num_records_bytes=rem_cols * fx.Int32(4),
+            )
+            return kv_t, sc_t_rsrc
+
         def _dma_kv_tile_to_lds(slot_byte_i32, col0_i32):
             """Cooperatively async-copy KV[col0:col0+BKV, :] into LDS slot.
 
             All MR_BLOCK_THREADS threads participate; thread ``tid`` at load ``i``
             writes LDS byte ``(i*MR_BLOCK_THREADS + tid)*DMA_BYTES`` (relative to
             the slot), reading the matching linear byte of the row-major tile.
-            OOB columns are clamped to ``seq_len_kv-1`` (harmless -- masked out in
-            the epilogue by the per-row window predicate).
+
+            The descriptors are re-based at column ``col0`` every tile (SALU
+            only), so each lane's offset is loop-invariant and the loop spends
+            no VALU on DMA addressing. Columns past ``seq_len_kv`` fall outside
+            ``num_records`` and read 0; they are masked out of the stored
+            logits by the per-row window predicate.
             """
-            wave_slot_i32 = slot_byte_i32 + wave * fx.Int32(64 * DMA_BYTES)
-            wave_slot_scalar = rocdl.readfirstlane(
-                fx.Int64.ir_type, fx.Int64(fx.Uint32(wave_slot_i32)).ir_value()
-            )
+            wave_slot_scalar = fx.Int64(
+                fx.Uint32(slot_byte_i32 + wave_s * fx.Int32(64 * DMA_BYTES))
+            ).ir_value()
             lds_ptr = buffer_ops.get_element_ptr(lds_ptr0, wave_slot_scalar)
+            kv_rsrc_t, sc_rsrc_t = _tile_rsrcs(col0_i32)
 
             dma_bytes = fx.Int32(DMA_BYTES)
             d = fx.Int32(D)
-            seq_len_kv_m_1 = seq_len_kv - fx.Int32(1)
 
             for i in range_constexpr(NUM_KV_DMAS):
                 lin_bytes = (tid + fx.Int32(i * MR_BLOCK_THREADS)) * dma_bytes
@@ -973,16 +992,14 @@ def _build_kernel_mfma_lds_pipe(
                     _mask_b = (row_local & fx.Int32(NC - 1)) * fx.Int32(mfma.frag_bytes)
                     d_off = d_off ^ _mask_b
 
-                col = col0_i32 + row_local
-                col_cl = fx.min(col, seq_len_kv_m_1)
-                voffset = col_cl * d + d_off
+                voffset = row_local * d + d_off
                 if const_expr(i > 0):
                     lds_ptr = buffer_ops.get_element_ptr(
                         lds_ptr,
                         static_byte_offset=MR_BLOCK_THREADS * DMA_BYTES,
                     )
                 rocdl.raw_ptr_buffer_load_lds(
-                    kv_rsrc,
+                    kv_rsrc_t,
                     lds_ptr,
                     dma_bytes,
                     fx.Int32(voffset),
@@ -1001,9 +1018,9 @@ def _build_kernel_mfma_lds_pipe(
                         fx.Int64.ir_type, fx.Int64(fx.Uint32(sc_byte_i32)).ir_value()
                     ),
                 )
-                sc_col = fx.min(col0_i32 + fx.Int32(s * 64) + lane, seq_len_kv_m_1)
+                sc_col = fx.Int32(s * 64) + lane
                 rocdl.raw_ptr_buffer_load_lds(
-                    sc_rsrc,
+                    sc_rsrc_t,
                     sc_lds_ptr,
                     fx.Int32(4),
                     fx.Int32(sc_col * fx.Int32(4)),
@@ -1152,12 +1169,22 @@ def _build_kernel_mfma_lds_pipe(
             # (rs_scales[g]) -- one multiply per group instead of per n-tile.
             kv_scales_tile = [None] * N_TILES
             rs_scales = [None] * (N_TILES // RS_GROUP)
+            if const_expr(not lds_scales):
+                sc_rsrc_tile = _tile_rsrcs(col0)[1]
             for ni in range_constexpr(N_TILES):
                 col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 cols[ni] = col
                 if const_expr(not lds_scales):
-                    col_cl = fx.min(col, seq_len_kv - fx.Int32(1))
-                    kv_scales_tile[ni] = fx.Float32(sc_t[col_cl])
+                    # Column-relative offset into the tile's descriptor; past
+                    # seq_len_kv the hardware returns 0 (masked column).
+                    kv_scales_tile[ni] = fx.Float32(
+                        buffer_ops.buffer_load(
+                            sc_rsrc_tile,
+                            fx.Int32(ni * mfma.MFMA_N) + lane_mod_N,
+                            vec_width=1,
+                            dtype=T.f32,
+                        )
+                    )
                 col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 if const_expr(lds_scales and not rs_head):
                     kv_scales_tile[ni] = _lds_read_scale(
