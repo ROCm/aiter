@@ -2,27 +2,31 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """CPU behavior at the retune input/artifact and OS scheduling boundaries."""
 
+from __future__ import annotations
+
 import copy
 import csv
 import importlib.util
 import tempfile
 import unittest
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[2] / "docs/a8w4_work/run_serial_retune.py"
 
 
-def load_workflow():
+def load_workflow() -> Any:
     spec = importlib.util.spec_from_file_location("a8w4_retune_workflow", SCRIPT)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-def write_csv(path, rows):
+def write_csv(path: str | Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="") as output:
         writer = csv.DictWriter(output, fieldnames=rows[0])
@@ -30,7 +34,7 @@ def write_csv(path, rows):
         writer.writerows(rows)
 
 
-def shape(token):
+def shape(token: int) -> dict[str, Any]:
     return {
         "token": token,
         "model_dim": 3072,
@@ -48,7 +52,7 @@ def shape(token):
 
 
 class TestRetuneInputs(unittest.TestCase):
-    def test_union_preserves_tuned_only_shape_and_tag_provenance_once(self):
+    def test_union_preserves_tuned_only_shape_and_tag_provenance_once(self) -> None:
         workflow = load_workflow()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -72,7 +76,7 @@ class TestRetuneInputs(unittest.TestCase):
             self.assertTrue(Path(record["input"]).is_file())
             self.assertEqual(len(record["input_sha256"]), 64)
 
-    def test_shape_identity_comes_from_input_header(self):
+    def test_shape_identity_comes_from_input_header(self) -> None:
         workflow = load_workflow()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -83,7 +87,9 @@ class TestRetuneInputs(unittest.TestCase):
             self.assertEqual(record["shape_count"], 2)
             self.assertIn("source_dimension", record["shape_fields"])
 
-    def test_winner_requires_matching_finite_profile_and_a8_producer_consumer(self):
+    def test_winner_requires_matching_finite_profile_and_a8_producer_consumer(
+        self,
+    ) -> None:
         workflow = load_workflow()
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -136,7 +142,9 @@ class TestRetuneInputs(unittest.TestCase):
 
 
 class TestSerialScheduler(unittest.TestCase):
-    def test_idle_hip_context_does_not_hide_active_or_unknown_gpu_resources(self):
+    def test_idle_hip_context_does_not_hide_active_or_unknown_gpu_resources(
+        self,
+    ) -> None:
         workflow = load_workflow()
         zero_context = {
             "pid": 21,
@@ -162,7 +170,7 @@ class TestSerialScheduler(unittest.TestCase):
             AmdSmiMemoryType=SimpleNamespace(VRAM=1),
         )
 
-        def bdf_probe(buffer, _size, _gpu):
+        def bdf_probe(buffer: Any, _size: int, _gpu: int) -> int:
             buffer.value = b"0000:05:00.0"
             return 0
 
@@ -192,7 +200,7 @@ class TestSerialScheduler(unittest.TestCase):
                 )
             )
 
-    def test_executed_python_entry_excludes_formatter_input_files(self):
+    def test_executed_python_entry_excludes_formatter_input_files(self) -> None:
         workflow = load_workflow()
         self.assertEqual(
             workflow.python_entry(["python3", "-u", "-m", "black", "gemm_moe_tune.py"]),
@@ -225,29 +233,31 @@ class TestSerialScheduler(unittest.TestCase):
             "-c",
         )
 
-    def test_models_wait_for_workers_before_next_launch_and_continue_failed_model(self):
+    def test_models_wait_for_workers_before_next_launch_and_continue_failed_model(
+        self,
+    ) -> None:
         workflow = load_workflow()
         events = []
 
         class System:
             @contextmanager
-            def locks(self, gpus):
+            def locks(self, gpus: list[int]) -> Iterator[None]:
                 events.append("locked")
                 yield
                 events.append("released")
 
-            def tune_processes(self):
+            def tune_processes(self) -> list[dict[str, Any]]:
                 return []
 
-            def source_state(self, repo):
+            def source_state(self, repo: str | Path) -> dict[str, Any]:
                 return {"revision": "fixture", "sources": {"kernel.py": "known hash"}}
 
-            def gpu_snapshot(self, gpus):
+            def gpu_snapshot(self, gpus: list[int]) -> list[dict[str, Any]]:
                 return [
                     {"hip_id": gpu, "bdf": "0000:05:00.0", "idle": True} for gpu in gpus
                 ]
 
-            def launch(self, command, **kwargs):
+            def launch(self, command: list[str], **kwargs: Any) -> Any:
                 assert command[command.index("--batch") + 1] == "4"
                 name = Path(command[command.index("-i") + 1]).stem
                 events.append(f"launch {name}")
@@ -256,7 +266,7 @@ class TestSerialScheduler(unittest.TestCase):
                 class Process:
                     pid = 100
 
-                    def wait(self):
+                    def wait(self) -> int:
                         import json
 
                         record = json.loads(
@@ -271,7 +281,7 @@ class TestSerialScheduler(unittest.TestCase):
 
                 return Process()
 
-            def drain_group(self, process):
+            def drain_group(self, process: Any) -> None:
                 events.append("workers ended")
 
         with tempfile.TemporaryDirectory() as directory:
@@ -314,18 +324,18 @@ class TestSerialScheduler(unittest.TestCase):
             )
             self.assertTrue((output / "retune_run.json").is_file())
 
-    def test_external_tune_blocks_every_model_before_launch(self):
+    def test_external_tune_blocks_every_model_before_launch(self) -> None:
         workflow = load_workflow()
 
         class System:
             @contextmanager
-            def locks(self, gpus):
+            def locks(self, gpus: list[int]) -> Iterator[None]:
                 yield
 
-            def tune_processes(self):
+            def tune_processes(self) -> list[dict[str, Any]]:
                 return [{"pid": 91, "entry": "gemm_moe_tune.py"}]
 
-            def launch(self, *args, **kwargs):
+            def launch(self, *args: Any, **kwargs: Any) -> Any:
                 raise AssertionError("external tune must prevent subprocess launch")
 
         with tempfile.TemporaryDirectory() as directory:
