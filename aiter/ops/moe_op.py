@@ -216,6 +216,8 @@ def router_gemm_topk_softmax_asm(
         time. The caller gives every graph that can replay at the same time as
         another one its own workspace. A call outside a capture can leave it
         out and then uses a workspace that is cached for the current stream.
+        A workspace that is not a contiguous int32 tensor on the same GPU, or
+        that is too small, raises before the launch.
 
     Other shapes, other GPUs and M above 8 raise a RuntimeError.
     """

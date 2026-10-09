@@ -428,14 +428,59 @@ def _run_guard_checks():
         "get_router_topk_workspace() during a capture",
     )
 
+    # A workspace from the caller must own the memory that the kernel writes.
+    # The zero-stride view reports as many int32 elements as a real workspace
+    # but owns only one, so a size check alone would let the kernel write its
+    # logits and its counter past the end of that one element. 8 * 520 int32
+    # elements hold the logits of 8 tokens but not the counter after them. The
+    # checks run before the launch, so a rejected call writes neither the
+    # outputs nor the memory behind the view.
+    weights, ids, tei = output_buffers(2)
+    one_int = torch.zeros(1, dtype=dtypes.i32)
+    num_ints = get_router_topk_workspace().numel()
+    _expect_raises(
+        lambda: run_fused(
+            x, w, weights, ids, tei, one_int.as_strided((num_ints,), (0,))
+        ),
+        "workspace must be contiguous",
+        "a zero-stride workspace view",
+    )
+    _expect_raises(
+        lambda: run_fused(
+            x, w, weights, ids, tei, torch.zeros(2 * num_ints, dtype=dtypes.i32)[::2]
+        ),
+        "workspace must be contiguous",
+        "a workspace view with stride 2",
+    )
+    _expect_raises(
+        lambda: run_fused(
+            x, w, weights, ids, tei, torch.zeros(4 * num_ints + 1, dtype=dtypes.u8)[1:]
+        ),
+        "workspace must be int32",
+        "a byte workspace at an odd offset",
+    )
+    _expect_raises(
+        lambda: run_fused(
+            x, w, weights, ids, tei, torch.zeros(8 * 520, dtype=dtypes.i32)
+        ),
+        "workspace must hold at least",
+        "a workspace without room for the counter",
+    )
+    torch.cuda.synchronize()
+    assert one_int.item() == 0, "a rejected call wrote into the zero-stride view"
+    assert (
+        weights.isnan().all() and (ids[:, :TOPK] == -1).all() and (tei == -1).all()
+    ), "a rejected call wrote the outputs"
+
     x, w = make_inputs(0, "randn")
     weights, ids, tei = output_buffers(0)
     run_fused(x, w, weights, ids, tei)
 
     aiter.logger.info(
         "guard checks passed: 9 tokens, dim 4096, a contiguous [M, 10] topk_ids, "
-        "fp16 input, a captured call without a workspace and a workspace allocated "
-        "during a capture raise, and 0 tokens is a no-op"
+        "fp16 input, a captured call without a workspace, a workspace allocated "
+        "during a capture, and a zero-stride, strided, byte or too small workspace "
+        "raise, and 0 tokens is a no-op"
     )
 
 

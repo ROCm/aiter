@@ -81,7 +81,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* topk_weights,         // [M, topk + 1] fp32
      aiter_tensor_t* topk_ids,             // [M, topk] or [M, topk + 1] int32, row stride topk + 1
      aiter_tensor_t* token_expert_indices, // [M, topk] int32
-     aiter_tensor_t* workspace,            // zero-initialized, at least kWorkspaceBytes
+     aiter_tensor_t* workspace,            // zeroed contiguous int32, at least kWorkspaceBytes
      hipStream_t stream),
     (hidden_states, gate_weight, topk_weights, topk_ids, token_expert_indices, workspace, stream))
 {
@@ -151,6 +151,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 ": token_expert_indices must be a contiguous [",
                 m,
                 ", topk] tensor");
+    // numel() counts the elements of a view, not the memory behind it. A view
+    // with a zero or overlapping stride can count enough elements while it
+    // owns almost no memory, and the kernel would write past its end. A
+    // contiguous int32 tensor owns all numel() * 4 bytes it reports.
+    AITER_CHECK(workspace->dtype() == AITER_DTYPE_i32,
+                fn,
+                ": workspace must be int32, got ",
+                AiterDtype_to_str(workspace->dtype()));
+    AITER_CHECK(workspace->is_contiguous(), fn, ": workspace must be contiguous");
     AITER_CHECK(workspace->numel() * workspace->element_size() >= kWorkspaceBytes,
                 fn,
                 ": workspace must hold at least ",
