@@ -867,7 +867,7 @@ __launch_bounds__(WARPS_PER_CTA * opus::get_warp_size()) __global__
         NUM_SHARED_EXPERTS > 0 &&
         NUM_SHARED_EXPERTS * GATE_LDS_CAP * static_cast<int>(sizeof(DTYPE)) <= 65536;
     static constexpr int GATE_LDS_SLOTS = GATE_LDS_FITS ? NUM_SHARED_EXPERTS * GATE_LDS_CAP : 1;
-    __shared__ alignas(64) DTYPE s_gate[GATE_LDS_SLOTS];
+    __shared__ __attribute__((aligned(64))) DTYPE s_gate[GATE_LDS_SLOTS];
     bool use_lds_gate = false;
     if constexpr(NUM_SHARED_EXPERTS > 0 && SCORING_FUNC != SharedExpertScoringFunc::NONE &&
                  GATE_LDS_FITS)

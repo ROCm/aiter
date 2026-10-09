@@ -71,6 +71,7 @@ PS_OPTIONS = [True, False]
 
 CASE_SET_NAME_OPTIONS = [
     "normal_accuracy",
+    "ps_accuracy",
     "sliding_window_accuracy",
     "sliding_window_performance",
 ]
@@ -2133,6 +2134,43 @@ def normal_performance_test():
     parse_arg_and_run_test()
 
 
+def ps_accuracy_test():
+    """Run PS accuracy test with multiple splits and query_length > 1."""
+    global BLOCK_SIZE_OPTIONS
+    global QUERY_LENGTH_OPTIONS
+    global BATCH_SIZE_OPTIONS
+    global HEAD_CONFIGURATIONS
+    global CONTEXT_LENGTH_OPTIONS
+    global QUANT_MODE_OPTIONS
+    global HEAD_DIMENSION_OPTIONS
+    global TRANS_V_OPTIONS
+    global KV_VARLEN_OPTIONS
+    global USE_TORCH_FLASH_REF_OPTIONS
+    global CONTEXT_PARTITION_SIZE_OPTIONS
+    global SINKS_OPTIONS
+    global SLIDING_WINDOW_OPTIONS
+    global COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS
+    global PS_OPTIONS
+
+    SINKS_OPTIONS = [False]
+    SLIDING_WINDOW_OPTIONS = [0]
+    PS_OPTIONS = [True]
+    USE_TORCH_FLASH_REF_OPTIONS = [False]
+    CONTEXT_PARTITION_SIZE_OPTIONS = [256]
+
+    HEAD_DIMENSION_OPTIONS = [128]
+    HEAD_CONFIGURATIONS = [(8, 1), (16, 1), (64, 8)]
+    QUERY_LENGTH_OPTIONS = [1, 4]
+    COMPUTE_TYPES_QUANT_Q_AND_KV_OPTIONS = [["bf16", False, False]]
+    QUANT_MODE_OPTIONS = ["per_tensor"]
+    CONTEXT_LENGTH_OPTIONS = [2048, 8192]
+    BATCH_SIZE_OPTIONS = [16]
+    TRANS_V_OPTIONS = [False]
+    KV_VARLEN_OPTIONS = [False]
+    BLOCK_SIZE_OPTIONS = [16]
+    parse_arg_and_run_test()
+
+
 def sliding_window_accuracy_test():
     """Run sliding window accuracy test."""
     global BLOCK_SIZE_OPTIONS
@@ -2216,6 +2254,8 @@ def test_multi_case_set(case_set_name):
         normal_accuracy_test()
     elif case_set_name == "normal_performance":
         normal_performance_test()
+    elif case_set_name == "ps_accuracy":
+        ps_accuracy_test()
     elif case_set_name == "sliding_window_accuracy":
         sliding_window_accuracy_test()
     elif case_set_name == "sliding_window_performance":

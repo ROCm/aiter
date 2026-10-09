@@ -1406,6 +1406,7 @@ def attention_forward_decode_triton_impl(
         WINDOW_SIZE_RIGHT=window_size_right,
         USE_BLOCK_TABLE=use_block_table,
         IS_FP8=IS_FP8,
+        enable_fp_fusion=True,
     )
 
     if DEBUG:
@@ -1465,4 +1466,5 @@ def attention_forward_decode_triton_impl(
         splitK_pow2=splitK_pow2,
         MASK_SPLITK=mask_split_k,
         PADDED_HEAD=is_padded_head,
+        enable_fp_fusion=True,
     )
