@@ -357,6 +357,62 @@ def test_shuffled_cache_must_be_packed():
     assert_matches(run(c, shuf, shuffled=True), ref, live, "packed shuffled")
 
 
+def test_rejects_overlapping_out():
+    """A page-contiguous block axis does not make the rows disjoint. At row
+    stride 1 every query shares storage with its neighbour, so the kernel
+    overwrites scores it already wrote (3.26 max abs error) while the call
+    reports success. Each axis has to clear the extent below it."""
+    c = make_case(1, 256, 2048)
+    tq, mb = c["q8"].shape[0], c["mb"]
+    buf = torch.full((tq * mb,), SENTINEL, dtype=torch.float32, device="cuda")
+
+    def run_with(shape, stride):
+        out = torch.as_strided(buf, shape, stride)
+        score_prefill_flydsl(
+            c["q_bf16"],
+            c["cache"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            1.0 / LOG2E,
+            out=out,
+        )
+
+    for stride in (
+        (tq * mb, 1, 1),  # rows alias
+        (tq * mb, mb - 1, 1),  # rows overlap by one block
+    ):
+        with pytest.raises(ValueError, match="non-overlapping"):
+            run_with((1, tq, mb), stride)
+    # A zero head stride is rejected too, but by `_validate_tensor` before this
+    # check sees it -- assert the rejection, not which guard caught it.
+    with pytest.raises(ValueError):
+        run_with((1, tq, mb), (0, mb, 1))
+
+    # Exactly-packed and padded-but-disjoint are both still accepted.
+    ref, live = reference(c)
+    assert_matches(run(c, c["cache"]), ref, live, "packed out")
+    wide = torch.full((1, tq, 2 * mb), SENTINEL, dtype=torch.float32, device="cuda")
+    padded = wide[:, :, :mb]
+    assert padded.stride() == (tq * 2 * mb, 2 * mb, 1)
+    score_prefill_flydsl(
+        c["q_bf16"],
+        c["cache"],
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+        out=padded,
+    )
+    assert_matches(padded.reshape(ref.shape), ref, live, "padded out")
+
+
 def test_bf16_cache_path():
     """A bf16 cache takes a different arithmetic path, and nothing else here
     builds one -- `make_case` is fp8 only, so `score_page`'s non-k128 tail and

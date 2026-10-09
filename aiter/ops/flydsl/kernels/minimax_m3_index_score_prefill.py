@@ -2237,8 +2237,19 @@ def score_prefill_flydsl(
         raise ValueError(
             f"out: expected [{heads}, {total_q}, {max_block}], got {tuple(out.shape)}"
         )
-    if out.stride(2) != 1:
-        raise ValueError("out: the block axis must be contiguous")
+    # Contiguity of the block axis is not enough: positive strides that are too
+    # small make rows alias, and the kernel then overwrites scores it already
+    # wrote while this function reports success (measured 3.26 max abs error at
+    # row stride 1). Each axis must clear the whole extent below it. Padding
+    # above that is fine and is what the production layout uses -- this mirrors
+    # the decode scorer's check, minus its feature-contiguous arm, which this
+    # entry does not accept.
+    st = out.stride()
+    if st[2] != 1 or st[1] < max_block or st[0] < total_q * st[1]:
+        raise ValueError(
+            f"out: expected a page-contiguous non-overlapping layout, got "
+            f"stride {st} for [{heads}, {total_q}, {max_block}]"
+        )
     nreq = cu_seqlens_q.shape[0] - 1
     if nreq < 1 or seq_lens.shape[0] < nreq or prefix_lens.shape[0] < nreq:
         raise ValueError("seq_lens/prefix_lens must cover every request")
