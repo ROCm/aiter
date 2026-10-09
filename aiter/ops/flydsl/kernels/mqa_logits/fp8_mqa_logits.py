@@ -793,6 +793,12 @@ def _build_kernel_mfma_lds_pipe(
 
     N_TILES = BKV // mfma.MFMA_N
     M_TILES = H // mfma.MFMA_M
+    # Unroll the tile loop by NUM_BUFFERS so each slot's LDS offset is a
+    # compile-time constant.
+    UNROLL_KV_TILE_LOOP = rs_head and not sw_pipe and not lds_scales
+    # Hand the sw_pipe MFMA/reduce interleave to the AMDGPU pipeline solver on
+    # the low-occupancy routes.
+    IGLP_SW_PIPE = sw_pipe and WPB <= 2
     K_STEPS = D // mfma.MFMA_K
     # n-tiles per reduce-scatter group: one per MFMA_N-lane group of the wave.
     RS_GROUP = 64 // mfma.MFMA_N
@@ -914,8 +920,6 @@ def _build_kernel_mfma_lds_pipe(
         lane_frag_off = lane_div_N * fx.Int32(mfma.frag_bytes)
         cp_4xfp32, tc_c_w = _make_weight_copy(mma, lane)
 
-        # Wave-uniform copy of the wave index, so the per-tile DMA LDS base
-        # is computed on the SALU instead of a readfirstlane every tile.
         wave_s = fx.Int32(rocdl.readfirstlane(fx.Int32.ir_type, wave.ir_value()))
 
         # First row owned by this wave.
@@ -1142,11 +1146,14 @@ def _build_kernel_mfma_lds_pipe(
             )
 
         # ---- Steady-state software pipeline over BKV tiles ----
-        for t_iv in range(fx.Int32(0), n_tiles, fx.Int32(1)):
-            t = fx.Int32(t_iv)
+        # slot_static: compile-time slot (unroll_slots) or None (t % NB).
+        def _tile(t, slot_static):
             col0 = tile_start + t * fx.Int32(BKV)
-            slot_idx = t % fx.Int32(NUM_BUFFERS)
-            slot_dword = slot_idx * fx.Int32(SLOT_I32)
+            if const_expr(slot_static is None):
+                slot_idx = t % fx.Int32(NUM_BUFFERS)
+                slot_dword = slot_idx * fx.Int32(SLOT_I32)
+            else:
+                slot_dword = fx.Int32(slot_static * SLOT_I32)
 
             # Wait until only the (PREFETCH_DEPTH-1) newer tiles remain in flight,
             # i.e. the current tile is complete; then sync so every wave sees the
@@ -1226,7 +1233,14 @@ def _build_kernel_mfma_lds_pipe(
             if const_expr(_need_barrier_b):
                 gpu.barrier()
             t_next = t + fx.Int32(PREFETCH_DEPTH)
-            next_slot_byte = (t_next % fx.Int32(NUM_BUFFERS)) * fx.Int32(SLOT_BYTES)
+            if const_expr(slot_static is None):
+                next_slot_byte = (t_next % fx.Int32(NUM_BUFFERS)) * fx.Int32(
+                    SLOT_BYTES
+                )
+            else:
+                next_slot_byte = fx.Int32(
+                    ((slot_static + PREFETCH_DEPTH) % NUM_BUFFERS) * SLOT_BYTES
+                )
             col0_next = tile_start + t_next * fx.Int32(BKV)
             _dma_kv_tile_to_lds(next_slot_byte, col0_next)
 
@@ -1304,6 +1318,8 @@ def _build_kernel_mfma_lds_pipe(
                     for j in range_constexpr(RPW)
                     for ni in range_constexpr(N_TILES)
                 ]
+                if const_expr(IGLP_SW_PIPE):
+                    rocdl.iglp_opt(0)
                 cf = _emit_acc_issue(
                     mfma, mma, gemm_kw, a_packs[items[0][0]], b_packs[items[0][1]]
                 )
@@ -1363,6 +1379,18 @@ def _build_kernel_mfma_lds_pipe(
 
                     if const_expr(k + 1 < len(items)):
                         cf = cf_next
+
+        if const_expr(UNROLL_KV_TILE_LOOP):
+            # Unrolled by NUM_BUFFERS so every slot offset is a constant (tile
+            # t lives in slot t % NUM_BUFFERS).
+            for t0_iv in range(fx.Int32(0), n_tiles, fx.Int32(NUM_BUFFERS)):
+                for u in range_constexpr(NUM_BUFFERS):
+                    t_u = fx.Int32(t0_iv) + fx.Int32(u)
+                    if t_u < n_tiles:
+                        _tile(t_u, u)
+        else:
+            for t_iv in range(fx.Int32(0), n_tiles, fx.Int32(1)):
+                _tile(fx.Int32(t_iv), None)
 
         # ---- Fused clean_logits prefill: per-wave, over this wave's own rows.
         # A wave holds starts[]/ends[] only for its RPW rows; making all waves
