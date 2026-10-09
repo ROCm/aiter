@@ -24,6 +24,8 @@ MODEL_SHAPES = [
     (896, 3584, 3072, 16),
 ]
 SUPPORTED_GFX = ["gfx950"]
+# Shape parameters are supplied by main(), not pytest fixtures.
+__test__ = False
 
 
 def run_torch(
