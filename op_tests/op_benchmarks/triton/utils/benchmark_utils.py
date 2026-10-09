@@ -6,7 +6,10 @@ import sys
 import tempfile
 import time
 import warnings
+import math
 from pathlib import Path
+from collections.abc import Callable
+from typing import Sequence, Any, List
 
 import matplotlib.pyplot as plt
 import torch
@@ -378,3 +381,82 @@ def get_dtype_bytes(dtype):
 def get_caller_name_no_ext():
     caller_file = inspect.stack()[1].filename  # full path of caller
     return Path(caller_file).stem  # filename without extension
+
+def run_input_generator(gen: Callable[[], tuple], fields: Sequence[str]) -> dict[str, Any]:
+    values = gen()
+    if len(values) != len(fields):
+        raise ValueError(
+            f"{gen.func.__name__} returned {len(values)} values, "
+            f"expected {len(fields)}: {fields}"
+        )
+    return {name: val for name, val in zip(fields, values) if name != "_"}
+
+def generate_rotating_buffers_pool(gen: Callable, out_vals_keys: tuple, target_mb: int, min_pool_len: int):
+    kwargs = run_input_generator(gen, out_vals_keys)
+    per_set_bytes = sum([kwargs[a].numel() * kwargs[a].element_size() for a in out_vals_keys if a != "_"])
+
+    pool_len = max(min_pool_len, math.ceil(target_mb *1024 * 1024 / per_set_bytes))
+    pool = []
+    for _ in range(pool_len):
+        pool.append(run_input_generator(gen, out_vals_keys))
+
+    return pool
+
+
+def do_bench_aiter_triton(fn: Callable, 
+                          rot_bufs: List[dict[str, torch.Tensor]], 
+                          warmup_iters: int = 3, 
+                          kernels_per_graph: int = 1000,
+                          num_replays: int = 10,
+                          warmup_replays: int = 3,
+                          ) -> float :
+    
+    #warmup
+    for _ in range(warmup_iters):
+        fn(**(rot_bufs[0]))
+    torch.cuda.synchronize()
+
+    #Build per-dispatch callables that rotate through buffer pool
+    pool_len = len(rot_bufs)
+    def _make_fn(idx):
+        return lambda: fn(**(rot_bufs[idx % pool_len]))
+
+    fns =[_make_fn(i) for i in range(kernels_per_graph)]
+
+    #capture graph
+    stream = torch.cuda.Stream()
+    with torch.cuda.stream(stream):
+        for f in fns[:min(3, len(fns))]:
+            f()
+        torch.cuda.synchronize()
+
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g, stream=stream):
+            for f in fns:
+                f()
+    torch.cuda.synchronize()
+
+    #warmup replays
+    for _ in range(warmup_replays):
+        g.replay()
+    torch.cuda.synchronize()
+
+    #Timed replays
+    start_events = []
+    end_events = []
+    for _ in range(num_replays):
+        se = torch.cuda.Event(enable_timing=True)
+        ee = torch.cuda.Event(enable_timing=True)
+        se.record()
+        g.replay()
+        ee.record()
+        start_events.append(se)
+        end_events.append(ee)
+    torch.cuda.synchronize()
+
+    times_ms = [se.elapsed_time(ee) for se, ee in zip(start_events, end_events)]
+    per_kernel_ms = [ t / kernels_per_graph for t in times_ms]
+
+    ms = sum(per_kernel_ms) / len(per_kernel_ms)
+
+    return ms

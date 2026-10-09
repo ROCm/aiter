@@ -2,7 +2,10 @@ import functools
 import math
 import sys
 from collections.abc import Callable
+from typing import Sequence, Any
 
+import torch
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 import triton
 
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as triton_gemm_a8w8
@@ -20,18 +23,19 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_model_benchmark_object,
     get_shape_benchmark_object,
     print_vgpr,
+    run_input_generator,
+    generate_rotating_buffers_pool,
+    do_bench_aiter_triton
 )
 from op_tests.triton_tests.gemm.basic.test_gemm_a8w8 import (
     generate_gemm_a8w8_inputs,
 )
 
-
-def bench_gemm_fn(
-    M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, impl: Callable
-):
-    # NOTE: Assume bias and output has the same dtype
+def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: bool, kernel_fn: Callable):
     c_dtype = str_to_torch_dtype["bf16"]
-    x, _, weight, x_scale, w_scale, bias, y = generate_gemm_a8w8_inputs(
+
+    #Input generator callable partial
+    _p_gen = functools.partial(generate_gemm_a8w8_inputs,
         M,
         N,
         K,
@@ -39,22 +43,22 @@ def bench_gemm_fn(
         c_dtype,
         layout=layout,
         output=True,
-        shuffle=shuffle,
+        shuffle=shuffle
     )
+    _out_vals_keys = ["x", "_", "w", "x_scale", "w_scale", "bias", "y"] #keys for outputs from the gen function
 
-    # flops
+    #create rotating buffers pool
+    rot_bufs = generate_rotating_buffers_pool(_p_gen, _out_vals_keys, target_mb=256, min_pool_len=4)
+
+    #Kernel FLOPS and Mem Accesses(bytes)
     flops = 2.0 * M * N * K
-    # memory transfer
-    mem_read = (M * K) * x.element_size() + (N * K) * weight.element_size()
-    mem_write = (M * N) * bias.element_size()
+    mem_read = (M * K) * rot_bufs[0]["x"].element_size() + (N * K) * rot_bufs[0]["w"].element_size()
+    mem_write = (M * N) * rot_bufs[0]["bias"].element_size()
     mem = mem_read + mem_write
-    ms = triton.testing.do_bench(
-        lambda: impl(x, weight, x_scale, w_scale, bias, c_dtype, y),
-        warmup=25,
-        rep=100,
-    )
 
-    # Return exactly one scalar depending on which metric is active
+    ms = do_bench_aiter_triton(kernel_fn, rot_bufs)
+
+    #Return metric
     if metric == "time":
         return ms
     elif metric == "throughput":
@@ -66,7 +70,7 @@ def bench_gemm_fn(
     else:
         raise ValueError("Unknown metric: " + metric)
 
-
+    
 def run_model_benchmark(args, impl):
     """
     Runs benchmark given a --model argument.
@@ -125,7 +129,8 @@ def run_benchmark(args, defaults):
     assert not (args.shape and args.model) or not (
         args.shape and args.M
     ), "User can specify --shape or --model MODEL -M VAL exclusively"
-    if args.gluon:
+    
+    if args.backend == "gluon":
         if args.shuffle:
             impl = gluon_gemm_a8w8_preshuffle
         else:
@@ -136,6 +141,7 @@ def run_benchmark(args, defaults):
                 "Argument --shuffle is only supported with --gluon flag."
             )
         impl = triton_gemm_a8w8
+
     if args.model:
         unsupported_args = []
         for arg in unsupported_args:
@@ -161,11 +167,7 @@ def run_benchmark(args, defaults):
 def parse_args():
     parser = get_parser(kernel_name="A8W8 GEMM")
     parser = add_argparse_ff(parser)
-    parser.add_argument(
-        "--gluon",
-        action="store_true",
-        help="Use Gluon implementation",
-    )
+
     parser.add_argument(
         "--shuffle",
         action="store_true",
