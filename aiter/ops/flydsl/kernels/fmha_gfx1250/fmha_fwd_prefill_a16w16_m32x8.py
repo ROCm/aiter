@@ -1181,15 +1181,13 @@ def _prologue_attention(
             ctx=_kv_ctx,
         )
 
-    # LO copies the K band, HI the V band. Each half's second copy differs too: LO's is
-    # K(start+1) into slot 2, the tile the body no longer issues once K runs ahead; HI's
-    # is V(start) into slot 0, read by body start's dead PV. All four are built here --
-    # the address math is pure and sits in Q's global-load shadow either way; only the
-    # ``.async_load()``s go under the warp-type branch.
+    # LO copies the K band, HI the V band, both of tile start into slot 1. HI owes one
+    # more, V(start) into slot 0, which body start's dead PV reads; LO owes none, because
+    # body start issues K(start+1) itself. Built here because the address math is pure and
+    # sits in Q's global-load shadow either way; only the ``.async_load()``s go under the
+    # warp-type branch.
     _start_valid = _kv_valid(start_tile)
-    fill_tile = start_tile + fx.Int32(1)
     k0 = _k_desc(_k_lds_buf(_PSLOT[1]), start_row0, _start_valid)
-    k_fill = _k_desc(_k_lds_buf(_PSLOT[2]), _tile_row0(fill_tile), _kv_valid(fill_tile))
     v0 = _v_desc(_k_lds_buf(_PSLOT[1]), start_row0, _start_valid)
     v_fill = _v_desc(_k_lds_buf(_PSLOT[0]), start_row0, _start_valid)
 
@@ -1208,20 +1206,19 @@ def _prologue_attention(
     assert _drains[WarpType.LO] == _drains[WarpType.HI], "prologue fence is per-WG"
     _kv_drain = _drains[WarpType.LO]
 
-    # When each copy goes out is NOT transport-independent. Under V2, copies whose
-    # destination misses Q go out BEFORE Q is read, so their global latency overlaps Q's
-    # and the wait drops tensorcnt down to them instead of to 0; only LO's K-ahead fill
-    # (logical slot 2) lands on Q, so that one waits for the barrier. Under V1 there is no
-    # such overlap to have: Q's own stage is on asynccnt too and its part2 waits that
-    # counter to a depth counted over Q's loads ALONE, so a tile copy issued first would
-    # corrupt the count. Everything goes after the barrier, and after part2, which ends at
-    # depth 0.
+    # When each copy goes out is NOT transport-independent. Under V2 every prologue copy
+    # misses Q's chunks, so all of them go out BEFORE Q is read and their global latency
+    # overlaps Q's; the first tile to land on Q's slot is now body start's own K(start+1),
+    # long past Q's drain. Under V1 there is no such overlap to have: Q's own stage is on
+    # asynccnt too and its part2 waits that counter to a depth counted over Q's loads
+    # ALONE, so a tile copy issued first would corrupt the count. Everything goes after
+    # the barrier, and after part2, which ends at depth 0.
     if USE_TDM_LOADER:
         _early = {WarpType.LO: [k0], WarpType.HI: [v0, v_fill]}
-        _late = {WarpType.LO: [k_fill], WarpType.HI: []}
+        _late = {WarpType.LO: [], WarpType.HI: []}
     else:
         _early = {WarpType.LO: [], WarpType.HI: []}
-        _late = {WarpType.LO: [k0, k_fill], WarpType.HI: [v0, v_fill]}
+        _late = {WarpType.LO: [k0], WarpType.HI: [v0, v_fill]}
 
     _is_lo = warp_idx < fx.Int32(NUM_WAVES // 2)
     if USE_TDM_LOADER:
@@ -1240,12 +1237,11 @@ def _prologue_attention(
 
         _issue_early(_is_lo)
     q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
-    # Q's ds_loads must be RETIRED, not just issued, before the barrier that releases
-    # the late copies onto Q's chunks: gpu.barrier() does not retire LDS reads, and Q's
-    # atom is per-wave while a tile's is per-producer (wave A's Q region is written by
-    # wave B's share of the tile).
-    rocdl.s_wait_dscnt(0)
-    gpu.barrier()
+    # No rendezvous here. Q's chunks are slot 1's and no prologue copy lands on them; the
+    # first writer is body start's own K(start+1), past the fence below. That fence is
+    # therefore the WAR wall, and its gpu.barrier() retires this wave's Q reads on the way
+    # in -- Q's atom is per-wave but a tile's is per-producer, so wave A's Q region is
+    # written by wave B's share and the wall has to be a workgroup barrier either way.
 
     @flyc.jit
     def _issue_late(is_lo):
@@ -1398,9 +1394,6 @@ def _core_attention_multi_kv_tiles(
     _kv_valid = pro["kv_valid"]
     _kv_drain = pro["kv_drain"]
     q_frags = pro["q_frags"]
-    # This half's per-tile copy count: the depth LO's partial steady-state fence names to
-    # leave the newest tile in flight. The K and V bands differ whenever qk_hdim != v_hdim.
-    num_tdm_copies, num_async_copies = pro["kv_counts"][warp_type]
 
     def _get_kv_desc(slot, row0, valid):
         """This half's BufferOpDescriptor for one tile: LO issues every K copy, HI every
@@ -1583,30 +1576,25 @@ def _core_attention_multi_kv_tiles(
         # count is uniform and the last iteration needs no peel -- cheaper than the extra
         # trace a peel costs, against ~2 dead L2-resident tile loads per workgroup. The
         # clamped re-load lands in the slot body num_tiles reads as its dead K, and O
-        # stages past all the slots. This half's copy: LO K(u+2) into slot 0 (its K half
-        # died at body u-1; its V half is what this body reads, a different chunk),
-        # HI V(u+1) into slot 2.
-        _ahead = 2 if warp_type.is_lo else 1
-        wr_slot = slot_of[0] if _ahead == 2 else slot_of[N_KV_PP - 1]
-        pf_tile = u + fx.Int32(_ahead)
+        # stages past all the slots. Both halves copy tile u+1 into slot 2 -- K and V
+        # occupy disjoint chunks of it, and the slot last held tile u-2, dead since body
+        # u-2 -- so the distance is the same on both and the slot arithmetic has no half
+        # to branch on.
+        wr_slot = slot_of[N_KV_PP - 1]
+        pf_tile = u + fx.Int32(1)
         pf_row0 = _tile_row0(pf_tile)
         pf_valid = _kv_valid(pf_tile)
 
         def _drain_barrier():
-            # The producing half's own copy counter. K runs two bodies ahead, so LO reaches
-            # this fence with the tile it is about to read second-oldest and can leave the
-            # newest in flight. V only has one body of slack on the ring head this half
-            # issues, so HI still drains to 0.
+            # Both halves have exactly one copy outstanding and the next body reads it, so
+            # both drain to 0: there is nothing older to leave in flight.
             #
             # dscnt is drained only to _NH: the leading half issues its ring head at the
             # tail of the previous body, so a full drain here would retire it right before
             # the gemm that wants it in flight. The gemm's own last ring fragment already
             # took dscnt to 0, so every read older than the head is retired regardless --
             # the WAR wall for the slot about to be written still holds.
-            if warp_type.is_lo:
-                _kv_fence(num_tdm_copies, num_async_copies, num_dscnt=_NH)
-            else:
-                _kv_fence(*_kv_drain, num_dscnt=_NH)
+            _kv_fence(*_kv_drain, num_dscnt=_NH)
 
         # This half's descriptor for tile ``pf``'s K (LO) or V (HI) into the oldest slot.
         # Built up front: pure, so its address VALU overlaps the drain; only the copy
