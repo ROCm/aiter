@@ -950,11 +950,6 @@ def prepare_pa_decode_plan(
             default_plan.sliding_window,
             limit,
             max_context_length,
-            max(
-                key_cache.numel() * key_cache.element_size(),
-                value_cache.numel() * value_cache.element_size(),
-            )
-            >= 2**31,
         )
         config = _pa_decode_autotuner.resolve_config(
             attention_key=attention_key,
