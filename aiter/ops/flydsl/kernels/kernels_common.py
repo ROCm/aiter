@@ -105,6 +105,33 @@ def atomic_add_i32(memref, val, offset, syncscope):
     return _atomic_rmw_i32(_llvm.AtomicBinOp.add, memref, val, offset, syncscope)
 
 
+def atomic_load_i32(memref, offset, syncscope):
+    """Atomically load an int32; a spin on this does not contend like an RMW."""
+    ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
+    return fx.Int32(
+        _llvm.LoadOp(
+            T.i32,
+            ptr,
+            alignment=4,
+            ordering=_llvm.AtomicOrdering.monotonic,
+            syncscope=syncscope,
+        ).result
+    )
+
+
+def atomic_store_i32(memref, val, offset, syncscope):
+    """Atomically store an int32."""
+    ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
+    val = fx.Int32(val) if isinstance(val, int) else val
+    _llvm.StoreOp(
+        as_ir_value(val),
+        ptr,
+        alignment=4,
+        ordering=_llvm.AtomicOrdering.monotonic,
+        syncscope=syncscope,
+    )
+
+
 def atomic_or_i32(memref, val, offset, syncscope):
     """Atomically OR an int32 value in and return the previous value."""
     return _atomic_rmw_i32(_llvm.AtomicBinOp._or, memref, val, offset, syncscope)

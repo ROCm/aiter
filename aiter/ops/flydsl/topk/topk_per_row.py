@@ -17,6 +17,7 @@ from ..kernels.topk.radix_topk_one_block import (
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_per_row_decode import (
+    ONE_CTA_MAX_ROW_LENGTH,
     build_topk_per_row_decode_module,
     topk_per_row_decode_chunks,
     topk_per_row_decode_workspace_shapes,
@@ -25,8 +26,6 @@ from ..kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
 )
 
-# Measured crossover between the one-workgroup and multi-kernel paths.
-_ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 
@@ -40,7 +39,8 @@ def _get_cached_workspace(
     """Keep scratch isolated by device, stream, and exact kernel layout."""
     return (
         torch.empty(hist_shape, device=device, dtype=torch.int32),
-        torch.empty(state_shape, device=device, dtype=torch.int32),
+        # Rendezvous counters start at zero; the kernel rearms them after use.
+        torch.zeros(state_shape, device=device, dtype=torch.int32),
     )
 
 
@@ -54,7 +54,8 @@ def _get_topk_workspace(
     if torch.cuda.is_current_stream_capturing():
         return (
             torch.empty(hist_shape, device=device, dtype=torch.int32),
-            torch.empty(state_shape, device=device, dtype=torch.int32),
+            # Each captured workspace needs zeroed rendezvous counters.
+            torch.zeros(state_shape, device=device, dtype=torch.int32),
         )
     return _get_cached_workspace(device, stream_id, hist_shape, state_shape)
 
@@ -379,10 +380,14 @@ def flydsl_top_k_per_row_decode(
     )
 
     rows, width = logits.shape
-    arch = torch.cuda.get_device_properties(logits.device).gcnArchName
+    properties = torch.cuda.get_device_properties(logits.device)
+    arch = properties.gcnArchName
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
-    if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
+    # Allocated width bounds every row: at or below the one-CTA limit no row
+    # can be long. A wider buffer may still hold short rows; the multi-CTA
+    # kernel reads each row's length and gives a short one a single CTA.
+    if width <= ONE_CTA_MAX_ROW_LENGTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
             k, wave_size=wave_size, write_values=values is not None
         )
@@ -394,16 +399,15 @@ def flydsl_top_k_per_row_decode(
             values if values is not None else logits,
             width,
             next_n,
-            stride0,
             rows,
             stream,
         )
         return
 
-    # One row is `chunks` blocks, so the split has to follow the row count: at
-    # one row, 16 chunks leaves all but a handful of CUs idle, and at many rows
-    # it makes the single-block reduce walk counters nobody needed.
-    chunks = topk_per_row_decode_chunks(rows, width, wave_size)
+    if rows == 0:
+        return
+    # One row is `chunks` blocks, sized so the grid fits one block per CU.
+    chunks = topk_per_row_decode_chunks(rows, width, properties.multi_processor_count)
     hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable, chunks)
     partial_hist, state = _get_topk_workspace(
         logits.device, stream.cuda_stream, hist_shape, state_shape
@@ -426,7 +430,6 @@ def flydsl_top_k_per_row_decode(
         state,
         width,
         next_n,
-        stride0,
         rows,
         stream,
     )

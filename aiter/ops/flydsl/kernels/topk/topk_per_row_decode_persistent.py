@@ -35,11 +35,7 @@ _RUNNING_EQUAL = 7
 
 
 @cache
-def build_topk_per_row_decode_one_workgroup_module(
-    k: int,
-    wave_size: int,
-    write_values: bool = False,
-):
+def build_one_workgroup_row(k: int, wave_size: int, write_values: bool = False):
     if wave_size not in (32, 64):
         raise ValueError("wave size must be 32 or 64")
     num_waves = _BLOCK_THREADS // wave_size
@@ -51,22 +47,19 @@ def build_topk_per_row_decode_one_workgroup_module(
         scan: fx.Array[fx.Int32, num_waves * 2, 16]
         metadata: fx.Array[fx.Int32, 8, 16]
 
-    @flyc.kernel(
-        name="topk_per_row_decode_1wg_"
-        + kernel_signature(k=k, wave=wave_size, wv=write_values),
-        known_block_size=[_BLOCK_THREADS, 1, 1],
-    )
-    def topk_per_row_decode_one_workgroup_kernel(
-        input: fx.Tensor,
-        row_ends: fx.Tensor,
-        indices: fx.Tensor,
-        values: fx.Tensor,
-        width: fx.Int32,
-        next_n: fx.Int32,
-        stride0: fx.Int32,
-        write_values: fx.Constexpr[bool],
+    @flyc.jit
+    def one_workgroup_row(
+        row,
+        input,
+        row_ends,
+        indices,
+        values,
+        width,
+        next_n,
+        histogram,
+        scan,
+        metadata,
     ):
-        row = fx.block_idx.x
         tid = fx.thread_idx.x
         lane = tid % wave_size
         wave = tid // wave_size
@@ -78,11 +71,6 @@ def build_topk_per_row_decode_one_workgroup_module(
         block_threads = fx.Int32(_BLOCK_THREADS)
         top_k = fx.Int32(k)
         sign_bit = fx.Int32(-2147483648)
-
-        storage = fx.SharedAllocator().allocate(SharedStorage)
-        histogram = storage.histogram.peek().view(fx.make_layout(_NUM_BUCKETS, 1))
-        scan = storage.scan.peek().view(fx.make_layout(num_waves * 2, 1))
-        metadata = storage.metadata.peek().view(fx.make_layout(8, 1))
 
         # Slice the row first, then build the descriptor over it. Built over
         # the whole tensor and sliced afterwards, the row offset has to fit the
@@ -429,6 +417,48 @@ def build_topk_per_row_decode_one_workgroup_module(
                 metadata,
             )
 
+    return SharedStorage, one_workgroup_row
+
+
+@cache
+def build_topk_per_row_decode_one_workgroup_module(
+    k: int,
+    wave_size: int,
+    write_values: bool = False,
+):
+    SharedStorage, one_workgroup_row = build_one_workgroup_row(
+        k, wave_size, write_values
+    )
+    num_waves = _BLOCK_THREADS // wave_size
+
+    @flyc.kernel(
+        name="topk_per_row_decode_1wg_"
+        + kernel_signature(k=k, wave=wave_size, wv=write_values),
+        known_block_size=[_BLOCK_THREADS, 1, 1],
+    )
+    def topk_per_row_decode_one_workgroup_kernel(
+        input: fx.Tensor,
+        row_ends: fx.Tensor,
+        indices: fx.Tensor,
+        values: fx.Tensor,
+        width: fx.Int32,
+        next_n: fx.Int32,
+        write_values: fx.Constexpr[bool],
+    ):
+        storage = fx.SharedAllocator().allocate(SharedStorage)
+        one_workgroup_row(
+            fx.block_idx.x,
+            input,
+            row_ends,
+            indices,
+            values,
+            width,
+            next_n,
+            storage.histogram.peek().view(fx.make_layout(_NUM_BUCKETS, 1)),
+            storage.scan.peek().view(fx.make_layout(num_waves * 2, 1)),
+            storage.metadata.peek().view(fx.make_layout(8, 1)),
+        )
+
     @flyc.jit
     def launch_topk_per_row_decode_one_workgroup(
         input: fx.Tensor,
@@ -437,7 +467,6 @@ def build_topk_per_row_decode_one_workgroup_module(
         values: fx.Tensor,
         width: fx.Int32,
         next_n: fx.Int32,
-        stride0: fx.Int32,
         rows_m: fx.Int32,
         stream: fx.Stream,
     ):
@@ -448,7 +477,6 @@ def build_topk_per_row_decode_one_workgroup_module(
             values,
             width,
             next_n,
-            stride0,
             write_values,
         ).launch(
             grid=(rows_m, 1, 1),
