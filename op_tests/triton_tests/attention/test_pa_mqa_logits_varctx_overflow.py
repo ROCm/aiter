@@ -193,5 +193,73 @@ def test_varctx_kv_read_offset_no_overflow(batch):
     )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or DEVICE_ARCH not in _VARCTX_ARCHS,
+    reason=f"VarCtx Gluon path requires gfx942/gfx950; got {DEVICE_ARCH}",
+)
+def test_varctx_small_cache_buffer_load():
+    ctx_list = [2048, 4096]
+    q, kvc, w, ctx_lens, block_tables, t_max, _ = _make_inputs(2, ctx_list)
+    assert kvc.numel() < 2**31 - 1
+
+    golden = _run(q, kvc, w, ctx_lens, block_tables, t_max, None)
+    sched = deepgemm_fp8_paged_mqa_logits_schedule(
+        2, 1, ctx_lens, t_max, ChunkK=CHUNK_K, WavePerEU=2
+    )
+    var = _run(q, kvc, w, ctx_lens, block_tables, t_max, sched)
+    for b, ctx_len in enumerate(ctx_list):
+        actual = var[b, :ctx_len].double()
+        expected = golden[b, :ctx_len].double()
+        cos = (actual * expected).sum() / (actual.norm() * expected.norm())
+        assert cos > 0.999
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or DEVICE_ARCH not in _VARCTX_ARCHS,
+    reason=f"VarCtx Gluon path requires gfx942/gfx950; got {DEVICE_ARCH}",
+)
+def test_varctx_large_page_offset_no_overflow():
+    """KVBlockSize=256 exercises the VarCtx one-page-per-stage load branch."""
+    block_size = 256
+    page_bytes = block_size * INDEX_DIM
+    high_page = (2**31 + page_bytes - 1) // page_bytes
+    assert high_page * page_bytes >= 2**31
+
+    cache = torch.zeros(
+        (high_page + 2, block_size, 1, INDEX_DIM), dtype=torch.uint8, device=dev
+    )
+    packed = cache.view(high_page + 2, page_bytes)
+    fp8_one = torch.ones((), dtype=torch.float32, device=dev).to(FP8)
+    for pages in (slice(0, 2), slice(high_page, high_page + 2)):
+        packed[pages, : block_size * HEAD_DIM] = fp8_one.view(torch.uint8)
+        packed[pages, block_size * HEAD_DIM :].view(torch.float32).fill_(1.0)
+
+    q = torch.ones((1, 1, HEADS, HEAD_DIM), dtype=torch.float32, device=dev).to(FP8)
+    weights = torch.ones((1, HEADS), dtype=torch.float32, device=dev)
+    ctx_lens = torch.tensor([2 * block_size], dtype=torch.int32, device=dev)
+    sched = deepgemm_fp8_paged_mqa_logits_schedule(
+        1, 1, ctx_lens, 2 * block_size, ChunkK=CHUNK_K, WavePerEU=2
+    )
+
+    for pages in ((0, 1), (high_page, high_page + 1)):
+        block_tables = torch.tensor([pages], dtype=torch.int32, device=dev)
+        out = torch.full((1, 2 * block_size), float("-inf"), device=dev)
+        deepgemm_fp8_paged_mqa_logits(
+            q,
+            cache,
+            weights,
+            out,
+            ctx_lens,
+            block_tables,
+            2 * block_size,
+            ChunkK=CHUNK_K,
+            Preshuffle=True,
+            KVBlockSize=block_size,
+            WavePerEU=2,
+            VarCtxSchedule=sched,
+        )
+        torch.testing.assert_close(out, torch.full_like(out, HEADS * HEAD_DIM))
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v", "-s"]))
