@@ -19,12 +19,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
 import pandas as pd
 import torch
+
+from op_tests.tuning_tests.mxfp4_cpu_test_utils import cpu_tuner_environment
 
 KEYS = [
     "gfx",
@@ -58,6 +59,12 @@ RESULT_COLUMNS = [
     "tflops",
     "bw",
 ]
+FAILURE_COLUMNS = KEYS + [
+    "status",
+    "failure_reason",
+    "failure_phase",
+    "missing_aux_keys",
+]
 G1 = "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt"
 G2_PREFIX = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128"
 OBSERVATIONS = {
@@ -73,9 +80,7 @@ OBSERVATIONS = {
 
 
 def _tuner_module() -> Any:
-    module = importlib.import_module("csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune")
-    torch.set_default_device("cpu")
-    return module
+    return importlib.import_module("csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune")
 
 
 def _controlled_tuner_class(module: Any) -> type:
@@ -136,27 +141,35 @@ def _cpu_shape_process(
 ) -> None:
     """Use the real isolated-worker aggregation without launching GPU work."""
     keys, row, args, _gpu = payload
-    module = _tuner_module()
+    with cpu_tuner_environment():
+        module = _tuner_module()
+        torch.set_default_device("cpu")
 
-    class WorkerTuner(_controlled_tuner_class(module)):
-        def _run_candidate(
-            self,
-            row: dict[str, Any],
-            candidate: dict[str, Any],
-            args: argparse.Namespace,
-        ) -> float:
-            if row["token"] == 1 and candidate["kernelName2"].endswith("_atomic_sbm16"):
-                os._exit(17)
-            return super()._run_candidate(row, candidate, args)
+        class WorkerTuner(_controlled_tuner_class(module)):
+            def _run_candidate(
+                self,
+                row: dict[str, Any],
+                candidate: dict[str, Any],
+                args: argparse.Namespace,
+            ) -> float:
+                if row["token"] == 1 and candidate["kernelName2"].endswith(
+                    "_atomic_sbm16"
+                ):
+                    os._exit(17)
+                return super()._run_candidate(row, candidate, args)
 
-    tuner = WorkerTuner.__new__(WorkerTuner)
-    tuner.keys = keys
-    out_q.put((index, tuner._tune_one_shape(row, args)))
+        tuner = WorkerTuner.__new__(WorkerTuner)
+        tuner.keys = keys
+        out_q.put((index, tuner._tune_one_shape(row, args)))
 
 
 class TestCoupledTuningResults(unittest.TestCase):
     def setUp(self) -> None:
+        environment = cpu_tuner_environment()
+        environment.__enter__()
+        self.addCleanup(environment.__exit__, None, None, None)
         self.module = _tuner_module()
+        torch.set_default_device("cpu")
         self.tempdir = tempfile.TemporaryDirectory()
         self.addCleanup(self.tempdir.cleanup)
         self.root = Path(self.tempdir.name)
@@ -166,25 +179,13 @@ class TestCoupledTuningResults(unittest.TestCase):
         self.stack = contextlib.ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(
-            patch.object(torch.cuda, "device_count", return_value=0)
-        )
-        self.stack.enter_context(
-            patch.object(torch.cuda, "current_device", return_value=0)
-        )
-        self.stack.enter_context(
-            patch.object(
-                torch.cuda,
-                "get_device_properties",
-                return_value=SimpleNamespace(multi_processor_count=256),
-            )
-        )
-        self.stack.enter_context(
             patch.object(self.module, "get_gfx_runtime", return_value="gfx950")
         )
         # CPU infrastructure tests replace the HIP capability boundary as
         # well as candidate execution; real aux build/dispatch has GPU coverage.
         from aiter.ops import moe_mxfp4_aux
 
+        self.prepare_aux = moe_mxfp4_aux.prepare_mxfp4_moe_aux
         self.stack.enter_context(
             patch.object(moe_mxfp4_aux, "prepare_mxfp4_moe_aux", return_value=None)
         )
@@ -198,6 +199,7 @@ class TestCoupledTuningResults(unittest.TestCase):
         batch: int = 2,
         timeout: int = 0,
         existing_rows: Any = None,
+        all_shapes: bool = False,
     ) -> None:
         pd.DataFrame(rows, columns=KEYS).to_csv(self.input_file, index=False)
         if existing_rows is not None:
@@ -233,8 +235,164 @@ class TestCoupledTuningResults(unittest.TestCase):
                 "0.1",
             ]
         )
+        if all_shapes:
+            args.all = True
+            args.untune_file = str(self.output_file)
         with contextlib.redirect_stdout(io.StringIO()):
             tuner.run(args)
+
+    def test_retune_shared_csv_preserves_foreign_architecture_and_other_cu_rows(
+        self,
+    ) -> None:
+        target = _input_row()
+        target.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        target.update(
+            us=9.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        foreign = dict(
+            target,
+            gfx="gfx942",
+            cu_num=304,
+            act_type="ActivationType.Gelu",
+            dtype="torch.float16",
+            kernelName1="foreign_g1",
+            kernelName2="foreign_g2",
+        )
+        other_cu = dict(target, cu_num=128, kernelName1="other_cu_g1")
+        original = pd.DataFrame([foreign, target, other_cu])
+        self.run_csv(
+            [_input_row()], existing_rows=original.to_dict("records"), all_shapes=True
+        )
+        tuned = pd.read_csv(self.output_file)
+        actual_foreign = tuned[(tuned.gfx == "gfx942") | (tuned.cu_num == 128)]
+        pd.testing.assert_frame_equal(
+            actual_foreign.reset_index(drop=True),
+            original.iloc[[0, 2]].reset_index(drop=True),
+            check_dtype=False,
+        )
+        self.assertEqual(tuned.loc[tuned.cu_num == 256, "us"].tolist(), [7.0])
+
+    def test_aux_preflight_persists_all_not_run_shapes_and_missing_key_mapping(
+        self,
+    ) -> None:
+        from aiter.ops import moe_mxfp4_aux as aux
+
+        fm = importlib.import_module("aiter.fused_moe")
+        rows = [
+            dict(_input_row(token), expert=24, model_dim=7168, inter_dim=inter, topk=6)
+            for token, inter in ((1, 3072), (2, 512))
+        ] + [_input_row(3), _input_row(64)]
+        winner = _input_row(100)
+        winner.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        winner.update(
+            us=9.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+        )
+        pd.DataFrame([winner], columns=KEYS + RESULT_COLUMNS).to_csv(
+            self.output_file, index=False
+        )
+        saved_winner = self.output_file.read_bytes()
+        self.profile_file.write_text("previous profile data\n")
+        saved_profile = self.profile_file.read_bytes()
+        missing_key = "aux_sortzi_NE24_TOPK6_MB16_H7168"
+
+        class PreflightBoundary(_controlled_tuner_class(self.module)):
+            def _candidate_rows(self, row, full_search=False):
+                return [{"block_m": 16}]
+
+            def tune(self, *args):
+                raise AssertionError("aux failure must happen before shape workers")
+
+        with (
+            patch.object(fm, "_MOE_SORT_BACKEND", "auto"),
+            patch.object(aux, "prepare_mxfp4_moe_aux", wraps=self.prepare_aux),
+            patch.object(
+                aux,
+                "_mxfp4_moe_sort_internal_is_supported",
+                side_effect=lambda expert, topk, hidden, bm, zero: expert != 24
+                or not zero,
+            ),
+            self.assertRaisesRegex(aux._MissingMxfp4MoeAuxInstances, missing_key),
+        ):
+            self.run_csv(rows, PreflightBoundary, mp=4)
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertEqual(failures.columns.tolist(), FAILURE_COLUMNS)
+        pd.testing.assert_frame_equal(failures[KEYS], pd.DataFrame(rows)[KEYS])
+        self.assertEqual(failures.status.tolist(), ["not_run"] * 4)
+        self.assertEqual(failures.failure_phase.tolist(), ["aux_preflight"] * 4)
+        self.assertEqual(
+            failures.missing_aux_keys.fillna("").tolist(),
+            [missing_key, missing_key, "", ""],
+        )
+        self.assertTrue(
+            failures.failure_reason.str.contains("not started").iloc[2:].all()
+        )
+        self.assertEqual(self.profile_file.read_bytes(), saved_profile)
+        self.assertEqual(self.output_file.read_bytes(), saved_winner)
+
+    def test_aux_preflight_matches_structured_instance_after_display_name_change(
+        self,
+    ) -> None:
+        from aiter.ops import moe_mxfp4_aux as aux
+
+        rows = [
+            dict(_input_row(1), expert=24, model_dim=7168, inter_dim=3072, topk=6),
+            dict(_input_row(1), expert=128, model_dim=3072, inter_dim=512, topk=4),
+        ]
+        missing = aux._MissingMxfp4MoeAuxInstances([(24, 6, 7168, True)])
+        missing.missing_keys = ("renamed_sort_instance",)
+
+        class PreflightBoundary(_controlled_tuner_class(self.module)):
+            def _candidate_rows(self, row, full_search=False):
+                return [{"block_m": 16}]
+
+        with (
+            patch.object(aux, "prepare_mxfp4_moe_aux", side_effect=missing),
+            self.assertRaises(aux._MissingMxfp4MoeAuxInstances),
+        ):
+            self.run_csv(rows, PreflightBoundary)
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertEqual(
+            failures.missing_aux_keys.fillna("").tolist(), ["renamed_sort_instance", ""]
+        )
+        self.assertIn(
+            "missing required generated instances", failures.iloc[0].failure_reason
+        )
+
+    def test_aux_module_failure_records_reason_without_claiming_missing_keys(
+        self,
+    ) -> None:
+        from aiter.ops import moe_mxfp4_aux as aux
+
+        rows = [_input_row(1), _input_row(2)]
+        with (
+            patch.object(
+                aux,
+                "prepare_mxfp4_moe_aux",
+                side_effect=RuntimeError("module load failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "module load failed"),
+        ):
+            self.run_csv(rows)
+        failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
+        self.assertEqual(failures.columns.tolist(), FAILURE_COLUMNS)
+        self.assertEqual(failures.token.tolist(), [1, 2])
+        self.assertTrue(failures.status.eq("not_run").all())
+        self.assertTrue(failures.missing_aux_keys.isna().all())
+        self.assertTrue(
+            failures.failure_reason.str.contains("module load failed").all()
+        )
+        self.assertFalse(self.profile_file.exists())
+        self.assertFalse(self.output_file.exists())
 
     def test_csv_saves_fastest_valid_winner_and_all_candidate_observations(
         self,
@@ -269,6 +427,7 @@ class TestCoupledTuningResults(unittest.TestCase):
         self.assertTrue(failed_candidates["failure_reason"].str.len().gt(0).all())
         failed_shapes = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
         self.assertTrue(failed_shapes.empty)
+        self.assertEqual(failed_shapes.columns.tolist(), FAILURE_COLUMNS)
 
     def test_shape_exception_preserves_later_winners_profile_and_full_failure_reason(
         self,
@@ -295,7 +454,9 @@ class TestCoupledTuningResults(unittest.TestCase):
         self.assertEqual(set(profile["token"]), {2, 3})
         failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
         self.assertEqual(failures["token"].tolist(), [1])
-        self.assertTrue(set(KEYS).issubset(failures.columns))
+        self.assertEqual(failures.columns.tolist(), FAILURE_COLUMNS)
+        self.assertEqual(failures.failure_phase.tolist(), ["tuning"])
+        self.assertTrue(failures.missing_aux_keys.isna().all())
         self.assertIn(failure_reason, failures.iloc[0]["failure_reason"])
 
     def test_dead_worker_preserves_completed_profiles_and_other_shapes_finish(
@@ -512,6 +673,70 @@ class TestCoupledTuningResults(unittest.TestCase):
             tuned["kernelName2"].tolist()[1], "moe_ck2stages_gemm2_256x32x128x128_1x4"
         )
 
+    def test_write_back_keeps_primary_over_tagged_fallback_of_untouched_shape(
+        self,
+    ) -> None:
+        primary = _input_row(token=2)
+        primary.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        primary.update(
+            us=9.0,
+            us1=9.0,
+            block_m=16,
+            kernelName1=G1,
+            kernelName2=G2_PREFIX + "_reduce_sbm16",
+            err1="1.0%",
+            err2="1.0%",
+            _tag="",
+        )
+        fallback = _input_row(token=2)
+        fallback.update(dict.fromkeys(RESULT_COLUMNS, 0))
+        fallback.update(
+            us=21.0,
+            us1=13.0,
+            block_m=32,
+            kernelName1="flydsl_moe1_afp4_wfp4_bf16_t32x32x256_w3_kw4",
+            kernelName2="moe_ck2stages_gemm2_256x32x128x128_1x4",
+            err1="0.0%",
+            err2="1.4%",
+            _tag="flydsl_fallback",
+        )
+        self.run_csv([_input_row()], existing_rows=[primary, fallback])
+
+        tuned = pd.read_csv(self.output_file).sort_values("token")
+        self.assertEqual(tuned["token"].tolist(), [1, 2])
+        self.assertEqual(tuned["kernelName1"].tolist(), [G1, G1])
+        self.assertEqual(tuned["us"].tolist(), [7.0, 9.0])
+        self.assertNotIn("_tag", tuned.columns)
+
+    def test_failed_retune_drops_old_invalid_winner_with_legacy_key_values(
+        self,
+    ) -> None:
+        class EmptyCandidates(_controlled_tuner_class(self.module)):
+            def _candidate_rows(
+                self, row: dict[str, Any] | pd.Series, full_search: bool = False
+            ) -> list[dict[str, Any]]:
+                return []
+
+        for legacy in (
+            {"use_g1u1": True, "doweight_stage1": False},
+            {"token": 1.0},
+        ):
+            with self.subTest(legacy=legacy):
+                old = _input_row()
+                old.update(dict.fromkeys(RESULT_COLUMNS, 0))
+                old.update(
+                    us=-1,
+                    kernelName1=G1,
+                    kernelName2=G2_PREFIX + "_reduce_sbm16",
+                    err1="90.0%",
+                    err2="90.0%",
+                    **legacy,
+                )
+                with self.assertRaises(SystemExit) as stopped:
+                    self.run_csv([_input_row()], EmptyCandidates, existing_rows=[old])
+                self.assertEqual(stopped.exception.code, 1)
+                self.assertTrue(pd.read_csv(self.output_file).empty)
+
     def test_fully_covered_resume_refreshes_stale_failure_manifest(self) -> None:
         failure_file = self.output_file.with_suffix(".failed_shapes.csv")
         failed = _input_row()
@@ -532,7 +757,7 @@ class TestCoupledTuningResults(unittest.TestCase):
 
         failures = pd.read_csv(failure_file)
         self.assertTrue(failures.empty)
-        self.assertEqual(failures.columns.tolist(), KEYS + ["status", "failure_reason"])
+        self.assertEqual(failures.columns.tolist(), FAILURE_COLUMNS)
         self.assertEqual(pd.read_csv(self.output_file)["us"].tolist(), [7.0])
         self.assertFalse(self.profile_file.exists())
 
@@ -552,7 +777,7 @@ class TestCoupledTuningResults(unittest.TestCase):
 
         failures = pd.read_csv(self.output_file.with_suffix(".failed_shapes.csv"))
         self.assertTrue(failures.empty)
-        self.assertEqual(failures.columns.tolist(), KEYS + ["status", "failure_reason"])
+        self.assertEqual(failures.columns.tolist(), FAILURE_COLUMNS)
         self.assertEqual(pd.read_csv(self.output_file)["us"].tolist(), [7.0])
 
     def test_accepted_aliases_save_canonical_runtime_keys_and_deduplicate(self) -> None:

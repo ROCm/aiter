@@ -13,10 +13,31 @@ from types import SimpleNamespace
 from typing import Any
 
 HARNESS = Path(__file__).resolve().parents[1] / "test_mxfp4_flydsl_public_csv.py"
+RUNTIME = Path(__file__).resolve().parents[2] / "aiter/fused_moe.py"
 
 
 def load_csv_boundary() -> Any:
     # Execute only the CSV boundary; importing the GPU harness is unnecessary.
+    runtime_tree = ast.parse(RUNTIME.read_text(), filename=str(RUNTIME))
+    runtime_tree.body = [
+        node
+        for node in runtime_tree.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_PADDED_M_TIERS"
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.FunctionDef)
+            and node.name in ("nextPow2", "get_padded_M")
+        )
+    ]
+    runtime = {}
+    exec(  # noqa: S102 - trusted runtime token-padding boundary
+        compile(runtime_tree, str(RUNTIME), "exec"), runtime
+    )
     tree = ast.parse(HARNESS.read_text())
     tree.body = [
         node
@@ -27,7 +48,7 @@ def load_csv_boundary() -> Any:
     namespace = {
         "Path": Path,
         "csv": csv,
-        "fm": SimpleNamespace(_PADDED_M_TIERS=[32768, 131072]),
+        "fm": SimpleNamespace(**runtime),
     }
     exec(  # noqa: S102 - trusted checkout CSV boundary
         compile(tree, str(HARNESS), "exec"), namespace
@@ -70,7 +91,9 @@ class TestPublicCsvLookup(unittest.TestCase):
                     [request, dict(lookup, _tag="flydsl_fallback"), lookup]
                 )
             rows = harness.csv_rows(path)
-            selection = harness.select_csv_lookup(rows, rows[0], 4)
+            lookup_token = harness.fm.get_padded_M(int(rows[0]["token"]))
+            self.assertEqual(lookup_token, 4)
+            selection = harness.select_csv_lookup(rows, rows[0], lookup_token)
             self.assertEqual(selection["csv_row"], 2)
             self.assertEqual(selection["token"], 4)
             self.assertEqual(selection["kernelName1"], "lookup_pair")
@@ -81,20 +104,35 @@ class TestPublicCsvLookup(unittest.TestCase):
     ) -> None:
         harness = load_csv_boundary()
         request = row(65536, "requested_pair")
+        lookup_token = harness.fm.get_padded_M(int(request["token"]))
+        self.assertEqual(lookup_token, 32768)
         self.assertEqual(
             harness.select_csv_lookup(
-                [request, row(32768, "tier_pair")], request, 32768
+                [request, row(32768, "tier_pair")], request, lookup_token
             )["token"],
             32768,
         )
         request = row(196608, "requested_pair")
+        lookup_token = harness.fm.get_padded_M(int(request["token"]))
+        self.assertEqual(lookup_token, 131072)
+        exact = harness.select_csv_lookup(
+            [row(32768, "tier_pair"), row(131072, "large_pair")],
+            request,
+            lookup_token,
+        )
+        self.assertEqual(exact["kernelName1"], "large_pair")
+        self.assertEqual(exact["kernelName2"], "large_pair_g2")
         selection = harness.select_csv_lookup(
-            [request, row(32768, "tier_pair")], request, 131072
+            [request, row(32768, "tier_pair")], request, lookup_token
         )
         self.assertEqual(selection["token"], 32768)
+        self.assertEqual(selection["kernelName1"], "tier_pair")
+        self.assertEqual(selection["kernelName2"], "tier_pair_g2")
         self.assertIsNone(
             harness.select_csv_lookup(
-                [row(4, "wrong_shape")], dict(row(3, "x"), topk="8"), 4
+                [row(4, "wrong_shape")],
+                dict(row(3, "x"), topk="8"),
+                harness.fm.get_padded_M(3),
             )
         )
 
