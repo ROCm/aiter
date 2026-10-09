@@ -136,6 +136,45 @@ def test_dma_partial_pages(page, dim, trans_v, device):
     torch.testing.assert_close(output.float(), expected, atol=0.005, rtol=0.005)
 
 
+@pytest.mark.parametrize("page", [64, 128])
+@pytest.mark.parametrize("query_length,group", [(1, 8), (4, 4)])
+def test_packed_page_scale_tails(page, query_length, group, device):
+    from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
+
+    # The final 16-token cache chunk contains NaNs outside the context. V scales
+    # span 256x and use a different pattern from K scales, exposing scale/chunk
+    # mismatches when a wave reads contraction chunks from packed LDS.
+    length = 2 * page + 17
+    q, k, v, kc, vc, table, lengths = _inputs(
+        device, length, query_length=query_length, group=group, page=page, divisor=16
+    )
+    count = kc.shape[0] * page
+    index = torch.arange(count, device=device).reshape(kc.shape[0], 1, page, 1)
+    ks = torch.exp2((index % 7 - 3).float())
+    vs = torch.exp2(((index * 3) % 9 - 4).float())
+    last_page = int(table[0, -1])
+    kc[last_page, :, :, length % page :, :] = float("nan")
+    vc[last_page, :, length % page // 16, :, length % 16 :] = float("nan")
+    output = torch.full_like(q, float("nan"))
+    plan = plan_pa_decode(lengths, 1, max_partitions=1, query_length=query_length)
+    pa_decode(
+        output,
+        q,
+        kc,
+        vc,
+        lengths,
+        table,
+        128**-0.5,
+        query_length,
+        compute_type=kc.dtype,
+        key_scale=ks,
+        value_scale=vs,
+        work_plan=plan,
+    )
+    expected = _reference(q, k * ks, v * vs, table, lengths, query_length, 0, None)
+    torch.testing.assert_close(output.float(), expected, atol=0.005, rtol=0.005)
+
+
 @pytest.mark.parametrize("parts", [1, 4, 8, 32, 33, 64, 65, 256])
 def test_partition_boundaries(parts, device):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode

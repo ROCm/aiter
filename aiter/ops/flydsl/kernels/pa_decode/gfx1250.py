@@ -6,6 +6,9 @@
 Four waves split a 64-token compute tile within each 256-token plan tile.
 K and V move from the packed paged cache to alternating LDS buffers via TDM
 for per-token scales and power-of-two D128+, with vector DMA for other cases.
+FP8 D128/page64+ transposed caches with one query tile retain their packed LDS
+layout, avoiding
+TDM transposition and padding; WMMA operands assemble directly from chunks.
 FP8 Q and P use native eight-element conversion; BF16 uses K32 WMMA.
 BF16 TDM is enabled for power-of-two D64–512, with vector DMA otherwise.
 Softmax statistics and accumulation stay FP32.
@@ -89,8 +92,19 @@ class Gfx1250Traits:
         return self.q_tiles * 16 * self.q_stride
 
     @property
+    def packed_lds(self):
+        return (
+            not self.bf16
+            and self.per_token_kv
+            and self.head_dim == 128
+            and self.block_size >= 64
+            and self.trans_v
+            and self.m_tiles == 1
+        )
+
+    @property
     def k_bytes(self):
-        return self.TOKENS * self.q_stride
+        return self.TOKENS * (self.head_dim if self.packed_lds else self.q_stride)
 
     @property
     def v_stride(self):
@@ -98,7 +112,7 @@ class Gfx1250Traits:
 
     @property
     def v_bytes(self):
-        return self.head_dim * self.v_stride
+        return self.head_dim * (self.TOKENS if self.packed_lds else self.v_stride)
 
     @property
     def kv_stride(self):
@@ -185,6 +199,17 @@ class Gfx1250Memory:
         result = fx.Vector.from_elements(words, dtype=fx.Int32)
         return result.bitcast(fx.BFloat16) if self.t.bf16 else result
 
+    def packed_operand(self, offset, rows, k, lane16, half):
+        # WMMA distributes alternating 16-byte contraction chunks across the
+        # two half-waves. Read them directly from the packed LDS layout.
+        words = []
+        for j in range_constexpr(k // 32):
+            frag = self.load(
+                offset + (half + 2 * j) * rows * 16 + lane16 * 16, fx.Int32, 4
+            )
+            words.extend([frag[i] for i in range_constexpr(4)])
+        return fx.Vector.from_elements(words, dtype=fx.Int32)
+
     def async_copy(self, global_base, global_offset, shared_offset):
         src = create_llvm_ptr(global_base + fx.Int64(global_offset), address_space=1)
         dst = create_llvm_ptr(
@@ -216,7 +241,7 @@ class Gfx1250Memory:
             extents,
             strides=strides,
             num_warps=1,
-            pad_interval=width,
+            pad_interval=width if row_stride != width else 0,
             pad_amount=row_stride - width,
             early_timeout=True,
         )
@@ -230,6 +255,57 @@ class Gfx1250Memory:
 
     @flyc.jit
     def stage_tdm(self, token_base, kv_off, full_tile=False):
+        if const_expr(self.t.packed_lds):
+            self.stage_packed_tdm(token_base, kv_off, full_tile)
+        else:
+            self.stage_padded_tdm(token_base, kv_off, full_tile)
+
+    @flyc.jit
+    def stage_packed_tdm(self, token_base, kv_off, full_tile):
+        ctx, t = self.ctx, self.t
+        table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
+        # Keep the cache's contiguous 16-byte chunks in LDS. TDM then gathers
+        # whole spans without transposing them or inserting row padding.
+        safe = (
+            token_base
+            if full_tile
+            else (token_base < ctx.planned_context).select(token_base, fx.Int32(0))
+        )
+        page = fx.Int32(
+            table[
+                ctx.planned_seq * ctx.max_blocks_per_seq
+                + fx.Uint32(safe) // t.block_size
+            ]
+        )
+        off = (fx.Int64(page) * ctx.n_kv + ctx.kv_h) * t.head_dim * t.block_size
+        pt = fx.Uint32(safe) % t.block_size
+        valid = fx.max(
+            fx.Int32(0),
+            fx.min(fx.Int32(16), ctx.planned_context - token_base - ctx.warp * 16),
+        )
+        self.tdm_copy(
+            ctx.key_cache_ptr,
+            off + (pt + ctx.warp * 16) * 16,
+            kv_off + ctx.warp * 2048,
+            (8, 16, 16),
+            (t.block_size * 16, 16, 1),
+            (None, None if full_tile else valid, None),
+            16,
+            16,
+        )
+        self.tdm_copy(
+            ctx.value_cache_ptr,
+            off + (pt // 16 + ctx.warp) * 128 * 16,
+            kv_off + t.k_bytes + ctx.warp * 2048,
+            (128, 16),
+            (16, 1),
+            (None, None if full_tile else valid),
+            16,
+            16,
+        )
+
+    @flyc.jit
+    def stage_padded_tdm(self, token_base, kv_off, full_tile):
         ctx, t = self.ctx, self.t
         table = fx.recast_iter(fx.Int32, ctx.block_tables_ptr)
         # Explicit wave slices keep the hardware padding local to each copy.
@@ -631,13 +707,20 @@ class Gfx1250Pipeline:
                 scores = fx.Vector.filled(8, 0.0, fx.Float32)
                 qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
                 for d in range_constexpr(t.head_dim // qk_k):
-                    a = self.mem.operand(
-                        kv_off + ctx.warp * 16 * t.q_stride + d * qk_k * t.elem_bytes,
-                        t.q_stride,
-                        qk_k,
-                        ctx.lane16,
-                        ctx.half,
-                    )
+                    if const_expr(t.packed_lds):
+                        a = self.mem.packed_operand(
+                            kv_off + ctx.warp * 2048, 16, qk_k, ctx.lane16, ctx.half
+                        )
+                    else:
+                        a = self.mem.operand(
+                            kv_off
+                            + ctx.warp * 16 * t.q_stride
+                            + d * qk_k * t.elem_bytes,
+                            t.q_stride,
+                            qk_k,
+                            ctx.lane16,
+                            ctx.half,
+                        )
                     if const_expr(resident_q):
                         b = q_operand
                     else:
@@ -694,13 +777,16 @@ class Gfx1250Pipeline:
                 safe_max = (new_max > fx.Float32(float("-inf"))).select(
                     new_max, fx.Float32(0.0)
                 )
-                corr = fx.Float32(fx.exp2(old_max - safe_max))
+                # Approximate exponentials avoid the library underflow fixup.
+                # Keep infinity semantics for masked rows and empty history.
+                corr = fx.Float32(fx.exp2(old_max - safe_max, fastmath="afn"))
                 probs = fx.Vector(
                     fx.exp2(
                         scores
                         - fx.Vector.from_elements(
                             [fx.Float32(safe_max)], dtype=fx.Float32
-                        ).broadcast_to(8)
+                        ).broadcast_to(8),
+                        fastmath="afn",
                     )
                 )
                 local_sum = probs.reduce(ReductionOp.ADD)
@@ -729,12 +815,43 @@ class Gfx1250Pipeline:
                         local_sum,
                         fx.Float32,
                     )
+                # Prefetch V operands before waiting for cross-wave P stores.
+                pv_k = 32 if t.bf16 else 64
+                if const_expr(t.packed_lds):
+                    v_operands = [
+                        [
+                            self.mem.packed_operand(
+                                kv_off + t.k_bytes + (vh * 64 + ctx.warp * 16) * 16,
+                                128,
+                                64,
+                                ctx.lane16,
+                                ctx.half,
+                            )
+                        ]
+                        for vh in range_constexpr(vh_count)
+                    ]
+                else:
+                    v_operands = [
+                        [
+                            self.mem.operand(
+                                kv_off
+                                + t.k_bytes
+                                + (vh * 64 + ctx.warp * 16) * t.v_stride
+                                + d * pv_k * t.elem_bytes,
+                                t.v_stride,
+                                pv_k,
+                                ctx.lane16,
+                                ctx.half,
+                            )
+                            for d in range_constexpr(t.TOKENS // pv_k)
+                        ]
+                        for vh in range_constexpr(vh_count)
+                    ]
                 gpu.barrier()
                 denom = state[m * state_stride + 1] * corr + self.mem.load(
                     t.stats_offset + 256 + ctx.lane16 * t.NWARP * 4, fx.Float32, t.NWARP
                 ).reduce(ReductionOp.ADD)
                 next_state.extend([new_max, denom])
-                pv_k = 32 if t.bf16 else 64
                 p_operands = [
                     self.mem.operand(
                         t.p_offset + d * pv_k * t.elem_bytes,
@@ -744,23 +861,6 @@ class Gfx1250Pipeline:
                         ctx.half,
                     )
                     for d in range_constexpr(t.TOKENS // pv_k)
-                ]
-                # Issue independent LDS operand loads before the PV MMAs.
-                v_operands = [
-                    [
-                        self.mem.operand(
-                            kv_off
-                            + t.k_bytes
-                            + (vh * 64 + ctx.warp * 16) * t.v_stride
-                            + d * pv_k * t.elem_bytes,
-                            t.v_stride,
-                            pv_k,
-                            ctx.lane16,
-                            ctx.half,
-                        )
-                        for d in range_constexpr(t.TOKENS // pv_k)
-                    ]
-                    for vh in range_constexpr(vh_count)
                 ]
                 for vh in range_constexpr(vh_count):
                     out = fx.Vector.filled(8, 0.0, fx.Float32)
