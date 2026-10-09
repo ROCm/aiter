@@ -24,10 +24,8 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
-from .. import buffer_ops
 from ..kernels_common import (
     ceildiv,
-    create_llvm_ptr,
     warp_reduce_scatter_strided,
     warp_reduce_strided,
 )
@@ -980,6 +978,8 @@ def _build_kernel_mfma_lds_pipe(
     # the slot a multiple of the DMA's 128-byte destination alignment.
     SCALE_DMAS = ceildiv(BKV, 64) if lds_scales else 0
     SCALE_BYTES = SCALE_DMAS * 64 * 4
+    # Columns spanned by a tile's buffer views (the scale DMAs round up to 64).
+    TILE_COLS = max(BKV, 64 * ceildiv(BKV, 64))
     SLOT_BYTES = KV_BYTES + SCALE_BYTES
     SLOT_I32 = SLOT_BYTES // 4
     SCALE_DW = KV_BYTES // 4  # slot-relative dword offset of the scales
@@ -1077,59 +1077,64 @@ def _build_kernel_mfma_lds_pipe(
         wave_row0 = block_row0 + wave * fx.Int32(RPW)
 
         q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
-        cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
-        ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
+        cs_t = fx.rocdl.make_buffer_tensor(cu_starts)
+        ce_t = fx.rocdl.make_buffer_tensor(cu_ends)
         _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
 
-        # ---- LDS region + async-DMA base pointer ----
+        # ---- LDS region ----
         # One flat i32 array of NUM_BUFFERS slots: lds_ptr serves the MFMA reads,
-        # lds_ptr0 the DMA writes.
+        # lds_i8 (the same address, byte-granular) the DMA writes.
         lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().slots.ptr
-        # ptrtoint on a Shared pointer yields i32; address space 3 is LDS, which
-        # is what raw_ptr_buffer_load_lds wants.
-        lds_ptr0 = create_llvm_ptr(
-            fx.Int64(fx.Uint32(fx.ptrtoint(lds_ptr))), address_space=3
-        )
+        lds_i8 = fx.recast_iter(fx.Int8, lds_ptr)
+        lds_f32 = fx.recast_iter(fx.Float32, lds_ptr)
         _frag_ty = Vec.make_type(8, fx.Int32)
 
         def _lds_read_frag(dword_idx):
             """One lane's 32-byte B-fragment out of the staged LDS tile."""
             return fx.ptr_load(lds_ptr + dword_idx, result_type=_frag_ty)
 
-        def _tile_rsrcs(col0_i32):
-            """KV / kv_scales descriptors based at column ``col0``, bounded at
-            ``seq_len_kv`` (num_records shrinks with col0)."""
+        # Global->LDS DMA atoms: 16 bytes of KV / one f32 kv_scale per lane.
+        # The LDS destination is wave-uniform; the instruction fans the
+        # wave's lanes out from it lane-contiguously.
+        kv_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
+        sc_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+
+        def _tile_view(it, col0_i32, col_elems, elem_bytes):
+            """Flat buffer view of a per-KV-column array, starting at ``col0``.
+
+            The column offset goes into the descriptor base (a scalar i64
+            address add, not a per-lane voffset), so every lane's offset
+            within the tile is loop-invariant. ``num_records`` ends at
+            ``seq_len_kv``: columns past it read 0, and are masked out of the
+            stored logits by the per-row window predicate.
+            """
             rem_cols = fx.max(seq_len_kv - col0_i32, fx.Int32(0))
-            kv_t = buffer_ops.create_buffer_resource(
-                KV,
-                base_byte_offset=col0_i32 * fx.Int32(D),
-                num_records_bytes=rem_cols * fx.Int32(D),
+            it = fx.add_offset(it, fx.Int64(col0_i32) * fx.Int64(col_elems))
+            view = fx.make_view(it, fx.make_layout(TILE_COLS * col_elems, 1))
+            return fx.rocdl.make_buffer_tensor(
+                fx.Tensor(view),
+                num_records_bytes=fx.Int64(rem_cols * fx.Int32(col_elems * elem_bytes)),
             )
-            sc_t_rsrc = buffer_ops.create_buffer_resource(
-                kv_scales,
-                base_byte_offset=col0_i32 * fx.Int32(4),
-                num_records_bytes=rem_cols * fx.Int32(4),
-            )
-            return kv_t, sc_t_rsrc
+
+        kv_i8 = fx.recast_iter(fx.Int8, fx.get_iter(KV))
+
+        def _kv_tile(col0_i32):
+            return _tile_view(kv_i8, col0_i32, D, 1)
+
+        def _scale_tile(col0_i32):
+            return _tile_view(fx.get_iter(kv_scales), col0_i32, 1, 4)
 
         def _dma_kv_tile_to_lds(slot_byte_i32, col0_i32):
             """Cooperatively async-copy KV[col0:col0+BKV, :] into LDS slot.
 
             All MR_BLOCK_THREADS threads participate; thread ``tid`` at load ``i``
             writes LDS byte ``(i*MR_BLOCK_THREADS + tid)*DMA_BYTES`` (relative to
-            the slot), reading the matching linear byte of the row-major tile.
-
-            The descriptors are re-based at column ``col0`` every tile (SALU
-            only), so each lane's offset is loop-invariant and the loop spends
-            no VALU on DMA addressing. Columns past ``seq_len_kv`` fall outside
-            ``num_records`` and read 0; they are masked out of the stored
-            logits by the per-row window predicate.
+            the slot), reading the matching swizzled byte of the row-major tile.
             """
-            wave_slot_scalar = fx.Int64(
-                fx.Uint32(slot_byte_i32 + wave_s * fx.Int32(64 * DMA_BYTES))
-            ).ir_value()
-            lds_ptr = buffer_ops.get_element_ptr(lds_ptr0, wave_slot_scalar)
-            kv_rsrc_t, sc_rsrc_t = _tile_rsrcs(col0_i32)
+            lds_dst = fx.add_offset(
+                lds_i8, slot_byte_i32 + wave_s * fx.Int32(64 * DMA_BYTES)
+            )
+            kv_src = fx.logical_divide(_kv_tile(col0_i32), fx.make_layout(1, 1))
 
             dma_bytes = fx.Int32(DMA_BYTES)
             d = fx.Int32(D)
@@ -1147,39 +1152,25 @@ def _build_kernel_mfma_lds_pipe(
 
                 voffset = row_local * d + d_off
                 if const_expr(i > 0):
-                    lds_ptr = buffer_ops.get_element_ptr(
-                        lds_ptr,
-                        static_byte_offset=MR_BLOCK_THREADS * DMA_BYTES,
-                    )
-                rocdl.raw_ptr_buffer_load_lds(
-                    kv_rsrc_t,
-                    lds_ptr,
-                    dma_bytes,
-                    fx.Int32(voffset),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                    fx.Int32(1),
+                    lds_dst = fx.add_offset(lds_dst, MR_BLOCK_THREADS * DMA_BYTES)
+                fx.copy(
+                    kv_dma,
+                    fx.slice(kv_src, (None, voffset)),
+                    fx.make_view(lds_dst, fx.make_layout(1, 1)),
                 )
 
             # kv_scales[col0 + s*64 + lane] -> slot scale dword s*64 + lane.
             # Same wave-uniform destination in every wave (see SCALE_DMAS).
+            if const_expr(SCALE_DMAS > 0):
+                sc_src = fx.logical_divide(_scale_tile(col0_i32), fx.make_layout(1, 1))
             for s in range_constexpr(SCALE_DMAS):
-                sc_byte_i32 = slot_byte_i32 + fx.Int32(KV_BYTES + s * 64 * 4)
-                sc_lds_ptr = buffer_ops.get_element_ptr(
-                    lds_ptr0,
-                    rocdl.readfirstlane(
-                        fx.Int64.ir_type, fx.Int64(fx.Uint32(sc_byte_i32)).ir_value()
-                    ),
+                sc_dst = fx.add_offset(
+                    lds_f32, slot_byte_i32 // 4 + fx.Int32(SCALE_DW + s * 64)
                 )
-                sc_col = fx.Int32(s * 64) + lane
-                rocdl.raw_ptr_buffer_load_lds(
-                    sc_rsrc_t,
-                    sc_lds_ptr,
-                    fx.Int32(4),
-                    fx.Int32(sc_col * fx.Int32(4)),
-                    fx.Int32(0),
-                    fx.Int32(0),
-                    fx.Int32(1),
+                fx.copy(
+                    sc_dma,
+                    fx.slice(sc_src, (None, fx.Int32(s * 64) + lane)),
+                    fx.make_view(sc_dst, fx.make_layout(1, 1)),
                 )
 
         def _lds_read_scale(dword_idx):
@@ -1355,7 +1346,7 @@ def _build_kernel_mfma_lds_pipe(
             kv_scales_tile = [None] * N_TILES
             rs_scales = [None] * (N_TILES // RS_GROUP)
             if const_expr(not lds_scales):
-                sc_rsrc_tile = _tile_rsrcs(col0)[1]
+                sc_tile = _scale_tile(col0)
             for ni in range_constexpr(N_TILES):
                 col = col0 + fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 cols[ni] = col
@@ -1363,12 +1354,7 @@ def _build_kernel_mfma_lds_pipe(
                     # Column-relative offset into the tile's descriptor; past
                     # seq_len_kv the hardware returns 0 (masked column).
                     kv_scales_tile[ni] = fx.Float32(
-                        buffer_ops.buffer_load(
-                            sc_rsrc_tile,
-                            fx.Int32(ni * mfma.MFMA_N) + lane_mod_N,
-                            vec_width=1,
-                            dtype=T.f32,
-                        )
+                        sc_tile[fx.Int32(ni * mfma.MFMA_N) + lane_mod_N]
                     )
                 col_local = fx.Int32(ni * mfma.MFMA_N) + lane_mod_N
                 if const_expr(lds_scales and not rs_head):
