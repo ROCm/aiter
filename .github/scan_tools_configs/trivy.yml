@@ -8,6 +8,11 @@
 # or a `.trivyignore`) belong there. What goes here is what should hold
 # for a repository that has said nothing.
 
+# The security baseline runs Trivy from the workflow workspace and checks the
+# target repository out under .scan-target, so this explicit path lets Trivy
+# use the repository's path-scoped suppressions.
+ignorefile: .scan-target/.trivyignore.yaml
+
 scan:
   skip-dirs:
     - .git
