@@ -6479,10 +6479,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self._mxfp4_err_ratio = args.errRatio
         result = super().run(args, fast_mode)
         if not args.run_config and not args.compare and self.untunedf.empty:
-            pd.DataFrame(columns=self.keys + ["status", "failure_reason"]).to_csv(
-                Path(self._mxfp4_output_file).with_suffix(".failed_shapes.csv"),
-                index=False,
-            )
+            self._write_failed_shapes(pd.DataFrame(), self._mxfp4_output_file)
         return result
 
     def pre_process(self, args: "argparse.Namespace") -> "None":
@@ -6492,12 +6489,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return
         import importlib
 
-        from aiter.ops.moe_mxfp4_aux import prepare_mxfp4_moe_aux
+        from aiter.ops.moe_mxfp4_aux import (
+            _MissingMxfp4MoeAuxInstances,
+            prepare_mxfp4_moe_aux,
+        )
 
         sorting = importlib.import_module("aiter.fused_moe")
         shapes = []
+        aux_rows = set()
         if sorting._MOE_SORT_BACKEND not in ("opus", "ck"):
-            for _, row in self.untunedf.iterrows():
+            for index, row in self.untunedf.iterrows():
                 expert, topk = int(row["expert"]), int(row["topk"])
                 if sorting._aux_uses_opus("opus", 16, int(row["token"]) * topk, expert):
                     continue
@@ -6512,7 +6513,44 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     shapes.append(
                         (expert, int(row["model_dim"]), int(row["inter_dim"]), topk)
                     )
-        prepare_mxfp4_moe_aux(shapes)
+                    aux_rows.add(index)
+        try:
+            prepare_mxfp4_moe_aux(shapes)
+        except Exception as exc:
+            # Persist both missing-instance and module build/load failures.
+            missing_by_shape = {}
+            if isinstance(exc, _MissingMxfp4MoeAuxInstances):
+                for (expert, topk, hidden, _zero_init), key in zip(
+                    exc.missing_instances, exc.missing_keys
+                ):
+                    missing_by_shape.setdefault((expert, topk, hidden), []).append(key)
+            failures = []
+            for index, row in self.untunedf.iterrows():
+                row_missing = []
+                if index in aux_rows:
+                    row_missing = missing_by_shape.get(
+                        (int(row["expert"]), int(row["topk"]), int(row["model_dim"])),
+                        [],
+                    )
+                reason = (
+                    "missing required generated instances: " + ", ".join(row_missing)
+                    if row_missing
+                    else "tuning not started because auxiliary preparation failed"
+                )
+                failures.append(
+                    {
+                        **{key: row[key] for key in self.keys},
+                        "status": "not_run",
+                        "missing_aux_keys": ";".join(row_missing),
+                        "failure_reason": f"{reason}; {type(exc).__name__}: {exc}",
+                    }
+                )
+            self._write_failed_shapes(
+                pd.DataFrame(failures),
+                self.get_out_file(args.tune_file),
+                phase="aux_preflight",
+            )
+            raise
         if shapes and os.environ.get("AITER_REBUILD", "0") != "0":
             # Spawned workers import the JIT layer again. The parent prepared
             # this module; workers reuse it rather than force a shared rebuild.
@@ -6849,7 +6887,45 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def get_untuned_gemm_list(self, untuned_gemm_file: "str") -> "pd.DataFrame":
         if getattr(self, "_mxfp4_run_config", False):
             return super().get_untuned_gemm_list(untuned_gemm_file)
-        untunedf = _read_csv(untuned_gemm_file)
+        return self._normalize_untuned_rows(
+            _read_csv(untuned_gemm_file), untuned_gemm_file
+        )
+
+    def get_retune_gemm_list(self, args: "argparse.Namespace") -> "None":
+        if getattr(self, "_mxfp4_run_config", False):
+            return super().get_retune_gemm_list(args)
+        if args.untune_file is None:
+            raise ValueError("untune_file must be specified for retuning")
+        untunedf = _read_csv(args.untune_file)
+        gfx, cu_num = self.get_gfx(), self.get_cu_num()
+        if "gfx" not in untunedf.columns:
+            untunedf["gfx"] = gfx
+        if "cu_num" not in untunedf.columns:
+            untunedf["cu_num"] = cu_num
+        target_mask = (untunedf["gfx"] == gfx) & (untunedf["cu_num"] == cu_num)
+        # Keep the source index until validation reports the original CSV row.
+        self.untunedf = self._normalize_untuned_rows(
+            untunedf.loc[target_mask].copy(), args.untune_file
+        )[self.keys]
+        if self.get_out_file(args.tune_file) == args.untune_file:
+            self.tunedf = untunedf.loc[~target_mask].copy()
+        else:
+            self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+            if "gfx" not in self.tunedf.columns:
+                self.tunedf.insert(0, "gfx", gfx)
+            retuned = (
+                self.tunedf[self.keys]
+                .apply(tuple, axis=1)
+                .isin(self.untunedf[self.keys].apply(tuple, axis=1))
+            )
+            if args.verbose:
+                aiter.logger.info(f"retuning {retuned.sum()} shapes")
+                print(self.tunedf[retuned])
+            self.tunedf = self.tunedf.loc[~retuned].copy()
+
+    def _normalize_untuned_rows(
+        self, untunedf: "pd.DataFrame", untuned_gemm_file: "str"
+    ) -> "pd.DataFrame":
         required = [k for k in self.keys if k not in ("gfx", "cu_num")]
         missing = [col for col in required if col not in untunedf.columns]
         if missing:
@@ -7426,6 +7502,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
             results, columns=self.columns + ["status", "failure_reason"]
         )
 
+    def _write_failed_shapes(
+        self, rows: "pd.DataFrame", output_file: "str", phase: "str" = "tuning"
+    ) -> "None":
+        failures = rows.reindex(
+            columns=self.keys
+            + ["status", "failure_reason", "failure_phase", "missing_aux_keys"]
+        ).copy()
+        failures["failure_phase"] = failures["failure_phase"].fillna(phase)
+        failures["missing_aux_keys"] = failures["missing_aux_keys"].fillna("")
+        failure_file = Path(output_file).with_suffix(".failed_shapes.csv")
+        failure_file.parent.mkdir(parents=True, exist_ok=True)
+        failures.to_csv(failure_file, index=False)
+
     def tune_summary(self, status: "str") -> "None":
         observed = pd.concat([self.success, self.failed], ignore_index=True)
         observed_keys = set(observed[self.keys].astype(str).apply(tuple, axis=1))
@@ -7452,10 +7541,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 ],
                 ignore_index=True,
             )
-        failure_file = Path(self._mxfp4_output_file).with_suffix(".failed_shapes.csv")
-        self.failed.reindex(columns=self.keys + ["status", "failure_reason"]).to_csv(
-            failure_file, index=False
-        )
+        self._write_failed_shapes(self.failed, self._mxfp4_output_file)
         super().tune_summary(status)
 
     def result_to_csv(self, results, file, concat=False):
@@ -7467,17 +7553,21 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
                 else:
                     old_tunedf[col] = ""
+        # Like FmoeTuner, drop legacy tagged rows and the _tag column first; a
+        # kept fallback row would otherwise win the key-only dedup below over
+        # the primary row of the same shape.
+        if "_tag" in old_tunedf.columns:
+            old_tunedf = old_tunedf[old_tunedf["_tag"].fillna("") == ""].drop(
+                columns=["_tag"]
+            )
         # Like the base tuner, keep every saved row. Only an invalid saved winner
         # for a shape retuned in this run is dropped, so a failed retune cannot
         # leave it behind; rows of other shapes and kernel families are untouched.
+        # Keys compare as raw tuples, as in update_tunedf, so legacy 1.0/True
+        # values match the normalized 1 of the same shape.
         if not old_tunedf.empty and not results.empty:
-            retuned_keys = set(results[self.keys].astype(str).apply(tuple, axis=1))
-            retuned = (
-                old_tunedf[self.keys]
-                .astype(str)
-                .apply(tuple, axis=1)
-                .isin(retuned_keys)
-            )
+            retuned_keys = set(results[self.keys].apply(tuple, axis=1))
+            retuned = old_tunedf[self.keys].apply(tuple, axis=1).isin(retuned_keys)
             if retuned.any():
                 valid_saved = self._valid_tuned_mask(
                     old_tunedf[retuned],
@@ -7494,9 +7584,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
         resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
         resultdf.to_csv(file, index=False)
-        self.failed[self.keys + ["status", "failure_reason"]].to_csv(
-            Path(file).with_suffix(".failed_shapes.csv"), index=False
-        )
+        self._write_failed_shapes(self.failed, file)
 
 
 def _mxfp4_tune_shape_worker(payload):

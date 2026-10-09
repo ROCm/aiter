@@ -79,6 +79,29 @@ python3 -m unittest discover -s op_tests/tuning_tests -v
 
 ### Running individual tuner tests
 
+The MXMOE CPU tests use a scoped host environment and run without visible GPUs:
+
+```bash
+HIP_VISIBLE_DEVICES='' ROCR_VISIBLE_DEVICES='' \
+python3 -m pytest -q op_tests/tuning_tests/test_mxfp4_flydsl_tuning.py \
+  op_tests/tuning_tests/test_mxfp4_flydsl_results.py \
+  op_tests/tuning_tests/test_mxfp4_cpu_test_isolation.py \
+  op_tests/tuning_tests/test_mxfp4_moe_aux_codegen.py \
+  op_tests/tuning_tests/test_public_a8w4_csv_lookup.py
+```
+
+Collection imports no aiter GPU modules for the input/results tests. Execution
+uses the installed aiter host extension for enum types and the installed Python
+dependencies (torch, Triton, FlyDSL). The scoped environment supplies gfx950
+metadata, permits older system Triton only for these host checks, and rejects
+GPU initialization and extension builds. It restores environment overrides and
+the incoming default device on exit. Actual GPU CLI validation continues to use
+the real device detection, packages and compiled kernels.
+If torch changes its private default-device storage, the tests try the public
+query with GPU initialization blocked. If that query cannot read the setting
+safely, the tests report an unsupported environment before changing any device
+setting or environment variable.
+
 Each tuner in `test_tune_pipeline.py` has two variants: `_mp1` (single GPU) and `_mp_default` (all GPUs).
 
 ```bash

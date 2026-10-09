@@ -98,6 +98,25 @@ def _mxfp4_moe_sort_internal_is_supported(
     """Private dispatch probe; not exported through ``aiter.ops`` or ``aiter``."""
 
 
+class _MissingMxfp4MoeAuxInstances(RuntimeError):
+    def __init__(self, missing_instances: list[tuple[int, int, int, bool]]) -> None:
+        # Structural identity is separate from the generated instance name so
+        # callers can match shapes without duplicating the name format.
+        self.missing_instances = tuple(missing_instances)
+        self.missing_keys = tuple(
+            f"aux_{'sortzi' if zero_init else 'sortonly'}_NE{expert}"
+            f"_TOPK{topk}_MB16_H{hidden}"
+            for expert, topk, hidden, zero_init in self.missing_instances
+        )
+        super().__init__(
+            "module_moe_mxfp4_aux is missing generated instances: "
+            + ", ".join(self.missing_keys)
+            + ". Add support in moe_aux/codegen/gen_instances.py if needed, "
+            "then rerun this preparation in a fresh process with AITER_REBUILD=1 "
+            "before launching tuning workers."
+        )
+
+
 def prepare_mxfp4_moe_aux(shapes: "Iterable[tuple[int, int, int, int]]") -> None:
     """Load/build and verify the BM16 sort instances before tuning workers start.
 
@@ -113,16 +132,9 @@ def prepare_mxfp4_moe_aux(shapes: "Iterable[tuple[int, int, int, int]]") -> None
             if not _mxfp4_moe_sort_internal_is_supported(
                 expert, topk, hidden, 16, zero_init
             ):
-                operation = "sortzi" if zero_init else "sortonly"
-                missing.append(f"aux_{operation}_NE{expert}_TOPK{topk}_MB16_H{hidden}")
+                missing.append((expert, topk, hidden, zero_init))
     if missing:
-        raise RuntimeError(
-            "module_moe_mxfp4_aux is missing generated instances: "
-            + ", ".join(missing)
-            + ". Add support in moe_aux/codegen/gen_instances.py if needed, "
-            "then rerun this preparation in a fresh process with AITER_REBUILD=1 "
-            "before launching tuning workers."
-        )
+        raise _MissingMxfp4MoeAuxInstances(missing)
 
 
 @compile_ops("module_moe_mxfp4_aux", develop=True)
