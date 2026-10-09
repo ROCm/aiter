@@ -91,103 +91,15 @@ jobs:
       contents: read
       actions: read           # read this run's own jobs to see whether the review ever started
     steps:
+      - uses: actions/checkout@v4      # the watchdog script ships with the skill
       - name: Report a review that never got a runner
-        uses: actions/github-script@v7
         env:
           STUCK_MINUTES: '20'          # a healthy runner claims a job in seconds
           PR: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
           AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
           OWNER_OVERRIDE: ${{ vars.AITER_RUNNER_OWNER }}
-        with:
-          script: |
-            const mins = Number(process.env.STUCK_MINUTES);
-            // A typo here makes the deadline expire before the first poll, so the loop never runs
-            // and the alarm fires at once -- paging the runner owner about a box that is fine.
-            // That is the false page this job exists to prevent, so fail as the config error it is.
-            if (!Number.isFinite(mins) || mins <= 0) {
-              core.setFailed(
-                `STUCK_MINUTES is not a usable number of minutes: `
-                + `${JSON.stringify(process.env.STUCK_MINUTES)}`);
-              return;
-            }
-            const repo = { owner: context.repo.owner, repo: context.repo.repo };
-            const deadline = Date.now() + mins * 60_000;
-
-            // Is the box working on some other review? The single runner serialises them, so
-            // waiting behind one is normal and must not page anyone: a false alarm here would
-            // cost exactly what the mis-triaged GLM pages did.
-            const boxBusy = async () => {
-              // Page through all of them. A batch of reviews queues up as a long list of
-              // in_progress runs, and the API returns the newest first -- so the one actually
-              // running a review is last, and a single page of 20 would miss exactly it.
-              const live = await github.paginate(github.rest.actions.listWorkflowRuns, {
-                ...repo, workflow_id: 'aiter-review-bot.yml',
-                status: 'in_progress', per_page: 100 });
-              for (const run of live) {
-                if (run.id === context.runId) continue;
-                const j = await github.rest.actions.listJobsForWorkflowRun(
-                  { ...repo, run_id: run.id });
-                if (j.data.jobs.some(x => x.name === 'review' && x.status === 'in_progress'))
-                  return true;
-              }
-              return false;
-            };
-
-            // Poll rather than sleep the whole window: a watchdog that returns as soon as the
-            // box is accounted for does not hold a hosted runner, which matters when a batch of
-            // reviews queues up and each one carries its own watchdog.
-            let sawReview = false;
-            while (Date.now() < deadline) {
-              await new Promise(r => setTimeout(r, 120_000));
-              const self = await github.rest.actions.listJobsForWorkflowRun(
-                { ...repo, run_id: context.runId });
-              const review = self.data.jobs.find(j => j.name === 'review');
-              if (review) {
-                sawReview = true;
-                if (review.status !== 'queued') return;            // ours started
-              }
-            }
-
-            // The job this watchdog exists to watch was never in its own run's job list -- a
-            // rename, or a matrix that suffixes job names. Treating that as "ours started" would
-            // report success forever while watching nothing, so name the problem instead; it is
-            // a workflow-structure fault, not a reason to page anyone about the box.
-            if (!sawReview) {
-              core.setFailed(
-                `this run has no job named 'review', so the watchdog is watching nothing`);
-              return;
-            }
-
-            // Ask about the box only now. Asking inside the loop and returning on the first yes
-            // abandons the PR: the runner can die a minute later with nobody left watching, and
-            // a queued job never fails on its own.
-            if (await boxBusy()) {
-              core.notice('the runner is busy with another review; queueing is expected');
-              return;
-            }
-
-            // Still queued, with no review running anywhere: nothing is listening for this label.
-            const owner = (process.env.OWNER_OVERRIDE || '').trim() || 'zufayu';
-            const body =
-              `\u26a0\ufe0f **aiter-bot** \u2014 no self-hosted runner claimed this review in `
-              + `${mins} min, so it has not started. Nothing is wrong with this PR.\n\n`
-              + `A queued job never fails on its own, so this notice is the only signal: the `
-              + `runner process is probably not running on the box \u2014 see `
-              + `\`.claude/skills/review-pr/RUNNER-SETUP.md\` section 5.\n\n`
-              + `@${owner} \u2014 please check the runner.\n\n`
-              + `<sub>A queued job expires after 24 h. Re-comment \`@aiter-bot review\` once it `
-              + `is back.</sub>`;
-            // Post as aiter-bot, like every other message this workflow sends.
-            const r = await fetch(
-              `https://api.github.com/repos/${repo.owner}/${repo.repo}/issues/`
-              + `${process.env.PR}/comments`,
-              { method: 'POST',
-                headers: { authorization: `token ${process.env.AITER_BOT_TOKEN}`,
-                           accept: 'application/vnd.github+json' },
-                body: JSON.stringify({ body }) });
-            if (!r.ok) core.warning(`could not post the stuck-review notice: ${r.status}`);
-            core.setFailed(`no runner claimed this review in ${mins} min`);
-
+        run: python3 .claude/skills/review-pr/watchdog.py
   review:
     needs: gate
     if: needs.gate.outputs.ok == 'true'
