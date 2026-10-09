@@ -16,7 +16,6 @@ from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 
 from ..kernels_common import LOG2E, ceildiv
-from ..symmetric_arena import SymmetricArena
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .common import (
     AUX_SYS,
@@ -40,6 +39,7 @@ from .common import (
     uni,
     wave_red,
 )
+from .mega_moe_tp import SymmetricArena
 
 __all__ = ["SpRsNorm"]
 

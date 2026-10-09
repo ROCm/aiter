@@ -4,15 +4,13 @@
 
 Experts are replicated over the TP group and ``inter_dim`` is sharded; one launch
 runs the collectives around GEMM1 + activation + GEMM2 of this rank's inter slice.
-``comm_mode``: ``"ag_rs"`` (sequence-parallel in/out), ``"rs"`` (replicated in,
-reduce-scattered out), ``"ar"`` (replicated in, all-reduced out), ``"ar_ar"``
-(partial in, all-reduced out). Weights are MXFP4 (``shuffle_weight(16, 16)`` +
-``e8m0_shuffle``).
+``comm_mode``: ``"ag_rs"`` (sequence-parallel in/out) or ``"ar"`` (replicated in,
+all-reduced out). Weights are MXFP4 (``shuffle_weight(16, 16)`` + ``e8m0_shuffle``).
 
 Contract:
 
 * ``forward`` is a collective: every rank calls it the same number of times, in the
-  same order, with the same local token count (and, rs / ar / ar_ar, the same routing).
+  same order, with the same local token count (and, ar, the same input and routing).
   Layers of one shape may share an instance (``set_weights``): their forwards form one
   collective sequence.
 * ``prepare(local_tokens)`` before CUDA graph capture: it compiles every launch config,
@@ -32,10 +30,11 @@ Contract:
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
 
-Large-batch (LB) schedule (``schedule="dynamic"``): from ``lb_min`` global tokens up; its
-row tile is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_small``
-up to ``lb_small_max`` tokens; ``lb_npp`` GEMM1 column blocks per A pass; ``lb_q`` output
-column chunks per GEMM2 unit. Unset fields fall back to ``AITER_MEGAMOE_TP_LB_*``.
+Schedules (planned in the kernel from the routing): up to 256 global tokens the dynamic
+one, from ``lb_min`` (default 256) global tokens up the large-batch (LB) one; its row tile
+is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_small`` up to
+``lb_small_max`` tokens; ``lb_npp`` GEMM1 column blocks per A pass; ``lb_q`` output column
+chunks per GEMM2 unit. Unset fields fall back to ``AITER_MEGAMOE_TP_LB_*``.
 """
 
 from __future__ import annotations
@@ -89,7 +88,7 @@ class MegaMoeTPConfig:
     comm_mode: str = "ag_rs"
     comm_dtype: str = "fp8"
     ar_gather: str = "auto"
-    schedule: str = "tuned"
+    schedule: str = "dynamic"
     act_dtype: str = "fp4"
     lb_min: int | None = None
     lb_mt: int | str | None = None
@@ -171,10 +170,10 @@ class MegaMoeTP:
         tail=None,
         bf16: bool = False,
     ):
-        """ag_rs: x [m, H] (own tokens); rs / ar: x [M, H] replicated; ar_ar: x [M, H]
-        partial. tail (ag_rs, see tail_ok): (res_in, res_out, norm_w) -> also
-        res_out = y + res_in and every rank's FP8 rows (+ fp32 scales; bf16: + the bf16
-        rows) of the norm of res_out: returns (y, q, scale[, rows])."""
+        """ag_rs: x [m, H] (own tokens); ar: x [M, H] replicated. tail (ag_rs, see
+        tail_ok): (res_in, res_out, norm_w) -> also res_out = y + res_in and every rank's
+        FP8 rows (+ fp32 scales; bf16: + the bf16 rows) of the norm of res_out: returns
+        (y, q, scale[, rows])."""
         return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
 
     __call__ = forward

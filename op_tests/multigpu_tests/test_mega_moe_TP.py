@@ -33,7 +33,7 @@ from aiter.utility import fp4_utils
 
 QUANT_TYPE = aiter.QuantType.per_1x32
 FP4 = dtypes.fp4x2
-MODES = ("ag_rs", "rs", "ar", "ar_ar")
+MODES = ("ag_rs", "ar")
 
 
 @dataclass(frozen=True)
@@ -254,17 +254,7 @@ def make_case(shape, wt, ctx, mode, tokens, kind, seed, mask=0.0) -> Case:
         dist.all_reduce(full)
         ref = full[ctx.rank * m : (ctx.rank + 1) * m]
     else:
-        full = torch_partial(shape, wt, x, w_ref, ids_ref)
-        dist.all_reduce(full)
-        ref = full[ctx.rank * m : (ctx.rank + 1) * m] if mode == "rs" else full
-    if mode == "ar_ar":
-        gp = torch.Generator(device=ctx.device).manual_seed(seed + 31)
-        noise = torch.randn((ctx.world, *x.shape), device=ctx.device, generator=gp)
-        noise -= noise.mean(0, keepdim=True)
-        x = (x.float() / ctx.world + 0.1 * noise[ctx.rank]).to(dtypes.bf16)
-        xs = x.float()
-        dist.all_reduce(xs)
-        ref = torch_partial(shape, wt, xs.to(dtypes.bf16), w_ref, ids_ref)
+        ref = torch_partial(shape, wt, x, w_ref, ids_ref)
         dist.all_reduce(ref)
     return Case(x.contiguous(), w, ids, ref)
 
@@ -342,7 +332,7 @@ def case_accuracy(
         c = make_case(shape, wt, ctx, mode, tokens, kind, args.seed + 1000 * s + tokens)
         y = call(layer, c).clone()
         worst = max(worst, check(y, c, rtol_of(args, comm_dtype, ar_gather)))
-        if mode in ("ar", "ar_ar") and not identical_across_ranks(y):
+        if mode == "ar" and not identical_across_ranks(y):
             raise CaseFailure("all-reduce output differs across ranks")
     return worst
 
@@ -425,12 +415,12 @@ def case_graph(shape, wt, ctx, args, mode):
 
 
 def case_dynamic(shape, wt, ctx, args, mode, lb):
-    # dynamic schedule (lb: the large-batch one at its smallest row tile, which takes
-    # the mixed GEMM2 split); odd local token counts and a narrow routing
+    # the dynamic schedule up to 256 tokens (lb: the large-batch one from 1 token up, at
+    # its smallest row tile, which takes the mixed GEMM2 split); odd local token
+    # counts and a narrow routing
     kw = {"lb_min": 1, "lb_mt": 3, "lb_mt_small": 3, "lb_npp": 2, "lb_q": 3}
-    kw = kw if lb else {}
     layer = new_layer(
-        shape, wt, ctx, mode, args.max_local_tokens, schedule="dynamic", **kw
+        shape, wt, ctx, mode, args.max_local_tokens, **(kw if lb else {"lb_min": 0})
     )
     worst = 0.0
     tokens = sorted({ctx.world, 3 * ctx.world, 33 * ctx.world, args.tokens[-1]})
@@ -452,9 +442,7 @@ def ref_tail(y, res, nw, eps):
 
 def case_tail(shape, wt, ctx, args):
     # fused tail, in place as ATOM calls it: tail=(res, res, w)
-    layer = new_layer(
-        shape, wt, ctx, "ag_rs", args.max_local_tokens, schedule="dynamic", lb_min=1
-    )
+    layer = new_layer(shape, wt, ctx, "ag_rs", args.max_local_tokens, lb_min=1)
     eng = layer.engine
     t = args.tokens[-1]
     if not layer.tail_ok(t // ctx.world):
@@ -660,7 +648,7 @@ def run_model(name, ctx, args, results):
         for cd in args.comm_dtypes:
             if cd != "fp8":
                 run(f"{pre} comm {cd}", *acc, tokens, "random", cd)
-        if mode in ("ar", "ar_ar"):
+        if mode == "ar":
             run(f"{pre} ar_gather fp8", *acc, tokens, "random", "fp8", "fp8")
         for what, fn in (
             ("varying m", case_varying_m),

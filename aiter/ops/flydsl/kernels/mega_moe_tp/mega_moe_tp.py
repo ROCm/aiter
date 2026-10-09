@@ -1,22 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Host side of the single-kernel TP MegaMoE (launch configs, schedules, launches)."""
+"""Host side of the single-kernel TP MegaMoE (launch configs, buffers, launches)."""
 
 from __future__ import annotations
 
-import csv
+import contextlib
+import ctypes
 import dataclasses
-import functools
-import heapq
-import math
 import os
 from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
 
+from ...quick_allreduce_int4_ipc import UncachedIpcHeap as _Ipc
 from ..kernels_common import ceildiv
-from ..symmetric_arena import SymmetricArena
 from ..tensor_shim import _preload_compiled, _run_compiled
 from .mega_moe_tp_kernel import (
     CTRL_ERR,
@@ -33,13 +31,6 @@ from .mega_moe_tp_kernel import (
     NCTA_MAX,
     NMETA_CAP,
     TN_MAX,
-    UNIT_G1X,
-    UNIT_G2COL,
-    UNIT_REC,
-    UNIT_SIGNAL,
-    XQ_MAX,
-    XQ_P,
-    XQ_SHIFT,
     compile_mega_moe_tp,
     gemm2_chunk_groups,
     gemm2_group_step,
@@ -51,14 +42,12 @@ __all__ = [
     "LaunchCfg",
     "MegaMoeTPEngine",
     "mega_moe_tp_shape_supported",
-    "tuned_config_path",
 ]
 
 LDS_LIMIT = 160 * 1024
 LB_PF_MAX = 1024
 AG8_MIN = 512
-COMM_MODES = ("ag_rs", "rs", "ar", "ar_ar")
-_TUNED_LIKE = {"ar": "ar_ar", "rs": "ag_rs"}
+COMM_MODES = ("ag_rs", "ar")
 _ERR_NAMES = (
     (ERR_FLAG, "flag"),
     (ERR_META, "routing"),
@@ -66,100 +55,191 @@ _ERR_NAMES = (
     (ERR_COMM, "reduce"),
     (ERR_YAG, "output gather"),
 )
-CSV_KEY = (
-    "gfx",
-    "cu_num",
-    "tp",
-    "comm_mode",
-    "model_dim",
-    "inter_dim",
-    "expert",
-    "topk",
-    "act",
-)
-CSV_CFG = ("block_m", "nsk", "npp", "xb", "dyn", "route_fp8", "ll", "llr")
 
 
 @dataclass(frozen=True)
 class LaunchCfg:
+    """One kernel variant: row tile 16 * mt; ll / llr: LL reduce-scatter packets / LL
+    route rows too; npp: GEMM1 column blocks per A pass; ag8: MXFP8 all-reduce second
+    hop; lb: large-batch schedule (pf: GEMM2 prefetch, lp: forced GEMM1 inter pieces);
+    tn: fused tail (1: FP8 rows, 2: + bf16 rows)."""
+
     mt: int
-    dyn: bool
-    route_fp8: bool
     ll: bool = False
     llr: bool = False
-    nsk: int = 4
     npp: int = 1
-    xb: int = 0
     ag8: bool = False
     lb: bool = False
     tn: int = 0
     pf: bool = False
     lp: int = 0
 
-    @property
-    def block_m(self) -> int:
-        return 16 * self.mt
+
+# --- intra-node symmetric memory (hipIpc, via quick_allreduce_int4_ipc) ---------------
+
+_ALIGN = 256
+# a peer allocation maps once per process (arenas can share one): handle -> [ptr, refs]
+_OPEN: dict[bytes, list] = {}
 
 
-def tuned_config_path() -> str:
-    from aiter.jit.core import AITER_CONFIGS
+def _allocation_base(ptr: int) -> int:
+    hip = _Ipc._load_hip()
+    hip.hipMemGetAddressRange.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(ctypes.c_size_t),
+        ctypes.c_void_p,
+    ]
+    base, size = ctypes.c_void_p(), ctypes.c_size_t()
+    err = hip.hipMemGetAddressRange(
+        ctypes.byref(base), ctypes.byref(size), ctypes.c_void_p(ptr)
+    )
+    _Ipc._hip_check(err, what="hipMemGetAddressRange")
+    return int(base.value or 0)
 
-    return AITER_CONFIGS.AITER_CONFIG_MEGAMOE_TP_FILE
+
+def _ipc_open(handle: bytes) -> int:
+    ent = _OPEN.get(handle)
+    if ent is None:
+        ent = _OPEN[handle] = [_Ipc.open_mem_handle(handle), 0]
+    ent[1] += 1
+    return ent[0]
 
 
-@functools.cache
-def _tuned_rows(path: str) -> dict:
-    rows: dict = {}
-    if not os.path.exists(path):
-        return rows
+def _ipc_close(handle: bytes) -> None:
+    ent = _OPEN[handle]
+    ent[1] -= 1
+    if ent[1] == 0:
+        del _OPEN[handle]
+        _Ipc.close_mem_handle(ent[0])
 
-    def num(r, k, default=0):
-        v = (r.get(k) or "").strip()
-        return int(float(v)) if v and v.lower() != "nan" else default
 
-    def key(v):
-        try:
-            return str(int(float(v)))
-        except ValueError:
-            return v
-
-    with open(path) as f:
-        for r in csv.DictReader(f):
-            cfg = LaunchCfg(
-                mt=num(r, "block_m") // 16,
-                dyn=num(r, "dyn") == 1,
-                route_fp8=num(r, "route_fp8") == 1,
-                ll=num(r, "ll") == 1,
-                llr=num(r, "llr") == 1,
-                nsk=num(r, "nsk", 4),
-                npp=num(r, "npp", 1),
-                xb=num(r, "xb"),
-            )
-            rows.setdefault(tuple(key(r[k]) for k in CSV_KEY), []).append(
-                (num(r, "token"), cfg)
-            )
-    for v in rows.values():
-        v.sort(key=lambda t: t[0])
-    return rows
+@contextlib.contextmanager
+def _no_expandable_segments():
+    # hipIpcGetMemHandle cannot export expandable-segment (VMM) memory
+    conf = os.environ.get("PYTORCH_HIP_ALLOC_CONF") or os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF", ""
+    )
+    on = "expandable_segments:true" in conf.replace(" ", "").lower()
+    if on:
+        torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+    try:
+        yield
+    finally:
+        if on:
+            torch.cuda.memory._set_allocator_settings("expandable_segments:True")
 
 
 @dataclass
-class _Sched:
-    units: torch.Tensor
-    recs: torch.Tensor
-    npieces: int = 0
-    piece_e0: int = 0
-    xsplit: int = 0
-    xrem: int = 0
-    xw: int = 0
-    col0: int = 0
-    ncol: int = 0
-    xl_e0: int = 0
-    xl_s0: int = 0
+class _Slice:
+    offset: int
+    nbytes: int
+    shape: tuple
+    dtype: torch.dtype
+    local: torch.Tensor | None = None
 
 
-def _kind(k, j, groups=0):
-    return k | (groups << 8) | (j << XQ_SHIFT)
+class SymmetricArena:
+    """A same-layout device arena (torch caching-allocator memory) on every rank of
+    ``group``, mapped into all peers with hipIpc. The exported handle covers the
+    allocator segment holding the arena (peers address it by its offset in it).
+    Destruction is not collective: synchronize every rank before dropping an instance.
+    In containers on the host network ROCm 7.1 needs HSA_ENABLE_IPC_MODE_LEGACY=1."""
+
+    def __init__(self, *, group=None, device: torch.device | None = None):
+        self.group = group
+        self.device = device or torch.device("cuda", torch.cuda.current_device())
+        self.rank = dist.get_rank(group=group)
+        self.world_size = dist.get_world_size(group=group)
+        self._slices: dict[str, _Slice] = {}
+        self._cursor = 0
+        self._storage: torch.Tensor | None = None
+        self._base_ptrs: tuple[int, ...] = ()
+        self._opened: list[bytes] = []
+
+    def reserve(self, name: str, shape, dtype: torch.dtype) -> _Slice:
+        """Carve out a named region. Must run in the same order on every rank."""
+        if self._storage is not None or name in self._slices:
+            raise RuntimeError(f"cannot reserve {name!r}")
+        shape = tuple(int(s) for s in shape)
+        offset = ceildiv(self._cursor, _ALIGN) * _ALIGN
+        nbytes = torch.Size(shape).numel() * torch.empty((), dtype=dtype).element_size()
+        self._cursor = offset + nbytes
+        self._slices[name] = _Slice(offset, nbytes, shape, dtype)
+        return self._slices[name]
+
+    def commit(self) -> SymmetricArena:
+        """Collective: allocate and map every rank's arena (raises on every rank if any
+        rank fails)."""
+        total = ceildiv(self._cursor, _ALIGN) * _ALIGN
+        with _no_expandable_segments():
+            self._storage = torch.zeros(total, dtype=torch.uint8, device=self.device)
+        base_ptr = int(self._storage.data_ptr())
+        for s in self._slices.values():
+            s.local = self._storage[s.offset : s.offset + s.nbytes].view(s.dtype)
+            s.local = s.local.view(s.shape)
+        try:
+            with torch.cuda.device(self.device):
+                handle = _Ipc.get_mem_handle_bytes(base_ptr)
+                payload = (handle, base_ptr - _allocation_base(base_ptr), total)
+            err = ""
+        except RuntimeError as exc:
+            payload, err = None, str(exc)
+        torch.cuda.synchronize(self.device)
+        gathered: list = [None] * self.world_size
+        dist.all_gather_object(gathered, (payload, err), group=self.group)
+        bad = {r: e for r, (_, e) in enumerate(gathered) if e}
+        if not bad and any(p[2] != total for p, _ in gathered):
+            bad = {r: f"{p[2]} B, not {total} B" for r, (p, _) in enumerate(gathered)}
+        ptrs, err = [], ""
+        if not bad:
+            try:
+                with torch.cuda.device(self.device):
+                    for r, ((handle, off, _), _) in enumerate(gathered):
+                        if r == self.rank:
+                            ptrs.append(base_ptr)
+                        else:
+                            ptrs.append(_ipc_open(handle) + off)
+                            self._opened.append(handle)
+            except RuntimeError as exc:
+                err = str(exc)
+            opened: list = [None] * self.world_size
+            dist.all_gather_object(opened, err, group=self.group)
+            bad = {r: e for r, e in enumerate(opened) if e}
+        if bad:
+            self.close()
+            raise RuntimeError(f"SymmetricArena: mapping failed on ranks {bad}")
+        self._base_ptrs = tuple(ptrs)
+        dist.barrier(group=self.group)
+        return self
+
+    def close(self) -> None:
+        """Unmap the peers' arenas (no kernel may use them any more)."""
+        if self._opened:
+            torch.cuda.synchronize(self.device)
+            for handle in self._opened:
+                _ipc_close(handle)
+            self._opened = []
+            self._base_ptrs = ()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001, S110 (interpreter teardown)
+            pass
+
+    def barrier(self) -> None:
+        """Collective; also waits for this device, so a barrier implemented as a GPU
+        kernel (NCCL) never runs next to the next (persistent) launch."""
+        dist.barrier(group=self.group)
+        torch.cuda.synchronize(self.device)
+
+    @property
+    def storage(self) -> torch.Tensor:
+        return self._storage
+
+    @property
+    def base_ptrs(self) -> tuple[int, ...]:
+        return self._base_ptrs
 
 
 class MegaMoeTPLDSError(ValueError):
@@ -199,7 +279,7 @@ class MegaMoeTPEngine:
         comm_mode: str = "ag_rs",
         comm_dtype: str = "fp8",
         ar_gather: str = "auto",
-        schedule: str = "tuned",
+        schedule: str = "dynamic",
         act_dtype: str = "fp4",
         lb: dict | None = None,
         tail_eps: float = 1e-6,
@@ -226,18 +306,16 @@ class MegaMoeTPEngine:
             )
         self.mode = comm_mode
         self.check = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
-        if schedule not in ("tuned", "dynamic"):
-            raise ValueError(f"unknown schedule {schedule!r}")
-        self.schedule = schedule
-        self.chunk = schedule == "dynamic"
+        if schedule != "dynamic":
+            raise ValueError(f'unknown schedule {schedule!r} (only "dynamic")')
         if act_dtype not in ("fp4", "fp8"):
             raise ValueError(f"unknown act_dtype {act_dtype!r}")
         self.a8 = act_dtype == "fp8"
-        if self.a8 and schedule != "dynamic":
-            raise ValueError('act_dtype="fp8" needs schedule="dynamic"')
         lb = lb or {}
-        lb_min = int(_lb_param(lb.get("min"), "AITER_MEGAMOE_TP_LB_MIN", "0"))
-        self.lb_min = lb_min if schedule == "dynamic" and not self.a8 else 0
+        # above DYN_MAX tokens always the LB schedule (fp8 activations: never)
+        lb_min = int(_lb_param(lb.get("min"), "AITER_MEGAMOE_TP_LB_MIN", "256"))
+        lb_min = lb_min if 0 < lb_min <= DYN_MAX else DYN_MAX + 1
+        self.lb_min = 0 if self.a8 else lb_min
         self.lb_mt, self.lb_mt_table = _mt_table(
             _lb_param(lb.get("mt"), "AITER_MEGAMOE_TP_LB_MT", "3")
         )
@@ -254,9 +332,7 @@ class MegaMoeTPEngine:
         step = gemm2_group_step(model_dim, inter_dim)
         valid = [d for d in range(1, nck + 1) if nck % d == 0 and d * gpc % step == 0]
         self.lb_q = max((d for d in valid if d <= lb_q), default=min(valid))
-        self.ar = comm_mode in ("ar", "ar_ar")
-        self.xrep = comm_mode in ("ar", "rs")
-        self.rrep = self.ar or self.xrep
+        self.ar = comm_mode == "ar"
         self.rank, self.tp = int(rank), int(world_size)
         self.H, self.I, self.E, self.K = model_dim, inter_dim, experts, topk
         self.mmax = int(max_local_tokens)
@@ -280,12 +356,9 @@ class MegaMoeTPEngine:
             raise ValueError(f"fused TP MegaMoE needs gfx950, not {self.gfx}")
         self.agr = max(1, ceildiv(self.mmax, self.n_cta))
         self._check_limits()
-        static = not (
-            self.schedule == "dynamic" and self.lb_min and self.lb_min <= DYN_MAX + 1
-        )
-        if static and self._lds(1, False) > LDS_LIMIT:
+        if not self._fits(self.mmax):
             ok = self.mmax
-            while ok > 1 and self._lds(1, False, mmax=ok) > LDS_LIMIT:
+            while ok > 1 and not self._fits(ok):
                 ok -= max(1, ok // 64)
             raise MegaMoeTPLDSError(
                 f"max_local_tokens={self.mmax} does not fit in LDS for h{model_dim} "
@@ -303,11 +376,6 @@ class MegaMoeTPEngine:
             "recv", (self.tp, tot if self.ar else self.mmax, H), torch.bfloat16
         )
         self._flag = arena.reserve("flag", (FLAG_INTS,), torch.int32)
-        self._pre = arena.reserve(
-            "pre",
-            (self.tp, self.mmax, H) if self.ar and not self.xrep else (1,),
-            torch.bfloat16,
-        )
         self._yall = arena.reserve(
             "yall", (tot, H) if self.ar else (1,), torch.bfloat16
         )
@@ -329,16 +397,9 @@ class MegaMoeTPEngine:
             (tot if self.ar else self.mmax, H), dtype=torch.bfloat16, device=self.device
         )
 
-        self._scheds: dict = {}
-        self.sched = self._sched(0)
         self.dyn_max = min(tot, DYN_MAX)
-        extra = (
-            max(
-                max(self.sched.npieces - 1, 0) * tot,
-                (inter_dim // 128 - 1) * self.dyn_max,
-            )
-            * topk
-        )
+        # partial rows of the GEMM2 pieces past the first (dynamic schedule)
+        extra = (inter_dim // 128 - 1) * self.dyn_max * topk
         if extra * H * 2 >= 1 << 31:
             raise ValueError("split-expert partial rows exceed 32-bit buffer offsets")
         self.proutes = torch.zeros(
@@ -349,22 +410,6 @@ class MegaMoeTPEngine:
             dtype=torch.uint8,
             device=self.device,
         )
-        key = (
-            self.gfx,
-            self.n_cta,
-            self.tp,
-            comm_mode,
-            H,
-            inter_dim,
-            experts,
-            topk,
-            activation,
-        )
-        rows = _tuned_rows(os.path.abspath(tuned_config_path()))
-        self._tuned = rows.get(tuple(str(k) for k in key), [])
-        if not self._tuned and comm_mode in _TUNED_LIKE:
-            key = key[:3] + (_TUNED_LIKE[comm_mode],) + key[4:]
-            self._tuned = rows.get(tuple(str(k) for k in key), [])
         self._cfgs: dict = {}
         self._launchers: dict = {}
         self._armed: set = set()
@@ -376,13 +421,13 @@ class MegaMoeTPEngine:
         bad = []
         if self.agr > (4 if self.a8 else 8):
             bad.append(f"max_local_tokens <= {(4 if self.a8 else 8) * self.n_cta}")
-        if not self.rrep and ceildiv(self.mmax * K, 256) > min(NMETA_CAP, self.n_cta):
+        if not self.ar and ceildiv(self.mmax * K, 256) > min(NMETA_CAP, self.n_cta):
             bad.append(f"max_local_tokens * topk <= {256 * min(NMETA_CAP, self.n_cta)}")
         if self.lb_min and self.lb_min <= tot and self.I // 128 >= 2:
             mts = [self.lb_mt, *(n for _, n in self.lb_mt_table)]
             if self.lb_small_max >= self.lb_min:
                 mts.append(self.lb_mt_small)
-            mt = min(self._fit_mt(t, True, lb=True) for t in mts)
+            mt = min(self._fit_mt(t, lb=True) for t in mts)
             if self.E + ceildiv(tot * K, 16 * mt) + 1 > NCHLB_MAX:
                 bad.append(f"LB row chunks <= {NCHLB_MAX} (larger LB row tiles)")
         for what, n in (
@@ -418,192 +463,14 @@ class MegaMoeTPEngine:
         self._bind_weights(w1, w1_scale, w2, w2_scale)
         self._args = (None, None)
 
-    def _pieces(self, rem: int) -> int:
-        nb = self.I // 128
-        for p in [1] + ([2] if nb % 2 == 0 and nb > 2 else []):
-            if rem * p >= self.n_cta:
-                return p
-        return nb
-
-    def _sched(self, xb: int) -> _Sched:
-        sc = self._scheds.get(xb)
-        if sc is None:
-            sc = self._scheds[xb] = self._schedule(xb)
-        return sc
-
-    def _schedule(self, xb: int = 0) -> _Sched:
-        E, C, I = self.E, self.n_cta, self.I
-        full, rem = divmod(E, C)
-        per = [[(c * full + k, 0, I, 0) for k in range(full)] for c in range(C)]
-        e = full * C
-        sc = {"piece_e0": e}
-        cols = []
-        if rem:
-            p = self._pieces(rem)
-            nslice = I // 128
-            xok = rem <= XQ_MAX and nslice <= XQ_P
-            extra = 2 * rem - C
-            pairs = (
-                xok
-                and full == 0
-                and nslice % 2 == 0
-                and 0 < extra < C
-                and extra % 2 == 0
-                and (extra // 2) * nslice % 2 == 0
-            )
-            if pairs:
-                cols = self._schedule_pairs(per, rem, nslice, sc, xb)
-            elif xok and rem * p >= C and (rem * p) % C:
-                cols = self._schedule_balanced(per, e, rem, nslice)
-                sc.update(xsplit=nslice, xrem=rem)
-            elif xok and rem * p < C:
-                cols = self._schedule_few(per, e, rem, nslice, sc)
-            else:
-                width = I // p
-                pieces = [
-                    (e + j, k * width, width, 0) for j in range(rem) for k in range(p)
-                ]
-                for idx, piece in enumerate(pieces):
-                    per[(C - 1 - idx) % C].insert(0, piece)
-                sc["npieces"] = p
-        if cols:
-            sc["xw"] = math.lcm(
-                gemm2_group_step(self.H, I), gemm2_chunk_groups(self.H, I)
-            )
-        units, recs = [], []
-        for lst in per:
-            recs.append(
-                [len(units), len(units) + len(lst)]
-                + list(lst[0] if lst else (0, 0, 0, 0))
-            )
-            recs[-1] += [0] * (UNIT_REC - len(recs[-1]))
-            units += [list(u) for u in lst]
-        sc.update(col0=len(units), ncol=len(cols))
-        units += [list(u) for u in cols]
-        dev = self.device
-        return _Sched(
-            torch.tensor(units or [[0, 0, 0, 0]], dtype=torch.int32, device=dev),
-            torch.tensor(recs, dtype=torch.int32, device=dev),
-            **sc,
-        )
-
-    def _schedule_pairs(self, per, E, nslice, sc, xb=0):
-        C, I, H = len(per), self.I, self.H
-        g2 = H // 256
-        step = math.lcm(gemm2_group_step(H, I), gemm2_chunk_groups(H, I))
-        nx = (2 * E - C) // 2
-        nh = nx * nslice
-        hosts = range(C - nh, C)
-        half = nslice // 2
-        for c in range(C):
-            j, h = divmod(c, 2)
-            per[c] = [(j, h * half * 128, half * 128, _kind(UNIT_G1X, j))]
-            if c not in hosts:
-                lo = 0 if h == 0 else g2 // 2 + xb
-                hi = g2 // 2 + xb if h == 0 else g2
-                per[c].append((j, lo, 0, _kind(UNIT_G2COL, j, hi - lo)))
-        for idx, c in enumerate(hosts):
-            j, k = divmod(idx, nslice)
-            per[c].append((E - nx + j, k * 128, 128, _kind(UNIT_G1X, E - nx + j)))
-        for c in range(C):
-            per[c][0] = per[c][0][:3] + (per[c][0][3] | UNIT_SIGNAL,)
-        cols = []
-        late0 = (C - nh) // 2
-        for g in range(0, g2, step):
-            for c in hosts:
-                j, h = divmod(c, 2)
-                if h * (g2 // 2) <= g < (h + 1) * (g2 // 2):
-                    cols.append((j, g, 0, _kind(UNIT_G2COL, j, step)))
-            for j in range(E - nx, E):
-                cols.append((j, g, 0, _kind(UNIT_G2COL, j, step)))
-        sc.update(xsplit=nslice, xrem=E, xl_e0=late0, xl_s0=late0, piece_e0=late0)
-        return cols
-
-    def _schedule_few(self, per, e, rem, nslice, sc):
-        C, I = len(per), self.I
-        step = math.lcm(gemm2_group_step(self.H, I), gemm2_chunk_groups(self.H, I))
-        hosts = sorted({(C - 1 - idx) % C for idx in range(rem * nslice)})
-        slot = {e + j: j for j in range(rem)}
-        for c in hosts:
-            slot[per[c][0][0]] = len(slot)
-        sc.update(xsplit=nslice, xrem=len(slot))
-        if sorted(slot) == list(range(min(slot), self.E)):
-            sc["xl_e0"] = min(slot)
-        for c in hosts:
-            e0 = per[c][0][0]
-            per[c] = [(e0, 0, I, _kind(UNIT_G1X, slot[e0]))]
-        for idx in range(rem * nslice):
-            j, k = divmod(idx, nslice)
-            per[(C - 1 - idx) % C].append(
-                (e + j, k * 128, 128, _kind(UNIT_G1X, slot[e + j]))
-            )
-        for c in range(C):
-            k = next((k for k in range(len(per[c])) if per[c][k][3] == 0), 0)
-            per[c][k] = per[c][k][:3] + (per[c][k][3] | UNIT_SIGNAL,)
-        return [
-            (ex, g, 0, _kind(UNIT_G2COL, j, step))
-            for g in range(0, self.H // 256, step)
-            for ex, j in slot.items()
-        ]
-
-    def _schedule_balanced(self, per, e, rem, nslice):
-        H, I, C = self.H, self.I, len(per)
-        g2 = H // 256
-        unit = math.lcm(gemm2_group_step(H, I), gemm2_chunk_groups(H, I))
-        full, g1x, grp, over = (
-            3 * I * H // 2,
-            128 * H + 32 * 1024,
-            256 * I // 2,
-            64 * 1024,
-        )
-        load = [full * len(lst) for lst in per]
-        for idx in range(rem * nslice):
-            j, k = divmod(idx, nslice)
-            c = (C - 1 - idx) % C
-            per[c].insert(0, (e + j, k * 128, 128, _kind(UNIT_G1X, j)))
-            load[c] += g1x
-        nu = g2 // unit
-        n = max(1, min(nu, round(4 * C / rem)))
-        dyn_rounds = max(1, n // 3)
-        cuts = [unit * (nu * t // n) for t in range(n + 1)]
-        heap = [(load[c], c) for c in range(C)]
-        heapq.heapify(heap)
-        for t in range(n - dyn_rounds):
-            g0, g1 = cuts[t], cuts[t + 1]
-            for j in range(rem):
-                lc, c = heapq.heappop(heap)
-                per[c].append((e + j, g0, 0, _kind(UNIT_G2COL, j, g1 - g0)))
-                heapq.heappush(heap, (lc + (g1 - g0) * grp + over, c))
-        for c in range(C):
-            full_k = [k for k in range(len(per[c])) if per[c][k][3] == 0]
-            k = max(full_k) if full_k else 0
-            per[c][k] = per[c][k][:3] + (per[c][k][3] | UNIT_SIGNAL,)
-        return [
-            (e + j, cuts[t], 0, _kind(UNIT_G2COL, j, cuts[t + 1] - cuts[t]))
-            for t in range(n - dyn_rounds, n)
-            for j in range(rem)
-        ]
-
-    def _chunks(
-        self, mt: int, dyn: bool, mmax: int = 0, lb: bool = False
-    ) -> tuple[int, int]:
-        if not (dyn and (self.chunk or lb)):
-            return 0, 0
+    def _chunks(self, mt: int, mmax: int = 0, lb: bool = False) -> tuple[int, int]:
         rch = 16 * mt
         tot = (mmax or self.mmax) * self.tp
         if not lb:
             tot = min(tot, DYN_MAX)
         return rch, self.E + ceildiv(tot * self.K, rch) + 1
 
-    def _consts(
-        self,
-        mt: int,
-        dyn: bool,
-        nab: int = 4,
-        nsk: int = 4,
-        mmax: int = 0,
-        lb: bool = False,
-    ) -> dict:
+    def _consts(self, mt: int, nab: int = 4, mmax: int = 0, lb: bool = False) -> dict:
         mmax = mmax or self.mmax
         return mega_moe_tp_consts(
             self.H,
@@ -611,124 +478,76 @@ class MegaMoeTPEngine:
             mt,
             mmax * self.tp,
             max(1, ceildiv(mmax, self.n_cta)),
-            self.E if dyn else 0,
+            self.E,
             nab,
-            nsk,
-            self._chunks(mt, dyn, mmax, lb)[1],
+            self._chunks(mt, mmax, lb)[1],
             self.a8,
             lb,
         )
 
-    def _nab(
-        self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0, lb: bool = False
-    ) -> int:
-        lds = self._consts(mt, dyn, 4, nsk, mmax, lb)["LDS_BYTES"]
+    def _nab(self, mt: int, mmax: int = 0, lb: bool = False) -> int:
         if lb:
             return 3
-        return 4 if lds <= LDS_LIMIT else 3
+        return 4 if self._consts(mt, 4, mmax)["LDS_BYTES"] <= LDS_LIMIT else 3
 
-    def _lds(
-        self, mt: int, dyn: bool, nsk: int = 4, mmax: int = 0, lb: bool = False
-    ) -> int:
-        nab = self._nab(mt, dyn, nsk, mmax, lb)
-        return self._consts(mt, dyn, nab, nsk, mmax, lb)["LDS_BYTES"]
+    def _lds(self, mt: int, mmax: int = 0, lb: bool = False) -> int:
+        nab = self._nab(mt, mmax, lb)
+        return self._consts(mt, nab, mmax, lb)["LDS_BYTES"]
 
-    def _fit_mt(self, mt: int, dyn: bool, nsk: int = 4, lb: bool = False) -> int:
+    def _fits(self, mmax: int) -> bool:
+        # the smallest row tile of each schedule these batches can take fits in LDS
+        lb = bool(self.lb_min) and mmax * self.tp >= self.lb_min
+        return self._lds(1, mmax) <= LDS_LIMIT and (
+            not lb or self._lds(1, mmax, lb=True) <= LDS_LIMIT
+        )
+
+    def _fit_mt(self, mt: int, lb: bool = False) -> int:
         mt = max(1, min(6, int(mt)))
-        while mt > 1 and self._lds(mt, dyn, nsk, lb=lb) > LDS_LIMIT:
+        while mt > 1 and self._lds(mt, lb=lb) > LDS_LIMIT:
             mt -= 1
         return mt
 
-    def _fit_npp(self, npp: int, nsk: int) -> int:
-        ok = npp >= 1 and nsk % (2 * npp) == 0 and (self.H // 128 * npp) % nsk == 0
+    def _fit_npp(self, npp: int) -> int:
+        ok = npp >= 1 and 4 % (2 * npp) == 0 and (self.H // 128 * npp) % 4 == 0
         return npp if ok else 1
-
-    def _fit_nsk(self, mt: int, dyn: bool, nsk: int) -> int:
-        nsk = nsk if nsk in (4, 6, 8) and (self.H // 128) % nsk == 0 else 4
-        while nsk > 4 and self._lds(mt, dyn, nsk) > LDS_LIMIT:
-            nsk -= 2
-        return nsk
-
-    def default_config(self, m: int) -> LaunchCfg:
-        tot = m * self.tp
-        dyn = tot <= self.dyn_max and self.I // 128 >= 2 and tot * self.K <= 2 * self.E
-        rpe = ceildiv(tot * self.K, self.E)
-        return LaunchCfg(
-            mt=self._fit_mt(ceildiv(rpe, 16), dyn),
-            dyn=dyn,
-            route_fp8=not dyn,
-            ll=tot <= 256,
-            llr=tot <= 128,
-        )
 
     def config(self, m: int) -> LaunchCfg:
         cfg = self._cfgs.get(m)
         if cfg is None:
             tot = m * self.tp
-            lb = bool(self.lb_min) and tot >= self.lb_min and self.I // 128 >= 2
+            lb = bool(self.lb_min) and tot >= self.lb_min
+            fp8 = not self.comm_bf16
             if lb:
                 mt = next((n for t, n in self.lb_mt_table if tot <= t), self.lb_mt)
+                small = tot <= self.lb_small_max
+                lp = 0 if tot <= LB_PF_MAX else 3
                 cfg = LaunchCfg(
-                    mt=self.lb_mt_small if tot <= self.lb_small_max else mt,
-                    dyn=True,
-                    route_fp8=False,
-                    npp=2 if tot <= self.lb_small_max else self.lb_npp,
+                    self._fit_mt(self.lb_mt_small if small else mt, lb=True),
+                    npp=self._fit_npp(2 if small else self.lb_npp),
+                    ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                     lb=True,
                     pf=tot <= LB_PF_MAX,
-                    lp=0 if tot <= LB_PF_MAX else 3,
+                    lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
                 )
-            elif self.schedule == "dynamic" and tot <= self.dyn_max:
+            elif tot <= self.dyn_max:
                 cfg = LaunchCfg(
-                    mt=1 if tot <= 32 else 2 if tot <= 64 else 3,
-                    dyn=True,
-                    route_fp8=False,
-                    ll=tot <= 256,
-                    llr=tot <= 128,
+                    self._fit_mt(1 if tot <= 32 else 2 if tot <= 64 else 3),
+                    ll=tot <= 256 and fp8,
+                    llr=tot <= 128 and fp8,
+                    ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                 )
-            elif self._tuned:
-                cfg = next((c for t, c in self._tuned if t >= tot), self._tuned[-1][1])
             else:
-                cfg = self.default_config(m)
-            dyn = cfg.dyn and (lb or tot <= self.dyn_max) and self.I // 128 >= 2
-            dyn = dyn and self._lds(1, True, lb=lb) <= LDS_LIMIT
-            lb = lb and dyn
-            if self.a8 and not dyn:
                 raise ValueError(
                     f'act_dtype="fp8": {tot} tokens are beyond the dynamic schedule'
                 )
-            mt = self._fit_mt(cfg.mt, dyn, lb=lb)
-            nsk = 4 if lb else self._fit_nsk(mt, dyn, cfg.nsk)
-            fp8 = not self.comm_bf16
-            cfg = LaunchCfg(
-                mt,
-                dyn,
-                cfg.route_fp8 and fp8,
-                cfg.ll and fp8,
-                cfg.ll and cfg.llr and fp8,
-                nsk,
-                self._fit_npp(cfg.npp, nsk),
-                cfg.xb if cfg.xb % 2 == 0 and 0 <= cfg.xb < self.H // 512 else 0,
-                self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
-                lb,
-                0,
-                lb and cfg.pf,
-                cfg.lp if lb and self.I // 128 % max(cfg.lp, 1) == 0 else 0,
-            )
             self._cfgs[m] = cfg
         return cfg
 
-    def _cfg_sched(self, cfg: LaunchCfg) -> _Sched:
-        return self._sched(0 if cfg.dyn else cfg.xb)
-
     def _arll(self, cfg: LaunchCfg) -> bool:
-        sc = self._cfg_sched(cfg)
-        return self.ar and cfg.ll and cfg.llr and (cfg.dyn or sc.npieces <= 1)
+        return self.ar and cfg.ll and cfg.llr
 
     def _ag8(self, cfg: LaunchCfg) -> bool:
         return self.ar and (self.ag_fp8 or cfg.ag8) and not self._arll(cfg)
-
-    def _xl(self, cfg: LaunchCfg) -> bool:
-        return not cfg.dyn and not cfg.ll and self._cfg_sched(cfg).xl_e0 > 0
 
     def _key(self, cfg: LaunchCfg):
         return (cfg, self.tn_eps, self.tn_gemma) if cfg.tn else cfg
@@ -736,17 +555,7 @@ class MegaMoeTPEngine:
     def _launcher(self, cfg: LaunchCfg):
         fn = self._launchers.get(self._key(cfg))
         if fn is None:
-            sc = self._cfg_sched(cfg)
-            static = (
-                {}
-                if cfg.dyn
-                else {
-                    "npieces": sc.npieces,
-                    "xsplit": sc.xsplit,
-                    "xrem": sc.xrem,
-                    "xw": sc.xw,
-                }
-            )
+            rch, nch = self._chunks(cfg.mt, lb=cfg.lb)
             fn = compile_mega_moe_tp(
                 H=self.H,
                 I=self.I,
@@ -758,26 +567,18 @@ class MegaMoeTPEngine:
                 situ_beta=self.situ[0],
                 situ_linear_beta=self.situ[1],
                 swiglu_limit=self.swiglu_limit,
-                route_fp8=cfg.route_fp8
-                or (cfg.ll and cfg.llr and (cfg.dyn or sc.npieces <= 1)),
+                route_fp8=cfg.ll and cfg.llr,
                 agr=self.agr,
                 tp=self.tp,
                 ar=self.ar,
-                dyn_e=self.E if cfg.dyn else 0,
-                nab=self._nab(cfg.mt, cfg.dyn, cfg.nsk, lb=cfg.lb),
-                nsk=cfg.nsk,
+                nab=self._nab(cfg.mt, lb=cfg.lb),
                 npp=cfg.npp,
                 ll_rs=cfg.ll,
                 ll_route=cfg.ll and cfg.llr,
-                xl=self._xl(cfg),
-                xl_s0=sc.xl_s0 if self._xl(cfg) else 0,
                 comm_bf16=self.comm_bf16,
-                xrep=self.xrep,
                 ag8=self._ag8(cfg),
-                dx=cfg.dyn and cfg.ll and cfg.llr and not self.a8,
-                rch=self._chunks(cfg.mt, cfg.dyn, lb=cfg.lb)[0],
-                nch=self._chunks(cfg.mt, cfg.dyn, lb=cfg.lb)[1],
-                vb=self.schedule != "dynamic",
+                rch=rch,
+                nch=nch,
                 a8=self.a8,
                 lb=cfg.lb,
                 lbq=self.lb_q if cfg.lb else 1,
@@ -786,7 +587,6 @@ class MegaMoeTPEngine:
                 tn_gemma=self.tn_gemma,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
-                **static,
             )
             self._launchers[self._key(cfg)] = fn
         return fn
@@ -815,7 +615,7 @@ class MegaMoeTPEngine:
         if not topk_weights.is_floating_point():
             raise ValueError(f"topk_weights: need float32, got {topk_weights.dtype}")
         m = rows
-        if self.rrep:
+        if self.ar:
             if m % self.tp:
                 raise ValueError(
                     f"{self.mode}: {m} tokens are not a multiple of tp={self.tp}"
@@ -832,7 +632,7 @@ class MegaMoeTPEngine:
         return m
 
     def _check_replicas(self, m, x, topk_weights, topk_ids) -> None:
-        if self.rrep:
+        if self.ar:
             fp = [
                 float(t.double().sum())
                 for t in (x, topk_weights, topk_ids, (x.float() * x.float()).sum(1))
@@ -846,7 +646,7 @@ class MegaMoeTPEngine:
                 f"{self.mode}: local token counts differ across ranks: "
                 f"{[g[0] for g in got]}"
             )
-        if self.rrep and any(g[1] != fp for g in got):
+        if self.ar and any(g[1] != fp for g in got):
             raise ValueError(
                 f"{self.mode}: x / topk_ids / topk_weights must be the same on every "
                 "rank (replicated input)"
@@ -882,7 +682,7 @@ class MegaMoeTPEngine:
         raise RuntimeError(f"MegaMoeTP.prepare: warmup launches timed out ({errs})")
 
     def _warmup(self, m: int, tn: int = 0) -> None:
-        rows = m * self.tp if self.rrep else m
+        rows = m * self.tp if self.ar else m
         dev = self.device
         x = torch.zeros((rows, self.H), dtype=torch.bfloat16, device=dev)
         ids = torch.arange(rows * self.K, dtype=torch.int32, device=dev) % self.E
@@ -918,7 +718,6 @@ class MegaMoeTPEngine:
         self._armed.add(self._key(cfg))
 
     def _launch_args(self, m, cfg, y, x, ids, tw, tail=None):
-        sc = self._cfg_sched(cfg)
         peers = [int(b) for b in self.arena.base_ptrs] + [0] * (MAX_TP - self.tp)
 
         def ptr(t):
@@ -936,8 +735,6 @@ class MegaMoeTPEngine:
             self.routes.data_ptr(),
             self.proutes.data_ptr(),
             self.ctrl.data_ptr(),
-            sc.units.data_ptr(),
-            sc.recs.data_ptr(),
             *peers,
             self._x.offset,
             self._xs.offset,
@@ -945,16 +742,12 @@ class MegaMoeTPEngine:
             self._w.offset,
             self._recv.offset,
             self._flag.offset,
-            self._pre.offset,
             self._yall.offset,
             self.rank,
             self.tp,
             m,
             self.mmax,
-            sc.xl_e0 if self._xl(cfg) else (0 if cfg.dyn else sc.piece_e0),
             self.xg.data_ptr(),
-            0 if cfg.dyn else sc.col0,
-            0 if cfg.dyn else sc.ncol,
             *(ptr(t) for t in (tail or (None, None, None))),
             self._qall.offset,
             self._sall.offset,
