@@ -414,12 +414,12 @@ test_mxscale_bmm_batch_first.__test__ = False
 
 
 # --- tileN column-map regression guard ------------------------------------
-# kid312/313 are COM_REP_N>1 kernels that previously transposed output column
+# kid8312/8313 are COM_REP_N>1 kernels that previously transposed output column
 # groups. Keep them out of the narrow perf table, but always exercise both
 # output layouts with signed, varied-block-scale data so the bug cannot
 # silently return.
 #
-# kid388/389/390 are here for the adjacent reason: they reach the T_M=1 / T_N=2
+# kid8388/8389/8390 are here for the adjacent reason: they reach the T_M=1 / T_N=2
 # grid because they asked for it (TILE_N_) rather than because B_M == 16 left
 # them no choice, so they are the first to run that column map with an M axis
 # spanning more than one tile. The shape is deliberately not tile-aligned (100
@@ -428,8 +428,8 @@ test_mxscale_bmm_batch_first.__test__ = False
 # alone; the shuffled layout has its own guards.
 _TILEN_REGRESSION_CASES = (
     # (G, M, N, K),        kids sharing that shape
-    ((2, 16, 128, 1024), (312, 313)),
-    ((2, 100, 128, 1024), (388, 389, 390)),
+    ((2, 16, 128, 1024), (8312, 8313)),
+    ((2, 100, 128, 1024), (8388, 8389, 8390)),
 )
 _TILEN_REGRESSION_ERR_TOL = 0.003
 
@@ -445,9 +445,9 @@ def check_tilen_column_map():
         O_in = O_mx.transpose(0, 1)
         xs_in = xs_mx.transpose(0, 1)
         ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
-        # Must go through the picker: kid388/389/390 are bpreshuffle kids, and a
+        # Must go through the picker: kid8388/8389/8390 are bpreshuffle kids, and a
         # preshuffled kid handed the row-major buffer does not raise, it just
-        # returns a wrong answer. kid312/313 predate this and are row-major, so
+        # returns a wrong answer. kid8312/8313 predate this and are row-major, so
         # the guard used to pass W_mx directly and was correct only by accident.
         weight_for = _weight_picker(W_mx)
 
