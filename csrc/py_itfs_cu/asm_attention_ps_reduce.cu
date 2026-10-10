@@ -4,7 +4,7 @@
 #include <cstddef>
 #include <limits>
 
-struct __attribute__((packed)) PaPsReduceArgs
+struct __attribute__((packed)) AttentionPsReduceArgs
 {
     void* output;
     p2 padding0;
@@ -34,34 +34,34 @@ struct __attribute__((packed)) PaPsReduceArgs
     p3 padding12;
 };
 
-static_assert(sizeof(PaPsReduceArgs) == 208);
-static_assert(offsetof(PaPsReduceArgs, partial_output) == 0x10);
-static_assert(offsetof(PaPsReduceArgs, partial_lse) == 0x20);
-static_assert(offsetof(PaPsReduceArgs, reduce_indptr) == 0x30);
-static_assert(offsetof(PaPsReduceArgs, reduce_final_map) == 0x40);
-static_assert(offsetof(PaPsReduceArgs, reduce_partial_map) == 0x50);
-static_assert(offsetof(PaPsReduceArgs, final_lse) == 0x60);
-static_assert(offsetof(PaPsReduceArgs, num_heads) == 0x70);
-static_assert(offsetof(PaPsReduceArgs, num_tiles) == 0x80);
-static_assert(offsetof(PaPsReduceArgs, output_query_stride_bytes) == 0x90);
-static_assert(offsetof(PaPsReduceArgs, output_head_stride_bytes) == 0xA0);
-static_assert(offsetof(PaPsReduceArgs, tile_stride) == 0xB0);
-static_assert(offsetof(PaPsReduceArgs, query_stride) == 0xC0);
+static_assert(sizeof(AttentionPsReduceArgs) == 208);
+static_assert(offsetof(AttentionPsReduceArgs, partial_output) == 0x10);
+static_assert(offsetof(AttentionPsReduceArgs, partial_lse) == 0x20);
+static_assert(offsetof(AttentionPsReduceArgs, reduce_indptr) == 0x30);
+static_assert(offsetof(AttentionPsReduceArgs, reduce_final_map) == 0x40);
+static_assert(offsetof(AttentionPsReduceArgs, reduce_partial_map) == 0x50);
+static_assert(offsetof(AttentionPsReduceArgs, final_lse) == 0x60);
+static_assert(offsetof(AttentionPsReduceArgs, num_heads) == 0x70);
+static_assert(offsetof(AttentionPsReduceArgs, num_tiles) == 0x80);
+static_assert(offsetof(AttentionPsReduceArgs, output_query_stride_bytes) == 0x90);
+static_assert(offsetof(AttentionPsReduceArgs, output_head_stride_bytes) == 0xA0);
+static_assert(offsetof(AttentionPsReduceArgs, tile_stride) == 0xB0);
+static_assert(offsetof(AttentionPsReduceArgs, query_stride) == 0xC0);
 
 AITER_C_ITFS
-void pa_ps_reduce(aiter_tensor_t* partial_output,
-                  aiter_tensor_t* partial_lse,
-                  aiter_tensor_t* reduce_indptr,
-                  aiter_tensor_t* reduce_final_map,
-                  aiter_tensor_t* reduce_partial_map,
-                  int max_seqlen_q,
-                  aiter_tensor_t* final_output,
-                  aiter_tensor_t* final_lse,
-                  hipStream_t stream)
+void attention_ps_reduce(aiter_tensor_t* partial_output,
+                         aiter_tensor_t* partial_lse,
+                         aiter_tensor_t* reduce_indptr,
+                         aiter_tensor_t* reduce_final_map,
+                         aiter_tensor_t* reduce_partial_map,
+                         int max_seqlen_q,
+                         aiter_tensor_t* final_output,
+                         aiter_tensor_t* final_lse,
+                         hipStream_t stream)
 {
     AITER_CHECK(partial_output && partial_lse && reduce_indptr && reduce_final_map &&
                     reduce_partial_map && final_output,
-                __func__, ": explicit PS metadata and output tensors are required");
+                __func__, ": explicit reduction metadata and output tensors are required");
     AITER_CHECK(final_output->is_gpu(), __func__, ": output must be on a GPU");
     const HipDeviceGuard device_guard(final_output->device_id);
     const std::string arch_id = get_gpu_arch();
@@ -129,7 +129,7 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
     const uint32_t tile_groups = static_cast<uint32_t>(std::min<int64_t>(
         num_tiles, std::max<uint32_t>(1, (target_groups + groups_per_tile - 1) / groups_per_tile)));
 
-    PaPsReduceArgs args{};
+    AttentionPsReduceArgs args{};
     args.output = final_output->data_ptr();
     args.partial_output = partial_output->data_ptr();
     args.partial_lse = partial_lse->data_ptr();
@@ -148,7 +148,7 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
     const std::string output_type =
         final_output->dtype() == AITER_DTYPE_fp16 ? "fp16" : "bf16";
     const reduceConfig* selected_config = nullptr;
-    for(const auto& entry : cfg_pa_ps_reduce_asm)
+    for(const auto& entry : cfg_attention_ps_reduce_asm)
     {
         const auto& config = entry.second;
         if(config.arch == arch_id && config.oType == output_type &&

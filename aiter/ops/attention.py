@@ -559,8 +559,10 @@ def pa_reduce_v1(
     )
 
 
-@compile_ops("module_pa_ps_reduce_asm", fc_name="pa_ps_reduce", ffi_type="ctypes")
-def _pa_ps_reduce_asm(
+@compile_ops(
+    "module_attention_ps_reduce_asm", fc_name="attention_ps_reduce", ffi_type="ctypes"
+)
+def _attention_ps_reduce_asm(
     partial_output: torch.Tensor,
     partial_lse: torch.Tensor,
     reduce_indptr: torch.Tensor,
@@ -569,7 +571,14 @@ def _pa_ps_reduce_asm(
     max_seqlen_q: int,
     final_output: torch.Tensor,
     final_lse: torch.Tensor | None = None,
-) -> None: ...
+) -> None:
+    """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
+
+    Partial output/LSE must be contiguous FP32 tensors with compatible int32
+    reduction maps on the output device. Output is BF16/FP16 [queries, heads,
+    128]; optional final LSE is FP32. The producer must follow the same partial
+    layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
+    """
 
 
 def pa_persistent_fwd(
@@ -655,7 +664,7 @@ def pa_persistent_fwd(
         and torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
         == "gfx950"
     ):
-        reduce_fn = _pa_ps_reduce_asm
+        reduce_fn = _attention_ps_reduce_asm
     reduce_fn(
         logits,
         splitLse,
