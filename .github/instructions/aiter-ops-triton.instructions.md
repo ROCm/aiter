@@ -140,9 +140,10 @@ and every fallback that reached them are gone. Flag:
   populated; the few `.gitkeep` files left from the migration are inert
   leftovers, not placeholders to maintain.
 - A new arch directory seeded from another arch without the copy being
-  byte-identical and called out in the commit message. The one seeding rule in
-  force is gfx950 → gfx1250, triton only — never into a gluon directory, never
-  backwards into gfx950.
+  byte-identical and called out in the commit message. The seeding rules in
+  force are the ones listed in `configs/CLAUDE.md`: gfx950 -> gfx1250 and
+  gfx1151 -> gfx1150, triton only, and gfx1101 -> gfx1200, gfx1201, triton MHA
+  only. Never into a gluon directory, never backwards into gfx950.
 - `kpack` in any config outside gfx942, whether added or already there.
   Triton's AMD backend deprecates `kpack` on CDNA4 — it warns and
   force-overrides `kpack = 1` on gfx950, and the parameter is slated for
