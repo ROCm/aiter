@@ -397,6 +397,9 @@ All weight/scale pre-shuffle helpers are unified in
   config dicts (`BLOCK_SIZE_*`, `num_warps`, `waves_per_eu`, ...) or passes
   literal `config=` overrides to a wrapper. Tests exercise the wrapper's own
   config resolution — tuning values live only in `configs/` JSON.
+  Explicit candidate validation belongs in `utils/_triton/tuning/harness.py`.
+  Its runner may expose `validate(config)`, called once per candidate before
+  profiling; reference checks must stay out of the timed call.
 - Unit tests assert, they do not dump. Flag `print(...)` of tensors, shapes,
   or timings and any ad-hoc `if __name__ == "__main__"` reporting block in a
   test file: correctness is checked with asserts
