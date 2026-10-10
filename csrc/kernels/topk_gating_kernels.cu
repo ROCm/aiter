@@ -45,34 +45,57 @@ void topk_gating(aiter_tensor_t& topk_weights,
                  aiter_tensor_t& correction_bias,
                  bool need_renorm,
                  float routed_scaling_factor,
-                 const std::string& score_func)
+                 const std::string& score_func,
+                 int num_shared_experts)
 {
     AITER_CHECK(topk_weights.dtype() == AITER_DTYPE_fp32,
                 "topk_weights must be float32");
     AITER_CHECK(topk_indices.dtype() == AITER_DTYPE_i32,
                 "topk_indices must be int32");
+    AITER_CHECK(num_shared_experts == 0 || num_shared_experts == 1 ||
+                    num_shared_experts == 2 || num_shared_experts == 4 ||
+                    num_shared_experts == 8,
+                "num_shared_experts must be 0, 1, 2, 4 or 8, got ",
+                num_shared_experts);
 
     HipDeviceGuard device_guard(gating_output.device_id);
 
-    const int sf_code     = parse_score_func(score_func);
-    const int num_experts = gating_output.size(1);
-    const int topk        = topk_indices.size(1);
-    const bool has_bias   = correction_bias.numel() > 0;
+    const int sf_code       = parse_score_func(score_func);
+    const int gating_cols   = static_cast<int>(gating_output.size(1));
+    const int num_experts   = gating_cols - num_shared_experts;
+    const int topk          = static_cast<int>(topk_indices.size(1));
+    const bool has_bias     = correction_bias.numel() > 0;
 
+    AITER_CHECK(num_experts > 0,
+                "gating_output has no routed experts after ", num_shared_experts,
+                " shared expert column(s)");
+    AITER_CHECK(gating_output.stride(1) == 1,
+                "gating_output rows must be contiguous");
     AITER_CHECK(topk <= static_cast<int>(WARP_SIZE),
                 "topk (", topk, ") exceeds WARP_SIZE (", WARP_SIZE, ")");
     AITER_CHECK(topk <= num_experts,
                 "topk (", topk, ") exceeds num_experts (", num_experts, ")");
+    AITER_CHECK(topk_weights.stride(0) == topk_indices.stride(0),
+                "topk_weights and topk_indices must share a row stride");
+    if(num_shared_experts > 0)
+    {
+        AITER_CHECK(topk_weights.size(1) >= topk + num_shared_experts,
+                    "topk_weights needs ", topk + num_shared_experts,
+                    " columns for topk plus shared experts, got ",
+                    topk_weights.size(1));
+    }
 
     topk_gating_params p{};
     p.gating                = gating_output.data_ptr();
     p.bias                  = has_bias ? correction_bias.data_ptr() : nullptr;
     p.weights               = reinterpret_cast<float*>(topk_weights.data_ptr());
     p.ids                   = reinterpret_cast<int*>(topk_indices.data_ptr());
-    p.stride_tk             = topk_indices.stride(0);
+    p.stride_tk             = static_cast<size_t>(topk_indices.stride(0));
     p.num_experts           = num_experts;
+    p.gating_stride         = static_cast<int>(gating_output.stride(0));
+    p.num_shared_experts    = num_shared_experts;
     p.topk                  = topk;
-    p.num_tokens            = gating_output.size(0);
+    p.num_tokens            = static_cast<int>(gating_output.size(0));
     p.routed_scaling_factor = routed_scaling_factor;
     p.need_renorm           = need_renorm;
     p.stream                = aiter::getCurrentHIPStream();

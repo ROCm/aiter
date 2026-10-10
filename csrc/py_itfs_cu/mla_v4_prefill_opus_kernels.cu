@@ -10,6 +10,7 @@
 
 #define OPUS_MLA_V4_PREFILL_IMPL
 #include "mla_v4_prefill_opus.h"
+#include "../cpp_itfs/pa/pa_ps.cuh"
 
 #include "aiter_hip_common.h"
 #include "aiter_stream.h"
@@ -17,16 +18,17 @@
 
 #include <cstddef>
 
-void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
-                                           aiter_tensor_t& unified_kv,
-                                           aiter_tensor_t& kv_indices_prefix,
-                                           aiter_tensor_t& kv_indptr_prefix,
-                                           aiter_tensor_t& kv,
-                                           aiter_tensor_t& kv_indices_extend,
-                                           aiter_tensor_t& kv_indptr_extend,
-                                           aiter_tensor_t& attn_sink,
-                                           aiter_tensor_t& out,
-                                           float softmax_scale)
+// The bf16/fp16 kernels' shared validation and arguments (`kargs.N` 0: nothing to run).
+static opus_mla_v4_prefill_kargs opus_mla_v4_prefill_a16w16_kargs(aiter_tensor_t& q,
+                                                                  aiter_tensor_t& unified_kv,
+                                                                  aiter_tensor_t& kv_indices_prefix,
+                                                                  aiter_tensor_t& kv_indptr_prefix,
+                                                                  aiter_tensor_t& kv,
+                                                                  aiter_tensor_t& kv_indices_extend,
+                                                                  aiter_tensor_t& kv_indptr_extend,
+                                                                  aiter_tensor_t& attn_sink,
+                                                                  aiter_tensor_t& out,
+                                                                  float softmax_scale)
 {
     // ---- Shape / dtype validation -----------------------------------------
     AITER_CHECK(q.dim() == 3, "q must be 3-D [N, H, D], got ndim=", q.dim());
@@ -80,8 +82,6 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
     const int total_pages  = static_cast<int>(unified_kv.size(0));
     const int total_tokens = static_cast<int>(kv.size(0));
 
-    if (N == 0) return;
-
     // ---- Build kernel args -----------------------------------------------
     opus_mla_v4_prefill_kargs kargs{};
     kargs.q_ptr             = q.data_ptr();
@@ -106,6 +106,26 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
     AITER_CHECK(kargs.stride_kv_page == static_cast<int>(kv.stride(0)),
                 "unified_kv and kv must share row stride along the D dim");
     kargs.softmax_scale     = softmax_scale;
+    return kargs;
+}
+
+void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
+                                           aiter_tensor_t& unified_kv,
+                                           aiter_tensor_t& kv_indices_prefix,
+                                           aiter_tensor_t& kv_indptr_prefix,
+                                           aiter_tensor_t& kv,
+                                           aiter_tensor_t& kv_indices_extend,
+                                           aiter_tensor_t& kv_indptr_extend,
+                                           aiter_tensor_t& attn_sink,
+                                           aiter_tensor_t& out,
+                                           float softmax_scale)
+{
+    const opus_mla_v4_prefill_kargs kargs = opus_mla_v4_prefill_a16w16_kargs(
+        q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
+        kv_indptr_extend, attn_sink, out, softmax_scale);
+    const int N = kargs.N;
+    const int H = kargs.H;
+    if (N == 0) return;
 
     // ---- Launch ----------------------------------------------------------
     HipDeviceGuard guard(q.device_id);
@@ -136,6 +156,81 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
                                    opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits, 32, 8);
 
 #undef LAUNCH_OPUS_MLA_V4_PREFILL
+}
+
+void opus_mla_v4_prefill_a16w16_gfx950_split_fwd(aiter_tensor_t& q,
+                                                 aiter_tensor_t& unified_kv,
+                                                 aiter_tensor_t& kv_indices_prefix,
+                                                 aiter_tensor_t& kv_indptr_prefix,
+                                                 aiter_tensor_t& kv,
+                                                 aiter_tensor_t& kv_indices_extend,
+                                                 aiter_tensor_t& kv_indptr_extend,
+                                                 aiter_tensor_t& attn_sink,
+                                                 aiter_tensor_t& partial_o,
+                                                 aiter_tensor_t& partial_max,
+                                                 aiter_tensor_t& partial_sum,
+                                                 aiter_tensor_t& out,
+                                                 float softmax_scale,
+                                                 int num_splits)
+{
+    const opus_mla_v4_prefill_kargs kargs = opus_mla_v4_prefill_a16w16_kargs(
+        q, unified_kv, kv_indices_prefix, kv_indptr_prefix, kv, kv_indices_extend,
+        kv_indptr_extend, attn_sink, out, softmax_scale);
+    const int N = kargs.N;
+    const int H = kargs.H;
+    const int D = kargs.D;
+    AITER_CHECK(H <= 32, "split-K runs the 16mx1_16nx4 kernel only (H <= 32), got H=", H);
+    AITER_CHECK(num_splits == 2 || num_splits == 4 || num_splits == 8,
+                "split-K takes num_splits 2, 4 or 8, got ", num_splits);
+    for(aiter_tensor_t* t : {&partial_o, &partial_max, &partial_sum})
+        AITER_CHECK(t->dtype() == AITER_DTYPE_fp32 && t->is_contiguous(),
+                    "partial_o / partial_max / partial_sum must be contiguous fp32");
+    AITER_CHECK(partial_o.numel() >= static_cast<int64_t>(N) * num_splits * H * D &&
+                    partial_max.numel() >= static_cast<int64_t>(N) * num_splits * H &&
+                    partial_sum.numel() >= static_cast<int64_t>(N) * num_splits * H,
+                "partial_o must hold [N, num_splits, H, D], partial_max / partial_sum [N, num_splits, H]");
+    if (N == 0) return;
+    const opus_mla_v4_prefill_split_kargs split_kargs{
+        kargs,
+        reinterpret_cast<float*>(partial_o.data_ptr()),
+        reinterpret_cast<float*>(partial_max.data_ptr()),
+        reinterpret_cast<float*>(partial_sum.data_ptr()),
+        num_splits};
+
+    HipDeviceGuard guard(q.device_id);
+    const hipStream_t stream = aiter::getCurrentHIPStream();
+    // The reduce: a token a batch row, a head a "kv head" of one query each,
+    // every thread one of the D columns. No sink: split 0 already counts it.
+    auto reduce = [&](auto out_tag, auto parts) {
+        using D_OUT = decltype(out_tag);
+        aiter::pa_decode_ps_reduce_hip_kernel<D_OUT, float, float, false, 512, 1, decltype(parts)::value>
+            <<<dim3(N, H, 1), 512, 0, stream>>>(
+                reinterpret_cast<D_OUT*>(out.data_ptr()),
+                split_kargs.partial_sum,
+                split_kargs.partial_max,
+                split_kargs.partial_o,
+                nullptr,
+                kargs.stride_qo_n, 0, kargs.stride_qo_h, 0,
+                num_splits * H, 1, H,
+                num_splits * H * D, D, H * D, 0);
+        HIP_CALL_LAUNCH(hipGetLastError());
+    };
+    auto launch = [&](auto dtype_tag, auto out_tag) {
+        using Traits = opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits<16, 64, 512, 4, decltype(dtype_tag), true>;
+        dim3 grid(N, ceil_div(H, Traits::Q_TILE_SIZE * Traits::T_M), num_splits);
+        opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel<Traits><<<grid, Traits::BLOCK_SIZE, 0, stream>>>(split_kargs);
+        HIP_CALL_LAUNCH(hipGetLastError());
+        if(num_splits == 2)
+            reduce(out_tag, std::integral_constant<int, 2>{});
+        else if(num_splits == 4)
+            reduce(out_tag, std::integral_constant<int, 4>{});
+        else
+            reduce(out_tag, std::integral_constant<int, 8>{});
+    };
+    if(q.dtype() == AITER_DTYPE_bf16)
+        launch(bf16_t{}, __hip_bfloat16{});
+    else
+        launch(fp16_t{}, _Float16{});
 }
 
 void opus_mla_v4_prefill_a8w8_gfx950_fwd(aiter_tensor_t& q_nope,
