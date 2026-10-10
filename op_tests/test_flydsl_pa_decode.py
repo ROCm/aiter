@@ -82,9 +82,11 @@ class DecodeCase:
     num_kv_heads: int = 1
     query_group_size: int = 16
     head_dim: int = 128
+    value_dim: int | None = None
     block_size: int = 128
     trans_v: bool = True
     dtype: torch.dtype = torch.bfloat16
+    kv_dtype: torch.dtype | None = None
     num_partitions: int | None = 7
     per_token: bool = True
     sliding_window: int = 0
@@ -136,7 +138,10 @@ def run_torch(
     kv_heads, page_size = key_cache.shape[1:3]
     group = heads // kv_heads
     queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
-    output = torch.zeros_like(queries)
+    value_dim = value_cache.shape[2]
+    output = torch.zeros(
+        (*queries.shape[:-1], value_dim), dtype=torch.float32, device=query.device
+    )
     positions = torch.arange(query_length, device=query.device)
 
     for seq, length in enumerate(context_lengths.cpu().tolist()):
@@ -168,18 +173,26 @@ def run_torch(
         probs = torch.exp(scores - log_denominator)
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
-    return output.reshape_as(query)
+    return output.reshape(batch * query_length, heads, value_dim)
 
 
 def _make_inputs(case, planned=False):
     torch.manual_seed(37 if case.sparse else 0)
     batch, page, dim = len(case.lengths), case.block_size, case.head_dim
+    value_dim = dim if case.value_dim is None else case.value_dim
     kv_heads, ql = case.num_kv_heads, case.query_length
     heads = kv_heads * case.query_group_size
     counts = [max(1, (length + page - 1) // page) for length in case.lengths]
     num_pages = sum(counts)
+    is_bf16_kv = case.kv_dtype == torch.bfloat16
     quant_dtype = (
-        torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
+        torch.bfloat16
+        if is_bf16_kv
+        else (
+            torch.float8_e4m3fn
+            if get_gfx_runtime() == "gfx950"
+            else torch.float8_e4m3fnuz
+        )
     )
     query = torch.empty((batch * ql, heads, dim), dtype=case.dtype).uniform_(-0.5, 0.5)
     if case.masked_scale:
@@ -187,10 +200,17 @@ def _make_inputs(case, planned=False):
     key = torch.empty((num_pages, kv_heads, page, dim), dtype=case.dtype).uniform_(
         -0.5, 0.5
     )
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
-    quantize = pertoken_quant if case.per_token else per_tensor_quant
-    key_quant, key_scale = quantize(key, quant_dtype=quant_dtype)
-    value_quant, value_scale = quantize(value, quant_dtype=quant_dtype)
+    value = torch.empty(
+        (num_pages, kv_heads, page, value_dim), dtype=case.dtype
+    ).uniform_(-0.5, 0.5)
+    if is_bf16_kv:
+        assert case.dtype == torch.bfloat16 and not case.per_token
+        key_quant, value_quant = key, value
+        key_scale = value_scale = None
+    else:
+        quantize = pertoken_quant if case.per_token else per_tensor_quant
+        key_quant, key_scale = quantize(key, quant_dtype=quant_dtype)
+        value_quant, value_scale = quantize(value, quant_dtype=quant_dtype)
     del key, value
 
     if case.per_token and case.sparse:
@@ -210,7 +230,7 @@ def _make_inputs(case, planned=False):
             # Positive periodic V exposes repeated sink mass without cancellation;
             # per-tensor cases retain a shared scale and use larger FP8 values.
             token_values = (torch.arange(count * page) % 4 + 1).float()
-            token_values *= 0.25 if case.per_token else 32
+            token_values *= 0.25 if case.per_token or is_bf16_kv else 32
             key_quant[start:end].zero_()
             value_quant[start:end] = token_values.reshape(count, 1, page, 1).to(
                 quant_dtype
@@ -246,13 +266,18 @@ def _make_inputs(case, planned=False):
     key_quant, value_quant = scatter(key_quant), scatter(value_quant)
     if case.per_token:
         key_scale, value_scale = scatter(key_scale), scatter(value_scale)
+    vector_width = 8 if is_bf16_kv else 16
     key_cache = (
-        key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
+        key_quant.reshape(
+            physical_pages, kv_heads, page, dim // vector_width, vector_width
+        )
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
     value_cache = (
-        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
+        value_quant.reshape(
+            physical_pages, kv_heads, page // vector_width, vector_width, value_dim
+        )
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if case.trans_v
@@ -306,9 +331,9 @@ def _make_inputs(case, planned=False):
     )
     psum = torch.full(shape, float("nan"), dtype=torch.float32)
     pmax = torch.full_like(psum, float("nan"))
-    pout = torch.full((*shape, dim), float("nan"), dtype=case.dtype)
+    pout = torch.full((*shape, value_dim), float("nan"), dtype=case.dtype)
     args = (
-        torch.full_like(query, float("nan")),
+        torch.full((batch * ql, heads, value_dim), float("nan"), dtype=case.dtype),
         query,
         key_cache,
         value_cache,
@@ -329,6 +354,12 @@ def _make_inputs(case, planned=False):
         sinks,
     )
     options = {"sliding_window": case.sliding_window, "work_plan": plan}
+    reference_key_scale = (
+        torch.ones(1, dtype=torch.float32) if is_bf16_kv else key_scale
+    )
+    reference_value_scale = (
+        torch.ones(1, dtype=torch.float32) if is_bf16_kv else value_scale
+    )
     reference = partial(
         run_torch,
         query,
@@ -336,13 +367,73 @@ def _make_inputs(case, planned=False):
         value_quant.permute(0, 1, 3, 2),
         table,
         context,
-        key_scale,
-        value_scale,
+        reference_key_scale,
+        reference_value_scale,
         query_length=ql,
         sliding_window=case.sliding_window,
         sinks=sinks,
     )
     return args, options, reference
+
+
+@pytest.mark.parametrize("scale_shape", [(), (1, 1, 1, 1)])
+def test_fp8_qlen8_dispatch_normalizes_scalar_scale_shapes(scale_shape):
+    case = DecodeCase(
+        lengths=(257,),
+        query_length=8,
+        head_dim=192,
+        value_dim=128,
+        block_size=64,
+        trans_v=True,
+        per_token=False,
+        sparse=False,
+        num_partitions=8,
+    )
+    args, options, reference = _make_inputs(case)
+    args = list(args)
+    args[12] = args[12].reshape(scale_shape)
+    args[13] = args[13].reshape(scale_shape)
+    pa_decode(*args, **options)
+    _assert_close(args[0], reference())
+
+
+@pytest.mark.parametrize("fallback", ["fp16", "strided-output"])
+def test_fp8_qlen8_dispatch_preserves_generic_fallback(monkeypatch, fallback):
+    case = DecodeCase(
+        lengths=(257,),
+        query_length=8,
+        head_dim=128,
+        block_size=64,
+        trans_v=True,
+        dtype=torch.float16 if fallback == "fp16" else torch.bfloat16,
+        per_token=False,
+        sparse=False,
+        num_partitions=8,
+    )
+    args, options, _reference = _make_inputs(case)
+    args = list(args)
+    if fallback == "strided-output":
+        rows, heads, value_dim = args[0].shape
+        args[0] = torch.empty((rows, heads, value_dim + 1), dtype=args[0].dtype)[
+            ..., :value_dim
+        ]
+        assert args[0].stride(-1) == 1 and not args[0].is_contiguous()
+
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+
+    def unexpected_fast_path(*_args, **_kwargs):
+        raise AssertionError(f"{fallback} must use the generic dispatcher")
+
+    class GenericFallbackReached(Exception):
+        pass
+
+    def stop_at_generic_compile(**_kwargs):
+        raise GenericFallbackReached
+
+    monkeypatch.setattr(module, "_pa_decode_fp8_qlen8", unexpected_fast_path)
+    monkeypatch.setattr(module, "compile_pa_decode_tile", stop_at_generic_compile)
+    with pytest.raises(GenericFallbackReached):
+        pa_decode(*args, **options)
 
 
 def _run_flydsl(*args, sliding_window=0, work_plan=None):
@@ -531,6 +622,176 @@ LENS_1024 = (0, 1, 1025, 1281)
 LENS_4096 = (0, 1, 4097, 4353)
 LENS_8192 = (0, 1, 8193, 8449)
 CASES = [
+    _case(
+        "fp8-qlen8-full-d128-short",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=1,
+        lengths=(257,),
+    ),
+    _case(
+        "fp8-qlen8-full-d192-short",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=1,
+        value_dim=128,
+        lengths=(511,),
+    ),
+    _case(
+        "fp8-qlen8-full-d192-uneven",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        value_dim=128,
+        lengths=(2049, 1025),
+    ),
+    _case(
+        "fp8-qlen8-full-d192-wave",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        value_dim=128,
+        lengths=(1027,) * 9,
+    ),
+    _case(
+        "fp8-qlen8-full-d192-np64",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=64,
+        value_dim=128,
+        lengths=(65536,),
+    ),
+    _case(
+        "fp8-qlen8-window128-asymmetric-sinks",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        lengths=(127, 128, 129, 135, 257, 515),
+    ),
+    _case(
+        "fp8-qlen8-window128-asymmetric-long",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        lengths=(65536, 65529),
+    ),
+    _case(
+        "fp8-qlen8-window128-asymmetric-np1",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=1,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        lengths=(257, 515),
+    ),
+    _case(
+        "bf16-qlen8-window128-asymmetric-sinks",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(0, 1, 7, 8, 127, 128, 129, 135, 257, 515),
+    ),
+    _case(
+        "bf16-qlen8-window128-asymmetric-long",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(65536, 65529),
+    ),
+    _case(
+        "bf16-qlen8-window128-asymmetric-np1",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=1,
+        window=128,
+        sink=FP32,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(257, 515),
+    ),
+    _case(
+        "bf16-qlen8-window128-asymmetric-no-sink",
+        shape=(8, 1, 16, 192),
+        cache=(64, 1, 0),
+        parts=8,
+        window=128,
+        value_dim=128,
+        kv_dtype=torch.bfloat16,
+        lengths=(128, 257),
+    ),
+    _case(
+        "fp8-qlen8-window1024-sinks",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        lengths=(1023, 1024, 1025, 1031, 2051),
+    ),
+    _case(
+        "fp8-qlen8-window1024-long",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        lengths=(65536,),
+    ),
+    _case(
+        "bf16-qlen8-window1024-sinks",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(1023, 1024, 1025, 1031, 2051),
+    ),
+    _case(
+        "bf16-qlen8-window1024-long",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(65536,),
+    ),
+    _case(
+        "bf16-qlen8-window1024-np1",
+        shape=(8, 1, 16, 128),
+        cache=(64, 1, 0),
+        parts=1,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(1023, 1031),
+    ),
+    _case(
+        "bf16-qlen8-window1024-hkv2",
+        shape=(8, 2, 16, 128),
+        cache=(64, 1, 0),
+        parts=8,
+        window=1024,
+        sink=FP32,
+        kv_dtype=torch.bfloat16,
+        lengths=(1031, 2051),
+    ),
     *_cases(
         "shape cache parts window sink",
         [
@@ -874,6 +1135,18 @@ CASES = [
 @pytest.mark.parametrize("case", CASES)
 def test_pa_decode(case, planned, monkeypatch):
     """Check numerics, contracts and graph replays."""
+    if get_gfx_runtime() != "gfx950" and case.value_dim not in (None, case.head_dim):
+        pytest.skip("asymmetric value widths require the gfx950 Qlen8 path")
+    if (
+        planned
+        and case.value_dim not in (None, case.head_dim)
+        and not (
+            case.query_length == 8
+            and case.sliding_window == 128
+            and (case.head_dim, case.value_dim) == (192, 128)
+        )
+    ):
+        pytest.skip("other asymmetric widths use the static FP8 Qlen8 path")
     if planned and case.num_partitions is not None:
         context = torch.tensor(case.lengths, dtype=torch.int32)
         num_compute_units = torch.cuda.get_device_properties(
@@ -974,7 +1247,33 @@ def test_pa_decode(case, planned, monkeypatch):
         graph.replay()
         check(disabled_sink=step == 2)
 
-    _assert_contracts(args, options)
+    if case.query_length == 8 and case.sparse:
+        table = args[5]
+        original_table = table.clone()
+        context.copy_(torch.tensor(case.lengths, dtype=torch.int32))
+        if sinks is not None:
+            sinks.copy_(original_sinks)
+        for tensor in (output, *scratch):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        check()
+        original_output = output.clone()
+
+        table.copy_(original_table.roll(1, dims=1))
+        for tensor in (output, *scratch):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        check()
+        assert not torch.equal(output, original_output)
+
+        table.copy_(original_table)
+        for tensor in (output, *scratch):
+            tensor.fill_(float("nan"))
+        graph.replay()
+        torch.testing.assert_close(output, original_output, rtol=0, atol=0)
+
+    if case.value_dim in (None, case.head_dim):
+        _assert_contracts(args, options)
     if plan is not None:
         # Check int32 limits without allocating a matching KV cache.
         lengths = (-1, 0, 1, 257, 2**31 - 1)
@@ -986,6 +1285,94 @@ def test_pa_decode(case, planned, monkeypatch):
             query_length=case.query_length,
         )
         _assert_plan(extreme_plan, lengths)
+
+
+@pytest.mark.parametrize(
+    ("dim", "value_dim", "window"),
+    [(128, 128, 1024), (192, 128, 128)],
+    ids=["draft-d128-w1024", "target-d192-v128-w128"],
+)
+def test_pa_decode_bf16_qlen8_large_physical_page(dim, value_dim, window):
+    """A selected BF16 K/V page beyond 2 GiB must retain its full address."""
+    if get_gfx_runtime() != "gfx950":
+        pytest.skip("BF16 page-offset regression is qualified on gfx950")
+    page, query_length, heads, parts = 64, 8, 16, 8
+    physical_page = (1 << 31) // (dim * page * 2) + 3
+    assert physical_page * dim * page * 2 > 1 << 31
+    key = torch.empty((physical_page + 1, 1, dim // 8, page, 8), dtype=torch.bfloat16)
+    value = torch.empty(
+        (physical_page + 1, 1, page // 8, value_dim, 8), dtype=torch.bfloat16
+    )
+    key[physical_page].zero_()
+    value[physical_page].fill_(2)
+    query = torch.zeros((query_length, heads, dim), dtype=torch.bfloat16)
+    output = torch.full(
+        (query_length, heads, value_dim), float("nan"), dtype=torch.bfloat16
+    )
+    lengths = torch.tensor([1031], dtype=torch.int32)
+    table = torch.full((1, 17), physical_page, dtype=torch.int32)
+    plan = plan_pa_decode(
+        lengths,
+        1,
+        max_partitions=parts,
+        sliding_window=window,
+        query_length=query_length,
+    )
+    shape = (1, plan.capacity, query_length * heads)
+    pmax = torch.empty(shape, dtype=torch.float32)
+    psum = torch.empty_like(pmax)
+    pout = torch.empty((*shape, value_dim), dtype=torch.bfloat16)
+    pa_decode(
+        output,
+        query,
+        key,
+        value,
+        lengths,
+        table,
+        dim**-0.5,
+        query_length,
+        parts,
+        compute_type=torch.bfloat16,
+        key_scale=None,
+        value_scale=None,
+        max_logits=pmax,
+        exp_sums=psum,
+        temporary_output=pout,
+        sliding_window=window,
+        work_plan=plan,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, torch.full_like(output, 2), rtol=0, atol=0)
+
+
+def test_pa_decode_bf16_qlen8_window128_asymmetric_contract():
+    case = DecodeCase(
+        lengths=(257,),
+        query_length=8,
+        num_kv_heads=1,
+        query_group_size=16,
+        head_dim=192,
+        value_dim=128,
+        block_size=64,
+        trans_v=True,
+        dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        num_partitions=8,
+        per_token=False,
+        sliding_window=128,
+        sparse=False,
+    )
+    args, options, _reference = _make_inputs(case, planned=True)
+    scaled_args = list(args)
+    scaled_args[12] = torch.ones(1, dtype=torch.float32)
+    with pytest.raises(ValueError, match="BF16 KV is unscaled"):
+        pa_decode(*scaled_args, **options)
+
+    wrong_plan = plan_pa_decode(
+        args[4], 1, max_partitions=8, sliding_window=1024, query_length=8
+    )
+    with pytest.raises(NotImplementedError, match="asymmetric value width"):
+        pa_decode(*args, sliding_window=1024, work_plan=wrong_plan)
 
 
 @benchmark()
