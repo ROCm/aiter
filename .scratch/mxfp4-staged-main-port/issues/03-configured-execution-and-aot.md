@@ -4,7 +4,7 @@
 
 **Blocked by:** 02: Deliver complete default-environment staged search.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Read the existing tuner AITER_MXFP4_TUNE_SWIGLU_LIMIT and stage2 settings once per invocation, normalize defaults/configured production-valid values and forward the fixed snapshot through workers, direct G1, bootstrap, Torch references and pair validation in every search mode; retain default Situv2 parameters and reject unsupported activation/limit combinations.
 - [ ] Keep the parent and workers' AITER_MXFP4_TUNE_SWIGLU_LIMIT, AITER_FLYDSL_STAGE2_FP8 and AITER_MXFP4_INTERMEDIATE environment unchanged from snapshot capture until the tuning run ends. Production retains its per-call stage2 environment reads, so worker inherited effective settings must match the snapshot. Test default/unset/empty and enabled/combined settings through spawned-worker and production-path behavior; verify the path actually selected agrees with the snapshot. No new runtime binding or mutation-detection mechanism is required.
