@@ -1,0 +1,82 @@
+5b09efe5f docs: retain calibration parser red evidence as lossless gzip
+d1ee15592 Merge ticket 04: MXFP4 calibration and acceptance for final integration review
+431380fab Retain complete current MXFP4 GPU calibration deployment and replay evidence
+942c3ae52 Report targeted winner replays and retain exact coordinator script
+e5c84ccca State measured calibration scope and optimization limits precisely
+a3644ca3d Index complete calibration acceptance and reproduction artifacts
+afb773c59 Update calibration gate accounting after completed winner deployment
+617030e1c Record corrected omitted Situv2 production and precompiled acceptance
+ddc2fd4a2 Verify every calibrated winner in exact production AOT and run-only paths
+3f25f8f84 Record completed initial calibration before deployment acceptance
+459e0e21e Plan targeted checks for all negative and material measured differences
+8b0b547a9 Verify sequential physical-card search evidence and actual anchor costs
+8bf1820e5 Report all 27 MXFP4 searches and concrete winner ranking concerns
+9fe88d246 Retain aggregate matrix work planning without runtime validity assumptions
+855553bcb Retain cost observation shape configuration and measurement pointers
+b9922411c Update later full-anchor planning with measured full64 attempt overhead
+c133f94fc Record combined acceptance verification and existing warnings
+be3e5469b Record combined offline policy lifecycle and calibration checks
+eacf9177e Check omitted Situv2 parameters at actual production stage boundary
+476af59e0 Verify omitted Situv2 API parameters use actual MXFP4 defaults
+dd901a440 Distinguish omitted Situv2 replay from tuner-default CSV timing
+ba4dde073 Record calibration protocol and artifact boundaries
+d335696c6 Retain targeted alternating replay for measured winner discrepancies
+217ece905 Count real staged fallback expansion and retain winner screening ranks
+752ce62e6 Clarify equal cache conditions and matching calibration replay data
+613f4d86a Start each initial calibration search with equal empty FlyDSL caches
+5a8c31c17 Document MXFP4 usage and retain complete calibration outcome reporting
+2bf018b21 Apply repository formatting to calibration acceptance scripts
+5c21e62b1 Finalize exited calibration tasks without repeating GPU searches
+d3b0d67f9 Replay calibration weights and omitted Situv2 API defaults exactly
+6c69bb11b Capture real tuner accounting and reuse exact CK toolchain path
+a6732765c Prepare prescribed MXFP4 calibration matrix and offline cost planning
+cd7b67cc4 docs: resolve configured ticket 03 and claim final acceptance ticket 04
+1e901d768 Merge ticket 03: configured MXFP4 execution, AOT and numerical acceptance
+5ec9158b0 record final ninety-task acceptance sequence and measurement scope
+281fc4054 preserve raw snapshot red evidence as lossless gzip
+33a02292f Merge commit '5ecf52618' into implement/mxfp4-03
+f7eac4d7f retain complete configured MXFP4 numerical and deployment acceptance
+d066e4d7a retain portable coordinated acceptance replay and full job summaries
+65f427867 prepare independent matching-limit production clamp comparison
+5ecf52618 docs: retain configured execution and AOT incremental review evidence
+4e5d8bdc2 await process exit before declaring GPU evidence complete
+14c462e98 test: execute selected MXFP4 batch file through CPU worker pool
+c7cb8a041 docs: provide spawn-safe selected MXFP4 batch compiler
+f9484be29 verify custom limits through direct screening and reference bootstrap
+143378b33 retain known task failures when GPU result evidence is absent
+32e5ed6d4 add fail-explicit current GPU acceptance summarizer
+eae714474 test: verify configured MXFP4 selected-CSV batch collection
+7e745a53d verify caller-controlled same-key limit retuning behavior
+dd36c1293 test: complete specified MXFP4 accumulation fixture coverage
+da7239ff5 Merge commit '5df591a14' into implement/mxfp4-03
+e52d664e6 record complete configured and default MXFP4 regression checks
+836abf3b9 test: prepare admitted configured MXFP4 acceptance pairs
+1b19aa38d serialize unbounded activation limits in AOT acceptance records
+bbc81dc7a cover individual inherited stage2 switches and document ticket03 paths
+9260524a5 feat: align MXFP4 AOT activation and stage2 output settings
+f0849a6c1 add configured specified-pair and exact deployment acceptance harness
+2308ce0bf fix MXFP4 invocation configuration and FP8 route forwarding
+5df591a14 docs: record routing seed and timing environment in GPU tasks
+9c035b435 docs: resolve staged search ticket 02 and claim configured execution ticket 03
+00f9c6073 Merge ticket 02: implement default MXFP4 staged search and GPU acceptance
+a1a8d2fd9 Merge branch 'integration/mxfp4-staged-main-port' into implement/mxfp4-02
+05a7244fb test: retain default staged numerical production and cold AOT evidence
+85dcad12c test: assert complete deployed stage configuration and label diagnostics
+059973a37 test: retain exact default production and AOT replay harness
+09c9b5ef2 feat: connect staged screening to main MXFP4 GPU execution
+fd5ef6f3b docs: retain scoped lifecycle and staged implementation reviews
+db653d9f3 test: coordinate staged worker exit before result receive
+8d30e77ee Merge branch 'integration/mxfp4-staged-main-port' into implement/mxfp4-02
+2c902bf08 feat: supervise staged shapes with private pipes and owned timeouts
+4daaacfd9 test: add sequential physical GPU acceptance task controller
+60cbce1f6 feat: screen staged MXFP4 pairs with exhaustive group fallback
+65a4eba35 feat: plan staged MXFP4 search from shared pruned candidates
+fb9f741cc docs: synchronize active port state and current evidence pointers
+119212da2 docs: resolve lifecycle ticket 01 and claim staged search ticket 02
+47cb9fb46 Merge ticket 01: preserve MXFP4 tuner lifecycle and runtime identity
+eb33ca87d docs: compress intermediate lifecycle logs without altering evidence
+bb4740ce8 Merge branch 'integration/mxfp4-staged-main-port' into implement/mxfp4-01
+3a05e8ce0 fix: preserve MXFP4 tuning lifecycle and runtime identity
+1a057371b docs: align evidence environment with fixed-base CK dependency
+9cb9e05bd docs: record isolated port toolchain and infrastructure baseline
+559e83fa7 docs: retain MXFP4 port specification and claim ticket 01
