@@ -1,0 +1,9 @@
+[aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-review-fixes/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+[mxfp4-port] pruned G1: pid=632208 token=128 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=4 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=632208 token=2048 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=632208 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=632208 token=128 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=4 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=632208 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=situv2 M_est=64 valid=84 kept=27
+Prepared 22 specified-pair requests; no GPU or FlyDSL compilation
