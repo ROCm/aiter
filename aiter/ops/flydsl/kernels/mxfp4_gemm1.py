@@ -1032,7 +1032,7 @@ def _gemm1_body(
                 a_cur = issue_a_ds_read(read_slot)
                 asc_cur = issue_a_scale_ds_read(K_C - k_stages)
             if const_expr(not inline_quant):
-                if const_expr(a_dtype == "fp8" and BM == 128 and kAStages == k_stages):
+                if const_expr(BM == 128 and kAStages == k_stages):
                     # The two-slot BM128 ring reuses the slot just read. Every
                     # wave must finish its LDS reads before any wave's DMA
                     # overwrites rows consumed by the other waves.
