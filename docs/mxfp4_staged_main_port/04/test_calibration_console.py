@@ -30,3 +30,37 @@ def test_search_report_counts_valid_and_failed_attempts_and_actual_summary(tmp_p
     )
     assert report["finite_reference_errors"] == ["0.011174"]
     assert report["tuning_summary_seconds"] == 107.2228
+
+
+def test_finalize_exited_search_records_complete_evidence_without_gpu_launch(tmp_path):
+    import json
+
+    job_dir = tmp_path / "case"
+    artifact = job_dir / "search-task"
+    artifact.mkdir(parents=True)
+    (artifact / "task.json").write_text(
+        json.dumps(
+            dict(
+                process_start_utc="2026-10-10T00:00:00+00:00",
+                process_exit_utc="2026-10-10T00:00:03+00:00",
+                exit_code=0,
+                implementation_commit="abc",
+                environment={},
+            )
+        )
+    )
+    (artifact / "console.log.txt").write_text(
+        "[mxfp4-port] token=64 inter=384 g1 + g2 us=10.0\n"
+        "[aiter] Tuning Finished. tune 1 shapes, total tuning time is 2.5 seconds\n"
+    )
+    (job_dir / "winner.csv").write_text("us,kernelName1,kernelName2\n10.0,g1,g2\n")
+    result = driver.finalize_search(
+        dict(id="case", mode="prune"), job_dir, dict(total_pairs=1)
+    )
+    assert result["outcome"] == "valid" and result["validation_attempts"] == 1
+    assert (
+        result["search_wall_seconds"] == 3 and result["tuning_summary_seconds"] == 2.5
+    )
+    assert (job_dir / "search.json").exists()
+    assert (artifact / "console.log.txt.gz").exists()
+    assert not (artifact / "console.log.txt").exists()
