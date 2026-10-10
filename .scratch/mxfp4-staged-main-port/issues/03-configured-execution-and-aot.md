@@ -30,3 +30,7 @@ Acceptance: 231 unique focused controlled cases passed across the retained defau
 See [implementation](../../../docs/mxfp4_staged_main_port/03/implementation.md), [GPU evidence](../../../docs/mxfp4_staged_main_port/03/gpu/README.md), [complete task sequence](../../../docs/mxfp4_staged_main_port/03/gpu/task-sequence.json), and adjacent reproducible scripts/configuration/full compressed logs/traces. Ninety-task process wall sum is `731.858303` seconds; wider task interval includes idle waits. Specified-pair CSVs are validation measurements, not search winners.
 
 Situv2 here uses the existing tuner reference defaults 4/25 explicitly and matches current AOT variants. Omitted public API parameters1/1 require a separate final replay under ticket04. The prescribed 27 searches and final Standards/Spec review remain ticket04 work; no missing final acceptance is marked passed by this Answer.
+
+## Final acceptance clarification
+
+Ticket04's public omitted-argument test established that the selected MXFP4 path overrides generic normalization to the existing4/25 defaults (`fused_moe.py` stage1 forwarding). The earlier planned1/1 omitted-call expectation was a harness/coordinator inference, not the actual MXFP4 default or a spec requirement. The corrected exact production and precompiled retries pass with4/25; explicit1/1 AOT compatibility remains preserved. See ticket04 Answer and its Situv2 diagnosis record.
