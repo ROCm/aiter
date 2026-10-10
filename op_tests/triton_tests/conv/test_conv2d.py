@@ -20,9 +20,10 @@ Plus test_cross_method (differential correctness) that runs every NCHW
 kernel on shapes routable by all of them and verifies they all match
 F.conv2d. NCHW-only by design; 2 cases (one per dtype).
 
-Plus 7 exact-route and configuration-precedence regression cases.
+Plus 7 exact-route and configuration-precedence regression cases, 2
+scalar-parameter cases, 1 cache-clear case, and 2 inference-tensor cases.
 
-Total: 12 + 12 + 12 + 36 + 2 + 7 = 81 cases.
+Total: 12 + 12 + 12 + 36 + 2 + 7 + 2 + 1 + 2 = 86 cases.
 
 Where a kernel's guard rejects a shape (e.g. winograd on a 5x5), the
 shape is silently skipped inside run_all_methods.
@@ -34,14 +35,20 @@ shapes, in op_benchmarks/triton/model_benchmarking_tool/bench_models.py).
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 import aiter.ops.triton.conv.conv2d as conv2d_module
+from aiter.ops.triton.conv import _prepack as conv_prepack
+from aiter.ops.triton.conv._prepack import clear_conv2d_weight_pack_caches
 from aiter.ops.triton.utils import conv_config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from op_tests.triton_tests.conv._helpers import (
     ALL_SUPPORTED_ARCHS,
+    CONV2D_WEIGHT_PACK_CACHE_NAMES,
     ORDERED_METHODS,
     TestSuite,
+    assert_weight_pack_cache_clear_is_scoped,
+    dynamic_conv_tolerances,
     run_activations,
     run_cross_method,
     run_edge_cases,
@@ -131,6 +138,76 @@ def test_cross_method(dtype):
     _assert_suite(suite)
 
 
+@pytest.mark.parametrize("layout", ["nchw", "nhwc"])
+def test_scalar_parameters_and_noncontiguous_input(layout):
+    """Conv2D accepts scalar parameters and materializes sliced inputs."""
+    torch.manual_seed(0)
+    x_base = torch.randn(1, 32, 12, 18, device="cuda", dtype=torch.float16)
+    x = x_base[..., ::2]
+    assert not x.is_contiguous(), f"expected sliced input, got strides={x.stride()}"
+    w = torch.randn(48, 32, 1, 1, device="cuda", dtype=torch.float16)
+
+    y = conv2d_module.conv2d(x, w, stride=1, padding=0, dilation=1, layout=layout)
+    ref = F.conv2d(x.float(), w.float())
+    rtol, atol = dynamic_conv_tolerances(torch.float16, 32)
+    torch.testing.assert_close(y.float(), ref, rtol=rtol, atol=atol)
+    if layout == "nhwc":
+        assert y.is_contiguous(
+            memory_format=torch.channels_last
+        ), f"expected channels-last output, got strides={y.stride()}"
+    else:
+        assert (
+            y.is_contiguous()
+        ), f"expected contiguous output, got strides={y.stride()}"
+
+
+def test_conv2d_weight_pack_cache_clear_is_scoped(monkeypatch):
+    assert_weight_pack_cache_clear_is_scoped(
+        monkeypatch,
+        conv_prepack,
+        clear_conv2d_weight_pack_caches,
+        CONV2D_WEIGHT_PACK_CACHE_NAMES,
+    )
+
+
+def test_inference_weight_bypasses_pack_cache_and_observes_updates(monkeypatch):
+    cache = conv_prepack._LRUPackCache(maxsize=2)
+    monkeypatch.setattr(conv_prepack, "_PACK_CACHE_3x3", cache)
+
+    with torch.inference_mode():
+        weight = torch.arange(18, dtype=torch.float16, device="cpu").reshape(2, 1, 3, 3)
+        first, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+        second, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+        weight.add_(10)
+        refreshed, _ = conv_prepack.get_or_make_weight_pack_3x3(weight, block_c=4)
+
+    assert not cache._d, "inference weights must not enter the global cache"
+    assert second is not first, "inference weight unexpectedly reused a pack"
+    assert refreshed is not second, "updated inference weight reused a stale pack"
+    expected = weight.reshape(2, 1, 9).permute(0, 2, 1)
+    torch.testing.assert_close(refreshed[:, :, :1], expected)
+
+
+def test_conv2d_inference_weight_observes_updates():
+    torch.manual_seed(0)
+    with torch.inference_mode():
+        x = torch.randn(1, 64, 16, 16, device="cuda", dtype=torch.float16)
+        weight = torch.randn(32, 64, 3, 3, device="cuda", dtype=torch.float16)
+
+        output = conv2d_module.conv2d(x, weight, padding=1)
+        reference = F.conv2d(x.float(), weight.float(), padding=1)
+
+        weight.add_(0.25)
+        output_after_update = conv2d_module.conv2d(x, weight, padding=1)
+        reference_after_update = F.conv2d(x.float(), weight.float(), padding=1)
+
+    rtol, atol = dynamic_conv_tolerances(torch.float16, 64 * 3 * 3)
+    torch.testing.assert_close(output.float(), reference, rtol=rtol, atol=atol)
+    torch.testing.assert_close(
+        output_after_update.float(), reference_after_update, rtol=rtol, atol=atol
+    )
+
+
 # -- Configuration lookup and routing (no kernel launches) -------------------
 
 _GFX1100_PINNED = {
@@ -203,7 +280,10 @@ def test_exact_nchw_pin_selects_direct(
 ):
     _use_arch(monkeypatch, arch)
 
-    assert _resolve_nchw_3x3(shape) is conv2d_module.Route.DIRECT_NCHW_3X3
+    route = _resolve_nchw_3x3(shape)
+    assert (
+        route is conv2d_module.Route.DIRECT_NCHW_3X3
+    ), f"expected direct NCHW route for pinned {arch} shape, got {route}"
 
 
 @pytest.mark.parametrize("arch", ["gfx1100", "gfx1151"])
@@ -212,7 +292,10 @@ def test_unpinned_nchw_shape_falls_back_to_cblocked(
 ):
     _use_arch(monkeypatch, arch)
 
-    assert _resolve_nchw_3x3(_UNPINNED) is conv2d_module.Route.CBLOCKED_NCHW
+    route = _resolve_nchw_3x3(_UNPINNED)
+    assert (
+        route is conv2d_module.Route.CBLOCKED_NCHW
+    ), f"expected NCHWc fallback for unpinned {arch} shape, got {route}"
 
 
 @pytest.mark.parametrize(
@@ -225,10 +308,10 @@ def test_exact_nchw_pin_uses_complete_shape_key(
 ):
     _use_arch(monkeypatch, "gfx1100")
 
+    route = _resolve_nchw_3x3(_GFX1100_PINNED, **route_override)
     assert (
-        _resolve_nchw_3x3(_GFX1100_PINNED, **route_override)
-        is conv2d_module.Route.CBLOCKED_NCHW
-    )
+        route is conv2d_module.Route.CBLOCKED_NCHW
+    ), f"expected NCHWc after shape-key change {route_override}, got {route}"
 
 
 def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config_cache):
@@ -248,7 +331,11 @@ def test_conv_config_layout_variant_precedence(monkeypatch, isolated_conv_config
             "TEST-CONV-VARIANTS", shape_key=key, M=M, variants=variants
         )["source"]
 
-    assert selected("nhwc") == "layout"
-    assert selected() == "generic"
-    assert selected("nhwc", key="missing") == "bucket"
-    assert selected("nhwc", key="missing", M=65) == "any"
+    assert selected("nhwc") == "layout", "layout-specific config was not preferred"
+    assert selected() == "generic", "generic shape config was not selected"
+    assert (
+        selected("nhwc", key="missing") == "bucket"
+    ), "M bucket was not used after a layout-specific shape miss"
+    assert (
+        selected("nhwc", key="missing", M=65) == "any"
+    ), "generic fallback was not used after shape and bucket misses"

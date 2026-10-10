@@ -599,8 +599,11 @@ class IPCBufferPool:
         if count == 0:
             return
         handle_sz = 64  # sizeof(hipIpcMemHandle_t)
-        handle = torch.empty(count * handle_sz, dtype=torch.uint8)
-        offset = torch.empty(count, dtype=torch.int64)
+        # Host memory regardless of torch's default device: the C side writes
+        # these through plain pointers, and a GPU tensor pickled to a peer is
+        # rebuilt there on this rank's GPU, opening a HIP context on it.
+        handle = torch.empty(count * handle_sz, dtype=torch.uint8, device="cpu")
+        offset = torch.empty(count, dtype=torch.int64, device="cpu")
         self._graph_ipc_meta_fn(ar_ptr, handle.data_ptr(), offset.data_ptr())
         handles, offsets = self._gather_ipc_meta((handle, offset))
         logger.info("Registering %d cuda graph addresses", count)
@@ -614,7 +617,8 @@ class IPCBufferPool:
 
     def _broadcast_ipc(self, data_ptr: int) -> tuple[list, list]:
         """Get IPC handle for *data_ptr* and broadcast across all ranks."""
-        handle = torch.empty(64, dtype=torch.uint8)  # sizeof(hipIpcMemHandle_t)
+        # sizeof(hipIpcMemHandle_t); host memory, as in flush_graph_buffers
+        handle = torch.empty(64, dtype=torch.uint8, device="cpu")
         self._ipc_handle_fn(data_ptr, handle.data_ptr())
         return self._gather_ipc_meta((handle, 0))
 

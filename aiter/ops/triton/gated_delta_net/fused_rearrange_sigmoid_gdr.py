@@ -12,7 +12,7 @@ import os
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule.decode.fused_rearrange_sigmoid_gdr import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.decode.fused_rearrange_sigmoid_gdr import (
     fused_rearrange_sigmoid_gated_delta_rule_update_kernel,
 )
 
