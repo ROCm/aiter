@@ -6,12 +6,12 @@ The user approved the four-ticket breakdown on 2026-10-10 after [spec reviewer r
 
 | ID | Ticket | Blocked by | Status |
 | --- | --- | --- | --- |
-| 01 | [Safe tuning lifecycle](issues/01-safe-tuning-lifecycle.md) | — | claimed |
-| 02 | [Complete default staged search](issues/02-default-staged-search.md) | 01 | ready-for-agent |
+| 01 | [Safe tuning lifecycle](issues/01-safe-tuning-lifecycle.md) | — | resolved |
+| 02 | [Complete default staged search](issues/02-default-staged-search.md) | 01 | claimed |
 | 03 | [Configured execution and AOT](issues/03-configured-execution-and-aot.md) | 02 | ready-for-agent |
 | 04 | [Calibration and acceptance](issues/04-calibration-and-acceptance.md) | 03 | ready-for-agent |
 
-The approved delivery sequence is 01→02→03→04. Ticket 01 is the initial frontier; later tickets require their recorded blockers to be completed. Some AOT and prune/full parameter repairs in 03 could technically be prepared before 02, but the approved ticket order is retained to coordinate shared edits and verify complete configured staged behavior before closing 03. These are completion gates for whole tickets, not a claim that every internal change has the same code dependency. No partial-ready states or new blocking edges are introduced. Ticket 01 is claimed; no ticket has yet met its completion gate. Tickets 02–04 remain blocked.
+The approved delivery sequence is 01→02→03→04. Ticket 01 is the initial frontier; later tickets require their recorded blockers to be completed. Some AOT and prune/full parameter repairs in 03 could technically be prepared before 02, but the approved ticket order is retained to coordinate shared edits and verify complete configured staged behavior before closing 03. These are completion gates for whole tickets, not a claim that every internal change has the same code dependency. No partial-ready states or new blocking edges are introduced. Ticket 01 is resolved after integration merge and recorded acceptance. Ticket 02 is claimed and is the current frontier; tickets 03–04 remain blocked.
 
 See [spec.md](spec.md), [plan.md](plan.md), [acceptance.md](acceptance.md) and [facts.md](facts.md) for contracts, execution order, checks and evidence. After ticket publication, the user authorized the pre-implementation reviewer corrections: spec is now `ready-for-agent`, its pause is removed, and current tickets include the clarified device/regression/environment/cost-planning requirements. This map tracks current ticket state; the spec defines behavior. The four-ticket order and staged algorithm remain unchanged.
 
@@ -23,4 +23,8 @@ The [crossed-pair experiment](cross-experiment-review.md) is complete and its fi
 
 The sole mutable ticket-state location is this integration worktree: `/root/workspace/tmp_dev/aiter-mxfp4-integration/.scratch/mxfp4-staged-main-port/`. Only the primary coordinator updates ticket status, Answers and this map. Implementer copies are read-only context; implementation branches submit code, behavior documentation and evidence without tracker-state edits. The original source worktree remains unchanged.
 
-Integration branch: `integration/mxfp4-staged-main-port`, fixed base `882ea79dd7cc7091f859a5bedac914523ac77bbd`. Current frontier: ticket 01 (claimed); tickets 02–04 remain blocked by their predecessors.
+Integration branch: `integration/mxfp4-staged-main-port`, fixed base `882ea79dd7cc7091f859a5bedac914523ac77bbd`. Current frontier: ticket 02 (claimed); ticket 01 resolved at merge `47cb9fb46d8ea532beea98d6dc7d920475f7ece6`; tickets 03–04 remain blocked by their predecessors.
+
+## Ticket 01 delivery
+
+Ticket 01 resolved with implementation `3a05e8ce0`, merged as `47cb9fb46d8ea532beea98d6dc7d920475f7ece6`. Its Answer links 55 controlled lifecycle and 55 shared infrastructure checks plus static verification. The early uncontrolled-execution incident remains disclosed in delivery evidence and is excluded from acceptance. Ticket 02 starts from the resulting integration tip.
