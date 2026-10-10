@@ -376,6 +376,66 @@ def _make_inputs(case, planned=False):
     return args, options, reference
 
 
+@pytest.mark.parametrize("scale_shape", [(), (1, 1, 1, 1)])
+def test_fp8_qlen8_dispatch_normalizes_scalar_scale_shapes(scale_shape):
+    case = DecodeCase(
+        lengths=(257,),
+        query_length=8,
+        head_dim=192,
+        value_dim=128,
+        block_size=64,
+        trans_v=True,
+        per_token=False,
+        sparse=False,
+        num_partitions=8,
+    )
+    args, options, reference = _make_inputs(case)
+    args = list(args)
+    args[12] = args[12].reshape(scale_shape)
+    args[13] = args[13].reshape(scale_shape)
+    pa_decode(*args, **options)
+    _assert_close(args[0], reference())
+
+
+@pytest.mark.parametrize("fallback", ["fp16", "strided-output"])
+def test_fp8_qlen8_dispatch_preserves_generic_fallback(monkeypatch, fallback):
+    case = DecodeCase(
+        lengths=(257,),
+        query_length=8,
+        head_dim=128,
+        block_size=64,
+        trans_v=True,
+        dtype=torch.float16 if fallback == "fp16" else torch.bfloat16,
+        per_token=False,
+        sparse=False,
+        num_partitions=8,
+    )
+    args, options, _reference = _make_inputs(case)
+    args = list(args)
+    if fallback == "strided-output":
+        rows, heads, value_dim = args[0].shape
+        args[0] = torch.empty((rows, heads, value_dim + 1), dtype=args[0].dtype)[
+            ..., :value_dim
+        ]
+        assert args[0].stride(-1) == 1 and not args[0].is_contiguous()
+
+    module = importlib.import_module("aiter.ops.flydsl.pa_decode")
+
+    def unexpected_fast_path(*_args, **_kwargs):
+        raise AssertionError(f"{fallback} must use the generic dispatcher")
+
+    class GenericFallbackReached(Exception):
+        pass
+
+    def stop_at_generic_compile(**_kwargs):
+        raise GenericFallbackReached
+
+    monkeypatch.setattr(module, "_pa_decode_fp8_qlen8", unexpected_fast_path)
+    monkeypatch.setattr(module, "compile_pa_decode_tile", stop_at_generic_compile)
+    with pytest.raises(GenericFallbackReached):
+        pa_decode(*args, **options)
+
+
 def _run_flydsl(*args, sliding_window=0, work_plan=None):
     if work_plan is not None:
         plan_pa_decode(

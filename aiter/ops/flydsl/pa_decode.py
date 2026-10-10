@@ -106,9 +106,9 @@ def _pa_decode_fp8_qlen8(
     if (
         output.shape != (batch * 8, 16, 128)
         or output.dtype != torch.bfloat16
-        or output.stride(-1) != 1
+        or not output.is_contiguous()
     ):
-        raise ValueError("FP8 Qlen8 requires BF16 output [B*8, 16, 128]")
+        raise ValueError("FP8 Qlen8 requires contiguous BF16 output [B*8, 16, 128]")
     if (
         key_cache.ndim != 5
         or key_cache.shape[1:] != (1, head_dim // 16, 64, 16)
@@ -374,6 +374,17 @@ def pa_decode(
             f"context_lengths.shape[0] * query_length ({num_seqs} * {query_length})"
         )
 
+    qlen8_key_scale = (
+        key_scale.reshape(1)
+        if isinstance(key_scale, torch.Tensor) and key_scale.numel() == 1
+        else key_scale
+    )
+    qlen8_value_scale = (
+        value_scale.reshape(1)
+        if isinstance(value_scale, torch.Tensor) and value_scale.numel() == 1
+        else value_scale
+    )
+
     # Use the Qlen8 wave kernels for this full-attention geometry. Keep SWA,
     # sinks, per-token scales, and other shapes on the existing dispatcher.
     if (
@@ -383,15 +394,18 @@ def pa_decode(
         and work_plan is None
         and num_q_heads == 16
         and head_dim in (128, 192)
+        and query.dtype == torch.bfloat16
         and output.shape == (num_seqs * 8, 16, 128)
+        and output.dtype == torch.bfloat16
+        and output.is_contiguous()
         and key_cache.shape[1] == 1
         and key_cache.shape[-2:] == (64, 16)
         and key_cache.dtype == torch.float8_e4m3fn
         and value_cache.shape == (key_cache.shape[0], 1, 4, 128, 16)
         and compute_type == key_cache.dtype
-        and isinstance(key_scale, torch.Tensor)
-        and isinstance(value_scale, torch.Tensor)
-        and key_scale.numel() == value_scale.numel() == 1
+        and isinstance(qlen8_key_scale, torch.Tensor)
+        and isinstance(qlen8_value_scale, torch.Tensor)
+        and qlen8_key_scale.numel() == qlen8_value_scale.numel() == 1
         and 1 <= max_context_partition_num <= 64
     ):
         return _pa_decode_fp8_qlen8(
@@ -403,8 +417,8 @@ def pa_decode(
             block_tables,
             softmax_scale,
             max_context_partition_num,
-            key_scale,
-            value_scale,
+            qlen8_key_scale,
+            qlen8_value_scale,
             max_logits,
             exp_sums,
             temporary_output,
