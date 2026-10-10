@@ -50,6 +50,7 @@ def gemm_a8w8(
         w (torch.Tensor): Weight matrix with shape (N, K), internally transposed.
         x_scale (torch.Tensor): Scale factor for x with shape (M, 1) or (M,).
         w_scale (torch.Tensor): Scale factor for w with shape (1, N) or (N,).
+            Preshuffled FP8 weights also accept (N, 1).
         bias (Optional[torch.Tensor]): Bias vector with shape (N,).
         dtype (Optional[torch.dtype]): Output datatype (BF16 or FP16).
         y (Optional[torch.Tensor]): Pre-allocated output tensor with shape (M, N).

@@ -786,7 +786,7 @@ def gemm_a8w8_bpreshuffle(
         # Keep the (16,16)-shuffled layout: a plain GEMM would silently read
         # different weights. Select before CK lookup/JIT; those kernels do not
         # implement this operation on gfx1201.
-        from .triton.gemm.basic.gemm_a8w8 import gemm_a8w8
+        from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 
         return gemm_a8w8(XQ, WQ, x_scale, w_scale, dtype=dtype, b_preshuffled=True)
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
