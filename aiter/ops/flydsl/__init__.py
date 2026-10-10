@@ -121,6 +121,11 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
     ),
+    "normalize_qsa_backend": (".qsa", "normalize_qsa_backend"),
+    "qsa_auto_uses_flydsl": (".qsa", "qsa_auto_uses_flydsl"),
+    "qsa_k1_block_ids": (".qsa", "qsa_k1_block_ids"),
+    "qsa_k2": (".qsa", "qsa_k2"),
+    "qsa_layer": (".qsa", "qsa_layer"),
 }
 
 __all__ = [
@@ -155,7 +160,12 @@ __all__ = [
     "gather_kv_b_proj_flydsl_fp8_supported",
     "gather_kv_b_proj_flydsl_supported",
     "make_fp4_mqa_plan",
+    "normalize_qsa_backend",
     "pa_decode",
+    "qsa_auto_uses_flydsl",
+    "qsa_k1_block_ids",
+    "qsa_k2",
+    "qsa_layer",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
