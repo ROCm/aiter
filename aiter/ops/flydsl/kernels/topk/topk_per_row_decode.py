@@ -10,6 +10,7 @@ candidates in the same launch. No CTA waits on another, so the grid never needs
 to be co-resident. Both the part and the merge run the one-block selector.
 """
 
+from collections import OrderedDict
 from functools import cache
 
 import flydsl.compiler as flyc
@@ -28,6 +29,7 @@ from .radix_topk_one_block import (
     _MAX_ROW_ELEMENTS,
     _VEC,
     build_radix_topk_one_block_body,
+    build_radix_topk_one_block_module,
 )
 from .topk_common import _row_length
 
@@ -62,7 +64,12 @@ def build_topk_per_row_decode_module(
     arch: str,
     packed_rows: bool = False,
 ):
-    """Build the decode kernel; the grid is rows * num_parts CTAs."""
+    """Build the decode kernel; the grid is rows * num_parts CTAs.
+
+    gfx942 intentionally reuses the wave64 one-block body with
+    _LONG_RADIX_DEFAULT. The standalone one-block arch allowlist is a
+    performance routing policy, not a compatibility limit of this body.
+    """
     # Parts always publish values for the merge; the first trip gates its value
     # writes at run time, the merge at build time.
     shared_storage, run_one_block_body = build_radix_topk_one_block_body(
@@ -193,7 +200,10 @@ def build_topk_per_row_decode_module(
 
         def arrive(last_part):
             # Every wave drains its stores before lane 0 publishes the CTA.
-            rocdl.s_waitcnt(vmcnt=0)
+            if const_expr(arch.startswith("gfx12")):
+                rocdl.s_wait_storecnt(0)
+            else:
+                rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
             if tid == 0:
                 fence_agent_release()
@@ -267,34 +277,52 @@ def build_topk_per_row_decode_module(
     return launch_topk_per_row_decode_kernel
 
 
-_WORKSPACES_ATTR = "_aiter_flydsl_topk_decode_workspaces"
+_GRAPH_WORKSPACES_ATTR = "_aiter_flydsl_topk_decode_graph_workspaces"
+_MAX_EAGER_WORKSPACES = 16
+_EAGER_WORKSPACES: OrderedDict[tuple, tuple[torch.Tensor, ...]] = OrderedDict()
 
 
-def _get_workspace(indices, rows, columns):
-    """Keep workspace alive exactly as long as the graph's static output.
-
-    CUDAGraph callers already retain their input/output tensors for replay.
-    An eager warmup allocates and zeros the counters once, so later capture
-    records no memset. Capture without warmup is also valid: its first
-    allocation records a defensive zero-fill in that graph. Different
-    candidate widths receive independent counters. Reusing one output
-    concurrently from multiple streams is already invalid because the final
-    indices would race.
-    """
-    key = (rows, columns)
-    workspaces = getattr(indices, _WORKSPACES_ATTR, None)
-    if workspaces is not None and key in workspaces:
-        return workspaces[key]
-    if workspaces is None:
-        workspaces = {}
-        setattr(indices, _WORKSPACES_ATTR, workspaces)
-    # Arrival starts at zero; the last CTA subtracts active_parts to rearm it.
-    workspace = (
+def _allocate_workspace(indices, rows, columns):
+    return (
         torch.empty((rows, columns), device=indices.device, dtype=torch.int32),
         torch.empty((rows, columns), device=indices.device, dtype=torch.float32),
         torch.zeros((rows,), device=indices.device, dtype=torch.int32),
     )
-    workspaces[key] = workspace
+
+
+def _get_workspace(indices, stream_id, rows, columns):
+    """Return stream-local eager storage or output-owned Graph storage."""
+    device = indices.device
+    if torch.cuda.is_current_stream_capturing():
+        key = (stream_id, rows, columns)
+        workspaces = getattr(indices, _GRAPH_WORKSPACES_ATTR, None)
+        if workspaces is not None and key in workspaces:
+            return workspaces[key]
+        if workspaces is None:
+            workspaces = {}
+            setattr(indices, _GRAPH_WORKSPACES_ATTR, workspaces)
+
+        # Graph capture starts after a device synchronize. Claim a matching
+        # eager warmup workspace and remove it from the eager pool so a later
+        # eager call cannot race this Graph. Capture-first gets private storage.
+        workspace = None
+        for eager_key in reversed(_EAGER_WORKSPACES):
+            eager_device, _, eager_rows, eager_columns = eager_key
+            if (eager_device, eager_rows, eager_columns) == (device, rows, columns):
+                workspace = _EAGER_WORKSPACES.pop(eager_key)
+                break
+        if workspace is None:
+            workspace = _allocate_workspace(indices, rows, columns)
+        workspaces[key] = workspace
+        return workspace
+
+    key = (device, stream_id, rows, columns)
+    workspace = _EAGER_WORKSPACES.pop(key, None)
+    if workspace is None:
+        workspace = _allocate_workspace(indices, rows, columns)
+    _EAGER_WORKSPACES[key] = workspace
+    if len(_EAGER_WORKSPACES) > _MAX_EAGER_WORKSPACES:
+        _EAGER_WORKSPACES.popitem(last=False)
     return workspace
 
 
@@ -316,6 +344,32 @@ def launch_topk_per_row_decode(
     packed_rows: bool,
 ) -> None:
     parts = topk_per_row_decode_parts(rows, width, num_cus, stable)
+    if parts == 1:
+        launcher = build_radix_topk_one_block_module(
+            k,
+            block_threads=_BLOCK_THREADS,
+            write_values=values is not None,
+            stable=stable,
+            short_rows=False,
+            is_decode=True,
+            wave_size=wave_size,
+            arch=arch,
+            packed_rows=packed_rows,
+        )
+        _run_compiled(
+            launcher,
+            logits,
+            row_starts,
+            seq_lens,
+            indices,
+            values if values is not None else logits,
+            width,
+            next_n,
+            rows,
+            stream,
+        )
+        return
+
     launcher = build_topk_per_row_decode_module(
         k,
         stable,
@@ -324,7 +378,9 @@ def launch_topk_per_row_decode(
         arch=arch,
         packed_rows=packed_rows,
     )
-    partial_indices, partial_values, counters = _get_workspace(indices, rows, parts * k)
+    partial_indices, partial_values, counters = _get_workspace(
+        indices, stream.cuda_stream, rows, parts * k
+    )
     _run_compiled(
         launcher,
         logits,

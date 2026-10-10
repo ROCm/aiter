@@ -219,9 +219,10 @@ def build_radix_topk_one_block_body(
         input_row_iter points at the segment's first element; indices are
         reported as index_base + column. The hooks let one part of a split row
         reuse the body: row_labels (a buffer view) replaces the reported
-        indices and write_row_values gates the value writes at run time. The
-        copy for rows no longer than k writes identity indices, so a caller
-        that sets row_labels must never send such a row here.
+        indices and the compile-time write_row_values flag gates value writes.
+        The copy for rows no longer than k writes identity indices and is
+        intentionally disabled for labelled merge rows, which must be longer
+        than k.
         """
         tid = fx.thread_idx.x
         lane = tid % wave_size
@@ -348,6 +349,19 @@ def build_radix_topk_one_block_body(
                 prefix == prefix_threshold,
             )
 
+        def ordered_value(key):
+            bits = (key < zero).select(key ^ sign_bit, key ^ fx.Int32(-1))
+            return fx.Int32(bits).bitcast(fx.Float32)
+
+        def write_selected_value(view, pos, col, key):
+            if const_expr(write_values) and write_row_values:
+                # All NaNs share key -1, so reload only NaNs to preserve their
+                # sign/payload. Every normal value is rebuilt from its VGPR key.
+                if key == fx.Int32(-1):
+                    view[pos] = input_row[col]
+                else:
+                    view[pos] = ordered_value(key)
+
         # FlyDSL tracks indexed stores as SSA writes: store helpers take writable
         # views explicitly; orchestration helpers capture the fixed kernel views.
         def scatter_unstable_key(
@@ -357,15 +371,13 @@ def build_radix_topk_one_block_body(
                 out_pos = atomic_add_i32(metadata, one, _RUNNING_ABOVE, "workgroup")
                 if out_pos < top_k:
                     row_indices[out_pos] = reported_index(col)
-                    if const_expr(write_values) and write_row_values:
-                        row_values[out_pos] = input_row[col]
+                    write_selected_value(row_values, out_pos, col, key)
             elif equal:
                 back_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
                 if back_pos < num_needed:
                     out_pos = top_k - one - back_pos
                     row_indices[out_pos] = reported_index(col)
-                    if const_expr(write_values) and write_row_values:
-                        row_values[out_pos] = input_row[col]
+                    write_selected_value(row_values, out_pos, col, key)
 
         def reset_scatter_counters(metadata, reset_above=True):
             if tid == 0:
@@ -758,14 +770,12 @@ def build_radix_topk_one_block_body(
                         out_pos = my_above + accepted_equal
                         if cls == 2:
                             row_indices[out_pos] = reported_index(col)
-                            if const_expr(write_values) and write_row_values:
-                                row_values[out_pos] = input_row[col]
+                            write_selected_value(row_values, out_pos, col, key)
                             my_above = my_above + 1
                         elif cls == 1:
                             if my_eq < num_needed:
                                 row_indices[out_pos] = reported_index(col)
-                                if const_expr(write_values) and write_row_values:
-                                    row_values[out_pos] = input_row[col]
+                                write_selected_value(row_values, out_pos, col, key)
                             my_eq = my_eq + 1
                 above_base = above_base + (packed_step_total >> _PACKED_COUNT_BITS)
                 next_eq_base = equal_base + (
@@ -1067,8 +1077,7 @@ def build_radix_topk_one_block_body(
                                 staged_local_indices[out_pos] = col
                         else:
                             row_indices[out_pos] = reported_index(col)
-                            if const_expr(write_values) and write_row_values:
-                                row_values[out_pos] = input_row[col]
+                            write_selected_value(row_values, out_pos, col, key)
                 active = active & (prefix == prefix_threshold)
                 if active:
                     bucket = radix_bucket(key, shift, mask)
