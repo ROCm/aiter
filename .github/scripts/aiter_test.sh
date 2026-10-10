@@ -120,6 +120,28 @@ for file in "${sharded_files[@]}"; do
                 "$file"
             )
             ;;
+        op_tests/multigpu_tests/test_mega_moe_tp.py)
+            {
+                echo "Running MegaMoE TP (MiniMax-M3, GLM-5) on 4 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$arch" != "gfx950" || "$ngpu" -lt 4 ]]; then
+                        echo "Skipping $test_file: requires 4 gfx950 GPUs, got $ngpu x $arch"
+                        exit 0
+                    fi
+                    exec torchrun --standalone --nproc_per_node=4 "$test_file" \
+                        --models m3 glm5 --tokens 256 512 1024 2048
+                '
+                _ "$file"
+            )
+            ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
             {
                 echo "Using AITER_MLA_DECODE_PERSISTENT_MAX_BATCH=0 for $file"
