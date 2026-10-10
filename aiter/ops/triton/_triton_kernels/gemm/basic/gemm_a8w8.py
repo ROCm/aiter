@@ -137,9 +137,10 @@ def _gemm_a8w8_kernel(
             # shuffle_weight(layout=(16, 16)) on byte-sized FP8 weights:
             # [N/16, 16, K/32, 2, 16] -> [N/16, K/32, 2, 16, 16].
             # stride_bn is the physical, possibly padded K of the (N, K) buffer.
+            # Widen before multiplication so large weight buffers do not wrap.
             b_ptrs = b_ptr + (
-                (offs_bn[None, :] // 16) * stride_bn * 16
-                + (offs_k_split[:, None] // 16) * 256
+                (offs_bn[None, :].to(tl.int64) // 16) * stride_bn * 16
+                + (offs_k_split[:, None].to(tl.int64) // 16) * 256
                 + (offs_bn[None, :] % 16) * 16
                 + offs_k_split[:, None] % 16
             )
