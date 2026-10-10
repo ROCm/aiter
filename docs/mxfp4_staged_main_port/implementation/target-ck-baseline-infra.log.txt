@@ -1,0 +1,122 @@
+test_returns_zero_on_invalid_time (op_tests.tuning_tests.test_tuner_infra.TestCalculate.test_returns_zero_on_invalid_time) ... [aiter] [pid=255519 pname=MainProcess] start build [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-notes/target-ck-baseline-jit/build/module_aiter_core
+[aiter] [pid=255519 pname=MainProcess] [32mfinish build [module_aiter_core], cost 10.1s [0m
+[aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-notes/target-ck-baseline-jit/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-integration/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+ok
+test_tflops_bw_positive (op_tests.tuning_tests.test_tuner_infra.TestCalculate.test_tflops_bw_positive) ... ok
+test_all_shapes_fail (op_tests.tuning_tests.test_tuner_infra.TestPostProcess.test_all_shapes_fail)
+When all kernels for all shapes fail, should still produce fallback entries. ... [aiter] error: no valid candidate found for ('gfx942', 304, 1, 1024, 512), please check the result or errRatio in all result file running with --profile_file
+[aiter] No kernel can be used for ('gfx942', 304, 1, 1024, 512)
+[aiter] error: no valid candidate found for ('gfx942', 304, 32, 2048, 1024), please check the result or errRatio in all result file running with --profile_file
+[aiter] No kernel can be used for ('gfx942', 304, 32, 2048, 1024)
+ok
+test_filters_by_err_ratio (op_tests.tuning_tests.test_tuner_infra.TestPostProcess.test_filters_by_err_ratio)
+Kernels exceeding errRatio should be skipped. ... ok
+test_filters_invalid_and_inf_times (op_tests.tuning_tests.test_tuner_infra.TestPostProcess.test_filters_invalid_and_inf_times)
+us=-1 (error) and us=inf (timeout) should be excluded. ... ok
+test_picks_fastest_per_shape (op_tests.tuning_tests.test_tuner_infra.TestPostProcess.test_picks_fastest_per_shape)
+Basic: 2 shapes, 3 kernels each, picks fastest. ... ok
+test_single_shape_single_kernel (op_tests.tuning_tests.test_tuner_infra.TestPostProcess.test_single_shape_single_kernel)
+Minimal case: 1 shape, 1 kernel -> should work. ... ok
+test_topk_not_leak_across_shapes (op_tests.tuning_tests.test_tuner_infra.TestPostProcess.test_topk_not_leak_across_shapes)
+BUG REGRESSION: topk must not leak between shapes. ... [aiter] error: no valid candidate found for ('gfx942', 304, 1, 1024, 512), please check the result or errRatio in all result file running with --profile_file
+[aiter] No kernel can be used for ('gfx942', 304, 1, 1024, 512)
+ok
+test_topk_not_shrink_across_shapes (op_tests.tuning_tests.test_tuner_infra.TestPostProcess.test_topk_not_shrink_across_shapes)
+topk should not shrink when one shape has fewer valid candidates than topk. ... ok
+test_drops_all_na_rows (op_tests.tuning_tests.test_tuner_infra.TestReadCSV.test_drops_all_na_rows) ... ok
+test_drops_unnamed_columns (op_tests.tuning_tests.test_tuner_infra.TestReadCSV.test_drops_unnamed_columns) ... ok
+test_strips_whitespace (op_tests.tuning_tests.test_tuner_infra.TestReadCSV.test_strips_whitespace) ... ok
+test_deduplicates (op_tests.tuning_tests.test_tuner_infra.TestSortResults.test_deduplicates) ... ok
+test_column_mismatch_merges (op_tests.tuning_tests.test_tuner_infra.TestUpdateConfigFiles.test_column_mismatch_merges)
+Two CSVs with different columns -> merged with missing cols filled. ... ok
+test_empty_path_returns_as_is (op_tests.tuning_tests.test_tuner_infra.TestUpdateConfigFiles.test_empty_path_returns_as_is) ... ok
+test_missing_second_file (op_tests.tuning_tests.test_tuner_infra.TestUpdateConfigFiles.test_missing_second_file)
+Second path doesn't exist -> only first file data. ... ok
+test_single_path_returns_as_is (op_tests.tuning_tests.test_tuner_infra.TestUpdateConfigFiles.test_single_path_returns_as_is) ... ok
+test_tag_column_dedup (op_tests.tuning_tests.test_tuner_infra.TestUpdateConfigFiles.test_tag_column_dedup)
+CSVs with _tag column -> dedup uses keys + _tag. ... ok
+test_two_files_merge_dedup (op_tests.tuning_tests.test_tuner_infra.TestUpdateConfigFiles.test_two_files_merge_dedup)
+Two CSVs with overlapping keys -> merged, fastest us kept. ... ok
+test_two_files_non_overlapping (op_tests.tuning_tests.test_tuner_infra.TestUpdateConfigFiles.test_two_files_non_overlapping)
+Two CSVs with different keys -> both rows in output. ... ok
+test_appends_new_key (op_tests.tuning_tests.test_tuner_infra.TestUpdateTunedf.test_appends_new_key) ... ok
+test_merges_existing_key (op_tests.tuning_tests.test_tuner_infra.TestUpdateTunedf.test_merges_existing_key) ... ok
+test_below_threshold (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_below_threshold)
+1% speedup is below 3% threshold -> skip. ... ok
+test_both_error (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_both_error)
+Both pre and post error -> skip. ... ok
+test_empty_post (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_empty_post)
+Empty post results -> empty plan. ... ok
+test_empty_pre (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_empty_pre)
+Empty pre results -> empty plan. ... ok
+test_multi_shape_mixed (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_multi_shape_mixed)
+Multiple shapes: one improved, one below threshold, one error. ... ok
+test_no_baseline (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_no_baseline)
+Pre has error, post is ok -> update with 'no_baseline' reason. ... ok
+test_post_error (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_post_error)
+Pre ok, post error -> skip. ... ok
+test_regression_zero_speedup (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_regression_zero_speedup)
+Post is slower than pre -> skip (negative improvement). ... ok
+test_threshold_met (op_tests.tuning_tests.test_compare_logic.TestBuildCompareUpdatePlan.test_threshold_met)
+50% speedup exceeds 3% threshold -> update. ... ok
+test_base_has_extra_shapes (op_tests.tuning_tests.test_compare_logic.TestMergeCompareFilteredResults.test_base_has_extra_shapes)
+Base has shapes not in comparison -> they are preserved. ... ok
+test_candidate_file_missing (op_tests.tuning_tests.test_compare_logic.TestMergeCompareFilteredResults.test_candidate_file_missing)
+Candidate file doesn't exist -> returns base. ... ok
+test_empty_comparison_returns_base (op_tests.tuning_tests.test_compare_logic.TestMergeCompareFilteredResults.test_empty_comparison_returns_base)
+Empty comparison DataFrame -> returns base unchanged. ... ok
+test_improved_shapes_replaced (op_tests.tuning_tests.test_compare_logic.TestMergeCompareFilteredResults.test_improved_shapes_replaced)
+Improved shape is taken from candidate CSV. ... ok
+test_mixed_update_and_skip (op_tests.tuning_tests.test_compare_logic.TestMergeCompareFilteredResults.test_mixed_update_and_skip)
+Two shapes: one improved, one not. ... ok
+test_no_updates_returns_base (op_tests.tuning_tests.test_compare_logic.TestMergeCompareFilteredResults.test_no_updates_returns_base)
+Comparison all skip -> returns base unchanged. ... ok
+test_non_improved_kept (op_tests.tuning_tests.test_compare_logic.TestMergeCompareFilteredResults.test_non_improved_kept)
+Non-improved shape keeps base value. ... ok
+test_accelerator_breaks_immediately (op_tests.tuning_tests.test_mp_tuner_logic.TestAcceleratorError.test_accelerator_breaks_immediately)
+AcceleratorError should break immediately and trigger restart. ... ok
+test_2gpu_half_is_1 (op_tests.tuning_tests.test_mp_tuner_logic.TestConsecutiveTimeouts.test_2gpu_half_is_1)
+2 GPUs: half=1, single consecutive timeout triggers break. ... ok
+test_half_gpu_consecutive_triggers_break (op_tests.tuning_tests.test_mp_tuner_logic.TestConsecutiveTimeouts.test_half_gpu_consecutive_triggers_break)
+4 consecutive timeouts with 8 GPUs (half=4): should break. ... ok
+test_pending_timeout_resets_consecutive (op_tests.tuning_tests.test_mp_tuner_logic.TestConsecutiveTimeouts.test_pending_timeout_resets_consecutive)
+Task not yet expired (still running) resets consecutive count. ... ok
+test_single_timeout_no_break_8gpu (op_tests.tuning_tests.test_mp_tuner_logic.TestConsecutiveTimeouts.test_single_timeout_no_break_8gpu)
+1 stuck GPU out of 8: should NOT break early. ... ok
+test_success_resets_consecutive (op_tests.tuning_tests.test_mp_tuner_logic.TestConsecutiveTimeouts.test_success_resets_consecutive)
+Success in between resets counter: 3 timeouts, 1 ok, 3 timeouts != break for 8 GPU. ... ok
+test_keyerror_no_restart_without_root_cause (op_tests.tuning_tests.test_mp_tuner_logic.TestKeyErrorHandling.test_keyerror_no_restart_without_root_cause)
+If only KeyError tasks remain, no restart, they keep polling. ... ok
+test_keyerror_stays_in_remaining (op_tests.tuning_tests.test_mp_tuner_logic.TestKeyErrorHandling.test_keyerror_stays_in_remaining)
+KeyError tasks should NOT be in completed_this_round. ... ok
+test_keyerror_with_timeout_gets_resubmitted (op_tests.tuning_tests.test_mp_tuner_logic.TestKeyErrorHandling.test_keyerror_with_timeout_gets_resubmitted)
+KeyError tasks wait for root-cause timeout to trigger restart. ... ok
+test_queued_task_has_no_elapsed_execution_time (op_tests.tuning_tests.test_mp_tuner_logic.TestTaskExecutionTiming.test_queued_task_has_no_elapsed_execution_time) ... ok
+test_worker_records_start_only_when_task_leaves_queue (op_tests.tuning_tests.test_mp_tuner_logic.TestTaskExecutionTiming.test_worker_records_start_only_when_task_leaves_queue) ... choose 0 kernels
+choose 0 kernels
+Tuning result for 'gfx': 'gfx942', 'cu_num': 304, 'M': 1, 'N': 1024, 'K': 512 is kernelId=2 kernel_2 splitK=0, 8.0us, err_ratio=0.02, tflops=0.13 TFLOPS, bw=131.46 GB/s
+Tuning result for 'gfx': 'gfx942', 'cu_num': 304, 'M': 1, 'N': 1024, 'K': 512 is kernelId=2 kernel_2 splitK=0, 7.0us, err_ratio=0.01, tflops=0.15 TFLOPS, bw=150.24 GB/s
+Tuning result for 'gfx': 'gfx942', 'cu_num': 304, 'M': 1, 'N': 1024, 'K': 512 is kernelId=0 kernel_0 splitK=0, 5.0us, err_ratio=0.01, tflops=0.21 TFLOPS, bw=210.33 GB/s
+choose 0 kernels
+choose 1 kernels
+path 1: /tmp/tmphmcu31am/nonexistent.csv (not exist)
+[aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-notes/target-ck-baseline-jit/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-integration/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+ok
+test_reset_clears_only_the_given_slots (op_tests.tuning_tests.test_mp_tuner_logic.TestTaskStartTimeReset.test_reset_clears_only_the_given_slots) ... ok
+test_reset_clears_worker_pids (op_tests.tuning_tests.test_mp_tuner_logic.TestTaskStartTimeReset.test_reset_clears_worker_pids) ... ok
+test_exited_worker_is_detected (op_tests.tuning_tests.test_mp_tuner_logic.TestTaskWorkerExit.test_exited_worker_is_detected) ... ok
+test_worker_pid_recorded_when_task_starts (op_tests.tuning_tests.test_mp_tuner_logic.TestTaskWorkerExit.test_worker_pid_recorded_when_task_starts) ... [aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-notes/target-ck-baseline-jit/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-integration/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+ok
+test_finite_error_ratio_keeps_maximum (op_tests.tuning_tests.test_mp_tuner_logic.TestWorkerErrorRatio.test_finite_error_ratio_keeps_maximum) ... ok
+test_nonfinite_error_ratio_is_rejected (op_tests.tuning_tests.test_mp_tuner_logic.TestWorkerErrorRatio.test_nonfinite_error_ratio_is_rejected) ... ok
+
+----------------------------------------------------------------------
+Ran 55 tests in 18.210s
+
+OK
