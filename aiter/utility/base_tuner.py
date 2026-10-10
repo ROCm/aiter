@@ -16,6 +16,7 @@ import torch
 
 from aiter import dtypes, logger
 from aiter.jit.utils.chip_info import get_gfx_runtime as _chip_get_gfx
+from aiter.jit.utils.chip_info import gfx_from_cu_num
 
 INVALID_TIME = -1
 
@@ -35,6 +36,7 @@ def _read_csv(filepath, **kwargs):
 
 
 class TunerCommon:
+    input_metadata: ClassVar[tuple[str, ...]] = ()
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         "verbose": False,
         "tune_file": "",
@@ -182,7 +184,9 @@ class TunerCommon:
             "--profile_file",
             default=defaults["profile_file"],
             required=False,
-            help="output: all tuning results stored in this file",
+            help=getattr(
+                self, "PROFILE_HELP", "output: all tuning results stored in this file"
+            ),
         )
         self.parser.add_argument(
             "--warmup",
@@ -278,10 +282,10 @@ class TunerCommon:
         ## merge config files
         ##example: AITER_CONFIG_GEMM_A4W4="/path1:/path2"
 
-        df_list.append(_read_csv(path_list[0]))
+        df_list.append(self._normalize_tuned_identity(_read_csv(path_list[0])))
         for i, path in enumerate(path_list[1:]):
             if os.path.exists(path):
-                df = _read_csv(path)
+                df = self._normalize_tuned_identity(_read_csv(path))
                 df_list.append(df)
             else:
                 print(f"path {i+1}: {path} (not exist)")
@@ -347,6 +351,27 @@ class TunerCommon:
             print(f"Not exist tuned file: {all_tuned_file}")
             columns = self.columns if not columns else columns
             tunedf = pd.DataFrame(columns=columns)
+        return self._normalize_tuned_csv(tunedf)
+
+    def _normalize_tuned_csv(self, tunedf):
+        return self._normalize_tuned_identity(tunedf)
+
+    def _normalize_tuned_identity(self, tunedf):
+        """Backfill only missing legacy identities; retain explicit device rows."""
+        tunedf = tunedf.copy()
+        if "gfx" in self.keys:
+            if "gfx" not in tunedf:
+                tunedf.insert(0, "gfx", pd.Series(index=tunedf.index, dtype=object))
+            missing = tunedf["gfx"].isna() | tunedf["gfx"].astype(str).str.strip().eq(
+                ""
+            )
+            if missing.any():
+                if "cu_num" in tunedf:
+                    tunedf.loc[missing, "gfx"] = tunedf.loc[missing, "cu_num"].map(
+                        gfx_from_cu_num
+                    )
+                else:
+                    tunedf.loc[missing, "gfx"] = self.get_gfx()
         return tunedf
 
     def get_retune_gemm_list(self, args):
@@ -360,12 +385,16 @@ class TunerCommon:
             cu_num = self.get_cu_num()
             if "gfx" not in self.untunedf.columns:
                 self.untunedf["gfx"] = gfx
+            if "cu_num" not in self.untunedf.columns:
+                self.untunedf["cu_num"] = cu_num
             target_mask = (self.untunedf["gfx"] == gfx) & (
                 self.untunedf["cu_num"] == cu_num
             )
             self.tunedf = self.untunedf[~target_mask]
             self.untunedf = self.untunedf[target_mask]
-            self.untunedf = self.untunedf[self.keys]
+            self.untunedf = self.untunedf[
+                self.keys + [c for c in self.input_metadata if c in self.untunedf]
+            ]
         else:
             # retune shapes that are in both untune_file and tune_file
             untunedf = self.get_untuned_gemm_list(args.untune_file)
@@ -381,12 +410,14 @@ class TunerCommon:
                 else:
                     untunedf["gfx"] = gfx
                 untunedf = untunedf[target_mask]
-            self.untunedf = untunedf[self.keys]
+            self.untunedf = untunedf[
+                self.keys + [c for c in self.input_metadata if c in untunedf]
+            ]
             self.tunedf = self.get_tuned_gemm_list(args.tune_file)
             if "gfx" not in self.tunedf.columns and "gfx" in self.untunedf.columns:
                 self.tunedf.insert(0, "gfx", gfx)
 
-            untunedf_cols = self.untunedf.columns
+            untunedf_cols = self.keys
             mask = (
                 self.tunedf[untunedf_cols]
                 .apply(tuple, axis=1)
@@ -400,9 +431,12 @@ class TunerCommon:
     def update_tunedf(self, df_old, df_updates):
         """update tuned result to old df"""
         """ for shapes already tuned, we update the result inplace"""
+        df_old = self._normalize_tuned_csv(df_old)
         if df_updates.empty:
             return df_old
         key_columns = self.keys
+        dedup_keys = key_columns + (["_tag"] if "_tag" in df_old else [])
+        df_old = df_old.drop_duplicates(subset=dedup_keys, keep="last").copy()
         df_updates = df_updates.loc[:, self.columns]
         # Backfill columns present in the new results but missing from a legacy
         # tuned CSV (for example a newly added gfx key column), so that the
@@ -456,7 +490,12 @@ class TunerCommon:
         return df_old
 
     def sortResults(self, tune_file, issorted, values):
-        tunedf = _read_csv(tune_file)
+        if not os.path.exists(tune_file):
+            return
+        try:
+            tunedf = self._normalize_tuned_csv(_read_csv(tune_file))
+        except pd.errors.EmptyDataError:
+            return
         # Migrate legacy tuned files lacking a gfx column so the gfx-aware
         # dedup/sort keys below do not KeyError; keep gfx as the leading column.
         if "gfx" in self.keys and "gfx" not in tunedf.columns:
@@ -538,6 +577,9 @@ class TunerCommon:
         resultdf = self.result_to_df(bestConfigs)
         return resultdf
 
+    def _summary_shape_keys(self):
+        return self.keys
+
     def tune_summary(self, status):
         """Summary of tuning results"""
         logger.info("============= Tuning results Summary: ==============")
@@ -552,10 +594,14 @@ class TunerCommon:
         logger.info("Failed shapes:")
         print(self.failed, flush=True)
 
-        tunedf_subset = tunedf[self.untunedf.columns].astype(self.untunedf.dtypes)
-        mask = self.untunedf.apply(tuple, axis=1).isin(
-            tunedf_subset.apply(tuple, axis=1)
-        )
+        # Input-only validation metadata is not part of the persisted shape key.
+        keys = self._summary_shape_keys()
+        requested = self.untunedf[keys].copy()
+        tunedf_subset = tunedf[keys].astype(requested.dtypes)
+        for column in requested.select_dtypes(include="object"):
+            requested[column] = requested[column].map(str)
+            tunedf_subset[column] = tunedf_subset[column].map(str)
+        mask = requested.apply(tuple, axis=1).isin(tunedf_subset.apply(tuple, axis=1))
         self.remain_untuned = self.untunedf[~mask]
 
         if not self.remain_untuned.empty:
