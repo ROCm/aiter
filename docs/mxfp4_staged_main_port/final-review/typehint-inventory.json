@@ -1,0 +1,3588 @@
+[
+  {
+    "path": "aiter/aot/flydsl/mxfp4_moe.py",
+    "line": 105,
+    "name": "parse_csv",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": false
+  },
+  {
+    "path": "aiter/utility/base_tuner.py",
+    "line": 356,
+    "name": "_normalize_tuned_csv",
+    "missing": [
+      "tunedf",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "aiter/utility/base_tuner.py",
+    "line": 359,
+    "name": "_normalize_tuned_identity",
+    "missing": [
+      "tunedf",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "aiter/utility/base_tuner.py",
+    "line": 580,
+    "name": "_summary_shape_keys",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 5974,
+    "name": "_already_tuned_mask",
+    "missing": [
+      "dedup_cols",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6497,
+    "name": "_capture_configuration",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6510,
+    "name": "_invocation_configuration",
+    "missing": [
+      "args",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6521,
+    "name": "parse_args",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6527,
+    "name": "pre_process",
+    "missing": [
+      "args",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6531,
+    "name": "_setup_specific_arguments",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6541,
+    "name": "_unsupported_row_reason",
+    "missing": [
+      "row",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6581,
+    "name": "_already_tuned_mask",
+    "missing": [
+      "dedup_cols",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6595,
+    "name": "_runtime_device_identity",
+    "missing": [
+      "gpu",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6603,
+    "name": "get_gfx",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6615,
+    "name": "get_cu_num",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6622,
+    "name": "_preflight_devices",
+    "missing": [
+      "mp_num",
+      "ngpu",
+      "staged",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6632,
+    "name": "_summary_shape_keys",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6638,
+    "name": "_normalize_tuned_csv",
+    "missing": [
+      "tunedf",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 6895,
+    "name": "_staged_candidate_plan",
+    "missing": [
+      "row",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+    "line": 7106,
+    "name": "_screening_limit",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/03/create_fixtures.py",
+    "line": 303,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/03/create_fixtures.py",
+    "line": 332,
+    "name": "forbidden",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/03/summarize_acceptance.py",
+    "line": 9,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+    "line": 23,
+    "name": "alternating_samples",
+    "missing": [
+      "measure",
+      "repeats",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+    "line": 43,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+    "line": 104,
+    "name": "launch",
+    "missing": [
+      "label",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+    "line": 117,
+    "name": "measure",
+    "missing": [
+      "label",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+    "line": 137,
+    "name": "fingerprint",
+    "missing": [
+      "tensor",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/create_calibration.py",
+    "line": 21,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/create_calibration.py",
+    "line": 97,
+    "name": "forbidden",
+    "missing": [
+      "*unused_args",
+      "*unused_kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/run_calibration.py",
+    "line": 18,
+    "name": "write_json",
+    "missing": [
+      "path",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/run_calibration.py",
+    "line": 23,
+    "name": "parse_search_console",
+    "missing": [
+      "console",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/run_calibration.py",
+    "line": 48,
+    "name": "finalize_search",
+    "missing": [
+      "job",
+      "job_dir",
+      "counts",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/run_calibration.py",
+    "line": 107,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 14,
+    "name": "finite_number",
+    "missing": [
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 22,
+    "name": "search_result",
+    "missing": [
+      "record",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 52,
+    "name": "comparison",
+    "missing": [
+      "reference",
+      "candidate",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 64,
+    "name": "wall_totals",
+    "missing": [
+      "searches",
+      "model",
+      "config",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 89,
+    "name": "rank_retention",
+    "missing": [
+      "prune_winner",
+      "console",
+      "screen_topk",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 135,
+    "name": "staged_fallback_groups",
+    "missing": [
+      "console",
+      "screen_topk",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 156,
+    "name": "summarize",
+    "missing": [
+      "records",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 206,
+    "name": "load_records",
+    "missing": [
+      "manifest",
+      "gpu_dir",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 251,
+    "name": "display",
+    "missing": [
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 257,
+    "name": "error_range",
+    "missing": [
+      "errors",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 264,
+    "name": "markdown_report",
+    "missing": [
+      "report",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_calibration.py",
+    "line": 397,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/summarize_deployment.py",
+    "line": 13,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_alternating_replay.py",
+    "line": 15,
+    "name": "test_alternating_pairs_keep_every_sample_and_reverse_order_between_cycles",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_alternating_replay.py",
+    "line": 19,
+    "name": "measure",
+    "missing": [
+      "label",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_console.py",
+    "line": 14,
+    "name": "test_search_report_counts_valid_and_failed_attempts_and_actual_summary",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_console.py",
+    "line": 35,
+    "name": "test_finalize_exited_search_records_complete_evidence_without_gpu_launch",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_console.py",
+    "line": 69,
+    "name": "test_finalize_failed_completed_search_reports_pair_failure_not_incomplete",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 15,
+    "name": "summary_module",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 23,
+    "name": "manifest_records",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 55,
+    "name": "update",
+    "missing": [
+      "records",
+      "identifier",
+      "*result",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 59,
+    "name": "test_missing_and_nonfinite_winners_keep_all_paired_outcomes",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 82,
+    "name": "test_regret_separates_pruning_and_screening_on_matching_valid_winners",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 123,
+    "name": "test_default_and_extended_wall_totals_retain_incomplete_accounting",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 162,
+    "name": "test_prune_valid_staged_invalid_counts_each_failure_cause",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 191,
+    "name": "test_cli_reads_completed_search_artifacts_and_keeps_missing_searches",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 252,
+    "name": "test_cli_preserves_recorded_failure_cause_and_nonzero_task_exit",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 299,
+    "name": "test_rank_retention_uses_stable_nonatomic_ties_and_separate_atomic_group",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 346,
+    "name": "test_failed_screen_has_no_rank_even_when_fallback_validates_pair",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 365,
+    "name": "test_fallback_count_infers_expansion_after_nonempty_shortlist_failure",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 383,
+    "name": "test_fallback_count_unions_explicit_and_inferred_groups_once",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/04/test_calibration_summary.py",
+    "line": 397,
+    "name": "test_cli_reports_rank_retention_only_when_staged_log_exists",
+    "missing": [
+      "tmp_path",
+      "compressed",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/compile_selected.py",
+    "line": 9,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 31,
+    "name": "write_json",
+    "missing": [
+      "path",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 45,
+    "name": "fingerprint",
+    "missing": [
+      "tensor",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 53,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 32,
+    "name": "json_value",
+    "missing": [
+      "item",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 177,
+    "name": "capture_reduction",
+    "missing": [
+      "target",
+      "out",
+      "token",
+      "topk",
+      "hidden",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 191,
+    "name": "capture_quantized_scatter",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 201,
+    "name": "capture_g1",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 241,
+    "name": "capture_g2",
+    "missing": [
+      "*positional",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 339,
+    "name": "production",
+    "missing": [
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "line": 371,
+    "name": "pair",
+    "missing": [
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/default_replay.py",
+    "line": 31,
+    "name": "write_json",
+    "missing": [
+      "path",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/default_replay.py",
+    "line": 36,
+    "name": "fingerprint",
+    "missing": [
+      "tensor",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/default_replay.py",
+    "line": 44,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/default_replay.py",
+    "line": 113,
+    "name": "capture_g1",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/default_replay.py",
+    "line": 146,
+    "name": "capture_g2",
+    "missing": [
+      "*positional",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/default_replay.py",
+    "line": 210,
+    "name": "production",
+    "missing": [
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 26,
+    "name": "utc_now",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 30,
+    "name": "write_json",
+    "missing": [
+      "path",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 34,
+    "name": "command_json",
+    "missing": [
+      "command",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 42,
+    "name": "snapshot",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 66,
+    "name": "identity_matches",
+    "missing": [
+      "sample",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 72,
+    "name": "is_idle",
+    "missing": [
+      "sample",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 90,
+    "name": "await_idle",
+    "missing": [
+      "artifact",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 106,
+    "name": "verify_child",
+    "missing": [
+      "artifact",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 146,
+    "name": "stop_owned_processes",
+    "missing": [
+      "process",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 160,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/run_gpu_task.py",
+    "line": 240,
+    "name": "cancelled",
+    "missing": [
+      "signum",
+      "frame",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 13,
+    "name": "controller",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 21,
+    "name": "sample",
+    "missing": [
+      "use",
+      "memory",
+      "processes",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 33,
+    "name": "test_idle_gate_distinguishes_discovery_from_real_gpu_work",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 46,
+    "name": "test_physical_identity_requires_uuid_and_pci",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 57,
+    "name": "test_cancellation_stops_the_owned_process_group_before_waiting",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 72,
+    "name": "test_unavailable_occupancy_uses_remaining_idle_evidence",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 84,
+    "name": "test_cancellation_cleans_a_cpu_descendant",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "docs/mxfp4_staged_main_port/scripts/test_run_gpu_task.py",
+    "line": 64,
+    "name": "wait",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/_controlled_tuner_import.py",
+    "line": 19,
+    "name": "import_moe_tuner",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/_controlled_tuner_import.py",
+    "line": 23,
+    "name": "discover",
+    "missing": [
+      "command",
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/_mxfp4_selected_batch_smoke.py",
+    "line": 11,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/_mxfp4_selected_batch_smoke.py",
+    "line": 18,
+    "name": "forbidden",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/_mxfp4_selected_batch_smoke.py",
+    "line": 21,
+    "name": "compile_without_launch",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/run_controlled_tuner_checks.py",
+    "line": 16,
+    "name": "main",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 25,
+    "name": "offline_environment",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 44,
+    "name": "winner_csv",
+    "missing": [
+      "tmp_path",
+      "activation",
+      "epilog",
+      "bn",
+      "bm",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 67,
+    "name": "test_custom_limit_changes_stage1_compile_jobs_without_changing_names",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 81,
+    "name": "test_invalid_limits_are_rejected_before_aot_jobs_are_returned",
+    "missing": [
+      "tmp_path",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 87,
+    "name": "test_situv2_retains_default_parameter_variants_and_rejects_a_custom_limit",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 101,
+    "name": "test_omitted_limit_matches_batch_environment_and_explicit_limit_takes_precedence",
+    "missing": [
+      "monkeypatch",
+      "tmp_path",
+      "activation",
+      "default",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 117,
+    "name": "external_compiler",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 131,
+    "name": "test_standalone_accepts_custom_limit_and_compiles_the_discovered_jobs",
+    "missing": [
+      "monkeypatch",
+      "tmp_path",
+      "external_compiler",
+      "capsys",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 146,
+    "name": "test_enabled_fp4_scatter_jobs_match_production_and_preserve_bias_fallback",
+    "missing": [
+      "monkeypatch",
+      "tmp_path",
+      "bn",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 159,
+    "name": "test_fp4_scatter_compile_entry_supplies_valid_packed_payload_and_e8m0_scales",
+    "missing": [
+      "monkeypatch",
+      "tmp_path",
+      "bn",
+      "external_compiler",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 185,
+    "name": "test_stage2_flags_select_matching_compile_jobs_and_leave_atomic_bf16",
+    "missing": [
+      "monkeypatch",
+      "tmp_path",
+      "external_compiler",
+      "fp8",
+      "fp4",
+      "reduce_dtype",
+      "scatter_dtype",
+      "limit",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 218,
+    "name": "test_fp4_flag_keeps_bn512_scatter_on_supported_bf16_path",
+    "missing": [
+      "monkeypatch",
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 225,
+    "name": "test_selected_csv_batch_collection_uses_matching_environment_and_excludes_other_csvs",
+    "missing": [
+      "monkeypatch",
+      "tmp_path",
+      "external_compiler",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 252,
+    "name": "test_documented_selected_csv_batch_runs_real_pool_in_an_independent_cpu_process",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 35,
+    "name": "forbidden",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_aot_configuration.py",
+    "line": 122,
+    "name": "compile_without_launch",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 25,
+    "name": "test_invocation_captures_limit_and_stage2_settings_for_every_shape",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 49,
+    "name": "test_invalid_activation_limit_rejects_invocation_before_gpu_work",
+    "missing": [
+      "monkeypatch",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 60,
+    "name": "test_custom_limit_rejects_situv2_even_if_same_shape_is_already_tuned",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 72,
+    "name": "test_separate_invocations_on_one_tuner_capture_current_settings",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 89,
+    "name": "test_fp8_stage2_pair_and_screening_receive_original_route_weights",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 132,
+    "name": "test_production_stage2_path_matches_invocation_configuration",
+    "missing": [
+      "monkeypatch",
+      "fp8",
+      "fp4",
+      "epilog",
+      "bn",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 235,
+    "name": "cpu_configuration_worker",
+    "missing": [
+      "payload",
+      "result_tx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 282,
+    "name": "test_spawned_shape_inherits_snapshot_and_stable_production_settings",
+    "missing": [
+      "monkeypatch",
+      "limit",
+      "fp8",
+      "fp4",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 330,
+    "name": "test_custom_limit_same_key_skips_or_replaces_csv_as_requested",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "retune",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 104,
+    "name": "stage2",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 168,
+    "name": "gemm",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 171,
+    "name": "reduction",
+    "missing": [
+      "target",
+      "out",
+      "token",
+      "topk",
+      "hidden",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 178,
+    "name": "scatter",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 182,
+    "name": "quantized_scatter",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 35,
+    "name": "tune_shape",
+    "missing": [
+      "row",
+      "args",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_configured_paths.py",
+    "line": 304,
+    "name": "cpu_only_start",
+    "missing": [
+      "process",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_public_situv2_defaults.py",
+    "line": 24,
+    "name": "test_actual_mxfp4_stage_receives_omitted_defaults_and_explicit_parameters",
+    "missing": [
+      "monkeypatch",
+      "beta",
+      "linear_beta",
+      "expected",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_public_situv2_defaults.py",
+    "line": 29,
+    "name": "stage1",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_public_situv2_defaults.py",
+    "line": 33,
+    "name": "stage2",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 25,
+    "name": "test_g1_screening_times_only_direct_kernel_after_untimed_setup",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 83,
+    "name": "fake_case",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 118,
+    "name": "test_g1_screening_matches_bm_input_quantization_and_effective_default_parameters",
+    "missing": [
+      "monkeypatch",
+      "bm",
+      "act",
+      "configured_limit",
+      "expected_limit",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 222,
+    "name": "test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 322,
+    "name": "test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap",
+    "missing": [
+      "monkeypatch",
+      "limit",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 30,
+    "name": "prepare",
+    "missing": [
+      "*args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 34,
+    "name": "prepare_launch",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 38,
+    "name": "measure",
+    "missing": [
+      "launch",
+      "num_warmup",
+      "num_iters",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 60,
+    "name": "__init__",
+    "missing": [
+      "shape",
+      "dtype",
+      "value",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 66,
+    "name": "view",
+    "missing": [
+      "dtype",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 69,
+    "name": "numel",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 75,
+    "name": "zero_",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 79,
+    "name": "__getitem__",
+    "missing": [
+      "index",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 141,
+    "name": "prepare_case",
+    "missing": [
+      "*args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 146,
+    "name": "sort",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 152,
+    "name": "prequant",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 160,
+    "name": "prepare_output",
+    "missing": [
+      "input",
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 169,
+    "name": "direct",
+    "missing": [
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 190,
+    "name": "measure",
+    "missing": [
+      "call",
+      "num_warmup",
+      "num_iters",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 239,
+    "name": "prepare_case",
+    "missing": [
+      "*args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 243,
+    "name": "sort",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 249,
+    "name": "producer",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 260,
+    "name": "consume",
+    "missing": [
+      "payload",
+      "w1",
+      "w2",
+      "sti",
+      "sei",
+      "nvi",
+      "output",
+      "topk",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 281,
+    "name": "measure",
+    "missing": [
+      "call",
+      "num_warmup",
+      "num_iters",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 340,
+    "name": "torch_stage1",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 347,
+    "name": "populate",
+    "missing": [
+      "reference",
+      "intermediate",
+      "token",
+      "topk",
+      "bm",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 356,
+    "name": "consume",
+    "missing": [
+      "payload",
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 364,
+    "name": "torch_stage2",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 369,
+    "name": "compare",
+    "missing": [
+      "reference",
+      "actual",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 374,
+    "name": "pair",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_execution.py",
+    "line": 380,
+    "name": "torch_ref",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 24,
+    "name": "parse_cli",
+    "missing": [
+      "monkeypatch",
+      "*options",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 31,
+    "name": "test_cli_accepts_staged_with_default_screening_topk",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 38,
+    "name": "test_cli_accepts_any_positive_staged_screening_topk",
+    "missing": [
+      "monkeypatch",
+      "screen_topk",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 51,
+    "name": "test_cli_preserves_default_prune_and_full",
+    "missing": [
+      "monkeypatch",
+      "mode",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 61,
+    "name": "test_cli_rejects_explicit_screening_topk_without_explicit_staged",
+    "missing": [
+      "monkeypatch",
+      "capsys",
+      "mode",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 74,
+    "name": "test_cli_rejects_nonpositive_or_noninteger_screening_topk",
+    "missing": [
+      "monkeypatch",
+      "screen_topk",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 88,
+    "name": "test_cli_retains_tuner_and_grouped_combination_checks",
+    "missing": [
+      "monkeypatch",
+      "options",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 94,
+    "name": "pair_names",
+    "missing": [
+      "rows",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 98,
+    "name": "test_staged_plan_projects_real_pruned_pairs_and_supports_i384_without_gpu",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 128,
+    "name": "test_staged_keeps_main_m_est_boundary_rules",
+    "missing": [
+      "m_est",
+      "expected_bms",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 162,
+    "name": "test_staged_rejects_actual_shape_contract_before_enumeration",
+    "missing": [
+      "monkeypatch",
+      "updates",
+      "reason",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 176,
+    "name": "plan_fixture",
+    "missing": [
+      "monkeypatch",
+      "row",
+      "pairs",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 191,
+    "name": "test_staged_preserves_complete_names_and_groups_reduce_with_scatter",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 285,
+    "name": "test_staged_rejects_incompatible_admitted_pair_contract",
+    "missing": [
+      "monkeypatch",
+      "bm",
+      "g1",
+      "g2",
+      "reason",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 300,
+    "name": "test_staged_shape_validates_only_successful_shortlist_product",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 346,
+    "name": "controlled_search",
+    "missing": [
+      "monkeypatch",
+      "pairs",
+      "screen_topk",
+      "row",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 422,
+    "name": "events",
+    "missing": [
+      "state",
+      "kind",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 427,
+    "name": "test_staged_screening_topk_caps_shortlist_product",
+    "missing": [
+      "monkeypatch",
+      "screen_topk",
+      "count",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 436,
+    "name": "test_staged_exact_ties_keep_only_k_in_admitted_order",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 460,
+    "name": "test_staged_excludes_failed_screening_scores_when_a_shortlist_is_valid",
+    "missing": [
+      "monkeypatch",
+      "invalid",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 470,
+    "name": "test_staged_bootstrap_prefers_admitted_reference_and_keeps_it_untimed",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 480,
+    "name": "test_staged_reference_retries_only_remaining_admitted_candidates",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 500,
+    "name": "test_staged_exhausts_admitted_pairs_after_independent_fixture_failure",
+    "missing": [
+      "monkeypatch",
+      "failure",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 537,
+    "name": "test_staged_invalid_shortlist_expands_without_rerunning_returned_outcomes",
+    "missing": [
+      "monkeypatch",
+      "invalid",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 557,
+    "name": "test_staged_screening_failed_candidates_can_win_during_fallback",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 572,
+    "name": "test_staged_no_winner_and_empty_universe_return_invalid",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 588,
+    "name": "test_staged_scores_and_pair_cache_are_fresh_for_each_shape",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 603,
+    "name": "test_staged_reuses_g1_ranking_across_atomic_reduce_and_scatter_groups",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 628,
+    "name": "test_staged_all_atomic_reference_failures_preserve_valid_nonatomic_pair",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 658,
+    "name": "test_staged_g2_failure_exhausts_only_affected_compatibility_group",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 677,
+    "name": "test_staged_bootstrap_failure_is_local_to_bm_and_later_groups_still_screen",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 168,
+    "name": "forbid_enumeration",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 183,
+    "name": "enumerated",
+    "missing": [
+      "shape_row",
+      "full_search",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 332,
+    "name": "validate",
+    "missing": [
+      "row",
+      "candidate",
+      "args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 370,
+    "name": "returned",
+    "missing": [
+      "outcome",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 375,
+    "name": "enumerate_pairs",
+    "missing": [
+      "actual_row",
+      "full_search",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 380,
+    "name": "consumer",
+    "missing": [
+      "actual_row",
+      "name",
+      "actual_args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 385,
+    "name": "bootstrap",
+    "missing": [
+      "actual_row",
+      "producer",
+      "consumer",
+      "actual_args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 390,
+    "name": "screen_g1",
+    "missing": [
+      "actual_row",
+      "name",
+      "actual_args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 395,
+    "name": "screen_g2",
+    "missing": [
+      "actual_row",
+      "producer",
+      "name",
+      "actual_args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_search.py",
+    "line": 400,
+    "name": "validate",
+    "missing": [
+      "actual_row",
+      "candidate",
+      "actual_args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 25,
+    "name": "cpu_result_worker",
+    "missing": [
+      "payload",
+      "result_tx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 34,
+    "name": "cpu_coordinated_worker",
+    "missing": [
+      "payload",
+      "result_tx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 47,
+    "name": "cpu_outcome_worker",
+    "missing": [
+      "payload",
+      "result_tx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 69,
+    "name": "allow_only_explicit_cpu_shape_workers",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 80,
+    "name": "payloads",
+    "missing": [
+      "args",
+      "*rows",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 84,
+    "name": "test_staged_supervisor_empty_batch_launches_none_and_one_shape_gets_worker_pid",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 187,
+    "name": "run_in_thread",
+    "missing": [
+      "operation",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 202,
+    "name": "test_result_arrival_keeps_gpu_and_process_owned_until_exit",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 227,
+    "name": "test_different_gpu_workers_overlap_and_all_completed_handles_close",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 252,
+    "name": "test_one_slot_uses_fresh_worker_and_bounded_handles_for_every_shape",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 263,
+    "name": "test_fatal_clean_eof_python_failure_and_result_before_fatal_continue_later_rows",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 293,
+    "name": "test_unexpected_receive_and_deserialization_failure_clean_owned_workers",
+    "missing": [
+      "failure",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 320,
+    "name": "test_parent_cancellation_or_wait_failure_stops_launches_and_preserves_exception",
+    "missing": [
+      "monkeypatch",
+      "failure",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 343,
+    "name": "test_start_failure_closes_created_process_and_both_pipe_endpoints",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 354,
+    "name": "test_start_failure_survives_pipe_close_failure_during_cleanup",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 370,
+    "name": "test_staged_scheduler_preserves_main_mp_cap_and_uses_preflighted_first_visible_gpus",
+    "missing": [
+      "monkeypatch",
+      "mp",
+      "shape_count",
+      "gpu_count",
+      "expected",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 393,
+    "name": "test_staged_single_slot_uses_first_visible_gpu_and_empty_batch_never_schedules",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 413,
+    "name": "test_staged_rejects_unsupported_participant_before_scheduler",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 429,
+    "name": "test_staged_result_remains_readable_when_process_exit_precedes_receive",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 72,
+    "name": "cpu_only_start",
+    "missing": [
+      "process",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 95,
+    "name": "__init__",
+    "missing": [
+      "process",
+      "gpu",
+      "context",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 101,
+    "name": "start",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 110,
+    "name": "join",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 114,
+    "name": "close",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 120,
+    "name": "exitcode",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 123,
+    "name": "__getattr__",
+    "missing": [
+      "name",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 128,
+    "name": "__init__",
+    "missing": [
+      "connection",
+      "context",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 131,
+    "name": "recv_bytes",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 140,
+    "name": "close",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 145,
+    "name": "__getattr__",
+    "missing": [
+      "name",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 150,
+    "name": "__init__",
+    "missing": [
+      "base",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 163,
+    "name": "Pipe",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 169,
+    "name": "Process",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 176,
+    "name": "wait_until_received",
+    "missing": [
+      "count",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 182,
+    "name": "assert_closed",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 191,
+    "name": "run",
+    "missing": [
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 327,
+    "name": "fail_wait",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 433,
+    "name": "wait_after_exit",
+    "missing": [
+      "waitables",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 380,
+    "name": "schedule",
+    "missing": [
+      "batch",
+      "slots",
+      "ctx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 400,
+    "name": "schedule",
+    "missing": [
+      "batch",
+      "slots",
+      "ctx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_supervision.py",
+    "line": 417,
+    "name": "forbidden",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_timeout.py",
+    "line": 14,
+    "name": "test_staged_operation_restores_existing_handler_and_timer",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_timeout.py",
+    "line": 33,
+    "name": "test_staged_soft_timeout_is_returned_as_screen_failure_and_restores_timer",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_timeout.py",
+    "line": 54,
+    "name": "test_staged_soft_timeout_unavailable_handler_runs_without_touching_timer",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_timeout.py",
+    "line": 64,
+    "name": "test_staged_soft_timeout_outside_main_thread_runs_without_touching_timer",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_timeout.py",
+    "line": 74,
+    "name": "test_mxfp4_help_reports_soft_timeout_and_preserves_other_tuner_help",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_staged_timeout.py",
+    "line": 38,
+    "name": "interrupted",
+    "missing": [
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 58,
+    "name": "prohibit_real_shape_workers_and_gpu_data",
+    "missing": [
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 95,
+    "name": "shape",
+    "missing": [
+      "token",
+      "*updates",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 121,
+    "name": "tuner_args",
+    "missing": [
+      "tuner",
+      "source",
+      "output",
+      "*options",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 140,
+    "name": "devices",
+    "missing": [
+      "current",
+      "*identities",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 159,
+    "name": "controlled_mxfp4",
+    "missing": [
+      "tuner",
+      "monkeypatch",
+      "attempts",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 173,
+    "name": "test_all_preserves_gate_metadata_through_winner_summary",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "same_file",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 191,
+    "name": "test_retune_replaces_duplicate_old_winners",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 205,
+    "name": "test_same_file_all_without_device_identity_retains_gate_metadata",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 222,
+    "name": "test_shared_csv_preserves_valid_rows_and_normalizes_legacy_defaults",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "empty_input",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 256,
+    "name": "test_multiple_shared_files_migrate_identity_before_merge",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "modern_second",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 292,
+    "name": "test_runtime_preflight_rejects_participating_device_before_work",
+    "missing": [
+      "monkeypatch",
+      "mode",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 309,
+    "name": "test_runtime_identity_uses_selected_logical_gpu_and_ignores_unused_device",
+    "missing": [
+      "monkeypatch",
+      "mode",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 326,
+    "name": "test_supported_mixed_cu_runtime_rows_finish_summary",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 351,
+    "name": "test_no_visible_gpu_fails_nonempty_but_empty_batch_starts_no_work",
+    "missing": [
+      "monkeypatch",
+      "mode",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 363,
+    "name": "test_unused_gpu0_does_not_reject_single_slot_current_supported_gpu",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "all_rows",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 382,
+    "name": "test_single_slot_rejects_current_unsupported_gpu_even_if_gpu0_supported",
+    "missing": [
+      "monkeypatch",
+      "mode",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 398,
+    "name": "test_failed_retune_preserves_old_winner_and_continues_later_shape",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "failure",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 444,
+    "name": "test_candidate_order_and_finite_winner_survive_bad_first_timing",
+    "missing": [
+      "monkeypatch",
+      "mode",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 476,
+    "name": "test_all_empty_device_selection_does_not_restore_input_rows",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "same_file",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 504,
+    "name": "test_prune_full_parallelism_selection_is_preserved",
+    "missing": [
+      "monkeypatch",
+      "mp",
+      "shape_count",
+      "gpu_count",
+      "expected",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 527,
+    "name": "test_unsupported_already_tuned_row_fails_and_later_winner_persists",
+    "missing": [
+      "tmp_path",
+      "monkeypatch",
+      "all_rows",
+      "same_file",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 61,
+    "name": "forbidden",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 160,
+    "name": "candidates",
+    "missing": [
+      "row",
+      "full_search",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 163,
+    "name": "measure",
+    "missing": [
+      "row",
+      "candidate",
+      "args",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 299,
+    "name": "forbid_workers",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 332,
+    "name": "simulated_workers",
+    "missing": [
+      "payloads",
+      "slots",
+      "ctx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 409,
+    "name": "candidates",
+    "missing": [
+      "row",
+      "full_search",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 414,
+    "name": "measure",
+    "missing": [
+      "row",
+      "candidate",
+      "args",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 449,
+    "name": "candidates",
+    "missing": [
+      "row",
+      "full_search",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 456,
+    "name": "measure",
+    "missing": [
+      "row",
+      "candidate",
+      "args",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py",
+    "line": 512,
+    "name": "scheduled",
+    "missing": [
+      "payloads",
+      "slots",
+      "ctx",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 64,
+    "name": "prohibit_gpu_work",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 132,
+    "name": "forbid_uncontrolled_gpu_work",
+    "missing": [
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 137,
+    "name": "shape",
+    "missing": [
+      "token",
+      "*updates",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 158,
+    "name": "historical_result",
+    "missing": [
+      "token",
+      "*updates",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 182,
+    "name": "controlled_environment",
+    "missing": [
+      "root",
+      "outcomes",
+      "dispatched",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 233,
+    "name": "args_for",
+    "missing": [
+      "tuner",
+      "source",
+      "output",
+      "*options",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 251,
+    "name": "test_ordinary_fmoe_preserves_schema_nt_stage_timings_and_profiles",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 295,
+    "name": "test_ordinary_retune_replaces_duplicate_old_winners",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 309,
+    "name": "test_ordinary_fmoe_migrates_legacy_shared_csv_without_losing_nt_or_numbers",
+    "missing": [
+      "tmp_path",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 338,
+    "name": "test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner",
+    "missing": [
+      "tmp_path",
+      "outcome",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 386,
+    "name": "test_ordinary_fmoe_empty_input_finishes_without_measurement",
+    "missing": [
+      "tmp_path",
+      "output_exists",
+      "all_rows",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 413,
+    "name": "test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows",
+    "missing": [
+      "tmp_path",
+      "same_file",
+      "all_rows",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 450,
+    "name": "test_ordinary_fmoe_command_returns_summary_exit_status",
+    "missing": [
+      "tmp_path",
+      "outcome",
+      "expected_status",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 67,
+    "name": "forbidden",
+    "missing": [
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 187,
+    "name": "measure",
+    "missing": [
+      "tasks",
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": true,
+    "wholly_untyped": true
+  },
+  {
+    "path": "op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py",
+    "line": 117,
+    "name": "cpu_only",
+    "missing": [
+      "_factory",
+      "*args",
+      "*kwargs",
+      "return"
+    ],
+    "nested": false,
+    "wholly_untyped": true
+  }
+]
