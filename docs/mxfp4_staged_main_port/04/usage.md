@@ -231,8 +231,10 @@ For a default-environment winner, reset both output switches to 0 and the
 tuning-limit variable to empty before starting separate default AOT/replay
 tasks; omit `--swiglu-limit`. Tuner Situv2 uses `(beta, linear_beta)=(4,25)`;
 production replay of that tuning contract must pass those values. Public
-Situv2's omitted `(1,1)` parameters are a separate execution contract and must
-be verified separately. AOT retains both existing Situv2 parameter variants.
+Situv2's omitted API beta arguments resolve to the selected MXFP4 path's
+established `(4,25)` defaults; verify that actual dispatch rather than infer
+`(1,1)` from generic normalization. AOT retains both existing variants, with
+`(1,1)` used for explicit API parameters.
 
 ## Interpret measurements and timeouts
 
@@ -313,4 +315,4 @@ and seed0 data/routes, using `--preserve-generated-route-weights` in the harness
 Use the same runtime/cache root for AOT and precompiled replay; override
 `--runtime` consistently if using a separate runtime directory. Public Situv2
 omitted-parameter acceptance uses `--situv2-public-defaults` to omit beta API
-arguments and compare with Torch `(1,1)` while asserting actual kernel arguments.
+arguments and compare with Torch `(4,25)` while asserting actual kernel arguments.
