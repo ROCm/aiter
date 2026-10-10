@@ -24,7 +24,15 @@ def main():
             result_path = directory / f"{action}.json"
             task_path = directory / f"{action}-task" / "task.json"
             if not result_path.exists() or not task_path.exists():
-                record["actions"][action] = {"status": "incomplete"}
+                task = json.loads(task_path.read_text()) if task_path.exists() else {}
+                record["actions"][action] = {
+                    "status": (
+                        "failed"
+                        if task.get("exit_code") not in (None, 0)
+                        else "incomplete"
+                    ),
+                    "exit_code": task.get("exit_code"),
+                }
                 continue
             result = json.loads(result_path.read_text())
             task = json.loads(task_path.read_text())
@@ -81,17 +89,11 @@ def main():
                 "jobs": result.get("jobs"),
                 **evidence,
             }
+        statuses = {item["status"] for item in record["actions"].values()}
         record["status"] = (
-            "pass"
-            if all(item["status"] == "pass" for item in record["actions"].values())
-            else (
-                "incomplete"
-                if any(
-                    item["status"] == "incomplete"
-                    for item in record["actions"].values()
-                )
-                else "failed"
-            )
+            "failed"
+            if "failed" in statuses
+            else "incomplete" if "incomplete" in statuses else "pass"
         )
         summary.append(record)
     args.output.write_text(
