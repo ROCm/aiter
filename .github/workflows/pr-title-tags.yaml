@@ -12,7 +12,8 @@ name: PR Title Tags & Labels
 # component namespace ([fix], [Perf], [MLA], [gfx1250], ...) are never
 # touched. The same rule applies to labels: only the component labels listed
 # in COMPONENT_LABELS are ever added or removed — human labels (ci:*, ...)
-# are left alone, while hand-toggling a managed component label is corrected
+# are left alone, except gfx942 config changes add ci:triton-300x.
+# Hand-toggling a managed component label is corrected
 # on the spot. To keep a PR's title untouched, add the 'no-auto-title' label —
 # it takes effect immediately, and removing it re-syncs the title on the spot.
 # Component labels are synced regardless of the opt-out: the AITER-triton
@@ -50,7 +51,8 @@ jobs:
           script: |
             // The component labels this workflow owns (name -> color). Only
             // these are ever added or removed; anything else on the PR
-            // (ci:*, no-auto-title, ...) belongs to humans.
+            // (ci:*, no-auto-title, ...) belongs to humans, except the
+            // add-only ci:triton-300x label for gfx942 config changes below.
             const COMPONENT_LABELS = {
               'Triton/Gluon': '1d76db',
               'ASM':          '5319e7',
@@ -86,12 +88,17 @@ jobs:
             const optedOut = pr.labels.some(l => l.name === 'no-auto-title');
 
             // ---- changed files (paginated) ----
-            const files = (await github.paginate(github.rest.pulls.listFiles, {
+            const changedFiles = await github.paginate(github.rest.pulls.listFiles, {
               owner: context.repo.owner,
               repo: context.repo.repo,
               pull_number: pr.number,
               per_page: 100,
-            })).map(f => f.filename);
+            });
+            if (changedFiles.length !== pr.changed_files) {
+              throw new Error(`Incomplete PR file list: ${changedFiles.length}/${pr.changed_files}`);
+            }
+            const files = changedFiles.map(f => f.filename);
+            const changedPaths = changedFiles.flatMap(f => [f.filename, f.previous_filename].filter(Boolean));
 
             // ---- path predicates ----
             const isDoc    = f => f.startsWith('docs/') || f.endsWith('.md');
@@ -217,4 +224,14 @@ jobs:
               core.info(`Labels: +[${labelsToAdd}] -[${labelsToRemove}]`);
             } else {
               core.info('Labels already in sync.');
+            }
+
+            if (changedPaths.some(f => f.startsWith('aiter/ops/triton/configs/gfx942/') && !isDoc(f))
+                && !pr.labels.some(l => l.name === 'ci:triton-300x')) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: pr.number,
+                labels: ['ci:triton-300x'],
+              });
             }

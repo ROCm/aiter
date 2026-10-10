@@ -385,6 +385,7 @@ def gemm_a16w16_(
         BLOCK_K = config["BLOCK_K"]
         NUM_BUFFERS = config.get("NUM_BUFFERS", 2)
         num_warps = config["num_warps"]
+        waves_per_eu = config.get("waves_per_eu", 0)
 
         num_k_tiles = triton.cdiv(K, BLOCK_K)
         _MIN_BUFFERS = {"bandwidth_bound": 1, "compute_bound": 2}
@@ -435,7 +436,9 @@ def gemm_a16w16_(
             y = torch.empty((M, N), dtype=dtype, device=x.device)
 
         wmma_layout, operand_a, operand_b = create_wmma_layouts(num_warps)
-        shared_a, shared_b = create_shared_layouts(BLOCK_M, BLOCK_N, BLOCK_K, layout)
+        shared_a, shared_b = create_shared_layouts(
+            BLOCK_M, BLOCK_N, BLOCK_K, layout, x.element_size() * 8
+        )
 
         grid = (triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N), 1)
 
@@ -473,6 +476,7 @@ def gemm_a16w16_(
             USE_ACTIVATION=activation is not None,
             ADD_BIAS=(bias is not None),
             num_warps=num_warps,
+            waves_per_eu=waves_per_eu,
         )
 
         return y

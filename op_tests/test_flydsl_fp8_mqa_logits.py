@@ -68,8 +68,9 @@ REF_IMPL = (
 
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
+    from aiter.ops.flydsl.fp8_mqa_logits_kernels import _auto_variant
 except ImportError:
-    flydsl_fp8_mqa_logits = None
+    flydsl_fp8_mqa_logits = _auto_variant = None
 
 # Bench timing knobs, set from argv in main(), read by _time_us.
 BENCH_WARMUP = 10
@@ -405,6 +406,35 @@ def verify_fp8_mqa_logits(
     return ret
 
 
+# The variant gfx942 auto-selects, pinned at both RPB band edges in s_q * s_k,
+# on either side of the odd-s_q step-down, and at the WPB switch.
+_GFX942_AUTO_VARIANTS = {
+    (1, 1024): "mfma_r1_w4",
+    (62, 8192): "mfma_r1_w4",
+    (64, 8192): "mfma_r2_w4",  # 2**19
+    (512, 1024): "mfma_r2_w4",  # 2**19
+    (65, 8192): "mfma_r1_w4",  # odd, below 2**21: steps down
+    (254, 8192): "mfma_r2_w4",
+    (256, 8192): "mfma_r4_w4",  # 2**21
+    (257, 8192): "mfma_r4_w4",  # odd, from 2**21 up: pads
+    (1024, 131072): "mfma_r4_w4",  # long-context indexer prefill
+    (2048, 8192): "mfma_r4_w2",
+}
+
+
+@benchmark()
+def verify_auto_variant(s_q, s_k, num_heads):
+    """Check the gfx942 auto-selected variant against its pin. Launches nothing."""
+    variant = _auto_variant(s_q, s_k, num_heads)
+    expected = _GFX942_AUTO_VARIANTS[(s_q, s_k)]
+    if variant != expected:
+        raise AssertionError(
+            f"auto-selected {variant}, expected {expected} "
+            f"[s_q={s_q} s_k={s_k} nh={num_heads}]"
+        )
+    return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
+
+
 _FLUSH_CACHE = None
 
 
@@ -648,7 +678,7 @@ def _full_set(args):
 def _reduced_set(args):
     """One case per (shape, window) pair, with the remaining axes rotated.
 
-    56 cases on the defaults, which is what the CI lane runs. Shape and window
+    65 cases on the defaults, which is what the CI lane runs. Shape and window
     are the axes that reach genuinely distinct kernel paths -- the grid.y split,
     the negative/empty window collapse, the cu_starts clamp -- so they are
     covered exhaustively. num_heads, head_dim, clean_logits and the operand
@@ -750,6 +780,10 @@ def main():
             # enough that most blocks end up owning an empty column range.
             (64, 2048),
             (64, 8192),
+            # gfx942 auto-selects r4 from 256*8192 == 2**21 up (pinned in
+            # _GFX942_AUTO_VARIANTS). 257 is odd, so the launcher pads it.
+            (256, 8192),
+            (257, 8192),
             # s_kv < s_q. A causal mask then puts cu_ends below zero on the
             # leading rows, so these cover the negative-window path end to end.
             (128, 64),
@@ -816,6 +850,27 @@ def main():
         )
 
     failures = []
+    total = len(cases) * len(scenarios)
+    if "verify" in scenarios and get_gfx() == "gfx942":
+        rows = []
+        for (s_q, s_k), nh in itertools.product(_GFX942_AUTO_VARIANTS, args.num_heads):
+            pin = {"s_q": s_q, "s_k": s_k, "num_heads": nh}
+            try:
+                rows.append(verify_auto_variant(**pin))
+            except AssertionError as exc:
+                aiter.logger.error("FAILED auto_variant case: %s", exc)
+                failures.append(("auto_variant", f"s_q={s_q} s_k={s_k} nh={nh}", exc))
+                rows.append({**pin, "gfx": get_gfx(), "status": "FAIL"})
+        total += len(rows)
+        aiter.logger.info(
+            "fp8_mqa_logits auto_variant summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+    elif "verify" in scenarios:
+        aiter.logger.warning(
+            "%s: skipping the auto_variant pins, which are gfx942-only", get_gfx()
+        )
+
     for scenario in scenarios:
         run = verify_fp8_mqa_logits if scenario == "verify" else bench_fp8_mqa_logits
         rows = []
@@ -834,7 +889,7 @@ def main():
                     exc,
                     exc_info=not isinstance(exc, AssertionError),
                 )
-                failures.append((scenario, case, exc))
+                failures.append((scenario, _case_tag(*case), exc))
                 rows.append({**case._asdict(), "gfx": get_gfx(), "status": "FAIL"})
         df = pd.DataFrame(rows)
         aiter.logger.info(
@@ -845,16 +900,12 @@ def main():
         if "speedup" in df:
             _log_speedup(df["speedup"])
 
-    total = len(cases) * len(scenarios)
     if failures:
         aiter.logger.error(
             "fp8_mqa_logits: %d of %d case runs FAILED\n%s",
             len(failures),
             total,
-            "\n".join(
-                f"  [{sc}] {_case_tag(*case)}\n        {exc}"
-                for sc, case, exc in failures
-            ),
+            "\n".join(f"  [{sc}] {tag}\n        {exc}" for sc, tag, exc in failures),
         )
         sys.exit(1)
     aiter.logger.info("fp8_mqa_logits: all %d case runs passed", total)

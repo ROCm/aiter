@@ -14,20 +14,25 @@ _MANIFESTS = (
         "f6f4gemm_bf16_per1x32Fp6Fp4.csv",
         "mxfp6_mxfp4_c0_256_padk2",
         "a6w4_asm_tuned_gemm.csv",
+        3,
     ),
     (
         "f4f6gemm",
         "f4f6gemm_bf16_per1x32Fp4Fp6.csv",
         "mxfp4_c0_mxfp6_256_padk2",
         "a4w6_asm_tuned_gemm.csv",
+        2,
     ),
 )
 
 
 @pytest.mark.parametrize(
-    ("module", "manifest_name", "pack_layout", "tuned_name"), _MANIFESTS
+    ("module", "manifest_name", "pack_layout", "tuned_name", "exact_count"),
+    _MANIFESTS,
 )
-def test_mixed_mxfp_manifest_objects(module, manifest_name, pack_layout, tuned_name):
+def test_mixed_mxfp_manifest_objects(
+    module, manifest_name, pack_layout, tuned_name, exact_count
+):
     manifest_dir = _REPO_ROOT / "hsa" / "gfx950" / module
     with (manifest_dir / manifest_name).open(newline="") as manifest_file:
         rows = list(csv.DictReader(manifest_file))
@@ -57,11 +62,25 @@ def test_mixed_mxfp_manifest_objects(module, manifest_name, pack_layout, tuned_n
         assert min(swizzle_bounds) >= 0
         if swizzle_bounds[2] > 0:
             assert swizzle_bounds[0] > 0 and swizzle_bounds[1] > 0
+        exact_shape = tuple(
+            int(row[name]) for name in ("exact_M", "exact_N", "exact_K")
+        )
+        assert exact_shape == (0, 0, 0) or min(exact_shape) > 0
+        if exact_shape != (0, 0, 0):
+            assert exact_shape[0] % 256 == exact_shape[1] % 256 == 0
+            assert exact_shape[2] % 128 == 0
 
         code_object = manifest_dir / row["co_name"]
         code_object_bytes = code_object.read_bytes()
         assert code_object_bytes.startswith(b"\x7fELF")
         assert row["knl_name"].encode() in code_object_bytes
+    assert (
+        sum(
+            any(int(row[name]) > 0 for name in ("exact_M", "exact_N", "exact_K"))
+            for row in rows
+        )
+        == exact_count
+    )
 
     tuned_path = _REPO_ROOT / "aiter" / "configs" / tuned_name
     with tuned_path.open(newline="") as tuned_file:

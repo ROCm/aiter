@@ -104,7 +104,9 @@ def inverse_rope_group_quant(
     Args:
         o: ``[S, H, head_dim]`` bf16/fp16 attention output before inverse RoPE.
         positions: ``[S]`` absolute positions.
-        cos_cache/sin_cache: ``[max_pos, rd//2]``.
+        cos_cache/sin_cache: ``[max_pos, rd//2]``, the dtype of ``o``, or fp32
+            with ``scale_layout="row"`` (a model keeping its table in fp32, as
+            DeepSeek-V4.1 does; the rotation is fp32 either way).
         num_groups: output-LoRA local groups ``G``.
         quant_group_size: quant block along ``D``; V4 wo_a path uses 128.
         scale_layout: e8m0 scale storage:
@@ -148,6 +150,16 @@ def inverse_rope_group_quant(
         assert cache.dim() == 2, (
             f"{name} must be 2D [max_pos, rd//2], got {tuple(cache.shape)}; "
             "reshape a cache carrying singleton batch/head dims at the call site"
+        )
+    # Raised here rather than left to the kernel's AITER_CHECK, which aborts.
+    if sin_cache.dtype != cos_cache.dtype or not (
+        cos_cache.dtype == o.dtype
+        or (cos_cache.dtype == torch.float32 and scale_layout == "row")
+    ):
+        raise ValueError(
+            f"cos/sin must share the dtype of o ({o.dtype}), or be fp32 with "
+            f"scale_layout='row'; got {cos_cache.dtype}/{sin_cache.dtype} "
+            f"with {scale_layout!r}"
         )
 
     from .. import dtypes
