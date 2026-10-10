@@ -4,7 +4,7 @@
 
 **Blocked by:** 03: Support configured output paths and matching AOT.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Account for every prescribed MiniMax/GPT-OSS BM16/32/64/128, atomic/reduce, BM128 scatter N128/N256, I384/K128 and I512/K128/K256 case, small winner smoke, Situv2 A4W4 and both-flags default/custom-limit combinations. Reuse valid unchanged prior-ticket evidence; run missing/affected coverage.
 - [ ] Verify the integrated input→worker/search→CSV→summary/exit and exact production/precompiled paths retain metadata, device, recovery and ordinary prune/full compatibility.
