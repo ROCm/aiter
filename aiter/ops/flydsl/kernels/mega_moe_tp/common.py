@@ -7,6 +7,7 @@ from __future__ import annotations
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
+from flydsl._mlir.dialects import rocdl as _rocdl
 from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -197,40 +198,34 @@ def bst(val, rs, voff, soff, aux=0):
     )
 
 
-def asm(text, cons="", args=()):
-    _llvm.inline_asm(None, [_u(a) for a in args], text, cons, has_side_effects=True)
-
-
-# LDS-DMA has no wrapper that keeps the compiler out of its counters: inline
-# asm, so it neither sees nor waits on these loads; waits are explicit.
-def dma16(lds_addr, rs, voff, soff, nt=False):
-    asm(
-        "s_mov_b32 m0, $0\n\tbuffer_load_dwordx4 $1, $2, $3 offen"
-        + (" nt" if nt else "")
-        + " lds",
-        "s,v,s,s",
-        (uni(lds_addr), i32(voff), rs, uni(soff)),
+# LDS-DMA (buffer_load ... lds, M0 = LDS base): the async form, so the compiler's
+# waitcnt pass does not wait on it; waits are explicit (wait_vm).
+def _dma(lds_addr, rs, voff, soff, nbytes, aux):
+    _rocdl.raw_ptr_buffer_load_async_lds(
+        rs,
+        _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), _u(uni(lds_addr))).result,
+        _u(i32(nbytes)),
+        _u(i32(voff)),
+        _u(uni(soff)),
+        _u(i32(0)),
+        aux=_attr(aux),
     )
+
+
+def dma16(lds_addr, rs, voff, soff, nt=False):
+    _dma(lds_addr, rs, voff, soff, 16, 2 if nt else 0)
 
 
 def dma4(lds_addr, rs, voff, soff, sys=False):
-    asm(
-        "s_mov_b32 m0, $0\n\tbuffer_load_dword $1, $2, $3 offen"
-        + (" sc0 sc1" if sys else "")
-        + " lds",
-        "s,v,s,s",
-        (uni(lds_addr), i32(voff), rs, uni(soff)),
-    )
+    _dma(lds_addr, rs, voff, soff, 4, AUX_SYS if sys else 0)
 
 
-# Waits stay inline asm: they count the asm LDS-DMA loads, which the compiler's
-# waitcnt pass cannot see (it would merge or drop an s_waitcnt intrinsic).
 def wait_vm(n):
-    asm(f"s_waitcnt vmcnt({min(int(n), 63)})")
+    rocdl.s_waitcnt(vmcnt=min(int(n), 63))
 
 
 def wait_lgkm0():
-    asm("s_waitcnt lgkmcnt(0)")
+    rocdl.s_waitcnt(lgkmcnt=0)
 
 
 def amax(vals):

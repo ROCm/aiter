@@ -17,7 +17,6 @@ from .common import (
     AUX_SYS,
     V4I,
     _ctpop,
-    asm,
     bld,
     bst,
     g_add_agent,
@@ -109,7 +108,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     @traced
     def _drop_stale(tid, a):
         if tid < i32(64):
-            asm("buffer_inv sc0")  # no wrapper
+            fx.memory_fence(syncscope="agent", ordering=ACQ)  # drop stale L1 lines
         bid = i32(gpu.block_id("x"))
         if (tid < i32(64)) & (bid < i32(N_XCD)) & (a["epoch"] == i32(1)):
             fx.memory_fence(syncscope="one-as", ordering=ACQ)
