@@ -167,7 +167,7 @@ def devices(*identities: "tuple[str, int]", current: "int" = 0) -> "Iterator[Non
 def controlled_mxfp4(
     tuner: "moe.Mxfp4FlydslTuner",
     monkeypatch: "pytest.MonkeyPatch",
-    attempts: "list[int]",
+    attempts: "list[dict[str, object]]",
 ) -> "None":
     def candidates(
         row: "dict[str, object]", full_search: "bool" = False
@@ -422,7 +422,7 @@ def test_single_slot_rejects_current_unsupported_gpu_even_if_gpu0_supported(
     "failure", ["empty", "exception", "nan", "inf", "zero", "negative"]
 )
 def test_failed_retune_preserves_old_winner_and_continues_later_shape(
-    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", failure: "Exception | str"
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", failure: "str"
 ) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape(), shape(8)]).to_csv(source, index=False)
@@ -546,7 +546,7 @@ def test_prune_full_parallelism_selection_is_preserved(
     mp: "int",
     shape_count: "int",
     gpu_count: "int",
-    expected: "object",
+    expected: "int",
 ) -> "None":
     with devices(*[("gfx950", 256)] * gpu_count):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)

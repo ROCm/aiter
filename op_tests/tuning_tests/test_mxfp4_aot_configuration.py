@@ -210,11 +210,11 @@ def test_stage2_flags_select_matching_compile_jobs_and_leave_atomic_bf16(
     monkeypatch: "pytest.MonkeyPatch",
     tmp_path: "Path",
     external_compiler: "list[dict[str, object]]",
-    fp8: "bool",
-    fp4: "bool",
+    fp8: "str",
+    fp4: "str",
     reduce_dtype: "str",
     scatter_dtype: "str",
-    limit: "str | None",
+    limit: "float | None",
 ) -> "None":
     monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", fp8)
     monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", fp4)

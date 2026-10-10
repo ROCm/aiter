@@ -106,7 +106,7 @@ def main() -> "None":
     stage1 = kernel_module.flydsl_mxfp4_gemm1
     stage2 = g2_module.mxfp4_moe_gemm2
 
-    def capture_g1(**kwargs: "object") -> "tuple[torch.Tensor, torch.Tensor]":
+    def capture_g1(**kwargs: "object") -> "None":
         for key in (
             "BM",
             "BN",
