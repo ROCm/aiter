@@ -1,0 +1,20 @@
+# 04: Complete prescribed acceptance, calibration and review
+
+**What to build:** The integrated port has all required numerical/deployment evidence, reproducible results for the agreed calibration matrix, accurate usage documentation and no unresolved actionable in-scope review findings.
+
+**Blocked by:** 03: Support configured output paths and matching AOT.
+
+**Status:** ready-for-agent
+
+- [ ] Account for every prescribed MiniMax/GPT-OSS BM16/32/64/128, atomic/reduce, BM128 scatter N128/N256, I384/K128 and I512/K128/K256 case, small winner smoke, Situv2 A4W4 and both-flags default/custom-limit combinations. Reuse valid unchanged prior-ticket evidence; run missing/affected coverage.
+- [ ] Verify the integrated input→worker/search→CSV→summary/exit and exact production/precompiled paths retain metadata, device, recovery and ordinary prune/full compatibility.
+- [ ] Before calibration, count admitted stage candidates and pipeline pairs through the shared enumeration without GPU launches, by BM/accumulation group, especially the full anchors at tokens 64/2048/8192. Before starting each full anchor, record a projected wall-time range from representative per-pair attempt overhead observed in prescribed focused checks, cold/warm compilation assumptions and preparation/warmup/profiling/failure costs; report uncertainty and update with actual progress. Static legality is not runtime validity, and winner kernel latency times pair count is not tuning wall time. Retain the matrix and soft-timeout contract without adding searches or hard deadlines.
+- [ ] Execute the specification's 27 initial searches: seven default MiniMax prune/staged rows plus three full anchors, and five GPT-OSS configurations each prune/staged, default K 2 and limit 5 where prescribed. Use outputs/selection settings that ensure each search runs instead of skipping already-tuned rows from another mode.
+- [ ] Check idle before each independent GPU task, execute sequentially on the same physical card verified through acceptance's identity/mapping procedure, and fix comparable input/routes, toolchain, warmup/iterations and compilation/cache conditions with separate configuration artifacts.
+- [ ] Record selected names, finite error/latency, validation count, tuning wall time and main-compatible kernel-duration sum. Label matched elapsed/span diagnostics separately; exclude synthetic GPU trace annotations.
+- [ ] Report full→prune, prune→staged and full→staged effects only where matching valid data exists. Keep M_est pruning costs distinct from new screening effects; no full-reference result means an unavailable comparison.
+- [ ] Keep all paired prune/staged outcome rows, count prune-valid/staged-invalid runs and classify failure causes separately from timing regret; missing winners must not silently disappear from the report.
+- [ ] Use targeted alternating replay/rank retention/conditioned measurements or re-search only for concrete remaining discrepancies. Do not automatically widen the matrix, merge groups, alter K/fallback or impose a hard regret/speedup goal.
+- [ ] Update help/docs for modes, K, unsupported-row exit, profile limits, soft timeout, physical identity, stable invocation environment and matching output/limit/AOT/production configuration. Explicitly describe an existing default-limit same-key row: a limit 5 run without --all can silently skip it; --all retunes and replaces it when a valid winner is saved. Output flags have the same collision, so the caller must choose the intended file; --all does not isolate configurations. Historical experiments do not replace current acceptance.
+- [ ] Run appropriate combined tests and repository checks, review Standards and Spec, resolve actionable in-scope findings and disclose baseline failures or unavailable evidence honestly.
+- [ ] Retain complete current implementation/device/data/configuration/measurement and production/AOT records, account for all 27 searches and targeted repetitions, and satisfy the [specification](../spec.md) before resolving the port.
