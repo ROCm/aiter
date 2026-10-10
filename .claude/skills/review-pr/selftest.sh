@@ -160,5 +160,48 @@ if [ "$wd_rc" -ne 0 ] && [ "$wbad" -eq 0 ]; then
   echo "  ❌ watchdog_test.py did not run — ${why:-exit $wd_rc}"; bad=$((bad + 1))
 fi
 
+echo "[queue gate]"
+# Same reason as the watchdog: the gate only runs from the default branch, so GitHub will not
+# execute this until it merges. Drive the shipping script against a fake API and a fixed clock.
+qg=$(python3 "$S/queue_gate_test.py" 2>&1); qg_rc=$?
+printf '%s\n' "$qg" | grep -E '^  (✅|❌)' || true
+qok=$(printf '%s\n' "$qg" | grep -c '✅' || true)
+qbad=$(printf '%s\n' "$qg" | grep -c '❌' || true)
+ok=$((ok + qok)); bad=$((bad + qbad))
+if [ "$qg_rc" -ne 0 ] && [ "$qbad" -eq 0 ]; then
+  why=$(printf '%s\n' "$qg" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ queue_gate_test.py did not run — ${why:-exit $qg_rc}"; bad=$((bad + 1))
+fi
+
+echo "[notify handoff]"
+# The report job stays quiet when _notify.py says it already spoke, so that flag must mean a
+# comment actually landed. _notify.py returns 0 without posting in three cases -- no status
+# file, no token, a POST that threw -- and claiming "notified" in any of them would trade a
+# visible failure for a silent one. Two of the three are testable without a network.
+notified_flag() {  # <status file contents or empty> -> what _notify.py wrote to GITHUB_OUTPUT
+  local w o; w=$(mktemp -d); o=$(mktemp)
+  [ -n "$1" ] && printf '%s\n' "$1" > "$w/.aiter-review-status"
+  ( cd "$w" && GITHUB_WORKSPACE="$w" GITHUB_OUTPUT="$o" AITER_BOT_TOKEN= GITHUB_REPOSITORY= \
+      python3 "$S/_notify.py" 42 >/dev/null 2>&1 )
+  local n; n=$(grep -c notified "$o" 2>/dev/null || true)   # grep -c exits 1 on zero matches
+  echo "${n:-0}"
+  rm -rf "$w" "$o"
+}
+t "no status to report claims nothing" "$(notified_flag '')" "0"
+t "a report it could not send claims nothing" "$(notified_flag 'flow\tsomething broke')" "0"
+
+echo "[lost review]"
+# The other end of the watchdog: a review that started and then vanished. Same reason it cannot
+# be exercised here -- the job only runs from the default branch.
+lr=$(python3 "$S/lost_review_test.py" 2>&1); lr_rc=$?
+printf '%s\n' "$lr" | grep -E '^  (✅|❌)' || true
+lok=$(printf '%s\n' "$lr" | grep -c '✅' || true)
+lbad=$(printf '%s\n' "$lr" | grep -c '❌' || true)
+ok=$((ok + lok)); bad=$((bad + lbad))
+if [ "$lr_rc" -ne 0 ] && [ "$lbad" -eq 0 ]; then
+  why=$(printf '%s\n' "$lr" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ lost_review_test.py did not run — ${why:-exit $lr_rc}"; bad=$((bad + 1))
+fi
+
 echo "=== $ok green / $bad red ==="
 [ "$bad" -eq 0 ]

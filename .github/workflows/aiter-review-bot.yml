@@ -39,11 +39,15 @@ jobs:
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@aiter-bot review')
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read           # read other runs to see how deep the queue already is
     outputs:
-      ok: ${{ steps.gate.outputs.ok }}
+      ok: ${{ steps.queue.outputs.ok }}
     steps:
+      - uses: actions/checkout@v4      # queue_gate.py ships with the skill
       - name: Authorize (trigger + allowlist) before any self-hosted checkout
-        id: gate
+        id: auth
         uses: actions/github-script@v7
         env:
           AITER_REVIEW_AUTHORIZED: ${{ vars.AITER_REVIEW_AUTHORIZED }}   # optional; empty -> authorized.txt
@@ -78,6 +82,21 @@ jobs:
             core.setOutput('ok', ok ? 'true' : 'false');
             core.notice(`commenter=${who} trigger=${trig} authorized=${allow.has(who)} -> ${ok ? 'run' : 'ignored'}`);
 
+      # Accepting a request the box cannot work through is how one gets lost: a queued job is
+      # cancelled after 24 h, and the notifier lives inside the job that never ran. Answer the
+      # requester here instead -- on their PR, at the moment they ask.
+      - name: Queue depth — answer the requester, refuse work the box cannot do
+        id: queue
+        if: always()
+        env:
+          AUTHORIZED: ${{ steps.auth.outputs.ok }}
+          PR: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+          OWNER_OVERRIDE: ${{ vars.AITER_RUNNER_OWNER }}
+          MAX_WAIT_HOURS: ${{ vars.AITER_MAX_WAIT_HOURS }}   # optional; default 8
+        run: python3 .claude/skills/review-pr/queue_gate.py
+
   watchdog:
     # The one failure the in-job notifier cannot reach. With no runner the review job stays
     # `queued`: run_one.sh never starts, so _notify.py never runs, GitHub sends no failure mail,
@@ -104,6 +123,8 @@ jobs:
     needs: gate
     if: needs.gate.outputs.ok == 'true'
     runs-on: [self-hosted, box308]        # label the runner with these at registration
+    outputs:
+      notified: ${{ steps.notify.outputs.notified }}
     timeout-minutes: 120    # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
     env:
       PR: ${{ github.event.issue.number }}          # issue number == PR number here
@@ -140,6 +161,7 @@ jobs:
         run: python3 "${{ steps.rl.outputs.dir }}/_publish.py" "$PR" --post
 
       - name: Report a failed review to the owner (as aiter-bot)
+        id: notify
         # Runs even when the review step failed. run_one.sh writes .aiter-review-status as
         # "<class>\t<message>"; _notify.py maps the class to its owner and posts one comment
         # @-mentioning them (glm->yhl-amd, atom->valarLip, machine->gyohuangxin, flow/env->the
@@ -159,4 +181,34 @@ jobs:
           if [ "${{ steps.review.outcome }}" = "failure" ] && [ ! -f "$GITHUB_WORKSPACE/.aiter-review-status" ]; then
             printf 'flow\tthe review step failed with no classified status (a hard timeout kill?) -- see the job log\n' > "$GITHUB_WORKSPACE/.aiter-review-status"
           fi
+          # _notify.py sets the `notified` output itself, and only once a post has actually
+          # landed. It returns 0 without posting in three cases -- no status file, no token, a
+          # POST that threw -- and in every one of them the report job must still speak.
           python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"
+
+  report:
+    # `if: always()` inside the review job covers a step that failed; it cannot cover a job that
+    # stopped existing. When the self-hosted runner loses contact mid-review, not one step runs,
+    # so nothing is written and nothing is posted -- from the PR it reads as a review still in
+    # progress, forever. This job lives on hosted infra, so it is alive exactly when the box is
+    # not, and it speaks only when the review ended badly having reported nothing itself.
+    needs: [gate, review]
+    # Skips the common case entirely rather than spinning a runner to decide it did not
+    # need one. lost_review.py keeps its own guard, so this is a saving, not the decision.
+    if: always() && needs.gate.outputs.ok == 'true' && needs.review.result != 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Report a review that vanished without reporting
+        env:
+          REVIEW_RESULT: ${{ needs.review.result }}
+          NOTIFIED: ${{ needs.review.outputs.notified }}
+          PR: ${{ github.event.issue.number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          GH_TOKEN: ${{ github.token }}
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+          OWNER_OVERRIDE: ${{ vars.AITER_RUNNER_OWNER }}
+        run: python3 .claude/skills/review-pr/lost_review.py
