@@ -1444,6 +1444,7 @@ namespace py = pybind11;
           py::arg("need_renorm"),                            \
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
+          py::arg("num_shared_experts")    = 0,              \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
 
 #define MOE_TOPK_CK_PYBIND          \
