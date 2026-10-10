@@ -173,6 +173,23 @@ if [ "$qg_rc" -ne 0 ] && [ "$qbad" -eq 0 ]; then
   echo "  ❌ queue_gate_test.py did not run — ${why:-exit $qg_rc}"; bad=$((bad + 1))
 fi
 
+echo "[notify handoff]"
+# The report job stays quiet when _notify.py says it already spoke, so that flag must mean a
+# comment actually landed. _notify.py returns 0 without posting in three cases -- no status
+# file, no token, a POST that threw -- and claiming "notified" in any of them would trade a
+# visible failure for a silent one. Two of the three are testable without a network.
+notified_flag() {  # <status file contents or empty> -> what _notify.py wrote to GITHUB_OUTPUT
+  local w o; w=$(mktemp -d); o=$(mktemp)
+  [ -n "$1" ] && printf '%s\n' "$1" > "$w/.aiter-review-status"
+  ( cd "$w" && GITHUB_WORKSPACE="$w" GITHUB_OUTPUT="$o" AITER_BOT_TOKEN= GITHUB_REPOSITORY= \
+      python3 "$S/_notify.py" 42 >/dev/null 2>&1 )
+  local n; n=$(grep -c notified "$o" 2>/dev/null || true)   # grep -c exits 1 on zero matches
+  echo "${n:-0}"
+  rm -rf "$w" "$o"
+}
+t "no status to report claims nothing" "$(notified_flag '')" "0"
+t "a report it could not send claims nothing" "$(notified_flag 'flow\tsomething broke')" "0"
+
 echo "[lost review]"
 # The other end of the watchdog: a review that started and then vanished. Same reason it cannot
 # be exercised here -- the job only runs from the default branch.

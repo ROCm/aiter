@@ -181,10 +181,10 @@ jobs:
           if [ "${{ steps.review.outcome }}" = "failure" ] && [ ! -f "$GITHUB_WORKSPACE/.aiter-review-status" ]; then
             printf 'flow\tthe review step failed with no classified status (a hard timeout kill?) -- see the job log\n' > "$GITHUB_WORKSPACE/.aiter-review-status"
           fi
+          # _notify.py sets the `notified` output itself, and only once a post has actually
+          # landed. It returns 0 without posting in three cases -- no status file, no token, a
+          # POST that threw -- and in every one of them the report job must still speak.
           python3 "${{ steps.rl.outputs.dir }}/_notify.py" "$PR"
-          # Tell the report job below that this ran, so it stays quiet. Set only after the fact:
-          # if _notify.py itself fails, the fallback should still speak.
-          echo "notified=true" >> "$GITHUB_OUTPUT"
 
   report:
     # `if: always()` inside the review job covers a step that failed; it cannot cover a job that
