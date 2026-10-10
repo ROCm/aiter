@@ -270,7 +270,14 @@ def cpu_configuration_worker(payload, result_tx):
 
 @pytest.mark.parametrize(
     "limit,fp8,fp4",
-    [(None, None, None), ("", "", ""), (None, "1", "1"), ("5", "1", "1")],
+    [
+        (None, None, None),
+        ("", "", ""),
+        (None, "1", None),
+        (None, None, "1"),
+        (None, "1", "1"),
+        ("5", "1", "1"),
+    ],
 )
 def test_spawned_shape_inherits_snapshot_and_stable_production_settings(
     monkeypatch, limit, fp8, fp4
