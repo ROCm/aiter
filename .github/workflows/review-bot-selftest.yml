@@ -36,3 +36,27 @@ jobs:
 
       - name: Guards — failure triage, run budget, refuter call site, watchdog
         run: bash .claude/skills/review-pr/selftest.sh
+
+      # pyproject.toml excludes `.claude` from the repo-wide ruff: the directory was invisible to
+      # it until `.gitignore` was narrowed, and a 174-finding burndown does not belong in whatever
+      # PR happens to touch the bot next. Excluding it and stopping there would leave these files
+      # with no linter at all, which is the kind of gap this skill exists to close, so they get
+      # their own -- narrower on purpose.
+      #
+      # Measured with ruff 0.16.0, the version pinned in pre-checks.yaml:
+      #
+      #     F,E9                                       7   <- enforced here
+      #     default - {UP031,FURB167,SIM115,ISC004}   29
+      #     default - UP031                          101
+      #     default                                  174   (102 of them in triage.py)
+      #
+      # F and E9 are the findings that break something at runtime -- an undefined name, an unused
+      # import, a syntax error. The rest are style, and widening to them is a deliberate, costed
+      # step rather than a mystery: the numbers above are what it costs.
+      #
+      # `--no-force-exclude` keeps the explicit path winning over that pyproject exclude, so this
+      # cannot be turned into a silent no-op by a later config change.
+      - name: Lint the skill for real errors
+        run: |
+          pip3 install --quiet ruff==0.16.0
+          ruff check --no-cache --no-force-exclude --select F,E9 .claude/skills/review-pr/

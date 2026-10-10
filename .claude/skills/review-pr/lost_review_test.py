@@ -11,7 +11,6 @@ import contextlib
 import io
 import sys
 import types
-import urllib.parse
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
