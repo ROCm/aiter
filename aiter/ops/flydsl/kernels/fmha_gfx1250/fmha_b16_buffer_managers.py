@@ -48,7 +48,7 @@ _CHUNK_BYTES = _CHUNK_ELEMS * _BF16_BYTES  # 16
 # gfx1250 is wave32; every swizzle/reshape here assumes 32 lanes per wave. FlyDSL
 # exposes the wave size only compiler-side (GPUTarget.warp_size), not as a trace-time
 # Python int, hence the named constant.
-_WAVE_LANES = 32
+_WAVE_SIZE = 32
 
 # Default 8-wave ("m16x8") threadgroup; override via the ``num_waves`` ctor arg.
 _DEFAULT_NUM_WAVES = 8
@@ -67,12 +67,6 @@ _O_DSCNT_MAX = 63  # s_wait_dscnt SIMM16[5:0]
 # LDS budget the O ring fits inside (the caller's non-current K|V slot):
 # 8 waves * 2 units * 2KB = 32KB.
 _O_LDS_BUDGET_BYTES = 32 * 1024
-
-# Global->LDS async write tile (the V1 transport): 8(kv) x 32(hdim) per warp call,
-# one b128 per lane -- lane ``l`` writes row ``l // 4``, 8-element chunk ``l % 4``. K and
-# V share it; so does the padded LDS layout they land in (see the K/V staging section).
-_WR_TILE_KV = 8
-_WR_TILE_HD = _WMMA_K
 
 # O staging (OManager16b): no padding -- an XOR swizzle on the 8-bf16 chunk index makes
 # both the b128 store and b128 read bank-conflict-free. MI400 LDS = 64 banks x 4 B, so a
@@ -97,38 +91,15 @@ def _as_bases(ptr_lds):
 
 
 # ---- gfx1250 Expert Scheduling Mode 2 --------------------------------------
-# DEP_MODE=2 turns the HW VA_VDST/VM_VSRC issue interlocks OFF. The kernel enables it
-# with the `amdgpu-expert-scheduling-mode` LLVM hint at jit time (see _ensure_*_kernel);
-# LLVM then emits the setreg AND inserts every dependency cover itself (post-RA depctr
-# waits) for the plain intrinsic memory ops below -- the SSA-visible RAW/WAR hazards and
-# the LDS RAW between the async global->LDS load and the ds_load that reads it back. So
-# this file emits nothing but ordinary flydsl intrinsics in BOTH modes, and mode 2 is
-# codegen-identical to mode 0 plus the one setreg.
-#
-# That is also why every memory op here is a plain intrinsic (``create_llvm_ptr`` +
-# ``llvm_dialect.load``/``store``, ``rocdl.ds_load_tr16_b128``,
-# ``buffer_ops.buffer_store``) rather than an opaque inline-asm block with hand-written
-# covers. An opaque ds_load hides the RAW against the async global->LDS store -- no SSA
-# edge, LDS unmodeled -- and LLVM mis-orders it under DEP_MODE=2, producing silent NaN
-# at scale. See memory fmha-flydsl-0-3-x-migration / fmha-m16x8-sched-mode2-unsafe.
-#
-# The kernel module imports this flag and flips the hint in lockstep; it no longer
-# changes codegen in this file. False -> mode 0.
+# DEP_MODE=2 disables the HW issue interlocks (Shader Programming Guide, expert
+# scheduling mode); LLVM then inserts every dependency cover itself, so this file emits
+# only ordinary flydsl intrinsics in both modes. False -> mode 0.
 ENABLE_SCHED_MODE2 = True
 
 
 def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
-    """Issue a BATCH of async 16B (b128) global->LDS loads. Pure issue, no address math:
-    the managers' ``global_load_ptrs`` already built the pointers.
-
-    ``gptrs``/``lds_ptrs`` are equal-length lists of address-space-1 sources and
-    address-space-3 destinations (a scalar is treated as a 1-load batch); ``cluster``
-    selects the MCAST form (K/V) over plain global (Q).
-
-    ``imm_offs`` is an optional list of per-load compile-time byte immediates, b128
-    aligned. The async immediate hits BOTH the global source and the LDS dest by the same
-    amount in lockstep (GPU-verified), so a caller wanting a global-only stride must
-    pre-subtract it from ``lds_ptrs`` (see ``global_load_ptrs``)."""
+    """Issue a batch of async b128 global->LDS loads; ``cluster`` picks the MCAST form.
+    ``imm_offs`` shifts BOTH the global source and the LDS destination in lockstep."""
     if not isinstance(gptrs, (list, tuple)):
         gptrs = [gptrs]
     if not isinstance(lds_ptrs, (list, tuple)):
@@ -205,14 +176,8 @@ class ProducerCtx:
 
 class BufferOpDescriptor:
     """Everything needed to issue ONE wave's share of a global<->LDS tile op, and to
-    fence it afterwards.
-
-    Building a descriptor is PURE -- it emits no memory op, only address arithmetic --
-    which is the whole reason this is an object rather than a call: the caller builds it
-    early, lets the address VALU sink into an unrelated load's shadow, and calls
-    ``async_load()`` much later. The concrete subclass is the TRANSPORT (``kind``), so a
-    caller that just wants "fill this tile" never branches on the loader family. The op is
-    named rather than anonymous (``issue()``) to leave room for a store counterpart.
+    fence it afterwards. Building one is PURE -- address arithmetic only, no memory op --
+    so the caller can build it early and call ``async_load()`` much later.
 
     ``asynccnt`` / ``tensorcnt`` are how many of THIS wave's copies the op will put on
     each hardware counter. Both are always present; a transport that does not touch a
@@ -327,6 +292,10 @@ def _async_band_descriptor(
         producer_warp=ctx.producer_warp,
         num_producer_warps=ctx.num_producer_warps,
     )
+    # Write tile: 8(kv) x 32(hdim) per warp call, one b128 per lane -- lane ``l`` writes
+    # row ``l // 4``, 8-element chunk ``l % 4``. K and V share it.
+    _WR_TILE_KV = 8
+    _WR_TILE_HD = _WMMA_K
     _assert_multiple("producer band rows", num_rows, _WR_TILE_KV)
     _assert_multiple("hdim", hdim, _WR_TILE_HD)
     base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_x)))
@@ -1403,7 +1372,7 @@ class OManager16bV1:
             loaded = []
             gidxs = []
             for r in range(TPU):
-                f = fx.Int32(r * _WAVE_LANES) + lane_idx  # 32 b128 chunks per round
+                f = fx.Int32(r * _WAVE_SIZE) + lane_idx  # 32 b128 chunks per round
                 q_out = f // G  # q-row within this warp [0,16)
                 d_local = (f % G) * _CHUNK_ELEMS
                 addr = lds_warp + self._lds_byte(slot, q_out, d_local)
@@ -1657,7 +1626,7 @@ class OManager16bV3:
         self.row_elems = v_hdim + _O_PAD_ELEMS  # PADDED (conflict-free ds_store)
         self.row_bytes = self.row_elems * _BF16_BYTES
         self.chunks_per_row = v_hdim // _CHUNK_ELEMS  # b128 chunks per row
-        self.num_rounds = (_WMMA_M * self.chunks_per_row) // _WAVE_LANES
+        self.num_rounds = (_WMMA_M * self.chunks_per_row) // _WAVE_SIZE
         self._pending = []  # per-qtile (tile_lds, base_row)
 
     def get_lds_size_in_byte(self):
@@ -1778,7 +1747,7 @@ class OManager16bV3:
         gqa = self.gqa_ratio
         cpr = self.chunks_per_row
         rpw = self.rows_per_warp
-        num_rounds = (rpw * cpr) // _WAVE_LANES
+        num_rounds = (rpw * cpr) // _WAVE_SIZE
         ptr_O_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_O)))
         # packed rows [warp_base, warp_base+rpw) valid iff pr//gqa < q_len iff pr < q_len*gqa.
         valid_rows = q_len * fx.Int32(gqa) - warp_base
@@ -1787,7 +1756,7 @@ class OManager16bV3:
         )
         addrs = []
         for r in range(num_rounds):
-            c = fx.Int32(r * _WAVE_LANES) + lane_idx
+            c = fx.Int32(r * _WAVE_SIZE) + lane_idx
             row = c // fx.Int32(cpr)
             d_chunk = c % fx.Int32(cpr)
             srow = fx.min(

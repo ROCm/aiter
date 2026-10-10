@@ -92,7 +92,6 @@ WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x
 BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
 # 1 => BLOCK_M 128 ("m16x8"), 2 => BLOCK_M 256. Chosen per call by _pick_num_q_tiles.
 NUM_Q_TILES_CHOICES = (1, 2)
-NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
 # Causal work grows with the M index, so dispatch the heavy tiles first.
 REVERSE_M_ORDER = True
 
@@ -136,9 +135,8 @@ SUPPORTED_V_HDIM = (64, 128)
 # KV sequence block (columns of one QK GEMM tile). Configurable; 64 for now.
 N_BLOCK_CHOICES = (32, 64, 128, 256)
 # ---- LDS chunk layout: 12 x 26 KB = 312 KB of the 320 KB budget. ----
-# Chunk i sits at LDS_CHUNK_BYTES * i, and every K|V tile is MANDATORILY split 2-way
-# along n_block, the two halves landing in chunks 6 apart so they fall in different
-# 64 KB LDS segments (segment = base // 64 KB):
+# Chunk i sits at LDS_CHUNK_BYTES * i. Every K|V tile is split 2-way along n_block, the
+# halves 6 chunks apart so they land in different 64 KB LDS segments:
 #
 #   K[0][0]   0..26  seg 0      K[0][1] 156..182  seg 2
 #   V[0][0]  26..52  seg 0      V[0][1] 182..208  seg 2,3
@@ -147,50 +145,30 @@ N_BLOCK_CHOICES = (32, 64, 128, 256)
 #   K[2][0] 104..130 seg 1,2    K[2][1] 260..286  seg 4
 #   V[2][0] 130..156 seg 2      V[2][1] 286..312  seg 4
 #
-# Q and O own no LDS of their own -- they time-share KV chunks (see _q_wave_base /
-# _o_wave_base). Slot slot_idx owns [52*slot_idx, +52) low and [156 + 52*slot_idx, +52) high.
+# Q and O own no LDS -- they time-share KV chunks (see _q_wave_base / _o_wave_base).
 LDS_CHUNK_BYTES = 26 * 1024
 KV_LDS_SPLITS = 2  # halves one K (or V) tile is split into along n_block
 # Per-wave Q / O region inside a chunk pair. 17 KB covers 32 rows x 256 hdim + pad.
 LDS_QO_BYTES = 17 * 1024
 
 DEFAULT_N_BLOCK = 64
-# Preference order for the auto-picked n_block (widest first). A wider tile only fits if
-# BOTH split halves still sit in one chunk, so the 12-chunk map is untouched.
+# Auto-picked n_block, widest first: a wider tile must still fit one chunk per split half
+# and the register file (128 doubles the live fragment state, spilling above this hdim).
 N_BLOCK_PREF = (128, 64)
-# ...and only if the body still fits the register file: 128 doubles the live fragment
-# state, which spills above this hdim.
 N_BLOCK_WIDE_MAX_QK_HDIM = 128
 
-# K|V LDS slots the main loop rotates through. 3 is the exact minimum for the
-# software-pipelined body: it reads V(tile_idx-1) from slot 0 and K(tile_idx) from slot 1 while the
-# copy for tile tile_idx+1 is written into slot 2.
+# K|V LDS slots the main loop rotates through. 3 is the minimum for the software-pipelined
+# body: it reads V(tile_idx-1) from slot 0 and K(tile_idx) from slot 1 while tile_idx+1 is
+# written into slot 2. Two slots would need V written into the slot this body still reads,
+# which also races the carried ring head.
 N_KV_PP = 3
-# K runs one tile ahead of V. Body tile_idx reads K from slot 1 and V from slot 0, so landing
-# both copies in slot 2 would leave K one body of latency cover against V's two. LO
-# instead writes K(tile_idx+2) into slot 0 -- a chunk whose K half died at body tile_idx-1 and whose V
-# half this body reads (the 12-chunk layout keeps them disjoint) -- which buys K the same
-# two bodies, for one extra prologue copy (K(start+1) into slot 2).
-#
-# That head start is also what lets LO's steady-state fence be partial: it reaches the
-# drain with the tile it is about to read already retired and the newest still in flight,
-# so it waits to a depth of one tile instead of to 0. HI, one body of slack, drains fully.
 
-# Softmax uses the native exp2 intrinsic and S reaches it already in log2 units
-# (S' = S * softmax_scale * LOG2E), so the inner loop is a plain exp2(S' - m) and m/LSE
-# live in the log2 domain. LOG2E is folded into Q by the bf16 multiply the Q loader
-# already does -- free, but it rounds the scale to bf16's 8 mantissa bits. The exact
-# alternative is to scale the f32 QK accumulator instead, at num_q_tiles*num_kv_frags*8 VALU per tile.
+# Softmax runs in log2 units: LOG2E is folded into Q by the Q loader's bf16 multiply, so
+# the inner loop is a plain exp2(S' - m) and m/LSE live in the log2 domain.
 
-# Deferred oaccu rescale (FAv4 innovation, hk_mla spec §9.1.1). Rescaling O by
-# corr = exp(m_prev - m_new) is a full-width VALU pass every tile, but corr == 1 when the
-# running max doesn't move. So keep m STALE while the tile's row max stays within
-# RESCALE_THRESHOLD logit units of it: P = exp2(S - m_stale) accumulates against the
-# un-rescaled oaccu/denom, staying consistent. The per-lane test is promoted to
-# wave-uniform via ballot, so the caller can gate the wide multiply with one
-# non-divergent scf.if. The threshold is in NATURAL logits (m is log2-domain, so the
-# compare scales by LOG2E): 8.0 defers until the max would move by e^8, far under the
-# e^88 fp32 overflow wall. False (or threshold < 0) always rescales.
+# Deferred oaccu rescale (FAv4, hk_mla spec §9.1.1): corr == 1 when the running max does
+# not move, so keep m STALE while the row max stays within RESCALE_THRESHOLD natural
+# logits of it and skip the full-width multiply. False (or threshold < 0) always rescales.
 ENABLE_DEFER_RESCALE = True
 RESCALE_THRESHOLD = 8.0
 
@@ -199,48 +177,34 @@ RESCALE_THRESHOLD = 8.0
 # exp2(big_neg - real) still underflows to 0. Masked scores themselves stay -inf.
 BIG_NEG = -1.0e30
 
-# Compile-time Q/K/V loader select. False = V1 (Q ring async + swizzled LDS; K/V
-# cluster_load_async), True = V2 (Q per-warp TDM; K/V TDM global->LDS, HW OOB, far fewer
-# address VGPRs). O is selected separately by O_VARIANT. For K and V the two differ ONLY
-# in that transport -- same padded row-major LDS, same fragment reads, V2 a subclass of
-# V1 -- so this picks a class pair and no call site below branches on it.
+# Compile-time Q/K/V loader select. False = V1 (cluster_load_async), True = V2 (TDM,
+# HW OOB, far fewer address VGPRs). The two differ only in transport, so this picks a
+# class pair and no call site branches on it. O is selected separately by O_VARIANT.
 USE_TDM_LOADER = True
 
-# K/V producer specialization: the LO half issues every K copy, the HI half every V copy,
-# each wave of a half taking one dense n_block/KV_PRODUCER_WARPS row band, so a half's
-# counter tracks one operand. The drain barrier still publishes both. The partition
-# reaches the managers as a ProducerCtx, so it is transport-independent.
+# K/V producer specialization: LO issues every K copy, HI every V copy, each wave taking
+# one dense n_block/KV_PRODUCER_WARPS row band, so a half's counter tracks one operand.
 KV_PRODUCER_WARPS = NUM_WAVES // 2
 
-# LO/HI anti-phase (FA3 ping-pong). Both halves run the same tile stream and the same
-# number of bodies and barriers; the HI half runs its two phases in the opposite order,
+# LO/HI anti-phase (FA3 ping-pong). Same tile stream, same barrier count, opposite phase:
 #   LO body tile_idx:  gemm(tile_idx)                 | BAR | softmax(tile_idx)
 #   HI body tile_idx:  softmax(tile_idx-1) + rescale  | BAR | gemm(tile_idx)
-# so each barrier window has one half in the WMMA stream and the other in the softmax
-# VALU stream. HI carries s_acc across the back edge instead of P (and needs no carried
-# ring head -- its head hides under the softmax that opens its own body). Its dead
-# leading softmax(start-1) is neutralized by seeding s_acc to -inf, which is exactly the
-# fully-masked path (m_new = m_prev, corr = 1, P = 0, d unchanged). The lagging half also
-# puts its KV drain barrier AFTER the gemm, so the loop's back-edge bookkeeping and the
-# prefetch descriptor's VALU/SALU land behind it.
+# so one half is in the WMMA stream while the other is in the softmax VALU stream. HI
+# carries s_acc instead of P, seeded to -inf so its dead leading softmax is a no-op.
 # O writer variant (decoupled from USE_TDM_LOADER): "v1" swizzled LDS + buffer_store (fastest so
 # far), "v2" TDM store (padding ignored -> contiguous LDS -> bank conflict, slow), "v3" padded LDS +
 # global_store_async_from_lds_b128.
 O_VARIANT = "v2"
 
-# LDS->VGPR ring for the fused PV+QK WMMA stream (``_pv_qk_gemm``). Bursting every
-# ds_load of the resident KV tile into VGPRs before the first wmma makes the live cost
-# scale with hdim; the ring instead holds only RING loads live at 4 VGPR each, num_prefetch =
-# RING - 2*LAG in flight. Spanning both operand streams lets its refills pull K loads
-# while the PV wmma stream is still running. Keep RING a multiple of 4 -- an odd wrap
-# flips slot parity, costing a cycle on half the wmma. LAG=0 with RING >= num_ds_loads
-# reproduces the un-ringed burst.
+# LDS->VGPR ring for the fused PV+QK WMMA stream (``_pv_qk_gemm``). Holds only RING loads
+# live at 4 VGPR each, num_prefetch = RING - 2*LAG in flight, instead of bursting a whole
+# tile before the first wmma. Keep RING a multiple of 4 -- an odd wrap flips slot parity,
+# costing a cycle on half the wmma.
 PVQK_RING = 24
 PVQK_LAG = 2
 # Ring-head loads issued at the END of a body (under the softmax VALU) and carried across
-# the back edge as iter_args, instead of at the top of the body that consumes them. The V
-# they read is tile tile_idx, already resident in the slot this body used for K. Clamped to num_prefetch;
-# 0 restores the un-carried head. Costs 4 VGPR per carried load.
+# the back edge, instead of at the top of the body that consumes them. Clamped to
+# num_prefetch; 0 restores the un-carried head. Costs 4 VGPR per carried load.
 PVQK_HEAD_CARRY = 20
 
 # NOTE: the remaining tiling constants (chunk sizes, K/V write-tile + V swizzle
@@ -265,12 +229,8 @@ def _lane_id():
     )
 
 
-def _kv_wait(num_tensorcnt=-1, num_asynccnt=-1):
-    """Retire this wave's K/V global->LDS copies down to the given per-counter depths.
-
-    A counter is waited only if the caller names it (default -1 emits nothing for it), so
-    a mixed loader pair -- a V1 K manager on ``asynccnt``, a V2 V manager on
-    ``tensorcnt`` -- can share one fence."""
+def _copy_wait(num_tensorcnt=-1, num_asynccnt=-1):
+    """Retire this wave's copies to the given per-counter depths; -1 skips a counter."""
     if num_tensorcnt >= 0:
         tdm_ops.tensor_wait(num_tensorcnt)
     if num_asynccnt >= 0:
@@ -291,15 +251,10 @@ def _bare_barrier():
     rocdl.s_barrier_wait(-1)
 
 
-def _kv_fence(num_tensorcnt=-1, num_asynccnt=-1, num_dscnt=None):
-    """``_kv_wait``, then publish the retired copies workgroup-wide.
-
-    The counters only bound the issuing wave's own copies, so the ``s_barrier`` is what
-    publishes a wave's share of a tile to its peers; it doubles as the WAR wall for the
-    slot about to be written. ``num_dscnt`` bounds this wave's in-flight LDS reads across
-    it: ``None`` takes ``gpu.barrier()``'s full drain, a depth swaps that for a bare
-    signal/wait plus a partial wait so a ring head issued just above survives."""
-    _kv_wait(num_tensorcnt, num_asynccnt)
+def _copy_fence(num_tensorcnt=-1, num_asynccnt=-1, num_dscnt=None):
+    """``_copy_wait``, then a barrier to publish them; ``num_dscnt`` bounds in-flight LDS
+    reads across it (None = gpu.barrier()'s full drain)."""
+    _copy_wait(num_tensorcnt, num_asynccnt)
     rocdl.sched_barrier(0)
     if num_dscnt is None:
         gpu.barrier()
@@ -319,11 +274,7 @@ def _load_seqlen_pair(ptr_tensor, idx):
 
 def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     """Load this lane's per-head sink logit from the 1-D fp32 ``sink[num_heads_q]`` — one
-    extra ``exp(sink)`` term in the softmax denominator, in the scaled-score domain.
-
-    Flat ``llvm.load`` rather than ``buffer_load``, which would re-scale the offset
-    internally; flat keeps the address arithmetic SSA-visible for LLVM to cover under
-    sched mode 2. No bounds check needed: ``q_head_idx`` is in range by construction."""
+    extra ``exp(sink)`` term in the softmax denominator, in the scaled-score domain."""
     del num_heads_q  # in-bounds by construction; no buffer bounds check needed
     sink_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_sink)))
     byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
@@ -371,21 +322,12 @@ def _wmma(a, b, c):
         else rocdl.wmma_f32_16x16x32_bf16
     )
     # modC defaults to WMMACModifier::none (== the old modC=0); omit it.
-    d = wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
-    # Every wmma is one tick of the ring's WAR clock: the depctr the hazard pass puts
-    # in front of a refill counts the VALU between the last read of those registers
-    # and the ds_load that reclaims them. Let the scheduler slide a wmma across a
-    # ds_load and that count stops matching the geometry the ring was built for.
-    rocdl.sched_barrier(0)
-    return d
+    return wmma(v8f32, _ir(a), _ir(b), _ir(c), reuseA=False, reuseB=False).result
 
 
-def _p_to_elem(p_list, elem_dtype):
-    """Narrow softmax's f32 P^T to the wmma element type. Split out of ``_softmax`` so the
-    caller can place it AFTER the next gemm's ring head -- nothing in the head depends on
-    P, so the ds_loads issue first and the v_cvt batch fills their shadow. Costs P a wider
-    live range (f32, not narrowed) across the head."""
-    return [[p_vec.to(elem_dtype) for p_vec in pt] for pt in p_list]
+def _convert_vectors(vec_lists, dtype):
+    """Convert a list of lists of vectors to ``dtype``."""
+    return [[v.to(dtype) for v in row] for row in vec_lists]
 
 
 def _keepalive(vals):
@@ -408,15 +350,6 @@ def _ring_num_prefetch(num_frag, ring, ring_lag):
     if num_ld <= ring:
         return num_ld
     return ring - 2 * ring_lag
-
-
-def _emit_ld(emit, j):
-    """One ring ds_load, fenced. Pairs with the fence in ``_wmma``: together they hold
-    the load/wmma interleave exactly as emitted, which is what makes the refill's WAR
-    distance equal the ring geometry instead of whatever the scheduler settles on."""
-    v = emit(j)
-    rocdl.sched_barrier(0)
-    return v
 
 
 def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None):
@@ -460,7 +393,8 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
             a[i] = v
     else:
         for i in range(num_prefetch):
-            a[i] = _emit_ld(emit, i)
+            a[i] = emit(i)
+            rocdl.sched_barrier(0)
         rocdl.sched_barrier(0)  # pin the num_prefetch-deep burst above the stream
 
     steady = num_frag - num_prefetch // 2
@@ -473,7 +407,8 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
         for k in range(2):
             j = 2 * i + num_prefetch + k
             if j < num_ld:
-                a[j % ring] = _emit_ld(emit, j)
+                a[j % ring] = emit(j)
+                rocdl.sched_barrier(0)
 
     def _release(i):
         j = i - rel
@@ -582,7 +517,7 @@ def _softmax(
 
     Returns ``(p, m_new, d_new, corr)`` plus ``rescale_masks``. p is num_kv_frags v8 **f32** P^T =
     exp(S^T - m_new), NOT narrowed to the wmma element type -- the caller places that with
-    ``_p_to_elem``. m_new is STALE (== m_prev) when that row's ballot did not fire (FAv4
+    ``_convert_vectors``. m_new is STALE (== m_prev) when that row's ballot did not fire (FAv4
     §9.1.1), with corr == 1 and d_new = corr*d_prev + rowsum(p). ``rescale_masks`` is the num_q_tiles
     raw ballots (None when deferral is compiled out), for the caller to fold into its one
     branch condition at the use site.
@@ -850,6 +785,7 @@ def _pv_qk_gemm(
                 )
                 p_frags[(q_tile_idx, k_tile_idx)] = p_frag
                 out_list[q_tile_idx][d_tile_idx] = _wmma(v_frag, p_frag, acc)
+                rocdl.sched_barrier(0)
             return
         kv, d_tile_idx = divmod(i - num_v_frags, num_k_tiles)
         k_frag = lo.shuffle(hi, list(range(16)))
@@ -862,6 +798,7 @@ def _pv_qk_gemm(
             s_acc_list[q_tile_idx][kv] = _wmma(
                 k_frag, q_frags_list[q_tile_idx][d_tile_idx], acc
             )
+            rocdl.sched_barrier(0)
 
     def dies(i):
         # The PV half's B operands die on the final d-tile row, which is where the ring is
@@ -1171,10 +1108,8 @@ def _prologue_attention(
     # ``.async_load()``), so it is hoisted into the Q global-load shadow and the copies
     # themselves issue last, leaving nothing between them and the prologue barrier.
     #
-    # Slot rotation is LOCAL to this WG's tile stream: the prologue puts start_tile_idx into
-    # slot 1 and the loop carries the slot bases as iter_args (rotated in the yield), so
-    # start_tile_idx is irrelevant to the placement and no runtime "% N_KV_PP" is evaluated.
-    # Body tile_idx reads K from slot 1 and V from slot 0, so the first body needs tile
+    # Slot rotation is local to this WG's tile stream, so start_tile_idx never enters the
+    # placement. Body tile_idx reads K from slot 1 and V from slot 0, so the first body needs tile
     # start_tile_idx's K AND V in slot 1 (K for QK(start_tile_idx), V for the next body's PV) and
     # only FINITE data in slot 0's V region -- its PV is the dead leading one, p == 0, and
     # 0 * NaN would poison O. Loading start_tile_idx's V there is the cheapest such filler.
@@ -1215,21 +1150,16 @@ def _prologue_attention(
             ctx=_kv_ctx,
         )
 
-    # LO copies the K band, HI the V band, both of tile start into slot 1. HI owes one
-    # more, V(start) into slot 0, which body start's dead PV reads; LO owes none, because
-    # body start issues K(start+1) itself. Built here because the address math is pure and
-    # sits in Q's global-load shadow either way; only the ``.async_load()``s go under the
-    # warp-type branch.
+    # LO copies the K band, HI the V band, both of tile start into slot 1; HI owes one more,
+    # V(start) into slot 0 for body start's dead PV. Built here because the address math is
+    # pure; only the ``.async_load()``s go under the warp-type branch.
     _start_valid = _kv_valid(start_tile_idx)
     k_start_desc = _k_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
     v_start_desc = _v_desc(_k_lds_buf(_PHYSICAL_SLOT[1]), start_row0, _start_valid)
     v_dummy_desc = _v_desc(_k_lds_buf(_PHYSICAL_SLOT[0]), start_row0, _start_valid)
 
-    # Per-half counter usage, straight off the descriptors' declared counts. A counter a
-    # half's copies never touch gets -1 ("do not wait on it at all"), NOT 0. The one it
-    # does touch gets that half's per-tile copy count -- the depth LO's partial
-    # steady-state fence names to leave the newest tile in flight. The two bands differ
-    # whenever qk_hdim != v_hdim, so the core takes the pair and picks its own.
+    # Per-half counter usage, off the descriptors' declared counts. A counter this half
+    # never touches gets -1 ("do not wait on it"), NOT 0.
     kv_counts = {
         WarpType.LO: (k_start_desc.tensorcnt or -1, k_start_desc.asynccnt or -1),
         WarpType.HI: (v_start_desc.tensorcnt or -1, v_start_desc.asynccnt or -1),
@@ -1240,13 +1170,9 @@ def _prologue_attention(
     assert _drains[WarpType.LO] == _drains[WarpType.HI], "prologue fence is per-WG"
     _kv_drain = _drains[WarpType.LO]
 
-    # When each copy goes out is NOT transport-independent. Under V2 every prologue copy
-    # misses Q's chunks, so all of them go out BEFORE Q is read and their global latency
-    # overlaps Q's; the first tile to land on Q's slot is now body start's own K(start+1),
-    # long past Q's drain. Under V1 there is no such overlap to have: Q's own stage is on
-    # asynccnt too and its part2 waits that counter to a depth counted over Q's loads
-    # ALONE, so a tile copy issued first would corrupt the count. Everything goes after
-    # the barrier, and after part2, which ends at depth 0.
+    # Under V2 no prologue copy lands on Q's chunks, so all go out before Q is read and
+    # overlap its latency. Under V1 Q's own stage shares asynccnt and part2 waits a depth
+    # counted over Q's loads alone, so every copy must go after part2.
     if USE_TDM_LOADER:
         _early = {
             WarpType.LO: [k_start_desc],
@@ -1274,11 +1200,6 @@ def _prologue_attention(
 
         _issue_early(_is_lo)
     q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
-    # No rendezvous here. Q's chunks are slot 1's and no prologue copy lands on them; the
-    # first writer is body start's own K(start+1), past the fence below. That fence is
-    # therefore the WAR wall, and its gpu.barrier() retires this wave's Q reads on the way
-    # in -- Q's atom is per-wave but a tile's is per-producer, so wave A's Q region is
-    # written by wave B's share and the wall has to be a workgroup barrier either way.
 
     @flyc.jit
     def _issue_late(is_lo):
@@ -1286,16 +1207,13 @@ def _prologue_attention(
             for _desc in _late[WarpType.LO]:
                 _desc.async_load()
         else:
-            # HI enters its resting priority at the first point both halves have reached:
-            # from here on the lagging half must not lose arbitration to its SIMD-mate,
-            # and _pv_qk_gemm's exit restores this same level after every gemm.
             rocdl.s_setprio(1)
             for _desc in _late[WarpType.HI]:
                 _desc.async_load()
 
     _issue_late(_is_lo)
     rocdl.sched_barrier(0)
-    _kv_fence(*_kv_drain)
+    _copy_fence(*_kv_drain)
 
     return {
         "lane_idx": lane_idx,
@@ -1327,12 +1245,7 @@ def _prologue_attention(
 
 
 def _o_pack(o_list):
-    """Fold the per-d-tile O accumulators into ONE vector value.
-
-    Eight separate <8 x f32> loop-carried values are eight independent live ranges the
-    allocator may place anywhere, including astride the Lo256/Hi256 bank boundary; one
-    <64 x f32> is a single aligned tuple it cannot scatter. The shuffles are constant
-    index tuples, so they lower to REG_SEQUENCE / EXTRACT_SUBREG, not to moves."""
+    """Fold the per-d-tile O accumulators into ONE vector value."""
     cur = list(o_list)
     while len(cur) > 1:
         width = cur[0].numel
@@ -1471,20 +1384,15 @@ def _core_attention_multi_kv_tiles(
     d_tiles = v_hdim // WMMA_M
     num_q_tiles = num_q_tiles_per_wave
     num_kv_frags = n_block // WMMA_N
-    # Per-q-tile carried state: [m, d, O, P_0 .. P_{num_kv_frags-1}]. P is the software pipeline --
-    # body tile_idx's PV consumes the P body tile_idx-1's softmax produced. The HI half runs softmax(tile_idx-1)
-    # before gemm(tile_idx), so its last num_kv_frags slots hold the f32 s_acc the next body's softmax
-    # consumes instead of the bf16 P; the slot count is the same. O is ONE wide vector:
-    # the d_tiles accumulators travel the back edge as a single tuple (see _o_pack), which
-    # the P slots do NOT, because the gemm ring produces and consumes them one at a time.
+    # Per-q-tile carried state: [m, d, O, P_0 .. P_{num_kv_frags-1}]. The lagging half
+    # carries the f32 s_acc in the P slots instead of bf16 P; the slot count is the same.
+    # O travels the back edge as ONE tuple (see _o_pack); the P slots do not, because the
+    # gemm ring produces and consumes them one at a time.
     _q_state_slots = 2 + 1 + num_kv_frags
     _is_lagging_softmax = not warp_type.is_lo
     if _is_lagging_softmax:
-        # Rotating the drain to the body tail shifts this half's barrier stream by one:
-        # it now opens with the phase barrier and closes with the drain. One filler here
-        # (and its partner after the loop on the leading half) re-pairs the two streams
-        # so phase barrier still meets phase barrier.
-        _kv_fence(*_kv_drain)
+        # Barrier-count filler: re-pairs the two halves' barrier streams.
+        _copy_fence(*_kv_drain)
     if has_sink:
         num_heads_q = gpu.grid_dim.y * fx.Int32(gqa_ratio)
         m_init = [
@@ -1496,8 +1404,6 @@ def _core_attention_multi_kv_tiles(
     else:
         m_init = [fx.Float32(BIG_NEG) for _ in range(num_q_tiles)]
         d_init = [fx.Float32(0.0) for _ in range(num_q_tiles)]
-    # P == 0 makes the first body's PV the dead leading one (0 * V onto the zero O), so
-    # no prologue QK/softmax trace is needed.
     _init = []
     for q_tile_idx in range(num_q_tiles):
         _init += (
@@ -1516,10 +1422,8 @@ def _core_attention_multi_kv_tiles(
             ]
         )
 
-    # ---- One ds_load base-pointer set per slot plus the slot's byte base, all carried as
-    # iter_args and LEFT-ROTATED in the yield: iteration i reads set 0 (= tile i) and
-    # writes tile i+2 at byte base 2. Rotation is pure register renaming, so no runtime
-    # "% N_KV_PP" is ever evaluated. The per-manager base count is carried generically. ----
+    # ---- One ds_load base-pointer set per slot plus the slot's byte base, carried as
+    # iter_args and LEFT-ROTATED in the yield, so no runtime "% N_KV_PP" is evaluated. ----
     k_lds_ld = [
         k_mgr.ds_load_ptrs(ptr_lds=_k_lds_bufs(_PHYSICAL_SLOT[i]), lane_idx=lane_idx)
         for i in range(N_KV_PP)
@@ -1657,7 +1561,7 @@ def _core_attention_multi_kv_tiles(
             # the gemm that wants it in flight. The gemm's own last ring fragment already
             # took dscnt to 0, so every read older than the head is retired regardless --
             # the WAR wall for the slot about to be written still holds.
-            _kv_fence(*_kv_drain, num_dscnt=_num_head_carry)
+            _copy_fence(*_kv_drain, num_dscnt=_num_head_carry)
 
         # This half's descriptor for tile ``pf``'s K (LO) or V (HI) into the oldest slot.
         # Built up front: pure, so its address VALU overlaps the drain; only the copy
@@ -1801,7 +1705,7 @@ def _core_attention_multi_kv_tiles(
             rocdl.sched_barrier(0)
             pvqk_head = _pvqk_head()
             rocdl.sched_barrier(0)
-            p_list = _p_to_elem(p_f32, elem_dtype)
+            p_list = _convert_vectors(p_f32, elem_dtype)
             # Anchor the conversion in THIS block. Its only real use is past the barrier,
             # so MachineSink (which ignores sched_barrier) would otherwise sink every
             # v_cvt_pk_bf16_f32 into the gemm and interleave it with the WMMA.
@@ -1848,7 +1752,7 @@ def _core_attention_multi_kv_tiles(
                 lambda j: v_mgr.load_one_to_reg(v_slots[1], j), 0, _num_head_carry
             )
             rocdl.sched_barrier(0)
-            carry_next = _p_to_elem(carry_f32, elem_dtype)
+            carry_next = _convert_vectors(carry_f32, elem_dtype)
 
         # Yield: num_q_tiles updated (m, d, O, P) groups, then the ds pointers and slot bases
         # left-rotated by one so slot 0 holds tile tile_idx (next body's PV) and the oldest
@@ -1970,7 +1874,7 @@ def _core_attention_multi_kv_tiles(
     # and final[2] IS an O chunk -- so the drain needs a rendezvous behind it, which
     # ``_epilogue_attention`` supplies, since a wave only retires its own copies and O's
     # chunk halves are shared by wave pairs.
-    _kv_wait(*_kv_drain)
+    _copy_wait(*_kv_drain)
     return _epi_state(
         m_list=[
             fx.Float32(final[q_tile_idx * _q_state_slots + 0])
@@ -2189,7 +2093,7 @@ def _core_attention_one_kv_tile(
         _issue_kv(_is_lo)
     # The only barrier in the body: a wave's counters bound its own copies, so this is
     # what publishes the tile to the other seven.
-    _kv_fence(*_kv_drain_depths(_num_tdm_copies, _num_async_copies))
+    _copy_fence(*_kv_drain_depths(_num_tdm_copies, _num_async_copies))
 
     k_lds = k_mgr.ds_load_ptrs(ptr_lds=_split_bufs(k_buf), lane_idx=lane_idx)
     v_lds = v_mgr.ds_load_ptrs(ptr_lds=_split_bufs(v_buf), lane_idx=lane_idx)
@@ -2253,7 +2157,7 @@ def _core_attention_one_kv_tile(
         ],
         kv_len=kv_len,
     )
-    p_list = _p_to_elem(p_f32, elem_dtype)
+    p_list = _convert_vectors(p_f32, elem_dtype)
     _keepalive([v for pt in p_list for v in pt])
     o_list, _ = _pv_qk_gemm(
         v_emit=_v_emit,
@@ -2742,9 +2646,7 @@ def build_fmha_fwd_prefill_a16w16_m32x8(
                 + fx.Int64(1)
             ) * fx.Int64(4)
 
-            # An empty batch must NOT enter the core: kv_len==0 leaves the softmax denom
-            # at 0 and the epilogue would write O/0 = NaN to that batch's query rows,
-            # while q_len==0 has no rows to write at all.
+            # An empty batch must not enter the core: kv_len==0 would write O/0 = NaN.
             if (q_len > fx.Int32(0)) & (kv_len > fx.Int32(0)):
                 _core_kwargs = {
                     "qk_hdim": QK_HDIM,
@@ -2982,24 +2884,16 @@ _launch_fns = (
 
 
 def _pick_one_kv_tile(max_seqlen_k, qk_hdim, v_hdim, dtype_str):
-    """True when the launch bounds every WG to a single KV tile.
-
-    kv_len_wg is floored at 1 and never exceeds kv_len, so max_seqlen_k <= n_block makes
-    num_tiles == 1 everywhere -- causal and windowed included, since both only clip it.
-    The kernel then drops the left and clean sub-loops, which cannot run.
-    """
+    """True when the launch bounds every WG to a single KV tile."""
     n_block = pick_n_block(qk_hdim, v_hdim, _DTYPE_MAP[dtype_str])
     return int(max_seqlen_k) <= n_block
 
 
 def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio):
-    """Smallest Q tile whose grid still fits one workgroup wave; the largest otherwise.
-
-    The kernel is LDS-bound to one workgroup per CU, and halving BLOCK_M doubles KV
-    traffic, so a smaller tile only pays while the bigger one leaves CUs idle.
-    """
+    """Smallest Q tile whose grid still fits one workgroup wave; the largest otherwise."""
     rows = int(max_seqlen_q) * int(gqa_ratio)
     per_tile = int(num_kv_heads) * int(batch)
+    NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
     resident = get_cu_num() * NUM_WGS_PER_CU
     for num_tiles in sorted(NUM_Q_TILES_CHOICES):
         block_m = _block_m(num_tiles)
