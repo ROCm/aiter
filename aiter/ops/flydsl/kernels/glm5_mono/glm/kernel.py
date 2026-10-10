@@ -4363,9 +4363,7 @@ def build_glm5_monokernel(
         for t in range(start("down"), N_DN_TILES, G):
             t = fx.Int32(t)
             stamp("down", t, 0)
-            if const_expr(
-                ug_split(S, expert_inter) is None
-            ):  # else routed before up/gate
+            if const_expr(S == 1):  # S > 1 routed before up/gate
                 dn_route(load_bias())
             gpu.barrier()
             gu = wave // DN_WPR
