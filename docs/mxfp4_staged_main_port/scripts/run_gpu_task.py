@@ -17,21 +17,22 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from types import FrameType
 
 MONITOR_GPU = 7
 UUID = "GPU-5d8a72a332aa124c"
 PCI = "0000:f5:00.0"
 
 
-def utc_now():
+def utc_now() -> "str":
     return datetime.datetime.now(datetime.timezone.utc).isoformat()
 
 
-def write_json(path, value):
+def write_json(path: "Path", value: "object") -> "None":
     Path(path).write_text(json.dumps(value, indent=2) + "\n")
 
 
-def command_json(command):
+def command_json(command: "list[str]") -> "dict[str, object] | list[dict[str, object]]":
     result = subprocess.run(command, capture_output=True, text=True, check=True)
     positions = [
         p for p in (result.stdout.find("{"), result.stdout.find("[")) if p >= 0
@@ -39,7 +40,7 @@ def command_json(command):
     return json.loads(result.stdout[min(positions) :])
 
 
-def snapshot():
+def snapshot() -> "dict[str, object]":
     status = command_json(
         [
             "rocm-smi",
@@ -63,13 +64,13 @@ def snapshot():
     return {"utc": utc_now(), "status": status, "processes": processes}
 
 
-def identity_matches(sample):
+def identity_matches(sample: "dict[str, object]") -> "bool":
     status = sample["status"]
     hardware_id = status["Unique ID"].lower().removeprefix("0x")
     return "GPU-" + hardware_id == UUID and status["PCI Bus"].lower() == PCI
 
 
-def is_idle(sample):
+def is_idle(sample: "dict[str, object]") -> "bool":
     active = any(
         entry.get("mem_usage", {}).get("value", 0) > 0
         or entry.get("usage", {}).get("gfx", {}).get("value", 0) > 0
@@ -87,7 +88,7 @@ def is_idle(sample):
     )
 
 
-def await_idle(artifact):
+def await_idle(artifact: "Path") -> "dict[str, object]":
     consecutive = 0
     while consecutive < 3:
         sample = snapshot()
@@ -103,7 +104,7 @@ def await_idle(artifact):
     return sample
 
 
-def verify_child(artifact):
+def verify_child(artifact: "Path") -> "None":
     import torch
 
     if os.environ.get("ROCR_VISIBLE_DEVICES") != UUID:
@@ -143,7 +144,7 @@ def verify_child(artifact):
     )
 
 
-def stop_owned_processes(process):
+def stop_owned_processes(process: "subprocess.Popen[bytes]") -> "None":
     # The worker owns a new session; cancellation also stops its spawned tuner
     # workers. The final kill removes any descendant that ignored termination.
     try:
@@ -157,7 +158,7 @@ def stop_owned_processes(process):
         pass
 
 
-def main():
+def main() -> "int":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--artifact", type=Path, required=True)
     parser.add_argument("--cwd", type=Path, required=True)
@@ -237,7 +238,7 @@ def main():
     process = None
     previous_term = signal.getsignal(signal.SIGTERM)
 
-    def cancelled(signum, frame):
+    def cancelled(signum: "int", frame: "FrameType | None") -> "None":
         raise KeyboardInterrupt(f"Task controller received signal {signum}")
 
     signal.signal(signal.SIGTERM, cancelled)

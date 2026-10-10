@@ -11,7 +11,7 @@ from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import (
 )
 
 
-def test_staged_operation_restores_existing_handler_and_timer():
+def test_staged_operation_restores_existing_handler_and_timer() -> "None":
     tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
     tuner.keys = KEYS
     owned_handler = object()
@@ -30,12 +30,14 @@ def test_staged_operation_restores_existing_handler_and_timer():
     assert timer.call_args_list[-1] == mock.call(signal.ITIMER_REAL, 25.0, 3.0)
 
 
-def test_staged_soft_timeout_is_returned_as_screen_failure_and_restores_timer():
+def test_staged_soft_timeout_is_returned_as_screen_failure_and_restores_timer() -> (
+    "None"
+):
     tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
     installed = []
     owned_handler = object()
 
-    def interrupted():
+    def interrupted() -> "float":
         installed[0](signal.SIGALRM, None)
 
     with (
@@ -51,7 +53,9 @@ def test_staged_soft_timeout_is_returned_as_screen_failure_and_restores_timer():
     assert timer.call_args_list[-1] == mock.call(signal.ITIMER_REAL, 13.0, 0.0)
 
 
-def test_staged_soft_timeout_unavailable_handler_runs_without_touching_timer():
+def test_staged_soft_timeout_unavailable_handler_runs_without_touching_timer() -> (
+    "None"
+):
     tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
     with (
         mock.patch.object(signal, "getsignal", return_value=None),
@@ -61,7 +65,9 @@ def test_staged_soft_timeout_unavailable_handler_runs_without_touching_timer():
     timer.assert_not_called()
 
 
-def test_staged_soft_timeout_outside_main_thread_runs_without_touching_timer():
+def test_staged_soft_timeout_outside_main_thread_runs_without_touching_timer() -> (
+    "None"
+):
     tuner = moe.Mxfp4FlydslTuner.__new__(moe.Mxfp4FlydslTuner)
     with (
         mock.patch.object(signal, "signal", side_effect=ValueError("main thread")),
@@ -71,7 +77,7 @@ def test_staged_soft_timeout_outside_main_thread_runs_without_touching_timer():
     timer.assert_not_called()
 
 
-def test_mxfp4_help_reports_soft_timeout_and_preserves_other_tuner_help():
+def test_mxfp4_help_reports_soft_timeout_and_preserves_other_tuner_help() -> "None":
     from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import RESULTS, devices
 
     with devices(("gfx950", 256)):

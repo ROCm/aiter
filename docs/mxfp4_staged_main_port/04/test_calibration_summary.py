@@ -8,11 +8,12 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
 
-def summary_module():
+def summary_module() -> "ModuleType":
     path = Path(__file__).with_name("summarize_calibration.py")
     spec = importlib.util.spec_from_file_location("summarize_calibration", path)
     module = importlib.util.module_from_spec(spec)
@@ -20,7 +21,7 @@ def summary_module():
     return module
 
 
-def manifest_records():
+def manifest_records() -> "list[dict[str, object]]":
     records = []
     for token in (64, 128, 512, 1024, 2048, 4096, 8192):
         modes = (
@@ -52,11 +53,13 @@ def manifest_records():
     return records
 
 
-def update(records, identifier, **result):
+def update(
+    records: "list[dict[str, object]]", identifier: "str", **result: "object"
+) -> "None":
     next(record for record in records if record["id"] == identifier).update(result)
 
 
-def test_missing_and_nonfinite_winners_keep_all_paired_outcomes():
+def test_missing_and_nonfinite_winners_keep_all_paired_outcomes() -> "None":
     records = manifest_records()
     update(records, "minimax-64-prune", outcome="valid", winner_us=10.0)
     update(records, "minimax-64-staged", outcome="valid", winner_us=float("inf"))
@@ -79,7 +82,7 @@ def test_missing_and_nonfinite_winners_keep_all_paired_outcomes():
     }
 
 
-def test_regret_separates_pruning_and_screening_on_matching_valid_winners():
+def test_regret_separates_pruning_and_screening_on_matching_valid_winners() -> "None":
     records = manifest_records()
     update(records, "minimax-64-full", outcome="valid", winner_us=10.0)
     update(records, "minimax-64-prune", outcome="valid", winner_us=12.0)
@@ -120,7 +123,7 @@ def test_regret_separates_pruning_and_screening_on_matching_valid_winners():
     assert nonfinite["full_to_prune"]["available"] is False
 
 
-def test_default_and_extended_wall_totals_retain_incomplete_accounting():
+def test_default_and_extended_wall_totals_retain_incomplete_accounting() -> "None":
     records = manifest_records()
     for record in records:
         if record["mode"] != "full":
@@ -159,7 +162,7 @@ def test_default_and_extended_wall_totals_retain_incomplete_accounting():
     assert report["searches"][1]["validation_attempts"] == 3
 
 
-def test_prune_valid_staged_invalid_counts_each_failure_cause():
+def test_prune_valid_staged_invalid_counts_each_failure_cause() -> "None":
     records = manifest_records()
     for config, cause in zip(
         ("default", "fp8", "fp4", "limit5", "combined5"),
@@ -188,7 +191,9 @@ def test_prune_valid_staged_invalid_counts_each_failure_cause():
     }
 
 
-def test_cli_reads_completed_search_artifacts_and_keeps_missing_searches(tmp_path):
+def test_cli_reads_completed_search_artifacts_and_keeps_missing_searches(
+    tmp_path: "Path",
+) -> "None":
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps(manifest_records()))
     gpu = tmp_path / "gpu"
@@ -249,7 +254,9 @@ def test_cli_reads_completed_search_artifacts_and_keeps_missing_searches(tmp_pat
     assert "extended_gpt" in text
 
 
-def test_cli_preserves_recorded_failure_cause_and_nonzero_task_exit(tmp_path):
+def test_cli_preserves_recorded_failure_cause_and_nonzero_task_exit(
+    tmp_path: "Path",
+) -> "None":
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps(manifest_records()))
     gpu = tmp_path / "gpu"
@@ -296,7 +303,9 @@ def test_cli_preserves_recorded_failure_cause_and_nonzero_task_exit(tmp_path):
     assert failed["valid_winner"] is False
 
 
-def test_rank_retention_uses_stable_nonatomic_ties_and_separate_atomic_group():
+def test_rank_retention_uses_stable_nonatomic_ties_and_separate_atomic_group() -> (
+    "None"
+):
     g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
     g1_fast = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu_xcd2"
     g1_later = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu_xcd4"
@@ -343,7 +352,7 @@ def test_rank_retention_uses_stable_nonatomic_ties_and_separate_atomic_group():
     assert atomic_report["pair_validated"] is False
 
 
-def test_failed_screen_has_no_rank_even_when_fallback_validates_pair():
+def test_failed_screen_has_no_rank_even_when_fallback_validates_pair() -> "None":
     g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
     g2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
     console = (
@@ -362,7 +371,7 @@ def test_failed_screen_has_no_rank_even_when_fallback_validates_pair():
     assert report["pair_validated"] is True
 
 
-def test_fallback_count_infers_expansion_after_nonempty_shortlist_failure():
+def test_fallback_count_infers_expansion_after_nonempty_shortlist_failure() -> "None":
     g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
     g2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
     expanded = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_scatter_sbm128"
@@ -380,7 +389,7 @@ def test_fallback_count_infers_expansion_after_nonempty_shortlist_failure():
     assert summary_module().staged_fallback_groups(console, screen_topk=2) == 0
 
 
-def test_fallback_count_unions_explicit_and_inferred_groups_once():
+def test_fallback_count_unions_explicit_and_inferred_groups_once() -> "None":
     g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
     g2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
     console = (
@@ -394,7 +403,9 @@ def test_fallback_count_unions_explicit_and_inferred_groups_once():
 
 
 @pytest.mark.parametrize("compressed", (False, True))
-def test_cli_reports_rank_retention_only_when_staged_log_exists(tmp_path, compressed):
+def test_cli_reports_rank_retention_only_when_staged_log_exists(
+    tmp_path: "Path", compressed: "bool"
+) -> "None":
     manifest = tmp_path / "manifest.json"
     manifest.write_text(json.dumps(manifest_records()))
     gpu = tmp_path / "gpu"

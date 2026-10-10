@@ -10,6 +10,7 @@ import csv
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 import torch
@@ -22,7 +23,7 @@ from aiter.aot.flydsl import mxfp4_moe as aot
 
 
 @pytest.fixture(autouse=True)
-def offline_environment(monkeypatch):
+def offline_environment(monkeypatch: "pytest.MonkeyPatch") -> "None":
     for name in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         assert os.environ.get(name) == "", name
     for name in (
@@ -32,7 +33,7 @@ def offline_environment(monkeypatch):
     ):
         monkeypatch.delenv(name, raising=False)
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: "object", **kwargs: "object") -> "None":
         pytest.fail("offline AOT check reached GPU work")
 
     monkeypatch.setattr(torch.cuda, "_lazy_init", forbidden)
@@ -41,7 +42,14 @@ def offline_environment(monkeypatch):
     monkeypatch.setattr(torch.cuda, "CUDAGraph", forbidden)
 
 
-def winner_csv(tmp_path, *, activation="swiglu", epilog="scatter", bn=128, bm=128):
+def winner_csv(
+    tmp_path: "Path",
+    *,
+    activation: "str" = "swiglu",
+    epilog: "str" = "scatter",
+    bn: "int" = 128,
+    bm: "int" = 128,
+) -> "Path":
     suffix = "" if activation == "silu" else f"_{activation}"
     row = {
         "token": 128,
@@ -64,7 +72,9 @@ def winner_csv(tmp_path, *, activation="swiglu", epilog="scatter", bn=128, bm=12
     return path
 
 
-def test_custom_limit_changes_stage1_compile_jobs_without_changing_names(tmp_path):
+def test_custom_limit_changes_stage1_compile_jobs_without_changing_names(
+    tmp_path: "Path",
+) -> "None":
     path = winner_csv(tmp_path)
     defaults = [job for job in aot.parse_csv(str(path)) if job["stage"] == 1]
     custom = [
@@ -78,13 +88,17 @@ def test_custom_limit_changes_stage1_compile_jobs_without_changing_names(tmp_pat
 
 
 @pytest.mark.parametrize("value", [0, -1, float("nan"), float("inf"), "invalid"])
-def test_invalid_limits_are_rejected_before_aot_jobs_are_returned(tmp_path, value):
+def test_invalid_limits_are_rejected_before_aot_jobs_are_returned(
+    tmp_path: "Path", value: "object"
+) -> "None":
     path = winner_csv(tmp_path)
     with pytest.raises(ValueError, match="finite positive"):
         aot.parse_csv(str(path), swiglu_limit=value)
 
 
-def test_situv2_retains_default_parameter_variants_and_rejects_a_custom_limit(tmp_path):
+def test_situv2_retains_default_parameter_variants_and_rejects_a_custom_limit(
+    tmp_path: "Path",
+) -> "None":
     path = winner_csv(tmp_path, activation="situv2")
     jobs = [job for job in aot.parse_csv(str(path)) if job["stage"] == 1]
     assert {
@@ -99,8 +113,12 @@ def test_situv2_retains_default_parameter_variants_and_rejects_a_custom_limit(tm
 )
 @pytest.mark.parametrize("value", [None, "", "5"])
 def test_omitted_limit_matches_batch_environment_and_explicit_limit_takes_precedence(
-    monkeypatch, tmp_path, activation, default, value
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: "Path",
+    activation: "str",
+    default: "float",
+    value: "object",
+) -> "None":
     if value is not None:
         monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", value)
     path = winner_csv(tmp_path, activation=activation)
@@ -114,12 +132,12 @@ def test_omitted_limit_matches_batch_environment_and_explicit_limit_takes_preced
 
 
 @pytest.fixture
-def external_compiler(monkeypatch):
+def external_compiler(monkeypatch: "pytest.MonkeyPatch") -> "list[dict[str, object]]":
     import flydsl.compiler
 
     invocations = []
 
-    def compile_without_launch(*args, **kwargs):
+    def compile_without_launch(*args: "object", **kwargs: "object") -> "None":
         assert os.environ["COMPILE_ONLY"] == "1"
         assert os.environ["FLYDSL_GPU_ARCH"] == "gfx950"
         invocations.append(args)
@@ -129,8 +147,11 @@ def external_compiler(monkeypatch):
 
 
 def test_standalone_accepts_custom_limit_and_compiles_the_discovered_jobs(
-    monkeypatch, tmp_path, external_compiler, capsys
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: "Path",
+    external_compiler: "list[dict[str, object]]",
+    capsys: "pytest.CaptureFixture[str]",
+) -> "None":
     path = winner_csv(tmp_path, epilog="atomic")
     monkeypatch.setattr(
         sys, "argv", ["mxfp4_moe", "--csv", str(path), "--swiglu-limit", "5"]
@@ -144,8 +165,8 @@ def test_standalone_accepts_custom_limit_and_compiles_the_discovered_jobs(
 
 @pytest.mark.parametrize("bn", [128, 256])
 def test_enabled_fp4_scatter_jobs_match_production_and_preserve_bias_fallback(
-    monkeypatch, tmp_path, bn
-):
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path", bn: "int"
+) -> "None":
     monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
     path = winner_csv(tmp_path, bn=bn)
     jobs = [job for job in aot.parse_csv(str(path)) if job["stage"] == 2]
@@ -157,8 +178,11 @@ def test_enabled_fp4_scatter_jobs_match_production_and_preserve_bias_fallback(
 
 @pytest.mark.parametrize("bn", [128, 256])
 def test_fp4_scatter_compile_entry_supplies_valid_packed_payload_and_e8m0_scales(
-    monkeypatch, tmp_path, bn, external_compiler
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: "Path",
+    bn: "int",
+    external_compiler: "list[dict[str, object]]",
+) -> "None":
     monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
     path = winner_csv(tmp_path, bn=bn)
     job = next(
@@ -183,15 +207,15 @@ def test_fp4_scatter_compile_entry_supplies_valid_packed_payload_and_e8m0_scales
 )
 @pytest.mark.parametrize("limit", [None, 5])
 def test_stage2_flags_select_matching_compile_jobs_and_leave_atomic_bf16(
-    monkeypatch,
-    tmp_path,
-    external_compiler,
-    fp8,
-    fp4,
-    reduce_dtype,
-    scatter_dtype,
-    limit,
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: "Path",
+    external_compiler: "list[dict[str, object]]",
+    fp8: "bool",
+    fp4: "bool",
+    reduce_dtype: "str",
+    scatter_dtype: "str",
+    limit: "str | None",
+) -> "None":
     monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", fp8)
     monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", fp4)
     for epilog, expected in (
@@ -215,7 +239,9 @@ def test_stage2_flags_select_matching_compile_jobs_and_leave_atomic_bf16(
     assert external_compiler
 
 
-def test_fp4_flag_keeps_bn512_scatter_on_supported_bf16_path(monkeypatch, tmp_path):
+def test_fp4_flag_keeps_bn512_scatter_on_supported_bf16_path(
+    monkeypatch: "pytest.MonkeyPatch", tmp_path: "Path"
+) -> "None":
     monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
     path = winner_csv(tmp_path, bn=512)
     jobs = [job for job in aot.parse_csv(str(path)) if job["stage"] == 2]
@@ -223,8 +249,10 @@ def test_fp4_flag_keeps_bn512_scatter_on_supported_bf16_path(monkeypatch, tmp_pa
 
 
 def test_selected_csv_batch_collection_uses_matching_environment_and_excludes_other_csvs(
-    monkeypatch, tmp_path, external_compiler
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    tmp_path: "Path",
+    external_compiler: "list[dict[str, object]]",
+) -> "None":
     from aiter.aot.flydsl.common import collect_aot_jobs
 
     unused_dir = tmp_path / "unused"
@@ -250,8 +278,8 @@ def test_selected_csv_batch_collection_uses_matching_environment_and_excludes_ot
 
 
 def test_documented_selected_csv_batch_runs_real_pool_in_an_independent_cpu_process(
-    tmp_path,
-):
+    tmp_path: "Path",
+) -> "None":
     selected = winner_csv(tmp_path)
     environment = dict(os.environ)
     environment.update(

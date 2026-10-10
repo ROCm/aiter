@@ -1,0 +1,2 @@
+PASS: 30 changed files retain identical executable AST after removing signature annotations and annotation imports.
+Scope: 308 newly untyped signatures plus parse_csv return, from fixed final Standards inventory. Untouched legacy signatures remain untouched.

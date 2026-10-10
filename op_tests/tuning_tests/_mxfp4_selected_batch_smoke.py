@@ -8,17 +8,17 @@ from pathlib import Path
 from op_tests.tuning_tests._controlled_tuner_import import import_moe_tuner
 
 
-def main():
+def main() -> "None":
     for name in ("ROCR_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "CUDA_VISIBLE_DEVICES"):
         assert os.environ.get(name) == "", name
     import_moe_tuner()
     import flydsl.compiler
     import torch
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: "object", **kwargs: "object") -> "None":
         raise AssertionError("selected batch smoke reached GPU work")
 
-    def compile_without_launch(*args, **kwargs):
+    def compile_without_launch(*args: "object", **kwargs: "object") -> "None":
         assert os.environ["COMPILE_ONLY"] == "1"
         assert os.environ["FLYDSL_GPU_ARCH"] == "gfx950"
 

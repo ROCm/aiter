@@ -21,21 +21,25 @@ from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import (
 )
 
 
-def parse_cli(monkeypatch, *options):
+def parse_cli(monkeypatch: "pytest.MonkeyPatch", *options: "object") -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     monkeypatch.setattr(sys, "argv", ["gemm_moe_tune", *options])
     return tuner.parse_args()
 
 
-def test_cli_accepts_staged_with_default_screening_topk(monkeypatch):
+def test_cli_accepts_staged_with_default_screening_topk(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     args = parse_cli(monkeypatch, "--mxfp4-flydsl", "--mxfp4-search-mode", "staged")
     assert args.mxfp4_search_mode == "staged"
     assert args.mxfp4_screen_topk == 2
 
 
 @pytest.mark.parametrize("screen_topk", [1, 2, 7])
-def test_cli_accepts_any_positive_staged_screening_topk(monkeypatch, screen_topk):
+def test_cli_accepts_any_positive_staged_screening_topk(
+    monkeypatch: "pytest.MonkeyPatch", screen_topk: "int"
+) -> "None":
     args = parse_cli(
         monkeypatch,
         "--mxfp4-flydsl",
@@ -48,7 +52,9 @@ def test_cli_accepts_any_positive_staged_screening_topk(monkeypatch, screen_topk
 
 
 @pytest.mark.parametrize("mode", [None, "prune", "full"])
-def test_cli_preserves_default_prune_and_full(monkeypatch, mode):
+def test_cli_preserves_default_prune_and_full(
+    monkeypatch: "pytest.MonkeyPatch", mode: "str | None"
+) -> "None":
     options = ["--mxfp4-flydsl"]
     if mode is not None:
         options.extend(["--mxfp4-search-mode", mode])
@@ -59,8 +65,10 @@ def test_cli_preserves_default_prune_and_full(monkeypatch, mode):
 
 @pytest.mark.parametrize("mode", [None, "prune", "full"])
 def test_cli_rejects_explicit_screening_topk_without_explicit_staged(
-    monkeypatch, capsys, mode
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    capsys: "pytest.CaptureFixture[str]",
+    mode: "str | None",
+) -> "None":
     options = ["--mxfp4-flydsl", "--mxfp4-screen-topk", "2"]
     if mode is not None:
         options.extend(["--mxfp4-search-mode", mode])
@@ -71,7 +79,9 @@ def test_cli_rejects_explicit_screening_topk_without_explicit_staged(
 
 
 @pytest.mark.parametrize("screen_topk", ["0", "-1", "2.5"])
-def test_cli_rejects_nonpositive_or_noninteger_screening_topk(monkeypatch, screen_topk):
+def test_cli_rejects_nonpositive_or_noninteger_screening_topk(
+    monkeypatch: "pytest.MonkeyPatch", screen_topk: "int"
+) -> "None":
     with pytest.raises(SystemExit) as failure:
         parse_cli(
             monkeypatch,
@@ -85,17 +95,21 @@ def test_cli_rejects_nonpositive_or_noninteger_screening_topk(monkeypatch, scree
 
 
 @pytest.mark.parametrize("options", [[], ["--mxfp4-flydsl", "--grouped-gemm"]])
-def test_cli_retains_tuner_and_grouped_combination_checks(monkeypatch, options):
+def test_cli_retains_tuner_and_grouped_combination_checks(
+    monkeypatch: "pytest.MonkeyPatch", options: "list[str]"
+) -> "None":
     with pytest.raises(SystemExit) as failure:
         parse_cli(monkeypatch, *options, "--mxfp4-search-mode", "staged")
     assert failure.value.code == 2
 
 
-def pair_names(rows):
+def pair_names(rows: "list[dict[str, object]]") -> "list[tuple[str, str]]":
     return [(row["kernelName1"], row["kernelName2"]) for row in rows]
 
 
-def test_staged_plan_projects_real_pruned_pairs_and_supports_i384_without_gpu():
+def test_staged_plan_projects_real_pruned_pairs_and_supports_i384_without_gpu() -> (
+    "None"
+):
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     row = shape(512, inter_dim=384)
@@ -125,7 +139,9 @@ def test_staged_plan_projects_real_pruned_pairs_and_supports_i384_without_gpu():
         (129, {64, 128}),
     ],
 )
-def test_staged_keeps_main_m_est_boundary_rules(m_est, expected_bms):
+def test_staged_keeps_main_m_est_boundary_rules(
+    m_est: "int", expected_bms: "set[int]"
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     row = shape(m_est, expert=4, topk=4)
@@ -160,12 +176,12 @@ def test_staged_keeps_main_m_est_boundary_rules(m_est, expected_bms):
     ],
 )
 def test_staged_rejects_actual_shape_contract_before_enumeration(
-    monkeypatch, updates, reason
-):
+    monkeypatch: "pytest.MonkeyPatch", updates: "object", reason: "str"
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
 
-    def forbid_enumeration(*args, **kwargs):
+    def forbid_enumeration(*args: "object", **kwargs: "object") -> "None":
         pytest.fail("unsupported shape entered candidate enumeration")
 
     monkeypatch.setattr(tuner, "_candidate_rows", forbid_enumeration)
@@ -173,14 +189,20 @@ def test_staged_rejects_actual_shape_contract_before_enumeration(
         tuner._staged_candidate_plan(shape(**updates))
 
 
-def plan_fixture(monkeypatch, row, pairs):
+def plan_fixture(
+    monkeypatch: "pytest.MonkeyPatch",
+    row: "dict[str, object]",
+    pairs: "list[tuple[int, str, str]] | None",
+) -> "moe.StagedSearchPlan":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     candidates = [
         tuner._candidate_row(row, bm, gemm1, gemm2) for bm, gemm1, gemm2 in pairs
     ]
 
-    def enumerated(shape_row, full_search=False):
+    def enumerated(
+        shape_row: "dict[str, object]", full_search: "bool" = False
+    ) -> "list[dict[str, object]]":
         assert full_search is False
         return candidates
 
@@ -188,7 +210,9 @@ def plan_fixture(monkeypatch, row, pairs):
     return tuner._staged_candidate_plan(row)
 
 
-def test_staged_preserves_complete_names_and_groups_reduce_with_scatter(monkeypatch):
+def test_staged_preserves_complete_names_and_groups_reduce_with_scatter(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     g1 = "flydsl_mxmoe_g1_a4w4_128x128x256_swiglu"
     g1_xcd = g1 + "_xcd2"
     atomic = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_sbm128"
@@ -283,8 +307,8 @@ def test_staged_preserves_complete_names_and_groups_reduce_with_scatter(monkeypa
     ],
 )
 def test_staged_rejects_incompatible_admitted_pair_contract(
-    monkeypatch, bm, g1, g2, reason
-):
+    monkeypatch: "pytest.MonkeyPatch", bm: "int", g1: "str", g2: "str", reason: "str"
+) -> "None":
     with pytest.raises(ValueError, match=reason):
         plan_fixture(monkeypatch, shape(), [(bm, g1, g2)])
 
@@ -297,7 +321,9 @@ G2_B = "flydsl_moe2_layout_afp4_wfp4_bf16_t32x256x128_atomic_sbm32"
 G2_C = "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_persist_sbm32"
 
 
-def test_staged_shape_validates_only_successful_shortlist_product(monkeypatch):
+def test_staged_shape_validates_only_successful_shortlist_product(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     row = shape(128)
@@ -329,7 +355,11 @@ def test_staged_shape_validates_only_successful_shortlist_product(monkeypatch):
     )
     attempts = []
 
-    def validate(row, candidate, args):
+    def validate(
+        row: "dict[str, object]",
+        candidate: "dict[str, object]",
+        args: "SimpleNamespace",
+    ) -> "float":
         attempts.append((candidate["kernelName1"], candidate["kernelName2"]))
         candidate.update(us=9.5, us1=9.5, us2=0)
         return 9.5
@@ -343,7 +373,13 @@ def test_staged_shape_validates_only_successful_shortlist_product(monkeypatch):
     assert result["us"] == result["us1"] == 9.5 and result["us2"] == 0
 
 
-def controlled_search(monkeypatch, *, pairs=None, screen_topk=1, row=None):
+def controlled_search(
+    monkeypatch: "pytest.MonkeyPatch",
+    *,
+    pairs: "list[tuple[int, str, str]] | None" = None,
+    screen_topk: "int" = 1,
+    row: "dict[str, object] | None" = None
+) -> "SimpleNamespace":
     """Provide returned GPU-boundary outcomes, retaining the real search policy."""
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
@@ -367,37 +403,57 @@ def controlled_search(monkeypatch, *, pairs=None, screen_topk=1, row=None):
         iters=5,
     )
 
-    def returned(outcome):
+    def returned(outcome: "float | bool | Exception") -> "float | bool":
         if isinstance(outcome, BaseException):
             raise outcome
         return outcome
 
-    def enumerate_pairs(actual_row, full_search=False):
+    def enumerate_pairs(
+        actual_row: "dict[str, object]", full_search: "bool" = False
+    ) -> "list[dict[str, object]]":
         state.events.append(("enumerate", actual_row["token"], full_search))
         assert full_search is False
         return [tuner._candidate_row(actual_row, bm, g1, g2) for bm, g1, g2 in pairs]
 
-    def consumer(actual_row, name, actual_args):
+    def consumer(
+        actual_row: "dict[str, object]", name: "str", actual_args: "SimpleNamespace"
+    ) -> "bool":
         state.events.append(("consumer", name))
         assert actual_args is args
         return returned(state.consumers.get(name, True))
 
-    def bootstrap(actual_row, producer, consumer, actual_args):
+    def bootstrap(
+        actual_row: "dict[str, object]",
+        producer: "object",
+        consumer: "object",
+        actual_args: "SimpleNamespace",
+    ) -> "bool":
         state.events.append(("bootstrap", producer, consumer))
         assert actual_args is args
         return returned(state.bootstrap.get(producer, True))
 
-    def screen_g1(actual_row, name, actual_args):
+    def screen_g1(
+        actual_row: "dict[str, object]", name: "str", actual_args: "SimpleNamespace"
+    ) -> "float":
         state.events.append(("g1", name))
         assert actual_args is args
         return returned(state.stage1.get(name, 1.0))
 
-    def screen_g2(actual_row, producer, name, actual_args):
+    def screen_g2(
+        actual_row: "dict[str, object]",
+        producer: "object",
+        name: "str",
+        actual_args: "SimpleNamespace",
+    ) -> "float":
         state.events.append(("g2", producer, name))
         assert actual_args is args
         return returned(state.stage2.get(name, 1.0))
 
-    def validate(actual_row, candidate, actual_args):
+    def validate(
+        actual_row: "dict[str, object]",
+        candidate: "dict[str, object]",
+        actual_args: "SimpleNamespace",
+    ) -> "float":
         pair = candidate["kernelName1"], candidate["kernelName2"]
         state.events.append(("validate", *pair))
         assert actual_args is args
@@ -419,12 +475,14 @@ def controlled_search(monkeypatch, *, pairs=None, screen_topk=1, row=None):
     return state
 
 
-def events(state, kind):
+def events(state: "SimpleNamespace", kind: "str") -> "list[tuple[object, ...]]":
     return [event[1:] for event in state.events if event[0] == kind]
 
 
 @pytest.mark.parametrize("screen_topk,count", [(1, 1), (2, 4), (7, 9)])
-def test_staged_screening_topk_caps_shortlist_product(monkeypatch, screen_topk, count):
+def test_staged_screening_topk_caps_shortlist_product(
+    monkeypatch: "pytest.MonkeyPatch", screen_topk: "int", count: "int"
+) -> "None":
     state = controlled_search(monkeypatch, screen_topk=screen_topk)
     state.run()
     attempted = events(state, "validate")
@@ -433,7 +491,9 @@ def test_staged_screening_topk_caps_shortlist_product(monkeypatch, screen_topk, 
         assert attempted == [(G1_B, G2_C), (G1_B, G2_A), (G1_C, G2_C), (G1_C, G2_A)]
 
 
-def test_staged_exact_ties_keep_only_k_in_admitted_order(monkeypatch):
+def test_staged_exact_ties_keep_only_k_in_admitted_order(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     state = controlled_search(monkeypatch, screen_topk=2)
     state.stage1 = dict.fromkeys((G1_A, G1_B, G1_C), 1.0)
     state.stage2 = dict.fromkeys((G2_A, G2_B, G2_C), 1.0)
@@ -458,8 +518,8 @@ def test_staged_exact_ties_keep_only_k_in_admitted_order(monkeypatch):
     ],
 )
 def test_staged_excludes_failed_screening_scores_when_a_shortlist_is_valid(
-    monkeypatch, invalid
-):
+    monkeypatch: "pytest.MonkeyPatch", invalid: "float | Exception"
+) -> "None":
     state = controlled_search(monkeypatch, screen_topk=7)
     state.stage1 = {G1_A: invalid, G1_B: 1.0, G1_C: invalid}
     state.stage2 = {G2_A: invalid, G2_B: invalid, G2_C: 1.0}
@@ -467,7 +527,9 @@ def test_staged_excludes_failed_screening_scores_when_a_shortlist_is_valid(
     assert events(state, "validate") == [(G1_B, G2_C)]
 
 
-def test_staged_bootstrap_prefers_admitted_reference_and_keeps_it_untimed(monkeypatch):
+def test_staged_bootstrap_prefers_admitted_reference_and_keeps_it_untimed(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     state = controlled_search(monkeypatch)
     result = state.run()
     assert events(state, "consumer") == [(G2_A,)]
@@ -477,7 +539,9 @@ def test_staged_bootstrap_prefers_admitted_reference_and_keeps_it_untimed(monkey
     assert result["us"] == 10.0
 
 
-def test_staged_reference_retries_only_remaining_admitted_candidates(monkeypatch):
+def test_staged_reference_retries_only_remaining_admitted_candidates(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     state = controlled_search(monkeypatch)
     state.consumers = {
         G2_A: RuntimeError("preferred consumer"),
@@ -498,8 +562,8 @@ def test_staged_reference_retries_only_remaining_admitted_candidates(monkeypatch
 
 @pytest.mark.parametrize("failure", ["consumer", "producer", "g1", "g2"])
 def test_staged_exhausts_admitted_pairs_after_independent_fixture_failure(
-    monkeypatch, failure
-):
+    monkeypatch: "pytest.MonkeyPatch", failure: "Exception | str"
+) -> "None":
     state = controlled_search(monkeypatch)
     if failure == "consumer":
         state.consumers = dict.fromkeys((G2_A, G2_B, G2_C), False)
@@ -535,8 +599,8 @@ def test_staged_exhausts_admitted_pairs_after_independent_fixture_failure(
     ],
 )
 def test_staged_invalid_shortlist_expands_without_rerunning_returned_outcomes(
-    monkeypatch, invalid
-):
+    monkeypatch: "pytest.MonkeyPatch", invalid: "float | Exception"
+) -> "None":
     state = controlled_search(monkeypatch)
     state.validation[(G1_B, G2_C)] = invalid
     state.validation[(G1_B, G2_B)] = 4.0
@@ -554,7 +618,9 @@ def test_staged_invalid_shortlist_expands_without_rerunning_returned_outcomes(
     )
 
 
-def test_staged_screening_failed_candidates_can_win_during_fallback(monkeypatch):
+def test_staged_screening_failed_candidates_can_win_during_fallback(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     state = controlled_search(monkeypatch)
     state.stage1[G1_C] = RuntimeError("producer screen")
     state.stage2[G2_A] = float("inf")
@@ -569,7 +635,9 @@ def test_staged_screening_failed_candidates_can_win_during_fallback(monkeypatch)
     )
 
 
-def test_staged_no_winner_and_empty_universe_return_invalid(monkeypatch):
+def test_staged_no_winner_and_empty_universe_return_invalid(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     state = controlled_search(monkeypatch)
     state.validation = dict.fromkeys(state.pairs, RuntimeError("all pairs incorrect"))
     failed = state.run()
@@ -585,7 +653,9 @@ def test_staged_no_winner_and_empty_universe_return_invalid(monkeypatch):
     )
 
 
-def test_staged_scores_and_pair_cache_are_fresh_for_each_shape(monkeypatch):
+def test_staged_scores_and_pair_cache_are_fresh_for_each_shape(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     state = controlled_search(monkeypatch)
     state.validation[(G1_B, G2_C)] = RuntimeError("first shape incorrect")
     state.run()
@@ -600,7 +670,9 @@ def test_staged_scores_and_pair_cache_are_fresh_for_each_shape(monkeypatch):
     assert result["token"] == 256 and result["us"] == 0.2
 
 
-def test_staged_reuses_g1_ranking_across_atomic_reduce_and_scatter_groups(monkeypatch):
+def test_staged_reuses_g1_ranking_across_atomic_reduce_and_scatter_groups(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     g1 = "flydsl_mxmoe_g1_a4w4_128x128x256_swiglu"
     other = "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_xcd2"
     atomic = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_sbm128"
@@ -626,8 +698,8 @@ def test_staged_reuses_g1_ranking_across_atomic_reduce_and_scatter_groups(monkey
 
 
 def test_staged_all_atomic_reference_failures_preserve_valid_nonatomic_pair(
-    monkeypatch,
-):
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     reduce = "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_reduce_sbm32"
     state = controlled_search(
         monkeypatch,
@@ -655,7 +727,9 @@ def test_staged_all_atomic_reference_failures_preserve_valid_nonatomic_pair(
     )
 
 
-def test_staged_g2_failure_exhausts_only_affected_compatibility_group(monkeypatch):
+def test_staged_g2_failure_exhausts_only_affected_compatibility_group(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     reduce = "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_reduce_sbm32"
     state = controlled_search(
         monkeypatch,
@@ -675,8 +749,8 @@ def test_staged_g2_failure_exhausts_only_affected_compatibility_group(monkeypatc
 
 
 def test_staged_bootstrap_failure_is_local_to_bm_and_later_groups_still_screen(
-    monkeypatch,
-):
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     g1_64 = "flydsl_mxmoe_g1_a4w4_64x128x256_swiglu"
     g2_64 = "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x128_atomic_sbm64"
     state = controlled_search(

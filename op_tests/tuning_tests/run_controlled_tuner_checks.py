@@ -13,7 +13,7 @@ from op_tests.tuning_tests._controlled_tuner_import import import_moe_tuner
 import_moe_tuner()
 
 
-def main():
+def main() -> "int":
     suite = unittest.TestLoader().loadTestsFromNames(
         [
             "op_tests.tuning_tests.test_tuner_infra",
