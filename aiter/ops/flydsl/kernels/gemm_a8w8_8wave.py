@@ -463,7 +463,9 @@ def compile_fp8_gemm_8w(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            # Letting 2 * A + B loads stay outstanding here crosses the barrier
+            # with LDS writes still in flight that the next iteration reads.
+            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
