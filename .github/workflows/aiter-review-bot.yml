@@ -210,5 +210,7 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           GH_TOKEN: ${{ github.token }}
           AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
-          OWNER_OVERRIDE: ${{ vars.AITER_RUNNER_OWNER }}
+          # The flow owner, not the runner owner: what lands here is "the job said nothing and
+          # the cause is in the log", which is a triage job, not necessarily a box problem.
+          OWNER_OVERRIDE: ${{ vars.AITER_FLOW_OWNER }}
         run: python3 .claude/skills/review-pr/lost_review.py

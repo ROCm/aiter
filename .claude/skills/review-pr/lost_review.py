@@ -24,15 +24,18 @@ from watchdog import GitHub      # sibling; sys.path[0] is this script's directo
 
 
 def body(result, owner, run_url):
+    # Says what is known and no more. This fires for a runner that lost contact mid-review, for
+    # a review that ran fine and then failed to publish its card, and for a notice that could not
+    # be posted -- naming one of them as the cause would send the reader to the wrong place.
     return (
-        "⚠️ **aiter-bot** — the review job ended as `%s` without posting anything, "
-        "so there is no review and no failure report for this PR.\n\n"
-        "Everything that reports a failure runs inside that job, which means a job that stops "
-        "existing — the runner losing contact mid-review is the usual cause — cannot "
-        "report itself. Nothing is wrong with this PR, and nothing was changed on it.\n\n"
-        "@%s — please check the runner.%s\n\n"
-        "<sub>Re-comment `@aiter-bot review` to try again. See "
-        "`.claude/skills/review-pr/RUNNER-SETUP.md` section 5.</sub>"
+        "\u26a0\ufe0f **aiter-bot** \u2014 the review job ended as `%s` and nothing was posted "
+        "for this PR: no review card, and no failure report either.\n\n"
+        "Everything that reports a failure runs inside that job, so a job that stops existing, "
+        "or one whose posting step is what failed, cannot report itself. The run log says which "
+        "\u2014 a runner that lost contact mid-review and a card that could not be published "
+        "both end up here. Nothing is wrong with this PR, and nothing on it was changed.\n\n"
+        "@%s \u2014 the run below has the cause.%s\n\n"
+        "<sub>Re-comment `@aiter-bot review` to try again.</sub>"
         % (result, owner, ("\n\nRun: " + run_url) if run_url else ""))
 
 
