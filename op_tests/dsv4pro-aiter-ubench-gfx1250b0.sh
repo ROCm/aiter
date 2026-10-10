@@ -127,8 +127,8 @@ HIP_VISIBLE_DEVICES=0 \
 echo "[3/11] exit=$?" >> $SUMMARY
 echo ""
 
-# 4. MLA-v4 decode [EP] (fp8 sparse, Opus vs asm) — single GPU
-echo "=== [4/11] MLA-v4 decode [EP] (fp8 sparse, Opus vs asm) ==="
+# 4. MLA-v4 decode [EP] (fp8 sparse, asm) — single GPU
+echo "=== [4/11] MLA-v4 decode [EP] (fp8 sparse, asm) ==="
 (
   failed=0
   # Representative HCA/CSA pools; pair each pool with one sparse top-k instead
@@ -145,7 +145,7 @@ echo "=== [4/11] MLA-v4 decode [EP] (fp8 sparse, Opus vs asm) ==="
         --total_pages $kv_pool \
         --total_tokens 512 \
         --prec fp8 \
-        --backend opus asm \
+        --backend asm \
         --no-verify
     case_exit=$?
     if [ "$case_exit" -ne 0 ]; then
@@ -154,7 +154,7 @@ echo "=== [4/11] MLA-v4 decode [EP] (fp8 sparse, Opus vs asm) ==="
     fi
   done
   exit "$failed"
-) 2>&1 | tee $LOGDIR/04_mla_v4_decode_ep_opus_asm.log
+) 2>&1 | tee $LOGDIR/04_mla_v4_decode_ep_asm.log
 echo "[4/11] exit=${PIPESTATUS[0]}" >> $SUMMARY
 echo ""
 
