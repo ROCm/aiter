@@ -52,6 +52,7 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_g2_kname_any,
 )
 from aiter.ops.moe_mxfp4_aux import (
+    _MissingMxfp4MoeAuxInstances,
     _mxfp4_moe_sort_internal_is_supported,
     is_mxfp4_moe_scatter_supported,
 )
@@ -2896,31 +2897,31 @@ def _flydsl_v2_stage2_wrapper(
 
 
 def _mxmoe_opus_cfg_unsupported(
-    p1,
-    kernel_name2,
-    cfg,
+    p1: dict,
+    kernel_name2: str,
+    cfg: dict,
     *,
-    gfx,
-    model_dim,
-    inter_dim,
-    expert,
-    topk,
-    dtype,
-    q_dtype_a,
-    q_dtype_w,
-    q_type,
-    use_g1u1,
-    doweight_stage1,
-    gate_mode,
-    hidden_pad,
-    intermediate_pad,
-    is_ep,
-    has_stage2_bias,
-    q_dtype_a2,
-    input_dtype,
-    has_stage2_scatter,
-    has_num_local_tokens,
-):
+    gfx: str,
+    model_dim: int,
+    inter_dim: int,
+    expert: int,
+    topk: int,
+    dtype: torch.dtype,
+    q_dtype_a: torch.dtype,
+    q_dtype_w: torch.dtype,
+    q_type: QuantType,
+    use_g1u1: bool,
+    doweight_stage1: bool,
+    gate_mode: GateMode,
+    hidden_pad: int,
+    intermediate_pad: int,
+    is_ep: bool,
+    has_stage2_bias: bool,
+    q_dtype_a2: torch.dtype | None,
+    input_dtype: torch.dtype | None,
+    has_stage2_scatter: bool,
+    has_num_local_tokens: bool,
+) -> str:
     """Static common contract for the explicit MXMOE -> OPUS selection."""
     if (p1["a_dtype"], p1["out_dtype"]) != ("fp8", "fp8"):
         return "GEMM1 requires A8W4 and FP8out"
@@ -2985,7 +2986,7 @@ def _mxmoe_opus_cfg_unsupported(
     return ""
 
 
-def _is_mxmoe_opus_metadata(metadata):
+def _is_mxmoe_opus_metadata(metadata: MOEMetadata) -> bool:
     return (
         getattr(metadata.stage1, "func", metadata.stage1) is _mxfp4_a4w4_stage1_fw
         and getattr(metadata.stage2, "func", metadata.stage2)
@@ -2994,17 +2995,17 @@ def _is_mxmoe_opus_metadata(metadata):
 
 
 def _mxmoe_opus_call_unsupported(
-    metadata,
-    hidden_states,
-    w1,
-    w2,
-    w1_scale,
-    w2_scale,
-    a1_scale,
-    topk_ids,
+    metadata: MOEMetadata,
+    hidden_states: torch.Tensor,
+    w1: torch.Tensor,
+    w2: torch.Tensor,
+    w1_scale: torch.Tensor | None,
+    w2_scale: torch.Tensor | None,
+    a1_scale: torch.Tensor | None,
+    topk_ids: torch.Tensor,
     *,
-    block_size_M,
-):
+    block_size_M: int | None,
+) -> str:
     """Check tensor preparation and the actual sort before each public call."""
     if block_size_M is not None and int(block_size_M) != int(metadata.block_m):
         return f"block_size_M={block_size_M} differs from configured BM/SBM={metadata.block_m}"
@@ -3065,7 +3066,16 @@ def _mxmoe_opus_call_unsupported(
         int(metadata.block_m),
         not stage2_uses_route_reduce(metadata.stage2),
     ):
-        return "actual generated sort instance is unavailable in module_moe_mxfp4_aux"
+        raise _MissingMxfp4MoeAuxInstances(
+            [
+                (
+                    w1.shape[0],
+                    topk,
+                    w2.shape[1],
+                    not stage2_uses_route_reduce(metadata.stage2),
+                )
+            ]
+        )
     return ""
 
 
@@ -3427,6 +3437,16 @@ def get_2stage_cfgs(
         # Invalid MXMOE names must fail before a backend/layout check can
         # silently discard the row and substitute a heuristic kernel.
         parsed_g1 = _parse_mxfp4_g1_kname(kn1) if _is_mxfp4_kname(kn1) else None
+        if (
+            parsed_g1 is not None
+            and _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
+            and q_dtype_a2 not in (None, dtypes.fp8)
+        ):
+            # The existing A8W4 heuristic fallback consumes FP8 intermediate.
+            # Discarding this row cannot satisfy a different explicit request.
+            raise NotImplementedError(
+                f"No fallback backend for MXMOE -> OPUS supports requested intermediate precision {q_dtype_a2}; requires FP8"
+            )
         if (
             parsed_g1 is not None
             and _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
