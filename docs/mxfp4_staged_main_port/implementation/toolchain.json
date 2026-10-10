@@ -18,11 +18,14 @@
   "flydsl_wheel": "/tmp/aiter-mxfp4-cross-deps/flydsl-0.3.4.1-cp312-cp312-manylinux_2_27_x86_64.whl",
   "flydsl_wheel_sha256": "0c2f1271a3adb6f994915aa7c7976752f843ffcd1aa323a388d01f234bf809ce",
   "rocm_base_site_packages": "/opt/venv/lib/python3.12/site-packages",
-  "ck_dir": "/root/workspace/tmp_dev/aiter/3rdparty/composable_kernel",
+  "ck_dir": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
   "integration_branch": "integration/mxfp4-staged-main-port",
   "integration_worktree": "/root/workspace/tmp_dev/aiter-mxfp4-integration",
   "fixed_base": "882ea79dd7cc7091f859a5bedac914523ac77bbd",
   "base_source_branch": "main at specification publication",
   "remote_main_readonly_observation": "b0c4209d4dbe517ccb3db9fa02d897c426509be1\trefs/heads/main",
-  "environment_install_scope": "new dedicated venv only; existing environment unmodified"
+  "environment_install_scope": "new dedicated venv only; existing environment unmodified",
+  "original_ck_readonly_used_for_initial_baseline": "/root/workspace/tmp_dev/aiter/3rdparty/composable_kernel",
+  "ck_commit": "96afae1d54fc79c26857de7e1683b0dde1ff3c6f",
+  "ck_worktree_scope": "new detached worktree at target gitlink; original checkout unchanged"
 }

@@ -4,7 +4,7 @@ Implementation branch: `integration/mxfp4-staged-main-port`, worktree `/root/wor
 
 ## Environment and baseline
 
-[toolchain.json](toolchain.json) records the new dedicated Python environment and package versions. It inherits the host ROCm 7.1 Torch/Triton packages, installs FlyDSL 0.3.4.1 from a retained wheel and adds only tools to this dedicated environment. The original `/opt/venv` and historical cross environment are unchanged. `CK_DIR` points to the preserved original checkout for read-only headers; new integration worktrees initially have an empty CK submodule.
+[toolchain.json](toolchain.json) records the new dedicated Python environment and package versions. It inherits the host ROCm 7.1 Torch/Triton packages, installs FlyDSL 0.3.4.1 from a retained wheel and adds only tools to this dedicated environment. The original `/opt/venv` and historical cross environment are unchanged. The initial baseline used the preserved original checkout for read-only CK headers. Integration now contains a separate detached CK worktree at fixed-base gitlink `96afae1d54fc79c26857de7e1683b0dde1ff3c6f`; the original CK checkout remains unchanged.
 
 The host Torch 2.8 environment contains Triton 3.4. The repository-supported `AITER_USE_SYSTEM_TRITON=1` override permits imports with a version warning. Controlled lifecycle tests execute no GPU kernels; this warning does not establish numerical or deployment acceptance. Every required MXFP4 GPU path must be verified on the current integration implementation. Any actual unsupported API/path remains an acceptance failure until addressed.
 
@@ -23,3 +23,5 @@ env PATH=/root/workspace/tmp_dev/mxfp4-port-env/bin:$PATH \
 Physical target for all subsequent real tasks: `ROCR_VISIBLE_DEVICES=GPU-5d8a72a332aa124c`, `HIP_VISIBLE_DEVICES=0`, expected PCI `0000:f5:00.0`, gfx950/256 CUs. Monitoring-only exploration confirmed this identity and one idle sample; every real task needs its own fresh idle check and child PCI verification. GPU execution is coordinated sequentially by the primary agent.
 
 Baseline results and environment preparation are not completion evidence for tickets 02–04 or the 27-search calibration. Ticket-specific records will identify implementation commits, command/configuration, measurement conditions, exit status, numerical, exact production and precompiled outcomes.
+
+The same 55 baseline checks also passed with the precise fixed-base CK checkout in 18.210 seconds; [target-ck-baseline-infra.log.txt](target-ck-baseline-infra.log.txt) records this dependency-aligned baseline. Its command uses `CK_DIR=/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel` and `AITER_JIT_DIR=/root/workspace/tmp_dev/mxfp4-port-notes/target-ck-baseline-jit`; all other arguments match the initial baseline above.
