@@ -42,7 +42,9 @@ def test_invocation_captures_limit_and_stage2_settings_for_every_shape(
         args = tuner.parse_args()
         snapshots = []
 
-        def tune_shape(row: "dict[str, object]", args: "SimpleNamespace") -> "None":
+        def tune_shape(
+            row: "dict[str, object]", args: "SimpleNamespace"
+        ) -> "dict[str, object]":
             snapshots.append(args.mxfp4_configuration)
             return {**row, "us": 1.0}
 
@@ -117,7 +119,7 @@ def test_fp8_stage2_pair_and_screening_receive_original_route_weights(
     )
     observed = []
 
-    def stage2(*args: "object", **kwargs: "object") -> "None":
+    def stage2(*args: "object", **kwargs: "object") -> "object":
         observed.append(kwargs["topk_weights"])
         return sorting[4]
 

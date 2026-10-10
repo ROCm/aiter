@@ -6,6 +6,7 @@ The normal ROCm/FlyDSL toolchain is needed for imports. These checks prohibit
 GPU tensor preparation, profiling and real shape-worker launches.
 """
 
+import argparse
 import sys
 from types import SimpleNamespace
 
@@ -21,7 +22,9 @@ from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import (
 )
 
 
-def parse_cli(monkeypatch: "pytest.MonkeyPatch", *options: "object") -> "None":
+def parse_cli(
+    monkeypatch: "pytest.MonkeyPatch", *options: "str"
+) -> "argparse.Namespace":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     monkeypatch.setattr(sys, "argv", ["gemm_moe_tune", *options])
@@ -176,7 +179,7 @@ def test_staged_keeps_main_m_est_boundary_rules(
     ],
 )
 def test_staged_rejects_actual_shape_contract_before_enumeration(
-    monkeypatch: "pytest.MonkeyPatch", updates: "object", reason: "str"
+    monkeypatch: "pytest.MonkeyPatch", updates: "dict[str, object]", reason: "str"
 ) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
