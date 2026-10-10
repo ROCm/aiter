@@ -43,3 +43,18 @@ The existing system Triton 3.4 version warning remains visible. AITER core
 extension compilation is CPU import preparation. Matching deployment commands
 and caller-owned CSV settings are documented in
 [the AOT usage guide](../../../../aiter/aot/flydsl/README.md).
+
+`create_fixtures.py` prepares the 17 specified-pair requests for the configured
+acceptance harness from the current real admitted M_est-pruned enumeration.
+Each request chooses the first matching G2 BM/BN/BK/epilog in original order;
+it introduces no new candidate source or search. The manifest names the exact
+G1/G2 and settings, and each canonical input CSV has `us=0` pending numerical
+validation. `fixtures-origin.json` records the enumeration commit and counts;
+those counts are proposed pairs, not numerical or timing evidence.
+
+Run the same empty-visibility environment above with
+`python docs/mxfp4_staged_main_port/03/create_fixtures.py` to regenerate requests.
+This overwrites request CSVs, so use a separate `--output-dir` after acceptance
+has written validated timing rows. The script uses the existing controlled
+import helper, requires the normal ROCm/FlyDSL and pytest toolchain, and rejects
+nonempty/unspecified visibility; GPU work and FlyDSL compilation fail closed.
