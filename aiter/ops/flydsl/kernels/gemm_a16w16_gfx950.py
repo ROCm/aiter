@@ -27,6 +27,10 @@ from .gemm_a16w16_gfx950_utils import (
     wait_vmcnt_and_barrier,
 )
 from .kernels_common import run_cached
+from .tensor_shim import (
+    AITER_FLYDSL_KERNARG_PRELOAD,
+    AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+)
 
 GEMM_A16W16_DTYPE_FP32 = 1
 GEMM_A16W16_DTYPE_BF16 = 2
@@ -1302,6 +1306,14 @@ def gemm_a16w16_gfx950(
         block=(param.block_threads, 1, 1),
         stream=stream,
     )
+
+
+gemm_a16w16_gfx950.compile_hints = {
+    "llvm_options": {
+        "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
+        "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
+    },
+}
 
 
 def make_gemm_a16w16_param_and_validate(m, n, k, kwargs):

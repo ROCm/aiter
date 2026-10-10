@@ -88,6 +88,12 @@ _SKINNY = [
     (24, 6144, 2048, 24, 24, 64, 3, 4),
     (17, 6144, 2048, 32, 24, 64, 3, 4),
     (32, 6144, 2048, 32, 24, 64, 3, 4),
+    # GLM-5.2 qkv_a_proj decode (N=2624, K=6144): the tuned rows, including the
+    # M that reach a row through padding (3 -> 4, 7 -> 8)
+    (1, 2624, 6144, 4, 16, 128, 3, 4),
+    (3, 2624, 6144, 4, 16, 128, 4, 4),
+    (6, 2624, 6144, 8, 16, 128, 3, 8),
+    (7, 2624, 6144, 8, 16, 128, 2, 4),
     # 171 slabs: not a multiple of the 8 XCDs, so the linear slab mapping runs
     (5, 4104, 2048, 8, 24, 64, 4, 4),
     # other slab widths, deeper K, two waves
