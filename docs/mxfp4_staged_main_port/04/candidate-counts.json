@@ -1,0 +1,1456 @@
+{
+  "implementation_commit": "cd7b67cc44b579c06026c86d439f85ceb26191b4",
+  "dependency": "ROCm/FlyDSL imports with synthetic discovery; whole-process empty visibility; guarded GPU/JIT boundaries",
+  "legality": "Static admitted pairs, not runtime compilation or numerical validity",
+  "records": [
+    {
+      "id": "minimax-64-full",
+      "m_est": 2,
+      "total_pairs": 1368,
+      "unique_gemm1": 84,
+      "unique_gemm2": 68,
+      "k2_shortlist_pairs_upper": 32,
+      "staged_exhaustive_fallback_pairs_upper": 1368,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-64-prune",
+      "m_est": 2,
+      "total_pairs": 192,
+      "unique_gemm1": 12,
+      "unique_gemm2": 16,
+      "k2_shortlist_pairs_upper": 8,
+      "staged_exhaustive_fallback_pairs_upper": 192,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-64-staged",
+      "m_est": 2,
+      "total_pairs": 192,
+      "unique_gemm1": 12,
+      "unique_gemm2": 16,
+      "k2_shortlist_pairs_upper": 8,
+      "staged_exhaustive_fallback_pairs_upper": 192,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-128-prune",
+      "m_est": 4,
+      "total_pairs": 1056,
+      "unique_gemm1": 66,
+      "unique_gemm2": 32,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 1056,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-128-staged",
+      "m_est": 4,
+      "total_pairs": 1056,
+      "unique_gemm1": 66,
+      "unique_gemm2": 32,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 1056,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-512-prune",
+      "m_est": 16,
+      "total_pairs": 1056,
+      "unique_gemm1": 66,
+      "unique_gemm2": 32,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 1056,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-512-staged",
+      "m_est": 16,
+      "total_pairs": 1056,
+      "unique_gemm1": 66,
+      "unique_gemm2": 32,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 1056,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-1024-prune",
+      "m_est": 32,
+      "total_pairs": 1056,
+      "unique_gemm1": 66,
+      "unique_gemm2": 32,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 1056,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-1024-staged",
+      "m_est": 32,
+      "total_pairs": 1056,
+      "unique_gemm1": 66,
+      "unique_gemm2": 32,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 1056,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-2048-full",
+      "m_est": 64,
+      "total_pairs": 1368,
+      "unique_gemm1": 84,
+      "unique_gemm2": 68,
+      "k2_shortlist_pairs_upper": 32,
+      "staged_exhaustive_fallback_pairs_upper": 1368,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-2048-prune",
+      "m_est": 64,
+      "total_pairs": 456,
+      "unique_gemm1": 27,
+      "unique_gemm2": 52,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 456,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-2048-staged",
+      "m_est": 64,
+      "total_pairs": 456,
+      "unique_gemm1": 27,
+      "unique_gemm2": 52,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 456,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-4096-prune",
+      "m_est": 128,
+      "total_pairs": 360,
+      "unique_gemm1": 21,
+      "unique_gemm2": 52,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 360,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-4096-staged",
+      "m_est": 128,
+      "total_pairs": 360,
+      "unique_gemm1": 21,
+      "unique_gemm2": 52,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 360,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 8,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-8192-full",
+      "m_est": 256,
+      "total_pairs": 1368,
+      "unique_gemm1": 84,
+      "unique_gemm2": 68,
+      "k2_shortlist_pairs_upper": 32,
+      "staged_exhaustive_fallback_pairs_upper": 1368,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-8192-prune",
+      "m_est": 256,
+      "total_pairs": 216,
+      "unique_gemm1": 12,
+      "unique_gemm2": 36,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 216,
+      "groups": [
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "minimax-8192-staged",
+      "m_est": 256,
+      "total_pairs": 216,
+      "unique_gemm1": 12,
+      "unique_gemm2": 36,
+      "k2_shortlist_pairs_upper": 16,
+      "staged_exhaustive_fallback_pairs_upper": 216,
+      "groups": [
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-default-prune",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-default-staged",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-fp8-prune",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-fp8-staged",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-fp4-prune",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-fp4-staged",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-limit5-prune",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-limit5-staged",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-combined5-prune",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    },
+    {
+      "id": "gpt-2048-combined5-staged",
+      "m_est": 64,
+      "total_pairs": 912,
+      "unique_gemm1": 27,
+      "unique_gemm2": 104,
+      "k2_shortlist_pairs_upper": 24,
+      "staged_exhaustive_fallback_pairs_upper": 912,
+      "groups": [
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 9,
+          "gemm2_candidates": 16,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 16,
+          "pairs": 192,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 16,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 24,
+          "pairs": 144,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    }
+  ]
+}
