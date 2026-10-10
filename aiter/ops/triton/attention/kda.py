@@ -2,13 +2,11 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
-import math
 
 import torch
 import triton
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
 _LOGGER = AiterTritonLogger()
@@ -17,54 +15,17 @@ _LOG_INFO = _LOGGER._logger.isEnabledFor(logging.INFO)
 _ARCH = arch_info.get_arch()
 
 fused_recurrent_kda_packed_decode_kernel = None
+get_kda_config = None
 if _ARCH == "gfx1250":
     from aiter.ops.triton._gluon_kernels.gfx1250.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
+        get_kda_config,
     )
 elif _ARCH == "gfx950":
     from aiter.ops.triton._gluon_kernels.gfx950.attention.kda_decode import (
         fused_recurrent_kda_packed_decode_kernel,
+        get_kda_config,
     )
-
-
-def get_kda_config(
-    avg_T: int,
-    num_seqs: int,
-    HV: int,
-    K: int,
-    V: int,
-    overrides: dict | None = None,
-    fused: bool = False,
-) -> dict:
-    cfg_dir = resolve_config_dir("attention", "KDA_DECODE", backend="gluon")
-    tuned = load_config_json(f"{cfg_dir}/DEFAULT.json")
-    num_seq_heads = num_seqs * HV
-    aligned = K % 32 == 0 and V % 32 == 0
-    if fused:
-        bucket = "fused"
-    elif avg_T > 1:
-        if aligned and num_seq_heads >= 3072 and V % 128 == 0:
-            bucket = "t_gt1_seq_heads_geq_3072"
-        elif aligned and num_seq_heads >= 384:
-            bucket = "t_gt1_seq_heads_geq_384"
-        elif K % 16 == 0:
-            bucket = "t_gt1_default"
-        else:
-            bucket = "default"
-    elif aligned and 256 <= num_seq_heads <= 512:
-        bucket = "t1_seq_heads_256_to_512"
-    else:
-        bucket = "default"
-    config = dict(tuned[bucket])
-    overrides = overrides or {}
-    config.update(overrides)
-    if "SK" not in overrides:
-        config["SK"] = min(config["SK"], math.gcd(32, K))
-        if "num_warps" not in overrides:
-            config["num_warps"] = max(
-                1, min(config["num_warps"], config["BV"] * config["SK"] // 32)
-            )
-    return config
 
 
 def fused_recurrent_kda(
@@ -167,7 +128,9 @@ def fused_recurrent_kda(
     W = conv_weight.shape[1] if use_conv else 4
     if use_conv:
         assert conv_weight.shape == (3, W, H * K) and conv_weight.is_contiguous()
-        assert conv_state.shape[1:] == (3 * H * K, W - 1) and HV * V == H * K
+        assert conv_state.shape[1] == 3 * H * K and HV * V == H * K
+        if num_accepted_tokens is None:
+            assert conv_state.shape[2] >= W - 1
     if use_rms_gate:
         assert out_gate.shape == v.shape and out_gate.stride()[2:] == (V, 1)
         assert B == 1 or out_gate.stride(0) == T * out_gate.stride(1)
@@ -240,6 +203,9 @@ def fused_recurrent_kda(
     use_tdm_fused_load = config.get("use_tdm_fused_load", False)
     tdm_store_bufs = config.get("tdm_store_bufs", 2)
     sched_strategy = config.get("sched_strategy")
+    resident_state = config.get(
+        "resident_state", avg_T > 1 or num_accepted_tokens is not None
+    )
     assert V % BV == 0, f"BV={BV} must divide V={V}"
     assert 32 % SK == 0 and K % SK == 0, f"SK={SK} must divide 32 and K={K}"
     assert (BV * SK) % (
@@ -265,6 +231,13 @@ def fused_recurrent_kda(
     else:
         stride_indices_seq = 1
         assert num_accepted_tokens is None, "spec decoding requires ssm_state_indices"
+
+    if use_conv and num_accepted_tokens is not None:
+        # spec window: taps read from num_accepted-1 (< T); token t lands at W-2+t
+        max_tok = ssm_state_indices.shape[1] if ssm_state_indices.ndim > 1 else 1
+        assert (
+            conv_state.shape[2] >= W - 2 + max_tok
+        ), f"spec conv_state needs {W - 2 + max_tok} taps, got {conv_state.shape[2]}"
 
     if initial_state is not None:
         assert initial_state.dtype == torch.float32
@@ -407,6 +380,7 @@ def fused_recurrent_kda(
         W=W,
         USE_CONV=use_conv,
         USE_RMS_GATE=use_rms_gate,
+        **({"RESIDENT_STATE": bool(resident_state)} if _ARCH == "gfx950" else {}),
         num_warps=num_warps,
         **(
             {"llvm_fn_attrs": f"amdgpu-sched-strategy={sched_strategy}"}

@@ -12,6 +12,7 @@
 #pragma once
 #include "aiter_tensor.h"
 #include <opus/dtypes.hpp>
+#include <type_traits>
 
 // Public API: prefill attention over two CSR ranges (prefix + extend).
 //
@@ -40,6 +41,25 @@ void opus_mla_v4_prefill_a16w16_gfx950_fwd(aiter_tensor_t& q,
                                            aiter_tensor_t& attn_sink,
                                            aiter_tensor_t& out,
                                            float softmax_scale);
+
+// gfx950 split-K (H <= 32, num_splits 2/4/8): each token's keys split over
+// num_splits blocks, which write `partial_o` [N, num_splits, H, D] and
+// `partial_max` / `partial_sum` [N, num_splits, H] (fp32), split 0 counting
+// the sink; pa_decode_ps_reduce_hip_kernel folds them into `out`.
+void opus_mla_v4_prefill_a16w16_gfx950_split_fwd(aiter_tensor_t& q,
+                                                 aiter_tensor_t& unified_kv,
+                                                 aiter_tensor_t& kv_indices_prefix,
+                                                 aiter_tensor_t& kv_indptr_prefix,
+                                                 aiter_tensor_t& kv,
+                                                 aiter_tensor_t& kv_indices_extend,
+                                                 aiter_tensor_t& kv_indptr_extend,
+                                                 aiter_tensor_t& attn_sink,
+                                                 aiter_tensor_t& partial_o,
+                                                 aiter_tensor_t& partial_max,
+                                                 aiter_tensor_t& partial_sum,
+                                                 aiter_tensor_t& out,
+                                                 float softmax_scale,
+                                                 int num_splits);
 
 // gfx1250: only the bf16 variant is built into the code object.
 void opus_mla_v4_prefill_a16w16_gfx1250_fwd(aiter_tensor_t& q,
@@ -132,6 +152,20 @@ struct opus_mla_v4_prefill_kargs
     int stride_qo_h;
     int stride_kv_page;
     float softmax_scale;
+};
+
+// The gfx950 16mx1_16nx4 split-K kernel's arguments: the shared ones and the
+// partials. grid.z splits each token's keys over num_splits; split s writes
+// its normalized O, its row max (natural units) and its sum of exponentials
+// (split 0's counting the sink), which aiter's pa_decode_ps_reduce_hip_kernel
+// folds into the output.
+struct opus_mla_v4_prefill_split_kargs
+{
+    opus_mla_v4_prefill_kargs base;
+    float* __restrict__ partial_o;   // [N, num_splits, H, D]
+    float* __restrict__ partial_max; // [N, num_splits, H]
+    float* __restrict__ partial_sum; // [N, num_splits, H]
+    int num_splits;
 };
 
 // Kernel arguments for the split-precision (NoPE fp8 / RoPE bf16) DSA prefill.
@@ -230,17 +264,23 @@ struct opus_mla_v4_prefill_a16w16_16mx8_32nx1_traits
 
 // Compile-time tile/MFMA configuration for the 16mx1_16nx4 variant (T_M=1,
 // T_N=NUM_WARPS). Used when H <= 32. KV_TILE=64, NUM_WARPS=4, BLOCK_SIZE=256.
+// SPLIT: the split-K kernel (`opus_mla_v4_prefill_split_kargs`); without it
+// the kernel is the unsplit one, its arguments and code untouched.
 template <int Q_TILE_SIZE_  = 16,
           int KV_TILE_SIZE_ = 64,
           int D_TILE_SIZE_  = 512,
           int NUM_WARPS_    = 4,
-          typename D_ATTN_  = bf16_t>
+          typename D_ATTN_  = bf16_t,
+          bool SPLIT_       = false>
 struct opus_mla_v4_prefill_a16w16_16mx1_16nx4_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int D_TILE_SIZE  = D_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
+    static constexpr bool SPLIT       = SPLIT_;
+    using kargs_type = std::conditional_t<SPLIT_, opus_mla_v4_prefill_split_kargs,
+                                          opus_mla_v4_prefill_kargs>;
 
     static constexpr int WARP_SIZE  = 64; // AMD wavefront size
     static constexpr int BLOCK_SIZE = NUM_WARPS * WARP_SIZE;
@@ -476,7 +516,7 @@ __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; 
 template <class Traits>
 __global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefill_kargs kargs);
 template <class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs);
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type kargs);
 template <class Traits>
 __global__ void opus_mla_v4_prefill_a8w8_16mx8_32nx1_kernel(opus_mla_v4_prefill_fp8_kargs kargs);
 template <class Traits>
@@ -489,7 +529,7 @@ __global__ void opus_mla_v4_prefill_a16w16_16mx8_32nx1_kernel(opus_mla_v4_prefil
 {
 }
 template <class Traits>
-__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs)
+__global__ void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type)
 {
 }
 template <class Traits>
@@ -2103,9 +2143,13 @@ __device__ void mla_v4_prefill_accum_pipelined(opus_mla_v4_prefill_kargs kargs,
 
 // ─── PA kernel: template on traits; K/V in shared, Q in registers, Flash Attention online softmax ───
 template<class Traits>
-__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(opus_mla_v4_prefill_kargs kargs) {
+__global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16w16_16mx1_16nx4_kernel(typename Traits::kargs_type args) {
     using namespace opus;
     using namespace opus_mla_v4_prefill_a16w16_16mx1_16nx4;
+    const opus_mla_v4_prefill_kargs& kargs = [&]() -> const opus_mla_v4_prefill_kargs& {
+        if constexpr (Traits::SPLIT) return args.base;
+        else return args;
+    }();
     using T = opus::remove_cvref_t<Traits>;
     using D_ATTN = typename T::D_ATTN;
     using D_ACC = typename T::D_ACC;
@@ -2139,11 +2183,27 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
     D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
     D_ACC l_row = 0.0f;
 
+    // Split-K: this split's share of the token's keys -- prefix, then extend
+    // -- in whole tiles.
+    [[maybe_unused]] int split_lo = 0, split_hi = 0, prefix_len = 0;
+    if constexpr (T::SPLIT) {
+        prefix_len = kargs.kv_indptr_prefix[q_token_idx + 1] - kargs.kv_indptr_prefix[q_token_idx];
+        const int extend_len = kargs.kv_indptr_extend[q_token_idx + 1] - kargs.kv_indptr_extend[q_token_idx];
+        const int chunk = ceil_div(ceil_div(prefix_len + extend_len, args.num_splits), T::KV_TILE_SIZE) * T::KV_TILE_SIZE;
+        split_lo = block_id_z() * chunk;
+        split_hi = split_lo + chunk;
+    }
+
     // ──── Prefix segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_prefix[q_token_idx];
+        int page_idx_begin       = kargs.kv_indptr_prefix[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_prefix[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        int valid_kv_len         = page_idx_end - page_idx_begin;
+        if constexpr (T::SPLIT) {
+            const int begin = min(split_lo, valid_kv_len);
+            valid_kv_len    = max(min(split_hi, valid_kv_len) - begin, 0);
+            page_idx_begin += begin;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.unified_kv_ptr, kargs.kv_indices_prefix, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
@@ -2153,12 +2213,45 @@ __global__ __launch_bounds__(Traits::BLOCK_SIZE, 2) void opus_mla_v4_prefill_a16
 
     // ──── Extend segment ────
     {
-        const int page_idx_begin = kargs.kv_indptr_extend[q_token_idx];
+        int page_idx_begin       = kargs.kv_indptr_extend[q_token_idx];
         const int page_idx_end   = kargs.kv_indptr_extend[q_token_idx + 1];
-        const int valid_kv_len   = page_idx_end - page_idx_begin;
+        int valid_kv_len         = page_idx_end - page_idx_begin;
+        if constexpr (T::SPLIT) {
+            const int begin = min(max(split_lo - prefix_len, 0), valid_kv_len);
+            valid_kv_len    = min(max(split_hi - prefix_len, 0), valid_kv_len) - begin;
+            page_idx_begin += begin;
+        }
         const int num_kv_tiles   = ceil_div(valid_kv_len, T::KV_TILE_SIZE);
 
         mla_v4_prefill_accum_pipelined<Traits>(kargs, kargs.kv_ptr, kargs.kv_indices_extend, page_idx_begin, valid_kv_len, num_kv_tiles, smem_kv, smem_ml, smem_p, v_q, v_o, m_row, l_row, temperature_scale);
+    }
+
+    if constexpr (T::SPLIT) {
+        // A split's normalized O, row max and sum, merged by a plain softmax
+        // reduce. The sink is a key whose value is zero: split 0 counts it in
+        // its sum, so the reduce never sees it. A split past the token's keys
+        // contributes nothing: sum 0, max -inf.
+        if (block_id_z() == 0) {
+            auto g_sink = make_gmem(reinterpret_cast<const D_ACC*>(kargs.attn_sink_ptr), kargs.H * sizeof(D_ACC));
+            const D_ACC sink_log2 = load(g_sink, h_block_start + lane_id % T::W_M)[0] * LOG2_E;
+            const D_ACC m_sink = max(m_row, sink_log2);
+            const D_ACC alpha = __builtin_amdgcn_exp2f(m_row - m_sink);
+            l_row = l_row * alpha + __builtin_amdgcn_exp2f(sink_log2 - m_sink);
+            m_row = m_sink;
+            scale_output_tile<T>(v_o, alpha);
+        }
+        const D_ACC inv_l = (l_row > D_ACC(0.0f)) ? D_ACC(1.0f) / l_row : D_ACC(0.0f);
+        scale_output_tile<T>(v_o, inv_l);
+        const int64_t part = (static_cast<int64_t>(q_token_idx) * args.num_splits + block_id_z()) * kargs.H + h_block_start;
+        auto g_po = make_gmem(args.partial_o + part * T::D_TILE_SIZE, (kargs.H - h_block_start) * T::D_TILE_SIZE * sizeof(D_ACC));
+        int warp_id = __builtin_amdgcn_readfirstlane(thread_id_x() / T::WARP_SIZE);
+        store<T::VEC_O>(g_po, v_o, make_layout_o<T>(warp_id, lane_id, T::D_TILE_SIZE));
+        if (warp_id == 0 && lane_id < T::W_M && h_block_start + lane_id < kargs.H) {
+            // m_row is in log2 units (scores x scale x log2(e)); the reduce takes natural ones
+            args.partial_max[part + lane_id] = (l_row > D_ACC(0.0f)) ? m_row / LOG2_E : -opus::numeric_limits<D_ACC>::infinity();
+            args.partial_sum[part + lane_id] = l_row;
+        }
+        return;
     }
 
     // ──── Sink finalization, normalize O, and store to gmem ────
