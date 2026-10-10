@@ -1,0 +1,20 @@
+{
+  "g1_screens": 12,
+  "g2_screens": 32,
+  "validation_attempts": 8,
+  "fallback_groups": 0,
+  "shape_summary_tuning_seconds": 107.2228,
+  "finite_reference_errors": [
+    "0.011137",
+    "0.011172",
+    "0.011170",
+    "0.011170",
+    "0.011174",
+    "0.011167",
+    "0.011172",
+    "0.011172",
+    "0.011172",
+    "0.011172"
+  ],
+  "acceptance": "smallstagedCLI exits0 and canonicalwinner; production/AOT separate pending"
+}

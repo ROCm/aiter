@@ -9,6 +9,11 @@ import re
 import sys
 import tempfile
 from argparse import ArgumentTypeError
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from multiprocessing.connection import wait as wait_for_connections
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -65,6 +70,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_kernels,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
+    runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
@@ -83,7 +89,17 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.utility.mp_tuner import mp_tuner
+from aiter.utility.mp_tuner import _is_accelerator_error, mp_tuner
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+    DEFAULT_SCREEN_TOPK,
+    AccumulationMode,
+    GEMM2ScreeningKey,
+    PipelinePairKey,
+    build_staged_candidate_plan,
+    reference_consumer_order,
+    screening_shortlist,
+    select_reference_producer,
+)
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
@@ -506,9 +522,15 @@ class FmoeTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
-            choices=("prune", "full"),
-            help="GEMM1 search mode: prune by M_est (default) or search all legal "
-            "variants (full); requires --mxfp4-flydsl.",
+            choices=("prune", "full", "staged"),
+            help="prune by M_est (default), exhaust all legal variants (full), "
+            "or screen the pruned stages (staged); requires --mxfp4-flydsl.",
+        )
+        self.parser.add_argument(
+            "--mxfp4-screen-topk",
+            type=int,
+            help="positive screening top-K per stage context (default 2); "
+            "requires explicit --mxfp4-search-mode staged; distinct from routing top-k.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -522,7 +544,15 @@ class FmoeTuner(TunerCommon):
             self.parser.error(
                 "--mxfp4-search-mode requires --mxfp4-flydsl without --grouped-gemm"
             )
+        if args.mxfp4_screen_topk is not None:
+            if args.mxfp4_screen_topk <= 0:
+                self.parser.error("--mxfp4-screen-topk must be a positive integer")
+            if args.mxfp4_search_mode != "staged":
+                self.parser.error(
+                    "--mxfp4-screen-topk requires explicit --mxfp4-search-mode staged"
+                )
         args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
+        args.mxfp4_screen_topk = args.mxfp4_screen_topk or 2
         return args
 
     @staticmethod
@@ -6463,6 +6493,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "does not write stage-ranking or full-pair profile artifacts"
     )
 
+    def _setup_specific_arguments(self):
+        super()._setup_specific_arguments()
+        for action in self.parser._actions:
+            if action.dest == "timeout":
+                action.help = (
+                    "best-effort per-operation SIGALRM timeout in seconds (default 1800); "
+                    "needs control to return to Python. No parent or shape hard deadline; "
+                    "a still-live permanent hang may wait indefinitely."
+                )
+
     @staticmethod
     def _unsupported_row_reason(row):
         for field, expected in (
@@ -6540,10 +6580,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ).multi_processor_count
         )
 
-    def _preflight_devices(self, mp_num, ngpu):
+    def _preflight_devices(self, mp_num, ngpu, *, staged=False):
         if ngpu < 1:
             raise ValueError("MXFP4 tuning requires a visible runtime GPU")
-        selected = [torch.cuda.current_device()] if mp_num == 1 else range(mp_num)
+        selected = (
+            [torch.cuda.current_device()]
+            if mp_num == 1 and not staged
+            else range(mp_num)
+        )
         return [self._runtime_device_identity(gpu) for gpu in selected]
 
     def _summary_shape_keys(self):
@@ -6809,6 +6853,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
+    def _staged_candidate_plan(self, row):
+        reason = self._unsupported_row_reason(row)
+        if reason is not None:
+            raise ValueError(reason)
+        return build_staged_candidate_plan(
+            row, self._candidate_rows(row, full_search=False)
+        )
+
     @staticmethod
     def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
         data = FmoeTuner.generate_data(
@@ -7012,6 +7064,534 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return us
 
+    @staticmethod
+    def _screening_limit():
+        value = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        return None if value in (None, "") else float(value)
+
+    def _prepare_screening_case(
+        self, row: dict[str, Any], block_m: int, atomic: bool
+    ) -> tuple[dict[str, Any], tuple[torch.Tensor, ...]]:
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
+        sorting = moe_sorting(
+            data["topk_ids"],
+            data["topk_weights"],
+            ne,
+            h,
+            dtypes.bf16,
+            block_size=block_m,
+            accumulate=atomic,
+            output_aux="opus",
+        )
+        return data, sorting
+
+    @staticmethod
+    def _prepare_gemm1_screening(
+        data: dict[str, Any],
+        sorting: tuple[torch.Tensor, ...],
+        kn1: str,
+        topk: int,
+        swiglu_limit: float | None = None,
+    ) -> tuple[Callable[[], None], torch.Tensor, torch.Tensor]:
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+
+        cfg = _parse_mxfp4_g1_kname(kn1)
+        bm = cfg["BM"]
+        if cfg["inline_quant"] != (bm == 16):
+            raise ValueError(
+                f"GEMM1 BM{bm} violates the derived input quantization contract"
+            )
+        sti, sw, sei, nvi, moe_buf, m_indices, _reverse_sorted = sorting
+        stage1_input, stage1_scale = data["input"], None
+        if bm == 16:
+            if stage1_input.dtype != dtypes.bf16:
+                raise ValueError("GEMM1 BM16 inline quantization requires BF16 input")
+        else:
+            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+                input=stage1_input,
+                sorted_ids=sti,
+                num_valid_ids=nvi,
+                token_num=stage1_input.shape[0],
+                topk=topk,
+                block_size=bm,
+                sorted_weights=sw,
+                num_experts_upper_bound=data["w1_a16"].shape[0],
+            )
+            if stage1_input.dtype != dtypes.fp4x2 or stage1_scale is None:
+                raise ValueError(
+                    f"GEMM1 BM{bm} requires fused-prequantized FP4 input and scales"
+                )
+        situ_beta = DEFAULT_SITUV2_BETA if cfg["act"] == "situv2" else 1.0
+        situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA if cfg["act"] == "situv2" else 1.0
+        # The production wrapper prepares output buffers and launches once,
+        # outside screening timing. Reuse those buffers for kernel-only timing.
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            stage1_input,
+            data["w1_a16"],
+            data["w2_a16"],
+            sti,
+            sei,
+            nvi,
+            None,
+            topk,
+            block_m=bm,
+            a1_scale=stage1_scale,
+            w1_scale=data["w1s_a16"],
+            kernelName1=kn1,
+            m_indices=m_indices,
+            moe_buf=moe_buf,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
+        )
+        placeholder = torch.empty(0, device=stage1_input.device, dtype=torch.uint8)
+        launch = functools.partial(
+            flydsl_mxfp4_gemm1,
+            a_quant=placeholder if bm == 16 else stage1_input,
+            a_scale_sorted_shuffled=placeholder if bm == 16 else stage1_scale,
+            w1_u8=data["w1_a16"].view(torch.uint8),
+            w1_scale_u8=data["w1s_a16"].view(torch.uint8),
+            sorted_expert_ids=sei,
+            cumsum_tensor=nvi,
+            m_indices=m_indices,
+            inter_sorted_quant=inter_q,
+            inter_sorted_shuffled_scale=inter_s,
+            hidden_states=stage1_input,
+            n_tokens=stage1_input.shape[0],
+            NE=data["w1_a16"].shape[0],
+            D_HIDDEN=data["w2_a16"].shape[1],
+            D_INTER=data["w1_a16"].shape[1] // 2,
+            topk=topk,
+            BM=bm,
+            BN=cfg["BN"],
+            BK=cfg["BK"],
+            use_nt=cfg["use_nt"],
+            inline_quant=cfg["inline_quant"],
+            prefetch_hidden=cfg["prefetch_hidden"],
+            xcd_swizzle=cfg["xcd_swizzle"],
+            num_waves=cfg["num_waves"],
+            k_wave=cfg["k_wave"],
+            interleave=False,
+            a_dtype=cfg["a_dtype"],
+            out_dtype=cfg["out_dtype"],
+            native_scale_layout=bm == 16,
+            act=cfg["act"],
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
+        )
+        return launch, inter_q, inter_s
+
+    def _screen_gemm1(self, row: dict[str, Any], kn1: str, args: Any) -> float:
+        from aiter.test_common import run_perftest
+
+        data, sorting = self._prepare_screening_case(
+            row, _parse_mxfp4_g1_kname(kn1)["BM"], False
+        )
+        launch, _inter_q, _inter_s = self._prepare_gemm1_screening(
+            data, sorting, kn1, int(row["topk"]), self._screening_limit()
+        )
+        _, us = run_perftest(
+            launch, num_warmup=int(args.warmup), num_iters=int(args.iters)
+        )
+        return float(us)
+
+    @staticmethod
+    def _gemm2_screening_call(
+        data: dict[str, Any],
+        sorting: tuple[torch.Tensor, ...],
+        inter_q: torch.Tensor,
+        inter_s: torch.Tensor,
+        kn2: str,
+        topk: int,
+    ) -> Callable[[], torch.Tensor]:
+        cfg = parse_g2_kname_any(kn2)
+        sti, sw, sei, nvi, moe_buf, _m_indices, reverse_sorted = sorting
+        out = moe_buf if moe_buf.numel() else torch.empty_like(data["input"])
+
+        def launch() -> torch.Tensor:
+            # Atomic accumulation must start from zero on every timed iteration.
+            # The production wrapper includes each non-atomic reduction/scatter.
+            if cfg["atomic"]:
+                out.zero_()
+            return _mxfp4_a4w4_stage2_fw(
+                inter_q,
+                data["w1_a16"],
+                data["w2_a16"],
+                sti,
+                sei,
+                nvi,
+                out,
+                topk,
+                w2_scale=data["w2s_a16"],
+                a2_scale=inter_s,
+                block_m=cfg["BM"],
+                sorted_weights=sw,
+                kernelName2=kn2,
+                reverse_sorted=reverse_sorted,
+            )
+
+        return launch
+
+    def _screen_gemm2(
+        self, row: dict[str, Any], kn1: str, kn2: str, args: Any
+    ) -> float:
+        from aiter.test_common import run_perftest
+
+        cfg = parse_g2_kname_any(kn2)
+        data, sorting = self._prepare_screening_case(row, cfg["BM"], cfg["atomic"])
+        # The validated producer runs once during candidate-local setup. Neither
+        # its execution nor its intermediate survives into another screening run.
+        _producer, inter_q, inter_s = self._prepare_gemm1_screening(
+            data, sorting, kn1, int(row["topk"]), self._screening_limit()
+        )
+        launch = self._gemm2_screening_call(
+            data, sorting, inter_q, inter_s, kn2, int(row["topk"])
+        )
+        _, us = run_perftest(
+            launch, num_warmup=int(args.warmup), num_iters=int(args.iters)
+        )
+        return float(us)
+
+    @staticmethod
+    def _check_reference_output(
+        ref: torch.Tensor, out: torch.Tensor, err_ratio: float, label: str
+    ) -> bool:
+        err = cosine_diff_compare(ref, out, msg=label)
+        if err is None or not math.isfinite(float(err)) or float(err) > err_ratio:
+            raise RuntimeError(f"cosine err_ratio {err} > {err_ratio}")
+        return True
+
+    def _check_reference_consumer(
+        self, row: dict[str, Any], kn2: str, args: Any
+    ) -> bool:
+        cfg = parse_g2_kname_any(kn2)
+        data, sorting = self._prepare_screening_case(row, cfg["BM"], True)
+        token, topk = int(row["token"]), int(row["topk"])
+        activation = {
+            "silu": ActivationType.Silu,
+            "swiglu": ActivationType.Swiglu,
+            "situv2": ActivationType.Situv2,
+        }[self._row_act(row)]
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            data["a1_qt"],
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            data["a1_scale"],
+            data["w1_scale"],
+            dtype=dtypes.bf16,
+            activation=activation,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+            topk=topk,
+            swiglu_limit=self._screening_limit(),
+        )
+        sti, _sw, _sei, nvi, *_rest = sorting
+        intermediate = {
+            "sti": sti,
+            "cumsum": nvi,
+            "max_sorted": sti.shape[0],
+            "n": int(nvi[0].item()),
+        }
+        # Populate the native-BM sorted payload and scale layout from Torch,
+        # independently of every GEMM1 kernel under test.
+        _v2_populate_stage2(
+            {"ref1": ref1, "adtype": "fp4"}, intermediate, token, topk, cfg["BM"]
+        )
+        launch = self._gemm2_screening_call(
+            data, sorting, intermediate["isq"], intermediate["iss"], kn2, topk
+        )
+        out = launch()
+        ref = FmoeTuner.run_torch_moe_stage2(
+            ref1,
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            a2_scale=None,
+            w2_scale=data["w2_scale"],
+            dtype=dtypes.bf16,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+        )
+        return self._check_reference_output(
+            ref, out, float(args.errRatio), f"reference consumer[{kn2}]"
+        )
+
+    def _check_reference_pair(
+        self, row: dict[str, Any], kn1: str, kn2: str, args: Any
+    ) -> bool:
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        activation = {
+            "silu": ActivationType.Silu,
+            "swiglu": ActivationType.Swiglu,
+            "situv2": ActivationType.Situv2,
+        }[self._row_act(row)]
+        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
+        out = self._port_e2e(
+            data,
+            kn1,
+            kn2,
+            topk,
+            ne,
+            h,
+            dtypes.bf16,
+            swiglu_limit=self._screening_limit(),
+        )
+        ref = self._torch_ref(
+            data, topk, dtypes.bf16, activation, swiglu_limit=self._screening_limit()
+        )
+        return self._check_reference_output(
+            ref, out, float(args.errRatio), f"reference pair[{kn1}+{kn2}]"
+        )
+
+    @contextmanager
+    def _staged_timeout(self, timeout: int) -> Iterator[None]:
+        """Apply one best-effort staged-operation timeout."""
+        import signal
+
+        if timeout <= 0:
+            yield
+            return
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        if previous_handler is None:
+            print(
+                "[mxfp4-staged] --timeout disabled because the existing SIGALRM "
+                "handler cannot be restored; a stalled operation may wait "
+                "indefinitely",
+                flush=True,
+            )
+            yield
+            return
+
+        class _StagedOperationTimeout(Exception):
+            pass
+
+        def _on_alarm(signum: int, frame: Any) -> None:
+            raise _StagedOperationTimeout(f"exceeded {timeout}s timeout")
+
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
+        try:
+            signal.signal(signal.SIGALRM, _on_alarm)
+        except ValueError:
+            print(
+                "[mxfp4-staged] --timeout disabled because SIGALRM cannot be "
+                "installed outside the main thread; a stalled operation may "
+                "wait indefinitely",
+                flush=True,
+            )
+            yield
+            return
+        try:
+            signal.setitimer(signal.ITIMER_REAL, timeout)
+            yield
+        finally:
+            try:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            finally:
+                signal.signal(signal.SIGALRM, previous_handler)
+                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
+
+    def _screen_candidate(
+        self, launch: Callable[[], float], label: str, timeout: int
+    ) -> float:
+        try:
+            with self._staged_timeout(timeout):
+                us = launch()
+                if not math.isfinite(us) or us <= 0:
+                    raise ValueError(f"non-positive or non-finite screening time: {us}")
+                print(f"[mxfp4-staged] {label} screening us={us}", flush=True)
+                return us
+        except Exception as exc:
+            if _is_accelerator_error(exc):
+                raise
+            print(f"[mxfp4-staged] {label} screening failed: {exc}", flush=True)
+            return self.INVALID_TIME
+
+    def _tune_staged_shape(
+        self, row: dict[str, Any], args: Any, timeout: int
+    ) -> dict[str, Any]:
+        plan = self._staged_candidate_plan(row)
+        if not plan.pairs:
+            return _mxfp4_failed_row(self.keys, row, "no pipeline-pair candidates")
+        screen_topk = getattr(args, "mxfp4_screen_topk", DEFAULT_SCREEN_TOPK)
+        gemm2_groups = {group.key: group for group in plan.gemm2_groups}
+        producers = {}
+        for group in plan.gemm1_groups:
+            atomic_group = gemm2_groups.get(
+                GEMM2ScreeningKey(group.key.block_m, AccumulationMode.ATOMIC)
+            )
+            if atomic_group is None:
+                continue
+            consumers = reference_consumer_order(atomic_group.candidates)
+            if not consumers:
+                continue
+            consumer = None
+            for reference in consumers:
+                try:
+                    with self._staged_timeout(timeout):
+                        if self._check_reference_consumer(
+                            row, reference.identity.kernel_name, args
+                        ):
+                            consumer = reference.identity.kernel_name
+                            break
+                        raise RuntimeError(
+                            "reference consumer returned an incorrect output"
+                        )
+                except Exception as exc:
+                    if _is_accelerator_error(exc):
+                        raise
+                    print(
+                        f"[mxfp4-staged] reference consumer "
+                        f"{reference.identity.kernel_name} failed: {exc}",
+                        flush=True,
+                    )
+            if consumer is None:
+                continue
+            preferred = select_reference_producer(group.candidates)
+            producer_order = (preferred,) + tuple(
+                candidate for candidate in group.candidates if candidate != preferred
+            )
+            for reference in producer_order:
+                producer = reference.identity.kernel_name
+                try:
+                    with self._staged_timeout(timeout):
+                        if self._check_reference_pair(row, producer, consumer, args):
+                            producers[group.key.block_m] = producer
+                            break
+                        raise RuntimeError(
+                            "reference producer returned an incorrect output"
+                        )
+                except Exception as exc:
+                    if _is_accelerator_error(exc):
+                        raise
+                    print(
+                        f"[mxfp4-staged] reference producer {producer} failed: {exc}",
+                        flush=True,
+                    )
+
+        gemm1_shortlists = {
+            group.key: screening_shortlist(
+                (
+                    (
+                        candidate,
+                        self._screen_candidate(
+                            functools.partial(
+                                self._screen_gemm1,
+                                row,
+                                candidate.identity.kernel_name,
+                                args,
+                            ),
+                            f"GEMM1 {candidate.identity.kernel_name}",
+                            timeout,
+                        ),
+                    )
+                    for candidate in group.candidates
+                ),
+                screen_topk,
+            )
+            for group in plan.gemm1_groups
+            if group.key.block_m in producers
+        }
+        gemm2_shortlists = {
+            group.key: screening_shortlist(
+                (
+                    (
+                        candidate,
+                        self._screen_candidate(
+                            functools.partial(
+                                self._screen_gemm2,
+                                row,
+                                producers[group.key.block_m],
+                                candidate.identity.kernel_name,
+                                args,
+                            ),
+                            f"GEMM2 {candidate.identity.kernel_name}",
+                            timeout,
+                        ),
+                    )
+                    for candidate in group.candidates
+                ),
+                screen_topk,
+            )
+            for group in plan.gemm2_groups
+            if group.key.block_m in producers
+        }
+        best = None
+        evaluated_pairs: dict[PipelinePairKey, tuple[float, str | None]] = {}
+        for group in plan.pipeline_groups:
+            gemm1 = {
+                candidate.identity
+                for candidate in gemm1_shortlists.get(group.gemm1_screening_key, ())
+            }
+            gemm2 = {
+                candidate.identity
+                for candidate in gemm2_shortlists.get(group.gemm2_screening_key, ())
+            }
+            shortlisted = tuple(
+                pair
+                for pair in group.pairs
+                if pair.key.gemm1 in gemm1 and pair.key.gemm2 in gemm2
+            )
+            if not shortlisted:
+                print(
+                    f"[mxfp4-staged] exhaustive fallback BM{group.key.block_m} "
+                    f"{group.key.accumulation_mode.value}: no usable reference/shortlist",
+                    flush=True,
+                )
+            group_best = None
+            for pairs in (shortlisted, group.pairs):
+                for pair in pairs:
+                    if pair.key in evaluated_pairs:
+                        continue
+                    candidate = dict(pair.candidate_row)
+                    try:
+                        with self._staged_timeout(timeout):
+                            us = float(self._run_candidate(row, candidate, args))
+                            failure = (
+                                None
+                                if math.isfinite(us) and us > 0
+                                else f"non-positive or non-finite validation time: {us}"
+                            )
+                    except Exception as exc:
+                        if _is_accelerator_error(exc):
+                            raise
+                        us, failure = self.INVALID_TIME, str(exc)
+                    # Only returned outcomes enter this shape-local cache;
+                    # exception objects could retain tensors through tracebacks.
+                    evaluated_pairs[pair.key] = (us, failure)
+                    print(
+                        f"[mxfp4-staged] {candidate['kernelName1']} + "
+                        f"{candidate['kernelName2']} "
+                        + (
+                            f"validation failed: {failure}"
+                            if failure is not None
+                            else f"us={us}"
+                        ),
+                        flush=True,
+                    )
+                    if failure is None and (
+                        group_best is None or us < float(group_best["us"])
+                    ):
+                        group_best = candidate
+                # A passing shortlist needs no expansion. Fallback, however,
+                # must finish the entire group before choosing its winner.
+                if group_best is not None:
+                    break
+            if group_best is not None and (
+                best is None or float(group_best["us"]) < float(best["us"])
+            ):
+                best = group_best
+        if best is None:
+            return _mxfp4_failed_row(self.keys, row, "FAILED: no valid staged pair")
+        return best
+
     def _tune_one_shape(self, row, args):
         """Sweep all (g1, g2) candidates for one shape; return the best row dict.
 
@@ -7029,6 +7609,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return _mxfp4_failed_row(self.keys, row, f"UNSUPPORTED: {reason}")
 
         timeout = int(getattr(args, "timeout", 0) or 0)
+        if getattr(args, "mxfp4_search_mode", "prune") == "staged":
+            return self._tune_staged_shape(row, args, timeout)
 
         class _CandidateTimeout(Exception):
             pass
@@ -7089,9 +7671,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
         mp_num = int(getattr(args, "mp", 1) or 1)
         ngpu = torch.cuda.device_count()
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
-        identities = self._preflight_devices(mp_num, ngpu)
+        staged = getattr(args, "mxfp4_search_mode", "prune") == "staged"
+        identities = (
+            self._preflight_devices(mp_num, ngpu, staged=True)
+            if staged
+            else self._preflight_devices(mp_num, ngpu)
+        )
 
-        if mp_num <= 1:
+        if mp_num <= 1 and not staged:
             for row in rows:
                 row["gfx"], row["cu_num"] = identities[0]
             return [self._tune_one_shape(row, args) for row in rows]
@@ -7105,7 +7692,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         ctx = _mp.get_context("spawn")
         payloads = [(self.keys, row, args, None) for row in rows]
-        results = _run_shapes_isolated(payloads, mp_num, ctx)
+        results = (
+            _run_staged_shapes_isolated(payloads, mp_num, ctx)
+            if staged
+            else _run_shapes_isolated(payloads, mp_num, ctx)
+        )
         # A None means the shape's process died mid-shape (e.g. a C++ abort()).
         # Report it as a failed shape rather than dropping it, so the run
         # finishes and the failure shows up in the summary.
@@ -7176,6 +7767,164 @@ def _mxfp4_shape_proc(payload, out_q, idx):
     """Child entry point: post the shape's result so the parent can tell a
     finished shape apart from a worker that died mid-shape."""
     out_q.put((idx, _mxfp4_tune_shape_worker(payload)))
+
+
+def _mxfp4_staged_shape_proc(
+    payload: tuple[Any, dict[str, Any], Any, int | None], result_tx: Any
+) -> None:
+    """Send one staged shape result through its worker-private Pipe."""
+    try:
+        result_tx.send(_mxfp4_tune_shape_worker(payload))
+    finally:
+        result_tx.close()
+
+
+@dataclass
+class _StagedShapeSlot:
+    proc: Any
+    gpu: int
+    result_rx: Any
+    result_received: bool = False
+    result: dict[str, Any] | None = None
+
+
+def _run_staged_shapes_isolated(
+    payloads: list[tuple[Any, dict[str, Any], Any, int | None]],
+    mp_num: int,
+    ctx: Any,
+    entry: Callable[..., None] = _mxfp4_staged_shape_proc,
+) -> list[dict[str, Any] | None]:
+    """Run staged shapes with one private result Pipe per fresh worker.
+
+    Within one Tuning run, a logical GPU remains owned until its worker exits,
+    preserving Per-GPU measurement exclusivity. Exclusivity between separate
+    Tuning runs is the caller's responsibility. There is intentionally no parent
+    deadline for a worker that remains alive.
+    """
+    results: list[dict[str, Any] | None] = [None] * len(payloads)
+    running: dict[int, _StagedShapeSlot] = {}
+    cleanup_slots: list[_StagedShapeSlot] = []
+    free_gpus = list(range(mp_num))
+    done: set[int] = set()
+    next_payload = 0
+
+    def _receive_result(slot: _StagedShapeSlot) -> None:
+        receive_failed = False
+        try:
+            try:
+                payload = slot.result_rx.recv_bytes()
+            except EOFError:
+                return
+            slot.result = ForkingPickler.loads(payload)
+            slot.result_received = True
+        except BaseException:
+            receive_failed = True
+            raise
+        finally:
+            try:
+                slot.result_rx.close()
+            except BaseException:
+                if not receive_failed:
+                    raise
+
+    try:
+        while len(done) < len(payloads):
+            while next_payload < len(payloads) and free_gpus:
+                gpu = free_gpus.pop(0)
+                keys, row, args, _ = payloads[next_payload]
+                result_rx, result_tx = ctx.Pipe(duplex=False)
+                start_failed = False
+                try:
+                    proc = ctx.Process(
+                        target=entry,
+                        args=((keys, row, args, gpu), result_tx),
+                        daemon=True,
+                    )
+                    slot = _StagedShapeSlot(proc, gpu, result_rx)
+                    cleanup_slots.append(slot)
+                    proc.start()
+                except BaseException:
+                    start_failed = True
+                    try:
+                        result_rx.close()
+                    except BaseException:  # noqa: BLE001,S110
+                        pass
+                    raise
+                finally:
+                    try:
+                        result_tx.close()
+                    except BaseException:
+                        if not start_failed:
+                            raise
+                running[next_payload] = slot
+                next_payload += 1
+
+            waitables = []
+            for slot in running.values():
+                if not slot.result_rx.closed:
+                    waitables.append(slot.result_rx)
+                waitables.append(slot.proc.sentinel)
+            ready = wait_for_connections(waitables)
+
+            for slot in running.values():
+                if not slot.result_rx.closed and slot.result_rx in ready:
+                    _receive_result(slot)
+
+            for idx, slot in list(running.items()):
+                if slot.proc.sentinel not in ready:
+                    continue
+                if not slot.result_rx.closed:
+                    _receive_result(slot)
+                slot.proc.join()
+                exitcode = slot.proc.exitcode
+                if slot.result_received and exitcode == 0:
+                    results[idx] = slot.result
+                else:
+                    print(
+                        f"[mxfp4-port] worker for shape {idx} failed "
+                        f"(exitcode={exitcode}, result_received={slot.result_received})",
+                        flush=True,
+                    )
+                slot.proc.close()
+                cleanup_slots.remove(slot)
+                running.pop(idx)
+                free_gpus.append(slot.gpu)
+                done.add(idx)
+    finally:
+        # Only slots that were not successfully closed on the normal path remain
+        # cleanup-owned. Cleanup is best-effort and must not replace the exception
+        # already leaving the supervisor.
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.is_alive():
+                    slot.proc.terminate()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        # terminate() is followed by an immediate is_alive() check, which does
+        # not guarantee a SIGTERM grace period. Kill workers still reporting alive.
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.is_alive():
+                    slot.proc.kill()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.pid is not None:
+                    slot.proc.join()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+            try:
+                if not slot.result_rx.closed:
+                    slot.result_rx.close()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+            try:
+                slot.proc.close()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+
+    return results
 
 
 def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
