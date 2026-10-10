@@ -1,4 +1,5 @@
 #include "aiter_tensor.h"
+#include "asm_reduce_configs.hpp"
 
 #include <cstddef>
 #include <limits>
@@ -63,7 +64,8 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
                 __func__, ": explicit PS metadata and output tensors are required");
     AITER_CHECK(final_output->is_gpu(), __func__, ": output must be on a GPU");
     const HipDeviceGuard device_guard(final_output->device_id);
-    AITER_CHECK(get_gpu_arch() == "gfx950", __func__, ": requires gfx950");
+    const std::string arch_id = get_gpu_arch();
+    AITER_CHECK(arch_id == "gfx950", __func__, ": requires gfx950");
     for(const auto* tensor : {partial_output, partial_lse, reduce_indptr, reduce_final_map,
                               reduce_partial_map})
     {
@@ -143,33 +145,30 @@ void pa_ps_reduce(aiter_tensor_t* partial_output,
     args.query_stride = query_groups;
 
     const bool adaptive = num_heads * final_output->size(0) < num_cu;
-    const int merge_waves = adaptive ? 8 : 1;
-
-    AiterAsmKernel* kernel = nullptr;
-    if(adaptive)
+    const std::string output_type =
+        final_output->dtype() == AITER_DTYPE_fp16 ? "fp16" : "bf16";
+    const reduceConfig* selected_config = nullptr;
+    for(const auto& entry : cfg_pa_ps_reduce_asm)
     {
-        const std::string stem = std::string("pa_p16_d128_8w_reduce_ps_auto") +
-            (final_output->dtype() == AITER_DTYPE_fp16 ? "_fp16" : "_bf16");
-        const std::string symbol = "_ZN5aiter" + std::to_string(stem.size()) + stem + "E";
-        static SynchronizedCache<std::string, AiterAsmKernel> implementations;
-        kernel = &implementations.get_or_create(stem, [&]() {
-            return AiterAsmKernel(symbol.c_str(), ("pa/" + stem + ".co").c_str());
-        });
+        const auto& config = entry.second;
+        if(config.arch == arch_id && config.oType == output_type &&
+           config.headDim == final_output->size(2) && config.adaptive == adaptive)
+        {
+            selected_config = &config;
+            break;
+        }
     }
-    else if(final_output->dtype() == AITER_DTYPE_fp16)
-    {
-        static AiterAsmKernel implementation("_ZN5aiter26pa_p16_d128_reduce_ps_fp16E",
-                                              "pa/pa_p16_d128_reduce_ps_fp16.co");
-        kernel = &implementation;
-    }
-    else
-    {
-        static AiterAsmKernel implementation("_ZN5aiter26pa_p16_d128_reduce_ps_bf16E",
-                                              "pa/pa_p16_d128_reduce_ps_bf16.co");
-        kernel = &implementation;
-    }
+    AITER_CHECK(selected_config != nullptr,
+                __func__, ": cannot get heuristic reduce kernel! arch:", arch_id,
+                " output_type:", output_type, " head_dim:", final_output->size(2),
+                " adaptive:", adaptive);
+    const auto& config = *selected_config;
+    static SynchronizedCache<std::string, AiterAsmKernel> implementations;
+    auto* kernel = &implementations.get_or_create(arch_id + config.knl_name, [&]() {
+        return AiterAsmKernel(config.knl_name.c_str(), config.co_name.c_str());
+    });
     size_t argument_size = sizeof(args);
     kernel->launch_kernel({&args, &argument_size, static_cast<int>(num_heads),
                             static_cast<int>(query_groups), static_cast<int>(tile_groups),
-                            64 * merge_waves, 1, 1, stream});
+                            64 * config.waves, 1, 1, stream});
 }

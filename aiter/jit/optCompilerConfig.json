@@ -65,7 +65,7 @@
         "extra_include": [],
         "verbose": "False",
         "torch_exclude": "True",
-        "blob_gen_cmd": "''"
+        "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m reduce --output_dir {{}}'"
     },
     "module_pa_metadata": {
         "srcs": [
