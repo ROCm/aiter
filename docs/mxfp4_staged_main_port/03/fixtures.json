@@ -355,5 +355,110 @@
     "bm": 128,
     "bn": 128,
     "bk": 128
+  },
+  {
+    "id": "minimax128-bm16-reduce",
+    "csv": "docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-reduce.csv",
+    "shape": {
+      "token": 128,
+      "model_dim": 3072,
+      "inter_dim": 384,
+      "expert": 256,
+      "topk": 8,
+      "act_type": "ActivationType.Silu"
+    },
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "clamp_fixture": false,
+    "kn1": "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt",
+    "kn2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_reduce_nt_sbm16",
+    "bm": 16,
+    "bn": 128,
+    "bk": 128
+  },
+  {
+    "id": "minimax128-bm32-atomic",
+    "csv": "docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-atomic.csv",
+    "shape": {
+      "token": 128,
+      "model_dim": 3072,
+      "inter_dim": 384,
+      "expert": 256,
+      "topk": 8,
+      "act_type": "ActivationType.Silu"
+    },
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "clamp_fixture": false,
+    "kn1": "flydsl_mxmoe_g1_a4w4_32x64x256",
+    "kn2": "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_nt_sbm32",
+    "bm": 32,
+    "bn": 128,
+    "bk": 128
+  },
+  {
+    "id": "minimax2048-bm64-reduce",
+    "csv": "docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-reduce.csv",
+    "shape": {
+      "token": 2048,
+      "model_dim": 3072,
+      "inter_dim": 384,
+      "expert": 256,
+      "topk": 8,
+      "act_type": "ActivationType.Silu"
+    },
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "clamp_fixture": false,
+    "kn1": "flydsl_mxmoe_g1_a4w4_64x128x256",
+    "kn2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x128_reduce_nt_sbm64",
+    "bm": 64,
+    "bn": 128,
+    "bk": 128
+  },
+  {
+    "id": "minimax2048-bm128-atomic",
+    "csv": "docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-atomic.csv",
+    "shape": {
+      "token": 2048,
+      "model_dim": 3072,
+      "inter_dim": 384,
+      "expert": 256,
+      "topk": 8,
+      "act_type": "ActivationType.Silu"
+    },
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "clamp_fixture": false,
+    "kn1": "flydsl_mxmoe_g1_a4w4_128x128x256",
+    "kn2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_nt_sbm128",
+    "bm": 128,
+    "bn": 128,
+    "bk": 128
+  },
+  {
+    "id": "gpt2048-combined5-atomic",
+    "csv": "docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-atomic.csv",
+    "shape": {
+      "token": 2048,
+      "model_dim": 3072,
+      "inter_dim": 512,
+      "expert": 128,
+      "topk": 4,
+      "act_type": "ActivationType.Swiglu"
+    },
+    "fp8": true,
+    "fp4": true,
+    "limit": 5,
+    "clamp_fixture": false,
+    "kn1": "flydsl_mxmoe_g1_a4w4_128x128x256_swiglu",
+    "kn2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_nt_sbm128",
+    "bm": 128,
+    "bn": 128,
+    "bk": 128
   }
 ]
