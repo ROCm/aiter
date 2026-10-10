@@ -5,17 +5,14 @@ import pytest
 import torch
 
 from aiter.ops.triton.activation import silu_and_mul_backward
-from aiter.ops.triton.utils import config_utils
-from aiter.ops.triton.utils._triton.arch_info import get_arch
+from aiter.ops.triton.utils._triton import arch_info
 
 _SUPPORTED_ARCHS = ("gfx950",)
-pytestmark = [
-    pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required"),
-    pytest.mark.skipif(
-        torch.cuda.is_available() and get_arch() not in _SUPPORTED_ARCHS,
-        reason="silu_and_mul_backward supports gfx950",
-    ),
-]
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+_requires_gfx950 = pytest.mark.skipif(
+    torch.cuda.is_available() and arch_info.get_arch() not in _SUPPORTED_ARCHS,
+    reason="silu_and_mul_backward supports gfx950",
+)
 
 
 def _torch_reference(grad_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
@@ -41,6 +38,7 @@ def _torch_reference(grad_output: torch.Tensor, x: torch.Tensor) -> torch.Tensor
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("noncontiguous_grad", [False, True])
+@_requires_gfx950
 def test_silu_and_mul_backward(shape, dtype, noncontiguous_grad):
     torch.manual_seed(0)
     x = torch.randn(shape, dtype=dtype, device="cuda")
@@ -58,6 +56,7 @@ def test_silu_and_mul_backward(shape, dtype, noncontiguous_grad):
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
+@_requires_gfx950
 def test_silu_and_mul_backward_explicit_out():
     x = torch.randn((7, 256), dtype=torch.bfloat16, device="cuda")
     grad_output = torch.randn((7, 128), dtype=x.dtype, device=x.device)
@@ -69,6 +68,7 @@ def test_silu_and_mul_backward_explicit_out():
     )
 
 
+@_requires_gfx950
 def test_silu_and_mul_backward_empty_rows():
     x = torch.empty((0, 64), dtype=torch.bfloat16, device="cuda")
     grad_output = torch.empty((0, 32), dtype=x.dtype, device=x.device)
@@ -78,6 +78,7 @@ def test_silu_and_mul_backward_empty_rows():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="requires two GPUs")
+@_requires_gfx950
 def test_silu_and_mul_backward_non_current_device():
     current_device = torch.cuda.current_device()
     input_device = (current_device + 1) % torch.cuda.device_count()
@@ -95,12 +96,21 @@ def test_silu_and_mul_backward_non_current_device():
 def test_silu_and_mul_backward_unsupported_arch(monkeypatch):
     x = torch.randn((2, 64), dtype=torch.bfloat16, device="cuda")
     grad_output = torch.randn((2, 32), dtype=x.dtype, device=x.device)
-    monkeypatch.setattr(config_utils.arch_info, "get_arch", lambda: "gfx942")
+    properties = type("DeviceProperties", (), {"gcnArchName": "gfx942:sramecc+"})()
 
-    with pytest.raises(FileNotFoundError, match="gfx942.*silu_and_mul_backward"):
+    def get_device_properties(device):
+        assert device == x.device
+        return properties
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", get_device_properties)
+
+    with pytest.raises(
+        RuntimeError, match="silu_and_mul_backward requires gfx950, got gfx942"
+    ):
         silu_and_mul_backward(grad_output, x)
 
 
+@_requires_gfx950
 def test_silu_and_mul_backward_validation():
     x = torch.randn((2, 64), dtype=torch.bfloat16, device="cuda")
     grad_output = torch.randn((2, 32), dtype=x.dtype, device=x.device)
