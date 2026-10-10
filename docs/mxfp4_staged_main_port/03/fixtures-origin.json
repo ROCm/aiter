@@ -1,0 +1,17 @@
+{
+  "implementation_commit": "da7239ff56e1c3119493500ec9b6717406e6185b",
+  "kind": "specified-pair requests from current admitted M_est-pruned enumeration",
+  "numerical_acceptance": false,
+  "timing_acceptance": false,
+  "gpu_work": false,
+  "flydsl_compilation": false,
+  "fixture_count": 22,
+  "shape_candidate_counts": {
+    "minimax-128": 1056,
+    "minimax-2048": 456,
+    "gpt-2048": 912,
+    "gpt-128": 2112,
+    "situv2-2048": 912
+  },
+  "previous_fixture_origin_commit": "bbc81dc7a9b942e8f811cce7f57d080eadf4e9c1"
+}
