@@ -127,15 +127,35 @@ HIP_VISIBLE_DEVICES=0 \
 echo "[3/11] exit=$?" >> $SUMMARY
 echo ""
 
-# 4. MLA-v4 sparse prefill (asm, fp8) — single GPU
-echo "=== [4/11] MLA-v4 sparse prefill (asm, fp8) ==="
-HIP_VISIBLE_DEVICES=0 \
-  python op_tests/test_pa_sparse_prefill.py \
-    --prec fp8 \
-    --backend asm \
-    --h_q 128 \
-  2>&1 | tee $LOGDIR/04_mla_v4_sparse_prefill_asm.log || true
-echo "[4/11] exit=$?" >> $SUMMARY
+# 4. MLA-v4 decode [EP] (fp8 sparse, Opus vs asm) — single GPU
+echo "=== [4/11] MLA-v4 decode [EP] (fp8 sparse, Opus vs asm) ==="
+(
+  failed=0
+  # Representative HCA/CSA pools; pair each pool with one sparse top-k instead
+  # of taking the CLI's Cartesian product across every pool and top-k value.
+  for spec in "HCA 140 64" "CSA 384 192" "CSA 1024 512"; do
+    read -r kv_group kv_pool topk <<< "$spec"
+    echo "--- KV group=$kv_group pool=$kv_pool topk=$topk batch=512 ---"
+    HIP_VISIBLE_DEVICES=0 \
+      python op_tests/test_pa_sparse_prefill.py \
+        -n 512 \
+        --h_q 128 \
+        -d 512 \
+        --topk $topk \
+        --total_pages $kv_pool \
+        --total_tokens 512 \
+        --prec fp8 \
+        --backend opus asm \
+        --no-verify
+    case_exit=$?
+    if [ "$case_exit" -ne 0 ]; then
+      echo "FAIL KV_group=$kv_group pool=$kv_pool topk=$topk exit=$case_exit"
+      failed=1
+    fi
+  done
+  exit "$failed"
+) 2>&1 | tee $LOGDIR/04_mla_v4_decode_ep_opus_asm.log
+echo "[4/11] exit=${PIPESTATUS[0]}" >> $SUMMARY
 echo ""
 
 # 5. MLA-v3 decode (asm, fp8) — single GPU
@@ -149,15 +169,15 @@ HIP_VISIBLE_DEVICES=0 \
 echo "[5/11] exit=$?" >> $SUMMARY
 echo ""
 
-# 6. MLA-v4 decode (asm, FP8 NOPE + BF16 RoPE) — single GPU
-echo "=== [6/11] MLA-v4 decode (asm, FP8 NOPE + BF16 RoPE) ==="
+# 6. MLA-v4 decode [TP] (asm kernarg-preload, no split merge) — single GPU
+echo "=== [6/11] MLA-v4 decode [TP] (asm kernarg-preload, split-kv=1) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/test_mla_v4_kargpreld.py \
     --batch 64 \
     --kv-seq-lens 256 512 1024 \
     --variant qh64-q1-16mx4-64nx1-np qh128-q1-16mx4-64nx1-np \
-    --split-kv 1 2 4 \
-  2>&1 | tee $LOGDIR/06_mla_v4_decode_asm.log || true
+    --split-kv 1 \
+  2>&1 | tee $LOGDIR/06_mla_v4_decode_tp_asm.log || true
 echo "[6/11] exit=$?" >> $SUMMARY
 echo ""
 
