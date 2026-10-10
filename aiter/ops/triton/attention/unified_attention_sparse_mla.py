@@ -1,6 +1,28 @@
+import functools
+
+import triton
+
 from aiter.ops.triton._triton_kernels.attention.unified_attention_sparse_mla import (
     _kernel_unified_attention_sparse_mla_2d,
 )
+from aiter.ops.triton.utils.tuned_config_utils import get_tuned_kernel_config
+
+_FALLBACK = triton.Config({"BLOCK_M": 16}, num_warps=4, num_stages=1)
+
+
+@functools.cache
+def _launch_config() -> triton.Config:
+    """Read-only launch config, resolved once per process.
+
+    Decode runs this per step, and an arch with no published entry warns on
+    every miss, so the uncached call would log once per launch.
+    """
+    return get_tuned_kernel_config(
+        "attention",
+        "UNIFIED_ATTENTION_SPARSE_MLA",
+        "_kernel_unified_attention_sparse_mla_2d",
+        _FALLBACK,
+    )
 
 
 def unified_attention_sparse_mla(
@@ -47,16 +69,21 @@ def unified_attention_sparse_mla(
     k = kv
     v = kv[..., :kv_lora_rank]
 
-    BLOCK_M = 16
+    cfg = _launch_config()
+    BLOCK_M = cfg.kwargs["BLOCK_M"]
+    # A program covers BLOCK_M heads and masks those past the head count; halve a
+    # larger tuned value while it does not divide the head count, to mask fewer rows.
+    while BLOCK_M > _FALLBACK.kwargs["BLOCK_M"] and num_query_heads % BLOCK_M:
+        BLOCK_M //= 2
 
-    total_num_q_blocks = q.shape[0] * (num_query_heads // BLOCK_M)
+    total_num_q_blocks = q.shape[0] * triton.cdiv(num_query_heads, BLOCK_M)
     ALL_DECODE = max_seqlen_q == 1
 
     ROPE_RANK = head_size - kv_lora_rank
     KV_LORA_RANK = kv_lora_rank
     TILE_SIZE = block_size
-    num_stages_2d = 1
-    num_warps = 4
+    num_stages_2d = cfg.num_stages
+    num_warps = cfg.num_warps
     _kernel_unified_attention_sparse_mla_2d[(total_num_q_blocks,)](
         output_ptr=out,
         query_ptr=q,
