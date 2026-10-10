@@ -781,8 +781,16 @@ def _emit_prequant_copy_preshuffle(c: SimpleNamespace) -> None:
             offset_is_bytes=True,
             cache_modifier=_PREQUANT_NT_STORE,
         )
+    # Row-major keeps each row's e8m0 dwords contiguous (row * 56 + g).
+    # The interleaved store scatters them at stride wmma_rep*16, one dword per
+    # cache line. GEMM's row_major_ascale path consumes the contiguous layout.
+    row_major_scale = bool(getattr(c, "row_major_scale", False))
+    row_i32 = dst.payload_row_i32
     for g, src_dword in scale_chunks:
-        dst_dword_idx = scale_row_dword_base + g * c_stride
+        if const_expr(row_major_scale):
+            dst_dword_idx = fx.Int32(row_i32) * c_n_scale_dwords + g
+        else:
+            dst_dword_idx = scale_row_dword_base + g * c_stride
 
         # Tail-lane guard: n_scale_dwords may not be a wave multiple.
         def _store_scale_dword(dst_dword_idx=dst_dword_idx, src_dword=src_dword):
@@ -1605,6 +1613,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
+    row_major_scale: bool = False,
 ):
     """Route-indexed grouped quant+preshuffle.
 
@@ -1647,6 +1656,12 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
 
+    if row_major_scale:
+        if not prequantized or ksplit or remap_rows or fuse_ep_psum:
+            raise ValueError(
+                "row_major_scale is the prequantized full-row copy path "
+                "(no ksplit, no remap, no ep psum)"
+            )
     if prequantized:
         assert src_scale_bytes_per_row >= L.scale_bytes_per_row, (
             f"src_scale_bytes_per_row {src_scale_bytes_per_row} cannot hold "
@@ -1669,13 +1684,16 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     # In the name because it changes what the kernel READS, not just how fast:
     # two builds with the same feat_dim/quant_mode are not interchangeable.
     prequant_tag = f"_pq{src_scale_bytes_per_row}" if prequantized else ""
+    # Layout of the scale buffer, not just a speed hint: interleaved and
+    # row-major builds are not interchangeable.
+    rm_tag = "_rm" if row_major_scale else ""
     source_topk_is_pow2 = source_topk > 0 and (source_topk & (source_topk - 1)) == 0
     source_topk_shift = source_topk.bit_length() - 1 if source_topk_is_pow2 else 0
 
     module_name = (
         f"moe_fused_quant_preshuffle_routeks_fd{feat_dim}_r{wmma_rep}"
         f"_{quant_mode}_{L.native_tag}_{source_tag}{remap_tag}{psum_tag}{ksplit_tag}"
-        f"{prequant_tag}"
+        f"{prequant_tag}{rm_tag}"
     )
 
     @flyc.kernel(name=module_name, known_block_size=[BLOCK_THREADS, 1, 1])
@@ -1927,6 +1945,7 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
                 scale_t_i32=scale_t_i32,
                 lane=lane,
                 wmma_rep=wmma_rep,
+                row_major_scale=row_major_scale,
             )
             if const_expr(ksplit):
                 k_group_val = fx.Uint32(fx.block_idx.y)

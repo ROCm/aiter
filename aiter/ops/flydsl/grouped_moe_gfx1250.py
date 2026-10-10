@@ -918,10 +918,30 @@ def _grouped_a8w4_tdm_moe(
             f"row at model_dim {model_dim}, got {_src_width}"
         )
 
-    # A quantizing TDM dispatch lands the e8m0 row on the wire row-major, one row
-    # per dest row: nothing local re-lays it out, so gemm1 takes the 16-row
-    # interleave on its LDS->register read instead.
-    _row_major_ascale = _compact and _prequantized
+    # A quantizing TDM dispatch lands the e8m0 row on the wire row-major.
+    # Compact dispatch is already in GEMM row order, so gemm1 interleaves on
+    # the LDS read. The mori path still has to gather into grouped rows; it
+    # writes those scales row-major too. Scattering them into the interleaved
+    # layout in this kernel, then having gemm1 read that layout, was slower
+    # than one coalesced store plus the row-major LDS read -- BUT only on the
+    # decode kernel (tile_m=256, wmma_rep=8). gemm1's row-major A-scale read is
+    # a strided ds_read with a 2-way bank conflict; on the prefill tile
+    # (tile_m=64, m_warp=1) that conflict costs more than the preshuffle saves
+    # (measured: gemm1 +18%, net +9us/layer at 4k tokens), and on tiny decode
+    # batches (<~1k tokens) the small-M gemm1 regresses too. Gate on both so
+    # prefill and ramp steps keep the original interleaved store untouched.
+    _rm_min_tokens = int(os.environ.get("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
+    _row_major_a1 = (
+        _prequantized
+        and not _compact
+        and not _fuse_ep_route_quant
+        and ep_psum_params is None
+        and int(tile_m) >= 256
+        and int(token_num) >= _rm_min_tokens
+        and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1")
+        in ("1", "true", "True")
+    )
+    _row_major_ascale = (_compact and _prequantized) or _row_major_a1
     # Local quant instead writes one compact row-major row per token and rebuilds
     # the interleaved layout gemm1 reads in a second pass, so neither write lands
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
@@ -991,6 +1011,7 @@ def _grouped_a8w4_tdm_moe(
             out_scale=_compact_ascale_buf,
             row_to_token=_row_to_token,
             ep_psum_params=ep_psum_params,
+            row_major_scale=_row_major_a1,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1164,6 +1185,7 @@ def _grouped_a8w4_tdm_moe(
                     prequantized_scale=src_a1_scale if _prequantized else None,
                     out_payload=a1_payload,
                     out_scale=a1_scale,
+                    row_major_scale=_row_major_a1,
                 ),
             )
         )
@@ -1222,6 +1244,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
+                        row_major_ascale=int(_row_major_ascale),
                         **_situ_kw,
                     ),
                 )
@@ -1260,6 +1283,7 @@ def _grouped_a8w4_tdm_moe(
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
                         lds_soa_load_interleave=lds_soa_load_interleave,
+                        row_major_ascale=int(_row_major_ascale),
                         **_situ_kw,
                     ),
                 )
