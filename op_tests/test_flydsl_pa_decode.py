@@ -7,7 +7,6 @@ Run with: python -m pytest -q op_tests/test_flydsl_pa_decode.py
 """
 
 import importlib.util
-from contextlib import contextmanager
 from itertools import product
 
 import pytest
@@ -277,24 +276,6 @@ _BF16_CASES = _COMMON_CASES + [
     ],
     ("graph-workspace", {"query_length": 4, "max_partitions": 7, "capture": True}),
 ]
-_AUTOTUNE_CASES = [
-    (
-        "fp8-per-token",
-        {"kv_dtype": "fp8", "scale_mode": "per-token", "head_dim": 128},
-    ),
-    (
-        "fp8-per-tensor",
-        {
-            "kv_dtype": "fp8",
-            "query_dtype": torch.float16,
-            "scale_mode": "per-tensor",
-            "trans_v": False,
-            "head_dim": 64,
-        },
-    ),
-    ("bf16-mtp", {"head_dim": 192, "query_length": 4}),
-    ("bf16-window", {"query_length": 4, "window": 257, "sink_dtype": torch.float32}),
-]
 _INVALID_CASES = [
     ("fp16-query", NotImplementedError, "BF16 KV requires bfloat16 queries"),
     ("plain-v", ValueError, "BF16 KV requires the vectorized 5D value_cache layout"),
@@ -311,13 +292,6 @@ _INVALID_CASES = [
 def _check_output(output, reference):
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
-
-
-def _check_same_plan(actual, expected):
-    assert actual.capacity == expected.capacity
-    assert actual.max_partitions == expected.max_partitions
-    torch.testing.assert_close(actual.work_info, expected.work_info, atol=0, rtol=0)
-    torch.testing.assert_close(actual.reduce_info, expected.reduce_info, atol=0, rtol=0)
 
 
 def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
@@ -353,185 +327,6 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
         )
 
 
-def _isolated_pa_decode_autotuner(pa, cache_file):
-    """Use FlyDSL's own cache loader while keeping user tuning data untouched."""
-    from flydsl.autotune import Autotuner
-
-    original = pa._pa_decode_autotuner
-    tuner = Autotuner(
-        original.fn,
-        configs=original.configs,
-        key=original.key,
-        warmup=original.warmup,
-        rep=original.rep,
-        prune_configs_by=original.prune_configs_by,
-        reset_to_zero=original.reset_to_zero,
-        restore_value=original.restore_value,
-        pre_hook=original.pre_hook,
-        post_hook=original.post_hook,
-        default=original.default,
-        artifact_name=original.artifact_name,
-        validate_hook=original.validate_hook,
-        select_config=original.select_config,
-    )
-    tuner._cache_file = cache_file
-    tuner.cache.clear()
-    tuner._load_disk_cache()
-    return tuner
-
-
-def _check_cache_reuse(pa, tuner, arguments, options, plan, reference, monkeypatch):
-    """Allocation geometry and scheduling bounds must reuse the native cache."""
-    query, key, value, lengths, table, scale, query_length = arguments
-    dim, page = query.shape[-1], key.shape[3]
-    padded_query = torch.empty(
-        (*query.shape[:-1], dim + 16), dtype=query.dtype, device=query.device
-    )
-    strided_query = padded_query[..., :dim]
-    strided_query.copy_(query)
-    extended_arguments = (
-        strided_query,
-        torch.cat((key, key[:1])),
-        torch.cat((value, value[:1])),
-        lengths,
-        torch.cat((table, torch.zeros_like(table[:, :1])), dim=1),
-        scale,
-        query_length,
-    )
-    extended_options = dict(options)
-    extended_options["max_context_length"] = table.shape[1] * page + 1
-    for name in ("key_scale", "value_scale"):
-        kv_scale = options[name]
-        if isinstance(kv_scale, torch.Tensor):
-            extended_options[name] = (
-                torch.cat((kv_scale, kv_scale[:1])).squeeze(-1)
-                if kv_scale.numel() > 1
-                else kv_scale.reshape(1, 1)
-            )
-
-    def forbidden_default(*_, **__):
-        pytest.fail("equivalent attention geometry missed the native tuning cache")
-
-    with monkeypatch.context() as cached_only:
-        cached_only.setattr(tuner, "default", forbidden_default)
-        reused_plan = pa.prepare_pa_decode_plan(
-            *extended_arguments, max_partitions=plan.max_partitions, **extended_options
-        )
-    assert len(tuner.cache) == 1
-    _check_same_plan(reused_plan, plan)
-    output = torch.full_like(query, float("nan"))
-    pa.pa_decode(output, *extended_arguments, work_plan=reused_plan, **extended_options)
-    _check_output(output, reference)
-
-
-def _prepare_autotuned_plan(
-    pa, arguments, options, reference, case, monkeypatch, tmp_path
-):
-    """Check native search, candidate accuracy, persistence and default lookup."""
-    from flydsl.autotune import do_bench
-
-    autotune = importlib.import_module("flydsl.autotune")
-    query, key, value, lengths, table, _, _ = arguments
-    kv_heads = key.shape[1]
-    num_cu = torch.cuda.get_device_properties(query.device).multi_processor_count
-    limit = num_cu if case["max_partitions"] is None else case["max_partitions"]
-    monkeypatch.setattr(autotune, "_tuning_enabled", lambda: True)
-    arch = torch.cuda.get_device_properties(query.device).gcnArchName.split(":", 1)[0]
-    cache_file = tmp_path / "configs" / "pa" / arch / "_pa_decode_autotuner.json"
-    tuner = _isolated_pa_decode_autotuner(pa, cache_file)
-    monkeypatch.setattr(pa, "_get_pa_decode_autotuner", {arch: tuner}.__getitem__)
-    assert tuner._do_bench is do_bench
-    assert tuner.select_config is None
-    snapshots = [
-        (tensor, tensor.clone())
-        for tensor in (query, key, value, lengths, table, *options.values())
-        if isinstance(tensor, torch.Tensor)
-    ]
-    # Scalar host-to-device copies must precede capture, with device tensors
-    # retained alongside the graphs holding their pointers.
-    host_scales = {
-        name: options[name]
-        for name in ("key_scale", "value_scale")
-        if key.dtype != torch.bfloat16 and not isinstance(options[name], torch.Tensor)
-    }
-    validated = {}
-    original_validate = tuner.validate_hook
-
-    @contextmanager
-    def validate_candidate(sig_args):
-        resources = sig_args["resources"]
-        with original_validate(sig_args):
-            yield
-        budget = sig_args["workgroup_budget"]
-        _check_output(resources.outputs[budget], reference)
-        validated[budget] = resources
-        for name, expected in host_scales.items():
-            scale = resources.options[name]
-            assert isinstance(scale, torch.Tensor)
-            assert scale.device == query.device
-            assert scale.dtype == torch.float32
-            assert scale.shape == (1,)
-            assert scale.item() == (1.0 if expected is None else expected)
-
-    monkeypatch.setattr(tuner, "validate_hook", validate_candidate)
-    plan = pa.prepare_pa_decode_plan(*arguments, max_partitions=limit, **options)
-    assert validated
-    assert len(tuner.cache) == 1
-    assert cache_file.is_file()
-    selected = next(iter(tuner.cache.values())).kwargs["workgroup_budget"]
-    assert selected in validated
-    resources = validated[selected]
-    assert set(validated) == set(resources.graphs)
-    expected_budgets = {}
-    for budget in (2 * num_cu, 128, 256, 512, 1024, 2048, 4096):
-        capacity = min(
-            lengths.numel() * limit,
-            max(lengths.numel(), (budget + kv_heads - 1) // kv_heads),
-        )
-        expected_budgets.setdefault(capacity, budget)
-    assert set(validated) == set(expected_budgets.values())
-    assert plan.capacity == min(
-        lengths.numel() * limit,
-        max(lengths.numel(), (selected + kv_heads - 1) // kv_heads),
-    )
-    for tensor, snapshot in snapshots:
-        torch.testing.assert_close(tensor, snapshot, atol=0, rtol=0)
-
-    def forbidden_prepare(*_, **__):
-        pytest.fail("cache/default lookup prepared autotune benchmark candidates")
-
-    def forbidden_benchmark(*_, **__):
-        pytest.fail("cache/default lookup benchmarked an autotune candidate")
-
-    monkeypatch.setattr(autotune, "_tuning_enabled", lambda: False)
-    reloaded = _isolated_pa_decode_autotuner(pa, cache_file)
-    assert reloaded.cache
-    monkeypatch.setattr(pa, "_get_pa_decode_autotuner", {arch: reloaded}.__getitem__)
-    monkeypatch.setattr(pa._PADecodeAutotuneResources, "prepare", forbidden_prepare)
-    monkeypatch.setattr(reloaded, "_do_bench", forbidden_benchmark)
-    cached_plan = pa.prepare_pa_decode_plan(*arguments, max_partitions=limit, **options)
-    _check_same_plan(cached_plan, plan)
-    if case["cache_reuse"]:
-        _check_cache_reuse(
-            pa, reloaded, arguments, options, cached_plan, reference, monkeypatch
-        )
-
-    # A fresh native-cache miss uses 2*CU without preparing or timing graphs.
-    miss = _isolated_pa_decode_autotuner(pa, tmp_path / "empty.json")
-    monkeypatch.setattr(pa, "_get_pa_decode_autotuner", {arch: miss}.__getitem__)
-    monkeypatch.setattr(miss, "_do_bench", forbidden_benchmark)
-    default_plan = pa.prepare_pa_decode_plan(
-        *arguments, max_partitions=limit, **options
-    )
-    assert default_plan.capacity == min(
-        lengths.numel() * limit,
-        max(lengths.numel(), (2 * num_cu + kv_heads - 1) // kv_heads),
-    )
-    assert not miss.cache
-    options.update(resources.options)
-    return cached_plan
-
-
 @pytest.mark.parametrize(
     "case",
     [
@@ -556,38 +351,6 @@ def _prepare_autotuned_plan(
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         *[
             pytest.param(
-                dict(
-                    kv_heads=2,
-                    group_size=4,
-                    max_partitions=None,
-                    autotune=True,
-                    cache_reuse=True,
-                    capture=True,
-                    **geometry,
-                ),
-                id=f"autotune-{name}",
-            )
-            for name, geometry in _AUTOTUNE_CASES
-        ],
-        *[
-            pytest.param(
-                {
-                    "kv_dtype": "fp8",
-                    "group_size": 4,
-                    "head_dim": 64,
-                    "max_partitions": 2,
-                    "pattern": "constant",
-                    "lengths": (1, 64),
-                    "scale_mode": mode,
-                    "autotune": True,
-                    "capture": True,
-                },
-                id=f"autotune-{mode}-scales",
-            )
-            for mode in ("python", "none")
-        ],
-        *[
-            pytest.param(
                 {
                     "invalid_input": invalid,
                     "error": error,
@@ -600,7 +363,7 @@ def _prepare_autotuned_plan(
         ],
     ],
 )
-def test_pa_decode(case, device, monkeypatch, tmp_path):
+def test_pa_decode(case, device, monkeypatch):
     """FP8/BF16 decode shares input, reference, planning and replay checks."""
     case = dict(
         {
@@ -618,8 +381,6 @@ def test_pa_decode(case, device, monkeypatch, tmp_path):
             "scale_mode": "none",
             "trans_v": True,
             "capture": False,
-            "autotune": False,
-            "cache_reuse": False,
             "lengths": None,
         },
         **case,
@@ -697,28 +458,13 @@ def test_pa_decode(case, device, monkeypatch, tmp_path):
         "max_context_length": context.max().item(),
     }
     arguments = (query, key_cache, value_cache, context, table, dim**-0.5, query_length)
-    if case["autotune"]:
-        reference = _reference(
-            query,
-            logical_key,
-            logical_value,
-            table,
-            context,
-            query_length,
-            window,
-            sinks,
-        )
-        plan = _prepare_autotuned_plan(
-            pa, arguments, options, reference, case, monkeypatch, tmp_path
-        )
-    else:
-        plan = pa.plan_pa_decode(
-            context,
-            kv_heads,
-            max_partitions=case["max_partitions"],
-            query_length=query_length,
-            sliding_window=window,
-        )
+    plan = pa.plan_pa_decode(
+        context,
+        kv_heads,
+        max_partitions=case["max_partitions"],
+        query_length=query_length,
+        sliding_window=window,
+    )
     if "invalid_input" in case:
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
