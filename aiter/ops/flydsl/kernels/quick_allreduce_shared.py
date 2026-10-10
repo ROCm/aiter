@@ -48,7 +48,7 @@ _CM_SC0 = 1
 _CM_NT = 2
 _CM_SC1 = 16
 
-# Cache policy for the peer stores in _fanout_nt / _publish, per inbox memory
+# Cache policy for the peer stores in _fanout / _publish, per inbox memory
 # type.
 #
 # On an uncached inbox the memory type does all the work: a store cannot sit in
@@ -79,6 +79,8 @@ _CM_SC1 = 16
 # makes every payload load bypass L1 and L2 (``sc0 sc1``) -- ``nt`` is a reuse
 # hint, not a bypass, and could be answered from a line cached by an earlier
 # call into the same slot. A system-scope acquire is what makes ``nt`` safe.
+# The mesh's relay blocks are the exception: they read the bounce with plain
+# loads behind an agent-scope acquire, see ``_RELAY_RECV_CM`` there.
 #
 # ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
 # consecutive quads; see the layouts in the kernel body.

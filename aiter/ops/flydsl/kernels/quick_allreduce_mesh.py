@@ -30,7 +30,8 @@ At TP2 a fixed fraction of the blocks, the *relay* blocks, can write their
 packet into a bounce buffer on a third GPU instead of the peer's inbox, so a
 share of each direction's traffic takes the two xGMI links through that GPU.
 The peer reads it from the bounce in place of its inbox. Flags, colours and the
-reduction order are unchanged.
+reduction order are unchanged. Relay blocks read the bounce with plain loads
+behind an L1 invalidate; see ``_RELAY_RECV_CM``.
 """
 
 import flydsl.compiler as flyc
@@ -218,6 +219,20 @@ RELAY_MAX_DEN = 8
 # which the flag, landing in the peer's inbox, does not otherwise order.
 _RELAY_STORE_CM = _CM_SC0 | _CM_SC1 | _CM_NT
 
+# A relay block reads the bounce with plain loads behind an agent-scope acquire
+# (`buffer_inv sc1`), where direct blocks read their inbox with `sc0 sc1` behind
+# a workgroup-scope acquire that emits no invalidate. Both are correct. On
+# gfx950 at 80 MiB the plain loads cut what relaying costs a GEMM on the relay
+# GPU from 24-26% to about 1% (4-5% at 10 MiB) and a copy from 14-17% to 4-5%,
+# and the relay itself runs 6-8% faster; why `sc0 sc1` costs that much is not
+# established. The invalidate is what makes plain loads correct: L1 holds UC
+# lines, and a block reads the same bounce slots on every tile, so a plain load
+# could otherwise be served the previous tile's packet. A workgroup-scope
+# acquire would invalidate nothing. gfx942 has the same acquire semantics but
+# has not been run.
+_RELAY_RECV_CM = 0
+_RELAY_ACQUIRE_SCOPE = rocdl.SyncScope.AgentOneAs
+
 
 def check_relay(relay):
     num, den = (int(x) for x in relay)
@@ -297,6 +312,11 @@ def make_quick_allreduce_mesh_kernel(
     release_scope = policy["release"]
     acquire_scope = policy["acquire"]
     recv_policy = policy["recv"]
+    # Locals rather than module constants read from the kernel helpers, so they
+    # are part of the compile-cache key.
+    relay_store_cm = _RELAY_STORE_CM
+    relay_recv_cm = _RELAY_RECV_CM
+    relay_acquire_scope = _RELAY_ACQUIRE_SCOPE
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
     if super_tile not in SUPER_TILES:
@@ -393,16 +413,11 @@ def make_quick_allreduce_mesh_kernel(
         peers = _load_peers(peer_ptrs, world_size + (2 if relay is not None else 0))
         peer_vec = fx.Vector.from_elements(peers[:world_size], dtype=fx.Int64)
         inbox = _buffer_ptr(_to_sgpr_i64(peer_vec[rank]), T.i32, 4)
-        recv_buf = inbox
         if const_expr(relay is not None):
             # Uniform per block, and the same on both ranks for the same tiles.
             is_relay = (bid % fx.Int32(relay[1])) < fx.Int32(relay[0])
             bounce_out = _buffer_ptr(_to_sgpr_i64(peers[world_size]), T.i32, 4)
-            recv_buf = _buffer_ptr(
-                _to_sgpr_i64(is_relay.select(peers[world_size + 1], peer_vec[rank])),
-                T.i32,
-                4,
-            )
+            bounce_in = _buffer_ptr(_to_sgpr_i64(peers[world_size + 1]), T.i32, 4)
 
         def _push_base(j):
             """Inbox base of destination *j*, a lane-varying ``push_peers`` index."""
@@ -509,23 +524,7 @@ def make_quick_allreduce_mesh_kernel(
                     )
             return own
 
-        def _fanout(phase, inbox_src, sub):
-            """NT-store one rank-tile, branching on the relay once per fanout.
-
-            A per-store test of ``is_relay`` stops the LDS reads from being
-            issued ahead of the stores, on the direct blocks of a relay engine
-            as well as the relay blocks. ``to_bounce`` is a Python bool, so
-            each side specializes and the store itself does not branch.
-            """
-            if const_expr(relay is not None):
-                if is_relay:
-                    _fanout_nt(phase, inbox_src, sub, True)
-                else:
-                    _fanout_nt(phase, inbox_src, sub, False)
-            else:
-                _fanout_nt(phase, inbox_src, sub, False)
-
-        def _fanout_nt(phase, inbox_src, sub, to_bounce):
+        def _fanout(phase, inbox_src, sub, to_bounce):
             """NT-store one rank-tile from LDS to every destination's inbox.
 
             Lockstep stripes of up to 8 sectors cover the rank-tile: at the
@@ -577,7 +576,7 @@ def make_quick_allreduce_mesh_kernel(
                                 bounce_out,
                                 wire_off,
                                 v4,
-                                cache_modifier=_RELAY_STORE_CM,
+                                cache_modifier=relay_store_cm,
                             )
                         else:
                             _store_peer(j, wire_off, v4)
@@ -631,7 +630,7 @@ def make_quick_allreduce_mesh_kernel(
             while current != color:
                 current = _load_flag(flag)
 
-        def _wait_release(phase, color):
+        def _wait_release(phase, color, invalidate=None):
             # Lane ``t`` watches one source. Without skip_self that is source
             # ``t``; with it our own flag is never published, so the N-1 lanes
             # step over our own index.
@@ -658,19 +657,28 @@ def make_quick_allreduce_mesh_kernel(
             # because the policy pairs it with `sc0 sc1` payload loads
             # (`recv_policy`), which bypass both caches.
             _acquire_inbox(acquire_scope)
+            # A relay block's plain bounce loads need the L1 emptied of the
+            # slots it read on its previous tile; *invalidate* says whether
+            # there was one. See _RELAY_RECV_CM.
+            if const_expr(invalidate is not None):  # noqa: SIM102
+                if invalidate:
+                    _acquire_inbox(relay_acquire_scope)
 
-        def _recv_quantized(phase, src, sub, k=0):
+        def _recv_quantized(phase, src, sub, k, to_bounce):
             base = _sub_tile_i32(phase, src, sub)
             if const_expr(k):
                 base = base + fx.Int32(k * c.rank_tile_i32)
+            buf, bits = (
+                (bounce_in, relay_recv_cm) if to_bounce else (inbox, recv_policy)
+            )
 
             def _get(off):
-                return _buffer_load(recv_buf, base + off, 1, fx.Int32, recv_policy)[0]
+                return _buffer_load(buf, base + off, 1, fx.Int32, bits)[0]
 
             words, word = _codec_load(c, _get, tid, scale_slot)
             return words, _scale_from_word(c, word, pair_in_slot)
 
-        def _reduce_scattered(sub, own=None):
+        def _reduce_scattered(sub, own, to_bounce):
             """Dequant-accumulate every peer's reduce-scatter packet for *sub*."""
             accs = [None] * rank_atoms
             for src in range_constexpr(world_size):
@@ -683,7 +691,7 @@ def make_quick_allreduce_mesh_kernel(
                             accs[k] = _add_f16(own[k], accs[k])
                     else:
                         words, scale = _recv_quantized(
-                            PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k
+                            PHASE_REDUCE_SCATTER, fx.Int32(src), sub, k, to_bounce
                         )
                         if const_expr(accs[k] is None):
                             accs[k] = _codec_dequant(c, words, scale, tid)
@@ -691,7 +699,7 @@ def make_quick_allreduce_mesh_kernel(
                             accs[k] = _codec_dequant(c, words, scale, tid, accs[k])
             return accs
 
-        def _recv_all_gather(sub, own=None):
+        def _recv_all_gather(sub, own, to_bounce):
             """Dequantize every peer's all-gather packet back into full-tile atoms."""
             gathered = []
             for src in range_constexpr(world_size):
@@ -701,7 +709,7 @@ def make_quick_allreduce_mesh_kernel(
                         gathered.append(None if own is None else own[k])
                     else:
                         words, scale = _recv_quantized(
-                            PHASE_ALL_GATHER, fx.Int32(src), sub, k
+                            PHASE_ALL_GATHER, fx.Int32(src), sub, k, to_bounce
                         )
                         gathered.append(_codec_dequant(c, words, scale, tid))
             return gathered
@@ -712,99 +720,126 @@ def make_quick_allreduce_mesh_kernel(
         # silently leave every tile above n_blocks unprocessed. `grid` still
         # sizes the wire slots and colour array, so n_blocks <= grid always.
         n_block_tiles = (num_tiles - bid + n_blocks - fx.Int32(1)) // n_blocks
-        color = _load_color()
-        if const_expr(super_tile == 1):
-            for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
-                tile = bid + i * n_blocks
-                atoms = _load_tile_atoms(tile)
-                _pack_reduce_scatter(atoms)
-                gpu.barrier()
-                _fanout(PHASE_REDUCE_SCATTER, rank, fx.Int32(0))
-                _publish(PHASE_REDUCE_SCATTER, rank, color)
 
-                _wait_release(PHASE_REDUCE_SCATTER, color)
-                # ST=1 keeps the whole tile in registers across the wait, so
-                # under skip_self our share is simply read back out of it.
-                own_rs = None
-                if const_expr(self_rank is not None):
-                    own_rs = _own_atoms(atoms)
-                acc = _reduce_scattered(fx.Int32(0), own_rs)
+        def _run(to_bounce):
+            """The whole schedule, specialized for relay or direct blocks.
 
-                own_ag = _pack_all_gather(acc)
-                gpu.barrier()
-                _fanout(PHASE_ALL_GATHER, rank, fx.Int32(0))
-                _publish(PHASE_ALL_GATHER, rank, color)
+            Branching once per block rather than per store or load keeps
+            ``is_relay`` out of the fanout, where a per-store test stops the
+            LDS reads from being issued ahead of the stores, and lets the
+            receive loads carry each side's own cache bits.
+            """
 
-                _wait_release(PHASE_ALL_GATHER, color)
-                gathered = _recv_all_gather(fx.Int32(0), own_ag)
-                _store_tile_atoms(tile, gathered)
+            def reused(i):
+                # One invalidate per tile, at the reduce-scatter acquire,
+                # covers both phases: only this block reads its slots, and
+                # neither is read again before its own flag wait, so nothing
+                # refills the all-gather slot in between. A block's first tile
+                # needs none, as L1 is invalidated at the start of every
+                # dispatch.
+                return (i > fx.Int32(0)) if to_bounce else None
 
-                color = color + fx.Int32(1)
-                if color == fx.Int32(0):  # 0 is unset sentinel
-                    color = fx.Int32(1)
-        else:
-            st_i = fx.Int32(super_tile)
-            for i in range(fx.Int32(0), n_block_tiles, st_i):
-                remain = n_block_tiles - i
-                n_this = (remain < st_i).select(remain, st_i)
-
-                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    tile = bid + (i + s) * n_blocks
+            color = _load_color()
+            if const_expr(super_tile == 1):
+                for i in range(fx.Int32(0), n_block_tiles, fx.Int32(1)):
+                    tile = bid + i * n_blocks
                     atoms = _load_tile_atoms(tile)
                     _pack_reduce_scatter(atoms)
                     gpu.barrier()
-                    _fanout(PHASE_REDUCE_SCATTER, rank, s)
-                    if (s + fx.Int32(1)) < n_this:
-                        # Drain this wave's LDS loads, then join the WG.
-                        # world_size<8 leaves waves idle in fanout; without the
-                        # barrier they pack the next sub-tile into LDS while
-                        # a busy wave still ptr_loads it. lgkmcnt only: NT
-                        # payload stays in flight until _publish.
-                        rocdl.s_waitcnt(lgkmcnt=0)
-                        gpu.barrier()
+                    _fanout(PHASE_REDUCE_SCATTER, rank, fx.Int32(0), to_bounce)
+                    _publish(PHASE_REDUCE_SCATTER, rank, color)
 
-                _publish(PHASE_REDUCE_SCATTER, rank, color)
-                _wait_release(PHASE_REDUCE_SCATTER, color)
-
-                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    # Under skip_self nothing is carried from the first loop --
-                    # that would be ST tiles of registers across the wait -- so
-                    # our share is reloaded from the input, a local cached read
-                    # against the uncached inbox read it replaces. Likewise our
-                    # reduced chunk is stored now rather than carried to the
-                    # third loop; the all-gather publish below releases it.
-                    tile = bid + (i + s) * n_blocks
+                    _wait_release(PHASE_REDUCE_SCATTER, color, reused(i))
+                    # ST=1 keeps the whole tile in registers across the wait, so
+                    # under skip_self our share is simply read back out of it.
                     own_rs = None
                     if const_expr(self_rank is not None):
-                        own_rs = [
-                            _load_atom(tile, self_rank * rank_atoms + k)
-                            for k in range_constexpr(rank_atoms)
-                        ]
-                    acc = _reduce_scattered(s, own_rs)
+                        own_rs = _own_atoms(atoms)
+                    acc = _reduce_scattered(fx.Int32(0), own_rs, to_bounce)
+
                     own_ag = _pack_all_gather(acc)
-                    if const_expr(own_ag is not None):
-                        for k in range_constexpr(rank_atoms):
-                            _store_atom(tile, self_rank * rank_atoms + k, own_ag[k])
                     gpu.barrier()
-                    _fanout(PHASE_ALL_GATHER, rank, s)
-                    if (s + fx.Int32(1)) < n_this:
-                        rocdl.s_waitcnt(lgkmcnt=0)
-                        gpu.barrier()
+                    _fanout(PHASE_ALL_GATHER, rank, fx.Int32(0), to_bounce)
+                    _publish(PHASE_ALL_GATHER, rank, color)
 
-                _publish(PHASE_ALL_GATHER, rank, color)
-                _wait_release(PHASE_ALL_GATHER, color)
-
-                for s in range(fx.Int32(0), n_this, fx.Int32(1)):
-                    gathered = _recv_all_gather(s)
-                    tile = bid + (i + s) * n_blocks
+                    _wait_release(PHASE_ALL_GATHER, color)
+                    gathered = _recv_all_gather(fx.Int32(0), own_ag, to_bounce)
                     _store_tile_atoms(tile, gathered)
 
-                color = color + fx.Int32(1)
-                if color == fx.Int32(0):  # 0 is unset sentinel
-                    color = fx.Int32(1)
-        if tid == 0:
-            _store_color(color)
-        gpu.barrier()
+                    color = color + fx.Int32(1)
+                    if color == fx.Int32(0):  # 0 is unset sentinel
+                        color = fx.Int32(1)
+            else:
+                st_i = fx.Int32(super_tile)
+                for i in range(fx.Int32(0), n_block_tiles, st_i):
+                    remain = n_block_tiles - i
+                    n_this = (remain < st_i).select(remain, st_i)
+
+                    for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                        tile = bid + (i + s) * n_blocks
+                        atoms = _load_tile_atoms(tile)
+                        _pack_reduce_scatter(atoms)
+                        gpu.barrier()
+                        _fanout(PHASE_REDUCE_SCATTER, rank, s, to_bounce)
+                        if (s + fx.Int32(1)) < n_this:
+                            # Drain this wave's LDS loads, then join the WG.
+                            # world_size<8 leaves waves idle in fanout; without the
+                            # barrier they pack the next sub-tile into LDS while
+                            # a busy wave still ptr_loads it. lgkmcnt only: NT
+                            # payload stays in flight until _publish.
+                            rocdl.s_waitcnt(lgkmcnt=0)
+                            gpu.barrier()
+
+                    _publish(PHASE_REDUCE_SCATTER, rank, color)
+                    _wait_release(PHASE_REDUCE_SCATTER, color, reused(i))
+
+                    for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                        # Under skip_self nothing is carried from the first loop --
+                        # that would be ST tiles of registers across the wait -- so
+                        # our share is reloaded from the input, a local cached read
+                        # against the uncached inbox read it replaces. Likewise our
+                        # reduced chunk is stored now rather than carried to the
+                        # third loop; the all-gather publish below releases it.
+                        tile = bid + (i + s) * n_blocks
+                        own_rs = None
+                        if const_expr(self_rank is not None):
+                            own_rs = [
+                                _load_atom(tile, self_rank * rank_atoms + k)
+                                for k in range_constexpr(rank_atoms)
+                            ]
+                        acc = _reduce_scattered(s, own_rs, to_bounce)
+                        own_ag = _pack_all_gather(acc)
+                        if const_expr(own_ag is not None):
+                            for k in range_constexpr(rank_atoms):
+                                _store_atom(tile, self_rank * rank_atoms + k, own_ag[k])
+                        gpu.barrier()
+                        _fanout(PHASE_ALL_GATHER, rank, s, to_bounce)
+                        if (s + fx.Int32(1)) < n_this:
+                            rocdl.s_waitcnt(lgkmcnt=0)
+                            gpu.barrier()
+
+                    _publish(PHASE_ALL_GATHER, rank, color)
+                    _wait_release(PHASE_ALL_GATHER, color)
+
+                    for s in range(fx.Int32(0), n_this, fx.Int32(1)):
+                        gathered = _recv_all_gather(s, None, to_bounce)
+                        tile = bid + (i + s) * n_blocks
+                        _store_tile_atoms(tile, gathered)
+
+                    color = color + fx.Int32(1)
+                    if color == fx.Int32(0):  # 0 is unset sentinel
+                        color = fx.Int32(1)
+            if tid == 0:
+                _store_color(color)
+            gpu.barrier()
+
+        if const_expr(relay is not None):
+            if is_relay:
+                _run(True)
+            else:
+                _run(False)
+        else:
+            _run(False)
 
     flat_wg = f"{block},{block}"
 

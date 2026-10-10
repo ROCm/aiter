@@ -32,7 +32,9 @@ sweep ends in a markdown table:
   only on xGMI, when four GPUs are visible and this arch has relay defaults.
   The direct TP2 rows always run. Relay rows run eager; a block-512 and a
   block-256 shape also run captured into a CUDA graph, replayed with the inputs
-  refilled between replays.
+  refilled between replays. A block-64 row with every block relaying, eager
+  and graph, makes each block re-read its bounce slots, which catches a relay
+  acquire that no longer empties L1.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
 shapes, the full ``block``/``skip_self`` sweep, the fp16 transport over a
@@ -270,6 +272,14 @@ RELAY_CASES = (
 # The default relay rows that also run under CUDA-graph replay: 80 MiB is on
 # the block-512 rung (from 4 MiB), 2.5 MiB on the block-256 rung.
 RELAY_GRAPH_CASES = ((8192, 5120, "int4"), (256, 5120, "int4"))
+# (tokens, hidden, codec, block, grid_cap): 16 tiles of 8 KiB over 8 blocks, all
+# relaying, so every block reads its bounce slots twice with too little traffic
+# in between to evict them from L1. A relay block's plain loads read the
+# previous tile's packet here unless its acquire invalidates L1, so this fails
+# if that is dropped or narrowed to workgroup scope. Eager and under graph
+# replay.
+RELAY_REUSE_CASES = ((64, 1024, "int4", 64, 8),)
+RELAY_REUSE_FRACTION = (1, 1)
 # (tokens, hidden, codec, relay_fraction, super_tile), ``--extended`` only.
 EXTENDED_RELAY_CASES = (
     (8192, 5120, "int4", (1, 4), None),
@@ -1240,12 +1250,14 @@ def _relay_key(
     super_tile,
     grid_cap=None,
     min_bytes=0,
+    block=None,
 ) -> tuple:
     """The engine for a relay row, on *codec*'s wire.
 
     ``min_bytes`` 0 relays from the first byte. ``None`` keeps the host's
     per-arch cutoff. A pinned super-tile also pins skip_self, which the relay
     needs on every engine and which a pinned rung does not default to.
+    ``block`` pins the block size on every rung; ``None`` keeps each rung's.
     """
     kw = {
         "algorithm": "mesh",
@@ -1260,6 +1272,8 @@ def _relay_key(
         kw.update(super_tile=super_tile, skip_self=True)
     if grid_cap is not None:
         kw["grid_cap"] = grid_cap
+    if block is not None:
+        kw["block"] = block
     return _key(tp, **kw)
 
 
@@ -1295,6 +1309,7 @@ def test_quick_allreduce_relay(
     min_bytes=0,
     calls=RELAY_CALLS,
     graph=False,
+    block=None,
 ):
     """TP2 relay against its direct twin on the same inputs.
 
@@ -1315,13 +1330,15 @@ def test_quick_allreduce_relay(
             super_tile,
             grid_cap,
             min_bytes,
+            block,
         ),
         _relay_case(tokens, hidden, codec, calls, graph),
     )
     nbytes = tokens * hidden * 2
     label = (
         f"tp={tp} relay={tuple(relay_devices)} f={tuple(relay_fraction)} {codec} "
-        f"{tokens}x{hidden} st={super_tile} grid_cap={grid_cap} graph={graph}"
+        f"{tokens}x{hidden} st={super_tile} grid_cap={grid_cap} block={block} "
+        f"graph={graph}"
     )
     expected_st = super_tile or _shipping_st(rows, nbytes, "mesh", tp)
     if exact:
@@ -1718,11 +1735,33 @@ def main():
                     0,
                     RELAY_CALLS,
                     graph,
+                    None,
                 )
                 for tokens, hidden, codec, graph in relay_cases
                 for fraction in args.relay_fraction
                 for grid_cap in args.grid_cap
             ]
+            if args.mnk is None:
+                relay += [
+                    (
+                        tokens,
+                        hidden,
+                        2,
+                        pair,
+                        RELAY_REUSE_FRACTION,
+                        codec,
+                        1,
+                        grid_cap,
+                        True,
+                        0,
+                        RELAY_CALLS,
+                        graph,
+                        block,
+                    )
+                    for tokens, hidden, codec, block, grid_cap in RELAY_REUSE_CASES
+                    if codec in args.relay_codec
+                    for graph in (False, True)
+                ]
             if args.extended:
                 relay += [
                     (
@@ -1738,6 +1777,7 @@ def main():
                         0,
                         RELAY_CALLS,
                         False,
+                        None,
                     )
                     for tokens, hidden, codec, fraction, st in EXTENDED_RELAY_CASES
                 ]
@@ -1771,6 +1811,7 @@ def main():
                             None,
                             calls,
                             False,
+                            None,
                         )
                         for tokens, used, calls in (
                             (at - 1, False, RELAY_CALLS),
@@ -1793,9 +1834,10 @@ def main():
         floor,
         calls,
         graph,
+        block,
     ) in relay:
         _register(
-            _relay_key(tp, pair, fraction, codec, st, grid_cap, floor),
+            _relay_key(tp, pair, fraction, codec, st, grid_cap, floor, block),
             _relay_case(tokens, hidden, codec, calls, graph),
         )
 
