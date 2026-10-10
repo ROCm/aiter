@@ -23,11 +23,15 @@ compiles or launches, and they provide no numerical/precompiled acceptance.
 TDD cycles reproduced an unsupported limit keyword, absent invalid/Situv2
 rejection, missing environment forwarding, rejected standalone argument,
 incorrect BF16 scatter job and missing FP4 scale-buffer failures before the
-corresponding implementation. The final 30 tests cover defaults, custom limit,
+corresponding implementation. The final 31 tests cover defaults, custom limit,
 unset/empty/enabled gates, both switches with default/custom limit, BN128/BN256
 packed scatter, BN512 BF16 fallback, bias and atomic jobs. The selected-CSV
 batch collector test verifies limit-5/both-switches discovery, deduplication,
 exclusion of an unselected Situv2 CSV and successful host compile entry checks.
+An independent CPU subprocess executes the documented `compile_selected.py`
+file through the actual two-worker AOT pool with the external compiler stub.
+The current pool uses `fork`; this check verifies that path and does not claim
+spawn execution. The guarded file entry is importable by spawned workers.
 
 Reproduce from this checkout:
 
