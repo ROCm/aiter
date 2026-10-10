@@ -356,11 +356,10 @@ def is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, num_kv_splits):
         return False
     if os.environ.get("AITER_MLA_V4_FUSED", "1") == "0":
         return False
-    fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
     gqa = Q.size(1) // KV.size(2)
     return (
-        Q.dtype in fp8_dtypes
-        and KV.dtype in fp8_dtypes
+        Q.dtype == torch.float8_e4m3fn
+        and KV.dtype == torch.float8_e4m3fn
         and gqa == 32
         and int(max_seqlen_q) == 1
     )

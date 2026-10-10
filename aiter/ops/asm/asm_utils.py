@@ -342,9 +342,10 @@ def launch_co_cluster(
 # ---------------------------------------------------------------------------
 # torch dtype -> short kernel-table string. Kept generic (the asm csv `qType` /
 # `kvType` columns use these). Extend as new kernel dtypes ship.
+# "fp8" means OCP e4m3fn: the shipped code objects carry no fp8-format selector,
+# so e4m3fnuz (different bias / NaN encoding) must not alias onto them.
 _DTYPE_TO_STR = {
     torch.float8_e4m3fn: "fp8",
-    torch.float8_e4m3fnuz: "fp8",
     torch.bfloat16: "bf16",
 }
 
