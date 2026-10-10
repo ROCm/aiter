@@ -375,12 +375,17 @@ def test_public_a8w4_csv(
             intermediate.update(contract)
             ids = args[3][:int(args[5][0].item())].long()
             live = ((ids & 0xFFFFFF) < token) & ((ids >> 24) < topk)
-            live_payload = payload[:ids.numel()][live].view(torch.uint8)
+            route_ids = (ids[live] & 0xFFFFFF) * topk + (ids[live] >> 24)
+            route_order = route_ids.argsort()
+            assert torch.equal(route_ids[route_order], torch.arange(token * topk,
+                device=route_ids.device)), "sort omitted or duplicated a live route"
+            live_payload = payload[:ids.numel()][live][route_order].view(torch.uint8)
+            routed_scales = active_scales[route_order].view(torch.uint8)
             if current_scale_byte is None:
-                control_intermediate = (live_payload.clone(), active_scales.view(torch.uint8).clone())
+                control_intermediate = (live_payload.clone(), routed_scales.clone())
             else:
-                assert torch.equal(live_payload, control_intermediate[0])
-                assert torch.equal(active_scales.view(torch.uint8), control_intermediate[1])
+                assert torch.equal(live_payload, control_intermediate[0]), "poison changed routed FP8 payload"
+                assert torch.equal(routed_scales, control_intermediate[1]), "poison changed routed scale bytes"
                 intermediate["normal_poison_intermediate_equal"] = True
             if g1["BM"] == 16:
                 native_q, native_s = original1(*args, **dict(kwargs, native_scale_layout=True))
@@ -389,10 +394,14 @@ def test_public_a8w4_csv(
                 native_values = native_q[:ids.numel()][live].float() * fp4_utils.e8m0_to_f32(
                     native_scale).repeat_interleave(32, 1)
                 assert torch.equal(native_values, decoded), "native/regular live values differ"
-                assert torch.equal(native_scale.view(torch.uint8), active_scales.view(torch.uint8))
+                assert torch.equal(native_scale.view(torch.uint8), active_scales.view(torch.uint8)), (
+                    "native/regular live scale bytes differ"
+                )
                 intermediate["native_regular_equivalent"] = True
             if block_amplitude != 1.0:
-                assert torch.equal(decoded[:, :32], torch.zeros_like(decoded[:, :32]))
+                assert torch.equal(decoded[:, :32], torch.zeros_like(decoded[:, :32])), (
+                    "expected zero intermediate group"
+                )
                 live_indices = torch.where(live)[0]
                 first = active_scales[live_indices // 16 == 0, 1:].view(torch.uint8)
                 second = active_scales[live_indices // 16 == 1, 1:].view(torch.uint8)
