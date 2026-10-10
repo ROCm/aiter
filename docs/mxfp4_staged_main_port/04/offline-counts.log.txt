@@ -1,0 +1,28 @@
+[aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-04/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+[mxfp4-port] pruned G1: pid=482616 token=64 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=2 valid=84 kept=12
+[mxfp4-port] pruned G1: pid=482616 token=64 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=2 valid=84 kept=12
+[mxfp4-port] pruned G1: pid=482616 token=128 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=4 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=482616 token=128 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=4 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=482616 token=512 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=16 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=482616 token=512 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=16 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=482616 token=1024 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=32 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=482616 token=1024 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=32 valid=84 kept=66
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=4096 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=128 valid=84 kept=21
+[mxfp4-port] pruned G1: pid=482616 token=4096 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=128 valid=84 kept=21
+[mxfp4-port] pruned G1: pid=482616 token=8192 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=256 valid=84 kept=12
+[mxfp4-port] pruned G1: pid=482616 token=8192 model_dim=3072 inter_dim=384 expert=256 topk=8 act=silu M_est=256 valid=84 kept=12
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+[mxfp4-port] pruned G1: pid=482616 token=2048 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=64 valid=84 kept=27
+Prepared 27 separate search inputs and shared-enumeration counts
