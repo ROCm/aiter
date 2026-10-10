@@ -8,6 +8,7 @@ external FlyDSL compiler is replaced so no GPU kernel compiles or launches.
 
 import csv
 import os
+import subprocess
 import sys
 
 import pytest
@@ -246,3 +247,33 @@ def test_selected_csv_batch_collection_uses_matching_environment_and_excludes_ot
         aot.compile_one_config(**job)["compile_time"] is not None for job in jobs
     )
     assert external_compiler
+
+
+def test_documented_selected_csv_batch_runs_real_pool_in_an_independent_cpu_process(
+    tmp_path,
+):
+    selected = winner_csv(tmp_path)
+    environment = dict(os.environ)
+    environment.update(
+        AITER_MXFP4_TUNE_SWIGLU_LIMIT="5",
+        AITER_FLYDSL_STAGE2_FP8="1",
+        AITER_MXFP4_INTERMEDIATE="1",
+        AITER_FLYDSL_AOT_WORKERS="2",
+    )
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "op_tests.tuning_tests._mxfp4_selected_batch_smoke",
+            "--csv",
+            str(selected),
+        ],
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "2 worker processes" in result.stdout
+    assert "Compiled: 4 ok, 0 failed" in result.stdout
