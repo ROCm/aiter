@@ -324,3 +324,31 @@ def test_spawned_shape_inherits_snapshot_and_stable_production_settings(
             "fp4_scatter": fp4 == "1",
             "swiglu_limit": 5.0 if limit == "5" else 7.0,
         }
+
+
+@pytest.mark.parametrize("retune", [False, True])
+def test_custom_limit_same_key_skips_or_replaces_csv_as_requested(
+    tmp_path, monkeypatch, retune
+):
+    from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import (
+        controlled_mxfp4,
+        tuner_args,
+    )
+
+    source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+    pd.DataFrame([shape()]).to_csv(source, index=False)
+    monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
+    attempts = []
+    with devices(("gfx950", 256)):
+        tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+        old = tuner._candidate_row(shape(), 16, "default-limit-g1", "default-limit-g2")
+        old.update(us=20, us1=20)
+        pd.DataFrame([old]).to_csv(output, index=False)
+        controlled_mxfp4(tuner, monkeypatch, attempts)
+        tuner.run(tuner_args(tuner, source, output, *(["--all"] if retune else [])))
+    csv = pd.read_csv(output)
+    assert len(attempts) == int(retune)
+    assert csv.us.tolist() == ([10.25] if retune else [20])
+    assert csv.kernelName1.tolist() == (
+        ["g1-controlled"] if retune else ["default-limit-g1"]
+    )
