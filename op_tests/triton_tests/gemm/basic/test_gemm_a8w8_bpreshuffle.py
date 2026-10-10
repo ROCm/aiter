@@ -7,7 +7,6 @@ import torch
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
 from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 pytestmark = pytest.mark.skipif(
@@ -16,7 +15,7 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def inputs(m, n, k, row_strided=False):
+def generate_gemm_a8w8_bpreshuffle_inputs(m, n, k, row_strided=False):
     torch.manual_seed(17)
     x = torch.randn((m, k * (2 if row_strided else 1)), device="cuda") * 0.25
     x = x.to(torch.float8_e4m3fn)
@@ -28,7 +27,7 @@ def inputs(m, n, k, row_strided=False):
     return x, w, sx, sw
 
 
-def reference(x, w, sx, sw, dtype):
+def run_torch(x, w, sx, sw, dtype):
     return ((x.float() @ w.float().T) * sx * sw.T).to(dtype)
 
 
@@ -38,24 +37,20 @@ def reference(x, w, sx, sw, dtype):
 )
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_public_bpreshuffle(m, n, k, dtype):
-    x, w, sx, sw = inputs(m, n, k)
+    x, w, sx, sw = generate_gemm_a8w8_bpreshuffle_inputs(m, n, k)
     shuffled = shuffle_weight(w, pad_k_to=32)
     output = gemm_a8w8_bpreshuffle(x, shuffled, sx, sw, dtype=dtype)
     assert output.shape == (m, n)
     assert output.dtype == dtype
     assert torch.isfinite(output).all()
     torch.testing.assert_close(
-        output, reference(x, w, sx, sw, dtype), rtol=0.02, atol=0.01
+        output, run_torch(x, w, sx, sw, dtype), rtol=0.02, atol=0.01
     )
 
 
-@pytest.mark.parametrize("split_k", [1, 3, 8])
 @pytest.mark.parametrize("m,k", [(1, 65), (3, 513), (32, 2048)])
-def test_explicit_config_split_k_and_output(m, k, split_k):
-    x, w, sx, sw = inputs(m, 80, k, row_strided=True)
-    config, _ = get_gemm_config("GEMM-A8W8_BPRESHUFFLE", m, 80, k)
-    config["NUM_KSPLIT"] = split_k
-    saved = dict(config)
+def test_resolved_config_and_output(m, k):
+    x, w, sx, sw = generate_gemm_a8w8_bpreshuffle_inputs(m, 80, k, row_strided=True)
     out = torch.empty((m, 80), device="cuda", dtype=torch.bfloat16)
     result = gemm_a8w8(
         x,
@@ -63,18 +58,16 @@ def test_explicit_config_split_k_and_output(m, k, split_k):
         sx,
         sw.T,
         y=out,
-        config=config,
         b_preshuffled=True,
     )
     assert result is out
-    assert config == saved
     torch.testing.assert_close(
-        result, reference(x, w, sx, sw, out.dtype), rtol=0.02, atol=0.01
+        result, run_torch(x, w, sx, sw, out.dtype), rtol=0.02, atol=0.01
     )
 
 
 def test_zero_input_and_graph_replay():
-    x, w, sx, sw = inputs(4, 64, 65)
+    x, w, sx, sw = generate_gemm_a8w8_bpreshuffle_inputs(4, 64, 65)
     shuffled = shuffle_weight(w, pad_k_to=32)
     # Warm all kernels before capture.
     for _ in range(3):
@@ -84,7 +77,7 @@ def test_zero_input_and_graph_replay():
         output = gemm_a8w8_bpreshuffle(x, shuffled, sx, sw)
     graph.replay()
     torch.testing.assert_close(
-        output, reference(x, w, sx, sw, output.dtype), rtol=0.02, atol=0.01
+        output, run_torch(x, w, sx, sw, output.dtype), rtol=0.02, atol=0.01
     )
     x.copy_(torch.zeros_like(x))
     graph.replay()
@@ -93,9 +86,9 @@ def test_zero_input_and_graph_replay():
 
 
 def test_torch_compile_public_entry():
-    x, w, sx, sw = inputs(4, 64, 96)
+    x, w, sx, sw = generate_gemm_a8w8_bpreshuffle_inputs(4, 64, 96)
     compiled = torch.compile(gemm_a8w8_bpreshuffle, backend="eager", fullgraph=True)
     output = compiled(x, shuffle_weight(w), sx, sw)
     torch.testing.assert_close(
-        output, reference(x, w, sx, sw, output.dtype), rtol=0.02, atol=0.01
+        output, run_torch(x, w, sx, sw, output.dtype), rtol=0.02, atol=0.01
     )
