@@ -13,3 +13,5 @@ The optimistic lower rates assume warmed imports and mostly cached compilation; 
 Each anchor records this estimate before startup and its actual process elapsed/attempt count after exit. Progress logs let the coordinator refine expectations. Soft SIGALRM is not a hard bound; a permanently live hang remains unbounded. No required search is skipped or stopped on a cost estimate.
 
 Every source record, compilation-cache path and assumption is in full-anchor-cost-estimates.json.
+
+Full64 completed1368 returned validations in699.554s process wall (tuner summary692.345s), about0.511s per returned attempt, inside its pre-start569–11544s range. This includes normal attempt overhead and cold keys, with common auxiliary infrastructure warmed. Later anchor estimates retain their original uncertainty because token2048/8192 reference preparation, memory and unseen compilation keys can change that rate. The completed observation is copied into later pre-start records.
