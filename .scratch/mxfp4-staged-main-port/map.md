@@ -2,7 +2,7 @@
 
 Status: claimed
 
-The user approved the four-ticket breakdown on 2026-10-10 after [spec reviewer resolution](reviewer-comments.md). The sole current implementation tickets are published under [issues](issues/README.md); ticket 01 is resolved and ticket 02 is claimed, with the blocking edges below. Implementation was authorized by the user and ticket 01 is now claimed. Target main remains `882ea79dd7cc7091f859a5bedac914523ac77bbd`.
+The user approved the four-ticket breakdown on 2026-10-10 after [spec reviewer resolution](reviewer-comments.md). The sole current implementation tickets are published under [issues](issues/README.md); ticket 01 is resolved and ticket 02 is claimed, with the blocking edges below. Implementation was authorized by the user; ticket 01 is resolved and ticket 02 is active. Target main remains `882ea79dd7cc7091f859a5bedac914523ac77bbd`.
 
 | ID | Ticket | Blocked by | Status |
 | --- | --- | --- | --- |
