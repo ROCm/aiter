@@ -151,6 +151,7 @@ def decode_valid_scales(
     sorted_ids: torch.Tensor,
     valid_ids: torch.Tensor,
     token: int,
+    native_scale_layout: bool | None = None,
 ) -> torch.Tensor:
     """Check only E8M0 bytes actually consumed for live sorted intermediate rows."""
     from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
@@ -160,7 +161,9 @@ def decode_valid_scales(
     rows = torch.arange(ids.numel(), device=ids.device)[valid, None]
     groups = torch.arange(inter_dim // 32, device=ids.device)[None, :]
     chunk_bytes = kas_per_chunk_dw_for(inter_dim) * 4
-    if block_m == 16:
+    if native_scale_layout is None:
+        native_scale_layout = block_m == 16
+    if native_scale_layout:
         offsets = (
             (rows // 16) * chunk_bytes
             + (groups // 8) * 256
@@ -204,7 +207,8 @@ def test_public_a8w4_csv(
     expected_pair = (kernel1, kernel2) if expected_pair is None else expected_pair
     g1 = _parse_mxfp4_g1_kname(kernel1)
     g2 = parse_flydsl_v2_gemm2_kernel(kernel2)
-    if (g1["a_dtype"], g1["out_dtype"]) != ("fp8", "fp8") or g2 is None:
+    is_opus = fm._opus_a8w4.is_opus_a8w4_stage2_kernel(kernel2)
+    if (g1["a_dtype"], g1["out_dtype"]) != ("fp8", "fp8") or (g2 is None and not is_opus):
         return {
             "status": "mode_skip",
             "failure_reason": "row is not an A8/FP8 coupled pair",
@@ -224,7 +228,10 @@ def test_public_a8w4_csv(
     )
     reference = run_torch(data, topk, activation, limit, bias1=bias1)
     output = torch.empty((token, model_dim), device="cuda", dtype=dtypes.bf16)
-    original1, original2 = fm._mxfp4_a4w4_stage1_fw, fm._mxfp4_a4w4_stage2_fw
+    original1 = fm._mxfp4_a4w4_stage1_fw
+    original2 = (
+        fm._opus_a8w4.opus_a8w4_stage2_wrapper if is_opus else fm._mxfp4_a4w4_stage2_fw
+    )
     calls, intermediate = [], {}
 
     @functools.wraps(original1)
@@ -244,7 +251,8 @@ def test_public_a8w4_csv(
         )
         if payload.dtype == dtypes.fp8:
             active_scales = decode_valid_scales(
-                payload, scales, inter_dim, kwargs["block_m"], args[3], args[5], token
+                payload, scales, inter_dim, kwargs["block_m"], args[3], args[5], token,
+                native_scale_layout=kwargs.get("native_scale_layout"),
             )
             intermediate.update(
                 live_scale_min=int(active_scales.view(torch.uint8).min().item()),
@@ -254,10 +262,11 @@ def test_public_a8w4_csv(
 
     @functools.wraps(original2)
     def observe2(*args: Any, **kwargs: Any) -> Any:
-        calls.append(("g2", kwargs["kernelName2"]))
+        calls.append(("g2", kwargs["kernelName" if is_opus else "kernelName2"]))
         intermediate.update(
             reader_payload_dtype=str(args[0].dtype),
             reader_scale_dtype=str(kwargs["a2_scale"].dtype),
+            **({"opus_kid": kwargs["launch"].kernel_id} if is_opus else {}),
         )
         return original2(*args, **kwargs)
 
@@ -291,7 +300,8 @@ def test_public_a8w4_csv(
         "lookup_csv_token": lookup_csv_token,
     }
     with patch.object(fm, "_mxfp4_a4w4_stage1_fw", observe1), patch.object(
-        fm, "_mxfp4_a4w4_stage2_fw", observe2
+        fm._opus_a8w4 if is_opus else fm,
+        "opus_a8w4_stage2_wrapper" if is_opus else "_mxfp4_a4w4_stage2_fw", observe2
     ):
         fm.get_2stage_cfgs.cache_clear()
         for poison in (float("nan"), 11.0):
@@ -299,6 +309,12 @@ def test_public_a8w4_csv(
             result = public()
             assert result.data_ptr() == output.data_ptr()
             assert torch.isfinite(result).all()
+            if is_opus:
+                error = cosine_diff_compare(reference, result)
+                assert math.isfinite(error) and error <= 0.1
+                mismatch = checkAllclose(reference.float(), result.float(),
+                    rtol=0.1, atol=0.05, tol_err_ratio=0.05, msg="MXMOE -> OPUS output poison")
+                assert math.isfinite(mismatch) and mismatch <= 0.05
         actual1 = next((name for stage, name in reversed(calls) if stage == "g1"), "")
         actual2 = next((name for stage, name in reversed(calls) if stage == "g2"), "")
         ret.update(actual_G1=actual1, actual_G2=actual2)
@@ -339,6 +355,8 @@ def test_public_a8w4_csv(
             atol=0.05,
             msg="public A8W4 CSV output",
         )
+        if is_opus:
+            assert math.isfinite(element_error) and element_error <= 0.05
         ret.update(intermediate, element_error=element_error)
     fm.get_2stage_cfgs.cache_clear()
     # Observe once above; timed calls run the original pipeline with no host
@@ -364,6 +382,12 @@ def test_public_a8w4_csv(
         assert torch.isfinite(result).all()
         err = cosine_diff_compare(reference, result)
         assert math.isfinite(err) and err <= 0.1 and math.isfinite(us) and us > 0
+        if is_opus:
+            mismatch = checkAllclose(reference.float(), result.float(),
+                rtol=0.1, atol=0.05, tol_err_ratio=0.05, msg="MXMOE -> OPUS public")
+            assert math.isfinite(mismatch) and mismatch <= 0.05
+            ret[f"{name} mismatch_ratio"] = mismatch
+            ret["opus_kid"] = intermediate["opus_kid"]
         ret[f"{name} us"] = us
         ret[f"{name} TFLOPS"] = flops / us / 1e6
         ret[f"{name} TB/s"] = nbytes / us / 1e6
