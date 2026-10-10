@@ -67,3 +67,26 @@ focused fixtures cover reference/screen failures, invalid shortlist expansion,
 nonfinite outcomes, returned soft timeout/exception outcomes, stable ties and
 shape-context reset. The fake outcomes verify policy independently of GPU
 compilation and numerical behavior; those remain part of later real acceptance.
+
+## Staged shape ownership and timeout
+
+Staged retains main's parallelism normalization/caps but assigns the first
+participating visible devices, even with one slot. Every shape owns a fresh
+process and private one-way result Pipe. A result is retained until the worker
+exits, joins and closes; a nonzero exit makes the shape fail even if a result
+arrived first. Completed handles close before GPU reassignment. Parent/IPC
+failures stop new launches and clean owned processes/endpoints, preserving the
+original exception. The existing direct/Queue prune/full schedules remain.
+
+The operation SIGALRM timer restores its previous handler and previous timer.
+The help reports best-effort recovery and the absence of a parent/shape hard
+deadline; a still-live GPU operation that never returns may wait indefinitely.
+The first timer test failed because the existing timer was lost before the
+owned `setitimer` implementation. The first supervisor test failed because the
+private-Pipe entry point was absent before fresh-worker implementation.
+
+CPU supervisor fixtures allow only explicit module-level fake worker targets,
+with GPU visibility empty and all real GPU/measurement functions forbidden.
+Events/barriers coordinate result-before-exit and cross-device overlap; no fixed
+sleep establishes execution ordering. Fake multi-device coverage does not
+constitute physical multi-GPU measurement evidence.
