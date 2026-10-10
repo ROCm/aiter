@@ -101,6 +101,20 @@ for a worked example and static validation results.
 - **Default**: `""` (empty string)
 - **Description**: Optional output file to store **all** tuning results (not just the best ones). Useful for profiling and analyzing all kernel candidates.
 
+The dedicated `--mxfp4-flydsl` tuner does not write stage-ranking or full-pair
+profile artifacts through this option. Its winner CSV writes the validated
+end-to-end kernel-duration sum to both `us1` and `us`, with `us2=0`. Ordinary
+fMoE retains its stage timings and profiling outputs.
+
+MXFP4 input rows may contain `gate_mode`; it is retained for support validation
+and removed from the winner CSV. An unsupported requested row is reported even
+if its shape key is already tuned. Later supported rows continue, valid old
+shared-CSV rows survive failed retuning, and any failed or unfinished requested
+row yields a nonzero command exit. The tuner validates every scheduled runtime
+GPU before shape work and writes each result's assigned gfx/CU identity. Prune/full single-slot execution retains the caller's current GPU; multi-slot
+execution uses the first selected visible logical GPUs. Build-time
+`GPU_ARCHS` and unused visible devices do not define the supported runtime set.
+
 **Example**:
 ```bash
 --profile_file aiter/configs/profile_fmoe_all.csv
@@ -268,4 +282,3 @@ python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
 - Only G1U1 (gate-up fused) MoE configurations are currently supported for tuning
 - Supported quantization types include: per_Token, per_1x128 (blockscale), per_1x32 (MXFP4, gfx950 only)
 - If you use flag `PREBUILD_KERNELS=1` when you install aiter, it will build moe kernels in tuned csv by default. If you want to use the new result of moe tuning, please remove `build` and `*.so` in `aiter/jit` first, then re-install aiter after finishing tune. This can take a lot of time and is not recommended.
-
