@@ -43,3 +43,27 @@ op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py -q
 The environment's existing system Triton3.4 warning is retained; these controlled
 checks execute no Triton kernel. GPU, numerical, production and AOT evidence are
 recorded separately after the tested policy and supervisor are connected.
+
+## Controlled screening and pair selection
+
+Shape-level staged policy selects deterministic admitted atomic reference
+consumers and G1 producers, retries returned reference failures in the same
+admitted BM set, and keeps bootstrap untimed. G1 ranks are shared across
+accumulation groups. Screening retains at most K positive finite scores in
+stable admitted order. Selected products use ordinary pair validation; only
+that validation supplies the canonical winner timing/error fields.
+
+A missing reference, empty successful stage ranking or no valid shortlisted
+pair enters exhaustive group-local validation over the original pruned pairs.
+Every returned pair outcome is stored as scalar time/failure text and its full
+pair identity; expansion never repeats it. Screening failures remain eligible
+for pair fallback, and fallback continues to its last admitted pair before
+selecting a winner. Cache and rankings belong to one shape invocation.
+
+TDD evidence: the first controlled staged-shape test observed nine normal pair
+attempts when K1 required one ranked product; after the policy implementation it
+observed only that product and its separately supplied end-to-end timing. The
+focused fixtures cover reference/screen failures, invalid shortlist expansion,
+nonfinite outcomes, returned soft timeout/exception outcomes, stable ties and
+shape-context reset. The fake outcomes verify policy independently of GPU
+compilation and numerical behavior; those remain part of later real acceptance.

@@ -9,6 +9,8 @@ import re
 import sys
 import tempfile
 from argparse import ArgumentTypeError
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -83,9 +85,16 @@ from aiter.utility import fp4_utils
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
-from aiter.utility.mp_tuner import mp_tuner
+from aiter.utility.mp_tuner import _is_accelerator_error, mp_tuner
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+    DEFAULT_SCREEN_TOPK,
+    AccumulationMode,
+    GEMM2ScreeningKey,
+    PipelinePairKey,
     build_staged_candidate_plan,
+    reference_consumer_order,
+    screening_shortlist,
+    select_reference_producer,
 )
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
@@ -7037,6 +7046,245 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return us
 
+    @contextmanager
+    def _staged_timeout(self, timeout: int) -> Iterator[None]:
+        """Apply one best-effort staged-operation timeout."""
+        import signal
+
+        if timeout <= 0:
+            yield
+            return
+
+        previous_handler = signal.getsignal(signal.SIGALRM)
+        if previous_handler is None:
+            print(
+                "[mxfp4-staged] --timeout disabled because the existing SIGALRM "
+                "handler cannot be restored; a stalled operation may wait "
+                "indefinitely",
+                flush=True,
+            )
+            yield
+            return
+
+        class _StagedOperationTimeout(Exception):
+            pass
+
+        def _on_alarm(signum: int, frame: Any) -> None:
+            raise _StagedOperationTimeout(f"exceeded {timeout}s timeout")
+
+        try:
+            signal.signal(signal.SIGALRM, _on_alarm)
+        except ValueError:
+            print(
+                "[mxfp4-staged] --timeout disabled because SIGALRM cannot be "
+                "installed outside the main thread; a stalled operation may "
+                "wait indefinitely",
+                flush=True,
+            )
+            yield
+            return
+        try:
+            signal.alarm(timeout)
+            yield
+        finally:
+            try:
+                signal.alarm(0)
+            finally:
+                signal.signal(signal.SIGALRM, previous_handler)
+
+    def _screen_candidate(
+        self, launch: Callable[[], float], label: str, timeout: int
+    ) -> float:
+        try:
+            with self._staged_timeout(timeout):
+                us = launch()
+                if not math.isfinite(us) or us <= 0:
+                    raise ValueError(f"non-positive or non-finite screening time: {us}")
+                return us
+        except Exception as exc:
+            if _is_accelerator_error(exc):
+                raise
+            print(f"[mxfp4-staged] {label} screening failed: {exc}", flush=True)
+            return self.INVALID_TIME
+
+    def _tune_staged_shape(
+        self, row: dict[str, Any], args: Any, timeout: int
+    ) -> dict[str, Any]:
+        plan = self._staged_candidate_plan(row)
+        if not plan.pairs:
+            return _mxfp4_failed_row(self.keys, row, "no pipeline-pair candidates")
+        screen_topk = getattr(args, "mxfp4_screen_topk", DEFAULT_SCREEN_TOPK)
+        gemm2_groups = {group.key: group for group in plan.gemm2_groups}
+        producers = {}
+        for group in plan.gemm1_groups:
+            atomic_group = gemm2_groups.get(
+                GEMM2ScreeningKey(group.key.block_m, AccumulationMode.ATOMIC)
+            )
+            if atomic_group is None:
+                continue
+            consumers = reference_consumer_order(atomic_group.candidates)
+            if not consumers:
+                continue
+            consumer = None
+            for reference in consumers:
+                try:
+                    with self._staged_timeout(timeout):
+                        if self._check_reference_consumer(
+                            row, reference.identity.kernel_name, args
+                        ):
+                            consumer = reference.identity.kernel_name
+                            break
+                        raise RuntimeError(
+                            "reference consumer returned an incorrect output"
+                        )
+                except Exception as exc:
+                    if _is_accelerator_error(exc):
+                        raise
+                    print(
+                        f"[mxfp4-staged] reference consumer "
+                        f"{reference.identity.kernel_name} failed: {exc}",
+                        flush=True,
+                    )
+            if consumer is None:
+                continue
+            preferred = select_reference_producer(group.candidates)
+            producer_order = (preferred,) + tuple(
+                candidate for candidate in group.candidates if candidate != preferred
+            )
+            for reference in producer_order:
+                producer = reference.identity.kernel_name
+                try:
+                    with self._staged_timeout(timeout):
+                        if self._check_reference_pair(row, producer, consumer, args):
+                            producers[group.key.block_m] = producer
+                            break
+                        raise RuntimeError(
+                            "reference producer returned an incorrect output"
+                        )
+                except Exception as exc:
+                    if _is_accelerator_error(exc):
+                        raise
+                    print(
+                        f"[mxfp4-staged] reference producer {producer} failed: {exc}",
+                        flush=True,
+                    )
+
+        gemm1_shortlists = {
+            group.key: screening_shortlist(
+                (
+                    (
+                        candidate,
+                        self._screen_candidate(
+                            functools.partial(
+                                self._screen_gemm1,
+                                row,
+                                candidate.identity.kernel_name,
+                                args,
+                            ),
+                            f"GEMM1 {candidate.identity.kernel_name}",
+                            timeout,
+                        ),
+                    )
+                    for candidate in group.candidates
+                ),
+                screen_topk,
+            )
+            for group in plan.gemm1_groups
+            if group.key.block_m in producers
+        }
+        gemm2_shortlists = {
+            group.key: screening_shortlist(
+                (
+                    (
+                        candidate,
+                        self._screen_candidate(
+                            functools.partial(
+                                self._screen_gemm2,
+                                row,
+                                producers[group.key.block_m],
+                                candidate.identity.kernel_name,
+                                args,
+                            ),
+                            f"GEMM2 {candidate.identity.kernel_name}",
+                            timeout,
+                        ),
+                    )
+                    for candidate in group.candidates
+                ),
+                screen_topk,
+            )
+            for group in plan.gemm2_groups
+            if group.key.block_m in producers
+        }
+        best = None
+        evaluated_pairs: dict[PipelinePairKey, tuple[float, str | None]] = {}
+        for group in plan.pipeline_groups:
+            gemm1 = {
+                candidate.identity
+                for candidate in gemm1_shortlists.get(group.gemm1_screening_key, ())
+            }
+            gemm2 = {
+                candidate.identity
+                for candidate in gemm2_shortlists.get(group.gemm2_screening_key, ())
+            }
+            shortlisted = tuple(
+                pair
+                for pair in group.pairs
+                if pair.key.gemm1 in gemm1 and pair.key.gemm2 in gemm2
+            )
+            if not shortlisted:
+                print(
+                    f"[mxfp4-staged] exhaustive fallback BM{group.key.block_m} "
+                    f"{group.key.accumulation_mode.value}: no usable reference/shortlist",
+                    flush=True,
+                )
+            group_best = None
+            for pairs in (shortlisted, group.pairs):
+                for pair in pairs:
+                    if pair.key in evaluated_pairs:
+                        continue
+                    candidate = dict(pair.candidate_row)
+                    try:
+                        with self._staged_timeout(timeout):
+                            us = float(self._run_candidate(row, candidate, args))
+                            failure = (
+                                None
+                                if math.isfinite(us) and us > 0
+                                else f"non-positive or non-finite validation time: {us}"
+                            )
+                    except Exception as exc:
+                        if _is_accelerator_error(exc):
+                            raise
+                        us, failure = self.INVALID_TIME, str(exc)
+                    # Only returned outcomes enter this shape-local cache;
+                    # exception objects could retain tensors through tracebacks.
+                    evaluated_pairs[pair.key] = (us, failure)
+                    print(
+                        f"[mxfp4-staged] {candidate['kernelName1']} + "
+                        f"{candidate['kernelName2']} "
+                        + (
+                            f"validation failed: {failure}"
+                            if failure is not None
+                            else f"us={us}"
+                        ),
+                        flush=True,
+                    )
+                    if failure is None and (
+                        group_best is None or us < float(group_best["us"])
+                    ):
+                        group_best = candidate
+                # A passing shortlist needs no expansion. Fallback, however,
+                # must finish the entire group before choosing its winner.
+                if group_best is not None:
+                    break
+            if group_best is not None and (
+                best is None or float(group_best["us"]) < float(best["us"])
+            ):
+                best = group_best
+        if best is None:
+            return _mxfp4_failed_row(self.keys, row, "FAILED: no valid staged pair")
+        return best
+
     def _tune_one_shape(self, row, args):
         """Sweep all (g1, g2) candidates for one shape; return the best row dict.
 
@@ -7054,6 +7302,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return _mxfp4_failed_row(self.keys, row, f"UNSUPPORTED: {reason}")
 
         timeout = int(getattr(args, "timeout", 0) or 0)
+        if getattr(args, "mxfp4_search_mode", "prune") == "staged":
+            return self._tune_staged_shape(row, args, timeout)
 
         class _CandidateTimeout(Exception):
             pass
