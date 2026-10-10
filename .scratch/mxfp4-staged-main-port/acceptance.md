@@ -1,6 +1,6 @@
 # MXFP4 staged port acceptance
 
-Status: ready-for-agent
+Status: resolved
 
 The [spec.md](spec.md) and the approved [four tickets](issues/README.md) incorporate the authorized pre-implementation reviewer corrections and are ready for implementation. Implementation and ticket-specific acceptance are active; the [work map](map.md) tracks state and [current evidence](../../docs/mxfp4_staged_main_port/implementation/README.md) links recorded results. Required GPU and calibration evidence is recorded as it is completed. This reference supplies fixture rationale and measurement details. Historical experiment evidence does not replace integrated-port validation.
 
@@ -117,3 +117,5 @@ The current port completed all27 initial searches with9327.387s summed process w
 Each record states target and implementation commits, runtime GPU/architecture/CU, visible-device restriction, toolchain versions, activation/limit, stage2 flags, shape, input/route generation, measurement and cache conditions, numerical outcome, selected names, validation count, tuning wall time, production replay and AOT outcome.
 
 Run focused policy/infrastructure/CSV/supervisor/parameter checks and the relevant GPU acceptance checks, plus repository formatting and compile checks. Final review checks both repository standards and this revised spec. Report unavailable evidence and pre-existing unrelated failures distinctly; do not carry forward the old branch's test counts or calibration as current acceptance.
+
+All required current-port acceptance is complete. The27-search matrix, production/AOT checks, targeted replay and final two-axis clearance are retained in [final delivery](../../docs/mxfp4_staged_main_port/DELIVERY.md) and ticket04 Answer. This acceptance contract remains the reproducible requirements reference.
