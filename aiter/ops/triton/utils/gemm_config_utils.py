@@ -77,13 +77,17 @@ def _get_gemm_config_cached(
             specialized_suffixes.append(f"B={B}-N={N}-K={K}")
         specialized_suffixes.append(f"N={N}-K={K}")
 
-    is_tuned = False
+    tuned_keys = set()
     for suffix in specialized_suffixes:
         specialized_config = load_config_json(
             f"{cfg_dir}/{config_name}-{suffix}.json", required=False
         )
         if specialized_config is not None:
-            config_dict, is_tuned = specialized_config, True
+            tuned_keys = set(specialized_config)
+            # A tuning-installed file holds only tuned buckets; DEFAULT.json serves the rest.
+            if specialized_config.get("DEFAULT_FALLBACK"):
+                specialized_config = {**config_dict, **specialized_config}
+            config_dict = specialized_config
             break
 
     # Explicit bounds override file-defined bounds; legacy files use the standard bounds.
@@ -100,13 +104,13 @@ def _get_gemm_config_cached(
     for bound in search_bounds:
         key = f"M_LEQ_{bound}"
         if M <= bound and key in config_dict:
-            return dict(config_dict[key]), is_tuned
+            return dict(config_dict[key]), key in tuned_keys
 
     # Search for M_GEQ_x keys
     for bound in reversed(search_bounds):
         key = f"M_GEQ_{bound}"
         if M >= bound and key in config_dict:
-            return dict(config_dict[key]), is_tuned
+            return dict(config_dict[key]), key in tuned_keys
 
     if "any" in config_dict:
         return dict(config_dict["any"]), False
