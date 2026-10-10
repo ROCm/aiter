@@ -10,13 +10,13 @@ import aiter
 from aiter import ActivationType, QuantType
 from aiter.fused_moe import moe_sorting
 from aiter.fused_moe_registry import FusedMoeRequest
-from aiter.ops.flydsl.kernels.moe_gemm_2stage import (
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import (
     flydsl_absmax,
     flydsl_quant_per_tensor,
     invert_sorted_ids,
     sorted_sum,
 )
-from aiter.ops.flydsl.kernels.moe_gemm_2stage.common import _ptr
+from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.common import _ptr
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
 
@@ -180,7 +180,7 @@ def _get_compiled_kernel(
     down_path="default",
     down_output_padding_bytes=0,
 ):
-    from aiter.ops.flydsl.kernels.moe_gemm_2stage import compile_gemm
+    from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8 import compile_gemm
 
     return compile_gemm(
         N=N,
@@ -368,7 +368,7 @@ def _run_prefill(
         task_num,
     )
     if config.down_path == "8x1_compact":
-        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gemm2_8x1_compact import (
+        from aiter.ops.flydsl.kernels.moe_gemm_2stage.gfx9_fp8.gemm2_8x1_compact import (
             allocate_task_buffers,
         )
 
