@@ -127,46 +127,36 @@ HIP_VISIBLE_DEVICES=0 \
 echo "[3/12] exit=$?" >> $SUMMARY
 echo ""
 
-# 4. MLA-v4 decode [EP] (fp8 sparse, asm) — single GPU
-echo "=== [4/12] MLA-v4 decode [EP] (fp8 sparse, asm) ==="
-(
-  failed=0
-  # Representative HCA/CSA pools; pair each pool with one sparse top-k instead
-  # of taking the CLI's Cartesian product across every pool and top-k value.
-  for spec in "HCA 140 64" "CSA 384 192" "CSA 1024 512"; do
-    read -r kv_group kv_pool topk <<< "$spec"
-    echo "--- KV group=$kv_group pool=$kv_pool topk=$topk batch=512 ---"
-    HIP_VISIBLE_DEVICES=0 \
-      python op_tests/test_pa_sparse_prefill.py \
-        -n 512 \
-        --h_q 128 \
-        -d 512 \
-        --topk $topk \
-        --total_pages $kv_pool \
-        --total_tokens 512 \
-        --prec fp8 \
-        --backend asm \
-        --no-verify
-    case_exit=$?
-    if [ "$case_exit" -ne 0 ]; then
-      echo "FAIL KV_group=$kv_group pool=$kv_pool topk=$topk exit=$case_exit"
-      failed=1
-    fi
-  done
-  exit "$failed"
-) 2>&1 | tee $LOGDIR/04_mla_v4_decode_ep_asm.log
+# 4. MLA-v4 decode [EP] (fp8 sparse ASM, dense compute peak) — single GPU
+echo "=== [4/12] MLA-v4 decode [EP] (fp8 sparse ASM, dense compute peak) ==="
+# topk=0 uses the full prefix pool plus the causal extend window.
+HIP_VISIBLE_DEVICES=0 \
+  python op_tests/test_pa_sparse_prefill.py \
+    -n 1024 \
+    --h_q 128 \
+    -d 512 \
+    --topk 0 \
+    --total_pages 32768 \
+    --total_tokens 1024 \
+    --prec fp8 \
+    --backend asm \
+    --data-init norm \
+    --no-verify \
+  2>&1 | tee $LOGDIR/04_mla_v4_decode_ep_asm.log
 echo "[4/12] exit=${PIPESTATUS[0]}" >> $SUMMARY
 echo ""
 
-# 5. MLA-v3 decode (asm, fp8) — single GPU
-echo "=== [5/12] MLA-v3 decode (asm, fp8) ==="
+# 5. MLA-v3 decode (asm, fp8, bandwidth peak) — single GPU
+echo "=== [5/12] MLA-v3 decode (asm, fp8, bandwidth peak) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/test_mla_decode_pagesize64.py \
-    -n 128,1 \
-    -b 1 16 64 512 \
-    -c 1024 8192 \
-  2>&1 | tee $LOGDIR/05_mla_v3_decode_asm.log || true
-echo "[5/12] exit=$?" >> $SUMMARY
+    -n 8,1 16,1 \
+    -b 1024 \
+    -c 16384 \
+    --split-kv 1 \
+    --init randn \
+  2>&1 | tee $LOGDIR/05_mla_v3_decode_asm.log
+echo "[5/12] exit=${PIPESTATUS[0]}" >> $SUMMARY
 echo ""
 
 # 6. MLA-v4 decode [TP] (asm kernarg-preload, no split merge) — single GPU
