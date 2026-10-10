@@ -66,31 +66,30 @@ def make_sgpr_opaque(val_i32):
     return op.res
 
 
-def _raw_lds_ptr(lds_base_idx, byte_offset):
-    """Materialize an LLVM LDS pointer from a pre-extracted byte base."""
-    lds_ptr_ty = ir.Type.parse("!llvm.ptr<3>")
-    total_byte = fx.Index(lds_base_idx) + fx.Index(byte_offset)
-    return llvm_dialect.inttoptr(lds_ptr_ty, fx.Int32(total_byte).ir_value())
+def _lds_ptr(lds_base_idx, byte_offset, element_type, alignment):
+    """Materialize an aligned LDS pointer from a pre-extracted byte base."""
+    lds_ptr_ty = fx.PointerType.get(element_type, fx.AddressSpace.Shared, alignment)
+    total_byte = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
+    return fx.inttoptr(lds_ptr_ty, total_byte)
 
 
 def lds_load_b128_raw(lds_base_idx, byte_offset):
-    """Load 16 bytes from LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(
-        ir.VectorType.get([4], ir.IntegerType.get_signless(32)), ptr_val
-    )
+    """Load 16 bytes from LDS using a pre-extracted byte base."""
+    vec_type = fx.Vector.make_type(4, fx.Int32)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    return as_ir_value(fx.ptr_load(ptr_val, result_type=vec_type))
 
 
 def lds_load_b32_raw(lds_base_idx, byte_offset):
     """Load 4 bytes from LDS as ``i32`` using a pre-extracted base index."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    return llvm_dialect.load(ir.IntegerType.get_signless(32), ptr_val)
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 4)
+    return as_ir_value(fx.ptr_load(ptr_val))
 
 
 def lds_store_b128_raw(lds_base_idx, byte_offset, data):
-    """Store 16 bytes to LDS using a pre-extracted base index (raw LLVM)."""
-    ptr_val = _raw_lds_ptr(lds_base_idx, byte_offset)
-    llvm_dialect.store(as_ir_value(data), ptr_val)
+    """Store 16 bytes to LDS using a pre-extracted byte base."""
+    ptr_val = _lds_ptr(lds_base_idx, byte_offset, fx.Int32.ir_type, 16)
+    fx.ptr_store(as_ir_value(data), ptr_val)
 
 
 def workgroup_barrier(use_cluster=False):
@@ -135,9 +134,7 @@ def pipeline_fence_wait(use_cluster=False):
 
 def fmin_f32(a, b):
     """Scalar f32 min (maps to v_min_num_f32)."""
-    from flydsl.expr import arith
-
-    return fx.Float32(arith.minnumf(as_ir_value(a), as_ir_value(b)))
+    return fx.minnumf(fx.Float32(a), fx.Float32(b))
 
 
 def fclamp_f32(x, lo, hi):
