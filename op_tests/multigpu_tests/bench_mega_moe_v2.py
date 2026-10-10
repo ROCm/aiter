@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import statistics
 from dataclasses import replace
 from pathlib import Path
 
@@ -101,7 +102,10 @@ def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, 
         destination_scores = torch.rand(
             (tokens, world), device=device, generator=generator
         )
-        destination = torch.topk(destination_scores, topk, dim=-1).indices
+        destination_order = destination_scores.argsort(dim=-1, descending=True)
+        slots = torch.arange(topk, device=device)
+        destination = destination_order[:, slots % world]
+        local_slot = slots // world
         if route == "rank-balanced-last":
             hot = torch.ones_like(destination, dtype=torch.bool)
         elif route == "rank-mixed-skew":
@@ -114,7 +118,12 @@ def make_inputs(tokens, rank, world, model_dim, experts, topk, route, hot_bias, 
         cold_expert = torch.randint(
             1, local_experts, (tokens, topk), device=device, generator=generator
         )
-        hot_expert = local_experts - 1 if route == "rank-balanced-last" else 0
+        hot_expert = (
+            local_experts - 1 - local_slot
+            if route == "rank-balanced-last"
+            else local_slot
+        )
+        cold_expert = cold_expert // topk * topk + local_slot
         ids = destination * local_experts + torch.where(hot, hot_expert, cold_expert)
         values = torch.randn(
             (tokens, topk), dtype=torch.float32, device=device, generator=generator
@@ -169,31 +178,93 @@ def capture(body):
     for _ in range(5):
         graph.replay()
     barrier()
+    graph._benchmark_body = body
     return graph
 
 
-def time_graph(graph, iters, device):
-    barrier()
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
-    start.record()
-    for _ in range(iters):
-        graph.replay()
-    end.record()
-    torch.cuda.synchronize()
-    local_ms = start.elapsed_time(end) / iters
-    mean = torch.tensor(local_ms, dtype=torch.float64, device=device)
+def run_online_mori(
+    op,
+    x,
+    weights,
+    ids,
+    expert_mask,
+    layer_weights,
+    block_num,
+    warp_per_block,
+    trim_rows,
+):
+    w1, w1_scale, w2, w2_scale = layer_weights
+    dispatched, recv_weights, recv_scales, recv_ids, recv_tokens = op.dispatch(
+        x,
+        weights,
+        None,
+        ids,
+        block_num=block_num,
+        warp_per_block=warp_per_block,
+    )
+    dispatched, recv_weights, recv_scales, recv_ids = trim_mori_dispatch_output(
+        dispatched,
+        recv_weights,
+        recv_scales,
+        recv_ids,
+        trim_rows,
+    )
+    local_out = fused_moe(
+        dispatched,
+        w1,
+        w2,
+        recv_weights,
+        recv_ids,
+        expert_mask,
+        quant_type=aiter.QuantType.per_1x32,
+        num_local_tokens=recv_tokens,
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        a1_scale=None,
+        dtype=torch.bfloat16,
+        swiglu_limit=SWIGLU_LIMIT,
+        gate_mode=GateMode.INTERLEAVE.value,
+    )
+    return op.combine(
+        local_out, None, ids, block_num=block_num, warp_per_block=warp_per_block
+    )[0][: x.shape[0]]
+
+
+def time_graph(graph, iters, device, cache_graph=None):
+    start = torch.cuda.Event(enable_timing=True, external=True)
+    end = torch.cuda.Event(enable_timing=True, external=True)
+    measured = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(measured, stream=torch.cuda.Stream()):
+        ms.shmem_barrier_on_stream(torch.cuda.current_stream())
+        start.record()
+        graph._benchmark_body()
+        end.record()
+    samples = []
+    for iteration in range(iters + 5):
+        if cache_graph is not None:
+            cache_graph.replay()
+        measured.replay()
+        torch.cuda.synchronize()
+        if iteration >= 5:
+            samples.append(start.elapsed_time(end))
+    mean = torch.tensor(samples, dtype=torch.float64, device=device)
     maximum = mean.clone()
     dist.all_reduce(mean, op=dist.ReduceOp.SUM)
     dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
-    return float(mean.item() / dist.get_world_size()), float(maximum.item())
+    return (
+        statistics.median(mean.tolist()) / dist.get_world_size(),
+        statistics.median(maximum.tolist()),
+    )
 
 
-def profile_graph(graph, name, rank, out_dir, replays=3):
+def profile_graph(graph, name, rank, out_dir, replays=3, cache_graph=None):
     barrier()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
         dist.barrier()
         for _ in range(replays):
+            if cache_graph is not None:
+                cache_graph.replay()
+            ms.shmem_barrier_on_stream(torch.cuda.current_stream())
             graph.replay()
         torch.cuda.synchronize()
     path = Path(out_dir)
@@ -204,6 +275,7 @@ def profile_graph(graph, name, rank, out_dir, replays=3):
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--network", choices=("v4_pro", "v4_1_flash"), default="v4_pro")
     parser.add_argument("--tokens", type=int, default=8192)
     parser.add_argument("--rank-tokens", default="")
     parser.add_argument("--config-tokens", type=int, default=0)
@@ -231,6 +303,7 @@ def main():
     parser.add_argument("--experts", type=int, default=EXPERTS)
     parser.add_argument("--topk", type=int, default=TOPK)
     parser.add_argument("--iters", type=int, default=10)
+    parser.add_argument("--cold-cache-mb", type=int, default=512)
     parser.add_argument(
         "--route",
         choices=(
@@ -252,12 +325,19 @@ def main():
     parser.add_argument("--stage1-dispatch-cu", type=int, default=0)
     parser.add_argument("--stage1-grid-mult", type=int, default=0)
     parser.add_argument("--stage1-b-nt", type=int, default=-1)
+    parser.add_argument("--stage1-tile-n", type=int, default=0)
+    parser.add_argument("--stage1-sort-block-m", type=int, default=0)
+    parser.add_argument("--stage1-num-waves", type=int, default=0)
+    parser.add_argument("--stage2-block-n", type=int, default=0)
+    parser.add_argument("--stage2-block-m", type=int, default=0)
     parser.add_argument("--stage1-tile-resource", action="store_true")
     parser.add_argument("--check-variant", action="store_true")
     parser.add_argument("--profile-dir", default="")
     parser.add_argument("--mega-only", action="store_true")
     parser.add_argument("--perf-guard", action="store_true")
     args = parser.parse_args()
+    if args.network == "v4_1_flash":
+        args.model_dim, args.inter_dim, args.experts, args.topk = 5120, 2304, 384, 6
 
     if not args.mega_only and args.phase is None:
         parser.error("--phase {decode,prefill} is required for a Mori comparison")
@@ -274,8 +354,8 @@ def main():
     os.environ["AITER_BF16_FP8_MOE_BOUND"] = "0"
 
     rank, world, device = setup_dist()
-    if world != 8:
-        raise ValueError("This comparison requires eight ranks")
+    if world not in ((2, 4) if args.network == "v4_1_flash" else (8,)):
+        raise ValueError("Flash requires EP2/EP4; V4-Pro comparison requires EP8")
     if args.experts % world:
         raise ValueError(f"experts={args.experts} must be divisible by world={world}")
     rank_tokens = [int(value) for value in args.rank_tokens.split(",") if value]
@@ -323,6 +403,12 @@ def main():
         torch.ones_like(ids.flatten(), dtype=torch.int64),
     )
     dist.all_reduce(route_counts, op=dist.ReduceOp.SUM)
+    received_tokens = (
+        (ids[:, :, None] // local_experts == torch.arange(world, device=device))
+        .any(dim=1)
+        .sum(dim=0)
+    )
+    dist.all_reduce(received_tokens, op=dist.ReduceOp.SUM)
     expert_counts = torch.bincount(
         ids.flatten().to(torch.int64), minlength=args.experts
     )
@@ -358,6 +444,11 @@ def main():
         or args.stage1_dispatch_cu
         or args.stage1_grid_mult
         or args.stage1_b_nt >= 0
+        or args.stage1_tile_n
+        or args.stage1_sort_block_m
+        or args.stage1_num_waves
+        or args.stage2_block_n
+        or args.stage2_block_m
         or args.stage1_tile_resource
         or args.config_tokens
     ):
@@ -377,6 +468,12 @@ def main():
                 stage1_updates["grid_mult"] = args.stage1_grid_mult
             if args.stage1_b_nt >= 0:
                 stage1_updates["b_nt"] = args.stage1_b_nt
+            if args.stage1_tile_n:
+                stage1_updates["tile_n"] = args.stage1_tile_n
+            if args.stage1_sort_block_m:
+                stage1_updates["sort_block_m"] = args.stage1_sort_block_m
+            if args.stage1_num_waves:
+                stage1_updates["num_waves"] = args.stage1_num_waves
             if args.stage1_tile_resource:
                 stage1_updates["use_tile_resource"] = True
             if stage1_updates:
@@ -386,9 +483,13 @@ def main():
                 or args.stage2_persist_cu
                 or args.stage2_skew_cu
                 or args.disable_stage2_skew
+                or args.stage2_block_n
+                or args.stage2_block_m
             ):
                 stage2 = replace(
                     stage2,
+                    block_n=args.stage2_block_n or stage2.block_n,
+                    block_m=args.stage2_block_m or stage2.block_m,
                     persist_strided=args.stage2_strided,
                     persist_cu=args.stage2_persist_cu or stage2.persist_cu,
                     skew_cu=(
@@ -433,54 +534,51 @@ def main():
     holders = {}
 
     def mori_body():
-        dispatched, recv_weights, recv_scales, recv_ids, recv_tokens = mori_op.dispatch(
+        holders["mori"] = run_online_mori(
+            mori_op,
             x,
             route_weights,
-            None,
             ids,
-            block_num=mori_block_num,
-            warp_per_block=mori_warp_per_block,
-        )
-        dispatched, recv_weights, recv_scales, recv_ids = trim_mori_dispatch_output(
-            dispatched,
-            recv_weights,
-            recv_scales,
-            recv_ids,
+            expert_mask,
+            (w1, w1_scale, w2, w2_scale),
+            mori_block_num,
+            mori_warp_per_block,
             mori_trim_rows,
         )
-        local_out = fused_moe(
-            dispatched,
-            w1,
-            w2,
-            recv_weights,
-            recv_ids,
-            expert_mask,
-            quant_type=aiter.QuantType.per_1x32,
-            num_local_tokens=recv_tokens,
-            w1_scale=w1_scale,
-            w2_scale=w2_scale,
-            a1_scale=None,
-            dtype=torch.bfloat16,
-            swiglu_limit=SWIGLU_LIMIT,
-            gate_mode=GateMode.INTERLEAVE.value,
-        )
-        holders["mori"] = mori_op.combine(
-            local_out,
-            None,
-            ids,
-            block_num=mori_block_num,
-            warp_per_block=mori_warp_per_block,
-        )[0][:tokens]
 
     def mega_body():
-        holders["mega"] = mega(x, route_weights, ids)
+        holders["mega"] = mega(
+            x,
+            route_weights,
+            ids,
+            config_tokens=max_rank_tokens,
+            w1=w1,
+            w1_scale=w1_scale,
+            w2=w2,
+            w2_scale=w2_scale,
+        )
+
+    if not args.mega_only:
+        mori_body()
+        baseline_output = holders["mori"].clone()
+        barrier()
+        mega_body()
+        error_sq = (holders["mega"].float() - baseline_output.float()).square().sum()
+        norm_sq = baseline_output.float().square().sum()
+        dist.all_reduce(error_sq)
+        dist.all_reduce(norm_sq)
+        baseline_rel_l2 = float((error_sq / norm_sq).sqrt())
+        if not baseline_rel_l2 < 0.1:
+            raise AssertionError(f"MegaMoE vs baseline relL2={baseline_rel_l2}")
+        if rank == 0:
+            print(f"[ACCURACY] baseline_rel_l2={baseline_rel_l2:.6f}", flush=True)
 
     mori_graph = None if args.mega_only else capture(mori_body)
     print(f"[STEP] rank={rank} mori-capture-done", flush=True)
     if rank == 0 and mori_graph is not None:
         full_recv_rows = mori_op.max_num_tokens_to_recv()
         fused_moe_rows = min(full_recv_rows, mori_trim_rows or full_recv_rows)
-        tune_topk = args.topk - 1  # fused_moe's expert-parallel lookup convention
+        tune_topk = args.topk
         print(
             "[MORI_CONFIG] "
             f"mode=MANUAL phase={phase} graph_bs={graph_bs} dp_size={world} "
@@ -497,16 +595,22 @@ def main():
     print(f"[STEP] rank={rank} mega-capture-done", flush=True)
     if rank == 0:
         print(f"[MEGA_CONFIG] {mega._active_config}", flush=True)
+    cache_storage = torch.zeros(
+        args.cold_cache_mb * 1024 * 1024, dtype=torch.uint8, device=device
+    )
+    cache_graph = capture(lambda: cache_storage.add_(1)) if args.cold_cache_mb else None
     mori_ms = (
         (float("nan"), float("nan"))
         if mori_graph is None
-        else time_graph(mori_graph, args.iters, device)
+        else time_graph(mori_graph, args.iters, device, cache_graph)
     )
-    mega_ms = time_graph(mega_graph, args.iters, device)
+    mega_ms = time_graph(mega_graph, args.iters, device, cache_graph)
     x_q, x_scale = mega.quantize(x)
 
     def mega_stage1():
-        mega._run_fused_stage1(x_q, route_weights, x_scale, ids)
+        mega._run_fused_stage1(
+            x_q, route_weights, x_scale, ids, config=mega._active_config.stage1
+        )
 
     stage1_graph = capture(mega_stage1)
     print(f"[STEP] rank={rank} stage1-capture-done", flush=True)
@@ -518,10 +622,10 @@ def main():
 
     stage2_graph = capture(mega_stage2)
     print(f"[STEP] rank={rank} stage2-capture-done", flush=True)
-    stage1_ms = time_graph(stage1_graph, args.iters, device)
+    stage1_ms = time_graph(stage1_graph, args.iters, device, cache_graph)
     mega_stage1()
     barrier()
-    stage2_ms = time_graph(stage2_graph, args.iters, device)
+    stage2_ms = time_graph(stage2_graph, args.iters, device, cache_graph)
 
     rel_l2 = None
     if args.check_variant:
@@ -537,6 +641,8 @@ def main():
             candidate.float() - reference.float()
         ).norm() / reference.float().norm()
         dist.all_reduce(rel_l2, op=dist.ReduceOp.MAX)
+        if not float(rel_l2) < 0.001:
+            raise AssertionError(f"variant vs default relL2={float(rel_l2)}")
 
     if args.profile_dir:
         if mori_graph is not None:
@@ -572,6 +678,10 @@ def main():
     if rank == 0:
         print(f"[ROUTES] per-destination-rank={route_counts.tolist()}", flush=True)
         print(
+            f"[RECEIVED] unique_tokens={received_tokens.tolist()} max_tokens={int(received_tokens.max())}",
+            flush=True,
+        )
+        print(
             f"[EXPERTS] active={(expert_counts > 0).sum().item()} max_routes={expert_counts.max().item()} "
             f"mean_routes={expert_counts.float().mean().item():.1f}",
             flush=True,
@@ -588,7 +698,8 @@ def main():
             f"mori_e2e={mori_ms[0]:.4f}/{mori_ms[1]:.4f}ms "
             f"mega_e2e={mega_ms[0]:.4f}/{mega_ms[1]:.4f}ms speedup={speedup:.2f}% "
             f"stage1={stage1_ms[0]:.4f}/{stage1_ms[1]:.4f}ms "
-            f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms rank-mean/max",
+            f"stage2_combine={stage2_ms[0]:.4f}/{stage2_ms[1]:.4f}ms "
+            f"cold_cache_mb={args.cold_cache_mb} median-rank-mean/max",
             flush=True,
         )
         if guard_floor is not None:

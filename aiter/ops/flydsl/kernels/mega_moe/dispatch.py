@@ -575,7 +575,7 @@ def emit_direct_fixed_slot_finalize(
     *, fz_npes, fz_epr, fz_cap, fz_mtpr, fz_rank, fz_tile_m, n_tiles, addr_disp, parity, expected
 ):
     """Finalize local fixed slots as soon as every source publishes this destination."""
-    assert 0 < fz_epr <= 64, "direct fixed-slot finalize requires 1..64 experts per rank"
+    assert 0 < fz_epr <= 256
     dispatch_table = ptr_buf_tensor(addr_disp, fx.Int64)
 
     def dp(i):
@@ -612,23 +612,27 @@ def emit_direct_fixed_slot_finalize(
             comm_ops.wait_i32_until_equals(a_source_done + fx.Int64(done_index) * fx.Int64(4), expected)
         comm_ops.fence_system_acquire()
 
-        valid_expert = lane < fx.Int32(fz_epr)
-        safe_expert = valid_expert.select(lane, fx.Int32(0))
-        count = running[safe_expert]
-        count = valid_expert.select(count, fx.Int32(0))
-        overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
-        overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
-        overflow_count = fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, fz_epr - 1))
-        no_overflow = overflow_count == fx.Int32(0)
-        safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
-        num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
-        max_expert_tiles = _wave_reduce_max_i32(num_expert_tiles, lane)
-        inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
-        metadata_base = inclusive_tiles - num_expert_tiles
-        total_tiles = fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, fz_epr - 1))
+        total_tiles = fx.Int32(0)
+        overflow_count = fx.Int32(0)
+        max_expert_tiles = fx.Int32(0)
+        for chunk in range_constexpr((fz_epr + 63) // 64):
+            expert = lane + fx.Int32(chunk * 64)
+            valid_expert = expert < fx.Int32(fz_epr)
+            safe_expert = valid_expert.select(expert, fx.Int32(0))
+            count = valid_expert.select(running[safe_expert], fx.Int32(0))
+            overflow_flag = (count > fx.Int32(fz_cap)).select(fx.Int32(1), fx.Int32(0))
+            overflow_prefix = _wave_inclusive_scan_i32(overflow_flag, lane)
+            last_lane = min(63, fz_epr - chunk * 64 - 1)
+            overflow_count += fx.Int32(fx.rocdl.readlane(T.i32, overflow_prefix, last_lane))
+            safe_count = (count <= fx.Int32(fz_cap)).select(count, fx.Int32(0))
+            num_expert_tiles = (safe_count + fx.Int32(fz_tile_m - 1)) // fx.Int32(fz_tile_m)
+            chunk_max = _wave_reduce_max_i32(num_expert_tiles, lane)
+            max_expert_tiles = (chunk_max > max_expert_tiles).select(chunk_max, max_expert_tiles)
+            inclusive_tiles = _wave_inclusive_scan_i32(num_expert_tiles, lane)
+            metadata_base = total_tiles + inclusive_tiles - num_expert_tiles
+            total_tiles += fx.Int32(fx.rocdl.readlane(T.i32, inclusive_tiles, last_lane))
 
-        if valid_expert:
-            if no_overflow:
+            if valid_expert:
                 global_expert = fx.Int32(fz_rank * fz_epr) + safe_expert
                 payload_base = safe_expert * fx.Int32(fz_cap)
                 for tile in range(fx.Int32(0), num_expert_tiles, 1):
@@ -646,10 +650,9 @@ def emit_direct_fixed_slot_finalize(
                         fz_npes * fz_mtpr
                     )
                 expert_tile_end[safe_expert] = metadata_base + num_expert_tiles
-            else:
-                expert_tile_end[safe_expert] = fx.Int32(0)
-            running[safe_expert] = fx.Int32(0)
+                running[safe_expert] = fx.Int32(0)
 
+        no_overflow = overflow_count == fx.Int32(0)
         if lane == fx.Int32(0):
             num_valid = no_overflow.select(total_tiles * fx.Int32(fz_tile_m), fx.Int32(0))
             ready_work = no_overflow.select(total_tiles * fx.Int32(n_tiles), fx.Int32(0))

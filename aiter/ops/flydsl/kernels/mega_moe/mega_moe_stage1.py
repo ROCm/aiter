@@ -59,8 +59,9 @@ def _validate_fixed_slot_geometry(
     if tile_m <= 0 or max_tokens_per_rank <= 0:
         raise ValueError("fixed-slot requires positive tile and token capacities")
     required_cap = ((npes * max_tokens_per_rank + tile_m - 1) // tile_m) * tile_m
-    if npes != 8 or experts_per_rank != 48 or cap != required_cap:
-        raise ValueError("fixed-slot dispatch requires the direct EP8/EPR48 layout")
+    supported = (npes, experts_per_rank) in ((8, 48), (2, 192), (4, 96))
+    if not supported or cap != required_cap:
+        raise ValueError("unsupported fixed-slot EP geometry or capacity")
 
 
 def _validate_dispatch_capacity(
@@ -100,6 +101,7 @@ def compile_mega_moe_stage1(
     work_shards: int | None = None, payload_chunk_rows: int = 0,
     tile_state_stride: int = 0,
     swiglu_limit: float = 0.0,
+    pair_k: bool = False,
     _return_kernel_spec: bool = False,
 ):
     arch = str(get_rocm_arch() or "")
@@ -148,7 +150,7 @@ def compile_mega_moe_stage1(
     assert launch_grid_x <= num_cu * 33 + 1
     M_REPEAT = sort_block_m // 16
     NUM_ACC_N = n_per_wave // 16
-    assert NUM_ACC_N % 2 == 0 and M_REPEAT % 2 == 0
+    assert NUM_ACC_N % 2 == 0 and sort_block_m in (16, 32, 64, 128)
 
     TILE_K_BYTES = tile_k // 2
     assert TILE_K_BYTES % 128 == 0
@@ -222,7 +224,9 @@ def compile_mega_moe_stage1(
     FAST_COPY = compact_dispatch and envs.AITER_MEGA_DISPATCH_FAST_COPY
     # Paired GEMM1 K loop for fixed-slot tiles with LDS-DMA A copies; compact
     # prefill is slower with it (its 8-wave tiles already hide the latency).
-    PAIR_K = fixed_slot_dispatch and async_a_copy and envs.AITER_MEGA_S1_FIXED_KPAIR
+    PAIR_K = async_a_copy and (
+        pair_k or (fixed_slot_dispatch and envs.AITER_MEGA_S1_FIXED_KPAIR)
+    )
     EPI_EVEC = envs.AITER_MEGA_S1_EPI_EVEC
     dispatch_path = "fixedslot" if fixed_slot_dispatch else "compact"
     swiglu_suffix = "" if swiglu_limit <= 0 else f"_sl{str(float(swiglu_limit)).replace('.', 'p')}"
@@ -728,6 +732,7 @@ def compile_mega_moe_stage1_bundle(
             payload_chunk_rows=config.payload_chunk_rows,
             tile_state_stride=tile_state_stride,
             swiglu_limit=swiglu_limit,
+            pair_k=config.pair_k,
             _return_kernel_spec=True,
         )
         for config in variants
@@ -813,7 +818,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
     use_tile_resource=True, waves_per_eu_hint=2,
     b_nt=-1, work_shards=None,
     payload_chunk_rows=0, tile_state_stride=0,
-    swiglu_limit=0.0):
+    swiglu_limit=0.0, pair_k=False):
     launch = compile_mega_moe_stage1(
         model_dim=model_dim, inter_dim=inter_dim, rank=rank, experts_per_rank=experts_per_rank,
         fuse_npes=fuse_npes, fuse_topk=fuse_topk, fuse_cap=fuse_cap, fuse_mtpr=fuse_mtpr,
@@ -825,6 +830,7 @@ def run_mega_moe_stage1(out, x, w, scale_x, scale_w, sorted_token_ids, expert_id
         b_nt=b_nt, work_shards=work_shards, payload_chunk_rows=payload_chunk_rows,
         tile_state_stride=tile_state_stride,
         swiglu_limit=swiglu_limit,
+        pair_k=pair_k,
     )
     _run_compiled(
         launch, out, x, w, scale_x, scale_w, sorted_token_ids, expert_ids, num_valid_ids, out_scale,

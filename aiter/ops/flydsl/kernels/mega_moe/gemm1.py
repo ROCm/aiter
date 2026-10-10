@@ -38,7 +38,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
-    NUM_A_SCALE = M_REPEAT // _PACK
+    NUM_A_SCALE = (M_REPEAT + _PACK - 1) // _PACK
     B_STATE_END = (
         N_ACC + NUM_ACC_N * _PACK
     )
@@ -378,7 +378,7 @@ def compile_gemm1(
     n_tiles = (2 * inter_dim) // tile_n
     m_repeat = sort_block_m // 16
     num_acc_n = n_per_wave // 16
-    assert num_acc_n % 2 == 0 and m_repeat % 2 == 0
+    assert num_acc_n % 2 == 0 and sort_block_m in (16, 32, 64, 128)
 
     a_k_step_bytes = tile_k
     k_iters = model_dim // tile_k

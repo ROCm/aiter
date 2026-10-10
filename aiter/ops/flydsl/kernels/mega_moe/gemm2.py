@@ -186,6 +186,7 @@ def gemm2_compute_v2(
     explicit_m_row=None,
     explicit_n_block=None,
     explicit_expert=None,
+    dense_bm16_scales=False,
 ):
     """Run GEMM2, optionally using an explicitly selected expert row/tile."""
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
@@ -324,7 +325,9 @@ def gemm2_compute_v2(
 
     asc_per_mb = fx.Int32(kScaleSubBlocks) * kAS_per_chunk_dw * fx.Int32(4)
     asc_num = fx.Int64(i32_max_m_blocks) * fx.Int64(asc_per_mb)
-    scale_chunk0 = m_block_idx if const_expr(is_bm16) else m_row // 32
+    scale_chunk0 = (
+        m_block_idx if const_expr(is_bm16 and not dense_bm16_scales) else m_row // 32
+    )
 
     def make_ascale_view(sub):
         base_dw = (scale_chunk0 + fx.Int32(sub)) * kAS_per_chunk_dw
@@ -355,7 +358,12 @@ def gemm2_compute_v2(
                 ascale_views[sub][lane_div_16, lane_mod_16, chunk_kt, None],
                 saf,
             )
-            out.append(Vec(saf.load())[0])
+            scale_word = Vec(saf.load())[0]
+            if const_expr(is_bm16 and dense_bm16_scales):
+                scale_word = scale_word.shrui(
+                    ((m_row // fx.Int32(16)) & fx.Int32(1)) * fx.Int32(8)
+                )
+            out.append(scale_word)
         return out
 
     # Stream B weights and scales through registers so use_nt reaches the ISA cache policy.
