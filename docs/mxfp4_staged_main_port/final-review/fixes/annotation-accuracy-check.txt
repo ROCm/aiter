@@ -1,0 +1,3 @@
+PASS: 8 accuracy corrections retain identical executable AST against ff4e6db25; no runtime imports or GPU behavior changed.
+Audited actual text-vs-path calls, out-buffer wrapper returns, all new pytest parameter tables, process payload tuple shapes, absent comparison records, and attempted-row collection values.
+Environment fixture strings use str/None; direct G1/reduce/scatter capture returns use None; cancellation uses BaseException.

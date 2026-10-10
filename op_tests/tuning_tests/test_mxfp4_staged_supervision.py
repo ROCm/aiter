@@ -344,7 +344,7 @@ def test_unexpected_receive_and_deserialization_failure_clean_owned_workers(
     "failure", [KeyboardInterrupt("parent cancelled"), RuntimeError("wait failed")]
 )
 def test_parent_cancellation_or_wait_failure_stops_launches_and_preserves_exception(
-    monkeypatch: "pytest.MonkeyPatch", failure: "Exception | str"
+    monkeypatch: "pytest.MonkeyPatch", failure: "BaseException"
 ) -> "None":
     base = _GET_CONTEXT("spawn")
     ctx = TrackingContext(base)
@@ -398,7 +398,7 @@ def test_staged_scheduler_preserves_main_mp_cap_and_uses_preflighted_first_visib
     mp: "int",
     shape_count: "int",
     gpu_count: "int",
-    expected: "object",
+    expected: "int",
 ) -> "None":
     identities = [("gfx950", 256)] * expected + [("gfx942", 304)] * (
         gpu_count - expected
@@ -408,7 +408,9 @@ def test_staged_scheduler_preserves_main_mp_cap_and_uses_preflighted_first_visib
         observed = []
 
         def schedule(
-            batch: "list[dict[str, object]]", slots: "int", ctx: "BaseContext"
+            batch: "list[tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]]",
+            slots: "int",
+            ctx: "BaseContext",
         ) -> "list[dict[str, object]]":
             observed.append((slots, len(batch)))
             return [dict(row, us=3.0) for _, row, _, _ in batch]
@@ -430,7 +432,9 @@ def test_staged_single_slot_uses_first_visible_gpu_and_empty_batch_never_schedul
         launches = []
 
         def schedule(
-            batch: "list[dict[str, object]]", slots: "int", ctx: "BaseContext"
+            batch: "list[tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]]",
+            slots: "int",
+            ctx: "BaseContext",
         ) -> "list[dict[str, object]]":
             launches.append(slots)
             return [

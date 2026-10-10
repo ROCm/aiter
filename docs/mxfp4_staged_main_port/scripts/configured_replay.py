@@ -177,7 +177,7 @@ def main() -> "None":
         topk: "int",
         hidden: "int",
         **kwargs: "object",
-    ) -> "torch.Tensor":
+    ) -> "None":
         fp8 = kwargs["is_fp8"]
         assert kwargs["topk_weights"] is (data["topk_weights"] if fp8 else None)
         operations.append(
@@ -191,7 +191,7 @@ def main() -> "None":
         )
         return reduction(target, out, token, topk, hidden, **kwargs)
 
-    def capture_quantized_scatter(**kwargs: "object") -> "torch.Tensor":
+    def capture_quantized_scatter(**kwargs: "object") -> "None":
         operations.append(
             {
                 "op": "final-fp4-scatter",
@@ -201,7 +201,7 @@ def main() -> "None":
         )
         return quantized_scatter(**kwargs)
 
-    def capture_g1(**kwargs: "object") -> "tuple[torch.Tensor, torch.Tensor]":
+    def capture_g1(**kwargs: "object") -> "None":
         for key in (
             "BM",
             "BN",

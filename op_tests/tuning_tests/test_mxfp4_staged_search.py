@@ -83,7 +83,7 @@ def test_cli_rejects_explicit_screening_topk_without_explicit_staged(
 
 @pytest.mark.parametrize("screen_topk", ["0", "-1", "2.5"])
 def test_cli_rejects_nonpositive_or_noninteger_screening_topk(
-    monkeypatch: "pytest.MonkeyPatch", screen_topk: "int"
+    monkeypatch: "pytest.MonkeyPatch", screen_topk: "str"
 ) -> "None":
     with pytest.raises(SystemExit) as failure:
         parse_cli(
@@ -565,7 +565,7 @@ def test_staged_reference_retries_only_remaining_admitted_candidates(
 
 @pytest.mark.parametrize("failure", ["consumer", "producer", "g1", "g2"])
 def test_staged_exhausts_admitted_pairs_after_independent_fixture_failure(
-    monkeypatch: "pytest.MonkeyPatch", failure: "Exception | str"
+    monkeypatch: "pytest.MonkeyPatch", failure: "str"
 ) -> "None":
     state = controlled_search(monkeypatch)
     if failure == "consumer":
