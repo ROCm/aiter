@@ -232,6 +232,8 @@ in lowercase (`mhc_fused_sinkhorn`).
 When an arch has no file for a family, copy the file from the nearest
 measured arch. The copy must be byte identical. Say it in the commit message.
 The allowed seeds are gfx950 → gfx1250 and gfx1151 → gfx1150, Triton only.
+The seed from gfx1101 to gfx1200 and gfx1201 is also allowed, for Triton MHA
+only.
 Never seed a Gluon folder. Never seed into gfx950. Replace seeds with
 measured values.
 
