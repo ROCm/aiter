@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any
+from typing import Any, TypeVar
 
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
@@ -62,6 +63,58 @@ class GEMM1StageCandidate:
 class GEMM2StageCandidate:
     identity: GEMM2ExecutionIdentity
     original_order: int
+
+
+StageCandidate = TypeVar("StageCandidate", GEMM1StageCandidate, GEMM2StageCandidate)
+
+
+def screening_shortlist(
+    scores: Iterable[tuple[StageCandidate, float]], screen_topk: int
+) -> tuple[StageCandidate, ...]:
+    """Keep finite positive scores, breaking ties by admitted candidate order."""
+    successful = [
+        (candidate, us) for candidate, us in scores if math.isfinite(us) and us > 0
+    ]
+    successful.sort(key=lambda result: (result[1], result[0].original_order))
+    return tuple(candidate for candidate, _ in successful[:screen_topk])
+
+
+def select_reference_producer(
+    candidates: tuple[GEMM1StageCandidate, ...],
+) -> GEMM1StageCandidate:
+    def preference(candidate: GEMM1StageCandidate) -> tuple[bool, int]:
+        cfg = _parse_mxfp4_g1_kname(candidate.identity.kernel_name)
+        preferred = (
+            cfg["BN"] == 128
+            and cfg["BK"] == 256
+            and cfg["num_waves"] == 4
+            and cfg["k_wave"] == 1
+            and not cfg["prefetch_hidden"]
+            and not cfg["xcd_swizzle"]
+            and cfg["use_nt"] == (cfg["BM"] == 16)
+        )
+        return not preferred, candidate.original_order
+
+    return min(candidates, key=preference)
+
+
+def reference_consumer_order(
+    candidates: tuple[GEMM2StageCandidate, ...],
+) -> tuple[GEMM2StageCandidate, ...]:
+    consumers = []
+    for candidate in candidates:
+        cfg = parse_flydsl_v2_gemm2_kernel(candidate.identity.kernel_name)
+        if cfg is None or cfg["epilog"] != "atomic":
+            continue
+        preferred = (
+            cfg["tile_n"] == 128
+            and cfg["tile_k"] == 128
+            and not cfg["persist"]
+            and not cfg["use_nt"]
+        )
+        consumers.append((not preferred, candidate.original_order, candidate))
+    consumers.sort(key=lambda item: item[:2])
+    return tuple(candidate for _, _, candidate in consumers)
 
 
 @dataclass(frozen=True)

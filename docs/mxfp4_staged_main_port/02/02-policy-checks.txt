@@ -1,0 +1,28 @@
+........................................................................ [ 62%]
+...........................................                              [100%]
+=============================== warnings summary ===============================
+aiter/ops/triton/gluon/__init__.py:16
+  /root/workspace/tmp_dev/aiter-mxfp4-02/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+    warnings.warn(
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_all_preserves_gate_metadata_through_winner_summary[False]
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_supported_mixed_cu_runtime_rows_finish_summary
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_unused_gpu0_does_not_reject_single_slot_current_supported_gpu[False]
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_unused_gpu0_does_not_reject_single_slot_current_supported_gpu[True]
+  /root/workspace/tmp_dev/aiter-mxfp4-02/aiter/utility/base_tuner.py:487: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    df_old = pd.concat([df_old, unmatched_rows], ignore_index=True)
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py: 20 warnings
+  /root/workspace/tmp_dev/aiter-mxfp4-02/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:7411: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    self.success = pd.concat([self.success, valid], ignore_index=True)
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py: 11 warnings
+  /root/workspace/tmp_dev/aiter-mxfp4-02/aiter/utility/base_tuner.py:587: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    tunedf = pd.concat([self.success, self.failed])
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py: 10 warnings
+  /root/workspace/tmp_dev/aiter-mxfp4-02/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:7412: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    self.failed = pd.concat([self.failed, invalid], ignore_index=True)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+115 passed, 46 warnings in 4.06s
