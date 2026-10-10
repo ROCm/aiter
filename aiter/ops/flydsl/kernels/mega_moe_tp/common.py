@@ -201,9 +201,12 @@ def bst(val, rs, voff, soff, aux=0):
 # LDS-DMA (buffer_load ... lds, M0 = LDS base): the async form, so the compiler's
 # waitcnt pass does not wait on it; waits are explicit (wait_vm).
 def _dma(lds_addr, rs, voff, soff, nbytes, aux):
+    lds_ptr = fx.to_llvm_ptr(
+        fx.inttoptr(fx.PointerType.get(T.i8, fx.AddressSpace.Shared), uni(lds_addr))
+    )
     _rocdl.raw_ptr_buffer_load_async_lds(
         rs,
-        _llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<3>"), _u(uni(lds_addr))).result,
+        lds_ptr,
         _u(i32(nbytes)),
         _u(i32(voff)),
         _u(uni(soff)),
