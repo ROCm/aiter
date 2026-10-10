@@ -408,7 +408,7 @@ def test_staged_scheduler_preserves_main_mp_cap_and_uses_preflighted_first_visib
         observed = []
 
         def schedule(
-            batch: "list[tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]]",
+            batch: "list[tuple[list[str], dict[str, object], SimpleNamespace, None]]",
             slots: "int",
             ctx: "BaseContext",
         ) -> "list[dict[str, object]]":
@@ -432,7 +432,7 @@ def test_staged_single_slot_uses_first_visible_gpu_and_empty_batch_never_schedul
         launches = []
 
         def schedule(
-            batch: "list[tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]]",
+            batch: "list[tuple[list[str], dict[str, object], SimpleNamespace, None]]",
             slots: "int",
             ctx: "BaseContext",
         ) -> "list[dict[str, object]]":
