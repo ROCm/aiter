@@ -677,7 +677,7 @@ def test_pa_mqa_logits_fp4_page8(
     lag = torch.arange(next_n - 1, -1, -1, dtype=torch.int32, device=dev)
     row_ends = (context_lens[:, None] - lag).reshape(-1)
 
-    def launch():
+    def launch(out=out, out_offsets=None):
         flydsl_pa_mqa_logits_fp4(
             q_packed,
             pack_q_scales(q_e8m0),
@@ -693,6 +693,7 @@ def test_pa_mqa_logits_fp4_page8(
             query_start_loc=query_start_loc,
             max_query_len=next_n,
             out=out,
+            out_offsets=out_offsets,
         )
 
     launch()
@@ -711,6 +712,26 @@ def test_pa_mqa_logits_fp4_page8(
     # same fp4 operands, fp32 accumulation: only the summation order differs
     assert max_err < 1e-3 * want.abs().max().item(), max_err
     assert tail_ok, "columns past a row's context were written"
+    _check_page8_packed(launch, out, row_ends)
+
+
+def _check_page8_packed(launch, plane, row_ends):
+    """The same launch into a flat buffer, each row at its own 64-element
+    aligned start (out_offsets): bit for bit the plane's row, nothing written
+    between rows."""
+    lens = row_ends.clamp(min=0)
+    spans = (lens + 63) // 64 * 64
+    starts = (torch.cumsum(spans, 0) - spans).to(torch.int32)
+    sentinel = 7.0
+    flat = torch.full((int(spans.sum()) + 64,), sentinel, device=dev)
+    launch(out=flat, out_offsets=starts)
+    torch.cuda.synchronize()
+    written = torch.zeros_like(flat, dtype=torch.bool)
+    for row, (start, length) in enumerate(zip(starts.tolist(), lens.tolist())):
+        span = flat[start : start + length]
+        assert torch.equal(span, plane[row, :length]), f"packed row {row} differs"
+        written[start : start + length] = True
+    assert bool((flat[~written] == sentinel).all()), "packed rows wrote past their span"
 
 
 def _print_perf_summary():

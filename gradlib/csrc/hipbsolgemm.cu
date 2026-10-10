@@ -13,6 +13,34 @@
 #include "aiter_hip_common.h"  // HipDeviceGuard, get_gpu_arch
 #include "rocm_ops.hpp"        // pybind11 + namespace py + aiter_tensor_t caster
 #include <array>
+#include <fcntl.h>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <io.h>
+#include <windows.h>
+
+#define LOCK_EX 2
+#define LOCK_UN 8
+
+// No flock() on Windows.
+static int flock(int fd, int operation)
+{
+    HANDLE h = reinterpret_cast<HANDLE>(_get_osfhandle(fd));
+    OVERLAPPED ov{};
+    BOOL ok = operation == LOCK_EX
+                  ? LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &ov)
+                  : UnlockFileEx(h, 0, MAXDWORD, MAXDWORD, &ov);
+    return ok ? 0 : -1;
+}
+#else
+#include <sys/file.h>
+#include <unistd.h>
+#endif
 
 // #include <rocblas/rocblas.h>
 
