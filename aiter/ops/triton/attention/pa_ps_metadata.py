@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import torch
 import triton
 
+from aiter.ops.attention import get_pa_metadata_info_v1
 from aiter.ops.triton._triton_kernels.attention.pa_ps_metadata import (
     _pa_ps_chunk_scan,
     _pa_ps_schedule,
@@ -21,6 +22,8 @@ class PaPsMetadataPlan:
     tile_totals[chunks], sequence_info[batch, 5], and chunk_prefix[chunks, 3],
     where chunks = ceil(batch / scan_block_size). Allocate all tensors on
     the input GPU before capture; their lifetime and reuse belong to the caller.
+    work_info, reduce_final_map, and reduce_partial_map may have extra leading
+    capacity. Other tensors must use the exact shapes above.
     """
 
     work_metadata_ptrs: torch.Tensor
@@ -70,7 +73,8 @@ def plan_pa_ps_metadata(
     Returns the supplied plan. The integration layer allocates its buffers,
     loads the launch configuration, and owns reuse and graph capture. Every
     call fills the plan on the input device's current stream without allocation
-    or device-to-host reads. Refresh after changing lengths or indptrs.
+    or device-to-host reads. Tensor layouts and capacities are checked before
+    any kernel launch. Refresh after changing lengths or indptrs.
     No-split records retain partial_qo_loc=-1. This is an opt-in scheduling
     policy, not a replacement for get_pa_metadata_v1.
     """
@@ -109,12 +113,21 @@ def plan_pa_ps_metadata(
         not isinstance(work_overhead, int) or not 1 <= work_overhead <= 1024
     ):
         raise ValueError("work_overhead must be an integer in [1, 1024]")
+    if not isinstance(plan.work_overhead, int) or not 1 <= plan.work_overhead <= 1024:
+        raise ValueError("plan.work_overhead must be an integer in [1, 1024]")
+    for name in ("scan_block_size", "num_warps"):
+        value = getattr(plan, name)
+        if (
+            not isinstance(value, int)
+            or isinstance(value, bool)
+            or value <= 0
+            or value & (value - 1)
+        ):
+            raise ValueError(f"plan.{name} must be a positive power-of-two integer")
 
     with torch.cuda.device(device):
         if (
-            plan.sequence_info.shape != (batch, 5)
-            or plan.sequence_info.device != device
-            or plan.num_heads_per_head_k != num_heads_per_head_k
+            plan.num_heads_per_head_k != num_heads_per_head_k
             or plan.num_heads_k != num_heads_k
             or plan.max_qlen != max_qlen
             or plan.block_size != block_size
@@ -122,12 +135,60 @@ def plan_pa_ps_metadata(
             or (work_overhead is not None and plan.work_overhead != work_overhead)
         ):
             raise ValueError("reused plan does not match the input geometry or policy")
-        num_cu = plan.work_indptr.numel() - 1
+        metadata_specs = get_pa_metadata_info_v1(batch, num_heads_k)
+        num_cu = metadata_specs[1][0] - 1
         if num_cu % num_heads_k:
             raise ValueError("KV head count must divide the persistent TG count")
+        chunks = triton.cdiv(batch, plan.scan_block_size)
+        buffer_specs = tuple(
+            zip(
+                (
+                    "work_metadata_ptrs",
+                    "work_indptr",
+                    "work_info",
+                    "reduce_indptr",
+                    "reduce_final_map",
+                    "reduce_partial_map",
+                ),
+                metadata_specs,
+            )
+        ) + (
+            ("tile_prefix", ((batch,), torch.int64)),
+            ("tile_totals", ((chunks,), torch.int64)),
+            ("sequence_info", ((batch, 5), torch.int64)),
+            ("chunk_prefix", ((chunks, 3), torch.int64)),
+        )
+        for name, (shape, dtype) in buffer_specs:
+            tensor = getattr(plan, name)
+            if not isinstance(tensor, torch.Tensor):
+                raise TypeError(f"plan.{name} must be a torch.Tensor")
+            if (
+                tensor.device != device
+                or tensor.dtype != dtype
+                or not tensor.is_contiguous()
+            ):
+                raise ValueError(
+                    f"plan.{name} must be contiguous {dtype} on the input GPU"
+                )
+            expected_shape = (shape,) if isinstance(shape, int) else shape
+            allow_extra = name in (
+                "work_info",
+                "reduce_final_map",
+                "reduce_partial_map",
+            )
+            if (
+                tensor.ndim != len(expected_shape)
+                or tensor.shape[1:] != expected_shape[1:]
+                or tensor.shape[0] < expected_shape[0]
+                or (not allow_extra and tensor.shape[0] != expected_shape[0])
+            ):
+                capacity = "at least " if allow_extra else ""
+                raise ValueError(
+                    f"plan.{name} requires shape {capacity}{expected_shape}, "
+                    f"got {tuple(tensor.shape)}"
+                )
         groups = num_cu // num_heads_k
         max_parts = min(max_partitions, groups)
-        chunks = plan.tile_totals.numel()
         block_chunks = triton.next_power_of_2(chunks)
         if chunks > 1:
             _pa_ps_tile_scan[(chunks,)](
