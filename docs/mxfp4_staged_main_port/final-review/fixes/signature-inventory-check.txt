@@ -1,0 +1,2 @@
+PASS: all309 original inventory function identities annotated; removed duplicate fingerprints are supplied by the annotated shared helper.
+No untouched legacy signatures were required by this check.
