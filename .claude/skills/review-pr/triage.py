@@ -1302,10 +1302,10 @@ def derive(files, title="", raw_diff=""):
         for p, f in files.items()
     ):
         hit(
-            "modified-kernel", "A1 B2 D1 D8 P6"
+            "modified-kernel", "A1 A4 B2 D1 D8 P6"
         )  # D9 is scanner-backed, not read as prose
     if re.search(r"tl\.constexpr", add) or re.search(r"['\"]gfx\d+['\"]", add):
-        hit("new-routing-value", "B4 C4")
+        hit("new-routing-value", "A4 B4 C4")
     if any(
         p.endswith((".csv", ".yaml", ".yml"))
         or (p.endswith(".json") and ("config" in p or "tuned" in p))

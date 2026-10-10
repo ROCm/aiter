@@ -41,6 +41,15 @@ New dispatch condition (e.g., `if is_deepseek():`) enables a kernel for more arc
 Real example (vLLM#16435): FusedMoE activated for wrong model families → follow-up restrict PR needed.
 → `⚠️ A3: activation condition [X] enables more than validated scope [Y]`
 
+**A4 — New feature branch in existing kernel without regression test** ⚠️/🔴
+A PR adds a new dispatch branch (new activation type, new dtype, new quant path) to an existing kernel but does not test that existing operators' correctness and performance are preserved. Adding a branch often touches shared code: widening a template condition, narrowing a guard, refactoring a shared lambda, changing a scale computation. These side-effects can silently regress every pre-existing path.
+Trigger: the diff adds a new `if/elif/else` branch or a new template specialization to an existing kernel, and the new branch shares code (constants, scale logic, store paths, bias conditions) with pre-existing branches.
+What to check: (1) every shared constant or condition the PR changes — does the change preserve the old value for old inputs? (2) are existing paths tested in the PR's test plan, or only the new path? (3) for perf-sensitive kernels, is there a before/after benchmark on old paths?
+Severity: 🔴 if a shared constant or condition provably changes behavior for existing inputs (wrong scale, skipped reciprocal, dropped bias). ⚠️ if the shared path change is theoretically safe but untested on old inputs.
+FP self-check: a new branch that is fully gated by `if constexpr(NewFeature)` and touches no shared code is exempt — it cannot affect old paths. Only fire when the diff modifies code that old paths also execute.
+Real examples: PR#5708 narrowed `enable_bias` from `_needs_swiglu_bias_support()` to `activation == Swiglu && _needs_swiglu_bias_support()` — could have regressed Situv2 bias on Opus/FlyDSL paths (analyzed as safe, but not tested). PR#5985 widened `kStoreTakesDivisor` to include `fp16_t` — broke the reciprocal scale on gfx942 fp16 MXFP8 quant (scale_err=55/56 groups), because the software convert path expected the reciprocal but received the raw divisor.
+→ `🔴/⚠️ A4: new [feature] branch added to [kernel] — shared [code/constant] changed, verify existing [paths] are not regressed`
+
 ---
 
 ### B — Silent Bypass
