@@ -431,6 +431,19 @@ def compile_fp8_gemm_8w(
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
 
+        # FIXME: this barrier is divergent and has no counterpart on the other
+        # half of the workgroup. wave_m is wave_id // 4, so waves 4-7 execute it
+        # and waves 0-3 do not; waves 0-3 reach the barrier below instead and
+        # the hardware releases the two groups together. Every later barrier is
+        # then pairing waves that are one barrier apart, which is not what any
+        # of them was written to express.
+        #
+        # Left alone here because it is not the cause of the corruption the
+        # wait count below fixes -- making it unconditional while keeping the
+        # old count still produces wrong results (3 of 6 runs on M=32768 N=7168
+        # K=1792), and with the corrected count both forms are clean. Removing
+        # the divergence is a separate change that needs its own analysis of
+        # what the prologue barriers are meant to order.
         if wave_m == 1:
             rocdl.s_barrier()
 
