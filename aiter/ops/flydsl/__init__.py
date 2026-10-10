@@ -162,6 +162,9 @@ __all__ = [
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
 register_fused_moe_impl("flydsl_gfx942", _fused_moe_impl_path)
+register_fused_moe_impl(
+    "flydsl_a4w4c", "aiter.ops.flydsl.moe_a4w4_compact:run_moe_a4w4_compact"
+)
 
 
 def __getattr__(name: str):

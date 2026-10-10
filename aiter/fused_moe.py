@@ -26,6 +26,7 @@ from aiter.fused_moe_registry import (
     BoundFusedMoeImpl,
     FusedMoeImplResolutionError,
     FusedMoeRequest,
+    make_fused_moe_impl_kernel_name,
     resolve_fused_moe_impl,
 )
 from aiter.jit.core import AITER_CONFIGS, AITER_CSRC_DIR, PY, bd_dir, mp_lock
@@ -36,6 +37,9 @@ from aiter.jit.utils.chip_info import (
     gfx_from_cu_num,
 )
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.a4w4c_kname import IMPL_NAME as A4W4C_IMPL_NAME
+from aiter.ops.flydsl.a4w4c_kname import impl_config as a4w4c_impl_config
+from aiter.ops.flydsl.a4w4c_kname import is_a4w4c_kname
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.types import Stage2ScatterContext
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
@@ -3305,13 +3309,28 @@ def get_2stage_cfgs(
         is_shuffled if opus_weights_shuffled is None else opus_weights_shuffled
     )
     try:
+        if is_a4w4c_kname(kernel_name1):
+            if inter_dim % 128 != 0 or model_dim % 256 != 0:
+                raise ValueError(
+                    f"A4W4 compact MoE needs inter_dim % 128 == 0 and "
+                    f"model_dim % 256 == 0, got {inter_dim}, {model_dim}"
+                )
+            if q_dtype_a != dtypes.fp4x2:
+                raise ValueError(
+                    f"A4W4 compact MoE needs fp4 activations, got {q_dtype_a}"
+                )
+            # Per-stage A4W4 compact names run as one whole-graph impl.
+            kernel_name1 = make_fused_moe_impl_kernel_name(
+                A4W4C_IMPL_NAME, a4w4c_impl_config(kn1, kn2)
+            )
         full_impl = (
             None if bypass_tuned_config else resolve_fused_moe_impl(kernel_name1)
         )
-    except FusedMoeImplResolutionError as error:
+    except (FusedMoeImplResolutionError, ValueError) as error:
         logger.warning(f"[fused_moe] {error}; using default heuristics.")
         cfg = None
         full_impl = None
+        kernel_name1 = ""
     if full_impl is not None and kernel_name1.startswith("impl__flydsl_"):
         unsupported = None
         if not weights_shuffled:
