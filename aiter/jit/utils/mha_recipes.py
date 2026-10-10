@@ -1,20 +1,86 @@
-def _ck_targets_flag() -> str:
-    """Return ``--targets <runtime arch>`` when the runtime GPU is not gfx9.
+def _ck_targets_flag_for_arches(gfxs: list[str]) -> str:
+    gfxs = [gfx for gfx in gfxs if gfx != "cpu"]
+    if not gfxs or all(gfx.startswith("gfx9") for gfx in gfxs):
+        return ""
+    return f" --targets {','.join(gfxs)}"
 
-    ck-tile's ``generate.py`` defaults to ``--targets gfx9,gfx950``, so any
-    non-gfx9 host (gfx10/11/12) ends up with an empty kernel set and ``mha_fwd``
-    fails at dispatch with "invalid argument for fmha_fwd". For gfx9 hosts we
-    keep the default (covers both gfx942 and gfx950 like before).
+
+def _require_ck_batch_prefill_targets(gfxs: list[str]) -> None:
+    unsupported = [gfx for gfx in gfxs if gfx != "cpu" and not gfx.startswith("gfx9")]
+    if unsupported:
+        raise RuntimeError(
+            "CK batch-prefill code generation only supports gfx9 targets; "
+            f"unsupported targets: {', '.join(unsupported)}"
+        )
+
+
+def _apply_ck_mha_prebuild_target_policy(build_args: list[dict], gfxs: list[str]):
+    targets_flag = _ck_targets_flag_for_arches(gfxs)
+    batch_prefill_supported = not any(
+        gfx != "cpu" and not gfx.startswith("gfx9") for gfx in gfxs
+    )
+    target_modules = {"module_mha_fwd", "module_mha_varlen_fwd", "libmha_fwd"}
+    adjusted = []
+
+    for build in build_args:
+        md_name = build["md_name"]
+        if md_name == "module_mha_batch_prefill" and not batch_prefill_supported:
+            continue
+        if md_name not in target_modules:
+            adjusted.append(build)
+            continue
+
+        commands = build.get("blob_gen_cmd", [])
+        if isinstance(commands, str):
+            commands = [commands]
+        commands = list(commands)
+        filtered = []
+        for command in commands:
+            parts = command.split()
+            try:
+                mode = parts[parts.index("-d") + 1]
+            except (ValueError, IndexError):
+                filtered.append(command)
+                continue
+            if mode == "batch_prefill" and not batch_prefill_supported:
+                continue
+            if (
+                mode in ("fwd", "fwd_splitkv")
+                and targets_flag
+                and "--targets" not in parts
+            ):
+                command += targets_flag
+            filtered.append(command)
+
+        adjusted_build = dict(build)
+        adjusted_build["blob_gen_cmd"] = filtered
+        if md_name == "libmha_fwd" and not batch_prefill_supported:
+            adjusted_build["srcs"] = [
+                source
+                for source in build.get("srcs", [])
+                if not source.replace("\\", "/")
+                .rstrip("'\"")
+                .endswith("/cpp_itfs/mha_fwd_batch_prefill.cu")
+            ]
+        adjusted.append(adjusted_build)
+
+    return adjusted
+
+
+def _ck_targets_flag() -> str:
+    """Select every build architecture for CK FMHA code generation.
+
+    CK's default covers gfx9 and gfx950. gfx10 targets have no FMHA factory in
+    the pinned CK generator; other targets need explicit targets. GPU_ARCHS may
+    name several architectures, which CK expects as a comma-separated list.
     """
     try:
-        from chip_info import get_gfx
+        from chip_info import get_gfx_list
 
-        gfx = get_gfx()
+        gfxs = get_gfx_list()
     except Exception:  # noqa: BLE001
         return ""
-    if gfx.startswith("gfx9"):
-        return ""
-    return f" --targets {gfx}"
+    return _ck_targets_flag_for_arches(gfxs)
 
 
 def compose_mha_fwd_variant_suffix_and_filter(

@@ -4,8 +4,6 @@ import argparse
 
 import torch
 
-from ..jit.utils.chip_info import get_gfx_runtime
-from ..ops.enum import ActivationType, QuantType
 from .aiter_types import aiter_dtypes, aiter_tensor_t
 
 defaultDtypes = {
@@ -25,7 +23,10 @@ _8bit_fallback = torch.uint8
 
 
 def get_dtype_fp8():
-    return defaultDtypes.get(get_gfx_runtime(), {"fp8": _8bit_fallback})["fp8"]
+    if torch.version.hip is None or not torch.cuda.is_available():
+        return _8bit_fallback
+    gfx = torch.cuda.get_device_properties(0).gcnArchName.split(":", 1)[0]
+    return defaultDtypes.get(gfx, {"fp8": _8bit_fallback})["fp8"]
 
 
 i4x2 = getattr(torch, "int4", _8bit_fallback)
@@ -164,6 +165,8 @@ def str2Dtype(v):
         elif s in d_dtypes:
             return d_dtypes[s]
         else:
+            from ..ops.enum import QuantType
+
             # Case-insensitive lookup for QuantType
             s_lower = s.lower()
             for name in dir(QuantType):
@@ -182,6 +185,8 @@ def str2Dtype(v):
 
 
 def str2ActivationType(s):
+    from ..ops.enum import ActivationType
+
     s = str(s)
     members = getattr(ActivationType, "__members__", None)
     if members is not None:

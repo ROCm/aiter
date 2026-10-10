@@ -315,9 +315,11 @@ if PREBUILD_KERNELS != 0:
         )
     else:
         from jit.utils.mha_recipes import (
+            _apply_ck_mha_prebuild_target_policy,
             get_mha_varlen_prebuild_variants_by_names,
         )
         from jit.utils.moe_recipes import get_moe_ck2stages_prebuild_variants
+        from jit.utils.chip_info import get_gfx_list
 
         exclude_ops = get_exclude_ops()
         all_opts_args_build, _ = core.get_args_of_build("all", exclude=exclude_ops)
@@ -373,6 +375,10 @@ if PREBUILD_KERNELS != 0:
                     }
                 )
             all_opts_args_build.extend(extra_args_build)
+
+        all_opts_args_build = _apply_ck_mha_prebuild_target_policy(
+            all_opts_args_build, get_gfx_list()
+        )
 
         bd = f"{core.get_user_jit_dir()}/build"
 
