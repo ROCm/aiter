@@ -4,7 +4,7 @@
 
 **Blocked by:** 01: Make the existing MXFP4 tuning lifecycle safe.
 
-**Status:** ready-for-agent
+**Status:** claimed
 
 - [ ] Extend the single search selector to prune/full/staged, default prune; positive explicit screening top-K is valid only with staged, default 2, distinct from routing top-k. Preserve prune/full candidate order and supervision mechanisms, with 01's all-mode MXFP4 device preflight.
 - [ ] Derive staged records only from the same M_est-pruned layout-v2 pair universe, equal sorting/G1/G2 BM. Planning executes no GPU pairs and excludes native/re-tile expansion.
