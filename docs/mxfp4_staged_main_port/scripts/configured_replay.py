@@ -111,9 +111,9 @@ def main():
     )
     from aiter.test_common import get_trace_perf
     from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
+        FmoeTuner,
         Mxfp4FlydslTuner,
         cosine_diff_compare,
-        FmoeTuner,
     )
 
     fm = importlib.import_module("aiter.fused_moe")

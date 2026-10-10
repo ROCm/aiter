@@ -40,13 +40,13 @@ def test_finalize_exited_search_records_complete_evidence_without_gpu_launch(tmp
     artifact.mkdir(parents=True)
     (artifact / "task.json").write_text(
         json.dumps(
-            dict(
-                process_start_utc="2026-10-10T00:00:00+00:00",
-                process_exit_utc="2026-10-10T00:00:03+00:00",
-                exit_code=0,
-                implementation_commit="abc",
-                environment={},
-            )
+            {
+                "process_start_utc": "2026-10-10T00:00:00+00:00",
+                "process_exit_utc": "2026-10-10T00:00:03+00:00",
+                "exit_code": 0,
+                "implementation_commit": "abc",
+                "environment": {},
+            }
         )
     )
     (artifact / "console.log.txt").write_text(
@@ -55,7 +55,7 @@ def test_finalize_exited_search_records_complete_evidence_without_gpu_launch(tmp
     )
     (job_dir / "winner.csv").write_text("us,kernelName1,kernelName2\n10.0,g1,g2\n")
     result = driver.finalize_search(
-        dict(id="case", mode="prune"), job_dir, dict(total_pairs=1)
+        {"id": "case", "mode": "prune"}, job_dir, {"total_pairs": 1}
     )
     assert result["outcome"] == "valid" and result["validation_attempts"] == 1
     assert (
