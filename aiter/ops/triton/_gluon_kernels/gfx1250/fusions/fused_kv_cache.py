@@ -419,7 +419,15 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
     OUTPUT_Q_NOPE_ZEROS_AND_Q_PE: gl.constexpr = False,
     HAVE_K_SCALE: gl.constexpr = False,
     UPCAST_OPERAND: gl.constexpr = False,
+    APPLY_ROPE: gl.constexpr = True,
 ):
+    # Accepted only to keep the signature aligned with the Triton kernel; the
+    # TDM cos/sin staging below has no NoPE variant.
+    # TODO: Support APPLY_ROPE=False (NoPE layers) on gfx1250. Skip the cos/sin
+    # TDM loads and rotation and pass q_pe/k_pe through unchanged, as the
+    # Triton kernel does.
+    tl.static_assert(APPLY_ROPE, "gluon MLA cat+cache kernel requires rope")
+
     # 1-warp (wave32) blocked layouts matching the Triton-generated ttgir.
     L_NOPE: gl.constexpr = gl.BlockedLayout(
         size_per_thread=[8], threads_per_warp=[32], warps_per_cta=[1], order=[0]
@@ -632,7 +640,9 @@ def _fused_qk_rope_cat_and_cache_mla_kernel(
         # decode_q_pe on TDM async_store — those alternatives lower per-WGP
         # SIMD-instruction count but degrade IPC enough that wall-clock
         # dispatch time grows.
-        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE and pid < num_decode_toks_for_zeros * QH:
+        # Gate on the token, not the pid: with the head-major mapping above,
+        # pid < num_decode_toks_for_zeros * QH covers every pid_b in [0, B).
+        if OUTPUT_Q_NOPE_ZEROS_AND_Q_PE and pid_b < num_decode_toks_for_zeros:
             decode_q_pe_base = (
                 pid_b * decode_q_pe_out_stride_b + pid_hq * decode_q_pe_out_stride_h
             )
