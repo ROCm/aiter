@@ -1,3 +1,5 @@
+import itertools
+
 import pytest
 import torch
 
@@ -178,6 +180,16 @@ def rms_norm(x, w, eps):
     return x
 
 
+def rounded_neox_rope(x, cos, sin, positions):
+    """RoPE with each BF16 product rounded before the final sum."""
+    x1, x2 = x.chunk(2, dim=-1)
+    c = cos[positions].reshape(-1, 1, x1.shape[-1])
+    s = sin[positions].reshape(-1, 1, x1.shape[-1])
+    first = (x1 * c).float() - (x2 * s).float()
+    second = (x2 * c).float() + (x1 * s).float()
+    return torch.cat((first, second), dim=-1).to(x.dtype)
+
+
 def run_torch_with_cache(
     qkv,
     q_weight,
@@ -197,6 +209,10 @@ def run_torch_with_cache(
     v_scale,
     qkv_layout: str = "interleaved",
     cache_layout: str = "HND",
+    q_scale: float = 1.0,
+    cos=None,
+    sin=None,
+    positions=None,
 ):
     """Reference: split QKV, RMSNorm Q/K, RoPE, optional KV de-scale, paged KV write.
 
@@ -222,6 +238,8 @@ def run_torch_with_cache(
         v_scale: Optional scalar scale for V before cache write (``None`` => 1).
         qkv_layout: ``"interleaved"`` or ``"blocked"`` gated layout; ignored when not gated.
         cache_layout: ``"HND"`` or ``"NHD"`` paged KV tensor layout for the reference caches.
+        q_scale: Optional query scale applied after RMSNorm's output cast.
+        cos, sin, positions: RoPE tables and positions for the BF16-rounded scale path.
     """
     QH = QH_PER_KH * KH
     q_size = QH * D
@@ -249,20 +267,26 @@ def run_torch_with_cache(
     k = rms_norm(k, k_weight, eps)
 
     # 3. RoPE
-    q = ref_rope_sbhd_fwd(
-        q,
-        ref_freqs,
-        rotate_style=rotate_style,
-        reuse_freqs_front_part=reuse_freqs_front_part,
-        nope_first=False,
-    )
-    k = ref_rope_sbhd_fwd(
-        k,
-        ref_freqs,
-        rotate_style=rotate_style,
-        reuse_freqs_front_part=reuse_freqs_front_part,
-        nope_first=False,
-    )
+    if q_scale != 1.0:
+        assert rotate_style == RotateStyle.NEOX and reuse_freqs_front_part
+        q = (q.float() * q_scale).to(q.dtype)
+        q = rounded_neox_rope(q, cos, sin, positions)
+        k = rounded_neox_rope(k, cos, sin, positions)
+    else:
+        q = ref_rope_sbhd_fwd(
+            q,
+            ref_freqs,
+            rotate_style=rotate_style,
+            reuse_freqs_front_part=reuse_freqs_front_part,
+            nope_first=False,
+        )
+        k = ref_rope_sbhd_fwd(
+            k,
+            ref_freqs,
+            rotate_style=rotate_style,
+            reuse_freqs_front_part=reuse_freqs_front_part,
+            nope_first=False,
+        )
 
     if k_scale is None:
         k_scale = 1
@@ -314,29 +338,54 @@ def run_torch_with_cache(
         return q, k, v, k_cache, v_cache
 
 
-# Parametrize grid for ``test_fused_qkv_split_qk_rope_with_cache``; see that test's
-# docstring for the meaning of each argument.
-# Grid is intentionally kept small for default test runs.  Key coverage:
-#   - B=4: a representative token batch (single-value avoids ~3x blow-up)
-#   - QH_PER_KH=[1,4]: MHA (1:1) and GQA (4:1) — drops the middle value (2)
-#     coverage over the full-dim run.
-@pytest.mark.parametrize("B", [4])
-@pytest.mark.parametrize("QH_PER_KH", [1, 4])
-@pytest.mark.parametrize("KH", [1, 4])
-@pytest.mark.parametrize("D", [64, 128])
-@pytest.mark.parametrize("block_size", [16])
-@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
-@pytest.mark.parametrize("max_embed_positions", [131072])
-@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
-@pytest.mark.parametrize("attn_output_gate", [False, True])
-@pytest.mark.parametrize("use_kv_scale", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("qkv_layout", ["interleaved", "blocked"])
-@pytest.mark.parametrize("cache_layout", ["HND", "NHD"])
+# Keep the existing coverage grid and append a few scale/weightless cases to
+# this same test. A separate cross-product would multiply the full grid.
+_cache_case_grid = itertools.product(
+    [4],  # tokens
+    [1, 4],  # query heads per KV head
+    [1, 4],  # KV heads
+    [64, 128],  # head dim
+    [16],  # cache block size
+    [RotateStyle.GPTJ, RotateStyle.NEOX],
+    [131072],  # position table length
+    [False, True],  # frequency reuse
+    [False, True],  # attention output gate
+    [False, True],  # KV scales
+    [torch.bfloat16],
+    ["interleaved", "blocked"],  # packed QKV layout
+    ["HND", "NHD"],  # cache layout
+    [None, 32],  # rotary span: full or partial
+)
+_cache_cases = [(*case, 1.0, False) for case in _cache_case_grid]
+_cache_cases += [
+    pytest.param(
+        tokens,
+        16,
+        2,
+        128,
+        16,
+        RotateStyle.NEOX,
+        256,
+        True,
+        False,
+        False,
+        torch.bfloat16,
+        "interleaved",
+        "NHD",
+        None,
+        3.87,
+        True,
+        id=f"scaled-weightless-{tokens}-tokens",
+    )
+    for tokens in (1, 64, 1024)
+]
+
+
 @pytest.mark.parametrize(
-    "rotary_dim",
-    [None, 32],
-    ids=["full", "32"],
+    "B,QH_PER_KH,KH,D,block_size,rotate_style,max_embed_positions,"
+    "reuse_freqs_front_part,attn_output_gate,use_kv_scale,dtype,qkv_layout,"
+    "cache_layout,rotary_dim,q_scale,weightless_norm",
+    _cache_cases,
 )
 def test_fused_qkv_split_qk_rope_with_cache(
     B,
@@ -353,6 +402,8 @@ def test_fused_qkv_split_qk_rope_with_cache(
     qkv_layout,
     cache_layout,
     rotary_dim,
+    q_scale,
+    weightless_norm,
 ):
     """E2E ``fused_qkv_split_qk_norm_rope_cache`` vs torch reference (norm, RoPE, paged KV).
 
@@ -376,6 +427,8 @@ def test_fused_qkv_split_qk_rope_with_cache(
         cache_layout: Paged KV tensor layout, ``"HND"`` or ``"NHD"``.
         rotary_dim: RoPE span in features along the head dim; ``None`` means full ``D``,
             ``32`` exercises partial RoPE when ``D`` is 64 or 128.
+        q_scale: Scale applied to BF16-rounded normalized queries.
+        weightless_norm: Use zero gamma and the scale-path epsilon.
     """
 
     rd = D if rotary_dim is None else rotary_dim
@@ -392,9 +445,9 @@ def test_fused_qkv_split_qk_rope_with_cache(
             "(kernel/table layout matches ref_rope in that mode)"
         )
 
-    eps = 1e-6
+    eps = 1e-5 if weightless_norm else 1e-6
     QH = QH_PER_KH * KH
-    torch.manual_seed(1)
+    torch.manual_seed(1064 if weightless_norm else 1)
 
     freqs_last_dim = (rotary_dim // 2) if reuse_freqs_front_part else rotary_dim
 
@@ -412,8 +465,9 @@ def test_fused_qkv_split_qk_rope_with_cache(
         B, max_embed_positions, freqs_last_dim, dtype
     )
     ref_freqs = freqs[pos].squeeze(-2)
-    q_weight = torch.randn((D,), dtype=dtype, device="cuda")
-    k_weight = torch.randn((D,), dtype=dtype, device="cuda")
+    weight_factory = torch.zeros if weightless_norm else torch.randn
+    q_weight = weight_factory((D,), dtype=dtype, device="cuda")
+    k_weight = weight_factory((D,), dtype=dtype, device="cuda")
 
     # Setup Paged Cache
     num_blocks = (B + block_size - 1) // block_size + 2  # Extra blocks for safety
@@ -458,6 +512,7 @@ def test_fused_qkv_split_qk_rope_with_cache(
         attn_output_gate=attn_output_gate,
         gated_qkv_layout=qkv_layout,
         kv_cache_layout=cache_layout,
+        q_scale=q_scale,
     )
     if attn_output_gate:
         q_tri, gate_tri, k_tri, v_tri = tri_result
@@ -484,6 +539,10 @@ def test_fused_qkv_split_qk_rope_with_cache(
         v_scale,
         qkv_layout=qkv_layout,
         cache_layout=cache_layout,
+        q_scale=q_scale,
+        cos=cos,
+        sin=sin,
+        positions=pos,
     )
 
     if attn_output_gate:
@@ -492,12 +551,13 @@ def test_fused_qkv_split_qk_rope_with_cache(
         q_ref, k_ref, v_ref, k_cache_ref, v_cache_ref = ref_result
 
     # BF16 vs float ref: occasional ~0.011 drift (incl. partial rotary_dim < D)
-    atol, rtol = 2e-2, 2e-2
+    atol, rtol = (0.05, 0.05) if weightless_norm else (2e-2, 2e-2)
 
     # Verify Contiguous Outputs
     if attn_output_gate:
         torch.testing.assert_close(gate_tri, gate_ref, atol=atol, rtol=rtol)
-    torch.testing.assert_close(q_tri, q_ref, atol=atol, rtol=rtol)
+    q_atol = 0.15 if weightless_norm else atol
+    torch.testing.assert_close(q_tri, q_ref, atol=q_atol, rtol=rtol)
     torch.testing.assert_close(k_tri, k_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(v_tri, v_ref, atol=atol, rtol=rtol)
 
