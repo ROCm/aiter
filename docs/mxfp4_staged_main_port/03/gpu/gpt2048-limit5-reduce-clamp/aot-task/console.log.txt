@@ -1,0 +1,3 @@
+[aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-03/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(

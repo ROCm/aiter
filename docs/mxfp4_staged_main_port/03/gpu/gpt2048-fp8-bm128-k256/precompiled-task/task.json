@@ -1,0 +1,54 @@
+{
+  "coordinator_start_utc": "2026-10-10T15:22:03.286412+00:00",
+  "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-03",
+  "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+  "command": [
+    "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+    "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "--csv",
+    "docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm128-k256.csv",
+    "--result",
+    "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/precompiled.json",
+    "--action",
+    "replay"
+  ],
+  "implementation_commit": "4e5d8bdc213880549e144a28d017a208c4661488",
+  "environment": {
+    "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+    "HIP_VISIBLE_DEVICES": "0",
+    "GPU_ARCHS": "gfx950",
+    "CU_NUM": null,
+    "FLYDSL_GPU_ARCH": "gfx950",
+    "AITER_USE_SYSTEM_TRITON": "1",
+    "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+    "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/aot-03-fp81-fp40-limitdefault",
+    "FLYDSL_RUNTIME_RUN_ONLY": "1",
+    "AITER_CONFIG_FMOE": null,
+    "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+    "AITER_FLYDSL_STAGE2_FP8": "1",
+    "AITER_MXFP4_INTERMEDIATE": "0",
+    "TUNE_MOE_EXPERT_BALANCE": null,
+    "TUNE_MOE_ROUTING_SEED": null,
+    "AITER_LOG_MORE": null,
+    "AITER_MOE_EXPERT_BALANCE": null,
+    "MAX_JOBS": "8"
+  },
+  "timeout_contract": "No task or shape hard deadline; wait for child exit",
+  "idle_before_start": {
+    "utc": "2026-10-10T15:22:07.818004+00:00",
+    "status": {
+      "Unique ID": "0x5d8a72a332aa124c",
+      "GPU use (%)": "0",
+      "GFX Activity": "115093071",
+      "PCI Bus": "0000:F5:00.0",
+      "VRAM Total Memory (B)": "309220868096",
+      "VRAM Total Used Memory (B)": "297766912"
+    },
+    "processes": []
+  },
+  "pid": 442698,
+  "process_start_utc": "2026-10-10T15:22:07.821859+00:00",
+  "exit_code": 0,
+  "process_exit_utc": "2026-10-10T15:22:13.712964+00:00"
+}
