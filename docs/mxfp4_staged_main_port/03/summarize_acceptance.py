@@ -88,7 +88,7 @@ def main():
                 "process_exit_utc": task.get("process_exit_utc"),
                 "environment": result["environment"],
                 "fingerprints": result.get("fingerprints"),
-                "jobs": result.get("jobs"),
+                "compile_jobs": result.get("jobs"),
                 **evidence,
             }
         statuses = {item["status"] for item in record["actions"].values()}
