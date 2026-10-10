@@ -27,6 +27,7 @@ if _base_version < _MIN_FLYDSL_VERSION:
     )
 
 _LAZY_IMPORTS = {
+    "DenseGemmConfig": (".gemm_a16wfp4", "DenseGemmConfig"),
     "FP8_MQA_LOGITS_DEFAULT_VARIANT": (
         ".fp8_mqa_logits_kernels",
         "DEFAULT_VARIANT",
@@ -35,7 +36,9 @@ _LAZY_IMPORTS = {
         ".fp8_mqa_logits_kernels",
         "KERNEL_VARIANTS",
     ),
+    "PreshuffledA16WFP4Weight": (".gemm_a16wfp4", "PreshuffledA16WFP4Weight"),
     "QuickAllReduceInt4": (".quick_allreduce_int4", "QuickAllReduceInt4"),
+    "a16wfp4_shape_supported": (".gemm_a16wfp4", "a16wfp4_shape_supported"),
     "compute_varqlen_windows": (
         ".kernels.mqa_logits.pa_mqa_logits_fp4_prefill",
         "compute_varqlen_windows",
@@ -62,6 +65,7 @@ _LAZY_IMPORTS = {
         ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
         "flydsl_fp8_paged_mqa_logits_gfx950",
     ),
+    "flydsl_gemm_a16wfp4": (".gemm_a16wfp4", "flydsl_gemm_a16wfp4"),
     "flydsl_hgemm": (".gemm_kernels", "flydsl_hgemm"),
     "flydsl_hstu_attention": (
         ".hstu_attention",
@@ -121,14 +125,18 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
     ),
+    "prepare_gemm_a16wfp4_weight": (".gemm_a16wfp4", "prepare_gemm_a16wfp4_weight"),
 }
 
 __all__ = [
+    "DenseGemmConfig",
     "FP8_MQA_LOGITS_DEFAULT_VARIANT",
     "FP8_MQA_LOGITS_VARIANTS",
     "Fp4MqaPlan",
     "GateMode",
+    "PreshuffledA16WFP4Weight",
     "QuickAllReduceInt4",
+    "a16wfp4_shape_supported",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
     "flydsl_flash_attn_fp8_func",
@@ -137,6 +145,7 @@ __all__ = [
     "flydsl_fp8_mqa_logits",
     "flydsl_fp8_paged_mqa_logits",
     "flydsl_fp8_paged_mqa_logits_gfx950",
+    "flydsl_gemm_a16wfp4",
     "flydsl_hgemm",
     "flydsl_hstu_attention",
     "flydsl_hstu_attention_bwd",
@@ -156,6 +165,7 @@ __all__ = [
     "gather_kv_b_proj_flydsl_supported",
     "make_fp4_mqa_plan",
     "pa_decode",
+    "prepare_gemm_a16wfp4_weight",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
