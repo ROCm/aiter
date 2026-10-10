@@ -140,7 +140,28 @@
         "observed_process_seconds_per_attempt": 0.5113701937134503,
         "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
         "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
-        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound."
+        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound.",
+        "evidence_path": "docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/search.json",
+        "shape": {
+          "token": 64,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8,
+          "activation": "Silu"
+        },
+        "context": {
+          "fp8": false,
+          "fp4": false,
+          "limit": null,
+          "input_seed": 0,
+          "route_seed": 0,
+          "expert_balance": false,
+          "warmup": 5,
+          "iters": 101,
+          "physical_uuid": "GPU-5d8a72a332aa124c",
+          "pci": "0000:f5:00.0"
+        }
       },
       "estimate_update": "Retain original wide range after observing full64 ~0.511s per returned attempt; 2048/8192 preparation/reference costs and new cold compile keys are not determined by token64 throughput."
     },
@@ -176,7 +197,28 @@
         "observed_process_seconds_per_attempt": 0.5113701937134503,
         "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
         "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
-        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound."
+        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound.",
+        "evidence_path": "docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/search.json",
+        "shape": {
+          "token": 64,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8,
+          "activation": "Silu"
+        },
+        "context": {
+          "fp8": false,
+          "fp4": false,
+          "limit": null,
+          "input_seed": 0,
+          "route_seed": 0,
+          "expert_balance": false,
+          "warmup": 5,
+          "iters": 101,
+          "physical_uuid": "GPU-5d8a72a332aa124c",
+          "pci": "0000:f5:00.0"
+        }
       },
       "estimate_update": "Retain original wide range after observing full64 ~0.511s per returned attempt; 2048/8192 preparation/reference costs and new cold compile keys are not determined by token64 throughput."
     }
@@ -191,7 +233,28 @@
       "observed_process_seconds_per_attempt": 0.5113701937134503,
       "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
       "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
-      "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound."
+      "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound.",
+      "evidence_path": "docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/search.json",
+      "shape": {
+        "token": 64,
+        "model_dim": 3072,
+        "inter_dim": 384,
+        "expert": 256,
+        "topk": 8,
+        "activation": "Silu"
+      },
+      "context": {
+        "fp8": false,
+        "fp4": false,
+        "limit": null,
+        "input_seed": 0,
+        "route_seed": 0,
+        "expert_balance": false,
+        "warmup": 5,
+        "iters": 101,
+        "physical_uuid": "GPU-5d8a72a332aa124c",
+        "pci": "0000:f5:00.0"
+      }
     }
   ]
 }
