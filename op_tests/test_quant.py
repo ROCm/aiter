@@ -102,6 +102,56 @@ def test_quant_1x128_e8m0(m, n, q_dtype, h_dtype, shuffle, strided):
     return {"us": us}
 
 
+def _mx32_indices(rows, scale_n):
+    """Flat MX-shuffle index of every valid (row, group) for group size 32."""
+    pad = ((scale_n + 7) // 8) * 8
+    x = torch.arange(rows)[:, None]
+    y = torch.arange(scale_n)[None, :]
+    return (
+        (x // 32 * pad) * 32
+        + (y // 8) * 256
+        + (y % 4) * 64
+        + (x % 16) * 4
+        + (y % 8) // 4 * 2
+        + (x % 32) // 16
+    )
+
+
+def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided):
+    """Byte-exact dynamic_per_group_scaled_quant, group 32, e8m0 scales.
+
+    Shapes with M % 32 == 0 and (N/32) % 8 == 0 take the gfx1250 tile path;
+    the others stay on the generic kernel.
+    """
+    G = 32
+    fp4 = q_dtype == dtypes.fp4x2
+    src = torch.randn((m, n + (G if strided else 0)), dtype=h_dtype)
+    x = src[:, :n]
+    out = torch.empty((m, n // 2 if fp4 else n), dtype=q_dtype)
+    scale_n = n // G
+    pad = ((scale_n + 7) // 8) * 8 if shuffle else scale_n
+    scale = torch.empty((m * pad,), dtype=dtypes.fp8_e8m0)
+    dynamic_per_group_scaled_quant(out, x, scale, G, shuffle_scale=shuffle)
+
+    xf = x.float().view(m, scale_n, G)
+    mx = MxDtypeInt.FP4_E2M1 if fp4 else MxDtypeInt.FP8_E4M3
+    ref_scale = f32_to_mx_e8m0_scale(xf.abs().amax(-1), dtype=mx).view(torch.uint8)
+    xs = xf / (ref_scale.to(torch.int32) - 127).float().exp2()[..., None]
+    if fp4:
+        ref_out = f32_to_mxfp4(xs.view(m, n)).view(torch.uint8)
+    else:
+        fp8_max = torch.finfo(dtypes.fp8).max
+        ref_out = xs.clamp(-fp8_max, fp8_max).to(dtypes.fp8).view(torch.uint8)
+    got = scale.view(torch.uint8)
+    if shuffle:
+        got = got[_mx32_indices(m, scale_n)]
+    else:
+        got = got.view(m, scale_n)
+    scale_err = int((got != ref_scale).sum())
+    out_err = int((out.view(torch.uint8) != ref_out).sum())
+    assert scale_err == 0 and out_err == 0, f"{m=} {n=} {shuffle=} {strided=} {scale_err=} {out_err=}"
+
+
 def test_mxfp8_nonfinite(group_size, shuffle, h_dtype, pattern):
     """A NaN/Inf makes its MXFP8 group invalid (scale 0xff, data 0xff); others unchanged."""
     x = torch.ones((32, group_size * 8), dtype=h_dtype)
@@ -256,6 +306,15 @@ for key in [k for k in args.quant if k in d_quant_e8m0]:
     aiter.logger.info("%s summary (markdown):\n%s", key, df.to_markdown(index=False))
 
 if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
+    for m, n in ((32, 256), (64, 768), (128, 7168), (40, 320), (32, 160)):
+        for q_dtype, h_dtype, shuffle, strided in itertools.product(
+            [dtypes.fp8, dtypes.fp4x2],
+            [dtypes.bf16, dtypes.fp16],
+            [True, False],
+            [False, True],
+        ):
+            test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided)
+    aiter.logger.info("fp8_1x32_e8m0 passed")
     for gs, shuffle in itertools.product([32, 64, 128], [True, False]):
         for h_dtype, pattern in itertools.product(
             [dtypes.bf16, dtypes.fp16],

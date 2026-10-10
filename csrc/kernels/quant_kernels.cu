@@ -46,7 +46,7 @@ constexpr int kDynGqTdmKPT            = 2;  // staged steps per block (TDM kerne
 // Every TUNING choice below is gated on gfx1250: each was swept there and leans on
 // something arch-specific (wave32, b128 as the widest per-lane access). Nothing was
 // measured on gfx950, so that target keeps the shape it had before.
-template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool packed_bf16_amax = false, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false>
+template <typename DTYPE_I, typename DTYPE_O, int thread_data_size = 32, int32_t group_size = 128, bool shuffle_scale = true, int32_t block_size = 64, bool emit_e8m0_scale = false, bool enable_tdm = false, int tdm_tile_rows = 0, bool packed_bf16_amax = false, bool full_group_stores = false, bool wide_group_stores = false, bool grid_2d = false, bool mx32_tile = false>
 __global__ void __launch_bounds__(block_size)
 dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                       float* __restrict__ scale,
@@ -284,6 +284,9 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     const bool scale_run_in_lds =
         kScaleRunInLds && static_cast<int64_t>(gridDim.x) * kScaleRun >= kScaleRunMinGroups;
     __shared__ uint32_t s_scale_run[kScaleRunInLds ? (kScaleRun + 3) / 4 : 1];
+    // One MX scale tile is 32 rows x 8 groups = 256 bytes, already the hardware
+    // layout. Threads keep the bytes here and one wave stores the tile whole.
+    alignas(16) __shared__ uint8_t s_mx32[mx32_tile ? 256 : 1];
 
     // full_group_stores pairs groups gid and gid ^ 1: neighbouring rows at one column
     // under column-major order, neighbouring columns of one row otherwise.
@@ -406,6 +409,17 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                 scale_dst = reinterpret_cast<uint8_t*>(scale) + scale_idx;
                 scale_val = static_cast<uint8_t>(
                     (__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0b11111111);
+                if constexpr(mx32_tile)
+                {
+                    // Within-tile part of mx_scale_shuffle_idx. The block owns
+                    // rows [32*by, +32) and groups [8*bx, +8).
+                    static_assert(group_size == 32 && shuffle_scale);
+                    const int row_in = threadIdx.x / 8;
+                    const int col_in = threadIdx.x % 8;
+                    const int swiz   = (col_in % 4) * 64 + (row_in % 16) * 4 +
+                                     (col_in / 4) * 2 + row_in / 16;
+                    scale_dst = s_mx32 + swiz;
+                }
             }
             else
             {
@@ -573,6 +587,33 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                 *scale_dst = scale_val;
         }
     };   // process
+
+    if constexpr(mx32_tile)
+    {
+        // 256 threads, one group each: thread = row_in * 8 + col_in, so eight
+        // lanes own one row's groups and their 32 B fp8 stores sit back to back.
+        static_assert(block_size == 256 && group_size == 32 && num_thread_per_group == 1);
+        const int row_in = threadIdx.x / 8;
+        const int col_in = threadIdx.x % 8;
+        const int64_t gx = static_cast<int64_t>(blockIdx.y) * 32 + row_in;
+        const int32_t gy = static_cast<int32_t>(blockIdx.x) * 8 + col_in;
+        process(gather(input + gx * ori_row_stride + static_cast<int64_t>(gy) * group_size),
+                gx,
+                gy,
+                gx * scaleN + gy);
+        __syncthreads();
+        // (x/32)*scaleN_pad*32 + (y/8)*256, with x = 32*by and y = 8*bx.
+        const int64_t tile_base =
+            (static_cast<int64_t>(blockIdx.y) * scaleN_pad + static_cast<int64_t>(blockIdx.x) * 8) *
+            32;
+        if(threadIdx.x < 16)
+        {
+            const uint4 word = *reinterpret_cast<const uint4*>(s_mx32 + threadIdx.x * 16);
+            *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(scale) + tile_base +
+                                      threadIdx.x * 16) = word;
+        }
+        return;
+    }
 
 #if defined(__gfx1250__)
     if constexpr(kUseTdmShape)
@@ -1647,6 +1688,46 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
+                    // group 32 + MX shuffle: one block is one 32x8 scale tile.
+                    // Threads walk groups along the row, so the 32 B fp8 stores
+                    // already coalesce; the 256 scale bytes are staged and
+                    // stored as sixteen uint4s instead of 256 scattered bytes.
+                    if constexpr(_GS == 32 && ee && ss &&
+                                (std::is_same_v<out_t, opus::fp8_t> ||
+                                 std::is_same_v<out_t, opus::fp4_t>))
+                    {
+                        constexpr bool kBf16 = std::is_same_v<input_dtype, opus::bf16_t>;
+                        // fp4 below one tile per CU lost to the generic kernel
+                        // (32x7168: 2.07 -> 2.43 us); fp8 wins at every size.
+                        const int64_t mx32_tiles =
+                            static_cast<int64_t>(rows / 32) * (scaleN / 8);
+                        const bool mx32 =
+                            dyn_gq_tuned_arch() && num_rows_ptr == nullptr &&
+                            (std::is_same_v<out_t, opus::fp8_t> ||
+                             mx32_tiles >= static_cast<int64_t>(get_num_cu_func())) &&
+                            rows >= 32 && rows % 32 == 0 && scaleN % 8 == 0 &&
+                            row_stride % 8 == 0 &&
+                            reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
+                            reinterpret_cast<uintptr_t>(scales.data_ptr()) % 16 == 0;
+                        if(mx32)
+                        {
+                            aiter::dynamic_per_group_scaled_quant_kernel<
+                                input_dtype, out_t, 32, 32, true, 256, true, false, 0, kBf16,
+                                false, false, false, true>
+                                <<<dim3(scaleN / 8, rows / 32), dim3(256), 0, stream>>>(
+                                reinterpret_cast<out_t*>(out.data_ptr()),
+                                reinterpret_cast<float*>(scales.data_ptr()),
+                                reinterpret_cast<input_dtype*>(input.data_ptr()),
+                                nullptr,
+                                rows,
+                                cols,
+                                row_stride,
+                                oob_size,
+                                nullptr,
+                                num_rows_factor);
+                            return;
+                        }
+                    }
                     // 16x512 tiles staged by TDM, with 256B row stores; the kernel maps
                     // tiles so each XCD owns whole 256B spans of the scale output. It wins
                     // once there are two tiles per SIMD at cols >= 12288, or three at
