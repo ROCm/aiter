@@ -65,6 +65,10 @@ from aiter.ops.triton.conv.conv2d import (
     conv2d_winograd_f4x3,
     conv2d_winograd_f4x3_cblocked,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import (
+    get_parser,
+    override_parser_action,
+)
 from op_tests.triton_tests.conv._helpers import (
     _winograd_tolerances,
     dynamic_conv_tolerances,
@@ -894,12 +898,7 @@ def run_sweep(args) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        prog="bench_conv2d",
-        description="Benchmark aiter.ops.triton.conv.conv2d (single shape or sweep).",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    p = get_parser(kernel_name="bench_conv2d")
     p.add_argument(
         "--dtype",
         "--conv_dtype",
@@ -923,11 +922,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=["nchw", "nhwc"],
         default="nchw",
     )
-    p.add_argument(
-        "--metric",
-        type=str.lower,
-        choices=["time", "throughput"],
-        default="throughput",
+    override_parser_action(
+        p, action="--metric", choices=["time", "throughput"], default="throughput"
     )
     p.add_argument(
         "--no-bias",
@@ -947,14 +943,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="detect MIOpen solver names via a subprocess (sweep mode only; "
         "adds ~60-120s upfront cost)",
-    )
-    p.add_argument(
-        "--model",
-        type=str,
-        default=None,
-        help="sweep mode: load conv2d shapes for this model from "
-        "conv_shapes.json (case-insensitive substring match). If omitted, "
-        "defaults to resnet50 unless --smoke is passed.",
     )
     p.add_argument(
         "--smoke",
