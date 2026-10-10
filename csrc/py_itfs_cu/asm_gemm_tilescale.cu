@@ -413,6 +413,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                         t->size(1) == N && t->is_contiguous() && aligned(t) && t->device_id == dev,
                     __func__,
                     " h and x must be contiguous, 16-byte aligned bf16 [M, N] on the output's GPU");
+    AITER_CHECK(aligned(out), __func__, " out must be 16-byte aligned");
+    // out and h are written tile by tile while x is still being read, so none of the three may overlap
+    const auto overlap = [&](const aiter_tensor_t* p, const aiter_tensor_t* q) {
+        const auto a0 = reinterpret_cast<uintptr_t>(p->ptr), b0 = reinterpret_cast<uintptr_t>(q->ptr);
+        return a0 < b0 + static_cast<uintptr_t>(bytes(q)) && b0 < a0 + static_cast<uintptr_t>(bytes(p));
+    };
+    AITER_CHECK(!overlap(out, h) && !overlap(out, x) && !overlap(h, x),
+                __func__,
+                " out, h and x must not overlap");
     AITER_CHECK(bias->dtype() == AITER_DTYPE_bf16 && bias->is_contiguous() && bias->numel() == N &&
                     aligned(bias) && bias->device_id == dev,
                 __func__,

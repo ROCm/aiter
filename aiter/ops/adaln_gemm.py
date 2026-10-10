@@ -57,9 +57,15 @@ _WS: dict = {}
 
 
 def _workspace(pass_: int, device, N: int, K: int):
-    key = (pass_, device, N, K)
+    # One workspace per stream: calls on two streams may overlap, and the kernels use the
+    # workspace and counters for the whole launch. Under CUDA-graph capture, allocate for the
+    # graph instead of caching: the tensors come from the graph's pool and must not outlive it.
+    ws, cnt = _manifest()[(pass_, N, K)]
+    if torch.cuda.is_current_stream_capturing():
+        return (torch.empty(ws, dtype=torch.float32, device=device),
+                torch.zeros(cnt, dtype=torch.int32, device=device))
+    key = (pass_, device, torch.cuda.current_stream(device).cuda_stream, N, K)
     if key not in _WS:
-        ws, cnt = _manifest()[(pass_, N, K)]
         _WS[key] = (torch.empty(ws, dtype=torch.float32, device=device),
                     torch.zeros(cnt, dtype=torch.int32, device=device))
     return _WS[key]

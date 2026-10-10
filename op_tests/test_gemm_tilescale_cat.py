@@ -114,3 +114,20 @@ def test_no_kernel():
         gemm_a6w6_tilescale_cat(u8[: 256 * 192], u8[: 256 * 192], u8[:2048], u8[:2048], u8[: 256 * 192],
                                 u8[: 256 * 192], u8[:2048], u8[:2048], t, torch.empty_like(t), 256, 256,
                                 t[0], t, t[:32])
+
+
+@requires_gfx950
+@pytest.mark.parametrize("alias", ["out_is_h", "out_is_x", "h_is_x"])
+def test_aliasing_rejected(alias):
+    t = torch.empty(256, 256, dtype=torch.bfloat16, device="cuda")
+    u8 = torch.empty(256 * 256, dtype=torch.uint8, device="cuda")
+    out, h, x = t, torch.empty_like(t), torch.empty_like(t)
+    if alias == "out_is_h":
+        h = out
+    elif alias == "out_is_x":
+        x = out
+    else:
+        x = h
+    with pytest.raises(Exception, match="must not overlap"):
+        gemm_a6w6_tilescale_cat(u8[: 256 * 192], u8[: 256 * 192], u8[:2048], u8[:2048], u8[: 256 * 192],
+                                u8[: 256 * 192], u8[:2048], u8[:2048], out, h, 256, 256, t[0], x, t[:32])

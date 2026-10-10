@@ -44,3 +44,26 @@ def test_adaln_gemm(row):
         run(out)
         assert torch.equal(out.view(torch.int16), first.view(torch.int16))
     assert _err(out, gold) <= 1.05 * _err(ref, gold) + 1e-6
+
+
+def test_adaln_fwd_rejects_strided_bias():
+    p, N, K = next(r for r in ROWS if r[0] == 0)
+    x = torch.randn(32, K, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(N, K, device="cuda", dtype=torch.bfloat16)
+    out = torch.empty(32, N, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(Exception, match="bias must be a contiguous"):
+        adaln_fwd(x, w, torch.randn(2 * N, device="cuda", dtype=torch.bfloat16)[::2], out)
+
+
+def test_adaln_workspace_per_stream():
+    from aiter.ops.adaln_gemm import _workspace
+
+    p, N, K = next(r for r in ROWS if r[0] in (0, 1))
+    dev = torch.device("cuda", torch.cuda.current_device())
+    s1, s2 = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(s1):
+        w1 = _workspace(p, dev, N, K)
+        assert _workspace(p, dev, N, K)[0] is w1[0]  # cached per stream
+    with torch.cuda.stream(s2):
+        w2 = _workspace(p, dev, N, K)
+    assert w1[0].data_ptr() != w2[0].data_ptr() and w1[1].data_ptr() != w2[1].data_ptr()

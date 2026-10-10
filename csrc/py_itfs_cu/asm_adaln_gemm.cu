@@ -130,6 +130,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     AITER_CHECK(a->device_id == b->device_id && a->device_id == out->device_id,
                 __func__,
                 " all tensors must be on the same GPU");
+    // The kernels read every tensor through a flat buffer resource: a strided or offset view
+    // would be read as if it were dense, so require dense, aligned tensors on the operands' GPU.
+    constexpr size_t kTensorAlignment = 16;
+    const auto aligned = [](const aiter_tensor_t* t) {
+        return reinterpret_cast<uintptr_t>(t->ptr) % kTensorAlignment == 0;
+    };
+    const auto dense_on_device = [&](const aiter_tensor_t* t) {
+        return t->is_contiguous() && t->device_id == a->device_id && aligned(t);
+    };
+    AITER_CHECK(aligned(a) && aligned(b) && aligned(out),
+                __func__,
+                " operands and output must be 16-byte aligned");
+    AITER_CHECK(bias == nullptr || dense_on_device(bias),
+                __func__,
+                " bias must be a contiguous, 16-byte aligned tensor on the operands' GPU");
+    AITER_CHECK((ws == nullptr || dense_on_device(ws)) && (cnt == nullptr || dense_on_device(cnt)),
+                __func__,
+                " workspace and counters must be contiguous, 16-byte aligned tensors on the operands' GPU");
     AITER_CHECK(a->size(0) == 32, __func__, " the micro-batch (rows of the 32-row operand) must be 32");
     int64_t N = 0, K = 0;
     if(pass == 0)
