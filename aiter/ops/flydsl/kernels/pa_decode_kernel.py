@@ -26,7 +26,9 @@ Logical layouts (not preshuffled):
 
 Four-wave CTAs process 256-token plan tiles: QK splits tokens, PV splits head
 dim, and P passes through LDS to transpose ownership between the MMAs.
-gfx1250 uses wave32 WMMA and 64-token subtiles with async K/V LDS staging.
+gfx1250 uses wave32 WMMA and 64-/128-token subtiles with async K/V LDS staging.
+FP8 per-token D128/D256 transposed page128 caches with one query tile and full
+attention use 128-token staging and PV WMMA to amortize page/scale loads.
 FP8 per-token scales with power-of-two D128+ use TDM; other cases use vector DMA.
 Native BF16 uses eight-element cache packing, unquantized Q/P, no K/V scales,
 and K32 WMMA with FP32 accumulation. BF16 TDM supports power-of-two D64–512.

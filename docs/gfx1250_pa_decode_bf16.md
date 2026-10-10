@@ -71,7 +71,7 @@ Refresh the plan after changing lengths, as for FP8. The current
 or an explicitly measured `workgroup_budget` for BF16. Timing results below
 search budgets without changing production defaults or installing cache entries.
 
-Validation on gfx1250 passed 163 GPU cases: the existing 114 FP8 cases and 49
+The original validation on gfx1250 passed 163 GPU cases: 114 FP8 cases and 49
 native BF16 cases. BF16 coverage includes both query dtypes and V layouts,
 page16/64/128, D64/128/256/384/512/768/1024, empty and partial contexts, MTP,
 windows, sinks, probability tails, small queries, refreshed graphs, odd query
@@ -82,7 +82,6 @@ on those architectures was not performed.
 ```bash
 GPU_ARCHS=gfx1250 python3 -m pytest -q \
   op_tests/test_flydsl_pa_decode.py \
-  op_tests/test_flydsl_pa_decode_gfx1250.py \
   op_tests/test_flydsl_pa_decode_bf16.py
 ```
 

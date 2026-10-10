@@ -63,9 +63,18 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
 
 
 def _make_inputs(
-    query_length, kv_heads, group_size, dim, page_size, dtype, pattern, device
+    query_length,
+    kv_heads,
+    group_size,
+    dim,
+    page_size,
+    dtype,
+    pattern,
+    device,
+    lengths=None,
 ):
-    lengths = (0, 1, 255, 256, 257, 1027) if pattern == "random" else (1024,)
+    if lengths is None:
+        lengths = (0, 1, 255, 256, 257, 1027) if pattern == "random" else (1024,)
     batch = len(lengths)
     pages_per_seq = (max(lengths) + page_size - 1) // page_size
     num_pages = batch * pages_per_seq
@@ -225,3 +234,130 @@ def test_pa_decode(
     )
     assert torch.isfinite(output).all()
     torch.testing.assert_close(output.float(), reference, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
+@pytest.mark.parametrize("query_length", [1, 2], ids=["decode", "mtp2"])
+@pytest.mark.parametrize("head_dim", [128, 256], ids=["d128", "d256"])
+def test_pa_decode_packed_page_boundaries(dtype, query_length, head_dim, device):
+    """Page-sized FP8 tiles must zero-fill tails and survive plan refresh."""
+    from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
+
+    torch.manual_seed(13)
+    lengths = (
+        0,
+        1,
+        15,
+        16,
+        17,
+        63,
+        64,
+        65,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        1027,
+    )
+    heads, group, dim, page = 2, 8, head_dim, 128
+    query, key, value, table, context = _make_inputs(
+        query_length, heads, group, dim, page, dtype, "random", device, lengths
+    )
+    # Keep short-context Q/P rounding within the suite's absolute tolerance,
+    # so this test isolates masking, zero-fill, and refreshed scratch reads.
+    value.mul_(0.5)
+    fp8 = (
+        torch.float8_e4m3fnuz if get_gfx_runtime() == "gfx942" else torch.float8_e4m3fn
+    )
+    key, ks = pertoken_quant(key, quant_dtype=fp8)
+    value, vs = pertoken_quant(value, quant_dtype=fp8)
+    references = []
+    for active in (lengths, tuple(min(length, 129) for length in lengths)):
+        reference_lengths = torch.tensor(active, dtype=torch.int32, device=device)
+        references.append(
+            _reference(
+                query,
+                key.float() * ks,
+                value.float() * vs,
+                table,
+                reference_lengths,
+                query_length,
+                0,
+                None,
+            )
+        )
+    # Poison bytes/scales outside every original sequence's valid context.
+    # Their pages are owned by that sequence; no live token is overwritten.
+    poison = torch.tensor(float("nan"), dtype=fp8, device=device).view(torch.uint8)
+    for seq, length in enumerate(lengths):
+        if length and length % page:
+            physical = table[seq, length // page].item()
+            key.view(torch.uint8)[physical, :, length % page :] = poison
+            value.view(torch.uint8)[physical, :, length % page :] = poison
+            ks[physical, :, length % page :] = float("nan")
+            vs[physical, :, length % page :] = float("nan")
+    pages = key.shape[0]
+    kc = (
+        key.reshape(pages, heads, page, dim // 16, 16)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    vc = (
+        value.reshape(pages, heads, page // 16, 16, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+    )
+    plan = plan_pa_decode(
+        context,
+        heads,
+        max_partitions=7,
+        workgroup_budget=128,
+        query_length=query_length,
+    )
+    output = torch.full_like(query, float("nan"))
+    shape = (heads, plan.capacity, query_length * group)
+    sums = torch.full(shape, float("nan"), dtype=torch.float32, device=device)
+    maxima = torch.full_like(sums, float("nan"))
+    partial = torch.full((*shape, dim), float("nan"), dtype=dtype, device=device)
+
+    def launch():
+        pa_decode(
+            output,
+            query,
+            kc,
+            vc,
+            context,
+            table,
+            dim**-0.5,
+            query_length,
+            key_scale=ks,
+            value_scale=vs,
+            work_plan=plan,
+            max_context_length=max(lengths),
+            exp_sums=sums,
+            max_logits=maxima,
+            temporary_output=partial,
+        )
+
+    launch()
+    torch.testing.assert_close(output.float(), references[0], atol=5e-3, rtol=5e-3)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    context.copy_(
+        torch.tensor(
+            [min(length, 129) for length in lengths], dtype=torch.int32, device=device
+        )
+    )
+    plan_pa_decode(context, heads, plan=plan, query_length=query_length)
+    sums.fill_(float("nan"))
+    maxima.fill_(float("nan"))
+    partial.fill_(float("nan"))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), references[1], atol=5e-3, rtol=5e-3)

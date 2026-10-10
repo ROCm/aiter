@@ -1,0 +1,275 @@
+{
+  "status": "COMPLETE",
+  "args": {
+    "page_size": 128,
+    "kv_heads": 8,
+    "head_dim": 256,
+    "query_heads": 64,
+    "query_length": 1,
+    "query_dtype": "bf16",
+    "v_layout": "transposed",
+    "seed": 0,
+    "data_init": "uniform",
+    "kv_scale": "per-token",
+    "window": 0,
+    "check_sequences": 4,
+    "atol": null,
+    "rtol": null,
+    "max_partitions": null,
+    "include_plan": false,
+    "warmup": 3,
+    "graph_iterations": 32,
+    "replays": 12,
+    "rounds": 7
+  },
+  "results": [
+    {
+      "workgroup_budget": 512,
+      "plan_capacity": 64,
+      "active_tasks": 61,
+      "latency_us": 23.76142640908559,
+      "min_us": 23.711976905663807,
+      "max_us": 23.79042903582255,
+      "samples_us": [
+        23.79042903582255,
+        23.784689605236053,
+        23.735346893469494,
+        23.75318855047226,
+        23.779372374216717,
+        23.711976905663807,
+        23.76142640908559
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 5.06573763408306,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "baseline",
+      "repeat": 0
+    },
+    {
+      "workgroup_budget": 2048,
+      "plan_capacity": 256,
+      "active_tasks": 125,
+      "latency_us": 35.05829721689224,
+      "min_us": 35.026061038176216,
+      "max_us": 35.13288994630178,
+      "samples_us": [
+        35.04692763090134,
+        35.05829721689224,
+        35.10107100009918,
+        35.13288994630178,
+        35.02731521924337,
+        35.06633390982946,
+        35.026061038176216
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 3.433399838426898,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "baseline",
+      "repeat": 0
+    },
+    {
+      "workgroup_budget": 512,
+      "plan_capacity": 64,
+      "active_tasks": 61,
+      "latency_us": 20.14727642138799,
+      "min_us": 20.12714371085167,
+      "max_us": 20.20423983534177,
+      "samples_us": [
+        20.193494856357574,
+        20.1407087345918,
+        20.140080402294796,
+        20.14727642138799,
+        20.150721073150635,
+        20.20423983534177,
+        20.12714371085167
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 5.974462725503595,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "optimized",
+      "repeat": 0
+    },
+    {
+      "workgroup_budget": 2048,
+      "plan_capacity": 256,
+      "active_tasks": 125,
+      "latency_us": 36.4097977677981,
+      "min_us": 36.351059873898826,
+      "max_us": 36.50754690170288,
+      "samples_us": [
+        36.35753194491068,
+        36.42064332962036,
+        36.41970703999201,
+        36.4097977677981,
+        36.39008104801178,
+        36.50754690170288,
+        36.351059873898826
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 3.3059549730995212,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "optimized",
+      "repeat": 0
+    },
+    {
+      "workgroup_budget": 512,
+      "plan_capacity": 64,
+      "active_tasks": 61,
+      "latency_us": 20.16250789165497,
+      "min_us": 20.093239843845367,
+      "max_us": 20.186293870210648,
+      "samples_us": [
+        20.183791716893513,
+        20.186293870210648,
+        20.137786865234375,
+        20.181185255448025,
+        20.152494311332703,
+        20.16250789165497,
+        20.093239843845367
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 5.969949405441741,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "optimized",
+      "repeat": 1
+    },
+    {
+      "workgroup_budget": 2048,
+      "plan_capacity": 256,
+      "active_tasks": 125,
+      "latency_us": 36.38392686843872,
+      "min_us": 36.32988532384237,
+      "max_us": 36.44338746865591,
+      "samples_us": [
+        36.44338746865591,
+        36.33468598127365,
+        36.44046684106191,
+        36.42252584298452,
+        36.38392686843872,
+        36.350334684054054,
+        36.32988532384237
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 3.3083056822108543,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "optimized",
+      "repeat": 1
+    },
+    {
+      "workgroup_budget": 512,
+      "plan_capacity": 64,
+      "active_tasks": 61,
+      "latency_us": 23.719278474648792,
+      "min_us": 23.669935762882233,
+      "max_us": 23.77394586801529,
+      "samples_us": [
+        23.70947351058324,
+        23.77394586801529,
+        23.67473393678665,
+        23.754437764485676,
+        23.669935762882233,
+        23.746299246946972,
+        23.719278474648792
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 5.074739188574002,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "baseline",
+      "repeat": 1
+    },
+    {
+      "workgroup_budget": 2048,
+      "plan_capacity": 256,
+      "active_tasks": 125,
+      "latency_us": 35.104408860206604,
+      "min_us": 35.019281009833016,
+      "max_us": 35.13685613870621,
+      "samples_us": [
+        35.019281009833016,
+        35.0323220094045,
+        35.121833284695946,
+        35.063304007053375,
+        35.13685613870621,
+        35.136853655179344,
+        35.104408860206604
+      ],
+      "useful_kv_bytes": 120369152,
+      "useful_kv_tb_s": 3.4288898719057244,
+      "checked_sequences": [
+        0,
+        13,
+        10,
+        3
+      ],
+      "max_abs_error": 0.002655383199453354,
+      "reference_checked": true,
+      "atol": 0.005,
+      "rtol": 0.005,
+      "candidate": "baseline",
+      "repeat": 1
+    }
+  ]
+}

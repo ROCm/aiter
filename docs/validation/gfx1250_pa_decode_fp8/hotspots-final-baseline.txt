@@ -1,0 +1,53 @@
+
+Loading: /workspace/benchmark-results/fp8-bandwidth60/att-final-baseline/ui_output_agent_4361_dispatch_18582
+
+  Kernel:        ui_output_agent_4361_dispatch_18582
+  Instructions:  1,183
+  Total cycles:  13.09M
+  Total stalls:  11.20M  (85.6% of total cycles)
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  Register Pressure & Occupancy
+══════════════════════════════════════════════════════════════════════════════════════════
+  Architecture:   gfx942 (CDNA3)
+  (kernel_trace CSV not matched — accum/LDS/SGPR estimated from ISA only; pass --kernel <name_substr> to enable CSV metadata lookup)
+  arch_vgpr:      223  (MFMA vgpr-form: accumulators in arch file, no AGPR)
+  total VGPR:     224 / 512  -> 2 waves/SIMD
+
+  occupancy:      2 waves/SIMD  (bound by VGPR)
+  -> 3 waves requires combined VGPR (arch+accum) <= 170
+
+  Instruction mix:
+    MFMA: 0,  buffer_load: 0,  buffer_store: 0
+    ds_read: 59,  ds_write: 11
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  Stall Breakdown by Type
+══════════════════════════════════════════════════════════════════════════════════════════
+  Type               Stall  Bar
+  --------------  --------  --------------------------------------
+  other             10.84M  [█████████████████████████████░]  96.8%
+  barrier           350.6K  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   3.1%
+  SMEM               12.9K  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   0.1%
+  VMEM-load            369  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   0.0%
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  Top-15 Hotspot Instructions  (by stall cycles)
+══════════════════════════════════════════════════════════════════════════════════════════
+    #     Stall   %Total  Type          ASM                                               Source
+  ---  --------  -------  ------------  ------------------------------------------------  ------------------------------
+    1     5.45M   48.60%  other         s_wait_loadcnt 0x1                                sults/fp8-bandwidth60/baseline.py:1145
+    2    811.1K    7.24%  other         s_wait_loadcnt 0x0                                sults/fp8-bandwidth60/baseline.py:1145
+    3    747.0K    6.67%  other         s_wait_loadcnt 0x0                                sults/fp8-bandwidth60/baseline.py:1145
+    4    517.5K    4.62%  other         s_wait_tensorcnt 0x0                              sults/fp8-bandwidth60/baseline.py:1145
+    5    406.6K    3.63%  other         s_wait_dscnt 0x0                                  sults/fp8-bandwidth60/baseline.py:1145
+    6    369.6K    3.30%  other         s_wait_dscnt 0x4                                  sults/fp8-bandwidth60/baseline.py:1145
+    7    352.7K    3.15%  other         s_wait_dscnt 0x4                                  sults/fp8-bandwidth60/baseline.py:1145
+    8    320.3K    2.86%  other         s_wait_dscnt 0x1                                  sults/fp8-bandwidth60/baseline.py:1145
+    9    255.5K    2.28%  other         s_wait_dscnt 0x0                                  sults/fp8-bandwidth60/baseline.py:1145
+   10    243.7K    2.18%  other         s_wait_dscnt 0x0                                  sults/fp8-bandwidth60/baseline.py:1145
+   11    226.2K    2.02%  barrier       s_barrier_wait 0xffff                             sults/fp8-bandwidth60/baseline.py:1145
+   12    223.1K    1.99%  other         s_wait_dscnt 0x0                                  sults/fp8-bandwidth60/baseline.py:1145
+   13    219.0K    1.95%  other         s_wait_dscnt 0x2                                  sults/fp8-bandwidth60/baseline.py:1145
+   14    205.1K    1.83%  other         s_wait_dscnt 0x0                                  sults/fp8-bandwidth60/baseline.py:1145
+   15    191.5K    1.71%  other         s_wait_dscnt 0x0                                  sults/fp8-bandwidth60/baseline.py:1145

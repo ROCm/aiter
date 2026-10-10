@@ -70,7 +70,8 @@ the before/after sweep.
 
 ## Validation
 
-The 114 GPU tests cover BF16/FP16 queries, scalar/per-token scales, both V layouts,
+The original 114-case GPU validation covered BF16/FP16 queries,
+scalar/per-token scales, both V layouts,
 page16/64/128, MTP, windows, sinks, partition boundaries, refreshed graphs, odd
 strides, poisoned scratch, 2/4 GiB offsets, partial pages, D384/768 fallback and
 one-buffer D1024. gfx942/gfx950 MTP4 tile and reducer compile checks passed;
@@ -78,8 +79,7 @@ those architectures were not tested numerically or benchmarked.
 
 ```bash
 GPU_ARCHS=gfx1250 python3 -m pytest -q \
-  op_tests/test_flydsl_pa_decode.py \
-  op_tests/test_flydsl_pa_decode_gfx1250.py
+  op_tests/test_flydsl_pa_decode.py
 ```
 
 The paired benchmark, raw timing samples, counters, ISA and plots are recorded
@@ -92,3 +92,39 @@ The analysis followed FlyDSL's
 and
 [isa-resource-diff](https://github.com/ROCm/FlyDSL/blob/main/.claude/skills/isa-resource-diff/SKILL.md)
 workflows.
+
+## D128 page-sized FP8 tiles
+
+The packed per-token D128 path now uses 128-token staging and K128 PV WMMA
+for page128, full attention, and at most 16 query rows per KV head. This extends
+the existing D256 path. The 256-token planner contract and workgroup budget
+remain the same. Other storage modes and windowed rows retain their tile sizes.
+
+FlyDSL ATT traces identified global-load waits around page-table lookup and
+scale staging as the dominant stalls. Matched B64/4K equal-context traces
+showed `s_wait_loadcnt` stalls decrease from 1,176,507 to 411,586 cycles (65%),
+with total sampled cycles decreasing 53%. The shipped analyzer's CDNA occupancy
+estimate does not apply to gfx1250; interpretation uses its actual split-counter
+instructions. Exact-specialization ISA reports VGPR118 to146, SGPR89 to102,
+and static LDS21056 to38976 bytes, with no register spills or private scratch.
+The increased resources are accepted because paired unprofiled timing improved.
+
+A same-process baseline/candidate comparison of B16/B64, context limits4K/16K,
+and uniform/log-uniform/bimodal random contexts improved all 12 cases by
+1.13–2.09× at budget512. An idle-GPU rerun measured B64/16K uniform at
+210.378 µs, 5.170 TB/s useful KV bandwidth and approximately5.134 TB/s external
+read bandwidth. Separate single-pass `FETCH_SIZE` collection normalizes read
+bytes by unprofiled decode+reduce graph latency. This is warm-cache read traffic,
+not total bus utilization; the device reports23.347 TB/s peak.
+
+The benchmark's four sampled reference checks passed in each case. Checking
+every sequence exposed a short-context FP8 Q/P rounding error of0.008108 on a
+13-token row with atol=rtol=0.005. The full results preserve this limitation and
+the failed validation attempt; they do not claim strict accuracy for every row.
+The new boundary tests cover FP16/BF16 queries, decode/MTP2, page/token tails,
+NaN cache padding, poisoned scratch and graph plan refresh.
+
+Timings, counters, traces and resource reports are saved in
+`/home/sixifang/gfx1250-dev/benchmark-results/fp8-optimization/`.
+`BANDWIDTH.md` describes the rerun and measurement limitations;
+`bandwidth-summary.json`/`.csv` contain all12 combined rows.

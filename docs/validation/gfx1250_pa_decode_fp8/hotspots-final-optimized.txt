@@ -1,0 +1,53 @@
+
+Loading: /workspace/benchmark-results/fp8-bandwidth60/att-final-optimized/ui_output_agent_54706_dispatch_18582
+
+  Kernel:        ui_output_agent_54706_dispatch_18582
+  Instructions:  1,141
+  Total cycles:  11.00M
+  Total stalls:  9.06M  (82.4% of total cycles)
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  Register Pressure & Occupancy
+══════════════════════════════════════════════════════════════════════════════════════════
+  Architecture:   gfx942 (CDNA3)
+  (kernel_trace CSV not matched — accum/LDS/SGPR estimated from ISA only; pass --kernel <name_substr> to enable CSV metadata lookup)
+  arch_vgpr:      240  (MFMA vgpr-form: accumulators in arch file, no AGPR)
+  total VGPR:     240 / 512  -> 2 waves/SIMD
+
+  occupancy:      2 waves/SIMD  (bound by VGPR)
+  -> 3 waves requires combined VGPR (arch+accum) <= 170
+
+  Instruction mix:
+    MFMA: 0,  buffer_load: 0,  buffer_store: 0
+    ds_read: 58,  ds_write: 10
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  Stall Breakdown by Type
+══════════════════════════════════════════════════════════════════════════════════════════
+  Type               Stall  Bar
+  --------------  --------  --------------------------------------
+  other              8.75M  [████████████████████████████░░]  96.5%
+  barrier           303.3K  [█░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   3.3%
+  SMEM               14.2K  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   0.2%
+  VMEM-load            114  [░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   0.0%
+
+══════════════════════════════════════════════════════════════════════════════════════════
+  Top-15 Hotspot Instructions  (by stall cycles)
+══════════════════════════════════════════════════════════════════════════════════════════
+    #     Stall   %Total  Type          ASM                                               Source
+  ---  --------  -------  ------------  ------------------------------------------------  ------------------------------
+    1     6.50M   71.71%  other         s_wait_tensorcnt 0x0                              ults/fp8-bandwidth60/optimized.py:1195
+    2    422.3K    4.66%  other         s_wait_dscnt 0x0                                  ults/fp8-bandwidth60/optimized.py:1195
+    3    373.7K    4.12%  other         s_wait_dscnt 0x1                                  ults/fp8-bandwidth60/optimized.py:1195
+    4    262.9K    2.90%  other         s_wait_dscnt 0x0                                  ults/fp8-bandwidth60/optimized.py:1195
+    5    241.0K    2.66%  other         s_wait_kmcnt 0x0                                  ults/fp8-bandwidth60/optimized.py:1195
+    6    237.5K    2.62%  other         s_wait_dscnt 0x0                                  ults/fp8-bandwidth60/optimized.py:1195
+    7    221.8K    2.45%  barrier       s_barrier_wait 0xffff                             ults/fp8-bandwidth60/optimized.py:1195
+    8    219.2K    2.42%  other         s_wait_dscnt 0x0                                  ults/fp8-bandwidth60/optimized.py:1195
+    9     98.4K    1.09%  other         s_wait_dscnt 0x0                                  ults/fp8-bandwidth60/optimized.py:1195
+   10     61.0K    0.67%  barrier       s_barrier_wait 0xffff                             ults/fp8-bandwidth60/optimized.py:1195
+   11     49.5K    0.55%  other         s_wait_dscnt 0x1                                  ults/fp8-bandwidth60/optimized.py:1195
+   12     24.3K    0.27%  other         s_wait_dscnt 0x4                                  ults/fp8-bandwidth60/optimized.py:1195
+   13     16.9K    0.19%  other         s_wait_dscnt 0x7                                  ults/fp8-bandwidth60/optimized.py:1195
+   14     14.6K    0.16%  other         s_wait_kmcnt 0x0                                  ults/fp8-bandwidth60/optimized.py:1192
+   15     13.4K    0.15%  other         s_wait_dscnt 0x9                                  ults/fp8-bandwidth60/optimized.py:1195

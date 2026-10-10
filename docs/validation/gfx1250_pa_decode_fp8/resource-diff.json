@@ -1,0 +1,31 @@
+{
+  "compared_kernels": 2,
+  "exit_code": 1,
+  "improved_metrics": 1,
+  "problems": [],
+  "rows": [
+    {
+      "blocked": [],
+      "deltas": {
+        "arch_vgpr": 17,
+        "lds_read": -1,
+        "lds_static_bytes": 66560,
+        "lds_write": -1,
+        "numbered_sgpr": -9,
+        "sgpr": -9,
+        "vgpr": 17
+      },
+      "kernel": "kernel_0::kernel_0",
+      "side": null
+    }
+  ],
+  "schema": 2,
+  "tool": "isa_resource_table",
+  "total_kernels": 2,
+  "verdict": "RESULT: REGRESSION",
+  "warnings": [
+    "FLYDSL_DUMP_IR writes one directory per kernel *name* with no specialization key, so different JIT specializations overwrite each other and cache hits emit no dump. Compare only trees from a single run with FLYDSL_RUNTIME_ENABLE_CACHE=0.",
+    "FLYDSL_DUMP_IR writes one directory per kernel *name* with no specialization key, so different JIT specializations overwrite each other and cache hits emit no dump. Compare only trees from a single run with FLYDSL_RUNTIME_ENABLE_CACHE=0."
+  ],
+  "worsened_metrics": 2
+}

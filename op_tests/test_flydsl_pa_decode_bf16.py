@@ -3,13 +3,97 @@
 
 """Native BF16 compute/cache regressions for gfx1250 planned PA decode."""
 
+import importlib.util
+
 import pytest
 import torch
 
 from op_tests.test_flydsl_pa_decode import _make_inputs, _reference
-from op_tests.test_flydsl_pa_decode_gfx1250 import device as _gfx1250_device
 
-device = _gfx1250_device
+
+@pytest.fixture
+def device(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("ROCm is not available")
+    if torch.cuda.get_device_properties(0).gcnArchName.split(":")[0] != "gfx1250":
+        pytest.skip("requires gfx1250")
+    if importlib.util.find_spec("flydsl") is None:
+        pytest.skip("FlyDSL is not installed")
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    return torch.device("cuda")
+
+
+def _inputs(
+    device,
+    length,
+    *,
+    query_length=1,
+    group=1,
+    dim=128,
+    trans_v=True,
+    strides=False,
+    page_ids=None,
+    pool_pages=None,
+    page=128,
+    divisor=8,
+    cache_dtype=torch.float8_e4m3fn,
+):
+    pages = (length + page - 1) // page
+    if page_ids is None:
+        page_ids = torch.randperm(pages, device=device, dtype=torch.int32)
+    table = page_ids.reshape(1, pages)
+    pool_pages = pages if pool_pages is None else pool_pages
+    # Representable values isolate lane/operand mapping from FP8 cache rounding.
+    torch.manual_seed(17)
+    key = torch.randint(-4, 5, (pages, 1, page, dim), device=device).float() / divisor
+    value = torch.randint(-4, 5, key.shape, device=device).float() / divisor
+    qshape = (query_length, group, dim)
+    query = (torch.randint(-4, 5, qshape, device=device).float() / divisor).bfloat16()
+    if strides:
+        query_view = torch.empty_strided(
+            qshape,
+            (group * (dim + 1) + 3, dim + 1, 1),
+            dtype=query.dtype,
+            device=device,
+        )
+        query_view.copy_(query)
+        query = query_view
+    chunk = 16 // torch.empty((), dtype=cache_dtype).element_size()
+    cache_key = torch.empty(
+        (pool_pages, 1, dim // chunk, page, chunk), dtype=cache_dtype, device=device
+    )
+    vshape = (
+        (pool_pages, 1, page // chunk, dim, chunk)
+        if trans_v
+        else (pool_pages, 1, dim, page)
+    )
+    cache_value = torch.empty(vshape, dtype=cache_dtype, device=device)
+    packed_key = (
+        key.reshape(pages, 1, page, dim // chunk, chunk)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+        .to(cache_key.dtype)
+    )
+    packed_value = (
+        (
+            value.reshape(pages, 1, page // chunk, chunk, dim).permute(0, 1, 2, 4, 3)
+            if trans_v
+            else value.permute(0, 1, 3, 2)
+        )
+        .contiguous()
+        .to(cache_value.dtype)
+    )
+    # FP8 index_copy is not implemented by all bring-up PyTorch builds.
+    for logical, physical in enumerate(page_ids.cpu().tolist()):
+        cache_key[physical].copy_(packed_key[logical])
+        cache_value[physical].copy_(packed_value[logical])
+    if pool_pages == pages:
+        reference_key, reference_value = torch.empty_like(key), torch.empty_like(value)
+        reference_key[page_ids.long()] = key
+        reference_value[page_ids.long()] = value
+        key, value = reference_key, reference_value
+    lengths = torch.tensor([length], dtype=torch.int32, device=device)
+    return query, key, value, cache_key, cache_value, table, lengths
 
 
 def _pack(key, value, trans_v):
@@ -83,7 +167,6 @@ def test_bf16_cache(
 @pytest.mark.parametrize("trans_v", [False, True])
 def test_bf16_graph_refresh(trans_v, device):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
-    from op_tests.test_flydsl_pa_decode_gfx1250 import _inputs
 
     q, k, v, kc, vc, table, lengths = _inputs(
         device,
@@ -144,7 +227,6 @@ def test_bf16_graph_refresh(trans_v, device):
 @pytest.mark.parametrize("trans_v", [False, True])
 def test_bf16_wide_addresses(boundary, trans_v, device):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
-    from op_tests.test_flydsl_pa_decode_gfx1250 import _inputs
 
     page_bytes = 128 * 128 * 2
     high_page = boundary // page_bytes
@@ -178,7 +260,6 @@ def test_bf16_wide_addresses(boundary, trans_v, device):
 
 def test_bf16_reject_scales(device):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
-    from op_tests.test_flydsl_pa_decode_gfx1250 import _inputs
 
     q, _k, _v, kc, vc, table, lengths = _inputs(device, 128, cache_dtype=torch.bfloat16)
     plan = plan_pa_decode(lengths, 1, max_partitions=1)
@@ -200,7 +281,6 @@ def test_bf16_reject_scales(device):
 @pytest.mark.parametrize("trans_v", [False, True])
 def test_bf16_large_mtp(trans_v, device):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
-    from op_tests.test_flydsl_pa_decode_gfx1250 import _inputs
 
     # BF16 D1024/MTP4/G16 needs one K/V buffer and reuses one Q tile.
     q, k, v, kc, vc, table, lengths = _inputs(

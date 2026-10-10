@@ -1,0 +1,74 @@
+[
+  {
+    "case": "baseline-b64-c65536-budget512",
+    "batch": 64,
+    "context": 65536,
+    "candidate": "baseline",
+    "budget": 512,
+    "returncode": 0,
+    "latency_us": 1409.2241128285725
+  },
+  {
+    "case": "optimized-b64-c65536-budget512",
+    "batch": 64,
+    "context": 65536,
+    "candidate": "optimized",
+    "budget": 512,
+    "returncode": 0,
+    "latency_us": 1304.8345247904458
+  },
+  {
+    "case": "baseline-b128-c65536-budget512",
+    "batch": 128,
+    "context": 65536,
+    "candidate": "baseline",
+    "budget": 512,
+    "returncode": 0,
+    "latency_us": 2853.034019470215
+  },
+  {
+    "case": "optimized-b128-c65536-budget2048",
+    "batch": 128,
+    "context": 65536,
+    "candidate": "optimized",
+    "budget": 2048,
+    "returncode": 0,
+    "latency_us": 2627.8918584187822
+  },
+  {
+    "case": "baseline-b64-c131072-budget2048",
+    "batch": 64,
+    "context": 131072,
+    "candidate": "baseline",
+    "budget": 2048,
+    "returncode": 0,
+    "latency_us": 2851.137161254883
+  },
+  {
+    "case": "optimized-b64-c131072-budget2048",
+    "batch": 64,
+    "context": 131072,
+    "candidate": "optimized",
+    "budget": 2048,
+    "returncode": 0,
+    "latency_us": 2624.1741975148516
+  },
+  {
+    "case": "baseline-b128-c131072-budget512",
+    "batch": 128,
+    "context": 131072,
+    "candidate": "baseline",
+    "budget": 512,
+    "returncode": 0,
+    "latency_us": 5718.135833740234
+  },
+  {
+    "case": "optimized-b128-c131072-budget2048",
+    "batch": 128,
+    "context": 131072,
+    "candidate": "optimized",
+    "budget": 2048,
+    "returncode": 0,
+    "latency_us": 5322.010835011801
+  }
+]
