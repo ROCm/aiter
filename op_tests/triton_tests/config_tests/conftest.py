@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Test environment configuration for op_tests.
+"""Test environment configuration scoped strictly to config_tests.
 
 Provides CPU-fallback math shims ONLY when Triton is not installed,
 and guards aiter import ONLY when ROCm is not present on the host.
-Preserves native behavior for real ROCm/GPU environments.
+Scoped to config_tests so unrelated op_tests suites are completely unaffected.
 """
 
 import os
 import sys
 from unittest.mock import MagicMock
+
+_repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../"))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 # Minimal math fallback ONLY for CPU host environments where Triton is not installed
 if "triton" not in sys.modules:
@@ -33,7 +37,6 @@ if _t is not None:
 
 # In host environments without ROCm (e.g. macOS / CPU-only dev boxes),
 # skip CK/HIP JIT compilation to allow importing aiter config utils.
-# On real ROCm systems, leave AITER_TRITON_ONLY unset to preserve CK/HIP op testing.
 _rocm_home = os.getenv("ROCM_PATH", "/opt/rocm")
 if not os.path.exists(_rocm_home) and not os.path.exists(f"{_rocm_home}/.info/version"):
     os.environ.setdefault("AITER_TRITON_ONLY", "1")

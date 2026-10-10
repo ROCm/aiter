@@ -44,6 +44,7 @@ def test_attention_config_schema(path: str):
     # Check tile parameters when present in entries
     for k, v in table.items():
         if isinstance(v, dict):
+            assert len(v) > 0, f"{rel_path(path)} [{k}]: entry cannot be empty"
             for param in ("BLOCK_M", "BLOCK_N", "BLOCK_SIZE_M", "BLOCK_SIZE_N"):
                 if param in v:
                     val = v[param]

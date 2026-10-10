@@ -39,6 +39,7 @@ def test_moe_config_schema(path: str):
         if key.startswith("_") or key == "comment":
             continue
         assert isinstance(cfg, dict), f"{rel_path(path)}: {key} must map to a dict"
+        assert len(cfg) > 0, f"{rel_path(path)} [{key}]: config entry cannot be empty"
 
         for bkey in ("block_n", "block_k", "BLOCK_SIZE_K", "BLOCK_SIZE_N", "BLOCK_M", "BLOCK_N"):
             if bkey in cfg:

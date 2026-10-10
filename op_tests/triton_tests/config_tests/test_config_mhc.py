@@ -50,6 +50,7 @@ def test_mhc_config_schema(path: str):
 
     for k, v in table.items():
         if isinstance(v, dict):
+            assert len(v) > 0, f"{rel_path(path)} [{k}]: entry cannot be empty"
             for bkey in ("BLOCK_M", "BLOCK_K", "BLOCK_C", "TILE_K"):
                 if bkey in v:
                     val = v[bkey]

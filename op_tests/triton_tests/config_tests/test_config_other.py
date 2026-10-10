@@ -21,19 +21,23 @@ import pytest
 
 from aiter.ops.triton.utils import (
     config_utils,
-    gemm_config_utils,
+    mhc_config_utils,
     normalization_config_utils,
     quant_config_utils,
 )
-import aiter.ops.triton._triton_kernels.gmm as gmm_kernels
+import aiter.ops.triton.gmm as gmm
 from op_tests.triton_tests.config_tests.common import (
+    CONFIGS_PATH,
     check_no_mixed_geq_leq,
+    clear_all_config_caches,
     discover_architectures,
     filter_configs_by_op,
     is_power_of_two,
     load_json_dict,
     rel_path,
     set_test_arch,
+    validate_config_file_layout_and_naming,
+    validate_gemm_config_table,
 )
 
 GMM_FILES = filter_configs_by_op("gmm")
@@ -70,7 +74,7 @@ def test_gmm_loader_resolves(arch: str):
     """Test GMM get_config loader across architectures."""
     with set_test_arch(arch):
         for variant in ("gmm", "ptgmm", "nptgmm"):
-            cfg = gmm_kernels.get_config(variant, M=1024, K=2048, N=2048, G=4)
+            cfg = gmm.get_config(variant, M=1024, K=2048, N=2048, G=4)
             assert isinstance(cfg, dict)
             assert "BLOCK_SIZE_M" in cfg or "num_warps" in cfg
 
@@ -78,8 +82,8 @@ def test_gmm_loader_resolves(arch: str):
 def test_gmm_dispatch_thresholds_gfx950():
     """Verify GMM dispatch rules switch correctly on gfx950 (addressing #6105)."""
     with set_test_arch("gfx950"):
-        cfg_large = gmm_kernels.get_config("gmm", M=8192, K=4096, N=4096, G=32, accumulate=False)
-        cfg_default = gmm_kernels.get_config("gmm", M=8191, K=4096, N=4096, G=32, accumulate=False)
+        cfg_large = gmm.get_config("gmm", M=8192, K=4096, N=4096, G=32, accumulate=False)
+        cfg_default = gmm.get_config("gmm", M=8191, K=4096, N=4096, G=32, accumulate=False)
         assert cfg_large != cfg_default, "GMM dispatch rule failed to select large_kn config"
 
 
@@ -196,17 +200,48 @@ def test_fusions_specialized_resolution(arch: str, backend: str, n_val: int, fpa
 # --- Cache Isolation & Fail-Fast ---
 
 def test_cache_isolation_across_architectures():
-    """Verify that looking up configs on different arches does not suffer cache pollution."""
-    with set_test_arch("gfx942"):
-        cfg_942, _ = gemm_config_utils.get_gemm_config(
-            "GEMM-A16W16", M=128, N=1024, K=1024, backend="triton"
-        )
-    with set_test_arch("gfx950"):
-        cfg_950, _ = gemm_config_utils.get_gemm_config(
-            "GEMM-A16W16", M=128, N=1024, K=1024, backend="triton"
-        )
-    assert isinstance(cfg_942, dict)
-    assert isinstance(cfg_950, dict)
+    """Verify that looking up configs on different arches does not suffer cache pollution.
+
+    Verifies that the underlying cached loader (load_config_json) preserves distinct
+    configs across architectures without clearing the cache between lookups, and that
+    cached results match their architecture-specific expected configurations.
+    """
+    clear_all_config_caches()
+    try:
+        fpath_942 = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/DEFAULT.json")
+        fpath_950 = os.path.join(CONFIGS_PATH, "gfx950/triton/gemm/gemm_a16w16/DEFAULT.json")
+
+        cfg_942 = config_utils.load_config_json(fpath_942)
+        assert config_utils.load_config_json.cache_info().currsize >= 1
+
+        # DO NOT clear cache between lookups: query gfx950 while gfx942 is cached
+        cfg_950 = config_utils.load_config_json(fpath_950)
+        assert config_utils.load_config_json.cache_info().currsize >= 2
+
+        # Assert architecture-specific expected parameters differ and match expected values
+        assert cfg_942["any"]["num_stages"] == 2
+        assert cfg_950["any"]["num_stages"] == 3
+        assert cfg_942["any"]["BLOCK_SIZE_N"] == 256
+        assert cfg_950["any"]["BLOCK_SIZE_N"] == 128
+        assert cfg_942 != cfg_950
+
+        # Query gfx942 again from warm cache: must still match gfx942, not gfx950
+        cfg_942_cached = config_utils.load_config_json(fpath_942)
+        assert cfg_942_cached == cfg_942
+
+        # Verify multi-arch cached function _c_thresholds preserves distinct arch results
+        t_942 = mhc_config_utils._c_thresholds("gfx942", "MHC_FUSED_SINKHORN")
+        t_950 = mhc_config_utils._c_thresholds("gfx950", "MHC_FUSED_SINKHORN")
+        assert mhc_config_utils._c_thresholds.cache_info().currsize >= 2
+        assert 7168 not in t_942
+        assert 7168 in t_950
+        assert t_942 != t_950
+
+        # Query gfx942 again from warm cache: must still match original gfx942 thresholds
+        t_942_cached = mhc_config_utils._c_thresholds("gfx942", "MHC_FUSED_SINKHORN")
+        assert t_942_cached == t_942
+    finally:
+        clear_all_config_caches()
 
 
 def test_missing_required_config_file_raises():
@@ -288,9 +323,94 @@ def test_negative_overlapping_bounds_rejected():
         check_no_mixed_geq_leq(overlapping_table, "dummy/path.json")
 
 
-def test_negative_filename_arch_prefix_rejected():
-    """Verify naming rules strictly reject architecture-prefixed filenames in nested layout."""
+def test_negative_filename_and_layout_rejected():
+    """Verify validate_config_file_layout_and_naming rejects malformed paths and names."""
+    # 1. Reject architecture-prefixed filenames in nested layout
     for arch in ("gfx942", "gfx950", "gfx1250"):
-        bad_name = f"{arch}_DEFAULT.json"
-        assert bad_name.startswith(f"{arch}_")
-        assert not (not bad_name.startswith(f"{arch}_") and not bad_name.startswith(f"{arch}-"))
+        bad_name = os.path.join(CONFIGS_PATH, f"{arch}/triton/gemm/gemm_a16w16/{arch}_DEFAULT.json")
+        with pytest.raises(AssertionError, match="filename must not have arch prefix"):
+            validate_config_file_layout_and_naming(bad_name)
+
+    # 2. Reject paths that are too shallow (depth 4)
+    bad_shallow = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/DEFAULT.json")
+    with pytest.raises(AssertionError, match="Path must have exactly 5 components"):
+        validate_config_file_layout_and_naming(bad_shallow)
+
+    # 3. Reject paths that are too deep (depth 6)
+    bad_deep = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/extra/DEFAULT.json")
+    with pytest.raises(AssertionError, match="Path must have exactly 5 components"):
+        validate_config_file_layout_and_naming(bad_deep)
+
+    # 4. Reject invalid backends
+    bad_backend = os.path.join(CONFIGS_PATH, "gfx942/invalid_backend/gemm/gemm_a16w16/DEFAULT.json")
+    with pytest.raises(AssertionError, match="invalid backend"):
+        validate_config_file_layout_and_naming(bad_backend)
+
+
+def test_negative_gemm_missing_any_fallback_rejected():
+    """Verify GEMM table schema rejects tables without the required 'any' fallback."""
+    table_without_any = {
+        "M_LEQ_32": {"BLOCK_SIZE_M": 16, "BLOCK_SIZE_N": 32, "num_warps": 4},
+        "M_LEQ_64": {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "num_warps": 4},
+    }
+    with pytest.raises(AssertionError, match="GEMM table must contain an 'any' fallback"):
+        validate_gemm_config_table(table_without_any, path="dummy.json", backend="triton")
+
+
+def test_negative_specialized_filename_rejected():
+    """Verify validate_config_file_layout_and_naming rejects malformed specialized filenames."""
+    # 1. Reject specialized files missing hyphens / suffixes entirely
+    bad_no_suffix = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/specialized.json")
+    with pytest.raises(AssertionError, match="must follow <CONFIG_NAME>-<suffix>.json format"):
+        validate_config_file_layout_and_naming(bad_no_suffix)
+
+    bad_no_hyphen = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/GEMM_A16W16.json")
+    with pytest.raises(AssertionError, match="must follow <CONFIG_NAME>-<suffix>.json format"):
+        validate_config_file_layout_and_naming(bad_no_hyphen)
+
+    # 2. Reject empty suffix (trailing hyphen)
+    bad_empty_suffix = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/GEMM-A16W16-.json")
+    with pytest.raises(AssertionError, match="must follow <CONFIG_NAME>-<suffix>.json format"):
+        validate_config_file_layout_and_naming(bad_empty_suffix)
+
+    # 3. Reject missing suffix when hyphen is only within CONFIG_NAME
+    bad_stem_only = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/GEMM-A16W16.json")
+    with pytest.raises(AssertionError, match="must have exactly one valid decomposition"):
+        validate_config_file_layout_and_naming(bad_stem_only)
+
+    # 4. Reject mismatched CONFIG_NAME stem vs parent dtype directory
+    bad_mismatch = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/OTHER_OP-N=1024-K=1024.json")
+    with pytest.raises(AssertionError, match="must have exactly one valid decomposition"):
+        validate_config_file_layout_and_naming(bad_mismatch)
+
+    # 5. Reject non-JSON extension
+    bad_ext = os.path.join(CONFIGS_PATH, "gfx942/triton/gemm/gemm_a16w16/GEMM-A16W16-N=1024.txt")
+    with pytest.raises(AssertionError, match="must end with.*json"):
+        validate_config_file_layout_and_naming(bad_ext)
+
+
+def test_negative_unanchored_specialized_decomposition_ambiguous():
+    """Verify that specialized filenames with hyphens in CONFIG_NAME are ambiguous
+    in isolation without parent dtype anchoring, proving why directory-anchored
+    decomposition (validate_config_file_layout_and_naming) is required.
+    """
+    fname = "GEMM-A16W16-N=1024-K=4096.json"
+    stem = fname[:-5]
+    parts = stem.split("-")
+    # Without anchoring to dtype, multiple valid (config_name, suffix) splits exist:
+    unanchored_splits = [
+        ("-".join(parts[:i]), "-".join(parts[i:]))
+        for i in range(1, len(parts))
+        if config_utils._CONFIG_NAME_RE.fullmatch("-".join(parts[:i]))
+        and len("-".join(parts[i:])) > 0
+    ]
+    # In isolation: multiple decompositions exist (e.g. ('GEMM', ...) and ('GEMM-A16W16', ...))
+    assert len(unanchored_splits) > 1, f"Expected ambiguous splits in isolation, got {unanchored_splits}"
+
+    # Anchored to parent dtype 'gemm_a16w16': exactly one unique decomposition exists
+    anchored_splits = [
+        s for s in unanchored_splits
+        if config_utils._dtype_dir(s[0]) == "gemm_a16w16"
+    ]
+    assert len(anchored_splits) == 1, f"Expected unique anchored split, got {anchored_splits}"
+    assert anchored_splits[0] == ("GEMM-A16W16", "N=1024-K=4096")

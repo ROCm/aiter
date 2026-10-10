@@ -58,6 +58,7 @@ def test_conv_config_schema(path: str):
                 entries.append((k, v))
 
     for name, cfg in entries:
+        assert len(cfg) > 0, f"{rel_path(path)} [{name}]: config entry cannot be empty"
         for bkey in ("BLOCK_M", "BLOCK_N", "BLOCK_K", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"):
             if bkey in cfg:
                 val = cfg[bkey]

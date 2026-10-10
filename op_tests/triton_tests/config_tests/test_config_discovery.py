@@ -17,13 +17,13 @@ import json
 import os
 import pytest
 
-from aiter.ops.triton.utils import config_utils
 from op_tests.triton_tests.config_tests.common import (
     check_no_mixed_geq_leq,
     discover_all_config_files,
     discover_architectures,
     load_json_dict,
     rel_path,
+    validate_config_file_layout_and_naming,
 )
 
 ALL_CONFIG_FILES = discover_all_config_files()
@@ -82,38 +82,15 @@ def test_all_config_dirs_have_default():
 @pytest.mark.parametrize("path", ALL_CONFIG_FILES, ids=rel_path)
 def test_config_file_layout_and_naming(path: str):
     """Verify that every config file strictly follows configs/CLAUDE.md rules:
-    - Path matches <configs>/<arch>/<backend>/<op>/<dtype>/<filename>
+    - Path matches <configs>/<arch>/<backend>/<op>/<dtype>/<filename> (exactly 5 components)
     - <arch> matches config_utils._ARCH_SAFE_RE
     - <backend> is in _VALID_BACKENDS ('triton', 'gluon')
     - <op> matches config_utils._OP_RE
-    - <dtype> is lowercase with underscores
+    - <dtype> is lowercase with underscores, no hyphens
     - Filename has no architecture prefix
     - Filename is either DEFAULT.json or <CONFIG_NAME>-<suffix>.json (or legacy mha.json)
     """
-    rel = rel_path(path)
-    parts = rel.split(os.sep)
-    assert len(parts) >= 5, f"Path too shallow: {rel}"
-
-    arch, backend, op, dtype = parts[0], parts[1], parts[2], parts[3]
-    fname = parts[-1]
-
-    assert config_utils._ARCH_SAFE_RE.fullmatch(arch), f"{rel}: invalid arch identifier '{arch}'"
-    assert backend in config_utils._VALID_BACKENDS, f"{rel}: invalid backend '{backend}'"
-    assert config_utils._OP_RE.fullmatch(op), f"{rel}: invalid op identifier '{op}'"
-    assert dtype == dtype.lower(), f"{rel}: dtype directory must be lowercase"
-    assert "-" not in dtype, f"{rel}: dtype directory must not contain hyphens"
-
-    # No architecture prefix in filenames
-    for a in DISCOVERED_ARCHS:
-        assert not fname.startswith(f"{a}_") and not fname.startswith(f"{a}-"), (
-            f"{rel}: filename must not have arch prefix '{a}'"
-        )
-
-    # Valid filename formats
-    if fname not in ("DEFAULT.json", "mha.json"):
-        assert "-" in fname, (
-            f"{rel}: specialized file should follow <CONFIG_NAME>-<suffix>.json format"
-        )
+    validate_config_file_layout_and_naming(path)
 
 
 @pytest.mark.parametrize("path", ALL_CONFIG_FILES, ids=rel_path)

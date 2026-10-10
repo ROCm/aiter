@@ -23,12 +23,11 @@ from aiter.ops.triton.utils import (
     gemm_config_utils,
 )
 from op_tests.triton_tests.config_tests.common import (
-    check_no_mixed_geq_leq,
     discover_architectures,
     filter_configs_by_op,
-    is_power_of_two,
     rel_path,
     set_test_arch,
+    validate_gemm_config_table,
 )
 
 GEMM_FILES = filter_configs_by_op("gemm")
@@ -47,38 +46,7 @@ def test_gemm_config_schema(path: str):
     """
     with open(path, "r", encoding="utf-8") as f:
         table = json.load(f)
-
-    assert "any" in table or any(k.startswith("M_LEQ_") for k in table), (
-        f"{rel_path(path)}: GEMM table must contain an 'any' fallback or M_LEQ bounds"
-    )
-    check_no_mixed_geq_leq(table, path)
-
-    for key, cfg in table.items():
-        if key in ("M_BOUNDS", "_note", "DEFAULT_FALLBACK"):
-            continue
-        assert key == "any" or key.startswith("M_LEQ_") or key.startswith("M_GEQ_"), (
-            f"{rel_path(path)}: unexpected key '{key}'"
-        )
-        assert isinstance(cfg, dict), f"{rel_path(path)}: {key} must map to a dict"
-
-        for param in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"):
-            if param in cfg:
-                val = cfg[param]
-                assert is_power_of_two(val), (
-                    f"{rel_path(path)} [{key}]: {param}={val} must be a positive power of 2"
-                )
-
-        if "num_warps" in cfg:
-            warps = cfg["num_warps"]
-            assert warps in (1, 2, 4, 8, 16, 32), (
-                f"{rel_path(path)} [{key}]: unexpected num_warps={warps}"
-            )
-
-        if "num_stages" in cfg:
-            stages = cfg["num_stages"]
-            assert isinstance(stages, int) and stages > 0, (
-                f"{rel_path(path)} [{key}]: num_stages must be positive integer, got {stages}"
-            )
+    validate_gemm_config_table(table, path=path)
 
 
 def _infer_gemm_config_name(dtype_dir: str, files: list[str]) -> str:
