@@ -70,6 +70,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_kernels,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
+    runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
@@ -7063,6 +7064,292 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return us
 
+    @staticmethod
+    def _screening_limit():
+        value = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        return None if value in (None, "") else float(value)
+
+    def _prepare_screening_case(
+        self, row: dict[str, Any], block_m: int, atomic: bool
+    ) -> tuple[dict[str, Any], tuple[torch.Tensor, ...]]:
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
+        sorting = moe_sorting(
+            data["topk_ids"],
+            data["topk_weights"],
+            ne,
+            h,
+            dtypes.bf16,
+            block_size=block_m,
+            accumulate=atomic,
+            output_aux="opus",
+        )
+        return data, sorting
+
+    @staticmethod
+    def _prepare_gemm1_screening(
+        data: dict[str, Any],
+        sorting: tuple[torch.Tensor, ...],
+        kn1: str,
+        topk: int,
+        swiglu_limit: float | None = None,
+    ) -> tuple[Callable[[], None], torch.Tensor, torch.Tensor]:
+        from aiter.ops.flydsl.mxfp4_gemm1_kernels import flydsl_mxfp4_gemm1
+
+        cfg = _parse_mxfp4_g1_kname(kn1)
+        bm = cfg["BM"]
+        if cfg["inline_quant"] != (bm == 16):
+            raise ValueError(
+                f"GEMM1 BM{bm} violates the derived input quantization contract"
+            )
+        sti, sw, sei, nvi, moe_buf, m_indices, _reverse_sorted = sorting
+        stage1_input, stage1_scale = data["input"], None
+        if bm == 16:
+            if stage1_input.dtype != dtypes.bf16:
+                raise ValueError("GEMM1 BM16 inline quantization requires BF16 input")
+        else:
+            stage1_input, stage1_scale = aiter.fused_dynamic_mxfp4_quant_moe_sort(
+                input=stage1_input,
+                sorted_ids=sti,
+                num_valid_ids=nvi,
+                token_num=stage1_input.shape[0],
+                topk=topk,
+                block_size=bm,
+                sorted_weights=sw,
+                num_experts_upper_bound=data["w1_a16"].shape[0],
+            )
+            if stage1_input.dtype != dtypes.fp4x2 or stage1_scale is None:
+                raise ValueError(
+                    f"GEMM1 BM{bm} requires fused-prequantized FP4 input and scales"
+                )
+        situ_beta = DEFAULT_SITUV2_BETA if cfg["act"] == "situv2" else 1.0
+        situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA if cfg["act"] == "situv2" else 1.0
+        # The production wrapper prepares output buffers and launches once,
+        # outside screening timing. Reuse those buffers for kernel-only timing.
+        inter_q, inter_s = _mxfp4_a4w4_stage1_fw(
+            stage1_input,
+            data["w1_a16"],
+            data["w2_a16"],
+            sti,
+            sei,
+            nvi,
+            None,
+            topk,
+            block_m=bm,
+            a1_scale=stage1_scale,
+            w1_scale=data["w1s_a16"],
+            kernelName1=kn1,
+            m_indices=m_indices,
+            moe_buf=moe_buf,
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
+        )
+        placeholder = torch.empty(0, device=stage1_input.device, dtype=torch.uint8)
+        launch = functools.partial(
+            flydsl_mxfp4_gemm1,
+            a_quant=placeholder if bm == 16 else stage1_input,
+            a_scale_sorted_shuffled=placeholder if bm == 16 else stage1_scale,
+            w1_u8=data["w1_a16"].view(torch.uint8),
+            w1_scale_u8=data["w1s_a16"].view(torch.uint8),
+            sorted_expert_ids=sei,
+            cumsum_tensor=nvi,
+            m_indices=m_indices,
+            inter_sorted_quant=inter_q,
+            inter_sorted_shuffled_scale=inter_s,
+            hidden_states=stage1_input,
+            n_tokens=stage1_input.shape[0],
+            NE=data["w1_a16"].shape[0],
+            D_HIDDEN=data["w2_a16"].shape[1],
+            D_INTER=data["w1_a16"].shape[1] // 2,
+            topk=topk,
+            BM=bm,
+            BN=cfg["BN"],
+            BK=cfg["BK"],
+            use_nt=cfg["use_nt"],
+            inline_quant=cfg["inline_quant"],
+            prefetch_hidden=cfg["prefetch_hidden"],
+            xcd_swizzle=cfg["xcd_swizzle"],
+            num_waves=cfg["num_waves"],
+            k_wave=cfg["k_wave"],
+            interleave=False,
+            a_dtype=cfg["a_dtype"],
+            out_dtype=cfg["out_dtype"],
+            native_scale_layout=bm == 16,
+            act=cfg["act"],
+            situ_beta=situ_beta,
+            situ_linear_beta=situ_linear_beta,
+            swiglu_limit=runtime_swiglu_limit(swiglu_limit, cfg["act"]),
+        )
+        return launch, inter_q, inter_s
+
+    def _screen_gemm1(self, row: dict[str, Any], kn1: str, args: Any) -> float:
+        from aiter.test_common import run_perftest
+
+        data, sorting = self._prepare_screening_case(
+            row, _parse_mxfp4_g1_kname(kn1)["BM"], False
+        )
+        launch, _inter_q, _inter_s = self._prepare_gemm1_screening(
+            data, sorting, kn1, int(row["topk"]), self._screening_limit()
+        )
+        _, us = run_perftest(
+            launch, num_warmup=int(args.warmup), num_iters=int(args.iters)
+        )
+        return float(us)
+
+    @staticmethod
+    def _gemm2_screening_call(
+        data: dict[str, Any],
+        sorting: tuple[torch.Tensor, ...],
+        inter_q: torch.Tensor,
+        inter_s: torch.Tensor,
+        kn2: str,
+        topk: int,
+    ) -> Callable[[], torch.Tensor]:
+        cfg = parse_g2_kname_any(kn2)
+        sti, sw, sei, nvi, moe_buf, _m_indices, reverse_sorted = sorting
+        out = moe_buf if moe_buf.numel() else torch.empty_like(data["input"])
+
+        def launch() -> torch.Tensor:
+            # Atomic accumulation must start from zero on every timed iteration.
+            # The production wrapper includes each non-atomic reduction/scatter.
+            if cfg["atomic"]:
+                out.zero_()
+            return _mxfp4_a4w4_stage2_fw(
+                inter_q,
+                data["w1_a16"],
+                data["w2_a16"],
+                sti,
+                sei,
+                nvi,
+                out,
+                topk,
+                w2_scale=data["w2s_a16"],
+                a2_scale=inter_s,
+                block_m=cfg["BM"],
+                sorted_weights=sw,
+                kernelName2=kn2,
+                reverse_sorted=reverse_sorted,
+            )
+
+        return launch
+
+    def _screen_gemm2(
+        self, row: dict[str, Any], kn1: str, kn2: str, args: Any
+    ) -> float:
+        from aiter.test_common import run_perftest
+
+        cfg = parse_g2_kname_any(kn2)
+        data, sorting = self._prepare_screening_case(row, cfg["BM"], cfg["atomic"])
+        # The validated producer runs once during candidate-local setup. Neither
+        # its execution nor its intermediate survives into another screening run.
+        _producer, inter_q, inter_s = self._prepare_gemm1_screening(
+            data, sorting, kn1, int(row["topk"]), self._screening_limit()
+        )
+        launch = self._gemm2_screening_call(
+            data, sorting, inter_q, inter_s, kn2, int(row["topk"])
+        )
+        _, us = run_perftest(
+            launch, num_warmup=int(args.warmup), num_iters=int(args.iters)
+        )
+        return float(us)
+
+    @staticmethod
+    def _check_reference_output(
+        ref: torch.Tensor, out: torch.Tensor, err_ratio: float, label: str
+    ) -> bool:
+        err = cosine_diff_compare(ref, out, msg=label)
+        if err is None or not math.isfinite(float(err)) or float(err) > err_ratio:
+            raise RuntimeError(f"cosine err_ratio {err} > {err_ratio}")
+        return True
+
+    def _check_reference_consumer(
+        self, row: dict[str, Any], kn2: str, args: Any
+    ) -> bool:
+        cfg = parse_g2_kname_any(kn2)
+        data, sorting = self._prepare_screening_case(row, cfg["BM"], True)
+        token, topk = int(row["token"]), int(row["topk"])
+        activation = {
+            "silu": ActivationType.Silu,
+            "swiglu": ActivationType.Swiglu,
+            "situv2": ActivationType.Situv2,
+        }[self._row_act(row)]
+        ref1 = FmoeTuner.run_torch_moe_stage1(
+            data["a1_qt"],
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            data["a1_scale"],
+            data["w1_scale"],
+            dtype=dtypes.bf16,
+            activation=activation,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+            topk=topk,
+            swiglu_limit=self._screening_limit(),
+        )
+        sti, _sw, _sei, nvi, *_rest = sorting
+        intermediate = {
+            "sti": sti,
+            "cumsum": nvi,
+            "max_sorted": sti.shape[0],
+            "n": int(nvi[0].item()),
+        }
+        # Populate the native-BM sorted payload and scale layout from Torch,
+        # independently of every GEMM1 kernel under test.
+        _v2_populate_stage2(
+            {"ref1": ref1, "adtype": "fp4"}, intermediate, token, topk, cfg["BM"]
+        )
+        launch = self._gemm2_screening_call(
+            data, sorting, intermediate["isq"], intermediate["iss"], kn2, topk
+        )
+        out = launch()
+        ref = FmoeTuner.run_torch_moe_stage2(
+            ref1,
+            data["w1_qt"],
+            data["w2_qt"],
+            data["topk_weights"],
+            data["topk_ids"],
+            a2_scale=None,
+            w2_scale=data["w2_scale"],
+            dtype=dtypes.bf16,
+            quant_type=QuantType.per_1x32,
+            doweight_stage1=False,
+        )
+        return self._check_reference_output(
+            ref, out, float(args.errRatio), f"reference consumer[{kn2}]"
+        )
+
+    def _check_reference_pair(
+        self, row: dict[str, Any], kn1: str, kn2: str, args: Any
+    ) -> bool:
+        ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
+        token, topk = int(row["token"]), int(row["topk"])
+        activation = {
+            "silu": ActivationType.Silu,
+            "swiglu": ActivationType.Swiglu,
+            "situv2": ActivationType.Situv2,
+        }[self._row_act(row)]
+        data = self._prepare_case(token, h, e, ne, topk, dtypes.bf16)
+        out = self._port_e2e(
+            data,
+            kn1,
+            kn2,
+            topk,
+            ne,
+            h,
+            dtypes.bf16,
+            swiglu_limit=self._screening_limit(),
+        )
+        ref = self._torch_ref(
+            data, topk, dtypes.bf16, activation, swiglu_limit=self._screening_limit()
+        )
+        return self._check_reference_output(
+            ref, out, float(args.errRatio), f"reference pair[{kn1}+{kn2}]"
+        )
+
     @contextmanager
     def _staged_timeout(self, timeout: int) -> Iterator[None]:
         """Apply one best-effort staged-operation timeout."""
@@ -7119,6 +7406,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 us = launch()
                 if not math.isfinite(us) or us <= 0:
                     raise ValueError(f"non-positive or non-finite screening time: {us}")
+                print(f"[mxfp4-staged] {label} screening us={us}", flush=True)
                 return us
         except Exception as exc:
             if _is_accelerator_error(exc):
