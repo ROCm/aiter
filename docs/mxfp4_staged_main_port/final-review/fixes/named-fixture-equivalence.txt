@@ -1,0 +1,2 @@
+PASS: 22 regenerated named requests retain identical fixture metadata and candidate configuration CSV fields, matched by stable fixture id.
+Measured timing/error/roofline fields remain original GPU evidence; offline generation does not substitute new measurements.
