@@ -1,0 +1,84 @@
+EXISTING PASS minimax-64-full search
+RUN minimax-64-prune search
+Started GPU7 task pid=512391: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-64-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/search-task
+RUN minimax-64-staged search
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=516112: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-64-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/search-task
+RUN minimax-128-prune search
+Started GPU7 task pid=519217: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-128-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/search-task
+RUN minimax-128-staged search
+Started GPU7 task pid=525375: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-128-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/search-task
+RUN minimax-512-prune search
+Started GPU7 task pid=527687: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-512-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/search-task
+RUN minimax-512-staged search
+Started GPU7 task pid=530311: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-512-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/search-task
+RUN minimax-1024-prune search
+Started GPU7 task pid=532371: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-1024-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/search-task
+RUN minimax-1024-staged search
+Started GPU7 task pid=534622: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-1024-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/search-task
+FULL COST minimax-2048-full: [842, 14280] seconds; Wide extrapolation, not a bound. Unknown compile keys/failures; 8192 token memory/reference costs are extrapolated from prescribed 2048 pair checks. A still-live GPU hang is unbounded.
+RUN minimax-2048-full search
+Started GPU7 task pid=536686: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'full', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-2048-full.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/search-task
+RUN minimax-2048-prune search
+Started GPU7 task pid=540135: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-2048-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/search-task
+RUN minimax-2048-staged search
+Started GPU7 task pid=541964: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-2048-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/search-task
+RUN minimax-4096-prune search
+Started GPU7 task pid=544015: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-4096-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/search-task
+RUN minimax-4096-staged search
+Started GPU7 task pid=545595: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-4096-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/search-task
+FULL COST minimax-8192-full: [1732, 27960] seconds; Wide extrapolation, not a bound. Unknown compile keys/failures; 8192 token memory/reference costs are extrapolated from prescribed 2048 pair checks. A still-live GPU hang is unbounded.
+RUN minimax-8192-full search
+Started GPU7 task pid=547208: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'full', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-8192-full.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/search-task
+RUN minimax-8192-prune search
+Started GPU7 task pid=550543: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-8192-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/search-task
+RUN minimax-8192-staged search
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=551775: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/minimax-8192-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/search-task
+RUN gpt-2048-default-prune search
+Started GPU7 task pid=552923: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-default-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/search-task
+RUN gpt-2048-default-staged search
+Started GPU7 task pid=555625: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-default-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/search-task
+RUN gpt-2048-fp8-prune search
+Started GPU7 task pid=558304: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-fp8-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/search-task
+RUN gpt-2048-fp8-staged search
+Started GPU7 task pid=561004: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-fp8-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/search-task
+RUN gpt-2048-fp4-prune search
+Started GPU7 task pid=563673: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-fp4-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/search-task
+RUN gpt-2048-fp4-staged search
+Started GPU7 task pid=566350: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-fp4-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/search-task
+RUN gpt-2048-limit5-prune search
+Started GPU7 task pid=569331: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-limit5-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/search-task
+RUN gpt-2048-limit5-staged search
+Started GPU7 task pid=571973: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-limit5-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/search-task
+RUN gpt-2048-combined5-prune search
+Started GPU7 task pid=574615: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'prune', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-combined5-prune.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/winner.csv']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/search-task
+RUN gpt-2048-combined5-staged search
+Started GPU7 task pid=577260: ['csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py', '--mxfp4-flydsl', '--mxfp4-search-mode', 'staged', '--mp', '1', '--all', '--sort', 'True', '--warmup', '5', '--iters', '101', '--errRatio', '0.1', '-i', 'docs/mxfp4_staged_main_port/04/inputs/gpt-2048-combined5-staged.csv', '-o', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/winner.csv', '--mxfp4-screen-topk', '2']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/search-task
+Selected prescribed calibration actions completed

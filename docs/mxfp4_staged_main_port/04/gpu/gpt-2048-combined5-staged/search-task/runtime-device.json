@@ -1,0 +1,14 @@
+{
+  "utc": "2026-10-10T18:32:27.385525+00:00",
+  "pid": 577260,
+  "logical_gpu": 0,
+  "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+  "monitor_gpu": 7,
+  "pci": "0000:f5:00.0",
+  "gfx": "gfx950",
+  "cu_num": 256,
+  "name": "AMD Instinct MI355X",
+  "total_memory": 309220868096,
+  "torch": "2.8.0+rocm7.1.0.git7a520360",
+  "hip": "7.1.25424-4179531dcd"
+}

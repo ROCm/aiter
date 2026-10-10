@@ -1,0 +1,12 @@
+{"utc": "2026-10-10T16:36:33.590106+00:00", "id": "minimax-1024-prune", "attempts": 32, "elapsed": 28.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:37:18.605351+00:00", "id": "minimax-1024-prune", "attempts": 131, "elapsed": 73.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:38:03.617310+00:00", "id": "minimax-1024-prune", "attempts": 225, "elapsed": 118.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:38:48.628013+00:00", "id": "minimax-1024-prune", "attempts": 322, "elapsed": 163.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:39:33.638189+00:00", "id": "minimax-1024-prune", "attempts": 416, "elapsed": 208.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:40:18.649851+00:00", "id": "minimax-1024-prune", "attempts": 511, "elapsed": 253.8, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:41:03.661865+00:00", "id": "minimax-1024-prune", "attempts": 608, "elapsed": 298.8, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:41:48.673187+00:00", "id": "minimax-1024-prune", "attempts": 704, "elapsed": 343.8, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:42:33.685362+00:00", "id": "minimax-1024-prune", "attempts": 797, "elapsed": 388.8, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:43:18.696682+00:00", "id": "minimax-1024-prune", "attempts": 872, "elapsed": 433.8, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:44:03.709124+00:00", "id": "minimax-1024-prune", "attempts": 940, "elapsed": 478.8, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:44:48.719299+00:00", "id": "minimax-1024-prune", "attempts": 1024, "elapsed": 523.8, "g1_screens": 0, "g2_screens": 0}

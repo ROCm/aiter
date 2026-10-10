@@ -1,0 +1,102 @@
+{
+  "implementation_commit": "459e0e21e1461e45573eeaab01a38fbd08566614",
+  "csv": "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/winner.csv",
+  "shape": {
+    "token": 64,
+    "model_dim": 3072,
+    "inter_dim": 384,
+    "expert": 256,
+    "topk": 8
+  },
+  "action": "replay",
+  "swiglu_limit": null,
+  "clamp_evidence": null,
+  "preserve_generated_route_weights": true,
+  "situv2_public_defaults": false,
+  "situv2_beta": null,
+  "situv2_linear_beta": null,
+  "activation": "ActivationType.Silu",
+  "kernelName1": "flydsl_mxmoe_g1_a4w4_16x256x256_f16in_nt_xcd4",
+  "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16",
+  "block_m": 16,
+  "fuse_quant": "fp4",
+  "explicit_q_dtype_a": "torch.float4_e2m1fn_x2",
+  "quant_type": "QuantType.per_1x32",
+  "operations": [
+    {
+      "op": "g1",
+      "BM": 16,
+      "a_dtype": "fp4",
+      "out_dtype": "fp4",
+      "inline_quant": true,
+      "native_scale_layout": true,
+      "situ_beta": 1.0,
+      "situ_linear_beta": 1.0,
+      "interleave": false,
+      "hidden_dtype": "torch.bfloat16",
+      "swiglu_limit": "inf"
+    },
+    {
+      "op": "g2",
+      "kwargs": {
+        "BM": "16",
+        "BN": "256",
+        "BK": "128",
+        "a_dtype": "fp4",
+        "b_dtype": "fp4",
+        "epilog": "atomic",
+        "SBM": "16",
+        "persist": "False",
+        "out_dtype": "bf16"
+      },
+      "target_shape": [
+        64,
+        3072
+      ],
+      "target_dtype": "torch.bfloat16",
+      "scale_shape": null
+    }
+  ],
+  "finite": true,
+  "output_fingerprint": "65bd799c15c69c4a53c3682fdf5edc0ef69f7efe0734b8ba3931fa6d00ebf685",
+  "output_scalars": {
+    "sum": -472.4532165527344,
+    "norm": 544.9011840820312,
+    "min": -6.28125,
+    "max": 5.78125
+  },
+  "cosine_diff": 0.011497607187353931,
+  "input_csv_kernel_sum_us": 76.0348,
+  "synchronized_diagnostic_kernel_sum_with_main_aggregation_us": 75.55590217391321,
+  "raw_real_kernel_duration_sum_us": 75.75437623762376,
+  "matched_synchronized_real_kernel_trace_span_us": 228.96426844832922,
+  "matched_synchronized_elapsed_median_us": 227.5453880429268,
+  "matched_synchronized_elapsed_min_us": 222.96514362096786,
+  "matched_synchronized_elapsed_max_us": 401.81074291467667,
+  "trace_real_kernel_count": 404,
+  "measurement": {
+    "warmup": 5,
+    "iters": 101,
+    "timing_scope": "synchronized per-call diagnostic, using main kernel-duration aggregation; span and elapsed from same synchronized calls; CSV tuner latency uses normal continuous run_perftest"
+  },
+  "setup_seconds": 0.7550517730414867,
+  "wall_seconds": 3.869857913814485,
+  "torch_seed": 0,
+  "fingerprints": {
+    "input": "68dd32cc79866e8820faf45a88e0a4b144c515d2e0c94e67e6c8dee22db9e81b",
+    "topk_ids": "d688b398575f4c2db2ad3e753dc969d5d606844b02725391b615b7888d40a33c",
+    "topk_weights": "d430a9a7259c0a04b8038ab26db460ec7930d71c392c5c47bb04e0ed3f27db03"
+  },
+  "environment": {
+    "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+    "HIP_VISIBLE_DEVICES": "0",
+    "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+    "AITER_FLYDSL_STAGE2_FP8": "0",
+    "AITER_MXFP4_INTERMEDIATE": "0",
+    "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/calibration-aot-04-default",
+    "FLYDSL_RUNTIME_RUN_ONLY": "1",
+    "GPU_ARCHS": "gfx950",
+    "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+  }
+}
