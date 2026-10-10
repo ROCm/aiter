@@ -172,7 +172,12 @@ def test_shuffle_weight_pad_k_to_pads_last_dim():
     assert shuffled.aiter_padded_k == 128
 
 
-def test_gemm_a8w8_bpreshuffle_pads_activation_for_ck(monkeypatch):
+@pytest.fixture
+def cdna_dispatch(monkeypatch):
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx942")
+
+
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_ck(monkeypatch, cdna_dispatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -202,7 +207,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_ck(monkeypatch):
     assert seen["tail_is_zero"]
 
 
-def test_gemm_a8w8_bpreshuffle_pads_activation_for_cktile(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_cktile(monkeypatch, cdna_dispatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -232,7 +237,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_cktile(monkeypatch):
     assert seen["tail_is_zero"]
 
 
-def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch, cdna_dispatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -264,7 +269,7 @@ def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
     assert seen["tail_is_zero"]
 
 
-def test_gemm_a8w8_bpreshuffle_pads_activation_for_untuned_cktile(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_untuned_cktile(monkeypatch, cdna_dispatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -297,7 +302,7 @@ def test_gemm_a8w8_bpreshuffle_pads_activation_for_untuned_cktile(monkeypatch):
     assert seen["tail_is_zero"]
 
 
-def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch, cdna_dispatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
