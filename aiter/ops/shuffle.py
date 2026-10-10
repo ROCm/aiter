@@ -65,6 +65,57 @@ def shuffle_mxfp8fp4_scale(src: torch.Tensor) -> torch.Tensor:
     return out.view(x_type)
 
 
+#: Rows one packed mxfp8 A-scale group spans: a lane's four 16-row M tiles.
+_MXFP8_A_SCALE_GROUP = 64
+
+
+def shuffle_mxfp8_a_scale(exps: torch.Tensor) -> torch.Tensor:
+    """A-scale layout for the 8-wave mxfp8 GEMM, from ``[M, K/32]`` e8m0 bytes.
+
+    Returns a flat int32 buffer to hand the kernel as ``A_scale``. Two things
+    happen, for two different reasons.
+
+    **K-block major.** A block group's sixteen lanes want sixteen consecutive
+    rows of one K block, so K major puts them at consecutive addresses and the
+    load coalesces. Row major spreads them ``K/32`` bytes apart, which measures
+    +50-67% on the whole GEMM -- the addresses, not the bytes: same
+    instruction count, 3.2x the cache accesses.
+
+    **Four M tiles to a dword.** A lane's four A tiles differ only by sixteen
+    rows and share the K block, and ``opsel_b`` on the scaled MFMA names which
+    byte of the 32-bit scale operand the instruction reads. So packing the four
+    into one dword turns four loads into one and the byte select costs nothing.
+    Worth -5 to -7.5%, and it shrinks the buffer 4x by storing bytes rather
+    than int32. CK does the same in ``preShuffleScaleBuffer_gfx950``.
+
+    So within each 64-row group the order goes from ``ti*16 + r`` to
+    ``r*4 + ti``, a ``(4, 16) -> (16, 4)`` transpose and nothing else.
+    """
+    if exps.ndim != 2:
+        raise ValueError(f"expected a 2-D [M, K/32] scale, got {exps.ndim}-D")
+    m, kb = exps.shape
+    if m % _MXFP8_A_SCALE_GROUP:
+        raise ValueError(f"M={m} must be a multiple of {_MXFP8_A_SCALE_GROUP}")
+    out = exps.view(torch.uint8).t().contiguous()  # [K/32, M], K-block major
+    out = out.view(kb, m // _MXFP8_A_SCALE_GROUP, 4, 16)  # M -> (group, ti, r)
+    return out.permute(0, 1, 3, 2).contiguous().reshape(-1).view(torch.int32)
+
+
+def shuffle_mxfp8_b_scale(exps: torch.Tensor) -> torch.Tensor:
+    """B-scale layout for the 8-wave mxfp8 GEMM, from ``[N/32, K/32]`` e8m0 bytes.
+
+    K-block major for the same coalescing reason as the A scale, but no packing:
+    a 16-column tile never straddles a 32-column group, so all sixteen lanes of
+    a block group read the same address and the load is already a broadcast.
+    Widened to int32 because the MFMA's scale operand is a 32-bit register read
+    at op_sel 0, which makes a plain dword load cheaper than sub-dword
+    addressing on a buffer that is kilobytes against the weight's megabytes.
+    """
+    if exps.ndim != 2:
+        raise ValueError(f"expected a 2-D [N/32, K/32] scale, got {exps.ndim}-D")
+    return exps.view(torch.uint8).t().contiguous().to(torch.int32).reshape(-1)
+
+
 def shuffle_blockscale_to_mxfp8_scale(scale: torch.Tensor, n: int) -> torch.Tensor:
     """128x128 e8m0 block scale [ceil(n/128), K/128] -> shuffled 1x32 [pad32(n), K/32].
 

@@ -221,10 +221,32 @@ class StoreC:
 
 
 class Mfma16x16x128:
-    def __init__(self, n_tiles_a, n_tiles_b):
+    """``opsel_b_per_tile`` packs the B-tile scales four to a dword.
+
+    The scale operand is a 32-bit register and ``opsel_b`` names which of its
+    four bytes the instruction reads. So if the four B tiles' ue8m0 bytes are
+    packed into one dword, one load serves all four and the byte select costs
+    nothing -- it is the instruction's own field, not a shift. That needs one
+    atom per tile, since the attribute is baked in at atom construction. CK
+    does the same thing in ``preShuffleScaleBuffer_gfx950``.
+    """
+
+    def __init__(self, n_tiles_a, n_tiles_b, *, opsel_b_per_tile=False):
         self.atom = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
         )
+        self.atoms_b = [
+            fx.make_mma_atom(
+                fx.rocdl.cdna4.MFMA_Scale(
+                    16,
+                    16,
+                    128,
+                    fx.Float8E4M3FN,
+                    opsel_b=(j if opsel_b_per_tile else 0),
+                )
+            )
+            for j in range_constexpr(n_tiles_b)
+        ]
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
@@ -249,10 +271,25 @@ class Mfma16x16x128:
         fx.gemm(self.atom, c_frag, a_frag, b_frag, c_frag)
         return c_frag.load().ir_value()
 
-    def call(self, a, b, c, *, set_prio=True):
+    def call(self, a, b, c, *, set_prio=True, scale_a=None, scale_b=None):
+        """``scale_a`` / ``scale_b``, when given, are per-tile ue8m0 operands.
+
+        ``v_mfma_scale_f32_16x16x128_f8f6f4`` carries one ue8m0 scale per 32 K
+        per row and gathers the four of them across lanes: lane ``16*s + r``
+        supplies block ``s`` of row ``r`` at op_sel 0. One MFMA therefore
+        consumes a whole K=128 step with its four 32-blocks already dequantised
+        in hardware, so there is no promote arithmetic to schedule.
+
+        Leaving both None keeps the unscaled call byte-for-byte as it was.
+        """
         assert len(a) == self.n_tiles_a
         assert len(b) == self.n_tiles_b
         assert len(c) == self.n_tiles_a * self.n_tiles_b
+        scaled = scale_a is not None
+        assert scaled == (scale_b is not None), "pass both scales or neither"
+        if scaled:
+            assert len(scale_a) == self.n_tiles_a
+            assert len(scale_b) == self.n_tiles_b
 
         a_frags = [
             self._make_operand_frag(a[idx]) for idx in range_constexpr(self.n_tiles_a)
@@ -269,7 +306,18 @@ class Mfma16x16x128:
         for i in range_constexpr(self.n_tiles_a):
             for j in range_constexpr(self.n_tiles_b):
                 cf = c_frags[self.idx(i, j)]
-                fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
+                if const_expr(scaled):
+                    fx.gemm(
+                        self.atoms_b[j],
+                        cf,
+                        a_frags[i],
+                        b_frags[j],
+                        cf,
+                        scale_a=scale_a[i],
+                        scale_b=scale_b[j],
+                    )
+                else:
+                    fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
         if const_expr(set_prio):
             rocdl.s_setprio(0)
             rocdl.s_barrier()
