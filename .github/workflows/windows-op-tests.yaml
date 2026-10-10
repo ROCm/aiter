@@ -1,0 +1,109 @@
+name: Windows Op Tests
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/windows-op-tests.yaml"
+      - "op_tests/windows/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-op-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  op-tests:
+    name: op_tests/windows (gfx1201)
+    runs-on: windows-gfx1201-gpu-rocm
+    timeout-minutes: 90
+    env:
+      GFX: gfx1201
+      ROCM_INDEX: https://stable.repo.amd.com/rocm/whl-next/
+      ROCM_VERSION: 10.1.0
+      TORCH_VERSION: 2.14.0+rocm10.1.0
+      AITER_USE_SYSTEM_TRITON: "1"
+      ENABLE_CK: "0"
+      PREBUILD_KERNELS: "0"
+
+    steps:
+      - name: Configure Git long paths
+        shell: powershell
+        run: git config --global core.longpaths true
+
+      - name: Checkout aiter repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Cache pip wheels
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: pip-${{ runner.os }}-${{ env.GFX }}-rocm${{ env.ROCM_VERSION }}-torch${{ env.TORCH_VERSION }}
+
+      - name: Install ROCm and PyTorch from ROCm pip index
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-op-tests"
+          if (Test-Path $venv) {
+            Remove-Item -Recurse -Force $venv
+          }
+
+          python --version
+          python -m venv $venv
+          $python = Join-Path $venv "Scripts\python.exe"
+
+          & $python --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $python -m pip install `
+            --index-url "$env:ROCM_INDEX" `
+            --extra-index-url https://pypi.org/simple `
+            "torch[device-$env:GFX]==$env:TORCH_VERSION" `
+            "rocm[devel,device-$env:GFX]==$env:ROCM_VERSION"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $python -m rocm_sdk init
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Install aiter
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-op-tests"
+          $python = Join-Path $venv "Scripts\python.exe"
+
+          & $python -m pip install --upgrade `
+            -r requirements.txt `
+            wheel `
+            "setuptools_scm<10" `
+            triton-windows `
+            numpy
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          & $python -m pip install -e . --no-build-isolation -v
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Run op_tests/windows
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Continue"
+          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-op-tests"
+          $python = Join-Path $venv "Scripts\python.exe"
+
+          & $python -m pytest -q -s op_tests/windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
