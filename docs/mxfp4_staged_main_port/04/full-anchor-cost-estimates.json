@@ -131,7 +131,18 @@
         "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
         "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
         "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
-      ]
+      ],
+      "prior_completed_anchor_observation": {
+        "id": "minimax-64-full",
+        "process_wall_seconds": 699.554425,
+        "tuner_summary_seconds": 692.3451,
+        "returned_pairs": 1368,
+        "observed_process_seconds_per_attempt": 0.5113701937134503,
+        "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
+        "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
+        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound."
+      },
+      "estimate_update": "Retain original wide range after observing full64 ~0.511s per returned attempt; 2048/8192 preparation/reference costs and new cold compile keys are not determined by token64 throughput."
     },
     {
       "id": "minimax-8192-full",
@@ -156,8 +167,31 @@
         "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
         "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
         "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
-      ]
+      ],
+      "prior_completed_anchor_observation": {
+        "id": "minimax-64-full",
+        "process_wall_seconds": 699.554425,
+        "tuner_summary_seconds": 692.3451,
+        "returned_pairs": 1368,
+        "observed_process_seconds_per_attempt": 0.5113701937134503,
+        "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
+        "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
+        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound."
+      },
+      "estimate_update": "Retain original wide range after observing full64 ~0.511s per returned attempt; 2048/8192 preparation/reference costs and new cold compile keys are not determined by token64 throughput."
     }
   ],
-  "cache_protocol_revision": "First full64 starts with empty calibration-search-04-default cache. All later initial searches use a fresh initially empty per-id FlyDSL cache; auxiliary AITER cache stays warmed equally. First task is unchanged; no active environment mutation."
+  "cache_protocol_revision": "First full64 starts with empty calibration-search-04-default cache. All later initial searches use a fresh initially empty per-id FlyDSL cache; auxiliary AITER cache stays warmed equally. First task is unchanged; no active environment mutation.",
+  "observed_completed_anchors": [
+    {
+      "id": "minimax-64-full",
+      "process_wall_seconds": 699.554425,
+      "tuner_summary_seconds": 692.3451,
+      "returned_pairs": 1368,
+      "observed_process_seconds_per_attempt": 0.5113701937134503,
+      "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
+      "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
+      "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound."
+    }
+  ]
 }
