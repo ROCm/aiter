@@ -100,6 +100,7 @@ def _paged_attn_decode_v1_wo_dot_kernel(
         kv_blk_nums = tl.load(blk_tbl_start_ptr + b)
         kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
         blk_seq_offs = b * KV_BLK_SZ + blk_offs
+        blk_seq_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
             & (blk_offs[:, None] < KV_BLK_SZ)
@@ -118,11 +119,11 @@ def _paged_attn_decode_v1_wo_dot_kernel(
         qk = tl.sum(
             (q[None, :] * k).to(tl.float32), axis=1
         )  # [1, HEAD_SZ_POW2] * [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(blk_seq_mask, qk, float("-inf"))
 
         if alibi_slopes_ptr is not None:
             qk += (alibi_slope * (blk_seq_offs - seq_len + 1)).to(tl.float32)
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(blk_seq_mask, qk, float("-inf"))
 
         max_logit_new = tl.maximum(tl.max(qk, axis=0), max_logit)
 
@@ -132,7 +133,7 @@ def _paged_attn_decode_v1_wo_dot_kernel(
         acc *= alpha
 
         # load v [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
-        v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask)
+        v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
         if v_0.dtype.is_fp8():
             v = v_0.to(tl.float32) * v_scale
         else:
@@ -248,6 +249,7 @@ def _paged_attn_decode_v1_w_dot_kernel(
         kv_blk_nums = tl.load(blk_tbl_start_ptr + b)
         kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
         blk_seq_offs = b * KV_BLK_SZ + blk_offs
+        blk_seq_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
             & (blk_offs[:, None] < KV_BLK_SZ)
@@ -262,7 +264,7 @@ def _paged_attn_decode_v1_w_dot_kernel(
         # qk: [QUERY_GRP_SZ_POW2, KV_BLK_SZ_POW2]
         qk = tl.dot(q, k.T, out_dtype=tl.float32)
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & blk_seq_mask[None, :],
             qk,
             float("-inf"),
         )
@@ -273,7 +275,7 @@ def _paged_attn_decode_v1_w_dot_kernel(
             )
 
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & blk_seq_mask[None, :],
             qk,
             float("-inf"),
         )
@@ -371,7 +373,10 @@ def _paged_attn_decode_v2_wo_dot_kernel(
 
     seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
-    num_kv_blks = tl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
+    # KV_BLK_SZ need not divide SEQ_PARTITION_SZ, so the first and last block of a
+    # partition can straddle its boundaries; the mask below keeps only its tokens.
+    kv_blk_start = seq_start_idx // KV_BLK_SZ
+    num_kv_blks = tl.cdiv(seq_end_idx, KV_BLK_SZ) - kv_blk_start
 
     blk_offs = tl.arange(0, KV_BLK_SZ_POW2)
     head_sz_offs = tl.arange(0, HEAD_SZ_POW2)
@@ -396,7 +401,6 @@ def _paged_attn_decode_v2_wo_dot_kernel(
         + blk_offs[:, None] * stride_k_kb
         + head_sz_offs[None, :]
     )
-    kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
     blk_tables_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
     for b in range(num_kv_blks):
@@ -405,6 +409,11 @@ def _paged_attn_decode_v2_wo_dot_kernel(
 
         kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
+        blk_seq_mask = (
+            (blk_seq_offs >= seq_start_idx)
+            & (blk_seq_offs < seq_end_idx)
+            & (blk_offs < KV_BLK_SZ)
+        )
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
             & (blk_offs[:, None] < KV_BLK_SZ)
@@ -418,11 +427,11 @@ def _paged_attn_decode_v2_wo_dot_kernel(
 
         # qk: [KV_BLK_SZ_POW2]
         qk = tl.sum((q[None, :] * k).to(tl.float32), axis=1)
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(blk_seq_mask, qk, float("-inf"))
 
         if alibi_slopes is not None:
             qk += (alibi_slope * (blk_seq_offs - seq_len + 1)).to(tl.float32)
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(blk_seq_mask, qk, float("-inf"))
 
         max_logit_new = tl.maximum(max_logit, tl.max(qk, axis=0))
 
@@ -630,7 +639,10 @@ def _paged_attn_decode_v2_w_dot_kernel(
 
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
 
-    num_kv_blks = tl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
+    # KV_BLK_SZ need not divide SEQ_PARTITION_SZ, so the first and last block of a
+    # partition can straddle its boundaries; the mask below keeps only its tokens.
+    kv_blk_start = seq_start_idx // KV_BLK_SZ
+    num_kv_blks = tl.cdiv(seq_end_idx, KV_BLK_SZ) - kv_blk_start
 
     blk_offs = tl.arange(0, KV_BLK_SZ_POW2)
     head_sz_offs = tl.arange(0, HEAD_SZ_POW2)
@@ -665,7 +677,6 @@ def _paged_attn_decode_v2_w_dot_kernel(
         + blk_offs[:, None] * stride_k_kb
         + head_sz_offs[None, :]
     )
-    kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     for b in range(num_kv_blks):
         kv_blk_idx = kv_blk_start + b
@@ -673,6 +684,11 @@ def _paged_attn_decode_v2_w_dot_kernel(
 
         kv_blk_offs = kv_blk_nums * stride_k_b + kv_offs
         blk_seq_offs = kv_blk_idx * KV_BLK_SZ + blk_offs
+        blk_seq_mask = (
+            (blk_seq_offs >= seq_start_idx)
+            & (blk_seq_offs < seq_end_idx)
+            & (blk_offs < KV_BLK_SZ)
+        )
         kv_mask = (
             (blk_seq_offs[:, None] < seq_len)
             & (blk_offs[:, None] < KV_BLK_SZ)
@@ -687,7 +703,7 @@ def _paged_attn_decode_v2_w_dot_kernel(
         # qk: [QUERY_GRP_SZ_POW2, KV_BLK_SZ_POW2]
         qk = tl.dot(q, k.T, out_dtype=tl.float32)
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & blk_seq_mask[None, :],
             qk,
             float("-inf"),
         )
@@ -697,7 +713,7 @@ def _paged_attn_decode_v2_w_dot_kernel(
                 tl.float32
             )
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & blk_seq_mask[None, :],
             qk,
             float("-inf"),
         )
@@ -959,10 +975,10 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
 
         # qk #[KV_BLK_SZ_POW2]
         qk = tl.sum((q[None, :] * k).to(tl.float32), axis=1)
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(kv_scale_mask, qk, float("-inf"))
         if alibi_slopes_ptr is not None:
             qk += (alibi_slope * (blk_seq_offs - seq_len + 1)).to(tl.float32)
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(kv_scale_mask, qk, float("-inf"))
 
         max_logit_new = tl.maximum(tl.max(qk, axis=0), max_logit)
 
@@ -973,7 +989,7 @@ def _paged_attn_decode_v1_wo_dot_kernel_per_token_quant(
 
         # load v [KV_BLK_SZ_POW2, HEAD_SZ_POW2]
         v_scale = tl.load(v_scale_ptr + kv_scale_offs, mask=kv_scale_mask, other=0.0)
-        v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask)
+        v_0 = tl.load(v_cache_ptr + kv_blk_offs, mask=kv_mask, other=0.0)
         if v_0.dtype.is_fp8():
             v = v_0.to(tl.float32) * v_scale[:, None]
         else:
@@ -1113,7 +1129,7 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
         # qk: [QUERY_GRP_SZ_POW2, KV_BLK_SZ_POW2]
         qk = tl.dot(q, k.T, out_dtype=tl.float32)
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & kv_scale_mask[None, :],
             qk,
             float("-inf"),
         )
@@ -1124,7 +1140,7 @@ def _paged_attn_decode_v1_w_dot_kernel_per_token_quant(
             )
 
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & kv_scale_mask[None, :],
             qk,
             float("-inf"),
         )
@@ -1228,7 +1244,10 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
 
     seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
-    num_kv_blks = tl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
+    # KV_BLK_SZ need not divide SEQ_PARTITION_SZ, so the first and last block of a
+    # partition can straddle its boundaries; the mask below keeps only its tokens.
+    kv_blk_start = seq_start_idx // KV_BLK_SZ
+    num_kv_blks = tl.cdiv(seq_end_idx, KV_BLK_SZ) - kv_blk_start
 
     blk_offs = tl.arange(0, KV_BLK_SZ_POW2)
     head_sz_offs = tl.arange(0, HEAD_SZ_POW2)
@@ -1253,7 +1272,6 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
         + blk_offs[:, None] * stride_k_kb
         + head_sz_offs[None, :]
     )
-    kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
     k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb
     blk_tables_start_ptr = blk_tables_ptr + seq_idx * stride_bt_s
 
@@ -1269,7 +1287,11 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
             & (head_sz_offs[None, :] < HEAD_SZ)
         )
 
-        kv_scale_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
+        kv_scale_mask = (
+            (blk_seq_offs >= seq_start_idx)
+            & (blk_seq_offs < seq_end_idx)
+            & (blk_offs < KV_BLK_SZ)
+        )
         kv_scale_offs = kv_blk_nums * stride_k_scale_b + k_scale_offs
 
         # load k[KV_BLK_SZ_POW2, HEAD_SZ_POW2]
@@ -1280,11 +1302,11 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
 
         # qk: [KV_BLK_SZ_POW2]
         qk = tl.sum((q[None, :] * k).to(tl.float32), axis=1)
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(kv_scale_mask, qk, float("-inf"))
 
         if alibi_slopes is not None:
             qk += (alibi_slope * (blk_seq_offs - seq_len + 1)).to(tl.float32)
-        qk = tl.where(blk_seq_offs < seq_len, qk, float("-inf"))
+        qk = tl.where(kv_scale_mask, qk, float("-inf"))
 
         max_logit_new = tl.maximum(max_logit, tl.max(qk, axis=0))
 
@@ -1499,7 +1521,10 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
 
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
 
-    num_kv_blks = tl.cdiv(seq_end_idx - seq_start_idx, KV_BLK_SZ)
+    # KV_BLK_SZ need not divide SEQ_PARTITION_SZ, so the first and last block of a
+    # partition can straddle its boundaries; the mask below keeps only its tokens.
+    kv_blk_start = seq_start_idx // KV_BLK_SZ
+    num_kv_blks = tl.cdiv(seq_end_idx, KV_BLK_SZ) - kv_blk_start
 
     blk_offs = tl.arange(0, KV_BLK_SZ_POW2)
     head_sz_offs = tl.arange(0, HEAD_SZ_POW2)
@@ -1534,7 +1559,6 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
         + blk_offs[:, None] * stride_k_kb
         + head_sz_offs[None, :]
     )
-    kv_blk_start = seq_part_idx * (SEQ_PARTITION_SZ // KV_BLK_SZ)
     k_scale_offs = kv_head_idx * stride_k_scale_nh + blk_offs * stride_k_scale_kb
     blk_tables_start_ptr = blk_tables_ptrs + seq_idx * stride_bt_s
     for b in range(num_kv_blks):
@@ -1549,7 +1573,11 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
             & (head_sz_offs[None, :] < HEAD_SZ)
         )
 
-        kv_scale_mask = (blk_seq_offs < seq_len) & (blk_offs < KV_BLK_SZ)
+        kv_scale_mask = (
+            (blk_seq_offs >= seq_start_idx)
+            & (blk_seq_offs < seq_end_idx)
+            & (blk_offs < KV_BLK_SZ)
+        )
         kv_scale_offs = kv_blk_nums * stride_k_scale_b + k_scale_offs
 
         # load k[KV_BLK_SZ_POW2, HEAD_SZ_POW2]
@@ -1561,7 +1589,7 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
         # qk: [QUERY_GRP_SZ_POW2, KV_BLK_SZ_POW2]
         qk = tl.dot(q, k.T, out_dtype=tl.float32)
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & kv_scale_mask[None, :],
             qk,
             float("-inf"),
         )
@@ -1571,7 +1599,7 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
                 tl.float32
             )
         qk = tl.where(
-            (q_grp_offs[:, None] < QUERY_GRP_SZ) & (blk_seq_offs[None, :] < seq_len),
+            (q_grp_offs[:, None] < QUERY_GRP_SZ) & kv_scale_mask[None, :],
             qk,
             float("-inf"),
         )
