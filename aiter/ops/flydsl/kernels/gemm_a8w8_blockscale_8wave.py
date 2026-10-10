@@ -462,8 +462,8 @@ def compile_gemm_fp8_8wave(
 
         def begin_compute_phase():
             rocdl.sched_barrier(0)
-            rocdl.s_barrier()
             rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+            rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
         def end_compute_phase():
@@ -718,8 +718,6 @@ def compile_gemm_fp8_8wave(
                     if const_expr(m_slice == 0):
                         lds_rd_Br(tick)
                     else:
-                        # A_t must survive slice0; only slice1's read closes
-                        # its lifetime in both staggered wave groups.
                         async_copy_At(lds_idx=tick, ki=ki + 2)
 
                     fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
@@ -740,6 +738,13 @@ def compile_gemm_fp8_8wave(
                         # B survives in registers through slice1; its LDS
                         # slot is already free after slice0's reads.
                         async_copy_Bl(lds_idx=tick, ki=ki + 2)
+                    else:
+                        # Six k+2 A/B loads follow all k+1 loads; ScaleA(k+2)
+                        # has not issued yet. W6 before BL[s1].begin lets
+                        # L.BL[s1].end confirm every producer's completion.
+                        rocdl.s_waitcnt(
+                            encode_waitcnt_950(vmcnt=vm_load_cnt_a + vm_load_cnt_b * 2)
+                        )
 
                     fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
                     begin_compute_phase()
@@ -756,19 +761,7 @@ def compile_gemm_fp8_8wave(
                     if const_expr(m_slice == 0):
                         async_copy_Br(lds_idx=tick, ki=ki + 2)
                     else:
-                        # BL[s1]'s end barrier closes all current ScaleA reads.
                         async_copy_scale_a(lds_idx=tick, ki=ki + 2)
-                        # this vmcnt ensure ki+1 prefetch all complted. The mainloop next iteration would read the ki+1 data.
-                        rocdl.s_waitcnt(
-                            encode_waitcnt_950(
-                                vmcnt=vm_load_cnt_a
-                                + vm_load_cnt_b * 2
-                                + vm_load_cnt_scale_a
-                            )
-                        )
-                        # BL[s1] has consumed the current B_l registers.
-                        # The next LDS slot predates A_b(k+1), which
-                        # the rolling vmcnt wait above completes.
                         lds_rd_Bl(lds_idx=tock)
 
                     fifo_scale_a_1, fifo_scale_b_1 = mfma_scaleA, mfma_scaleB[1]
