@@ -42,8 +42,8 @@ class MegaMoEV2:
         swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
         act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0):
     # fmt: on
-        if quant != "a8w4":
-            raise ValueError("MegaMoEV2 currently supports quant='a8w4' only")
+        if quant not in ("a4w4", "a8w4"):
+            raise ValueError("MegaMoEV2 quant must be 'a4w4' or 'a8w4'")
         if experts % world_size != 0:
             raise ValueError(f"experts={experts} must be divisible by world_size={world_size}")
         if max_tok_per_rank <= 0 or max_tok_per_rank & (max_tok_per_rank - 1):
@@ -58,9 +58,13 @@ class MegaMoEV2:
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
         self.mtpr = int(max_tok_per_rank)
-        self._a_dtype = "fp8"
-        self._a_torch_dtype = torch.float8_e4m3fn
-        self._a_view_dim = self.model_dim
+        self._a_dtype = "fp4" if quant == "a4w4" else "fp8"
+        self._a_torch_dtype = (
+            torch.float4_e2m1fn_x2
+            if self._a_dtype == "fp4"
+            else torch.float8_e4m3fn
+        )
+        self._a_view_dim = self.model_dim // 2 if self._a_dtype == "fp4" else self.model_dim
         self.swiglu_limit = float(swiglu_limit)
         self.act = act
         self.situ_beta = float(situ_beta)
@@ -71,6 +75,7 @@ class MegaMoEV2:
             raise ValueError("situv2 requires positive situ_beta / situ_linear_beta")
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
+            a_dtype=self._a_dtype,
             p2p_quant=stage2_p2p_quant,
             experts_per_rank=self.epr,
             model_dim=self.model_dim,
@@ -182,21 +187,46 @@ class MegaMoEV2:
         v = op._ll_views()
         self._s1_rx = v["rx_em"]
         self._s1_scale_i32 = v["scale_em_i32"]
+        self._s1_rx_kernel = (
+            self._s1_rx.view(torch.uint8)
+            if self._a_dtype == "fp4"
+            else self._s1_rx
+        )
+        self._s1_scale_kernel = (
+            self._s1_scale_i32.view(torch.uint8)
+            if self._a_dtype == "fp4"
+            else self._s1_scale_i32
+        )
 
         inter_dim = self.inter_dim
         a2rows = self._s1_nvm
-        self._s1_out = torch.zeros(
-            (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
-        )
+        if self._a_dtype == "fp4":
+            self._s1_out = torch.zeros(
+                (a2rows, inter_dim // 2), dtype=torch.uint8, device=self.dev
+            ).view(torch.float4_e2m1fn_x2)
+            self._s1_out_kernel = self._s1_out.view(torch.uint8)
+        else:
+            self._s1_out = torch.zeros(
+                (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
+            )
+            self._s1_out_kernel = self._s1_out
         prows = ((a2rows + 255) // 256) * 256
         pcols = (((inter_dim // 32) + 7) // 8) * 8
         self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
-        self._s1_quant_x = torch.empty(
-            self.mtpr,
-            self.model_dim,
-            dtype=torch.float8_e4m3fn,
-            device=self.dev,
-        )
+        if self._a_dtype == "fp4":
+            self._s1_quant_x = torch.empty(
+                self.mtpr,
+                self.model_dim // 2,
+                dtype=torch.uint8,
+                device=self.dev,
+            ).view(torch.float4_e2m1fn_x2)
+        else:
+            self._s1_quant_x = torch.empty(
+                self.mtpr,
+                self.model_dim,
+                dtype=torch.float8_e4m3fn,
+                device=self.dev,
+            )
         self._s1_quant_scale = torch.empty(
             self.mtpr,
             self._s1_scale_dim,
@@ -426,6 +456,7 @@ class MegaMoEV2:
                     num_prepare_cu=prepare_blocks,
                     num_quant_cu=preload_quant_blocks,
                     quant_cu_capacity=self._s1_quant_cu_capacity,
+                    quant_mode=self._a_dtype,
                     model_dim=self.model_dim,
                     payload_chunk_rows=config.payload_chunk_rows,
                     tile_state_stride=self._s1_tile_state_stride,
@@ -433,10 +464,10 @@ class MegaMoEV2:
 
         op = self._s1_op
         self._s1_preload_bundle(
-            self._s1_out,
-            self._s1_rx,
+            self._s1_out_kernel,
+            self._s1_rx_kernel,
             self._s1_w1,
-            self._s1_scale_i32,
+            self._s1_scale_kernel,
             self._s1_w1_scale,
             op.tile_row_base,
             op.sorted_expert_ids,
@@ -468,6 +499,8 @@ class MegaMoEV2:
             variants=self._bundle_plan.stage1_variants,
             swiglu_limit=self.swiglu_limit,
             act=self.act, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta,
+            a_dtype=self._a_dtype,
+            out_dtype=self._a_dtype,
         )
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
@@ -534,6 +567,7 @@ class MegaMoEV2:
             num_prepare_cu=prepare_blocks,
             num_quant_cu=quant_blocks,
             quant_cu_capacity=self._s1_quant_cu_capacity,
+            quant_mode=self._a_dtype,
             model_dim=self.model_dim,
             payload_chunk_rows=config.payload_chunk_rows,
             tile_state_stride=self._s1_tile_state_stride,
@@ -592,7 +626,7 @@ class MegaMoEV2:
             self._run_compact_prepare(topk_ids, cur_tok, config, stream)
         op = self._s1_op
         common_args = (
-            self._s1_out, self._s1_rx, self._s1_w1, self._s1_scale_i32, self._s1_w1_scale,
+            self._s1_out_kernel, self._s1_rx_kernel, self._s1_w1, self._s1_scale_kernel, self._s1_w1_scale,
             op.tile_row_base, op.sorted_expert_ids, op.num_valid, self._s1_osd, fx.Int32(self._s1_nvm),
             fx.Int64(self._s1_disp.data_ptr()), fx.Int32(cur_tok), fx.Int64(x.data_ptr()),
             fx.Int64(topk_ids.data_ptr()), fx.Int64(wts.data_ptr()), fx.Int64(scales.data_ptr()),
@@ -614,6 +648,8 @@ class MegaMoEV2:
             "act": self.act,
             "situ_beta": self.situ_beta,
             "situ_linear_beta": self.situ_linear_beta,
+            "a_dtype": self._a_dtype,
+            "out_dtype": self._a_dtype,
             "bounds_check": self._s1_bounds_check,
         }
         entry = self._active_bundle_entry
@@ -659,6 +695,19 @@ class MegaMoEV2:
         if x_bf16.shape[0] == 0:
             # A zero-token rank still participates in the downstream
             # collectives, but HIP rejects a zero-grid quant kernel launch.
+            if self._a_dtype == "fp4":
+                return (
+                    torch.empty(
+                        (0, self._a_view_dim),
+                        dtype=self._a_torch_dtype,
+                        device=self.dev,
+                    ),
+                    torch.empty(
+                        (0, self._s1_scale_dim),
+                        dtype=torch.uint8,
+                        device=self.dev,
+                    ),
+                )
             return self._s1_quant_x[:0], self._s1_quant_scale[:0]
         return per_1x32_mx_quant(x_bf16, quant_mode=self._a_dtype)
 

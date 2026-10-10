@@ -2,6 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """Static MegaMoEV2 configuration rules for MI355X."""
 
+import os
 from bisect import bisect_left
 from dataclasses import dataclass, replace
 from functools import cache
@@ -37,12 +38,21 @@ INDEXED_PAYLOAD_MIN_SBM = 128
 # Source-indexed payload storage cuts the maximum-capacity activation buffer
 # by roughly ``topk``.  Keep every smaller capacity on the historical layout.
 REFERENCE_EXPERTS_PER_RANK = 48
+R1_EXPERTS_PER_RANK = 32
 KIMI_K3_EXPERTS_PER_RANK = 112
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
 MAX_FANOUT_SEGMENTS = 1024
 MAX_FANOUT_EXPERTS_PER_RANK = 256
+P2P_QUANT_AUTO = "auto"
+P2P_QUANT_NONE = "none"
+P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
+SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
+
+ACTIVATION_FP4 = "fp4"
+ACTIVATION_FP8 = "fp8"
+SUPPORTED_ACTIVATION_DTYPES = (ACTIVATION_FP4, ACTIVATION_FP8)
 P2P_QUANT_AUTO = "auto"
 P2P_QUANT_NONE = "none"
 P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
@@ -406,16 +416,347 @@ def _replace_config(
     )
 
 
+def _apply_a4_tuning(
+    config: MegaMoEConfig,
+    *,
+    tokens: int,
+    bucket: int,
+    mtpr: int,
+    experts_per_rank: int,
+) -> MegaMoEConfig:
+    """Apply only A4W4 configurations validated on MI355X.
+
+    The unsafe BS8192 DCU/grid/chunk overrides are intentionally excluded.
+
+    Kimi-K3's 112 experts per rank must not inherit R1/V4-Pro A4W4 knobs; its
+    tuning lives in select_mega_moe_config so it applies to A8W4 too.
+    """
+    if experts_per_rank == KIMI_K3_EXPERTS_PER_RANK:
+        return config
+    if mtpr <= FIXED_SLOT_MAX_MTPR:
+        if bucket == 4:
+            config = _replace_config(config, stage1={"grid_mult": 4})
+        elif bucket == 16:
+            config = _replace_config(config, stage1={"grid_mult": 3})
+
+    if bucket <= 128 and config.stage1.async_a_copy:
+        # FP4 halves the A K-step bytes. SBM64 gives every thread at least one
+        # 16-byte async copy unless a validated synchronous patch below applies.
+        config = _replace_config(config, stage1={"sort_block_m": 64})
+
+    if 256 <= tokens < 32768:
+        config = _replace_config(config, stage1={"waves_per_eu_hint": 1})
+
+    if experts_per_rank == R1_EXPERTS_PER_RANK:
+        if bucket <= 128:
+            if bucket in (8, 16, 32):
+                # SBM32 + num_waves=8 needs the async A-copy DMA path: the
+                # synchronous reg->LDS copy races under 8 waves (CUDA-graph
+                # replay nondeterminism).  async_a_copy=True makes the w8 + mfma
+                # geometry deterministic.
+                stage1_patch: dict[str, object] = {
+                    "sort_block_m": 32,
+                    "num_waves": 8,
+                    "async_a_copy": True,
+                    "mfma_amajor": True,
+                }
+            elif bucket == 128:
+                # SBM64 + w8 on the async DMA path (crash-free).
+                stage1_patch = {
+                    "sort_block_m": 64,
+                    "num_waves": 8,
+                    "async_a_copy": True,
+                    "mfma_amajor": True,
+                }
+            elif bucket == 64:
+                # bs=64 uses the SBM64+w8 base with synchronous A-copy: SBM64
+                # keeps the reg->LDS copy race-free without async (the race only
+                # bites SBM32+nw8), so async off is safe.  Pairs with the deep_a
+                # pipeline in Stage2 + dcu160.  work_shards 4->2 reduces the
+                # dispatch kernel's scheduling overhead.
+                stage1_patch = {
+                    "sort_block_m": 64,
+                    "num_waves": 8,
+                    "async_a_copy": False,
+                    "mfma_amajor": True,
+                    "work_shards": 2,
+                }
+            else:
+                stage1_patch = {
+                    "sort_block_m": 32,
+                    "num_waves": 4,
+                    "async_a_copy": False,
+                }
+            config = _replace_config(config, stage1=stage1_patch)
+        if mtpr == 8192:
+            # num_dispatch_cu per token bucket (MI355X), retuned after the
+            # read-before-write fix: higher DCU + grid_mult=2 on small buckets.
+            r1_dispatch_cu = {
+                1: 192,
+                2: 224,
+                4: 224,
+                8: 224,
+                16: 160,
+                32: 128,
+                64: 160,
+                128: 160,
+                256: 96,
+                512: 160,
+                1024: 32,
+                2048: 64,
+                4096: 72,
+                8192: 96,
+            }[bucket]
+            # Latency-bound tiny buckets retuned on MI355X: bs1 dcu->192, bs2/4
+            # dcu->224, bs4 also grid_mult 1->2.  dcu224 is bucket-specific (it
+            # oversubscribes CUs at bs16), so it is set per bucket.
+            stage1_patch = {"num_dispatch_cu": r1_dispatch_cu}
+            if bucket in (2, 4, 8, 16, 32):
+                stage1_patch["grid_mult"] = 2
+            config = _replace_config(config, stage1=stage1_patch)
+            if bucket == 2048:
+                # Raise the sort block to 128 (as 4096/8192 already use) with
+                # mfma_amajor for bucket 2048.
+                config = _replace_config(
+                    config,
+                    stage1={
+                        "sort_block_m": 128,
+                        "num_waves": 8,
+                        "tile_n": 512,
+                        "mfma_amajor": True,
+                    },
+                )
+            if bucket == 64:
+                # bs=64 Stage2: deep_a pipeline on the SBM64+w8 base with bm64;
+                # pairs with the dcu160 set above.  block_n stays at 256.
+                config = _replace_config(
+                    config,
+                    stage2={
+                        "block_m": 64,
+                        "b2stage": True,
+                        "deep_a_pipeline": True,
+                    },
+                )
+            if bucket == 128:
+                # bs=128 Stage2: deep_a pipeline + bm64 (widen the M tile to fill
+                # the SBM64 sort block), mirroring V4-Pro's large-bucket recipe.
+                # bm64 is required; plain deep_a without it does nothing here.
+                config = _replace_config(
+                    config,
+                    stage2={
+                        "block_m": 64,
+                        "b2stage": True,
+                        "deep_a_pipeline": True,
+                    },
+                )
+            if bucket == 256:
+                # bs=256: BN256 + BM64 on the base SBM64/w8/async path.
+                # skew_cu=96 (the K3-style CU-skew that _select_large_stage2
+                # only gives buckets >=512); scoped to 256 since it does not help
+                # 512.  b_nt=0 caches the weights instead of streaming them past
+                # L2 (reused enough at 256 tokens); scoped to 256 since 128
+                # reuses them too little.
+                config = _replace_config(
+                    config,
+                    stage1={"mfma_amajor": True, "b_nt": 0},
+                    stage2={"block_n": 256, "block_m": 64, "skew_cu": 96},
+                )
+        elif bucket == 16384:
+            config = _replace_config(config, stage1={"payload_chunk_rows": 1536})
+        elif bucket == 32768:
+            config = _replace_config(
+                config,
+                stage1={"payload_chunk_rows": 384, "num_dispatch_cu": 64},
+            )
+        # Experimental override hook (default off): R1_TUNE_JSON supplies a
+        # {"stage1":{...},"stage2":{...}} patch, R1_TUNE_BUCKETS scopes it to a
+        # comma-separated bucket allowlist so the bundle plan's other buckets
+        # keep their validated geometry.  Used only for tuning sweeps.
+        _tune = os.environ.get("R1_TUNE_JSON")
+        if _tune:
+            import json
+
+            _only = os.environ.get("R1_TUNE_BUCKETS")
+            if not _only or bucket in {int(x) for x in _only.split(",") if x}:
+                _patch = json.loads(_tune)
+                config = _replace_config(
+                    config,
+                    stage1=_patch.get("stage1"),
+                    stage2=_patch.get("stage2"),
+                )
+        return config
+
+    # These tables are V4-Pro-specific.
+    if experts_per_rank != REFERENCE_EXPERTS_PER_RANK:
+        return config
+
+    bucket_stage1: dict[str, object] = {}
+    bucket_stage2: dict[str, object] = {}
+    if bucket == 512:
+        bucket_stage1 = {
+            "b_nt": 0,
+            "num_dispatch_cu": 160,
+        }
+    elif bucket == 1024:
+        bucket_stage1 = {"sort_block_m": 128, "num_dispatch_cu": 88}
+        bucket_stage2 = {"block_m": 64}
+    elif bucket == 4096:
+        bucket_stage1 = {"num_dispatch_cu": 72}
+    if bucket_stage1 or bucket_stage2:
+        config = _replace_config(
+            config,
+            stage1=bucket_stage1,
+            stage2=bucket_stage2,
+        )
+
+    if config.p2p_quant == P2P_QUANT_FP8_BLOCKWISE and bucket == 1024:
+        config = _replace_config(
+            config,
+            stage1={"grid_mult": 1},
+            stage2={"persist_cu": 224},
+        )
+
+    if mtpr == 8192:
+        if bucket <= 1024:
+            config = _replace_config(config, stage1={"num_dispatch_cu": 32})
+
+        if bucket == 8:
+            # FP4 SBM32 contains exactly 256 16-byte A chunks. The 8-wave GEMM
+            # keeps its compute geometry while waves 0-3 perform async copies.
+            config = _replace_config(
+                config,
+                stage1={
+                    "sort_block_m": 32,
+                    "num_waves": 8,
+                    "async_a_copy": True,
+                },
+            )
+
+        if bucket in (16, 32, 64, 128):
+            config = _replace_config(
+                config,
+                stage1={
+                    "sort_block_m": 32,
+                    "tile_n": 256,
+                    "num_waves": 4,
+                    # bs16/32/64 grid_mult 1->2 (with dcu128->224 below):
+                    # V4-Pro's epr=48 dispatch has enough work to use the extra
+                    # grid epoch.
+                    "grid_mult": 2 if bucket in (16, 32, 64) else 1,
+                    "mfma_amajor": False,
+                    "async_a_copy": False,
+                },
+                stage2={"block_m": 32},
+            )
+
+        dispatch_cu = {
+            2: 128,
+            4: 128,
+            8: 32,
+            16: 128,
+            32: 224,
+            64: 224,
+            128: 128,
+            256: 224,
+            512: 160,
+            # bs1024 dcu32->96 (the only lever that moves it; 2048/4096/8192 are
+            # compute-bound and regress under every knob).
+            1024: 96,
+            4096: 72,
+        }.get(bucket)
+        if dispatch_cu is not None:
+            stage1_patch: dict[str, object] = {"num_dispatch_cu": dispatch_cu}
+            if bucket == 256:
+                stage1_patch["tile_n"] = 256
+            config = _replace_config(config, stage1=stage1_patch)
+
+    # Stage2 fields that drifted away from the pre-rebase tuning; restore them.
+    # Two of them also unblock the deep Stage2 path below, which the drifted
+    # geometry was suppressing.  Scoped to the large-MTPR class, the regime
+    # these were tuned against.
+    if mtpr_config_class(mtpr) == MAX_MTPR_CLASS:
+        restore_stage2: dict[str, object] = {}
+        if bucket == 256:
+            # bs256 (with dcu96->224 above): use_nt streams the GEMM2 down-proj
+            # weight past L2, and persist_cu 128->96 frees CUs for dispatch.
+            restore_stage2 = {
+                "block_m": 64,
+                "block_n": 256,
+                "persist_cu": 96,
+                "b2stage": True,
+                "deep_a_pipeline": True,
+                "use_nt": True,
+            }
+        elif bucket == 512:
+            restore_stage2 = {
+                "block_m": 64,
+                "b2stage": True,
+                "deep_a_pipeline": True,
+            }
+        elif bucket == 2048:
+            restore_stage2 = {"block_m": 64}
+        elif bucket == 8192 and config.stage2.aligned_pair:
+            # Aligned-pair and the deep path are mutually exclusive; prefer the
+            # deep path here and give aligned-pair up.
+            restore_stage2 = {"aligned_pair": False, "pair_cu": 0, "skew_cu": 96}
+        block_m = restore_stage2.get("block_m")
+        if block_m is not None:
+            sbm = config.stage1.sort_block_m
+            if block_m > sbm or sbm % block_m:
+                # block_m has to tile the Stage1 sort block.  Skip the field
+                # rather than raise if a later Stage1 change breaks that.
+                restore_stage2.pop("block_m")
+        if restore_stage2:
+            config = _replace_config(config, stage2=restore_stage2)
+    elif bucket == 256:
+        # Bounded MTPR keeps BN128 with the deep pipeline off, so the table
+        # above does not carry over.  b2stage is applied at bucket 256 only, not
+        # 512.
+        config = _replace_config(config, stage2={"b2stage": True})
+
+    # The deep Stage2 path is enabled only for A4 and only where the base
+    # geometry uses BN256, so A8 remains byte-for-byte mainline.
+    if (
+        bucket >= 1024
+        and config.stage2.block_n == 256
+        and not config.stage2.aligned_pair
+    ):
+        config = _replace_config(
+            config,
+            stage2={"b2stage": True, "deep_a_pipeline": True},
+        )
+
+    # Experimental override hook (default off): V4_TUNE_JSON supplies a
+    # {"stage1":{...},"stage2":{...}} patch, V4_TUNE_BUCKETS scopes it to a
+    # comma-separated bucket allowlist.  Used only for tuning sweeps.
+    _v4_tune = os.environ.get("V4_TUNE_JSON")
+    if _v4_tune:
+        import json
+
+        _v4_only = os.environ.get("V4_TUNE_BUCKETS")
+        if not _v4_only or bucket in {int(x) for x in _v4_only.split(",") if x}:
+            _v4_patch = json.loads(_v4_tune)
+            config = _replace_config(
+                config,
+                stage1=_v4_patch.get("stage1"),
+                stage2=_v4_patch.get("stage2"),
+            )
+    return config
+
+
 def select_mega_moe_config(
     tokens: int,
     mtpr: int,
     *,
+    a_dtype: str = ACTIVATION_FP8,
     p2p_quant: str = P2P_QUANT_AUTO,
     experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
 ) -> MegaMoEConfig:
+    if a_dtype not in SUPPORTED_ACTIVATION_DTYPES:
+        raise ValueError(f"unsupported activation dtype={a_dtype!r}")
     if p2p_quant not in (P2P_QUANT_AUTO, *SUPPORTED_P2P_QUANT_MODES):
         raise ValueError(f"unsupported p2p_quant={p2p_quant!r}")
     if mtpr <= 0 or mtpr & (mtpr - 1):
@@ -458,6 +799,18 @@ def select_mega_moe_config(
         inter_dim,
         fixed_slot_dispatch,
     )
+    if experts_per_rank == R1_EXPERTS_PER_RANK and bucket == 8192:
+        config = _replace_config(
+            config,
+            stage2={"aligned_pair": False, "pair_cu": 0},
+        )
+    if a_dtype == ACTIVATION_FP4 and bucket <= 128 and config.stage1.async_a_copy:
+        # FP4 halves each A K-step. SBM64 keeps at least one 16-byte async
+        # copy per thread in the eight-wave Stage1 configuration.
+        config = replace(
+            config,
+            stage1=replace(config.stage1, sort_block_m=64),
+        )
     if p2p_quant == P2P_QUANT_AUTO:
         desired_p2p = (
             P2P_QUANT_FP8_BLOCKWISE if mtpr >= P2P_FP8_MIN_MTPR else config.p2p_quant
@@ -467,45 +820,88 @@ def select_mega_moe_config(
     if desired_p2p != config.p2p_quant:
         config = replace(config, p2p_quant=desired_p2p)
     if experts_per_rank == KIMI_K3_EXPERTS_PER_RANK:
-        # Kimi-K3 packs 112 experts per rank, so the dispatch carries far more
-        # work than the generic num_dispatch_cu=32 (sized for 32-expert ranks)
-        # can keep fed.  Use 160 CUs through the middle buckets and 96 at the
-        # ends (bs=1 cannot fill 160; the largest buckets spend more on
-        # scheduling than they recover).
+        # K3 packs 112 experts per rank, so the generic num_dispatch_cu=32
+        # (sized for 32-expert ranks) starves the dispatch.  Use 160 through the
+        # middle, 96 at the ends (bs=1 cannot fill 160; the largest buckets
+        # spend more on scheduling than they recover).
         config = _replace_config(
             config,
             stage1={"num_dispatch_cu": 96 if bucket == 1 or bucket >= 2048 else 160},
         )
-        # Stage2 runs in a different phase than the dispatch, so its tuning
-        # composes with the CU change above.
+        # Stage2 persist_cu composes with the dispatch change (different phase):
+        # 192 at 2048/4096, 256 from 8192.  Nothing below 2048 is touched.
         if bucket >= 2048:
             config = _replace_config(
                 config,
                 stage2={"persist_cu": 192 if bucket <= 4096 else 256},
             )
-        # At this inter_dim Stage2 is a large fraction of e2e, so widen its
-        # N-tile to BN256 off the generic BN128.  block_m=64 fills the SBM64
-        # sort block for 256-2048; the largest buckets already run BM64.
+        # Widen Stage2 to BN256 off the generic BN128 at this inter_dim.  Not
+        # the deep-A path the BN256 rule earlier in selection turns on: deep_a
+        # fails to build at 8192, and that rule runs before this branch so it
+        # does not see the BN256 set here.
         if bucket >= 4096:
             config = _replace_config(
                 config,
                 stage2={"block_n": 256, "b2stage": True},
             )
         elif 256 <= bucket <= 2048:
+            # These buckets run Stage1 with sort_block_m 64 but take the generic
+            # M tile 32, so each Stage2 tile covers half a sort block; widen
+            # block_m to 64 to fill it.
             config = _replace_config(
                 config,
                 stage2={"block_m": 64, "block_n": 256, "b2stage": True},
             )
         elif 8 <= bucket <= 128:
-            # BN256 extends down to bs 8-128; bs 1-4 stay BN128 (too few tokens
-            # to fill the wider tile).  SBM32 here pins block_m to 32.  b2stage
-            # stays off here: it is neutral for these small buckets and only
-            # pays off once Stage2 dominates at bs>=256.
+            # BN256 extends the wider Stage2 N-tile down to bs 8-128 (block_n
+            # only; b2stage/deep_a add nothing here and SBM32 pins block_m=32).
+            # bs 1-4 stay BN128 (too few tokens to fill the wider tile).
             config = _replace_config(
                 config,
                 stage2={"block_n": 256},
             )
+        # Default-off sweep hook (K3 only): K3_TUNE_JSON injects a
+        # {"stage1":{...},"stage2":{...}} patch at config-selection time -- i.e.
+        # before MegaMoEV2 sizes its dispatch workspace and preloads the bundle
+        # -- so dispatch-geometry knobs (num_dispatch_cu/grid_mult) stay
+        # consistent across the plan instead of faulting the way a
+        # post-construction bench override does.  K3_TUNE_BUCKETS scopes it to a
+        # bucket allowlist so the other plan entries keep their geometry.
+        _k3_tune = os.environ.get("K3_TUNE_JSON")
+        if _k3_tune:
+            import json
 
+            _k3_only = os.environ.get("K3_TUNE_BUCKETS")
+            if not _k3_only or bucket in {int(x) for x in _k3_only.split(",") if x}:
+                _k3_patch = json.loads(_k3_tune)
+                config = _replace_config(
+                    config,
+                    stage1=_k3_patch.get("stage1"),
+                    stage2=_k3_patch.get("stage2"),
+                )
+    # Experiment toggle (default off): let a8w4 R1 borrow the FP4 R1 tuning
+    # table to see whether the small/mid-bucket knobs (w8/deep_a/skew/b_nt/dcu)
+    # also help FP8.  Scoped to FP8+R1 via R1_A8W4_TRY_A4 so production FP8 is
+    # untouched.  The FP4-only INDEXED_PAYLOAD async-revert below stays gated on
+    # FP4 (it is specific to FP4's 8x16B K-step packing).
+    _try_a4_on_a8 = a_dtype == ACTIVATION_FP8 and bool(os.environ.get("R1_A8W4_TRY_A4"))
+    if a_dtype == ACTIVATION_FP4 or _try_a4_on_a8:
+        config = _apply_a4_tuning(
+            config,
+            tokens=tokens,
+            bucket=bucket,
+            mtpr=mtpr,
+            experts_per_rank=experts_per_rank,
+        )
+        if (
+            a_dtype == ACTIVATION_FP4
+            and mtpr >= INDEXED_PAYLOAD_MIN_MTPR
+            and config.stage1.sort_block_m >= INDEXED_PAYLOAD_MIN_SBM
+        ):
+            # FP4 packs one K step into 8 16-byte chunks, so a 16-lane direct
+            # global-to-LDS atom spans two rows. Indexed payload gives every
+            # row an independent source key, which that atom cannot express.
+            config = _replace_config(config, stage1={"async_a_copy": False})
     if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
         # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
         # reject the combination here instead of at launch.
@@ -519,6 +915,7 @@ def select_mega_moe_config(
 def build_mega_moe_bundle_plan(
     mtpr: int,
     *,
+    a_dtype: str = ACTIVATION_FP8,
     p2p_quant: str = P2P_QUANT_AUTO,
     experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
     model_dim: int = 7168,
@@ -546,6 +943,7 @@ def build_mega_moe_bundle_plan(
         config = select_mega_moe_config(
             bucket,
             mtpr,
+            a_dtype=a_dtype,
             p2p_quant=p2p_quant,
             experts_per_rank=experts_per_rank,
             model_dim=model_dim,
