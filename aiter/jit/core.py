@@ -602,8 +602,9 @@ class AITER_CONFIG:
             if not op_tuned_file_list:
                 config_file = default_file
             else:
-                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
-                tuned_files = default_file + ":" + tuned_files
+                tuned_files = os.pathsep.join(
+                    [default_file] + [str(p) for p in op_tuned_file_list]
+                )
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
