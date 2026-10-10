@@ -54,7 +54,6 @@ _OPS = ("attn_2d", "attn_3d", "reduce", "kv_split")
 _ARCH_ALIAS = {
     "gfx1101": "gfx1100",
     "gfx1102": "gfx1100",
-    "gfx1150": "gfx1151",
 }
 
 _SEP = "."
