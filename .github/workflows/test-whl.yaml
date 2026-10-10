@@ -42,10 +42,10 @@ jobs:
       actions: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
       - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         timeout-minutes: 30
         with:
           pattern: aiter-whl-packages-py*
@@ -53,35 +53,40 @@ jobs:
           merge-multiple: true
 
       - name: Validate inputs
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          WHEEL_NAMES: ${{ inputs.wheel_names }}
         run: |
           # Validate release_type
-          if [[ ! "${{ inputs.release_type }}" =~ ^(nightlies|devreleases)$ ]]; then
-            echo "❌ ERROR: Invalid release_type: ${{ inputs.release_type }}"
+          if [[ ! "${RELEASE_TYPE}" =~ ^(nightlies|devreleases)$ ]]; then
+            echo "❌ ERROR: Invalid release_type: ${RELEASE_TYPE}"
             echo "Must be 'nightlies' or 'devreleases'"
             exit 1
           fi
 
           # Validate wheel_names
-          if [ -z "${{ inputs.wheel_names }}" ]; then
+          if [ -z "${WHEEL_NAMES}" ]; then
             echo "❌ ERROR: wheel_names is empty"
             exit 1
           fi
 
       - name: Determine wheel to test
+        env:
+          PYTHON_VERSION: ${{ matrix.python_version }}
+          WHEEL_NAMES: ${{ inputs.wheel_names }}
         run: |
           # Convert Python version to wheel format (e.g., 3.12 -> cp312)
-          PYTHON_VERSION="${{ matrix.python_version }}"
           CP_VERSION="cp${PYTHON_VERSION/./}"
 
           echo "Looking for wheel matching: ${CP_VERSION}"
-          echo "Available wheels: ${{ inputs.wheel_names }}"
+          echo "Available wheels: ${WHEEL_NAMES}"
 
           # Find the wheel matching this Python version
           WHEEL_NAME=""
-          for WHL in ${{ inputs.wheel_names }}; do
+          for WHL in ${WHEEL_NAMES}; do
             if [[ "${WHL}" == *"${CP_VERSION}"* ]]; then
               WHEEL_NAME="${WHL}"
-              echo "WHEEL_NAME=${WHL}" >> $GITHUB_ENV
+              echo "WHEEL_NAME=${WHL}" >> "$GITHUB_ENV"
               echo "✅ Selected wheel for testing: ${WHL}"
               break
             fi
@@ -89,11 +94,14 @@ jobs:
 
           if [ -z "${WHEEL_NAME}" ]; then
             echo "❌ ERROR: No wheel found matching Python version ${CP_VERSION}"
-            echo "Available wheels: ${{ inputs.wheel_names }}"
+            echo "Available wheels: ${WHEEL_NAMES}"
             exit 1
           fi
 
       - name: Start GPU test container
+        env:
+          WORKSPACE: ${{ github.workspace }}
+          DOCKER_IMAGE: ${{ matrix.docker_image }}
         run: |
           docker ps -aq -f name=aiter_test | xargs -r docker stop | xargs -r docker rm || true
 
@@ -104,14 +112,14 @@ jobs:
           fi
 
           docker run -dt --network=host --user root --device=/dev/kfd $DEVICE_FLAG \
-            -v "${{ github.workspace }}:/workspace" \
+            -v "${WORKSPACE}:/workspace" \
             --ipc=host --group-add video \
             --shm-size 16g \
             --cap-add=SYS_PTRACE \
             --security-opt seccomp=unconfined \
             -w /workspace \
             --name aiter_test \
-            ${{ matrix.docker_image }}
+            "${DOCKER_IMAGE}"
 
       - name: Verify GPU accessibility
         run: |
@@ -128,12 +136,14 @@ jobs:
 
       - name: Install wheels
         id: install
+        env:
+          PYTHON_VERSION: ${{ matrix.python_version }}
         run: |
           echo "============================================"
           echo "Installing wheel"
           echo "Wheel: ${WHEEL_NAME}"
           echo "From: dist/${WHEEL_NAME}"
-          echo "Python: ${{ matrix.python_version }}"
+          echo "Python: ${PYTHON_VERSION}"
           echo "============================================"
 
           # Copy wheel into container
@@ -159,9 +169,11 @@ jobs:
 
       - name: Run single-GPU tests
         id: tests
+        env:
+          MATRIX_LABEL: ${{ matrix.label }}
         run: |
           echo "============================================================"
-          echo "Running SINGLE-GPU tests on ${{ matrix.label }}"
+          echo "Running SINGLE-GPU tests on ${MATRIX_LABEL}"
           echo "============================================================"
 
           # Basic test suite (5 tests)
@@ -189,14 +201,20 @@ jobs:
 
       - name: Test summary
         if: always()
+        env:
+          MATRIX_LABEL: ${{ matrix.label }}
+          MATRIX_RUNNER: ${{ matrix.runner }}
+          PYTHON_VERSION: ${{ matrix.python_version }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          TESTS_OUTCOME: ${{ steps.tests.outcome }}
         run: |
-          echo "## Test Summary - ${{ matrix.label }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Runner**: ${{ matrix.runner }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Python**: ${{ matrix.python_version }}" >> $GITHUB_STEP_SUMMARY
+          echo "## Test Summary - ${MATRIX_LABEL}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Runner**: ${MATRIX_RUNNER}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Python**: ${PYTHON_VERSION}" >> $GITHUB_STEP_SUMMARY
           echo "- **Wheel**: \`${WHEEL_NAME}\`" >> $GITHUB_STEP_SUMMARY
           echo "- **Source**: GitHub Actions artifact" >> $GITHUB_STEP_SUMMARY
-          echo "- **Install**: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Tests**: ${{ steps.tests.outcome }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Install**: ${INSTALL_OUTCOME}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Tests**: ${TESTS_OUTCOME}" >> $GITHUB_STEP_SUMMARY
 
           # Add GPU info if available
           GPU_INFO=$(docker exec aiter_test bash -c "rocm-smi --showproductname 2>/dev/null" || echo "N/A")

@@ -20,22 +20,24 @@ jobs:
       contents: read
     steps:
       - name: Validate inputs
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
         run: |
-          if [[ ! "${{ inputs.release_type }}" =~ ^(nightlies|devreleases)$ ]]; then
-            echo "ERROR: Invalid release_type: ${{ inputs.release_type }}"
+          if [[ ! "${RELEASE_TYPE}" =~ ^(nightlies|devreleases)$ ]]; then
+            echo "ERROR: Invalid release_type: ${RELEASE_TYPE}"
             echo "Must be 'nightlies' or 'devreleases'"
             exit 1
           fi
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           sparse-checkout: |
             .github/scripts/generate_summary.py
           path: aiter
 
       - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           aws-region: us-east-1
           role-to-assume: arn:aws:iam::661452401056:role/framework-aiter-${{ inputs.release_type }}
@@ -50,11 +52,14 @@ jobs:
           fi
 
       - name: Download wheels from staging
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          WHEEL_NAMES: ${{ inputs.wheel_names }}
         run: |
-          STAGING="s3://framework-whls-${{ inputs.release_type }}/whl-staging/gfx942-gfx950"
+          STAGING="s3://framework-whls-${RELEASE_TYPE}/whl-staging/gfx942-gfx950"
           mkdir -p /tmp/promote-wheels
           echo "Downloading wheels from ${STAGING}"
-          for WHL in ${{ inputs.wheel_names }}; do
+          for WHL in ${WHEEL_NAMES}; do
             echo "Downloading ${WHL}..."
             aws s3 cp "${STAGING}/${WHL}" "/tmp/promote-wheels/${WHL}"
           done
@@ -62,10 +67,13 @@ jobs:
           ls -lh /tmp/promote-wheels/
 
       - name: Upload wheels to ${{ inputs.release_type }}
+        env:
+          RELEASE_TYPE: ${{ inputs.release_type }}
+          WHEEL_NAMES: ${{ inputs.wheel_names }}
         run: |
-          RELEASE="s3://framework-whls-${{ inputs.release_type }}/whl/gfx942-gfx950"
+          RELEASE="s3://framework-whls-${RELEASE_TYPE}/whl/gfx942-gfx950"
           echo "Uploading wheels to ${RELEASE}"
-          for WHL in ${{ inputs.wheel_names }}; do
+          for WHL in ${WHEEL_NAMES}; do
             echo "Uploading ${WHL}..."
             aws s3 cp "/tmp/promote-wheels/${WHL}" "${RELEASE}/${WHL}"
           done

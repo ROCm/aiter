@@ -1425,7 +1425,8 @@ def run_pa_gluon_test(
             .detach()
             .cpu()
             .numpy()
-            .tobytes()
+            .tobytes(),
+            usedforsecurity=False,
         ).hexdigest()
         logger.info("out_flashattn_ref_md5=%s", out_flashattn_ref_md5)
 
@@ -1540,7 +1541,8 @@ def run_pa_gluon_test(
         .detach()
         .cpu()
         .numpy()
-        .tobytes()
+        .tobytes(),
+        usedforsecurity=False,
     ).hexdigest()
     gluon_hash = hashlib.md5(
         final_output_gluon.contiguous()
@@ -1548,7 +1550,8 @@ def run_pa_gluon_test(
         .detach()
         .cpu()
         .numpy()
-        .tobytes()
+        .tobytes(),
+        usedforsecurity=False,
     ).hexdigest()
     logger.info("out_ref_md5=%s", out_ref_md5)
     logger.info("gluon_output_md5=%s", gluon_hash)
