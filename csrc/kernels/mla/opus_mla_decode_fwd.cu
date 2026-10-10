@@ -25,8 +25,6 @@
 
 #include "aiter_hip_common.h"
 #include "opus/mla_decode_fp8_16mx1_32nx4.hpp"
-#include "opus/mla_decode_fp8_16mx4_64nx1.hpp"
-#include "opus/mla_decode_fp8_16mx8_32nx1.hpp"
 #include "opus/mla_decode_kargs.h"
 #include "opus/mla_decode_mxfp8_16mx8_32nx1.hpp"
 
@@ -65,46 +63,32 @@ constexpr OpusDecodeVariant kA16W16_32mx3{"opus_mla_decode_a16w16_32mx3_32nx1_ke
                                        "mla_opus/opus_mla_decode_a16w16_32mx3_32nx1.co",
                                        96,
                                        256};
-// The one fp8 code object: the same 16mx4_64nx1 kernel that is compiled in-tree below, but
-// built in OpFoundry (opus_attn/dsa_v32/gfx950, `make co`) with the amdgpu-pin-op-dst
-// toolchain, which is the only way its register pins take effect -- a stock hipcc reports
-// [[clang::amdgpu_pin_agpr]] as an unknown attribute and drops it. Pinning Q to a0 takes the
-// build from 250 VGPR + 136 AGPR to 256 + 44. AITER_MLA_OPUS_16MX4_CO=1 picks it over the
-// in-tree build so the two can be compared directly; both want metadata packed at 64 rows.
-constexpr OpusDecodeVariant kFp8_16mx4{"opus_mla_decode_fp8_16mx4_64nx1_kernel",
-                                       "mla_opus/opus_mla_decode_fp8_16mx4_64nx1.co",
-                                       64,
-                                       256};
 // fp8 32mx4 / 64nx1 (csrc/kernels/mla/opus/mla_decode_fp8_32mx4_64nx1.hpp): 4 waves x 32 packed
-// query rows, i.e. the same 128-row work items the 16mx8 build consumes, so it reuses that
-// metadata as is. Prebuilt only: its register map (Q, half of O and the K/V ring in AGPRs, the
-// other half of O and both score buffers in VGPRs) needs the pin toolchain, and a stock ROCm
-// clang forces every MFMA into AGPR form, which cannot fit. One entry per specialization.
+// query rows, i.e. the 128-row work items aiter's metadata packs by default for fp8. Prebuilt
+// only: its register map (Q, half of O and the K/V ring in AGPRs, the other half of O and both
+// score buffers in VGPRs) needs the pin toolchain, and a stock ROCm clang forces every MFMA into
+// AGPR form, which cannot fit. One entry per specialization.
 constexpr const char* kFp8_32mx4_co = "mla_opus/opus_mla_decode_fp8_32mx4_64nx1.co";
-constexpr int kFp8_32mx4_rows       = 128;
-constexpr int kFp8_32mx4_block      = 256;
+// fp8 16mx4 / 64nx1 (mla_decode_fp8_16mx4_64nx1.hpp, the HIP port of the SP3 16mx4_64nx1
+// shape), prebuilt the same way (mla_decode_fp8_16mx4_64nx1_co.hip): a stock hipcc drops its
+// register pins. 64 packed query rows per workgroup, so a work item must not carry more than
+// 64 rows -- hand it a 128-row item and every wave but the first reads the wrong head --
+// which the metadata guarantees for exactly the shapes opus_fp8_route sends here (64 rows or
+// fewer per request, and kPackedQoLenPerWg 64 for nhead 32 x 3).
+constexpr const char* kFp8_16mx4_co = "mla_opus/opus_mla_decode_fp8_16mx4_64nx1.co";
+constexpr int kFp8_co_block         = 256;
 
 constexpr int kHeadDimQk = 576;
 constexpr int kHeadDimVo = 512;
 
 using MxFp8Traits = opus_mla_decode_mxfp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, bf16_t, bf16_t>;
 
-// Causal is a compile-time specialization, so the caller's `causal` flag picks
-// between two builds rather than steering a branch inside one. A request with a
-// single query token needs no diagonal either way -- it then sits at the end of
-// the KV run and masks nothing -- so max_seqlen_q == 1 keeps the build that only
-// masks out-of-bounds columns even when causal is asked for.
-template <bool CAUSAL, bool LARGE_KV = false>
-using OpusTraitsC =
-    opus_mla_decode_fp8_16mx8_32nx1_traits<16, 32, 8, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV>;
-using OpusTraits = OpusTraitsC<false>;
-
 // --- fp8 (16, 1): 4 waves of 32 KV tokens, Q shared through LDS ---------------------
-// The 16mx8 kernel above gives every wave its own 16 query rows, so it needs nhead *
-// max_seqlen_q >= 128 to fill a workgroup. At nhead 16 with one query token there are only
-// 16 rows to go round, so this build tiles the KV tokens across the waves instead: four
-// waves of 32 tokens, ping-pong over two LDS slots. AITER_MLA_OPUS_32NX4_SLOTS_1=1 selects
-// the single-slot floor build, which has no DMA overlap but fits two blocks per CU.
+// The row-tiled builds give every wave its own query rows, so they need nhead * max_seqlen_q
+// rows to fill a workgroup. At nhead 16 with one query token there are only 16 rows to go
+// round, so this build tiles the KV tokens across the waves instead: four waves of 32
+// tokens, ping-pong over two LDS slots. AITER_MLA_OPUS_32NX4_SLOTS_1=1 selects the
+// single-slot floor build, which has no DMA overlap but fits two blocks per CU.
 //
 // page_size 1 only -- the rope DMA deals a 16-token line, so the within-page token offset
 // would be per-lane above 1. The 16nx8 geometry this replaced is the only fp8 build that
@@ -116,37 +100,37 @@ using OpusTraits16mx1x32nx4C =
 template <bool CAUSAL, bool LARGE_KV = false>
 using OpusTraits16mx1x32nx4S1C =
     opus_mla_decode_fp8_16mx1_32nx4_traits<16, 32, 4, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, 1>;
-
-// --- fp8 (16, 4): 4 waves of 16 query rows, 64 KV tokens per tile -------------------
-// The HIP port of the SP3 16mx4_64nx1 shape. It fills a workgroup with 64 packed query rows
-// where 16mx8 needs 128, so it is the build for nhead * max_seqlen_q == 64.
-//
-// Env-gated rather than routed by shape, because a work item here covers T_M * W_M = 64 rows
-// and the metadata has to have been generated with that packing (kPackedQoLenPerWg 64) --
-// hand it 128-row items and every wave but the first reads the wrong head.
-template <bool CAUSAL, bool LARGE_KV = false>
-using OpusTraits16mx4x64nx1C =
-    opus_mla_decode_fp8_16mx4_64nx1_traits<16, 64, 4, fp8_t, fp8_t, bf16_t, CAUSAL, LARGE_KV, 3>;
-
-struct OpusLaunch16mx4x64nx1
-{
-    template <class Traits>
-    static void launch(int num_workers, hipStream_t stream, const opus_mla_decode_fp8_kargs& kargs)
-    {
-        opus_mla_decode_fp8_16mx4_64nx1_kernel<Traits>
-            <<<dim3(num_workers, 1, 1), dim3(Traits::BLOCK_SIZE), 0, stream>>>(kargs);
-    }
-};
-
 inline bool opus_env_flag(const char* name)
 {
     const char* v = std::getenv(name);
     return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
-inline bool opus_use_16mx1_kernel(int nhead, int max_seqlen_q)
+// Shape routing for the merged-buffer fp8 path, mirroring the asm persistent fp8 heuristic
+// (csrc/py_itfs_cu/asm_mla.cu): what asm runs on its qh32 / qseqlen4 kernel (128 packed rows
+// per workgroup) goes to 32mx4, what it runs on qh16 / qseqlen4 (64 rows) to 16mx4. nhead
+// here is nhead per KV head (MLA has one), after mla.py's fold of the non-native head counts.
+// aiter/mla.py keeps the same table so a shape with no build stays on the asm path.
+enum class OpusFp8Route
 {
-    return nhead == 16 && max_seqlen_q == 1;
+    k32mx4,
+    k16mx4,
+    k16mx1,
+    kNone,
+};
+
+inline OpusFp8Route opus_fp8_route(int nhead, int max_seqlen_q)
+{
+    const int q = max_seqlen_q;
+    if((nhead == 32 && q >= 4) || (nhead == 64 && q >= 2) || nhead == 128 ||
+       (nhead == 96 && q <= 6))
+        return OpusFp8Route::k32mx4;
+    if((nhead == 16 && (q == 3 || q == 4)) || (nhead == 32 && (q == 2 || q == 3)) ||
+       (nhead == 64 && q == 1))
+        return OpusFp8Route::k16mx4;
+    if(nhead == 16 && q == 1)
+        return OpusFp8Route::k16mx1;
+    return OpusFp8Route::kNone;
 }
 
 struct OpusLaunch16mx1x32nx4
@@ -160,7 +144,7 @@ struct OpusLaunch16mx1x32nx4
     }
 };
 
-// causal x large_kv fan-out, shared by every traits-templated build (16mx1 and 16mx4).
+// causal x large_kv fan-out for the traits-templated in-tree build (16mx1).
 template <template <bool, bool> class TraitsC, class Launcher>
 void launch_opus_16mx1(bool causal,
                        int max_seqlen_q,
@@ -431,25 +415,31 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      causal,
      stream))
 {
-    using T               = OpusTraits;
     const std::string gfx = get_gpu_arch();
     AITER_CHECK(
         gfx == "gfx950", __func__, ": unsupported GPU arch '", gfx, "' (supported: gfx950).");
     // No build here addresses a block table any more: the 16mx1 shape routes to 32nx4,
     // whose rope DMA deals a 16-token line and so cannot carry a per-lane within-page
     // offset. page_size > 1 belongs to the asm path, and the python gate keeps it there.
-    const bool use_16mx1 = opus_use_16mx1_kernel(q->size(1), max_seqlen_q);
     AITER_CHECK(page_size == 1, __func__, ": only page_size == 1 is supported, got ", page_size);
-    AITER_CHECK(q->size(-1) == T::D_HEAD_SIZE,
+    const OpusFp8Route route = opus_fp8_route(q->size(1), max_seqlen_q);
+    AITER_CHECK(route != OpusFp8Route::kNone,
+                __func__,
+                ": no opus fp8 build for nhead ",
+                q->size(1),
+                " x max_seqlen_q ",
+                max_seqlen_q,
+                " (the python gate keeps such shapes on the asm path)");
+    AITER_CHECK(q->size(-1) == kHeadDimQk,
                 __func__,
                 ": q last dim must be ",
-                T::D_HEAD_SIZE,
+                kHeadDimQk,
                 " (merged nope+rope), got ",
                 q->size(-1));
-    AITER_CHECK(kv->size(-1) == T::D_HEAD_SIZE,
+    AITER_CHECK(kv->size(-1) == kHeadDimQk,
                 __func__,
                 ": kv last dim must be ",
-                T::D_HEAD_SIZE,
+                kHeadDimQk,
                 " (merged nope+rope), got ",
                 kv->size(-1));
     AITER_CHECK(q_scale != nullptr && q_scale->dtype() == AITER_DTYPE_fp32 && q_scale->numel() >= 1,
@@ -491,11 +481,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.softmax_scale = softmax_scale;
 
     // Merged d=576 buffer: one row per (token, head); rope is the +D_NOPE slice.
-    kargs.stride_q_b     = H * T::D_HEAD_SIZE;
-    kargs.stride_q_h     = T::D_HEAD_SIZE;
-    kargs.stride_o_b     = H * T::D_NOPE_SIZE;
-    kargs.stride_o_h     = T::D_NOPE_SIZE;
-    kargs.stride_kv_page = T::D_HEAD_SIZE;
+    kargs.stride_q_b     = H * kHeadDimQk;
+    kargs.stride_q_h     = kHeadDimQk;
+    kargs.stride_o_b     = H * kHeadDimVo;
+    kargs.stride_o_h     = kHeadDimVo;
+    kargs.stride_kv_page = kHeadDimQk;
 
     // A buffer descriptor's num_records is 32 bits, so it cannot span a KV cache of 4 GiB
     // or more; past that the bound wraps and every load beyond it silently returns zero.
@@ -508,115 +498,62 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                              static_cast<int64_t>(sizeof(fp8_t));
     const bool large_kv = kv_bytes >= (int64_t{1} << 32);
 
-    // 128 packed query rows per workgroup on 4 waves (32mx4 / 64nx1, prebuilt). Opt-in for now.
-    if(opus_env_flag("AITER_MLA_OPUS_32MX4") && (H * max_seqlen_q) % kFp8_32mx4_rows == 0)
-    {
-        const bool use_causal = causal && max_seqlen_q > 1;
-        // Split-DMA builds release a KV slot a chunk at a time, at the price of a second
-        // barrier per tile; that pays once a worker has a long run of tiles (measured on
-        // nhead*qlen 128: +2..4% from ~32 tiles per worker, -1.5..3% below). The KV token count
-        // over the tile size and the worker count gives that run length. Large-KV builds are
-        // whole-tile only. AITER_MLA_OPUS_32MX4_SPLIT=0/1 overrides the heuristic.
-        const int64_t tiles_per_worker =
-            static_cast<int64_t>(kv_indices->numel()) / 64 / std::max(num_workers, 1);
-        const char* split_env = std::getenv("AITER_MLA_OPUS_32MX4_SPLIT");
-        const bool split = split_env != nullptr ? (split_env[0] == '1') : tiles_per_worker >= 32;
-        static bool traced = false; // first call only: the test loops the kernel
-        if(!traced && opus_env_flag("AITER_MLA_OPUS_TRACE") && (traced = true))
-            fprintf(stderr,
-                    "[opus_mla_decode_fp8] 32mx4_64nx1 co causal=%d large_kv=%d split=%d "
-                    "(tiles/worker %ld)\n",
-                    use_causal,
-                    large_kv,
-                    split && !large_kv,
-                    static_cast<long>(tiles_per_worker));
-        size_t arg_size = sizeof(kargs);
-        auto launch     = [&](AiterAsmKernel& impl) {
-            impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1, kFp8_32mx4_block, 1, 1,
-                                stream});
-        };
-#define MLA32MX4_LAUNCH(entry)                                                        \
-    do                                                                                \
-    {                                                                                 \
-        static AiterAsmKernel impl("opus_mla_decode_fp8_32mx4_64nx1_" entry, kFp8_32mx4_co); \
-        launch(impl);                                                                 \
-    } while(0)
-        if(large_kv)
-        {
-            if(use_causal)
-                MLA32MX4_LAUNCH("causal_large");
-            else
-                MLA32MX4_LAUNCH("nc_large");
-        }
-        else if(use_causal)
-        {
-            if(split)
-                MLA32MX4_LAUNCH("causal");
-            else
-                MLA32MX4_LAUNCH("causal_ns");
-        }
-        else
-        {
-            if(split)
-                MLA32MX4_LAUNCH("nc");
-            else
-                MLA32MX4_LAUNCH("nc_ns");
-        }
-#undef MLA32MX4_LAUNCH
-        return;
-    }
-
-    // 64 packed query rows per workgroup. Opt-in: the metadata must have been generated with
-    // the matching packing, which the shape check below only makes plausible, not certain.
-    if(opus_env_flag("AITER_MLA_OPUS_16MX4") && H * max_seqlen_q == 64)
-    {
-        // The prebuilt, register-pinned build of this same kernel. Only the non-causal,
-        // small-KV instantiation is in the code object, so anything else stays in-tree.
-        if(opus_env_flag("AITER_MLA_OPUS_16MX4_CO") && !(causal && max_seqlen_q > 1) &&
-           !large_kv)
-        {
-            size_t arg_size = sizeof(kargs);
-            static AiterAsmKernel impl(kFp8_16mx4.kernel_name, kFp8_16mx4.co_path);
-            impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1,
-                                kFp8_16mx4.block_size, 1, 1, stream});
-            return;
-        }
-        launch_opus_16mx1<OpusTraits16mx4x64nx1C, OpusLaunch16mx4x64nx1>(
-            causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
-        return;
-    }
-
-    if(use_16mx1)
-    {
-        // The floor build, for A/B only: one slot, so a tile's whole gmem latency sits in
-        // the open. Measured 13 to 15% slower than the ring on the memory-bound shapes.
-        static const bool want_1slot = opus_env_flag("AITER_MLA_OPUS_32NX4_SLOTS_1");
-
-        if(want_1slot)
-            launch_opus_16mx1<OpusTraits16mx1x32nx4S1C, OpusLaunch16mx1x32nx4>(
-                causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
-        else
-            launch_opus_16mx1<OpusTraits16mx1x32nx4C, OpusLaunch16mx1x32nx4>(
-                causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
-        return;
-    }
-
-    auto launch = [&](auto traits) {
-        opus_mla_decode_fp8_16mx8_32nx1_kernel<decltype(traits)>
-            <<<dim3(num_workers, 1, 1), dim3(T::BLOCK_SIZE), 0, stream>>>(kargs);
+    // The prebuilt builds: entry <name>_{nc,causal}[_large] of one code object each, every
+    // entry loaded once on first use.
+    const bool use_causal = causal && max_seqlen_q > 1;
+    size_t arg_size       = sizeof(kargs);
+    auto launch_co        = [&](AiterAsmKernel& impl) {
+        impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1, kFp8_co_block, 1, 1, stream});
     };
-    if(causal && max_seqlen_q > 1)
+#define OPUS_FP8_CO_ENTRY(name, entry, co)                                             \
+    do                                                                                 \
+    {                                                                                  \
+        static AiterAsmKernel impl("opus_mla_decode_fp8_" name "_" entry, co);         \
+        launch_co(impl);                                                               \
+    } while(0)
+#define OPUS_FP8_CO_LAUNCH(name, co)                                                   \
+    do                                                                                 \
+    {                                                                                  \
+        static bool traced = false; /* first call only: the test loops the kernel */  \
+        if(!traced && opus_env_flag("AITER_MLA_OPUS_TRACE") && (traced = true))        \
+            fprintf(stderr,                                                            \
+                    "[opus_mla_decode_fp8] " name " co causal=%d large_kv=%d\n",       \
+                    use_causal,                                                        \
+                    large_kv);                                                         \
+        if(large_kv && use_causal)                                                     \
+            OPUS_FP8_CO_ENTRY(name, "causal_large", co);                               \
+        else if(large_kv)                                                              \
+            OPUS_FP8_CO_ENTRY(name, "nc_large", co);                                   \
+        else if(use_causal)                                                            \
+            OPUS_FP8_CO_ENTRY(name, "causal", co);                                     \
+        else                                                                           \
+            OPUS_FP8_CO_ENTRY(name, "nc", co);                                         \
+    } while(0)
+
+    // 128 packed query rows per workgroup on 4 waves.
+    if(route == OpusFp8Route::k32mx4)
     {
-        if(large_kv)
-            launch(OpusTraitsC<true, true>{});
-        else
-            launch(OpusTraitsC<true, false>{});
+        OPUS_FP8_CO_LAUNCH("32mx4_64nx1", kFp8_32mx4_co);
+        return;
     }
+
+    // 64 packed query rows per workgroup on 4 waves. The pinned code object measured 2% faster
+    // than the same source through aiter's stock JIT, which drops the pins.
+    if(route == OpusFp8Route::k16mx4)
+    {
+        OPUS_FP8_CO_LAUNCH("16mx4_64nx1", kFp8_16mx4_co);
+        return;
+    }
+#undef OPUS_FP8_CO_LAUNCH
+#undef OPUS_FP8_CO_ENTRY
+
+    // route == k16mx1. The floor build, for A/B only: one slot, so a tile's whole gmem latency
+    // sits in the open. Measured 13 to 15% slower than the ring on the memory-bound shapes.
+    static const bool want_1slot = opus_env_flag("AITER_MLA_OPUS_32NX4_SLOTS_1");
+    if(want_1slot)
+        launch_opus_16mx1<OpusTraits16mx1x32nx4S1C, OpusLaunch16mx1x32nx4>(
+            causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
     else
-    {
-        if(large_kv)
-            launch(OpusTraitsC<false, true>{});
-        else
-            launch(OpusTraitsC<false, false>{});
-    }
+        launch_opus_16mx1<OpusTraits16mx1x32nx4C, OpusLaunch16mx1x32nx4>(
+            causal, max_seqlen_q, large_kv, num_workers, stream, kargs);
 }

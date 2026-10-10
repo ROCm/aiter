@@ -41,11 +41,10 @@
 //   stage2 [mem]     mask S(t) (scalar branch, last tiles only)
 //   stage3 [compute] gemm1 PV(t-1) [16 MFMA, V ring refilled behind each]
 //                    || softmax head(t), chopped into per-d-tile chunks; then O rescale
-// With SPLIT_DMA (traits) stage1 carries only chunks 2, 3 of DMA(t+1), and a second barrier
-// halfway through stage3 -- slot t-1's chunks 0, 1, 4 read out -- sends chunks 0, 1, 4 of
-// DMA(t+2) a phase early. Measured with ATT (b128 c8192): the MFMA runs of both GEMMs are
-// saturated and ~26% of a phase was vmcnt on the KV DMA, so what is left is bytes in flight,
-// not issue order; at ~5 TB/s the kernel sits near the scattered-row DRAM ceiling.
+// Measured with ATT (b128 c8192): the MFMA runs of both GEMMs are saturated and ~26% of a
+// phase is vmcnt on the KV DMA; at ~5 TB/s the kernel sits near the scattered-row DRAM
+// ceiling. Releasing a slot a chunk at a time (a second barrier mid-PV sending part of
+// DMA(t+2) a phase early) measured within noise of whole-tile DMA, so a slot is released whole.
 
 #include "mla_decode_traits.h"
 
@@ -142,6 +141,42 @@ buffer_load_lds_asm(const opus::vector_t<int, 4>& rsrc, opus::u32_t voff, opus::
             "v"(voff),
             "s"(rsrc)
             : "memory");
+}
+
+// opus::async_load for a single issue, through the asm above: async_load's builtin is exactly
+// the compiler-visible LDS-DMA (measured: 7 more vmcnt(0) in the 32mx4 loop). u_smem must be
+// wave-uniform, as it feeds M0. The descriptor is the caller's, extracted once: copied out of
+// the gmem at every issue, it is kept in VGPRs and read back with four v_readfirstlane per DMA.
+template <opus::index_t VEC, class D, class LayoutG, class LayoutS>
+__device__ inline void buffer_load_lds(const opus::vector_t<int, 4>& rsrc,
+                                       const opus::smem<D>& s,
+                                       const LayoutG& u_gmem,
+                                       const LayoutS& u_smem)
+{
+    constexpr int size = static_cast<int>(sizeof(D));
+    static_assert(opus::layout_load_traits<LayoutG, VEC>::r_elem.value == 1, "one issue per call");
+    const auto v_os = static_cast<opus::u32_t>(opus::layout_to_offsets<VEC>(u_gmem)[0] * size);
+    const auto s_os = static_cast<opus::u32_t>(opus::layout_to_offsets<VEC>(u_smem)[0] * size);
+    const auto lds  = static_cast<opus::u32_t>(reinterpret_cast<__UINTPTR_TYPE__>(s.ptr));
+    buffer_load_lds_asm<VEC * size>(rsrc, v_os, lds + s_os);
+}
+
+// opus smem::tr_load for one ds_read_b64_tr_b8, through the builtin rather than opus's inline
+// asm: the read outlives several MFMA, and an asm result is one the compiler believes ready at
+// once (measured: 3-4% wrong outputs, 2x slower). The layout's compile-time shift goes onto the
+// pointer after the lane offset, so it folds into the read's immediate (summed into the lane
+// offset first, a third of the reads lose it and the kernel spills).
+template <opus::index_t VEC, class D, class Layout>
+__device__ inline auto tr_load_b8(const opus::smem<D>& s, const Layout& u)
+{
+    static_assert(VEC * sizeof(D) == 8, "ds_read_b64_tr_b8 reads 8 bytes");
+    using shift        = opus::layout_shift_traits<opus::remove_cvref_t<Layout>>;
+    using v2i_t        = opus::vector_t<int, 2>;
+    constexpr int size = static_cast<int>(sizeof(D));
+    const auto& b      = static_cast<const typename shift::base&>(u);
+    auto* lane         = s.ptr + b(0_I) * size;
+    auto* addr         = reinterpret_cast<OPUS_LDS_ADDR v2i_t*>(lane + shift::value * size);
+    return __builtin_bit_cast(opus::vector_t<D, VEC>, __builtin_amdgcn_ds_read_tr8_b64_v2i32(addr));
 }
 
 // ============================================================================================
@@ -570,7 +605,10 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
     auto u_gkv_r             = make_layout_gkv<T, T::kv_threads_d / 2 - 1>(lane_id);
     auto u_skv               = make_layout_skv<T>(warp_id);
     auto u_rk                = make_layout_rk<T>(lane_id);
-    auto u_rv                = make_layout_rv<T>(lane_id);
+    // V's lane offset folded once into a bare linear offset: read through the five-coordinate
+    // layout itself, every transpose read re-adds the coordinates and keeps them all live.
+    const auto u_rv = make_layout(make_tuple(number<T::VEC_TR_V>{})) +
+                      layout_to_offsets<T::VEC_TR_V>(make_layout_rv<T>(lane_id))[0];
 
     auto kv_handle = [&](auto u, auto d0) {
         if constexpr(T::LARGE_KV)
@@ -655,17 +693,16 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
                       (d % tiles_per_chunk) * 2 * T::VEC_KV>{};
     };
 
-    // One GEMM0 k-step's K, both token tiles: four ds_read_b128. The lane's offset is summed
-    // once, out here, so each read is one base VGPR plus an immediate.
-    const int k_lane = layout_to_offsets<T::VEC_KV>(u_rk)[0];
+    // One GEMM0 k-step's K, both token tiles: four ds_read_b128.
     auto load_k_step = [&](auto& dst, smem<D_K> kv, auto ks) {
         constexpr int base =
             KV_AGPR_BASE<T> + (decltype(ks)::value % T::K_DEPTH) * K_AGPR_PER_STEP<T>;
+        auto* half = reinterpret_cast<k_half_t*>(&dst);
         static_for<T::GEMM0_E_N>([&](auto nt) {
             static_for<2>([&](auto pp) {
                 constexpr int h = nt.value * 2 + pp.value;
                 MLA32MX4_PIN_AGPR(base + h * K_AGPR_PER_HALF<T>)
-                dst[h] = kv.template _load<T::VEC_KV>(k_lane + decltype(k_off(nt, ks, pp))::value);
+                half[h] = load<T::VEC_KV>(kv, u_rk + k_off(nt, ks, pp));
             });
         });
     };
@@ -698,22 +735,13 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
     };
 
     // V d-tile dt of the tile in slot `kv`: four transpose reads into ring entry dt % V_DEPTH.
-    // The builtin, not opus's inline-asm tr_load: V outlives its read by several MFMA, and an
-    // asm result is one the compiler believes ready at once.
-    using v2i_t      = vector_t<int, 2>;
-    const int v_lane = layout_to_offsets<T::VEC_TR_V>(u_rv)[0];
-    auto load_v      = [&](smem<D_K> kv, auto dt) {
+    auto load_v = [&](smem<D_K> kv, auto dt) {
         constexpr int buf  = decltype(dt)::value % T::V_DEPTH;
         constexpr int base = KV_AGPR_BASE<T> + buf * V_AGPR_PER_TILE<T>;
         auto* piece        = reinterpret_cast<v_piece_t*>(&v_v[buf]);
-        auto* lane_base    = kv.ptr + v_lane;
         static_for<T::v_tile_ds_read_insts>([&](auto q) {
-            constexpr int off = decltype(v_off(dt, q))::value;
             MLA32MX4_PIN_AGPR(base + q.value * (T::VEC_TR_V / 4))
-            piece[q.value] =
-                __builtin_bit_cast(v_piece_t,
-                                   __builtin_amdgcn_ds_read_tr8_b64_v2i32(
-                                       reinterpret_cast<OPUS_LDS_ADDR v2i_t*>(lane_base + off)));
+            piece[q.value] = tr_load_b8<T::VEC_TR_V>(kv, u_rv + v_off(dt, q));
         });
     };
     auto load_v_head = [&](smem<D_K> kv) {
@@ -845,7 +873,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
     };
     vector_t<int, 4> idx_rsrc;
     __builtin_memcpy(&idx_rsrc, &g_kv_indices.cached_rsrc, sizeof(idx_rsrc));
-    auto issue_idx_dma = [&](int tile_idx) {
+    auto async_load_kv_indices = [&](int tile_idx) {
         const int tok = min(tile_idx * T::KV_TILE_SIZE + lane_id, valid_kv_len - 1);
         buffer_load_lds_asm<sizeof(int)>(idx_rsrc,
                                          static_cast<u32_t>(tok) * sizeof(int),
@@ -877,44 +905,37 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
     };
 
     // KV gmem->LDS, one instruction at a time: DMA i of a tile is pass i / smem_d_rpt_kv,
-    // chunk i % smem_d_rpt_kv (the last chunk being rope + pad). One call is one
-    // buffer_load_lds (m0 rewritten, s_nop, load), so the phase can spread them over GEMM0's
-    // MFMA. A tile past the range still gets its DMA, so every phase issues the same count and
-    // the vmcnt budget is a constant.
+    // chunk i % smem_d_rpt_kv (the last chunk being rope + pad). One call is one LDS-DMA
+    // (m0 rewritten, s_nop, load), so the phase can spread them over GEMM0's MFMA. A tile past
+    // the range still gets its DMA, so every phase issues the same count and the vmcnt budget
+    // is a constant.
     [[maybe_unused]] vector_t<int, 4> kv_rsrc;
-    [[maybe_unused]] u32_t gkv_lane = 0, gkv_r_lane = 0;
     if constexpr(!T::LARGE_KV)
-    {
         __builtin_memcpy(&kv_rsrc, &g_kv.cached_rsrc, sizeof(kv_rsrc));
-        gkv_lane   = static_cast<u32_t>(layout_to_offsets<T::VEC_KV>(u_gkv)[0]);
-        gkv_r_lane = static_cast<u32_t>(layout_to_offsets<T::VEC_KV>(u_gkv_r)[0]);
-    }
-    const u32_t skv_wave = static_cast<u32_t>(layout_to_offsets<T::VEC_KV>(u_skv)[0]);
-    auto issue_dma       = [&](smem<D_K> kv, const auto& po, auto i) {
+    auto async_load_kv_chunk = [&](smem<D_K> kv, const auto& po, auto i) {
         constexpr int p     = decltype(i)::value / T::smem_d_rpt_kv;
         constexpr int c     = decltype(i)::value % T::smem_d_rpt_kv;
         constexpr int s_off = c * T::smem_kv_chunk + p * T::NUM_WARPS * T::smem_kv_block;
-        const auto poff     = po[p];
         if constexpr(T::LARGE_KV)
         {
             if constexpr(c < rope_chunk)
                 global_load<T::VEC_KV>(
-                    g_kv + (poff + c * T::smem_row_kv), kv.ptr, u_gkv, u_skv + s_off);
+                    g_kv + (po[p] + c * T::smem_row_kv), kv.ptr, u_gkv, u_skv + s_off);
             else
-                global_load<T::VEC_KV>(g_kv_r + poff, kv.ptr, u_gkv_r, u_skv + s_off);
+                global_load<T::VEC_KV>(g_kv_r + po[p], kv.ptr, u_gkv_r, u_skv + s_off);
         }
         else
         {
-            const u32_t voff = (c < rope_chunk)
-                                         ? gkv_lane + static_cast<u32_t>(poff + c * T::smem_row_kv)
-                                         : gkv_r_lane + static_cast<u32_t>(poff + rope_g);
-            buffer_load_lds_asm<T::VEC_KV>(
-                kv_rsrc, voff, lds_addr(kv) + skv_wave + static_cast<u32_t>(s_off));
+            if constexpr(c < rope_chunk)
+                buffer_load_lds<T::VEC_KV>(
+                    kv_rsrc, kv, u_gkv + (po[p] + c * T::smem_row_kv), u_skv + s_off);
+            else
+                buffer_load_lds<T::VEC_KV>(kv_rsrc, kv, u_gkv_r + (po[p] + rope_g), u_skv + s_off);
         }
     };
     auto async_load_kv = [&](smem<D_K> kv, const auto& pages) {
         const auto po = dma_offsets(pages);
-        static_for<T::kv_buffer_load_insts>([&](auto i) { issue_dma(kv, po, i); });
+        static_for<T::kv_buffer_load_insts>([&](auto i) { async_load_kv_chunk(kv, po, i); });
     };
 
     const u32_t neg_inf_v = std::bit_cast<u32_t>(-numeric_limits<D_ACC>::infinity());
@@ -946,53 +967,20 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
     pin_q();
     pin_o();
 
-    // SPLIT_DMA: a slot is released a chunk at a time rather than whole. PV(t-1) walks V in d
-    // order, so chunks 0 and 1 (d-tiles 0..7) are read out halfway through it, and chunk 4
-    // (rope + pad) is GEMM0's only and free once QK(t-1) is done. A second barrier halfway
-    // through PV(t-1) therefore lets the EARLY part of tile t+2 -- chunks 0, 1, 4 of both
-    // passes, 60% of its bytes -- go into slot t-1 a phase ahead; only the LATE part (chunks
-    // 2, 3) waits for the next phase's first barrier. With one-phase-ahead DMA the kernel sat
-    // ~26% of its time on vmcnt; this keeps more of each tile in flight.
-    // Not under LARGE_KV: its 64-bit per-lane DMA addresses do not fit next to PV's live set
-    // (measured: 100 VGPR of spill), so that build keeps the whole tile in one issue.
-    constexpr bool SPLIT_DMA = T::SPLIT_DMA && !T::LARGE_KV;
-    constexpr int EARLY_DMAS = SPLIT_DMA ? 3 * T::KV_PASSES : 0;     // 6
-    constexpr int LATE_DMAS  = T::kv_buffer_load_insts - EARLY_DMAS; // 4 (10 unsplit)
-    // DMA index i = pass * smem_d_rpt_kv + chunk (see issue_dma).
-    auto early_dma_idx = [](auto j) {
-        constexpr int jj = decltype(j)::value, c = jj % 3;
-        return number<(jj / 3) * T::smem_d_rpt_kv + (c < 2 ? c : T::smem_d_rpt_kv - 1)>{};
-    };
-    auto late_dma_idx = [](auto j) {
-        constexpr int jj = decltype(j)::value;
-        if constexpr(SPLIT_DMA)
-            return number<(jj / 2) * T::smem_d_rpt_kv + 2 + jj % 2>{};
-        else
-            return number<jj>{};
-    };
-    // PV step after which the mid barrier sits: every V read of chunks 0 and 1 (d-tiles 0..7)
-    // has been issued V_DEPTH steps before it.
-    constexpr int MID_STEP = 2 * (T::smem_row_kv / T::W_M) - 1; // 7
-
-    // Tiles tile_begin and tile_begin+1 whole into slots 0 and 1, then the index DMA of
-    // tile_begin+3 and the EARLY part of tile_begin+2 into slot 2 -- what a phase for
-    // tile_begin would have issued -- so the first loop phase's vmcnt budget holds.
-    issue_idx_dma(tile_begin);
-    issue_idx_dma(tile_begin + 1);
-    issue_idx_dma(tile_begin + 2);
+    // Tiles tile_begin and tile_begin+1 into slots 0 and 1, then the index DMA of tile_begin+3
+    // -- what a phase for tile_begin would have issued -- so the first loop phase's vmcnt
+    // budget holds.
+    async_load_kv_indices(tile_begin);
+    async_load_kv_indices(tile_begin + 1);
+    async_load_kv_indices(tile_begin + 2);
     __builtin_amdgcn_s_waitcnt(0);
     asm volatile("" ::: "memory");
     const auto pages_a = load_kv_pages(tile_begin);
     const auto pages_b = load_kv_pages(tile_begin + 1);
     async_load_kv(s_kv[0], pages_a);
     async_load_kv(s_kv[1], pages_b);
-    issue_idx_dma(tile_begin + 3);
-    if constexpr(SPLIT_DMA)
-    {
-        const auto po_c = dma_offsets(load_kv_pages(tile_begin + 2));
-        static_for<EARLY_DMAS>([&](auto j) { issue_dma(s_kv[2], po_c, early_dma_idx(j)); });
-    }
-    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + T::kv_index_load_insts + EARLY_DMAS>{});
+    async_load_kv_indices(tile_begin + 3);
+    s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + T::kv_index_load_insts>{});
     lds_barrier();
 
     // Partial phase for tile_begin: QK and the softmax head. There is no previous tile to run a
@@ -1022,18 +1010,13 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
                          int t,
                          auto sbuf) {
         auto& vs_cur = sflat(vs_cur_arr);
-        // stage0 [mem]: wait out DMA(t) -- its LATE part is the newest of it -- leaving the
-        // EARLY part of t+2 (unsplit: the index DMA of t+2) in flight; the barrier then publishes
-        // K(t) and tells every wave that PV(t-2) is done with the slot the LATE part of t+1 is
-        // about to overwrite.
-        s_waitcnt_vmcnt(number < SPLIT_DMA ? EARLY_DMAS : T::kv_index_load_insts > {});
+        // stage0 [mem]: wait out DMA(t), leaving the index DMA of t+2 in flight; the barrier
+        // then publishes K(t) and tells every wave that PV(t-2) is done with the slot DMA(t+1)
+        // is about to overwrite.
+        s_waitcnt_vmcnt(number<T::kv_index_load_insts>{});
         lds_barrier();
         pin_q();
         const auto po = dma_offsets(load_kv_pages(t + 1));
-        // The EARLY part's offsets are fetched only at the mid barrier (see pv_chunk): held from
-        // here they are live across the whole phase, which the LARGE_KV build (64-bit
-        // offsets) measured as 102 VGPR of spill.
-        [[maybe_unused]] opus::remove_cvref_t<decltype(po)> po2{};
         load_k_head(kv_cur);
         stage_end();
 
@@ -1042,20 +1025,16 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
         __builtin_amdgcn_s_setprio(1);
         clear_s(vs_cur_arr, sbuf);
         compute_qk(vs_cur_arr, kv_cur, sbuf, [&](auto ks) {
-            // The index DMA of t+3 first (split: it feeds next phase's EARLY part and must beat
-            // this phase's LATE DMA home), then the LATE part of t+1, one per k-step.
-            if constexpr(ks.value == 0 && SPLIT_DMA)
-                issue_idx_dma(t + 3);
-            if constexpr(ks.value < LATE_DMAS && ks.value < T::GEMM0_E_K - 1)
-                issue_dma(kv_next, po, late_dma_idx(ks));
+            // DMA(t+1), one per k-step, the remainder on the last; then the index DMA of t+3.
+            constexpr int n_dma = T::kv_buffer_load_insts;
+            if constexpr(ks.value < n_dma && ks.value < T::GEMM0_E_K - 1)
+                async_load_kv_chunk(kv_next, po, ks);
             if constexpr(ks.value == T::GEMM0_E_K - 1)
             {
-                static_for<(LATE_DMAS >= T::GEMM0_E_K ? LATE_DMAS - T::GEMM0_E_K + 1 : 0)>(
-                    [&](auto j) {
-                        issue_dma(kv_next, po, late_dma_idx(number<T::GEMM0_E_K - 1 + j.value>{}));
-                    });
-                if constexpr(!SPLIT_DMA)
-                    issue_idx_dma(t + 3);
+                static_for<(n_dma >= T::GEMM0_E_K ? n_dma - T::GEMM0_E_K + 1 : 0)>([&](auto j) {
+                    async_load_kv_chunk(kv_next, po, number<T::GEMM0_E_K - 1 + j.value>{});
+                });
+                async_load_kv_indices(t + 3);
             }
             if constexpr(ks.value < TAIL_CHUNKS)
                 tail_chunk(vs_prev_arr, ks);
@@ -1128,31 +1107,9 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
                 anchor_vgpr(grp[(k - 4) / 4]);
         };
         static_assert(4 + s_half_len / 2 <= T::GEMM1_E_M, "the head must fit the PV shadows");
-        // SPLIT_DMA's mid barrier: once this wave's V reads of chunks 0 and 1 are home (they
-        // are older than the V_DEPTH d-tiles still in flight, hence the non-zero count), the
-        // barrier tells every wave that slot t-1's chunks 0, 1, 4 are free, and the EARLY part
-        // of t+2 goes in, one DMA per remaining PV step.
-        auto pv_chunk = [&](auto dt) {
-            head_chunk(dt);
-            if constexpr(SPLIT_DMA)
-            {
-                constexpr int d = decltype(dt)::value;
-                static_assert(MID_STEP + EARLY_DMAS < T::GEMM1_E_M);
-                if constexpr(d == MID_STEP)
-                {
-                    // The page reads come after the V reads, so the count below covers them
-                    // too; they are this wave's own ring entry, landed by stage0's vmcnt.
-                    po2 = dma_offsets(load_kv_pages(t + 2));
-                    s_waitcnt_lgkmcnt(number<(T::V_DEPTH - 1) * T::v_tile_ds_read_insts>{});
-                    lds_barrier();
-                }
-                if constexpr(d > MID_STEP && d - MID_STEP - 1 < EARLY_DMAS)
-                    issue_dma(kv_prev, po2, early_dma_idx(number<d - MID_STEP - 1>{}));
-            }
-        };
         __builtin_amdgcn_s_setprio(1);
         pin_o();
-        compute_pv(kv_prev, pv_chunk);
+        compute_pv(kv_prev, head_chunk);
         // O now holds PV(t-1) at the old max; move it to the new one before PV(t) lands.
         rescale_o();
         // What lets the next barrier release slot t-1: without it a wave could pass it with V

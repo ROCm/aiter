@@ -897,12 +897,23 @@ def mla_decode_fwd(
         # Opt-in opus merged-buffer fp8 path (gfx950). Requires a single
         # merged d=576 fp8 q/kv buffer and per-tensor scalar float q/kv scales,
         # or a bf16 q/kv buffer of the same shape.
+        # Shapes with an opus fp8 build: what asm runs on its qh32 / qseqlen4 kernel goes to
+        # 32mx4, what it runs on qh16 / qseqlen4 to 16mx4, and nhead 16 x 1 to 32nx4 -- the
+        # table in opus_fp8_route (csrc/kernels/mla/opus_mla_decode_fwd.cu). Anything else
+        # stays on the asm path. nhead is the folded one here.
+        opus_fp8_shape = (
+            (nhead == 32 and max_seqlen_q >= 2)
+            or nhead == 64
+            or nhead == 128
+            or (nhead == 96 and max_seqlen_q <= 6)
+            or (nhead == 16 and max_seqlen_q in (1, 3, 4))
+        )
         opus_is_fp8 = (
             q.dtype == dtypes.fp8
             and kv_buffer.dtype == dtypes.fp8
-            # No opus fp8 build addresses a real block table any more: 16mx1 (nhead 16, one
-            # query token) routes to 32nx4 and everything else to 16mx8, and neither has
-            # been ported past one token per page.
+            and opus_fp8_shape
+            # No opus fp8 build addresses a real block table: none has been ported past one
+            # token per page.
             and page_size == 1
             and q_scale is not None
             and kv_scale is not None

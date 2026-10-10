@@ -66,8 +66,9 @@ using opus::operator""_I;
 namespace mla_decode_fwd_16mx4_64nx1_fp8fp8 {
 
 // Register pins. Only the amdgpu-pin-op-dst toolchain knows the attributes, and only there do
-// the macros expand to them (stock clang would warn and drop them anyway), so aiter's in-tree
-// build and OpFoundry's .co compile one source. A pin binds a *definition*, hence the array
+// the macros expand to them (stock clang would warn and drop them anyway), so a stock compile
+// and the prebuilt .co (mla_decode_fp8_16mx4_64nx1_co.hip) share one source; aiter loads only
+// the .co, which measured 2% faster. A pin binds a *definition*, hence the array
 // types for K and S below: a store through a reinterpret_cast of a flat vector is not a
 // definition the allocator honours.
 #if defined(__has_cpp_attribute)
@@ -990,7 +991,6 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
             load_v(kv, number<T::GEMM1_E_N - 1>{});
     };
     auto no_co = [](auto) {};
-
     constexpr index_t s_len      = T::GEMM0_E_N * T::W_M * T::W_N / T::WARP_SIZE; // 16
     constexpr index_t s_half_len = s_len / 2;
     constexpr int QK_MFMA_CNT    = T::GEMM0_E_N * T::GEMM0_E_K; // 20
@@ -1547,21 +1547,19 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     }
 }
 
-} // namespace mla_decode_fwd_16mx4_64nx1_fp8fp8
-
-// Persistent entry point: the grid is sized to the machine, not to the problem, and each
-// block drains the work items the metadata kernel assigned it through work_indptr.
+// Persistent body: the grid is sized to the machine, not to the problem, and each block
+// drains the work items the metadata kernel assigned it through work_indptr. A __device__
+// function so the prebuilt code object can wrap it in the extern "C" entries aiter looks up
+// by name (mla_decode_fp8_16mx4_64nx1_co.hip).
 //
 // One block per CU: 3 KV slots plus the P exchange are 130 KB. That is also what makes the
 // register budget work -- one wave per SIMD gets the whole 512-register file, and this shape
 // needs more than 256 (v_o 128, v_q 40, v_s 2x16, v_k 2x16, v_v 64, v_p 8).
 template <class Traits>
-__global__
-__launch_bounds__(Traits::BLOCK_SIZE,
-                  1) void opus_mla_decode_fp8_16mx4_64nx1_kernel(opus_mla_decode_fp8_kargs kargs)
+__device__ __attribute__((always_inline)) void
+mla_decode_fwd_persistent(opus_mla_decode_fp8_kargs kargs)
 {
     using namespace opus;
-    using namespace mla_decode_fwd_16mx4_64nx1_fp8fp8;
     using T = opus::remove_cvref_t<Traits>;
 
     const int work_id = block_id_x();
@@ -1582,6 +1580,16 @@ __launch_bounds__(Traits::BLOCK_SIZE,
         __builtin_amdgcn_sched_barrier(0);
         mla_decode_fwd_one_req<Traits>(kargs, w, smem_buffer, temperature_scale);
     }
+}
+
+} // namespace mla_decode_fwd_16mx4_64nx1_fp8fp8
+
+template <class Traits>
+__global__
+__launch_bounds__(Traits::BLOCK_SIZE,
+                  1) void opus_mla_decode_fp8_16mx4_64nx1_kernel(opus_mla_decode_fp8_kargs kargs)
+{
+    mla_decode_fwd_16mx4_64nx1_fp8fp8::mla_decode_fwd_persistent<Traits>(kargs);
 }
 
 #endif // !__HIP_DEVICE_COMPILE__ || !__gfx950__

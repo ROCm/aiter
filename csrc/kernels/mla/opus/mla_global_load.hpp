@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <opus/opus.hpp>
 
 // --- global->LDS async copy on a 64-bit flat address (GLOBAL_LOAD_LDS) ---

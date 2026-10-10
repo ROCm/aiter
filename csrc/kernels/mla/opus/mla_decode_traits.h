@@ -623,8 +623,7 @@ template <int Q_TILE_SIZE_  = 32,
           typename D_OUT_   = bf16_t,
           bool CAUSAL_      = false,
           bool LARGE_KV_    = false,
-          int KV_SLOTS_     = 3,
-          bool SPLIT_DMA_   = true>
+          int KV_SLOTS_     = 3>
 struct opus_mla_decode_fp8_32mx4_64nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;  // query rows one wave owns
@@ -684,9 +683,6 @@ struct opus_mla_decode_fp8_32mx4_64nx1_traits
     static constexpr int V_DEPTH = 4;
     static_assert(V_DEPTH * W_M * W_K == K_DEPTH * GEMM0_E_N * W_N * W_K,
                   "the V ring must fold exactly onto the K ring");
-    // Release a KV slot a chunk at a time (see SPLIT_DMA in the kernel). Pays on long work
-    // items; on a handful of tiles its extra barrier per phase costs more than it hides.
-    static constexpr bool SPLIT_DMA = SPLIT_DMA_;
 
     static constexpr int VEC_Q    = 16; // fp8 dwordx4
     static constexpr int VEC_KV   = 16;
