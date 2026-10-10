@@ -317,6 +317,8 @@ def test_gemm(
     # Skip unsupported combos up front (before prep/shuffle) so they show as
     # "not support" rather than crashing on a shape assert.
     pre = "ABpreShuffle" if apre else "BpreShuffle"
+    # M x N launch cluster selected by asm_f4gemm.cu; the .co name stays 4x4.
+    cluster = "1x4" if 0 < M <= 256 else "4x4"
     reason = _support_reason(outtype, apre, M, N, K)
     if reason is not None:
         base = f"f4gemm_{outtype}_{intype}_{pre}_256x256_4x4_ps"
@@ -335,7 +337,7 @@ def test_gemm(
             "gfx": get_gfx(),
             "knl_name": actual_knl,
             "tile": "256x256",
-            "cluster": "4x4",
+            "cluster": cluster,
             "asm us": float("nan"),
             "asm TFLOPS": float("nan"),
             "asm TB/s": float("nan"),
@@ -428,10 +430,9 @@ def test_gemm(
     # the verbatim knl_name otherwise (kept in the table, see main()).
     actual_knl = knl_name if (knl_name and knl_name != "auto") else base
     ret = {"gfx": get_gfx(), "knl_name": actual_knl}
-    # Structured algo details (f4gemm.csv columns): F4GEMM tiles are always
-    # 256x256 with a 4x4 (cluster_x x cluster_y) cluster; no splitk/unroll axis.
+    # The tile comes from f4gemm.csv; the cluster also depends on M at dispatch.
     ret["tile"] = "256x256"
-    ret["cluster"] = "4x4"
+    ret["cluster"] = cluster
     # Report TG occupancy for the 256x256 tile.
     _report_active_tg(M, N, 256, 256, base)
     # Only a missing .co is reported as "not support"; any other failure (OOM,
@@ -752,8 +753,7 @@ def main():
         aiter.logger.info(
             "wrote JSON summary (%d rows) to %s", len(df_full), args.json_out
         )
-    # Keep knl_name (the actual .co) + tile; drop columns constant within a table
-    # (cluster is always 4x4).
+    # Keep the actual .co name, tile, and M x N launch cluster in the table.
     df = df_full.drop(
         columns=[
             "seed",

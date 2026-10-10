@@ -285,13 +285,18 @@ static void f4gemm_launch(aiter_tensor_t* A,
         cfg.knl_name, [&]() { return AiterAsmKernel(cfg.knl_name.c_str(), cfg.co_name.c_str()); });
 
     // ----- Launch geometry: cluster + persistent -----
-    // Every f4gemm .co is a persistent shader, so the launch is fixed-size and
-    // independent of M/N/K. The tile-walk swizzle is NOT baked into
+    // Every f4gemm .co is a persistent shader with a fixed total workgroup
+    // count. The tile-walk swizzle is NOT baked into
     // the .co: the shader reads log2(gridX)/log2(gridY) as kernargs, so the host
     // picks the cluster-grid shape here and must ship it. persistent_tg / grid_y
     // are runtime-only knobs; gridX is derived.
-    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1; // compile-time per .co (CSV)
-    const int cluster_y = cfg.cluster_y > 0 ? cfg.cluster_y : 1;
+    // The gfx1250 shaders read cluster dimensions and build multicast masks
+    // from TTMP6. Use one cluster row for a single M tile to avoid the padded
+    // M tiles introduced by the 4x4 manifest default.
+    const int cluster_x = cfg.cluster_x > 0 ? cfg.cluster_x : 1;
+    const bool single_m_tile =
+        arch_id == "gfx1250" && Mdim > 0 && Mdim <= cfg.tile_m;
+    const int cluster_y = single_m_tile ? 1 : (cfg.cluster_y > 0 ? cfg.cluster_y : 1);
 
     constexpr int PERSISTENT_TG = 256; // total threadgroups (pow2 * cluster count)
     constexpr int PERSISTENT_GY = 4;   // cluster-grid Y dim (M dir); gridX derived
