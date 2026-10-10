@@ -29,8 +29,12 @@ import sys
 from watchdog import GitHub
 
 AVG_REVIEW_MINUTES = 50      # measured: a full review is about this
-MAX_AHEAD = 6                # ~5 h of queue; beyond that, say no instead of accepting silently
+MAX_WAIT_HOURS = 8           # refuse beyond this rather than accept it; see below
 NO_RUNNER_MINUTES = 30       # nothing moving for this long, with work waiting, means nobody is taking it
+
+# The limit is a wait, not a queue length, because the constraint it answers is a wait: GitHub
+# cancels a job that has been queued for 24 h, silently. Eight hours leaves room for the estimate
+# to be wrong by a factor of three and still not lose the request.
 
 
 def _age_minutes(stamp, now):
@@ -63,11 +67,12 @@ def decide(running, waiting, cfg):
     ahead = running + len(waiting)
     if running == 0 and waiting and max(waiting) >= cfg["no_runner_minutes"]:
         return "no-runner", ahead, int(max(waiting))
-    if ahead >= cfg["max_ahead"]:
-        return "too-deep", ahead, ahead * cfg["avg_minutes"]
+    eta = ahead * cfg["avg_minutes"]
+    if eta >= cfg["max_wait_minutes"]:
+        return "too-deep", ahead, eta
     if ahead == 0:
         return "idle", 0, 0
-    return "queued", ahead, ahead * cfg["avg_minutes"]
+    return "queued", ahead, eta
 
 
 def _hours(minutes):
@@ -114,11 +119,18 @@ def run(api, env, now=None):
 
     now = now or datetime.datetime.now(datetime.timezone.utc)
     cfg = {"avg_minutes": float(env.get("AVG_REVIEW_MINUTES") or AVG_REVIEW_MINUTES),
-           "max_ahead": int(env.get("MAX_AHEAD") or MAX_AHEAD),
+           "max_wait_minutes": float(env.get("MAX_WAIT_HOURS") or MAX_WAIT_HOURS) * 60,
            "no_runner_minutes": float(env.get("NO_RUNNER_MINUTES") or NO_RUNNER_MINUTES)}
 
     repo = env["GITHUB_REPOSITORY"]
-    running, waiting = survey(api, repo, int(env["GITHUB_RUN_ID"]), now)
+    # Authorization fails closed; this does not. Refusing every review because the queue could
+    # not be measured would turn a bug in this file into an outage of the whole bot, and the
+    # thing it guards against -- a request lost in a long queue -- is rarer than that.
+    try:
+        running, waiting = survey(api, repo, int(env["GITHUB_RUN_ID"]), now)
+    except Exception as e:                                  # noqa: BLE001 - degrade, not crash
+        print("::warning::could not measure the queue (%s: %s); proceeding" % (type(e).__name__, e))
+        return finish(True, "unmeasured")
     verdict, ahead, eta = decide(running, waiting, cfg)
 
     if verdict == "idle":

@@ -50,6 +50,8 @@ def drive(mod, scn):
                 return {"jobs": scn.get("jobs", {}).get(rid, [])}
             if "/runs" in u.path:
                 runs = scn.get("runs", [])
+                if runs == "boom":                  # the API being unreadable, not empty
+                    raise RuntimeError("GET %s -> 500" % path)
                 per, page = int(q["per_page"][0]), int(q["page"][0])
                 newest_first = sorted(runs, key=lambda r: -r["id"])
                 return {"workflow_runs": newest_first[(page - 1) * per:page * per]}
@@ -117,13 +119,13 @@ CASES = [
     # A queue deeper than the day is the thing that loses requests: GitHub cancels a job that
     # waits 24 h, and the notifier lives inside the job that never ran.
     ("refuses rather than accept a queue it cannot work through",
-     busy(1, 5),
+     busy(1, 9),
      lambda r: [
-         (r["ok"] is False, "accepted a request into a six-deep queue"),
+         (r["ok"] is False, "accepted a request into a queue it cannot work through"),
          ("ok=false" in r["output_file"], "told the workflow to proceed anyway"),
          (len(r["posts"]) == 1 and "not queued" in r["posts"][0]["body"],
           "did not tell the requester it was refused"),
-         (len(r["posts"]) == 1 and "6 deep" in r["posts"][0]["body"], "did not say how deep"),
+         (len(r["posts"]) == 1 and "10 deep" in r["posts"][0]["body"], "did not say how deep"),
      ]),
 
     # Nothing moving with work waiting: dead or wedged, indistinguishable from here, same remedy.
@@ -168,8 +170,18 @@ CASES = [
          (len(r["posts"]) == 1 and "@zufayu" not in r["posts"][0]["body"], "paged the default too"),
      ]),
 
+    # A bug here must not become an outage: the queue check is a courtesy, authorization is not.
+    ("lets an authorized review through when the queue cannot be measured",
+     {"runs": "boom"},
+     lambda r: [
+         (r["ok"] is True, "a failure to measure the queue stopped an authorized review"),
+         (r["verdict"] == "unmeasured", "verdict was %r" % r["verdict"]),
+         (any("could not measure" in m for m in r["warnings"]), "degraded without saying so"),
+         (not r["posts"], "commented about a queue it could not read"),
+     ]),
+
     ("still decides when the comment cannot be posted",
-     dict(busy(1, 5), env={}, post_status=403),
+     dict(busy(1, 9), env={}, post_status=403),
      lambda r: [
          (any("403" in m for m in r["warnings"]), "swallowed the failed post"),
          (r["ok"] is False, "a token problem silently turned a refusal into an acceptance"),
@@ -180,8 +192,8 @@ MUTANTS = [
     ("the stalled-queue check",
      'if running == 0 and waiting and max(waiting) >= cfg["no_runner_minutes"]:', "if False:",
      "refuses and pages the owner when nothing is being served"),
-    ("the queue depth limit",
-     'if ahead >= cfg["max_ahead"]:', "if False:",
+    ("the wait limit",
+     'if eta >= cfg["max_wait_minutes"]:', "if False:",
      "refuses rather than accept a queue it cannot work through"),
     ("skipping its own run",
      'if run["id"] == own_run_id:', "if False:",
@@ -192,6 +204,10 @@ MUTANTS = [
     ("staying quiet when the box is free",
      "if ahead == 0:", "if False:",
      "starts at once and says nothing when the box is free"),
+    ("the degrade-on-error path",
+     "except Exception as e:                                  # noqa: BLE001 - degrade, not crash",
+     "except ZeroDivisionError as e:",
+     "lets an authorized review through when the queue cannot be measured"),
     ("the owner override",
      '(env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"', '"zufayu"',
      "pages the override owner when the repo sets one"),

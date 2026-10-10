@@ -94,7 +94,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
           OWNER_OVERRIDE: ${{ vars.AITER_RUNNER_OWNER }}
-          MAX_AHEAD: ${{ vars.AITER_MAX_QUEUE }}          # optional; default 6
+          MAX_WAIT_HOURS: ${{ vars.AITER_MAX_WAIT_HOURS }}   # optional; default 8
         run: python3 .claude/skills/review-pr/queue_gate.py
 
   watchdog:
