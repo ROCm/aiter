@@ -93,6 +93,14 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 # * recv: ``sc0 sc1``. The payload loads go past L1 and L2 to memory.
 # * fanout: "sector".
 #
+# ``acquire`` and ``recv`` are one decision and must change together. A
+# workgroup-scope acquire invalidates nothing, so it is only safe when ``recv``
+# makes every payload load bypass L1 and L2 (``sc0 sc1``) -- ``nt`` is a reuse
+# hint, not a bypass, and could be answered from a line cached by an earlier
+# call into the same slot. A system-scope acquire is what makes ``nt`` safe.
+# The mesh's relay blocks are the exception: they read the bounce with plain
+# loads behind an agent-scope acquire, see ``_RELAY_RECV_CM`` there.
+#
 # Fine-grained inbox
 # ------------------
 # This memory type is cacheable. A retired store can stay in the L2 of the
