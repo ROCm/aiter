@@ -80,6 +80,10 @@ def main():
     import torch
 
     from aiter import ActivationType, QuantType, dtypes
+    from aiter.ops.flydsl.mxfp4_kname import (
+        _parse_mxfp4_g1_kname,
+        parse_flydsl_v2_gemm2_kernel,
+    )
     from aiter.test_common import get_trace_perf
     from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
         Mxfp4FlydslTuner,
@@ -101,10 +105,29 @@ def main():
     operations = []
     kernel_module = importlib.import_module("aiter.ops.flydsl.mxfp4_gemm1_kernels")
     g2_module = importlib.import_module("aiter.ops.flydsl.kernels.mxmoe_dispatcher")
+    parsed_g1 = _parse_mxfp4_g1_kname(row["kernelName1"])
+    parsed_g2 = parse_flydsl_v2_gemm2_kernel(row["kernelName2"])
     stage1 = kernel_module.flydsl_mxfp4_gemm1
     stage2 = g2_module.mxfp4_moe_gemm2
 
     def capture_g1(**kwargs):
+        for key in (
+            "BM",
+            "BN",
+            "BK",
+            "use_nt",
+            "inline_quant",
+            "prefetch_hidden",
+            "xcd_swizzle",
+            "num_waves",
+            "k_wave",
+            "a_dtype",
+            "out_dtype",
+            "act",
+        ):
+            assert kwargs[key] == parsed_g1[key], (key, kwargs[key], parsed_g1[key])
+        assert kwargs["interleave"] is False
+        assert kwargs["native_scale_layout"] == (parsed_g1["BM"] == 16)
         operations.append(
             {
                 "op": "g1",
@@ -121,6 +144,21 @@ def main():
         return stage1(**kwargs)
 
     def capture_g2(*positional, **kwargs):
+        for key, parsed_key in (
+            ("BM", "tile_m"),
+            ("BN", "tile_n"),
+            ("BK", "tile_k"),
+            ("use_nt", "use_nt"),
+            ("epilog", "epilog"),
+            ("a_dtype", "a_dtype"),
+            ("b_dtype", "b_dtype"),
+            ("out_dtype", "out_dtype"),
+        ):
+            assert kwargs[key] == parsed_g2[parsed_key], (
+                key,
+                kwargs[key],
+                parsed_g2[parsed_key],
+            )
         operations.append(
             {
                 "op": "g2",
@@ -249,9 +287,9 @@ def main():
             "finite": True,
             "cosine_diff": error,
             "tuner_kernel_sum_us": float(row["us"]),
-            "main_profile_kernel_duration_sum_us": metric,
+            "synchronized_diagnostic_kernel_sum_with_main_aggregation_us": metric,
             "raw_real_kernel_duration_sum_us": kernel_sum,
-            "matched_real_kernel_span_us": span,
+            "matched_synchronized_real_kernel_trace_span_us": span,
             "matched_synchronized_elapsed_median_us": statistics.median(elapsed),
             "matched_synchronized_elapsed_min_us": min(elapsed),
             "matched_synchronized_elapsed_max_us": max(elapsed),
@@ -259,7 +297,7 @@ def main():
             "measurement": {
                 "warmup": args.warmup,
                 "iters": args.iters,
-                "timing_scope": "main kernel duration sum; elapsed/span are separate matched companions",
+                "timing_scope": "synchronized per-call diagnostic, using main kernel-duration aggregation; span and elapsed from same synchronized calls; CSV tuner latency uses normal continuous run_perftest",
             },
             "setup_seconds": setup_seconds,
             "wall_seconds": time.perf_counter() - started,
