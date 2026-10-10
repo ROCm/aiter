@@ -1,0 +1,48 @@
+F                                                                        [100%]
+=================================== FAILURES ===================================
+______ test_invocation_captures_limit_and_stage2_settings_for_every_shape ______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x76bee9a49af0>
+
+    def test_invocation_captures_limit_and_stage2_settings_for_every_shape(monkeypatch):
+        monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
+        monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+        monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
+        with devices(("gfx950", 256)):
+            tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
+            monkeypatch.setattr("sys.argv", ["tuner", "--mxfp4-flydsl"])
+            args = tuner.parse_args()
+            snapshots = []
+    
+            def tune_shape(row, args):
+                snapshots.append(args.mxfp4_configuration)
+                return {**row, "us": 1.0}
+    
+            monkeypatch.setattr(tuner, "_tune_one_shape", tune_shape)
+>           tuner.tune(pd.DataFrame([shape(128), shape(2048)]), None, args)
+
+op_tests/tuning_tests/test_mxfp4_configured_paths.py:38: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:7684: in tune
+    return [self._tune_one_shape(row, args) for row in rows]
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+row = {'act_type': 'ActivationType.Swiglu', 'cu_num': 256, 'doweight_stage1': 0, 'dtype': 'torch.bfloat16', ...}
+args = Namespace(verbose=False, untune_file='/root/workspace/tmp_dev/aiter-mxfp4-03/aiter/configs/model_configs/kimik2_fp4_un...improvement_pct=3.0, last=False, grouped_gemm=False, mxfp4_flydsl=True, mxfp4_search_mode='prune', mxfp4_screen_topk=2)
+
+    def tune_shape(row, args):
+>       snapshots.append(args.mxfp4_configuration)
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+E       AttributeError: 'Namespace' object has no attribute 'mxfp4_configuration'
+
+op_tests/tuning_tests/test_mxfp4_configured_paths.py:34: AttributeError
+=============================== warnings summary ===============================
+aiter/ops/triton/gluon/__init__.py:16
+  /root/workspace/tmp_dev/aiter-mxfp4-03/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+    warnings.warn(
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED op_tests/tuning_tests/test_mxfp4_configured_paths.py::test_invocation_captures_limit_and_stage2_settings_for_every_shape
+1 failed, 1 warning in 3.57s
