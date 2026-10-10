@@ -258,9 +258,10 @@ def _fwd_kernel_stage2_asm(
                 e_max = n_e_max
             offs_logic += stride_mid_ob
             offs_v += stride_mid_ob * Lv
+            # No valid split (empty sequence): e_sum == 0, define O = 0.
             tl.store(
                 O + cur_qo * stride_obs + cur_head * stride_oh + offs_d,
-                acc / e_sum,
+                tl.where(e_sum > 0, acc / e_sum, 0.0),
                 mask=mask_d,
             )
             if HAS_FINAL_LSE:
