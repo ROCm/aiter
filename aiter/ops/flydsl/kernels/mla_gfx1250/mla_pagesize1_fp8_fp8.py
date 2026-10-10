@@ -305,7 +305,7 @@ def launch_mla_pagesize1_fp8_fp8(
             pad_amount=KV_PAD_AMOUNT,
             index_size=32,
             gather_tile_dim1=KV_GATHER_ROWS_PER_WAVE,
-            lds_byte_offset=fx.Index(0),
+            lds_byte_offset=0,
         )
 
         def load_page_indices(tile_start):
@@ -598,7 +598,7 @@ def launch_mla_pagesize1_fp8_fp8(
                     (running_max - new_max) * fx.Float32(LOG2E),
                     fx.Float32(0.0),
                 )
-            alpha = fx.Float32(rocdl.exp2(T.f32, alpha_arg.ir_value()))
+            alpha = fx.exp2(alpha_arg, fastmath="afn")
 
             with fx.fastmath(fm_no_inf):
                 exp_bias = fx.Float32(0.0) - new_max * fx.Float32(LOG2E)
@@ -631,9 +631,7 @@ def launch_mla_pagesize1_fp8_fp8(
                         ]
                 tile_probabilities = []
                 for i in range_constexpr(QK_ACC_DWORDS):
-                    probability = fx.Float32(
-                        rocdl.exp2(T.f32, probability_args[i].ir_value())
-                    )
+                    probability = fx.exp2(probability_args[i], fastmath="afn")
                     if const_expr(mask_bounds):
                         probability = probability_validity[i].select(
                             probability, fx.Float32(0.0)
