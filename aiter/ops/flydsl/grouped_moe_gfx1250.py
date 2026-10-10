@@ -65,10 +65,18 @@ def _as_bool(value, default: bool) -> bool:
 def _as_int(value, default: int | None) -> int | None:
     # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
     # cell can come back as the literal "nan"; read those as unset like _cell.
+    # The default config is merged with pandas too, which writes the integers of
+    # a column that has a blank cell as floats ("16.0").
     text = "" if value is None else str(value).strip()
     if text == "" or text.lower() in ("nan", "none"):
         return default
-    return int(text)
+    try:
+        return int(text)
+    except ValueError:
+        number = float(text)
+        if not number.is_integer():
+            raise
+        return int(number)
 
 
 def _dtype_name(dtype) -> str:
@@ -167,10 +175,16 @@ def _find_grouped_config(
     # stays backward compatible with pre-gfx tuned files.
     # The tuner rewrites its frame through ``astype(str)``, so a blank cell can
     # come back as the literal "nan"; read those as unset (wildcard) instead of
-    # as a value that matches nothing.
+    # as a value that matches nothing. The pandas-merged default config writes
+    # ep_fused = 1 as "1.0", which has to match the key "1".
     def _cell(row, k):
         value = str(row.get(k) or "").strip()
-        return "" if value.lower() in ("nan", "none") else value
+        if value.lower() in ("nan", "none"):
+            return ""
+        whole, dot, frac = value.partition(".")
+        if dot and frac.strip("0") == "" and whole.lstrip("-").isdigit():
+            return whole
+        return value
 
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
