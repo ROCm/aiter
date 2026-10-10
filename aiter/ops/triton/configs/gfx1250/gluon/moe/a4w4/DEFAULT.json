@@ -2272,5 +2272,17 @@
         "block_k": 256,
         "num_buffers": 2,
         "num_warps": 4
+    },
+    "bm64_n1536_k7168_xlarge": {
+        "block_n": 256,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
+    },
+    "bm64_n7168_k768_xlarge": {
+        "block_n": 128,
+        "block_k": 256,
+        "num_buffers": 2,
+        "num_warps": 4
     }
 }
