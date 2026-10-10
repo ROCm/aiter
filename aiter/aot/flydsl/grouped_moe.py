@@ -46,7 +46,16 @@ def _as_bool(value, default: bool = False) -> bool:
 def _as_int(value, default: int | None = None) -> int | None:
     if value is None or str(value).strip() == "":
         return default
-    return int(value)
+    # The default config is merged with pandas, which writes the integers of a
+    # column that has a blank cell as floats ("16.0").
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError:
+        number = float(text)
+        if not number.is_integer():
+            raise
+        return int(number)
 
 
 def _as_float(value, default: float) -> float:
@@ -97,12 +106,12 @@ def parse_csv(csv_path: str):
                 for col in ("model_dim", "inter_dim", "expert", "token")
             ):
                 continue
-            n_warp = int(row.get("n_warp") or 4)
-            token_num = int(row["token"])
-            tile_m = int(row.get("tile_m") or 64)
-            m_warp = int(row.get("m_warp") or 1)
+            n_warp = _as_int(row.get("n_warp"), 4)
+            token_num = _as_int(row["token"])
+            tile_m = _as_int(row.get("tile_m"), 64)
+            m_warp = _as_int(row.get("m_warp"), 1)
             warp_tile_m = tile_m // m_warp
-            topk = int(row.get("topk") or 1)
+            topk = _as_int(row.get("topk"), 1)
             raw_max_m = _as_int(row.get("max_m"), token_num)
             max_m = _align_max_m(raw_max_m, warp_tile_m)
             act_type = row.get("act_type", "")
@@ -114,9 +123,9 @@ def parse_csv(csv_path: str):
                 act = "silu"
             base_job = {
                 "kernel_name": row.get("kernelName1", "grouped_gemm1"),
-                "model_dim": int(row["model_dim"]),
-                "inter_dim": int(row["inter_dim"]),
-                "experts": int(row["expert"]),
+                "model_dim": _as_int(row["model_dim"]),
+                "inter_dim": _as_int(row["inter_dim"]),
+                "experts": _as_int(row["expert"]),
                 "max_m": max_m,
                 "token_num": token_num,
                 "topk": topk,
@@ -125,9 +134,9 @@ def parse_csv(csv_path: str):
                 "tile_k": _TILE_K,
                 "m_warp": m_warp,
                 "n_warp": n_warp,
-                "num_buffers": int(row.get("num_buffers") or 2),
-                "split_k1": int(row.get("split_k1") or 1),
-                "split_k2": int(row.get("split_k2") or 1),
+                "num_buffers": _as_int(row.get("num_buffers"), 2),
+                "split_k1": _as_int(row.get("split_k1"), 1),
+                "split_k2": _as_int(row.get("split_k2"), 1),
                 "out_dtype": "bf16" if row.get("dtype") == "torch.bfloat16" else "f16",
                 "persistent_workers": _as_int(row.get("persistent_workers"), None),
                 "act": act,
