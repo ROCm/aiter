@@ -8,13 +8,19 @@ OCP on gfx950. See ``kernels.pa_decode_kernel`` for Q/P quantization and
 MFMA specialization details.
 """
 
+import functools
+
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
+from .kernels.pa_decode_kernel import (
+    KV_COMPUTE_BLOCK,
+    compile_pa_decode_tile,
+    d256_m1_pipe,
+)
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import (
@@ -24,6 +30,54 @@ from .kernels.pa_decode_reduce import (
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
 
 
+def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
+    """Block, token and head strides; size-1 axes are never stepped, so 0."""
+    return tuple(0 if view.shape[d] == 1 else int(view.stride(d)) for d in range(3))
+
+
+def _view_span(view: torch.Tensor) -> int:
+    """Elements from the view's first element through its last, inclusive."""
+    return 1 + sum(
+        (size - 1) * stride for size, stride in zip(view.shape, view.stride())
+    )
+
+
+# 4096 int32 page ids are 16 KiB of LDS. A page-64 table of 16384 columns is
+# 1,048,576 tokens and needs exactly this many ids at 4 partitions, fewer
+# with more partitions.
+_PAGE_ID_LIMIT = 4096
+
+
+@functools.lru_cache(maxsize=32)
+def _warn_unstaged_page_ids(
+    max_blocks: int, block_size: int, num_partitions: int, pages: int
+) -> None:
+    from aiter import logger
+
+    logger.warning(
+        "pa_decode is reading page ids inside the tile loop: block table "
+        "width %d, page %d, %d partitions needs %d page ids, above the "
+        "%d-id LDS limit. Increase num_partitions or pass a narrower table "
+        "to stage them first.",
+        max_blocks,
+        block_size,
+        num_partitions,
+        pages,
+        _PAGE_ID_LIMIT,
+    )
+
+
+def _stage_page_capacity(max_blocks: int, block_size: int, num_partitions: int) -> int:
+    """Page ids staged per CTA. Zero leaves the block-table load in the tile loop."""
+    max_tiles = (max_blocks * block_size + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+    tiles_per_part = (max_tiles + num_partitions - 1) // num_partitions
+    pages = tiles_per_part * (KV_COMPUTE_BLOCK // block_size)
+    if pages <= _PAGE_ID_LIMIT:
+        return pages
+    _warn_unstaged_page_ids(max_blocks, block_size, num_partitions, pages)
+    return 0
+
+
 def get_recommended_splits(
     num_sequences: int,
     num_kv_heads: int,
@@ -31,17 +85,29 @@ def get_recommended_splits(
     max_partitions: int | None = None,
     *,
     max_context_length: int | None = None,
+    ctas_per_cu: int = 2,
 ) -> int:
     """Recommend a uniform split count for scratch allocation and ``pa_decode``.
 
     Without ``max_context_length``, the default cap is eight. A host length
-    hint targets two CTAs per CU, bounded by 256-token tiles and the reducer
-    limit; short contexts and large grids retain the legacy recommendation.
-    ``max_partitions`` caps either mode. Allocate scratch and call ``pa_decode``
-    with the returned count for every sequence; no GPU lengths are read back.
+    hint targets ``ctas_per_cu`` CTAs per CU, bounded by 256-token tiles and
+    the reducer limit. The default is two. Pass one only when
+    ``d256_m1_pipe`` is true: a static gfx950 call with head 256, page 64,
+    plain V, per-tensor scales, query length 1, and one query M-tile.
+    A work plan and every other shape keep two.
+    Short contexts and large grids retain the legacy recommendation.
+    ``max_partitions`` caps either mode. Allocate scratch and call
+    ``pa_decode`` with the returned count for every sequence; no GPU lengths
+    are read back.
     """
     if max_context_length is not None and max_context_length < 0:
         raise ValueError("max_context_length must be non-negative")
+    if (
+        not isinstance(ctas_per_cu, int)
+        or isinstance(ctas_per_cu, bool)
+        or ctas_per_cu <= 0
+    ):
+        raise ValueError(f"ctas_per_cu must be a positive int, got {ctas_per_cu!r}")
     if max_partitions is None:
         max_partitions = 8 if max_context_length is None else MAX_CONTEXT_PARTITIONS
     if not 4 <= max_partitions <= MAX_CONTEXT_PARTITIONS:
@@ -59,7 +125,8 @@ def get_recommended_splits(
         context_tiles = (max_context_length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
         work_limit = max(8, context_tiles)
         sequence_heads = max(1, num_sequences * num_kv_heads)
-        occupancy_limit = (num_sm + sequence_heads - 1) // sequence_heads
+        occupancy_target = ctas_per_cu * props.multi_processor_count
+        occupancy_limit = (occupancy_target + sequence_heads - 1) // sequence_heads
         n = max(legacy, min(work_limit, occupancy_limit))
     return max(4, min(n, max_partitions))
 
@@ -188,8 +255,8 @@ def launch_pa_decode_ps_reduce(
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x] or NHD [num_blocks, kv_block_size, num_kv_heads, head_size]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x] or NHD like key_cache
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -213,6 +280,15 @@ def pa_decode(
     Supports page sizes 16/64/128 and head_dim 64 or multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
     ALiBi and externally quantized queries are unsupported.
+
+    A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
+    [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
+    arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
+    requires gfx950, head 256, page 64, query_length 1, one query M-tile,
+    per-tensor scales, and no work plan. Each view must be 16-byte aligned
+    with 16-byte multiple strides, its token rows must not overlap, and its
+    strides and in-page span must fit int32; heads-outermost storage with
+    several KV heads is thus limited to 2 GiB per head.
 
     MTP lengths include the query tokens and use dense causal masking.
     Independently selected sparse queries need separate table rows and
@@ -282,7 +358,7 @@ def pa_decode(
     expected_ranks = (
         ("output", output, (3,)),
         ("query", query, (3,)),
-        ("key_cache", key_cache, (5,)),
+        ("key_cache", key_cache, (4, 5)),
         ("value_cache", value_cache, (4, 5)),
         ("context_lengths", context_lengths, (1,)),
         ("block_tables", block_tables, (2,)),
@@ -316,7 +392,20 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
-    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    nhd_layout = key_cache.dim() == 4
+    if nhd_layout:
+        num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
+        num_hgroups, hgroup_width = head_dim // 16, 16
+        if k_head != head_dim:
+            raise ValueError(
+                "NHD key_cache shape must be "
+                "[num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+            )
+    else:
+        num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = (
+            key_cache.shape
+        )
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
@@ -346,7 +435,31 @@ def pa_decode(
         )
 
     trans_v = value_cache.dim() == 5
-    if trans_v:
+    if nhd_layout:
+        if value_cache.shape != key_cache.shape:
+            raise ValueError(
+                "NHD value_cache shape must match key_cache, "
+                f"got {tuple(value_cache.shape)} vs {tuple(key_cache.shape)}"
+            )
+        if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
+            raise ValueError("NHD key and value head axes must be contiguous")
+        for name, view in (("key_cache", key_cache), ("value_cache", value_cache)):
+            # K loads and V LDS-DMAs move 16-byte chunks.
+            strides = _nhd_strides(view)
+            if view.data_ptr() % 16 or any(stride % 16 for stride in strides):
+                raise ValueError(
+                    f"NHD {name} needs a 16-byte aligned base and block, token "
+                    f"and head strides that are multiples of 16, got data_ptr "
+                    f"{view.data_ptr():#x} and strides {view.stride()}"
+                )
+            # The V tail bound is live_tokens * token_stride bytes.
+            if strides[1] < head_dim:
+                raise ValueError(
+                    f"NHD {name} token rows must not overlap, got token stride "
+                    f"{view.stride(1)} for head_dim={head_dim}"
+                )
+        v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
+    elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
         expected_v_tail = (block_size // 16, head_dim, 16)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
@@ -467,6 +580,8 @@ def pa_decode(
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
+        if nhd_layout and name in ("key_cache", "value_cache"):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
@@ -556,8 +671,62 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
-    # Widen before either cache's i32 element offsets can wrap.
-    wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
+    stride_k_block = stride_k_token = stride_k_head = 0
+    stride_v_block = stride_v_token = stride_v_head = 0
+    if nhd_layout and not d256_m1_pipe(
+        arch,
+        work_plan is not None,
+        head_dim,
+        block_size,
+        trans_v,
+        per_token_kv,
+        query_length,
+        query_group_size,
+    ):
+        raise NotImplementedError(
+            "NHD pa_decode requires gfx950, head 256, page 64, query_length 1, "
+            "one query M-tile, per-tensor scales, and no work plan"
+        )
+        stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
+        stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)
+        # Strides are i32 kernel arguments, and the in-page offset and V tail
+        # bound stay i32 even in wide mode.
+        strides = (stride_k_block, stride_k_head, stride_v_block, stride_v_head)
+        page_span = block_size * max(stride_k_token, stride_v_token)
+        if max(*strides, page_span) >= 2**31:
+            raise NotImplementedError(
+                "NHD pa_decode requires int32 block and head strides and "
+                "block_size * token_stride < 2**31, got strides "
+                f"{key_cache.stride()} and {value_cache.stride()}"
+            )
+
+    # Widen before either cache's i32 element offsets can wrap. A strided NHD
+    # view can span more bytes than numel(), and its head stride may scale
+    # with num_blocks, so measure the highest byte offset.
+    if nhd_layout:
+        wide_kv_addressing = (
+            max(_view_span(key_cache), _view_span(value_cache)) >= 2**31
+        )
+    else:
+        wide_kv_addressing = max(key_cache.numel(), value_cache.numel()) >= 2**31
+
+    # Bound page-id LDS by the block table, not the live lengths, so capture
+    # and replay keep the same specialization. Past 16 KiB, leave the table
+    # load in the tile loop and warn once for that width.
+    stage_page_capacity = 0
+    if d256_m1_pipe(
+        arch,
+        work_plan is not None,
+        head_dim,
+        block_size,
+        trans_v,
+        per_token_kv,
+        query_length,
+        query_group_size,
+    ):
+        stage_page_capacity = _stage_page_capacity(
+            block_tables.shape[1], int(block_size), num_partitions
+        )
 
     # Add sinks once: here for static NP=1, otherwise in reduction.
     use_direct_sinks = sinks is not None and num_partitions == 1 and work_plan is None
@@ -583,6 +752,8 @@ def pa_decode(
             sliding_window=sliding_window,
             use_sinks=use_direct_sinks,
             sink_dtype_str=get_dtype_str(sinks.dtype) if use_direct_sinks else "f32",
+            stage_page_capacity=stage_page_capacity,
+            nhd_layout=nhd_layout,
         )
 
     if num_partitions == 1 and work_plan is None:
@@ -679,6 +850,12 @@ def pa_decode(
             int(output.stride(1)),
             int(query.stride(0)),
             int(query.stride(1)),
+            stride_k_block,
+            stride_k_token,
+            stride_k_head,
+            stride_v_block,
+            stride_v_token,
+            stride_v_head,
             (
                 ptr_arg(work_plan.work_info, fx.Int32)
                 if work_plan is not None

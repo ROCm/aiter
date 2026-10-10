@@ -11,6 +11,8 @@
 Contexts include MTP tokens. Positive windows require a plan; 0/-1 allow both
 static and planned decoding. Plan caps default to device CU count; explicit
 partitions override static recommendations. CLI timing includes the reducer.
+``--layout nhd`` times only gfx950, head 256, page 64, plain V, per-tensor
+scales, and query length 1. Other shapes stay on the packed sweep.
 """
 
 import argparse
@@ -31,13 +33,17 @@ from aiter.test_common import benchmark, run_perftest
 try:
     from aiter.ops.flydsl.pa_decode import (
         MAX_CONTEXT_PARTITIONS,
+        _stage_page_capacity,
+        d256_m1_pipe,
         get_recommended_splits,
         pa_decode,
         plan_pa_decode,
     )
 except (ImportError, AttributeError, RuntimeError, OSError):
     MAX_CONTEXT_PARTITIONS = 256
-    get_recommended_splits = pa_decode = plan_pa_decode = None
+    get_recommended_splits = d256_m1_pipe = None
+    pa_decode = plan_pa_decode = None
+    _stage_page_capacity = None
 
 SUPPORTED_GFX = ("gfx942", "gfx950")
 KV_COMPUTE_BLOCK = 256
@@ -95,6 +101,13 @@ class DecodeCase:
     masked_scale: bool = False
     query_splits: int | None = None
     wide_kv_addressing: bool | None = None
+    nhd: bool = False
+    # NHD storage with KV heads outermost: the head stride spans the pool.
+    nhd_head_major: bool = False
+    # Zero K and V one-hot in head channel tile % head_dim. Channels repeat
+    # every head_dim tiles. A dropped or misweighted partial still exceeds
+    # the tolerance.
+    one_hot_v: bool = False
 
 
 def _require_gpu():
@@ -229,7 +242,16 @@ def _make_inputs(case, planned=False):
             )
             values = torch.where(visible, (tokens % 4 + 1).float() * 0.25, 0)
             value_quant[start:end] = values.reshape(count, 1, page, 1).to(quant_dtype)
+        if case.one_hot_v and length > 0:
+            tokens = torch.arange(count * page)
+            values = torch.zeros(count * page, dim)
+            values[tokens, (tokens // KV_COMPUTE_BLOCK) % dim] = 224
+            key_quant[start:end].zero_()
+            value_quant[start:end] = values.reshape(count, 1, page, dim).to(quant_dtype)
         start = end
+    if case.one_hot_v:
+        # A long row's channel mean is ~256 / length of the one-hot value.
+        value_scale.fill_(0.25)
 
     selected = (
         2 * torch.randperm(num_pages) + 1 if case.sparse else torch.arange(num_pages)
@@ -246,18 +268,40 @@ def _make_inputs(case, planned=False):
     key_quant, value_quant = scatter(key_quant), scatter(value_quant)
     if case.per_token:
         key_scale, value_scale = scatter(key_scale), scatter(value_scale)
-    key_cache = (
-        key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
-        .permute(0, 1, 3, 2, 4)
-        .contiguous()
-    )
-    value_cache = (
-        value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
-        .permute(0, 1, 2, 4, 3)
-        .contiguous()
-        if case.trans_v
-        else value_quant.permute(0, 1, 3, 2).contiguous()
-    )
+    if case.nhd:
+        # Token rows hold K then V; rows is [pages, kv_heads, page, 2 * dim].
+        if case.nhd_head_major:
+            rows = torch.empty(
+                kv_heads, physical_pages, page, 2 * dim, dtype=quant_dtype
+            ).transpose(0, 1)
+        else:
+            rows = torch.empty(
+                physical_pages, kv_heads, page, 2 * dim, dtype=quant_dtype
+            )
+        rows[..., :dim] = key_quant
+        rows[..., dim:] = value_quant
+        # fp8 NaN in the unwritten tail must not poison PV.
+        nan = torch.zeros((), dtype=torch.uint8).fill_(0x7F).view(quant_dtype)
+        page_base = 0
+        for length, count in zip(case.lengths, counts):
+            used = length % page
+            if length > 0 and used:
+                rows[selected[page_base + count - 1], :, used:, dim:] = nan
+            page_base += count
+        key_cache, value_cache = rows.transpose(1, 2).split(dim, dim=-1)
+    else:
+        key_cache = (
+            key_quant.reshape(physical_pages, kv_heads, page, dim // 16, 16)
+            .permute(0, 1, 3, 2, 4)
+            .contiguous()
+        )
+        value_cache = (
+            value_quant.reshape(physical_pages, kv_heads, page // 16, 16, dim)
+            .permute(0, 1, 2, 4, 3)
+            .contiguous()
+            if case.trans_v
+            else value_quant.permute(0, 1, 3, 2).contiguous()
+        )
     table = torch.zeros((batch, max(counts)), dtype=torch.int32)
     start = 0
     for seq, count in enumerate(counts):
@@ -279,12 +323,27 @@ def _make_inputs(case, planned=False):
         sinks = torch.where(sinks.abs() < 10, sinks + offset, sinks)
     parts = case.num_partitions
     if parts is None and not planned:
+        ctas_per_cu = (
+            1
+            if d256_m1_pipe(
+                get_gfx_runtime(),
+                planned,
+                case.head_dim,
+                page,
+                case.trans_v,
+                case.per_token,
+                case.query_length,
+                case.query_group_size,
+            )
+            else 2
+        )
         parts = get_recommended_splits(
             batch,
             kv_heads,
             KV_COMPUTE_BLOCK // page,
             case.max_partitions,
             max_context_length=max(case.lengths),
+            ctas_per_cu=ctas_per_cu,
         )
     plan = (
         plan_pa_decode(
@@ -483,6 +542,28 @@ def _assert_contracts(args, options):
             )
             with pytest.raises(ValueError, match="query_length"):
                 pa_decode(*args, **{**options, "work_plan": wrong_plan})
+
+
+def _assert_nhd_contracts(args, options, reference):
+    """Reject NHD views that break the 16-byte loads or the V tail bound."""
+    key, value = args[2:4]
+    block, token, head, _ = key.stride()
+
+    def view(tensor, stride, offset=0):
+        return tensor.as_strided(tensor.shape, stride, tensor.storage_offset() + offset)
+
+    for invalid, message in [
+        (view(key, key.stride(), offset=1), "16-byte"),
+        (view(key, (block, token - 8, head, 1)), "16-byte"),
+        (view(key, (block, 128, head, 1)), "overlap"),
+    ]:
+        with pytest.raises(ValueError, match=message):
+            pa_decode(*args[:2], invalid, *args[3:], **options)
+    if key.shape[2] == 1:
+        # A single KV head is never stepped, so its stride may be anything.
+        odd = (block, token, 2**40 + 8, 1)
+        args = (*args[:2], view(key, odd), view(value, odd), *args[4:])
+        _assert_close(_run_flydsl(*args, **options), reference())
 
 
 def _case(
@@ -805,6 +886,72 @@ CASES = [
         dtype=FP16,
         lengths=(0, 1, 257, 65537),
     ),
+    # 8192 tokens and 8 splits is four tiles per CTA, so page-id staging runs.
+    _case(
+        "d256-m1-page64",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(0, 1, 255, 256, 257, 8192),
+    ),
+    # Above 64 splits the static D256 reducer splits partitions over four
+    # groups; 130 leaves the last group short. 260 tiles fill every split,
+    # so the last group's partials are live.
+    _case(
+        "d256-m1-page64-np130",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=130,
+        lengths=(0, 1, 257, 66532),
+        one_hot_v=True,
+    ),
+    # 256 splits on 256 tiles: one tile per CTA, every split live, and a
+    # partial last page.
+    _case(
+        "nhd-d256-page64-np256",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=256,
+        lengths=(65500,),
+        nhd=True,
+        one_hot_v=True,
+    ),
+    _case(
+        "nhd-d256-page64-hkv2",
+        (1, 2, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(1, 65, 8192),
+        nhd=True,
+    ),
+    # Wide mode must widen the head term once the head stride spans the pool.
+    _case(
+        "nhd-d256-page64-hkv2-head-major-wide",
+        (1, 2, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(1, 65, 8192),
+        nhd=True,
+        nhd_head_major=True,
+        wide_kv_addressing=True,
+    ),
+    _case(
+        "nhd-d256-page64",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(0, 1, 63, 64, 65, 255, 256, 257, 8192),
+        nhd=True,
+    ),
+    # More CTAs than CUs selects single-buffered NHD V staging.
+    _case(
+        "nhd-d256-page64-wide-grid",
+        (1, 1, 8, 256),
+        (64, 0, 0),
+        parts=8,
+        lengths=(0, 1, 63, 64, 65, 255, 256, 257, 8192) * 8,
+        nhd=True,
+    ),
     _case(
         "exact-parts-override",
         (1, 1, 16, 128),
@@ -870,6 +1017,51 @@ CASES = [
 ]
 
 
+def test_d256_m1_pipe_is_static_gfx950_page64():
+    """ctas_per_cu=1 follows this predicate, including the no-work-plan condition."""
+    if d256_m1_pipe is None:
+        pytest.skip("FlyDSL pa_decode is not available")
+    assert d256_m1_pipe("gfx950", False, 256, 64, False, False, 1, 8)
+    assert not d256_m1_pipe("gfx950", True, 256, 64, False, False, 1, 8)
+    assert not d256_m1_pipe("gfx942", False, 256, 64, False, False, 1, 8)
+    assert not d256_m1_pipe("gfx950", False, 256, 128, False, False, 1, 8)
+
+
+def test_stage_page_capacity_stays_on_for_a_1m_table():
+    """A page-64 table of 1,048,576 tokens stages at 4 partitions and not below that."""
+    if _stage_page_capacity is None:
+        pytest.skip("FlyDSL pa_decode is not available")
+    # 16384 columns * page 64. Four partitions is exactly 4096 ids.
+    assert _stage_page_capacity(16384, 64, 4) == 4096
+    assert _stage_page_capacity(16384, 64, 8) == 2048
+    assert _stage_page_capacity(16384, 64, 3) == 0
+    assert _stage_page_capacity(16385, 64, 4) == 0
+
+
+def test_recommended_splits_ctas_per_cu():
+    """Length-aware splits follow ctas_per_cu; the default stays at two."""
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="ctas_per_cu"):
+            get_recommended_splits(1, 1, 4, max_context_length=8192, ctas_per_cu=bad)
+    _require_gpu()
+    assert get_recommended_splits(
+        1, 1, 4, max_context_length=8192, ctas_per_cu=1
+    ) == get_recommended_splits(1, 1, 4, max_context_length=8192)
+    cus = torch.cuda.get_device_properties("cuda").multi_processor_count
+
+    def splits(seqs, ctas):
+        return max(8, min(MAX_CONTEXT_PARTITIONS, (ctas * cus + seqs - 1) // seqs))
+
+    length = 1_048_576
+    for seqs in (2, 4):
+        assert get_recommended_splits(seqs, 1, 4, max_context_length=length) == splits(
+            seqs, 2
+        )
+        assert get_recommended_splits(
+            seqs, 1, 4, max_context_length=length, ctas_per_cu=1
+        ) == splits(seqs, 1)
+
+
 @pytest.mark.parametrize("planned", [False, True], ids=["static", "planned"])
 @pytest.mark.parametrize("case", CASES)
 def test_pa_decode(case, planned, monkeypatch):
@@ -885,6 +1077,11 @@ def test_pa_decode(case, planned, monkeypatch):
                     context, case.num_kv_heads, max_partitions=case.num_partitions
                 )
             return
+    if case.nhd and (planned or get_gfx_runtime() != "gfx950"):
+        args, options, _reference = _make_inputs(case, planned)
+        with pytest.raises(NotImplementedError, match="NHD"):
+            pa_decode(*args, **options)
+        return
     args, options, reference = _make_inputs(case, planned)
     if not planned and case.sliding_window > 0:
         with pytest.raises(ValueError, match="work_plan"):
@@ -975,6 +1172,8 @@ def test_pa_decode(case, planned, monkeypatch):
         check(disabled_sink=step == 2)
 
     _assert_contracts(args, options)
+    if case.nhd:
+        _assert_nhd_contracts(args, options, reference)
     if plan is not None:
         # Check int32 limits without allocating a matching KV cache.
         lengths = (-1, 0, 1, 257, 2**31 - 1)
@@ -1002,6 +1201,7 @@ def run_pa_decode_tile_case(
     per_token=False,
     query_length=1,
     num_partitions=None,
+    layout="packed",
 ):
     if min(batch_size, context_length, query_length, num_query_heads, num_kv_heads) < 1:
         raise ValueError(
@@ -1013,6 +1213,25 @@ def run_pa_decode_tile_case(
         raise ValueError("pa_decode only supports fp16/bf16")
     if num_partitions is not None and not 1 <= num_partitions <= MAX_CONTEXT_PARTITIONS:
         raise ValueError(f"num_partitions must be in [1, {MAX_CONTEXT_PARTITIONS}]")
+    if layout not in ("packed", "nhd"):
+        raise ValueError(f"layout must be packed or nhd, got {layout}")
+    if layout == "nhd" and (
+        d256_m1_pipe is None
+        or not d256_m1_pipe(
+            get_gfx_runtime(),
+            False,
+            head_dim,
+            block_size,
+            trans_v,
+            per_token,
+            query_length,
+            num_query_heads // num_kv_heads,
+        )
+    ):
+        raise ValueError(
+            "NHD timing requires gfx950, head 256, page 64, plain V, "
+            "per-tensor scales, query length 1, and one query M-tile"
+        )
     case = DecodeCase(
         lengths=(context_length,) * batch_size,
         query_length=query_length,
@@ -1026,6 +1245,7 @@ def run_pa_decode_tile_case(
         max_partitions=max_partitions,
         per_token=per_token,
         sparse=False,
+        nhd=layout == "nhd",
     )
     args, options, reference_call = _make_inputs(case)
     reference = reference_call()
@@ -1133,6 +1353,17 @@ def _parse_args(argv=None):
         default=[None],
         help="Exact split counts (1..256), overriding --max-partitions.",
     )
+    parser.add_argument(
+        "-l",
+        "--layout",
+        nargs="*",
+        choices=("packed", "nhd"),
+        default=["packed", "nhd"],
+        help=(
+            "KV cache layout. nhd times only head 256, page 64, plain V, "
+            "per-tensor scales, and query length 1 on gfx950."
+        ),
+    )
     args = parser.parse_args(argv)
     if (
         args.max_partitions is not None
@@ -1160,33 +1391,98 @@ def main():
         return
     torch.set_default_device("cuda")
     rows = []
-    for dtype, batch, shape, page, trans_v, per_token, ql, parts in itertools.product(
-        args.dtype,
-        args.batch,
-        args.shapes,
-        args.block_size,
-        args.trans_v,
-        args.per_token,
-        args.query_length,
-        args.num_partitions,
-    ):
-        heads, kv_heads, dim, context = shape
-        rows.append(
-            run_pa_decode_tile_case(
-                batch,
-                heads,
-                kv_heads,
-                dim,
-                context,
-                page,
-                dtype,
-                bool(trans_v),
-                args.max_partitions,
-                bool(per_token),
-                query_length=ql,
-                num_partitions=parts,
+    if "packed" in args.layout:
+        for (
+            dtype,
+            batch,
+            shape,
+            page,
+            trans_v,
+            per_token,
+            ql,
+            parts,
+        ) in itertools.product(
+            args.dtype,
+            args.batch,
+            args.shapes,
+            args.block_size,
+            args.trans_v,
+            args.per_token,
+            args.query_length,
+            args.num_partitions,
+        ):
+            heads, kv_heads, dim, context = shape
+            rows.append(
+                run_pa_decode_tile_case(
+                    batch,
+                    heads,
+                    kv_heads,
+                    dim,
+                    context,
+                    page,
+                    dtype,
+                    bool(trans_v),
+                    args.max_partitions,
+                    bool(per_token),
+                    query_length=ql,
+                    num_partitions=parts,
+                    layout="packed",
+                )
             )
-        )
+    if "nhd" in args.layout:
+        # NHD is the page-64 head-256 contract. Do not cross it with the
+        # packed sweep's other heads, pages, or V layouts.
+        if get_gfx_runtime() != "gfx950":
+            aiter.logger.warning(
+                "NHD pa_decode timing is gfx950-only; skipping on %s",
+                get_gfx_runtime(),
+            )
+        else:
+            nhd_rows = 0
+            for dtype, batch, shape, ql, parts in itertools.product(
+                args.dtype,
+                args.batch,
+                args.shapes,
+                args.query_length,
+                args.num_partitions,
+            ):
+                heads, kv_heads, dim, context = shape
+                if kv_heads < 1 or heads % kv_heads:
+                    continue
+                if not d256_m1_pipe(
+                    get_gfx_runtime(),
+                    False,
+                    dim,
+                    64,
+                    False,
+                    False,
+                    ql,
+                    heads // kv_heads,
+                ):
+                    continue
+                nhd_rows += 1
+                rows.append(
+                    run_pa_decode_tile_case(
+                        batch,
+                        heads,
+                        kv_heads,
+                        dim,
+                        context,
+                        64,
+                        dtype,
+                        False,
+                        args.max_partitions,
+                        False,
+                        query_length=ql,
+                        num_partitions=parts,
+                        layout="nhd",
+                    )
+                )
+            if nhd_rows == 0:
+                aiter.logger.warning(
+                    "no NHD rows: use head 256, query length 1, and at most "
+                    "16 query heads per KV head"
+                )
     aiter.logger.info(
         "pa_decode summary (markdown):\n%s", pd.DataFrame(rows).to_markdown(index=False)
     )
