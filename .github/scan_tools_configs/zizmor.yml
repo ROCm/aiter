@@ -17,6 +17,7 @@ rules:
     ignore:
       # Metadata-only PR automation; these workflows don't checkout or run PR code.
       - aiter-triton-board.yaml:24
+      - extended-test.yaml:5
       - pr-title-tags.yaml:30
       - pr-welcome-comment.yaml:3
   github-app:
