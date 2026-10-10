@@ -3,8 +3,10 @@
 """Summarize recorded calibration outcomes without inventing missing results."""
 
 import argparse
+import gzip
 import json
 import math
+import re
 from collections import Counter
 from pathlib import Path
 
@@ -84,6 +86,73 @@ def wall_totals(searches, model, config=None):
     return totals
 
 
+def rank_retention(prune_winner, console, screen_topk=2):
+    """Rank a prune winner within the staged log's screening contexts."""
+    g1 = prune_winner["kernelName1"]
+    g2 = prune_winner["kernelName2"]
+    block_m = int(re.search(r"_a4w4_(\d+)x", g1).group(1))
+    accumulation = "atomic" if "_atomic" in g2 else "non_atomic"
+    scores = {"GEMM1": [], "GEMM2": []}
+    for stage, name, score in re.findall(
+        r"\[mxfp4-staged\] (GEMM[12]) (\S+) screening us=(\S+)", console
+    ):
+        pattern = r"_a4w4_(\d+)x" if stage == "GEMM1" else r"_bf16_t(\d+)x"
+        match = re.search(pattern, name)
+        if match is None or int(match.group(1)) != block_m:
+            continue
+        if (
+            stage == "GEMM2"
+            and ("atomic" if "_atomic" in name else "non_atomic") != accumulation
+        ):
+            continue
+        latency = float(score)
+        if math.isfinite(latency) and latency > 0:
+            scores[stage].append((name, latency))
+    ranks = []
+    for stage, name in (("GEMM1", g1), ("GEMM2", g2)):
+        ranked = sorted(scores[stage], key=lambda item: item[1])
+        ranks.append(
+            next((i for i, item in enumerate(ranked, 1) if item[0] == name), None)
+        )
+    validated = (g1, g2) in re.findall(
+        r"\[mxfp4-staged\] (\S+) \+ (\S+) (?:us=|validation failed:)", console
+    )
+    return {
+        "block_m": block_m,
+        "accumulation_mode": accumulation,
+        "screen_topk": screen_topk,
+        "g1_rank": ranks[0],
+        "g2_rank": ranks[1],
+        "g1_successful_candidates": len(scores["GEMM1"]),
+        "g2_successful_candidates": len(scores["GEMM2"]),
+        "both_retained": all(
+            rank is not None and rank <= screen_topk for rank in ranks
+        ),
+        "pair_validated": validated,
+    }
+
+
+def staged_fallback_groups(console, screen_topk=2):
+    """Count groups with logged fallback or returned pairs outside the shortlist."""
+    groups = {
+        (int(block_m), accumulation.replace("-", "_"))
+        for block_m, accumulation in re.findall(
+            r"\[mxfp4-staged\] exhaustive fallback BM(\d+) (atomic|non-atomic):",
+            console,
+        )
+    }
+    pairs = re.findall(
+        r"\[mxfp4-staged\] (\S+) \+ (\S+) (?:us=|validation failed:)", console
+    )
+    for g1, g2 in pairs:
+        retained = rank_retention(
+            {"kernelName1": g1, "kernelName2": g2}, console, screen_topk
+        )
+        if not retained["both_retained"]:
+            groups.add((retained["block_m"], retained["accumulation_mode"]))
+    return len(groups)
+
+
 def summarize(records):
     """Return per-search outcomes and paired comparisons for annotated manifest jobs."""
     searches = [search_result(record) for record in records]
@@ -110,6 +179,14 @@ def summarize(records):
                 "full_to_staged": comparison(full, staged),
             }
         )
+        if (
+            prune
+            and prune["valid_winner"]
+            and staged
+            and staged["valid_winner"]
+            and "rank_retention" in staged
+        ):
+            rows[-1]["rank_retention"] = staged["rank_retention"]
         if prune and prune["valid_winner"] and staged and not staged["valid_winner"]:
             causes[staged["failure_cause"]] += 1
     return {
@@ -145,6 +222,29 @@ def load_records(manifest, gpu_dir):
         ):
             record["outcome"] = "incomplete_run"
         annotated.append(record)
+    groups = {}
+    for record in annotated:
+        key = (record["model"], record["token"], record["config"])
+        groups.setdefault(key, {})[record["mode"]] = record
+    for modes in groups.values():
+        prune, staged = modes.get("prune"), modes.get("staged")
+        if not (
+            prune
+            and staged
+            and search_result(prune)["valid_winner"]
+            and search_result(staged)["valid_winner"]
+        ):
+            continue
+        console = gpu_dir / staged["id"] / "search-task" / "console.log.txt"
+        compressed = Path(str(console) + ".gz")
+        if compressed.exists():
+            with gzip.open(compressed, "rt") as stream:
+                text = stream.read()
+        elif console.exists():
+            text = console.read_text()
+        else:
+            continue
+        staged["rank_retention"] = rank_retention(prune["winner"], text)
     return annotated
 
 
@@ -227,6 +327,38 @@ def markdown_report(report):
             ),
         )
         lines.append("| " + " | ".join(display(value) for value in values) + " |")
+    retained = [row for row in report["paired_rows"] if "rank_retention" in row]
+    if retained:
+        lines.extend(
+            [
+                "",
+                "## Prune winner screening ranks",
+                "",
+                (
+                    "Ranks use successful staged screens, ascending score with original log "
+                    "order for ties. GEMM1 ranks are reused per BM; GEMM2 ranks separate atomic "
+                    "and non-atomic accumulation, combining reduce/scatter in the latter. "
+                    "Pair validated means a returned validation outcome was logged, including failure."
+                ),
+                "",
+                "| Model | Tokens | Configuration | BM | Accumulation | GEMM1 rank | GEMM2 rank | Both retained K2 | Pair validated |",
+                "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+            ]
+        )
+        for row in retained:
+            rank = row["rank_retention"]
+            values = (
+                row["model"],
+                row["token"],
+                row["config"],
+                rank["block_m"],
+                rank["accumulation_mode"],
+                rank["g1_rank"],
+                rank["g2_rank"],
+                rank["both_retained"],
+                rank["pair_validated"],
+            )
+            lines.append("| " + " | ".join(display(value) for value in values) + " |")
     invalid = report["prune_valid_staged_invalid"]
     lines.extend(
         [
