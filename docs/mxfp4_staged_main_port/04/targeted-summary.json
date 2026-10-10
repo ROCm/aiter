@@ -1,0 +1,2500 @@
+{
+  "tasks": 10,
+  "profiles": 60,
+  "additional_searches": 0,
+  "all_exit_zero": true,
+  "nonfinite_or_over_gate_samples": 0,
+  "overlaps": 0,
+  "results": [
+    {
+      "id": "minimax-64-default-full-vs-prune",
+      "left_id": "minimax-64-full",
+      "right_id": "minimax-64-prune",
+      "reason": "Full universe contains prune universe but independent prune winner is1.45% faster; check winner ordering/noise.",
+      "rank_retention": {
+        "block_m": 16,
+        "accumulation_mode": "atomic",
+        "screen_topk": 2,
+        "g1_rank": 2,
+        "g2_rank": 1,
+        "g1_successful_candidates": 12,
+        "g2_successful_candidates": 8,
+        "both_retained": true,
+        "pair_validated": true
+      },
+      "median_relative_difference_percent": 0.861770014828056,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 75.46964285714294,
+            "cosine_diff": 0.011496737199381601,
+            "profiling_attempt_wall_seconds": 0.09453306719660759
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 75.87806185567,
+            "cosine_diff": 0.011498424679842412,
+            "profiling_attempt_wall_seconds": 0.26063030399382114
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 76.12689473684199,
+            "cosine_diff": 0.011498939004846886,
+            "profiling_attempt_wall_seconds": 0.08541695773601532
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 75.21511956521745,
+            "cosine_diff": 0.011497862420579708,
+            "profiling_attempt_wall_seconds": 0.08471163269132376
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 75.36917525773195,
+            "cosine_diff": 0.011497992938408474,
+            "profiling_attempt_wall_seconds": 0.08807950746268034
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 76.01868421052629,
+            "cosine_diff": 0.011496720465937416,
+            "profiling_attempt_wall_seconds": 0.29072538390755653
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 75.36917525773195,
+          "kernel_sum_min_us": 75.21511956521745,
+          "kernel_sum_max_us": 75.46964285714294,
+          "kernel_sum_population_stddev_us": 0.10467356721420541
+        },
+        "right": {
+          "kernel_sum_median_us": 76.01868421052629,
+          "kernel_sum_min_us": 75.87806185567,
+          "kernel_sum_max_us": 76.12689473684199,
+          "kernel_sum_population_stddev_us": 0.1018724515390608
+        },
+        "reason": "Full universe contains prune universe but independent prune winner is1.45% faster; check winner ordering/noise.",
+        "shape": {
+          "token": 64,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "64",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "16",
+            "ksplit": "0",
+            "us1": "76.9861",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16",
+            "err2": "1.1%",
+            "us": "76.9861",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "47.07",
+            "bw": "11775.63"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "64",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "16",
+            "ksplit": "0",
+            "us1": "75.8671",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_16x256x256_f16in_nt_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16",
+            "err2": "1.1%",
+            "us": "75.8671",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "47.77",
+            "bw": "11949.31"
+          }
+        },
+        "implementation_commit": "617030e1cb52c81ef20687b6f6d23ae89e6f034f",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": false,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-64-default-full-vs-prune",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "68dd32cc79866e8820faf45a88e0a4b144c515d2e0c94e67e6c8dee22db9e81b",
+          "topk_ids": "d688b398575f4c2db2ad3e753dc969d5d606844b02725391b615b7888d40a33c",
+          "topk_weights": "d430a9a7259c0a04b8038ab26db460ec7930d71c392c5c47bb04e0ed3f27db03"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 9.992665846832097
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T18:59:44.995597+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-64-default-full-vs-prune/result.json",
+          "--reason",
+          "Full universe contains prune universe but independent prune winner is1.45% faster; check winner ordering/noise.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "617030e1cb52c81ef20687b6f6d23ae89e6f034f",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-64-default-full-vs-prune",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T18:59:49.554471+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "344957883",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 604587,
+        "process_start_utc": "2026-10-10T18:59:49.558203+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:00:01.408808+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T18:59:50.441508+00:00",
+        "pid": 604587,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "minimax-128-default-prune-vs-staged",
+      "left_id": "minimax-128-prune",
+      "right_id": "minimax-128-staged",
+      "reason": "Negative independent staged difference while prune winner G2 rank3 was not retained; check noise.",
+      "rank_retention": {
+        "block_m": 16,
+        "accumulation_mode": "atomic",
+        "screen_topk": 2,
+        "g1_rank": 1,
+        "g2_rank": 3,
+        "g1_successful_candidates": 12,
+        "g2_successful_candidates": 8,
+        "both_retained": false,
+        "pair_validated": false
+      },
+      "median_relative_difference_percent": 0.9339557319297809,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 81.4254591836734,
+            "cosine_diff": 0.011327307185809543,
+            "profiling_attempt_wall_seconds": 0.0947604114189744
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 82.24276041666661,
+            "cosine_diff": 0.011327204817837444,
+            "profiling_attempt_wall_seconds": 0.24981696158647537
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 82.39655208333342,
+            "cosine_diff": 0.011327990641527674,
+            "profiling_attempt_wall_seconds": 0.085725880227983
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 81.50814583333334,
+            "cosine_diff": 0.01132721389654301,
+            "profiling_attempt_wall_seconds": 0.08550932537764311
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 81.65683999999993,
+            "cosine_diff": 0.011326633130424812,
+            "profiling_attempt_wall_seconds": 0.08820110559463501
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 82.26939583333345,
+            "cosine_diff": 0.011327061187673126,
+            "profiling_attempt_wall_seconds": 0.2822253704071045
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 81.50814583333334,
+          "kernel_sum_min_us": 81.4254591836734,
+          "kernel_sum_max_us": 81.65683999999993,
+          "kernel_sum_population_stddev_us": 0.09573349547142226
+        },
+        "right": {
+          "kernel_sum_median_us": 82.26939583333345,
+          "kernel_sum_min_us": 82.24276041666661,
+          "kernel_sum_max_us": 82.39655208333342,
+          "kernel_sum_population_stddev_us": 0.06710690813191261
+        },
+        "reason": "Negative independent staged difference while prune winner G2 rank3 was not retained; check noise.",
+        "shape": {
+          "token": 128,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "128",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "16",
+            "ksplit": "0",
+            "us1": "84.5815",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16",
+            "err2": "1.1%",
+            "us": "84.5815",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "85.69",
+            "bw": "10725.15"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "128",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "16",
+            "ksplit": "0",
+            "us1": "84.2686",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_xcd4",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16",
+            "err2": "1.1%",
+            "us": "84.2686",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "86.01",
+            "bw": "10764.97"
+          }
+        },
+        "implementation_commit": "afb773c5947229efe06268f5a0e22f458b690f60",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": false,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-128-default-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "54cc867518cecb90c8242baf638966198c3ddd05e5431d060a14d87967b03612",
+          "topk_ids": "6fca5a5992ae97225fdc7284cdaef6b182ee044a0874375f2a904a765b73dd4b",
+          "topk_weights": "b534cf265cc60310bc27db18cf6747ba0f591fc31ca55d761e6de743ce149bd3"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 9.792386822402477
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:00:01.466685+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-128-default-prune-vs-staged/result.json",
+          "--reason",
+          "Negative independent staged difference while prune winner G2 rank3 was not retained; check noise.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "617030e1cb52c81ef20687b6f6d23ae89e6f034f",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-128-default-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:00:08.217922+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "344987563",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 604990,
+        "process_start_utc": "2026-10-10T19:00:08.221493+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:00:20.159727+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:00:09.111898+00:00",
+        "pid": 604990,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "minimax-512-default-prune-vs-staged",
+      "left_id": "minimax-512-prune",
+      "right_id": "minimax-512-staged",
+      "reason": "Staged+3.54%; prune winner G1 rank4 was excluded.",
+      "rank_retention": {
+        "block_m": 32,
+        "accumulation_mode": "atomic",
+        "screen_topk": 2,
+        "g1_rank": 4,
+        "g2_rank": 1,
+        "g1_successful_candidates": 54,
+        "g2_successful_candidates": 8,
+        "both_retained": false,
+        "pair_validated": false
+      },
+      "median_relative_difference_percent": -0.24725638818695606,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 96.75663636363637,
+            "cosine_diff": 0.01129147404579034,
+            "profiling_attempt_wall_seconds": 0.11572057195007801
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 96.57723232323207,
+            "cosine_diff": 0.011291526371952076,
+            "profiling_attempt_wall_seconds": 0.2624720213934779
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 96.59584693877531,
+            "cosine_diff": 0.011291212321124955,
+            "profiling_attempt_wall_seconds": 0.10629431903362274
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 96.83527835051558,
+            "cosine_diff": 0.011291385089493011,
+            "profiling_attempt_wall_seconds": 0.10919608175754547
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 96.94347422680399,
+            "cosine_diff": 0.01129140041813248,
+            "profiling_attempt_wall_seconds": 0.29490648675709963
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 96.73534693877536,
+            "cosine_diff": 0.011291308440698256,
+            "profiling_attempt_wall_seconds": 0.10774604417383671
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 96.83527835051558,
+          "kernel_sum_min_us": 96.75663636363637,
+          "kernel_sum_max_us": 96.94347422680399,
+          "kernel_sum_population_stddev_us": 0.07659365861419015
+        },
+        "right": {
+          "kernel_sum_median_us": 96.59584693877531,
+          "kernel_sum_min_us": 96.57723232323207,
+          "kernel_sum_max_us": 96.73534693877536,
+          "kernel_sum_population_stddev_us": 0.07055886869230611
+        },
+        "reason": "Staged+3.54%; prune winner G1 rank4 was excluded.",
+        "shape": {
+          "token": 512,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "512",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "32",
+            "ksplit": "0",
+            "us1": "97.7542",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_32x64x256_nt_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_sbm32",
+            "err2": "1.1%",
+            "us": "97.7542",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "296.57",
+            "bw": "9316.1"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "512",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "32",
+            "ksplit": "0",
+            "us1": "101.2191",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_32x128x256_nt_xcd4",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_sbm32",
+            "err2": "1.1%",
+            "us": "101.2191",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "286.42",
+            "bw": "8997.2"
+          }
+        },
+        "implementation_commit": "afb773c5947229efe06268f5a0e22f458b690f60",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": false,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-512-default-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "ef9b1a78798df183a110737241aa91d723bb97748afeda9f442d00a513dc3ea9",
+          "topk_ids": "fa30907decbbc2ee8e13804e77aaf4ac7bd810d40540b0c0736ef68ed47d8c29",
+          "topk_weights": "fba097c07fd682710b6f68d1bd353887b84725b2636441811ea5920280477e5f"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 7.734725149348378
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:00:20.195338+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-512-default-prune-vs-staged/result.json",
+          "--reason",
+          "Staged+3.54%; prune winner G1 rank4 was excluded.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "afb773c5947229efe06268f5a0e22f458b690f60",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-512-default-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:00:26.990062+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345019280",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 605475,
+        "process_start_utc": "2026-10-10T19:00:26.994087+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:00:36.484258+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:00:27.843673+00:00",
+        "pid": 605475,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "minimax-2048-default-prune-vs-staged",
+      "left_id": "minimax-2048-prune",
+      "right_id": "minimax-2048-staged",
+      "reason": "Staged+2.79%; prune winner G1 rank5 was excluded.",
+      "rank_retention": {
+        "block_m": 64,
+        "accumulation_mode": "non_atomic",
+        "screen_topk": 2,
+        "g1_rank": 5,
+        "g2_rank": 2,
+        "g1_successful_candidates": 12,
+        "g2_successful_candidates": 8,
+        "both_retained": false,
+        "pair_validated": false
+      },
+      "median_relative_difference_percent": 3.2354155867219125,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 173.95759595959575,
+            "cosine_diff": 0.011172921112586942,
+            "profiling_attempt_wall_seconds": 0.36263235192745924
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 179.64290816326525,
+            "cosine_diff": 0.011172921112586942,
+            "profiling_attempt_wall_seconds": 0.14631198439747095
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 179.5553626373631,
+            "cosine_diff": 0.011172921112586942,
+            "profiling_attempt_wall_seconds": 0.14336829166859388
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 174.01286868686836,
+            "cosine_diff": 0.011172921112586942,
+            "profiling_attempt_wall_seconds": 0.41592048294842243
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 174.6378699999998,
+            "cosine_diff": 0.011172921112586942,
+            "profiling_attempt_wall_seconds": 0.14391706977039576
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 179.67142857142852,
+            "cosine_diff": 0.011172921112586942,
+            "profiling_attempt_wall_seconds": 0.14156587421894073
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 174.01286868686836,
+          "kernel_sum_min_us": 173.95759595959575,
+          "kernel_sum_max_us": 174.6378699999998,
+          "kernel_sum_population_stddev_us": 0.3084827540369175
+        },
+        "right": {
+          "kernel_sum_median_us": 179.64290816326525,
+          "kernel_sum_min_us": 179.5553626373631,
+          "kernel_sum_max_us": 179.67142857142852,
+          "kernel_sum_population_stddev_us": 0.04938390857777949
+        },
+        "reason": "Staged+2.79%; prune winner G1 rank5 was excluded.",
+        "shape": {
+          "token": 2048,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "64",
+            "ksplit": "0",
+            "us1": "174.7378",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_64x256x256_nt_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x128_reduce_sbm64",
+            "err2": "1.1%",
+            "us": "174.7378",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "663.65",
+            "bw": "5292.75"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "64",
+            "ksplit": "0",
+            "us1": "179.6055",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_64x256x256_xcd4",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x128_reduce_persist_sbm64",
+            "err2": "1.1%",
+            "us": "179.6055",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "645.66",
+            "bw": "5149.31"
+          }
+        },
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": false,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-2048-default-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "1e8bff7bfa24f28ffa33c74d26b5519a28a72250e5a35ae9cd53e8ff52f1069a",
+          "topk_ids": "4342eac5adaee4fa90984c55fc203372c108fb14817e2b5db982b4976caf07ab",
+          "topk_weights": "22591df31db3ade91a0914990478033aca85bd44afe84513cd0c5691cb9119cb"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 12.574041329324245
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:00:36.518757+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-2048-default-prune-vs-staged/result.json",
+          "--reason",
+          "Staged+2.79%; prune winner G1 rank5 was excluded.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "afb773c5947229efe06268f5a0e22f458b690f60",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-2048-default-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:00:43.227445+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345053639",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 605687,
+        "process_start_utc": "2026-10-10T19:00:43.231223+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:00:57.814260+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:00:44.110203+00:00",
+        "pid": 605687,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "gpt-2048-default-prune-vs-staged",
+      "left_id": "gpt-2048-default-prune",
+      "right_id": "gpt-2048-default-staged",
+      "reason": "Staged+5.11%; atomic prune winner G2 rank3 was excluded.",
+      "rank_retention": {
+        "block_m": 64,
+        "accumulation_mode": "atomic",
+        "screen_topk": 2,
+        "g1_rank": 2,
+        "g2_rank": 3,
+        "g1_successful_candidates": 12,
+        "g2_successful_candidates": 16,
+        "both_retained": false,
+        "pair_validated": false
+      },
+      "median_relative_difference_percent": 3.735393123242381,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 117.23325000000017,
+            "cosine_diff": 0.011469718665017115,
+            "profiling_attempt_wall_seconds": 0.1292361794039607
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 121.58168686868689,
+            "cosine_diff": 0.011467794179218838,
+            "profiling_attempt_wall_seconds": 0.14312216266989708
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 121.67626000000006,
+            "cosine_diff": 0.011467794179218838,
+            "profiling_attempt_wall_seconds": 0.1443939134478569
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 117.29483673469393,
+            "cosine_diff": 0.011469822671260288,
+            "profiling_attempt_wall_seconds": 0.3884690357372165
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 117.42462244897985,
+            "cosine_diff": 0.011469825299800118,
+            "profiling_attempt_wall_seconds": 0.12364450003951788
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 121.82739000000049,
+            "cosine_diff": 0.011467794179218838,
+            "profiling_attempt_wall_seconds": 0.14154329895973206
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 117.29483673469393,
+          "kernel_sum_min_us": 117.23325000000017,
+          "kernel_sum_max_us": 117.42462244897985,
+          "kernel_sum_population_stddev_us": 0.0797640073044816
+        },
+        "right": {
+          "kernel_sum_median_us": 121.67626000000006,
+          "kernel_sum_min_us": 121.58168686868689,
+          "kernel_sum_max_us": 121.82739000000049,
+          "kernel_sum_population_stddev_us": 0.1011898012009663
+        },
+        "reason": "Staged+5.11%; atomic prune winner G2 rank3 was excluded.",
+        "shape": {
+          "token": 2048,
+          "model_dim": 3072,
+          "inter_dim": 512,
+          "expert": 128,
+          "topk": 4
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "64",
+            "ksplit": "0",
+            "us1": "115.6761",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_64x128x256_swiglu_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x256_atomic_persist_nt_sbm64",
+            "err2": "1.1%",
+            "us": "115.6761",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "668.33",
+            "bw": "5384.47"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "64",
+            "ksplit": "0",
+            "us1": "121.5918",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_64x256x256_swiglu_xcd4",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x256_reduce_persist_sbm64",
+            "err2": "1.1%",
+            "us": "121.5918",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "635.81",
+            "bw": "5122.5"
+          }
+        },
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": false,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-default-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "1e8bff7bfa24f28ffa33c74d26b5519a28a72250e5a35ae9cd53e8ff52f1069a",
+          "topk_ids": "2944042b5fbfa639790fa52aefd597eb68335e66dcc368dd60412a5a2e83f072",
+          "topk_weights": "f284ddd2a5d8185ce2f844b63778e9b73f953f9611177384ddb80ee82fd6713e"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 11.719242742285132
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:00:57.848561+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-default-prune-vs-staged/result.json",
+          "--reason",
+          "Staged+5.11%; atomic prune winner G2 rank3 was excluded.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-default-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:01:04.622878+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345092647",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 606237,
+        "process_start_utc": "2026-10-10T19:01:04.627403+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:01:18.399433+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:01:05.509621+00:00",
+        "pid": 606237,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "gpt-2048-fp8-prune-vs-staged",
+      "left_id": "gpt-2048-fp8-prune",
+      "right_id": "gpt-2048-fp8-staged",
+      "reason": "Staged+8.48%; non-atomic prune winner G2 rank7 was excluded.",
+      "rank_retention": {
+        "block_m": 128,
+        "accumulation_mode": "non_atomic",
+        "screen_topk": 2,
+        "g1_rank": 2,
+        "g2_rank": 7,
+        "g1_successful_candidates": 6,
+        "g2_successful_candidates": 24,
+        "both_retained": false,
+        "pair_validated": false
+      },
+      "median_relative_difference_percent": 8.021934272694796,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 102.23948979591822,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.30635121557861567
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 110.44107446808529,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.14380218274891376
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 110.61625806451617,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.13997345976531506
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 102.1240989010988,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.35028342343866825
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 102.53841999999982,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.14169432129710913
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 110.38485106382973,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.1384313851594925
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 102.23948979591822,
+          "kernel_sum_min_us": 102.1240989010988,
+          "kernel_sum_max_us": 102.53841999999982,
+          "kernel_sum_population_stddev_us": 0.17459040908939946
+        },
+        "right": {
+          "kernel_sum_median_us": 110.44107446808529,
+          "kernel_sum_min_us": 110.38485106382973,
+          "kernel_sum_max_us": 110.61625806451617,
+          "kernel_sum_population_stddev_us": 0.09854472397582265
+        },
+        "reason": "Staged+8.48%; non-atomic prune winner G2 rank7 was excluded.",
+        "shape": {
+          "token": 2048,
+          "model_dim": 3072,
+          "inter_dim": 512,
+          "expert": 128,
+          "topk": 4
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "101.864",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_xcd2",
+            "err1": "1.2%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_reduce_nt_sbm128",
+            "err2": "1.2%",
+            "us": "101.864",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "758.95",
+            "bw": "6114.57"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "110.5011",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_xcd2",
+            "err1": "1.2%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x256_reduce_sbm128",
+            "err2": "1.2%",
+            "us": "110.5011",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "699.63",
+            "bw": "5636.63"
+          }
+        },
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": true,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "1",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-fp8-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "1e8bff7bfa24f28ffa33c74d26b5519a28a72250e5a35ae9cd53e8ff52f1069a",
+          "topk_ids": "2944042b5fbfa639790fa52aefd597eb68335e66dcc368dd60412a5a2e83f072",
+          "topk_weights": "f284ddd2a5d8185ce2f844b63778e9b73f953f9611177384ddb80ee82fd6713e"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 12.51695583295077
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:01:18.432438+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-fp8-prune-vs-staged/result.json",
+          "--reason",
+          "Staged+8.48%; non-atomic prune winner G2 rank7 was excluded.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-fp8-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "1",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:01:25.159958+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345122337",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 606487,
+        "process_start_utc": "2026-10-10T19:01:25.163907+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:01:39.547926+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:01:26.044330+00:00",
+        "pid": 606487,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "gpt-2048-limit5-prune-vs-staged",
+      "left_id": "gpt-2048-limit5-prune",
+      "right_id": "gpt-2048-limit5-staged",
+      "reason": "Staged+4.24%; atomic prune winner G2 rank3 was excluded.",
+      "rank_retention": {
+        "block_m": 64,
+        "accumulation_mode": "atomic",
+        "screen_topk": 2,
+        "g1_rank": 2,
+        "g2_rank": 3,
+        "g1_successful_candidates": 12,
+        "g2_successful_candidates": 16,
+        "both_retained": false,
+        "pair_validated": false
+      },
+      "median_relative_difference_percent": 4.48299968937087,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 116.41804081632641,
+            "cosine_diff": 0.01146976706734315,
+            "profiling_attempt_wall_seconds": 0.1287578884512186
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 121.63706122449398,
+            "cosine_diff": 0.011467794179218838,
+            "profiling_attempt_wall_seconds": 0.35284282360225916
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 121.75947474747485,
+            "cosine_diff": 0.011467794179218838,
+            "profiling_attempt_wall_seconds": 0.14324977900832891
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 116.03347916666725,
+            "cosine_diff": 0.011469755704821893,
+            "profiling_attempt_wall_seconds": 0.3703367244452238
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 116.56894791666635,
+            "cosine_diff": 0.011469723274134647,
+            "profiling_attempt_wall_seconds": 0.1250250358134508
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 121.29329000000006,
+            "cosine_diff": 0.011467794179218838,
+            "profiling_attempt_wall_seconds": 0.14208297617733479
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 116.41804081632641,
+          "kernel_sum_min_us": 116.03347916666725,
+          "kernel_sum_max_us": 116.56894791666635,
+          "kernel_sum_population_stddev_us": 0.22543473989091956
+        },
+        "right": {
+          "kernel_sum_median_us": 121.63706122449398,
+          "kernel_sum_min_us": 121.29329000000006,
+          "kernel_sum_max_us": 121.75947474747485,
+          "kernel_sum_population_stddev_us": 0.19734120034340447
+        },
+        "reason": "Staged+4.24%; atomic prune winner G2 rank3 was excluded.",
+        "shape": {
+          "token": 2048,
+          "model_dim": 3072,
+          "inter_dim": 512,
+          "expert": 128,
+          "topk": 4
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "64",
+            "ksplit": "0",
+            "us1": "117.0535",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_64x256x256_swiglu_xcd4",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x256_atomic_persist_nt_sbm64",
+            "err2": "1.1%",
+            "us": "117.0535",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "660.46",
+            "bw": "5321.11"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "64",
+            "ksplit": "0",
+            "us1": "122.0186",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_64x256x256_swiglu_xcd4",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x256_reduce_persist_sbm64",
+            "err2": "1.1%",
+            "us": "122.0186",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "633.59",
+            "bw": "5104.58"
+          }
+        },
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "swiglu_limit": 5.0,
+        "configuration": {
+          "swiglu_limit": 5.0,
+          "stage2_fp8": false,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-limit5-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "1e8bff7bfa24f28ffa33c74d26b5519a28a72250e5a35ae9cd53e8ff52f1069a",
+          "topk_ids": "2944042b5fbfa639790fa52aefd597eb68335e66dcc368dd60412a5a2e83f072",
+          "topk_weights": "f284ddd2a5d8185ce2f844b63778e9b73f953f9611177384ddb80ee82fd6713e"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 9.475999846123159
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:01:39.581525+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-limit5-prune-vs-staged/result.json",
+          "--reason",
+          "Staged+4.24%; atomic prune winner G2 rank3 was excluded.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-limit5-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:01:46.362636+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345152585",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 606721,
+        "process_start_utc": "2026-10-10T19:01:46.366523+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:01:57.855969+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:01:47.226492+00:00",
+        "pid": 606721,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "gpt-2048-combined5-prune-vs-staged",
+      "left_id": "gpt-2048-combined5-prune",
+      "right_id": "gpt-2048-combined5-staged",
+      "reason": "Staged+8.36%; same rank7 reduce loss as FP8 with configured limit5.",
+      "rank_retention": {
+        "block_m": 128,
+        "accumulation_mode": "non_atomic",
+        "screen_topk": 2,
+        "g1_rank": 1,
+        "g2_rank": 7,
+        "g1_successful_candidates": 6,
+        "g2_successful_candidates": 24,
+        "both_retained": false,
+        "pair_validated": false
+      },
+      "median_relative_difference_percent": 5.661578812892198,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 105.30162626262647,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.34402167424559593
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 111.35643157894745,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.14404750522226095
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 111.26336082474226,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.14044346753507853
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 104.93019587628847,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.4037018660455942
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 105.53349484536098,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.1417204588651657
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 111.03505434782619,
+            "cosine_diff": 0.011819098830521235,
+            "profiling_attempt_wall_seconds": 0.13973798416554928
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 105.30162626262647,
+          "kernel_sum_min_us": 104.93019587628847,
+          "kernel_sum_max_us": 105.53349484536098,
+          "kernel_sum_population_stddev_us": 0.24848277777085118
+        },
+        "right": {
+          "kernel_sum_median_us": 111.26336082474226,
+          "kernel_sum_min_us": 111.03505434782619,
+          "kernel_sum_max_us": 111.35643157894745,
+          "kernel_sum_population_stddev_us": 0.13501824459980732
+        },
+        "reason": "Staged+8.36%; same rank7 reduce loss as FP8 with configured limit5.",
+        "shape": {
+          "token": 2048,
+          "model_dim": 3072,
+          "inter_dim": 512,
+          "expert": 128,
+          "topk": 4
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "101.9686",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_xcd2",
+            "err1": "1.2%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_reduce_nt_sbm128",
+            "err2": "1.2%",
+            "us": "101.9686",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "758.17",
+            "bw": "6108.29"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "110.4887",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_xcd2",
+            "err1": "1.2%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x256_reduce_sbm128",
+            "err2": "1.2%",
+            "us": "110.4887",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "699.7",
+            "bw": "5637.27"
+          }
+        },
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "swiglu_limit": 5.0,
+        "configuration": {
+          "swiglu_limit": 5.0,
+          "stage2_fp8": true,
+          "fp4_scatter": true
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5",
+          "AITER_FLYDSL_STAGE2_FP8": "1",
+          "AITER_MXFP4_INTERMEDIATE": "1",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-combined5-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "1e8bff7bfa24f28ffa33c74d26b5519a28a72250e5a35ae9cd53e8ff52f1069a",
+          "topk_ids": "2944042b5fbfa639790fa52aefd597eb68335e66dcc368dd60412a5a2e83f072",
+          "topk_weights": "f284ddd2a5d8185ce2f844b63778e9b73f953f9611177384ddb80ee82fd6713e"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 12.952319794334471
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:01:57.888867+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-combined5-prune-vs-staged/result.json",
+          "--reason",
+          "Staged+8.36%; same rank7 reduce loss as FP8 with configured limit5.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-combined5-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5",
+          "AITER_FLYDSL_STAGE2_FP8": "1",
+          "AITER_MXFP4_INTERMEDIATE": "1",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:02:04.623655+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345182567",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 606959,
+        "process_start_utc": "2026-10-10T19:02:04.627589+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:02:19.563165+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:02:05.490739+00:00",
+        "pid": 606959,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "gpt-2048-fp4-prune-vs-staged",
+      "left_id": "gpt-2048-fp4-prune",
+      "right_id": "gpt-2048-fp4-staged",
+      "reason": "Same selected pair measured\u22120.658% staged difference in independent processes; alternating replay quantifies noise.",
+      "rank_retention": {
+        "block_m": 128,
+        "accumulation_mode": "non_atomic",
+        "screen_topk": 2,
+        "g1_rank": 2,
+        "g2_rank": 2,
+        "g1_successful_candidates": 6,
+        "g2_successful_candidates": 24,
+        "both_retained": true,
+        "pair_validated": true
+      },
+      "median_relative_difference_percent": -0.10287652497512623,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 110.94142268041182,
+            "cosine_diff": 0.0181499500670399,
+            "profiling_attempt_wall_seconds": 0.30798233672976494
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 110.7263999999996,
+            "cosine_diff": 0.0181499500670399,
+            "profiling_attempt_wall_seconds": 0.14181571081280708
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 110.82729000000025,
+            "cosine_diff": 0.0181499500670399,
+            "profiling_attempt_wall_seconds": 0.14134188182651997
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 110.82315306122436,
+            "cosine_diff": 0.0181499500670399,
+            "profiling_attempt_wall_seconds": 0.35789881087839603
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 110.95872164948436,
+            "cosine_diff": 0.0181499500670399,
+            "profiling_attempt_wall_seconds": 0.14124539494514465
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 111.01169000000034,
+            "cosine_diff": 0.0181499500670399,
+            "profiling_attempt_wall_seconds": 0.14036667440086603
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 110.94142268041182,
+          "kernel_sum_min_us": 110.82315306122436,
+          "kernel_sum_max_us": 110.95872164948436,
+          "kernel_sum_population_stddev_us": 0.06024560774818044
+        },
+        "right": {
+          "kernel_sum_median_us": 110.82729000000025,
+          "kernel_sum_min_us": 110.7263999999996,
+          "kernel_sum_max_us": 111.01169000000034,
+          "kernel_sum_population_stddev_us": 0.11812071800614704
+        },
+        "reason": "Same selected pair measured\u22120.658% staged difference in independent processes; alternating replay quantifies noise.",
+        "shape": {
+          "token": 2048,
+          "model_dim": 3072,
+          "inter_dim": 512,
+          "expert": 128,
+          "topk": 4
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "111.0863",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_xcd2",
+            "err1": "1.8%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_nt_sbm128",
+            "err2": "1.8%",
+            "us": "111.0863",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "695.94",
+            "bw": "5606.94"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "2048",
+            "model_dim": "3072",
+            "inter_dim": "512",
+            "expert": "128",
+            "topk": "4",
+            "act_type": "ActivationType.Swiglu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "110.3552",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_swiglu_xcd2",
+            "err1": "1.8%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x256_scatter_nt_sbm128",
+            "err2": "1.8%",
+            "us": "110.3552",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "700.55",
+            "bw": "5644.09"
+          }
+        },
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": false,
+          "fp4_scatter": true
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "1",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-fp4-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "1e8bff7bfa24f28ffa33c74d26b5519a28a72250e5a35ae9cd53e8ff52f1069a",
+          "topk_ids": "2944042b5fbfa639790fa52aefd597eb68335e66dcc368dd60412a5a2e83f072",
+          "topk_weights": "f284ddd2a5d8185ce2f844b63778e9b73f953f9611177384ddb80ee82fd6713e"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 13.204074417240918
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:02:19.597169+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-fp4-prune-vs-staged/result.json",
+          "--reason",
+          "Same selected pair measured\u22120.658% staged difference in independent processes; alternating replay quantifies noise.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-fp4-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "1",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:02:26.395341+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345213531",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 607189,
+        "process_start_utc": "2026-10-10T19:02:26.399575+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:02:41.434910+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:02:27.259009+00:00",
+        "pid": 607189,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    },
+    {
+      "id": "minimax-8192-default-prune-vs-staged",
+      "left_id": "minimax-8192-prune",
+      "right_id": "minimax-8192-staged",
+      "reason": "Retained/validated prune winner and staged measured\u22120.059% difference; alternating replay quantifies near-zero ordering noise.",
+      "rank_retention": {
+        "block_m": 128,
+        "accumulation_mode": "non_atomic",
+        "screen_topk": 2,
+        "g1_rank": 1,
+        "g2_rank": 1,
+        "g1_successful_candidates": 6,
+        "g2_successful_candidates": 12,
+        "both_retained": true,
+        "pair_validated": true
+      },
+      "median_relative_difference_percent": 0.09694026499045272,
+      "result": {
+        "samples": [
+          {
+            "cycle": 0,
+            "label": "left",
+            "kernel_sum_us": 408.2342872340427,
+            "cosine_diff": 0.011168417926035401,
+            "profiling_attempt_wall_seconds": 0.31695575173944235
+          },
+          {
+            "cycle": 0,
+            "label": "right",
+            "kernel_sum_us": 406.7123936170206,
+            "cosine_diff": 0.011168417926035401,
+            "profiling_attempt_wall_seconds": 0.1552240615710616
+          },
+          {
+            "cycle": 1,
+            "label": "right",
+            "kernel_sum_us": 407.6687628865979,
+            "cosine_diff": 0.011168417926035401,
+            "profiling_attempt_wall_seconds": 0.15422293357551098
+          },
+          {
+            "cycle": 1,
+            "label": "left",
+            "kernel_sum_us": 406.56234020618524,
+            "cosine_diff": 0.011168417926035401,
+            "profiling_attempt_wall_seconds": 0.36311284359544516
+          },
+          {
+            "cycle": 2,
+            "label": "left",
+            "kernel_sum_us": 407.0263775510207,
+            "cosine_diff": 0.011168417926035401,
+            "profiling_attempt_wall_seconds": 0.15445809811353683
+          },
+          {
+            "cycle": 2,
+            "label": "right",
+            "kernel_sum_us": 407.4209499999997,
+            "cosine_diff": 0.011168417926035401,
+            "profiling_attempt_wall_seconds": 0.1519956337288022
+          }
+        ],
+        "left": {
+          "kernel_sum_median_us": 407.0263775510207,
+          "kernel_sum_min_us": 406.56234020618524,
+          "kernel_sum_max_us": 408.2342872340427,
+          "kernel_sum_population_stddev_us": 0.7047287361264716
+        },
+        "right": {
+          "kernel_sum_median_us": 407.4209499999997,
+          "kernel_sum_min_us": 406.7123936170206,
+          "kernel_sum_max_us": 407.6687628865979,
+          "kernel_sum_population_stddev_us": 0.40525788146649044
+        },
+        "reason": "Retained/validated prune winner and staged measured\u22120.059% difference; alternating replay quantifies near-zero ordering noise.",
+        "shape": {
+          "token": 8192,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8
+        },
+        "winners": {
+          "left": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "8192",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "406.7968",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_scatter_sbm128",
+            "err2": "1.1%",
+            "us": "406.7968",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "1140.27",
+            "bw": "2412.67"
+          },
+          "right": {
+            "gfx": "gfx950",
+            "cu_num": "256",
+            "token": "8192",
+            "model_dim": "3072",
+            "inter_dim": "384",
+            "expert": "256",
+            "topk": "8",
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": "1",
+            "doweight_stage1": "0",
+            "block_m": "128",
+            "ksplit": "0",
+            "us1": "406.5586",
+            "kernelName1": "flydsl_mxmoe_g1_a4w4_128x256x256_xcd2",
+            "err1": "1.1%",
+            "us2": "0",
+            "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_scatter_nt_sbm128",
+            "err2": "1.1%",
+            "us": "406.5586",
+            "run_1stage": "0",
+            "xbf16": "0",
+            "flat": "0",
+            "tflops": "1140.93",
+            "bw": "2414.09"
+          }
+        },
+        "implementation_commit": "e5c84ccca7bf9de72a5209ed6c804ca56cf07571",
+        "swiglu_limit": null,
+        "configuration": {
+          "swiglu_limit": null,
+          "stage2_fp8": false,
+          "fp4_scatter": false
+        },
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-8192-default-prune-vs-staged",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+        },
+        "fingerprints": {
+          "input": "790edbfcd6e78d6e381408cd01f925d328948baa77404ab50605b349d23b4462",
+          "topk_ids": "3ca5ebbc1b411691a36301d71d1d8965b848e43299138d3269e59bd0af50e37f",
+          "topk_weights": "3800304a668e6ab5b5ce29971e3238add5bc5aabe91103b03757e86325f9b206"
+        },
+        "measurement": {
+          "warmup": 5,
+          "iters": 101,
+          "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+          "repeats_per_pair": 3,
+          "one_prepared_fixture": true
+        },
+        "wall_seconds": 13.060526603832841
+      },
+      "task": {
+        "coordinator_start_utc": "2026-10-10T19:02:41.469345+00:00",
+        "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+        "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+        "command": [
+          "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+          "docs/mxfp4_staged_main_port/04/alternating_replay.py",
+          "--left",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/winner.csv",
+          "--right",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/winner.csv",
+          "--result",
+          "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-8192-default-prune-vs-staged/result.json",
+          "--reason",
+          "Retained/validated prune winner and staged measured\u22120.059% difference; alternating replay quantifies near-zero ordering noise.",
+          "--repeats",
+          "3"
+        ],
+        "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+        "environment": {
+          "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+          "HIP_VISIBLE_DEVICES": "0",
+          "GPU_ARCHS": "gfx950",
+          "CU_NUM": null,
+          "FLYDSL_GPU_ARCH": "gfx950",
+          "AITER_USE_SYSTEM_TRITON": "1",
+          "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+          "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+          "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-minimax-8192-default-prune-vs-staged",
+          "FLYDSL_RUNTIME_RUN_ONLY": null,
+          "AITER_CONFIG_FMOE": null,
+          "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+          "AITER_FLYDSL_STAGE2_FP8": "0",
+          "AITER_MXFP4_INTERMEDIATE": "0",
+          "TUNE_MOE_EXPERT_BALANCE": "False",
+          "TUNE_MOE_ROUTING_SEED": "0",
+          "AITER_LOG_MORE": null,
+          "AITER_MOE_EXPERT_BALANCE": null,
+          "MAX_JOBS": "8"
+        },
+        "timeout_contract": "No task or shape hard deadline; wait for child exit",
+        "idle_before_start": {
+          "utc": "2026-10-10T19:02:48.205627+00:00",
+          "status": {
+            "Unique ID": "0x5d8a72a332aa124c",
+            "GPU use (%)": "0",
+            "GFX Activity": "345243723",
+            "PCI Bus": "0000:F5:00.0",
+            "VRAM Total Memory (B)": "309220868096",
+            "VRAM Total Used Memory (B)": "297766912"
+          },
+          "processes": []
+        },
+        "pid": 607517,
+        "process_start_utc": "2026-10-10T19:02:48.210023+00:00",
+        "exit_code": 0,
+        "process_exit_utc": "2026-10-10T19:03:03.096345+00:00"
+      },
+      "identity": {
+        "utc": "2026-10-10T19:02:49.054527+00:00",
+        "pid": 607517,
+        "logical_gpu": 0,
+        "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+        "monitor_gpu": 7,
+        "pci": "0000:f5:00.0",
+        "gfx": "gfx950",
+        "cu_num": 256,
+        "name": "AMD Instinct MI355X",
+        "total_memory": 309220868096,
+        "torch": "2.8.0+rocm7.1.0.git7a520360",
+        "hip": "7.1.25424-4179531dcd"
+      }
+    }
+  ]
+}
