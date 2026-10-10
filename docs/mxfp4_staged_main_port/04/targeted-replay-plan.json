@@ -1,0 +1,178 @@
+[
+  {
+    "id": "minimax-64-default-full-vs-prune",
+    "left": "minimax-64-full",
+    "right": "minimax-64-prune",
+    "reason": "Full universe contains prune universe but independent prune winner is1.45% faster; check winner ordering/noise.",
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 16,
+      "accumulation_mode": "atomic",
+      "screen_topk": 2,
+      "g1_rank": 2,
+      "g2_rank": 1,
+      "g1_successful_candidates": 12,
+      "g2_successful_candidates": 8,
+      "both_retained": true,
+      "pair_validated": true
+    }
+  },
+  {
+    "id": "minimax-128-default-prune-vs-staged",
+    "left": "minimax-128-prune",
+    "right": "minimax-128-staged",
+    "reason": "Negative independent staged difference while prune winner G2 rank3 was not retained; check noise.",
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 16,
+      "accumulation_mode": "atomic",
+      "screen_topk": 2,
+      "g1_rank": 1,
+      "g2_rank": 3,
+      "g1_successful_candidates": 12,
+      "g2_successful_candidates": 8,
+      "both_retained": false,
+      "pair_validated": false
+    }
+  },
+  {
+    "id": "minimax-512-default-prune-vs-staged",
+    "left": "minimax-512-prune",
+    "right": "minimax-512-staged",
+    "reason": "Staged+3.54%; prune winner G1 rank4 was excluded.",
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 32,
+      "accumulation_mode": "atomic",
+      "screen_topk": 2,
+      "g1_rank": 4,
+      "g2_rank": 1,
+      "g1_successful_candidates": 54,
+      "g2_successful_candidates": 8,
+      "both_retained": false,
+      "pair_validated": false
+    }
+  },
+  {
+    "id": "minimax-2048-default-prune-vs-staged",
+    "left": "minimax-2048-prune",
+    "right": "minimax-2048-staged",
+    "reason": "Staged+2.79%; prune winner G1 rank5 was excluded.",
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 64,
+      "accumulation_mode": "non_atomic",
+      "screen_topk": 2,
+      "g1_rank": 5,
+      "g2_rank": 2,
+      "g1_successful_candidates": 12,
+      "g2_successful_candidates": 8,
+      "both_retained": false,
+      "pair_validated": false
+    }
+  },
+  {
+    "id": "gpt-2048-default-prune-vs-staged",
+    "left": "gpt-2048-default-prune",
+    "right": "gpt-2048-default-staged",
+    "reason": "Staged+5.11%; atomic prune winner G2 rank3 was excluded.",
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 64,
+      "accumulation_mode": "atomic",
+      "screen_topk": 2,
+      "g1_rank": 2,
+      "g2_rank": 3,
+      "g1_successful_candidates": 12,
+      "g2_successful_candidates": 16,
+      "both_retained": false,
+      "pair_validated": false
+    }
+  },
+  {
+    "id": "gpt-2048-fp8-prune-vs-staged",
+    "left": "gpt-2048-fp8-prune",
+    "right": "gpt-2048-fp8-staged",
+    "reason": "Staged+8.48%; non-atomic prune winner G2 rank7 was excluded.",
+    "fp8": true,
+    "fp4": false,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 128,
+      "accumulation_mode": "non_atomic",
+      "screen_topk": 2,
+      "g1_rank": 2,
+      "g2_rank": 7,
+      "g1_successful_candidates": 6,
+      "g2_successful_candidates": 24,
+      "both_retained": false,
+      "pair_validated": false
+    }
+  },
+  {
+    "id": "gpt-2048-limit5-prune-vs-staged",
+    "left": "gpt-2048-limit5-prune",
+    "right": "gpt-2048-limit5-staged",
+    "reason": "Staged+4.24%; atomic prune winner G2 rank3 was excluded.",
+    "fp8": false,
+    "fp4": false,
+    "limit": 5,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 64,
+      "accumulation_mode": "atomic",
+      "screen_topk": 2,
+      "g1_rank": 2,
+      "g2_rank": 3,
+      "g1_successful_candidates": 12,
+      "g2_successful_candidates": 16,
+      "both_retained": false,
+      "pair_validated": false
+    }
+  },
+  {
+    "id": "gpt-2048-combined5-prune-vs-staged",
+    "left": "gpt-2048-combined5-prune",
+    "right": "gpt-2048-combined5-staged",
+    "reason": "Staged+8.36%; same rank7 reduce loss as FP8 with configured limit5.",
+    "fp8": true,
+    "fp4": true,
+    "limit": 5,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 128,
+      "accumulation_mode": "non_atomic",
+      "screen_topk": 2,
+      "g1_rank": 1,
+      "g2_rank": 7,
+      "g1_successful_candidates": 6,
+      "g2_successful_candidates": 24,
+      "both_retained": false,
+      "pair_validated": false
+    }
+  }
+]
