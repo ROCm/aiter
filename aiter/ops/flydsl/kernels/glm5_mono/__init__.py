@@ -4,5 +4,5 @@
 """Shared implementation details for model-specific MonoKernels.
 
 Device sources track FlyDSL PR #1204 at 21a3d1ee, as carried by ROCm/ATOM#2435
-at bdc157af.
+at bdc157af, trimmed to GLM-5.
 """
