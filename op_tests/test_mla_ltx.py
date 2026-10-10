@@ -8,10 +8,12 @@ Follows op_tests/test_quant.py layout (aiter-op-test SKILL).
 
 Examples:
   python op_tests/test_mla_ltx.py
-    # default on gfx942: 16 BF16 cases (16/128 heads, ps+nps, boundary+split-KV)
+    # default on gfx942: every GFX942_PRESETS row in each of its modes (boundary+split-KV)
     # default on gfx950: PR global-load .co sweep (8 presets, ps, boundary+page16m)
   python op_tests/test_mla_ltx.py --suites kv_address --ps nps
-    # gfx942: stage-1 only; use --ps ps for persistent only (8 cases each)
+    # gfx942: BF16 16/128 heads, stage-1 only; use --ps ps for persistent only (8 cases each)
+  python op_tests/test_mla_ltx.py --preset qh16_fp8_q4 qh16_bf16_q8 --ps nps prefill
+    # gfx942: the named presets in the named modes (nps / ps / prefill)
   python op_tests/test_mla_ltx.py --preset qh64_fp8_q1 --ps ps --lse off --page-base 19000000 --ctx 4
   python op_tests/test_mla_ltx.py --preset qh16_fp8_q1 qh64_bf16_q1 --suites boundary --ps ps --lse off
   python op_tests/test_mla_ltx.py --suites page16m -d fp8 -kvd fp8 -n 16,1 --ps ps --lse off --ctx 4
@@ -156,9 +158,50 @@ PRESETS: dict[str, PresetConfig] = {
     # legacy aliases
     "qh16_fp8": (dtypes.fp8, dtypes.fp8, 16, 1),
     "qh64_bf16": (dtypes.bf16, dtypes.bf16, 64, 1),
+    # gfx942 only (hsa/gfx942/mla/mla_asm.csv)
+    "qh128_fp8_q1": (dtypes.fp8, dtypes.fp8, 128, 1),
+    "qh16_a16w8_q1": (dtypes.bf16, dtypes.fp8, 16, 1),
+    "qh32_bf16_q1": (dtypes.bf16, dtypes.bf16, 32, 1),
+    "qh32_bf16_q2": (dtypes.bf16, dtypes.bf16, 32, 2),
+    "qh64_bf16_q2": (dtypes.bf16, dtypes.bf16, 64, 2),
+    "qh128_bf16_q8": (dtypes.bf16, dtypes.bf16, 128, 8),
 }
 DEFAULT_PRESET = "qh16_fp8_q1"
-GFX942_PRESETS = ("qh16_bf16_q1", "qh128_bf16_q1")
+
+# gfx942 kv_address coverage: preset -> modes, with the .co each mode selects.
+# nps = stage-1 split-KV, ps = persistent, prefill = mla_prefill_fwd.
+# Not covered: mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps_page64_ds32 (page_size 64).
+GFX942_PRESETS: dict[str, tuple[str, ...]] = {
+    # nps: mla_dec_stage1_bf16_a16w16_subQ16_mqa16, ps: mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps
+    "qh16_bf16_q1": ("nps", "ps"),
+    # nps: mla_dec_stage1_bf16_a16w16_subQ128_mqa128, ps: folded to 16 heads (as qh16_bf16_q1)
+    "qh128_bf16_q1": ("nps", "ps"),
+    # nps: mla_a16w16_qh16_m16x4_n16x1_coex0_mask1
+    "qh16_bf16_q4": ("nps",),
+    # nps: mla_a16w16_qh16_m32x4_n16x1_coex0_mask1, prefill: mla_pfl_bf16_a16w16_causal_subQ16_mqa16
+    "qh16_bf16_q8": ("nps", "prefill"),
+    # prefill: mla_pfl_bf16_a16w16_causal_subQ128_mqa128
+    "qh128_bf16_q8": ("prefill",),
+    # nps: MLA_A16W16_1TG_4W_32mx1_16nx1_Coex0_Msk1_QH16_Q1
+    "qh32_bf16_q1": ("nps",),
+    # nps: MLA_A16W16_1TG_4W_32mx1_16nx1_Coex0_Msk1_QH16
+    "qh32_bf16_q2": ("nps",),
+    # nps: MLA_A16W16_1TG_4W_64mx1_16nx1_Coex0_Msk1_QH16
+    "qh64_bf16_q2": ("nps",),
+    # ps: mla_dec_stage1_bf16_a16w16_subQ16_mqa16_ps
+    "qh8_bf16_q2": ("ps",),
+    # ps: mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps
+    "qh16_a16w8_q1": ("ps",),
+    # nps: mla_a8w8_qh16_qseqlen1_gqaratio16, ps: mla_a8w8_qh16_qseqlen1_gqaratio16_ps
+    "qh16_fp8_q1": ("nps", "ps"),
+    # nps: mla_a8w8_qh16_qseqlen2_gqaratio16, ps: mla_a8w8_qh16_qseqlen2_gqaratio16_ps
+    "qh16_fp8_q2": ("nps", "ps"),
+    # nps: mla_a8w8_qh64_qseqlen4_gqaratio16, ps: mla_a8w8_qh64_qseqlen4_gqaratio16_ps
+    "qh16_fp8_q4": ("nps", "ps"),
+    # nps: mla_a8w8_qh128_m32x4_n16x2_msk1, ps: mla_a8w8_qh128_m32x4_n16x2_msk0_ps
+    "qh128_fp8_q1": ("nps", "ps"),
+}
+GFX942_MODES = ("nps", "ps", "prefill")
 
 # PR #4452 global-load .co: decode presets reachable via ps+lse off (skip cprr;
 # skip qh16_fp8_q4 nps -> unrefreshed qh64_qseqlen4 alias in mla_asm.csv).
@@ -220,12 +263,14 @@ def _point_cases_for(h: Harness) -> list[PointCase]:
 
 
 def _kv_address_cases(h: Harness) -> list[PointCase]:
-    # A BF16 row starts below 4 GiB but straddles it at page 3,728,270.
+    # A BF16 row starts below 4 GiB but straddles it at page 3,728,270 (FP8: 7,456,540).
+    # The last query token sees every row, so straddling4g ends on that row.
     boundary = (1 << 32) // h.bytes_per_page
+    ctx = h.decode_qlen
     return [
-        PointCase(boundary - 1, 1, "below4g", "kv_address"),
-        PointCase(boundary, 1, "straddling4g", "kv_address"),
-        PointCase(boundary + 1, 1, "above4g", "kv_address"),
+        PointCase(boundary - ctx, ctx, "below4g", "kv_address"),
+        PointCase(boundary - ctx + 1, ctx, "straddling4g", "kv_address"),
+        PointCase(boundary + 1, ctx, "above4g", "kv_address"),
         PointCase(boundary + 1, 256, "above4g-splitkv", "kv_address", max_split=4),
     ]
 
@@ -308,13 +353,18 @@ def _build_persistent_metadata(
     qo_indptr, kv_indptr, kv_last_page_lens, max_split_per_batch, *_legacy
 ):
     bs = qo_indptr.shape[0] - 1
-    dtype = dtypes.bf16
+    # gfx942 plans FP8 128 heads unfolded only with the real dtypes; gfx950 keeps
+    # the BF16 metadata its sweep was validated with.
+    if get_gfx() == "gfx942":
+        dtype_q, dtype_kv = HARNESS.q_dtype, HARNESS.kv_dtype
+    else:
+        dtype_q = dtype_kv = dtypes.bf16
     sizes = aiter.get_mla_metadata_info_v1(
         bs,
         HARNESS.decode_qlen,
         HARNESS.nhead,
-        dtype,
-        dtype,
+        dtype_q,
+        dtype_kv,
         is_sparse=False,
         fast_mode=True,
         num_kv_splits=max_split_per_batch,
@@ -346,8 +396,8 @@ def _build_persistent_metadata(
         fast_mode=True,
         max_split_per_batch=max_split_per_batch,
         intra_batch_mode=False,
-        dtype_q=dtype,
-        dtype_kv=dtype,
+        dtype_q=dtype_q,
+        dtype_kv=dtype_kv,
     )
     return {
         "work_meta_data": wmd,
@@ -397,6 +447,7 @@ def run_asm_mla_decode(
     }
     if HARNESS.use_fp8:
         kw["q_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
+    if HARNESS.kv_dtype == dtypes.fp8:
         kw["kv_scale"] = torch.ones(1, dtype=torch.float, device="cuda")
     if persistent:
         kw["num_kv_splits"] = max_split
@@ -420,6 +471,22 @@ def run_asm_mla_decode(
         cp_world_size=1,
         cp_rank=0,
         **kw,
+    )
+    return out
+
+
+def run_asm_mla_prefill(q, kv_buffer, num_pages, out, qo_indptr, kv_indptr, kv_indices):
+    kv_lens = torch.ones(BATCH_SIZE, dtype=torch.int, device="cuda")
+    aiter.mla.mla_prefill_fwd(
+        q,
+        kv_buffer.view(num_pages, PAGE_SIZE, NHEAD_KV, QK_HEAD_DIM),
+        out,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        kv_lens,
+        HARNESS.decode_qlen,
+        sm_scale=1.0 / (QK_HEAD_DIM**0.5),
     )
     return out
 
@@ -489,6 +556,7 @@ def test_mla_ltx(
     nhead,
     decode_qlen,
     check_kv_address=False,
+    prefill=False,
 ):
     apply_config(q_dtype, kv_dtype, nhead, decode_qlen)
     if _KV_POOL is None:
@@ -497,7 +565,7 @@ def test_mla_ltx(
     pool, num_pages = _KV_POOL
     if check_kv_address:
         return _check_kv_address(
-            pool, page_base, ctx_len, label, persistent, return_lse, max_split
+            pool, page_base, ctx_len, label, persistent, return_lse, max_split, prefill
         )
     pb = None if page_base == SEQ_PAGE_BASE else page_base
     qo, kv_i, kv_x = _make_indptr(ctx_len, pb)
@@ -554,27 +622,37 @@ def test_mla_ltx(
 
 
 def _check_kv_address(
-    pool, page_base, ctx_len, label, persistent, return_lse, max_split
+    pool, page_base, ctx_len, label, persistent, return_lse, max_split, prefill
 ):
     """ROCm/aiter#5826: compare identical KV data at low and high offsets."""
-    mode = "persistent" if persistent else "stage1"
-    name = f"{label}-{mode}-{HARNESS.nhead}"
+    mode = "prefill" if prefill else "persistent" if persistent else "stage1"
+    qlen = HARNESS.decode_qlen
+    q_name, kv_name = (_csv_type_name(d) for d in (HARNESS.q_dtype, HARNESS.kv_dtype))
+    name = f"{label}-{mode}-{HARNESS.nhead}-{q_name}_{kv_name}-q{qlen}"
     generator = torch.Generator(device="cpu").manual_seed(42)
     q_cpu = torch.randn(
-        1, HARNESS.nhead, QK_HEAD_DIM, generator=generator, device="cpu"
-    ).to(torch.bfloat16)
+        qlen, HARNESS.nhead, QK_HEAD_DIM, generator=generator, device="cpu"
+    ).to(HARNESS.q_dtype)
     kv_cpu = torch.randn(ctx_len, QK_HEAD_DIM, generator=generator, device="cpu").to(
-        torch.bfloat16
+        HARNESS.kv_dtype
     )
     # Independent of GPU page indexing, including the reference's KV reads.
-    scores = (q_cpu[0].float() @ kv_cpu.float().T) * (QK_HEAD_DIM**-0.5)
-    reference = (torch.softmax(scores, dim=-1) @ kv_cpu[:, :V_HEAD_DIM].float())[None]
+    # Causal: query token t sees the first ctx_len - qlen + 1 + t rows.
+    scores = (q_cpu.float() @ kv_cpu.float().T) * (QK_HEAD_DIM**-0.5)
+    hidden = torch.ones(qlen, ctx_len, dtype=torch.bool, device="cpu")
+    hidden = hidden.triu(ctx_len - qlen + 1)
+    scores.masked_fill_(hidden[:, None, :], float("-inf"))
+    reference = torch.softmax(scores, dim=-1) @ kv_cpu[:, :V_HEAD_DIM].float()
+    # The FP8-Q kernels also round P to FP8.
+    tol = 6e-2 if HARNESS.use_fp8 else 2e-2
     q = q_cpu.cuda()
     source = kv_cpu.cuda().view(ctx_len, NHEAD_KV, QK_HEAD_DIM)
     pool[SAFE_PAGE_BASE : SAFE_PAGE_BASE + ctx_len].copy_(source)
     placed = pool[page_base : page_base + ctx_len]
     placed.copy_(source)
-    torch.testing.assert_close(placed.cpu().view_as(kv_cpu), kv_cpu, rtol=0, atol=0)
+    torch.testing.assert_close(
+        placed.cpu().view_as(kv_cpu).float(), kv_cpu.float(), rtol=0, atol=0
+    )
 
     ret = {"gfx": get_gfx(), "label": label, "passed": True}
     try:
@@ -585,25 +663,30 @@ def _check_kv_address(
         ):
             qo, kv_i, kv_x = _make_indptr(ctx_len, page)
             out = torch.full(
-                (1, HARNESS.nhead, V_HEAD_DIM),
+                (qlen, HARNESS.nhead, V_HEAD_DIM),
                 float("nan"),
                 dtype=torch.bfloat16,
                 device="cuda",
             )
-            run_asm_mla_decode(
-                q,
-                pool_view,
-                pool_view.shape[0],
-                out,
-                qo,
-                kv_i,
-                kv_x,
-                persistent=bool(persistent),
-                return_lse=bool(return_lse),
-                max_split=max_split,
-            )
+            if prefill:
+                run_asm_mla_prefill(
+                    q, pool_view, pool_view.shape[0], out, qo, kv_i, kv_x
+                )
+            else:
+                run_asm_mla_decode(
+                    q,
+                    pool_view,
+                    pool_view.shape[0],
+                    out,
+                    qo,
+                    kv_i,
+                    kv_x,
+                    persistent=bool(persistent),
+                    return_lse=bool(return_lse),
+                    max_split=max_split,
+                )
             torch.testing.assert_close(
-                out.float().cpu(), reference, atol=2e-2, rtol=2e-2, msg=control
+                out.float().cpu(), reference, atol=tol, rtol=tol, msg=control
             )
     except AssertionError as exc:
         ret["passed"] = False
@@ -649,6 +732,7 @@ def _sweep_rows(
     persistent_modes: list[bool],
     lse_modes: list[bool],
     max_splits: list[int] | None,
+    prefill: bool = False,
 ) -> list[dict]:
     rows: list[dict] = []
     for c in points:
@@ -671,6 +755,7 @@ def _sweep_rows(
                     nhead,
                     decode_qlen,
                     check_kv_address=c.suite == "kv_address",
+                    prefill=prefill,
                 )
             )
     for ctx, label in seq:
@@ -710,13 +795,15 @@ def main():
                 "off",
             ]
         )
+    elif len(sys.argv) == 1 and gfx == "gfx942":
+        sys.argv.extend(["--preset", *GFX942_PRESETS])
 
     if gfx not in SUPPORTED_GFX:
         aiter.logger.warning("mla_ltx unsupported on %s; skipping", gfx)
         return
 
     is_gfx942 = gfx == "gfx942"
-    _dq, _dkv, _dn, _dql = PRESETS[GFX942_PRESETS[0] if is_gfx942 else DEFAULT_PRESET]
+    _dq, _dkv, _dn, _dql = PRESETS["qh16_bf16_q1" if is_gfx942 else DEFAULT_PRESET]
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="MLA decode large page_id / >4 GiB KV pool (gfx942/gfx950 asm)",
@@ -769,8 +856,8 @@ def main():
         "--ps",
         dest="persistent",
         nargs="*",
-        default=["nps", "ps"] if is_gfx942 else ["ps"],
-        help="ps / nps sweep (default: both on gfx942, ps on gfx950)",
+        default=list(GFX942_MODES) if is_gfx942 else ["ps"],
+        help="ps / nps sweep, plus prefill on gfx942 (default: all on gfx942, ps on gfx950)",
     )
     parser.add_argument(
         "--lse",
@@ -808,7 +895,8 @@ def main():
     )
     args = parser.parse_args()
 
-    persistent_modes = _parse_persistent(args.persistent)
+    run_prefill = is_gfx942 and "prefill" in args.persistent
+    persistent_modes = _parse_persistent([v for v in args.persistent if v != "prefill"])
     lse_modes = _parse_lse(args.lse)
     ctx_overrides = args.ctx if args.ctx else [0]
 
@@ -822,15 +910,21 @@ def main():
             )
         ]
 
-    if is_gfx942 and any(
-        row not in [PRESETS[p] for p in GFX942_PRESETS] for row in config_rows
-    ):
-        parser.error(
-            "gfx942 coverage requires BF16 Q/KV, 16 or 128 heads, and decode_qlen=1"
-        )
+    gfx942_modes = {PRESETS[name]: modes for name, modes in GFX942_PRESETS.items()}
+    if is_gfx942 and any(row not in gfx942_modes for row in config_rows):
+        parser.error("gfx942 coverage requires a GFX942_PRESETS config")
 
     address_results = []
     for q_dtype, kv_dtype, nhead, decode_qlen in config_rows:
+        row_persistent, row_prefill = persistent_modes, False
+        if is_gfx942:
+            modes = gfx942_modes[(q_dtype, kv_dtype, nhead, decode_qlen)]
+            row_persistent = [
+                p for p in persistent_modes if ("ps" if p else "nps") in modes
+            ]
+            row_prefill = run_prefill and "prefill" in modes
+            if not row_persistent and not row_prefill:
+                continue
         apply_config(q_dtype, kv_dtype, nhead, decode_qlen)
         global _POINT_CASES, _SEQUENTIAL_CASES, _KV_POOL
         _POINT_CASES = _point_cases_for(HARNESS)
@@ -898,10 +992,24 @@ def main():
                 kv_dtype,
                 nhead,
                 decode_qlen,
-                persistent_modes,
+                row_persistent,
                 lse_modes,
                 args.num_kv_splits,
             )
+            if row_prefill:
+                rows += _sweep_rows(
+                    [c for c in points if c.suite == "kv_address"],
+                    [],
+                    ctx_override,
+                    q_dtype,
+                    kv_dtype,
+                    nhead,
+                    decode_qlen,
+                    [False],
+                    [False],
+                    args.num_kv_splits,
+                    prefill=True,
+                )
             address_results.extend(row for row in rows if "passed" in row)
             df = pd.DataFrame(rows)
             aiter.logger.info(
