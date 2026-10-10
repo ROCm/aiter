@@ -353,10 +353,10 @@ class TunerCommon:
             tunedf = pd.DataFrame(columns=columns)
         return self._normalize_tuned_csv(tunedf)
 
-    def _normalize_tuned_csv(self, tunedf):
+    def _normalize_tuned_csv(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
         return self._normalize_tuned_identity(tunedf)
 
-    def _normalize_tuned_identity(self, tunedf):
+    def _normalize_tuned_identity(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
         """Backfill only missing legacy identities; retain explicit device rows."""
         tunedf = tunedf.copy()
         if "gfx" in self.keys:
@@ -577,7 +577,7 @@ class TunerCommon:
         resultdf = self.result_to_df(bestConfigs)
         return resultdf
 
-    def _summary_shape_keys(self):
+    def _summary_shape_keys(self) -> "list[str]":
         return self.keys
 
     def tune_summary(self, status):

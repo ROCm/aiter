@@ -8,10 +8,12 @@ sorting, and summary use the real ordinary tuner; only the measurement dispatch
 and runtime device properties are controlled.
 """
 
+import argparse
 import os
 import subprocess
 import sys
 import textwrap
+from collections.abc import Callable, Iterator
 from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -61,10 +63,10 @@ RESULTS = [
 
 
 @contextmanager
-def prohibit_gpu_work():
+def prohibit_gpu_work() -> "Iterator[None]":
     """Fail closed, including when a subprocess imports a fresh tuner class."""
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: "object", **kwargs: "object") -> "None":
         # pytest.fail escapes the tuner's catch(Exception) recovery path.
         pytest.fail("controlled ordinary lifecycle test reached real GPU work")
 
@@ -114,7 +116,11 @@ def prohibit_gpu_work():
         ):
             factory = getattr(torch, name)
 
-            def cpu_only(*args, _factory=factory, **kwargs):
+            def cpu_only(
+                *args: "object",
+                _factory: "Callable[..., torch.Tensor]" = factory,
+                **kwargs: "object"
+            ) -> "torch.Tensor":
                 device = kwargs.get("device")
                 if device is not None and torch.device(device).type == "cpu":
                     return _factory(*args, **kwargs)
@@ -129,12 +135,12 @@ def prohibit_gpu_work():
 
 
 @pytest.fixture(autouse=True)
-def forbid_uncontrolled_gpu_work():
+def forbid_uncontrolled_gpu_work() -> "Iterator[None]":
     with prohibit_gpu_work():
         yield
 
 
-def shape(token=4, **updates):
+def shape(token: "int" = 4, **updates: "object") -> "dict[str, object]":
     row = {
         "gfx": "gfx942",
         "cu_num": 304,
@@ -155,7 +161,7 @@ def shape(token=4, **updates):
     return row
 
 
-def historical_result(token=2, **updates):
+def historical_result(token: "int" = 2, **updates: "object") -> "dict[str, object]":
     row = dict(
         shape(token),
         block_m=16,
@@ -179,12 +185,18 @@ def historical_result(token=2, **updates):
 
 
 @contextmanager
-def controlled_environment(root, outcomes=None, dispatched=None):
+def controlled_environment(
+    root: "Path",
+    outcomes: "dict[int, str] | None" = None,
+    dispatched: "list[object] | None" = None,
+) -> "Iterator[None]":
     """Keep real CK tasks and return measurements without executing their funcs."""
     outcomes = outcomes or {}
     (root / "aiter" / "configs").mkdir(parents=True, exist_ok=True)
 
-    def measure(tasks, *args, **kwargs):
+    def measure(
+        tasks: "list[object]", *args: "object", **kwargs: "object"
+    ) -> "list[tuple[object, float, float]]":
         results = []
         for task in tasks:
             tag = task[0]
@@ -230,7 +242,9 @@ def controlled_environment(root, outcomes=None, dispatched=None):
         yield
 
 
-def args_for(tuner, source, output, *options):
+def args_for(
+    tuner: "moe.FmoeTuner", source: "Path", output: "Path", *options: "object"
+) -> "argparse.Namespace":
     return tuner.parser.parse_args(
         [
             "-i",
@@ -248,7 +262,9 @@ def args_for(tuner, source, output, *options):
     )
 
 
-def test_ordinary_fmoe_preserves_schema_nt_stage_timings_and_profiles(tmp_path):
+def test_ordinary_fmoe_preserves_schema_nt_stage_timings_and_profiles(
+    tmp_path: "Path",
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     profile = tmp_path / "paired-profile.csv"
     pd.DataFrame([shape(8), shape(), shape()]).to_csv(source, index=False)
@@ -292,7 +308,7 @@ def test_ordinary_fmoe_preserves_schema_nt_stage_timings_and_profiles(tmp_path):
     assert len(raw) == len(dispatched)
 
 
-def test_ordinary_retune_replaces_duplicate_old_winners(tmp_path):
+def test_ordinary_retune_replaces_duplicate_old_winners(tmp_path: "Path") -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape()]).to_csv(source, index=False)
     pd.DataFrame([historical_result(4, us=20), historical_result(4, us=21)]).to_csv(
@@ -307,8 +323,8 @@ def test_ordinary_retune_replaces_duplicate_old_winners(tmp_path):
 
 
 def test_ordinary_fmoe_migrates_legacy_shared_csv_without_losing_nt_or_numbers(
-    tmp_path,
-):
+    tmp_path: "Path",
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape()]).to_csv(source, index=False)
     old = pd.DataFrame(
@@ -336,8 +352,8 @@ def test_ordinary_fmoe_migrates_legacy_shared_csv_without_losing_nt_or_numbers(
 
 @pytest.mark.parametrize("outcome", ["failed", "timeout", "incorrect"])
 def test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner(
-    tmp_path, outcome
-):
+    tmp_path: "Path", outcome: "object"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     profile = tmp_path / "paired-profile.csv"
     pd.DataFrame([shape(), shape(6, use_g1u1=0), shape(8)]).to_csv(source, index=False)
@@ -384,8 +400,8 @@ def test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner
 @pytest.mark.parametrize("output_exists", [False, True])
 @pytest.mark.parametrize("all_rows", [False, True])
 def test_ordinary_fmoe_empty_input_finishes_without_measurement(
-    tmp_path, output_exists, all_rows
-):
+    tmp_path: "Path", output_exists: "bool", all_rows: "bool"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame(columns=KEYS).to_csv(source, index=False)
     if output_exists:
@@ -411,8 +427,8 @@ def test_ordinary_fmoe_empty_input_finishes_without_measurement(
 @pytest.mark.parametrize("same_file", [False, True])
 @pytest.mark.parametrize("all_rows", [False, True])
 def test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows(
-    tmp_path, same_file, all_rows
-):
+    tmp_path: "Path", same_file: "bool", all_rows: "bool"
+) -> "None":
     source = tmp_path / "input.csv"
     output = source if same_file else tmp_path / "winner.csv"
     old = [historical_result(8), historical_result()]
@@ -448,8 +464,8 @@ def test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_row
     ],
 )
 def test_ordinary_fmoe_command_returns_summary_exit_status(
-    tmp_path, outcome, expected_status
-):
+    tmp_path: "Path", outcome: "object", expected_status: "int"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape(), shape(8)]).to_csv(source, index=False)
     command = textwrap.dedent("""\

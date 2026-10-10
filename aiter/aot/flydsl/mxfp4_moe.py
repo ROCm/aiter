@@ -107,7 +107,9 @@ def _job_key(job: dict) -> tuple:
     )
 
 
-def parse_csv(csv_path, swiglu_limit: float | None = None):
+def parse_csv(
+    csv_path: "str | io.TextIOBase", swiglu_limit: float | None = None
+) -> "list[dict[str, object]]":
     """Parse jobs with the caller's limit or AITER_MXFP4_TUNE_SWIGLU_LIMIT.
 
     An unset/empty environment preserves activation defaults. Batch AOT uses
