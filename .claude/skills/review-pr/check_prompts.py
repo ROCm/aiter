@@ -116,6 +116,8 @@ def check_owner_fallbacks():
          r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
         ("lost_review.py", "flow",
          r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
+        ("queue_gate.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
     ]
     bad = 0
     for filename, cls, pattern in rows:
@@ -137,6 +139,30 @@ def check_owner_fallbacks():
             continue
         print(f"\u2705 {filename} matches _notify.py's {cls} class: {default} via {var}")
     return 1 if bad else 0
+
+
+def check_notified_handoff():
+    """The report job stays quiet when the review job says it already spoke. That answer travels
+    _notify.py -> step output -> job output -> the report job's env, and every link is a string
+    that something else has to spell the same way. Break one and nothing errors: the flag simply
+    arrives empty, the report fires on every failed review, and the duplicate notice looks like
+    the bot being broken rather than the wiring being broken."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    notify = (HERE / "_notify.py").read_text(encoding="utf-8")
+    links = [
+        ("_notify.py writes the flag", 'fh.write("notified=true' in notify),
+        ("the review job has a step to write it", re.search(r"^\s+id: notify\s*$", wf, re.M)),
+        ("the review job exports it",
+         re.search(r"^\s+notified: \$\{\{ steps\.notify\.outputs\.notified \}\}", wf, re.M)),
+        ("the report job reads it",
+         re.search(r"^\s+NOTIFIED: \$\{\{ needs\.review\.outputs\.notified \}\}", wf, re.M)),
+    ]
+    broken = [name for name, found in links if not found]
+    if broken:
+        print("\u274c the notified handoff is broken at: %s" % "; ".join(broken))
+        return 1
+    print("\u2705 notified handoff intact: _notify.py -> step -> job output -> report")
+    return 0
 
 
 def check_runner_label_exclusive():
@@ -176,6 +202,7 @@ def main():
     bad += check_fail_classes()
     bad += check_budget_fits()
     bad += check_owner_fallbacks()
+    bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
