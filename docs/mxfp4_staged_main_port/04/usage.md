@@ -290,7 +290,10 @@ with the recorded toolchain:
 the toolchain Python for child tasks. The coordinator reads the manifest,
 chooses separate mode/configuration winners, fixes the settings for each task
 and runs fresh independent processes sequentially through the physical-GPU
-idle/identity controller. Leave `--only` omitted for the prescribed matrix;
+idle/identity controller. Each initial search uses a fresh initially empty
+FlyDSL cache; the shared AITER auxiliary cache is warmed equally. First full64
+used an initially empty default-config path, which provides the same starting
+condition as the later per-id paths. Leave `--only` omitted for the prescribed matrix;
 selected IDs are for review or diagnosis. Existing successful task records
 are retained rather than executed again; a failed/incomplete prior task
 requires diagnosis.
@@ -305,5 +308,9 @@ After search, verify the matching winners in separate deployment tasks:
 ```
 
 These replay/AOT/run-only tasks are deployment checks, separate from the 27
-initial searches. Use the same runtime/cache root for AOT and precompiled
-replay; override `--runtime` consistently if using a separate runtime directory.
+initial searches. Winner replay preserves the generated search route weights
+and seed0 data/routes, using `--preserve-generated-route-weights` in the harness.
+Use the same runtime/cache root for AOT and precompiled replay; override
+`--runtime` consistently if using a separate runtime directory. Public Situv2
+omitted-parameter acceptance uses `--situv2-public-defaults` to omit beta API
+arguments and compare with Torch `(1,1)` while asserting actual kernel arguments.
