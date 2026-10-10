@@ -36,9 +36,11 @@ def main():
                 continue
             result = json.loads(result_path.read_text())
             task = json.loads(task_path.read_text())
-            status = "pass"
-            if task.get("exit_code") != 0:
-                status = "failed"
+            status = (
+                "incomplete"
+                if task.get("exit_code") is None
+                else "pass" if task["exit_code"] == 0 else "failed"
+            )
             if action == "aot":
                 if not result["results"] or not all(
                     item.get("compile_time") is not None for item in result["results"]
