@@ -47,6 +47,7 @@ QK_ROPE_HEAD_DIM = 64
 QK_HEAD_DIM = KV_LORA_RANK + QK_ROPE_HEAD_DIM
 V_HEAD_DIM = KV_LORA_RANK
 PAGE_SIZE = 1
+DS32_PAGE_SIZE = 64  # uint8 KV: [nope fp8 | 4 fp32 block scales | rope bf16] pages
 NHEAD_KV = 1
 DECODE_QLEN = 1
 BATCH_SIZE = 1
@@ -78,6 +79,8 @@ def _csv_type_name(dtype) -> str:
         return "fp8"
     if dtype in (dtypes.bf16, torch.bfloat16):
         return "bf16"
+    if dtype == torch.uint8:
+        return "ds32"
     raise ValueError(f"unsupported dtype: {dtype}")
 
 
@@ -106,7 +109,17 @@ class Harness:
         return self.q_dtype == dtypes.fp8 and self.kv_dtype == dtypes.fp8
 
     @property
+    def ds32(self) -> bool:
+        return self.kv_dtype == torch.uint8
+
+    @property
+    def page_size(self) -> int:
+        return DS32_PAGE_SIZE if self.ds32 else PAGE_SIZE
+
+    @property
     def bytes_per_page(self) -> int:
+        if self.ds32:
+            return DS32_PAGE_SIZE * (KV_LORA_RANK + 4 * 4 + QK_ROPE_HEAD_DIM * 2)
         return QK_HEAD_DIM * _dtype_element_size(self.kv_dtype)
 
     def summary(self) -> str:
@@ -165,12 +178,14 @@ PRESETS: dict[str, PresetConfig] = {
     "qh32_bf16_q2": (dtypes.bf16, dtypes.bf16, 32, 2),
     "qh64_bf16_q2": (dtypes.bf16, dtypes.bf16, 64, 2),
     "qh128_bf16_q8": (dtypes.bf16, dtypes.bf16, 128, 8),
+    "qh16_ds32_q1": (dtypes.bf16, torch.uint8, 16, 1),
+    "qh16_ds32_q2": (dtypes.bf16, torch.uint8, 16, 2),
+    "qh16_ds32_q4": (dtypes.bf16, torch.uint8, 16, 4),
 }
 DEFAULT_PRESET = "qh16_fp8_q1"
 
 # gfx942 kv_address coverage: preset -> modes, with the .co each mode selects.
 # nps = stage-1 split-KV, ps = persistent, prefill = mla_prefill_fwd.
-# Not covered: mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps_page64_ds32 (page_size 64).
 GFX942_PRESETS: dict[str, tuple[str, ...]] = {
     # nps: mla_dec_stage1_bf16_a16w16_subQ16_mqa16, ps: mla_a16w16_qh16_m16x4_n16x1_coex0_mask1_ps
     "qh16_bf16_q1": ("nps", "ps"),
@@ -200,6 +215,10 @@ GFX942_PRESETS: dict[str, tuple[str, ...]] = {
     "qh16_fp8_q4": ("nps", "ps"),
     # nps: mla_a8w8_qh128_m32x4_n16x2_msk1, ps: mla_a8w8_qh128_m32x4_n16x2_msk0_ps
     "qh128_fp8_q1": ("nps", "ps"),
+    # ps: mla_a16w8_qh16_m16x4_n16x1_coex0_mask1_ps_page64_ds32
+    "qh16_ds32_q1": ("ps",),
+    "qh16_ds32_q2": ("ps",),
+    "qh16_ds32_q4": ("ps",),
 }
 GFX942_MODES = ("nps", "ps", "prefill")
 
@@ -265,13 +284,19 @@ def _point_cases_for(h: Harness) -> list[PointCase]:
 def _kv_address_cases(h: Harness) -> list[PointCase]:
     # A BF16 row starts below 4 GiB but straddles it at page 3,728,270 (FP8: 7,456,540).
     # The last query token sees every row, so straddling4g ends on that row.
+    # ds32 uses one full page; page 102,300 starts 4 KiB below 4 GiB.
     boundary = (1 << 32) // h.bytes_per_page
-    ctx = h.decode_qlen
+    ctx = max(h.decode_qlen, h.page_size)
+    pages = ctx // h.page_size
+    # The metadata splits page-64 KV into 64-page work items.
+    split_ctx = 256 if h.page_size == 1 else 65 * h.page_size
     return [
-        PointCase(boundary - ctx, ctx, "below4g", "kv_address"),
-        PointCase(boundary - ctx + 1, ctx, "straddling4g", "kv_address"),
+        PointCase(boundary - pages, ctx, "below4g", "kv_address"),
+        PointCase(boundary - pages + 1, ctx, "straddling4g", "kv_address"),
         PointCase(boundary + 1, ctx, "above4g", "kv_address"),
-        PointCase(boundary + 1, 256, "above4g-splitkv", "kv_address", max_split=4),
+        PointCase(
+            boundary + 1, split_ctx, "above4g-splitkv", "kv_address", max_split=4
+        ),
     ]
 
 
@@ -342,6 +367,10 @@ def _seed_pages(kv_buffer: torch.Tensor, ranges: Iterable[tuple[int, int]]) -> N
 
 
 def _build_kv_pool(num_pages: int, ranges: list[tuple[int, int]]) -> torch.Tensor:
+    if HARNESS.ds32:  # only _check_kv_address uses it; it writes its own pages
+        return torch.zeros(
+            (num_pages, HARNESS.bytes_per_page), dtype=torch.uint8, device="cuda"
+        )
     kv = torch.zeros(
         (num_pages, NHEAD_KV, QK_HEAD_DIM), dtype=HARNESS.kv_dtype, device="cuda"
     )
@@ -357,6 +386,8 @@ def _build_persistent_metadata(
     # the BF16 metadata its sweep was validated with.
     if get_gfx() == "gfx942":
         dtype_q, dtype_kv = HARNESS.q_dtype, HARNESS.kv_dtype
+        if HARNESS.ds32:
+            dtype_kv = dtypes.fp8
     else:
         dtype_q = dtype_kv = dtypes.bf16
     sizes = aiter.get_mla_metadata_info_v1(
@@ -389,8 +420,8 @@ def _build_persistent_metadata(
         ri,
         rfm,
         rpm,
-        page_size=PAGE_SIZE,
-        kv_granularity=max(PAGE_SIZE, 16),
+        page_size=HARNESS.page_size,
+        kv_granularity=max(HARNESS.page_size, 16),
         max_seqlen_qo=HARNESS.decode_qlen,
         uni_seqlen_qo=HARNESS.decode_qlen,
         fast_mode=True,
@@ -411,12 +442,13 @@ def _build_persistent_metadata(
 
 def _make_indptr(ctx_len: int, page_base: int | None):
     qlen = HARNESS.decode_qlen
-    kv_indptr = torch.tensor([0, ctx_len], dtype=torch.int, device="cuda")
+    pages = ctx_len // HARNESS.page_size
+    kv_indptr = torch.tensor([0, pages], dtype=torch.int, device="cuda")
     if page_base is None:
-        kv_indices = torch.arange(ctx_len, dtype=torch.int, device="cuda")
+        kv_indices = torch.arange(pages, dtype=torch.int, device="cuda")
     else:
         kv_indices = torch.arange(
-            page_base, page_base + ctx_len, dtype=torch.int, device="cuda"
+            page_base, page_base + pages, dtype=torch.int, device="cuda"
         )
     qo_indptr = torch.tensor([0, qlen], dtype=torch.int, device="cuda")
     return qo_indptr, kv_indptr, kv_indices
@@ -436,11 +468,16 @@ def run_asm_mla_decode(
     max_split: int,
 ):
     sm = 1.0 / (QK_HEAD_DIM**0.5)
-    kv_lens = torch.ones(BATCH_SIZE, dtype=torch.int, device="cuda")
-    kv_view = kv_buffer.view(num_pages, PAGE_SIZE, NHEAD_KV, QK_HEAD_DIM)
+    # kv_last_page_lens: ds32 contexts are whole pages.
+    kv_lens = torch.full((BATCH_SIZE,), HARNESS.page_size, dtype=torch.int)
+    kv_view = (
+        kv_buffer
+        if HARNESS.ds32
+        else kv_buffer.view(num_pages, PAGE_SIZE, NHEAD_KV, QK_HEAD_DIM)
+    )
     q_asm = q.to(dtypes.fp8) if HARNESS.use_fp8 else q
     kw = {
-        "page_size": PAGE_SIZE,
+        "page_size": HARNESS.page_size,
         "nhead_kv": NHEAD_KV,
         "sm_scale": sm,
         "return_lse": return_lse,
@@ -621,6 +658,22 @@ def test_mla_ltx(
     return ret
 
 
+def _ds32_pages(ctx_len: int, generator: torch.Generator):
+    """Random ds32 KV: (dequantized rows, packed uint8 pages)."""
+    nope = torch.randn(ctx_len, KV_LORA_RANK, generator=generator, device="cpu")
+    nope = nope.to(dtypes.fp8)
+    # Power-of-two scales keep the kernel's bf16 K/V exact.
+    scale = 2.0 ** torch.randint(-1, 2, (ctx_len, 4), generator=generator, device="cpu")
+    rope = torch.randn(ctx_len, QK_ROPE_HEAD_DIM, generator=generator, device="cpu")
+    rope = rope.to(torch.bfloat16)
+    pages = ctx_len // DS32_PAGE_SIZE
+    packed = torch.cat(
+        [t.view(torch.uint8).view(pages, -1) for t in (nope, scale, rope)], dim=1
+    )
+    nope = nope.float().view(ctx_len, 4, -1) * scale[..., None]
+    return torch.cat([nope.flatten(1), rope.float()], dim=1), packed
+
+
 def _check_kv_address(
     pool, page_base, ctx_len, label, persistent, return_lse, max_split, prefill
 ):
@@ -633,9 +686,13 @@ def _check_kv_address(
     q_cpu = torch.randn(
         qlen, HARNESS.nhead, QK_HEAD_DIM, generator=generator, device="cpu"
     ).to(HARNESS.q_dtype)
-    kv_cpu = torch.randn(ctx_len, QK_HEAD_DIM, generator=generator, device="cpu").to(
-        HARNESS.kv_dtype
-    )
+    if HARNESS.ds32:
+        kv_cpu, packed = _ds32_pages(ctx_len, generator)
+    else:
+        kv_cpu = torch.randn(
+            ctx_len, QK_HEAD_DIM, generator=generator, device="cpu"
+        ).to(HARNESS.kv_dtype)
+        packed = kv_cpu.view(ctx_len, NHEAD_KV, QK_HEAD_DIM)
     # Independent of GPU page indexing, including the reference's KV reads.
     # Causal: query token t sees the first ctx_len - qlen + 1 + t rows.
     scores = (q_cpu.float() @ kv_cpu.float().T) * (QK_HEAD_DIM**-0.5)
@@ -646,12 +703,13 @@ def _check_kv_address(
     # The FP8-Q kernels also round P to FP8.
     tol = 6e-2 if HARNESS.use_fp8 else 2e-2
     q = q_cpu.cuda()
-    source = kv_cpu.cuda().view(ctx_len, NHEAD_KV, QK_HEAD_DIM)
-    pool[SAFE_PAGE_BASE : SAFE_PAGE_BASE + ctx_len].copy_(source)
-    placed = pool[page_base : page_base + ctx_len]
+    source = packed.cuda()
+    pages = source.shape[0]
+    pool[SAFE_PAGE_BASE : SAFE_PAGE_BASE + pages].copy_(source)
+    placed = pool[page_base : page_base + pages]
     placed.copy_(source)
     torch.testing.assert_close(
-        placed.cpu().view_as(kv_cpu).float(), kv_cpu.float(), rtol=0, atol=0
+        placed.cpu().view(torch.uint8), packed.view(torch.uint8), rtol=0, atol=0
     )
 
     ret = {"gfx": get_gfx(), "label": label, "passed": True}
