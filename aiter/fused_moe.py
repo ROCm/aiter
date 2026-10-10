@@ -852,7 +852,6 @@ def fused_moe(
     shared_w2_scale: torch.Tensor | None = None,
     shared_expert_id: int = -1,
     stage2_scatter: Stage2ScatterContext | None = None,
-    ep_has_fake_route: bool = False,
     # Optional [M, model_dim] destination for the result, to save the caller a
     # copy. Must be contiguous, match shape/dtype/device and not overlap
     # hidden_states, or the call raises; when given it is what gets returned.
@@ -860,6 +859,7 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
 ):
     if (
         any(
@@ -989,11 +989,11 @@ def fused_moe_fake(
     ep_world_size: int = 0,
     ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    ep_has_fake_route: bool = False,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1051,11 +1051,11 @@ def fused_moe_(
     ep_world_size: int = 0,
     ep_combine_quant: int = 0,
     ep_source_token_map: torch.Tensor | None = None,
-    ep_has_fake_route: bool = False,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1130,11 +1130,11 @@ def _fused_moe_impl(
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
     stage2_scatter: Stage2ScatterContext | None = None,
-    ep_has_fake_route: bool = False,
     output: torch.Tensor | None = None,
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -2972,7 +2972,6 @@ def get_2stage_cfgs(
     is_shuffled=True,
     gate_mode=GateMode.SEPARATED.value,
     is_ep=False,
-    ep_has_fake_route=False,
     has_stage1_bias=False,
     has_stage2_bias=False,
     situ_beta=1.0,
@@ -2986,6 +2985,7 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    ep_has_fake_route=False,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -4128,7 +4128,6 @@ def fused_moe_2stages(
     linear_beta=None,
     gate_mode=GateMode.SEPARATED.value,
     expert_mask=None,
-    ep_has_fake_route=False,
     m_indices=None,
     reverse_sorted=None,
     _metadata_transform: Callable | None = None,
@@ -4138,6 +4137,7 @@ def fused_moe_2stages(
     output=None,
     _stage2_override: Callable | None = None,
     routing_num_experts: int | None = None,
+    ep_has_fake_route=False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
