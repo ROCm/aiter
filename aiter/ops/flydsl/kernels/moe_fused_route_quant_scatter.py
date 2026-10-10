@@ -1656,12 +1656,11 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
     block_iters = L.block_iters
     amax_shuffle_dists = L.amax_shuffle_dists
 
-    if row_major_scale:
-        if not prequantized or ksplit or remap_rows or fuse_ep_psum:
-            raise ValueError(
-                "row_major_scale is the prequantized full-row copy path "
-                "(no ksplit, no remap, no ep psum)"
-            )
+    if row_major_scale and (not prequantized or ksplit or remap_rows or fuse_ep_psum):
+        raise ValueError(
+            "row_major_scale is the prequantized full-row copy path "
+            "(no ksplit, no remap, no ep psum)"
+        )
     if prequantized:
         assert src_scale_bytes_per_row >= L.scale_bytes_per_row, (
             f"src_scale_bytes_per_row {src_scale_bytes_per_row} cannot hold "

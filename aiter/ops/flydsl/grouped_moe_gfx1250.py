@@ -938,8 +938,7 @@ def _grouped_a8w4_tdm_moe(
         and ep_psum_params is None
         and int(tile_m) >= 256
         and int(token_num) >= _rm_min_tokens
-        and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1")
-        in ("1", "true", "True")
+        and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
     )
     _row_major_ascale = (_compact and _prequantized) or _row_major_a1
     # Local quant instead writes one compact row-major row per token and rebuilds
