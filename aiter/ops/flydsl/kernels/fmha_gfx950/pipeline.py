@@ -911,15 +911,15 @@ class DualwaveFp8KernelContext:
             causal_num_tiles = (
                 fx.Index(causal_end_i32) + kv_tile_size - 1
             ) // kv_tile_size
-            max_num_tiles = fx.Index(
-                (causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles)
+            max_num_tiles = (causal_num_tiles < num_kv_tiles).select(
+                causal_num_tiles, num_kv_tiles
             )
         else:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
         max_num_tiles = ((max_num_tiles + 1) // 2) * 2
-        max_num_tiles = fx.Index((max_num_tiles < 4).select(4, max_num_tiles))
+        max_num_tiles = (max_num_tiles < 4).select(4, max_num_tiles)
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -930,14 +930,14 @@ class DualwaveFp8KernelContext:
                 // 2
                 * 2
             )
-            chunk = fx.Index((chunk < 6).select(6, chunk))
+            chunk = (chunk < 6).select(6, chunk)
             split_t0 = self.split_idx * chunk
             split_t_end = split_t0 + chunk
-            split_t_end = fx.Index(
-                (split_t_end < max_num_tiles).select(split_t_end, max_num_tiles)
+            split_t_end = (split_t_end < max_num_tiles).select(
+                split_t_end, max_num_tiles
             )
-            split_t_end = fx.Index(
-                (max_num_tiles - split_t_end < 4).select(max_num_tiles, split_t_end)
+            split_t_end = (max_num_tiles - split_t_end < 4).select(
+                max_num_tiles, split_t_end
             )
             self.split_nonempty = split_t0 + 4 <= max_num_tiles
         else:
@@ -952,7 +952,7 @@ class DualwaveFp8KernelContext:
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
                 in_mask = causal_end_raw_i32 > fx.Int32(0)
                 active = in_mask if active is None else (active & in_mask)
-            split_t_end = fx.Index(active.select(split_t_end, split_t0))
+            split_t_end = active.select(split_t_end, split_t0)
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
