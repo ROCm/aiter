@@ -507,6 +507,7 @@ class AITER_CONFIG:
         )
 
         saved_files = []
+        failed_files = []
         offset = 0
         for src_path, src_df in source_pairs:
             start, end = offset, offset + len(src_df)
@@ -516,21 +517,42 @@ class AITER_CONFIG:
                 drop=True
             )
             if len(new_src_df) < len(src_df):
-                new_src_df.to_csv(src_path, index=False)
+                try:
+                    new_src_df.to_csv(src_path, index=False)
+                except OSError as exc:
+                    # A read-only install or container cannot take the rewrite.
+                    # Letting that escape would replace the diagnostic below
+                    # with a bare PermissionError, dropping the dedup key and
+                    # the env var hint exactly where they are needed most, and
+                    # would also abandon any remaining source half-rewritten.
+                    failed_files.append(f"  {src_path}: {exc}")
+                    continue
                 saved_files.append(
                     f"  {src_path}: {len(src_df)} -> {len(new_src_df)} rows"
                 )
+        if failed_files:
+            outcome = (
+                "Resolved by keeping best performing (lowest 'us') for each key, "
+                "but not every source config file could be rewritten.\n"
+            )
+        else:
+            outcome = (
+                "Auto-resolved by keeping best performing (lowest 'us') for each "
+                "key and saved back to source config files.\n"
+            )
         saved_info = "\n".join(saved_files) if saved_files else "  (no files updated)"
+        failed_info = (
+            "\nNot updated:\n" + "\n".join(failed_files) if failed_files else ""
+        )
         raise RuntimeError(
             dup_header
-            + "Auto-resolved by keeping best performing (lowest 'us') for each "
-            "key and saved back to source config files.\n"
-            "In a source checkout, re-run and commit the updated files. "
+            + outcome
+            + "In a source checkout, re-run and commit the updated files. "
             "In an installed package or container the rewritten files may not "
             "persist, so re-running can hit the same duplicates.\n"
             + env_hint
             + f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
-            f"Updated files:\n{saved_info}"
+            f"Updated files:\n{saved_info}" + failed_info
         )
 
     def update_config_files(

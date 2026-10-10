@@ -34,11 +34,13 @@ Run:
 """
 
 import csv
+import errno
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 try:  # importing aiter requires torch; skip cleanly where it is unavailable.
     from aiter.jit import core
@@ -219,6 +221,34 @@ class TestConfigShapeCollision(unittest.TestCase):
         self.assertIsNotNone(err)
         self.assertIn("dedup key: ['M', 'N', 'K', 'cu_num', 'gfx']", err)
         self.assertIn("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", err)
+
+    def test_duplicate_error_survives_read_only_sources(self):
+        """The dedup write-back runs before the diagnostic is raised, so on a
+        read-only install the write error would replace that diagnostic with a
+        bare PermissionError -- dropping the key and the env var hint in the
+        one environment that cannot act on them anyway (ROCm/aiter#5184), and
+        leaving any remaining source half-rewritten. Report the failure instead
+        and do not claim those files were updated."""
+
+        def _read_only(self, path_or_buf=None, *args, **kwargs):
+            raise PermissionError(errno.EROFS, "Read-only file system", path_or_buf)
+
+        import pandas as pd
+
+        for with_model_file in (True, False):
+            with self.subTest(with_model_file=with_model_file):
+                with mock.patch.object(pd.DataFrame, "to_csv", _read_only):
+                    err = self._run_synthetic(dup=True, with_model_file=with_model_file)
+                self.assertIsNotNone(err)
+                self.assertTrue(
+                    err.startswith("RuntimeError:"),
+                    f"write failure replaced the duplicate diagnostic:\n{err}",
+                )
+                self.assertIn("dedup key: ['M', 'N', 'K', 'cu_num', 'gfx']", err)
+                self.assertIn("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", err)
+                # The unwritten source must not be listed as updated.
+                self.assertIn("Not updated:", err)
+                self.assertIn("(no files updated)", err)
 
     def test_selfcheck_passes_on_clean(self):
         """Negative control: distinct shapes must NOT be flagged (no false
