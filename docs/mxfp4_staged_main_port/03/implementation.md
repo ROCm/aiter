@@ -40,5 +40,20 @@ FP4 scatter; no reference quantization is added to conceal an error.
 
 GPU execution and final measured results are recorded separately under `gpu/`.
 Only the root coordinator launches GPU tasks, with the designated UUID/PCI idle
-gate and one independent process at a time. Current artifacts are implementation
-and controlled evidence until those real tasks complete.
+gate and one independent process at a time. All22 specified pairs completed all4 actions (88 tasks). The two independent
+matching-limit clamp controls also passed, giving90 sequential task records.
+See [the GPU evidence](gpu/README.md) for exact names, numerical errors,
+AOT job configuration, kernel sums, process timing and full traces.
+
+The documented selected-CSV batch path uses a guarded file and the existing
+collector/worker pool. Its31 controlled AOT checks include an independent CPU
+subprocess through the real pool with the external FlyDSL compiler substituted.
+The full default model corpus includes Situv2 and therefore cannot accept a
+custom limit globally; selected compatible CSVs provide matching batch jobs.
+
+Controlled coverage has231 unique cases: the189 recorded default/configuration
+regression cases,2 caller-owned CSV reuse cases,9 additional custom direct/
+bootstrap parameter cases and31 AOT cases. The repeated24 execution checks
+include the prior15 and those9 new cases. Required syntax/Black/Ruff/diff
+checks pass. Omitted public Situv2 API1/1 remains a separate final acceptance
+check; this ticket records the tuner default reference parameters4/25 explicitly.

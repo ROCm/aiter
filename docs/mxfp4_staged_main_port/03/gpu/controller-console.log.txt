@@ -1,0 +1,359 @@
+EXISTING PASS minimax128-bm16-atomic pair
+RUN minimax128-bm16-atomic replay fp80-fp40-limitdefault
+Started GPU7 task pid=423801: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/replay-task
+RUN minimax128-bm16-atomic aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=423997: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/aot-task
+RUN minimax128-bm16-atomic precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=425008: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/precompiled-task
+RUN minimax128-bm32-reduce pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=425307: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/pair-task
+RUN minimax128-bm32-reduce replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=426332: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/replay-task
+RUN minimax128-bm32-reduce aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=426491: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/aot-task
+RUN minimax128-bm32-reduce precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=427131: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/precompiled-task
+RUN minimax2048-bm64-atomic pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=427292: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/pair-task
+RUN minimax2048-bm64-atomic replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=427884: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/replay-task
+RUN minimax2048-bm64-atomic aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=428343: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/aot-task
+RUN minimax2048-bm64-atomic precompiled fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=428827: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/precompiled-task
+RUN minimax2048-bm128-reduce pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=429115: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/pair-task
+RUN minimax2048-bm128-reduce replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=429442: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/replay-task
+RUN minimax2048-bm128-reduce aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=429867: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/aot-task
+RUN minimax2048-bm128-reduce precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=430373: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/precompiled-task
+RUN minimax2048-bm128-scatter pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=430674: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/pair-task
+RUN minimax2048-bm128-scatter replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=431402: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/replay-task
+RUN minimax2048-bm128-scatter aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=431692: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/aot-task
+RUN minimax2048-bm128-scatter precompiled fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=432138: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/precompiled-task
+RUN gpt128-fp8-bm16-k128 pair fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=432425: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm16-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/pair-task
+RUN gpt128-fp8-bm16-k128 replay fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=433209: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm16-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/replay-task
+RUN gpt128-fp8-bm16-k128 aot fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=433496: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm16-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/aot-task
+RUN gpt128-fp8-bm16-k128 precompiled fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=434776: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm16-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/precompiled-task
+RUN gpt128-fp8-bm32-k256 pair fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=435231: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm32-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/pair-task
+RUN gpt128-fp8-bm32-k256 replay fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=435687: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm32-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/replay-task
+RUN gpt128-fp8-bm32-k256 aot fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=436114: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm32-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/aot-task
+RUN gpt128-fp8-bm32-k256 precompiled fp81-fp40-limitdefault
+Started GPU7 task pid=436606: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt128-fp8-bm32-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/precompiled-task
+RUN gpt2048-fp8-bm64-k128 pair fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=436948: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm64-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/pair-task
+RUN gpt2048-fp8-bm64-k128 replay fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=437278: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm64-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/replay-task
+RUN gpt2048-fp8-bm64-k128 aot fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=438013: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm64-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/aot-task
+RUN gpt2048-fp8-bm64-k128 precompiled fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=438882: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm64-k128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/precompiled-task
+RUN gpt2048-fp8-bm128-k256 pair fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=439180: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm128-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/pair-task
+RUN gpt2048-fp8-bm128-k256 replay fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=440936: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm128-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/replay-task
+RUN gpt2048-fp8-bm128-k256 aot fp81-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=442039: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm128-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/aot-task
+RUN gpt2048-fp8-bm128-k256 precompiled fp81-fp40-limitdefault
+Started GPU7 task pid=442698: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp8-bm128-k256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/precompiled-task
+RUN gpt2048-fp4-n128 pair fp80-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=442860: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/pair-task
+RUN gpt2048-fp4-n128 replay fp80-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=443064: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/replay-task
+RUN gpt2048-fp4-n128 aot fp80-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=443642: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/aot-task
+RUN gpt2048-fp4-n128 precompiled fp80-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=444259: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n128.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/precompiled-task
+RUN gpt2048-fp4-n256 pair fp80-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=444693: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/pair-task
+RUN gpt2048-fp4-n256 replay fp80-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=445399: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/replay-task
+RUN gpt2048-fp4-n256 aot fp80-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=445822: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/aot-task
+RUN gpt2048-fp4-n256 precompiled fp80-fp41-limitdefault
+Started GPU7 task pid=446140: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-fp4-n256.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/precompiled-task
+RUN gpt2048-limit5-reduce-clamp pair fp80-fp40-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=446432: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-limit5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/pair.json', '--action', 'pair', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/pair-task
+RUN gpt2048-limit5-reduce-clamp replay fp80-fp40-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=446927: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-limit5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/replay.json', '--action', 'replay', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/replay-task
+RUN gpt2048-limit5-reduce-clamp aot fp80-fp40-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=447213: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-limit5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/aot.json', '--action', 'aot', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/aot-task
+RUN gpt2048-limit5-reduce-clamp precompiled fp80-fp40-limit5
+Started GPU7 task pid=447844: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-limit5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/precompiled.json', '--action', 'replay', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/precompiled-task
+RUN gpt2048-combined7-reduce pair fp81-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=448285: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/pair-task
+RUN gpt2048-combined7-reduce replay fp81-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=448791: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/replay-task
+RUN gpt2048-combined7-reduce aot fp81-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=449206: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/aot-task
+RUN gpt2048-combined7-reduce precompiled fp81-fp41-limitdefault
+Started GPU7 task pid=449712: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/precompiled-task
+RUN gpt2048-combined7-scatter pair fp81-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=450138: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/pair-task
+RUN gpt2048-combined7-scatter replay fp81-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=450440: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/replay-task
+RUN gpt2048-combined7-scatter aot fp81-fp41-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=450729: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/aot-task
+RUN gpt2048-combined7-scatter precompiled fp81-fp41-limitdefault
+Started GPU7 task pid=451423: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined7-scatter.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/precompiled-task
+RUN gpt2048-combined5-reduce-clamp pair fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=451730: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/pair.json', '--action', 'pair', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/pair-task
+RUN gpt2048-combined5-reduce-clamp replay fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=452211: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/replay.json', '--action', 'replay', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/replay-task
+RUN gpt2048-combined5-reduce-clamp aot fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=452635: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/aot.json', '--action', 'aot', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/aot-task
+RUN gpt2048-combined5-reduce-clamp precompiled fp81-fp41-limit5
+Started GPU7 task pid=453278: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-reduce-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/precompiled.json', '--action', 'replay', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/precompiled-task
+RUN gpt2048-combined5-scatter-clamp pair fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=453583: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-scatter-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/pair.json', '--action', 'pair', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/pair-task
+RUN gpt2048-combined5-scatter-clamp replay fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=454030: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-scatter-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/replay.json', '--action', 'replay', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/replay-task
+RUN gpt2048-combined5-scatter-clamp aot fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=454315: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-scatter-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/aot.json', '--action', 'aot', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/aot-task
+RUN gpt2048-combined5-scatter-clamp precompiled fp81-fp41-limit5
+Started GPU7 task pid=454786: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-scatter-clamp.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/precompiled.json', '--action', 'replay', '--swiglu-limit', '5', '--clamp-fixture']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/precompiled-task
+RUN gpt2048-situv2-reduce pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=455055: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-situv2-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/pair-task
+RUN gpt2048-situv2-reduce replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=455522: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-situv2-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/replay-task
+RUN gpt2048-situv2-reduce aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=455950: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-situv2-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/aot-task
+RUN gpt2048-situv2-reduce precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=456638: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-situv2-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/precompiled-task
+RUN minimax128-bm16-reduce pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=456924: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/pair-task
+RUN minimax128-bm16-reduce replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=457480: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/replay-task
+RUN minimax128-bm16-reduce aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=457641: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/aot-task
+RUN minimax128-bm16-reduce precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=458086: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm16-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/precompiled-task
+RUN minimax128-bm32-atomic pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=458519: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/pair-task
+RUN minimax128-bm32-atomic replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=458958: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/replay-task
+RUN minimax128-bm32-atomic aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=459467: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/aot-task
+RUN minimax128-bm32-atomic precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=459858: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/precompiled-task
+RUN minimax2048-bm64-reduce pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=460295: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/pair-task
+RUN minimax2048-bm64-reduce replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=460741: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/replay-task
+RUN minimax2048-bm64-reduce aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=461167: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/aot-task
+RUN minimax2048-bm64-reduce precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=461482: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm64-reduce.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/precompiled-task
+RUN minimax2048-bm128-atomic pair fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=461912: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/pair.json', '--action', 'pair']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/pair-task
+RUN minimax2048-bm128-atomic replay fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=462376: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/replay.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/replay-task
+RUN minimax2048-bm128-atomic aot fp80-fp40-limitdefault
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=462678: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/aot.json', '--action', 'aot']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/aot-task
+RUN minimax2048-bm128-atomic precompiled fp80-fp40-limitdefault
+Started GPU7 task pid=463121: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/minimax2048-bm128-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/precompiled.json', '--action', 'replay']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/precompiled-task
+RUN gpt2048-combined5-atomic pair fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=463409: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/pair.json', '--action', 'pair', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/pair-task
+RUN gpt2048-combined5-atomic replay fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=463989: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/replay.json', '--action', 'replay', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/replay-task
+RUN gpt2048-combined5-atomic aot fp81-fp41-limit5
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=464147: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/aot.json', '--action', 'aot', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/aot-task
+RUN gpt2048-combined5-atomic precompiled fp81-fp41-limit5
+Started GPU7 task pid=464875: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', 'docs/mxfp4_staged_main_port/03/fixtures/gpt2048-combined5-atomic.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/precompiled.json', '--action', 'replay', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/precompiled-task
+All prescribed ticket03 task records completed
