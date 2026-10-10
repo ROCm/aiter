@@ -132,14 +132,17 @@ def main():
     )
     clamp_evidence = None
     if args.clamp_fixture:
+        alternate_limit = 7 if args.swiglu_limit == 5 else 5
         default_reference = tuner._torch_ref(
-            data, shape["topk"], dtypes.bf16, activation, swiglu_limit=7
+            data, shape["topk"], dtypes.bf16, activation, swiglu_limit=alternate_limit
         )
         assert not torch.equal(
             reference, default_reference
         ), "clamp fixture did not distinguish limit5 from7"
         clamp_evidence = {
             "hidden_multiplier": 16,
+            "actual_limit": args.swiglu_limit,
+            "alternate_limit": alternate_limit,
             "reference_limit5_vs7_cosine_diff": float(
                 cosine_diff_compare(reference, default_reference, printLog=False)
             ),
@@ -432,6 +435,13 @@ def main():
             "quant_type": str(QuantType.per_1x32),
             "operations": operations,
             "finite": True,
+            "output_fingerprint": fingerprint(output),
+            "output_scalars": {
+                "sum": float(output.float().sum().item()),
+                "norm": float(output.float().norm().item()),
+                "min": float(output.min().item()),
+                "max": float(output.max().item()),
+            },
             "cosine_diff": error,
             "input_csv_kernel_sum_us": float(row["us"]),
             "synchronized_diagnostic_kernel_sum_with_main_aggregation_us": metric,
