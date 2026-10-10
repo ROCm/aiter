@@ -188,11 +188,64 @@ class TestMxmoeOpusRuntime(unittest.TestCase):
                 )
                 self.assertTrue(any(reason in message for message in logs.output))
 
+    def test_public_explicit_fp4_intermediate_cannot_fall_back_to_fp8(self):
+        torch, a, fm = self.torch, self.aiter, self.fm
+        with patch.object(
+            fm, "moe_sorting", side_effect=AssertionError("sort must not run")
+        ), self.assertRaisesRegex(NotImplementedError, "intermediate precision"):
+            fm.fused_moe(
+                torch.empty((31, 3072), dtype=a.dtypes.bf16),
+                torch.empty((128, 1024, 1536), dtype=a.dtypes.fp4x2),
+                torch.empty((128, 3072, 256), dtype=a.dtypes.fp4x2),
+                torch.empty((31, 4), dtype=a.dtypes.fp32),
+                torch.empty((31, 4), dtype=a.dtypes.i32),
+                dtype=a.dtypes.bf16,
+                quant_type=a.QuantType.per_1x32,
+                quant_dtype_a=a.dtypes.fp8,
+                quant_dtype_a2=a.dtypes.fp4x2,
+                gate_mode="interleave",
+            )
+
+    def test_missing_compiled_bm16_sort_requires_preparation_before_sort(self):
+        torch, a, fm = self.torch, self.aiter, self.fm
+        missing = importlib.import_module(
+            "aiter.ops.moe_mxfp4_aux"
+        )._MissingMxfp4MoeAuxInstances
+        self.g1 = "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out"
+        self.g2 = "opus_moe2_layout_afp8_wfp4_atomic_t16x128x256_sbm16_cache_b3_ws2"
+        self.write_csv(inter_dim=384, block_m=16)
+        w1 = torch.empty((128, 768, 1536), dtype=a.dtypes.fp4x2)
+        w2 = torch.empty((128, 3072, 192), dtype=a.dtypes.fp4x2)
+        w1.is_shuffled = w2.is_shuffled = True
+        with patch.object(
+            fm, "_mxfp4_aux_instance_supported", return_value=False
+        ), patch.object(
+            fm, "moe_sorting", side_effect=AssertionError("sort must not run")
+        ), self.assertRaises(
+            missing
+        ) as context:
+            fm.fused_moe(
+                torch.empty((31, 3072), dtype=a.dtypes.bf16),
+                w1,
+                w2,
+                torch.empty((31, 4), dtype=a.dtypes.fp32),
+                torch.empty((31, 4), dtype=a.dtypes.i32),
+                dtype=a.dtypes.bf16,
+                quant_type=a.QuantType.per_1x32,
+                quant_dtype_a=a.dtypes.fp8,
+                gate_mode="interleave",
+                w1_scale=torch.empty((128 * 768, 96), dtype=a.dtypes.fp8_e8m0),
+                w2_scale=torch.empty((128 * 3072, 16), dtype=a.dtypes.fp8_e8m0),
+            )
+        self.assertEqual(context.exception.missing_instances, ((128, 4, 3072, True),))
+        self.assertIn("aux_sortzi_NE128_TOPK4_MB16_H3072", str(context.exception))
+        self.assertIn("AITER_REBUILD=1", str(context.exception))
+        self.assertFalse(torch.cuda.is_initialized())
+
     def test_unsupported_call_semantics_fall_back(self):
         for kwargs, reason in (
             ({"has_stage2_bias": True}, "stage2 bias"),
             ({"is_ep": True}, "EP"),
-            ({"q_dtype_a2": self.aiter.dtypes.fp4x2}, "FP8 intermediate"),
             ({"opus_weights_shuffled": False}, "is_shuffled"),
             ({"has_num_local_tokens": True}, "num_local_tokens"),
         ):
