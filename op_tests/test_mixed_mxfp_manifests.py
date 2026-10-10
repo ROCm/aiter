@@ -14,14 +14,14 @@ _MANIFESTS = (
         "f6f4gemm_bf16_per1x32Fp6Fp4.csv",
         "mxfp6_mxfp4_c0_256_padk2",
         "a6w4_asm_tuned_gemm.csv",
-        3,
+        25,
     ),
     (
         "f4f6gemm",
         "f4f6gemm_bf16_per1x32Fp4Fp6.csv",
         "mxfp4_c0_mxfp6_256_padk2",
         "a4w6_asm_tuned_gemm.csv",
-        2,
+        24,
     ),
 )
 
