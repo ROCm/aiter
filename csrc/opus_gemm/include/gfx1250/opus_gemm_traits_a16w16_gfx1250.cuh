@@ -2,9 +2,9 @@
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 //
 // Traits + kargs for the gfx1250 a16w16 cluster/TDM split-K pipeline that
-// reduces via an fp32 WORKSPACE + a separate REDUCE kernel (no atomic_add,
-// no self-clear, no semaphore). The workspace buffer is allocated externally
-// (torch.empty on the Python side) and passed as a direct pointer in kargs.
+// reduces via a per-kid bf16/fp32 WORKSPACE + a separate REDUCE kernel (no
+// atomic_add, no self-clear, no semaphore). The caller-owned typed workspace
+// is passed as a direct pointer in kargs.
 //
 // This header is the SINGLE source of truth for every compile-time constant
 // the pipeline needs: the pipeline file
@@ -33,31 +33,16 @@ constexpr int kCtdmLayoutTileN = 0;
 constexpr int kCtdmLayoutTileM = 1;
 }  // namespace opus_gfx1250
 
-
-#ifndef OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-#define OPUS_GEMM_SPLITK_WS_HANDLE_DEFINED
-// Indirection slot for the split-K fp32 workspace pointer. Captured HIP
-// graphs hold the slot address (stable), not the workspace ptr, so a
-// post-capture grow + hipFree of the old buffer doesn't dangle the graph.
-struct opus_splitk_ws_handle {
-    void*         ptr;    // current backing workspace; null until first grow
-    unsigned long bytes;  // current capacity in bytes
-};
-#endif
-
 #ifndef OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
 #define OPUS_GEMM_CLUSTER_TDM_WS_KARGS_GFX1250_DEFINED
 // Kernel arguments for the gfx1250 a16w16 cluster/TDM split-K (workspace)
-// pipeline. The main kernel writes partial sums (bf16 by default) into
-// ptr_ws laid out as [split_k, padded_M, padded_N] (per host launch;
-// batch handled by a per-batch host launch with pointer offsets). The reduce
-// kernel consumes it, folds bias once, casts to Y dtype, writes C[M, N].
-// The workspace buffer is allocated externally (torch.empty on the Python
-// side) and passed in directly -- no indirection through a handle struct.
+// pipeline. The main kernel writes D_WS partial sums into ptr_ws laid out as
+// [split_k, padded_M, padded_N]. The reduce kernel consumes them,
+// re-accumulates in fp32, folds bias once, casts to Y dtype, and writes C[M,N].
 struct opus_gemm_cluster_tdm_ws_kargs_gfx1250 {
     const void* __restrict__ ptr_a;          // bf16 [M, K]
     const void* __restrict__ ptr_b;          // bf16 [N, K] (A @ B^T)
-    void*       __restrict__ ptr_ws;         // workspace [split_k, padded_M, padded_N]
+    void*       __restrict__ ptr_ws;         // D_WS [split_k, padded_M, padded_N]
     void*       __restrict__ ptr_c;          // bf16/fp32 [M, N] (filled by reduce kernel)
     const void* __restrict__ ptr_bias;       // consumed by reduce kernel only
     int m;
@@ -111,54 +96,27 @@ struct opus_gemm_splitk_fuse_kargs_gfx1250
 
 #ifndef OPUS_GEMM_4WAVE_COMPUTE_KARGS_GFX1250_DEFINED
 #define OPUS_GEMM_4WAVE_COMPUTE_KARGS_GFX1250_DEFINED
-// Kernel arguments for the gfx1250 a16w16 SYMMETRIC 4-wave compute pipeline
-// (kernel_tag a16w16_4wave_co). Shorter than the split-K kargs above because
-// this pipeline has no workspace, no split_k and no bias: every wave both
-// TDM-loads and runs WMMA, and bf16 C is stored straight out through LDS.
-//
-// This kernel is compiled by HIP (not hand-written asm), so it uses the plain
-// C++ kernarg ABI -- do NOT add `packed` or p2/p3 padding members the way the
-// asm .co kargs structs do. Host and device share this one definition, so the
-// two cannot drift.
-// EXACTLY 64 BYTES, and it must stay that way: built with -D__HIPCC_RTC__ the
-// .co has a single by-value kernarg and no hidden/implicit args, so this struct
-// IS the kernarg segment. build_info.json records kernarg_segment_size, which
-// makes "still 64" the regression signal that the ABI has not drifted.
-//
-// The batch strides are 64-bit ELEMENT counts: they cross 2^31 at 4 GiB of bf16,
-// and int arithmetic there is UB long before the hardware minds. The budget for
-// that came from dropping two fields rather than growing the struct:
-//   * a batch COUNT -- grid.z already carries it, the kernel never read it;
-//   * a C batch stride -- the kernel derives m * stride_c, which also stays
-//     correct for a row-padded C, unlike the M * N the host used to pass.
+// Exact kernarg ABI baked into every pre-built 4wave CO image. Batch strides
+// are 64-bit element counts; grid.z carries the batch count and C's batch
+// stride is derived from m * stride_c in the device pipeline.
 struct opus_gemm_4wave_compute_kargs_gfx1250 {
-    const void* __restrict__ ptr_a;   //  0  bf16 [batch, M, K]
-    const void* __restrict__ ptr_b;   //  8  bf16 [batch, N, K]  (C = A * B^T)
-    void*       __restrict__ ptr_c;   // 16  bf16 [batch, M, N]
-    int64_t stride_a_batch;           // 24  = M * stride_a
-    int64_t stride_b_batch;           // 32  = N * stride_b
+    const void* __restrict__ ptr_a;   //  0: bf16 [batch, M, K]
+    const void* __restrict__ ptr_b;   //  8: bf16 [batch, N, K]
+    void*       __restrict__ ptr_c;   // 16: bf16 [batch, M, N]
+    int64_t stride_a_batch;           // 24
+    int64_t stride_b_batch;           // 32
     int m;                            // 40
     int n;                            // 44
     int k;                            // 48
-    int stride_a;                     // 52  A row pitch (>= K)
-    int stride_b;                     // 56  B row pitch (>= K)
-    int stride_c;                     // 60  C row pitch (>= N)
+    int stride_a;                     // 52
+    int stride_b;                     // 56
+    int stride_c;                     // 60
 };
 static_assert(sizeof(opus_gemm_4wave_compute_kargs_gfx1250) == 64,
-              "the 4wave_co kernarg segment is baked into the pre-built .co at "
-              "64 bytes -- changing this size means rebuilding gen_co/*/*.co");
+              "the pre-built 4wave CO kernarg ABI must remain 64 bytes");
 #endif
 
-// ── 4wave_compute user traits ───────────────────────────────────────────────
-// The compile-time config for the symmetric 4-wave pipeline. Member names are
-// the UPPER_CASE spellings the pipeline body already reads, kept verbatim from
-// the standalone kernel this was ported from: the register pinning in that body
-// is fragile enough (see the pipeline header) that renaming through it is not
-// worth the risk. k-prefixed aliases are added for the host launcher, which
-// follows the aiter convention.
-//
-// CLUSTER_WG_M / CLUSTER_WG_N are template parameters rather than the hardcoded
-// 4/4 of the standalone, so the instance table can sweep cluster geometry.
+// Host-visible configuration shared with the offline 4wave device build.
 template<int BLOCK_SIZE_,
          int B_M_, int B_N_, int B_K_,
          int NUM_SLOTS_,
@@ -166,98 +124,62 @@ template<int BLOCK_SIZE_,
          int CLUSTER_WG_M_ = 4,
          int CLUSTER_WG_N_ = 4>
 struct opus_a16w16_4wave_compute_traits_gfx1250 {
-    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;   // 128 = 4 waves x 32
-
+    static constexpr int BLOCK_SIZE = BLOCK_SIZE_;
     static constexpr int B_M = B_M_;
     static constexpr int B_N = B_N_;
     static constexpr int B_K = B_K_;
 
-    using D_A   = D_A_;
-    using D_B   = D_B_;
-    using D_C   = D_C_;
+    using D_A = D_A_;
+    using D_B = D_B_;
+    using D_C = D_C_;
     using D_ACC = D_ACC_;
+    using DataA = D_A;
+    using DataB = D_B;
+    using DataC = D_C;
+    using DataAcc = D_ACC;
     static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
 
-    static constexpr int VEC_A = 16 / (int)sizeof(D_A);   // 8 for bf16 (b128 ds_read)
+    static constexpr int VEC_A = 16 / (int)sizeof(D_A);
     static constexpr int VEC_B = 16 / (int)sizeof(D_B);
-
-    // LDS prefetch ring depth. The pipeline keeps 2 TDMs in flight and reuses
-    // slot g%P three steps later, so P >= 3 keeps g, g+1, g+2 distinct.
     static constexpr int NUM_SLOTS = NUM_SLOTS_;
-    // How many slots the K loop may use is a property of the PIPELINE, not of the
-    // geometry, so each pipeline asserts its own bound.
-    static_assert(NUM_SLOTS >= 2, "the ring needs at least two slots");
+    static_assert(NUM_SLOTS >= 2, "the LDS ring needs at least two slots");
 
-    // Cluster-launch multicast geometry: a CLUSTER_WG_M x CLUSTER_WG_N grid of
-    // workgroups per cluster. A is multicast to the CLUSTER_WG_N peers sharing
-    // an M row, B to the CLUSTER_WG_M peers sharing an N column.
     static constexpr int CLUSTER_WG_M = CLUSTER_WG_M_;
     static constexpr int CLUSTER_WG_N = CLUSTER_WG_N_;
-    // TDM multicast fans out to at most 5 WGs per group, and the per-cluster
-    // workgroup_mask is 16-bit.
     static_assert(CLUSTER_WG_M >= 1 && CLUSTER_WG_N >= 1 &&
                   CLUSTER_WG_M <= 5 && CLUSTER_WG_N <= 5 &&
                   CLUSTER_WG_M * CLUSTER_WG_N <= 16,
                   "cluster dims must be 1..5 per side and <= 16 WGs total");
 
-    // TDM/LDS pad: +16B (one PAD_ELEMS group) per B_K row -> bank-conflict-free
-    // b128 ds_read. Only the ELEMENT geometry lives here, because that is all the
-    // host needs to size LDS; the D# pad_interval/pad_amount encoding is derived
-    // by opus::tdm_traits::padding_auto, and the pipeline static_asserts that its
-    // pitch matches SMEM_PITCH so the two can never drift.
-    static_assert((B_K & (B_K - 1)) == 0, "B_K must be a power of 2 for a single pad per row");
-    static constexpr int PAD_ELEMS    = 16 / (int)sizeof(D_A);   // 8 bf16 = +16B
-    static constexpr int SMEM_PITCH   = B_K + PAD_ELEMS;
-
-    // One LDS slot holds the full B_M x B_K (A) / B_N x B_K (B) tile.
+    static_assert((B_K & (B_K - 1)) == 0,
+                  "B_K must be a power of two for the TDM padding scheme");
+    static constexpr int PAD_ELEMS = 16 / (int)sizeof(D_A);
+    static constexpr int SMEM_PITCH = B_K + PAD_ELEMS;
     static constexpr int SLOT_BYTES_A = B_M * SMEM_PITCH * (int)sizeof(D_A);
     static constexpr int SLOT_BYTES_B = B_N * SMEM_PITCH * (int)sizeof(D_B);
-    static constexpr int SEG_BYTES_A  = NUM_SLOTS * SLOT_BYTES_A;
-    static constexpr int SEG_BYTES_B  = NUM_SLOTS * SLOT_BYTES_B;
+    static constexpr int SEG_BYTES_A = NUM_SLOTS * SLOT_BYTES_A;
+    static constexpr int SEG_BYTES_B = NUM_SLOTS * SLOT_BYTES_B;
     static constexpr int SEG_BYTES_AB = SEG_BYTES_A + SEG_BYTES_B;
 
-    // 1-WG/CU enforcement via LDS padding, the same trick the split-K traits use
-    // below. This pipeline is only correct at one workgroup per CU: every tile
-    // whose A/B segments fit twice in the 320 KB budget (<= 160 KB) raced --
-    // non-deterministically wrong at large grids, in BOTH this and the
-    // wave-layout pipeline. Padding past 160 KB so a second workgroup cannot
-    // co-reside fixes it; the pad tail is never accessed.
-    //
-    // That occupancy is the variable (rather than tile size or register
-    // pressure) is pinned down by a control group: 71 variants whose registers
-    // would admit two waves per SIMD but whose LDS does not are all correct,
-    // while the 61 where both admit two are all wrong. Both races behind it -- a
-    // write-after-read on the ring and a trailing "zero-extent" transfer that
-    // zero-fills the slot C stages in -- are fixed; the pad stays only because
-    // dropping it is a per-shape performance trade. See KNOWN_ISSUES.md issue 1.
-    // -DOPUS_CO_NO_1WG_PAD drops it, back to 2 WG/CU, for re-measuring.
-    static constexpr int kHalfLds     = 160 * 1024;
+    // Enforce the one-WG/CU occupancy used to validate the shipped images.
+    static constexpr int kHalfLds = 160 * 1024;
 #ifdef OPUS_CO_NO_1WG_PAD
-    static constexpr int LDS_BYTES    = SEG_BYTES_AB;
+    static constexpr int LDS_BYTES = SEG_BYTES_AB;
 #else
-    static constexpr int LDS_BYTES    =
+    static constexpr int LDS_BYTES =
         (SEG_BYTES_AB <= kHalfLds) ? (kHalfLds + 1024) : SEG_BYTES_AB;
 #endif
     static_assert(LDS_BYTES <= 320 * 1024, "LDS exceeds the 320KB/CU budget");
 
-    // aiter-convention aliases for the host launcher (which never sees the
-    // pipeline header, only this one).
-    static constexpr int kBlockM        = B_M;
-    static constexpr int kBlockN        = B_N;
-    static constexpr int kBlockK        = B_K;
-    static constexpr int kNumSlots      = NUM_SLOTS;
-    static constexpr int kClusterWgM    = CLUSTER_WG_M;
-    static constexpr int kClusterWgN    = CLUSTER_WG_N;
+    static constexpr int kBlockM = B_M;
+    static constexpr int kBlockN = B_N;
+    static constexpr int kBlockK = B_K;
+    static constexpr int kNumSlots = NUM_SLOTS;
+    static constexpr int kClusterWgM = CLUSTER_WG_M;
+    static constexpr int kClusterWgN = CLUSTER_WG_N;
     static constexpr int kLdsTotalBytes = LDS_BYTES;
 };
 
-// ── 4wave with a CONFIGURABLE WAVE LAYOUT (a16w16_4wave_wl_co) ──────────────
-// Same geometry as the traits above plus TILE_M x TILE_N, the shape in which the
-// four waves tile the block. TILE_M * TILE_N == 4 (checked in the pipeline).
-// (4, 1) reproduces the fixed layout of the reference traits, so the two agree
-// wherever they overlap; the pipeline that reads this one is
-// opus_gemm_pipeline_a16w16_4wave_wl_gfx1250.cuh. kargs are shared -- the block
-// geometry lives entirely here, so the kernarg struct never changes.
 template<int BLOCK_SIZE_,
          int B_M_, int B_N_, int B_K_,
          int NUM_SLOTS_,
@@ -267,20 +189,21 @@ template<int BLOCK_SIZE_,
          int TILE_M_ = 4,
          int TILE_N_ = 1>
 struct opus_a16w16_4wave_wl_traits_gfx1250
-    : opus_a16w16_4wave_compute_traits_gfx1250<BLOCK_SIZE_, B_M_, B_N_, B_K_, NUM_SLOTS_,
-                                               D_A_, D_B_, D_C_, D_ACC_,
-                                               CLUSTER_WG_M_, CLUSTER_WG_N_> {
+    : opus_a16w16_4wave_compute_traits_gfx1250<
+          BLOCK_SIZE_, B_M_, B_N_, B_K_, NUM_SLOTS_,
+          D_A_, D_B_, D_C_, D_ACC_, CLUSTER_WG_M_, CLUSTER_WG_N_> {
     static constexpr int TILE_M = TILE_M_;
     static constexpr int TILE_N = TILE_N_;
 };
 
 // ── User-facing traits = the SINGLE compile-time config the pipeline reads ──
-//   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_C MUST be float (main kernel
-//   writes the fp32 workspace; the reduce kernel casts to the final Y dtype).
+//   D_A=D_B=bf16, D_ACC=float (WMMA fp32 acc), D_WS is bf16 or fp32.
+//   The main kernel casts its accumulator to D_WS and the reducer reads the
+//   same physical type before re-accumulating in fp32.
 template<int BLOCK_SIZE_,
          int B_M_, int B_N_, int B_K_,
          int LAYOUT_,
-         typename D_A_, typename D_B_, typename D_C_, typename D_ACC_,
+         typename D_A_, typename D_B_, typename D_WS_, typename D_ACC_,
          bool ENABLE_BIAS_ = false,
          int NUM_SLOTS_ = 3,
          int WG_PER_CU_ = 2,
@@ -295,18 +218,18 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
 
     using D_A   = D_A_;
     using D_B   = D_B_;
-    using D_C   = D_C_;                                // workspace dtype
+    using D_WS  = D_WS_;
     using D_ACC = D_ACC_;
     static_assert(std::is_same<D_A, D_B>::value, "A/B dtype must match");
-    // D_C is the split-K PARTIAL type, not the output dtype -- the reduce picks the
-    // output. Either width is legal; the kid table chooses (splitk_workspace_dtype).
-    static_assert(std::is_same<D_C, float>::value || std::is_same<D_C, __bf16>::value,
-                  "cluster_tdm_splitk_ws partial workspace must be float or __bf16");
+    static_assert(std::is_same<D_WS, D_A>::value ||
+                      std::is_same<D_WS, D_ACC>::value,
+                  "cluster_tdm_splitk_ws D_WS must be bf16 input storage or "
+                  "fp32 accumulator storage");
 
     // Aliases used by the pipeline / layout helpers.
     using DataA   = D_A;
     using DataB   = D_B;
-    using DataC   = D_C;
+    using DataWS  = D_WS;
     using DataAcc = D_ACC;
 
     static constexpr int VEC_A = 16 / (int)sizeof(D_A);   // 8 for bf16
@@ -424,8 +347,9 @@ struct opus_cluster_tdm_splitk_ws_traits_gfx1250 {
     // gfx1250 LDS max ~320KB.
     static_assert(kLdsTotalBytes <= 320 * 1024, "LDS exceeds 320KB");
 
-    // Workspace plain store: fp32 dwordx4.
-    static constexpr int kCVec = 16 / (int)sizeof(DataAcc);      // 4 (fp32)
+    // Four workspace elements per issue. This preserves the accumulator
+    // register partition for both bf16 and fp32 storage.
+    static constexpr int kCVec = 4;
 
     // ── Warp-derived WMMA register-decomposition constants ───────────────────
     // (computed from kWarpRt so device/host passes match)

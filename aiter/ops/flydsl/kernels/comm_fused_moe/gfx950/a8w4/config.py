@@ -89,6 +89,7 @@ class MegakernelConfig:
     service_tile_group: int = 1
     producer_mode: str = "routes"
     flat_producer_grid: bool = False
+    sorted_input: bool = False
 
     def __post_init__(self):
         if self.m <= 0:
@@ -449,6 +450,7 @@ class WindowConfig:
     local_workers: int
     reduce_scatter_grid: int
     all_gather_grid: int
+    sorted_input: bool = False
 
     def __post_init__(self):
         if self.m <= 0:

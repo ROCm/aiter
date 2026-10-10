@@ -1,0 +1,211 @@
+#!/usr/bin/env bash
+# Headless review of one PR: fetch -> GLM worker -> GLM refuter -> gates -> collect.
+# Lives in the review-pr skill dir and drives the rest of the skill (calls its fetch.sh and
+# triage.py). Pure GLM on the box (claude-glm), no claude-mix. Publishing is a separate step
+# (_publish.py); this script does not publish.
+#
+# This is the backend of the @aiter-bot review workflow, and can also be run by hand.
+#
+# ⚠️ Must run in a plain terminal / the runner, NOT inside an auto-mode Claude session — the
+#    auto-mode classifier blocks a headless sub-agent launched with
+#    --dangerously-skip-permissions as "Create Unsafe Agents". A runner is a plain shell.
+#
+# ⚠️ Cross-family strength: worker and refuter are both GLM (same family) here. The refuter's
+#    value comes from being a different family (Opus) catching the GLM worker's mistakes. Pure
+#    GLM is weaker adversarially; point REFUTER_CMD at Opus to restore the cross-family check.
+set -euo pipefail
+
+PR="${1:?usage: run_one.sh <pr> [owner/repo]}"
+REPO="${2:-ROCm/aiter}"
+SKILL="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .claude/skills/review-pr
+PROJ="$(git -C "$SKILL" rev-parse --show-toplevel)"     # repo root
+STATUS="${GITHUB_WORKSPACE:-$PROJ}/.aiter-review-status"
+rm -f "$STATUS"   # fresh run: never inherit a previous run's verdict
+# GUARANTEE a responsible person is always identified: any non-zero exit OR a signal kill (the
+# agent/job timeout kills with SIGTERM, which skips a plain EXIT trap) that did NOT classify
+# itself still leaves a status so _notify.py routes it -- to the bot owner (flow) for triage --
+# instead of dying silently. Trap both the exit and the terminating signals.
+_on_exit() { local ec=$?; [ "$ec" -ne 0 ] && [ ! -f "$STATUS" ] && printf "flow\trun_one exited unexpectedly (code %s) with no classified failure -- see the job log\n" "$ec" > "$STATUS"; return 0; }
+_on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal (likely the job or agent timeout) -- see the job log\n" > "$STATUS"; exit 143; }
+trap _on_exit EXIT
+trap _on_signal TERM INT
+
+# The workflow's timeout-minutes is the real ceiling: AGENT_TIMEOUT x RETRIES x (worker+refuter)
+# can exceed it, and a run killed at the job cap dies mid-agent with no classified status. Cap the
+# retries against a deadline that sits inside it instead. Anchored here, at the start: the fetch,
+# the prompt check and the health probe all spend the same wall clock the agents do, and a budget
+# that starts counting after them can still overrun the job cap.
+: "${AITER_RUN_BUDGET:=6000}"      # 100 min, under the job's timeout-minutes of 120
+: "${AITER_AGENT_TIMEOUT:=2400}"   # 40 min per agent attempt; one default, read everywhere below
+DEADLINE=$(( $(date +%s) + AITER_RUN_BUDGET ))
+
+# GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.
+# The container runs as root; declare the docker sandbox so headless tools work.
+export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 CLAUDE_GLM_QUIET=1 IS_SANDBOX=1 PYTHONUTF8=1
+# Kernel validation off unless a GPU of the matching arch is present; report the gap honestly.
+export REVIEW_AUTO_VALIDATE="${REVIEW_AUTO_VALIDATE:-0}"
+
+# gh's own login may be broken (GraphQL 401 observed) while ~/.git-credentials is fine. If so,
+# hold the token in a PLAIN var and hand it only to fetch.sh's env below -- never `export` it, or
+# the headless review agent (--dangerously-skip-permissions on untrusted PR content) inherits a
+# GitHub token from its environment. RUNNER-SETUP.md's GH_CONFIG_DIR path avoids needing this.
+GH_FALLBACK_TOK=""
+if ! gh api repos/"$REPO" --jq .full_name >/dev/null 2>&1; then
+  GH_FALLBACK_TOK=$(sed -n 's#https://\([^:]*\):\([^@]*\)@github.com#\2#p' ~/.git-credentials | head -1)
+fi
+
+# The box's Claude entrypoint. Default is claude-glm (resolves a remote GLM over a tunnel);
+# on a box that hosts GLM itself, set AITER_REVIEW_AGENT to a local `claude` pointed at the
+# on-box endpoint (ANTHROPIC_BASE_URL=http://localhost:<port>), so no tunnel/wrapper is needed.
+AGENT="${AITER_REVIEW_AGENT:-claude-glm}"
+WORKER_CMD=("$AGENT" -p --dangerously-skip-permissions)
+# Cross-family (restores the refuter's value): set AITER_REVIEW_REFUTER_AGENT to an Opus entrypoint.
+REFUTER_CMD=("${AITER_REVIEW_REFUTER_AGENT:-$AGENT}" -p --dangerously-skip-permissions)
+say() { echo "[run_one #$PR] $*"; }
+# Classify a failed review and expose it so the notify step @-mentions the RIGHT owner:
+#   atom -> GLM/backend (honglie) | flow -> this review pipeline (bot owner) | env -> runner box.
+# Writes <class>TAB<message> to the status file the workflow reads, plus an ::error annotation.
+fail() {  # <class> <exit-code> <message...>
+  local cls="$1" code="$2"; shift 2
+  say "$*"
+  echo "::error title=aiter-bot::[$cls] $*"
+  printf '%s\t%s\n' "$cls" "$*" > "$STATUS"
+  exit "$code"
+}
+
+# Fail fast if the prompts have drifted from SKILL.md (they quote it verbatim).
+python3 "$SKILL/check_prompts.py" >/dev/null || fail flow 4 "prompts drifted from SKILL.md -- regenerate the prompt copies (check_prompts.py)"
+
+# GLM health-gate: a review is worthless if the backend is down, and a dead GLM otherwise
+# hangs ~40s per agent call and dies silently mid-review. When a direct endpoint is configured
+# (ANTHROPIC_BASE_URL, i.e. an on-box GLM), deep-probe it with a REAL 1-token inference — not
+# the shallow /health, which stays green while inference is wedged — and fail fast with a clear
+# signal. claude-glm mode resolves its own endpoint, so there is nothing to probe here.
+if [ -n "${ANTHROPIC_BASE_URL:-}" ]; then
+  say "GLM health probe..."
+  _code=$(curl -s -m "${AITER_GLM_PROBE_TIMEOUT:-30}" --noproxy '*' \
+    "$ANTHROPIC_BASE_URL/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d "{\"model\":\"${ANTHROPIC_MODEL:-/models/GLM-5.3}\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":1}" \
+    -o /dev/null -w '%{http_code}' 2>/dev/null || true)
+  if [ "$_code" != "200" ]; then
+    fail glm 5 "GLM backend unavailable at $ANTHROPIC_BASE_URL (deep inference probe returned '$_code')"
+  fi
+  say "GLM ok"
+fi
+
+# 1) fetch (the skill's own Step-1 fetcher) -> WORK dir
+say "fetch..."
+FL="$(mktemp)"
+if [ -n "$GH_FALLBACK_TOK" ]; then
+  (cd "$PROJ" && GH_TOKEN="$GH_FALLBACK_TOK" GITHUB_TOKEN="$GH_FALLBACK_TOK" bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
+else
+  (cd "$PROJ" && bash "$SKILL/fetch.sh" "$PR" "$REPO") 2>&1 | tee "$FL"
+fi
+W="$(grep -oE 'WORK=[^[:space:]]+/review-pr-[A-Za-z0-9]+' "$FL" | tail -1 | cut -d= -f2)"
+rm -f "$FL"
+[ -n "$W" ] && [ -d "$W" ] || fail env 1 "fetch produced no WORK dir -- check gh auth/token, network, git and disk on the runner"
+
+# applies.txt fix: the skill's fetch.sh checks `git apply` against PROJECT_ROOT's worktree but
+# reports it as the merge target; re-check on the merge-target worktree checked out at BASE_SHA.
+if [ -d "$W/merge-target" ]; then
+  BASE=$(grep -oE '[0-9a-f]{40}' "$W/merge_target.txt" 2>/dev/null | head -1)
+  if git -C "$W/merge-target" -c core.fileMode=false apply --check "$W/pr.diff" 2>"$W/.err2"; then
+    echo "APPLIES: the diff still applies to merge target $BASE (rechecked on the merge-target worktree)" > "$W/applies.txt"
+  else
+    { echo "STALE: no longer applies to merge target $BASE -- the PR needs a rebase,"
+      echo "  and any CI result on it describes a tree that has moved"
+      sed 's/^/  /' "$W/.err2"; } > "$W/applies.txt"
+  fi
+fi
+say "WORK=$W"
+
+# The GLM backend can be slow or time out on a shared box. Give each agent AITER_AGENT_TIMEOUT
+# (default 2400s / 40min). A *timeout* is never retried -- a slow generation is slow on retry too;
+# only a transient failure (dropped connection / 5xx) is retried, up to AITER_REVIEW_RETRIES
+# (default 2) attempts, requiring a non-empty output file to count the attempt as success.
+run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
+  local label="$1" pf="$2" out="$3"; shift 3
+  local n=0 max="${AITER_REVIEW_RETRIES:-2}" rc
+  while :; do
+    # Never start an attempt that cannot finish inside the run budget. The job cap would kill it
+    # mid-flight, and a run killed there dies with no classified status at all -- worse than the
+    # timeout it would have reported. Out of budget is a timeout, so say 124 and let the caller
+    # treat it like one.
+    if [ $(( $(date +%s) + ${AITER_AGENT_TIMEOUT} )) -gt "$DEADLINE" ]; then
+      # Out of budget is reported as a timeout so the caller does not retry it, but the two have
+      # opposite fixes -- record which one happened so the page names the knob that helps.
+      AGENT_TIMEOUT_CAUSE=budget
+      say "$label: not enough run budget left to start an attempt"; return 124
+    fi
+    n=$((n + 1)); rm -f "$out"
+    (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT}" "$@" "$(cat "$pf")"); rc=$?
+    [ "$rc" -eq 0 ] && [ -s "$out" ] && return 0
+    if [ "$rc" -eq 124 ]; then
+      AGENT_TIMEOUT_CAUSE=agent
+      say "$label hit the ${AITER_AGENT_TIMEOUT}s timeout -- not retrying a timeout"; return 124
+    fi
+    if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error?)"; return 1; fi
+    say "$label attempt $n failed (rc=$rc, transient?); retrying in $((n * 10))s"; sleep $((n * 10))
+  done
+}
+
+# Triage an agent failure. A timeout is this pipeline's own budget, not a backend fault, so it
+# routes to flow -- a review that needs longer must never page the model owner.
+agent_fail() {  # <label> <rc> <exit-code-for-a-backend-fault>
+  if [ "$2" -eq 124 ]; then
+    if [ "${AGENT_TIMEOUT_CAUSE:-}" = budget ]; then
+      fail flow 6 "the $1 never started: AITER_RUN_BUDGET=${AITER_RUN_BUDGET}s for the whole run was already spent. Raising AITER_AGENT_TIMEOUT makes this refusal fire sooner, not later -- raise the budget and the job's timeout-minutes together"
+    fi
+    fail flow 6 "the $1 did not finish within AITER_AGENT_TIMEOUT=${AITER_AGENT_TIMEOUT}s; the backend answered normally -- raise it in the runner .env"
+  fi
+  fail glm "$3" "the GLM $1 failed -- the backend errored or returned nothing"
+}
+
+# 2) worker (headless GLM), with retry on a transient GLM failure
+say "worker (GLM)..."
+bash "$SKILL/render.sh" worker "$W" > "$W/_pw.txt"
+run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || agent_fail worker $? 2
+
+# 3) refuter (headless GLM) -- Step 7.7; or the NONE line for a 0-finding card
+say "refuter..."
+if grep -qiE '(NO FINDINGS|✅)' "$W/card.md" && ! grep -qE '^(🔴|⚠️|📝)' "$W/card.md"; then
+  printf 'NONE AVAILABLE -- 0 findings on the card (NO FINDINGS); nothing for an independent reader to refute\n' > "$W/independent.txt"
+else
+  bash "$SKILL/render.sh" refuter "$W" "$W/card.md" > "$W/_prf.txt"
+  # errexit is on: a bare `run_agent ...; rc=$?` exits the script on the first non-zero return,
+  # so everything below -- the downgrade and the triage both -- would never run.
+  rc=0; run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    # card.md is already written and the findings are real work; a refuter timeout must not throw
+    # it away. Degrade onto the gate's own "no independent reader" path, which only passes if the
+    # card admits it -- so the downgrade reaches the reader instead of hiding in the log.
+    say "refuter hit the ${AITER_AGENT_TIMEOUT}s timeout -- publishing the card unrefuted"
+    printf 'NONE AVAILABLE -- the refuter did not finish within %ss on this box\n' "${AITER_AGENT_TIMEOUT}" > "$W/independent.txt"
+    sed -i '0,/^Review (advisory):/s//Review (advisory, not independently refuted):/' "$W/card.md"
+    # That sed is anchored to one literal shape of a model-generated line. If the card bolds or
+    # indents it the edit silently does nothing, the gate finds no admission, and a known-good
+    # card is discarded -- the exact loss this branch exists to prevent. Say it unconditionally.
+    grep -q 'not independently refuted' "$W/card.md" \
+      || sed -i '1i Review (advisory, not independently refuted): the refuter did not finish' "$W/card.md"
+  elif [ "$rc" -ne 0 ]; then
+    agent_fail refuter "$rc" 3
+  fi
+fi
+
+# 3b) apply the refuter's verdicts: drop KILLED findings from the card before the gates, or the
+# independent gate red-fails every review whose refuter did its job (kills a finding). No-op on a
+# 0-finding card (NONE AVAILABLE) or a count mismatch.
+python3 "$SKILL/_apply_refutation.py" "$W/card.md" "$W/independent.txt"
+
+# 4) gates + collect (call the python directly; no thin shell wrappers)
+say "gates..."
+python3 "$SKILL/_gates.py" "$W" "$PROJ"
+say "collect..."
+python3 "$SKILL/_collect.py" "$W"
+
+# Clean up the scratch WORK dir + its worktrees on success (set -e keeps it on failure for debug).
+for wt in "$W/merge-target" "$W/head"; do [ -d "$wt" ] && git -C "$PROJ" worktree remove --force "$wt" 2>/dev/null || true; done
+rm -rf "$W"
+git -C "$PROJ" worktree prune 2>/dev/null || true
+
+say "done. report in $SKILL/reports/PR-$PR/ (uncommitted, unpublished)"

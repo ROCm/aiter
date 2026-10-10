@@ -9,6 +9,7 @@ import triton.language as tl
 from triton.backends.compiler import GPUTarget
 from triton.tools.compile import CompileArgs, compile_kernel
 
+from aiter import logger
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.utility.triton.triton_metadata_redirect import (
     AOTMetadataContext,
@@ -5778,7 +5779,7 @@ aot_kernel0_hsaco = [
 
 def test_f32_kernel():
     with tempfile.TemporaryDirectory() as temp_dir:
-        print("temp_dir:", temp_dir)
+        logger.info("temp_dir: %s", temp_dir)
 
         # write hsaco
         hsaco_file = os.path.join(temp_dir, "empty_kernel.hsaco")
@@ -5806,7 +5807,7 @@ def test_f32_kernel():
 
 def test_jit():
     with tempfile.TemporaryDirectory() as temp_dir:
-        print("temp_dir:", temp_dir)
+        logger.info("temp_dir: %s", temp_dir)
 
         # write hsaco
         hsaco_file = os.path.join(temp_dir, "empty_kernel.hsaco")
@@ -5832,7 +5833,7 @@ def test_jit():
 
 def test_separate_compile_and_run():
     with tempfile.TemporaryDirectory() as temp_dir:
-        print("temp_dir:", temp_dir)
+        logger.info("temp_dir: %s", temp_dir)
 
         # write hsaco
         hsaco_file = os.path.join(temp_dir, "empty_kernel.hsaco")
@@ -5876,7 +5877,7 @@ def test_separate_compile_and_run():
 
 if __name__ == "__main__":
     if SKIP_TEST:
-        print(SKIP_REASON)
+        logger.info(SKIP_REASON)
     else:
         test_f32_kernel()
         test_jit()

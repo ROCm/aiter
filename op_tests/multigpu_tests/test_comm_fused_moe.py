@@ -104,6 +104,7 @@ class Stage2Case:
     tokens: int
     block_m: int
     inter_states: torch.Tensor
+    kernel_inter_states: torch.Tensor
     a2_scale: torch.Tensor
     reference_a2_scale: torch.Tensor
     topk_ids: torch.Tensor
@@ -121,6 +122,7 @@ class Stage2Fixture:
     metadata: object
     ordinary_kernel: str
     requires_output_zero: bool
+    sorted_inter: bool
     shared_partial: torch.Tensor
     reference: torch.Tensor
 
@@ -300,7 +302,12 @@ def _resolve_ordinary_stage2(tokens: int):
         or getattr(metadata.stage2, "keywords", {}).get("kernelName2")
         or ""
     )
-    return metadata, kernel_name, not stage2_uses_route_reduce(metadata.stage2)
+    return (
+        metadata,
+        kernel_name,
+        not stage2_uses_route_reduce(metadata.stage2),
+        bool(metadata.skip_inter_quant),
+    )
 
 
 def _make_stage2_case(
@@ -308,6 +315,7 @@ def _make_stage2_case(
     route: str,
     block_m: int,
     requires_output_zero: bool,
+    sorted_inter: bool,
     rank: int,
     device,
 ) -> Stage2Case:
@@ -368,10 +376,20 @@ def _make_stage2_case(
         if sorting_out.numel()
         else torch.empty((tokens, MODEL_DIM), dtype=torch.bfloat16, device=device)
     )
+    inter_states = inter_states.view(tokens, TOPK, INTER_DIM)
+    kernel_inter_states = inter_states
+    if sorted_inter:
+        packed = sorted_ids[:row_capacity].to(torch.int64)
+        token, slot = packed & 0x00FFFFFF, packed >> 24
+        ok = (token < tokens) & (slot < TOPK)
+        flat = inter_states.reshape(tokens * TOPK, INTER_DIM)
+        kernel_inter_states = flat.new_zeros((row_capacity, INTER_DIM))
+        kernel_inter_states[ok] = flat[(token * TOPK + slot)[ok]]
     return Stage2Case(
         tokens=tokens,
         block_m=block_m,
-        inter_states=inter_states.view(tokens, TOPK, INTER_DIM),
+        inter_states=inter_states,
+        kernel_inter_states=kernel_inter_states,
         a2_scale=a2_scale,
         reference_a2_scale=reference_a2_scale,
         topk_ids=topk_ids,
@@ -451,7 +469,7 @@ def _run_ordinary_stage2(
     if fixture.requires_output_zero:
         case.partial_out.zero_()
     fixture.metadata.stage2(
-        case.inter_states,
+        case.kernel_inter_states,
         None,
         weights.kernel,
         case.sorted_token_ids,
@@ -473,12 +491,15 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
     if key in session.stage2_fixtures:
         return session.stage2_fixtures[key]
 
-    metadata, kernel_name, requires_zero = _resolve_ordinary_stage2(tokens)
+    metadata, kernel_name, requires_zero, sorted_inter = _resolve_ordinary_stage2(
+        tokens
+    )
     case = _make_stage2_case(
         tokens,
         route,
         int(metadata.block_m),
         requires_zero,
+        sorted_inter,
         session.rank,
         session.device,
     )
@@ -489,6 +510,7 @@ def _stage2_fixture(session: TestSession, tokens: int, route: str) -> Stage2Fixt
         metadata=metadata,
         ordinary_kernel=kernel_name,
         requires_output_zero=requires_zero,
+        sorted_inter=sorted_inter,
         shared_partial=shared,
         reference=reference,
     )
@@ -814,7 +836,7 @@ def _run_stage2_case(
         prepared = runner.prepare_shared_partial(fixture.shared_partial)
         return runner(
             stage2_args=(
-                case.inter_states,
+                case.kernel_inter_states,
                 None,
                 session.weights.kernel,
                 case.sorted_token_ids,
@@ -845,6 +867,7 @@ def _run_stage2_case(
     return {
         "ordinary kernel": fixture.ordinary_kernel,
         "comm_fused kernel": config_name(runner.config),
+        "inter layout": "sorted" if fixture.sorted_inter else "route-major",
         **result,
     }
 
