@@ -140,6 +140,16 @@ def fused_qk_rope_cat_and_cache_mla(
     B is the number of decode tokens, B_slot is the number of prefill + decode tokens, B_cache is the max number of tokens of kv_cache
     QH must be multiple of KH
 
+    - q_out: Optional pre-allocated output (B, QH, D1+D2). Required when
+      ``q_nope_prestored=True``.
+    - q_nope_prestored: When True, ``q_out[..., :D1]`` already holds q_nope
+      (e.g. a bf16-absorb k-up GEMM wrote q_nope straight into q_out), so this
+      op only ropes q_pe into ``q_out[..., D1:]`` and writes the KV cache,
+      skipping the q_nope read/copy. Restrictions (asserted below): requires
+      ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), and the
+      gfx1250 pure-decode MLA path; q_pe/KV results are bit-identical to the
+      full path.
+
     Returns:
     - q_out: The output matrix with shape (B, QH, D1+D2).
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
