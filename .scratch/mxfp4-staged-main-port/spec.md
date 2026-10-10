@@ -1,6 +1,6 @@
 # MXFP4 staged search port to main
 
-Status: claimed
+Status: resolved
 
 Published: 2026-10-10 through the user's explicit `to-spec` request. This specification consolidates the confirmed design, pipeline audit and single-GPU experiment. It defines the port to main `882ea79dd7cc7091f859a5bedac914523ac77bbd`; implementation state is maintained in [map.md](map.md).
 
@@ -249,3 +249,5 @@ Read these supporting sources when implementing their corresponding parts:
 - [Cross-experiment review](cross-experiment-review.md) and [experiment artifacts](../../docs/mxfp4_cross_measurement/20261010/README.md): reproducible data and its bounded conclusions.
 - [ADR 0001](../../docs/adr/0001-mxfp4-search-modes-on-main.md): why the single main-compatible selector stages after pruning.
 - [Implementation plan](plan.md) and [ticket map](map.md): the approved four-ticket sequence and current published ticket state.
+
+Implementation and required current acceptance are complete on `integration/mxfp4-staged-main-port`; all four tickets are resolved. See the ticket Answers, map and [final delivery](../../docs/mxfp4_staged_main_port/DELIVERY.md) for commits, evidence and remaining operational limits.

@@ -1,6 +1,6 @@
 # MXFP4 staged main-port implementation plan
 
-Status: claimed
+Status: resolved
 
 Reviewer decisions are incorporated and the user approved the four-ticket breakdown on 2026-10-10. The [published tickets](issues/README.md) are the sole current work set. The user subsequently authorized pre-implementation documentation corrections, including restoring the [specification](spec.md) to `ready-for-agent`; implementation is active and its state is recorded in [map.md](map.md). The spec defines behavior and the [work map](map.md) tracks ticket state. Detailed checks and the 27-search matrix are in [acceptance.md](acceptance.md).
 
@@ -42,3 +42,5 @@ Tickets 02–04 must document the kernel-sum metric, check matched production ex
 See [map.md](map.md) for the approved four-ticket set, statuses and blocking edges. Prior seven/ten drafts and the approved four-ticket snapshot are archived and cannot be claimed. Each published ticket includes its own behavior checks and focused production evidence; the completed design experiment does not replace integrated-port acceptance.
 
 For every real GPU acceptance/calibration task, use acceptance's physical-card identity and visibility procedure, then launch a fresh process only after idle checks. The current target maps by UUID and verified PCI to logical0. Compared tasks stay on the same physical card and execute sequentially.
+
+Implementation and required current acceptance are complete on `integration/mxfp4-staged-main-port`; all four tickets are resolved. See the ticket Answers, map and [final delivery](../../docs/mxfp4_staged_main_port/DELIVERY.md) for commits, evidence and remaining operational limits.
