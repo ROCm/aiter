@@ -4,7 +4,7 @@
 
 import hashlib
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     import torch
@@ -19,8 +19,8 @@ def fingerprint(tensor: "torch.Tensor") -> str:
 
 
 def trace_kernel_metrics(
-    events: Sequence[dict[str, object]], iters: int
-) -> tuple[list[dict[str, object]], float, float]:
+    events: Sequence[dict[str, Any]], iters: int
+) -> tuple[list[dict[str, Any]], float, float]:
     kernels = [
         event
         for event in events
