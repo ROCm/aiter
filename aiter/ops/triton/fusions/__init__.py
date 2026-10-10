@@ -11,6 +11,9 @@ from aiter.ops.triton.fusions.mhc import (
     mhc_post_dsv4,
     mhc_pre_dsv4,
 )
+from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
+    mhc_fused_post_pre_delayed_rmsnorm,
+)
 
 __all__ = [
     "MHC_DSV4_BACKWARD_FALLBACK",
@@ -18,6 +21,7 @@ __all__ = [
     "attn_res_gate",
     "fused_sigmoid_mul",
     "mhc",
+    "mhc_fused_post_pre_delayed_rmsnorm",
     "mhc_head_dsv4",
     "mhc_post",
     "mhc_post_dsv4",

@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MHC config loading: ``get_mhc_config()`` / ``get_mhc_post_config()``,
-with the documented gfx942 arch fallback, on top of the shared core in
-``config_utils``.
+"""MHC config loading: ``get_mhc_config()`` / ``get_mhc_post_config()`` /
+``get_mhc_fused_post_pre_delayed_rmsnorm_config()``, with the documented gfx942 arch fallback,
+on top of the shared core in ``config_utils``.
 """
 
 import functools
@@ -173,6 +173,35 @@ def get_mhc_post_config(M: int, C: int) -> dict:
         return dict(cfg["default"])
 
     raise KeyError(f"No matching config for M={M}, C={C} in 'MHC_POST'")
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_mhc_fused_post_pre_delayed_rmsnorm_config(M: int) -> dict:
+    """Pick the mhc_fused_post_pre_delayed_rmsnorm launch config for ``M`` tokens from the
+    arch's ``mhc_fused_post_pre_delayed_rmsnorm`` ``DEFAULT.json`` (gfx942 fallback).
+
+    Picks the smallest ``M_LEQ_<x>`` with ``M <= x``, else ``"any"``. The shipped
+    tables are for DeepSeek-V4.1 (hidden size 5120); the kernel requires
+    ``NUM_KSPLIT * TILE_K`` to divide the hidden size.
+    """
+    dev = arch_info.get_arch()
+    cfg = _load_with_fallback(
+        dev, "MHC_FUSED_POST_PRE_DELAYED_RMSNORM", "DEFAULT.json", required=True
+    )
+
+    m_bounds = sorted(
+        int(k[6:]) for k in cfg if k.startswith("M_LEQ_") and k[6:].isdigit()
+    )
+    for m_bound in m_bounds:
+        if M <= m_bound:
+            return dict(cfg[f"M_LEQ_{m_bound}"])
+
+    if "any" in cfg:
+        return dict(cfg["any"])
+
+    raise KeyError(
+        f"No matching config for M={M} in 'MHC_FUSED_POST_PRE_DELAYED_RMSNORM'"
+    )
 
 
 def hip_post_dispatch_block(C: int, arch_id: str) -> int | None:

@@ -239,11 +239,16 @@ def _pkmax_u16(a_i32, b_i32):
     return fx.max(va, vb).bitcast(fx.Int32)[0]
 
 
-def _swiglu_mul_batch(gate_values, up_values, limit=7.0):
+def _clamp_gate_up_batch(gate_values, up_values, limit=7.0):
     limit_f32 = fx.Float32(float(limit))
     neg_limit_f32 = fx.Float32(-float(limit))
     gates = [fx.min(gate, limit_f32) for gate in gate_values]
     ups = [fx.max(fx.min(up, limit_f32), neg_limit_f32) for up in up_values]
+    return gates, ups
+
+
+def _swiglu_mul_batch(gate_values, up_values, limit):
+    gates, ups = _clamp_gate_up_batch(gate_values, up_values, limit)
     # Fold alpha into the exp2 constant to retain this kernel's rounding.
     sigmoids = sigmoid_batch(gates, alpha=1.702)
     return [
@@ -284,6 +289,9 @@ def _activation_mul_batch(
             beta=situ_beta,
             linear_beta=situ_linear_beta,
         )
+    # DSV4/DSV4.1 SiLU semantics clamp gate/up before the multiply. The host
+    # supplies +inf for ordinary unclamped SiLU.
+    gate_values, up_values = _clamp_gate_up_batch(gate_values, up_values, swiglu_limit)
     return _silu_mul_batch(gate_values, up_values)
 
 

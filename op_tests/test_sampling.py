@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import subprocess
+import sys
 import warnings
 
 import pytest
@@ -69,6 +71,90 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
             rtol=1e-3,
             atol=1e-3,
         )
+
+
+@pytest.mark.parametrize("batch_size", [2, 19, 99])
+@pytest.mark.parametrize("vocab_size", [500, 32000, 128256])
+def test_top_k_renorm_probs_per_row_k(batch_size, vocab_size):
+    """Per-row top-k tensor: small k, k > 50, and disabled (k == vocab_size).
+
+    Only the scalar overload was covered, and it is the one case where the
+    host-side `max_k` always equals the per-row k. A tensor sends
+    `top_k_val = 0`, which falls back to `max_k = 50`.
+    """
+    torch.manual_seed(42)
+    pre_norm_prob = torch.rand(batch_size, vocab_size).to(0)
+    normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
+
+    choices = [10, 100, vocab_size]
+    k_arr = torch.tensor(
+        [choices[i % len(choices)] for i in range(batch_size)], dtype=torch.int32
+    )
+
+    sorted_prob, _ = torch.sort(normalized_prob, descending=True)
+    renorm_prob_ground_truth = normalized_prob.clone()
+    for i in range(batch_size):
+        k = int(k_arr[i])
+        if k < vocab_size:
+            pivot = sorted_prob[i, k - 1]
+            renorm_prob_ground_truth[i][normalized_prob[i] < pivot] = 0
+    renorm_prob_ground_truth = renorm_prob_ground_truth / renorm_prob_ground_truth.sum(
+        dim=-1, keepdim=True
+    )
+
+    renorm_prob = torch.ops.aiter.top_k_renorm_probs(
+        normalized_prob, *_to_tensor_scalar_tuple(k_arr)
+    )
+    for i in range(batch_size):
+        torch.testing.assert_close(
+            renorm_prob_ground_truth[i],
+            renorm_prob[i],
+            rtol=1e-3,
+            atol=1e-3,
+        )
+
+
+# Runs in a child process: the workspace is a function-local `static`, malloc'd
+# once per process, so a process that already called this op is a spent trial.
+_MIXED_TOP_K_BATCH = """
+import torch
+from aiter.ops import sampling  # noqa: F401
+
+torch.set_default_device("cuda")
+
+vocab_size = {vocab_size}
+probs = torch.rand(2, vocab_size)
+probs = probs / probs.sum(dim=-1, keepdim=True)
+
+# One request setting top_k, one leaving it disabled: the mixture vLLM
+# produces when both land in the same sampler batch.
+top_k_arr = torch.tensor([50, vocab_size], dtype=torch.int32)
+out = torch.ops.aiter.top_k_renorm_probs(probs, top_k_arr, 0)
+torch.cuda.synchronize()
+assert torch.isfinite(out).all()
+"""
+
+
+def test_top_k_renorm_probs_mixed_batch_does_not_fault():
+    """Regression guard for the out-of-bounds workspace write.
+
+    The overrun runs off the end, past everything that is read back, so the
+    values stay correct and there is nothing to assert but survival. The vocab
+    is oversized on purpose: at ~160K the ~640 KB overrun usually hides in the
+    allocator's 2 MB slack, while 1M puts it ~4 MB out. MI355X: 5/5 fresh
+    processes abort before the fix, 6/6 pass after.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", _MIXED_TOP_K_BATCH.format(vocab_size=1 << 20)],
+        capture_output=True,
+        text=True,
+        timeout=900,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"top_k_renorm_probs faulted on a mixed top-k batch, k = [50, {1 << 20}]\n"
+        f"stdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 19, 99, 989])

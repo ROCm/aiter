@@ -11,7 +11,10 @@ import pandas as pd
 import torch
 
 from aiter.ops import gemm_op_a6w6
-from csrc.gemm_a6w6.gemm_a6w6_tune import choose_guarded_kernel
+from csrc.gemm_a6w6.gemm_a6w6_tune import (
+    candidate_supports_shape,
+    choose_guarded_kernel,
+)
 
 AITER_ROOT = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -165,6 +168,32 @@ class TestA6W6TuningLookup(unittest.TestCase):
             gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME,
         )
 
+    def test_compiled_selector_matches_exact_then_padded_shape(self):
+        configs = (
+            (9450, 5120, 5120, "exact_kernel"),
+            (9472, 5120, 5120, "padded_kernel"),
+        )
+        with (
+            mock.patch.object(torch.compiler, "is_compiling", return_value=True),
+            mock.patch.object(
+                gemm_op_a6w6,
+                "_compiled_gemm_a6w6_configs",
+                return_value=configs,
+            ),
+        ):
+            self.assertEqual(
+                gemm_op_a6w6._select_gemm_a6w6_kernel(
+                    9450, 5120, 5120, None, device=torch.device("cuda:0")
+                ),
+                "exact_kernel",
+            )
+            self.assertEqual(
+                gemm_op_a6w6._select_gemm_a6w6_kernel(
+                    9451, 5120, 5120, None, device=torch.device("cuda:0")
+                ),
+                "padded_kernel",
+            )
+
 
 class TestA6W6ApiValidation(unittest.TestCase):
     def test_asm_wrapper_selects_safe_default_kernel(self):
@@ -217,6 +246,13 @@ class TestA6W6Manifest(unittest.TestCase):
                 configs.columns
             )
         )
+        self.assertTrue({"exact_M", "exact_N", "exact_K"}.issubset(configs.columns))
+        exact_columns = ["exact_M", "exact_N", "exact_K"]
+        specialized = configs[(configs[exact_columns] > 0).all(axis=1)]
+        self.assertEqual(len(specialized), 3)
+        generic = configs[(configs[exact_columns] == 0).all(axis=1)]
+        self.assertEqual(len(specialized) + len(generic), len(configs))
+        self.assertTrue((generic[exact_columns] == 0).all().all())
         swz0 = configs[
             configs["knl_name"] == gemm_op_a6w6._SAFE_FALLBACK_KERNEL_NAME
         ].iloc[0]
@@ -235,6 +271,23 @@ class TestA6W6Manifest(unittest.TestCase):
         manifest_dir = os.path.dirname(MANIFEST)
         for co_name in configs["co_name"]:
             self.assertTrue(os.path.exists(os.path.join(manifest_dir, co_name)))
+
+    def test_exact_physical_shape_candidate_filter(self):
+        exact = {
+            "kernel_id": 0,
+            "kernel_name": "exact",
+            "tile_m": 256,
+            "tile_n": 256,
+            "swizzle_max_m": 0,
+            "swizzle_max_n": 0,
+            "swizzle_max_k": 0,
+            "exact_m": 9472,
+            "exact_n": 5120,
+            "exact_k": 5120,
+        }
+        self.assertTrue(candidate_supports_shape(exact, 9450, 5120, 5120))
+        self.assertFalse(candidate_supports_shape(exact, 9473, 5120, 5120))
+        self.assertFalse(candidate_supports_shape(exact, 9450, 13824, 5120))
 
 
 class TestA6W6MinimumGainGuard(unittest.TestCase):
