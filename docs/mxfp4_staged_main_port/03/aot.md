@@ -44,7 +44,7 @@ extension compilation is CPU import preparation. Matching deployment commands
 and caller-owned CSV settings are documented in
 [the AOT usage guide](../../../../aiter/aot/flydsl/README.md).
 
-`create_fixtures.py` prepares the 17 specified-pair requests for the configured
+`create_fixtures.py` prepares the 22 specified-pair requests for the configured
 acceptance harness from the current real admitted M_est-pruned enumeration.
 Each request chooses the first matching G2 BM/BN/BK/epilog in original order;
 it introduces no new candidate source or search. The manifest names the exact

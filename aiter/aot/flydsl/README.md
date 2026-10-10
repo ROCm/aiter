@@ -108,11 +108,22 @@ AITER_FLYDSL_STAGE2_FP8=1 AITER_MXFP4_INTERMEDIATE=1 \
   python -m aiter.aot.flydsl.mxfp4_moe \
   --csv /path/to/limit5-both-winner.csv --swiglu-limit 5
 
-# The batch build reads the same limit and switches before collecting jobs.
+# Compile only this selected CSV through the shared batch worker pool.
 AITER_MXFP4_TUNE_SWIGLU_LIMIT=5 AITER_FLYDSL_STAGE2_FP8=1 \
-  AITER_MXFP4_INTERMEDIATE=1 AITER_CONFIG_FMOE=/path/to/limit5-both-winner.csv \
-  python -c 'from aiter.aot.flydsl.common import run_aot; run_aot("/path/to/cache")'
+  AITER_MXFP4_INTERMEDIATE=1 FLYDSL_RUNTIME_CACHE_DIR=/path/to/cache \
+  python - <<'PY'
+from aiter.aot.flydsl.common import collect_aot_jobs, run_jobs_parallel
+from aiter.aot.flydsl.mxfp4_moe import compile_one_config, parse_csv
+
+jobs = collect_aot_jobs(["/path/to/limit5-both-winner.csv"], parse_csv)
+results = run_jobs_parallel(compile_one_config, jobs)
+assert all(result["compile_time"] is not None for result in results), results
+PY
 ```
+
+The full default `run_aot` model corpus includes Situv2 rows. A custom limit
+rejects those rows; select only the CSVs compatible with that activation limit
+when preparing a custom batch.
 
 Production receives `swiglu_limit=5` through its explicit API and the same
 stage2 environment. The caller associates each winner CSV with those settings:
