@@ -42,13 +42,15 @@ MXFP4_G1_VARIANTS = {
 }
 
 
-def native_scale_layout_for(BM: int, out_dtype: str) -> bool:
+def native_scale_layout_for(BM: int, out_dtype: str, kernel_name2=None) -> bool:
     """The A-scale layout GEMM1 must emit for a block_m and output dtype.
 
     BM16 FP4/FP8 output writes one padded native scale chunk per block to
     match the SBM16 GEMM2 reader. Larger blocks use 32-row regular chunks.
     Runtime, tuner and AOT must all select the same layout.
     """
+    if isinstance(kernel_name2, str) and kernel_name2.startswith("opus_moe2_"):
+        return False
     return int(BM) == 16 and str(out_dtype).lower() in ("fp4", "fp8")
 
 
