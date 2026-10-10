@@ -2896,3 +2896,36 @@ namespace py = pybind11;
           py::arg("split_lse"),         \
           py::arg("final_output"),      \
           py::arg("attn_sink") = py::none());
+
+#define GFX1201_SAGE_PREPARE_PYBIND                                 \
+    m.def("gfx1201_sage_prepare_hip",                               \
+          &gfx1201_sage_prepare_hip,                                \
+          py::arg("query"),                                         \
+          py::arg("key"),                                           \
+          py::arg("value"),                                         \
+          py::arg("query_weight"),                                  \
+          py::arg("key_weight"),                                    \
+          py::arg("cosine"),                                        \
+          py::arg("sine"),                                          \
+          py::arg("maximum"),                                       \
+          py::arg("query_out"),                                     \
+          py::arg("key_out"),                                       \
+          py::arg("value_out"),                                     \
+          py::arg("query_scale"),                                   \
+          py::arg("key_scale"),                                     \
+          py::arg("value_scale"),                                   \
+          py::arg("rope_dim"),                                      \
+          py::arg("eps"),                                           \
+          py::arg("sm_scale"));
+
+#define GFX1201_SAGE_ATTENTION_PYBIND                               \
+    m.def("gfx1201_sage_attention_fwd_hip",                         \
+          &gfx1201_sage_attention_fwd_hip,                          \
+          py::arg("q_int8"),                                        \
+          py::arg("q_scale"),                                       \
+          py::arg("k_int8"),                                        \
+          py::arg("k_scale"),                                       \
+          py::arg("v_fp8"),                                         \
+          py::arg("v_scale"),                                       \
+          py::arg("out"),                                           \
+          py::arg("seq_len"));
