@@ -1,0 +1,16 @@
+..                                                                       [100%]
+=============================== warnings summary ===============================
+aiter/ops/triton/gluon/__init__.py:16
+  /root/workspace/tmp_dev/aiter-mxfp4-03/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+    warnings.warn(
+
+op_tests/tuning_tests/test_mxfp4_configured_paths.py::test_custom_limit_same_key_skips_or_replaces_csv_as_requested[True]
+  /root/workspace/tmp_dev/aiter-mxfp4-03/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:7767: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    self.success = pd.concat([self.success, valid], ignore_index=True)
+
+op_tests/tuning_tests/test_mxfp4_configured_paths.py::test_custom_limit_same_key_skips_or_replaces_csv_as_requested[True]
+  /root/workspace/tmp_dev/aiter-mxfp4-03/aiter/utility/base_tuner.py:587: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    tunedf = pd.concat([self.success, self.failed])
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+2 passed, 34 deselected, 3 warnings in 2.45s
