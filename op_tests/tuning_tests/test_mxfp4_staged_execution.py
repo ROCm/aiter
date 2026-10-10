@@ -106,11 +106,17 @@ def fake_case():
 
 @pytest.mark.parametrize("bm", [16, 32, 64, 128])
 @pytest.mark.parametrize(
-    "act,expected_limit",
-    [("silu", float("inf")), ("swiglu", 7.0), ("situv2", float("inf"))],
+    "act,configured_limit,expected_limit",
+    [
+        ("silu", None, float("inf")),
+        ("swiglu", None, 7.0),
+        ("situv2", None, float("inf")),
+        ("silu", 5, 5.0),
+        ("swiglu", 5, 5.0),
+    ],
 )
 def test_g1_screening_matches_bm_input_quantization_and_effective_default_parameters(
-    monkeypatch, bm, act, expected_limit
+    monkeypatch, bm, act, configured_limit, expected_limit
 ):
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
@@ -192,6 +198,8 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
         return None, 1.5
 
     monkeypatch.delenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", raising=False)
+    if configured_limit is not None:
+        monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", str(configured_limit))
     monkeypatch.setattr(tuner, "_prepare_case", prepare_case)
     monkeypatch.setattr(moe, "moe_sorting", sort)
     monkeypatch.setattr(moe.aiter, "fused_dynamic_mxfp4_quant_moe_sort", prequant)
@@ -310,9 +318,14 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
     assert events == ["producer", "complete-output", "complete-output"] * 3
 
 
+@pytest.mark.parametrize("limit", [None, 5.0])
 def test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap(
     monkeypatch,
+    limit,
 ):
+    monkeypatch.delenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", raising=False)
+    if limit is not None:
+        monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", str(limit))
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     data, sorting = fake_case()
@@ -325,6 +338,7 @@ def test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap(
     kn2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_sbm128"
 
     def torch_stage1(*args, **kwargs):
+        assert kwargs["swiglu_limit"] == limit
         assert kwargs["activation"] == moe.ActivationType.Swiglu
         assert kwargs["doweight_stage1"] is False and kwargs["topk"] == 4
         events.append("torch-stage1")
@@ -358,11 +372,13 @@ def test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap(
         return 0.01
 
     def pair(*args, **kwargs):
+        assert kwargs["swiglu_limit"] == limit
         assert args[1:3] == (kn1, kn2)
         events.append("normal-pair")
         return output
 
     def torch_ref(*args, **kwargs):
+        assert kwargs["swiglu_limit"] == limit
         events.append("normal-reference")
         return ref2
 
