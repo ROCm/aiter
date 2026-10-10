@@ -649,6 +649,8 @@ def bmm_a8w8_mxscale_opus(
             kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
 
     split_k = int(splitK if splitK is not None else 1)
+    if split_k == 0:  # Public no-split convention; launchers require one.
+        split_k = 1
     _opus_gemm_a8w8_mxscale_bmm_launch_raw(
         x,
         wo_a,

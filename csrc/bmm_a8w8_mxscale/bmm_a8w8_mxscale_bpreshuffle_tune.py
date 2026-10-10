@@ -22,13 +22,6 @@ sys.path.insert(0, os.path.join(_HERE, "..", "opus_gemm"))
 import opus_bmm_mxscale_tune as opus_tune
 
 from aiter import dtypes
-from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
-from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
-    bmm_kernel_name,
-    check_bmm_config,
-    parse_bmm_kernel_name,
-    pick_bmm_kernel_name,
-)
 
 FLYDSL_KERNEL_ID = -1
 _SPLITS = (1, 2, 4, 8, 16)
@@ -49,10 +42,14 @@ def gen_flydsl_bmm_data(b, m, n, k, seed, out_dtype, group, device="cuda"):
 
 
 def run_flydsl_bmm_bench(x, w, x_scale, w_scale, y, kernel_name):
+    from aiter.ops.flydsl.batched_gemm_a8w8 import run_bmm_a8w8_mxfp8
+
     return run_bmm_a8w8_mxfp8(x, w, x_scale, w_scale, y, kernel_name=kernel_name)
 
 
 def _runs(b, n, k, group, cfg):
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import check_bmm_config
+
     try:
         check_bmm_config(
             n, k, b, **cfg, x_scale_k=group, w_scale_n=group, w_scale_k=group
@@ -99,7 +96,9 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             raise SystemExit(f"--libtype: unknown backend(s) {sorted(unknown)}")
         # Seed flydsl from the table before tuning rewrites it.
         self.fly_seed = {}
-        if os.path.exists(opus_tune.BPRESHUFFLE_CSV):
+        if "flydsl" in self.libs and os.path.exists(opus_tune.BPRESHUFFLE_CSV):
+            from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+
             with open(opus_tune.BPRESHUFFLE_CSV) as source:
                 seed_rows = list(csv.DictReader(source))
             for r in seed_rows:
@@ -128,6 +127,12 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
     def _flydsl_names(self, b, m, n, k, block, how):
         if block == "1x32":
             return []
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
+            bmm_kernel_name,
+            parse_bmm_kernel_name,
+            pick_bmm_kernel_name,
+        )
+
         group = int(block.split("x")[1])
         seed = self.fly_seed.get((b, block), [])
         names = {r for mm, r in seed if how == "all" or m / 2 <= mm <= m * 2}
@@ -166,6 +171,8 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             raise ValueError(f"Unsupported BMM backend {row['libtype']!r}")
         if row["w_scale_block"] == "1x32":
             raise ValueError("FlyDSL BMM does not support 1x32 weight scales")
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+
         b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
         group = int(row["w_scale_block"].split("x")[0])
         name = str(row["kernelName"])
@@ -183,6 +190,8 @@ class BmmA8W8MxscaleBpreshuffleTuner(opus_tune.OpusBmmMxscaleTuner):
             yield from self._iter_opus_tasks(row, seed, args)
         if "flydsl" not in self.libs:
             return
+        from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+
         b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
         block = row["w_scale_block"]
         group = int(block.split("x")[0])

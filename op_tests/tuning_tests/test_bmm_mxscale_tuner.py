@@ -3,7 +3,9 @@
 """BMM tuner CSV and dispatch regressions; tensor generation is mocked."""
 
 import os
+import subprocess
 import sys
+import textwrap
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -171,8 +173,13 @@ def test_default_routes_layout_and_scale(tuner, monkeypatch, preshuffle, group):
 
 @pytest.mark.parametrize("group", [32, 128])
 def test_saved_flydsl_validation(tuner, monkeypatch, group):
-    name = joint.pick_bmm_kernel_name(4, 16, 1024, 4096, group, group, group)
-    config = joint.parse_bmm_kernel_name(name)
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
+        parse_bmm_kernel_name,
+        pick_bmm_kernel_name,
+    )
+
+    name = pick_bmm_kernel_name(4, 16, 1024, 4096, group, group, group)
+    config = parse_bmm_kernel_name(name)
     row = {
         **saved_row(block=f"{group}x{group}"),
         "libtype": "flydsl",
@@ -353,3 +360,79 @@ def test_1x32_cpu_quantization_and_reference():
     # is the biased exponent. Decode the raw bytes consistently for both.
     torch.testing.assert_close(ps.view(torch.uint8).view_as(ws), ws)
     torch.testing.assert_close(pq.float(), wq.float())
+
+
+@pytest.mark.parametrize("mode", ["help", "opus"])
+def test_opus_tuner_without_flydsl(tmp_path, mode):
+    source = tmp_path / "input.csv"
+    shapes().to_csv(source, index=False)
+    script = textwrap.dedent("""
+        import importlib.abc
+        import runpy
+        import sys
+
+        class NoFlyDSL(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "flydsl" or fullname.startswith("flydsl."):
+                    raise ModuleNotFoundError(f"No module named {fullname!r}", name=fullname)
+
+        sys.meta_path.insert(0, NoFlyDSL())
+        sys.path.insert(0, "csrc/bmm_a8w8_mxscale")
+        mode, source, output = sys.argv[1:]
+        if mode == "help":
+            sys.argv = ["tuner", "--libtype", "opus", "--help"]
+            runpy.run_module("bmm_a8w8_mxscale_bpreshuffle_tune", run_name="__main__")
+        else:
+            import bmm_a8w8_mxscale_bpreshuffle_tune as joint
+
+            tuner = joint.BmmA8W8MxscaleBpreshuffleTuner()
+            tuner.get_gfx = lambda: "gfx950"
+            tuner.get_cu_num = lambda: 256
+            args = tuner.parser.parse_args(
+                ["--libtype", "opus", "-i", source, "-o", output]
+            )
+            tuner.pre_process(args)
+            assert tuner.libs == {"opus"}
+            assert not tuner.fly_seed
+            tasks = [
+                task
+                for _, row in tuner.untunedf.iterrows()
+                for task in tuner._iter_tuning_tasks(row, 1, args)
+            ]
+            assert tasks and all(task[0][1] != joint.FLYDSL_KERNEL_ID for task in tasks)
+            assert "flydsl" not in sys.modules
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, mode, str(source), str(tmp_path / "out.csv")],
+        cwd=_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("kid,preshuffled", [(8320, False), (8179, True), (8471, True)])
+@pytest.mark.parametrize("split_k,expected", [(None, 1), (0, 1), (1, 1)])
+def test_bmm_no_split_convention(monkeypatch, kid, preshuffled, split_k, expected):
+    import torch
+
+    from aiter.ops.opus import gemm_op_a8w8 as backend
+    from aiter.ops.opus import policy
+
+    monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    x = torch.empty((128, 2, 4096), dtype=torch.float8_e4m3fn, device="meta")
+    w = torch.empty((2, 1024, 4096), dtype=x.dtype, device="meta")
+    xs = torch.empty((128, 2, 32), dtype=torch.uint8, device="meta")
+    ws = torch.empty((2, 8, 32), dtype=torch.uint8, device="meta")
+    launch = Mock()
+    monkeypatch.setattr(backend, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", launch)
+    result = backend.bmm_a8w8_mxscale_opus(
+        x, w, xs, ws, kernelId=kid, splitK=split_k, b_preshuffled=preshuffled
+    )
+    launch.assert_called_once()
+    assert launch.call_args.args[2] is result
+    assert launch.call_args.kwargs["kid"] == kid
+    assert launch.call_args.kwargs["split_k"] == expected
+    assert launch.call_args.kwargs["workspace"] is None
