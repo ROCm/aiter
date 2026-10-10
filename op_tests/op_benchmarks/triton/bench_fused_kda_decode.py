@@ -14,8 +14,6 @@ python bench_fused_kda_decode.py --batches 1 16 64 128
 python bench_fused_kda_decode.py --Hloc 8
 """
 
-import argparse
-
 import torch
 import triton
 import triton.language as tl
@@ -28,6 +26,7 @@ from aiter.ops.triton.gated_delta_net.causal_conv1d_decode import (
     causal_conv1d_update_split_qkv,
 )
 from aiter.ops.triton.gated_delta_net.fused_kda_decode import fused_kda_decode
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 DEVICE = "cuda"
 D = 128
@@ -345,10 +344,7 @@ def run_benchmark(args):
 
 
 def parse_args(args=None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Fused KDA Decode",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="Fused KDA Decode")
     parser.add_argument(
         "--Hloc",
         type=int,

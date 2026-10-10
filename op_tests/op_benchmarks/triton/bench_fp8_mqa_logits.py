@@ -1,10 +1,9 @@
-import argparse
-
 import torch
 import triton
 
 from aiter.ops.triton.attention.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.utils.types import e4m3_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -117,10 +116,7 @@ def run_benchmark(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="FP8 MQA Logits Benchmark",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="FP8 MQA Logits")
     parser.add_argument("--batch_size", type=int, default=1, help="batch size")
     parser.add_argument("--num_heads_q", type=int, default=64, help="num. q heads")
     parser.add_argument("--head_dim", type=int, default=128, help="head dim size")
@@ -135,13 +131,6 @@ def main():
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "throughput"],
-        default="throughput",
-        help="metric to plot",
     )
     args = parser.parse_args()
     run_benchmark(args)

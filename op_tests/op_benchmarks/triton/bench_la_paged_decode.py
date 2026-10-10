@@ -1,4 +1,3 @@
-import argparse
 import random
 import sys
 
@@ -9,6 +8,7 @@ from utils.benchmark_utils import get_model_configs
 from aiter.ops.triton.attention.lean_atten_paged import persistent_lean_attention_paged
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -384,10 +384,7 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Paged Attention decode",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="Paged Attention decode")
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)

@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Benchmarks for fast transpose Triton kernels."""
 
-import argparse
 from functools import partial
 
 import torch
@@ -12,6 +11,7 @@ from aiter.ops.triton.quant.fast_transpose import (
     fast_transpose_2d,
     transpose_packed_fp4,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 
@@ -110,9 +110,8 @@ def benchmark_packed_fp4_transpose(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fast_transpose", allow_abbrev=False
-    )
+    parser = get_parser(kernel_name="fast_transpose")
+    parser.set_defaults(metric="bandwidth")
     parser.add_argument(
         "--op",
         choices=["fast", "packed_fp4"],
@@ -123,14 +122,6 @@ def parse_args():
         "--dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp8"]
     )
     parser.add_argument("--shape", type=int, nargs=2, metavar=("M", "N"))
-    parser.add_argument(
-        "-metric",
-        "--metric",
-        nargs="?",
-        const="bandwidth",
-        choices=["time", "bandwidth"],
-        default="bandwidth",
-    )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()
 

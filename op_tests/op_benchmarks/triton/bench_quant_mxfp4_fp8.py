@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-import argparse
 import sys
 from functools import partial
 
@@ -11,8 +10,8 @@ import triton
 from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_mxfp8_quant
 from aiter.test_common import run_perftest
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant as fp4_utils_dynamic_mxfp4_quant
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
     get_caller_name_no_ext,
     get_model_configs,
 )
@@ -148,10 +147,8 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark MX Quant",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="MX Quant")
+    parser.set_defaults(metric="bandwidth")
     parser.add_argument(
         "--format",
         type=str,
@@ -165,19 +162,6 @@ def parse_args(args: list[str] | None = None):
         metavar=("M", "N"),
         help="Single shape to benchmark.",
     )
-    available_models = get_available_models()
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
     parser.add_argument(
         "-M",
         type=int,
@@ -203,13 +187,6 @@ def parse_args(args: list[str] | None = None):
         "--use-sr",
         action="store_true",
         help="Benchmark gfx950 stochastic rounding with a fixed Philox seed.",
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "bandwidth"],
-        default="bandwidth",
-        help="Metric to plot.",
     )
     parser.add_argument(
         "-o",

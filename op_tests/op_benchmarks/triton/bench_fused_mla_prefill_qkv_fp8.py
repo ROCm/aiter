@@ -3,7 +3,6 @@
 
 """Benchmark for the one-launch FP8 MLA prefill q/k/v prep."""
 
-import argparse
 import sys
 
 import torch
@@ -13,6 +12,7 @@ from aiter import dtypes
 from aiter.ops.triton.fusions.fused_mla_prefill_qkv_fp8 import (
     fused_mla_prefill_qkv_fp8,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -87,11 +87,8 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused MLA prefill q/k/v FP8 prep",
-        description="Benchmark the Triton fused MLA prefill q/k/v FP8 prep kernel",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="fused MLA prefill q/k/v FP8 prep")
+    parser.set_defaults(metric="all")
     parser.add_argument("-T", type=int, default=None, help="Number of tokens")
     parser.add_argument("-H", type=int, default=None, help="Real heads per rank")
     parser.add_argument("--H_out", type=int, default=16, help="Padded head count")
@@ -104,13 +101,6 @@ def parse_args():
     )
     parser.add_argument(
         "--dtype", type=str, default="bf16", choices=list(arg_to_torch_dtype)
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
-        choices=["all", "time", "bandwidth"],
-        help="Metric to report (default: all)",
     )
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)

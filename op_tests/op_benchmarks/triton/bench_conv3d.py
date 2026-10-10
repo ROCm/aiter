@@ -28,6 +28,7 @@ from aiter.ops.triton.conv.conv3d import (
     conv3d_winograd_hw_f4x3,
     conv3d_winograd_hw_f4x3_cblocked,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.conv._helpers import (
     _winograd_tolerances,
     apply_activation,
@@ -679,12 +680,7 @@ def run_benchmark(args) -> None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="bench_conv3d",
-        description="Benchmark Triton Conv3D against PyTorch.",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="bench_conv3d")
     source = parser.add_mutually_exclusive_group()
     source.add_argument(
         "--shape",
@@ -694,10 +690,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="benchmark one NCDHW/OIDHW shape",
     )
     source.add_argument(
-        "--model",
-        help="benchmark Conv3D shapes matching this model name",
-    )
-    source.add_argument(
         "--smoke",
         action="store_true",
         help="benchmark a compact edge-case sweep",
@@ -705,11 +697,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("fp16", "bf16"), default="fp16")
     parser.add_argument("--layout", choices=("ncdhw", "ndhwc"), default="ncdhw")
     parser.add_argument("--method", choices=METHODS, default="auto")
-    parser.add_argument(
-        "--metric",
-        choices=("time", "throughput", "bandwidth"),
-        default="throughput",
-    )
     parser.add_argument(
         "--activation",
         choices=("none", "relu", "relu6", "gelu"),

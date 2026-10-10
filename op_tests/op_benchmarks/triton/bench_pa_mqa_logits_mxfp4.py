@@ -26,6 +26,7 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_common import run_perftest
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import (
     pack_cache,
     preshuffle_cache,
@@ -187,9 +188,7 @@ def run_benchmark(args):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
-    )
+    p = get_parser(kernel_name="Paged MXFP4 MQA-Logits")
     p.add_argument(
         "--batch",
         type=int_list,

@@ -6,13 +6,13 @@
 Reports the public API, its preallocated-output path, and an FP32 eager reference.
 """
 
-import argparse
 import sys
 
 import torch
 import triton
 
 from aiter.ops.triton.activation import silu_and_mul_backward
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -99,15 +99,12 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Benchmark fused SiLU-and-multiply backward",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="SiLU-and-Mul Backward")
+    parser.set_defaults(metric="time")
     parser.add_argument("--rows", type=int, default=None)
     parser.add_argument("--width", type=int, default=None)
     parser.add_argument("--dtype", choices=tuple(_DTYPES), default="bf16")
     parser.add_argument("--provider", choices=(*_PROVIDERS, "all"), default="all")
-    parser.add_argument("--metric", choices=("time", "bandwidth"), default="time")
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)
     parser.add_argument("--print-vgpr", action="store_true")
