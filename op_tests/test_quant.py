@@ -154,7 +154,9 @@ def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided):
         got = got.view(m, scale_n)
     scale_err = int((got != ref_scale).sum())
     out_err = int((out.view(torch.uint8) != ref_out).sum())
-    assert scale_err == 0 and out_err == 0, f"{m=} {n=} {shuffle=} {strided=} {scale_err=} {out_err=}"
+    assert (
+        scale_err == 0 and out_err == 0
+    ), f"{m=} {n=} {shuffle=} {strided=} {scale_err=} {out_err=}"
 
 
 def test_mxfp8_nonfinite(group_size, shuffle, h_dtype, pattern):
