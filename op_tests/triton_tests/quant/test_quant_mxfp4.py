@@ -3,8 +3,11 @@
 
 import pytest
 import torch
+import triton
+import triton.language as tl
 
 from aiter import logger
+from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 from aiter.ops.triton.quant import dynamic_mxfp4_quant, dynamic_nvfp4_quant
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
@@ -221,6 +224,13 @@ def torch_dequant_nvfp4(
 @pytest.mark.parametrize(
     "M, N",
     [
+        # Shapes in different gfx1250 Gluon config buckets.
+        (1, 3072),
+        (4, 3072),
+        (8, 7168),
+        (32, 1024),
+        (256, 3072),
+        (40, 20000),
         (1, 4),
         (1, 28),
         (1, 32),
@@ -234,9 +244,15 @@ def torch_dequant_nvfp4(
         (256, 32),
         (160, 40),
         (280, 20),
+        # A few shapes spanning bench_quant_mxfp4_fp8.py's default range, plus
+        # non-power-of-2 shapes in between.
+        (8, 1024),
+        (2048, 3072),
+        (16384, 7168),
+        (6000, 5000),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_dynamic_mxfp4_quant(M: int, N: int, dtype):
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.manual_seed(20)
@@ -555,3 +571,76 @@ def test_dynamic_mxfp4_quant_sr_rounds_midpoints_without_bias():
     assert torch.all(scales == 127)
     assert torch.all((midpoint_values == 1.0) | (midpoint_values == 1.5))
     assert abs(round_up_fraction.item() - 0.5) < 0.02
+
+
+@triton.jit
+def _mxfp4_quant_op_kernel(
+    x_ptr,
+    fp4_ptr,
+    scale_ptr,
+    M: tl.constexpr,
+    N: tl.constexpr,
+    SCALING_MODE: tl.constexpr,
+    USE_ASM: tl.constexpr,
+):
+    rows = tl.program_id(0) * M + tl.arange(0, M)
+    x = tl.load(x_ptr + rows[:, None] * N + tl.arange(0, N)[None, :])
+    x_fp4, scales = _mxfp4_quant_op(x, N, M, 32, SCALING_MODE, USE_ASM)
+    fp4_cols = tl.arange(0, N // 2)
+    tl.store(fp4_ptr + rows[:, None] * (N // 2) + fp4_cols[None, :], x_fp4)
+    scale_cols = tl.arange(0, N // 32)
+    tl.store(scale_ptr + rows[:, None] * (N // 32) + scale_cols[None, :], scales)
+
+
+@pytest.mark.parametrize("scaling_mode", [0, 1])
+def test_mxfp4_quant_op_asm_matches_bits(scaling_mode):
+    torch.manual_seed(scaling_mode)
+    m, n = 1024, 128
+    x = torch.randn(m, n, device="cuda") * torch.exp2(
+        torch.randint(-140, 120, (m, 1), device="cuda").float()
+    )
+    # Rounding ties, -0.0 and an all-zero block.
+    x[0, :8] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -0.0])
+    x[1, :32] = 0.0
+    outs = []
+    for use_asm in (True, False):
+        x_fp4 = torch.empty(m, n // 2, dtype=torch.uint8, device="cuda")
+        scales = torch.empty(m, n // 32, dtype=torch.uint8, device="cuda")
+        _mxfp4_quant_op_kernel[(m // 16,)](
+            x, x_fp4, scales, M=16, N=n, SCALING_MODE=scaling_mode, USE_ASM=use_asm
+        )
+        outs.append((x_fp4, scales))
+    torch.testing.assert_close(outs[0][0], outs[1][0], atol=0, rtol=0)
+    torch.testing.assert_close(outs[0][1], outs[1][1], atol=0, rtol=0)
+    if scaling_mode == 1:
+        amax = x.reshape(m, -1, 32).abs().amax(-1).double().clamp(min=6 * 2**-126)
+        ref = torch.ceil(torch.log2(amax / 6)).to(torch.int32) + 127
+        torch.testing.assert_close(outs[0][1].int(), ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("M, N", [(1, 3072), (300, 1024), (33, 100)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
+def test_dynamic_mxfp4_quant_gluon_matches_triton(M: int, N: int, dtype):
+    arch = arch_info.get_arch()
+    if arch not in ("gfx950", "gfx1250"):
+        pytest.skip("The Gluon backend requires gfx950 or gfx1250")
+    if arch == "gfx950" and dtype != torch.bfloat16:
+        pytest.skip("The gfx950 Gluon kernel requires bf16 input")
+    torch.manual_seed(20)
+    x = torch.randn((M, N), dtype=dtype, device="cuda")
+
+    gluon_out, gluon_scale = dynamic_mxfp4_quant(x, backend="gluon")
+    triton_out, triton_scale = dynamic_mxfp4_quant(x, backend="triton")
+
+    torch.testing.assert_close(gluon_scale, triton_scale, atol=0, rtol=0)
+    torch.testing.assert_close(gluon_out, triton_out, atol=0, rtol=0)
+
+
+def test_dynamic_mxfp4_quant_backend_validation():
+    x = torch.randn((4, 64), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="Unknown backend"):
+        dynamic_mxfp4_quant(x, backend="cuda")
+    # gfx1250 runs Gluon for every dtype; elsewhere fp16 has no Gluon kernel.
+    if arch_info.get_arch() != "gfx1250":
+        with pytest.raises(RuntimeError, match="Gluon backend requires"):
+            dynamic_mxfp4_quant(x.half(), backend="gluon")

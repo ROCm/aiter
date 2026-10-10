@@ -30,17 +30,17 @@ _GROUPED_WEIGHT_CACHE = {}
 # (name, callable) per-kernel launches; None in production.
 kernel_bench_callable = None
 
-# fused_moe_ rebuilds Stage2ScatterContext without compact fields (custom-op
-# schema). MegaMoE stashes the live plan here for the grouped helper.
-_COMPACT_PLAN_TLS = threading.local()
+# fused_moe_ rebuilds Stage2ScatterContext without MegaMoE's dispatch fields
+# (custom-op schema). MegaMoE stashes the live context here for the grouped helper.
+_MEGA_DISPATCH_TLS = threading.local()
 
 
-def set_tdm_compact_plan(ctx: Stage2ScatterContext | None):
-    _COMPACT_PLAN_TLS.ctx = ctx
+def set_flydsl_dispatch_context(ctx: Stage2ScatterContext | None):
+    _MEGA_DISPATCH_TLS.ctx = ctx
 
 
-def _tdm_compact_plan():
-    return getattr(_COMPACT_PLAN_TLS, "ctx", None)
+def _flydsl_dispatch_context():
+    return getattr(_MEGA_DISPATCH_TLS, "ctx", None)
 
 
 def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
@@ -473,7 +473,7 @@ def _build_g2l_lut(
             nvr = torch.empty(1, dtype=torch.int32, device=device)
             _get_compiled_g2l_lut(
                 clear_counter=not (
-                    os.environ.get("MEGA_DISPATCH", "") == "tdm"
+                    _flydsl_dispatch_context() is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
                 )
@@ -574,12 +574,16 @@ def _grouped_a8w4_tdm_moe(
     m_warp2=None,
     n_warp2=None,
     num_buffers2=None,
+    cluster_m=-1,
     cluster_n=-1,
+    cluster_m2=-1,
     cluster_n2=None,
     waves_per_tensor_tdm=-1,
+    waves_per_tensor_tdm2=None,
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    lds_soa_load_interleave=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -602,7 +606,7 @@ def _grouped_a8w4_tdm_moe(
     device = hidden_states.device
     token_num, topk = topk_ids.shape
     enable_ep_scatter = stage2_scatter is not None
-    _compact_ctx = _tdm_compact_plan()
+    _compact_ctx = _flydsl_dispatch_context()
     _compact = bool(
         _compact_ctx is not None and getattr(_compact_ctx, "compact_layout", False)
     )
@@ -616,6 +620,8 @@ def _grouped_a8w4_tdm_moe(
         tile_k2 = tile_k
     if num_buffers2 is None:
         num_buffers2 = num_buffers
+    if waves_per_tensor_tdm2 is None:
+        waves_per_tensor_tdm2 = waves_per_tensor_tdm
     if m_warp2 is None:
         m_warp2 = m_warp
     if n_warp2 is None:
@@ -634,7 +640,10 @@ def _grouped_a8w4_tdm_moe(
         _plan_align = int(getattr(_compact_ctx, "compact_align_m", 0) or 0)
         if _plan_align:
             tile_m = min(int(tile_m), _plan_align)
-            tile_m2 = min(int(tile_m2), _plan_align)
+            # psum holds each expert's unpadded end, so a gemm2 tile narrower
+            # than the alignment can start in an expert's padding, map to the
+            # next expert, and scatter stale ep_rowmap rows into live slots.
+            tile_m2 = _plan_align
             if _plan_align % tile_m or _plan_align % tile_m2:
                 raise ValueError(
                     f"[grouped-moe compact] tiles {tile_m}/{tile_m2} do not divide "
@@ -700,9 +709,9 @@ def _grouped_a8w4_tdm_moe(
             # device=cuda) would allocate a CPU tensor and cudaMemcpy it, which
             # capture rejects unless pinned.
             _ep_nvt = torch.full((1,), int(token_num), dtype=torch.int32, device=device)
-        _direct_ep_mask = os.environ.get(
-            "MEGA_DISPATCH", ""
-        ) == "tdm" and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1") in (
+        _direct_ep_mask = _flydsl_dispatch_context() is not None and os.environ.get(
+            "AITER_TDM_DIRECT_EP_MASK", "1"
+        ) in (
             "1",
             "true",
             "True",
@@ -793,7 +802,7 @@ def _grouped_a8w4_tdm_moe(
         and not _fuse_ep_route_quant
         and int(E) <= 256
         and dtype in (torch.bfloat16, dtypes.bf16)
-        and os.environ.get("MEGA_DISPATCH", "") == "tdm"
+        and _flydsl_dispatch_context() is not None
         and os.environ.get("AITER_TDM_FUSE_PSUM_QUANT", "1") in ("1", "true", "True")
     )
     ep_psum_params = None
@@ -996,7 +1005,10 @@ def _grouped_a8w4_tdm_moe(
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = _b1 is None
+    disable_gemm1_requant = _as_bool(
+        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
+    )
+    _fuse_quant = _b1 is None and not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -1041,11 +1053,13 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
+            cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1076,11 +1090,13 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1120,11 +1136,13 @@ def _grouped_a8w4_tdm_moe(
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
+        cluster_m=cluster_m2,
         cluster_n=cluster_n2,
-        waves_per_tensor_tdm=waves_per_tensor_tdm,
+        waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=tdm_b_th,
+        lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
     )
 
@@ -1197,11 +1215,13 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
+                        cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
                 )
@@ -1233,11 +1253,13 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
                 )
@@ -1267,11 +1289,13 @@ def _grouped_a8w4_tdm_moe(
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
+                    cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
-                    waves_per_tensor_tdm=waves_per_tensor_tdm,
+                    waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
+                    lds_soa_load_interleave=lds_soa_load_interleave,
                 ),
             )
         )
@@ -1447,7 +1471,7 @@ def grouped_gemm_gfx1250_a8w4(
 
     device = hidden_states.device
     token_num, topk = topk_ids.shape
-    _cctx = _tdm_compact_plan()
+    _cctx = _flydsl_dispatch_context()
     _csv_tokens = token_num
     if _cctx is not None and getattr(_cctx, "compact_layout", False):
         # Dummy topk_ids are (1, topk) so fused_moe does not treat compact_cap
@@ -1528,12 +1552,18 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["num_buffers2"] = _as_int(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
             )
+            _tdm_kw["cluster_m"] = _as_int(cfg_row.get("cluster_m"), -1)
             _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
+            _tdm_kw["cluster_m2"] = _as_int(cfg_row.get("cluster_m2"), -1)
             _tdm_kw["cluster_n2"] = _as_int(
                 cfg_row.get("cluster_n2"), _tdm_kw["cluster_n"]
             )
             _tdm_kw["waves_per_tensor_tdm"] = _as_int(
                 cfg_row.get("waves_per_tensor_tdm"), -1
+            )
+            _tdm_kw["waves_per_tensor_tdm2"] = _as_int(
+                cfg_row.get("waves_per_tensor_tdm2"),
+                _tdm_kw["waves_per_tensor_tdm"],
             )
             _tdm_kw["next_stage_prefetch"] = _as_int(
                 cfg_row.get("next_stage_prefetch"), 0
@@ -1542,6 +1572,9 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_as_in_prologue"), 0
             )
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
+            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave"), 0
+            )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set

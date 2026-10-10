@@ -45,6 +45,11 @@ class CudaCommunicator(DeviceCommunicatorBase):
         self.use_custom_allreduce = _ENABLE_CUSTOM_ALL_REDUCE
         self.use_torch_symm_mem = False
 
+        # A reused communicator borrows the source's ca/qr comms; only the
+        # owner may dispose them in destroy(), or a borrowed handle is freed
+        # twice (double dispose / use-after-free).
+        self._owns_comms = reuse_from is None
+
         if reuse_from is not None:
             # Identical-rank group: share the source's allreduce communicators
             # instead of allocating a second set. Keeps our own unique_name, so
@@ -902,8 +907,12 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self.pynccl_comm is not None:
             self.pynccl_comm = None
         if self.qr_comm is not None:
+            if self._owns_comms:
+                self.qr_comm.close()
             self.qr_comm = None
         if self.ca_comm is not None:
+            if self._owns_comms:
+                self.ca_comm.close()
             self.ca_comm = None
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()

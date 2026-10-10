@@ -2,7 +2,6 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 """MegaMoE v2 fused dispatch, GEMM1, GEMM2, and combine implementation."""
 
-import os
 from dataclasses import replace
 
 import flydsl.expr as fx
@@ -13,6 +12,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
 )
+from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     INDEXED_PAYLOAD_MIN_MTPR,
@@ -30,6 +30,9 @@ __all__ = ["MegaMoEV2"]
 
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
+
+    # forward(mask_invalid_slots=...) is accepted: combine can skip -1 top-k slots.
+    supports_combine_mask = True
 
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
@@ -93,7 +96,7 @@ class MegaMoEV2:
         self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
-        if os.environ.get("AITER_MEGA_MOE_PRELOAD", "0") == "1":
+        if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
     def preload_aot_bundles(self):
@@ -646,9 +649,15 @@ class MegaMoEV2:
         *,
         config=None,
         prepared=False,
+        mask_invalid_slots=None,
     ):
         if config is None:
             config = self._select_config(run_tokens)
+        # Combine skips top-k slots with id -1 (never dispatched, so their partial
+        # is stale). The check costs prefill time, so it runs only when the
+        # caller says ids may be -1.
+        if mask_invalid_slots is None:
+            mask_invalid_slots = self._combine_mask
         self._run_fused_stage1(
             x,
             wts,
@@ -658,14 +667,20 @@ class MegaMoEV2:
             config=config.stage1,
             prepared=prepared,
         )
-        return self._run_stage2(run_tokens, stream, slice_output, config)
+        combine_ids = topk_ids if mask_invalid_slots else None
+        return self._run_stage2(run_tokens, stream, slice_output, config, combine_ids)
 
-    def _run_stage2(self, run_tokens, stream, slice_output, config: MegaMoEConfig):
+    def _run_stage2(
+        self, run_tokens, stream, slice_output, config: MegaMoEConfig, combine_ids=None
+    ):
+        """``combine_ids``: the top-k ids, when combine must skip their -1 slots."""
         if config.stage2.aligned_pair:
             return self._run_aligned_pair_stage2(
-                run_tokens, config, stream, slice_output
+                run_tokens, config, stream, slice_output, combine_ids
             )
-        ret = self._run_fused_stage2(run_tokens, config, stream)
+        ret = self._run_fused_stage2(
+            run_tokens, config, stream, combine_ids=combine_ids
+        )
         return self._stage2_output(ret, run_tokens, slice_output)
 
     def _stage2_output(self, result, run_tokens, slice_output):
@@ -681,7 +696,11 @@ class MegaMoEV2:
             )
         return out_tok[:run_tokens] if slice_output else out_tok
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(
+        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
+        """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
+        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -694,7 +713,8 @@ class MegaMoEV2:
         if self._s1_fixed_slot:
             x_q, scales = self.quantize(x_bf16)
             return self._run_joint(
-                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output
+                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
             )
 
         config = self._select_config(run_tokens)
@@ -722,13 +742,19 @@ class MegaMoEV2:
             slice_output,
             config=config,
             prepared=True,
+            mask_invalid_slots=mask_invalid_slots,
         )
 
-    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward_prequant(
+        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+        return self._run_joint(
+            x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+            mask_invalid_slots=mask_invalid_slots,
+        )
 
     forward_bf16 = forward
     __call__ = forward
@@ -744,6 +770,8 @@ class MegaMoEV2:
         )
 
         FlyDSLDispatchCombineIntraNodeOp._ENABLE_COMBINE_NO_STAGE1 = True
+        # Default of forward(mask_invalid_slots=...).
+        self._combine_mask = envs.AITER_MEGA_COMBINE_MASK
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
         k = comb_cfg.num_experts_per_token
@@ -906,12 +934,14 @@ class MegaMoEV2:
             )
             self._preload_aligned_pair_stage2(config, stream)
         for entry in self._bundle_plan.entries:
-            self.comb_op.preload_combine_no_stage1(
-                self._g2_combine_placeholder,
-                cur_tok=entry.token_bucket,
-                enable_weights=False,
-                stage2_p2p_quant=entry.config.p2p_quant,
-            )
+            for mask_topk_ids in (False, True):
+                self.comb_op.preload_combine_no_stage1(
+                    self._g2_combine_placeholder,
+                    cur_tok=entry.token_bucket,
+                    enable_weights=False,
+                    stage2_p2p_quant=entry.config.p2p_quant,
+                    mask_topk_ids=mask_topk_ids,
+                )
 
     def _run_fused_stage2(
         self,
@@ -922,6 +952,7 @@ class MegaMoEV2:
         runtime_pair_skip: bool = False,
         combine: bool = True,
         scatter_vec: int = 8,
+        combine_ids=None,
     ):
         comb_op = self.comb_op
         if stream is None:
@@ -940,8 +971,8 @@ class MegaMoEV2:
         if not combine:
             return None
         return comb_op.combine_no_stage1(
-            self._g2_combine_placeholder, None, None, cur_tok=run_tokens, enable_weights=False,
-            stage2_p2p_quant=p2p_quant,
+            self._g2_combine_placeholder, None, combine_ids, cur_tok=run_tokens,
+            enable_weights=False, stage2_p2p_quant=p2p_quant,
         )
 
     def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -960,6 +991,7 @@ class MegaMoEV2:
         config: MegaMoEConfig,
         stream,
         slice_output: bool,
+        combine_ids=None,
     ):
         """Overlap the common-pair kernel with the residual Stage2 kernel."""
         main_stream = torch.cuda.current_stream() if stream is None else stream
@@ -986,7 +1018,7 @@ class MegaMoEV2:
         result = self.comb_op.combine_no_stage1(
             self._g2_combine_placeholder,
             None,
-            None,
+            combine_ids,
             cur_tok=run_tokens,
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,

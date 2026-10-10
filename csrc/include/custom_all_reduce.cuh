@@ -480,7 +480,7 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool has_tail = false>
 __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
                                                                      RankData* _output_dp,
                                                                      RankSignals sg,
@@ -516,19 +516,19 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     }
     auto tmp_out = tmps[0];
     start_sync<ngpus>(sg, self_sg, rank);
-    // stage 1: reduce scatter
-    // `end - start` is not generally a multiple of `stride`, so a plain grid-stride loop gives
-    // the block a non-uniform trip count and the two __syncthreads() below pair up across
-    // iterations.
-    int loop_end = start + (end - start + stride - 1) / stride * stride;
-    for(int idx = start + tid; idx < loop_end; idx += stride)
+    // stage 1: reduce scatter. The optimized dispatch has equal rank partitions.
+    int loop_end = end;
+    if constexpr(has_tail)
     {
-        bool active = idx < end;
-        if(active)
-            *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
+        loop_end -= (end - start) % tnum_gpu;
+    }
+    int idx = start + tid;
+    for(; idx < loop_end; idx += stride)
+    {
+        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
         __syncthreads();
         // cal add in first 64 threads
-        if(warp_id == 0 && active)
+        if(warp_id == 0)
         {
             A add_reg;
 #pragma unroll
@@ -556,6 +556,15 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
             tmp_out[idx - start] = write_reg;
         }
         __syncthreads();
+    }
+    if constexpr(has_tail)
+    {
+        // Preserve the full-tile loop and its barriers. The remaining packs are
+        // reduced by their original owner threads without shared memory.
+        if(warp_id == 0 && idx < end)
+        {
+            tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+        }
     }
     end_sync<ngpus>(sg, self_sg, rank);
 
@@ -4621,19 +4630,19 @@ class CustomAllreduce
             }
         }
 
-#define KL(ngpus, name)                                                       \
-    do                                                                        \
-    {                                                                         \
-        if(is_broadcast_reg_outptr)                                           \
-        {                                                                     \
-            name<T, ngpus, true><<<blocks, threads, 0, stream>>>(             \
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size); \
-        }                                                                     \
-        else                                                                  \
-        {                                                                     \
-            name<T, ngpus, false><<<blocks, threads, 0, stream>>>(            \
-                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size); \
-        }                                                                     \
+#define KL(ngpus, name, ...)                                                                  \
+    do                                                                                        \
+    {                                                                                         \
+        if(is_broadcast_reg_outptr)                                                           \
+        {                                                                                     \
+            name<T, ngpus, true __VA_OPT__(, ) __VA_ARGS__><<<blocks, threads, 0, stream>>>(  \
+                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);                 \
+        }                                                                                     \
+        else                                                                                  \
+        {                                                                                     \
+            name<T, ngpus, false __VA_OPT__(, ) __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
+                input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size);                 \
+        }                                                                                     \
     } while(0)
 
 #define DISPATCH_REDUCE(ngpus, name)                      \
@@ -4644,6 +4653,10 @@ class CustomAllreduce
             if(use_write_mode)                            \
             {                                             \
                 KL(ngpus, name##_write_mode);             \
+            }                                             \
+            else if(size % THREAD_NUM != 0)               \
+            {                                             \
+                KL(ngpus, name, true);                    \
             }                                             \
             else                                          \
             {                                             \

@@ -1851,19 +1851,23 @@ def paged_attention_decode_sliding_window_head_1(
         if QUERY_SEQ_LEN_POW2 == 1:
             if IS_CAUSAL:
                 sequence_position_extension = query_seq_len - 1 - mtp_idx
-                causal_mask = (
-                    sequence_position_extension + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
                 if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
+                    causal_mask = (
+                        sequence_position_extension + qk_column_offsets[None, :]
+                        < sequence_end_idx
+                    ) & (
                         sequence_position_extension + qk_column_offsets[None, :]
                         >= sequence_start_idx + query_seq_len
                     )
                 else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension + qk_column_offsets[None, :]
-                        >= sequence_start_idx
+                    # Keep this split's own keys; the causal cut is global.
+                    causal_mask = (
+                        (qk_column_offsets[None, :] >= sequence_start_idx)
+                        & (qk_column_offsets[None, :] < sequence_end_idx)
+                        & (
+                            sequence_position_extension + qk_column_offsets[None, :]
+                            < context_length
+                        )
                     )
             else:
                 causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -1879,21 +1883,25 @@ def paged_attention_decode_sliding_window_head_1(
 
             if IS_CAUSAL:
                 sequence_position_extension = query_seq_len - 1 - query_token_idx
-                causal_mask = (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    < sequence_end_idx
-                )
                 if SLIDING_WINDOW > 0:
-                    causal_mask = causal_mask & (
+                    causal_mask = (
+                        sequence_position_extension[:, None]
+                        + qk_column_offsets[None, :]
+                        < sequence_end_idx
+                    ) & (
                         sequence_position_extension[:, None]
                         + qk_column_offsets[None, :]
                         >= sequence_start_idx + query_seq_len
                     )
                 else:
-                    causal_mask = causal_mask & (
-                        sequence_position_extension[:, None]
-                        + qk_column_offsets[None, :]
-                        >= sequence_start_idx
+                    causal_mask = (
+                        (qk_column_offsets[None, :] >= sequence_start_idx)
+                        & (qk_column_offsets[None, :] < sequence_end_idx)
+                        & (
+                            sequence_position_extension[:, None]
+                            + qk_column_offsets[None, :]
+                            < context_length
+                        )
                     )
             else:
                 causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -2068,13 +2076,9 @@ def paged_attention_decode_sliding_window_head_1(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        kv_block_start_idx = kv_block_start_idx2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
@@ -2940,19 +2944,24 @@ def paged_attention_decode_sliding_window(
         if IS_CAUSAL:
             # Compute causal mask based on sequence positions
             sequence_position_extension = query_seq_len - 1 - query_token_idx
-            causal_mask = (
-                sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                < sequence_end_idx
-            )
             if SLIDING_WINDOW > 0:
-                causal_mask = causal_mask & (
+                causal_mask = (
+                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
+                    < sequence_end_idx
+                ) & (
                     sequence_position_extension[:, None] + qk_column_offsets[None, :]
                     >= sequence_start_idx + query_seq_len
                 )
             else:
-                causal_mask = causal_mask & (
-                    sequence_position_extension[:, None] + qk_column_offsets[None, :]
-                    >= sequence_start_idx
+                # Keep this split's own keys; the causal cut is global.
+                causal_mask = (
+                    (qk_column_offsets[None, :] >= sequence_start_idx)
+                    & (qk_column_offsets[None, :] < sequence_end_idx)
+                    & (
+                        sequence_position_extension[:, None]
+                        + qk_column_offsets[None, :]
+                        < context_length
+                    )
                 )
         else:
             causal_mask = qk_column_offsets[None, :] < sequence_end_idx
@@ -3054,14 +3063,10 @@ def paged_attention_decode_sliding_window(
         else:
             attention_accumulator += attention_output
         max_logits = new_max_logits
-        if (
-            sequence_partition_idx + CONTEXT_PARTITION_SIZE_PER_BLOCK
-            < sequence_partition_end_idx
-        ):
-            kv_block_numbers = kv_block_numbers2
-            key_tensor = key_tensor2
-            kv_block_start_idx = kv_block_start_idx2
-            page_offset = page_offset2
+        kv_block_numbers = kv_block_numbers2
+        key_tensor = key_tensor2
+        kv_block_start_idx = kv_block_start_idx2
+        page_offset = page_offset2
 
     # ==================== SINKS HANDLING ====================
     # Add sinks contribution to exp_sums (does not contribute to attention output)
