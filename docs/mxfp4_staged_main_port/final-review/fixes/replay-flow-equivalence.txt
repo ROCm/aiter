@@ -1,0 +1,4 @@
+PASS
+docs/mxfp4_staged_main_port/scripts/configured_replay.py: preserved ordered warmup/call/synchronize/profiler/main-aggregation operations
+docs/mxfp4_staged_main_port/scripts/default_replay.py: preserved ordered warmup/call/synchronize/profiler/main-aggregation operations
+Pure helper worked-literal trace and CPU input hash tests cover the extracted operations.
