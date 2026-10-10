@@ -2917,3 +2917,15 @@ namespace py = pybind11;
           py::arg("rope_dim"),                                      \
           py::arg("eps"),                                           \
           py::arg("sm_scale"));
+
+#define GFX1201_SAGE_ATTENTION_PYBIND                               \
+    m.def("gfx1201_sage_attention_fwd_hip",                         \
+          &gfx1201_sage_attention_fwd_hip,                          \
+          py::arg("q_int8"),                                        \
+          py::arg("q_scale"),                                       \
+          py::arg("k_int8"),                                        \
+          py::arg("k_scale"),                                       \
+          py::arg("v_fp8"),                                         \
+          py::arg("v_scale"),                                       \
+          py::arg("out"),                                           \
+          py::arg("seq_len"));
