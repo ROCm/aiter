@@ -1,0 +1,7 @@
+{"utc": "2026-10-10T17:02:04.016056+00:00", "id": "minimax-2048-prune", "attempts": 48, "elapsed": 35.3, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:02:49.034012+00:00", "id": "minimax-2048-prune", "attempts": 129, "elapsed": 80.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:03:34.048689+00:00", "id": "minimax-2048-prune", "attempts": 183, "elapsed": 125.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:04:19.060715+00:00", "id": "minimax-2048-prune", "attempts": 256, "elapsed": 170.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:05:04.072968+00:00", "id": "minimax-2048-prune", "attempts": 329, "elapsed": 215.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:05:49.084566+00:00", "id": "minimax-2048-prune", "attempts": 356, "elapsed": 260.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:06:34.097529+00:00", "id": "minimax-2048-prune", "attempts": 424, "elapsed": 305.4, "g1_screens": 0, "g2_screens": 0}

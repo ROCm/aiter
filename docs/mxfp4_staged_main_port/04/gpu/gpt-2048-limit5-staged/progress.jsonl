@@ -1,0 +1,5 @@
+{"utc": "2026-10-10T18:20:50.868688+00:00", "id": "gpt-2048-limit5-staged", "attempts": 0, "elapsed": 2.9, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T18:21:35.924361+00:00", "id": "gpt-2048-limit5-staged", "attempts": 0, "elapsed": 48.0, "g1_screens": 17, "g2_screens": 0}
+{"utc": "2026-10-10T18:22:20.945527+00:00", "id": "gpt-2048-limit5-staged", "attempts": 0, "elapsed": 93.0, "g1_screens": 27, "g2_screens": 16}
+{"utc": "2026-10-10T18:23:05.966626+00:00", "id": "gpt-2048-limit5-staged", "attempts": 0, "elapsed": 138.0, "g1_screens": 27, "g2_screens": 67}
+{"utc": "2026-10-10T18:23:50.984863+00:00", "id": "gpt-2048-limit5-staged", "attempts": 0, "elapsed": 183.0, "g1_screens": 27, "g2_screens": 94}

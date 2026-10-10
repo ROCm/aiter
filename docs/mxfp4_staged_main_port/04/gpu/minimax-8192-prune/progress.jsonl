@@ -1,0 +1,4 @@
+{"utc": "2026-10-10T17:32:04.641318+00:00", "id": "minimax-8192-prune", "attempts": 16, "elapsed": 29.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:32:49.663507+00:00", "id": "minimax-8192-prune", "attempts": 95, "elapsed": 74.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:33:34.679576+00:00", "id": "minimax-8192-prune", "attempts": 116, "elapsed": 119.4, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T17:34:19.694535+00:00", "id": "minimax-8192-prune", "attempts": 184, "elapsed": 164.5, "g1_screens": 0, "g2_screens": 0}

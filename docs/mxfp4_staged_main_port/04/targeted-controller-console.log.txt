@@ -1,0 +1,40 @@
+TARGET minimax-64-default-full-vs-prune
+Started GPU7 task pid=604587: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-64-default-full-vs-prune/result.json', '--reason', 'Full universe contains prune universe but independent prune winner is1.45% faster; check winner ordering/noise.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-64-default-full-vs-prune/task
+TARGET minimax-128-default-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=604990: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-128-default-prune-vs-staged/result.json', '--reason', 'Negative independent staged difference while prune winner G2 rank3 was not retained; check noise.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-128-default-prune-vs-staged/task
+TARGET minimax-512-default-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=605475: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-512-default-prune-vs-staged/result.json', '--reason', 'Staged+3.54%; prune winner G1 rank4 was excluded.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-512-default-prune-vs-staged/task
+TARGET minimax-2048-default-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=605687: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-2048-default-prune-vs-staged/result.json', '--reason', 'Staged+2.79%; prune winner G1 rank5 was excluded.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-2048-default-prune-vs-staged/task
+TARGET gpt-2048-default-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=606237: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-default-prune-vs-staged/result.json', '--reason', 'Staged+5.11%; atomic prune winner G2 rank3 was excluded.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-default-prune-vs-staged/task
+TARGET gpt-2048-fp8-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=606487: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-fp8-prune-vs-staged/result.json', '--reason', 'Staged+8.48%; non-atomic prune winner G2 rank7 was excluded.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-fp8-prune-vs-staged/task
+TARGET gpt-2048-limit5-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=606721: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-limit5-prune-vs-staged/result.json', '--reason', 'Staged+4.24%; atomic prune winner G2 rank3 was excluded.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-limit5-prune-vs-staged/task
+TARGET gpt-2048-combined5-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=606959: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-combined5-prune-vs-staged/result.json', '--reason', 'Staged+8.36%; same rank7 reduce loss as FP8 with configured limit5.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-combined5-prune-vs-staged/task
+TARGET gpt-2048-fp4-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=607189: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-fp4-prune-vs-staged/result.json', '--reason', 'Same selected pair measured−0.658% staged difference in independent processes; alternating replay quantifies noise.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/gpt-2048-fp4-prune-vs-staged/task
+TARGET minimax-8192-default-prune-vs-staged
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=607517: ['docs/mxfp4_staged_main_port/04/alternating_replay.py', '--left', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/winner.csv', '--right', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-8192-default-prune-vs-staged/result.json', '--reason', 'Retained/validated prune winner and staged measured−0.059% difference; alternating replay quantifies near-zero ordering noise.', '--repeats', '3']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/targeted/minimax-8192-default-prune-vs-staged/task
+All ten targeted alternating replay tasks complete

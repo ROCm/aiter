@@ -1,0 +1,297 @@
+RUN minimax-64-full replay
+Started GPU7 task pid=580502: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/replay-task
+RUN minimax-64-full aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=580866: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/aot-task
+RUN minimax-64-full precompiled
+Started GPU7 task pid=581360: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/precompiled-task
+RUN minimax-64-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=581660: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/replay-task
+RUN minimax-64-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=581993: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/aot-task
+RUN minimax-64-prune precompiled
+Started GPU7 task pid=582514: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-prune/precompiled-task
+RUN minimax-64-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=582800: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/replay-task
+RUN minimax-64-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=582959: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/aot-task
+RUN minimax-64-staged precompiled
+Started GPU7 task pid=583320: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-64-staged/precompiled-task
+RUN minimax-128-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=583478: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/replay-task
+RUN minimax-128-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=583636: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/aot-task
+RUN minimax-128-prune precompiled
+Started GPU7 task pid=583952: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-prune/precompiled-task
+RUN minimax-128-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=584110: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/replay-task
+RUN minimax-128-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=584427: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/aot-task
+RUN minimax-128-staged precompiled
+Started GPU7 task pid=584868: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-128-staged/precompiled-task
+RUN minimax-512-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=585150: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/replay-task
+RUN minimax-512-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=585471: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/aot-task
+RUN minimax-512-prune precompiled
+Started GPU7 task pid=586114: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-prune/precompiled-task
+RUN minimax-512-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=586271: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/replay-task
+RUN minimax-512-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=586555: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/aot-task
+RUN minimax-512-staged precompiled
+Started GPU7 task pid=586870: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-512-staged/precompiled-task
+RUN minimax-1024-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=587036: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/replay-task
+RUN minimax-1024-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=587194: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/aot-task
+RUN minimax-1024-prune precompiled
+Started GPU7 task pid=587689: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-prune/precompiled-task
+RUN minimax-1024-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=587973: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/replay-task
+RUN minimax-1024-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=588140: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/aot-task
+RUN minimax-1024-staged precompiled
+Started GPU7 task pid=588455: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-1024-staged/precompiled-task
+RUN minimax-2048-full replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=588613: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/replay-task
+RUN minimax-2048-full aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=588771: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/aot-task
+RUN minimax-2048-full precompiled
+Started GPU7 task pid=589085: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-full/precompiled-task
+RUN minimax-2048-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=589252: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/replay-task
+RUN minimax-2048-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=589409: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/aot-task
+RUN minimax-2048-prune precompiled
+Started GPU7 task pid=589814: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-prune/precompiled-task
+RUN minimax-2048-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=589972: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/replay-task
+RUN minimax-2048-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=590130: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/aot-task
+RUN minimax-2048-staged precompiled
+Started GPU7 task pid=590490: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-2048-staged/precompiled-task
+RUN minimax-4096-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=590648: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/replay-task
+RUN minimax-4096-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=590933: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/aot-task
+RUN minimax-4096-prune precompiled
+Started GPU7 task pid=591212: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-prune/precompiled-task
+RUN minimax-4096-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=591379: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/replay-task
+RUN minimax-4096-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=591537: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/aot-task
+RUN minimax-4096-staged precompiled
+Started GPU7 task pid=591888: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-4096-staged/precompiled-task
+RUN minimax-8192-full replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=592046: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/replay-task
+RUN minimax-8192-full aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=592212: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/aot-task
+RUN minimax-8192-full precompiled
+Started GPU7 task pid=592691: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-full/precompiled-task
+RUN minimax-8192-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=592848: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/replay-task
+RUN minimax-8192-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=593006: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/aot-task
+RUN minimax-8192-prune precompiled
+Started GPU7 task pid=593331: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-prune/precompiled-task
+RUN minimax-8192-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=593615: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/replay-task
+RUN minimax-8192-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=593772: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/aot-task
+RUN minimax-8192-staged precompiled
+Started GPU7 task pid=594088: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/minimax-8192-staged/precompiled-task
+RUN gpt-2048-default-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=594254: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/replay-task
+RUN gpt-2048-default-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=594413: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/aot-task
+RUN gpt-2048-default-prune precompiled
+Started GPU7 task pid=594763: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-prune/precompiled-task
+RUN gpt-2048-default-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=595048: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/replay-task
+RUN gpt-2048-default-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=595207: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/aot-task
+RUN gpt-2048-default-staged precompiled
+Started GPU7 task pid=595587: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-default-staged/precompiled-task
+RUN gpt-2048-fp8-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=595744: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/replay-task
+RUN gpt-2048-fp8-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=596027: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/aot-task
+RUN gpt-2048-fp8-prune precompiled
+Started GPU7 task pid=596397: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-prune/precompiled-task
+RUN gpt-2048-fp8-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=596564: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/replay-task
+RUN gpt-2048-fp8-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=596721: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/aot-task
+RUN gpt-2048-fp8-staged precompiled
+Started GPU7 task pid=597162: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp8-staged/precompiled-task
+RUN gpt-2048-fp4-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=597320: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/replay-task
+RUN gpt-2048-fp4-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=597479: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/aot-task
+RUN gpt-2048-fp4-prune precompiled
+Started GPU7 task pid=597838: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-prune/precompiled-task
+RUN gpt-2048-fp4-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=597996: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/replay-task
+RUN gpt-2048-fp4-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=598154: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/aot-task
+RUN gpt-2048-fp4-staged precompiled
+Started GPU7 task pid=598434: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-fp4-staged/precompiled-task
+RUN gpt-2048-limit5-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=598727: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/replay-task
+RUN gpt-2048-limit5-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=598886: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/aot-task
+RUN gpt-2048-limit5-prune precompiled
+Started GPU7 task pid=599236: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/precompiled-task
+RUN gpt-2048-limit5-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=599401: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/replay-task
+RUN gpt-2048-limit5-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=599559: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/aot-task
+RUN gpt-2048-limit5-staged precompiled
+Started GPU7 task pid=600018: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-staged/precompiled-task
+RUN gpt-2048-combined5-prune replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=600182: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/replay-task
+RUN gpt-2048-combined5-prune aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=600340: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/aot-task
+RUN gpt-2048-combined5-prune precompiled
+Started GPU7 task pid=600711: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-prune/precompiled-task
+RUN gpt-2048-combined5-staged replay
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=600869: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/replay.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/replay-task
+RUN gpt-2048-combined5-staged aot
+GPU7 busy; waiting on prescribed card
+Started GPU7 task pid=601033: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/aot.json', '--preserve-generated-route-weights', '--action', 'aot', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/aot-task
+RUN gpt-2048-combined5-staged precompiled
+Started GPU7 task pid=601474: ['docs/mxfp4_staged_main_port/scripts/configured_replay.py', '--csv', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/winner.csv', '--result', '/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/precompiled.json', '--preserve-generated-route-weights', '--action', 'replay', '--warmup', '5', '--iters', '101', '--swiglu-limit', '5']
+GPU7 task exited 0: /root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-combined5-staged/precompiled-task
+Selected prescribed calibration actions completed

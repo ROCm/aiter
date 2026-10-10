@@ -1,0 +1,4 @@
+{"utc": "2026-10-10T16:45:33.730068+00:00", "id": "minimax-1024-staged", "attempts": 0, "elapsed": 19.5, "g1_screens": 5, "g2_screens": 0}
+{"utc": "2026-10-10T16:46:18.749122+00:00", "id": "minimax-1024-staged", "attempts": 0, "elapsed": 64.5, "g1_screens": 35, "g2_screens": 0}
+{"utc": "2026-10-10T16:47:03.764570+00:00", "id": "minimax-1024-staged", "attempts": 0, "elapsed": 109.5, "g1_screens": 60, "g2_screens": 0}
+{"utc": "2026-10-10T16:47:48.776362+00:00", "id": "minimax-1024-staged", "attempts": 14, "elapsed": 154.6, "g1_screens": 66, "g2_screens": 32}

@@ -1,0 +1,61 @@
+{
+  "coordinator_start_utc": "2026-10-10T18:53:52.935853+00:00",
+  "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-04",
+  "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+  "command": [
+    "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+    "docs/mxfp4_staged_main_port/scripts/configured_replay.py",
+    "--csv",
+    "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/winner.csv",
+    "--result",
+    "/root/workspace/tmp_dev/aiter-mxfp4-04/docs/mxfp4_staged_main_port/04/gpu/gpt-2048-limit5-prune/aot.json",
+    "--preserve-generated-route-weights",
+    "--action",
+    "aot",
+    "--warmup",
+    "5",
+    "--iters",
+    "101",
+    "--swiglu-limit",
+    "5"
+  ],
+  "implementation_commit": "3f25f8f84359c999060cb3ace0afa52df2cef577",
+  "environment": {
+    "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+    "HIP_VISIBLE_DEVICES": "0",
+    "GPU_ARCHS": "gfx950",
+    "CU_NUM": null,
+    "FLYDSL_GPU_ARCH": "gfx950",
+    "AITER_USE_SYSTEM_TRITON": "1",
+    "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+    "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/calibration-aot-04-limit5",
+    "FLYDSL_RUNTIME_RUN_ONLY": null,
+    "AITER_CONFIG_FMOE": null,
+    "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5",
+    "AITER_FLYDSL_STAGE2_FP8": "0",
+    "AITER_MXFP4_INTERMEDIATE": "0",
+    "TUNE_MOE_EXPERT_BALANCE": "False",
+    "TUNE_MOE_ROUTING_SEED": "0",
+    "AITER_LOG_MORE": null,
+    "AITER_MOE_EXPERT_BALANCE": null,
+    "MAX_JOBS": "8"
+  },
+  "timeout_contract": "No task or shape hard deadline; wait for child exit",
+  "idle_before_start": {
+    "utc": "2026-10-10T18:53:59.737265+00:00",
+    "status": {
+      "Unique ID": "0x5d8a72a332aa124c",
+      "GPU use (%)": "0",
+      "GFX Activity": "344805601",
+      "PCI Bus": "0000:F5:00.0",
+      "VRAM Total Memory (B)": "309220868096",
+      "VRAM Total Used Memory (B)": "297766912"
+    },
+    "processes": []
+  },
+  "pid": 598886,
+  "process_start_utc": "2026-10-10T18:53:59.740770+00:00",
+  "exit_code": 0,
+  "process_exit_utc": "2026-10-10T18:54:11.528233+00:00"
+}
