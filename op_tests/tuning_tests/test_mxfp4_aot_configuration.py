@@ -219,3 +219,30 @@ def test_fp4_flag_keeps_bn512_scatter_on_supported_bf16_path(monkeypatch, tmp_pa
     path = winner_csv(tmp_path, bn=512)
     jobs = [job for job in aot.parse_csv(str(path)) if job["stage"] == 2]
     assert {job["out_dtype"] for job in jobs} == {"bf16"}
+
+
+def test_selected_csv_batch_collection_uses_matching_environment_and_excludes_other_csvs(
+    monkeypatch, tmp_path, external_compiler
+):
+    from aiter.aot.flydsl.common import collect_aot_jobs
+
+    unused_dir = tmp_path / "unused"
+    unused_dir.mkdir()
+    winner_csv(unused_dir, activation="situv2")
+    selected = winner_csv(tmp_path)
+    monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
+    monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
+    monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
+    jobs = collect_aot_jobs([str(selected), str(selected)], aot.parse_csv)
+    assert len(jobs) == 4
+    assert {job["swiglu_limit"] for job in jobs if job["stage"] == 1} == {5.0}
+    assert {
+        (job["out_dtype"], job["enable_bias"]) for job in jobs if job["stage"] == 2
+    } == {
+        ("fp4", False),
+        ("bf16", True),
+    }
+    assert all(
+        aot.compile_one_config(**job)["compile_time"] is not None for job in jobs
+    )
+    assert external_compiler
