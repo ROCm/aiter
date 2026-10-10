@@ -149,7 +149,7 @@ TRAITS_NAME_MAP = {
 }
 
 KARGS_NAME_MAP = {
-    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_gemm_scale_splitk_kargs_gfx950",
+    "a8w8_mxscale_bmm_bpreshuffle_compact": "opus_bmm_compact_kargs_gfx950",
     "a8w8_scale": "opus_gemm_scale_kargs_gfx950",
     "a8w8_mxscale": "opus_gemm_scale_kargs_gfx950",
     "a8w8": "opus_gemm_noscale_kargs_gfx950",
@@ -2495,7 +2495,6 @@ def gen_bmm_mxscale_compact_instance(
     instance_impl_host_tu_split,
     **_unused,
 ):
-    kargs_name = "opus_bmm_compact_kargs_gfx950"
     _, tpl, fn = kargs_template_vars(k.kernel_tag, kargs_name)
     launcher = _BMM_COMPACT_LAUNCHER_BODY.replace("@@NAME@@", k.name).replace(
         "@@KERNEL@@", kernel_func

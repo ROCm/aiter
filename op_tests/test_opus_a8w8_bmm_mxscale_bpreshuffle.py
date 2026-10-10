@@ -14,7 +14,7 @@ All kids run on the same quantized data -- kid 320 on the row-major weight, 170
 and 171 on the preshuffled one -- so a mismatch localizes to the preshuffle /
 op_sel / direct-B changes rather than to the quantization or the reference.
 
-The compact regression covers the fixed fast path and K segment tails.
+The compact regression covers runtime dimensions, short K and segment tails.
 
 Usage:
     python3 op_tests/test_opus_a8w8_bmm_mxscale_bpreshuffle.py
@@ -488,6 +488,12 @@ def _check_dispatch():
 
 # Fast path, partial M/N tiles, and short/multi-tile K segment tails.
 COMPACT_SHAPES = [
+    (3, 7, 128, 128),
+    (2, 17, 256, 512),
+    (3, 97, 384, 768),
+    (3, 95, 256, 8192),
+    (2, 193, 512, 8448),
+    (16, 2047, 128, 256),
     (1, 1, 1024, 4096),
     (3, 65, 384, 4224),
     (2, 129, 512, 4608),
@@ -617,7 +623,7 @@ def main():
     print("dispatch: B-layout routing across the two public entries", flush=True)
     ok &= _check_dispatch()
     if args.split_k == 1 and any(kid in _COMPACT_KERNELS for kid in KIDS_BPRESHUFFLE):
-        print("compact: fast path and K segment tails", flush=True)
+        print("compact: runtime dimensions and K segment tails", flush=True)
         for shape in COMPACT_SHAPES:
             test_compact_mxscale_bmm(shape, ydt)
     for group in groups:

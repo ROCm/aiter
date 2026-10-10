@@ -58,14 +58,15 @@ __device__ __forceinline__ void opus_bmm_compact_runtime_body(opus_bmm_compact_k
     auto gsb = make_gmem((const unsigned char*)k.ptr_sfb + (size_t)batch * (N / 128) * scale_k);
     // Keep lane offsets invariant across K tiles. The buffer instruction
     // adds the CTA-uniform row/column and K-tile offsets in scalar registers.
-    // Invalid A rows keep the original bounded-resource vector offset.
+    // Padded rows can exceed the signed span before masking, so compute
+    // their vector offsets unsigned and retain the bounded-resource sentinel.
     const int a_soffset = row * k.batch * K;
     auto issue = [&](auto sc, int kt) {
         constexpr int s = decltype(sc)::value;
         static_for<CA>([&](auto ic) {
             constexpr int i = decltype(ic)::value;
             int lin = (i * TH + tid) * 16, r = lin / BK, c = (lin % BK) ^ ((r % (BK / 16)) * 16);
-            int src = r * k.batch * K + c;
+            unsigned int src = static_cast<unsigned int>(r) * k.batch * K + c;
             if(row + r >= k.m)
                 src = a_bytes;
             ga.template async_load<16>(sm + s * PITCH + (i * TH + wave * 64) * 16,
@@ -88,7 +89,7 @@ __device__ __forceinline__ void opus_bmm_compact_runtime_body(opus_bmm_compact_k
         static_for<CA>([&](auto ic) {
             constexpr int i = decltype(ic)::value;
             int lin = (i * TH + tid) * 16, r = lin / BK, c = (lin % BK) ^ ((r % (BK / 16)) * 16);
-            int src = r * k.batch * K + c;
+            unsigned int src = static_cast<unsigned int>(r) * k.batch * K + c;
             if(row + r >= k.m)
                 src = a_bytes;
             ga.template async_load<16>(sm + s * PITCH + (i * TH + wave * 64) * 16,
@@ -135,8 +136,8 @@ __device__ __forceinline__ void opus_bmm_compact_runtime_body(opus_bmm_compact_k
         const int kr = k_base / BK;
         if(scale_k % 4 == 0)
         {
-            // As on the fixed path, copy aligned scale dwords directly to
-            // LDS. The first tile wait covers these earlier VMEM requests.
+            // Copy aligned scale dwords directly to LDS. The first tile wait
+            // covers these earlier VMEM requests.
             const int scale_words = scale_k / 4;
             auto ga32 = make_gmem((const unsigned int*)k.ptr_sfa + batch * scale_words,
                                   (unsigned int)(k.m * k.batch * scale_k));
@@ -267,7 +268,7 @@ __device__ __forceinline__ void opus_bmm_compact_runtime_body(opus_bmm_compact_k
                                     int lin = (i * TH + tid) * 16;
                                     int r = lin / BK;
                                     int c = (lin % BK) ^ ((r % (BK / 16)) * 16);
-                                    int src = r * k.batch * K + c;
+                                    unsigned int src = static_cast<unsigned int>(r) * k.batch * K + c;
                                     if(row + r >= k.m) src = a_bytes;
                                     ga.template async_load<16>(
                                         sm + dest * PITCH + (i * TH + wave * 64) * 16,
@@ -323,7 +324,7 @@ __device__ __forceinline__ void opus_bmm_compact_runtime_body(opus_bmm_compact_k
         {
             auto v =
                 *reinterpret_cast<vector_t<D_OUT, VEC>*>(sm + (r * (BN + 8) + c) * sizeof(D_OUT));
-            int off = (row + r) * k.batch * N + col + c;
+            unsigned int off = static_cast<unsigned int>(row + r) * k.batch * N + col + c;
             if(row + r >= k.m)
                 off = k.m * k.batch * N; // Beyond the bounded output resource.
             gy.template store<VEC>(v, off);
@@ -386,14 +387,15 @@ __device__ __forceinline__ void opus_bmm_compact_full_body(opus_bmm_compact_karg
     auto gsb = make_gmem((const unsigned char*)k.ptr_sfb + (size_t)batch * (N / 128) * scale_k);
     // Keep lane offsets invariant across K tiles. The buffer instruction
     // adds the CTA-uniform row/column and K-tile offsets in scalar registers.
-    // Invalid A rows keep the original bounded-resource vector offset.
+    // Padded rows can exceed the signed span before masking, so compute
+    // their vector offsets unsigned and retain the bounded-resource sentinel.
     const int a_soffset = row * k.batch * K;
     auto issue = [&](auto sc, int kt) {
         constexpr int s = decltype(sc)::value;
         static_for<CA>([&](auto ic) {
             constexpr int i = decltype(ic)::value;
             int lin = (i * TH + tid) * 16, r = lin / BK, c = (lin % BK) ^ ((r % (BK / 16)) * 16);
-            int src = r * k.batch * K + c;
+            unsigned int src = static_cast<unsigned int>(r) * k.batch * K + c;
             if(row + r >= k.m)
                 src = a_bytes;
             ga.template async_load<16>(sm + s * PITCH + (i * TH + wave * 64) * 16,
@@ -416,7 +418,7 @@ __device__ __forceinline__ void opus_bmm_compact_full_body(opus_bmm_compact_karg
         static_for<CA>([&](auto ic) {
             constexpr int i = decltype(ic)::value;
             int lin = (i * TH + tid) * 16, r = lin / BK, c = (lin % BK) ^ ((r % (BK / 16)) * 16);
-            int src = r * k.batch * K + c;
+            unsigned int src = static_cast<unsigned int>(r) * k.batch * K + c;
             if(row + r >= k.m)
                 src = a_bytes;
             ga.template async_load<16>(sm + s * PITCH + (i * TH + wave * 64) * 16,
@@ -463,8 +465,8 @@ __device__ __forceinline__ void opus_bmm_compact_full_body(opus_bmm_compact_karg
         const int kr = k_base / BK;
         if(scale_k % 4 == 0)
         {
-            // As on the fixed path, copy aligned scale dwords directly to
-            // LDS. The first tile wait covers these earlier VMEM requests.
+            // Copy aligned scale dwords directly to LDS. The first tile wait
+            // covers these earlier VMEM requests.
             const int scale_words = scale_k / 4;
             auto ga32 = make_gmem((const unsigned int*)k.ptr_sfa + batch * scale_words,
                                   (unsigned int)(k.m * k.batch * scale_k));
@@ -599,7 +601,7 @@ __device__ __forceinline__ void opus_bmm_compact_full_body(opus_bmm_compact_karg
                                     int lin = (i * TH + tid) * 16;
                                     int r = lin / BK;
                                     int c = (lin % BK) ^ ((r % (BK / 16)) * 16);
-                                    int src = r * k.batch * K + c;
+                                    unsigned int src = static_cast<unsigned int>(r) * k.batch * K + c;
                                     if(row + r >= k.m) src = a_bytes;
                                     ga.template async_load<16>(
                                         sm + dest * PITCH + (i * TH + wave * 64) * 16,
@@ -653,7 +655,7 @@ __device__ __forceinline__ void opus_bmm_compact_full_body(opus_bmm_compact_karg
         {
             auto v =
                 *reinterpret_cast<vector_t<D_OUT, VEC>*>(sm + (r * (BN + 8) + c) * sizeof(D_OUT));
-            int off = (row + r) * k.batch * N + col + c;
+            unsigned int off = static_cast<unsigned int>(row + r) * k.batch * N + col + c;
             if(row + r >= k.m)
                 off = k.m * k.batch * N; // Beyond the bounded output resource.
             gy.template store<VEC>(v, off);
