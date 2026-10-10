@@ -2,7 +2,7 @@
 
 Status: ready-for-agent
 
-The [spec.md](spec.md) and the approved [four tickets](issues/README.md) incorporate the authorized pre-implementation reviewer corrections and are ready for implementation. No implementation or acceptance execution has started; the [work map](map.md) tracks ticket state. This reference supplies fixture rationale and measurement details. Historical experiment evidence does not replace integrated-port validation.
+The [spec.md](spec.md) and the approved [four tickets](issues/README.md) incorporate the authorized pre-implementation reviewer corrections and are ready for implementation. Implementation and ticket-specific acceptance are active; the [work map](map.md) tracks state and [current evidence](../../docs/mxfp4_staged_main_port/implementation/README.md) links recorded results. Required GPU and calibration evidence is recorded as it is completed. This reference supplies fixture rationale and measurement details. Historical experiment evidence does not replace integrated-port validation.
 
 ## Functional acceptance
 

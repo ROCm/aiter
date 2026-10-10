@@ -1,8 +1,8 @@
 # MXFP4 staged main-port implementation plan
 
-Status: ready-for-agent
+Status: claimed
 
-Reviewer decisions are incorporated and the user approved the four-ticket breakdown on 2026-10-10. The [published tickets](issues/README.md) are the sole current work set. The user subsequently authorized pre-implementation documentation corrections, including restoring the [specification](spec.md) to `ready-for-agent`; no implementation has started. The spec defines behavior and the [work map](map.md) tracks ticket state. Detailed checks and the 27-search matrix are in [acceptance.md](acceptance.md).
+Reviewer decisions are incorporated and the user approved the four-ticket breakdown on 2026-10-10. The [published tickets](issues/README.md) are the sole current work set. The user subsequently authorized pre-implementation documentation corrections, including restoring the [specification](spec.md) to `ready-for-agent`; implementation is active and its state is recorded in [map.md](map.md). The spec defines behavior and the [work map](map.md) tracks ticket state. Detailed checks and the 27-search matrix are in [acceptance.md](acceptance.md).
 
 ## Integration approach
 
