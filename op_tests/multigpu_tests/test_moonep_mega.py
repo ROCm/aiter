@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-"""EP8/EP4 check: MegaMoEV2 with MoonEP placement fused into prepare.
+"""EP8/EP4 check: MoonEP planning in front of an unchanged MegaMoEV2.
 
 Runs the same skewed routing through a plain MegaMoEV2 and through a
-``moonep_slots=B`` instance whose weight window is ``[EPR home | B slots]``.
-The slots are filled in ``after_prepare`` from the ``placed`` table prepare
+plain instance over ``R * (EPR + B)`` experts whose weight window is ``[EPR
+home | B slots]``, fed the virtual ids ``MoonEPPlanner`` rewrites the routes to.
+The slots are filled from the ``placed`` table the planner
 wrote, the way a production weight pool would.  Outputs must match.
 
-    torchrun --nproc-per-node 8|4 op_tests/multigpu_tests/test_moonep_mega_fuse.py
+    torchrun --nproc-per-node 8|4 op_tests/multigpu_tests/test_moonep_mega.py
 """
 
 import argparse
@@ -26,6 +27,7 @@ from test_mega_moe_v2 import (
 )
 
 from aiter.ops.flydsl.kernels.mega_moe import MegaMoEV2
+from aiter.ops.flydsl.kernels.moonep_plan import MoonEPPlanner
 
 MODEL_DIM, INTER_DIM, EXPERTS, TOPK, SWIGLU = 7168, 3072, 384, 6, 10.0
 
@@ -78,12 +80,12 @@ def main():
     parser.add_argument(
         "--stream",
         action="store_true",
-        help="pass an explicit side stream to forward()",
+        help="run planning, slot fill and forward() on an explicit side stream",
     )
     parser.add_argument(
         "--graph",
         action="store_true",
-        help="run the fused instance from one CUDA graph per layer",
+        help="run planning, slot fill and the instance from one CUDA graph per layer",
     )
     args = parser.parse_args()
     rank, world, device = _setup_dist()
@@ -117,59 +119,54 @@ def main():
             )
             del everyone
 
-        def bind_plain(moe, layer):
-            w1, w1s, w2, w2s = layer["home"]
+        def bind(moe, weights):
+            w1, w1s, w2, w2s = weights
             moe._s1_w1, moe._s1_w1_scale = w1.view(torch.uint8), w1s.view(torch.uint8)
             moe.w2, moe.w2_scale = w2, w2s
-
-        def bind_fused(moe, layer):
-            w1, w1s, w2, w2s = layer["views"]
-            moe._s1_w1, moe._s1_w1_scale = w1.view(torch.uint8), w1s.view(torch.uint8)
-            moe.w2, moe.w2_scale = w2, w2s
-            moe.bind_moonep_slot_state(layer["state"])
 
         first = layers[0]
+        mtpr = args.mtpr or args.tokens
+        common = {
+            "rank": rank,
+            "world_size": world,
+            "model_dim": MODEL_DIM,
+            "inter_dim": INTER_DIM,
+            "topk": TOPK,
+            "quant": "a8w4",
+            "max_tok_per_rank": mtpr,
+            "swiglu_limit": SWIGLU,
+        }
         plain = MegaMoEV2(
-            rank=rank,
-            world_size=world,
-            model_dim=MODEL_DIM,
-            inter_dim=INTER_DIM,
             experts=EXPERTS,
-            topk=TOPK,
-            quant="a8w4",
             w1=first["home"][0],
             w1_scale=first["home"][1],
             w2=first["home"][2],
             w2_scale=first["home"][3],
-            max_tok_per_rank=args.mtpr or args.tokens,
-            swiglu_limit=SWIGLU,
+            **common,
         )
-        fused = MegaMoEV2(
-            rank=rank,
-            world_size=world,
-            model_dim=MODEL_DIM,
-            inter_dim=INTER_DIM,
+        wide = MegaMoEV2(
             experts=world * (epr + B),
-            topk=TOPK,
-            quant="a8w4",
             w1=first["views"][0],
             w1_scale=first["views"][1],
             w2=first["views"][2],
             w2_scale=first["views"][3],
-            max_tok_per_rank=args.mtpr or args.tokens,
-            swiglu_limit=SWIGLU,
-            moonep_slots=B,
+            **common,
         )
-        shared = fused.new_moonep_slot_state()
+        planner = MoonEPPlanner(
+            rank=rank,
+            world_size=world,
+            experts=EXPERTS,
+            slots=B,
+            max_routes=mtpr * TOPK,
+        )
+        shared = planner.new_slot_state()
         for layer in layers:
-            layer["state"] = (
-                shared if args.shared_state else fused.new_moonep_slot_state()
-            )
+            layer["state"] = shared if args.shared_state else planner.new_slot_state()
 
         def prefetch(layer):
             if args.skip_prefetch:
                 return
-            placed, prev = fused.moonep_slot_tables()
+            placed, prev = layer["state"]["placed"], layer["state"]["prev"]
             want = placed[rank].long()
             copy = (want >= 0) & (want != prev[rank].long())
             src = want.clamp(min=0)
@@ -179,27 +176,30 @@ def main():
                     torch.where(copy[:, None], all_experts.index_select(0, src), rows)
                 )
 
+        def run(layer, x, wts, ids, balance):
+            if balance:
+                virtual = planner.plan(ids, layer["state"])
+                prefetch(layer)
+            else:
+                virtual = planner.home_ids(ids)
+            return wide.forward(x, wts, virtual)
+
         graphs = {}
         side = torch.cuda.Stream()
 
         def replay(index, layer, x, wts, ids):
-            """Capture this layer once (prepare, slot fill and all), then replay."""
+            """Capture this layer once (planning, slot fill and all), then replay."""
             if index not in graphs:
                 static = {"x": x.clone(), "wts": wts.clone(), "ids": ids.clone()}
 
-                def run():
-                    return fused.forward(
-                        static["x"],
-                        static["wts"],
-                        static["ids"],
-                        after_prepare=lambda: prefetch(layer),
-                    )
+                def body():
+                    return run(layer, static["x"], static["wts"], static["ids"], True)
 
-                run()
+                body()
                 _barrier()
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=torch.cuda.Stream()):
-                    static["out"] = run()
+                    static["out"] = body()
                 graphs[index] = (graph, static)
             graph, static = graphs[index]
             static["x"].copy_(x)
@@ -218,39 +218,26 @@ def main():
                     x, wts, ids = _routing(
                         args.tokens, rank, step + 5 * index, device, hot=step % 2 == 0
                     )
-                    bind_plain(plain, layer)
+                    bind(plain, layer["home"])
                     ref = plain.forward(x, wts, ids).clone()
                     _barrier()
-                    bind_fused(fused, layer)
+                    bind(wide, layer["views"])
                     if args.graph:
                         out = replay(index, layer, x, wts, ids)
                     elif args.stream:
-                        # The slot fill must follow prepare onto this stream.
                         side.wait_stream(torch.cuda.current_stream())
-                        out = fused.forward(
-                            x,
-                            wts,
-                            ids,
-                            stream=side,
-                            moonep_balance=balance,
-                            after_prepare=lambda layer=layer: prefetch(layer),
-                        )
+                        with torch.cuda.stream(side):
+                            out = run(layer, x, wts, ids, balance)
                         torch.cuda.current_stream().wait_stream(side)
                         out = out.clone()
                     else:
-                        out = fused.forward(
-                            x,
-                            wts,
-                            ids,
-                            moonep_balance=balance,
-                            after_prepare=lambda layer=layer: prefetch(layer),
-                        ).clone()
+                        out = run(layer, x, wts, ids, balance).clone()
                     _barrier()
                     diff = (out.float() - ref.float()).abs()
                     scale = ref.float().abs().max().clamp(min=1e-6)
                     max_rel = float(diff.max() / scale)
                     exact = bool(torch.equal(out, ref))
-                    placed, prev = fused.moonep_slot_tables()
+                    placed, prev = layer["state"]["placed"], layer["state"]["prev"]
                     prefetched = int((placed >= 0).sum())
                     kept = int(((placed >= 0) & (placed == prev)).sum())
                     stats = torch.tensor(

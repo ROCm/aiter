@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
-"""Single-GPU check of the MoonEP placement fused into MegaMoE prepare.
+"""Single-GPU check of the MoonEP planner kernels.
 
-Runs ``emit_moonep_placement`` + ``emit_moonep_virtual_counts`` in one
-standalone CTA on a synthetic gathered histogram and compares against
-a CPU reference of the MoonEP placement and a Python virtual-count split.
+Runs ``emit_moonep_placement`` in one standalone CTA on a synthetic gathered
+histogram and compares against a CPU reference of the MoonEP placement, then
+rewrites every source rank's routes with the planner's ``rewrite`` kernel and
+checks how many land on each virtual (destination, slot) against a Python
+split of the same placement.
 """
 
 import argparse
@@ -15,9 +17,9 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 
-from aiter.ops.flydsl.kernels.mega_moe.moonep_fuse import (
+from aiter.ops.flydsl.kernels.moonep_plan import (
     emit_moonep_placement,
-    emit_moonep_virtual_counts,
+    make_moonep_plan_jit,
     moonep_lds_fields,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -26,14 +28,14 @@ R, E, B, K = 8, 384, 8, 6
 EPN = E // R
 VS = EPN + B
 COUNT_STRIDE = E + R
-VIRTUAL_STRIDE = R * VS + R
 WAVES = 8
 
 _LAUNCHERS = {}
+_REWRITES = {}
 
 
-def _launcher(rank: int, balance: bool):
-    key = (rank, balance, B, R)
+def _launcher():
+    key = (B, R)
     if key in _LAUNCHERS:
         return _LAUNCHERS[key]
 
@@ -56,7 +58,7 @@ def _launcher(rank: int, balance: bool):
         target: fx.Array[fx.Int32, n_target, 16]
 
     @flyc.kernel(
-        name=f"test_moonep_fuse_w{R}_r{rank}_b{int(balance)}_s{B}",
+        name=f"test_moonep_placement_w{R}_s{B}",
         known_block_size=[WAVES * 64, 1, 1],
     )
     def kernel(
@@ -66,10 +68,6 @@ def _launcher(rank: int, balance: bool):
         slot_held: fx.Int64,
         slot_prev: fx.Int64,
         slot_placed: fx.Int64,
-        logical_pair_base: fx.Int64,
-        virtual_count: fx.Int64,
-        virtual_hist: fx.Int64,
-        virtual_pair_base: fx.Int64,
     ):
         lds = fx.SharedAllocator().allocate(Lds).peek()
         emit_moonep_placement(
@@ -92,23 +90,6 @@ def _launcher(rank: int, balance: bool):
             experts=E,
             slots=B,
             count_stride=COUNT_STRIDE,
-            balance=balance,
-        )
-        emit_moonep_virtual_counts(
-            count,
-            alloc_cumsum,
-            expert_to_slot,
-            logical_pair_base,
-            virtual_count,
-            virtual_hist,
-            virtual_pair_base,
-            num_waves=WAVES,
-            npes=R,
-            experts=E,
-            slots=B,
-            rank=rank,
-            count_stride=COUNT_STRIDE,
-            virtual_stride=VIRTUAL_STRIDE,
         )
 
     @flyc.jit
@@ -119,10 +100,6 @@ def _launcher(rank: int, balance: bool):
         slot_held: fx.Int64,
         slot_prev: fx.Int64,
         slot_placed: fx.Int64,
-        logical_pair_base: fx.Int64,
-        virtual_count: fx.Int64,
-        virtual_hist: fx.Int64,
-        virtual_pair_base: fx.Int64,
         stream: fx.Stream,
     ):
         kernel(
@@ -132,10 +109,6 @@ def _launcher(rank: int, balance: bool):
             slot_held,
             slot_prev,
             slot_placed,
-            logical_pair_base,
-            virtual_count,
-            virtual_hist,
-            virtual_pair_base,
         ).launch(grid=(1, 1, 1), block=(WAVES * 64, 1, 1), stream=stream)
 
     _LAUNCHERS[key] = launch
@@ -233,9 +206,10 @@ def _settle_reference(want, held):
     return target, placed, torch.where(placed >= 0, placed, held)
 
 
-def _virtual_reference(tpe, alloc, expert_to_slot, rank, pair_base):
-    vcount = torch.zeros(R, VIRTUAL_STRIDE, dtype=torch.int64)
-    vbase = torch.zeros(VIRTUAL_STRIDE, dtype=torch.int64)
+def _virtual_reference(tpe, alloc, expert_to_slot):
+    """Routes each source sends to each virtual id when expert e's routes are
+    ranked source-major and destination d takes ranks [C[e][d-1], C[e][d])."""
+    vcount = torch.zeros(R, R * VS, dtype=torch.int64)
     cumsum = alloc.t().cumsum(dim=1)  # [E, R]
     for e in range(E):
         begin = 0
@@ -248,34 +222,64 @@ def _virtual_reference(tpe, alloc, expert_to_slot, rank, pair_base):
                 if hi > lo:
                     column = d * VS + int(expert_to_slot[d, e])
                     vcount[s, column] = hi - lo
-                    if s == rank:
-                        vbase[column] = int(pair_base[e]) + lo - begin
                 low = high
             begin = end
-    return vcount, vbase
+    return vcount
 
 
-def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=True):
+def _rewrite_launcher():
+    key = (B, R)
+    if key not in _REWRITES:
+        _, _, rewrite = make_moonep_plan_jit(
+            rank=0, npes=R, experts=E, slots=B, grid=64
+        )
+        _REWRITES[key] = rewrite
+    return _REWRITES[key]
+
+
+def _rewrite(ids, source, tpe, g_cumsum, g_slot):
+    """Run the planner's rewrite kernel for one source rank's routes."""
+    dev = g_cumsum.device
+    flat = ids.flatten().long()
+    # Index of each route within its expert, in route order, as count gives.
+    local = torch.zeros_like(flat)
+    seen = torch.zeros(E, dtype=torch.int64)
+    for i, e in enumerate(flat.tolist()):
+        if e >= 0:
+            local[i] = seen[e]
+            seen[e] += 1
+    prefix = tpe[:source].sum(0) if source else torch.zeros(E, dtype=torch.int64)
+    g_ids = flat.to(dev, torch.int32)
+    g_local = local.to(dev, torch.int32)
+    g_prefix = prefix.to(dev, torch.int32)
+    g_out = torch.full_like(g_ids, 77)
+    _run_compiled(
+        _rewrite_launcher(),
+        fx.Int64(g_ids.data_ptr()),
+        fx.Int32(g_ids.numel()),
+        fx.Int64(g_local.data_ptr()),
+        fx.Int64(g_prefix.data_ptr()),
+        fx.Int64(g_cumsum.data_ptr()),
+        fx.Int64(g_slot.data_ptr()),
+        fx.Int64(g_out.data_ptr()),
+        fx.Stream(torch.cuda.current_stream().cuda_stream),
+    )
+    torch.cuda.synchronize()
+    return g_out.cpu().long()
+
+
+def run_case(skew: float, seed: int, *, sticky_held: bool):
     dev = torch.device("cuda")
     tokens = 2048
     ids = _routing(tokens, skew, seed)
+    ids[:, ::97, 0] = -1  # empty route slots: never counted, kept -1 by rewrite
     tpe = torch.stack(
-        [torch.bincount(ids[r].flatten().long(), minlength=E) for r in range(R)]
+        [torch.bincount(ids[r][ids[r] >= 0].long(), minlength=E) for r in range(R)]
     )
     count = torch.zeros(R, COUNT_STRIDE, dtype=torch.int32)
     count[:, :E] = tpe.to(torch.int32)
-    logical_pair_base = torch.zeros(COUNT_STRIDE, dtype=torch.int32)
-    logical_pair_base[1:] = count[rank].cumsum(0)[:-1].to(torch.int32)
 
     ref_alloc, ref_slot, ref_etc = _placement_reference(tpe)
-    if not balance:
-        ref_alloc = torch.zeros(R, E, dtype=torch.int64)
-        for e in range(E):
-            ref_alloc[e // EPN, e] = int(tpe[:, e].sum())
-        ref_etc = torch.full((R, B), -1, dtype=torch.int64)
-        ref_slot = torch.full((R, E), -1, dtype=torch.int64)
-        for d in range(R):
-            ref_slot[d, d * EPN : (d + 1) * EPN] = torch.arange(EPN)
 
     held = torch.full((R, B), -1, dtype=torch.int64)
     if sticky_held:
@@ -299,9 +303,7 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
         for s in range(B):
             if ref_etc[d, s] >= 0:
                 ref_slot_settled[d, ref_etc[d, s]] = EPN + int(target[d, s])
-    ref_vcount, ref_vbase = _virtual_reference(
-        tpe, ref_alloc, ref_slot_settled, rank, logical_pair_base
-    )
+    ref_vcount = _virtual_reference(tpe, ref_alloc, ref_slot_settled)
 
     t = lambda x: x.to(dev, torch.int32).contiguous()
     g_count = t(count)
@@ -310,10 +312,6 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
     g_held = t(held)
     g_prev = torch.zeros(R * B, dtype=torch.int32, device=dev)
     g_placed = torch.zeros(R * B, dtype=torch.int32, device=dev)
-    g_pair_base = t(logical_pair_base)
-    g_vcount = torch.full((R * VIRTUAL_STRIDE,), 77, dtype=torch.int32, device=dev)
-    g_vhist = torch.full((VIRTUAL_STRIDE,), 77, dtype=torch.int32, device=dev)
-    g_vbase = torch.full((VIRTUAL_STRIDE,), 77, dtype=torch.int32, device=dev)
     args = [
         g_count,
         g_cumsum,
@@ -321,13 +319,9 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
         g_held,
         g_prev,
         g_placed,
-        g_pair_base,
-        g_vcount,
-        g_vhist,
-        g_vbase,
     ]
     _run_compiled(
-        _launcher(rank, balance),
+        _launcher(),
         *[fx.Int64(a.data_ptr()) for a in args],
         fx.Stream(torch.cuda.current_stream().cuda_stream),
     )
@@ -335,21 +329,22 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
 
     got_alloc = g_cumsum.view(E, R).cpu().long()
     got_alloc = torch.cat([got_alloc[:, :1], got_alloc.diff(dim=1)], dim=1).t()
-    vcount = g_vcount.view(R, VIRTUAL_STRIDE).cpu().long()
+    vcount = torch.zeros(R, R * VS, dtype=torch.int64)
+    invalid_kept = True
+    for source in range(R):
+        kept = ids[source].flatten().long()
+        vids = _rewrite(ids[source], source, tpe, g_cumsum, g_slot)
+        invalid_kept &= bool(torch.equal(vids[kept < 0], kept[kept < 0]))
+        vcount[source] = torch.bincount(vids[kept >= 0], minlength=R * VS)
     checks = {
         "alloc": torch.equal(got_alloc, ref_alloc),
         "expert_to_slot": torch.equal(g_slot.view(R, E).cpu().long(), ref_slot_settled),
         "slot_prev": torch.equal(g_prev.view(R, B).cpu().long(), held),
         "slot_placed": torch.equal(g_placed.view(R, B).cpu().long(), ref_placed),
         "slot_held": torch.equal(g_held.view(R, B).cpu().long(), ref_held),
-        "virtual_count": torch.equal(vcount, ref_vcount),
-        "virtual_hist": torch.equal(g_vhist.cpu().long(), ref_vcount[rank]),
-        "virtual_pair_base": torch.equal(
-            torch.where(ref_vcount[rank] > 0, g_vbase.cpu().long(), 0), ref_vbase
-        ),
-        "conservation": torch.equal(
-            vcount.sum(0).view(-1)[: R * VS].view(R, VS).sum(1), ref_alloc.sum(1)
-        ),
+        "rewrite_counts": torch.equal(vcount, ref_vcount),
+        "rewrite_keeps_empty": invalid_kept,
+        "conservation": torch.equal(vcount.sum(0).view(R, VS).sum(1), ref_alloc.sum(1)),
     }
     moved = int(
         (
@@ -372,19 +367,18 @@ def run_case(rank: int, skew: float, seed: int, *, sticky_held: bool, balance=Tr
         print("etc got", g_placed.view(R, B).cpu().tolist())
         print("etc ref", ref_etc.tolist())
     print(
-        f"R={R} B={B} rank={rank} skew={skew} seed={seed} sticky={sticky_held} balance={balance} "
+        f"R={R} B={B} skew={skew} seed={seed} sticky={sticky_held} "
         f"moved={moved} prefetch={int((ref_etc >= 0).sum())} -> {'OK' if not bad else 'FAIL ' + ','.join(bad)}"
     )
     return not bad
 
 
 def _set_geometry(world: int, slots: int) -> None:
-    global R, EPN, B, VS, COUNT_STRIDE, VIRTUAL_STRIDE
+    global R, EPN, B, VS, COUNT_STRIDE
     R, B = world, slots
     EPN = E // R
     VS = EPN + B
     COUNT_STRIDE = E + R
-    VIRTUAL_STRIDE = R * VS + R
 
 
 def main() -> int:
@@ -396,16 +390,15 @@ def main() -> int:
     parser.add_argument("--world", default="8,4")
     args = parser.parse_args()
     cases = [
-        (0, 1.2, 1, False, True),
-        (3, 1.2, 2, True, True),
-        (7, 0.0, 3, False, True),
-        (5, 0.8, 4, True, True),
-        (2, 1.2, 5, True, False),
-        (1, -6.0, 6, False, True),
-        (4, -6.0, 7, True, True),
-        (6, -3.0, 8, True, True),
-        (0, -100.0, 9, False, True),
-        (7, -100.0, 10, True, True),
+        (1.2, 1, False),
+        (1.2, 2, True),
+        (0.0, 3, False),
+        (0.8, 4, True),
+        (-6.0, 6, False),
+        (-6.0, 7, True),
+        (-3.0, 8, True),
+        (-100.0, 9, False),
+        (-100.0, 10, True),
     ]
     if args.quick:
         cases = cases[:1]
@@ -413,10 +406,7 @@ def main() -> int:
     for world in (int(v) for v in args.world.split(",")):
         for slots in (int(v) for v in args.slots.split(",")):
             _set_geometry(world, slots)
-            results += [
-                run_case(r % world, s, seed, sticky_held=st, balance=bal)
-                for r, s, seed, st, bal in cases
-            ]
+            results += [run_case(s, seed, sticky_held=st) for s, seed, st in cases]
     ok = all(results)
     print("ALL_OK" if ok else "SOME_FAILED")
     return 0 if ok else 1

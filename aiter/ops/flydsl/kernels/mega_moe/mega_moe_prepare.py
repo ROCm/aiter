@@ -14,7 +14,6 @@ from flydsl.runtime.device import get_rocm_arch
 from .. import communication_ops_utils as comm_ops
 from ..tensor_shim import _preload_compiled, _run_compiled, ptr_buf_tensor
 from .dispatch import DispatchSlot, emit_dispatch_group, emit_dispatch_plan
-from .moonep_fuse import moonep_lds_fields
 from .quant import emit_per_1x32_mx_fp8_group
 
 
@@ -34,14 +33,8 @@ def compile_mega_moe_prepare(
     model_dim: int,
     payload_chunk_rows: int,
     tile_state_stride: int,
-    moonep_slots: int = 0,
-    moonep_balance: bool = True,
 ):
-    """Compile compact count/group/plan without the GEMM1 shared footprint.
-
-    ``moonep_slots`` (B) > 0 builds the MoonEP variant: ``experts_per_rank``
-    is the virtual ``EPR + B`` while ``topk_ids`` stay logical.
-    """
+    """Compile compact count/group/plan without the GEMM1 shared footprint."""
     arch = str(get_rocm_arch() or "")
     if not arch.startswith("gfx95"):
         raise RuntimeError(
@@ -63,10 +56,6 @@ def compile_mega_moe_prepare(
     tile_state_stride = int(tile_state_stride)
     total_experts = npes * epr
     total_segments = total_experts + npes
-    moonep_slots = int(moonep_slots)
-    moonep_balance = bool(moonep_balance)
-    route_epr = epr - moonep_slots
-    route_experts = npes * route_epr
     block_threads = num_waves * 64
     assert prepare_blocks >= 1
     launch_grid = prepare_blocks + quant_blocks + 1
@@ -76,44 +65,10 @@ def compile_mega_moe_prepare(
     assert chunk_rows > 0
     assert tile_state_stride > 0
 
-    if moonep_slots:
-        assert npes <= num_waves, "MoonEP placement runs one wave per rank"
-        lds_sizes = moonep_lds_fields(
-            npes=npes, experts=route_experts, slots=moonep_slots
-        )
-        mp = {k[3:]: v for k, v in lds_sizes.items()}
-        n_alloc, n_key, n_ecount, n_rem = (
-            mp["alloc"],
-            mp["key"],
-            mp["ecount"],
-            mp["rem"],
-        )
-        n_quota, n_bal, n_etc, n_target = (
-            mp["quota"],
-            mp["bal"],
-            mp["etc"],
-            mp["target"],
-        )
-
-        @fx.struct
-        class SharedStorage:
-            ticket: fx.Array[fx.Int64, 1, 8]
-            count_scratch: fx.Array[fx.Int32, total_segments, 16]
-            mp_alloc: fx.Array[fx.Int32, n_alloc, 16]
-            mp_key: fx.Array[fx.Int32, n_key, 16]
-            mp_ecount: fx.Array[fx.Int32, n_ecount, 16]
-            mp_rem: fx.Array[fx.Int32, n_rem, 16]
-            mp_quota: fx.Array[fx.Int32, n_quota, 16]
-            mp_bal: fx.Array[fx.Int32, n_bal, 16]
-            mp_etc: fx.Array[fx.Int32, n_etc, 16]
-            mp_target: fx.Array[fx.Int32, n_target, 16]
-
-    else:
-
-        @fx.struct
-        class SharedStorage:
-            ticket: fx.Array[fx.Int64, 1, 8]
-            count_scratch: fx.Array[fx.Int32, total_segments, 16]
+    @fx.struct
+    class SharedStorage:
+        ticket: fx.Array[fx.Int64, 1, 8]
+        count_scratch: fx.Array[fx.Int32, total_segments, 16]
 
     kernel_name = (
         f"megamoe_prepare_compact_m{tile_m}_dcu{dispatch_blocks}_pcu{prepare_blocks}_pc{chunk_rows}"
@@ -121,8 +76,6 @@ def compile_mega_moe_prepare(
         "_fov_runtime_dyn"
         f"_tss{tile_state_stride}_v13"
     )
-    if moonep_slots:
-        kernel_name += f"_moonep{moonep_slots}{'b' if moonep_balance else 'h'}"
 
     @flyc.kernel(name=kernel_name, known_block_size=[block_threads, 1, 1])
     def kernel(
@@ -244,18 +197,6 @@ def compile_mega_moe_prepare(
             parity = comm_ops.load_i32_system(addr_parity, fx.Int32(0))
             expected = comm_ops.load_i32_system(addr_expected, parity)
             group_phase_base = fx.Int32(generation) * fx.Int32(prepare_blocks * 2)
-            moonep_lds = ()
-            if const_expr(moonep_slots > 0):
-                moonep_lds = (
-                    lds.mp_alloc.ptr,
-                    lds.mp_key.ptr,
-                    lds.mp_ecount.ptr,
-                    lds.mp_rem.ptr,
-                    lds.mp_quota.ptr,
-                    lds.mp_bal.ptr,
-                    lds.mp_etc.ptr,
-                    lds.mp_target.ptr,
-                )
             if owner:
                 emit_dispatch_plan(
                     num_waves=num_waves,
@@ -277,17 +218,14 @@ def compile_mega_moe_prepare(
                     group_phase_base=group_phase_base,
                     payload_chunk_rows=chunk_rows,
                     tile_state_stride=tile_state_stride,
-                    moonep_slots=moonep_slots,
-                    moonep_balance=moonep_balance,
-                    moonep_lds=moonep_lds,
                 )
             if producer:
                 emit_dispatch_group(
                     num_waves=num_waves,
                     fz_npes=npes,
                     fz_k=topk,
-                    fz_epr=route_epr,
-                    fz_total_experts=route_experts,
+                    fz_epr=epr,
+                    fz_total_experts=total_experts,
                     addr_disp=addr_disp,
                     i32_cur_tok=i32_cur_tok,
                     addr_in_idx=addr_in_idx,

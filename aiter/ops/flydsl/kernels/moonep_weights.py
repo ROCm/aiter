@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import math
 
-import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.shmem as ms
 import torch
@@ -34,6 +33,7 @@ import torch
 from aiter.ops.flydsl.kernels.moonep_weight_prefetch_fast import (
     make_moonep_weight_prefetch_fast_jit,
 )
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 from aiter.ops.flydsl.moonep_vmm_pool import MoonEPVmmPool
 
 
@@ -61,6 +61,13 @@ class MoonEPWeightPool:
         )
         if any(b % 16 for b in row_bytes):
             raise ValueError(f"expert rows must be 16-byte aligned, got {row_bytes}")
+        # MegaMoE reads each weight window through 32-bit buffer offsets.
+        window = experts_per_rank + prefetch_slots
+        if any(window * b > 1 << 32 for b in row_bytes):
+            raise ValueError(
+                f"a {window}-expert window of {max(row_bytes)}-byte rows exceeds "
+                "4 GiB; use more ranks or fewer prefetch slots"
+            )
 
         self.rank = rank
         self.world_size = world_size
@@ -106,7 +113,6 @@ class MoonEPWeightPool:
         self._no_resident = torch.full(
             (prefetch_slots,), -1, dtype=torch.int32, device=self.device
         )
-        self._compiled = None
 
     def stage_home(self, weights: list[torch.Tensor]) -> None:
         """Copy this rank's expert weights, one tensor per part, into its home rows."""
@@ -155,18 +161,15 @@ class MoonEPWeightPool:
             resident = self._no_resident
         elif resident.dtype != torch.int32 or resident.numel() != self.prefetch_slots:
             raise ValueError("resident must be int32 with one entry per slot")
-        raw = (
-            sel.data_ptr(),
-            self._vmm.base,
-            self._vmm.local_segment.data_ptr(),
-            resident.data_ptr(),
-            stream,
+        # The first call compiles and runs the kernel, later ones only run it.
+        _run_compiled(
+            self._jit,
+            fx.Int64(sel.data_ptr()),
+            fx.Int64(self._vmm.base),
+            fx.Int64(self._vmm.local_segment.data_ptr()),
+            fx.Int64(resident.data_ptr()),
+            fx.Stream(stream.cuda_stream),
         )
-        if self._compiled is None:
-            self._compiled = flyc.compile(
-                self._jit, *(fx.Int64(a) for a in raw[:4]), stream
-            )
-        self._compiled(*raw)
 
     def close(self) -> None:
         if self._closed:
