@@ -6672,6 +6672,41 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "does not write stage-ranking or full-pair profile artifacts"
     )
 
+    @staticmethod
+    def _capture_configuration():
+        value = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+        limit = None if value in (None, "") else float(value)
+        if limit is not None and (not math.isfinite(limit) or limit <= 0):
+            raise ValueError(
+                "AITER_MXFP4_TUNE_SWIGLU_LIMIT must be finite and positive"
+            )
+        return {
+            "swiglu_limit": limit,
+            "stage2_fp8": os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1",
+            "fp4_scatter": os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1",
+        }
+
+    def _invocation_configuration(self, args=None):
+        # Production reads the two output switches per call. Callers keep all
+        # three variables stable for this invocation and its spawned workers.
+        if args is not None and hasattr(args, "mxfp4_configuration"):
+            self._configuration = args.mxfp4_configuration
+        elif args is not None or not hasattr(self, "_configuration"):
+            self._configuration = self._capture_configuration()
+        if args is not None:
+            args.mxfp4_configuration = self._configuration
+        return self._configuration
+
+    def parse_args(self):
+        args = super().parse_args()
+        self._configuration = self._capture_configuration()
+        args.mxfp4_configuration = self._configuration
+        return args
+
+    def pre_process(self, args):
+        self._invocation_configuration(args)
+        return super().pre_process(args)
+
     def _setup_specific_arguments(self):
         super()._setup_specific_arguments()
         for action in self.parser._actions:
@@ -6682,8 +6717,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     "a still-live permanent hang may wait indefinitely."
                 )
 
-    @staticmethod
-    def _unsupported_row_reason(row):
+    def _unsupported_row_reason(self, row):
         for field, expected in (
             ("dtype", dtypes.bf16),
             ("q_dtype_a", dtypes.fp4x2),
@@ -6701,6 +6735,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         activation = str(row.get("act_type")).rsplit(".", 1)[-1].lower()
         if activation not in ("silu", "situv2", "swiglu"):
             return f"unsupported act_type: {row.get('act_type')!r}"
+        if (
+            activation == "situv2"
+            and self._invocation_configuration()["swiglu_limit"] is not None
+        ):
+            return "MXMOE cannot apply a configured swiglu_limit to Situv2"
         gate = row.get("gate_mode", "separated")
         if pd.isna(gate) or str(gate).strip() == "":
             gate = "separated"
@@ -7155,6 +7194,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             a2_scale=inter_s,
             block_m=BM,
             sorted_weights=sw,
+            topk_weights=data["topk_weights"],
             kernelName2=kn2,
             reverse_sorted=reverse_sorted,
         )
@@ -7210,8 +7250,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "swiglu": ActivationType.Swiglu,
             "silu": ActivationType.Silu,
         }[self._row_act(row)]
-        limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-        swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+        swiglu_limit = self._invocation_configuration(args)["swiglu_limit"]
         fast_scan = bool(getattr(args, "fast_scan", False))
         # Never let a finalist retime erase a larger error already observed for
         # this candidate during the coarse pass. `_err` holds the exact ratio;
@@ -7333,8 +7372,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return us
 
-    @staticmethod
-    def _precompile_candidates(row, candidates):
+    def _precompile_candidates(self, row, candidates):
         """Populate the shared FlyDSL cache before GPU validation and timing.
 
         Compile-only workers use CPU dummy tensors, so they neither duplicate
@@ -7357,12 +7395,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
             # SiLU, 7.0 for SwiGLU). Runtime launches pass the tuned clamp
             # instead, so without this the cache misses and the scan JITs
             # during scoring.
-            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-            if limit_env not in (None, ""):
+            swiglu_limit = self._invocation_configuration()["swiglu_limit"]
+            if swiglu_limit is not None:
                 for job in jobs:
                     if job["stage"] == 1:
                         job["swiglu_limit"] = runtime_swiglu_limit(
-                            float(limit_env), job["act"]
+                            swiglu_limit, job["act"]
                         )
             worker_count = get_max_workers(len(jobs))
             batches = [jobs[index::worker_count] for index in range(worker_count)]
@@ -7398,10 +7436,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             )
             return 0, 0
 
-    @staticmethod
-    def _screening_limit():
-        value = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-        return None if value in (None, "") else float(value)
+    def _screening_limit(self):
+        return self._invocation_configuration()["swiglu_limit"]
 
     def _prepare_screening_case(
         self, row: dict[str, Any], block_m: int, atomic: bool
@@ -7563,6 +7599,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 a2_scale=inter_s,
                 block_m=cfg["BM"],
                 sorted_weights=sw,
+                topk_weights=data["topk_weights"],
                 kernelName2=kn2,
                 reverse_sorted=reverse_sorted,
             )
@@ -7937,6 +7974,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         """
         import signal
 
+        self._invocation_configuration(args)
         reason = self._unsupported_row_reason(row)
         if reason is not None:
             print(f"[mxfp4-port] unsupported shape: {reason}", flush=True)
@@ -7984,8 +8022,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "swiglu": ActivationType.Swiglu,
                 "silu": ActivationType.Silu,
             }[self._row_act(row)]
-            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
-            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+            swiglu_limit = self._invocation_configuration(args)["swiglu_limit"]
             # Build the expensive torch reference once per shape. Every coarse
             # warm-up and every final measured output is checked against it.
             # Apply the same swiglu clamp _run_candidate applies per candidate:
@@ -8167,6 +8204,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
 
     def tune(self, untunedf, tunedf, args):
         del tunedf
+        self._invocation_configuration(args)
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
 
         if not rows:
