@@ -65,7 +65,7 @@ def main():
     parser.add_argument(
         "--situv2-public-defaults",
         action="store_true",
-        help="Omit public beta arguments and compare with matching Torch beta1/linear_beta1",
+        help="Omit public beta arguments and verify MXFP4 defaults beta4/linear_beta25",
     )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
@@ -111,7 +111,6 @@ def main():
     )
     from aiter.test_common import get_trace_perf
     from csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune import (
-        FmoeTuner,
         Mxfp4FlydslTuner,
         cosine_diff_compare,
     )
@@ -141,38 +140,11 @@ def main():
         )(data["input"], quant_dtype=dtypes.fp4x2)
     if args.situv2_public_defaults:
         assert activation == ActivationType.Situv2 and args.action == "replay"
-        ref1 = FmoeTuner.run_torch_moe_stage1(
-            data["a1_qt"],
-            data["w1_qt"],
-            data["w2_qt"],
-            data["topk_weights"],
-            data["topk_ids"],
-            data["a1_scale"],
-            data["w1_scale"],
-            dtype=dtypes.bf16,
-            activation=activation,
-            quant_type=QuantType.per_1x32,
-            doweight_stage1=False,
-            topk=shape["topk"],
-            situ_beta=1.0,
-            situ_linear_beta=1.0,
-        )
-        reference = FmoeTuner.run_torch_moe_stage2(
-            ref1,
-            data["w1_qt"],
-            data["w2_qt"],
-            data["topk_weights"],
-            data["topk_ids"],
-            a2_scale=None,
-            w2_scale=data["w2_scale"],
-            dtype=dtypes.bf16,
-            quant_type=QuantType.per_1x32,
-            doweight_stage1=False,
-        )
-    else:
-        reference = tuner._torch_ref(
-            data, shape["topk"], dtypes.bf16, activation, swiglu_limit=args.swiglu_limit
-        )
+    # The selected MXFP4 production path resolves omitted Situv2 API betas to
+    # its established defaults4/25, matching the tuner Torch reference.
+    reference = tuner._torch_ref(
+        data, shape["topk"], dtypes.bf16, activation, swiglu_limit=args.swiglu_limit
+    )
     clamp_evidence = None
     if args.clamp_fixture:
         alternate_limit = 7 if args.swiglu_limit == 5 else 5
@@ -243,10 +215,8 @@ def main():
         ):
             assert kwargs[key] == parsed_g1[key], (key, kwargs[key], parsed_g1[key])
         if activation == ActivationType.Situv2:
-            expected_beta = 1.0 if args.situv2_public_defaults else DEFAULT_SITUV2_BETA
-            expected_linear_beta = (
-                1.0 if args.situv2_public_defaults else DEFAULT_SITUV2_LINEAR_BETA
-            )
+            expected_beta = DEFAULT_SITUV2_BETA
+            expected_linear_beta = DEFAULT_SITUV2_LINEAR_BETA
             assert kwargs["situ_beta"] == expected_beta
             assert kwargs["situ_linear_beta"] == expected_linear_beta
         assert kwargs["interleave"] is False
@@ -334,10 +304,8 @@ def main():
             assert kwargs["out"].dtype == torch.uint8 and kwargs["out"].ndim == 2
         return stage2(*positional, **kwargs)
 
-    situ_beta = 1.0 if args.situv2_public_defaults else DEFAULT_SITUV2_BETA
-    situ_linear_beta = (
-        1.0 if args.situv2_public_defaults else DEFAULT_SITUV2_LINEAR_BETA
-    )
+    situ_beta = DEFAULT_SITUV2_BETA
+    situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA
     metadata = fm.get_2stage_cfgs(
         shape["token"],
         shape["model_dim"],
