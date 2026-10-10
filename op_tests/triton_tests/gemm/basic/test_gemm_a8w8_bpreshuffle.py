@@ -5,10 +5,10 @@ import pytest
 import torch
 
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle
-from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or arch_info.get_arch() != "gfx1201",
