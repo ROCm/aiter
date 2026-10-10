@@ -20,3 +20,20 @@ The artifact directory records idle samples, exact command/environment/implement
 Set the dedicated environment's PATH, exact CK_DIR, task-specific AITER_JIT_DIR and FLYDSL_RUNTIME_CACHE_DIR, and matching flags/limits before real tasks. The script's fixed visibility takes precedence. On cancellation the task's independent process group is stopped, including its spawned workers, and interruption/exit evidence is finalized. GPU use and VRAM/process allocation gate activity; discovery-only entries with unavailable AMD-SMI occupancy use the remaining activity/memory/status evidence.
 
 Five offline behavioral tests passed. They cover identity, activity/allocation versus discovery, unavailable occupancy and cancellation of a harmless CPU descendant. Red and final logs are adjacent. These checks executed with empty GPU visibility and establish controller behavior only; they are not MXFP4 numerical or production/AOT acceptance.
+
+`default_replay.py --csv <canonical-one-row-winner.csv> --result <result.json>`
+performs explicit A4W4 public dispatch, checks the exact CSV G1/G2 names and
+metadata, observes actual direct kernel arguments, and compares final output
+with Torch at the configured default gate. Its synchronized elapsed and real
+kernel trace span are companion metrics. They are labelled separately from the
+main kernel-duration sum; synthetic GPU annotations do not enter the real
+kernel event counts. The trace and data/routing fingerprints are retained.
+
+Run `--action aot` first in a fresh `FLYDSL_RUNTIME_CACHE_DIR` to compile the
+selected CSV's default jobs; every job must report compilation success. Use that
+same AOT cache in a later independent replay process with
+`FLYDSL_RUNTIME_RUN_ONLY=1`. This default small BM16 fixture uses the generated
+C++ auxiliary sort (no FlyDSL input-prequant job); non-atomic G2 reduction is
+compiled by the AOT stage2 entry. Expanded configurations/auxiliary builders are
+validated by their separate acceptance tasks. The controller launches every
+real replay/AOT task after its idle gate and waits for exit.
