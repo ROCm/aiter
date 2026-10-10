@@ -1,0 +1,4 @@
+{"utc": "2026-10-10T17:57:35.256667+00:00", "id": "gpt-2048-fp8-staged", "attempts": 0, "elapsed": 29.9, "g1_screens": 8, "g2_screens": 0}
+{"utc": "2026-10-10T17:58:20.280156+00:00", "id": "gpt-2048-fp8-staged", "attempts": 0, "elapsed": 75.0, "g1_screens": 25, "g2_screens": 0}
+{"utc": "2026-10-10T17:59:05.297608+00:00", "id": "gpt-2048-fp8-staged", "attempts": 0, "elapsed": 120.0, "g1_screens": 27, "g2_screens": 53}
+{"utc": "2026-10-10T17:59:50.313523+00:00", "id": "gpt-2048-fp8-staged", "attempts": 0, "elapsed": 165.0, "g1_screens": 27, "g2_screens": 88}

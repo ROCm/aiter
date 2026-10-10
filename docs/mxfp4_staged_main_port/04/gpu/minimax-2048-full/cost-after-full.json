@@ -1,0 +1,139 @@
+{
+  "actual_search_wall_seconds": 807.80887,
+  "validation_attempts": 1368,
+  "static_pairs": 1368,
+  "original_estimate": {
+    "id": "minimax-2048-full",
+    "tokens": 2048,
+    "admitted_pairs": 1368,
+    "representative_per_pair_seconds_range": [
+      0.55,
+      10
+    ],
+    "projected_seconds_range": [
+      842,
+      14280
+    ],
+    "fixed_import_setup_reserve_seconds_range": [
+      90,
+      600
+    ],
+    "uncertainty": "Wide extrapolation, not a bound. Unknown compile keys/failures; 8192 token memory/reference costs are extrapolated from prescribed 2048 pair checks. A still-live GPU hang is unbounded.",
+    "assumptions": [
+      "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
+      "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
+      "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
+      "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
+      "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
+    ],
+    "prior_completed_anchor_observation": {
+      "id": "minimax-64-full",
+      "process_wall_seconds": 699.554425,
+      "tuner_summary_seconds": 692.3451,
+      "returned_pairs": 1368,
+      "observed_process_seconds_per_attempt": 0.5113701937134503,
+      "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
+      "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
+      "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound.",
+      "evidence_path": "docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/search.json",
+      "shape": {
+        "token": 64,
+        "model_dim": 3072,
+        "inter_dim": 384,
+        "expert": 256,
+        "topk": 8,
+        "activation": "Silu"
+      },
+      "context": {
+        "fp8": false,
+        "fp4": false,
+        "limit": null,
+        "input_seed": 0,
+        "route_seed": 0,
+        "expert_balance": false,
+        "warmup": 5,
+        "iters": 101,
+        "physical_uuid": "GPU-5d8a72a332aa124c",
+        "pci": "0000:f5:00.0"
+      }
+    },
+    "estimate_update": "Retain original wide range after observing full64 ~0.511s per returned attempt; 2048/8192 preparation/reference costs and new cold compile keys are not determined by token64 throughput.",
+    "recorded_before_start_utc": "2026-10-10T16:47:51.656948+00:00",
+    "compilation_state": "Fresh per-search FlyDSL cache; identical initially empty cache condition across modes/configurations; warmed common AITER auxiliary cache.",
+    "admitted_counts": {
+      "id": "minimax-2048-full",
+      "m_est": 64,
+      "total_pairs": 1368,
+      "unique_gemm1": 84,
+      "unique_gemm2": 68,
+      "k2_shortlist_pairs_upper": 32,
+      "staged_exhaustive_fallback_pairs_upper": 1368,
+      "groups": [
+        {
+          "block_m": 16,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 16,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 32,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 54,
+          "gemm2_candidates": 8,
+          "pairs": 432,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 64,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 12,
+          "gemm2_candidates": 8,
+          "pairs": 96,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 8,
+          "pairs": 48,
+          "k2_shortlist_pairs_upper": 4
+        },
+        {
+          "block_m": 128,
+          "accumulation_mode": "non-atomic",
+          "gemm1_candidates": 6,
+          "gemm2_candidates": 12,
+          "pairs": 72,
+          "k2_shortlist_pairs_upper": 4
+        }
+      ]
+    }
+  }
+}

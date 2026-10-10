@@ -1,0 +1,265 @@
+{
+  "source": "Current unchanged ticket03 prescribed pair evidence; excludes historical experiments",
+  "observed_minimax_harness_seconds_range": [
+    4.48360378947109,
+    26.675071466714144
+  ],
+  "observed_minimax_setup_seconds_range": [
+    0.7477321308106184,
+    0.789320508018136
+  ],
+  "observed_attempts": [
+    {
+      "id": "minimax128-bm16-atomic",
+      "token": 128,
+      "setup_seconds": 0.7477321308106184,
+      "total_pair_harness_seconds": 6.674320090562105,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-default",
+      "implementation_commit": "da7239ff56e1c3119493500ec9b6717406e6185b"
+    },
+    {
+      "id": "minimax128-bm16-reduce",
+      "token": 128,
+      "setup_seconds": 0.7686998480930924,
+      "total_pair_harness_seconds": 4.48360378947109,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "4e5d8bdc213880549e144a28d017a208c4661488"
+    },
+    {
+      "id": "minimax128-bm32-atomic",
+      "token": 128,
+      "setup_seconds": 0.761061254888773,
+      "total_pair_harness_seconds": 4.4908941481262445,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "4e5d8bdc213880549e144a28d017a208c4661488"
+    },
+    {
+      "id": "minimax128-bm32-reduce",
+      "token": 128,
+      "setup_seconds": 0.760378822684288,
+      "total_pair_harness_seconds": 26.675071466714144,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "eae7144741c6f6094cb668b461943746531607cc"
+    },
+    {
+      "id": "minimax2048-bm128-atomic",
+      "token": 2048,
+      "setup_seconds": 0.7626078929752111,
+      "total_pair_harness_seconds": 5.513782334513962,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "4e5d8bdc213880549e144a28d017a208c4661488"
+    },
+    {
+      "id": "minimax2048-bm128-reduce",
+      "token": 2048,
+      "setup_seconds": 0.789320508018136,
+      "total_pair_harness_seconds": 9.224377041682601,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "32e5ed6d479b36cbcd86d7b07da6e8f8182bf5f4"
+    },
+    {
+      "id": "minimax2048-bm128-scatter",
+      "token": 2048,
+      "setup_seconds": 0.7749337013810873,
+      "total_pair_harness_seconds": 5.220467166043818,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "32e5ed6d479b36cbcd86d7b07da6e8f8182bf5f4"
+    },
+    {
+      "id": "minimax2048-bm64-atomic",
+      "token": 2048,
+      "setup_seconds": 0.7768074087798595,
+      "total_pair_harness_seconds": 7.157577950507402,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "eae7144741c6f6094cb668b461943746531607cc"
+    },
+    {
+      "id": "minimax2048-bm64-reduce",
+      "token": 2048,
+      "setup_seconds": 0.7587329857051373,
+      "total_pair_harness_seconds": 5.067227683030069,
+      "cache": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+      "implementation_commit": "4e5d8bdc213880549e144a28d017a208c4661488"
+    }
+  ],
+  "anchors": [
+    {
+      "id": "minimax-64-full",
+      "tokens": 64,
+      "admitted_pairs": 1368,
+      "representative_per_pair_seconds_range": [
+        0.35,
+        8
+      ],
+      "projected_seconds_range": [
+        569,
+        11544
+      ],
+      "fixed_import_setup_reserve_seconds_range": [
+        90,
+        600
+      ],
+      "uncertainty": "Wide extrapolation, not a bound. Unknown compile keys/failures; 8192 token memory/reference costs are extrapolated from prescribed 2048 pair checks. A still-live GPU hang is unbounded.",
+      "assumptions": [
+        "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
+        "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
+        "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
+        "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
+        "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
+      ]
+    },
+    {
+      "id": "minimax-2048-full",
+      "tokens": 2048,
+      "admitted_pairs": 1368,
+      "representative_per_pair_seconds_range": [
+        0.55,
+        10
+      ],
+      "projected_seconds_range": [
+        842,
+        14280
+      ],
+      "fixed_import_setup_reserve_seconds_range": [
+        90,
+        600
+      ],
+      "uncertainty": "Wide extrapolation, not a bound. Unknown compile keys/failures; 8192 token memory/reference costs are extrapolated from prescribed 2048 pair checks. A still-live GPU hang is unbounded.",
+      "assumptions": [
+        "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
+        "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
+        "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
+        "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
+        "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
+      ],
+      "prior_completed_anchor_observation": {
+        "id": "minimax-64-full",
+        "process_wall_seconds": 699.554425,
+        "tuner_summary_seconds": 692.3451,
+        "returned_pairs": 1368,
+        "observed_process_seconds_per_attempt": 0.5113701937134503,
+        "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
+        "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
+        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound.",
+        "evidence_path": "docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/search.json",
+        "shape": {
+          "token": 64,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8,
+          "activation": "Silu"
+        },
+        "context": {
+          "fp8": false,
+          "fp4": false,
+          "limit": null,
+          "input_seed": 0,
+          "route_seed": 0,
+          "expert_balance": false,
+          "warmup": 5,
+          "iters": 101,
+          "physical_uuid": "GPU-5d8a72a332aa124c",
+          "pci": "0000:f5:00.0"
+        }
+      },
+      "estimate_update": "Retain original wide range after observing full64 ~0.511s per returned attempt; 2048/8192 preparation/reference costs and new cold compile keys are not determined by token64 throughput."
+    },
+    {
+      "id": "minimax-8192-full",
+      "tokens": 8192,
+      "admitted_pairs": 1368,
+      "representative_per_pair_seconds_range": [
+        1.2,
+        20
+      ],
+      "projected_seconds_range": [
+        1732,
+        27960
+      ],
+      "fixed_import_setup_reserve_seconds_range": [
+        90,
+        600
+      ],
+      "uncertainty": "Wide extrapolation, not a bound. Unknown compile keys/failures; 8192 token memory/reference costs are extrapolated from prescribed 2048 pair checks. A still-live GPU hang is unbounded.",
+      "assumptions": [
+        "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
+        "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
+        "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
+        "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
+        "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
+      ],
+      "prior_completed_anchor_observation": {
+        "id": "minimax-64-full",
+        "process_wall_seconds": 699.554425,
+        "tuner_summary_seconds": 692.3451,
+        "returned_pairs": 1368,
+        "observed_process_seconds_per_attempt": 0.5113701937134503,
+        "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
+        "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
+        "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound.",
+        "evidence_path": "docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/search.json",
+        "shape": {
+          "token": 64,
+          "model_dim": 3072,
+          "inter_dim": 384,
+          "expert": 256,
+          "topk": 8,
+          "activation": "Silu"
+        },
+        "context": {
+          "fp8": false,
+          "fp4": false,
+          "limit": null,
+          "input_seed": 0,
+          "route_seed": 0,
+          "expert_balance": false,
+          "warmup": 5,
+          "iters": 101,
+          "physical_uuid": "GPU-5d8a72a332aa124c",
+          "pci": "0000:f5:00.0"
+        }
+      },
+      "estimate_update": "Retain original wide range after observing full64 ~0.511s per returned attempt; 2048/8192 preparation/reference costs and new cold compile keys are not determined by token64 throughput."
+    }
+  ],
+  "cache_protocol_revision": "First full64 starts with empty calibration-search-04-default cache. All later initial searches use a fresh initially empty per-id FlyDSL cache; auxiliary AITER cache stays warmed equally. First task is unchanged; no active environment mutation.",
+  "observed_completed_anchors": [
+    {
+      "id": "minimax-64-full",
+      "process_wall_seconds": 699.554425,
+      "tuner_summary_seconds": 692.3451,
+      "returned_pairs": 1368,
+      "observed_process_seconds_per_attempt": 0.5113701937134503,
+      "implementation_commit": "6c69bb11beae1414e7d2e8468d737019b1c15bff",
+      "cache_start": "Initially empty dedicated FlyDSL cache; warm shared AITER auxiliary infrastructure",
+      "interpretation": "Actual full64 normal pair-attempt overhead includes compilation/preparation/reference/warmup/profiling/failures, excluding controller idle wait. Later shapes and cold keys may cost more; not a hard bound.",
+      "evidence_path": "docs/mxfp4_staged_main_port/04/gpu/minimax-64-full/search.json",
+      "shape": {
+        "token": 64,
+        "model_dim": 3072,
+        "inter_dim": 384,
+        "expert": 256,
+        "topk": 8,
+        "activation": "Silu"
+      },
+      "context": {
+        "fp8": false,
+        "fp4": false,
+        "limit": null,
+        "input_seed": 0,
+        "route_seed": 0,
+        "expert_balance": false,
+        "warmup": 5,
+        "iters": 101,
+        "physical_uuid": "GPU-5d8a72a332aa124c",
+        "pci": "0000:f5:00.0"
+      }
+    }
+  ],
+  "aggregate_initial_matrix_work_note": {
+    "no_fallback_validation_attempts_upper": 13296,
+    "meaning": "sum of full/prune admitted pairs plus staged K2 initial shortlist maxima; actual outcomes/fallback can change counts, no runtime validity implied",
+    "staged_validation_fallback_upper_total": 8952
+  }
+}

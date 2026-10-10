@@ -57,6 +57,16 @@ def main():
     parser.add_argument("--action", choices=("pair", "replay", "aot"), default="replay")
     parser.add_argument("--swiglu-limit", type=float)
     parser.add_argument("--clamp-fixture", action="store_true")
+    parser.add_argument(
+        "--preserve-generated-route-weights",
+        action="store_true",
+        help="Replay calibration search data including its original route weights",
+    )
+    parser.add_argument(
+        "--situv2-public-defaults",
+        action="store_true",
+        help="Omit public beta arguments and verify MXFP4 defaults beta4/linear_beta25",
+    )
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=101)
     args = parser.parse_args()
@@ -115,18 +125,23 @@ def main():
     tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
     setup_started = time.perf_counter()
     data = tuner._prepare_case(**shape, dtype=dtypes.bf16)
-    # Deliberately nonuniform route weights distinguish exactly-once weighting
-    # from the unweighted or squared-weight alternatives on the same data.
-    route_weights = torch.arange(
-        1, shape["topk"] + 1, device="cuda", dtype=torch.float32
-    )
-    route_weights /= route_weights.sum()
-    data["topk_weights"] = route_weights.expand(shape["token"], -1).contiguous()
+    if not args.preserve_generated_route_weights:
+        # Specified-pair fixtures use deliberately nonuniform weights. Search
+        # winner replay keeps the generated weights from the calibration data.
+        route_weights = torch.arange(
+            1, shape["topk"] + 1, device="cuda", dtype=torch.float32
+        )
+        route_weights /= route_weights.sum()
+        data["topk_weights"] = route_weights.expand(shape["token"], -1).contiguous()
     if args.clamp_fixture:
         data["input"] *= 16
         data["a1_qt"], data["a1_scale"] = __import__("aiter").get_torch_quant(
             QuantType.per_1x32
         )(data["input"], quant_dtype=dtypes.fp4x2)
+    if args.situv2_public_defaults:
+        assert activation == ActivationType.Situv2 and args.action == "replay"
+    # The selected MXFP4 production path resolves omitted Situv2 API betas to
+    # its established defaults4/25, matching the tuner Torch reference.
     reference = tuner._torch_ref(
         data, shape["topk"], dtypes.bf16, activation, swiglu_limit=args.swiglu_limit
     )
@@ -199,6 +214,11 @@ def main():
             "act",
         ):
             assert kwargs[key] == parsed_g1[key], (key, kwargs[key], parsed_g1[key])
+        if activation == ActivationType.Situv2:
+            expected_beta = DEFAULT_SITUV2_BETA
+            expected_linear_beta = DEFAULT_SITUV2_LINEAR_BETA
+            assert kwargs["situ_beta"] == expected_beta
+            assert kwargs["situ_linear_beta"] == expected_linear_beta
         assert kwargs["interleave"] is False
         assert kwargs["native_scale_layout"] == (parsed_g1["BM"] == 16)
         operations.append(
@@ -209,6 +229,8 @@ def main():
                 "out_dtype": kwargs["out_dtype"],
                 "inline_quant": kwargs["inline_quant"],
                 "native_scale_layout": kwargs["native_scale_layout"],
+                "situ_beta": kwargs["situ_beta"],
+                "situ_linear_beta": kwargs["situ_linear_beta"],
                 "interleave": kwargs["interleave"],
                 "hidden_dtype": str(kwargs["hidden_states"].dtype),
                 "swiglu_limit": str(kwargs["swiglu_limit"]),
@@ -282,6 +304,8 @@ def main():
             assert kwargs["out"].dtype == torch.uint8 and kwargs["out"].ndim == 2
         return stage2(*positional, **kwargs)
 
+    situ_beta = DEFAULT_SITUV2_BETA
+    situ_linear_beta = DEFAULT_SITUV2_LINEAR_BETA
     metadata = fm.get_2stage_cfgs(
         shape["token"],
         shape["model_dim"],
@@ -301,9 +325,9 @@ def main():
         gate_mode="separated",
         opus_weights_shuffled=True,
         swiglu_limit=args.swiglu_limit,
-        situ_beta=DEFAULT_SITUV2_BETA if activation == ActivationType.Situv2 else 1.0,
+        situ_beta=situ_beta if activation == ActivationType.Situv2 else 1.0,
         situ_linear_beta=(
-            DEFAULT_SITUV2_LINEAR_BETA if activation == ActivationType.Situv2 else 1.0
+            situ_linear_beta if activation == ActivationType.Situv2 else 1.0
         ),
     )
     assert metadata.stage1.keywords["kernelName1"] == row["kernelName1"], metadata
@@ -313,6 +337,20 @@ def main():
     ), metadata
 
     def production():
+        activation_kwargs = (
+            {}
+            if args.situv2_public_defaults
+            else {
+                "beta": (
+                    DEFAULT_SITUV2_BETA if activation == ActivationType.Situv2 else None
+                ),
+                "linear_beta": (
+                    DEFAULT_SITUV2_LINEAR_BETA
+                    if activation == ActivationType.Situv2
+                    else None
+                ),
+            }
+        )
         return fm.fused_moe(
             data["input"],
             data["w1_a16"],
@@ -327,12 +365,7 @@ def main():
             gate_mode="separated",
             quant_dtype_a=dtypes.fp4x2,
             swiglu_limit=args.swiglu_limit,
-            beta=DEFAULT_SITUV2_BETA if activation == ActivationType.Situv2 else None,
-            linear_beta=(
-                DEFAULT_SITUV2_LINEAR_BETA
-                if activation == ActivationType.Situv2
-                else None
-            ),
+            **activation_kwargs,
         )
 
     def pair():
@@ -426,6 +459,12 @@ def main():
             "action": args.action,
             "swiglu_limit": args.swiglu_limit,
             "clamp_evidence": clamp_evidence,
+            "preserve_generated_route_weights": args.preserve_generated_route_weights,
+            "situv2_public_defaults": args.situv2_public_defaults,
+            "situv2_beta": situ_beta if activation == ActivationType.Situv2 else None,
+            "situv2_linear_beta": (
+                situ_linear_beta if activation == ActivationType.Situv2 else None
+            ),
             "activation": row["act_type"],
             "kernelName1": row["kernelName1"],
             "kernelName2": row["kernelName2"],

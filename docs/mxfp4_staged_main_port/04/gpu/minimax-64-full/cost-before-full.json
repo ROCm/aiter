@@ -1,0 +1,103 @@
+{
+  "id": "minimax-64-full",
+  "tokens": 64,
+  "admitted_pairs": 1368,
+  "representative_per_pair_seconds_range": [
+    0.35,
+    8
+  ],
+  "projected_seconds_range": [
+    569,
+    11544
+  ],
+  "fixed_import_setup_reserve_seconds_range": [
+    90,
+    600
+  ],
+  "uncertainty": "Wide extrapolation, not a bound. Unknown compile keys/failures; 8192 token memory/reference costs are extrapolated from prescribed 2048 pair checks. A still-live GPU hang is unbounded.",
+  "assumptions": [
+    "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
+    "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
+    "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
+    "Search uses initially empty dedicated default-configuration FlyDSL cache shared across sequential full/prune/staged invocations; keys compiled by earlier required searches stay warm. Auxiliary AITER JIT cache is already warm.",
+    "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
+  ],
+  "recorded_before_start_utc": "2026-10-10T15:52:54.410652+00:00",
+  "implementation_commit": "6c69bb11b",
+  "compilation_state": "Initially empty calibration-search-04-default FlyDSL cache, existing warm shared auxiliary JIT; same GPU/toolchain/warmup5/iters101 with seed0 random routes.",
+  "admitted_counts": {
+    "id": "minimax-64-full",
+    "m_est": 2,
+    "total_pairs": 1368,
+    "unique_gemm1": 84,
+    "unique_gemm2": 68,
+    "k2_shortlist_pairs_upper": 32,
+    "staged_exhaustive_fallback_pairs_upper": 1368,
+    "groups": [
+      {
+        "block_m": 16,
+        "accumulation_mode": "atomic",
+        "gemm1_candidates": 12,
+        "gemm2_candidates": 8,
+        "pairs": 96,
+        "k2_shortlist_pairs_upper": 4
+      },
+      {
+        "block_m": 16,
+        "accumulation_mode": "non-atomic",
+        "gemm1_candidates": 12,
+        "gemm2_candidates": 8,
+        "pairs": 96,
+        "k2_shortlist_pairs_upper": 4
+      },
+      {
+        "block_m": 32,
+        "accumulation_mode": "atomic",
+        "gemm1_candidates": 54,
+        "gemm2_candidates": 8,
+        "pairs": 432,
+        "k2_shortlist_pairs_upper": 4
+      },
+      {
+        "block_m": 32,
+        "accumulation_mode": "non-atomic",
+        "gemm1_candidates": 54,
+        "gemm2_candidates": 8,
+        "pairs": 432,
+        "k2_shortlist_pairs_upper": 4
+      },
+      {
+        "block_m": 64,
+        "accumulation_mode": "atomic",
+        "gemm1_candidates": 12,
+        "gemm2_candidates": 8,
+        "pairs": 96,
+        "k2_shortlist_pairs_upper": 4
+      },
+      {
+        "block_m": 64,
+        "accumulation_mode": "non-atomic",
+        "gemm1_candidates": 12,
+        "gemm2_candidates": 8,
+        "pairs": 96,
+        "k2_shortlist_pairs_upper": 4
+      },
+      {
+        "block_m": 128,
+        "accumulation_mode": "atomic",
+        "gemm1_candidates": 6,
+        "gemm2_candidates": 8,
+        "pairs": 48,
+        "k2_shortlist_pairs_upper": 4
+      },
+      {
+        "block_m": 128,
+        "accumulation_mode": "non-atomic",
+        "gemm1_candidates": 6,
+        "gemm2_candidates": 12,
+        "pairs": 72,
+        "k2_shortlist_pairs_upper": 4
+      }
+    ]
+  }
+}
