@@ -256,5 +256,10 @@
         "pci": "0000:f5:00.0"
       }
     }
-  ]
+  ],
+  "aggregate_initial_matrix_work_note": {
+    "no_fallback_validation_attempts_upper": 13296,
+    "meaning": "sum of full/prune admitted pairs plus staged K2 initial shortlist maxima; actual outcomes/fallback can change counts, no runtime validity implied",
+    "staged_validation_fallback_upper_total": 8952
+  }
 }
