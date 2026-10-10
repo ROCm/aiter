@@ -467,7 +467,9 @@ def test_fmoe_ep_mxfp4(
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
         a source token is received iff it owns >=1 local expert (deduplicated), so
         total_recv <= token and non-local routes are masked. Buffer is trimmed to
-        trim_M = token with a padded tail.
+        trim_M = token with a padded tail. AITER_MOE_EXPERT_BALANCE=true uses
+        synthetic routing balanced across global experts and EP ranks, matching
+        ATOM's init_balance_router_logits; otherwise routing scores are random.
       * "fake": mirror ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb,
         atom/model_ops/moe.py:121-136). `token` is the PER-RANK batch M; every
         token's topk picks are redirected onto this rank's local expert block via a
@@ -535,6 +537,8 @@ def test_fmoe_ep_mxfp4(
     expert_mask[E:-1] = 1
 
     dtype = dtypes.bf16
+    balanced = os.environ.get("AITER_MOE_EXPERT_BALANCE", "false").lower() == "true"
+    routing = "balanced" if balanced or ep_mode == "fake" else "random"
 
     if ep_mode == "fake":
         # ---------- ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb) shape model ----------
@@ -614,7 +618,23 @@ def test_fmoe_ep_mxfp4(
         src_input = _randn_or_const(
             (n_src, model_dim), const_init=const_init, dtype=dtype
         )
-        src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
+        if balanced:
+            if E % ep != 0 or not 1 <= topk <= E:
+                raise ValueError(
+                    "Balanced real EP routing requires E divisible by ep and "
+                    f"1 <= topk <= E, got E={E}, ep={ep}, topk={topk}"
+                )
+            # Match ATOM's global balanced router: walk ranks first, then
+            # local expert slots. Each expert gets floor/ceil(n_src*topk/E)
+            # routes, and each token's routes span EP ranks evenly.
+            t = torch.arange(n_src, device="cuda").unsqueeze(1)
+            k = torch.arange(topk, device="cuda").unsqueeze(0)
+            p = t * topk + k
+            expert_ids = (p % ep) * experts_per_rank + (p // ep) % experts_per_rank
+            src_score = torch.full((n_src, E), -10.0, dtype=dtype, device="cuda")
+            src_score.scatter_(1, expert_ids, 10.0)
+        else:
+            src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
         src_topk_ids = torch.empty(
             (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
         )
@@ -644,7 +664,7 @@ def test_fmoe_ep_mxfp4(
         assert total_recv <= trim_M, f"total_recv={total_recv} exceeds trim_M={trim_M}"
         print(
             f"  [EP sim] global_token={token} topk={topk} ep={ep} graph_bs={graph_bs} "
-            f"n_src={n_src} total_recv={total_recv} trim_M={trim_M}"
+            f"n_src={n_src} total_recv={total_recv} trim_M={trim_M} routing={routing}"
         )
 
         # Step 3: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
@@ -923,6 +943,7 @@ def test_fmoe_ep_mxfp4(
         {
             "quant": quant_label,
             "ep_mode": ep_mode,
+            "routing": routing,
             "global_token": token,
             "total_recv": total_recv,
             "trim_M": trim_M,
@@ -1047,6 +1068,8 @@ parser.add_argument(
     help="""Routing model for the mxfp4 EP tests (g1u1_a8w4_mxfp4/g1u1_a4w4_mxfp4):
     real = simulate MORI dispatch: -m is GLOBAL tokens, dedup + mask, only
            ~1/ep of routes land locally (total_recv <= token).
+           AITER_MOE_EXPERT_BALANCE=true balances routing across global experts
+           and EP ranks; otherwise routing scores are random.
     fake = ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb, moe.py:121-136): -m is the
            PER-RANK batch M, every token's topk redirected onto local experts
            (full M*topk local routes, no mask/dedup). Aligns with
@@ -1069,7 +1092,7 @@ parser.add_argument(
     metavar="VALUE",
     help="""initialize activations (input) and weights (w1/w2) to the constant
     VALUE instead of random values (mxfp4 EP tests only). Bare --const-init uses
-    0.0 (zero-init). Routing scores stay random so expert selection is unchanged.
+    0.0 (zero-init). Routing scores are unaffected by this option.
     Mirrors flydsl_tests/test_flydsl_grouped_gemm.py --const-init.""",
 )
 
