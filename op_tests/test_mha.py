@@ -1130,10 +1130,38 @@ _OPUS_BATCH_IDS = [
 ]
 
 
+def _opus_sink(nheads, enabled, hi=False):
+    """One learned fp32 logit per query head, or None.
+
+    Swept over the heads so the "sink dominates every score" branch and the
+    max-reference path are both exercised within a single case. ``hi`` selects
+    logits whose upper range exceeds the key-score max by more than fp32 exp2 can
+    represent, forcing the softmax to rebase onto max(m_row, sink).
+    """
+    if not enabled:
+        return None
+    lo, up = (60.0, 130.0) if hi else (-4.0, 12.0)
+    return torch.linspace(lo, up, nheads, device="cuda", dtype=torch.float32)
+
+
 def _run_opus_batch_case(
-    batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, d_qk, d_v, causal
+    batch_size,
+    seqlen_q,
+    seqlen_kv,
+    nheads,
+    nheads_k,
+    d_qk,
+    d_v,
+    causal,
+    with_sink=False,
+    sink_hi=False,
 ):
-    """Shared body: flash_attn_func with LSE, assert it routed to OPUS, check results."""
+    """Shared body: flash_attn_func with LSE, assert it routed to OPUS, check results.
+
+    with_sink adds one learned logit per query head. A sink is a valueless extra key:
+    it leaves the softmax numerator unchanged but grows the denominator, attenuating O
+    and raising LSE. Fully-masked rows remain O=0 with LSE equal to the sink logit.
+    """
     torch.manual_seed(0)
     q = torch.randn(
         batch_size, seqlen_q, nheads, d_qk, device="cuda", dtype=dtypes.bf16
@@ -1144,6 +1172,7 @@ def _run_opus_batch_case(
     v = torch.randn(
         batch_size, seqlen_kv, nheads_k, d_v, device="cuda", dtype=dtypes.bf16
     )
+    sink = _opus_sink(nheads, with_sink, hi=sink_hi)
 
     with torch.no_grad():
         out, lse = aiter.flash_attn_func(
@@ -1156,29 +1185,37 @@ def _run_opus_batch_case(
             window_size=(-1, -1),
             return_lse=True,
             return_attn_probs=False,
+            sink_ptr=sink,
         )
         # The dispatch chain tries several backends before OPUS; without this the
         # checks below could be validating a different kernel.
         out_opus = fmha_fwd_bf16_opus_fwd(
-            q, k, v, softmax_scale=d_qk**-0.5, causal=causal
+            q, k, v, softmax_scale=d_qk**-0.5, causal=causal, sink=sink
         )
     assert torch.equal(
         out, out_opus
     ), f"flash_attn_func did not route to the opus d{d_qk} kernel"
 
-    tag = f"opus-d{d_qk}"
-    out_ref, _, _ = attention_ref(q, k, v, causal=causal)
-    out_pt, _, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    tag = f"opus-d{d_qk}" + ("-sink" if with_sink else "")
+    out_ref, _, _ = attention_ref(q, k, v, causal=causal, sink=sink)
+    out_pt, _, _ = attention_ref(
+        q, k, v, causal=causal, sink=sink, upcast=False, reorder_ops=True
+    )
     out_tol = max(2 * (out_pt - out_ref).abs().max().item(), 0.01)
     out_diff = (out - out_ref).abs().max().item()
     print(f"[{tag}] out max diff: {out_diff} tol={out_tol}")
     assert out_diff <= out_tol
 
-    lse_ref = opus_ref_lse(q, k, causal)
+    # A sink does not create keys, so the no-key (-inf) rows come from the
+    # sink-free LSE. With a sink the denominator gains one column, which is
+    # exactly logaddexp(no-sink LSE, sink); for a fully-masked row that collapses
+    # to the sink logit, matching the kernel's "attend only the sink" result.
+    no_key = opus_ref_lse(q, k, causal)
+    lse_ref = torch.logaddexp(no_key, sink.view(1, nheads, 1)) if with_sink else no_key
     assert tuple(lse.shape) == (batch_size, nheads, seqlen_q), f"lse {tuple(lse.shape)}"
     opus_check_lse(tag, lse, lse_ref)
 
-    dead = torch.isneginf(lse_ref)  # rows that see no keys -> O must be exactly 0
+    dead = torch.isneginf(no_key)  # rows that see no keys -> O must be exactly 0
     if dead.any():
         dead_o = dead.permute(0, 2, 1).unsqueeze(-1).expand_as(out)
         assert (out[dead_o] == 0).all(), f"{tag}: fully-masked rows must produce O=0"
@@ -1225,3 +1262,610 @@ def test_flash_attn_func_opus_d192_v128(
     _run_opus_batch_case(
         batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, 192, 128, causal
     )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_kv,nheads,nheads_k",
+    _OPUS_BATCH_CASES,
+    ids=_OPUS_BATCH_IDS,
+)
+def test_flash_attn_func_opus_d64(
+    batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, causal, monkeypatch
+):
+    """OPUS gfx950 dense D=64 forward through flash_attn_func, with LSE.
+
+    The symmetric kernel is traits-parameterised on D; this is the same coverage
+    as the D=128 test one head dim down. Env-gated like the D=128 case.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus D=64 kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_batch_case(
+        batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, 64, 64, causal
+    )
+
+
+# Sink correctness: a representative subset, including a no-key case so the
+# "fully masked -> attend only the sink" branch is exercised.
+_OPUS_SINK_CASES = [
+    (2, 64, 64, 8, 2),  # GQA
+    (2, 128, 128, 16, 1),  # MQA
+    (1, 256, 256, 8, 8),  # MHA
+    (2, 300, 0, 8, 2),  # no keys -> every row attends only the sink
+]
+_OPUS_SINK_IDS = [
+    f"b{b}_sq{sq}_sk{sk}_h{h}_hkv{hk}" for (b, sq, sk, h, hk) in _OPUS_SINK_CASES
+]
+
+
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_kv,nheads,nheads_k",
+    _OPUS_SINK_CASES,
+    ids=_OPUS_SINK_IDS,
+)
+def test_flash_attn_func_opus_sink(
+    batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, causal, d, monkeypatch
+):
+    """OPUS symmetric kernel with a per-head attention sink (D in {64, 128}).
+
+    Checks O against attention_ref and the fp32 LSE against logaddexp(no-sink LSE,
+    sink) -- the LSE is the sharp check since the sink lives in the denominator.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_batch_case(
+        batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, d, d, causal, with_sink=True
+    )
+
+
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_kv,nheads,nheads_k",
+    [(2, 64, 64, 8, 2), (1, 256, 256, 8, 8)],
+    ids=["b2_sq64_sk64_h8_hkv2", "b1_sq256_sk256_h8_hkv8"],
+)
+def test_flash_attn_func_opus_sink_dominant(
+    batch_size, seqlen_q, seqlen_kv, nheads, nheads_k, causal, d, monkeypatch
+):
+    """A dominant sink must remain finite by becoming the softmax reference max."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_batch_case(
+        batch_size,
+        seqlen_q,
+        seqlen_kv,
+        nheads,
+        nheads_k,
+        d,
+        d,
+        causal,
+        with_sink=True,
+        sink_hi=True,
+    )
+
+
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_sink_posinf(causal, d, monkeypatch):
+    """A +inf sink receives all probability: O is zero and LSE is +inf."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    torch.manual_seed(0)
+    nheads, nheads_k = 8, 2
+    q = torch.randn(2, 64, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(2, 64, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(2, 64, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    sink = torch.full((nheads,), float("inf"), device="cuda", dtype=torch.float32)
+    with torch.no_grad():
+        out, lse = aiter.flash_attn_func(
+            q, k, v, causal=causal, return_lse=True, sink_ptr=sink
+        )
+        out_opus = fmha_fwd_bf16_opus_fwd(
+            q, k, v, softmax_scale=d**-0.5, causal=causal, sink=sink
+        )
+    assert torch.equal(out, out_opus), "did not route to the OPUS kernel"
+    assert torch.isposinf(
+        lse
+    ).all(), f"+inf sink must give LSE=+inf, got {lse.unique()}"
+    assert (out == 0).all(), "+inf sink must receive all probability"
+
+
+@pytest.mark.parametrize("grad_on", ["qkv", "sink"])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_func_sink_requires_grad_rejected(d, grad_on):
+    """The public dense API rejects sinks until its backward implements them."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU to build q/k/v")
+    nheads, nheads_k = 8, 2
+    qkv_kw = {
+        "device": "cuda",
+        "dtype": dtypes.bf16,
+        "requires_grad": grad_on == "qkv",
+    }
+    q = torch.randn(2, 64, nheads, d, **qkv_kw)
+    k = torch.randn(2, 64, nheads_k, d, **qkv_kw)
+    v = torch.randn(2, 64, nheads_k, d, **qkv_kw)
+    sink = torch.randn(
+        nheads, device="cuda", dtype=torch.float32, requires_grad=grad_on == "sink"
+    )
+    with pytest.raises(NotImplementedError, match="sink"):
+        aiter.flash_attn_func(q, k, v, sink_ptr=sink)
+
+
+@pytest.mark.parametrize("grad_on", ["qkv", "sink"])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_varlen_func_sink_requires_grad_rejected(d, grad_on):
+    """The public varlen API applies the same forward-only sink guard."""
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU to build q/k/v")
+    nheads, nheads_k = 8, 2
+    qkv_kw = {
+        "device": "cuda",
+        "dtype": dtypes.bf16,
+        "requires_grad": grad_on == "qkv",
+    }
+    q = torch.randn(80, nheads, d, **qkv_kw)
+    k = torch.randn(80, nheads_k, d, **qkv_kw)
+    v = torch.randn(80, nheads_k, d, **qkv_kw)
+    sink = torch.randn(
+        nheads, device="cuda", dtype=torch.float32, requires_grad=grad_on == "sink"
+    )
+    cu = torch.tensor([0, 32, 80], dtype=torch.int32, device="cuda")
+    with pytest.raises(NotImplementedError, match="varlen"):
+        aiter.flash_attn_varlen_func(q, k, v, cu, cu, 48, 48, sink_ptr=sink)
+
+
+# Single-sequence shapes for the varlen router (batch is always 1 here).
+#   (seqlen_q, seqlen_kv, nheads, nheads_k)
+_OPUS_VARLEN_CASES = [
+    (64, 64, 8, 2),  # 1 KV tile, GQA
+    (128, 512, 16, 1),  # cross sq < sk, MQA
+    (512, 128, 8, 8),  # cross sq > sk, MHA
+    (4096, 1024, 8, 2),  # long-ish prefill, GQA
+]
+_OPUS_VARLEN_IDS = [
+    f"sq{sq}_sk{sk}_h{h}_hkv{hk}" for (sq, sk, h, hk) in _OPUS_VARLEN_CASES
+]
+
+
+def _run_opus_single_seq_varlen(
+    seqlen_q, seqlen_kv, nheads, nheads_k, d, causal, with_sink
+):
+    """A one-sequence varlen batch must route to the dense OPUS kernel and produce
+    output bit-identical to sending that sequence straight to the dense entry."""
+    torch.manual_seed(0)
+    q = torch.randn(seqlen_q, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(seqlen_kv, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(seqlen_kv, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    sink = _opus_sink(nheads, with_sink)
+    cu_q = torch.tensor([0, seqlen_q], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, seqlen_kv], dtype=torch.int32, device="cuda")
+
+    with torch.no_grad():
+        out, lse = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            seqlen_q,
+            seqlen_kv,
+            causal=causal,
+            return_lse=True,
+            sink_ptr=sink,
+        )
+        # The same single sequence sent straight to the dense OPUS op.
+        out_dense, lse_dense = fmha_fwd_bf16_opus_fwd(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=d**-0.5,
+            causal=causal,
+            sink=sink,
+            return_lse=True,
+        )
+    tag = f"opus-varlen-d{d}" + ("-sink" if with_sink else "")
+    assert tuple(out.shape) == (
+        seqlen_q,
+        nheads,
+        d,
+    ), f"{tag}: out shape {tuple(out.shape)}"
+    assert tuple(lse.shape) == (
+        nheads,
+        seqlen_q,
+    ), f"{tag}: lse shape {tuple(lse.shape)}"
+    # Routing + view correctness: O and LSE must exactly equal the dense path.
+    assert torch.equal(
+        out, out_dense.squeeze(0)
+    ), f"{tag}: single-seq varlen did not route to the dense OPUS kernel"
+    assert torch.equal(
+        lse, lse_dense.squeeze(0)
+    ), f"{tag}: single-seq varlen LSE differs from dense OPUS"
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv,nheads,nheads_k",
+    _OPUS_VARLEN_CASES,
+    ids=_OPUS_VARLEN_IDS,
+)
+def test_flash_attn_func_opus_varlen_single_seq(
+    seqlen_q, seqlen_kv, nheads, nheads_k, causal, d, with_sink, monkeypatch
+):
+    """flash_attn_varlen_func on a one-sequence batch routes to dense OPUS."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_single_seq_varlen(
+        seqlen_q, seqlen_kv, nheads, nheads_k, d, causal, with_sink
+    )
+
+
+# (valid_q, valid_k, buf_q, buf_k): the K/V buffer is LONGER than the valid range,
+# mirroring vLLM's fixed-size chunked-context workspace. Q is always exact (the router
+# requires it), so buf_q == valid_q.
+_OPUS_OVERSIZED_CASES = [
+    (128, 300, 128, 512),  # K/V oversized (the vLLM chunked-context shape)
+    (256, 512, 256, 1024),  # larger valid range, K/V oversized
+]
+_OPUS_OVERSIZED_IDS = [
+    f"vq{vq}_vk{vk}_bq{bq}_bk{bk}" for (vq, vk, bq, bk) in _OPUS_OVERSIZED_CASES
+]
+
+
+def _run_opus_oversized_buffer(
+    valid_q, valid_k, buf_q, buf_k, nheads, nheads_k, d, causal, with_sink
+):
+    """The single-seq router must attend only the valid prefix of an oversized
+    buffer. The tail past the valid range is poisoned so that attending any stale
+    row would move the result far outside tolerance."""
+    torch.manual_seed(0)
+    q = torch.randn(buf_q, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(buf_k, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(buf_k, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    k[valid_k:] = 50.0  # poison the stale tail
+    v[valid_k:] = -50.0
+    sink = _opus_sink(nheads, with_sink)
+    cu_q = torch.tensor([0, valid_q], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, valid_k], dtype=torch.int32, device="cuda")
+
+    with torch.no_grad():
+        out, _ = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            valid_q,
+            valid_k,
+            causal=causal,
+            return_lse=True,
+            sink_ptr=sink,
+        )
+        # Dense OPUS on the CLEAN valid prefix only. Equality proves both that the
+        # call routed to OPUS and that the poisoned tail never entered the softmax.
+        out_ref = fmha_fwd_bf16_opus_fwd(
+            q[:valid_q].unsqueeze(0),
+            k[:valid_k].unsqueeze(0),
+            v[:valid_k].unsqueeze(0),
+            softmax_scale=d**-0.5,
+            causal=causal,
+            sink=sink,
+        )
+    tag = f"opus-oversized-d{d}"
+    assert tuple(out.shape) == (
+        valid_q,
+        nheads,
+        d,
+    ), f"{tag}: out shape {tuple(out.shape)}"
+    assert torch.equal(
+        out, out_ref.squeeze(0)
+    ), f"{tag}: poisoned tail leaked into the output (or did not route to OPUS)"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "valid_q,valid_k,buf_q,buf_k",
+    _OPUS_OVERSIZED_CASES,
+    ids=_OPUS_OVERSIZED_IDS,
+)
+def test_flash_attn_func_opus_oversized_buffer(
+    valid_q, valid_k, buf_q, buf_k, causal, monkeypatch
+):
+    """An oversized single-seq packed buffer attends only its valid prefix."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_oversized_buffer(
+        valid_q,
+        valid_k,
+        buf_q,
+        buf_k,
+        nheads=8,
+        nheads_k=2,
+        d=64,
+        causal=causal,
+        with_sink=True,
+    )
+
+
+# ─── out= passthrough: dense entry, and the single-seq varlen router ──────────────
+# The buffer must be written IN PLACE (avoiding a hidden copy is the point) and the
+# routed result must stay bit-identical to the dense op.
+
+_OPUS_OUT_SHAPE = {
+    "seqlen_q": 128,
+    "seqlen_kv": 300,
+    "nheads": 8,
+    "nheads_k": 2,
+    "d": 64,
+}
+
+
+def _opus_out_qkv(seqlen_q, seqlen_kv, nheads, nheads_k, d, packed):
+    torch.manual_seed(0)
+    qs = (seqlen_q, nheads, d) if packed else (1, seqlen_q, nheads, d)
+    kvs = (seqlen_kv, nheads_k, d) if packed else (1, seqlen_kv, nheads_k, d)
+    return (
+        torch.randn(*qs, device="cuda", dtype=dtypes.bf16),
+        torch.randn(*kvs, device="cuda", dtype=dtypes.bf16),
+        torch.randn(*kvs, device="cuda", dtype=dtypes.bf16),
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_out_param(causal):
+    """flash_attn_func(out=...) fills the caller's buffer in place and returns it.
+
+    Deliberately NOT gated on gfx950: every backend in _flash_attn_forward receives
+    `out`, so this also covers the CK fallback on other parts.
+    """
+    q, k, v = _opus_out_qkv(**_OPUS_OUT_SHAPE, packed=False)
+    with torch.no_grad():
+        ref = aiter.flash_attn_func(q, k, v, causal=causal)
+        out = torch.empty_like(ref)
+        got = aiter.flash_attn_func(q, k, v, causal=causal, out=out)
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    assert got.data_ptr() == out.data_ptr(), "out= was not written in place"
+    assert torch.equal(out, ref), "out= changed the result"
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_varlen_out_param(causal, with_sink, monkeypatch):
+    """A single-seq varlen call carrying out= still routes to dense OPUS, with the
+    caller's buffer written in place (no copy)."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    s = _OPUS_OUT_SHAPE
+    q, k, v = _opus_out_qkv(**s, packed=True)
+    sink = _opus_sink(s["nheads"], with_sink)
+    cu_q = torch.tensor([0, s["seqlen_q"]], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, s["seqlen_kv"]], dtype=torch.int32, device="cuda")
+    out = torch.empty(
+        s["seqlen_q"], s["nheads"], s["d"], device="cuda", dtype=dtypes.bf16
+    )
+
+    with torch.no_grad():
+        got = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            s["seqlen_q"],
+            s["seqlen_kv"],
+            causal=causal,
+            sink_ptr=sink,
+            out=out,
+        )
+        ref = fmha_fwd_bf16_opus_fwd(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            softmax_scale=s["d"] ** -0.5,
+            causal=causal,
+            sink=sink,
+        )
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    tag = f"opus-varlen-out-d{s['d']}"
+    assert (
+        got.data_ptr() == out.data_ptr()
+    ), f"{tag}: out= buffer was copied, not filled"
+    assert torch.equal(
+        out, ref.squeeze(0)
+    ), f"{tag}: out= path did not route to the dense OPUS kernel"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_varlen_out_param_oversized_rejected(causal, monkeypatch):
+    """An out= with more rows than Q must never be silently accepted.
+
+    A varlen call returns one row per query row, so an oversized out would leave a stale
+    tail. Both OPUS gates decline it and CK rejects it too, so the observable contract is
+    that the call RAISES rather than returning a truncated buffer.
+    """
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    s = _OPUS_OUT_SHAPE
+    q, k, v = _opus_out_qkv(**s, packed=True)
+    cu_q = torch.tensor([0, s["seqlen_q"]], dtype=torch.int32, device="cuda")
+    cu_k = torch.tensor([0, s["seqlen_kv"]], dtype=torch.int32, device="cuda")
+    out = torch.full(
+        (s["seqlen_q"] + 64, s["nheads"], s["d"]),
+        99.0,
+        device="cuda",
+        dtype=dtypes.bf16,
+    )
+
+    with torch.no_grad(), pytest.raises(RuntimeError):
+        aiter.flash_attn_varlen_func(
+            q, k, v, cu_q, cu_k, s["seqlen_q"], s["seqlen_kv"], causal=causal, out=out
+        )
+
+
+# ─── group (varlen) mode on the symmetric OPUS kernel ────────────────────────────
+# A multi-sequence batch is what the single-sequence router cannot reach. Each sequence
+# is checked against a dense OPUS call on that sequence alone, and every sequence's K/V
+# is scaled distinctly so reading past its own seqlen is loud rather than a drift.
+# Bit-equality is the sharp assertion: group mode uses exactly the dense call's tiles,
+# so only the addressing differs.
+
+# Ragged on purpose: non-tile-aligned tails, and a seqlen_q > seqlen_kv group (which
+# makes the causal bottom-right offset negative).
+_OPUS_GROUP_CASES = [
+    ([128, 64], [300, 128]),
+    ([96, 160, 32], [96, 512, 300]),
+    ([64, 128], [512, 64]),  # group 1 has seqlen_q > seqlen_kv
+    ([128, 0, 64], [256, 128, 300]),  # empty middle group -> short-circuit
+    ([64, 128], [0, 64]),  # no-key group -> O=0 and LSE=-inf (or sink)
+]
+_OPUS_GROUP_IDS = [
+    f"g{len(q)}_q{'-'.join(map(str, q))}_k{'-'.join(map(str, k))}"
+    for (q, k) in _OPUS_GROUP_CASES
+]
+
+
+def _run_opus_group_case(q_lens, kv_lens, nheads, nheads_k, d, causal, with_sink):
+    torch.manual_seed(0)
+    total_q, total_k = sum(q_lens), sum(kv_lens)
+    q = torch.randn(total_q, nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(total_k, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(total_k, nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    # Distinct magnitude per sequence so cross-group leakage is loud, not subtle.
+    koff = 0
+    for i, kl in enumerate(kv_lens):
+        k[koff : koff + kl] *= float(2 * i + 1) * 4.0
+        v[koff : koff + kl] *= float(2 * i + 1) * 4.0
+        koff += kl
+
+    sink = _opus_sink(nheads, with_sink)
+    cu_q = torch.tensor(
+        [0, *itertools.accumulate(q_lens)], dtype=torch.int32, device="cuda"
+    )
+    cu_k = torch.tensor(
+        [0, *itertools.accumulate(kv_lens)], dtype=torch.int32, device="cuda"
+    )
+
+    with torch.no_grad():
+        out, lse = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max(q_lens),
+            max(kv_lens),
+            causal=causal,
+            return_lse=True,
+            sink_ptr=sink,
+        )
+    tag = f"opus-group-d{d}-g{len(q_lens)}" + ("-sink" if with_sink else "")
+    assert tuple(out.shape) == (total_q, nheads, d), f"{tag}: out {tuple(out.shape)}"
+    assert tuple(lse.shape) == (nheads, total_q), f"{tag}: lse {tuple(lse.shape)}"
+
+    # Prefix sums, not a running counter: an empty group still consumes its K/V rows.
+    q_off = [0, *itertools.accumulate(q_lens)]
+    k_off = [0, *itertools.accumulate(kv_lens)]
+    for i, (ql, kl) in enumerate(zip(q_lens, kv_lens)):
+        qo, ko = q_off[i], k_off[i]
+        if ql == 0:
+            continue  # empty group: no rows to compare, the short-circuit wrote nothing
+        with torch.no_grad():
+            ref, ref_lse = fmha_fwd_bf16_opus_fwd(
+                q[qo : qo + ql].unsqueeze(0),
+                k[ko : ko + kl].unsqueeze(0),
+                v[ko : ko + kl].unsqueeze(0),
+                softmax_scale=d**-0.5,
+                causal=causal,
+                sink=sink,
+                return_lse=True,
+            )
+        assert torch.equal(out[qo : qo + ql], ref.squeeze(0)), (
+            f"{tag}: group {i} O differs from dense OPUS "
+            "(cross-group leakage, or it fell back to CK)"
+        )
+        assert torch.equal(lse[:, qo : qo + ql], ref_lse.squeeze(0)), (
+            f"{tag}: group {i} LSE differs from dense OPUS "
+            "(packed [H, total_q] offset is wrong)"
+        )
+
+
+@pytest.mark.parametrize("with_sink", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("q_lens,kv_lens", _OPUS_GROUP_CASES, ids=_OPUS_GROUP_IDS)
+def test_flash_attn_func_opus_group_varlen(
+    q_lens, kv_lens, causal, d, with_sink, monkeypatch
+):
+    """A multi-sequence varlen batch runs on the symmetric OPUS kernel in group mode,
+    each sequence matching a dense OPUS call on that sequence alone."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    _run_opus_group_case(
+        q_lens, kv_lens, nheads=8, nheads_k=2, d=d, causal=causal, with_sink=with_sink
+    )
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_flash_attn_func_opus_group_declines_padded_cu(causal, monkeypatch):
+    """Caller-supplied KV padding is unvalidated for this kernel, so the group gate must
+    decline it and the call must still be numerically correct on the CK fallback."""
+    if get_gfx() != "gfx950":
+        pytest.skip("opus symmetric kernel requires gfx950")
+    monkeypatch.setenv("AITER_ENABLE_FMHA_OPUS", "1")
+    d, nheads, nheads_k = 64, 8, 2
+    q_lens, kv_lens = [128, 64], [256, 128]
+    torch.manual_seed(0)
+    q = torch.randn(sum(q_lens), nheads, d, device="cuda", dtype=dtypes.bf16)
+    k = torch.randn(sum(kv_lens), nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    v = torch.randn(sum(kv_lens), nheads_k, d, device="cuda", dtype=dtypes.bf16)
+    cu_q = torch.tensor(
+        [0, *itertools.accumulate(q_lens)], dtype=torch.int32, device="cuda"
+    )
+    cu_k = torch.tensor(
+        [0, *itertools.accumulate(kv_lens)], dtype=torch.int32, device="cuda"
+    )
+
+    with torch.no_grad():
+        got = aiter.flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            max(q_lens),
+            max(kv_lens),
+            causal=causal,
+            cu_seqlens_q_padded=cu_q.clone(),
+            cu_seqlens_k_padded=cu_k.clone(),
+        )
+    got = got[0] if isinstance(got, (tuple, list)) else got
+    assert tuple(got.shape) == (sum(q_lens), nheads, d)
+
+    qo = ko = 0
+    for ql, kl in zip(q_lens, kv_lens):
+        qd = q[qo : qo + ql].unsqueeze(0)
+        kd = k[ko : ko + kl].unsqueeze(0)
+        vd = v[ko : ko + kl].unsqueeze(0)
+        ref, _, _ = attention_ref(qd, kd, vd, causal=causal)
+        pt, _, _ = attention_ref(
+            qd, kd, vd, causal=causal, upcast=False, reorder_ops=True
+        )
+        tol = max(2 * (pt - ref).abs().max().item(), 0.01)
+        diff = (got[qo : qo + ql] - ref.squeeze(0)).abs().max().item()
+        assert diff <= tol, f"padded-cu fallback is wrong: {diff} > {tol}"
+        qo += ql
+        ko += kl
