@@ -65,7 +65,7 @@ class TestMxmoeOpusRuntime(unittest.TestCase):
         options = dict(gate_mode="interleave", opus_weights_shuffled=True,
             input_dtype=a.dtypes.bf16)
         options.update(kwargs)
-        return self.fm.get_2stage_cfgs(32, 3072, 512, 128, 4, a.dtypes.bf16,
+        return self.fm.get_2stage_cfgs(32, 3072, int(self.row["inter_dim"]), 128, 4, a.dtypes.bf16,
             a.dtypes.fp8, a.dtypes.fp4x2, a.QuantType.per_1x32, True,
             a.ActivationType.Silu, False, 0, 0, **options)
 
@@ -79,6 +79,51 @@ class TestMxmoeOpusRuntime(unittest.TestCase):
         self.assertTrue(metadata.prequant)
         self.assertEqual(metadata.block_m, 32)
         self.assertFalse(self.torch.cuda.is_initialized())
+
+    def test_bm16_padded_csv_selects_regular_without_changing_native_metadata(self):
+        self.g1 = "flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out"
+        self.g2 = "opus_moe2_layout_afp8_wfp4_atomic_t16x128x256_sbm16_cache_b3_ws2"
+        self.write_csv(inter_dim=384, block_m=16)
+        native_name = "flydsl_moe2_layout_afp8_wfp4_bf16_t16x128x128_atomic_sbm16"
+        native = self.fm._make_mxfp4_metadata(self.g1, native_name,
+            self.fm.GateMode.INTERLEAVE, 0)
+        selected = self.select()
+        self.assertEqual(selected.stage1.keywords["kernelName1"], self.g1)
+        self.assertEqual(selected.stage2.keywords["launch"].kernel_id, 2008)
+        self.assertFalse(selected.stage1.keywords["native_scale_layout"])
+        self.assertTrue(native.stage1.keywords["native_scale_layout"])
+        self.assertEqual(selected.block_m, 16)
+
+    def test_stage1_regular_scales_expose_padded_stride_and_reader_capacity(self):
+        torch, a = self.torch, self.aiter
+        launcher = importlib.import_module("aiter.ops.flydsl.mxfp4_gemm1_kernels")
+        for inter, native, cols, minimum_bytes in (
+            (384, False, 16, 2560),
+            (1408, False, 48, 7680),
+            (384, True, 12, 4608),
+            (1408, True, 44, 13824),
+        ):
+            with self.subTest(inter=inter, native=native):
+                hidden = torch.empty((31, 512), dtype=a.dtypes.bf16)
+                w1 = torch.empty((2, 2 * inter, 256), dtype=a.dtypes.fp4x2)
+                w2 = torch.empty((2, 512, inter // 2), dtype=a.dtypes.fp4x2)
+                with patch.object(launcher, "flydsl_mxfp4_gemm1") as launch:
+                    payload, scales = self.fm._mxfp4_a4w4_stage1_fw(
+                        hidden, w1, w2, torch.empty(144, dtype=a.dtypes.i32),
+                        torch.empty(9, dtype=a.dtypes.i32),
+                        torch.tensor([144, 31], dtype=a.dtypes.i32), None, 2,
+                        kernelName1="flydsl_mxmoe_g1_a8w4_16x128x256_f16in_nt_fp8out",
+                        native_scale_layout=native,
+                    )
+                self.assertEqual(payload.shape, (144, inter))
+                self.assertEqual(scales.shape[1], cols)
+                self.assertEqual(scales.stride(), (cols, 1))
+                self.assertTrue(scales.is_contiguous())
+                self.assertGreaterEqual(scales.numel(), minimum_bytes)
+                self.assertEqual(scales.shape[0] % 32, 0)
+                self.assertIs(launch.call_args.kwargs["inter_sorted_shuffled_scale"], scales)
+        self.assertFalse(torch.cuda.is_initialized())
+
 
     def test_non_fp8out_and_mismatched_csv_block_fall_back(self):
         for changes, reason in (
