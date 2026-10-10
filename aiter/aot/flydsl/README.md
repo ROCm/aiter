@@ -111,15 +111,13 @@ AITER_FLYDSL_STAGE2_FP8=1 AITER_MXFP4_INTERMEDIATE=1 \
 # Compile only this selected CSV through the shared batch worker pool.
 AITER_MXFP4_TUNE_SWIGLU_LIMIT=5 AITER_FLYDSL_STAGE2_FP8=1 \
   AITER_MXFP4_INTERMEDIATE=1 FLYDSL_RUNTIME_CACHE_DIR=/path/to/cache \
-  python - <<'PY'
-from aiter.aot.flydsl.common import collect_aot_jobs, run_jobs_parallel
-from aiter.aot.flydsl.mxfp4_moe import compile_one_config, parse_csv
-
-jobs = collect_aot_jobs(["/path/to/limit5-both-winner.csv"], parse_csv)
-results = run_jobs_parallel(compile_one_config, jobs)
-assert all(result["compile_time"] is not None for result in results), results
-PY
+  python docs/mxfp4_staged_main_port/scripts/compile_selected.py \
+  --csv /path/to/limit5-both-winner.csv
 ```
+
+The batch script has a guarded main entry so spawned workers can import it
+without restarting collection. Run it from the repo root with that checkout
+on `PYTHONPATH`, or from an environment with the same checkout installed.
 
 The full default `run_aot` model corpus includes Situv2 rows. A custom limit
 rejects those rows; select only the CSVs compatible with that activation limit
