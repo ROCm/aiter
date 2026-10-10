@@ -2,11 +2,14 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Offline checks through the calibration report's summarize(records) seam."""
 
+import gzip
 import importlib.util
 import json
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 def summary_module():
@@ -291,3 +294,163 @@ def test_cli_preserves_recorded_failure_cause_and_nonzero_task_exit(tmp_path):
     )
     assert failed["task"]["exit_code"] == -11
     assert failed["valid_winner"] is False
+
+
+def test_rank_retention_uses_stable_nonatomic_ties_and_separate_atomic_group():
+    g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
+    g1_fast = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu_xcd2"
+    g1_later = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu_xcd4"
+    reduce = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
+    scatter = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_scatter_sbm128"
+    later_reduce = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_reduce_sbm128"
+    atomic = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_sbm128"
+    atomic_fast = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_atomic_sbm128"
+    console = "\n".join(
+        [
+            f"[mxfp4-staged] GEMM1 {g1_fast} screening us=1.0",
+            f"[mxfp4-staged] GEMM1 {g1} screening us=2.0",
+            f"[mxfp4-staged] GEMM1 {g1_later} screening us=2.0",
+            "[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_64x128x128_f16in_nt_silu screening us=0.1",
+            f"[mxfp4-staged] GEMM2 {atomic_fast} screening us=0.1",
+            f"[mxfp4-staged] GEMM2 {atomic} screening us=0.2",
+            f"[mxfp4-staged] GEMM2 {reduce} screening us=10.0",
+            f"[mxfp4-staged] GEMM2 {scatter} screening us=10.0",
+            f"[mxfp4-staged] GEMM2 {later_reduce} screening us=10.0",
+            f"[mxfp4-staged] {g1} + {scatter} us=12.0",
+        ]
+    )
+
+    report = summary_module().rank_retention(
+        {"kernelName1": g1, "kernelName2": scatter}, console
+    )
+
+    assert report == {
+        "block_m": 128,
+        "accumulation_mode": "non_atomic",
+        "screen_topk": 2,
+        "g1_rank": 2,
+        "g2_rank": 2,
+        "g1_successful_candidates": 3,
+        "g2_successful_candidates": 3,
+        "both_retained": True,
+        "pair_validated": True,
+    }
+    atomic_report = summary_module().rank_retention(
+        {"kernelName1": g1, "kernelName2": atomic}, console
+    )
+    assert atomic_report["g2_rank"] == 2
+    assert atomic_report["g2_successful_candidates"] == 2
+    assert atomic_report["pair_validated"] is False
+
+
+def test_failed_screen_has_no_rank_even_when_fallback_validates_pair():
+    g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
+    g2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
+    console = (
+        f"[mxfp4-staged] GEMM1 {g1} screening us=1.0\n"
+        f"[mxfp4-staged] GEMM2 {g2} screening failed: fixture\n"
+        f"[mxfp4-staged] {g1} + {g2} validation failed: returned fixture\n"
+    )
+
+    report = summary_module().rank_retention(
+        {"kernelName1": g1, "kernelName2": g2}, console
+    )
+
+    assert report["g1_rank"] == 1
+    assert report["g2_rank"] is None
+    assert report["both_retained"] is False
+    assert report["pair_validated"] is True
+
+
+def test_fallback_count_infers_expansion_after_nonempty_shortlist_failure():
+    g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
+    g2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
+    expanded = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x256x128_scatter_sbm128"
+    console = (
+        f"[mxfp4-staged] GEMM1 {g1} screening us=1.0\n"
+        f"[mxfp4-staged] GEMM2 {g2} screening us=1.0\n"
+        f"[mxfp4-staged] GEMM2 {expanded} screening us=2.0\n"
+        f"[mxfp4-staged] {g1} + {g2} validation failed: returned fixture\n"
+        f"[mxfp4-staged] {g1} + {expanded} us=4.0\n"
+    )
+
+    count = summary_module().staged_fallback_groups(console, screen_topk=1)
+
+    assert count == 1
+    assert summary_module().staged_fallback_groups(console, screen_topk=2) == 0
+
+
+def test_fallback_count_unions_explicit_and_inferred_groups_once():
+    g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
+    g2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
+    console = (
+        "[mxfp4-staged] exhaustive fallback BM128 non-atomic: no usable reference/shortlist\n"
+        "[mxfp4-staged] exhaustive fallback BM128 non-atomic: no usable reference/shortlist\n"
+        "[mxfp4-staged] exhaustive fallback BM64 atomic: no usable reference/shortlist\n"
+        f"[mxfp4-staged] {g1} + {g2} us=4.0\n"
+    )
+
+    assert summary_module().staged_fallback_groups(console) == 2
+
+
+@pytest.mark.parametrize("compressed", (False, True))
+def test_cli_reports_rank_retention_only_when_staged_log_exists(tmp_path, compressed):
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps(manifest_records()))
+    gpu = tmp_path / "gpu"
+    g1 = "flydsl_mxmoe_g1_a4w4_128x128x128_f16in_nt_silu"
+    g2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_reduce_sbm128"
+    for token in (64, 128):
+        for mode in ("prune", "staged"):
+            directory = gpu / f"minimax-{token}-{mode}"
+            (directory / "search-task").mkdir(parents=True)
+            (directory / "search.json").write_text(
+                json.dumps(
+                    {
+                        "outcome": "valid",
+                        "winner_us": 10.0,
+                        "winner": {"kernelName1": g1, "kernelName2": g2},
+                    }
+                )
+            )
+            (directory / "search-task" / "task.json").write_text(
+                json.dumps({"exit_code": 0})
+            )
+    console = (
+        f"[mxfp4-staged] GEMM1 {g1} screening us=1.0\n"
+        f"[mxfp4-staged] GEMM2 {g2} screening us=2.0\n"
+        f"[mxfp4-staged] {g1} + {g2} us=3.0\n"
+    )
+    console_path = gpu / "minimax-64-staged" / "search-task" / "console.log.txt"
+    if compressed:
+        with gzip.open(str(console_path) + ".gz", "wt") as stream:
+            stream.write(console)
+    else:
+        console_path.write_text(console)
+    output = tmp_path / "report.json"
+    markdown = tmp_path / "report.md"
+
+    subprocess.run(
+        [
+            sys.executable,
+            str(Path(__file__).with_name("summarize_calibration.py")),
+            "--manifest",
+            str(manifest),
+            "--gpu-dir",
+            str(gpu),
+            "--output",
+            str(output),
+            "--markdown",
+            str(markdown),
+        ],
+        check=True,
+    )
+
+    report = json.loads(output.read_text())
+    rows = {
+        row["token"]: row for row in report["paired_rows"] if row["model"] == "minimax"
+    }
+    assert rows[64]["rank_retention"]["both_retained"] is True
+    assert rows[64]["rank_retention"]["pair_validated"] is True
+    assert "rank_retention" not in rows[128]
+    assert "Prune winner screening ranks" in markdown.read_text()
