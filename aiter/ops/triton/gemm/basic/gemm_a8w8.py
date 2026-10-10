@@ -13,7 +13,10 @@ from aiter.ops.triton._triton_kernels.gemm.basic.gemm_a8w8 import (
 )
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_xcds
-from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+from aiter.ops.triton.utils.gemm_config_utils import (
+    compute_splitk_params,
+    get_gemm_config,
+)
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton.utils.types import (
     get_scaled_dot_format_string,
@@ -36,6 +39,7 @@ def gemm_a8w8(
     config: dict | None = None,
     skip_reduce: bool | None = False,
     backend: str = "triton",
+    b_preshuffled: bool = False,
 ):
     """
     Computes 8 bit matrix multiplication Y = (X @ W^T) * (x_scale * w_scale) with optional bias.
@@ -54,6 +58,9 @@ def gemm_a8w8(
         skip_reduce (Optional[bool]): Skip reduction of split-K partial results.
             Enables kernel fusion with downstream operations (FP8/FP4 quantization,
             RMSNorm). Returns shape (NUM_KSPLIT, M, N) instead of (M, N).
+        b_preshuffled (bool): Read contiguous FP8 weights produced by
+            shuffle_weight(layout=(16, 16)), retaining their (N, padded_K)
+            shape. The Triton backend supports logical K <= padded_K.
 
     Returns:
         torch.Tensor: Output with shape (M, N) or (NUM_KSPLIT, M, N) if skip_reduce=True.
@@ -67,10 +74,22 @@ def gemm_a8w8(
         tuple(w_scale.shape),
     )
 
-    assert x.shape[1] == w.shape[1], "Incompatible dimensions!!!"
-
     M, K = x.shape
-    N, K = w.shape
+    N, weight_k = w.shape
+
+    if b_preshuffled:
+        assert backend == "triton", "shuffled weights require the Triton backend"
+        assert x.dtype == w.dtype == torch.float8_e4m3fn, "E4M3FN FP8 required"
+        assert w.is_contiguous(), "shuffled weights must be contiguous"
+        assert N % 16 == 0 and weight_k % 32 == 0, "invalid (16,16) shuffle shape"
+        assert 0 < K <= weight_k, "logical K must fit the shuffled weight"
+        assert (
+            x_scale.numel() == M and w_scale.numel() == N
+        ), "per-row/channel scales required"
+        assert x_scale.dtype == w_scale.dtype == torch.float32, "FP32 scales required"
+        x_scale, w_scale = x_scale.contiguous(), w_scale.contiguous()
+    else:
+        assert K == weight_k, "Incompatible dimensions!!!"
 
     w = w.T
 
@@ -88,8 +107,15 @@ def gemm_a8w8(
     if config is None:
         if backend == "gluon":
             config, _ = get_gemm_config("GEMM-A8W8", M, N, K, backend="gluon")
+        elif b_preshuffled:
+            config, _ = get_gemm_config("GEMM-A8W8_BPRESHUFFLE", M, N, K)
         else:
             config, _ = _get_config(M, N, K)
+
+    if b_preshuffled:
+        # Also normalize explicit tuning configs without mutating the caller.
+        config = compute_splitk_params(dict(config), K)
+        assert config["BLOCK_SIZE_K"] % 16 == 0
 
     if y is None and (config.get("NUM_KSPLIT", 1) == 1 or not skip_reduce):
         y = torch.empty((M, N), dtype=dtype, device=x.device)
@@ -173,6 +199,7 @@ def gemm_a8w8(
         y.stride(0) if config["NUM_KSPLIT"] == 1 else y_pp.stride(1),
         y.stride(1) if config["NUM_KSPLIT"] == 1 else y_pp.stride(2),
         (bias is not None) and (config["NUM_KSPLIT"] == 1),
+        B_PRESHUFFLED=b_preshuffled,
         **config,
     )
 

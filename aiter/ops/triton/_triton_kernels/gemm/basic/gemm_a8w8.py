@@ -15,6 +15,7 @@ _gemm_a8w8_repr = make_kernel_repr(
     "_gemm_a8w8_kernel",
     [
         "HAS_BIAS",
+        "B_PRESHUFFLED",
         "BLOCK_SIZE_M",
         "BLOCK_SIZE_N",
         "BLOCK_SIZE_K",
@@ -73,6 +74,7 @@ def _gemm_a8w8_kernel(
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
     cache_modifier: tl.constexpr,
+    B_PRESHUFFLED: tl.constexpr = False,
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8 instead.
@@ -131,9 +133,20 @@ def _gemm_a8w8_kernel(
         a_ptrs = a_ptr + (
             offs_am[:, None] * stride_am + offs_k_split[None, :] * stride_ak
         )
-        b_ptrs = b_ptr + (
-            offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-        )
+        if B_PRESHUFFLED:
+            # shuffle_weight(layout=(16, 16)) on byte-sized FP8 weights:
+            # [N/16, 16, K/32, 2, 16] -> [N/16, K/32, 2, 16, 16].
+            # stride_bn is the physical, possibly padded K of the (N, K) buffer.
+            b_ptrs = b_ptr + (
+                (offs_bn[None, :] // 16) * stride_bn * 16
+                + (offs_k_split[:, None] // 16) * 256
+                + (offs_bn[None, :] % 16) * 16
+                + offs_k_split[:, None] % 16
+            )
+        else:
+            b_ptrs = b_ptr + (
+                offs_k_split[:, None] * stride_bk + offs_bn[None, :] * stride_bn
+            )
 
         # Create pointers for the scale tensors and load them
         a_scale = tl.load(a_scale_ptr + offs_am)
@@ -165,7 +178,10 @@ def _gemm_a8w8_kernel(
 
             # Advance the ptrs to the next K block.
             a_ptrs += BLOCK_SIZE_K * stride_ak
-            b_ptrs += BLOCK_SIZE_K * stride_bk
+            if B_PRESHUFFLED:
+                b_ptrs += BLOCK_SIZE_K * 16
+            else:
+                b_ptrs += BLOCK_SIZE_K * stride_bk
 
         # Apply scale
         accumulator *= a_scale[:, None] * b_scale[None, :]

@@ -776,6 +776,13 @@ def gemm_a8w8_bpreshuffle(
     #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
+    if get_gfx() == "gfx1201":
+        # Keep the (16,16)-shuffled layout: a plain GEMM would silently read
+        # different weights. Select before CK lookup/JIT; those kernels do not
+        # implement this operation on gfx1201.
+        from .triton.gemm.basic.gemm_a8w8 import gemm_a8w8
+
+        return gemm_a8w8(XQ, WQ, x_scale, w_scale, dtype=dtype, b_preshuffled=True)
     Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     # CKTile only supports bf16 dtype
