@@ -38,6 +38,7 @@ Run from the aiter repo root so `op_tests/` siblings import cleanly:
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mhc       # mHC fused RMSNorm
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops qk_norm   # QK norm + RoPE
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops score_qk  # FP8 paged MQA logits
+    python op_tests/bench_gfx1250_combo.py --dsv4 --ops score_qk_fp4  # MXFP4 paged MQA logits (OPUS)
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mori_ep   # MORI EPv2 dispatch/combine
     python op_tests/bench_gfx1250_combo.py --dsv4 --ops mega_moe  # base + Mega, 4 GPUs
 
@@ -69,6 +70,9 @@ same thing to every op:
                     smaller M stays out because of a UT bug; see DSV4_OPS.
     mla_v4_prefill  1024..16384, the DSv4 prefill chunk. 65536 faults; see
                     _MLA_PREFILL_TOKENS.
+    score_qk_fp4    16, 128, 512, a subset of score_qk's tiers. The axis is
+                    the decode batch (sequences) of its MTP 1 and MTP 4 cases;
+                    its prefill cases are fixed; see _SCORE_QK_FP4_TOKENS.
 
 With the variable unset, the child-UT ops (score_qk, a8w8_blockscale) pass no
 shape flag at all, so each UT sweeps the range its owner maintains. The
@@ -112,7 +116,7 @@ Operators whose underlying UT has no configurable initializer print an explicit
 notice when these flags are supplied; the setting is never silently claimed.
 The current passthrough matrix is:
 
-    DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale
+    DATA + SCALE + seed   moe, gemm, f8gemm, a8w8_blockscale, score_qk_fp4
     DATA + seed           a16w16, mega_moe, mori_ep, mhc, qk_norm,
                           inverse_rope, score_qk, mla_v4_decode, mla_v4_prefill
     DATA mapping only     mha (norm -> randn, constant -> const0.25)
@@ -471,6 +475,19 @@ _SCORE_QK_KV_LENGTHS = (
     ("16K/4K average", "4608"),
     ("32K/16K average", "10240"),
 )
+# score_qk_fp4 is the MXFP4 OPUS kernel for the same op. Its decode sweep is a
+# subset of score_qk's batch tiers and KV lengths, so each row has a score_qk
+# counterpart, at MTP 1 and MTP 4; a decode launch scores batch * mtp query rows.
+# The tiers are a small batch, the one both MTPs peak at, and a large one; the
+# 384-column KV is left out, as a launch that short times the launch, not the
+# kernel. The prefill cases are DSv4's CSA ones (fresh, and chunked on committed
+# KV), 16384 rows over 1/2/4 sequences, and do not follow AITER_BENCH_TOKENS.
+# The two sides are kept to about the same number of rows.
+_SCORE_QK_FP4_TOKENS = _tokens((16, 128, 512))
+_SCORE_QK_FP4_DECODE_KV = ("4608", "10240")
+_SCORE_QK_FP4_PREFILL_BATCH = ("1", "2", "4")
+# Compressed committed-KV columns of the chunked prefill.
+_SCORE_QK_FP4_PREFILL_CTX = ("10000", "25000")
 # Was unset, which let the UT sweep its own 27-value default down to M=1. Two
 # reasons to set it. First, M here is the token count of one step, so the small
 # end of that default is decode batch and the large end is prefill chunk. This
@@ -1737,6 +1754,60 @@ def run_score_qk(args):
         )
 
 
+def run_score_qk_fp4(args):
+    """Run DSv4 MXFP4 paged MQA logits (OPUS): CSA prefill and MTP 1/4 decode.
+
+    Every row runs each kernel instance the arch compiled (qlen4_kv64,
+    qlen1_kv64) as a candidate column set; perf tables only (no corner sweep).
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    init_pairs = _init_pairs(args, defaults=(("norm", "auto"),))
+    base_cmd = [
+        sys.executable,
+        "op_tests/test_pa_mqa_logits_mxfp4_opus.py",
+        "--data-init",
+        *(data for data, _ in init_pairs),
+        "--scale-init",
+        *(scale for _, scale in init_pairs),
+        "--seed",
+        str(args.seed),
+    ]
+    _run_child(
+        "score_qk_fp4 (CSA prefill, fresh + chunked, 16384 rows)",
+        [
+            *base_cmd,
+            "--modes",
+            "fresh",
+            "chunked",
+            "-b",
+            *_SCORE_QK_FP4_PREFILL_BATCH,
+            "-c",
+            *_SCORE_QK_FP4_PREFILL_CTX,
+        ],
+        cwd=repo_root,
+        extract=_json_tables,
+        structured=True,
+    )
+    _run_child(
+        "score_qk_fp4 (decode, MTP 1/4)",
+        [
+            *base_cmd,
+            "--modes",
+            "decode",
+            "--mtp",
+            "1",
+            "4",
+            "--decode-batch",
+            *map(str, _SCORE_QK_FP4_TOKENS),
+            "-c",
+            *_SCORE_QK_FP4_DECODE_KV,
+        ],
+        cwd=repo_root,
+        extract=_json_tables,
+        structured=True,
+    )
+
+
 def run_mori_ep(args):
     """Run MORI EPv2 dispatch/combine at the DSv4 MoE shape."""
     _unused_scale_init(args, "mori_ep")
@@ -2202,6 +2273,7 @@ OPS = {
     "mhc": run_mhc,
     "qk_norm": run_qk_norm,
     "score_qk": run_score_qk,
+    "score_qk_fp4": run_score_qk_fp4,
     "mori_ep": run_mori_ep,
     "mega_moe": run_mega_moe,
 }
@@ -2285,6 +2357,7 @@ DSV4_OPS = [
     "mhc",
     "qk_norm",
     "score_qk",
+    "score_qk_fp4",
 ]
 
 
