@@ -203,6 +203,8 @@ def main():
         "AITER_FLYDSL_STAGE2_FP8",
         "AITER_MXFP4_INTERMEDIATE",
         "TUNE_MOE_EXPERT_BALANCE",
+        "TUNE_MOE_ROUTING_SEED",
+        "AITER_LOG_MORE",
         "AITER_MOE_EXPERT_BALANCE",
         "MAX_JOBS",
     ]
