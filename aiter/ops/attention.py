@@ -916,6 +916,28 @@ def mla_decode_v4_asm(
 
 
 @compile_ops(MD_NAME_V4, ffi_type="ctypes")
+def mla_decode_v4_fused_asm(
+    Q: torch.Tensor,
+    qrope: torch.Tensor,
+    KV: torch.Tensor,
+    kvrope: torch.Tensor,
+    qo_indptr: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    sink: torch.Tensor,
+    # [total_q, num_kv_splits, (num_heads+1)*v_head_dim] FP32 write-only scratch
+    splitData: torch.Tensor,
+    # [total_q, num_kv_splits, num_heads, 1] FP32 write-only scratch
+    splitLse: torch.Tensor,
+    # [total_query_len, num_heads, v_head_dim] BF16 final result
+    output: torch.Tensor,
+    max_seqlen_q: int,
+    num_kv_splits: int,
+    kv_last_page_lens: torch.Tensor | None = None,
+) -> None: ...
+
+
+@compile_ops(MD_NAME_V4, ffi_type="ctypes")
 def mla_decode_v4_ps_asm(
     # [N, 128, 512] FP8 packed Q + e8m0 scale region
     Q: torch.Tensor,
