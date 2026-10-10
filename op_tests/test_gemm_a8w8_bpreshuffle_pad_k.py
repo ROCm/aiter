@@ -4,9 +4,9 @@
 import pytest
 import torch
 
-from aiter import dtypes
 from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
+from aiter.utility import dtypes
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -52,7 +52,12 @@ def test_shuffle_weight_pad_k_to_pads_last_dim():
     assert shuffled.aiter_padded_k == 128
 
 
-def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_ck_config(monkeypatch):
+@pytest.fixture
+def cdna_dispatch(monkeypatch):
+    monkeypatch.setattr(gemm_mod, "get_gfx", lambda: "gfx942")
+
+
+def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_ck_config(monkeypatch, cdna_dispatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -80,7 +85,9 @@ def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_ck_config(monkeypatch):
     assert seen["w_shape"] == (16, 128)
 
 
-def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_cktile_config(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_cktile_config(
+    monkeypatch, cdna_dispatch
+):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -108,7 +115,9 @@ def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_cktile_config(monkeypatch):
     assert seen["w_shape"] == (16, 128)
 
 
-def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(
+    monkeypatch, cdna_dispatch
+):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -138,7 +147,9 @@ def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
     assert seen["w_shape"] == (16, 128)
 
 
-def test_gemm_a8w8_bpreshuffle_uses_cktile_for_untuned_padded_k(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_uses_cktile_for_untuned_padded_k(
+    monkeypatch, cdna_dispatch
+):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -169,7 +180,7 @@ def test_gemm_a8w8_bpreshuffle_uses_cktile_for_untuned_padded_k(monkeypatch):
     assert seen["w_shape"] == (16, 128)
 
 
-def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch, cdna_dispatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
