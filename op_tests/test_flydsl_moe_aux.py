@@ -31,7 +31,10 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.flydsl.grouped_moe_gfx1250 import _grouped_a8w4_preshuffle_e8m0_scale
+from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+    _build_g2l_lut,
+    _grouped_a8w4_preshuffle_e8m0_scale,
+)
 from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
     build_moe_contiguous_psum_module,
     build_moe_contiguous_psum_remap_ep_module,
@@ -90,6 +93,13 @@ def run_torch_g2l_lut(mask, E, nvt, topk):
     return lut, torch.zeros(E, dtype=I32, device=mask.device), nvt * topk
 
 
+def random_expert_mask(n, E):
+    """Build an EP mask with exactly E enabled global experts."""
+    mask = torch.zeros(n, dtype=I32)
+    mask[torch.randperm(n, device="cpu")[:E].to(mask.device)] = 1
+    return mask
+
+
 def run_torch_psum(masked_m, tile_m):
     m = masked_m.to(torch.int64)
     aligned = ((m + tile_m - 1) // tile_m) * tile_m
@@ -123,10 +133,10 @@ def run_torch_gather_reduce(grouped, rmap, w, dtype):
 # ------------------------------------------------------------------- tests
 @benchmark()
 def test_g2l_lut(n, E, topk):
-    """EP global->local expert LUT build (single-block Hillis-Steele scan)."""
-    launch = build_moe_g2l_lut_module()
+    """EP global->local expert LUT build (single-block hierarchical scan)."""
+    launch = build_moe_g2l_lut_module(max_experts=512 if n <= 512 else 1024)
     nvt = max(1, n // 4)
-    mask = (torch.rand(n) < 0.6).to(I32)
+    mask = random_expert_mask(n, E)
     nvt_t = torch.tensor([nvt], dtype=I32)
     ref_lut, ref_cnt, ref_nvr = run_torch_g2l_lut(mask, E, nvt, topk)
 
@@ -175,6 +185,32 @@ def test_g2l_lut(n, E, topk):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+def test_g2l_lut_dispatch(n, E, topk):
+    """Exercise production variant selection and the >1024 torch fallback."""
+    nvt = max(1, n // 4)
+    mask = random_expert_mask(n, E)
+    nvt_t = torch.tensor([nvt], dtype=I32)
+    ref_lut, ref_cnt, ref_nvr = run_torch_g2l_lut(mask, E, nvt, topk)
+
+    lut, counter, nvr = _build_g2l_lut(mask, E, mask.device, nvt_t, topk)
+    checkAllclose(ref_lut.float(), lut.float(), rtol=0, atol=0, msg="dispatch lut")
+    if n <= 1024:
+        assert counter is not None and nvr is not None
+        checkAllclose(
+            ref_cnt.float(), counter.float(), rtol=0, atol=0, msg="dispatch counter"
+        )
+        checkAllclose(
+            torch.tensor([float(ref_nvr)]),
+            nvr.float(),
+            rtol=0,
+            atol=0,
+            msg="dispatch nvr",
+        )
+    else:
+        assert counter is None and nvr is None
+    return {"gfx": get_gfx(), "n": n, "path": "flydsl" if n <= 1024 else "torch"}
 
 
 @benchmark()
@@ -857,8 +893,7 @@ def test_route_g2l_fused(numel, E_global, n_buckets, w_dtype):
     max_m = max(512, 4 * numel // max(1, n_buckets))
 
     # Exactly n_buckets enabled global experts; the LUT is their rank order.
-    mask = torch.zeros(E_global, dtype=I32)
-    mask[torch.randperm(E_global, device="cpu")[:n_buckets].to(mask.device)] = 1
+    mask = random_expert_mask(E_global, n_buckets)
     g2l, _, _ = run_torch_g2l_lut(mask, n_buckets, 1, 1)
     topk_ids = torch.randint(0, E_global, (numel,), dtype=I32)
     weight_in = torch.rand(numel, dtype=torch.float32)
@@ -1022,16 +1057,27 @@ def main():
     args = parser.parse_args()
     dmap = {"bf16": torch.bfloat16, "f16": torch.float16}
 
-    # n <= 512: the LUT scan is single-workgroup (MAX_G2L_EXPERTS).
+    # Keep one direct-kernel case for each meaningful extension point: the first
+    # 1024-thread variant, K3's sparse production shape, and full capacity.
+    # Production dispatch owns the exact 512/513 and 1024/1025 boundaries below.
     summarize(
         "moe_g2l_lut",
         [
             test_g2l_lut(n, E, topk)
-            for n, E, topk in itertools.product(
-                [64, 512], [e for e in args.experts if e <= 512], [2, 8]
-            )
+            for n, E, topk in [
+                *itertools.product(
+                    [64, 512], [e for e in args.experts if e <= 512], [2, 8]
+                ),
+                (513, 128, 8),
+                (896, 56, 16),
+                (1024, 512, 8),
+            ]
             if E <= n
         ],
+    )
+    summarize(
+        "moe_g2l_lut dispatch boundaries",
+        [test_g2l_lut_dispatch(n, min(n, 256), 8) for n in [512, 513, 1024, 1025]],
     )
     summarize(
         "moe_contiguous_psum",
