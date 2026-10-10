@@ -84,6 +84,9 @@ from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.dtypes import str2ActivationType, str2Dtype
 from aiter.utility.fp4_utils import moe_mxfp4_sort
 from aiter.utility.mp_tuner import mp_tuner
+from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import (
+    build_staged_candidate_plan,
+)
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     build_v2_inputs as _v2_build_inputs,
 )
@@ -506,9 +509,15 @@ class FmoeTuner(TunerCommon):
         )
         self.parser.add_argument(
             "--mxfp4-search-mode",
-            choices=("prune", "full"),
-            help="GEMM1 search mode: prune by M_est (default) or search all legal "
-            "variants (full); requires --mxfp4-flydsl.",
+            choices=("prune", "full", "staged"),
+            help="prune by M_est (default), exhaust all legal variants (full), "
+            "or screen the pruned stages (staged); requires --mxfp4-flydsl.",
+        )
+        self.parser.add_argument(
+            "--mxfp4-screen-topk",
+            type=int,
+            help="positive screening top-K per stage context (default 2); "
+            "requires explicit --mxfp4-search-mode staged; distinct from routing top-k.",
         )
 
     def parse_args(self) -> argparse.Namespace:
@@ -522,7 +531,15 @@ class FmoeTuner(TunerCommon):
             self.parser.error(
                 "--mxfp4-search-mode requires --mxfp4-flydsl without --grouped-gemm"
             )
+        if args.mxfp4_screen_topk is not None:
+            if args.mxfp4_screen_topk <= 0:
+                self.parser.error("--mxfp4-screen-topk must be a positive integer")
+            if args.mxfp4_search_mode != "staged":
+                self.parser.error(
+                    "--mxfp4-screen-topk requires explicit --mxfp4-search-mode staged"
+                )
         args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
+        args.mxfp4_screen_topk = args.mxfp4_screen_topk or 2
         return args
 
     @staticmethod
@@ -6808,6 +6825,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     continue
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
+
+    def _staged_candidate_plan(self, row):
+        reason = self._unsupported_row_reason(row)
+        if reason is not None:
+            raise ValueError(reason)
+        return build_staged_candidate_plan(
+            row, self._candidate_rows(row, full_search=False)
+        )
 
     @staticmethod
     def _prepare_case(token, model_dim, inter_dim, expert, topk, dtype):
