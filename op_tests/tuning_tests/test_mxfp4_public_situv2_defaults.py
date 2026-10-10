@@ -25,11 +25,11 @@ def test_actual_mxfp4_stage_receives_omitted_defaults_and_explicit_parameters(
     monkeypatch: "pytest.MonkeyPatch",
     beta: "float | None",
     linear_beta: "float | None",
-    expected: "object",
+    expected: "tuple[float, float]",
 ) -> "None":
     observed = []
 
-    def stage1(*args: "object", **kwargs: "object") -> "None":
+    def stage1(*args: "object", **kwargs: "object") -> "tuple[torch.Tensor, None]":
         observed.append((kwargs["situ_beta"], kwargs["situ_linear_beta"]))
         return torch.empty((1, 1, 128), device="cpu"), None
 
