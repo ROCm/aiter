@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Decide whether to accept a review request, and tell the requester what to expect.
+
+The box runs one review at a time and each takes the better part of an hour, so requests queue.
+A queued GitHub job is cancelled after 24 h, and the notifier lives inside the job that never
+ran -- so a request accepted into a queue deeper than the day can simply vanish, in silence,
+from the point of view of the person who asked.
+
+The fix is not to detect that afterwards but to stop accepting work that cannot be done: this
+runs in the gate, on the hosted runner, before anything reaches the box. It answers the
+requester, on their own PR, at the moment they ask -- rather than paging the runner's owner
+some time later.
+
+It also catches a runner that is not taking work at all. Nothing queued is moving and something
+has been waiting a while means the box is dead or wedged; the two are indistinguishable from
+here and have the same remedy, so the message does not pretend to tell them apart.
+
+Usage (from the gate job): python3 .claude/skills/review-pr/queue_gate.py
+Reads AUTHORIZED, PR, GH_TOKEN, AITER_BOT_TOKEN, OWNER_OVERRIDE, the tuning below, and the
+GITHUB_* that Actions sets for every step. Writes `ok` to GITHUB_OUTPUT.
+"""
+
+import datetime
+import os
+import sys
+
+# watchdog.py sits next to this file; sys.path[0] is the script's own directory, so this picks
+# up the sibling rather than any installed package of the same name.
+from watchdog import GitHub
+
+AVG_REVIEW_MINUTES = 50      # measured: a full review is about this
+MAX_AHEAD = 6                # ~5 h of queue; beyond that, say no instead of accepting silently
+NO_RUNNER_MINUTES = 30       # nothing moving for this long, with work waiting, means nobody is taking it
+
+
+def _age_minutes(stamp, now):
+    t = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
+        tzinfo=datetime.timezone.utc)
+    return (now - t).total_seconds() / 60.0
+
+
+def survey(api, repo, own_run_id, now):
+    """How many reviews are running, and how long the waiting ones have waited."""
+    running, waiting = 0, []
+    for run in api.in_progress_runs(repo):
+        if run["id"] == own_run_id:
+            continue
+        review = next((j for j in api.jobs(repo, run["id"]) if j["name"] == "review"), None)
+        if review is None:
+            continue
+        if review["status"] == "in_progress":
+            running += 1
+        elif review["status"] == "queued":
+            waiting.append(_age_minutes(run["created_at"], now))
+    return running, waiting
+
+
+def decide(running, waiting, cfg):
+    """Pure: (running count, list of waiting ages in minutes) -> (verdict, ahead, eta_minutes).
+
+    Verdicts: 'idle' (start now), 'queued' (start in eta), 'too-deep' (refuse), 'no-runner'.
+    """
+    ahead = running + len(waiting)
+    if running == 0 and waiting and max(waiting) >= cfg["no_runner_minutes"]:
+        return "no-runner", ahead, int(max(waiting))
+    if ahead >= cfg["max_ahead"]:
+        return "too-deep", ahead, ahead * cfg["avg_minutes"]
+    if ahead == 0:
+        return "idle", 0, 0
+    return "queued", ahead, ahead * cfg["avg_minutes"]
+
+
+def _hours(minutes):
+    return "%.0f min" % minutes if minutes < 90 else "%.1f h" % (minutes / 60.0)
+
+
+def message(verdict, ahead, eta, owner):
+    if verdict == "no-runner":
+        return (
+            "⚠️ **aiter-bot** — %d review(s) have been waiting %s and none has "
+            "started, so the self-hosted runner is not picking up work. It is either down or "
+            "wedged; both need the same thing, a look at the box.\n\n"
+            "This request was **not queued**, because a job queued behind a stopped runner is "
+            "cancelled after 24 h without a word.\n\n"
+            "@%s — please check the runner, then re-comment `@aiter-bot review`.\n\n"
+            "<sub>See `.claude/skills/review-pr/RUNNER-SETUP.md` section 5.</sub>"
+            % (ahead, _hours(eta), owner))
+    if verdict == "too-deep":
+        return (
+            "**aiter-bot** — the box reviews one PR at a time and is **%d deep** right now "
+            "(roughly %s of work ahead).\n\n"
+            "This request was **not queued**: a job that waits more than 24 h is cancelled "
+            "silently, so saying no now is better than losing it later.\n\n"
+            "Re-comment `@aiter-bot review` once the queue is shorter."
+            % (ahead, _hours(eta)))
+    return ("**aiter-bot** — queued behind %d review(s); expect to start in about %s. "
+            "The box reviews one PR at a time." % (ahead, _hours(eta)))
+
+
+def run(api, env, now=None):
+    """Returns (ok, verdict). Posts at most one comment."""
+    out = env.get("GITHUB_OUTPUT")
+
+    def finish(ok, verdict):
+        if out:
+            with open(out, "a", encoding="utf-8") as fh:
+                fh.write("ok=%s\n" % ("true" if ok else "false"))
+        print("::notice::queue gate: %s -> %s" % (verdict, "run" if ok else "not queued"))
+        return ok, verdict
+
+    # The authorization step owns that decision; this one only ever narrows it.
+    if (env.get("AUTHORIZED") or "").strip().lower() != "true":
+        return finish(False, "unauthorized")
+
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    cfg = {"avg_minutes": float(env.get("AVG_REVIEW_MINUTES") or AVG_REVIEW_MINUTES),
+           "max_ahead": int(env.get("MAX_AHEAD") or MAX_AHEAD),
+           "no_runner_minutes": float(env.get("NO_RUNNER_MINUTES") or NO_RUNNER_MINUTES)}
+
+    repo = env["GITHUB_REPOSITORY"]
+    running, waiting = survey(api, repo, int(env["GITHUB_RUN_ID"]), now)
+    verdict, ahead, eta = decide(running, waiting, cfg)
+
+    if verdict == "idle":
+        return finish(True, verdict)        # starts at once; a comment would be noise
+
+    owner = (env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"
+    status = api.comment(repo, env["PR"], message(verdict, ahead, eta, owner))
+    if not 200 <= status < 300:
+        print("::warning::could not post the queue notice: %s" % status)
+    return finish(verdict == "queued", verdict)
+
+
+def main():
+    api = GitHub(os.environ["GH_TOKEN"], os.environ.get("AITER_BOT_TOKEN", ""))
+    ok, _ = run(api, os.environ)
+    return 0 if ok is not None else 1      # the gate's output carries the decision, not the exit
+
+
+if __name__ == "__main__":
+    sys.exit(main())

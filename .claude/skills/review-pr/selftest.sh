@@ -160,5 +160,18 @@ if [ "$wd_rc" -ne 0 ] && [ "$wbad" -eq 0 ]; then
   echo "  ❌ watchdog_test.py did not run — ${why:-exit $wd_rc}"; bad=$((bad + 1))
 fi
 
+echo "[queue gate]"
+# Same reason as the watchdog: the gate only runs from the default branch, so GitHub will not
+# execute this until it merges. Drive the shipping script against a fake API and a fixed clock.
+qg=$(python3 "$S/queue_gate_test.py" 2>&1); qg_rc=$?
+printf '%s\n' "$qg" | grep -E '^  (✅|❌)' || true
+qok=$(printf '%s\n' "$qg" | grep -c '✅' || true)
+qbad=$(printf '%s\n' "$qg" | grep -c '❌' || true)
+ok=$((ok + qok)); bad=$((bad + qbad))
+if [ "$qg_rc" -ne 0 ] && [ "$qbad" -eq 0 ]; then
+  why=$(printf '%s\n' "$qg" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ queue_gate_test.py did not run — ${why:-exit $qg_rc}"; bad=$((bad + 1))
+fi
+
 echo "=== $ok green / $bad red ==="
 [ "$bad" -eq 0 ]
