@@ -15,6 +15,8 @@
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <cstdlib>
+#include <mutex>
+#include <string>
 
 
 const int32_t BlockSize           = 256;
@@ -22,12 +24,31 @@ const int32_t groupQuantBlockSize = 64;
 
 namespace aiter {
 
-// Host-side twin of the kernel's kTunedForThisArch. Cached: get_gpu_arch() queries the
-// device properties, and this sits on the launch path of every quant call.
-static inline bool dyn_gq_tuned_arch()
+// Host-side twin of the kernel's kTunedForThisArch, plus the CU count the launch shapes
+// key on. Cached per device: one process can drive different archs, and a gfx1250-only
+// launch (grid_2d resolves blockIdx.y only in gfx1250 code) on another arch leaves most
+// of the output unwritten.
+struct DynGqDevice
 {
-    static const bool tuned = (get_gpu_arch() == "gfx1250");
-    return tuned;
+    bool tuned;
+    int num_cu;
+};
+
+static const DynGqDevice& dyn_gq_device(int device_id)
+{
+    constexpr int kMaxDevices = 64;
+    static std::once_flag once[kMaxDevices];
+    static DynGqDevice info[kMaxDevices];
+    AITER_CHECK(device_id >= 0 && device_id < kMaxDevices, __func__, " device id ", device_id,
+                " out of range");
+    std::call_once(once[device_id], [device_id] {
+        hipDeviceProp_t prop;
+        HIP_CALL(hipGetDeviceProperties(&prop, device_id));
+        const std::string arch_full(prop.gcnArchName);
+        const std::string arch = arch_full.substr(0, arch_full.find(':'));
+        info[device_id]        = {arch == "gfx1250", prop.multiProcessorCount};
+    });
+    return info[device_id];
 }
 
 // gfx1250: use 256-thread blocks once there are at least a quarter as many as SIMDs.
@@ -1316,6 +1337,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+    const DynGqDevice& dev = dyn_gq_device(input.device_id);
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
@@ -1333,9 +1355,9 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
                 // See the note at the other launch site: the 64/256 split is gfx1250-only.
                 // See the note at the other launch site: the wide block needs blocks to spare.
                 static constexpr int32_t kBlkTuned = kColMajor ? 64 : 256;
-                const int simds_bs = static_cast<int>(get_num_cu_func()) * 4;
+                const int simds_bs = dev.num_cu * 4;
                 const bool wide_ok =
-                    dyn_gq_tuned_arch() &&
+                    dev.tuned &&
                     (static_cast<int64_t>(num_group) * num_thread_per_group / kBlkTuned) >=
                         static_cast<int64_t>(simds_bs);   // one block per SIMD, unswept path
                 const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
@@ -1497,40 +1519,56 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         const int r        = 4 * s.value + rsub; // row within the 32-row block
         const bool valid   = row0 + r < rows;
         vec_i thread_data  = data[s.value];
+        // MXFP8: any NaN or Inf makes its group invalid (E8M0 0xff scale, FP8 NaN data).
         float absMax       = 1e-10f;
         for(int j = 0; j < kElems; ++j)
-            absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
+            absMax = __builtin_elementwise_maximum(absMax, abs(static_cast<float>(thread_data[j])));
+        // The cross-lane reduce drops NaNs, so fold them to Inf first.
+        absMax = __builtin_isnan(absMax) ? __builtin_inff() : absMax;
         absMax = multithread_reduce(absMax, aiter::Max(), 2);
-        bool degenerate_group = false;
-        if constexpr(kHwConvertDiv)
-        {
-            degenerate_group = !(absMax < __builtin_inff());
-            absMax           = fminf(absMax, 448.0f * 0x1.0p119f);
-        }
-        const float row_scale =
+        float row_scale =
             aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
+        if constexpr(aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even)
+        {
+            if(!__builtin_isfinite(absMax))
+                row_scale = __builtin_inff();
+        }
         if(lane % 2 == 0)
             scale_blk[r * 4 + (lane % 8) / 2] =
                 valid ? static_cast<uint8_t>((__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF)
                       : uint8_t{0x7F};
         if(!valid)
             return;
-        if constexpr(kHwConvertDiv)
+        // The native convert does not saturate. Only RoundDown / Even can floor the scale
+        // enough for finite data to overflow; an invalid group's 0xff scale already yields NaN.
+        if constexpr(kHwConvertDiv && kScaleMayClip)
         {
-            if(kScaleMayClip || degenerate_group)
+            const float hi = 448.0f * row_scale;
+            for(int j = 0; j < kElems; ++j)
             {
-                const float hi = 448.0f * row_scale;
-                for(int j = 0; j < kElems; ++j)
-                {
-                    const float v = static_cast<float>(thread_data[j]);
-                    if(v > hi)
-                        thread_data[j] = static_cast<DTYPE_I>(hi);
-                    if(v < -hi)
-                        thread_data[j] = static_cast<DTYPE_I>(-hi);
-                }
+                const float v = static_cast<float>(thread_data[j]);
+                if(v > hi)
+                    thread_data[j] = static_cast<DTYPE_I>(hi);
+                if(v < -hi)
+                    thread_data[j] = static_cast<DTYPE_I>(-hi);
             }
         }
-        const vec_o q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
+        vec_o q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
+        // Software converts saturate NaN to a finite value: rewrite an invalid group.
+        if constexpr(!kHwConvertDiv)
+        {
+            if(!__builtin_isfinite(row_scale))
+            {
+#if defined(__gfx942__)
+                constexpr uint8_t kNaN = 0x80;
+#else
+                constexpr uint8_t kNaN = 0xFF;
+#endif
+                opus::static_for<kElems>([&](auto j) {
+                    q[j.value] = __builtin_bit_cast(opus::fp8_t, kNaN);
+                });
+            }
+        }
         *reinterpret_cast<vec_o*>(out + (row0 + r) * cols + col) = q;
     });
 }
@@ -1640,6 +1678,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
+    const DynGqDevice& dev = dyn_gq_device(input.device_id);
 
     DISPATCH_GROUP_SIZE(group_size,
         static constexpr int thread_data_size     = 32;
@@ -1658,9 +1697,9 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             // arch picks at launch; an untuned arch keeps the 64 it always had.
             // No TDM staging here: the unstaged path is faster wherever it applied.
             static constexpr int32_t kBlkTuned = 256;
-            const int simds_bs = static_cast<int>(get_num_cu_func()) * 4;
+            const int simds_bs = dev.num_cu * 4;
             const bool wide_ok =
-                dyn_gq_tuned_arch() &&
+                dev.tuned &&
                 (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) *
                         kDynGqWideBlkPerSimdDenom >=
                     static_cast<int64_t>(simds_bs);
@@ -1697,14 +1736,15 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                  std::is_same_v<out_t, opus::fp4_t>))
                     {
                         constexpr bool kBf16 = std::is_same_v<input_dtype, opus::bf16_t>;
-                        // fp4 below one tile per CU lost to the generic kernel
-                        // (32x7168: 2.07 -> 2.43 us); fp8 wins at every size.
+                        // Below these tile counts the generic kernel is faster:
+                        // fp8 needs two tiles per CU (1024x2048 bf16: 2.43 -> 2.64 us),
+                        // fp4 three per SIMD (4096x4096: 6.44 -> 6.56 us).
                         const int64_t mx32_tiles =
                             static_cast<int64_t>(rows / 32) * (scaleN / 8);
+                        constexpr int kMinTilesPerCu = std::is_same_v<out_t, opus::fp8_t> ? 2 : 12;
                         const bool mx32 =
-                            dyn_gq_tuned_arch() && num_rows_ptr == nullptr &&
-                            (std::is_same_v<out_t, opus::fp8_t> ||
-                             mx32_tiles >= static_cast<int64_t>(get_num_cu_func())) &&
+                            dev.tuned && num_rows_ptr == nullptr &&
+                            mx32_tiles >= static_cast<int64_t>(kMinTilesPerCu) * dev.num_cu &&
                             rows >= 32 && rows % 32 == 0 && scaleN % 8 == 0 &&
                             row_stride % 8 == 0 &&
                             reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
@@ -1738,7 +1778,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         const int64_t tiles_total =
                             static_cast<int64_t>(rows / 16) * (cols / 512);
                         const bool tiled =
-                            dyn_gq_tuned_arch() && num_rows_ptr == nullptr &&
+                            dev.tuned && num_rows_ptr == nullptr &&
                             row_stride % 8 == 0 &&
                             reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
                             rows % 16 == 0 && cols % 512 == 0 && cols >= 7168 &&
@@ -1786,7 +1826,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                                               ee && _GS == 128;
                     const bool fgs_pairs = kColMajor ? (num_rows_ptr == nullptr && rows % 2 == 0)
                                                      : scaleN % 2 == 0;
-                    const bool fgs = kFgsType && dyn_gq_tuned_arch() && fgs_pairs &&
+                    const bool fgs = kFgsType && dev.tuned && fgs_pairs &&
                                      oob_size <= std::numeric_limits<int32_t>::max();
                     auto dispatch = [&](auto blk_tag) {
                         if constexpr(kFgsType)
