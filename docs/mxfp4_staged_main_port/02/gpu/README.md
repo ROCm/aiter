@@ -51,3 +51,5 @@ GPU annotation events are excluded;303 real events=3 kernels×101 iterations.
 GPU/toolchain/environment records accompany each task. Full27-search calibration,
 I384/BM32/large-token/output-mode acceptance and Situv2 production belong to the
 remaining tickets; this small M_est1 fixture does not establish scatter coverage.
+
+Selected original console logs and failed-test red output are retained as lossless gzip files to preserve raw whitespace while satisfying diff checks. Decompress with `gzip -dc <path>.gz`.
