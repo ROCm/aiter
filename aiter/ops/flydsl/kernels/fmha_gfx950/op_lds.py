@@ -170,7 +170,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 addr = (
                     k_base + traits.K_BAND_BASE[b] + row + traits.K_WS_OFF[ws] + d_base
                 )
-                out.append(self.read_i32x8_lds(self.lds_kv_base_ptr, addr))
+                out.append(self.read_i32x8_lds(self.lds.kv.ptr, addr))
             return out
 
         return (_read_strip(n_lo), _read_strip(n_hi))
