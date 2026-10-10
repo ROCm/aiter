@@ -1624,7 +1624,6 @@ def cmdGenFunc_mha_batch_prefill(
     blob_gen_cmd = [
         f"{CK_DIR}/example/ck_tile/01_fmha/generate.py -d batch_prefill "
         "--receipt 200 --filter {} --output_dir {{}}".format(filter_fwd)
-        + _ck_targets_flag()
     ]
     return {
         "md_name": md_name,
