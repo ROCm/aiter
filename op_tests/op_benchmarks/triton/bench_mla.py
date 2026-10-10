@@ -216,7 +216,7 @@ def benchmark(args):
             out = mla_prefill_fwd(
                 query,
                 kv_buffer,
-                out,
+                output,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_k=seq_lens_kv,
                 max_seqlen_kv=max_seqlen_kv,
@@ -256,7 +256,7 @@ def benchmark(args):
 
         def fn():
             if decode_qlen > 0:
-                out = mla_decode_fwd(
+                mla_decode_fwd(
                     query,
                     maybe_shuffled_kv_buffer,
                     output,
@@ -275,10 +275,10 @@ def benchmark(args):
                     skip_reduce=skip_reduce,
                 )
             else:
-                out = mla_prefill_fwd(
+                mla_prefill_fwd(
                     query,
                     kv_buffer,
-                    out,
+                    output,
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_k=seq_lens_kv,
                     max_seqlen_kv=max_seqlen_kv,
