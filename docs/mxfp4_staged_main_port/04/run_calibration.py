@@ -35,6 +35,58 @@ def parse_search_console(console):
     )
 
 
+def finalize_search(job, job_dir, counts):
+    """Capture an exited controller task; this function never launches a search."""
+    artifact = job_dir / "search-task"
+    task = json.loads((artifact / "task.json").read_text())
+    if "process_exit_utc" not in task:
+        raise RuntimeError(f"Cannot finalize a running task: {artifact}")
+    winner = job_dir / "winner.csv"
+    result_path = job_dir / "search.json"
+    import csv
+
+    rows = list(csv.DictReader(winner.open())) if winner.exists() else []
+    task = json.loads((artifact / "task.json").read_text())
+    start = datetime.datetime.fromisoformat(task["process_start_utc"])
+    end = datetime.datetime.fromisoformat(task["process_exit_utc"])
+    result = dict(
+        job,
+        outcome=(
+            "valid"
+            if task.get("exit_code") == 0
+            and len(rows) == 1
+            and float(rows[0]["us"]) > 0
+            else "incomplete-run"
+        ),
+        winner=rows[0] if len(rows) == 1 else None,
+        winner_us=float(rows[0]["us"]) if len(rows) == 1 else None,
+        search_wall_seconds=(end - start).total_seconds(),
+        implementation_commit=task["implementation_commit"],
+        environment=task["environment"],
+        static_counts=counts,
+        **parse_search_console(artifact / "console.log.txt"),
+    )
+    write_json(result_path, result)
+    console = artifact / "console.log.txt"
+    with gzip.open(str(console) + ".gz", "wb") as stream:
+        stream.write(console.read_bytes())
+    # Preserve complete compressed console; avoid unbounded tracked raw logs.
+    console.unlink()
+    if job["mode"] == "full":
+        write_json(
+            job_dir / "cost-after-full.json",
+            dict(
+                actual_search_wall_seconds=result["search_wall_seconds"],
+                validation_attempts=result["validation_attempts"],
+                static_pairs=counts["total_pairs"],
+                original_estimate=json.loads(
+                    (job_dir / "cost-before-full.json").read_text()
+                ),
+            ),
+        )
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -46,6 +98,11 @@ def main():
         default=Path("/root/workspace/tmp_dev/mxfp4-port-runtime"),
     )
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--finalize-only",
+        action="store_true",
+        help="Record exited search tasks without launching GPU work",
+    )
     parser.add_argument(
         "--only",
         action="append",
@@ -73,6 +130,10 @@ def main():
             continue
         job_dir = base / "gpu" / job["id"]
         winner = job_dir / "winner.csv"
+        if args.finalize_only:
+            if not (job_dir / "search.json").exists():
+                finalize_search(job, job_dir, counts[job["id"]])
+            continue
         for action in args.actions:
             artifact = job_dir / (action + "-task")
             result_path = job_dir / (
@@ -210,47 +271,7 @@ def main():
                 check=False,
             )
             if action == "search":
-                import csv
-
-                rows = list(csv.DictReader(winner.open())) if winner.exists() else []
-                task = json.loads((artifact / "task.json").read_text())
-                start = datetime.datetime.fromisoformat(task["process_start_utc"])
-                end = datetime.datetime.fromisoformat(task["process_exit_utc"])
-                result = dict(
-                    job,
-                    outcome=(
-                        "valid"
-                        if completed.returncode == 0
-                        and len(rows) == 1
-                        and float(rows[0]["us"]) > 0
-                        else "incomplete-run"
-                    ),
-                    winner=rows[0] if len(rows) == 1 else None,
-                    winner_us=float(rows[0]["us"]) if len(rows) == 1 else None,
-                    search_wall_seconds=(end - start).total_seconds(),
-                    implementation_commit=task["implementation_commit"],
-                    environment=task["environment"],
-                    static_counts=counts[job["id"]],
-                    **parse_search_console(artifact / "console.log.txt"),
-                )
-                write_json(result_path, result)
-                console = artifact / "console.log.txt"
-                with gzip.open(str(console) + ".gz", "wb") as stream:
-                    stream.write(console.read_bytes())
-                # Preserve complete compressed console; avoid unbounded tracked raw logs.
-                console.unlink()
-                if job["mode"] == "full":
-                    write_json(
-                        job_dir / "cost-after-full.json",
-                        dict(
-                            actual_search_wall_seconds=result["search_wall_seconds"],
-                            validation_attempts=result["validation_attempts"],
-                            static_pairs=counts[job["id"]]["total_pairs"],
-                            original_estimate=json.loads(
-                                (job_dir / "cost-before-full.json").read_text()
-                            ),
-                        ),
-                    )
+                finalize_search(job, job_dir, counts[job["id"]])
             if completed.returncode:
                 raise SystemExit(
                     f"Task failed {job['id']} {action} exit={completed.returncode}; diagnose before continuation"
