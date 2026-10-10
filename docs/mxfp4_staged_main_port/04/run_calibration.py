@@ -163,7 +163,7 @@ def main():
                         recorded_before_start_utc=datetime.datetime.now(
                             datetime.timezone.utc
                         ).isoformat(),
-                        compilation_state="Shared initially empty default-config search cache; earlier search keys retained. See prior task order and attempt logs.",
+                        compilation_state="Fresh per-search FlyDSL cache; identical initially empty cache condition across modes/configurations; warmed common AITER auxiliary cache.",
                         admitted_counts=counts[job["id"]],
                     ),
                 )
@@ -197,16 +197,19 @@ def main():
                     "FLYDSL_RUNTIME_CACHE_DIR": str(
                         args.runtime
                         / (
-                            (
-                                "calibration-aot-04-"
-                                if action in ("aot", "precompiled")
-                                else "calibration-search-04-"
-                            )
-                            + job["config"]
+                            "calibration-aot-04-" + job["config"]
+                            if action in ("aot", "precompiled")
+                            else "calibration-search-04-" + job["id"]
                         )
                     ),
                 }
             )
+            if action == "search":
+                search_cache = Path(env["FLYDSL_RUNTIME_CACHE_DIR"])
+                if search_cache.exists() and any(search_cache.iterdir()):
+                    raise RuntimeError(
+                        f"New search requires initially empty FlyDSL cache: {search_cache}"
+                    )
             env.pop("FLYDSL_RUNTIME_RUN_ONLY", None)
             env.pop("AITER_CONFIG_FMOE", None)
             if action == "precompiled":

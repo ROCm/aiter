@@ -104,7 +104,7 @@
         "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
         "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
         "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
-        "Search uses initially empty dedicated default-configuration FlyDSL cache shared across sequential full/prune/staged invocations; keys compiled by earlier required searches stay warm. Auxiliary AITER JIT cache is already warm.",
+        "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
         "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
       ]
     },
@@ -129,7 +129,7 @@
         "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
         "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
         "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
-        "Search uses initially empty dedicated default-configuration FlyDSL cache shared across sequential full/prune/staged invocations; keys compiled by earlier required searches stay warm. Auxiliary AITER JIT cache is already warm.",
+        "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
         "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
       ]
     },
@@ -154,9 +154,10 @@
         "Same physical UUID/PCI and exact toolchain; warmup5/iters101; cosine gate0.1.",
         "Observed independent pair harness includes initial imports, reference preparation, actual compilation/cache, warmup and normal profiling plus additional synchronized diagnostics. It is an intentionally conservative upper comparator, not repeated identical normal-attempt cost.",
         "Lower rate is an optimistic warmed normal-attempt hypothesis after one-time imports/aux builds; not independently measured. Upper rate includes cold key preparation/compilation and failed attempts based on retained focused pair elapsed observations.",
-        "Search uses initially empty dedicated default-configuration FlyDSL cache shared across sequential full/prune/staged invocations; keys compiled by earlier required searches stay warm. Auxiliary AITER JIT cache is already warm.",
+        "Every initial search starts with a fresh initially empty dedicated per-id FlyDSL cache; shared AITER auxiliary JIT cache is already warm. First full64 used its own initially empty default-config path before this protocol refinement.",
         "Each full start writes this range and exact current configuration before GPU startup. Actual elapsed/attempt progress updates and final cost-after-full retained; no hard task deadline or scope reduction."
       ]
     }
-  ]
+  ],
+  "cache_protocol_revision": "First full64 starts with empty calibration-search-04-default cache. All later initial searches use a fresh initially empty per-id FlyDSL cache; auxiliary AITER cache stays warmed equally. First task is unchanged; no active environment mutation."
 }
