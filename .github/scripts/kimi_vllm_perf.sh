@@ -1,6 +1,6 @@
 #!/bin/bash
 # Self-contained Kimi-K2.5 vLLM (upstream) throughput PERFORMANCE gate.
-# Runs inside an official ROCm vLLM image (e.g. rocm/vllm-dev:nightly) with the
+# Runs inside an official ROCm vLLM image (e.g. vllm/vllm-openai-rocm:nightly) with the
 # PR's AITER already installed. Launches `vllm serve` (the exact flags that pass
 # the accuracy gate), warms up, then runs a throughput sweep over concurrency
 # and prints `KIMI_PERF_C64_OUT_TOKS=<output token throughput at concurrency 64>`
@@ -30,7 +30,7 @@ if ss -tlnp 2>/dev/null | grep -q ":${PORT} "; then echo "ERROR: port $PORT busy
 
 echo "== launching vllm serve =="
 # Same launch as the accuracy gate. Do NOT pass `--load-format fastsafetensors`:
-# the official rocm/vllm-dev:nightly image does not bundle the package, so the
+# the official vllm/vllm-openai-rocm:nightly image does not bundle the package, so the
 # flag kills every TP worker during weight load.
 vllm serve "$MODEL" \
     --host 127.0.0.1 --port "$PORT" \
