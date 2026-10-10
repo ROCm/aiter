@@ -1,0 +1,89 @@
+{
+  "implementation_commit": "4e5d8bdc213880549e144a28d017a208c4661488",
+  "csv": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/fixtures/minimax128-bm32-atomic.csv",
+  "shape": {
+    "token": 128,
+    "model_dim": 3072,
+    "inter_dim": 384,
+    "expert": 256,
+    "topk": 8
+  },
+  "action": "replay",
+  "swiglu_limit": null,
+  "clamp_evidence": null,
+  "activation": "ActivationType.Silu",
+  "kernelName1": "flydsl_mxmoe_g1_a4w4_32x64x256",
+  "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t32x128x128_atomic_nt_sbm32",
+  "block_m": 32,
+  "fuse_quant": "fp4",
+  "explicit_q_dtype_a": "torch.float4_e2m1fn_x2",
+  "quant_type": "QuantType.per_1x32",
+  "operations": [
+    {
+      "op": "g1",
+      "BM": 32,
+      "a_dtype": "fp4",
+      "out_dtype": "fp4",
+      "inline_quant": false,
+      "native_scale_layout": false,
+      "interleave": false,
+      "hidden_dtype": "torch.float4_e2m1fn_x2",
+      "swiglu_limit": "inf"
+    },
+    {
+      "op": "g2",
+      "kwargs": {
+        "BM": "32",
+        "BN": "128",
+        "BK": "128",
+        "a_dtype": "fp4",
+        "b_dtype": "fp4",
+        "epilog": "atomic",
+        "SBM": "32",
+        "persist": "False",
+        "out_dtype": "bf16"
+      },
+      "target_shape": [
+        128,
+        3072
+      ],
+      "target_dtype": "torch.bfloat16",
+      "scale_shape": null
+    }
+  ],
+  "finite": true,
+  "cosine_diff": 0.0112831835520395,
+  "input_csv_kernel_sum_us": 96.4334,
+  "synchronized_diagnostic_kernel_sum_with_main_aggregation_us": 97.71159340659342,
+  "raw_real_kernel_duration_sum_us": 98.06095049504951,
+  "matched_synchronized_real_kernel_trace_span_us": 257.50984055925124,
+  "matched_synchronized_elapsed_median_us": 254.5434981584549,
+  "matched_synchronized_elapsed_min_us": 250.09457021951675,
+  "matched_synchronized_elapsed_max_us": 444.3712532520294,
+  "trace_real_kernel_count": 505,
+  "measurement": {
+    "warmup": 5,
+    "iters": 101,
+    "timing_scope": "synchronized per-call diagnostic, using main kernel-duration aggregation; span and elapsed from same synchronized calls; CSV tuner latency uses normal continuous run_perftest"
+  },
+  "setup_seconds": 0.7644327422603965,
+  "wall_seconds": 3.902730860747397,
+  "torch_seed": 0,
+  "fingerprints": {
+    "input": "54cc867518cecb90c8242baf638966198c3ddd05e5431d060a14d87967b03612",
+    "topk_ids": "cefe4f6f781d2b6085faa43fa089174c41135f6dcc9250175d87f3118ceeb318",
+    "topk_weights": "0103e4d6edbdbe5322530c0eacd810230cd5b211de8e306990daddbd1fb7d5b6"
+  },
+  "environment": {
+    "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+    "HIP_VISIBLE_DEVICES": "0",
+    "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+    "AITER_FLYDSL_STAGE2_FP8": "0",
+    "AITER_MXFP4_INTERMEDIATE": "0",
+    "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/pair-03-fp80-fp40-limitdefault",
+    "FLYDSL_RUNTIME_RUN_ONLY": null,
+    "GPU_ARCHS": "gfx950",
+    "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+  }
+}

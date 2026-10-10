@@ -1,0 +1,785 @@
+[
+  {
+    "fixture": "minimax128-bm16-atomic",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:12:36.220631+00:00",
+    "exit_utc": "2026-10-10T15:12:49.158292+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/replay-task"
+  },
+  {
+    "fixture": "minimax128-bm16-atomic",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:12:49.161746+00:00",
+    "exit_utc": "2026-10-10T15:13:05.240218+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/aot-task"
+  },
+  {
+    "fixture": "minimax128-bm16-atomic",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:13:05.242935+00:00",
+    "exit_utc": "2026-10-10T15:13:15.555548+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-atomic/precompiled-task"
+  },
+  {
+    "fixture": "minimax128-bm32-reduce",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:13:15.558417+00:00",
+    "exit_utc": "2026-10-10T15:13:51.185237+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/pair-task"
+  },
+  {
+    "fixture": "minimax128-bm32-reduce",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:13:51.187856+00:00",
+    "exit_utc": "2026-10-10T15:14:03.940432+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/replay-task"
+  },
+  {
+    "fixture": "minimax128-bm32-reduce",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:14:03.943337+00:00",
+    "exit_utc": "2026-10-10T15:14:18.431976+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/aot-task"
+  },
+  {
+    "fixture": "minimax128-bm32-reduce",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:14:18.434585+00:00",
+    "exit_utc": "2026-10-10T15:14:29.021118+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-reduce/precompiled-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-atomic",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:14:29.023673+00:00",
+    "exit_utc": "2026-10-10T15:14:45.072900+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/pair-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-atomic",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:14:45.075840+00:00",
+    "exit_utc": "2026-10-10T15:14:58.118545+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/replay-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-atomic",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:14:58.121167+00:00",
+    "exit_utc": "2026-10-10T15:15:15.348427+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/aot-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-atomic",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:15:15.350902+00:00",
+    "exit_utc": "2026-10-10T15:15:30.218784+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-atomic/precompiled-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-reduce",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:15:30.221119+00:00",
+    "exit_utc": "2026-10-10T15:15:48.140359+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/pair-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-reduce",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:15:48.143110+00:00",
+    "exit_utc": "2026-10-10T15:16:00.813599+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/replay-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-reduce",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:16:00.815979+00:00",
+    "exit_utc": "2026-10-10T15:16:22.183456+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/aot-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-reduce",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:16:22.186272+00:00",
+    "exit_utc": "2026-10-10T15:16:32.711807+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-reduce/precompiled-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-scatter",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:16:32.714109+00:00",
+    "exit_utc": "2026-10-10T15:16:46.810904+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/pair-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-scatter",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:16:46.813639+00:00",
+    "exit_utc": "2026-10-10T15:17:06.020631+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/replay-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-scatter",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:17:06.023301+00:00",
+    "exit_utc": "2026-10-10T15:17:23.935016+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/aot-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-scatter",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:17:23.937509+00:00",
+    "exit_utc": "2026-10-10T15:17:36.850041+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-scatter/precompiled-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm16-k128",
+    "action": "pair",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:17:36.852298+00:00",
+    "exit_utc": "2026-10-10T15:17:54.067708+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/pair-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm16-k128",
+    "action": "replay",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:17:54.070500+00:00",
+    "exit_utc": "2026-10-10T15:18:11.396802+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/replay-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm16-k128",
+    "action": "aot",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:18:11.399135+00:00",
+    "exit_utc": "2026-10-10T15:18:27.868958+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/aot-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm16-k128",
+    "action": "precompiled",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:18:27.871624+00:00",
+    "exit_utc": "2026-10-10T15:19:10.956096+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm16-k128/precompiled-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm32-k256",
+    "action": "pair",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:19:10.958535+00:00",
+    "exit_utc": "2026-10-10T15:19:31.673648+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/pair-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm32-k256",
+    "action": "replay",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:19:31.676493+00:00",
+    "exit_utc": "2026-10-10T15:19:44.599377+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/replay-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm32-k256",
+    "action": "aot",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:19:44.601828+00:00",
+    "exit_utc": "2026-10-10T15:19:58.919858+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/aot-task"
+  },
+  {
+    "fixture": "gpt128-fp8-bm32-k256",
+    "action": "precompiled",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:19:58.922434+00:00",
+    "exit_utc": "2026-10-10T15:20:09.850656+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt128-fp8-bm32-k256/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm64-k128",
+    "action": "pair",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:20:09.853122+00:00",
+    "exit_utc": "2026-10-10T15:20:29.732109+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/pair-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm64-k128",
+    "action": "replay",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:20:29.735150+00:00",
+    "exit_utc": "2026-10-10T15:20:42.336271+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/replay-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm64-k128",
+    "action": "aot",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:20:42.338650+00:00",
+    "exit_utc": "2026-10-10T15:20:59.393881+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/aot-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm64-k128",
+    "action": "precompiled",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:20:59.396414+00:00",
+    "exit_utc": "2026-10-10T15:21:12.012016+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm64-k128/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm128-k256",
+    "action": "pair",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:21:12.014275+00:00",
+    "exit_utc": "2026-10-10T15:21:29.502240+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/pair-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm128-k256",
+    "action": "replay",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:21:29.505003+00:00",
+    "exit_utc": "2026-10-10T15:21:42.121052+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/replay-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm128-k256",
+    "action": "aot",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:21:42.123437+00:00",
+    "exit_utc": "2026-10-10T15:22:03.244597+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/aot-task"
+  },
+  {
+    "fixture": "gpt2048-fp8-bm128-k256",
+    "action": "precompiled",
+    "config": "fp81-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:22:03.247120+00:00",
+    "exit_utc": "2026-10-10T15:22:13.721786+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp8-bm128-k256/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n128",
+    "action": "pair",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:22:13.724339+00:00",
+    "exit_utc": "2026-10-10T15:22:32.077417+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/pair-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n128",
+    "action": "replay",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:22:32.080509+00:00",
+    "exit_utc": "2026-10-10T15:22:44.625446+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/replay-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n128",
+    "action": "aot",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:22:44.628568+00:00",
+    "exit_utc": "2026-10-10T15:23:26.276048+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/aot-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n128",
+    "action": "precompiled",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:23:26.278609+00:00",
+    "exit_utc": "2026-10-10T15:23:43.210824+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n128/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n256",
+    "action": "pair",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:23:43.213375+00:00",
+    "exit_utc": "2026-10-10T15:24:03.320450+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/pair-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n256",
+    "action": "replay",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:24:03.323304+00:00",
+    "exit_utc": "2026-10-10T15:24:22.471581+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/replay-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n256",
+    "action": "aot",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:24:22.474131+00:00",
+    "exit_utc": "2026-10-10T15:24:38.481887+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/aot-task"
+  },
+  {
+    "fixture": "gpt2048-fp4-n256",
+    "action": "precompiled",
+    "config": "fp80-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:24:38.484429+00:00",
+    "exit_utc": "2026-10-10T15:24:49.545549+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-fp4-n256/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-limit5-reduce-clamp",
+    "action": "pair",
+    "config": "fp80-fp40-limit5",
+    "start_utc": "2026-10-10T15:24:49.548116+00:00",
+    "exit_utc": "2026-10-10T15:25:07.844866+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/pair-task"
+  },
+  {
+    "fixture": "gpt2048-limit5-reduce-clamp",
+    "action": "replay",
+    "config": "fp80-fp40-limit5",
+    "start_utc": "2026-10-10T15:25:07.847545+00:00",
+    "exit_utc": "2026-10-10T15:25:20.578480+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/replay-task"
+  },
+  {
+    "fixture": "gpt2048-limit5-reduce-clamp",
+    "action": "aot",
+    "config": "fp80-fp40-limit5",
+    "start_utc": "2026-10-10T15:25:20.581268+00:00",
+    "exit_utc": "2026-10-10T15:25:42.403951+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/aot-task"
+  },
+  {
+    "fixture": "gpt2048-limit5-reduce-clamp",
+    "action": "precompiled",
+    "config": "fp80-fp40-limit5",
+    "start_utc": "2026-10-10T15:25:42.406614+00:00",
+    "exit_utc": "2026-10-10T15:25:53.208007+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-limit5-reduce-clamp/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-reduce",
+    "action": "pair",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:25:53.210466+00:00",
+    "exit_utc": "2026-10-10T15:26:11.128448+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/pair-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-reduce",
+    "action": "replay",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:26:11.131154+00:00",
+    "exit_utc": "2026-10-10T15:26:24.075524+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/replay-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-reduce",
+    "action": "aot",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:26:24.077943+00:00",
+    "exit_utc": "2026-10-10T15:26:45.068002+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/aot-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-reduce",
+    "action": "precompiled",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:26:45.070533+00:00",
+    "exit_utc": "2026-10-10T15:26:55.794039+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-reduce/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-scatter",
+    "action": "pair",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:26:55.796971+00:00",
+    "exit_utc": "2026-10-10T15:27:10.697616+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/pair-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-scatter",
+    "action": "replay",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:27:10.700771+00:00",
+    "exit_utc": "2026-10-10T15:27:23.273107+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/replay-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-scatter",
+    "action": "aot",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:27:23.275649+00:00",
+    "exit_utc": "2026-10-10T15:27:37.561400+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/aot-task"
+  },
+  {
+    "fixture": "gpt2048-combined7-scatter",
+    "action": "precompiled",
+    "config": "fp81-fp41-limitdefault",
+    "start_utc": "2026-10-10T15:27:37.564284+00:00",
+    "exit_utc": "2026-10-10T15:27:48.401451+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined7-scatter/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-reduce-clamp",
+    "action": "pair",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:27:48.404294+00:00",
+    "exit_utc": "2026-10-10T15:28:06.579218+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/pair-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-reduce-clamp",
+    "action": "replay",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:28:06.581827+00:00",
+    "exit_utc": "2026-10-10T15:28:19.267947+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/replay-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-reduce-clamp",
+    "action": "aot",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:28:19.270518+00:00",
+    "exit_utc": "2026-10-10T15:28:40.279140+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/aot-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-reduce-clamp",
+    "action": "precompiled",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:28:40.281822+00:00",
+    "exit_utc": "2026-10-10T15:28:51.191153+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-reduce-clamp/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-scatter-clamp",
+    "action": "pair",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:28:51.193725+00:00",
+    "exit_utc": "2026-10-10T15:29:07.034564+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/pair-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-scatter-clamp",
+    "action": "replay",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:29:07.037627+00:00",
+    "exit_utc": "2026-10-10T15:29:19.990515+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/replay-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-scatter-clamp",
+    "action": "aot",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:29:19.993089+00:00",
+    "exit_utc": "2026-10-10T15:29:35.865974+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/aot-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-scatter-clamp",
+    "action": "precompiled",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:29:35.868473+00:00",
+    "exit_utc": "2026-10-10T15:29:46.267707+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-scatter-clamp/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-situv2-reduce",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:29:46.270187+00:00",
+    "exit_utc": "2026-10-10T15:30:04.797245+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/pair-task"
+  },
+  {
+    "fixture": "gpt2048-situv2-reduce",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:30:04.800036+00:00",
+    "exit_utc": "2026-10-10T15:30:17.772052+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/replay-task"
+  },
+  {
+    "fixture": "gpt2048-situv2-reduce",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:30:17.774637+00:00",
+    "exit_utc": "2026-10-10T15:30:48.326449+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/aot-task"
+  },
+  {
+    "fixture": "gpt2048-situv2-reduce",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:30:48.329076+00:00",
+    "exit_utc": "2026-10-10T15:30:59.144115+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-situv2-reduce/precompiled-task"
+  },
+  {
+    "fixture": "minimax128-bm16-reduce",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:30:59.146457+00:00",
+    "exit_utc": "2026-10-10T15:31:12.257424+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/pair-task"
+  },
+  {
+    "fixture": "minimax128-bm16-reduce",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:31:12.260257+00:00",
+    "exit_utc": "2026-10-10T15:31:24.976463+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/replay-task"
+  },
+  {
+    "fixture": "minimax128-bm16-reduce",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:31:24.978911+00:00",
+    "exit_utc": "2026-10-10T15:31:36.838412+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/aot-task"
+  },
+  {
+    "fixture": "minimax128-bm16-reduce",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:31:36.841132+00:00",
+    "exit_utc": "2026-10-10T15:31:47.095174+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm16-reduce/precompiled-task"
+  },
+  {
+    "fixture": "minimax128-bm32-atomic",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:31:47.097718+00:00",
+    "exit_utc": "2026-10-10T15:32:00.130447+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/pair-task"
+  },
+  {
+    "fixture": "minimax128-bm32-atomic",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:32:00.133152+00:00",
+    "exit_utc": "2026-10-10T15:32:21.616099+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/replay-task"
+  },
+  {
+    "fixture": "minimax128-bm32-atomic",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:32:21.619089+00:00",
+    "exit_utc": "2026-10-10T15:32:34.148084+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/aot-task"
+  },
+  {
+    "fixture": "minimax128-bm32-atomic",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:32:34.150763+00:00",
+    "exit_utc": "2026-10-10T15:32:44.447707+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax128-bm32-atomic/precompiled-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-reduce",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:32:44.450217+00:00",
+    "exit_utc": "2026-10-10T15:32:58.420569+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/pair-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-reduce",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:32:58.423523+00:00",
+    "exit_utc": "2026-10-10T15:33:11.342815+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/replay-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-reduce",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:33:11.345590+00:00",
+    "exit_utc": "2026-10-10T15:33:26.753344+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/aot-task"
+  },
+  {
+    "fixture": "minimax2048-bm64-reduce",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:33:26.756201+00:00",
+    "exit_utc": "2026-10-10T15:33:37.226879+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm64-reduce/precompiled-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-atomic",
+    "action": "pair",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:33:37.229794+00:00",
+    "exit_utc": "2026-10-10T15:33:51.570006+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/pair-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-atomic",
+    "action": "replay",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:33:51.572825+00:00",
+    "exit_utc": "2026-10-10T15:34:13.064203+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/replay-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-atomic",
+    "action": "aot",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:34:13.066877+00:00",
+    "exit_utc": "2026-10-10T15:34:27.298632+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/aot-task"
+  },
+  {
+    "fixture": "minimax2048-bm128-atomic",
+    "action": "precompiled",
+    "config": "fp80-fp40-limitdefault",
+    "start_utc": "2026-10-10T15:34:27.301427+00:00",
+    "exit_utc": "2026-10-10T15:34:38.158626+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/minimax2048-bm128-atomic/precompiled-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-atomic",
+    "action": "pair",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:34:38.161950+00:00",
+    "exit_utc": "2026-10-10T15:34:52.177587+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/pair-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-atomic",
+    "action": "replay",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:34:52.180732+00:00",
+    "exit_utc": "2026-10-10T15:35:11.704161+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/replay-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-atomic",
+    "action": "aot",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:35:11.706906+00:00",
+    "exit_utc": "2026-10-10T15:35:25.689272+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/aot-task"
+  },
+  {
+    "fixture": "gpt2048-combined5-atomic",
+    "action": "precompiled",
+    "config": "fp81-fp41-limit5",
+    "start_utc": "2026-10-10T15:35:25.692418+00:00",
+    "exit_utc": "2026-10-10T15:35:35.960610+00:00",
+    "exit_code": 0,
+    "artifact": "/root/workspace/tmp_dev/aiter-mxfp4-03/docs/mxfp4_staged_main_port/03/gpu/gpt2048-combined5-atomic/precompiled-task"
+  }
+]

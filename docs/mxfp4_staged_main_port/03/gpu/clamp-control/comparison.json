@@ -1,0 +1,33 @@
+{
+  "same_fixed_input_and_routes": true,
+  "different_actual_outputs": true,
+  "same_exact_names": true,
+  "limits": [
+    5,
+    7
+  ],
+  "errors": [
+    0.0075543639292640075,
+    0.009116174375803476
+  ],
+  "output_fingerprints": [
+    "dce83f00e2eda0eef2202af858acc5c9d8f6b963d667ceeb2f0537f5ce081da9",
+    "625e85d06d0c8d7480b4757580c44a202119e47b98db20fd16a69beea4d4a30d"
+  ],
+  "output_scalars": [
+    {
+      "sum": -221721.828125,
+      "norm": 394683.4375,
+      "min": -884.0,
+      "max": 780.0
+    },
+    {
+      "sum": -77423.875,
+      "norm": 643042.4375,
+      "min": -1408.0,
+      "max": 1304.0
+    }
+  ],
+  "stable_matching_invocations": true,
+  "implementation_commit": "65f4278670287bd1f4c2f972651cf7343277fb4d"
+}
