@@ -76,10 +76,19 @@ def _has_rocm_toolchain() -> bool:
 # are the supported fallback without it. Linux keeps failing loudly instead,
 # where ROCm is a hard prerequisite and its absence is a broken install.
 if not AITER_TRITON_ONLY and sys.platform == "win32" and not _has_rocm_toolchain():
+    import importlib.util
+
     AITER_TRITON_ONLY = True
+    # rocm[devel] ships its toolchain as an archive that stays packed until
+    # `rocm-sdk init` runs, so an installed wheel is not yet a usable toolchain.
+    if importlib.util.find_spec("rocm_sdk_devel") is not None:
+        hint = "Run `rocm-sdk init` to unpack the rocm[devel] toolchain"
+    else:
+        hint = "Install rocm[devel] or the HIP SDK"
     logger.warning(
         "No ROCm install found; falling back to the Triton ops. "
-        "Install the HIP SDK and set HIP_PATH to build the C++/HIP ops."
+        "%s to build the C++/HIP ops.",
+        hint,
     )
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
