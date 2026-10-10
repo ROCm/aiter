@@ -174,5 +174,49 @@
       "both_retained": false,
       "pair_validated": false
     }
+  },
+  {
+    "id": "gpt-2048-fp4-prune-vs-staged",
+    "left": "gpt-2048-fp4-prune",
+    "right": "gpt-2048-fp4-staged",
+    "reason": "Same selected pair measured\u22120.658% staged difference in independent processes; alternating replay quantifies noise.",
+    "fp8": false,
+    "fp4": true,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 128,
+      "accumulation_mode": "non_atomic",
+      "screen_topk": 2,
+      "g1_rank": 2,
+      "g2_rank": 2,
+      "g1_successful_candidates": 6,
+      "g2_successful_candidates": 24,
+      "both_retained": true,
+      "pair_validated": true
+    }
+  },
+  {
+    "id": "minimax-8192-default-prune-vs-staged",
+    "left": "minimax-8192-prune",
+    "right": "minimax-8192-staged",
+    "reason": "Retained/validated prune winner and staged measured\u22120.059% difference; alternating replay quantifies near-zero ordering noise.",
+    "fp8": false,
+    "fp4": false,
+    "limit": null,
+    "repeats_per_pair": 3,
+    "search_invocations": 0,
+    "rank_retention": {
+      "block_m": 128,
+      "accumulation_mode": "non_atomic",
+      "screen_topk": 2,
+      "g1_rank": 1,
+      "g2_rank": 1,
+      "g1_successful_candidates": 6,
+      "g2_successful_candidates": 12,
+      "both_retained": true,
+      "pair_validated": true
+    }
   }
 ]
