@@ -15,7 +15,6 @@
 #include "mx_quant_utils.h"
 #include "rocprim/rocprim.hpp"
 #include <cstdlib>
-#include <mutex>
 #include <string>
 
 
@@ -34,21 +33,16 @@ struct DynGqDevice
     int num_cu;
 };
 
-static const DynGqDevice& dyn_gq_device(int device_id)
+static DynGqDevice dyn_gq_device(int device_id)
 {
-    constexpr int kMaxDevices = 64;
-    static std::once_flag once[kMaxDevices];
-    static DynGqDevice info[kMaxDevices];
-    AITER_CHECK(device_id >= 0 && device_id < kMaxDevices, __func__, " device id ", device_id,
-                " out of range");
-    std::call_once(once[device_id], [device_id] {
-        hipDeviceProp_t prop;
+    static SynchronizedCache<int, DynGqDevice> cache;
+    return cache.get_or_create(device_id, [device_id] {
+        hipDeviceProp_t prop{};
         HIP_CALL(hipGetDeviceProperties(&prop, device_id));
         const std::string arch_full(prop.gcnArchName);
         const std::string arch = arch_full.substr(0, arch_full.find(':'));
-        info[device_id]        = {arch == "gfx1250", prop.multiProcessorCount};
+        return DynGqDevice{arch == "gfx1250", prop.multiProcessorCount};
     });
-    return info[device_id];
 }
 
 // gfx1250: use 256-thread blocks once there are at least a quarter as many as SIMDs.
@@ -1337,7 +1331,7 @@ void dynamic_per_token_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    const DynGqDevice& dev = dyn_gq_device(input.device_id);
+    const DynGqDevice dev = dyn_gq_device(input.device_id);
 
     if(cols == 32 || cols == 64 || cols == 128)
     {
@@ -1678,7 +1672,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
 
     HipDeviceGuard device_guard(input.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    const DynGqDevice& dev = dyn_gq_device(input.device_id);
+    const DynGqDevice dev = dyn_gq_device(input.device_id);
 
     DISPATCH_GROUP_SIZE(group_size,
         static constexpr int thread_data_size     = 32;
