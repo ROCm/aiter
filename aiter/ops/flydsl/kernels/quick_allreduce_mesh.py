@@ -195,15 +195,16 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
     return MESH_ST_LADDER.get((str(link), int(world_size)), ())
 
 
-# ``(link, world_size, arch) -> (relay_min_bytes, (num, den))``. Used only when
-# the caller passes ``relay_devices``; production dispatch does not, because the
-# relay GPUs may host other work, and the per-process VRAM and context cost on
-# them, with all four pairs relaying at once, is unmeasured. From which
-# payload those engines relay, and the share of blocks they relay. Measured
-# under CUDA-graph replay on an idle node with the 4-bit wire at hidden size
-# 5120, as the speedup over the direct engine: 3/8 gives about 1.4x from 20 to
-# 120 MiB, about 1.2x over 5-10 MiB, and loses below about 0.5 MiB. Cross-process
-# spread at 80 MiB is about 5%. 1/4 and 1/2 are slower than 3/8 from 5 MiB up.
+# ``(link, world_size, arch) -> (relay_min_bytes, (num, den))``: the payload
+# from which the relay engines run, and the share of blocks that relay. Used
+# only when the caller passes ``relay_devices``; production dispatch does not,
+# because the relay GPUs may host other work and the context cost on them with
+# all four pairs relaying at once is unmeasured. At INT4 a rank allocates
+# 13.6 MiB for relaying, half of it as bounces on a relay GPU. On gfx950 under
+# graph replay (INT4, hidden 5120), 3/8 is 1.43-1.53x direct at 20-120 MiB,
+# 1.32-1.37x at 5-10 MiB and 1.07-1.24x at 0.5-2.5 MiB, and breaks even near
+# 0.23 MiB. 1/2 is 1-7% slower than 3/8 at 2.5-10 MiB and 1-6% faster from
+# 20 MiB up; 3/8 stays because what 1/2 costs the relay GPUs is unmeasured.
 MESH_RELAY_DEFAULTS = {("xgmi", 2, "gfx950"): (480 << 10, (3, 8))}
 
 # Wire formats the mesh can build.
