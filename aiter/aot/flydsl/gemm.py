@@ -70,6 +70,7 @@ from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     parse_8wave_kernel_name,
 )
 from aiter.ops.flydsl.gemm_kernels import (
+    SKINNY_POLICY,
     SPLIT_K_SEMAPHORE_MAX_LEN,
     get_flydsl_hgemm_kernel_params,
 )
@@ -312,11 +313,12 @@ def parse_csv(csv_path: str):
                 params = get_flydsl_hgemm_kernel_params(kernel_name)
                 if params is not None:
                     params = dict(params)
-                    params["kind"] = (
-                        "a16w16_gfx1250"
-                        if params["target_gfx"] == "gfx1250"
-                        else "hgemm"
-                    )
+                    if params["policy"] == SKINNY_POLICY:
+                        params["kind"] = "hgemm_skinny"
+                    elif params["target_gfx"] == "gfx1250":
+                        params["kind"] = "a16w16_gfx1250"
+                    else:
+                        params["kind"] = "hgemm"
             else:
                 params = None
 
@@ -486,6 +488,50 @@ def _compile_hgemm_to_cache(
             compiler=flyc.compile,
             dispatch_args=dispatch_args,
         )
+
+
+def _compile_hgemm_skinny_to_cache(
+    *,
+    n: int,
+    k: int,
+    block_m: int,
+    block_n: int,
+    block_k: int,
+    stages: int,
+    k_waves: int,
+    target_gfx: str,
+    **kwargs,
+):
+    del kwargs
+
+    import torch
+
+    from aiter.ops.flydsl.kernels.gemm_a16w16_skinny_gfx950 import (
+        compile_gemm_a16w16_skinny_gfx950,
+        skinny_config_error,
+    )
+
+    if target_gfx != "gfx950":
+        raise ValueError(
+            f"The FlyDSL skinny HGEMM kernel only supports gfx950, got {target_gfx}"
+        )
+    err = skinny_config_error(n, k, block_m, block_n, block_k, stages, k_waves)
+    if err is not None:
+        raise ValueError(f"Invalid FlyDSL skinny HGEMM config for N={n}, K={k}: {err}")
+    exe = compile_gemm_a16w16_skinny_gfx950(
+        n, k, block_m, block_n, block_k, stages, k_waves
+    )
+    # N and K are compiled in; M is a kernel argument. Placeholder tensors only
+    # supply pointer arguments, which ptr_arg turns into null under FakeTensorMode.
+    placeholder = torch.empty((1,), dtype=torch.bfloat16)
+    _compile_executable_to_cache(
+        exe,
+        _ptr_view_safe(placeholder),
+        _ptr_view_safe(placeholder),
+        _ptr_view_safe(placeholder),
+        1,
+        fx.Stream(0),
+    )
 
 
 def _compile_a16w16_gfx1250_to_cache(
@@ -1030,6 +1076,10 @@ def compile_one_config(
                 hgemm_kwargs = dict(kwargs)
                 hgemm_kwargs["target_gfx"] = aot_arch
                 _compile_hgemm_to_cache(m=m, n=n, k=k, **hgemm_kwargs)
+            elif kind == "hgemm_skinny":
+                skinny_kwargs = dict(kwargs)
+                skinny_kwargs["target_gfx"] = aot_arch
+                _compile_hgemm_skinny_to_cache(n=n, k=k, **skinny_kwargs)
             elif kind == "a16w16_gfx1250":
                 a16w16_kwargs = dict(kwargs)
                 a16w16_kwargs["target_gfx"] = aot_arch
