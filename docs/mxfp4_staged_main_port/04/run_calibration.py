@@ -6,6 +6,7 @@
 import argparse
 import datetime
 import gzip
+import importlib.util
 import json
 import os
 import re
@@ -25,13 +26,20 @@ def parse_search_console(console):
     ordinary = re.findall(r"\[mxfp4-port\] token=.+ \+ .+ us=", text)
     failures = re.findall(r"\[mxfp4-port\] candidate failed:", text)
     summary = re.findall(r"total tuning time is ([0-9.]+) seconds", text)
+    fallback_count = len(re.findall(r"\[mxfp4-staged\] exhaustive fallback", text))
+    if staged:
+        summary_path = Path(__file__).with_name("summarize_calibration.py")
+        spec = importlib.util.spec_from_file_location(
+            "calibration_summary", summary_path
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        fallback_count = module.staged_fallback_groups(text)
     return {
         "validation_attempts": len(staged) + len(ordinary) + len(failures),
         "g1_screens": len(re.findall(r"\[mxfp4-staged\] GEMM1 .+ screening", text)),
         "g2_screens": len(re.findall(r"\[mxfp4-staged\] GEMM2 .+ screening", text)),
-        "fallback_groups": len(
-            re.findall(r"\[mxfp4-staged\] exhaustive fallback", text)
-        ),
+        "fallback_groups": fallback_count,
         "finite_reference_errors": re.findall(r"cosine_diff=([0-9.eE+-]+)", text),
         "tuning_summary_seconds": float(summary[-1]) if summary else None,
     }
@@ -51,15 +59,22 @@ def finalize_search(job, job_dir, counts):
     task = json.loads((artifact / "task.json").read_text())
     start = datetime.datetime.fromisoformat(task["process_start_utc"])
     end = datetime.datetime.fromisoformat(task["process_exit_utc"])
+    text = (artifact / "console.log.txt").read_text()
+    outcome = "valid"
+    if task.get("exit_code") != 0 or len(rows) != 1 or float(rows[0]["us"]) <= 0:
+        if task.get("exit_code", 0) < 0 or re.search(
+            r"worker .* (?:failed|died)|device-side|memory access fault", text
+        ):
+            outcome = "worker-death"
+        elif re.search(
+            r"all candidates failed|no valid staged pair|Tuning Finished", text
+        ):
+            outcome = "normal-pair"
+        else:
+            outcome = "incomplete-run"
     result = dict(
         job,
-        outcome=(
-            "valid"
-            if task.get("exit_code") == 0
-            and len(rows) == 1
-            and float(rows[0]["us"]) > 0
-            else "incomplete-run"
-        ),
+        outcome=outcome,
         winner=rows[0] if len(rows) == 1 else None,
         winner_us=float(rows[0]["us"]) if len(rows) == 1 else None,
         search_wall_seconds=(end - start).total_seconds(),
