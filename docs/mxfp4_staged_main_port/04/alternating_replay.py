@@ -9,7 +9,6 @@ input/routes/weights and normal kernel-duration-sum profiling are retained.
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
@@ -19,6 +18,8 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+
+from docs.mxfp4_staged_main_port.scripts.replay_common import fingerprint
 
 
 def alternating_samples(
@@ -136,11 +137,6 @@ def main() -> "None":
         }
 
     result = alternating_samples(measure, args.repeats)
-
-    def fingerprint(tensor: "torch.Tensor") -> "str":
-        return hashlib.sha256(
-            tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-        ).hexdigest()
 
     result.update(
         reason=args.reason,

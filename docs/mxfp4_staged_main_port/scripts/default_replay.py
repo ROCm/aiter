@@ -1,15 +1,8 @@
 #!/usr/bin/env python3
 """Coordinator-launched exact CSV replay, AOT build and precompiled replay."""
 
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    import torch
-
-
 import argparse
 import csv
-import hashlib
 import importlib
 import json
 import math
@@ -19,6 +12,11 @@ import subprocess
 import time
 from pathlib import Path
 from unittest import mock
+
+from docs.mxfp4_staged_main_port.scripts.replay_common import (
+    fingerprint,
+    trace_kernel_metrics,
+)
 
 ENV_KEYS = (
     "ROCR_VISIBLE_DEVICES",
@@ -37,14 +35,6 @@ ENV_KEYS = (
 def write_json(path: "Path", value: "object") -> "None":
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-
-
-def fingerprint(tensor: "torch.Tensor") -> "str":
-    import torch
-
-    return hashlib.sha256(
-        tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-    ).hexdigest()
 
 
 def main() -> "None":
@@ -261,19 +251,7 @@ def main() -> "None":
     trace = args.result.with_suffix(".trace.json")
     prof.export_chrome_trace(str(trace))
     events = json.loads(trace.read_text())["traceEvents"]
-    kernels = [
-        event
-        for event in events
-        if event.get("cat") == "kernel" and event.get("ph") == "X"
-    ]
-    assert kernels and all(
-        event.get("cat") != "gpu_user_annotation" for event in kernels
-    )
-    kernel_sum = sum(event["dur"] for event in kernels) / args.iters
-    span = (
-        max(event["ts"] + event["dur"] for event in kernels)
-        - min(event["ts"] for event in kernels)
-    ) / args.iters
+    kernels, kernel_sum, span = trace_kernel_metrics(events, args.iters)
     metric = float(get_trace_perf(prof, args.iters))
     assert math.isfinite(metric) and metric > 0
     write_json(

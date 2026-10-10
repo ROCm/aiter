@@ -1,12 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from types import SimpleNamespace
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import StagedSearchPlan
-
 import argparse
 import functools
 import math
@@ -15,13 +9,13 @@ import re
 import sys
 import tempfile
 from argparse import ArgumentTypeError
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_connections
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pandas as pd
 import torch
@@ -115,6 +109,11 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     populate_v2_intermediate_from_ref as _v2_populate_stage2,
 )
+
+if TYPE_CHECKING:
+    from types import SimpleNamespace
+
+    from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import StagedSearchPlan
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
@@ -6532,9 +6531,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         args.mxfp4_configuration = self._configuration
         return args
 
-    def pre_process(
-        self, args: "argparse.Namespace | SimpleNamespace | None"
-    ) -> "None":
+    def pre_process(self, args: "argparse.Namespace | SimpleNamespace") -> "None":
         self._invocation_configuration(args)
         return super().pre_process(args)
 
@@ -6548,7 +6545,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     "a still-live permanent hang may wait indefinitely."
                 )
 
-    def _unsupported_row_reason(self, row: "dict[str, object]") -> "str | None":
+    def _unsupported_row_reason(
+        self, row: "Mapping[str, object] | pd.Series"
+    ) -> "str | None":
         for field, expected in (
             ("dtype", dtypes.bf16),
             ("q_dtype_a", dtypes.fp4x2),
