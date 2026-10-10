@@ -1,23 +1,27 @@
-name: Windows Op Tests
+name: Windows Smoke Test
 
 on:
   pull_request:
     branches: [main]
     paths:
-      - ".github/workflows/windows-op-tests.yaml"
+      - ".github/workflows/windows-smoke-test.yaml"
+      - "aiter/**"
+      - "csrc/**"
       - "op_tests/windows/**"
+      - "requirements.txt"
+      - "setup.py"
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: windows-op-tests-${{ github.ref }}
+  group: windows-smoke-test-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  op-tests:
-    name: op_tests/windows (gfx1201)
+  jit-op-smoke:
+    name: JIT op smoke (gfx1201)
     runs-on: windows-gfx1201-gpu-rocm
     timeout-minutes: 90
     env:
@@ -55,7 +59,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-op-tests"
+          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-smoke"
           if (Test-Path $venv) {
             Remove-Item -Recurse -Force $venv
           }
@@ -84,7 +88,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-op-tests"
+          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-smoke"
           $python = Join-Path $venv "Scripts\python.exe"
 
           & $python -m pip install --upgrade `
@@ -102,7 +106,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Continue"
-          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-op-tests"
+          $venv = Join-Path $env:RUNNER_TEMP "aiter-windows-smoke"
           $python = Join-Path $venv "Scripts\python.exe"
 
           & $python -m pytest -q -s op_tests/windows
