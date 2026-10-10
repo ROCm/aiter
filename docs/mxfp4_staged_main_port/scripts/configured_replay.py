@@ -29,8 +29,17 @@ ENV_KEYS = (
 
 
 def write_json(path, value):
+    def json_value(item):
+        if isinstance(item, float) and not math.isfinite(item):
+            return str(item)
+        if isinstance(item, dict):
+            return {key: json_value(child) for key, child in item.items()}
+        if isinstance(item, (list, tuple)):
+            return [json_value(child) for child in item]
+        return item
+
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    path.write_text(json.dumps(json_value(value), indent=2, allow_nan=False) + "\n")
 
 
 def fingerprint(tensor):
