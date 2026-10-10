@@ -24,13 +24,13 @@ def parse_search_console(console):
     staged = re.findall(r"\[mxfp4-staged\] .+ \+ .+ (?:us=|validation failed:)", text)
     ordinary = re.findall(r"\[mxfp4-port\] token=.+ \+ .+ us=", text)
     failures = re.findall(r"\[mxfp4-port\] candidate failed:", text)
-    summary = re.findall(r"Total tuning time \(s\):\s*([0-9.]+)", text)
+    summary = re.findall(r"total tuning time is ([0-9.]+) seconds", text)
     return dict(
         validation_attempts=len(staged) + len(ordinary) + len(failures),
         g1_screens=len(re.findall(r"\[mxfp4-staged\] GEMM1 .+ screening", text)),
         g2_screens=len(re.findall(r"\[mxfp4-staged\] GEMM2 .+ screening", text)),
         fallback_groups=len(re.findall(r"\[mxfp4-staged\] exhaustive fallback", text)),
-        finite_reference_errors=re.findall(r"err_ratio:\s*([0-9.eE+-]+)", text),
+        finite_reference_errors=re.findall(r"cosine_diff=([0-9.eE+-]+)", text),
         tuning_summary_seconds=float(summary[-1]) if summary else None,
     )
 
@@ -119,7 +119,10 @@ def main():
                     "FLYDSL_GPU_ARCH": "gfx950",
                     "AITER_USE_SYSTEM_TRITON": "1",
                     "MAX_JOBS": "8",
-                    "CK_DIR": str(root / "3rdparty/composable_kernel"),
+                    "CK_DIR": os.environ.get(
+                        "CK_DIR",
+                        "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+                    ),
                     "AITER_JIT_DIR": str(args.runtime / "jit-default"),
                     "AITER_FLYDSL_STAGE2_FP8": "1" if job["fp8"] else "0",
                     "AITER_MXFP4_INTERMEDIATE": "1" if job["fp4"] else "0",
