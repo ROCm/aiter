@@ -24,6 +24,7 @@ import datetime
 import math
 import os
 import sys
+import time
 
 # watchdog.py sits next to this file; sys.path[0] is the script's own directory, so this picks
 # up the sibling rather than any installed package of the same name.
@@ -32,6 +33,7 @@ from watchdog import GitHub
 AVG_REVIEW_MINUTES = 50      # measured: a full review is about this
 MAX_WAIT_HOURS = 8           # refuse beyond this rather than accept it; see below
 NO_RUNNER_MINUTES = 30       # nothing moving for this long, with work waiting, means nobody is taking it
+RECHECK_SECONDS = 60         # before calling a box dead, see whether it was simply between reviews
 
 # The limit is a wait, not a queue length, because the constraint it answers is a wait: GitHub
 # cancels a job that has been queued for 24 h, silently. Eight hours leaves room for the estimate
@@ -124,7 +126,7 @@ def message(verdict, ahead, eta, owner):
             "The box reviews one PR at a time." % (ahead, _hours(eta)))
 
 
-def run(api, env, now=None):
+def run(api, env, now=None, sleep=time.sleep):
     """Returns (ok, verdict). Posts at most one comment."""
     out = env.get("GITHUB_OUTPUT")
 
@@ -150,8 +152,23 @@ def run(api, env, now=None):
                "max_wait_minutes": tunable(env, "MAX_WAIT_HOURS", MAX_WAIT_HOURS) * 60,
                "no_runner_minutes": tunable(env, "NO_RUNNER_MINUTES", NO_RUNNER_MINUTES)}
         repo = env["GITHUB_REPOSITORY"]
-        running, waiting = survey(api, repo, int(env["GITHUB_RUN_ID"]), now)
+        own = int(env["GITHUB_RUN_ID"])
+        running, waiting = survey(api, repo, own, now)
         verdict, ahead, eta = decide(running, waiting, cfg)
+
+        # One snapshot cannot tell a dead runner from the seconds between one review finishing
+        # and the next being picked up: in both, nothing is running and something has been
+        # waiting a while -- the waiting is long because it sat behind the review that just
+        # ended, not because nobody is working. Look again before calling a healthy box dead. A
+        # handoff closes in seconds; an outage does not.
+        if verdict == "no-runner":
+            pause = tunable(env, "RECHECK_SECONDS", RECHECK_SECONDS)
+            sleep(pause)
+            later = now + datetime.timedelta(seconds=pause)
+            running, waiting = survey(api, repo, own, later)
+            verdict, ahead, eta = decide(running, waiting, cfg)
+            if verdict != "no-runner":
+                print("::notice::the box was between reviews, not stopped")
 
         if verdict == "idle":
             return finish(True, verdict)    # starts at once; a comment would be noise

@@ -39,6 +39,9 @@ jobs:
       github.event.issue.pull_request &&
       contains(github.event.comment.body, '@aiter-bot review')
     runs-on: ubuntu-latest
+    # A few API calls and, on the rare stalled-queue path, one 60s pause. Without this the
+    # default is six hours, which is a long time to hold a runner because an API call hung.
+    timeout-minutes: 10
     permissions:
       contents: read
       actions: read           # read other runs to see how deep the queue already is

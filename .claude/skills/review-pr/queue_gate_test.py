@@ -38,7 +38,8 @@ def stamp(minutes_ago):
 
 
 def drive(mod, scn):
-    rec = {"posts": [], "notices": [], "warnings": [], "gets": 0, "ok": None, "verdict": None}
+    rec = {"posts": [], "notices": [], "warnings": [], "gets": 0, "ok": None,
+           "verdict": None, "slept": 0, "passes": 0}
 
     class Fake(mod.GitHub):
         def _get(self, path):
@@ -52,6 +53,10 @@ def drive(mod, scn):
                 runs = scn.get("runs", [])
                 if runs == "boom":                  # the API being unreadable, not empty
                     raise RuntimeError("GET %s -> 500" % path)
+                if callable(runs):                  # the box changing between the two looks
+                    if int(q["page"][0]) == 1:
+                        rec["passes"] += 1
+                    runs = runs(rec["passes"])
                 per, page = int(q["per_page"][0]), int(q["page"][0])
                 newest_first = sorted(runs, key=lambda r: -r["id"])
                 return {"workflow_runs": newest_first[(page - 1) * per:page * per]}
@@ -71,7 +76,9 @@ def drive(mod, scn):
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        rec["ok"], rec["verdict"] = mod.run(Fake("gh-token", "bot-token"), env, now=NOW)
+        rec["ok"], rec["verdict"] = mod.run(
+            Fake("gh-token", "bot-token"), env, now=NOW,
+            sleep=lambda s: rec.__setitem__("slept", rec["slept"] + s))
     for line in buf.getvalue().splitlines():
         if line.startswith("::notice::"):
             rec["notices"].append(line[10:])
@@ -139,6 +146,21 @@ CASES = [
          (len(r["posts"]) == 1 and "not queued" in r["posts"][0]["body"],
           "did not say the request was dropped"),
          (r["verdict"] == "no-runner", "verdict was %r" % r["verdict"]),
+     ]),
+
+    # One snapshot cannot tell a dead runner from the seconds between one review ending and the
+    # next being picked up -- in both, nothing is running and something has been waiting a long
+    # time, because it was waiting behind the review that just finished.
+    ("does not call a box dead while it is between reviews",
+     {"runs": lambda n: ([{"id": 200, "created_at": stamp(55)}] if n == 1
+                         else [{"id": 200, "created_at": stamp(55)},
+                               {"id": 201, "created_at": stamp(105)}]),
+      "jobs": {200: REVIEW_QUEUED, 201: REVIEW_RUNNING}},
+     lambda r: [
+         (r["verdict"] != "no-runner", "called a healthy box dead during a handoff"),
+         (r["ok"] is True, "refused a review because of a handoff gap"),
+         (not any("@zufayu" in p["body"] for p in r["posts"]), "paged the owner over a handoff"),
+         (r["slept"] > 0, "decided without looking again"),
      ]),
 
     # Waiting is normal while someone is being served; only a stalled queue means trouble.
@@ -222,6 +244,10 @@ MUTANTS = [
     ("the stalled-queue check",
      'if running == 0 and waiting and max(waiting) >= cfg["no_runner_minutes"]:', "if False:",
      "refuses and pages the owner when nothing is being served"),
+    ("looking twice before calling a box dead",
+     'if verdict == "no-runner":\n            pause = tunable(env, "RECHECK_SECONDS", RECHECK_SECONDS)',
+     'if False:\n            pause = tunable(env, "RECHECK_SECONDS", RECHECK_SECONDS)',
+     "does not call a box dead while it is between reviews"),
     ("the wait limit",
      'if eta >= cfg["max_wait_minutes"]:', "if False:",
      "refuses rather than accept a queue it cannot work through"),
