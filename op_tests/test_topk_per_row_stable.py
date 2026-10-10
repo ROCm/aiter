@@ -224,7 +224,10 @@ def check_decode_packed(num_rows, width, k, tie_level):
 def check_decode_cross_part_tie():
     """Stable merge must keep the smallest global indices across equal parts."""
     rows, width, k = 1, 131072, 512
-    logits = torch.ones((rows, width), dtype=torch.float32, device="cuda")
+    logits = torch.zeros((rows, width), dtype=torch.float32, device="cuda")
+    part_width = width // 2
+    part0_ties = k // 4
+    logits[0, part_width - part0_ties : part_width + k] = 1
     seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
     indices = torch.empty((rows, k), dtype=torch.int32, device="cuda")
     top_k_per_row_decode(
@@ -239,7 +242,13 @@ def check_decode_cross_part_tie():
         stable=True,
     )
     torch.cuda.synchronize()
-    ok = torch.equal(indices[0], torch.arange(k, dtype=torch.int32, device="cuda"))
+    expected = torch.arange(
+        part_width - part0_ties,
+        part_width + k - part0_ties,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    ok = torch.equal(indices[0], expected)
     print(f"[decode cross-part tie] smallest_indices={ok}")
     return ok
 

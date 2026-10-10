@@ -219,8 +219,8 @@ def build_radix_topk_one_block_body(
         input_row_iter points at the segment's first element; indices are
         reported as index_base + column. The hooks let one part of a split row
         reuse the body: row_labels (a buffer view) replaces the reported
-        indices and the compile-time write_row_values flag gates value writes.
-        The copy for rows no longer than k writes identity indices and is
+        indices and write_row_values gates value writes. The copy for rows no
+        longer than k writes identity indices and is
         intentionally disabled for labelled merge rows, which must be longer
         than k.
         """

@@ -458,9 +458,9 @@ def test_flydsl_decode_split_reuse():
     )
     row_starts = torch.zeros(num_rows, dtype=torch.int32)
 
-    def run(logits, indices, stable):
+    def run(logits, indices, stable, values=None):
         aiter.flydsl_top_k_per_row_decode(
-            logits, 1, seq_lens, indices, num_rows, width, 1, top_k, stable
+            logits, 1, seq_lens, indices, num_rows, width, 1, top_k, stable, values
         )
 
     def check(logits, indices, stable, what):
@@ -481,6 +481,22 @@ def test_flydsl_decode_split_reuse():
             run(logits, indices, stable)
             check(logits, indices, stable, f"eager call #{call_idx} stable={stable}")
 
+    logits = new_logits(34)
+    indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+    values = torch.empty((num_rows, top_k), dtype=torch.float32)
+    run(logits, indices, True, values)
+    reference = _decode_reference(logits, seq_lens, top_k)
+    assert compare_topk_results(
+        logits,
+        indices,
+        reference,
+        row_starts,
+        seq_lens,
+        top_k,
+        stable=True,
+        values=values,
+    ), "stable merge values mismatch"
+
     graphs, buffers = [], []
     for seed in (44, 55):
         logits = new_logits(seed)
@@ -488,25 +504,44 @@ def test_flydsl_decode_split_reuse():
         run(logits, indices, False)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            for _ in range(3):
-                run(logits, indices, False)
+            run(logits, indices, False)
         graphs.append(graph)
         buffers.append((logits, indices))
+    graph_buffers = list(zip(graphs, buffers))
     for replay in range(20):
-        for graph, (logits, indices) in zip(graphs, buffers):
+        # Replay the second graph first once: capture order must not initialize
+        # or otherwise affect another graph's counter.
+        replay_order = reversed(graph_buffers) if replay == 0 else graph_buffers
+        for graph, (logits, indices) in replay_order:
             logits.copy_(new_logits(100 + replay))
             graph.replay()
             check(logits, indices, False, f"graph replay #{replay}")
 
-    # A caller may capture without an eager warmup. This records one defensive
-    # counter zero-fill in the graph instead of rejecting the capture.
+    # Reproduce a temporary output view captured without warmup, followed by
+    # ordinary eager allocations before the first replay.
     logits = new_logits(58)
-    indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+    output_owner = torch.empty((num_rows + 1, top_k), dtype=torch.int32)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        run(logits, indices, False)
-    graph.replay()
-    check(logits, indices, False, "capture without warmup")
+        run(logits, output_owner[:num_rows], False)
+    victims = (
+        torch.full((num_rows, 16 * top_k), 17, dtype=torch.int32),
+        torch.full((num_rows, 16 * top_k), 19.0, dtype=torch.float32),
+        torch.full((num_rows,), 23, dtype=torch.int32),
+    )
+    for seed in (59, 60, 61):
+        eager_logits = new_logits(seed)
+        eager_indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+        run(eager_logits, eager_indices, False)
+        check(eager_logits, eager_indices, False, "eager after capture")
+    for replay in range(3):
+        logits.copy_(new_logits(80 + replay))
+        graph.replay()
+        torch.cuda.synchronize()
+        check(logits, output_owner[:num_rows], False, "temporary-view graph replay")
+        assert bool((victims[0] == 17).all())
+        assert bool((victims[1] == 19).all())
+        assert bool((victims[2] == 23).all())
 
     streams = [torch.cuda.Stream() for _ in range(2)]
     outs = []

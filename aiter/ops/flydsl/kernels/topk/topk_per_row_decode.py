@@ -10,8 +10,8 @@ candidates in the same launch. No CTA waits on another, so the grid never needs
 to be co-resident. Both the part and the merge run the one-block selector.
 """
 
-from collections import OrderedDict
-from functools import cache
+from functools import cache, lru_cache
+from threading import Lock
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -19,6 +19,7 @@ import torch
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.utility.graph_alloc import persistent_alloc
 
 from ..communication_ops_utils import (
     atomic_add_agent,
@@ -153,50 +154,44 @@ def build_topk_per_row_decode_module(
 
         def run_first_trip():
             # A direct row writes the final output; a part writes candidates.
-            # Do not select between fly.ptrs: arith.select on !fly.ptr leaves an
-            # unrealized_conversion_cast to !llvm.ptr beside llvm.gep uses.
             input_iter = fx.add_offset(
                 fx.get_iter(logits_row), packed_start + row_start
             )
             seg_len = row_end - row_start
-            if direct_row:
-                if const_expr(write_values):
-                    run_one_block_body(
-                        storage,
-                        input_iter,
-                        seg_len,
-                        final_indices,
-                        final_values,
-                        row_start,
-                        write_row_values=True,
-                    )
-                else:
-                    run_one_block_body(
-                        storage,
-                        input_iter,
-                        seg_len,
-                        final_indices,
-                        part_values,
-                        row_start,
-                        write_row_values=False,
-                    )
-            else:
-                part_offset = part * fx.Int32(k)
-                run_one_block_body(
-                    storage,
-                    input_iter,
-                    seg_len,
-                    fx.make_view(
-                        fx.add_offset(fx.get_iter(part_indices), part_offset),
-                        part_indices.layout,
-                    ),
-                    fx.make_view(
-                        fx.add_offset(fx.get_iter(part_values), part_offset),
-                        part_values.layout,
-                    ),
-                    row_start,
-                    write_row_values=True,
-                )
+            part_offset_bytes = fx.Int64(part * fx.Int32(k)) * fx.Int64(4)
+            index_addr = direct_row.select(
+                fx.Int64(ptrtoint(fx.get_iter(final_indices))),
+                fx.Int64(ptrtoint(fx.get_iter(part_indices))) + part_offset_bytes,
+            )
+            value_addr = direct_row.select(
+                fx.Int64(ptrtoint(fx.get_iter(final_values))),
+                fx.Int64(ptrtoint(fx.get_iter(part_values))) + part_offset_bytes,
+            )
+            index_ptr = fx.inttoptr(
+                fx.PointerType.get(
+                    fx.Int32.ir_type,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=4,
+                ),
+                index_addr,
+            )
+            value_ptr = fx.inttoptr(
+                fx.PointerType.get(
+                    fx.Float32.ir_type,
+                    address_space=fx.AddressSpace.Global,
+                    alignment=4,
+                ),
+                value_addr,
+            )
+            run_one_block_body(
+                storage,
+                input_iter,
+                seg_len,
+                fx.make_view(index_ptr, final_indices.layout),
+                fx.make_view(value_ptr, final_values.layout),
+                row_start,
+                write_row_values=fx.Boolean(write_values) | ~direct_row,
+            )
 
         def arrive(last_part):
             # Every wave drains its stores before lane 0 publishes the CTA.
@@ -277,53 +272,81 @@ def build_topk_per_row_decode_module(
     return launch_topk_per_row_decode_kernel
 
 
-_GRAPH_WORKSPACES_ATTR = "_aiter_flydsl_topk_decode_graph_workspaces"
-_MAX_EAGER_WORKSPACES = 16
-_EAGER_WORKSPACES: OrderedDict[tuple, tuple[torch.Tensor, ...]] = OrderedDict()
-
-
-def _allocate_workspace(indices, rows, columns):
+def _allocate_partials(device, rows, columns):
     return (
-        torch.empty((rows, columns), device=indices.device, dtype=torch.int32),
-        torch.empty((rows, columns), device=indices.device, dtype=torch.float32),
-        torch.zeros((rows,), device=indices.device, dtype=torch.int32),
+        torch.empty((rows, columns), device=device, dtype=torch.int32),
+        torch.empty((rows, columns), device=device, dtype=torch.float32),
     )
 
 
-def _get_workspace(indices, stream_id, rows, columns):
-    """Return stream-local eager storage or output-owned Graph storage."""
-    device = indices.device
+def _allocate_workspace(device, rows, columns):
+    return (
+        *_allocate_partials(device, rows, columns),
+        torch.zeros((rows,), device=device, dtype=torch.int32),
+    )
+
+
+@lru_cache(maxsize=16)
+def _get_cached_workspace(device, stream_id, rows, columns):
+    return _allocate_workspace(device, rows, columns)
+
+
+_COUNTER_LOCK = Lock()
+_COUNTER_RESERVES = {}
+_CAPTURE_COUNTERS = []
+_MAX_COUNTER_RESERVES = 16
+
+
+def _reserve_capture_counter(device, rows, columns):
+    """Keep one initialized counter ready for a later capture of this shape."""
+    key = (device, rows, columns)
+    with _COUNTER_LOCK:
+        if _COUNTER_RESERVES.get(key):
+            return
+        with persistent_alloc(device):
+            counter = torch.zeros((rows,), device=device, dtype=torch.int32)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(device))
+        _COUNTER_RESERVES.setdefault(key, []).append((counter, ready))
+        if len(_COUNTER_RESERVES) > _MAX_COUNTER_RESERVES:
+            del _COUNTER_RESERVES[next(iter(_COUNTER_RESERVES))]
+
+
+def _claim_capture_counter(device, rows, columns):
+    key = (device, rows, columns)
+    with _COUNTER_LOCK:
+        reserves = _COUNTER_RESERVES.get(key)
+        if not reserves:
+            return None
+        workspace = reserves.pop()
+        if not reserves:
+            del _COUNTER_RESERVES[key]
+        # A captured graph retains only raw pointers. Keep every claimed
+        # counter alive permanently; each capture gets a distinct counter.
+        _CAPTURE_COUNTERS.append(workspace)
+    counter, ready = workspace
+    torch.cuda.current_stream(device).wait_event(ready)
+    return counter
+
+
+def _get_workspace(device, stream_id, rows, columns):
+    """Use cached eager storage and capture-private partials/counters."""
     if torch.cuda.is_current_stream_capturing():
-        key = (stream_id, rows, columns)
-        workspaces = getattr(indices, _GRAPH_WORKSPACES_ATTR, None)
-        if workspaces is not None and key in workspaces:
-            return workspaces[key]
-        if workspaces is None:
-            workspaces = {}
-            setattr(indices, _GRAPH_WORKSPACES_ATTR, workspaces)
-
-        # Graph capture starts after a device synchronize. Claim a matching
-        # eager warmup workspace and remove it from the eager pool so a later
-        # eager call cannot race this Graph. Capture-first gets private storage.
-        workspace = None
-        for eager_key in reversed(_EAGER_WORKSPACES):
-            eager_device, _, eager_rows, eager_columns = eager_key
-            if (eager_device, eager_rows, eager_columns) == (device, rows, columns):
-                workspace = _EAGER_WORKSPACES.pop(eager_key)
-                break
-        if workspace is None:
-            workspace = _allocate_workspace(indices, rows, columns)
-        workspaces[key] = workspace
-        return workspace
-
-    key = (device, stream_id, rows, columns)
-    workspace = _EAGER_WORKSPACES.pop(key, None)
-    if workspace is None:
-        workspace = _allocate_workspace(indices, rows, columns)
-    _EAGER_WORKSPACES[key] = workspace
-    if len(_EAGER_WORKSPACES) > _MAX_EAGER_WORKSPACES:
-        _EAGER_WORKSPACES.popitem(last=False)
+        partials = _allocate_partials(device, rows, columns)
+        counters = _claim_capture_counter(device, rows, columns)
+        if counters is None:
+            # Capture-first remains safe: this zero-fill becomes a Graph node.
+            counters = torch.zeros((rows,), device=device, dtype=torch.int32)
+        return (*partials, counters)
+    workspace = _get_cached_workspace(device, stream_id, rows, columns)
+    _reserve_capture_counter(device, rows, columns)
     return workspace
+
+
+def clear_topk_per_row_decode_workspace_cache() -> None:
+    _get_cached_workspace.cache_clear()
+    with _COUNTER_LOCK:
+        _COUNTER_RESERVES.clear()
 
 
 def launch_topk_per_row_decode(
@@ -379,7 +402,7 @@ def launch_topk_per_row_decode(
         packed_rows=packed_rows,
     )
     partial_indices, partial_values, counters = _get_workspace(
-        indices, stream.cuda_stream, rows, parts * k
+        indices.device, stream.cuda_stream, rows, parts * k
     )
     _run_compiled(
         launcher,

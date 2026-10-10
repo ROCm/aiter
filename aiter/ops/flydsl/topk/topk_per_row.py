@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -16,14 +16,23 @@ from ..kernels.topk.radix_topk_one_block import (
     _MAX_ROW_ELEMENTS,
     build_radix_topk_one_block_module,
 )
-from ..kernels.topk.topk_per_row_decode import launch_topk_per_row_decode
+from ..kernels.topk.topk_per_row_decode import (
+    clear_topk_per_row_decode_workspace_cache as _clear_decode_workspace_cache,
+)
+from ..kernels.topk.topk_per_row_decode import (
+    launch_topk_per_row_decode,
+)
 from ..kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
 )
 
-# Crossover between the one-workgroup kernel and the split decode kernel.
+# Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
+
+
+def clear_topk_per_row_decode_workspace_cache() -> None:
+    _clear_decode_workspace_cache()
 
 
 @lru_cache(maxsize=128)
@@ -397,7 +406,7 @@ def flydsl_top_k_per_row_decode(
         values,
         arch,
         wave_size,
-        torch.cuda.get_device_properties(logits.device).multi_processor_count,
+        get_cu_num(),
         stream,
         packed,
     )
