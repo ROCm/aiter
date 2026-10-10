@@ -58,6 +58,8 @@ def drive(mod, scn):
             raise AssertionError("unexpected GET %s" % path)
 
         def _post(self, path, body, token):
+            if scn.get("post_raises"):              # a network error on the way out, not a 4xx
+                raise RuntimeError("connection reset")
             rec["posts"].append({"path": path, "body": body["body"], "token": token})
             return scn.get("post_status", 201)
 
@@ -176,8 +178,36 @@ CASES = [
      lambda r: [
          (r["ok"] is True, "a failure to measure the queue stopped an authorized review"),
          (r["verdict"] == "unmeasured", "verdict was %r" % r["verdict"]),
-         (any("could not measure" in m for m in r["warnings"]), "degraded without saying so"),
+         (any("RuntimeError" in m for m in r["warnings"]),
+          "degraded without naming the cause: %s" % r["warnings"]),
          (not r["posts"], "commented about a queue it could not read"),
+     ]),
+
+    # A repo var is a text box. An unusable value in it must never be more drastic than no value
+    # at all -- the watchdog learned this with STUCK_MINUTES, where one made it page about a
+    # healthy box. Here a bad one could refuse every review, or stop the bot outright.
+    ("falls back to the default when a tuning value is unusable",
+     dict(busy(0, 0), env={"MAX_WAIT_HOURS": "abc"}),
+     lambda r: [
+         (r["ok"] is True, "a typo in a repo variable stopped an authorized review"),
+         (r["verdict"] == "idle", "verdict was %r, not the normal one" % r["verdict"]),
+         (any("MAX_WAIT_HOURS" in m for m in r["warnings"]), "swapped in a default in silence"),
+     ]),
+
+    ("refuses nothing when a tuning value is zero",
+     dict(busy(0, 0), env={"MAX_WAIT_HOURS": "0"}),
+     lambda r: [
+         (r["ok"] is True, "a zero in a repo variable refused a review on an idle box"),
+         (not r["posts"], "told the requester an idle box was too deep"),
+     ]),
+
+    # The degrade has to cover the whole check, not just the measurement -- this one blows up
+    # after the queue has been read, on the way out.
+    ("lets the review through when posting the notice blows up",
+     dict(busy(1, 2), post_raises=True),
+     lambda r: [
+         (r["ok"] is True, "an error after the queue was read stopped an authorized review"),
+         (r["verdict"] == "unmeasured", "verdict was %r" % r["verdict"]),
      ]),
 
     ("still decides when the comment cannot be posted",
@@ -208,6 +238,9 @@ MUTANTS = [
      "except Exception as e:                                  # noqa: BLE001 - degrade, not crash",
      "except ZeroDivisionError as e:",
      "lets an authorized review through when the queue cannot be measured"),
+    ("the fallback for an unusable tuning value",
+     "if not math.isfinite(value) or value <= 0:", "if False:",
+     "falls back to the default when a tuning value is unusable"),
     ("the owner override",
      '(env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"', '"zufayu"',
      "pages the override owner when the repo sets one"),

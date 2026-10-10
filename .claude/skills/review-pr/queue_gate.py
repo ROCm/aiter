@@ -21,6 +21,7 @@ GITHUB_* that Actions sets for every step. Writes `ok` to GITHUB_OUTPUT.
 """
 
 import datetime
+import math
 import os
 import sys
 
@@ -41,6 +42,27 @@ def _age_minutes(stamp, now):
     t = datetime.datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(
         tzinfo=datetime.timezone.utc)
     return (now - t).total_seconds() / 60.0
+
+
+def tunable(env, name, default):
+    """Read a repo var that is a number, or fall back loudly.
+
+    These arrive from `vars.*`, which is a text box: a typo, a stray unit, or a well-meant `0`
+    all reach here as a string. The watchdog learned this the hard way with STUCK_MINUTES, where
+    an unusable value made the deadline expire before the first poll and paged the runner's owner
+    about a healthy box. An unusable value must never be more drastic than no value at all.
+    """
+    raw = (env.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        value = float("nan")
+    if not math.isfinite(value) or value <= 0:
+        print("::warning::%s=%r is not a usable number; using %s" % (name, raw, default))
+        return default
+    return value
 
 
 def survey(api, repo, own_run_id, now):
@@ -117,30 +139,31 @@ def run(api, env, now=None):
     if (env.get("AUTHORIZED") or "").strip().lower() != "true":
         return finish(False, "unauthorized")
 
-    now = now or datetime.datetime.now(datetime.timezone.utc)
-    cfg = {"avg_minutes": float(env.get("AVG_REVIEW_MINUTES") or AVG_REVIEW_MINUTES),
-           "max_wait_minutes": float(env.get("MAX_WAIT_HOURS") or MAX_WAIT_HOURS) * 60,
-           "no_runner_minutes": float(env.get("NO_RUNNER_MINUTES") or NO_RUNNER_MINUTES)}
-
-    repo = env["GITHUB_REPOSITORY"]
-    # Authorization fails closed; this does not. Refusing every review because the queue could
-    # not be measured would turn a bug in this file into an outage of the whole bot, and the
-    # thing it guards against -- a request lost in a long queue -- is rarer than that.
+    # Authorization fails closed; everything from here does not. Refusing every review because
+    # some part of the queue check broke would turn one bug in this file into an outage of the
+    # whole bot -- a worse failure than the one it guards against, which is a single request lost
+    # in a long queue. So the whole of it degrades, not just the API call: a missing variable, an
+    # unparseable one, a network error on the way out.
     try:
+        now = now or datetime.datetime.now(datetime.timezone.utc)
+        cfg = {"avg_minutes": tunable(env, "AVG_REVIEW_MINUTES", AVG_REVIEW_MINUTES),
+               "max_wait_minutes": tunable(env, "MAX_WAIT_HOURS", MAX_WAIT_HOURS) * 60,
+               "no_runner_minutes": tunable(env, "NO_RUNNER_MINUTES", NO_RUNNER_MINUTES)}
+        repo = env["GITHUB_REPOSITORY"]
         running, waiting = survey(api, repo, int(env["GITHUB_RUN_ID"]), now)
+        verdict, ahead, eta = decide(running, waiting, cfg)
+
+        if verdict == "idle":
+            return finish(True, verdict)    # starts at once; a comment would be noise
+
+        owner = (env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"
+        status = api.comment(repo, env["PR"], message(verdict, ahead, eta, owner))
+        if not 200 <= status < 300:
+            print("::warning::could not post the queue notice: %s" % status)
+        return finish(verdict == "queued", verdict)
     except Exception as e:                                  # noqa: BLE001 - degrade, not crash
-        print("::warning::could not measure the queue (%s: %s); proceeding" % (type(e).__name__, e))
+        print("::warning::the queue check failed (%s: %s); proceeding" % (type(e).__name__, e))
         return finish(True, "unmeasured")
-    verdict, ahead, eta = decide(running, waiting, cfg)
-
-    if verdict == "idle":
-        return finish(True, verdict)        # starts at once; a comment would be noise
-
-    owner = (env.get("OWNER_OVERRIDE") or "").strip() or "zufayu"
-    status = api.comment(repo, env["PR"], message(verdict, ahead, eta, owner))
-    if not 200 <= status < 300:
-        print("::warning::could not post the queue notice: %s" % status)
-    return finish(verdict == "queued", verdict)
 
 
 def main():
