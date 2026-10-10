@@ -164,8 +164,8 @@ python op_tests/op_benchmarks/triton/bench_gemm_a8w8_blockscale.py [-gluon]
 The wrapper dispatches by `(nhead, kv_c.dtype)` to one of three compile-time regimes (single `@gluon.jit` kernel, REGIME constexpr gates layouts and grid mapping):
 
 - **`bh64`** (`nhead in {64, 128}`): bf16 KV, BLOCK_H=64, BLOCK_N=64, multi-batch + XCD-aware 3-D grid. `NUM_KV_SPLITS` auto-picked &isin; {1, 2, 4} so the launch fills ~256 workgroups (one wave on MI350). When `NUM_KV_SPLITS == 1`, stage-1 writes the final attention output directly to `o` (no temp buffer, no reduce). When `NUM_KV_SPLITS > 1`, stage-1 writes per-split `(acc, fp32 lse)` and stage-2 (`_mla_softmax_reducev_kernel`) reduces them into `o`.
-- **`bh16bn128`** (`nhead &le; 16`, `batch_size == 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 2-D grid `(1, NUM_KV_SPLITS)` with token-bound `NUM_KV_SPLITS = max(1, min(256, min_kv_seq_len))` — 256 for the normal long-context path, reduced only for small kv (`min_kv_seq_len < 256`) so every split stays non-empty. Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
-- **`bh16bn64`** (`nhead &le; 16`, bf16 KV): BLOCK_H=16, BLOCK_N=64, 2-D grid `(batch_size, NUM_KV_SPLITS)` with block-bound `NUM_KV_SPLITS = max(1, min(256 // batch_size, cdiv(min_kv_seq_len, BLOCK_N)))` — fills ~256 WGs but never splits a sequence into more than its 64-token block count, so small kv is supported and it collapses to 1 (one WG per batch over the whole sequence) when `min_kv_seq_len <= 64`. Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
+- **`bh16bn128`** (`nhead &le; 96`, `batch_size &ge; 1`, fp8 KV): BLOCK_H=16, BLOCK_N=128, 3-D grid `(batch_size, NUM_KV_SPLITS, cdiv(nhead, BLOCK_H) * qlen)`, `NUM_KV_SPLITS` is a launch budget: by default `max(1, 256 // (batch_size * qlen * cdiv(nhead, BLOCK_H)))`, which fills ~256 workgroups but collapses to 1 once the head blocks and MTP positions already exceed a wave. Pass `kv_len_hint` to pick it from a cost model instead (see **KV split budget** below). Optional `kv_scale` dequant. Stage-2 reduce runs whenever `NUM_KV_SPLITS > 1` (skipped via the fast path only at `min_kv_seq_len == 1`). Supports the general case `num_iter &isin; {1, 2, ...}` (no `gl.assume(num_iter >= 3)`). `NHEAD < BLOCK_H` masks OOB heads on Q load and O store (wasted MFMA lanes are free; this regime is memory-bound).
+- **`bh16bn64`** (`nhead &le; 96`, bf16 KV): BLOCK_H=16, BLOCK_N=64, the same 3-D grid and the same `NUM_KV_SPLITS` budget as `bh16bn128` (occupancy-only by default, cost-model when `kv_len_hint` is given). Use when KV is kept in bf16 (no fp8 quant). Same `NHEAD < BLOCK_H` masking. Full decode (stage-1, plus stage-2 reduce into `o` when `NUM_KV_SPLITS > 1`).
 
 All three regimes run the full decode and dsv4 prefill. `return_lse=True` also returns the merged fp32 lse `[batch, nhead]`, so `mla_gluon(...)` returns `(o, final_lse)` instead of `(o, None)`.
 
@@ -177,17 +177,39 @@ Modified from [FlashMLA](https://github.com/deepseek-ai/FlashMLA/blob/main/bench
 | Q dtype | bf16 | bf16 | bf16 |
 | KV dtype | bf16 | fp8 | bf16 |
 | Output | bf16 | bf16 | bf16 |
-| batch_size | 64, 128, or 256 | 1 | &ge; 1 |
-| nhead | 64 or 128 | &le; 16 (tested: 4, 8, 16) | &le; 16 (tested: 4, 8, 16) |
+| batch_size | 64, 128, or 256 | &ge; 1 | &ge; 1 |
+| nhead | 64 or 128 | &le; 96 (tested: 4, 8, 16, 96) | &le; 96 (tested: 4, 8, 16, 96) |
 | Page size | 1 | 1 | 1 |
 | BLOCK_H | 64 | 16 | 16 |
 | BLOCK_N | 64 | 128 | 64 |
 | MFMA | 16&times;16&times;32, warps=[4,1] | 16&times;16&times;32, warps=[1,4] | 16&times;16&times;32, warps=[1,4] |
-| Grid | 3-D XCD-aware | 2-D `(1, NUM_KV_SPLITS)` | 2-D `(batch, NUM_KV_SPLITS)` |
-| NUM_KV_SPLITS | auto &isin; {1, 2, 4} from (batch, nhead) | `max(1, min(256, min_kv_seq_len))` (token-bound; 256 for ctx &ge; 256) | `max(1, min(256 // batch_size, cdiv(min_kv_seq_len, 64)))` (block-bound; collapses to 1 for ctx &le; 64) |
+| Grid | 3-D XCD-aware | 3-D `(batch, NUM_KV_SPLITS, cdiv(nhead,16)*qlen)` | same as `bh16bn128` |
+| NUM_KV_SPLITS | auto &isin; {1, 2, 4} from (batch, nhead) | `max(1, 256 // (batch*qlen*cdiv(nhead,16)))`, or cost-model from `kv_len_hint` | same as `bh16bn128` |
 | `kv_scale` | unused (pass 1.0) | dequant scale folded into `qk_scale` (applied before softmax for fp8 correctness) | unused (pass 1.0) |
 | Seq constraint | `min_kv_seq_len > NUM_KV_SPLITS * (3 * BLOCK_N + NUM_KV_SPLITS)` (the `3` matches the kernel's `gl.assume(num_iter > 3)`) | `min_kv_seq_len &ge; 1` (small kv 1..256 supported; token-bound clamp keeps splits non-empty) | `min_kv_seq_len &ge; 1` (small kv 1..256 supported; block-bound clamp keeps splits non-empty) |
 | Stage-2 reduce | skipped when `NUM_KV_SPLITS == 1` | skipped when `NUM_KV_SPLITS == 1` (i.e. `min_kv_seq_len == 1`) | skipped when `NUM_KV_SPLITS == 1` |
+
+**KV split budget (`bh16*` regimes):** `NUM_KV_SPLITS` only sizes the launch; the
+kernel partitions with `kv_len_per_split = max(BLOCK_N, seq // NUM_KV_SPLITS)` and
+derives `active_kv_splits` from the runtime length, so a budget larger than the
+sequence can support is wasteful but not wrong.
+
+By default the budget is occupancy-only, `max(1, 256 // (batch_size * qlen * cdiv(nhead, BLOCK_H)))`.
+It is deliberately independent of sequence length so CUDA Graph capture cannot
+freeze a value derived from one capture's sequence lengths. The cost of knowing
+nothing about the context is that the floor collapses to a single split as soon
+as the unsplit grid passes half a wave: `256 // base_grid` is already 1 for
+`base_grid >= 129`, which with `nhead=96` (six head blocks per query position)
+means `batch*qlen >= 22`. From there every workgroup walks the whole context
+while most of the GPU sits idle.
+
+Callers that can name a representative length may pass `kv_len_hint` and get the
+split count from a cost model instead: the walk costs
+`cdiv(base_grid * s, 256) * cdiv(max(BLOCK_N, kv_len / s), BLOCK_N)` (waves times
+the kernel's own per-split iteration count), against `base_grid * s` partials
+that stage 2 must read back. The hint is a host scalar, not a device tensor, so a
+CUDA Graph caller can pass its capacity and the pick stays fixed across replays.
+Left as `None` the budget is unchanged.
 
 **Page table modes** (`use_2d_view`, both regimes):
 - `True`: `page_table = block_table [batch, max_seqlen]`, `seq_info = cache_seqlens [batch]`. Use for fixed-length or pre-padded variable-length sequences.
