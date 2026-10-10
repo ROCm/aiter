@@ -208,7 +208,6 @@ def parse_int_or_list(value):
 
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="fused_qk_cat_and_cache_mla")
-    parser.set_defaults(metric="time")
     parser.add_argument(
         "-M",
         type=parse_int_or_list,
