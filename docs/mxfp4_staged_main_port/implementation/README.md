@@ -1,0 +1,25 @@
+# Current implementation evidence
+
+Implementation branch: `integration/mxfp4-staged-main-port`, worktree `/root/workspace/tmp_dev/aiter-mxfp4-integration`, fixed main base `882ea79dd7cc7091f859a5bedac914523ac77bbd`. The original source branch/worktree and existing experiments are preserved. The integration tree contains the current specification and four tickets under `.scratch/mxfp4-staged-main-port/`; only the primary coordinator writes their state and Answers.
+
+## Environment and baseline
+
+[toolchain.json](toolchain.json) records the new dedicated Python environment and package versions. It inherits the host ROCm 7.1 Torch/Triton packages, installs FlyDSL 0.3.4.1 from a retained wheel and adds only tools to this dedicated environment. The original `/opt/venv` and historical cross environment are unchanged. `CK_DIR` points to the preserved original checkout for read-only headers; new integration worktrees initially have an empty CK submodule.
+
+The host Torch 2.8 environment contains Triton 3.4. The repository-supported `AITER_USE_SYSTEM_TRITON=1` override permits imports with a version warning. Controlled lifecycle tests execute no GPU kernels; this warning does not establish numerical or deployment acceptance. Every required MXFP4 GPU path must be verified on the current integration implementation. Any actual unsupported API/path remains an acceptance failure until addressed.
+
+Baseline shared infrastructure checks were run before ticket-01 code changes on documentation-only integration commit `559e83fa7d750204a9164cdf97777c830fa760ff`: 55 tests passed in 19.311 seconds. [baseline-infra.log.txt](baseline-infra.log.txt) retains output. These tests exercise shared infrastructure and simulated process logic; module import builds the CPU enum/core extension and requires ROCm/FlyDSL imports. No GPU kernel tuning or measurement was performed.
+
+```bash
+env PATH=/root/workspace/tmp_dev/mxfp4-port-env/bin:$PATH \
+  AITER_USE_SYSTEM_TRITON=1 \
+  CK_DIR=/root/workspace/tmp_dev/aiter/3rdparty/composable_kernel \
+  AITER_JIT_DIR=/root/workspace/tmp_dev/mxfp4-port-notes/baseline-jit \
+  python -m unittest op_tests.tuning_tests.test_tuner_infra \
+    op_tests.tuning_tests.test_compare_logic \
+    op_tests.tuning_tests.test_mp_tuner_logic -v
+```
+
+Physical target for all subsequent real tasks: `ROCR_VISIBLE_DEVICES=GPU-5d8a72a332aa124c`, `HIP_VISIBLE_DEVICES=0`, expected PCI `0000:f5:00.0`, gfx950/256 CUs. Monitoring-only exploration confirmed this identity and one idle sample; every real task needs its own fresh idle check and child PCI verification. GPU execution is coordinated sequentially by the primary agent.
+
+Baseline results and environment preparation are not completion evidence for tickets 02–04 or the 27-search calibration. Ticket-specific records will identify implementation commits, command/configuration, measurement conditions, exit status, numerical, exact production and precompiled outcomes.
