@@ -6,7 +6,7 @@ from aiter.aot.flydsl.common import collect_aot_jobs, run_jobs_parallel
 from aiter.aot.flydsl.mxfp4_moe import compile_one_config, parse_csv
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", nargs="+", required=True)
     parser.add_argument("--swiglu-limit", type=float, default=None)

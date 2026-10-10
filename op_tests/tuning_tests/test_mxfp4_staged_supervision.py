@@ -9,6 +9,9 @@ GPU visibility. The only admitted worker targets are the CPU functions below.
 import multiprocessing
 import os
 import threading
+from collections.abc import Callable
+from multiprocessing.connection import Connection
+from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
 from types import SimpleNamespace
 
@@ -22,7 +25,10 @@ _GET_CONTEXT = multiprocessing.get_context
 _PROCESS_START = BaseProcess.start
 
 
-def cpu_result_worker(payload, result_tx):
+def cpu_result_worker(
+    payload: "tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]",
+    result_tx: "Connection",
+) -> "None":
     keys, row, args, gpu = payload
     del keys, args
     try:
@@ -31,7 +37,10 @@ def cpu_result_worker(payload, result_tx):
         result_tx.close()
 
 
-def cpu_coordinated_worker(payload, result_tx):
+def cpu_coordinated_worker(
+    payload: "tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]",
+    result_tx: "Connection",
+) -> "None":
     keys, row, args, gpu = payload
     del keys
     try:
@@ -44,7 +53,10 @@ def cpu_coordinated_worker(payload, result_tx):
         result_tx.close()
 
 
-def cpu_outcome_worker(payload, result_tx):
+def cpu_outcome_worker(
+    payload: "tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]",
+    result_tx: "Connection",
+) -> "None":
     keys, row, args, gpu = payload
     del keys, args
     try:
@@ -66,10 +78,10 @@ CPU_WORKERS = {cpu_result_worker, cpu_coordinated_worker, cpu_outcome_worker}
 
 
 @pytest.fixture(autouse=True)
-def allow_only_explicit_cpu_shape_workers(monkeypatch):
+def allow_only_explicit_cpu_shape_workers(monkeypatch: "pytest.MonkeyPatch") -> "None":
     lifecycle.prohibit_real_shape_workers_and_gpu_data.__wrapped__(monkeypatch)
 
-    def cpu_only_start(process):
+    def cpu_only_start(process: "BaseProcess") -> "None":
         if process._target not in CPU_WORKERS:
             pytest.fail("supervisor test attempted a non-CPU worker target")
         return _PROCESS_START(process)
@@ -77,11 +89,15 @@ def allow_only_explicit_cpu_shape_workers(monkeypatch):
     monkeypatch.setattr(BaseProcess, "start", cpu_only_start)
 
 
-def payloads(*rows, args=None):
+def payloads(
+    *rows: "object", args: "SimpleNamespace | None" = None
+) -> "list[tuple[tuple[str, ...], dict[str, object], SimpleNamespace, None]]":
     return [(tuple(row), row, args or SimpleNamespace(), None) for row in rows]
 
 
-def test_staged_supervisor_empty_batch_launches_none_and_one_shape_gets_worker_pid():
+def test_staged_supervisor_empty_batch_launches_none_and_one_shape_gets_worker_pid() -> (
+    "None"
+):
     ctx = _GET_CONTEXT("spawn")
     assert moe._run_staged_shapes_isolated([], 1, ctx, entry=cpu_result_worker) == []
     results = moe._run_staged_shapes_isolated(
@@ -92,13 +108,15 @@ def test_staged_supervisor_empty_batch_launches_none_and_one_shape_gets_worker_p
 
 
 class TrackingProcess:
-    def __init__(self, process, gpu, context):
+    def __init__(
+        self, process: "BaseProcess", gpu: "int", context: "TrackingContext"
+    ) -> "None":
         self.process, self.gpu, self.context = process, gpu, context
         self.closed = False
         self.joined = False
         self.saved_exitcode = None
 
-    def start(self):
+    def start(self) -> "None":
         outstanding = [proc for proc in self.context.processes if not proc.closed]
         self.context.handle_counts.append(len(outstanding))
         self.context.starts.append(self.gpu)
@@ -107,28 +125,28 @@ class TrackingProcess:
             raise self.context.start_failure
         self.process.start()
 
-    def join(self, *args, **kwargs):
+    def join(self, *args: "object", **kwargs: "object") -> "None":
         self.process.join(*args, **kwargs)
         self.joined = True
 
-    def close(self):
+    def close(self) -> "None":
         self.saved_exitcode = self.process.exitcode
         self.process.close()
         self.closed = True
 
     @property
-    def exitcode(self):
+    def exitcode(self) -> "int | None":
         return self.saved_exitcode if self.closed else self.process.exitcode
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: "str") -> "object":
         return getattr(self.process, name)
 
 
 class TrackingConnection:
-    def __init__(self, connection, context):
+    def __init__(self, connection: "Connection", context: "TrackingContext") -> "None":
         self.connection, self.context = connection, context
 
-    def recv_bytes(self):
+    def recv_bytes(self) -> "bytes":
         if self.context.receive_failure is not None:
             raise self.context.receive_failure
         payload = self.connection.recv_bytes()
@@ -137,17 +155,17 @@ class TrackingConnection:
             self.context.received.notify_all()
         return b"invalid-pickle" if self.context.invalid_payload else payload
 
-    def close(self):
+    def close(self) -> "None":
         self.connection.close()
         if self.context.close_failure is not None:
             raise self.context.close_failure
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: "str") -> "object":
         return getattr(self.connection, name)
 
 
 class TrackingContext:
-    def __init__(self, base):
+    def __init__(self, base: "BaseContext") -> "None":
         self.base = base
         self.processes = []
         self.pipes = []
@@ -160,35 +178,39 @@ class TrackingContext:
         self.close_failure = None
         self.invalid_payload = False
 
-    def Pipe(self, *args, **kwargs):
+    def Pipe(
+        self, *args: "object", **kwargs: "object"
+    ) -> "tuple[TrackingConnection, Connection]":
         rx, tx = self.base.Pipe(*args, **kwargs)
         result = TrackingConnection(rx, self), tx
         self.pipes.append(result)
         return result
 
-    def Process(self, *args, **kwargs):
+    def Process(self, *args: "object", **kwargs: "object") -> "TrackingProcess":
         process = TrackingProcess(
             self.base.Process(*args, **kwargs), kwargs["args"][0][3], self
         )
         self.processes.append(process)
         return process
 
-    def wait_until_received(self, count):
+    def wait_until_received(self, count: "int") -> "bool":
         with self.received:
             return self.received.wait_for(
                 lambda: self.receive_count >= count, timeout=20
             )
 
-    def assert_closed(self):
+    def assert_closed(self) -> "None":
         assert all(process.closed for process in self.processes)
         assert all(endpoint.closed for pipe in self.pipes for endpoint in pipe)
 
 
-def run_in_thread(operation):
+def run_in_thread(
+    operation: "Callable[[], object]",
+) -> "tuple[threading.Thread, list[object], list[BaseException]]":
     result = []
     errors = []
 
-    def run():
+    def run() -> "None":
         try:
             result.append(operation())
         except BaseException as error:  # noqa: BLE001 - transport test-thread failures
@@ -199,7 +221,7 @@ def run_in_thread(operation):
     return thread, result, errors
 
 
-def test_result_arrival_keeps_gpu_and_process_owned_until_exit():
+def test_result_arrival_keeps_gpu_and_process_owned_until_exit() -> "None":
     base = _GET_CONTEXT("spawn")
     args = SimpleNamespace(allow_exit=base.Event())
     ctx = TrackingContext(base)
@@ -224,7 +246,7 @@ def test_result_arrival_keeps_gpu_and_process_owned_until_exit():
     ctx.assert_closed()
 
 
-def test_different_gpu_workers_overlap_and_all_completed_handles_close():
+def test_different_gpu_workers_overlap_and_all_completed_handles_close() -> "None":
     base = _GET_CONTEXT("spawn")
     args = SimpleNamespace(allow_exit=base.Event(), barrier=base.Barrier(2))
     ctx = TrackingContext(base)
@@ -249,7 +271,7 @@ def test_different_gpu_workers_overlap_and_all_completed_handles_close():
     ctx.assert_closed()
 
 
-def test_one_slot_uses_fresh_worker_and_bounded_handles_for_every_shape():
+def test_one_slot_uses_fresh_worker_and_bounded_handles_for_every_shape() -> "None":
     ctx = TrackingContext(_GET_CONTEXT("spawn"))
     results = moe._run_staged_shapes_isolated(
         payloads(*[{"token": i} for i in range(4)]), 1, ctx, entry=cpu_result_worker
@@ -260,7 +282,9 @@ def test_one_slot_uses_fresh_worker_and_bounded_handles_for_every_shape():
     ctx.assert_closed()
 
 
-def test_fatal_clean_eof_python_failure_and_result_before_fatal_continue_later_rows():
+def test_fatal_clean_eof_python_failure_and_result_before_fatal_continue_later_rows() -> (
+    "None"
+):
     ctx = TrackingContext(_GET_CONTEXT("spawn"))
     results = moe._run_staged_shapes_isolated(
         payloads(
@@ -290,7 +314,9 @@ def test_fatal_clean_eof_python_failure_and_result_before_fatal_continue_later_r
         "deserialize",
     ],
 )
-def test_unexpected_receive_and_deserialization_failure_clean_owned_workers(failure):
+def test_unexpected_receive_and_deserialization_failure_clean_owned_workers(
+    failure: "Exception | str",
+) -> "None":
     base = _GET_CONTEXT("spawn")
     args = SimpleNamespace(allow_exit=base.Event())
     ctx = TrackingContext(base)
@@ -318,13 +344,13 @@ def test_unexpected_receive_and_deserialization_failure_clean_owned_workers(fail
     "failure", [KeyboardInterrupt("parent cancelled"), RuntimeError("wait failed")]
 )
 def test_parent_cancellation_or_wait_failure_stops_launches_and_preserves_exception(
-    monkeypatch, failure
-):
+    monkeypatch: "pytest.MonkeyPatch", failure: "Exception | str"
+) -> "None":
     base = _GET_CONTEXT("spawn")
     ctx = TrackingContext(base)
     args = SimpleNamespace(allow_exit=base.Event())
 
-    def fail_wait(*args, **kwargs):
+    def fail_wait(*args: "object", **kwargs: "object") -> "None":
         raise failure
 
     monkeypatch.setattr(moe, "wait_for_connections", fail_wait)
@@ -340,7 +366,7 @@ def test_parent_cancellation_or_wait_failure_stops_launches_and_preserves_except
     ctx.assert_closed()
 
 
-def test_start_failure_closes_created_process_and_both_pipe_endpoints():
+def test_start_failure_closes_created_process_and_both_pipe_endpoints() -> "None":
     ctx = TrackingContext(_GET_CONTEXT("spawn"))
     ctx.start_failure = RuntimeError("CPU spawn failed")
     with pytest.raises(RuntimeError) as actual:
@@ -351,7 +377,7 @@ def test_start_failure_closes_created_process_and_both_pipe_endpoints():
     ctx.assert_closed()
 
 
-def test_start_failure_survives_pipe_close_failure_during_cleanup():
+def test_start_failure_survives_pipe_close_failure_during_cleanup() -> "None":
     ctx = TrackingContext(_GET_CONTEXT("spawn"))
     ctx.start_failure = RuntimeError("CPU spawn failed")
     ctx.close_failure = ValueError("receive endpoint close failed")
@@ -368,8 +394,12 @@ def test_start_failure_survives_pipe_close_failure_during_cleanup():
     [(0, 3, 3, 1), (-1, 3, 3, 1), (8, 1, 3, 1), (8, 3, 2, 2), (2, 3, 3, 2)],
 )
 def test_staged_scheduler_preserves_main_mp_cap_and_uses_preflighted_first_visible_gpus(
-    monkeypatch, mp, shape_count, gpu_count, expected
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    mp: "int",
+    shape_count: "int",
+    gpu_count: "int",
+    expected: "object",
+) -> "None":
     identities = [("gfx950", 256)] * expected + [("gfx942", 304)] * (
         gpu_count - expected
     )
@@ -377,7 +407,9 @@ def test_staged_scheduler_preserves_main_mp_cap_and_uses_preflighted_first_visib
         tuner = moe.Mxfp4FlydslTuner("mxfp4", lifecycle.KEYS, lifecycle.RESULTS)
         observed = []
 
-        def schedule(batch, slots, ctx):
+        def schedule(
+            batch: "list[dict[str, object]]", slots: "int", ctx: "BaseContext"
+        ) -> "list[dict[str, object]]":
             observed.append((slots, len(batch)))
             return [dict(row, us=3.0) for _, row, _, _ in batch]
 
@@ -391,13 +423,15 @@ def test_staged_scheduler_preserves_main_mp_cap_and_uses_preflighted_first_visib
 
 
 def test_staged_single_slot_uses_first_visible_gpu_and_empty_batch_never_schedules(
-    monkeypatch,
-):
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     with lifecycle.devices(("gfx950", 224), ("gfx942", 304), current=1):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", lifecycle.KEYS, lifecycle.RESULTS)
         launches = []
 
-        def schedule(batch, slots, ctx):
+        def schedule(
+            batch: "list[dict[str, object]]", slots: "int", ctx: "BaseContext"
+        ) -> "list[dict[str, object]]":
             launches.append(slots)
             return [
                 dict(row, gfx="gfx950", cu_num=224, us=3.0) for _, row, _, _ in batch
@@ -410,11 +444,13 @@ def test_staged_single_slot_uses_first_visible_gpu_and_empty_batch_never_schedul
     assert launches == [1] and results[0]["cu_num"] == 224
 
 
-def test_staged_rejects_unsupported_participant_before_scheduler(monkeypatch):
+def test_staged_rejects_unsupported_participant_before_scheduler(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     with lifecycle.devices(("gfx950", 256), ("gfx942", 304)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", lifecycle.KEYS, lifecycle.RESULTS)
 
-        def forbidden(*args, **kwargs):
+        def forbidden(*args: "object", **kwargs: "object") -> "None":
             pytest.fail("unsupported staged participant reached scheduling")
 
         monkeypatch.setattr(moe, "_run_staged_shapes_isolated", forbidden)
@@ -426,11 +462,13 @@ def test_staged_rejects_unsupported_participant_before_scheduler(monkeypatch):
             )
 
 
-def test_staged_result_remains_readable_when_process_exit_precedes_receive(monkeypatch):
+def test_staged_result_remains_readable_when_process_exit_precedes_receive(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     ctx = TrackingContext(_GET_CONTEXT("spawn"))
     observed = []
 
-    def wait_after_exit(waitables):
+    def wait_after_exit(waitables: "list[object]") -> "list[object]":
         from multiprocessing.connection import wait
 
         process = next(proc for proc in ctx.processes if not proc.closed)

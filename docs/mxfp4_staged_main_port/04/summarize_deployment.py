@@ -10,7 +10,7 @@ from itertools import pairwise
 from pathlib import Path
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--root", type=Path, default=Path(__file__).resolve().parents[3]
@@ -177,7 +177,7 @@ def main():
         "",
         "ConfiguredFP8 reduce winners record unweighted packedFP8 routes and final exactly-once route weighting; configuredFP4 scatter winners record packed payload/scales and complete quantized scatter. Both-flags reduce winners retainFP8 output. Required scatter/atomic combinations and active limit5 clamp fixtures remain separately covered by ticket03; winner replay supplies the same configured limit as its search.",
         "",
-        "Targeted alternating pair checks, corrected omitted-argument Situv2 replay and finalStandards/Spec review are separate remaining gates; this completed winner-deployment record does not close ticket04 before them.",
+        "Corrected omitted-argumentSituv2 production/run-only retries also passed with actual4/25 defaults, retained separately in situv2-public-defaults.md. All10 targeted alternating pair checks passed60 finite normal kernel-sum profiles, with median/dispersion/rank analysis in targeted-summary.md. FinalStandards/Spec review is the remaining closing gate.",
     ]
     (base / "deployment-summary.md").write_text("\n".join(lines) + "\n")
 

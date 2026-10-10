@@ -2,6 +2,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Offline behavioral checks for the acceptance task controller."""
 
+from types import ModuleType
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pytest
+
+
 import importlib.util
 import os
 import signal
@@ -10,7 +17,7 @@ import sys
 from pathlib import Path
 
 
-def controller():
+def controller() -> "ModuleType":
     path = Path(__file__).with_name("run_gpu_task.py")
     spec = importlib.util.spec_from_file_location("run_gpu_task", path)
     module = importlib.util.module_from_spec(spec)
@@ -18,7 +25,12 @@ def controller():
     return module
 
 
-def sample(*, use=0, memory=297766912, processes=()):
+def sample(
+    *,
+    use: "int" = 0,
+    memory: "int" = 297766912,
+    processes: "tuple[dict[str, object], ...]" = (),
+) -> "dict[str, object]":
     return {
         "status": {
             "Unique ID": "0x5d8a72a332aa124c",
@@ -30,7 +42,7 @@ def sample(*, use=0, memory=297766912, processes=()):
     }
 
 
-def test_idle_gate_distinguishes_discovery_from_real_gpu_work():
+def test_idle_gate_distinguishes_discovery_from_real_gpu_work() -> "None":
     task = controller()
     assert task.is_idle(sample())
     assert task.is_idle(
@@ -43,7 +55,7 @@ def test_idle_gate_distinguishes_discovery_from_real_gpu_work():
     assert not task.is_idle(sample(processes=[{"cu_occupancy": 1}]))
 
 
-def test_physical_identity_requires_uuid_and_pci():
+def test_physical_identity_requires_uuid_and_pci() -> "None":
     task = controller()
     assert task.identity_matches(sample())
     wrong = sample()
@@ -54,14 +66,16 @@ def test_physical_identity_requires_uuid_and_pci():
     assert not task.identity_matches(wrong)
 
 
-def test_cancellation_stops_the_owned_process_group_before_waiting(monkeypatch):
+def test_cancellation_stops_the_owned_process_group_before_waiting(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     task = controller()
     observed = []
 
     class Process:
         pid = 123
 
-        def wait(self):
+        def wait(self) -> "None":
             observed.append("wait")
 
     monkeypatch.setattr(task.os, "killpg", lambda pid, sig: observed.append((pid, sig)))
@@ -69,7 +83,7 @@ def test_cancellation_stops_the_owned_process_group_before_waiting(monkeypatch):
     assert observed == [(123, task.signal.SIGTERM), "wait", (123, task.signal.SIGKILL)]
 
 
-def test_unavailable_occupancy_uses_remaining_idle_evidence():
+def test_unavailable_occupancy_uses_remaining_idle_evidence() -> "None":
     task = controller()
     discovery = {
         "mem_usage": {"value": 0},
@@ -81,7 +95,7 @@ def test_unavailable_occupancy_uses_remaining_idle_evidence():
     assert not task.is_idle(sample(processes=[dict(discovery, mem_usage={"value": 1})]))
 
 
-def test_cancellation_cleans_a_cpu_descendant(tmp_path):
+def test_cancellation_cleans_a_cpu_descendant(tmp_path: "Path") -> "None":
     task = controller()
     pid_file = tmp_path / "descendant.pid"
     child_code = (

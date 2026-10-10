@@ -1,0 +1,12 @@
+# Final review repairs
+
+The single review-fix implementer started at integration5b09efe5f2843edd0ce104531c55f2fe9e41e3e5 and addressed all findings from the retained Standards and Spec reviews. These changes preserve current-port candidate/search/kernel/CSV behavior and do not repeat the27-search calibration.
+
+- S1: all308 newly wholly untyped signatures plus the optionalAOT `parse_csv` return now carry lightweight types. DataFrame/Series, Namespace, mappings, paths, process/connections, callables and actualCPU fixture returns are named directly. GPU types are imported only for typing where needed; unchanged legacy signatures are untouched. `annotation-equivalence.txt` proves the30-file types-only patch retains identical executableAST after removing annotations/type imports; `signature-inventory-check.txt` accounts for all309 original identities and moved fingerprints.
+- S2: the three executable replay tools share tensor fingerprints, and the two synchronized trace readers share raw real-kernel aggregation. Individual fixture generation, warmup, profiling/call synchronization, main`get_trace_perf` aggregation and result contracts remain local. `replay-flow-equivalence.txt` records preserved measurement flow; two worked-literal/CPU-byte tests passed after their retained red run.
+- S3: named immutable`FixtureRequest` fields replace the11-value anonymous tuple contract. Empty-visibility offline generation reproduces all22 admitted fixture metadata/configuration rows by stableid. Measured timing/error/roofline values remain untouched originalGPU evidence.
+- Spec documentation: the acceptance reference now links measured27-search totals, and the deployment report generator reflects completedSituv2/targeted checks. Tracker state and finalAnswers remain root-owned.
+
+Validation after the repairs:294 controlled checks passed in104.08s with48 existing toolchain/Pandas warnings. TargetedBlack/Ruff/py_compile/diff checks pass. The root coordinator also ran two new independent exact run-only default/configured replay tasks on UUIDGPU-5d8a72a332aa124c/PCI0000:f5:00.0; both exited0 with finite numerical gate≤0.1 and exact unchangedselected names. Complete results, commands, runtime identities, idle/process records and lossless compressed traces/logs are under`gpu/`.
+
+New repair commits adopt the documented `git commit -s` convention. Earlier implementation/evidence commits and their recordedSHAs remain preserved; no history rewrite was performed. Final root reviewer verification and tracker closure follow integration merge of this branch.

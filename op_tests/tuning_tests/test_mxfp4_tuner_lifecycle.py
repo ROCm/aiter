@@ -6,9 +6,13 @@ Full-module imports require the normal AITER ROCm/FlyDSL toolchain. Devices and
 measurement outcomes are simulated at the approved tuning boundaries.
 """
 
+import argparse
 import multiprocessing
+from collections.abc import Iterator
 from contextlib import contextmanager
+from multiprocessing.context import BaseContext
 from multiprocessing.process import BaseProcess
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
@@ -55,10 +59,12 @@ RESULTS = [
 
 
 @pytest.fixture(autouse=True)
-def prohibit_real_shape_workers_and_gpu_data(monkeypatch):
+def prohibit_real_shape_workers_and_gpu_data(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     # Spawn does not inherit parent mocks. Every multi-slot fixture must replace
     # this boundary with controlled scheduling, even while the code is red.
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: "object", **kwargs: "object") -> "None":
         pytest.fail("controlled lifecycle test reached real GPU work")
 
     monkeypatch.setenv("ROCR_VISIBLE_DEVICES", "")
@@ -92,7 +98,7 @@ def prohibit_real_shape_workers_and_gpu_data(monkeypatch):
     torch.set_default_device("cpu")
 
 
-def shape(token=4, **updates):
+def shape(token: "int" = 4, **updates: "object") -> "dict[str, object]":
     row = dict(
         zip(
             KEYS,
@@ -118,7 +124,9 @@ def shape(token=4, **updates):
     return row
 
 
-def tuner_args(tuner, source, output, *options):
+def tuner_args(
+    tuner: "moe.Mxfp4FlydslTuner", source: "Path", output: "Path", *options: "object"
+) -> "argparse.Namespace":
     return tuner.parser.parse_args(
         [
             "-i",
@@ -137,7 +145,7 @@ def tuner_args(tuner, source, output, *options):
 
 
 @contextmanager
-def devices(*identities, current=0):
+def devices(*identities: "tuple[str, int]", current: "int" = 0) -> "Iterator[None]":
     properties = [
         SimpleNamespace(gcnArchName=gfx, multi_processor_count=cu)
         for gfx, cu in identities
@@ -156,11 +164,21 @@ def devices(*identities, current=0):
         yield
 
 
-def controlled_mxfp4(tuner, monkeypatch, attempts):
-    def candidates(row, full_search=False):
+def controlled_mxfp4(
+    tuner: "moe.Mxfp4FlydslTuner",
+    monkeypatch: "pytest.MonkeyPatch",
+    attempts: "list[int]",
+) -> "None":
+    def candidates(
+        row: "dict[str, object]", full_search: "bool" = False
+    ) -> "list[dict[str, object]]":
         return [tuner._candidate_row(row, 16, "g1-controlled", "g2-controlled")]
 
-    def measure(row, candidate, args):
+    def measure(
+        row: "dict[str, object]",
+        candidate: "dict[str, object]",
+        args: "SimpleNamespace",
+    ) -> "float":
         attempts.append(dict(row))
         candidate.update(us=10.25, us1=10.25, us2=0, err1="0.0%", err2="0.0%")
         return 10.25
@@ -171,8 +189,8 @@ def controlled_mxfp4(tuner, monkeypatch, attempts):
 
 @pytest.mark.parametrize("same_file", [False, True])
 def test_all_preserves_gate_metadata_through_winner_summary(
-    tmp_path, monkeypatch, same_file
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", same_file: "bool"
+) -> "None":
     source = tmp_path / "input.csv"
     output = source if same_file else tmp_path / "winner.csv"
     pd.DataFrame([shape(gate_mode="GateMode.SEPARATED")]).to_csv(source, index=False)
@@ -188,7 +206,9 @@ def test_all_preserves_gate_metadata_through_winner_summary(
     assert tuner.failed.empty and tuner.remain_untuned.empty
 
 
-def test_retune_replaces_duplicate_old_winners(tmp_path, monkeypatch):
+def test_retune_replaces_duplicate_old_winners(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape()]).to_csv(source, index=False)
     with devices(("gfx950", 256)):
@@ -203,8 +223,8 @@ def test_retune_replaces_duplicate_old_winners(tmp_path, monkeypatch):
 
 
 def test_same_file_all_without_device_identity_retains_gate_metadata(
-    tmp_path, monkeypatch
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
     file = tmp_path / "same.csv"
     pd.DataFrame([shape(gate_mode="GateMode.SEPARATED")]).drop(
         columns=["gfx", "cu_num"]
@@ -220,8 +240,8 @@ def test_same_file_all_without_device_identity_retains_gate_metadata(
 
 @pytest.mark.parametrize("empty_input", [False, True])
 def test_shared_csv_preserves_valid_rows_and_normalizes_legacy_defaults(
-    tmp_path, monkeypatch, empty_input
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", empty_input: "bool"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "shared.csv"
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
@@ -254,8 +274,8 @@ def test_shared_csv_preserves_valid_rows_and_normalizes_legacy_defaults(
 
 @pytest.mark.parametrize("modern_second", [False, True])
 def test_multiple_shared_files_migrate_identity_before_merge(
-    tmp_path, monkeypatch, modern_second
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", modern_second: "bool"
+) -> "None":
     source, first, second = (
         tmp_path / "input.csv",
         tmp_path / "first.csv",
@@ -289,14 +309,16 @@ def test_multiple_shared_files_migrate_identity_before_merge(
 
 
 @pytest.mark.parametrize("mode", ["prune", "full"])
-def test_runtime_preflight_rejects_participating_device_before_work(monkeypatch, mode):
+def test_runtime_preflight_rejects_participating_device_before_work(
+    monkeypatch: "pytest.MonkeyPatch", mode: "str | None"
+) -> "None":
     with devices(("gfx950", 256), ("gfx942", 304)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
         attempts = []
         controlled_mxfp4(tuner, monkeypatch, attempts)
         args = SimpleNamespace(mp=2, timeout=0, mxfp4_search_mode=mode)
 
-        def forbid_workers(*args, **kwargs):
+        def forbid_workers(*args: "object", **kwargs: "object") -> "None":
             pytest.fail("unsupported participants reached worker launch")
 
         monkeypatch.setattr(moe, "_run_shapes_isolated", forbid_workers)
@@ -307,8 +329,8 @@ def test_runtime_preflight_rejects_participating_device_before_work(monkeypatch,
 
 @pytest.mark.parametrize("mode", ["prune", "full"])
 def test_runtime_identity_uses_selected_logical_gpu_and_ignores_unused_device(
-    monkeypatch, mode
-):
+    monkeypatch: "pytest.MonkeyPatch", mode: "str | None"
+) -> "None":
     with devices(("gfx950:sramecc+", 224), ("gfx942", 304)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
         attempts = []
@@ -323,13 +345,17 @@ def test_runtime_identity_uses_selected_logical_gpu_and_ignores_unused_device(
     assert results[0]["cu_num"] == 224
 
 
-def test_supported_mixed_cu_runtime_rows_finish_summary(tmp_path, monkeypatch):
+def test_supported_mixed_cu_runtime_rows_finish_summary(
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape(), shape(8)]).to_csv(source, index=False)
     with devices(("gfx950", 256), ("gfx950", 224)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
 
-        def simulated_workers(payloads, slots, ctx):
+        def simulated_workers(
+            payloads: "object", slots: "int", ctx: "BaseContext"
+        ) -> "list[dict[str, object]]":
             results = []
             for index, (keys, row, args, _) in enumerate(payloads):
                 row = dict(row, gfx="gfx950", cu_num=256 if index == 0 else 224)
@@ -349,8 +375,8 @@ def test_supported_mixed_cu_runtime_rows_finish_summary(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("mode", ["prune", "full"])
 def test_no_visible_gpu_fails_nonempty_but_empty_batch_starts_no_work(
-    monkeypatch, mode
-):
+    monkeypatch: "pytest.MonkeyPatch", mode: "str | None"
+) -> "None":
     monkeypatch.setattr(torch.cuda, "device_count", lambda: 0)
     tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     args = SimpleNamespace(mp=0, timeout=0, mxfp4_search_mode=mode)
@@ -361,8 +387,8 @@ def test_no_visible_gpu_fails_nonempty_but_empty_batch_starts_no_work(
 
 @pytest.mark.parametrize("all_rows", [False, True])
 def test_unused_gpu0_does_not_reject_single_slot_current_supported_gpu(
-    tmp_path, monkeypatch, all_rows
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", all_rows: "bool"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape()]).to_csv(source, index=False)
     with devices(("gfx942", 304), ("gfx950", 224), current=1):
@@ -380,8 +406,8 @@ def test_unused_gpu0_does_not_reject_single_slot_current_supported_gpu(
 
 @pytest.mark.parametrize("mode", ["prune", "full"])
 def test_single_slot_rejects_current_unsupported_gpu_even_if_gpu0_supported(
-    monkeypatch, mode
-):
+    monkeypatch: "pytest.MonkeyPatch", mode: "str | None"
+) -> "None":
     with devices(("gfx950", 256), ("gfx942", 304), current=1):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
         with pytest.raises(ValueError, match="GPU1.*gfx942"):
@@ -396,8 +422,8 @@ def test_single_slot_rejects_current_unsupported_gpu_even_if_gpu0_supported(
     "failure", ["empty", "exception", "nan", "inf", "zero", "negative"]
 )
 def test_failed_retune_preserves_old_winner_and_continues_later_shape(
-    tmp_path, monkeypatch, failure
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", failure: "Exception | str"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     pd.DataFrame([shape(), shape(8)]).to_csv(source, index=False)
     with devices(("gfx950", 256)):
@@ -406,12 +432,18 @@ def test_failed_retune_preserves_old_winner_and_continues_later_shape(
         old.update(us=20, us1=20)
         pd.DataFrame([old]).to_csv(output, index=False)
 
-        def candidates(row, full_search=False):
+        def candidates(
+            row: "dict[str, object]", full_search: "bool" = False
+        ) -> "list[dict[str, object]]":
             if row["token"] == 4 and failure == "empty":
                 return []
             return [tuner._candidate_row(row, 16, "g1-controlled", "g2-controlled")]
 
-        def measure(row, candidate, args):
+        def measure(
+            row: "dict[str, object]",
+            candidate: "dict[str, object]",
+            args: "SimpleNamespace",
+        ) -> "float":
             if row["token"] == 4:
                 if failure == "exception":
                     raise RuntimeError("controlled measurement failure")
@@ -441,19 +473,27 @@ def test_failed_retune_preserves_old_winner_and_continues_later_shape(
 
 
 @pytest.mark.parametrize("mode", ["prune", "full"])
-def test_candidate_order_and_finite_winner_survive_bad_first_timing(monkeypatch, mode):
+def test_candidate_order_and_finite_winner_survive_bad_first_timing(
+    monkeypatch: "pytest.MonkeyPatch", mode: "str | None"
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
         observed = []
 
-        def candidates(row, full_search=False):
+        def candidates(
+            row: "dict[str, object]", full_search: "bool" = False
+        ) -> "list[dict[str, object]]":
             observed.append(("universe", full_search))
             return [
                 tuner._candidate_row(row, 16, name, "g2")
                 for name in ("bad", "valid", "slower")
             ]
 
-        def measure(row, candidate, args):
+        def measure(
+            row: "dict[str, object]",
+            candidate: "dict[str, object]",
+            args: "SimpleNamespace",
+        ) -> "float":
             name = candidate["kernelName1"]
             observed.append(name)
             us = {"bad": float("nan"), "valid": 8.5, "slower": 12.0}[name]
@@ -474,8 +514,8 @@ def test_candidate_order_and_finite_winner_survive_bad_first_timing(monkeypatch,
 
 @pytest.mark.parametrize("same_file", [False, True])
 def test_all_empty_device_selection_does_not_restore_input_rows(
-    tmp_path, monkeypatch, same_file
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", same_file: "bool"
+) -> "None":
     source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
     if same_file:
         output = source
@@ -502,14 +542,20 @@ def test_all_empty_device_selection_does_not_restore_input_rows(
     [(0, 3, 3, 1), (-1, 3, 3, 1), (8, 1, 3, 1), (8, 3, 2, 2), (2, 3, 3, 2)],
 )
 def test_prune_full_parallelism_selection_is_preserved(
-    monkeypatch, mp, shape_count, gpu_count, expected
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    mp: "int",
+    shape_count: "int",
+    gpu_count: "int",
+    expected: "object",
+) -> "None":
     with devices(*[("gfx950", 256)] * gpu_count):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
         attempts = []
         controlled_mxfp4(tuner, monkeypatch, attempts)
 
-        def scheduled(payloads, slots, ctx):
+        def scheduled(
+            payloads: "object", slots: "int", ctx: "BaseContext"
+        ) -> "list[dict[str, object]]":
             assert slots == expected
             return [tuner._tune_one_shape(row, args) for _, row, args, _ in payloads]
 
@@ -525,8 +571,11 @@ def test_prune_full_parallelism_selection_is_preserved(
 @pytest.mark.parametrize("all_rows", [False, True])
 @pytest.mark.parametrize("same_file", [False, True])
 def test_unsupported_already_tuned_row_fails_and_later_winner_persists(
-    tmp_path, monkeypatch, all_rows, same_file
-):
+    tmp_path: "Path",
+    monkeypatch: "pytest.MonkeyPatch",
+    all_rows: "bool",
+    same_file: "bool",
+) -> "None":
     source = tmp_path / "input.csv"
     output = source if same_file else tmp_path / "winner.csv"
     requested = [

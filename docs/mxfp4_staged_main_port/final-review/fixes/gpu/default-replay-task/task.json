@@ -1,0 +1,152 @@
+{
+  "coordinator_start_utc": "2026-10-10T20:35:12.176039+00:00",
+  "cwd": "/root/workspace/tmp_dev/aiter-mxfp4-review-fixes",
+  "python": "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+  "command": [
+    "/root/workspace/tmp_dev/mxfp4-port-env/bin/python",
+    "docs/mxfp4_staged_main_port/scripts/default_replay.py",
+    "--csv",
+    "docs/mxfp4_staged_main_port/02/gpu/small-winner.csv",
+    "--result",
+    "docs/mxfp4_staged_main_port/final-review/fixes/gpu/default-replay.json"
+  ],
+  "implementation_commit": "a154bc871b0c35339b00da5dd9b14fa85e09375b",
+  "environment": {
+    "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+    "HIP_VISIBLE_DEVICES": "0",
+    "GPU_ARCHS": "gfx950",
+    "CU_NUM": null,
+    "FLYDSL_GPU_ARCH": "gfx950",
+    "AITER_USE_SYSTEM_TRITON": "1",
+    "AITER_JIT_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/jit-default",
+    "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/aot-default",
+    "FLYDSL_RUNTIME_RUN_ONLY": "1",
+    "AITER_CONFIG_FMOE": null,
+    "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "",
+    "AITER_FLYDSL_STAGE2_FP8": "0",
+    "AITER_MXFP4_INTERMEDIATE": "0",
+    "TUNE_MOE_EXPERT_BALANCE": null,
+    "TUNE_MOE_ROUTING_SEED": null,
+    "AITER_LOG_MORE": null,
+    "AITER_MOE_EXPERT_BALANCE": null,
+    "MAX_JOBS": "8"
+  },
+  "timeout_contract": "No task or shape hard deadline; wait for child exit",
+  "idle_before_start": {
+    "utc": "2026-10-10T20:35:16.774021+00:00",
+    "status": {
+      "Unique ID": "0x5d8a72a332aa124c",
+      "GPU use (%)": "0",
+      "GFX Activity": "345294222",
+      "PCI Bus": "0000:F5:00.0",
+      "VRAM Total Memory (B)": "309220868096",
+      "VRAM Total Used Memory (B)": "297832448"
+    },
+    "processes": [
+      {
+        "name": "N/A",
+        "pid": 3987487,
+        "memory_usage": {
+          "gtt_mem": {
+            "value": 0,
+            "unit": "B"
+          },
+          "cpu_mem": {
+            "value": 0,
+            "unit": "B"
+          },
+          "vram_mem": {
+            "value": 0,
+            "unit": "B"
+          }
+        },
+        "mem_usage": {
+          "value": 0,
+          "unit": "B"
+        },
+        "usage": {
+          "gfx": {
+            "value": 0,
+            "unit": "ns"
+          },
+          "enc": {
+            "value": 0,
+            "unit": "ns"
+          }
+        },
+        "cu_occupancy": 0
+      },
+      {
+        "name": "N/A",
+        "pid": 3989068,
+        "memory_usage": {
+          "gtt_mem": {
+            "value": 0,
+            "unit": "B"
+          },
+          "cpu_mem": {
+            "value": 0,
+            "unit": "B"
+          },
+          "vram_mem": {
+            "value": 0,
+            "unit": "B"
+          }
+        },
+        "mem_usage": {
+          "value": 0,
+          "unit": "B"
+        },
+        "usage": {
+          "gfx": {
+            "value": 0,
+            "unit": "ns"
+          },
+          "enc": {
+            "value": 0,
+            "unit": "ns"
+          }
+        },
+        "cu_occupancy": 0
+      },
+      {
+        "name": "N/A",
+        "pid": 3989069,
+        "memory_usage": {
+          "gtt_mem": {
+            "value": 0,
+            "unit": "B"
+          },
+          "cpu_mem": {
+            "value": 0,
+            "unit": "B"
+          },
+          "vram_mem": {
+            "value": 0,
+            "unit": "B"
+          }
+        },
+        "mem_usage": {
+          "value": 0,
+          "unit": "B"
+        },
+        "usage": {
+          "gfx": {
+            "value": 0,
+            "unit": "ns"
+          },
+          "enc": {
+            "value": 0,
+            "unit": "ns"
+          }
+        },
+        "cu_occupancy": 0
+      }
+    ]
+  },
+  "pid": 635378,
+  "process_start_utc": "2026-10-10T20:35:16.777403+00:00",
+  "exit_code": 0,
+  "process_exit_utc": "2026-10-10T20:35:23.036373+00:00"
+}

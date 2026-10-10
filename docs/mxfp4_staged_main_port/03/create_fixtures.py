@@ -7,11 +7,26 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import NamedTuple
 from unittest import mock
 
-# (id, model, token, BM, BN, BK, epilog, FP8, FP4, limit, clamp fixture)
+
+class FixtureRequest(NamedTuple):
+    fixture_id: str
+    model: str
+    token: int
+    bm: int
+    bn: int
+    bk: int
+    epilog: str
+    fp8: bool
+    fp4: bool
+    limit: float | None
+    clamp: bool
+
+
 REQUESTS = (
-    (
+    FixtureRequest(
         "minimax128-bm16-reduce",
         "minimax",
         128,
@@ -24,7 +39,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax128-bm32-atomic",
         "minimax",
         128,
@@ -37,7 +52,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax2048-bm64-reduce",
         "minimax",
         2048,
@@ -50,7 +65,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax2048-bm128-atomic",
         "minimax",
         2048,
@@ -63,7 +78,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-combined5-atomic",
         "gpt",
         2048,
@@ -76,7 +91,7 @@ REQUESTS = (
         5,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax128-bm16-atomic",
         "minimax",
         128,
@@ -89,7 +104,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax128-bm32-reduce",
         "minimax",
         128,
@@ -102,7 +117,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax2048-bm64-atomic",
         "minimax",
         2048,
@@ -115,7 +130,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax2048-bm128-reduce",
         "minimax",
         2048,
@@ -128,7 +143,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "minimax2048-bm128-scatter",
         "minimax",
         2048,
@@ -141,7 +156,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt128-fp8-bm16-k128",
         "gpt",
         128,
@@ -154,7 +169,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt128-fp8-bm32-k256",
         "gpt",
         128,
@@ -167,7 +182,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-fp8-bm64-k128",
         "gpt",
         2048,
@@ -180,7 +195,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-fp8-bm128-k256",
         "gpt",
         2048,
@@ -193,7 +208,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-fp4-n128",
         "gpt",
         2048,
@@ -206,7 +221,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-fp4-n256",
         "gpt",
         2048,
@@ -219,7 +234,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-limit5-reduce-clamp",
         "gpt",
         2048,
@@ -232,7 +247,7 @@ REQUESTS = (
         5,
         True,
     ),
-    (
+    FixtureRequest(
         "gpt2048-combined7-reduce",
         "gpt",
         2048,
@@ -245,7 +260,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-combined7-scatter",
         "gpt",
         2048,
@@ -258,7 +273,7 @@ REQUESTS = (
         None,
         False,
     ),
-    (
+    FixtureRequest(
         "gpt2048-combined5-reduce-clamp",
         "gpt",
         2048,
@@ -271,7 +286,7 @@ REQUESTS = (
         5,
         True,
     ),
-    (
+    FixtureRequest(
         "gpt2048-combined5-scatter-clamp",
         "gpt",
         2048,
@@ -284,7 +299,7 @@ REQUESTS = (
         5,
         True,
     ),
-    (
+    FixtureRequest(
         "gpt2048-situv2-reduce",
         "situv2",
         2048,
@@ -300,7 +315,7 @@ REQUESTS = (
 )
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent)
     args = parser.parse_args()
@@ -329,7 +344,7 @@ def main():
     csv_dir = args.output_dir / "fixtures"
     csv_dir.mkdir(exist_ok=True)
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: "object", **kwargs: "object") -> "None":
         raise AssertionError(
             "offline fixture enumeration reached compilation or GPU work"
         )
@@ -342,9 +357,12 @@ def main():
         mock.patch.object(torch.cuda, "CUDAGraph", side_effect=forbidden),
     ):
         for request in REQUESTS:
-            fixture_id, model, token, bm, bn, bk, epilog, fp8, fp4, limit, clamp = (
-                request
-            )
+            fixture_id = request.fixture_id
+            model, token = request.model, request.token
+            bm, bn, bk = request.bm, request.bn, request.bk
+            epilog = request.epilog
+            fp8, fp4, limit = request.fp8, request.fp4, request.limit
+            clamp = request.clamp
             shape_key = (model, token)
             if shape_key not in candidates_by_shape:
                 row = shape(token)

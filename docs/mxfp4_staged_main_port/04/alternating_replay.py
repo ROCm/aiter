@@ -9,18 +9,22 @@ input/routes/weights and normal kernel-duration-sum profiling are retained.
 
 import argparse
 import csv
-import hashlib
 import json
 import math
 import os
 import statistics
 import subprocess
 import time
+from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
 
+from docs.mxfp4_staged_main_port.scripts.replay_common import fingerprint
 
-def alternating_samples(measure, repeats):
+
+def alternating_samples(
+    measure: "Callable[[str], dict[str, float]]", repeats: "int"
+) -> "dict[str, object]":
     samples = []
     for cycle in range(repeats):
         order = ("left", "right") if cycle % 2 == 0 else ("right", "left")
@@ -40,7 +44,7 @@ def alternating_samples(measure, repeats):
     return report
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--left", type=Path, required=True)
     parser.add_argument("--right", type=Path, required=True)
@@ -101,7 +105,7 @@ def main():
         swiglu_limit=configuration["swiglu_limit"],
     )
 
-    def launch(label):
+    def launch(label: "str") -> "torch.Tensor":
         row = rows[label]
         return tuner._port_e2e(
             data,
@@ -114,7 +118,7 @@ def main():
             swiglu_limit=configuration["swiglu_limit"],
         )
 
-    def measure(label):
+    def measure(label: "str") -> "dict[str, float]":
         output = launch(label)
         torch.cuda.synchronize()
         error = float(cosine_diff_compare(reference, output, printLog=False))
@@ -133,11 +137,6 @@ def main():
         }
 
     result = alternating_samples(measure, args.repeats)
-
-    def fingerprint(tensor):
-        return hashlib.sha256(
-            tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-        ).hexdigest()
 
     result.update(
         reason=args.reason,

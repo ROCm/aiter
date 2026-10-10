@@ -3,7 +3,6 @@
 
 import argparse
 import csv
-import hashlib
 import importlib
 import json
 import math
@@ -13,6 +12,11 @@ import subprocess
 import time
 from pathlib import Path
 from unittest import mock
+
+from docs.mxfp4_staged_main_port.scripts.replay_common import (
+    fingerprint,
+    trace_kernel_metrics,
+)
 
 ENV_KEYS = (
     "ROCR_VISIBLE_DEVICES",
@@ -28,8 +32,8 @@ ENV_KEYS = (
 )
 
 
-def write_json(path, value):
-    def json_value(item):
+def write_json(path: "Path", value: "object") -> "None":
+    def json_value(item: "object") -> "object":
         if isinstance(item, float) and not math.isfinite(item):
             return str(item)
         if isinstance(item, dict):
@@ -42,15 +46,7 @@ def write_json(path, value):
     path.write_text(json.dumps(json_value(value), indent=2, allow_nan=False) + "\n")
 
 
-def fingerprint(tensor):
-    import torch
-
-    return hashlib.sha256(
-        tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-    ).hexdigest()
-
-
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--result", type=Path, required=True)
@@ -174,7 +170,14 @@ def main():
     reduction = reduction_module._run_moe_reduction
     quantized_scatter = __import__("aiter").mxfp4_moe_scatter_reduce_q
 
-    def capture_reduction(target, out, token, topk, hidden, **kwargs):
+    def capture_reduction(
+        target: "torch.Tensor",
+        out: "torch.Tensor",
+        token: "int",
+        topk: "int",
+        hidden: "int",
+        **kwargs: "object",
+    ) -> "torch.Tensor":
         fp8 = kwargs["is_fp8"]
         assert kwargs["topk_weights"] is (data["topk_weights"] if fp8 else None)
         operations.append(
@@ -188,7 +191,7 @@ def main():
         )
         return reduction(target, out, token, topk, hidden, **kwargs)
 
-    def capture_quantized_scatter(**kwargs):
+    def capture_quantized_scatter(**kwargs: "object") -> "torch.Tensor":
         operations.append(
             {
                 "op": "final-fp4-scatter",
@@ -198,7 +201,7 @@ def main():
         )
         return quantized_scatter(**kwargs)
 
-    def capture_g1(**kwargs):
+    def capture_g1(**kwargs: "object") -> "tuple[torch.Tensor, torch.Tensor]":
         for key in (
             "BM",
             "BN",
@@ -238,7 +241,7 @@ def main():
         )
         return stage1(**kwargs)
 
-    def capture_g2(*positional, **kwargs):
+    def capture_g2(*positional: "object", **kwargs: "object") -> "torch.Tensor":
         for key, parsed_key in (
             ("BM", "tile_m"),
             ("BN", "tile_n"),
@@ -336,7 +339,7 @@ def main():
         metadata.block_m == int(row["block_m"]) and metadata.fuse_quant == "fp4"
     ), metadata
 
-    def production():
+    def production() -> "torch.Tensor":
         activation_kwargs = (
             {}
             if args.situv2_public_defaults
@@ -368,7 +371,7 @@ def main():
             **activation_kwargs,
         )
 
-    def pair():
+    def pair() -> "torch.Tensor":
         return tuner._port_e2e(
             data,
             row["kernelName1"],
@@ -419,19 +422,7 @@ def main():
     trace = args.result.with_suffix(".trace.json")
     prof.export_chrome_trace(str(trace))
     events = json.loads(trace.read_text())["traceEvents"]
-    kernels = [
-        event
-        for event in events
-        if event.get("cat") == "kernel" and event.get("ph") == "X"
-    ]
-    assert kernels and all(
-        event.get("cat") != "gpu_user_annotation" for event in kernels
-    )
-    kernel_sum = sum(event["dur"] for event in kernels) / args.iters
-    span = (
-        max(event["ts"] + event["dur"] for event in kernels)
-        - min(event["ts"] for event in kernels)
-    ) / args.iters
+    kernels, kernel_sum, span = trace_kernel_metrics(events, args.iters)
     metric = float(get_trace_perf(prof, args.iters))
     assert math.isfinite(metric) and metric > 0
     if args.action == "pair":

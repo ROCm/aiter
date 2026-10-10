@@ -11,16 +11,19 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import ModuleType
 from unittest import mock
 
 import torch
 
 
-def import_moe_tuner():
+def import_moe_tuner() -> "ModuleType":
     run = subprocess.run
     set_default_device = torch.set_default_device
 
-    def discover(command, *args, **kwargs):
+    def discover(
+        command: "list[str]", *args: "object", **kwargs: "object"
+    ) -> "subprocess.CompletedProcess[str]":
         if isinstance(command, (list, tuple)) and Path(command[0]).name in (
             "rocminfo",
             "hipinfo",

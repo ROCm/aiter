@@ -9,13 +9,13 @@ import re
 import sys
 import tempfile
 from argparse import ArgumentTypeError
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from multiprocessing.connection import wait as wait_for_connections
 from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import TYPE_CHECKING, Any, ClassVar
 
 import pandas as pd
 import torch
@@ -109,6 +109,11 @@ from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     populate_v2_intermediate_from_ref as _v2_populate_stage2,
 )
+
+if TYPE_CHECKING:
+    from types import SimpleNamespace
+
+    from csrc.ck_gemm_moe_2stages_codegen.mxfp4_staged_search import StagedSearchPlan
 from csrc.ck_gemm_moe_2stages_codegen.mxfp4_v2_tune_utils import (
     v2_stage1_sorted_ref as _v2_stage1_ref,
 )
@@ -5971,7 +5976,7 @@ class FmoeTuner(TunerCommon):
                     mask = self._already_tuned_mask(dedup_cols)
                     self.untunedf = self.untunedf[~mask]
 
-    def _already_tuned_mask(self, dedup_cols):
+    def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
         return (
             self.untunedf[dedup_cols]
             .apply(tuple, axis=1)
@@ -6494,7 +6499,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
     )
 
     @staticmethod
-    def _capture_configuration():
+    def _capture_configuration() -> "dict[str, float | bool | None]":
         value = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
         limit = None if value in (None, "") else float(value)
         if limit is not None and (not math.isfinite(limit) or limit <= 0):
@@ -6507,7 +6512,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
             "fp4_scatter": os.environ.get("AITER_MXFP4_INTERMEDIATE", "0") == "1",
         }
 
-    def _invocation_configuration(self, args=None):
+    def _invocation_configuration(
+        self, args: "argparse.Namespace | SimpleNamespace | None" = None
+    ) -> "dict[str, float | bool | None]":
         # Production reads the two output switches per call. Callers keep all
         # three variables stable for this invocation and its spawned workers.
         if args is not None and hasattr(args, "mxfp4_configuration"):
@@ -6518,17 +6525,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
             args.mxfp4_configuration = self._configuration
         return self._configuration
 
-    def parse_args(self):
+    def parse_args(self) -> "argparse.Namespace":
         args = super().parse_args()
         self._configuration = self._capture_configuration()
         args.mxfp4_configuration = self._configuration
         return args
 
-    def pre_process(self, args):
+    def pre_process(self, args: "argparse.Namespace | SimpleNamespace") -> "None":
         self._invocation_configuration(args)
         return super().pre_process(args)
 
-    def _setup_specific_arguments(self):
+    def _setup_specific_arguments(self) -> "None":
         super()._setup_specific_arguments()
         for action in self.parser._actions:
             if action.dest == "timeout":
@@ -6538,7 +6545,9 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     "a still-live permanent hang may wait indefinitely."
                 )
 
-    def _unsupported_row_reason(self, row):
+    def _unsupported_row_reason(
+        self, row: "Mapping[str, object] | pd.Series"
+    ) -> "str | None":
         for field, expected in (
             ("dtype", dtypes.bf16),
             ("q_dtype_a", dtypes.fp4x2),
@@ -6578,7 +6587,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             return "topk must not exceed expert count"
         return None
 
-    def _already_tuned_mask(self, dedup_cols):
+    def _already_tuned_mask(self, dedup_cols: "list[str]") -> "pd.Series":
         times = pd.to_numeric(self.tunedf.get("us"), errors="coerce")
         valid = self.tunedf[(times > 0) & (times < self.INF_TIME)]
         mask = (
@@ -6592,7 +6601,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         return mask & ~unsupported
 
     @staticmethod
-    def _runtime_device_identity(gpu):
+    def _runtime_device_identity(gpu: "int") -> "tuple[str, int]":
         properties = torch.cuda.get_device_properties(gpu)
         arch = str(properties.gcnArchName).split(":", 1)[0].lower()
         cu = int(properties.multi_processor_count)
@@ -6600,7 +6609,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
             raise ValueError(f"MXFP4 tuning GPU{gpu} must be gfx950, got {arch}")
         return arch, cu
 
-    def get_gfx(self):
+    def get_gfx(self) -> "str":
         # Main's single-slot prune/full path runs on the caller's current GPU.
         return (
             str(
@@ -6612,14 +6621,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
             .lower()
         )
 
-    def get_cu_num(self):
+    def get_cu_num(self) -> "int":
         return int(
             torch.cuda.get_device_properties(
                 torch.cuda.current_device()
             ).multi_processor_count
         )
 
-    def _preflight_devices(self, mp_num, ngpu, *, staged=False):
+    def _preflight_devices(
+        self, mp_num: "int", ngpu: "int", *, staged: "bool" = False
+    ) -> "list[tuple[str, int]]":
         if ngpu < 1:
             raise ValueError("MXFP4 tuning requires a visible runtime GPU")
         selected = (
@@ -6629,13 +6640,13 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return [self._runtime_device_identity(gpu) for gpu in selected]
 
-    def _summary_shape_keys(self):
+    def _summary_shape_keys(self) -> "list[str]":
         # Requested rows are assigned to runtime GPUs by the scheduler. A
         # successful row on another supported CU count still completes its
         # requested shape; output keeps the actual assigned gfx/CU identity.
         return [key for key in self.keys if key not in ("gfx", "cu_num")]
 
-    def _normalize_tuned_csv(self, tunedf):
+    def _normalize_tuned_csv(self, tunedf: "pd.DataFrame") -> "pd.DataFrame":
         tunedf = super()._normalize_tuned_csv(tunedf)
         # Filter fallback tags while their meaning is still available.
         if "_tag" in tunedf:
@@ -6892,7 +6903,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 cands.append(self._candidate_row(row, bm, kn1, kn2v))
         return cands
 
-    def _staged_candidate_plan(self, row):
+    def _staged_candidate_plan(self, row: "dict[str, object]") -> "StagedSearchPlan":
         reason = self._unsupported_row_reason(row)
         if reason is not None:
             raise ValueError(reason)
@@ -7103,7 +7114,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         return us
 
-    def _screening_limit(self):
+    def _screening_limit(self) -> "float | None":
         return self._invocation_configuration()["swiglu_limit"]
 
     def _prepare_screening_case(
