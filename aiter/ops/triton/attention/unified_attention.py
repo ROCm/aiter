@@ -147,16 +147,40 @@ def _gfx950_gluon_supported(params: _UAParams):
     )
 
 
+def _gfx950_split_params(params: _UAParams):
+    """Size the split by the gluon grid when a sequence spans several query blocks."""
+    if params.all_decode or params.max_seqlen_q * params.num_queries_per_kv <= 128:
+        return params
+    config = get_unified_attention_config("attn_3d", params, backend="gluon")
+    block_m = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    block_q = block_m // params.num_queries_per_kv
+    num_q_blocks = params.num_tokens // block_q + params.num_seqs
+    return params._replace(num_2d_prgms=num_q_blocks * params.num_kv_heads)
+
+
+def _gfx950_split_grid(params: _UAParams):
+    """Decode, and batches too small to fill the GPU, take the split grid."""
+    if params.all_decode:
+        return True
+    if params.sliding_window > 0:
+        return False
+    # unsplit, the 2d grid is faster
+    config = get_unified_attention_config(
+        "kv_split", _gfx950_split_params(params), backend="gluon"
+    )
+    return config["NUM_SEGMENTS"] > 1
+
+
 def use_2d_kernel(params: _UAParams, backend: str = "triton"):
     # if IS_DEVICE_ARCH_GFX12, always use 3D if all_decode and 2D otherwise
     if IS_DEVICE_ARCH_GFX12:
         return (params.sliding_window > 0) or (not params.all_decode)
 
     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
-    # and it owns its KV split, so decode always takes the 3d path (a single
-    # segment simply drops the split axis) and everything else the 2d one.
+    # and it owns its KV split, so decode and split batches take the 3d path
+    # (a single segment simply drops the split axis) and the rest the 2d one.
     if backend == "gluon" and _gfx950_gluon_supported(params):
-        return not params.all_decode
+        return not _gfx950_split_grid(params)
 
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
@@ -368,8 +392,11 @@ def unified_attention(
             _unified_attention_2d_triton(params)
     else:
         use_gluon_3d = is_3d_gluon_available(params, backend)
+        split_params = params
+        if use_gluon_3d and DEVICE_ARCH == "gfx950":
+            split_params = _gfx950_split_params(params)
         config = get_unified_attention_config(
-            "kv_split", params, backend="gluon" if use_gluon_3d else "triton"
+            "kv_split", split_params, backend="gluon" if use_gluon_3d else "triton"
         )
         NUM_SEGMENTS = config["NUM_SEGMENTS"]
         # The triton kernels read a shuffled tile as one contiguous page, so
@@ -1121,7 +1148,7 @@ def _unified_attention_3d_gfx950(
     NUM_SEGMENTS,
     TILE_SIZE,
 ):
-    """Decode: one program per (query block, kv head[, KV split]).
+    """Decode and split batches: one program per (query block, kv head[, KV split]).
 
     num_warps is not tuned directly here; BLOCK_M rows are split MFMA_DIM to a
     warp, so the warp count follows the query group the launch has to cover.
@@ -1130,6 +1157,10 @@ def _unified_attention_3d_gfx950(
     config = get_unified_attention_config("attn_3d", params, backend="gluon")
     MFMA_DIM = config["MFMA_DIM"]
     BLOCK_M = max(config["BLOCK_M"], triton.next_power_of_2(params.num_queries_per_kv))
+    q_rows = triton.next_power_of_2(params.max_seqlen_q * params.num_queries_per_kv)
+    if not params.all_decode and q_rows <= 128:
+        # short queries: one block covers the sequence
+        BLOCK_M = max(BLOCK_M, q_rows)
     # An unsplit launch that already leaves CUs idle can afford a wider query
     # block, which buys back the warps the missing split axis would have used.
     if NUM_SEGMENTS == 1 and params.num_2d_prgms <= 2 * params.num_sms:
