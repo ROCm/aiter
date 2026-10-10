@@ -21,6 +21,7 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 
+import flydsl.compiler as flyc
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
@@ -85,19 +86,27 @@ class _SplitPolicy:
         Target total blocks as a multiple of the device CU count.
     fallback_cu : int
         Nominal CU count to assume when the device query fails.
+    block_overhead_tiles : int | None
+        Per-block fixed cost, in BKV tiles, of the occupancy-aware cost model
+        (``_splits_by_wave_cost``). None keeps the ``cu_oversub`` target.
     """
 
     min_seq_len_kv: int
     min_tiles_per_split: int
     cu_oversub: int
     fallback_cu: int
+    block_overhead_tiles: int | None = None
 
 
 _SPLIT_POLICIES = {
     # Tuned on MI300X (304 CU) against the direct-load builder at BKV=128,
     # where min_tiles_per_split=8 is 1024 KV columns.
     "gfx942": _SplitPolicy(
-        min_seq_len_kv=4096, min_tiles_per_split=8, cu_oversub=4, fallback_cu=304
+        min_seq_len_kv=4096,
+        min_tiles_per_split=8,
+        cu_oversub=4,
+        fallback_cu=304,
+        block_overhead_tiles=8,  # fitted on MI325X
     ),
     # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
     "gfx950": _SplitPolicy(
@@ -122,12 +131,36 @@ def _device_cu_count(device_index: int) -> int:
         return _split_policy().fallback_cu
 
 
+@lru_cache(maxsize=256)
+def _splits_by_wave_cost(grid_x, effective_cus, window_tiles, max_splits, overhead):
+    """``num_splits`` in [1, min(max_splits, 64)] minimizing the wave-quantized cost
+    ``ceil(grid_x * s / effective_cus) * (ceil(window_tiles / s) + overhead)``."""
+    return min(
+        range(1, min(max_splits, 64) + 1),
+        key=lambda s: -(-(grid_x * s) // effective_cus)
+        * (-(-window_tiles // s) + overhead),
+    )
+
+
+def _max_blocks_per_cu(launcher, args):
+    """Max resident blocks per CU of *launcher*'s kernel, cached on the launcher.
+    None on a first call during graph capture, where HIP cannot load a module."""
+    if not hasattr(launcher, "_max_blocks_per_cu"):
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        # Meta tensors make flyc.compile compile only, without launching.
+        args = [a.to("meta") if isinstance(a, torch.Tensor) else a for a in args]
+        launcher._max_blocks_per_cu = flyc.compile(launcher, *args).max_blocks_per_cu()
+    return launcher._max_blocks_per_cu
+
+
 def _auto_num_splits(
     seq_len_padded: int,
     seq_len_kv: int,
     rows_per_block: int,
     block_kv: int,
     device_index: int,
+    blocks_per_cu: int | None = None,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
@@ -136,15 +169,28 @@ def _auto_num_splits(
     occupancy at no correctness cost (logits[m,n] are independent across n).
     Returns 1 once the row grid alone oversubscribes the device. The three
     tuning constants are per-arch -- see ``_SPLIT_POLICIES``.
+
+    With ``blocks_per_cu`` known, minimizes ``_splits_by_wave_cost`` over
+    ``cu_count * blocks_per_cu`` instead, since occupancy depends on the kernel
+    instance (``mfma_r2_w4``: 8 blocks/CU at H=16, 2 at H=128).
     """
     pol = _split_policy()
     grid_x = seq_len_padded // rows_per_block
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
+    max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
+    if blocks_per_cu is not None:
+        # The window bounds live on the device; the full KV extent stands in.
+        return _splits_by_wave_cost(
+            grid_x,
+            _device_cu_count(device_index) * blocks_per_cu,
+            seq_len_kv // block_kv,
+            max_splits,
+            pol.block_overhead_tiles,
+        )
     target_blocks = pol.cu_oversub * _device_cu_count(device_index)
     if grid_x >= target_blocks:
         return 1
-    max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
     return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
 
 
@@ -587,28 +633,26 @@ def flydsl_fp8_mqa_logits(
         device=Q.device,
     )[:, :seq_len_kv]
 
-    num_splits = _auto_num_splits(
-        seq_len_padded, seq_len_kv, _ROWS_PER_BLOCK, _BKV, Q.device.index
-    )
-
     if stream is None:
         stream = torch.cuda.current_stream()
 
+    tensors = (Q, KV, kv_scales, weights, cu_starts, cu_ends, logits)
+    scalars = (int(seq_len_padded), int(seq_len_kv), int(logits.stride(0)))
+
     with torch.cuda.device(Q.device.index):
-        _run_compiled(
-            launcher,
-            Q,
-            KV,
-            kv_scales,
-            weights,
-            cu_starts,
-            cu_ends,
-            logits,
-            int(seq_len_padded),
-            int(seq_len_kv),
-            int(logits.stride(0)),
-            int(num_splits),
-            stream,
+        blocks_per_cu = None
+        if _split_policy().block_overhead_tiles is not None:
+            blocks_per_cu = _max_blocks_per_cu(
+                launcher, (*tensors, *scalars, 1, stream)
+            )
+        num_splits = _auto_num_splits(
+            seq_len_padded,
+            seq_len_kv,
+            _ROWS_PER_BLOCK,
+            _BKV,
+            Q.device.index,
+            blocks_per_cu,
         )
+        _run_compiled(launcher, *tensors, *scalars, int(num_splits), stream)
 
     return logits[:seq_len, :]
