@@ -1,0 +1,355 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Regression tests for the fused route-sort + MXFP4 input quant kernel.
+
+Targets the Qwen3.5 MXFP4 MoE decode shape: model_dim=4096, block_m=32, and
+the two instantiated routes (num_experts, topk) in {(512, 10), (513, 11)}.
+"""
+
+import pytest
+import torch
+
+import aiter
+from aiter import dtypes
+from aiter.fused_moe import (
+    _fused_decode_sort_quant,
+    _is_fused_decode_sort_quant_enabled,
+    moe_sorting,
+)
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.quant import (
+    fused_dynamic_mxfp4_quant_moe_sort,
+    per_1x32_f4_quant_hip,
+)
+
+
+def _running_on_gfx950() -> bool:
+    """True only on a live ROCm gfx950 device.
+
+    Everything under test lowers to the scalef32 fp4-cvt instructions, which
+    exist only on gfx950 and trap elsewhere -- so gating on
+    ``torch.cuda.is_available()`` alone would let this suite run, and fault, on
+    NVIDIA or on an earlier CDNA part. ``get_gfx_runtime`` rather than
+    ``get_gfx`` because the latter honours ``GPU_ARCHS`` and can name an arch
+    that is not the one installed.
+    """
+    if not torch.cuda.is_available() or torch.version.hip is None:
+        return False
+    try:
+        return get_gfx_runtime() == "gfx950"
+    except (KeyError, OSError, RuntimeError):
+        # Unrecognized arch, or no rocminfo to ask -- either way, not gfx950.
+        return False
+
+
+pytestmark = pytest.mark.skipif(
+    not _running_on_gfx950(), reason="a ROCm gfx950 device is required"
+)
+
+HIDDEN = 4096
+BLOCK_M = 32
+# The last expert of the (513, 11) route is a fused shared expert every token
+# is routed to; (512, 10) dispatches its shared expert separately.
+FUSED_SHARED_ROUTE = (513, 11)
+ROUTE_VARIANTS = (
+    pytest.param(513, 11, id="fused_shared_e513_topk11"),
+    pytest.param(512, 10, id="separate_shared_e512_topk10"),
+)
+# Includes non-power-of-2 counts: the kernel's contract is M in [1, 128], not
+# a whitelist, and the tail handling differs for partial 32-row blocks.
+TOKEN_COUNTS = [1, 2, 3, 4, 8, 16, 17, 32, 64, 100, 127, 128]
+
+
+def _make_inputs(tokens: int, experts: int, topk: int):
+    torch.manual_seed(1000 + tokens)
+    hidden = torch.randn((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    if (experts, topk) != FUSED_SHARED_ROUTE:
+        topk_ids = torch.stack(
+            [
+                torch.randperm(experts, dtype=torch.int32, device="cuda")[:topk]
+                for _ in range(tokens)
+            ]
+        )
+        topk_weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
+    else:
+        shared = experts - 1
+        routed_ids = torch.stack(
+            [
+                torch.randperm(shared, dtype=torch.int32, device="cuda")[: topk - 1]
+                for _ in range(tokens)
+            ]
+        )
+        topk_ids = torch.cat(
+            (
+                routed_ids,
+                torch.full((tokens, 1), shared, dtype=torch.int32, device="cuda"),
+            ),
+            dim=1,
+        )
+        topk_weights = torch.cat(
+            (
+                torch.rand((tokens, topk - 1), dtype=torch.float32, device="cuda"),
+                torch.ones((tokens, 1), dtype=torch.float32, device="cuda"),
+            ),
+            dim=1,
+        )
+    return hidden, topk_ids, topk_weights
+
+
+def _canonical_entries(sorted_ids, sorted_weights, sorted_experts, num_valid_ids):
+    valid, tokens = [int(v) for v in num_valid_ids.cpu().tolist()]
+    entries = []
+    for block, expert in enumerate(sorted_experts[: valid // BLOCK_M].cpu().tolist()):
+        for row in range(block * BLOCK_M, block * BLOCK_M + BLOCK_M):
+            packed = int(sorted_ids[row].item())
+            token = packed & 0x00FFFFFF
+            if token != tokens:
+                entries.append(
+                    (
+                        expert,
+                        token,
+                        (packed >> 24) & 0xFF,
+                        float(sorted_weights[row].item()),
+                    )
+                )
+    return sorted(entries)
+
+
+def _run_fused(hidden, topk_ids, topk_weights, experts):
+    tokens = hidden.shape[0]
+    route_count = topk_ids.numel()
+    active_experts = min(experts, route_count)
+    max_sorted = (
+        (route_count + active_experts * (BLOCK_M - 1) + BLOCK_M - 1)
+        // BLOCK_M
+        * BLOCK_M
+    )
+    sorted_ids = torch.empty(max_sorted, dtype=torch.int32, device="cuda")
+    sorted_weights = torch.empty(max_sorted, dtype=torch.float32, device="cuda")
+    sorted_experts = torch.empty(
+        (max_sorted + BLOCK_M - 1) // BLOCK_M, dtype=torch.int32, device="cuda"
+    )
+    num_valid_ids = torch.empty(2, dtype=torch.int32, device="cuda")
+    moe_buf = torch.empty((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    activation_quant = torch.empty(
+        (tokens, HIDDEN // 2), dtype=dtypes.fp4x2, device="cuda"
+    )
+    activation_scale_token = torch.empty(
+        (tokens, HIDDEN // 32), dtype=dtypes.fp8_e8m0, device="cuda"
+    )
+    aiter.mxfp4_moe_sort_quant_fwd(
+        hidden,
+        topk_ids,
+        topk_weights,
+        sorted_ids,
+        sorted_weights,
+        sorted_experts,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale_token,
+        experts,
+    )
+    return (
+        sorted_ids,
+        sorted_weights,
+        sorted_experts,
+        num_valid_ids,
+        moe_buf,
+        activation_quant,
+        activation_scale_token,
+    )
+
+
+@pytest.mark.parametrize("experts, topk", ROUTE_VARIANTS)
+@pytest.mark.parametrize("tokens", TOKEN_COUNTS)
+def test_fused_sort_quant_matches_opus_and_generic_quant(tokens, experts, topk):
+    hidden, topk_ids, topk_weights = _make_inputs(tokens, experts, topk)
+
+    ref_ids, ref_weights, ref_experts, ref_valid, _ = moe_sorting(
+        topk_ids,
+        topk_weights,
+        experts,
+        HIDDEN,
+        dtypes.bf16,
+        BLOCK_M,
+    )
+    ref_quant, _ = fused_dynamic_mxfp4_quant_moe_sort(
+        hidden,
+        sorted_ids=ref_ids,
+        num_valid_ids=ref_valid,
+        token_num=tokens,
+        topk=topk,
+        block_size=BLOCK_M,
+        sorted_weights=ref_weights,
+    )
+    compact_quant, compact_scale = per_1x32_f4_quant_hip(hidden, shuffle=False)
+    fused = _run_fused(hidden, topk_ids, topk_weights, experts)
+    torch.cuda.synchronize()
+
+    (
+        fused_ids,
+        fused_weights,
+        fused_experts,
+        fused_valid,
+        fused_moe_buf,
+        fused_quant,
+        fused_scale_token,
+    ) = fused
+    assert _canonical_entries(
+        ref_ids, ref_weights, ref_experts, ref_valid
+    ) == _canonical_entries(fused_ids, fused_weights, fused_experts, fused_valid)
+    torch.testing.assert_close(fused_valid, ref_valid, rtol=0, atol=0)
+    torch.testing.assert_close(fused_moe_buf, torch.zeros_like(fused_moe_buf))
+    torch.testing.assert_close(
+        fused_quant.view(torch.uint8), ref_quant.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        fused_quant.view(torch.uint8), compact_quant.view(torch.uint8), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        fused_scale_token.view(torch.uint8),
+        compact_scale.view(torch.uint8),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.parametrize("tokens", [2, 4])
+def test_fused_decode_sort_quant_returns_sorted_scale(tokens):
+    hidden, topk_ids, topk_weights = _make_inputs(tokens, 512, 10)
+    result = _fused_decode_sort_quant(
+        hidden,
+        topk_ids,
+        topk_weights,
+        model_dim=HIDDEN,
+        global_experts=512,
+        block_m=BLOCK_M,
+        moebuf_dtype=torch.bfloat16,
+        accumulate=True,
+    )
+    activation_scale = result[-1]
+    assert activation_scale.shape[0] == result[0].shape[0]
+    assert activation_scale.shape[1] == HIDDEN // 32
+    compact_result = _fused_decode_sort_quant(
+        hidden,
+        topk_ids,
+        topk_weights,
+        model_dim=HIDDEN,
+        global_experts=512,
+        block_m=BLOCK_M,
+        moebuf_dtype=torch.bfloat16,
+        accumulate=True,
+        compact_scale=True,
+    )
+    compact_scale = compact_result[-1]
+    assert compact_scale.shape == (tokens, HIDDEN // 32)
+
+
+@pytest.mark.parametrize(
+    "experts, topk, tokens, expected",
+    [
+        pytest.param(512, 10, 100, True, id="non_power_of_2_m_accepted"),
+        pytest.param(513, 11, 8, True, id="fused_shared_route_accepted"),
+        pytest.param(512, 8, 8, False, id="uninstantiated_topk"),
+        pytest.param(256, 10, 8, False, id="uninstantiated_experts"),
+        pytest.param(512, 10, 129, False, id="m_above_kernel_contract"),
+    ],
+)
+def test_fused_decode_sort_quant_gate(monkeypatch, experts, topk, tokens, expected):
+    """The gate must reject anything the kernel is not instantiated for.
+
+    ``AITER_CHECK`` aborts the process instead of raising, so an unsupported
+    shape reaching the op is fatal -- this gate is the only guard.
+    """
+    monkeypatch.setenv("SGLANG_AITER_FUSED_DECODE_SORT_QUANT", "auto")
+    pool = min(experts, 512)
+    topk_ids = torch.stack(
+        [
+            torch.randperm(pool, dtype=torch.int32, device="cuda")[:topk]
+            for _ in range(tokens)
+        ]
+    )
+    topk_weights = torch.rand((tokens, topk), dtype=torch.float32, device="cuda")
+    hidden = torch.randn((tokens, HIDDEN), dtype=torch.bfloat16, device="cuda")
+    assert (
+        _is_fused_decode_sort_quant_enabled(
+            hidden,
+            topk_ids,
+            topk_weights,
+            global_experts=experts,
+            block_m=BLOCK_M,
+            quant_type=aiter.QuantType.per_1x32,
+            q_dtype_a=dtypes.fp4x2,
+            q_dtype_w=dtypes.fp4x2,
+            activation=aiter.ActivationType.Silu,
+            is_g1u1=True,
+            expert_mask=None,
+            num_local_tokens=None,
+            need_local_topk_ids=False,
+            run_1stage=False,
+            stage1_is_flydsl=True,
+            hidden_pad=0,
+            ksplit=0,
+        )
+        is expected
+    )
+
+
+@pytest.mark.parametrize(
+    "runtime_arch", ["gfx942", None], ids=["unsupported", "detection_failure"]
+)
+def test_fused_decode_sort_quant_gate_uses_runtime_arch(monkeypatch, runtime_arch):
+    """Runtime dispatch must ignore a potentially different build target."""
+    monkeypatch.setenv("SGLANG_AITER_FUSED_DECODE_SORT_QUANT", "auto")
+    if runtime_arch is None:
+
+        def detect_runtime_arch():
+            raise RuntimeError("runtime architecture unavailable")
+
+    else:
+
+        def detect_runtime_arch():
+            return runtime_arch
+
+    monkeypatch.setattr("aiter.fused_moe.get_gfx_runtime", detect_runtime_arch)
+    hidden, topk_ids, topk_weights = _make_inputs(8, 512, 10)
+
+    assert not _is_fused_decode_sort_quant_enabled(
+        hidden,
+        topk_ids,
+        topk_weights,
+        global_experts=512,
+        block_m=BLOCK_M,
+        quant_type=aiter.QuantType.per_1x32,
+        q_dtype_a=dtypes.fp4x2,
+        q_dtype_w=dtypes.fp4x2,
+        activation=aiter.ActivationType.Silu,
+        is_g1u1=True,
+        expert_mask=None,
+        num_local_tokens=None,
+        need_local_topk_ids=False,
+        run_1stage=False,
+        stage1_is_flydsl=True,
+        hidden_pad=0,
+        ksplit=0,
+    )
+
+
+@pytest.mark.parametrize("experts, topk", ROUTE_VARIANTS)
+def test_fused_sort_quant_is_cuda_graph_replay_safe(experts, topk):
+    hidden, topk_ids, topk_weights = _make_inputs(4, experts, topk)
+    # Compile/warm up before capture. The graph itself only records the
+    # fixed-address operator launch; all buffers are preallocated.
+    _run_fused(hidden, topk_ids, topk_weights, experts)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        fused = _run_fused(hidden, topk_ids, topk_weights, experts)
+    graph.replay()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    assert int(fused[3][1].item()) == 4
+    torch.testing.assert_close(fused[4], torch.zeros_like(fused[4]))
