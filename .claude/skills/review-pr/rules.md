@@ -427,6 +427,7 @@ Real example (aiter#4538): a FlyDSL kernel whose entire justification was perf w
 | Test logs its verdict instead of asserting it | `if <ok>: log("...pass") else: log("...fail")` with no assert on the same condition | `⚠️ HK19: [test] cannot fail — assert the condition; the log is not a check` |
 | `print()` for diagnostics in new test code | `print(` on a `+` line in `op_tests/**/test_*.py` | `📝 HK16: [location] prints — assert instead, or route it through the aiter logger with % placeholders` |
 | Root logger reconfigured at import | `logging.basicConfig(` on a `+` line outside `__main__` | `⚠️ HK17: basicConfig at import puts the whole process's root logger at that level — use the aiter logger` |
+| Submodule pinned to non-upstream commit | Diff changes a `3rdparty/*` submodule pin; `git branch -r --contains <new-hash>` (inside the submodule remote) returns empty — the commit is not on any upstream branch | `🔴 HK20: [submodule] pinned to [hash] which is not on any upstream branch — personal/local commits can be gc'd or become unfetchable, breaking all downstream git submodule update. Merge the commit into upstream (e.g. CK develop) first, then repin to the official commit. Ref: PR#5708 pinned composable_kernel to a personal commit (1f66d862) not on CK develop, while PR#4620 correctly pinned to a develop commit (af9e1d1f).` |
 
 ---
 
