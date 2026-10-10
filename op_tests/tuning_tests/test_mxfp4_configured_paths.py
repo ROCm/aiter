@@ -149,8 +149,8 @@ def test_fp8_stage2_pair_and_screening_receive_original_route_weights(
 )
 def test_production_stage2_path_matches_invocation_configuration(
     monkeypatch: "pytest.MonkeyPatch",
-    fp8: "bool",
-    fp4: "bool",
+    fp8: "str | None",
+    fp4: "str | None",
     epilog: "str",
     bn: "int",
 ) -> "None":
@@ -312,7 +312,10 @@ def cpu_configuration_worker(
     ],
 )
 def test_spawned_shape_inherits_snapshot_and_stable_production_settings(
-    monkeypatch: "pytest.MonkeyPatch", limit: "float | None", fp8: "bool", fp4: "bool"
+    monkeypatch: "pytest.MonkeyPatch",
+    limit: "str | None",
+    fp8: "str | None",
+    fp4: "str | None",
 ) -> "None":
     for name, value in zip(
         (
