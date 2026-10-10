@@ -13,7 +13,6 @@ stays ``atoms * 1152``.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T, as_ir_value
@@ -244,8 +243,9 @@ def _store_v4i32_nt_global(addr_i64, data):
     so all destinations issue together. ``nontemporal`` skips L2; this is
     payload, not a flag. ``fx.ptr_store`` has no NT flag.
     """
-    ptr_ty = ir.Type.parse("!llvm.ptr<1>")
-    ptr = llvm.IntToPtrOp(ptr_ty, as_ir_value(addr_i64)).result
+    ptr = fx.to_llvm_ptr(
+        fx.inttoptr(fx.PointerType.get(T.i8, fx.AddressSpace.Global, 16), addr_i64)
+    )
     llvm.StoreOp(as_ir_value(data), ptr, alignment=16, nontemporal=True)
 
 
