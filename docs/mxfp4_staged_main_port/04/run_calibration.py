@@ -25,14 +25,16 @@ def parse_search_console(console):
     ordinary = re.findall(r"\[mxfp4-port\] token=.+ \+ .+ us=", text)
     failures = re.findall(r"\[mxfp4-port\] candidate failed:", text)
     summary = re.findall(r"total tuning time is ([0-9.]+) seconds", text)
-    return dict(
-        validation_attempts=len(staged) + len(ordinary) + len(failures),
-        g1_screens=len(re.findall(r"\[mxfp4-staged\] GEMM1 .+ screening", text)),
-        g2_screens=len(re.findall(r"\[mxfp4-staged\] GEMM2 .+ screening", text)),
-        fallback_groups=len(re.findall(r"\[mxfp4-staged\] exhaustive fallback", text)),
-        finite_reference_errors=re.findall(r"cosine_diff=([0-9.eE+-]+)", text),
-        tuning_summary_seconds=float(summary[-1]) if summary else None,
-    )
+    return {
+        "validation_attempts": len(staged) + len(ordinary) + len(failures),
+        "g1_screens": len(re.findall(r"\[mxfp4-staged\] GEMM1 .+ screening", text)),
+        "g2_screens": len(re.findall(r"\[mxfp4-staged\] GEMM2 .+ screening", text)),
+        "fallback_groups": len(
+            re.findall(r"\[mxfp4-staged\] exhaustive fallback", text)
+        ),
+        "finite_reference_errors": re.findall(r"cosine_diff=([0-9.eE+-]+)", text),
+        "tuning_summary_seconds": float(summary[-1]) if summary else None,
+    }
 
 
 def finalize_search(job, job_dir, counts):
@@ -75,14 +77,14 @@ def finalize_search(job, job_dir, counts):
     if job["mode"] == "full":
         write_json(
             job_dir / "cost-after-full.json",
-            dict(
-                actual_search_wall_seconds=result["search_wall_seconds"],
-                validation_attempts=result["validation_attempts"],
-                static_pairs=counts["total_pairs"],
-                original_estimate=json.loads(
+            {
+                "actual_search_wall_seconds": result["search_wall_seconds"],
+                "validation_attempts": result["validation_attempts"],
+                "static_pairs": counts["total_pairs"],
+                "original_estimate": json.loads(
                     (job_dir / "cost-before-full.json").read_text()
                 ),
-            ),
+            },
         )
     return result
 
