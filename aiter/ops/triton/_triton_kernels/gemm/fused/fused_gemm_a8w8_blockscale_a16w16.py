@@ -86,7 +86,7 @@ def _fused_gemm_a8w8_blockscale_a16w16_kernel(
     GRID_MN_FP8: tl.constexpr,
     GRID_MN_BF16: tl.constexpr,
     SKIP_REDUCE: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
 
     tl.assume(stride_a_fp8_m > 0)

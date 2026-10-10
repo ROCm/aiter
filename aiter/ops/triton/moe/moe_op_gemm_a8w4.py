@@ -128,7 +128,8 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
             "w_cache_modifier": w_cache_modifier,
             "split_k": split_k,
             "waves_per_eu": tuned.get("waves_per_eu", 0),
-            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 16),
+            # gfx1250 configs omit it; 0 is the compiler default
+            "matrix_instr_nonkdim": tuned.get("matrix_instr_nonkdim", 0),
             "kpack": tuned.get("kpack", 1),
         }
 
@@ -159,7 +160,8 @@ def get_kernel_config_triton(m, n, k, routing_data, swizzle_mx_scale=None):
             "w_cache_modifier": w_cache_modifier,
             "split_k": split_k,
             "waves_per_eu": proxy.get("waves_per_eu", 0),
-            "matrix_instr_nonkdim": proxy.get("matrix_instr_nonkdim", 16),
+            # gfx1250 configs omit it; 0 is the compiler default
+            "matrix_instr_nonkdim": proxy.get("matrix_instr_nonkdim", 0),
             "kpack": proxy.get("kpack", 1),
         }
 

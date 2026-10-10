@@ -257,7 +257,7 @@ def _gemm_a8w8_blockscale_preshuffle_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """
     Note: this is Triton jited function and not meant to be called directly. Call gemm_a8w8_blockscale function

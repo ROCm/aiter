@@ -74,7 +74,7 @@ def _batched_gemm_afp4_wfp4_kernel(
     NUM_KSPLIT: tl.constexpr,
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.

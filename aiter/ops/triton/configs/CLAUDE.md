@@ -219,14 +219,20 @@ The returned config is a fresh deep copy, safe to mutate.
 
   ```
   BLOCK_SIZE_M, BLOCK_SIZE_N, BLOCK_SIZE_K, GROUP_SIZE_M,
-  num_warps, num_stages, waves_per_eu, matrix_instr_nonkdim,
-  cache_modifier, NUM_KSPLIT
+  num_warps, num_stages, waves_per_eu, NUM_KSPLIT
   ```
+
+  plus `matrix_instr_nonkdim` and `cache_modifier`, except on gfx1250: its
+  WMMA lowering ignores `matrix_instr_nonkdim` and its tables set no cache
+  modifier, so the gfx1250 tables omit both. Kernels launched with these
+  configs default the parameters to `matrix_instr_nonkdim=0` (the compiler
+  default) and `cache_modifier=None`, and wrappers that read them by key use
+  `config.get()` with the same values, so a missing key means exactly that.
 
   `add_default_gemm_config_params()` backfills `NUM_KSPLIT=1` and
   `cache_modifier=None` as a last resort, and `compute_splitk_params()`
   derives `SPLITK_BLOCK_SIZE` and may clamp `BLOCK_SIZE_K` / `NUM_KSPLIT`.
-  Neither is a license to omit keys.
+  Neither is a license to omit the other keys.
 
 ### `_get_config()` stays a thin wrapper
 
@@ -291,7 +297,7 @@ guesses:
 
 | Family | Backend | Key | Entry keys |
 | ------ | ------- | --- | ---------- |
-| `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` |
+| `A8W4` | `triton` | `bm<block_m>_n<N>_k<K>` | `BLOCK_SIZE_N`, `BLOCK_SIZE_K`, `num_warps`, `num_stages`, `waves_per_eu`, `matrix_instr_nonkdim` (not on gfx1250) |
 | `A8W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps`, `persistent_iters` |
 | `A4W4` | `gluon` | `bm<block_m>_n<N>_k<K>_<bucket>`, then `bm<block_m>_any` | `block_n`, `block_k`, `num_buffers`, `num_warps` |
 
@@ -434,12 +440,10 @@ is not tuning, and it should be replaced by measured numbers.
   shape keys and MHC `C_`/`M_LEQ_` all belong to their own families.
 - Reintroduce a probe, a candidate list, or a cross-backend/cross-arch search
   in `resolve_config_dir()`. A miss is an error with a path in it.
-- Add `kpack` to a gfx950 config. Triton's AMD backend deprecates `kpack` on
-  CDNA4 — it warns and force-overrides `kpack = 1` there, and the parameter is
-  slated for removal. No gfx950 config carries it today; keep it that way.
-  gfx942 configs still may. The RDNA trees (gfx1151, gfx1201, gfx1250) do
-  carry `kpack` in places — those entries predate the rule, so do not add new
-  ones and drop them when you retune the family.
+- Add `kpack` to a config for any arch but gfx942. Triton's AMD backend
+  deprecates `kpack` on CDNA4 — it warns and force-overrides `kpack = 1` there,
+  and the parameter is slated for removal. gfx942 configs still carry it; no
+  other arch does, so keep it that way.
 
 ### Not tuning configs
 

@@ -7,8 +7,6 @@
         "NUM_KSPLIT": 1,
         "num_warps": 4,
         "num_stages": 2,
-        "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": null
+        "waves_per_eu": 0
     }
 }

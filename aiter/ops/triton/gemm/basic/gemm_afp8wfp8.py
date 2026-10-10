@@ -228,10 +228,9 @@ def gemm_afp8wfp8(
     # Byte pointers can inflate LDS allocation despite identical E4M3 bits.
     x, w = x.view(torch.float8_e4m3fn), w.view(torch.float8_e4m3fn)
     x_scales, w_scales = x_scales.view(torch.uint8), w_scales.view(torch.uint8)
-    launch_options = {
-        k: launch[k]
-        for k in ("num_warps", "num_stages", "waves_per_eu", "matrix_instr_nonkdim")
-    }
+    launch_options = {k: launch[k] for k in ("num_warps", "num_stages", "waves_per_eu")}
+    # gfx1250 configs omit it
+    launch_options["matrix_instr_nonkdim"] = launch.get("matrix_instr_nonkdim", 0)
     scales = {
         "A_SCALE_K_GROUP": x_scale_group_size,
         "B_SCALE_N_GROUP": group_n,
@@ -305,7 +304,7 @@ def gemm_afp8wfp8(
             FUSED_SPLITS=fused_splits,
             ws_ptr=partials,
             cnt_ptr=counters,
-            cache_modifier=launch["cache_modifier"],
+            cache_modifier=launch.get("cache_modifier"),  # gfx1250 configs omit it
             **scales,
             **launch_options,
         )
@@ -533,7 +532,7 @@ def gemm_afp8wfp8_preshuffle(
             SPLITK_BLOCK_SIZE=config["SPLITK_BLOCK_SIZE"],
             num_warps=config["num_warps"],
             warp_bases=tuple(warp_bases),
-            cache_modifier=config["cache_modifier"],
+            cache_modifier=config.get("cache_modifier"),  # gfx1250 configs omit it
             NUM_BUFFERS=num_buffers,
             # Every gluon preshuffle config declares this; configs/CLAUDE.md
             # forbids Python-side defaults for tuning values, so a missing key

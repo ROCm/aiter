@@ -865,8 +865,8 @@ def _gemm_a8w8_blockscale_preshuffle_bandwidth_bound_kernel(
     # GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
     warp_bases: gl.constexpr,
-    cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    cache_modifier: gl.constexpr = None,  # gfx1250 configs omit it
     MAYBE_LOOP_UNROLL: gl.constexpr = False,
 ):
     """
@@ -1371,8 +1371,8 @@ def _gemm_a8w8_blockscale_preshuffle_compute_bound_kernel(
     # GRID_MN: gl.constexpr,
     num_warps: gl.constexpr,
     warp_bases: gl.constexpr,
-    cache_modifier: gl.constexpr,
     NUM_BUFFERS: gl.constexpr,
+    cache_modifier: gl.constexpr = None,  # gfx1250 configs omit it
     MAYBE_LOOP_UNROLL: gl.constexpr = False,
 ):
     """

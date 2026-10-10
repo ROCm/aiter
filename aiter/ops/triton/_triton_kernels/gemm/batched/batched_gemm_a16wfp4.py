@@ -77,7 +77,7 @@ def _batched_gemm_a16wfp4_kernel(
     EVEN_K: tl.constexpr,
     PRE_QUANT: tl.constexpr,
     HAVE_Y_SCALE: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """
     Kernel for computing the matmul C = A x B.

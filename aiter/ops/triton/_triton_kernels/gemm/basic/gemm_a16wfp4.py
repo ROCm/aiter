@@ -64,10 +64,10 @@ def _gemm_a16wfp4_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
     GRID_MN: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr = 0,  # gfx1250 configs omit it
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.
@@ -240,10 +240,10 @@ def _gemm_a16wfp4_preshuffle_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
     GRID_MN: tl.constexpr,
     PREQUANT: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr = 0,  # gfx1250 configs omit it
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """Kernel for computing the matmul C = A x B.
     A and B inputs are in the microscale fp4 (mxfp4) format.

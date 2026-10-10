@@ -8,8 +8,6 @@
         "num_warps": 4,
         "num_stages": 2,
         "waves_per_eu": 0,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": null,
         "N_FIRST": false,
         "FUSED_SPLITK": false,
         "REDUCE_BLOCK_SIZE_M": 32,

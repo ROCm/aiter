@@ -82,7 +82,7 @@ def _fused_gemm_a8w8_blockscale_split_cat(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     tl.assume(stride_a_m > 0)
     tl.assume(stride_a_k > 0)
@@ -332,7 +332,7 @@ def _fused_gemm_a8w8_blockscale_preshuffle_split_cat(
     SPLITK_BLOCK_SIZE: tl.constexpr,
     EVEN_K: tl.constexpr,
     GRID_MN: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     tl.assume(stride_a_m > 0)
     tl.assume(stride_a_k > 0)

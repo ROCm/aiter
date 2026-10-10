@@ -345,8 +345,9 @@ def fused_fp4_bmm_rope_cat_and_cache_mla(
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
         waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        cache_modifier=config["cache_modifier"],
+        # gfx1250 configs omit these
+        matrix_instr_nonkdim=config.get("matrix_instr_nonkdim", 0),
+        cache_modifier=config.get("cache_modifier"),
     )
 
     if NUM_KSPLIT > 1:
@@ -658,8 +659,9 @@ def fused_fp8_bmm_rope_cat_and_cache_mla(
         num_warps=config["num_warps"],
         num_stages=config["num_stages"],
         waves_per_eu=config["waves_per_eu"],
-        matrix_instr_nonkdim=config["matrix_instr_nonkdim"],
-        cache_modifier=config["cache_modifier"],
+        # gfx1250 configs omit these
+        matrix_instr_nonkdim=config.get("matrix_instr_nonkdim", 0),
+        cache_modifier=config.get("cache_modifier"),
     )
 
     return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out

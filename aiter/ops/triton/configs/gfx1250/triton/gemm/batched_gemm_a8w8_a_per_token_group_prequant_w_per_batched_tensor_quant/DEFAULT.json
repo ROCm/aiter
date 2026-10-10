@@ -5,9 +5,7 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 8,
         "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg"
+        "waves_per_eu": 2
     },
     "M_LEQ_32": {
         "BLOCK_SIZE_M": 32,
@@ -15,9 +13,7 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 8,
         "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg"
+        "waves_per_eu": 2
     },
     "M_LEQ_64": {
         "BLOCK_SIZE_M": 32,
@@ -25,9 +21,7 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 8,
         "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg"
+        "waves_per_eu": 2
     },
     "M_LEQ_128": {
         "BLOCK_SIZE_M": 32,
@@ -35,9 +29,7 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 8,
         "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg"
+        "waves_per_eu": 2
     },
     "M_LEQ_256": {
         "BLOCK_SIZE_M": 32,
@@ -45,9 +37,7 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 8,
         "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg"
+        "waves_per_eu": 2
     },
     "any": {
         "BLOCK_SIZE_M": 32,
@@ -55,8 +45,6 @@
         "GROUP_SIZE_M": 1,
         "num_warps": 8,
         "num_stages": 2,
-        "waves_per_eu": 2,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg"
+        "waves_per_eu": 2
     }
 }

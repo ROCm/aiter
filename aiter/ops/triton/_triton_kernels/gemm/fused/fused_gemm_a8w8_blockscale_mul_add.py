@@ -78,8 +78,8 @@ def _fused_gemm_a8w8_blockscale_mul_add_kernel(
     num_warps: tl.constexpr,
     num_stages: tl.constexpr,
     waves_per_eu: tl.constexpr,
-    matrix_instr_nonkdim: tl.constexpr,
-    cache_modifier: tl.constexpr,
+    matrix_instr_nonkdim: tl.constexpr = 0,  # gfx1250 configs omit it
+    cache_modifier: tl.constexpr = None,  # gfx1250 configs omit it
 ):
     """
     Kernel for computing the matmul C = A x B.
