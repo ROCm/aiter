@@ -35,6 +35,7 @@ def _get_gemm_config_cached(
     specialized_filename: str | None = None,
     backend: str = "triton",
     B: int | None = None,
+    cu: int | None = None,
 ) -> tuple[dict, bool]:
     """
     Internal cached implementation. Do NOT use this directly — use
@@ -73,8 +74,14 @@ def _get_gemm_config_cached(
     if specialized_filename is not None:
         specialized_suffixes = [specialized_filename]
     elif N is not None and K is not None:
+        # Parts of one arch can differ in CU count; a "-CU=<n>" file tuned for
+        # this CU count wins over the arch-wide one.
         if B is not None:
+            if cu is not None:
+                specialized_suffixes.append(f"B={B}-N={N}-K={K}-CU={cu}")
             specialized_suffixes.append(f"B={B}-N={N}-K={K}")
+        if cu is not None:
+            specialized_suffixes.append(f"N={N}-K={K}-CU={cu}")
         specialized_suffixes.append(f"N={N}-K={K}")
 
     is_tuned = False
@@ -147,6 +154,7 @@ def get_gemm_config(
     1. Load default config file: <d_type>/DEFAULT.json
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
+       In 2 and 3, a {...}-CU={cu}.json file for the device's CU count is tried first.
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
     4. Search M_LEQ_x using explicit bounds, file M_BOUNDS or STANDARD_M_BOUNDS
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
@@ -168,8 +176,9 @@ def get_gemm_config(
         Dictionary with the config params (a fresh deep-copy safe to mutate),
         bool indicating if the config is tuned.(True if tuned, False otherwise)
     """
+    cu = arch_info.get_cu_count() if specialized_filename is None else None
     config, is_tuned = _get_gemm_config_cached(
-        config_name, M, N, K, bounds, specialized_filename, backend, B
+        config_name, M, N, K, bounds, specialized_filename, backend, B, cu
     )
     return _copy_gemm_config(config), is_tuned
 
