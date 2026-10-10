@@ -6,8 +6,10 @@
 One workgroup owns ``(row, kv_head, split)``.  Q is staged once, paged K/V
 are gathered in ``BLOCK_N`` tiles, QK and PV use BF16 MFMA, and online
 softmax is maintained in log2 space.  Decode runs BLOCK_N=16 over two waves
-with split-K; prefill runs BLOCK_N=32 over two waves and, once the grid
-alone fills the machine, writes its output directly.
+with split-K. On gfx942, a BN16 grid that fits in one workgroup per CU
+widens to four waves and each lane loads its own MFMA K fragment.
+Prefill runs BLOCK_N=32 over two waves and, once the grid alone fills the
+machine, writes its output directly.
 
 gfx942 aliases K and V in one LDS tile so the tile stays under 64 KiB.
 gfx950 decode still overlays one tile. Only gfx950 prefill stores K and V
@@ -107,7 +109,11 @@ def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
 
 
 def _launch_config(
-    rows: int, n_sel: int, n_kv_heads: int, head_dim: int
+    rows: int,
+    n_sel: int,
+    n_kv_heads: int,
+    head_dim: int,
+    tiny_splits: int = _TINY_SPLITS,
 ) -> tuple[int, int, int]:
     """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
     base_programs = rows * n_kv_heads
@@ -120,7 +126,7 @@ def _launch_config(
         _DECODE_BANDS_NARROW if head_dim <= _NARROW_HEAD_DIM else _DECODE_BANDS_WIDE
     )
     if base_programs <= tiny_max:
-        block_n, target_splits, threads = 16, _TINY_SPLITS, _DECODE_THREADS
+        block_n, target_splits, threads = 16, tiny_splits, _DECODE_THREADS
     elif base_programs <= mid_max:
         block_n, target_splits, threads = 16, 64, _DECODE_THREADS
     elif base_programs < 32:
@@ -142,6 +148,29 @@ def _launch_config(
     tiles = max(1, (n_sel + block_n - 1) // block_n)
     max_useful_splits = 1 << (tiles.bit_length() - 1)
     return block_n, threads, min(max_useful_splits, target_splits)
+
+
+def _gfx942_reg_qk(head_dim: int, block_n: int) -> bool:
+    """256-thread BN16 gather holds every K16 step in some wave's registers.
+
+    Four waves, sixteen threads per token, eight elements per thread. A wave
+    therefore owns two K16 steps per gather round, and one round is
+    ``col_owners`` chunks. That covers ``head_dim`` exactly when D is a
+    multiple of 128, and the prefetch keeps the whole tile in registers only
+    when a single gather chunk is the whole round.
+    """
+    if block_n != 16 or head_dim % 128:
+        return False
+    vec = 8
+    d_chunks = head_dim // vec
+    col_owners = 256 // block_n
+    if d_chunks % col_owners:
+        return False
+    gather_rounds = d_chunks // col_owners
+    gather_chunk = next(
+        c for c in range(min(gather_rounds, 4), 0, -1) if gather_rounds % c == 0
+    )
+    return gather_rounds // gather_chunk == 1
 
 
 def build_qsa_k2_module(
@@ -265,8 +294,25 @@ def build_qsa_k2_module(
     # all block_n tokens and need no cross-wave reduction.
     qk_split = not decode_tr_pv and num_waves > 1 and n_subtiles % num_waves == 0
     qk_sub_per_wave = n_subtiles // num_waves if qk_split else n_subtiles
-    # One 4-wide f32 C fragment per lane per subtile.
-    qk_score_slots = n_subtiles * 64 * 4 if qk_split else 1
+    # gfx942 256-thread BN16: each lane global-loads the four bf16 MFMA A
+    # already wants (token ``lane % 16``, K ``step * 16 + (lane // 16) * 4``).
+    # That is the same K split as the vec8 gather, without the wave shuffle
+    # that repacked those halves. Partial scores still meet in LDS before
+    # softmax. V stays on the existing shared-memory path.
+    qk_reg = (
+        (not use_k32) and block_threads == 256 and _gfx942_reg_qk(head_dim, block_n)
+    )
+    # One 4-wide f32 C fragment per lane per subtile. The register split
+    # keeps one subtile and one partial per wave.
+    if qk_reg:
+        qk_score_slots = num_waves * 64 * 4
+    elif qk_split:
+        qk_score_slots = n_subtiles * 64 * 4
+    else:
+        qk_score_slots = 1
+    # K-step distance between the two halves a wave owns, and between rounds.
+    reg_k_wave = (64 // block_n) * vec // qk_k
+    reg_k_round = col_owners * vec // qk_k
 
     def make_k_lds_view(k_arr, offset, shape):
         # gfx950 XOR on stride D. Prefill V overlay reuses this map;
@@ -319,6 +365,7 @@ def build_qsa_k2_module(
             ns=n_splits,
             qkk=qk_k,
             wide=int(wide_cache),
+            **({"qks": "reg4a"} if qk_reg else {}),
             **({"kvs": "x".join(str(s) for s in kv_strides)} if strided_wide else {}),
         ),
         known_block_size=[block_threads, 1, 1],
@@ -367,6 +414,8 @@ def build_qsa_k2_module(
         )
         lds_copy = fx.make_copy_atom(fx.UniversalCopy128b(), BFloat16)
         lds_copy64 = fx.make_copy_atom(fx.UniversalCopy64b(), BFloat16)
+        k_a_copy = fx.make_copy_atom(fx.UniversalCopy64b(), BFloat16)
+        k_a_buf = buf_copy_atom(8, BFloat16)
         kv_tile, kv_tv = fx.make_layout_tv(
             fx.make_layout((block_n, col_owners), (1, block_n)),
             fx.make_layout((1, vec), (vec, 1)),
@@ -385,6 +434,11 @@ def build_qsa_k2_module(
                 BFloat16.ir_type,
                 address_space=fx.AddressSpace.Global,
                 alignment=16,
+            )
+            a_ptr_ty = fx.PointerType.get(
+                BFloat16.ir_type,
+                address_space=fx.AddressSpace.Global,
+                alignment=8,
             )
             page_elems64 = Int64(kv_strides[0])
             token_elems64 = Int64(kv_strides[1])
@@ -658,15 +712,29 @@ def build_qsa_k2_module(
             num_records_bytes=group_size * head_dim * 2,
         )
         q_frags = []
-        for ks in range_constexpr(qk_steps):
-            q_tile = fx.make_view(
-                fx.get_iter(q_group) + Int32(ks * qk_k),
-                fx.make_layout((16, qk_k), (head_dim, 1)),
-            )
-            q_src = qk_q_copy.partition_S(q_tile)
-            q_frag = fx.make_fragment_like(q_src)
-            fx.copy(q_copy, q_src, q_frag)
-            q_frags.append(q_frag)
+        if const_expr(qk_reg):
+            # This wave's K steps only. The other waves cover the rest.
+            for r in range_constexpr(gather_rounds):
+                for s in range_constexpr(2):
+                    ks = wave * Int32(reg_k_wave) + Int32(r * reg_k_round + s)
+                    q_tile = fx.make_view(
+                        fx.get_iter(q_group) + ks * Int32(qk_k),
+                        fx.make_layout((16, qk_k), (head_dim, 1)),
+                    )
+                    q_src = qk_q_copy.partition_S(q_tile)
+                    q_frag = fx.make_fragment_like(q_src)
+                    fx.copy(q_copy, q_src, q_frag)
+                    q_frags.append(q_frag)
+        else:
+            for ks in range_constexpr(qk_steps):
+                q_tile = fx.make_view(
+                    fx.get_iter(q_group) + Int32(ks * qk_k),
+                    fx.make_layout((16, qk_k), (head_dim, 1)),
+                )
+                q_src = qk_q_copy.partition_S(q_tile)
+                q_frag = fx.make_fragment_like(q_src)
+                fx.copy(q_copy, q_src, q_frag)
+                q_frags.append(q_frag)
 
         # Pin the masking below the loads. Left alone the scheduler sinks the
         # index loads under the first Q wait to recycle Q's registers, which
@@ -674,20 +742,15 @@ def build_qsa_k2_module(
         # needs them. Only VMEM reads may cross, so the page-table load still
         # floats up to the moment its index lands. Decode only: prefill has
         # enough tiles to hide the chain and loses 6% at L32768 if pinned.
-        if const_expr(decode_tr_pv):
+        pin_q = decode_tr_pv or gfx942_v_pf
+        if const_expr(pin_q):
             fx.rocdl.sched_barrier("vmem_read")
         phys0 = load_page(tok0)
 
         q_regs = []
-        for ks in range_constexpr(qk_steps):
-            q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
-            if const_expr(decode_tr_pv):
-                # Packed cndmask. The per-element f32 round-trip packed with
-                # v_perm; AMD zeros OOB heads at the load mask instead.
-                q_regs.append(
-                    q_live.select(q_vec, fx.Vector.filled(qk_vec, 0.0, BFloat16))
-                )
-            else:
+        if const_expr(qk_reg):
+            for ks in range_constexpr(gather_rounds * 2):
+                q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
                 q_regs.append(
                     fx.Vector.from_elements(
                         [
@@ -699,9 +762,97 @@ def build_qsa_k2_module(
                         BFloat16,
                     )
                 )
+        else:
+            for ks in range_constexpr(qk_steps):
+                q_vec = fx.Vector(fx.memref_load_vec(q_frags[ks]))
+                if const_expr(decode_tr_pv):
+                    # Packed cndmask. The per-element f32 round-trip packed with
+                    # v_perm; AMD zeros OOB heads at the load mask instead.
+                    q_regs.append(
+                        q_live.select(q_vec, fx.Vector.filled(qk_vec, 0.0, BFloat16))
+                    )
+                else:
+                    q_regs.append(
+                        fx.Vector.from_elements(
+                            [
+                                q_live.select(q_vec[i].to(Float32), Float32(0.0)).to(
+                                    BFloat16
+                                )
+                                for i in range_constexpr(qk_vec)
+                            ],
+                            BFloat16,
+                        )
+                    )
         init_acc = [fx.Vector.filled(4, 0.0, Float32) for _ in range(out_chunks)]
         init_acc.append(Float32(float("-inf")))
         init_acc.append(Float32(0.0))
+        # One fragment per gather round on the LDS path. The direct-A path
+        # carries one 4-wide fragment per K step this wave owns.
+        n_k_pref = gather_rounds * 2 if qk_reg else n_gather_chunks * gather_chunk
+
+        def k_row_of(phys, page_off):
+            if const_expr(wide_cache):
+                return kv_row(k_base, phys, page_off)
+            return fx.logical_divide(
+                fx.slice(k_buf, (phys, page_off, kv_h, None)),
+                vec_layout,
+            )
+
+        def load_k_frags(phys, page_off):
+            if const_expr(qk_reg):
+                frags = []
+                for i in range_constexpr(n_k_pref):
+                    ks = wave * Int32(reg_k_wave) + Int32(
+                        (i // 2) * reg_k_round + (i % 2)
+                    )
+                    d = ks * Int32(qk_k) + lane_kg * Int32(4)
+                    frag = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
+                    if const_expr(wide_cache):
+                        addr = k_base + (
+                            Int64(phys) * page_elems64
+                            + Int64(page_off) * token_elems64
+                            + Int64(kv_h) * head_elems64
+                            + Int64(d)
+                        ) * Int64(2)
+                        src = fx.make_view(
+                            fx.inttoptr(a_ptr_ty, addr),
+                            fx.make_layout(qk_vec, 1),
+                        )
+                        fx.copy_atom_call(k_a_copy, src, frag)
+                    else:
+                        row = fx.slice(k_buf, (phys, page_off, kv_h, None))
+                        src = fx.make_view(
+                            fx.get_iter(row) + d,
+                            fx.make_layout(qk_vec, 1),
+                        )
+                        fx.copy_atom_call(k_a_buf, src, frag)
+                    frags.append(frag)
+                return frags
+            k_row = k_row_of(phys, page_off)
+            frags = []
+            for gr in range_constexpr(n_k_pref):
+                d_chunk = chunk_owner + Int32(gr * col_owners)
+                k_src = fx.slice(k_row, (None, d_chunk))
+                k_frag = fx.make_fragment_like(k_src)
+                fx.copy(kv_copy, k_src, k_frag)
+                frags.append(k_frag)
+            return frags
+
+        def store_k_pref(vecs, live_k):
+            for gr in range_constexpr(n_k_pref):
+                k_vec = live_k.select(
+                    vecs[gr],
+                    fx.Vector.filled(vec, 0.0, BFloat16),
+                )
+                k_tile = make_k_lds_view(
+                    k_arr,
+                    Int32(gr * gather_span),
+                    (block_n, gather_span),
+                )
+                k_dst = kv_store.partition_D(k_tile)
+                k_store_frag = fx.make_fragment_like(k_dst)
+                fx.memref_store_vec(k_vec, k_store_frag)
+                fx.copy(lds_copy, k_store_frag, k_dst)
 
         def tile_body(safe_phys, page_off_i, live, state):
             gpu.barrier()
@@ -725,74 +876,88 @@ def build_qsa_k2_module(
                     fx.copy(kv_copy, v_src, v_frag)
                     v_frags.append(v_frag)
 
-            if const_expr(wide_cache):
-                k_row = kv_row(k_base, safe_phys, page_off_i)
+            if const_expr(gfx942_v_pf):
+                # Issued during the previous tile's softmax and PV, so the
+                # gather has a whole tile of math to come back. This tile
+                # only parks it in LDS. The register QK path consumes the
+                # same vectors directly and does not publish K.
+                k_pref = [state[out_chunks + 5 + i] for i in range(n_k_pref)]
+                if const_expr(not qk_reg):
+                    store_k_pref(k_pref, live)
             else:
-                k_row = fx.logical_divide(
-                    fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)),
-                    vec_layout,
-                )
-            for gc in range_constexpr(n_gather_chunks):
-                k_frags = []
-                for j in range_constexpr(gather_chunk):
-                    gr = gc * gather_chunk + j
-                    d_chunk = chunk_owner + Int32(gr * col_owners)
-                    k_src = fx.slice(k_row, (None, d_chunk))
-                    k_frag = fx.make_fragment_like(k_src)
-                    fx.copy(kv_copy, k_src, k_frag)
-                    k_frags.append(k_frag)
-                for j in range_constexpr(gather_chunk):
-                    gr = gc * gather_chunk + j
-                    k_vec = live.select(
-                        fx.Vector(fx.memref_load_vec(k_frags[j])),
-                        fx.Vector.filled(vec, 0.0, BFloat16),
+                if const_expr(wide_cache):
+                    k_row = kv_row(k_base, safe_phys, page_off_i)
+                else:
+                    k_row = fx.logical_divide(
+                        fx.slice(k_buf, (safe_phys, page_off_i, kv_h, None)),
+                        vec_layout,
                     )
-                    if const_expr(use_k32):
+                for gc in range_constexpr(n_gather_chunks):
+                    k_frags = []
+                    for j in range_constexpr(gather_chunk):
+                        gr = gc * gather_chunk + j
                         d_chunk = chunk_owner + Int32(gr * col_owners)
-                        k_dst = fx.make_view(
-                            k_arr.ptr + amd_k_off(col, d_chunk * Int32(8)),
-                            fx.make_layout(8, 1),
+                        k_src = fx.slice(k_row, (None, d_chunk))
+                        k_frag = fx.make_fragment_like(k_src)
+                        fx.copy(kv_copy, k_src, k_frag)
+                        k_frags.append(k_frag)
+                    for j in range_constexpr(gather_chunk):
+                        gr = gc * gather_chunk + j
+                        k_vec = live.select(
+                            fx.Vector(fx.memref_load_vec(k_frags[j])),
+                            fx.Vector.filled(vec, 0.0, BFloat16),
                         )
-                        k_store_frag = fx.make_rmem_tensor(
-                            fx.make_layout(8, 1), BFloat16
-                        )
-                        fx.memref_store_vec(k_vec, k_store_frag)
-                        fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
-                    else:
-                        k_tile = make_k_lds_view(
-                            k_arr,
-                            Int32(gr * gather_span),
-                            (block_n, gather_span),
-                        )
-                        k_dst = kv_store.partition_D(k_tile)
-                        k_store_frag = fx.make_fragment_like(k_dst)
-                        fx.memref_store_vec(k_vec, k_store_frag)
-                        fx.copy(lds_copy, k_store_frag, k_dst)
+                        if const_expr(use_k32):
+                            d_chunk = chunk_owner + Int32(gr * col_owners)
+                            k_dst = fx.make_view(
+                                k_arr.ptr + amd_k_off(col, d_chunk * Int32(8)),
+                                fx.make_layout(8, 1),
+                            )
+                            k_store_frag = fx.make_rmem_tensor(
+                                fx.make_layout(8, 1), BFloat16
+                            )
+                            fx.memref_store_vec(k_vec, k_store_frag)
+                            fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
+                        else:
+                            k_tile = make_k_lds_view(
+                                k_arr,
+                                Int32(gr * gather_span),
+                                (block_n, gather_span),
+                            )
+                            k_dst = kv_store.partition_D(k_tile)
+                            k_store_frag = fx.make_fragment_like(k_dst)
+                            fx.memref_store_vec(k_vec, k_store_frag)
+                            fx.copy(lds_copy, k_store_frag, k_dst)
+            # gfx942 V goes out before the K-publish barrier. QK alone is
+            # shorter than this gather, so the loads also cover the LDS
+            # wait and the barrier. Nothing may cross, which keeps the
+            # loads from sinking to the consume.
+            v_frags_pf = []
+            if const_expr(gfx942_v_pf):
+                for gr in range_constexpr(v_pf_rounds):
+                    d_chunk = chunk_owner + Int32(gr * col_owners)
+                    v_src = fx.slice(v_row, (None, d_chunk))
+                    v_frag = fx.make_fragment_like(v_src)
+                    fx.copy(kv_copy, v_src, v_frag)
+                    v_frags_pf.append(v_frag)
+                fx.rocdl.sched_barrier("none")
             if const_expr(token_major_v):
                 fx.rocdl.s_waitcnt(lgkmcnt=0)
                 fx.rocdl.s_barrier()
             else:
                 gpu.barrier()
 
-            # V rounds issued ahead of QK, so their latency lands under the
-            # MFMA block. Every round in flight costs 4 VGPRs, so when V
-            # overlays K the prefetch is one chunk deep; with a separate V
-            # region there is no aliasing barrier to sit behind and the whole
-            # gather can ride across QK, which is where the memory-level
-            # parallelism comes from. gfx942 overlays too, but a partial
-            # chunk held across QK slowed BN32 prefill, so gfx942_v_pf is
-            # set only when that one chunk is the whole gather.
-            v_frags_pf = []
-            if (
-                const_expr(use_k32)
-                and const_expr(not decode_tr_pv)
-                or const_expr(gfx942_v_pf)
-            ):
+            # gfx950 prefill issues V ahead of QK into its own LDS region.
+            # A partial gfx942 chunk held across QK slowed BN32, so that
+            # path only prefetches when one chunk is the whole gather,
+            # and it does so above the barrier.
+            v_ahead = use_k32 and not decode_tr_pv
+            if const_expr(v_ahead):
                 for gr in range_constexpr(v_pf_rounds):
                     d_chunk = chunk_owner + Int32(gr * col_owners)
                     v_src = fx.slice(v_row, (None, d_chunk))
                     v_frag = fx.make_fragment_like(v_src)
-                    fx.copy(kv_copy, v_src, v_frag)
+                    fx.copy(g_copy, v_src, v_frag)
                     v_frags_pf.append(v_frag)
 
             # Compute K @ Q^T. The transposed QK C map is token-major in each
@@ -813,33 +978,73 @@ def build_qsa_k2_module(
                                 n_tok, Int32(ks * qk_k) + lane_kg * Int32(8)
                             )
                         acc4 = qk_mfma(a_vec, fx.Vector(q_regs[ks]), acc4)
-                else:
+                elif const_expr(not qk_reg):
                     k_row_bytes = Int32(head_dim if use_k32 else k_stride)
-                    sA = make_k_lds_view(k_arr, n0 * k_row_bytes, (16, qk_k))
-                    a_src = qk_a_copy.partition_S(sA)
-                    a_frag = fx.make_fragment_like(a_src)
-                    fx.copy(qk_b_atom, a_src, a_frag)
-                    for ks in range_constexpr(qk_steps - 1):
-                        sA_n = make_k_lds_view(
+
+                    def load_qk_a(ks, n0=n0, k_row_bytes=k_row_bytes):
+                        sA_k = make_k_lds_view(
                             k_arr,
-                            n0 * k_row_bytes + Int32((ks + 1) * qk_k),
+                            n0 * k_row_bytes + Int32(ks * qk_k),
                             (16, qk_k),
                         )
-                        a_src_n = qk_a_copy.partition_S(sA_n)
-                        a_frag_n = fx.make_fragment_like(a_src_n)
-                        fx.copy(qk_b_atom, a_src_n, a_frag_n)
-                        acc4 = qk_mfma(
-                            fx.Vector(fx.memref_load_vec(a_frag)),
+                        src = qk_a_copy.partition_S(sA_k)
+                        frag = fx.make_fragment_like(src)
+                        fx.copy(qk_b_atom, src, frag)
+                        return frag
+
+                    def mfma_qk(frag, ks, acc):
+                        return qk_mfma(
+                            fx.Vector(fx.memref_load_vec(frag)),
                             fx.Vector(q_regs[ks]),
-                            acc4,
+                            acc,
                         )
-                        a_frag = a_frag_n
-                    acc4 = qk_mfma(
-                        fx.Vector(fx.memref_load_vec(a_frag)),
-                        fx.Vector(q_regs[qk_steps - 1]),
-                        acc4,
-                    )
+
+                    # gfx942 decode: two K steps per LDS read. Issue the next
+                    # pair before consuming the current one, and let nothing
+                    # cross, so that read stays in flight under the MFMA.
+                    # The scoreboard then waits only for the pair being used.
+                    pipe_qk = gfx942_v_pf and qk_steps >= 2
+                    if const_expr(pipe_qk):
+                        a0 = load_qk_a(0)
+                        a1 = load_qk_a(1)
+                        n_pairs = qk_steps // 2
+                        for p in range_constexpr(n_pairs - 1):
+                            b0 = load_qk_a(2 * p + 2)
+                            b1 = load_qk_a(2 * p + 3)
+                            fx.rocdl.sched_barrier("none")
+                            acc4 = mfma_qk(a0, 2 * p, acc4)
+                            acc4 = mfma_qk(a1, 2 * p + 1, acc4)
+                            a0 = b0
+                            a1 = b1
+                        last = 2 * (n_pairs - 1)
+                        acc4 = mfma_qk(a0, last, acc4)
+                        acc4 = mfma_qk(a1, last + 1, acc4)
+                        if const_expr(qk_steps % 2 == 1):
+                            tail = qk_steps - 1
+                            acc4 = mfma_qk(load_qk_a(tail), tail, acc4)
+                    else:
+                        a_frag = load_qk_a(0)
+                        for ks in range_constexpr(qk_steps - 1):
+                            a_frag_n = load_qk_a(ks + 1)
+                            acc4 = mfma_qk(a_frag, ks, acc4)
+                            a_frag = a_frag_n
+                        acc4 = mfma_qk(a_frag, qk_steps - 1, acc4)
+                else:
+                    # Prefetched A fragments are already this lane's MFMA A.
+                    for i in range_constexpr(n_k_pref):
+                        raw = fx.Vector(state[out_chunks + 5 + i])
+                        a_vec = live.select(
+                            raw, fx.Vector.filled(qk_vec, 0.0, BFloat16)
+                        )
+                        acc4 = qk_mfma(a_vec, fx.Vector(q_regs[i]), acc4)
                 qk_local.append(acc4)
+            if const_expr(gfx942_v_pf):
+                # The mask that consumes the fragment is VALU and cannot
+                # cross, which holds vmcnt(0) until the MFMA is done.
+                # Letting that mask rise reuses the fragment registers
+                # for the K LDS reads and drains the gather halfway
+                # through QK.
+                fx.rocdl.sched_barrier("vmem_read")
 
             if const_expr(qk_split):
                 # Publish this wave's subtiles. The two barriers already in
@@ -857,6 +1062,17 @@ def build_qsa_k2_module(
                             score_layout,
                         ),
                     )
+            if const_expr(qk_reg):
+                sc_frag = fx.make_rmem_tensor(score_layout, Float32)
+                fx.memref_store_vec(qk_local[0], sc_frag)
+                fx.copy_atom_call(
+                    score_copy,
+                    sc_frag,
+                    fx.make_view(
+                        score_arr.ptr + wave * Int32(256) + lane * Int32(4),
+                        score_layout,
+                    ),
+                )
 
             if const_expr(not split_kv_lds):
                 # K and V share one MMA scratch, so every wave must finish
@@ -980,8 +1196,42 @@ def build_qsa_k2_module(
                         sc_frag,
                     )
                     qk_accs.append(fx.Vector(fx.memref_load_vec(sc_frag)))
+            elif const_expr(qk_reg):
+                acc = fx.Vector.filled(4, 0.0, Float32)
+                for w in range_constexpr(num_waves):
+                    sc_frag = fx.make_rmem_tensor(score_layout, Float32)
+                    fx.copy_atom_call(
+                        score_copy,
+                        fx.make_view(
+                            score_arr.ptr + Int32(w * 256) + lane * Int32(4),
+                            score_layout,
+                        ),
+                        sc_frag,
+                    )
+                    acc = acc + fx.Vector(fx.memref_load_vec(sc_frag))
+                qk_accs = [acc]
             else:
                 qk_accs = qk_local
+
+            # Next tile's K, issued before softmax and PV. The page load
+            # has had all of QK to land. Nothing may cross the fence, so
+            # these loads cannot sink onto the next tile's vmcnt the way
+            # an unpinned gather does.
+            if const_expr(gfx942_v_pf):
+                tok_next = state[out_chunks + 3]
+                phys_next = state[out_chunks + 5 + n_k_pref]
+                tile_i = state[out_chunks + 6 + n_k_pref]
+                # One tile past the split clamps to its first column, so
+                # the last iteration's extra gather stays in bounds.
+                safe_n, off_n, _live_n = resolve(tok_next, tile_i + Int32(1), phys_next)
+                next_frags = load_k_frags(safe_n, off_n)
+                # Nothing crosses, so the new loads stay above softmax and
+                # PV instead of sinking to the next tile's drain. The
+                # values are read into vectors after PV, which is what the
+                # loop can carry.
+                fx.rocdl.sched_barrier("none")
+            else:
+                next_frags = []
 
             m_prev = Float32(state[out_chunks])
             l_prev = Float32(state[out_chunks + 1])
@@ -1139,7 +1389,14 @@ def build_qsa_k2_module(
                     else:
                         acc4 = pv_mfma(p_vecs[ng], v_vec, acc4)
                 next_acc.append(acc4)
-            return next_acc + [m_new, l_new]
+            if const_expr(gfx942_v_pf):
+                more = [
+                    fx.Vector(fx.memref_load_vec(next_frags[i]))
+                    for i in range(n_k_pref)
+                ]
+            else:
+                more = []
+            return next_acc + [m_new, l_new] + more
 
         # Software-pipelined address resolution. Each iteration issues the
         # index two tiles ahead and the page one tile ahead; neither is read
@@ -1149,11 +1406,20 @@ def build_qsa_k2_module(
         # epilogue's ``results`` indices are unchanged.
         n_tiles = tile_end - tile_start
         n_tiles = (tile_end > tile_start).select(n_tiles, zero)
+        if const_expr(gfx942_v_pf):
+            # Tile 0's K starts once its page load has had the Q block to
+            # land. Later tiles are issued at the end of the previous one.
+            safe0, off0, _live0 = resolve(tok0, Int32(0), phys0)
+            k0_frags = load_k_frags(safe0, off0)
+            k0 = [fx.Vector(fx.memref_load_vec(k0_frags[i])) for i in range(n_k_pref)]
+            init_state = init_acc + [tok0, tok1, phys0] + k0
+        else:
+            init_state = init_acc + [tok0, tok1, phys0]
         for tile64, state in range(
             fx.Int64(0),
             fx.Int64(n_tiles),
             fx.Int64(1),
-            init=init_acc + [tok0, tok1, phys0],
+            init=init_state,
         ):
             t = Int32(tile64)
             tok_cur = Int32(state[out_chunks + 2])
@@ -1162,8 +1428,14 @@ def build_qsa_k2_module(
             tok_n2 = load_index(t + Int32(2))
             phys_n1 = load_page(tok_n1)
             safe_phys, page_off_i, live = resolve(tok_cur, t, phys_cur)
-            acc = tile_body(safe_phys, page_off_i, live, state)
-            results = yield acc + [tok_n1, tok_n2, phys_n1]
+            if const_expr(gfx942_v_pf):
+                acc = tile_body(safe_phys, page_off_i, live, state + [phys_n1, t])
+                head_n = out_chunks + 2
+                carried = acc[:head_n] + [tok_n1, tok_n2, phys_n1] + acc[head_n:]
+            else:
+                acc = tile_body(safe_phys, page_off_i, live, state)
+                carried = acc + [tok_n1, tok_n2, phys_n1]
+            results = yield carried
 
         m_final = Float32(results[out_chunks])
         l_final = Float32(results[out_chunks + 1])
@@ -1511,7 +1783,22 @@ def qsa_k2(
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
     n_sel = int(indices.shape[1])
-    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
+    # gfx950 keeps the fitted 128-split tiny band. On gfx942, 129 BN16
+    # tiles at 64 splits leave one workgroup with 3 tiles, and that group
+    # sets M=1. 65 splits caps every group at 2. The merge widens to 256
+    # threads at that point; 128 splits widened it further and lost.
+    tiny_splits = _TINY_SPLITS if use_k32 else 65
+    block_n, block_threads, n_splits = _launch_config(
+        rows, n_sel, n_kv_heads, head_dim, tiny_splits
+    )
+    # gfx950 stays on the fitted 128-thread schedule. gfx942 BN16 with one
+    # workgroup per CU has two idle SIMDs at 128 threads; 256 threads fills
+    # them, and the register QK split keeps that from redoing every K step.
+    if arch == "gfx942" and _gfx942_reg_qk(head_dim, block_n):
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        if int(rows) * n_kv_heads * n_splits <= get_cu_num():
+            block_threads = 256
     if n_splits == 1:
         # The split kernel stores straight into out. A caller workspace
         # is not a second buffer on this path.

@@ -12,8 +12,9 @@ prefill scores 16 query rows per workgroup. The indexer head count is 4 or
 
 ``qsa_k2`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the selected
 token ids. Decode runs a BLOCK_N=16 two-wave tile with split-K and an LSE
-merge; prefill runs BLOCK_N=32 two waves and writes output directly once the
-grid alone fills the machine. Softmax is online in log2 space and the split
+merge; gfx942 widens that tile to four waves when the grid fits in the CUs.
+Prefill runs BLOCK_N=32 two waves and writes output directly once the grid
+alone fills the machine. Softmax is online in log2 space and the split
 partials are FP32. Expand+tail and the sigmoid gate stay unfused.
 
 ``qsa_oracle`` is the fp32 reference. The concrete shapes all of these are
