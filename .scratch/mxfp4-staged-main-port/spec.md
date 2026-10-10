@@ -1,10 +1,10 @@
 # MXFP4 staged search port to main
 
-Status: ready-for-agent
+Status: claimed
 
-Published: 2026-10-10 through the user's explicit `to-spec` request. This specification consolidates the confirmed design, pipeline audit and single-GPU experiment. It defines the port to main `882ea79dd7cc7091f859a5bedac914523ac77bbd`; implementation has not started.
+Published: 2026-10-10 through the user's explicit `to-spec` request. This specification consolidates the confirmed design, pipeline audit and single-GPU experiment. It defines the port to main `882ea79dd7cc7091f859a5bedac914523ac77bbd`; implementation state is maintained in [map.md](map.md).
 
-Revision state: reviewer decisions are incorporated. Reference/all-stage-screening failure now uses group-local exhaustive validation. The user assigns CSV/configuration consistency to the caller; no sidecar or automatic configuration binding is required. The user approved and published four implementation tickets on 2026-10-10. This specification is ready for implementation; no implementation ticket has started. See [reviewer-comments.md](reviewer-comments.md) and the [ticket map](map.md).
+Revision state: reviewer decisions are incorporated. Reference/all-stage-screening failure now uses group-local exhaustive validation. The user assigns CSV/configuration consistency to the caller; no sidecar or automatic configuration binding is required. The user approved and published four implementation tickets on 2026-10-10. Implementation is authorized and active; the [ticket map](map.md) records completed acceptance and the current frontier. See [reviewer-comments.md](reviewer-comments.md) and the [ticket map](map.md).
 
 ## Problem Statement
 
