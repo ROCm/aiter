@@ -10,6 +10,7 @@ import itertools
 import math
 import os
 from typing import Any
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -310,6 +311,218 @@ def decode_bm16_intermediate(
     )
     decoded = values * fp4_utils.e8m0_to_f32(valid_scale).repeat_interleave(32, 1)
     return decoded, valid_scale
+
+
+@benchmark()
+def test_bm128_stage1_repeat(precision: str, block_n: int) -> dict[str, Any]:
+    """Identical GEMM1 inputs must produce identical live intermediate bytes."""
+    from aiter.ops.flydsl import mxfp4_gemm1_kernels
+
+    token, model_dim, inter_dim, expert, topk, block_m = 129, 3072, 384, 128, 4, 128
+    a_dtype = "fp8" if precision == "A8W4" else "fp4"
+    data = Mxfp4FlydslTuner._prepare_case(
+        token, model_dim, inter_dim, expert, topk, dtypes.bf16, a_dtype=a_dtype
+    )
+    # Four experts each have a complete BM128 block and one live tail row.
+    data["topk_ids"] = (
+        torch.arange(topk, dtype=dtypes.i32).expand(token, topk).contiguous()
+    )
+    data["topk_weights"] = (
+        torch.tensor([0.1, 0.2, 0.3, 0.4], dtype=dtypes.fp32)
+        .expand(token, topk)
+        .contiguous()
+    )
+    g1 = Mxfp4FlydslTuner._g1_kname(
+        block_m, False, False, bn=block_n, a_dtype=a_dtype, out_dtype=a_dtype
+    )
+    sti, sw, sei, nvi, moe_buf, indices, reverse = moe_sorting(
+        data["topk_ids"],
+        data["topk_weights"],
+        expert,
+        model_dim,
+        dtypes.bf16,
+        block_size=block_m,
+        accumulate=False,
+        output_aux="opus",
+    )
+    prequant = (
+        aiter.fused_dynamic_mxfp8_quant_moe_sort
+        if a_dtype == "fp8"
+        else aiter.fused_dynamic_mxfp4_quant_moe_sort
+    )
+    stage1_input, stage1_scale = prequant(
+        input=data["input"],
+        sorted_ids=sti,
+        num_valid_ids=nvi,
+        token_num=token,
+        topk=topk,
+        block_size=block_m,
+        sorted_weights=sw,
+        num_experts_upper_bound=expert,
+    )
+    # Observe the real wrapper call, then freeze its tensors and output buffers.
+    # Replays do not sort, quantize, select a variant, or allocate again.
+    launcher = mxfp4_gemm1_kernels.flydsl_mxfp4_gemm1
+    launch_kwargs = {}
+
+    def capture(**kwargs):
+        result = launcher(**kwargs)
+        torch.cuda.synchronize()
+        launch_kwargs.update(
+            {
+                key: value.clone() if isinstance(value, torch.Tensor) else value
+                for key, value in kwargs.items()
+            }
+        )
+        return result
+
+    with patch.object(mxfp4_gemm1_kernels, "flydsl_mxfp4_gemm1", capture):
+        payload, scale = _mxfp4_a4w4_stage1_fw(
+            stage1_input,
+            data["w1_a16"],
+            data["w2_a16"],
+            sti,
+            sei,
+            nvi,
+            None,
+            topk,
+            block_m=block_m,
+            a1_scale=stage1_scale,
+            w1_scale=data["w1s_a16"],
+            kernelName1=g1,
+            m_indices=indices,
+            interleave=a_dtype == "fp8",
+            moe_buf=moe_buf,
+        )
+
+    payload = launch_kwargs["inter_sorted_quant"]
+    scale = launch_kwargs["inter_sorted_shuffled_scale"]
+    sorted_rows = int(nvi[0].item())
+    live_rows = reverse.long()
+
+    def live_intermediate():
+        decoded, reader_scale = decode_bm16_intermediate(
+            payload[:sorted_rows], scale, inter_dim, native=False
+        )
+        live_scale = reader_scale[live_rows]
+        values = decoded[live_rows]
+        assert torch.isfinite(values).all(), f"{g1}: nonfinite intermediate"
+        decoded_scale = fp4_utils.e8m0_to_f32(live_scale)
+        assert torch.isfinite(decoded_scale).all() and (decoded_scale > 0).all()
+        return (
+            payload.view(torch.uint8)[live_rows],
+            live_scale.view(torch.uint8),
+            values,
+        )
+
+    def replay():
+        launcher(**launch_kwargs)
+        return payload, scale
+
+    # A frozen output clone starts valid. Poison it once so a skipped write
+    # cannot pass either the replay checks or the independent reference check.
+    payload.view(torch.uint8).fill_(255)
+    scale.view(torch.uint8).fill_(255)
+    replay()
+    first_q, first_s, _ = live_intermediate()
+    first_q, first_s = first_q.clone(), first_s.clone()
+
+    repeats = 32
+    for repeat in range(repeats):
+        replay()
+        actual_q, actual_s, _ = live_intermediate()
+        assert torch.equal(
+            first_q, actual_q
+        ), f"{g1}: payload changed at repeat {repeat}"
+        assert torch.equal(
+            first_s, actual_s
+        ), f"{g1}: scales changed at repeat {repeat}"
+
+    # Match the producer's quantization path: A4W4 quantizes FP32 activation;
+    # A8W4 materializes BF16 before quantizing its intermediate to MXFP8.
+    ref1 = FmoeTuner.run_torch_moe_stage1(
+        data["a1_qt"],
+        data["w1_qt"],
+        data["w2_qt"],
+        data["topk_weights"],
+        data["topk_ids"],
+        data["a1_scale"],
+        data["w1_scale"],
+        dtype=dtypes.bf16 if a_dtype == "fp8" else dtypes.fp32,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,
+        doweight_stage1=False,
+        topk=topk,
+    )
+    quant = per_1x32_f8_scale_f8_quant if a_dtype == "fp8" else per_1x32_f4_quant
+    quant_kwargs = {"scale_type": dtypes.fp8_e8m0} if a_dtype == "fp8" else {}
+    ref_q, ref_s = quant(ref1.reshape(-1, inter_dim), **quant_kwargs)
+    ref_values = ref_q.float() if a_dtype == "fp8" else fp4_utils.mxfp4_to_f32(ref_q)
+    reference = ref_values * fp4_utils.e8m0_to_f32(ref_s).repeat_interleave(32, 1)
+    assert torch.isfinite(reference).all()
+
+    # Report useful live-route FLOPs; the kernel also computes padded rows.
+    flops = 4 * token * topk * model_dim * inter_dim
+    # Logical input/output traffic counts the four routed experts, not all
+    # allocated expert weights or unused sorted-buffer capacity.
+    nbytes = sum(
+        value.numel() * value.element_size()
+        for value in (
+            data["a1_qt"],
+            data["a1_scale"],
+            data["w1_qt"][:topk],
+            data["w1_scale"][:topk],
+            first_q,
+            first_s,
+        )
+    )
+    ret = {
+        "gfx": get_gfx(),
+        "token": token,
+        "model_dim": model_dim,
+        "inter_dim": inter_dim,
+        "expert": expert,
+        "topk": topk,
+        "block_m": block_m,
+        "GEMM1": g1,
+        "repeats": repeats,
+    }
+    candidates = {"GEMM1": replay}
+    for name, candidate in candidates.items():
+        _, us = run_perftest(candidate, num_warmup=2, num_iters=5)
+        actual_q, actual_s, actual = live_intermediate()
+        assert torch.equal(first_q, actual_q) and torch.equal(first_s, actual_s)
+        error = checkAllclose(
+            reference.float(),
+            actual.float(),
+            rtol=0.2,
+            atol=0.1,
+            msg=f"{g1}: quantized torch intermediate",
+            catastrophic_check=True,
+        )
+        assert error <= 0.05
+        amplitude_error = cosine_diff_compare(reference, actual, msg=g1)
+        assert math.isfinite(amplitude_error) and amplitude_error < 0.02
+        assert math.isfinite(us) and us > 0
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = error
+    return ret
+
+
+test_bm128_stage1_repeat.__test__ = False
+
+
+@pytest.mark.parametrize("precision", ["A4W4", "A8W4"])
+@pytest.mark.parametrize("block_n", [128, 256])
+def test_bm128_stage1_fixed_input_repeat(precision: str, block_n: int) -> None:
+    with torch.device("cuda"):
+        result = test_bm128_stage1_repeat(precision, block_n)
+    aiter.logger.info(
+        "BM128 GEMM1 repeat summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
 
 
 @benchmark()
@@ -810,6 +1023,9 @@ def main() -> None:
     parser.add_argument(
         "--tile-k", type=int, choices=(128, 256), nargs="*", default=[128, 256]
     )
+    parser.add_argument(
+        "--block-n", type=int, choices=(128, 256), nargs="*", default=[128, 256]
+    )
     args = parser.parse_args()
     torch.set_default_device("cuda")
     results = []
@@ -845,6 +1061,14 @@ def main() -> None:
     aiter.logger.info(
         "coupled MXMOE summary (markdown):\n%s",
         pd.DataFrame(results).to_markdown(index=False),
+    )
+    repeated = [
+        test_bm128_stage1_repeat(precision, block_n)
+        for precision, block_n in itertools.product(args.precision, args.block_n)
+    ]
+    aiter.logger.info(
+        "BM128 GEMM1 repeat summary (markdown):\n%s",
+        pd.DataFrame(repeated).to_markdown(index=False),
     )
 
 
