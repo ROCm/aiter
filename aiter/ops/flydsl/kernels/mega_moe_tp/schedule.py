@@ -8,7 +8,6 @@ from __future__ import annotations
 import functools
 
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
@@ -109,9 +108,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     @traced
     def _drop_stale(tid, a):
         if tid < i32(64):
-            # Drop stale L1 lines. buffer_inv sc0 has no DSL / intrinsic form: the
-            # nearest fence (agent acquire) emits buffer_inv sc1, which costs ~1.5%.
-            _llvm.inline_asm(None, [], "buffer_inv sc0", "", has_side_effects=True)
+            fx.memory_fence(syncscope="agent", ordering=ACQ)  # drop stale L1 lines
         bid = i32(gpu.block_id("x"))
         if (tid < i32(64)) & (bid < i32(N_XCD)) & (a["epoch"] == i32(1)):
             fx.memory_fence(syncscope="one-as", ordering=ACQ)
