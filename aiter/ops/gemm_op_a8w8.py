@@ -2251,10 +2251,23 @@ def _get_mxfp8_bpreshuffle_config(M: int, N: int, K: int):
     A tuned row wins. An ASM row that does not fit this M (a padded-M row serves
     smaller M too) falls back to the ASM kernel's own heuristic; an untuned shape
     to the FlyDSL heuristic, else the ASM one. kernelName None = ASM heuristic.
+    gfx950 rows are FlyDSL mxpsh kernels (unshuffled 1x32 scales); an untuned
+    gfx950 shape runs the mxpsh heuristic tile.
     """
     config = get_CKGEMM_config(
         M, N, K, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
     )
+    if get_gfx() == "gfx950":
+        if config is not None and config["libtype"] == "flydsl":
+            return "flydsl", str(config["kernelName"]), int(config["splitK"])
+        from .flydsl.mxscale_preshuffle_kernels import pick_mxfp8_kernel_name_gfx950
+
+        name = pick_mxfp8_kernel_name_gfx950(M, N, K)
+        logger.warning(
+            f"[gfx950] gemm_a8w8_mxfp8_bpreshuffle untuned M={M}, N={N}, K={K}; "
+            f"falling back to flydsl kernel '{name}'."
+        )
+        return "flydsl", name, 1 if name is None else int(name.rsplit("_sk", 1)[1])
     if config is not None:
         libtype, kernel_name = config["libtype"], str(config["kernelName"])
         if libtype == "flydsl":
@@ -2312,12 +2325,17 @@ def gemm_a8w8_mxfp8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     out: Tensor | None = None,
 ) -> Tensor:
-    """gfx1250 FP8 GEMM with 1x32 e8m0 scales; returns ``out`` or a new [M, N].
+    """FP8 GEMM with 1x32 e8m0 scales; returns ``out`` or a new [M, N].
 
     XQ: [M, K] FP8 row-major. WQ: [N, K] FP8, 16x16 preshuffled.
-    x_scale: [pad32(M), K/32] e8m0, m32k4. w_scale: [N, K/32] e8m0, n32k4.
-    The tuned CSV picks the ASM or FlyDSL kernel per (M, N, K); a shape or M
-    it does not cover runs a heuristic kernel (see _get_mxfp8_bpreshuffle_config).
+
+    * gfx950: x_scale [M, K/32] and w_scale [N, K/32] e8m0, row-major and
+      unshuffled. The w_scale block is read off its shape and served by
+      flydsl.gemm_a8w8_mxfp8 (as the batched mxscale GEMM does).
+    * gfx1250: x_scale [pad32(M), K/32] e8m0, m32k4; w_scale [N, K/32] e8m0,
+      n32k4. The tuned CSV picks the ASM or FlyDSL kernel per (M, N, K); a
+      shape or M it does not cover runs a heuristic kernel (see
+      _get_mxfp8_bpreshuffle_config).
     """
     M, K = XQ.shape
     N = WQ.shape[0]
@@ -2325,6 +2343,10 @@ def gemm_a8w8_mxfp8_bpreshuffle(
     if M == 0:
         return Y
     libtype, kernel_name, splitk = _get_mxfp8_bpreshuffle_config(M, N, K)
+    if get_gfx() == "gfx950":
+        from .flydsl.gemm_a8w8_mxfp8 import run_gemm_a8w8_mxfp8
+
+        return run_gemm_a8w8_mxfp8(XQ, WQ, x_scale, w_scale, Y, kernel_name)
     if libtype == "asm" and (dtype != dtypes.bf16 or not Y.is_contiguous()):
         # The ASM kernels write a compact BF16 [M, N] only.
         fallback = _mxfp8_32_fallback_kernel_name(M, N, K)

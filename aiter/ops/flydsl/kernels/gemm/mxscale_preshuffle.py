@@ -26,7 +26,9 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     _DTYPE_SHORT,
+    ROW_SCALE_CHUNK,
     make_kernel_name,
+    row_scale_panel,
 )
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent,
@@ -129,8 +131,11 @@ def _launch_gemm_impl(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    a_scale_block: Constexpr[str] = "1x32",
+    b_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
+    a_scale_layout: Constexpr[str] = "mfma_tile",
+    b_scale_layout: Constexpr[str] = "mfma_tile",
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -138,8 +143,32 @@ def _launch_gemm_impl(
     batch>1 = strided-batched over grid.z. The a_/sca_/c_ row/batch strides make A/scale_a/C
     addressing caller-controlled; each <0 keeps the contiguous [B,M,*] bmn default, all set =
     the [M,B,*] mbn layout. waves_per_eu<=0 = unset.
+
+    Each operand's e8m0 scale has its own block and layout:
+      a_scale_block "1x32" | "1x128" (1x128 broadcasts to the 1x32 MFMA, a8w8 only),
+      b_scale_block "1x32" | "128x128" (likewise),
+      *_scale_layout "mfma_tile": pre-shuffled by the caller (shuffle_scale_a16w4 for
+      1x32, shuffle_scale_blockscale_a/_b for the coarse blocks), read from global;
+      "row": the unshuffled row-major [rows, K//32] tensor (no row padding), staged
+      through LDS by the kernel (1x32, a8w8, batch 1).
     """
     BM, BN, BK = tile_m, tile_n, tile_k
+    assert a_scale_block in ("1x32", "1x128"), f"a_scale_block {a_scale_block}"
+    assert b_scale_block in ("1x32", "128x128"), f"b_scale_block {b_scale_block}"
+    _bs_a = a_scale_block == "1x128"
+    _bs_b = b_scale_block == "128x128"
+    # The coarse blocks' former single spelling, still used by the fused small-M
+    # gate and the GPU symbol.
+    blockscale = {
+        (False, False): "none",
+        (True, False): "a",
+        (False, True): "b",
+        (True, True): "ab",
+    }[(_bs_a, _bs_b)]
+    for _layout in (a_scale_layout, b_scale_layout):
+        assert _layout in ("mfma_tile", "row"), f"scale layout {_layout}"
+    _row_a = a_scale_layout == "row"
+    _row_b = b_scale_layout == "row"
     small_m_bf16 = (
         BM == 16
         and blockscale != "none"
@@ -197,8 +226,6 @@ def _launch_gemm_impl(
     # blockscale (A 1x128 / B 128x128): feed the coarse scale to the 1x32 MFMA by
     # broadcasting in the load ADDRESS. A drops K_Lane(4); B drops K_Lane*N_Lane(64)
     # and reads one word per 128-N-block (nsb//4).
-    _bs_a = blockscale in ("a", "ab")
-    _bs_b = blockscale in ("b", "ab")
     _sc_k0_a = 16 if _bs_a else 64  # per-256K-chunk dword stride (A: drop K_Lane=4)
     _sc_k0_b = 1 if _bs_b else 64  # (B: drop K_Lane*N_Lane=64)
     _scale_chunk_dw_a = ((K + 255) // 256) * _sc_k0_a
@@ -212,6 +239,31 @@ def _launch_gemm_impl(
     n_coop = A_LDS_B // a_copy_granularity  # 16B cooperative loads per thread
     n_pairs = max(1, num_acc_n // 2)
     m_pairs = max(1, m_chunks // 2)
+    _row_any = _row_a or _row_b
+    if const_expr(_row_any):
+        # Row-major scales: a scale row's bytes for one K-tile are BK//32 apart from
+        # the next row's, so per-tile loads touch a cache line per row. Instead an
+        # LDS panel row holds SC_C K-tiles (CROW_B contiguous bytes), filled by dword
+        # LDS-DMA: slice j (rows [j*rs, (j+1)*rs)) of chunk c+1 rides iteration j
+        # of chunk c, double-buffered by chunk parity. A slice's spare lanes run on
+        # into the following rows (the data those will hold) or the panel tail.
+        # Only a "row" operand gets a panel (A first, then B).
+        assert batch == 1, "row scale layout: batch 1"
+        assert a_dtype == "fp8" and b_dtype == "fp8", "row scale layout: a8w8"
+        assert not (_row_a and _bs_a) and not (
+            _row_b and _bs_b
+        ), "row scale layout reads 1x32 blocks only"
+        SC_ROW_B = BK // 32  # bytes per scale row per K-tile
+        SC_WPR = SC_ROW_B // 4  # one dword per 128-K MFMA step
+        SC_C = ROW_SCALE_CHUNK  # K-tiles per chunk
+        CROW_B = SC_C * SC_ROW_B
+        SC_RS_A, SC_PASS_A, SC_PANEL_A = (
+            row_scale_panel(BM, BK, num_threads) if _row_a else (0, 0, 0)
+        )
+        SC_RS_B, SC_PASS_B, SC_PANEL_B = (
+            row_scale_panel(BN, BK, num_threads) if _row_b else (0, 0, 0)
+        )
+        SC_LDS_B = SC_PANEL_A + SC_PANEL_B
 
     # Scheduler counts per loop iter: MFMAs, A LDS reads/thread (fp6/fp8 2 per (mi,kh)), gmem loads.
     sched_mfma_total = k_halves * m_chunks * num_acc_n
@@ -221,11 +273,30 @@ def _launch_gemm_impl(
         a_ds_per = 2
     sched_num_ds_load = m_chunks * k_halves * a_ds_per
     sched_num_gmem = n_coop + num_acc_n * k_halves * B_BLK_PER_MMA + m_pairs + n_pairs
+    if const_expr(_row_any):
+        # A row operand's scale rows come from LDS (one read per 16-row tile); its
+        # DMA replaces that operand's per-pair global scale loads.
+        sched_num_sc_ds = (m_chunks if _row_a else 0) + (num_acc_n if _row_b else 0)
+        # Also counted in the A-read group: the slack keeps every A ds_read ahead
+        # of the MFMAs (an exact count measured up to 1.4x slower on some tiles).
+        sched_num_ds_load += sched_num_sc_ds
+        sched_num_gmem += (SC_PASS_A - m_pairs if _row_a else 0) + (
+            SC_PASS_B - n_pairs if _row_b else 0
+        )
 
-    @fx.struct
-    class SharedA:
-        a0: fx.Array[Int8, A_LDS_B, 16]
-        a1: fx.Array[Int8, A_LDS_B, 16]
+        @fx.struct
+        class SharedA:
+            a0: fx.Array[Int8, A_LDS_B, 16]
+            a1: fx.Array[Int8, A_LDS_B, 16]
+            s0: fx.Array[Int8, SC_LDS_B, 16]
+            s1: fx.Array[Int8, SC_LDS_B, 16]
+
+    else:
+
+        @fx.struct
+        class SharedA:
+            a0: fx.Array[Int8, A_LDS_B, 16]
+            a1: fx.Array[Int8, A_LDS_B, 16]
 
     # Name the GPU symbol after the tuned-CSV kernelName instead of letting FlyDSL
     # fall back to "kernel_gemm_<id>" -- otherwise every config profiles under the
@@ -246,6 +317,8 @@ def _launch_gemm_impl(
         _kname += "_fused_reduce"
     if multi_row_tile:
         _kname += "_multirow"
+    if _row_any:
+        _kname += f"_sl{'r' if _row_a else 'm'}{'r' if _row_b else 'm'}"
 
     def _kernel_body(
         arg_c: fx.Int64,
@@ -535,6 +608,121 @@ def _launch_gemm_impl(
 
         n_acc = m_chunks * num_acc_n
 
+        if const_expr(_row_any):
+            _i8g4 = fx.PointerType.get(
+                T.i8, address_space=fx.AddressSpace.Global, alignment=4
+            )
+            sc_row_g = K // 32  # bytes per global scale row
+
+            def _sc_src(addr, nrec):
+                buf = fx.rocdl.make_buffer_tensor(
+                    fx.Tensor(
+                        fx.make_view(
+                            fx.inttoptr(_i8g4, addr), fx.make_layout(1 << 30, 1)
+                        )
+                    ),
+                    max_size=False,
+                    num_records_bytes=nrec,
+                )
+                return fx.logical_divide(buf, fx.make_layout(1, 1))
+
+            # Bounded to the tensors: rows past M read 0 (and are never stored).
+            sc_panels = []  # (source, first row, rows per slice, passes, panel byte)
+            if const_expr(_row_a):
+                sa_row = _sc_src(arg_scale_a, fx.Int64(i32_m) * fx.Int64(sc_row_g))
+                sc_panels.append((sa_row, bx_m, SC_RS_A, SC_PASS_A, 0))
+            if const_expr(_row_b):
+                sb_row = _sc_src(arg_scale_b, fx.Int64(N * sc_row_g))
+                sc_panels.append((sb_row, by_n, SC_RS_B, SC_PASS_B, SC_PANEL_A))
+            sc_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+            sc_row_copy = fx.make_copy_atom(
+                fx.UniversalCopy64b() if SC_WPR == 2 else fx.UniversalCopy32b(), Int32
+            )
+            sS0_i8 = fx.recast_iter(_i8s, lds.s0.ptr)
+            sS0_i32 = fx.recast_iter(Int32, lds.s0.ptr)
+            sc_db = fx.Int32(fx.ptrtoint(lds.s1.ptr)) - fx.Int32(
+                fx.ptrtoint(lds.s0.ptr)
+            )
+            sc_db_dw = sc_db // 4
+            b_wave_n = wave * (BN // num_waves)
+            # v_perm pool = {hi:lo}; selector byte b+4 picks hi.byte(b), b picks
+            # lo.byte(b), 0x0C gives 0. Lane l reads 32-K group b = l // 16.
+            sc_sel = fx.Int32(0x0C0C0000) + lane_div_16 * 256 + lane_div_16 + 4
+
+            def dma_scale_slice(kt_c, j, buf):
+                """Slice j of the chunk starting at K-tile kt_c into buffer buf."""
+                for src, row0, rs, passes, off in sc_panels:
+                    for i in range_constexpr(passes):
+                        # Lane l of a wave lands at the wave-uniform base + l * 4.
+                        q = i * num_threads + tid
+                        row = j * rs + q // (CROW_B // 4)
+                        gbyte = (
+                            (row0 + row) * sc_row_g
+                            + kt_c * SC_ROW_B
+                            + (q % (CROW_B // 4)) * 4
+                        )
+                        lds_off = rocdl.readfirstlane(
+                            T.i32,
+                            buf * sc_db
+                            + off
+                            + j * (rs * CROW_B)
+                            + i * num_threads * 4
+                            + wave * 256,
+                        )
+                        dst = fx.make_view(
+                            fx.add_offset(sS0_i8, lds_off), fx.make_layout(1, 1)
+                        )
+                        fx.copy(sc_dma, fx.slice(src, (None, gbyte)), dst)
+
+            def _sc_row(buf, j, lrow, crow, base):
+                # Panel row lrow + crow, K-tile j of the chunk: SC_WPR dwords, one per
+                # kh. lrow is the per-lane part; the compile-time crow and base stay
+                # out of it so they fold into the ds_read immediate offset.
+                t = fx.make_rmem_tensor(SC_WPR, Int32)
+                off = (
+                    buf * sc_db_dw
+                    + lrow * (CROW_B // 4)
+                    + j * SC_WPR
+                    + (crow * CROW_B + base) // 4
+                )
+                fx.copy(
+                    sc_row_copy,
+                    fx.make_view(
+                        fx.add_offset(sS0_i32, off), fx.make_layout(SC_WPR, 1)
+                    ),
+                    t,
+                )
+                return Vec(fx.memref_load_vec(t))
+
+            def _sc_pack(r0, r1):
+                # The shuffled-layout word: byte kh*2 + i = row (r + 16*i)'s scale for
+                # MFMA step kh, so the opsel atoms and one VGPR per row pair are kept.
+                w = fx.Int32(rocdl.perm_b32(r0[0], r1[0], sc_sel))
+                if const_expr(k_halves == 2):
+                    w = w | (fx.Int32(rocdl.perm_b32(r0[1], r1[1], sc_sel)) << 16)
+                return w
+
+            def _sc_pairs(buf, j, lrow, n_tiles, base):
+                words = []
+                for p_ in range_constexpr(max(1, n_tiles // 2)):
+                    r0 = _sc_row(buf, j, lrow, p_ * 32, base)
+                    r1 = r0
+                    if const_expr(2 * p_ + 1 < n_tiles):
+                        r1 = _sc_row(buf, j, lrow, p_ * 32 + 16, base)
+                    words.append(_sc_pack(r0, r1))
+                return words
+
+            def load_sc_row(buf, j):
+                # (sa, sb) of the row operands from LDS; None for a mfma_tile one.
+                sa = sb = None
+                if const_expr(_row_a):
+                    sa = _sc_pairs(buf, j, lane_mod_16, m_chunks, 0)
+                if const_expr(_row_b):
+                    sb = _sc_pairs(
+                        buf, j, b_wave_n + lane_mod_16, num_acc_n, SC_PANEL_A
+                    )
+                return sa, sb
+
         def load_b(kt):
             # buffer_load_dwordx4 into i32[4] frags; fp8 B packs two K0 blocks (lo/hi, 64 K
             # apart, f8f6f4 ABI) into i32[8] — same shuffle as read_a's fp6/fp8 A path.
@@ -565,12 +753,24 @@ def _launch_gemm_impl(
                         ops.append(t)
             return ops
 
-        def load_sc(chunk_kt):
+        def load_sc(chunk_kt, want_a=True, want_b=True):
             # (sa, sb) e8m0 words per m-/n-pair for one 256-K chunk (uniform base -> SGPR soffset).
             # blockscale uses smaller per-chunk strides (compact buffer) + broadcast lanes.
+            # A row-layout operand comes from load_sc_row instead (want_* False -> None).
             koff_a = chunk_kt * _sc_k0_a
             koff_b = chunk_kt * _sc_k0_b
-            sa = [
+            if const_expr(not want_a):
+                sa = None
+            else:
+                sa = _load_sc_a(koff_a)
+            if const_expr(not want_b):
+                sb = None
+            else:
+                sb = _load_sc_b(koff_b)
+            return sa, sb
+
+        def _load_sc_a(koff_a):
+            return [
                 Vec(
                     fly.copy_atom_call_ssa(
                         [T.vec(1, T.i32)],
@@ -584,6 +784,8 @@ def _launch_gemm_impl(
                 )[0]
                 for mp in range_constexpr(m_pairs)
             ]
+
+        def _load_sc_b(koff_b):
             # blockscale B: a wave's N-span lies in one 128-N block (per-wave N =
             # BN//num_waves <= 128, block-aligned), so every n_pair reads the SAME
             # word -> load once and reuse instead of n_pairs redundant loads.
@@ -618,14 +820,17 @@ def _launch_gemm_impl(
                     )[0]
                     for np in range_constexpr(n_pairs)
                 ]
-            return sa, sb
+            return sb
 
         def compute(accs, av, bv, sa_v, sb_v, scale_shift=None):
             # tile_k=128: shift the active 128-K half of the shared 256-K word into the opsel's low bytes.
+            # A row operand's packed word holds only this K-tile: nothing to shift.
             if const_expr(scale_shift is not None):
-                sa_v = [v.shrui(scale_shift) for v in sa_v]
-                sb_v = [v.shrui(scale_shift) for v in sb_v]
-            if const_expr(BN < 128):
+                if const_expr(not _row_a):
+                    sa_v = [v.shrui(scale_shift) for v in sa_v]
+                if const_expr(not _row_b):
+                    sb_v = [v.shrui(scale_shift) for v in sb_v]
+            if const_expr(BN < 128 and not _row_b):
                 _bnsh = ((by_n + wave * (BN // num_waves)) % 32) // 16 * 8
                 sb_v = [v.shrui(_bnsh) for v in sb_v]
             # kh OUTERMOST: consecutive MFMAs hit distinct accumulators (dense issue). Each
@@ -654,6 +859,10 @@ def _launch_gemm_impl(
 
         def hot_loop_scheduler():
             # Interleave the MFMAs with the tile's vmem + A-LDS loads: preload all hints, then issue MFMAs 1-by-1.
+            if const_expr(_row_any):
+                # Scale LDS reads ahead of every DMA: an LDS read after an in-flight
+                # buffer_load...lds may alias it, so the backend would wait vmcnt.
+                rocdl.sched_dsrd(sched_num_sc_ds)
             rocdl.sched_vmem(sched_num_gmem)
             rocdl.sched_dsrd(sched_num_ds_load)
             for _ in range_constexpr(sched_mfma_total):
@@ -669,6 +878,9 @@ def _launch_gemm_impl(
         # range; the loop trips k_tiles_local times and the ping-pong parity tracks the local
         # iteration (iv), not the absolute tile.
         dma_a_to_lds(kt0, fx.Int32(0))
+        if const_expr(_row_any):
+            for j in range_constexpr(SC_C):
+                dma_scale_slice(kt0, fx.Int32(j), fx.Int32(0))
         rocdl.s_waitcnt(0)
         gpu.barrier()
         for iv, state in range(
@@ -683,10 +895,27 @@ def _launch_gemm_impl(
             # clamp last-iter prefetch to the local last tile, then rebase to absolute
             pf_kt = kt0 + (nkt - nkt // k_tiles_local)
             chunk_kt = kt if tiles_per_chunk == 1 else kt // tiles_per_chunk
-            scale_shift = None if tiles_per_chunk == 1 else (kt % tiles_per_chunk) * 16
+            scale_shift = None
+            if const_expr(tiles_per_chunk > 1 and not (_row_a and _row_b)):
+                scale_shift = (kt % tiles_per_chunk) * 16
+            if const_expr(_row_any):
+                # Next chunk's slice first (its scattered rows are the slowest load
+                # the end-of-iteration drain waits for), then this tile's scale reads
+                # ahead of A's: LDS returns in order.
+                c_idx = ivi // SC_C
+                c_j = ivi % SC_C
+                dma_scale_slice(kt0 + (c_idx + 1) * SC_C, c_j, (c_idx + 1) % 2)
+                sa_r, sb_r = load_sc_row(c_idx % 2, c_j)
             av = read_a(cur)
             bv = load_b(kt)
-            sa_v, sb_v = load_sc(chunk_kt)
+            if const_expr(_row_a and _row_b):
+                sa_v, sb_v = sa_r, sb_r
+            elif const_expr(_row_any):
+                sa_v, sb_v = load_sc(chunk_kt, not _row_a, not _row_b)
+                sa_v = sa_r if _row_a else sa_v
+                sb_v = sb_r if _row_b else sb_v
+            else:
+                sa_v, sb_v = load_sc(chunk_kt)
             dma_a_to_lds(pf_kt, nxt)  # A DMA after B/scale loads -> overlaps the MFMAs
             accs = compute(accs, av, bv, sa_v, sb_v, scale_shift)
             hot_loop_scheduler()
@@ -1040,8 +1269,11 @@ def launch_gemm(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    a_scale_block: Constexpr[str] = "1x32",
+    b_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
+    a_scale_layout: Constexpr[str] = "mfma_tile",
+    b_scale_layout: Constexpr[str] = "mfma_tile",
 ):
     """Launch the established non-fused GEMM ABI used by existing configs."""
     _launch_gemm_impl(
@@ -1073,8 +1305,11 @@ def launch_gemm(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        a_scale_block,
+        b_scale_block,
         multi_row_tile,
+        a_scale_layout,
+        b_scale_layout,
     )
 
 
@@ -1108,8 +1343,11 @@ def launch_gemm_fused(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    a_scale_block: Constexpr[str] = "1x32",
+    b_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
+    a_scale_layout: Constexpr[str] = "mfma_tile",
+    b_scale_layout: Constexpr[str] = "mfma_tile",
 ):
     """Launch the M<=16 split-K GEMM with its fused reduction arguments."""
     _launch_gemm_impl(
@@ -1141,8 +1379,11 @@ def launch_gemm_fused(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        a_scale_block,
+        b_scale_block,
         multi_row_tile,
+        a_scale_layout,
+        b_scale_layout,
     )
 
 

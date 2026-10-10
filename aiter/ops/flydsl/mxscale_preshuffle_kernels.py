@@ -34,7 +34,7 @@ _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
 @functools.cache
-def _gemm_exe(_cfg, fused, _multi_row):
+def _gemm_exe(_cfg, fused, _multi_row, _scale_layouts=None):
     import flydsl.compiler as flyc
 
     from .kernels.gemm.mxscale_preshuffle import launch_gemm, launch_gemm_fused
@@ -85,6 +85,10 @@ def flydsl_mxscale_preshuffle_gemm(
     split_k: int = 1,
     blockscale: bool = True,
     stream=None,
+    a_scale_block: str | None = None,
+    b_scale_block: str | None = None,
+    a_scale_layout: str = "mfma_tile",
+    b_scale_layout: str = "mfma_tile",
 ) -> torch.Tensor:
     """Run the gfx950 MXFP4/6/8 preshuffle GEMM. a8w8 = a_dtype="fp8", b_dtype="fp8".
 
@@ -105,12 +109,25 @@ def flydsl_mxscale_preshuffle_gemm(
     * blockscale=False: a_scale/b_scale are per-1x32 E8M0 run through
       `shuffle_scale_a16w4`.
 
-    Either way the op does NOT repack -- the caller pre-shuffles. For blockscale the
+    Per operand, a_/b_scale_block ("1x32" | "1x128" / "1x32" | "128x128") override
+    the blocks blockscale picks, and a_/b_scale_layout say how each scale is laid
+    out (see flydsl_gemm_mxscale_preshuffle_common.SCALE_LAYOUTS):
+
+    * "mfma_tile" (default): pre-shuffled by the caller, as above.
+    * "row" (1x32 blocks, a8w8): the UNSHUFFLED row-major E8M0, A [M, K//32] with
+      no row padding / B [N, K//32]; the kernel stages it through LDS itself.
+
+    The op does NOT repack a mfma_tile scale -- the caller pre-shuffles. For blockscale the
     kernel broadcasts to the 1x32 scaled-MFMA via the scale load address. Prepare the
     static B-scale at weight-prep time to keep it off the per-call path; the per-token
     A-scale is a plain reshape+permute, so build it on device (a host round-trip
     costs more than this GEMM).
     """
+    from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
+        SCALE_BLOCKS_A,
+        SCALE_BLOCKS_B,
+        SCALE_LAYOUTS,
+    )
     from .kernels.tensor_shim import _run_compiled, ptr_arg
 
     # Logical K: fp4 A packs 2 codes/byte (A last dim = K//2); fp6/fp8 A = 1 byte/code.
@@ -138,24 +155,48 @@ def flydsl_mxscale_preshuffle_gemm(
             f"unsupported Out dtype {Out.dtype}; expected bfloat16 or float16"
         )
 
-    # blockscale is the default path; an unsupported shape is an error rather than
-    # a silent downgrade, so a4w4/a6w4 callers have to opt out explicitly.
-    if blockscale:
-        if a_dtype != "fp8" or b_dtype != "fp8":
+    # blockscale picks the blocks unless an operand names its own.
+    if a_scale_block is None:
+        a_scale_block = "1x128" if blockscale else "1x32"
+    if b_scale_block is None:
+        b_scale_block = "128x128" if blockscale else "1x32"
+    if a_scale_block not in SCALE_BLOCKS_A or b_scale_block not in SCALE_BLOCKS_B:
+        raise ValueError(
+            f"unsupported scale blocks a={a_scale_block!r} b={b_scale_block!r}; "
+            f"expected a in {SCALE_BLOCKS_A}, b in {SCALE_BLOCKS_B}"
+        )
+    for layout in (a_scale_layout, b_scale_layout):
+        if layout not in SCALE_LAYOUTS:
+            raise ValueError(f"unsupported scale layout {layout!r}; {SCALE_LAYOUTS}")
+    coarse = (a_scale_block, b_scale_block) != ("1x32", "1x32")
+    # An unsupported shape is an error rather than a silent downgrade, so
+    # a4w4/a6w4 callers have to opt out of the blockscale default explicitly.
+    if coarse and (a_dtype != "fp8" or b_dtype != "fp8"):
+        raise ValueError(
+            f"a coarse scale block is a8w8-only; got a_dtype={a_dtype!r} "
+            f"b_dtype={b_dtype!r}"
+        )
+    if b_scale_block == "128x128" and N % 128 != 0:
+        raise ValueError(f"a 128x128 b_scale needs N ({N}) a multiple of 128")
+    for name, t, block, layout, rows in (
+        ("a_scale", a_scale, a_scale_block, a_scale_layout, M),
+        ("b_scale", b_scale, b_scale_block, b_scale_layout, N),
+    ):
+        if layout != "row":
+            continue
+        if block != "1x32" or (a_dtype, b_dtype) != ("fp8", "fp8"):
+            raise ValueError(f"a row {name} is the a8w8 1x32 path; got {block}")
+        if tuple(t.shape) != (rows, K // 32) or not t.is_contiguous():
             raise ValueError(
-                f"blockscale is a8w8-only; got a_dtype={a_dtype!r} b_dtype={b_dtype!r}"
+                f"row {name} must be a contiguous {(rows, K // 32)}, got "
+                f"{tuple(t.shape)} stride {tuple(t.stride())}"
             )
-        if N % 128 != 0:
-            raise ValueError(f"blockscale requires N ({N}) to be a multiple of 128")
-    # a_scale/b_scale are already compact-shuffled by the caller
-    # (shuffle_scale_blockscale_a/_b). No per-call repack here.
-    bs_mode = "ab" if blockscale else "none"
     split_k = int(split_k)
     # For the latency-sensitive M<=16 path, keep the split partials in BF16 and
     # let the last arriving GEMM block reduce them. This avoids a second launch
     # without introducing output atomics or a grid-wide spin wait.
     splitk_fused = (
-        blockscale
+        coarse
         and split_k > 1
         and M <= 16
         and int(tile_m) == 16
@@ -196,10 +237,12 @@ def flydsl_mxscale_preshuffle_gemm(
         int(waves_per_eu),
         int(xcd_swizzle),
         split_k,  # k_batch
-        bs_mode,  # blockscale
+        a_scale_block,
+        b_scale_block,
     )
     multi_row = int(tile_m) == 16 and M > 1
-    gemm_exe = _gemm_exe(cfg, splitk_fused, multi_row)
+    layouts = (a_scale_layout, b_scale_layout)  # launch_gemm's last Constexprs
+    gemm_exe = _gemm_exe(cfg, splitk_fused, multi_row, layouts)
     # Build each runtime pointer wrapper once per op.  The fused ABI carries two
     # additional pointer slots; re-wrapping Out (or the split workspace) for
     # those aliases measurably increases launch gaps on very short decode GEMMs.
@@ -222,6 +265,7 @@ def flydsl_mxscale_preshuffle_gemm(
             st,
             *cfg,
             multi_row,
+            *layouts,
         )
         return Out
 
@@ -256,6 +300,7 @@ def flydsl_mxscale_preshuffle_gemm(
             st,
             *cfg,
             multi_row,
+            *layouts,
         )
         return Out
 
@@ -276,6 +321,7 @@ def flydsl_mxscale_preshuffle_gemm(
         st,
         *cfg,
         multi_row,
+        *layouts,
     )
     _run_compiled(
         _reduce_exe((split_k, out_dtype)),
@@ -307,12 +353,14 @@ def _warn_untuned(M, N, K, a_dtype, b_dtype, kernel_name):
 
 
 @functools.lru_cache(maxsize=1024)
-def _heuristic_tile(a_dtype, b_dtype, M, N, K):
+def _heuristic_tile(a_dtype, b_dtype, M, N, K, scales=()):
     from aiter.jit.utils.chip_info import get_cu_num
 
     from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import candidates_for
 
-    cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K)]
+    # scales: candidates_for's scale kwargs as sorted (name, value) pairs, which
+    # keep the call hashable for the cache; () is the blockscale default.
+    cands = [ki for _, ki in candidates_for(a_dtype, b_dtype, M, N, K, **dict(scales))]
     if not cands:
         return None
 
@@ -405,3 +453,70 @@ def run_gemm_a8w8_mxscale_preshuffle_gfx950(XQ, WQ, x_scale, w_scale, Out, kerne
         split_k=p["split_k"],
         blockscale=True,
     )
+
+
+# gemm_a8w8_mxfp8_bpreshuffle's gfx950 scales: unshuffled row-major 1x32 on both
+# operands, as sorted (name, value) pairs (see _heuristic_tile).
+MXFP8_ROW_SCALES = (
+    ("a_scale_block", "1x32"),
+    ("a_scale_layout", "row"),
+    ("b_scale_block", "1x32"),
+    ("b_scale_layout", "row"),
+)
+
+
+def run_gemm_a8w8_mxfp8_gfx950(XQ, WQ, x_scale, w_scale, Out, kernel_name=None):
+    """gfx950 FP8 GEMM with unshuffled per-1x32 e8m0 scales, into ``Out``.
+
+    XQ [M, K] fp8 row-major; WQ [N, K] fp8, shuffle_weight(., (16, 16)).
+    x_scale [M, K // 32] and w_scale [N, K // 32] e8m0, row-major and NOT
+    shuffled (no row padding): the kernel stages them through LDS itself.
+    ``kernel_name`` is a tuned row's mxpsh kernelName, else the heuristic picks.
+    """
+    from .gemm_tune.flydsl_gemm_mxscale_preshuffle_common import parse_kernel_name
+
+    for name, t in (("XQ", XQ), ("WQ", WQ), ("Out", Out)):
+        if not t.is_contiguous():
+            raise RuntimeError(
+                f"[FlyDSL gfx950 mxfp8] {name} must be contiguous, got shape "
+                f"{tuple(t.shape)} stride {tuple(t.stride())}"
+            )
+    M, K = int(XQ.shape[0]), int(XQ.shape[-1])
+    N = int(Out.shape[-1])
+    if kernel_name is None:
+        ki = _heuristic_tile("fp8", "fp8", M, N, K, MXFP8_ROW_SCALES)
+        if ki is None:
+            raise NotImplementedError(
+                f"[FlyDSL gfx950 mxfp8] no kernel for M={M}, N={N}, K={K} with "
+                f"1x32 scales (needs K%128==0 and N a multiple of a tile_n)"
+            )
+        kernel_name = ki.name
+        _warn_untuned(M, N, K, "fp8", "fp8", kernel_name)
+    p = parse_kernel_name(kernel_name)
+    if p is None or (p["a_dtype"], p["b_dtype"]) != ("fp8", "fp8"):
+        raise ValueError(
+            f"[FlyDSL gfx950 mxfp8] {kernel_name!r} is not an a8w8 mxpsh kernel"
+        )
+    # flydsl_mxscale_preshuffle_gemm checks the row scale shapes.
+    return flydsl_mxscale_preshuffle_gemm(
+        XQ,
+        WQ,
+        x_scale,
+        w_scale,
+        Out,
+        a_dtype="fp8",
+        b_dtype="fp8",
+        tile_m=p["tile_m"],
+        tile_n=p["tile_n"],
+        tile_k=p["tile_k"],
+        waves_per_eu=p["waves_per_eu"],
+        xcd_swizzle=p["xcd_swizzle"],
+        split_k=p["split_k"],
+        **dict(MXFP8_ROW_SCALES),
+    )
+
+
+def pick_mxfp8_kernel_name_gfx950(M, N, K):
+    """The kernelName run_gemm_a8w8_mxfp8_gfx950 runs for an untuned shape."""
+    ki = _heuristic_tile("fp8", "fp8", M, N, K, MXFP8_ROW_SCALES)
+    return None if ki is None else ki.name

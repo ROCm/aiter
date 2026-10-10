@@ -163,9 +163,49 @@ def parse_kernel_name(name: str):
     }
 
 
-def estimated_lds_bytes(ki: kernelInstance) -> int:
-    """Double-buffered A tile in LDS (SharedA.a0/a1), row-major [tile_m][a_row_bytes]."""
-    return 2 * ki.tile_m * _a_row_bytes(ki.a_dtype, ki.tile_k)
+# Each operand's e8m0 scale is a block and a layout -- the kernel's
+# a_/b_scale_block and a_/b_scale_layout Constexprs. A block is "1x32", or the
+# coarse "1x128" (A) / "128x128" (B) broadcast to the 1x32 MFMA (a8w8 only).
+# A layout is "mfma_tile" (pre-shuffled by the caller) or "row" (the unshuffled
+# row-major [rows, K // 32] scale, staged through LDS by the kernel; 1x32 only).
+# The defaults spell the a8w8 blockscale contract the tuned tables were built for.
+SCALE_BLOCKS_A = ("1x32", "1x128")
+SCALE_BLOCKS_B = ("1x32", "128x128")
+SCALE_LAYOUTS = ("mfma_tile", "row")
+
+# "row" layout: K-tiles per LDS scale-panel row.
+ROW_SCALE_CHUNK = 4
+
+
+def row_scale_panel(rows: int, tile_k: int, num_threads: int) -> tuple[int, int, int]:
+    """(rows per slice, DMA passes per slice, bytes) of one row-layout LDS panel.
+
+    A panel row holds ROW_SCALE_CHUNK K-tiles of one scale row; slice j of the
+    next chunk is DMA'd a dword per lane in iteration j, and a slice's spare
+    lanes run on past it, so the panel is padded to cover the last slice's tail.
+    """
+    crow = ROW_SCALE_CHUNK * tile_k // 32
+    rs = -(-rows // ROW_SCALE_CHUNK)
+    passes = -(-(rs * crow // 4) // num_threads)
+    size = max(
+        rows * crow, (ROW_SCALE_CHUNK - 1) * rs * crow + passes * num_threads * 4
+    )
+    return rs, passes, (size + 15) // 16 * 16
+
+
+def estimated_lds_bytes(
+    ki: kernelInstance,
+    a_scale_layout: str = "mfma_tile",
+    b_scale_layout: str = "mfma_tile",
+) -> int:
+    """Double-buffered A tile in LDS (SharedA.a0/a1), row-major [tile_m][a_row_bytes],
+    plus the double-buffered scale panel of each row-layout operand."""
+    lds = 2 * ki.tile_m * _a_row_bytes(ki.a_dtype, ki.tile_k)
+    threads = min(_WAVES_PER_WG, ki.tile_n // _MFMA_N) * 64
+    for layout, rows in ((a_scale_layout, ki.tile_m), (b_scale_layout, ki.tile_n)):
+        if layout == "row":
+            lds += 2 * row_scale_panel(rows, ki.tile_k, threads)[2]
+    return lds
 
 
 def _max_lds_bytes() -> int:
@@ -204,7 +244,16 @@ def instance_valid(ki: kernelInstance) -> bool:
     return not estimated_lds_bytes(ki) > _max_lds_bytes()
 
 
-def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+def fits_shape(
+    ki: kernelInstance,
+    M: int,
+    N: int,
+    K: int,
+    a_scale_block: str = "1x128",
+    b_scale_block: str = "128x128",
+    a_scale_layout: str = "mfma_tile",
+    b_scale_layout: str = "mfma_tile",
+) -> bool:
     """M is ragged (grid ceil + OOB clip). K must be a multiple of 128: each e8m0
     microscale half is 128-K, and tile_k=128 pairs two halves into one 256-K scale
     word (shuffle_scale rounds K up to a whole 256-K chunk). K%tile_k excludes
@@ -212,15 +261,28 @@ def fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
 
     split-K legality (split_k>1): the per-split K length (K/split_k) must stay a
     whole number of tile_k K-tiles AND a whole number of 256-K e8m0 scale chunks,
-    so the split boundary never straddles a tile or a microscale word."""
+    so the split boundary never straddles a tile or a microscale word.
+
+    The scale blocks / layouts are the kernel's (see SCALE_LAYOUTS); the defaults
+    are the a8w8 blockscale contract. A row-layout operand's scale panel must fit
+    LDS next to A."""
     if K % 128 != 0:
+        return False
+    if (
+        "row" in (a_scale_layout, b_scale_layout)
+        and estimated_lds_bytes(ki, a_scale_layout, b_scale_layout) > _max_lds_bytes()
+    ):
         return False
     if ki.tile_m == 16 and M > 16:
         return False
     # blockscale is a8w8-only and needs whole 128-N blocks: shuffle_scale_blockscale_b
     # takes (N//128, K//128) and the kernel reads 4 dwords per 128-N block. fp4/fp6
     # combos run the per-1x32 MX path (blockscale=False) and are exempt.
-    if (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8") and N % 128 != 0:
+    if (
+        (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8")
+        and b_scale_block == "128x128"
+        and N % 128 != 0
+    ):
         return False
     if (N % ki.tile_n != 0) or (K % ki.tile_k != 0):
         return False
@@ -264,10 +326,13 @@ def _build_kernels_list():
 kernels_list = _build_kernels_list()
 
 
-def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int):
-    """(kernel_id, kernelInstance) that match the dtypes and fit the shape."""
+def candidates_for(a_dtype: str, b_dtype: str, M: int, N: int, K: int, **scales):
+    """(kernel_id, kernelInstance) that match the dtypes and fit the shape.
+    ``scales`` are fits_shape's a_/b_scale_block and a_/b_scale_layout."""
     return [
         (i, ki)
         for i, ki in kernels_list.items()
-        if ki.a_dtype == a_dtype and ki.b_dtype == b_dtype and fits_shape(ki, M, N, K)
+        if ki.a_dtype == a_dtype
+        and ki.b_dtype == b_dtype
+        and fits_shape(ki, M, N, K, **scales)
     ]
