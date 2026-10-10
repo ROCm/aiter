@@ -6,8 +6,11 @@ from bisect import bisect_left
 from dataclasses import dataclass, replace
 from functools import cache
 
+from . import envs
+
 TOKEN_BUCKETS = (
     1,
+    2,
     4,
     8,
     16,
@@ -25,18 +28,25 @@ TOKEN_BUCKETS = (
 )
 FIXED_GRID_MULT_VALUES = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
 P2P_FP8_MIN_MTPR = 1024
-FIXED_SLOT_MAX_MTPR = 255
+# Fixed-slot (direct expert slots, no count exchange) is the default up to MTPR
+# 128; AITER_MEGA_FIXED_SLOT_MAX_MTPR extends it (see envs.py).
+FIXED_SLOT_MAX_MTPR = envs.AITER_MEGA_FIXED_SLOT_MAX_MTPR
 MAX_MTPR_CLASS = 32768
-# Source-indexed payload storage cuts the maximum-capacity activation buffer
-# by roughly ``topk``.  Keep every smaller capacity on the historical layout.
 INDEXED_PAYLOAD_MIN_MTPR = MAX_MTPR_CLASS
 INDEXED_PAYLOAD_MIN_SBM = 128
+# Source-indexed payload storage cuts the maximum-capacity activation buffer
+# by roughly ``topk``.  Keep every smaller capacity on the historical layout.
 REFERENCE_EXPERTS_PER_RANK = 48
+KIMI_K3_EXPERTS_PER_RANK = 112
 # Compact route metadata dedicates ten bits to the global expert/group segment.
 # Under the EP8 protocol this admits 8 * 127 expert segments plus 8 group
 # segments.  The next expert would require segment 1024 and cannot be encoded.
 MAX_FANOUT_SEGMENTS = 1024
 MAX_FANOUT_EXPERTS_PER_RANK = 256
+P2P_QUANT_AUTO = "auto"
+P2P_QUANT_NONE = "none"
+P2P_QUANT_FP8_BLOCKWISE = "fp8_blockwise_1x32"
+SUPPORTED_P2P_QUANT_MODES = (P2P_QUANT_NONE, P2P_QUANT_FP8_BLOCKWISE)
 
 
 def fixed_stage1_epoch_slot(grid_mult: int, num_dispatch_cu: int, num_cu: int) -> int:
@@ -90,6 +100,7 @@ class Stage2Config:
     skew_cu: int = 0
     block_k: int = 256
     b_hoist: bool = True
+    b2stage: bool = False
     ascale_prefetch: bool = True
     spatial_partition: int = 402
     bf16_lds: bool = False
@@ -97,6 +108,7 @@ class Stage2Config:
     pair_cu: int = 0
     pair_block_m: int = 32
     pair_block_n: int = 256
+    deep_a_pipeline: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +128,8 @@ class MegaMoEConfig:
             raise ValueError(f"unsupported p2p_quant={self.p2p_quant!r}")
         if self.p2p_quant != "none" and self.stage2.bf16_lds:
             raise ValueError("FP8 P2P requires Stage2 bf16_lds=False")
+        if self.stage2.deep_a_pipeline and not self.stage2.b2stage:
+            raise ValueError("Stage2 deep_a_pipeline requires b2stage=True")
 
 
 @dataclass(frozen=True, slots=True)
@@ -203,7 +217,9 @@ def _select_fixed_stage1(bucket: int) -> Stage1Config:
         grid_mult=grid_mult,
         num_dispatch_cu=_fixed_dispatch_cu(bucket),
         mfma_amajor=False,
-        async_a_copy=False,
+        # LDS-DMA A copies + the paired K loop keep the B prefetch in flight,
+        # which matters when few tiles are resident.
+        async_a_copy=bucket <= 8,
         use_tile_resource=bucket <= 16,
         b_nt=0 if bucket == 1 else 3,
         waves_per_eu_hint=1 if bucket == 16 else 2,
@@ -306,10 +322,12 @@ def _select_bounded_stage2(
     )
     if model_dim < 4096:
         block_n = 128
-    persist = bucket >= 128
+    # Fixed-slot buckets below 128 also run persistent: the non-persistent grid
+    # is sized for the MTPR capacity, and its idle CTAs delay the real tiles.
+    persist = bucket >= 128 or fixed_slot
     if not persist:
         persist_cu = 0
-    elif bucket == 256:
+    elif bucket < 128 or bucket == 256:
         persist_cu = 128
     elif bucket == 1024:
         persist_cu = 256
@@ -320,7 +338,8 @@ def _select_bounded_stage2(
         block_n=block_n,
         persist=persist,
         persist_cu=persist_cu,
-        use_nt=bucket <= 128,
+        # Non-temporal W2 loads also for fixed-slot 256 (DP-padded decode graphs).
+        use_nt=bucket <= 128 or (fixed_slot and bucket <= 256),
         persist_strided=512 <= bucket <= 2048,
     )
 
@@ -374,15 +393,31 @@ def _select_bucket_config(
     return MegaMoEConfig(stage1=stage1, stage2=stage2, p2p_quant="none")
 
 
+def _replace_config(
+    config: MegaMoEConfig,
+    *,
+    stage1: dict[str, object] | None = None,
+    stage2: dict[str, object] | None = None,
+) -> MegaMoEConfig:
+    return replace(
+        config,
+        stage1=replace(config.stage1, **stage1) if stage1 else config.stage1,
+        stage2=replace(config.stage2, **stage2) if stage2 else config.stage2,
+    )
+
+
 def select_mega_moe_config(
     tokens: int,
     mtpr: int,
     *,
+    p2p_quant: str = P2P_QUANT_AUTO,
     experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
     model_dim: int = 7168,
     inter_dim: int = 3072,
     world_size: int = 8,
 ) -> MegaMoEConfig:
+    if p2p_quant not in (P2P_QUANT_AUTO, *SUPPORTED_P2P_QUANT_MODES):
+        raise ValueError(f"unsupported p2p_quant={p2p_quant!r}")
     if mtpr <= 0 or mtpr & (mtpr - 1):
         raise ValueError(f"mtpr={mtpr} must be a positive power of two")
     if tokens > mtpr:
@@ -405,7 +440,7 @@ def select_mega_moe_config(
         and world_size == 8
         and experts_per_rank == REFERENCE_EXPERTS_PER_RANK
     )
-    if fixed_slot_dispatch and bucket > 128:
+    if fixed_slot_dispatch and bucket > FIXED_SLOT_MAX_MTPR:
         raise ValueError(f"fixed-slot does not support token bucket {bucket}")
     total_segments = world_size * experts_per_rank + world_size
     if total_segments > MAX_FANOUT_SEGMENTS:
@@ -413,19 +448,78 @@ def select_mega_moe_config(
             f"MegaMoE v2 fanout needs {total_segments} segments, exceeding "
             f"the {MAX_FANOUT_SEGMENTS}-segment route metadata limit"
         )
-    return _select_bucket_config(
-        bucket,
+    # Bucket 2 is an exact tuning identity, while its untuned A8 base remains
+    # bucket 1 so adding it does not change existing A8 geometry.
+    base_bucket = 1 if bucket == 2 else bucket
+    config = _select_bucket_config(
+        base_bucket,
         mtpr_class,
         model_dim,
         inter_dim,
         fixed_slot_dispatch,
     )
+    if p2p_quant == P2P_QUANT_AUTO:
+        desired_p2p = (
+            P2P_QUANT_FP8_BLOCKWISE if mtpr >= P2P_FP8_MIN_MTPR else config.p2p_quant
+        )
+    else:
+        desired_p2p = p2p_quant
+    if desired_p2p != config.p2p_quant:
+        config = replace(config, p2p_quant=desired_p2p)
+    if experts_per_rank == KIMI_K3_EXPERTS_PER_RANK:
+        # Kimi-K3 packs 112 experts per rank, so the dispatch carries far more
+        # work than the generic num_dispatch_cu=32 (sized for 32-expert ranks)
+        # can keep fed.  Use 160 CUs through the middle buckets and 96 at the
+        # ends (bs=1 cannot fill 160; the largest buckets spend more on
+        # scheduling than they recover).
+        config = _replace_config(
+            config,
+            stage1={"num_dispatch_cu": 96 if bucket == 1 or bucket >= 2048 else 160},
+        )
+        # Stage2 runs in a different phase than the dispatch, so its tuning
+        # composes with the CU change above.
+        if bucket >= 2048:
+            config = _replace_config(
+                config,
+                stage2={"persist_cu": 192 if bucket <= 4096 else 256},
+            )
+        # At this inter_dim Stage2 is a large fraction of e2e, so widen its
+        # N-tile to BN256 off the generic BN128.  block_m=64 fills the SBM64
+        # sort block for 256-2048; the largest buckets already run BM64.
+        if bucket >= 4096:
+            config = _replace_config(
+                config,
+                stage2={"block_n": 256, "b2stage": True},
+            )
+        elif 256 <= bucket <= 2048:
+            config = _replace_config(
+                config,
+                stage2={"block_m": 64, "block_n": 256, "b2stage": True},
+            )
+        elif 8 <= bucket <= 128:
+            # BN256 extends down to bs 8-128; bs 1-4 stay BN128 (too few tokens
+            # to fill the wider tile).  SBM32 here pins block_m to 32.  b2stage
+            # stays off here: it is neutral for these small buckets and only
+            # pays off once Stage2 dominates at bs>=256.
+            config = _replace_config(
+                config,
+                stage2={"block_n": 256},
+            )
+
+    if config.stage2.aligned_pair and config.p2p_quant != P2P_QUANT_FP8_BLOCKWISE:
+        # The aligned-pair Stage2 kernel only emits the FP8 P2P row layout, so
+        # reject the combination here instead of at launch.
+        raise ValueError(
+            f"p2p_quant={config.p2p_quant!r} conflicts with aligned-pair Stage2"
+        )
+    return config
 
 
 @cache
 def build_mega_moe_bundle_plan(
     mtpr: int,
     *,
+    p2p_quant: str = P2P_QUANT_AUTO,
     experts_per_rank: int = REFERENCE_EXPERTS_PER_RANK,
     model_dim: int = 7168,
     inter_dim: int = 3072,
@@ -452,6 +546,7 @@ def build_mega_moe_bundle_plan(
         config = select_mega_moe_config(
             bucket,
             mtpr,
+            p2p_quant=p2p_quant,
             experts_per_rank=experts_per_rank,
             model_dim=model_dim,
             inter_dim=inter_dim,

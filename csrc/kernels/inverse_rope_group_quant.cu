@@ -328,7 +328,12 @@ __device__ __forceinline__ opus::vector_t<opus::fp8_t, N>
 // than being divided out of one index, and k_slots arrives as an argument rather
 // than from blockDim.x. inverse_rope_group_quant.md 13.3 has the reasoning and
 // the measurements.
+//
+// cos_t is the cache's element type: scalar_t, or float for a model that keeps
+// its rotation table in fp32 (DeepSeek-V4.1). The rotation itself is fp32
+// either way, so a float cache only removes the rounding of the table.
 template <typename scalar_t,
+          typename cos_t,
           int HEAD_DIM,
           int RD,
           int GROUP_SIZE,
@@ -343,8 +348,8 @@ __global__ void inverse_rope_group_quant_kernel(
     opus::fp8_t* __restrict__ x_fp8,
     uint8_t* __restrict__ x_scale,
     const int64_t* __restrict__ positions,
-    const scalar_t* __restrict__ cos_cache,
-    const scalar_t* __restrict__ sin_cache,
+    const cos_t* __restrict__ cos_cache,
+    const cos_t* __restrict__ sin_cache,
     int S,
     int H,
     int G,
@@ -769,8 +774,8 @@ __global__ void inverse_rope_group_quant_kernel(
     // tier is off, and taking it outside hands those lanes a zero angle (err 0 ->
     // 0.10 on the row layout, which no n32k4 test can see since the tier is what
     // makes any_rope scalar).
-    const scalar_t* cos_row = cos_cache;
-    const scalar_t* sin_row = sin_cache;
+    const cos_t* cos_row = cos_cache;
+    const cos_t* sin_row = sin_cache;
     if(any_rope)
     {
         int64_t pos = positions[s];
@@ -960,12 +965,13 @@ __global__ void inverse_rope_group_quant_kernel(
 
         constexpr int NCOS = THREAD_DATA_SIZE / 2;
         // 16B is the widest load, and NCOS is a power of two here.
-        constexpr int CCHUNK = NCOS >= 8 ? 8 : NCOS;
-        using vec_c = opus::vector_t<scalar_t, CCHUNK>;
-        // Written a whole vec_c at a time, which at CCHUNK 8 of bf16 is a
-        // 16-byte access that scalar_t's own alignment would leave undefined.
-        __align__(alignof(vec_c)) scalar_t cbuf[NCOS];
-        __align__(alignof(vec_c)) scalar_t sbuf[NCOS];
+        constexpr int kCosPer16B = 16 / static_cast<int>(sizeof(cos_t));
+        constexpr int CCHUNK = NCOS >= kCosPer16B ? kCosPer16B : NCOS;
+        using vec_c = opus::vector_t<cos_t, CCHUNK>;
+        // Written a whole vec_c at a time, which at 16 bytes is an access that
+        // cos_t's own alignment would leave undefined.
+        __align__(alignof(vec_c)) cos_t cbuf[NCOS];
+        __align__(alignof(vec_c)) cos_t sbuf[NCOS];
         // Loaded unguarded off a clamped row: the exec mask the guard needed
         // caused WAR-hazard xcnt drains. Lanes below the tail read row 0 and
         // discard it (same cache line, L1 hit).
@@ -1180,8 +1186,17 @@ void inverse_rope_group_quant(
     AITER_CHECK(positions.dtype() == AITER_DTYPE_i64, "positions must be int64");
     AITER_CHECK(cos_cache.dim() == 2 && sin_cache.dim() == 2,
                 "cos_cache/sin_cache must be 2D [max_pos, rd/2]");
-    AITER_CHECK(cos_cache.dtype() == o.dtype() && sin_cache.dtype() == o.dtype(),
-                "cos/sin dtype must match o");
+    AITER_CHECK(sin_cache.dtype() == cos_cache.dtype(),
+                "sin_cache dtype must match cos_cache");
+    // An fp32 table is instantiated for the row-major layout only: that is the
+    // one its consumer (DeepSeek-V4.1's wo_a on gfx950) reads, and the padded
+    // layouts would double their instantiations for no caller.
+    const bool cos_f32 = cos_cache.dtype() == AITER_DTYPE_fp32;
+    AITER_CHECK(cos_cache.dtype() == o.dtype() ||
+                    (cos_f32 && scale_layout == kScaleRowMajor),
+                "cos/sin dtype must match o, or be fp32 with the row-major "
+                "scale layout; got ",
+                AiterDtype_to_str(cos_cache.dtype()));
     CHECK_CONTIGUOUS(o);
     CHECK_CONTIGUOUS(x_fp8);
     CHECK_CONTIGUOUS(cos_cache);
@@ -1462,20 +1477,22 @@ void inverse_rope_group_quant(
                 const bool row_based =
                     input_needs_row_base || payload_elems > kDescReach;
 
-                auto go1 = [&](auto tier_tag, auto row_tag, auto geometry_tag)
+                auto go_cos = [&](auto cos_tag, auto tier_tag, auto row_tag,
+                                  auto geometry_tag)
                 {
+                    using cos_opus_t = typename decltype(cos_tag)::type;
                     inverse_rope_group_quant_kernel<
-                        scalar_opus_t, HEAD_DIM_T, RD_T, GS, TDS, KPT, LAYOUT,
-                        decltype(tier_tag)::value, decltype(row_tag)::value,
+                        scalar_opus_t, cos_opus_t, HEAD_DIM_T, RD_T, GS, TDS, KPT,
+                        LAYOUT, decltype(tier_tag)::value, decltype(row_tag)::value,
                         decltype(geometry_tag)::value>
                         <<<grid, block, tdm_lds_bytes, stream>>>(
                             reinterpret_cast<const scalar_opus_t*>(o.data_ptr()),
                             reinterpret_cast<opus::fp8_t*>(x_fp8.data_ptr()),
                             reinterpret_cast<uint8_t*>(x_scale.data_ptr()),
                             reinterpret_cast<const int64_t*>(positions.data_ptr()),
-                            reinterpret_cast<const scalar_opus_t*>(
+                            reinterpret_cast<const cos_opus_t*>(
                                 cos_cache.data_ptr()),
-                            reinterpret_cast<const scalar_opus_t*>(
+                            reinterpret_cast<const cos_opus_t*>(
                                 sin_cache.data_ptr()),
                             S, H, G, D, scale_n, k_slots,
                             x_scale.stride(0), x_scale.stride(1), x_scale.stride(2),
@@ -1485,6 +1502,22 @@ void inverse_rope_group_quant(
                             swap_sg,
                             super_major ? n_super : 0,
                             nope_slots);
+                };
+                auto go1 = [&](auto tier_tag, auto row_tag, auto geometry_tag)
+                {
+                    // Checked on entry: a float table only reaches here with
+                    // the row-major layout, the only one it is built for.
+                    if constexpr(LAYOUT == kScaleRowMajor)
+                    {
+                        if(cos_f32)
+                        {
+                            go_cos(std::type_identity<float>{}, tier_tag, row_tag,
+                                   geometry_tag);
+                            return;
+                        }
+                    }
+                    go_cos(std::type_identity<scalar_opus_t>{}, tier_tag, row_tag,
+                           geometry_tag);
                 };
                 auto go_row = [&](auto tier_tag, auto row_tag)
                 {

@@ -315,6 +315,7 @@ def build_candidate_gather(
         block,
         page_size,
         num_warps=num_warps,
+        enable_fp_fusion=True,
     )
     return {"slots": slots, "block": block, "positions": pos}, cu
 
@@ -416,6 +417,7 @@ def build_schedule(
         SLICE_ROOM=SLICE_ROOM,
         BLOCK_T=256,
         num_warps=4,
+        enable_fp_fusion=True,
     )
     # The launcher takes the grid from the length, so the length is the contract
     return out[: num_ctas * 4]
@@ -845,6 +847,7 @@ def paged_mxfp4_mqa_logits(
         BSCORE_BLOCK=cand_block if bscore_on else CANDIDATE_BLOCK,
         num_warps=cfg["num_warps"],
         waves_per_eu=cfg["waves_per_eu"],
+        enable_fp_fusion=True,
     )
     if calc_logits and calc_block_scores:
         return logits, block_scores

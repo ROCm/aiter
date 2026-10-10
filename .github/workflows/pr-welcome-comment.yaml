@@ -31,12 +31,13 @@ jobs:
             | Label | Tests |
             |-------|-------|
             | \`ci:gfx1250-ffm-triton\` | Run the five-shard gfx1250 FFM Triton test suite |
-            | \`ci:triton-300x\` | Run an additional Triton test job on MI300X in PRs; main branch always runs both MI35X and MI300X |
-            | \`multigpu\` | Aiter multi-GPU tests on the 8-GPU runner |
+            | \`ci:triton-300x\` | Run an additional Triton test job on MI300X in PRs (added automatically when gfx942 configs change); main branch always runs both MI35X and MI300X |
+            | \`ci:triton-355\` | Run the full Triton test suite on MI35X, not only the tests the change affects |
+            | \`ci:multi-gpu\` | Aiter multi-GPU tests on the 8-GPU runner |
             | \`ci:sglang\` | SGLang integration tests: DeepSeek-R1-MXFP4 accuracy, Qwen 3.5 accuracy |
             | \`ci:atom\` | ATOM benchmark: DeepSeek-R1-0528, GPT-OSS-120B |
             | \`ci:atom_full\` | ATOM accuracy suite for PR and main models from ATOM \`models_accuracy.json\` |
-            | \`ci:vllm\` | vLLM benchmark: GPT-OSS-120B, DeepSeek-R1-0528, Kimi-K2.5 |
+            | \`ci:vllm\` | vLLM benchmark: DeepSeek-V4-Pro, MiniMax-M3-MXFP4 |
             | \`ci:all\` | All standard extended tests (excludes \`ci:atom_full\`) |
 
             > Only add \`ci:atom_full\` for FlyDSL or Triton upgrades.

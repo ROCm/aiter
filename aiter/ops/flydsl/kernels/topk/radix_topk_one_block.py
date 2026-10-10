@@ -87,8 +87,12 @@ def build_radix_topk_one_block_module(
     *,
     wave_size: int,
     arch: str = "",
+    packed_rows: bool = False,
 ):
     """Build a prefill/decode kernel specialized for the row-length bounds.
+
+    packed_rows (decode only): row r is read from element row_starts[r] of
+    the input's first row, its indices still relative to that start.
 
     short_rows requires every effective row length <= 4096.
     wave_size must match the target architecture and is part of the cache key.
@@ -208,6 +212,7 @@ def build_radix_topk_one_block_module(
             f"radix_topk_one_block_{'decode' if is_decode else 'prefill'}"
             f"_{row_variant}_k{k}_b{block_threads}_w{wave_size}"
             f"_v{int(write_values)}_s{int(stable)}"
+            f"{'_packed' if packed_rows else ''}"
         ),
         known_block_size=[block_threads, 1, 1],
     )
@@ -238,12 +243,14 @@ def build_radix_topk_one_block_module(
         else:
             row_start = row_starts[row]
             row_end = row_ends[row]
+        # where the row's scores begin; the indices count from row_start
+        read_start = row_starts[row] if packed_rows else row_start
         row_len = row_end - row_start
         full_vector_count = row_len // vec_width
 
         # Input and output views
         physical_row = fx.slice(input, (row, None))
-        input_row_iter = fx.add_offset(fx.get_iter(physical_row), row_start)
+        input_row_iter = fx.add_offset(fx.get_iter(physical_row), read_start)
         input_row = fx.rocdl.make_buffer_tensor(
             fx.make_view(input_row_iter, fx.make_layout(_MAX_ROW_ELEMENTS, 1)),
             num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
@@ -1282,7 +1289,7 @@ def build_radix_topk_one_block_module(
                 if const_expr(write_values):
                     value = fx.Float32(float("-inf"))
                     if col < row_len:
-                        value = physical_row[row_start + col]
+                        value = physical_row[read_start + col]
                     row_values[col] = value
 
         def write_direct_vector(row_indices, row_values):

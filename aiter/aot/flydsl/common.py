@@ -140,7 +140,12 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     ``flydsl.expr``). Job collection is therefore not free in the
     parent process, just shifted once out of every child."""
     if kind is OpKind.MEGA_MOE:
-        from .mega_moe import default_jobs
+        from .mega_moe import production_jobs
+
+        # Ships both V4-Pro and Kimi-K3 so neither JITs online at serving time.
+        return production_jobs()
+    if kind is OpKind.FMHA_FP8:
+        from .fmha_fp8 import default_jobs
 
         return default_jobs()
     if kind is OpKind.MOE:
@@ -155,8 +160,6 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         from .grouped_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.CHUNK_GDN_H:
         from .chunk_gdn_h import DEFAULT_CSVS, parse_csv
-    elif kind is OpKind.FMHA_FP8:
-        from .fmha_fp8 import DEFAULT_CSVS, parse_csv
     else:
         raise ValueError(f"unknown FlyDSL AOT kind: {kind!r}")
     return collect_aot_jobs(DEFAULT_CSVS, parse_csv)

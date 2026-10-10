@@ -1,0 +1,474 @@
+{
+    "shapes": {
+        "N=1,C=1024,D=18,H=17,W=30,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=18,H=17,W=30,K=129,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=18,H=17,W=30,K=4096,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=3,H=178,W=322,K=512,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=3,H=46,W=82,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=3,H=90,W=162,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=33,H=34,W=60,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=34,H=34,W=60,K=128,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=4,H=90,W=162,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=1024,D=6,H=178,W=322,K=512,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=12,D=3,H=354,W=642,K=160,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 32,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=12,D=6,H=354,W=642,K=160,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 32,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=128,D=123,H=136,W=240,K=128,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "N=1,C=128,D=123,H=136,W=240,K=48,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=128,D=123,H=136,W=240,K=64,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=128,D=18,H=17,W=30,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=160,D=3,H=178,W=322,K=320,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=160,D=3,H=354,W=642,K=160,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=160,D=6,H=178,W=322,K=320,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=160,D=6,H=354,W=642,K=160,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=192,D=6,H=178,W=198,K=192,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=256,D=123,H=68,W=120,K=256,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=256,D=123,H=68,W=120,K=512,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=256,D=124,H=68,W=120,K=256,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=256,D=3,H=354,W=642,K=12,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=256,D=3,H=354,W=642,K=256,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=256,D=6,H=354,W=642,K=12,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=256,D=6,H=354,W=642,K=256,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=320,D=3,H=178,W=322,K=320,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=320,D=3,H=90,W=162,K=640,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "N=1,C=320,D=4,H=90,W=162,K=640,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=320,D=6,H=178,W=322,K=320,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=384,D=3,H=46,W=51,K=384,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "N=1,C=384,D=4,H=90,W=100,K=384,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=48,D=123,H=136,W=240,K=128,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=48,D=3,H=46,W=82,K=1024,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=512,D=3,H=178,W=322,K=512,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=512,D=3,H=354,W=642,K=256,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "N=1,C=512,D=33,H=34,W=60,K=4096,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=512,D=33,H=34,W=60,K=512,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=512,D=6,H=178,W=322,K=512,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=512,D=6,H=354,W=642,K=256,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=512,D=63,H=68,W=120,K=512,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=512,D=64,H=68,W=120,K=128,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=64,D=4,H=16,W=16,K=64,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=1,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=64,D=8,H=24,W=24,K=64,T=3,R=3,S=3,sd=2,sh=2,sw=2,pd=1,ph=1,pw=1,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1,
+            "waves_per_eu": 2
+        },
+        "N=1,C=640,D=3,H=46,W=82,K=640,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=640,D=3,H=46,W=82,K=96,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 64,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=640,D=3,H=90,W=162,K=640,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        },
+        "N=1,C=640,D=4,H=90,W=162,K=640,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 4,
+            "num_warps": 8,
+            "num_stages": 1
+        },
+        "N=1,C=96,D=6,H=354,W=394,K=96,T=3,R=3,S=3,sd=1,sh=1,sw=1,pd=0,ph=0,pw=0,dd=1,dh=1,dw=1": {
+            "BLOCK_M": 128,
+            "BLOCK_N": 128,
+            "BLOCK_K": 64,
+            "GROUP_SIZE_M": 8,
+            "num_warps": 4,
+            "num_stages": 1
+        }
+    },
+    "M_LEQ_1024": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "M_LEQ_4096": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 4,
+        "num_stages": 1,
+        "waves_per_eu": 2
+    },
+    "M_LEQ_8192": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "M_LEQ_32768": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 8,
+        "num_stages": 1
+    },
+    "M_LEQ_65536": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "M_LEQ_262144": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 64,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 4,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "any": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 1
+    }
+}
