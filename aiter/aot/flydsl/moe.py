@@ -22,7 +22,10 @@ replayed at the smallest such M as well as at T.
 
 aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
 replay runs in one process per target arch, with the GPUs hidden and
-``GPU_ARCHS`` set before aiter is imported. Those processes need no GPU.
+``GPU_ARCHS`` set before aiter is imported. Those processes need no GPU; they
+run side by side and split the worker budget by job count. Within one, a
+worker replays several jobs of one row in turn, so the kernels they share
+compile once.
 
 Usage:
     # Compile every FlyDSL kernel the default tuned CSVs reach
@@ -45,6 +48,7 @@ import os
 import subprocess
 import sys
 import time
+import zlib
 from collections import Counter
 from contextlib import contextmanager
 from unittest import mock
@@ -53,6 +57,7 @@ from aiter.aot.flydsl.common import (
     collect_aot_jobs,
     cu_num_to_arch,
     dedupe_jobs,
+    get_max_workers,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -86,6 +91,11 @@ _ROW_FIELDS = (
     "kernelName1",
     "kernelName2",
 )
+# gate_mode is overwritten by each job's variant.
+_ROW_KEY = ("csv_path", *(f for f in _ROW_FIELDS if f != "gate_mode"))
+# Jobs of one row share most of their kernels, so one worker replays them in
+# turn; capped so no single worker trails the rest of the build.
+_JOBS_PER_WORKER = 12
 _FP8 = ("float8_e4m3fn", "float8_e4m3fnuz")
 _FP4 = "float4_e2m1fn_x2"
 
@@ -431,6 +441,31 @@ def _load_host_helpers(arch: str, cu_num: int) -> None:
         _mxfp4_moe_sort_internal_is_supported(256, 8, 7168, 32, True)
 
 
+def _replay_batch(jobs: list[dict], kernel_name: str) -> dict:
+    return {
+        "kernel_name": kernel_name,
+        "compile_time": 0.0,
+        "results": [compile_one_config(**job) for job in jobs],
+    }
+
+
+def _batches(jobs: list[dict]) -> list[list[dict]]:
+    """Each row's jobs in runs of at most ``_JOBS_PER_WORKER``, largest first.
+    A run keeps both token counts of a variant together. Equal-sized runs are
+    shuffled (stably) so that neighbouring rows of one model, which share
+    kernels and would wait on each other's compiles, do not start together."""
+    rows: dict[tuple, list[dict]] = {}
+    for job in jobs:
+        rows.setdefault(tuple(job[f] for f in _ROW_KEY), []).append(job)
+    batches = [
+        (row, row_jobs[start : start + _JOBS_PER_WORKER])
+        for row, row_jobs in rows.items()
+        for start in range(0, len(row_jobs), _JOBS_PER_WORKER)
+    ]
+    batches.sort(key=lambda b: (-len(b[1]), zlib.crc32(repr(b[0]).encode())))
+    return [batch for _, batch in batches]
+
+
 def _replay_arch(jobs: list[dict], arch: str) -> int:
     """Replay ``jobs`` in this process; GPU_ARCHS must already name ``arch``."""
     if os.environ.get("GPU_ARCHS") != arch:
@@ -439,7 +474,15 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
             "imported; run through `python -m aiter.aot.flydsl.moe`"
         )
     _load_host_helpers(arch, _int(jobs[0]["cu_num"]))
-    results = run_jobs_parallel(compile_one_config, jobs)
+    batches = _batches(jobs)
+    outcomes = run_jobs_parallel(
+        _replay_batch,
+        [{"jobs": batch, "kernel_name": batch[0]["kernel_name"]} for batch in batches],
+    )
+    results = []
+    for batch, outcome in zip(batches, outcomes):
+        # A worker that died takes its whole batch with it.
+        results += outcome.get("results") or [{"compile_time": None}] * len(batch)
     failed = sum(1 for r in results if r["compile_time"] is None)
     rejected = Counter(r["unsupported"] for r in results if r.get("unsupported"))
     unsupported = sum(rejected.values())
@@ -453,7 +496,7 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
     return failed
 
 
-def _arch_env(arch: str) -> dict:
+def _arch_env(arch: str, workers: int) -> dict:
     env = dict(os.environ)
     env.pop("AITER_AOT_IMPORT", None)
     env.update(
@@ -461,6 +504,7 @@ def _arch_env(arch: str) -> dict:
         HIP_VISIBLE_DEVICES="-1",
         ROCR_VISIBLE_DEVICES="-1",
         CUDA_VISIBLE_DEVICES="-1",
+        AITER_FLYDSL_AOT_WORKERS=str(workers),
     )
     return env
 
@@ -470,15 +514,16 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
     Returns the number of archs whose replay failed."""
     jobs = collect_aot_jobs(csv_paths, functools.partial(parse_csv, edges=edges))
     archs = sorted({job_arch(job) for job in jobs})
-    # gate_mode is overwritten by each job's variant.
-    row_fields = ("csv_path", *(f for f in _ROW_FIELDS if f != "gate_mode"))
-    rows = {tuple(job[f] for f in row_fields) for job in jobs}
+    rows = {tuple(job[f] for f in _ROW_KEY) for job in jobs}
     print(
         f"[aiter] FlyDSL MoE replay: {len(rows)} rows, {len(jobs)} jobs, "
         f"archs {', '.join(archs) or '-'}",
         flush=True,
     )
-    failed = 0
+    # The archs replay side by side and split one worker budget by job count.
+    workers = get_max_workers(len(jobs))
+    jobs_per_arch = Counter(job_arch(job) for job in jobs)
+    replays = []
     for arch in archs:
         command = [sys.executable, "-m", "aiter.aot.flydsl.moe", "--arch", arch]
         command += ["--csv"]
@@ -487,9 +532,9 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
             command.append("--row-tokens-only")
         if check:
             command.append("--check")
-        replay = subprocess.run(command, env=_arch_env(arch), check=False)
-        failed += replay.returncode != 0
-    return failed
+        share = max(1, round(workers * jobs_per_arch[arch] / len(jobs)))
+        replays.append(subprocess.Popen(command, env=_arch_env(arch, share)))
+    return sum(replay.wait() != 0 for replay in replays)
 
 
 def main():
