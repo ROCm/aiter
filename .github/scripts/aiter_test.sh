@@ -120,7 +120,7 @@ for file in "${sharded_files[@]}"; do
                 "$file"
             )
             ;;
-        op_tests/multigpu_tests/test_mega_moe_TP.py)
+        op_tests/multigpu_tests/test_mega_moe_tp.py)
             {
                 echo "Running MegaMoE TP (MiniMax-M3, GLM-5) on 4 GPUs when supported"
             } | tee -a latest_test.log

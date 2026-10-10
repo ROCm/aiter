@@ -3,7 +3,7 @@
 """Fused TP MegaMoE layer (a4w4, MXFP4, gfx950) vs torch: accuracy + perf sweep, feature
 cases and SpRsNorm, each ending in a markdown summary table::
 
-    torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_TP.py \\
+    torchrun --nproc_per_node=4 op_tests/multigpu_tests/test_mega_moe_tp.py \\
         --models m3 glm5 -t 256 512 1024 2048
 
 Run with plain ``python3`` it relaunches itself under torchrun on up to 8 GPUs, or
@@ -85,10 +85,6 @@ class Ctx:
         t = torch.tensor([int(ok)], device=self.device)
         dist.all_reduce(t, op=dist.ReduceOp.MIN)
         return bool(t.item())
-
-    def log(self, msg: str):
-        if self.rank == 0:
-            print(msg, flush=True)
 
 
 def rel_l2(actual, expected) -> float:
@@ -476,60 +472,65 @@ def case_tail(shape, wt, ctx, S):
     return e_q
 
 
-def case_sp_rs_norm(ctx, S):
-    """SpRsNorm (+ the fused router) vs torch, twice back to back on new inputs."""
-    H, eps = 6144, 1e-6
-    E, K, scale, shared_w = 128, 4, 2.0, 0.5
-    op = SpRsNorm(
-        H, S.max_tokens, eps, device=ctx.device, router=(E, K, scale, shared_w)
-    )
+SPRS_EPS = 1e-6
+# SpRsNorm's fused router: experts, top-k, routed scaling, shared-expert weight
+SPRS_ROUTER = (128, 4, 2.0, 0.5)
+
+
+def sp_rs_norm_inputs(hidden, tokens, router, seed):
+    """Partial sums, residual and norm weight (+ the router's gate / bias / outputs)."""
+    ctx = S.ctx
+    E, K = SPRS_ROUTER[:2]
+    m = tokens // ctx.world
     gen = torch.Generator(device=ctx.device).manual_seed(7)
-    wg = (torch.randn((E, H), generator=gen, device=ctx.device) * H**-0.5 * 3).to(
-        dtypes.bf16
-    )
+    wg = torch.randn((E, hidden), generator=gen, device=ctx.device) * hidden**-0.5 * 3
     bias = (0.05 * torch.randn((E,), generator=gen, device=ctx.device)).float()
-    w = (0.1 * torch.randn((H,), generator=gen, device=ctx.device)).to(dtypes.bf16)
-    worst = 0.0
-    routed = S.max_tokens // (16 * ctx.world) * 16 * ctx.world
-    for tokens, rt in ((routed, True), (S.max_tokens, False)) * 2:
-        m = tokens // ctx.world
-        g = torch.Generator(device=ctx.device).manual_seed(1000 + ctx.rank + tokens)
-        part = torch.randn((tokens, H), generator=g, device=ctx.device).to(dtypes.bf16)
-        res = torch.randn((tokens, H), generator=g, device=ctx.device).to(dtypes.bf16)
+    w = (0.1 * torch.randn((hidden,), generator=gen, device=ctx.device)).to(dtypes.bf16)
+    g = torch.Generator(device=ctx.device).manual_seed(seed + ctx.rank + tokens)
+    part = torch.randn((tokens, hidden), generator=g, device=ctx.device).to(dtypes.bf16)
+    res = torch.randn((tokens, hidden), generator=g, device=ctx.device).to(dtypes.bf16)
+    rt = None
+    if router:
         ids = torch.empty((m, K + 1), dtype=torch.int32, device=ctx.device)
         tw = torch.empty((m, K + 1), dtype=torch.float32, device=ctx.device)
-        rt = (wg, bias, ids, tw) if rt and op.routes(tokens) else None
-        out, res_out = op(part, res, w, router=rt)
-        torch.cuda.synchronize()
-        tot = part.float()
-        dist.all_reduce(tot)
-        rows = slice(ctx.rank * m, (ctx.rank + 1) * m)
-        h = tot[rows] + res[rows].float()
-        ref = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + eps) * (w.float() + 1)
-        e = max(rel_l2(res_out[rows], h), rel_l2(out[rows], ref))
-        worst = max(worst, e)
-        bad, info = op.poll_errors() or not e < 0.01, f"rel_l2={e:.4f}"
-        if rt is not None:
-            logits = (ref.to(dtypes.bf16).float() @ wg.float().t()).to(dtypes.bf16)
-            rid = torch.empty((m, K), dtype=torch.int32, device=ctx.device)
-            rtw = torch.empty((m, K), dtype=torch.float32, device=ctx.device)
-            aiter.topk_gating(rtw, rid, logits, bias, True, scale, score_func="sigmoid")
-            same = (ids[:, :K].sort(1).values == rid.sort(1).values).all(1)
-            mine = torch.gather(tw[:, :K], 1, ids[:, :K].argsort(1))
-            want = torch.gather(rtw, 1, rid.argsort(1))
-            e_w = ((mine - want).abs() / want.abs().clamp_min(1e-6))[same]
-            # bf16 logits: near-ties may pick another expert
-            st = torch.tensor([float(same.sum()), m], device=ctx.device)
-            dist.all_reduce(st)
-            e_w = float(e_w.max()) if e_w.numel() else 0.0
-            info += f" same experts {float(st[0] / st[1]):.3f} weight err {e_w:.1e}"
-            bad = bad or float(st[0] / st[1]) < 0.9 or e_w > 0.02
-            bad = bad or not bool(
-                (ids[:, K] == E).all() and (tw[:, K] == shared_w).all()
-            )
-        if not ctx.all_ok(not bad):
-            raise CaseFailure(f"M={tokens} router={rt is not None}: {info}")
-    return worst
+        rt = (wg.to(dtypes.bf16), bias, ids, tw)
+    return part, res, w, rt
+
+
+def check_sp_rs_norm(op, inputs, out, res_out):
+    """rel_l2 of (res_out, out) vs torch (+ the router's experts / weights); raises on a
+    mismatch. Returns (rel_l2, torch normed rows of this rank)."""
+    ctx = S.ctx
+    part, res, w, rt = inputs
+    E, K, scale, shared_w = SPRS_ROUTER
+    m = part.shape[0] // ctx.world
+    tot = part.float()
+    dist.all_reduce(tot)
+    rows = slice(ctx.rank * m, (ctx.rank + 1) * m)
+    h = tot[rows] + res[rows].float()
+    ref = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + SPRS_EPS) * (w.float() + 1)
+    e = max(rel_l2(res_out[rows], h), rel_l2(out[rows], ref))
+    bad, info = op.poll_errors() or not e < 0.01, f"rel_l2={e:.4f}"
+    if rt is not None:
+        wg, bias, ids, tw = rt
+        logits = (ref.to(dtypes.bf16).float() @ wg.float().t()).to(dtypes.bf16)
+        rid = torch.empty((m, K), dtype=torch.int32, device=ctx.device)
+        rtw = torch.empty((m, K), dtype=torch.float32, device=ctx.device)
+        aiter.topk_gating(rtw, rid, logits, bias, True, scale, score_func="sigmoid")
+        same = (ids[:, :K].sort(1).values == rid.sort(1).values).all(1)
+        mine = torch.gather(tw[:, :K], 1, ids[:, :K].argsort(1))
+        want = torch.gather(rtw, 1, rid.argsort(1))
+        e_w = ((mine - want).abs() / want.abs().clamp_min(1e-6))[same]
+        # bf16 logits: near-ties may pick another expert
+        st = torch.tensor([float(same.sum()), m], device=ctx.device)
+        dist.all_reduce(st)
+        e_w = float(e_w.max()) if e_w.numel() else 0.0
+        info += f" same experts {float(st[0] / st[1]):.3f} weight err {e_w:.1e}"
+        bad = bad or float(st[0] / st[1]) < 0.9 or e_w > 0.02
+        bad = bad or not bool((ids[:, K] == E).all() and (tw[:, K] == shared_w).all())
+    if not ctx.all_ok(not bad):
+        raise CaseFailure(f"M={part.shape[0]} router={rt is not None}: {info}")
+    return e, ref
 
 
 def case_masked(shape, wt, ctx, S, mode):
@@ -760,10 +761,64 @@ def test_mega_moe_tp_case(model: str, mode: str, case: str):
     }
 
 
+def _sp_rs_norm_op(hidden):
+    key = ("sp_rs_norm", hidden)
+    if key not in S.layers:
+        S.layers[key] = SpRsNorm(
+            hidden, S.max_tokens, SPRS_EPS, device=S.ctx.device, router=SPRS_ROUTER
+        )
+    return S.layers[key]
+
+
 @benchmark()
-def test_sp_rs_norm(hidden: int, tokens: int):
-    """SpRsNorm (+ the fused router) vs torch, twice back to back on new inputs."""
-    return {"gfx": get_gfx(), "rel_l2": case_sp_rs_norm(S.ctx, S)}
+def test_sp_rs_norm(hidden: int, tokens: int, router: bool):
+    """SpRsNorm (+ the fused router) vs torch (not timed), twice back to back on new
+    inputs, then timed on the second."""
+    ctx = S.ctx
+    op = _sp_rs_norm_op(hidden)
+    if router and not op.routes(tokens):
+        raise CaseFailure(f"router does not run at {tokens} tokens")
+    for seed in (1000, 2000):
+        inputs = sp_rs_norm_inputs(hidden, tokens, router, seed)
+        out, res_out = op(*inputs[:3], router=inputs[3])
+        torch.cuda.synchronize()
+        e, ref = check_sp_rs_norm(op, inputs, out, res_out)
+    m = tokens // ctx.world
+    rows = slice(ctx.rank * m, (ctx.rank + 1) * m)
+    err = _rank_max(
+        checkAllclose(
+            ref,
+            out[rows].to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg="sp_rs_norm: ",
+            printLog=ctx.rank == 0,
+        )
+    )
+    dist.barrier()
+    _, us = run_perftest(
+        op,
+        *inputs[:3],
+        router=inputs[3],
+        num_iters=PERF_ITERS,
+        num_warmup=PERF_WARMUP,
+        use_cuda_event=True,
+    )
+    dist.barrier()
+    us = _rank_max(us)
+    E = SPRS_ROUTER[0]
+    # cluster-wide: the router GEMM; bytes per rank: partials in, own rows of the
+    # residual in, res_out + out (+ the gate weight) out
+    flops = 2 * tokens * E * hidden if router else 0
+    nbytes = ctx.world * 2 * hidden * (tokens + 3 * m + (E if router else 0))
+    return {
+        "gfx": get_gfx(),
+        "sp_rs_norm us": us,
+        "sp_rs_norm TFLOPS": flops / us / 1e6,
+        "sp_rs_norm TB/s": nbytes / us / 1e6,
+        "sp_rs_norm err": err,
+        "sp_rs_norm rel_l2": e,
+    }
 
 
 def _run(fn, *args) -> dict:
@@ -783,7 +838,7 @@ def _run(fn, *args) -> dict:
     return row
 
 
-def _summary(name: str, rows: list) -> None:
+def summarize(name: str, rows: list) -> None:
     if rows and S.ctx.rank == 0:
         aiter.logger.info(
             "%s summary (markdown):\n%s",
@@ -796,6 +851,11 @@ def _summary(name: str, rows: list) -> None:
 
 def main() -> int:
     global S
+    # whole-op arch gate before anything launches (positive allow-list)
+    if get_gfx() not in SUPPORTED_GFX:
+        if int(os.environ.get("RANK", "0")) == 0:
+            aiter.logger.warning("MegaMoE TP unsupported on %s; skipping", get_gfx())
+        return 0
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter, description=__doc__
     )
@@ -830,19 +890,14 @@ def main() -> int:
         help="Routing distributions.\n    e.g.: -r random",
     )
     parser.add_argument(
-        "-s",
         "--seeds",
         type=int,
         nargs="*",
         default=[0, 1],
-        help="Input / routing seeds.\n    e.g.: -s 0",
+        help="Input / routing seeds.\n    e.g.: --seeds 0",
     )
     args = parser.parse_args()
 
-    if get_gfx() not in SUPPORTED_GFX:
-        if int(os.environ.get("RANK", "0")) == 0:
-            aiter.logger.warning("MegaMoE TP unsupported on %s; skipping", get_gfx())
-        return 0
     ctx = Ctx()
     if ctx.rank != 0:
         aiter.logger.setLevel("WARNING")
@@ -872,10 +927,14 @@ def main() -> int:
         gc.collect()
         torch.cuda.empty_cache()
         dist.barrier()
-    rows["SpRsNorm"].append(_run(test_sp_rs_norm, 6144, max_tokens))
+    routed = max_tokens // (16 * ctx.world) * 16 * ctx.world
+    for tokens, router in ((routed, True), (max_tokens, False)):
+        if tokens:
+            rows["SpRsNorm"].append(_run(test_sp_rs_norm, 6144, tokens, router))
+    S.layers = {}
 
     for name, r in rows.items():
-        _summary(f"MegaMoE TP tp{ctx.world} {name}", r)
+        summarize(f"MegaMoE TP tp{ctx.world} {name}", r)
     failed = [r for rs in rows.values() for r in rs if r["status"] != "PASS"]
     total = sum(len(rs) for rs in rows.values())
     if ctx.rank == 0:
@@ -895,7 +954,7 @@ def _relaunch() -> int:
 
     n = torch.cuda.device_count()
     if n < 2 or not mega_moe_tp_supported():
-        print("test_mega_moe_TP: skipped (needs >= 2 gfx950 GPUs)", flush=True)
+        print("test_mega_moe_tp: skipped (needs >= 2 gfx950 GPUs)", flush=True)
         return 0
     n = 8 if n >= 8 else 4 if n >= 4 else 2
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone"]
