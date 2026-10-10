@@ -102,12 +102,14 @@ def _barrier(vmcnt=63, lgkmcnt=63):
 barrier = _barrier
 
 
-def _idx_to_llvm_ptr(idx_val, addr_space=1):
-    """Convert a byte address to an LLVM pointer without adding alignment claims."""
-    idx_v = idx_val._value if hasattr(idx_val, "_value") else idx_val
-    i64_raw = fx.Int64(idx_v).ir_value()
-    ptr_ty = ir.Type.parse(f"!llvm.ptr<{addr_space}>")
-    return llvm.inttoptr(ptr_ty, i64_raw)
+def _idx_to_fly_ptr(idx_val, value, alignment):
+    """Build a typed global pointer with the access's proven byte alignment."""
+    value_type = fx.as_ir_value(value).type
+    elem_type = (
+        value_type.element_type if isinstance(value_type, ir.VectorType) else value_type
+    )
+    ptr_ty = fx.PointerType.get(elem_type, fx.AddressSpace.Global, alignment)
+    return fx.inttoptr(ptr_ty, fx.Int64(idx_val))
 
 
 def compile_mixed_moe_gemm1_common(
@@ -1749,7 +1751,7 @@ def compile_mixed_moe_gemm1_common(
                     k0_scale
                 )
                 c_tile_m_idx = arith.constant(tile_m, index=True)
-                tid_in_range = fx.Index(tx) < fx.Index(c_tile_m_idx)
+                tid_in_range = fx.Index(tx) < c_tile_m_idx
 
                 def _tid_then():
                     tid_row = bx_m + tx
@@ -2283,9 +2285,7 @@ def compile_mixed_moe_gemm1_common(
 
                         local_max = c0_f32
                         for i in range_constexpr(e_vec):
-                            abs_v = llvm.call_intrinsic(
-                                f32, "llvm.fabs.f32", [frag_vals[i].ir_value()], [], []
-                            )
+                            abs_v = fx.math.absf(frag_vals[i])
                             local_max = arith.maximumf(local_max, abs_v)
 
                         for si in range_constexpr(num_shuffle_steps_s1):
@@ -2329,27 +2329,20 @@ def compile_mixed_moe_gemm1_common(
                             ptr_addr_idx = row_byte_base + col_g0 // arith.constant(
                                 2, index=True
                             )
-                            out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                             pack_bytes = e_vec // 2
                             if const_expr(pack_bytes == 1):
-                                store_val = arith.TruncIOp(T.i8, packed_i32)
-                                store_raw = (
-                                    store_val._value
-                                    if hasattr(store_val, "_value")
-                                    else store_val
-                                )
-                                llvm.StoreOp(
-                                    store_raw, out_ptr_v, alignment=1, nontemporal=True
+                                store_val = fx.Int8(packed_i32)
+                                fx.generic_store(
+                                    _idx_to_fly_ptr(ptr_addr_idx, store_val, 1),
+                                    store_val,
+                                    nontemporal=True,
                                 )
                             elif const_expr(pack_bytes == 2):
-                                store_val = arith.TruncIOp(T.i16, packed_i32)
-                                store_raw = (
-                                    store_val._value
-                                    if hasattr(store_val, "_value")
-                                    else store_val
-                                )
-                                llvm.StoreOp(
-                                    store_raw, out_ptr_v, alignment=2, nontemporal=True
+                                store_val = fx.Int16(packed_i32)
+                                fx.generic_store(
+                                    _idx_to_fly_ptr(ptr_addr_idx, store_val, 2),
+                                    store_val,
+                                    nontemporal=True,
                                 )
                             else:
                                 packed_raw = (
@@ -2357,8 +2350,10 @@ def compile_mixed_moe_gemm1_common(
                                     if hasattr(packed_i32, "_value")
                                     else packed_i32
                                 )
-                                llvm.StoreOp(
-                                    packed_raw, out_ptr_v, alignment=4, nontemporal=True
+                                fx.generic_store(
+                                    _idx_to_fly_ptr(ptr_addr_idx, packed_raw, 4),
+                                    packed_raw,
+                                    nontemporal=True,
                                 )
 
                         elif const_expr(need_fp8):
@@ -2377,18 +2372,11 @@ def compile_mixed_moe_gemm1_common(
                                         packed_i32,
                                         w,
                                     )
-                                out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                                 if const_expr(e_vec == 2):
-                                    store_val = arith.TruncIOp(T.i16, packed_i32)
-                                    store_raw = (
-                                        store_val._value
-                                        if hasattr(store_val, "_value")
-                                        else store_val
-                                    )
-                                    llvm.StoreOp(
-                                        store_raw,
-                                        out_ptr_v,
-                                        alignment=2,
+                                    store_val = fx.Int16(packed_i32)
+                                    fx.generic_store(
+                                        _idx_to_fly_ptr(ptr_addr_idx, store_val, 2),
+                                        store_val,
                                         nontemporal=True,
                                     )
                                 else:
@@ -2397,10 +2385,9 @@ def compile_mixed_moe_gemm1_common(
                                         if hasattr(packed_i32, "_value")
                                         else packed_i32
                                     )
-                                    llvm.StoreOp(
+                                    fx.generic_store(
+                                        _idx_to_fly_ptr(ptr_addr_idx, packed_raw, 4),
                                         packed_raw,
-                                        out_ptr_v,
-                                        alignment=4,
                                         nontemporal=True,
                                     )
                             else:
@@ -2424,16 +2411,14 @@ def compile_mixed_moe_gemm1_common(
                                     word_ptr = ptr_addr_idx + arith.constant(
                                         wg * 4, index=True
                                     )
-                                    out_ptr_v = _idx_to_llvm_ptr(word_ptr)
                                     packed_raw = (
                                         packed_w._value
                                         if hasattr(packed_w, "_value")
                                         else packed_w
                                     )
-                                    llvm.StoreOp(
+                                    fx.generic_store(
+                                        _idx_to_fly_ptr(word_ptr, packed_raw, 4),
                                         packed_raw,
-                                        out_ptr_v,
-                                        alignment=4,
                                         nontemporal=True,
                                     )
 
@@ -2458,7 +2443,7 @@ def compile_mixed_moe_gemm1_common(
                                     + d4 * c2_i32
                                     + d1
                                 )
-                                e8m0_i8 = arith.TruncIOp(T.i8, e8m0_biased)
+                                e8m0_i8 = fx.Int8(e8m0_biased)
                                 buffer_ops.buffer_store(
                                     e8m0_i8,
                                     sorted_scale_rsrc,
@@ -2478,15 +2463,13 @@ def compile_mixed_moe_gemm1_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
-                        frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.fadd,
-                            out_ptr_v,
-                            frag_v,
-                            llvm.AtomicOrdering.monotonic,
+                        frag_vec = fx.Vector(frag)
+                        fx.atomic_add(
+                            _idx_to_fly_ptr(
+                                ptr_addr_idx, frag_vec, e_vec_sk * out_elem_bytes
+                            ),
+                            frag_vec,
                             syncscope="agent",
-                            alignment=e_vec_sk * out_elem_bytes,
                         )
                     else:
                         col_idx = col_g0
@@ -2494,12 +2477,12 @@ def compile_mixed_moe_gemm1_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                         frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.StoreOp(
+                        fx.generic_store(
+                            _idx_to_fly_ptr(
+                                ptr_addr_idx, frag_v, e_vec * out_elem_bytes
+                            ),
                             frag_v,
-                            out_ptr_v,
-                            alignment=e_vec * out_elem_bytes,
                             nontemporal=True,
                         )
 
@@ -3523,14 +3506,14 @@ def compile_mixed_moe_gemm2_common(
             if const_expr(not bool(accumulate)):
                 out_nbytes_idx = (
                     tokens_in
-                    * fx.Index(topk)
+                    * topk_idx
                     * n_in
                     * arith.constant(out_elem_bytes, index=True)
                 )
             if const_expr(need_fp8_out):
                 out_nbytes_idx = (
                     tokens_in
-                    * fx.Index(topk)
+                    * topk_idx
                     * arith.constant(out_row_bytes_const, index=True)
                 )
             out_nbytes_i32 = fx.Int32(out_nbytes_idx)
@@ -3600,11 +3583,10 @@ def compile_mixed_moe_gemm2_common(
             if const_expr(persistent):
                 c_cu = arith.constant(cu_num, index=True)
                 c_tm_p = arith.constant(tile_m, index=True)
-                _num_valid_idx = fx.Index(num_valid_i32)
-                total_m_tiles = (_num_valid_idx + c_tm_p - c1_p) // c_tm_p
+                total_m_tiles = (num_valid_idx + c_tm_p - c1_p) // c_tm_p
                 tiles_per_block_base = total_m_tiles // c_cu
                 tiles_remainder = total_m_tiles - (tiles_per_block_base * c_cu)
-                has_extra_tile = fx.Index(bx_persist) < fx.Index(tiles_remainder)
+                has_extra_tile = fx.Index(bx_persist) < tiles_remainder
                 extra_tile = has_extra_tile.select(c1_p, c0_p)
                 tiles_per_block = tiles_per_block_base + extra_tile
                 start_tail = has_extra_tile.select(bx_persist, tiles_remainder)
@@ -4445,7 +4427,7 @@ def compile_mixed_moe_gemm2_common(
                     row_stride_bytes_pre <= 16384
                 )
                 c_tile_m_idx = arith.constant(tile_m, index=True)
-                tid_in_range = fx.Index(tx) < fx.Index(c_tile_m_idx)
+                tid_in_range = fx.Index(tx) < c_tile_m_idx
                 r216_defer_tid = bool(
                     r139_xdma_first
                     and use_async_copy
@@ -4890,14 +4872,15 @@ def compile_mixed_moe_gemm2_common(
                                 1,
                             )
                             word_ptr = ptr_addr_idx + arith.constant(wg * 4, index=True)
-                            out_ptr_v = _idx_to_llvm_ptr(word_ptr)
                             packed_raw = (
                                 packed_w._value
                                 if hasattr(packed_w, "_value")
                                 else packed_w
                             )
-                            llvm.StoreOp(
-                                packed_raw, out_ptr_v, alignment=4, nontemporal=True
+                            fx.generic_store(
+                                _idx_to_fly_ptr(word_ptr, packed_raw, 4),
+                                packed_raw,
+                                nontemporal=True,
                             )
                         # e8m0 scale byte at [model_dim + col_g0/8].
                         scale_byte_idx = (
@@ -4905,10 +4888,11 @@ def compile_mixed_moe_gemm2_common(
                             + arith.constant(model_dim, index=True)
                             + (col_g0 // arith.constant(8, index=True))
                         )
-                        scale_ptr_v = _idx_to_llvm_ptr(scale_byte_idx)
                         e8m0_raw = fx.Int8(E).ir_value()
-                        llvm.StoreOp(
-                            e8m0_raw, scale_ptr_v, alignment=1, nontemporal=True
+                        fx.generic_store(
+                            _idx_to_fly_ptr(scale_byte_idx, e8m0_raw, 1),
+                            e8m0_raw,
+                            nontemporal=True,
                         )
                     elif const_expr(not bool(accumulate)):
                         col_idx = col_g0
@@ -4916,12 +4900,12 @@ def compile_mixed_moe_gemm2_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
                         frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.StoreOp(
+                        fx.generic_store(
+                            _idx_to_fly_ptr(
+                                ptr_addr_idx, frag_v, e_vec * out_elem_bytes
+                            ),
                             frag_v,
-                            out_ptr_v,
-                            alignment=e_vec * out_elem_bytes,
                             nontemporal=True,
                         )
                     elif const_expr(use_buf_atomic):
@@ -4941,15 +4925,13 @@ def compile_mixed_moe_gemm2_common(
                             out_elem_bytes, index=True
                         )
                         ptr_addr_idx = row_byte_base + byte_off_col
-                        out_ptr_v = _idx_to_llvm_ptr(ptr_addr_idx)
-                        frag_v = frag._value if hasattr(frag, "_value") else frag
-                        llvm.AtomicRMWOp(
-                            llvm.AtomicBinOp.fadd,
-                            out_ptr_v,
-                            frag_v,
-                            llvm.AtomicOrdering.monotonic,
+                        frag_vec = fx.Vector(frag)
+                        fx.atomic_add(
+                            _idx_to_fly_ptr(
+                                ptr_addr_idx, frag_vec, e_vec * out_elem_bytes
+                            ),
+                            frag_vec,
                             syncscope="agent",
-                            alignment=e_vec * out_elem_bytes,
                         )
 
                 e_vec = 2 if accumulate else min(body_tile_n // 32, 8)

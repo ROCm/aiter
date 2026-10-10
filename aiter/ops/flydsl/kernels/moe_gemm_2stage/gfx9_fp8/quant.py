@@ -8,9 +8,9 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm, vector
+from flydsl._mlir.dialects import vector
 from flydsl.expr import range_constexpr, rocdl
-from flydsl.expr.typing import T, as_ir_value
+from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.expr.utils.arith import _to_raw as _raw
 
@@ -67,15 +67,7 @@ def flydsl_absmax():
 
         vmax = wave_reduce_max(vmax)
         if tid == 0:
-            llvm_ptr = fx.to_llvm_ptr(Amax)
-            llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.fmax,
-                llvm_ptr,
-                as_ir_value(vmax),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            )
+            fx.atomic_max(Amax, vmax, syncscope="agent")
 
     @flyc.jit
     def launch(
