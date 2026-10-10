@@ -173,5 +173,18 @@ if [ "$qg_rc" -ne 0 ] && [ "$qbad" -eq 0 ]; then
   echo "  ❌ queue_gate_test.py did not run — ${why:-exit $qg_rc}"; bad=$((bad + 1))
 fi
 
+echo "[lost review]"
+# The other end of the watchdog: a review that started and then vanished. Same reason it cannot
+# be exercised here -- the job only runs from the default branch.
+lr=$(python3 "$S/lost_review_test.py" 2>&1); lr_rc=$?
+printf '%s\n' "$lr" | grep -E '^  (✅|❌)' || true
+lok=$(printf '%s\n' "$lr" | grep -c '✅' || true)
+lbad=$(printf '%s\n' "$lr" | grep -c '❌' || true)
+ok=$((ok + lok)); bad=$((bad + lbad))
+if [ "$lr_rc" -ne 0 ] && [ "$lbad" -eq 0 ]; then
+  why=$(printf '%s\n' "$lr" | grep -m1 -E 'Error|Traceback|No such file' | sed 's/^ *//' | cut -c1-110)
+  echo "  ❌ lost_review_test.py did not run — ${why:-exit $lr_rc}"; bad=$((bad + 1))
+fi
+
 echo "=== $ok green / $bad red ==="
 [ "$bad" -eq 0 ]
