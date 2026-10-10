@@ -9,7 +9,7 @@ The saved winner metric is main-compatible device kernel-duration sum for comple
 | MiniMax seven default rows | 4392 | 120 | 2507.705s | 908.925s | 2.759x |
 | GPT-OSS five environments | 4560 | 120 | 2464.419s | 1042.376s | 2.364x |
 
-All27 process wall sums total9327.387s; all searches returned13296 validated pipeline pairs. Staged recorded405G1/772G2 screens and0 inferred/explicit fallback work groups. Static counts remain separate from actual compilation/numerical evidence.
+The27 independent search tasks span15:52:59–18:35:50UTC, with0 overlaps verified from recorded process start/exit times. All27 process wall sums total9327.387s; all searches returned13296 validated pipeline pairs. Staged recorded405G1/772G2 screens and0 inferred/explicit fallback work groups. Static counts remain separate from actual compilation/numerical evidence.
 
 | MiniMax tokens | Full winner sum μs | Prune winner sum μs | Staged winner sum μs | Full→prune | Prune→staged | Full→staged |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -37,6 +37,6 @@ MiniMax512/2048 prune winners were excluded at G1 ranks4/5. GPTdefault/limit5 pr
 
 Eight concrete two-winner checks are retained in `targeted-replay-plan.json`: full/prune64, prune/staged128/512/2048 and GPTdefault/FP8/limit5/combined5. Each proposes three balanced alternating cycles on one fixed generated fixture, with normal main kernel-sum timing, finite Torch gate0.1 and median/dispersion. They add no tuning invocation. Their measured outcomes and the81 exact winner production/AOT tasks are pending root execution; this report does not mark them passed. Smaller retained-winner and same-pair differences remain explicitly described as independent measurement variation unless later evidence requires another focused check. There is no hard regret/speedup threshold or automaticK/group/policy change.
 
-Full anchors returned1368 validations each. Their process wall totals were699.554s (token64),807.809s (2048),896.597s (8192). Each retained its pre-start compilation/preparation/warmup/profiling/failure estimate and uncertainty, progress records and actual end record. The large-token actual fell below its conservative pre-start1732–27960s estimate; the extrapolated lower planning hypothesis was not a guaranteed bound. Cost estimates never stopped or reduced required search work.
+Full anchors returned1368 validations each. Their process wall totals were699.554s (token64),807.809s (2048),896.597s (8192). Each retained its pre-start compilation/preparation/warmup/profiling/failure estimate and uncertainty, progress records and actual end record. Token2048 actual807.809s fell slightly below its pre-start842–14280s range; token8192 actual896.597s fell below its conservative pre-start1732–27960s estimate; the extrapolated lower planning hypothesis was not a guaranteed bound. Cost estimates never stopped or reduced required search work.
 
 The complete names, errors, settings, counts, times and screening ranks are in `calibration-summary.json` and `calibration-summary.md`. Original task/runtime identity, idle samples, full compressed logs, outputs and cost/progress evidence remain under `gpu/<search-id>/`. Final production/AOT, targeted repeat results and Standards/Spec review remain required before closing ticket04.
