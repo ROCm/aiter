@@ -424,3 +424,27 @@ def test_staged_rejects_unsupported_participant_before_scheduler(monkeypatch):
                 None,
                 SimpleNamespace(mp=2, timeout=0, mxfp4_search_mode="staged"),
             )
+
+
+def test_staged_result_remains_readable_when_process_exit_precedes_receive(monkeypatch):
+    ctx = TrackingContext(_GET_CONTEXT("spawn"))
+    observed = []
+
+    def wait_after_exit(waitables):
+        from multiprocessing.connection import wait
+
+        process = next(proc for proc in ctx.processes if not proc.closed)
+        wait([process.sentinel])
+        process.process.join()
+        assert process.process.exitcode == 0
+        observed.append(ctx.receive_count)
+        return wait(waitables)
+
+    monkeypatch.setattr(moe, "wait_for_connections", wait_after_exit)
+    results = moe._run_staged_shapes_isolated(
+        payloads({"token": 1}, {"token": 2}), 1, ctx, entry=cpu_result_worker
+    )
+    assert observed == [0, 1]
+    assert [row["token"] for row in results] == [1, 2]
+    assert all(process.joined for process in ctx.processes)
+    ctx.assert_closed()
