@@ -1345,8 +1345,15 @@ def _fused_moe_impl(
     metadata = _resolve_metadata()
     if _is_mxmoe_opus_metadata(metadata):
         reason = _mxmoe_opus_call_unsupported(
-            metadata, hidden_states, w1, w2, w1_scale, w2_scale, a1_scale,
-            topk_ids, block_size_M=block_size_M,
+            metadata,
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            a1_scale,
+            topk_ids,
+            block_size_M=block_size_M,
         )
         if reason:
             logger.warning(
@@ -2240,9 +2247,7 @@ def _mxfp4_a4w4_stage1(
         # under-allocates and the last blocks write past the buffer (D_INTER=1408
         # spans 49152 B where the unpadded figure gives 45056 B).
         chunks = (max_sorted + BM - 1) // BM
-        inter_scale_bytes = max(
-            inter_scale_bytes, chunks * chunk_bytes
-        )
+        inter_scale_bytes = max(inter_scale_bytes, chunks * chunk_bytes)
     else:
         # Regular chunks pack 32 rows. Expose their physical column stride so
         # consumers deriving the chunk stride from tensor metadata read it as-is.
@@ -2891,10 +2896,30 @@ def _flydsl_v2_stage2_wrapper(
 
 
 def _mxmoe_opus_cfg_unsupported(
-    p1, kernel_name2, cfg, *, gfx, model_dim, inter_dim, expert, topk, dtype, q_dtype_a,
-    q_dtype_w, q_type, use_g1u1, doweight_stage1, gate_mode, hidden_pad,
-    intermediate_pad, is_ep, has_stage2_bias, q_dtype_a2, input_dtype,
-    has_stage2_scatter, has_num_local_tokens,
+    p1,
+    kernel_name2,
+    cfg,
+    *,
+    gfx,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    doweight_stage1,
+    gate_mode,
+    hidden_pad,
+    intermediate_pad,
+    is_ep,
+    has_stage2_bias,
+    q_dtype_a2,
+    input_dtype,
+    has_stage2_scatter,
+    has_num_local_tokens,
 ):
     """Static common contract for the explicit MXMOE -> OPUS selection."""
     if (p1["a_dtype"], p1["out_dtype"]) != ("fp8", "fp8"):
@@ -2918,8 +2943,12 @@ def _mxmoe_opus_cfg_unsupported(
     if p1["inline_quant"] and input_dtype == dtypes.fp8:
         return "inline GEMM1 reads BF16 and cannot accept FP8 input"
     supported, reason = _opus_a8w4.cfg_is_supported(
-        kernel_name2, cfg=cfg, gfx=gfx, block_m=cfg.get("block_m", BLOCK_SIZE_M),
-        is_ep=is_ep, has_stage2_bias=has_stage2_bias,
+        kernel_name2,
+        cfg=cfg,
+        gfx=gfx,
+        block_m=cfg.get("block_m", BLOCK_SIZE_M),
+        is_ep=is_ep,
+        has_stage2_bias=has_stage2_bias,
     )
     if not supported:
         return reason
@@ -2934,11 +2963,20 @@ def _mxmoe_opus_cfg_unsupported(
 
     try:
         _assert_supported(
-            D_HIDDEN=model_dim, D_INTER=inter_dim, BM=p1["BM"], BN=p1["BN"],
-            BK=p1["BK"], use_nt=p1["use_nt"], inline_quant=p1["inline_quant"],
-            prefetch_hidden=p1["prefetch_hidden"], a_dtype=p1["a_dtype"],
-            out_dtype=p1["out_dtype"], act=p1["act"], num_waves=p1["num_waves"],
-            k_wave=p1["k_wave"], native_scale_layout=False,
+            D_HIDDEN=model_dim,
+            D_INTER=inter_dim,
+            BM=p1["BM"],
+            BN=p1["BN"],
+            BK=p1["BK"],
+            use_nt=p1["use_nt"],
+            inline_quant=p1["inline_quant"],
+            prefetch_hidden=p1["prefetch_hidden"],
+            a_dtype=p1["a_dtype"],
+            out_dtype=p1["out_dtype"],
+            act=p1["act"],
+            num_waves=p1["num_waves"],
+            k_wave=p1["k_wave"],
+            native_scale_layout=False,
         )
     except NotImplementedError as exc:
         return str(exc)
@@ -2956,8 +2994,16 @@ def _is_mxmoe_opus_metadata(metadata):
 
 
 def _mxmoe_opus_call_unsupported(
-    metadata, hidden_states, w1, w2, w1_scale, w2_scale, a1_scale,
-    topk_ids, *, block_size_M,
+    metadata,
+    hidden_states,
+    w1,
+    w2,
+    w1_scale,
+    w2_scale,
+    a1_scale,
+    topk_ids,
+    *,
+    block_size_M,
 ):
     """Check tensor preparation and the actual sort before each public call."""
     if block_size_M is not None and int(block_size_M) != int(metadata.block_m):
@@ -2969,35 +3015,54 @@ def _mxmoe_opus_call_unsupported(
     tensors = [hidden_states, w1, w2, w1_scale, w2_scale, topk_ids]
     if w1_scale is None or w2_scale is None:
         return "both weights require E8M0 scales"
-    if any(scale.dtype not in (torch.uint8, dtypes.fp8_e8m0) for scale in (w1_scale, w2_scale)):
+    if any(
+        scale.dtype not in (torch.uint8, dtypes.fp8_e8m0)
+        for scale in (w1_scale, w2_scale)
+    ):
         return "weight scales require one-byte E8M0 storage"
     experts, hidden, inter = w1.shape[0], w2.shape[1], w2.shape[-1] * 2
     if hidden_states.shape[1] != hidden or w1.shape[-1] * 2 != hidden:
         return "activation and packed W1 dimensions do not match model_dim"
     if w1_scale.numel() < experts * 2 * inter * _padded_scale_cols(hidden):
         return "W1 scales are smaller than the padded preshuffle stride"
-    if (w2_scale.dim() != 2 or w2_scale.shape[0] != experts * hidden
-        or w2_scale.shape[1] != _padded_scale_cols(inter)):
-        return "W2 scales require contiguous [expert * model_dim, padded group32] storage"
+    if (
+        w2_scale.dim() != 2
+        or w2_scale.shape[0] != experts * hidden
+        or w2_scale.shape[1] != _padded_scale_cols(inter)
+    ):
+        return (
+            "W2 scales require contiguous [expert * model_dim, padded group32] storage"
+        )
     if any(not tensor.is_contiguous() for tensor in tensors):
         return "weights, scales, activation and routing must be contiguous"
     if len({tensor.device for tensor in tensors}) != 1:
         return "cross-device tensors"
     if hidden_states.dtype == dtypes.fp8:
         if a1_scale is None:
-            raise ValueError("MXFP8 input requires original per-token E8M0 activation scales")
+            raise ValueError(
+                "MXFP8 input requires original per-token E8M0 activation scales"
+            )
         expected = (hidden_states.shape[0], hidden_states.shape[1] // 32)
-        if tuple(a1_scale.shape) != expected or a1_scale.dtype not in (torch.uint8, dtypes.fp8_e8m0):
-            raise ValueError(f"MXFP8 input requires per-token group32 E8M0 scales of shape {expected}")
+        if tuple(a1_scale.shape) != expected or a1_scale.dtype not in (
+            torch.uint8,
+            dtypes.fp8_e8m0,
+        ):
+            raise ValueError(
+                f"MXFP8 input requires per-token group32 E8M0 scales of shape {expected}"
+            )
         if not a1_scale.is_contiguous() or a1_scale.device != hidden_states.device:
-            raise ValueError("MXFP8 activation scales must be contiguous and on the input device")
+            raise ValueError(
+                "MXFP8 activation scales must be contiguous and on the input device"
+            )
     M, topk = topk_ids.shape
-    generated_sort = (
-        not _aux_uses_opus(metadata.output_aux, metadata.block_m, M * topk, w1.shape[0])
-        and _MOE_SORT_BACKEND not in ("opus", "ck")
-    )
+    generated_sort = not _aux_uses_opus(
+        metadata.output_aux, metadata.block_m, M * topk, w1.shape[0]
+    ) and _MOE_SORT_BACKEND not in ("opus", "ck")
     if generated_sort and not _mxfp4_aux_instance_supported(
-        w1.shape[0], topk, w2.shape[1], int(metadata.block_m),
+        w1.shape[0],
+        topk,
+        w2.shape[1],
+        int(metadata.block_m),
         not stage2_uses_route_reduce(metadata.stage2),
     ):
         return "actual generated sort instance is unavailable in module_moe_mxfp4_aux"
@@ -3032,16 +3097,22 @@ def _make_mxfp4_metadata(
             {"kernelName2": kernel_name2}, resolved_block_m
         )
     stage2 = (
-        functools.partial(_opus_a8w4.opus_a8w4_stage2_wrapper,
-            kernelName=kernel_name2, launch=opus_launch)
-        if is_opus else functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernel_name2)
+        functools.partial(
+            _opus_a8w4.opus_a8w4_stage2_wrapper,
+            kernelName=kernel_name2,
+            launch=opus_launch,
+        )
+        if is_opus
+        else functools.partial(_mxfp4_a4w4_stage2_fw, kernelName2=kernel_name2)
     )
     return MOEMetadata(
         stage1=functools.partial(
             _mxfp4_a4w4_stage1_fw,
             kernelName1=kernel_name1,
             interleave=(gate_mode == GateMode.INTERLEAVE),
-            native_scale_layout=native_scale_layout_for(p1["BM"], p1["out_dtype"], kernel_name2),
+            native_scale_layout=native_scale_layout_for(
+                p1["BM"], p1["out_dtype"], kernel_name2
+            ),
         ),
         stage2=stage2,
         block_m=resolved_block_m,
@@ -3356,9 +3427,15 @@ def get_2stage_cfgs(
         # Invalid MXMOE names must fail before a backend/layout check can
         # silently discard the row and substitute a heuristic kernel.
         parsed_g1 = _parse_mxfp4_g1_kname(kn1) if _is_mxfp4_kname(kn1) else None
-        if (parsed_g1 is not None and _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
-            and input_dtype == dtypes.fp8 and not _has_input_activation_scales):
-            raise ValueError("MXFP8 input requires original per-token E8M0 activation scales")
+        if (
+            parsed_g1 is not None
+            and _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2)
+            and input_dtype == dtypes.fp8
+            and not _has_input_activation_scales
+        ):
+            raise ValueError(
+                "MXFP8 input requires original per-token E8M0 activation scales"
+            )
         has_opus = kn1.startswith("opus_") or kn2.startswith("opus_")
         if opus_weights_shuffled is None:
             opus_weights_shuffled = is_shuffled
@@ -3431,14 +3508,29 @@ def get_2stage_cfgs(
         elif _opus_a8w4.is_opus_a8w4_stage2_kernel(kn2):
             reject_reason = (
                 "excluded for this invocation"
-                if _exclude_mxmoe_opus else _mxmoe_opus_cfg_unsupported(
-                    parsed_g1, kn2, cfg, gfx=gfx, model_dim=model_dim,
-                    inter_dim=inter_dim, expert=expert, topk=topk, dtype=dtype, q_dtype_a=q_dtype_a,
-                    q_dtype_w=q_dtype_w, q_type=q_type, use_g1u1=use_g1u1,
-                    doweight_stage1=doweight_stage1, gate_mode=gate_mode,
-                    hidden_pad=hidden_pad, intermediate_pad=intermediate_pad,
-                    is_ep=is_ep, has_stage2_bias=has_stage2_bias,
-                    q_dtype_a2=q_dtype_a2, input_dtype=input_dtype,
+                if _exclude_mxmoe_opus
+                else _mxmoe_opus_cfg_unsupported(
+                    parsed_g1,
+                    kn2,
+                    cfg,
+                    gfx=gfx,
+                    model_dim=model_dim,
+                    inter_dim=inter_dim,
+                    expert=expert,
+                    topk=topk,
+                    dtype=dtype,
+                    q_dtype_a=q_dtype_a,
+                    q_dtype_w=q_dtype_w,
+                    q_type=q_type,
+                    use_g1u1=use_g1u1,
+                    doweight_stage1=doweight_stage1,
+                    gate_mode=gate_mode,
+                    hidden_pad=hidden_pad,
+                    intermediate_pad=intermediate_pad,
+                    is_ep=is_ep,
+                    has_stage2_bias=has_stage2_bias,
+                    q_dtype_a2=q_dtype_a2,
+                    input_dtype=input_dtype,
                     has_stage2_scatter=has_stage2_scatter,
                     has_num_local_tokens=has_num_local_tokens,
                 )
@@ -4332,6 +4424,7 @@ def fused_moe_2stages(
         and getattr(w2, "is_shuffled", False),
         config_file=_metadata_config_file,
         input_dtype=hidden_states.dtype,
+        _has_input_activation_scales=a1_scale is not None,
     )
     if _metadata_transform is not None:
         metadata = _metadata_transform(metadata)
@@ -4345,7 +4438,8 @@ def fused_moe_2stages(
         # this keyed on block_m rather than on _aux_uses_opus, which now sends
         # block_m 16 to Opus for the sort alone.
         and int(metadata.block_m) != 16
-        and _parse_mxfp4_g1_kname(metadata.stage1.keywords["kernelName1"])["a_dtype"] == "fp4"
+        and _parse_mxfp4_g1_kname(metadata.stage1.keywords["kernelName1"])["a_dtype"]
+        == "fp4"
     ):
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1 on the default Opus auxiliary path.
