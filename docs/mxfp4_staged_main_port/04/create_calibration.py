@@ -60,17 +60,17 @@ def main():
         )
         for mode in modes:
             jobs.append(
-                dict(
-                    id=f"minimax-{token}-{mode}",
-                    model="minimax",
-                    token=token,
-                    config="default",
-                    mode=mode,
-                    fp8=False,
-                    fp4=False,
-                    limit=None,
-                    row=row,
-                )
+                {
+                    "id": f"minimax-{token}-{mode}",
+                    "model": "minimax",
+                    "token": token,
+                    "config": "default",
+                    "mode": mode,
+                    "fp8": False,
+                    "fp4": False,
+                    "limit": None,
+                    "row": row,
+                }
             )
     for config, fp8, fp4, limit in (
         ("default", False, False, None),
@@ -81,84 +81,86 @@ def main():
     ):
         for mode in ("prune", "staged"):
             jobs.append(
-                dict(
-                    id=f"gpt-2048-{config}-{mode}",
-                    model="gpt",
-                    token=2048,
-                    config=config,
-                    mode=mode,
-                    fp8=fp8,
-                    fp4=fp4,
-                    limit=limit,
-                    row=shape(2048, gate_mode="separated"),
-                )
+                {
+                    "id": f"gpt-2048-{config}-{mode}",
+                    "model": "gpt",
+                    "token": 2048,
+                    "config": config,
+                    "mode": mode,
+                    "fp8": fp8,
+                    "fp4": fp4,
+                    "limit": limit,
+                    "row": shape(2048, gate_mode="separated"),
+                }
             )
 
     def forbidden(*unused_args, **unused_kwargs):
         raise AssertionError("offline counting reached compilation or GPU work")
 
     counts = []
-    with mock.patch.object(flydsl.compiler, "compile", side_effect=forbidden):
-        with mock.patch.multiple(
+    with (
+        mock.patch.object(flydsl.compiler, "compile", side_effect=forbidden),
+        mock.patch.multiple(
             torch.cuda,
             **{
                 name: forbidden
                 for name in ("_lazy_init", "synchronize", "Event", "CUDAGraph")
             },
-        ):
-            for job in jobs:
-                row = job["row"]
-                pairs = tuner._candidate_rows(row, full_search=job["mode"] == "full")
-                plan = build_staged_candidate_plan(row, pairs)
-                groups = []
-                for group in plan.pipeline_groups:
-                    n1, n2 = len(group.gemm1_candidates), len(group.gemm2_candidates)
-                    assert len(group.pairs) == n1 * n2
-                    groups.append(
-                        dict(
-                            block_m=group.key.block_m,
-                            accumulation_mode=group.key.accumulation_mode.value,
-                            gemm1_candidates=n1,
-                            gemm2_candidates=n2,
-                            pairs=len(group.pairs),
-                            k2_shortlist_pairs_upper=min(2, n1) * min(2, n2),
-                        )
-                    )
-                counts.append(
-                    dict(
-                        id=job["id"],
-                        m_est=(row["token"] * row["topk"] + row["expert"] - 1)
-                        // row["expert"],
-                        total_pairs=len(pairs),
-                        unique_gemm1=sum(len(g.candidates) for g in plan.gemm1_groups),
-                        unique_gemm2=sum(len(g.candidates) for g in plan.gemm2_groups),
-                        k2_shortlist_pairs_upper=sum(
-                            g["k2_shortlist_pairs_upper"] for g in groups
-                        ),
-                        staged_exhaustive_fallback_pairs_upper=len(pairs),
-                        groups=groups,
-                    )
+        ),
+    ):
+        for job in jobs:
+            row = job["row"]
+            pairs = tuner._candidate_rows(row, full_search=job["mode"] == "full")
+            plan = build_staged_candidate_plan(row, pairs)
+            groups = []
+            for group in plan.pipeline_groups:
+                n1, n2 = len(group.gemm1_candidates), len(group.gemm2_candidates)
+                assert len(group.pairs) == n1 * n2
+                groups.append(
+                    {
+                        "block_m": group.key.block_m,
+                        "accumulation_mode": group.key.accumulation_mode.value,
+                        "gemm1_candidates": n1,
+                        "gemm2_candidates": n2,
+                        "pairs": len(group.pairs),
+                        "k2_shortlist_pairs_upper": min(2, n1) * min(2, n2),
+                    }
                 )
-                path = inputs / f"{job['id']}.csv"
-                with path.open("w", newline="") as stream:
-                    writer = csv.DictWriter(stream, fieldnames=row)
-                    writer.writeheader()
-                    writer.writerow(row)
-                job["input"] = os.path.relpath(path, root)
-                del job["row"]
+            counts.append(
+                {
+                    "id": job["id"],
+                    "m_est": (row["token"] * row["topk"] + row["expert"] - 1)
+                    // row["expert"],
+                    "total_pairs": len(pairs),
+                    "unique_gemm1": sum(len(g.candidates) for g in plan.gemm1_groups),
+                    "unique_gemm2": sum(len(g.candidates) for g in plan.gemm2_groups),
+                    "k2_shortlist_pairs_upper": sum(
+                        g["k2_shortlist_pairs_upper"] for g in groups
+                    ),
+                    "staged_exhaustive_fallback_pairs_upper": len(pairs),
+                    "groups": groups,
+                }
+            )
+            path = inputs / f"{job['id']}.csv"
+            with path.open("w", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=row)
+                writer.writeheader()
+                writer.writerow(row)
+            job["input"] = os.path.relpath(path, root)
+            del job["row"]
     assert len(jobs) == 27 and Counter(job["model"] for job in jobs) == {
         "minimax": 17,
         "gpt": 10,
     }
     (args.output_dir / "manifest.json").write_text(json.dumps(jobs, indent=2) + "\n")
-    output = dict(
-        implementation_commit=subprocess.check_output(
+    output = {
+        "implementation_commit": subprocess.check_output(
             ["git", "rev-parse", "HEAD"], cwd=root, text=True
         ).strip(),
-        dependency="ROCm/FlyDSL imports with synthetic discovery; whole-process empty visibility; guarded GPU/JIT boundaries",
-        legality="Static admitted pairs, not runtime compilation or numerical validity",
-        records=counts,
-    )
+        "dependency": "ROCm/FlyDSL imports with synthetic discovery; whole-process empty visibility; guarded GPU/JIT boundaries",
+        "legality": "Static admitted pairs, not runtime compilation or numerical validity",
+        "records": counts,
+    }
     (args.output_dir / "candidate-counts.json").write_text(
         json.dumps(output, indent=2) + "\n"
     )
