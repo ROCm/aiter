@@ -51,7 +51,7 @@ from aiter.jit.core import (
     AITER_ROOT_DIR,
     get_asm_dir,
 )
-from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime, gfx_from_cu_num
+from aiter.jit.utils.chip_info import get_gfx, gfx_from_cu_num
 from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_BETA,
     DEFAULT_SITUV2_LINEAR_BETA,
@@ -5918,7 +5918,7 @@ class FmoeTuner(TunerCommon):
                 )
             else:
                 self.tunedf = None
-            self.untunedf["gfx"] = get_gfx_runtime()
+            self.untunedf["gfx"] = self.get_gfx()
             self.untunedf["cu_num"] = self.get_cu_num()
             # Migrate a legacy tuned file that predates the gfx column so the
             # untuned-vs-tuned dedup below (which now includes gfx) doesn't fail.
@@ -5938,12 +5938,15 @@ class FmoeTuner(TunerCommon):
                     if col in self.untunedf.columns and col in self.tunedf.columns
                 ]
                 if len(dedup_cols) == len(self.keys):
-                    mask = (
-                        self.untunedf[dedup_cols]
-                        .apply(tuple, axis=1)
-                        .isin(self.tunedf[dedup_cols].apply(tuple, axis=1))
-                    )
+                    mask = self._already_tuned_mask(dedup_cols)
                     self.untunedf = self.untunedf[~mask]
+
+    def _already_tuned_mask(self, dedup_cols):
+        return (
+            self.untunedf[dedup_cols]
+            .apply(tuple, axis=1)
+            .isin(self.tunedf[dedup_cols].apply(tuple, axis=1))
+        )
 
     def e2e_tune(self, args):
         """
@@ -6454,6 +6457,130 @@ class Mxfp4FlydslTuner(FmoeTuner):
     --mxfp4-search-mode full to enumerate all statically supported GEMM1 variants.
     """
 
+    input_metadata: ClassVar[tuple[str, ...]] = ("gate_mode",)
+    PROFILE_HELP: ClassVar[str] = (
+        "ordinary fMoE profiling output; the dedicated --mxfp4-flydsl tuner "
+        "does not write stage-ranking or full-pair profile artifacts"
+    )
+
+    @staticmethod
+    def _unsupported_row_reason(row):
+        for field, expected in (
+            ("dtype", dtypes.bf16),
+            ("q_dtype_a", dtypes.fp4x2),
+            ("q_dtype_w", dtypes.fp4x2),
+            ("q_type", QuantType.per_1x32),
+        ):
+            if str(row.get(field)) != str(expected):
+                return f"{field} must be {expected}, got {row.get(field)!r}"
+        for field, allowed in (
+            ("use_g1u1", ("1", "1.0", "true")),
+            ("doweight_stage1", ("0", "0.0", "false")),
+        ):
+            if str(row.get(field)).lower() not in allowed:
+                return f"{field} must be {allowed[0]}, got {row.get(field)!r}"
+        activation = str(row.get("act_type")).rsplit(".", 1)[-1].lower()
+        if activation not in ("silu", "situv2", "swiglu"):
+            return f"unsupported act_type: {row.get('act_type')!r}"
+        gate = row.get("gate_mode", "separated")
+        if pd.isna(gate) or str(gate).strip() == "":
+            gate = "separated"
+        if str(gate).rsplit(".", 1)[-1].lower() != "separated":
+            return f"gate_mode must be separated, got {gate!r}"
+        for field in ("token", "model_dim", "inter_dim", "expert", "topk"):
+            try:
+                value = int(row.get(field, 0))
+                if value > 0 and value == float(row[field]):
+                    continue
+            except (TypeError, ValueError, OverflowError):
+                pass
+            return f"{field} must be a positive integer, got {row.get(field)!r}"
+        if int(row["topk"]) > int(row["expert"]):
+            return "topk must not exceed expert count"
+        return None
+
+    def _already_tuned_mask(self, dedup_cols):
+        times = pd.to_numeric(self.tunedf.get("us"), errors="coerce")
+        valid = self.tunedf[(times > 0) & (times < self.INF_TIME)]
+        mask = (
+            self.untunedf[dedup_cols]
+            .apply(tuple, axis=1)
+            .isin(valid[dedup_cols].apply(tuple, axis=1))
+        )
+        unsupported = self.untunedf.apply(
+            lambda row: self._unsupported_row_reason(row) is not None, axis=1
+        )
+        return mask & ~unsupported
+
+    @staticmethod
+    def _runtime_device_identity(gpu):
+        properties = torch.cuda.get_device_properties(gpu)
+        arch = str(properties.gcnArchName).split(":", 1)[0].lower()
+        cu = int(properties.multi_processor_count)
+        if arch != "gfx950":
+            raise ValueError(f"MXFP4 tuning GPU{gpu} must be gfx950, got {arch}")
+        return arch, cu
+
+    def get_gfx(self):
+        # Main's single-slot prune/full path runs on the caller's current GPU.
+        return (
+            str(
+                torch.cuda.get_device_properties(
+                    torch.cuda.current_device()
+                ).gcnArchName
+            )
+            .split(":", 1)[0]
+            .lower()
+        )
+
+    def get_cu_num(self):
+        return int(
+            torch.cuda.get_device_properties(
+                torch.cuda.current_device()
+            ).multi_processor_count
+        )
+
+    def _preflight_devices(self, mp_num, ngpu):
+        if ngpu < 1:
+            raise ValueError("MXFP4 tuning requires a visible runtime GPU")
+        selected = [torch.cuda.current_device()] if mp_num == 1 else range(mp_num)
+        return [self._runtime_device_identity(gpu) for gpu in selected]
+
+    def _summary_shape_keys(self):
+        # Requested rows are assigned to runtime GPUs by the scheduler. A
+        # successful row on another supported CU count still completes its
+        # requested shape; output keeps the actual assigned gfx/CU identity.
+        return [key for key in self.keys if key not in ("gfx", "cu_num")]
+
+    def _normalize_tuned_csv(self, tunedf):
+        tunedf = super()._normalize_tuned_csv(tunedf)
+        # Filter fallback tags while their meaning is still available.
+        if "_tag" in tunedf:
+            tunedf = tunedf[tunedf["_tag"].fillna("").eq("")].drop(columns="_tag")
+        for column in self.columns:
+            if column not in tunedf:
+                tunedf[column] = "" if column.startswith("kernelName") else 0
+        for column in (
+            "block_m",
+            "ksplit",
+            "us1",
+            "us2",
+            "run_1stage",
+            "xbf16",
+            "flat",
+            "tflops",
+            "bw",
+            "nt",
+        ):
+            if column in tunedf:
+                tunedf[column] = pd.to_numeric(tunedf[column], errors="coerce").fillna(
+                    0
+                )
+        tunedf = tunedf.drop(columns=list(self.input_metadata), errors="ignore")
+        # nt belongs to ordinary fMoE rows sharing this production file.
+        columns = self.columns + (["nt"] if "nt" in tunedf else [])
+        return tunedf[columns]
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
         "untune_file": f"{AITER_ROOT_DIR}/aiter/configs/model_configs/kimik2_fp4_untuned_fmoe.csv",
@@ -6863,6 +6990,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
             num_iters=int(args.iters),
         )
         us = round(float(us), 4)
+        if not math.isfinite(us) or us <= 0:
+            raise RuntimeError(f"invalid MXFP4 validation time {us}")
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
         # is the right roofline for it. Untuned rows keep dtypes as strings, while
         # calculate() looks bpe up by torch dtype.
@@ -6894,6 +7023,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         """
         import signal
 
+        reason = self._unsupported_row_reason(row)
+        if reason is not None:
+            print(f"[mxfp4-port] unsupported shape: {reason}", flush=True)
+            return _mxfp4_failed_row(self.keys, row, f"UNSUPPORTED: {reason}")
+
         timeout = int(getattr(args, "timeout", 0) or 0)
 
         class _CandidateTimeout(Exception):
@@ -6917,6 +7051,8 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 signal.alarm(timeout)
             try:
                 us = self._run_candidate(row, candidate, args)
+                if not math.isfinite(float(us)) or us <= 0:
+                    raise RuntimeError(f"invalid MXFP4 validation time {us}")
                 print(
                     f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
                     f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
@@ -6933,7 +7069,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if timeout > 0:
                     signal.alarm(0)
         if best is None:
-            best = candidates[0]
+            best = candidates[0] if candidates else self._candidate_row(row, 0, "", "")
             best["us"] = self.INVALID_TIME
             best["kernelName1"] = ("FAILED: " + "; ".join(failures))[:240]
             print(
@@ -6947,14 +7083,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
         del tunedf
         rows = [row.to_dict() for _, row in untunedf.iterrows()]
 
+        if not rows:
+            return []
+
         mp_num = int(getattr(args, "mp", 1) or 1)
-        try:
-            ngpu = torch.cuda.device_count()
-        except Exception:  # noqa: BLE001
-            ngpu = 1
+        ngpu = torch.cuda.device_count()
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
+        identities = self._preflight_devices(mp_num, ngpu)
 
         if mp_num <= 1:
+            for row in rows:
+                row["gfx"], row["cu_num"] = identities[0]
             return [self._tune_one_shape(row, args) for row in rows]
 
         # One fresh process per shape (memory fully released between shapes),
@@ -6986,21 +7125,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
     def result_to_csv(self, results, file, concat=False):
         del concat
         old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        for col in self.columns:
-            if col not in old_tunedf.columns:
-                if col == "gfx" and "cu_num" in old_tunedf.columns:
-                    old_tunedf[col] = old_tunedf["cu_num"].map(gfx_from_cu_num)
-                else:
-                    old_tunedf[col] = ""
-        valid = results[
-            (results["us"] != self.INVALID_TIME) & (results["us"] != self.INF_TIME)
-        ]
-        invalid = results[
-            (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
-        ]
+        old_times = pd.to_numeric(old_tunedf["us"], errors="coerce")
+        # A same-file input can contain untuned shape rows. They are requests,
+        # not historical winners, and must not survive as zero-time output.
+        old_tunedf = old_tunedf[(old_times > 0) & (old_times < self.INF_TIME)]
+        times = pd.to_numeric(results["us"], errors="coerce")
+        valid = results[(times > 0) & (times < self.INF_TIME)]
+        invalid = results[~results.index.isin(valid.index)]
         resultdf = self.update_tunedf(old_tunedf, valid)
         self.success = pd.concat([self.success, valid], ignore_index=True)
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
+        resultdf = self._normalize_tuned_csv(resultdf)
         resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
         resultdf.to_csv(file, index=False)
 
@@ -7014,6 +7149,7 @@ def _mxfp4_tune_shape_worker(payload):
         torch.cuda.set_device(gpu)
         tuner = Mxfp4FlydslTuner.__new__(Mxfp4FlydslTuner)
         tuner.keys = keys
+        row["gfx"], row["cu_num"] = tuner._runtime_device_identity(gpu)
         print(
             f"[mxfp4-port] shape token={row['token']} inter={row['inter_dim']} "
             f"expert={row['expert']} topk={row['topk']} -> GPU{gpu}",

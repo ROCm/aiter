@@ -1,0 +1,21 @@
+PARTIAL VERBATIM EXCERPTS; COMPLETE RAW LOGS WERE NOT SAVED.
+
+First run:
+[mxfp4-port] tuning 2 shapes across 2 GPUs
+[mxfp4-port] shape token=8 inter=512 expert=128 topk=4 -> GPU1
+[mxfp4-port] pruned G1: pid=232533 token=8 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=1 valid=84 kept=12
+[mxfp4-port] shape token=4 inter=512 expert=128 topk=4 -> GPU0
+[mxfp4-port] pruned G1: pid=232532 token=4 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=1 valid=84 kept=12
+[aiter] LoadKernel: _ZN5aiter24topksoftmax_4x128x4_bf16E hsaco: /root/workspace/tmp_dev/aiter-mxfp4-01/hsa//gfx950/topksoftmax/topksoftmax_4x128x4_bf16.co
+mxfp4_moe aux codegen: 330 instances under /root/workspace/tmp_dev/aiter-mxfp4-01/aiter/jit/build/module_moe_mxfp4_aux/blob.staging/instances/
+[mxfp4-port] candidate failed: flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu/flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16: 'types.SimpleNamespace' object has no attribute 'errRatio'
+1 failed, 2 passed, 6 warnings in 90.87s (0:01:30)
+
+Second run:
+[mxfp4-port] tuning 2 shapes across 2 GPUs
+[mxfp4-port] shape token=4 inter=512 expert=128 topk=4 -> GPU0
+[mxfp4-port] pruned G1: pid=244497 token=4 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=1 valid=84 kept=12
+[mxfp4-port] shape token=8 inter=512 expert=128 topk=4 -> GPU1
+[mxfp4-port] pruned G1: pid=244498 token=8 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=1 valid=84 kept=12
+[mxfp4-port] candidate failed: flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu/flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16: 'types.SimpleNamespace' object has no attribute 'errRatio'
+1 failed, 2 passed, 6 warnings in 68.77s (0:01:08)

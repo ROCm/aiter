@@ -1,0 +1,1533 @@
+......................................FFFFFF....F.FFFFF                  [100%]
+=================================== FAILURES ===================================
+______ test_ordinary_fmoe_preserves_schema_nt_stage_timings_and_profiles _______
+
+args = (1,), kwargs = {'device': 'cpu'}
+
+    def forbidden(*args, **kwargs):
+        # pytest.fail escapes the tuner's catch(Exception) recovery path.
+>       pytest.fail("controlled ordinary lifecycle test reached real GPU work")
+E       Failed: controlled ordinary lifecycle test reached real GPU work
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:69: Failed
+
+During handling of the above exception, another exception occurred:
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_preserves_s0')
+
+    def test_ordinary_fmoe_preserves_schema_nt_stage_timings_and_profiles(tmp_path):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        profile = tmp_path / "paired-profile.csv"
+        pd.DataFrame([shape(8), shape(), shape()]).to_csv(source, index=False)
+        pd.DataFrame([historical_result(), historical_result(us=9.5)]).to_csv(
+            output, index=False
+        )
+        dispatched = []
+        with controlled_environment(tmp_path, dispatched=dispatched):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+>           tuner.run(args_for(tuner, source, output, "--profile_file", str(profile)))
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:252: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+aiter/utility/base_tuner.py:1584: in run
+    raise tune_exit
+aiter/utility/base_tuner.py:1563: in run
+    self.tune_summary(tuning_status)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune.FmoeTuner object at 0x7cfbebf557c0>
+status = 'Finished'
+
+    def tune_summary(self, status):
+        """Summary of tuning results"""
+        logger.info("============= Tuning results Summary: ==============")
+        tuning_time = round(time.time() - self.tune_start_time, 4)
+        tunedf = pd.concat([self.success, self.failed])
+        logger.info(
+            f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
+        )
+        logger.info("Successfully tuned shapes:")
+        if not self.success.empty:
+            print(self.success, flush=True)
+        logger.info("Failed shapes:")
+        print(self.failed, flush=True)
+    
+        # Input-only validation metadata is not part of the persisted shape key.
+        keys = self._summary_shape_keys()
+        requested = self.untunedf[keys].copy()
+        tunedf_subset = tunedf[keys].astype(requested.dtypes)
+        for column in requested.select_dtypes(include="object"):
+            requested[column] = requested[column].map(str)
+            tunedf_subset[column] = tunedf_subset[column].map(str)
+        mask = requested.apply(tuple, axis=1).isin(tunedf_subset.apply(tuple, axis=1))
+        self.remain_untuned = self.untunedf[~mask]
+    
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
+        if not self.remain_untuned.empty or not self.failed.empty:
+            logger.error(
+                "\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details"
+            )
+>           sys.exit(1)
+E           SystemExit: 1
+
+aiter/utility/base_tuner.py:614: SystemExit
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      8  ...  QuantType.per_1x128         1                0
+1  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[2 rows x 14 columns]
+
+Start tuning ['gfx942' 304 8 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      8  ...  QuantType.per_1x128         1                0
+1  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[2 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0004 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+_____________ test_ordinary_retune_replaces_duplicate_old_winners ______________
+
+args = (1,), kwargs = {'device': 'cpu'}
+
+    def forbidden(*args, **kwargs):
+        # pytest.fail escapes the tuner's catch(Exception) recovery path.
+>       pytest.fail("controlled ordinary lifecycle test reached real GPU work")
+E       Failed: controlled ordinary lifecycle test reached real GPU work
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:69: Failed
+
+During handling of the above exception, another exception occurred:
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_retune_replaces_0')
+
+    def test_ordinary_retune_replaces_duplicate_old_winners(tmp_path):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        pd.DataFrame([shape()]).to_csv(source, index=False)
+        pd.DataFrame([historical_result(4, us=20), historical_result(4, us=21)]).to_csv(
+            output, index=False
+        )
+        with controlled_environment(tmp_path):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+>           tuner.run(args_for(tuner, source, output, "--all"))
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:294: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+aiter/utility/base_tuner.py:1584: in run
+    raise tune_exit
+aiter/utility/base_tuner.py:1563: in run
+    self.tune_summary(tuning_status)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune.FmoeTuner object at 0x7cfbebf5a390>
+status = 'Finished'
+
+    def tune_summary(self, status):
+        """Summary of tuning results"""
+        logger.info("============= Tuning results Summary: ==============")
+        tuning_time = round(time.time() - self.tune_start_time, 4)
+        tunedf = pd.concat([self.success, self.failed])
+        logger.info(
+            f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
+        )
+        logger.info("Successfully tuned shapes:")
+        if not self.success.empty:
+            print(self.success, flush=True)
+        logger.info("Failed shapes:")
+        print(self.failed, flush=True)
+    
+        # Input-only validation metadata is not part of the persisted shape key.
+        keys = self._summary_shape_keys()
+        requested = self.untunedf[keys].copy()
+        tunedf_subset = tunedf[keys].astype(requested.dtypes)
+        for column in requested.select_dtypes(include="object"):
+            requested[column] = requested[column].map(str)
+            tunedf_subset[column] = tunedf_subset[column].map(str)
+        mask = requested.apply(tuple, axis=1).isin(tunedf_subset.apply(tuple, axis=1))
+        self.remain_untuned = self.untunedf[~mask]
+    
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
+        if not self.remain_untuned.empty or not self.failed.empty:
+            logger.error(
+                "\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details"
+            )
+>           sys.exit(1)
+E           SystemExit: 1
+
+aiter/utility/base_tuner.py:614: SystemExit
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[1 rows x 14 columns]
+
+Start tuning ['gfx942' 304 4 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[1 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0004 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+__ test_ordinary_fmoe_migrates_legacy_shared_csv_without_losing_nt_or_numbers __
+
+args = (1,), kwargs = {'device': 'cpu'}
+
+    def forbidden(*args, **kwargs):
+        # pytest.fail escapes the tuner's catch(Exception) recovery path.
+>       pytest.fail("controlled ordinary lifecycle test reached real GPU work")
+E       Failed: controlled ordinary lifecycle test reached real GPU work
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:69: Failed
+
+During handling of the above exception, another exception occurred:
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_migrates_le0')
+
+    def test_ordinary_fmoe_migrates_legacy_shared_csv_without_losing_nt_or_numbers(
+        tmp_path,
+    ):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        pd.DataFrame([shape()]).to_csv(source, index=False)
+        old = pd.DataFrame(
+            [
+                historical_result(),
+                historical_result(8, cu_num=256),
+                historical_result(10, _tag="obsolete"),
+            ]
+        ).drop(columns=["gfx", "xbf16", "flat"])
+        old.to_csv(output, index=False)
+        with controlled_environment(tmp_path):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+>           tuner.run(args_for(tuner, source, output))
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:315: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+aiter/utility/base_tuner.py:1584: in run
+    raise tune_exit
+aiter/utility/base_tuner.py:1563: in run
+    self.tune_summary(tuning_status)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune.FmoeTuner object at 0x7cfbebf30470>
+status = 'Finished'
+
+    def tune_summary(self, status):
+        """Summary of tuning results"""
+        logger.info("============= Tuning results Summary: ==============")
+        tuning_time = round(time.time() - self.tune_start_time, 4)
+        tunedf = pd.concat([self.success, self.failed])
+        logger.info(
+            f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
+        )
+        logger.info("Successfully tuned shapes:")
+        if not self.success.empty:
+            print(self.success, flush=True)
+        logger.info("Failed shapes:")
+        print(self.failed, flush=True)
+    
+        # Input-only validation metadata is not part of the persisted shape key.
+        keys = self._summary_shape_keys()
+        requested = self.untunedf[keys].copy()
+        tunedf_subset = tunedf[keys].astype(requested.dtypes)
+        for column in requested.select_dtypes(include="object"):
+            requested[column] = requested[column].map(str)
+            tunedf_subset[column] = tunedf_subset[column].map(str)
+        mask = requested.apply(tuple, axis=1).isin(tunedf_subset.apply(tuple, axis=1))
+        self.remain_untuned = self.untunedf[~mask]
+    
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
+        if not self.remain_untuned.empty or not self.failed.empty:
+            logger.error(
+                "\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details"
+            )
+>           sys.exit(1)
+E           SystemExit: 1
+
+aiter/utility/base_tuner.py:614: SystemExit
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[1 rows x 14 columns]
+
+Start tuning ['gfx942' 304 4 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[1 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0004 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+_ test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner[failed] _
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_reports_fai0')
+outcome = 'failed'
+
+    @pytest.mark.parametrize("outcome", ["failed", "timeout", "incorrect"])
+    def test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner(
+        tmp_path, outcome
+    ):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        profile = tmp_path / "paired-profile.csv"
+        pd.DataFrame([shape(), shape(6, use_g1u1=0), shape(8)]).to_csv(source, index=False)
+        pd.DataFrame([historical_result()]).to_csv(output, index=False)
+        dispatched = []
+        with controlled_environment(tmp_path, outcomes={4: outcome}, dispatched=dispatched):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+            with pytest.raises(SystemExit) as status:
+                tuner.run(
+                    args_for(
+                        tuner,
+                        source,
+                        output,
+                        "--batch",
+                        "1",
+                        "--profile_file",
+                        str(profile),
+                    )
+                )
+    
+        assert status.value.code == 1
+>       assert list(tuner.failed.token) == [4]
+E       assert [] == [4]
+E         
+E         Right contains one more item: 4
+E         Use -v to get more diff
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:353: AssertionError
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+1  gfx942     304      6  ...  QuantType.per_1x128         0                0
+2  gfx942     304      8  ...  QuantType.per_1x128         1                0
+
+[3 rows x 14 columns]
+
+Start tuning ['gfx942' 304 4 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+1  gfx942     304      6  ...  QuantType.per_1x128         0                0
+2  gfx942     304      8  ...  QuantType.per_1x128         1                0
+
+[3 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0004 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+_ test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner[timeout] _
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_reports_fai1')
+outcome = 'timeout'
+
+    @pytest.mark.parametrize("outcome", ["failed", "timeout", "incorrect"])
+    def test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner(
+        tmp_path, outcome
+    ):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        profile = tmp_path / "paired-profile.csv"
+        pd.DataFrame([shape(), shape(6, use_g1u1=0), shape(8)]).to_csv(source, index=False)
+        pd.DataFrame([historical_result()]).to_csv(output, index=False)
+        dispatched = []
+        with controlled_environment(tmp_path, outcomes={4: outcome}, dispatched=dispatched):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+            with pytest.raises(SystemExit) as status:
+                tuner.run(
+                    args_for(
+                        tuner,
+                        source,
+                        output,
+                        "--batch",
+                        "1",
+                        "--profile_file",
+                        str(profile),
+                    )
+                )
+    
+        assert status.value.code == 1
+>       assert list(tuner.failed.token) == [4]
+E       assert [] == [4]
+E         
+E         Right contains one more item: 4
+E         Use -v to get more diff
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:353: AssertionError
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+1  gfx942     304      6  ...  QuantType.per_1x128         0                0
+2  gfx942     304      8  ...  QuantType.per_1x128         1                0
+
+[3 rows x 14 columns]
+
+Start tuning ['gfx942' 304 4 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+1  gfx942     304      6  ...  QuantType.per_1x128         0                0
+2  gfx942     304      8  ...  QuantType.per_1x128         1                0
+
+[3 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0003 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+_ test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner[incorrect] _
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_reports_fai2')
+outcome = 'incorrect'
+
+    @pytest.mark.parametrize("outcome", ["failed", "timeout", "incorrect"])
+    def test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner(
+        tmp_path, outcome
+    ):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        profile = tmp_path / "paired-profile.csv"
+        pd.DataFrame([shape(), shape(6, use_g1u1=0), shape(8)]).to_csv(source, index=False)
+        pd.DataFrame([historical_result()]).to_csv(output, index=False)
+        dispatched = []
+        with controlled_environment(tmp_path, outcomes={4: outcome}, dispatched=dispatched):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+            with pytest.raises(SystemExit) as status:
+                tuner.run(
+                    args_for(
+                        tuner,
+                        source,
+                        output,
+                        "--batch",
+                        "1",
+                        "--profile_file",
+                        str(profile),
+                    )
+                )
+    
+        assert status.value.code == 1
+>       assert list(tuner.failed.token) == [4]
+E       assert [] == [4]
+E         
+E         Right contains one more item: 4
+E         Use -v to get more diff
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:353: AssertionError
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+1  gfx942     304      6  ...  QuantType.per_1x128         0                0
+2  gfx942     304      8  ...  QuantType.per_1x128         1                0
+
+[3 rows x 14 columns]
+
+Start tuning ['gfx942' 304 4 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+1  gfx942     304      6  ...  QuantType.per_1x128         0                0
+2  gfx942     304      8  ...  QuantType.per_1x128         1                0
+
+[3 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0003 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+_ test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows[False-False] _
+
+args = (1,), kwargs = {'device': 'cpu'}
+
+    def forbidden(*args, **kwargs):
+        # pytest.fail escapes the tuner's catch(Exception) recovery path.
+>       pytest.fail("controlled ordinary lifecycle test reached real GPU work")
+E       Failed: controlled ordinary lifecycle test reached real GPU work
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:69: Failed
+
+During handling of the above exception, another exception occurred:
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_all_and_non0')
+same_file = False, all_rows = False
+
+    @pytest.mark.parametrize("same_file", [False, True])
+    @pytest.mark.parametrize("all_rows", [False, True])
+    def test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows(
+        tmp_path, same_file, all_rows
+    ):
+        source = tmp_path / "input.csv"
+        output = source if same_file else tmp_path / "winner.csv"
+        old = [historical_result(8), historical_result()]
+        requested = old if same_file else [shape(8), shape(4)]
+        pd.DataFrame(old).to_csv(output, index=False)
+        pd.DataFrame(requested).to_csv(source, index=False)
+        dispatched = []
+        with controlled_environment(tmp_path, dispatched=dispatched):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+            options = ["--all"] if all_rows else []
+>           tuner.run(args_for(tuner, source, output, *options))
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:417: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+aiter/utility/base_tuner.py:1584: in run
+    raise tune_exit
+aiter/utility/base_tuner.py:1563: in run
+    self.tune_summary(tuning_status)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune.FmoeTuner object at 0x7cfbebf26f30>
+status = 'Finished'
+
+    def tune_summary(self, status):
+        """Summary of tuning results"""
+        logger.info("============= Tuning results Summary: ==============")
+        tuning_time = round(time.time() - self.tune_start_time, 4)
+        tunedf = pd.concat([self.success, self.failed])
+        logger.info(
+            f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
+        )
+        logger.info("Successfully tuned shapes:")
+        if not self.success.empty:
+            print(self.success, flush=True)
+        logger.info("Failed shapes:")
+        print(self.failed, flush=True)
+    
+        # Input-only validation metadata is not part of the persisted shape key.
+        keys = self._summary_shape_keys()
+        requested = self.untunedf[keys].copy()
+        tunedf_subset = tunedf[keys].astype(requested.dtypes)
+        for column in requested.select_dtypes(include="object"):
+            requested[column] = requested[column].map(str)
+            tunedf_subset[column] = tunedf_subset[column].map(str)
+        mask = requested.apply(tuple, axis=1).isin(tunedf_subset.apply(tuple, axis=1))
+        self.remain_untuned = self.untunedf[~mask]
+    
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
+        if not self.remain_untuned.empty or not self.failed.empty:
+            logger.error(
+                "\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details"
+            )
+>           sys.exit(1)
+E           SystemExit: 1
+
+aiter/utility/base_tuner.py:614: SystemExit
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+1  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[1 rows x 14 columns]
+
+Start tuning ['gfx942' 304 4 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+1  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[1 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0004 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+_ test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows[True-False] _
+
+args = (1,), kwargs = {'device': 'cpu'}
+
+    def forbidden(*args, **kwargs):
+        # pytest.fail escapes the tuner's catch(Exception) recovery path.
+>       pytest.fail("controlled ordinary lifecycle test reached real GPU work")
+E       Failed: controlled ordinary lifecycle test reached real GPU work
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:69: Failed
+
+During handling of the above exception, another exception occurred:
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_all_and_non2')
+same_file = False, all_rows = True
+
+    @pytest.mark.parametrize("same_file", [False, True])
+    @pytest.mark.parametrize("all_rows", [False, True])
+    def test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows(
+        tmp_path, same_file, all_rows
+    ):
+        source = tmp_path / "input.csv"
+        output = source if same_file else tmp_path / "winner.csv"
+        old = [historical_result(8), historical_result()]
+        requested = old if same_file else [shape(8), shape(4)]
+        pd.DataFrame(old).to_csv(output, index=False)
+        pd.DataFrame(requested).to_csv(source, index=False)
+        dispatched = []
+        with controlled_environment(tmp_path, dispatched=dispatched):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+            options = ["--all"] if all_rows else []
+>           tuner.run(args_for(tuner, source, output, *options))
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:417: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+aiter/utility/base_tuner.py:1584: in run
+    raise tune_exit
+aiter/utility/base_tuner.py:1563: in run
+    self.tune_summary(tuning_status)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune.FmoeTuner object at 0x7cfbebb13ad0>
+status = 'Finished'
+
+    def tune_summary(self, status):
+        """Summary of tuning results"""
+        logger.info("============= Tuning results Summary: ==============")
+        tuning_time = round(time.time() - self.tune_start_time, 4)
+        tunedf = pd.concat([self.success, self.failed])
+        logger.info(
+            f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
+        )
+        logger.info("Successfully tuned shapes:")
+        if not self.success.empty:
+            print(self.success, flush=True)
+        logger.info("Failed shapes:")
+        print(self.failed, flush=True)
+    
+        # Input-only validation metadata is not part of the persisted shape key.
+        keys = self._summary_shape_keys()
+        requested = self.untunedf[keys].copy()
+        tunedf_subset = tunedf[keys].astype(requested.dtypes)
+        for column in requested.select_dtypes(include="object"):
+            requested[column] = requested[column].map(str)
+            tunedf_subset[column] = tunedf_subset[column].map(str)
+        mask = requested.apply(tuple, axis=1).isin(tunedf_subset.apply(tuple, axis=1))
+        self.remain_untuned = self.untunedf[~mask]
+    
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
+        if not self.remain_untuned.empty or not self.failed.empty:
+            logger.error(
+                "\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details"
+            )
+>           sys.exit(1)
+E           SystemExit: 1
+
+aiter/utility/base_tuner.py:614: SystemExit
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      8  ...  QuantType.per_1x128         1                0
+1  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[2 rows x 14 columns]
+
+Start tuning ['gfx942' 304 8 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      8  ...  QuantType.per_1x128         1                0
+1  gfx942     304      4  ...  QuantType.per_1x128         1                0
+
+[2 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0003 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+_ test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows[True-True] _
+
+args = (1,), kwargs = {'device': 'cpu'}
+
+    def forbidden(*args, **kwargs):
+        # pytest.fail escapes the tuner's catch(Exception) recovery path.
+>       pytest.fail("controlled ordinary lifecycle test reached real GPU work")
+E       Failed: controlled ordinary lifecycle test reached real GPU work
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:69: Failed
+
+During handling of the above exception, another exception occurred:
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_all_and_non3')
+same_file = True, all_rows = True
+
+    @pytest.mark.parametrize("same_file", [False, True])
+    @pytest.mark.parametrize("all_rows", [False, True])
+    def test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows(
+        tmp_path, same_file, all_rows
+    ):
+        source = tmp_path / "input.csv"
+        output = source if same_file else tmp_path / "winner.csv"
+        old = [historical_result(8), historical_result()]
+        requested = old if same_file else [shape(8), shape(4)]
+        pd.DataFrame(old).to_csv(output, index=False)
+        pd.DataFrame(requested).to_csv(source, index=False)
+        dispatched = []
+        with controlled_environment(tmp_path, dispatched=dispatched):
+            tuner = moe.FmoeTuner("ordinary-fmoe", KEYS, RESULTS)
+            options = ["--all"] if all_rows else []
+>           tuner.run(args_for(tuner, source, output, *options))
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:417: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+aiter/utility/base_tuner.py:1584: in run
+    raise tune_exit
+aiter/utility/base_tuner.py:1563: in run
+    self.tune_summary(tuning_status)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+self = <csrc.ck_gemm_moe_2stages_codegen.gemm_moe_tune.FmoeTuner object at 0x7cfbebe93830>
+status = 'Finished'
+
+    def tune_summary(self, status):
+        """Summary of tuning results"""
+        logger.info("============= Tuning results Summary: ==============")
+        tuning_time = round(time.time() - self.tune_start_time, 4)
+        tunedf = pd.concat([self.success, self.failed])
+        logger.info(
+            f"Tuning {status}. tune {len(tunedf)} shapes, total tuning time is {tuning_time} seconds"
+        )
+        logger.info("Successfully tuned shapes:")
+        if not self.success.empty:
+            print(self.success, flush=True)
+        logger.info("Failed shapes:")
+        print(self.failed, flush=True)
+    
+        # Input-only validation metadata is not part of the persisted shape key.
+        keys = self._summary_shape_keys()
+        requested = self.untunedf[keys].copy()
+        tunedf_subset = tunedf[keys].astype(requested.dtypes)
+        for column in requested.select_dtypes(include="object"):
+            requested[column] = requested[column].map(str)
+            tunedf_subset[column] = tunedf_subset[column].map(str)
+        mask = requested.apply(tuple, axis=1).isin(tunedf_subset.apply(tuple, axis=1))
+        self.remain_untuned = self.untunedf[~mask]
+    
+        if not self.remain_untuned.empty:
+            logger.info("untuned shapes:")
+            print(self.remain_untuned)
+        if not self.remain_untuned.empty or not self.failed.empty:
+            logger.error(
+                "\033[91m[Tuning not Finished]\033[0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details"
+            )
+>           sys.exit(1)
+E           SystemExit: 1
+
+aiter/utility/base_tuner.py:614: SystemExit
+----------------------------- Captured stdout call -----------------------------
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      8  ...  QuantType.per_1x128         1                0
+1  gfx942     304      2  ...  QuantType.per_1x128         1                0
+
+[2 rows x 14 columns]
+
+Start tuning ['gfx942' 304 8 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+ 'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+Index: []
+      gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+0  gfx942     304      8  ...  QuantType.per_1x128         1                0
+1  gfx942     304      2  ...  QuantType.per_1x128         1                0
+
+[2 rows x 14 columns]
+----------------------------- Captured stderr call -----------------------------
+[aiter] ============= Tuning results Summary: ==============
+[aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0003 seconds
+[aiter] Successfully tuned shapes:
+[aiter] Failed shapes:
+[aiter] untuned shapes:
+[aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+______ test_ordinary_fmoe_command_returns_summary_exit_status[success-0] _______
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret0')
+outcome = 'success', expected_status = 0
+
+    @pytest.mark.parametrize(
+        "outcome,expected_status",
+        [
+            ("success", 0),
+            ("failed", 1),
+            ("unfinished", 1),
+        ],
+    )
+    def test_ordinary_fmoe_command_returns_summary_exit_status(
+        tmp_path, outcome, expected_status
+    ):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        pd.DataFrame([shape(), shape(8)]).to_csv(source, index=False)
+        command = textwrap.dedent("""\
+            from pathlib import Path
+            import runpy
+            import sys
+            from op_tests.tuning_tests.test_ordinary_tuner_lifecycle import (
+                controlled_environment,
+            )
+            root, outcome = sys.argv[1:3]
+            sys.argv = [sys.argv[0], *sys.argv[3:]]
+            with controlled_environment(Path(root), outcomes={4: outcome}):
+                runpy.run_path("csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+                               run_name="__main__")
+        """)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                command,
+                str(tmp_path),
+                outcome,
+                "-i",
+                str(source),
+                "-o",
+                str(output),
+                "--mp",
+                "1",
+                "--timeout",
+                "0",
+                "--batch",
+                "1",
+                "--sort",
+                "True",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ,
+                ROCR_VISIBLE_DEVICES="",
+                HIP_VISIBLE_DEVICES="",
+                CUDA_VISIBLE_DEVICES="",
+            ),
+            timeout=30,
+            check=False,
+        )
+    
+>       assert result.returncode == expected_status, result.stdout + result.stderr
+E       AssertionError: Not exist tuned file: /tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret0/winner.csv
+E               gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+E         0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+E         1  gfx942     304      8  ...  QuantType.per_1x128         1                0
+E         
+E         [2 rows x 14 columns]
+E         
+E         Start tuning ['gfx942' 304 4 512 256 2 2 'ActivationType.Silu' 'torch.bfloat16'
+E          'torch.float8_e4m3fn' 'torch.float8_e4m3fn' 'QuantType.per_1x128' 1 0]
+E         Empty DataFrame
+E         Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw, nt]
+E         Index: []
+E               gfx  cu_num  token  ...               q_type  use_g1u1  doweight_stage1
+E         0  gfx942     304      4  ...  QuantType.per_1x128         1                0
+E         1  gfx942     304      8  ...  QuantType.per_1x128         1                0
+E         
+E         [2 rows x 14 columns]
+E         [aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-notes/isolated-01-jit/module_aiter_core.so
+E         /root/workspace/tmp_dev/aiter-mxfp4-01/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+E           warnings.warn(
+E         [aiter] ============= Tuning results Summary: ==============
+E         [aiter] Tuning Finished. tune 0 shapes, total tuning time is 0.0004 seconds
+E         [aiter] Successfully tuned shapes:
+E         [aiter] Failed shapes:
+E         [aiter] untuned shapes:
+E         [aiter] [91m[Tuning not Finished][0m some shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['/root/workspace/tmp_dev/mxfp4-port-env/bin/python', '-c', 'from pathlib import Path\nimport ru...me shapes are not tuned or all failed, please check the result file or tune with --profile_file to get more details\n').returncode
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:492: AssertionError
+_______ test_ordinary_fmoe_command_returns_summary_exit_status[failed-1] _______
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret1')
+outcome = 'failed', expected_status = 1
+
+    @pytest.mark.parametrize(
+        "outcome,expected_status",
+        [
+            ("success", 0),
+            ("failed", 1),
+            ("unfinished", 1),
+        ],
+    )
+    def test_ordinary_fmoe_command_returns_summary_exit_status(
+        tmp_path, outcome, expected_status
+    ):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        pd.DataFrame([shape(), shape(8)]).to_csv(source, index=False)
+        command = textwrap.dedent("""\
+            from pathlib import Path
+            import runpy
+            import sys
+            from op_tests.tuning_tests.test_ordinary_tuner_lifecycle import (
+                controlled_environment,
+            )
+            root, outcome = sys.argv[1:3]
+            sys.argv = [sys.argv[0], *sys.argv[3:]]
+            with controlled_environment(Path(root), outcomes={4: outcome}):
+                runpy.run_path("csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+                               run_name="__main__")
+        """)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                command,
+                str(tmp_path),
+                outcome,
+                "-i",
+                str(source),
+                "-o",
+                str(output),
+                "--mp",
+                "1",
+                "--timeout",
+                "0",
+                "--batch",
+                "1",
+                "--sort",
+                "True",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ,
+                ROCR_VISIBLE_DEVICES="",
+                HIP_VISIBLE_DEVICES="",
+                CUDA_VISIBLE_DEVICES="",
+            ),
+            timeout=30,
+            check=False,
+        )
+    
+        assert result.returncode == expected_status, result.stdout + result.stderr
+>       winner = pd.read_csv(output)
+                 ^^^^^^^^^^^^^^^^^^^
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:493: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:1026: in read_csv
+    return _read(filepath_or_buffer, kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:620: in _read
+    parser = TextFileReader(filepath_or_buffer, **kwds)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:1620: in __init__
+    self._engine = self._make_engine(f, self.engine)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:1880: in _make_engine
+    self.handles = get_handle(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+path_or_buf = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret1/winner.csv')
+mode = 'r'
+
+    @doc(compression_options=_shared_docs["compression_options"] % "path_or_buf")
+    def get_handle(
+        path_or_buf: FilePath | BaseBuffer,
+        mode: str,
+        *,
+        encoding: str | None = None,
+        compression: CompressionOptions | None = None,
+        memory_map: bool = False,
+        is_text: bool = True,
+        errors: str | None = None,
+        storage_options: StorageOptions | None = None,
+    ) -> IOHandles[str] | IOHandles[bytes]:
+        """
+        Get file handle for given path/buffer and mode.
+    
+        Parameters
+        ----------
+        path_or_buf : str or file handle
+            File path or object.
+        mode : str
+            Mode to open path_or_buf with.
+        encoding : str or None
+            Encoding to use.
+        {compression_options}
+    
+               May be a dict with key 'method' as compression mode
+               and other keys as compression options if compression
+               mode is 'zip'.
+    
+               Passing compression options as keys in dict is
+               supported for compression modes 'gzip', 'bz2', 'zstd' and 'zip'.
+    
+            .. versionchanged:: 1.4.0 Zstandard support.
+    
+        memory_map : bool, default False
+            See parsers._parser_params for more information. Only used by read_csv.
+        is_text : bool, default True
+            Whether the type of the content passed to the file/buffer is string or
+            bytes. This is not the same as `"b" not in mode`. If a string content is
+            passed to a binary file/buffer, a wrapper is inserted.
+        errors : str, default 'strict'
+            Specifies how encoding and decoding errors are to be handled.
+            See the errors argument for :func:`open` for a full list
+            of options.
+        storage_options: StorageOptions = None
+            Passed to _get_filepath_or_buffer
+    
+        Returns the dataclass IOHandles
+        """
+        # Windows does not default to utf-8. Set to utf-8 for a consistent behavior
+        encoding = encoding or "utf-8"
+    
+        errors = errors or "strict"
+    
+        # read_csv does not know whether the buffer is opened in binary/text mode
+        if _is_binary_mode(path_or_buf, mode) and "b" not in mode:
+            mode += "b"
+    
+        # validate encoding and errors
+        codecs.lookup(encoding)
+        if isinstance(errors, str):
+            codecs.lookup_error(errors)
+    
+        # open URLs
+        ioargs = _get_filepath_or_buffer(
+            path_or_buf,
+            encoding=encoding,
+            compression=compression,
+            mode=mode,
+            storage_options=storage_options,
+        )
+    
+        handle = ioargs.filepath_or_buffer
+        handles: list[BaseBuffer]
+    
+        # memory mapping needs to be the first step
+        # only used for read_csv
+        handle, memory_map, handles = _maybe_memory_map(handle, memory_map)
+    
+        is_path = isinstance(handle, str)
+        compression_args = dict(ioargs.compression)
+        compression = compression_args.pop("method")
+    
+        # Only for write methods
+        if "r" not in mode and is_path:
+            check_parent_directory(str(handle))
+    
+        if compression:
+            if compression != "zstd":
+                # compression libraries do not like an explicit text-mode
+                ioargs.mode = ioargs.mode.replace("t", "")
+            elif compression == "zstd" and "b" not in ioargs.mode:
+                # python-zstandard defaults to text mode, but we always expect
+                # compression libraries to use binary mode.
+                ioargs.mode += "b"
+    
+            # GZ Compression
+            if compression == "gzip":
+                if isinstance(handle, str):
+                    # error: Incompatible types in assignment (expression has type
+                    # "GzipFile", variable has type "Union[str, BaseBuffer]")
+                    handle = gzip.GzipFile(  # type: ignore[assignment]
+                        filename=handle,
+                        mode=ioargs.mode,
+                        **compression_args,
+                    )
+                else:
+                    handle = gzip.GzipFile(
+                        # No overload variant of "GzipFile" matches argument types
+                        # "Union[str, BaseBuffer]", "str", "Dict[str, Any]"
+                        fileobj=handle,  # type: ignore[call-overload]
+                        mode=ioargs.mode,
+                        **compression_args,
+                    )
+    
+            # BZ Compression
+            elif compression == "bz2":
+                # Overload of "BZ2File" to handle pickle protocol 5
+                # "Union[str, BaseBuffer]", "str", "Dict[str, Any]"
+                handle = get_bz2_file()(  # type: ignore[call-overload]
+                    handle,
+                    mode=ioargs.mode,
+                    **compression_args,
+                )
+    
+            # ZIP Compression
+            elif compression == "zip":
+                # error: Argument 1 to "_BytesZipFile" has incompatible type
+                # "Union[str, BaseBuffer]"; expected "Union[Union[str, PathLike[str]],
+                # ReadBuffer[bytes], WriteBuffer[bytes]]"
+                handle = _BytesZipFile(
+                    handle, ioargs.mode, **compression_args  # type: ignore[arg-type]
+                )
+                if handle.buffer.mode == "r":
+                    handles.append(handle)
+                    zip_names = handle.buffer.namelist()
+                    if len(zip_names) == 1:
+                        handle = handle.buffer.open(zip_names.pop())
+                    elif not zip_names:
+                        raise ValueError(f"Zero files found in ZIP file {path_or_buf}")
+                    else:
+                        raise ValueError(
+                            "Multiple files found in ZIP file. "
+                            f"Only one file per ZIP: {zip_names}"
+                        )
+    
+            # TAR Encoding
+            elif compression == "tar":
+                compression_args.setdefault("mode", ioargs.mode)
+                if isinstance(handle, str):
+                    handle = _BytesTarFile(name=handle, **compression_args)
+                else:
+                    # error: Argument "fileobj" to "_BytesTarFile" has incompatible
+                    # type "BaseBuffer"; expected "Union[ReadBuffer[bytes],
+                    # WriteBuffer[bytes], None]"
+                    handle = _BytesTarFile(
+                        fileobj=handle, **compression_args  # type: ignore[arg-type]
+                    )
+                assert isinstance(handle, _BytesTarFile)
+                if "r" in handle.buffer.mode:
+                    handles.append(handle)
+                    files = handle.buffer.getnames()
+                    if len(files) == 1:
+                        file = handle.buffer.extractfile(files[0])
+                        assert file is not None
+                        handle = file
+                    elif not files:
+                        raise ValueError(f"Zero files found in TAR archive {path_or_buf}")
+                    else:
+                        raise ValueError(
+                            "Multiple files found in TAR archive. "
+                            f"Only one file per TAR archive: {files}"
+                        )
+    
+            # XZ Compression
+            elif compression == "xz":
+                # error: Argument 1 to "LZMAFile" has incompatible type "Union[str,
+                # BaseBuffer]"; expected "Optional[Union[Union[str, bytes, PathLike[str],
+                # PathLike[bytes]], IO[bytes]], None]"
+                handle = get_lzma_file()(
+                    handle, ioargs.mode, **compression_args  # type: ignore[arg-type]
+                )
+    
+            # Zstd Compression
+            elif compression == "zstd":
+                zstd = import_optional_dependency("zstandard")
+                if "r" in ioargs.mode:
+                    open_args = {"dctx": zstd.ZstdDecompressor(**compression_args)}
+                else:
+                    open_args = {"cctx": zstd.ZstdCompressor(**compression_args)}
+                handle = zstd.open(
+                    handle,
+                    mode=ioargs.mode,
+                    **open_args,
+                )
+    
+            # Unrecognized Compression
+            else:
+                msg = f"Unrecognized compression type: {compression}"
+                raise ValueError(msg)
+    
+            assert not isinstance(handle, str)
+            handles.append(handle)
+    
+        elif isinstance(handle, str):
+            # Check whether the filename is to be opened in binary mode.
+            # Binary mode does not support 'encoding' and 'newline'.
+            if ioargs.encoding and "b" not in ioargs.mode:
+                # Encoding
+>               handle = open(
+                    handle,
+                    ioargs.mode,
+                    encoding=ioargs.encoding,
+                    errors=errors,
+                    newline="",
+                )
+E               FileNotFoundError: [Errno 2] No such file or directory: '/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret1/winner.csv'
+
+/opt/venv/lib/python3.12/site-packages/pandas/io/common.py:873: FileNotFoundError
+_____ test_ordinary_fmoe_command_returns_summary_exit_status[unfinished-1] _____
+
+tmp_path = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret2')
+outcome = 'unfinished', expected_status = 1
+
+    @pytest.mark.parametrize(
+        "outcome,expected_status",
+        [
+            ("success", 0),
+            ("failed", 1),
+            ("unfinished", 1),
+        ],
+    )
+    def test_ordinary_fmoe_command_returns_summary_exit_status(
+        tmp_path, outcome, expected_status
+    ):
+        source, output = tmp_path / "input.csv", tmp_path / "winner.csv"
+        pd.DataFrame([shape(), shape(8)]).to_csv(source, index=False)
+        command = textwrap.dedent("""\
+            from pathlib import Path
+            import runpy
+            import sys
+            from op_tests.tuning_tests.test_ordinary_tuner_lifecycle import (
+                controlled_environment,
+            )
+            root, outcome = sys.argv[1:3]
+            sys.argv = [sys.argv[0], *sys.argv[3:]]
+            with controlled_environment(Path(root), outcomes={4: outcome}):
+                runpy.run_path("csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+                               run_name="__main__")
+        """)
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                command,
+                str(tmp_path),
+                outcome,
+                "-i",
+                str(source),
+                "-o",
+                str(output),
+                "--mp",
+                "1",
+                "--timeout",
+                "0",
+                "--batch",
+                "1",
+                "--sort",
+                "True",
+            ],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            env=dict(
+                os.environ,
+                ROCR_VISIBLE_DEVICES="",
+                HIP_VISIBLE_DEVICES="",
+                CUDA_VISIBLE_DEVICES="",
+            ),
+            timeout=30,
+            check=False,
+        )
+    
+        assert result.returncode == expected_status, result.stdout + result.stderr
+>       winner = pd.read_csv(output)
+                 ^^^^^^^^^^^^^^^^^^^
+
+op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py:493: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:1026: in read_csv
+    return _read(filepath_or_buffer, kwds)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:620: in _read
+    parser = TextFileReader(filepath_or_buffer, **kwds)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:1620: in __init__
+    self._engine = self._make_engine(f, self.engine)
+                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+/opt/venv/lib/python3.12/site-packages/pandas/io/parsers/readers.py:1880: in _make_engine
+    self.handles = get_handle(
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+path_or_buf = PosixPath('/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret2/winner.csv')
+mode = 'r'
+
+    @doc(compression_options=_shared_docs["compression_options"] % "path_or_buf")
+    def get_handle(
+        path_or_buf: FilePath | BaseBuffer,
+        mode: str,
+        *,
+        encoding: str | None = None,
+        compression: CompressionOptions | None = None,
+        memory_map: bool = False,
+        is_text: bool = True,
+        errors: str | None = None,
+        storage_options: StorageOptions | None = None,
+    ) -> IOHandles[str] | IOHandles[bytes]:
+        """
+        Get file handle for given path/buffer and mode.
+    
+        Parameters
+        ----------
+        path_or_buf : str or file handle
+            File path or object.
+        mode : str
+            Mode to open path_or_buf with.
+        encoding : str or None
+            Encoding to use.
+        {compression_options}
+    
+               May be a dict with key 'method' as compression mode
+               and other keys as compression options if compression
+               mode is 'zip'.
+    
+               Passing compression options as keys in dict is
+               supported for compression modes 'gzip', 'bz2', 'zstd' and 'zip'.
+    
+            .. versionchanged:: 1.4.0 Zstandard support.
+    
+        memory_map : bool, default False
+            See parsers._parser_params for more information. Only used by read_csv.
+        is_text : bool, default True
+            Whether the type of the content passed to the file/buffer is string or
+            bytes. This is not the same as `"b" not in mode`. If a string content is
+            passed to a binary file/buffer, a wrapper is inserted.
+        errors : str, default 'strict'
+            Specifies how encoding and decoding errors are to be handled.
+            See the errors argument for :func:`open` for a full list
+            of options.
+        storage_options: StorageOptions = None
+            Passed to _get_filepath_or_buffer
+    
+        Returns the dataclass IOHandles
+        """
+        # Windows does not default to utf-8. Set to utf-8 for a consistent behavior
+        encoding = encoding or "utf-8"
+    
+        errors = errors or "strict"
+    
+        # read_csv does not know whether the buffer is opened in binary/text mode
+        if _is_binary_mode(path_or_buf, mode) and "b" not in mode:
+            mode += "b"
+    
+        # validate encoding and errors
+        codecs.lookup(encoding)
+        if isinstance(errors, str):
+            codecs.lookup_error(errors)
+    
+        # open URLs
+        ioargs = _get_filepath_or_buffer(
+            path_or_buf,
+            encoding=encoding,
+            compression=compression,
+            mode=mode,
+            storage_options=storage_options,
+        )
+    
+        handle = ioargs.filepath_or_buffer
+        handles: list[BaseBuffer]
+    
+        # memory mapping needs to be the first step
+        # only used for read_csv
+        handle, memory_map, handles = _maybe_memory_map(handle, memory_map)
+    
+        is_path = isinstance(handle, str)
+        compression_args = dict(ioargs.compression)
+        compression = compression_args.pop("method")
+    
+        # Only for write methods
+        if "r" not in mode and is_path:
+            check_parent_directory(str(handle))
+    
+        if compression:
+            if compression != "zstd":
+                # compression libraries do not like an explicit text-mode
+                ioargs.mode = ioargs.mode.replace("t", "")
+            elif compression == "zstd" and "b" not in ioargs.mode:
+                # python-zstandard defaults to text mode, but we always expect
+                # compression libraries to use binary mode.
+                ioargs.mode += "b"
+    
+            # GZ Compression
+            if compression == "gzip":
+                if isinstance(handle, str):
+                    # error: Incompatible types in assignment (expression has type
+                    # "GzipFile", variable has type "Union[str, BaseBuffer]")
+                    handle = gzip.GzipFile(  # type: ignore[assignment]
+                        filename=handle,
+                        mode=ioargs.mode,
+                        **compression_args,
+                    )
+                else:
+                    handle = gzip.GzipFile(
+                        # No overload variant of "GzipFile" matches argument types
+                        # "Union[str, BaseBuffer]", "str", "Dict[str, Any]"
+                        fileobj=handle,  # type: ignore[call-overload]
+                        mode=ioargs.mode,
+                        **compression_args,
+                    )
+    
+            # BZ Compression
+            elif compression == "bz2":
+                # Overload of "BZ2File" to handle pickle protocol 5
+                # "Union[str, BaseBuffer]", "str", "Dict[str, Any]"
+                handle = get_bz2_file()(  # type: ignore[call-overload]
+                    handle,
+                    mode=ioargs.mode,
+                    **compression_args,
+                )
+    
+            # ZIP Compression
+            elif compression == "zip":
+                # error: Argument 1 to "_BytesZipFile" has incompatible type
+                # "Union[str, BaseBuffer]"; expected "Union[Union[str, PathLike[str]],
+                # ReadBuffer[bytes], WriteBuffer[bytes]]"
+                handle = _BytesZipFile(
+                    handle, ioargs.mode, **compression_args  # type: ignore[arg-type]
+                )
+                if handle.buffer.mode == "r":
+                    handles.append(handle)
+                    zip_names = handle.buffer.namelist()
+                    if len(zip_names) == 1:
+                        handle = handle.buffer.open(zip_names.pop())
+                    elif not zip_names:
+                        raise ValueError(f"Zero files found in ZIP file {path_or_buf}")
+                    else:
+                        raise ValueError(
+                            "Multiple files found in ZIP file. "
+                            f"Only one file per ZIP: {zip_names}"
+                        )
+    
+            # TAR Encoding
+            elif compression == "tar":
+                compression_args.setdefault("mode", ioargs.mode)
+                if isinstance(handle, str):
+                    handle = _BytesTarFile(name=handle, **compression_args)
+                else:
+                    # error: Argument "fileobj" to "_BytesTarFile" has incompatible
+                    # type "BaseBuffer"; expected "Union[ReadBuffer[bytes],
+                    # WriteBuffer[bytes], None]"
+                    handle = _BytesTarFile(
+                        fileobj=handle, **compression_args  # type: ignore[arg-type]
+                    )
+                assert isinstance(handle, _BytesTarFile)
+                if "r" in handle.buffer.mode:
+                    handles.append(handle)
+                    files = handle.buffer.getnames()
+                    if len(files) == 1:
+                        file = handle.buffer.extractfile(files[0])
+                        assert file is not None
+                        handle = file
+                    elif not files:
+                        raise ValueError(f"Zero files found in TAR archive {path_or_buf}")
+                    else:
+                        raise ValueError(
+                            "Multiple files found in TAR archive. "
+                            f"Only one file per TAR archive: {files}"
+                        )
+    
+            # XZ Compression
+            elif compression == "xz":
+                # error: Argument 1 to "LZMAFile" has incompatible type "Union[str,
+                # BaseBuffer]"; expected "Optional[Union[Union[str, bytes, PathLike[str],
+                # PathLike[bytes]], IO[bytes]], None]"
+                handle = get_lzma_file()(
+                    handle, ioargs.mode, **compression_args  # type: ignore[arg-type]
+                )
+    
+            # Zstd Compression
+            elif compression == "zstd":
+                zstd = import_optional_dependency("zstandard")
+                if "r" in ioargs.mode:
+                    open_args = {"dctx": zstd.ZstdDecompressor(**compression_args)}
+                else:
+                    open_args = {"cctx": zstd.ZstdCompressor(**compression_args)}
+                handle = zstd.open(
+                    handle,
+                    mode=ioargs.mode,
+                    **open_args,
+                )
+    
+            # Unrecognized Compression
+            else:
+                msg = f"Unrecognized compression type: {compression}"
+                raise ValueError(msg)
+    
+            assert not isinstance(handle, str)
+            handles.append(handle)
+    
+        elif isinstance(handle, str):
+            # Check whether the filename is to be opened in binary mode.
+            # Binary mode does not support 'encoding' and 'newline'.
+            if ioargs.encoding and "b" not in ioargs.mode:
+                # Encoding
+>               handle = open(
+                    handle,
+                    ioargs.mode,
+                    encoding=ioargs.encoding,
+                    errors=errors,
+                    newline="",
+                )
+E               FileNotFoundError: [Errno 2] No such file or directory: '/tmp/pytest-of-root/pytest-32/test_ordinary_fmoe_command_ret2/winner.csv'
+
+/opt/venv/lib/python3.12/site-packages/pandas/io/common.py:873: FileNotFoundError
+=============================== warnings summary ===============================
+aiter/ops/triton/gluon/__init__.py:16
+  /root/workspace/tmp_dev/aiter-mxfp4-01/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+    warnings.warn(
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_all_preserves_gate_metadata_through_winner_summary[False]
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_supported_mixed_cu_runtime_rows_finish_summary
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_unused_gpu0_does_not_reject_single_slot_current_supported_gpu[False]
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py::test_unused_gpu0_does_not_reject_single_slot_current_supported_gpu[True]
+  /root/workspace/tmp_dev/aiter-mxfp4-01/aiter/utility/base_tuner.py:487: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    df_old = pd.concat([df_old, unmatched_rows], ignore_index=True)
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py: 20 warnings
+  /root/workspace/tmp_dev/aiter-mxfp4-01/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:7136: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    self.success = pd.concat([self.success, valid], ignore_index=True)
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py: 11 warnings
+  /root/workspace/tmp_dev/aiter-mxfp4-01/aiter/utility/base_tuner.py:587: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    tunedf = pd.concat([self.success, self.failed])
+
+op_tests/tuning_tests/test_mxfp4_tuner_lifecycle.py: 10 warnings
+  /root/workspace/tmp_dev/aiter-mxfp4-01/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:7137: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+    self.failed = pd.concat([self.failed, invalid], ignore_index=True)
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+=========================== short test summary info ============================
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_preserves_schema_nt_stage_timings_and_profiles
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_retune_replaces_duplicate_old_winners
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_migrates_legacy_shared_csv_without_losing_nt_or_numbers
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner[failed]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner[timeout]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_reports_failed_and_unfinished_rows_and_saves_later_winner[incorrect]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows[False-False]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows[True-False]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_all_and_non_all_preserve_history_and_select_requested_rows[True-True]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_command_returns_summary_exit_status[success-0]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_command_returns_summary_exit_status[failed-1]
+FAILED op_tests/tuning_tests/test_ordinary_tuner_lifecycle.py::test_ordinary_fmoe_command_returns_summary_exit_status[unfinished-1]
+12 failed, 43 passed, 46 warnings in 14.78s
