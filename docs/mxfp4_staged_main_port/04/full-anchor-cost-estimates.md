@@ -8,7 +8,7 @@ Current prescribed-pair evidence supplies elapsed overhead, not winner kernel la
 | minimax-2048-full | 1368 | [0.55, 10] | 14.0–238.0 min |
 | minimax-8192-full | 1368 | [1.2, 20] | 28.9–466.0 min |
 
-The optimistic lower rates assume warmed imports and mostly cached compilation; they are hypotheses rather than directly measured normal-attempt values. The upper rates allow cold compile keys, extra preparation/reference costs and failures. Large token8192 has not been measured by the focused pair fixtures, so the range explicitly scales that uncertainty. The dedicated search cache begins empty and remains shared within each recorded configuration. Main warmup5/iters101, data seed0/routes seed0, toolchain and physical card stay fixed.
+The optimistic lower rates assume warmed imports and mostly cached compilation; they are hypotheses rather than directly measured normal-attempt values. The upper rates allow cold compile keys, extra preparation/reference costs and failures. Large token8192 has not been measured by the focused pair fixtures, so the range explicitly scales that uncertainty. Every initial search starts with an initially empty dedicated FlyDSL cache. First full64 used an empty default-config path; later searches use separate per-id paths, preserving that same cold-key starting condition. The shared AITER auxiliary cache stays warmed equally. Main warmup5/iters101, data seed0/routes seed0, toolchain and physical card stay fixed.
 
 Each anchor records this estimate before startup and its actual process elapsed/attempt count after exit. Progress logs let the coordinator refine expectations. Soft SIGALRM is not a hard bound; a permanently live hang remains unbounded. No required search is skipped or stopped on a cost estimate.
 
