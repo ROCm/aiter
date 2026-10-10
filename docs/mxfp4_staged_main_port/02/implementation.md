@@ -90,3 +90,26 @@ with GPU visibility empty and all real GPU/measurement functions forbidden.
 Events/barriers coordinate result-before-exit and cross-device overlap; no fixed
 sleep establishes execution ordering. Fake multi-device coverage does not
 constitute physical multi-GPU measurement evidence.
+
+## Completed default GPU path
+
+Actual screening now shares main's case/sorting and production wrappers. Direct
+G1 gets normalized activation limits/default betas and complete named launch
+fields; fused prequant supplies its expert upper bound. Reference consumer
+self-test uses the existing Torch layout-faithful intermediate population helper,
+and producer bootstrap checks one normal untimed pair. Every G2 attempt creates
+its own producer intermediate and times complete output handling.
+
+The coordinator completed the prescribed small staged CSV smoke, exact public
+A4W4 production, four cold AOT jobs and later precompiled-only public replay.
+See `gpu/README.md` and retained task/result artifacts. All tasks exit0, output
+is finite and errors0.01117 are below0.1. The winner's canonical end-to-end time
+is15.3478 us; screening ranks supply no winner CSV times. Physical-card identity,
+idle gates, stable default settings and external cache separation are recorded.
+
+Final controlled checks:77 planning/policy +15 execution +5 timeout +38 lifecycle
+=135 passed in3.90 seconds;19 supervisor checks passed in the earlier integrated
+139-check run, and the deterministic exit-before-read companion passed separately.
+This totals155 distinct focused checks. Black/Ruff of all7 changed Python files,
+syntax and diff whitespace checks pass. Incremental read-only reviews found no
+remaining default-path defect; their notes are retained by the coordinator.

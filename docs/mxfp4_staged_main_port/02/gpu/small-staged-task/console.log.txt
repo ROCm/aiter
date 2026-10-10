@@ -1,0 +1,108 @@
+[aiter] [pid=363885 pname=MainProcess] start build [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/build/module_aiter_core
+[aiter] [pid=363885 pname=MainProcess] [32mfinish build [module_aiter_core], cost 10.5s [0m
+[aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-02/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+Not exist tuned file: docs/mxfp4_staged_main_port/02/gpu/small-winner.csv
+      gfx  cu_num  token  ...  use_g1u1  doweight_stage1  gate_mode
+0  gfx950     256      4  ...         1                0  separated
+
+[1 rows x 15 columns]
+[mxfp4-port] tuning 1 shapes across 1 GPUs
+[aiter] import [module_aiter_core] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/module_aiter_core.so
+/root/workspace/tmp_dev/aiter-mxfp4-02/aiter/ops/triton/gluon/__init__.py:16: UserWarning: [aiter] AITER_USE_SYSTEM_TRITON=1: aiter gluon kernels require triton>=3.6.0, found 3.4.0+rocm7.1.0.gitf9e5bf54. Please install a compatible version via .github/scripts/install_triton.sh, otherwise unexpected errors may occur.
+  warnings.warn(
+[mxfp4-port] shape token=4 inter=512 expert=128 topk=4 -> GPU0
+[mxfp4-port] pruned G1: pid=364497 token=4 model_dim=3072 inter_dim=512 expert=128 topk=4 act=swiglu M_est=1 valid=84 kept=12
+[aiter] [pid=364497 pname=SpawnProcess-1] start build [module_moe_topksoftmax_asm] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/build/module_moe_topksoftmax_asm
+[aiter] [pid=364497 pname=SpawnProcess-1] [32mfinish build [module_moe_topksoftmax_asm], cost 5.9s [0m
+[aiter] LoadKernel: _ZN5aiter24topksoftmax_4x128x4_bf16E hsaco: /root/workspace/tmp_dev/aiter-mxfp4-02/hsa//gfx950/topksoftmax/topksoftmax_4x128x4_bf16.co
+[aiter] [pid=364497 pname=SpawnProcess-1] start build [module_moe_sorting_opus] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/build/module_moe_sorting_opus
+[aiter] [pid=364497 pname=SpawnProcess-1] [32mfinish build [module_moe_sorting_opus], cost 6.7s [0m
+[aiter] import [module_moe_sorting_opus] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/module_moe_sorting_opus.so
+[aiter] [pid=364497 pname=SpawnProcess-1] start build [module_moe_mxfp4_aux] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/build/module_moe_mxfp4_aux
+mxfp4_moe aux codegen: 330 instances under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/build/module_moe_mxfp4_aux/blob.staging/instances/
+[aiter] [pid=364497 pname=SpawnProcess-1] [32mfinish build [module_moe_mxfp4_aux], cost 44.0s [0m
+[aiter] import [module_moe_mxfp4_aux] under /root/workspace/tmp_dev/mxfp4-port-runtime/jit-default/module_moe_mxfp4_aux.so
+[aiter] reference consumer[flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16][cosine_diff=0.011137 [32mpassed~[0m]
+[aiter] reference pair[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu+flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16][cosine_diff=0.011172 [32mpassed~[0m]
+[W1010 14:43:31.079457813 collection.cpp:1116] Warning: ROCTracer produced duplicate flow start: 1 (function operator())
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu screening us=8.10347000000001
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2 screening us=7.244660000000001
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd4 screening us=7.261879999999998
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu screening us=7.218275510204087
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu_xcd2 screening us=7.5490400000000015
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu_xcd4 screening us=7.449490000000005
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x256x256_f16in_nt_swiglu screening us=8.326289999999993
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x256x256_f16in_nt_swiglu_xcd2 screening us=7.91666999999999
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x256x256_f16in_nt_swiglu_xcd4 screening us=7.893479999999993
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x256x256_f16in_hpf_nt_swiglu screening us=8.48151515151514
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x256x256_f16in_hpf_nt_swiglu_xcd2 screening us=8.586300000000014
+[mxfp4-staged] GEMM1 flydsl_mxmoe_g1_a4w4_16x256x256_f16in_hpf_nt_swiglu_xcd4 screening us=8.666290000000004
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_nt_sbm16 screening us=6.560070000000021
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_persist_nt_sbm16 screening us=7.198470000000043
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16 screening us=6.943289999999983
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_persist_sbm16 screening us=8.776676767676811
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_atomic_nt_sbm16 screening us=6.6008900000000175
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_atomic_persist_nt_sbm16 screening us=7.285250000000034
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_atomic_sbm16 screening us=6.685270000000006
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_atomic_persist_sbm16 screening us=7.109270000000001
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_nt_sbm16 screening us=6.605280000000033
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_persist_nt_sbm16 screening us=6.700870000000004
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16 screening us=6.275650000000014
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_persist_sbm16 screening us=7.440499999999983
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_nt_sbm16 screening us=6.1244600000000045
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_persist_nt_sbm16 screening us=6.825680000000027
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_sbm16 screening us=5.936859999999944
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_persist_sbm16 screening us=6.872480000000047
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_reduce_nt_sbm16 screening us=6.042571428571469
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_reduce_persist_nt_sbm16 screening us=6.264717171717205
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_reduce_sbm16 screening us=6.050040000000029
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_reduce_persist_sbm16 screening us=6.2432799999999915
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_reduce_nt_sbm16 screening us=5.819103092783448
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_reduce_persist_nt_sbm16 screening us=6.105863157894708
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_reduce_sbm16 screening us=5.815402061855725
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x256_reduce_persist_sbm16 screening us=6.077249999999988
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_reduce_nt_sbm16 screening us=6.016448979591834
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_reduce_persist_nt_sbm16 screening us=6.207840425531939
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_reduce_sbm16 screening us=6.019306122448924
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_reduce_persist_sbm16 screening us=6.194434343434408
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_nt_sbm16 screening us=5.805041237113382
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_persist_nt_sbm16 screening us=6.048931818181819
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_sbm16 screening us=5.7853979591837295
+[mxfp4-staged] GEMM2 flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_persist_sbm16 screening us=6.042459999999985
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_nt_sbm16][cosine_diff=0.011170 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2 + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_nt_sbm16 us=16.7044
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_sbm16][cosine_diff=0.011170 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2 + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_sbm16 us=16.358
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_nt_sbm16][cosine_diff=0.011174 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_nt_sbm16 us=16.8498
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_sbm16][cosine_diff=0.011167 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_atomic_sbm16 us=15.3478
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_nt_sbm16][cosine_diff=0.011172 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2 + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_nt_sbm16 us=19.8908
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_sbm16][cosine_diff=0.011172 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_nt_swiglu_xcd2 + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_sbm16 us=18.4411
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_nt_sbm16][cosine_diff=0.011172 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_nt_sbm16 us=19.115
+[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu+flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_sbm16][cosine_diff=0.011172 [32mpassed~[0m]
+[mxfp4-staged] flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_swiglu + flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x256_reduce_sbm16 us=17.5836
+/root/workspace/tmp_dev/aiter-mxfp4-02/aiter/utility/base_tuner.py:487: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  df_old = pd.concat([df_old, unmatched_rows], ignore_index=True)
+/root/workspace/tmp_dev/aiter-mxfp4-02/csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:7727: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  self.success = pd.concat([self.success, valid], ignore_index=True)
+[aiter] processed 1 batches of 1, Processing Status ====> 100.0% tuned in mxfp4FlydslTuner
+[aiter] ============= Tuning results Summary: ==============
+/root/workspace/tmp_dev/aiter-mxfp4-02/aiter/utility/base_tuner.py:587: FutureWarning: The behavior of DataFrame concatenation with empty or all-NA entries is deprecated. In a future version, this will no longer exclude empty or all-NA columns when determining the result dtypes. To retain the old behavior, exclude the relevant entries before the concat operation.
+  tunedf = pd.concat([self.success, self.failed])
+[aiter] Tuning Finished. tune 1 shapes, total tuning time is 107.2228 seconds
+[aiter] Successfully tuned shapes:
+Not exist tuned file: docs/mxfp4_staged_main_port/02/gpu/small-winner.csv
+      gfx cu_num token model_dim  ... xbf16 flat tflops        bw
+0  gfx950    256     4      3072  ...     0    0   9.84  39355.26
+
+[1 rows x 28 columns]
+[aiter] Failed shapes:
+Empty DataFrame
+Columns: [gfx, cu_num, token, model_dim, inter_dim, expert, topk, act_type, dtype, q_dtype_a, q_dtype_w, q_type, use_g1u1, doweight_stage1, block_m, ksplit, us1, kernelName1, err1, us2, kernelName2, err2, us, run_1stage, xbf16, flat, tflops, bw]
+Index: []
