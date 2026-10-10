@@ -9,9 +9,8 @@ Wraps the gfx942/gfx950 kernel builders in
     (``_auto_variant`` / ``KERNEL_VARIANTS`` / ``DEFAULT_VARIANT``).
   - A build cache keyed by shape/variant/dtype-conversion flags
     (``compile_fp8_mqa_logits``).
-  - Host-side seq_len padding, output-column alignment, and the occupancy-aware
-    KV-column split (``grid.y``) heuristic that fills the device for small-M
-    shapes (``_auto_num_splits``, ``aiter.ops.flydsl.kernel_occupancy``).
+  - Host-side seq_len padding, output-column alignment, and the KV-column
+    split (``grid.y``) heuristic that fills the device for small-M shapes.
 """
 
 from __future__ import annotations
@@ -22,11 +21,11 @@ import re
 from dataclasses import dataclass
 from functools import lru_cache
 
+import flydsl.compiler as flyc
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx
 
-from .kernel_occupancy import kernel_occupancy
 from .kernels.mqa_logits.fp8_mqa_logits import (
     _MFMA16,
     _MFMA16_K128,
@@ -84,24 +83,19 @@ class _SplitPolicy:
         stops being amortized. Note this is denominated in *tiles*, so its
         column-equivalent scales with the variant's ``block_kv``.
     cu_oversub : int
-        Target total blocks as a multiple of the device CU count. Used only by
-        the fixed-oversubscription path (``occupancy_aware=False``).
+        Target total blocks as a multiple of the device CU count.
     fallback_cu : int
         Nominal CU count to assume when the device query fails.
-    occupancy_aware : bool
-        Minimize the wave-quantized cost model over ``cu_count * occupancy``
-        instead of targeting a fixed ``cu_oversub``. See ``_auto_num_splits``.
-    block_overhead_tiles : int
-        Per-block fixed cost in BKV tiles (Q/weight preload, tail effects).
-        Paid once per split, so it bounds the split count. Fitted on MI325X.
+    block_overhead_tiles : int | None
+        Per-block fixed cost, in BKV tiles, of the occupancy-aware cost model
+        (``_splits_by_wave_cost``). None keeps the ``cu_oversub`` target.
     """
 
     min_seq_len_kv: int
     min_tiles_per_split: int
     cu_oversub: int
     fallback_cu: int
-    occupancy_aware: bool = False
-    block_overhead_tiles: int = 0
+    block_overhead_tiles: int | None = None
 
 
 _SPLIT_POLICIES = {
@@ -112,12 +106,9 @@ _SPLIT_POLICIES = {
         min_tiles_per_split=8,
         cu_oversub=4,
         fallback_cu=304,
-        occupancy_aware=True,
-        block_overhead_tiles=8,
+        block_overhead_tiles=8,  # fitted on MI325X
     ),
-    # Tuned on MI355X (256 CU) against the LDS-pipelined builder. Stays on
-    # the fixed-oversubscription path: its auto-selected variants span too
-    # few occupancy values for the cost model to help.
+    # Tuned on MI355X (256 CU) against the LDS-pipelined builder.
     "gfx950": _SplitPolicy(
         min_seq_len_kv=0, min_tiles_per_split=2, cu_oversub=4, fallback_cu=256
     ),
@@ -140,30 +131,27 @@ def _device_cu_count(device_index: int) -> int:
         return _split_policy().fallback_cu
 
 
-# Caps the per-launch scan; no measured optimum reached it.
-_MAX_SPLIT_SEARCH = 64
-
-
 @lru_cache(maxsize=256)
-def _splits_by_wave_cost(
-    grid_x: int, effective_cus: int, window_tiles: int, max_splits: int, overhead: int
-) -> int:
-    """``num_splits`` minimizing a wave-quantized cost model::
-
-        cost(s) = ceil(grid_x * s / effective_cus) * (ceil(W / s) + overhead)
-
-    ``W`` is the KV window in BKV tiles. Ties go to the smaller ``s``. Not
-    monotone in ``effective_cus``: more occupancy can fit a grid in one wave
-    with fewer splits. Partial waves are not priced fractionally; that
-    measured worse overall.
-    """
+def _splits_by_wave_cost(grid_x, effective_cus, window_tiles, max_splits, overhead):
+    """``num_splits`` in [1, min(max_splits, 64)] minimizing the wave-quantized cost
+    ``ceil(grid_x * s / effective_cus) * (ceil(window_tiles / s) + overhead)``."""
     return min(
-        range(1, min(max_splits, _MAX_SPLIT_SEARCH) + 1),
-        key=lambda s: (
-            -(-(grid_x * s) // effective_cus) * (-(-window_tiles // s) + overhead),
-            s,
-        ),
+        range(1, min(max_splits, 64) + 1),
+        key=lambda s: -(-(grid_x * s) // effective_cus)
+        * (-(-window_tiles // s) + overhead),
     )
+
+
+def _max_blocks_per_cu(launcher, args):
+    """Max resident blocks per CU of *launcher*'s kernel, cached on the launcher.
+    None on a first call during graph capture, where HIP cannot load a module."""
+    if not hasattr(launcher, "_max_blocks_per_cu"):
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        # Meta tensors make flyc.compile compile only, without launching.
+        args = [a.to("meta") if isinstance(a, torch.Tensor) else a for a in args]
+        launcher._max_blocks_per_cu = flyc.compile(launcher, *args).max_blocks_per_cu()
+    return launcher._max_blocks_per_cu
 
 
 def _auto_num_splits(
@@ -172,54 +160,38 @@ def _auto_num_splits(
     rows_per_block: int,
     block_kv: int,
     device_index: int,
-    launcher=None,
-    variant: str | None = None,
-    num_heads: int = 0,
-    head_size: int = 0,
+    blocks_per_cu: int | None = None,
 ) -> int:
     """KV-column splits (grid.y) to fill the device when the row grid is small.
 
     For small-M / large-N shapes the ``ceil(seq_len/RPB)`` row grid leaves the
     device block-starved; splitting each row's window across ``grid.y`` recovers
     occupancy at no correctness cost (logits[m,n] are independent across n).
+    Returns 1 once the row grid alone oversubscribes the device. The three
+    tuning constants are per-arch -- see ``_SPLIT_POLICIES``.
 
-    How full the device is depends on the kernel instance, not just the
-    shape: gfx942's ``mfma_r2_w4`` holds 8 blocks/CU at num_heads=16 and 2
-    at 128, so one ``cu_oversub`` constant cannot suit both. The
-    occupancy-aware path forms ``cu_count * kernel_occupancy`` effective CUs
-    and minimizes ``_splits_by_wave_cost`` over them; other arches keep the
-    original behaviour exactly.
+    With ``blocks_per_cu`` known, minimizes ``_splits_by_wave_cost`` over
+    ``cu_count * blocks_per_cu`` instead, since occupancy depends on the kernel
+    instance (``mfma_r2_w4``: 8 blocks/CU at H=16, 2 at H=128).
     """
     pol = _split_policy()
     grid_x = seq_len_padded // rows_per_block
     if grid_x == 0 or seq_len_kv < pol.min_seq_len_kv:
         return 1
-    cu_count = _device_cu_count(device_index)
     max_splits = max(1, (seq_len_kv // block_kv) // pol.min_tiles_per_split)
-
-    if not pol.occupancy_aware:
-        target_blocks = pol.cu_oversub * cu_count
-        if grid_x >= target_blocks:
-            return 1
-        return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
-
-    occupancy = kernel_occupancy(
-        launcher,
-        arch=_ARCH,
-        variant=variant,
-        num_heads=num_heads,
-        head_size=head_size,
-        device_index=device_index,
-    )
-    effective_cus = cu_count * occupancy
-    # cu_starts/cu_ends live on the device, so the true window is unknown
-    # without a sync. The full KV extent bounds it, and only the ratio
-    # between candidates matters to the argmin -- exact causal windows were
-    # measured to give the same choice.
-    window_tiles = max(1, seq_len_kv // block_kv)
-    return _splits_by_wave_cost(
-        grid_x, effective_cus, window_tiles, max_splits, pol.block_overhead_tiles
-    )
+    if blocks_per_cu is not None:
+        # The window bounds live on the device; the full KV extent stands in.
+        return _splits_by_wave_cost(
+            grid_x,
+            _device_cu_count(device_index) * blocks_per_cu,
+            seq_len_kv // block_kv,
+            max_splits,
+            pol.block_overhead_tiles,
+        )
+    target_blocks = pol.cu_oversub * _device_cu_count(device_index)
+    if grid_x >= target_blocks:
+        return 1
+    return max(1, min(math.ceil(target_blocks / grid_x), max_splits))
 
 
 # Kernel-variant registry (arch-dependent).
@@ -661,36 +633,26 @@ def flydsl_fp8_mqa_logits(
         device=Q.device,
     )[:, :seq_len_kv]
 
-    num_splits = _auto_num_splits(
-        seq_len_padded,
-        seq_len_kv,
-        _ROWS_PER_BLOCK,
-        _BKV,
-        Q.device.index,
-        launcher=launcher,
-        variant=variant,
-        num_heads=num_heads,
-        head_size=head_size,
-    )
-
     if stream is None:
         stream = torch.cuda.current_stream()
 
+    tensors = (Q, KV, kv_scales, weights, cu_starts, cu_ends, logits)
+    scalars = (int(seq_len_padded), int(seq_len_kv), int(logits.stride(0)))
+
     with torch.cuda.device(Q.device.index):
-        _run_compiled(
-            launcher,
-            Q,
-            KV,
-            kv_scales,
-            weights,
-            cu_starts,
-            cu_ends,
-            logits,
-            int(seq_len_padded),
-            int(seq_len_kv),
-            int(logits.stride(0)),
-            int(num_splits),
-            stream,
+        blocks_per_cu = None
+        if _split_policy().block_overhead_tiles is not None:
+            blocks_per_cu = _max_blocks_per_cu(
+                launcher, (*tensors, *scalars, 1, stream)
+            )
+        num_splits = _auto_num_splits(
+            seq_len_padded,
+            seq_len_kv,
+            _ROWS_PER_BLOCK,
+            _BKV,
+            Q.device.index,
+            blocks_per_cu,
         )
+        _run_compiled(launcher, *tensors, *scalars, int(num_splits), stream)
 
     return logits[:seq_len, :]
