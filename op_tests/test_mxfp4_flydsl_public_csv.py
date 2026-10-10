@@ -13,6 +13,7 @@ import itertools
 import json
 import math
 import os
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -47,6 +48,7 @@ def run_torch(
     activation: ActivationType,
     limit: float | None,
     bias1: torch.Tensor | None = None,
+    fp8_intermediate: bool = False,
 ) -> torch.Tensor:
     ref1 = FmoeTuner.run_torch_moe_stage1(
         data["a1_qt"],
@@ -64,13 +66,22 @@ def run_torch(
         topk=topk,
         swiglu_limit=limit,
     )
+    a2_scale = None
+    if fp8_intermediate:
+        from aiter.ops.quant import per_1x32_f8_scale_f8_quant
+
+        shape = ref1.shape
+        ref1, a2_scale = per_1x32_f8_scale_f8_quant(
+            ref1.reshape(-1, shape[-1]), scale_type=dtypes.fp8_e8m0
+        )
+        ref1 = ref1.reshape(shape)
     return FmoeTuner.run_torch_moe_stage2(
         ref1,
         data["w1_qt"],
         data["w2_qt"],
         data["topk_weights"],
         data["topk_ids"],
-        a2_scale=None,
+        a2_scale=a2_scale,
         w2_scale=data["w2_scale"],
         dtype=dtypes.bf16,
         quant_type=QuantType.per_1x32,
@@ -143,6 +154,17 @@ def select_csv_lookup(
     return None
 
 
+def scale_byte_offsets(rows, groups, inter_dim: int, *, native: bool):
+    """Map logical rows/groups to the shared producer/consumer byte layout."""
+    chunk_bytes = ((inter_dim // 32 + 7) // 8) * 256
+    offsets = (
+        (rows // (16 if native else 32)) * chunk_bytes
+        + (groups // 8) * 256 + (groups % 4) * 64
+        + (rows % 16) * 4 + ((groups // 4) % 2) * 2
+    )
+    return offsets if native else offsets + (rows // 16) % 2
+
+
 def decode_valid_scales(
     payload: torch.Tensor,
     scales: torch.Tensor,
@@ -154,40 +176,69 @@ def decode_valid_scales(
     native_scale_layout: bool | None = None,
 ) -> torch.Tensor:
     """Check only E8M0 bytes actually consumed for live sorted intermediate rows."""
-    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
-
     ids = sorted_ids[: int(valid_ids[0].item())].long()
     valid = (ids & 0xFFFFFF) < token
     rows = torch.arange(ids.numel(), device=ids.device)[valid, None]
     groups = torch.arange(inter_dim // 32, device=ids.device)[None, :]
-    chunk_bytes = kas_per_chunk_dw_for(inter_dim) * 4
     if native_scale_layout is None:
         native_scale_layout = block_m == 16
-    if native_scale_layout:
-        offsets = (
-            (rows // 16) * chunk_bytes
-            + (groups // 8) * 256
-            + (groups % 4) * 64
-            + (rows % 16) * 4
-            + ((groups // 4) % 2) * 2
-        )
-    else:
-        # Regular chunks pair 16-row halves in adjacent bytes, and groups are
-        # 256-byte tiles. This is the existing shared writer/reader swizzle.
-        offsets = (
-            (rows // 32) * chunk_bytes
-            + (groups // 8) * 256
-            + (groups % 4) * 64
-            + (rows % 16) * 4
-            + ((groups // 4) % 2) * 2
-            + (rows // 16) % 2
-        )
+    offsets = scale_byte_offsets(rows, groups, inter_dim, native=native_scale_layout)
     active_scales = scales.view(torch.uint8).flatten()[offsets].view(dtypes.fp8_e8m0)
     decoded = payload[: ids.numel()][valid].float() * fp4_utils.e8m0_to_f32(
         active_scales
     ).repeat_interleave(32, 1)
     assert torch.isfinite(decoded).all(), "non-finite decoded live intermediate"
     return active_scales
+
+
+def inspect_regular_scales(payload, scales, sorted_ids, valid_ids, token,
+                           topk, inter_dim, block_m, scale_byte):
+    """Check selected bytes separately from the reader's full 4-byte loads."""
+    sorted_rows = int(valid_ids[0].item())
+    ids = sorted_ids[:sorted_rows].long()
+    live = ((ids & 0xFFFFFF) < token) & ((ids >> 24) < topk)
+    rows = torch.arange(sorted_rows, device=ids.device)[:, None]
+    groups = torch.arange(inter_dim // 32, device=ids.device)[None, :]
+    offsets = scale_byte_offsets(rows, groups, inter_dim, native=False)
+    raw = scales.view(torch.uint8).flatten()
+    physical_cols = ((inter_dim // 32 + 7) // 8) * 8
+    assert scales.is_contiguous() and scales.shape[1] == physical_cols
+    assert scales.stride() == (physical_cols, 1)
+    assert scales.shape[0] >= (sorted_ids.numel() + 31) // 32 * 32
+    # All active sorted blocks include padding lanes. They load whole words;
+    # only live routes and valid K tiles contribute selected bytes to output.
+    words = (offsets // 4 * 4).unique()
+    assert int(words.min()) >= 0 and int(words.max()) + 3 < raw.numel()
+    selector = ((groups // 4) % 2) * 2 + (rows // 16) % 2
+    assert torch.equal(offsets, offsets // 4 * 4 + selector)
+    if scale_byte == 255:
+        assert (raw[offsets[live]] != 255).all(), "producer omitted live scale bytes"
+    padded_groups = torch.arange(inter_dim // 32, physical_cols,
+        device=ids.device)[None, :]
+    padding_offsets = scale_byte_offsets(rows, padded_groups, inter_dim, native=False)
+    trailing = torch.empty(0, device=ids.device, dtype=torch.long)
+    if sorted_rows % 32:
+        tail_rows = torch.arange(sorted_rows, (sorted_rows + 31) // 32 * 32,
+            device=ids.device)[:, None]
+        trailing = scale_byte_offsets(tail_rows, groups, inter_dim, native=False)
+    if scale_byte == 255:
+        assert (raw[padding_offsets] == 255).all(), "unexpected padded K-pack write"
+        assert (raw[trailing] == 255).all(), "unexpected trailing row-half write"
+    active_scales = raw[offsets[live]].view(dtypes.fp8_e8m0)
+    decoded = payload[:sorted_rows][live].float() * fp4_utils.e8m0_to_f32(
+        active_scales).repeat_interleave(32, 1)
+    assert torch.isfinite(decoded).all()
+    return decoded, active_scales, {
+        "scale_shape": tuple(scales.shape), "scale_stride": tuple(scales.stride()),
+        "sorted_rows": sorted_rows, "active_blocks": sorted_rows // block_m,
+        "last_row_half": ((sorted_rows // 16) - 1) % 2,
+        "live_routes": int(live.sum()), "live_scale_bytes": offsets[live].numel(),
+        "writer_overwritten_bytes": int((raw != scale_byte).sum()) if scale_byte is not None else None,
+        "reader_word_min": int(words.min()), "reader_word_end": int(words.max()) + 3,
+        "allocation_bytes": raw.numel(), "padded_k_bytes": padding_offsets.numel(),
+        "unwritten_row_half_bytes": trailing.numel(),
+        "selector_checked": True,
+    }
 
 
 @benchmark()
@@ -203,6 +254,9 @@ def test_public_a8w4_csv(
     expected_pair: tuple[str, str] | None = None,
     lookup_csv_token: int | None = None,
     stage1_bias: int = 0,
+    routing: str = "random",
+    block_amplitude: float = 1.0,
+    scale_byte: int | None = None,
 ) -> dict[str, Any]:
     expected_pair = (kernel1, kernel2) if expected_pair is None else expected_pair
     g1 = _parse_mxfp4_g1_kname(kernel1)
@@ -216,6 +270,38 @@ def test_public_a8w4_csv(
     data = Mxfp4FlydslTuner._prepare_case(
         token, model_dim, inter_dim, expert, topk, dtypes.bf16, a_dtype="fp8"
     )
+    if routing != "random":
+        assert expert > topk and token > g1["BM"]
+        data["topk_ids"] = torch.arange(
+            topk, dtype=dtypes.i32, device="cuda"
+        ).expand(token, topk).contiguous()
+        if routing == "fixed-tail":
+            data["topk_ids"][0, 0] = topk
+        data["topk_weights"] = torch.arange(
+            1, topk + 1, dtype=dtypes.fp32, device="cuda"
+        ).expand(token, topk).contiguous()
+        data["topk_weights"] /= topk * (topk + 1) / 2
+        route_counts = torch.bincount(data["topk_ids"].flatten().long(), minlength=expert)
+        expected_counts = [token] * topk
+        if routing == "fixed-tail":
+            expected_counts[0] -= 1
+            expected_counts.append(1)
+        assert route_counts[:len(expected_counts)].tolist() == expected_counts
+        assert int(route_counts[len(expected_counts):].sum()) == 0
+    if block_amplitude != 1.0:
+        from aiter.ops.quant import per_1x32_mx_quant_hip
+        from aiter.ops.shuffle import shuffle_weight
+
+        data["input"][g1["BM"]:] *= block_amplitude
+        zero_columns = torch.cat((torch.arange(32), inter_dim + torch.arange(32)))
+        data["w1_qt"].view(torch.uint8)[:, zero_columns] = 0
+        data["w1_a16"] = shuffle_weight(
+            data["w1_qt"], (16, 16), is_guinterleave=True, gate_up=True
+        )
+        data["a1_qt"], data["a1_scale"] = per_1x32_mx_quant_hip(
+            data["input"], quant_dtype=dtypes.fp8,
+            scale_type=dtypes.fp8_e8m0, shuffle=False,
+        )
     limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
     limit = (
         float(limit_env)
@@ -226,16 +312,37 @@ def test_public_a8w4_csv(
         torch.randn((expert, 2 * inter_dim), device="cuda", dtype=torch.float32)
         if stage1_bias else None
     )
-    reference = run_torch(data, topk, activation, limit, bias1=bias1)
+    reference = run_torch(data, topk, activation, limit, bias1=bias1,
+        fp8_intermediate=is_opus)
     output = torch.empty((token, model_dim), device="cuda", dtype=dtypes.bf16)
     original1 = fm._mxfp4_a4w4_stage1_fw
     original2 = (
         fm._opus_a8w4.opus_a8w4_stage2_wrapper if is_opus else fm._mxfp4_a4w4_stage2_fw
     )
-    calls, intermediate = [], {}
+    calls, intermediate, sort_calls = [], {}, []
+    control_intermediate = None
+    current_scale_byte = None
+    launcher = importlib.import_module("aiter.ops.flydsl.mxfp4_gemm1_kernels")
+    original_launch = launcher.flydsl_mxfp4_gemm1
+    original_generated_sort = aiter.mxfp4_moe_sort
+    original_opus_sort = aiter.moe_sorting_opus_fwd
+
+    def observe_launch(*args, **kwargs):
+        if current_scale_byte is not None:
+            kwargs["inter_sorted_shuffled_scale"].view(torch.uint8).fill_(current_scale_byte)
+        return original_launch(*args, **kwargs)
+
+    def observe_generated_sort(*args, **kwargs):
+        sort_calls.append("generated")
+        return original_generated_sort(*args, **kwargs)
+
+    def observe_opus_sort(*args, **kwargs):
+        sort_calls.append("opus")
+        return original_opus_sort(*args, **kwargs)
 
     @functools.wraps(original1)
     def observe1(*args: Any, **kwargs: Any) -> Any:
+        nonlocal control_intermediate
         result = original1(*args, **kwargs)
         calls.append(("g1", kwargs["kernelName1"]))
         payload, scales = result
@@ -248,6 +355,8 @@ def test_public_a8w4_csv(
             interleave=kwargs["interleave"],
             prequant_has_scales=kwargs.get("a1_scale") is not None,
             stage1_has_bias=kwargs.get("bias1") is not None,
+            native_scale_layout=kwargs.get("native_scale_layout", g1["BM"] == 16),
+            scale_shape=tuple(scales.shape), scale_stride=tuple(scales.stride()),
         )
         if payload.dtype == dtypes.fp8:
             active_scales = decode_valid_scales(
@@ -258,6 +367,41 @@ def test_public_a8w4_csv(
                 live_scale_min=int(active_scales.view(torch.uint8).min().item()),
                 live_scale_max=int(active_scales.view(torch.uint8).max().item()),
             )
+        if is_opus and scale_byte is not None:
+            decoded, active_scales, contract = inspect_regular_scales(
+                payload, scales, args[3], args[5], token, topk, inter_dim,
+                kwargs["block_m"], current_scale_byte,
+            )
+            intermediate.update(contract)
+            ids = args[3][:int(args[5][0].item())].long()
+            live = ((ids & 0xFFFFFF) < token) & ((ids >> 24) < topk)
+            live_payload = payload[:ids.numel()][live].view(torch.uint8)
+            if current_scale_byte is None:
+                control_intermediate = (live_payload.clone(), active_scales.view(torch.uint8).clone())
+            else:
+                assert torch.equal(live_payload, control_intermediate[0])
+                assert torch.equal(active_scales.view(torch.uint8), control_intermediate[1])
+                intermediate["normal_poison_intermediate_equal"] = True
+            if g1["BM"] == 16:
+                native_q, native_s = original1(*args, **dict(kwargs, native_scale_layout=True))
+                native_scale = decode_valid_scales(native_q, native_s, inter_dim,
+                    16, args[3], args[5], token, native_scale_layout=True)
+                native_values = native_q[:ids.numel()][live].float() * fp4_utils.e8m0_to_f32(
+                    native_scale).repeat_interleave(32, 1)
+                assert torch.equal(native_values, decoded), "native/regular live values differ"
+                assert torch.equal(native_scale.view(torch.uint8), active_scales.view(torch.uint8))
+                intermediate["native_regular_equivalent"] = True
+            if block_amplitude != 1.0:
+                assert torch.equal(decoded[:, :32], torch.zeros_like(decoded[:, :32]))
+                live_indices = torch.where(live)[0]
+                first = active_scales[live_indices // 16 == 0, 1:].view(torch.uint8)
+                second = active_scales[live_indices // 16 == 1, 1:].view(torch.uint8)
+                assert first.numel() and second.numel()
+                shared_rows = min(first.shape[0], second.shape[0])
+                assert not torch.equal(first[:shared_rows], second[:shared_rows]), (
+                    "first BM16 blocks need distinct scales"
+                )
+                intermediate["distinct_bm16_block_scales"] = True
         return result
 
     @functools.wraps(original2)
@@ -299,16 +443,59 @@ def test_public_a8w4_csv(
         "lookup_token": fm.get_padded_M(token),
         "lookup_csv_token": lookup_csv_token,
     }
-    with patch.object(fm, "_mxfp4_a4w4_stage1_fw", observe1), patch.object(
-        fm._opus_a8w4 if is_opus else fm,
-        "opus_a8w4_stage2_wrapper" if is_opus else "_mxfp4_a4w4_stage2_fw", observe2
-    ):
+    if routing != "random":
+        ret["route_counts"] = expected_counts
+    uses_generated = g1["BM"] == 16 and token * topk < expert
+    if uses_generated and fm._MOE_SORT_BACKEND == "auto":
+        zero_init = (
+            not fm._opus_a8w4.parse_stage2_config(
+                {"kernelName2": kernel2}, g1["BM"]
+            ).route_out
+            if is_opus else g2["epilog"] == "atomic"
+        )
+        supported = fm._mxfp4_aux_instance_supported(expert, topk, model_dim,
+            g1["BM"], zero_init)
+        assert supported, "actual generated auxiliary instance is unavailable"
+        ret["compiled_aux_supported"] = supported
+        module = importlib.import_module("aiter.jit.core").get_module("module_moe_mxfp4_aux")
+        ret["compiled_aux_module"] = module.__file__
+        ret["compiled_aux_sha256"] = hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
+        ret["compiled_aux_key"] = (
+            f"aux_{'sortzi' if zero_init else 'sortonly'}_NE{expert}"
+            f"_TOPK{topk}_MB{g1['BM']}_H{model_dim}"
+        )
+    with ExitStack() as stack:
+        stack.enter_context(patch.object(fm, "_mxfp4_a4w4_stage1_fw", observe1))
+        stack.enter_context(patch.object(fm._opus_a8w4 if is_opus else fm,
+            "opus_a8w4_stage2_wrapper" if is_opus else "_mxfp4_a4w4_stage2_fw", observe2))
+        stack.enter_context(patch.object(launcher, "flydsl_mxfp4_gemm1", observe_launch))
+        stack.enter_context(patch.object(aiter, "mxfp4_moe_sort", observe_generated_sort))
+        stack.enter_context(patch.object(aiter, "moe_sorting_opus_fwd", observe_opus_sort))
         fm.get_2stage_cfgs.cache_clear()
+        control = public().clone() if scale_byte is not None else None
+        if control is not None:
+            normal_repeat = public()
+            repeat_error = cosine_diff_compare(control, normal_repeat, printLog=False)
+            repeat_mismatch = checkAllclose(control.float(), normal_repeat.float(),
+                rtol=0.1, atol=0.05, msg="normal initialization repeat")
+            assert math.isfinite(repeat_error) and repeat_error <= 0.1
+            assert math.isfinite(repeat_mismatch) and repeat_mismatch <= 0.05
+            ret["normal_repeat_error"] = repeat_error
+            ret["normal_repeat_mismatch"] = repeat_mismatch
+        current_scale_byte = scale_byte
         for poison in (float("nan"), 11.0):
             output.fill_(poison)
             result = public()
             assert result.data_ptr() == output.data_ptr()
             assert torch.isfinite(result).all()
+            if control is not None:
+                repeat_error = checkAllclose(control.float(), result.float(),
+                    rtol=0.1, atol=0.05, msg="scale initialization control")
+                assert math.isfinite(repeat_error) and repeat_error <= 0.05
+                control_error = cosine_diff_compare(control, result, printLog=False)
+                assert math.isfinite(control_error) and control_error <= 0.1
+                ret["normal_poison_error"] = control_error
+                ret["normal_poison_mismatch"] = repeat_error
             if is_opus:
                 error = cosine_diff_compare(reference, result)
                 assert math.isfinite(error) and error <= 0.1
@@ -318,6 +505,10 @@ def test_public_a8w4_csv(
         actual1 = next((name for stage, name in reversed(calls) if stage == "g1"), "")
         actual2 = next((name for stage, name in reversed(calls) if stage == "g2"), "")
         ret.update(actual_G1=actual1, actual_G2=actual2)
+        ret["sort_backends"] = sorted(set(sort_calls))
+        assert len(ret["sort_backends"]) == 1, "public sort backend changed between calls"
+        if fm._MOE_SORT_BACKEND == "auto":
+            assert ret["sort_backends"] == ["generated" if uses_generated else "opus"]
         expected = (
             [("g1", expected_pair[0]), ("g2", expected_pair[1])]
             if expected_pair
@@ -414,6 +605,12 @@ def main() -> None:
     )
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--stage1-bias", type=int, choices=(0, 1), nargs="+", default=[0])
+    parser.add_argument("-b", "--batch", type=int, nargs="+", default=None,
+        help="actual token counts; CSV lookup uses their padded token keys")
+    parser.add_argument("--routing", choices=("random", "fixed", "fixed-tail"),
+        nargs="+", default=["random"])
+    parser.add_argument("--block-amplitude", type=float, nargs="+", default=[1.0])
+    parser.add_argument("--scale-byte", type=int, choices=(0, 255), nargs="+", default=[None])
     args = parser.parse_args()
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("public A8W4 CSV validation unsupported on %s", get_gfx())
@@ -425,12 +622,20 @@ def main() -> None:
     fm.cfg_2stages = None
     fm.get_2stage_cfgs.cache_clear()
     records = []
-    for index, stage1_bias in itertools.product(indices, args.stage1_bias):
+    for index, stage1_bias, batch, routing, amplitude, scale_byte in itertools.product(
+        indices, args.stage1_bias, args.batch or [None], args.routing,
+        args.block_amplitude, args.scale_byte,
+    ):
         row = rows[index]
-        lookup = select_csv_lookup(rows, row, fm.get_padded_M(int(row["token"])))
+        token = int(row["token"]) if batch is None else batch
+        lookup = select_csv_lookup(rows, row, fm.get_padded_M(token))
         base = {
             "csv_row": index,
             "stage1_bias": stage1_bias,
+            "actual_token": token,
+            "routing": routing,
+            "block_amplitude": amplitude,
+            "scale_byte": scale_byte,
             "source_tag": row.get("_tag", ""),
             "shape": row,
             "requested_pair": {"G1": row["kernelName1"], "G2": row["kernelName2"]},
@@ -455,10 +660,10 @@ def main() -> None:
                 with torch.device("cuda"):
                     base.update(
                         test_public_a8w4_csv(
+                            token,
                             *(
                                 int(row[col])
                                 for col in (
-                                    "token",
                                     "model_dim",
                                     "inter_dim",
                                     "expert",
@@ -475,6 +680,9 @@ def main() -> None:
                             ),
                             lookup_csv_token=lookup["token"] if lookup else None,
                             stage1_bias=stage1_bias,
+                            routing=routing,
+                            block_amplitude=amplitude,
+                            scale_byte=scale_byte,
                         )
                     )
         except Exception as exc:  # noqa: BLE001

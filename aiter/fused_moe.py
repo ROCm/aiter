@@ -2229,6 +2229,9 @@ def _mxfp4_a4w4_stage1(
     inter_cols = D_INTER if out_dtype == "fp8" else D_INTER // 2
     inter_scale_cols = D_INTER // 32
     inter_scale_bytes = max_sorted * max((1024 // BM_MIN) * 4, inter_scale_cols * 2)
+    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
+
+    chunk_bytes = kas_per_chunk_dw_for(D_INTER) * 4
     if native_scale_layout:
         # The native BM16 layout addresses one *padded* chunk per M block:
         # kas_per_chunk_dw_for pads scale-N up to a multiple of 8 columns, so
@@ -2236,11 +2239,16 @@ def _mxfp4_a4w4_stage1(
         # D_INTER // 32 is not a multiple of 8. Sizing on the unpadded width
         # under-allocates and the last blocks write past the buffer (D_INTER=1408
         # spans 49152 B where the unpadded figure gives 45056 B).
-        from aiter.ops.flydsl.kernels.mxfp4_gemm_common import kas_per_chunk_dw_for
-
         chunks = (max_sorted + BM - 1) // BM
         inter_scale_bytes = max(
-            inter_scale_bytes, chunks * kas_per_chunk_dw_for(D_INTER) * 4
+            inter_scale_bytes, chunks * chunk_bytes
+        )
+    else:
+        # Regular chunks pack 32 rows. Expose their physical column stride so
+        # consumers deriving the chunk stride from tensor metadata read it as-is.
+        inter_scale_cols = _padded_scale_cols(D_INTER)
+        inter_scale_bytes = max(
+            inter_scale_bytes, ((max_sorted + 31) // 32) * chunk_bytes
         )
     inter_dtype = dtypes.fp8 if out_dtype == "fp8" else torch.uint8
     inter_sorted_quant = torch.empty(
@@ -2922,9 +2930,6 @@ def _mxmoe_opus_cfg_unsupported(
         return "OPUS requires inter_dim >= 256 and divisible by 128"
     if model_dim % launch.instance.block_n:
         return f"model_dim must be divisible by OPUS block_n={launch.instance.block_n}"
-    # Ticket 02 enables these once the padded regular buffer contract is ready.
-    if p1["BM"] == 16 or inter_dim % 256:
-        return "BM16/padded regular scales are not yet supported"
     from aiter.ops.flydsl.mxfp4_gemm1_kernels import _assert_supported
 
     try:
