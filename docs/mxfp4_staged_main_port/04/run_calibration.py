@@ -183,6 +183,7 @@ def main():
                     str(winner),
                     "--result",
                     str(result_path),
+                    "--preserve-generated-route-weights",
                     "--action",
                     "replay" if action == "precompiled" else action,
                     "--warmup",
