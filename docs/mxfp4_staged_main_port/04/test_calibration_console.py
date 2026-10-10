@@ -11,7 +11,9 @@ driver = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(driver)
 
 
-def test_search_report_counts_valid_and_failed_attempts_and_actual_summary(tmp_path):
+def test_search_report_counts_valid_and_failed_attempts_and_actual_summary(
+    tmp_path: "Path",
+) -> "None":
     log = tmp_path / "console.log.txt"
     log.write_text(
         "[aiter] port[flydsl_mxmoe_g1_a4w4_16x128x256_f16in+flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16][cosine_diff=0.011174 passed~]\n"
@@ -32,7 +34,9 @@ def test_search_report_counts_valid_and_failed_attempts_and_actual_summary(tmp_p
     assert report["tuning_summary_seconds"] == 107.2228
 
 
-def test_finalize_exited_search_records_complete_evidence_without_gpu_launch(tmp_path):
+def test_finalize_exited_search_records_complete_evidence_without_gpu_launch(
+    tmp_path: "Path",
+) -> "None":
     import json
 
     job_dir = tmp_path / "case"
@@ -66,7 +70,9 @@ def test_finalize_exited_search_records_complete_evidence_without_gpu_launch(tmp
     assert not (artifact / "console.log.txt").exists()
 
 
-def test_finalize_failed_completed_search_reports_pair_failure_not_incomplete(tmp_path):
+def test_finalize_failed_completed_search_reports_pair_failure_not_incomplete(
+    tmp_path: "Path",
+) -> "None":
     import json
 
     job_dir = tmp_path / "failed"

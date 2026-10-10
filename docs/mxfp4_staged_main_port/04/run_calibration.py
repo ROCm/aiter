@@ -15,12 +15,12 @@ import sys
 from pathlib import Path
 
 
-def write_json(path, value):
+def write_json(path: "Path", value: "object") -> "None":
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
-def parse_search_console(console):
+def parse_search_console(console: "Path") -> "dict[str, object]":
     text = console.read_text()
     staged = re.findall(r"\[mxfp4-staged\] .+ \+ .+ (?:us=|validation failed:)", text)
     ordinary = re.findall(r"\[mxfp4-port\] token=.+ \+ .+ us=", text)
@@ -45,7 +45,9 @@ def parse_search_console(console):
     }
 
 
-def finalize_search(job, job_dir, counts):
+def finalize_search(
+    job: "dict[str, object]", job_dir: "Path", counts: "dict[str, object]"
+) -> "dict[str, object]":
     """Capture an exited controller task; this function never launches a search."""
     artifact = job_dir / "search-task"
     task = json.loads((artifact / "task.json").read_text())
@@ -104,7 +106,7 @@ def finalize_search(job, job_dir, counts):
     return result
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--root", type=Path, default=Path(__file__).resolve().parents[3]

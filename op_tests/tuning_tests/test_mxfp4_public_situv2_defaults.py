@@ -22,15 +22,18 @@ fm = importlib.import_module("aiter.fused_moe")
     "beta,linear_beta,expected", [(None, None, (4.0, 25.0)), (1.0, 1.0, (1.0, 1.0))]
 )
 def test_actual_mxfp4_stage_receives_omitted_defaults_and_explicit_parameters(
-    monkeypatch, beta, linear_beta, expected
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    beta: "float | None",
+    linear_beta: "float | None",
+    expected: "object",
+) -> "None":
     observed = []
 
-    def stage1(*args, **kwargs):
+    def stage1(*args: "object", **kwargs: "object") -> "None":
         observed.append((kwargs["situ_beta"], kwargs["situ_linear_beta"]))
         return torch.empty((1, 1, 128), device="cpu"), None
 
-    def stage2(*args, **kwargs):
+    def stage2(*args: "object", **kwargs: "object") -> "None":
         return None
 
     monkeypatch.setattr(fm, "_mxfp4_a4w4_stage1_fw", stage1)

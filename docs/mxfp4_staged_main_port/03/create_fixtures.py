@@ -300,7 +300,7 @@ REQUESTS = (
 )
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent)
     args = parser.parse_args()
@@ -329,7 +329,7 @@ def main():
     csv_dir = args.output_dir / "fixtures"
     csv_dir.mkdir(exist_ok=True)
 
-    def forbidden(*args, **kwargs):
+    def forbidden(*args: "object", **kwargs: "object") -> "None":
         raise AssertionError(
             "offline fixture enumeration reached compilation or GPU work"
         )

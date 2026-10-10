@@ -7,6 +7,7 @@ entry points are fail-closed and GPU visibility is empty.
 """
 
 import weakref
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -22,20 +23,26 @@ from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import (
 )
 
 
-def test_g1_screening_times_only_direct_kernel_after_untimed_setup(monkeypatch):
+def test_g1_screening_times_only_direct_kernel_after_untimed_setup(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     events = []
 
-    def prepare(*args):
+    def prepare(*args: "object") -> "tuple[dict[str, object], tuple[object, ...]]":
         events.append("case")
         return {}, ()
 
-    def prepare_launch(*args, **kwargs):
+    def prepare_launch(
+        *args: "object", **kwargs: "object"
+    ) -> "tuple[Callable[[], None], object, object]":
         events.append("wrapper")
         return lambda: events.append("kernel"), object(), object()
 
-    def measure(launch, *, num_warmup, num_iters):
+    def measure(
+        launch: "Callable[[], object]", *, num_warmup: "int", num_iters: "int"
+    ) -> "tuple[None, float]":
         assert (num_warmup, num_iters) == (3, 5)
         assert events == ["case", "wrapper"]
         events.append("timing")
@@ -57,30 +64,35 @@ def test_g1_screening_times_only_direct_kernel_after_untimed_setup(monkeypatch):
 
 
 class FakeTensor:
-    def __init__(self, shape, dtype=None, value=3):
+    def __init__(
+        self,
+        shape: "tuple[int, ...]",
+        dtype: "torch.dtype | None" = None,
+        value: "object" = 3,
+    ) -> "None":
         self.shape = shape
         self.dtype = dtype or moe.dtypes.bf16
         self.device = "cpu"
         self.value = value
 
-    def view(self, dtype):
+    def view(self, dtype: "torch.dtype | None") -> "FakeTensor":
         return self
 
-    def numel(self):
+    def numel(self) -> "int":
         product = 1
         for dimension in self.shape:
             product *= dimension
         return product
 
-    def zero_(self):
+    def zero_(self) -> "FakeTensor":
         self.value = 0
         return self
 
-    def __getitem__(self, index):
+    def __getitem__(self, index: "int") -> "SimpleNamespace":
         return SimpleNamespace(item=lambda: 128)
 
 
-def fake_case():
+def fake_case() -> "tuple[dict[str, object], tuple[object, ...]]":
     data = {
         "input": FakeTensor((4, 3072)),
         "w1_a16": FakeTensor((128, 1024, 1536), torch.uint8),
@@ -116,8 +128,12 @@ def fake_case():
     ],
 )
 def test_g1_screening_matches_bm_input_quantization_and_effective_default_parameters(
-    monkeypatch, bm, act, configured_limit, expected_limit
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    bm: "int",
+    act: "str",
+    configured_limit: "float | None",
+    expected_limit: "float",
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     row = shape(
@@ -138,18 +154,18 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
     events = []
     wrapper_parameters = {}
 
-    def prepare_case(*args):
+    def prepare_case(*args: "object") -> "dict[str, object]":
         assert not timed
         events.append("case")
         return data
 
-    def sort(*args, **kwargs):
+    def sort(*args: "object", **kwargs: "object") -> "tuple[object, ...]":
         assert not timed
         assert kwargs == {"block_size": bm, "accumulate": False, "output_aux": "opus"}
         events.append("sort")
         return sorting
 
-    def prequant(**kwargs):
+    def prequant(**kwargs: "object") -> "tuple[object, object]":
         assert not timed
         assert kwargs["input"] is data["input"]
         assert kwargs["num_experts_upper_bound"] == 128
@@ -157,7 +173,9 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
         events.append("prequant")
         return packed, scales
 
-    def prepare_output(input, *args, **kwargs):
+    def prepare_output(
+        input: "object", *args: "object", **kwargs: "object"
+    ) -> "object":
         assert not timed
         assert input is (data["input"] if bm == 16 else packed)
         assert kwargs["a1_scale"] is (None if bm == 16 else scales)
@@ -166,7 +184,7 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
         events.append("wrapper")
         return intermediate
 
-    def direct(**kwargs):
+    def direct(**kwargs: "object") -> "None":
         assert timed
         assert kwargs["hidden_states"] is (data["input"] if bm == 16 else packed)
         assert kwargs["inline_quant"] == kwargs["native_scale_layout"] == (bm == 16)
@@ -187,7 +205,9 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
         assert kwargs["inter_sorted_shuffled_scale"] is intermediate[1]
         events.append("kernel")
 
-    def measure(call, *, num_warmup, num_iters):
+    def measure(
+        call: "Callable[[], object]", *, num_warmup: "int", num_iters: "int"
+    ) -> "tuple[None, float]":
         nonlocal timed
         assert (num_warmup, num_iters) == (3, 5)
         timed = True
@@ -220,8 +240,8 @@ def test_g1_screening_matches_bm_input_quantization_and_effective_default_parame
 
 
 def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
-    monkeypatch,
-):
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     data, _ = fake_case()
@@ -236,17 +256,17 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
     output_refs = []
     events = []
 
-    def prepare_case(*args):
+    def prepare_case(*args: "object") -> "dict[str, object]":
         assert not timed
         return data
 
-    def sort(*args, **kwargs):
+    def sort(*args: "object", **kwargs: "object") -> "tuple[object, ...]":
         assert not timed
         _, sorting = fake_case()
         output_refs.append(weakref.ref(sorting[4]))
         return sorting
 
-    def producer(*args, **kwargs):
+    def producer(*args: "object", **kwargs: "object") -> "tuple[object, object]":
         assert not timed
         assert all(reference() is None for reference in intermediates)
         assert kwargs["kernelName1"] == producer_name and kwargs["swiglu_limit"] == 7.0
@@ -257,7 +277,17 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
         events.append("producer")
         return payload, scale
 
-    def consume(payload, w1, w2, sti, sei, nvi, output, topk, **kwargs):
+    def consume(
+        payload: "FakeTensor",
+        w1: "object",
+        w2: "object",
+        sti: "object",
+        sei: "object",
+        nvi: "object",
+        output: "FakeTensor",
+        topk: "int",
+        **kwargs: "object",
+    ) -> "object":
         assert timed
         assert (
             payload is intermediates[-2]() and kwargs["a2_scale"] is intermediates[-1]()
@@ -278,7 +308,9 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
         events.append("complete-output")
         return output
 
-    def measure(call, *, num_warmup, num_iters):
+    def measure(
+        call: "Callable[[], object]", *, num_warmup: "int", num_iters: "int"
+    ) -> "tuple[None, float]":
         nonlocal timed
         assert (num_warmup, num_iters) == (3, 5)
         timed = True
@@ -320,9 +352,9 @@ def test_g2_screening_owns_fresh_intermediate_and_times_complete_output_path(
 
 @pytest.mark.parametrize("limit", [None, 5.0])
 def test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap(
-    monkeypatch,
-    limit,
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    limit: "float | None",
+) -> "None":
     monkeypatch.delenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", raising=False)
     if limit is not None:
         monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", str(limit))
@@ -337,14 +369,20 @@ def test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap(
     kn1 = "flydsl_mxmoe_g1_a4w4_128x128x256_swiglu"
     kn2 = "flydsl_moe2_layout_afp4_wfp4_bf16_t128x128x128_atomic_sbm128"
 
-    def torch_stage1(*args, **kwargs):
+    def torch_stage1(*args: "object", **kwargs: "object") -> "object":
         assert kwargs["swiglu_limit"] == limit
         assert kwargs["activation"] == moe.ActivationType.Swiglu
         assert kwargs["doweight_stage1"] is False and kwargs["topk"] == 4
         events.append("torch-stage1")
         return ref1
 
-    def populate(reference, intermediate, token, topk, bm):
+    def populate(
+        reference: "object",
+        intermediate: "dict[str, object]",
+        token: "int",
+        topk: "int",
+        bm: "int",
+    ) -> "None":
         assert reference == {"ref1": ref1, "adtype": "fp4"}
         assert (token, topk, bm) == (2048, 4, 128)
         assert (
@@ -353,7 +391,11 @@ def test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap(
         events.append("layout-population")
         intermediate.update(isq=torch_intermediate[0], iss=torch_intermediate[1])
 
-    def consume(payload, *args, **kwargs):
+    def consume(
+        payload: "FakeTensor",
+        *args: "object",
+        **kwargs: "object",
+    ) -> "object":
         assert (
             payload is torch_intermediate[0]
             and kwargs["a2_scale"] is torch_intermediate[1]
@@ -361,23 +403,23 @@ def test_reference_consumer_uses_torch_layout_before_untimed_pair_bootstrap(
         events.append("torch-consumer")
         return output
 
-    def torch_stage2(*args, **kwargs):
+    def torch_stage2(*args: "object", **kwargs: "object") -> "object":
         assert args[0] is ref1
         events.append("torch-stage2")
         return ref2
 
-    def compare(reference, actual, **kwargs):
+    def compare(reference: "object", actual: "object", **kwargs: "object") -> "float":
         assert reference is ref2 and actual is output
         events.append("compare")
         return 0.01
 
-    def pair(*args, **kwargs):
+    def pair(*args: "object", **kwargs: "object") -> "object":
         assert kwargs["swiglu_limit"] == limit
         assert args[1:3] == (kn1, kn2)
         events.append("normal-pair")
         return output
 
-    def torch_ref(*args, **kwargs):
+    def torch_ref(*args: "object", **kwargs: "object") -> "object":
         assert kwargs["swiglu_limit"] == limit
         events.append("normal-reference")
         return ref2

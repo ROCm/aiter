@@ -5,6 +5,14 @@
 Normal ROCm/FlyDSL imports, offline discovery and fail-closed GPU entry points.
 """
 
+from multiprocessing.connection import Connection
+from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
+
 from types import SimpleNamespace
 
 import pandas as pd
@@ -22,7 +30,9 @@ from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import (
 PORT_E2E = moe.Mxfp4FlydslTuner._port_e2e
 
 
-def test_invocation_captures_limit_and_stage2_settings_for_every_shape(monkeypatch):
+def test_invocation_captures_limit_and_stage2_settings_for_every_shape(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
     monkeypatch.setenv("AITER_FLYDSL_STAGE2_FP8", "1")
     monkeypatch.setenv("AITER_MXFP4_INTERMEDIATE", "1")
@@ -32,7 +42,7 @@ def test_invocation_captures_limit_and_stage2_settings_for_every_shape(monkeypat
         args = tuner.parse_args()
         snapshots = []
 
-        def tune_shape(row, args):
+        def tune_shape(row: "dict[str, object]", args: "SimpleNamespace") -> "None":
             snapshots.append(args.mxfp4_configuration)
             return {**row, "us": 1.0}
 
@@ -47,8 +57,8 @@ def test_invocation_captures_limit_and_stage2_settings_for_every_shape(monkeypat
 
 @pytest.mark.parametrize("value", ["0", "-5", "nan", "inf"])
 def test_invalid_activation_limit_rejects_invocation_before_gpu_work(
-    monkeypatch, value
-):
+    monkeypatch: "pytest.MonkeyPatch", value: "object"
+) -> "None":
     monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", value)
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
@@ -57,7 +67,9 @@ def test_invalid_activation_limit_rejects_invocation_before_gpu_work(
             tuner.parse_args()
 
 
-def test_custom_limit_rejects_situv2_even_if_same_shape_is_already_tuned(monkeypatch):
+def test_custom_limit_rejects_situv2_even_if_same_shape_is_already_tuned(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     monkeypatch.setenv("AITER_MXFP4_TUNE_SWIGLU_LIMIT", "5")
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
@@ -69,7 +81,9 @@ def test_custom_limit_rejects_situv2_even_if_same_shape_is_already_tuned(monkeyp
     assert result["us"] == -1 and "Situv2" in result["kernelName1"]
 
 
-def test_separate_invocations_on_one_tuner_capture_current_settings(monkeypatch):
+def test_separate_invocations_on_one_tuner_capture_current_settings(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     with devices(("gfx950", 256)):
         tuner = moe.Mxfp4FlydslTuner("mxfp4", KEYS, RESULTS)
     snapshots = []
@@ -86,7 +100,9 @@ def test_separate_invocations_on_one_tuner_capture_current_settings(monkeypatch)
     assert [item["swiglu_limit"] for item in snapshots] == [7.0, 5.0]
 
 
-def test_fp8_stage2_pair_and_screening_receive_original_route_weights(monkeypatch):
+def test_fp8_stage2_pair_and_screening_receive_original_route_weights(
+    monkeypatch: "pytest.MonkeyPatch",
+) -> "None":
     from op_tests.tuning_tests.test_mxfp4_staged_execution import fake_case
 
     data, sorting = fake_case()
@@ -101,7 +117,7 @@ def test_fp8_stage2_pair_and_screening_receive_original_route_weights(monkeypatc
     )
     observed = []
 
-    def stage2(*args, **kwargs):
+    def stage2(*args: "object", **kwargs: "object") -> "None":
         observed.append(kwargs["topk_weights"])
         return sorting[4]
 
@@ -130,8 +146,12 @@ def test_fp8_stage2_pair_and_screening_receive_original_route_weights(monkeypatc
     "epilog,bn", [("atomic", 128), ("reduce", 128), ("scatter", 128), ("scatter", 256)]
 )
 def test_production_stage2_path_matches_invocation_configuration(
-    monkeypatch, fp8, fp4, epilog, bn
-):
+    monkeypatch: "pytest.MonkeyPatch",
+    fp8: "bool",
+    fp4: "bool",
+    epilog: "str",
+    bn: "int",
+) -> "None":
     import importlib
 
     from op_tests.tuning_tests.test_mxfp4_staged_execution import FakeTensor, fake_case
@@ -165,21 +185,28 @@ def test_production_stage2_path_matches_invocation_configuration(
         lambda dimensions, **kwargs: FakeTensor(dimensions, kwargs["dtype"]),
     )
 
-    def gemm(**kwargs):
+    def gemm(**kwargs: "object") -> "None":
         observed.update(kwargs)
 
-    def reduction(target, out, token, topk, hidden, **kwargs):
+    def reduction(
+        target: "torch.Tensor",
+        out: "torch.Tensor",
+        token: "int",
+        topk: "int",
+        hidden: "int",
+        **kwargs: "object",
+    ) -> "None":
         assert kwargs["is_fp8"] == (expected == "fp8")
         assert kwargs["topk_weights"] is (
             data["topk_weights"] if expected == "fp8" else None
         )
         finished.append("reduce")
 
-    def scatter(**kwargs):
+    def scatter(**kwargs: "object") -> "None":
         assert kwargs["out"] is sorting[4]
         finished.append("scatter")
 
-    def quantized_scatter(**kwargs):
+    def quantized_scatter(**kwargs: "object") -> "None":
         assert kwargs["flat_out_q"].shape == (256, 1536)
         assert kwargs["flat_out_scale"].shape == (256, 96)
         assert (
@@ -232,7 +259,10 @@ _GET_CONTEXT = multiprocessing.get_context
 _PROCESS_START = BaseProcess.start
 
 
-def cpu_configuration_worker(payload, result_tx):
+def cpu_configuration_worker(
+    payload: "tuple[tuple[str, ...], dict[str, object], SimpleNamespace, int]",
+    result_tx: "Connection",
+) -> "None":
     import importlib
 
     from op_tests.tuning_tests._controlled_tuner_import import import_moe_tuner
@@ -280,8 +310,8 @@ def cpu_configuration_worker(payload, result_tx):
     ],
 )
 def test_spawned_shape_inherits_snapshot_and_stable_production_settings(
-    monkeypatch, limit, fp8, fp4
-):
+    monkeypatch: "pytest.MonkeyPatch", limit: "float | None", fp8: "bool", fp4: "bool"
+) -> "None":
     for name, value in zip(
         (
             "AITER_MXFP4_TUNE_SWIGLU_LIMIT",
@@ -301,7 +331,7 @@ def test_spawned_shape_inherits_snapshot_and_stable_production_settings(
         )
         args = tuner.parse_args()
 
-        def cpu_only_start(process):
+        def cpu_only_start(process: "BaseProcess") -> "None":
             assert process._target is cpu_configuration_worker
             return _PROCESS_START(process)
 
@@ -328,8 +358,8 @@ def test_spawned_shape_inherits_snapshot_and_stable_production_settings(
 
 @pytest.mark.parametrize("retune", [False, True])
 def test_custom_limit_same_key_skips_or_replaces_csv_as_requested(
-    tmp_path, monkeypatch, retune
-):
+    tmp_path: "Path", monkeypatch: "pytest.MonkeyPatch", retune: "bool"
+) -> "None":
     from op_tests.tuning_tests.test_mxfp4_tuner_lifecycle import (
         controlled_mxfp4,
         tuner_args,

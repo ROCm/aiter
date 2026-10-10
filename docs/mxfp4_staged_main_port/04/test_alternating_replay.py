@@ -12,11 +12,13 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 
 
-def test_alternating_pairs_keep_every_sample_and_reverse_order_between_cycles():
+def test_alternating_pairs_keep_every_sample_and_reverse_order_between_cycles() -> (
+    "None"
+):
     calls = []
     values = {"left": iter([10.0, 12.0, 11.0]), "right": iter([9.0, 8.0, 10.0])}
 
-    def measure(label):
+    def measure(label: "str") -> "dict[str, float]":
         calls.append(label)
         return {"kernel_sum_us": next(values[label]), "cosine_diff": 0.011}
 

@@ -11,7 +11,7 @@ from collections import Counter
 from pathlib import Path
 
 
-def finite_number(value):
+def finite_number(value: "object") -> "bool":
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
@@ -19,7 +19,7 @@ def finite_number(value):
     )
 
 
-def search_result(record):
+def search_result(record: "dict[str, object]") -> "dict[str, object]":
     result = dict(record)
     result["outcome"] = record.get("outcome", "incomplete_run")
     latency = record.get("winner_us")
@@ -49,7 +49,9 @@ def search_result(record):
     return result
 
 
-def comparison(reference, candidate):
+def comparison(
+    reference: "object", candidate: "dict[str, object]"
+) -> "dict[str, object]":
     if reference is None or candidate is None:
         return {"available": False, "regret_percent": None, "reason": "missing_search"}
     if not reference["valid_winner"] or not candidate["valid_winner"]:
@@ -61,7 +63,9 @@ def comparison(reference, candidate):
     }
 
 
-def wall_totals(searches, model, config=None):
+def wall_totals(
+    searches: "list[dict[str, object]]", model: "str", config: "str | None" = None
+) -> "dict[str, dict[str, object]]":
     totals = {}
     for mode in ("prune", "staged"):
         matching = [
@@ -86,7 +90,9 @@ def wall_totals(searches, model, config=None):
     return totals
 
 
-def rank_retention(prune_winner, console, screen_topk=2):
+def rank_retention(
+    prune_winner: "dict[str, object]", console: "Path", screen_topk: "int" = 2
+) -> "dict[str, object]":
     """Rank a prune winner within the staged log's screening contexts."""
     g1 = prune_winner["kernelName1"]
     g2 = prune_winner["kernelName2"]
@@ -132,7 +138,7 @@ def rank_retention(prune_winner, console, screen_topk=2):
     }
 
 
-def staged_fallback_groups(console, screen_topk=2):
+def staged_fallback_groups(console: "Path", screen_topk: "int" = 2) -> "int":
     """Count groups with logged fallback or returned pairs outside the shortlist."""
     groups = {
         (int(block_m), accumulation.replace("-", "_"))
@@ -153,7 +159,7 @@ def staged_fallback_groups(console, screen_topk=2):
     return len(groups)
 
 
-def summarize(records):
+def summarize(records: "list[dict[str, object]]") -> "dict[str, object]":
     """Return per-search outcomes and paired comparisons for annotated manifest jobs."""
     searches = [search_result(record) for record in records]
     groups = {}
@@ -203,7 +209,7 @@ def summarize(records):
     }
 
 
-def load_records(manifest, gpu_dir):
+def load_records(manifest: "Path", gpu_dir: "Path | None") -> "list[dict[str, object]]":
     records = json.loads(manifest.read_text())
     if gpu_dir is None:
         return records
@@ -248,20 +254,20 @@ def load_records(manifest, gpu_dir):
     return annotated
 
 
-def display(value):
+def display(value: "object") -> "str":
     if value is None:
         return "unavailable"
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
-def error_range(errors):
+def error_range(errors: "object") -> "str | None":
     if not errors:
         return None
     numbers = [float(error) for error in errors]
     return f"{min(numbers):.6g}–{max(numbers):.6g} ({len(numbers)} logged)"
 
 
-def markdown_report(report):
+def markdown_report(report: "dict[str, object]") -> "str":
     lines = [
         "# MXFP4 calibration results",
         "",
@@ -394,7 +400,7 @@ def markdown_report(report):
     return "\n".join(lines) + "\n"
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument(

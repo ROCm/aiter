@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Coordinator-launched exact CSV replay, AOT build and precompiled replay."""
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import torch
+
+
 import argparse
 import csv
 import hashlib
@@ -28,12 +34,12 @@ ENV_KEYS = (
 )
 
 
-def write_json(path, value):
+def write_json(path: "Path", value: "object") -> "None":
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
 
 
-def fingerprint(tensor):
+def fingerprint(tensor: "torch.Tensor") -> "str":
     import torch
 
     return hashlib.sha256(
@@ -41,7 +47,7 @@ def fingerprint(tensor):
     ).hexdigest()
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, required=True)
     parser.add_argument("--result", type=Path, required=True)
@@ -110,7 +116,7 @@ def main():
     stage1 = kernel_module.flydsl_mxfp4_gemm1
     stage2 = g2_module.mxfp4_moe_gemm2
 
-    def capture_g1(**kwargs):
+    def capture_g1(**kwargs: "object") -> "tuple[torch.Tensor, torch.Tensor]":
         for key in (
             "BM",
             "BN",
@@ -143,7 +149,7 @@ def main():
         )
         return stage1(**kwargs)
 
-    def capture_g2(*positional, **kwargs):
+    def capture_g2(*positional: "object", **kwargs: "object") -> "torch.Tensor":
         for key, parsed_key in (
             ("BM", "tile_m"),
             ("BN", "tile_n"),
@@ -207,7 +213,7 @@ def main():
         metadata.block_m == int(row["block_m"]) and metadata.fuse_quant == "fp4"
     ), metadata
 
-    def production():
+    def production() -> "torch.Tensor":
         return fm.fused_moe(
             data["input"],
             data["w1_a16"],

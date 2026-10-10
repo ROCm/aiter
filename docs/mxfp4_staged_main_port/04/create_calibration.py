@@ -18,7 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 
-def main():
+def main() -> "None":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output-dir", type=Path, default=Path(__file__).parent)
     args = parser.parse_args()
@@ -94,7 +94,7 @@ def main():
                 }
             )
 
-    def forbidden(*unused_args, **unused_kwargs):
+    def forbidden(*unused_args: "object", **unused_kwargs: "object") -> "None":
         raise AssertionError("offline counting reached compilation or GPU work")
 
     counts = []
