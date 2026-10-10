@@ -50,7 +50,7 @@ def search_result(record: "dict[str, object]") -> "dict[str, object]":
 
 
 def comparison(
-    reference: "object", candidate: "dict[str, object]"
+    reference: "dict[str, object] | None", candidate: "dict[str, object] | None"
 ) -> "dict[str, object]":
     if reference is None or candidate is None:
         return {"available": False, "regret_percent": None, "reason": "missing_search"}
@@ -91,7 +91,7 @@ def wall_totals(
 
 
 def rank_retention(
-    prune_winner: "dict[str, object]", console: "Path", screen_topk: "int" = 2
+    prune_winner: "dict[str, object]", console: "str", screen_topk: "int" = 2
 ) -> "dict[str, object]":
     """Rank a prune winner within the staged log's screening contexts."""
     g1 = prune_winner["kernelName1"]
@@ -138,7 +138,7 @@ def rank_retention(
     }
 
 
-def staged_fallback_groups(console: "Path", screen_topk: "int" = 2) -> "int":
+def staged_fallback_groups(console: "str", screen_topk: "int" = 2) -> "int":
     """Count groups with logged fallback or returned pairs outside the shortlist."""
     groups = {
         (int(block_m), accumulation.replace("-", "_"))
