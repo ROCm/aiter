@@ -1,0 +1,98 @@
+[
+  {
+    "task": "small-staged-task",
+    "pid": 363885,
+    "commit": "09c9b5ef27aaf322435308166f0b0dd0c5bbd1f4",
+    "process_start_utc": "2026-10-10T14:42:14.475305+00:00",
+    "process_exit_utc": "2026-10-10T14:44:16.331683+00:00",
+    "process_wall_seconds": 121.856378,
+    "exit_code": 0,
+    "idle_samples": 3,
+    "runtime_device": {
+      "utc": "2026-10-10T14:42:15.348331+00:00",
+      "pid": 363885,
+      "logical_gpu": 0,
+      "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+      "monitor_gpu": 7,
+      "pci": "0000:f5:00.0",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "name": "AMD Instinct MI355X",
+      "total_memory": 309220868096,
+      "torch": "2.8.0+rocm7.1.0.git7a520360",
+      "hip": "7.1.25424-4179531dcd"
+    }
+  },
+  {
+    "task": "small-production-task",
+    "pid": 378862,
+    "commit": "85dcad12cb1243b573c4729a0d897cd6924f468d",
+    "process_start_utc": "2026-10-10T14:45:22.219642+00:00",
+    "process_exit_utc": "2026-10-10T14:45:28.214285+00:00",
+    "process_wall_seconds": 5.994643,
+    "exit_code": 0,
+    "idle_samples": 3,
+    "runtime_device": {
+      "utc": "2026-10-10T14:45:23.098015+00:00",
+      "pid": 378862,
+      "logical_gpu": 0,
+      "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+      "monitor_gpu": 7,
+      "pci": "0000:f5:00.0",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "name": "AMD Instinct MI355X",
+      "total_memory": 309220868096,
+      "torch": "2.8.0+rocm7.1.0.git7a520360",
+      "hip": "7.1.25424-4179531dcd"
+    }
+  },
+  {
+    "task": "small-aot-task",
+    "pid": 379947,
+    "commit": "85dcad12cb1243b573c4729a0d897cd6924f468d",
+    "process_start_utc": "2026-10-10T14:46:07.460196+00:00",
+    "process_exit_utc": "2026-10-10T14:46:17.501654+00:00",
+    "process_wall_seconds": 10.041458,
+    "exit_code": 0,
+    "idle_samples": 3,
+    "runtime_device": {
+      "utc": "2026-10-10T14:46:08.347034+00:00",
+      "pid": 379947,
+      "logical_gpu": 0,
+      "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+      "monitor_gpu": 7,
+      "pci": "0000:f5:00.0",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "name": "AMD Instinct MI355X",
+      "total_memory": 309220868096,
+      "torch": "2.8.0+rocm7.1.0.git7a520360",
+      "hip": "7.1.25424-4179531dcd"
+    }
+  },
+  {
+    "task": "small-precompiled-task",
+    "pid": 381962,
+    "commit": "85dcad12cb1243b573c4729a0d897cd6924f468d",
+    "process_start_utc": "2026-10-10T14:46:51.617055+00:00",
+    "process_exit_utc": "2026-10-10T14:46:58.034310+00:00",
+    "process_wall_seconds": 6.417255,
+    "exit_code": 0,
+    "idle_samples": 6,
+    "runtime_device": {
+      "utc": "2026-10-10T14:46:52.587842+00:00",
+      "pid": 381962,
+      "logical_gpu": 0,
+      "physical_uuid_selector": "GPU-5d8a72a332aa124c",
+      "monitor_gpu": 7,
+      "pci": "0000:f5:00.0",
+      "gfx": "gfx950",
+      "cu_num": 256,
+      "name": "AMD Instinct MI355X",
+      "total_memory": 309220868096,
+      "torch": "2.8.0+rocm7.1.0.git7a520360",
+      "hip": "7.1.25424-4179531dcd"
+    }
+  }
+]
