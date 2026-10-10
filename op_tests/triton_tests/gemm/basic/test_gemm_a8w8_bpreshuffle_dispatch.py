@@ -50,7 +50,7 @@ def test_bpreshuffle_keeps_existing_bias_contract(monkeypatch):
 def test_shuffle_address_mapping():
     # Exact bytes, independent of GPU arithmetic and FP8 tolerances. Include
     # multiple N tiles and K tiles so a wrong permutation cannot pass by chance.
-    from aiter.ops.shuffle import shuffle_weight
+    from aiter.ops.triton.utils.shuffle import shuffle_weight
 
     n, k = 48, 160
     torch.manual_seed(17)

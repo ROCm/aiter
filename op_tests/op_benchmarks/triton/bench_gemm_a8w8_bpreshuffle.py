@@ -10,9 +10,9 @@ import torch
 import triton.testing
 
 from aiter.ops.gemm_op_a8w8 import gemm_a8w8_bpreshuffle
-from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.shuffle import shuffle_weight
 
 
 def main():
