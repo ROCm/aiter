@@ -3,13 +3,17 @@
 
 """MXFP4 paged MQA logits (OPUS) -- correctness and perf, through the arch dispatcher.
 
-Tables: corner cases, causal prefill, CSA prefill (fresh, and chunked at PR #5332's shapes),
-and MTP decode -- as markdown and as one-line JSON records for a benchmark driver. Every launch
-goes through ``aiter.ops.opus.pa_mqa_logits_mxfp4``. Inputs use the natural (3-D) layouts on
-gfx1250 and the MFMA-permuted (4-D) ones on gfx950; the reference always reads natural E8M0.
+Tables (``--modes``): corner cases, causal prefill, CSA prefill (fresh and chunked) and MTP
+decode -- as markdown and as one-line JSON records for a benchmark driver. Every perf row runs
+each kernel instance this arch compiled as a candidate (``<instance> us/TFLOPS/TB/s/err``).
+Every launch goes through ``aiter.ops.opus.pa_mqa_logits_mxfp4``. Inputs use the natural (3-D)
+layouts on gfx1250 and the MFMA-permuted (4-D) ones on gfx950; the reference always reads
+natural E8M0. Each table sweeps ``itertools.product`` of its own list arguments.
 
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py             # the full default sweep
-    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py -b 1 2      # a quick subset
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes causal chunked -b 1 2 -c 25000
+    python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py --modes decode \\
+        --mtp 1 4 --decode-batch 32 128 --long-frac 1 0.875       # MTP decode, two raggednesses
     python3 op_tests/test_pa_mqa_logits_mxfp4_opus.py \\
         --data-init constant uniform --scale-init constant auto   # two paired init regimes
 
@@ -44,7 +48,6 @@ from aiter.benchmark_reporting import print_json_table
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus._arch import GFX950, _device_arch
 from aiter.ops.opus.pa_mqa_logits_mxfp4 import (
-    _default_variant,
     _launch,
     pa_mqa_logits_mxfp4,
     pa_mqa_logits_mxfp4_block_table_width,
@@ -75,7 +78,6 @@ SCALE_BYTES = 4  # K_TILES * n_tiles per lane dword
 CSA_RATIO = 4  # ATOM's compression ratio: row n sees floor((pos + 1) / 4)
 
 # Decode windows are COMPRESSED column counts: 25000 at ratio 4 is ~100k raw tokens.
-DECODE_SEQS = 32
 DECODE_WIN_LONG = 25000
 DECODE_WIN_SHORT = 100
 
@@ -84,6 +86,7 @@ DECODE_WIN_SHORT = 100
 TILE_EDGE_ENDS = (1, 63, 64, 65, 127, 128, 129, 191, 255, 256, 257, 383, 384, 385)
 PREFILL_TOTAL_QLEN = 16384
 PREFILL_QMIN = 800
+MODES = ["corner", "causal", "fresh", "chunked", "decode"]
 N_COS_SAMPLE = 8
 
 # Pinned, not a flag: readings at different iteration counts are not comparable.
@@ -399,14 +402,6 @@ def _variants():
 def _qpb_max():
     """The widest compiled ``Q_PER_BLOCK`` (the row replication factor of ``_g4``)."""
     return max((v.q_per_block for v in _variants()), default=4)
-
-
-def _resolve_variant(name):
-    """``name`` if this arch compiled it, else ``None`` (the op default), so one decode shape
-    list drives both targets."""
-    if name is None:
-        return None
-    return name if name in {v.name for v in _variants()} else None
 
 
 def assert_qshare_windows(cu_tiles, num_tiles, local_starts, local_ends, q_per_block):
@@ -939,22 +934,6 @@ def gen_prefill_qlens(bs, total=PREFILL_TOTAL_QLEN, qmin=PREFILL_QMIN, seed=0):
     return parts
 
 
-def tail_causal_windows(qlens, ctxs):
-    """MTP tail-causal windows in packed (b, n) order: row n of batch b sees
-    ``[0, ctx[b] - (qlen[b] - 1 - n))``; plain causal when ``qlen == ctx``."""
-    rb, ls, le = [], [], []
-    for b, (q, c) in enumerate(zip(qlens, ctxs)):
-        for n in range(q):
-            rb.append(b)
-            ls.append(0)
-            le.append(max(c - (q - 1 - n), 0))
-
-    def t(v):
-        return torch.tensor(v, dtype=torch.int32, device=dev)
-
-    return t(rb), t(ls), t(le)
-
-
 def score(fn, inp, rb, ls, le, total_q, n_logits, seed):
     """Time the launch, then score it. Scoring runs after timing and frees its temporaries:
     the reference's ~1 GB of allocator churn would otherwise skew the next timing."""
@@ -973,53 +952,50 @@ def score(fn, inp, rb, ls, le, total_q, n_logits, seed):
     return ret
 
 
-@benchmark()
-def test_prefill_causal(bs, data_init, scale_init, seed):
-    """Causal prefill: 16384 rows split across ``bs`` batches, ctx == qlen. The split is seeded
-    by ``bs`` so ``--seed`` moves only the data."""
-    qlens = gen_prefill_qlens(bs, seed=bs)
-    total_q = sum(qlens)
-    inp = build_inputs(bs, max(qlens), total_q, seed, data_init, scale_init)
-    cu = torch.tensor(
-        [0] + list(itertools.accumulate(qlens)), dtype=torch.int32, device=dev
-    )
-    rb, ls, le = tail_causal_windows(qlens, qlens)
-    # The plan is per forward, so it is built outside the timed region.
-    plan = pa_mqa_logits_mxfp4_plan(
-        cu, le, total_q=total_q, local_starts=ls, row_to_batch=rb
-    )
-    out = torch.full(
-        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-    )
+def run_candidates(inp, cu, rb, ls, le, batch, n_logits, seed, local_starts=True):
+    """The candidate loop: time and score every kernel instance this arch compiled on one shape.
 
-    # Bound as defaults, not closed over, to avoid late binding across shapes.
-    def ours(inp=inp, plan=plan, out=out):
-        return pa_mqa_logits_mxfp4(
-            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, plan, inp.max_seq_len,
-            weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
-        )  # fmt: skip
+    Inputs are shared; each instance gets its own buffers, plan and ``-inf``-filled ``out``, all
+    built outside the timed region (the plan is per forward, the kernel per layer). Columns are
+    ``<instance> tiles/ctas/us/TFLOPS/TB/s/err``. ``local_starts=False`` passes None, as ATOM's
+    decode call does.
+    """
+    total_q = int(le.numel())
+    ret = {}
+    for v in _variants():
+        buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, batch, variant=v)
+        plan = pa_mqa_logits_mxfp4_plan(
+            cu,
+            le,
+            buffers=buffers,
+            total_q=total_q,
+            local_starts=ls if local_starts else None,
+            row_to_batch=rb,
+        )
+        out = torch.full(
+            (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
+        )
 
-    n_logits = int((le - ls).clamp(min=0).sum().item())
-    ret = {
-        "gfx": get_gfx(),
-        # The op's own default instance (no `variant` passed).
-        "variant": plan.variant.name,
-        "total_q": total_q,
-        "tiles": plan.num_tiles,
-        "ctas": plan.num_ctas,
-        "max_win": int(le.max()),
-        "n_logits": n_logits,
-    }
-    ret.update(score(ours, inp, rb, ls, le, total_q, n_logits, seed=seed))
-    del inp, out
-    torch.cuda.empty_cache()
+        # Bound as defaults, not closed over, to avoid late binding across instances.
+        def ours(inp=inp, plan=plan, out=out):
+            return pa_mqa_logits_mxfp4(
+                inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
+                inp.weights, plan, inp.max_seq_len,
+                weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
+            )  # fmt: skip
+
+        ret[f"{v.name} tiles"] = plan.num_tiles
+        ret[f"{v.name} ctas"] = plan.num_ctas
+        for k, val in score(ours, inp, rb, ls, le, total_q, n_logits, seed).items():
+            ret[f"{v.name} {k}"] = val
+        del ours, plan, out, buffers
+        torch.cuda.empty_cache()
     return ret
 
 
-def run_windowed_case(per_batch, data_init, scale_init, seed, variant=None):
-    """Launch and score one prefill case from explicit per-row ``(start, end)`` windows, on the
-    op's default instance or on ``variant``. Shared by the two CSA regimes."""
+def run_windowed_case(per_batch, data_init, scale_init, seed):
+    """Run every instance on one prefill shape given as explicit per-row ``(start, end)``
+    windows. Shared by the three prefill tables."""
     bs = len(per_batch)
     qlens = [len(w) for w in per_batch]
     total_q = sum(qlens)
@@ -1033,118 +1009,91 @@ def run_windowed_case(per_batch, data_init, scale_init, seed, variant=None):
     ls = t([s for w in per_batch for (s, _) in w])
     le = t([e for w in per_batch for (_, e) in w])
     cu = t([0] + list(itertools.accumulate(qlens)))
-    # Built outside the timed region, as in `test_prefill_causal`.
-    buffers = (
-        None
-        if variant is None
-        else pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, bs, variant=variant)
-    )
-    plan = pa_mqa_logits_mxfp4_plan(
-        cu, le, buffers=buffers, total_q=total_q, local_starts=ls, row_to_batch=rb
-    )
-    out = torch.full(
-        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-    )
-
-    def ours(inp=inp, plan=plan, out=out):
-        return pa_mqa_logits_mxfp4(
-            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, plan, inp.max_seq_len,
-            weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
-        )  # fmt: skip
-
     n_logits = int((le - ls).clamp(min=0).sum().item())
     ret = {
         "gfx": get_gfx(),
-        "variant": plan.variant.name,
-        "total_q": total_q,
-        "tiles": plan.num_tiles,
-        "ctas": plan.num_ctas,
+        "rows": total_q,
         "min_win": int((le - ls).min()),
         "max_win": int(le.max()),
         "max_seq_len": inp.max_seq_len,
         "n_logits": n_logits,
     }
-    ret.update(score(ours, inp, rb, ls, le, total_q, n_logits, seed=seed))
-    del inp, out
+    ret.update(run_candidates(inp, cu, rb, ls, le, bs, n_logits, seed))
+    del inp
     torch.cuda.empty_cache()
     return ret
 
 
 @benchmark()
-def test_prefill_fresh(bs, qlen, data_init, scale_init, seed):
-    """Fresh CSA prefill: ``bs`` empty sequences of ``qlen`` rows, row n sees
-    ``(n + 1) // CSA_RATIO``."""
+def test_prefill_causal(batch, total_q, data_init, scale_init, seed):
+    """Causal prefill: ``total_q`` rows split raggedly across ``batch`` sequences, ctx == qlen.
+    The split is seeded by ``batch`` so ``--seed`` moves only the data."""
+    qlens = gen_prefill_qlens(batch, total=total_q, seed=batch)
     return run_windowed_case(
-        [_csa_fresh(qlen) for _ in range(bs)], data_init, scale_init, seed
+        [[(0, n + 1) for n in range(q)] for q in qlens], data_init, scale_init, seed
     )
 
 
 @benchmark()
-def test_prefill_chunked(bs, kvlen, variant, data_init, scale_init, seed):
-    """Chunked CSA prefill at PR #5332's shapes: ``PREFILL_TOTAL_QLEN`` rows split raggedly by
-    ``gen_prefill_qlens``, each chunk the tail of ``kvlen`` compressed rows, so row n sees
-    ``kvlen - (qlen - 1 - n) // CSA_RATIO``. ``variant`` None means the op default.
-    """
+def test_prefill_fresh(batch, total_q, data_init, scale_init, seed):
+    """Fresh CSA prefill: ``batch`` empty sequences of ``total_q // batch`` rows, row n sees
+    ``(n + 1) // CSA_RATIO``."""
     return run_windowed_case(
-        [_csa_chunked(q, kvlen) for q in gen_prefill_qlens(bs, seed=bs)],
+        [_csa_fresh(total_q // batch) for _ in range(batch)],
         data_init,
         scale_init,
         seed,
-        variant,
     )
 
 
 @benchmark()
-def test_decode(mtp, seqs, n_long, variant, data_init, scale_init, seed):
-    """MTP decode: ``seqs`` sequences of ``mtp`` rows, ``n_long`` with the long window, on
-    ``variant`` (None = op default). Tile count is fixed per ``(mtp, seqs)``, so the ragged
-    shapes isolate load balance. Every row takes its sequence's whole window.
+def test_prefill_chunked(batch, total_q, ctx, data_init, scale_init, seed):
+    """Chunked CSA prefill: ``total_q`` rows split raggedly by ``gen_prefill_qlens``, each chunk
+    the tail of ``ctx`` compressed rows, so row n sees ``ctx - (qlen - 1 - n) // CSA_RATIO``.
+    ``total_q = 16384, ctx = 25000`` at ``batch`` 1/2/4 are PR #5332's shapes.
     """
-    variant = _resolve_variant(variant)  # the arch default if not compiled here
-    n_short = seqs - n_long
-    ctxs = [DECODE_WIN_LONG] * n_long + [DECODE_WIN_SHORT] * n_short
-    qlens = [mtp] * seqs
-    total_q = seqs * mtp
-    inp = build_inputs(seqs, max(ctxs), total_q, seed, data_init, scale_init)
+    return run_windowed_case(
+        [
+            _csa_chunked(q, ctx)
+            for q in gen_prefill_qlens(batch, total=total_q, seed=batch)
+        ],
+        data_init,
+        scale_init,
+        seed,
+    )
+
+
+@benchmark()
+def test_decode(mtp, batch, ctx, long_frac, data_init, scale_init, seed):
+    """MTP decode: ``batch`` sequences of ``mtp`` rows. ``long_frac`` of them (rounded) see
+    ``ctx`` compressed columns and the rest ``DECODE_WIN_SHORT``; the tile count is fixed per
+    ``(mtp, batch)``, so ``long_frac < 1`` isolates load balance. Every row takes its sequence's
+    whole window.
+    """
+    n_long = min(max(round(long_frac * batch), 0), batch)
+    ctxs = [ctx] * n_long + [DECODE_WIN_SHORT] * (batch - n_long)
+    total_q = batch * mtp
+    inp = build_inputs(batch, max(ctxs), total_q, seed, data_init, scale_init)
 
     def t(v):
         return torch.tensor(v, dtype=torch.int32, device=dev)
 
-    rb = t([b for b in range(seqs) for _ in range(mtp)])
+    rb = t([b for b in range(batch) for _ in range(mtp)])
     ls = torch.zeros(total_q, dtype=torch.int32, device=dev)
-    le = t([ctxs[b] for b in range(seqs) for _ in range(mtp)])
-    cu = t([0] + list(itertools.accumulate(qlens)))
-    # `local_starts` stays None, as in ATOM's decode call.
-    buffers = pa_mqa_logits_mxfp4_plan_buffers(dev, total_q, seqs, variant=variant)
-    plan = pa_mqa_logits_mxfp4_plan(
-        cu, le, buffers=buffers, total_q=total_q, row_to_batch=rb
-    )
-    out = torch.full(
-        (total_q, inp.max_seq_len), float("-inf"), dtype=torch.float32, device=dev
-    )
-
-    def ours(inp=inp, plan=plan, out=out):
-        return pa_mqa_logits_mxfp4(
-            inp.q_packed, inp.q_scale, inp.kv_cache, inp.kv_scale, inp.block_tables,
-            inp.weights, plan, inp.max_seq_len,
-            weight_scale=WEIGHT_SCALE, kv_block_size=KV_BLOCK_SIZE, out=out,
-        )  # fmt: skip
-
+    le = t([ctxs[b] for b in range(batch) for _ in range(mtp)])
+    cu = t([0] + list(itertools.accumulate([mtp] * batch)))
     n_logits = int(le.sum().item())
     ret = {
         "gfx": get_gfx(),
-        "regime": "uniform" if n_short == 0 else "ragged",
-        "n_short": n_short,
-        "variant": plan.variant.name,
+        "n_long": n_long,
         "rows": total_q,
-        "tiles": plan.num_tiles,
-        "ctas": plan.num_ctas,
         "max_win": int(le.max()),
         "n_logits": n_logits,
     }
-    ret.update(score(ours, inp, rb, ls, le, total_q, n_logits, seed=seed))
-    del inp, out
+    ret.update(
+        run_candidates(inp, cu, rb, ls, le, batch, n_logits, seed, local_starts=False)
+    )
+    del inp
     torch.cuda.empty_cache()
     return ret
 
@@ -1185,12 +1134,36 @@ def main():
         description="config input of test",
     )
     parser.add_argument(
-        "-b", "--batch", type=int, nargs="*", default=[1, 2, 4, 8, 16],
-        help="causal prefill batch sizes; total_q is fixed at 16384 and split across them",
+        "--modes", nargs="*", choices=MODES, default=MODES,
+        help="which tables to run; `corner` is the correctness sweep (corner cases and\n"
+             "the NaN-scale probe), the rest are perf",
     )  # fmt: skip
     parser.add_argument(
-        "--no-verify", action="store_true", help="skip the correctness sweep, perf only"
-    )
+        "-b", "--batch", type=int, nargs="*", default=[1, 2, 4, 8, 16],
+        help="prefill sequences (causal, fresh, chunked); --total-q rows are split across them",
+    )  # fmt: skip
+    parser.add_argument(
+        "-q", "--total-q", type=int, nargs="*", default=[PREFILL_TOTAL_QLEN],
+        help="prefill query rows",
+    )  # fmt: skip
+    parser.add_argument(
+        "-c", "--ctx", type=int, nargs="*", default=[DECODE_WIN_LONG],
+        help="compressed context columns: chunked prefill's committed KV, and the long\n"
+             "decode window",
+    )  # fmt: skip
+    parser.add_argument(
+        "--decode-batch", type=int, nargs="*", default=[1, 8, 32, 128],
+        help="decode sequences",
+    )  # fmt: skip
+    parser.add_argument(
+        "--mtp", type=int, nargs="*", default=[1, 4, 8],
+        help="decode query rows per sequence (next_n)",
+    )  # fmt: skip
+    parser.add_argument(
+        "--long-frac", type=float, nargs="*", default=[1.0],
+        help=f"fraction of decode sequences on the --ctx window; the rest see\n"
+             f"{DECODE_WIN_SHORT} columns, so < 1 is a ragged batch",
+    )  # fmt: skip
     # Not `add_data_init_args`: its --scale-init offers float dists, not E8M0_SCALE_DISTS.
     parser.add_argument(
         "--data-init", nargs="+", choices=list(DATA_DISTS), default=["norm"],
@@ -1209,9 +1182,32 @@ def main():
     )  # fmt: skip
     args = parser.parse_args()
 
-    pairs = init_pairs(args.data_init, args.scale_init)
+    modes = set(args.modes)
+    if modes & {"causal", "chunked"}:
+        for b, q in itertools.product(args.batch, args.total_q):
+            if q < b * PREFILL_QMIN:
+                parser.error(
+                    f"--total-q {q} cannot be split raggedly across --batch {b}: the "
+                    f"split needs at least {PREFILL_QMIN} rows per sequence"
+                )
+    if "fresh" in modes:
+        for b, q in itertools.product(args.batch, args.total_q):
+            if q % b:
+                parser.error(
+                    f"fresh prefill splits --total-q evenly: {q} is not a multiple of "
+                    f"--batch {b}"
+                )
+    if "decode" in modes and any(not 0 <= f <= 1 for f in args.long_frac):
+        parser.error("--long-frac values must be in [0, 1]")
+    if any(
+        v < 1
+        for v in args.batch + args.total_q + args.ctx + args.decode_batch + args.mtp
+    ):
+        parser.error("--batch, --total-q, --ctx, --decode-batch and --mtp must be >= 1")
 
-    corner, not_judged, ok = [], [], True
+    pairs = init_pairs(args.data_init, args.scale_init)
+    ok = True
+
     for data_init, scale_init in pairs:
         distinct, disagree = scale_spread(scale_init)
         aiter.logger.info(
@@ -1220,94 +1216,73 @@ def main():
             distinct,
             100.0 * disagree,
         )
-        if args.no_verify:
-            continue
-        blind = correctness_blindness(data_init, scale_init)
-        if blind is not None:
-            # Own table: a skip row would NaN-fill and turn the bool columns into floats.
-            not_judged.append(
-                {
-                    "data_init": data_init,
-                    "scale_init": scale_init,
-                    "seed": args.seed,
-                    "err_msg": blind,
-                }
-            )
-            continue
-        rows = run_corner(data_init, scale_init, args.seed)
-        ok = all(r["pass"] for r in rows) and ok
-        corner += rows
-    if not_judged:
-        summarize("pa_mqa_logits_mxfp4 corner (not judged)", not_judged)
-    if corner:
-        summarize("pa_mqa_logits_mxfp4 corner", corner)
 
-    # NaN E8M0 propagation, on its own data, independent of the init pairs.
-    if not args.no_verify:
+    if "corner" in modes:
+        corner, not_judged = [], []
+        for data_init, scale_init in pairs:
+            blind = correctness_blindness(data_init, scale_init)
+            if blind is not None:
+                # Own table: a skip row would NaN-fill and turn the bool columns into floats.
+                not_judged.append(
+                    {
+                        "data_init": data_init,
+                        "scale_init": scale_init,
+                        "seed": args.seed,
+                        "err_msg": blind,
+                    }
+                )
+                continue
+            rows = run_corner(data_init, scale_init, args.seed)
+            ok = all(r["pass"] for r in rows) and ok
+            corner += rows
+        if not_judged:
+            summarize("pa_mqa_logits_mxfp4 corner (not judged)", not_judged)
+        if corner:
+            summarize("pa_mqa_logits_mxfp4 corner", corner)
+        # NaN E8M0 propagation, on its own data, independent of the init pairs.
         ok = run_nan_scale(args.seed) and ok
 
-    summarize(
-        "pa_mqa_logits_mxfp4 prefill causal",
-        [
-            test_prefill_causal(bs, data_init, scale_init, args.seed)
+    def sweep(name, fn, *axes):
+        """One table: ``fn`` over the init pairs crossed with ``itertools.product(*axes)``."""
+        rows = [
+            fn(*shape, data_init, scale_init, args.seed)
             for data_init, scale_init in pairs
-            for bs in args.batch
-        ],
-    )
+            for shape in itertools.product(*axes)
+        ]
+        if rows:
+            summarize(name, rows)
 
-    fresh_shapes = [(1, 16384), (2, 8192), (4, 4096)]
-    summarize(
-        f"pa_mqa_logits_mxfp4 prefill fresh (csa ratio {CSA_RATIO})",
-        [
-            test_prefill_fresh(bs, qlen, data_init, scale_init, args.seed)
-            for data_init, scale_init in pairs
-            for bs, qlen in fresh_shapes
-        ],
-    )
-
-    # PR #5332's chunked shapes, on the default and every other compiled instance (gfx950's
-    # `qlen1_kv256` is aimed at these long windows).
-    chunked_shapes = [(1, 25000), (2, 25000), (4, 25000)]
-    default = _default_variant(_device_arch(torch.cuda.current_device()))
-    chunked_variants = [None] + [v.name for v in _variants() if v.name != default]
-    summarize(
-        f"pa_mqa_logits_mxfp4 prefill chunked (csa ratio {CSA_RATIO}, #5332 shapes)",
-        [
-            test_prefill_chunked(bs, kvlen, v, data_init, scale_init, args.seed)
-            for data_init, scale_init in pairs
-            for v in chunked_variants
-            for bs, kvlen in chunked_shapes
-        ],
-    )
-
-    # (mtp, seqs, n_long, variant). MTP = 1 carries the batch sweep: there `seqs` is the tile
-    # count. Ragged rows hold the tile count and move only the long fraction. mtp = 1 names the
-    # one-row instance explicitly; the op default (four-row on gfx1250) would idle 3 of 4 waves.
-    decode_shapes = [
-        (1, 1, 1, "qlen1_kv64"),
-        (1, 8, 8, "qlen1_kv64"),
-        (1, DECODE_SEQS, DECODE_SEQS, "qlen1_kv64"),
-        (1, 128, 128, "qlen1_kv64"),
-        (1, DECODE_SEQS, 4, "qlen1_kv64"),
-        (1, 128, 16, "qlen1_kv64"),
-        # gfx950-only instance; gfx1250 falls back to its default (`_resolve_variant`).
-        (1, DECODE_SEQS, DECODE_SEQS, "qlen1_kv256"),
-        (1, 128, 16, "qlen1_kv256"),
-        (4, DECODE_SEQS, DECODE_SEQS, None),
-        (8, DECODE_SEQS, DECODE_SEQS, None),
-        (4, DECODE_SEQS, 16, None),
-        (4, DECODE_SEQS, 4, None),
-        (4, DECODE_SEQS, 28, None),
-    ]
-    summarize(
-        f"pa_mqa_logits_mxfp4 decode "
-        f"(win {DECODE_WIN_LONG}/{DECODE_WIN_SHORT} compressed cols)",
-        [
-            test_decode(mtp, seqs, n_long, variant, data_init, scale_init, args.seed)
-            for data_init, scale_init in pairs
-            for mtp, seqs, n_long, variant in decode_shapes
-        ],
-    )
+    if "causal" in modes:
+        sweep(
+            "pa_mqa_logits_mxfp4 prefill causal",
+            test_prefill_causal,
+            args.batch,
+            args.total_q,
+        )
+    if "fresh" in modes:
+        sweep(
+            f"pa_mqa_logits_mxfp4 prefill fresh (csa ratio {CSA_RATIO})",
+            test_prefill_fresh,
+            args.batch,
+            args.total_q,
+        )
+    if "chunked" in modes:
+        sweep(
+            f"pa_mqa_logits_mxfp4 prefill chunked (csa ratio {CSA_RATIO})",
+            test_prefill_chunked,
+            args.batch,
+            args.total_q,
+            args.ctx,
+        )
+    if "decode" in modes:
+        sweep(
+            f"pa_mqa_logits_mxfp4 decode (short window {DECODE_WIN_SHORT} compressed cols)",
+            test_decode,
+            args.mtp,
+            args.decode_batch,
+            args.ctx,
+            args.long_frac,
+        )
 
     raise SystemExit(0 if ok else 1)
 
