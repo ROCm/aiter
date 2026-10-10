@@ -44,14 +44,25 @@ _I32_MAX = 2**31
 
 #: Workgroups the 256-wide tile's grid needs before it beats the 128-wide one.
 #:
-#: The narrow tile exists to double the grid when the wide one is launch
-#: starved, so what decides between them is the wide grid's *size*, not M --
-#: and the grid is ``ceildiv(M, BLOCK_M) * (N / BLOCK_N)``, which depends on N
-#: as much as on M. Gating on M alone is only ever right for the N it was
-#: fitted to: mori measured a bare ``M < 2048`` costing 48% at M=1280 on one
-#: shape, because two shapes turn over at different M (between 1024 and 1280 on
-#: one, between 1536 and 1792 on the other) and land at 128->160 and 120->140
-#: wide-grid workgroups.
+#: The narrow tile exists to widen a launch-starved grid, so what decides
+#: between them is the wide grid's *size*, not M -- and the grid is
+#: ``ceildiv(M, BLOCK_M) * (N / BLOCK_N)``, which depends on N as much as on M.
+#: Gating on M alone is only ever right for the N it was fitted to.
+#:
+#: Both tiles timed at each M on MI355X, us, min of 3 medians:
+#:
+#:     N=5120 K=2048            N=8192 K=1280
+#:     grid  BN=128  BN=256     grid  BN=128  BN=256
+#:      60    31.4    37.8       64    28.4    30.6
+#:      80    33.5    38.8       96    30.0    32.1
+#:     100    37.0    41.0      128    32.0    33.8
+#:     120    39.4    41.7      160    44.2    33.2  <- turns over
+#:     140    58.4    42.2      192    46.3    35.6
+#:     160    56.8    41.2      256    47.2    36.8
+#:
+#: The narrow tile's cost is a step, not a slope, and the two shapes step in
+#: (120, 140] and (128, 160]. 140 is in both gaps; it picks the faster tile at
+#: all 13 points measured.
 WIDE_TILE_MIN_GRID = 140
 #: What the narrow tile costs to get: its store cannot use the permlane lane
 #: transpose, which needs exactly two N-tiles.
