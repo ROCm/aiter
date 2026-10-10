@@ -5,13 +5,16 @@ import argparse
 import os
 
 import pandas as pd
+import pytest
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.core import get_asm_dir
 from aiter.ops.gemm_op_a6w6 import (
+    _select_gemm_a6w6_kernel,
     dequant_mxfp6_torch,
+    gemm_a6w6_asm,
     quant_mxfp6_gemm,
     quant_mxfp6_torch,
 )
@@ -23,6 +26,25 @@ SCALE_GROUP_SIZE = 32
 pd.set_option("display.max_columns", 30)
 pd.set_option("display.width", 1000)
 pd.set_option("display.max_colwidth", 30)
+
+SPECIALIZED_CASES = (
+    (
+        (9450, 5120, 5120),
+        "aiter_a6w6_m9472_n5120_k5120_m82",
+        "f6gemm_dmabig_kernel_func",
+    ),
+    (
+        (9450, 13824, 5120),
+        "aiter_a6w6_m9472_n13824_k5120_m82",
+        "f6gemm_dmabig_kernel_func",
+    ),
+    (
+        (9450, 5120, 13824),
+        "aiter_a6w6_m9472_n5120_k13824_m82",
+        "f6gemm_dmabig_allk_kernel_func",
+    ),
+)
+SPECIALIZED_SQUARE_KERNEL = SPECIALIZED_CASES[0][1]
 
 
 @perftest(num_iters=5)
@@ -79,17 +101,84 @@ def test_gemm(dtype, M, N, K, kernel_name=None):
     return ret
 
 
+test_gemm.__test__ = False
+
+
 def _manifest_kernel_names(M, N, K):
     manifest = os.path.join(get_asm_dir(), "f6gemm", "f6gemm_bf16_per1x32Fp6.csv")
     configs = pd.read_csv(manifest)
     padM = (M + 255) // 256 * 256
     padN = (N + 255) // 256 * 256
     padK = (K + 127) // 128 * 128
-    compatible = (configs["swizzle_max_K"] <= 0) | (
+    exact_compatible = (configs["exact_K"] <= 0) | (
+        (padM == configs["exact_M"])
+        & (padN == configs["exact_N"])
+        & (padK == configs["exact_K"])
+    )
+    swizzle_compatible = (configs["swizzle_max_K"] <= 0) | (
         (padK > configs["swizzle_max_K"])
         | ((padM <= configs["swizzle_max_M"]) & (padN <= configs["swizzle_max_N"]))
     )
+    compatible = exact_compatible & swizzle_compatible
     return configs.loc[compatible, "knl_name"].astype(str).tolist()
+
+
+@pytest.mark.parametrize(
+    "shape,specialized_kernel,safe_kernel",
+    SPECIALIZED_CASES,
+    ids=("square", "ffn_up", "ffn_down"),
+)
+@torch.no_grad()
+def test_specialized_dispatch_matches_safe_kernel(
+    shape, specialized_kernel, safe_kernel
+):
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 assembly requires gfx950")
+    M, N, K = shape
+    padM = (M + 255) // 256 * 256
+    padN = (N + 255) // 256 * 256
+    torch.manual_seed(M + N + K)
+    x = torch.randn((M, K), dtype=torch.bfloat16)
+    w = torch.randn((N, K), dtype=torch.bfloat16)
+    A, A_scale = quant_mxfp6_gemm(x)
+    B, B_scale = quant_mxfp6_gemm(w)
+    baseline = torch.empty((padM, padN), dtype=torch.bfloat16)
+    actual = torch.empty_like(baseline)
+    selected = _select_gemm_a6w6_kernel(M, N, K, None)
+    assert selected == specialized_kernel
+    gemm_a6w6_asm(A, B, A_scale, B_scale, baseline, K, safe_kernel)
+    gemm_a6w6_asm(A, B, A_scale, B_scale, actual, K, selected)
+    assert torch.equal(actual[:M, :N], baseline[:M, :N])
+
+
+def test_manifest_excludes_shape_guarded_kernels_from_incompatible_sweeps():
+    small = _manifest_kernel_names(257, 513, 129)
+    assert not any("a6w6_m9472_" in name for name in small)
+    square = _manifest_kernel_names(9450, 5120, 5120)
+    assert SPECIALIZED_SQUARE_KERNEL in square
+    assert "aiter_a6w6_m9472_n13824_k5120_m82" not in square
+    assert "aiter_a6w6_m9472_n5120_k13824_m82" not in square
+
+
+@torch.no_grad()
+def test_specialized_kernel_rejects_incompatible_physical_shape():
+    from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
+
+    if get_gfx() != "gfx950":
+        pytest.skip("A6W6 assembly requires gfx950")
+    M, N, K = 257, 513, 129
+    padM = (M + 255) // 256 * 256
+    padN = (N + 255) // 256 * 256
+    padK = (K + 127) // 128 * 128
+    x = torch.randn((M, K), dtype=torch.bfloat16)
+    w = torch.randn((N, K), dtype=torch.bfloat16)
+    A, A_scale = quant_mxfp6_gemm(x)
+    B, B_scale = quant_mxfp6_gemm(w)
+    out = torch.empty((padM, padN), dtype=torch.bfloat16)
+    with pytest.raises(RuntimeError, match="requested physical shape"):
+        gemm_a6w6_asm(A, B, A_scale, B_scale, out, padK, SPECIALIZED_SQUARE_KERNEL)
 
 
 def main():
@@ -119,6 +208,7 @@ def main():
             (8192, 8192, 8192),
             (16384, 16384, 16384),
             # transformer shapes
+            (9450, 5120, 5120),
             (9450, 13824, 5120),
             (9450, 5120, 13824),
             # Exercise row, column, and contraction-dimension padding together.

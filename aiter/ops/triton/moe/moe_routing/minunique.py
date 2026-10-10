@@ -135,7 +135,9 @@ def _minunique_common(
         num_warps=1,
     )
     expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
-    routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, k, expt_data)
+    routing_data = RoutingData(
+        block_m, gate_scal, hist, n_expts_tot, k, expt_data, topk_ids=expt_indx2
+    )
     return routing_data, topk_indx, gate_indx
 
 

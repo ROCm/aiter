@@ -1,0 +1,21 @@
+# Branches the archiver never touches. One per line: an exact name, or "re:"
+# plus a regex searched in the name (anchor with ^ and $ for a whole name).
+# Protected branches and open-PR head/base branches are exempt without listing.
+# A line added after a branch was archived spares the archive; restoring it is
+#     git push origin archive/<date>/<name>:<name>
+# Say what breaks if the branch moves.
+
+# Default branch, and the name it goes by in older clones and forks.
+main
+master
+
+# The published documentation site. Deleting it takes the docs offline.
+gh-pages
+
+# Long-lived integration branch; several teams cut from it.
+stable
+
+# Release branches. 16 of these were already past 30 days on 2026-09-15, and
+# being untouched for a year is what a shipped release looks like.
+re:^release/.*$
+re:^v[0-9].*$

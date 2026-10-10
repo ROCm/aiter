@@ -25,6 +25,9 @@ SHAPES = [
     (384, 7168, 768, 6),  # dsv4_tp4
     (384, 7168, 512, 6),  # dsv4_tp6 (and dsv4_tp8: INTER 384->512 padded)
     (384, 5120, 768, 6),  # dsv4.1 TP=4 (INTER 576->640, support key pads to 768)
+    (128, 5120, 768, 3),  # dsv4.1 DSpark draft TP=4 (INTER 576->640)
+    (128, 5120, 1280, 3),  # dsv4.1 DSpark TP=2 (INTER 1152 pads to 1280)
+    (384, 5120, 1280, 6),  # dsv4.1 target TP=2 (INTER 1152 pads to 1280)
     (96, 5120, 2304, 6),  # dsv4.1 EP=4, TP=1
     (32, 5120, 2304, 2),  # dsv4.1 DSpark EP
     (32, 5120, 2304, 3),  # dsv4.1 DSpark EP
@@ -44,6 +47,7 @@ SHAPES = [
     (128, 3072, 3072, 4),  # GPT-OSS TP=1
     (129, 6144, 512, 5),  # MiniMax-M3 (INTER 384 pads to 512)
     (129, 6144, 768, 5),  # MiniMax-M3
+    (129, 6144, 1536, 5),  # MiniMax-M3 TP=2
     (256, 3072, 256, 8),  # MiniMax-M2.5 TP=6
     (256, 3072, 512, 8),  # MiniMax-M2.5 (INTER 384 pads to 512)
     (256, 7168, 256, 8),  # DSV3/Kimi-K2 E256

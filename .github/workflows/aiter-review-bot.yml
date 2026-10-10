@@ -78,11 +78,33 @@ jobs:
             core.setOutput('ok', ok ? 'true' : 'false');
             core.notice(`commenter=${who} trigger=${trig} authorized=${allow.has(who)} -> ${ok ? 'run' : 'ignored'}`);
 
+  watchdog:
+    # The one failure the in-job notifier cannot reach. With no runner the review job stays
+    # `queued`: run_one.sh never starts, so _notify.py never runs, GitHub sends no failure mail,
+    # and the run reads as "in progress" indefinitely -- this box sat dead for days that way.
+    # This job runs on GitHub-hosted infra, so it is alive exactly when the box is not.
+    needs: gate
+    if: needs.gate.outputs.ok == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    permissions:
+      contents: read
+      actions: read           # read this run's own jobs to see whether the review ever started
+    steps:
+      - uses: actions/checkout@v4      # the watchdog script ships with the skill
+      - name: Report a review that never got a runner
+        env:
+          STUCK_MINUTES: '20'          # a healthy runner claims a job in seconds
+          PR: ${{ github.event.issue.number }}
+          GH_TOKEN: ${{ github.token }}
+          AITER_BOT_TOKEN: ${{ secrets.AITER_BOT_TOKEN }}
+          OWNER_OVERRIDE: ${{ vars.AITER_RUNNER_OWNER }}
+        run: python3 .claude/skills/review-pr/watchdog.py
   review:
     needs: gate
     if: needs.gate.outputs.ok == 'true'
     runs-on: [self-hosted, box308]        # label the runner with these at registration
-    timeout-minutes: 90     # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
+    timeout-minutes: 120    # bound a wedged review; the single runner must not be pinned for GitHub's 6h default
     env:
       PR: ${{ github.event.issue.number }}          # issue number == PR number here
       COMMENTER: ${{ github.event.comment.user.login }}

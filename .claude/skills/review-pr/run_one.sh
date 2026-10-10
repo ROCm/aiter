@@ -30,6 +30,15 @@ _on_signal() { [ -f "$STATUS" ] || printf "flow\trun_one was killed by a signal 
 trap _on_exit EXIT
 trap _on_signal TERM INT
 
+# The workflow's timeout-minutes is the real ceiling: AGENT_TIMEOUT x RETRIES x (worker+refuter)
+# can exceed it, and a run killed at the job cap dies mid-agent with no classified status. Cap the
+# retries against a deadline that sits inside it instead. Anchored here, at the start: the fetch,
+# the prompt check and the health probe all spend the same wall clock the agents do, and a budget
+# that starts counting after them can still overrun the job cap.
+: "${AITER_RUN_BUDGET:=6000}"      # 100 min, under the job's timeout-minutes of 120
+: "${AITER_AGENT_TIMEOUT:=2400}"   # 40 min per agent attempt; one default, read everywhere below
+DEADLINE=$(( $(date +%s) + AITER_RUN_BUDGET ))
+
 # GLM-5.3 is not in Claude's model catalog; disable the unknown-model window enforcement.
 # The container runs as root; declare the docker sandbox so headless tools work.
 export CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1 CLAUDE_GLM_QUIET=1 IS_SANDBOX=1 PYTHONUTF8=1
@@ -110,24 +119,52 @@ if [ -d "$W/merge-target" ]; then
 fi
 say "WORK=$W"
 
-# The GLM backend can be slow or time out on a shared box; a single request timeout must not
-# kill the whole review. Retry the agent up to AITER_REVIEW_RETRIES (default 2) with backoff,
-# requiring its output file to exist and be non-empty before counting the attempt as success.
+# The GLM backend can be slow or time out on a shared box. Give each agent AITER_AGENT_TIMEOUT
+# (default 2400s / 40min). A *timeout* is never retried -- a slow generation is slow on retry too;
+# only a transient failure (dropped connection / 5xx) is retried, up to AITER_REVIEW_RETRIES
+# (default 2) attempts, requiring a non-empty output file to count the attempt as success.
 run_agent() {  # <label> <prompt-file> <out-file> <cmd...>
   local label="$1" pf="$2" out="$3"; shift 3
-  local n=0 max="${AITER_REVIEW_RETRIES:-2}"
+  local n=0 max="${AITER_REVIEW_RETRIES:-2}" rc
   while :; do
+    # Never start an attempt that cannot finish inside the run budget. The job cap would kill it
+    # mid-flight, and a run killed there dies with no classified status at all -- worse than the
+    # timeout it would have reported. Out of budget is a timeout, so say 124 and let the caller
+    # treat it like one.
+    if [ $(( $(date +%s) + ${AITER_AGENT_TIMEOUT} )) -gt "$DEADLINE" ]; then
+      # Out of budget is reported as a timeout so the caller does not retry it, but the two have
+      # opposite fixes -- record which one happened so the page names the knob that helps.
+      AGENT_TIMEOUT_CAUSE=budget
+      say "$label: not enough run budget left to start an attempt"; return 124
+    fi
     n=$((n + 1)); rm -f "$out"
-    if (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT:-1000}" "$@" "$(cat "$pf")") && [ -s "$out" ]; then return 0; fi
-    if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error/timeout?)"; return 1; fi
-    say "$label attempt $n failed (GLM slow/timeout?); retrying in $((n * 10))s"; sleep $((n * 10))
+    (cd "$PROJ" && timeout "${AITER_AGENT_TIMEOUT}" "$@" "$(cat "$pf")"); rc=$?
+    [ "$rc" -eq 0 ] && [ -s "$out" ] && return 0
+    if [ "$rc" -eq 124 ]; then
+      AGENT_TIMEOUT_CAUSE=agent
+      say "$label hit the ${AITER_AGENT_TIMEOUT}s timeout -- not retrying a timeout"; return 124
+    fi
+    if [ "$n" -ge "$max" ]; then say "$label failed after $max attempts (GLM error?)"; return 1; fi
+    say "$label attempt $n failed (rc=$rc, transient?); retrying in $((n * 10))s"; sleep $((n * 10))
   done
 }
 
-# 2) worker (headless GLM), with retry on GLM timeout
+# Triage an agent failure. A timeout is this pipeline's own budget, not a backend fault, so it
+# routes to flow -- a review that needs longer must never page the model owner.
+agent_fail() {  # <label> <rc> <exit-code-for-a-backend-fault>
+  if [ "$2" -eq 124 ]; then
+    if [ "${AGENT_TIMEOUT_CAUSE:-}" = budget ]; then
+      fail flow 6 "the $1 never started: AITER_RUN_BUDGET=${AITER_RUN_BUDGET}s for the whole run was already spent. Raising AITER_AGENT_TIMEOUT makes this refusal fire sooner, not later -- raise the budget and the job's timeout-minutes together"
+    fi
+    fail flow 6 "the $1 did not finish within AITER_AGENT_TIMEOUT=${AITER_AGENT_TIMEOUT}s; the backend answered normally -- raise it in the runner .env"
+  fi
+  fail glm "$3" "the GLM $1 failed -- the backend errored or returned nothing"
+}
+
+# 2) worker (headless GLM), with retry on a transient GLM failure
 say "worker (GLM)..."
 bash "$SKILL/render.sh" worker "$W" > "$W/_pw.txt"
-run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || fail glm 2 "the GLM worker failed after retries -- the backend is timing out or down"
+run_agent "worker" "$W/_pw.txt" "$W/card.md" "${WORKER_CMD[@]}" || agent_fail worker $? 2
 
 # 3) refuter (headless GLM) -- Step 7.7; or the NONE line for a 0-finding card
 say "refuter..."
@@ -135,7 +172,24 @@ if grep -qiE '(NO FINDINGS|✅)' "$W/card.md" && ! grep -qE '^(🔴|⚠️|📝)
   printf 'NONE AVAILABLE -- 0 findings on the card (NO FINDINGS); nothing for an independent reader to refute\n' > "$W/independent.txt"
 else
   bash "$SKILL/render.sh" refuter "$W" "$W/card.md" > "$W/_prf.txt"
-  run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || fail glm 3 "the GLM refuter failed after retries -- the backend is timing out or down"
+  # errexit is on: a bare `run_agent ...; rc=$?` exits the script on the first non-zero return,
+  # so everything below -- the downgrade and the triage both -- would never run.
+  rc=0; run_agent "refuter" "$W/_prf.txt" "$W/independent.txt" "${REFUTER_CMD[@]}" || rc=$?
+  if [ "$rc" -eq 124 ]; then
+    # card.md is already written and the findings are real work; a refuter timeout must not throw
+    # it away. Degrade onto the gate's own "no independent reader" path, which only passes if the
+    # card admits it -- so the downgrade reaches the reader instead of hiding in the log.
+    say "refuter hit the ${AITER_AGENT_TIMEOUT}s timeout -- publishing the card unrefuted"
+    printf 'NONE AVAILABLE -- the refuter did not finish within %ss on this box\n' "${AITER_AGENT_TIMEOUT}" > "$W/independent.txt"
+    sed -i '0,/^Review (advisory):/s//Review (advisory, not independently refuted):/' "$W/card.md"
+    # That sed is anchored to one literal shape of a model-generated line. If the card bolds or
+    # indents it the edit silently does nothing, the gate finds no admission, and a known-good
+    # card is discarded -- the exact loss this branch exists to prevent. Say it unconditionally.
+    grep -q 'not independently refuted' "$W/card.md" \
+      || sed -i '1i Review (advisory, not independently refuted): the refuter did not finish' "$W/card.md"
+  elif [ "$rc" -ne 0 ]; then
+    agent_fail refuter "$rc" 3
+  fi
 fi
 
 # 3b) apply the refuter's verdicts: drop KILLED findings from the card before the gates, or the

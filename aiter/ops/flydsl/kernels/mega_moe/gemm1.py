@@ -34,7 +34,7 @@ class _LdsF32View:
 @flyc.jit
 def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
     a_scale_lds, a_lds_i32, K_ITERS, M_REPEAT, NUM_ACC_N, A_K_STEP_BYTES, pipe_weights,
-    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input):
+    mfma_amajor, async_a_copy, trb_rsrc, tib_rsrc, indirect_input, pair_k):
 # fmt: on
     N_ACC = M_REPEAT * NUM_ACC_N
     NUM_B_SCALE = NUM_ACC_N // _PACK
@@ -77,7 +77,7 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
                 a_scale_lds,
                 fx.Int32(0),
             )
-        for sp_i, state in range(0, K_ITERS - 1, 1, init=init):
+        def _kstep(sp_i, state):
             sp = fx.Int32(sp_i)
             acc = [Vec(a) for a in state[:N_ACC]]
             b_prev = [
@@ -162,7 +162,24 @@ def do_tile(m_tile, n_tile_base, expert, sched, a_gather, a_s2r, b_loader, b_sca
             if const_expr(async_a_copy):
                 yv += sb_next
                 yv += sa_next
-            state = yield yv
+            return yv
+
+        if const_expr(pair_k):
+            # Two K steps per iteration (ping-pong B registers): the rolled loop
+            # copies the prefetched B tile into loop-carried registers, which
+            # forces a vmcnt drain of the prefetch every step.
+            pairs = (K_ITERS - 1) // 2
+            for pr_i, state in range(0, pairs, 1, init=init):
+                pr = fx.Int32(pr_i)
+                mid = _kstep(pr * fx.Int32(2), state)
+                yv = _kstep(pr * fx.Int32(2) + fx.Int32(1), mid)
+                state = yield yv
+            if const_expr((K_ITERS - 1) % 2):
+                state = _kstep(fx.Int32(K_ITERS - 2), state)
+        else:
+            for sp_i, state in range(0, K_ITERS - 1, 1, init=init):
+                yv = _kstep(sp_i, state)
+                state = yield yv
         acc = [Vec(r) for r in state[:N_ACC]]
         b_prev = [
             [Vec(state[N_ACC + ni * _PACK + ks]) for ks in range(_PACK)]
@@ -273,7 +290,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     m_repeat, num_acc_n, a_k_step_bytes, total_threads, k_iters, a_lds_i32, n_tiles,
     expert_offset, b_cache_modifier, swizzle_a, pipe_weights, mfma_amajor, async_a_copy,
     use_tile_resource, indirect_input, indexed_input=False, row_map_rsrc=None,
-    source_rows=0, swiglu_limit=0.0):
+    source_rows=0, swiglu_limit=0.0, pair_k=False, evec):
     # fmt: on
     """Build the GEMM1 atoms and return its expert resolver and tile runner."""
     sched = TileScheduler(
@@ -312,7 +329,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
     epi = SiluQuantEpilogue(out_rsrc=out_rsrc, out_scale_rsrc=os_rsrc, sorted_rsrc=trb_rsrc, tokens=0,
         inter_dim=inter_dim, m_repeat=m_repeat, num_acc_n=num_acc_n, sort_block_m=sort_block_m, tile_n=tile_n,
         num_waves=num_waves, lds_out=c_tile, swiglu_limit=swiglu_limit, always_valid=True,
-        out_tensor=out_tensor if use_tile_resource else None)
+        out_tensor=out_tensor if use_tile_resource else None, evec=evec)
     # fmt: on
 
     def _decode(flat):
@@ -333,7 +350,7 @@ def build_fused_gemm1(*, x_tensor, w_rsrc, sw_rsrc, sx_rsrc,
             a_s2r, b_loader, b_scale, a_scale, mfma, epi, a_buf,
             a_scale_lds, a_lds_i32, k_iters, m_repeat, num_acc_n,
             a_k_step_bytes, pipe_weights, mfma_amajor, async_a_copy,
-            trb_rsrc, tib_rsrc, indirect_input)
+            trb_rsrc, tib_rsrc, indirect_input, pair_k)
         # fmt: on
 
     return expert_of_flat, do_scheduled_tile
@@ -421,7 +438,7 @@ def compile_gemm1(
             expert_offset=expert_offset, b_cache_modifier=b_cache_modifier, swizzle_a=swizzle_a,
             pipe_weights=pipe_weights, mfma_amajor=mfma_amajor, async_a_copy=async_a_copy,
             use_tile_resource=use_tile_resource, indirect_input=False,
-            swiglu_limit=swiglu_limit,
+            swiglu_limit=swiglu_limit, evec=8 if use_tile_resource else 2,
         )
         total_work = (num_valid // fx.Int32(sort_block_m)) * fx.Int32(n_tiles)
         for flat in range(fx.block_idx.x, total_work, grid_x):
