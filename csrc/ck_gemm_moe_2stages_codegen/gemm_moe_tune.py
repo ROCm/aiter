@@ -11,6 +11,9 @@ import tempfile
 from argparse import ArgumentTypeError
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
+from multiprocessing.connection import wait as wait_for_connections
+from multiprocessing.reduction import ForkingPickler
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -6489,6 +6492,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
         "does not write stage-ranking or full-pair profile artifacts"
     )
 
+    def _setup_specific_arguments(self):
+        super()._setup_specific_arguments()
+        for action in self.parser._actions:
+            if action.dest == "timeout":
+                action.help = (
+                    "best-effort per-operation SIGALRM timeout in seconds (default 1800); "
+                    "needs control to return to Python. No parent or shape hard deadline; "
+                    "a still-live permanent hang may wait indefinitely."
+                )
+
     @staticmethod
     def _unsupported_row_reason(row):
         for field, expected in (
@@ -6566,10 +6579,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
             ).multi_processor_count
         )
 
-    def _preflight_devices(self, mp_num, ngpu):
+    def _preflight_devices(self, mp_num, ngpu, *, staged=False):
         if ngpu < 1:
             raise ValueError("MXFP4 tuning requires a visible runtime GPU")
-        selected = [torch.cuda.current_device()] if mp_num == 1 else range(mp_num)
+        selected = (
+            [torch.cuda.current_device()]
+            if mp_num == 1 and not staged
+            else range(mp_num)
+        )
         return [self._runtime_device_identity(gpu) for gpu in selected]
 
     def _summary_shape_keys(self):
@@ -7072,6 +7089,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
         def _on_alarm(signum: int, frame: Any) -> None:
             raise _StagedOperationTimeout(f"exceeded {timeout}s timeout")
 
+        previous_timer = signal.getitimer(signal.ITIMER_REAL)
         try:
             signal.signal(signal.SIGALRM, _on_alarm)
         except ValueError:
@@ -7084,13 +7102,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
             yield
             return
         try:
-            signal.alarm(timeout)
+            signal.setitimer(signal.ITIMER_REAL, timeout)
             yield
         finally:
             try:
-                signal.alarm(0)
+                signal.setitimer(signal.ITIMER_REAL, 0)
             finally:
                 signal.signal(signal.SIGALRM, previous_handler)
+                signal.setitimer(signal.ITIMER_REAL, *previous_timer)
 
     def _screen_candidate(
         self, launch: Callable[[], float], label: str, timeout: int
@@ -7364,9 +7383,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
         mp_num = int(getattr(args, "mp", 1) or 1)
         ngpu = torch.cuda.device_count()
         mp_num = max(1, min(mp_num, ngpu, len(rows)))
-        identities = self._preflight_devices(mp_num, ngpu)
+        staged = getattr(args, "mxfp4_search_mode", "prune") == "staged"
+        identities = (
+            self._preflight_devices(mp_num, ngpu, staged=True)
+            if staged
+            else self._preflight_devices(mp_num, ngpu)
+        )
 
-        if mp_num <= 1:
+        if mp_num <= 1 and not staged:
             for row in rows:
                 row["gfx"], row["cu_num"] = identities[0]
             return [self._tune_one_shape(row, args) for row in rows]
@@ -7380,7 +7404,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
         )
         ctx = _mp.get_context("spawn")
         payloads = [(self.keys, row, args, None) for row in rows]
-        results = _run_shapes_isolated(payloads, mp_num, ctx)
+        results = (
+            _run_staged_shapes_isolated(payloads, mp_num, ctx)
+            if staged
+            else _run_shapes_isolated(payloads, mp_num, ctx)
+        )
         # A None means the shape's process died mid-shape (e.g. a C++ abort()).
         # Report it as a failed shape rather than dropping it, so the run
         # finishes and the failure shows up in the summary.
@@ -7451,6 +7479,164 @@ def _mxfp4_shape_proc(payload, out_q, idx):
     """Child entry point: post the shape's result so the parent can tell a
     finished shape apart from a worker that died mid-shape."""
     out_q.put((idx, _mxfp4_tune_shape_worker(payload)))
+
+
+def _mxfp4_staged_shape_proc(
+    payload: tuple[Any, dict[str, Any], Any, int | None], result_tx: Any
+) -> None:
+    """Send one staged shape result through its worker-private Pipe."""
+    try:
+        result_tx.send(_mxfp4_tune_shape_worker(payload))
+    finally:
+        result_tx.close()
+
+
+@dataclass
+class _StagedShapeSlot:
+    proc: Any
+    gpu: int
+    result_rx: Any
+    result_received: bool = False
+    result: dict[str, Any] | None = None
+
+
+def _run_staged_shapes_isolated(
+    payloads: list[tuple[Any, dict[str, Any], Any, int | None]],
+    mp_num: int,
+    ctx: Any,
+    entry: Callable[..., None] = _mxfp4_staged_shape_proc,
+) -> list[dict[str, Any] | None]:
+    """Run staged shapes with one private result Pipe per fresh worker.
+
+    Within one Tuning run, a logical GPU remains owned until its worker exits,
+    preserving Per-GPU measurement exclusivity. Exclusivity between separate
+    Tuning runs is the caller's responsibility. There is intentionally no parent
+    deadline for a worker that remains alive.
+    """
+    results: list[dict[str, Any] | None] = [None] * len(payloads)
+    running: dict[int, _StagedShapeSlot] = {}
+    cleanup_slots: list[_StagedShapeSlot] = []
+    free_gpus = list(range(mp_num))
+    done: set[int] = set()
+    next_payload = 0
+
+    def _receive_result(slot: _StagedShapeSlot) -> None:
+        receive_failed = False
+        try:
+            try:
+                payload = slot.result_rx.recv_bytes()
+            except EOFError:
+                return
+            slot.result = ForkingPickler.loads(payload)
+            slot.result_received = True
+        except BaseException:
+            receive_failed = True
+            raise
+        finally:
+            try:
+                slot.result_rx.close()
+            except BaseException:
+                if not receive_failed:
+                    raise
+
+    try:
+        while len(done) < len(payloads):
+            while next_payload < len(payloads) and free_gpus:
+                gpu = free_gpus.pop(0)
+                keys, row, args, _ = payloads[next_payload]
+                result_rx, result_tx = ctx.Pipe(duplex=False)
+                start_failed = False
+                try:
+                    proc = ctx.Process(
+                        target=entry,
+                        args=((keys, row, args, gpu), result_tx),
+                        daemon=True,
+                    )
+                    slot = _StagedShapeSlot(proc, gpu, result_rx)
+                    cleanup_slots.append(slot)
+                    proc.start()
+                except BaseException:
+                    start_failed = True
+                    try:
+                        result_rx.close()
+                    except BaseException:  # noqa: BLE001,S110
+                        pass
+                    raise
+                finally:
+                    try:
+                        result_tx.close()
+                    except BaseException:
+                        if not start_failed:
+                            raise
+                running[next_payload] = slot
+                next_payload += 1
+
+            waitables = []
+            for slot in running.values():
+                if not slot.result_rx.closed:
+                    waitables.append(slot.result_rx)
+                waitables.append(slot.proc.sentinel)
+            ready = wait_for_connections(waitables)
+
+            for slot in running.values():
+                if not slot.result_rx.closed and slot.result_rx in ready:
+                    _receive_result(slot)
+
+            for idx, slot in list(running.items()):
+                if slot.proc.sentinel not in ready:
+                    continue
+                if not slot.result_rx.closed:
+                    _receive_result(slot)
+                slot.proc.join()
+                exitcode = slot.proc.exitcode
+                if slot.result_received and exitcode == 0:
+                    results[idx] = slot.result
+                else:
+                    print(
+                        f"[mxfp4-port] worker for shape {idx} failed "
+                        f"(exitcode={exitcode}, result_received={slot.result_received})",
+                        flush=True,
+                    )
+                slot.proc.close()
+                cleanup_slots.remove(slot)
+                running.pop(idx)
+                free_gpus.append(slot.gpu)
+                done.add(idx)
+    finally:
+        # Only slots that were not successfully closed on the normal path remain
+        # cleanup-owned. Cleanup is best-effort and must not replace the exception
+        # already leaving the supervisor.
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.is_alive():
+                    slot.proc.terminate()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        # terminate() is followed by an immediate is_alive() check, which does
+        # not guarantee a SIGTERM grace period. Kill workers still reporting alive.
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.is_alive():
+                    slot.proc.kill()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+        for slot in cleanup_slots:
+            try:
+                if slot.proc.pid is not None:
+                    slot.proc.join()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+            try:
+                if not slot.result_rx.closed:
+                    slot.result_rx.close()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+            try:
+                slot.proc.close()
+            except BaseException:  # noqa: BLE001,S110
+                pass
+
+    return results
 
 
 def _run_shapes_isolated(payloads, mp_num, ctx, entry=_mxfp4_shape_proc):
