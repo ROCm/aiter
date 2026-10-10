@@ -209,7 +209,7 @@ def parse_csv(csv_path: str):
                                 "enable_bias": enable_bias,
                                 "interleave": interleave,
                                 "native_scale_layout": native_scale_layout_for(
-                                    p1["BM"], p1["out_dtype"]
+                                    p1["BM"], p1["out_dtype"], kn2
                                 ),
                                 "num_waves": p1.get("num_waves", 4),
                                 "k_wave": p1.get("k_wave", 1),
