@@ -37,15 +37,20 @@ NETWORKS = {
         "topk": 6,
         "swiglu_limit": 10.0,
     },
-    # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112;
-    # the numerical reference intentionally keeps MegaMoEV2's current bounded
-    # SwiGLU activation while the K3 activation integration remains separate.
+    # Kimi-K3 routing/weight geometry.  This exercises topk16 and EP8/epr112 and
+    # the real K3 activation: SiTUv2 (hidden_act="situ"), which self-saturates
+    # via tanh, so it carries no hard swiglu clamp.  beta=4.0 / linear_beta=25.0
+    # are the K3 checkpoint constants the MegaMoE SiTU kernel bakes in (SGLang
+    # kimi_k3.py asserts exactly these for the MegaMoE a2a backend).
     "kimi_k3_route": {
         "model_dim": 3584,
-        "inter_dim": 512,
+        "inter_dim": 3072,
         "experts": 896,
         "topk": 16,
-        "swiglu_limit": 10.0,
+        "swiglu_limit": 0.0,
+        "act": "situv2",
+        "situ_beta": 4.0,
+        "situ_linear_beta": 25.0,
     },
 }
 
@@ -246,6 +251,9 @@ def _reference(
     inter_dim,
     experts,
     swiglu_limit,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     x_all, token_counts = _all_gather_variable(x)
     weights_all, _ = _all_gather_variable(route_weights, token_counts)
@@ -270,13 +278,20 @@ def _reference(
         inp = x_all[rows].float()
         gate = inp @ w1[:inter_dim].T
         up = inp @ w1[inter_dim:].T
-        # MegaMoEV2 treats swiglu_limit <= 0 as "no clamp"; clamping here
-        # unconditionally turns up into zeros at the operator's own default of
-        # 0.0, so the reference is all-zero and relL2 divides by zero.
-        if swiglu_limit > 0:
-            gate = gate.clamp(max=swiglu_limit)
-            up = up.clamp(-swiglu_limit, swiglu_limit)
-        hidden = F.silu(gate) * up
+        if act == "situv2":
+            # SiTUv2 (Kimi-K3 hidden_act="situ"), matching SGLang SituAndMul and
+            # the operator's no-clamp situv2 epilogue: tanh self-saturates.
+            gate = situ_beta * torch.tanh(gate / situ_beta) * torch.sigmoid(gate)
+            up = situ_linear_beta * torch.tanh(up / situ_linear_beta)
+            hidden = gate * up
+        else:
+            # MegaMoEV2 treats swiglu_limit <= 0 as "no clamp"; clamping here
+            # unconditionally turns up into zeros at the operator's own default of
+            # 0.0, so the reference is all-zero and relL2 divides by zero.
+            if swiglu_limit > 0:
+                gate = gate.clamp(max=swiglu_limit)
+                up = up.clamp(-swiglu_limit, swiglu_limit)
+            hidden = F.silu(gate) * up
         out = (hidden @ w2.T) * weights_all[rows, slots, None]
         partial.index_add_(0, rows, out)
         del w1, w2, inp, hidden, out
@@ -345,6 +360,9 @@ def _run_size(moe, x, weights, ids, ref_weights, args, rank, world, device):
             moe.inter_dim,
             moe.experts,
             moe.swiglu_limit,
+            moe.act,
+            moe.situ_beta,
+            moe.situ_linear_beta,
         )
         rel_l2 = _rel_l2(output, reference)
         if rel_l2 >= args.rtol:
@@ -422,6 +440,9 @@ def _check_pad_tail(moe, x, weights, ids, ref_weights, args, rank, world, device
         moe.inter_dim,
         moe.experts,
         moe.swiglu_limit,
+        moe.act,
+        moe.situ_beta,
+        moe.situ_linear_beta,
     )
     # -1: every row of every rank is padding, so there is nothing to compare.
     rel_l2 = _rel_l2(eager_output[:real], reference)
@@ -503,11 +524,17 @@ def _install_config_policy(moe, config_tokens, unify_fields):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--network", choices=NETWORKS, default="v4_pro")
+    parser.add_argument("--quant", choices=("a8w4",), default="a8w4")
+    parser.add_argument(
+        "--stage2-p2p-quant",
+        choices=("auto", "none", "fp8_blockwise_1x32"),
+        default="auto",
+    )
     parser.add_argument("--bs-list", default="128")
     parser.add_argument("--iters", type=int, default=30)
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--accuracy-max-bs", type=int, default=128)
-    parser.add_argument("--rtol", type=float, default=0.10)
+    parser.add_argument("--rtol", type=float)
     parser.add_argument("--max-tok-per-rank", type=int)
     parser.add_argument("--rank-tokens", default="")
     parser.add_argument("--config-tokens", type=int, default=0)
@@ -535,6 +562,8 @@ def main():
         > 1
     ):
         raise ValueError("fanout adversarial flags are mutually exclusive")
+    if args.rtol is None:
+        args.rtol = 0.10
     batch_sizes = [int(value) for value in args.bs_list.split(",")]
     if not batch_sizes or min(batch_sizes) <= 0:
         raise ValueError("--bs-list must contain positive integers")
@@ -614,13 +643,14 @@ def main():
                 shared_moe = MegaMoEV2(
                     rank=rank,
                     world_size=world,
-                    quant="a8w4",
+                    quant=args.quant,
                     w1=w1,
                     w1_scale=w1_scale,
                     w2=w2,
                     w2_scale=w2_scale,
                     max_tok_per_rank=max_tok_per_rank,
                     fanout_masks=fanout_masks,
+                    stage2_p2p_quant=args.stage2_p2p_quant,
                     **network,
                 )
             moe = shared_moe
