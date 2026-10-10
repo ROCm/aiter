@@ -14,6 +14,7 @@ from .topk_per_row_decode import (
     _f32_to_ord,
     _load_f32x4,
     _row_length,
+    _row_view,
     _warp_inclusive_prefix_i32,
 )
 
@@ -39,7 +40,11 @@ def build_topk_per_row_decode_one_workgroup_module(
     k: int,
     wave_size: int,
     write_values: bool = False,
+    packed_rows: bool = False,
 ):
+    """packed_rows: row r is read from element row_starts[r] of a flat input
+    (indices still relative to that start); otherwise from the input's row r
+    and row_starts is not read."""
     if wave_size not in (32, 64):
         raise ValueError("wave size must be 32 or 64")
     num_waves = _BLOCK_THREADS // wave_size
@@ -53,11 +58,17 @@ def build_topk_per_row_decode_one_workgroup_module(
 
     @flyc.kernel(
         name="topk_per_row_decode_1wg_"
-        + kernel_signature(k=k, wave=wave_size, wv=write_values),
+        + kernel_signature(
+            k=k,
+            wave=wave_size,
+            wv=write_values,
+            **({"packed": 1} if packed_rows else {}),
+        ),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
     def topk_per_row_decode_one_workgroup_kernel(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -90,8 +101,11 @@ def build_topk_per_row_decode_one_workgroup_module(
         # or past 4 GiB is unaddressable -- measured on the small-k selector,
         # which had the same shape: at exactly 4 GiB every row came back wrong
         # with nothing raised. A row is 4 MiB at the widest width here.
+        input_row = _row_view(
+            input, row_starts, row_ends, row, width, next_n, packed_rows
+        )
         input_resource = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(fx.slice(input, (row, None)), max_size=False),
+            fx.rocdl.make_buffer_tensor(input_row, max_size=False),
             fx.make_layout(_VEC, 1),
         )
         row_len = _row_length(row, row_ends, width, next_n)
@@ -357,10 +371,12 @@ def build_topk_per_row_decode_one_workgroup_module(
                     valid = out_pos < row_len
                     row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
                     if const_expr(write_values):
-                        row_values[out_pos] = valid.select(
-                            input[row, out_pos],
-                            fx.Float32(float("-inf")),
-                        )
+                        # read only inside the row: a packed row's next
+                        # elements are another row's, or past the buffer
+                        value = fx.Float32(float("-inf"))
+                        if valid:
+                            value = input_row[out_pos]
+                        row_values[out_pos] = value
 
         if row_len > top_k:
             if tid < 8:
@@ -432,6 +448,7 @@ def build_topk_per_row_decode_one_workgroup_module(
     @flyc.jit
     def launch_topk_per_row_decode_one_workgroup(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -443,6 +460,7 @@ def build_topk_per_row_decode_one_workgroup_module(
     ):
         topk_per_row_decode_one_workgroup_kernel(
             input,
+            row_starts,
             row_ends,
             indices,
             values,
