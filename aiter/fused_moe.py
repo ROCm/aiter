@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import math
 import os
 import re
 from collections.abc import Callable
@@ -1385,6 +1386,10 @@ def _fused_moe_impl(
 
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     if metadata.full_impl is not None:
+        # flydsl_gfx942 is the only registered whole-graph backend. Its SiLU
+        # epilogue never reads swiglu_limit; SwiGLU does. Raising here is the
+        # guard. Teaching that epilogue to clamp is separate work.
+        _raise_if_whole_graph_drops_swiglu_limit(swiglu_limit, activation)
         full_output = metadata.full_impl(
             FusedMoeRequest(
                 hidden_states=hidden_states,
@@ -1515,6 +1520,9 @@ def _fused_moe_impl(
     if metadata.run_1stage:
         if _stage2_override is not None:
             raise RuntimeError("_stage2_override requires a two-stage MoE config")
+        # fused_moe_1stage has no swiglu_limit parameter; asm fmoe/fmoe_g1u1
+        # would otherwise run an unclamped activation.
+        _raise_if_swiglu_limit_dropped(fused_moe_1stage, swiglu_limit, activation)
         _stage1_call = functools.partial(
             metadata.stage1,
             hidden_states,
@@ -4051,6 +4059,82 @@ def get_2stage_cfgs(
     )
 
 
+def _swiglu_limit_is_active(swiglu_limit) -> bool:
+    """True only for a finite positive clamp bound.
+
+    ``None``, ``0.0``, and ``+inf`` are not active. That matches the no-clamp
+    sentinels of ``runtime_swiglu_limit`` (``aiter.ops.flydsl.moe_kernels``)
+    and ``_opus_runtime_swiglu_limit`` (``aiter.ops.opus.moe_stage1_a8w4``):
+    both treat a falsy limit (``None``, ``0.0``) as unset, and both encode an
+    unclamped SiLU as ``+inf``. vLLM's ROCm backend forwards ``0.0`` when its
+    config limit is ``None``, so ``0.0`` reaches this API on every
+    unconfigured call and must not raise.
+    """
+    if swiglu_limit is None:
+        return False
+    try:
+        value = float(swiglu_limit)
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(value) and value > 0.0
+
+
+def _activation_label(activation) -> str:
+    name = getattr(activation, "name", None)
+    if isinstance(name, str) and name:
+        return f"ActivationType.{name}"
+    text = str(activation)
+    if text.startswith("ActivationType."):
+        return text
+    return repr(activation)
+
+
+def _dropped_swiglu_limit_message(kernel: str, swiglu_limit, activation) -> str:
+    return (
+        f"{kernel} cannot apply swiglu_limit={float(swiglu_limit)!r} for "
+        f"{_activation_label(activation)} on {get_gfx()}; the clamp would be "
+        "silently dropped. Supported stage-1 families for a clamped activation "
+        "are FlyDSL and Opus."
+    )
+
+
+def _stage1_applies_swiglu_limit(stage1_func, activation) -> bool:
+    if stage1_func in (_flydsl_stage1_wrapper, _opus_a8w4_stage1_wrapper):
+        return True
+    if stage1_func is _mxfp4_a4w4_stage1_fw:
+        # runtime_swiglu_limit consumes the bound for silu and swiglu.
+        # _normalize_mxfp4_activation_params nulls every other activation.
+        return activation in (ActivationType.Silu, ActivationType.Swiglu)
+    # FHMoE replaces the FlyDSL wrapper after metadata resolution and already
+    # threads the limit through _stage1_extra_args into runtime_swiglu_limit.
+    from aiter.fhmoe import _flydsl_fhmoe_stage1_wrapper
+
+    return stage1_func is _flydsl_fhmoe_stage1_wrapper
+
+
+def _raise_if_swiglu_limit_dropped(stage1_func, swiglu_limit, activation) -> None:
+    if not _swiglu_limit_is_active(swiglu_limit):
+        return
+    if _stage1_applies_swiglu_limit(stage1_func, activation):
+        return
+    kernel = getattr(stage1_func, "__name__", repr(stage1_func))
+    raise NotImplementedError(
+        _dropped_swiglu_limit_message(kernel, swiglu_limit, activation)
+    )
+
+
+def _raise_if_whole_graph_drops_swiglu_limit(swiglu_limit, activation) -> None:
+    """flydsl_gfx942 applies the bound for SwiGLU and ignores it for SiLU."""
+    if not _swiglu_limit_is_active(swiglu_limit):
+        return
+    if activation == ActivationType.Swiglu:
+        return
+    raise NotImplementedError(
+        _dropped_swiglu_limit_message("flydsl_gfx942", swiglu_limit, activation)
+        + " This backend applies a clamped activation for SwiGLU only."
+    )
+
+
 def fused_moe_2stages(
     hidden_states,
     w1,  # [expert(local_expert:EP), inter_dim*2, dim] N,K
@@ -4305,7 +4389,15 @@ def fused_moe_2stages(
         # would silently drop the clamp on paths outside this change.
         extra_stage1_args["swiglu_limit"] = swiglu_limit
     elif stage1_func is _mxfp4_a4w4_stage1_fw:
+        # Silu and Swiglu keep the caller bound (runtime_swiglu_limit consumes
+        # it). Any other activation nulls normalized_swiglu_limit.
+        _raise_if_swiglu_limit_dropped(stage1_func, swiglu_limit, activation)
         extra_stage1_args["swiglu_limit"] = normalized_swiglu_limit
+    else:
+        # CK, CK-Tile, and asm stage1 have no swiglu_limit parameter. FHMoE's
+        # FlyDSL wrapper is recognized inside the helper and is not an error:
+        # its limit already arrived via _stage1_extra_args.
+        _raise_if_swiglu_limit_dropped(stage1_func, swiglu_limit, activation)
     if stage1_func is _flydsl_stage1_wrapper and metadata.skip_inter_quant:
         extra_stage1_args["v2_output_layout"] = True
     if stage1_func is _flydsl_stage1_wrapper:
