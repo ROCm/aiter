@@ -74,7 +74,6 @@ from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels import tdm_ops_gfx1250 as tdm_ops
 from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import make_lds_copy_ops
 from aiter.ops.flydsl.kernels.kernels_common import (
-    create_llvm_ptr,
     format_kernel_name,
     get_warp_size,
 )
@@ -99,6 +98,12 @@ BLOCK_THREADS = 256
 # once: slicing k costs nothing on the store side but makes the gathered loads
 # shorter, which is what that pass is short of.
 _PRESHUF_LDS = 32768
+
+
+def _i32_ptr(ptr):
+    """View a byte-pointer kernel argument as aligned i32 elements."""
+    ptr_type = fx.PointerType.get(fx.Int32.ir_type, ptr.address_space, 4)
+    return fx.recast_iter(ptr_type, ptr)
 
 
 @fx.struct
@@ -967,22 +972,13 @@ def build_moe_fused_route_quant_scatter_module(
                 slot_incr = c1_i32
             slot_on_lane0 = arith.constant(0, type=i32)
             if lane == 0:
-                counter_addr = fx.Int64(ptrtoint(counter)) + fx.Int64(expert) * 4
-                counter_ptr = create_llvm_ptr(counter_addr)
-                counter_ptr = (
-                    counter_ptr._value
-                    if hasattr(counter_ptr, "_value")
-                    else counter_ptr
-                )
+                counter_ptr = _i32_ptr(counter) + expert
                 slot_on_lane0 = fx.Uint32(
-                    llvm.AtomicRMWOp(
-                        llvm.AtomicBinOp.add,
+                    fx.atomic_add(
                         counter_ptr,
-                        _raw(slot_incr),
-                        llvm.AtomicOrdering.monotonic,
+                        fx.Int32(slot_incr),
                         syncscope="agent",
-                        alignment=4,
-                    ).result
+                    )
                 )
             # readlane needs raw ir.Value operands in this FlyDSL build (the
             # /workspace/FlyDSL example's auto-unwrap + T.i32() are a newer API).
@@ -1110,7 +1106,7 @@ def build_moe_fused_route_quant_scatter_module(
         with ir.InsertionPoint(ctx.gpu_module_body):
             pass
 
-        grid_x = arith.index_cast(T.index, grid_blocks)
+        grid_x = fx.Index(grid_blocks)
         fused_kernel(
             topk_ids,
             counter,
@@ -2829,7 +2825,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         c_lanes_per_block = arith.constant(lanes_per_mx_block, type=i32)
         c_elems_per_lane = arith.constant(elems_per_lane, type=i32)
 
-        # --- cross-block scratch access helpers (raw !llvm.ptr<1> at elem idx) ---
+        # --- cross-block scratch access helpers ---
         def _wait_mem():
             # Drain outstanding global memory ops (loads + stores) so atomics /
             # coherent writes are committed to the L2 coherence point.
@@ -2840,21 +2836,20 @@ def build_moe_fused_route_psum_quant_scatter_module(
                 rocdl.s_waitcnt(0)
 
         def _elem_ptr(tensor, elem_idx_i32):
+            # Keep this address calculation: recasting the kernel pointer changes
+            # the fused route/psum instruction sequence on gfx950.
             addr = fx.Int64(ptrtoint(tensor)) + fx.Int64(elem_idx_i32) * 4
-            p = create_llvm_ptr(addr)
-            return p._value if hasattr(p, "_value") else p
+            ptr_type = fx.PointerType.get(fx.Int32.ir_type, fx.AddressSpace.Global, 4)
+            return fx.inttoptr(ptr_type, addr)
 
         def _atomic_add(tensor, elem_idx_i32, addend):
             ptr = _elem_ptr(tensor, elem_idx_i32)
             return fx.Uint32(
-                llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
+                fx.atomic_add(
                     ptr,
-                    addend,
-                    llvm.AtomicOrdering.monotonic,
+                    fx.Int32(addend),
                     syncscope="agent",
-                    alignment=4,
-                ).result
+                )
             )
 
         tid = fx.Uint32(fx.thread_idx.x)

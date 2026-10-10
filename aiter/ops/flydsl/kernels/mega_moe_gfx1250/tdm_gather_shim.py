@@ -18,8 +18,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl._mlir.dialects import rocdl, vector
@@ -75,13 +75,14 @@ def _byte_offset_to_i64(offset):
     ``index_cast`` just to satisfy this boundary.
     """
     if isinstance(offset, int):
-        return arith.constant(offset, type=T.i64)
+        return fx.Int64(offset)
     raw = _raw(offset)
     if isinstance(raw.type, ir.IndexType):
-        return arith.index_cast(T.i64, raw)
+        return fx.Int64(raw)
     if raw.type == T.i64:
-        return _ArithValue(raw)
-    return _ArithValue(std_arith.ExtUIOp(T.i64, raw).result)
+        return fx.Int64(raw)
+    # Byte offsets represented by narrower signless integers were zero-extended.
+    return fx.Uint64(raw)
 
 
 def _zero_dgroup_v8i32():
@@ -326,12 +327,8 @@ def make_tensor_gather_dgroup0(
     g0_s0 = arith.constant(g0_pred, type=T.i32)
     g0_s1 = lds_addr_i32
 
-    i32 = ir.IntegerType.get_signless(32)
-    g0_s2 = _ArithValue(std_arith.TruncIOp(i32, _raw(glb_base_i64)).result)
-    hi_raw = _ArithValue(_raw(glb_base_i64)).shrui(arith.constant(32, type=T.i64))
-    g0_s3 = _ArithValue(std_arith.TruncIOp(i32, _raw(hi_raw)).result) | arith.constant(
-        1 << 31, type=T.i32
-    )
+    g0_s2 = fx.Uint32(_raw(glb_base_i64))
+    g0_s3 = fx.Uint32(fx.Uint64(_raw(glb_base_i64)) >> 32) | fx.Uint32(1 << 31)
     return vector.from_elements(
         T.vec(4, T.i32),
         [
