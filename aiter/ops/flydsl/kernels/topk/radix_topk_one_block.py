@@ -16,7 +16,7 @@ from flydsl.expr import const_expr, gpu, range_constexpr
 from flydsl.expr.typing import T
 
 from ..kernels_common import atomic_add_i32, atomic_or_i32
-from .topk_common import _load_f32x4, _row_length
+from .topk_common import _f32_to_ord, _load_f32x4, _row_length
 
 _VEC = 4
 _LOAD_UNROLL = 4
@@ -324,8 +324,7 @@ def build_radix_topk_one_block_body(
 
         # Key encoding and classification
         def ordered_key(value):
-            bits = value.bitcast(fx.Int32)
-            return bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF)) ^ sign_bit
+            return _f32_to_ord(value) ^ sign_bit
 
         def radix_bucket(key, shift, mask):
             return (key >> fx.Int32(shift)) & fx.Int32(mask)
@@ -349,10 +348,6 @@ def build_radix_topk_one_block_body(
                 prefix == prefix_threshold,
             )
 
-        def ordered_value(key):
-            bits = (key < zero).select(key ^ sign_bit, key ^ fx.Int32(-1))
-            return bits.bitcast(fx.Float32)
-
         # FlyDSL tracks indexed stores as SSA writes: store helpers take writable
         # views explicitly; orchestration helpers capture the fixed kernel views.
         def scatter_unstable_key(
@@ -363,14 +358,14 @@ def build_radix_topk_one_block_body(
                 if out_pos < top_k:
                     row_indices[out_pos] = reported_index(col)
                     if const_expr(write_values) and write_row_values:
-                        row_values[out_pos] = ordered_value(key)
+                        row_values[out_pos] = input_row[col]
             elif equal:
                 back_pos = atomic_add_i32(metadata, one, _RUNNING_EQUAL, "workgroup")
                 if back_pos < num_needed:
                     out_pos = top_k - one - back_pos
                     row_indices[out_pos] = reported_index(col)
                     if const_expr(write_values) and write_row_values:
-                        row_values[out_pos] = ordered_value(key)
+                        row_values[out_pos] = input_row[col]
 
         def reset_scatter_counters(metadata, reset_above=True):
             if tid == 0:
@@ -764,13 +759,13 @@ def build_radix_topk_one_block_body(
                         if cls == 2:
                             row_indices[out_pos] = reported_index(col)
                             if const_expr(write_values) and write_row_values:
-                                row_values[out_pos] = ordered_value(key)
+                                row_values[out_pos] = input_row[col]
                             my_above = my_above + 1
                         elif cls == 1:
                             if my_eq < num_needed:
                                 row_indices[out_pos] = reported_index(col)
                                 if const_expr(write_values) and write_row_values:
-                                    row_values[out_pos] = ordered_value(key)
+                                    row_values[out_pos] = input_row[col]
                             my_eq = my_eq + 1
                 above_base = above_base + (packed_step_total >> _PACKED_COUNT_BITS)
                 next_eq_base = equal_base + (
@@ -1073,7 +1068,7 @@ def build_radix_topk_one_block_body(
                         else:
                             row_indices[out_pos] = reported_index(col)
                             if const_expr(write_values) and write_row_values:
-                                row_values[out_pos] = ordered_value(key)
+                                row_values[out_pos] = input_row[col]
                 active = active & (prefix == prefix_threshold)
                 if active:
                     bucket = radix_bucket(key, shift, mask)

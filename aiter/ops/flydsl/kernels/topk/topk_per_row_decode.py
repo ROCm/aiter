@@ -76,10 +76,6 @@ def build_topk_per_row_decode_module(
     )
     aligned_k = (k + _VEC - 1) // _VEC * _VEC
     part_elements = max(_STABLE_PART_ELEMENTS if stable else _PART_ELEMENTS, aligned_k)
-    # The selector's copy for rows no longer than k writes the final output at
-    # offset 0. Only a direct row may reach it, so a part must be longer.
-    if part_elements <= k:
-        raise ValueError(f"k={k} leaves a part no longer than k")
 
     @fx.struct
     class ArrivalStorage:
@@ -285,7 +281,7 @@ def _get_workspace(indices, rows, columns):
     concurrently from multiple streams is already invalid because the final
     indices would race.
     """
-    key = columns
+    key = (rows, columns)
     workspaces = getattr(indices, _WORKSPACES_ATTR, None)
     if workspaces is not None and key in workspaces:
         return workspaces[key]
