@@ -38,4 +38,4 @@ Search kernel-duration sum is the CSV selection metric. The matched elapsed and 
 
 ConfiguredFP8 reduce winners record unweighted packedFP8 routes and final exactly-once route weighting; configuredFP4 scatter winners record packed payload/scales and complete quantized scatter. Both-flags reduce winners retainFP8 output. Required scatter/atomic combinations and active limit5 clamp fixtures remain separately covered by ticket03; winner replay supplies the same configured limit as its search.
 
-Targeted alternating pair checks, corrected omitted-argument Situv2 replay and finalStandards/Spec review are separate remaining gates; this completed winner-deployment record does not close ticket04 before them.
+Corrected omitted-argumentSituv2 production/run-only retries also passed with actual4/25 defaults, retained separately in situv2-public-defaults.md. Targeted alternating pair checks and finalStandards/Spec review are separate remaining gates; this completed winner-deployment record does not close ticket04 before them.
