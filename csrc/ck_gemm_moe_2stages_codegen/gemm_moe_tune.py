@@ -6325,6 +6325,10 @@ class GroupedFmoeTuner(FmoeTuner):
             cache = getattr(grouped_mod, "_GROUPED_CONFIG_CACHE", None)
             if cache is not None:
                 cache.clear()
+            # The row lookup is memoized on the shape only, not on the CSV
+            # path, so without this every candidate after the first gets the
+            # first candidate's row.
+            grouped_mod._find_grouped_config.cache_clear()
 
         config_path = self._write_candidate_config(candidate)
         old_config = os.environ.get("AITER_CONFIG_GROUPED_FMOE")
@@ -6346,6 +6350,13 @@ class GroupedFmoeTuner(FmoeTuner):
                 if str(row.get("gate_mode", "")).endswith("INTERLEAVE")
                 else GateMode.SEPARATED
             )
+            # Without it fused_moe quantizes the activations to fp4 on gfx1250,
+            # so an a8w4 candidate runs as a4w4 and never matches its own row.
+            quant_dtype_a = (
+                dtypes.fp8
+                if self._data_format(str(row["q_dtype_a"])) == "a8w4"
+                else dtypes.fp4x2
+            )
 
             def _call():
                 return fused_moe(
@@ -6360,6 +6371,7 @@ class GroupedFmoeTuner(FmoeTuner):
                     w2_scale=case[6],
                     dtype=torch.bfloat16,
                     gate_mode=gate_mode.value,
+                    quant_dtype_a=quant_dtype_a,
                 )
 
             _call()
