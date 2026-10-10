@@ -89,15 +89,17 @@ Import-time discovery metadata is simulated only in the test bootstrap;
 production identity/preflight functions still execute against each test's
 controlled runtime properties. Discovery caches are cleared after import.
 
-`isolated-lifecycle-checks.txt` retains the red guard run (12 failures caused by
-blocking explicit CPU dummy allocations); `isolated-shared-infra.txt` and
-`isolated-shared-infra-final.txt` retain failed runner attempts. A stdin runner
+`isolated-lifecycle-checks.txt.gz` retains the red guard run (12 failures caused by
+blocking explicit CPU dummy allocations); `isolated-shared-infra.txt.gz` and
+`isolated-shared-infra-final.txt.gz` retain failed runner attempts. A stdin runner
 could not be re-imported by CPU spawn workers, and the first file runner did not
 bootstrap child imports. The retained file runner fixes both issues. These failed
-attempts are excluded from the green counts. `controlled-checks.txt` is the earlier
+attempts are excluded from the green counts. `controlled-checks.txt.gz` is the earlier
 96-check intermediate run and does not establish final acceptance.
 
 The early uncontrolled GPU execution incident and incomplete raw-log retention
 are explicitly recorded in `incident.md`; no incident output is counted as
 acceptance. All actual numerical, production, AOT and calibration acceptance is
 owned by later tickets and the coordinator.
+
+Long intermediate/failed logs are losslessly gzip-compressed; these files contain complete shell-captured output. The incident console excerpts remain partial because those two original tool outputs were not written to disk.
