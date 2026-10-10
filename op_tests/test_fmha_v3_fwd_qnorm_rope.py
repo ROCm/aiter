@@ -2,16 +2,20 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """fmha_v3_fwd_qnorm_rope vs a Triton RMSNorm + interleaved-RoPE row kernel followed by the plain v3 forward.
 
-Everything is required to be bitwise equal: out, lse, q_n, q_rstd, and dq / dk / dv of the v3 backward run on q_n
-(with the fused forward's out / lse) vs on the reference q (with the reference forward's out / lse).
+Everything is required to be bitwise equal: out, lse, q_n, q_rstd, and dq / dk / dv of the deterministic backward run
+on q_n (with the fused forward's out / lse) vs on the reference q (with the reference forward's out / lse). The v3 asm
+backward (non-deterministic mode, as training runs it) must give bitwise dk / dv; its dq accumulates with atomics in
+16 bits, so it is compared within a tolerance.
 The reference row kernel uses 8 rows per program and 4 warps (32 threads per row, 4 columns each), whose reduction
 order the fused kernel reproduces.
 
     python op_tests/test_fmha_v3_fwd_qnorm_rope.py [-b 32] [-s 512] [--heads 24]
+    pytest op_tests/test_fmha_v3_fwd_qnorm_rope.py
 """
 
 import argparse
 
+import pytest
 import torch
 import triton
 import triton.language as tl
@@ -108,19 +112,32 @@ def run(B, S, H, streams, eps=1e-6, seed=0):
                layout=out.stride() == out_ref.stride() and lse.shape == lse_ref.shape,
                no_q_n=same(out2, out) and same(lse2, lse) and same(q_rstd2, q_rstd))
 
-    # v3 backward (16-bit dq accumulation, non-deterministic mode = the v3 asm path) on the fused forward's
-    # (q_n, out, lse) vs on the reference's
+    # backward on the fused forward's (q_n, out, lse) vs on the reference's: deterministic mode bitwise; the v3 asm
+    # path (non-deterministic mode, 16-bit dq atomics) bitwise for dk / dv, dq within the atomics' rounding
     dout = rn(B, S, H, D)
-    grads = []
-    for qq, oo, ll in ((bshd(q_n), out, lse), (bshd(q_ref), out_ref, lse_ref)):
-        dq, dk, dv = (torch.empty(B, S, H, D, device=dev, dtype=torch.bfloat16) for _ in range(3))
-        _flash_attn_backward(dout, qq, bshd(k), bshd(v), oo, ll, dq, dk, dv, None, 0.0, scale, False, -1, -1, None,
-                             None, False, rng_state, False, 1)
-        grads.append((dq, dk, dv))
-    torch.cuda.synchronize()
-    for i, name in enumerate(("dq", "dk", "dv")):
-        res[name] = same(grads[0][i], grads[1][i])
+    for deterministic in (True, False):
+        grads = []
+        for qq, oo, ll in ((bshd(q_n), out, lse), (bshd(q_ref), out_ref, lse_ref)):
+            dq, dk, dv = (torch.empty(B, S, H, D, device=dev, dtype=torch.bfloat16) for _ in range(3))
+            _flash_attn_backward(dout, qq, bshd(k), bshd(v), oo, ll, dq, dk, dv, None, 0.0, scale, False, -1, -1,
+                                 None, None, deterministic, rng_state, False, 1)
+            grads.append((dq, dk, dv))
+        torch.cuda.synchronize()
+        tag = "" if deterministic else "_v3"
+        for i, name in enumerate(("dq", "dk", "dv")):
+            a, b = grads[0][i], grads[1][i]
+            if deterministic or name != "dq":
+                res[name + tag] = same(a, b)
+            else:
+                res[name + tag] = ((a.float() - b.float()).abs().max() <= 2 ** -6 * b.float().abs().max()).item()
     return res
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("streams", [[512], [256, 256]], ids=["one_stream", "two_streams"])
+def test_fmha_v3_fwd_qnorm_rope(streams):
+    r = run(32, 512, 24, streams)
+    assert all(r.values()), {k: v for k, v in r.items() if not v}
 
 
 if __name__ == "__main__":
