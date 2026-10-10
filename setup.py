@@ -270,6 +270,10 @@ def get_exclude_ops():
     all_modules = _load_modules_from_config()
     exclude_ops = []
 
+    # gfx1201-only modules use RDNA4 WMMA/FP8 instructions; build them only for gfx1201.
+    if "gfx1201" not in core.get_gfx_list():
+        exclude_ops.extend(m for m in all_modules if m.startswith("module_gfx1201_"))
+
     # When CK is disabled, exclude all CK-dependent modules
     if not ENABLE_CK:
         exclude_ops.extend(sorted(core._get_ck_exclude_modules()))

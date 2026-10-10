@@ -2078,5 +2078,21 @@
         "verbose": "False",
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
+        },
+    "module_gfx1201_sage_prepare": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/gfx1201_sage_prepare_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/gfx1201_sage_prepare.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffp-contract=off'",
+            "'-fno-gpu-flush-denormals-to-zero'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
     }
 }
