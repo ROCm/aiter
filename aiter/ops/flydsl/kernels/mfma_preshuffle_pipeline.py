@@ -30,8 +30,7 @@ def swizzle_xor16(row, col, k_blocks16):
     k_blocks16 is always a power of 2 (tile_k_bytes / 16), so use
     bitwise AND instead of remui to save ~10 VALU cycles on CDNA.
     """
-    mask = fx.Index(k_blocks16) - 1
-    rem = fx.Index(row) & mask
+    rem = fx.Index(row) & (k_blocks16 - 1)
     return fx.Index(col) ^ (rem * 16)
 
 
@@ -385,29 +384,24 @@ def xcd_remap_bx_by(
     if xcd_swizzle <= 0:
         return bx, by
 
-    _c1 = fx.Index(1)
-    _c_tm = fx.Index(tile_m)
     grid_n = (N + tile_n - 1) // tile_n if N % tile_n else N // tile_n
-    _gx = fx.Index(grid_n)
-    _gy = (c_m + _c_tm - _c1) // _c_tm
+    _gy = (c_m + tile_m - 1) // tile_m
 
-    _linear_id = bx * _gx + by
-    _num_wgs = _gx * _gy
+    _linear_id = bx * grid_n + by
+    _num_wgs = grid_n * _gy
 
-    _c_xcds = fx.Index(num_xcds)
-    _q = _num_wgs // _c_xcds
-    _r = _num_wgs % _c_xcds
-    _xcd = _linear_id % _c_xcds
-    _in_xcd = _linear_id // _c_xcds
+    _q = _num_wgs // num_xcds
+    _r = _num_wgs % num_xcds
+    _xcd = _linear_id % num_xcds
+    _in_xcd = _linear_id // num_xcds
     _clip = (_xcd < _r).select(_xcd, _r)
     _wgid = _xcd * _q + _clip + _in_xcd
 
-    _c_wgm = fx.Index(xcd_swizzle)
-    _num_wgid_in_group = _c_wgm * _gx
+    _num_wgid_in_group = xcd_swizzle * grid_n
     _group_id = _wgid // _num_wgid_in_group
-    _first_pid_m = _group_id * _c_wgm
+    _first_pid_m = _group_id * xcd_swizzle
     _remaining_m = _gy - _first_pid_m
-    _group_size_m = (_remaining_m < _c_wgm).select(_remaining_m, _c_wgm)
+    _group_size_m = (_remaining_m < xcd_swizzle).select(_remaining_m, xcd_swizzle)
 
     _wgid_in_group = _wgid % _num_wgid_in_group
     new_bx = _first_pid_m + (_wgid_in_group % _group_size_m)
