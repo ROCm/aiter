@@ -1,0 +1,3 @@
+{"utc": "2026-10-10T17:07:19.111782+00:00", "id": "minimax-2048-staged", "attempts": 0, "elapsed": 20.4, "g1_screens": 2, "g2_screens": 0}
+{"utc": "2026-10-10T17:08:04.128485+00:00", "id": "minimax-2048-staged", "attempts": 0, "elapsed": 65.4, "g1_screens": 23, "g2_screens": 0}
+{"utc": "2026-10-10T17:08:49.142813+00:00", "id": "minimax-2048-staged", "attempts": 0, "elapsed": 110.4, "g1_screens": 27, "g2_screens": 33}

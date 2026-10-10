@@ -1,0 +1,10 @@
+{"utc": "2026-10-10T16:25:14.035633+00:00", "attempts": 142, "admitted_pairs": 1056, "process_elapsed_seconds": 76.20737}
+{"utc": "2026-10-10T16:26:48.460016+00:00", "id": "minimax-512-prune", "attempts": 349, "elapsed": 170.6, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:27:33.472469+00:00", "id": "minimax-512-prune", "attempts": 442, "elapsed": 215.6, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:28:18.481212+00:00", "id": "minimax-512-prune", "attempts": 534, "elapsed": 260.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:29:03.492104+00:00", "id": "minimax-512-prune", "attempts": 624, "elapsed": 305.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:29:48.500356+00:00", "id": "minimax-512-prune", "attempts": 710, "elapsed": 350.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:30:33.510575+00:00", "id": "minimax-512-prune", "attempts": 798, "elapsed": 395.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:31:18.520434+00:00", "id": "minimax-512-prune", "attempts": 869, "elapsed": 440.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:32:03.528566+00:00", "id": "minimax-512-prune", "attempts": 929, "elapsed": 485.7, "g1_screens": 0, "g2_screens": 0}
+{"utc": "2026-10-10T16:32:48.537059+00:00", "id": "minimax-512-prune", "attempts": 1010, "elapsed": 530.7, "g1_screens": 0, "g2_screens": 0}

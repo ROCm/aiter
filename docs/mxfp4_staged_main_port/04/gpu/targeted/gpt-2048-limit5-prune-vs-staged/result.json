@@ -1,0 +1,159 @@
+{
+  "samples": [
+    {
+      "cycle": 0,
+      "label": "left",
+      "kernel_sum_us": 116.41804081632641,
+      "cosine_diff": 0.01146976706734315,
+      "profiling_attempt_wall_seconds": 0.1287578884512186
+    },
+    {
+      "cycle": 0,
+      "label": "right",
+      "kernel_sum_us": 121.63706122449398,
+      "cosine_diff": 0.011467794179218838,
+      "profiling_attempt_wall_seconds": 0.35284282360225916
+    },
+    {
+      "cycle": 1,
+      "label": "right",
+      "kernel_sum_us": 121.75947474747485,
+      "cosine_diff": 0.011467794179218838,
+      "profiling_attempt_wall_seconds": 0.14324977900832891
+    },
+    {
+      "cycle": 1,
+      "label": "left",
+      "kernel_sum_us": 116.03347916666725,
+      "cosine_diff": 0.011469755704821893,
+      "profiling_attempt_wall_seconds": 0.3703367244452238
+    },
+    {
+      "cycle": 2,
+      "label": "left",
+      "kernel_sum_us": 116.56894791666635,
+      "cosine_diff": 0.011469723274134647,
+      "profiling_attempt_wall_seconds": 0.1250250358134508
+    },
+    {
+      "cycle": 2,
+      "label": "right",
+      "kernel_sum_us": 121.29329000000006,
+      "cosine_diff": 0.011467794179218838,
+      "profiling_attempt_wall_seconds": 0.14208297617733479
+    }
+  ],
+  "left": {
+    "kernel_sum_median_us": 116.41804081632641,
+    "kernel_sum_min_us": 116.03347916666725,
+    "kernel_sum_max_us": 116.56894791666635,
+    "kernel_sum_population_stddev_us": 0.22543473989091956
+  },
+  "right": {
+    "kernel_sum_median_us": 121.63706122449398,
+    "kernel_sum_min_us": 121.29329000000006,
+    "kernel_sum_max_us": 121.75947474747485,
+    "kernel_sum_population_stddev_us": 0.19734120034340447
+  },
+  "reason": "Staged+4.24%; atomic prune winner G2 rank3 was excluded.",
+  "shape": {
+    "token": 2048,
+    "model_dim": 3072,
+    "inter_dim": 512,
+    "expert": 128,
+    "topk": 4
+  },
+  "winners": {
+    "left": {
+      "gfx": "gfx950",
+      "cu_num": "256",
+      "token": "2048",
+      "model_dim": "3072",
+      "inter_dim": "512",
+      "expert": "128",
+      "topk": "4",
+      "act_type": "ActivationType.Swiglu",
+      "dtype": "torch.bfloat16",
+      "q_dtype_a": "torch.float4_e2m1fn_x2",
+      "q_dtype_w": "torch.float4_e2m1fn_x2",
+      "q_type": "QuantType.per_1x32",
+      "use_g1u1": "1",
+      "doweight_stage1": "0",
+      "block_m": "64",
+      "ksplit": "0",
+      "us1": "117.0535",
+      "kernelName1": "flydsl_mxmoe_g1_a4w4_64x256x256_swiglu_xcd4",
+      "err1": "1.1%",
+      "us2": "0",
+      "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x256_atomic_persist_nt_sbm64",
+      "err2": "1.1%",
+      "us": "117.0535",
+      "run_1stage": "0",
+      "xbf16": "0",
+      "flat": "0",
+      "tflops": "660.46",
+      "bw": "5321.11"
+    },
+    "right": {
+      "gfx": "gfx950",
+      "cu_num": "256",
+      "token": "2048",
+      "model_dim": "3072",
+      "inter_dim": "512",
+      "expert": "128",
+      "topk": "4",
+      "act_type": "ActivationType.Swiglu",
+      "dtype": "torch.bfloat16",
+      "q_dtype_a": "torch.float4_e2m1fn_x2",
+      "q_dtype_w": "torch.float4_e2m1fn_x2",
+      "q_type": "QuantType.per_1x32",
+      "use_g1u1": "1",
+      "doweight_stage1": "0",
+      "block_m": "64",
+      "ksplit": "0",
+      "us1": "122.0186",
+      "kernelName1": "flydsl_mxmoe_g1_a4w4_64x256x256_swiglu_xcd4",
+      "err1": "1.1%",
+      "us2": "0",
+      "kernelName2": "flydsl_moe2_layout_afp4_wfp4_bf16_t64x128x256_reduce_persist_sbm64",
+      "err2": "1.1%",
+      "us": "122.0186",
+      "run_1stage": "0",
+      "xbf16": "0",
+      "flat": "0",
+      "tflops": "633.59",
+      "bw": "5104.58"
+    }
+  },
+  "implementation_commit": "a3644ca3dce981cd31b85f9bbe66eb13d1866248",
+  "swiglu_limit": 5.0,
+  "configuration": {
+    "swiglu_limit": 5.0,
+    "stage2_fp8": false,
+    "fp4_scatter": false
+  },
+  "environment": {
+    "ROCR_VISIBLE_DEVICES": "GPU-5d8a72a332aa124c",
+    "HIP_VISIBLE_DEVICES": "0",
+    "TUNE_MOE_ROUTING_SEED": "0",
+    "TUNE_MOE_EXPERT_BALANCE": "False",
+    "AITER_MXFP4_TUNE_SWIGLU_LIMIT": "5",
+    "AITER_FLYDSL_STAGE2_FP8": "0",
+    "AITER_MXFP4_INTERMEDIATE": "0",
+    "FLYDSL_RUNTIME_CACHE_DIR": "/root/workspace/tmp_dev/mxfp4-port-runtime/targeted-04-gpt-2048-limit5-prune-vs-staged",
+    "CK_DIR": "/root/workspace/tmp_dev/aiter-mxfp4-integration/3rdparty/composable_kernel"
+  },
+  "fingerprints": {
+    "input": "1e8bff7bfa24f28ffa33c74d26b5519a28a72250e5a35ae9cd53e8ff52f1069a",
+    "topk_ids": "2944042b5fbfa639790fa52aefd597eb68335e66dcc368dd60412a5a2e83f072",
+    "topk_weights": "f284ddd2a5d8185ce2f844b63778e9b73f953f9611177384ddb80ee82fd6713e"
+  },
+  "measurement": {
+    "warmup": 5,
+    "iters": 101,
+    "metric": "normal continuous main run_perftest device kernel-duration sum; profiling wall is search diagnostic, not serving latency",
+    "repeats_per_pair": 3,
+    "one_prepared_fixture": true
+  },
+  "wall_seconds": 9.475999846123159
+}
