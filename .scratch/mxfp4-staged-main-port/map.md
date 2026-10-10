@@ -2,7 +2,7 @@
 
 Status: claimed
 
-The user approved the four-ticket breakdown on 2026-10-10 after [spec reviewer resolution](reviewer-comments.md). The sole current implementation tickets are published under [issues](issues/README.md); all four are `ready-for-agent`, with the blocking edges below. Implementation was authorized by the user and ticket 01 is now claimed. Target main remains `882ea79dd7cc7091f859a5bedac914523ac77bbd`.
+The user approved the four-ticket breakdown on 2026-10-10 after [spec reviewer resolution](reviewer-comments.md). The sole current implementation tickets are published under [issues](issues/README.md); ticket 01 is resolved and ticket 02 is claimed, with the blocking edges below. Implementation was authorized by the user; ticket 01 is resolved and ticket 02 is active. Target main remains `882ea79dd7cc7091f859a5bedac914523ac77bbd`.
 
 | ID | Ticket | Blocked by | Status |
 | --- | --- | --- | --- |
@@ -11,7 +11,7 @@ The user approved the four-ticket breakdown on 2026-10-10 after [spec reviewer r
 | 03 | [Configured execution and AOT](issues/03-configured-execution-and-aot.md) | 02 | ready-for-agent |
 | 04 | [Calibration and acceptance](issues/04-calibration-and-acceptance.md) | 03 | ready-for-agent |
 
-The approved delivery sequence is 01→02→03→04. Ticket 01 is the initial frontier; later tickets require their recorded blockers to be completed. Some AOT and prune/full parameter repairs in 03 could technically be prepared before 02, but the approved ticket order is retained to coordinate shared edits and verify complete configured staged behavior before closing 03. These are completion gates for whole tickets, not a claim that every internal change has the same code dependency. No partial-ready states or new blocking edges are introduced. Ticket 01 is resolved after integration merge and recorded acceptance. Ticket 02 is claimed and is the current frontier; tickets 03–04 remain blocked.
+The approved delivery sequence is 01→02→03→04. Ticket 01 was the initial frontier; later tickets require their recorded blockers to be completed. Some AOT and prune/full parameter repairs in 03 could technically be prepared before 02, but the approved ticket order is retained to coordinate shared edits and verify complete configured staged behavior before closing 03. These are completion gates for whole tickets, not a claim that every internal change has the same code dependency. No partial-ready states or new blocking edges are introduced. Ticket 01 is resolved after integration merge and recorded acceptance. Ticket 02 is claimed and is the current frontier; tickets 03–04 remain blocked.
 
 See [spec.md](spec.md), [plan.md](plan.md), [acceptance.md](acceptance.md) and [facts.md](facts.md) for contracts, execution order, checks and evidence. After ticket publication, the user authorized the pre-implementation reviewer corrections: spec is now `ready-for-agent`, its pause is removed, and current tickets include the clarified device/regression/environment/cost-planning requirements. This map tracks current ticket state; the spec defines behavior. The four-ticket order and staged algorithm remain unchanged.
 
