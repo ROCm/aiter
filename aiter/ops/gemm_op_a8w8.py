@@ -752,6 +752,12 @@ def gemm_a8w8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
+    """FP8 GEMM consuming shuffle_weight(layout=(16, 16)) weights.
+
+    The gfx1201 Triton path uses per-token FP32 activation scales and
+    per-channel FP32 weight scales. WQ may have a padded K >= XQ.shape[-1];
+    the padding is not included in the dot product.
+    """
     assert dtype in [
         torch.bfloat16,
         torch.float16,
