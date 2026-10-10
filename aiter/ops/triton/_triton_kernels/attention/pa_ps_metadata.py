@@ -14,6 +14,7 @@ def _pa_ps_tile_scan(
     NUM_SEQS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
+    """Write block-local inclusive prefixes and separate block totals."""
     block = tl.program_id(0)
     sequence = block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     context = tl.load(context_lengths + sequence, sequence < NUM_SEQS, other=0)
@@ -63,9 +64,11 @@ def _pa_ps_sequence_scan(
         tiles = (context.to(tl.int64) + 255) // 256
         total_tiles = tl.sum(tiles, 0)
     else:
-        prefix = tl.load(tile_prefix + sequence, valid, other=0)
-        previous = tl.load(tile_prefix + sequence - 1, valid & (local > 0), other=0)
-        tiles = tl.where(valid, prefix - previous, 0)
+        local_prefix = tl.load(tile_prefix + sequence, valid, other=0)
+        previous_local_prefix = tl.load(
+            tile_prefix + sequence - 1, valid & (local > 0), other=0
+        )
+        tiles = tl.where(valid, local_prefix - previous_local_prefix, 0)
         chunk = tl.arange(0, BLOCK_CHUNKS)
         total_tiles = tl.sum(
             tl.load(tile_totals + chunk, chunk < NUM_CHUNKS, other=0), 0
@@ -157,6 +160,7 @@ def _pa_ps_write_metadata(
     BLOCK_SIZE: tl.constexpr,
     BLOCK_PARTS: tl.constexpr,
 ):
+    """Store partition bases once; query tasks write base plus their query offset."""
     sequence = tl.program_id(0)
     head = tl.program_id(1)
     count = tl.load(sequence_info + sequence * 5)
@@ -181,23 +185,23 @@ def _pa_ps_write_metadata(
     begin = part * tiles // count
     end = (part + 1) * tiles // count
     partial = tl.where(count > 1, (partial_start + part) * MAX_QLEN, -1)
-    for query_part in range(query_parts):
+    for query_part in tl.range(0, query_parts):
         slot = head * total_work + work_start + part * query_parts + query_part
         first_query = query_start + query_part
         last_query = tl.where(query_parts > 1, first_query + 1, query_end)
         partial_row = tl.where(count > 1, partial + query_part, -1)
         tl.store(work_info + slot * 8, sequence, active)
-        tl.store(work_info + slot * 8 + 1, partial_row, active)
-        tl.store(work_info + slot * 8 + 2, first_query, active)
-        tl.store(work_info + slot * 8 + 3, last_query, active)
+        tl.store(work_info + slot * 8 + 1, partial_row.to(tl.int32), active)
+        tl.store(work_info + slot * 8 + 2, first_query.to(tl.int32), active)
+        tl.store(work_info + slot * 8 + 3, last_query.to(tl.int32), active)
         tl.store(
             work_info + slot * 8 + 4,
-            page_start + tl.minimum(begin * (256 // PAGE_SIZE), pages),
+            (page_start + tl.minimum(begin * (256 // PAGE_SIZE), pages)).to(tl.int32),
             active,
         )
         tl.store(
             work_info + slot * 8 + 5,
-            page_start + tl.minimum(end * (256 // PAGE_SIZE), pages),
+            (page_start + tl.minimum(end * (256 // PAGE_SIZE), pages)).to(tl.int32),
             active,
         )
         tl.store(work_info + slot * 8 + 6, 0, active)
@@ -209,11 +213,13 @@ def _pa_ps_write_metadata(
     if head == 0:
         if sequence == 0:
             tl.store(reduce_indptr, 0)
-        tl.store(reduce_indptr + sequence + 1, partial_end)
+        tl.store(reduce_indptr + sequence + 1, partial_end.to(tl.int32))
         tl.store(reduce_final_map + sequence * 2, query_start)
         tl.store(reduce_final_map + sequence * 2 + 1, query_end)
         tl.store(
-            reduce_partial_map + partial_start + part, partial, active & (count > 1)
+            reduce_partial_map + partial_start + part,
+            partial.to(tl.int32),
+            active & (count > 1),
         )
 
 
@@ -299,7 +305,7 @@ def _pa_ps_schedule(
         work_offset = work_end - count + lower
     tl.store(
         work_indptr + group,
-        head * total_work + work_offset,
+        (head * total_work + work_offset).to(tl.int32),
         group <= NUM_CU,
     )
     tl.store(work_metadata_ptrs, work_indptr.to(tl.uint64))

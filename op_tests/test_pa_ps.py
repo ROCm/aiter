@@ -611,9 +611,49 @@ def test_pa_ps(
             torch.set_printoptions(threshold=999999, linewidth=120)
             print(f"==>load {name} from {file_name}:\n{meta}")
     elif metadata_planner == "tile":
-        from aiter.ops.triton.attention.pa_ps_metadata import plan_pa_ps_metadata
+        from aiter.ops.triton.attention.pa_ps_metadata import (
+            PaPsMetadataPlan,
+            plan_pa_ps_metadata,
+        )
+        from aiter.ops.triton.utils.config_utils import (
+            load_config_json,
+            resolve_config_dir,
+        )
 
-        plan = plan_pa_ps_metadata(
+        config = load_config_json(
+            f"{resolve_config_dir('attention', 'PA-PS-METADATA')}/DEFAULT.json"
+        )
+        scan_block_size = config["BLOCK_SIZE"]
+        chunks = (batch_size + scan_block_size - 1) // scan_block_size
+        plan = PaPsMetadataPlan(
+            work_metadata_ptrs=work_metadata_ptrs,
+            work_indptr=work_indptr,
+            work_info=work_info,
+            reduce_indptr=reduce_indptr,
+            reduce_final_map=reduce_final_map,
+            reduce_partial_map=reduce_partial_map,
+            tile_prefix=torch.empty(
+                (batch_size,), dtype=torch.int64, device=seq_lens_kv.device
+            ),
+            tile_totals=torch.empty(
+                (chunks,), dtype=torch.int64, device=seq_lens_kv.device
+            ),
+            sequence_info=torch.empty(
+                (batch_size, 5), dtype=torch.int64, device=seq_lens_kv.device
+            ),
+            chunk_prefix=torch.empty(
+                (chunks, 3), dtype=torch.int64, device=seq_lens_kv.device
+            ),
+            num_heads_per_head_k=num_query_heads // num_kv_heads,
+            num_heads_k=num_kv_heads,
+            max_qlen=int(max_qlen),
+            block_size=block_size,
+            max_partitions=256,
+            work_overhead=config["work_overhead"],
+            scan_block_size=scan_block_size,
+            num_warps=config["num_warps"],
+        )
+        plan_pa_ps_metadata(
             qo_indptr,
             kv_indptr,
             seq_lens_kv,
@@ -621,19 +661,7 @@ def test_pa_ps(
             num_kv_heads,
             max_qlen=int(max_qlen),
             block_size=block_size,
-        )
-        work_metadata_ptrs = plan.work_metadata_ptrs
-        work_indptr = plan.work_indptr
-        work_info = plan.work_info
-        reduce_indptr = plan.reduce_indptr
-        reduce_final_map = plan.reduce_final_map
-        reduce_partial_map = plan.reduce_partial_map
-        metadata_map.update(
-            work_indptr=work_indptr,
-            work_info=work_info,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
+            plan=plan,
         )
         torch.cuda.synchronize()
         start_event = torch.cuda.Event(enable_timing=True)

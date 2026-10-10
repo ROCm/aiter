@@ -3,7 +3,6 @@ from dataclasses import dataclass
 import torch
 import triton
 
-from aiter.ops.attention import get_pa_metadata_info_v1
 from aiter.ops.triton._triton_kernels.attention.pa_ps_metadata import (
     _pa_ps_chunk_scan,
     _pa_ps_schedule,
@@ -11,12 +10,18 @@ from aiter.ops.triton._triton_kernels.attention.pa_ps_metadata import (
     _pa_ps_tile_scan,
     _pa_ps_write_metadata,
 )
-from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 
 @dataclass(frozen=True)
 class PaPsMetadataPlan:
-    """Preallocated PA_PS ABI tensors and private GPU planning workspace."""
+    """Caller-owned PA_PS tensors, planning workspace, and launch configuration.
+
+    The six metadata tensors use get_pa_metadata_info_v1 shapes and dtypes.
+    Workspace tensors are contiguous int64: tile_prefix[batch],
+    tile_totals[chunks], sequence_info[batch, 5], and chunk_prefix[chunks, 3],
+    where chunks = ceil(batch / scan_block_size). Allocate all tensors on
+    the input GPU before capture; their lifetime and reuse belong to the caller.
+    """
 
     work_metadata_ptrs: torch.Tensor
     work_indptr: torch.Tensor
@@ -49,9 +54,9 @@ def plan_pa_ps_metadata(
     block_size: int = 16,
     max_partitions: int = 256,
     work_overhead: int | None = None,
-    plan: PaPsMetadataPlan | None = None,
+    plan: PaPsMetadataPlan,
 ) -> PaPsMetadataPlan:
-    """Build or refresh tile-weighted metadata for unchanged PA_PS ASM kernels.
+    """Fill caller-provided metadata for unchanged PA_PS ASM kernels in place.
 
     Inputs are contiguous GPU int32 vectors with packed Q/page indptrs. Each
     request has 1..max_qlen Q rows and valid context/page lengths for the ASM
@@ -62,12 +67,15 @@ def plan_pa_ps_metadata(
     tasks fit the persistent TG budget. KV partitions and reduction maps stay
     unchanged, including the max_qlen-spaced partial layout.
 
-    Returns the six existing PA metadata tensors plus reusable workspace.
-    Allocate outside graph capture, then pass plan to refresh on the current
-    stream without allocation or device-to-host reads. Refresh after changing
-    lengths or indptrs. No-split records retain partial_qo_loc=-1. This is an
-    opt-in scheduling policy, not a replacement for get_pa_metadata_v1.
+    Returns the supplied plan. The integration layer allocates its buffers,
+    loads the launch configuration, and owns reuse and graph capture. Every
+    call fills the plan on the input device's current stream without allocation
+    or device-to-host reads. Refresh after changing lengths or indptrs.
+    No-split records retain partial_qo_loc=-1. This is an opt-in scheduling
+    policy, not a replacement for get_pa_metadata_v1.
     """
+    if not isinstance(plan, PaPsMetadataPlan):
+        raise TypeError("plan must be a caller-allocated PaPsMetadataPlan")
     device = context_lengths.device
     batch = context_lengths.numel()
     for name, tensor, size in (
@@ -103,33 +111,6 @@ def plan_pa_ps_metadata(
         raise ValueError("work_overhead must be an integer in [1, 1024]")
 
     with torch.cuda.device(device):
-        if plan is None:
-            if torch.cuda.is_current_stream_capturing():
-                raise ValueError("allocate a plan before graph capture")
-            config = load_config_json(
-                f"{resolve_config_dir('attention', 'PA-PS-METADATA')}/DEFAULT.json"
-            )
-            scan_block_size = config["BLOCK_SIZE"]
-            chunks = triton.cdiv(batch, scan_block_size)
-            metadata = [
-                torch.empty(shape, dtype=dtype, device=device)
-                for shape, dtype in get_pa_metadata_info_v1(batch, num_heads_k)
-            ]
-            plan = PaPsMetadataPlan(
-                *metadata,
-                torch.empty((batch,), dtype=torch.int64, device=device),
-                torch.empty((chunks,), dtype=torch.int64, device=device),
-                torch.empty((batch, 5), dtype=torch.int64, device=device),
-                torch.empty((chunks, 3), dtype=torch.int64, device=device),
-                num_heads_per_head_k,
-                num_heads_k,
-                max_qlen,
-                block_size,
-                max_partitions,
-                config["work_overhead"] if work_overhead is None else work_overhead,
-                scan_block_size,
-                config["num_warps"],
-            )
         if (
             plan.sequence_info.shape != (batch, 5)
             or plan.sequence_info.device != device
