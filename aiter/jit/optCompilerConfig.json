@@ -1,4 +1,29 @@
 {
+    "module_sparse_mla_bf16": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/kernels/mla/sparse_mla_bf16.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_common.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_full_lds.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_full_lds_pv.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_headtiles.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_reduce.cuh'",
+            "f'{AITER_CSRC_DIR}/kernels/mla/hk/sparse_mla_bf16_wave4.cuh'"
+        ],
+        "flags_extra_cc": ["'-DENABLE_CK=0'"],
+        "flags_extra_hip": [
+            "'-DKITTENS_CDNA4'",
+            "'-fno-gpu-flush-denormals-to-zero'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''",
+        "third_party": [
+            "'HipKittens'"
+        ],
+        "is_experimental": "True"
+    },
     "module_aiter_core": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/aiter_core_pybind.cu'"
