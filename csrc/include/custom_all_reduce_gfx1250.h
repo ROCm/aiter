@@ -68,6 +68,47 @@ void reduce_scatter(fptr_t _fa,
                     int64_t m, int64_t n, int64_t k,
                     int64_t split_dim,
                     int64_t reg_ptr, int64_t reg_bytes);
+// LL128 unroll2 staging: each rank allocates its own scratch, then the bases are
+// exchanged (raw pointers on the VMM path, IPC handles + offsets otherwise).
+// Required before the LL128 routing band can be used.
+int64_t alloc_ll128_unroll2_scratch(fptr_t _fa);
+void init_ll128_unroll2_peers(fptr_t _fa, const std::vector<int64_t>& all_ptrs);
+void init_ll128_unroll2_peers_ipc(fptr_t _fa,
+                                  const std::vector<int64_t>& ipc_handle_ptrs,
+                                  const std::vector<int64_t>& offsets);
+// CAS 2-shot barrier flags. Required before the CAS routing band can be used.
+int64_t alloc_cas_flags(fptr_t _fa);
+void init_cas_peers(fptr_t _fa, const std::vector<int64_t>& all_ptrs);
+void init_cas_peers_ipc(fptr_t _fa,
+                        const std::vector<int64_t>& ipc_handle_ptrs,
+                        const std::vector<int64_t>& offsets);
+// Staging for the CAS 2-shot variant that keeps `input` read-only. Only needed
+// by all_reduce_cas_2shot_scratch, which is not on the routed path.
+int64_t alloc_cas_scratch(fptr_t _fa);
+void init_cas_scratch_peers(fptr_t _fa, const std::vector<int64_t>& all_ptrs);
+void init_cas_scratch_peers_ipc(fptr_t _fa,
+                                const std::vector<int64_t>& ipc_handle_ptrs,
+                                const std::vector<int64_t>& offsets);
+// Standalone entry points, for benchmarking a single kernel in isolation. The
+// routed path (all_reduce above) picks kernels by size and never calls these.
+void all_reduce_ll128_unroll2(fptr_t _fa,
+                              const aiter_tensor_t& inp,
+                              const aiter_tensor_t& out,
+                              int64_t block_size);
+void all_reduce_cas_2shot(fptr_t _fa,
+                          const aiter_tensor_t& inp,
+                          const aiter_tensor_t& out,
+                          int64_t reg_inp_ptr,
+                          int64_t reg_inp_bytes,
+                          int64_t block_size,
+                          int64_t unroll_factor);
+void all_reduce_cas_2shot_scratch(fptr_t _fa,
+                                  const aiter_tensor_t& inp,
+                                  const aiter_tensor_t& out,
+                                  int64_t reg_inp_ptr,
+                                  int64_t reg_inp_bytes,
+                                  int64_t block_size,
+                                  int64_t unroll_factor);
 void dispose(fptr_t _fa);
 int64_t meta_size();
 // register_input/output_buffer receive direct device pointers per rank.
