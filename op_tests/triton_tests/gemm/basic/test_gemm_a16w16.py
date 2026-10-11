@@ -307,11 +307,26 @@ def test_gemm_a16_w16_gluon_compute_bound(M: int, N: int, K: int, dtype, output,
     torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
 
 
-def test_gemm_a16_w16_gluon_compute_bound_is_scheduled():
-    """The compiled kernel carries the MFMA scheduler's sched.barriers. A Triton
-    that accepted schedule_hint but ignored it would still pass the numerical
-    tests, about 15% slower."""
-    M, N, K = 4096, 4096, 8192
+@pytest.mark.parametrize(
+    "tile",
+    [
+        (256, 256),
+        (256, 128),
+        (128, 256),
+        (128, 128),
+        (256, 64),
+        (64, 256),
+        (128, 64),
+        (64, 128),
+        (64, 64),
+    ],
+)
+@pytest.mark.parametrize("bias", [False, True])
+def test_gemm_a16_w16_gluon_compute_bound_tiles(tile, bias):
+    """Every tile gives the right result, and the compiled kernels carry the MFMA
+    scheduler's sched.barriers: a Triton that accepted schedule_hint but ignored
+    it would still pass the numerical check, about 15% slower."""
+    M, N, K = 1024, 1024, 512
     _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
     from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
         _gemm_a16w16_compute_bound_kernel,
@@ -320,9 +335,19 @@ def test_gemm_a16_w16_gluon_compute_bound_is_scheduled():
     x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
         M, N, K, torch.bfloat16, output=False
     )
-    gemm_a16w16(
-        x, w, None, out_dtype, None, backend="gluon", kernel_type="compute_bound"
+    b = torch.randn((N,), dtype=torch.bfloat16, device="cuda") if bias else None
+    torch_out = F.linear(x, w, bias=b)
+    out = gemm_a16w16(
+        x,
+        w,
+        b,
+        out_dtype,
+        None,
+        backend="gluon",
+        kernel_type="compute_bound",
+        config={"BLOCK_M": tile[0], "BLOCK_N": tile[1]},
     )
+    torch.testing.assert_close(out, torch_out, atol=1e-1, rtol=1e-2)
     # device_caches[device] = (kernel_cache, key_cache, target, backend, binder)
     compiled = [
         kernel
