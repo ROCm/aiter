@@ -413,12 +413,10 @@ def build_causal_conv1d_update_module(
                 for j in fx.range_constexpr(W):
                     acc = acc + w_col[j] * win[j]
                 if fx.const_expr(SILU):
-                    # The bare intrinsic is what the Triton oracles lower to, so
-                    # it is what keeps the parity suite bit-exact.
+                    # Explicit afn lowers to the native exp2 used by the Triton
+                    # oracles, keeping the parity suite bit-exact.
                     f32_ty = fx.Float32.ir_type
-                    ex = fx.Float32(
-                        rocdl.exp2(f32_ty, (acc * fx.Float32(-_LOG2E)).ir_value())
-                    )
+                    ex = fx.exp2(acc * fx.Float32(-_LOG2E), fastmath="afn")
                     acc = acc * fx.Float32(rocdl.rcp(f32_ty, fx.Float32(1.0) + ex))
                 o_vals.append(acc.to(elem_dtype))
                 window = win[1:]  # slide the register window left by one
@@ -845,11 +843,9 @@ def build_causal_conv1d_update_sglang_module(
                 return acc + (w * v).to(elem_dtype).to(fx.Float32)
 
             def _silu(acc):
-                # Bare intrinsic, as above: a library sigmoid breaks parity.
+                # The afn exp2 takes the same native path as above.
                 f32_ty = fx.Float32.ir_type
-                ex = fx.Float32(
-                    rocdl.exp2(f32_ty, (acc * fx.Float32(-_LOG2E)).ir_value())
-                )
+                ex = fx.exp2(acc * fx.Float32(-_LOG2E), fastmath="afn")
                 return acc * fx.Float32(rocdl.rcp(f32_ty, fx.Float32(1.0) + ex))
 
             def _hist(cur, cur_const):

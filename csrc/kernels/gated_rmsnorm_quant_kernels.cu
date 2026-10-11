@@ -340,7 +340,7 @@ void gated_rmsnorm_fp8_group_quant(
  * - ONLY supports head_dim=128 (RMSNorm group) and num_heads <= 128.
  * - AMD GPU: warp_size=64.
  */
-template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16>
+template <typename DTYPE_I, typename DTYPE_O, int GROUP_SIZE = 128, int THREAD_DATA_SIZE = 16, bool USE_SIGMOID = false>
 __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
     DTYPE_O* __restrict__ out,           // [num_tokens, num_heads * head_dim]
     float* __restrict__ scale,           // [num_tokens]
@@ -425,13 +425,18 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
         float variance = sum_sq * inv_head_dim;
         float inv_std = rsqrtf(variance + static_cast<float>(epsilon));
 
-        // norm(x) * silu(z), and track this thread's local amax.
+        // norm(x) * gate(z), and track this thread's local amax.
+        // gate = sigmoid(z) if USE_SIGMOID, else silu(z).
         #pragma unroll
         for (int i = 0; i < THREAD_DATA_SIZE; i++) {
             float normed = x_vals[i] * weight_vals[i] * inv_std;
             float sigmoid_z = 1.0f / (1.0f + expf(-z_vals[i]));
-            float silu_z = z_vals[i] * sigmoid_z;
-            gated_vals[i] = normed * silu_z;
+            if constexpr (USE_SIGMOID) {
+                gated_vals[i] = normed * sigmoid_z;
+            } else {
+                float silu_z = z_vals[i] * sigmoid_z;
+                gated_vals[i] = normed * silu_z;
+            }
             local_max = fmaxf(local_max, fabsf(gated_vals[i]));
         }
     }
@@ -487,7 +492,7 @@ __global__ void gated_rmsnorm_fp8_per_token_quant_kernel(
     }
 }
 
-template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE>
+template <typename DTYPE_I, typename DTYPE_O, int THREAD_DATA_SIZE, bool USE_SIGMOID>
 void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
     aiter_tensor_t& out,
     aiter_tensor_t& scale,
@@ -519,7 +524,7 @@ void gated_rmsnorm_fp8_per_token_quant_launcher_impl(
     const int64_t z_token_stride = z.stride(0);
     const int64_t z_head_stride  = z.stride(1);
 
-    gated_rmsnorm_fp8_per_token_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE>
+    gated_rmsnorm_fp8_per_token_quant_kernel<DTYPE_I, DTYPE_O, GROUP_SIZE, THREAD_DATA_SIZE, USE_SIGMOID>
         <<<grid, block, 0, stream>>>(
             reinterpret_cast<DTYPE_O*>(out.data_ptr()),
             reinterpret_cast<float*>(scale.data_ptr()),
@@ -544,7 +549,8 @@ void gated_rmsnorm_fp8_per_token_quant_launcher(
     const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim]
     const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim]
     const aiter_tensor_t& weight,   // [head_dim]
-    double epsilon)
+    double epsilon,
+    bool use_sigmoid)
 {
     AITER_CHECK(x.dim() == 3, "Input x must be 3D: [num_tokens, num_heads, head_dim]");
     AITER_CHECK(z.dim() == 3, "Input z must be 3D: [num_tokens, num_heads, head_dim]");
@@ -577,8 +583,13 @@ void gated_rmsnorm_fp8_per_token_quant_launcher(
     AITER_CHECK(static_cast<int64_t>(scale.numel()) == num_tokens, "scale must have num_tokens elements, got ", scale.numel());
 
     constexpr int thread_data_size = 16;
-    gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size>(
-        out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+    if (use_sigmoid) {
+        gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, true>(
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+    } else {
+        gated_rmsnorm_fp8_per_token_quant_launcher_impl<DTYPE_I, DTYPE_O, thread_data_size, false>(
+            out, scale, x, z, weight, epsilon, num_tokens, num_heads, head_dim);
+    }
 }
 
 /**
@@ -590,7 +601,8 @@ void gated_rmsnorm_fp8_per_token_quant(
     const aiter_tensor_t& x,        // [num_tokens, num_heads, head_dim]
     const aiter_tensor_t& z,        // [num_tokens, num_heads, head_dim]
     const aiter_tensor_t& weight,   // [head_dim]
-    double epsilon)
+    double epsilon,
+    bool use_sigmoid)
 {
     AITER_CHECK(x.is_gpu(), "Input x must be on CUDA device");
     AITER_CHECK(z.is_gpu(), "Input z must be on CUDA device");
@@ -611,10 +623,10 @@ void gated_rmsnorm_fp8_per_token_quant(
 
     if (x.dtype() == AITER_DTYPE_bf16) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::bf16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon);
+            out, scale, x, z, weight, epsilon, use_sigmoid);
     } else if (x.dtype() == AITER_DTYPE_fp16) {
         gated_rmsnorm_fp8_per_token_quant_launcher<opus::fp16_t, opus::fp8_t>(
-            out, scale, x, z, weight, epsilon);
+            out, scale, x, z, weight, epsilon, use_sigmoid);
     } else {
         AITER_CHECK(false, "Unsupported dtype combination. Input: ", AiterDtype_to_str(x.dtype()),
                     ", Output: ", AiterDtype_to_str(out.dtype()));
