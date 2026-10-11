@@ -35,7 +35,6 @@ from .common import (
     poll_sys_ge,
     rsrc,
     sum_live,
-    traced,
     uni,
     wave_red,
 )
@@ -118,7 +117,7 @@ def compile_sp_rs_norm(
     def lds_stf(L, off, v):
         lds_st(L, off, fx.Float32(v).bitcast(fx.Int32))
 
-    @traced
+    @flyc.jit
     def wait_epoch(a, addr):
         cur = poll_sys_ge(addr, a["epoch"], 1)
         if before(cur, a["epoch"]):
@@ -137,7 +136,7 @@ def compile_sp_rs_norm(
             ks = ((ks == i32(1)) & (cap >= i32(d))).select(i32(d), ks)
         return rt, ks
 
-    @traced
+    @flyc.jit
     def router_tasks(L, a, tid):
         m = a["m"]
         bid = i32(gpu.block_id("x"))
@@ -250,7 +249,7 @@ def compile_sp_rs_norm(
                 router_row(a, lane, rt, i32(rl_), KS)
             gpu.barrier()
 
-    @traced
+    @flyc.jit
     def router_row(a, lane, rt, rl, KS):
         rzp = rsrc(a["zp"])
         rb = rsrc(a["bias"])
@@ -361,7 +360,7 @@ def compile_sp_rs_norm(
                 0,
             )
 
-    @traced
+    @flyc.jit
     def blk_sum(L, tid, v):
         r = wave_red(v.bitcast(fx.Int32), tid % i32(64), fadd)
         if ((tid % i32(64)) == i32(0)) & (tid < i32(NTH)):
@@ -373,7 +372,7 @@ def compile_sp_rs_norm(
         gpu.barrier()
         return t
 
-    @traced
+    @flyc.jit
     def send_rows(a, tid):
         m = a["m"]
         bid = i32(gpu.block_id("x"))
@@ -414,7 +413,7 @@ def compile_sp_rs_norm(
                         AUX_SYS,
                     )
 
-    @traced
+    @flyc.jit
     def post_flags(L, a, tid):
         rocdl.s_waitcnt(vmcnt=0)
         gpu.barrier()
@@ -426,7 +425,7 @@ def compile_sp_rs_norm(
             fo = fx.Int64(a["off_f"]) + fx.Int64((a["rank"] * i32(NB) + bid) * i32(4))
             g_st_sys(fx.Int64(peer) + fo, a["epoch"])
 
-    @traced
+    @flyc.jit
     def wait_row(a, tid, r):
         if tid < i32(tp):
             k = (a["rank"] - tid - i32(1) + i32(tp)) % i32(tp)
@@ -440,7 +439,7 @@ def compile_sp_rs_norm(
                 wait_epoch(a, addr)
         gpu.barrier()
 
-    @traced
+    @flyc.jit
     def reduce_rows(L, a, tid):
         m = a["m"]
         bid = i32(gpu.block_id("x"))
