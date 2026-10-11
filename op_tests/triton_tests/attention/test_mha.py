@@ -41,7 +41,13 @@ def _test_mha_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        head_dim=HEAD_SZ,
+        v_head_dim=HEAD_SZ,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.manual_seed(20)
     torch.cuda.empty_cache()
@@ -465,7 +471,13 @@ def _test_mha_varlen_impl(
     backend: str = "triton",
     dtype=torch.bfloat16,
 ):
-    skip_if_gluon_unsupported(backend, dropout_p=DROPOUT)
+    skip_if_gluon_unsupported(
+        backend,
+        dropout_p=DROPOUT,
+        head_dim=HEAD_SZ,
+        v_head_dim=HEAD_SZ,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     torch.set_printoptions(threshold=10000)
     torch.cuda.empty_cache()

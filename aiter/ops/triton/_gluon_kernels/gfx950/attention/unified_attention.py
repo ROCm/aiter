@@ -4,9 +4,12 @@ import triton.experimental.gluon.language as gl
 import triton.language as tl
 from packaging.version import Version
 from triton.experimental import gluon
-from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 
+from aiter.ops.triton._gluon_kernels.common.utils import (
+    elementwise_max_prop_nan,
+    reduce_max_prop_nan,
+)
 from aiter.ops.triton.utils.common_utils import strip_annotate
 from aiter.ops.triton.utils.types import e4m3_dtype
 
@@ -50,19 +53,6 @@ def _async_copy_accepts_distributed_layout() -> bool:
 # Use the offset_bases / DistributedLinearLayout KV-load path only when async_copy
 # accepts it; otherwise fall back to the BlockedLayout path (works everywhere).
 ASYNC_COPY_SUPPORTS_DISTRIBUTED = _async_copy_accepts_distributed_layout()
-
-_MAX_PROPAGATE_NAN_ALL = gl.constexpr(PropagateNan.ALL)
-
-
-@gluon.jit
-def elementwise_max_prop_nan(a, b):
-    return gl.maximum(a, b, propagate_nan=_MAX_PROPAGATE_NAN_ALL)
-
-
-@gluon.jit
-def reduce_max_prop_nan(input, axis=None, keep_dims=False):
-    """Reduce-max that propagates NaN. Skipping NaN handling is extra work on AMD."""
-    return gl.reduce(input, axis, elementwise_max_prop_nan, keep_dims=keep_dims)
 
 
 @gluon.constexpr_function
