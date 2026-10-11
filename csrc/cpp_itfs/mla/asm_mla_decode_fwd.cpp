@@ -58,20 +58,13 @@ void asm_mla_decode_fwd(std::optional<std::string> folder,
     }
     if(not_built(folder.value()))
     {
-        std::string cmd = fmt::format(
-            R"(python3 -m csrc.cpp_itfs.mla.asm_mla_decode_fwd --gqa_ratio={gqa_ratio} \
-                                    --page_size={page_size} \
-                                    --q_dtype={q_dtype} \
-                                    --kv_dtype={kv_dtype} \
-                                    --num_kv_splits={num_kv_splits} \
-                                    --v_head_dim={v_head_dim})",
-            fmt::arg("gqa_ratio", gqa_ratio),
-            fmt::arg("page_size", page_size),
-            fmt::arg("q_dtype", q_dtype),
-            fmt::arg("kv_dtype", kv_dtype),
-            fmt::arg("num_kv_splits", num_kv_splits),
-            fmt::arg("v_head_dim", v_head_dim));
-        execute_cmd(cmd);
+        run_codegen("csrc.cpp_itfs.mla.asm_mla_decode_fwd",
+                    {{"gqa_ratio", std::to_string(gqa_ratio)},
+                     {"page_size", std::to_string(page_size)},
+                     {"q_dtype", q_dtype},
+                     {"kv_dtype", kv_dtype},
+                     {"num_kv_splits", std::to_string(num_kv_splits)},
+                     {"v_head_dim", std::to_string(v_head_dim)}});
     }
     run_lib(func_name,
             folder.value(),
