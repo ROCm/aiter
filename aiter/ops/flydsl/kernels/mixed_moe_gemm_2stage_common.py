@@ -539,7 +539,7 @@ def compile_mixed_moe_gemm1_common(
                 first_m = group_id * group_m
                 remaining_m = grid_y - first_m
                 group_size_m = (fx.Uint64(remaining_m) < fx.Uint64(group_m)).select(
-                    remaining_m, fx.Index(group_m)
+                    remaining_m, group_m
                 )
                 workgroup_in_group = workgroup_id % workgroups_per_group
                 bx_persist = first_m + (workgroup_in_group % group_size_m)
@@ -547,7 +547,7 @@ def compile_mixed_moe_gemm1_common(
 
             by_n = by * tile_n
 
-            k_base_idx = fx.Index(0)
+            k_base_idx = 0
             if const_expr(is_splitk):
                 bz = gpu.block_id("z")
                 k_base_idx = bz * k_dim
@@ -795,7 +795,7 @@ def compile_mixed_moe_gemm1_common(
                     body_lds_x_pong = base_ptr_pong + fx.Int64(pong_off)
                     body_lds_x_ping = base_ptr_ping + fx.Int64(ping_off)
                 else:
-                    wave_k_id = fx.Index(0)
+                    wave_k_id = 0
 
                 num_acc_n = n_per_wave // 16
                 c_n_per_wave = n_per_wave
@@ -3314,7 +3314,7 @@ def compile_mixed_moe_gemm2_common(
                 first_m = group_id * group_m
                 remaining_m = grid_y - first_m
                 group_size_m = (fx.Uint64(remaining_m) < fx.Uint64(group_m)).select(
-                    remaining_m, fx.Index(group_m)
+                    remaining_m, group_m
                 )
                 workgroup_in_group = workgroup_id % workgroups_per_group
                 bx_persist = first_m + (workgroup_in_group % group_size_m)
