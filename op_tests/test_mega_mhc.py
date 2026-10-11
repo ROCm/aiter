@@ -529,6 +529,7 @@ def run_correctness_checks():
                         2047,
                         2048,
                         2049,
+                        4095,
                         4097,
                         4161,
                         7920,
@@ -548,7 +549,18 @@ def run_correctness_checks():
                 [
                     (tokens, mode)
                     for mode in MODES
-                    for tokens in [1025, 2048, 3072, 4096, 4160, 8192, 8193, 15841]
+                    for tokens in [
+                        1025,
+                        2048,
+                        2049,
+                        3072,
+                        4095,
+                        4096,
+                        4160,
+                        8192,
+                        8193,
+                        15841,
+                    ]
                 ],
             ),
             (
@@ -557,7 +569,7 @@ def run_correctness_checks():
             ),
             (
                 check_switch_post_on_same_workspace,
-                [(tokens,) for tokens in [16, 17, 128, 2048]],
+                [(tokens,) for tokens in [16, 17, 128, 2048, 2049, 4096]],
             ),
             (
                 check_generation_wrap_and_changed_graph_input,

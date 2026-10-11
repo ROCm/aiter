@@ -16,7 +16,10 @@ namespace aiter {
 namespace {
 using StreamTuning = mega_mhc_stream::Tuning<MHC_STREAM_VARIANT>;
 template <bool POST>
-using KernelTuning  = mega_mhc_stream::Tuning<MHC_STREAM_VARIANT, POST>;
+using KernelTuning = mega_mhc_stream::Tuning<MHC_STREAM_VARIANT, POST>;
+template <bool POST, int STREAMS>
+constexpr int launch_threads =
+    MHC_STREAM_VARIANT == 11 && POST && STREAMS == 4 ? 512 : KernelTuning<POST>::threads;
 constexpr int BM    = 16;
 constexpr int BK    = 32;
 constexpr int SLOTS = 32; // 24 projection outputs, residual sqsum, collapse sqsum
@@ -66,7 +69,7 @@ __device__ __forceinline__ float sum_element_lanes(float x)
     return x;
 }
 
-template <int SPLIT, int TILE_M = BM, int STAGE_COLS = 0, int GROUPS = 1>
+template <int SPLIT, int TILE_M = BM, int STAGE_COLS = 0, int GROUPS = 1, int THREADS = 256>
 __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   float (&reduction)[4][TILE_M][SLOTS],
                                                   unsigned int& last,
@@ -91,10 +94,10 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
                                                   int sinkhorn_repeat,
                                                   bf16* staged = nullptr)
 {
-    constexpr int hidden = 5120, THREADS = 256;
-    const int split_k = SPLIT ? SPLIT : split_arg;
-    const int tid     = threadIdx.x;
-    const int nblocks = (tokens + TILE_M - 1) / TILE_M;
+    constexpr int hidden = 5120;
+    const int split_k    = SPLIT ? SPLIT : split_arg;
+    const int tid        = threadIdx.x;
+    const int nblocks    = (tokens + TILE_M - 1) / TILE_M;
     auto g_norm =
         opus::make_gmem<bf16>(layer_input + static_cast<int64_t>(token_block) * TILE_M * hidden,
                               tile_rows * hidden * sizeof(bf16));
@@ -162,7 +165,7 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
     __syncthreads();
 
     // One 16-lane subgroup per token; a larger M tile uses two gate batches.
-    for(int gate_base = 0; gate_base < TILE_M; gate_base += 16)
+    for(int gate_base = 0; (THREADS == 256 || tid < 256) && gate_base < TILE_M; gate_base += 16)
     {
         const int gate_row   = gate_base + tid / 16;
         const int gate_lane  = (tid % 16) ^ ((tid & 4) ? 3 : 0) ^ ((tid & 8) ? 4 : 0);
@@ -208,7 +211,47 @@ __device__ __forceinline__ void finish_last_split(float (&total)[TILE_M][SLOTS],
     // rounded collapse visible to these ordinary vector loads.
     // Batch four independent vectors to overlap normalization loads. Buffer
     // bounds discard tail-row stores; clamp padded rows when reading rstd.
-    if constexpr(GROUPS >= 4 && STAGE_COLS > 0)
+    // Keep the main loop's 128-byte segments; each lane normalizes two rows
+    // at the same column and reuses one weight vector. The LDS/global choice
+    // is uniform within each wave.
+    if constexpr(GROUPS == 8 && STAGE_COLS > 0)
+    {
+        static_assert(TILE_M == 16 && THREADS == 512 && SPLIT == 1);
+        const int group = tid / 64, lane = tid % 64;
+        const int row = lane / 8, k_lane = (lane % 8) * 8;
+        const float inv[2] = {total[row][25], total[row + 8][25]};
+        for(int k = 0; k < hidden / GROUPS; k += 64)
+        {
+            const int col = group * (hidden / GROUPS) + k + k_lane;
+            bf16x8 x[2], w = load_vector_nbytes<bf16, 8, 16>(g_weight, col);
+#pragma unroll
+            for(int u = 0; u < 2; ++u)
+            {
+                const int r = row + u * 8;
+                if(k < STAGE_COLS / GROUPS)
+                {
+                    const int p  = group * (STAGE_COLS / GROUPS) + k + k_lane;
+                    const int sw = ((p / 8) ^ ((r & 7) ^ ((r & 1) << 2))) * 8 + (p & 7);
+                    x[u]         = *reinterpret_cast<const bf16x8*>(staged + r * STAGE_COLS + sw);
+                }
+                else
+                    x[u] = load_vector_nbytes<bf16, 8, 16, 1>(g_norm, r * hidden + col);
+            }
+            __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+            for(int u = 0; u < 2; ++u)
+            {
+                bf16x8 out;
+#pragma unroll
+                for(int e = 0; e < 8; ++e)
+                    out[e] = opus::fp32_to_bf16(static_cast<float>(x[u][e]) * inv[u] *
+                                                static_cast<float>(w[e]));
+                store_vector_nbytes<bf16, bf16, 8, 16, GROUP_NT>(
+                    g_norm, out, (row + u * 8) * hidden + col);
+            }
+        }
+    }
+    else if constexpr(GROUPS >= 4 && STAGE_COLS > 0)
     {
         const int group = tid / 64, lane = tid % 64;
         for(int i = lane * 8; i < tile_rows * (hidden / GROUPS); i += 64 * 8)
@@ -1083,15 +1126,21 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
 #if defined(__gfx950__)
     static_assert(TILE_M == 16 || TILE_M == 32);
     static_assert(STAGED >= 0 && STAGED < 5120 && STAGED % 512 == 0);
-    constexpr int THREADS = 256, hidden = 5120, BM = TILE_M, MT = BM / 16;
+    constexpr bool EIGHT_WAVE_POST = HAS_POST && POST_STREAMS == 4 && MHC_STREAM_VARIANT == 11;
+    constexpr int THREADS = EIGHT_WAVE_POST ? 512 : 256, hidden = 5120, BM = TILE_M, MT = BM / 16;
+    // Eight-wave post tiles split H into 640-column stripes. A 32-column
+    // transpose reuses LDS for the two MFMA chunks, retaining 3584 collapse
+    // columns without spilling registers. Other large tiles keep four waves.
     // Four streams per wave keep post mixing and collapse in registers for
     // staged, medium-sized grids. Larger grids use two streams per wave to
     // reduce register pressure. No-post retains one stream per wave. Every
     // mapping keeps each lane's 16-byte load in a contiguous 128-byte segment.
     constexpr int STREAMS_PER_WAVE = HAS_POST ? POST_STREAMS : 1, NC = HAS_POST ? 2 : 4,
-                  WAVES_PER_GROUP = 4 / STREAMS_PER_WAVE;
+                  WAVES_PER_GROUP = 4 / STREAMS_PER_WAVE,
+                  GROUPS          = STREAMS_PER_WAVE * (THREADS / 256),
+                  ACC_STREAMS     = EIGHT_WAVE_POST ? 1 : STREAMS_PER_WAVE;
     static_assert(POST_STREAMS == 2 || POST_STREAMS == 4);
-    constexpr int hidden_part = hidden / STREAMS_PER_WAVE;
+    constexpr int hidden_part = hidden / GROUPS;
     const int token_block     = blockIdx.x;
     if(token_block * BM >= tokens)
         return;
@@ -1115,9 +1164,29 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         opus::make_gmem<bf16>(const_cast<bf16*>(fn_packed), 24 * 4 * hidden * sizeof(float));
     // Each M16 fragment retains its row/stream mapping. M32 shares the same
     // fn operands across both fragments, halving fn loads per token block pair.
-    __shared__ bf16 old_r[STREAMS_PER_WAVE][4][BM][BK * NC];
-    __shared__ bf16 new_r[STREAMS_PER_WAVE][4][BM][BK * NC];
-    __shared__ float reduction[4][BM][SLOTS];
+    __shared__ bf16 old_r[GROUPS][4][BM][BK * NC];
+    __shared__ bf16 new_r[GROUPS][4][BM][BK * (EIGHT_WAVE_POST ? 1 : NC)];
+    // Reuse the compact per-wave partials after their reduction. Preserve the
+    // ordinary array layout on four-wave paths for vector LDS accesses.
+    union Scratch
+    {
+        float local[THREADS / 64][BM][26];
+        float finish[4][BM][SLOTS];
+    };
+    __shared__ Scratch scratch;
+    __shared__ float stream_reduction[4][BM][SLOTS];
+    auto& local_reduction = [&]() -> auto& {
+        if constexpr(EIGHT_WAVE_POST)
+            return scratch.local;
+        else
+            return stream_reduction;
+    }();
+    auto& reduction = [&]() -> auto& {
+        if constexpr(EIGHT_WAVE_POST)
+            return scratch.finish;
+        else
+            return stream_reduction;
+    }();
     __shared__ float total[BM][SLOTS];
     __shared__ unsigned int last;
     // The unused placeholder disappears when STAGED is zero.
@@ -1151,7 +1220,7 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
             }
         }
     }
-    f32x4 acc[MT][STREAMS_PER_WAVE][2] = {};
+    f32x4 acc[MT][ACC_STREAMS][2] = {};
     float sq_r[2 * MT] = {}, sq_x[2 * MT] = {};
     struct Tile
     {
@@ -1179,7 +1248,11 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         __builtin_amdgcn_sched_barrier(0);
         return tile;
     };
-    Tile current = load_tile(begin);
+    // Keep only the current residual tile at eight waves. Chunk zero of fn
+    // overlaps its load; chunk one is loaded at its MFMA to stay within VGPRs.
+    Tile current{};
+    if constexpr(!EIGHT_WAVE_POST)
+        current = load_tile(begin);
 #pragma unroll(HAS_POST ? 1 : 2)
     for(int ki = 0; ki < hidden_part; ki += NC * BK)
     {
@@ -1188,7 +1261,7 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
 #pragma unroll
         for(int s = 0; s < STREAMS_PER_WAVE; ++s)
 #pragma unroll
-            for(int c = 0; c < NC; ++c)
+            for(int c = 0; c < (EIGHT_WAVE_POST ? 1 : NC); ++c)
 #pragma unroll
                 for(int op = 0; op < 3; ++op)
                 {
@@ -1200,7 +1273,9 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                 }
         __builtin_amdgcn_sched_barrier(0);
         Tile next{};
-        if(ki + NC * BK < hidden_part)
+        if constexpr(EIGHT_WAVE_POST)
+            current = load_tile(k);
+        else if(ki + NC * BK < hidden_part)
             next = load_tile(k + NC * BK);
         bf16x8 r[STREAMS_PER_WAVE][NC * MT];
 #pragma unroll
@@ -1235,18 +1310,36 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
 #pragma unroll
                 for(int s = 0; s < STREAMS_PER_WAVE; ++s)
                 {
-#pragma unroll
-                    for(int e = 0; e < 8; e += 2)
+                    if constexpr(EIGHT_WAVE_POST && !IDENTITY_PRE)
                     {
-                        f32x2 v = mul_float_pair(bf16_pair_to_float(current.x[c], e),
-                                                 post[c % 2 + (c / NC) * 2][s]);
 #pragma unroll
-                        for(int h = 0; h < 4; ++h)
-                            v = fma_float_pair(bf16_pair_to_float(old_regs[h], e),
-                                               comb[c % 2 + (c / NC) * 2][s][h],
-                                               v);
-                        r[s][c][e]     = opus::fp32_to_bf16(v[0]);
-                        r[s][c][e + 1] = opus::fp32_to_bf16(v[1]);
+                        for(int e = 0; e < 8; ++e)
+                        {
+                            float v =
+                                static_cast<float>(current.x[c][e]) * post[c % 2 + (c / NC) * 2][s];
+#pragma unroll
+                            for(int h = 0; h < 4; ++h)
+                                v = fmaf(static_cast<float>(old_regs[h][e]),
+                                         comb[c % 2 + (c / NC) * 2][s][h],
+                                         v);
+                            r[s][c][e] = opus::fp32_to_bf16(v);
+                        }
+                    }
+                    else
+                    {
+#pragma unroll
+                        for(int e = 0; e < 8; e += 2)
+                        {
+                            f32x2 v = mul_float_pair(bf16_pair_to_float(current.x[c], e),
+                                                     post[c % 2 + (c / NC) * 2][s]);
+#pragma unroll
+                            for(int h = 0; h < 4; ++h)
+                                v = fma_float_pair(bf16_pair_to_float(old_regs[h], e),
+                                                   comb[c % 2 + (c / NC) * 2][s][h],
+                                                   v);
+                            r[s][c][e]     = opus::fp32_to_bf16(v[0]);
+                            r[s][c][e + 1] = opus::fp32_to_bf16(v[1]);
+                        }
                     }
                     store_vector_nbytes<bf16, bf16, 8, 16, 2>(
                         g_out,
@@ -1258,16 +1351,20 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
 #pragma unroll
             for(int s = 0; s < STREAMS_PER_WAVE; ++s)
             {
-                *reinterpret_cast<bf16x8*>(&new_r[group][stream_wave * STREAMS_PER_WAVE + s][tr]
-                                                 [lds_col(tr, ((c % NC) / 2) * 64 + k_lane)]) =
-                    r[s][c];
+                if constexpr(!EIGHT_WAVE_POST)
+                    *reinterpret_cast<bf16x8*>(&new_r[group][stream_wave * STREAMS_PER_WAVE + s][tr]
+                                                     [lds_col(tr, ((c % NC) / 2) * 64 + k_lane)]) =
+                        r[s][c];
                 sq_r[c % 2 + (c / NC) * 2] = bf16_sqsum(r[s][c], sq_r[c % 2 + (c / NC) * 2]);
             }
         }
-        if constexpr(STREAMS_PER_WAVE == 4)
-            __builtin_amdgcn_wave_barrier();
-        else
-            __syncthreads();
+        if constexpr(!EIGHT_WAVE_POST)
+        {
+            if constexpr(STREAMS_PER_WAVE == 4)
+                __builtin_amdgcn_wave_barrier();
+            else
+                __syncthreads();
+        }
 #pragma unroll
         for(int c = 0; c < NC * MT; ++c)
         {
@@ -1300,10 +1397,9 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                     collapsed[e] = opus::fp32_to_bf16(v);
                 }
                 sq_x[c % 2 + (c / NC) * 2] = bf16_sqsum(collapsed, sq_x[c % 2 + (c / NC) * 2]);
-                if(ki < STAGED / STREAMS_PER_WAVE)
+                if(ki < STAGED / GROUPS)
                 {
-                    const int col =
-                        group * (STAGED / STREAMS_PER_WAVE) + ki + ((c % NC) / 2) * 64 + k_lane;
+                    const int col = group * (STAGED / GROUPS) + ki + ((c % NC) / 2) * 64 + k_lane;
                     *reinterpret_cast<bf16x8*>(&collapse_lds[tr][lds_col(tr, col)]) = collapsed;
                 }
                 else
@@ -1311,31 +1407,83 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
                         g_norm, collapsed, tr * hidden + k + ((c % NC) / 2) * 64 + k_lane);
             }
         }
+        if constexpr(EIGHT_WAVE_POST)
+        {
 #pragma unroll
-        for(int m = 0; m < MT; ++m)
-#pragma unroll
-            for(int s = 0; s < STREAMS_PER_WAVE; ++s)
+            for(int m = 0; m < MT; ++m)
 #pragma unroll
                 for(int c = 0; c < NC; ++c)
                 {
-                    bf16x8 mr = *reinterpret_cast<const bf16x8*>(
-                        &new_r[group][stream_wave * STREAMS_PER_WAVE + s][m * 16 + lane % 16]
-                              [lds_col(lane % 16, c * BK + (lane / 16) * 8)]);
-                    acc[m][s][0] = opus::mfma_f32_16x16x32_bf16{}(fn[s][c][0], mr, acc[m][s][0]);
-                    acc[m][s][0] = opus::mfma_f32_16x16x32_bf16{}(fn[s][c][1], mr, acc[m][s][0]);
-                    acc[m][s][1] = opus::mfma_f32_16x16x32_bf16{}(fn[s][c][2], mr, acc[m][s][1]);
+                    // Four lanes publish 32 columns for this MFMA chunk.
+                    // Reuse the same LDS tile only after all readers finish.
+                    if((lane % 8) / 4 == c)
+                    {
+#pragma unroll
+                        for(int s = 0; s < STREAMS_PER_WAVE; ++s)
+#pragma unroll
+                            for(int u = 0; u < 2; ++u)
+                                *reinterpret_cast<bf16x8*>(
+                                    &new_r[group][s][m * 16 + row + u * 8][(lane % 4) * 8]) =
+                                    r[s][m * NC + u];
+                    }
+                    __builtin_amdgcn_wave_barrier();
+#pragma unroll
+                    for(int s = 0; s < STREAMS_PER_WAVE; ++s)
+                    {
+                        if(c > 0)
+                        {
+#pragma unroll
+                            for(int op = 0; op < 3; ++op)
+                            {
+                                const int off = ((((k / BK + c) * 4 + s) * 3 + op) * 64 + lane) * 8;
+                                fn[s][c][op]  = load_vector_nbytes<bf16, 8, 16>(g_fn, off);
+                            }
+                            __builtin_amdgcn_sched_barrier(0);
+                        }
+                        bf16x8 mr = *reinterpret_cast<const bf16x8*>(
+                            &new_r[group][s][m * 16 + lane % 16][(lane / 16) * 8]);
+                        acc[m][0][0] =
+                            opus::mfma_f32_16x16x32_bf16{}(fn[s][c][0], mr, acc[m][0][0]);
+                        acc[m][0][0] =
+                            opus::mfma_f32_16x16x32_bf16{}(fn[s][c][1], mr, acc[m][0][0]);
+                        acc[m][0][1] =
+                            opus::mfma_f32_16x16x32_bf16{}(fn[s][c][2], mr, acc[m][0][1]);
+                    }
+                    __builtin_amdgcn_wave_barrier();
                 }
+        }
+        else
+        {
+#pragma unroll
+            for(int m = 0; m < MT; ++m)
+#pragma unroll
+                for(int s = 0; s < STREAMS_PER_WAVE; ++s)
+#pragma unroll
+                    for(int c = 0; c < NC; ++c)
+                    {
+                        bf16x8 mr = *reinterpret_cast<const bf16x8*>(
+                            &new_r[group][stream_wave * STREAMS_PER_WAVE + s][m * 16 + lane % 16]
+                                  [lds_col(lane % 16, c * BK + (lane / 16) * 8)]);
+                        acc[m][s][0] =
+                            opus::mfma_f32_16x16x32_bf16{}(fn[s][c][0], mr, acc[m][s][0]);
+                        acc[m][s][0] =
+                            opus::mfma_f32_16x16x32_bf16{}(fn[s][c][1], mr, acc[m][s][0]);
+                        acc[m][s][1] =
+                            opus::mfma_f32_16x16x32_bf16{}(fn[s][c][2], mr, acc[m][s][1]);
+                    }
+        }
         if constexpr(!HAS_POST)
             __syncthreads();
         if constexpr(STREAMS_PER_WAVE == 4)
             __builtin_amdgcn_wave_barrier();
-        current = next;
+        if constexpr(!EIGHT_WAVE_POST)
+            current = next;
     }
 #pragma unroll
     for(int m = 0; m < MT; ++m)
     {
 #pragma unroll
-        for(int s = 0; s < STREAMS_PER_WAVE; ++s)
+        for(int s = 0; s < ACC_STREAMS; ++s)
 #pragma unroll
             for(int e = 0; e < 4; ++e)
                 acc[m][s][1][e] += __shfl_xor(acc[m][s][1][e], 32, 64);
@@ -1345,9 +1493,10 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
             for(int e = 0; e < 4; ++e)
             {
                 float v = acc[m][0][n][e];
-                for(int s = 1; s < STREAMS_PER_WAVE; ++s)
+                for(int s = 1; s < ACC_STREAMS; ++s)
                     v += acc[m][s][n][e];
-                reduction[wid][m * 16 + lane % 16][n * 16 + lane / 16 * 4 + e] = v;
+                if(!EIGHT_WAVE_POST || n == 0 || lane < 32)
+                    local_reduction[wid][m * 16 + lane % 16][n * 16 + lane / 16 * 4 + e] = v;
             }
     }
     __syncthreads();
@@ -1358,8 +1507,8 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
         sq_x[c] = sum_element_lanes<8>(sq_x[c]);
         if(lane % 8 == 0)
         {
-            reduction[wid][row + c * 8][24] = sq_r[c];
-            reduction[wid][row + c * 8][25] = sq_x[c];
+            local_reduction[wid][row + c * 8][24] = sq_r[c];
+            local_reduction[wid][row + c * 8][25] = sq_x[c];
         }
     }
     __syncthreads();
@@ -1367,33 +1516,34 @@ __device__ __forceinline__ void large_tiles(const bf16* residual,
     {
         float v = 0;
 #pragma unroll
-        for(int w = 0; w < 4; ++w)
-            v += reduction[w][i / SLOTS][i % SLOTS];
+        for(int w = 0; w < THREADS / 64; ++w)
+            if(!EIGHT_WAVE_POST || i % SLOTS < 26)
+                v += local_reduction[w][i / SLOTS][i % SLOTS];
         total[i / SLOTS][i % SLOTS] = v;
     }
-    finish_last_split<1, BM, STAGED, STREAMS_PER_WAVE>(total,
-                                                       reduction,
-                                                       last,
-                                                       1,
-                                                       tokens,
-                                                       token_block,
-                                                       tile_rows,
-                                                       partials,
-                                                       counters,
-                                                       layer_input,
-                                                       norm_weight,
-                                                       hc_scale,
-                                                       hc_base,
-                                                       next_pre,
-                                                       post_out,
-                                                       comb_out,
-                                                       rms_eps,
-                                                       pre_eps,
-                                                       sinkhorn_eps,
-                                                       post_mult,
-                                                       norm_eps,
-                                                       20,
-                                                       &collapse_lds[0][0]);
+    finish_last_split<1, BM, STAGED, GROUPS, THREADS>(total,
+                                                      reduction,
+                                                      last,
+                                                      1,
+                                                      tokens,
+                                                      token_block,
+                                                      tile_rows,
+                                                      partials,
+                                                      counters,
+                                                      layer_input,
+                                                      norm_weight,
+                                                      hc_scale,
+                                                      hc_base,
+                                                      next_pre,
+                                                      post_out,
+                                                      comb_out,
+                                                      rms_eps,
+                                                      pre_eps,
+                                                      sinkhorn_eps,
+                                                      post_mult,
+                                                      norm_eps,
+                                                      20,
+                                                      &collapse_lds[0][0]);
 #endif
 }
 
@@ -1696,7 +1846,7 @@ template <bool HAS_POST,
           int LARGE_M      = BM,
           int LARGE_STAGE  = 0,
           int POST_STREAMS = 2>
-__global__ __launch_bounds__(KernelTuning<HAS_POST>::threads,
+__global__ __launch_bounds__((launch_threads<HAS_POST, POST_STREAMS>),
                              1) void mega_mhc_kernel(const bf16* residual,
                                                      const bf16* sublayer,
                                                      const float* post_mix,
@@ -2053,7 +2203,7 @@ void mega_mhc_bf16(aiter_tensor_t& residual_out,
         <<<dim3(MHC_STREAM_VARIANT == 12 ? (POST ? 512 : 256)                          \
                 : KERNEL_SPLIT(POST) > 1 ? ((blocks + 7) / 8) * 8 * KERNEL_SPLIT(POST) \
                                          : (t + ROWS - 1) / ROWS),                     \
-           KernelTuning<POST>::threads,                                                \
+           (launch_threads<POST, STREAMS>),                                            \
            0,                                                                          \
            stream>>>(static_cast<const bf16*>(residual.data_ptr()),                    \
                      static_cast<const bf16*>(sublayer_out.data_ptr()),                \

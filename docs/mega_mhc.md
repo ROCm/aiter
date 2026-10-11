@@ -59,6 +59,7 @@ path for shapes that otherwise use distributed normalization.
 | 385–512 | mid512 | 8 | 8 |
 | 513–1024 | mid1024 | 4 | 8 |
 | 1025–2048 | mid2048 | 2 | 8 |
+| 2049–4096, post enabled | large | 1 | 8 |
 | 4160 | tail | body 1, tail 32 | 4 |
 | Other >2048 | large | 1 | 4 |
 
@@ -93,9 +94,18 @@ wave reuses its four old residual values and sublayer value for two output
 streams. Without post-mix, the large path retains one stream per wave. Both
 choices instantiate the same `large_tiles` function and preserve 128-byte
 segments. For grids fitting in one CU round (at most 4096 tokens), post keeps all four
-streams in each wave, which owns one quarter of H. Post-mix and collapse then
-reuse registers, and only the MFMA layout conversion needs wave-local LDS.
-T=4160 uses four streams per wave for its body; its generic tail retains one.
+streams in each of eight waves, which owns a 640-column stripe of H. Post-mix
+and collapse reuse registers, and only the MFMA layout conversion needs
+wave-local LDS. The two 32-column MFMA chunks reuse one 32-column transpose
+buffer: each half of the row's eight lanes publishes its chunk, then a wave
+barrier protects the read and subsequent reuse. This saves 32 KiB of LDS
+compared with an eight-wave, 64-column transpose and keeps 3584 collapse
+columns staged. Its reduction scratch is shared between phases; total LDS is
+162816 bytes. The first fn chunk overlaps the current residual load and the
+second is loaded at its MFMA. Scalar post arithmetic and packed identity-pre
+arithmetic fit in 256 and 240 VGPRs respectively, without spills.
+T=4160 retains four waves with four streams per wave for its body; its generic
+tail retains one stream per wave.
 
 Large tiles now choose the M dimension and collapse staging independently of
 the split count. No-post uses M=32 for T>=8192 when the last round of 256
@@ -105,13 +115,15 @@ runtime value, and all large tiles retain 16-byte lane loads and split K=1.
 
 M=16 tiles can keep part of the BF16 collapse in LDS: 3584 columns per token
 with post, or 4096 without post. The two-stream post layout stages the first
-1792 columns of each column half; the four-stream layout stages the first 896
-columns of each quarter. Normalization reads these values directly from LDS and
-only reloads the remaining columns from global memory. It preserves the
-main loop's 128-byte segments and processes four independent vectors per
-batch. This uses 154 KiB of LDS, so staging is enabled only for at most one
-CU round or a last round that is at least 15/16 full. Sparse final rounds keep
-the original M16/global-staging path to avoid an occupancy-related tail.
+1792 columns of each column half; the eight-wave post layout stages the first
+448 columns of each 640-column stripe. Normalization reads these values
+directly from LDS and only reloads the remaining columns from global memory.
+Eight-wave normalization keeps the main loop's 128-byte segments, handles
+rows r and r+8 together, and reuses one weight vector for both rows. Each wave
+chooses LDS or global loads uniformly. The other staged layouts retain their
+four-vector batches. Staging uses 154–159 KiB of LDS, so it is enabled only
+for at most one CU round or a last round that is at least 15/16 full. Sparse
+final rounds keep the original M16/global-staging path to avoid an occupancy-related tail.
 For T=4160 with post, blocks 0–255 process the body and blocks 256–511 cover
 the generic tail (128 of the tail blocks have valid rows). The body stages
 2560 columns, keeping its shared storage plus the generic storage below the
