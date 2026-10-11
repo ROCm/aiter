@@ -103,3 +103,129 @@ def filter_tune_df(tune_df, targets: list):
     for gfx, cu_num in targets:
         mask |= (tune_df["gfx"] == gfx) & (tune_df["cu_num"] == cu_num)
     return tune_df[mask]
+
+
+# Mirrors CK example/ck_tile/01_fmha/codegen/ops/fmha_fwd.py get_factory().
+# More-specific prefixes first (gfx950 before gfx9, gfx115 before gfx11).
+# gfx120 and gfx115 are the same length — "longest first" is the wrong
+# invariant. Bare "gfx12" does not match gfx120 and is omitted.
+#
+# CK also has a gfx125 factory, but no gfx125x part reaches here: the only
+# one in GFX_MAP is gfx1250, which _CK_FMHA_EXCLUDED_ARCHS skips. Re-enabling
+# CK fmha for a gfx125x part means dropping it from that set and restoring a
+# ("gfx125", "gfx125") row here.
+_CK_FMHA_ARCH_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("gfx950", "gfx950"),
+    ("gfx120", "gfx12"),
+    ("gfx115", "gfx115"),
+    ("gfx11", "gfx11"),
+    ("gfx9", "gfx9"),
+)
+
+# Architectures that must never generate CK fmha kernels, even though CK has a
+# factory for them. gfx1250 uses the ASM/FlyDSL/Triton path and its CK-free
+# infrastructure instead. Matched on the full arch name, not a prefix, so
+# unrelated gfx125x parts are not silently swept in.
+_CK_FMHA_EXCLUDED_ARCHS: frozenset[str] = frozenset({"gfx1250"})
+
+# Every optCompilerConfig.json module whose blob_gen_cmd runs CK's
+# example/ck_tile/01_fmha/generate.py. Excluded wholesale when
+# ck_fmha_enabled() is False. Kept in sync by
+# test_ck_fmha_modules_match_config.
+CK_FMHA_MODULES: tuple[str, ...] = (
+    "module_mha_fwd",
+    "module_mha_varlen_fwd",
+    "module_mha_batch_prefill",
+    "module_mha_bwd",
+    "module_mha_varlen_bwd",
+    "libmha_fwd",
+    "libmha_bwd",
+)
+
+
+def _normalize_arch(arch: str) -> str:
+    return arch.split(":", 1)[0].lower()
+
+
+def ck_fmha_enabled_for(archs: list[str]) -> bool:
+    """False only when every named arch is explicitly excluded from CK fmha.
+
+    An empty or wholly-unrecognized list (cpu, gfx1030) is *not* an opt-out --
+    those keep CK's default target set, unchanged from before this feature.
+    """
+    names = [_normalize_arch(arch) for arch in archs]
+    if not names:
+        return True
+    return not all(name in _CK_FMHA_EXCLUDED_ARCHS for name in names)
+
+
+def ck_fmha_enabled() -> bool:
+    """ck_fmha_enabled_for() against the current GPU_ARCHS / live GPU list.
+
+    Consumed by setup.py's PREBUILD module selection. The plain JIT path does
+    not consult this yet -- see PR #5786 discussion -- so a gfx1250 JIT build
+    still reaches ck_fmha_targets()'s CK-default fallback.
+    """
+    from chip_info import get_gfx_list  # lazy: chip_info imports this module
+
+    return ck_fmha_enabled_for(get_gfx_list())
+
+
+def map_gpu_archs_to_ck_fmha_targets(archs: list[str]) -> list[str]:
+    """Map GPU_ARCHS / get_gfx_list() names to CK fmha factory keys.
+
+    Unknown names are omitted. Already-emitted keys are skipped. Order follows
+    the input arch list.
+    """
+    keys: list[str] = []
+    seen: set[str] = set()
+    for arch in archs:
+        name = _normalize_arch(arch)
+        if name in _CK_FMHA_EXCLUDED_ARCHS:
+            continue
+        mapped = None
+        for prefix, key in _CK_FMHA_ARCH_PREFIXES:
+            if name.startswith(prefix):
+                mapped = key
+                break
+        if mapped is None or mapped in seen:
+            continue
+        seen.add(mapped)
+        keys.append(mapped)
+    return keys
+
+
+def ck_fmha_targets() -> str:
+    """Comma-joined CK fmha --targets for the current get_gfx_list().
+
+    Unmapped lists (cpu, gfx1030, empty) keep CK's default gfx9,gfx950.
+
+    Callers must check ck_fmha_enabled() first: on a gfx1250-only build every
+    arch is excluded, the key list is empty, and this would otherwise fall back
+    to CK's gfx9,gfx950 default and emit kernels that cannot run there.
+    """
+    from chip_info import get_gfx_list  # lazy: chip_info imports this module
+
+    keys = map_gpu_archs_to_ck_fmha_targets(get_gfx_list())
+    return ",".join(keys) if keys else "gfx9,gfx950"
+
+
+def ck_fmha_factory_key(gfx: str) -> str:
+    """CK fmha factory key for an explicit gfx name, '' when unmapped."""
+    keys = map_gpu_archs_to_ck_fmha_targets([gfx])
+    return keys[0] if keys else ""
+
+
+def ck_fmha_batch_prefill_gen_targets() -> str:
+    """--targets for 01_fmha generate.py -d batch_prefill.
+
+    CK drops every batch_prefill kernel if any --targets token is not gfx9*.
+    Pass the gfx9* subset when the mapped list has one; otherwise pass
+    ck_fmha_targets() so generate.py still emits fmha_batch_prefill_api.cpp.
+    Never return ''.
+    """
+    from chip_info import get_gfx_list  # lazy: chip_info imports this module
+
+    keys = map_gpu_archs_to_ck_fmha_targets(get_gfx_list())
+    gfx9 = ",".join(k for k in keys if k.startswith("gfx9"))
+    return gfx9 or ck_fmha_targets()
