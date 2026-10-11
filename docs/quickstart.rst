@@ -1,190 +1,75 @@
 Quickstart
 ==========
 
-This guide will get you started with AITER in 5 minutes.
+Install a matched ROCm/PyTorch/AITER stack using :doc:`installation`. These
+examples target CDNA gfx942/gfx950 with FP16 attention and BF16 normalization
+and MoE. They are small reference checks, not a benchmark or a statement that
+every release/hardware combination has been validated. First use may JIT
+compile kernels. On other targets, consult the operator's tests and restrictions.
 
-Installation
-------------
+From a source checkout, run the complete example:
 
 .. code-block:: bash
 
-   # Install from source
-   git clone --recursive https://github.com/ROCm/aiter.git
-   cd aiter
-   python3 setup.py develop
+   python docs/examples/quickstart.py
 
-Verify Installation
--------------------
+The script logs the package, PyTorch, HIP and GPU versions, raises on a
+numerical mismatch, and prints each output shape on success. Record its output
+and ``git rev-parse HEAD`` when validating a stack. The CPU documentation job
+checks Python syntax and source signatures; execute this script on your
+supported ROCm stack to validate imports, dispatch and numerical results.
 
-.. code-block:: python
+Flash attention
+---------------
 
-   import aiter
-   import torch
+Inputs use **BSHD** layout: batch, sequence, heads, head dimension. The FP32
+reference implements the same causal mask and scale.
 
-   # Verify AITER is working
-   print(f"PyTorch version: {torch.__version__}")
-   print(f"ROCm available: {torch.cuda.is_available()}")
+.. literalinclude:: examples/quickstart.py
+   :language: python
+   :start-after: # BEGIN attention
+   :end-before: # END attention
 
-   # Try importing a key function
-   from aiter import flash_attn_func
-   print("AITER loaded successfully!")
+Packed variable-length attention
+--------------------------------
 
-First Example: Flash Attention
--------------------------------
+Packed tokens use ``(total_tokens, heads, head_dim)`` with device-side int32
+cumulative sequence offsets. This example checks each sequence independently;
+it does not configure a paged KV cache.
 
-Here's a simple example using AITER's optimized attention kernel:
-
-.. code-block:: python
-
-   import torch
-   import aiter
-
-   # Input tensors (batch_size=2, seq_len=1024, num_heads=16, head_dim=64)
-   batch_size, seq_len, num_heads, head_dim = 2, 1024, 16, 64
-
-   query = torch.randn(batch_size, seq_len, num_heads, head_dim,
-                       device='cuda', dtype=torch.float16)
-   key = torch.randn(batch_size, seq_len, num_heads, head_dim,
-                     device='cuda', dtype=torch.float16)
-   value = torch.randn(batch_size, seq_len, num_heads, head_dim,
-                       device='cuda', dtype=torch.float16)
-
-   # Run optimized flash attention
-   output = aiter.flash_attn_func(query, key, value, causal=True)
-
-   print(f"Output shape: {output.shape}")
-   # Output shape: torch.Size([2, 1024, 16, 64])
-
-Variable-Length Sequences
--------------------------
-
-AITER excels at handling variable-length sequences with page tables:
-
-.. code-block:: python
-
-   import torch
-   import aiter
-
-   # Query with variable lengths per batch
-   query = torch.randn(5, 2048, 16, 64, device='cuda', dtype=torch.float16)
-
-   # Page table configuration (see tutorials for details)
-   page_table = torch.tensor([[0, 1, 2], [3, 4, 5]], device='cuda', dtype=torch.int32)
-
-   # KV cache in paged format
-   kv_cache = torch.randn(6, 16, 128, 64, device='cuda', dtype=torch.float16)
-
-   # Variable-length attention with page tables
-   output = aiter.flash_attn_with_kvcache(
-       query, kv_cache, page_table,
-       block_size=128, causal=True
-   )
-
-Mixture of Experts (MoE)
-------------------------
-
-Efficient grouped GEMM for MoE layers:
-
-.. code-block:: python
-
-   import torch
-   import aiter
-
-   # MOE routing - select top-2 experts for each token
-   num_tokens = 4096
-   num_experts = 8
-   hidden_dim = 512
-   ffn_dim = 2048
-   top_k = 2
-
-   # Input tokens
-   x = torch.randn(num_tokens, hidden_dim, device='cuda', dtype=torch.float16)
-
-   # Expert weights for all experts
-   w1 = torch.randn(num_experts, hidden_dim, ffn_dim, device='cuda', dtype=torch.float16)
-   w2 = torch.randn(num_experts, ffn_dim, hidden_dim, device='cuda', dtype=torch.float16)
-
-   # Router logits and expert selection
-   router_logits = torch.randn(num_tokens, num_experts, device='cuda', dtype=torch.float16)
-
-   # Fused MOE operation (gate + up projection + down projection)
-   output = aiter.fmoe(
-       x, w1, w2, router_logits,
-       topk=top_k,
-       renormalize=True
-   )
-
-   print(f"MoE output shape: {output.shape}")  # [4096, 512]
+.. literalinclude:: examples/quickstart.py
+   :language: python
+   :start-after: # BEGIN varlen
+   :end-before: # END varlen
 
 RMSNorm
 -------
 
-Optimized normalization for LLM inference:
+``rms_norm`` allocates its result. The similarly named low-level ``rmsnorm``
+requires an output buffer; see :doc:`api/normalization`.
 
-.. code-block:: python
+.. literalinclude:: examples/quickstart.py
+   :language: python
+   :start-after: # BEGIN rmsnorm
+   :end-before: # END rmsnorm
 
-   import torch
-   import aiter
+Mixture of experts
+------------------
 
-   # Input tensor (batch_size, seq_len, hidden_dim)
-   x = torch.randn(2, 1024, 4096, device='cuda', dtype=torch.float16)
+Route tokens first, then call ``aiter.fused_moe.fused_moe`` with routing weights
+and IDs. Gate/up weights are ``(experts, 2 * intermediate, hidden)``; down weights
+are ``(experts, hidden, intermediate)``. This example follows the unquantized
+path in ``op_tests/test_moe_2stage.py`` and compares with its maintained PyTorch
+reference. Quantized paths require their own packing and scale contracts.
 
-   # Weight for normalization
-   weight = torch.ones(4096, device='cuda', dtype=torch.float16)
+.. literalinclude:: examples/quickstart.py
+   :language: python
+   :start-after: # BEGIN moe
+   :end-before: # END moe
 
-   # Fast RMSNorm
-   output = aiter.rmsnorm(x, weight, eps=1e-6)
-
-Performance Tips
-----------------
-
-1. **Use FP16/BF16**: AITER kernels are optimized for half-precision
-2. **Enable compilation**: Set ``PREBUILD_KERNELS=2`` for inference workloads
-3. **Batch when possible**: Larger batches better utilize GPU
-4. **Profile first**: Use ROCm profiler to identify bottlenecks
-
-.. code-block:: bash
-
-   # Example: Profile your workload
-   rocprof --stats python your_script.py
-
-Next Steps
+Next steps
 ----------
 
-* :doc:`tutorials/attention` - Deep dive into attention mechanisms
-* :doc:`tutorials/moe` - Learn about MoE optimizations
-* :doc:`tutorials/variable_length` - Handle variable-length sequences
-* :doc:`api/attention` - Full API reference
-* :doc:`benchmarks` - Performance comparisons
-
-Common Issues
--------------
-
-**ImportError: No module named 'aiter'**
-   Make sure ROCm libraries are in your library path:
-
-   .. code-block:: bash
-
-      export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
-
-**RuntimeError: No AMD GPU found**
-   Verify GPU is accessible:
-
-   .. code-block:: bash
-
-      rocm-smi
-      rocminfo | grep gfx
-
-**Compilation errors during first run**
-   JIT compilation may take time on first use. Pre-compile kernels:
-
-   .. code-block:: bash
-
-      PREBUILD_KERNELS=2 GPU_ARCHS="native" python3 setup.py install
-
-Get Help
---------
-
-* **Documentation**: https://rocm.github.io/aiter/
-* **GitHub Issues**: https://github.com/ROCm/aiter/issues
-* **ROCm Community**: https://github.com/ROCm/ROCm/discussions
+* :doc:`api/attention`, :doc:`api/gemm`, :doc:`api/moe`, :doc:`api/normalization`
+* :doc:`tutorials/basic_usage`: timing and memory measurement
+* :doc:`autotuning_pipeline`: matched configuration tuning and validation
