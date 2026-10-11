@@ -333,8 +333,8 @@ def create_buffer_resource_from_addr(
         >>> data = buffer_load(rsrc, i32_zero, vec_width=4, dtype=T.i32)
     """
     addr_i64 = _unwrap_value(addr_i64)
-    ptr_type = ir.Type.parse("!llvm.ptr")
-    base_ptr = llvm.IntToPtrOp(ptr_type, addr_i64).result
+    ptr_type = fx.PointerType.get(T.i8(), fx.AddressSpace.Generic, 1)
+    base_ptr = fx.to_llvm_ptr(fx.inttoptr(ptr_type, addr_i64))
     flags = fx.Int32(_get_buffer_flags()).ir_value()
     stride = fx.Int16(0).ir_value()
     if num_records_bytes is None:
