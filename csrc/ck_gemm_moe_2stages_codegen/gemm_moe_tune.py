@@ -6424,23 +6424,107 @@ class GroupedFmoeTuner(FmoeTuner):
         del args, topk, fast_mode
         return pd.DataFrame(results, columns=self.columns)
 
+    # What grouped_moe_gfx1250 (and the AOT parser, for split_k*) reads a blank
+    # cell as: the value of another column of the same row, or a constant.
+    _BLANK_SAME_AS: ClassVar[dict[str, str]] = {
+        "tile_m2": "tile_m",
+        "tile_n2": "tile_n",
+        "tile_k2": "tile_k",
+        "m_warp2": "m_warp",
+        "n_warp2": "n_warp",
+        "num_buffer_stage2": "num_buffers",
+        "cluster_n2": "cluster_n",
+        "waves_per_tensor_tdm2": "waves_per_tensor_tdm",
+    }
+    _BLANK_VALUE: ClassVar[dict[str, int]] = {
+        "split_k1": 1,
+        "split_k2": 1,
+        "cluster_m": -1,
+        "cluster_n": -1,
+        "cluster_m2": -1,
+        "waves_per_tensor_tdm": -1,
+        "next_stage_prefetch": 0,
+        "tdm_as_in_prologue": 0,
+        "tdm_b_th": 0,
+        "lds_soa_load_interleave": 0,
+    }
+
+    @classmethod
+    def _blank_means(cls, column, row):
+        while column in cls._BLANK_SAME_AS:
+            source = cls._BLANK_SAME_AS[column]
+            if row.get(source, ""):
+                return row[source]
+            column = source
+        value = cls._BLANK_VALUE.get(column)
+        return "" if value is None else str(value)
+
+    @staticmethod
+    def _csv_text(value):
+        # pandas hands blank cells back as NaN, and the integers of a column
+        # that has a blank cell as floats; write them as the CSV spells them.
+        text = "" if value is None else str(value).strip()
+        if text.lower() in ("nan", "none", "<na>"):
+            return ""
+        whole, dot, frac = text.partition(".")
+        if dot and frac.strip("0") == "" and whole.lstrip("-").isdigit():
+            return whole
+        return text
+
     def result_to_csv(self, results, file, concat=False):
         del concat
-        old_tunedf = self.get_tuned_gemm_list(file, self.columns)
-        for col in self.columns:
-            if col not in old_tunedf.columns:
-                old_tunedf[col] = ""
         valid = results[
             (results["us"] != self.INVALID_TIME) & (results["us"] != self.INF_TIME)
         ]
         invalid = results[
             (results["us"] == self.INVALID_TIME) | (results["us"] == self.INF_TIME)
         ]
-        resultdf = self.update_tunedf(old_tunedf, valid)
         self.success = pd.concat([self.success, valid], ignore_index=True)
         self.failed = pd.concat([self.failed, invalid], ignore_index=True)
-        resultdf = resultdf.astype(str).drop_duplicates(subset=self.keys, keep="last")
-        resultdf.to_csv(file, index=False)
+        # Read the file as text, so that a pandas round trip does not rewrite
+        # the rows this run leaves alone ("16" becomes "16.0").
+        if os.path.exists(file) and os.path.getsize(file) > 0:
+            old_rows = pd.read_csv(file, dtype=str, keep_default_na=False)
+            columns = list(old_rows.columns)
+            # The lookup does not read gate_mode (kernelName1 names the
+            # layout), so a file without the column does not get one, and a
+            # re-tuned row replaces the old one instead of landing next to it.
+            columns += [
+                c for c in self.columns if c not in columns and c != "gate_mode"
+            ]
+            old_rows = old_rows.to_dict("records")
+        else:
+            columns = list(self.columns)
+            old_rows = []
+        keys = [k for k in self.keys if k in columns]
+        rows = [{c: row.get(c, "") for c in columns} for row in old_rows]
+        where = {
+            tuple(self._csv_text(row.get(k, "")) for k in keys): i
+            for i, row in enumerate(old_rows)
+        }
+        # One blank cell makes the AITER config merge read the whole column as
+        # floats, which the AOT parser's int() rejects; so in a column without
+        # blanks, a re-tuned row gets the value a blank cell means instead.
+        no_blanks = {
+            c
+            for c in columns
+            if c not in self.columns
+            and old_rows
+            and all(str(row.get(c, "")).strip() for row in old_rows)
+        }
+        for result in valid.to_dict("records"):
+            # The columns the tuner does not set mean what a blank cell means:
+            # it timed the candidate with them blank.
+            new = {c: self._csv_text(result.get(c, "")) for c in columns}
+            for c in no_blanks:
+                new[c] = self._blank_means(c, new)
+            key = tuple(new[k] for k in keys)
+            if key in where:
+                rows[where[key]] = new
+            else:
+                where[key] = len(rows)
+                rows.append(new)
+        pd.DataFrame(rows, columns=columns).to_csv(file, index=False)
 
 
 class Mxfp4FlydslTuner(FmoeTuner):

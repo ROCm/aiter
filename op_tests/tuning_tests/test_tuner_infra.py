@@ -574,5 +574,151 @@ class TestUpdateConfigFiles(unittest.TestCase):
                 os.unlink(merged_path)
 
 
+class TestGroupedFmoeResultToCsv(unittest.TestCase):
+    """GroupedFmoeTuner.result_to_csv on a file laid out like tuned_grouped_fmoe.csv,
+    which has no gate_mode column and blank cells in integer columns."""
+
+    # The key and result columns gemm_moe_tune.py builds the grouped tuner with.
+    KEYS = (
+        "gfx",
+        "cu_num",
+        "token",
+        "model_dim",
+        "inter_dim",
+        "expert",
+        "topk",
+        "act_type",
+        "dtype",
+        "q_dtype_a",
+        "q_dtype_w",
+        "q_type",
+        "use_g1u1",
+        "doweight_stage1",
+        "gate_mode",
+        "ep_fused",
+    )
+    RESULTS = (
+        "max_m",
+        "tile_m",
+        "tile_n",
+        "tile_k",
+        "m_warp",
+        "n_warp",
+        "num_buffers",
+        "grouped_persistent_m",
+        "persistent_workers",
+        "kernelName1",
+        "kernelName2",
+        "us",
+        "tflops",
+        "bw",
+    )
+    HEADER = (
+        "gfx,cu_num,token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,"
+        "q_dtype_w,ep_fused,q_type,use_g1u1,doweight_stage1,max_m,tile_m,tile_n,tile_k,"
+        "tile_m2,m_warp,n_warp,num_buffers,split_k1,grouped_persistent_m,"
+        "persistent_workers,kernelName1,kernelName2,us,tflops,bw"
+    )
+    SHAPE = (
+        "7168,768,384,6,ActivationType.Silu,torch.bfloat16,torch.float8_e4m3fn,"
+        "torch.float4_e2m1fn_x2,,QuantType.per_1x32,1,0"
+    )
+
+    def _tuner(self):
+        import importlib
+        import sys
+
+        tune_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..",
+            "..",
+            "csrc",
+            "ck_gemm_moe_2stages_codegen",
+        )
+        sys.path.insert(0, os.path.abspath(tune_dir))
+        try:
+            gemm_moe_tune = importlib.import_module("gemm_moe_tune")
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"gemm_moe_tune not importable: {e}")
+        finally:
+            sys.path.pop(0)
+        return gemm_moe_tune.GroupedFmoeTuner(
+            "groupedFmoeTuner",
+            list(self.KEYS),
+            list(self.RESULTS),
+            "grouped fmoe tuner",
+        )
+
+    def _candidate(self, token, tile_m, us):
+        return {
+            "gfx": "gfx1250",
+            "cu_num": 256,
+            "token": token,
+            "model_dim": 7168,
+            "inter_dim": 768,
+            "expert": 384,
+            "topk": 6,
+            "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float8_e4m3fn",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
+            "gate_mode": "GateMode.INTERLEAVE",
+            "ep_fused": float("nan"),
+            "max_m": tile_m,
+            "tile_m": tile_m,
+            "tile_n": 256,
+            "tile_k": 256,
+            "m_warp": 1,
+            "n_warp": 4,
+            "num_buffers": 2,
+            "grouped_persistent_m": 1,
+            "persistent_workers": "",
+            "kernelName1": "grouped_gemm1_a8w4_gugu",
+            "kernelName2": "grouped_gemm2_a8w4",
+            "us": us,
+            "tflops": 0,
+            "bw": 0,
+        }
+
+    def test_replaces_in_place_and_keeps_other_rows(self):
+        tuner = self._tuner()
+        old_4096 = f"gfx1250,256,4096,{self.SHAPE},4096,16,256,256,16,1,4,2,1,0,,k1,k2,468.0528,0,0"
+        old_8192 = f"gfx1250,256,8192,{self.SHAPE},8192,64,256,256,,1,4,2,1,0,,k1,k2,2011.94,0,0"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            f.write(f"{self.HEADER}\n{old_4096}\n{old_8192}\n")
+            path = f.name
+        try:
+            results = pd.DataFrame(
+                [self._candidate(4096, 64, 300.5), self._candidate(2048, 32, 250.25)],
+                columns=tuner.columns,
+            )
+            tuner.result_to_csv(results, path)
+            with open(path) as f:
+                lines = f.read().splitlines()
+            # No gate_mode column is added, so the re-tuned row matches the old one.
+            self.assertEqual(lines[0], self.HEADER)
+            self.assertEqual(len(lines), 4)
+            # The row this run does not tune keeps its text: tile_m2 stays blank
+            # here and the other integers do not turn into "64.0".
+            self.assertEqual(lines[2], old_8192)
+            # The re-tuned row is replaced in place. A column the tuner does not
+            # set stays blank where the file has blank cells (tile_m2), and gets
+            # the value a blank means where it has none (split_k1), so the
+            # config merge does not turn that column into floats.
+            new_4096 = dict(zip(self.HEADER.split(","), lines[1].split(",")))
+            self.assertEqual(new_4096["token"], "4096")
+            self.assertEqual(new_4096["tile_m"], "64")
+            self.assertEqual(new_4096["tile_m2"], "")
+            self.assertEqual(new_4096["split_k1"], "1")
+            self.assertEqual(new_4096["us"], "300.5")
+            # A shape the file does not have yet is appended.
+            self.assertEqual(lines[3].split(",")[2], "2048")
+        finally:
+            os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
