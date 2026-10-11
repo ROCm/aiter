@@ -146,15 +146,7 @@ def fclamp_f32(x, lo, hi):
 
 def _fma_f32(a, b, c):
     """Evaluate ``a * b + c`` as one fused f32 operation."""
-    return fx.Float32(
-        llvm_dialect.call_intrinsic(
-            T.f32,
-            "llvm.fma.f32",
-            [as_ir_value(a), as_ir_value(b), as_ir_value(c)],
-            [],
-            [],
-        )
-    )
+    return fx.Float32(fx.fma(fx.Float32(a), fx.Float32(b), fx.Float32(c)))
 
 
 def fused_silu_swiglu_elem(g, u, *, swiglu, limit_f32, neg_limit_f32):
