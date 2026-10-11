@@ -604,6 +604,113 @@ def get_GEMM_config_with_quant_type(
     return config
 
 
+def _bpreshuffle_group(has_gfx, gfx, cu_num, n, k, q_dtype_w):
+    quant = str(q_dtype_w)
+    if has_gfx:
+        return (gfx, cu_num, n, k, quant)
+    return (cu_num, n, k, quant)
+
+
+@functools.cache
+def _largest_bpreshuffle_rows(tuned_file: str) -> dict:
+    """Largest tuned M for each device and (N, K, dtype). Misses below that M
+    stay on the default kernel; only an M above the table reuses the row."""
+    if tuned_file not in _GEMM_QUANT_TYPE_CACHE:
+        get_GEMM_config_with_quant_type(1, 1, 1, dtypes.fp8, tuned_file)
+    table = _GEMM_QUANT_TYPE_CACHE[tuned_file]
+    has_gfx = _GEMM_QUANT_TYPE_HAS_GFX[tuned_file]
+    best: dict = {}
+    for key, row in table.items():
+        if has_gfx:
+            gfx, cu_num, tuned_m, n, k, quant = key
+            group = (gfx, cu_num, n, k, quant)
+        else:
+            cu_num, tuned_m, n, k, quant = key
+            group = (cu_num, n, k, quant)
+        current = best.get(group)
+        if current is None or tuned_m > current[0]:
+            best[group] = (tuned_m, row)
+    return best
+
+
+_REUSED_BPRESUFFLE_SHAPES: set[tuple] = set()
+
+
+def reuse_largest_bpreshuffle_config(
+    m: int,
+    n: int,
+    k: int,
+    q_dtype_w: torch.dtype,
+    tuned_file: str,
+):
+    """Tuned row for an M larger than every tuned M of this (N, K), else None."""
+    rows = _largest_bpreshuffle_rows(tuned_file)
+    has_gfx = _GEMM_QUANT_TYPE_HAS_GFX.get(tuned_file, False)
+    found = rows.get(
+        _bpreshuffle_group(has_gfx, get_gfx(), get_cu_num(), n, k, q_dtype_w)
+    )
+    if found is None or m <= found[0]:
+        return None
+    tuned_m, row = found
+    token = (n, k, tuned_m, str(q_dtype_w))
+    if token not in _REUSED_BPRESUFFLE_SHAPES:
+        _REUSED_BPRESUFFLE_SHAPES.add(token)
+        logger.info(
+            "gemm_a8w8_bpreshuffle M:%s is above the tuned table for N:%s, K:%s; "
+            "reusing the M:%s row %s",
+            m,
+            n,
+            k,
+            tuned_m,
+            row.get("kernelName", row.get("libtype")),
+        )
+    return row
+
+
+def _slice_activation_scale(scale: Tensor, start: int, end: int, rows: int) -> Tensor:
+    if scale.ndim > 0 and scale.shape[0] == rows:
+        return scale[start:end]
+    return scale
+
+
+def _invoke_bpreshuffle_config(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    config: dict,
+) -> Tensor:
+    libtype = config["libtype"]
+    split_k = int(config["splitK"])
+    k = XQ.shape[-1]
+    w_k = WQ.shape[-1]
+    if libtype == "ck":
+        return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, split_k)
+    if libtype == "cktile":
+        return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, split_k)
+    if libtype == "flydsl":
+        from .flydsl.gemm_kernels import PRESHUFFLE_M_MAX
+
+        rows = XQ.shape[0]
+        if rows > PRESHUFFLE_M_MAX:
+            for start in range(0, rows, PRESHUFFLE_M_MAX):
+                end = min(start + PRESHUFFLE_M_MAX, rows)
+                _invoke_bpreshuffle_config(
+                    XQ[start:end],
+                    WQ,
+                    _slice_activation_scale(x_scale, start, end, rows),
+                    w_scale,
+                    Y[start:end],
+                    config,
+                )
+            return Y
+        if w_k > k:
+            XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+        return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+    raise RuntimeError(f"gemm_a8w8_bpreshuffle has no libtype {libtype}")
+
+
 def gemm_a8w8_fake(
     XQ: Tensor,
     WQ: Tensor,
@@ -738,8 +845,13 @@ def gemm_a8w8_bpreshuffle_fake(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
-    return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+    return (
+        out
+        if out is not None
+        else torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+    )
 
 
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
@@ -751,6 +863,7 @@ def gemm_a8w8_bpreshuffle(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
     assert dtype in [
         torch.bfloat16,
@@ -762,7 +875,7 @@ def gemm_a8w8_bpreshuffle(
     w_k = WQ.shape[-1]
     if w_k < k:
         raise RuntimeError(
-            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, " f"XQ K={k}"
+            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={w_k}, XQ K={k}"
         )
 
     # if (
@@ -776,7 +889,15 @@ def gemm_a8w8_bpreshuffle(
     #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if out is not None:
+        if out.shape != (m, n) or out.dtype != dtype or out.device != XQ.device:
+            raise ValueError(
+                f"out must be shape {(m, n)}, dtype {dtype}, device {XQ.device}; "
+                f"got shape {tuple(out.shape)}, dtype {out.dtype}, device {out.device}"
+            )
+        Y = out
+    else:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
 
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
@@ -794,17 +915,24 @@ def gemm_a8w8_bpreshuffle(
             dtypes.fp8,
             AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
         )
+    if config is None:
+        config = reuse_largest_bpreshuffle_config(
+            m,
+            n,
+            k,
+            dtypes.fp8,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+        )
+    if config is None and w_k > k:
+        config = reuse_largest_bpreshuffle_config(
+            m,
+            n,
+            w_k,
+            dtypes.fp8,
+            AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE,
+        )
     if config is not None:
-        libtype = config["libtype"]
-        splitK = int(config["splitK"])
-        if libtype == "ck":
-            return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Y, splitK)
-        elif libtype == "cktile":
-            return gemm_a8w8_bpreshuffle_cktile(XQ, WQ, x_scale, w_scale, Y, splitK)
-        elif libtype == "flydsl":
-            if w_k > k:
-                XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
-            return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+        return _invoke_bpreshuffle_config(XQ, WQ, x_scale, w_scale, Y, config)
 
     if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (

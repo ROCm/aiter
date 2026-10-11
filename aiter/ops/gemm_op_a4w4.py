@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
+import os
 
 import pandas as pd
 import torch
@@ -16,6 +17,33 @@ from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
+
+# Latent MXFP4 up-proj at M=16384 allocates a padded [M, N] bf16 output per
+# layer (~224 MiB). Reuse one buffer per (device, stream, shape) like MoE scratch.
+_GEMM_A4W4_OUT_CACHE: dict[
+    tuple[torch.device, int, tuple[int, int], torch.dtype], torch.Tensor
+] = {}
+
+
+def _get_gemm_a4w4_out(
+    m_padded: int,
+    n: int,
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    shape = (m_padded, n)
+    if os.environ.get("AITER_GEMM_A4W4_OUT_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtype, device=device)
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape, dtype)
+    out = _GEMM_A4W4_OUT_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtype, device=device)
+        _GEMM_A4W4_OUT_CACHE[key] = out
+    return out
 
 
 @functools.lru_cache(maxsize=1024)
@@ -207,7 +235,7 @@ def gemm_a4w4(
             beta=beta,
         )
         return out.view(*A.shape[:-1], out.shape[-1])
-    out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
+    out = _get_gemm_a4w4_out((m + 31) // 32 * 32, n, dtype, A.device)
     if gfx_arch in ["gfx942"]:
         raise RuntimeError(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
