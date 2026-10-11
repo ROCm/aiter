@@ -561,6 +561,10 @@ def get_mhc_fused_post_pre_config(
     _check_mhc_res_preshuffle_arch(res_preshuffle, arch)
     policy = _MHC_FUSED_POST_PRE_CONFIG.get((arch, num_cu), _mhc_fused_config_default)
     split_k, tile_m, tile_n, tile_k = policy(m, hidden_size, num_cu)
+    if arch == "gfx950" and not w_preshuffle_bf16 and m <= 1024:
+        # FP32 fn decode: tile_m=32 is never faster than 16 here (up to 1.4x
+        # slower, M=144), bit-identical; packed BF16 and prefill keep the policy.
+        tile_m = 16
     if (
         w_preshuffle_bf16
         and res_preshuffle
