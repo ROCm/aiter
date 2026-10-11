@@ -56,12 +56,6 @@ def _grouped_weight_uint8(w: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _as_bool(value, default: bool) -> bool:
-    if value is None or str(value).strip() == "":
-        return default
-    return str(value).strip() in _TRUTHY_ENV
-
-
 def _as_int(value, default: int | None) -> int | None:
     # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
     # cell can come back as the literal "nan"; read those as unset like _cell.
@@ -69,6 +63,12 @@ def _as_int(value, default: int | None) -> int | None:
     if text == "" or text.lower() in ("nan", "none"):
         return default
     return int(text)
+
+
+def _as_bool(value, default: bool) -> bool:
+    if value is None or str(value).strip() == "":
+        return default
+    return str(value).strip() in _TRUTHY_ENV
 
 
 def _dtype_name(dtype) -> str:
@@ -596,7 +596,10 @@ def _grouped_a8w4_tdm_moe(
 
     import torch
 
-    from aiter.ops.flydsl.grouped_gemm_mxfp4 import flydsl_grouped_gemm_a8w4_masked
+    from aiter.ops.flydsl.grouped_gemm_mxfp4 import (
+        flydsl_grouped_gemm_a8w4_masked,
+        supports_gfx1250_a_preshuffle,
+    )
     from aiter.ops.flydsl.moe_kernels import (
         flydsl_moe_fused_ep_route_quant_compact,
         flydsl_moe_fused_quant_preshuffle,
@@ -922,6 +925,63 @@ def _grouped_a8w4_tdm_moe(
     # per dest row: nothing local re-lays it out, so gemm1 takes the 16-row
     # interleave on its LDS->register read instead.
     _row_major_ascale = _compact and _prequantized
+    _a_preshuffle_common = not any(
+        (
+            enable_ep_scatter,
+            bool(tdm_as_in_prologue),
+            bool(_row_major_ascale),
+            _prequantized,
+        )
+    )
+    # Serving captures decode and prefill shapes in the same process. Enable the
+    # optimized layout only for shapes accepted by the retained kernel; all
+    # other shapes continue through the ordinary row-major producer/GEMM.
+    _gemm1_a_preshuffle = (
+        _is_fp4
+        and _a_preshuffle_common
+        and supports_gfx1250_a_preshuffle(
+            N=two_inter,
+            K=model_dim,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            tile_k=tile_k,
+            m_warp=m_warp,
+            n_warp=n_warp,
+            num_buffers=num_buffers,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=stage1_act,
+            stage1_quant_out=0,
+            has_bias=int(_b1 is not None),
+            cluster_n=cluster_n,
+            next_stage_prefetch=next_stage_prefetch,
+            n_experts=E,
+        )
+    )
+    # GEMM2 consumes expert-local grouped rows, so its producer switches layout
+    # independently from the token-once GEMM1 producer.
+    _gemm2_a_preshuffle = (
+        _is_fp4
+        and _a_preshuffle_common
+        and supports_gfx1250_a_preshuffle(
+            N=model_dim,
+            K=inter_dim,
+            tile_m=tile_m2,
+            tile_n=tile_n2,
+            tile_k=tile_k2,
+            m_warp=m_warp2,
+            n_warp=n_warp2,
+            num_buffers=num_buffers2,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=0,
+            stage1_quant_out=0,
+            has_bias=int(_b2 is not None),
+            cluster_n=cluster_n,
+            next_stage_prefetch=next_stage_prefetch,
+            n_experts=E,
+        )
+    )
     # Local quant instead writes one compact row-major row per token and rebuilds
     # the interleaved layout gemm1 reads in a second pass, so neither write lands
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
@@ -929,6 +989,7 @@ def _grouped_a8w4_tdm_moe(
     _compact_ascale = (
         not _compact
         and not _prequantized
+        and not _gemm1_a_preshuffle
         and _ep_nvr is None
         and _use_fused_quant_preshuffle(
             model_dim, wmma_rep, _quant_mode, token_num, topk
@@ -991,6 +1052,7 @@ def _grouped_a8w4_tdm_moe(
             out_scale=_compact_ascale_buf,
             row_to_token=_row_to_token,
             ep_psum_params=ep_psum_params,
+            a_preshuffle=_gemm1_a_preshuffle,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -1002,13 +1064,36 @@ def _grouped_a8w4_tdm_moe(
                 scale_k_per_tile=tile_k // 32,
             )
 
-    # Fuse gemm1 activation + MX quantization + scale preshuffle into the
-    # kernel epilogue, eliminating the standalone
-    # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
+    # Fuse activation and MX quantization when GEMM1/GEMM2 use the same A layout.
+    # Generic output is row-major and tuned output is A-preshuffled; mixed layouts
+    # retain the standalone conversion kernel.
     disable_gemm1_requant = _as_bool(
         os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
     )
-    _fuse_quant = _b1 is None and not disable_gemm1_requant
+    _fuse_quant = (
+        not disable_gemm1_requant
+        and (_b1 is None)
+        and (_gemm1_a_preshuffle == _gemm2_a_preshuffle)
+    )
+    _fused_gemm1_n_warp = (
+        4
+        if (
+            _fuse_quant
+            and E == 64
+            and token_num == 1536
+            and topk == 8
+            and model_dim == 7168
+            and inter_dim == 2048
+            and tile_m == 192
+            and tile_n == 256
+            and tile_k == 256
+            and m_warp == 2
+            and n_warp == 2
+            and num_buffers == 4
+            and cluster_n == 4
+        )
+        else n_warp
+    )
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -1025,7 +1110,7 @@ def _grouped_a8w4_tdm_moe(
             dtype=torch.uint8,
             device=device,
         )
-        # The gemm1 kernel writes fp8 payload to `a2_payload` (passed as
+        # The gemm1 kernel writes the MX payload to `a2_payload` (passed as
         # `out` / arg_c) and preshuffled e8m0 scale to `a2_scale` (passed via
         # quant_scale / arg_quant_scale).
         flydsl_grouped_gemm_a8w4_masked(
@@ -1043,7 +1128,7 @@ def _grouped_a8w4_tdm_moe(
             tile_n=tile_n,
             tile_k=tile_k,
             m_warp=m_warp,
-            n_warp=n_warp,
+            n_warp=_fused_gemm1_n_warp,
             out_is_f16=out_is_f16,
             a_is_fp4=_a_is_fp4,
             stage1_act=stage1_act,
@@ -1063,6 +1148,7 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_preshuffle=_gemm1_a_preshuffle,
             **_situ_kw,
         )
     else:
@@ -1100,8 +1186,11 @@ def _grouped_a8w4_tdm_moe(
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
+            a_preshuffle=_gemm1_a_preshuffle,
             **_situ_kw,
         )
+        # Quantize only routed rows. Per-expert padding and the sentinel tail
+        # remain unwritten and are excluded by GEMM2's mn_oob bound.
         a2_payload, a2_scale = flydsl_moe_fused_quant_preshuffle(
             y,
             1,
@@ -1109,7 +1198,13 @@ def _grouped_a8w4_tdm_moe(
             wmma_rep=wmma_rep2,
             quant_mode=_quant_mode,
             masked_m=None,
-            topids_to_rows=None,
+            topids_to_rows=topids_to_rows,
+            source_topk=0,
+            num_valid_routes=_ep_nvr,
+            a_preshuffle=_gemm2_a_preshuffle,
+            m_tile_map=psum,
+            n_experts=E,
+            expert_tile_m=_align_m,
         )
 
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
@@ -1141,7 +1236,8 @@ def _grouped_a8w4_tdm_moe(
         waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
-        tdm_b_th=tdm_b_th,
+        tdm_b_th=0,
+        a_preshuffle=_gemm2_a_preshuffle,
         lds_soa_load_interleave=lds_soa_load_interleave,
         **_ep_gemm2_kwargs,
     )
@@ -1164,6 +1260,7 @@ def _grouped_a8w4_tdm_moe(
                     prequantized_scale=src_a1_scale if _prequantized else None,
                     out_payload=a1_payload,
                     out_scale=a1_scale,
+                    a_preshuffle=_gemm1_a_preshuffle,
                 ),
             )
         )
@@ -1179,7 +1276,13 @@ def _grouped_a8w4_tdm_moe(
                         wmma_rep=wmma_rep2,
                         quant_mode=_quant_mode,
                         masked_m=None,
-                        topids_to_rows=None,
+                        topids_to_rows=topids_to_rows,
+                        source_topk=0,
+                        num_valid_routes=_ep_nvr,
+                        a_preshuffle=_gemm2_a_preshuffle,
+                        m_tile_map=psum,
+                        n_experts=E,
+                        expert_tile_m=_align_m,
                         out_payload=a2_payload,
                         out_scale=a2_scale,
                     ),
@@ -1205,7 +1308,7 @@ def _grouped_a8w4_tdm_moe(
                         tile_n=tile_n,
                         tile_k=tile_k,
                         m_warp=m_warp,
-                        n_warp=n_warp,
+                        n_warp=_fused_gemm1_n_warp,
                         out_is_f16=out_is_f16,
                         a_is_fp4=_a_is_fp4,
                         stage1_act=stage1_act,
@@ -1221,6 +1324,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        a_preshuffle=_gemm1_a_preshuffle,
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
@@ -1259,6 +1363,7 @@ def _grouped_a8w4_tdm_moe(
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        a_preshuffle=_gemm1_a_preshuffle,
                         lds_soa_load_interleave=lds_soa_load_interleave,
                         **_situ_kw,
                     ),
@@ -1294,7 +1399,8 @@ def _grouped_a8w4_tdm_moe(
                     waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
-                    tdm_b_th=tdm_b_th,
+                    tdm_b_th=0,
+                    a_preshuffle=_gemm2_a_preshuffle,
                     lds_soa_load_interleave=lds_soa_load_interleave,
                 ),
             )
@@ -1624,6 +1730,7 @@ def grouped_gemm_gfx1250_a8w4(
         _ov_nw = _tdm_env("AITER_TDM_N_WARP")
         _ov_mw2 = _tdm_env("AITER_TDM_M_WARP2")
         _ov_nw2 = _tdm_env("AITER_TDM_N_WARP2")
+        _ov_wpt = _tdm_env("AITER_FLYDSL_NUM_WAVES_PER_TENSOR_TDM")
         if any(v is not None for v in (_ov_mw, _ov_nw, _ov_mw2, _ov_nw2)):
             _base_mw = _ov_mw if _ov_mw is not None else _tdm_kw.get("m_warp", 1)
             _base_nw = _ov_nw if _ov_nw is not None else _tdm_kw.get("n_warp", n_warp)
@@ -1631,6 +1738,8 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["n_warp"] = _base_nw
             _tdm_kw["m_warp2"] = _ov_mw2 if _ov_mw2 is not None else _base_mw
             _tdm_kw["n_warp2"] = _ov_nw2 if _ov_nw2 is not None else _base_nw
+        if _ov_wpt is not None:
+            _tdm_kw["waves_per_tensor_tdm"] = _ov_wpt
         return _grouped_a8w4_tdm_moe(
             hidden_states,
             w1,
