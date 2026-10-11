@@ -14,6 +14,9 @@ python bench_chunk_delta_attn.py
 # Single shape: B=2 T=4096 H=16 K=64 V=64
 python bench_chunk_delta_attn.py --shape 2 4096 16 64 64
 
+# Without safe_gate (unbounded gate), which takes the token-parallel intra kernel
+python bench_chunk_delta_attn.py --no-safe-gate
+
 # Save CSV
 python bench_chunk_delta_attn.py -o
 """
@@ -141,8 +144,8 @@ def run_benchmark(args):
                 use_gate_in_kernel=True,
                 A_log=A_log,
                 dt_bias=dt_bias,
-                lower_bound=-5.0,
-                safe_gate=True,
+                lower_bound=None if args.no_safe_gate else -5.0,
+                safe_gate=not args.no_safe_gate,
                 use_qk_l2norm_in_kernel=True,
                 use_beta_sigmoid_in_kernel=True,
             )
@@ -189,6 +192,12 @@ def parse_args(args=None):
         nargs=5,
         metavar=("B", "T", "H", "K", "V"),
         help="Single shape to benchmark instead of the default sweep.",
+    )
+    parser.add_argument(
+        "--no-safe-gate",
+        action="store_true",
+        help="Run without safe_gate (and without lower_bound), which routes the "
+        "intra-chunk step to the token-parallel kernel instead of the sub-chunk one.",
     )
     parser.add_argument(
         "-o",
