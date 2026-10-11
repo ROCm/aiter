@@ -546,10 +546,13 @@ class BuildExtension(build_ext):
     Fallbacks to the standard distutils backend if Ninja is not available.
 
     .. note::
-        By default, the Ninja backend uses #CPUS + 2 workers to build the
-        extension. This may use up too many resources on some systems. One
-        can control the number of workers by setting the `MAX_JOBS` environment
-        variable to a non-negative number.
+        The Ninja backend uses AITER's live CPU and memory worker budget. One
+        can impose an additional ceiling by setting the `AITER_MAX_JOBS`
+        environment variable to an integer. The live limits are recalculated
+        for every build. Non-positive values impose one worker. At the
+        AITER-owned runtime JIT compile boundary, a valid generic `MAX_JOBS`
+        is honored as a non-mutating legacy ceiling when `AITER_MAX_JOBS` is
+        unset. Merely importing AITER does not consult `MAX_JOBS`.
     """
 
     @classmethod
@@ -1529,7 +1532,9 @@ def _write_ninja_file_and_build_library(
     if verbose:
         print(f"Building extension module {name}...", file=sys.stderr)
     _run_ninja_build(
-        build_directory, verbose, error_prefix=f"Error building extension '{name}'"
+        build_directory,
+        verbose,
+        error_prefix=f"Error building extension '{name}'",
     )
 
 
@@ -1656,35 +1661,28 @@ def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
     return flags
 
 
-def _get_num_workers(verbose: bool) -> int | None:
-    max_jobs = os.environ.get("MAX_JOBS")
-    if max_jobs is not None and max_jobs.isdigit():
-        if int(max_jobs) > int(max(1, os.cpu_count() * 0.8)):
-            max_jobs = int(max(1, os.cpu_count() * 0.8))
-        if verbose:
-            print(
-                f"Using envvar MAX_JOBS ({max_jobs}) as the number of workers...",
-                file=sys.stderr,
-            )
-    else:
-        max_jobs = int(max(1, os.cpu_count() * 0.8))
+def _get_num_workers(verbose: bool) -> int:
+    from aiter_worker_limits import get_compile_worker_count
+
+    max_jobs = get_compile_worker_count()
+    if verbose:
         print(
-            f"Using 0.8*cpu_cnt MAX_JOBS ({max_jobs}) as the number of workers...",
+            f"Using AITER worker budget ({max_jobs}) as the number of workers...",
             file=sys.stderr,
         )
-    prebuild_thread_num = os.environ.get("PREBUILD_THREAD_NUM")
-    if prebuild_thread_num is not None:
-        max_jobs = int(max_jobs) / int(prebuild_thread_num)
-    return int(max_jobs)
+    return max_jobs
 
 
-def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
+def _run_ninja_build(
+    build_directory: str,
+    verbose: bool,
+    error_prefix: str,
+) -> None:
     # Stream compiler progress without changing the application logger format.
     verbose = verbose or os.getenv("AITER_JIT_VERBOSE", "0") == "1"
     command = ["ninja", "-v"]
     num_workers = _get_num_workers(verbose)
-    if num_workers is not None:
-        command.extend(["-j", str(num_workers)])
+    command.extend(["-j", str(num_workers)])
     env = os.environ.copy()
 
     try:

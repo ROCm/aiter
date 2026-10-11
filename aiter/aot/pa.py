@@ -1,23 +1,6 @@
-import concurrent.futures
-import os
-from collections import namedtuple
-
+from aiter.aot.pa_common import build_configs
+from aiter_worker_limits import adopt_legacy_max_jobs, run_configs
 from csrc.cpp_itfs.pa.pa import compile
-
-PAConfig = namedtuple(
-    "PAConfig",
-    [
-        "gqa_ratio",
-        "head_size",
-        "npar_loops",
-        "block_size",
-        "dtype",
-        "kv_dtype",
-        "fp8_kv_dtype",
-        "out_dtype",
-        "alibi_enabled",
-    ],
-)
 
 
 def process_config(config):
@@ -35,70 +18,9 @@ def process_config(config):
 
 
 def main():
-    configs = []
-    for gqa_ratio in range(1, 17):
-        for alibi_enabled in ["false", "true"]:
-            for block_size in [1, 16, 32]:
-                for npar_loops in range(1, 9):
-                    for head_size in [64, 128]:
-                        configs.append(
-                            PAConfig(
-                                gqa_ratio=gqa_ratio,
-                                head_size=head_size,
-                                npar_loops=npar_loops,
-                                dtype="_Float16",
-                                kv_dtype="_Float16",
-                                fp8_kv_dtype="auto",
-                                out_dtype="_Float16",
-                                block_size=block_size,
-                                alibi_enabled=alibi_enabled,
-                            )
-                        )
-                        configs.append(
-                            PAConfig(
-                                gqa_ratio=gqa_ratio,
-                                head_size=head_size,
-                                npar_loops=npar_loops,
-                                dtype="__hip_bfloat16",
-                                kv_dtype="__hip_bfloat16",
-                                fp8_kv_dtype="auto",
-                                out_dtype="__hip_bfloat16",
-                                block_size=block_size,
-                                alibi_enabled=alibi_enabled,
-                            )
-                        )
-                        configs.append(
-                            PAConfig(
-                                gqa_ratio=gqa_ratio,
-                                head_size=head_size,
-                                npar_loops=npar_loops,
-                                dtype="_Float16",
-                                kv_dtype="uint8_t",
-                                fp8_kv_dtype="fp8",
-                                out_dtype="_Float16",
-                                block_size=block_size,
-                                alibi_enabled=alibi_enabled,
-                            )
-                        )
-                        configs.append(
-                            PAConfig(
-                                gqa_ratio=gqa_ratio,
-                                head_size=head_size,
-                                npar_loops=npar_loops,
-                                dtype="__hip_bfloat16",
-                                kv_dtype="uint8_t",
-                                fp8_kv_dtype="fp8",
-                                out_dtype="__hip_bfloat16",
-                                block_size=block_size,
-                                alibi_enabled=alibi_enabled,
-                            )
-                        )
-
-    with concurrent.futures.ProcessPoolExecutor(
-        os.environ.get("MAX_JOBS", "16")
-    ) as executor:
-        executor.map(process_config, configs)
+    run_configs(build_configs(), process_config)
 
 
 if __name__ == "__main__":
+    adopt_legacy_max_jobs()
     main()

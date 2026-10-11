@@ -10,6 +10,15 @@ import sys
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
+from aiter_worker_limits import (
+    adopt_legacy_max_jobs,
+    get_worker_count,
+    split_worker_budget,
+    worker_ceiling,
+)
+
+adopt_legacy_max_jobs()
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
@@ -45,25 +54,6 @@ if not AITER_TRITON_ONLY and IS_WINDOWS and not has_rocm_toolchain():
 if AITER_TRITON_ONLY:
     ENABLE_CK = False
     PREBUILD_KERNELS = False
-
-
-def getMaxJobs():
-    # calculate the maximum allowed NUM_JOBS based on cores
-    max_num_jobs_cores = max(1, os.cpu_count() * 0.8)
-
-    try:
-        import psutil
-
-        # calculate the maximum allowed NUM_JOBS based on free memory
-        free_memory_gb = psutil.virtual_memory().available / (1024**3)
-        max_num_jobs_memory = int(free_memory_gb / 0.5)  # assuming 0.5 GB per job
-    except ImportError:
-        # psutil may not be available during metadata extraction
-        max_num_jobs_memory = max_num_jobs_cores
-
-    # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-    max_jobs = int(max(1, min(max_num_jobs_cores, max_num_jobs_memory)))
-    return max_jobs
 
 
 def is_develop_mode():
@@ -406,13 +396,15 @@ if PREBUILD_KERNELS != 0:
                 third_party=one_opt_args["third_party"],
             )
 
-        prebuid_thread_num = 5
-        max_jobs = os.environ.get("MAX_JOBS")
-        if max_jobs is not None and max_jobs.isdigit() and int(max_jobs) > 0:
-            prebuid_thread_num = min(prebuid_thread_num, int(max_jobs))
-        else:
-            prebuid_thread_num = min(prebuid_thread_num, getMaxJobs())
-        os.environ["PREBUILD_THREAD_NUM"] = str(prebuid_thread_num)
+        # Split the *global* worker budget between the outer module pool and
+        # each module's inner Ninja invocation. The work-capped budget is not
+        # used here: with a short module list it would collapse the inner
+        # budget to one job and strand most of the machine. The inner budget
+        # travels through the shared worker-ceiling env var instead of a
+        # build_module() argument.
+        outer_workers, inner_workers = split_worker_budget(
+            get_worker_count(), len(all_opts_args_build)
+        )
 
         # --- FlyDSL AOT pre-compilation (MOE + GEMM, before CK) ---
         if not IS_WINDOWS:
@@ -432,7 +424,10 @@ if PREBUILD_KERNELS != 0:
                     os.environ["AITER_AOT_IMPORT"] = _prev_aot_import
 
         # --- CK kernel builds ---
-        with ThreadPoolExecutor(max_workers=prebuid_thread_num) as executor:
+        with (
+            worker_ceiling(inner_workers),
+            ThreadPoolExecutor(max_workers=outer_workers) as executor,
+        ):
             list(executor.map(build_one_module, all_opts_args_build))
 
         # Retune GEMM shapes on the live GPU after the main build phase.
@@ -450,27 +445,6 @@ if PREBUILD_KERNELS != 0:
                 csrc_dir=f"{this_dir}/csrc",
                 repo_dir=this_dir,
             )
-
-
-class NinjaBuildExtension(build_ext):
-    """Custom build_ext that defers expensive operations until run() is called."""
-
-    def run(self):
-        # Set MAX_JOBS for ninja
-        max_jobs_env = os.environ.get("MAX_JOBS")
-        if max_jobs_env is None:
-            max_jobs = getMaxJobs()
-            os.environ["MAX_JOBS"] = str(max_jobs)
-        else:
-            try:
-                if int(max_jobs_env) <= 0:
-                    raise ValueError("MAX_JOBS must be a positive integer")
-            except ValueError:
-                max_jobs = getMaxJobs()
-                os.environ["MAX_JOBS"] = str(max_jobs)
-
-        # Run the actual build
-        super().run()
 
 
 setup_requires = [
@@ -506,6 +480,7 @@ setup(
     name=PACKAGE_NAME,
     use_scm_version=True,
     packages=packages,
+    py_modules=["aiter_worker_limits"],
     include_package_data=True,
     package_data={
         "": ["*"],
@@ -516,7 +491,7 @@ setup(
         "Operating System :: Unix",
         "Operating System :: Microsoft :: Windows",
     ],
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={"build_ext": build_ext},
     # 3.8/3.9 have not actually worked for a long time: 81 modules already use
     # PEP 604 annotations (`X | None`) without `from __future__ import
     # annotations`, so they raise TypeError at import time on <3.10. Keep in sync

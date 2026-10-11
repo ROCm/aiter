@@ -1,0 +1,542 @@
+import ast
+import inspect
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+import aiter_worker_limits as worker_limits
+
+configure_worker_subprocesses = worker_limits.configure_worker_subprocesses
+adopt_legacy_max_jobs = worker_limits.adopt_legacy_max_jobs
+get_compile_worker_count = worker_limits.get_compile_worker_count
+get_cpu_worker_budget = worker_limits.get_cpu_worker_budget
+get_worker_count = worker_limits.get_worker_count
+get_worker_count_for = worker_limits.get_worker_count_for
+get_gpu_worker_count = worker_limits.get_gpu_worker_count
+split_worker_budget = worker_limits.split_worker_budget
+
+
+class WorkerAwarenessTest(unittest.TestCase):
+    def setUp(self):
+        # These tests model affinity/memory independently of the test host quota.
+        quota = patch.object(worker_limits, "_cgroup_cpu_quota", return_value=None)
+        quota.start()
+        self.addCleanup(quota.stop)
+
+    def cgroup_files(self, files):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = pathlib.Path(temporary.name)
+        for name, contents in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(contents.format(root=root))
+        for attribute, filename in (
+            ("_PROC_SELF_CGROUP_PATH", "membership"),
+            ("_PROC_SELF_MOUNTINFO_PATH", "mountinfo"),
+        ):
+            mocked = patch.object(worker_limits, attribute, str(root / filename))
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        return root
+
+    def test_worker_count_accepts_no_per_caller_default(self):
+        self.assertEqual(tuple(inspect.signature(get_worker_count).parameters), ())
+
+    def test_cpu_budget_uses_at_most_eighty_percent(self):
+        self.assertEqual(get_cpu_worker_budget(cpu_count=24), 19)
+        self.assertEqual(get_cpu_worker_budget(cpu_count=4), 3)
+
+    def test_cpu_budget_uses_process_available_cpus(self):
+        with patch.object(worker_limits, "_process_cpu_count", return_value=24):
+            self.assertEqual(get_cpu_worker_budget(), 19)
+
+    def test_process_cpu_count_falls_back_to_affinity(self):
+        with patch.object(
+            os, "process_cpu_count", return_value=None, create=True
+        ), patch.object(os, "sched_getaffinity", return_value={0, 1, 2, 3}):
+            self.assertEqual(worker_limits._process_cpu_count(), 4)
+
+    def test_cpu_budget_always_returns_at_least_one(self):
+        for logical_cpus in (0, 1):
+            with self.subTest(logical_cpus=logical_cpus):
+                self.assertEqual(get_cpu_worker_budget(cpu_count=logical_cpus), 1)
+        with patch.object(worker_limits, "_process_cpu_count", return_value=1):
+            self.assertEqual(get_cpu_worker_budget(), 1)
+
+    def test_automatic_budgets_contain_only_cpu_and_memory(self):
+        with patch.object(
+            worker_limits, "get_cpu_worker_budget", return_value=6
+        ), patch.object(
+            worker_limits,
+            "_host_available_memory_bytes",
+            return_value=3 * worker_limits.EST_WORKER_RSS_BYTES,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
+        ):
+            self.assertEqual(worker_limits._automatic_worker_snapshot(), (6, 3, None))
+
+    def test_v2_cgroup_membership_maps_to_current_and_parent_directories(self):
+        root = self.cgroup_files(
+            {
+                "membership": "0::/jobs/worker\n",
+                "mountinfo": "36 25 0:32 / {root}/cgroup rw - cgroup2 none rw\n",
+            }
+        )
+        mount_point = root / "cgroup"
+        self.assertEqual(
+            worker_limits._cgroup_directories("memory"),
+            [
+                ("v2", str(mount_point / "jobs/worker")),
+                ("v2", str(mount_point / "jobs")),
+                ("v2", str(mount_point)),
+            ],
+        )
+
+    def test_v1_memory_controller_membership_respects_mount_root(self):
+        root = self.cgroup_files(
+            {
+                "membership": "5:cpu,memory:/docker/worker\n",
+                "mountinfo": "29 23 0:26 /docker {root}/memory rw - cgroup cgroup rw,memory\n",
+            }
+        )
+        mount_point = root / "memory"
+        self.assertEqual(
+            worker_limits._cgroup_directories("memory"),
+            [
+                ("v1", str(mount_point / "worker")),
+                ("v1", str(mount_point)),
+            ],
+        )
+
+    def test_hybrid_cgroup_mounts_all_contribute_memory_directories(self):
+        root = self.cgroup_files(
+            {
+                "membership": "0::/container\n5:memory:/container\n",
+                "mountinfo": "36 25 0:32 / {root}/unified rw - cgroup2 none rw\n"
+                "29 23 0:26 / {root}/memory rw - cgroup cgroup rw,memory\n",
+                "unified/container/memory.max": str(16 * 1024**3),
+                "unified/container/memory.current": str(1 * 1024**3),
+                "memory/container/memory.limit_in_bytes": str(8 * 1024**3),
+                "memory/container/memory.usage_in_bytes": str(7 * 1024**3),
+            }
+        )
+        v2_mount = root / "unified"
+        v1_mount = root / "memory"
+        self.assertEqual(
+            worker_limits._cgroup_directories("memory"),
+            [
+                ("v2", str(v2_mount / "container")),
+                ("v2", str(v2_mount)),
+                ("v1", str(v1_mount / "container")),
+                ("v1", str(v1_mount)),
+            ],
+        )
+        remaining, _ = worker_limits._cgroup_memory_bound()
+        self.assertEqual(remaining, 1 * 1024**3)
+
+    def test_cgroup_remaining_memory_uses_tightest_finite_ancestor(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            child = root / "child"
+            child.mkdir()
+            (child / "memory.max").write_text("max\n")
+            (child / "memory.current").write_text("1073741824\n")
+            (root / "memory.max").write_text(str(8 * 1024**3))
+            (root / "memory.current").write_text(str(2 * 1024**3))
+            with patch.object(
+                worker_limits,
+                "_cgroup_directories",
+                return_value=[("v2", str(child)), ("v2", str(root))],
+            ):
+                remaining, _ = worker_limits._cgroup_memory_bound()
+
+        self.assertEqual(remaining, 6 * 1024**3)
+
+    def test_v1_cgroup_remaining_memory_uses_limit_and_usage_files(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            directory = pathlib.Path(tempdir)
+            (directory / "memory.limit_in_bytes").write_text(str(8 * 1024**3))
+            (directory / "memory.usage_in_bytes").write_text(str(3 * 1024**3))
+            with patch.object(
+                worker_limits,
+                "_cgroup_directories",
+                return_value=[("v1", str(directory))],
+            ):
+                remaining, _ = worker_limits._cgroup_memory_bound()
+
+        self.assertEqual(remaining, 5 * 1024**3)
+
+    def test_finite_cgroup_with_unreadable_usage_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            directory = pathlib.Path(tempdir)
+            (directory / "memory.max").write_text(str(8 * 1024**3))
+            with patch.object(
+                worker_limits,
+                "_cgroup_directories",
+                return_value=[("v2", str(directory))],
+            ):
+                remaining, _ = worker_limits._cgroup_memory_bound()
+
+        self.assertEqual(remaining, 0)
+
+    def test_container_memory_caps_large_host_worker_budget(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            worker_limits,
+            "_host_available_memory_bytes",
+            return_value=256 * 1024**3,
+        ), patch.object(
+            worker_limits,
+            "_cgroup_memory_bound",
+            return_value=(8 * 1024**3, None),
+        ), patch.object(
+            worker_limits, "_process_cpu_count", return_value=128
+        ):
+            self.assertEqual(worker_limits._automatic_worker_snapshot(), (102, 5, None))
+            self.assertEqual(get_worker_count(), 5)
+
+    def test_four_cpu_worker_count_uses_eighty_percent(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            worker_limits,
+            "_host_available_memory_bytes",
+            return_value=10 * 1024**3,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
+        ), patch.object(
+            worker_limits, "_process_cpu_count", return_value=4
+        ):
+            self.assertEqual(get_worker_count(), 3)
+            self.assertNotIn("AITER_MAX_JOBS", os.environ)
+
+    def test_worker_ceiling_precedence_without_environment_mutation(self):
+        cases = (
+            (None, None, 6, 6),
+            (None, "2", 6, 2),
+            (None, "99", 6, 6),
+            (None, "not-an-integer", 6, 6),
+            (None, "0", 6, 6),
+            (None, "-7", 6, 6),
+            ("5", "2", 5, 5),
+            ("99", None, 6, 6),
+            ("99", "2", 6, 6),
+            ("1", None, 1, 1),
+            ("0", "2", 1, 1),
+            ("-7", "2", 1, 1),
+            ("", "2", 6, 6),
+            ("auto", "2", 6, 6),
+            ("not-an-integer", "2", 6, 6),
+        )
+        for canonical, legacy, generic_expected, compile_expected in cases:
+            environment = {
+                name: value
+                for name, value in (("AITER_MAX_JOBS", canonical), ("MAX_JOBS", legacy))
+                if value is not None
+            }
+            with self.subTest(environment=environment), patch.dict(
+                os.environ, environment, clear=True
+            ), patch.object(
+                worker_limits, "_automatic_worker_snapshot", return_value=(8, 6, None)
+            ) as snapshot:
+                self.assertEqual(get_worker_count(), generic_expected)
+                self.assertEqual(get_compile_worker_count(), compile_expected)
+                self.assertEqual(snapshot.call_count, 2)
+                self.assertEqual(dict(os.environ), environment)
+
+    def test_automatic_worker_budget_is_recomputed_on_every_call(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            worker_limits,
+            "_automatic_worker_snapshot",
+            side_effect=((102, 180, None), (1, 1, None)),
+        ) as automatic_budgets:
+            self.assertEqual(get_worker_count(), 102)
+            self.assertEqual(get_worker_count(), 1)
+            self.assertEqual(automatic_budgets.call_count, 2)
+            self.assertNotIn("AITER_MAX_JOBS", os.environ)
+
+    def test_runtime_jit_uses_legacy_aware_compile_helper(self):
+        tree = ast.parse((_REPO_ROOT / "aiter/jit/utils/cpp_extension.py").read_text())
+        imported_names = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module == "aiter_worker_limits"
+            for alias in node.names
+        }
+        self.assertIn("get_compile_worker_count", imported_names)
+        calls = [
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "get_compile_worker_count"
+        ]
+        self.assertEqual(len(calls), 1)
+
+    def test_standalone_entrypoint_adopts_valid_legacy_max_jobs(self):
+        with patch.dict(os.environ, {"MAX_JOBS": "7"}, clear=True), self.assertWarns(
+            FutureWarning
+        ) as warning:
+            adopt_legacy_max_jobs()
+            self.assertEqual(os.environ["MAX_JOBS"], "7")
+            self.assertEqual(os.environ["AITER_MAX_JOBS"], "7")
+            self.assertIn(
+                "use AITER_MAX_JOBS instead", str(warning.warnings[0].message)
+            )
+
+    def test_explicit_aiter_max_jobs_prevents_legacy_adoption(self):
+        with patch.dict(
+            os.environ,
+            {"AITER_MAX_JOBS": "3", "MAX_JOBS": "7"},
+            clear=True,
+        ), patch.object(worker_limits.warnings, "warn") as warn:
+            adopt_legacy_max_jobs()
+
+            self.assertEqual(os.environ["AITER_MAX_JOBS"], "3")
+            self.assertEqual(os.environ["MAX_JOBS"], "7")
+            warn.assert_not_called()
+
+    def test_invalid_legacy_max_jobs_is_not_adopted(self):
+        for raw_value in ("", "auto", "0", "-7"):
+            with self.subTest(raw_value=raw_value), patch.dict(
+                os.environ, {"MAX_JOBS": raw_value}, clear=True
+            ), patch.object(worker_limits.warnings, "warn") as warn:
+                adopt_legacy_max_jobs()
+
+                self.assertEqual(os.environ["MAX_JOBS"], raw_value)
+                self.assertNotIn("AITER_MAX_JOBS", os.environ)
+                warn.assert_not_called()
+
+    def test_adopted_legacy_ceiling_remains_clamped_to_live_limits(self):
+        with patch.dict(os.environ, {"MAX_JOBS": "99"}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(4, 3, None)
+        ):
+            with self.assertWarns(FutureWarning):
+                adopt_legacy_max_jobs()
+            self.assertEqual(get_worker_count(), 3)
+
+    def test_legacy_adoption_is_wired_only_at_owned_entrypoints(self):
+        guarded_entrypoints = (
+            "aiter/aot/asm_mla_decode_fwd.py",
+            "aiter/aot/pa.py",
+            "aiter/aot/pa_ragged.py",
+            "aiter/aot/pa_v1.py",
+            "aiter/aot/sampling.py",
+            "aiter/aot/flydsl/chunk_gdn_h.py",
+            "aiter/aot/flydsl/gemm.py",
+            "aiter/aot/flydsl/grouped_moe.py",
+            "aiter/aot/flydsl/moe.py",
+            "csrc/cpp_itfs/pa_gluon_aot/pa_decode_gluon_aot_prebuild.py",
+            "csrc/opus_gemm/gen_co/build_co.py",
+            "op_tests/opus/device/setup.py",
+        )
+        for relative_path in guarded_entrypoints:
+            with self.subTest(relative_path=relative_path):
+                tree = ast.parse((_REPO_ROOT / relative_path).read_text())
+                main_guards = [
+                    node
+                    for node in tree.body
+                    if isinstance(node, ast.If) and "__main__" in ast.unparse(node.test)
+                ]
+                self.assertEqual(len(main_guards), 1)
+                calls = [
+                    node.func.id
+                    for node in ast.walk(main_guards[0])
+                    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                ]
+                self.assertIn("adopt_legacy_max_jobs", calls)
+
+        setup_tree = ast.parse((_REPO_ROOT / "setup.py").read_text())
+        top_level_calls = [
+            node.value.func.id
+            for node in setup_tree.body
+            if isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+        ]
+        self.assertIn("adopt_legacy_max_jobs", top_level_calls)
+
+    def test_worker_ceiling_scopes_nested_compiler_budget(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(8, 8, None)
+        ):
+            with worker_limits.worker_ceiling(3):
+                self.assertEqual(os.environ["AITER_MAX_JOBS"], "3")
+                self.assertEqual(get_compile_worker_count(), 3)
+            self.assertNotIn("AITER_MAX_JOBS", os.environ)
+
+    def test_worker_ceiling_restores_previous_ceiling_on_error(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "5"}, clear=True):
+            with self.assertRaises(RuntimeError), worker_limits.worker_ceiling(2):
+                self.assertEqual(os.environ["AITER_MAX_JOBS"], "2")
+                raise RuntimeError("boom")
+            self.assertEqual(os.environ["AITER_MAX_JOBS"], "5")
+
+    def test_zero_memory_capacity_still_returns_one_worker(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            worker_limits,
+            "_host_available_memory_bytes",
+            return_value=0,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
+        ), patch.object(
+            worker_limits, "_process_cpu_count", return_value=1
+        ):
+            self.assertEqual(get_worker_count(), 1)
+            self.assertNotIn("AITER_MAX_JOBS", os.environ)
+
+    def test_available_memory_caps_default_workers(self):
+        with patch.dict(os.environ, {}, clear=True), patch.object(
+            worker_limits,
+            "_host_available_memory_bytes",
+            return_value=4 * worker_limits.EST_WORKER_RSS_BYTES,
+        ), patch.object(
+            worker_limits, "_cgroup_memory_bound", return_value=(None, None)
+        ), patch.object(
+            worker_limits, "_process_cpu_count", return_value=64
+        ):
+            self.assertEqual(get_worker_count(), 4)
+            self.assertNotIn("AITER_MAX_JOBS", os.environ)
+
+    def test_worker_configures_supported_build_controls(self):
+        with patch.dict(
+            os.environ,
+            {
+                "AITER_MAX_JOBS": "23",
+                "MAX_JOBS": "64",
+                "NINJAFLAGS": "-j99",
+            },
+            clear=True,
+        ):
+            configure_worker_subprocesses()
+            self.assertEqual(os.environ["AITER_MAX_JOBS"], "1")
+            self.assertEqual(os.environ["MAX_JOBS"], "64")
+            self.assertEqual(os.environ["CMAKE_BUILD_PARALLEL_LEVEL"], "1")
+            self.assertEqual(os.environ["MAKEFLAGS"], "-j1")
+            self.assertEqual(os.environ["NINJAFLAGS"], "-j99")
+
+    def test_work_capped_worker_count_never_returns_zero(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
+        ):
+            self.assertEqual(get_worker_count_for(0), 1)
+            self.assertEqual(get_worker_count_for(3), 3)
+
+    def test_worker_count_for_honors_explicit_ceiling(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
+        ):
+            self.assertEqual(get_worker_count_for(100, None), 19)
+            self.assertEqual(get_worker_count_for(100, 4), 4)
+            self.assertEqual(get_worker_count_for(100, 99), 19)
+            self.assertEqual(get_worker_count_for(2, 99), 2)
+
+    def test_worker_count_for_explicit_ceiling_never_returns_zero(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "19"}, clear=True), patch.object(
+            worker_limits, "_automatic_worker_snapshot", return_value=(32, 32, None)
+        ):
+            for explicit in (0, -7):
+                with self.subTest(explicit=explicit):
+                    self.assertEqual(get_worker_count_for(100, explicit), 1)
+
+    def test_split_worker_budget_caps_outer_pool(self):
+        self.assertEqual(split_worker_budget(32, 40), (5, 6))
+        self.assertEqual(split_worker_budget(32, 3), (3, 10))
+
+    def test_split_worker_budget_divides_the_same_total(self):
+        # The *global* total is divided, so a short module list still uses the
+        # whole machine instead of collapsing to one inner job per module.
+        outer, inner = split_worker_budget(24, 40)
+        self.assertEqual(outer, 5)
+        self.assertEqual(inner, 4)
+        self.assertEqual(split_worker_budget(24, 2), (2, 12))
+        self.assertEqual(split_worker_budget(24, module_count=1), (1, 24))
+
+    def test_split_worker_budget_never_returns_zero(self):
+        self.assertEqual(split_worker_budget(0, 0), (1, 1))
+        self.assertEqual(split_worker_budget(1, 100), (1, 1))
+
+    def test_gpu_worker_count_scales_with_visible_devices(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(
+                get_gpu_worker_count(1000, 4), 4 * worker_limits.EST_WORKERS_PER_GPU
+            )
+
+    def test_gpu_worker_count_honors_per_device_override(self):
+        with patch.dict(os.environ, {"AITER_GPU_WORKERS_PER_DEVICE": "2"}, clear=True):
+            self.assertEqual(get_gpu_worker_count(1000, 3), 6)
+
+    def test_gpu_worker_count_is_clamped_by_explicit_ceiling(self):
+        with patch.dict(os.environ, {"AITER_MAX_JOBS": "5"}, clear=True):
+            self.assertEqual(get_gpu_worker_count(1000, 4), 5)
+
+    def test_gpu_worker_count_is_capped_by_submitted_work(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(get_gpu_worker_count(3, 4), 3)
+            self.assertEqual(get_gpu_worker_count(0, 4), 1)
+
+    def test_gpu_worker_count_requires_a_visible_gpu(self):
+        for device_count in (0, -1):
+            with self.subTest(device_count=device_count), self.assertRaisesRegex(
+                RuntimeError, "requires at least one visible GPU"
+            ):
+                get_gpu_worker_count(3, device_count)
+
+    def test_gpu_worker_count_uses_runtime_count_without_reparsing_masks(self):
+        with patch.dict(os.environ, {"HIP_VISIBLE_DEVICES": "0,99"}, clear=True):
+            self.assertEqual(
+                get_gpu_worker_count(1000, 1), worker_limits.EST_WORKERS_PER_GPU
+            )
+
+    def test_worker_does_not_set_unsupported_ninja_environment(self):
+        with patch.dict(os.environ, {}, clear=True):
+            configure_worker_subprocesses()
+            self.assertEqual(os.environ["AITER_MAX_JOBS"], "1")
+            self.assertEqual(os.environ["CMAKE_BUILD_PARALLEL_LEVEL"], "1")
+            self.assertEqual(os.environ["MAKEFLAGS"], "-j1")
+            self.assertNotIn("NINJAFLAGS", os.environ)
+            self.assertEqual(os.environ["OMP_NUM_THREADS"], "1")
+
+    def test_worker_ninja_limit_is_passed_explicitly(self):
+        # Load the production launch functions without importing torch/ROCm.
+        source = _REPO_ROOT / "aiter/jit/utils/cpp_extension.py"
+        tree = ast.parse(source.read_text())
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_get_num_workers", "_run_ninja_build"}
+        ]
+        namespace = {
+            "os": os,
+            "sys": sys,
+            "subprocess": subprocess,
+        }
+        exec(  # noqa: S102 - Execute only functions from the checked-in source.
+            compile(ast.Module(body=functions, type_ignores=[]), str(source), "exec"),
+            namespace,
+        )
+        for flags in (None, "-j99"):
+            with self.subTest(ninjaflags=flags), patch.dict(
+                os.environ, {"MAX_JOBS": "64"}, clear=True
+            ), patch.object(
+                worker_limits, "_automatic_worker_snapshot", return_value=(8, 8, None)
+            ), patch.object(
+                subprocess, "run"
+            ) as run:
+                if flags is not None:
+                    os.environ["NINJAFLAGS"] = flags
+                configure_worker_subprocesses()
+                namespace["_run_ninja_build"]("/tmp/build", False, "build failed")
+                self.assertEqual(run.call_args.args[0], ["ninja", "-v", "-j", "1"])
+                self.assertEqual(run.call_args.kwargs["env"].get("NINJAFLAGS"), flags)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

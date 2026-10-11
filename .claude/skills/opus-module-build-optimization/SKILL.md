@@ -45,7 +45,7 @@ for tu in *.cuda.o; do
 done | sort -rn | head -10
 ```
 
-Top 1-2 TUs ARE the build wall under `MAX_JOBS >= N`. Optimize those; don't touch the long tail.
+Top 1-2 TUs ARE the build wall under `AITER_MAX_JOBS >= N`. Optimize those; don't touch the long tail.
 
 ### Per-pass timing (host vs device)
 
@@ -209,7 +209,7 @@ If every per-instance device.cu redundantly emits instantiations of a shared sub
 
 **Fix**: emit one `instances/shared_kernel.device.cu` carrying all instantiations of the shared sub-kernel; remove them from each per-instance device.cu. Forward declarations in the fused host TU still resolve at link time.
 
-Per-instance TU walls drop; CPU footprint shrinks proportionally to N. End-to-end wall doesn't always move (the slowest TU may not be the shared one), but helps under constrained `MAX_JOBS`.
+Per-instance TU walls drop; CPU footprint shrinks proportionally to N. End-to-end wall doesn't always move (the slowest TU may not be the shared one), but helps under constrained `AITER_MAX_JOBS`.
 
 **When NOT to apply**: fewer than ~5 instances of the shared sub-kernel.
 
