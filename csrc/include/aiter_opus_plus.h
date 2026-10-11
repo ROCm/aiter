@@ -66,6 +66,21 @@ OPUS_D decltype(auto) fp32_to_fp8_scaled_x2(const S& s, float inverted_scale)
 #endif
 }
 
+// fp32x2 -> fp8x2 with scale, no clamp: NaN and anything past +-max convert to NaN.
+// For MX scales, which keep finite values in range.
+OPUS_D fp8x2_t fp32_to_fp8_scaled_x2_noclamp(fp32x2_t s, float inverted_scale)
+{
+    fp32x2_t tmp = pk_mul_f32(s, fp32x2_t{inverted_scale, inverted_scale});
+#if defined(__gfx942__) || defined(__gfx950__) || defined(__gfx1200__) || \
+    defined(__gfx1201__) || defined(__gfx1250__)
+    int w;
+    asm volatile("v_cvt_pk_fp8_f32 %0, %1, %2" : "=v"(w) : "v"(tmp[0]), "v"(tmp[1]));
+    return __builtin_bit_cast(fp8x2_t, static_cast<int16_t>(w));
+#else
+    (void)tmp; return fp8x2_t{};
+#endif
+}
+
 template <typename S, std::enable_if_t<std::is_same_v<S, fp32x4_t>, bool> = true>
 OPUS_D decltype(auto) fp32_to_fp8_scaled_x4(const S& s, float inverted_scale)
 {
@@ -641,6 +656,23 @@ OPUS_D decltype(auto) scaled_cast_div(const S& s, float scale)
     return scaled_cast<D>(s, 1.0f / scale);
 }
 
+// fp8 scaled_cast without the +-max clamp; see fp32_to_fp8_scaled_x2_noclamp.
+template <typename S>
+OPUS_D decltype(auto) scaled_cast_fp8_noclamp(const S& s, float inverted_scale)
+{
+    constexpr index_t N = size<S>();
+    static_assert(N % 2 == 0);
+    vector_t<fp8_t, N> out;
+    static_for<N / 2>([&](auto i) {
+        auto pair = fp32_to_fp8_scaled_x2_noclamp(
+            fp32x2_t{static_cast<float>(s[i.value * 2]), static_cast<float>(s[i.value * 2 + 1])},
+            inverted_scale);
+        out[i.value * 2]     = pair[0];
+        out[i.value * 2 + 1] = pair[1];
+    });
+    return out;
+}
+
 // fp4 target: any fp32 vector size via x2 loop
 template <
     typename D,
@@ -807,7 +839,8 @@ template <typename T,
           bool interleave            = false,
           int interleave_thread_size = WARP_SIZE,
           typename T_R               = T,
-          bool scale_is_divisor      = false>
+          bool scale_is_divisor      = false,
+          bool fp8_noclamp           = false>
 __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
                                     const opus::vector_t<DTYPE_I, vec_size>& vec,
                                     int row_offset,
@@ -855,7 +888,12 @@ __device__ void store_vector_nbytes(opus::gmem<T>& buffer,
             else
             {
                 opus::vector_t<T_R, chunk_size_elements> chunk_convert;
-                if constexpr(scale_is_divisor)
+                if constexpr(fp8_noclamp)
+                {
+                    static_assert(std::is_same_v<T_R, opus::fp8_t> && !scale_is_divisor);
+                    chunk_convert = scaled_cast_fp8_noclamp(*chunk_ptr, inverted_scale);
+                }
+                else if constexpr(scale_is_divisor)
                     chunk_convert = scaled_cast_div<T_R>(*chunk_ptr, inverted_scale);
                 else
                     chunk_convert = scaled_cast<T_R>(*chunk_ptr, inverted_scale);
@@ -890,7 +928,8 @@ template <typename T,
           int interleave_thread_size = WARP_SIZE,
           int num_repeat             = 1,
           typename T_R               = T,
-          bool scale_is_divisor      = false>
+          bool scale_is_divisor      = false,
+          bool fp8_noclamp           = false>
 __device__ void store_vector(opus::gmem<T>& buffer,
                              const opus::vector_t<DTYPE_I, vec_size>& vec,
                              int row_offset,
@@ -900,17 +939,17 @@ __device__ void store_vector(opus::gmem<T>& buffer,
     static constexpr index_t store_bytes      = vec_size * opus::sizeof_bits<T_R>::value / 8;   // total output bytes (logical type T_R)
     if constexpr((store_bytes / num_store_repeat) % 16 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 16, aux, interleave, interleave_thread_size, T_R, scale_is_divisor, fp8_noclamp>(
             buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 8 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 8, aux, interleave, interleave_thread_size, T_R, scale_is_divisor, fp8_noclamp>(
             buffer, vec, row_offset, inverted_scale);
     }
     else if constexpr((store_bytes / num_store_repeat) % 4 == 0)
     {
-        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R, scale_is_divisor>(
+        store_vector_nbytes<T, DTYPE_I, vec_size, 4, aux, interleave, interleave_thread_size, T_R, scale_is_divisor, fp8_noclamp>(
             buffer, vec, row_offset, inverted_scale);
     }
     else
