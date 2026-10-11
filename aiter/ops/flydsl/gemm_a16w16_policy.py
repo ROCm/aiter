@@ -169,6 +169,11 @@ def _gfx1250_configs(m: int, n: int, k: int):
     ):
         if gfx1250_lds_bytes(block_m, block_n, block_k, stages, split_k) > lds_bytes:
             continue
+        # The split-K reduction code grows with the accumulators per wave: with 64 of
+        # them (256x256 on 2x2 waves) one candidate compiled for minutes, and no gfx1250
+        # row uses split-K with more than 2.
+        if split_k > 1 and (block_m // m_waves // 16) * (block_n // n_waves // 16) > 4:
+            continue
         # The prologue fills stages - 1 buffers from each split's K range.
         if -(-(k // split_k) // block_k) < stages - 1:
             continue
