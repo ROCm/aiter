@@ -16,6 +16,7 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits_schedule,
 )
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
 
@@ -422,6 +423,8 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
             if (
                 not args.kv_preshuffle
                 and kv_cache_fp8.shape[0] * kv_cache_fp8.stride(0) >= 2**31
+            ) or (
+                EnableVarCtxOpt and max_addressable_bytes(kv_cache_fp8) >= 2**31 - 1
             ):
                 aot_name += "_kv64"
 
