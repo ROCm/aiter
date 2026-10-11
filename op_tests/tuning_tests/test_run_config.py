@@ -44,6 +44,24 @@ def _gpu_available():
         return False
 
 
+def _current_gfx():
+    try:
+        from aiter.jit.utils.chip_info import get_gfx
+
+        return get_gfx()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _skip_unless_required_gfx(test, name, cfg):
+    required = cfg.get("required_gfx")
+    if not required:
+        return
+    gfx = _current_gfx()
+    if gfx != required:
+        test.skipTest(f"{name} requires {required}, got {gfx or 'unknown'}")
+
+
 def _find_tuned_csvs(pattern):
     """Find all tuned CSVs matching pattern in configs/ and model_configs/."""
     found = []
@@ -327,6 +345,17 @@ TUNER_FAMILIES = {
         "timeout": 3600,
         "config_property": "AITER_CONFIG_FMOE_FILE",
     },
+    "fhmoe": {
+        "script": "csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+        "csv_pattern": "tuned_fhmoe",
+        "exclude_patterns": ["untuned"],
+        "extra_args": ["--fhmoe"],
+        "config_property": "AITER_CONFIG_FHMOE_FILE",
+        # gemm_moe_tune.py --fhmoe SystemExits in __main__ off gfx950.
+        "required_gfx": "gfx950",
+        # 12 DSV4 rows, distinct FlyDSL pairs. 600s died after token=512 OK.
+        "timeout": 1800,
+    },
     "gradlib_bf16": {
         "script": "gradlib/gradlib/gemm_tuner.py",
         "csv_pattern": "bf16_tuned_gemm",
@@ -355,6 +384,7 @@ class TestRunConfig(unittest.TestCase):
 
     def _test_family(self, name):
         cfg = TUNER_FAMILIES[name]
+        _skip_unless_required_gfx(self, name, cfg)
         timeout = cfg.get("timeout", 600)
         extra_args = cfg.get("extra_args", None)
 
@@ -444,6 +474,9 @@ class TestRunConfig(unittest.TestCase):
     def test_fmoe(self):
         self._test_family("fmoe")
 
+    def test_fhmoe(self):
+        self._test_family("fhmoe")
+
     def test_gradlib_bf16(self):
         self._test_family("gradlib_bf16")
 
@@ -487,6 +520,7 @@ class TestRunConfigCustom(unittest.TestCase):
             f"Unknown family '{family}'. Available: {list(TUNER_FAMILIES.keys())}",
         )
         cfg = TUNER_FAMILIES[family]
+        _skip_unless_required_gfx(self, family, cfg)
         timeout = cfg.get("timeout", 600)
         extra_args = cfg.get("extra_args", None)
 
