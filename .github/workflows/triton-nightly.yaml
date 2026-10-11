@@ -1,0 +1,481 @@
+name: Triton Nightly
+
+# Full Triton suite on MI350 and MI300X every night. A shard that fails is
+# retried once: passing on the retry is reported as flaky, failing twice is a
+# hard failure. Every run — green or red — comments on the rolling
+# "Triton nightly status" issue, so the result reaches watchers either way.
+# Hard failures add the ranked suspect commits, then a capped first-parent
+# bisect names the exact PR.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC, after the 03:00 release nightly
+  workflow_dispatch:
+    inputs:
+      bisect:
+        description: 'Bisect hard failures to the offending PR'
+        type: boolean
+        default: true
+      max_bisect_commits:
+        description: 'Skip the bisect if more commits than this are in range'
+        default: '80'
+
+permissions:
+  contents: read
+  issues: write
+  actions: read
+
+concurrency:
+  group: triton-nightly
+  cancel-in-progress: false
+
+env:
+  # Always notified. Suspect commit authors are @mentioned automatically.
+  NIGHTLY_WATCHERS: '@Boss2002n'
+
+jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
+  split_triton_tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Split the full Triton suite (8 shards)
+        run: ./.github/scripts/split_tests.sh --shards 8 --test-type triton
+      - uses: actions/upload-artifact@v4
+        with:
+          name: triton_shards
+          path: triton_shard_*.list
+          retention-days: 7
+
+  prepare_triton_wheel:
+    needs: [ci_config]
+    uses: ./.github/workflows/prepare-triton-wheel.yaml
+    with:
+      docker-image: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      artifact-name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
+      retention-days: 3
+
+  test:
+    name: ${{ matrix.runner == 'linux-aiter-mi35x-1' && 'MI350' || 'MI300X' }} / Shard ${{ matrix.shard }}
+    needs: [ci_config, split_triton_tests, prepare_triton_wheel]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [linux-aiter-mi35x-1, linux-aiter-oci-mi300x-1]
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      ARCH: ${{ matrix.runner == 'linux-aiter-mi35x-1' && 'MI350' || 'MI300X' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          submodules: 'recursive'
+
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 15
+        with:
+          name: triton_shards
+
+      - uses: actions/download-artifact@v4
+        timeout-minutes: 30
+        continue-on-error: true
+        with:
+          name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
+          path: triton_wheels
+
+      - name: Docker login
+        env:
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          for attempt in 1 2 3; do
+            if echo "$DOCKER_PASSWORD" | docker login -u rocmshared --password-stdin; then
+              exit 0
+            fi
+            [ "${attempt}" != 3 ] && sleep 10
+          done
+          echo "Docker login failed after 3 attempts, continuing anyway"
+          exit 0
+
+      - name: Run the container
+        run: |
+          set -ex
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name triton_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Setup Aiter and Triton
+        run: docker exec -w /workspace triton_test ./.github/scripts/build_aiter_triton.sh
+
+      - name: Run shard (retry once on failure)
+        id: run
+        run: |
+          set -u
+          SHARD_TESTS=$(cat triton_shard_${{ matrix.shard }}.list)
+          mkdir -p test-reports
+          docker exec -w /workspace triton_test mkdir -p test-reports
+          run_shard () {
+            docker exec -w /workspace triton_test \
+              pytest -v ${SHARD_TESTS} -o junit_family=xunit1 \
+                --junitxml=test-reports/triton.xml
+          }
+          STATUS=pass
+          if ! run_shard; then
+            echo "::warning::${ARCH} shard ${{ matrix.shard }} failed — retrying once"
+            cp test-reports/triton.xml test-reports/attempt1.xml 2>/dev/null || true
+            if run_shard; then
+              STATUS=flaky
+            else
+              STATUS=fail
+            fi
+          fi
+          echo "status=${STATUS}" >> "$GITHUB_OUTPUT"
+          python3 - "$STATUS" <<'PY'
+          import json, os, sys, glob
+          import xml.etree.ElementTree as ET
+          status = sys.argv[1]
+          failed = []
+          def case_path(case):
+              # xunit1 records `file`; xunit2 does not, so fall back to the
+              # dotted classname (dropping any trailing test-class name).
+              if case.get("file"):
+                  return case.get("file")
+              parts = (case.get("classname") or "").split(".")
+              while parts:
+                  candidate = "/".join(parts) + ".py"
+                  if os.path.exists(candidate):
+                      return candidate
+                  parts.pop()
+              return ""
+
+          for path in ("test-reports/triton.xml",):
+              try:
+                  root = ET.parse(path).getroot()
+              except Exception:
+                  continue
+              for case in root.iter("testcase"):
+                  if case.find("failure") is not None or case.find("error") is not None:
+                      f = case_path(case)
+                      if f:
+                          failed.append(f)
+          json.dump(
+              {
+                  "arch": os.environ["ARCH"],
+                  "shard": os.environ["SHARD"],
+                  "status": status,
+                  "failed_tests": sorted(set(failed)),
+              },
+              open(f"test-reports/status-{os.environ['ARCH']}-{os.environ['SHARD']}.json", "w"),
+              indent=1,
+          )
+          PY
+        env:
+          SHARD: ${{ matrix.shard }}
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nightly-${{ env.ARCH }}-shard-${{ matrix.shard }}
+          path: test-reports/
+          retention-days: 14
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f triton_test || true
+
+  report:
+    name: Report and triage
+    needs: [test]
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      hard_failures: ${{ steps.aggregate.outputs.hard_failures }}
+      missing_shards: ${{ steps.aggregate.outputs.missing_shards }}
+      last_green: ${{ steps.last_green.outputs.sha }}
+      failing_tests: ${{ steps.aggregate.outputs.failing_tests }}
+      failing_mi350: ${{ steps.aggregate.outputs.failing_MI350 }}
+      failing_mi300x: ${{ steps.aggregate.outputs.failing_MI300X }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: nightly-*
+          path: reports
+
+      - name: Aggregate shard results
+        id: aggregate
+        env:
+          # Keep in sync with the `test` job matrix below.
+          EXPECTED_ARCHES: MI350 MI300X
+          SHARD_COUNT: '8'
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import glob, json, os
+          arches = os.environ["EXPECTED_ARCHES"].split()
+          shards = int(os.environ["SHARD_COUNT"])
+          rows, failing = [], set()
+          per_arch = {a: set() for a in arches}
+          for p in sorted(glob.glob("reports/**/status-*.json", recursive=True)):
+              s = json.load(open(p))
+              rows.append(s)
+              if s["status"] == "fail":
+                  failing.update(s["failed_tests"])
+                  per_arch.setdefault(s["arch"], set()).update(s["failed_tests"])
+          # A shard that died before writing its status file must not read as
+          # a pass: compare what reported against the full matrix.
+          expected = {(a, str(i)) for a in arches for i in range(shards)}
+          reported = {(r["arch"], str(r["shard"])) for r in rows}
+          missing = sorted(expected - reported)
+          hard = [r for r in rows if r["status"] == "fail"]
+          flaky = [r for r in rows if r["status"] == "flaky"]
+          if missing:
+              names = ", ".join(f"{a} shard {s}" for a, s in missing)
+              overall = f"🚨 **{len(missing)} shard(s) never reported** — {names}"
+          elif hard:
+              overall = f"❌ **{len(hard)} shard(s) failed twice**"
+          elif flaky:
+              overall = f"⚠️ **all green, {len(flaky)} shard(s) passed only on retry**"
+          else:
+              overall = "✅ **all green**"
+          table = ["| arch | shard | result |", "|---|---|---|"]
+          for r in sorted(rows, key=lambda r: (r["arch"], int(r["shard"]))):
+              mark = {"pass": "✅ pass", "flaky": "⚠️ flaky (passed on retry)", "fail": "❌ failed twice"}[r["status"]]
+              table.append(f"| {r['arch']} | {r['shard']} | {mark} |")
+          print(f"hard_failures={len(hard)}")
+          print(f"flaky={len(flaky)}")
+          print(f"shards_reported={len(rows)}")
+          print(f"missing_shards={len(missing)}")
+          for a in arches:
+              print(f"failing_{a}=" + " ".join(sorted(per_arch.get(a, ()))))
+          print("failing_tests=" + " ".join(sorted(failing)))
+          with open("summary.md", "w") as fh:
+              fh.write(overall + "\n\n" + "\n".join(table) + "\n")
+          with open("failing_tests.txt", "w") as fh:
+              fh.write("\n".join(sorted(failing)) + "\n")
+          for a in arches:
+              with open(f"failing_tests_{a}.txt", "w") as fh:
+                  fh.write("\n".join(sorted(per_arch.get(a, ()))) + "\n")
+          PY
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Find the last green nightly
+        id: last_green
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runs = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: 'triton-nightly.yaml',
+              status: 'success',
+              branch: 'main',
+              per_page: 1,
+            });
+            const sha = runs.data.workflow_runs[0]?.head_sha || '';
+            core.info(sha ? `last green nightly: ${sha}` : 'no previous green nightly');
+            core.setOutput('sha', sha);
+
+      - name: Rank suspect commits
+        if: steps.aggregate.outputs.hard_failures != '0' && steps.last_green.outputs.sha != ''
+        run: |
+          python3 .github/scripts/triton_nightly_blame.py \
+            --since "${{ steps.last_green.outputs.sha }}" \
+            --tests failing_tests.txt > suspects.md || echo "suspect ranking unavailable" > suspects.md
+          cat suspects.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment the result on the nightly status issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8'); } catch { return ''; } };
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const failing = read('failing_tests.txt').trim();
+            const suspects = read('suspects.md').trim();
+            const parts = [
+              `### Triton nightly — \`${context.sha.slice(0, 9)}\` · [run log](${runUrl})`,
+              '',
+              read('summary.md'),
+            ];
+            if (failing) {
+              parts.push('', '<details><summary>Failing tests</summary>', '', '```', failing, '```', '', '</details>');
+            }
+            if (suspects) {
+              parts.push('', suspects);
+            }
+            parts.push('', `cc ${process.env.NIGHTLY_WATCHERS || ''}`);
+            const body = parts.join('\n');
+            const title = 'Triton nightly status';
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'triton-nightly', per_page: 1,
+            });
+            if (existing.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+              core.info(`commented on #${existing.data[0].number}`);
+            } else {
+              const issue = await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['triton-nightly'],
+              });
+              core.info(`opened tracker #${issue.data.number}`);
+            }
+
+      - name: Fail the workflow on hard failures
+        if: steps.aggregate.outputs.hard_failures != '0' || steps.aggregate.outputs.missing_shards != '0'
+        run: |
+          echo "hard failures: ${{ steps.aggregate.outputs.hard_failures }}, missing shards: ${{ steps.aggregate.outputs.missing_shards }}"
+          exit 1
+
+  bisect:
+    name: Bisect ${{ matrix.arch }}
+    needs: [ci_config, report]
+    if: >-
+      always() && needs.report.outputs.hard_failures != '0'
+      && needs.report.outputs.last_green != ''
+      && (github.event_name == 'schedule' || inputs.bisect)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: MI350
+            runner: linux-aiter-mi35x-1
+          - arch: MI300X
+            runner: linux-aiter-oci-mi300x-1
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
+      LAST_GREEN: ${{ needs.report.outputs.last_green }}
+      # Each architecture bisects only its own failures: an MI300X-only
+      # regression does not reproduce on MI350, so a merged list would walk
+      # the history finding nothing bad and blame the wrong PR.
+      FAILING_MI350: ${{ needs.report.outputs.failing_mi350 }}
+      FAILING_MI300X: ${{ needs.report.outputs.failing_mi300x }}
+      ARCH: ${{ matrix.arch }}
+      MAX_COMMITS: ${{ inputs.max_bisect_commits || '80' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: 'recursive'
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: ${{ needs.ci_config.outputs.triton_wheel_artifact_name }}
+          path: triton_wheels
+
+      - name: Pick this architecture's failures and check the range
+        id: range
+        run: |
+          if [ "${ARCH}" = "MI350" ]; then TESTS="${FAILING_MI350}"; else TESTS="${FAILING_MI300X}"; fi
+          if [ -z "${TESTS// /}" ]; then
+            echo "No ${ARCH} failures to bisect."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "FAILING_TESTS=${TESTS}" >> "$GITHUB_ENV"
+          COUNT=$(git rev-list --first-parent --count "${LAST_GREEN}..HEAD")
+          echo "range=${COUNT}" >> "$GITHUB_OUTPUT"
+          if [ "${COUNT}" -gt "${MAX_COMMITS}" ]; then
+            echo "::warning::${COUNT} commits since the last green nightly (> ${MAX_COMMITS}) — skipping the bisect"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Run the container
+        if: steps.range.outputs.skip != 'true'
+        run: |
+          set -ex
+          if [ -f "/etc/podinfo/gha-render-devices" ]; then
+            DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices)
+          else
+            DEVICE_FLAG="--device /dev/dri"
+          fi
+          docker run -dt \
+          --device=/dev/kfd $DEVICE_FLAG \
+          --shm-size=16G \
+          -e TRITON_WHEEL_DIR=/workspace/triton_wheels \
+          --group-add $(getent group render | cut -d: -f3) \
+          --group-add $(getent group video | cut -d: -f3) \
+          -v "${{ github.workspace }}:/workspace" \
+          -w /workspace \
+          --name triton_test \
+          ${{ env.DOCKER_IMAGE }}
+
+      - name: Bisect
+        if: steps.range.outputs.skip != 'true'
+        id: bisect
+        run: |
+          set -o pipefail
+          # The step script is part of the tree being bisected, so it does not
+          # exist at older commits — run it from outside the working tree.
+          cp .github/scripts/triton_nightly_bisect_step.sh "${RUNNER_TEMP}/bisect_step.sh"
+          chmod +x "${RUNNER_TEMP}/bisect_step.sh"
+          git bisect start --first-parent HEAD "${LAST_GREEN}"
+          git bisect run "${RUNNER_TEMP}/bisect_step.sh" "${FAILING_TESTS}" | tee bisect.log
+          git bisect log > bisect-full.log || true
+          git bisect reset || true
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import re
+          log = open("bisect.log", encoding="utf-8", errors="replace").read()
+          m = re.search(r"([0-9a-f]{7,40}) is the first bad commit", log)
+          print(f"culprit={m.group(1) if m else ''}")
+          PY
+
+      - name: Report the culprit
+        if: always() && steps.bisect.outputs.culprit != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const sha = '${{ steps.bisect.outputs.culprit }}';
+            const commit = await github.rest.repos.getCommit({
+              owner: context.repo.owner, repo: context.repo.repo, ref: sha,
+            });
+            const subject = commit.data.commit.message.split('\n')[0];
+            const login = commit.data.author?.login;
+            const pr = subject.match(/#(\d+)/);
+            const body = [
+              `**Bisect result (${process.env.ARCH}):** \`${sha.slice(0, 9)}\` is the first bad commit.`,
+              '',
+              `> ${subject}`,
+              '',
+              pr ? `PR: #${pr[1]}` : '',
+              login ? `Author: @${login}` : '',
+            ].filter(Boolean).join('\n');
+            const existing = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'open', labels: 'triton-nightly', per_page: 1,
+            });
+            if (existing.data.length) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.data[0].number, body,
+              });
+            }
+
+      - name: Cleanup container
+        if: always()
+        run: docker rm -f triton_test || true
