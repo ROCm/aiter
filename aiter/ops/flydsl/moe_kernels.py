@@ -2113,7 +2113,7 @@ def _flydsl_moe_stage2_impl(
     inter_dim = inter_states.shape[2]
 
     # Debug: force stage2 to use the masked reduce epilogue instead of atomic
-    # accumulate. Enabled by default; set AITER_FLYDSL_FORCE_REDUCE=0 to opt out.
+    # accumulation. Disabled by default; set AITER_FLYDSL_FORCE_REDUCE=1 to opt in.
     if os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1":
         mode = "reduce"
     elif (
@@ -2181,7 +2181,8 @@ def _flydsl_moe_stage2_impl(
         _persist_m = -1 if m_blocks > 256 else 1
 
     if a_dtype == "fp8":
-        # FP8 uses non-persistent scheduling, so cap grid.y via persist_m.
+        # Normalize FP8-A grid scheduling from runtime occupancy, even for
+        # legacy tuned names that retain `_persist` as part of their identity.
         _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
     if bias is not None and bias.dtype != torch.float32:

@@ -17,9 +17,14 @@ Usage:
     # Custom CSV file(s)
     python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
 
+    # Include runtime-debug stage-2 variants
+    python -m aiter.aot.flydsl.moe --include-forced-reduce --include-stage2-fp8
+
 Environment variables:
     FLYDSL_RUNTIME_CACHE_DIR  Cache directory (default: ~/.flydsl/cache)
     ARCH                      Target GPU architecture (e.g. gfx942, gfx950).
+    AITER_FLYDSL_FORCE_REDUCE Include forced-reduce variants when set to 1.
+    AITER_FLYDSL_STAGE2_FP8   Include stage-2 FP8 variants when set to 1.
 """
 
 import argparse
@@ -36,9 +41,12 @@ from aiter.aot.flydsl.common import (
     override_env,
     run_jobs_parallel,
 )
+from aiter.fhmoe_contract import _is_hy4_mxfp8_fhmoe_contract
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg as _ptr_view_safe
 from aiter.ops.flydsl.moe_kernels import (
+    _S2_LEGACY_FP8_PITCH_ALIGN,
+    _S2_LEGACY_FP8_SCALE_BLK,
     _get_compiled_silu_fused,
     _run_compiled,
     _s1_args_fp4,
@@ -65,7 +73,17 @@ DEFAULT_CSVS = [
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
 
-def parse_csv(csv_path: str):
+def _mx_w2_scale_numel(experts: int, model_dim: int, inter_dim: int) -> int:
+    scale_k = (inter_dim + 255) // 256 * 256
+    return experts * model_dim * (scale_k // 32)
+
+
+def parse_csv(
+    csv_path: str,
+    *,
+    include_forced_reduce: bool = False,
+    include_stage2_fp8: bool = False,
+):
     """Parse the CSV and return a list of unique compile jobs.
 
     Each job is a dict with keys:
@@ -90,6 +108,8 @@ def parse_csv(csv_path: str):
             cu_num = int(row.get("cu_num", "0"))
             block_m = int(row.get("block_m", "0") or "0")
             shared_expert_id = int(row.get("shared_expert_id", "-1") or "-1")
+            model_dim_pad = int(row.get("hidden_pad", "0") or "0")
+            inter_dim_pad = int(row.get("intermediate_pad", "0") or "0")
             act_type = row.get("act_type", "")
             act_name = act_type.strip().split(".")[-1].lower()
             act = act_name if act_name in ("swiglu", "situv2") else "silu"
@@ -181,6 +201,8 @@ def parse_csv(csv_path: str):
                         "enable_bias": enable_bias,
                         "token_num": token,
                         "block_m": block_m,
+                        "model_dim_pad": model_dim_pad,
+                        "inter_dim_pad": inter_dim_pad,
                     }
                     if shared_expert_id >= 0:
                         job["shared_expert_id"] = shared_expert_id
@@ -198,12 +220,54 @@ def parse_csv(csv_path: str):
                         full_job["v2_output_layout"] = True
                         if stage2_v2_params is not None:
                             full_job["out_dtype"] = stage2_v2_params["a_dtype"]
-                    key = job_identity(full_job)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-
-                    jobs.append(full_job)
+                    is_hy4_stage1 = params["stage"] == 1 and (
+                        _is_hy4_mxfp8_fhmoe_contract(
+                            model_dim=model_dim,
+                            inter_dim=inter_dim,
+                            experts=experts,
+                            topk=topk,
+                            routed_mxfp8=params["b_dtype"] == "fp8",
+                            hidden_pad=model_dim_pad,
+                            intermediate_pad=inter_dim_pad,
+                            gate_interleaved=params.get("gate_mode") == "interleave",
+                            doweight_stage1=doweight_stage1,
+                            shared_expert_id=shared_expert_id,
+                        )
+                    )
+                    compile_jobs = [full_job]
+                    if is_hy4_stage1:
+                        compile_jobs = [
+                            {**full_job, "clamp_shared": True},
+                            {**full_job, "clamp_shared": False},
+                        ]
+                    for compile_job in compile_jobs:
+                        key = job_identity(compile_job)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        jobs.append(compile_job)
+                    if params["stage"] == 2 and (
+                        include_forced_reduce or include_stage2_fp8
+                    ):
+                        reduce_job = full_job
+                        if params.get("mode", "atomic") != "reduce":
+                            reduce_job = dict(full_job)
+                            reduce_job["mode"] = "reduce"
+                            reduce_job["forced_reduce_variant"] = True
+                            if include_forced_reduce:
+                                forced_key = job_identity(reduce_job)
+                                if forced_key not in seen:
+                                    seen.add(forced_key)
+                                    jobs.append(reduce_job)
+                        if include_stage2_fp8 and params["b_dtype"] in ("fp4", "fp8"):
+                            fp8_reduce = dict(reduce_job)
+                            fp8_reduce.pop("forced_reduce_variant", None)
+                            fp8_reduce["stage2_fp8_inter"] = True
+                            fp8_reduce["stage2_fp8_variant"] = True
+                            fp8_key = job_identity(fp8_reduce)
+                            if fp8_key not in seen:
+                                seen.add(fp8_key)
+                                jobs.append(fp8_reduce)
 
     return jobs
 
@@ -239,12 +303,16 @@ def _precompile_to_cache(
     cu_num: int = 0,
     token_num: int = 0,
     block_m: int = 0,
+    model_dim_pad: int = 0,
+    inter_dim_pad: int = 0,
     a_scale_one: bool = False,
     xcd_swizzle: int = 0,
     enable_bias: bool = False,
     stage1_fuse_quant=None,
+    stage2_fp8_inter: bool = False,
     k_wave: int = 1,
     v2_output_layout: bool = False,
+    clamp_shared: bool = True,
     # Stage2-only kernel tuning knobs (registered by the production-variant
     # entries in `get_flydsl_stage2_kernels`). Forwarded into
     # `compile_flydsl_moe_stage2` for stage 2 AOT compilation.
@@ -262,8 +330,8 @@ def _precompile_to_cache(
     topk, a_dtype, b_dtype, ...)`` combination, then dispatches into the same
     runtime entry points used by the fused-MoE op.  ``COMPILE_ONLY=1`` causes
     the executor to compile and persist the artifact without launching a
-    kernel.  This guarantees that the cache key written here equals the cache
-    key the runtime will look up at inference time.
+    kernel. Tests compare representative AOT/runtime identities and run-only
+    retrieval so cache-key drift is detected.
     """
     import torch
 
@@ -324,7 +392,7 @@ def _precompile_to_cache(
         return None
 
     def _make_a1_scale():
-        """Mirror fused_moe_2stages a1_scale construction (per_1x32 + fp4-weight path)."""
+        """Mirror per-1x32 MXFP4/MXFP8 runtime a1_scale construction."""
         if not use_mx_gemm:
             return None
         if a_dtype == "fp8":
@@ -400,7 +468,7 @@ def _precompile_to_cache(
         return None
 
     def _make_w_scale(scale_storage_numel: int):
-        # mxfp4 e8m0 scale -- viewed as uint8 by _view_safe before kernel launch.
+        # MX E8M0 scale storage is viewed as uint8 before kernel launch.
         return torch.zeros(scale_storage_numel, dtype=torch.uint8, device=dev)
 
     def _make_a_user(a_dtype_user_shape):
@@ -601,30 +669,35 @@ def _precompile_to_cache(
                 if _aot_backend is None
                 else _aot_backend.compile_stage1
             )
-            exe = compile_stage1(
-                model_dim=model_dim,
-                inter_dim=inter_dim,
-                experts=E,
-                topk=topk,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                tile_k=tile_k,
-                doweight_stage1=(sw is not None),
-                a_dtype=a_dtype,
-                b_dtype=b_dtype,
-                out_dtype=_gemm_out_dtype,
-                act=act,
-                use_async_copy=True,
-                k_batch=k_batch,
-                waves_per_eu=waves_per_eu,
-                b_nt=b_nt,
-                gate_mode=gate_mode,
-                enable_bias=(kernel_bias is not None),
-                a_scale_one=a_scale_one,
-                xcd_swizzle=xcd_swizzle,
-                k_wave=k_wave,
-                v2_output_layout=_v2_output_layout,
-            )
+            stage1_compile_kwargs = {
+                "model_dim": model_dim,
+                "inter_dim": inter_dim,
+                "experts": E,
+                "topk": topk,
+                "tile_m": tile_m,
+                "tile_n": tile_n,
+                "tile_k": tile_k,
+                "doweight_stage1": (sw is not None),
+                "a_dtype": a_dtype,
+                "b_dtype": b_dtype,
+                "out_dtype": _gemm_out_dtype,
+                "act": act,
+                "use_async_copy": True,
+                "k_batch": k_batch,
+                "waves_per_eu": waves_per_eu,
+                "b_nt": b_nt,
+                "gate_mode": gate_mode,
+                "model_dim_pad": model_dim_pad,
+                "inter_dim_pad": inter_dim_pad,
+                "enable_bias": (kernel_bias is not None),
+                "a_scale_one": a_scale_one,
+                "xcd_swizzle": xcd_swizzle,
+                "k_wave": k_wave,
+                "v2_output_layout": _v2_output_layout,
+            }
+            if _aot_backend is not None:
+                stage1_compile_kwargs["clamp_shared"] = clamp_shared
+            exe = compile_stage1(**stage1_compile_kwargs)
             _run_compiled(exe, args)
 
             if _gui_sk_fused or _gui_sk or _splitk_fp4:
@@ -682,7 +755,7 @@ def _precompile_to_cache(
 
             a2_scale = _make_a2_scale_for_stage2()
             if use_mx_gemm:
-                w2_scale = _make_w_scale(E * model_dim * (inter_dim // 32))
+                w2_scale = _make_w_scale(_mx_w2_scale_numel(E, model_dim, inter_dim))
             else:
                 w2_scale = torch.zeros(1, device=dev, dtype=torch.float32)
 
@@ -700,11 +773,27 @@ def _precompile_to_cache(
             out = torch.zeros((tokens, model_dim), dtype=torch_out_dtype, device=dev)
             target = out
             if not accumulate:
-                target = torch.empty(
-                    (tokens * topk * model_dim,),
-                    device=dev,
-                    dtype=torch_out_dtype,
-                )
+                if stage2_fp8_inter:
+                    from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
+                        fp8out_row_bytes,
+                    )
+
+                    target = torch.empty(
+                        tokens * topk,
+                        fp8out_row_bytes(
+                            model_dim,
+                            scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
+                            pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
+                        ),
+                        device=dev,
+                        dtype=torch.uint8,
+                    )
+                else:
+                    target = torch.empty(
+                        (tokens * topk * model_dim,),
+                        device=dev,
+                        dtype=torch_out_dtype,
+                    )
 
             flat_a_scale = (
                 a2_scale.view(-1)
@@ -737,6 +826,8 @@ def _precompile_to_cache(
             else:
                 _persist_m = -1 if m_blocks > 256 else 1
             if a_dtype == "fp8":
+                # Mirror runtime normalization for legacy tuned names that
+                # retain `_persist` as part of their identity.
                 _persist_m = resolve_flydsl_grid_y_persist_m(m_blocks)
 
             _n_in = model_dim
@@ -801,7 +892,7 @@ def _precompile_to_cache(
                 doweight_stage2=(sw is not None),
                 a_dtype=a_dtype,
                 b_dtype=b_dtype,
-                out_dtype=out_dtype,
+                out_dtype=("fp8" if stage2_fp8_inter else out_dtype),
                 accumulate=accumulate,
                 persist_m=_persist_m,
                 sort_block_m=sort_block_m,
@@ -810,6 +901,8 @@ def _precompile_to_cache(
                 use_global_a=requires_flydsl_stage2_global_a(a),
                 cu_num_mul=cu_num_mul,
                 b_nt=b_nt,
+                model_dim_pad=model_dim_pad,
+                inter_dim_pad=inter_dim_pad,
                 xcd_swizzle=xcd_swizzle,
                 enable_bias=enable_bias,
             )
@@ -832,6 +925,9 @@ def _precompile_to_cache(
                     expert_mask=None,
                     topk_ids=None,
                     stream=0,
+                    is_fp8=stage2_fp8_inter,
+                    fp8_scale_blk=_S2_LEGACY_FP8_SCALE_BLK,
+                    fp8_pitch_align=_S2_LEGACY_FP8_PITCH_ALIGN,
                 )
 
 
@@ -1116,7 +1212,23 @@ def main():
         default=DEFAULT_CSVS,
         help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
     )
+    parser.add_argument(
+        "--include-forced-reduce",
+        action="store_true",
+        help="also compile stage-2 variants used by AITER_FLYDSL_FORCE_REDUCE=1",
+    )
+    parser.add_argument(
+        "--include-stage2-fp8",
+        action="store_true",
+        help="also compile MX stage-2 variants used by AITER_FLYDSL_STAGE2_FP8=1",
+    )
     args = parser.parse_args()
+    include_forced_reduce = args.include_forced_reduce or (
+        os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
+    )
+    include_stage2_fp8 = args.include_stage2_fp8 or (
+        os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+    )
 
     csv_paths = [os.path.abspath(p) for p in args.csv]
     for csv_path in csv_paths:
@@ -1129,7 +1241,14 @@ def main():
     )
     arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
 
-    all_jobs = collect_aot_jobs(csv_paths, parse_csv)
+    all_jobs = collect_aot_jobs(
+        csv_paths,
+        lambda path: parse_csv(
+            path,
+            include_forced_reduce=include_forced_reduce,
+            include_stage2_fp8=include_stage2_fp8,
+        ),
+    )
 
     stage1_jobs = [j for j in all_jobs if j["stage"] == 1]
     stage2_jobs = [j for j in all_jobs if j["stage"] == 2]
@@ -1146,6 +1265,8 @@ def main():
     print("  Compile arch: (from cu_num)")
     print(f"  Cache dir:    {cache_dir}")
     print(f"  Target arch:  {arch}")
+    print(f"  Forced reduce: {'enabled' if include_forced_reduce else 'disabled'}")
+    print(f"  Stage2 FP8:    {'enabled' if include_stage2_fp8 else 'disabled'}")
     print("=" * 72)
 
     total_t0 = time.time()

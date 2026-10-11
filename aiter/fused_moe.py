@@ -691,11 +691,34 @@ def get_topk_valid_mask(
     return expert_mask[topk_ids]
 
 
+def _is_flydsl_stage2(stage2: Callable) -> bool:
+    func = getattr(stage2, "func", stage2)
+    return func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False)
+
+
+def _stage2_honors_forced_reduce(stage2: Callable) -> bool:
+    """Return whether stage2 reaches the runtime FORCE_REDUCE override."""
+    if not _is_flydsl_stage2(stage2):
+        return False
+    kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
+    parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
+    if parsed is None:
+        raise ValueError(
+            "AITER_FLYDSL_FORCE_REDUCE requires a recognized FlyDSL stage2 "
+            f"kernel, got {kernel_name!r}"
+        )
+    # The a16w-mix launcher returns before the environment override. MXFP4
+    # always atomically scatters; INT4 follows only its configured kernel mode.
+    return not (
+        parsed.get("a_dtype") == "bf16" and parsed.get("b_dtype") in ("fp4", "int4")
+    )
+
+
 def stage2_uses_route_reduce(stage2: Callable) -> bool:
     """Return True when stage2 writes per-slot route output then reduces it."""
     func = getattr(stage2, "func", stage2)
     kernel_name = getattr(stage2, "keywords", {}).get("kernelName", "")
-    if func is _flydsl_stage2_wrapper or getattr(func, "_is_flydsl_stage2", False):
+    if _is_flydsl_stage2(func):
         parsed = _get_flydsl_moe_kernels().get_flydsl_kernel_params(kernel_name)
         if parsed is None:
             return False
@@ -859,14 +882,69 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    # False explicitly selects unclamped shared-expert semantics and is accepted
+    # only when the HY4-compatible geometry/layout contract also matches.
+    clamp_shared: bool = True,
 ):
-    if (
+    """Run fused MoE, dispatching to FHMoE when shared-expert tensors are present.
+
+    Supplying any shared tensor (or ``shared_expert_id``) requires all four
+    shared weight/scale tensors and dispatches through the gfx950 FHMoE path.
+    Inputs must satisfy the contracts documented in :mod:`aiter.fhmoe`.
+
+    ``clamp_shared`` is an FHMoE model-semantic input. The default ``True``
+    applies the configured SiLU clamp to routed and shared experts. ``False``
+    changes only the shared expert to unclamped SiLU; routed experts still use
+    ``swiglu_limit``. The unclamped mode is accepted only for HY4-compatible
+    MXFP8 geometry/layout.
+
+    This argument previously followed geometry-derived behavior. HY4 callers
+    that require the original unclamped shared expert must now pass
+    ``clamp_shared=False`` explicitly. Clamped and unclamped stage-1 kernels
+    have distinct AOT cache identities, so deployments changing this setting
+    must rebuild their FlyDSL AOT cache.
+
+    """
+    has_shared_expert = (
         any(
             tensor is not None
             for tensor in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
         )
         or shared_expert_id != -1
-    ):
+    )
+    if not clamp_shared and not has_shared_expert:
+        raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
+    if has_shared_expert:
+        unsupported = []
+        if stage2_scatter is not None:
+            unsupported.append("stage2_scatter")
+        if quant_type_a is not None:
+            unsupported.append("quant_type_a")
+        fhmoe_quant_dtype_a = (
+            dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
+        )
+        if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
+            unsupported.append("quant_dtype_a")
+        if quant_dtype_a2 is not None:
+            unsupported.append("quant_dtype_a2")
+        if a1_scale is not None:
+            unsupported.append("a1_scale")
+        if a2_scale is not None:
+            unsupported.append("a2_scale")
+        if unsupported:
+            raise NotImplementedError(
+                "FHMoE shared-expert dispatch does not support "
+                + ", ".join(unsupported)
+            )
+        weights = (w1, w2, shared_w1, shared_w2)
+        if any(
+            weight is not None and not getattr(weight, "is_shuffled", False)
+            for weight in weights
+        ):
+            raise ValueError(
+                "FHMoE weights must be AITER-preshuffled and marked "
+                "is_shuffled=True; re-run the shuffle after tensor copies"
+            )
         from aiter.fhmoe import _fhmoe
 
         return _fhmoe(
@@ -898,6 +976,7 @@ def fused_moe(
             shared_w1_scale=shared_w1_scale,
             shared_w2_scale=shared_w2_scale,
             shared_expert_id=shared_expert_id,
+            clamp_shared=clamp_shared,
             output=output,
         )
     if not block_size_M:
@@ -1136,6 +1215,7 @@ def _fused_moe_impl(
     _stage1_extra_args: dict | None = None,
     _stage2_extra_args: dict | None = None,
     _stage2_override: Callable | None = None,
+    _enforce_metadata_block_size: bool = False,
 ) -> torch.Tensor:
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
@@ -1291,8 +1371,7 @@ def _fused_moe_impl(
         ):
             if _bad:
                 raise NotImplementedError(
-                    f"a16w4 (bf16 A x MXFP4 W) {_a16w4_why} is not supported: "
-                    f"{_why}."
+                    f"a16w4 (bf16 A x MXFP4 W) {_a16w4_why} is not supported: {_why}."
                 )
 
     config_situ_beta, config_situ_linear_beta, _ = _normalize_mxfp4_activation_params(
@@ -1301,7 +1380,7 @@ def _fused_moe_impl(
 
     def _resolve_metadata(disable_inline_sort=False):
         metadata = get_2stage_cfgs(
-            get_padded_M(M),  # consider token_num > 1024 as prefill
+            get_padded_M(M),
             model_dim,
             inter_dim,
             E,
@@ -1383,6 +1462,15 @@ def _fused_moe_impl(
             "FlyDSL fallback cannot accept this invocation."
         )
 
+    if (
+        _enforce_metadata_block_size
+        and block_size_M is not None
+        and int(block_size_M) != int(metadata.block_m)
+    ):
+        raise ValueError(
+            f"FHMoE block_size_M={block_size_M} does not match the selected "
+            f"kernel block size {metadata.block_m}"
+        )
     block_size_M = metadata.block_m if block_size_M is None else block_size_M
     if metadata.full_impl is not None:
         full_output = metadata.full_impl(
@@ -1439,6 +1527,9 @@ def _fused_moe_impl(
 
     sort_m_indices = None
     sort_reverse_sorted = None
+    force_stage2_reduce = os.environ.get(
+        "AITER_FLYDSL_FORCE_REDUCE", "0"
+    ) == "1" and _stage2_honors_forced_reduce(metadata.stage2)
     if metadata.output_aux:
         # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
         # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
@@ -1466,7 +1557,7 @@ def _fused_moe_impl(
             expert_mask,
             num_local_tokens,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=_atomic,
+            accumulate=_atomic and not force_stage2_reduce,
             output_aux=metadata.output_aux,
             output=output,
         )
@@ -1492,7 +1583,9 @@ def _fused_moe_impl(
             num_local_tokens,
             moe_sorting_dispatch_policy,
             return_local_topk_ids=need_local_topk_ids,
-            accumulate=not stage2_uses_route_reduce(metadata.stage2),
+            accumulate=not (
+                stage2_uses_route_reduce(metadata.stage2) or force_stage2_reduce
+            ),
             flat=metadata.flat,
             output=None if metadata.flat else output,
         )
@@ -1871,6 +1964,12 @@ _PADDED_M_TIERS = [32768, 131072]
 
 
 def get_padded_M(M):
+    """Map runtime M to a tuning bucket.
+
+    Values below 32768 use the next power of two, 32768..131071 use the 32768
+    tier, and values from 131072 upward use the 131072 tier. Individual model
+    contracts may impose a stricter maximum before lookup.
+    """
     if M < _PADDED_M_TIERS[0]:
         return nextPow2(M)
     for tier in reversed(_PADDED_M_TIERS):
@@ -3246,8 +3345,7 @@ def get_2stage_cfgs(
             reject_reason = f"no MXMOE kernel for activation {activation!r}"
         elif configured_act != expected_act:
             reject_reason = (
-                f"activation {configured_act!r} does not match runtime "
-                f"{expected_act!r}"
+                f"activation {configured_act!r} does not match runtime {expected_act!r}"
             )
         elif swiglu_limit and expected_act not in ("silu", "swiglu"):
             reject_reason = (

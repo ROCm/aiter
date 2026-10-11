@@ -150,6 +150,17 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
         return default_jobs()
     if kind is OpKind.MOE:
         from .moe import DEFAULT_CSVS, parse_csv
+
+        include_forced_reduce = os.environ.get("AITER_FLYDSL_FORCE_REDUCE", "0") == "1"
+        include_stage2_fp8 = os.environ.get("AITER_FLYDSL_STAGE2_FP8", "0") == "1"
+        return collect_aot_jobs(
+            DEFAULT_CSVS,
+            lambda path: parse_csv(
+                path,
+                include_forced_reduce=include_forced_reduce,
+                include_stage2_fp8=include_stage2_fp8,
+            ),
+        )
     elif kind is OpKind.MXFP4_MOE:
         from .mxfp4_moe import DEFAULT_CSVS, parse_csv
     elif kind is OpKind.GEMM:
