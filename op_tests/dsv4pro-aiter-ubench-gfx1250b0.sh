@@ -171,8 +171,8 @@ HIP_VISIBLE_DEVICES=0 \
 echo "[6/13] exit=$?" >> $SUMMARY
 echo ""
 
-# 7. MQA indexer (Gluon, bf16) — single GPU
-echo "=== [7/13] MQA indexer (Gluon, bf16) ==="
+# 7. MQA indexer (Gluon, fp8) — single GPU
+echo "=== [7/13] MQA indexer (Gluon, fp8) ==="
 for kv in 384 4608 10240; do
   echo "--- kv_length=$kv ---"
   HIP_VISIBLE_DEVICES=0 \
