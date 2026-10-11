@@ -7,6 +7,7 @@ indices.
 TODO: add details once API has settled
 """
 
+import functools
 import math
 
 import torch
@@ -23,6 +24,9 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+)
+from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
+    _pa_decode_sparse_v4_2buff as gluon_pa_decode_sparse_v4_2buff,
 )
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
@@ -71,6 +75,49 @@ def _check_out(out, q, dtype):
     return out
 
 
+# ---------------------------------------------------------------------------
+# DSv4 "2buff" packed-fp8 KV layout, byte-identical to what the gfx1250 MLA-v4
+# asm decode kernel (aiter.mla.mla_decode_fwd_v4_nm ->
+# _ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE) consumes. See
+# ATOM atom/model_ops/v4_kernels/v4_quant.py (V4_* constants) and
+# aiter op_tests/test_mla_v4_kargpreld.py::_native_to_2buff_for_asm.
+#
+#   row = [ NoPE 448 x fp8-e4m3 | 14 E8M0 scale bytes | 50 pad ] = 512 B
+#         + a separate bf16 RoPE plane of 64 elements (128 B)
+# ---------------------------------------------------------------------------
+_V4_DIM_NOPE = 448
+_V4_DIM_ROPE = 64
+_V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE  # 512, the logical head dim
+_V4_PACKED_FP8_DTYPES = (torch.float8_e4m3fn, torch.uint8)
+
+# ---------------------------------------------------------------------------
+# DSv4 unified paged cache, the layout vLLM's own allocator produces
+# (``fp8_ds_mla``; csrc/.../fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu):
+# per paged block of block_size tokens,
+#   [0,       bs*576)         token data, 448 B fp8 NoPE | 128 B bf16 RoPE
+#   [bs*576,  bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad per token
+# so a record is 584 B and the scales sit in a per-block TRAILER, not beside
+# their row. _V4_DATA_UNIT / _V4_SC_UNIT are gcd(bs*584, 576) and
+# gcd(bs*584, 8): the units that make the gather row indices integral.
+# ---------------------------------------------------------------------------
+_V4_ROW_BYTES = _V4_DIM_NOPE + 2 * _V4_DIM_ROPE  # 576
+_V4_NUM_TILES = _V4_DIM_NOPE // _FP8_GROUP_SIZE  # 7 quant groups
+_V4_SC_RAW = _V4_DIM_NOPE // _FP8_GROUP_SIZE + 1  # 7 real + 1 pad = 8
+_V4_REC_BYTES = _V4_ROW_BYTES + _V4_SC_RAW  # 584, the packed record
+# The ALIGNED record is the same content padded to a 128-byte multiple, so
+# each token's scales sit inside it and every token starts 128-B aligned
+# (TDM then takes the direct global->L2->LDS path). 584 -> 640.
+#
+# Its first 512 bytes are byte-identical to an ATOM 2buff row --
+# 448 NoPE | 14 duplicated UE8M0 scales | 50 pad -- and [512, 640) is the 2buff
+# RoPE row, so the same packing serves Q and KV.
+_V4_REC_ALIGNED = ((_V4_REC_BYTES + 127) // 128) * 128
+# Where the RoPE half sits inside that record: after the 2buff row.
+_V4_ROPE_IN_REC = 512
+_V4_DATA_UNIT = 64
+_V4_SC_UNIT = _V4_SC_RAW
+
+
 def pa_decode_sparse(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -83,11 +130,17 @@ def pa_decode_sparse(
     kv_splits: int | None = None,
     has_invalid: bool | None = True,
     skip_reduce: bool | None = False,
+    use_lru_cache_partials: bool = False,
     USE_EXP2: bool | None = None,
     *,
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
     extra_indptr: torch.Tensor | None = None,
+    unified_kv_rope: torch.Tensor | None = None,
+    q_rope: torch.Tensor | None = None,
+    num_warps: int | None = None,
+    ctas_h: int = 1,
+    q_tdm: bool = True,
     out: torch.Tensor | None = None,
     inv_rope_positions: torch.Tensor | None = None,
     inv_rope_cos_sin_cache: torch.Tensor | None = None,
@@ -118,10 +171,62 @@ def pa_decode_sparse(
             ``kv_splits == 1`` (the single-CTA path already produces the final
             ``out`` directly). Useful for profiling the main kernel in
             isolation and for callers that fold the reduce into a downstream op.
-        extra_cache/extra_indices/extra_indptr: gfx950 packed-only — the SWA+top-k
-            two-loop's second (top-k) cache + index set; must be None otherwise.
+        use_lru_cache_partials: reuse the split-K partial buffers across calls
+            rather than allocating them per call. They run to tens of MB per
+            layer, so a per-step forward churns gigabytes through the
+            allocator, and the caller's runtime cannot account for them.
+            Cached entries are never freed -- a captured CUDA graph records
+            their addresses. Ignored under ``skip_reduce``, where the caller
+            owns the partials.
+        extra_cache/extra_indices/extra_indptr: a second cache and ragged index
+            set attended over in the same pass. vLLM's decode splits its keys
+            this way and these follow its naming: the FIRST (positional) cache
+            is its ``main_cache`` = ``swa_k_cache``, the sliding-window keys,
+            and this one is its ``extra_cache`` = ``kv_cache``, the compressed
+            keys the sparse top-k selects. The two hold the identical record.
+            Supported on the gfx950 packed path and on the gfx1250 vLLM
+            ``fp8_ds_mla`` path; must be None otherwise.
+
+            Both read the same KV format, but each takes ONE Q form for now:
+            gfx950 bf16 Q (a16w8), gfx1250 packed fp8 Q plus ``q_rope``
+            (a8w8). gfx950's kernel has no Q-side scale operand and gfx1250's
+            has no bf16 Q path, so the two are not interchangeable.
+        unified_kv_rope: gfx1250-only — ``[total_pages, 64]`` bf16 RoPE plane.
+            Supplying it selects the DSv4 "2buff" packed-fp8 path, in which
+            ``unified_kv`` is the ``[total_pages, 512]`` fp8 pool laid out
+            exactly as the MLA-v4 asm decode kernel expects
+            (448 fp8 NoPE | 14 duplicated E8M0 group scales | 50 pad), so the
+            same pool can be handed to either kernel with no repacking.
+            ``kv_scales`` must be None (the scales are inline) and ``q_rope``
+            is required (Q is packed the same way).
+        q_tdm: DEFAULT ON. Load Q by TDM descriptor into LDS instead of masked
+            buffer_loads. Worth 90.4 -> 71.7us (kv_len 384) and
+            58.9 -> 43.5us (kv_len 136), and it takes VGPR spills 146 -> 0 on
+            its own, because Q stops materialising [BLOCK_H, D] register tiles
+            and lands in LDS already in dot_q_layout. Set False to A/B it.
+        ctas_h: EXPERIMENTAL, default 1 (off). Launch ``ctas_h`` CTAs as one
+            workgroup cluster, splitting ``block_h`` across them. All CTAs of a
+            cluster serve the same token and want the same KV rows, so the KV
+            fetch is multicast once per cluster instead of re-fetched per
+            head-block. Only pays off when the kernel is spilling: it helped
+            the MX kernel a lot (130.4 -> 83.7us) and the un-TDM'd stage kernel
+            at short kv_len, but HURTS the stage kernel once ``q_tdm`` has
+            removed its spills (72.2 -> 97.9us).
+            UNVERIFIED/SUSPECT: ``cluster.arrive``/``wait`` need every CTA of a
+            cluster co-resident; the large per-CTA LDS of the ``q_tdm`` path
+            may prevent that and hang. Re-verify before enabling.
+        num_warps: override the warp count. The default ties warps to
+            ``block_h`` so the per-thread accumulator is
+            ``block_h * D / (num_warps * 32)`` = 256 VGPRs at every block_h;
+            overriding it is the only way to shrink the accumulator's register
+            footprint.
+        q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q, required on the 2buff
+            path: ``q`` is then the packed fp8 ``[N, H, 512]`` Q — i.e. full
+            a8w8 parity with the asm kernel.
         inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
-            the output epilogue (see _pa_decode_sparse_gfx950_gluon).
+            the output epilogue (see _pa_decode_sparse_gfx950_gluon). The
+            gfx1250 2buff path returns before the guard below and ignores
+            them; see _pa_decode_sparse_v4_2buff.
 
     On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
     packed fp8_dsv4_mla (584 B rows) / bf16 block cache (``extra_*`` = the
@@ -145,6 +250,54 @@ def pa_decode_sparse(
     """
     if not q.is_cuda:
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
+
+    # An aligned record is 448 NoPE | 14 duplicated UE8M0 | 50 pad | 128 RoPE.
+    # Its first 512 bytes are byte-identical to an ATOM 2buff row and the last
+    # 128 are its RoPE row, so a one-tensor paged cache is simply sliced into
+    # the two buffers the 2buff kernel already reads -- no separate kernel.
+    if (
+        unified_kv_rope is None
+        and unified_kv.dim() == 3
+        and unified_kv.shape[-1] == _V4_REC_ALIGNED
+        and unified_kv.dtype in _V4_PACKED_FP8_DTYPES
+    ):
+        unified_kv, unified_kv_rope = _v4_split_aligned(unified_kv)
+        if extra_cache is not None:
+            extra_cache, extra_cache_rope = _v4_split_aligned(extra_cache)
+        else:
+            extra_cache_rope = None
+    else:
+        extra_cache_rope = None
+
+    v4_2buff = unified_kv_rope is not None
+    if v4_2buff:
+        return _pa_decode_sparse_v4_2buff(
+            q,
+            unified_kv,
+            unified_kv_rope,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+            q_rope=q_rope,
+            kv_scales=kv_scales,
+            num_warps=num_warps,
+            ctas_h=ctas_h,
+            q_tdm=q_tdm,
+            block_h=block_h,
+            kv_splits=kv_splits,
+            has_invalid=has_invalid,
+            skip_reduce=skip_reduce,
+            use_lru_cache_partials=use_lru_cache_partials,
+            out=out,
+            extra_cache=extra_cache,
+            extra_cache_rope=extra_cache_rope,
+            extra_indices=extra_indices,
+            extra_indptr=extra_indptr,
+        )
+    if q_rope is not None:
+        raise RuntimeError("q_rope requires unified_kv_rope (the DSv4 2buff path)")
+
     if q.dtype not in (torch.bfloat16, torch.float16):
         raise RuntimeError(f"pa_decode_sparse expects fp16/bf16 q, got {q.dtype}")
     _LOGGER.info(
@@ -196,9 +349,10 @@ def pa_decode_sparse(
                 out_mxfp8=out_mxfp8,
             )
 
-    assert (
-        extra_cache is None and extra_indices is None and extra_indptr is None
-    ), "extra_cache/extra_indices/extra_indptr are gfx950 packed-only"
+    assert extra_cache is None and extra_indices is None and extra_indptr is None, (
+        "extra_cache/extra_indices/extra_indptr need the gfx950 packed path or "
+        "the gfx1250 fp8_ds_mla path"
+    )
     assert (
         inv_rope_positions is None and out_mxfp8 is None
     ), "the output epilogue is gfx950 gluon-only"
@@ -308,11 +462,16 @@ def pa_decode_sparse(
     # the reduce masks their stale partial-buffer slots).
     # print(f"{kv_indices.shape[0]=}")
     if kv_splits is None:
-        max_kv_len = kv_indices.shape[0]
-        max_kv_splits = max(1, triton.cdiv(max_kv_len, block_k))
+        # PER TOKEN: the split is per token, so the ceiling is the tile count
+        # ONE token has. kv_indices.shape[0] is every token's indices together,
+        # so the ceiling never bound and splits were made with no work in them
+        # -- and a dead split still costs the reduce a slab row.
+        avg_kv_len = max(1, kv_indices.shape[0] // max(1, T))
+        max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
         kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
         kv_splits = min(max_kv_splits, kv_splits)
-        kv_splits = triton.next_power_of_2(kv_splits)
+        # DOWN to a power of two: rounding up puts back what the ceiling removed.
+        kv_splits = 1 << (max(1, kv_splits).bit_length() - 1)
 
     if use_gluon:
         _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
@@ -425,6 +584,8 @@ def pa_decode_sparse(
         acc_partial,
         attn_sink,
         kv_indptr,
+        kv_indptr,
+        kv_indices,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -446,6 +607,9 @@ def pa_decode_sparse(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         USE_EXP2=USE_EXP2,
+        HAS_EXTRA=False,
+        MAIN_IS_WINDOW=False,
+        MAIN_BLOCK_SIZE_RED=1,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
@@ -933,5 +1097,507 @@ def _pa_decode_sparse_gfx950_gluon(
         **epilogue,
         # A 2-split tile spans two warps; more warps would hold duplicate lanes.
         num_warps=min(4, grid_splits),
+    )
+    return out
+
+
+def _v4_split_aligned(cache: torch.Tensor):
+    """An aligned paged cache -> the two buffers the 2buff kernel reads.
+
+    ``[nb, block, 640]`` uint8 becomes ``[nb, block, 512]`` (the 2buff row:
+    NoPE, its duplicated scales and pad) and ``[nb, block, 64]`` bf16 (the RoPE
+    row). Both are VIEWS -- they keep the 640-byte record stride, which the
+    descriptors take as the row stride, so nothing is copied or repacked.
+    """
+    if cache.shape[-1] != _V4_REC_ALIGNED:
+        raise RuntimeError(
+            f"aligned cache records must be {_V4_REC_ALIGNED} B, got "
+            f"{cache.shape[-1]}"
+        )
+    u8 = cache.view(torch.uint8)
+    # The data half must arrive TYPED: the kernel feeds it to the scaled MMA as
+    # e4m3, and a uint8 tile is upcast down a different path entirely. Both
+    # slices keep the 640-byte record stride, so nothing is copied.
+    return (
+        u8[..., :_V4_DIM_QK].view(torch.float8_e4m3fn),
+        u8[..., _V4_ROPE_IN_REC:].view(torch.bfloat16),
+    )
+
+
+def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
+    """(rows, blk_rows, block_size, num_slots) for a 2buff pool.
+
+    A flat ``[P, 512]`` pool is page size 1 with one row per page, so the slot
+    IS the row. A paged ``[nb, block, 512]`` view -- what a vLLM aligned cache
+    slices to -- is contiguous inside a page but jumps by the pooled block
+    stride across pages, so the kernel needs both the page size and the number
+    of record-rows that stride spans.
+    """
+    if kv.dim() == 2:
+        if kv.shape[1] != _V4_DIM_QK:
+            raise RuntimeError(
+                f"{name} must be [P, {_V4_DIM_QK}], got {tuple(kv.shape)}"
+            )
+        if rope.shape[0] != kv.shape[0]:
+            raise RuntimeError(f"{name} rope rows {rope.shape[0]} != {kv.shape[0]}")
+        return kv.shape[0], 1, 1, kv.shape[0]
+
+    if kv.dim() != 3 or kv.shape[2] != _V4_DIM_QK:
+        raise RuntimeError(
+            f"{name} must be [P, {_V4_DIM_QK}] or [nb, block, {_V4_DIM_QK}], "
+            f"got {tuple(kv.shape)}"
+        )
+    nb, block_size, _ = kv.shape
+    row_stride = kv.stride(1)
+    blk_stride = kv.stride(0)
+    if rope.stride(1) != row_stride // 2:
+        raise RuntimeError(
+            f"{name}: rope row stride {rope.stride(1)} must be half the kv row "
+            f"stride {row_stride} -- both halves live in one record"
+        )
+    if blk_stride % row_stride:
+        raise RuntimeError(
+            f"{name} block stride {blk_stride} must be a multiple of the record "
+            f"stride {row_stride}"
+        )
+    if block_size & (block_size - 1):
+        raise RuntimeError(f"{name} page size {block_size} must be a power of two")
+    rows = (nb - 1) * (blk_stride // row_stride) + block_size
+    if rows > 2**31 - 1:
+        raise RuntimeError(
+            f"{name} spans {rows:,} descriptor rows, past the int32 bound"
+        )
+    return rows, blk_stride // row_stride, block_size, nb * block_size
+
+
+@functools.cache
+def _v4_decode_partials(t_cap, kv_splits, h_padded, d, device_index):
+    """Persistent fp32 partials for the split-K decode path.
+
+    maxsize=None so entries are never evicted and the storage is never freed:
+    a captured CUDA graph holds these addresses, and handing that memory back
+    to the allocator would let a later allocation land underneath a replay.
+    Sized at a power-of-two token count so the number of distinct buffers stays
+    small; callers slice to their actual T.
+    """
+    dev = torch.device("cuda", device_index)
+    m = torch.empty((t_cap, kv_splits, h_padded), dtype=torch.float32, device=dev)
+    l = torch.empty_like(m)
+    acc = torch.empty((t_cap, kv_splits, h_padded, d), dtype=torch.float32, device=dev)
+    return m, l, acc
+
+
+def _pa_decode_sparse_v4_2buff(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    unified_kv_rope: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+    q_rope: torch.Tensor | None = None,
+    kv_scales: torch.Tensor | None = None,
+    extra_cache: torch.Tensor | None = None,
+    extra_cache_rope: torch.Tensor | None = None,
+    extra_indices: torch.Tensor | None = None,
+    extra_indptr: torch.Tensor | None = None,
+    num_warps: int | None = None,
+    ctas_h: int = 1,
+    q_tdm: bool = True,
+    block_h: int | None = None,
+    kv_splits: int | None = None,
+    has_invalid: bool = True,
+    skip_reduce: bool = False,
+    use_lru_cache_partials: bool = False,
+    out: torch.Tensor | None = None,
+):
+    """gfx1250 driver for the DSv4 "2buff" packed-fp8 KV pool.
+
+    Byte-for-byte the layout ``aiter.mla.mla_decode_fwd_v4_nm`` (the
+    ``mla_a8w8_qh64_1tg_16mx4_64nx1_sparse`` asm kernel) reads, so ATOM's
+    ``unified_kv`` / ``unified_kv_rope`` / ``q_packed`` / ``q_rope`` buffers go
+    straight in with no repacking:
+
+      unified_kv      [P, 512]    fp8 e4m3 (or uint8): 448 NoPE | 14 dup E8M0 | 50 pad
+      unified_kv_rope [P, 64]     bf16
+      q               [N, H, 512] fp8 packed
+      q_rope          [N, H, 64]  bf16
+
+    Returns ``[N, H, 512]`` bf16 (MLA's V is the whole row: dequantized NoPE
+    followed by the bf16 RoPE half).
+
+    NOT IMPLEMENTED HERE -- the fused output epilogue
+    ``inv_rope_positions`` / ``inv_rope_cos_sin_cache`` / ``out_mxfp8``.
+    ``pa_decode_sparse`` dispatches to this driver *before* the assert that
+    rejects them for non-gfx950 paths, and this signature does not take them,
+    so a caller that passes them gets them SILENTLY IGNORED: the output comes
+    back un-rotated and in bf16 rather than MXFP8, with no error. No caller
+    does that today (the epilogue is a gfx950 gluon path), which is why it is
+    documented rather than guarded.
+
+    TODO: implement the epilogue on this path -- inverse GPT-J RoPE over the
+    trailing rope lanes and the optional MXFP8 quant -- and wire the three
+    arguments through from ``pa_decode_sparse``. Until then, either add the
+    guard at the ``v4_2buff`` branch in ``pa_decode_sparse`` or keep this note
+    in step with it. See ``_pa_decode_sparse_gfx950_gluon`` for the reference
+    implementation and ``test_pa_decode_sparse_inv_rope_mxfp8_epilogue`` for
+    the expected numerics.
+    """
+    if DEVICE_ARCH != "gfx1250":
+        raise RuntimeError(
+            f"the DSv4 2buff packed-fp8 path is gfx1250-only, got {DEVICE_ARCH}"
+        )
+    if kv_scales is not None:
+        raise RuntimeError(
+            "kv_scales must be None on the 2buff path: the E8M0 group scales are "
+            "inline in bytes [448, 462) of every packed row"
+        )
+    assert unified_kv.dtype in _V4_PACKED_FP8_DTYPES, (
+        f"unified_kv must be {_V4_PACKED_FP8_DTYPES} (OCP e4m3 / raw bytes), "
+        f"got {unified_kv.dtype}"
+    )
+    assert unified_kv_rope.dtype == torch.bfloat16
+    assert unified_kv_rope.shape[-1] == _V4_DIM_ROPE, (
+        f"unified_kv_rope must be [..., {_V4_DIM_ROPE}] bf16, got "
+        f"{tuple(unified_kv_rope.shape)}"
+    )
+    main_rows, main_blk_rows, main_block_size, main_slots = _v4_2buff_geometry(
+        unified_kv, unified_kv_rope, "unified_kv"
+    )
+
+    has_extra = extra_cache is not None
+    if has_extra:
+        assert extra_cache_rope is not None, "extra_cache needs extra_cache_rope"
+        assert extra_indices is not None and extra_indptr is not None
+        assert extra_cache.dtype in _V4_PACKED_FP8_DTYPES
+        assert extra_cache_rope.dtype == torch.bfloat16
+        (
+            extra_rows,
+            extra_blk_rows,
+            extra_block_size,
+            extra_slots,
+        ) = _v4_2buff_geometry(extra_cache, extra_cache_rope, "extra_cache")
+        assert extra_indices.dtype == torch.int32 and extra_indices.is_contiguous()
+        assert extra_indptr.dtype == torch.int32 and extra_indptr.is_contiguous()
+    else:
+        # Aliases, not real work: the kernel never reads them under HAS_EXTRA
+        # = False, but the launch still has to typecheck.
+        extra_cache = unified_kv
+        extra_cache_rope = unified_kv_rope
+        extra_indices = kv_indices
+        extra_indptr = kv_indptr
+        extra_rows, extra_blk_rows, extra_block_size = main_rows, 1, 1
+        extra_slots = main_slots
+
+    if q_rope is None:
+        raise RuntimeError(
+            "the 2buff path needs the packed fp8 Q: pass q_rope alongside q"
+        )
+    T, H, D = q.shape
+    assert D == _V4_DIM_QK, f"2buff path is fixed to D={_V4_DIM_QK}, got {D}"
+    assert (
+        q.dtype in _V4_PACKED_FP8_DTYPES
+    ), f"q must be the packed fp8 [N, H, {_V4_DIM_QK}] tensor, got {q.dtype}"
+    assert q_rope.shape == (T, H, _V4_DIM_ROPE) and q_rope.dtype == torch.bfloat16
+    assert q_rope.is_contiguous()
+
+    assert kv_indices.dtype == torch.int32 and kv_indices.is_contiguous()
+    assert kv_indptr.dtype == torch.int32 and kv_indptr.is_contiguous()
+
+    _LOGGER.info(
+        f"PA_DECODE_SPARSE_V4_2BUFF T={T} H={H} D={D} "
+        f"total_indices={kv_indices.shape[0]}"
+    )
+
+    out = _check_out(out, q, torch.bfloat16)
+
+    # The kernel reads the packed pool as raw bytes: the E8M0 scale bytes live
+    # inside the rows, and an fp8-typed tile would reinterpret them as e4m3
+    # (byte 0x7F == scale 2^0 is an e4m3 NaN). The NoPE bytes are bitcast back
+    # to e4m3 in-kernel.
+    kv_u8 = unified_kv.view(torch.uint8)
+    extra_u8 = extra_cache.view(torch.uint8)
+    q_u8 = q.view(torch.uint8)
+
+    # Same BLOCK_H / BLOCK_K / warp heuristics as the bf16 gluon path.
+    if block_h is None:
+        if H >= 128:
+            block_h = 128
+        elif H >= 64:
+            if T >= 2048:
+                block_h = 64
+            elif T >= 32:
+                block_h = 32
+            else:
+                block_h = 16
+        elif H >= 32:
+            # [TEMPORARY] pinned to 32. BLOCK_H=16 is miscompiled by upstream
+            # Triton on the single-stream KV_SPLITS==1 path -- the epilogue's
+            # tdm.async_store reads an LDS tile the wave has not finished
+            # writing, giving ~1e38 garbage (plan section 27 / 30.4). BLOCK_H=32
+            # is clean on both compilers, so pin it until the compiler fix
+            # lands, then restore: block_h = 32 if T >= 256 else 16
+            block_h = 32
+        else:
+            block_h = triton.next_power_of_2(H)
+    else:
+        block_h = triton.next_power_of_2(block_h)
+    block_h = max(block_h, 16)
+
+    n_head_blocks = triton.cdiv(H, block_h)
+    h_padded = n_head_blocks * block_h
+    block_d = D
+
+    block_k = 16
+    waves_per_eu = 1
+    if block_h == 128:
+        # A 64-row KV tile: now that the Q operand is streamed from LDS one K
+        # step at a time instead of held in registers, the wider tile no longer
+        # overflows the register file, and the fatter iteration amortises the
+        # accumulator rescale and the barriers over twice the work -- 64.4us vs
+        # 69.9us at kv_len=384, T=512, H=128.
+        block_k = 64
+        attn_num_warps = 8
+        max_num_wg = 256
+        # The bf16 path asks for 2 waves/EU here; the dequant pushes this
+        # kernel's register demand past that, so requesting it only costs
+        # spills (measured ~4% on T=512, H=128, kv_len=384).
+        waves_per_eu = 1
+    elif block_h == 64:
+        attn_num_warps = 4
+        max_num_wg = 256
+    elif block_h == 32:
+        attn_num_warps = 2
+        max_num_wg = 512
+    else:
+        attn_num_warps = 1
+        max_num_wg = 1024
+    if ctas_h > 1:
+        # block_h is the CLUSTER tile: each CTA owns block_h // ctas_h heads,
+        # and warps follow the per-CTA tile (16 heads -> 1 warp). The per-CTA
+        # tile may not fall below the 16-row WMMA instruction tile -- without
+        # this the compiler dies with a bare "PassManager::run failed".
+        assert not (block_h % ctas_h), f"block_h {block_h} % ctas_h {ctas_h}"
+        assert block_h // ctas_h >= 16, (
+            f"ctas_h={ctas_h} would give {block_h // ctas_h} heads per CTA for "
+            f"block_h={block_h}; the WMMA tile is 16 rows, so ctas_h must be "
+            f"<= block_h // 16 ({block_h // 16})"
+        )
+        attn_num_warps = max(1, (block_h // ctas_h) // 16)
+    if num_warps is not None:
+        attn_num_warps = num_warps
+    # Q_IN_VGPR: keep the loop-invariant Q tile resident instead of re-reading
+    # it from LDS every K step. Gated on the warp count because that sets the
+    # VGPR budget -- num_warps 8 caps at 512/SIMD and the BLOCK_H=128 kernel
+    # already measures ~494, while num_warps <= 4 caps at 1024 against 737
+    # (BLOCK_H=16) / 604 (BLOCK_H=32), leaving room for the ~64 VGPR Q tile.
+    reduce_num_warps = 1
+    reduce_waves_per_eu = 4
+    USE_EXP2 = True
+
+    if kv_splits is None:
+        # PER TOKEN: the split is per token, so the ceiling is the tile count
+        # ONE token has. kv_indices.shape[0] is every token's indices together,
+        # so the ceiling never bound and splits were made with no work in them
+        # -- and a dead split still costs the reduce a slab row.
+        total_idx = kv_indices.shape[0] + (extra_indices.shape[0] if has_extra else 0)
+        avg_kv_len = max(1, total_idx // max(1, T))
+        max_kv_splits = max(1, triton.cdiv(avg_kv_len, block_k))
+        kv_splits = max(1, max_num_wg // max(1, T * n_head_blocks))
+        kv_splits = min(max_kv_splits, kv_splits)
+        # DOWN to a power of two: rounding up puts back what the ceiling removed.
+        kv_splits = 1 << (max(1, kv_splits).bit_length() - 1)
+        # CAP. Occupancy is only half the story: every split also writes and
+        # then re-reads T * H_padded * D fp32 of partials, so past the point
+        # where the attention kernel stops speeding up, the splits cost more
+        # than they buy -- and they slow the ATTENTION down too, not just the
+        # reduce. Measured, main + reduce, kv_len 384:
+        #
+        #   H=32  T=16   32 splits 17.26us -> 8 splits 13.63us   (main 10.89
+        #                -> 10.41, reduce 6.37 -> 3.23)
+        #   H=128 T=16   16 splits 52.15us -> 8 splits 43.54us
+        #   H=32/128, T >= 64: the heuristic already picks <= 4, unchanged.
+        #
+        # Only small T can reach past 8, because the occupancy term is
+        # max_num_wg // (T * n_head_blocks).
+        kv_splits = min(kv_splits, 8)
+
+    _lds_budget = arch_info._LDS_CAP_BYTES.get(DEVICE_ARCH)
+    _lds_cap = max(1, _lds_budget // (block_d * 4))
+    kv_splits = min(kv_splits, 1 << (_lds_cap.bit_length() - 1))
+    # KV_SPLITS == 1 takes a different output path: the accumulators are
+    # reassembled in LDS and pushed out with tdm.async_store, rather than the
+    # reduce writing `out` from the partials. That path is CORRECT -- an
+    # earlier comment here called it a race, which it is not. It is
+    # miscompiled by upstream Triton 3.8.0 at BLOCK_H=16 only (the
+    # `s_wait_dscnt` before `tensor_store_from_lds` is dropped), and BLOCK_H
+    # is pinned to 32 above precisely so that tile is unreachable. The
+    # internal build is correct at every BLOCK_H.
+    if kv_splits > 8:
+        reduce_num_warps = 4
+        reduce_waves_per_eu = 1
+
+    if kv_splits == 1:
+        m_partial = l_partial = acc_partial = out  # unused inside the kernel
+        mp_strides = (0, 0, 0)
+        lp_strides = (0, 0, 0)
+        ap_strides = (0, 0, 0, 0)
+    else:
+        # skip_reduce hands the partials back to the caller, who then owns
+        # them; a shared buffer would be overwritten under it next call.
+        _cache_ok = (
+            use_lru_cache_partials and not skip_reduce and q.device.type == "cuda"
+        )
+        if _cache_ok:
+            m_full, l_full, acc_full = _v4_decode_partials(
+                triton.next_power_of_2(T), kv_splits, h_padded, D, q.device.index
+            )
+            m_partial = m_full[:T]
+            l_partial = l_full[:T]
+            acc_partial = acc_full[:T]
+        else:
+            m_partial = torch.empty(
+                (T, kv_splits, h_padded), dtype=torch.float32, device=q.device
+            )
+            l_partial = torch.empty_like(m_partial)
+            acc_partial = torch.empty(
+                (T, kv_splits, h_padded, D), dtype=torch.float32, device=q.device
+            )
+        mp_strides = m_partial.stride()
+        lp_strides = l_partial.stride()
+        ap_strides = acc_partial.stride()
+
+    # Route the fp32 acc partials through LDS + tdm.async_store instead of
+    # buffer_store, but only at small T. Measured main-kernel time, kv_len 384:
+    #
+    #        H=32                      H=128
+    #   T=16  10.31 -> 8.69  (-1.62)   38.42 -> 39.02 (+0.60)
+    #   T=64  15.00 -> 15.08           80.93 -> 84.52 (+3.59)
+    #   T=256 31.02 -> 30.36 (-0.66)  203.23 -> 207.45 (+4.22)
+    #
+    # It pays only where there is little else to overlap the staging with; at
+    # larger T the LDS round trip costs more than the wider store buys.
+    #
+    # NEVER at BLOCK_H=16: upstream Triton 3.8.0 drops the `s_wait_dscnt`
+    # before `tensor_store_from_lds`, so the TDM engine reads an LDS tile the
+    # wave has not finished writing. That bug is not specific to the
+    # KV_SPLITS==1 epilogue -- this store hits it too (4 op-test failures at
+    # H=16 when it was unguarded). See plan section 27.
+    _tdm_partials = T <= 16 and block_h != 16
+    grid_attn = (T, n_head_blocks, kv_splits)
+    gluon_pa_decode_sparse_v4_2buff[grid_attn](
+        q,
+        q_u8,
+        q_rope,
+        unified_kv,
+        kv_u8,
+        unified_kv_rope,
+        kv_indices,
+        kv_indptr,
+        extra_cache,
+        extra_u8,
+        extra_cache_rope,
+        extra_indices,
+        extra_indptr,
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        out,
+        main_rows,
+        extra_rows,
+        main_blk_rows,
+        extra_blk_rows,
+        main_slots,
+        extra_slots,
+        q.stride(0),
+        q.stride(1),
+        q_rope.stride(0),
+        q_rope.stride(1),
+        unified_kv.stride(-2),
+        unified_kv_rope.stride(-2),
+        mp_strides[0],
+        mp_strides[1],
+        mp_strides[2],
+        lp_strides[0],
+        lp_strides[1],
+        lp_strides[2],
+        ap_strides[0],
+        ap_strides[1],
+        ap_strides[2],
+        ap_strides[3],
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        kv_splits,
+        float(softmax_scale),
+        BLOCK_H=block_h,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        NOPE_DIM=_V4_DIM_NOPE,
+        ROPE_DIM=_V4_DIM_ROPE,
+        GROUP_SIZE=_FP8_GROUP_SIZE,
+        Q_IN_VGPR=(attn_num_warps <= 4),
+        HAS_INVALID=bool(has_invalid),
+        Q_TDM=bool(q_tdm),
+        USE_EXP2=USE_EXP2,
+        CTAS_H=ctas_h,
+        MAIN_BLOCK_SIZE=main_block_size,
+        EXTRA_BLOCK_SIZE=extra_block_size,
+        HAS_EXTRA=has_extra,
+        TDM_PARTIALS=_tdm_partials,
+        num_warps=attn_num_warps,
+        num_stages=2,
+        waves_per_eu=waves_per_eu,
+        num_ctas=ctas_h,
+    )
+
+    if kv_splits == 1:
+        return out
+
+    if skip_reduce:
+        return acc_partial, m_partial, l_partial
+
+    block_h_reduce = 1
+    grid_reduce = (T, triton.cdiv(H, block_h_reduce))
+    gluon_pa_decode_sparse_reduce[grid_reduce](
+        m_partial,
+        l_partial,
+        acc_partial,
+        attn_sink,
+        kv_indptr,
+        extra_indptr,
+        kv_indices,
+        out,
+        m_partial.stride(0),
+        m_partial.stride(1),
+        m_partial.stride(2),
+        l_partial.stride(0),
+        l_partial.stride(1),
+        l_partial.stride(2),
+        acc_partial.stride(0),
+        acc_partial.stride(1),
+        acc_partial.stride(2),
+        acc_partial.stride(3),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        H,
+        D,
+        kv_splits,
+        BLOCK_H=block_h_reduce,
+        BLOCK_D=block_d,
+        BLOCK_K=block_k,
+        USE_EXP2=USE_EXP2,
+        # The reduce counts a token's live segments in TILES, and with two
+        # streams that count is main_tiles + extra_tiles -- it has to see the
+        # extra stream's indptr or it scrubs the wrong segments.
+        HAS_EXTRA=has_extra,
+        MAIN_IS_WINDOW=False,
+        MAIN_BLOCK_SIZE_RED=1,
+        num_warps=reduce_num_warps,
+        waves_per_eu=reduce_waves_per_eu,
     )
     return out
