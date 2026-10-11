@@ -21,13 +21,17 @@ Usage:
 import argparse
 import itertools
 import math
+import os
 import random
+
+# This test exists to exercise the FlyDSL m32x8 kernel, so take every shape it can
+# serve away from ASM/CK. Read live by both dispatchers, so setting it here is enough.
+os.environ["AITER_ENABLE_EXPERIMENTAL"] = "1"
 
 import pandas as pd
 import torch
 
 import aiter
-from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -37,7 +41,7 @@ SUPPORTED_GFX = ["gfx1250"]
 
 # (d_qk, d_v) pairs the FlyDSL kernels can serve at all. Anything else is
 # rejected up front rather than silently falling through to CK/Triton.
-SUPPORTED_D_QK_V = [(256, 128), (192, 128), (128, 128)]
+SUPPORTED_D_QK_V = [(256, 128), (192, 128), (128, 128), (64, 64)]
 
 # Kernels that can be timed per case. "flydsl" is the path under test; "triton"
 # is an optional cross-check for plain (no sink / no window) thd configs.
@@ -48,6 +52,13 @@ KERNELS = ["flydsl", "triton"]
 # different number of times and land in different L2 states -- their `us`
 # columns then are not comparable with each other.
 _ROTATE = 4
+
+# Timing loop size. This file is a correctness harness: 101 timed iterations per
+# row used to dominate a sweep's wall clock for a `us` column nobody reads here.
+# Default is now a token loop; `--bench` restores a converged one. Either way,
+# measure perf with op_tests/op_benchmarks/flydsl/bench_mha_fwd.py, not with this script.
+_ITERS = 3
+_WARMUP = 1
 
 
 # ============================================================================
@@ -206,37 +217,18 @@ def _nbytes(tot_q, tot_k, H_q, H_kv, d_qk, d_v, elem_size, return_lse):
 
 
 # ============================================================================
-# Routing mirrors -- only sweep configs that really reach the FlyDSL kernel
+# Dispatch filter -- only sweep pairs the FlyDSL kernel can serve
 # ============================================================================
 
 
-def _flydsl_serves_thd(d_qk, d_v, causal, sink, window):
-    """True when ``flash_attn_varlen_func`` lands on the FlyDSL m32x8 kernel.
+def _flydsl_serves(d_qk, d_v):
+    """True when the FlyDSL m32x8 kernel serves this (d_qk, d_v).
 
-    Mirrors ``aiter/ops/mha.py`` (the PR3039 gfx1250 ASM gate) and
-    ``flydsl_flash_attn_varlen_func`` in ``aiter/ops/flydsl/fmha_kernels.py``.
+    AITER_ENABLE_EXPERIMENTAL is forced on at import, so both routers hand us every
+    pair we support regardless of what ASM or CK would otherwise claim; the pair is
+    the only thing left to filter on.
     """
-    if d_v != 128:
-        return False
-    exp = is_experimental_enabled()
-    if d_qk == 256:
-        return exp  # else CK
-    if d_qk not in (128, 192):
-        return False
-    # The gfx1250 ASM kernel claims d128 only for plain causal attention with
-    # no sink and no finite window; non-causal / sink / windowed d128 is ours.
-    asm_claims_d128 = (
-        d_qk == 128 and not exp and causal and not sink and tuple(window) == (-1, -1)
-    )
-    return not asm_claims_d128
-
-
-def _flydsl_serves_bshd(d_qk, d_v):
-    """True when ``flash_attn_func`` lands on the FlyDSL m32x8 BSHD kernel.
-    No ASM/sibling competes for BSHD, so routing is head-dim only."""
-    if d_v != 128:
-        return False
-    return d_qk in (128, 192) or (d_qk == 256 and is_experimental_enabled())
+    return (d_qk, d_v) in SUPPORTED_D_QK_V
 
 
 # ============================================================================
@@ -372,6 +364,8 @@ def test_mha_flydsl_varlen(
             return_lse and name == "flydsl",
             sink_t,
             num_rotate_args=_ROTATE,
+            num_iters=_ITERS,
+            num_warmup=_WARMUP,
         )
         # Only the flydsl call was asked for an LSE.
         if isinstance(data, (tuple, list)):
@@ -394,20 +388,26 @@ def test_mha_flydsl_varlen(
         )
 
         if lse is not None:
-            # Kernel LSE is [total_q, nheads_q]; the reference is per batch
-            # [nheads_q, sq]. Empty-KV batches carry -inf (or sink[h]) and are
-            # compared the same way -- isclose(-inf, -inf) holds.
+            # Kernel LSE is fp32 [nheads_q, total_q] (the aiter varlen convention,
+            # asserted here because test_mha_varlen.py, test_flydsl_fmha.py and the
+            # bwd test all slice it as lse[:, cu[b]:cu[b+1]]); the reference is
+            # per batch [nheads_q, sq]. Empty-KV batches carry -inf (or sink[h])
+            # and are compared the same way -- isclose(-inf, -inf) holds.
+            assert lse.dtype == torch.float32, f"lse dtype {lse.dtype}"
+            assert tuple(lse.shape) == (
+                H_q,
+                total_q,
+            ), f"bad thd lse shape {tuple(lse.shape)}"
             for b in range(B):
+                got = lse[:, cu_q[b] : cu_q[b + 1]]
                 if seqs_k[b] == 0:
                     exp_lse = (
-                        sink_t.view(1, -1).expand(seqs_q[b], H_q)
+                        sink_t.view(-1, 1).expand(H_q, seqs_q[b])
                         if sink_t is not None
-                        else torch.full((seqs_q[b], H_q), float("-inf"), device=device)
+                        else torch.full((H_q, seqs_q[b]), float("-inf"), device=device)
                     )
-                    got = lse[cu_q[b] : cu_q[b + 1]]
                 else:
                     exp_lse = ref_lses[b]
-                    got = lse[cu_q[b] : cu_q[b + 1]].permute(1, 0)
                 err = max(
                     err,
                     checkAllclose(
@@ -461,6 +461,8 @@ def test_mha_flydsl_batch(
         return_lse,
         sink_t,
         num_rotate_args=_ROTATE,
+        num_iters=_ITERS,
+        num_warmup=_WARMUP,
     )
     out, lse = data if return_lse else (data, None)
 
@@ -472,7 +474,13 @@ def test_mha_flydsl_batch(
     ), f"bad out shape {tuple(out.shape)}"
     err = checkAllclose(ref, out.float(), rtol=1e-2, atol=1e-2, msg="flydsl bshd out: ")
     if lse is not None:
-        # Kernel LSE is [B, nheads_q, sq]; the reference matches that layout.
+        # Kernel LSE is fp32 [B, nheads_q, sq], the layout test_mha.py asserts.
+        assert lse.dtype == torch.float32, f"lse dtype {lse.dtype}"
+        assert tuple(lse.shape) == (
+            B,
+            H_q,
+            sq,
+        ), f"bad bshd lse shape {tuple(lse.shape)}"
         err = max(
             err,
             checkAllclose(ref_lse, lse, rtol=1e-2, atol=1e-2, msg="flydsl bshd lse: "),
@@ -806,7 +814,19 @@ def main():
         "        ('i' rather than -1: argparse reads a leading -1 as a flag.)\n"
         "        e.g.: -w i,i 64,64 128,0 256,i i,256",
     )
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Restore a converged timing loop (101 iters / 2 warmup) so the us and\n"
+        "        TFLOPS columns mean something. Off by default -- a correctness sweep\n"
+        "        pays for the compile and the allclose only.\n"
+        "        e.g.: --bench",
+    )
     args = parser.parse_args()
+
+    if args.bench:
+        global _ITERS, _WARMUP
+        _ITERS, _WARMUP = 101, 2
 
     causals = [bool(c) for c in args.causal]
     lses = [bool(e) for e in args.return_lse]
@@ -819,8 +839,8 @@ def main():
         for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
             args.d_qk_v, thd_shapes, args.dtype, causals, lses, sinks, windows
         ):
-            if not _flydsl_serves_thd(d_qk, d_v, causal, sink, window):
-                continue  # CK / ASM / sibling would run -- not what this test gates
+            if not _flydsl_serves(d_qk, d_v):
+                continue  # not a pair the FlyDSL kernel can serve
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
                 test_mha_flydsl_varlen(
@@ -845,7 +865,7 @@ def main():
         for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
             args.batch_d_qk_v, bshd_shapes, args.dtype, causals, lses, sinks, windows
         ):
-            if not _flydsl_serves_bshd(d_qk, d_v):
+            if not _flydsl_serves(d_qk, d_v):
                 continue
             B, sq, sk, H_q, H_kv = shape
             rows.append(
