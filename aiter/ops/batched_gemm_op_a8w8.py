@@ -190,7 +190,15 @@ def _load_mxscale_bmm_tuned(
 ) -> dict:
     """{(gfx,b,m,n,k,w_scale_block): row} from the mxscale BMM tuned CSV; {} if
     it is missing. A CSV that predates the w_scale_block column holds only
-    128x128 rows."""
+    128x128 rows.
+
+    The raw-weight table is the policy's, so defer to it rather than parsing the
+    same file twice and risking two answers; only the preshuffled table is read
+    here."""
+    if not bpreshuffle:
+        from .opus.policy import _load_mxscale_bmm_tuned as load_raw
+
+        return load_raw(libtype)
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     try:
         df = pd.read_csv(path).drop_duplicates()
@@ -234,6 +242,12 @@ def lookup_mxscale_bmm_config(
     instead of named fields, so a backend gets its own kernel identifier
     reported without this layer knowing which column holds it.
     """
+    if not bpreshuffle:
+        from .opus.policy import lookup_mxscale_bmm_config as lookup_raw
+
+        return lookup_raw(b, m, n, k, w_scale_block=w_scale_block, libtype=libtype)
+    if w_scale_block != "128x128":
+        raise ValueError("preshuffled MXFP8 BMM only supports w_scale_block=128x128")
     gfx = get_gfx()
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
@@ -271,8 +285,9 @@ def _get_mxscale_bmm_launch_plan(
     m: int,
     n: int,
     k: int,
+    w_scale_block: str = "128x128",
 ) -> tuple[int, int]:
-    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k)
+    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k, w_scale_block=w_scale_block)
 
 
 def _batched_gemm_a8w8_mxscale_impl(
@@ -281,6 +296,7 @@ def _batched_gemm_a8w8_mxscale_impl(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    w_scale_block: str = "128x128",
 ) -> Tensor:
     # This body executes behind the public custom-op boundary, so real eager
     # tensors carry concrete integer dimensions here.  Avoid four redundant
@@ -288,15 +304,18 @@ def _batched_gemm_a8w8_mxscale_impl(
     m, g, k = x.shape
     n = wo_a.shape[1]
     raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
-    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k)
+    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k, w_scale_block)
 
     Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
     if split_k <= 1:
         # The shape resolver already returns a final canonical global kid.
         # Enter the checked C++ launcher directly for the common no-workspace
         # path instead of repeating the unified public routing contract.  The
-        # C++ boundary still validates dtype, shape, device, stride, arch and
-        # exact kid.  Workspace cases retain the unified Python planner below.
+        # C++ boundary still validates dtype, shape, device, stride, arch,
+        # exact kid and the kid's own M/N/K tile alignment -- the last of these
+        # because an unaligned shape is silently wrong rather than rejected,
+        # and no launch plan is built here to catch it.  Workspace cases retain
+        # the unified Python planner below.
         raw_launch(
             x,
             wo_a,
@@ -327,6 +346,7 @@ def _batched_gemm_a8w8_mxscale_fake(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    w_scale_block: str = "128x128",
 ) -> Tensor:
     return torch.empty(
         (x.shape[0], x.shape[1], wo_a.shape[1]),
@@ -342,9 +362,17 @@ def batched_gemm_a8w8_mxscale(
     x_scale: Tensor,
     w_scale: Tensor,
     dtype: torch.dtype = dtypes.bf16,
+    w_scale_block: str = "128x128",
 ) -> Tensor:
-    """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``."""
-    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+    """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``.
+
+    ``w_scale_block`` selects "128x128" (default) or "32x32" scale blocks, named
+    as N-by-K. Provide ``x_scale[M,G,ceil(K/k_block)]`` and
+    ``w_scale[G,ceil(N/n_block),ceil(K/k_block)]`` in E8M0 format.
+    """
+    return _batched_gemm_a8w8_mxscale_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype, w_scale_block=w_scale_block
+    )
 
 
 # Same family, preshuffled weight.

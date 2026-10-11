@@ -150,21 +150,50 @@ inline __device__ auto make_layout_rb(int lane_id, int wave_id_n) {
         opus::unfold_p_coord(rb_block_dim, opus::tuple{lane_id_n % T::T_M, wave_id_n, lane_id_n / T::T_M, lane_id / T::W_N}));
 }
 
+// Which MX block inside one MFMA's K extent this lane owns.
+//
+// A deliberate twin of the flatmm split-K pipeline's sf_lane_k_block rather than
+// a shared definition: that one carries an always_inline added to dodge clang
+// 22's "operand has incorrect register class" on the 128 kernels, and folding
+// the two would put that workaround's codegen at risk for a family it was not
+// tuned on. The dim this feeds has extent 1 at GROUP_K=128, so the coord can
+// only ever be 0 there.
+template<typename T>
+__attribute__((always_inline)) OPUS_D int sf_lane_k_block_scale(int lane_id) {
+    if constexpr (T::SF_PER_MFMA_K == 1) {
+        (void)lane_id;
+        return 0;
+    } else {
+        return (lane_id / T::W_M) / T::SF_LANE_K_DIV;
+    }
+}
+
 template<typename T>
 inline __device__ auto make_layout_sfa(int lane_id, int wave_id_m, int stride_sfa) {
+    // The K side is two dims so the lane's own MX block can be addressed: the y
+    // dim steps one per MFMA and the p dim picks the block inside it. The p dim
+    // is innermost, so the byte index is ik * SF_PER_MFMA_K + lane block -- the
+    // natural K order of the scale row.
+    //
+    // At GROUP_K=128 both SF_LANE_SCALES_PER_BK and SF_PER_MFMA_K collapse to
+    // B_K/GROUP_K and 1, and the lane coord is a literal 0, so this emits the
+    // same address as the single-y-dim form it replaces.
     constexpr auto sfa_block_shape = opus::make_tuple(
         opus::number<T::E_M>{},
         opus::number<T::T_M>{},
         opus::number<T::W_M>{},
-        opus::number<T::B_K / T::GROUP_K>{});
+        opus::number<T::SF_LANE_SCALES_PER_BK>{},
+        opus::number<T::SF_PER_MFMA_K>{});
 
     constexpr auto sfa_block_dim = opus::make_tuple(
         opus::make_tuple(opus::y_dim{}, opus::p_dim{}, opus::p_dim{}),
-        opus::make_tuple(opus::y_dim{}));
+        opus::make_tuple(opus::y_dim{}, opus::p_dim{}));
 
     return opus::make_layout(
         sfa_block_shape,
         opus::unfold_x_stride(sfa_block_dim, sfa_block_shape, opus::tuple{stride_sfa, 1_I}),
-        opus::unfold_p_coord(sfa_block_dim, opus::tuple{wave_id_m, lane_id % T::W_M}));
+        opus::unfold_p_coord(sfa_block_dim,
+            opus::tuple{wave_id_m, lane_id % T::W_M,
+                        sf_lane_k_block_scale<T>(lane_id)}));
 }
 #endif // __HIP_DEVICE_COMPILE__
