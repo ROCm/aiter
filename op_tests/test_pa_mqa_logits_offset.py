@@ -136,7 +136,8 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
 
 
 @pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
+    get_gfx() not in ("gfx942", "gfx950", "gfx1250")
+    or not enable_jit_gluon_pa_mqa_logits_kernel,
     reason="Requires the CDNA Gluon JIT paged MQA kernel",
 )
 @pytest.mark.parametrize("block_size", [1, 8, 16, 64, 128])
@@ -147,6 +148,7 @@ def test_paged_mqa_logits_wide_output_no_tail_drop(batch_size):
     [
         pytest.param((997, 63, 1), 1, 32, 128, id="decode"),
         pytest.param((3000, 257, 3, 0), 3, 64, 128, id="mtp"),
+        pytest.param((511, 7), 1, 64, 64, id="dim64"),
     ],
 )
 @torch.inference_mode()
@@ -165,6 +167,8 @@ def test_paged_mqa_logits_non_preshuffle(
     those reads in allocated memory and expose incorrect scores instead.
     Block size 1 also checks the original per-token paging layout.
     """
+    if block_size > 1 and get_gfx() == "gfx1250":
+        pytest.skip("gfx1250 base kernel requires KVBlockSize == 1")
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(5591)
     fp8_dtype = dtypes.fp8
@@ -393,7 +397,8 @@ def test_paged_mqa_logits_preshuffle(
 
 
 @pytest.mark.skipif(
-    get_gfx() not in ("gfx942", "gfx950") or not enable_jit_gluon_pa_mqa_logits_kernel,
+    get_gfx() not in ("gfx942", "gfx950", "gfx1250")
+    or not enable_jit_gluon_pa_mqa_logits_kernel,
     reason="Requires the CDNA Gluon JIT paged MQA kernel",
 )
 @pytest.mark.parametrize(
@@ -417,6 +422,8 @@ def test_paged_mqa_logits_large_kv_offsets(
     boundary_bits: int,
 ) -> None:
     """Cross buffer bounds and K/FP32-scale offset overflow with a small batch."""
+    if block_size > 1 and get_gfx() == "gfx1250":
+        pytest.skip("gfx1250 skips block_size > 1")
     preshuffle = layout != "plain"
     device = "cuda"
     generator = torch.Generator(device=device).manual_seed(5614)

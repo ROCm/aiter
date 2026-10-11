@@ -357,6 +357,96 @@ _deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr = make_kernel_repr(
 )
 
 
+@triton.jit
+def _deepgemm_fp8_paged_mqa_logits_persistent_schedule(
+    context_len_ptr,
+    cta_info_ptr,
+    batch_size: tl.constexpr,
+    slots: tl.constexpr,
+    max_model_len,
+    ChunkK: tl.constexpr,
+    NEXT_N: tl.constexpr,
+    BLOCK_B: tl.constexpr,
+    BLOCK_S: tl.constexpr,
+):
+    """Build [packed query row, first chunk, chunk count, context length].
+
+    Like the FlyDSL FP4 schedule, find the smallest chunk budget whose CTA
+    count fits the persistent grid. Empty sequences consume no slots. Balance
+    the chunks within each sequence so its last CTA is not a short straggler.
+    """
+    b = tl.arange(0, BLOCK_B)
+    ctx = tl.load(context_len_ptr + b, mask=b < batch_size, other=0)
+    ctx = tl.minimum(tl.maximum(ctx, 0), max_model_len)
+    chunks = tl.cdiv(ctx, ChunkK)
+    slot = tl.program_id(0) * BLOCK_S + tl.arange(0, BLOCK_S)
+    max_chunks = tl.max(chunks, 0)
+    min_chunks = tl.min(tl.where(b < batch_size, chunks, max_chunks), 0)
+    if (min_chunks == max_chunks) & (max_chunks >= slots // batch_size):
+        # Enough uniform chunks to fill the grid: all divisors are compile-time
+        # constants. Contexts can still differ within their final chunk.
+        per_seq: tl.constexpr = slots // batch_size
+        batch = slot // per_seq
+        split = slot % per_seq
+        valid = (slot < per_seq * batch_size) & (slot < slots)
+        ctx_slot = tl.load(context_len_ptr + batch, mask=valid, other=0)
+        ctx_slot = tl.minimum(tl.maximum(ctx_slot, 0), max_model_len)
+        uniform_per_cta = max_chunks // per_seq
+        uniform_extra = max_chunks % per_seq
+        start = split * uniform_per_cta + tl.minimum(split, uniform_extra)
+        count = uniform_per_cta + (split < uniform_extra).to(tl.int32)
+    else:
+        total_chunks = tl.sum(chunks, 0)
+        nonempty = tl.sum((chunks > 0).to(tl.int32), 0)
+        lo = tl.maximum(tl.cdiv(total_chunks, slots), 1)
+        # sum(ceil(chunks / s)) < total_chunks / s + nonempty. With this
+        # upper bound it is < slots + 1, hence <= slots for integer CTA counts.
+        hi = tl.maximum(
+            tl.minimum(max_chunks, tl.cdiv(total_chunks, slots - nonempty + 1)), 1
+        )
+        while lo < hi:
+            mid = (lo + hi) // 2
+            fits = tl.sum(tl.cdiv(chunks, mid), 0) <= slots
+            hi = tl.where(fits, mid, hi)
+            lo = tl.where(fits, lo, mid + 1)
+
+        ctas = tl.cdiv(chunks, lo)
+        end = tl.cumsum(ctas, 0)
+        begin = end - ctas
+        batch = tl.sum(
+            ((end[None, :] <= slot[:, None]) & (b[None, :] < batch_size)).to(tl.int32),
+            1,
+        )
+        valid = (slot < tl.sum(ctas, 0)) & (slot < slots)
+        selected = (batch[:, None] == b[None, :]) & valid[:, None]
+        seq_chunks = tl.sum(tl.where(selected, chunks[None, :], 0), 1)
+        seq_ctas = tl.maximum(tl.sum(tl.where(selected, ctas[None, :], 0), 1), 1)
+        split = slot - tl.sum(tl.where(selected, begin[None, :], 0), 1)
+        ctx_slot = tl.sum(tl.where(selected, ctx[None, :], 0), 1)
+        per_cta = seq_chunks // seq_ctas
+        extra = seq_chunks % seq_ctas
+        start = split * per_cta + tl.minimum(split, extra)
+        count = per_cta + (split < extra).to(tl.int32)
+
+    field = tl.arange(0, 4)
+    for n in tl.static_range(NEXT_N):
+        row = slot * NEXT_N + n
+        info = tl.where(
+            field[None, :] == 0,
+            (batch * NEXT_N + n)[:, None],
+            tl.where(
+                field[None, :] == 1,
+                start[:, None],
+                tl.where(field[None, :] == 2, count[:, None], ctx_slot[:, None]),
+            ),
+        )
+        tl.store(
+            cta_info_ptr + row[:, None] * 4 + field[None, :],
+            tl.where(valid[:, None], info, 0),
+            (slot < slots)[:, None],
+        )
+
+
 @triton.jit(repr=_deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr)
 def _deepgemm_fp8_paged_mqa_logits_varctx_schedule(
     batch_size,
