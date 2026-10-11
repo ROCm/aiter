@@ -431,6 +431,14 @@ def compile_fp8_gemm_8w(
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
 
+        # Opens a deliberate half-wave stagger: this gives waves 4-7 one extra
+        # barrier, and since s_barrier is a counting rendezvous, waves 0-3 run
+        # one phase ahead from here on -- which is what the double-buffered
+        # main loop below wants. Do not make it unconditional; that destroys
+        # the stagger without fixing anything (still 3 of 6 runs wrong on
+        # M=32768 N=7168 K=1792 with the old wait count).
+        #
+        # It is never closed, though. See the note before the epilogue.
         if wave_m == 1:
             rocdl.s_barrier()
 
@@ -463,7 +471,9 @@ def compile_fp8_gemm_8w(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            # Letting 2 * A + B loads stay outstanding here crosses the barrier
+            # with LDS writes still in flight that the next iteration reads.
+            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
@@ -524,6 +534,20 @@ def compile_fp8_gemm_8w(
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
+
+        # TODO: the half-wave stagger the prologue opened is never closed. The
+        # matching `if wave_m == 0: rocdl.s_barrier()` belongs here, before the
+        # epilogue, so the two halves are level again -- gcnasm closes it at
+        # the same point (opus_gemm_a2a_lsa, quad-subtile template) and so does
+        # mori's fused copy of this pipeline.
+        #
+        # Nothing follows store_c here, so the imbalance is not observable
+        # today and this is left as a note rather than a change. It does not
+        # stay unobservable: with the counts unbalanced, a `wait_barrier(0)`
+        # added after store_c does not mean "every wave's C tile has retired",
+        # it rendezvouses waves 0-3 with waves 4-7 still one barrier back and
+        # before their stores. Anything appended to this epilogue is silently
+        # wrong until the pair is closed.
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
