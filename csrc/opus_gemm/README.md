@@ -239,7 +239,7 @@ The public `opus_bmm` interface still uses batch-first transpose views and
 support is not a performance selection: existing general pipelines remain
 available, and the tuner compares eligible compact kids without changing
 existing tuned CSV rows. Regression coverage is in
-`op_tests/test_opus_a8w8_bmm_mxscale_bpreshuffle.py`.
+`op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py`.
 
 Kid 8477 adds a `16x32x512` compact tile for small M: 128 threads (two
 compute waves in a 1x2 grid), three A/B LDS slots, and 73 KiB of LDS.

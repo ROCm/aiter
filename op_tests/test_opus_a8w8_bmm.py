@@ -859,6 +859,13 @@ def check_shuffle_scale_bytes():
 # unchecked until whoever tuned it found out, and the three clang cannot
 # register-allocate would have to be remembered here as well as there. Reading
 # the catalog makes both automatic.
+#
+# GROUP_N is part of the filter, not just GROUP_K: the 1x32 kids share the
+# 32-element K block but scale per N row, so the square w_scale built below has
+# the wrong shape for them and their launcher refuses it. Every 1x32 kid is
+# preshuffled, so they are covered in the bpreshuffle file, which quantises a
+# per-N-row weight for them; keeping the split on GROUP_N is what stops the two
+# from drifting into each other.
 _MX32_GROUP = 32
 _MX32_SHAPE = (2, 128, 256, 4096)  # G, M, N, K
 _MX32_ERR_TOL = 0.003
@@ -866,7 +873,7 @@ _MX32_KIDS = tuple(
     sorted(
         kid
         for kid, inst in a8w8_mxscale_bmm_kernels_list.items()
-        if inst.GROUP_K == _MX32_GROUP
+        if inst.GROUP_K == _MX32_GROUP and inst.GROUP_N == _MX32_GROUP
     )
 )
 
@@ -881,14 +888,20 @@ def check_mx32_kids():
         _block_varied((g, n, k), k), group=_MX32_GROUP
     )
     O_in = O_mx.transpose(0, 1)
-    xs_in = xs_mx.transpose(0, 1)
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=_MX32_GROUP).transpose(0, 1)
     failures = []
+    # Route B and the scales through the pickers rather than passing the
+    # row-major buffers. A preshuffled kid handed row-major B does not raise, it
+    # quietly computes against the same reference, so skipping the pickers turns
+    # every bpreshuffle twin in this set into a silent numerical failure.
+    weight_for = _weight_picker(W_mx)
+    scale_for = _scale_picker(xs_mx, ws_mx, n, k)
 
     for kid in _MX32_KIDS:
         out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
+        sfa, sfb = scale_for(kid)
         try:
-            _run_opus(O_in, W_mx, out, xs_in, ws_mx, kid)
+            _run_opus(O_in, weight_for(kid), out, sfa, sfb, kid)
             torch.cuda.synchronize()
         except RuntimeError as exc:
             # A launcher refusing the shape -- too few K tiles to prime the
@@ -904,6 +917,51 @@ def check_mx32_kids():
 
     assert not failures, "GROUP_K=32 kids:\n  " + "\n  ".join(failures)
     return len(_MX32_KIDS)
+
+
+# --- wave1 bpreshuffle, GROUP_N == GROUP_K == 128 -------------------------
+# The wave1 tiles are the only single-wave bpreshuffle pipeline in the family,
+# so nothing else instantiates their B-fragment addressing. M=17 is deliberate:
+# the guard is the unaligned tail, which an aligned M would let a wrong
+# fragment stride pass.
+_WAVE1_KIDS = tuple(range(8440, 8450))
+_WAVE1_SPLITS = (1, 2)
+
+
+def check_wave1_group128():
+    """Check the wave1 bpreshuffle tiles against a dequantized reference."""
+    torch.manual_seed(89)
+    g, m, n, k = 2, 17, 128, 1024
+    x, xs, xf = _quant_per_token_e8m0(torch.randn(g, m, k))
+    w, ws, wf = _quant_block_e8m0(torch.randn(g, n, k))
+    xd = x.to(dtypes.fp32) * xf.repeat_interleave(GROUP, -1)
+    wd = w.to(dtypes.fp32) * wf.repeat_interleave(GROUP, 1).repeat_interleave(GROUP, -1)
+    ref = torch.bmm(xd, wd.transpose(1, 2)).to(dtypes.bf16)
+    w_sh = shuffle_weight(w, layout=(16, 16))
+    checks = 0
+    # Calls opus_bmm directly rather than through _run_opus. That helper exists
+    # to model the DSV4 mmajor path and so transposes what it is given; these
+    # buffers are already batch-major, so routing them through it would mean
+    # transposing them first only for the helper to transpose them back -- the
+    # round trip is an identity on both shape and stride, leaving nothing but a
+    # double negation to read past.
+    for kid in _WAVE1_KIDS:
+        for split in _WAVE1_SPLITS:
+            out = torch.empty_like(ref)
+            opus_bmm(
+                x,
+                w_sh,
+                out,
+                kid=int(kid),
+                layout="mxscale_bmm",
+                x_scale=xs,
+                w_scale=ws,
+                split_k=int(split),
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, ref, rtol=0.02, atol=0.03)
+            checks += 1
+    return checks
 
 
 def check_splitk_workspace():
@@ -1154,6 +1212,10 @@ def main():
     )
     n_mx32_kids = check_mx32_kids()
     aiter.logger.info("GROUP_K=32 MX quantisation passed for %d kids", n_mx32_kids)
+    n_wave1 = check_wave1_group128()
+    aiter.logger.info(
+        "wave1 bpreshuffle group128 passed for %d kid/split pairs", n_wave1
+    )
 
     # Both are pure host arithmetic (~0.4 s) and they catch the one class of bug
     # a single tile shape hides: an off-by-one in the shuffled scale index that

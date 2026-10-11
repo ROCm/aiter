@@ -1,6 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Correctness + perf check for the opus fp8 e8m0 mxscale BMM B-preshuffle kids.
+"""Correctness + perf check for the fp8 e8m0 mxscale BMM B-preshuffle path.
+
+Named after the public entry ``batched_gemm_a8w8_mxscale_bpreshuffle`` rather
+than after opus, because that entry now dispatches to either the opus kids or
+the FlyDSL backend depending on the shape, and both are exercised here.
+
+Kids are grouped by their ``GROUP_N x GROUP_K`` block. Each block gets its own
+weight, w_scale and reference: 32x32 and 128x128 scale a square N/K block, 1x32
+scales every N row on its own, and only the matching w_scale shape is accepted.
 
 kid 170 is kid 320's tile (64x32x256 -> a 32x32x256 per-wave register tile, i.e.
 COM_REP_M/N/K = 2/2/2) with two compile-time axes flipped: the weight comes from
@@ -10,16 +18,17 @@ a third: since the preshuffle order already is the mfma_16x16x128 B fragment
 order, its consumer waves ``buffer_load`` B straight into the MFMA registers and
 B never touches LDS.
 
-All kids run on the same quantized data -- kid 320 on the row-major weight, 170
-and 171 on the preshuffled one -- so a mismatch localizes to the preshuffle /
-op_sel / direct-B changes rather than to the quantization or the reference.
+Within a block all kids run on the same quantized data -- kid 320 on the
+row-major weight, 170 and 171 on the preshuffled one -- so a mismatch localizes
+to the preshuffle / op_sel / direct-B changes rather than to the quantization.
+Every kid is scored against the torch reference, not against another kid.
 
 The compact regression covers runtime dimensions, short K and segment tails.
 
 Usage:
-    python3 op_tests/test_opus_a8w8_bmm_mxscale_bpreshuffle.py
-    python3 -m pytest -q op_tests/test_opus_a8w8_bmm_mxscale_bpreshuffle.py
-    python3 op_tests/test_opus_a8w8_bmm_mxscale_bpreshuffle.py -g 4 -n 1024 -k 4096
+    python3 op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py
+    python3 -m pytest -q op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py
+    python3 op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py -g 4 -n 1024 -k 4096
 """
 
 import argparse
@@ -36,7 +45,9 @@ from aiter.ops.opus import opus_bmm, policy
 from aiter.ops.opus.gemm_op_a8w8 import (
     _mxscale_bmm_workspace,
     _opus_gemm_a8w8_mxscale_bmm_launch_raw,
+    bmm_a8w8_mxscale_opus,
 )
+from aiter.ops.quant import per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import run_perftest
 from csrc.opus_gemm.opus_gemm_common import (
@@ -76,6 +87,12 @@ KID_PLAIN = 8320  # same tile, row-major B, broadcast scale pack
 # ships for the shape under test (kid8158 is the large-M pick on many of them).
 KIDS_PLAIN_EXTRA = (8311, 8321, 8653, 8325, 8158)
 
+# Measured against the dequantized torch reference. The e8m0 quant floor on these
+# shapes is ~0.0014 and every kid, row-major and preshuffled alike, sits exactly
+# on it, so this leaves about 2x headroom -- the same gate the tuner and
+# op_tests/test_opus_a8w8_bmm.py use.
+_ERR_TOL = 0.003
+
 
 def _rel_err(y, ref):
     return (y.float() - ref).abs().mean().item() / (ref.abs().mean().item() + 1e-9)
@@ -85,19 +102,37 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     O_bf16 = _block_varied((g, m, k), k)
     W_bf16 = _block_varied((g, n, k), k)
     O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16, group=group)
-    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16, group=group)
-    # Same bytes, 16x16-tiled: [G, N, K] -> [G][N/16][K/32][2][16 n][16 k].
-    W_sh = shuffle_weight(W_mx, layout=(16, 16))
 
     O_in = O_mx.transpose(0, 1)  # [m, g, k] mmajor view
     xs_in = xs_mx.transpose(0, 1)  # [m, g, k/group] view
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=group).transpose(
-        0, 1
-    )  # [m, g, n]
 
-    scale_for = _scale_picker(xs_mx, ws_mx, n, k)
+    # One weight, scale and reference per GROUP_N. The 1x32 kids share GROUP_K
+    # with the square ones but scale per N row, so their w_scale is [G,N,K/32]
+    # rather than [G,N/32,K/32] -- handing them the square one is not a stricter
+    # test, it is a shape their launcher refuses. Quantized on demand so a run
+    # that selects no kid of a given GROUP_N does not pay for it.
+    _data = {}
 
-    def _call(kid, W):
+    def data_for(group_n):
+        if group_n not in _data:
+            W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(
+                W_bf16, group=group, group_n=group_n
+            )
+            _data[group_n] = (
+                W_mx,
+                # Same bytes, 16x16-tiled: [G,N,K] -> [G][N/16][K/32][2][16n][16k].
+                shuffle_weight(W_mx, layout=(16, 16)),
+                ws_mx,
+                _scale_picker(xs_mx, ws_mx, n, k),
+                run_torch(
+                    O_mx, W_mx, xs_fp32, ws_fp32, group=group, group_n=group_n
+                ).transpose(
+                    0, 1
+                ),  # [m, g, n]
+            )
+        return _data[group_n]
+
+    def _call(kid, W, scale_for):
         Y = torch.zeros((m, g, n), dtype=ydt)
         xs_kid, ws_kid = scale_for(kid)
         _opus_gemm_a8w8_mxscale_bmm_launch_raw(
@@ -117,19 +152,44 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     # returning something wrong -- e.g. the B_K=512 tiles need more K-tiles than
     # K=1024 provides. Those are absent from the row, not failures.
     errs = {}
+    kid_group_n = {}  # kid -> the GROUP_N whose data it ran on, for the bench pass
     skipped = []
     kid_plain = KID_PLAIN + (1000 if group == 32 else 0)
     for kid in KIDS_BPRESHUFFLE:
-        if policy.mxscale_bmm_kid_group(kid) != group:
+        # Split the whole block, not just GROUP_K: GROUP_N picks which weight.
+        group_n, group_k = (
+            int(v) for v in policy.mxscale_bmm_kid_block(kid).split("x")
+        )
+        if group_k != group:
             continue
+        _, W_sh, _, scale_for, ref = data_for(group_n)
         try:
-            errs[kid] = _rel_err(_call(kid, W_sh), ref)
+            errs[kid] = _rel_err(_call(kid, W_sh, scale_for), ref)
+            kid_group_n[kid] = group_n
         except (RuntimeError, ValueError):
             skipped.append(kid)
+    # Every block this GROUP_K has in the catalog must have been attempted. The
+    # bug this catches is not a wrong number, it is a missing row: a selection
+    # rule that drops a block sends all of its kids into `skipped`, which reads
+    # as "this tile does not divide this shape", and the run still prints PASS
+    # with twelve fewer entries than nobody counts. Asserted on attempted, not
+    # on scored, because a shape where every kid of a block legitimately skips
+    # is allowed.
+    want = {
+        policy.mxscale_bmm_kid_block(kid)
+        for kid in KIDS_BPRESHUFFLE
+        if policy.mxscale_bmm_kid_block(kid).endswith(f"x{group}")
+    }
+    got = {f"{group_n}x{group}" for group_n in _data}
+    assert got == want, f"GROUP_K={group} blocks not attempted: {sorted(want - got)}"
+
     # The row-major reference kid, or at a K too short for it the 128-deep one.
+    # Square only -- every 1x32 kid is preshuffled, so that block has no
+    # row-major member to run here.
+    W_mx, _, _, scale_for_sq, ref_sq = data_for(group)
     for cand in (kid_plain, kid_plain - KID_PLAIN + 8653):
         try:
-            err_plain = _rel_err(_call(cand, W_mx), ref)
+            err_plain = _rel_err(_call(cand, W_mx, scale_for_sq), ref_sq)
         except RuntimeError as e:
             plain_exc = e
             continue
@@ -141,24 +201,34 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     # The public entry end to end: guarded custom op -> the preshuffle table
     # (the entry picks that one, nothing to set) -> the row's backend, opus or
     # flydsl, or flydsl's heuristic for a shape the table lacks.
-    err_pub = None
+    # It infers the block from the w_scale shape, so each GROUP_N is a separate
+    # route through it. Only those with a kid that ran: where every kid of a
+    # GROUP_N was skipped, the shape has no kernel and the entry has nothing to
+    # reach, which is the skip, not a failure.
+    err_pub = {}
     if split_k == 1:  # the entry defaults splitK, so only compare where they agree
-        err_pub = _rel_err(
-            batched_gemm_a8w8_mxscale_bpreshuffle(
-                O_in.contiguous(), W_sh, xs_in.contiguous(), ws_mx, dtype=ydt
-            ),
-            ref,
-        )
+        for group_n in sorted(set(kid_group_n.values())):
+            _, W_sh, ws_mx, _, ref = _data[group_n]
+            err_pub[group_n] = _rel_err(
+                batched_gemm_a8w8_mxscale_bpreshuffle(
+                    O_in.contiguous(), W_sh, xs_in.contiguous(), ws_mx, dtype=ydt
+                ),
+                ref,
+            )
 
     row = f"G{group:<3} g={g:<3} m={m:<6} n={n:<6} k={k:<6} sk={split_k} "
     row += "  ".join(f"kid{kid}={e:.5f}" for kid, e in errs.items())
     row += f"  kid{kid_plain}={err_plain:.5f}"
-    row += f"  public={'off' if err_pub is None else f'{err_pub:.5f}'}"
+    row += "  public=" + (
+        "off"
+        if not err_pub
+        else " ".join(f"{gn}x{group}:{e:.5f}" for gn, e in err_pub.items())
+    )
     if skipped:
         row += "  skipped=" + ",".join(str(k) for k in skipped)
     if bench:
 
-        def _time(kid, W):
+        def _time(kid, W, scale_for):
             xs_kid, ws_kid = scale_for(kid)
             _, t = run_perftest(
                 _opus_gemm_a8w8_mxscale_bmm_launch_raw,
@@ -177,18 +247,22 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
             )
             return t
 
-        times = [f"kid{kid}={_time(kid, W_sh):.2f}us" for kid in errs]
-        times.append(f"kid{kid_plain}={_time(kid_plain, W_mx):.2f}us")
+        times = [
+            f"kid{kid}={_time(kid, _data[kid_group_n[kid]][1], _data[kid_group_n[kid]][3]):.2f}us"
+            for kid in errs
+        ]
+        times.append(f"kid{kid_plain}={_time(kid_plain, W_mx, scale_for_sq):.2f}us")
         for kid in KIDS_PLAIN_EXTRA:
-            times.append(f"kid{kid}={_time(kid, W_mx):.2f}us")
+            times.append(f"kid{kid}={_time(kid, W_mx, scale_for_sq):.2f}us")
         row += "  |  " + "  ".join(times)
     print(row, flush=True)
-    # The preshuffle kids differ from the plain one only in where B's bytes live
-    # and how the (identical) scale bytes reach the MFMA, so they must land on
-    # the plain kid's accuracy, not merely "close to" the reference.
-    tol = max(2.0 * err_plain, err_plain + 1e-4)
-    ok = all(e <= tol for e in errs.values())
-    return ok and (err_pub is None or err_pub <= tol)
+    # Every kid is judged against the torch reference, not against the row-major
+    # kid. kid_plain stays in the row as a reading aid -- it is the same tile with
+    # B row-major, so a preshuffle kid drifting away from it is still the first
+    # thing to look at -- but it no longer sets the bar, because anchoring the
+    # tolerance to another kernel makes the gate move whenever that kernel does.
+    ok = all(e <= _ERR_TOL for e in errs.values())
+    return ok and all(e <= _ERR_TOL for e in err_pub.values())
 
 
 def _check_tables():
@@ -564,6 +638,153 @@ def test_compact_mxscale_bmm(shape, dtype):
         assert torch.equal(y, first)
 
 
+# --- GROUP_N == 1, GROUP_K == 32 -----------------------------------------
+# These are bpreshuffle-only: there is no row-major 1x32 kid, so `_run` above
+# cannot host them -- its gate is "match the row-major twin's accuracy" and
+# there is no twin. ``check_1x32_kids`` in op_tests/test_opus_a8w8_bmm.py
+# checks the kernels against a dequantized reference with the kid pinned; what
+# is left, and what lives here, is the public entry: route selection, the
+# per-row scale reaching the kernel intact, and capture.
+_1X32_SHAPE = (2, 129, 512, 4608)  # B, M, N, K -- M and K deliberately untidy
+
+
+def _inputs_1x32(b, m, n, k, dtype=torch.bfloat16, seed=197):
+    """Per-N-row K32 e8m0 scales, plus a dequantized fp32 reference."""
+    torch.manual_seed(seed)
+
+    def quant(shape):
+        # Vary every row and K32 block independently: a square grouping or a
+        # wrong MFMA lane's scale then moves the result by a power of two,
+        # which a uniform magnitude would absorb.
+        blocks = torch.randn((*shape[:-1], k // 32, 32), device="cuda")
+        exponents = (
+            torch.arange(blocks.numel() // 32, device="cuda").reshape(
+                *shape[:-1], k // 32, 1
+            )
+            % 9
+            - 4
+        )
+        values = (blocks * torch.exp2(exponents.float())).reshape(shape).bfloat16()
+        q, scales = per_1x32_f8_scale_f8_quant(values, scale_type=torch.uint8)
+        scales = scales.view(*shape[:-1], k // 32)
+        dequant = q.float() * torch.exp2(
+            scales.view(torch.uint8).float() - 127
+        ).repeat_interleave(32, dim=-1)
+        return q, scales, dequant
+
+    x, xs, xd = quant((m, b, k))
+    w, ws, wd = quant((b, n, k))
+    ref = torch.einsum("mbk,bnk->mbn", xd, wd).to(dtype)
+    return x, shuffle_weight(w, (16, 16)), xs, ws, ref
+
+
+def test_public_entry_1x32():
+    """The public entry must route 1x32 scales to a 1x32 kid and stay exact.
+
+    ``check_1x32_kids`` pins the kid, so it cannot see a routing regression:
+    a 1x32 w_scale handed to a square kid is refused outright, and a square
+    scale sent to a 1x32 kid is the mirror of that. This is the only check that
+    lets the entry choose.
+    """
+    x, w, xs, ws, ref = _inputs_1x32(*_1X32_SHAPE)
+    y = batched_gemm_a8w8_mxscale_bpreshuffle(x, w, xs, ws)
+    torch.cuda.synchronize()
+    # Aggregate, not elementwise. At K=4608 of signed data the accumulation
+    # cancels, so outputs near zero sit further from a dequantized reference
+    # than any elementwise tolerance worth setting, while the aggregate stays
+    # orders tighter than the gate. The exactness this test needs is checked
+    # below, against the kernel itself rather than against the reference.
+    rel = (y.float() - ref.float()).abs().mean() / ref.float().abs().mean()
+    assert rel.item() < 0.003, f"public entry rel err {rel.item():.5f}"
+
+    # A tuned row naming a square-block kid must fall back to the matching 1x32
+    # kid rather than be taken at face value -- this is the drift a retune
+    # leaves behind when the scale layout changes under a stale CSV. Bit-exact
+    # against the entry's own pick: a fallback landing anywhere else shows up
+    # here even when both answers are numerically acceptable.
+    stale_square_kid = next(
+        kid for kid in KIDS_BPRESHUFFLE if policy.mxscale_bmm_kid_block(kid) == "32x32"
+    )
+    fallback = bmm_a8w8_mxscale_opus(
+        x,
+        w,
+        xs,
+        ws,
+        kernelId=stale_square_kid,
+        b_preshuffled=True,
+        group_n=1,
+        group_size=32,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(fallback, y, rtol=0, atol=0)
+
+
+def test_rejects_square_scale_shape_on_1x32_kid():
+    """A square w_scale on a 1x32 kid must be refused, not quietly misread."""
+    x, w, xs, ws, ref = _inputs_1x32(*_1X32_SHAPE)
+    kid = next(k for k in KIDS_BPRESHUFFLE if policy.mxscale_bmm_kid_block(k) == "1x32")
+    square_ws = ws[:, ::32, :].contiguous()  # [B, N/32, K/32] -- the wrong block
+    with pytest.raises((ValueError, RuntimeError), match="w_scale"):
+        opus_bmm(
+            x.transpose(0, 1),
+            w,
+            torch.empty_like(ref).transpose(0, 1),
+            kid=kid,
+            layout="mxscale_bmm",
+            x_scale=xs.transpose(0, 1),
+            w_scale=square_ws,
+        )
+
+
+def test_cuda_graph_replay_1x32():
+    """Capture + replay on the 1x32 route, which has its own scale plumbing."""
+    x, w, xs, ws, _ = _inputs_1x32(*_1X32_SHAPE)
+    eager = batched_gemm_a8w8_mxscale_bpreshuffle(x, w, xs, ws)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = batched_gemm_a8w8_mxscale_bpreshuffle(x, w, xs, ws)
+    for _ in range(2):
+        captured.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(captured).all(), "replay left the buffer untouched"
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
+def test_cuda_graph_replay():
+    """The public entry must be capturable and replay bit-identically.
+
+    Nothing else here runs this path under a graph, and graph capture is where
+    a kernel that allocates, synchronizes, or reads a host value at launch time
+    stops working -- none of which the eager calls above can see. Serving
+    frameworks capture this entry, so a regression would surface there first.
+
+    The buffer is refilled with NaN before each replay: a graph that captured
+    nothing, or whose output pointer drifted, leaves the NaNs behind rather
+    than quietly re-presenting the previous result.
+    """
+    # bf16 only: this shape routes to the FlyDSL backend, whose BMM declines a
+    # fp32 output. Pinning the dtype keeps the test about capture rather than
+    # about which backend a shape happens to land on.
+    dtype = torch.bfloat16
+    b, m, n, k = 2, 129, 512, 4608
+    x, w, xs, ws, _ = _compact_inputs(b, m, n, k, dtype)
+    eager = batched_gemm_a8w8_mxscale_bpreshuffle(x, w, xs, ws, dtype=dtype)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = batched_gemm_a8w8_mxscale_bpreshuffle(x, w, xs, ws, dtype=dtype)
+    for _ in range(2):
+        captured.fill_(float("nan"))
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(captured).all(), "replay left the buffer untouched"
+        # Same inputs and same kid, so this is determinism, not tolerance.
+        torch.testing.assert_close(captured, eager, rtol=0, atol=0)
+
+
 def main():
     global KIDS_BPRESHUFFLE, KIDS_PLAIN_EXTRA
     p = argparse.ArgumentParser()
@@ -626,6 +847,12 @@ def main():
         print("compact: runtime dimensions and K segment tails", flush=True)
         for shape in COMPACT_SHAPES:
             test_compact_mxscale_bmm(shape, ydt)
+        print("cuda graph: capture + replay of the public entry", flush=True)
+        test_cuda_graph_replay()
+        print("1x32: public entry route, square-scale refusal, capture", flush=True)
+        test_public_entry_1x32()
+        test_rejects_square_scale_shape_on_1x32_kid()
+        test_cuda_graph_replay_1x32()
     for group in groups:
         for k in ks:
             for m in [int(x) for x in args.sizes.split(",")]:
