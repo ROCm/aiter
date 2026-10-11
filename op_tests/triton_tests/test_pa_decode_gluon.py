@@ -1076,8 +1076,7 @@ def prepare_gluon_query_and_scale(
     return quantized_query_gluon, query_scale_gluon, output_gluon
 
 
-@perftest()
-def run_gluon_kernel(
+def _run_gluon_kernel(
     output: torch.Tensor,
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -1126,7 +1125,6 @@ def run_gluon_kernel(
 
     Returns:
         None (modifies output in-place)
-        Note: The @perftest() decorator wraps this to return (None, avg_time)
     """
     if pa_decode_gluon is not None:
         pa_decode_gluon(
@@ -1156,6 +1154,16 @@ def run_gluon_kernel(
         raise RuntimeError(
             "This version triton does not support gluon; please upgrade to 3.5.0 or higher!"
         )
+
+
+_timed_gluon_kernel = perftest()(_run_gluon_kernel)
+
+
+def run_gluon_kernel(*args, **kwargs):
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        # Correctness tests need one invocation, not benchmark repetitions.
+        return _run_gluon_kernel(*args, **kwargs), float("nan")
+    return _timed_gluon_kernel(*args, **kwargs)
 
 
 @benchmark()
@@ -2249,7 +2257,10 @@ def sliding_window_performance_test():
 
 
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
-def test_multi_case_set(case_set_name):
+def test_multi_case_set(case_set_name, monkeypatch):
+    if case_set_name.endswith("_performance"):
+        # Performance case sets must still report real timing under pytest.
+        monkeypatch.setitem(globals(), "run_gluon_kernel", _timed_gluon_kernel)
     if case_set_name == "normal_accuracy":
         normal_accuracy_test()
     elif case_set_name == "normal_performance":

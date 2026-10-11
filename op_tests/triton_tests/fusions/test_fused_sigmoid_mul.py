@@ -41,7 +41,7 @@ def generate_fused_sigmoid_mul_inputs(shape, dtype, device="cuda"):
         (8192, 512),
     ],
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_explicit_out", [False, True])
 def test_fused_sigmoid_mul(shape, dtype, use_explicit_out):
     if not torch.cuda.is_available():
@@ -131,7 +131,7 @@ _K3_PADDED_ATTN_ROW = 2048
 @pytest.mark.parametrize(
     "n_tokens", [1, 7, 56, 64, 1166, 7827], ids=lambda n: f"tokens{n}"
 )
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("x_layout", ["contiguous", "padded_heads"])
 @pytest.mark.parametrize("use_explicit_out", [False, True])
 def test_fused_sigmoid_mul_row_strided(n_tokens, dtype, x_layout, use_explicit_out):

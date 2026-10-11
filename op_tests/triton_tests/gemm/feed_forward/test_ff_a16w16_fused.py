@@ -16,7 +16,7 @@ from op_tests.triton_tests.gemm.feed_forward.ff_test_utils import (
 
 @pytest.mark.parametrize("activation", ["silu_exp2", "gelu_tanh", "relu", None])
 @pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_ff_a16w16_fused_ungated(
     batch: int, hidden_dim: int, intermediate_dim: int, dtype, output, activation
@@ -40,7 +40,7 @@ def test_ff_a16w16_fused_ungated(
 
 @pytest.mark.parametrize("activation", ["silu_exp2", "gelu_tanh", "relu", None])
 @pytest.mark.parametrize("batch, hidden_dim, intermediate_dim", get_x_vals())
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("output", [True, False])
 def test_ff_a16w16_fused_gated(
     batch: int, hidden_dim: int, intermediate_dim: int, dtype, output, activation

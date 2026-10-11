@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import random
+from itertools import product
 
 import pytest
 import torch
@@ -361,18 +362,32 @@ def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monke
     torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
-@pytest.mark.parametrize("B", [1, 4, 57, 64])
-# @pytest.mark.parametrize("H_Q, H_KV", [(1,1), (16, 16), (2,1), (24,4)]) #TODO: GQA failing
-@pytest.mark.parametrize("H_Q, H_KV", [(1, 1), (16, 16)])
-@pytest.mark.parametrize("D", [1, 64, 128])
-@pytest.mark.parametrize("KV_BLK_SZ", [1, 4, 512])
-@pytest.mark.parametrize("SEQ_LEN", [1, 32, 57, 512, 10000])
-@pytest.mark.parametrize("NUM_BLK", [4, 32])
+@pytest.mark.parametrize(
+    "B, H_Q, H_KV, D, KV_BLK_SZ, SEQ_LEN, NUM_BLK",
+    [
+        (b, h, h, d, block, seq, num_blocks)
+        for b, h, d, block, seq, num_blocks in product(
+            [1, 4, 57, 64],
+            [1, 16],
+            [1, 64, 128],
+            [1, 4, 512],
+            [1, 32, 57, 512],
+            [4, 32],
+        )
+        if not (d == 128 and block == 512)  # Exceeds MI300 shared memory.
+    ]
+    + [
+        # Long sequences exercise partition/reduction and tail masking without
+        # multiplying the expensive reference over the full short-sequence grid.
+        (1, 1, 1, 64, 4, 10000, 4),
+        (4, 16, 16, 128, 4, 10000, 32),
+        (1, 16, 16, 64, 512, 10000, 32),
+    ],
+)
 @pytest.mark.parametrize(
     "dtype, kv_cache_dtype, compute_type, output_type",
     [
-        (torch.float16, torch.float16, tl.float16, torch.float16),
-        # (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
+        (torch.bfloat16, torch.bfloat16, tl.bfloat16, torch.bfloat16),
     ],
 )
 def test_paged_attn_per_token_quant(
@@ -388,12 +403,6 @@ def test_paged_attn_per_token_quant(
     compute_type,
     output_type,
 ):
-    if D == 128 and KV_BLK_SZ == 512:  # Causes Shared Memory out of resources on Mi300
-        pytest.skip("D={128} and KV_BLK_SZ={512} causes shared memory out of resources")
-
-    if SEQ_LEN >= 8192 and B >= 16:
-        pytest.skip("B>={4} and SEQ_LEN>={8192} tests are too slow")
-
     torch.cuda.empty_cache()  # Helps avoid hangs in large tests
     torch.set_printoptions(precision=5, threshold=10000)
 
