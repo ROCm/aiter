@@ -5,14 +5,16 @@
 #include <string_view>
 #include <unordered_map>
 
-#include <torch/extension.h>
+#include "gemm_a4w4_blockscale.h"
 
+#include "aiter_stream.h"
 #include "gemm_a4w4_blockscale_common.cuh"
 #include "gemm_a4w4_blockscale_lookup.h"
 #include "gemm_a4w4_blockscale_manifest.h"
 
-using BlockwiseKernel = torch::Tensor (*)(
-    torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, torch::Tensor&, int);
+using BlockwiseKernel = aiter_tensor_t& (*)(
+    aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&, aiter_tensor_t&,
+    int, hipStream_t);
 
 // Name-keyed dispatch table; see gemm_a8w8_blockscale.cu for the rationale
 // behind std::string_view keys + raw fn-ptr values (constant-init into
@@ -53,7 +55,7 @@ BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
         {
             return it->second;
         }
-        TORCH_CHECK(false,
+        AITER_CHECK(false,
                     "gemm_a4w4_blockscale kernel '",
                     kernelName,
                     "' is not present in the compiled registry. The tuned CSV references a "
@@ -66,28 +68,52 @@ BlockwiseKernel blockscale_dispatch(const std::string& kernelName)
         CDataType>;
 }
 
-torch::Tensor gemm_a4w4_blockscale(torch::Tensor& XQ,
-                                   torch::Tensor& WQ,
-                                   torch::Tensor& x_scale,
-                                   torch::Tensor& w_scale,
-                                   torch::Tensor& Y,
-                                   int splitK,
-                                   std::string kernelName)
-{
-    TORCH_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
-    TORCH_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
+namespace aiter {
 
-    if(Y.dtype() == at::ScalarType::Half)
+aiter_tensor_t& gemm_a4w4_blockscale(aiter_tensor_t& XQ,
+                                      aiter_tensor_t& WQ,
+                                      aiter_tensor_t& x_scale,
+                                      aiter_tensor_t& w_scale,
+                                      aiter_tensor_t& Y,
+                                      int splitK,
+                                      hipStream_t stream,
+                                      std::string kernelName)
+{
+    check_a4w4_operands(XQ, WQ, x_scale, w_scale, Y);
+    AITER_CHECK(XQ.dtype() == WQ.dtype(), "Weights and activations should have the same dtype!");
+    AITER_CHECK(x_scale.dtype() == w_scale.dtype(), "Scales should have the same dtype!");
+
+    if(Y.dtype() == AITER_DTYPE_fp16)
     {
-        blockscale_dispatch<F16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
+        blockscale_dispatch<F16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK, stream);
     }
-    else if(Y.dtype() == at::ScalarType::BFloat16)
+    else if(Y.dtype() == AITER_DTYPE_bf16)
     {
-        blockscale_dispatch<B16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK);
+        blockscale_dispatch<B16>(kernelName)(XQ, WQ, x_scale, w_scale, Y, splitK, stream);
     }
     else
     {
-        TORCH_CHECK(false, "Unsupported scales/output dtype!");
+        AITER_CHECK(false, "Unsupported scales/output dtype!");
     }
     return Y;
 }
+
+namespace torch_itfs {
+
+void gemm_a4w4_blockscale(aiter_tensor_t& XQ,
+                          aiter_tensor_t& WQ,
+                          aiter_tensor_t& x_scale,
+                          aiter_tensor_t& w_scale,
+                          aiter_tensor_t& Y,
+                          int splitK,
+                          std::string kernelName)
+{
+    // A failed check has to reach Python as an exception, not abort() the
+    // interpreter -- this is the binding boundary, so flip throw mode here.
+    aiter_detail::AiterThrowGuard throw_guard;
+    aiter::gemm_a4w4_blockscale(
+        XQ, WQ, x_scale, w_scale, Y, splitK, getCurrentHIPStream(), kernelName);
+}
+
+} // namespace torch_itfs
+} // namespace aiter
