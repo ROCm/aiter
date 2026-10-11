@@ -5,17 +5,20 @@
 # Design rules it enforces (each learned from a real failure mode):
 #   * isolation is REPORTED, never assumed  -- no docker here, so: worktree + private caches
 #   * arch coverage is REPORTED, never implied -- a gfx950 box cannot validate a gfx942 claim
-#   * the repo's own tests are NOT trusted as coverage -- S1 runs its own shape grid, because
-#     a suite whose odd/unaligned shapes are commented out passes while the tail path is broken
+#   * a test is run and where it CAME FROM is reported -- a test the PR ships was written by
+#     the same hand as the code it grades, and a change nothing runs at all is a blocker
+#   * the target's own run is the coverage. The validator does not synthesise shapes the
+#     target never ran; it reports which shapes reached the kernel and which rows this PR
+#     disabled, and leaves the judgement about whether that is enough to the reviewer
 #   * a green pytest with loosened tolerances is not a pass -- tolerances are policy-checked
 #   * GPU is claimed over a sampling window and locked (kernel-profiling-optimization skill)
 #
 #   * correctness is not performance -- a kernel PR can compute the right values and still
 #     be a regression, so base and head are also timed, on the same locked GPU, back to back
 #
-# usage: validate_pr.sh --repo <worktree> --target <test file or pytest node> [--patch p.patch]
-#                       [--head-sha <expected PR head>] [--shape-env VAR]
-#                       [--grid "M,N,dt;..."] [--tol-table f32=1e-5,...]
+# usage: validate_pr.sh --repo <worktree> (--target <test file or node> | --no-target <reason>)
+#                       [--patch p.patch]
+#                       [--head-sha <expected PR head>] [--tol-table f32=1e-5,...]
 #                       [--perf-args "--scenario bench"] [--no-perf]
 #                       --expected-route NAME [--label NAME] [--out report.json]
 set -uo pipefail
@@ -24,26 +27,17 @@ REPO_WT=""
 TESTS=""
 PATCHF=""
 HEAD_SHA=""
-SHAPE_ENV=""
-GRID=""
 EXPECTED_ROUTE=""
+# Local names to capture at each route call, in the order the kernel takes them. This is a
+# READING of the target's own run -- which shapes reached the kernel -- not an injection.
 SHAPE_VARS=""
-SHAPE_ARG=""
-SHAPE_ARGNAMES=""
-# Extra independent test axes, each `NAME=FLAG:v1;v2;...`. The shape grid is one ordered
-# tuple on one channel, which is the whole of what a target's shape flag accepts; a target
-# whose remaining knobs are separate flags -- head counts, dtypes, window modes -- could not
-# be gridded over them at all, so entire failing configurations were unreachable however the
-# grid was spelled. On ROCm/aiter#4538 that is `--num-heads`, whose default is `64 128`, and
-# the public API asserts at num_heads=16 in a configuration the validator could not request.
 # Force the runner instead of inferring it. The classifier is structural and can be
 # wrong in both directions; when it is, a caller who can see the target should be able
 # to say so rather than having a runner-selection artefact charged to the PR author.
 RUNNER_OVERRIDE=""
-AXES=()
-AXIS_CLI=()
-AXIS_CLI_OVERRIDE=()
-AXIS_REPORT="[]"
+RUNNER_REASON=""
+# The caller's declaration that they looked for a test exercising this change and found none.
+NO_TARGET_REASON=""
 TOL_TABLE=""
 LABEL="run"
 OUT=""
@@ -79,6 +73,30 @@ PERF_MIN_ROWS="${PERF_MIN_ROWS:-3}"
 PERF_CONTROL_COLUMN=""
 PERF_CONTROL_TOL="${PERF_CONTROL_TOL:-0.10}"
 PERF_BASELINE_METHOD="patch-reversed-same-worktree"
+# The file the timing runs execute. It defaults to the correctness target, and until now it
+# WAS the correctness target -- run_perf simply reused $TEST_FILE. Naming it separately
+# changes nothing by itself; what it does is force the places that ask "is the target on
+# base?" to say WHICH target. Four of them read a state computed from the correctness
+# target, two write to the worktree, and one deletes from it.
+PERF_TARGET=""
+# How the validator came to be timing that file. A caller who names it has read the diff;
+# falling back to the correctness target is the validator's own inference, and the two are
+# not the same kind of evidence -- the same distinction runner_basis and test_provenance
+# already draw. Absent any measurement, this is what tells a reader whose choice it was.
+PERF_TARGET_BASIS="same-as-correctness-target"
+PERF_TARGET_PROVENANCE="unknown"
+PERF_TARGET_PROVENANCE_REASON=""
+# Discovery can return two targets -- the repository's bench and the one the PR ships -- and
+# both get timed. Everything above describes ONE target and stays that way: PERF_TARGET is
+# what perf_detect and run_perf act on, and the loops below set it per iteration. What the
+# loops accumulate lives in these index-aligned arrays instead. Parallel arrays are a poor
+# record type, and bash offers no better one; the arrays exist only to carry results to the
+# manifest, where scrape_perf.py assembles them back into objects.
+PERF_TARGETS=()
+PERF_TARGET_BASES=()
+PERF_TARGET_BASIS_REASONS=()
+PERF_TARGET_PROVENANCES=()
+PERF_TARGET_PROVENANCE_REASONS=()
 TARGET_PYTHON="${PYTHON_BIN:-$(command -v python3 || command -v python || true)}"
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 
@@ -94,28 +112,44 @@ while [ "$#" -gt 0 ]; do
     --repo) need_value "$@"; REPO_WT="$2"; shift 2;;
     --target) need_value "$@"; TESTS="$2"; shift 2;;
     --tests) need_value "$@"; TESTS="$2"; shift 2;;
+    --no-target) need_value "$@"; NO_TARGET_REASON="$2"; shift 2;;
     --patch) need_value "$@"; PATCHF="$2"; shift 2;;
     --head-sha) need_value "$@"; HEAD_SHA="$2"; shift 2;;
-    --shape-env) need_value "$@"; SHAPE_ENV="$2"; shift 2;;
-    --grid) need_value "$@"; GRID="$2"; shift 2;;
     --expected-route) need_value "$@"; EXPECTED_ROUTE="$2"; shift 2;;
     --shape-vars) need_value "$@"; SHAPE_VARS="$2"; shift 2;;
-    --shape-arg) need_value "$@"; SHAPE_ARG="$2"; shift 2;;
-    --shape-argnames) need_value "$@"; SHAPE_ARGNAMES="$2"; shift 2;;
-    --axis) need_value "$@"; AXES+=("$2"); shift 2;;
     --runner) need_value "$@"; RUNNER_OVERRIDE="$2"; shift 2;;
+    --runner-reason) need_value "$@"; RUNNER_REASON="$2"; shift 2;;
     --tol-table) need_value "$@"; TOL_TABLE="$2"; shift 2;;
     --label) need_value "$@"; LABEL="$2"; shift 2;;
     --out) need_value "$@"; OUT="$2"; shift 2;;
     --perf-args) need_value "$@"; PERF_ARGS="$2"; PERF_ARGS_SET=1; shift 2;;
+    --perf-target) need_value "$@"; PERF_TARGET="$2"; PERF_TARGET_BASIS="declared-by-caller"; shift 2;;
     --perf-control-column) need_value "$@"; PERF_CONTROL_COLUMN="$2"; shift 2;;
     --no-perf) PERF_ENABLED=0; shift;;
     *) echo "unknown arg $1" >&2; exit 2;;
   esac
 done
 
-if [ -z "$REPO_WT" ] || [ -z "$TESTS" ]; then
-  echo "--repo and --target are required" >&2
+PERF_CONTROL_COLUMN=$(python3 -c 'import sys; print(sys.argv[1].strip())' "$PERF_CONTROL_COLUMN")
+
+if [ -z "$REPO_WT" ]; then
+  echo "--repo is required" >&2
+  exit 2
+fi
+# A PR with runtime surface and no test that exercises it is a finding about the PR, and it used
+# to be a usage error: the caller who looked and found nothing had no way to say so, so the run
+# died before writing a report and the PR went unvalidated rather than red.
+#
+# It stays an error to supply NEITHER, because a forgotten --target must not read as "there is no
+# test" -- that would publish a caller's slip as a blocker against the author, which is the one
+# mistake this file spends the most lines avoiding. The absence has to be DECLARED, with a reason,
+# exactly like the runner is.
+if [ -n "$TESTS" ] && [ -n "$NO_TARGET_REASON" ]; then
+  echo "--target and --no-target contradict each other; supply one" >&2
+  exit 2
+fi
+if [ -z "$TESTS" ] && [ -z "$NO_TARGET_REASON" ]; then
+  echo "one of --target or --no-target <reason> is required" >&2
   exit 2
 fi
 if ! git -C "$REPO_WT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -135,30 +169,6 @@ if [ -n "$PATCHF" ]; then
 fi
 if [ -n "$OUT" ]; then
   OUT=$(cd -- "$(dirname -- "$OUT")" && pwd)/$(basename -- "$OUT")
-fi
-if [ -n "$SHAPE_ARGNAMES" ] && [ -n "$GRID" ]; then
-  if ! python3 - "$SHAPE_ARGNAMES" "$GRID" <<'PY'
-import sys
-
-names = [part.strip() for part in sys.argv[1].split(",") if part.strip()]
-rows = [row for row in sys.argv[2].split(";") if row.strip()]
-bad = [row for row in rows if len(row.split(",")) != len(names)]
-if bad:
-    print(
-        f"--grid rows must have {len(names)} cells to match --shape-argnames "
-        f"{','.join(names)}; offending rows: {bad}",
-        file=sys.stderr,
-    )
-    raise SystemExit(1)
-PY
-  then
-    # Checked here and not inside a phase. The arity check used to live in the plugin
-    # generator, whose exit status run_pytest never read: the stale plugin from the previous
-    # phase survived, head-grid re-ran the invalid-grid sentinel, and its failure was
-    # published as "the PR adds this target and its independent shape grid fails".
-    echo "--grid does not match --shape-argnames" >&2
-    exit 2
-  fi
 fi
 if [ -n "$HEAD_SHA" ] && [[ ! "$HEAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "--head-sha must be a full 40-character commit OID" >&2
@@ -202,73 +212,35 @@ JSON="$WORK/report.json"
 PROBE_DIR="$WORK/probe"
 PROBE_MODULE="validation_probe_${RANDOM}_${RANDOM}"
 mkdir -p "$PROBE_DIR"
-python3 - "$LABEL" "$JSON" <<'PY'
-import json
-import sys
+REPORT_TOOL="$SCRIPT_DIR/report.py"
+TARGET_TOOL="$SCRIPT_DIR/target_run.py"
+python3 "$REPORT_TOOL" init "$JSON" "$LABEL"
 
-json.dump(
-    {"label": sys.argv[1], "stages": {}, "findings": []},
-    open(sys.argv[2], "w"),
-    indent=2,
-)
-PY
-
+# Every write to the report goes through report.py, which is its only writer. These wrappers
+# keep the call sites unchanged; `--` guards values that begin with a dash.
 jset_json() {
-  python3 - "$JSON" "$1" "$2" <<'PY'
-import json
-import sys
-
-path, key, raw = sys.argv[1:4]
-data = json.load(open(path))
-current = data
-parts = key.split(".")
-for part in parts[:-1]:
-    current = current.setdefault(part, {})
-current[parts[-1]] = json.loads(raw)
-json.dump(data, open(path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" set --json -- "$JSON" "$1" "$2"
 }
 
 jset_string() {
-  python3 - "$JSON" "$1" "$2" <<'PY'
-import json
-import sys
-
-path, key, value = sys.argv[1:4]
-data = json.load(open(path))
-current = data
-parts = key.split(".")
-for part in parts[:-1]:
-    current = current.setdefault(part, {})
-current[parts[-1]] = value
-json.dump(data, open(path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" set -- "$JSON" "$1" "$2"
 }
 
 stage_note() {
-  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
-import json
-import sys
+  python3 "$REPORT_TOOL" stage -- "$JSON" "$1" "$2" "$3"
+}
 
-path, name, status, note = sys.argv[1:5]
-data = json.load(open(path))
-data["stages"][name] = {"status": status, "note": note}
-json.dump(data, open(path, "w"), indent=2)
-PY
+# Reads one field out of any JSON blob a tool handed back. It sat 400 lines below its first
+# caller until perf target discovery acquired an earlier one -- bash resolves a function only
+# from definitions it has already executed, so the call failed with `command not found` and,
+# with no `set -e`, the run carried on with an empty variable. Helpers live up here with the
+# other helpers.
+stats_field() {
+  python3 "$TARGET_TOOL" stats-field "$1" "$2"
 }
 
 finding() {
-  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
-import json
-import sys
-
-path, severity, stage, detail = sys.argv[1:5]
-data = json.load(open(path))
-data["findings"].append(
-    {"severity": severity, "stage": stage, "detail": detail}
-)
-json.dump(data, open(path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" finding -- "$JSON" "$1" "$2" "$3"
 }
 
 log_excerpt() {
@@ -286,122 +258,11 @@ PY
 }
 
 mark_runtime_coverage() {
-  python3 - "$JSON" "$1" "$2" "$3" <<'PY'
-import json
-import pathlib
-import sys
-
-report_path, raw_stats, runner, log_path = sys.argv[1:5]
-stats = json.loads(raw_stats)
-if stats["executed"] < 1:
-    raise SystemExit(0)
-if runner == "script" and pathlib.Path(log_path).stat().st_size == 0:
-    raise SystemExit(0)
-# A script that exits 0 with output has proved that a process ran, not that an architecture
-# was exercised: aiter#4538's own target returns silently with exit 0 and a log line when the
-# arch is unsupported or an optional package is missing. When a route WAS named and the run's
-# receipt observed no call to it, there is positive evidence that no work reached the device,
-# so no runtime credit is issued. With no route named nothing was observed either way, and
-# the basis below says so instead of implying a measurement.
-if runner == "script" and stats.get("observed_work") == 0:
-    raise SystemExit(0)
-data = json.load(open(report_path))
-gpu = data["stages"].get("gpu_claim", {})
-arch = gpu.get("arch")
-if gpu.get("status") == "pass" and arch:
-    data["arch_coverage"][arch] = "runtime"
-    data.setdefault("arch_coverage_basis", {})[arch] = (
-        f"pytest-junit-executed:{stats['executed']}"
-        if runner == "pytest"
-        # "script-exit-zero-with-output" described the process, not the work: a target that
-        # printed one line and returned earned the same architecture credit as one that
-        # graded 56 cases. The basis now names the count the stats carry and where it came
-        # from, so a reader can see whether an architecture was exercised or merely visited.
-        else (
-            f"script-observed-work:{stats.get('observed_work')} "
-            f"({stats.get('basis', 'unknown basis')})"
-            if stats["failures"] == 0
-            else f"script-nonzero-with-output ({stats.get('basis', 'unknown basis')})"
-        )
-    )
-    json.dump(data, open(report_path, "w"), indent=2)
-PY
+  python3 "$REPORT_TOOL" coverage -- "$JSON" "$1" "$2" "$3"
 }
 
 finish_report() {
-  python3 - "$JSON" "$OUT" <<'PY'
-import datetime
-import json
-import pathlib
-import shutil
-import sys
-
-source, output = sys.argv[1:3]
-data = json.load(open(source))
-required_stages = (
-    "merge_sim",
-    "gpu_claim",
-    "runtime_compat",
-    "test_policy",
-    "baseline_control",
-    "correctness_repo_tests",
-    "correctness_s1_grid",
-    "execution_receipt",
-    "index_width_scan",
-)
-for name in required_stages:
-    if name not in data["stages"]:
-        data["stages"][name] = {
-            "status": "skip",
-            "note": "validator internal error: stage did not record a result",
-        }
-        data["findings"].append(
-            {
-                "severity": "note",
-                "stage": name,
-                "detail": "stage result was missing; validation is inconclusive",
-            }
-        )
-
-severities = {finding["severity"] for finding in data["findings"]}
-complete = (
-    isinstance(data.get("runtime_identity"), dict)
-    and bool(data["runtime_identity"].get("module_path"))
-    and data["stages"]["merge_sim"]["status"] == "pass"
-    and data["stages"]["gpu_claim"]["status"] == "pass"
-    and data["stages"]["runtime_compat"]["status"] == "pass"
-    and data["stages"]["test_policy"]["status"] == "pass"
-    and data["stages"]["baseline_control"]["status"] == "pass"
-    and data["stages"]["correctness_repo_tests"]["status"] == "pass"
-    and data["stages"]["correctness_s1_grid"]["status"] == "pass"
-    and data["stages"]["execution_receipt"]["status"] == "pass"
-    and data["stages"]["index_width_scan"]["status"] == "info"
-)
-if "blocker" in severities:
-    verdict = "BLOCK"
-elif "should-fix" in severities:
-    verdict = "NEEDS_WORK"
-elif not complete:
-    verdict = "INCONCLUSIVE"
-else:
-    verdict = "PASS"
-data["verdict"] = verdict
-data["process_exit_code"] = (
-    0 if verdict == "PASS" else (2 if verdict == "INCONCLUSIVE" else 1)
-)
-data["finished_utc"] = datetime.datetime.now(datetime.timezone.utc).strftime(
-    "%Y-%m-%dT%H:%M:%SZ"
-)
-json.dump(data, open(source, "w"), indent=2)
-shutil.copyfile(source, output)
-# The exit code is derived from THIS run's verdict, recorded here, next to the write that
-# earned it. Reading it back out of `--out` made the caller's exit status depend on a file
-# any earlier run could have left behind.
-pathlib.Path(source).with_name("verdict").write_text(verdict + "\n")
-print(f"verdict={verdict}  findings={len(data['findings'])}  -> {output}")
-for item in data["findings"]:
-    print(f"  [{item['severity']}] {item['stage']}: {item['detail'][:150]}")
-PY
+  python3 "$REPORT_TOOL" finish "$JSON" "$OUT"
 }
 
 # Two independent facts about the supplied worktree:
@@ -409,6 +270,7 @@ PY
 #   PATCH_APPLIED=1  this process applied the patch and still owes the caller a revert
 BASE_ACTIVE=0
 PATCH_APPLIED=0
+PATCH_STATUS=""
 restore_head() {
   if [ "$BASE_ACTIVE" -eq 0 ]; then
     return 0
@@ -443,30 +305,7 @@ record_gpu_activity_after() {
   if [ -z "$PICK" ]; then
     return
   fi
-  ACTIVITY_AFTER=$(HIP_ID="$PICK" python3 - "$SCRIPT_DIR/pick-idle-gpu.py" <<'PY'
-import importlib.util
-import os
-import sys
-
-spec = importlib.util.spec_from_file_location("validation_gpu_picker", sys.argv[1])
-picker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(picker)
-amdsmi = picker.import_amdsmi()
-
-requested = int(os.environ["HIP_ID"])
-amdsmi.amdsmi_init()
-try:
-    for handle in amdsmi.amdsmi_get_processor_handles():
-        if amdsmi.amdsmi_get_gpu_enumeration_info(handle).get("hip_id") == requested:
-            gfx, _ = picker.read_activity(amdsmi, handle)
-            print("unavailable" if gfx is None else gfx)
-            break
-    else:
-        raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
-finally:
-    amdsmi.amdsmi_shut_down()
-PY
-  )
+  ACTIVITY_AFTER=$(python3 "$SCRIPT_DIR/gpu_probe.py" activity "$PICK")
   if [[ "$ACTIVITY_AFTER" =~ ^[0-9]+$ ]]; then
     jset_json "stages.gpu_claim.gfx_activity_after_pct" "$ACTIVITY_AFTER"
   elif [ "$ACTIVITY_AFTER" = "unavailable" ]; then
@@ -486,15 +325,24 @@ jset_json "arch_coverage" '{}'
 jset_json "arch_coverage_basis" '{}'
 jset_json "degraded_mode" 'null'
 jset_json "runtime_identity" 'null'
-jset_string "test_selection.target" "$TESTS"
-jset_string "test_selection.shape_env" "$SHAPE_ENV"
-jset_string "test_selection.grid" "$GRID"
-jset_string "test_selection.shape_arg" "$SHAPE_ARG"
-jset_string "test_selection.shape_argnames" "$SHAPE_ARGNAMES"
+if [ -n "$TESTS" ]; then
+  jset_string "test_selection.target" "$TESTS"
+else
+  # `null`, not `""`. An empty string is what an unset variable also produces, and the one thing
+  # this field must distinguish is "nobody named a target" from "the caller looked and there is
+  # none". The second is a declaration, and it is paired with test_provenance: none below.
+  jset_json "test_selection.target" 'null'
+fi
 jset_string "test_selection.expected_route" "$EXPECTED_ROUTE"
 jset_string "test_selection.shape_vars" "$SHAPE_VARS"
 jset_string "test_selection.runner" "unresolved"
 jset_string "test_selection.runner_reason" "merge simulation has not completed"
+# Provisional, for the same reason the runner above is: a run that exits before the patch is
+# applied still owes the reader a legal report, and a required field that is simply absent
+# reads as an oversight rather than as a stage that never got to run.
+jset_string "test_selection.test_provenance" "unknown"
+jset_string "test_selection.test_provenance_reason" \
+  "merge simulation has not completed, so the target has not been compared against the patch"
 
 # ---------- stage 1: merge simulation ----------
 BASE_SHA=$(git -C "$REPO_WT" rev-parse HEAD)
@@ -525,6 +373,10 @@ if [ -n "$PATCHF" ]; then
   if git -C "$REPO_WT" apply --check "$PATCHF" >/dev/null 2>&1 \
       && git -C "$REPO_WT" apply "$PATCHF" >/dev/null 2>&1; then
     PATCH_APPLIED=1
+    # Taken here and nowhere else: the worktree was verified clean four lines up, so this is
+    # the only moment at which `git status` describes the patch and nothing else. Later stages
+    # write caches, receipts and bench artifacts into the same tree.
+    PATCH_STATUS=$(git -C "$REPO_WT" status --porcelain --untracked-files=all)
     stage_note "merge_sim" "pass" "patch applies cleanly to the recorded base"
     jset_string "repo.patch_sha256" "$(sha256sum "$PATCHF" | awk '{print $1}')"
     if [ -n "$HEAD_SHA" ]; then
@@ -545,6 +397,32 @@ else
   jset_string "repo.head" "$BASE_SHA"
   stage_note "merge_sim" "skip" \
     "checkout validated directly; no base-to-head patch was supplied, so merge and attribution were not tested"
+fi
+
+# ---------- no target: the PR ships no executable evidence ----------
+#
+# Placed AFTER the merge simulation and not before it, because a report review-pr cannot bind to
+# the PR head is not evidence about that PR. The blocker is only worth publishing once `repo.base`
+# and `repo.head` pin what it is a blocker about.
+#
+# A blocker, not a skip. A skip says "the validator could not establish this"; here the validator
+# established something, and what it established is that a change with runtime surface arrived
+# with nothing that runs it. review-pr reports a PR with no runtime surface as N/A and never gets
+# here, so reaching this line means the caller judged there IS surface -- and then found nothing
+# exercising it.
+if [ -z "$TESTS" ]; then
+  jset_string "test_selection.runner" "none"
+  jset_string "test_selection.runner_reason" \
+    "no target was declared, so there was nothing to choose a runner for"
+  jset_string "test_selection.runner_basis" "declared-by-caller"
+  jset_string "test_selection.test_provenance" "none"
+  jset_string "test_selection.test_provenance_reason" "$NO_TARGET_REASON"
+  stage_note "correctness_repo_tests" "skip" \
+    "the caller declared that no test exercises this change: $NO_TARGET_REASON"
+  finding "blocker" "correctness" \
+    "this change has runtime surface and no test exercises it, so nothing about its behaviour was run: $NO_TARGET_REASON"
+  finish_report
+  exit 1
 fi
 
 # ---------- stage 2: GPU claim (sampling window + whole-run lock) ----------
@@ -626,50 +504,7 @@ else
       jset_string "degraded_mode" "NO_GPU"
       finding "note" "gpu_claim" "GPU claim raced with another process; no runtime correctness claim is made"
     else
-      GPU_INFO=$(HIP_ID="$PICK" python3 - "$SCRIPT_DIR/pick-idle-gpu.py" <<'PY'
-import importlib.util
-import json
-import os
-import socket
-import sys
-
-spec = importlib.util.spec_from_file_location("validation_gpu_picker", sys.argv[1])
-picker = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(picker)
-amdsmi = picker.import_amdsmi()
-
-requested = int(os.environ["HIP_ID"])
-amdsmi.amdsmi_init()
-try:
-    match = None
-    for smi_index, handle in enumerate(amdsmi.amdsmi_get_processor_handles()):
-        enumeration = amdsmi.amdsmi_get_gpu_enumeration_info(handle)
-        if enumeration.get("hip_id") == requested:
-            match = (smi_index, handle)
-            break
-    if match is None:
-        raise RuntimeError(f"HIP index {requested} has no amd-smi mapping")
-    smi_index, handle = match
-    asic = amdsmi.amdsmi_get_gpu_asic_info(handle)
-    gfx_activity, _ = picker.read_activity(amdsmi, handle)
-    print(
-        json.dumps(
-            {
-                "status": "pass",
-                "hip_index": requested,
-                "amd_smi_index": smi_index,
-                "model": asic.get("market_name", "unknown"),
-                "arch": asic.get("target_graphics_version", "unknown"),
-                "bdf": amdsmi.amdsmi_get_gpu_device_bdf(handle),
-                "gfx_activity_before_pct": gfx_activity,
-                "host": socket.gethostname(),
-            }
-        )
-    )
-finally:
-    amdsmi.amdsmi_shut_down()
-PY
-)
+      GPU_INFO=$(python3 "$SCRIPT_DIR/gpu_probe.py" identify "$PICK")
       GPU_INFO_RC=$?
       if [ "$GPU_INFO_RC" -ne 0 ]; then
         flock -u "$GPU_LOCK_FD"
@@ -692,6 +527,26 @@ PY
 fi
 
 # ---------- stage 3: repo-aware runtime compatibility ----------
+# Runtime probes import the candidate too. Construct the same allowlisted environment used
+# by correctness/perf BEFORE the first import, including the build-identity subprocesses.
+TARGET_BASE_ENV=()
+mapfile -d '' -t TARGET_BASE_ENV < <(python3 "$TARGET_TOOL" env)
+jset_json "isolation.target_environment" \
+  "$(python3 "$TARGET_TOOL" env-summary "${TARGET_BASE_ENV[@]}")"
+mkdir -p "$WORK/head/home" "$WORK/head/xdg-cache" "$WORK/head/flydsl-cache" \
+  "$WORK/head/triton-cache" "$WORK/head/torch-extensions" "$WORK/head/aiter-jit"
+RUNTIME_ENV=(
+  "PYTHONDONTWRITEBYTECODE=1"
+  "HOME=$WORK/head/home"
+  "XDG_CACHE_HOME=$WORK/head/xdg-cache"
+  "FLYDSL_CACHE_DIR=$WORK/head/flydsl-cache"
+  "FLYDSL_RUNTIME_CACHE_DIR=$WORK/head/flydsl-cache"
+  "TRITON_CACHE_DIR=$WORK/head/triton-cache"
+  "TORCH_EXTENSIONS_DIR=$WORK/head/torch-extensions"
+  "AITER_TRITON_ONLY=1"
+  "AITER_JIT_DIR=$WORK/head/aiter-jit"
+)
+[ -n "$PICK" ] && RUNTIME_ENV+=("HIP_VISIBLE_DEVICES=$PICK")
 RUNTIME_OK=0
 RUNTIME_SOURCE_CHANGED=0
 RC_OUT=""
@@ -727,8 +582,7 @@ case "$REPO_KIND" in
     PROBE_PATH="$REPO_WT${PYLIB:+:$PYLIB}"
     RC_OUT=$(
       cd "$REPO_WT" \
-        && AITER_TRITON_ONLY=1 AITER_JIT_DIR="$WORK/head/aiter-jit" \
-          PYTHONDONTWRITEBYTECODE=1 \
+        && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" \
           PYTHONPATH="$PROBE_PATH" timeout 300 \
           "$TARGET_PYTHON" - "$REPO_WT" 2>&1 <<'PY'
 import importlib
@@ -762,7 +616,8 @@ PY
     if [ "$RC_OUT" = "" ]; then
       RC_OUT=$(
         cd "$REPO_WT" \
-          && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" timeout 300 \
+          && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" \
+            PYTHONPATH="$PROBE_PATH" timeout 300 \
             "$TARGET_PYTHON" - "$REPO_WT/python/flydsl/__init__.py" \
               "$EXPECTED_FLYDSL_ROOT" 2>&1 <<'PY'
 import importlib
@@ -811,8 +666,7 @@ if [ "$RC" -eq 0 ]; then
     [ -n "$PYLIB" ] && DEPENDENCY_ARGS=(--dependency-root "$PYLIB")
     (
       cd "$REPO_WT" \
-        && AITER_TRITON_ONLY=1 AITER_JIT_DIR="$WORK/head/aiter-jit" \
-          PYTHONDONTWRITEBYTECODE=1 \
+        && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" \
           PYTHONPATH="$PROBE_PATH" timeout 300 \
           "$TARGET_PYTHON" "$SCRIPT_DIR/validate_evidence.py" runtime aiter "$REPO_WT" \
           "${DEPENDENCY_ARGS[@]}" --output "$IDENTITY_FILE"
@@ -821,7 +675,7 @@ if [ "$RC" -eq 0 ]; then
   else
     (
       cd "$REPO_WT" \
-        && PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PROBE_PATH" \
+        && env -i "${TARGET_BASE_ENV[@]}" "${RUNTIME_ENV[@]}" PYTHONPATH="$PROBE_PATH" \
           timeout 300 "$TARGET_PYTHON" "$SCRIPT_DIR/validate_evidence.py" runtime flydsl \
           "$EXPECTED_FLYDSL_ROOT" --output "$IDENTITY_FILE"
     ) >"$WORK/runtime-identity.log" 2>&1
@@ -1019,7 +873,7 @@ if commented_added:
             "stage": "test_policy",
             "detail": (
                 f"this change comments out {commented_added} additional shape rows; "
-                "independent boundary-grid coverage must remain explicit"
+                "shape coverage the suite used to have must not be dropped silently"
             ),
         }
     )
@@ -1044,741 +898,151 @@ fi
 TEST_PYTHONPATH="$PROBE_DIR:$SCRIPT_DIR:$TEST_PYTHONPATH"
 TEST_FILE=${TESTS%%::*}
 TARGET_PATH="$REPO_WT/$TEST_FILE"
-RUNNER_JSON=$(python3 - "$TARGET_PATH" "$TESTS" <<'PY'
-import ast
-import json
-import pathlib
-import sys
-
-path = pathlib.Path(sys.argv[1])
-selector = sys.argv[2]
-if "::" in selector:
-    result = {"runner": "pytest", "reason": "explicit pytest node selector"}
-elif not path.is_file():
-    result = {"runner": "none", "reason": "target file does not exist on head"}
-else:
-    try:
-        tree = ast.parse(path.read_text())
-    except (OSError, SyntaxError) as error:
-        result = {"runner": "none", "reason": f"target AST is not readable: {error}"}
-    else:
-        # "Defines a test* function" is not the same as "pytest can collect it". aiter's
-        # dominant op_tests convention is a SCRIPT whose worker happens to be named
-        # `test_<op>(m, d, dtype)` and is called from `main()` with real arguments. pytest
-        # collects it, cannot supply the parameters, and errors -- and the validator then
-        # published "the PR adds this test target and it fails on head" against the author,
-        # on a target that is green run as a script with the very shapes the run requested.
-        # Observed on ROCm/aiter#5081 and, in its argv-parsing variant, on ROCm/aiter#5172.
-        def decorator_names(node):
-            names = []
-            for decorator in node.decorator_list:
-                current = decorator.func if isinstance(decorator, ast.Call) else decorator
-                parts = []
-                while isinstance(current, ast.Attribute):
-                    parts.append(current.attr)
-                    current = current.value
-                if isinstance(current, ast.Name):
-                    parts.append(current.id)
-                names.append(".".join(reversed(parts)))
-            return names
-
-        def collectable(node):
-            if any(
-                "parametrize" in name or "fixture" in name or "usefixtures" in name
-                for name in decorator_names(node)
-            ):
-                return True
-            spec = node.args
-            required = [*spec.posonlyargs, *spec.args]
-            defaults = spec.defaults or []
-            if defaults:
-                required = required[: len(required) - len(defaults)]
-            # A required positional parameter can still be a fixture, but a fixture the
-            # module itself does not define and does not import is not one pytest will find
-            # in a bare op_tests file. Being conservative in the other direction -- calling
-            # such a target collectable -- is what produced the false blocker.
-            return not required
-
-        pytest_nodes = [
-            node
-            for node in tree.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name.startswith("test")
-        ]
-        has_test_class = any(
-            isinstance(node, ast.ClassDef) and node.name.startswith("Test")
-            for node in tree.body
-        )
-        has_pytest = has_test_class or any(collectable(node) for node in pytest_nodes)
-        uncollectable_only = bool(pytest_nodes) and not has_pytest
-        has_main = any(
-            isinstance(node, ast.If)
-            and isinstance(node.test, ast.Compare)
-            and isinstance(node.test.left, ast.Name)
-            and node.test.left.id == "__name__"
-            and len(node.test.ops) == 1
-            and isinstance(node.test.ops[0], ast.Eq)
-            and len(node.test.comparators) == 1
-            and isinstance(node.test.comparators[0], ast.Constant)
-            and node.test.comparators[0].value == "__main__"
-            for node in tree.body
-        )
-        # A module that parses argv in its BODY cannot be collected by pytest: the import
-        # pytest performs runs that call with pytest's own argv and argparse exits the
-        # process. Observed on ROCm/aiter#5172, whose target defines test nodes AND parses
-        # argv at module level -- it is green as a script and dies in collection, and the
-        # report described it as a red target with no hint that the runner was the cause.
-        parses_argv_at_import = any(
-            isinstance(node, ast.Call)
-            and getattr(node.func, "attr", "") in {"parse_args", "parse_known_args"}
-            for statement in tree.body
-            if not isinstance(
-                statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
-            )
-            for node in ast.walk(statement)
-        )
-        if has_pytest:
-            result = {"runner": "pytest", "reason": "target defines pytest test nodes"}
-            if parses_argv_at_import:
-                result["runner_risk"] = (
-                    "the target parses argv in its module body, which pytest executes at "
-                    "collection with its own argv; a collection error here is a property "
-                    "of the runner selection, not necessarily of the code under test"
-                )
-        elif has_main:
-            reason = "target has a __main__ entry point"
-            if uncollectable_only:
-                reason += (
-                    "; its test* functions take required positional parameters and carry no"
-                    " parametrize/fixture decorator, so pytest cannot collect them"
-                )
-            result = {"runner": "script", "reason": reason}
-        elif uncollectable_only:
-            result = {
-                "runner": "none",
-                "reason": (
-                    "target's only test* functions take required positional parameters with"
-                    " no parametrize/fixture decorator, and it has no __main__ entry point,"
-                    " so neither runner can execute it"
-                ),
-            }
-        else:
-            result = {"runner": "none", "reason": "target has no pytest nodes or __main__ entry point"}
-print(json.dumps(result))
-PY
-)
-TARGET_RUNNER=$(python3 - "$RUNNER_JSON" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])["runner"])
-PY
-)
-TARGET_RUNNER_REASON=$(python3 - "$RUNNER_JSON" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])["reason"])
-PY
-)
-jset_string "test_selection.runner" "$TARGET_RUNNER"
-if [ -n "$RUNNER_OVERRIDE" ] && [ "$TARGET_RUNNER" != "none" ]; then
+# A pytest node id selects cases within a file; a timing run executes the file. So where the
+# perf target falls back to the correctness target, it falls back to its FILE, never its node
+# id. Discovery below may replace this; a caller who passed --perf-target has settled it.
+if [ -z "$PERF_TARGET" ]; then
+  PERF_TARGET="$TEST_FILE"
+fi
+# The runner is DECLARED by the caller, not derived here. Reading the target and deciding
+# whether pytest can collect it is judgement, and judgement belongs in the prompt -- but a
+# declaration is not a measurement, so the report records which of the two it got. A reader who
+# cannot tell "the validator determined this" from "the caller asserted this" cannot weigh a
+# runner-caused failure correctly, and that failure gets charged to the PR author.
+TARGET_RUNNER="none"
+TARGET_RUNNER_REASON=""
+TARGET_RUNNER_BASIS=""
+if [ ! -f "$TARGET_PATH" ]; then
+  TARGET_RUNNER="none"
+  TARGET_RUNNER_REASON="target file does not exist on head"
+  TARGET_RUNNER_BASIS="target-missing"
+elif [ "$TESTS" != "${TESTS%%::*}" ]; then
+  # A `path::node` selector is not a judgement about the file; nothing can run that string as a
+  # script. This one fact stays here because it is syntax, not analysis.
+  TARGET_RUNNER="pytest"
+  TARGET_RUNNER_REASON="explicit pytest node selector"
+  TARGET_RUNNER_BASIS="explicit-node-selector"
+elif [ -n "$RUNNER_OVERRIDE" ]; then
   case "$RUNNER_OVERRIDE" in
-    pytest|script)
-      if [ "$RUNNER_OVERRIDE" != "$TARGET_RUNNER" ]; then
-        TARGET_RUNNER_REASON="caller forced --runner $RUNNER_OVERRIDE (structural selection said $TARGET_RUNNER: $TARGET_RUNNER_REASON)"
-        TARGET_RUNNER="$RUNNER_OVERRIDE"
-        jset_string "test_selection.runner" "$TARGET_RUNNER"
-      fi
-      ;;
-    *) echo "--runner must be pytest or script" >&2; exit 2;;
+    pytest|script|none) TARGET_RUNNER="$RUNNER_OVERRIDE" ;;
+    *) echo "--runner must be pytest, script, or none" >&2; exit 2;;
   esac
-fi
-jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
-TARGET_RUNNER_RISK=$(python3 -c \
-  'import json,sys; print(json.loads(sys.argv[1]).get("runner_risk",""))' "$RUNNER_JSON")
-if [ -n "$TARGET_RUNNER_RISK" ]; then
-  jset_string "test_selection.runner_risk" "$TARGET_RUNNER_RISK"
-fi
-# Two independent channels can carry the S1 grid: the target's own CLI flag (--shape-arg)
-# and an environment variable it reads (--shape-env). They are probed separately and the
-# results are combined, because a caller who supplies both is describing one target that has
-# both -- and an earlier version let the env probe's result overwrite the CLI probe's
-# unconditionally, so supplying both DISCARDED a working CLI channel and then reported the
-# env channel's absence as the reason no grid ran.
-GRID_HOOK_CLI=0
-GRID_HOOK_ENV=0
-GRID_HOOK_OK=0
-GRID_CHANNEL=""
-if [ -n "$SHAPE_ARG" ] && [ -n "$GRID" ] && [ "$TARGET_RUNNER" = "script" ] \
-    && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  GRID_HOOK_CLI=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" <<'PY'
-import ast
-import sys
-
-tree = ast.parse(open(sys.argv[1], encoding='utf-8').read())
-flag = sys.argv[2]
-found = False
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    if getattr(node.func, "attr", "") != "add_argument":
-        continue
-    for arg in node.args:
-        if isinstance(arg, ast.Constant) and arg.value == flag:
-            found = True
-print(int(found))
-PY
-)
-fi
-if [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ] \
-    && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  GRID_HOOK_ENV=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ENV" <<'PY'
-import ast
-import sys
-
-tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
-name = sys.argv[2]
-
-def attr_path(node):
-    parts = []
-    while isinstance(node, ast.Attribute):
-        parts.append(node.attr)
-        node = node.value
-    if isinstance(node, ast.Name):
-        parts.append(node.id)
-    return tuple(reversed(parts))
-
-found = False
-for node in ast.walk(tree):
-    if isinstance(node, ast.Call) and node.args:
-        path = attr_path(node.func)
-        key = node.args[0]
-        if (
-            path in {("os", "getenv"), ("os", "environ", "get")}
-            and isinstance(key, ast.Constant)
-            and key.value == name
-        ):
-            found = True
-            break
-    if isinstance(node, ast.Subscript) and attr_path(node.value) == ("os", "environ"):
-        key = node.slice
-        if isinstance(key, ast.Constant) and key.value == name:
-            found = True
-            break
-print(int(found))
-PY
-)
-fi
-
-GRID_HOOK_PYTEST=0
-GRID_PYTEST_REFUSAL=""
-if [ -n "$SHAPE_ARGNAMES" ] && [ -n "$GRID" ] && [ "$TARGET_RUNNER" = "pytest" ] \
-    && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  # Held to the same standard of proof as the other two channels: the names must actually be
-  # parameters of a test the file defines, or bound by a parametrize mark it declares. A name
-  # the file does not take would append a parametrization nothing consumes.
-  GRID_PYTEST_PROBE=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARGNAMES" <<'PY'
-import ast
-import sys
-
-tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
-wanted = {name.strip() for name in sys.argv[2].split(",") if name.strip()}
-
-def mark_names(call):
-    if not call.args:
-        return set()
-    first = call.args[0]
-    if isinstance(first, ast.Constant) and isinstance(first.value, str):
-        return {part.strip() for part in first.value.split(",") if part.strip()}
-    if isinstance(first, (ast.List, ast.Tuple)):
-        return {
-            str(e.value) for e in first.elts if isinstance(e, ast.Constant)
-        }
-    return set()
-
-
-def mark_values_are_scalar(call):
-    """Do this mark's own values look like the scalar cells a grid can express?
-
-    The gate used to read only the argnames. A target parametrizing a single `case: dict`
-    therefore passed it, the validator substituted integers, and the target raised
-    `TypeError: 'int' object is not subscriptable` -- which the executor published as
-    "the PR adds this target and its independent shape grid fails", a BLOCK against an author
-    whose own suite was 138 passed in the same report. SKILL.md already documented that such
-    targets stay INCONCLUSIVE; this is that promise implemented rather than asserted.
-
-    Unknown-shaped values (a module constant, a call) are treated as NOT scalar. A grid this
-    channel cannot express must cost an INCONCLUSIVE, never a blocker aimed at the author.
-    """
-    if len(call.args) < 2:
-        return False
-    values = call.args[1]
-    if not isinstance(values, (ast.List, ast.Tuple)):
-        return False
-    if not values.elts:
-        return False
-    for row in values.elts:
-        cells = row.elts if isinstance(row, (ast.List, ast.Tuple)) else [row]
-        for cell in cells:
-            if isinstance(cell, ast.Constant):
-                continue
-            if isinstance(cell, ast.UnaryOp) and isinstance(cell.operand, ast.Constant):
-                continue
-            return False
-    return True
-
-
-# Decided per test function, exactly as the plugin decides per metafunc. A file-wide check
-# let one unrelated test's overlapping mark disable the channel for the whole file.
-reachable = False
-refusal = ""
-for node in ast.walk(tree):
-    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        continue
-    if not node.name.startswith("test"):
-        continue
-    args = node.args
-    names = {
-        a.arg for a in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs)
-    }
-    marks = [
-        d for d in node.decorator_list
-        if isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "parametrize"
-    ]
-    bound_all = set()
-    blocked = False
-    reason = ""
-    for mark in marks:
-        bound = mark_names(mark)
-        bound_all |= bound
-        if (bound & wanted) and not (bound <= wanted):
-            blocked = True
-            reason = f"the target parametrises {sorted(bound)} together, so name all of them or none"
-        if (bound & wanted) and not mark_values_are_scalar(mark):
-            blocked = True
-            reason = "the target's own parametrize values are not scalar cells (a dict or object per case), which a shape grid cannot express"
-    if wanted <= (names | bound_all) and not blocked:
-        reachable = True
-        break
-    if wanted <= (names | bound_all) and reason and not refusal:
-        # The names ARE present; something else refused. Saying "does not take all of these as
-        # test parameters" when it does sends the caller to fix a spelling that was correct.
-        refusal = reason
-print(int(bool(wanted) and reachable), refusal)
-raise SystemExit(0)
-
-available = set()
-for node in ast.walk(tree):
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        if node.name.startswith("test"):
-            args = node.args
-            for arg in list(args.posonlyargs) + list(args.args) + list(args.kwonlyargs):
-                available.add(arg.arg)
-partial = False
-for node in ast.walk(tree):
-    if isinstance(node, ast.Call):
-        func = node.func
-        if getattr(func, "attr", "") == "parametrize" and node.args:
-            first = node.args[0]
-            bound = set()
-            if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                bound = {part.strip() for part in first.value.split(",") if part.strip()}
-            elif isinstance(first, (ast.List, ast.Tuple)):
-                bound = {
-                    str(element.value)
-                    for element in first.elts
-                    if isinstance(element, ast.Constant)
-                }
-            available |= bound
-            # A mark binding the wanted names together with others cannot be replaced without
-            # leaving those others unfilled, so the plugin refuses it. Refuse here too, or the
-            # channel is reported established and the run then fails for an unrelated reason.
-            if (bound & wanted) and not (bound <= wanted):
-                partial = True
-print(int(bool(wanted) and wanted <= available and not partial))
-PY
-)
-  GRID_HOOK_PYTEST=${GRID_PYTEST_PROBE%% *}
-  GRID_PYTEST_REFUSAL=${GRID_PYTEST_PROBE#* }
-  [ "$GRID_PYTEST_REFUSAL" = "$GRID_PYTEST_PROBE" ] && GRID_PYTEST_REFUSAL=""
-fi
-
-# Combine. The CLI channel is preferred when both probe positive, because the caller named the
-# flag explicitly and a flag the target parses is stronger evidence than a variable it reads.
-if [ "$GRID_HOOK_CLI" -eq 1 ]; then
-  GRID_HOOK_OK=1
-  GRID_CHANNEL="cli"
-elif [ "$GRID_HOOK_ENV" -eq 1 ]; then
-  GRID_HOOK_OK=1
-  GRID_CHANNEL="env"
-elif [ "$GRID_HOOK_PYTEST" -eq 1 ]; then
-  GRID_HOOK_OK=1
-  GRID_CHANNEL="pytest"
-fi
-jset_string "test_selection.grid_channel" "$GRID_CHANNEL"
-# The reason a grid did not run must name which channel was tried and what was found, so a
-# caller can tell "this target has no shape channel" from "the channel I named is not the one
-# this target has" -- and so a limit of the validator is never published as a property of the
-# target.
-GRID_CHANNEL_REASON=""
-if [ -n "$GRID" ] && [ "$GRID_HOOK_OK" -ne 1 ]; then
-  if [ -z "$SHAPE_ARG" ] && [ -z "$SHAPE_ENV" ] && [ -z "$SHAPE_ARGNAMES" ]; then
-    GRID_CHANNEL_REASON="a grid was supplied but neither --shape-arg nor --shape-env named a channel to deliver it through"
-  else
-    GRID_CHANNEL_REASON="grid channel not established:"
-    if [ -n "$SHAPE_ARG" ]; then
-      if [ "$TARGET_RUNNER" != "script" ]; then
-        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON --shape-arg '"'"'$SHAPE_ARG'"'"' was ignored because the target runs under $TARGET_RUNNER and the CLI channel is wired only for script targets (a validator limit, not a target property);"
-      else
-        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON '"'"'$SHAPE_ARG'"'"' is not passed to add_argument in $TEST_FILE;"
-      fi
-    fi
-    if [ -n "$SHAPE_ENV" ]; then
-      GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $TEST_FILE does not read \$$SHAPE_ENV;"
-    fi
-    if [ -n "$SHAPE_ARGNAMES" ]; then
-      if [ "$TARGET_RUNNER" != "pytest" ]; then
-        GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON --shape-argnames needs a pytest target and this one runs under $TARGET_RUNNER;"
-      else
-        if [ -n "$GRID_PYTEST_REFUSAL" ]; then
-          GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $GRID_PYTEST_REFUSAL;"
-        else
-          GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON $TEST_FILE does not take all of '"'"'$SHAPE_ARGNAMES'"'"' as test parameters;"
-        fi
-      fi
-    fi
-  fi
-fi
-if [ -n "$GRID_CHANNEL_REASON" ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  GRID_CHANNEL_OFFERS=$(python3 - "$REPO_WT/$TEST_FILE" <<'PY'
-import ast
-
-import sys
-
-tree = ast.parse(open(sys.argv[1], encoding="utf-8").read())
-env, flags, argnames = set(), set(), set()
-for node in ast.walk(tree):
-    if isinstance(node, ast.Call):
-        func = node.func
-        parts = []
-        walk = func
-        while isinstance(walk, ast.Attribute):
-            parts.append(walk.attr)
-            walk = walk.value
-        if isinstance(walk, ast.Name):
-            parts.append(walk.id)
-        path = tuple(reversed(parts))
-        if path in {("os", "getenv"), ("os", "environ", "get")} and node.args:
-            key = node.args[0]
-            if isinstance(key, ast.Constant):
-                env.add(str(key.value))
-        if getattr(func, "attr", "") == "add_argument":
-            for arg in node.args:
-                if isinstance(arg, ast.Constant) and str(arg.value).startswith("-"):
-                    flags.add(str(arg.value))
-        if getattr(func, "attr", "") == "parametrize" and node.args:
-            first = node.args[0]
-            if isinstance(first, ast.Constant) and isinstance(first.value, str):
-                argnames.add(",".join(p.strip() for p in first.value.split(",")))
-            elif isinstance(first, (ast.List, ast.Tuple)):
-                argnames.add(
-                    ",".join(
-                        str(e.value) for e in first.elts if isinstance(e, ast.Constant)
-                    )
-                )
-    if isinstance(node, ast.Subscript):
-        walk, parts = node.value, []
-        while isinstance(walk, ast.Attribute):
-            parts.append(walk.attr)
-            walk = walk.value
-        if isinstance(walk, ast.Name):
-            parts.append(walk.id)
-        if tuple(reversed(parts)) == ("os", "environ"):
-            key = node.slice
-            if isinstance(key, ast.Constant):
-                env.add(str(key.value))
-
-offers = []
-if env:
-    offers.append("--shape-env candidates: " + ", ".join(sorted(env)))
-if flags:
-    offers.append("--shape-arg candidates: " + ", ".join(sorted(flags)))
-if argnames:
-    offers.append(
-        "--shape-argnames candidates: " + "; ".join(sorted(a for a in argnames if a))
-    )
-print(" | ".join(offers) if offers else "this target exposes no shape channel of any kind")
-PY
-)
-  GRID_CHANNEL_REASON="$GRID_CHANNEL_REASON what this target does offer -> $GRID_CHANNEL_OFFERS"
-fi
-jset_string "test_selection.grid_channel_reason" "$GRID_CHANNEL_REASON"
-# ---- Is the grid actually independent of what the target already runs?
-#
-# A proven hook says the target CONSUMES the grid. It says nothing about whether the grid
-# asks for anything the target would not have run anyway. On ROCm/aiter#4538 all three
-# requested shapes were already in the target's own `--shapes` default list, so the "S1
-# grid" re-ran a strict subset of the repository run and the report presented it as
-# independent coverage -- the exact duplication SKILL.md says this stage exists to prevent.
-# The check is a comparison against the target's own declared defaults for the same flag, so
-# it is a property of the request and the target, not of any one repository.
-GRID_INDEPENDENCE="unknown"
-# The default reason must describe THIS run, not a hypothetical target. Publishing "the
-# channel exposes no declared defaults" whenever the comparison did not happen states a
-# fact about the target that the run never established -- observed on ROCm/aiter#5172,
-# whose `-c` flag does declare a default list, while the channel had been demoted for an
-# unrelated reason. Say which of the several ways this comparison can be skipped applied.
-if [ -z "$GRID" ]; then
-  GRID_INDEPENDENCE_REASON="no shape grid was requested, so there was nothing to compare"
-elif [ "$GRID_CHANNEL" != "cli" ]; then
-  GRID_INDEPENDENCE_REASON="independence is only computed for the CLI-flag channel (this run established '${GRID_CHANNEL:-none}'); the target's own defaults were not read"
-elif [ "$GRID_HOOK_OK" -ne 1 ]; then
-  GRID_INDEPENDENCE_REASON="the shape flag's hook was not established, so the target's own defaults were not read"
+  TARGET_RUNNER_REASON="${RUNNER_REASON:-declared by the caller, which stated no reason}"
+  TARGET_RUNNER_BASIS="declared-by-caller"
 else
-  GRID_INDEPENDENCE_REASON="the target file is not present, so its defaults could not be read"
+  # Refusing to guess is the whole point. A default of "pytest" here is what published a
+  # collection error as the PR's test failing on head.
+  TARGET_RUNNER="none"
+  TARGET_RUNNER_REASON="no --runner was declared for this target, so it was not run"
+  TARGET_RUNNER_BASIS="undeclared"
 fi
-if [ -n "$GRID" ] && [ "$GRID_CHANNEL" = "cli" ] \
-    && [ "$GRID_HOOK_OK" -eq 1 ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
-  GRID_INDEPENDENCE_JSON=$(python3 - "$REPO_WT/$TEST_FILE" "$SHAPE_ARG" "$GRID" <<'PY'
-import ast
-import json
-import sys
+jset_string "test_selection.runner" "$TARGET_RUNNER"
+jset_string "test_selection.runner_reason" "$TARGET_RUNNER_REASON"
+jset_string "test_selection.runner_basis" "$TARGET_RUNNER_BASIS"
 
-path, flag, grid = sys.argv[1:4]
-requested = [cell.strip() for cell in grid.split(";") if cell.strip()]
-
-
-def literal_cells(node):
-    """Render an add_argument default as the argv spellings it stands for."""
-    try:
-        value = ast.literal_eval(node)
-    except (ValueError, SyntaxError):
-        return None
-    if not isinstance(value, (list, tuple)):
-        value = [value]
-    cells = []
-    for item in value:
-        if isinstance(item, (list, tuple)):
-            cells.append(",".join(str(part) for part in item))
-        else:
-            cells.append(str(item))
-    return cells
-
-
-defaults = None
-tree = ast.parse(open(path, encoding="utf-8").read())
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    if getattr(node.func, "attr", "") != "add_argument":
-        continue
-    if not any(
-        isinstance(arg, ast.Constant) and arg.value == flag for arg in node.args
-    ):
-        continue
-    for keyword in node.keywords:
-        if keyword.arg == "default":
-            defaults = literal_cells(keyword.value)
-
-if defaults is None:
-    print(json.dumps({
-        "independence": "unknown",
-        "reason": f"the target declares no literal default for {flag}",
-    }))
-    raise SystemExit(0)
-
-novel = [cell for cell in requested if cell not in defaults]
-if not requested:
-    result = {"independence": "unknown", "reason": "no grid cells were requested"}
-elif not novel:
-    result = {
-        "independence": "duplicates-target-defaults",
-        "reason": (
-            f"every requested cell is already in the target's own {flag} default "
-            f"({', '.join(requested)}); this grid re-runs a subset of the repository "
-            "target and is not an independent control"
-        ),
-        "target_defaults": defaults,
-        "novel_cells": [],
-    }
-else:
-    result = {
-        "independence": "adds-coverage",
-        "reason": (
-            f"{len(novel)} of {len(requested)} requested cells are outside the target's "
-            f"own {flag} default: {', '.join(novel)}"
-        ),
-        "target_defaults": defaults,
-        "novel_cells": novel,
-    }
-print(json.dumps(result))
-PY
-)
-  GRID_INDEPENDENCE=$(python3 -c \
-    'import json,sys; print(json.loads(sys.argv[1])["independence"])' \
-    "$GRID_INDEPENDENCE_JSON")
-  GRID_INDEPENDENCE_REASON=$(python3 -c \
-    'import json,sys; print(json.loads(sys.argv[1])["reason"])' \
-    "$GRID_INDEPENDENCE_JSON")
+# Which of the two kinds of evidence this run is about to gather. The status was captured at
+# stage 1, when it still described the patch alone.
+# `-n "$PATCHF"` and not PATCH_APPLIED: the latter tracks a liability -- whether this process
+# still owes the caller a revert -- and it is toggled by every phase switch. The question here is
+# the immutable one, whether a patch was supplied at all.
+if [ -n "$PATCHF" ]; then
+  PROVENANCE_OUT=$(printf '%s' "$PATCH_STATUS" \
+    | "$SCRIPT_DIR/target_run.py" provenance "$TEST_FILE" --patch-supplied)
+else
+  PROVENANCE_OUT=$("$SCRIPT_DIR/target_run.py" provenance "$TEST_FILE" </dev/null)
 fi
-jset_string "test_selection.grid_independence" "$GRID_INDEPENDENCE"
-jset_string "test_selection.grid_independence_reason" "$GRID_INDEPENDENCE_REASON"
+TEST_PROVENANCE=${PROVENANCE_OUT%%$'\n'*}
+TEST_PROVENANCE_REASON=${PROVENANCE_OUT#*$'\n'}
+jset_string "test_selection.test_provenance" "$TEST_PROVENANCE"
+jset_string "test_selection.test_provenance_reason" "$TEST_PROVENANCE_REASON"
+# Not a defect, and deliberately not a should-fix: a PR is entitled to bring its own test, and
+# whether that test is a good one is a reading, which belongs to review-pr. What the report owes
+# the reader is the fact that the evidence and the code under review came from the same hand.
+if [ "$TEST_PROVENANCE" = "pr-added" ] || [ "$TEST_PROVENANCE" = "pr-modified" ]; then
+  finding "note" "correctness" \
+    "the evidence is not independent of the change: $TEST_PROVENANCE_REASON"
+fi
 
-# ---- Extra axes.
+# ---------- which file gets timed ----------
+# Two places a perf target comes from, and this commit implements the first: a bench the PR
+# itself ships. Run here, and not later beside the timing runs, because here the patch is
+# still applied -- the base phase reverses it out further down, and a bench the PR adds is
+# not in the tree once that happens.
 #
-# Parsed and structurally proven here, next to the shape channel, because they obey the same
-# rule: a channel is credited only when the target's own source declares it, and it is
-# believed only after the target has been observed REFUSING a deliberately invalid value.
-# The difference from --grid is arity, not trust: --grid is one tuple on one flag, an axis is
-# one named knob on its own flag, and a target's failing configuration frequently lives on a
-# knob the shape flag cannot reach.
-AXIS_STATE="none"
-AXIS_STATE_REASON="no extra axes were requested"
-if [ "${#AXES[@]}" -gt 0 ]; then
-  if [ "$TARGET_RUNNER" != "script" ]; then
-    AXIS_STATE="unusable"
-    AXIS_STATE_REASON="extra axes reach script targets only (this target runs under $TARGET_RUNNER)"
-  elif [ ! -f "$REPO_WT/$TEST_FILE" ]; then
-    AXIS_STATE="unusable"
-    AXIS_STATE_REASON="the target file is not present, so no axis flag could be proven"
-  else
-    AXIS_STATE="declared"
-    AXIS_STATE_REASON="${#AXES[@]} axis/axes requested"
+# `--no-perf` skips the search outright: reading every file the patch touched to answer a
+# question nobody asked is work, and the answer would go into a stage that reports `skip`.
+PERF_TARGET_BASIS_REASON=""
+PERF_CANDIDATES="[]"
+# What the patch changed, as discovery saw it. Carried to the stage so "nothing timed this"
+# can be told apart from "there was nothing here to time": the first is a gap the author can
+# close, the second is not a finding at all.
+PERF_KERNEL_MODULES="[]"
+PERF_NATIVE_PATHS="[]"
+PERF_TARGETS=("$PERF_TARGET")
+PERF_TARGET_BASES=("$PERF_TARGET_BASIS")
+PERF_TARGET_BASIS_REASONS=("")
+if [ "$PERF_TARGET_BASIS" != "declared-by-caller" ] && [ "$PERF_ENABLED" -eq 1 ]; then
+  PERF_DISCOVERY=$(printf '%s' "$PATCH_STATUS" \
+    | "$SCRIPT_DIR/scrape_perf.py" discover \
+      --root "$REPO_WT" --correctness-target "$TEST_FILE" --patch "$PATCHF")
+  if [ -n "$PERF_DISCOVERY" ]; then
+    PERF_TARGETS=()
+    PERF_TARGET_BASES=()
+    PERF_TARGET_BASIS_REASONS=()
+    # Both paths are timed when both resolve. The count comes from the discovery blob rather
+    # than from reading indices until one is empty, which cannot tell "past the end" from
+    # "this field is blank".
+    PERF_TARGET_COUNT=$(stats_field "$PERF_DISCOVERY" target_count)
+    for ((_i = 0; _i < PERF_TARGET_COUNT; _i++)); do
+      PERF_TARGETS+=("$(stats_field "$PERF_DISCOVERY" "targets.$_i.target")")
+      PERF_TARGET_BASES+=("$(stats_field "$PERF_DISCOVERY" "targets.$_i.basis")")
+      PERF_TARGET_BASIS_REASONS+=("$(stats_field "$PERF_DISCOVERY" "targets.$_i.reason")")
+    done
+    PERF_TARGET="${PERF_TARGETS[0]}"
+    PERF_TARGET_BASIS="${PERF_TARGET_BASES[0]}"
+    PERF_TARGET_BASIS_REASON="${PERF_TARGET_BASIS_REASONS[0]}"
+    PERF_CANDIDATES=$(python3 "$TARGET_TOOL" stats-field --json "$PERF_DISCOVERY" candidates)
+    PERF_KERNEL_MODULES=$(python3 "$TARGET_TOOL" \
+      stats-field --json "$PERF_DISCOVERY" kernel_modules)
+    PERF_NATIVE_PATHS=$(python3 "$TARGET_TOOL" \
+      stats-field --json "$PERF_DISCOVERY" native_paths)
   fi
 fi
-AXIS_UNPROVEN=""
-if [ "${#AXES[@]}" -gt 0 ]; then
-  # Record what was ASKED FOR before deciding whether it could be honoured. An empty `axes`
-  # beside a non-`none` axis_state loses the request itself: a reader could not see that a
-  # head-count axis had been requested and dropped -- which is precisely the silently
-  # narrowed test space this stage exists to make visible.
-  AXIS_REPORT=$(python3 - "${AXES[@]}" <<'PY'
-import json
-import sys
 
-axes = []
-for spec in sys.argv[1:]:
-    name, _, rest = spec.partition("=")
-    flag, _, values = rest.partition(":")
-    axes.append({
-        "name": name.strip(),
-        "flag": flag.strip(),
-        "values": [cell.strip() for cell in values.split(";") if cell.strip()],
-        "hook_proof": "not-evaluated",
-    })
-print(json.dumps(axes))
-PY
-)
-fi
-if [ "$AXIS_STATE" = "declared" ]; then
-  AXIS_REPORT=$(python3 - "$REPO_WT/$TEST_FILE" "${AXES[@]}" <<'PY'
-import ast
-import json
-import sys
-
-path = sys.argv[1]
-tree = ast.parse(open(path, encoding="utf-8").read())
-
-declared = {}
-for node in ast.walk(tree):
-    if not isinstance(node, ast.Call):
-        continue
-    if getattr(node.func, "attr", "") != "add_argument":
-        continue
-    flags = [a.value for a in node.args if isinstance(a, ast.Constant)]
-    default = None
-    for keyword in node.keywords:
-        if keyword.arg == "default":
-            try:
-                default = ast.literal_eval(keyword.value)
-            except (ValueError, SyntaxError):
-                default = None
-    for flag in flags:
-        declared[flag] = default
-
-axes = []
-for spec in sys.argv[2:]:
-    name, _, rest = spec.partition("=")
-    flag, _, values = rest.partition(":")
-    cells = [cell.strip() for cell in values.split(";") if cell.strip()]
-    entry = {
-        "name": name.strip(),
-        "flag": flag.strip(),
-        "values": cells,
-        # `hook_proof` is the STRUCTURAL half only. Nothing downstream may treat it as
-        # consumption: the runtime refusal probe decides that, exactly as for --shape-arg.
-        "hook_proof": "flag-declared-in-add_argument"
-        if flag.strip() in declared
-        else "flag-not-declared",
-    }
-    if not entry["name"] or not entry["flag"] or not cells:
-        entry["hook_proof"] = "malformed-axis-spec"
-    if entry["hook_proof"] == "flag-declared-in-add_argument":
-        default = declared.get(entry["flag"])
-        if default is not None:
-            rendered = default if isinstance(default, (list, tuple)) else [default]
-            rendered = [str(item) for item in rendered]
-            entry["target_defaults"] = rendered
-            novel = [cell for cell in cells if cell not in rendered]
-            entry["novel_values"] = novel
-            entry["independence"] = (
-                "adds-coverage" if novel else "duplicates-target-defaults"
-            )
-        else:
-            entry["independence"] = "unknown"
-    axes.append(entry)
-
-print(json.dumps(axes))
-PY
-)
-  AXIS_UNPROVEN=$(python3 -c '
-import json
-import sys
-
-axes = json.loads(sys.argv[1])
-bad = [a["name"] or "(unnamed)" for a in axes
-       if a["hook_proof"] != "flag-declared-in-add_argument"]
-print(",".join(bad))
-' "$AXIS_REPORT")
-  if [ -n "$AXIS_UNPROVEN" ]; then
-    AXIS_STATE="hook-not-found"
-    AXIS_STATE_REASON="the target declares no argparse flag for: $AXIS_UNPROVEN"
-  else
-    while IFS= read -r token; do
-      [ -n "$token" ] && AXIS_CLI+=("$token")
-    done < <(python3 -c '
-import json
-import sys
-
-for axis in json.loads(sys.argv[1]):
-    print(axis["flag"])
-    for value in axis["values"]:
-        print(value)
-' "$AXIS_REPORT")
+# The same question test_provenance asks, asked of every file the timing runs will execute. It
+# is the same pure function against the same snapshot -- a perf target is a target, and "did
+# the patch write this?" has one answer however the file is used. Reusing it also inherits the
+# honesty that no patch means `unknown` rather than a cheerful `pre-existing`.
+PERF_TARGET_PROVENANCES=()
+PERF_TARGET_PROVENANCE_REASONS=()
+for _target in "${PERF_TARGETS[@]}"; do
+  if [ "$_target" = "$TEST_FILE" ]; then
+    PERF_TARGET_PROVENANCES+=("$TEST_PROVENANCE")
+    PERF_TARGET_PROVENANCE_REASONS+=("$TEST_PROVENANCE_REASON")
+    continue
   fi
-fi
-jset_json "test_selection.axes" "$AXIS_REPORT"
-jset_string "test_selection.axis_state" "$AXIS_STATE"
-jset_string "test_selection.axis_state_reason" "$AXIS_STATE_REASON"
+  if [ -n "$PATCHF" ]; then
+    PERF_PROVENANCE_OUT=$(printf '%s' "$PATCH_STATUS" \
+      | "$SCRIPT_DIR/target_run.py" provenance "$_target" --patch-supplied)
+  else
+    PERF_PROVENANCE_OUT=$("$SCRIPT_DIR/target_run.py" provenance "$_target" </dev/null)
+  fi
+  PERF_TARGET_PROVENANCES+=("${PERF_PROVENANCE_OUT%%$'\n'*}")
+  PERF_TARGET_PROVENANCE_REASONS+=("${PERF_PROVENANCE_OUT#*$'\n'}")
+done
+PERF_TARGET_PROVENANCE="${PERF_TARGET_PROVENANCES[0]}"
+PERF_TARGET_PROVENANCE_REASON="${PERF_TARGET_PROVENANCE_REASONS[0]}"
 
 # Runs the selected target once, whatever its runner is -- the name predates script targets.
-# The second argument is the grid VALUE, not an env assignment: the channel is decided by
-# the channel that probed positive. It used to take "$SHAPE_ENV=$GRID" and re-split on the
-# first `=`, which
-# worked for a CLI-only run only because an unset SHAPE_ENV left a leading `=` that the split
-# then removed -- the shapes were travelling inside a string shaped like the channel they were
-# not using.
 run_pytest() {
   local label="$1"
-  local grid_value="$2"
   local log="$WORK/$TARGET_RUNNER-$label.log"
   local phase=${label%%-*}
   local cache_root="$WORK/$phase"
   local junit="$cache_root/junit-$label.xml"
-  # Per LABEL, not per phase. head-repo and head-grid share a phase directory, so a grid run
-  # that died during collection overwrote the receipt head-repo had already written and the
-  # report claimed the route never executed -- erasing evidence that had been collected.
+  # Per LABEL, not per phase. Two runs sharing a phase directory would otherwise have the
+  # second overwrite the receipt the first had already written, and the report would claim
+  # the route never executed -- erasing evidence that had been collected.
   local receipt="$cache_root/execution-receipt-$label.json"
   mkdir -p "$cache_root/home" "$cache_root/xdg-cache" \
     "$cache_root/flydsl-cache" "$cache_root/triton-cache" \
@@ -1786,20 +1050,8 @@ run_pytest() {
     "$cache_root/aiter-jit"
   rm -f "$junit" "$receipt"
   if [ "$TARGET_RUNNER" = "pytest" ] || [ -n "$EXPECTED_ROUTE" ]; then
-    python3 - "$SCRIPT_DIR/validation_probe.py" \
-      "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt" <<'PY'
-import pathlib
-import sys
-
-source, output, route, shape_vars, receipt = sys.argv[1:6]
-text = pathlib.Path(source).read_text()
-text += (
-    f"\n_VALIDATION_EXPECTED_ROUTE = {route!r}\n"
-    f"_VALIDATION_SHAPE_VARS = {shape_vars!r}\n"
-    f"_VALIDATION_RECEIPT_PATH = {receipt!r}\n"
-)
-pathlib.Path(output).write_text(text)
-PY
+    python3 "$TARGET_TOOL" probe-module "$SCRIPT_DIR/validation_probe.py" \
+      "$PROBE_DIR/$PROBE_MODULE.py" "$EXPECTED_ROUTE" "$SHAPE_VARS" "$receipt"
   fi
   local -a environment=(
     "HIP_VISIBLE_DEVICES=$PICK"
@@ -1814,107 +1066,13 @@ PY
     "AITER_JIT_DIR=$cache_root/aiter-jit"
     "VALIDATION_PHASE=$label"
   )
-  # The pytest channel needs its plugin generated per run, with the grid baked in, so the
-  # tested PR can neither read nor forge it.
-  local -a shape_plugin=()
-  if [ "$GRID_CHANNEL" = "pytest" ] && [ -n "$grid_value" ]; then
-    local _grid_value="$grid_value"
-    # Remove first: a generator that fails must not leave the PREVIOUS phase's plugin in
-    # place, or the next phase silently re-runs the grid it was carrying.
-    rm -f "$PROBE_DIR/${PROBE_MODULE}_shapes.py"
-    python3 - "$SCRIPT_DIR/shape_grid_plugin.py" \
-      "$PROBE_DIR/${PROBE_MODULE}_shapes.py" "$SHAPE_ARGNAMES" "$_grid_value" <<'PY'
-import pathlib
-import sys
-
-source, output, argnames, grid = sys.argv[1:5]
-names = tuple(part.strip() for part in argnames.split(",") if part.strip())
-SENTINEL = "__VALIDATOR_INVALID_GRID__"
-if grid.strip() == SENTINEL:
-    # The invalid-grid probe must reach the TARGET, not crash the plugin. A row of the wrong
-    # arity would raise inside pytest's parametrize and the non-zero exit would credit the
-    # channel without the target ever having consumed a shape. Keep the arity, poison the
-    # values: the target then fails on its own, which is the evidence the probe is for.
-    rows = [tuple(SENTINEL for _ in names)]
-else:
-    rows = [
-        tuple(cell.strip() for cell in row.split(","))
-        for row in grid.split(";")
-        if row.strip()
-    ]
-bad = [row for row in rows if len(row) != len(names)]
-if bad:
-    raise SystemExit(
-        f"grid rows must have {len(names)} cells to match --shape-argnames "
-        f"{','.join(names)}; offending rows: {bad}"
-    )
-# Cells arrive as text. Anything that is an integer is passed as one, because a test that
-# indexes or allocates with a shape argument needs an int, not "128". Everything else is left
-# as the string the caller wrote, which is what a dtype argument wants.
-def _coerce(cell):
-    if cell in ("True", "False"):
-        # Before this, "False" reached the target as a non-empty string, which is truthy, and
-        # every row of a boolean dimension silently ran the True branch.
-        return cell == "True"
-    if cell in ("None", "none"):
-        return None
-    try:
-        return int(cell)
-    except ValueError:
-        pass
-    try:
-        return float(cell)
-    except ValueError:
-        return cell
-
-rows = [tuple(_coerce(cell) for cell in row) for row in rows]
-text = pathlib.Path(source).read_text()
-text += (
-    f"\n_VALIDATION_SHAPE_ARGNAMES = {names!r}\n"
-    f"_VALIDATION_SHAPE_GRID = {rows!r}\n"
-)
-pathlib.Path(output).write_text(text)
-PY
-    if [ ! -s "$PROBE_DIR/${PROBE_MODULE}_shapes.py" ]; then
-      echo "shape plugin generation failed for $label" >&2
-      printf '%s|%s\n' 2 "$log"
-      return 0
-    fi
-    shape_plugin=(-p "${PROBE_MODULE}_shapes")
-    # The plugin now carries the grid; nothing may also send it on argv or in the env.
-    grid_value=""
-  fi
-  local -a shape_cli=()
-  # Dispatch on the channel that actually probed positive, not on "--shape-arg was supplied".
-  # With both flags given and only the env channel real, the old condition still routed the
-  # grid through the CLI flag the target does not parse.
-  if [ -n "$grid_value" ] && [ "$GRID_CHANNEL" = "cli" ]; then
-    shape_cli=("$SHAPE_ARG")
-    local _old_ifs="$IFS"
-    IFS=';'
-    for _shape in $grid_value; do
-      [ -n "$_shape" ] && shape_cli+=("$_shape")
-    done
-    IFS="$_old_ifs"
-  elif [ -n "$grid_value" ] && [ "$GRID_CHANNEL" = "env" ]; then
-    environment+=("$SHAPE_ENV=$grid_value")
-  fi
-  # Extra axes ride on the same argv as the shape grid, so the run that carries the grid is
-  # the run that carries the axes and one receipt describes both. AXIS_CLI_OVERRIDE exists
-  # only for the per-axis refusal probes, which must send one deliberately invalid value and
-  # nothing else.
-  if [ "${#AXIS_CLI_OVERRIDE[@]}" -gt 0 ]; then
-    shape_cli+=("${AXIS_CLI_OVERRIDE[@]}")
-  elif [ -n "$grid_value" ] && [ "${#AXIS_CLI[@]}" -gt 0 ] \
-      && [ "$GRID_CHANNEL" = "cli" ]; then
-    shape_cli+=("${AXIS_CLI[@]}")
-  fi
+  # A script target is invoked bare: the shapes it runs are its own, and the validator has
+  # nothing to add to its argv.
   if [ "$TARGET_RUNNER" = "pytest" ]; then
     (
       cd "$REPO_WT" \
         && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
-          "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "${shape_plugin[@]}" \
-            "$TESTS" -x -q \
+          "$TARGET_PYTHON" -m pytest -p "$PROBE_MODULE" "$TESTS" -x -q \
             --junitxml="$junit" -o "cache_dir=$cache_root/pytest-cache"
     ) >"$log" 2>&1
   elif [ -n "$EXPECTED_ROUTE" ]; then
@@ -1922,60 +1080,35 @@ PY
       cd "$REPO_WT" \
         && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
           "$TARGET_PYTHON" "$SCRIPT_DIR/run_script_with_probe.py" \
-            "$PROBE_MODULE" "$TEST_FILE" "${shape_cli[@]}"
+            "$PROBE_MODULE" "$TEST_FILE"
     ) >"$log" 2>&1
   else
     (
       cd "$REPO_WT" \
         && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$TIMEOUT" \
-          "$TARGET_PYTHON" "$TEST_FILE" "${shape_cli[@]}"
+          "$TARGET_PYTHON" "$TEST_FILE"
     ) >"$log" 2>&1
   fi
   local result=$?
   echo "$result|$log"
 }
 
-# Decide whether the target can be timed at all, and with what arguments. A perf harness
-# cannot be inferred from the diff, only from the target's own text, and aiter carries three
-# conventions for it.
+# Decide whether the target can be timed at all, and with what arguments. Which harness a
+# target has is a reading of its source, and it lives in scrape_perf.py with the reasons for
+# it; what stays here is only whether there is a file to read.
 perf_detect() {
-  local file="$REPO_WT/$TEST_FILE"
+  local file="$REPO_WT/$PERF_TARGET"
   if [ ! -f "$file" ]; then
-    PERF_BASIS="the target file is not present in this checkout"
+    PERF_BASIS="the perf target $PERF_TARGET is not present in this checkout"
     return 1
   fi
-  local detected
-  detected=$(python3 - "$file" <<'PY'
-import pathlib
-import sys
-
-text = pathlib.Path(sys.argv[1]).read_text(errors="replace")
-if "--scenario" in text and "bench" in text:
-    print("--scenario bench")
-elif "perftest" in text or "@benchmark" in text:
-    # `perftest`, not `run_perftest`. aiter has three timing conventions and the bare
-    # `perftest` decorator is one of them; matching only the longer name misses 12 of the
-    # 123 targets in op_tests/, 11 of which have live `perftest` usage. Reporting those as
-    # "no benchmark entry point" reads as "there was nothing to measure" when the truth is
-    # that the detector was too narrow -- the failure mode this whole stage exists to avoid.
-    # This is a substring test, not a parse, so it also matches a commented-out import (the
-    # 12th target). That error is the safe one: the run finds no timing table and the stage
-    # reports `skip`, which is where it would have landed anyway.
-    print("")
-else:
-    raise SystemExit(3)
-PY
-  )
-  if [ $? -ne 0 ]; then
+  local harness
+  if ! harness=$("$SCRIPT_DIR/scrape_perf.py" detect "$file"); then
     PERF_BASIS="the target exposes no benchmark entry point (no --scenario bench, no perftest/@benchmark harness)"
     return 1
   fi
-  PERF_ARGS="$detected"
-  if [ -n "$detected" ]; then
-    PERF_BASIS="target exposes --scenario bench"
-  else
-    PERF_BASIS="target uses the perftest/@benchmark harness"
-  fi
+  PERF_ARGS=${harness%%$'\n'*}
+  PERF_BASIS=${harness#*$'\n'}
   return 0
 }
 
@@ -1986,16 +1119,11 @@ PY
 #     already warm and the table measures the kernel rather than a compile.
 #   * PERF_TIMEOUT is separate from TIMEOUT, because silently killing a legitimately long
 #     sweep would produce an empty log -- indistinguishable from "this target has no harness".
-# A bench harness routinely writes its results next to the code -- aiter targets drop a
-# tuned_op_bench.csv in the repo root. The baseline phase asserts a CLEAN worktree after the
-# base runs, so an artifact left by the timing run sets BASE_READY=0 and skips the entire head
-# correctness phase: measured, the same target went PASS with --no-perf and INCONCLUSIVE with
-# perf on, with head correctness never executed. A perf stage that silently disables
-# correctness validation is far worse than no perf stage, so the timing run has to leave the
-# worktree exactly as it found it.
 #
-# Scoped deliberately: only paths whose git status CHANGED across the timing run are touched.
-# Anything already dirty beforehand is somebody else's and is left alone.
+# A timing run leaves artifacts behind -- aiter targets drop a tuned_op_bench.csv in the repo
+# root -- and the baseline phase asserts a clean worktree, so the run has to leave the tree as
+# it found it. These two record the tree before and put it back after; which paths may be
+# touched, and which must only be reported, is decided in scrape_perf.py.
 perf_snapshot() {
   git -C "$REPO_WT" status --porcelain --untracked-files=all \
     >"$WORK/perf-worktree-$1.txt" 2>/dev/null || : >"$WORK/perf-worktree-$1.txt"
@@ -2004,75 +1132,7 @@ perf_snapshot() {
 perf_restore() {
   local before="$WORK/perf-worktree-$1.txt"
   [ -r "$before" ] || return 0
-  python3 - "$REPO_WT" "$before" <<'PY'
-import pathlib
-import shutil
-import subprocess
-import sys
-
-root = pathlib.Path(sys.argv[1]).resolve()
-
-
-def parse(text):
-    entries = {}
-    for line in text.splitlines():
-        if len(line) > 3:
-            entries[line[3:]] = line[:2]
-    return entries
-
-
-before = parse(pathlib.Path(sys.argv[2]).read_text(errors="replace"))
-current = parse(
-    subprocess.run(
-        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
-        capture_output=True,
-        text=True,
-        check=False,
-    ).stdout
-)
-
-removed, reverted, skipped = [], [], []
-for path, code in current.items():
-    if before.get(path) == code:
-        continue
-    # git quotes paths with unusual characters. Un-quoting them correctly is fiddly and
-    # this code deletes files, so refuse to guess and report instead.
-    if path.startswith('"'):
-        skipped.append(path)
-        continue
-    target = root / path
-    try:
-        resolved = target.resolve()
-    except OSError:
-        skipped.append(path)
-        continue
-    if root != resolved and root not in resolved.parents:
-        skipped.append(path)
-        continue
-    if code == "??":
-        if resolved.is_dir() and not resolved.is_symlink():
-            shutil.rmtree(resolved, ignore_errors=True)
-        else:
-            try:
-                resolved.unlink()
-            except OSError:
-                skipped.append(path)
-                continue
-        removed.append(path)
-    else:
-        subprocess.run(
-            ["git", "-C", str(root), "checkout", "--", path],
-            capture_output=True,
-            check=False,
-        )
-        reverted.append(path)
-
-if removed or reverted or skipped:
-    print(
-        f"timing run artifacts cleaned: removed={removed} "
-        f"reverted={reverted} skipped={skipped}"
-    )
-PY
+  "$SCRIPT_DIR/scrape_perf.py" restore-worktree "$REPO_WT" "$before"
 }
 
 # Run one side PERF_REPEAT times. Results go to globals rather than a packed string because
@@ -2082,11 +1142,15 @@ PERF_RUN_LOGS=()
 PERF_RUN_RC=0
 run_perf_repeats() {
   local phase="$1"
+  # Which target this side is timing. Part of the log name because two targets are timed in
+  # the same phase and a shared name would have the second overwrite the first -- silently,
+  # since both sides would still find a readable log at the path they recorded.
+  local slot="$2"
   local index result rc
   PERF_RUN_LOGS=()
   PERF_RUN_RC=0
   for ((index = 1; index <= PERF_REPEAT; index++)); do
-    result=$(run_perf "$phase-perf-$index")
+    result=$(run_perf "$phase-perf-t$slot-$index")
     rc=${result%%|*}
     PERF_RUN_LOGS+=("${result##*|}")
     # Any failed repeat poisons the side: the reduction takes a minimum, so one truncated
@@ -2130,7 +1194,7 @@ run_perf() {
   (
     cd "$REPO_WT" \
       && env -i "${TARGET_BASE_ENV[@]}" "${environment[@]}" timeout "$PERF_TIMEOUT" \
-        "$TARGET_PYTHON" "$TEST_FILE" "${extra[@]}"
+        "$TARGET_PYTHON" "$PERF_TARGET" "${extra[@]}"
   ) >"$log" 2>&1
   local result=$?
   echo "$result|$log"
@@ -2150,48 +1214,8 @@ target_stats() {
     # coverage. When a route was named, the run's own receipt carries observable work, and
     # that count is used instead. With no route named there is still nothing to observe, and
     # the basis says so rather than implying a case count.
-    python3 - "$result" "$WORK/$phase/execution-receipt-$label.json" "$EXPECTED_ROUTE" <<'PY'
-import json
-import sys
-
-result = int(sys.argv[1])
-receipt_path, expected_route = sys.argv[2], sys.argv[3]
-# `executed` keeps its old meaning for everything that consumes it as a liveness signal
-# (the no-GPU requirement probe, the pass/skip decision), because a script that ran is a
-# script that ran. What changes is that it no longer PRETENDS to be a case count, and that
-# `observed_work` -- the only number here backed by evidence -- is published beside it.
-observed = None
-basis = "script process exit; no route was named, so no executed work could be counted"
-if expected_route:
-    try:
-        with open(receipt_path) as handle:
-            receipt = json.load(handle)
-    except (OSError, ValueError):
-        receipt = None
-    if receipt is None:
-        observed = 0
-        basis = (
-            "script process exit; a route was named and this run wrote no execution "
-            "receipt, so no executed work was observed"
-        )
-    else:
-        symbols = len(receipt.get("kernel_symbols") or [])
-        shapes = len(receipt.get("executed_shapes") or [])
-        observed = max(symbols, shapes)
-        basis = (
-            "observed route calls in this run's own execution receipt "
-            f"({symbols} symbol(s), {shapes} shape record(s))"
-        )
-print(json.dumps({
-    "tests": 1,
-    "failures": int(result != 0),
-    "errors": 0,
-    "skipped": 0,
-    "executed": 1,
-    "observed_work": observed,
-    "basis": basis,
-}))
-PY
+    python3 "$TARGET_TOOL" script-stats "$result" \
+      "$WORK/$phase/execution-receipt-$label.json" "$EXPECTED_ROUTE"
   elif [ -f "$junit" ]; then
     python3 "$SCRIPT_DIR/validate_evidence.py" pytest-stats "$junit"
   else
@@ -2200,93 +1224,8 @@ PY
   fi
 }
 
-# The grid receipt is preferred when it proves the route, because it is the run that
-# exercised the injected shapes; otherwise the repository run's receipt stands. A phase that
-# observed nothing never speaks over one that observed something.
 head_receipt() {
-  local grid="$WORK/head/execution-receipt-head-grid.json"
-  local repo="$WORK/head/execution-receipt-head-repo.json"
-  if [ -f "$grid" ] && python3 -c '
-import json, sys
-print(0 if json.load(open(sys.argv[1])).get("route") else 1)
-' "$grid" 2>/dev/null | grep -q '^0$'; then
-    printf '%s\n' "$grid"
-    return 0
-  fi
-  if [ -f "$repo" ]; then
-    printf '%s\n' "$repo"
-    return 0
-  fi
-  printf '%s\n' "$grid"
-}
-
-# ---------- credential-free execution isolation ----------
-#
-# The target is arbitrary code from an unmerged pull request, and it used to run with the
-# reviewer's whole environment attached: `env VAR=... <cmd>` ADDS to the inherited
-# environment, it does not replace it. Any GITHUB_TOKEN, GH_TOKEN, API key, SSH agent socket
-# or provider credential in the reviewer's shell was readable from `os.environ` inside the
-# code under review, and would land in a log the moment a target printed its environment.
-#
-# So the target's environment is CONSTRUCTED, not inherited. Everything a ROCm/PyTorch run
-# legitimately needs is passed by name or prefix; everything else is dropped; and anything
-# that looks like a secret is dropped even if a prefix would have kept it, because the
-# allowlist is about function and the denylist is about consequence.
-ENV_ALLOW_PREFIXES=(
-  PATH LD_LIBRARY_PATH LIBRARY_PATH CPATH TMPDIR TZ LANG LC_ TERM
-  USER LOGNAME HOSTNAME
-  ROCM HIP HSA HCC AMD GPU_ ROCR RCCL NCCL OMP_ MKL_ OPENBLAS NUMEXPR
-  CUDA TORCH PYTORCH TRITON FLYDSL AITER
-  VIRTUAL_ENV CC CXX CMAKE MAX_JOBS
-)
-ENV_DENY_RE='TOKEN|SECRET|PASSWD|PASSWORD|CREDENTIAL|_KEY|APIKEY|API_KEY|COOKIE|SESSION|AUTH|PRIVATE|GH_|GITHUB|SSH_|GPG_|NETRC'
-TARGET_BASE_ENV=()
-
-build_target_environment() {
-  # Emits NUL-separated NAME=VALUE pairs for the passthrough set.
-  python3 - "$ENV_DENY_RE" "${ENV_ALLOW_PREFIXES[@]}" <<'PY'
-import os
-import re
-import sys
-
-deny = re.compile(sys.argv[1])
-prefixes = tuple(sys.argv[2:])
-out = []
-for name, value in os.environ.items():
-    if not name.startswith(prefixes):
-        continue
-    if deny.search(name.upper()):
-        continue
-    out.append(f"{name}={value}")
-sys.stdout.write("\0".join(out))
-PY
-}
-
-mapfile -d '' -t TARGET_BASE_ENV < <(build_target_environment)
-jset_json "isolation.target_environment" "$(python3 - "${TARGET_BASE_ENV[@]}" <<'PY'
-import json
-import sys
-
-names = sorted(pair.split("=", 1)[0] for pair in sys.argv[1:])
-print(json.dumps({
-    "policy": "constructed (env -i + name/prefix allowlist + secret-shaped denylist)",
-    "passed_through": names,
-    "note": (
-        "the target is unmerged third-party code; it runs with a built environment rather "
-        "than the reviewer's, so a credential in the calling shell is not readable from it "
-        "and cannot reach a log"
-    ),
-}))
-PY
-)"
-
-stats_field() {
-  python3 - "$1" "$2" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])[sys.argv[2]])
-PY
+  printf '%s\n' "$WORK/head/execution-receipt-head-repo.json"
 }
 
 # ---------- does this target actually need a GPU? ----------
@@ -2299,7 +1238,7 @@ GPU_REQUIREMENT="required"
 GPU_REQUIREMENT_BASIS="a GPU was claimed, so whether the target can run without one was never probed; 'required' here is the conservative default, not an observation"
 if [ -z "$PICK" ]; then
   if [ "$RUNTIME_OK" -eq 1 ] && [ "$TARGET_RUNNER" != "none" ]; then
-    GPUFREE_RESULT=$(run_pytest "gpufree-probe" "")
+    GPUFREE_RESULT=$(run_pytest "gpufree-probe")
     GPUFREE_RC=${GPUFREE_RESULT%%|*}
     GPUFREE_LOG=${GPUFREE_RESULT##*|}
     GPUFREE_STATS=$(target_stats "gpufree-probe" "$GPUFREE_RC")
@@ -2332,12 +1271,30 @@ fi
 CAN_TEST=1
 SKIP_REASON=""
 PERF_BASE_RC=""
-PERF_BASE_LOG=""
 PERF_BASE_LOGS=()
-PERF_HEAD_RC=""
-PERF_HEAD_LOG=""
 PERF_HEAD_LOGS=()
 PERF_SKIP_REASON=""
+# Per-target results, index-aligned with PERF_TARGETS. Pre-filled so that a phase that never
+# ran leaves every slot with an answer -- an unset slot under `set -u` is a crash, and the
+# report a crash produces is no report at all.
+PERF_SKIP_REASONS=()
+PERF_BASELINE_METHODS=()
+PERF_ARGS_LIST=()
+PERF_BASIS_LIST=()
+PERF_BASE_RCS=()
+PERF_BASE_LOGS_JOINED=()
+PERF_HEAD_RCS=()
+PERF_HEAD_LOGS_JOINED=()
+for _slot in "${!PERF_TARGETS[@]}"; do
+  PERF_SKIP_REASONS+=("")
+  PERF_BASELINE_METHODS+=("patch-reversed-same-worktree")
+  PERF_ARGS_LIST+=("")
+  PERF_BASIS_LIST+=("")
+  PERF_BASE_RCS+=("")
+  PERF_BASE_LOGS_JOINED+=("")
+  PERF_HEAD_RCS+=("")
+  PERF_HEAD_LOGS_JOINED+=("")
+done
 if [ -z "$PICK" ] && [ "$GPU_REQUIREMENT" != "not-required" ]; then
   CAN_TEST=0
   SKIP_REASON="no verified-idle GPU was claimed"
@@ -2358,14 +1315,10 @@ fi
 BASE_REPO_STATE="not-run"
 BASE_REPO_RC=""
 BASE_REPO_LOG=""
-BASE_GRID_STATE="not-run"
-BASE_GRID_RC=""
-BASE_GRID_LOG=""
 
 if [ "$CAN_TEST" -eq 0 ]; then
   stage_note "baseline_control" "skip" "$SKIP_REASON"
   stage_note "correctness_repo_tests" "skip" "$SKIP_REASON"
-  stage_note "correctness_s1_grid" "skip" "$SKIP_REASON"
   stage_note "execution_receipt" "skip" "$SKIP_REASON"
   finding "note" "correctness" "$SKIP_REASON; this report makes no correctness claim"
 else
@@ -2378,11 +1331,15 @@ else
   # base tree times the OLD implementation through the SAME harness. That transplant is a
   # cross-tree comparison and is only attributable if something the patch does not touch
   # reproduces across it, which is what --perf-control-column requires below.
-  PERF_TRANSPLANT_SRC=""
-  if [ -n "$PATCHF" ] && [ "$PERF_ENABLED" -eq 1 ] && [ -f "$REPO_WT/$TEST_FILE" ]; then
-    PERF_TRANSPLANT_SRC="$WORK/transplant-target"
-    cp "$REPO_WT/$TEST_FILE" "$PERF_TRANSPLANT_SRC"
-  fi
+  PERF_TRANSPLANT_SRCS=()
+  for _slot in "${!PERF_TARGETS[@]}"; do
+    PERF_TRANSPLANT_SRCS+=("")
+    if [ -n "$PATCHF" ] && [ "$PERF_ENABLED" -eq 1 ] \
+        && [ -f "$REPO_WT/${PERF_TARGETS[$_slot]}" ]; then
+      PERF_TRANSPLANT_SRCS[$_slot]="$WORK/transplant-target-$_slot"
+      cp "$REPO_WT/${PERF_TARGETS[$_slot]}" "${PERF_TRANSPLANT_SRCS[$_slot]}"
+    fi
+  done
   if [ -n "$PATCHF" ]; then
     if git -C "$REPO_WT" apply -R --check "$PATCHF" >/dev/null 2>&1 \
         && git -C "$REPO_WT" apply -R "$PATCHF" >/dev/null 2>&1; then
@@ -2394,7 +1351,7 @@ else
 
     if [ "$BASE_READY" -eq 1 ]; then
       if [ -f "$REPO_WT/$TEST_FILE" ]; then
-        BASE_RESULT=$(run_pytest "base-repo" "")
+        BASE_RESULT=$(run_pytest "base-repo")
         BASE_REPO_RC=${BASE_RESULT%%|*}
         BASE_REPO_LOG=${BASE_RESULT##*|}
         BASE_REPO_STATS=$(target_stats "base-repo" "$BASE_REPO_RC")
@@ -2412,72 +1369,74 @@ else
       # number taken later, or on another box, or from the PR description, reintroduces
       # exactly the variance a 0.95 threshold is too tight to absorb.
       if [ "$PERF_ENABLED" -eq 1 ]; then
-        if [ "$BASE_REPO_STATE" = "target-not-present" ] \
-            && [ -z "$PERF_CONTROL_COLUMN" ]; then
-          PERF_SKIP_REASON="the PR adds this target, so a base timing requires transplanting it into the base tree; that comparison spans two trees and is only attributable when a column the patch does not touch reproduces across it, so --perf-control-column is required and was not supplied"
-        elif [ "$BASE_REPO_STATE" = "target-not-present" ] \
-            && [ -n "$PERF_TRANSPLANT_SRC" ] && [ -r "$PERF_TRANSPLANT_SRC" ]; then
-          mkdir -p "$(dirname "$REPO_WT/$TEST_FILE")"
-          cp "$PERF_TRANSPLANT_SRC" "$REPO_WT/$TEST_FILE"
-          PERF_BASELINE_METHOD="target-transplant"
-          if [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
+        # One pass per discovered target. Each keeps its own harness, its own baseline method
+        # and its own skip reason, because a target that could not be timed says nothing
+        # about the one beside it: the repository's bench takes an ordinary reversed-patch
+        # baseline while the PR's own bench needs a transplant, and either may fail alone.
+        for PERF_SLOT in "${!PERF_TARGETS[@]}"; do
+          PERF_TARGET="${PERF_TARGETS[$PERF_SLOT]}"
+          PERF_BASELINE_METHOD="patch-reversed-same-worktree"
+          PERF_SKIP_REASON=""
+          PERF_BASE_RC=""
+          PERF_BASE_LOGS=()
+          [ "$PERF_ARGS_SET" -eq 1 ] || PERF_ARGS=""
+          PERF_BASIS=""
+          PERF_TRANSPLANT_SRC="${PERF_TRANSPLANT_SRCS[$PERF_SLOT]}"
+          # Whether the PERF target survives the reverse-apply is its own question. It used to
+          # be answered with BASE_REPO_STATE, which describes the CORRECTNESS target -- the
+          # same file, back when perf had no target of its own. Once the two can differ that
+          # is a category error in both directions: a pre-existing bench alongside a PR-added
+          # unit test would be refused a baseline it could trivially have taken, and a
+          # PR-added bench alongside a pre-existing unit test would fall through to the
+          # ordinary branch and transplant nothing. Ask about the file about to be executed.
+          PERF_BASE_STATE="present"
+          [ -f "$REPO_WT/$PERF_TARGET" ] || PERF_BASE_STATE="target-not-present"
+          if [ "$PERF_BASE_STATE" = "target-not-present" ] \
+              && [ -z "$PERF_CONTROL_COLUMN" ]; then
+            PERF_SKIP_REASON="the PR adds this target, so a base timing requires transplanting it into the base tree; that comparison spans two trees and is only attributable when a column the patch does not touch reproduces across it, so --perf-control-column is required and was not supplied"
+          elif [ "$PERF_BASE_STATE" = "target-not-present" ] \
+              && [ -n "$PERF_TRANSPLANT_SRC" ] && [ -r "$PERF_TRANSPLANT_SRC" ]; then
+            mkdir -p "$(dirname "$REPO_WT/$PERF_TARGET")"
+            cp "$PERF_TRANSPLANT_SRC" "$REPO_WT/$PERF_TARGET"
+            PERF_BASELINE_METHOD="target-transplant"
+            if [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
+              perf_snapshot base
+              run_perf_repeats base "$PERF_SLOT"
+              PERF_BASE_RC=$PERF_RUN_RC
+              PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
+              perf_restore base
+            else
+              PERF_SKIP_REASON="$PERF_BASIS"
+            fi
+            # The transplanted file is not part of the base tree and must not be left in it:
+            # the cleanliness check that guards the head phase would otherwise fail and take
+            # the whole correctness phase down with it. Reached only when the perf target was
+            # absent from base a moment ago, so this deletes what the two lines above wrote
+            # and nothing else. Spelled with $TEST_FILE it would delete a TRACKED base file
+            # whenever the two targets differ -- dirtying the tree it keeps clean.
+            rm -f "$REPO_WT/$PERF_TARGET"
+          elif [ "$PERF_BASE_STATE" = "target-not-present" ]; then
+            PERF_SKIP_REASON="the PR adds this target and no copy of it was available to transplant onto base"
+          elif [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
             perf_snapshot base
-            run_perf_repeats base
+            run_perf_repeats base "$PERF_SLOT"
             PERF_BASE_RC=$PERF_RUN_RC
             PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
-            PERF_BASE_LOG="${PERF_BASE_LOGS[0]}"
             perf_restore base
           else
             PERF_SKIP_REASON="$PERF_BASIS"
           fi
-          # The transplanted file is not part of the base tree and must not be left in it:
-          # the cleanliness check that guards the head phase would otherwise fail and take
-          # the whole correctness phase down with it.
-          rm -f "$REPO_WT/$TEST_FILE"
-        elif [ "$BASE_REPO_STATE" = "target-not-present" ]; then
-          PERF_SKIP_REASON="the PR adds this target and no copy of it was available to transplant onto base"
-        elif [ "$PERF_ARGS_SET" -eq 1 ] || perf_detect; then
-          perf_snapshot base
-          run_perf_repeats base
-          PERF_BASE_RC=$PERF_RUN_RC
-          PERF_BASE_LOGS=("${PERF_RUN_LOGS[@]}")
-          PERF_BASE_LOG="${PERF_BASE_LOGS[0]}"
-          perf_restore base
-        else
-          PERF_SKIP_REASON="$PERF_BASIS"
-        fi
-      fi
-      if [ "$GRID_HOOK_OK" -eq 1 ]; then
-        if [ -f "$REPO_WT/$TEST_FILE" ]; then
-          BASE_PROBE_RESULT=$(run_pytest \
-            "base-grid-probe" "__VALIDATOR_INVALID_GRID__")
-          BASE_PROBE_RC=${BASE_PROBE_RESULT%%|*}
-          BASE_PROBE_LOG=${BASE_PROBE_RESULT##*|}
-          # A non-zero probe exit is only evidence that the GRID was consumed when the same
-          # target succeeds without it. On a held-out PR whose module could not be imported at
-          # all, the probe failed for that reason and the channel was credited although no
-          # shape ever reached the kernel. Require the unpoisoned baseline run to have passed.
-          if [ "$BASE_PROBE_RC" -eq 0 ] || [ "${BASE_REPO_RC:-1}" -ne 0 ]; then
-            BASE_GRID_STATE="hook-not-consumed"
-          else
-            BASE_GRID_RESULT=$(run_pytest "base-grid" "$GRID")
-            BASE_GRID_RC=${BASE_GRID_RESULT%%|*}
-            BASE_GRID_LOG=${BASE_GRID_RESULT##*|}
-            BASE_GRID_STATS=$(target_stats "base-grid" "$BASE_GRID_RC")
-            if [ "$BASE_GRID_RC" -eq 0 ] \
-                && [ "$(stats_field "$BASE_GRID_STATS" executed)" -eq 0 ]; then
-              BASE_GRID_STATE="all-skipped"
-            else
-              BASE_GRID_STATE="ran"
-            fi
-          fi
-        else
-          BASE_GRID_STATE="target-not-present"
-        fi
-      elif [ -n "$GRID" ]; then
-        BASE_GRID_STATE="hook-not-found"
-      else
-        BASE_GRID_STATE="not-configured"
+          PERF_SKIP_REASONS[$PERF_SLOT]="$PERF_SKIP_REASON"
+          PERF_BASELINE_METHODS[$PERF_SLOT]="$PERF_BASELINE_METHOD"
+          PERF_ARGS_LIST[$PERF_SLOT]="$PERF_ARGS"
+          PERF_BASIS_LIST[$PERF_SLOT]="$PERF_BASIS"
+          PERF_BASE_RCS[$PERF_SLOT]="$PERF_BASE_RC"
+          # Log lists are variable-length, and bash has no array of arrays. They are joined on
+          # newlines here and split back on newlines at the point of use; every path is one
+          # this script generated under $WORK, so none of them can contain one.
+          PERF_BASE_LOGS_JOINED[$PERF_SLOT]=$(printf '%s\n' "${PERF_BASE_LOGS[@]}")
+        done
+        PERF_TARGET="${PERF_TARGETS[0]}"
       fi
       if [ -n "$(git -C "$REPO_WT" status --porcelain --untracked-files=all)" ]; then
         BASE_READY=0
@@ -2505,42 +1464,19 @@ else
     else
       [ -n "${BASE_REPO_STATS:-}" ] || \
         BASE_REPO_STATS='{"tests":0,"failures":0,"errors":0,"skipped":0,"executed":0}'
-      [ -n "${BASE_GRID_STATS:-}" ] || \
-        BASE_GRID_STATS='{"tests":0,"failures":0,"errors":0,"skipped":0,"executed":0}'
       python3 - "$JSON" "$BASE_REPO_STATE" "${BASE_REPO_RC:-}" \
-        "$BASE_REPO_LOG" "$BASE_REPO_STATS" "$BASE_GRID_STATE" \
-        "${BASE_GRID_RC:-}" "$BASE_GRID_LOG" "$BASE_GRID_STATS" \
-        "${BASE_PROBE_RC:-}" "${BASE_PROBE_LOG:-}" <<'PY'
+        "$BASE_REPO_LOG" "$BASE_REPO_STATS" <<'PY'
 import json
 import sys
 
-(
-    path,
-    repo_state,
-    repo_exit,
-    repo_log,
-    repo_stats,
-    grid_state,
-    grid_exit,
-    grid_log,
-    grid_stats,
-    probe_exit,
-    probe_log,
-) = sys.argv[1:12]
+path, repo_state, repo_exit, repo_log, repo_stats = sys.argv[1:6]
 stage = {
     "status": "pass",
     "repo_tests": {"state": repo_state, "stats": json.loads(repo_stats)},
-    "s1_grid": {"state": grid_state, "stats": json.loads(grid_stats)},
 }
 if repo_exit:
     stage["repo_tests"]["exit"] = int(repo_exit)
     stage["repo_tests"]["log"] = repo_log
-if grid_exit:
-    stage["s1_grid"]["exit"] = int(grid_exit)
-    stage["s1_grid"]["log"] = grid_log
-if probe_exit:
-    stage["s1_grid"]["hook_probe_exit"] = int(probe_exit)
-    stage["s1_grid"]["hook_probe_log"] = probe_log
 data = json.load(open(path))
 data["stages"]["baseline_control"] = stage
 json.dump(data, open(path, "w"), indent=2)
@@ -2552,7 +1488,7 @@ PY
   fi
 
   if [ "$CAN_TEST" -eq 1 ]; then
-    HEAD_RESULT=$(run_pytest "head-repo" "")
+    HEAD_RESULT=$(run_pytest "head-repo")
     HEAD_RC=${HEAD_RESULT%%|*}
     HEAD_LOG=${HEAD_RESULT##*|}
     HEAD_STATS=$(target_stats "head-repo" "$HEAD_RC")
@@ -2596,276 +1532,56 @@ PY
         finding "note" "correctness" \
           "the test target is red on both baseline and head; the failure is not attributed without matching failure evidence"
       fi
-      # "Red on both sides" is an attribution, not an explanation. When the target carries a
-      # structural reason the selected RUNNER cannot run it, that reason belongs in the
-      # report -- otherwise a reader concludes the code is broken when the runner choice is.
-      if [ -n "$TARGET_RUNNER_RISK" ] && [ "$HEAD_EXECUTED" -eq 0 ]; then
+      # "Red on both sides" is an attribution, not an explanation. A reader who is not told
+      # that the runner could be the cause concludes the code is broken when the choice was.
+      if [ "$HEAD_EXECUTED" -eq 0 ]; then
         finding "note" "correctness" \
-          "the target executed nothing under the selected $TARGET_RUNNER runner, and $TARGET_RUNNER_RISK"
+          "the target executed nothing under the $TARGET_RUNNER runner ($TARGET_RUNNER_BASIS); a runner that cannot collect or execute this target produces exactly this result, so the runner selection is a candidate cause and the code is not the only one"
       fi
     fi
 
     # Head's timing run pairs with the base one and is skipped outright when base produced
     # nothing: a head-only number reproduces the PR's own comparison and cannot show a
     # regression, which is the single thing this stage is for.
-    if [ "$PERF_ENABLED" -eq 1 ] && [ -n "$PERF_BASE_LOG" ]; then
-      perf_snapshot head
-      run_perf_repeats head
-      PERF_HEAD_RC=$PERF_RUN_RC
-      PERF_HEAD_LOGS=("${PERF_RUN_LOGS[@]}")
-      PERF_HEAD_LOG="${PERF_HEAD_LOGS[0]}"
-      # Symmetric with base: the grid run and the caller's worktree both follow this point,
-      # and neither should inherit a results file the timing run happened to drop.
-      perf_restore head
+    if [ "$PERF_ENABLED" -eq 1 ]; then
+      for PERF_SLOT in "${!PERF_TARGETS[@]}"; do
+        [ -n "${PERF_BASE_LOGS_JOINED[$PERF_SLOT]:-}" ] || continue
+        PERF_TARGET="${PERF_TARGETS[$PERF_SLOT]}"
+        PERF_ARGS="${PERF_ARGS_LIST[$PERF_SLOT]}"
+        perf_snapshot head
+        run_perf_repeats head "$PERF_SLOT"
+        PERF_HEAD_RCS[$PERF_SLOT]=$PERF_RUN_RC
+        PERF_HEAD_LOGS_JOINED[$PERF_SLOT]=$(printf '%s\n' "${PERF_RUN_LOGS[@]}")
+        # Symmetric with base: the next slot's run and the caller's worktree both follow this
+        # point, and neither should inherit a results file the timing run happened to drop.
+        perf_restore head
+      done
+      PERF_TARGET="${PERF_TARGETS[0]}"
     fi
 
 
-    # Same causality requirement as the base side: a probe that fails because the target
-    # is broken proves nothing about the grid. On a held-out PR whose module could not be
-    # imported at all, the probe's non-zero exit credited the channel although no shape
-    # ever reached the kernel. Require the unpoisoned head run to have passed first.
-    if [ "$GRID_HOOK_OK" -eq 1 ] && [ "${HEAD_RC:-1}" -eq 0 ]; then
-      HEAD_PROBE_RESULT=$(run_pytest \
-        "head-grid-probe" "__VALIDATOR_INVALID_GRID__")
-      HEAD_PROBE_RC=${HEAD_PROBE_RESULT%%|*}
-      HEAD_PROBE_LOG=${HEAD_PROBE_RESULT##*|}
-      if [ "$HEAD_PROBE_RC" -eq 0 ]; then
-        stage_note "correctness_s1_grid" "skip" \
-          "target ignores $GRID_CHANNEL at runtime"
-        stage_note "execution_receipt" "skip" \
-          "shape-grid runtime handshake failed on $GRID_CHANNEL"
-        jset_json "stages.correctness_s1_grid.hook_probe_exit" "$HEAD_PROBE_RC"
-        jset_string "stages.correctness_s1_grid.hook_probe_log" "$HEAD_PROBE_LOG"
-        finding "note" "correctness" \
-          "the selected target passes an invalid shape-grid probe, so grid consumption is unproven"
-      else
-        # Every requested axis must be observed REFUSING an invalid value before its values
-        # are allowed onto the grid run's argv. Without this an axis flag the target declares
-        # but ignores -- or one whose value it silently clamps -- would let the report claim
-        # coverage of head counts or dtypes that never reached the kernel. An axis that fails
-        # the probe is dropped from the run and named in the report; it is never dropped
-        # quietly, because a silently narrowed test space is the failure this stage exists to
-        # prevent.
-        if [ "$AXIS_STATE" = "declared" ]; then
-          AXIS_REFUSED_OK=1
-          AXIS_PROBE_FAILED=""
-          for _axis_flag in $(python3 -c '
-import json
-import sys
-
-for axis in json.loads(sys.argv[1]):
-    print(axis["flag"])
-' "$AXIS_REPORT"); do
-            AXIS_CLI_OVERRIDE=("$_axis_flag" "__VALIDATOR_INVALID_AXIS__")
-            AXIS_PROBE_RESULT=$(run_pytest "head-axisprobe" "")
-            AXIS_CLI_OVERRIDE=()
-            if [ "${AXIS_PROBE_RESULT%%|*}" -eq 0 ]; then
-              AXIS_REFUSED_OK=0
-              AXIS_PROBE_FAILED="$AXIS_PROBE_FAILED $_axis_flag"
-            fi
-          done
-          if [ "$AXIS_REFUSED_OK" -eq 1 ]; then
-            AXIS_STATE="proven"
-            AXIS_STATE_REASON="every axis flag rejected a deliberately invalid value"
-          else
-            AXIS_STATE="hook-not-consumed"
-            AXIS_STATE_REASON="these axis flags accepted a deliberately invalid value, so the target does not consume them:$AXIS_PROBE_FAILED"
-            AXIS_CLI=()
-            finding "note" "correctness" \
-              "requested test axes were dropped: $AXIS_STATE_REASON"
-          fi
-          jset_string "test_selection.axis_state" "$AXIS_STATE"
-          jset_string "test_selection.axis_state_reason" "$AXIS_STATE_REASON"
-        fi
-        HEAD_GRID_RESULT=$(run_pytest "head-grid" "$GRID")
-        HEAD_GRID_RC=${HEAD_GRID_RESULT%%|*}
-        HEAD_GRID_LOG=${HEAD_GRID_RESULT##*|}
-        HEAD_GRID_STATS=$(target_stats "head-grid" "$HEAD_GRID_RC")
-        HEAD_GRID_EXECUTED=$(stats_field "$HEAD_GRID_STATS" executed)
-        # A proven axis that asks for values outside the target's own defaults makes the run
-        # independent even when the shape cells duplicate: the configuration reaching the
-        # kernel is one the repository target never runs.
-        AXIS_ADDS_COVERAGE=0
-        if [ "$AXIS_STATE" = "proven" ]; then
-          AXIS_ADDS_COVERAGE=$(python3 -c '
-import json
-import sys
-
-axes = json.loads(sys.argv[1])
-print(int(any(a.get("independence") == "adds-coverage" for a in axes)))
-' "$AXIS_REPORT")
-        fi
-        if [ "$AXIS_ADDS_COVERAGE" -eq 1 ] \
-            && [ "$GRID_INDEPENDENCE" = "duplicates-target-defaults" ]; then
-          GRID_INDEPENDENCE="adds-coverage"
-          GRID_INDEPENDENCE_REASON="the shape cells duplicate the target's defaults, but a proven extra axis requests values the target does not run by default"
-          # test_selection carries the same two fields and was written before the axes were
-          # proven. Leaving it holding the pre-override value put two contradicting answers
-          # in one report -- `test_selection.grid_independence: duplicates-target-defaults`
-          # beside `stages.correctness_s1_grid.independence: adds-coverage`. Observed on
-          # ROCm/aiter#5081. One question, one answer.
-          jset_string "test_selection.grid_independence" "$GRID_INDEPENDENCE"
-          jset_string "test_selection.grid_independence_reason" "$GRID_INDEPENDENCE_REASON"
-        fi
-        python3 - "$JSON" "$HEAD_GRID_RC" "$GRID" "$HEAD_GRID_LOG" \
-          "$HEAD_GRID_STATS" "$HEAD_PROBE_RC" "$HEAD_PROBE_LOG" \
-          "$GRID_INDEPENDENCE" "$GRID_INDEPENDENCE_REASON" <<'PY'
-import json
-import sys
-
-(
-    path,
-    exit_code,
-    grid,
-    log,
-    raw_stats,
-    probe_exit,
-    probe_log,
-    independence,
-    independence_reason,
-) = sys.argv[1:10]
-data = json.load(open(path))
-stats = json.loads(raw_stats)
-status = "fail" if int(exit_code) else ("pass" if stats["executed"] else "skip")
-note = ""
-if status == "skip":
-    note = "shape-grid target completed with no executed tests"
-# A red grid is still a red grid: a duplicate grid that FAILS is reporting a real defect in
-# the target and must keep its "fail". What a duplicate cannot do is earn a pass, because the
-# only thing a passing duplicate proves is that the repository run passed -- which
-# correctness_repo_tests already said.
-if status == "pass" and independence == "duplicates-target-defaults":
-    status = "skip"
-    note = independence_reason
-data["stages"]["correctness_s1_grid"] = {
-    "status": status,
-    "exit": int(exit_code),
-    "grid": grid,
-    "log": log,
-    "stats": stats,
-    "hook_probe_exit": int(probe_exit),
-    "hook_probe_log": probe_log,
-    "independence": independence,
-    "independence_reason": independence_reason,
-}
-if note:
-    data["stages"]["correctness_s1_grid"]["note"] = note
-json.dump(data, open(path, "w"), indent=2)
-PY
-        mark_runtime_coverage "$HEAD_GRID_STATS" "$TARGET_RUNNER" "$HEAD_GRID_LOG"
-        if [ "$GRID_INDEPENDENCE" = "duplicates-target-defaults" ] \
-            && [ "$HEAD_GRID_RC" -eq 0 ]; then
-          finding "note" "correctness" \
-            "the independent shape grid was not independent: $GRID_INDEPENDENCE_REASON"
-        fi
-        if [ "$HEAD_GRID_RC" -eq 0 ] && [ "$HEAD_GRID_EXECUTED" -eq 0 ]; then
-          finding "note" "correctness" \
-            "shape-grid target executed no tests; no grid claim is made"
-        elif [ "$HEAD_GRID_RC" -ne 0 ]; then
-          GRID_EXCERPT=$(log_excerpt "$HEAD_GRID_LOG")
-          if [ -z "$PATCHF" ]; then
-            finding "blocker" "correctness" \
-              "the independent shape grid fails on the supplied head checkout: $GRID_EXCERPT"
-          elif [ "$BASE_GRID_STATE" = "target-not-present" ]; then
-            finding "blocker" "correctness" \
-              "the PR adds this target and its independent shape grid fails: $GRID_EXCERPT"
-          elif [ "$BASE_GRID_STATE" = "ran" ] && [ "$BASE_GRID_RC" -eq 0 ]; then
-            finding "blocker" "correctness" \
-              "the independent shape grid passes on base and fails on head: $GRID_EXCERPT"
-          else
-            finding "note" "correctness" \
-              "the independent grid is red on both baseline and head; attribution is inconclusive"
-          fi
-        fi
-        # The grid's OWN receipt, not whichever head run wrote last. The grid exists to be a
-        # positive control against re-reporting the repo-default run under a second stage
-        # name; reading a shared receipt made that control unfalsifiable, because a receipt
-        # written by the default run satisfies --grid whenever the grid shapes are a subset
-        # of the target's own defaults.
-        RECEIPT_JSON=$(
-          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$(head_receipt)" \
-            --expected-route "$EXPECTED_ROUTE" --grid "$GRID" \
-            --grid-channel "$GRID_CHANNEL"
-        )
-        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
-        jset_string "stages.execution_receipt.receipt_scope" \
-          "the head-grid run only; the head-repo run has its own receipt"
-        RECEIPT_STATUS=$(python3 - "$RECEIPT_JSON" <<'PY'
-import json
-import sys
-
-print(json.loads(sys.argv[1])["status"])
-PY
-)
-        if [ "$RECEIPT_STATUS" != "pass" ]; then
-          finding "note" "execution_receipt" \
-            "route/shape execution receipt was not established; PASS is not permitted"
-        fi
+    # The receipt describes the target's own run, which is the only run there is. It answers
+    # one question -- did the changed code actually execute -- and a green suite that never
+    # reached the route is the failure it exists to catch.
+    if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
+      RECEIPT_JSON=$(
+        python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
+          "$(head_receipt)" --expected-route "$EXPECTED_ROUTE"
+      )
+      jset_json "stages.execution_receipt" "$RECEIPT_JSON"
+      jset_string "stages.execution_receipt.receipt_scope" "the head-repo run"
+      RECEIPT_STATUS=$(python3 -c \
+        'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
+      if [ "$RECEIPT_STATUS" != "pass" ]; then
+        finding "note" "execution_receipt" \
+          "route execution receipt was not established; PASS is not permitted"
       fi
-    elif [ -n "$SHAPE_ENV" ] && [ -n "$GRID" ]; then
-      stage_note "correctness_s1_grid" "skip" \
-        "configured shape environment variable is not referenced by the target"
-      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
-        RECEIPT_JSON=$(
-          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$(head_receipt)" \
-            --expected-route "$EXPECTED_ROUTE" --grid "" --grid-channel ""
-        )
-        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
-        jset_string "stages.execution_receipt.receipt_scope" \
-          "the head-repo run only; no grid run took place"
-        RECEIPT_STATUS=$(python3 -c \
-          'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
-        if [ "$RECEIPT_STATUS" != "pass" ]; then
-          finding "note" "execution_receipt" \
-            "route execution receipt was not established; PASS is not permitted"
-        fi
-      else
-        stage_note "execution_receipt" "skip" \
-          "shape-grid hook was not established and no route was supplied"
-      fi
-      finding "note" "correctness" \
-        "the selected target does not consume the configured shape-grid hook"
     else
-      # A skip must describe what was actually found. "kernel exposes no configured shape
-      # override" reads as a property of the target even when the real cause is that the
-      # validator ignored the channel the caller named -- which is a capability gap wearing a
-      # skip's costume, the exact failure this skill exists to prevent.
-      if [ -n "$GRID_CHANNEL_REASON" ]; then
-        stage_note "correctness_s1_grid" "skip" \
-          "$GRID_CHANNEL_REASON; coverage is repo-default-only"
-      elif [ -z "$GRID" ]; then
-        stage_note "correctness_s1_grid" "skip" \
-          "no --grid was supplied, so no independent shape coverage was attempted; coverage is repo-default-only"
-      else
-        stage_note "correctness_s1_grid" "skip" \
-          "kernel exposes no configured shape override; coverage is repo-default-only"
-      fi
-      if [ -n "$EXPECTED_ROUTE" ] && [ -f "$(head_receipt)" ]; then
-        RECEIPT_JSON=$(
-          python3 "$SCRIPT_DIR/validate_evidence.py" receipt \
-            "$(head_receipt)" \
-            --expected-route "$EXPECTED_ROUTE" --grid "" --grid-channel ""
-        )
-        jset_json "stages.execution_receipt" "$RECEIPT_JSON"
-        RECEIPT_STATUS=$(python3 -c \
-          'import json,sys; print(json.loads(sys.argv[1])["status"])' "$RECEIPT_JSON")
-        if [ "$RECEIPT_STATUS" != "pass" ]; then
-          finding "note" "execution_receipt" \
-            "route execution receipt was not established; PASS is not permitted"
-        fi
-      else
-        stage_note "execution_receipt" "skip" \
-          "no shape grid was configured and no route was supplied"
-      fi
-      finding "note" "correctness" \
-        "no independent shape-grid hook was configured; coverage is limited to repository defaults"
+      stage_note "execution_receipt" "skip" \
+        "no route was supplied, so nothing observed which work the target reached"
     fi
   else
     stage_note "correctness_repo_tests" "skip" \
-      "candidate patch was not restored after baseline control"
-    stage_note "correctness_s1_grid" "skip" \
       "candidate patch was not restored after baseline control"
     stage_note "execution_receipt" "skip" \
       "candidate patch was not restored after baseline control"
@@ -2931,8 +1647,9 @@ fi
 #
 # Emitted last because it is the only stage needing results from both the baseline phase and
 # the head phase. It is deliberately NOT in finish_report's required-stage set: `complete` is
-# computed from the nine correctness stages, so a perf run that could not happen downgrades
-# nothing and a PASS stays a PASS. What it can do is append a should-fix finding, which
+# computed from the required stages alone,
+# so a perf run that could not happen downgrades nothing and a PASS stays a PASS. What it can
+# do is append a should-fix finding, which
 # finish_report turns into NEEDS_WORK and exit 1 -- a measured regression is a real result,
 # not an advisory note, and the whole point of putting it in the deterministic layer is that
 # it ships its own reproducer (both logs, both exit codes, the command) with it.
@@ -2941,180 +1658,93 @@ fi
 # A timeout, a crash, a missing harness and a one-row table must never be able to look like
 # a regression, because a false regression here blocks a good PR and would get the stage
 # switched off within a week.
+#
+# Every discovered target contributes one measurement, whether or not it produced a number,
+# and the stage mirrors whichever of them gates. Which that is, is decided in scrape_perf.py
+# from the measurements; nothing here ranks anything.
+PERF_STAGE_COMPOSED=0
 if [ "$PERF_ENABLED" -ne 1 ]; then
   stage_note "perf" "skip" "perf measurement was disabled with --no-perf"
-elif [ -n "$PERF_SKIP_REASON" ]; then
-  stage_note "perf" "skip" "$PERF_SKIP_REASON"
-  finding "note" "perf" \
-    "no base-vs-head timing was taken: $PERF_SKIP_REASON"
-elif [ -z "$PERF_BASE_LOG" ] || [ -z "$PERF_HEAD_LOG" ]; then
-  PERF_WHY="the run did not reach both a baseline and a head phase"
-  [ "$CAN_TEST" -eq 0 ] && PERF_WHY="${SKIP_REASON:-$PERF_WHY}"
-  stage_note "perf" "skip" "$PERF_WHY"
-  finding "note" "perf" "no base-vs-head timing was taken: $PERF_WHY"
-elif [ "$PERF_BASE_RC" -ne 0 ] || [ "$PERF_HEAD_RC" -ne 0 ]; then
-  # Deliberately not a regression. A nonzero exit means the log is truncated at an unknown
-  # point, so any ratio drawn from it compares whatever happened to print before the crash.
-  PERF_WHY="benchmark run exited nonzero (base=$PERF_BASE_RC head=$PERF_HEAD_RC); timings from a truncated run are not comparable"
-  stage_note "perf" "skip" "$PERF_WHY"
-  jset_string "stages.perf.base_log" "$PERF_BASE_LOG"
-  jset_string "stages.perf.head_log" "$PERF_HEAD_LOG"
-  finding "note" "perf" "$PERF_WHY"
 else
-  PERF_JSON="$WORK/perf-compare.json"
-  "$SCRIPT_DIR/scrape_perf.py" \
-    --base "${PERF_BASE_LOGS[@]}" --head "${PERF_HEAD_LOGS[@]}" \
-    --threshold "$PERF_THRESHOLD" --min-rows "$PERF_MIN_ROWS" \
-    --out "$PERF_JSON" >/dev/null 2>"$WORK/perf-compare.err"
-  PERF_CMP_RC=$?
-  if [ "$PERF_CMP_RC" -ne 0 ] || [ ! -r "$PERF_JSON" ]; then
-    stage_note "perf" "skip" \
-      "the benchmark comparison failed: $(log_excerpt "$WORK/perf-compare.err")"
-    finding "note" "perf" \
-      "base and head both produced benchmark logs, but they could not be compared"
-  else
-    python3 - "$JSON" "$PERF_JSON" "$PERF_BASE_LOG" "$PERF_HEAD_LOG" \
-      "$BASE_SHA" "$PERF_ARGS" "$PERF_BASIS" \
-      "$PERF_BASELINE_METHOD" "$PERF_CONTROL_COLUMN" "$PERF_CONTROL_TOL" <<'PY'
-import json
-import sys
-
-(
-    report_path,
-    compare_path,
-    base_log,
-    head_log,
-    base_sha,
-    command,
-    basis,
-    baseline_method,
-    control_column,
-    control_tol,
-) = sys.argv[1:11]
-data = json.load(open(report_path))
-result = json.load(open(compare_path))
-
-# A transplanted baseline is only attributable if a column the patch does not touch
-# reproduces across the two trees. Without that agreement the difference could be anything
-# -- a different harness path, a different allocation, a different clock state -- and a
-# number nobody can attribute is worse than no number, so the stage skips and says why.
-control_note = ""
-control_ratio = None
-if baseline_method == "target-transplant":
-    columns = result.get("columns") or {}
-    match = None
-    for name in columns:
-        if control_column.lower() in name.lower():
-            match = name
-            break
-    if match is None:
-        control_note = (
-            f"the named control column {control_column!r} is not present in both logs, so "
-            "this cross-tree comparison cannot be attributed"
-        )
-        result["status"] = "insufficient"
-        result["reason"] = control_note
-    else:
-        control_ratio = columns[match].get("median_ratio")
-        tolerance = float(control_tol)
-        if control_ratio is None or abs(control_ratio - 1.0) > tolerance:
-            control_note = (
-                f"the control column {match!r} moved by "
-                f"{'unknown' if control_ratio is None else f'{abs(control_ratio - 1.0):.1%}'}"
-                f" across the two trees (tolerance {tolerance:.0%}); the patch does not "
-                "touch it, so the two runs are not comparable and no ratio is reported"
-            )
-            result["status"] = "insufficient"
-            result["reason"] = control_note
-        else:
-            control_note = (
-                f"control column {match!r} reproduced within "
-                f"{abs(control_ratio - 1.0):.1%} across the two trees"
-            )
-
-stage = {
-    "status": {"regression": "fail", "ok": "pass"}.get(result["status"], "skip"),
-    "baseline_method": baseline_method,
-    "baseline": (
-        f"{base_sha} with the candidate patch reversed, same worktree and GPU"
-        if baseline_method != "target-transplant"
-        else (
-            f"{base_sha} with the candidate patch reversed and this PR's own target file "
-            "copied in, same worktree and GPU; the target drives an entry point that exists "
-            "on both sides, so this times the pre-PR implementation through the same harness"
-        )
-    ),
-    "command": command or "(target's default entry point)",
-    "harness": basis,
-    "threshold": result.get("threshold"),
-    "matched_rows": result.get("matched_rows", 0),
-    # How rows were paired across the two sides. A relaxed key is a fact a reader needs: it
-    # means the target printed an unlabeled measurement column that the strict key would
-    # have treated as part of each row's identity.
-    "row_key_basis": result.get("row_key_basis", "unknown"),
-    "columns": result.get("columns", {}),
-    # Repeat count is part of the claim, not trivia: the threshold is only defensible
-    # because each cell is a best-of-N, so a reader has to be able to see N.
-    "repeats": {
-        "base": result.get("base_runs", 1),
-        "head": result.get("head_runs", 1),
-        "reduction": "best sample per cell (min latency / max throughput)",
-    },
-    "base_log": base_log,
-    "head_log": head_log,
-    "note": result.get("reason") or "",
-}
-if control_note:
-    stage["control_column"] = control_column
-    stage["control_note"] = control_note
-    if control_ratio is not None:
-        stage["control_ratio"] = control_ratio
-# median_ratio is omitted, never nulled, when there is no measurement: report_schema.json
-# types it as a number, and a null would fail validation at review-pr's identity gate --
-# turning "we could not measure" into "this report is malformed".
-# A stage the control gate rejected must not carry the numbers it rejected. Publishing a
-# median_ratio and a regressed_rows list beside `status: skip` reads as a regression that
-# was merely not acted on, when what happened is that the comparison was found
-# unattributable and no ratio is claimed at all.
-if control_note and result["status"] == "insufficient":
-    for field in ("median_ratio", "worst_column", "regressed_rows"):
-        result.pop(field, None)
-if result.get("median_ratio") is not None:
-    stage["median_ratio"] = result["median_ratio"]
-if result.get("worst_column"):
-    stage["worst_column"] = result["worst_column"]
-if result.get("regressed_rows"):
-    stage["regressed_rows"] = result["regressed_rows"]
-data["stages"]["perf"] = stage
-
-if result["status"] == "regression":
-    rows = ", ".join(
-        f"{row['row']}: {row['base']:g} -> {row['head']:g}"
-        for row in result.get("regressed_rows", [])[:3]
-    )
-    data["findings"].append(
-        {
-            "severity": "should-fix",
-            "stage": "perf",
-            "detail": (
-                "head is slower than base on the same locked GPU -- "
-                + result["reason"]
-                + (f"; worst rows: {rows}" if rows else "")
-            ),
-        }
-    )
-elif result["status"] == "insufficient":
-    data["findings"].append(
-        {
-            "severity": "note",
-            "stage": "perf",
-            "detail": f"no perf comparison was made: {result['reason']}",
-        }
-    )
-json.dump(data, open(report_path, "w"), indent=2)
-PY
-  fi
+  PERF_MANIFEST="$WORK/perf-measurements.json"
+  rm -f "$PERF_MANIFEST"
+  for PERF_SLOT in "${!PERF_TARGETS[@]}"; do
+    PERF_WHY="${PERF_SKIP_REASONS[$PERF_SLOT]}"
+    PERF_JSON=""
+    PERF_SLOT_BASE_LOGS=()
+    PERF_SLOT_HEAD_LOGS=()
+    [ -n "${PERF_BASE_LOGS_JOINED[$PERF_SLOT]}" ] \
+      && mapfile -t PERF_SLOT_BASE_LOGS <<<"${PERF_BASE_LOGS_JOINED[$PERF_SLOT]}"
+    [ -n "${PERF_HEAD_LOGS_JOINED[$PERF_SLOT]}" ] \
+      && mapfile -t PERF_SLOT_HEAD_LOGS <<<"${PERF_HEAD_LOGS_JOINED[$PERF_SLOT]}"
+    if [ -n "$PERF_WHY" ]; then
+      :
+    elif [ "${#PERF_SLOT_BASE_LOGS[@]}" -eq 0 ] \
+        || [ "${#PERF_SLOT_HEAD_LOGS[@]}" -eq 0 ]; then
+      PERF_WHY="the run did not reach both a baseline and a head phase"
+      [ "$CAN_TEST" -eq 0 ] && PERF_WHY="${SKIP_REASON:-$PERF_WHY}"
+    elif [ "${PERF_BASE_RCS[$PERF_SLOT]}" -ne 0 ] \
+        || [ "${PERF_HEAD_RCS[$PERF_SLOT]}" -ne 0 ]; then
+      # Deliberately not a regression. A nonzero exit means the log is truncated at an unknown
+      # point, so any ratio drawn from it compares whatever printed before the crash.
+      PERF_WHY="benchmark run exited nonzero (base=${PERF_BASE_RCS[$PERF_SLOT]} head=${PERF_HEAD_RCS[$PERF_SLOT]}); timings from a truncated run are not comparable"
+    else
+      PERF_JSON="$WORK/perf-compare-$PERF_SLOT.json"
+      "$SCRIPT_DIR/scrape_perf.py" \
+        --base "${PERF_SLOT_BASE_LOGS[@]}" --head "${PERF_SLOT_HEAD_LOGS[@]}" \
+        --threshold "$PERF_THRESHOLD" --min-rows "$PERF_MIN_ROWS" \
+        --out "$PERF_JSON" >/dev/null 2>"$WORK/perf-compare-$PERF_SLOT.err"
+      PERF_CMP_RC=$?
+      if [ "$PERF_CMP_RC" -ne 0 ] || [ ! -r "$PERF_JSON" ]; then
+        PERF_WHY="the benchmark comparison failed: $(log_excerpt "$WORK/perf-compare-$PERF_SLOT.err")"
+        PERF_JSON=""
+      fi
+    fi
+    "$SCRIPT_DIR/scrape_perf.py" measure \
+      --manifest "$PERF_MANIFEST" \
+      --target "${PERF_TARGETS[$PERF_SLOT]}" \
+      --target-basis "${PERF_TARGET_BASES[$PERF_SLOT]}" \
+      --target-basis-reason "${PERF_TARGET_BASIS_REASONS[$PERF_SLOT]}" \
+      --target-provenance "${PERF_TARGET_PROVENANCES[$PERF_SLOT]}" \
+      --target-provenance-reason "${PERF_TARGET_PROVENANCE_REASONS[$PERF_SLOT]}" \
+      --skip-reason "$PERF_WHY" --compare "$PERF_JSON" \
+      --base-log "${PERF_SLOT_BASE_LOGS[0]:-}" \
+      --head-log "${PERF_SLOT_HEAD_LOGS[0]:-}" \
+      --base-sha "$BASE_SHA" --command "${PERF_ARGS_LIST[$PERF_SLOT]}" \
+      --basis "${PERF_BASIS_LIST[$PERF_SLOT]}" \
+      --baseline-method "${PERF_BASELINE_METHODS[$PERF_SLOT]}" \
+      --control-column "$PERF_CONTROL_COLUMN" --control-tol "$PERF_CONTROL_TOL"
+  done
+  # A run that never got both phases cannot say a benchmark was missing -- it could not have
+  # run one either way, and its verdict is INCONCLUSIVE, which a should-fix would overwrite
+  # with the more confident NEEDS_WORK.
+  # BASE_READY is only assigned inside the branch CAN_TEST=1 takes, so it is read through a
+  # default: under `set -u` an unset name is a crash, and crashing here would cost the whole
+  # report to answer a question whose answer is already "no".
+  PERF_PHASES_REACHED=0
+  [ "$CAN_TEST" -eq 1 ] && [ "${BASE_READY:-0}" -eq 1 ] && PERF_PHASES_REACHED=1
+  "$SCRIPT_DIR/scrape_perf.py" stage --report "$JSON" --manifest "$PERF_MANIFEST" \
+    --kernel-modules "$PERF_KERNEL_MODULES" --native-paths "$PERF_NATIVE_PATHS" \
+    --candidates "$PERF_CANDIDATES" --phases-reached "$PERF_PHASES_REACHED"
+  PERF_STAGE_COMPOSED=1
 fi
+
+# After the chain, not inside it. stage_note REPLACES stages.perf wholesale, so a field
+# written by the branch above would survive on some paths and vanish on others -- and the
+# reader most in need of knowing which file was timed is the one reading a `skip`. Skipped
+# when the measurements composed the stage, because there the target fields describe the
+# measurement that gates, and this would overwrite that answer with the first target's.
+if [ "$PERF_STAGE_COMPOSED" -ne 1 ]; then
+  jset_string "stages.perf.target" "$PERF_TARGET"
+  jset_string "stages.perf.target_basis" "$PERF_TARGET_BASIS"
+  jset_string "stages.perf.target_provenance" "$PERF_TARGET_PROVENANCE"
+  jset_string "stages.perf.target_provenance_reason" "$PERF_TARGET_PROVENANCE_REASON"
+  jset_string "stages.perf.target_basis_reason" "$PERF_TARGET_BASIS_REASON"
+fi
+# Reported even where discovery declined, and especially there: a reader who is told only
+# "the fallback stood" cannot tell an empty search from a search that found three benches and
+# refused to pick between them. The second of those is a question for the caller.
+jset_json "stages.perf.candidates" "$PERF_CANDIDATES"
 
 record_gpu_activity_after
 finish_report

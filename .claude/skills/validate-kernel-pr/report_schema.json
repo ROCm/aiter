@@ -89,7 +89,7 @@
       }
     },
     "passing_correctness_stage": {
-      "description": "What a correctness stage has to look like for the report to be PASS: it ran, it exited 0, and it executed at least one test. Referenced by both correctness stages -- they were spelled out twice, and divergence between two copies of the PASS gate would silently change what earns a clearance.",
+      "description": "What the correctness stage has to look like for the report to be PASS: it ran, it exited 0, and it executed at least one test.",
       "required": [
         "status",
         "exit",
@@ -299,26 +299,20 @@
       "type": "object",
       "required": [
         "target",
-        "shape_env",
-        "grid",
         "expected_route",
         "shape_vars",
+        "test_provenance",
         "runner",
         "runner_reason"
       ],
       "properties": {
         "target": {
-          "type": "string",
+          "type": [
+            "string",
+            "null"
+          ],
           "minLength": 1,
-          "description": "Exact script file or pytest node/file selected by the caller."
-        },
-        "shape_env": {
-          "type": "string",
-          "description": "Environment variable used to inject the independent grid, or an empty string."
-        },
-        "shape_arg": {
-          "type": "string",
-          "description": "The target's own CLI flag used to inject the independent grid, or an empty string when the environment-variable channel or no channel was used."
+          "description": "Exact script file or pytest node/file selected by the caller. Null means the caller declared, with a reason in test_provenance_reason, that no test exercises this change -- which is a blocker, not an absence."
         },
         "gpu_requirement": {
           "type": "string",
@@ -332,17 +326,13 @@
           "type": "string",
           "description": "How gpu_requirement was established, including the executed-test count that rules out a suite which merely skipped everything."
         },
-        "grid": {
-          "type": "string",
-          "description": "Independent shape grid supplied by the caller, or an empty string."
-        },
         "expected_route": {
           "type": "string",
           "description": "Kernel or dispatch route that the execution receipt must prove."
         },
         "shape_vars": {
           "type": "string",
-          "description": "Comma-separated local variable names captured from each observed route call."
+          "description": "Optional comma-separated local variable names captured from each observed route call. Empty means route-only evidence."
         },
         "runner": {
           "type": "string",
@@ -357,114 +347,30 @@
           "type": "string",
           "minLength": 1
         },
-        "shape_argnames": {
-          "type": "string",
-          "description": "Comma-separated pytest parameter names the independent grid replaced, or an empty string when another channel or no channel was used."
-        },
-        "grid_channel": {
+        "runner_basis": {
           "type": "string",
           "enum": [
-            "",
-            "cli",
-            "env",
-            "pytest"
+            "declared-by-caller",
+            "explicit-node-selector",
+            "target-missing",
+            "undeclared"
           ],
-          "description": "Which channel actually delivered the independent grid. Empty when none was established. Declared but deliberately NOT required, so reports from earlier validators stay valid."
+          "description": "Where the runner came from. The validator no longer classifies the target, so 'declared-by-caller' marks the runner as the caller's claim rather than a measurement -- a distinction a reader needs to weigh a failure that the runner choice, not the code, produced."
         },
-        "grid_channel_reason": {
-          "type": "string",
-          "description": "When no channel was established, names each channel tried and what was found in the target -- so a limit of the validator is never published as a property of the target."
-        },
-        "grid_independence": {
+        "test_provenance": {
           "type": "string",
           "enum": [
-            "adds-coverage",
-            "duplicates-target-defaults",
+            "pre-existing",
+            "pr-added",
+            "pr-modified",
+            "none",
             "unknown"
           ],
-          "description": "Whether the requested grid cells ask for anything outside the target's own declared default for the same channel. A proven hook says the target CONSUMES the grid; this says whether the grid adds coverage."
+          "description": "Where the evidence came from, relative to the patch. A pre-existing test was not written to make this PR pass; a pr-added or pr-modified one was written by the same hand as the code it grades and can pass vacuously. Both are worth running, only one is independent, and a report that says only 'the target passed' has hidden which it got. 'none' is the caller's declaration that no test exercises the change at all."
         },
-        "grid_independence_reason": {
-          "type": "string"
-        },
-        "axis_state": {
+        "test_provenance_reason": {
           "type": "string",
-          "enum": [
-            "none",
-            "declared",
-            "proven",
-            "hook-not-found",
-            "hook-not-consumed",
-            "unusable"
-          ],
-          "description": "How far the requested extra axes got. Only `proven` means every axis flag was observed refusing a deliberately invalid value and its values rode the grid run."
-        },
-        "axis_state_reason": {
-          "type": "string"
-        },
-        "runner_risk": {
-          "type": "string",
-          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
-        },
-        "axes": {
-          "type": "array",
-          "description": "Extra independent test axes, each on its own CLI flag. The shape grid is one ordered tuple on one channel; an axis is a separate knob the shape flag cannot reach, such as a head count.",
-          "items": {
-            "type": "object",
-            "properties": {
-              "name": {
-                "type": "string"
-              },
-              "flag": {
-                "type": "string"
-              },
-              "values": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "hook_proof": {
-                "type": "string",
-                "enum": [
-                  "flag-declared-in-add_argument",
-                  "flag-not-declared",
-                  "malformed-axis-spec",
-                  "not-evaluated"
-                ]
-              },
-              "target_defaults": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "novel_values": {
-                "type": "array",
-                "items": {
-                  "type": "string"
-                }
-              },
-              "independence": {
-                "type": "string",
-                "enum": [
-                  "adds-coverage",
-                  "duplicates-target-defaults",
-                  "unknown"
-                ]
-              }
-            },
-            "required": [
-              "name",
-              "flag",
-              "values",
-              "hook_proof"
-            ]
-          }
-        },
-        "runner_risk": {
-          "type": "string",
-          "description": "A structural reason the SELECTED runner may be unable to run this target, e.g. a module body that parses argv, which pytest executes at collection with its own argv."
+          "description": "How that classification was reached, in terms a reader can check against the patch."
         }
       }
     },
@@ -478,7 +384,6 @@
         "test_policy",
         "baseline_control",
         "correctness_repo_tests",
-        "correctness_s1_grid",
         "execution_receipt",
         "index_width_scan"
       ],
@@ -621,29 +526,13 @@
             }
           }
         },
-        "correctness_s1_grid": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/stage"
-            }
-          ],
-          "description": "A shape grid this skill owns, independent of what the PR chose to test: non-toy, boundary/odd, long-context. 'skip' with repo-default-only when the kernel exposes no shape override.",
-          "properties": {
-            "grid": {
-              "type": "string"
-            },
-            "stats": {
-              "$ref": "#/definitions/execution_stats"
-            }
-          }
-        },
         "execution_receipt": {
           "allOf": [
             {
               "$ref": "#/definitions/stage"
             }
           ],
-          "description": "Machine-readable proof from the selected test naming the observed route, kernel symbols and every executed grid shape.",
+          "description": "Machine-readable proof from the selected test naming the observed route, kernel symbols and every shape the route was called with.",
           "properties": {
             "route": {
               "type": "string"
@@ -657,21 +546,11 @@
                 "type": "string"
               }
             },
-            "required_shapes": {
-              "type": "array",
-              "items": {
-                "type": "string"
-              }
-            },
             "executed_shapes": {
               "type": "array",
               "items": {
                 "type": "string"
               }
-            },
-            "shape_namespace": {
-              "type": "string",
-              "minLength": 1
             },
             "shape_capture": {
               "type": "object",
@@ -753,6 +632,51 @@
               "type": "string"
             },
             "harness": {
+              "type": "string"
+            },
+            "target": {
+              "type": "string",
+              "description": "The file the timing runs execute. Not the same thing as `test_selection.target`, which is the correctness target and may be a pytest node id: a timing run executes a file. Reported on every status, including `skip` -- the reader most in need of knowing which file was timed is the one reading a report where nothing was."
+            },
+            "target_basis": {
+              "type": "string",
+              "enum": [
+                "declared-by-caller",
+                "discovered-pr-shipped",
+                "discovered-repo-bench",
+                "same-as-correctness-target"
+              ],
+              "description": "Whose choice the timed file was. `declared-by-caller` means someone who read the diff named it with --perf-target. `discovered-repo-bench` means the repository already owned exactly one benchmark importing a module the patch changed; it is preferred over the next because a pre-existing bench is on both sides of the patch and needs no transplant. `discovered-pr-shipped` means the patch wrote exactly one file carrying a benchmark harness. `same-as-correctness-target` is the fallback, which is an inference and not a reading of the change -- it also covers every case discovery DECLINED, so read `target_basis_reason` and `candidates` before concluding nothing was found."
+            },
+            "target_basis_reason": {
+              "type": "string",
+              "description": "Why the timed file is the one it is. Carries the decline reason when discovery refused to choose."
+            },
+            "candidates": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "description": "Every file discovery considered a possible perf target. More than one means discovery declined rather than picked: which of several benches measures a given change is a reading of the diff, not a fact about it, and the caller settles it with --perf-target."
+            },
+            "measurements": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              },
+              "description": "One entry per timed target, each carrying its own `target`, `target_basis`, `target_provenance`, baseline method and result -- including the targets that produced no number, so a reader can tell a path that was never tried from one that was tried and could not be measured. When both discovery paths resolve, both are timed: a bench already in the repository and a bench the PR wrote measure different things. The fields at the top of this stage mirror whichever entry gates, so a reader who does not care that there were several sees exactly what a single-target report showed."
+            },
+            "target_provenance": {
+              "type": "string",
+              "enum": [
+                "pre-existing",
+                "pr-added",
+                "pr-modified",
+                "unknown"
+              ],
+              "description": "Whether the patch wrote the file being timed, computed by the same function as `test_selection.test_provenance` against the same post-apply snapshot. `pre-existing` is the only value under which the baseline needs no transplant, because the file is on both sides of the patch. `unknown` when no patch was supplied and nothing separates the target from the change."
+            },
+            "target_provenance_reason": {
               "type": "string"
             },
             "base_log": {
@@ -940,9 +864,6 @@
               "expected_route": {
                 "minLength": 1
               },
-              "shape_vars": {
-                "minLength": 1
-              },
               "runner": {
                 "enum": [
                   "pytest",
@@ -997,16 +918,12 @@
               "correctness_repo_tests": {
                 "$ref": "#/definitions/passing_correctness_stage"
               },
-              "correctness_s1_grid": {
-                "$ref": "#/definitions/passing_correctness_stage"
-              },
               "execution_receipt": {
                 "required": [
                   "status",
                   "producer",
                   "route",
                   "kernel_symbols",
-                  "required_shapes",
                   "executed_shapes",
                   "receipt_sha256"
                 ],
@@ -1029,17 +946,8 @@
                       "minLength": 1
                     }
                   },
-                  "required_shapes": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                      "type": "string",
-                      "minLength": 1
-                    }
-                  },
                   "executed_shapes": {
                     "type": "array",
-                    "minItems": 1,
                     "items": {
                       "type": "string",
                       "minLength": 1

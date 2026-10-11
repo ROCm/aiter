@@ -51,6 +51,7 @@ usage: scrape_perf.py --base b1.log [b2.log ...] --head h1.log [h2.log ...]
 """
 
 import argparse
+import ast
 import json
 import re
 import statistics
@@ -434,7 +435,1003 @@ def compare(base_texts, head_texts, threshold, min_rows):
     return result
 
 
+# --------------------------------------------------------------------------------------
+# The decisions that surround a timing run.
+#
+# The runs themselves stay in the entry point, for the same reason the target launch does:
+# they need the locked GPU, the phase's warm cache root, and a timeout the entry point owns.
+# What does not need to be there is the reasoning -- which harness the target has, what a
+# timing run is allowed to leave behind, and whether a measured difference is attributable.
+# Those were bash heredocs, which is to say they were untestable, and they are here instead.
+
+
+def detect_harness(text):
+    """Which benchmark entry point the target's own source offers, if any.
+
+    Returns {"args": ..., "basis": ...}, or None when the target exposes no harness.
+
+    Keep this in step with perf_command() in review-pr/SKILL.md, which computes the manual
+    fallback recipe. If the two disagree, that step prints a recipe for a harness this stage
+    declined to use, or "no benchmark entry point" for a target this stage happily timed.
+    A test asserts they agree, because a comment cannot enforce it.
+
+    A harness cannot be inferred from the diff, only from the target's text, and aiter
+    carries three conventions for it. Getting this wrong is survivable in one direction
+    only, which is why the tests below matter: a MISSED harness reports `skip` when there
+    was something to measure, while a FALSE harness produces a run with no timing table --
+    which lands on `skip` as well. Neither can manufacture a regression, because the
+    comparison is the ledger and it only ever counts rows it actually parsed.
+    """
+    if "--scenario" in text and "bench" in text:
+        return {"args": "--scenario bench", "basis": "target exposes --scenario bench"}
+    if "perftest" in text or "@benchmark" in text:
+        # `perftest`, not `run_perftest`. The bare decorator is one of aiter's three timing
+        # conventions; matching only the longer name misses 12 of the 123 targets in
+        # op_tests/, 11 with live `perftest` usage. Reporting those as "no benchmark entry
+        # point" reads as "there was nothing to measure" when the truth is that the detector
+        # was too narrow -- the failure mode this whole stage exists to avoid.
+        #
+        # A substring test, not a parse, so it also matches a commented-out import (the
+        # 12th target). That error is the safe one, per the docstring above.
+        return {"args": "", "basis": "target uses the perftest/@benchmark harness"}
+    if "triton.testing.perf_report" in text or "triton.testing.do_bench" in text:
+        # aiter's fourth convention, and the one its DEDICATED benchmark directory is written
+        # in. Measured: 58 of the 67 files under op_tests/op_benchmarks/ time themselves this
+        # way and exactly one of the 59 repo-wide also matches a rule above -- so every rule
+        # this detector had was blind to almost the whole of op_benchmarks/. Pointing
+        # --perf-target straight at bench_gemm_a8w8.py reported "no benchmark entry point".
+        #
+        # Which is precisely the failure this docstring names: a missed harness says "there
+        # was nothing to measure" when the truth is that the detector was too narrow.
+        return {
+            "args": "",
+            "basis": "target uses the triton.testing perf_report/do_bench harness",
+        }
+    return None
+
+
+# How the validator came to be timing the file it timed. `same-as-correctness-target` is the
+# fallback and is an INFERENCE -- nobody read the diff and concluded that file was the right
+# one to time; it is simply the only file the caller named.
+BASIS_CALLER = "declared-by-caller"
+BASIS_FALLBACK = "same-as-correctness-target"
+BASIS_SHIPPED = "discovered-pr-shipped"
+BASIS_REPO = "discovered-repo-bench"
+
+# The namespace a kernel change lives in. Discovery's second path asks which benches import
+# what the patch changed, and a change outside this prefix is not a kernel change: editing a
+# test's input generator would otherwise match the bench that imports that test, and the perf
+# stage would report on a file whose kernel nobody touched.
+KERNEL_PREFIX = "aiter"
+
+# Where aiter keeps the C++/HIP the python kernels dispatch into. Nothing this validator
+# launches reaches it: every target runs under AITER_TRITON_ONLY=1.
+NATIVE_PREFIX = "csrc/"
+
+
+def discover_shipped(status_text, read_text):
+    """Files the PATCH ITSELF wrote that carry a benchmark harness.
+
+    The first of the two places a perf target comes from: a PR that means to be faster
+    usually says so by bringing a bench along. This is the cheap half -- the patch already
+    told us which files it touched, and `detect_harness` already knows what a bench looks
+    like, so the only new work is asking the second question of the answers to the first.
+
+    `read_text` is injected rather than opened here, for the same reason `restore_worktree`
+    injects its three filesystem effects: the decision is then testable without a worktree,
+    and a decision that decides what gets EXECUTED deserves that.
+
+    Deletions are skipped. A file the patch removes is not on head and cannot be timed, and
+    the resulting `no such file` would arrive as a mysterious perf skip rather than as the
+    plain fact that the bench is gone. Git-quoted paths are skipped and returned separately:
+    this list feeds a `cp`, and a path we cannot spell is a path we must not act on.
+    """
+    candidates, unspellable = [], []
+    for line in status_text.splitlines():
+        if len(line) <= 3:
+            continue
+        code, path = line[:2], line[3:]
+        if path.startswith('"'):
+            unspellable.append(path)
+            continue
+        if "D" in code or not path.endswith(".py"):
+            continue
+        text = read_text(path)
+        if text is not None and detect_harness(text) is not None:
+            candidates.append(path)
+    return {"candidates": sorted(candidates), "unspellable": unspellable}
+
+
+def changed_kernel_modules(status_text):
+    """Dotted module names for the kernel sources the patch changed.
+
+    `aiter/ops/triton/gemm/basic/gemm_a8w8.py` -> `aiter.ops.triton.gemm.basic.gemm_a8w8`,
+    and a package's `__init__.py` -> the package. Deletions are skipped: a module that is not
+    on head cannot be imported by anything we are about to run.
+    """
+    modules = []
+    for line in status_text.splitlines():
+        if len(line) <= 3:
+            continue
+        code, path = line[:2], line[3:]
+        if path.startswith('"') or "D" in code or not path.endswith(".py"):
+            continue
+        name = module_name(path)
+        if not name or name.split(".")[0] != KERNEL_PREFIX:
+            continue
+        modules.append(name)
+    return sorted(set(modules))
+
+
+# A changed line that cannot alter what the machine does: blank, or a whole-line `#` comment.
+# Not an attempt to understand the diff -- just to tell "this kernel was edited" from "this
+# kernel's comments were edited", which is the difference between a gap worth naming and a
+# should-fix charged to somebody who fixed a typo.
+INERT_LINE_RE = re.compile(r"^\s*(#.*)?$")
+
+
+def substantive_modules(modules, patch_text):
+    """The subset of `modules` whose file the patch changes in code, not only in comments.
+
+    The coverage gap asks the author to bring a benchmark. Asking that of a PR that added a
+    docstring to a kernel would be the false positive this whole layer is arranged to avoid,
+    and it is not a hypothetical: a comment-only edit is what a harmless kernel PR looks
+    like. Under-matching is the safe direction here as everywhere else -- a module dropped
+    costs a finding nobody reads, a module kept wrongly costs an author a NEEDS_WORK.
+
+    A patch that cannot be read at all yields nothing, for the same reason.
+    """
+    touched, current = set(), None
+    for line in patch_text.splitlines():
+        if line.startswith("+++ "):
+            name = line[4:].strip()
+            current = name[2:] if name.startswith("b/") else name
+            continue
+        if current is None or line.startswith(("+++", "---")):
+            continue
+        if line[:1] in "+-" and not INERT_LINE_RE.match(line[1:]):
+            touched.add(current)
+    live = {module_name(path) for path in touched}
+    return [module for module in modules if module in live]
+
+
+def module_name(path):
+    """`aiter/ops/triton/k.py` -> `aiter.ops.triton.k`; a package's __init__ -> the package."""
+    if not path.endswith(".py"):
+        return ""
+    parts = path[: -len(".py")].split("/")
+    if parts[-1] == "__init__":
+        parts.pop()
+    return ".".join(parts)
+
+
+def changed_native(status_text):
+    """The C++/HIP sources the patch changed, which no timing run here will execute.
+
+    Separate from changed_kernel_modules because the two earn different severities. Every
+    target this validator launches runs under AITER_TRITON_ONLY=1, so a change under csrc/ is
+    not reached by anything it can time. That is this tool's blind spot, not a gap in the
+    author's evidence, and a should-fix for it would charge somebody for a limit of the
+    instrument.
+    """
+    paths = []
+    for line in status_text.splitlines():
+        if len(line) <= 3:
+            continue
+        code, path = line[:2], line[3:]
+        if path.startswith('"') or "D" in code:
+            continue
+        if path.startswith(NATIVE_PREFIX):
+            paths.append(path)
+    return sorted(set(paths))
+
+
+def imported_modules(text):
+    """Every module name a file imports, however it spells the import.
+
+    Parsed, not matched. aiter benches spell the same edge three ways --
+    `import aiter.ops.mha`, `from aiter.ops.triton.attention.mla import mla_decode_fwd`, and
+    `from aiter.ops.triton.attention import extend_attention` where the imported name is
+    itself a module. The last form is common enough in op_benchmarks/ that a regex over the
+    dotted path alone misses it, and a regex loose enough to catch it also matches
+    `gemm_a8w8_preshuffle` when the patch touched `gemm_a8w8`. The parse has neither problem.
+
+    A file that does not parse contributes nothing. That is the safe direction: it costs a
+    candidate, where a wrong candidate costs a finding against a PR author.
+
+    Relative imports are skipped -- resolving them needs the importing package, and a bench
+    that reaches a kernel through one is not something to guess at.
+    """
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module)
+            names.update(f"{node.module}.{alias.name}" for alias in node.names)
+    return names
+
+
+def discover_repo_benches(modules, walk, read_text, exclude=()):
+    """Files ALREADY in the repo that both carry a harness and import what changed.
+
+    The second of the two places a perf target comes from, and the one that covers the
+    ordinary kernel PR: the author changed a kernel and the repository already owns the bench
+    that measures it. `op_tests/op_benchmarks/triton/bench_gemm_a8w8.py` imports
+    `aiter.ops.triton.gemm.basic.gemm_a8w8` -- that import is an edge that can be checked,
+    where a matching filename is only a resemblance.
+
+    What the edge proves is that the bench REFERENCES the changed module. It does not prove
+    the bench executes the changed line: run_perf deliberately injects no probe, because a
+    traced kernel is not the kernel whose latency we are reporting, so nothing downstream can
+    close that gap. It is bounded instead by declining whenever the answer is not unique.
+    """
+    found = []
+    for path in walk():
+        if path in exclude:
+            continue
+        text = read_text(path)
+        if text is None or detect_harness(text) is None:
+            continue
+        if imported_modules(text) & set(modules):
+            found.append(path)
+    return sorted(found)
+
+
+# Where aiter keeps the files whose only job is timing. Used to break a tie between several
+# benches that all import the changed module, and ONLY to break a tie -- never to find a
+# candidate that the import edge did not already prove.
+#
+# This is not the filename-resemblance guess the import edge exists to avoid. `bench_gemm_a8w8`
+# looking like `gemm_a8w8` is a resemblance; a file living in the directory the project set
+# aside for benchmarks is a fact about how the project organises itself. Measured on 40 random
+# triton kernel modules: 10 resolved to one bench and 6 declined as ambiguous -- and all 6 had
+# a candidate here, so this converts every ambiguous case in the sample without touching the
+# refusals that matter. A change to the shared aiter.ops.triton.utils.types still declines,
+# because 13 of its 14 candidates are under this prefix and a tie is still a tie.
+BENCH_HOME = "op_tests/op_benchmarks/"
+
+
+def _resolve(candidates, correctness_target, kind, advice):
+    """One path's candidate list reduced to a target, or to the reason there is none.
+
+    Resolve the caller's own target, a unique candidate, or the repository tie-break. That
+    asymmetry is the safety argument for discovery: a target declined costs a
+    measurement, while a target picked WRONG spends a should-fix finding on a PR author whose
+    code may be innocent -- and nothing downstream can tell the two apart, because run_perf
+    injects no probe and no evidence exists that the bench executed the changed line.
+
+    Refusing to choose between several is the rule --runner established: a caller who can see
+    the diff decides, and the report says a choice was owed rather than inventing one.
+    """
+    if not candidates:
+        return None, f"nothing is {kind}"
+    if correctness_target in candidates:
+        return correctness_target, (
+            f"the correctness target is itself {advice}; its correctness run does not "
+            "replace a base/head timing comparison"
+        )
+    if len(candidates) > 1:
+        # One tie-break before declining, and only among candidates the import edge already
+        # proved: if exactly one of them lives where the project keeps its benchmarks, that is
+        # the benchmark. Anything else and the choice is a reading of the diff.
+        home = [path for path in candidates if path.startswith(BENCH_HOME)]
+        if len(home) == 1:
+            return home[0], ""
+        return None, (
+            "%d files are %s (%s); which of them measures this change is a reading of the "
+            "diff and not a fact about it, so name one with --perf-target"
+            % (len(candidates), kind, ", ".join(candidates))
+        )
+    return candidates[0], ""
+
+
+def choose_perf_targets(shipped, repo_benches, correctness_target):
+    """Every discovered target worth timing, or the single fallback entry.
+
+    When both paths resolve, BOTH are timed. They are not two guesses at one answer that a
+    tie-break should reduce to one: a bench already in the repository and a bench the PR
+    wrote measure different things, and the second is the one whose author chose what it
+    would say. Timing only the first would let a PR ship a bench nobody ran; timing only the
+    second would take the author's word for which numbers matter. The cost is one extra pair
+    of runs, and which of them decides the verdict is settled later by gate(), on the
+    measurements rather than on the choice.
+
+    The repository bench is listed first, and the reason is mechanical rather than a
+    preference. A pre-existing bench is on BOTH sides of the patch, so the baseline is this
+    worktree with the patch reversed -- one tree, no extra burden of proof. A bench the PR
+    adds is absent from base and forces the target-transplant baseline, which spans two trees
+    and is only attributable when --perf-control-column reproduces across them. Ordering the
+    cheaper, more attributable comparison first is not taste; it is also the order gate()
+    falls back on when nothing separates them.
+    """
+    repo_target, repo_reason = _resolve(
+        repo_benches,
+        correctness_target,
+        "a benchmark already in the repository importing what the patch changed",
+        "the repository's benchmark for what the patch changed",
+    )
+    ship_target, ship_reason = _resolve(
+        shipped["candidates"],
+        correctness_target,
+        "a file the patch ships carrying a benchmark harness",
+        "the benchmark the patch ships",
+    )
+    candidates = sorted(set(repo_benches) | set(shipped["candidates"]))
+    targets = []
+
+    if repo_target is not None:
+        targets.append(
+            {
+                "basis": (
+                    BASIS_FALLBACK if repo_target == correctness_target else BASIS_REPO
+                ),
+                "target": repo_target,
+                "reason": repo_reason
+                or (
+                    "the repository benchmark imports what this "
+                    "patch changed, and it is on both sides of the patch so the baseline "
+                    "needs no transplant"
+                ),
+            }
+        )
+    if ship_target is not None and ship_target != repo_target:
+        targets.append(
+            {
+                "basis": (
+                    BASIS_FALLBACK
+                    if ship_target == correctness_target
+                    else BASIS_SHIPPED
+                ),
+                "target": ship_target,
+                "reason": ship_reason
+                or (
+                    "the patch ships exactly one file carrying a benchmark harness"
+                    + (
+                        ""
+                        if repo_target is not None
+                        else f", and the repository offers none: {repo_reason}"
+                    )
+                ),
+            }
+        )
+    if not targets:
+        targets.append(
+            {
+                "basis": BASIS_FALLBACK,
+                "target": correctness_target,
+                "reason": f"{repo_reason}; and {ship_reason}",
+            }
+        )
+    return {"targets": targets, "candidates": candidates}
+
+
+def _status_entries(text):
+    """`git status --porcelain` output as {path: two-letter code}."""
+    return {line[3:]: line[:2] for line in text.splitlines() if len(line) > 3}
+
+
+def restore_worktree(root, before_text, current_text, unlink, rmtree, checkout):
+    """Undo what the timing run left in the worktree, and only that.
+
+    A bench harness routinely writes its results next to the code -- aiter targets drop a
+    tuned_op_bench.csv in the repo root. The baseline phase asserts a CLEAN worktree after
+    the base runs, so an artifact left by the timing run sets BASE_READY=0 and skips the
+    entire head correctness phase: measured, the same target went PASS with --no-perf and
+    INCONCLUSIVE with perf on, with head correctness never executed. A perf stage that
+    silently disables correctness validation is far worse than no perf stage.
+
+    Scoped deliberately: only paths whose status CHANGED across the run are touched.
+    Anything already dirty beforehand is somebody else's and is left alone. Anything this
+    function cannot be sure of -- a git-quoted path, a path that resolves outside the
+    worktree -- is reported as skipped rather than guessed at, because this code deletes
+    files and a wrong guess is unrecoverable.
+
+    The three filesystem effects are injected so the decision can be tested without a
+    worktree to wreck.
+    """
+    root = Path(root).resolve()
+    before = _status_entries(before_text)
+    removed, reverted, skipped = [], [], []
+    for path, code in _status_entries(current_text).items():
+        if before.get(path) == code:
+            continue
+        if path.startswith('"'):
+            skipped.append(path)
+            continue
+        try:
+            resolved = (root / path).resolve()
+        except OSError:
+            skipped.append(path)
+            continue
+        if root != resolved and root not in resolved.parents:
+            skipped.append(path)
+            continue
+        if code == "??":
+            if resolved.is_dir() and not resolved.is_symlink():
+                rmtree(resolved)
+            else:
+                try:
+                    unlink(resolved)
+                except OSError:
+                    skipped.append(path)
+                    continue
+            removed.append(path)
+        else:
+            checkout(path)
+            reverted.append(path)
+    return {"removed": removed, "reverted": reverted, "skipped": skipped}
+
+
+def attribute(result, baseline_method, control_column, control_tol):
+    """Whether a measured difference can be charged to the patch.
+
+    Only meaningful for a transplanted baseline, where the two sides are two different
+    trees. There the difference could be anything -- a different harness path, a different
+    allocation, a different clock state -- unless a column the patch does not touch
+    reproduces across both. A number nobody can attribute is worse than no number, so
+    without that agreement the comparison is downgraded to `insufficient` and says why.
+
+    Mutates `result` (the comparison's own verdict) and returns the note, or "" when there
+    was nothing to attribute.
+    """
+    if baseline_method != "target-transplant":
+        return "", None
+    columns = result.get("columns") or {}
+    requested = control_column.strip().casefold()
+    exact = [name for name in columns if name.strip().casefold() == requested]
+    matches = exact or [name for name in columns if requested in name.casefold()]
+    if not requested or len(matches) != 1:
+        if not requested:
+            problem = "the control column name is blank"
+        elif not matches:
+            problem = f"the named control column {control_column!r} is not present in both logs"
+        else:
+            problem = (
+                f"the named control column {control_column!r} is ambiguous: {matches}"
+            )
+        note = f"{problem}, so this cross-tree comparison cannot be attributed"
+        result["status"] = "insufficient"
+        result["reason"] = note
+        return note, None
+    match = matches[0]
+    ratio = columns[match].get("median_ratio")
+    tolerance = float(control_tol)
+    if ratio is None or abs(ratio - 1.0) > tolerance:
+        moved = "unknown" if ratio is None else f"{abs(ratio - 1.0):.1%}"
+        note = (
+            f"the control column {match!r} moved by {moved} across the two trees "
+            f"(tolerance {tolerance:.0%}); the patch does not touch it, so the two runs "
+            "are not comparable and no ratio is reported"
+        )
+        result["status"] = "insufficient"
+        result["reason"] = note
+        return note, ratio
+    return (
+        f"control column {match!r} reproduced within {abs(ratio - 1.0):.1%} "
+        "across the two trees"
+    ), ratio
+
+
+def perf_stage(result, context):
+    """The perf stage entry and any finding it earns, from a finished comparison.
+
+    Returns (stage, findings). The verdict mapping is the narrow one on purpose: only
+    `regression` may fail and only `ok` may pass. A timeout, a crash, a missing harness and
+    a one-row table all land on `skip`, because a false regression here blocks a good PR
+    and would get the stage switched off within a week.
+    """
+    control_note, control_ratio = attribute(
+        result,
+        context["baseline_method"],
+        context["control_column"],
+        context["control_tol"],
+    )
+    baseline_method = context["baseline_method"]
+    base_sha = context["base_sha"]
+    stage = {
+        "status": {"regression": "fail", "ok": "pass"}.get(result["status"], "skip"),
+        "baseline_method": baseline_method,
+        "baseline": (
+            f"{base_sha} with the candidate patch reversed, same worktree and GPU"
+            if baseline_method != "target-transplant"
+            else (
+                f"{base_sha} with the candidate patch reversed and this PR's own target "
+                "file copied in, same worktree and GPU; the target drives an entry point "
+                "that exists on both sides, so this times the pre-PR implementation "
+                "through the same harness"
+            )
+        ),
+        "command": context["command"] or "(target's default entry point)",
+        "harness": context["basis"],
+        "threshold": result.get("threshold"),
+        "matched_rows": result.get("matched_rows", 0),
+        # How rows were paired across the two sides. A relaxed key is a fact a reader
+        # needs: it means the target printed an unlabeled measurement column that the
+        # strict key would have treated as part of each row's identity.
+        "row_key_basis": result.get("row_key_basis", "unknown"),
+        "columns": result.get("columns", {}),
+        # Repeat count is part of the claim, not trivia: the threshold is only defensible
+        # because each cell is a best-of-N, so a reader has to be able to see N.
+        "repeats": {
+            "base": result.get("base_runs", 1),
+            "head": result.get("head_runs", 1),
+            "reduction": "best sample per cell (min latency / max throughput)",
+        },
+        "base_log": context["base_log"],
+        "head_log": context["head_log"],
+        "note": result.get("reason") or "",
+    }
+    if control_note:
+        stage["control_column"] = context["control_column"]
+        stage["control_note"] = control_note
+        if control_ratio is not None:
+            stage["control_ratio"] = control_ratio
+        # A stage the control gate rejected must not carry the numbers it rejected.
+        # Publishing a median_ratio and a regressed_rows list beside `status: skip` reads
+        # as a regression that was merely not acted on, when what happened is that the
+        # comparison was found unattributable and no ratio is claimed at all.
+        if result["status"] == "insufficient":
+            for field in ("median_ratio", "worst_column", "regressed_rows"):
+                result.pop(field, None)
+    # median_ratio is omitted, never nulled, when there is no measurement:
+    # report_schema.json types it as a number, and a null would fail validation at
+    # review-pr's identity gate -- turning "we could not measure" into "this report is
+    # malformed".
+    if result.get("median_ratio") is not None:
+        stage["median_ratio"] = result["median_ratio"]
+    if result.get("worst_column"):
+        stage["worst_column"] = result["worst_column"]
+    if result.get("regressed_rows"):
+        stage["regressed_rows"] = result["regressed_rows"]
+
+    findings = []
+    if result["status"] == "regression":
+        rows = ", ".join(
+            f"{row['row']}: {row['base']:g} -> {row['head']:g}"
+            for row in result.get("regressed_rows", [])[:3]
+        )
+        findings.append(
+            {
+                "severity": "should-fix",
+                "stage": "perf",
+                "detail": (
+                    "head is slower than base on the same locked GPU -- "
+                    + result["reason"]
+                    + (f"; worst rows: {rows}" if rows else "")
+                ),
+            }
+        )
+    elif result["status"] == "insufficient":
+        findings.append(
+            {
+                "severity": "note",
+                "stage": "perf",
+                "detail": f"no perf comparison was made: {result['reason']}",
+            }
+        )
+    return stage, findings
+
+
+# What a measurement carries about the file it timed. Repeated on every entry rather than
+# stated once for the stage: with two targets in play there is no "the" target, and a reader
+# holding one row of measurements[] must be able to tell what it measured without counting
+# back to a header.
+MEASUREMENT_TARGET_FIELDS = (
+    "target",
+    "target_basis",
+    "target_basis_reason",
+    "target_provenance",
+    "target_provenance_reason",
+)
+
+
+def measurement(context, read_text):
+    """One target's timing result: the stage entry it produces, and the findings it earns.
+
+    A target that was never timed is still a measurement. Dropping it would leave the report
+    describing only the targets that happened to work, which reads as though the others were
+    never tried -- and "the repository's bench was timed and the PR's own bench could not be"
+    is exactly the sentence a reviewer needs.
+    """
+    if context.get("skip_reason"):
+        stage = {"status": "skip", "note": context["skip_reason"]}
+        # Carried onto a skip too, when there are any. A run that exited nonzero produced a
+        # truncated log and no ratio; the log is still the only place a reader can see what
+        # it was doing when it stopped.
+        for side in ("base_log", "head_log"):
+            if context.get(side):
+                stage[side] = context[side]
+        findings = [
+            {
+                "severity": "note",
+                "stage": "perf",
+                "detail": "no base-vs-head timing was taken: " + context["skip_reason"],
+            }
+        ]
+    else:
+        stage, findings = perf_stage(json.loads(read_text(context["compare"])), context)
+    for field in MEASUREMENT_TARGET_FIELDS:
+        stage[field] = context.get(field, "")
+    return {"measurement": stage, "findings": findings}
+
+
+# `fail` is worse than `pass`, and both are worse than `skip` -- which is not a ranking of
+# outcomes but of standing. A skip made no claim, so it cannot be the measurement a verdict
+# rests on; it sinks to the bottom and only decides anything when nothing else is left.
+GATE_RANK = {"fail": 0, "pass": 1, "skip": 2}
+
+
+def gate(entries):
+    """Which of the timed targets decides the verdict.
+
+    The worse attributable number gates, and neither half of that is a new rule. A target
+    whose comparison could not be attributed reports `skip` -- the control-column gate in
+    attribute() already downgrades an unattributable cross-tree measurement, so an
+    un-chargeable number never reaches this ranking in a state where it could gate. Among
+    those that remain, taking the worst is what median_ratio already does across the columns
+    of a single table: the minimum, not the mean, because a kernel that got slower on one
+    shape got slower.
+
+    Ties fall to the earlier entry, which choose_perf_targets orders repository bench first --
+    the comparison that needed no transplant to be believable.
+    """
+
+    def worse(item):
+        index, entry = item
+        result = entry["measurement"]
+        return (
+            GATE_RANK.get(result["status"], 2),
+            result.get("median_ratio", 1.0),
+            index,
+        )
+
+    return min(enumerate(entries), key=worse)[1]
+
+
+def coverage_gap(
+    stage_status,
+    target_basis,
+    kernel_modules,
+    native_paths,
+    candidates,
+    phases_reached=1,
+):
+    """The finding a kernel change with nothing timing it earns, or None.
+
+    Silent unless the run actually reached both a baseline and a head phase. A report that
+    never got a GPU, or whose base tree would not come clean, has no standing to say a
+    benchmark was missing -- it could not have run one either way, and its verdict is
+    INCONCLUSIVE, which a should-fix would quietly overwrite with the more confident
+    NEEDS_WORK.
+
+    Only reached when the fallback stood -- when discovery found no target and no caller
+    named one. A target that WAS chosen and then failed to produce a number already carries
+    its own skip reason saying what went wrong with it, and a second finding claiming nothing
+    measures this change would contradict the measurement sitting beside it.
+
+    The distinction the severities draw is whose move it is next.
+
+    A python kernel changed and NOTHING in the repository or the patch measures it: that is
+    the author's gap, and it is a should-fix, which finish_report turns into NEEDS_WORK. Not
+    a blocker -- an unmeasured kernel is not a broken one -- and not a note either, because
+    a note is what this stage said for years while shipping no number at all, and nobody
+    acted on it.
+
+    Candidates exist but discovery declined between them: nothing is missing. Several files
+    could measure this change and picking one is a reading of the diff, which is the caller's
+    to make with --perf-target. Charging the author for that would be charging them for the
+    validator's refusal to guess.
+
+    Only csrc/ changed: a note, and pointedly not a should-fix. Every target here runs under
+    AITER_TRITON_ONLY=1, so no timing run this validator can launch reaches that code. The
+    gap is in the instrument, and the author cannot close it by writing a bench.
+    """
+    if not phases_reached:
+        return None
+    if stage_status in ("pass", "fail") or target_basis != BASIS_FALLBACK:
+        return None
+    if candidates:
+        return {
+            "severity": "note",
+            "stage": "perf",
+            "detail": (
+                "%d files could measure this change and discovery declined to choose between "
+                "them (%s); name one with --perf-target to have it timed"
+                % (len(candidates), ", ".join(candidates))
+            ),
+        }
+    if kernel_modules:
+        return {
+            "severity": "should-fix",
+            "stage": "perf",
+            "detail": (
+                "this PR changes kernel code (%s) and nothing times it: the patch ships no "
+                "benchmark, and no benchmark already in the repository imports what it "
+                "changed, so no base-vs-head number exists for a reviewer to weigh"
+                % ", ".join(kernel_modules)
+            ),
+        }
+    if native_paths:
+        return {
+            "severity": "note",
+            "stage": "perf",
+            "detail": (
+                "this PR changes native sources (%s) and every target here runs under "
+                "AITER_TRITON_ONLY=1, so nothing this validator can time reaches them; the "
+                "absence of a perf number is a limit of the tool, not of the PR"
+                % ", ".join(native_paths[:3])
+            ),
+        }
+    return None
+
+
+def cmd_measure(args):
+    """Append one target's result to the manifest the stage is later composed from.
+
+    Written incrementally, one call per target, because the alternative is bash holding a
+    growing JSON structure in a shell variable and splicing into it -- which is authoring
+    JSON in bash, and every bug that has cost this validator a report came from doing that.
+    """
+    path = Path(args.manifest)
+    entries = json.loads(path.read_text()) if path.exists() else []
+    entries.append(
+        measurement(
+            {
+                "target": args.target,
+                "target_basis": args.target_basis,
+                "target_basis_reason": args.target_basis_reason,
+                "target_provenance": args.target_provenance,
+                "target_provenance_reason": args.target_provenance_reason,
+                "skip_reason": args.skip_reason,
+                "compare": args.compare,
+                "base_log": args.base_log,
+                "head_log": args.head_log,
+                "base_sha": args.base_sha,
+                "command": args.command,
+                "basis": args.basis,
+                "baseline_method": args.baseline_method,
+                "control_column": args.control_column,
+                "control_tol": args.control_tol,
+            },
+            read_text=lambda name: Path(name).read_text(),
+        )
+    )
+    path.write_text(json.dumps(entries, indent=2))
+    return 0
+
+
+def cmd_detect(args):
+    """Exit 3, not 1, when there is no harness: 1 is what a crashed detector returns.
+
+    Arguments first, basis second, one per line -- and the arguments line is empty for the
+    decorator harness, which is why it goes first: the caller splits on the first newline,
+    and a leading empty field survives command substitution where a trailing one does not.
+    """
+    harness = detect_harness(Path(args.target).read_text(errors="replace"))
+    if harness is None:
+        return 3
+    print(harness["args"])
+    print(harness["basis"])
+    return 0
+
+
+def cmd_discover(args):
+    """One JSON object on stdout, and exit 0 whether or not anything was found.
+
+    The opposite convention to cmd_detect above, for a reason: this command ALWAYS has an
+    answer -- the fallback is an answer -- so a nonzero exit here is unambiguously a crash
+    and never a shrug. The caller reads fields out of the blob with `target_run.py
+    stats-field`, the same generic reader the target stats already go through.
+    """
+    root = Path(args.root).resolve()
+
+    def read_text(path):
+        candidate = (root / path).resolve()
+        # A patch could name a path outside the worktree. Reading one would be a file
+        # disclosure through a report; declining is free and there is nothing to lose.
+        if root not in candidate.parents or not candidate.is_file():
+            return None
+        return candidate.read_text(errors="replace")
+
+    def walk():
+        # Every .py in the worktree, not a curated list of test directories. aiter keeps
+        # benches in op_tests/op_benchmarks/, but 119 files elsewhere under op_tests/ carry a
+        # timing harness too, and a hardcoded directory would quietly decide that those are
+        # not perf tests. Measured at 1530 files and 0.3s on this repository, which is not a
+        # cost worth buying a guess with. .git is skipped because it holds no source.
+        for candidate in sorted(root.rglob("*.py")):
+            if ".git" in candidate.parts:
+                continue
+            yield str(candidate.relative_to(root))
+
+    status = sys.stdin.read()
+    shipped = discover_shipped(status, read_text)
+    kernel_modules = changed_kernel_modules(status)
+    repo_benches = discover_repo_benches(
+        kernel_modules,
+        walk,
+        read_text,
+        exclude=set(shipped["candidates"]),
+    )
+    decision = choose_perf_targets(shipped, repo_benches, args.correctness_target)
+    # What the patch changed, carried alongside what was found to time it. The two are only
+    # meaningful together: a kernel change with no candidate is a gap worth naming, and the
+    # same empty candidate list next to no kernel change is nothing at all.
+    # Only the modules the patch changes in CODE reach the gap. Discovery itself keeps using
+    # the unfiltered list: a comment-only edit beside a bench that already measures the kernel
+    # still gets timed, and timing it costs nothing and proves something.
+    decision["kernel_modules"] = (
+        substantive_modules(
+            kernel_modules, Path(args.patch).read_text(errors="replace")
+        )
+        if args.patch
+        else kernel_modules
+    )
+    decision["native_paths"] = changed_native(status)
+    decision["unspellable"] = shipped["unspellable"]
+    # Emitted so the caller can bound a `for` loop without asking a second question. bash has
+    # no way to measure the length of a JSON list, and the alternative -- reading indices
+    # until one comes back empty -- cannot tell "past the end" from "this field is empty".
+    decision["target_count"] = len(decision["targets"])
+    print(json.dumps(decision))
+    return 0
+
+
+def cmd_restore(args):
+    import shutil
+    import subprocess
+
+    root = Path(args.root).resolve()
+    current = subprocess.run(
+        ["git", "-C", str(root), "status", "--porcelain", "--untracked-files=all"],
+        capture_output=True,
+        text=True,
+        check=False,
+    ).stdout
+    outcome = restore_worktree(
+        root,
+        Path(args.before).read_text(errors="replace"),
+        current,
+        unlink=lambda path: path.unlink(),
+        rmtree=lambda path: shutil.rmtree(path, ignore_errors=True),
+        checkout=lambda path: subprocess.run(
+            ["git", "-C", str(root), "checkout", "--", path],
+            capture_output=True,
+            check=False,
+        ),
+    )
+    if any(outcome.values()):
+        print(
+            "timing run artifacts cleaned: "
+            f"removed={outcome['removed']} reverted={outcome['reverted']} "
+            f"skipped={outcome['skipped']}"
+        )
+    return 0
+
+
+def cmd_stage(args):
+    """Compose stages.perf from every measurement taken, mirroring the one that gates.
+
+    The gating measurement's fields are copied to the top level rather than nested under a
+    winner, so `median_ratio`, `worst_column` and `regressed_rows` sit exactly where they sat
+    when there was only ever one target. review-pr and validate_evidence.py read them from
+    there and keep working without knowing this stage can now hold more than one number.
+    """
+    report = json.loads(Path(args.report).read_text())
+    entries = json.loads(Path(args.manifest).read_text())
+    chosen = gate(entries)
+    stage = dict(chosen["measurement"])
+    stage["measurements"] = [entry["measurement"] for entry in entries]
+    report["stages"]["perf"] = stage
+    # The gating measurement's findings in full; from the others, only the notes. A second
+    # target that also regressed is already in measurements[] with its own rows, and a second
+    # should-fix would double the count of one problem -- finish_report reads that count. Its
+    # notes are a different matter: "the PR's own bench could not be attributed" is a reason
+    # the reader is owed whether or not that measurement is the one that gates.
+    report["findings"].extend(chosen["findings"])
+    for entry in entries:
+        if entry is chosen:
+            continue
+        report["findings"].extend(
+            item for item in entry["findings"] if item["severity"] == "note"
+        )
+    gap = coverage_gap(
+        stage["status"],
+        stage.get("target_basis", ""),
+        json.loads(args.kernel_modules),
+        json.loads(args.native_paths),
+        json.loads(args.candidates),
+        phases_reached=args.phases_reached,
+    )
+    if gap:
+        report["findings"].append(gap)
+    Path(args.report).write_text(json.dumps(report, indent=2))
+    return 0
+
+
+def subcommand(argv):
+    """The three surrounding decisions, dispatched by name.
+
+    Kept off the main parser so that comparing two logs stays the bare `--base/--head`
+    invocation it has always been -- that is the interface the entry point and the tests
+    already use, and renaming it would be churn with no reader on the other end.
+    """
+    parser = argparse.ArgumentParser(prog="scrape_perf.py")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    detect = sub.add_parser("detect", help="which benchmark harness a target exposes")
+    detect.add_argument("target")
+    detect.set_defaults(func=cmd_detect)
+
+    discover = sub.add_parser(
+        "discover", help="which file to time, read from the patch and the repo"
+    )
+    discover.add_argument("--root", required=True)
+    discover.add_argument("--correctness-target", required=True)
+    discover.add_argument("--patch", default="")
+    discover.set_defaults(func=cmd_discover)
+
+    restore = sub.add_parser(
+        "restore-worktree", help="undo what a timing run left behind"
+    )
+    restore.add_argument("root")
+    restore.add_argument("before")
+    restore.set_defaults(func=cmd_restore)
+
+    measure = sub.add_parser(
+        "measure", help="record one target's timing result for the stage"
+    )
+    measure.add_argument("--manifest", required=True)
+    measure.add_argument("--target", default="")
+    measure.add_argument("--target-basis", default="")
+    measure.add_argument("--target-basis-reason", default="")
+    measure.add_argument("--target-provenance", default="")
+    measure.add_argument("--target-provenance-reason", default="")
+    measure.add_argument("--skip-reason", default="")
+    measure.add_argument("--compare", default="")
+    measure.add_argument("--base-log", default="")
+    measure.add_argument("--head-log", default="")
+    measure.add_argument("--base-sha", default="")
+    measure.add_argument("--command", default="")
+    measure.add_argument("--basis", default="")
+    measure.add_argument("--baseline-method", default="patch-reversed-same-worktree")
+    measure.add_argument("--control-column", default="")
+    measure.add_argument("--control-tol", default="0.10")
+    measure.set_defaults(func=cmd_measure)
+
+    stage = sub.add_parser("stage", help="write the perf stage into the report")
+    stage.add_argument("--report", required=True)
+    stage.add_argument("--manifest", required=True)
+    # JSON lists, forwarded verbatim from what `discover` printed. bash is not authoring
+    # them; it is handing back a field it never opened.
+    stage.add_argument("--kernel-modules", default="[]")
+    stage.add_argument("--native-paths", default="[]")
+    stage.add_argument("--candidates", default="[]")
+    stage.add_argument("--phases-reached", type=int, default=1)
+    stage.set_defaults(func=cmd_stage)
+
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+# The names main() will route to subcommand(). Written by hand and therefore checked by a test:
+# it went stale the first time a subcommand was added, and the failure is quiet in the worst way
+# -- `discover` was registered on the subparser, reached this list's `not in`, and fell through
+# to the bare comparison parser, which exited 2 complaining about a missing --base. A caller
+# reading that has no reason to suspect the subcommand exists.
+SUBCOMMANDS = ("detect", "discover", "measure", "restore-worktree", "stage")
+
+
 def main(argv=None):
+    argv = sys.argv[1:] if argv is None else list(argv)
+    if argv and argv[0] in SUBCOMMANDS:
+        return subcommand(argv)
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--base",
