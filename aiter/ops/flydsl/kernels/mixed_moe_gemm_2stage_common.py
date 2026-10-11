@@ -1181,8 +1181,12 @@ def compile_mixed_moe_gemm1_common(
                                     a_load_threads * dma_bytes, type=T.i64
                                 )
 
-                            lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                            lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
+                            lds_ptr = fx.to_llvm_ptr(
+                                fx.inttoptr(
+                                    fx.PointerType.get(T.i8, fx.AddressSpace.Shared),
+                                    lds_ptr_i64,
+                                )
+                            )
 
                             rocdl.raw_ptr_buffer_load_lds(
                                 x_rsrc,
@@ -4123,8 +4127,14 @@ def compile_mixed_moe_gemm2_common(
                                         total_threads * dma_bytes, type=T.i64
                                     )
 
-                                lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-                                lds_ptr = llvm.inttoptr(lds_ptr_type, lds_ptr_i64)
+                                lds_ptr = fx.to_llvm_ptr(
+                                    fx.inttoptr(
+                                        fx.PointerType.get(
+                                            T.i8, fx.AddressSpace.Shared
+                                        ),
+                                        lds_ptr_i64,
+                                    )
+                                )
 
                                 rocdl.raw_ptr_buffer_load_lds(
                                     x_rsrc,

@@ -3,7 +3,6 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
     const_expr,
@@ -24,10 +23,11 @@ def wait_vmcnt_and_barrier(vmcnt=0):
     rocdl.s_barrier()
 
 
-def get_llvm_ptr(ptr, offset, dtype_bytes, ptr_type):
+def get_llvm_ptr(ptr, offset, dtype_bytes):
     byte_offset = fx.Int64(offset) * dtype_bytes
     address = buf_base_i64(ptr) + byte_offset
-    return llvm.IntToPtrOp(ptr_type, address.ir_value()).result
+    ptr_type = fx.PointerType.get(fx.Int8.ir_type, fx.AddressSpace.Global, 1)
+    return fx.to_llvm_ptr(fx.inttoptr(ptr_type, address))
 
 
 def _global_i32_ptr(ptr, offset):
@@ -47,7 +47,6 @@ def store_global_f32_vec(c_ptr, global_offset, vec, vec_size):
             c_ptr,
             global_offset + vec_idx * 4,
             4,
-            ir.Type.parse("!llvm.ptr<1>"),
         )
         llvm.InlineAsmOp(
             None,
@@ -190,7 +189,6 @@ class SplitKProtocol:
                             self.c_ptr,
                             c_offset,
                             self.C_DTYPE_BYTES,
-                            ir.Type.parse("!llvm.ptr<1>"),
                         )
                         llvm.InlineAsmOp(
                             None,
