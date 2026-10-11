@@ -19,8 +19,9 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.asm.asm_utils import get_gfx_from_device
 from aiter.ops.asm.mla_decode_v4 import (
     is_mla_v4_fused_eligible,
-    mla_decode_v4_asm_gfx1250,
+    mla_decode_v4_asm,
     mla_decode_v4_fused_asm_gfx1250,
+    mla_decode_v4_ps_asm,
     mla_v4_fused_slot_f32,
 )
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
@@ -1850,9 +1851,8 @@ def mla_decode_fwd_v4_nm(
 ):
     """v4 MLA decode forward.
 
-    On gfx1250, loads and launches the shipped `.co` directly from Python.
-    Other architectures keep using the canonical aiter JIT C-ABI module
-    `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
+    Loads and launches the shipped `.co` directly from Python
+    (aiter/ops/asm/mla_decode_v4.py). Returns
     `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
         attn_lse: [total_q, num_kv_splits, num_heads, 1]            FP32
@@ -2111,51 +2111,27 @@ def mla_decode_fwd_v4_nm(
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-    if runtime_gfx == "gfx1250":
-        mla_decode_v4_asm_gfx1250(
-            q,
-            qrope,
-            kv_buffer,
-            kvrope,
-            qo_indptr,
-            kv_indptr,
-            kv_page_indices,
-            split_indptr,
-            sink,
-            logits,
-            attn_lse,
-            output,
-            valid_split_count,
-            max_seqlen_q,
-            sm_scale_arg,
-            int(out_16_nosplit),
-            int(num_kv_splits),
-            use_valid_split_count_reduce,
-            kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
-        )
-    else:
-        # The canonical C++ dispatcher retains its C-ABI-compatible order.
-        aiter.mla_decode_v4_asm(
-            q,
-            qrope,
-            kv_buffer,
-            kvrope,
-            qo_indptr,
-            kv_indptr,
-            kv_page_indices,
-            split_indptr,
-            sink,
-            max_seqlen_q,
-            sm_scale_arg,
-            int(out_16_nosplit),
-            int(num_kv_splits),
-            logits,
-            attn_lse,
-            output,
-            valid_split_count,
-            use_valid_split_count_reduce,
-            kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
-        )
+    mla_decode_v4_asm(
+        q,
+        qrope,
+        kv_buffer,
+        kvrope,
+        qo_indptr,
+        kv_indptr,
+        kv_page_indices,
+        split_indptr,
+        sink,
+        logits,
+        attn_lse,
+        output,
+        valid_split_count,
+        max_seqlen_q,
+        sm_scale_arg,
+        int(out_16_nosplit),
+        int(num_kv_splits),
+        use_valid_split_count_reduce,
+        kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
+    )
 
     # ---- Cross-split FlashAttention merge via _fwd_kernel_stage2_asm ------
     if num_kv_splits > 1:
@@ -2256,7 +2232,7 @@ def mla_decode_fwd_v4_nm_ps(
         lse = torch.empty(
             (q_packed.size(0), 128), dtype=dtypes.fp32, device=q_packed.device
         )
-    aiter.mla_decode_v4_ps_asm(
+    mla_decode_v4_ps_asm(
         q_packed,
         q_rope,
         kv_packed,

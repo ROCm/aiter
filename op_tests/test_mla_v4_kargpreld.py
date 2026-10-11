@@ -54,7 +54,7 @@ SUPPORTED_GFX = ["gfx1250"]
 
 # ---------------------------------------------------------------------------
 # Variant under test (matches the cfg_mla_v4_asm entry in
-# hsa/gfx1250/mla_v4/mla_v4_asm.csv served by csrc/py_itfs_cu/asm_mla_v4.cu).
+# hsa/gfx1250/mla_v4/mla_v4_asm.csv served by aiter/ops/asm/mla_decode_v4.py).
 # ---------------------------------------------------------------------------
 GQA_RATIO = 16  # num_heads / num_kv_heads
 PAGE_SIZE = 1

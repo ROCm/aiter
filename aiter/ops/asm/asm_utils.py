@@ -145,9 +145,8 @@ def _get_hip():
     """Lazily bind libamdhip64 on first launch (NOT at import time).
 
     Deferring the bind keeps ``import aiter.mla`` side-effect-free on hosts
-    where this launcher is never exercised (e.g. non-gfx1250 arches that still
-    route through the C++ dispatcher), and avoids a hard import failure if HIP
-    is momentarily unavailable.
+    where this launcher is never exercised, and avoids a hard import failure
+    if HIP is momentarily unavailable.
     """
     global _hip
     if _hip is not None:
