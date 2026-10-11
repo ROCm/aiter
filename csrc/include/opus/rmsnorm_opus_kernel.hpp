@@ -4,10 +4,10 @@
 // OPUS RMSNorm device kernels. 2D block: x = threads/row, y = rows/block.
 #pragma once
 
-// fp32->bf16 store rounding (must precede opus.hpp): truncate (2) matches the CK reference.
-// RNE (0) is software (~2x slower) on gfx942, which lacks a hardware bf16 cvt.
+// fp32->bf16 store rounding (must precede opus.hpp): RNE (0), matching PyTorch. Truncation (2)
+// biases outputs toward zero; gfx942 has no bf16 cvt, so RNE runs in software (slower).
 #ifndef OPUS_FP32_to_BF16_DEFAULT
-#define OPUS_FP32_to_BF16_DEFAULT 2
+#define OPUS_FP32_to_BF16_DEFAULT 0
 #endif
 #include "opus/opus.hpp"
 
