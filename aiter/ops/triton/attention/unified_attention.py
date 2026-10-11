@@ -153,10 +153,24 @@ def use_2d_kernel(params: _UAParams, backend: str = "triton"):
         return (params.sliding_window > 0) or (not params.all_decode)
 
     # The gfx950 Gluon kernel is one kernel with a decode and a prefill grid,
-    # and it owns its KV split, so decode always takes the 3d path (a single
-    # segment simply drops the split axis) and everything else the 2d one.
+    # and it owns its KV split, so decode takes the 3d path (a single segment
+    # simply drops the split axis) and everything else the 2d one. The 2d grid
+    # has no split axis, so a batch that cannot fill the machine with query
+    # blocks alone still needs the 3d path: a speculative-decode step has
+    # max_seqlen_q > 1, but only a handful of query blocks. The thresholds are
+    # well under the triton one below: this 2d kernel is the stronger of the
+    # two, so the split has to buy more before it pays for its reduce pass. The
+    # 2d grid saturates the machine early and is then flat in the program count
+    # while the split grows with it, so they cross where the split's per-byte
+    # advantage runs out -- which is twice as far out for fp8, since it moves
+    # half the bytes. Both wins hold down to a 1k context, so there is no
+    # short-context term to go with them. Measured on gfx950.
     if backend == "gluon" and _gfx950_gluon_supported(params):
-        return not params.all_decode
+        if params.kv_cache_dtype == e4m3_dtype:
+            split_limit = params.num_sms * 2
+        else:
+            split_limit = params.num_sms * 3 // 4
+        return not params.all_decode and params.num_2d_prgms > split_limit
 
     if params.head_size >= 512 and not get_arch().is_rdna and not params.all_decode:
         return True
