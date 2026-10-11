@@ -307,6 +307,12 @@ TUNER_FAMILIES = {
         "exclude_patterns": [],
         "config_property": "AITER_CONFIG_GEMM_A4W6_ASM_FILE",
     },
+    "a16w8_mxfp8_asm": {
+        "script": "csrc/gemm_a16w8_mxfp8/gemm_a16w8_mxfp8_tune.py",
+        "csv_pattern": "a16w8_mxfp8_asm_tuned_gemm",
+        "exclude_patterns": [],
+        "config_property": "AITER_CONFIG_GEMM_A16W8_MXFP8_ASM_FILE",
+    },
     "batched_a8w8": {
         "script": "csrc/ck_batched_gemm_a8w8/batched_gemm_a8w8_tune.py",
         "csv_pattern": "a8w8_tuned_batched_gemm",
@@ -434,6 +440,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_a4w6_asm(self):
         self._test_family("a4w6_asm")
+
+    def test_a16w8_mxfp8_asm(self):
+        self._test_family("a16w8_mxfp8_asm")
 
     def test_batched_a8w8(self):
         self._test_family("batched_a8w8")
