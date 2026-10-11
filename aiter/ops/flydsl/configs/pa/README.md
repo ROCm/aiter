@@ -9,8 +9,9 @@ aiter/ops/flydsl/configs/pa/<arch>/_pa_decode_autotuner.json
 
 For example, MI300/MI308 results use `gfx942/` and MI350/MI355 results use
 `gfx950/`. FlyDSL creates the directory and JSON file when tuning saves a result.
-Preparing a plan without a cached result uses the `2*CU` default and does not
-create a file.
+Preparing a plan without a cached result uses the default budget (`CU` count for
+the gfx950 FP8 head-256 page-64 shapes, `2*CU` otherwise) and does not create a
+file.
 
 Run the standalone tuning script from the repository root or an installed AITER
 package. It constructs the requested shape, benchmarks native candidates, and
@@ -30,6 +31,7 @@ below. Each invocation searches the requested shape and retains cached results
 for other shapes. `--context-length` accepts one length for all batch rows or one
 length per row; lengths include query tokens. Use `--kv-dtype bf16` for unscaled
 BF16 K/V and `--help` for all shape, layout, window, sink, and device options.
+`--layout nhd` tunes the `[pages, 64, KV heads, 256]` FP8 per-tensor cache.
 
 Python callers can import `prepare_pa_decode_plan` from
 `aiter.ops.flydsl.pa_decode_tuning` (or `aiter.ops.flydsl`) and pass their actual
