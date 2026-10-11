@@ -346,6 +346,12 @@ TUNER_FAMILIES = {
         "timeout": 1800,
         "config_property": "AITER_CONFIG_GDN_K5_OPT_FILE",
     },
+    "paged_mqa_logits": {
+        "script": "csrc/paged_mqa_logits/paged_mqa_logits_tune.py",
+        "csv_pattern": "paged_mqa_logits_tuned",
+        "exclude_patterns": ["untuned"],
+        "config_property": "AITER_CONFIG_PAGED_MQA_LOGITS_FILE",
+    },
 }
 
 
@@ -452,6 +458,9 @@ class TestRunConfig(unittest.TestCase):
 
     def test_gdn_k5_opt(self):
         self._test_family("gdn_k5_opt")
+
+    def test_paged_mqa_logits(self):
+        self._test_family("paged_mqa_logits")
 
 
 @unittest.skipUnless(_gpu_available(), "No GPU available")
