@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import ctypes
+import math
 
 import torch
 import torch.distributed as dist
@@ -20,7 +21,10 @@ from .kernels.quick_allreduce_int4 import (
     TILE_BYTES,
     WORLD,
     clamp_grid_cap,
+    latency_max_tiles,
     make_quick_allreduce_int4_kernel,
+    mxfp4_scale_shape,
+    rmsnorm_hidden_supported,
 )
 from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
@@ -69,6 +73,7 @@ class _StEngine:
     def __init__(self, *, spec, group, rank: int, world_size: int):
         self.spec = spec
         self.launch = spec["launch"]
+        self._norm_launch = {}
         self.super_tile = spec["super_tile"]
         self.grid = spec["grid"]
         self.buf_bytes = spec["flags_bytes"] + spec["data_bytes"]
@@ -113,6 +118,31 @@ class _StEngine:
         except Exception:
             self.close()
             raise
+
+    def norm_launch(
+        self,
+        hidden: int,
+        eps: float,
+        gemma_norm: bool,
+        latency: bool = False,
+        mxfp4: bool = False,
+    ):
+        """Fused add+RMSNorm variant; shares this engine's inbox and colors."""
+        key = (int(hidden), float(eps), bool(gemma_norm), bool(latency), bool(mxfp4))
+        launch = self._norm_launch.get(key)
+        if launch is None:
+            launch = make_quick_allreduce_int4_kernel(
+                world_size=self.spec["world_size"],
+                super_tile=self.super_tile,
+                grid=self.grid,
+                norm_hidden=key[0],
+                norm_eps=key[1],
+                gemma_norm=key[2],
+                norm_latency=key[3],
+                norm_mxfp4=key[4],
+            )["launch"]
+            self._norm_launch[key] = launch
+        return launch
 
     def close(self):
         for b in self._peer_bases:
@@ -174,6 +204,8 @@ class QuickAllReduceInt4:
             raise RuntimeError(
                 f"QuickAllReduceInt4 supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
             )
+        # v_cvt_scalef32_pk_fp4_bf16 is gfx950-only.
+        self.supports_mxfp4 = arch == "gfx950"
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
@@ -187,6 +219,7 @@ class QuickAllReduceInt4:
         cu_count = int(
             torch.cuda.get_device_properties(self._device_index).multi_processor_count
         )
+        self._latency_max_tiles = latency_max_tiles(cu_count)
 
         sts = [1]
         if self.super_tile != 1:
@@ -279,6 +312,7 @@ class QuickAllReduceInt4:
         live_bytes: int,
         num_tiles: int,
         grid_x: int,
+        norm_ptrs: tuple[int, ...] = (0,) * 5,
     ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
@@ -292,6 +326,7 @@ class QuickAllReduceInt4:
             Int64(int(out.data_ptr())),
             Int64(int(eng._meta_ptr)),
             Int64(int(eng._meta_ptr + self.world_size * 8)),
+            *(Int64(p) for p in norm_ptrs),
             Int32(grid_x),
             stream,
         )
@@ -304,6 +339,8 @@ class QuickAllReduceInt4:
         stream,
         *,
         live_bytes: int,
+        launch=None,
+        norm_ptrs: tuple[int, ...] = (0,) * 5,
     ) -> None:
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         args = self._launch_args(
@@ -314,12 +351,13 @@ class QuickAllReduceInt4:
             live_bytes=live_bytes,
             num_tiles=num_tiles,
             grid_x=min(num_tiles, eng.grid),
+            norm_ptrs=norm_ptrs,
         )
         # A launch may still be using the raw HIP allocations when Python drops
         # the communicator. Keep cleanup conservative even if launch raises.
         self._has_launched = True
         with torch.cuda.device(self._device_index):
-            _run_compiled(eng.launch, *args)
+            _run_compiled(eng.launch if launch is None else launch, *args)
 
     def compile(self, inp, out, stream=None) -> None:
         """Eager-JIT every ST binary.
@@ -361,3 +399,175 @@ class QuickAllReduceInt4:
         st = self._pick_st(num_tiles)
         eng = self._by_st[st]
         self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
+
+    @staticmethod
+    def supports_rmsnorm(hidden: int, nbytes: int) -> bool:
+        """Whether ``allreduce_rmsnorm`` takes this row width and payload."""
+        return rmsnorm_hidden_supported(hidden) and nbytes < 1 << 31
+
+    @staticmethod
+    def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
+        """Shape of the e8m0 ``mxfp4_scale`` buffer for ``rows x hidden``."""
+        return mxfp4_scale_shape(rows, hidden)
+
+    def allreduce_rmsnorm(
+        self,
+        inp,
+        residual,
+        weight,
+        eps: float,
+        out,
+        residual_out,
+        *,
+        gemma_norm: bool = False,
+        stream=None,
+    ):
+        """Fused INT4 all-reduce + residual add + RMSNorm.
+
+        ``residual_out = allreduce(inp) + residual`` and
+        ``out = rmsnorm(residual_out, eps) * w`` with ``w = weight`` or
+        ``1 + weight`` when ``gemma_norm``.
+
+        Args:
+            inp: this rank's bf16 partial sum, ``rows x hidden`` elements.
+            residual: bf16 residual, same number of elements as ``inp``.
+            weight: bf16 RMSNorm weight of ``hidden`` elements; hidden must
+                be 2048, 4096, 8192 or 16384.
+            eps: RMSNorm epsilon.
+            out: bf16 output for the normed rows, same size as ``inp``.
+            residual_out: bf16 output for ``allreduce(inp) + residual``; may
+                be ``residual`` (in place), must not overlap ``inp`` or
+                ``out``.
+            gemma_norm: scale by ``1 + weight`` instead of ``weight``.
+            stream: ``None`` uses the current PyTorch stream on this device.
+        """
+        self._allreduce_rmsnorm(
+            inp, residual, weight, eps, out, residual_out, gemma_norm, stream
+        )
+
+    def allreduce_rmsnorm_mxfp4(
+        self,
+        inp,
+        residual,
+        weight,
+        eps: float,
+        out,
+        residual_out,
+        mxfp4_out,
+        mxfp4_scale,
+        *,
+        gemma_norm: bool = False,
+        stream=None,
+    ):
+        """``allreduce_rmsnorm`` that also MXFP4-quantizes ``out`` (gfx950).
+
+        Args:
+            inp, residual, weight, eps, out, residual_out, gemma_norm,
+                stream: as in ``allreduce_rmsnorm``.
+            mxfp4_out: 1-byte tensor of ``rows x hidden // 2`` bytes that
+                receives the packed FP4 values.
+            mxfp4_scale: 1-byte tensor of ``mxfp4_scale_shape(rows, hidden)``
+                that receives the shuffled e8m0 scales.
+
+        ``mxfp4_out`` and ``mxfp4_scale`` hold what
+        ``per_1x32_f4_quant_hip(out, shuffle=True)`` returns, bit for bit.
+        """
+        self._allreduce_rmsnorm(
+            inp,
+            residual,
+            weight,
+            eps,
+            out,
+            residual_out,
+            gemma_norm,
+            stream,
+            mxfp4=(mxfp4_out, mxfp4_scale),
+        )
+
+    def _allreduce_rmsnorm(
+        self,
+        inp,
+        residual,
+        weight,
+        eps,
+        out,
+        residual_out,
+        gemma_norm,
+        stream,
+        mxfp4=None,
+    ):
+        live_bytes = self._check_payload(inp, out)
+        hidden = int(weight.numel())
+        if not self.supports_rmsnorm(hidden, live_bytes):
+            # Atom byte offsets travel in the signed 32-bit soffset.
+            raise ValueError(
+                "fused RMSNorm supports hidden in (2048, 4096, 8192, 16384) "
+                f"and payloads under 2 GiB, got hidden={hidden}, "
+                f"{live_bytes} bytes"
+            )
+        if int(inp.numel()) % hidden != 0:
+            raise ValueError("numel must be a multiple of hidden")
+        for name, t in (
+            ("residual", residual),
+            ("residual_out", residual_out),
+            ("weight", weight),
+        ):
+            if not isinstance(t, torch.Tensor) or t.dtype != torch.bfloat16:
+                raise ValueError(f"{name} must be a bf16 tensor")
+            if not t.is_cuda or t.device.index != self._device_index:
+                raise ValueError(f"{name} must be on cuda:{self._device_index}")
+            if not t.is_contiguous() or int(t.data_ptr()) % 16 != 0:
+                raise ValueError(f"{name} must be contiguous and 16-byte aligned")
+        if residual.numel() != inp.numel() or residual_out.numel() != inp.numel():
+            raise ValueError("residual/residual_out must match inp numel")
+
+        def _overlap(a, b):
+            pa, pb = int(a.data_ptr()), int(b.data_ptr())
+            return max(pa, pb) < min(pa, pb) + live_bytes
+
+        if _overlap(residual_out, inp) or _overlap(residual_out, out):
+            raise ValueError("residual_out must not overlap inp or out")
+        if _overlap(residual, out) or (
+            _overlap(residual, residual_out)
+            and residual.data_ptr() != residual_out.data_ptr()
+        ):
+            raise ValueError(
+                "residual must be residual_out or not overlap it, and must "
+                "not overlap out"
+            )
+        mxfp4_ptrs = (0, 0)
+        if mxfp4 is not None:
+            if not self.supports_mxfp4:
+                raise RuntimeError("fused MXFP4 quant needs gfx950")
+            rows = int(inp.numel()) // hidden
+            for name, t, nbytes in (
+                ("mxfp4_out", mxfp4[0], live_bytes // 4),
+                ("mxfp4_scale", mxfp4[1], math.prod(mxfp4_scale_shape(rows, hidden))),
+            ):
+                if not isinstance(t, torch.Tensor) or t.element_size() != 1:
+                    raise ValueError(f"{name} must be a 1-byte tensor")
+                if not t.is_cuda or t.device.index != self._device_index:
+                    raise ValueError(f"{name} must be on cuda:{self._device_index}")
+                if not t.is_contiguous() or t.numel() < nbytes:
+                    raise ValueError(f"{name} must be contiguous with {nbytes} bytes")
+            mxfp4_ptrs = (int(mxfp4[0].data_ptr()), int(mxfp4[1].data_ptr()))
+        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
+        st = self._pick_st(num_tiles)
+        eng = self._by_st[st]
+        # One tile per workgroup at <= 2 workgroups per CU: occupancy is
+        # free, so take the low-latency build.
+        latency = st == 1 and num_tiles <= min(eng.grid, self._latency_max_tiles)
+        self._launch_eng(
+            eng,
+            inp,
+            out,
+            stream,
+            live_bytes=live_bytes,
+            launch=eng.norm_launch(hidden, eps, gemma_norm, latency, mxfp4 is not None),
+            norm_ptrs=(
+                int(residual.data_ptr()),
+                int(residual_out.data_ptr()),
+                int(weight.data_ptr()),
+                *mxfp4_ptrs,
+            ),
+        )
