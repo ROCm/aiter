@@ -1198,12 +1198,28 @@ OPUS_D bf16_t fp32_to_bf16_rtn_asm(const float& x) {
 OPUS_D constexpr auto fp16_to_fp32(const fp16_t& x) { return static_cast<fp32_t>(x); }
 OPUS_D constexpr auto fp32_to_fp16(const fp32_t& x) { return static_cast<fp16_t>(x); }
 OPUS_D constexpr auto bf16_to_fp32(const bf16_t& x) { union { u32_t i; float f; } u = {static_cast<u32_t>(__builtin_bit_cast(unsigned short, x)) << 16}; return u.f;}
+// Software RNE implementation: 0 preserves legacy NaN bits; 1 canonicalizes NaNs.
+// Define OPUS_FP32_to_BF16_RNE_IMPL=0 at compile time to use the original implementation.
+#ifndef OPUS_FP32_to_BF16_RNE_IMPL
+#define OPUS_FP32_to_BF16_RNE_IMPL 1
+#endif
+#if OPUS_FP32_to_BF16_RNE_IMPL != 0 && OPUS_FP32_to_BF16_RNE_IMPL != 1
+#error "OPUS_FP32_to_BF16_RNE_IMPL must be 0 (original) or 1 (optimized)"
+#endif
 OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
 {
     unsigned int bits = __builtin_bit_cast(unsigned int, f);
+#if OPUS_FP32_to_BF16_RNE_IMPL == 0
     if(~bits & 0x7f800000) { bits += 0x7fff + ((bits >> 16) & 1); /* Round to nearest even */ }
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
+#else
+    const unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
+    // Fast-math builds may optimize away NaN handling.
+    const unsigned int result =
+        ((bits & 0x7fffffffu) > 0x7f800000u) ? 0x7fff0000u : rounded;
+    return static_cast<unsigned short>(result >> 16);
+#endif
 }
 #if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
 template<index_t rm = OPUS_FP32_to_BF16_DEFAULT> // gfx950/gfx1250/gfx12 has instruction conversion, leave 'rm' here for compatiblity
