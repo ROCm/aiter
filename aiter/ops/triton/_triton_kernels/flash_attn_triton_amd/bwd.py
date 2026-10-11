@@ -881,6 +881,9 @@ def _bwd_dq_inner_split(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask * mask_mn
             p = tl.where(mask, p, 0.0)
+        else:
+            # Bounds mask still needed for a partial block, see _bwd_dkdv_inner.
+            p = tl.where(mask_mn, p, 0.0)
 
         # dp
         if IS_FP8:
@@ -1024,6 +1027,9 @@ def _bwd_dkdv_inner_split(
             causal_mask = (offs_m[None, :] - delta_qk) >= offs_n[:, None]
             mask = causal_mask & mask_nm
             pT = tl.where(mask, pT, 0.0)
+        else:
+            # Bounds mask still needed for a partial block, see _bwd_dkdv_inner.
+            pT = tl.where(mask_nm, pT, 0.0)
 
         # load DO
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
@@ -1208,6 +1214,9 @@ def _bwd_dkdvdq_inner_atomic(
             causal_mask = (offs_m[None, :] - delta_qk) >= (offs_n[:, None])
             mask = causal_mask & mask_nm
             pT = tl.where(mask, pT, 0.0)
+        else:
+            # Bounds mask still needed for a partial block, see _bwd_dkdv_inner.
+            pT = tl.where(mask_nm, pT, 0.0)
 
         # load DO
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
@@ -3012,6 +3021,11 @@ def _bwd_dkdv_inner(
                     tl.where(mask, pT, 0.0),
                 )
             pT = tl.where(mask, pT, 0.0)
+        else:
+            # Out-of-range slots of a partial block load as 0, giving exp(-m), which
+            # overflows to inf when the row's logsumexp is very negative (short
+            # sequences, large logits) and turns dK/dQ into NaN.
+            pT = tl.where(mask_nm, pT, 0.0)
         do = tl.load(do_ptrs, mask=mask_do, other=0.0)
         # Compute dV.
         if ENABLE_DROPOUT:
@@ -3219,6 +3233,9 @@ def _bwd_dq_inner(
                     )
                 mask = window_mask & mask
             p = tl.where(mask, p, 0.0)
+        else:
+            # Bounds mask still needed for a partial block, see _bwd_dkdv_inner.
+            p = tl.where(mask_mn, p, 0.0)
         # Compute dP and dS.
         if IS_FP8:
             dp = tl.dot(do.to(vT.type.element_ty), vT) * descale_v
@@ -5034,6 +5051,10 @@ def attention_backward_triton_impl(
                 stride_vh,
                 stride_vn,
                 stride_vd,
+                stride_dkb,
+                stride_dkh,
+                stride_dkn,
+                stride_dkd,
                 stride_dqb,
                 stride_dqh,
                 stride_dqm,
@@ -5099,6 +5120,10 @@ def attention_backward_triton_impl(
                 stride_vh,
                 stride_vn,
                 stride_vd,
+                stride_dkb,
+                stride_dkh,
+                stride_dkn,
+                stride_dkd,
                 stride_dqb,
                 stride_dqh,
                 stride_dqm,
