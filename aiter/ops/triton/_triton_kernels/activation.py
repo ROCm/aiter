@@ -274,7 +274,11 @@ def _act_mul_and_dynamic_mxfp4_quant_kernel(
         x = _apply_activation_from_str(a, ACTIVATION) * b
 
         out_tensor, bs_e8m0 = _mxfp4_quant_op(
-            x, BLOCK_SIZE_N, BLOCK_SIZE_M, MXFP4_QUANT_BLOCK_SIZE
+            x,
+            BLOCK_SIZE_N,
+            BLOCK_SIZE_M,
+            MXFP4_QUANT_BLOCK_SIZE,
+            SCALING_MODE=SCALING_MODE,
         )
 
         out_offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)

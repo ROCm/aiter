@@ -21,6 +21,9 @@ fp8_dtype = aiter.dtypes.fp8
 
 _LOGGER = AiterTritonLogger()
 
+# scaling_mode -> SCALING_MODE of _mxfp4_quant_op.
+_MXFP4_SCALING_MODES = {"even": 0, "ceil": 1}
+
 
 def _get_silu_and_mul_backward_config(n_cols: int) -> dict:
     config_dir = resolve_config_dir("fusions", "SILU-AND-MUL-BACKWARD")
@@ -50,13 +53,21 @@ def act_mul_and_mxfp4_quant(
 
         scaling_mode: The method to calculate MX block scaling.
             - "even" (default): `even_round` in `quark.torch.quantization.utils`.
-            - etc.
+            - "ceil": 2^ceil(log2(amax / 6)), the RoundUp (RCEIL) mode that
+              `per_1x32_f4_quant` uses by default. Scales and FP4 values match
+              it bit for bit, except that an all-zero block gets scale byte 1
+              here and 0 there; both dequantize to zero.
         shuffle: Indicates whether to enable preshuffling of scales.
             - When enabled, scale dimensions (X, Y) are adjusted to be multiples of 8 and 256, respectively.
     Returns:
         A tuple of (x_fp4, blockscale_e8m0).
     """
     _LOGGER.info("ACT_MUL_MXFP4_QUANT: x=%s activation=%s", tuple(x.shape), activation)
+    if scaling_mode not in _MXFP4_SCALING_MODES:
+        raise ValueError(
+            f"scaling_mode must be one of {tuple(_MXFP4_SCALING_MODES)}, "
+            f"got {scaling_mode!r}"
+        )
     # Assume x is 2D-Tensor for now
     M, N = x.shape
     # Activation (N/2) and storing results in uint8 (N/2) results in a feature dimension of N/4
@@ -124,7 +135,7 @@ def act_mul_and_mxfp4_quant(
         M=M,
         N=N_half,
         MXFP4_QUANT_BLOCK_SIZE=MXFP4_QUANT_BLOCK_SIZE,
-        SCALING_MODE=0,
+        SCALING_MODE=_MXFP4_SCALING_MODES[scaling_mode],
         ACTIVATION=activation,
         scaleN=scaleN_valid,
         scaleM_pad=(scaleM if use_scale_shuffle_padding else 1),
