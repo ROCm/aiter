@@ -1,0 +1,11 @@
+{
+    "attn_fwd": {
+        "PRE_LOAD_V": false,
+        "num_warps": 4,
+        "num_stages": 1
+    },
+    "_bwd_kernels": {
+        "num_warps": 4,
+        "num_stages": 1
+    }
+}
