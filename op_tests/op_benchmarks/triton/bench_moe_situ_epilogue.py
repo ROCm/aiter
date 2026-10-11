@@ -15,7 +15,32 @@ from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
 
-_M_VALUES = [1, 4, 16, 32, 64, 128, 192, 512, 1024, 1536, 2048]
+_M_VALUES = [
+    1,
+    4,
+    16,
+    32,
+    64,
+    128,
+    192,
+    256,
+    320,
+    384,
+    448,
+    512,
+    576,
+    640,
+    704,
+    768,
+    896,
+    1024,
+    1152,
+    1280,
+    1536,
+    1664,
+    1792,
+    2048,
+]
 
 
 def run_benchmark(args: argparse.Namespace) -> None:
