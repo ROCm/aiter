@@ -10,6 +10,11 @@ import sys
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
+try:
+    from setuptools.command.bdist_wheel import bdist_wheel
+except ImportError:  # setuptools < 70.1
+    from wheel.bdist_wheel import bdist_wheel
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
@@ -473,6 +478,28 @@ class NinjaBuildExtension(build_ext):
         super().run()
 
 
+class PythonAgnosticBdistWheel(bdist_wheel):
+    """Tag the wheel ``py3-none-<platform>`` when it holds no compiled modules.
+
+    Such a wheel carries only Python, C++/CK sources and ASM code objects, and
+    every host module is JIT-built on first use against the running
+    interpreter, so it is valid for any CPython 3 on the platform. The decision
+    is made from the files staged for the wheel, not from PREBUILD_KERNELS:
+    modules from a targeted prebuild, or JIT output left in aiter/jit/ by an
+    in-tree run, are packaged too and keep the interpreter-specific tag.
+    """
+
+    def get_tag(self):
+        impl, abi, plat = super().get_tag()
+        # bdist_wheel stages the wheel's files in bdist_dir before asking for
+        # the tag; if they are not there, keep the interpreter-specific tag.
+        staged = self.bdist_dir and os.path.isdir(self.bdist_dir)
+        pattern = os.path.join(self.bdist_dir or "", "**", "*.so")
+        if not staged or glob.glob(pattern, recursive=True):
+            return impl, abi, plat
+        return "py3", "none", plat
+
+
 setup_requires = [
     "packaging",
     "psutil",
@@ -516,7 +543,10 @@ setup(
         "Operating System :: Unix",
         "Operating System :: Microsoft :: Windows",
     ],
-    cmdclass={"build_ext": NinjaBuildExtension},
+    cmdclass={
+        "build_ext": NinjaBuildExtension,
+        "bdist_wheel": PythonAgnosticBdistWheel,
+    },
     # 3.8/3.9 have not actually worked for a long time: 81 modules already use
     # PEP 604 annotations (`X | None`) without `from __future__ import
     # annotations`, so they raise TypeError at import time on <3.10. Keep in sync
