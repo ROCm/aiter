@@ -41,6 +41,15 @@ New dispatch condition (e.g., `if is_deepseek():`) enables a kernel for more arc
 Real example (vLLM#16435): FusedMoE activated for wrong model families → follow-up restrict PR needed.
 → `⚠️ A3: activation condition [X] enables more than validated scope [Y]`
 
+**A4 — New feature branch in existing kernel without regression test** ⚠️/🔴
+A PR adds a new dispatch branch (new activation type, new dtype, new quant path) to an existing kernel but does not test that existing operators' correctness and performance are preserved. Adding a branch often touches shared code: widening a template condition, narrowing a guard, refactoring a shared lambda, changing a scale computation. These side-effects can silently regress every pre-existing path.
+Trigger: the diff adds a new `if/elif/else` branch or a new template specialization to an existing kernel, and the new branch shares code (constants, scale logic, store paths, bias conditions) with pre-existing branches.
+What to check: (1) every shared constant or condition the PR changes — does the change preserve the old value for old inputs? (2) are existing paths tested in the PR's test plan, or only the new path? (3) for perf-sensitive kernels, is there a before/after benchmark on old paths?
+Severity: 🔴 if a shared constant or condition provably changes behavior for existing inputs (wrong scale, skipped reciprocal, dropped bias). ⚠️ if the shared path change is theoretically safe but untested on old inputs.
+FP self-check: a new branch that is fully gated by `if constexpr(NewFeature)` and touches no shared code is exempt — it cannot affect old paths. Only fire when the diff modifies code that old paths also execute.
+Real examples: PR#5708 narrowed `enable_bias` from `_needs_swiglu_bias_support()` to `activation == Swiglu && _needs_swiglu_bias_support()` — could have regressed Situv2 bias on Opus/FlyDSL paths (analyzed as safe, but not tested). PR#5985 widened `kStoreTakesDivisor` to include `fp16_t` — broke the reciprocal scale on gfx942 fp16 MXFP8 quant (scale_err=55/56 groups), because the software convert path expected the reciprocal but received the raw divisor. PR#5914 added optional fp8 Q output to fused_qk_norm_rope kernel using a runtime pointer check (`if (q_out_fp8 != nullptr)`) instead of a template parameter — VGPR usage rose from 96 to 98 at head_size=512, crossing an allocation granule and dropping occupancy from 5 to 4 waves/SIMD for every existing caller passing nullptr; fixed by introducing a `HAS_Q_FP8` template parameter so the non-fp8 instantiation is byte-identical to the original.
+→ `🔴/⚠️ A4: new [feature] branch added to [kernel] — shared [code/constant] changed, verify existing [paths] are not regressed`
+
 ---
 
 ### B — Silent Bypass
@@ -427,6 +436,7 @@ Real example (aiter#4538): a FlyDSL kernel whose entire justification was perf w
 | Test logs its verdict instead of asserting it | `if <ok>: log("...pass") else: log("...fail")` with no assert on the same condition | `⚠️ HK19: [test] cannot fail — assert the condition; the log is not a check` |
 | `print()` for diagnostics in new test code | `print(` on a `+` line in `op_tests/**/test_*.py` | `📝 HK16: [location] prints — assert instead, or route it through the aiter logger with % placeholders` |
 | Root logger reconfigured at import | `logging.basicConfig(` on a `+` line outside `__main__` | `⚠️ HK17: basicConfig at import puts the whole process's root logger at that level — use the aiter logger` |
+| Submodule pinned to non-upstream commit | Diff changes a `3rdparty/*` submodule pin; `git branch -r --contains <new-hash>` (inside the submodule remote) returns empty — the commit is not on any upstream branch | `🔴 HK20: [submodule] pinned to [hash] which is not on any upstream branch — personal/local commits can be gc'd or become unfetchable, breaking all downstream git submodule update. Merge the commit into upstream (e.g. CK develop) first, then repin to the official commit. Ref: PR#5708 pinned composable_kernel to a personal commit (1f66d862) not on CK develop, while PR#4620 correctly pinned to a develop commit (af9e1d1f).` |
 
 ---
 
