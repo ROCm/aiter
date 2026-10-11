@@ -57,7 +57,6 @@ Notes:
     - VGPR analysis is not applicable since this uses CK kernels, not Triton kernels
 """
 
-import argparse
 import itertools
 import os
 import sys
@@ -66,8 +65,9 @@ import torch
 import triton
 
 import aiter
+from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
     get_caller_name_no_ext,
     get_dtype_bytes,
     get_model_configs,
@@ -138,7 +138,7 @@ def convert_lens_to_indptr(lens):
 
 
 def run_benchmark(args):
-    dtype = arg_to_torch_dtype[args.dtype]
+    dtype = str_to_torch_dtype[args.dtype]
     # Suppress repetitive warnings from aiter framework
     import logging
 
@@ -327,23 +327,13 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Batch Prefill with Paged KV Cache",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="Batch Prefill with Paged KV Cache")
     parser.add_argument(
         "-model_configs",
         type=str,
         default="utils/model_configs.json",
         help="Model config json file.",
     )
-    available_models = get_available_models()
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for custom config."
-    )
-    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-b", type=int, default=0, help="Batch size")
     parser.add_argument("-hq", type=int, default=0, help="Number of query heads")
     parser.add_argument("-hk", type=int, default=0, help="Number of key/value heads")
@@ -383,12 +373,6 @@ def parse_args():
     )
     args = parser.parse_args()
     return args
-
-
-arg_to_torch_dtype = {
-    "fp16": torch.float16,
-    "bf16": torch.bfloat16,
-}
 
 
 def main():

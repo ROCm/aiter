@@ -30,10 +30,26 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         help="Model config json file.",
     )
     parser.add_argument("--model", type=str, help=model_help)
+
+    def to_backend_arg(s: str) -> str | None:
+        if s == "auto":
+            return None
+        else:
+            return s
+
+
+    parser.add_argument(
+        "--backend",
+        type=to_backend_arg,
+        choices=["triton", "gluon", "auto"],
+        default="auto",
+        help="kernel backend to use",
+    )
+
     parser.add_argument(
         "--metric",
         type=str,
-        choices=["time", "throughput", "bandwidth"],
+        choices=["time", "throughput", "bandwidth", "all"],
         default="throughput",
         help="metric to plot",
     )

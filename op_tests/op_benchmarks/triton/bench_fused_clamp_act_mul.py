@@ -16,8 +16,6 @@ Correctness is not checked here — see op_tests/test_fused_clamp_act_mul.py for
 the value/scale reference test.
 """
 
-import argparse
-
 import torch
 import triton
 
@@ -26,6 +24,7 @@ from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     _is_gluon_available,
     fused_clamp_act_mul,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -152,11 +151,8 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused_clamp_act_mul",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="fused_clamp_act_mul")
+    parser.set_defaults(metric="bandwidth")
     parser.add_argument(
         "--dtype",
         type=str,
@@ -172,20 +168,6 @@ def parse_args(args: list[str] | None = None):
         nargs=2,
         metavar=("M", "N"),
         help="user-defined (M, N=n_half) shape; N must be a multiple of 128",
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "bandwidth", "throughput"],
-        default="bandwidth",
-        help="metric to plot",
-    )
-    parser.add_argument(
-        "--backend",
-        type=str,
-        choices=["auto", "triton", "gluon"],
-        default="auto",
-        help="dispatch backend; 'auto' picks gluon on gfx1250, triton elsewhere",
     )
     parser.add_argument(
         "--quant",

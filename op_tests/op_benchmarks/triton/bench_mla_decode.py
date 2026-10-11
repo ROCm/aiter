@@ -5,8 +5,8 @@ import triton
 
 from aiter.ops.triton.attention.mla_decode_rope import decode_attention_fwd_grouped_rope
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
     get_caller_name_no_ext,
     get_model_configs,
     print_vgpr,
@@ -151,25 +151,7 @@ def benchmark(args):
 
 
 def parse_args(args: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="Benchmark MLA Prefill",
-        allow_abbrev=False,
-    )
-    parser.add_argument(
-        "--model_configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    available_models = get_available_models(
-        filter="deepseek"
-    )  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models. Provide model family (the part before -) to benchmark all models in that family. One can provide multiple as --model \"llama3,mistral_7B\""
-    )
-    parser.add_argument("--model", type=str, default="", help=model_help)
+    parser = get_parser(kernel_name="MLA Prefill")
     parser.add_argument("-b", type=int, default=0, help="Batch size")
     parser.add_argument("--seqlen", type=int, default=0, help="Sequence length")
     parser.add_argument(

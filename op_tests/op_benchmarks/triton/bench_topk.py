@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import argparse
 import itertools
 import math
 import shutil
@@ -16,8 +15,8 @@ import triton
 from triton.testing import runtime
 
 from aiter.ops.triton.topk import topk as triton_topk
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
     get_model_configs,
 )
 
@@ -299,24 +298,8 @@ def run_benchmark(args, x_vals_list):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Top-K",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
+    parser = get_parser(kernel_name="Top-K")
+
     parser.add_argument(
         "--shape",
         type=int,
@@ -327,13 +310,7 @@ def parse_args():
     parser.add_argument(
         "--topk", type=int, default=1, help="Number of elements to select by top-K"
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time"],
-        default="time",
-        help="metric to plot",
-    )
+    parser.set_defaults(metric="time")
     parser.add_argument(
         "--save-dir", type=Path, default=Path("./figs"), help="Directory for PNG output"
     )

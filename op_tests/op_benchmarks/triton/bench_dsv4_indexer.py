@@ -9,12 +9,11 @@ Usage:
     python bench_dsv4_indexer.py -metric bandwidth
 """
 
-import argparse
-
 import torch
 import triton
 
 from aiter.ops.triton.attention.dsv4_indexer import dsv4_indexer, indexer_bwd
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # DSV4 representative shapes: (S, H, Hd, P, compress_ratio, topk)
@@ -87,19 +86,13 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(prog="Benchmark DSV4 Indexer", allow_abbrev=False)
+    parser = get_parser(kernel_name="DSV4 Indexer")
+    parser.set_defaults(metric="time")
     parser.add_argument(
         "--op",
         choices=["fwd", "bwd"],
         default="fwd",
         help="Which op to benchmark (default: fwd)",
-    )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

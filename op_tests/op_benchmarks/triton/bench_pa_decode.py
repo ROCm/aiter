@@ -1,4 +1,3 @@
-import argparse
 import random
 import sys
 
@@ -7,8 +6,8 @@ import triton
 
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
 from aiter.ops.triton.utils.types import torch_to_triton_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
     get_caller_name_no_ext,
     get_dtype_bytes,
     get_model_configs,
@@ -286,23 +285,13 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark Paged Attention decode",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="Paged Attention decode")
     parser.add_argument(
         "-model_configs",
         type=str,
         default="utils/model_configs.json",
         help="Model config json file.",
     )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument("--model", type=str, default=None, help=model_help)
     parser.add_argument("-b", type=int, default=0)
     parser.add_argument("-hq", type=int, default=0)
     parser.add_argument("-hk", type=int, default=0)
@@ -311,12 +300,7 @@ def parse_args():
     parser.add_argument("-kv_cache_dtype", default="fp16")
     parser.add_argument("-compute_type", default="fp16")
     parser.add_argument("-output_type", default="fp16")
-    parser.add_argument(
-        "--backend",
-        choices=["triton", "gluon"],
-        default="triton",
-        help="triton: paged_attention_decode; gluon: pa_decode_gluon (PS mode).",
-    )
+    parser.set_defaults(backend="triton")
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"
     )

@@ -5,13 +5,13 @@
 Benchmark for the fused x * sigmoid(gate) kernel.
 """
 
-import argparse
 import sys
 
 import torch
 import triton
 
 from aiter.ops.triton.fusions.fused_sigmoid_mul import fused_sigmoid_mul
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -105,11 +105,8 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark fused sigmoid-mul",
-        description="Benchmark the Triton fused x * sigmoid(gate) kernel",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="fused sigmoid-mul")
+    parser.set_defaults(metric="all")
     parser.add_argument("-N", type=int, default=None, help="Number of tokens")
     parser.add_argument("-D", type=int, default=None, help="Gated hidden width")
     parser.add_argument(
@@ -147,13 +144,6 @@ def parse_args():
     )
     parser.add_argument(
         "--dtype", type=str, default="bf16", choices=list(arg_to_torch_dtype)
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
-        choices=["all", "time", "bandwidth"],
-        help="Metric to report (default: all)",
     )
     parser.add_argument("--warmup", type=int, default=25)
     parser.add_argument("--rep", type=int, default=100)

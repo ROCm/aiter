@@ -6,13 +6,11 @@
 Usage:
     python bench_mhc_fused_post_pre_delayed_rmsnorm.py
     python bench_mhc_fused_post_pre_delayed_rmsnorm.py --mode no_post
-    python bench_mhc_fused_post_pre_delayed_rmsnorm.py -metric bandwidth
+    python bench_mhc_fused_post_pre_delayed_rmsnorm.py --metric bandwidth
 
 Timing uses ``do_bench_cudagraph``, so host launch overhead is excluded (serving runs
 decode under CUDA graphs).
 """
-
-import argparse
 
 import torch
 import triton
@@ -20,6 +18,7 @@ import triton
 from aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm import (
     mhc_fused_post_pre_delayed_rmsnorm,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_caller_name_no_ext
 
 # DeepSeek-V4.1 representative shapes: (M, n, C), decode batches and prefill chunks
@@ -107,21 +106,13 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark the fused delayed mHC seam", allow_abbrev=False
-    )
+    parser = get_parser(kernel_name="Fused Delayed mHC Seam")
+    parser.set_defaults(metric="time")
     parser.add_argument(
         "--mode",
         choices=["post", "no_post"],
         default="post",
         help="post: a regular seam (default); no_post: an Engram seam without the post block",
-    )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="time",
-        choices=["time", "bandwidth"],
-        default="time",
     )
     parser.add_argument("-o", action="store_true", default=False)
     return parser.parse_args()

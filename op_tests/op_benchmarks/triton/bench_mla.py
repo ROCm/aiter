@@ -3,7 +3,6 @@
 # import hip
 # hip.hip.hipInit(0)
 
-import argparse
 import random
 
 import torch
@@ -12,6 +11,7 @@ import triton
 from aiter.ops.triton.attention.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import e4m3_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -304,10 +304,7 @@ def benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark MLA Decode/Prefill",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="MLA Decode/Prefill")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument(
         "--decode_qlen", type=int, default=1
@@ -323,17 +320,9 @@ def parse_args():
     parser.add_argument("--q_dtype", type=str, default="bf16")
     parser.add_argument("--kv_dtype", type=str, default="bf16")
     parser.add_argument("--out_dtype", type=str, default="bf16")
-    parser.add_argument("--backend", type=str, default="triton")
+    parser.set_defaults(backend="triton", metric="bandwidth")
     parser.add_argument("--skip_reduce", type=bool, default=True)
     parser.add_argument("--device", default="cuda")
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="bandwidth",
-        choices=["time", "bandwidth"],
-        default="bandwidth",
-        help="Metrics for the kernel benchmark.",
-    )
     parser.add_argument(
         "-o",
         action="store_true",

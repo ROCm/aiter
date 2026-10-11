@@ -2,7 +2,6 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Benchmark 32x32 block-scaled MXFP4 quantization."""
 
-import argparse
 import sys
 
 import torch
@@ -15,6 +14,7 @@ from aiter.utility.fp4_utils import (
     f32_to_mxfp4,
 )
 from aiter.utility.mx_types import MxDtypeInt, MxScaleRoundModeInt
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -137,10 +137,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark block-scaled MXFP4 quantization",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="block-scaled MXFP4 quantization")
     parser.add_argument(
         "--shape",
         type=int,
@@ -159,12 +156,7 @@ def parse_args(args: list[str] | None = None):
         default="bf16",
         help="Input dtype.",
     )
-    parser.add_argument(
-        "--metric",
-        choices=["time", "bandwidth", "utilization"],
-        default="bandwidth",
-        help="Metric to report.",
-    )
+    parser.set_defaults(metric="bandwidth")
     parser.add_argument(
         "--peak-bandwidth-gbps",
         type=float,

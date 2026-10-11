@@ -1,5 +1,3 @@
-import argparse
-
 import torch
 from triton.testing import runtime
 
@@ -29,10 +27,8 @@ from aiter.ops.triton.rope.rope import (
     rope_thd_fwd,
     rope_thd_fwd_inplace,
 )
-from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
-    get_available_models,
-    get_model_configs,
-)
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
+from op_tests.op_benchmarks.triton.utils.benchmark_utils import get_model_configs
 from op_tests.triton_tests.rope.test_rope import generate_rope_inputs
 
 
@@ -531,25 +527,7 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark RoPE",
-        description="This script will not print out runtime as short running kernels cannot be measured accurately through triton.testing.do_bench function, please use rocprof to measure accurate runtime. For instance, try \"rocprofv2 --kernel-trace python bench_rope.py -l 'thd' -T 1 -H 128 -D 64 --two_inputs=true\"",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
-    available_models = get_available_models()  # Dynamically load model names
-    model_help = (
-        "Model name to benchmark. Select from: ["
-        + ", ".join(available_models)
-        + "]. Use 'all' to benchmark all models or leave blank for the default benchmark script."
-    )
-    parser.add_argument(
-        "--model-configs",
-        type=str,
-        default="utils/model_configs.json",
-        help="Model config json file.",
-    )
-    parser.add_argument("--model", type=str, help=model_help)
+    parser = get_parser(kernel_name="RoPE")
     parser.add_argument(
         "-l", type=str, help="'thd' or 'sbhd' the layout of the input.", default="thd"
     )

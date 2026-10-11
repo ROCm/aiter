@@ -22,13 +22,13 @@ higher number. The sequence layout runs a two-pass kernel and therefore reads
 the residual twice; its real HBM throughput is about 2x the reported value.
 """
 
-import argparse
 import sys
 
 import torch
 import triton
 
 from aiter.ops.triton.fusions.attn_res import attn_res_fwd, attn_res_gate
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -160,11 +160,7 @@ def run_benchmark(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        prog="Benchmark attention-residual",
-        description="Benchmark the Triton attention-residual (attn_res) kernel",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="attention-residual")
     parser.add_argument("-N", type=int, default=None, help="Number of tokens")
     parser.add_argument("-D", type=int, default=None, help="Hidden size")
     parser.add_argument("-L", type=int, default=None, help="Residual candidates")
@@ -216,13 +212,9 @@ def parse_args():
     parser.add_argument(
         "--dtype", type=str, default="bf16", choices=list(arg_to_torch_dtype)
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
-        choices=["all", "time", "bandwidth"],
-        help="Metric to report (default: all)",
-    )
+
+    parser.set_defaults(metric="all")
+
     parser.add_argument(
         "--onorm", action="store_true", default=False, help="Enable the output RMSNorm"
     )

@@ -19,8 +19,6 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_attention_dsv4_bwd.py --cfgs 4096,128,512
 """
 
-import argparse
-
 import torch
 import triton
 
@@ -31,6 +29,7 @@ from aiter.ops.triton.attention.sparse_attention_dsv4_bwd import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.test_mha_common import sparse_mla_dsv4_ref
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 D = 512
 SWA = 128  # sliding-window width
@@ -231,7 +230,7 @@ def run_bwd_bench(args, device):
 
 
 def _parse_args():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = get_parser(kernel_name="Sparse Attention DSV4 Backward")
     p.add_argument(
         "--cfgs",
         nargs="+",

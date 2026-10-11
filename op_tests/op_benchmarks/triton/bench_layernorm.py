@@ -1,5 +1,3 @@
-import argparse
-
 import torch
 import triton
 
@@ -12,6 +10,7 @@ from aiter.ops.triton.normalization.norm import (
     layernorm2d_fwd_with_smoothquant,
 )
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -184,24 +183,14 @@ def run_benchmark(args):
 
 
 def parse_args(args: list[str] | None = None):
-    parser = argparse.ArgumentParser(
-        prog="Benchmark LayerNorm",
-        allow_abbrev=False,
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="LayerNorm")
+    parser.set_defaults(metric="bandwidth")
     parser.add_argument(
         "--shape",
         type=int,
         nargs=2,
         metavar=("M", "N"),
         help="user-defined shape to benchmark",
-    )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        choices=["time", "bandwidth", "throughput"],
-        default="bandwidth",
-        help="metric to plot",
     )
     parser.add_argument(
         "--quant",

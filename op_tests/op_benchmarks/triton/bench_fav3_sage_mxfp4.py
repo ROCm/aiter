@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import argparse
 import csv
 import glob
 import logging
@@ -32,6 +31,7 @@ from op_tests.op_benchmarks.triton.bench_fav3_sage import (
     fav2_forward_func,
     sparse_flops_from_lut,
 )
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -527,7 +527,8 @@ def run_benchmark_block_sparse_repetitions(args):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Simplified MXFP4 Attention Benchmark")
+    parser = get_parser(kernel_name="FAv3 Sage MXFP4")
+    parser.set_defaults(metric=None)
     parser.add_argument("-b", type=int, required=True, help="Batch size")
     parser.add_argument("-hq", type=int, required=True, help="Number of Q heads")
     parser.add_argument("-hk", type=int, default=0, help="Number of K heads (GQA)")
@@ -603,14 +604,6 @@ def parse_args():
         type=str,
         default=None,
         help="Reference kernel for --compare_to_ref: torch (default) or fav2.",
-    )
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="throughput",
-        choices=["all", "time", "throughput", "bandwidth"],
-        default=None,
-        help="Metrics for the kernel benchmark.",
     )
     parser.add_argument(
         "-o",

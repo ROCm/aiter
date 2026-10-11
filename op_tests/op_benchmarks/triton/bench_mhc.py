@@ -43,6 +43,7 @@ import triton
 from aiter.ops.triton.fusions.mhc import mhc, mhc_post
 from aiter.ops.triton.utils.mhc_config_utils import hip_post_dispatch_block
 from aiter.test_common import checkAllclose
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
     print_vgpr,
@@ -545,11 +546,8 @@ def run_benchmark(args, operation):
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        prog="Benchmark mHC",
-        description="Benchmark mHC (manifold-constrained Hyper Connection) kernels",
-        allow_abbrev=False,
-    )
+    parser = get_parser(kernel_name="mHC")
+    parser.set_defaults(metric=None)
 
     parser.add_argument(
         "--op",
@@ -606,14 +604,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
-    parser.add_argument(
-        "-metric",
-        nargs="?",
-        const="throughput",
-        choices=["all", "time", "throughput", "bandwidth", "arithmetic_intensity"],
-        default=None,
-        help="Metrics for the kernel benchmark (default: all for pre, time+bandwidth for post)",
-    )
     parser.add_argument(
         "-print_vgpr",
         action="store_true",

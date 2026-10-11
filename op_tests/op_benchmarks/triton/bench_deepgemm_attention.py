@@ -18,6 +18,7 @@ from aiter.ops.triton.attention.pa_mqa_logits import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 from aiter.test_common import run_perftest
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 
 
 def cdiv(x: int, y: int) -> int:
@@ -458,7 +459,7 @@ def run_benchmark(args: argparse.Namespace, data_init: str = "norm"):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = get_parser(kernel_name="DeepGEMM Attention")
     parser.add_argument("-B", "--batch", type=int, default=128, help="Batch size.")
     parser.add_argument(
         "-hq",

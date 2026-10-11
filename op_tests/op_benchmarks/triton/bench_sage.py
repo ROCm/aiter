@@ -70,6 +70,7 @@ from aiter.ops.triton.quant.sage_attention_quant_wrappers import (
     sage_quant_mxfp4,
 )
 from aiter.test_mha_common import attention_ref, attention_ref_block_sparse
+from op_tests.op_benchmarks.triton.utils.argparse import get_parser
 from op_tests.op_benchmarks.triton.utils.benchmark_utils import (
     get_caller_name_no_ext,
 )
@@ -2333,10 +2334,7 @@ def run_block_sparse_repetitions(
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Unified SAGE attention benchmark (FAv3, MXFP4, AITER, FP8)",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
-    )
+    parser = get_parser(kernel_name="SAGE Attention")
 
     parser.add_argument(
         "--kernel",
@@ -2400,23 +2398,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional K-only absmax clip factor for mha4_i8fp8; overrides --qk-clip for K",
     )
-    parser.add_argument(
-        "--metric",
-        type=str,
-        default="all",
-        choices=[
-            "all",
-            "time",
-            "throughput",
-            "bandwidth",
-            "arithint",
-            "sparseput",
-        ],
-        help=(
-            "Metric to report. 'all' reports dense throughput and, in sparse mode, "
-            "effective sparse throughput"
-        ),
-    )
+    parser.set_defaults(metric="all")
 
     parser.add_argument("-o", action="store_true", help="Write Triton output CSV")
     parser.add_argument(

@@ -472,13 +472,6 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Sliding window size (default: disabled)",
     )
-    parser.add_argument(
-        "-backend",
-        type=str,
-        default=None,
-        choices=["triton", "gluon"],
-        help="Kernel backend",
-    )
 
     return parser.parse_args(args=args)
 
