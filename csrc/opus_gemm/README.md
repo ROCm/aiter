@@ -90,11 +90,11 @@ void opus_gemm_a8w8_mxscale_bmm_launch(
 | `a8w8` | empty | kid 2, FP32 Y | empty |
 | `a8w8_blockscale` | empty | kid 1, FP32 Y | empty |
 | `a8w8_blockscale_bpreshuffle` | kid 11000, BF16 Y | empty | empty |
-| `a8w8_mxscale_bmm` | empty | 45 exact ids in 8000--8653, BF16/FP32 Y | empty |
+| `a8w8_mxscale_bmm` | empty | registered BMM ids, including compact ids 8470--8484; BF16/FP32 Y | empty |
 
-Empty tables are explicit capability states. The merged registry currently
-contains 925 final ids, including 219 pre-built gfx1250 A16W16 CO ids. Those CO
-ids currently occupy 21016--21315 inside the reserved `[21000,27000)` band.
+Empty tables are explicit capability states. `kernels_list` is the source of
+truth for registered ids. The pre-built gfx1250 A16W16 CO ids occupy the
+reserved `[21000,27000)` band.
 The MXFP8 BMM ids are
 `8000 + family_local_kid`, which places them in an unused global band while
 preserving family-local tuning/debug correlation. Historical child-dictionary
@@ -133,8 +133,8 @@ Full canonical A16 counts are:
 
 `gen_instances.py` treats tuned CSV ids, the sidecar, the per-architecture
 default compile floor, and mandatory A8 ids as build availability. It emits no
-runtime shape table. All 45 gfx950 MXFP8 BMM ids are emitted as one family and
-deduplicated by generated symbol name rather than entering the ordinary
+runtime shape table. All gfx950 MXFP8 BMM ids in `BMM_MXSCALE_KIDS` are emitted
+as one family and deduplicated by generated symbol name rather than entering the ordinary
 per-kid subset. All available gfx1250 CO ids are in the gfx1250 compile floor;
 codegen emits their five-argument host launchers but no device translation
 units. The device bodies come from `gen_co/gfx1250/<symbol>.co`.
@@ -212,3 +212,66 @@ specialization that writes partial sums. Its direct BF16/FP32
 | `include/gfx1250/opus_co_launch_gfx1250.cuh` | first-use CO loader and cluster launcher |
 | `include/gfx*/opus_gemm_arch_*.cuh` | sorted exact-kid tables |
 | `include/gfx*/**/opus_gemm_traits*.cuh` | kernel arguments and traits |
+
+
+## Compact MXFP8 BMM on gfx950
+
+Kids 8470--8476 retain their original `N=1024, K=4096` device specialization.
+Other supported N/K shapes launch the same kid's general compact kernel. It
+stages at most 4096 K elements of E8M0 scales at a time and retains FP32
+accumulators across segments, so LDS usage does not grow with total K.
+Short and final segments reread their last valid A/B tile to maintain the
+prefetch depth, then drain outstanding copies before reusing LDS.
+
+The compact contract is:
+
+- `1 <= M < 2048`, `1 <= batch <= 16`;
+- positive N divisible by both 128 and the kid's `B_N`;
+- positive K divisible by the kid's `B_K` (128, 256, or 512);
+- ordinary 128x128 weight scales and 1x128 activation scales;
+- contiguous token-major A/scales/Y storage and `(16,16)` preshuffled B;
+- BF16 or FP32 output, split-K 0/1, no workspace;
+- 16-byte A/B/Y pointer alignment and 4-byte scale pointer alignment;
+- A's total bytes, each B batch's bytes, and Y's total bytes fit signed int32.
+
+The public `opus_bmm` interface still uses batch-first transpose views and
+`layout="mxscale_bmm"`. The C++ launcher validates physical strides. Shape
+support is not a performance selection: existing general pipelines remain
+available, and the tuner compares eligible compact kids without changing
+existing tuned CSV rows. Regression coverage is in
+`op_tests/test_opus_a8w8_bmm_mxscale_bpreshuffle.py`.
+
+Kid 8477 adds a `16x32x512` compact tile for small M: 128 threads (two
+compute waves in a 1x2 grid), three A/B LDS slots, and 73 KiB of LDS.
+It supports both the fixed N=1024/K=4096 and general paths, and requires K
+divisible by 512. All waves stage A/B and compute; this differs
+from kid 8179's same-size `bdirect` tile, where two producer waves stage A
+and two consumer waves load B directly into registers and perform MFMA.
+
+Additional compact candidates use four compute waves and the same group128
+scale contract. The LDS column includes A/B ring and scale panels; it alone
+does not determine actual occupancy, which also depends on registers.
+
+| Kid | Tile MxNxK | Wave grid MxN | A/B slots | LDS KiB |
+|---|---|---|---|---|
+| 8478 | 32x32x512 | 2x2 | 2 | 66 |
+| 8479 | 16x64x512 | 1x4 | 2 | 82 |
+| 8480 | 16x64x256 | 1x4 | 3 | 62 |
+| 8481 | 32x64x256 | 2x2 | 3 | 74 |
+| 8482 | 64x32x256 | 2x2 | 3 | 75 |
+| 8483 | 64x64x128 | 2x2 | 3 | 51 |
+| 8484 | 128x128x128 | 2x2 | 2 | 69 |
+
+These candidates cover intermediate tile sizes and shallower rings. They are
+additional tuner options, with no changes to existing kids or tuned CSV rows.
+
+## Tuning MXFP8 BMM
+
+See [MXFP8 BMM tuning](../bmm_a8w8_mxscale/README.md) for the header-only
+input/output CSV templates, input schema, OPUS/FlyDSL tuning commands,
+configuration verification and performance comparison workflow.
+
+The joint tuner is `csrc/bmm_a8w8_mxscale/bmm_a8w8_mxscale_bpreshuffle_tune.py`.
+The OPUS-only entry is `csrc/opus_gemm/opus_bmm_mxscale_tune.py`; it uses the
+same CSV schema and shared tuner options. Pass `--bpreshuffle` when tuning
+for the preshuffled-weight interface.

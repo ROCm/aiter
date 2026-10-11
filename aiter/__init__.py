@@ -152,10 +152,13 @@ else:
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
 
-    # topk_select imports flydsl at module scope and flydsl publishes
-    # Linux-only wheels, so the op is unavailable on Windows.
+    # topk_select requires the optional, Linux-only FlyDSL package.
     if sys.platform != "win32":
-        from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+        try:
+            from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+        except ModuleNotFoundError as exc:
+            if exc.name != "flydsl":
+                raise
 
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401

@@ -4,7 +4,7 @@
 
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 
 _A16W16_CO_TAGS = frozenset(
     {"a16w16_4wave_co", "a16w16_4wave_wl_co", "a16w16_4wave_wlr_co"}
@@ -26,6 +26,44 @@ _GFX942_KERNEL_NAME_TAGS = {
     "a16w16_quad_mfma32_kbuf1": "quad_mfma32",
     "a16w16_quad_mfma32_kbuf1_sk": "splitk_quad_mfma32_bf16ws",
 }
+
+
+_SF_SHUF_SUB_HEADER = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "include",
+    "gfx950",
+    "opus_gemm_traits_a8w8_scale_gfx950.cuh",
+)
+_SF_SHUF_SUB_CACHE: list[int] = []
+
+
+def _opus_sf_shuf_sub() -> int:
+    """``OPUS_SF_SHUF_SUB_VALUE``, parsed from the traits header.
+
+    One source of truth for the A-scale layout's ``sub``. The host picks which
+    ``shuffle_scale_a(x, K, sub)`` to feed a kid and the kernel decides how to
+    read it; if those two numbers disagree the kid does not fail, it returns
+    wrong numbers -- so this is parsed rather than restated. Raises if the
+    #define is absent, because a default here would resurrect exactly the
+    silent divergence it exists to prevent.
+    """
+    if not _SF_SHUF_SUB_CACHE:
+        import re
+
+        with open(_SF_SHUF_SUB_HEADER) as f:
+            m = re.search(
+                r"^#define\s+OPUS_SF_SHUF_SUB_VALUE\s+(\d+)\s*$",
+                f.read(),
+                re.MULTILINE,
+            )
+        if not m:
+            raise RuntimeError(
+                f"OPUS_SF_SHUF_SUB_VALUE not found in {_SF_SHUF_SUB_HEADER}; "
+                "the A-scale layout is undefined and any shuffled kid handed a "
+                "guessed sub would return wrong numbers silently"
+            )
+        _SF_SHUF_SUB_CACHE.append(int(m.group(1)))
+    return _SF_SHUF_SUB_CACHE[0]
 
 
 @dataclass
@@ -99,6 +137,40 @@ class OpusGemmInstance:
     prefetch_scale: bool = False
     fused_reduce: bool = False
     preload_sf: bool = False
+    # a8w8_mxscale BMM wave8 families only: the A scale panel arrives M-packed
+    # from the host (shuffle_scale_mxsk_mpack) and is read straight from global,
+    # so there is no panel to stage. Maps to the wave8 kernel's trailing
+    # `bool SFA_MPACK_GLOBAL`; see needs_mpacked_sfa for the caller's side of it.
+    mpack_sfa: bool = False
+    # a8w8_mxscale BMM wave8 families and flatmm-splitK: both scale panels arrive
+    # in the reference kernel's layout (shuffle_scale_a / _b) and are read from
+    # global one dword per (M subtile pair, K tile pair). Maps to the trailing
+    # `bool SHUFFLE_SCALE` of either kernel; see needs_shuffle_scale for the
+    # caller's side. Mutually exclusive with preload_sf, which it replaces.
+    shuffle_scale: bool = False
+    # a8w8_mxscale BMM wave8 families and flatmm-splitK: stage the shuffled scale
+    # words through the LDS panel instead of reading them from global on every K
+    # tile. Requires shuffle_scale. Maps to the kernel's trailing
+    # `bool SF_SHUF_IN_LDS`; see the _sfshuf_lds name suffix.
+    # The panel does not fit every tile and the kernel static_asserts rather than
+    # degrading, so an ill-fitting kid is a build error rather than a mislabelled
+    # reg build.
+    sf_shuf_in_lds: bool = False
+    # a8w8_mxscale BMM wave8 families only: band height in M tiles for the L2
+    # rasterization of the workgroup -> tile map, 0 for the plain linear map. Maps
+    # to the wave8 kernel's trailing `int XCD_WGM`.
+    xcd_wgm: int = 0
+    # a8w8_mxscale BMM wave1 only: register ring depth in K tiles, 0 for the
+    # traits' VGPR-budget default. Maps to the wave1 traits' trailing `int RING_`.
+    wave1_ring: int = 0
+    # Compact BMM: issue future B before current LDS reads, then issue A.
+    early_b: bool = False
+    # a8w8_mxscale BMM specialized-pipeline axis (minterleave / mouter /
+    # mouter_tunable / wave4m2_selfload families). Maps to the kernel's trailing
+    # `bool SKIP_SCALE_WAIT` template param: skip the s_waitcnt on the per-K-tile
+    # scale load (the scale is issued a tile ahead), trading a correctness margin
+    # for pipeline overlap. Drives both the launcher body and the device
+    # instantiation set for the kid.
     # Optional override for the D_OUT=void split-K specialization.  None keeps
     # the direct-output specialization's preload_sf setting; False lets an
     # exact kid retain its tuned splitK=1 preload while using the equivalent
@@ -106,8 +178,6 @@ class OpusGemmInstance:
     workspace_preload_sf: bool | None = None
     skip_scale_wait: bool = False
     pack_scale_on_demand: bool = False
-    k1024_only: bool = False
-    k1024_lb1: bool = False
     preload_sf_lds: bool = False
     name_root: str = "opus_gemm"
 
@@ -147,6 +217,8 @@ class OpusGemmInstance:
         # tag inserts shift right by one slot when arch_prefix is set
         tag_at = 1 + (1 if self.arch_prefix else 0)
         if self.kernel_tag == "a8w8_mxscale_bmm_flatmm_splitk":
+            # opus_bmm_a8w8_mxscale_flatmm_splitk_<geom>_wgpcu{N}[_selfload]
+            #     [_scaleprefetch][_sfpreload][_sfshuf]
             parts.insert(tag_at, "a8w8_mxscale_flatmm_splitk")
             parts.append(f"wgpcu{self.WG_PER_CU}")
             if self.direct_only:
@@ -155,6 +227,110 @@ class OpusGemmInstance:
                 parts.append("scaleprefetch")
             if self.preload_sf:
                 parts.append("sfpreload")
+            # Same trap as the bdirect branch below, and this one was live: the
+            # flatmm split-K kernel has implemented SHUFFLE_SCALE all along and the
+            # codegen spells it on every kid of that kernel, but no suffix here
+            # meant a shuffle_scale kid would have deduplicated onto its plain
+            # sibling and been emitted as the plain one -- measuring as "the layout
+            # makes no difference" with nothing raised.
+            if self.shuffle_scale:
+                parts.append("sfshuf")
+        elif self.kernel_tag in (
+            "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+            "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+        ):
+            # opus_bmm_a8w8_mxscale_bpreshuffle_bdirect[_tilen]_<geom>_wgpcu{N}
+            #     [_scaleprefetch][_sfpreload]
+            # The two flag suffixes matter: instances are deduplicated by name, so
+            # a tile that differs only by a bool would otherwise silently collapse
+            # onto its plain sibling and never be emitted.
+            #
+            # tilen shows in the T_MxT_N geom field as well (1x2 vs 2x1), so the
+            # tag token is belt and braces -- but the geom field is name-only and
+            # supplied by the factory, and this is the one that tracks the traits
+            # struct actually instantiated.
+            parts.insert(
+                tag_at,
+                (
+                    "a8w8_mxscale_bpreshuffle_bdirect_tilen"
+                    if self.kernel_tag.endswith("_tilen")
+                    else "a8w8_mxscale_bpreshuffle_bdirect"
+                ),
+            )
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.prefetch_scale:
+                parts.append("scaleprefetch")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.shuffle_scale:
+                # "sfshuf_lds" rather than a separate token, so the reg/lds pair of
+                # one kid differs in exactly this suffix and nothing else. Same
+                # rule as the wave8 families below -- and the same reason as the
+                # dedup note above: without it the panel kid hashes to the reg
+                # kid's filename, is never emitted, and the tuner ranks one kernel
+                # against itself while reporting that the panel changed nothing.
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_allwave":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_allwave_<geom>_wgpcu{N}_sfpreload
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_allwave")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.preload_sf:
+                parts.append("sfpreload")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_blds":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_blds_<geom>_wgpcu{N}
+            #     [_scaleprefetch][_sfpreload]
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_blds")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.prefetch_scale:
+                parts.append("scaleprefetch")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.shuffle_scale:
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave8n4":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_wave8n4_<geom>_wgpcu{N}_sfpreload
+            #     [_xcd{N}][_sfgmpack][_sfshuf]
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_wave8n4")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.xcd_wgm:
+                parts.append(f"xcd{self.xcd_wgm}")
+            if self.mpack_sfa:
+                parts.append("sfgmpack")
+            if self.shuffle_scale:
+                # "sfshuf_lds" rather than a separate token, so the reg/lds pair of
+                # one kid differs in exactly this suffix and nothing else.
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag in (
+            "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+            "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+        ):
+            # opus_bmm_a8w8_mxscale_bpreshuffle_wavetm1[_blds]_<geom>_wgpcu{N}_sfpreload
+            #     [_xcd{N}][_sfgmpack]
+            parts.insert(
+                tag_at, self.kernel_tag.replace("a8w8_mxscale_bmm_", "a8w8_mxscale_")
+            )
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.preload_sf:
+                parts.append("sfpreload")
+            if self.xcd_wgm:
+                parts.append(f"xcd{self.xcd_wgm}")
+            if self.mpack_sfa:
+                parts.append("sfgmpack")
+            if self.shuffle_scale:
+                parts.append("sfshuf_lds" if self.sf_shuf_in_lds else "sfshuf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_compact":
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_compact")
+            parts.append(f"buf{self.num_slots}")
+            if self.early_b:
+                parts.append("earlyb")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave1":
+            # opus_bmm_a8w8_mxscale_bpreshuffle_wave1_<geom>_wgpcu{N}
+            parts.insert(tag_at, "a8w8_mxscale_bpreshuffle_wave1")
+            parts.append(f"wgpcu{self.WG_PER_CU}")
+            if self.wave1_ring:
+                parts.append(f"ring{self.wave1_ring}")
         elif self.kernel_tag == "a8w8_mxscale_bmm_minterleave":
             parts.insert(tag_at, "a8w8_mxscale_flatmm_minterleave")
             parts.append(f"wgpcu{self.WG_PER_CU}")
@@ -165,11 +341,16 @@ class OpusGemmInstance:
             parts.append(f"wgpcu{self.WG_PER_CU}")
         elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline":
             parts.insert(tag_at, "a8w8_mxscale_pipeline")
-            if self.k1024_only:
-                parts.append("k1024")
-            elif self.k1024_lb1:
-                parts.append("k1024lb1")
-            elif self.preload_sf_lds:
+            if self.preload_sf_lds:
+                parts.append("preload_sf")
+        elif self.kernel_tag == "a8w8_mxscale_bmm_pipeline_bpreshuffle":
+            # opus_bmm_a8w8_mxscale_pipeline_bpreshuffle_<geom>[_preload_sf].
+            # Without this branch the tag fell through to the bare default, so
+            # kid196 was named opus_bmm_<geom> alone: it advertised neither the
+            # preshuffled B its caller must pass nor the scale preload, on a
+            # codegen that deduplicates instances by name.
+            parts.insert(tag_at, "a8w8_mxscale_pipeline_bpreshuffle")
+            if self.preload_sf_lds:
                 parts.append("preload_sf")
         elif self.kernel_tag == "a8w8_mxscale_bmm_mouter":
             parts.insert(tag_at, "a8w8_mxscale_flatmm_mouter")
@@ -275,6 +456,55 @@ class OpusGemmInstance:
             return self.B_M * mult if mult else 1
         return 1 if self.has_oob else self.B_M
 
+    @property
+    def needs_preshuffled_b(self) -> bool:
+        """Whether this kid reads B from shuffle_weight(w, layout=(16, 16)).
+
+        Read it from here for the same reason as m_align: a caller that hands a
+        row-major B to one of these kids gets no error, just a wrong answer, so
+        a hand-maintained second list of "the preshuffled ones" fails silently.
+        The m_align guard did exactly that -- it fed every kid the plain weight
+        and reported ~1.47 relative error for all 15 of them.
+        """
+        return "bpreshuffle" in self.kernel_tag
+
+    @property
+    def needs_mpacked_sfa(self) -> tuple[int, int] | None:
+        """(B_M, SFA_MB) for shuffle_scale_mxsk_mpack, or None for a plain A scale.
+
+        Same silent-wrong-answer hazard as needs_preshuffled_b: the layout is a
+        permutation of the same byte count, so a kid handed the plain (M, K/128)
+        scale runs and returns wrong numbers. SFA_MB = T_M*W_M is the row block one
+        M subtile steps over, which is what the packing folds into the low axis.
+        """
+        if not self.mpack_sfa:
+            return None
+        return self.B_M, self.T_M * self.W_M
+
+    @property
+    def needs_shuffle_scale(self) -> int | None:
+        """shuffle_scale_a's ``sub``, or None for a plain A scale.
+
+        sub is the row distance between the two M subtiles a dword pairs. It is a
+        property of the *layout*, not of this kid's wave grid: the quantize kernel
+        emits the A scale once per launch, so a deployment holds exactly one sub
+        and every kid must read that one. The value is READ FROM THE HEADER
+        (``_opus_sf_shuf_sub()``) rather than restated here -- if the host's sub
+        and the kernel's disagree the kid does not fail, it returns plausible
+        wrong numbers.
+
+        Same silent-wrong-answer hazard as needs_mpacked_sfa: a kid handed the
+        plain panels runs and returns wrong numbers. The A panel goes in with
+        stride(1) as the per-batch slab and stride(0) zeroed; the kernel derives
+        every other term, including the K block pair count, from the problem shape.
+
+        The two pipelines assert their own tile against this sub, so a kid whose
+        grid cannot read it fails to compile.
+        """
+        if not self.shuffle_scale:
+            return None
+        return _opus_sf_shuf_sub()
+
 
 def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     """Mirror gfx950 ``Traits::prefetch_k_iter`` for host-side planning.
@@ -306,6 +536,8 @@ def a16w16_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
 
 def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
     """Mirror gfx950 MXFP8 flatmm ``Traits::prefetch_k_iter``."""
+    if instance.kernel_tag == "a8w8_mxscale_bmm_bpreshuffle_wave1":
+        return 1  # the wave1 traits' per-split floor: its ring pads past the end
     sizeof_da = 1  # FP8
     is_tile_n = instance.B_M == 16
     load_group_m = 16 if is_tile_n else 32
@@ -329,7 +561,17 @@ def a8w8_mxscale_flatmm_prefetch_k_iter(instance: OpusGemmInstance) -> int:
 
 _BMM_M_ALIGN_TILES = {
     "a8w8_mxscale_bmm_flatmm_splitk": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_blds": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_allwave": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wave8n4": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_wave1": 0,
+    "a8w8_mxscale_bmm_bpreshuffle_compact": 0,
     "a8w8_mxscale_bmm_pipeline": 0,
+    "a8w8_mxscale_bmm_pipeline_bpreshuffle": 0,
     "a8w8_mxscale_bmm_fused": 0,
     "a8w8_mxscale_bmm_minterleave": 2,
     "a8w8_mxscale_bmm_wave4m2_selfload": 2,
@@ -343,6 +585,12 @@ _BMM_M_ALIGN_TILES = {
 # previously empty 8000 band.  The low digits intentionally preserve the
 # upstream id for tuning/debug correlation.
 BMM_MXSCALE_KID_OFFSET = 8000
+# A GROUP_N=GROUP_K=32 kid is its 128 mirror's id plus this, which keeps the low
+# digits the way the 8000 globalisation does: local 321 and 1321 become global
+# 8321 and 9321, so a pair is recognisable on sight in a log or a tuned CSV.
+# Declared here rather than beside the flatmm twins because the preshuffled
+# families twin as well, and they are built earlier in the file.
+MX32_KID_STRIDE = 1000
 
 
 def bmm_mxscale_global_kid(upstream_kid: int) -> int:
@@ -447,18 +695,30 @@ a8w8_scale_kernels_list = {
 
 
 def _a8w8_mxscale_bmm_flatmm_splitk(
-    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False
+    bm, bn, bk, wg_per_cu, direct_only=False, prefetch_scale=False, preload_sf=False,
+    shuffle_scale=False,
+    quant_block=128,
 ):
+    # quant_block is GROUP_N and GROUP_K together: A and B quantise on the same
+    # block, either DSv4's 128 or MX's 32. GROUP_M stays 1 (per token) for both.
     t_m, t_n = (1, 2) if bm == 16 else (2, 1)
     inst = OpusGemmInstance(
         256, bm, bn, bk, t_m, t_n, 16, 16, 128, 16, 16, 4,
-        1, 128, 128, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
+        1, quant_block, quant_block, "a8w8_mxscale_bmm_flatmm_splitk", ["fp32_t"],
         wg_per_cu, splitk_workspace_dtype="fp32_t",
     )
     inst.name_root = "opus_bmm"
     inst.direct_only = direct_only
     inst.prefetch_scale = prefetch_scale
     inst.preload_sf = preload_sf
+    # The kernel's static_asserts: the shuffle_scale dword pairs adjacent M
+    # subtiles and spans at most two K blocks, and it replaces the LDS panels
+    # rather than filling them. SFA_MB = T_M*W_M = 32 for this family.
+    if shuffle_scale:
+        assert not preload_sf, "shuffle_scale replaces the LDS scale panels"
+        assert bm % 64 == 0, f"B_M={bm}: shuffle_scale needs COM_REP_M even"
+        assert bk // 128 <= 2, f"B_K={bk}: shuffle_scale spans at most two K blocks"
+    inst.shuffle_scale = shuffle_scale
     return inst
 
 
@@ -504,6 +764,791 @@ _bmm_flatmm_local.update({
     for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
 })
 
+
+
+# Preshuffled-weight MXFP8 BMM kernel registrations.
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg_per_cu, prefetch_scale=False,
+                                          preload_sf=False, shuffle_scale=False,
+                                          tilen=False, sf_shuf_in_lds=False,
+                                          quant_block=128):
+    """Preshuffled B bypassing LDS, on the flatmm producer/consumer split.
+
+    Same kernel, launcher and tile geometry as the plain flatmm split-K family
+    (BLOCK_SIZE=256, MFMA 16x16x128, VEC=(16,16,4), GROUP=(1,128,128)); the
+    traits alias flips the B layout, the MFMA scale_op_sel byte select and B's
+    path. The 16x16 preshuffle order already IS the mfma_16x16x128 B fragment
+    order, so the consumer waves buffer_load B straight into their MFMA registers
+    and the producer waves stage A only. Callers pass shuffle_weight(w, (16, 16)).
+    """
+    # Same tileN/tileM naming rule as the plain flatmm split-K family: the real
+    # T_M/T_N comes from B_M in the traits, these only drive the symbol name.
+    # tilen forces the B_M == 16 grid onto a wider tile, so the name has to follow
+    # the traits rather than B_M.
+    t_m, t_n = (1, 2) if (bm == 16 or tilen) else (2, 1)
+    inst = OpusGemmInstance(
+        256,            # BLOCK_SIZE
+        bm, bn, bk,     # BLOCK tile
+        t_m, t_n,       # T_M, T_N (4-wave warp-spec; tileN=1,2 / tileM=2,1)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, DSv4's 128 or MX's
+        # 32. The traits this family derives from carry the 32 path, so the only
+        # thing that made these 128-only was the literal.
+        1, quant_block, quant_block,
+        ("a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen" if tilen
+         else "a8w8_mxscale_bmm_bpreshuffle_bdirect"),
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.prefetch_scale = prefetch_scale
+    inst.preload_sf = preload_sf
+    inst.shuffle_scale = shuffle_scale
+    # The shuffled layout's own LDS scale panel. Distinct from preload_sf, which
+    # stages the *plain* panel and is mutually exclusive with shuffle_scale in
+    # this pipeline (both fill the same LDS, with different addressing) -- so a
+    # panel kid here reads preload_sf False and sf_shuf_in_lds True, where a wave8
+    # panel kid carries both.
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    assert not (sf_shuf_in_lds and preload_sf), (
+        "the plain and shuffled scale panels are alternative fills of the same "
+        "LDS; the pipeline static_asserts they never coexist"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
+    return inst
+
+
+# bdirect tiles use producer waves for A and consumer waves for direct B loads.
+# Scale-panel variants preload E8M0 scales; the small-M tiles retain the
+# producer/consumer split with a 16-row output tile.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    179: (16, 32, 512, 2),
+    173: (16, 32, 256, 2),
+    # kid171 omits the scale panels used by kid172.
+    171: (64, 32, 256, 2),
+}
+_bmm_bpre_bdirect_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILES.items()
+}
+# Plain-scale panel variant of the BM16 tile. COM_REP_M=1 lets the panel
+# use the caller's row-major scale layout directly.
+_bmm_bpre_bdirect_local[399] = (
+    _a8w8_mxscale_bmm_bpreshuffle_bdirect(
+        16, 32, 512, 2, prefetch_scale=False, preload_sf=True
+    )
+)
+
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_PRELOAD_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    172: (64, 32, 256, 2),
+    # 128x128x128 bdirect tile with preloaded scale panels.
+    184: (128, 128, 128, 1),
+}
+# Larger B_K=256 tiles require additional staging and fragment registers.
+# This family uses B_K=128 for its wider tiles to stay within those budgets.
+_bmm_bpre_bdirect_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, preload_sf=True)
+    for kid, (bm, bn, bk, wg)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_PRELOAD_TILES.items()
+})
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg_per_cu, prefetch_scale=False,
+                                       preload_sf=False, shuffle_scale=False,
+                                       sf_shuf_in_lds=False, quant_block=128):
+    """Preshuffled B staged through LDS by producer waves.
+
+    Consumers read their MFMA fragments from LDS. The tile geometry matches
+    the plain flatmm family; the traits select B's byte order and scale_op_sel.
+    Callers pass shuffle_weight(w, (16, 16))."""
+    t_m, t_n = (1, 2) if bm == 16 else (2, 1)
+    inst = OpusGemmInstance(
+        256,            # BLOCK_SIZE
+        bm, bn, bk,     # BLOCK tile
+        t_m, t_n,       # T_M, T_N
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        # GROUP_M=1 (per-token); GROUP_N=GROUP_K=quant_block, 128 or MX's 32.
+        1, quant_block, quant_block,
+        "a8w8_mxscale_bmm_bpreshuffle_blds",
+        ["fp32_t"],
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.prefetch_scale = prefetch_scale
+    inst.preload_sf = preload_sf
+    inst.shuffle_scale = shuffle_scale
+    assert not (shuffle_scale and preload_sf), (
+        "preload_sf stages the *plain* scale panel and reads it with the plain "
+        "layout's addressing; the two flags are mutually exclusive (static_assert "
+        "in opus_gemm_pipeline_a8w8_mxscale_flatmm_splitk_gfx950.cuh). A shuffled "
+        "kid that wants an LDS panel asks for sf_shuf_in_lds instead."
+    )
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
+    return inst
+
+
+# Map each plain flatmm tile to its preshuffled-B/LDS counterpart.
+# Keep explicit IDs so existing tuned configurations remain valid.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF = {
+    321: 226,
+    653: 227,
+    324: 228,
+    325: 229,
+    326: 230,
+    # IDs 224 and 225 remain unused to avoid ambiguous historical config IDs.
+    32: 251,
+    64: 252,
+    128: 231,
+    137: 232,
+    138: 233,
+    139: 234,
+    256: 235,
+    311: 236,
+    312: 237,
+    313: 238,
+    314: 239,
+    316: 240,
+    317: 241,
+    318: 242,
+    319: 243,
+    320: 244,
+    322: 245,
+    323: 246,
+    327: 247,
+    640: 248,
+    642: 249,
+    650: 250,
+}
+_bmm_bpre_blds_local = {
+    twin: _a8w8_mxscale_bmm_bpreshuffle_blds(
+        plain.B_M, plain.B_N, plain.B_K, plain.WG_PER_CU,
+        prefetch_scale=plain.prefetch_scale,
+        preload_sf=plain.preload_sf,
+    )
+    for plain, twin in (
+        # _bmm_flatmm_local, not the globalized list: the twin map is keyed by
+        # this family's own kid numbers, and the globalized dict does not exist
+        # yet here -- upstream builds it at the bottom of the file, after adding
+        # BMM_MXSCALE_KID_OFFSET (8000) to every id.
+        (_bmm_flatmm_local[plain_kid], twin_kid)
+        for plain_kid, twin_kid in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF.items()
+    )
+}
+
+# Plain-scale panel variant of the BM16 tile with prefetched A scales.
+# COM_REP_M=1 allows direct panel loads from the caller's scale layout.
+_bmm_bpre_blds_local[398] = (
+    _a8w8_mxscale_bmm_bpreshuffle_blds(
+        32, 32, 256, 2, prefetch_scale=False, preload_sf=True
+    )
+)
+
+# kid646 is the DIRECT_ONLY persistent schedule, which carries its own B staging
+# and rejects the flags this family sets. kid0 is the heuristic default and an
+# alias of kid32's geometry, so kid224 already covers its tile.
+_BLDS_NO_TWIN = {0, 646}
+_blds_untwinned = sorted(
+    kid
+    for kid in _bmm_flatmm_local
+    if kid not in _BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF and kid not in _BLDS_NO_TWIN
+)
+assert not _blds_untwinned, (
+    f"plain flatmm kids {_blds_untwinned} have no preshuffled-B twin. A preshuffled "
+    "deployment cannot dispatch a row-major kid, so any cell one of these wins is a "
+    "cell preshuffling B costs performance on. Add an id to "
+    "_BMM_MXSCALE_BPRESHUFFLE_BLDS_TWIN_OF, or to _BLDS_NO_TWIN with the reason."
+)
+
+# Small tiles compatible with the shuffled-scale layout.
+# Each shuffled-scale variant retains its plain counterpart's geometry.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_SCALE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)   plain winner it answers
+    385: (16, 32, 256, 4, False),   # kid243
+    386: (32, 32, 256, 2, True),    # kid226
+    # kid387 wins nothing, and neither does its plain twin kid238. Kept only so
+    # kid238's tile stays expressible under the wholesale switch; retire together.
+    387: (16, 64, 256, 2, False),   # kid238
+    # kid239 is the same tile without prefetch and deliberately gets no twin: it
+    # wins nothing, so a twin would measure a kid the tuner never picks.
+    392: (16, 32, 512, 2, True),    # kid236
+}
+_bmm_bpre_blds_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg, prefetch_scale=pf,
+                                            shuffle_scale=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_SCALE_TILES.items()
+})
+
+# blds variant with an LDS shuffled-scale panel.
+# The registered BM32 tile fully consumes each packed scale word.
+_BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_PANEL_TILES = {
+    397: (32, 32, 256, 2, True),    # kid386 + panel
+}
+_bmm_bpre_blds_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_blds(bm, bn, bk, wg, prefetch_scale=pf,
+                                            shuffle_scale=True, sf_shuf_in_lds=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BLDS_SHUFFLE_PANEL_TILES.items()
+})
+
+# The shuffled-scale bdirect twins. A shuffled kid reads its A scale as packed
+# dwords instead of per-subtile bytes, so it replaces the plain LDS scale panel
+# rather than filling it -- one twin therefore answers both the panelled and the
+# un-panelled member of a plain pair (kid216 stands against kid171 and kid172).
+#
+# Flags track the plain twin; the per-kid comment names it.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, prefetch_scale)     twin of
+    216: (64, 32, 256, 2, False),    # kid171 / kid172
+    217: (128, 128, 128, 1, False),  # kid184
+    # ... and the same two tiles with the scale load hoisted ahead of the LDS wait.
+    # PREFETCH_SCALE is only testable here: the wave8n4/wavetm1 pipeline
+    # static_asserts !PREFETCH_SCALE.
+    334: (64, 32, 256, 2, True),     # kid216 + prefetch
+    335: (128, 128, 128, 1, True),   # kid217 + prefetch
+    384: (16, 32, 256, 2, False),    # kid173
+    # B_K=512, i.e. COM_REP_K=4, which spends two A-scale dwords along K
+    # (SF_GEOM::KD). prefetch_scale is off because kid179 does not have it and
+    # SF_PREFETCH is gated on COM_REP_K==1 anyway, so it would be inert.
+    391: (16, 32, 512, 2, False),    # kid179
+}
+_bmm_bpre_bdirect_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
+                                               shuffle_scale=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_SCALE_TILES.items()
+})
+
+# Shuffled-scale variants with an LDS panel. The prologue stages scales
+# once so the K loop reads the panel from LDS. SF_SHUF_IN_LDS and
+# SUBTILE_TILE remain separate registered traits.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_PANEL_TILES = {
+    393: (16, 32, 512, 2, False),    # kid391 + panel
+}
+_bmm_bpre_bdirect_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, prefetch_scale=pf,
+                                               shuffle_scale=True, sf_shuf_in_lds=True)
+    for kid, (bm, bn, bk, wg, pf)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_SHUFFLE_PANEL_TILES.items()
+})
+
+# Paired plain-panel and shuffled-scale bdirect configurations.
+# B_M=128 uses B_K=128 to satisfy the minimum prefetch depth.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE = {
+    #    (B_M, B_N, B_K, WG_PER_CU)   term moved, and what it moves
+    (336, 337): (64,  32,  128, 2),   # B_K  256->128: COM_REP_K 2->1
+    (338, 339): (128, 32,  128, 2),   # B_M   64->128: COM_REP_M 2->4, vs (336,337)
+    (342, 343): (64,  32,  256, 1),   # WG_PER_CU 2->1: occupancy only, geometry fixed
+    # (344, 345): (64, 128, 256, 1) -- B_N 32->128, vs (342,343). Unwired, see below.
+}
+# The 64x128x256 bdirect variants are not instantiated because of register
+# pressure. LDS feasibility alone does not establish register feasibility.
+for (_plain_kid, _shuf_kid), (_bm, _bn, _bk, _wg) in (
+    _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_ISOLATE.items()
+):
+    _bmm_bpre_bdirect_local[_plain_kid] = (
+        _a8w8_mxscale_bmm_bpreshuffle_bdirect(_bm, _bn, _bk, _wg, preload_sf=True)
+    )
+    _bmm_bpre_bdirect_local[_shuf_kid] = (
+        _a8w8_mxscale_bmm_bpreshuffle_bdirect(_bm, _bn, _bk, _wg, prefetch_scale=True,
+                                              shuffle_scale=True)
+    )
+
+
+# bdirect variants with the T_M=1, T_N=2 consumer grid at B_M > 16.
+# These remain registered but are excluded from the default tuning policy.
+_BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILEN_TILES = {
+    #    (B_M, B_N, B_K, WG_PER_CU, preload_sf)   corresponding shuffled-scale ID
+    388: (64, 32, 256, 1, True),    # kid342 (wg1 + panels)
+    389: (64, 32, 256, 2, True),    # kid172 (wg2 + panels), the family's m<=256 winner
+    390: (64, 32, 256, 2, False),   # kid171 (wg2, no panels), owns the K=1024 end
+}
+_bmm_bpre_bdirect_tilen_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_bdirect(bm, bn, bk, wg, preload_sf=pre,
+                                               tilen=True)
+    for kid, (bm, bn, bk, wg, pre)
+    in _BMM_MXSCALE_BPRESHUFFLE_BDIRECT_TILEN_TILES.items()
+}
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_allwave(bm, bn, bk, wg_per_cu, quant_block=128):
+    """Four compute waves on a 2x2 grid, with both A and preshuffled B in LDS.
+
+    All waves stage operands into the ring and perform MFMA."""
+    inst = OpusGemmInstance(
+        256,            # BLOCK_SIZE (4 waves)
+        bm, bn, bk,     # BLOCK tile
+        2, 2,           # T_M, T_N (name only; ALL_WAVE derives the 2x2 grid)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
+        "a8w8_mxscale_bmm_bpreshuffle_allwave",
+        ["fp32_t"],
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.preload_sf = True
+    return inst
+
+
+# A and B both staged means twice the LDS per ring slot: 64x64x256 at two
+# workgroups a CU and 128x128x256 at one leave fewer than the three slots the
+# pipeline needs, so neither is here.
+_BMM_MXSCALE_BPRESHUFFLE_ALLWAVE_TILES = {
+    #    (B_M, B_N, B_K, WG_PER_CU)
+    420: (64, 64, 256, 1),
+    422: (64, 64, 128, 2),
+    423: (64, 128, 256, 1),
+    424: (64, 128, 128, 2),
+    425: (128, 64, 256, 1),
+    426: (128, 128, 128, 1),
+    427: (128, 64, 128, 2),
+}
+_bmm_bpre_allwave_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_allwave(bm, bn, bk, wg)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_ALLWAVE_TILES.items()
+}
+# No GROUP_K=32 twins yet: the all-wave traits cap B_N at GROUP_N, which at 32
+# rejects every tile here.
+
+
+# Derive GROUP_N=GROUP_K=32 variants from existing plain-scale instances.
+# Geometry and scheduling stay aligned with their group128 counterparts.
+# Shuffled-scale variants require a different producer layout and are excluded.
+def _mx32_twins(local, ctor, skip=frozenset(), **ctor_kwargs):
+    """{mirror + MX32_KID_STRIDE: the same tile at quant_block=32}.
+
+    `skip` holds mirrors whose twin clang 22 cannot compile, the same defect
+    _MX32_CLANG_REGCLASS_SKIP covers for the split-K family, plus any whose twin
+    is held out for returning wrong answers.
+    """
+    twins = {}
+    for kid, inst in local.items():
+        if kid in skip:
+            continue
+        if inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False):
+            continue
+        twins[kid + MX32_KID_STRIDE] = ctor(
+            inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+            prefetch_scale=inst.prefetch_scale,
+            preload_sf=inst.preload_sf,
+            quant_block=32,
+            **ctor_kwargs,
+        )
+    return twins
+
+
+_bmm_bpre_bdirect_local.update(
+    _mx32_twins(_bmm_bpre_bdirect_local, _a8w8_mxscale_bmm_bpreshuffle_bdirect)
+)
+_bmm_bpre_blds_local.update(
+    # Exclude group32 variants affected by ROCm 7.2.4 clang-22 register
+    # allocation defects: kid235 fails register-class validation, while
+    # kids231/232 can reload an incomplete spilled MFMA accumulator.
+    _mx32_twins(_bmm_bpre_blds_local, _a8w8_mxscale_bmm_bpreshuffle_blds,
+                skip=frozenset({235, 231, 232}))
+)
+_bmm_bpre_bdirect_tilen_local.update(
+    _mx32_twins(_bmm_bpre_bdirect_tilen_local,
+                _a8w8_mxscale_bmm_bpreshuffle_bdirect, tilen=True)
+)
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg_per_cu, xcd_wgm=0,
+                                          mpack_sfa=False, shuffle_scale=False,
+                                          sf_shuf_in_lds=False, quant_block=128):
+    """Eight compute waves on a 2x4 grid with preshuffled B loaded directly.
+
+    SCALE_OPSEL requires COM_REP_M = B_M/(W_M*T_M) to be a multiple of four.
+    Eight waves distribute the accumulator and fragment register footprint.
+    Only A is staged in LDS; B loads are consumed one N repeat at a time."""
+    inst = OpusGemmInstance(
+        512,            # BLOCK_SIZE (8 waves)
+        bm, bn, bk,     # BLOCK tile
+        2, 4,           # T_M, T_N (name only; traits derive the real 2x4 grid)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
+        "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.preload_sf = True
+    inst.xcd_wgm = xcd_wgm
+    inst.mpack_sfa = mpack_sfa
+    inst.shuffle_scale = shuffle_scale
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
+    return inst
+
+
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    194: (256, 256, 128, 1),
+    # Half-M tile satisfying the SCALE_OPSEL COM_REP_M alignment.
+    168: (128, 256, 128, 1),
+    # 128x128 tile with the wave8n4 schedule.
+    175: (128, 64,  256, 1),
+    # 128x128 wave8n4 variants at two K tile depths.
+    348: (128, 128, 256, 1),
+    349: (128, 128, 128, 1),
+}
+_bmm_bpre_wave8n4_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg)
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_TILES.items()
+}
+
+# wave8n4 variants with XCD-aware banded workgroup mapping.
+# XCD_WGM selects the M-band height; zero keeps the linear tile order.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_XCD_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, XCD_WGM)     twin of
+    346: (256, 256, 128, 1, 4),               # kid194 + FlyDSL's band height
+    # Apply band height 4 to the additional 2x4 tiles.
+    401: (128, 64,  256, 1, 4),               # kid175 + band 4
+    402: (128, 128, 256, 1, 4),               # kid348 + band 4
+    # 347: (256, 256, 128, 1, 2),             # kid194 + half of it; noise, see above
+}
+_bmm_bpre_wave8n4_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_XCD_TILES.items()
+})
+
+# Shuffled-scale counterparts of the wave8n4 tiles.
+# The scale layout is fixed by its producer; every selected kernel must
+# consume that same layout. This wave grid uses SHUF_SUB=32 to pair
+# M subtiles in each packed scale word.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUFFLE_SCALE_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)     twin of
+    213: (256, 256, 128, 1),         # kid194
+    214: (128, 256, 128, 1),         # kid168
+    215: (128, 64,  256, 1),         # kid175 -- also the only COM_REP_K=2 shuffled kid
+}
+_bmm_bpre_wave8n4_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, shuffle_scale=True)
+    for kid, (bm, bn, bk, wg)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUFFLE_SCALE_TILES.items()
+})
+
+# Additional wave8n4 shuffled-scale counterparts with matching geometry.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUF_TWIN_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU, XCD_WGM, SF_SHUF_IN_LDS)   twin of
+    # -- reg form, the tiles that had no shuffled twin at all --
+    350: (256, 256, 128, 1, 4, False),                    # kid346  (15 rows)
+    351: (128, 128, 256, 1, 0, False),                    # kid348
+    352: (128, 128, 128, 1, 0, False),                    # kid349
+    # -- lds form, one per tile above plus one per kid213/214/215 --
+    360: (256, 256, 128, 1, 0, True),                     # kid194 / kid213
+    361: (128, 256, 128, 1, 0, True),                     # kid168 / kid214
+    362: (128, 64,  256, 1, 0, True),                     # kid175 / kid215
+    363: (256, 256, 128, 1, 4, True),                     # kid346 / kid350
+    364: (128, 128, 256, 1, 0, True),                     # kid348 / kid351
+    365: (128, 128, 128, 1, 0, True),                     # kid349 / kid352
+}
+_bmm_bpre_wave8n4_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave8n4(bm, bn, bk, wg, xcd_wgm=wgm,
+                                               shuffle_scale=True,
+                                               sf_shuf_in_lds=lds)
+    for kid, (bm, bn, bk, wg, wgm, lds)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVE8N4_SHUF_TWIN_TILES.items()
+})
+
+# B_K=256 variants with matched plain and shuffled-scale configurations.
+
+
+
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_wavetm1(block_size, bm, bn, bk, wg_per_cu,
+                                          xcd_wgm=0, mpack_sfa=False,
+                                          shuffle_scale=False, sf_shuf_in_lds=False,
+                                          quant_block=128, blds=False):
+    """T_M=1 tiles with A fragments retained in registers at B_M=128.
+
+    BLOCK_SIZE selects a 1x8 or 1x4 grid. The blds variant stages B through
+    the LDS ring; the direct-B variant loads it into registers."""
+    inst = OpusGemmInstance(
+        block_size,     # BLOCK_SIZE (512 -> 8 waves / 1x8, 256 -> 4 waves / 1x4)
+        bm, bn, bk,     # BLOCK tile
+        1, block_size // 64,  # T_M, T_N (name only; traits derive the real grid)
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block, quant_block,  # GROUP_M=1 (per-token), GROUP_N=GROUP_K
+        "a8w8_mxscale_bmm_bpreshuffle_wavetm1" + ("_blds" if blds else ""),
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.preload_sf = True
+    inst.xcd_wgm = xcd_wgm
+    inst.mpack_sfa = mpack_sfa
+    inst.shuffle_scale = shuffle_scale
+    assert not sf_shuf_in_lds or shuffle_scale, (
+        "sf_shuf_in_lds stages the shuffled scale words; it means nothing without "
+        "shuffle_scale"
+    )
+    inst.sf_shuf_in_lds = sf_shuf_in_lds
+    return inst
+
+
+# T_M=1 tiles. BLOCK_SIZE selects the number of N waves.
+# At B_M=128 the A fragments stay in registers; larger tiles use the
+# family's LDS streaming schedule.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU)
+    202: (512, 128, 256, 128, 1),
+    203: (256, 128, 256, 128, 1),
+}
+_bmm_bpre_wavetm1_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg)
+    for kid, (bs, bm, bn, bk, wg) in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_TILES.items()
+}
+
+# wavetm1 variants with XCD-aware workgroup rasterization.
+# The mapping groups nearby M tiles into bands to share cache-resident
+# operands. XCD_WGM selects the band height.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_XCD_TILES = {
+    # (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    205: (256, 128, 256, 128, 1, 4),   # kid203 with band height 4
+    404: (512, 128, 256, 128, 1, 4),   # = kid202 (1x8) + band 4
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_XCD_TILES.items()
+})
+
+# kid208 uses SFA_MPACK_GLOBAL: the caller supplies the A scale panel
+# packed along M instead of having the prologue pack ordinary scales.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_MPACK_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    208: (256, 128, 256, 128, 1, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm,
+                                               mpack_sfa=True)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_MPACK_TILES.items()
+})
+
+# Narrower wavetm1 tiles on the 1x4 compute-wave grid.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    405: (256, 64, 128, 256, 1, 4),
+    406: (256, 128, 128, 128, 1, 4),
+    407: (256, 64, 256, 128, 1, 4),
+    408: (256, 64, 64, 256, 1, 4),
+    409: (256, 128, 64, 256, 1, 4),
+    410: (256, 128, 128, 256, 1, 4),
+    411: (256, 64, 128, 128, 1, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_TILES.items()
+})
+
+# The 1x4 tiles at two workgroups per CU.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_WG2_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    451: (256, 128, 128, 128, 2, 4),
+    452: (256, 64, 128, 256, 2, 4),
+    453: (256, 64, 256, 128, 2, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_1X4_WG2_TILES.items()
+})
+
+# The 1x4 tiles with B staged through the LDS ring (wavetm1_blds). kid454 is
+# flydsl's b2/m2048 tile, 128x128x128 at four slots; the others are the 1x4
+# tiles whose A+B slot still leaves three.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_BLDS_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    454: (256, 128, 128, 128, 1, 4),
+    455: (256, 64, 128, 128, 1, 4),
+    456: (256, 64, 128, 256, 1, 4),
+    457: (256, 128, 256, 128, 1, 4),
+    # Two-wave decode tiles using the shared A/B LDS staging schedule.
+    # The B-LDS variant also participates in the scale-panel residency budget.
+    460: (128, 16, 32, 256, 2, 0),
+}
+_bmm_bpre_wavetm1_blds_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm, blds=True)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_BLDS_TILES.items()
+}
+
+# kid210 reads both scales in the shuffle_scale_a / shuffle_scale_b layout.
+# Each scale word packs two M subtiles crossed with two K blocks; B bytes
+# are duplicated for the shared scale_op_sel selection. At B_K=128 the
+# K loop unrolls by two to select the two K blocks in each word.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUFFLE_SCALE_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM)
+    210: (256, 128, 256, 128, 1, 4),
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm,
+                                               shuffle_scale=True)
+    for kid, (bs, bm, bn, bk, wg, wgm)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUFFLE_SCALE_TILES.items()
+})
+
+# Matched plain and shuffled-scale wavetm1 configurations.
+_BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUF_TWIN_TILES = {
+    #   (BLOCK_SIZE, B_M, B_N, B_K, WG_PER_CU, XCD_WGM, SF_SHUF_IN_LDS)  twin of
+    # -- reg form; kid205's is kid210 above --
+    370: (512, 128, 256, 128, 1, 0, False),                          # kid202
+    371: (256, 128, 256, 128, 1, 0, False),                          # kid203
+    # -- lds form --
+    380: (256, 128, 256, 128, 1, 4, True),                           # kid205 / kid210
+    381: (512, 128, 256, 128, 1, 0, True),                           # kid202 / kid370
+    382: (256, 128, 256, 128, 1, 0, True),                           # kid203 / kid371
+}
+_bmm_bpre_wavetm1_local.update({
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wavetm1(bs, bm, bn, bk, wg, xcd_wgm=wgm,
+                                               shuffle_scale=True,
+                                               sf_shuf_in_lds=lds)
+    for kid, (bs, bm, bn, bk, wg, wgm, lds)
+    in _BMM_MXSCALE_BPRESHUFFLE_WAVETM1_SHUF_TWIN_TILES.items()
+})
+
+# GROUP_K=32 counterparts of the all-compute direct-B families.
+# Construct them from the original instance's traits.
+def _mx32_wave8_twins(local, ctor, *lead, skip=frozenset(), **ctor_kwargs):
+    # ctor_kwargs is not decoration. This builds the twin from the mirror's
+    # *tile* attributes only, so any ctor flag that is not one of those -- blds
+    # being the one that exists today -- is silently lost and the twin comes out
+    # as a different kernel wearing the twin's id. It has to be passed back in
+    # here, by the caller, the same way the mirror's own dict passes it.
+    return {
+        kid + MX32_KID_STRIDE: ctor(
+            *[getattr(inst, a) for a in lead],
+            inst.B_M, inst.B_N, inst.B_K, inst.WG_PER_CU,
+            xcd_wgm=inst.xcd_wgm, quant_block=32, **ctor_kwargs,
+        )
+        for kid, inst in local.items()
+        if kid not in skip
+        and not (inst.shuffle_scale or inst.mpack_sfa or inst.sf_shuf_in_lds)
+    }
+
+
+_bmm_bpre_wave8n4_local.update(
+    _mx32_wave8_twins(_bmm_bpre_wave8n4_local, _a8w8_mxscale_bmm_bpreshuffle_wave8n4)
+)
+_bmm_bpre_wavetm1_local.update(
+    # The smaller B_K=128 tiles use the ring path when the whole-split scale
+    # panel would exceed their residency budget.
+    _mx32_wave8_twins(_bmm_bpre_wavetm1_local, _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
+                      "BLOCK_SIZE", skip=frozenset({407, 411, 453}))
+)
+_bmm_bpre_wavetm1_blds_local.update(
+    # GROUP_K=32 counterparts of the wave8n4 tiles.
+    _mx32_wave8_twins(_bmm_bpre_wavetm1_blds_local,
+                      _a8w8_mxscale_bmm_bpreshuffle_wavetm1,
+                      "BLOCK_SIZE", skip=frozenset({457}), blds=True)
+)
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_wave1(bm, bn, bk, wg_per_cu, ring=0, quant_block=128, group_n=None):
+    """Single-wave decode kernel with operands loaded directly into registers.
+
+    The pipeline uses no LDS staging or inter-wave barriers."""
+    inst = OpusGemmInstance(
+        64,             # BLOCK_SIZE: one wave64
+        bm, bn, bk,     # BLOCK tile
+        1, 1,           # T_M, T_N
+        16, 16, 128,    # W_M, W_N, W_K (MFMA 16x16x128 fp8) -- name only
+        16, 16, 4,      # VEC_A, VEC_B, VEC_C
+        1, quant_block if group_n is None else group_n, quant_block,
+        "a8w8_mxscale_bmm_bpreshuffle_wave1",
+        ["fp32_t"],     # single fp32 host stub; body branches on Y.dtype()
+        wg_per_cu,
+    )
+    inst.name_root = "opus_bmm"
+    inst.wave1_ring = ring
+    return inst
+
+
+# Single-wave decode tiles with several N/K depths and load schedules.
+_BMM_MXSCALE_BPRESHUFFLE_WAVE1_TILES = {
+    #   (B_M, B_N, B_K, WG_PER_CU)
+    440: (16, 32, 256, 2),
+    441: (16, 64, 256, 2),
+    442: (16, 32, 512, 2),
+    443: (32, 32, 256, 2),
+    444: (16, 32, 128, 2),
+    445: (16, 32, 256, 1),
+    # kid445 with the ring pinned shallower (default 4 stages, 192 VGPRs).
+    446: (16, 32, 256, 1, 2),
+    447: (16, 32, 256, 1, 3),
+    # B_N=16 variants increase the number of N tiles per workgroup row.
+    448: (16, 16, 256, 2),
+    449: (16, 16, 256, 1),
+}
+_bmm_bpre_wave1_local = {
+    kid: _a8w8_mxscale_bmm_bpreshuffle_wave1(*geom)
+    for kid, geom in _BMM_MXSCALE_BPRESHUFFLE_WAVE1_TILES.items()
+}
+
+# Independent per-N-row K32 scales. Keep IDs below the gfx942 band at 10000.
+_bmm_bpre_wave1_local.update({
+    1700 + kid - 440: _a8w8_mxscale_bmm_bpreshuffle_wave1(
+        *geom, quant_block=32, group_n=1
+    )
+    for kid, geom in _BMM_MXSCALE_BPRESHUFFLE_WAVE1_TILES.items()
+})
+_bmm_bpre_wave1_local[1710] = _a8w8_mxscale_bmm_bpreshuffle_wave1(
+    16, 16, 128, 2, quant_block=32, group_n=1
+)
+
+
+# Larger per-row K32 tile for shapes with enough output tiles to fill the GPU.
+# A two-stage register ring bounds operand storage while each load feeds more
+# MFMAs than the decode tiles above.
+_bmm_bpre_wave1_local[1713] = _a8w8_mxscale_bmm_bpreshuffle_wave1(
+    64, 64, 128, 2, 2, quant_block=32, group_n=1
+)
+
+
+# Derive GROUP_N=GROUP_K=32 flatmm variants with IDs offset by
+# MX32_KID_STRIDE. Exclude tiles affected by the ROCm 7.2.4 clang-22
+# register-class defect at the larger register footprints.
+_MX32_CLANG_REGCLASS_SKIP = frozenset({128, 139, 256})
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, direct, prefetch, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg, direct, prefetch) in _BMM_MXSCALE_SPLITK_TILES.items()
+    if kid not in _MX32_CLANG_REGCLASS_SKIP
+})
+# GROUP_K=32 PRELOAD_SF_LDS variants use the bounded scale ring selected
+# by SF_USE_RING, instead of allocating a whole-split scale panel.
+_bmm_flatmm_local.update({
+    kid + MX32_KID_STRIDE: _a8w8_mxscale_bmm_flatmm_splitk(
+        bm, bn, bk, wg, preload_sf=True, quant_block=32
+    )
+    for kid, (bm, bn, bk, wg) in _BMM_MXSCALE_SPLITK_PRELOAD_TILES.items()
+})
+
+
 # ROCm 7.2.4 clang-22 assigns an illegal register class while compiling this
 # exact high-pressure PRELOAD_SF_LDS + D_OUT=void specialization after the
 # workspace kargs moved to a direct pointer.  Its splitK=1 BF16/FP32 kernels
@@ -547,7 +1592,12 @@ _bmm_fused_local = {
     100: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_fused", 32, 128, 128, 2),
 }
 
-
+# pipeline (kids 149/150/151/152/158/159/164): BLOCK_SIZE 512, m{128,256}n{128,256}k128, dual
+# bf16/fp32 traits (output dtype baked into the traits tuple), non-splitk scale
+# kargs. One of the gemm_a8w8_scale_* kernels selected by flags. The wave
+# layout (T_M/T_N/W_*) is derived inside opus_gemm_a8w8_scale_traits_gfx950 from
+# BLOCK + <B_M,B_N,B_K>, so only B_M/B_N/B_K matter here (the T_M/T_N passed to
+# OpusGemmInstance are cosmetic for this tag).
 def _a8w8_mxscale_bmm_pipeline(**flags):
     inst = OpusGemmInstance(
         512, 256, 256, 128, 2, 1, 16, 16, 128, 16, 16, 4,
@@ -562,9 +1612,32 @@ def _a8w8_mxscale_bmm_pipeline(**flags):
 _bmm_pipeline_local = {
     149: _a8w8_mxscale_bmm_pipeline(B_M=128),
     150: _a8w8_mxscale_bmm_pipeline(),
-    151: _a8w8_mxscale_bmm_pipeline(k1024_only=True),
-    152: _a8w8_mxscale_bmm_pipeline(k1024_lb1=True),
     158: _a8w8_mxscale_bmm_pipeline(preload_sf_lds=True),
+    # kid159 uses preloaded scales at the half-M tile.
+    159: _a8w8_mxscale_bmm_pipeline(B_M=128, preload_sf_lds=True),
+    # kid164 uses preloaded scales with the N tile halved.
+    164: _a8w8_mxscale_bmm_pipeline(B_N=128, preload_sf_lds=True),
+}
+
+
+def _a8w8_mxscale_bmm_pipeline_bpreshuffle(**flags):
+    """Preshuffled-weight variant of the quadrant-scheduled pipeline.
+
+    The tile, 4x2 wave grid and LDS staging match kid158. The producer's
+    B addressing consumes shuffle_weight(w, (16, 16))."""
+    inst = OpusGemmInstance(
+        512, 256, 256, 128, 2, 1, 16, 16, 128, 16, 16, 4, 1, 128, 128,
+        "a8w8_mxscale_bmm_pipeline_bpreshuffle", ["fp32_t"], 1,
+    )
+    inst.name_root = "opus_bmm"
+    for key, val in flags.items():
+        setattr(inst, key, val)
+    return inst
+
+
+_bmm_pipeline_bpre_local = {
+    # kid196: kid158 (preload_sf_lds) with a preshuffled B.
+    196: _a8w8_mxscale_bmm_pipeline_bpreshuffle(preload_sf_lds=True),
 }
 _bmm_mouter_local = {
     131: _a8w8_mxscale_bmm_spec("a8w8_mxscale_bmm_mouter", 128, 128, 128, 1),
@@ -596,11 +1669,44 @@ _bmm_wave4m2_local = {
 }
 
 
+# All name-keyed a8w8_mxscale BMM kernel families (gfx950-only). Kept as a tuple
+# of the per-family kid-keyed dicts -- NOT merged into one dict, because int kids
+# repeat across families and are deduped downstream by launcher NAME (see
+# gen_instances.py). Single source of truth for both consumers there: the codegen
+# kdict merge and the BMM int-kid tune-lookup emitter.
+# Kids that read their scales in a layout the quantiser has to produce -- the
+# shuffle_scale words (with or without the LDS panel) and the host M-packed A
+# panel. Nothing upstream emits those layouts yet, and no tuned row uses these
+# kids, so they stay defined but are not built; set this to True to put all
+# of them back into the catalogue, the codegen and the tuner.
+BMM_BUILD_RELAID_SCALE_KIDS = False
+
+
+def _relaid_scale(inst):
+    return bool(inst.shuffle_scale or getattr(inst, "sf_shuf_in_lds", False)
+                or inst.mpack_sfa)
+
+
 def _globalize_bmm_kids(kernels):
-    return {bmm_mxscale_global_kid(kid): inst for kid, inst in kernels.items()}
+    return {
+        bmm_mxscale_global_kid(kid): inst
+        for kid, inst in kernels.items()
+        if BMM_BUILD_RELAID_SCALE_KIDS or not _relaid_scale(inst)
+    }
 
 
 a8w8_mxscale_bmm_flatmm_splitk_kernels_list = _globalize_bmm_kids(_bmm_flatmm_local)
+a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list = _globalize_bmm_kids(_bmm_bpre_bdirect_local)
+a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen_kernels_list = _globalize_bmm_kids(_bmm_bpre_bdirect_tilen_local)
+a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list = _globalize_bmm_kids(_bmm_bpre_blds_local)
+a8w8_mxscale_bmm_bpreshuffle_allwave_kernels_list = _globalize_bmm_kids(_bmm_bpre_allwave_local)
+a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list = _globalize_bmm_kids(_bmm_bpre_wave8n4_local)
+a8w8_mxscale_bmm_bpreshuffle_wavetm1_kernels_list = _globalize_bmm_kids(_bmm_bpre_wavetm1_local)
+a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds_kernels_list = _globalize_bmm_kids(
+    _bmm_bpre_wavetm1_blds_local
+)
+a8w8_mxscale_bmm_bpreshuffle_wave1_kernels_list = _globalize_bmm_kids(_bmm_bpre_wave1_local)
+a8w8_mxscale_bmm_pipeline_bpreshuffle_kernels_list = _globalize_bmm_kids(_bmm_pipeline_bpre_local)
 a8w8_mxscale_bmm_fused_kernels_list = _globalize_bmm_kids(_bmm_fused_local)
 a8w8_mxscale_bmm_minterleave_kernels_list = _globalize_bmm_kids(_bmm_minterleave_local)
 a8w8_mxscale_bmm_mouter_kernels_list = _globalize_bmm_kids(_bmm_mouter_local)
@@ -612,13 +1718,81 @@ a8w8_mxscale_bmm_wave8n2_kernels_list = _globalize_bmm_kids(_bmm_wave8n2_local)
 a8w8_mxscale_bmm_wave4m2_selfload_kernels_list = _globalize_bmm_kids(
     _bmm_wave4m2_local
 )
+
+
+def _a8w8_mxscale_bmm_bpreshuffle_compact(bm, bn, bk, wm, wn, nb, nt, early_b):
+    return OpusGemmInstance(
+        wm * wn * 64,
+        bm,
+        bn,
+        bk,
+        wm,
+        wn,
+        16,
+        16,
+        128,
+        16,
+        16,
+        4,
+        1,
+        128,
+        128,
+        "a8w8_mxscale_bmm_bpreshuffle_compact",
+        ["fp32_t"],
+        WG_PER_CU=1,
+        cachectl_a=0,
+        cachectl_b=2 if nt else 0,
+        num_slots=nb,
+        early_b=early_b,
+        name_root="opus_bmm",
+        max_m=2047,
+    )
+
+
+# Explicit local ids keep existing tuned CSVs stable when adding configurations.
+# Arguments: BM, BN, BK, WM, WN, LDS slots, non-temporal B, early B prefetch.
+a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list = _globalize_bmm_kids(
+    {
+        470: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 2, 2, 4, True, False),
+        471: _a8w8_mxscale_bmm_bpreshuffle_compact(96, 64, 256, 2, 2, 3, False, False),
+        472: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 256, 4, 2, 4, True, False),
+        473: _a8w8_mxscale_bmm_bpreshuffle_compact(
+            192, 128, 128, 2, 4, 3, False, False
+        ),
+        474: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, False),
+        475: _a8w8_mxscale_bmm_bpreshuffle_compact(192, 128, 128, 2, 4, 3, False, True),
+        476: _a8w8_mxscale_bmm_bpreshuffle_compact(256, 128, 128, 4, 2, 3, True, True),
+        477: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 32, 512, 1, 2, 3, False, False),
+        478: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 32, 512, 2, 2, 2, False, False),
+        479: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 512, 1, 4, 2, False, False),
+        480: _a8w8_mxscale_bmm_bpreshuffle_compact(16, 64, 256, 1, 4, 3, False, False),
+        481: _a8w8_mxscale_bmm_bpreshuffle_compact(32, 64, 256, 2, 2, 3, False, False),
+        482: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 32, 256, 2, 2, 3, False, False),
+        483: _a8w8_mxscale_bmm_bpreshuffle_compact(64, 64, 128, 2, 2, 3, False, False),
+        484: _a8w8_mxscale_bmm_bpreshuffle_compact(
+            128, 128, 128, 2, 2, 2, False, False
+        ),
+    }
+)
+
+
 a8w8_mxscale_bmm_kernel_lists = (
+    a8w8_mxscale_bmm_bpreshuffle_compact_kernels_list,
     a8w8_mxscale_bmm_flatmm_splitk_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_bdirect_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_blds_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_allwave_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wave8n4_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wavetm1_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds_kernels_list,
+    a8w8_mxscale_bmm_bpreshuffle_wave1_kernels_list,
     a8w8_mxscale_bmm_fused_kernels_list,
     a8w8_mxscale_bmm_minterleave_kernels_list,
     a8w8_mxscale_bmm_mouter_kernels_list,
     a8w8_mxscale_bmm_mouter_tunable_kernels_list,
     a8w8_mxscale_bmm_pipeline_kernels_list,
+    a8w8_mxscale_bmm_pipeline_bpreshuffle_kernels_list,
     a8w8_mxscale_bmm_wave8n2_kernels_list,
     a8w8_mxscale_bmm_wave4m2_selfload_kernels_list,
 )
@@ -1747,6 +2921,24 @@ kernels_list = {
 # fmt: on
 
 
+# Generated names must identify one configuration. Multiple IDs may alias
+# the same configuration, but distinct traits must not share a name.
+_name_owner = {}
+_name_clashes = []
+for _cat in (*a8w8_mxscale_bmm_kernel_lists, kernels_list):
+    for _kid, _inst in _cat.items():
+        _sig = repr(asdict(_inst))
+        _owner = _name_owner.setdefault(_inst.name, (_kid, _sig))
+        if _owner[1] != _sig:
+            _name_clashes.append((_owner[0], _kid, _inst.name))
+assert not _name_clashes, (
+    "these kid pairs differ in configuration yet share one instance name, so only "
+    f"one of each pair can be emitted: {_name_clashes}. Whatever distinguishes them "
+    "has to appear in OpusGemmInstance.name for their kernel_tag."
+)
+
+
+# Subset-compile kid taxonomy (consumed by gen_instances.py for the `HEURISTIC_DEFAULT_KIDS ?
 # Subset-compile kid taxonomy consumed by gen_instances.py.
 
 # Splitk kids: a16w16_flatmm_splitk pipeline (kid 200..223 + nooob mirror).
@@ -1926,6 +3118,14 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
         ),
         "a8w8": frozenset({"a8w8"}),
         "a8w8_blockscale": frozenset({"a8w8_scale"}),
+        # Keep in step with _A8W8_MXSCALE_BMM_TAGS in aiter/ops/opus/launch_plan.py.
+        # They are two hand-maintained copies of the same list and both are
+        # consulted, this one first: get_kernel_instance rejects a kid whose tag
+        # is missing here before the plan builder ever checks its own copy. A tag
+        # added to only one of them therefore looks like "no registered OPUS
+        # kernel", which reads as a missing kernel rather than a missing list
+        # entry -- that is exactly how all 133 preshuffled rows were dropped
+        # while the kids were present in kernels_list the whole time.
         "a8w8_mxscale_bmm": frozenset(
             {
                 "a8w8_mxscale_bmm_flatmm_splitk",
@@ -1936,6 +3136,19 @@ OPUS_KERNEL_TAGS_BY_ARCH_FAMILY = {
                 "a8w8_mxscale_bmm_pipeline",
                 "a8w8_mxscale_bmm_wave8n2",
                 "a8w8_mxscale_bmm_wave4m2_selfload",
+                # The preshuffled-B families: unreachable upstream, where gfx950
+                # preshuffle is off, but every row of the preshuffled tuned table
+                # names one.
+                "a8w8_mxscale_bmm_bpreshuffle_bdirect",
+                "a8w8_mxscale_bmm_bpreshuffle_bdirect_tilen",
+                "a8w8_mxscale_bmm_bpreshuffle_blds",
+                "a8w8_mxscale_bmm_bpreshuffle_allwave",
+                "a8w8_mxscale_bmm_bpreshuffle_wave8n4",
+                "a8w8_mxscale_bmm_bpreshuffle_wavetm1",
+                "a8w8_mxscale_bmm_bpreshuffle_wavetm1_blds",
+                "a8w8_mxscale_bmm_bpreshuffle_wave1",
+                "a8w8_mxscale_bmm_bpreshuffle_compact",
+                "a8w8_mxscale_bmm_pipeline_bpreshuffle",
             }
         ),
         "a8w8_blockscale_bpreshuffle": frozenset(),

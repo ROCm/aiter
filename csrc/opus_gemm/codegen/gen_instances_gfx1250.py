@@ -3,9 +3,13 @@
 """Generate gfx1250 OPUS A16W16 launchers."""
 
 import os
-from pathlib import Path
 
-from codegen.common import register_arch_map, register_emit, splitk_workspace_type
+from codegen.common import (
+    register_arch_map,
+    register_emit,
+    splitk_workspace_type,
+    write_if_changed,
+)
 
 # ---------------- gfx1250 arch-override maps ----------------
 
@@ -408,7 +412,7 @@ void
 }}}}
 #endif // launcher only on regular host pass
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     # The <fp32_t> token is the host launch-dispatch specialization. The physical
     # workspace type is independently embedded in the Traits alias above.
@@ -602,7 +606,7 @@ void
 }}}}
 #endif
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(INSTANCE_IMPL)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), INSTANCE_IMPL)
 
     host_decl = (
         f"template void\n"
@@ -720,7 +724,7 @@ void
 }}
 #endif
 """
-    Path(os.path.join(cg.impl_path, f"{k.name}.cuh")).write_text(instance_impl)
+    write_if_changed(os.path.join(cg.impl_path, f"{k.name}.cuh"), instance_impl)
 
     # Intentionally append host instantiations only. This is the compile bypass
     # that keeps release hipcc away from the pin-VGPR device pipeline.
