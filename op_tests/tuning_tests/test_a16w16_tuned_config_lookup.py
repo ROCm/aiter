@@ -112,5 +112,49 @@ class TestGfx1250FlydslCandidates(unittest.TestCase):
                     self.assertEqual({key: params[key] for key in config}, config, name)
 
 
+class TestGfx1250DefaultDispatch(unittest.TestCase):
+    """gfx1250 shapes without a tuned row: FlyDSL where Triton runs its default config, Triton otherwise."""
+
+    def _default(self, m, n, k, dtype=BF16, otype=BF16):
+        from aiter.ops.triton.utils._triton import arch_info
+
+        patches = [
+            mock.patch.object(tuned, "get_GEMM_A16W16_config_", dict),
+            mock.patch.object(tuned, "get_gfx", lambda: "gfx1250"),
+            mock.patch.object(tuned, "get_cu_num", lambda: 256),
+            mock.patch.object(tuned, "get_padded_m", lambda m_, _n, _k, _gl: m_),
+            mock.patch.object(arch_info, "get_arch", lambda: "gfx1250"),
+        ]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+        tuned.get_GEMM_A16W16_config.cache_clear()
+        self.addCleanup(tuned.get_GEMM_A16W16_config.cache_clear)
+        return tuned.get_GEMM_A16W16_config(m, n, k, False, dtype, otype)
+
+    def test_large_shapes_take_flydsl(self):
+        for m, tile in ((512, "_t128x128x64x4_"), (2048, "_t256x128x64x4_")):
+            config = self._default(m, 4096, 4096)
+            self.assertEqual(config["libtype"], "flydsl")
+            self.assertIn(tile, config["kernelName"])
+            params = tuned._get_flydsl_gemm_kernels().get_flydsl_hgemm_kernel_params(
+                config["kernelName"]
+            )
+            self.assertIsNotNone(params, config["kernelName"])
+
+    def test_other_shapes_stay_on_triton(self):
+        fp16 = str(torch.float16)
+        cases = [
+            (256, 4096, 4096, BF16),  # M below 512
+            (2048, 2048, 4096, BF16),  # N below 4096
+            (2048, 4096, 256, BF16),  # K below 512
+            (2048, 5120, 5120, BF16),  # Triton has a gfx1250 config for this (N, K)
+            (2048, 4096, 4096, fp16),
+        ]
+        for m, n, k, dtype in cases:
+            config = self._default(m, n, k, dtype, dtype)
+            self.assertEqual(config["libtype"], "triton", (m, n, k, dtype))
+
+
 if __name__ == "__main__":
     unittest.main()

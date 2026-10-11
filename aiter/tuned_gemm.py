@@ -42,6 +42,42 @@ def _get_flydsl_gemm_kernels():
     return gemm_kernels
 
 
+def _gfx1250_flydsl_default_kernel(M, N, K, bias, dtype, otype):
+    """The FlyDSL kernel for a gfx1250 BF16 GEMM without a tuned row, or None for Triton.
+
+    Where Triton runs its default config, these two FlyDSL configs took 0.35 to 0.68 of Triton's time for M >= 512,
+    N >= 4096 and K >= 512 (the shapes of the untuned BF16 CSVs). With fewer tiles Triton was faster, K < 512 is too
+    short for the 4-stage pipeline, and an (N, K) with its own Triton config can beat both.
+    """
+    if dtype != dtypes.bf16 or otype not in (dtypes.bf16, dtypes.fp32):
+        return None
+    if M < 512 or N < 4096 or K < 512:
+        return None
+    from aiter.ops.triton.utils.config_utils import resolve_config_dir
+
+    # The file's "any" entry covers the M buckets it does not list, so a file for (N, K), not
+    # get_gemm_config's is_tuned for this M, tells whether Triton runs a config made for this shape.
+    cfg_dir = resolve_config_dir("gemm", "GEMM-A16W16", backend="gluon")
+    if os.path.isfile(f"{cfg_dir}/GEMM-A16W16-N={N}-K={K}.json"):
+        return None
+    big = M > 768
+    config = {
+        "block_m": 256 if big else 128,
+        "block_n": 128,
+        "block_k": 64,
+        "stages": 4,
+        "split_k": 1,
+        "m_waves": 4 if big else 2,
+        "n_waves": 2,
+        "k_waves": 1,
+        "group_m": 0,
+        "use_half_tile_interleaved": False,
+    }
+    return _get_flydsl_gemm_kernels().flydsl_hgemm_kernel_name(
+        dtype=dtype, out_dtype=otype, config=config, has_bias=bias, target_gfx="gfx1250"
+    )
+
+
 this_dir = os.path.dirname(os.path.abspath(__file__))
 
 extensions_created = False
@@ -283,8 +319,17 @@ def get_GEMM_A16W16_config(
                 and not scaleAB
                 and eval(dtype) in (dtypes.bf16, dtypes.fp16)
             ):
-                default_config["libtype"] = "triton"
-                default_config["solidx"] = 0
+                kernel_name = _gfx1250_flydsl_default_kernel(
+                    M, N, K, bias, eval(dtype), eval(otype)
+                )
+                if kernel_name is None:
+                    default_config["libtype"] = "triton"
+                    default_config["solidx"] = 0
+                else:
+                    default_config["libtype"] = "flydsl"
+                    default_config["solidx"] = 0
+                    default_config["splitK"] = 1
+                    default_config["kernelName"] = kernel_name
             else:
                 default_config["libtype"] = "torch"
                 default_config["solidx"] = 0
