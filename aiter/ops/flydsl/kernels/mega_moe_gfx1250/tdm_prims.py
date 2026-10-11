@@ -43,12 +43,11 @@ from __future__ import annotations
 
 import math
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl.expr import arith
 from flydsl.expr.rocdl import readfirstlane, tdm_ops
 from flydsl.expr.typing import T
-
-from . import vector
 
 #: Widest ISA dim/tile field. Both extents and the row stride are 16-bit in the
 #: parts of GROUP1 a 2D descriptor actually uses.
@@ -92,8 +91,7 @@ def tdm_group1(dim0, dim1, elem_bytes, stride=None):
     if stride is None:
         stride = dim0
     ds = int(math.log2(elem_bytes))
-    return vector.from_elements(
-        T.vec(8, T.i32),
+    return fx.Vector.from_elements(
         [
             _i32(ds << 16),
             _i32((dim0 & 0xFFFF) << 16),
@@ -104,7 +102,8 @@ def tdm_group1(dim0, dim1, elem_bytes, stride=None):
             _i32(((stride >> 32) & 0xFFFF) | ((dim1 & 0xFFFF) << 16)),
             _i32((dim1 >> 16) & 0xFFFFFFFF),
         ],
-    )
+        fx.Int32,
+    ).ir_value()
 
 
 def tdm_group1_rows_4b(rows):
@@ -119,8 +118,7 @@ def tdm_group1_rows_4b(rows):
     dim0 = TDM_ROW_ELEMS_4B
     r = readfirstlane(T.i32, arith.unwrap(rows))
     r_hi = arith.shli(r, _i32(16))
-    return vector.from_elements(
-        T.vec(8, T.i32),
+    return fx.Vector.from_elements(
         [
             _i32(2 << 16),  # data_size = log2(4B)
             _i32(dim0 << 16),
@@ -131,7 +129,8 @@ def tdm_group1_rows_4b(rows):
             r_hi,
             _i32(0),
         ],
-    )
+        fx.Int32,
+    ).ir_value()
 
 
 def tdm_plan_xfer_4b(src_addr, dst_addr, n_elems):
@@ -189,15 +188,15 @@ def tdm_group0(lds_addr_i32, global_addr_i64):
         arith.trunci(i32, arith.shrui(addr, arith.constant(32, type=T.i64))),
         _i32(1 << 31),  # descriptor type field
     )
-    return vector.from_elements(
-        T.vec(4, T.i32),
+    return fx.Vector.from_elements(
         [
             _i32(1),
             readfirstlane(T.i32, arith.unwrap(lds_addr_i32)),
             readfirstlane(T.i32, lo),
             readfirstlane(T.i32, hi),
         ],
-    )
+        fx.Int32,
+    ).ir_value()
 
 
 def tdm_load(group0, group1, cache_policy=0):

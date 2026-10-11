@@ -51,7 +51,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, vector
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.primitive import range_constexpr
@@ -292,9 +292,9 @@ def _lds_barrier():
     s_barrier. gpu.barrier also waits on every global read in flight, and
     the reads issued ahead of a hand-off are exactly the ones meant to stay
     in flight across it."""
-    llvm.fence(llvm.AtomicOrdering.release, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
     rocdl.s_barrier()
-    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
 
 
 def _add(a, b):
@@ -918,17 +918,13 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 # (in the loop body's first wait as well, which also covers its
                 # entry)
                 kvs = [
-                    fx.Int32(
-                        vector.ExtractOp(
-                            _global_i32(
-                                kvs_page_base
-                                + fx.Int64(lane_kvs_off + fx.Int32(kt * 4 * page_size)),
-                                1,
-                            ),
-                            [],
-                            [0],
-                        ).result
-                    )
+                    fx.Vector(
+                        _global_i32(
+                            kvs_page_base
+                            + fx.Int64(lane_kvs_off + fx.Int32(kt * 4 * page_size)),
+                            1,
+                        )
+                    )[0]
                     for kt in range(k_tiles)
                 ]
                 kv = []
