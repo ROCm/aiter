@@ -359,7 +359,7 @@ def check_dispatch_boundaries(tokens, mode):
 
 
 def check_large_tiles_changed_graph_input(tokens, mode):
-    """Exercise M32 and LDS/global normalization, including padded row tiles."""
+    """Exercise register/LDS staging and normalization, including padded rows."""
     args, kw, reference = case(tokens, 5120, mode, seed=53)
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
@@ -496,7 +496,10 @@ def run_correctness_checks():
         (check_split_reuse, [(split_k,) for split_k in [1, 2, 5, 10, 16, 20, 32]]),
         (
             check_graphs_and_streams,
-            [(token_counts,) for token_counts in [(17, 384), (4160, 4160)]],
+            [
+                (token_counts,)
+                for token_counts in [(17, 384), (2048, 2048), (4160, 4160)]
+            ],
         ),
         (check_workspace_contract, [()]),
         (check_inference_weights, [()]),
@@ -522,6 +525,8 @@ def run_correctness_checks():
                         513,
                         1024,
                         1025,
+                        1536,
+                        2047,
                         2048,
                         2049,
                         4097,
@@ -543,7 +548,7 @@ def run_correctness_checks():
                 [
                     (tokens, mode)
                     for mode in MODES
-                    for tokens in [3072, 4096, 4160, 8192, 8193, 15841]
+                    for tokens in [1025, 2048, 3072, 4096, 4160, 8192, 8193, 15841]
                 ],
             ),
             (
@@ -552,11 +557,11 @@ def run_correctness_checks():
             ),
             (
                 check_switch_post_on_same_workspace,
-                [(tokens,) for tokens in [16, 17, 128]],
+                [(tokens,) for tokens in [16, 17, 128, 2048]],
             ),
             (
                 check_generation_wrap_and_changed_graph_input,
-                [(tokens,) for tokens in [4, 17, 128, 1024]],
+                [(tokens,) for tokens in [4, 17, 128, 1024, 2048]],
             ),
             (check_masked_dispatch_uses_generic, [()]),
         ]

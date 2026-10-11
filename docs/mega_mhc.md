@@ -62,13 +62,29 @@ path for shapes that otherwise use distributed normalization.
 | 4160 | tail | body 1, tail 32 | 4 |
 | Other >2048 | large | 1 | 4 |
 
-The distributed and generic paths assign one wave to each of four residual
-streams. Eight-wave distributed kernels use two groups of four stream-owning
+The generic path and most distributed variants assign one wave to each of four
+residual streams. Their eight-wave kernels use two groups of four stream-owning
 waves, each processing half the split's columns.
 Small post tiles use 128-byte contiguous segments, with each lane still reading
 16 bytes. Their workspace reserves capacity for 32 splits, and post uses the
 first 20. This lets post and no-post share a prepared workspace, including in
 one captured graph. Explicit `split_k` requests retain the generic path.
+
+For 1025–2048 tokens with post enabled, each of the eight waves owns all four
+streams and a distinct 320-column stripe of its split. It reuses residuals for
+post-mix and collapse in registers, using wave-local LDS only for the MFMA
+transpose. Five 64-column steps replace the original twenty 64-column steps
+per wave. Each lane still reads 16 bytes, and eight adjacent lanes cover one
+128-byte segment. Split K remains 2, and the no-post mapping is unchanged.
+
+This path issues the first fn chunk before loading the current residual tile;
+later fn chunks are loaded when their MFMAs are reached. Holding the next
+residual tile at the same time caused register spills, so this configuration
+does not prefetch that tile. Scalar post arithmetic with learned pre-mix and
+packed arithmetic with identity pre-mix fit without spills. Compact 26-column
+projection/square-sum scratch shares storage with the subsequent split reduction,
+keeping total LDS at 162832 bytes. FP32 accumulations, BF16 rounding seams, and
+all 20 Sinkhorn iterations are retained.
 
 The large path normally uses two streams per wave when post-mix is enabled. Waves 0/1
 cover columns 0–2559, and waves 2/3 cover columns 2560–5119. Within each pair,
@@ -117,8 +133,10 @@ These paths benefit with both repeated and rotating input/output addresses.
 Other variants retain their previous output policy. Intermediate collapse
 stores, projection/norm weights, and split publication accesses retain their
 existing policies; the kernel still needs their temporal reuse or visibility.
-The two-split variant's residual/sublayer reads remain temporal: applying NT
-to those reads substantially slows the 2048-token case.
+The two-split post variant uses WAVE_NT residual/sublayer reads and residual
+stores with its four-stream layout. Its no-post reads remain temporal. Applying
+NT to the earlier one-stream post layout was slower; the policy is selected
+together with the stream mapping and load schedule.
 
 Earlier fixed-address graph timings had a cache-assisted peak around 2048
 tokens. With post-mix and H=5120, the dominant tensor footprint is about 212 MB
@@ -141,6 +159,10 @@ are operator-level effective bandwidth, not physical HBM measurements.
   reduce memory and synchronization costs. Large-token kernels also use
   128-byte residual segments and non-temporal accesses. BF16 dot2 accumulates
   residual/collapse square sums in FP32.
+- **Mid-token post-mix:** the two-split path keeps all streams in one wave,
+  removing workgroup-wide exchanges from each post/collapse step. Deferred fn
+  loads and current-tile residual loads bound register use without spills.
+  The same distributed template still handles the other shapes and no-post.
 - **Large-token post-mix:** two streams per wave halve the old-residual LDS
   reads and duplicate sublayer loads. Packed FP32 multiply/FMA instructions
   process two elements together, retaining each element's accumulation order.

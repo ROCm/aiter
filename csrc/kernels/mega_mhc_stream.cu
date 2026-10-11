@@ -384,10 +384,15 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         split_k > 1 ? (blockIdx.x / 8 / split_k) * 8 + blockIdx.x % 8 : blockIdx.x;
     if(token_block_arg * BM >= tokens)
         return;
-    const int token_block = C::fixed_tokens && C::fixed_tokens <= BM ? 0 : token_block_arg;
-    const int tid         = threadIdx.x;
-    const int wid         = __builtin_amdgcn_readfirstlane(tid / 64);
-    const int wave = wid % 4, wg = C::groups == 1 ? 0 : wid / 4;
+    const int token_block        = C::fixed_tokens && C::fixed_tokens <= BM ? 0 : token_block_arg;
+    const int tid                = threadIdx.x;
+    const int wid                = __builtin_amdgcn_readfirstlane(tid / 64);
+    constexpr int STREAMS        = C::streams_per_wave;
+    constexpr bool LOCAL_STREAMS = STREAMS == 4;
+    constexpr int ACC_STREAMS    = LOCAL_STREAMS ? 1 : STREAMS;
+    static_assert(!LOCAL_STREAMS || hidden % (split_k * C::groups * STREAMS * C::chunks * BK) == 0);
+    constexpr int WAVES = 4 / STREAMS, GROUPS = C::groups * STREAMS;
+    const int wave = wid % WAVES, wg = GROUPS == 1 ? 0 : wid / WAVES;
     const int lane                = tid % 64;
     constexpr bool ELEMENT_LAYOUT = C::segment || HAS_POST || !IDENTITY_PRE;
     const int row                 = C::segment ? lane / 8 : ELEMENT_LAYOUT ? lane / 4 : lane % 16;
@@ -396,8 +401,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                                                      : lane / 16 * 8;
     const int token               = token_block * BM + row;
     const int split               = split_k > 1 ? (blockIdx.x / 8) % split_k : 0;
-    const int hidden_part         = hidden / (split_k * C::groups);
-    const int begin               = (split * C::groups + wg) * hidden_part;
+    const int hidden_part         = hidden / (split_k * GROUPS);
+    const int begin               = (split * GROUPS + wg) * hidden_part;
     const int nblocks             = (tokens + BM - 1) / BM;
 
     const int tile_token    = token_block * BM;
@@ -418,15 +423,39 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
 
     // Separate old/new tiles keep post mixing and collapse independent. In the
     // standard no-post identity layout, both arrays are optimized away.
-    __shared__ bf16 old_r[C::groups][4][BM][BK * C::lds_chunks];
-    __shared__ bf16 new_r[C::groups][4][BM][BK * C::lds_chunks];
-    __shared__ float reduction[4 * C::groups][BM][SLOTS];
+    __shared__ bf16 old_r[GROUPS][4][BM][BK * C::lds_chunks];
+    __shared__ bf16 new_r[GROUPS][4][BM][BK * C::lds_chunks];
+    // Projection (24 columns) and square sums (2 columns) are dead before
+    // split reduction starts. Reuse their storage for the finish scratch.
+    constexpr int LOCAL_SLOTS = STREAMS > 1 ? 26 : SLOTS;
+    union ReductionScratch
+    {
+        float local[4 * C::groups][BM][LOCAL_SLOTS];
+        float finish[2 * C::groups][BM][SLOTS];
+    };
+    __shared__ ReductionScratch scratch;
+    // Preserve vector LDS accesses for the one-stream layouts. The unused
+    // allocation is eliminated from each compile-time specialization.
+    __shared__ float stream_reduction[4 * C::groups][BM][SLOTS];
+    auto& reduction = [&]() -> auto& {
+        if constexpr(STREAMS > 1)
+            return scratch.finish;
+        else
+            return stream_reduction;
+    }();
+    auto& local_reduction = [&]() -> auto& {
+        if constexpr(STREAMS > 1)
+            return scratch.local;
+        else
+            return stream_reduction;
+    }();
     __shared__ float total[BM][SLOTS];
     __shared__ unsigned int last, ready, handed_mask, handoff_state;
-    __shared__ bf16 staged_x[C::groups][BM][hidden / (split_k * C::groups)];
+    __shared__ bf16 staged_x[GROUPS][BM][hidden / (split_k * GROUPS)];
 
-    constexpr int ROW_GROUPS = C::segment ? 2 : 1;
-    float post[ROW_GROUPS] = {}, comb[ROW_GROUPS][4] = {}, pre[ROW_GROUPS][4] = {};
+    constexpr int ROW_GROUPS        = C::segment ? 2 : 1;
+    float post[ROW_GROUPS][STREAMS] = {}, comb[ROW_GROUPS][STREAMS][4] = {},
+          pre[ROW_GROUPS][4] = {};
 #pragma unroll
     for(int c = 0; c < ROW_GROUPS; ++c)
     {
@@ -435,10 +464,14 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         {
             if constexpr(HAS_POST)
             {
-                post[c] = post_mix[tok * 4 + wave];
 #pragma unroll
-                for(int h = 0; h < 4; ++h)
-                    comb[c][h] = comb_mix[tok * 16 + h * 4 + wave];
+                for(int st = 0; st < STREAMS; ++st)
+                {
+                    post[c][st] = post_mix[tok * 4 + wave * STREAMS + st];
+#pragma unroll
+                    for(int h = 0; h < 4; ++h)
+                        comb[c][st][h] = comb_mix[tok * 16 + h * 4 + wave * STREAMS + st];
+                }
             }
             if constexpr(!IDENTITY_PRE)
             {
@@ -448,18 +481,20 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
             }
         }
     }
-    f32x4 acc[2]           = {};
+    f32x4 stream_acc[ACC_STREAMS][2] = {};
     float sq_r[ROW_GROUPS] = {}, sq_x[ROW_GROUPS] = {};
     constexpr int NC   = C::chunks;
     constexpr int DEAD = 1 << 29;
     auto tile_row      = [&](int c) { return row + (C::segment ? (c % 2) * 8 : 0); };
     auto tile_col      = [&](int c) { return (C::segment ? (c / 2) * 64 : c * BK) + k_lane; };
     auto tile_valid    = [&](int k, int c) {
+        if constexpr(LOCAL_STREAMS)
+            return true;
         return k + (C::segment ? tile_col(c) : c * BK) < begin + hidden_part;
     };
     struct Tile
     {
-        bf16x8 r[NC], x[NC];
+        bf16x8 r[STREAMS][NC], x[NC];
     };
     auto load_tile = [&](int k) {
         Tile tile{};
@@ -468,10 +503,13 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         {
             const int col    = k + tile_col(c);
             const bool valid = tile_valid(k, c);
-            tile.r[c]        = load_vector_nbytes<bf16, 8, 16>(
-                g_res, valid ? tile_row(c) * 4 * hidden + wave * hidden + col : DEAD);
+#pragma unroll
+            for(int st = 0; st < STREAMS; ++st)
+                tile.r[st][c] = load_vector_nbytes<bf16, 8, 16, (STREAMS > 1 ? 2 : 0)>(
+                    g_res,
+                    valid ? tile_row(c) * 4 * hidden + (wave * STREAMS + st) * hidden + col : DEAD);
             if constexpr(HAS_POST)
-                tile.x[c] = load_vector_nbytes<bf16, 8, 16>(
+                tile.x[c] = load_vector_nbytes<bf16, 8, 16, (STREAMS > 1 ? 2 : 0)>(
                     g_sub, valid ? tile_row(c) * hidden + col : DEAD);
         }
         __builtin_amdgcn_sched_barrier(0);
@@ -480,37 +518,48 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
     auto lds_col = [&](int r, int c) {
         return ((c / 8) ^ ((r & 7) ^ ((r & 1) << 2))) * 8 + (c & 7);
     };
-    Tile current = load_tile(begin);
-#pragma unroll
+    // The four-stream path already holds all gates and residual streams.
+    // Prefetching another residual tile would spill; overlap the first fn
+    // chunk with the current tile, then load later fn chunks at their MFMAs.
+    Tile current{};
+    if constexpr(!LOCAL_STREAMS)
+        current = load_tile(begin);
+#pragma unroll(LOCAL_STREAMS ? 1 : STREAMS > 1 ? 2 : (hidden_part + NC * BK - 1) / (NC * BK))
     for(int ki = 0; ki < hidden_part; ki += NC * BK)
     {
         const int k = begin + ki;
-        bf16x8 fn[NC][3];
+        bf16x8 fn[STREAMS][NC][3];
 #pragma unroll
-        for(int c = 0; c < NC; ++c)
-        {
+        for(int st = 0; st < STREAMS; ++st)
 #pragma unroll
-            for(int op = 0; op < 3; ++op)
-            {
-                const int off = ((((k / BK + c) * 4 + wave) * 3 + op) * 64 + lane) * 8;
-                fn[c][op]     = load_vector_nbytes<bf16, 8, 16>(
-                    g_fn, k + c * BK < begin + hidden_part ? off : DEAD);
-            }
-        }
+            for(int c = 0; c < (LOCAL_STREAMS ? 1 : NC); ++c)
+#pragma unroll
+                for(int op = 0; op < 3; ++op)
+                {
+                    const int off =
+                        ((((k / BK + c) * 4 + wave * STREAMS + st) * 3 + op) * 64 + lane) * 8;
+                    fn[st][c][op] = load_vector_nbytes<bf16, 8, 16>(
+                        g_fn, LOCAL_STREAMS || k + c * BK < begin + hidden_part ? off : DEAD);
+                }
         __builtin_amdgcn_sched_barrier(0);
         Tile next{};
-        if(k + NC * BK < begin + hidden_part)
+        if constexpr(LOCAL_STREAMS)
+            current = load_tile(k);
+        else if(k + NC * BK < begin + hidden_part)
             next = load_tile(k + NC * BK);
-        bf16x8 r[NC];
+        bf16x8 r[STREAMS][NC];
 #pragma unroll
-        for(int c = 0; c < NC; ++c)
-        {
-            r[c] = current.r[c];
-            if constexpr(HAS_POST)
-                *reinterpret_cast<bf16x8*>(
-                    &old_r[wg][wave][tile_row(c)][lds_col(tile_row(c), tile_col(c))]) = r[c];
-        }
-        if constexpr(HAS_POST)
+        for(int st = 0; st < STREAMS; ++st)
+#pragma unroll
+            for(int c = 0; c < NC; ++c)
+            {
+                r[st][c] = current.r[st][c];
+                if constexpr(HAS_POST && !LOCAL_STREAMS)
+                    *reinterpret_cast<bf16x8*>(&old_r[wg][wave * STREAMS + st][tile_row(c)]
+                                                     [lds_col(tile_row(c), tile_col(c))]) =
+                        r[st][c];
+            }
+        if constexpr(HAS_POST && !LOCAL_STREAMS)
             __syncthreads();
 #pragma unroll
         for(int c = 0; c < NC; ++c)
@@ -520,66 +569,89 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
                 bf16x8 old_regs[4];
 #pragma unroll
                 for(int h = 0; h < 4; ++h)
-                    old_regs[h] = *reinterpret_cast<const bf16x8*>(
-                        &old_r[wg][h][tile_row(c)][lds_col(tile_row(c), tile_col(c))]);
-                if constexpr(MHC_STREAM_VARIANT >= 3 && MHC_STREAM_VARIANT <= 5)
+                    if constexpr(LOCAL_STREAMS)
+                        old_regs[h] = current.r[h][c];
+                    else
+                        old_regs[h] = *reinterpret_cast<const bf16x8*>(
+                            &old_r[wg][h][tile_row(c)][lds_col(tile_row(c), tile_col(c))]);
+#pragma unroll
+                for(int st = 0; st < STREAMS; ++st)
                 {
-#pragma unroll
-                    for(int e = 0; e < 8; e += 2)
+                    if constexpr(STREAMS == 2 || (LOCAL_STREAMS && IDENTITY_PRE) ||
+                                 (MHC_STREAM_VARIANT >= 3 && MHC_STREAM_VARIANT <= 5))
                     {
-                        f32x2 v = mul_float_pair(bf16_pair_to_float(current.x[c], e),
-                                                 post[c % ROW_GROUPS]);
 #pragma unroll
-                        for(int h = 0; h < 4; ++h)
-                            v = fma_float_pair(
-                                bf16_pair_to_float(old_regs[h], e), comb[c % ROW_GROUPS][h], v);
-                        r[c][e]     = opus::fp32_to_bf16(v[0]);
-                        r[c][e + 1] = opus::fp32_to_bf16(v[1]);
+                        for(int e = 0; e < 8; e += 2)
+                        {
+                            f32x2 v = mul_float_pair(bf16_pair_to_float(current.x[c], e),
+                                                     post[c % ROW_GROUPS][st]);
+#pragma unroll
+                            for(int h = 0; h < 4; ++h)
+                                v = fma_float_pair(bf16_pair_to_float(old_regs[h], e),
+                                                   comb[c % ROW_GROUPS][st][h],
+                                                   v);
+                            r[st][c][e]     = opus::fp32_to_bf16(v[0]);
+                            r[st][c][e + 1] = opus::fp32_to_bf16(v[1]);
+                        }
                     }
-                }
-                else
-                {
-#pragma unroll
-                    for(int e = 0; e < 8; ++e)
+                    else
                     {
-                        float v = static_cast<float>(current.x[c][e]) * post[c % ROW_GROUPS];
 #pragma unroll
-                        for(int h = 0; h < 4; ++h)
-                            v = fmaf(
-                                static_cast<float>(old_regs[h][e]), comb[c % ROW_GROUPS][h], v);
-                        r[c][e] = opus::fp32_to_bf16(v);
+                        for(int e = 0; e < 8; ++e)
+                        {
+                            float v =
+                                static_cast<float>(current.x[c][e]) * post[c % ROW_GROUPS][st];
+#pragma unroll
+                            for(int h = 0; h < 4; ++h)
+                                v = fmaf(static_cast<float>(old_regs[h][e]),
+                                         comb[c % ROW_GROUPS][st][h],
+                                         v);
+                            r[st][c][e] = opus::fp32_to_bf16(v);
+                        }
                     }
+                    store_vector_nbytes<bf16, bf16, 8, 16, (C::segment ? 2 : 0)>(
+                        g_out,
+                        r[st][c],
+                        tile_valid(k, c) ? tile_row(c) * 4 * hidden +
+                                               (wave * STREAMS + st) * hidden + k + tile_col(c)
+                                         : DEAD);
                 }
-                store_vector_nbytes<bf16, bf16, 8, 16, (C::segment ? 2 : 0)>(
-                    g_out,
-                    r[c],
-                    tile_valid(k, c) ? tile_row(c) * 4 * hidden + wave * hidden + k + tile_col(c)
-                                     : DEAD);
             }
-            if constexpr(ELEMENT_LAYOUT)
-                *reinterpret_cast<bf16x8*>(
-                    &new_r[wg][wave][tile_row(c)][lds_col(tile_row(c), tile_col(c))]) = r[c];
-            sq_r[c % ROW_GROUPS] = bf16_sqsum(r[c], sq_r[c % ROW_GROUPS]);
+#pragma unroll
+            for(int st = 0; st < STREAMS; ++st)
+            {
+                if constexpr(ELEMENT_LAYOUT)
+                    *reinterpret_cast<bf16x8*>(&new_r[wg][wave * STREAMS + st][tile_row(c)]
+                                                     [lds_col(tile_row(c), tile_col(c))]) =
+                        r[st][c];
+                sq_r[c % ROW_GROUPS] = bf16_sqsum(r[st][c], sq_r[c % ROW_GROUPS]);
+            }
         }
-        // All chunks share this publication barrier. In post mode it also
-        // protects the old residual LDS tile before the next outer iteration.
-        if constexpr(ELEMENT_LAYOUT)
+        // A local-stream wave only needs its own LDS transpose to complete.
+        // The other layouts publish to the whole workgroup; that barrier also
+        // protects old_r before the next post iteration.
+        if constexpr(LOCAL_STREAMS)
+            __builtin_amdgcn_wave_barrier();
+        else if constexpr(ELEMENT_LAYOUT)
             __syncthreads();
 #pragma unroll
         for(int c = 0; c < NC; ++c)
         {
             constexpr bool LOCAL_IDENTITY = !C::segment && !HAS_POST && IDENTITY_PRE;
-            if(wave == (LOCAL_IDENTITY ? 0 : c % 4))
+            if(wave == (LOCAL_IDENTITY ? 0 : c % WAVES))
             {
                 bf16x8 new_regs[4], collapsed;
                 if constexpr(LOCAL_IDENTITY)
-                    new_regs[0] = r[c];
+                    new_regs[0] = r[0][c];
                 else
                 {
 #pragma unroll
                     for(int h = 0; h < (IDENTITY_PRE ? 1 : 4); ++h)
-                        new_regs[h] = *reinterpret_cast<const bf16x8*>(
-                            &new_r[wg][h][tile_row(c)][lds_col(tile_row(c), tile_col(c))]);
+                        if constexpr(LOCAL_STREAMS)
+                            new_regs[h] = r[h][c];
+                        else
+                            new_regs[h] = *reinterpret_cast<const bf16x8*>(
+                                &new_r[wg][h][tile_row(c)][lds_col(tile_row(c), tile_col(c))]);
                 }
 #pragma unroll
                 for(int e = 0; e < 8; ++e)
@@ -603,33 +675,64 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
             }
         }
 #pragma unroll
-        for(int c = 0; c < NC; ++c)
-        {
-            bf16x8 mr = r[c];
-            if constexpr(ELEMENT_LAYOUT)
-                mr = *reinterpret_cast<const bf16x8*>(
-                    &new_r[wg][wave][lane % 16][lds_col(lane % 16, c * BK + (lane / 16) * 8)]);
-            acc[0] = opus::mfma_f32_16x16x32_bf16{}(fn[c][0], mr, acc[0]);
-            acc[0] = opus::mfma_f32_16x16x32_bf16{}(fn[c][1], mr, acc[0]);
-            acc[1] = opus::mfma_f32_16x16x32_bf16{}(fn[c][2], mr, acc[1]);
-        }
+        for(int st = 0; st < STREAMS; ++st)
+#pragma unroll
+            for(int c = 0; c < NC; ++c)
+            {
+                if constexpr(LOCAL_STREAMS)
+                    if(c > 0)
+                    {
+#pragma unroll
+                        for(int op = 0; op < 3; ++op)
+                        {
+                            const int off = ((((k / BK + c) * 4 + st) * 3 + op) * 64 + lane) * 8;
+                            fn[st][c][op] = load_vector_nbytes<bf16, 8, 16>(g_fn, off);
+                        }
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                bf16x8 mr = r[st][c];
+                if constexpr(ELEMENT_LAYOUT)
+                    mr = *reinterpret_cast<const bf16x8*>(
+                        &new_r[wg][wave * STREAMS + st][lane % 16]
+                              [lds_col(lane % 16, c * BK + (lane / 16) * 8)]);
+                stream_acc[LOCAL_STREAMS ? 0 : st][0] = opus::mfma_f32_16x16x32_bf16{}(
+                    fn[st][c][0], mr, stream_acc[LOCAL_STREAMS ? 0 : st][0]);
+                stream_acc[LOCAL_STREAMS ? 0 : st][0] = opus::mfma_f32_16x16x32_bf16{}(
+                    fn[st][c][1], mr, stream_acc[LOCAL_STREAMS ? 0 : st][0]);
+                stream_acc[LOCAL_STREAMS ? 0 : st][1] = opus::mfma_f32_16x16x32_bf16{}(
+                    fn[st][c][2], mr, stream_acc[LOCAL_STREAMS ? 0 : st][1]);
+            }
         // Post's next old_r barrier protects new_r readers. Without post,
         // explicitly rendezvous before the next write to the shared tile.
         if constexpr(!HAS_POST && (C::segment || !IDENTITY_PRE))
             __syncthreads();
-        current = next;
+        if constexpr(LOCAL_STREAMS)
+            __builtin_amdgcn_wave_barrier();
+        else
+            current = next;
     }
 
-// Fold the packed last eight projection rows after the k loop.
+    // Fold the packed projection rows, then combine each wave's streams.
+    f32x4 acc[2] = {};
 #pragma unroll
-    for(int e = 0; e < 4; ++e)
-        acc[1][e] += __shfl_xor(acc[1][e], 32, 64);
+    for(int st = 0; st < ACC_STREAMS; ++st)
+    {
+#pragma unroll
+        for(int e = 0; e < 4; ++e)
+            stream_acc[st][1][e] += __shfl_xor(stream_acc[st][1][e], 32, 64);
+#pragma unroll
+        for(int n = 0; n < 2; ++n)
+            if(st == 0)
+                acc[n] = stream_acc[st][n];
+            else
+                acc[n] += stream_acc[st][n];
+    }
 #pragma unroll
     for(int n = 0; n < 2; ++n)
 #pragma unroll
         for(int e = 0; e < 4; ++e)
             if((n == 0 || lane < 32) && (!C::decode_rows || lane % 16 < tile_rows))
-                reduction[wid][lane % 16][n * 16 + lane / 16 * 4 + e] = acc[n][e];
+                local_reduction[wid][lane % 16][n * 16 + lane / 16 * 4 + e] = acc[n][e];
     if constexpr(C::segment)
     {
         __syncthreads();
@@ -640,8 +743,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
             sq_x[c] = sum_element_lanes<8>(sq_x[c]);
             if(lane % 8 == 0)
             {
-                reduction[wid][row + c * 8][24] = sq_r[c];
-                reduction[wid][row + c * 8][25] = sq_x[c];
+                local_reduction[wid][row + c * 8][24] = sq_r[c];
+                local_reduction[wid][row + c * 8][25] = sq_x[c];
             }
         }
     }
@@ -660,8 +763,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         // MFMA stores omit padding, so square sums can publish without a barrier.
         if((!C::decode_rows || row < tile_rows) && (ELEMENT_LAYOUT ? lane % 4 == 0 : lane < 16))
         {
-            reduction[wid][row][24] = sq_r[0];
-            reduction[wid][row][25] = sq_x[0];
+            local_reduction[wid][row][24] = sq_r[0];
+            local_reduction[wid][row][25] = sq_x[0];
         }
     }
     __syncthreads();
@@ -671,7 +774,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         float v = 0;
 #pragma unroll
         for(int h = 0; h < 4 * C::groups; ++h)
-            v += reduction[h][r][c];
+            if(c < LOCAL_SLOTS)
+                v += local_reduction[h][r][c];
         if(split_k == 1)
             total[r][c] = v;
         if(split_k > 1)
@@ -681,10 +785,11 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
     // Idle state keeps the generation in the upper 24 counter bits.
     // The lower eight arrival bits are zero between ordered launches.
     auto normalize_own_columns = [&]() {
-        // The two-split (1025..2048-token) variant benefits from streaming
-        // these final stores. Keep its residual/sublayer reads temporal.
+        // The two-split variant streams final normalized stores as well as
+        // the local-stream post path's residual/sublayer traffic.
         constexpr int norm_store_policy = C::split == 2 ? GROUP_NT : RT;
-        for(int i = (tid % 256) * 8; i < active_rows * hidden_part; i += 256 * 8)
+        for(int i = (tid % (256 / STREAMS)) * 8; i < active_rows * hidden_part;
+            i += (256 / STREAMS) * 8)
         {
             const int r = i / hidden_part, col = i % hidden_part;
             bf16x8 x = *reinterpret_cast<const bf16x8*>(&staged_x[wg][r][col]);
@@ -699,7 +804,8 @@ __device__ __forceinline__ void distributed_tiles(const bf16* residual,
         }
     };
     auto stage_own_columns = [&]() {
-        for(int i = (tid % 256) * 8; i < active_rows * hidden_part; i += 256 * 8)
+        for(int i = (tid % (256 / STREAMS)) * 8; i < active_rows * hidden_part;
+            i += (256 / STREAMS) * 8)
         {
             const int r = i / hidden_part, col = i % hidden_part;
             bf16x8 x = *reinterpret_cast<const bf16x8*>(&staged_x[wg][r][col]);

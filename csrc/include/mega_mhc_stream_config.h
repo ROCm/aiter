@@ -40,18 +40,24 @@ struct Tuning
     static_assert(ID >= 0 && ID < 14);
     // The workspace reserves the base split count; a post call can use a
     // smaller prefix. Explicit split_k requests select generic instead.
-    static constexpr Options selected =
-        POST && ID >= 3 && ID <= 5 ? Options{20, 2, 2, 2, 0, 0, 5, true} : options[ID];
-    static constexpr int split        = selected.split;
-    static constexpr int chunks       = selected.chunks;
-    static constexpr int groups       = selected.groups;
-    static constexpr int threads      = 256 * groups;
-    static constexpr int lds_chunks   = selected.lds_chunks;
-    static constexpr int fixed_tokens = selected.fixed_tokens;
-    static constexpr int decode_rows  = selected.decode_rows;
-    static constexpr int prefetch     = selected.prefetch;
-    static constexpr bool segment     = selected.segment;
-    static constexpr bool distributed = ID <= 10;
+    static constexpr Options selected = POST && ID >= 3 && ID <= 5
+                                            ? Options{20, 2, 2, 2, 0, 0, 5, true}
+                                        : POST && ID == 10 ? Options{2, 2, 2, 2, 0, 0, 5, true}
+                                                           : options[ID];
+    // Keep all four post streams in registers for the 1025..2048-token
+    // range. Eight waves cover independent column stripes without a
+    // workgroup barrier for every post/collapse step.
+    static constexpr int streams_per_wave = POST && ID == 10 ? 4 : 1;
+    static constexpr int split            = selected.split;
+    static constexpr int chunks           = selected.chunks;
+    static constexpr int groups           = selected.groups;
+    static constexpr int threads          = 256 * groups;
+    static constexpr int lds_chunks       = selected.lds_chunks;
+    static constexpr int fixed_tokens     = selected.fixed_tokens;
+    static constexpr int decode_rows      = selected.decode_rows;
+    static constexpr int prefetch         = selected.prefetch;
+    static constexpr bool segment         = selected.segment;
+    static constexpr bool distributed     = ID <= 10;
     static_assert(!distributed || 5120 % (split * groups * 32) == 0);
 };
 
