@@ -61,7 +61,7 @@ PAGE_SIZE = 1
 NUM_KV_HEADS = 1
 DIM_NOPE = 448  # FP8 NOPE bytes per token
 DIM_ROPE = 64  # BF16 ROPE elements per token (= 128 bytes; lives in qrope/kvrope)
-DIM_QK_PACKED = 576  # = args.dim(512) + args.k_rotary(64); matches poc_kl stride_Page
+DIM_QK_PACKED = 512  # FP8 NOPE 448 + e8m0 scales + pad; the kernel row stride
 V_HEAD_DIM = 512  # logical V head dim = args.dim = kv_lora_rank
 
 # Perf iteration counts (kept out of the @benchmark signature so they don't

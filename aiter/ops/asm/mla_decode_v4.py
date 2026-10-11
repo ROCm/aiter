@@ -374,10 +374,14 @@ def mla_decode_v4_asm_eager(
         raise ValueError("mla_decode_v4_asm: KV page_size must be a power of two")
     if preload and page_size != 1:
         raise ValueError("mla_decode_v4_asm: only support KV page_size==1")
-    if Q.size(2) != dim_qk_packed:
+    if Q.size(2) != _KV4_HEAD_DIM or dim_qk_packed != _KV4_HEAD_DIM:
         raise ValueError(
-            "mla_decode_v4_asm: Q head_size must equal KV head_size "
-            "(= dim_qk_packed)"
+            f"mla_decode_v4_asm: Q and KV head_size must be {_KV4_HEAD_DIM}, got "
+            f"{Q.size(2)} / {dim_qk_packed}"
+        )
+    if qrope.size(-1) != _KV4_DIM_ROPE or kvrope.size(-1) != _KV4_DIM_ROPE:
+        raise ValueError(
+            f"mla_decode_v4_asm: qrope / kvrope last dim must be {_KV4_DIM_ROPE}"
         )
     if out_16_nosplit and (
         splitData.numel() * splitData.element_size()
@@ -770,10 +774,15 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
         raise ValueError(
             "mla_decode_v4_fused_asm_gfx1250: only support KV page_size==1"
         )
-    if Q.size(2) != KV.size(3):
+    if Q.size(2) != _KV4_HEAD_DIM or KV.size(3) != _KV4_HEAD_DIM:
         raise ValueError(
-            "mla_decode_v4_fused_asm_gfx1250: Q head_size must equal KV "
-            "head_size (= dim_qk_packed)"
+            f"mla_decode_v4_fused_asm_gfx1250: Q and KV head_size must be "
+            f"{_KV4_HEAD_DIM}, got {Q.size(2)} / {KV.size(3)}"
+        )
+    if qrope.size(-1) != _KV4_DIM_ROPE or kvrope.size(-1) != _KV4_DIM_ROPE:
+        raise ValueError(
+            f"mla_decode_v4_fused_asm_gfx1250: qrope / kvrope last dim must be "
+            f"{_KV4_DIM_ROPE}"
         )
 
     num_seqs = qo_indptr.shape[0] - 1
