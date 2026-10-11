@@ -19,17 +19,16 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_common import (
     kernelInstance,
 )
 
-# Rows whose kernelName the current catalog cannot build. These predate the
-# knob-field schema that `kernelInstance.name` emits and carry a fifth numeric
-# token, so both the runtime parser here and the AOT parser in
-# `aiter/aot/flydsl/gemm.py` reject them: the shapes run on the CK default
-# heuristic and are never AOT-compiled. Regenerating the file with the current
-# tuner is what removes this entry -- it is a ratchet, so a *new* dead row in
-# any other file fails the test.
-KNOWN_UNBUILDABLE_ROWS = {
-    "model_configs/"
-    "a8w8_bpreshuffle_tuned_gemm_qwen3_5_397b_a17b_mxfp4_attnfp8.csv": 136,
-}
+# No shipped tuned row may name a kernel the current catalog cannot build.
+#
+# Such a row is inert in both directions: the runtime parser here falls back to
+# the CK default heuristic and the AOT parser in `aiter/aot/flydsl/gemm.py`
+# drops it from the build. The shape then runs untuned with nothing to say so.
+#
+# Kept as a dict rather than a bare assertion so that a file which genuinely
+# needs re-tuning can be quarantined with its row count and a reason, instead of
+# the whole gate being switched off.
+KNOWN_UNBUILDABLE_ROWS: dict[str, int] = {}
 
 
 def _config_root() -> str:
@@ -118,8 +117,9 @@ def test_shipped_tuned_rows_name_buildable_kernels():
         "set of tuned rows naming unbuildable kernels changed.\n"
         f"  found:    {unbuildable}\n"
         f"  expected: {KNOWN_UNBUILDABLE_ROWS}\n"
-        "A new entry means a tuner wrote names this catalog cannot build; a "
-        "smaller count means a file was regenerated -- update the constant."
+        "A new entry means a tuner wrote names this catalog cannot build, or a "
+        "kernelName schema change landed without migrating the shipped CSVs "
+        "(which is what produced the 136 inert rows this gate was added for)."
     )
 
 
