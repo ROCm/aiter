@@ -7,7 +7,7 @@ from functools import lru_cache
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 
 from ..kernels.kernels_common import get_warp_size
 from ..kernels.tensor_shim import _run_compiled
@@ -17,50 +17,22 @@ from ..kernels.topk.radix_topk_one_block import (
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_per_row_decode import (
-    build_topk_per_row_decode_module,
-    topk_per_row_decode_chunks,
-    topk_per_row_decode_workspace_shapes,
+    clear_topk_per_row_decode_workspace_cache as _clear_decode_workspace_cache,
+)
+from ..kernels.topk.topk_per_row_decode import (
+    launch_topk_per_row_decode,
 )
 from ..kernels.topk.topk_per_row_decode_persistent import (
     build_topk_per_row_decode_one_workgroup_module,
 )
 
-# Measured crossover between the one-workgroup and multi-kernel paths.
+# Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
 
 
-@lru_cache(maxsize=16)
-def _get_cached_workspace(
-    device: torch.device,
-    stream_id: int,
-    hist_shape: tuple[int, ...],
-    state_shape: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Keep scratch isolated by device, stream, and exact kernel layout."""
-    return (
-        torch.empty(hist_shape, device=device, dtype=torch.int32),
-        torch.empty(state_shape, device=device, dtype=torch.int32),
-    )
-
-
-def _get_topk_workspace(
-    device: torch.device,
-    stream_id: int,
-    hist_shape: tuple[int, ...],
-    state_shape: tuple[int, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    # Do not let graph-pool allocations escape through the process cache.
-    if torch.cuda.is_current_stream_capturing():
-        return (
-            torch.empty(hist_shape, device=device, dtype=torch.int32),
-            torch.empty(state_shape, device=device, dtype=torch.int32),
-        )
-    return _get_cached_workspace(device, stream_id, hist_shape, state_shape)
-
-
 def clear_topk_per_row_decode_workspace_cache() -> None:
-    _get_cached_workspace.cache_clear()
+    _clear_decode_workspace_cache()
 
 
 @lru_cache(maxsize=128)
@@ -206,8 +178,7 @@ def _validate_radix_topk_one_block_call(
     next_n: int,
     width: int | None = None,
 ) -> None:
-    """Raise if this call cannot run the one-block radix kernel. ``width``: a
-    row's bound, the logits' width unless packed rows stand for a plane."""
+    """Raise if this call cannot run the one-block radix kernel."""
     _validate_flydsl_topk_call(
         logits, next_n, row_ends, indices, num_rows, stride0, stride1, k, values
     )
@@ -379,11 +350,10 @@ def flydsl_top_k_per_row_decode(
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
-    ``row_starts`` [rows] i32: row r's scores start at element row_starts[r]
-    of ``logits``' first row (a packed buffer viewed with stride0 0), the
-    indices still relative to that start. ``plane_width`` (default the
-    logits' width) bounds every row and picks the kernel and its chunking,
-    as that plane's width would."""
+    ``row_starts`` enables packed rows: row r starts at row_starts[r] in the
+    input's first row, while output indices remain relative to that start.
+    ``plane_width`` bounds every row and selects the launch geometry.
+    """
 
     _validate_flydsl_topk_call(
         logits, next_n, seq_lens, indices, num_rows, stride0, stride1, k, values
@@ -391,16 +361,20 @@ def flydsl_top_k_per_row_decode(
 
     rows, width = logits.shape
     width = width if plane_width is None else plane_width
-    arch = torch.cuda.get_device_properties(logits.device).gcnArchName
+    if rows == 0:
+        return
+    # The bare arch name: the selector keys its radix layout and LDS on it.
+    arch = get_gfx_runtime()
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     packed = row_starts is not None
-    # unread unless packed: any int32 tensor keeps the launch's signature,
-    # and seq_lens is one
     starts = row_starts if packed else seq_lens
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
-            k, wave_size=wave_size, write_values=values is not None, packed_rows=packed
+            k,
+            wave_size=wave_size,
+            write_values=values is not None,
+            packed_rows=packed,
         )
         _run_compiled(
             launcher,
@@ -417,37 +391,24 @@ def flydsl_top_k_per_row_decode(
         )
         return
 
-    # One row is `chunks` blocks, so the split has to follow the row count: at
-    # one row, 16 chunks leaves all but a handful of CUs idle, and at many rows
-    # it makes the single-block reduce walk counters nobody needed.
-    chunks = topk_per_row_decode_chunks(rows, width, wave_size)
-    hist_shape, state_shape = topk_per_row_decode_workspace_shapes(rows, stable, chunks)
-    partial_hist, state = _get_topk_workspace(
-        logits.device, stream.cuda_stream, hist_shape, state_shape
-    )
-
-    launcher = build_topk_per_row_decode_module(
+    # Allocated width bounds every row, but a wide buffer may still hold short
+    # rows: the kernel reads each row's length and splits only the long ones.
+    launch_topk_per_row_decode(
+        logits,
+        next_n,
+        seq_lens,
+        starts,
+        indices,
+        rows,
+        width,
         k,
         stable,
-        wave_size=wave_size,
-        write_values=values is not None,
-        chunks_per_row=chunks,
-        packed_rows=packed,
-    )
-    _run_compiled(
-        launcher,
-        logits,
-        starts,
-        seq_lens,
-        indices,
-        values if values is not None else logits,
-        partial_hist,
-        state,
-        width,
-        next_n,
-        stride0,
-        rows,
+        values,
+        arch,
+        wave_size,
+        get_cu_num(),
         stream,
+        packed,
     )
 
 
@@ -468,15 +429,9 @@ def flydsl_radix_topk_one_block(
     plane_width: int | None = None,
     packed_rows: bool = False,
 ) -> None:
-    """Launch the one-block radix TopK kernel for one prefill or decode call.
-
-    ``packed_rows`` (decode): row r is read from element row_starts[r] of
-    ``logits``' first row (a packed buffer viewed with stride0 0), its
-    indices relative to that start. Explicit, because decode callers pass
-    their lengths as row_starts too. ``plane_width`` (default the logits'
-    width) bounds every row and picks the variant, as that plane's would."""
+    """Launch the one-block radix TopK kernel for one prefill or decode call."""
     if packed_rows and (not is_decode or row_starts is None):
-        raise ValueError("packed rows are a decode call with row_starts")
+        raise ValueError("packed rows require decode mode and row_starts")
     if row_starts is None:
         if not is_decode:
             raise ValueError("row_starts is required for prefill")

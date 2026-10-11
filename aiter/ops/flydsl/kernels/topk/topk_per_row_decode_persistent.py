@@ -10,7 +10,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
 from ..kernels_common import atomic_add_i32, kernel_signature
-from .topk_per_row_decode import (
+from .topk_common import (
     _f32_to_ord,
     _load_f32x4,
     _row_length,
