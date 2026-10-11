@@ -48,6 +48,11 @@ static DynGqDevice dyn_gq_device(int device_id)
 // gfx1250: use 256-thread blocks once there are at least a quarter as many as SIMDs.
 constexpr int kDynGqWideBlkPerSimdDenom = 4;
 constexpr int kDynGqTdmKPT            = 2;  // staged steps per block (TDM kernels)
+// MX scale tiles walked along the row by one mx32_tile block. Two halve the
+// fp4 time at large shapes (16384x7168: 45.0 -> 30.5 us); fp8 gains nothing
+// (33.8 -> 35.4 us) and four tiles are slower for both.
+template <typename DTYPE_O>
+constexpr int kMx32TilesX = std::is_same_v<DTYPE_O, opus::fp8_t> ? 1 : 2;
 
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
 // byte scale, fp8 / i8 output a continuous fp32 per-group scale.
@@ -611,21 +616,30 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         const int row_in = threadIdx.x / 8;
         const int col_in = threadIdx.x % 8;
         const int64_t gx = static_cast<int64_t>(blockIdx.y) * 32 + row_in;
-        const int32_t gy = static_cast<int32_t>(blockIdx.x) * 8 + col_in;
-        process(gather(input + gx * ori_row_stride + static_cast<int64_t>(gy) * group_size),
-                gx,
-                gy,
-                gx * scaleN + gy);
-        __syncthreads();
-        // (x/32)*scaleN_pad*32 + (y/8)*256, with x = 32*by and y = 8*bx.
-        const int64_t tile_base =
-            (static_cast<int64_t>(blockIdx.y) * scaleN_pad + static_cast<int64_t>(blockIdx.x) * 8) *
-            32;
-        if(threadIdx.x < 16)
+        constexpr int kTilesX = kMx32TilesX<DTYPE_O>;
+        for(int t = 0; t < kTilesX; ++t)
         {
-            const uint4 word = *reinterpret_cast<const uint4*>(s_mx32 + threadIdx.x * 16);
-            *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(scale) + tile_base +
-                                      threadIdx.x * 16) = word;
+            const int tile_x = static_cast<int>(blockIdx.x) * kTilesX + t;
+            if(tile_x * 8 >= scaleN)
+                break;
+            const int32_t gy = tile_x * 8 + col_in;
+            process(gather(input + gx * ori_row_stride + static_cast<int64_t>(gy) * group_size),
+                    gx,
+                    gy,
+                    gx * scaleN + gy);
+            __syncthreads();
+            // (x/32)*scaleN_pad*32 + (y/8)*256, with x = 32*by and y = 8*tile_x.
+            const int64_t tile_base =
+                (static_cast<int64_t>(blockIdx.y) * scaleN_pad + static_cast<int64_t>(tile_x) * 8) *
+                32;
+            if(threadIdx.x < 16)
+            {
+                const uint4 word = *reinterpret_cast<const uint4*>(s_mx32 + threadIdx.x * 16);
+                *reinterpret_cast<uint4*>(reinterpret_cast<uint8_t*>(scale) + tile_base +
+                                          threadIdx.x * 16) = word;
+            }
+            if constexpr(kTilesX > 1)
+                __syncthreads();
         }
         return;
     }
@@ -1721,10 +1735,11 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             AITER_DISPATCH_FLOATING16_TYPES_rmTorch(
                 input.dtype(), "dynamic_per_group_scaled_quant_kernel", [&] {
                     using input_dtype = typename aiter::hip2opus<scalar_t>::type;
-                    // group 32 + MX shuffle: one block is one 32x8 scale tile.
-                    // Threads walk groups along the row, so the 32 B fp8 stores
-                    // already coalesce; the 256 scale bytes are staged and
-                    // stored as sixteen uint4s instead of 256 scattered bytes.
+                    // group 32 + MX shuffle: one block covers kMx32TilesX 32x8
+                    // scale tiles of a row band. Threads walk groups along the
+                    // row, so the 32 B fp8 stores already coalesce; each tile's
+                    // 256 scale bytes are staged and stored as sixteen uint4s
+                    // instead of 256 scattered bytes.
                     if constexpr(_GS == 32 && ee && ss &&
                                 (std::is_same_v<out_t, opus::fp8_t> ||
                                  std::is_same_v<out_t, opus::fp4_t>))
@@ -1732,12 +1747,16 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                         constexpr bool kBf16 = std::is_same_v<input_dtype, opus::bf16_t>;
                         // Below these tile counts the generic kernel is faster:
                         // fp8 needs two tiles per CU (1024x2048 bf16: 2.43 -> 2.64 us),
-                        // fp4 three per SIMD (4096x4096: 6.44 -> 6.56 us).
+                        // fp4 four (4096x1536 at three: 3.94 -> 4.35 us), eight
+                        // below 1024 rows (512x16384 at four: 3.87 -> 4.21 us),
+                        // and it never wins at 256 rows (256x65536: 5.38 -> 5.68 us).
+                        constexpr bool kFp8 = std::is_same_v<out_t, opus::fp8_t>;
+                        constexpr int kTilesX = kMx32TilesX<out_t>;
                         const int64_t mx32_tiles =
                             static_cast<int64_t>(rows / 32) * (scaleN / 8);
-                        constexpr int kMinTilesPerCu = std::is_same_v<out_t, opus::fp8_t> ? 2 : 12;
+                        const int kMinTilesPerCu = kFp8 ? 2 : (rows >= 1024 ? 4 : 8);
                         const bool mx32 =
-                            dev.tuned && num_rows_ptr == nullptr &&
+                            dev.tuned && num_rows_ptr == nullptr && (kFp8 || rows >= 512) &&
                             mx32_tiles >= static_cast<int64_t>(kMinTilesPerCu) * dev.num_cu &&
                             rows >= 32 && rows % 32 == 0 && scaleN % 8 == 0 &&
                             row_stride % 8 == 0 &&
@@ -1748,7 +1767,10 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                             aiter::dynamic_per_group_scaled_quant_kernel<
                                 input_dtype, out_t, 32, 32, true, 256, true, false, 0, kBf16,
                                 false, false, false, true>
-                                <<<dim3(scaleN / 8, rows / 32), dim3(256), 0, stream>>>(
+                                <<<dim3((scaleN / 8 + kTilesX - 1) / kTilesX, rows / 32),
+                                    dim3(256),
+                                    0,
+                                    stream>>>(
                                 reinterpret_cast<out_t*>(out.data_ptr()),
                                 reinterpret_cast<float*>(scales.data_ptr()),
                                 reinterpret_cast<input_dtype*>(input.data_ptr()),
