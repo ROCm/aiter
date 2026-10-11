@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import functools
 from dataclasses import dataclass
 
 import flydsl.expr as fx
@@ -21,6 +22,65 @@ MFMA_ACC_ELEMS = MFMA_MNK * MFMA_MNK // WAVE
 LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
 BF16_LDS_LIMIT_BYTES = 64 * 1024
+PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
+
+
+def d256_m1_pipe(
+    arch,
+    kv_dtype,
+    head_dim,
+    block_size,
+    trans_v,
+    per_token_kv,
+    query_length,
+    query_group_size,
+    sliding_window,
+) -> bool:
+    """gfx950 FP8 head 256, page 64, plain V, per-tensor, dense, one M-tile."""
+    return (
+        "gfx95" in arch
+        and kv_dtype == "fp8"
+        and head_dim == 256
+        and block_size == 64
+        and not trans_v
+        and not per_token_kv
+        and query_length == 1
+        and sliding_window == 0
+        and query_length * query_group_size <= MFMA_MNK
+    )
+
+
+@functools.cache
+def _warn_unstaged_page_ids(pages: int) -> None:
+    from aiter import logger
+
+    logger.warning(
+        "pa_decode reads page ids inside the tile loop: a planned task may own "
+        "%d page ids, above the %d-id LDS limit. Lower max_context_length or "
+        "raise max_partitions and the workgroup budget to stage them first.",
+        pages,
+        PAGE_ID_STAGE_LIMIT,
+    )
+
+
+def stage_page_capacity(
+    num_seqs, work_capacity, num_partitions, max_context_length, block_size
+) -> int:
+    """Page ids one planned task can own, or 0 to keep table reads in the loop.
+
+    A sequence's task count is at least min(tiles, num_partitions) and the plan
+    spends work_capacity - num_seqs extra tasks in proportion to tiles, so no
+    task owns more tiles than this host-known bound.
+    """
+    max_tiles = -(-max_context_length // KV_COMPUTE_BLOCK)
+    extra = work_capacity - num_seqs
+    by_budget = -(-num_seqs * max_tiles // extra) if extra > 0 else max_tiles
+    tiles = min(max_tiles, max(-(-max_tiles // num_partitions), by_budget))
+    pages = tiles * (KV_COMPUTE_BLOCK // block_size)
+    if pages > PAGE_ID_STAGE_LIMIT:
+        _warn_unstaged_page_ids(pages)
+        return 0
+    return max(256, 1 << max(pages - 1, 0).bit_length())
 
 
 def _bf16_lds_bytes(head_dim, query_rows, block_size):
@@ -63,6 +123,7 @@ class PaDecodeSchedule:
         query_splits: int | None = None,
         max_context_length: int | None = None,
         sliding_window: int = 0,
+        nhd_layout: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
@@ -193,10 +254,44 @@ class PaDecodeSchedule:
             kv_buffer_u32 and MTP4_FUSED and wide_kv_addressing and block_size == 128
         )
 
+        # K is consumed once per tile: a nontemporal load keeps those lines from
+        # evicting V, which is still being merged in L2. V prefetch only stays
+        # live if the page-id load is not on the same in-order vmcnt chain, so
+        # the host-bounded page list is staged in LDS before the tile loop.
+        D256_M1_PIPE = d256_m1_pipe(
+            arch,
+            kv_dtype,
+            head_dim,
+            block_size,
+            trans_v,
+            per_token_kv,
+            query_length,
+            query_group_size,
+            sliding_window,
+        )
+        if nhd_layout and not D256_M1_PIPE:
+            raise NotImplementedError(
+                "NHD pa_decode is the gfx950 FP8 head-256 page-64 per-tensor "
+                "dense decode path"
+            )
+        stage_pages = 0
+        if D256_M1_PIPE and max_context_length is not None:
+            stage_pages = stage_page_capacity(
+                num_seqs, work_capacity, num_partitions, max_context_length, block_size
+            )
+        # A second NHD V buffer lets the next tile's DMA overlap PV, but its LDS
+        # leaves room for only one CTA per CU; larger grids run faster with two
+        # single-buffered CTAs sharing each CU.
+        NHD_V_BUFS = 2 if nhd_layout and split_workgroups <= num_compute_units else 1
+
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
-            TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
-        ) or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+            D256_M1_PIPE
+            or (
+                TUNED_PER_TOKEN and QUERIES_PER_CTA == 1 and 8 <= query_group_size <= 16
+            )
+            or (TUNED_SCALAR and block_size == 128 and TOTAL_ROWS <= MFMA_MNK)
+        )
         # Keep the tuned page/scale layout selection separate from V prefetch.
         PER_TOKEN_M1 = (
             prefetch_v
@@ -246,6 +341,10 @@ class PaDecodeSchedule:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            D256_M1_PIPE,
+            stage_pages,
+            nhd_layout,
+            NHD_V_BUFS,
         )
         return cls(
             cache_key=cache_key,
@@ -279,6 +378,10 @@ class PaDecodeTraits:
     prefetch_v: bool
     batch_first_plan_grid: bool
     buffer_plan_output: bool
+    D256_M1_PIPE: bool
+    stage_page_capacity: int
+    nhd_layout: bool
+    NHD_V_BUFS: int
 
     # Element formats and instruction policy.
     FP8: type
@@ -344,6 +447,13 @@ class PaDecodeTraits:
     sKScale_off: int
     sVScale_off: int
     sVScaleMax_off: int
+    sPages_off: int
+    sVnhd_off: int
+    nhd_buf_bytes: int
+    nhd_page_bytes: int
+    NHD_TOKS_PER_DMA: int
+    NHD_DMAS: int
+    NHD_K_LOADS: int
     total_bytes: int
 
     def o_slot(self, m: int, vh: int) -> int:
@@ -378,6 +488,10 @@ class PaDecodeTraits:
             batch_first_plan_grid,
             sliding_window,
             kv_dtype,
+            D256_M1_PIPE,
+            stage_page_capacity,
+            nhd_layout,
+            NHD_V_BUFS,
         ) = cache_key
         is_gfx950 = schedule.is_gfx950
         is_bf16_kv = kv_dtype == "bf16"
@@ -553,6 +667,29 @@ class PaDecodeTraits:
             NWARP_PAD * f32 if per_token_kv else 0
         )  # m-independent: one cross-warp slot
         total_bytes = sVScaleMax_off + sVScaleMax_bytes
+        # Page ids for the task's tiles, one i32 each, staged before the loop.
+        sPages_off = total_bytes
+        total_bytes += stage_page_capacity * 4
+        # NHD V: per warp one page of row-major token rows (head_dim bytes each)
+        # with XOR-swizzled 16-byte bands; see PaDecodeKVLoader.nhd_v_dma.
+        # An LDS-DMA writes LDSbase + M0 + lane*16, one wave-uniform 1 KiB run
+        # per instruction.
+        nhd_page_bytes = block_size * head_dim
+        nhd_buf_bytes = NWARP * nhd_page_bytes
+        NHD_TOKS_PER_DMA = (WAVE * 16) // head_dim
+        NHD_DMAS = block_size // NHD_TOKS_PER_DMA
+        NHD_K_LOADS = NCHUNK * QKHE_LOOP
+        sVnhd_off = (total_bytes + 15) & ~15
+        if nhd_layout:
+            # Lane L loads band L&15 of token L>>4: one 16-lane group covers
+            # one 256-byte row, so head_dim must be 256. Warp w stages one page
+            # of the tile, so the page must be TOK_PER_WARP tokens.
+            assert (
+                NHD_TOKS_PER_DMA == WAVE // 16 and head_dim == 256
+            ), "NHD V DMA maps one 16-lane group to one 256-byte token row"
+            assert block_size == TOK_PER_WARP, "NHD V DMA stages one page per warp"
+            assert NHD_DMAS * WAVE * 16 == nhd_page_bytes
+            total_bytes = sVnhd_off + NHD_V_BUFS * nhd_buf_bytes
 
         return cls(
             cache_key=cache_key,
@@ -570,6 +707,10 @@ class PaDecodeTraits:
             prefetch_v=prefetch_v,
             batch_first_plan_grid=batch_first_plan_grid,
             buffer_plan_output=buffer_plan_output,
+            D256_M1_PIPE=D256_M1_PIPE,
+            stage_page_capacity=stage_page_capacity,
+            nhd_layout=nhd_layout,
+            NHD_V_BUFS=NHD_V_BUFS,
             FP8=FP8,
             FP8_MAX=FP8_MAX,
             Q_DTYPE=Q_DTYPE,
@@ -629,5 +770,12 @@ class PaDecodeTraits:
             sKScale_off=sKScale_off,
             sVScale_off=sVScale_off,
             sVScaleMax_off=sVScaleMax_off,
+            sPages_off=sPages_off,
+            sVnhd_off=sVnhd_off,
+            nhd_buf_bytes=nhd_buf_bytes,
+            nhd_page_bytes=nhd_page_bytes,
+            NHD_TOKS_PER_DMA=NHD_TOKS_PER_DMA,
+            NHD_DMAS=NHD_DMAS,
+            NHD_K_LOADS=NHD_K_LOADS,
             total_bytes=total_bytes,
         )

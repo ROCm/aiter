@@ -5,15 +5,20 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import llvm as llvm_d
 from flydsl.compiler.protocol import dsl_size_of
-from flydsl.expr import const_expr, range_constexpr
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr import math as fmath
-from flydsl.expr.typing import ReductionOp
+from flydsl.expr.typing import ReductionOp, T
+from flydsl.expr.typing import Vector as Vec
 
-from .. import dpp_utils
-from ..tensor_shim import ptr_buf_tensor
+from .. import buffer_ops, dpp_utils
+from ..tensor_shim import buf_base_i64, ptr_buf_tensor
 from ..utils import rcp_f32
-from .traits import MFMA_MNK
+from .traits import MFMA_MNK, WAVE
+
+NT_LOAD = 2  # gfx950 buffer-load aux bit 1: nontemporal cache policy.
 
 
 class PaDecodeLds:
@@ -28,6 +33,30 @@ class PaDecodeLds:
         # the Python SharedStorage handle cannot cross that boundary.
         lds = fx.SharedAllocator().allocate(self.storage_type).peek()
         self.base = fx.recast_iter(fx.Uint8, lds.buf.ptr)  # byte-addressed base
+        if const_expr(self.traits.nhd_layout):
+            # The waitcnt pass treats every LDS access after an LDS-DMA as a
+            # possible alias of it and drains vmcnt, prefetched K included,
+            # unless scoped metadata proves otherwise. The NHD V region gets
+            # its own scope; all other LDS traffic is marked disjoint from it.
+            domain = '#llvm.alias_scope_domain<id = "pa_decode_lds">'
+            v_scope, other_scope = (
+                ir.ArrayAttr.get(
+                    [
+                        ir.Attribute.parse(
+                            f'#llvm.alias_scope<id = "{name}", domain = {domain}>'
+                        )
+                    ]
+                )
+                for name in ("pa_decode_lds_nhd_v", "pa_decode_lds_other")
+            )
+            self.other_scopes = {
+                "alias_scopes": other_scope,
+                "noalias_scopes": v_scope,
+            }
+            self.v_dma_scopes = {
+                "alias_scopes": v_scope,
+                "noalias_scopes": other_scope,
+            }
 
     def pointer(self, byte_off, elem_ty):
         # Restore element alignment lost by the byte-base recast.
@@ -38,12 +67,41 @@ class PaDecodeLds:
         return fx.recast_iter(ptr_ty, p)
 
     def load(self, byte_off, elem_ty, n):
+        if const_expr(self.traits.nhd_layout):
+            raw = llvm_d.load(
+                T.vec(n, elem_ty.ir_type),
+                fx.as_ir_value(fx.to_llvm_ptr(self.pointer(byte_off, elem_ty))),
+                alignment=dsl_size_of(elem_ty),
+                **self.other_scopes,
+            )
+            return Vec(raw)
         return fx.ptr_load(
             self.pointer(byte_off, elem_ty), result_type=fx.Vector.make_type(n, elem_ty)
         )
 
     def store(self, byte_off, elem_ty, vec):
+        if const_expr(self.traits.nhd_layout):
+            llvm_d.store(
+                fx.as_ir_value(vec),
+                fx.as_ir_value(fx.to_llvm_ptr(self.pointer(byte_off, elem_ty))),
+                alignment=dsl_size_of(elem_ty),
+                **self.other_scopes,
+            )
+            return
         fx.ptr_store(vec, self.pointer(byte_off, elem_ty))
+
+    def barrier_keep_dma(self):
+        # gpu.barrier's workgroup fences make the waitcnt pass drain every
+        # in-flight LDS-DMA. Only this CTA's LDS writes must be visible, so
+        # retire them and sync; the memory clobber keeps the compiler from
+        # moving LDS accesses across.
+        llvm_d.inline_asm(
+            None,
+            [],
+            "s_waitcnt lgkmcnt(0)\n\ts_barrier",
+            "~{memory}",
+            has_side_effects=True,
+        )
 
     def row_offset(self, byte_off, m_idx, width, elem_ty):
         return byte_off + m_idx * (width * dsl_size_of(elem_ty))
@@ -283,13 +341,34 @@ class PaDecodeKVLoader:
 
         return _load
 
-    def init_loaders(self):
-        self._k_load_vector = self._make_raw_flat_loader(
-            self.ctx.key_cache_ptr,
-            self.traits.KV_DTYPE,
-            self.traits.KV_VECTOR_WIDTH,
-            self.traits.KV_EXTENT,
+    def _make_nt_k_loader(self, tensor_ptr):
+        # K on the pipe is a flat global_load_dwordx4 with !nontemporal. Packed
+        # V stays on the cached copy; NHD V uses a nontemporal LDS DMA (see
+        # nhd_v_dma).
+        base = buf_base_i64(tensor_ptr)
+        ptr_ty = fx.PointerType.get(
+            fx.Int32.ir_type,
+            address_space=fx.AddressSpace.Global,
+            alignment=16,
         )
+
+        def _load(elem_idx):
+            # FP8 elements are one byte, so the element index is the byte offset.
+            ptr = fx.Pointer(fx.inttoptr(ptr_ty, base + fx.Int64(elem_idx)))
+            return fx.generic_load(ptr, dtype=fx.Int32, count=4, nontemporal=True)
+
+        return _load
+
+    def init_loaders(self):
+        if const_expr(self.traits.D256_M1_PIPE):
+            self._k_load_vector = self._make_nt_k_loader(self.ctx.key_cache_ptr)
+        else:
+            self._k_load_vector = self._make_raw_flat_loader(
+                self.ctx.key_cache_ptr,
+                self.traits.KV_DTYPE,
+                self.traits.KV_VECTOR_WIDTH,
+                self.traits.KV_EXTENT,
+            )
         self._v_load_vector = self._make_raw_flat_loader(
             self.ctx.value_cache_ptr,
             self.traits.KV_DTYPE,
@@ -374,6 +453,14 @@ class PaDecodeKVLoader:
     def load_pages(self, page, vec_width=1):
         # Even an in-bounds table entry can contain a stale page ID beyond
         # this context. Pin those pages to block 0 before loading K/V.
+        # Staged ids were pinned the same way when they were stored.
+        if const_expr(self.traits.stage_page_capacity and vec_width == 1):
+            rel = page - self.ctx.part_start * (
+                self.traits.TILE_TOK // self.traits.block_size
+            )
+            return fx.Int32(
+                self.lds.load(self.traits.sPages_off + rel * 4, fx.Int32, 1)[0]
+            )
         element_offset = self.ctx.seq * self.ctx.max_blocks_per_seq + page
         if const_expr(vec_width == 1):
             result = self.bt_buf[element_offset]
@@ -503,6 +590,21 @@ class PaDecodeKVLoader:
             self.traits.sVScale_off, a, buf_off
         )
 
+    def nhd_byte(self, page, tok, head_byte, block_stride, tok_stride, head_stride):
+        # The host bounds the in-page term to i32; a multi-head pool's head
+        # stride can scale with num_blocks, so wide mode widens it too.
+        if const_expr(self.traits.wide_kv_addressing):
+            return (
+                fx.Int64(page) * fx.Int64(block_stride)
+                + fx.Int64(self.ctx.kv_h) * fx.Int64(head_stride)
+                + fx.Int64(tok * tok_stride + head_byte)
+            )
+        return self.kv_address(
+            page,
+            block_stride,
+            tok * tok_stride + self.ctx.kv_h * head_stride + head_byte,
+        )
+
     def load_k_chunk(self, phys, a):
         # K token = warp*TOK_PER_WARP + a*MFMA_MNK + lane16, matching the
         # softmax mask and probability-word scatter.
@@ -528,21 +630,31 @@ class PaDecodeKVLoader:
                     w = self.load_k_vector(base)
                     ops.extend([w[0], w[1]])
             else:
-                base = self.kv_address(
-                    phys,
-                    self.ctx.n_kv
-                    * (
-                        self.traits.QCHUNK
-                        * self.traits.block_size
-                        * self.traits.QK_CHUNK_ELEMS
-                    ),
-                    (
-                        (self.ctx.kv_h * self.traits.QCHUNK + he_idx)
-                        * self.traits.block_size
-                        + within_page_tok
+                if const_expr(self.traits.nhd_layout):
+                    base = self.nhd_byte(
+                        phys,
+                        within_page_tok,
+                        he_idx * self.traits.QK_CHUNK_ELEMS,
+                        self.ctx.stride_k_block,
+                        self.ctx.stride_k_token,
+                        self.ctx.stride_k_head,
                     )
-                    * self.traits.QK_CHUNK_ELEMS,
-                )
+                else:
+                    base = self.kv_address(
+                        phys,
+                        self.ctx.n_kv
+                        * (
+                            self.traits.QCHUNK
+                            * self.traits.block_size
+                            * self.traits.QK_CHUNK_ELEMS
+                        ),
+                        (
+                            (self.ctx.kv_h * self.traits.QCHUNK + he_idx)
+                            * self.traits.block_size
+                            + within_page_tok
+                        )
+                        * self.traits.QK_CHUNK_ELEMS,
+                    )
                 w = self.load_k_vector(base)
                 ops.extend([w[0], w[1]])
             if const_expr(self.traits.block_size == 16):
@@ -618,6 +730,145 @@ class PaDecodeKVLoader:
         if const_expr(self.traits.head_dim == 64):
             fx.rocdl.sched_vmem(len(ops) // 2)
         return ops  # NVOPS i64, the 64-token contiguous run for this head
+
+    def nhd_band_slot(self, region, tok, band):
+        return (band ^ (tok & 7) ^ ((region & 1) * 8)) * 16
+
+    def nhd_v_dma(self, tile, buf):
+        """Stage one tile's V pages into NHD buffer ``buf`` with LDS-DMA.
+
+        NHD V is head-contiguous per token, so warp w stages its whole page
+        row-major: token t at t*head_dim, 16-byte head bands within the row.
+        Only the source address is per lane: lane L takes the band that belongs
+        in slot L. The bands are XOR-swizzled by the row and the region so a
+        transposed read, which walks one band across eight rows, spans banks
+        instead of repeating one.
+        """
+        traits = self.traits
+        # The LDS destination rides in M0, and the buffer descriptor in SGPRs,
+        # so both must be wave-uniform: a VGPR descriptor makes the backend
+        # wrap every load in a waterfall loop. The page comes from LDS, staged
+        # a tile earlier; reading it from the block table here would make the
+        # descriptor wait on a global load and drain the K prefetch with it.
+        warp_u = fx.Int32(rocdl.readfirstlane(T.i32, fx.as_ir_value(self.ctx.warp)))
+        page = fx.Int32(
+            rocdl.readfirstlane(T.i32, fx.as_ir_value(self.read_k_pages()[0]))
+        )
+        # Bound the page by the live context so hardware zero-fills the tail.
+        # Unwritten tails and block-0 padding can hold FP8 NaN, and 0 * NaN =
+        # NaN would poison PV.
+        live = self.ctx.context_len - (
+            tile * traits.TILE_TOK + warp_u * traits.TOK_PER_WARP
+        )
+        # A tile past the partition loads nothing but keeps the vmcnt
+        # sequence identical on every path.
+        live = (tile < self.ctx.part_end).select(live, fx.Int32(0))
+        live = (live > fx.Int32(0)).select(live, fx.Int32(0))
+        live = (live < fx.Int32(traits.block_size)).select(
+            live, fx.Int32(traits.block_size)
+        )
+        n_records = fx.Int32(
+            rocdl.readfirstlane(T.i32, fx.as_ir_value(live * self.ctx.stride_v_token))
+        )
+        v_head_off = (
+            fx.Int64(self.ctx.kv_h) * fx.Int64(self.ctx.stride_v_head)
+            if const_expr(traits.wide_kv_addressing)
+            else fx.Int64(self.ctx.kv_h * self.ctx.stride_v_head)
+        )
+        v_page = buffer_ops.create_buffer_resource_from_addr(
+            buf_base_i64(self.ctx.value_cache_ptr)
+            + fx.Int64(page) * fx.Int64(self.ctx.stride_v_block)
+            + v_head_off,
+            num_records_bytes=n_records,
+        )
+        region = (
+            traits.sVnhd_off
+            + buf * traits.nhd_buf_bytes
+            + warp_u * traits.nhd_page_bytes
+        )
+        for i in range_constexpr(traits.NHD_DMAS):
+            tok = i * traits.NHD_TOKS_PER_DMA + (self.ctx.lane >> 4)
+            band = self.ctx.lane & 15
+            rocdl.raw_ptr_buffer_load_lds(
+                v_page,
+                fx.as_ir_value(
+                    fx.to_llvm_ptr(self.lds.pointer(region + i * (WAVE * 16), fx.Int32))
+                ),
+                size=16,
+                voffset=fx.as_ir_value(
+                    tok * self.ctx.stride_v_token
+                    + self.nhd_band_slot(warp_u, tok, band)
+                ),
+                soffset=0,
+                offset=0,
+                aux=NT_LOAD,
+                **self.lds.v_dma_scopes,
+            )
+        fx.rocdl.sched_barrier(0)
+
+    def nhd_v_gather(self, buf):
+        """Read the staged V as the i64 packs ``load_v`` returns.
+
+        Callers wait for the DMA and pass a barrier first. The reads are scoped
+        disjoint from the DMA so the waitcnt pass does not also wait for the
+        next tile's DMA into the other buffer. The 16-lane group covers one
+        8-token pack: lane16 supplies row lane16>>1 and the half-chunk
+        lane16&1, and holds head element band*16+lane16 for all 8 tokens once
+        transposed with ds_read_tr8_b64.
+        """
+        traits = self.traits
+        row = self.ctx.lane16 >> 1
+        half = self.ctx.lane16 & 1
+        row_base = (
+            traits.sVnhd_off
+            + buf * traits.nhd_buf_bytes
+            + self.ctx.rgroup * traits.nhd_page_bytes
+            + row * traits.head_dim
+            + half * 8
+        )
+        gathered = []
+        for vh in range_constexpr(traits.VHE_CHUNKS):
+            band = vh * traits.RGROUP_QUARTERS + self.ctx.warp
+            base = row_base + self.nhd_band_slot(self.ctx.rgroup, row, band)
+            ops = []
+            for pack in range_constexpr(traits.NVOPS):
+                # Constant row stride per pack: a DS offset immediate.
+                raw = rocdl.ds_read_tr8_b64(
+                    T.vec(2, T.i32),
+                    fx.as_ir_value(
+                        fx.to_llvm_ptr(
+                            self.lds.pointer(
+                                base + pack * (8 * traits.head_dim), fx.Int32
+                            )
+                        )
+                    ),
+                    **self.lds.other_scopes,
+                ).result
+                ops.append(Vec(raw).bitcast(fx.Int64)[0])
+            gathered.append(ops)
+        return gathered
+
+    @flyc.jit
+    def stage_page_ids(self):
+        """Stage this task's page ids in LDS so the tile loop never reads the table."""
+        traits = self.traits
+        ppt = traits.TILE_TOK // traits.block_size
+        first_page = self.ctx.part_start * ppt
+        n_part_pages = (self.ctx.part_end - self.ctx.part_start) * ppt
+        rounds = traits.stage_page_capacity // traits.BLOCK_THREADS
+        for r in range_constexpr(rounds):
+            idx = self.ctx.tid + r * traits.BLOCK_THREADS
+            if idx < n_part_pages:
+                pg = first_page + idx
+                raw = fx.Int32(
+                    self.bt_buf[self.ctx.seq * self.ctx.max_blocks_per_seq + pg]
+                )
+                val = (pg < self.ctx.num_pages).select(raw, fx.Int32(0))
+                self.lds.store(
+                    traits.sPages_off + idx * 4,
+                    fx.Int32,
+                    fx.Vector.from_elements([val], dtype=fx.Int32),
+                )
 
     @flyc.jit
     def prefetch_first(self):

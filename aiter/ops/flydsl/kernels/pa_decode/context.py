@@ -32,6 +32,12 @@ class PaDecodeContext:
         stride_ks_head,
         stride_q_row,
         stride_q_head,
+        stride_k_block,
+        stride_k_token,
+        stride_k_head,
+        stride_v_block,
+        stride_v_token,
+        stride_v_head,
         num_sequences,
         planned_seq,
         planned_start,
@@ -54,6 +60,12 @@ class PaDecodeContext:
         self.stride_ks_head = stride_ks_head
         self.stride_q_row = stride_q_row
         self.stride_q_head = stride_q_head
+        self.stride_k_block = stride_k_block
+        self.stride_k_token = stride_k_token
+        self.stride_k_head = stride_k_head
+        self.stride_v_block = stride_v_block
+        self.stride_v_token = stride_v_token
+        self.stride_v_head = stride_v_head
         self.num_sequences = num_sequences
         self.planned_seq = planned_seq
         self.planned_start = planned_start

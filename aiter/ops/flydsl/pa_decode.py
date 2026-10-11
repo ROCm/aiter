@@ -15,11 +15,24 @@ import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
+from .kernels.pa_decode.traits import d256_m1_pipe
 from .kernels.pa_decode_kernel import KV_COMPUTE_BLOCK, compile_pa_decode_tile
 from .kernels.pa_decode_plan import PADecodePlan
 from .kernels.pa_decode_plan import plan_pa_decode as plan_pa_decode  # noqa: PLC0414
 from .kernels.pa_decode_reduce import compile_pa_decode_ps_reduce
 from .kernels.tensor_shim import _run_compiled, get_dtype_str, ptr_arg
+
+
+def _nhd_strides(view: torch.Tensor) -> tuple[int, int, int]:
+    """Block, token and head strides; size-1 axes are never stepped, so 0."""
+    return tuple(0 if view.shape[d] == 1 else int(view.stride(d)) for d in range(3))
+
+
+def _view_span(view: torch.Tensor) -> int:
+    """Elements from the view's first element through its last, inclusive."""
+    return 1 + sum(
+        (size - 1) * stride for size, stride in zip(view.shape, view.stride())
+    )
 
 
 def _flydsl_pointer_dtype(dtype: torch.dtype):
@@ -139,8 +152,8 @@ def launch_pa_decode_ps_reduce(
 def pa_decode(
     output: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
     query: torch.Tensor,  # [num_seqs * query_length, num_query_heads, head_size]
-    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x]
-    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x]
+    key_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size // x, kv_block_size, x] or NHD [num_blocks, 64, num_kv_heads, 256]
+    value_cache: torch.Tensor,  # [num_blocks, num_kv_heads, head_size, kv_block_size] or [num_blocks, num_kv_heads, kv_block_size // x, head_size, x] or NHD like key_cache
     context_lengths: torch.Tensor,  # [num_seqs]
     block_tables: torch.Tensor,  # [num_seqs, max_num_blocks_per_seq]
     softmax_scale: float,
@@ -165,6 +178,16 @@ def pa_decode(
     Supports page sizes 16/64/128. BF16 head dimensions are multiples of 64
     up to 1024; FP8 supports 64 and multiples of 128 up to 1024.
     K/V scales are [1] or [num_blocks, num_kv_heads, block_size, 1].
+
+    A 4D ``key_cache`` selects the NHD layout: K and V are equally shaped
+    [num_blocks, 64, num_kv_heads, 256] views with a contiguous head axis and
+    arbitrary other strides, e.g. both halves of one 512-byte token row. NHD
+    requires gfx950, FP8 KV, head 256, page 64, query_length 1, one query
+    M-tile, per-tensor scales, and no sliding window. Each view must be 16-byte
+    aligned with 16-byte multiple strides, its token rows must not overlap, and
+    its strides and in-page span must fit int32; heads-outermost storage with
+    several KV heads is thus limited to 2 GiB per head.
+
     BF16 K/V requires BF16 queries, compute_type=torch.bfloat16, no K/V scales,
     and vectorized 5D caches with x=8; FP8 uses x=16. BF16 Q/P operands stay
     in BF16 and softmax statistics and MFMA accumulation stay in FP32.
@@ -245,7 +268,7 @@ def pa_decode(
     expected_ranks = (
         ("output", output, (3,)),
         ("query", query, (3,)),
-        ("key_cache", key_cache, (5,)),
+        ("key_cache", key_cache, (4, 5)),
         ("value_cache", value_cache, (4, 5)),
         ("context_lengths", context_lengths, (1,)),
         ("block_tables", block_tables, (2,)),
@@ -279,7 +302,19 @@ def pa_decode(
             f"context_lengths.shape[0] ({num_seqs})"
         )
 
-    num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = key_cache.shape
+    nhd_layout = key_cache.dim() == 4
+    if nhd_layout:
+        num_blocks, block_size, num_kv_heads, k_head = key_cache.shape
+        if k_head != head_dim:
+            raise ValueError(
+                "NHD key_cache shape must be "
+                "[num_blocks, block_size, num_kv_heads, head_dim], "
+                f"got {tuple(key_cache.shape)} for head_dim={head_dim}"
+            )
+    else:
+        num_blocks, num_kv_heads, num_hgroups, block_size, hgroup_width = (
+            key_cache.shape
+        )
     if num_kv_heads < 1:
         raise ValueError(
             f"key_cache must contain at least one KV head, got {num_kv_heads}"
@@ -302,6 +337,8 @@ def pa_decode(
             f"pa_decode requires compute_type={expected_kv_dtype} for the KV cache "
             f"on {arch}, got {compute_type}"
         )
+    if nhd_layout and is_bf16_kv:
+        raise NotImplementedError("NHD pa_decode requires FP8 KV")
     vector_width = 8 if is_bf16_kv else 16
 
     # Enforce tile Q-load constraints and the reducer's 1024-thread limit.
@@ -319,7 +356,9 @@ def pa_decode(
                 else "are 64 and multiples of 128 in [128, 1024] for FP8 KV"
             )
         )
-    if num_hgroups != head_dim // vector_width or hgroup_width != vector_width:
+    if not nhd_layout and (
+        num_hgroups != head_dim // vector_width or hgroup_width != vector_width
+    ):
         raise ValueError(
             "key_cache shape must be "
             f"[num_blocks, num_kv_heads, head_dim // {vector_width}, "
@@ -334,7 +373,31 @@ def pa_decode(
     trans_v = value_cache.dim() == 5
     if is_bf16_kv and not trans_v:
         raise ValueError("BF16 KV requires the vectorized 5D value_cache layout")
-    if trans_v:
+    if nhd_layout:
+        if value_cache.shape != key_cache.shape:
+            raise ValueError(
+                "NHD value_cache shape must match key_cache, "
+                f"got {tuple(value_cache.shape)} vs {tuple(key_cache.shape)}"
+            )
+        if key_cache.stride(-1) != 1 or value_cache.stride(-1) != 1:
+            raise ValueError("NHD key and value head axes must be contiguous")
+        for name, view in (("key_cache", key_cache), ("value_cache", value_cache)):
+            # K loads and V LDS-DMAs move 16-byte chunks.
+            strides = _nhd_strides(view)
+            if view.data_ptr() % 16 or any(stride % 16 for stride in strides):
+                raise ValueError(
+                    f"NHD {name} needs a 16-byte aligned base and block, token "
+                    f"and head strides that are multiples of 16, got data_ptr "
+                    f"{view.data_ptr():#x} and strides {view.stride()}"
+                )
+            # The V tail bound is live_tokens * token_stride bytes.
+            if strides[1] < head_dim:
+                raise ValueError(
+                    f"NHD {name} token rows must not overlap, got token stride "
+                    f"{view.stride(1)} for head_dim={head_dim}"
+                )
+        v_num_blocks, v_num_kv_heads = num_blocks, num_kv_heads
+    elif trans_v:
         v_num_blocks, v_num_kv_heads = value_cache.shape[:2]
         expected_v_tail = (block_size // vector_width, head_dim, vector_width)
         if tuple(value_cache.shape[2:]) != expected_v_tail:
@@ -443,6 +506,8 @@ def pa_decode(
         ("block_tables", block_tables),
         ("context_lengths", context_lengths),
     ):
+        if nhd_layout and name in ("key_cache", "value_cache"):
+            continue
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
@@ -550,11 +615,51 @@ def pa_decode(
     psum = exp_sums
     pout = temporary_output
 
-    # Bound byte offsets as well as element indices for 16-bit BF16 caches.
-    cache_extent = max(
-        key_cache.numel() * key_cache.element_size(),
-        value_cache.numel() * value_cache.element_size(),
-    )
+    stride_k_block = stride_k_token = stride_k_head = 0
+    stride_v_block = stride_v_token = stride_v_head = 0
+    if nhd_layout:
+        if not d256_m1_pipe(
+            arch,
+            kv_dtype,
+            head_dim,
+            block_size,
+            trans_v,
+            per_token_kv,
+            query_length,
+            query_group_size,
+            sliding_window,
+        ):
+            raise NotImplementedError(
+                "NHD pa_decode requires gfx950, FP8 KV, head 256, page 64, "
+                "query_length 1, one query M-tile, per-tensor scales, and no "
+                "sliding window"
+            )
+        stride_k_block, stride_k_token, stride_k_head = _nhd_strides(key_cache)
+        stride_v_block, stride_v_token, stride_v_head = _nhd_strides(value_cache)
+        # Strides are i32 kernel arguments, and the in-page offset and V tail
+        # bound stay i32 even in wide mode.
+        strides = (stride_k_block, stride_k_head, stride_v_block, stride_v_head)
+        page_span = block_size * max(stride_k_token, stride_v_token)
+        if max(*strides, page_span) >= 2**31:
+            raise NotImplementedError(
+                "NHD pa_decode requires int32 block and head strides and "
+                "block_size * token_stride < 2**31, got strides "
+                f"{key_cache.stride()} and {value_cache.stride()}"
+            )
+
+    # Bound byte offsets as well as element indices for 16-bit BF16 caches. A
+    # strided NHD view can span more bytes than numel(), and its head stride
+    # may scale with num_blocks, so measure the highest byte offset.
+    if nhd_layout:
+        cache_extent = (
+            max(_view_span(key_cache), _view_span(value_cache))
+            * key_cache.element_size()
+        )
+    else:
+        cache_extent = max(
+            key_cache.numel() * key_cache.element_size(),
+            value_cache.numel() * value_cache.element_size(),
+        )
     wide_kv_addressing = cache_extent >= 2**31
     kv_buffer_u32 = cache_extent < 2**32
 
@@ -580,6 +685,7 @@ def pa_decode(
             work_capacity=work_plan.capacity,
             max_context_length=schedule_context_length,
             sliding_window=sliding_window,
+            nhd_layout=nhd_layout,
         )
 
     total_rows = query_length * query_group_size
@@ -663,6 +769,12 @@ def pa_decode(
             stride_ks_head,
             int(query.stride(0)),
             int(query.stride(1)),
+            stride_k_block,
+            stride_k_token,
+            stride_k_head,
+            stride_v_block,
+            stride_v_token,
+            stride_v_head,
             ptr_arg(work_plan.work_info, fx.Int32),
             work_plan.capacity,
             s,
