@@ -21,10 +21,24 @@ from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
 )
 
 DEFAULT_MTPRS = (8192, 16384, 32768)
+DEFAULT_QUANTS = ("a8w4",)
 # DeepSeek-V4-Pro deployment profiles: r0, r32, and r64 redundant experts.
 # Keep all three in the default AOT job set so the service never falls back to
 # an online compile merely because EPLB changes the physical expert count.
 DEFAULT_EXPERTS_PER_RANKS = (48, 52, 56)
+# Kimi-K3 deployment profile (EP8 / epr112, topk16, d3584 / i3072).  Added to
+# the default AOT job set so K3 serving never falls back to an online compile.
+K3_EXPERTS_PER_RANKS = (112,)
+K3_TOPK = 16
+K3_MODEL_DIM = 3584
+K3_INTER_DIM = 3072
+# K3 uses SiTUv2 (hidden_act="situ"); tanh self-saturates so no hard clamp.
+# beta=4.0 / linear_beta=25.0 are the K3 checkpoint constants the MegaMoE SiTU
+# kernel bakes in (SGLang kimi_k3.py asserts exactly these); they MUST match
+# op_tests kimi_k3_route or the AOT bundle name will not match at serving.
+K3_ACT = "situv2"
+K3_SITU_BETA = 4.0
+K3_SITU_LINEAR_BETA = 25.0
 WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
@@ -59,11 +73,15 @@ def default_jobs(
     mtprs=DEFAULT_MTPRS,
     experts_per_ranks=DEFAULT_EXPERTS_PER_RANKS,
     *,
+    quants=DEFAULT_QUANTS,
     world_size=WORLD_SIZE,
     topk=TOPK,
     model_dim=MODEL_DIM,
     inter_dim=INTER_DIM,
     swiglu_limit=SWIGLU_LIMIT,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     shape_suffix = ""
     if (world_size, topk, model_dim, inter_dim) != (
@@ -73,12 +91,16 @@ def default_jobs(
         INTER_DIM,
     ):
         shape_suffix = f"_w{world_size}_k{topk}_d{model_dim}_i{inter_dim}"
+    # Activation is baked into the Stage1 epilogue, so a non-default act needs a
+    # distinct AOT artifact name (mirrors the runtime kernel-name act suffix).
+    act_suffix = "" if act == "silu" else f"_{act}"
     return [
         {
             "kernel_name": (
-                f"mega_moe_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
-                f"_rank{rank}{shape_suffix}"
+                f"mega_moe_{quant}_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
+                f"_rank{rank}{shape_suffix}{act_suffix}"
             ),
+            "quant": quant,
             "stage": stage,
             "mtpr": mtpr,
             "experts_per_rank": experts_per_rank,
@@ -88,12 +110,49 @@ def default_jobs(
             "model_dim": model_dim,
             "inter_dim": inter_dim,
             "swiglu_limit": swiglu_limit,
+            "act": act,
+            "situ_beta": situ_beta,
+            "situ_linear_beta": situ_linear_beta,
         }
         for mtpr in mtprs
         for experts_per_rank in experts_per_ranks
+        for quant in quants
         for rank in range(world_size)
         for stage in (1, 2)
     ]
+
+
+def production_jobs(
+    mtprs=DEFAULT_MTPRS,
+    *,
+    quants=DEFAULT_QUANTS,
+    world_size=WORLD_SIZE,
+    swiglu_limit=SWIGLU_LIMIT,
+):
+    """Every geometry the service ships: V4-Pro (default shape) + Kimi-K3.
+
+    Used by the default build so both profiles are AOT-covered and neither
+    triggers an online JIT compile at serving time.
+    """
+    jobs = default_jobs(
+        mtprs, quants=quants, world_size=world_size, swiglu_limit=swiglu_limit
+    )
+    jobs += default_jobs(
+        mtprs,
+        K3_EXPERTS_PER_RANKS,
+        quants=quants,
+        world_size=world_size,
+        topk=K3_TOPK,
+        model_dim=K3_MODEL_DIM,
+        inter_dim=K3_INTER_DIM,
+        # SiTUv2 self-saturates -> no hard clamp; keep swiglu_limit at 0 so the
+        # kernel name matches the runtime kimi_k3_route (swiglu_limit=0.0).
+        swiglu_limit=0.0,
+        act=K3_ACT,
+        situ_beta=K3_SITU_BETA,
+        situ_linear_beta=K3_SITU_LINEAR_BETA,
+    )
+    return jobs
 
 
 def _tensor(shape, dtype):
@@ -106,11 +165,15 @@ def _compile_stage1(
     rank,
     plan,
     *,
+    a_dtype,
     world_size,
     topk,
     model_dim,
     inter_dim,
     swiglu_limit,
+    act="silu",
+    situ_beta=1.0,
+    situ_linear_beta=1.0,
 ):
     from aiter.ops.flydsl.kernels.mega_moe.mega_moe_prepare import (
         preload_mega_moe_prepare,
@@ -182,7 +245,7 @@ def _compile_stage1(
     # the validation/per-stage benchmark invokes it to isolate Stage1 timing.
     quant_rows = 2
     quant_groups = quant_rows * scale_dim
-    _get_launcher(model_dim, "fp8")(
+    _get_launcher(model_dim, a_dtype)(
         _tensor((quant_rows, model_dim), torch.bfloat16),
         _tensor((quant_rows, model_dim), torch.float8_e4m3fn),
         _tensor((quant_rows, scale_dim), torch.uint8),
@@ -206,6 +269,9 @@ def _compile_stage1(
         tile_state_stride=tile_state_stride,
         variants=plan.stage1_variants,
         swiglu_limit=swiglu_limit,
+        act=act,
+        situ_beta=situ_beta,
+        situ_linear_beta=situ_linear_beta,
     )
     launch(
         _tensor((1, inter_dim), torch.float8_e4m3fn),
@@ -236,6 +302,7 @@ def _compile_stage2(
     rank,
     plan,
     *,
+    a_dtype,
     world_size,
     topk,
     model_dim,
@@ -278,6 +345,7 @@ def _compile_stage2(
             "cu_num": NUM_CU,
             "p2p_quant_type": key.p2p_quant,
             "fixed_slot_dispatch": plan.fixed_slot_dispatch,
+            "a_dtype": a_dtype,
         }
         residual = (
             replace(stage2, skew_cu=stage2.persist_cu)
@@ -296,8 +364,10 @@ def _compile_stage2(
             BK=residual.block_k,
             use_nt=residual.use_nt,
             g2_bhoist=residual.b_hoist,
+            g2_b2stage=residual.b2stage,
             g2_ascale_pf=residual.ascale_prefetch,
             g2_spart=residual.spatial_partition,
+            g2_deep_a_pipeline=residual.deep_a_pipeline,
             persist=residual.persist,
             persist_cu=residual.persist_cu,
             persist_strided=residual.persist_strided,
@@ -332,7 +402,10 @@ def _compile_stage2(
             use_nt=stage2.use_nt,
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
+            a_dtype=a_dtype,
         )
 
     # Stage2's production bundle includes the terminal fused combine kernels.
@@ -408,6 +481,10 @@ def compile_one_config(**job):
         model_dim = job.get("model_dim", MODEL_DIM)
         inter_dim = job.get("inter_dim", INTER_DIM)
         swiglu_limit = job.get("swiglu_limit", SWIGLU_LIMIT)
+        act = job.get("act", "silu")
+        situ_beta = job.get("situ_beta", 1.0)
+        situ_linear_beta = job.get("situ_linear_beta", 1.0)
+        a_dtype = "fp8"
         plan = build_mega_moe_bundle_plan(
             job["mtpr"],
             experts_per_rank=job["experts_per_rank"],
@@ -422,11 +499,15 @@ def compile_one_config(**job):
                     job["experts_per_rank"],
                     job["rank"],
                     plan,
+                    a_dtype=a_dtype,
                     world_size=world_size,
                     topk=topk,
                     model_dim=model_dim,
                     inter_dim=inter_dim,
                     swiglu_limit=swiglu_limit,
+                    act=act,
+                    situ_beta=situ_beta,
+                    situ_linear_beta=situ_linear_beta,
                 )
             else:
                 _compile_stage2(
@@ -434,6 +515,7 @@ def compile_one_config(**job):
                     job["experts_per_rank"],
                     job["rank"],
                     plan,
+                    a_dtype=a_dtype,
                     world_size=world_size,
                     topk=topk,
                     model_dim=model_dim,
@@ -460,16 +542,44 @@ def main():
     parser.add_argument("--model-dim", type=int, default=MODEL_DIM)
     parser.add_argument("--inter-dim", type=int, default=INTER_DIM)
     parser.add_argument("--swiglu-limit", type=float, default=SWIGLU_LIMIT)
-    args = parser.parse_args()
-    jobs = default_jobs(
-        tuple(args.mtpr),
-        tuple(args.experts_per_rank),
-        world_size=args.world_size,
-        topk=args.topk,
-        model_dim=args.model_dim,
-        inter_dim=args.inter_dim,
-        swiglu_limit=args.swiglu_limit,
+    parser.add_argument("--act", default="silu", choices=("silu", "situv2"))
+    parser.add_argument("--situ-beta", type=float, default=1.0)
+    parser.add_argument("--situ-linear-beta", type=float, default=1.0)
+    parser.add_argument(
+        "--quant",
+        nargs="+",
+        choices=DEFAULT_QUANTS,
+        default=list(DEFAULT_QUANTS),
     )
+    args = parser.parse_args()
+    default_shape = (
+        list(args.experts_per_rank) == list(DEFAULT_EXPERTS_PER_RANKS)
+        and args.topk == TOPK
+        and args.model_dim == MODEL_DIM
+        and args.inter_dim == INTER_DIM
+    )
+    if default_shape:
+        # Default build ships both V4-Pro and Kimi-K3 so neither JITs online.
+        jobs = production_jobs(
+            tuple(args.mtpr),
+            quants=tuple(args.quant),
+            world_size=args.world_size,
+            swiglu_limit=args.swiglu_limit,
+        )
+    else:
+        jobs = default_jobs(
+            tuple(args.mtpr),
+            tuple(args.experts_per_rank),
+            quants=tuple(args.quant),
+            world_size=args.world_size,
+            topk=args.topk,
+            model_dim=args.model_dim,
+            inter_dim=args.inter_dim,
+            swiglu_limit=args.swiglu_limit,
+            act=args.act,
+            situ_beta=args.situ_beta,
+            situ_linear_beta=args.situ_linear_beta,
+        )
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
     print(f"Compiled: {len(results) - failed} ok, {failed} failed")
