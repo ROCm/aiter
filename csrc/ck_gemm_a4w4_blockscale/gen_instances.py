@@ -274,8 +274,10 @@ def get_tune_dict(tune_dict_csv):
         # kernelName.startswith("_ZN") (mangled C++ symbol of the ASM kernel);
         # apply the same filter here so the CK codegen sees only CK rows and
         # build_tune_dict's strict validation stays effective on genuine CK
-        # references.
-        df = df[~df["kernelName"].astype(str).str.startswith("_ZN")]
+        # references.  FlyDSL decode rows ("flydsl_*") are likewise dispatched
+        # in Python and are not in the CK registry.
+        names = df["kernelName"].astype(str)
+        df = df[~(names.str.startswith("_ZN") | names.str.startswith("flydsl_"))]
         return build_tune_dict(
             df,
             default_kernels_dict,

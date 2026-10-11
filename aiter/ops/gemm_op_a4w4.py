@@ -9,6 +9,9 @@ from torch import Tensor
 
 from aiter import logger
 from aiter.jit.utils.torch_guard import torch_compile_guard
+from aiter.ops.flydsl.decode_gemm_mxfp4 import (
+    parse_flydsl_decode_name as _parse_flydsl_decode_name,
+)
 
 from ..jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG, compile_ops
 from ..jit.utils.asm_guard import require_gfx1250_asm
@@ -77,6 +80,15 @@ def get_GEMM_config(M: int, N: int, K: int):
             f"shape is M:{M}, N:{N}, K:{K}, not found tuned config in {tuned_file}, will use default config!"
         )
     return config
+
+
+# Mirrors the arch check in flydsl_decode_gemm_mxfp4.
+_FLYDSL_DECODE_ARCHS = {"gfx950"}
+
+
+@functools.cache
+def _log_flydsl_decode_fallback(name, reason):
+    logger.info(f"gemm_a4w4: {name} not used ({reason}); falling back to asm/CK path")
 
 
 def _f4gemm_asm_dispatch(
@@ -219,6 +231,58 @@ def gemm_a4w4(
     if ck_config is not None:
         splitK = ck_config.get("splitK", None)
         kernelName = ck_config["kernelName"]
+    if kernelName.startswith("flydsl_"):
+        fly = _parse_flydsl_decode_name(kernelName)
+        reason = None
+        if fly is None:
+            reason = "unparsable name"
+        elif gfx_arch not in _FLYDSL_DECODE_ARCHS:
+            reason = f"unsupported arch {gfx_arch}"
+        elif (
+            global_A_scale is not None
+            or global_B_scale is not None
+            or bias is not None
+            or alpha not in (None, 1.0)
+            or beta not in (None, 0.0)
+            or dtype != dtypes.bf16
+            or not bpreshuffle
+            or apreshuffle
+        ):
+            reason = "unsupported gemm_a4w4 arguments"
+        if reason is None:
+            from .flydsl.decode_gemm_mxfp4 import (
+                DECODE_GEMM_MXFP4_LDS_LIMIT,
+                decode_gemm_mxfp4_lds_bytes,
+                flydsl_decode_gemm_mxfp4,
+            )
+
+            try:
+                lds = decode_gemm_mxfp4_lds_bytes(
+                    m, k, fly["tile_n"], fly["k_waves"], fly["split_k"]
+                )
+                if lds > DECODE_GEMM_MXFP4_LDS_LIMIT:
+                    reason = f"LDS {lds} B exceeds {DECODE_GEMM_MXFP4_LDS_LIMIT}"
+                else:
+                    # Wrapper needs an exact contiguous (m, n) output; the first m
+                    # rows of the padded buffer qualify. The split-K workspace is
+                    # allocated per call by the wrapper (stream/graph safe).
+                    fly_out = out[:m]
+                    flydsl_decode_gemm_mxfp4(
+                        A.view(m, k // 2),
+                        B,
+                        A_scale,
+                        B_scale,
+                        fly_out,
+                        **fly,
+                    )
+                    return fly_out.view(*A.shape[:-1], n)
+            except ValueError as e:
+                reason = str(e)
+        _log_flydsl_decode_fallback(kernelName, reason)
+        # A flydsl_ name must never reach the CK path; use the default asm heuristic.
+        kernelName = ""
+        splitK = 0
+        ck_config = None
     if (
         ck_config is not None
         and kernelName.find("_ZN") == -1
