@@ -6,7 +6,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 
-# Raw dialect, and the only one here. There IS an fx atom for global -> LDS,
+# The ROCDL operation below has no matching synchronous fx copy atom. There is
 # `cdna4.GlobalLoadAsyncLDS128b`, but only the async one: it completes through
 # asyncmark / wait_asyncmark, while this pipeline's `wait_barrier` is a
 # hand-counted `s_waitcnt vmcnt(N)` covering A and B together. Tracking A one
@@ -14,7 +14,6 @@ import flydsl.expr as fx
 # below. `rocdl.global.load.lds` is the synchronous form and counts in vmcnt,
 # so the existing barrier keeps covering it. Pointers still go through
 # `fx.to_llvm_ptr`, so no address space is hardcoded.
-from flydsl._mlir.dialects import rocdl as _rocdl_d
 from flydsl.expr import T, arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
@@ -125,7 +124,7 @@ class _WideG2SLoader:
             )
             src = fx.add_offset(self.kv_ptr, self.gl_offsets[step] + fx.Int64(k_offset))
             dst = fx.add_offset(lds_dst.ptr, fx.Int32(step_off) + self.lane_id * 16)
-            _rocdl_d.global_load_lds(
+            rocdl.global_load_lds(
                 _raw(fx.to_llvm_ptr(src)), _raw(fx.to_llvm_ptr(dst)), 16, 0
             )
 

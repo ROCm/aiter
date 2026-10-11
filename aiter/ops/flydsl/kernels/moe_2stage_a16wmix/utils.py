@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -37,13 +37,11 @@ A16WI4_GROUP_SIZE = 32
 
 
 def _udiv(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.divui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) // fx.Uint32(c))
 
 
 def _umod(a, c):
-    cc = fx.Int32(c) if isinstance(c, int) else c
-    return fx.Int32(arith.remui(_raw(a), _raw(cc)))
+    return fx.Int32(fx.Uint32(a) % fx.Uint32(c))
 
 
 def _global_i32_at(addr_i64, idx):
