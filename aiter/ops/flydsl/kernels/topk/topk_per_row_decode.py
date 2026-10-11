@@ -11,7 +11,6 @@ to be co-resident. Both the part and the merge run the one-block selector.
 """
 
 from functools import cache, lru_cache
-from threading import Lock
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -19,7 +18,6 @@ import torch
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-from aiter.utility.graph_alloc import persistent_alloc
 
 from ..communication_ops_utils import (
     atomic_add_agent,
@@ -272,16 +270,10 @@ def build_topk_per_row_decode_module(
     return launch_topk_per_row_decode_kernel
 
 
-def _allocate_partials(device, rows, columns):
+def _allocate_workspace(device, rows, columns):
     return (
         torch.empty((rows, columns), device=device, dtype=torch.int32),
         torch.empty((rows, columns), device=device, dtype=torch.float32),
-    )
-
-
-def _allocate_workspace(device, rows, columns):
-    return (
-        *_allocate_partials(device, rows, columns),
         torch.zeros((rows,), device=device, dtype=torch.int32),
     )
 
@@ -291,62 +283,16 @@ def _get_cached_workspace(device, stream_id, rows, columns):
     return _allocate_workspace(device, rows, columns)
 
 
-_COUNTER_LOCK = Lock()
-_COUNTER_RESERVES = {}
-_CAPTURE_COUNTERS = []
-_MAX_COUNTER_RESERVES = 16
-
-
-def _reserve_capture_counter(device, rows, columns):
-    """Keep one initialized counter ready for a later capture of this shape."""
-    key = (device, rows, columns)
-    with _COUNTER_LOCK:
-        if _COUNTER_RESERVES.get(key):
-            return
-        with persistent_alloc(device):
-            counter = torch.zeros((rows,), device=device, dtype=torch.int32)
-        ready = torch.cuda.Event()
-        ready.record(torch.cuda.current_stream(device))
-        _COUNTER_RESERVES.setdefault(key, []).append((counter, ready))
-        if len(_COUNTER_RESERVES) > _MAX_COUNTER_RESERVES:
-            del _COUNTER_RESERVES[next(iter(_COUNTER_RESERVES))]
-
-
-def _claim_capture_counter(device, rows, columns):
-    key = (device, rows, columns)
-    with _COUNTER_LOCK:
-        reserves = _COUNTER_RESERVES.get(key)
-        if not reserves:
-            return None
-        workspace = reserves.pop()
-        if not reserves:
-            del _COUNTER_RESERVES[key]
-        # A captured graph retains only raw pointers. Keep every claimed
-        # counter alive permanently; each capture gets a distinct counter.
-        _CAPTURE_COUNTERS.append(workspace)
-    counter, ready = workspace
-    torch.cuda.current_stream(device).wait_event(ready)
-    return counter
-
-
 def _get_workspace(device, stream_id, rows, columns):
-    """Use cached eager storage and capture-private partials/counters."""
+    """Use process-cached eager storage and Graph-pool-owned capture storage."""
     if torch.cuda.is_current_stream_capturing():
-        partials = _allocate_partials(device, rows, columns)
-        counters = _claim_capture_counter(device, rows, columns)
-        if counters is None:
-            # Capture-first remains safe: this zero-fill becomes a Graph node.
-            counters = torch.zeros((rows,), device=device, dtype=torch.int32)
-        return (*partials, counters)
-    workspace = _get_cached_workspace(device, stream_id, rows, columns)
-    _reserve_capture_counter(device, rows, columns)
-    return workspace
+        # The zero-fill is captured and replays before every kernel launch.
+        return _allocate_workspace(device, rows, columns)
+    return _get_cached_workspace(device, stream_id, rows, columns)
 
 
 def clear_topk_per_row_decode_workspace_cache() -> None:
     _get_cached_workspace.cache_clear()
-    with _COUNTER_LOCK:
-        _COUNTER_RESERVES.clear()
 
 
 def launch_topk_per_row_decode(
