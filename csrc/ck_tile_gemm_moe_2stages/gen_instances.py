@@ -101,7 +101,12 @@ torch::Tensor
     int KBatch = k_batch.has_value() ? k_batch.value() : 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = KBatch > 1 ? N : N / {3 - k.stage}; //gemm1 gate+up need / 2.
+    int stride_C = {"N" if self.is_split_k else f"KBatch > 1 ? N : N / {3 - k.stage}"}; //gemm1 gate+up need / 2; split-k writes raw gate/up.
+    // Split-k partitions run whole K tiles without masking; reject partitions
+    // that would read into the neighboring partition or past K.
+    TORCH_CHECK(KBatch == 1 || K % (KBatch * {k.KPerBlock}) == 0,
+                "{k.name}: K=", K, " must be a multiple of k_batch * KPerBlock = ",
+                KBatch, " * {k.KPerBlock} when k_batch > 1");
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}

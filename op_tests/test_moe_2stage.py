@@ -1271,6 +1271,35 @@ def test_route_workspace_token_capacity():
     aiter.logger.info("moe_2stage: route workspace capacity passed")
 
 
+def _iter_cktile_a16w4_split_k_cases():
+    """Yield strict bf16 x MXFP4 Swiglu cases for the CK-Tile split-k path.
+
+    The CK-Tile split-k gemm1 only handles partitions made of whole 256-wide K
+    tiles; fused_moe must lower split_k (down to 1) when model_dim is not a
+    multiple of split_k * 256. model_dim 256 / 768 need split_k=1, 512 / 1024
+    keep split_k=2. Tokens stay below GPTOSS_SWIGLU_MXFP4_BF16_BOUND (256) so
+    SEPARATED Swiglu keeps bf16 activations.
+    """
+    for model_dim in (256, 512, 768, 1024):
+        for token in (1, 16, 128):
+            yield dict(
+                dtype=dtypes.bf16,
+                token=token,
+                model_dim=model_dim,
+                inter_dim=256,
+                E=8,
+                topk=4,
+                actType=aiter.ActivationType.Swiglu,
+                gateMode=GateMode.SEPARATED.value,
+                qType=aiter.QuantType.per_1x32,
+                AQDType=dtypes.bf16,
+                WQDType=dtypes.fp4x2,
+                use_g1u1=True,
+                strict_accuracy=True,
+                check_aot_cache=False,
+            ), {"model": "cktile_a16w4_split_k"}
+
+
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1481,6 +1510,7 @@ else:
         )
     if not args.no_legacy:
         _case_iters.append(_iter_legacy_cases())
+    _case_iters.append(_iter_cktile_a16w4_split_k_cases())
 case_iter = itertools.chain(*_case_iters)
 
 _csv_out = os.environ.get("AITER_TUNED_OP_BENCH_CSV", "tuned_op_bench.csv")

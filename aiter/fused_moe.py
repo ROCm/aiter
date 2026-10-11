@@ -3886,17 +3886,26 @@ def get_2stage_cfgs(
         _min_split_k = 2 if swiglu_mxfp4_bf16_cktile else 1
         _split_k = max(int(ksplit), _min_split_k)
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
+        # The CK-Tile split-k kernel only handles partitions that are whole
+        # 256-wide K tiles. For the separated-gate path, launch with a valid
+        # k_batch (possibly 1) while keeping the raw-output split-k kernel.
+        _launch_split_k = (
+            _cktile_valid_split_k(model_dim, _split_k)
+            if swiglu_mxfp4_bf16_cktile
+            else _split_k
+        )
         return MOEMetadata(
             functools.partial(
                 cktile_moe_stage1,
                 n_pad_zeros=intermediate_pad // 64 * 64 * (2 if use_g1u1 else 1),
                 k_pad_zeros=hidden_pad // 128 * 128,
                 activation=activation,
-                split_k=_split_k,
+                split_k=_launch_split_k,
                 dtype=dtype,
                 post_activation_layout=(
                     "standard" if swiglu_mxfp4_bf16_cktile else "auto"
                 ),
+                raw_output=swiglu_mxfp4_bf16_cktile,
             ),
             functools.partial(
                 cktile_moe_stage2,
@@ -5029,6 +5038,31 @@ def ck_moe_stage1(
     return out
 
 
+# KPerBlock shared by every A16W4 CK-Tile gemm1 instance.
+_CKTILE_A16W4_K_TILE = 256
+
+# Raw-output split-k gemm1 instances, used when a raw split-k workspace is
+# needed with k_batch == 1. The split-k kernel kind ignores activation and
+# bias, so the bias-free instances match the heuristic split-k choice.
+_CKTILE_A16W4_SPLITK_GEMM1 = {
+    16: "moe_cktile2stages_gemm1_256x16x128x256_1x4_16x16x32_2perCU_1x32_silu_SplitK",
+    32: "moe_cktile2stages_gemm1_256x32x256x256_1x4_16x16x32_2perCU_1x32_silu_SplitK",
+    64: "moe_cktile2stages_gemm1_256x64x256x256_1x4_16x16x32_1perCU_1x32_silu_SplitK",
+}
+
+
+def _cktile_valid_split_k(k, split_k):
+    """Return the split count closest to ``split_k`` whose partitions are
+    whole CK-Tile K tiles. The CK-Tile split-k kernel runs full K tiles per
+    partition without masking, so other counts read the neighboring
+    partition (or past K) and corrupt the result."""
+    if k % _CKTILE_A16W4_K_TILE != 0:
+        return 1
+    k_tiles = k // _CKTILE_A16W4_K_TILE
+    divisors = [d for d in range(1, k_tiles + 1) if k_tiles % d == 0]
+    return min(divisors, key=lambda d: (abs(d - split_k), d))
+
+
 def cktile_moe_stage1(
     hidden_states,
     w1,
@@ -5051,6 +5085,7 @@ def cktile_moe_stage1(
     dtype=torch.bfloat16,
     kernel_name="",
     post_activation_layout="auto",
+    raw_output=False,
 ):
     token_num = hidden_states.shape[0]
     _, _n1, k1 = w1.shape
@@ -5069,7 +5104,15 @@ def cktile_moe_stage1(
         or out.device != hidden_states.device
     ):
         out = torch.empty(expected_out_shape, dtype=dtype, device=hidden_states.device)
-    needs_post_activation = split_k > 1
+    needs_post_activation = split_k > 1 or raw_output
+    if needs_post_activation and split_k == 1 and not kernel_name:
+        # Heuristic dispatch only picks split-k instances for split_k > 1.
+        if dtype != torch.bfloat16 or block_m not in _CKTILE_A16W4_SPLITK_GEMM1:
+            raise ValueError(
+                f"No CK-Tile raw split-k gemm1 instance for k_batch=1 with "
+                f"dtype={dtype}, block_m={block_m}"
+            )
+        kernel_name = _CKTILE_A16W4_SPLITK_GEMM1[block_m]
     # Split-k reduces into a token-topk workspace and applies activation after
     # reduction. Non-split legacy A16W4 keeps CK-Tile's fused gate/up epilogue.
     workspace_rows = token_num * topk
