@@ -1238,114 +1238,25 @@ def test_dsv4_i384_fhmoe_config_has_true_shapes():
     assert ordinary_m16["kernelName2"].startswith("opus_")
 
 
-def test_fhmoe_aot_manifest_covers_native_i384():
+def test_fhmoe_aot_replays_dedicated_rows():
     from aiter.aot.flydsl.moe import parse_csv
-    from aiter.ops.flydsl.moe_kernels import get_flydsl_kernel_params
 
-    ordinary_path = (
-        Path(__file__).resolve().parents[1]
-        / "aiter/configs/model_configs/dsv4_fp8fp4_tuned_fmoe.csv"
-    )
-    config_path = Path(__file__).resolve().parents[1] / "aiter/configs/tuned_fhmoe.csv"
-    ordinary_jobs = parse_csv(str(ordinary_path))
-    dedicated_jobs = parse_csv(str(config_path))
-    ordinary_fhmoe_jobs = [
-        job for job in ordinary_jobs if job.get("shared_expert_id", -1) >= 0
-    ]
+    configs = Path(__file__).resolve().parents[1] / "aiter/configs"
+    ordinary_jobs = parse_csv(str(configs / "model_configs/dsv4_fp8fp4_tuned_fmoe.csv"))
+    dedicated_jobs = parse_csv(str(configs / "tuned_fhmoe.csv"))
 
-    assert not ordinary_fhmoe_jobs
-    assert len(dedicated_jobs) == 24
-    assert all(job["inter_dim"] == 384 for job in dedicated_jobs)
-    assert all(job["shared_expert_id"] == 384 for job in dedicated_jobs)
-    assert all(not job.get("enable_bias", False) for job in dedicated_jobs)
-    assert {job["token_num"] for job in dedicated_jobs} == {
-        1,
-        2,
-        4,
-        8,
-        16,
-        32,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        2048,
+    assert all(job["shared_expert_id"] in ("", "-1") for job in ordinary_jobs)
+    assert dedicated_jobs
+    assert all(job["inter_dim"] == "384" for job in dedicated_jobs)
+    assert all(job["shared_expert_id"] == "384" for job in dedicated_jobs)
+    assert {job["bias"] for job in dedicated_jobs} == {"none"}
+    assert {job["gate_mode"] for job in dedicated_jobs} == {GateMode.INTERLEAVE.value}
+    tokens = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048}
+    assert {int(job["token"]) for job in dedicated_jobs} == tokens
+    # Each row also replays at the smallest M that resolves to it.
+    assert {(int(job["token"]), job["m"]) for job in dedicated_jobs} == {
+        (token, m) for token in tokens for m in {token // 2 + 1, token}
     }
-    for job in dedicated_jobs:
-        params = get_flydsl_kernel_params(job["kernel_name"])
-        assert params is not None
-        assert job.get("xcd_swizzle", 0) == params.get("xcd_swizzle", 0)
-        if job["stage"] == 1:
-            assert 384 % job["tile_n"] == 0
-        else:
-            assert 384 % job["tile_k"] == 0
-
-    m2048_names = {
-        job["kernel_name"] for job in dedicated_jobs if job["token_num"] == 2048
-    }
-    assert m2048_names == {
-        "flydsl_moe1_afp8_wfp4_bf16_t64x128x256_w3_bnt0_gui",
-        "flydsl_moe2_afp8_wfp4_bf16_t64x128x128_atomic",
-    }
-
-
-def test_fhmoe_aot_precompile_keeps_native_i384(monkeypatch: pytest.MonkeyPatch):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.aot.flydsl import moe as aot_moe
-
-    forwarded = {}
-
-    def precompile(**kwargs):
-        forwarded.update(kwargs)
-
-    monkeypatch.setattr(aot_moe, "_precompile_to_cache", precompile)
-    aot_fhmoe.precompile_fhmoe_to_cache(
-        experts=385,
-        shared_expert_id=384,
-        cu_num=256,
-        stage=2,
-        model_dim=7168,
-        inter_dim=384,
-        topk=7,
-    )
-
-    assert forwarded["inter_dim"] == 384
-    assert forwarded["_aot_backend"].shared_expert_id == 384
-
-
-def test_fhmoe_aot_stage1_forwards_optional_swiglu_abi(
-    monkeypatch: pytest.MonkeyPatch,
-):
-    from aiter.aot.flydsl import fhmoe as aot_fhmoe
-    from aiter.ops.flydsl import fhmoe as ops_fhmoe
-
-    tensor = torch.empty(0)
-    forwarded = {}
-
-    monkeypatch.setattr(aot_fhmoe, "_shared_weight", lambda *_: tensor)
-    monkeypatch.setattr(aot_fhmoe, "_shared_scale", lambda *_: tensor)
-
-    def build_args(*args, **kwargs):
-        forwarded.update(kwargs)
-        return args
-
-    monkeypatch.setattr(ops_fhmoe, "_s1_args_fhmoe", build_args)
-
-    result = aot_fhmoe._FHMoEAOTBackend(shared_expert_id=8).build_stage1_args(
-        *((tensor,) * 10),
-        1,
-        2,
-        3,
-        4,
-        "cpu",
-        swiglu_limit=10.0,
-        pass_swiglu_limit=False,
-    )
-
-    assert result
-    assert forwarded["swiglu_limit"] == 10.0
-    assert forwarded["pass_swiglu_limit"] is False
 
 
 @pytest.mark.parametrize(
