@@ -467,3 +467,301 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
     )
 
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def _sparse_prefill_single_source_torch(q, kv, indices, indptr, attn_sink, scale):
+    """Vectorized fp32 reference for one KV pool: pads each row's ragged slot list
+    to the longest row and masks padding and slots outside ``[0, len(kv))``.
+    ``attn_sink=None`` means no sink."""
+    T, H, _ = q.shape
+    lens = (indptr[1:] - indptr[:-1]).long()
+    K = max(int(lens.max().item()), 1)
+    pos = torch.arange(K, device=q.device)
+    in_row = pos[None, :] < lens[:, None]
+    flat = (indptr[:-1].long()[:, None] + pos[None, :]).clamp(
+        max=max(indices.numel() - 1, 0)
+    )
+    slots = torch.where(in_row, indices.long()[flat] if indices.numel() else -1, -1)
+    valid = (slots >= 0) & (slots < kv.shape[0])
+    kv_g = kv.float()[slots.clamp(0, max(kv.shape[0] - 1, 0))]  # [T, K, D]
+    kv_g = kv_g.masked_fill(~valid[..., None], 0.0)  # invalid rows contribute nothing
+    scores = torch.einsum("thd,tkd->thk", q.float(), kv_g) * scale
+    scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
+    if attn_sink is not None:
+        sink = attn_sink.float()[None, :, None].expand(T, H, 1)
+        scores = torch.cat([scores, sink], dim=-1)
+    cmax = scores.amax(dim=-1, keepdim=True)
+    cmax = torch.where(cmax == float("-inf"), torch.zeros_like(cmax), cmax)
+    w = (scores - cmax).exp()
+    w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-30)
+    return torch.einsum("thk,tkd->thd", w[..., :K], kv_g).to(q.dtype)
+
+
+def _inject_invalid_slots(indices, num_kv):
+    """Mark slots invalid in place: 1/8 to -1, 1/32 to exactly num_kv (the
+    first row past the pool) and 1/32 to far past it, up to the int32 max."""
+    n = indices.numel()
+    if not n:
+        return
+    perm = torch.randperm(n, device=indices.device)
+    indices[perm[: n // 8]] = -1
+    indices[perm[n // 8 : n // 8 + n // 32]] = num_kv
+    far = perm[n // 8 + n // 32 : n // 8 + 2 * (n // 32)]
+    indices[far] = torch.randint(
+        num_kv + 1,
+        2**31 - 1,
+        (far.numel(),),
+        dtype=indices.dtype,
+        device=indices.device,
+    )
+
+
+# DSv4.1-Flash TP4: H=16 per rank, D=512, top-512 + 128 SWA = 640 slots.
+# Lengths vary per row so the last BLOCK_K tile is usually partial.
+@pytest.mark.parametrize("T", [37, 2048])
+# H=32 exercises the autotuned launch; H<=16 the gfx942 fixed config.
+@pytest.mark.parametrize("H", [8, 16, 32])
+@pytest.mark.parametrize("max_len", [17, 640])
+@pytest.mark.parametrize("sentinels", [True, False])
+@pytest.mark.parametrize("with_sink", [True, False])
+def test_pa_prefill_sparse_single_source(T, H, max_len, sentinels, with_sink):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+        pytest.skip("covers the Triton single-source branch")
+
+    D = 512
+    torch.manual_seed(0)
+    dev = "cuda"
+    num_kv = 4096
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev) if with_sink else None
+    lens = torch.randint(1, max_len + 1, (T,), device=dev)
+    lens[::7] = 0  # empty rows: output is 0 (sink only)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
+    )
+    if sentinels and indices.numel():
+        _inject_invalid_slots(indices, num_kv)
+        row = int(torch.nonzero(lens >= 32)[0]) if bool((lens >= 32).any()) else None
+        if row is not None:  # a whole leading tile of -1
+            s = int(indptr[row])
+            indices[s : s + 16] = -1
+    scale = D**-0.5
+
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    out = torch.full_like(q, float("nan"))
+    ret = pa_prefill_sparse(
+        q,
+        kv,
+        indices,
+        indptr,
+        None,
+        None,
+        None,
+        sink,
+        scale,
+        out=out,
+    )
+    assert ret is out
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# Head dims other than 512 take the autotuned launch on every arch.
+@pytest.mark.parametrize("D", [128, 576])
+@pytest.mark.parametrize("sentinels", [True, False])
+def test_pa_prefill_sparse_single_source_other_head_dims(D, sentinels):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+        pytest.skip("covers the Triton single-source branch")
+
+    torch.manual_seed(1)
+    T, H, num_kv, dev = 257, 16, 2048, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    lens = torch.randint(1, 200, (T,), device=dev)
+    indptr = torch.zeros(T + 1, dtype=torch.int32, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int32, device=dev
+    )
+    if sentinels:
+        _inject_invalid_slots(indices, num_kv)
+    scale = D**-0.5
+
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+def _triton_branch_only():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if DEVICE_ARCH in ("gfx950", "gfx1250"):
+        pytest.skip("covers the Triton single-source branch")
+
+
+# An empty pool leaves nothing to gather: every query gets the sink-only (zero) output.
+@pytest.mark.parametrize("H", [8, 16])
+def test_pa_prefill_sparse_empty_kv_pool(H):
+    _triton_branch_only()
+    T, D, dev = 64, 512, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.empty(0, D, dtype=torch.bfloat16, device=dev)
+    indptr = torch.arange(0, (T + 1) * 16, 16, dtype=torch.int32, device=dev)
+    indices = torch.full((T * 16,), -1, dtype=torch.int32, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
+    torch.cuda.synchronize()
+    assert torch.equal(out, torch.zeros_like(out))
+
+
+# Strided or overlapping out= buffers would be written wrongly (gfx950 ignores
+# out.stride(2)) or raced on (an expand() over heads), so they are rejected.
+@pytest.mark.parametrize("layout", ["transposed", "expanded_heads"])
+def test_pa_prefill_sparse_rejects_non_contiguous_out(layout):
+    _triton_branch_only()
+    T, H, D = 4, 16, 512
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(8, D, dtype=torch.bfloat16, device="cuda")
+    indptr = torch.arange(0, T + 1, dtype=torch.int32, device="cuda")
+    indices = torch.zeros(T, dtype=torch.int32, device="cuda")
+    if layout == "transposed":
+        out = torch.empty(T, D, H, dtype=q.dtype, device="cuda").transpose(1, 2)
+    else:
+        out = torch.empty(T, 1, D, dtype=q.dtype, device="cuda").expand(T, H, D)
+    with pytest.raises(AssertionError, match="contiguous"):
+        pa_prefill_sparse(
+            q, kv, indices, indptr, None, None, None, None, D**-0.5, out=out
+        )
+
+
+# out= on whichever branch this device takes (Triton fallback, gfx950 or
+# gfx1250 Gluon): the supplied buffer is returned and holds the same result.
+def test_pa_prefill_sparse_out_buffer_every_branch():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    T, H, D = 512, 64, 512
+    two_sources = DEVICE_ARCH == "gfx1250"
+    q, ukv, p_idx, p_indptr, kv, e_idx, e_indptr, sink, scale = _make_inputs(
+        T, H, D, 128, 128 if two_sources else 1, T * 128, T * 128 if two_sources else 1
+    )
+    extend = (kv, e_idx, e_indptr) if two_sources else (None, None, None)
+    ref = pa_prefill_sparse(q, ukv, p_idx, p_indptr, *extend, sink, scale)
+    out = torch.full_like(q, float("nan"))
+    ret = pa_prefill_sparse(q, ukv, p_idx, p_indptr, *extend, sink, scale, out=out)
+    assert ret is out
+    assert torch.equal(out, ref)
+
+
+# int64 index buffers stay int64 on the Triton branch: slots past 2^31 - 1 must
+# be rejected as out of pool, not wrapped into range by an int32 cast.
+@pytest.mark.parametrize("H", [8, 16])
+def test_pa_prefill_sparse_int64_indices(H):
+    _triton_branch_only()
+    torch.manual_seed(3)
+    T, D, num_kv, dev = 512, 512, 4096, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    lens = torch.randint(1, 640, (T,), device=dev)
+    indptr = torch.zeros(T + 1, dtype=torch.int64, device=dev)
+    indptr[1:] = lens.cumsum(0)
+    indices = torch.randint(
+        0, num_kv, (int(indptr[-1]),), dtype=torch.int64, device=dev
+    )
+    n = indices.numel()
+    perm = torch.randperm(n, device=dev)
+    indices[perm[: n // 8]] = -1
+    # int32 casts of these would wrap to 0, 5 and num_kv - 1: valid-looking rows.
+    indices[perm[n // 8 : n // 8 + n // 16]] = 2**32
+    indices[perm[n // 8 + n // 16 : n // 8 + n // 8]] = 2**32 + 5
+    indices[perm[n // 4 : n // 4 + n // 16]] = 2**32 + num_kv - 1
+    scale = D**-0.5
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# The validity check must not rely on num_kv fitting int32. A real pool that
+# large cannot be allocated in a test, so expand one KV row to the full row
+# count (stride 0, no memory): every slot then reads the same row, and with a
+# sink the output still depends on how many slots were accepted,
+#   out = v * n e^s / (n e^s + e^sink),
+# so a negative slot wrongly accepted as valid changes it.
+@pytest.mark.parametrize("num_rows", [2**31 + 5, 2**33])
+def test_pa_prefill_sparse_huge_pool_rejects_negative_slots(num_rows):
+    _triton_branch_only()
+    torch.manual_seed(4)
+    T, H, D, L, dev = 256, 16, 512, 64, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    row = torch.randn(1, D, dtype=torch.bfloat16, device=dev)
+    kv = row.expand(num_rows, D)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    indptr = torch.arange(0, (T + 1) * L, L, dtype=torch.int32, device=dev)
+    indices = torch.randint(0, 2**31 - 1, (T * L,), dtype=torch.int32, device=dev)
+    indices[0::3] = -1
+    indices[1::7] = -(2**31)
+    scale = D**-0.5
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
+
+    n = (indices.view(T, L) >= 0).sum(1).float()[:, None]  # accepted slots per query
+    s_ = (q.float() @ row.float()[0]) * scale  # [T, H]: every key scores the same
+    m = torch.maximum(s_, sink[None, :])
+    w = n * torch.exp(s_ - m) / (n * torch.exp(s_ - m) + torch.exp(sink[None, :] - m))
+    ref = (w[..., None] * row.float()[0]).to(q.dtype)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# A one-row pool: Triton specializes the integer 1 as a constant.
+def test_pa_prefill_sparse_one_row_pool():
+    _triton_branch_only()
+    T, H, D, dev = 64, 16, 512, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(1, D, dtype=torch.bfloat16, device=dev)
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    indptr = torch.arange(0, (T + 1) * 4, 4, dtype=torch.int32, device=dev)
+    indices = torch.tensor([0, -1, 1, 0] * T, dtype=torch.int32, device=dev)
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# Invalid slots are gathered from row 0 and given zero weight; a non-finite
+# value there must still not reach the output (0 * NaN is NaN in the PV dot).
+@pytest.mark.parametrize("H", [8, 16, 32])
+def test_pa_prefill_sparse_nonfinite_row0_ignored_by_invalid_slots(H):
+    _triton_branch_only()
+    torch.manual_seed(5)
+    T, D, num_kv, dev = 256, 512, 1024, "cuda"
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device=dev)
+    kv = torch.randn(num_kv, D, dtype=torch.bfloat16, device=dev)
+    kv[0, ::2] = float("nan")
+    kv[0, 1::2] = float("inf")
+    sink = torch.randn(H, dtype=torch.float32, device=dev)
+    indptr = torch.arange(0, (T + 1) * 48, 48, dtype=torch.int32, device=dev)
+    indices = torch.randint(1, num_kv, (T * 48,), dtype=torch.int32, device=dev)
+    indices[0::4] = -1
+    indices[1::9] = num_kv + 3
+    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
+    assert torch.isfinite(out).all()
+    torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
+
+
+# An fp8 KV pool is rejected up front with a clear error instead of failing to
+# compile inside tl.dot.
+def test_pa_prefill_sparse_rejects_kv_dtype_mismatch():
+    _triton_branch_only()
+    T, H, D = 4, 16, 512
+    q = torch.randn(T, H, D, dtype=torch.bfloat16, device="cuda")
+    kv = torch.randn(8, D, device="cuda").to(torch.float8_e4m3fnuz)
+    indptr = torch.arange(0, T + 1, dtype=torch.int32, device="cuda")
+    indices = torch.zeros(T, dtype=torch.int32, device="cuda")
+    with pytest.raises(RuntimeError, match="dtype mismatch"):
+        pa_prefill_sparse(q, kv, indices, indptr, None, None, None, None, D**-0.5)
