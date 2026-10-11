@@ -158,7 +158,6 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     ``scale_block=32``: x_scale ``(pad32(M), K//32)`` and w_scale
     ``(N, K//32)`` fp8_e8m0, both in the shuffled m32k4 / n32k4 layout.
     """
-    _lazy_import()
     compute_bound = is_compute_wmma_kernel_name(kernel_name)
     mx32 = scale_block == MX32_BLOCK_K
     if not mx32 and scale_block != BLOCK_K:
@@ -182,9 +181,15 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
         raise RuntimeError(
             f"[FlyDSL gfx1250 mxfp8] K mismatch: A.K={K} vs B.K={WQ.shape[1]}"
         )
-    split_k = max(1, int(split_k))
-    cluster_m = max(1, int(cluster_m))
-    cluster_n = max(1, int(cluster_n))
+    split_k = int(split_k)
+    cluster_m = int(cluster_m)
+    cluster_n = int(cluster_n)
+    if split_k < 1 or not (1 <= cluster_m < 16 and 1 <= cluster_n < 16):
+        raise RuntimeError(
+            "split_k must be positive and cluster dimensions must be 1..15"
+        )
+    if min(M, N, K, tile_m, tile_n, tile_k) < 1:
+        raise RuntimeError("GEMM dimensions and tiles must be positive")
 
     if N % _BLOCK_N != 0 or K % BLOCK_K != 0:
         raise RuntimeError(
@@ -316,6 +321,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
 
     lda = XQ.stride(0)
     ldc = Out.stride(0)
+    _lazy_import()
     torch_stream = torch.cuda.current_stream(device=XQ.device)
     stream = _fx.Stream(torch_stream)
     fused = fused_splitk and _fused_splitk_ok(
@@ -339,7 +345,7 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     partials = (
         None
         if partial_shape is None
-        else torch.empty(partial_shape, dtype=Out.dtype, device=Out.device)
+        else torch.empty(partial_shape, dtype=torch.float32, device=Out.device)
     )
     gemm_out = Out if partials is None else partials
     out_is_f16 = 1 if out_dtype == "f16" else 0
@@ -409,13 +415,15 @@ def _run_mxfp8_bpreshuffle_gemm_a8_gfx1250(
     if partials is not None and not fused:
         dense = ldc == N
         _run_compiled(
-            _compile_splitk_reduce(split_k=split_k, out_dtype_str=out_dtype),
+            _compile_splitk_reduce(
+                split_k=split_k, out_dtype_str=out_dtype, partial_dtype_str="f32"
+            ),
             _ptr_arg(partials),
             _ptr_arg(Out),
             M * N if dense else N,
             1 if dense else M,
             ldc,
-            M * ldc * Out.element_size(),
+            M * ldc * partials.element_size(),
             stream,
         )
     return Out

@@ -75,7 +75,7 @@ def launch_gemm_a8w8_256x256(
         (128, 256, 128, 2, 2, 3),
     ), "only the tuned 2x2-wave profiles are supported"
     assert (
-        cluster_m >= 1 and cluster_n >= 1 and 1 < cluster_m * cluster_n <= 16
+        1 <= cluster_m < 16 and 1 <= cluster_n < 16 and 1 < cluster_m * cluster_n <= 16
     ), f"cluster_m*cluster_n must be 2..16, got {cluster_m}x{cluster_n}"
     assert split_k in (1, 2, 4, 8), f"split_k must be 1/2/4/8, got {split_k}"
     assert (
@@ -138,7 +138,11 @@ def launch_gemm_a8w8_256x256(
     PLANAR_SB_BASE = PLANAR_SA_BASE + num_buffers * STAGE_SA
     PLANAR_END = PLANAR_SB_BASE + num_buffers * STAGE_SB
 
-    ARENA_B = max(PLANAR_END, tile_m * C_LDS_ROW * 2)
+    partial_elem = (
+        fx.Float32 if split_k > 1 else (fx.Float16 if out_is_f16 else fx.BFloat16)
+    )
+    partial_bytes = 4 if split_k > 1 else 2
+    ARENA_B = max(PLANAR_END, tile_m * C_LDS_ROW * partial_bytes)
     # The compile target, not the host: AOT cross-compiles these gfx1250
     # kernels under FLYDSL_GPU_ARCH, which get_rocm_arch() honours.
     arch = get_rocm_arch().split(":", 1)[0]
@@ -981,10 +985,10 @@ def launch_gemm_a8w8_256x256(
                 )
             for wn in range_constexpr(wmma_n_rep):
                 col_rel = wnb + wn * 16 + kgrp * 8
-                h = accs[wm * wmma_n_rep + wn].to(oc)
+                h = accs[wm * wmma_n_rep + wn].to(partial_elem)
                 fx.ptr_store(
                     h.bitcast(fx.Int8),
-                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * 2,
+                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * partial_bytes,
                 )
         workgroup_barrier(use_cluster=False)
         c_off_rt = c_off_rt_out = blk_m64 * ldc64 + blk_n64
@@ -997,7 +1001,7 @@ def launch_gemm_a8w8_256x256(
         elif const_expr(split_k > 1):
             c_off_rt = c_off_rt + fx.Int64(split_idx) * fx.Int64(i32_m) * ldc64
         gC_base = fx.recast_iter(
-            fx.PointerType.get(oc.ir_type, arg_c.address_space),
+            fx.PointerType.get(partial_elem.ir_type, arg_c.address_space),
             arg_c,
         )
         if const_expr(cluster_splitk):
@@ -1035,7 +1039,7 @@ def launch_gemm_a8w8_256x256(
             fx.copy(
                 atomC,
                 _view(
-                    fx.recast_iter(oc, base_ptr),
+                    fx.recast_iter(partial_elem, base_ptr),
                     (tile_m, C_LDS_ROW),
                     (C_LDS_ROW, 1),
                 ),
