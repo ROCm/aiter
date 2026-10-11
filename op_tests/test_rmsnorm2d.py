@@ -2,12 +2,16 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import os
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
 
 import aiter
+import aiter.ops.rmsnorm as rmsnorm_ops
 from aiter import dtypes
+from aiter.jit.utils import chip_info
 from aiter.test_common import checkAllclose, perftest
 
 
@@ -158,6 +162,32 @@ def test_rmsnorm2d_fuseAdd_deterministic(dtype, m, n, runs=5):
             ), f"[deterministic] dim: {(m, n)}, {bad_rows} rows differ"
 
 
+def test_rmsnorm2d_tail_dispatch_follows_device():
+    """GPU_ARCHS names the build target. A gfx1250 device keeps rows with N % 8 != 0
+    off the HIP kernel whatever GPU_ARCHS says."""
+    x = torch.empty((1, 1002), dtype=dtypes.bf16)
+    old_archs = os.environ.get("GPU_ARCHS")
+    os.environ["GPU_ARCHS"] = "gfx942"
+    chip_info.get_gfx.cache_clear()
+    chip_info.get_gfx_custom_op_core.cache_clear()
+    try:
+        for device, hip in (("gfx1250", False), ("gfx942", True)):
+            with mock.patch.object(
+                rmsnorm_ops, "get_gfx_runtime", return_value=device, create=True
+            ):
+                assert rmsnorm_ops._use_hip_common(x, 0) == hip, (
+                    f"[tail dispatch] device {device}, GPU_ARCHS=gfx942: "
+                    f"expected {'HIP' if hip else 'opus'}"
+                )
+    finally:
+        if old_archs is None:
+            os.environ.pop("GPU_ARCHS", None)
+        else:
+            os.environ["GPU_ARCHS"] = old_archs
+        chip_info.get_gfx.cache_clear()
+        chip_info.get_gfx_custom_op_core.cache_clear()
+
+
 # for dtype in [dtypes.fp16, dtypes.bf16]:
 #     for m in [1, 2, 4, 8, 16, 32, 64, 128, 256]:
 #         for n in [4096, 8192, 16384, 32768, 65536]:
@@ -217,6 +247,7 @@ for dtype in l_dtype:
             test_rmsnorm2d_fuseAdd(dtype, m, n)
 
 print("\nstart row tail and determinism tests")
+test_rmsnorm2d_tail_dispatch_follows_device()
 for dtype in [d for d in l_dtype if d in (dtypes.fp16, dtypes.bf16)]:
     for m in [1, 64]:
         for n in [1002, 4094, 8190]:

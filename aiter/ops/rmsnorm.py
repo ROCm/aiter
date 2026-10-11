@@ -5,7 +5,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from ..jit.utils.chip_info import get_gfx
+from ..jit.utils.chip_info import get_gfx_runtime
 from ..jit.utils.torch_guard import torch_compile_guard
 from .quant import get_dtype_max
 
@@ -399,7 +399,7 @@ def _use_hip_common(input: Tensor, use_model_sensitive_rmsnorm: int) -> bool:
         and input.dim() == 2
         and input.element_size() == 2
         and input.shape[-1] <= 8192
-        and (input.shape[-1] % 8 == 0 or get_gfx() != "gfx1250")
+        and (input.shape[-1] % 8 == 0 or get_gfx_runtime() != "gfx1250")
     )
 
 
