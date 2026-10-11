@@ -26,6 +26,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     _DTYPE_SHORT,
+    W_SCALE_BLOCKS,
     make_kernel_name,
 )
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
@@ -80,12 +81,14 @@ def _scale_mma_atoms(a_dtype, b_dtype):
     }
 
 
-def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair):
+def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair, num_rows=None):
     """Preshuffled B view for one N-row tile; index [l//16, l%16, kt, half, p, None] -> i32[4].
 
     `pair` = K0 blocks per 128-K MFMA: 1 for fp4 B (one i32[4]), 2 for fp8 B (lo/hi halves
     packed into i32[8] by load_b). K0 blocks (256 i32 each) run contiguously along K as
     ((kt*k_halves + kh)*pair + p); the fp4 case keeps a size-1 `p` dim (byte-identical view).
+    `num_rows` (B's N) bounds the buffer to the tensor's end, for a half-step K
+    whose last block runs past the row tile.
     """
     col_base = rocdl.readfirstlane(T.i32, row_elems * KH4)
     i32_ptr_ty = fx.PointerType.get(
@@ -96,7 +99,10 @@ def _bq_view(arg_bq_addr, row_elems, KH4, k_tiles, k_halves, pair):
     shape = (4, 16, k_tiles, k_halves, pair, 4)
     strides = (64, 4, k_halves * pair * 256, pair * 256, 256, 1)
     view = fx.Tensor(fx.make_view(base_iter, fx.make_layout(shape, strides)))
-    return fx.rocdl.make_buffer_tensor(view, max_size=False)
+    if num_rows is None:
+        return fx.rocdl.make_buffer_tensor(view, max_size=False)
+    nrec = fx.Int64(fx.Int32(num_rows) - row_elems) * fx.Int64(KH4 * 4)
+    return fx.rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=nrec)
 
 
 @flyc.jit
@@ -129,7 +135,7 @@ def _launch_gemm_impl(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    w_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
@@ -140,15 +146,19 @@ def _launch_gemm_impl(
     the [M,B,*] mbn layout. waves_per_eu<=0 = unset.
     """
     BM, BN, BK = tile_m, tile_n, tile_k
+    _wsb = W_SCALE_BLOCKS[w_scale_block]
+    _bs_a, _bs_b, _bs_bk = _wsb.bs_a, _wsb.bs_b, _wsb.bs_bk
     small_m_bf16 = (
         BM == 16
-        and blockscale != "none"
         and out_dtype == "bf16"
         and batch == 1
         and c_row_stride < 0
         and c_batch_stride < 0
     )
     splitk_fused = small_m_bf16 and k_batch > 1 and BN <= 128
+    packed_row_store = (
+        small_m_bf16 and not multi_row_tile and (k_batch == 1 or splitk_fused)
+    )
     if const_expr(out_dtype == "bf16"):
         out_elem = BFloat16
     else:
@@ -177,7 +187,16 @@ def _launch_gemm_impl(
     else:  # fp4
         b_row_bytes, B_NDW, B_BLK_PER_MMA = K // 2, 4, 1
     KH4 = b_row_bytes // 4  # i32 per N-row in preshuffled B (== (K//2)//4 for fp4)
-    K_TILES = K // BK
+    # K = 64 mod 128 (32-wide scales only) ends in a half MFMA step: the last
+    # K-tile's upper 64 K run past the row, so A's hi half is zeroed there and B
+    # is bounded to its tensor (reads past it return 0). fits_shape keeps it to
+    # fp8 A, tile_k=128 and one split.
+    half_tail = K % BK != 0
+    if half_tail:
+        assert (
+            K % BK == 64 and BK == 128 and k_batch == 1 and a_dtype == "fp8"
+        ), f"half-step K={K} needs fp8 A, tile_k=128 and no split-K"
+    K_TILES = -(-K // BK)
     # split-K (k_batch>1): each grid.z split reduces k_tiles_local = K_TILES//k_batch
     # K-tiles. The M<=16 BF16 specialization writes a compact BF16 workspace and
     # reduces it in the last-arriving GEMM block; other variants write fp32 partial
@@ -194,16 +213,11 @@ def _launch_gemm_impl(
     num_acc_n = (BN // num_waves) // 16  # 16-col n-subblocks per wave
     _scale_chunk_dw = ((K + 255) // 256) * 64  # e8m0 stride in dwords
     _scale_k0_dw = 64
-    # blockscale (A 1x128 / B 128x128): feed the coarse scale to the 1x32 MFMA by
-    # broadcasting in the load ADDRESS. A drops K_Lane(4); B drops K_Lane*N_Lane(64)
-    # and reads one word per 128-N-block (nsb//4).
-    _bs_a = blockscale in ("a", "ab")
-    _bs_b = blockscale in ("b", "ab")
-    _sc_k0_a = 16 if _bs_a else 64  # per-256K-chunk dword stride (A: drop K_Lane=4)
-    _sc_k0_b = 1 if _bs_b else 64  # (B: drop K_Lane*N_Lane=64)
+    _sc_k0_a = _wsb.dw_a  # per-256K-chunk dword stride (A: drop K_Lane=4 if bs_a)
+    _sc_k0_b = _wsb.dw_b  # (B: drop N_Lane=16 if bs_b, and K_Lane=4 if bs_bk)
     _scale_chunk_dw_a = ((K + 255) // 256) * _sc_k0_a
     _scale_chunk_dw_b = ((K + 255) // 256) * _sc_k0_b
-    _b_sc_rows = (N // 128) if _bs_b else (N // 32)  # B scale super-rows
+    _b_sc_rows = N // _wsb.b_rows  # B scale super-rows
     a_copy_granularity = num_threads * 16
     assert A_LDS_B % a_copy_granularity == 0, (
         f"A_LDS_B ({A_LDS_B}B) must be divisible by num_threads*16 "
@@ -240,7 +254,7 @@ def _launch_gemm_impl(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        w_scale_block,
     )
     if splitk_fused:
         _kname += "_fused_reduce"
@@ -482,7 +496,15 @@ def _launch_gemm_impl(
 
         n_col_base = by_n + wave * (BN // num_waves)
         bq_views = [
-            _bq_view(arg_b, n_col_base + ni * 16, KH4, K_TILES, k_halves, B_BLK_PER_MMA)
+            _bq_view(
+                arg_b,
+                n_col_base + ni * 16,
+                KH4,
+                K_TILES,
+                k_halves,
+                B_BLK_PER_MMA,
+                N if half_tail else None,
+            )
             for ni in range_constexpr(num_acc_n)
         ]
         b_copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), 32)
@@ -522,16 +544,22 @@ def _launch_gemm_impl(
         )
         a_sc_base = [(bx_m // 32 + mp) * sca_rstride for mp in range_constexpr(m_pairs)]
         nsb = (by_n + wave * (BN // num_waves)) // 32
-        # B blockscale: 4 consecutive 32-N super-rows share one 128-N block scale.
+        _b_grp = _wsb.b_rows // 32  # 32-N super-rows sharing one B scale word
         b_sc_base = [
-            ((nsb + np) // 4 if _bs_b else (nsb + np)) * _scale_chunk_dw_b
+            ((nsb + np) // _b_grp) * _scale_chunk_dw_b
             for np in range_constexpr(n_pairs)
         ]
         sc_lane = lane_div_16 * 16 + lane_mod_16
-        # blockscale drops broadcast dims from the per-lane offset: A drops K_Lane
-        # (lane_div_16); B drops K_Lane + N_Lane (all lanes read one word).
+        # A coarse block drops its broadcast dims from the per-lane offset: A 1x128
+        # drops K_Lane (lane_div_16); B 32x32 drops N_Lane (lane_mod_16), B 128x128
+        # drops both (all lanes read one word).
         sc_lane_a = lane_mod_16 if _bs_a else sc_lane
-        sc_lane_b = fx.Int32(0) if _bs_b else sc_lane
+        if const_expr(_bs_b and _bs_bk):
+            sc_lane_b = fx.Int32(0)
+        elif const_expr(_bs_b):
+            sc_lane_b = lane_div_16
+        else:
+            sc_lane_b = sc_lane
 
         n_acc = m_chunks * num_acc_n
 
@@ -584,11 +612,12 @@ def _launch_gemm_impl(
                 )[0]
                 for mp in range_constexpr(m_pairs)
             ]
-            # blockscale B: a wave's N-span lies in one 128-N block (per-wave N =
-            # BN//num_waves <= 128, block-aligned), so every n_pair reads the SAME
-            # word -> load once and reuse instead of n_pairs redundant loads.
+            # coarse-N B: when a wave's N-span lies in one b_rows block (per-wave
+            # N = BN//num_waves <= b_rows, block-aligned), every n_pair reads the
+            # SAME word -> load once and reuse instead of n_pairs redundant loads.
+            _wave_n = BN // num_waves
             _bs_b_dedup = (
-                _bs_b and (BN // num_waves) <= 128 and (128 % (BN // num_waves) == 0)
+                _bs_b and _wave_n <= _wsb.b_rows and (_wsb.b_rows % _wave_n == 0)
             )
             if const_expr(_bs_b_dedup):
                 _sb0 = Vec(
@@ -685,6 +714,17 @@ def _launch_gemm_impl(
             chunk_kt = kt if tiles_per_chunk == 1 else kt // tiles_per_chunk
             scale_shift = None if tiles_per_chunk == 1 else (kt % tiles_per_chunk) * 16
             av = read_a(cur)
+            if const_expr(half_tail):
+                # The last K-tile's upper 64 K are the next row's bytes: zero A's
+                # hi half there (0 or -1 mask) so they contribute nothing.
+                hi_keep = (kt == fx.Int32(K_TILES - 1)).select(
+                    fx.Int32(0), fx.Int32(-1)
+                )
+                for t in av:
+                    v = Vec(fx.memref_load_vec(t))
+                    lo = v.shuffle(v, [0, 1, 2, 3])
+                    hi = v.shuffle(v, [4, 5, 6, 7]) & hi_keep
+                    t.store(lo.shuffle(hi, list(range(A_NDW))))
             bv = load_b(kt)
             sa_v, sb_v = load_sc(chunk_kt)
             dma_a_to_lds(pf_kt, nxt)  # A DMA after B/scale loads -> overlaps the MFMAs
@@ -754,15 +794,13 @@ def _launch_gemm_impl(
             ),
             fx.make_layout(1, 1),
         )
-        if const_expr(
-            (k_batch > 1 and not splitk_fused) or (small_m_bf16 and not multi_row_tile)
-        ):
+        if const_expr((k_batch > 1 and not splitk_fused) or packed_row_store):
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), store_elem)
         else:
             c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), store_elem)
         c_rstride = fx.Int32(c_stride)
         col_w = by_n + wave * (BN // num_waves) + lane_mod_16
-        if const_expr(small_m_bf16 and not multi_row_tile):
+        if const_expr(packed_row_store):
             # Avoid issuing the other 15 rows' masked stores (and their lane
             # exchanges) for the latency-critical single-row specialization.
             for ni in range_constexpr(num_acc_n):
@@ -1040,7 +1078,7 @@ def launch_gemm(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    w_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
 ):
     """Launch the established non-fused GEMM ABI used by existing configs."""
@@ -1073,7 +1111,7 @@ def launch_gemm(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        w_scale_block,
         multi_row_tile,
     )
 
@@ -1108,7 +1146,7 @@ def launch_gemm_fused(
     waves_per_eu: Constexpr[int],
     xcd_swizzle: Constexpr[int],
     k_batch: Constexpr[int] = 1,
-    blockscale: Constexpr[str] = "none",
+    w_scale_block: Constexpr[str] = "1x32",
     multi_row_tile: Constexpr[bool] = False,
 ):
     """Launch the M<=16 split-K GEMM with its fused reduction arguments."""
@@ -1141,7 +1179,7 @@ def launch_gemm_fused(
         waves_per_eu,
         xcd_swizzle,
         k_batch,
-        blockscale,
+        w_scale_block,
         multi_row_tile,
     )
 

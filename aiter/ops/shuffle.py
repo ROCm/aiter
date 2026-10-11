@@ -450,10 +450,15 @@ def shuffle_scale_a16w4(
     )
 
 
-def _pad_kblocks(s: torch.Tensor, K: int) -> tuple[torch.Tensor, int]:
+def _pad_kblocks(
+    s: torch.Tensor, K: int, per_chunk: int = 2
+) -> tuple[torch.Tensor, int]:
+    """Pad the K axis out to whole 256-K chunks of ``per_chunk`` scales each:
+    2 for 128-K granularity (K_Pack), 8 for 32-K (K_Pack x K_Lane)."""
     K1 = (K + 255) // 256
-    if s.shape[-1] < 2 * K1:
-        s = F.pad(s, (0, 2 * K1 - s.shape[-1]), value=0x7F)
+    want = per_chunk * K1
+    if s.shape[-1] < want:
+        s = F.pad(s, (0, want - s.shape[-1]), value=0x7F)
     return s, K1
 
 
@@ -480,22 +485,33 @@ def shuffle_scale_blockscale_a(a_scale: torch.Tensor, K: int) -> torch.Tensor:
     )
 
 
-def shuffle_scale_blockscale_b(b_scale: torch.Tensor, N: int, K: int) -> torch.Tensor:
+def shuffle_scale_blockscale_b(
+    b_scale: torch.Tensor, N: int, K: int, *, block_n: int = 128, block_k: int = 128
+) -> torch.Tensor:
+    """Preshuffle a coarse B scale into (N1, K1, K_Lane, K_Pack, N_Pack) order.
+
+    (128, 128) is the DeepSeek blockscale; (32, 32) keeps the MFMA's native 32-K
+    granularity and broadcasts along N only. Both drop N_Lane and duplicate
+    N_Pack; block_k=128 also collapses the K_Lane dim that block_k=32 keeps.
+    block_n only sets how many 32-row super-rows share a scale, which the kernel
+    resolves in its own addressing.
+    """
+    if 128 % block_k:
+        raise ValueError(f"block_k must divide 128; got {block_k}")
     s = b_scale.view(torch.uint8).contiguous()
-    if s.shape != (N // 128, K // 128):
+    if s.shape != (N // block_n, K // block_k):
         raise ValueError(
-            f"blockscale b_scale must be (N//128, K//128)=({N // 128}, {K // 128}); "
-            f"got {tuple(b_scale.shape)}"
+            f"blockscale b_scale must be (N//{block_n}, K//{block_k})="
+            f"({N // block_n}, {K // block_k}); got {tuple(b_scale.shape)}"
         )
-    s, K1 = _pad_kblocks(s, K)
+    k_lane = 128 // block_k  # 1 for 128-K granularity, 4 for 32-K
+    s, K1 = _pad_kblocks(s, K, per_chunk=2 * k_lane)
     from aiter.utility import dtypes
 
+    # (N1, K1, K_Pack, K_Lane) -> (N1, K1, K_Lane, K_Pack), then duplicate N_Pack.
+    s = s.view(N // block_n, K1, 2, k_lane).permute(0, 1, 3, 2)
     return (
-        s.view(N // 128, K1, 2, 1)
-        .expand(N // 128, K1, 2, 2)
-        .contiguous()
-        .view(-1)
-        .view(dtypes.fp8_e8m0)
+        s.unsqueeze(-1).expand(*s.shape, 2).contiguous().view(-1).view(dtypes.fp8_e8m0)
     )
 
 
