@@ -77,11 +77,13 @@ def compile_pa_decode_ps_reduce(
     bounded_plan_logits: bool = False,
     vectorize_plan_logits: bool = False,
     compact_plan: bool = False,
+    parallel_d256: bool = False,
 ):
     """Build PA decode's partitioned-softmax reducer.
 
     D128/NP>64 shares weights in LDS unless ``compact_plan`` selects
-    a two-wave CTA. Other shapes stay register-only.
+    a two-wave CTA. ``parallel_d256`` selects the same LDS reducer for D256
+    with NP>64 and four partition groups. Other shapes stay register-only.
     Sinks are per-head zero-value logits: include them in the shared maximum
     for stability and add their denominator mass once after summing KV.
     ``query_group_size`` is None for runtime GQA, or a matching positive value.
@@ -113,6 +115,8 @@ def compile_pa_decode_ps_reduce(
         )
     if compact_plan and (head_size != 128 or max_context_partition_num <= 64):
         raise ValueError("compact_plan requires a planned D128 reducer with NP>64")
+    if parallel_d256 and (head_size != 256 or max_context_partition_num <= 64):
+        raise ValueError("parallel_d256 requires a D256 reducer with NP>64")
     static_query_group_size = query_group_size
     planned_elements_per_thread = 2 if vectorize_plan_logits else 1
 
@@ -131,12 +135,16 @@ def compile_pa_decode_ps_reduce(
         offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
     ]
 
+    # D256 has four head waves; four partition groups stay within 1024 threads.
     use_parallel_lds = (
         head_size == 128 and max_context_partition_num > warp_size and not compact_plan
-    )
+    ) or parallel_d256
     parallel_groups = 1
     if use_parallel_lds:
-        parallel_groups = 2 if max_context_partition_num <= 96 else 8
+        if parallel_d256:
+            parallel_groups = 4
+        else:
+            parallel_groups = 2 if max_context_partition_num <= 96 else 8
     head_waves = head_size // warp_size
     worker_waves = head_waves * parallel_groups
     block_shape = (
@@ -546,17 +554,20 @@ def compile_pa_decode_ps_reduce(
             if group_in_range:
                 for local_part in fx.range_constexpr(parts_per_group):
                     part_idx = group_part_begin + fx.Int32(local_part)
-                    if part_idx < c_part_num:
-                        weight = fx.Float32(lds_weights[part_idx])
-                        logits_offset = (
-                            logits_seq_offset
-                            + kv_head_idx * stride_logits_head
-                            + part_idx * stride_logits_part
-                            + eqgs_idx * stride_logits_group
-                            + output_element
-                        )
-                        part_logits = fx.Float32(logits[logits_offset])
-                        acc = acc + part_logits * weight
+                    # Clamp and select instead of branching so the partition
+                    # loads are not serialized by a per-partition branch.
+                    part_in_range = part_idx < c_part_num
+                    safe_part_idx = part_in_range.select(part_idx, zero_i)
+                    weight = fx.Float32(lds_weights[safe_part_idx])
+                    logits_offset = (
+                        logits_seq_offset
+                        + kv_head_idx * stride_logits_head
+                        + safe_part_idx * stride_logits_part
+                        + eqgs_idx * stride_logits_group
+                        + output_element
+                    )
+                    part_logits = fx.Float32(logits[logits_offset])
+                    acc = acc + part_in_range.select(part_logits * weight, zero_f)
 
             if partition_group > zero_i:  # noqa: SIM102 - Preserve FlyDSL branches.
                 if group_in_range:

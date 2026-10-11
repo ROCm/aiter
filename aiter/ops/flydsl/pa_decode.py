@@ -118,6 +118,7 @@ def launch_pa_decode_ps_reduce(
             and exp_sums.ndim == 3
             and exp_sums.shape[1] <= 32 * output.shape[0]
         ),
+        parallel_d256=head_size == 256 and context_partition_num > 64,
     )
     sink_ptr = (
         ptr_arg(sink_token, _flydsl_pointer_dtype(sink_token.dtype))
