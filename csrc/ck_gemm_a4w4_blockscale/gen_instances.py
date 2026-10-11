@@ -275,9 +275,16 @@ def get_tune_dict(tune_dict_csv):
         # apply the same filter here so the CK codegen sees only CK rows and
         # build_tune_dict's strict validation stays effective on genuine CK
         # references.  FlyDSL decode rows ("flydsl_*") are likewise dispatched
-        # in Python and are not in the CK registry.
+        # in Python and are not in the CK registry, and so are Triton split-K
+        # rows ("triton_*").
         names = df["kernelName"].astype(str)
-        df = df[~(names.str.startswith("_ZN") | names.str.startswith("flydsl_"))]
+        df = df[
+            ~(
+                names.str.startswith("_ZN")
+                | names.str.startswith("flydsl_")
+                | names.str.startswith("triton_")
+            )
+        ]
         return build_tune_dict(
             df,
             default_kernels_dict,
