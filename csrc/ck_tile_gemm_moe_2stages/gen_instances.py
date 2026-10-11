@@ -39,6 +39,7 @@ class cktile_moe_2stage_gemm_codegen:
         activation,
         mul_routed_weight_stage,
         is_split_k,
+        has_bias,
         istune=False,
     ):
         self.working_path = working_path
@@ -54,6 +55,7 @@ class cktile_moe_2stage_gemm_codegen:
         self.c_dtype = c_dtype.lower()
         self.quant_type = quant_type
         self.is_split_k = is_split_k
+        self.has_bias = has_bias
         self.activation = act_dict[activation]
         self.mul_routed_weight_stage = mul_routed_weight_stage
 
@@ -283,7 +285,7 @@ template torch::Tensor
                 "(acc_data_type)": dtype_dict[self.acc_dtype],
                 "(c_data_type)": dtype_dict[self.c_dtype],
                 "(activation)": self.activation,
-                "(has_bias)": "true" if self.activation == 2 else "false",
+                "(has_bias)": "true" if self.has_bias else "false",
                 "(split_k)": "true" if self.is_split_k else "false",
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
@@ -647,10 +649,11 @@ if __name__ == "__main__":
     # for name-based dispatch header generation
     name_lookup_entries = []
 
-    for a_type, c_dtype, act_type, is_split_k in itertools.product(
-        a_types, c_dtypes, act_types, is_split_k_l
+    for a_type, c_dtype, act_type, is_split_k, has_bias in itertools.product(
+        a_types, c_dtypes, act_types, is_split_k_l, (False, True)
     ):
-        has_bias = act_type == "swiglu"
+        if act_type != "swiglu" and has_bias:
+            continue
 
         # a8w8 do not support
         if a_type in ["fp8", "bf8"] and is_split_k:
@@ -664,6 +667,7 @@ if __name__ == "__main__":
             act_type,
             2,
             is_split_k,
+            has_bias,
             False,
         )
         # gen all instances for gemm1 and gemm2
