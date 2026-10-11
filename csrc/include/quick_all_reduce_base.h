@@ -50,11 +50,10 @@ static constexpr int kTileSize = kBlockSize * kAtoms * sizeof(int32x4_t);
 // Max number of blocks. 304 CUs on MI300
 static constexpr int kMaxNumBlocks = 304 * 4;
 
-// Standard CDNA wavefront size.
-static constexpr int kWavefront = 64;
-
-// 256 thread, 4 wavefronts.
-static dim3 constexpr kBlockTwoShot = {kWavefront, kBlockSize / kWavefront, 1};
+// Keep launch geometry architecture-independent. Device code derives its
+// linear thread id from blockDim.x, so this works for wave32 and wave64.
+static constexpr int kBlockX        = 64;
+static dim3 constexpr kBlockTwoShot = {kBlockX, kBlockSize / kBlockX, 1};
 
 // Number of threads in a group for quantization
 // It corresponds to 32 F16 elements in quantization block
@@ -341,7 +340,8 @@ __quickreduce_device_inline__ float T2float_cast(__hip_bfloat16 a) { return __bf
 template <typename T>
 __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
 {
-    const int group_leader = (threadIdx.x / kThreadGroupSize) * kThreadGroupSize;
+    const int lane         = threadIdx.x % warpSize;
+    const int group_leader = (lane / kThreadGroupSize) * kThreadGroupSize;
 
     int wmax, wmin, wblockmax;
     int a, b;
@@ -374,12 +374,20 @@ __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
 
 __quickreduce_device_inline__ void set_sync_flag(uint32_t* flag_ptr, uint32_t flag)
 {
+#if defined(__gfx1250__)
+    __scoped_atomic_store_n(flag_ptr, flag, __ATOMIC_RELEASE, __MEMORY_SCOPE_SYSTEM);
+#else
     __atomic_store_n(flag_ptr, flag, __ATOMIC_RELEASE);
+#endif
 }
 
 __quickreduce_device_inline__ void wait_sync_flag(uint32_t* flag_ptr, uint32_t flag)
 {
+#if defined(__gfx1250__)
+    while(__scoped_atomic_load_n(flag_ptr, __ATOMIC_ACQUIRE, __MEMORY_SCOPE_SYSTEM) != flag) {}
+#else
     while(__atomic_load_n(flag_ptr, __ATOMIC_RELAXED) != flag) {}
+#endif
 }
 
 } // namespace aiter
