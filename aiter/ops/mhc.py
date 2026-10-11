@@ -113,6 +113,29 @@ def mhc_pre_big_fuse_rmsnorm(
 ) -> None: ...
 
 
+@compile_ops("module_mhc", develop=True)
+def mhc_pre_big_fuse_rmsnorm_quant(
+    post_mix: Tensor,
+    comb_mix: Tensor,
+    out: Tensor,
+    quant_out: Tensor,
+    quant_scale: Tensor,
+    gemm_out_mul: Tensor,
+    gemm_out_sqrsum: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    residual: Tensor,
+    norm_weight: Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    norm_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    res_preshuffle: int = 0,
+) -> None: ...
+
+
 # Pre-shuffled residual layout selected independently with res_preshuffle=1
 # (kernel-side tile width: mhc_res_ks).
 #   resS[k // KS][head][row][k % KS]  <-  res[row][head][k]
@@ -704,6 +727,111 @@ def mhc_pre(
     return post_mix, comb_mix, layer_input
 
 
+MHC_PRE_RMSNORM_QUANT_GFX950_M = (
+    1024,
+    2048,
+    4096,
+    8192,
+    16384,
+    32768,
+    65536,
+    131072,
+)
+
+
+def mhc_pre_quant_fake(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-6,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    m, hc_mult, hidden_size = residual.shape
+    device = residual.device
+    return (
+        torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.fp8, device=device),
+        torch.empty(m, 1, dtype=dtypes.fp32, device=device),
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_pre_quant_fake)
+def mhc_pre_quant(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-6,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    m, hc_mult, hidden_size = residual.shape
+    hc_mult3 = fn.size(0)
+    assert m in MHC_PRE_RMSNORM_QUANT_GFX950_M and hc_mult == 4 and hc_mult3 == 24
+    selected_splitk, selected_tile_k = get_mhc_pre_splitk(m, hc_mult * hidden_size)
+    device = residual.device
+    out_pad = torch.empty(
+        selected_splitk,
+        m,
+        (hc_mult3 + 31) // 32 * 32,
+        dtype=dtypes.fp32,
+        device=device,
+    )
+    out = out_pad[:, :, :hc_mult3]
+    sqrsum = torch.empty(selected_splitk, m, dtype=dtypes.fp32, device=device)
+    mhc_pre_gemm_sqrsum(out, sqrsum, residual, fn, selected_tile_k)
+
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    quant_out = torch.empty(m, hidden_size, dtype=dtypes.fp8, device=device)
+    quant_scale = torch.empty(m, 1, dtype=dtypes.fp32, device=device)
+    mhc_pre_big_fuse_rmsnorm_quant(
+        post_mix,
+        comb_mix,
+        layer_input,
+        quant_out,
+        quant_scale,
+        out,
+        sqrsum,
+        hc_scale,
+        hc_base,
+        residual,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        norm_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return post_mix, comb_mix, layer_input, quant_out, quant_scale
+
+
 @compile_ops("module_mhc", fc_name="mhc_post", develop=True)
 def _mhc_post(
     out: Tensor,
@@ -1059,3 +1187,147 @@ def mhc_fused_post_pre(
         )
 
     return post_mix, comb_mix, layer_input_out, next_residual
+
+
+def mhc_fused_post_pre_quant_fake(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-6,
+    w_preshuffle_bf16: bool = True,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    m = layer_input.size(0)
+    hc_mult = residual_in.size(1)
+    hidden_size = residual_in.size(2)
+    device = layer_input.device
+    return (
+        torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device),
+        torch.empty(m, hidden_size, dtype=dtypes.fp8, device=device),
+        torch.empty(m, 1, dtype=dtypes.fp32, device=device),
+        torch.empty_like(residual_in),
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=mhc_fused_post_pre_quant_fake)
+def mhc_fused_post_pre_quant(
+    layer_input: torch.Tensor,
+    residual_in: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    norm_weight: torch.Tensor,
+    rms_eps: float = 1e-6,
+    hc_pre_eps: float = 1e-6,
+    hc_sinkhorn_eps: float = 1e-6,
+    hc_post_mult_value: float = 1.0,
+    sinkhorn_repeat: int = 20,
+    norm_eps: float = 1e-6,
+    w_preshuffle_bf16: bool = True,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Fused mHC post/pre GEMM followed by RMSNorm and per-token FP8 quant.
+
+    This opt-in entry point preserves the existing APIs and is restricted to
+    the validated gfx950 GLM-5.3 prefill cells.
+    """
+    m, hidden_size = layer_input.shape
+    hc_mult = residual_in.size(1)
+    hc_mult3 = fn.size(0)
+    assert get_gfx_runtime() == "gfx950"
+    assert m in MHC_PRE_RMSNORM_QUANT_GFX950_M
+    assert hidden_size == 4096 and hc_mult == 4 and hc_mult3 == 24
+    assert residual_in.shape == (m, hc_mult, hidden_size)
+    assert fn.size(1) == hc_mult * hidden_size
+    if post_layer_mix.ndim == 3:
+        post_layer_mix = post_layer_mix.squeeze(-1)
+    assert post_layer_mix.shape == (m, hc_mult)
+    assert comb_res_mix.shape == (m, hc_mult, hc_mult)
+
+    split_k, tile_m, tile_n, tile_k = get_mhc_fused_post_pre_config(
+        m,
+        hidden_size,
+        w_preshuffle_bf16=w_preshuffle_bf16,
+        res_preshuffle=False,
+    )
+    device = layer_input.device
+    gemm_out_pad = torch.empty(
+        split_k, m, (hc_mult3 + 31) // 32 * 32, dtype=dtypes.fp32, device=device
+    )
+    gemm_out = gemm_out_pad[:, :, :hc_mult3]
+    gemm_out_sqrsum = torch.empty(split_k, m, dtype=dtypes.fp32, device=device)
+    next_residual = torch.empty_like(residual_in)
+    mhc_fused_post_pre_gemm_sqrsum(
+        gemm_out,
+        gemm_out_sqrsum,
+        next_residual,
+        layer_input,
+        residual_in,
+        post_layer_mix,
+        comb_res_mix,
+        fn,
+        tile_m,
+        tile_n,
+        tile_k,
+        w_preshuffle_bf16=int(w_preshuffle_bf16),
+        res_preshuffle=0,
+    )
+
+    post_mix = torch.empty(m, hc_mult, 1, dtype=dtypes.fp32, device=device)
+    comb_mix = torch.empty(m, hc_mult, hc_mult, dtype=dtypes.fp32, device=device)
+    layer_input_out = torch.empty(m, hidden_size, dtype=dtypes.bf16, device=device)
+    quant_out = torch.empty(m, hidden_size, dtype=dtypes.fp8, device=device)
+    quant_scale = torch.empty(m, 1, dtype=dtypes.fp32, device=device)
+    mhc_pre_big_fuse_rmsnorm_quant(
+        post_mix,
+        comb_mix,
+        layer_input_out,
+        quant_out,
+        quant_scale,
+        gemm_out,
+        gemm_out_sqrsum,
+        hc_scale,
+        hc_base,
+        next_residual,
+        norm_weight,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        norm_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
+    return (
+        post_mix,
+        comb_mix,
+        layer_input_out,
+        quant_out,
+        quant_scale,
+        next_residual,
+    )
