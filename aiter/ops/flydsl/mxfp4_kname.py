@@ -1,5 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#
+# Pure mxmoe kernel-name parsing (no torch / JIT deps) so the AOT pre-compile
+# pass can import it without triggering JIT module loads.
+#
+# Name: flydsl_mxmoe_g{1,2}_a4w4_<BM>x<BN>x<BK>[_flag...], lowercase. Shape is in
+# the CSV columns, not the name. g1 flags: f16in (inline act quant), nt (else
+# cached). g2 flags: atomic (else nonatomic), nt (atomic only), f4out / cshuffle.
 
 import re
 
@@ -193,6 +200,8 @@ def parse_g2_kname_any(kname) -> dict:
     return {
         "v2": False,
         "BM": p2["BM"],
+        "BN": p2["BN"],
+        "BK": p2["BK"],
         "atomic": p2["atomic"],
         "use_nt": p2["use_nt"],
         "mxfp4out": p2["mxfp4out"],

@@ -110,6 +110,78 @@ _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "
 kernel_bench_callable = None
 
 
+# Stage1's intermediate is consumed immediately by stage2, so it can be shared
+# across layers. Keyed by stream so overlapping launches stay correct, and by
+# exact shape so graph-baked pointers stay stable.
+_FLYDSL_STAGE1_OUT_CACHE: dict[
+    tuple[torch.device, int, tuple[int, int]], torch.Tensor
+] = {}
+_FLYDSL_STAGE1_FP4_OUT_CACHE: dict[
+    tuple[torch.device, int, tuple[int, int]], torch.Tensor
+] = {}
+
+# Stage2's reduce epilog scratch is [M, topk, D], ~1.9 GiB per layer at
+# M=16384. Shared across layers on the same stream like the stage1 scratch.
+_FLYDSL_STAGE2_REDUCE_TARGET_CACHE: dict[
+    tuple[torch.device, int, tuple, torch.dtype], torch.Tensor
+] = {}
+
+
+def _get_flydsl_stage1_out(
+    shape: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    if os.environ.get("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtypes.fp8, device=device)
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape)
+    out = _FLYDSL_STAGE1_OUT_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtypes.fp8, device=device)
+        _FLYDSL_STAGE1_OUT_CACHE[key] = out
+    return out
+
+
+def _get_flydsl_stage1_fp4_out(
+    shape: tuple[int, int],
+    device: torch.device,
+) -> torch.Tensor:
+    if os.environ.get("AITER_FLYDSL_STAGE1_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtypes.fp4x2, device=device)
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape)
+    out = _FLYDSL_STAGE1_FP4_OUT_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtypes.fp4x2, device=device)
+        _FLYDSL_STAGE1_FP4_OUT_CACHE[key] = out
+    return out
+
+
+def _get_flydsl_stage2_reduce_target(
+    shape: tuple[int, ...],
+    dtype: torch.dtype,
+    device: torch.device,
+) -> torch.Tensor:
+    if os.environ.get("AITER_FLYDSL_STAGE2_SCRATCH_REUSE", "0").lower() not in (
+        "1",
+        "true",
+    ):
+        return torch.empty(shape, dtype=dtype, device=device)
+    stream = torch.cuda.current_stream(device=device).cuda_stream
+    key = (device, stream, shape, dtype)
+    out = _FLYDSL_STAGE2_REDUCE_TARGET_CACHE.get(key)
+    if out is None:
+        out = torch.empty(shape, dtype=dtype, device=device)
+        _FLYDSL_STAGE2_REDUCE_TARGET_CACHE[key] = out
+    return out
+
+
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
 # topk_weights through the sorted_* kernarg slots and accumulate via
 # global_atomic_pk_add_bf16, so moe_sorting is a pass-through for them.
@@ -1981,6 +2053,22 @@ def _flydsl_stage1_wrapper(
         raise ValueError(f"Invalid FlyDSL kernel name: {kernelName}")
     if out_dtype is not None:
         parsed = {**parsed, "out_dtype": out_dtype}
+    if (
+        out is None
+        and v2_output_layout
+        and parsed.get("k_batch", 1) == 1
+        and not (parsed["a_dtype"] == "bf16" and parsed["b_dtype"] == "fp4")
+    ):
+        device = hidden_states.device
+        inter_dim = w1.shape[1] // 2
+        sorted_rows = max(
+            sorted_token_ids.shape[0],
+            sorted_expert_ids.shape[0] * parsed["tile_m"],
+        )
+        if parsed["out_dtype"] == "fp8":
+            out = _get_flydsl_stage1_out((sorted_rows, inter_dim), device)
+        elif parsed["out_dtype"] == "fp4":
+            out = _get_flydsl_stage1_fp4_out((sorted_rows, inter_dim // 2), device)
     if activation == ActivationType.Swiglu:
         act = "swiglu"
     elif activation == ActivationType.Situv2:
@@ -2296,6 +2384,8 @@ def _mxfp4_a4w4_stage2(
     device,
     use_nt=False,
     cshuffle=False,
+    BN=256,
+    BK=256,
     inter_real=None,  # w2.inter_real (unpadded inter for non-256-aligned shards)
 ):
     _xcd2 = _parse_mxfp4_g2_kname(kernelName2).get("xcd_swizzle", 0)
@@ -2339,6 +2429,8 @@ def _mxfp4_a4w4_stage2(
                 D_INTER_REAL=inter_real,
                 topk=topk,
                 xcd_swizzle=_xcd2,
+                BN=BN,
+                BK=BK,
             )
             # scatter_reduce fully overwrites each output row -> write the caller's
             # buffer directly (avoids a redundant (M, D_HIDDEN) D2D copy at the end).
@@ -2388,6 +2480,8 @@ def _mxfp4_a4w4_stage2(
         D_INTER_REAL=inter_real,
         topk=topk,
         xcd_swizzle=_xcd2,
+        BN=BN,
+        BK=BK,
     )
 
     if atomic:
@@ -2473,8 +2567,15 @@ def _mxfp4_a4w4_stage1_fw(
         and a1_scale is not None
     )
     if p1["a_dtype"] == "fp8" or prequantized:
+        # Already quantized: hand the kernel its input directly. This must be
+        # checked before inline_quant, which fp8 a_dtype also sets.
         a_quant = hidden_states
         a_scale = a1_scale
+    elif inline_quant:
+        # gemm1 quantizes straight into LDS; the global staging buffers are unread,
+        # exactly like a_scale_sorted_shuffled in _mxfp4_a4w4_stage1.
+        a_quant = _empty_u8(device)
+        a_scale = _empty_u8(device)
     else:
         a_quant = torch.empty((M, D_HIDDEN // 2), device=device, dtype=torch.uint8)
         a_scale = torch.empty((M, D_HIDDEN // 32), device=device, dtype=torch.uint8)
@@ -2621,6 +2722,8 @@ def _mxfp4_a4w4_stage2_fw(
         device=device,
         use_nt=cfg["use_nt"],
         cshuffle=cfg["cshuffle"],
+        BN=cfg["BN"],
+        BK=cfg["BK"],
         inter_real=inter_real,
     )
 
@@ -2753,7 +2856,7 @@ def _flydsl_v2_stage2_wrapper(
             _fp8_scale_blk = fp8out_scale_blk(model_dim_runtime)
             _fp8_pitch_align = FP8OUT_PITCH_ALIGN
 
-            target = torch.empty(
+            target = _get_flydsl_stage2_reduce_target(
                 (
                     token_num * topk,
                     fp8out_row_bytes(
@@ -2762,14 +2865,14 @@ def _flydsl_v2_stage2_wrapper(
                         pitch_align=_fp8_pitch_align,
                     ),
                 ),
-                dtype=torch.uint8,
-                device=out.device,
+                torch.uint8,
+                out.device,
             )
         else:
-            target = torch.empty(
+            target = _get_flydsl_stage2_reduce_target(
                 (token_num, topk, model_dim_runtime),
-                dtype=out.dtype,
-                device=out.device,
+                out.dtype,
+                out.device,
             )
         if expert_mask is not None:
             # EP sorting omits remote and fake routes, so GEMM2 intentionally
@@ -2850,6 +2953,51 @@ def _flydsl_v2_stage2_wrapper(
             fp8_pitch_align=_fp8_pitch_align,
         )
     return out
+
+
+def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
+    """Why this tuned (g1, g2) pair cannot run at (model_dim, inter_dim), or None.
+
+    The FlyDSL MoE kernels assert their tile/shape divisibility at compile time,
+    deep inside the launcher, which turns a stale or mis-keyed tuned CSV row into
+    a hard crash (during CUDA-graph capture it takes the whole server down). Mirror
+    the host-side checks here so the caller can drop the config and fall back to the
+    default heuristics, the same way ``_opus_a8w4.cfg_is_supported`` does for Opus.
+    """
+    v2 = parse_flydsl_v2_gemm2_kernel(kernelName2)
+    # Native mxmoe gemm1 (mxfp4_gemm1.py): K=model_dim and N_OUT=2*inter_dim
+    # against BN==BK==256.
+    if _is_mxfp4_kname(kernelName1) and (
+        model_dim % 256 != 0 or (2 * inter_dim) % 256 != 0
+    ):
+        return (
+            f"native mxmoe gemm1 {kernelName1!r} needs model_dim % 256 == 0 and "
+            f"2*inter_dim % 256 == 0, got model_dim={model_dim} inter_dim={inter_dim}"
+        )
+    # Native mxmoe gemm2 encodes BN/BK in its name. Kimi-K3 TP8 uses BK=128
+    # because its native inter_dim=384 is not divisible by the legacy BK=256.
+    if _is_mxfp4_kname(kernelName2):
+        p2 = _parse_mxfp4_g2_kname(kernelName2)
+        if p2["BN"] != 256 or p2["BK"] not in (128, 256):
+            return f"native mxmoe gemm2 {kernelName2!r} has unsupported BN/BK"
+        if inter_dim % p2["BK"] != 0:
+            return (
+                f"native mxmoe gemm2 {kernelName2!r} needs inter_dim % "
+                f"{p2['BK']} == 0, got {inter_dim}"
+            )
+    # v2 layout gemm2 (mxmoe_dispatcher.mxfp4_moe_gemm2): K % tile_k and N % tile_n.
+    if v2 is not None:
+        if inter_dim % v2["tile_k"] != 0:
+            return (
+                f"gemm2 {kernelName2!r} needs inter_dim % {v2['tile_k']} == 0, "
+                f"got {inter_dim}"
+            )
+        if model_dim % v2["tile_n"] != 0:
+            return (
+                f"gemm2 {kernelName2!r} needs model_dim % {v2['tile_n']} == 0, "
+                f"got {model_dim}"
+            )
+    return None
 
 
 def _make_mxfp4_metadata(
@@ -3299,6 +3447,20 @@ def get_2stage_cfgs(
                     "using default heuristics"
                 )
 
+    if cfg is not None:
+        shape_reason = _mxmoe_cfg_shape_reason(
+            str(cfg.get("kernelName1", "") or "").strip(),
+            str(cfg.get("kernelName2", "") or "").strip(),
+            model_dim,
+            inter_dim,
+        )
+        if shape_reason is not None:
+            cfg = None
+            logger.warning(
+                f"[fused_moe] discarding tuned config for {keys}: {shape_reason}; "
+                "using default heuristics. The tuned row was most likely written "
+                "for a different inter_dim/model_dim than this runtime shape."
+            )
     bypass_tuned_config = int(os.environ.get("AITER_BYPASS_TUNE_CONFIG", "0"))
     kernel_name1 = kn1 if cfg is not None else ""
     weights_shuffled = (
@@ -3373,7 +3535,6 @@ def get_2stage_cfgs(
             f"[fused_moe] discarding 1-stage tuned config for unsupported "
             f"activation {activation}; using default heuristics"
         )
-
     use_non_temporal_load = False
     if cfg is None or bypass_tuned_config:
         ksplit = 0
@@ -4330,6 +4491,15 @@ def fused_moe_2stages(
         extra_stage1_args["situ_linear_beta"] = (
             25.0 if linear_beta is None else float(linear_beta)
         )
+    elif stage1_func is _mxfp4_a4w4_stage1_fw:
+        if activation == ActivationType.Situv2:
+            extra_stage1_args["activation"] = "situv2"
+            extra_stage1_args["situ_beta"] = 4.0 if beta is None else float(beta)
+            extra_stage1_args["situ_linear_beta"] = (
+                25.0 if linear_beta is None else float(linear_beta)
+            )
+        else:
+            extra_stage1_args["activation"] = "silu"
     # EP: forward expert_mask + topk_ids to the flydsl stage2 wrapper so it can
     # switch to reduce mode and fuse the validity gather in compile_moe_reduction.
     if (
