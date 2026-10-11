@@ -817,6 +817,26 @@ def _mla_softmax_reducev_kernel(
 # fmt: on
 
 
+def bh16_num_kv_splits(batch_size, qlen, num_m_blocks):
+    """Pick the bh16 split-KV launch count for one decode step.
+
+    The budget is ~256 workgroups, independent of sequence length so a CUDA
+    graph cannot freeze a context-specific split. Head blocks and MTP qlen
+    already consume part of that wave.
+
+    qlen >= 8 (DSpark block 7 verifies 8 tokens) re-reads KV once per query
+    position. Dividing the budget by batch_size drops a 3-wide step from 32
+    splits to 10, and a long-context microbenchmark improves from 935 to 886
+    us when it keeps 32. The same floor regresses the 2-wide and 4-wide shapes,
+    so specialize only the 3-wide tail that sets AgentX c4 P90. qlen 4 (block
+    3) stays on the shared budget.
+    """
+    per_step = max(1, 256 // (batch_size * qlen * num_m_blocks))
+    if qlen >= 8 and batch_size == 3:
+        per_step = max(per_step, max(1, 256 // (qlen * num_m_blocks)))
+    return per_step
+
+
 def mla_gluon(
     q_nope,  # [batch, nhead, kv_lora_rank] or MTP [batch, qlen, nhead, kv_lora_rank]
     q_pe,  # [batch, nhead, qk_rope_head_dim] or MTP [batch, qlen, nhead, qk_rope_head_dim]
@@ -949,12 +969,10 @@ def mla_gluon(
         BLOCK_N = 128 if REGIME == "bh16bn128" else 64
         kv_dtype = torch.float8_e4m3fn if REGIME == "bh16bn128" else torch.bfloat16
         NUM_XCDS = 1  # unused by 2-D split grid mapping
-        # Fixed ~256-WG launch budget, independent of sequence length so CUDA
-        # Graph capture cannot freeze it; the kernels derive the per-batch
-        # partition from the runtime KV length. Head blocks and MTP qlen already
-        # consume part of the wave, so the budget divides by them too.
+        # See bh16_num_kv_splits. The kernels still derive the per-batch
+        # partition from the runtime KV length.
         NUM_M_BLOCKS = triton.cdiv(nhead, BLOCK_H)
-        NUM_KV_SPLITS = max(1, 256 // (batch_size * qlen * NUM_M_BLOCKS))
+        NUM_KV_SPLITS = bh16_num_kv_splits(batch_size, qlen, NUM_M_BLOCKS)
         assert (
             q_nope.dtype == torch.bfloat16 and q_pe.dtype == torch.bfloat16
         ), f"q_nope/q_pe must be bf16, got {q_nope.dtype}/{q_pe.dtype}"
