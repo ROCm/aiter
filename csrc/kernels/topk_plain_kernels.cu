@@ -225,18 +225,18 @@ struct ComputeTypeTraits
 {
     static_assert(sizeof(DataT) == 0,
                   "ComputeTypeTraits not specialized for this type. "
-                  "Supported types: _Float16, __bf16, float, int");
+                  "Supported types: fp16, bf16, float, int");
 };
 
 // Specializations for floating-point types -> float
 template <>
-struct ComputeTypeTraits<_Float16>
+struct ComputeTypeTraits<opus::fp16_t>
 {
     using type = float;
 };
 
 template <>
-struct ComputeTypeTraits<__bf16>
+struct ComputeTypeTraits<opus::bf16_t>
 {
     using type = float;
 };
@@ -291,7 +291,8 @@ namespace utils {
 template <typename T>
 struct is_supported_type
 {
-    static constexpr bool value = std::is_same_v<T, _Float16> || std::is_same_v<T, __bf16> ||
+    static constexpr bool value = std::is_same_v<T, opus::fp16_t> ||
+                                  std::is_same_v<T, opus::bf16_t> ||
                                   std::is_same_v<T, float> || std::is_same_v<T, int>;
 };
 
@@ -742,7 +743,7 @@ __forceinline__ __device__ T shfl_xor(T val, int stride)
     }
     else if constexpr(sizeof(T) == 2)
     {
-        // 16-bit types (_Float16, __bf16)
+        // 16-bit types (fp16, bf16)
         unsigned int val_u32      = __builtin_bit_cast(unsigned short, val);
         unsigned int result_u32   = __shfl_xor(val_u32, stride);
         unsigned short result_u16 = static_cast<unsigned short>(result_u32);
@@ -981,9 +982,21 @@ constexpr int MAX_CAPACITY = 2048;
 
 using int32x4_t = int __attribute__((ext_vector_type(4)));
 using floatx4_t = float __attribute__((ext_vector_type(4)));
-using bf16x8_t  = __bf16 __attribute__((ext_vector_type(8)));
-using halfx8_t  = _Float16 __attribute__((ext_vector_type(8)));
+using bf16x8_t  = opus::bf16x8_t;
+using halfx8_t  = opus::fp16x8_t;
 using index_t   = uint32_t;
+
+// llvm.amdgcn.raw.buffer.load's auxiliary cache-policy bits vary by ISA. These
+// are the same values exposed by CK's amd_buffer_coherence_enum::slc, kept
+// local so this torch-free kernel does not acquire a CK source dependency
+// solely for one integer constant.
+#if defined(__GFX12__)
+inline constexpr int raw_buffer_slc_policy = 25;
+#elif defined(__gfx942__) || defined(__gfx950__)
+inline constexpr int raw_buffer_slc_policy = 19;
+#else
+inline constexpr int raw_buffer_slc_policy = 2;
+#endif
 
 __device__ __forceinline__ static int32x4_t
 asm_buffer_load_dwordx4(int32x4_t srsrc,
@@ -1676,7 +1689,7 @@ struct WaveTopkFilter
     {
         static_assert(
             utils::is_supported_type_v<DataT>,
-            "Unsupported type DataT: only _Float16, __bf16, float, and int are implemented");
+            "Unsupported type DataT: only fp16, bf16, float, and int are implemented");
 
         const IdxT n           = end - start;
         const IdxT tid         = threadIdx.x;
@@ -1705,22 +1718,23 @@ struct WaveTopkFilter
     {
         static_assert(
             utils::is_supported_type_v<DataT>,
-            "Unsupported type DataT: only _Float16, __bf16, float, and int are implemented");
+            "Unsupported type DataT: only fp16, bf16, float, and int are implemented");
 
-        constexpr auto cache_policy = ck_tile::amd_buffer_coherence_enum::slc;
+        constexpr auto cache_policy = buffer_load_helpers::raw_buffer_slc_policy;
         const IdxT n                = end - start;
         const IdxT tid              = threadIdx.x;
         const IdxT stride           = blockDim.x;
         constexpr IdxT elements     = 16 / sizeof(DataT);
 
-        if constexpr(std::is_same_v<DataT, _Float16> || std::is_same_v<DataT, __bf16>)
+        if constexpr(std::is_same_v<DataT, opus::fp16_t> ||
+                     std::is_same_v<DataT, opus::bf16_t>)
         {
             constexpr IdxT tile    = elements;
             const IdxT block_tile  = blockDim.x * tile;
             const IdxT end_aligned = start + utils::round_up_to_multiple_of(n, block_tile);
             const IdxT tail        = end_aligned - block_tile;
 
-            using VecType = std::conditional_t<std::is_same_v<DataT, __bf16>,
+            using VecType = std::conditional_t<std::is_same_v<DataT, opus::bf16_t>,
                                                buffer_load_helpers::bf16x8_t,
                                                buffer_load_helpers::halfx8_t>;
 
@@ -2516,12 +2530,12 @@ void topk_per_row_kernel_launcher(const float* in,
         stream);
 }
 
-// Map the hip runtime element type bound by the dispatch macro to the ck_tile
-// element type the kernels expect (torch-free replacement for t2ck).
-template <typename T> struct hip2ck;
-template <> struct hip2ck<float>        { using type = ck_tile::fp32_t; };
-template <> struct hip2ck<__half>       { using type = ck_tile::fp16_t; };
-template <> struct hip2ck<hip_bfloat16> { using type = ck_tile::bf16_t; };
+// Map the HIP runtime element type bound by the torch-free dispatcher to the
+// canonical scalar spelling registered by Opus for this compiler.
+template <typename T> struct hip2opus;
+template <> struct hip2opus<float>        { using type = float; };
+template <> struct hip2opus<__half>       { using type = opus::fp16_t; };
+template <> struct hip2opus<hip_bfloat16> { using type = opus::bf16_t; };
 
 void topk_plain(aiter_tensor_t& values,   // [batch, len]
                 aiter_tensor_t& topk_ids, // [batch, k]
@@ -2555,7 +2569,7 @@ void topk_plain(aiter_tensor_t& values,   // [batch, len]
 
     // Dispatch based on value tensor dtype
     VLLM_DISPATCH_FLOATING_TYPES_rmTorch(values.dtype(), "topk_plain", [&] {
-        using input_dtype = typename hip2ck<scalar_t>::type;
+        using input_dtype = typename hip2opus<scalar_t>::type;
         // Dispatch based on index tensor dtype
         if(topk_ids.dtype() != AITER_DTYPE_i32)
         {
