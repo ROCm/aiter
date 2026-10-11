@@ -14,7 +14,7 @@ import flydsl.expr as fx
 # below. `rocdl.global.load.lds` is the synchronous form and counts in vmcnt,
 # so the existing barrier keeps covering it. Pointers still go through
 # `fx.to_llvm_ptr`, so no address space is hardcoded.
-from flydsl.expr import T, arith, const_expr, range_constexpr, rocdl
+from flydsl.expr import T, const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cvt_pk_f32_fp8
 from flydsl.expr.typing import Vector as Vec
 
@@ -378,9 +378,7 @@ class StoreKV:
                     if const_expr(n_valid < self.lds_half):
                         # Dead columns of the widened part: an index past the
                         # descriptor's last record discards the store.
-                        index = arith.select(
-                            col < n_valid, index, self.m_rows * row_stride
-                        )
+                        index = (col < n_valid).select(index, self.m_rows * row_stride)
                     self._store(vals[i], div, index)
 
     def store_k(self, c_frag, base_row, head, col_base):

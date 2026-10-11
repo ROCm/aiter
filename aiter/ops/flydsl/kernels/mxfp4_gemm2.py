@@ -278,9 +278,9 @@ def compile_gemm2_a4w4_port(
         if const_expr(_persistent):
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
             persist = tw > NUM_CU * 4
-            grid_x = fx.Index(persist.select(fx.Int32(NUM_CU), tw))
+            grid_x = fx.Int64(persist.select(fx.Int32(NUM_CU), tw))
         else:
-            grid_x = fx.Index(i32_max_m_blocks * _num_n_blocks)
+            grid_x = fx.Int64(i32_max_m_blocks * _num_n_blocks)
         gemm2_kernel(
             arg_aq,
             arg_ascale,
