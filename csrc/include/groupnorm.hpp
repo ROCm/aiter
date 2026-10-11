@@ -15,7 +15,9 @@ namespace aiter {
 //   bias:      affine bias   [num_channels], contiguous
 //   epsilon:   numerical stability term
 //
-// Supported dtypes for x/y/weight/bias: fp32, fp16, bf16.
+// Supported dtypes for x/y/weight/bias: fp32, fp16, bf16. These four tensors
+// must have the same dtype. The Python wrapper casts them to fp32 under CUDA
+// autocast to match PyTorch GroupNorm.
 void groupnorm_run(aiter_tensor_t& y,
                    aiter_tensor_t& workspace,
                    const aiter_tensor_t& x,
