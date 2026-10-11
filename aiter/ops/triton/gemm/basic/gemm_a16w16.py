@@ -87,7 +87,8 @@ def gemm_a16w16_(
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
     On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
-    supports TN problems with M, N multiples of 256 and K a multiple of 128.
+    takes a tile of 256, 128 or 64 per side (config BLOCK_M/BLOCK_N, or a default) and
+    needs M, N multiples of the tile and K a multiple of 128.
 
     Args:
         x (torch.Tensor): Input matrix with shape (M, K).
@@ -147,13 +148,19 @@ def gemm_a16w16_(
         N, _ = w.shape
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
+        # The tuner picks the tile per shape through the config; without one the
+        # kernel picks its default (see choose_tile).
+        tile = None
+        if config is not None and "BLOCK_M" in config:
+            tile = (int(config["BLOCK_M"]), int(config["BLOCK_N"]))
         _LOGGER.info(
-            "GEMM_A16W16 [gluon/gfx950]: x=%s w=%s kernel=%s",
+            "GEMM_A16W16 [gluon/gfx950]: x=%s w=%s kernel=%s tile=%s",
             x.shape,
             w.shape,
             kernel_type,
+            tile,
         )
-        return _GFX950_KERNEL_MAP[kernel_type](x, w, y, bias)
+        return _GFX950_KERNEL_MAP[kernel_type](x, w, y, bias, tile=tile)
 
     if persistent:
         assert not skip_reduce, (
@@ -614,7 +621,8 @@ def gemm_a16w16(
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
     On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
-    supports TN problems with M, N multiples of 256 and K a multiple of 128.
+    takes a tile of 256, 128 or 64 per side (config BLOCK_M/BLOCK_N, or a default) and
+    needs M, N multiples of the tile and K a multiple of 128.
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.
     """

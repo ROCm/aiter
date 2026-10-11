@@ -15,21 +15,68 @@ brought the scheduler; ``mfma(..., cd_regclass=)`` (triton-lang/triton#11792) wa
 already there. The tutorial explains every step:
 https://github.com/ROCm/gfx950-gluon-tutorials/tree/main/kernels/gemm/intra_wave/a16w16
 
-The tile is fixed and nothing is masked, so the kernel needs a TN problem (x
-row-major, w row-major (N, K)) with M and N multiples of 256 and K a multiple of 128
-of at least 256. ``unsupported_reason`` says why a problem is outside that.
+The tile is 256x256x64 by default and can be any (BLOCK_M, BLOCK_N) in ``TILES``,
+with BLOCK_K 64; every layout is derived from it. Nothing is masked, so the kernel
+needs a TN problem (x row-major, w row-major (N, K)) with M and N multiples of the
+tile and K a multiple of 128 of at least 256. ``unsupported_reason`` says why a
+problem is outside that, and ``choose_tile`` picks the default tile for a shape.
 """
 
+import functools
+import math
 import os
 
 import torch
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd import cdna4 as ttgl_cdna4
+from triton.runtime.jit import constexpr_function
 
-BLOCK_M, BLOCK_N, BLOCK_K = 256, 256, 64
+BLOCK_K = 64
+# (BLOCK_M, BLOCK_N), largest first; choose_tile keeps this order among equal areas.
+TILES = [
+    (256, 256),
+    (256, 128),
+    (128, 256),
+    (128, 128),
+    (256, 64),
+    (64, 256),
+    (128, 64),
+    (64, 128),
+    (64, 64),
+]
 NUM_WARPS = 4
 NUM_XCDS = 8
 GROUP_SIZE_M = 4
+
+
+@constexpr_function
+def compute_gload_layout(shared_layout, load_contig, num_warps, threads_per_warp=64):
+    """The coalesced global-load linear layout that matches a PaddedSharedLayout.
+
+    Partitions the shared layout's offset bases into register, lane and warp bases so
+    that each warp writes contiguous LDS offsets (what CoalesceAsyncCopy derives for a
+    padded encoding). At 256x256x64 this reproduces the tutorial's hand-written
+    layouts exactly; for the other tiles it follows BLOCK_M, BLOCK_N and BLOCK_K.
+    """
+    bases = [list(b) for b in shared_layout.offset_bases]
+    rank = len(shared_layout.shape)
+    n_reg = int(math.log2(load_contig))
+    n_lane = int(math.log2(threads_per_warp))
+    n_warp = int(math.log2(num_warps))
+    reg = bases[:n_reg]
+    lane = bases[n_reg : n_reg + n_lane]
+    warp = bases[n_reg + n_lane : n_reg + n_lane + n_warp]
+    while len(warp) < n_warp:  # zero-pad (broadcast) if we ran out of bases
+        warp.append([0] * rank)
+    reg += bases[n_reg + n_lane + n_warp :]
+    return gl.DistributedLinearLayout(
+        reg_bases=reg,
+        lane_bases=lane,
+        warp_bases=warp,
+        block_bases=[],
+        shape=list(shared_layout.shape),
+    )
 
 
 @gluon.jit
@@ -121,65 +168,25 @@ def _gemm_a16w16_compute_bound_kernel(
 
     pid_m, pid_n = _get_pids(M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M)
 
-    # Half-M global load layout
-    gLoadLayoutA: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[0, 1], [0, 2], [0, 4], [4, 0], [8, 0]],
-        lane_bases=[[0, 8], [0, 16], [0, 32], [16, 0], [32, 0], [64, 0]],
-        warp_bases=[[1, 0], [2, 0]],
-        block_bases=[],
-        shape=[BLOCK_M // 2, BLOCK_K],
+    # Every layout follows the tile: the shared layouts come from the dot-operand
+    # layouts and the global-load layouts from the shared layouts.
+    mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
+        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
     )
-    # Half-N global load layout
-    gLoadLayoutB: gl.constexpr = gl.DistributedLinearLayout(
-        reg_bases=[[1, 0], [2, 0], [4, 0], [0, 4], [0, 8]],
-        lane_bases=[[8, 0], [16, 0], [32, 0], [0, 16], [0, 32], [0, 64]],
-        warp_bases=[[0, 1], [0, 2]],
-        block_bases=[],
-        shape=[BLOCK_K, BLOCK_N // 2],
+    dotOpLayoutA: gl.constexpr = gl.DotOperandLayout(
+        operand_index=0, parent=mfmaLayout, k_width=8
     )
-
-    # Half-M padded shared layout
-    sharedLayoutA: gl.constexpr = gl.PaddedSharedLayout(
-        [[512, 16]],
-        [
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-            [0, 16],
-            [0, 32],
-            [16, 0],
-            [32, 0],
-            [64, 0],
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-        ],
-        [],
-        [BLOCK_M // 2, BLOCK_K],
+    dotOpLayoutB: gl.constexpr = gl.DotOperandLayout(
+        operand_index=1, parent=mfmaLayout, k_width=8
     )
-    # Half-N padded shared layout
-    sharedLayoutB: gl.constexpr = gl.PaddedSharedLayout(
-        [[512, 16]],
-        [
-            [1, 0],
-            [2, 0],
-            [4, 0],
-            [8, 0],
-            [16, 0],
-            [32, 0],
-            [0, 16],
-            [0, 32],
-            [0, 64],
-            [0, 1],
-            [0, 2],
-            [0, 4],
-            [0, 8],
-        ],
-        [],
-        [BLOCK_K, BLOCK_N // 2],
+    sharedLayoutA: gl.constexpr = ttgl_cdna4.compute_efficient_padded_shared_layout(
+        dotOpLayoutA, [BLOCK_M // 2, BLOCK_K], a_ptr.dtype.element_ty
     )
+    sharedLayoutB: gl.constexpr = ttgl_cdna4.compute_efficient_padded_shared_layout(
+        dotOpLayoutB, [BLOCK_K, BLOCK_N // 2], b_ptr.dtype.element_ty
+    )
+    gLoadLayoutA: gl.constexpr = compute_gload_layout(sharedLayoutA, 8, gl.num_warps())
+    gLoadLayoutB: gl.constexpr = compute_gload_layout(sharedLayoutB, 8, gl.num_warps())
 
     nBuffers: gl.constexpr = 2
     smemA_top = gl.allocate_shared_memory(
@@ -214,17 +221,6 @@ def _gemm_a16w16_compute_bound_kernel(
     a_bot_offsets_next = a_bot_offsets + BLOCK_K * stride_ak
     b_left_offsets_next = b_left_offsets + BLOCK_K * stride_bk
     b_right_offsets_next = b_right_offsets + BLOCK_K * stride_bk
-
-    mfmaLayout: gl.constexpr = gl.amd.AMDMFMALayout(
-        version=4, instr_shape=[16, 16, 32], transposed=True, warps_per_cta=[2, 2]
-    )
-
-    dotOpLayoutA: gl.constexpr = gl.DotOperandLayout(
-        operand_index=0, parent=mfmaLayout, k_width=8
-    )
-    dotOpLayoutB: gl.constexpr = gl.DotOperandLayout(
-        operand_index=1, parent=mfmaLayout, k_width=8
-    )
 
     acc_tl = gl.zeros((BLOCK_M // 2, BLOCK_N // 2), gl.float32, mfmaLayout)
     acc_bl = gl.zeros((BLOCK_M // 2, BLOCK_N // 2), gl.float32, mfmaLayout)
@@ -403,7 +399,15 @@ def _gemm_a16w16_compute_bound_kernel(
     ## is unchanged from v8 because the sub-tile variant produced only ~200 cycles
     ## of additional savings — within noise relative to the full kernel.
 
-    gStoreLayoutC: gl.constexpr = gl.BlockedLayout([1, 8], [4, 16], [4, 1], [1, 0])
+    # Store layout sized to the half tile: 8 contiguous elements per thread keep the
+    # 16-byte store, and one warp spans exactly BLOCK_N // 2 columns ([4, 16] lanes at
+    # BLOCK_N = 256, the tutorial's constant).
+    STORE_CONTIG: gl.constexpr = 8
+    STORE_LANES_N: gl.constexpr = (BLOCK_N // 2) // STORE_CONTIG
+    STORE_LANES_M: gl.constexpr = 64 // STORE_LANES_N
+    gStoreLayoutC: gl.constexpr = gl.BlockedLayout(
+        [1, STORE_CONTIG], [STORE_LANES_M, STORE_LANES_N], [4, 1], [1, 0]
+    )
 
     offs_cm = gl.arange(0, BLOCK_M // 2, gl.SliceLayout(1, gStoreLayoutC))
     offs_cn = gl.arange(0, BLOCK_N // 2, gl.SliceLayout(0, gStoreLayoutC))
@@ -490,12 +494,43 @@ def schedule_hint():
     return "" if os.environ.get("AITER_MFMA_SCHED", "1") == "0" else MFMA_SCHEDULE_HINT
 
 
-def unsupported_reason(M, N, K, x=None, w=None, bias=None, activation=None):
-    """Why this kernel cannot run the problem, or None if it can."""
+def supported_tiles(M, N):
+    """The tiles that divide M and N, largest first."""
+    return [(bm, bn) for bm, bn in TILES if M % bm == 0 and N % bn == 0]
+
+
+@functools.cache
+def _cu_count(device_index):
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def choose_tile(M, N, device=None):
+    """The default tile for a shape: the largest tile that gives at least one
+    workgroup per CU, else the one that gives the most workgroups. The tuner is
+    meant to override it per shape through the config (BLOCK_M, BLOCK_N)."""
+    tiles = supported_tiles(M, N)
+    if not tiles:
+        return None
+    cus = _cu_count(torch.cuda.current_device() if device is None else device)
+    for bm, bn in tiles:
+        if (M // bm) * (N // bn) >= cus:
+            return (bm, bn)
+    return tiles[-1]
+
+
+def unsupported_reason(M, N, K, x=None, w=None, bias=None, activation=None, tile=None):
+    """Why this kernel cannot run the problem, or None if it can. ``tile`` checks a
+    specific (BLOCK_M, BLOCK_N); None asks whether any tile fits."""
     if activation:
         return "no activation support yet"
-    if M % BLOCK_M or N % BLOCK_N:
-        return f"M and N must be multiples of {BLOCK_M} (got M={M}, N={N})"
+    if tile is not None:
+        if tuple(tile) not in TILES:
+            return f"tile {tuple(tile)} is not one of {TILES}"
+        bm, bn = tile
+        if M % bm or N % bn:
+            return f"M and N must be multiples of the {bm}x{bn} tile (got M={M}, N={N})"
+    elif not supported_tiles(M, N):
+        return f"M and N must be multiples of one tile in {TILES} (got M={M}, N={N})"
     if K % (2 * BLOCK_K) or K < 4 * BLOCK_K:
         return f"K must be a multiple of {2 * BLOCK_K} and at least {4 * BLOCK_K} (got K={K})"
     if x is not None and x.stride(1) != 1:
@@ -507,15 +542,17 @@ def unsupported_reason(M, N, K, x=None, w=None, bias=None, activation=None):
     return None
 
 
-def gemm_a16w16_compute_bound(x, w, y, bias=None):
-    """y = x @ w.T (+ bias) with x (M, K) and w (N, K), both row-major; y (M, N)."""
+def gemm_a16w16_compute_bound(x, w, y, bias=None, tile=None):
+    """y = x @ w.T (+ bias) with x (M, K) and w (N, K), both row-major; y (M, N).
+    ``tile`` is (BLOCK_M, BLOCK_N) from TILES; None picks ``choose_tile``."""
     M, K = x.shape
     N, _ = w.shape
-    reason = unsupported_reason(M, N, K, x, w)
+    reason = unsupported_reason(M, N, K, x, w, tile=tile)
     if reason is not None:
         raise ValueError(f"gfx950 gluon compute_bound a16w16: {reason}")
+    bm, bn = choose_tile(M, N, x.device) if tile is None else tile
     b = w.T  # (K, N) view, K contiguous: the layout the kernel loads
-    grid_mn = (M // BLOCK_M) * (N // BLOCK_N)
+    grid_mn = (M // bm) * (N // bn)
     _gemm_a16w16_compute_bound_kernel[(grid_mn, 1)](
         x,
         b,
@@ -530,8 +567,8 @@ def gemm_a16w16_compute_bound(x, w, y, bias=None):
         b.stride(1),
         y.stride(0),
         y.stride(1),
-        BLOCK_M=BLOCK_M,
-        BLOCK_N=BLOCK_N,
+        BLOCK_M=bm,
+        BLOCK_N=bn,
         BLOCK_K=BLOCK_K,
         GRID_MN=grid_mn,
         NUM_XCDS=NUM_XCDS,
