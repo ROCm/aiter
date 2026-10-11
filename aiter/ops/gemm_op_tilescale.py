@@ -23,7 +23,9 @@ residual epilogue for sbhd rows (row = s * Bt + b) and a gate table ``gate`` [Bt
     a = bf16(acc);  h32 = float(a) + float(bias);  h = bf16(h32);  out = bf16(fma(gate[row % Bt], h32, x))
 
 (fp32 math, one rounding per stored value; ``h32`` is not rounded before the fma). ``a6w6_tilescale_cat_table``
-lists the shapes with a kernel.
+lists the shapes with a kernel. ``gemm_fp8_tilescale_cat`` is the same for FP8 operands with tensorwise scales
+(``fp8_tilescale_cat_table``): ``a = bf16(acc * s1)`` with ``acc = A @ B^T * (s0 / s1) + A2 @ B2^T`` and
+``s = a_scale * b_scale`` per segment.
 """
 
 import csv
@@ -115,6 +117,13 @@ def a6w6_tilescale_cat_table(arch: str = "gfx950") -> frozenset:
     inside compiled regions)."""
     return frozenset((r["M"], r["N"], r["K"], r["k2"], r["epi_b"]) for r in _manifest(arch)
                      if r["abi"] == 5 and r["a_fmt"] == 6 and r["b_fmt"] == 6 and r.get("k2"))
+
+
+@functools.lru_cache(maxsize=None)
+def fp8_tilescale_cat_table(arch: str = "gfx950") -> frozenset:
+    """Shapes ``(M, N, K, K2, Bt)`` that ``gemm_fp8_tilescale_cat`` has a kernel for."""
+    return frozenset((r["M"], r["N"], r["K"], r["k2"], r["epi_b"]) for r in _manifest(arch)
+                     if r["abi"] == 6 and r["a_fmt"] == 8 and r["b_fmt"] == 8 and r.get("k2"))
 
 
 def tilescale_supported(M: int, N: int, K: int, a_fmt: int, b_fmt: int, bias: bool = False, b_codes: int = 0,
@@ -212,4 +221,15 @@ def gemm_a6w6_tilescale_cat(A, B, A_scale, B_scale, A2, B2, A2_scale, B2_scale, 
         raise ValueError(f"gemm_a6w6_tilescale_cat expects a 2D output, got {out.ndim}D")
     _gemm_tilescale_cat_asm(A, B, A_scale, B_scale, A2, B2, A2_scale, B2_scale, out, h, K, K2, bias, x, gate, b_c1,
                             b2_c1)
+    return out
+
+
+def gemm_fp8_tilescale_cat(A, B, a_scale, b_scale, A2, B2, a2_scale, b2_scale, out, h, K, K2, bias, x, gate):
+    """``gemm_a6w6_tilescale_cat`` for FP8: A / B (over K) and A2 / B2 (over K2) tilescale FP8 buffers as
+    ``gemm_fp8_tilescale`` takes them, each segment's scales one-element fp32 tensors (module docstring). Raises if no
+    kernel exists (``fp8_tilescale_cat_table``)."""
+    if out.ndim != 2:
+        raise ValueError(f"gemm_fp8_tilescale_cat expects a 2D output, got {out.ndim}D")
+    _gemm_tilescale_cat_asm(A, B, a_scale, b_scale, A2, B2, a2_scale, b2_scale, out, h, K, K2, bias, x, gate, None,
+                            None)
     return out

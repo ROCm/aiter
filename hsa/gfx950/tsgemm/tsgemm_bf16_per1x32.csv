@@ -95,3 +95,5 @@ a_fmt,b_fmt,b_codes,b_ilv,bias,M,N,K,kcls,kmin,grid,abi,ts_ver,knl_name,co_name,
 8,8,0,0,1,512,512,1024,0,0,4,1,1,aiter_ts_f8_bias_512x512x1024,aiter_ts_f8_bias_512x512x1024.co,0,0,0
 8,8,0,0,0,1024,768,1536,0,0,12,1,1,aiter_ts_f8_1024x768x1536,aiter_ts_f8_1024x768x1536.co,0,0,0
 8,8,0,0,1,1024,768,1536,0,0,12,1,1,aiter_ts_f8_bias_1024x768x1536,aiter_ts_f8_bias_1024x768x1536.co,0,0,0
+8,8,0,0,1,16384,3072,3072,0,0,768,6,1,aiter_ts_f8_cat_16384x3072x3072x12288,aiter_ts_f8_cat_16384x3072x3072x12288.co,32,0,12288
+8,8,0,0,1,512,512,512,0,0,4,6,1,aiter_ts_f8_cat_512x512x512x1024,aiter_ts_f8_cat_512x512x512x1024.co,32,0,1024

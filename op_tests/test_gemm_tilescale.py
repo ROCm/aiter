@@ -15,9 +15,11 @@ import aiter.ops.tilescale as TS
 from aiter.jit.core import AITER_META_DIR
 from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops.gemm_op_tilescale import (
+    fp8_tilescale_cat_table,
     fp8_tilescale_supported,
     gemm_a6w4_tilescale,
     gemm_fp8_tilescale,
+    gemm_fp8_tilescale_cat,
     gemm_mx_tilescale,
     tilescale_supported,
 )
@@ -42,9 +44,10 @@ def _manifest():
                 for r in csv.DictReader(f)]
 
 
-ALL_ROWS = [r for r in _manifest() if r["abi"] not in (2, 3, 4, 5)]  # exact-shape rows
+ALL_ROWS = [r for r in _manifest() if r["abi"] not in (2, 3, 4, 5, 6)]  # exact-shape rows
 ROWS = [r for r in ALL_ROWS if r["a_fmt"] != 8]  # MX rows
 FP8_ROWS = [r for r in ALL_ROWS if r["a_fmt"] == 8]
+FP8_CAT = [r for r in _manifest() if r["abi"] == 6]  # FP8 two-segment rows with the gated residual
 SOFTMAX_D = [r for r in _manifest() if r["abi"] == 4]  # exact-shape rows emitting attention's softmax_d
 GENERIC_ROWS = [r for r in _manifest() if r["abi"] in (2, 3)]
 A6W4 = [r for r in ROWS if (r["a_fmt"], r["b_fmt"]) == (6, 4)]
@@ -339,3 +342,38 @@ def test_fp8_out_row_slice():
     gemm_fp8_tilescale(A, B, s1, s1, big[M : 2 * M], K)
     assert torch.equal(big[M : 2 * M].view(torch.int16), ref.view(torch.int16))
     assert not big[:M].any() and not big[2 * M :].any()
+
+
+@requires_gfx950
+@pytest.mark.parametrize("row", FP8_CAT, ids=lambda r: r["knl_name"])
+def test_fp8_cat_vs_fp64(row):
+    """The FP8 two-segment kernel against an fp64 emulation of its contract: acc = A.B * s0 / s1 + A2.B2,
+    a = bf16(acc * s1), h32 = a + bias, h = bf16(h32), out = bf16(gate[row % Bt] * h32 + x); the gate a strided
+    chunk of a wider table."""
+    M, N, K, K2, Bt = row["M"], row["N"], row["K"], row["k2"], row["epi_b"]
+    assert (M, N, K, K2, Bt) in fp8_tilescale_cat_table()
+    g = torch.Generator(device="cuda").manual_seed(M + N + K + K2)
+    a, b, av, bv_ = _fp8_operands(M, N, K, g)
+    a2, b2, a2v, b2v = _fp8_operands(M, N, K2, g)
+    sa, sb = torch.tensor([2.0**-9], device="cuda"), torch.tensor([3.0 * 2.0**-11], device="cuda")
+    sa2, sb2 = torch.tensor([5.0 * 2.0**-12], device="cuda"), torch.tensor([2.0**-10], device="cuda")
+    bias = torch.randn(N, dtype=torch.bfloat16, device="cuda", generator=g)
+    x = torch.randn(M, N, dtype=torch.bfloat16, device="cuda", generator=g)
+    table = torch.randn(Bt, 3 * N, dtype=torch.bfloat16, device="cuda", generator=g)
+    gate = table[:, N : 2 * N]
+    out, h = torch.empty_like(x), torch.empty_like(x)
+    P = TS.pack_fp8_codes_ref
+    gemm_fp8_tilescale_cat(P(a), P(b), sa, sb, P(a2), P(b2), sa2, sb2, out, h, K, K2, bias, x, gate)
+    dt = torch.float64 if M * N <= 512 * 512 else torch.float32
+    s0, s1 = sa.double().item() * sb.double().item(), sa2.double().item() * sb2.double().item()
+    acc = (av.to(dt) @ bv_.to(dt).t()) * (s0 / s1) + a2v.to(dt) @ b2v.to(dt).t()
+    a_ = (acc * s1).float().to(torch.bfloat16)
+    h32 = a_.float() + bias.float()
+    out_ref = torch.addcmul(x.float(), gate.float().repeat(M // Bt, 1), h32).to(torch.bfloat16)
+    # fp32 accumulation order moves a by a bf16 ulp near rounding boundaries; h = bf16(a + bias) then by up to two
+    tol = lambda r_: float(r_.float().abs().max()) * 2**-6  # noqa: E731
+    assert float((h.float() - h32.to(torch.bfloat16).float()).abs().max()) <= tol(h32)
+    # a bf16 ulp of a (accumulation order) reaches out through the gate
+    tol_out = float(gate.float().abs().max()) * tol(h32) + float(out_ref.float().abs().max()) * 2**-8
+    assert float((out.float() - out_ref.float()).abs().max()) <= tol_out
+    assert (h == h32.to(torch.bfloat16)).float().mean().item() > 0.95

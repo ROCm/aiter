@@ -13,35 +13,47 @@
 #include <string>
 #include <unordered_map>
 
-// MX GEMMs on the tilescale layout (aiter/ops/tilescale.py): out[M, N] = A @ B^T (+ bias), bf16 out,
-// one E8M0 scale per 32 K in the tilescale slab. Operand formats per row of the manifest
+// MX GEMMs on the tilescale layout (aiter/ops/tilescale.py): out[M, N] = A @ B^T (+ bias), bf16
+// out, one E8M0 scale per 32 K in the tilescale slab. Operand formats per row of the manifest
 // (hsa/gfx950/tsgemm): a_fmt / b_fmt 4 (E2M1) or 6 (E2M3); FP6 codes are the K128-blocked C0 / C1
 // planes in one buffer; FP4 codes are row-major (b_codes 0) or K128-blocked (b_codes 1); b_ilv is
 // role B's scale interleave. a_fmt = b_fmt = 8: E4M3 with one fp32 scale per tensor (the scale
-// arguments are the two fp32 dequantization factors, one element each); the codes are two K128-blocked
-// planes in one buffer, bytes 0-15 then 16-31 of every 32-value K group (aiter/ops/tilescale.py,
-// fp8_planes); out = (A @ B^T) * a_scale * b_scale (+ bias). Rows are selected by (formats, b_codes, b_ilv, bias, M, N, K); `abi`
-// selects the kernarg marshalling:
+// arguments are the two fp32 dequantization factors, one element each); the codes are two
+// K128-blocked planes in one buffer, bytes 0-15 then 16-31 of every 32-value K group
+// (aiter/ops/tilescale.py, fp8_planes); out = (A @ B^T) * a_scale * b_scale (+ bias). Rows are
+// selected by (formats, b_codes, b_ilv, bias, M, N, K); `abi` selects the kernarg marshalling:
 //   0  the A4W4 160-byte kernarg (KernelArgsTs4)
 //   1  the A6W6 156-byte kernarg, 172 with bias (KernelArgsTs6): A6W6, and A6W4 with B's C1 slot
 //      aliasing B: the kernel never reads it
-//   2  abi 1 with K in the dword after N: the shape-generic kernels (M = N = K = 0 in the manifest), which
-//      serve every M, N (multiples of 256) and every K in their K-loop class -- K/128 = kcls (mod 12) and
-//      K >= kmin -- one tile per workgroup (grid = tiles).
-//   3  the K-generic A4W4 kernel: the first 112 bytes of abi 0 with K in the dword after N; serves every
-//      M, N (multiples of 256) and every K that is a multiple of 512 and >= kmin (kcls 12: any K-loop
-//      class), B scales at interleave 4; one tile per workgroup.
-//   4  abi 0 plus the attention softmax_d epilogue (148 bytes): C1 carries O ([M, N] bf16, out's layout)
-//      and C2's pointer / first dword δ ([B, N/128, S] fp32, from this GEMM's first sequence position) and
-//      its remaining elements. Rows are sbhd (row = s * B + b); the kernel adds, per row and 128-column
-//      head, the fp32 sum of bf16(out) * O over the head into δ, which the caller zeroes. Selected by the
-//      manifest's epi_b / epi_s (B, S; 0 for every other row).
-//   5  two-segment A6W6 with a gated-residual epilogue (gemm_tilescale_cat_asm, 304 bytes): abi 1 without
-//      bias (segment 0: A x B over K) + 4 bytes of padding, then segment 1's operands (A2's codes, B2's C0
-//      and C1 planes, A2's and B2's scale slabs), X, G, bias and H as (pointer, element count, pad), and the
-//      gate's row stride in elements. One fp32 accumulator runs over segment 0's K, then segment 1's K2
-//      (manifest column k2); then a = bf16(acc), h32 = a + bias (fp32), H = bf16(h32) and
-//      out = bf16(fma(G[row % epi_b], h32, X)). epi_b is the gate's row count (rows are sbhd, row = s * B + b).
+//   2  abi 1 with K in the dword after N: the shape-generic kernels (M = N = K = 0 in the
+//   manifest), which
+//      serve every M, N (multiples of 256) and every K in their K-loop class -- K/128 = kcls (mod
+//      12) and K >= kmin -- one tile per workgroup (grid = tiles).
+//   3  the K-generic A4W4 kernel: the first 112 bytes of abi 0 with K in the dword after N; serves
+//   every
+//      M, N (multiples of 256) and every K that is a multiple of 512 and >= kmin (kcls 12: any
+//      K-loop class), B scales at interleave 4; one tile per workgroup.
+//   4  abi 0 plus the attention softmax_d epilogue (148 bytes): C1 carries O ([M, N] bf16, out's
+//   layout)
+//      and C2's pointer / first dword δ ([B, N/128, S] fp32, from this GEMM's first sequence
+//      position) and its remaining elements. Rows are sbhd (row = s * B + b); the kernel adds, per
+//      row and 128-column head, the fp32 sum of bf16(out) * O over the head into δ, which the
+//      caller zeroes. Selected by the manifest's epi_b / epi_s (B, S; 0 for every other row).
+//   5  two-segment A6W6 with a gated-residual epilogue (gemm_tilescale_cat_asm, 304 bytes): abi 1
+//   without
+//      bias (segment 0: A x B over K) + 4 bytes of padding, then segment 1's operands (A2's codes,
+//      B2's C0 and C1 planes, A2's and B2's scale slabs), X, G, bias and H as (pointer, element
+//      count, pad), and the gate's row stride in elements. One fp32 accumulator runs over segment
+//      0's K, then segment 1's K2 (manifest column k2); then a = bf16(acc), h32 = a + bias (fp32),
+//      H = bf16(h32) and out = bf16(fma(G[row % epi_b], h32, X)). epi_b is the gate's row count
+//      (rows are sbhd, row = s * B + b).
+//   6  abi 5 for E4M3 with tensorwise scales (gemm_tilescale_cat_asm with fp32 one-element scales,
+//   320 bytes):
+//      segment 0's A and B as the two FP8 planes each (abi 1's memrefs), its two fp32 scales, then
+//      segment 1's planes (A2 P0, A2 P1, B2 P0, B2 P1), its two scales, X, G, bias and H as
+//      (pointer, element count, pad) and the gate's row stride. The accumulator is rescaled by s0 /
+//      s1 between the segments (s = a_scale * b_scale), so a = bf16(acc * s1) with acc = A.B * s0 /
+//      s1 + A2.B2; the epilogue is abi 5's.
 namespace {
 constexpr size_t kTensorAlignment = 16;
 
@@ -115,6 +127,27 @@ static_assert(offsetof(KernelArgsCat6, M) == 148 && offsetof(KernelArgsCat6, A2)
                   offsetof(KernelArgsCat6, X) == 240 && offsetof(KernelArgsCat6, ptr_H) == 288 &&
                   offsetof(KernelArgsCat6, ldg) == 300,
               "cat6 kernarg ABI mismatch");
+
+struct __attribute__((packed)) KernelArgsCat8
+{
+    Memref A0, A1, B0, B1, C;
+    void* ptr_SA;
+    uint32_t sa_elems, sa_pad;
+    void* ptr_SB;
+    uint32_t sb_elems;
+    uint32_t M;
+    uint32_t N;
+    uint32_t pad0;
+    Ptr1d A20, A21, B20, B21, SA2, SB2, X, G, Bias;
+    void* ptr_H;
+    uint32_t h_elems;
+    int32_t ldg;
+};
+static_assert(sizeof(KernelArgsCat8) == 320, "cat8 kernarg must be 320 bytes");
+static_assert(offsetof(KernelArgsCat8, M) == 148 && offsetof(KernelArgsCat8, A20) == 160 &&
+                  offsetof(KernelArgsCat8, X) == 256 && offsetof(KernelArgsCat8, ptr_H) == 304 &&
+                  offsetof(KernelArgsCat8, ldg) == 316,
+              "cat8 kernarg ABI mismatch");
 
 Memref memref(void* p, int64_t rows, int64_t row_bytes)
 {
@@ -450,6 +483,90 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 "16-byte aligned, on the output's GPU");
     const int64_t Bt = gate->size(0), ldg = gate->stride(0);
     AITER_CHECK(Bt > 0 && M % Bt == 0 && ldg < (int64_t{1} << 26), __func__, " gate rows must divide M");
+
+    // E4M3 with tensorwise scales (abi 6): fp32 one-element scales select it
+    if(A_scale->dtype() == AITER_DTYPE_fp32)
+    {
+        const aiter_tensor_t* seg8[2][4] = {{A, B, A_scale, B_scale}, {A2, B2, A2_scale, B2_scale}};
+        const int64_t ks8[2]             = {K, K2};
+        AITER_CHECK(B_c1 == nullptr && B2_c1 == nullptr,
+                    __func__,
+                    " the FP8 kernel takes no separate C1 planes");
+        for(int s = 0; s < 2; ++s)
+        {
+            for(const aiter_tensor_t* t : seg8[s])
+                AITER_CHECK(t->is_contiguous() && aligned(t) && t->device_id == dev,
+                            __func__,
+                            " operands and scales must be contiguous, 16-byte aligned, on the "
+                            "output's GPU");
+            AITER_CHECK(bytes(seg8[s][0]) == M * ks8[s] && bytes(seg8[s][1]) == N * ks8[s] &&
+                            seg8[s][2]->dtype() == AITER_DTYPE_fp32 && seg8[s][2]->numel() == 1 &&
+                            seg8[s][3]->dtype() == AITER_DTYPE_fp32 && seg8[s][3]->numel() == 1,
+                        __func__,
+                        " FP8 segment " + std::to_string(s) +
+                            ": A / B must be M*K / N*K bytes of planes, the scales one fp32 each");
+        }
+        const std::string arch8  = get_gpu_arch();
+        const tsgemmConfig* cfg8 = nullptr;
+        for(const auto& kv : cfg_tsgemm_bf16_per1x32)
+        {
+            const auto& c = kv.second;
+            if(c.arch == arch8 && c.abi == 6 && c.a_fmt == 8 && c.b_fmt == 8 && c.M == M &&
+               c.N == N && c.K == K && c.k2 == K2 && c.epi_b == Bt)
+            {
+                cfg8 = &c;
+                break;
+            }
+        }
+        AITER_CHECK(cfg8 != nullptr,
+                    __func__,
+                    " no FP8 two-segment tilescale kernel for " + std::to_string(M) + "x" +
+                        std::to_string(N) + "x(" + std::to_string(K) + "+" + std::to_string(K2) +
+                        ") with " + std::to_string(Bt) + " gate rows");
+        KernelArgsCat8 a;
+        std::memset(&a, 0, sizeof(a));
+        char* pa         = static_cast<char*>(A->ptr);
+        char* pbb        = static_cast<char*>(B->ptr);
+        char* pa2        = static_cast<char*>(A2->ptr);
+        char* pb2        = static_cast<char*>(B2->ptr);
+        a.A0             = memref(pa, M, K / 2);
+        a.A1             = memref(pa + M * K / 2, M, K / 2);
+        a.B0             = memref(pbb, N, K / 2);
+        a.B1             = memref(pbb + N * K / 2, N, K / 2);
+        a.C              = Memref{out->ptr,
+                     static_cast<uint32_t>(M),
+                     static_cast<uint32_t>(N),
+                     static_cast<uint32_t>(N),
+                     0};
+        a.ptr_SA         = A_scale->ptr;
+        a.sa_elems       = 1;
+        a.ptr_SB         = B_scale->ptr;
+        a.sb_elems       = 1;
+        a.M              = static_cast<uint32_t>(M);
+        a.N              = static_cast<uint32_t>(N);
+        const auto q1    = [](void* p, int64_t n) { return Ptr1d{p, static_cast<uint32_t>(n), 0}; };
+        a.A20            = q1(pa2, M * K2 / 2);
+        a.A21            = q1(pa2 + M * K2 / 2, M * K2 / 2);
+        a.B20            = q1(pb2, N * K2 / 2);
+        a.B21            = q1(pb2 + N * K2 / 2, N * K2 / 2);
+        a.SA2            = q1(A2_scale->ptr, 1);
+        a.SB2            = q1(B2_scale->ptr, 1);
+        a.X              = q1(x->ptr, M * N);
+        a.G              = q1(gate->ptr, (Bt - 1) * ldg + N);
+        a.Bias           = q1(bias->ptr, N);
+        a.ptr_H          = h->ptr;
+        a.h_elems        = static_cast<uint32_t>(M * N);
+        a.ldg            = static_cast<int32_t>(ldg);
+        size_t arg_size8 = sizeof(a);
+        const HipDeviceGuard device_guard8(dev);
+        static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map8;
+        const char* name8 = cfg8->knl_name.c_str();
+        const char* co8   = cfg8->co_name.c_str();
+        AiterAsmKernel* impl8 =
+            &impl_ptr_map8.get_or_create(name8, [&]() { return AiterAsmKernel(name8, co8); });
+        impl8->launch_kernel({&a, &arg_size8, cfg8->grid, 1, 1, 256, 1, 1, stream});
+        return;
+    }
 
     // per segment: codes, optional separate C1 plane, scale slabs
     char* pb[2];
