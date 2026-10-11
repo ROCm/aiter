@@ -345,10 +345,14 @@ class TestConfigShapeCollision(unittest.TestCase):
         """An ep_fused row must still win the EP lookup once the merge has
         written its ep_fused = 1 as "1.0"."""
         try:
+            import torch
+
             from aiter import ActivationType, QuantType, dtypes
             from aiter.ops.flydsl import grouped_moe_gfx1250 as grouped
         except Exception as e:  # noqa: BLE001
             self.skipTest(f"grouped MoE modules not importable: {e}")
+        # dtypes.fp8 is e4m3fnuz on gfx942, so name the dtypes the rows use.
+        q_dtype_a, q_dtype_w = torch.float8_e4m3fn, dtypes.fp4x2
         env_name, name = "AITER_CONFIG_GROUPED_FMOE", "tuned_grouped_fmoe"
         tmp = tempfile.mkdtemp(prefix="aiter_cfg_grouped_ep_")
         old_env = os.environ.get(env_name)
@@ -360,7 +364,7 @@ class TestConfigShapeCollision(unittest.TestCase):
                 f.write(key + "\n")
             shape = (
                 "7168,768,384,6,ActivationType.Silu,torch.bfloat16,"
-                "torch.float8_e4m3fn,torch.float4_e2m1fn_x2,QuantType.per_1x32"
+                f"{q_dtype_a},{q_dtype_w},QuantType.per_1x32"
             )
             with open(os.path.join(cfg, f"{name}.csv"), "w") as f:
                 f.write(f"gfx,cu_num,{key},tile_m,us\n")
@@ -381,9 +385,9 @@ class TestConfigShapeCollision(unittest.TestCase):
                 experts=384,
                 topk=6,
                 activation=ActivationType.Silu,
-                dtype=dtypes.bf16,
-                q_dtype_a=dtypes.fp8,
-                q_dtype_w=dtypes.fp4x2,
+                dtype=torch.bfloat16,
+                q_dtype_a=q_dtype_a,
+                q_dtype_w=q_dtype_w,
                 quant_type=QuantType.per_1x32,
                 ep_fused=True,
             )
