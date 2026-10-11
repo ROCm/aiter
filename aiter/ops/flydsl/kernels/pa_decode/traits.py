@@ -63,19 +63,25 @@ def _warn_unstaged_page_ids(pages: int) -> None:
     )
 
 
-def stage_page_capacity(
-    num_seqs, work_capacity, num_partitions, max_context_length, block_size
-) -> int:
-    """Page ids one planned task can own, or 0 to keep table reads in the loop.
+def max_tiles_per_task(num_seqs, work_capacity, num_partitions, max_context_length):
+    """Host bound on the KV tiles one dense planned task owns.
 
     A sequence's task count is at least min(tiles, num_partitions) and the plan
-    spends work_capacity - num_seqs extra tasks in proportion to tiles, so no
-    task owns more tiles than this host-known bound.
+    spends work_capacity - num_seqs extra tasks in proportion to tiles.
     """
     max_tiles = -(-max_context_length // KV_COMPUTE_BLOCK)
     extra = work_capacity - num_seqs
     by_budget = -(-num_seqs * max_tiles // extra) if extra > 0 else max_tiles
-    tiles = min(max_tiles, max(-(-max_tiles // num_partitions), by_budget))
+    return min(max_tiles, max(-(-max_tiles // num_partitions), by_budget))
+
+
+def stage_page_capacity(
+    num_seqs, work_capacity, num_partitions, max_context_length, block_size
+) -> int:
+    """Page ids to stage per task, or 0 to keep table reads in the tile loop."""
+    tiles = max_tiles_per_task(
+        num_seqs, work_capacity, num_partitions, max_context_length
+    )
     pages = tiles * (KV_COMPUTE_BLOCK // block_size)
     if pages > PAGE_ID_STAGE_LIMIT:
         _warn_unstaged_page_ids(pages)
