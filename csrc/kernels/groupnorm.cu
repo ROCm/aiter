@@ -297,8 +297,10 @@ void launchGroupNormKernel(aiter_tensor_t& y, aiter_tensor_t& workspace,
     constexpr uint32_t STEPS_PER_THREAD = 8;
     uint32_t gridx = (inner_size + (STEPS_PER_THREAD * THREADS_PER_BLOCK) - 1) / (STEPS_PER_THREAD * THREADS_PER_BLOCK);
 
+    // A vector must not cross a channel boundary because all four elements use
+    // the affine parameters selected for the vector's first element.
     bool align4 = false;
-    if(inner_size % 4 == 0 && gridx >= 16) {
+    if(numel_per_channel % 4 == 0 && gridx >= 16) {
         gridx = std::max<uint32_t>(1, gridx / 4);
         align4 = true;
     }
