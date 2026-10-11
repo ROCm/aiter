@@ -2,11 +2,45 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.moe.moe_routing.topk import (
+    _exact_sigmoid_biased_topk,
     _grouped_topk,
     _hash_routing,
     _topk,
 )
 from aiter.ops.triton.moe.moe_routing.bitmatrix import Bitmatrix
+
+
+def exact_sigmoid_biased_topk(
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    need_renorm: bool,
+    routed_scaling_factor: float,
+) -> None:
+    """Write exact gfx1250 sigmoid top-k results into caller-owned buffers.
+
+    Unlike :func:`topk`, this follows the HIP fp32/int32 ABI without a bitmatrix.
+    ``aiter.ops.topk`` guards the measured family and all fallback paths.
+    """
+    num_experts = gating_output.shape[1]
+    topk = topk_ids.shape[1]
+    _exact_sigmoid_biased_topk[(gating_output.shape[0],)](
+        gating_output,
+        correction_bias,
+        topk_weights,
+        topk_ids,
+        gating_output.stride(0),
+        topk_weights.stride(0),
+        topk_ids.stride(0),
+        gating_output.shape[0],
+        routed_scaling_factor,
+        N_EXPERTS=num_experts,
+        TOPK=topk,
+        BLOCK_N=triton.next_power_of_2(num_experts),
+        NEED_RENORM=need_renorm,
+        num_warps=4,
+    )
 
 
 def grouped_topk(
