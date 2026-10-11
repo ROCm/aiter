@@ -14,11 +14,9 @@ between chunks in LDS. Kimi-K3 (E=896) is the first model to exceed one chunk.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
-from flydsl.expr.typing import Int32, T
+from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
+from flydsl.expr.typing import Int32
 
-from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -631,23 +629,12 @@ def build_moe_route_psum_fused_module():
         gpu.barrier()
 
         # Phase B: route + workgroup-scope LDS atomic -> masked-layout rows.
-        # The atomic needs a raw addrspace(3) pointer, so the counter array's
-        # base is taken as an integer here; SharedAllocator has already folded
-        # its offset in, leaving only the per-expert element offset to add.
-        # create_llvm_ptr builds the addrspace(3) pointer via fx.to_llvm_ptr.
-        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
+        # The allocator's typed pointer keeps the counter in shared memory.
         numel_i32 = fx.Uint32(numel)
         for route_i32 in range(tid, numel_i32, MAX_EXPERTS_PER_BLOCK):
             e = topk_p[route_i32]
-            ptr = create_llvm_ptr(cnt_base_i64 + fx.Int64(e) * 4, 3)
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                arith.constant(1, type=T.i32),
-                llvm.AtomicOrdering.monotonic,
-                syncscope="workgroup",
-                alignment=4,
-            ).result
+            ptr = lds_cnt + e
+            slot = fx.atomic_add(ptr, fx.Int32(1), syncscope="workgroup")
             row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
             rows_p[route_i32] = row
         gpu.barrier()

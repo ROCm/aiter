@@ -18,12 +18,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import arith as std_arith
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl._mlir.dialects import rocdl, vector
-from flydsl.expr import arith
+from flydsl.expr import arith, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import T, as_ir_value
@@ -75,18 +74,19 @@ def _byte_offset_to_i64(offset):
     ``index_cast`` just to satisfy this boundary.
     """
     if isinstance(offset, int):
-        return arith.constant(offset, type=T.i64)
+        return fx.Int64(offset)
     raw = _raw(offset)
     if isinstance(raw.type, ir.IndexType):
-        return arith.index_cast(T.i64, raw)
+        return fx.Int64(raw)
     if raw.type == T.i64:
-        return _ArithValue(raw)
-    return _ArithValue(std_arith.ExtUIOp(T.i64, raw).result)
+        return fx.Int64(raw)
+    # Byte offsets represented by narrower signless integers were zero-extended.
+    return fx.Uint64(raw)
 
 
 def _zero_dgroup_v8i32():
     z = as_ir_value(arith.constant(0, type=T.i32))
-    return vector.from_elements(T.vec(8, T.i32), [z, z, z, z, z, z, z, z])
+    return fx.Vector.from_elements([z, z, z, z, z, z, z, z], fx.Int32).ir_value()
 
 
 @dsl_loc_tracing
@@ -212,13 +212,13 @@ def make_tensor_gather_descriptor(
     g1_s6 = arith.constant(0, type=T.i32)
     g1_s7 = arith.constant(0, type=T.i32)
 
-    dgroup1 = vector.from_elements(
-        T.vec(8, T.i32),
+    dgroup1 = fx.Vector.from_elements(
         [
             as_ir_value(v)
             for v in [g1_s0, g1_s1, g1_s2, g1_s3, g1_s4, g1_s5, g1_s6, g1_s7]
         ],
-    )
+        fx.Int32,
+    ).ir_value()
 
     # GROUP 2 & 3: row indices
     zero = arith.constant(0, type=T.i32)
@@ -255,8 +255,12 @@ def make_tensor_gather_descriptor(
             )
             g3_vals.append(arith.ori(lo_masked, hi_shifted))
 
-    dgroup2 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(v) for v in g2_vals])
-    dgroup3 = vector.from_elements(T.vec(4, T.i32), [as_ir_value(v) for v in g3_vals])
+    dgroup2 = fx.Vector.from_elements(
+        [as_ir_value(v) for v in g2_vals], fx.Int32
+    ).ir_value()
+    dgroup3 = fx.Vector.from_elements(
+        [as_ir_value(v) for v in g3_vals], fx.Int32
+    ).ir_value()
 
     return TDMGatherDescriptor(
         dgroup0=dgroup0,
@@ -326,21 +330,17 @@ def make_tensor_gather_dgroup0(
     g0_s0 = arith.constant(g0_pred, type=T.i32)
     g0_s1 = lds_addr_i32
 
-    i32 = ir.IntegerType.get_signless(32)
-    g0_s2 = _ArithValue(std_arith.TruncIOp(i32, _raw(glb_base_i64)).result)
-    hi_raw = _ArithValue(_raw(glb_base_i64)).shrui(arith.constant(32, type=T.i64))
-    g0_s3 = _ArithValue(std_arith.TruncIOp(i32, _raw(hi_raw)).result) | arith.constant(
-        1 << 31, type=T.i32
-    )
-    return vector.from_elements(
-        T.vec(4, T.i32),
+    g0_s2 = fx.Uint32(_raw(glb_base_i64))
+    g0_s3 = fx.Uint32(fx.Uint64(_raw(glb_base_i64)) >> 32) | fx.Uint32(1 << 31)
+    return fx.Vector.from_elements(
         [
             as_ir_value(g0_s0),
             as_ir_value(g0_s1),
             as_ir_value(g0_s2),
             as_ir_value(g0_s3),
         ],
-    )
+        fx.Int32,
+    ).ir_value()
 
 
 @dsl_loc_tracing

@@ -9,11 +9,9 @@ via per-expert atomicAdd. One thread per route, no host-side argsort.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import Int32, T
 
-from aiter.ops.flydsl.kernels.kernels_common import create_llvm_ptr
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
@@ -63,13 +61,10 @@ class _RouteG2LStorage:
     lut: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
 
 
-def _slot_ptr(base_i64, elem_idx, address_space=1):
-    """Raw LLVM pointer to i32 element ``elem_idx`` of the buffer at ``base_i64``.
-
-    The atomicrmw builder needs a raw ``!llvm.ptr<n>``, which the layout/buffer
-    ops do not produce, so the byte address is formed by hand here.
-    """
-    return create_llvm_ptr(base_i64 + fx.Int64(elem_idx) * 4, address_space)
+def _i32_ptr(ptr):
+    """View a byte-pointer kernel argument as aligned i32 elements."""
+    ptr_type = fx.PointerType.get(fx.Int32.ir_type, ptr.address_space, 4)
+    return fx.recast_iter(ptr_type, ptr)
 
 
 def build_moe_route_maps_module():
@@ -85,9 +80,7 @@ def build_moe_route_maps_module():
         topk: Int32,
         max_m: Int32,
     ):
-        i32 = T.i32
-        # Raw i32 constant: llvm.atomicrmw takes ir.Value operands, not fx types.
-        c1_i32 = arith.constant(1, type=i32)
+        c1_i32 = fx.Int32(1)
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
@@ -97,15 +90,8 @@ def build_moe_route_maps_module():
 
             e = topk_p[route]
 
-            ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                c1_i32,
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            ).result
+            ptr = _i32_ptr(atomic_buffer) + e
+            slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
 
             row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
             c_p[route] = row
@@ -153,9 +139,7 @@ def build_moe_topids_to_rows_module():
         numel: Int32,
         max_m: Int32,
     ):
-        i32 = T.i32
-        # Raw i32 constant: llvm.atomicrmw takes ir.Value operands, not fx types.
-        c1_i32 = arith.constant(1, type=i32)
+        c1_i32 = fx.Int32(1)
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         in_range = route < fx.Uint32(numel)
         if in_range:
@@ -163,15 +147,8 @@ def build_moe_topids_to_rows_module():
             out_p = ptr_buf_tensor(topids_to_rows)
 
             e = topk_p[route]
-            ptr = _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), e)
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                ptr,
-                c1_i32,
-                llvm.AtomicOrdering.monotonic,
-                syncscope="agent",
-                alignment=4,
-            ).result
+            ptr = _i32_ptr(atomic_buffer) + e
+            slot = fx.atomic_add(ptr, c1_i32, syncscope="agent")
             row = fx.Uint32(slot) + fx.Uint32(e) * fx.Uint32(max_m)
             out_p[route] = row
 
@@ -272,15 +249,12 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
             # A dropped route that claimed a slot would still cost a grouped GEMM
             # row, and its computed row would alias the bucket-0 route holding
             # that slot -- hence incr 0 plus the sentinel.
-            incr = is_drop.select(c0, c1).ir_value()
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), eff_e),
+            incr = fx.Int32(is_drop.select(c0, c1))
+            slot = fx.atomic_add(
+                _i32_ptr(atomic_buffer) + eff_e,
                 incr,
-                llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
-                alignment=4,
-            ).result
+            )
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
             row_out = is_drop.select(dropped_row, row)
             out_p[route] = row_out
@@ -381,9 +355,7 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
 
         lds_cnt = fx.SharedAllocator().allocate(_RouteCntStorage).peek().cnt.ptr
-        # The LDS atomic below needs a raw addrspace(3) pointer; SharedAllocator
-        # has already folded the array's offset into this base.
-        cnt_base_i64 = fx.Int64(fx.ptrtoint(lds_cnt))
+        # The allocator's typed pointer already carries the shared address space.
 
         tk_p = ptr_buf_tensor(topk_ids)
         g2l_p = ptr_buf_tensor(g2l_lut)
@@ -464,16 +436,11 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
         my_rank = fx.Uint32(0)
         if is_kept:
             my_rank = fx.Uint32(
-                llvm.AtomicRMWOp(
-                    llvm.AtomicBinOp.add,
-                    _slot_ptr(
-                        cnt_base_i64, eff_e, address_space=fx.AddressSpace.Shared
-                    ),
-                    c1,
-                    llvm.AtomicOrdering.monotonic,
+                fx.atomic_add(
+                    lds_cnt + eff_e,
+                    fx.Int32(c1),
                     syncscope="workgroup",
-                    alignment=4,
-                ).result
+                )
             )
 
         gpu.barrier()
@@ -486,14 +453,11 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
             base_v = fx.Int32(0)
             if nz:
                 base_v = fx.Int32(
-                    llvm.AtomicRMWOp(
-                        llvm.AtomicBinOp.add,
-                        _slot_ptr(fx.Int64(ptrtoint(atomic_buffer)), b),
-                        cnt.ir_value(),
-                        llvm.AtomicOrdering.monotonic,
+                    fx.atomic_add(
+                        _i32_ptr(atomic_buffer) + b,
+                        cnt,
                         syncscope="agent",
-                        alignment=4,
-                    ).result
+                    )
                 )
             lds_cnt[fx.Uint32(b)] = base_v
         gpu.barrier()
@@ -769,15 +733,12 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
             # Counting a dropped route inflates masked_m, which grows psum and
             # makes the grouped GEMM compute rows that only fold away via
             # gather_w=0; the sentinel keeps that row unclaimed and unambiguous.
-            incr = is_drop.select(c0, c1).ir_value()
-            slot = llvm.AtomicRMWOp(
-                llvm.AtomicBinOp.add,
-                _slot_ptr(fx.Int64(ptrtoint(counter)), eff_e),
+            incr = fx.Int32(is_drop.select(c0, c1))
+            slot = fx.atomic_add(
+                _i32_ptr(counter) + eff_e,
                 incr,
-                llvm.AtomicOrdering.monotonic,
                 syncscope="agent",
-                alignment=4,
-            ).result
+            )
             row = fx.Uint32(slot) + eff_e * fx.Uint32(max_m)
             row_out = is_drop.select(dropped_row, row)
             out_p[route] = row_out
