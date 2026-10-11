@@ -12,15 +12,17 @@ import torch
 
 import aiter.ops.triton.attention.sparse_mla as smd
 from aiter.ops.triton.attention.sparse_mla import (
+    FNUZ_ARCHS,
     FP8_ARCHS,
+    FP8_SCALAR_ARCHS,
     SUPPORTED_ARCHS,
     sparse_mla_fwd,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
-# The arch-native fp8, as a producer on this machine writes it. That is OCP e4m3,
-# what the kernel reads, only on FP8_ARCHS; the fp8 cases skip everywhere else.
+# The arch-native fp8, as a producer on this machine writes it, which is the
+# encoding the kernel reads.
 FP8_DTYPE = get_fp8_e4m3_dtype()
 FP8_MAX = torch.finfo(FP8_DTYPE).max
 KV_LORA, ROPE = 512, 64
@@ -31,8 +33,12 @@ def _skip_unless_supported(dots="bf16", fmt="bf16"):
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS:
         pytest.skip(f"sparse_mla_fwd does not support {arch}")
-    if (dots == "fp8" or fmt != "bf16") and arch not in FP8_ARCHS:
-        pytest.skip(f"fp8 is read as OCP e4m3, and {arch}'s native fp8 is fnuz")
+    if dots == "fp8" and arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"fp8 dots are {'/'.join(FP8_SCALAR_ARCHS)}-only")
+    if fmt == "tensor" and arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"the fp8_scalar cache is {'/'.join(FP8_SCALAR_ARCHS)}-only")
+    if fmt == "dsmla" and arch not in FP8_ARCHS:
+        pytest.skip(f"the fp8_dsv32_mla cache is {'/'.join(FP8_ARCHS)}-only")
 
 
 def quantize_flat_fp8(kv):
@@ -157,14 +163,15 @@ def test_sparse_mla(fmt, dots, tol, H, C, topk, ragged, pool):
 def test_dot_precision_arch_gate(arch):
     """The fp8-dot gate, for every arch, from any machine.
 
-    The matrix above skips its fp8 cases off gfx950, so the gate has no
-    coverage on any arch without this.
+    The matrix above only runs its fp8 cases on the arch it is on.
     """
     assert smd._resolve_dot_precision("bf16", "fp8_scalar", arch) is False
-    if arch in FP8_ARCHS:
+    if arch in FP8_SCALAR_ARCHS:
         assert smd._resolve_dot_precision("fp8", "fp8_scalar", arch) is True
+        with pytest.raises(ValueError, match="needs an fp8 cache"):
+            smd._resolve_dot_precision("fp8", "bf16", arch)
     else:
-        with pytest.raises(ValueError, match="fnuz"):
+        with pytest.raises(ValueError, match="not supported"):
             smd._resolve_dot_precision("fp8", "fp8_scalar", arch)
 
 
@@ -186,44 +193,72 @@ def test_packed_cache_arch_gate(arch):
 def test_fp8_arch_gate(arch):
     """fp8 q and fp8 caches, for every arch, from any machine."""
     smd._check_fp8_arch(arch, "bf16", torch.bfloat16)
+    if arch in FP8_SCALAR_ARCHS:
+        smd._check_fp8_arch(arch, "fp8_scalar", torch.bfloat16)
     for fmt, q_dtype in (
-        ("fp8_scalar", torch.bfloat16),
         ("fp8_dsv32_mla", torch.bfloat16),
         ("bf16", torch.float8_e4m3fn),
     ):
         if arch in FP8_ARCHS:
             smd._check_fp8_arch(arch, fmt, q_dtype)
         else:
-            with pytest.raises(ValueError, match="fnuz"):
+            with pytest.raises(ValueError, match="takes bf16 q"):
                 smd._check_fp8_arch(arch, fmt, q_dtype)
 
 
-@pytest.mark.parametrize("fmt", ["tensor", "dsmla"])
-def test_native_fp8_cache_rejected(fmt):
-    """This arch's own fp8 behind a uint8 view, through the public wrapper.
-
-    Only the arch tells those bytes apart from OCP, and going through
+def test_native_dsmla_cache_rejected():
+    """This arch's own fp8_dsv32_mla records behind a uint8 view, through the
+    public wrapper, where only fp8_scalar is supported. Going through
     sparse_mla_fwd also catches the gate losing its one call site.
     """
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS or arch in FP8_ARCHS:
-        pytest.skip(f"fp8 caches run on {arch}")
-    q, cache, ks, idx, ptr, _ = _build(fmt, 1, 16, 64, 1024, ragged=False)
+        pytest.skip(f"fp8_dsv32_mla runs on {arch}")
+    q, cache, ks, idx, ptr, _ = _build("dsmla", 1, 16, 64, 1024, ragged=False)
     assert cache.dtype == torch.uint8
-    with pytest.raises(ValueError, match="fnuz"):
+    with pytest.raises(ValueError, match="takes bf16 q"):
         sparse_mla_fwd(q, cache, ptr, idx, D_QK**-0.5, kv_scale=ks)
+
+
+def test_foreign_fp8_cache_dtype_rejected():
+    """A typed fp8 cache in the other arch's encoding is refused, not misread."""
+    arch = arch_info.get_arch()
+    if arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"no fp8 cache runs on {arch}")
+    q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
+    foreign = (
+        torch.float8_e4m3fn
+        if FP8_DTYPE == torch.float8_e4m3fnuz
+        else torch.float8_e4m3fnuz
+    )
+    with pytest.raises(ValueError, match=f"is not {arch}'s fp8"):
+        sparse_mla_fwd(q, cache.view(foreign), ptr, idx, D_QK**-0.5, kv_scale=ks)
+
+
+@pytest.mark.parametrize(
+    "dtype", [torch.float8_e5m2, torch.float8_e5m2fnuz, torch.int8, torch.bool]
+)
+def test_non_e4m3_byte_cache_dtype_rejected(dtype):
+    """Other one-byte dtypes are refused rather than decoded as e4m3."""
+    arch = arch_info.get_arch()
+    if arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"no fp8 cache runs on {arch}")
+    q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
+    with pytest.raises(ValueError, match="unsupported cache dtype"):
+        sparse_mla_fwd(q, cache.view(dtype), ptr, idx, D_QK**-0.5, kv_scale=ks)
 
 
 @pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
 def test_launch_config_published(arch):
     """Every supported arch ships its launch config, checked from any machine."""
     assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch).keys()
+    assert {"BLOCK_K", "num_warps"} <= smd._get_config(arch, fp8_dots=True).keys()
 
 
 def test_lds_budget_gfx950_is_unchecked():
     """gfx950 is left to the launcher, though arch_info lists its LDS too.
 
-    The footprint model holds only for gfx942's bf16, non-async tiles.
+    The footprint model holds only for gfx942's non-async tiles.
     """
     smd._check_lds_budget("gfx950", 64, 2048, 64, kv_lds_pad=16)
 
@@ -267,6 +302,24 @@ def test_lds_budget_gfx942_boundary(kv_lds_pad, kv_lora_rank, rope, need):
         return
     with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
         smd._check_lds_budget("gfx942", block_k, kv_lora_rank, rope, kv_lds_pad)
+
+
+@pytest.mark.parametrize(
+    "kv_lora_rank, rope, need",
+    [(512, 0, None), (512, 64, None), (1024, 0, 67584), (512, 512, 68608)],
+)
+def test_lds_budget_gfx942_fp8_tile(kv_lora_rank, rope, need):
+    """CPU-only: fp8 dots' one-byte tiles, at their own BLOCK_K on gfx942.
+
+    512/0 and 512/64 compile to the 34816 and 39936 B the model gives them.
+    """
+    block_k = smd._get_config("gfx942", fp8_dots=True)["BLOCK_K"]
+    args = ("gfx942", block_k, kv_lora_rank, rope, 0)
+    if need is None:
+        smd._check_lds_budget(*args, fp8_dots=True)
+        return
+    with pytest.raises(ValueError, match=rf"needs {need} B of LDS"):
+        smd._check_lds_budget(*args, fp8_dots=True)
 
 
 def test_ds_mla_format():
@@ -350,3 +403,53 @@ def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
         rope=0,
         dot_precision=dots,
     )
+
+
+def test_fp8_dots_keep_the_softmax_tail():
+    """Each query's first key scores 9 above the other 2047, which carry a fifth
+    of the output at p ~ 1e-4 each. That is below fnuz's smallest subnormal
+    unless P_SCALE lifts p before the PV dot, and with split-K off a single
+    program quantizes every tail p after the max.
+    """
+    arch = arch_info.get_arch()
+    if arch not in FNUZ_ARCHS:
+        pytest.skip(f"P_SCALE is 1 on {arch}")
+    C, H, topk, pool = 4, 16, 2048, 1 << 13
+    sm = KV_LORA**-0.5
+    g = torch.Generator().manual_seed(0)
+    # Head h reads axis h alone, where the dominant key is 1 (score 9) and the
+    # tail keys are 0 (score 0). Elsewhere the tail keys share one direction.
+    q = torch.zeros(C, H, KV_LORA)
+    q[:, range(H), range(H)] = 9.0 / sm
+    u = torch.randn(KV_LORA, generator=g)
+    kv = torch.nn.functional.normalize(
+        u + 0.3 * torch.randn(pool, KV_LORA, generator=g), dim=-1
+    )
+    kv = kv * KV_LORA**0.5
+    kv[:, :H] = 0
+    kv[-1] = 0
+    kv[-1, :H] = 1
+    idx = torch.stack(
+        [
+            torch.cat([torch.tensor([pool - 1]), torch.randperm(pool - 1, generator=g)])
+            for _ in range(C)
+        ]
+    )[:, :topk]
+    idx = idx.flatten().to(torch.int32).cuda()
+    ptr = torch.arange(0, (C + 1) * topk, topk, dtype=torch.int32, device="cuda")
+    q = q.to(torch.bfloat16).cuda()
+    cache, ks = quantize_flat_fp8(kv.cuda())
+    ref = reference(q, dequant_flat_fp8(cache, ks).to(torch.bfloat16), idx, ptr, sm)
+    out, _ = sparse_mla_fwd(
+        q,
+        cache,
+        ptr,
+        idx,
+        sm,
+        kv_scale=ks,
+        qk_rope_head_dim=0,
+        dot_precision="fp8",
+        kv_splits=1,
+    )
+    e = rel_err(out, ref)
+    assert e < 5e-2, f"softmax tail: rel-err {e:.3e}"

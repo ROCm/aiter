@@ -21,6 +21,7 @@ from torch.profiler import ProfilerActivity, profile
 
 from aiter.ops.triton.attention.sparse_mla import (
     FP8_ARCHS,
+    FP8_SCALAR_ARCHS,
     SUPPORTED_ARCHS,
     sparse_mla_fwd,
 )
@@ -74,7 +75,7 @@ def device_time_ms(func, warmup=25, rep=100, flush=True):
     return total / rep / 1e3
 
 
-def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes):
+def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, q_elem_bytes):
     """Bytes the launch actually moves, counting rows as gathered.
 
     Split-K partials are left out: the split count is the kernel's own decision,
@@ -82,7 +83,7 @@ def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes):
     """
     kv = nnz * D_QK * kv_elem_bytes  # the gather, and the bulk of it
     idx = nnz * 4  # int32 index stream, read once
-    q = num_tokens * num_heads * D_QK * kv_elem_bytes
+    q = num_tokens * num_heads * D_QK * q_elem_bytes
     out = num_tokens * num_heads * KV_LORA_RANK * 2
     return kv + idx + q + out
 
@@ -156,19 +157,19 @@ def run_benchmark(args):
         for tokens in args.num_tokens
     ]
 
-    # sparse_mla_fwd raises on fp8 where the arch's native fp8 is not OCP e4m3,
-    # and triton's harness does not catch it, so drop the series instead.
+    # sparse_mla_fwd raises on fp8 dots outside FP8_SCALAR_ARCHS, and triton's
+    # harness does not catch it, so drop the series instead.
     dot_vals = ["bf16"]
     dot_names = ["bf16 dots"]
     dot_styles = [("green", "-")]
-    if arch_info.get_arch() in FP8_ARCHS:
+    if arch_info.get_arch() in FP8_SCALAR_ARCHS:
         dot_vals.append("fp8")
         dot_names.append("fp8 dots")
         dot_styles.append(("blue", "-"))
     else:
         print(
-            f"note: skipping the fp8-dot series, {arch_info.get_arch()}'s native "
-            "fp8 is fnuz and the kernel reads OCP e4m3"
+            f"note: skipping the fp8-dot series, {arch_info.get_arch()} has no "
+            "fp8 dots"
         )
 
     benchmark = triton.testing.Benchmark(
@@ -199,10 +200,14 @@ def run_benchmark(args):
             device=q.device,
         )
         if dots == "fp8":
-            # Hand q over already quantized, the way production does.
-            cache, scale = kv_fp8, kv_scale
-            q_scale = (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
-            q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
+            cache, scale, q_scale = kv_fp8, kv_scale, None
+            if arch_info.get_arch() in FP8_ARCHS:
+                # Hand q over already quantized, the way production does. The
+                # other archs take bf16 q only and quantize it inside the kernel.
+                q_scale = (
+                    (q.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
+                )
+                q = (q.float() / q_scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)
         else:
             cache, scale, q_scale = kv, None, None
 
@@ -226,7 +231,9 @@ def run_benchmark(args):
         num_tokens = q.shape[0]
         # QK reads the whole row, PV only the latent half
         flops = 2.0 * num_heads * nnz * (D_QK + KV_LORA_RANK)
-        moved = bytes_moved(num_tokens, num_heads, nnz, 1 if dots == "fp8" else 2)
+        moved = bytes_moved(
+            num_tokens, num_heads, nnz, cache.element_size(), q.element_size()
+        )
 
         if metric == "time":
             return time_ms
