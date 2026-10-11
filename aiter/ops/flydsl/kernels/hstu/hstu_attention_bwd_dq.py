@@ -1,35 +1,24 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""hstu_attention_bwd_dq - FlyDSL kernel (causal-only; computes dQ)
+"""FlyDSL query-owned HSTU backward kernel for dQ.
 
-Companion to hstu_attention_bwd.py. That kernel is KV-owned and produces dV/dK
-(both reduce over the query index). dQ instead reduces over the **key** index:
+Each program owns query rows and streams KV tiles:
 
-    dQ[q, hc] = alpha * sum_kv dS[q, kv] * K[kv, hc]
-    dS[q, kv] = mask .* (1/N) * silu'(alpha*S) * (dO * V^T)[q, kv],  S = alpha*Q*K^T
+    Z = alpha * Q * K^T
+    dZ = mask * silu'(Z) * (dO * V^T) / N
+    dQ = alpha * dZ * K
 
-so it wants the opposite orientation: each program **owns a query tile** (BLOCK_M q
-rows) and **streams KV tiles** (BLOCK_N) -- exactly the forward's layout. dQ rows are
-owned by a single program, so this is a lock-free single-writer accumulator.
-
-Pipeline per streamed KV tile (mirrors the forward's K DMA + V register-prefetch):
-  - K staged global->LDS (swizzled); V register-prefetched then published to LDS.
-  - GEMM1 S^T[kv, q] = K * Q^T (A = K from LDS, B = Q resident) -- same as the forward.
-  - retain the SiLU-derivative gate silu'(alpha*S) and the causal mask.
-  - dA[kv, q] = V * dO^T (A = V from LDS, B = dO resident); dS = mask .* (1/N) * silu' .* dA.
-  - dQ[q, hc] += dS[q, kv] * K[kv, hc] (dS frag reused as A-operand; K re-read from LDS as B),
-    with alpha applied once in the epilogue.
-
-Constraints match hstu_attention_bwd.py (causal only; {f16,bf16}; the divisibility /
-arch contracts of the forward).
+K and V are staged through LDS. Q and dO remain resident in registers. Each dQ
+row has one writer, so accumulation needs no atomics.
 """
 
 import functools
+import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
@@ -56,8 +45,18 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
     swz_col,
 )
 
-# Reuse the exact same validation contract as the dV/dK kernel.
+# Both backward kernels accept the same problem and tile shapes.
 validate_hstu_attention_bwd_dq = validate_hstu_attention_bwd
+
+
+# Small-head tiles defer the SiLU derivative until dS construction. This overlaps
+# exp2/reciprocal work with dA MFMAs without changing the live-state size.
+#
+# HSTU_DQ_GATE_LATE=1/0 overrides the default at import time for custom tiles.
+# It is not a kernel-cache key; use a fresh process and runtime cache when changing it.
+# `const_expr` is required below so FlyDSL removes the inactive path.
+_GATE_LATE_ENV = os.environ.get("HSTU_DQ_GATE_LATE")
+_GATE_LATE_MAX_HEAD_DIM = 64
 
 
 @functools.lru_cache(maxsize=16384)
@@ -121,18 +120,20 @@ def build_hstu_attention_bwd_dq(
     DK_STEPS = hidden_dim // MFMA_DA_K  # dA contraction steps (over hidden d)
     HC_CHUNKS = head_dim // MFMA_M  # dQ accumulator chunks (over head_dim)
 
+    GATE_LATE = (
+        head_dim <= _GATE_LATE_MAX_HEAD_DIM
+        if _GATE_LATE_ENV is None
+        else _GATE_LATE_ENV == "1"
+    )
+
     num_q_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    # HZ_TOTAL = batch * num_heads and its group ceil are batch-dependent, so they
-    # are passed as runtime scalars (hz_total, hz_per_group) rather than baked in;
-    # this keeps `batch` out of the build cache key (one binary serves all batches).
+    # `hz` is a flattened (batch, head) index. Its total and per-group ceiling
+    # stay runtime values so one binary serves every batch size.
 
     stride_qk_n = num_heads * head_dim
 
     K_STRIDE = HEAD_DIM_K
-    # Columns in [head_dim, HEAD_DIM_K) have no backing element in this head, so the
-    # K DMA source needs clamping (see async_load_k) -- the dV/dK kernel's Q_COL_GUARD
-    # on its own padded operand. Only live when padded; a 64-aligned head_dim makes it
-    # compile-time false and emits no compare/select.
+    # Clamp DMA columns in the padded K stride to this head's valid storage.
     K_COL_GUARD = head_dim < HEAD_DIM_K
     V_STRIDE = hidden_dim
 
@@ -157,10 +158,7 @@ def build_hstu_attention_bwd_dq(
     NUM_BATCHES_V = max(1, BLOCK_N // ROWS_PER_BATCH_V)
     V_NEEDS_GUARD = ROWS_PER_BATCH_V > BLOCK_N
 
-    # LDS map: [K row-major tile][V row-major tile]. K is XOR-swizzled by column
-    # (mirrors the forward's K tile); V stays natural [kv, d]. Each field is a
-    # 16B-aligned fx.Array; SharedAllocator sizes the LDS global (no manual
-    # finalize/get_base/offset math).
+    # K is column-swizzled for MFMA reads; V remains row-major.
     @fx.struct
     class SharedStorage:
         k: fx.Array[elem_dtype, BLOCK_N * K_STRIDE, 16]
@@ -183,9 +181,9 @@ def build_hstu_attention_bwd_dq(
         c_zero_qk_pack = Vec.filled(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
         c_zero_da_pack = Vec.filled(MFMA_DA_LANE_K, 0.0, elem_dtype).ir_value()
 
-        # QK and V*dO use the architecture-native dimension-axis MFMA. The dQ
-        # sequence reduction stays 16-deep so dS can be reused without shuffles.
-        # Equal shapes share one atom (the gfx942 path).
+        # QK and V*dO use architecture-native dimension-axis MFMAs. The dQ
+        # reduction stays 16-deep to reuse dS without lane shuffles.
+        # Matching MFMA shapes share one accumulator binding.
         qk_mfma_acc, da_mfma_acc, mfma_acc = bind_mfma_accs(
             elem_dtype,
             (MFMA_QK_K, MFMA_QK_LANE_K),
@@ -205,13 +203,12 @@ def build_hstu_attention_bwd_dq(
         local_hz_idx = pos_in_group // fx.Int32(num_q_tiles)
         q_tile_idx = pos_in_group % fx.Int32(num_q_tiles)
         hz_idx = grid_group * hz_per_group + local_hz_idx
-        # Padded tail of the last group (see hstu_attention_bwd.py): clamp to hz_idx=0
-        # for in-bounds reads, then seq_len=0 makes every query tile inactive.
+        # Clamp padded grid blocks for safe metadata reads, then mark them inactive.
         block_valid = hz_idx < hz_total
         hz_idx = block_valid.select(hz_idx, fx.Int32(0))
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
-        # Optional sort-by-length load balancing (see hstu_attention_bwd.py).
+        # Remap batches so each grid group receives balanced sequence work.
         if has_perm:
             batch_idx = fx.Int32(perm[batch_idx])
 
@@ -219,7 +216,7 @@ def build_hstu_attention_bwd_dq(
         seq_len = fx.Int32(seq_offsets[batch_idx + fx.Int32(1)]) - seq_start
         seq_len = block_valid.select(seq_len, fx.Int32(0))
 
-        # ---- Masked-id clamps (contextual shift then target-tail clamp; oracle order) ----
+        # Apply contextual shifting before target-tail clamping.
         num_target = fx.Int32(0)
         if has_targets:
             num_target = fx.Int32(num_targets[batch_idx])
@@ -238,7 +235,6 @@ def build_hstu_attention_bwd_dq(
                 xid = (xid > max_id).select(max_id, xid)
             return xid
 
-        # grouped_loader is shared (layout-algebra based)
         q_load = grouped_loader(
             q, head_dim, MFMA_QK_LANE_K
         )  # resident Q (B-operand for S)
@@ -253,11 +249,8 @@ def build_hstu_attention_bwd_dq(
             fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
         ) * fx.Int64(2)
 
-        # Shape-carried LDS views (no manual row*stride+col; the trailing group axis
-        # carries the stride). K is grouped by MFMA_LANE_K for the swizzled GEMM1
-        # pack read + the dQ scalar gather; V is grouped by MFMA_LANE_K for the dA
-        # A-operand pack read. The V register-publish store writes VEC_V-wide, so it
-        # takes a VEC_V-grouped view of the same buffer.
+        # The trailing layout axis carries packed MFMA operands. V also has a
+        # VEC_V-grouped view for register-to-LDS stores.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         k_view = lds.k.view(
             fx.make_layout(
@@ -276,8 +269,7 @@ def build_hstu_attention_bwd_dq(
         )
         k_lds_byte_base = fx.ptrtoint(fx.get_iter(k_view))
 
-        # ── Copy-atom global->LDS DMA (buffer_load_lds via fx.copy) ──
-        # Same idiom as the dV/dK kernel (shared make_lds_dma helper).
+        # Copy-atom global-to-LDS DMA.
         _dma_atom, _lds_ptr_ty, _rebased_buffer_div = make_lds_dma(DMA_BYTES, elem_type)
 
         k_div = _rebased_buffer_div(
@@ -311,7 +303,7 @@ def build_hstu_attention_bwd_dq(
             q_packs.append(per_qg)
 
         # ---- Resident dO B-operand packs (dA = V*dO^T) ----
-        # b_pack[i] = dO[q = lane_mod_16, d = ks*16 + lane_div_16*4 + i]; contraction over d.
+        # Each pack holds adjacent hidden-dimension values for one query row.
         do_packs = []  # do_packs[ks][qg]
         for ks in range_constexpr(DK_STEPS):
             d_col = fx.Int32(ks * MFMA_DA_K) + lane_div_16 * fx.Int32(MFMA_DA_LANE_K)
@@ -332,11 +324,7 @@ def build_hstu_attention_bwd_dq(
         c_zero_f = fx.Float32(0.0)
 
         def silu_grad_batch(s_list):
-            """silu'(alpha*s) = sigma*(1 + alpha*s*(1-sigma)); same fast sigmoid as forward.
-
-            The fastmath context gives every add/mul the `fast` flag and turns the
-            reciprocal into v_rcp_f32; only exp2 stays on the amdgcn intrinsic. See the
-            dV/dK kernel for why the stable fx.math.exp2 is not used."""
+            """Compute silu'(alpha*s) with fast fp32 exp2 and reciprocal."""
             with arith.fastmath(arith.FastMathFlags.fast):
                 sc = [s * c_alpha for s in s_list]
                 tt = [s * c_neg_log2e for s in sc]
@@ -350,13 +338,12 @@ def build_hstu_attention_bwd_dq(
 
         q_row_ids = [to_id(q_rows[qg]) for qg in range_constexpr(Q_SUBTILES)]
 
-        # ---- Streamed KV range: causal upper bound + optional window lower / contextual opener ----
+        # ---- Streamed KV range: causal upper bound, window lower bound, context ----
         q_start = q_tile_idx * fx.Int32(BLOCK_M)
         q_end = q_start + fx.Int32(BLOCK_M)
         active = q_start < seq_len
         clamped = (q_end < seq_len).select(q_end, seq_len)
-        # The prefix block (holds logical row id 0) attends the whole contextual prefix above its
-        # diagonal, so its KV range opens to seq_len.
+        # Logical row zero attends the full contextual prefix above its diagonal.
         base_upper = clamped
         if has_contextual:
             ctx_block = q_start < fx.Int32(contextual_seq_len)
@@ -386,8 +373,8 @@ def build_hstu_attention_bwd_dq(
         wave_lds_base_k = fx.Int32(k_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
         )
-        # Wave-uniform base pulled into an SGPR; see the dV/dK kernel on why this
-        # unstable rocdl builder has no stable replacement.
+        # DMA needs a wave-uniform LDS base in an SGPR. FlyDSL has no stable
+        # exported wrapper for readfirstlane.
         wave_lds_lane0_k = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_k)
         k_dma_rows = []
         k_dma_gcols = []
@@ -520,9 +507,7 @@ def build_hstu_attention_bwd_dq(
                     def keep_col(
                         i, qg=qg, kv_ids=kv_ids, kv_raw=kv_raw, kv_in_seq=kv_in_seq
                     ):
-                        """mask for (owned query q_rows[qg], streamed key kv_raw[i]); same
-                        predicate as the forward: causal/diagonal, window, contextual opener.
-                        """
+                        """Apply causal, window, and contextual mask predicates."""
                         dist = q_row_ids[qg] - kv_ids[i]
                         keep = (q_rows[qg] == kv_raw[i]) | (dist > fx.Int32(0))
                         if has_window:
@@ -533,8 +518,14 @@ def build_hstu_attention_bwd_dq(
                         keep = keep & kv_in_seq[i] & q_in_bounds[qg]
                         return keep
 
+                    # Keep masks as rematerializable predicates instead of extending
+                    # the lifetime of masked fp32 gate values in VGPRs.
                     keep = [keep_col(i) for i in range_constexpr(MFMA_ELEMS_PER_LANE)]
-                    grad_vals = silu_grad_batch(s_vals)
+
+                    # Carry raw scores when gate evaluation is deferred.
+                    grad_vals = s_vals
+                    if const_expr(not GATE_LATE):
+                        grad_vals = silu_grad_batch(s_vals)
                     g_meta[ng][qg] = (grad_vals, keep)
             return g_meta
 
@@ -564,10 +555,13 @@ def build_hstu_attention_bwd_dq(
                     cur = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
                     for ks in range_constexpr(DK_STEPS):
                         cur = da_mfma_acc(v_a[ks].ir_value(), do_packs[ks][qg], cur)
+                    grad_vals, keep = g_meta[ng][qg]
+                    # Keep deferred gate work inside this loop to overlap dA MFMAs.
+                    if const_expr(GATE_LATE):
+                        grad_vals = silu_grad_batch(grad_vals)
                     da_vals = [
                         Vec(cur)[i] for i in range_constexpr(MFMA_ELEMS_PER_LANE)
                     ]
-                    grad_vals, keep = g_meta[ng][qg]
                     ds_vals = []
                     with arith.fastmath(arith.FastMathFlags.fast):
                         for i in range_constexpr(MFMA_ELEMS_PER_LANE):
@@ -621,11 +615,7 @@ def build_hstu_attention_bwd_dq(
             gpu.barrier()  # V published; K still resident in LDS for dQ's B-operand
             ds_packs = compute_ds_packs(g_meta)
             dq_acc = accum_dq_tile(dq_acc, ds_packs)
-            # accum_dq_tile reads the K/V LDS tiles at the end of the body, so without a
-            # closing barrier a wave that finishes early wraps around and DMAs the next
-            # tile over LDS another wave is still reading (WAR). Left open, dQ is wrong
-            # and not bitwise reproducible once batch*num_heads is large enough for
-            # waves to drift apart across tiles.
+            # Prevent the next DMA from overwriting K/V while another wave reads it.
             gpu.barrier()
             return dq_acc
 
@@ -642,7 +632,7 @@ def build_hstu_attention_bwd_dq(
                 loop_results = yield dq_acc
 
             # ---- Epilogue: store dQ (alpha applied here) ----
-            # dQ C[m=q, n=hc]: q row = q_wave_base + qg*16 + lane_div_16*4 + e; hc col = c*16 + lane_mod_16.
+            # MFMA lanes map directly to query rows and head-dimension columns.
             results = (
                 list(loop_results)
                 if isinstance(loop_results, (list, tuple))

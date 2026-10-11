@@ -1,35 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""hstu_attention_bwd - FlyDSL KV-owned **fused** backward (dV + dK in one pass)
+"""FlyDSL KV-owned HSTU backward kernel for dV and dK.
 
-Backward of HSTU attention. Given dO, recompute S = alpha*Q*K^T and sigma from
-Q,K (nothing is stashed by the forward), form the masked, silu-gated attention
-weights, and produce both KV-owned gradient families from the single recompute:
+Each program owns KV rows and streams query tiles. Both gradients reuse the same
+score and gate fragments:
 
-    dV[kv, d]  = (1/N) * sum_q P[q, kv] * dO[q, d],   P  = mask .* silu(alpha*S)
-    dK[kv, hc] = alpha  * sum_q dS[q, kv] * Q[q, hc], dS = mask .* (1/N) * silu'(alpha*S) .* (dO*V^T)
+    Z = alpha * Q * K^T
+    A = mask * silu(Z) / N
+    dV = A^T * dO
+    dZ = mask * silu'(Z) * (dO * V^T) / N
+    dK = alpha * dZ^T * Q
 
-Both dV and dKreduce over the **query** index and share the same
-S/dS fragment orientation with *no transpose*, so one program can carry both
-accumulator families and compute S **once** per streamed-query tile.
-
-Orientation (same as the forward with roles swapped): dV reduces over the query
-index, so each program owns a BLOCK_M KV tile and streams BLOCK_N query tiles; K
-and V are resident register operands; Q and dO are streamed through LDS. GEMM1's
-C[q, kv] = S is reused as the dV/dK GEMM2 A-operand (contracting q). dV/dK rows
-are single-writer.
-
-Constraints:
-  - causal + mask variants (num_targets / max_attn_len / contextual_seq_len).
-  - dtype in {f16, bf16}; accumulate in fp32.
-  - head_dim % 16 == 0, hidden_dim % 16 == 0. Necessary but not sufficient: the two
-    streamed tiles must each divide the arch's DMA pass and hidden_dim/vec_v lanes
-    per row must divide the thread block, which ties the usable dims to num_waves
-    (and rules some out entirely -- hidden_dim 144/176/208/240 have no valid tile).
-    A multiple of 64 is always safe; validate_hstu_attention_bwd is the authority.
-  - block_m must be a multiple of num_waves*16.
-  - fast/unsafe FP math: not strict IEEE-754 (mirrors the forward's SiLU).
+Rows are single-writer. Inputs are f16 or bf16, accumulation is fp32, and score
+math uses fast floating-point operations. `validate_hstu_attention_bwd` defines
+the supported dimensions, tile shapes, masks, and architectures.
 """
 
 import functools
@@ -227,9 +212,8 @@ def build_hstu_attention_bwd_dvdk(
     HC_CHUNKS = head_dim // MFMA_M
 
     num_kv_tiles = (max_seq_len + BLOCK_M - 1) // BLOCK_M
-    # HZ_TOTAL = batch * num_heads and its group ceil are batch-dependent, so they
-    # are passed as runtime scalars (hz_total, hz_per_group) rather than baked in;
-    # this keeps `batch` out of the build cache key (one binary serves all batches).
+    # `hz` is a flattened (batch, head) index. Its total and per-group ceiling
+    # stay runtime values so one binary serves every batch size.
     stride_qk_n = num_heads * head_dim
 
     Q_STRIDE = HEAD_DIM_K
@@ -256,13 +240,42 @@ def build_hstu_attention_bwd_dvdk(
     N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES
     N_ACC = N_ACC_DV + N_ACC_DK
 
-    # LDS map: [Q row-major tile][dO row-major tile]. Q is XOR-swizzled by column
-    # (mirrors the forward's K tile); dO stays natural [q, d]. Each field is a
-    # 16B-aligned fx.Array; SharedAllocator sizes the LDS global.
+    # Row-major tiles feed the score and dA MFMAs. Transposed copies make the
+    # query-reduction operands contiguous, replacing four scalar LDS reads with
+    # one packed read. The workgroup builds each copy once after the async DMA.
+    # Padding spreads adjacent transpose rows across LDS banks.
+    T_PAD = MFMA_LANE_K
+    DO_T_STRIDE = BLOCK_N + T_PAD
+    Q_T_STRIDE = BLOCK_N + T_PAD
+
+    # Keep total LDS at or below 32 KiB so two workgroups fit in a 64 KiB budget.
+    # Larger tiles use scalar gathers instead of transposed copies.
+    T_LDS_BUDGET = 32768
+    _lds_row_major = (BLOCK_N * Q_STRIDE + BLOCK_N * DO_STRIDE) * 2
+    _lds_transposed = (head_dim * Q_T_STRIDE + hidden_dim * DO_T_STRIDE) * 2
+    USE_T_TILES = (_lds_row_major + _lds_transposed) <= T_LDS_BUDGET
+    # A single-row placeholder keeps the LDS views valid when transposes are disabled.
+    T_Q_ROWS = head_dim if USE_T_TILES else 1
+    T_DO_ROWS = hidden_dim if USE_T_TILES else 1
+
+    # Build work is one unit per (row, 4-wide q group), spread over the workgroup.
+    assert BLOCK_N % MFMA_LANE_K == 0
+    T_QGROUPS = BLOCK_N // MFMA_LANE_K
+    DO_T_UNITS = hidden_dim * T_QGROUPS
+    Q_T_UNITS = head_dim * T_QGROUPS
+    NUM_DO_T_PASSES = (DO_T_UNITS + BLOCK_THREADS - 1) // BLOCK_THREADS
+    NUM_Q_T_PASSES = (Q_T_UNITS + BLOCK_THREADS - 1) // BLOCK_THREADS
+    DO_T_EXACT = DO_T_UNITS % BLOCK_THREADS == 0
+    Q_T_EXACT = Q_T_UNITS % BLOCK_THREADS == 0
+
+    # LDS stores row-major Q/dO for score and dA, plus unswizzled transposes for
+    # dK/dV. Q is column-swizzled to distribute its row-major MFMA reads.
     @fx.struct
     class SharedStorage:
         q: fx.Array[elem_dtype, BLOCK_N * Q_STRIDE, 16]
         do: fx.Array[elem_dtype, BLOCK_N * DO_STRIDE, 16]
+        q_t: fx.Array[elem_dtype, T_Q_ROWS * Q_T_STRIDE, 16]
+        do_t: fx.Array[elem_dtype, T_DO_ROWS * DO_T_STRIDE, 16]
 
     @flyc.kernel(known_block_size=[BLOCK_THREADS, 1, 1])
     def hstu_attention_bwd_dvdk(
@@ -282,10 +295,9 @@ def build_hstu_attention_bwd_dvdk(
         c_zero_qk_pack = Vec.filled(MFMA_QK_LANE_K, 0.0, elem_dtype).ir_value()
         c_zero_da_pack = Vec.filled(MFMA_DA_LANE_K, 0.0, elem_dtype).ir_value()
 
-        # QK and V*dO use the architecture-native dimension-axis MFMA. The dV
-        # and dK sequence reductions stay 16-deep so score fragments can remain
-        # register-resident without a cross-lane redistribution. Equal shapes
-        # share one atom (the gfx942 path).
+        # QK and V*dO use architecture-native dimension-axis MFMAs. The dV/dK
+        # reductions stay 16-deep to reuse score fragments without lane shuffles.
+        # Matching MFMA shapes share one accumulator binding.
         qk_mfma_acc, da_mfma_acc, mfma_acc = bind_mfma_accs(
             elem_dtype,
             (MFMA_QK_K, MFMA_QK_LANE_K),
@@ -314,9 +326,7 @@ def build_hstu_attention_bwd_dvdk(
         batch_idx = hz_idx // fx.Int32(num_heads)
         head_idx = hz_idx % fx.Int32(num_heads)
 
-        # Group-aware sort-by-length remap (same as the split kernels): each grid
-        # group processes a Sum(n^2)-balanced longest-first set. `perm` is built
-        # host-side; heads stay put. The dummy 1-elem perm is never traced when off.
+        # Remap batches so each grid group receives balanced quadratic sequence work.
         if const_expr(has_perm):
             batch_idx = fx.Int32(perm[batch_idx])
 
@@ -350,9 +360,7 @@ def build_hstu_attention_bwd_dvdk(
             fx.Int64(seq_start) * fx.Int64(stride_qk_n) + fx.Int64(q_head_offset)
         ) * fx.Int64(2)
 
-        # Shape-carried LDS views (the trailing group axis carries the stride). Q is grouped by MFMA_LANE_K for the swizzled GEMM1
-        # pack read + the dK scalar gather; dO is grouped by MFMA_LANE_K for the dA
-        # A-operand pack read + the dV scalar gather.
+        # The trailing layout axis carries each row's packed MFMA operand.
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         q_view = lds.q.view(
             fx.make_layout(
@@ -364,6 +372,20 @@ def build_hstu_attention_bwd_dvdk(
             fx.make_layout(
                 (BLOCK_N, DO_STRIDE // MFMA_DA_LANE_K, MFMA_DA_LANE_K),
                 (DO_STRIDE, MFMA_DA_LANE_K, 1),
+            )
+        )
+        # Transposed tiles, grouped along q by the accum-GEMM pack width so a
+        # B-operand pack is view[row, q_grp, None].load() -- a single ds_read_b64.
+        q_t_view = lds.q_t.view(
+            fx.make_layout(
+                (T_Q_ROWS, Q_T_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                (Q_T_STRIDE, MFMA_LANE_K, 1),
+            )
+        )
+        do_t_view = lds.do_t.view(
+            fx.make_layout(
+                (T_DO_ROWS, DO_T_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
+                (DO_T_STRIDE, MFMA_LANE_K, 1),
             )
         )
         q_lds_byte_base = fx.ptrtoint(fx.get_iter(q_view))
@@ -455,20 +477,10 @@ def build_hstu_attention_bwd_dvdk(
         kv_end_row = kv_start_row + fx.Int32(BLOCK_M)
         active = kv_start_row < seq_len
 
-        # ---- Streamed-query range: causal lower bound + optional window upper cap ----
-        # Causal: queries below the KV tile never attend it (dist<=0), so start the
-        # sweep at the tile's own row (contextual row-0 opener needs the full range).
-        # Window: a KV row is seen only by queries within `max_attn_len` *ahead* of it
-        # (KV-owned mirror of the dq window *lower* bound), so the causal `seq_len`
-        # upper bound can be capped at `kv_end + max_attn_len` — the beyond-window
-        # query tiles were iterated and masked to zero before (see the opt log).
-        # Targets clamp to the shared id `max_id`, so a target query's raw position
-        # (up to seq_len) is unrelated to its effective id: if this KV tile lies
-        # within the window of `max_id` (`win_upper > max_id`), *every* target query
-        # still attends and the cap must reopen to seq_len, else their dV/dK
-        # contributions would be dropped. Contextual keeps the conservative seq_len
-        # (prefix opener adds low-id queries that the raw-position cap can't reason
-        # about); semi_local_fig has no contextual, so it takes the capped path.
+        # Causal queries start at the owned KV tile. A local window caps the upper
+        # query bound. Target rows share `max_id`, so the cap reopens to `seq_len`
+        # when that effective ID sees this tile. Contextual masks keep the full
+        # range because raw positions do not describe contextual prefix rows.
         q_upper = seq_len
         if has_window and not has_contextual:
             win_upper = kv_end_row + fx.Int32(max_attn_len)
@@ -489,10 +501,8 @@ def build_hstu_attention_bwd_dvdk(
         wave_lds_base_q = fx.Int32(q_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
         )
-        # The base is wave-uniform, so pull it into an SGPR for the DMA destination.
-        # readfirstlane is unstable per FlyDSL docs/api_stability.md (absent from
-        # rocdl.__all__) and has no stable counterpart: fx.gpu exports lane_id and the
-        # shuffle_* family only. Same for the dO base below and the dQ kernel's K base.
+        # DMA needs a wave-uniform LDS base in an SGPR. FlyDSL has no stable
+        # exported wrapper for readfirstlane.
         wave_lds_lane0_q = rocdl.readfirstlane(fx.Int32.ir_type, wave_lds_base_q)
         q_dma_rows = []
         q_dma_gcols = []
@@ -538,9 +548,7 @@ def build_hstu_attention_bwd_dvdk(
                 src = fx.slice(q_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
 
-        # Direct dO global->LDS DMA, row-major [q, d].
-        # OOB q rows fetch token 0's dO (finite); their P/dS are masked to 0 so the
-        # value is multiplied out — same safe-garbage contract as the Q DMA.
+        # Out-of-range rows read token zero; masking removes them before accumulation.
         c_stride_do_n = fx.Int32(stride_do_n)
         wave_lds_base_do = fx.Int32(do_lds_byte_base) + fx.Int32(wave_id) * fx.Int32(
             WARP_SIZE * DMA_BYTES
@@ -567,6 +575,60 @@ def build_hstu_attention_bwd_dvdk(
                 )
                 src = fx.slice(do_div, (None, fx.Int32(src_elem)))
                 fx.copy(_dma_atom, src, dst)
+
+        # One transpose unit covers one row and one MFMA-width query group.
+        def _t_unit_decode(num_passes, units, exact):
+            rows, qgs = [], []
+            for p in range_constexpr(num_passes):
+                unit = tid + fx.Int32(p * BLOCK_THREADS)
+                if const_expr(not exact):
+                    # Surplus lanes redo the last unit rather than branch: the
+                    # write is idempotent (same address, same value).
+                    unit = (unit >= fx.Int32(units)).select(fx.Int32(units - 1), unit)
+                rows.append(unit // fx.Int32(T_QGROUPS))
+                qgs.append(unit % fx.Int32(T_QGROUPS))
+            return rows, qgs
+
+        do_t_rows, do_t_qgs = (
+            _t_unit_decode(NUM_DO_T_PASSES, DO_T_UNITS, DO_T_EXACT)
+            if USE_T_TILES
+            else ([], [])
+        )
+        q_t_rows, q_t_qgs = (
+            _t_unit_decode(NUM_Q_T_PASSES, Q_T_UNITS, Q_T_EXACT)
+            if USE_T_TILES
+            else ([], [])
+        )
+
+        def build_transposed_tiles():
+            """Build packed dO and Q transposes cooperatively in LDS."""
+            for p in range_constexpr(NUM_DO_T_PASSES):
+                d_row = do_t_rows[p]
+                qg = do_t_qgs[p]
+                q_base = qg * fx.Int32(MFMA_LANE_K)
+                d_grp = d_row // fx.Int32(MFMA_DA_LANE_K)
+                d_lane = d_row % fx.Int32(MFMA_DA_LANE_K)
+                elems = [
+                    do_view[q_base + fx.Int32(i), d_grp, d_lane]
+                    for i in range_constexpr(MFMA_LANE_K)
+                ]
+                do_t_view[d_row, qg, None].store(Vec.from_elements(elems, elem_dtype))
+            for p in range_constexpr(NUM_Q_T_PASSES):
+                hc_row = q_t_rows[p]
+                qg = q_t_qgs[p]
+                q_base = qg * fx.Int32(MFMA_LANE_K)
+                elems = []
+                for i in range_constexpr(MFMA_LANE_K):
+                    q_row = q_base + fx.Int32(i)
+                    col = q_swz_col(q_row, hc_row)
+                    elems.append(
+                        q_view[
+                            q_row,
+                            col // fx.Int32(MFMA_QK_LANE_K),
+                            col % fx.Int32(MFMA_QK_LANE_K),
+                        ]
+                    )
+                q_t_view[hc_row, qg, None].store(Vec.from_elements(elems, elem_dtype))
 
         def read_q_packs(ng):
             q_row = fx.Int32(ng * MFMA_M) + lane_mod_16
@@ -641,8 +703,18 @@ def build_hstu_attention_bwd_dvdk(
                     s_meta[ng][og] = (grad_vals, keep)
             return p_packs, s_meta
 
-        def _dv_gather(c):
-            # dO B-operand packs (4 adjacent q at a fixed d) for output chunk c.
+        def _dv_gather_t(c):
+            # dO B-operand packs (4 adjacent q at a fixed d) for output chunk c,
+            # one ds_read_b64 each out of dO^T.
+            do_packs = []
+            for ng in range_constexpr(Q_STREAM_SUBTILES):
+                d_row = fx.Int32(c * MFMA_M) + lane_mod_16
+                q_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
+                do_packs.append(do_t_view[d_row, q_grp, None].load().ir_value())
+            return do_packs
+
+        def _dv_gather_scalar(c):
+            # Fallback when dO^T does not fit: 4x ds_read_u16 per pack.
             do_packs = []
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 d_col = fx.Int32(c * MFMA_M) + lane_mod_16
@@ -655,6 +727,8 @@ def build_hstu_attention_bwd_dvdk(
                 ]
                 do_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
             return do_packs
+
+        _dv_gather = _dv_gather_t if USE_T_TILES else _dv_gather_scalar
 
         def accum_dv_tile(dv_acc, p_packs):
             # Prefetch next chunk's B-operand gather before consuming the current
@@ -708,11 +782,21 @@ def build_hstu_attention_bwd_dvdk(
                     ds_packs[ng][og] = pack_mfma_frag(ds_vals, is_bf16, elem_dtype)
             return ds_packs
 
-        def _dk_gather(c):
+        def _dk_gather_t(c):
             # Q B-operand packs (4 adjacent q at a fixed hc) for output chunk c,
-            # scalar-gathered from the *streamed* swizzled Q LDS view (col ->
-            # group col//MFMA_LANE_K, lane col%MFMA_LANE_K), reusing GEMM1's Q — no
-            # separate preshuffled q_t load.
+            # one ds_read_b64 each out of Q^T. The swizzle is absorbed into the
+            # transpose build, so no q_swz_col here.
+            qb_packs = []
+            for ng in range_constexpr(Q_STREAM_SUBTILES):
+                hc_row = fx.Int32(c * MFMA_M) + lane_mod_16
+                q_grp = fx.Int32(ng * (MFMA_M // MFMA_LANE_K)) + lane_div_16
+                qb_packs.append(q_t_view[hc_row, q_grp, None].load().ir_value())
+            return qb_packs
+
+        def _dk_gather_scalar(c):
+            # Fallback when Q^T does not fit: scalar-gather from the *streamed*
+            # swizzled Q LDS view (col -> group col//MFMA_LANE_K, lane
+            # col%MFMA_LANE_K), reusing GEMM1's Q.
             qb_packs = []
             for ng in range_constexpr(Q_STREAM_SUBTILES):
                 hc_col = fx.Int32(c * MFMA_M) + lane_mod_16
@@ -730,6 +814,8 @@ def build_hstu_attention_bwd_dvdk(
                     )
                 qb_packs.append(Vec.from_elements(elems, elem_dtype).ir_value())
             return qb_packs
+
+        _dk_gather = _dk_gather_t if USE_T_TILES else _dk_gather_scalar
 
         def accum_dk_tile(dk_acc, ds_packs):
             qb_cur = _dk_gather(0)
@@ -752,16 +838,18 @@ def build_hstu_attention_bwd_dvdk(
             async_load_do_lds(q_start)
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
+            # Defer the publish barrier so transpose writes overlap the score MFMAs.
+            if const_expr(USE_T_TILES):
+                build_transposed_tiles()
             q_packs = [read_q_packs(ng) for ng in range_constexpr(Q_STREAM_SUBTILES)]
             p_packs, s_meta = compute_s_tile(q_start, q_packs)
             dv_acc = [acc[i] for i in range(N_ACC_DV)]
             dk_acc = [acc[N_ACC_DV + i] for i in range(N_ACC_DK)]
+            if const_expr(USE_T_TILES):
+                gpu.barrier()  # dO^T / Q^T published
             dv_acc = accum_dv_tile(dv_acc, p_packs)
             dk_acc = accum_dk_tile(dk_acc, compute_ds_packs(s_meta))
-            # _dk_gather reads the Q LDS tile at the very end of the body, so without a
-            # closing barrier a wave that finishes early wraps around and DMAs the next
-            # tile over LDS another wave is still reading (WAR). Left open, dK is not
-            # bitwise reproducible run to run.
+            # Prevent the next DMA from overwriting Q LDS while another wave reads it.
             gpu.barrier()
             return dv_acc + dk_acc
 
