@@ -35,7 +35,7 @@ import inspect
 
 import flydsl.expr as fx
 from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, rocdl
+from flydsl._mlir.dialects import llvm
 from flydsl._mlir.extras import types as T
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.runtime.device import is_rdna_arch
@@ -43,7 +43,7 @@ from flydsl.runtime.device import is_rdna_arch
 # FlyDSL changed raw buffer cache policy from an i32 operand to an enum
 # attribute. Keep this vendored compatibility layer usable with both forms.
 _RAW_PTR_BUFFER_AUX_IS_ATTRIBUTE = (
-    inspect.signature(rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
+    inspect.signature(fx.rocdl.RawPtrBufferLoadOp).parameters["aux"].kind
     is inspect.Parameter.KEYWORD_ONLY
 )
 
@@ -301,9 +301,9 @@ class BufferResourceDescriptor:
 
         # Create resource descriptor (returns !llvm.ptr<8>)
         rsrc_type = ir.Type.parse("!llvm.ptr<8>")
-        rsrc = rocdl.MakeBufferRsrcOp(
+        rsrc = fx.rocdl.make_buffer_rsrc(
             rsrc_type, base_ptr, stride_val, num_records, flags
-        ).result
+        )
 
         return BufferResourceDescriptor(rsrc)
 
@@ -345,9 +345,7 @@ def create_buffer_resource_from_addr(
     else:
         num_records = fx.Int64(_unwrap_value(num_records_bytes)).ir_value()
     rsrc_type = ir.Type.parse("!llvm.ptr<8>")
-    return rocdl.MakeBufferRsrcOp(
-        rsrc_type, base_ptr, stride, num_records, flags
-    ).result
+    return fx.rocdl.make_buffer_rsrc(rsrc_type, base_ptr, stride, num_records, flags)
 
 
 @dsl_loc_tracing
@@ -492,15 +490,13 @@ def buffer_load(
     )
 
     # Emit buffer load
-    load_op = rocdl.RawPtrBufferLoadOp(
+    return fx.rocdl.raw_ptr_buffer_load(
         result_type,
         rsrc,
         offset.ir_value(),
         soffset,
         aux=aux,
     )
-
-    return load_op.result
 
 
 @dsl_loc_tracing
@@ -563,7 +559,7 @@ def buffer_store(
     )
 
     # Emit buffer store
-    rocdl.RawPtrBufferStoreOp(
+    fx.rocdl.raw_ptr_buffer_store(
         data,
         rsrc,
         offset.ir_value(),

@@ -4,18 +4,15 @@
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as _llvm
-from flydsl._mlir.dialects import rocdl as _rocdl
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .. import buffer_ops
 from ..mxfp4_gemm_common import _e8m0_from_amax, _fabs_f32
-
-traced = ASTRewriter.transform
 
 MAX_TP = 8
 DEADLINE = 200_000_000
@@ -204,7 +201,7 @@ def _dma(lds_addr, rs, voff, soff, nbytes, aux):
     lds_ptr = fx.to_llvm_ptr(
         fx.inttoptr(fx.PointerType.get(T.i8, fx.AddressSpace.Shared), uni(lds_addr))
     )
-    _rocdl.raw_ptr_buffer_load_async_lds(
+    fx.rocdl.raw_ptr_buffer_load_async_lds(
         rs,
         lds_ptr,
         _u(i32(nbytes)),
@@ -395,7 +392,7 @@ def alive(t0):
     return (now() - t0) < fx.Int64(DEADLINE)
 
 
-@traced
+@flyc.jit
 def spin_lds_ge(L, off, target):
     cur = lds_ld_acq(L, off)
     while cur < target:
@@ -403,14 +400,14 @@ def spin_lds_ge(L, off, target):
         cur = lds_ld_acq(L, off)
 
 
-@traced
+@flyc.jit
 def spin0(L, lane, off, target):
     if lane == i32(0):
         spin_lds_ge(L, off, target)
     rocdl.sched_barrier(0)
 
 
-@traced
+@flyc.jit
 def poll_sys_ge(addr, target, nap=2):
     cur = g_ld_sys(addr)
     t0 = now()

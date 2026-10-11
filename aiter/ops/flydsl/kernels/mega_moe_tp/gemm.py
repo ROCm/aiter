@@ -8,6 +8,7 @@ from __future__ import annotations
 import functools
 import math
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -38,7 +39,6 @@ from .common import (
     spin_lds_ge,
     swap16,
     swap32,
-    traced,
     uni,
     wait_lgkm0,
     wait_vm,
@@ -83,13 +83,13 @@ def build_gemm(kc: KernelCtx) -> dict:
     ll_pkt, npp, nsk, route_fp8 = kc.get("ll_pkt npp nsk route_fp8")
     route_region_bytes = kc.route_region_bytes
 
-    @traced
+    @flyc.jit
     def wait_a_chunk(L, lane, buf, q):
         if lane == i32(0):
             spin_lds_ge(L, L_CTL + (C_ASEQ * 4) + buf * i32(4), q + i32(1))
         rocdl.sched_barrier(0)
 
-    @traced
+    @flyc.jit
     def release_a_chunk(L, lane, buf):
         if lane == i32(0):
             lds_atomic_add(L, L_CTL + C_AFREE * 4 + buf * i32(4), 1, REL)
@@ -99,7 +99,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             return ((nnb % i32(npp)) == i32(0)).select(i32(npp), i32(1))
         return i32(1)
 
-    @traced
+    @flyc.jit
     def _gemm1_disp(L, tid, a, expert, i0, nnb, mte=None):
         if const_expr(npp > 1):
             if (nnb % i32(npp)) == i32(0):
@@ -109,7 +109,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         else:
             _gemm1(L, tid, a, expert, i0, nnb, 1, mte)
 
-    @traced
+    @flyc.jit
     def gemm1(L, tid, a, expert, i0, nnb, rows=None):
         nnb = uni(nnb)
         if const_expr(MTSKIP and rows is not None):
@@ -195,7 +195,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 MTE,
             )
 
-    @traced
+    @flyc.jit
     def _gemm1(L, tid, a, expert, i0, nnb, P, MTE=None):
         MTE = MT if MTE is None else MTE
         lane, w, rw, rws, vs, vsl, sg0, su0 = _g1_operands(tid, a, expert, i0)
@@ -273,7 +273,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         ]
         return f[0], f[1], f[2], f[3]
 
-    @traced
+    @flyc.jit
     def a_loader(L, tid, a):
         lane = tid % i32(64)
         rx = rsrc(a["ax"])
@@ -287,7 +287,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 spin_lds_ge(L, L_CTL + C_USEQ * 4, u - ub + i32(1))
             _a_unit(L, lane, a, rx, rxs, u)
 
-    @traced
+    @flyc.jit
     def _a_unit(L, lane, a, rx, rxs, u):
         R = uni(lds_ld_acq(L, L_CTL + C_UROWS * 4))
         nnb = unit_fields(L, u)[2] // i32(128)
@@ -349,7 +349,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             wait_vm(0)
             _loader_flush(L, lane)
 
-    @traced
+    @flyc.jit
     def _loader_advance(L, lane, q):
         pub = lds_ld_i32(L, L_CTL + C_LPUB * 4)
         if q + i32(1) - pub >= i32(ADEPTH):
@@ -363,7 +363,7 @@ def build_gemm(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_LQ * 4, q + i32(1))
         rocdl.sched_barrier(0)
 
-    @traced
+    @flyc.jit
     def _loader_flush(L, lane):
         if lane == i32(0):
             pub = lds_ld_i32(L, L_CTL + C_LPUB * 4)
@@ -374,12 +374,12 @@ def build_gemm(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_LPUB * 4, q)
         rocdl.sched_barrier(0)
 
-    @traced
+    @flyc.jit
     def report_chunk(L, lane, w, cidx):
         if lane == i32(0):
             lds_st_rel(L, L_CTL + C_DONE * 4 + w * i32(4), cidx)
 
-    @traced
+    @flyc.jit
     def maybe_report(L, lane, w, gi, signal, rlag_wait, lag=1):
         if (
             signal
@@ -447,7 +447,7 @@ def build_gemm(kc: KernelCtx) -> dict:
                 (rb * i32(CH2) + k // i32(2)) * i32(256),
             )
 
-    @traced
+    @flyc.jit
     def gemm2(
         L, tid, a, expert, ks0, r0, rows, signal, NKS, pidx, gi_lo=None, *args, **kw
     ):
@@ -475,7 +475,7 @@ def build_gemm(kc: KernelCtx) -> dict:
         else:
             g()
 
-    @traced
+    @flyc.jit
     def _gemm2(
         L,
         tid,

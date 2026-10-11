@@ -241,12 +241,10 @@ def _store_v4i32_nt_global(addr_i64, data):
     registers, so LLVM would serialize those lanes (one destination at a
     time). A flat global store takes the address from a vector register,
     so all destinations issue together. ``nontemporal`` skips L2; this is
-    payload, not a flag. ``fx.ptr_store`` has no NT flag.
+    payload, not a flag.
     """
-    ptr = fx.to_llvm_ptr(
-        fx.inttoptr(fx.PointerType.get(T.i8, fx.AddressSpace.Global, 16), addr_i64)
-    )
-    llvm.StoreOp(as_ir_value(data), ptr, alignment=16, nontemporal=True)
+    ptr = fx.inttoptr(fx.PointerType.get(T.i8, fx.AddressSpace.Global, 16), addr_i64)
+    fx.generic_store(ptr, data, nontemporal=True)
 
 
 def _load_i32_nt(rsrc, elem_off):

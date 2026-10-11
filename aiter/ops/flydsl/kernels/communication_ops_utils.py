@@ -15,9 +15,8 @@ from __future__ import annotations
 import csv
 from dataclasses import dataclass, field
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import rocdl as _rocdl_d
-from flydsl.compiler.ast_rewriter import ASTRewriter
 from flydsl.expr import arith
 from flydsl.expr.typing import T
 
@@ -55,7 +54,6 @@ __all__ = [
     "store_i32_lds",
     "store_i32_system",
     "store_i64_global_system",
-    "traced",
     "wait_i32_until_equals",
     "wait_i32_until_greater_than",
     "wait_i64_until_equals",
@@ -85,21 +83,10 @@ def _ptr_plus(base_i64, offset, elem_bytes):
     return _to_ptr_global(addr)
 
 
-def traced(fn):
-    """Run FlyDSL's AST rewriting over a helper that kernel bodies call.
-
-    ``@flyc.kernel`` and ``@flyc.jit`` apply this same transform to their own
-    source but do not recurse into callees, so a helper that wants ``if`` /
-    ``while`` over traced values (rather than a host-side truthiness test) has
-    to opt in.
-    """
-    return ASTRewriter.transform(fn)
-
-
 def waitcnt_all():
     """Drain outstanding gfx12 load/store counters before a grid barrier."""
-    _rocdl_d.s_wait_storecnt(0)
-    _rocdl_d.s_wait_loadcnt(0)
+    fx.rocdl.s_wait_storecnt(0)
+    fx.rocdl.s_wait_loadcnt(0)
 
 
 def waitcnt_stores():
@@ -109,7 +96,7 @@ def waitcnt_stores():
     by a grid barrier; in-flight loads need no wait, because their results are
     already ordered by the register dependencies that consume them.
     """
-    _rocdl_d.s_wait_storecnt(0)
+    fx.rocdl.s_wait_storecnt(0)
 
 
 def atomic_add_lds(addr_i64, val):
@@ -191,7 +178,7 @@ def load_v4i32_nt(base_i64, offset):
     return fx.generic_load(_ptr_plus(base_i64, offset, 4), count=4, nontemporal=True)
 
 
-@traced
+@flyc.jit
 def spin_until_ge_i64(addr_i64, val):
     """Spin until a monotonic cross-device i64 flag is at least ``val``."""
     cur = fx.Int64(load_i64_acquire(addr_i64))
@@ -200,7 +187,7 @@ def spin_until_ge_i64(addr_i64, val):
     return cur
 
 
-@traced
+@flyc.jit
 def spin_until_ge_i32_system(addr_i64, val, *, acquire=False, sleep=True):
     """Spin on a system-visible i32 flag until it reaches ``val``."""
     cur = fx.Int32(load_i32_global_system(addr_i64, acquire=acquire))
@@ -211,7 +198,7 @@ def spin_until_ge_i32_system(addr_i64, val, *, acquire=False, sleep=True):
     return cur
 
 
-@traced
+@flyc.jit
 def spin_until_ge_i32_agent(addr_i64, val, *, sleep=True):
     """Spin on an agent-visible i32 flag until it reaches ``val``."""
     cur = fx.Int32(load_i32_global_agent(addr_i64))
@@ -222,7 +209,7 @@ def spin_until_ge_i32_agent(addr_i64, val, *, sleep=True):
     return cur
 
 
-@traced
+@flyc.jit
 def spin_until_eq_i32(addr_i64, val):
     """Spin until an i32 flag equals ``val``."""
     cur = fx.Int32(load_i32_acquire(addr_i64))
@@ -231,7 +218,7 @@ def spin_until_eq_i32(addr_i64, val):
     return cur
 
 
-@traced
+@flyc.jit
 def spin_until_gt_i32(addr_i64, val):
     """Spin until an i32 flag exceeds ``val`` and return the observed value."""
     cur = fx.Int32(load_i32_acquire(addr_i64))
@@ -250,7 +237,7 @@ def wait_i32_until_greater_than(addr_i64, expected):
     return spin_until_gt_i32(addr_i64, expected)
 
 
-@traced
+@flyc.jit
 def wait_i64_until_equals(addr_i64, expected):
     """Spin until a system-visible i64 flag equals ``expected``."""
     cur = fx.Int64(load_i64_acquire(addr_i64))
