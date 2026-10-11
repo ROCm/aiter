@@ -16,7 +16,11 @@ from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
-from aiter.ops.attention import get_mla_decode_fwd_max_splits
+from aiter.ops.attention import (
+    get_mla_decode_fwd_max_splits,
+    mla_ps1_qh128_fp8_asm_fwd,
+    mla_ps64_qh128_fp8_asm_fwd,
+)
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -626,6 +630,105 @@ def mla_decode_fwd_ds32(
         final_lse if return_lse else None,
     )
     return o, (final_lse if return_lse else None)
+
+
+def mla_decode_fwd_qh128_asm(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    page_size: int,
+    kv_layout: str,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    softmax_scale: float,
+    kv_indptr: torch.Tensor | None = None,
+    kv_indices: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    page_table: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode gfx1250 QH128 FP8 MLA with page1 or shuffled page64 KV.
+
+    Q is [B,128,576] FP8 E4M3FN, with head stride 576 or 768 bytes, and one
+    query per sequence. Writes preallocated contiguous BF16 out[B,128,512]
+    and natural-log FP32 lse[B,128]. Returns out.
+
+    Supported cache/metadata combinations (all metadata is GPU int32):
+
+    * page_size=1, kv_layout="token_major": contiguous FP8 KV is
+      [physical_tokens,1,1,576], with each token's 512 NoPE/V values followed
+      by 64 RoPE values. Provide contiguous kv_indptr[B+1] and kv_indices[nnz];
+      omit seq_lens and page_table. The caller must provide nonnegative,
+      monotonic indptr within [0,nnz] and valid physical token IDs in each
+      used range. CSR contents are not checked on the host. This kernel
+      always writes LSE: provide a reusable contiguous FP32 [B,128] buffer
+      even if LSE is discarded.
+    * page_size=64, kv_layout="gluon_shuffled": contiguous FP8 KV is
+      [physical_pages,1,64,576], with separate NoPE/RoPE planes tiled into
+      16-token x 16-dimension blocks. Provide contiguous seq_lens[B] and
+      page_table[B,max_pages] with unit inner stride; omit kv_indptr and
+      kv_indices. LSE is optional. Invalid lengths/page IDs produce O=0 and
+      LSE=-inf; unused KV/page-table padding may be poisoned.
+
+    The cache writer must produce the declared layout; shapes cannot verify
+    its bytes. Segmented page64 KV is not supported. This entry point does
+    not repack KV or convert metadata between CSR and dense page tables.
+
+    q_scale and kv_scale are required GPU FP32 scalar tensors on Q's device.
+    For unit scales, create tensors containing 1.0 once during initialization,
+    before graph capture, and reuse them for each call. Used inputs/scales
+    must be finite. Empty sequences produce O=0, LSE=-inf. No split-K,
+    partial logits, or host metadata synchronization. Warm up the native
+    module on the target device before graph capture; page_size and
+    kv_layout select the kernel at capture time. The native launcher uses
+    the Q device's current stream. Callers manage tensor lifetimes and
+    dependencies across streams.
+    """
+    require_gfx1250_asm("mla_decode_fwd_qh128_asm")
+    if page_size == 1:
+        if kv_layout != "token_major":
+            raise ValueError("page_size=1 requires kv_layout='token_major'")
+        if (
+            kv_indptr is None
+            or kv_indices is None
+            or seq_lens is not None
+            or page_table is not None
+        ):
+            raise ValueError(
+                "page_size=1 requires kv_indptr and kv_indices; "
+                "omit seq_lens and page_table"
+            )
+        if lse is None:
+            raise ValueError(
+                "lse is required by the page1 kernel; supply an FP32 [B,128] buffer"
+            )
+        launch = mla_ps1_qh128_fp8_asm_fwd
+        metadata, indices = kv_indptr, kv_indices
+    elif page_size == 64:
+        if kv_layout != "gluon_shuffled":
+            raise ValueError("page_size=64 requires kv_layout='gluon_shuffled'")
+        if (
+            seq_lens is None
+            or page_table is None
+            or kv_indptr is not None
+            or kv_indices is not None
+        ):
+            raise ValueError(
+                "page_size=64 requires seq_lens and page_table; "
+                "omit kv_indptr and kv_indices"
+            )
+        launch = mla_ps64_qh128_fp8_asm_fwd
+        metadata, indices = seq_lens, page_table
+    else:
+        raise ValueError("page_size must be 1 or 64")
+    if q_scale is None or kv_scale is None:
+        raise ValueError(
+            "q_scale and kv_scale are required; create and reuse FP32 [1] "
+            "tensors containing 1.0 for unit scales"
+        )
+    launch(q, kv, metadata, indices, out, lse, q_scale, kv_scale, float(softmax_scale))
+    return out
 
 
 def mla_decode_fwd(
