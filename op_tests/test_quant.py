@@ -284,13 +284,26 @@ def _assert_tiled_paths_covered(g32_shapes, g128_shapes):
         return
     cu = torch.cuda.get_device_properties(torch.cuda.current_device())
     cu = cu.multi_processor_count
-    for q, tiles_per_cu in (("fp8", 2), ("fp4", 12)):
+
+    def tile_path(q, m, n):
+        if q == "fp8":
+            per_cu = 2
+        elif m >= 512:
+            per_cu = 4 if m >= 1024 else 8
+        else:
+            return False
+        return (
+            m % 32 == 0 and (n // 32) % 8 == 0 and (m // 32) * (n // 256) >= per_cu * cu
+        )
+
+    for q in ("fp8", "fp4"):
         assert any(
-            m % 32 == 0
-            and (n // 32) % 8 == 0
-            and (m // 32) * (n // 256) >= tiles_per_cu * cu
-            for m, n in g32_shapes
+            tile_path(q, m, n) for m, n in g32_shapes
         ), f"no {q} group-32 case reaches the tile path on {cu} CUs"
+    # fp4 blocks cover two tiles along the row; an odd count leaves a half block.
+    assert any(
+        tile_path("fp4", m, n) and (n // 256) % 2 for m, n in g32_shapes
+    ), f"no fp4 group-32 tile-path case has an odd tile count per row on {cu} CUs"
     assert any(
         m % 16 == 0
         and n % 512 == 0
@@ -475,8 +488,9 @@ for key in [k for k in args.quant if k in d_quant_e8m0]:
     aiter.logger.info("%s summary (markdown):\n%s", key, df.to_markdown(index=False))
 
 if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
-    # 32x8 scale tiles: 896 at (1024, 7168) reach the fp8 tile path, 3584 at
-    # (4096, 7168) the fp4 one; the small shapes stay on the generic kernel.
+    # 32x8 scale tiles: 896 at (1024, 7168) reach the fp8 tile path; fp4 needs
+    # 1024, so (4096, 1536) stays generic, (4096, 2304) has nine tiles per row
+    # band, and (16384, 1536) and (32768, 1024) cover narrow rows.
     g32_shapes = (
         (32, 256),
         (64, 768),
@@ -485,6 +499,10 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
         (32, 160),
         (1024, 7168),
         (4096, 7168),
+        (4096, 1536),
+        (4096, 2304),
+        (16384, 1536),
+        (32768, 1024),
     )
     # 16x512 tiles: 3584 at (4096, 7168), 3072 at (2048, 12288).
     g128_shapes = ((4096, 7168), (2048, 12288))
