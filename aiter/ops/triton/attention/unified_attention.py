@@ -532,6 +532,7 @@ def is_reduce_gluon_available(params: _UAParams, NUM_SEGMENTS, backend: str):
     return use_gluon and use_gluon_arch
 
 
+@arch_info.no_async_copy_on_gfx1250()
 def _unified_attention_2d_triton(params: _UAParams):
     if params.shuffled_kv_cache and (
         params.q_dtype == e4m3_dtype and params.kv_cache_dtype == e4m3_dtype
@@ -610,6 +611,7 @@ def _unified_attention_2d_triton(params: _UAParams):
     )
 
 
+@arch_info.no_async_copy_on_gfx1250()
 def _unified_attention_3d_triton(
     params: _UAParams,
     segm_output,
