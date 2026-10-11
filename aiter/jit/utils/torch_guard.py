@@ -89,6 +89,9 @@ NONE_WRAPPED_OP = [
     "fused_allreduce_rmsnorm",
     "fused_allreduce_rmsnorm_quant",
     "fused_qknorm_allreduce",
+    # Returns a str (the failing shape constraint, or ""), which is not a
+    # useful torch.library op -- and it is a pure host query anyway.
+    "gemm_a16w4_unsupported_reason",
 ]
 
 
