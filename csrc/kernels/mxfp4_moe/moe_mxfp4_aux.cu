@@ -119,7 +119,11 @@ void mxfp4_moe_sort_quant_kernel(
 
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
 
-    const std::string key = "aux_sort_quant_NE" + std::to_string(NE)
+    const bool fp8_quant = a_quant.dtype() == AITER_DTYPE_fp8;
+    const std::string key = std::string(fp8_quant
+                                           ? "aux_sort_quant_fp8_NE"
+                                           : "aux_sort_quant_NE") +
+        std::to_string(NE)
         + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
         + "_H" + std::to_string(D_HIDDEN);
     aux_find(sort_quant_lookup(), key, "mxfp4_moe_sort_quant")(
@@ -131,7 +135,8 @@ void mxfp4_moe_sort_quant_kernel(
         static_cast<float*>(sorted_weights.data_ptr()),
         a_quant.data_ptr(), a_scale.data_ptr(),
         static_cast<int32_t*>(m_indices.data_ptr()),
-        bf16_zero_ptr);
+        bf16_zero_ptr,
+        static_cast<int>(a_input.stride(0)));
 }
 
 
