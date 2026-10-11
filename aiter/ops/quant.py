@@ -20,10 +20,16 @@ from ..utility import mx_types as _mx_types
 from ..utility.mx_types import (
     MX_DEFAULT_ROUND_MODE,
     MxDtypeInt,
+    MXScaleLayoutInt,
     MxScaleRoundModeInt,
 )
 from . import triton
 from .enum import ActivationType, QuantType
+from .mx_scale_layout import (
+    mx_scale_buffer_shape,
+    resolve_mx_scale_layout,
+    to_mx_scale_layout,
+)
 
 # Type alias for round-mode parameters; Union keeps int interop without
 # triggering the JIT build that loading MxScaleRoundMode would cause.
@@ -98,9 +104,10 @@ def per_1x32_f4_quant(
     x,
     scale=None,
     quant_dtype=dtypes.fp4x2,
-    shuffle=False,
+    shuffle: bool | None = None,
     pack_dim=-1,
     round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
+    scale_layout: int | None = None,
 ):
     """Torch reference for MXFP4 (E2M1) per-1x32 block-scale quantization.
 
@@ -114,7 +121,9 @@ def per_1x32_f4_quant(
         x: Input of shape ``(..., N)`` or ``(M, N)``.
         scale: Pre-computed scale (optional, usually ``None``).
         quant_dtype: Must be ``dtypes.fp4x2``.
-        shuffle: Apply e8m0 scale shuffling for hardware.
+        shuffle: Legacy alias selecting ``AITER_E8M0`` when true.
+        scale_layout: Explicit :class:`MXScaleLayout`; mutually exclusive
+            with ``shuffle``.
         pack_dim: ``-1`` (default) packs the last dim -> ``tl.dot_scaled``
             **LHS** ``A(M,K) -> fp4=(M,K//2), scale=(M,K//32)``;
             ``0`` packs the first dim -> **RHS**
@@ -129,6 +138,12 @@ def per_1x32_f4_quant(
         ``(quantized_tensor, scale_tensor)``.
     """
     assert quant_dtype == dtypes.fp4x2
+    layout = resolve_mx_scale_layout(scale_layout, shuffle)
+    if pack_dim == 0 and layout != MXScaleLayoutInt.ROW_MAJOR:
+        raise NotImplementedError(
+            "pack_dim=0 only supports ROW_MAJOR scale layout; transpose the "
+            "logical scale before applying a consumer-specific layout"
+        )
 
     # For large (>4 GiB) >=3D inputs, iterate the outermost dim so peak memory
     # scales with a single slice instead of the whole tensor. Quantization is
@@ -141,16 +156,17 @@ def per_1x32_f4_quant(
                 x[i],
                 scale=scale,
                 quant_dtype=quant_dtype,
-                shuffle=False,
+                shuffle=None,
                 pack_dim=-1,
                 round_mode=round_mode,
+                scale_layout=MXScaleLayoutInt.ROW_MAJOR,
             )
             for i in range(x.shape[0])
         ]
         y = torch.stack([p[0] for p in parts], dim=0)
         scale = torch.cat([p[1].view(torch.uint8) for p in parts], dim=0)
-        if shuffle:
-            scale = fp4_utils.e8m0_shuffle(scale)
+        if layout != MXScaleLayoutInt.ROW_MAJOR:
+            scale = to_mx_scale_layout(scale, layout)
         scale = scale.view(dtypes.fp8_e8m0)
         return y, scale
 
@@ -193,8 +209,8 @@ def per_1x32_f4_quant(
     y = fp4_utils.f32_to_mxfp4(y)
     y = y.view(*shape_original[:-1], -1)
     scale = scale_e8m0_biased.view(m, -1).view(torch.uint8)
-    if shuffle:
-        scale = fp4_utils.e8m0_shuffle(scale)
+    if layout != MXScaleLayoutInt.ROW_MAJOR:
+        scale = to_mx_scale_layout(scale, layout)
     scale = scale.view(dtypes.fp8_e8m0)
 
     if transposed:
@@ -513,10 +529,11 @@ def per_1x32_mx_quant_hip(
     x,
     scale=None,
     quant_dtype=dtypes.fp4x2,
-    shuffle=False,
+    shuffle: bool | None = None,
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
     scale_type=None,
+    scale_layout: int | None = None,
 ):
     """1x32 per-group MX dynamic quant (HIP).
 
@@ -538,10 +555,12 @@ def per_1x32_mx_quant_hip(
 
     The legacy ``per_1x32_f4_quant_hip`` is kept as a thin wrapper for
     backward compatibility.
+    ``scale_layout`` is mutually exclusive with the legacy ``shuffle`` alias.
     """
     m, n = x.shape
     assert n % 32 == 0, f"n={n} must be divisible by 32"
     device = x.device
+    layout = resolve_mx_scale_layout(scale_layout, shuffle)
 
     # Per-dtype defaults / validation.
     if quant_dtype == dtypes.fp4x2:
@@ -563,10 +582,10 @@ def per_1x32_mx_quant_hip(
                 f"per_1x32_mx_quant_hip: fp8 output expects scale_type in "
                 f"{{fp32, fp8_e8m0}}, got {effective_scale_type}"
             )
-        if shuffle and effective_scale_type == dtypes.fp32:
+        if layout != MXScaleLayoutInt.ROW_MAJOR and effective_scale_type == dtypes.fp32:
             raise NotImplementedError(
                 "per_1x32_mx_quant_hip(quant_dtype=fp8, scale_type=fp32, "
-                "shuffle=True): the fp32-scale path uses a transposed "
+                "non-row scale_layout): the fp32-scale path uses a transposed "
                 "(scaleN, M) layout and is not supported through this "
                 "wrapper. Pass scale_type=dtypes.fp8_e8m0 for the swizzled "
                 "byte-scale layout, or use fused_dynamic_mxfp8_quant_moe_sort "
@@ -580,23 +599,19 @@ def per_1x32_mx_quant_hip(
 
     # Allocate scale buffer matching the requested layout.
     is_e8m0 = effective_scale_type == dtypes.fp8_e8m0
+    if scale_layout is not None and quant_dtype == dtypes.fp4x2:
+        if scale is not None or num_rows is not None or num_rows_factor != 1:
+            raise ValueError(
+                "explicit-layout MXFP4 quant requires dynamic scale and full input rows"
+            )
+        return quant_mxfp4_hip(x, scale_layout=layout)
     if scale is None:
         if is_e8m0:
-            if shuffle:
-                scale = torch.empty(
-                    (
-                        (m + 255) // 256 * 256,
-                        ((n + 31) // 32 + 7) // 8 * 8,
-                    ),
-                    dtype=torch.uint8,
-                    device=device,
-                ).view(dtypes.fp8_e8m0)
-            else:
-                scale = torch.empty(
-                    (m, (n + 31) // 32),
-                    dtype=torch.uint8,
-                    device=device,
-                ).view(dtypes.fp8_e8m0)
+            scale = torch.empty(
+                mx_scale_buffer_shape(m, (n + 31) // 32, layout),
+                dtype=torch.uint8,
+                device=device,
+            ).view(dtypes.fp8_e8m0)
         else:
             scale = torch.empty(
                 (m, (n + 31) // 32),
@@ -616,9 +631,10 @@ def per_1x32_mx_quant_hip(
         x,
         scale,
         32,
-        shuffle_scale=shuffle,
+        shuffle_scale=layout == MXScaleLayoutInt.AITER_E8M0,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        scale_layout_m32k4=layout == MXScaleLayoutInt.OPUS_F4,
     )
     return y, scale
 
@@ -627,9 +643,10 @@ def per_1x32_f4_quant_hip(
     x,
     scale=None,
     quant_dtype=dtypes.fp4x2,
-    shuffle=False,
+    shuffle: bool | None = None,
     num_rows: torch.Tensor | None = None,
     num_rows_factor=1,
+    scale_layout: int | None = None,
 ):
     """Backward-compat fp4-only wrapper around :func:`per_1x32_mx_quant_hip`.
 
@@ -648,6 +665,7 @@ def per_1x32_f4_quant_hip(
         shuffle=shuffle,
         num_rows=num_rows,
         num_rows_factor=num_rows_factor,
+        scale_layout=scale_layout,
     )
 
 
@@ -684,10 +702,24 @@ def per_token_quant_triton(x, scale=None, quant_dtype=dtypes.i8):
     return y, scale
 
 
-def per_1x32_f4_quant_triton(x, scale=None, quant_dtype=dtypes.fp4x2, shuffle=False):
+def per_1x32_f4_quant_triton(
+    x,
+    scale=None,
+    quant_dtype=dtypes.fp4x2,
+    shuffle: bool | None = None,
+    scale_layout: int | None = None,
+):
     assert quant_dtype == dtypes.fp4x2
+    layout = resolve_mx_scale_layout(scale_layout, shuffle)
+    if layout == MXScaleLayoutInt.OPUS_F4:
+        raise NotImplementedError(
+            "per_1x32_f4_quant_triton does not produce OPUS_F4 directly; "
+            "use per_1x32_f4_quant_hip"
+        )
     # y, scale = triton.quant.dynamic_mxfp4_quant(x)
-    y, scale = fp4_utils.dynamic_mxfp4_quant(x, shuffle=shuffle)
+    y, scale = fp4_utils.dynamic_mxfp4_quant(
+        x, shuffle=layout == MXScaleLayoutInt.AITER_E8M0
+    )
     return y.view(quant_dtype), scale
 
 
@@ -972,6 +1004,7 @@ def quant_mxfp4(
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
     shuffle_weight: bool = False,
+    scale_layout: int = -1,
 ) -> None: ...
 
 
@@ -979,10 +1012,11 @@ def quant_mxfp4_hip(
     x: torch.Tensor,
     group_size: int = 32,
     round_mode: RoundModeLike = MX_DEFAULT_ROUND_MODE,
-    e8m0_shuffle: bool = False,
+    e8m0_shuffle: bool | None = None,
     a16w4_shuffle: bool = False,
     gate_up: bool = False,
     shuffle_weight: bool = False,
+    scale_layout: int | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """HIP MXFP4 (E2M1) per-1x32 block-scale quantization.
 
@@ -1006,7 +1040,9 @@ def quant_mxfp4_hip(
             See :class:`MxScaleRoundMode` for the four formulas and
             cross-stack mapping. (Note: ``Even`` mode uses
             HW builtin RNE on gfx950 vs SW round-half-away on gfx942.)
-        e8m0_shuffle: Apply HW e8m0 scale shuffling layout.
+        e8m0_shuffle: Legacy alias selecting ``AITER_E8M0`` when true.
+        scale_layout: Explicit :class:`MXScaleLayout`; mutually exclusive
+            with ``e8m0_shuffle``.
         a16w4_shuffle: Apply A16W4 weight shuffling.
         gate_up: Pack gate / up activations together (MoE).
         shuffle_weight: Apply weight shuffling.
@@ -1020,6 +1056,7 @@ def quant_mxfp4_hip(
     assert x.dtype in (torch.float16, torch.bfloat16)
     rows, cols = x.shape
     assert cols % group_size == 0
+    layout = resolve_mx_scale_layout(scale_layout, e8m0_shuffle)
 
     # Normalise to the raw int the C++ ``static_cast<MxScaleRoundMode>(int)``
     # binding expects. ``MxScaleRoundMode`` is an ``IntEnum`` so this is also
@@ -1050,8 +1087,17 @@ def quant_mxfp4_hip(
         and not gate_up
         and not shuffle_weight
         and get_gfx() != "gfx942"
+        and layout != MXScaleLayoutInt.OPUS_F4
+        and (scale_layout is None or layout == MXScaleLayoutInt.ROW_MAJOR)
     ):
-        return per_1x32_f4_quant_hip(x, shuffle=e8m0_shuffle)
+        return per_1x32_f4_quant_hip(
+            x,
+            shuffle=(
+                e8m0_shuffle
+                if scale_layout is None
+                else layout == MXScaleLayoutInt.AITER_E8M0
+            ),
+        )
 
     fp4x2 = getattr(torch, "float4_e2m1fn_x2", torch.uint8)
     fp8_e8m0 = getattr(torch, "float8_e8m0fnu", torch.uint8)
@@ -1059,16 +1105,11 @@ def quant_mxfp4_hip(
     out_packed = torch.empty(rows, cols // 2, dtype=fp4x2, device=x.device)
 
     scaleN = cols // group_size
-    if e8m0_shuffle:
-        scaleN_pad = ((scaleN + 7) // 8) * 8
-        rows_pad = ((rows + 255) // 256) * 256
-        out_scale = torch.empty(
-            rows_pad, scaleN_pad, dtype=torch.uint8, device=x.device
-        ).view(fp8_e8m0)
-    else:
-        out_scale = torch.empty(rows, scaleN, dtype=torch.uint8, device=x.device).view(
-            fp8_e8m0
-        )
+    out_scale = torch.empty(
+        mx_scale_buffer_shape(rows, scaleN, layout),
+        dtype=torch.uint8,
+        device=x.device,
+    ).view(fp8_e8m0)
 
     quant_mxfp4(
         x,
@@ -1076,10 +1117,11 @@ def quant_mxfp4_hip(
         out_scale,
         group_size,
         round_mode_int,
-        e8m0_shuffle,
+        bool(e8m0_shuffle) if scale_layout is None else False,
         a16w4_shuffle,
         gate_up,
         shuffle_weight,
+        -1 if scale_layout is None else layout,
     )
     return out_packed, out_scale
 

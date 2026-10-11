@@ -49,11 +49,17 @@ namespace py = pybind11;
         .value("FP8_E4M3", aiter::MxDtype::FP8_E4M3)                                        \
         .value("FP8_E4M3_FNUZ", aiter::MxDtype::FP8_E4M3_FNUZ)                              \
         .export_values();                                                                   \
+    pybind11::enum_<aiter::MXScaleLayout>(m, "MXScaleLayout")                               \
+        .value("ROW_MAJOR", aiter::MXScaleLayout::ROW_MAJOR)                                 \
+        .value("AITER_E8M0", aiter::MXScaleLayout::AITER_E8M0)                               \
+        .value("OPUS_F4", aiter::MXScaleLayout::OPUS_F4)                                     \
+        .export_values();                                                                   \
     pybind11::implicitly_convertible<int, QuantType>();                                     \
     pybind11::implicitly_convertible<int, ActivationType>();                                \
     pybind11::implicitly_convertible<int, MlaVersion>();                                    \
     pybind11::implicitly_convertible<int, aiter::MxScaleRoundMode>();                       \
     pybind11::implicitly_convertible<int, aiter::MxDtype>();                                \
+    pybind11::implicitly_convertible<int, aiter::MXScaleLayout>();                          \
     m.attr("kDefaultMxScaleRoundMode") = static_cast<int>(aiter::kDefaultMxScaleRoundMode); \
     AITER_SET_STREAM_PYBIND                                                                 \
     pybind11::class_<aiter_tensor_t>(m, "aiter_tensor_t")                                   \
@@ -1805,7 +1811,8 @@ namespace py = pybind11;
           py::arg("e8m0_shuffle")   = false,                             \
           py::arg("a16w4_shuffle")  = false,                             \
           py::arg("gate_up")        = false,                             \
-          py::arg("shuffle_weight") = false);                             \
+          py::arg("shuffle_weight") = false,                             \
+          py::arg("scale_layout")   = -1);                               \
     m.def("quant_mxfp6_gemm_hip",                                        \
           &aiter::quant_mxfp6_gemm_hip,                                  \
           py::arg("input"),                                              \
@@ -2533,7 +2540,8 @@ namespace py = pybind11;
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
           py::arg("gemma_norm") = false,     \
-          py::arg("scale_layout_m32k4") = false); \
+          py::arg("scale_layout_m32k4") = false, \
+          py::arg("scale_layout") = -1);     \
     m.def("add_rmsnorm",                     \
           &aiter::add_rmsnorm,               \
           py::arg("out"),                    \
@@ -2553,7 +2561,8 @@ namespace py = pybind11;
           py::arg("group_size")    = 0,      \
           py::arg("shuffle_scale") = false,  \
           py::arg("gemma_norm") = false,     \
-          py::arg("scale_layout_m32k4") = false); \
+          py::arg("scale_layout_m32k4") = false, \
+          py::arg("scale_layout") = -1);     \
     m.def("rmsnorm",                         \
           &aiter::rmsnorm,                   \
           py::arg("out"),                    \

@@ -523,6 +523,7 @@ def _gemm_afp4wfp4_preshuffle_kernel(
     stride_ask,
     stride_bsn,
     stride_bsk,
+    A_SCALE_LAYOUT: tl.constexpr,
     # Meta-parameters
     BLOCK_SIZE_M: tl.constexpr,
     BLOCK_SIZE_N: tl.constexpr,
@@ -612,7 +613,7 @@ def _gemm_afp4wfp4_preshuffle_kernel(
             + offs_ks[None, :] * stride_bsk
         )
 
-        if BLOCK_SIZE_M < 32:
+        if A_SCALE_LAYOUT == 0:
             offs_ks_non_shufl = (
                 pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)
             ) + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
@@ -621,6 +622,23 @@ def _gemm_afp4wfp4_preshuffle_kernel(
                 + offs_am[:, None] * stride_asm
                 + offs_ks_non_shufl[None, :] * stride_ask
             )
+        elif BLOCK_SIZE_M < 32:
+            offs_ks_logical = (
+                pid_k * (SPLITK_BLOCK_SIZE // SCALE_GROUP_SIZE)
+            ) + tl.arange(0, BLOCK_SIZE_K // SCALE_GROUP_SIZE)
+            scale_n = 2 * K // SCALE_GROUP_SIZE
+            scale_n_pad = tl.cdiv(scale_n, 8) * 8
+            scale_rows = offs_am[:, None]
+            scale_groups = offs_ks_logical[None, :]
+            scale_offsets = (
+                (scale_rows // 32 * scale_n_pad) * 32
+                + (scale_groups // 8) * 256
+                + (scale_groups % 4) * 64
+                + (scale_rows % 16) * 4
+                + (scale_groups % 8) // 4 * 2
+                + (scale_rows % 32) // 16
+            )
+            a_scale_ptrs = a_scales_ptr + scale_offsets
         else:
             offs_asm = (
                 pid_m * (BLOCK_SIZE_M // 32) + tl.arange(0, (BLOCK_SIZE_M // 32))
@@ -634,7 +652,7 @@ def _gemm_afp4wfp4_preshuffle_kernel(
         accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
 
         for k in range(pid_k * num_k_iter, (pid_k + 1) * num_k_iter):
-            if BLOCK_SIZE_M < 32:
+            if A_SCALE_LAYOUT == 0 or BLOCK_SIZE_M < 32:
                 a_scales = tl.load(a_scale_ptrs)
             else:
                 a_scales = (
@@ -694,7 +712,7 @@ def _gemm_afp4wfp4_preshuffle_kernel(
             # Advance the ptrs to the next K block.
             a_ptrs += (BLOCK_SIZE_K // 2) * stride_ak
             b_ptrs += (BLOCK_SIZE_K // 2) * 16 * stride_bk
-            if BLOCK_SIZE_M < 32:
+            if A_SCALE_LAYOUT == 0:
                 a_scale_ptrs += (BLOCK_SIZE_K // SCALE_GROUP_SIZE) * stride_ask
             else:
                 a_scale_ptrs += BLOCK_SIZE_K * stride_ask

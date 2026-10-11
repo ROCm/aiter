@@ -2,6 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from aiter.ops.mx_scale_layout import from_mx_scale_layout
 from aiter.ops.quant import per_1x32_f4_quant_hip
 from aiter.ops.triton.quant.fused_mxfp4_quant import (
     fused_dynamic_mxfp4_quant_moe_sort,
@@ -13,6 +14,7 @@ from aiter.ops.triton.quant.fused_mxfp4_quant import (
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, unshuffle_scale_gemm
 from aiter.utility.fp4_utils import dynamic_mxfp4_quant, moe_mxfp4_sort
+from aiter.utility.mx_types import MXScaleLayoutInt
 from op_tests.triton_tests.gemm.basic.test_gemm_afp4wfp4 import (
     SCALE_GROUP_SIZE,
     e8m0_to_f32,
@@ -237,6 +239,40 @@ def test_fused_rms_quant(
     y1_fp32_triton = convert_mxfp4_to_fp32(y1_fp4_triton, y1_scales_triton)
 
     torch.testing.assert_close(y1_fp32_torch, y1_fp32_triton)
+
+
+@pytest.mark.parametrize("M", [1, 5, 33, 257])
+@pytest.mark.parametrize("N", [160, 256])
+@pytest.mark.parametrize(
+    "layout",
+    [
+        MXScaleLayoutInt.ROW_MAJOR,
+        MXScaleLayoutInt.AITER_E8M0,
+        MXScaleLayoutInt.OPUS_F4,
+    ],
+)
+@pytest.mark.parametrize("inargs", ["triton", "gluon"])
+def test_fused_rms_quant_explicit_scale_layout(M, N, layout, inargs):
+    if not arch_info.is_fp4_avail():
+        pytest.skip("MXFP4 not supported on this architecture")
+    if inargs == "gluon" and arch_info.get_arch() != "gfx1250":
+        pytest.skip("Gluon kernel only supported on gfx1250 hardware")
+
+    torch.manual_seed(0)
+    x = torch.randn((M, N), dtype=torch.bfloat16, device="cuda")
+    weight = torch.randn((N,), dtype=torch.bfloat16, device="cuda")
+    (row_q, row_scale), *_ = fused_rms_mxfp4_quant(
+        x, weight, 1e-6, scale_layout=MXScaleLayoutInt.ROW_MAJOR, inargs=inargs
+    )
+    (q, scale), *_ = fused_rms_mxfp4_quant(
+        x, weight, 1e-6, scale_layout=layout, inargs=inargs
+    )
+
+    assert torch.equal(q, row_q)
+    assert torch.equal(
+        from_mx_scale_layout(scale, M, N // 32, layout).view(torch.uint8),
+        row_scale.view(torch.uint8),
+    )
 
 
 def run_torch_reduce_act_mul_mxfp4_group_quant(x, x2, activation, dtype, shuffle):

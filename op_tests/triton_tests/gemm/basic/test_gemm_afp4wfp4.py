@@ -18,6 +18,7 @@ from aiter.ops.triton.gemm.basic.gemm_afp4wfp4 import (
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import str_to_torch_dtype
+from aiter.utility.mx_types import MXScaleLayoutInt
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -376,3 +377,58 @@ def test_gemm_mxfp4_preshuffled_gfx1250(
     )
 
     triton.testing.assert_close(torch_out, triton_out)
+
+
+@pytest.mark.parametrize(
+    "M,N,K",
+    [(m, 256, 256) for m in [1, 5, 16, 31, 32, 33, 128, 255, 256, 257]]
+    + [(5, 7168, 3584), (16, 3584, 7168)],
+)
+def test_gemm_mxfp4_explicit_aiter_scale_layout_all_m(M: int, N: int, K: int):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("Explicit all-M preshuffle regression is for gfx1250")
+
+    (
+        x,
+        w,
+        w_preshuf,
+        x_scales,
+        w_scales,
+        _legacy_x_scales,
+        _w_scales_shuffled,
+        _out_dtype,
+        y,
+    ) = generate_gemm_afp4wfp4_inputs(
+        M,
+        N,
+        K,
+        torch.bfloat16,
+        layout="TN",
+        output=True,
+        shuffle_scales_fg=True,
+        shuffle_weight_fg=True,
+    )
+    xs = shuffle_scale(x_scales)
+    ws = shuffle_scale(w_scales)
+
+    actual = gemm_afp4wfp4_preshuffle(
+        x,
+        w_preshuf,
+        xs,
+        ws,
+        torch.bfloat16,
+        y,
+        x_scale_layout=MXScaleLayoutInt.AITER_E8M0,
+        w_scale_layout=MXScaleLayoutInt.AITER_E8M0,
+    )
+    expected = run_torch(x, w, x_scales, w_scales, torch.bfloat16)
+    triton.testing.assert_close(expected, actual)
+
+    with pytest.raises(ValueError, match="AITER_E8M0"):
+        gemm_afp4wfp4_preshuffle(
+            x,
+            w_preshuf,
+            xs,
+            ws,
+            x_scale_layout=MXScaleLayoutInt.ROW_MAJOR,
+        )

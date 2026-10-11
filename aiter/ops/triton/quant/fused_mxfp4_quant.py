@@ -4,6 +4,10 @@ import torch
 import triton
 import triton.language as tl
 
+from aiter.ops.mx_scale_layout import (
+    mx_scale_buffer_shape,
+    normalize_mx_scale_layout,
+)
 from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_dynamic_mxfp4_quant_moe_sort_kernel,
     _gluon_fused_reduce_rms_mxfp4_quant_kernel,
@@ -23,6 +27,7 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.utility import dtypes
+from aiter.utility.mx_types import MXScaleLayoutInt
 
 _LOGGER = AiterTritonLogger()
 
@@ -39,6 +44,7 @@ def fused_rms_mxfp4_quant(
     scale_shuffle_padding: bool | None = False,
     output_unquantized_inp1=False,
     inargs: str = "auto",
+    scale_layout: int | None = None,
 ):
     """
     This op contains several steps:
@@ -62,6 +68,19 @@ def fused_rms_mxfp4_quant(
 
     MXFP4_QUANT_BLOCK_SIZE = 32
     M, N1 = x1.shape
+    if scale_layout is not None and (shuffle or scale_shuffle_padding):
+        raise ValueError(
+            "scale_layout conflicts with legacy shuffle/scale_shuffle_padding"
+        )
+    layout = (
+        normalize_mx_scale_layout(scale_layout)
+        if scale_layout is not None
+        else (
+            MXScaleLayoutInt.AITER_E8M0
+            if shuffle or scale_shuffle_padding
+            else MXScaleLayoutInt.ROW_MAJOR
+        )
+    )
     BLOCK_SIZE_N = max(triton.next_power_of_2(N1), MXFP4_QUANT_BLOCK_SIZE)
     BLOCK_SIZE_N2 = 1
     if x2 is not None:
@@ -76,15 +95,10 @@ def fused_rms_mxfp4_quant(
     BLOCK_SIZE_N = max(BLOCK_SIZE_N, MXFP4_QUANT_BLOCK_SIZE)
     out1_fp4 = torch.empty((M, N1 // 2), dtype=torch.uint8, device=x1.device)
     SCALE_N_valid = triton.cdiv(N1, MXFP4_QUANT_BLOCK_SIZE)
-    use_scale_shuffle_padding = shuffle or scale_shuffle_padding
-    if use_scale_shuffle_padding:
-        SCALE_M = triton.cdiv(M, 256) * 256
-        SCALE_N = triton.cdiv(SCALE_N_valid, 8) * 8
+    SCALE_M, SCALE_N = mx_scale_buffer_shape(M, SCALE_N_valid, layout)
+    if layout != MXScaleLayoutInt.ROW_MAJOR:
         # BLOCK_SIZE_M = triton.cdiv(BLOCK_SIZE_M, 32) * 32
         BLOCK_SIZE_N = triton.cdiv(BLOCK_SIZE_N, 32) * 32
-    else:
-        SCALE_M = M
-        SCALE_N = SCALE_N_valid
     out1_bs = torch.empty(
         (SCALE_M, SCALE_N),
         dtype=torch.uint8,
@@ -161,10 +175,11 @@ def fused_rms_mxfp4_quant(
         "FIRST_INPUT_RES": (res1 is not None),
         "FIRST_INPUT_OUT": output_unquantized_inp1,
         "SCALE_N": SCALE_N_valid,
-        "SCALE_M_PAD": (SCALE_M if use_scale_shuffle_padding else 1),
+        "SCALE_M_PAD": (SCALE_M if layout != MXScaleLayoutInt.ROW_MAJOR else 1),
         "SCALE_N_PAD": SCALE_N,
-        "SHUFFLE": shuffle,
-        "SHUFFLE_PAD": use_scale_shuffle_padding,
+        "SCALE_LAYOUT": layout,
+        "SHUFFLE": layout == MXScaleLayoutInt.AITER_E8M0,
+        "SHUFFLE_PAD": layout != MXScaleLayoutInt.ROW_MAJOR,
     }
 
     if use_gluon:
