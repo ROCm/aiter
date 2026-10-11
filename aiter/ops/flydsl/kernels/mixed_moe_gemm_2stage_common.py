@@ -147,6 +147,17 @@ def compile_mixed_moe_gemm1_common(
             "FHMoE stage1 requires shared_expert_id == experts - 1; "
             f"got {shared_expert_id=} and {experts=}"
         )
+    if persist_m == 0 or persist_m < -1:
+        raise ValueError(f"persist_m must be -1 or positive, got {persist_m}")
+    persistent = persist_m == -1
+    if persistent and xcd_swizzle:
+        raise ValueError("persistent stage1 does not support xcd_swizzle")
+    if persistent:
+        from aiter.jit.utils.chip_info import get_cu_num
+
+        cu_num = get_cu_num()
+    else:
+        cu_num = 0
     gpu_arch = get_hip_arch()
 
     def _al(x, a):
@@ -260,6 +271,7 @@ def compile_mixed_moe_gemm1_common(
     fp8q_tag = "_fp8q" if need_fp8 else ""
     sort_tag = "_sort" if need_sort else ""
     async_tag = "_async" if use_async_copy else ""
+    pm_tag = f"_persist_stride_cu{cu_num}" if persistent else f"_pm{persist_m}"
     sk_tag = f"_sk{k_batch}" if is_splitk else ""
     kw_tag = f"_kw{k_wave}" if k_wave > 1 else ""
     go_tag = "_go" if mock_gate_only else ""
@@ -277,7 +289,7 @@ def compile_mixed_moe_gemm1_common(
     kernel_version = 34 if heterogeneous_b else 33
     module_name = (
         f"mfma_moe1_silu_mul_a{a_dtype}_w{b_dtype}_{out_s}"
-        f"_t{tile_m}x{tile_n}x{tile_k}_pm{persist_m}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
+        f"_t{tile_m}x{tile_n}x{tile_k}{pm_tag}{fp4q_tag}{fp8q_tag}{sort_tag}{async_tag}{sk_tag}{kw_tag}{go_tag}{gui_tag}{as1_tag}{xcd_tag}{act_tag}{v2out_tag}{heterogeneous_tag}_v{kernel_version}"
     ).replace("-", "_")
 
     cshuffle_elem_bytes = 4 if need_quant else (4 if out_is_f32 else 2)
@@ -668,8 +680,14 @@ def compile_mixed_moe_gemm1_common(
                 sort_scale_nbytes = fx.Int32(sort_padded_rows * sort_padded_cols)
                 sorted_scale_rsrc = ptr_rsrc(arg_out_scale_sorted, sort_scale_nbytes)
 
-            PERSIST_M = persist_m
-            c_pm = arith.constant(PERSIST_M, index=True)
+            c_pm = arith.constant(max(persist_m, 1), index=True)
+            if const_expr(persistent):
+                c_workers = arith.constant(cu_num, index=True)
+                c_block_m = arith.constant(sort_block_m, index=True)
+                c_one = arith.constant(1, index=True)
+                total_m_tiles = (
+                    fx.Index(num_valid_i32) + c_block_m - c_one
+                ) // c_block_m
             # Per-iteration state, rebound by _persist_iter each pass so the
             # closures below see the current iteration's values.
             bx = bx_m = bx_m_i32 = blk_valid = None
@@ -1967,7 +1985,7 @@ def compile_mixed_moe_gemm1_common(
                         ],
                         f32_t,
                     )
-                    if const_expr(shared_b and need_fp8):
+                    if const_expr(need_fp8):
                         result = result.to(fx.BFloat16).to(fx.Float32)
                     return result
 
@@ -1979,7 +1997,7 @@ def compile_mixed_moe_gemm1_common(
                         g = g.to(fx.BFloat16).to(fx.Float32)
                         u = u.to(fx.BFloat16).to(fx.Float32)
                     result = activate_pair(g, u)
-                    if const_expr(shared_b and need_fp8):
+                    if const_expr(need_fp8):
                         result = result.to(fx.BFloat16).to(fx.Float32)
                     return result
 
@@ -2749,7 +2767,10 @@ def compile_mixed_moe_gemm1_common(
             def _persist_iter(mi_p):
                 nonlocal bx, bx_m, bx_m_i32, blk_valid
                 nonlocal expert_i32, expert_idx, exp_valid, is_shared_expert
-                bx = bx_persist * c_pm + mi_p
+                if const_expr(persistent):
+                    bx = mi_p
+                else:
+                    bx = bx_persist * c_pm + mi_p
                 bx_m = bx * arith.constant(sort_block_m, index=True)
                 bx_m_i32 = fx.Int32(bx_m)
                 blk_valid = fx.Uint32(bx_m_i32) < fx.Uint32(num_valid_i32)
@@ -2773,8 +2794,12 @@ def compile_mixed_moe_gemm1_common(
                 # init=[] keeps the index-typed induction variable (scf_range),
                 # matching the original scf.ForOp; the plain no-init form would
                 # dispatch to an i32 counter.
-                for mi_p, _ in range(c0_p, c_pm, c1_p, init=[]):
-                    _persist_iter(mi_p)
+                if const_expr(persistent):
+                    for mi_p, _ in range(bx_persist, total_m_tiles, c_workers, init=[]):
+                        _persist_iter(mi_p)
+                else:
+                    for mi_p, _ in range(c0_p, c_pm, c1_p, init=[]):
+                        _persist_iter(mi_p)
 
             _run_persist()
 
@@ -2903,6 +2928,8 @@ def compile_mixed_moe_gemm1_common(
         xcd_swizzle,
         v2_output_layout,
     )
+    if persistent:
+        cache_tag += (cu_num,)
     if heterogeneous_b:
         cache_tag += (shared_expert_id,)
 
@@ -2957,10 +2984,15 @@ def compile_mixed_moe_gemm1_common(
                 // arith.constant(2, index=True)
             )
 
-        c_pm_l = arith.constant(persist_m, index=True)
-        gy = (
-            fx.Index(i32_size_expert_ids_in) + c_pm_l - arith.constant(1, index=True)
-        ) // c_pm_l
+        if const_expr(persistent):
+            gy = arith.constant(cu_num, index=True)
+        else:
+            c_pm_l = arith.constant(persist_m, index=True)
+            gy = (
+                fx.Index(i32_size_expert_ids_in)
+                + c_pm_l
+                - arith.constant(1, index=True)
+            ) // c_pm_l
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(

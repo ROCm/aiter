@@ -859,6 +859,7 @@ def fused_moe(
     quant_type_a: QuantType | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
 ):
     if (
         any(
@@ -945,6 +946,7 @@ def fused_moe(
             int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
         ),
         ep_source_token_map=scatter_source_map,
+        ep_has_fake_route=ep_has_fake_route,
         output=output,
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
@@ -991,6 +993,7 @@ def fused_moe_fake(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
 ) -> torch.Tensor:
     device = topk_ids.device
     M, _topk = topk_ids.shape
@@ -1052,6 +1055,7 @@ def fused_moe_(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
 ) -> torch.Tensor:
     stage2_scatter = None
     if ep_source_token_map is not None:
@@ -1091,6 +1095,7 @@ def fused_moe_(
         linear_beta=linear_beta,
         gate_mode=gate_mode,
         stage2_scatter=stage2_scatter,
+        ep_has_fake_route=ep_has_fake_route,
         output=output,
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
@@ -1129,6 +1134,7 @@ def _fused_moe_impl(
     quant_type_a: int | None = None,
     quant_dtype_a: torch.dtype | None = None,
     quant_dtype_a2: torch.dtype | None = None,
+    ep_has_fake_route: bool = False,
     *,
     _q_dtype_a: torch.dtype | None = None,
     _metadata_transform: Callable | None = None,
@@ -1194,6 +1200,19 @@ def _fused_moe_impl(
         hidden_dtype=hidden_states.dtype,
         has_a1_scale=a1_scale is not None,
     )
+    if (
+        quant_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+        and activation == ActivationType.Silu
+        and gate_mode == GateMode.INTERLEAVE
+        and get_gfx() == "gfx950"
+        and expert_mask is not None
+        and isShuffled
+        and isG1U1
+        and not doweight_stage1
+    ):
+        # The gfx950 BF16/FP4 fallback has no plain-SiLU interleaved kernel.
+        q_dtype_a = dtypes.fp8
 
     if quant_dtype_a is not None:
         q_dtype_a = quant_dtype_a
@@ -1318,6 +1337,7 @@ def _fused_moe_impl(
             isShuffled,
             gate_mode,
             is_ep=expert_mask is not None,
+            ep_has_fake_route=ep_has_fake_route,
             has_stage1_bias=bias1 is not None,
             has_stage2_bias=bias2 is not None,
             situ_beta=config_situ_beta,
@@ -1578,6 +1598,7 @@ def _fused_moe_impl(
             linear_beta=linear_beta,
             gate_mode=gate_mode,
             expert_mask=expert_mask,
+            ep_has_fake_route=ep_has_fake_route,
             m_indices=sort_m_indices,
             reverse_sorted=sort_reverse_sorted,
             # Reuse the capability-validated row selected above. Re-looking it
@@ -2010,6 +2031,7 @@ def _flydsl_stage1_wrapper(
         w1_scale=w1_scale,
         a1_scale=a1_scale,
         sorted_weights=sorted_weights,
+        persist_m=parsed.get("persist_m", 0),
         use_async_copy=True,
         k_batch=parsed.get("k_batch", 1),
         # None, matching stage 2: the int4 registry emits no waves_per_eu key.
@@ -2963,6 +2985,7 @@ def get_2stage_cfgs(
     has_stage2_scatter=False,
     has_activation_scales=False,
     has_num_local_tokens=False,
+    ep_has_fake_route=False,
 ):
     gate_mode = GateMode(gate_mode)
     cktile_mxfp4_unsafe = q_dtype_w == dtypes.fp4x2 and inter_dim % 256 != 0
@@ -3085,6 +3108,9 @@ def get_2stage_cfgs(
             cfg_2stages_by_file[tune_file] = active_cfg_2stages
     cu_num = get_cu_num()
     gfx = get_gfx_runtime()
+    # Only callers that explicitly identify a masked fake route subtract it
+    # from the tuned-config key. Ordinary EP keeps the full runtime top-k.
+    topk -= int(is_ep and ep_has_fake_route)
     keys = (
         gfx,
         cu_num,
@@ -3745,18 +3771,14 @@ def get_2stage_cfgs(
         and not doweight_stage1
     )
     _is_a16w4 = _is_a16w4_situv2 or _is_a16w4_swiglu_rerouted
-    use_mxfp4_flydsl = _is_a16w4 or (
+    _is_silu_interleave_a8w4 = (
         dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
-        and (
-            activation in (ActivationType.Swiglu, ActivationType.Situv2)
-            or _flydsl_force
-        )
-        and (
-            q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
-            and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
-        )
-        and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
+        and activation == ActivationType.Silu
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+        and gate_mode == GateMode.INTERLEAVE
+        and get_gfx() == "gfx950"
         and is_shuffled
         and use_g1u1
         and not doweight_stage1
@@ -3794,6 +3816,26 @@ def get_2stage_cfgs(
         )
         return _make_mxfp4_metadata(_kn1, _kn2, gate_mode, 0, block_m=_bm)
 
+    use_mxfp4_flydsl = (
+        _is_a16w4
+        or _is_silu_interleave_a8w4
+        or (
+            dtype in [dtypes.bf16, dtypes.fp16]
+            and q_type == QuantType.per_1x32
+            and (
+                activation in (ActivationType.Swiglu, ActivationType.Situv2)
+                or _flydsl_force
+            )
+            and (
+                q_dtype_a in (dtypes.fp4x2, dtypes.fp8)
+                and q_dtype_w in (dtypes.fp4x2, dtypes.fp8)
+            )
+            and _flydsl_mxfp4_layout_is_compatible(q_dtype_a, gate_mode)
+            and is_shuffled
+            and use_g1u1
+            and not doweight_stage1
+        )
+    )
     if use_mxfp4_flydsl:
         from aiter.ops.flydsl.moe_kernels import (
             flydsl_kernel_name,
@@ -4095,6 +4137,7 @@ def fused_moe_2stages(
     output=None,
     _stage2_override: Callable | None = None,
     routing_num_experts: int | None = None,
+    ep_has_fake_route=False,
 ):
     quant_func = get_quant(quant_type)
     gate_mode = GateMode(gate_mode)
@@ -4133,6 +4176,7 @@ def fused_moe_2stages(
         is_shuffled,
         gate_mode,
         is_ep=expert_mask is not None,
+        ep_has_fake_route=ep_has_fake_route,
         has_stage1_bias=bias1 is not None,
         has_stage2_bias=bias2 is not None,
         situ_beta=config_situ_beta,
@@ -4213,6 +4257,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
@@ -4430,6 +4475,7 @@ def fused_moe_2stages(
                 token_num=token_num,
                 topk=topk,
                 block_size=block_size_M,
+                num_rows=num_local_tokens,
                 sorted_weights=sorted_weights,
                 num_experts_upper_bound=routing_num_experts,
             )
