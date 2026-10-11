@@ -4,7 +4,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 
@@ -152,7 +152,7 @@ def compile_gemm2_a4w4_port(
         lane = tx_i32 % fx.Int32(64)
         wave = rocdl.readfirstlane(T.i32, tx_i32 // fx.Int32(64))
 
-        _aq_num = fx.Index(i32_max_m_blocks) * fx.Index(BM * _K_HALF)
+        _aq_num = fx.Int64(i32_max_m_blocks) * (BM * _K_HALF)
         aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
@@ -277,11 +277,10 @@ def compile_gemm2_a4w4_port(
     ):
         if const_expr(_persistent):
             tw = i32_max_m_blocks * fx.Int32(_num_n_blocks)
-            persist = _raw(tw > fx.Int32(NUM_CU * 4))
-            grid_i32 = arith.select(persist, _raw(fx.Int32(NUM_CU)), _raw(tw))
-            grid_x = fx.Index(grid_i32)
+            persist = tw > NUM_CU * 4
+            grid_x = fx.Index(persist.select(fx.Int32(NUM_CU), tw))
         else:
-            grid_x = fx.Index(i32_max_m_blocks) * fx.Index(_num_n_blocks)
+            grid_x = fx.Index(i32_max_m_blocks * _num_n_blocks)
         gemm2_kernel(
             arg_aq,
             arg_ascale,
@@ -361,10 +360,10 @@ def _gemm2_body(
     e = rocdl.readfirstlane(T.i32, e)
     m_row = m_block_idx * fx.Int32(BM)
 
-    _asc_num = fx.Index(i32_max_m_blocks) * fx.Index(_asc_per_mb)
+    _asc_num = fx.Int64(i32_max_m_blocks) * _asc_per_mb
     ascale_rsrc = _buffer_rsrc(arg_ascale, _asc_num)
-    bq_rsrc = _buffer_rsrc(arg_bq, fx.Index(_bq_bytes))
-    bscale_rsrc = _buffer_rsrc(arg_bscale, fx.Index(_bscale_bytes))
+    bq_rsrc = _buffer_rsrc(arg_bq, _bq_bytes)
+    bscale_rsrc = _buffer_rsrc(arg_bscale, _bscale_bytes)
 
     # Sequential LDS layout: saq bytes at offset 0, f32 accumulator after them.
     saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
@@ -768,14 +767,13 @@ def _flat_mxfp4_epilog(
         if _bi + 1 < len(_blocks):
             _r_next, _grp_next, _col0_next = _issue_load(*_blocks[_bi + 1])
         if True:
-            amax_f = _raw(fx.math.absf(r[0]))
+            amax_f = fx.math.absf(r[0])
             for e in range_constexpr(1, 8):
-                abs_e = _raw(fx.math.absf(r[e]))
-                amax_f = arith.maxnumf(amax_f, abs_e)
-            amax = arith.shrui(arith.bitcast(T.i32, amax_f), _raw(fx.Int32(16)))
-            amax_dpp = _raw(_inline_dpp_quad_amax(amax))
-            f32b = arith.shli(amax_dpp, _raw(fx.Int32(16)))
-            e8m0, qscale_f = _e8m0_from_amax(fx.Float32(arith.bitcast(T.f32, f32b)))
+                amax_f = fx.maxnumf(amax_f, fx.math.absf(r[e]))
+            amax = amax_f.bitcast(fx.Int32).shrui(fx.Int32(16))
+            amax_dpp = fx.Int32(_inline_dpp_quad_amax(amax))
+            f32b = (amax_dpp << 16).bitcast(fx.Float32)
+            e8m0, qscale_f = _e8m0_from_amax(f32b)
             e8 = _raw(e8m0)
             qscale = _raw(qscale_f)
             packed = _raw(fx.Int32(0))
