@@ -536,6 +536,7 @@ class GroupCoordinator:
         group_name: str | None = None,
         reuse_from: "GroupCoordinator | None" = None,
         is_ep: bool = False,
+        all2all_manager_created: bool = False,
     ):
         group_name = group_name or "anonymous"
         self.unique_name = _get_unique_name(group_name)
@@ -650,6 +651,7 @@ class GroupCoordinator:
                     device_group=self.device_group,
                     unique_name=self.unique_name,
                     reuse_from=src_dc,
+                    skip_mori_shmem_init=all2all_manager_created,
                 )
                 # Ours to destroy; for a borrower that only drops references.
                 self._owns_device_communicator = True
@@ -1623,6 +1625,7 @@ def init_model_parallel_group(
     group_name: str | None = None,
     reuse_from: "GroupCoordinator | None" = None,
     is_ep: bool = False,
+    all2all_manager_created: bool = False,
 ) -> GroupCoordinator:
     return GroupCoordinator(
         group_ranks=group_ranks,
@@ -1633,6 +1636,7 @@ def init_model_parallel_group(
         group_name=group_name,
         reuse_from=reuse_from,
         is_ep=is_ep,
+        all2all_manager_created=all2all_manager_created,
     )
 
 
@@ -1876,6 +1880,7 @@ def initialize_model_parallel(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    all2all_manager_created: bool = False,
 ) -> None:
     """
     Initialize model parallel groups.
@@ -1892,6 +1897,8 @@ def initialize_model_parallel(
               e.g. [0,1,2,3,4,5,6,7]
             - 2D List[List[int]]: multiple independent subgroups,
               e.g. [[0,1,2,3],[4,5,6,7]]
+        all2all_manager_created: the all2all_manager will be created in /app/ATOM/atom/model_ops/fused_moe/mori_v2_prepare_finalize.py
+                                 in EP + multi-node + ATOM_MORI_V2 case, so skipping here
 
     Let's say we have a total of 8 GPUs denoted by g0 ... g7 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -2035,6 +2042,8 @@ def initialize_model_parallel(
             # "ep" in unique_name rule DeviceCommunicatorBase already owns; a
             # missed EP group silently loses all2all and returns wrong outputs.
             is_ep=group_name == "ep",
+            # Only EP builds an all2all manager.
+            all2all_manager_created=all2all_manager_created,
         )
         if dedup and source is None:
             _built_by_ranks[key] = group
@@ -2156,6 +2165,7 @@ def ensure_model_parallel_initialized(
     data_parallel_size: int = 1,
     prefill_context_model_parallel_size: int = 1,
     custom_group_config: dict[str, list] | None = None,
+    all2all_manager_created: bool = False,
 ) -> None:
     """Helper to initialize model parallel groups if they are not initialized,
     or ensure tensor-parallel and pipeline-parallel sizes are equal to expected
@@ -2171,6 +2181,7 @@ def ensure_model_parallel_initialized(
             data_parallel_size,
             prefill_context_model_parallel_size=prefill_context_model_parallel_size,
             custom_group_config=custom_group_config,
+            all2all_manager_created=all2all_manager_created,
         )
         return
 
