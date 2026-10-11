@@ -19,10 +19,11 @@ from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
 from .gemm_op_common import (
-    find_padded_m_row,
+    get_padded_m,
     mxscale_w_scale_block,
     with_mxscale_w_scale_block,
 )
+from .opus.policy import index_tuned_by_cu_num
 from .opus.policy import (
     resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
 )
@@ -188,9 +189,12 @@ _MXSCALE_BMM_KEYS = ["gfx", "b", "m", "n", "k", "w_scale_block"]
 def _load_mxscale_bmm_tuned(
     libtype: str | None = None, bpreshuffle: bool = False
 ) -> dict:
-    """{(gfx,b,m,n,k,w_scale_block): row} from the mxscale BMM tuned CSV; {} if
-    it is missing. A CSV that predates the w_scale_block column holds only
+    """{(gfx,cu_num,b,m,n,k,w_scale_block): row} from the mxscale BMM tuned CSV;
+    {} if it is missing. A CSV that predates the w_scale_block column holds only
     128x128 rows."""
+    shape_keys = ["gfx", "cu_num", "b", "m", "n", "k", "w_scale_block"]
+    shape_keys_fallback = _MXSCALE_BMM_KEYS
+
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     try:
         df = pd.read_csv(path).drop_duplicates()
@@ -198,9 +202,24 @@ def _load_mxscale_bmm_tuned(
         logger.warning("mxscale BMM tuned CSV not found at %s", path)
         return {}
     df = with_mxscale_w_scale_block(df, path)
+
+    required = set(shape_keys_fallback)
+    missing = required.difference(df.columns)
+    if missing:
+        raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
+
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype]
-    return df.set_index(_MXSCALE_BMM_KEYS).to_dict("index")
+
+    if "cu_num" not in df.columns:
+        logger.warning(
+            "MXFP8 BMM tuned CSV %r has no 'cu_num' column; falling back to "
+            "the fallback gfx-only key. Re-run the tuner to distinguish devices "
+            "that share an architecture but have different CU counts.",
+            path,
+        )
+        return df.set_index(shape_keys_fallback).to_dict("index")
+    return index_tuned_by_cu_num(df, path, shape_keys, shape_keys_fallback)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -235,12 +254,18 @@ def lookup_mxscale_bmm_config(
     reported without this layer knowing which column holds it.
     """
     gfx = get_gfx()
+    cu_num = get_cu_num()
     path = _mxscale_bmm_tuned_path(bpreshuffle)
     tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
 
-    row, padded_m = find_padded_m_row(
-        tuned, lambda pm: (gfx, b, pm, n, k, w_scale_block), m, n, k
-    )
+    row, padded_m = None, m
+    for gl in (None, 0, 1):
+        padded_m = m if gl is None else get_padded_m(m, n, k, gl)
+        row = tuned.get((gfx, cu_num, b, padded_m, n, k, w_scale_block))
+        if row is None:
+            row = tuned.get((gfx, b, padded_m, n, k, w_scale_block))
+        if row is not None:
+            break
 
     if row is None:
         logger.info(
@@ -254,13 +279,13 @@ def lookup_mxscale_bmm_config(
         if padded_m == m:
             logger.info(
                 f"shape is B:{b}, M:{m}, N:{n}, K:{k}, w_scale {w_scale_block}, is "
-                f"tuned on gfx = {gfx} in {path}, config is {cfg}!"
+                f"tuned on gfx = {gfx}, cu_num = {cu_num} in {path}, config is {cfg}!"
             )
         else:
             logger.info(
                 f"shape is B:{b}, M:{m}, N:{n}, K:{k}, w_scale {w_scale_block}, exact "
-                f"miss on gfx = {gfx}; using padded_M: {padded_m} config {cfg} from "
-                f"{path}!"
+                f"miss on gfx = {gfx}, cu_num = {cu_num}; using padded_M: {padded_m} "
+                f"config {cfg} from {path}!"
             )
     return row
 
