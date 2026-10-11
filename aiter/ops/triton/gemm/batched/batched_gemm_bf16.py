@@ -62,6 +62,10 @@ def batched_gemm_bf16(
     assert dtype in [
         torch.bfloat16,
         torch.float16,
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
+        torch.float8_e5m2fnuz,
     ], f"Output {dtype=} is currently not supported in batched_gemm_bf16"
     assert splitK is None, "Currently, there isn't any support for splitK on Triton"
 
