@@ -13,7 +13,7 @@ way as runtime JIT config lookup.
 Supported kernel families:
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
-  - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels
+  - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels (``_smbs`` suffix: gfx950 blockscale)
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
@@ -89,7 +89,7 @@ from aiter.ops.flydsl.kernels.gemm_a16w16_kernel_gfx1250 import (
 )
 from aiter.ops.flydsl.kernels.kernels_common import run_cached
 from aiter.ops.flydsl.kernels.preshuffle_gemm import compile_preshuffle_gemm
-from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg
+from aiter.ops.flydsl.kernels.tensor_shim import ptr_arg, unused_tensor_arg
 from aiter.ops.flydsl.mxfp8_bpreshuffle_gemm_gfx1250 import (
     BLOCK_K as SCALE_BLOCK_SIZE,
 )
@@ -135,10 +135,10 @@ _PRESHUFFLE_RE = re.compile(
     r"(?P<tile_m>\d+)x(?P<tile_n>\d+)x(?P<tile_k>\d+)_"
     r"(?P<qa>[A-Z0-9]+)_(?P<qw>[A-Z0-9]+)_(?P<out>[A-Z0-9]+)_"
     r"(?P<async_copy>\d+)x(?P<waves_per_eu>\d+)(?:x(?P<xcd_swizzle>\d+))?(?:x(?P<lds_stage>\d+))?_"
-    r"(?!ks\d+$)(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
+    r"(?!ks\d+(?:_smbs)?$|smbs$)(?P<scheduler>[A-Za-z][A-Za-z0-9]*)"
     # Trailing _ksN, emitted only for k_split > 1, so pre-split-K names still
     # match. Without it they fail fullmatch and drop out of the AOT build.
-    r"(?:_ks(?P<k_split>\d+))?$"
+    r"(?:_ks(?P<k_split>\d+))?(?P<blockscale>_smbs)?$"
 )
 _SHORT_DTYPE = {
     "F8": "fp8",
@@ -189,6 +189,7 @@ def _parse_preshuffle_kernel_name(name: str) -> dict | None:
         "lds_stage": int(m.group("lds_stage")) if m.group("lds_stage") else 2,
         "scheduler": m.group("scheduler"),
         "k_split": int(m.group("k_split")) if m.group("k_split") else 1,
+        "scale_mode": "blockscale" if m.group("blockscale") else "epilogue",
     }
 
 
@@ -232,8 +233,8 @@ def parse_csv(csv_path: str):
     with open(csv_path, newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            kernel_name = row.get("kernelName", "").strip()
-            libtype = row.get("libtype", "").strip()
+            kernel_name = (row.get("kernelName") or "").strip()
+            libtype = (row.get("libtype") or "").strip()
             if libtype != "flydsl" or not kernel_name.startswith("flydsl_"):
                 continue
 
@@ -325,8 +326,25 @@ def parse_csv(csv_path: str):
                     f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
                 )
                 continue
+            if (
+                params.get("kind") == "hgemm"
+                and int(row.get("splitK", "0")) != params["split_k"]
+            ):
+                raise ValueError("FlyDSL HGEMM CSV splitK does not match kernel name")
+            if params.get("kind") == "hgemm" and params.get("target_gfx") != gfx:
+                raise ValueError(
+                    "FlyDSL HGEMM CSV architecture does not match kernel name"
+                )
+            if (
+                params.get("kind") == "hgemm"
+                and params.get("n") is not None
+                and params.get("k") is not None
+                and (params.get("n"), params.get("k")) != (n, k)
+            ):
+                raise ValueError("FlyDSL HGEMM CSV N/K does not match kernel name")
 
             job = {
+                **params,
                 "kernel_name": kernel_name,
                 "m": m,
                 "n": n,
@@ -334,7 +352,6 @@ def parse_csv(csv_path: str):
                 "cu_num": cu_num,
                 "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
-                **params,
             }
             key = job_identity(job)
             if key in seen:
@@ -602,6 +619,7 @@ def _compile_preshuffle_to_cache(
     lds_stage: int = 2,
     scheduler: str = "Default",
     k_split: int = 1,
+    scale_mode: str = "epilogue",
     **kwargs,
 ):
     del kwargs
@@ -633,9 +651,15 @@ def _compile_preshuffle_to_cache(
         device=dev,
         dtype=torch.int32,
     )
-    scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
-    scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
-    bias = torch.empty(0, device=dev, dtype=out_torch_dtype)
+    if scale_mode == "blockscale":
+        scale_a = torch.empty((k // 128) * max(m, 1), device=dev, dtype=torch.float32)
+        scale_b = torch.empty(
+            ((n + 127) // 128) * (k // 128), device=dev, dtype=torch.float32
+        )
+    else:
+        scale_a = torch.empty((max(m, 1),), device=dev, dtype=torch.float32)
+        scale_b = torch.empty((max(n, 1),), device=dev, dtype=torch.float32)
+    bias = unused_tensor_arg(None, torch.empty(0, device=dev, dtype=out_torch_dtype))
     stream = fx.Stream(0)
 
     exe = compile_preshuffle_gemm(
@@ -652,6 +676,7 @@ def _compile_preshuffle_to_cache(
         xcd_swizzle=xcd_swizzle,
         lds_stage=lds_stage,
         split_k=k_split,
+        scale_mode=scale_mode,
     )
     # The layout-API launcher uses fx.Tensor args (it builds views via
     # fx.get_iter/make_view), so pass flat torch tensors directly rather
@@ -952,11 +977,11 @@ def _compile_ptpc_wmma_to_cache(
 
     with compile_only_env():
         launch_gemm_a8w8(
-            _ptr_view_safe(out),
-            _ptr_view_safe(xq),
-            _ptr_view_safe(wq),
-            _ptr_view_safe(scale_a),
-            _ptr_view_safe(scale_b),
+            ptr_arg(out),
+            ptr_arg(xq),
+            ptr_arg(wq),
+            ptr_arg(scale_a),
+            ptr_arg(scale_b),
             m,
             stream,
             n,

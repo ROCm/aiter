@@ -25,7 +25,7 @@ from torch import Tensor
 
 from aiter import dtypes, gemm_a16w16_asm, hipb_create_extension, hipb_mm, logger
 from aiter.jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gemm_op_common import get_padded_m
 
@@ -127,7 +127,7 @@ def get_GEMM_A16W16_tuned_config(
     cu_num = get_cu_num()
     padded_M = M
     config = None
-    gfx = get_gfx()
+    gfx = get_gfx_runtime()
     warned_invalid_opus = set()
     for gl in [None, 0, 1]:
         padded_M = M if gl is None else get_padded_m(M, N, K, gl)
@@ -153,12 +153,18 @@ def get_GEMM_A16W16_tuned_config(
                         config["kernelName"]
                     )
                 )
-                # None means the tuned CSV names a kernel absent from this
-                # catalog version; it is unrelated to FlyDSL import availability.
-                if flydsl_config is None:
+                # Main's dynamic-layout kernel names no longer encode concrete
+                # N/K, so only the schema-level identity is checked here.
+                if (
+                    flydsl_config is None
+                    or flydsl_config.get("target_gfx") != gfx
+                    or int(config["splitK"]) != flydsl_config.get("split_k")
+                    or flydsl_config.get("has_bias") != bias
+                ):
                     logger.warning(
                         f"FlyDSL kernel '{config['kernelName']}' from tuned config is not "
-                        "recognized by the current catalog; falling back to next candidate."
+                        "recognized or has incompatible architecture/split-K metadata; "
+                        "falling back to next candidate."
                     )
                     config = None
             if config is None:

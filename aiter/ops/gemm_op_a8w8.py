@@ -145,16 +145,18 @@ def gemm_a8w8_bpreshuffle_cktile(
 
 def _parse_flydsl_kernel_name(kernel_name: str):
     """Parse a flydsl kernelName into ``(tile_m, tile_n, tile_k, async_copy,
-    waves_per_eu, xcd_swizzle, lds_stage, scheduler, k_split)``, or None on
-    failure. Legacy names lacking the xcd/lds/scheduler tokens default them to
-    ``0``/``2``/``"Default"``; the ``_ksN`` split-K suffix is only emitted for
-    k_split > 1, so every previously tuned name still parses to k_split=1.
+    waves_per_eu, xcd_swizzle, lds_stage, scheduler, k_split, scale_mode)``, or
+    None on failure. Legacy names lacking the xcd/lds/scheduler tokens default
+    them to ``0``/``2``/``"Default"``; the ``_ksN`` split-K suffix is only
+    emitted for k_split > 1, so every previously tuned name still parses to
+    k_split=1. The trailing ``_smbs`` token marks the per-128-K blockscale
+    kernel; names without it are per-token (``"epilogue"``).
     """
     import re
 
     m = re.match(
         r"flydsl_bpreshuflle_(\d+)x(\d+)x(\d+)_\w+_\w+_\w+_(\d+)x(\d+)(?:x(\d+))?(?:x(\d+))?"
-        r"(?:_(?!ks\d+$)([A-Za-z][A-Za-z0-9]*))?(?:_ks(\d+))?$",
+        r"(?:_(?!ks\d+(?:_smbs)?$|smbs$)([A-Za-z][A-Za-z0-9]*))?(?:_ks(\d+))?(_smbs)?$",
         kernel_name,
     )
     if m is None:
@@ -164,7 +166,19 @@ def _parse_flydsl_kernel_name(kernel_name: str):
     lds_stage = int(m.group(7)) if m.group(7) else 2
     scheduler = m.group(8) if m.group(8) else "Default"
     k_split = int(m.group(9)) if m.group(9) else 1
-    return (tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split)
+    scale_mode = "blockscale" if m.group(10) else "epilogue"
+    return (
+        tm,
+        tn,
+        tk,
+        acp,
+        wpe,
+        xcd_swizzle,
+        lds_stage,
+        scheduler,
+        k_split,
+        scale_mode,
+    )
 
 
 def gemm_a8w8_bpreshuffle_flydsl(
@@ -196,7 +210,12 @@ def gemm_a8w8_bpreshuffle_flydsl(
     parsed = _parse_flydsl_kernel_name(kernel_name)
     if parsed is None:
         return gemm_a8w8_bpreshuffle_ck(XQ, WQ, x_scale, w_scale, Out)
-    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split = parsed
+    tm, tn, tk, acp, wpe, xcd_swizzle, lds_stage, scheduler, k_split, sm = parsed
+    if sm != "epilogue":
+        raise ValueError(
+            f"gemm_a8w8_bpreshuffle: blockscale kernel {kernel_name!r} in a "
+            "per-token config"
+        )
 
     flydsl_preshuffle_gemm_a8(
         XQ.contiguous(),
@@ -1430,6 +1449,37 @@ def gemm_a8w8_blockscale_bpreshuffle(
                 w_scale=w_scale,
             )
         elif libtype == "flydsl":
+            if kernelName.startswith("flydsl_bpreshuflle_"):
+                from .flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
+
+                parsed = _parse_flydsl_kernel_name(kernelName)
+                if parsed is None:
+                    raise ValueError(f"unparsable flydsl kernelName {kernelName!r}")
+                tm, tn, tk, acp, wpe, xcd, lds, sched, ks, sm = parsed
+                if sm != "blockscale":
+                    raise ValueError(
+                        f"gemm_a8w8_blockscale_bpreshuffle: per-token kernel "
+                        f"{kernelName!r} in a blockscale config"
+                    )
+                # x_scale must be [K/128, M] (transposed), as per_group_quant_hip(
+                # transpose_scale=True) emits; w_scale is [N/128, K/128].
+                return flydsl_preshuffle_gemm_a8(
+                    XQ.contiguous(),
+                    WQ.contiguous(),
+                    x_scale,
+                    w_scale,
+                    Y,
+                    tm,
+                    tn,
+                    tk,
+                    acp,
+                    wpe,
+                    xcd,
+                    lds_stage=lds,
+                    enable_scheduler=str(sched).lower() != "off",
+                    split_k=ks,
+                    scale_mode="blockscale",
+                )
             return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
                 XQ, WQ, x_scale, w_scale, Y, config
             )

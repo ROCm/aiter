@@ -41,6 +41,33 @@ def test_two_wave_vgpr_estimate_uses_128_threads():
     assert _estimate_max_wpe(32, 64, 512, total_vgpr=12) == 1
 
 
+def test_tuner_small_m_candidates_by_arch():
+    from aiter.ops.flydsl.gemm_tune import flydsl_gemm_a8w8_bpreshuffle_common as c
+
+    for arch in ("gfx942", "gfx950"):
+        pt = [
+            k
+            for k in c.kernels_list_942.values()
+            if c.kernel_fits_shape(k, 4, 2048, 2176, arch)
+        ] if arch == "gfx942" else [
+            k
+            for k in c.kernels_list_950.values()
+            if c.kernel_fits_shape(k, 4, 2048, 2176, arch)
+        ]
+        bs = [
+            k
+            for k in getattr(c, f"kernels_list_blockscale_{arch[3:]}").values()
+            if c.kernel_fits_shape(k, 4, 2048, 2176, arch)
+        ]
+        # K=2176 needs tile_k=128; M-overhanging 32-row tiles are admitted.
+        assert pt and bs
+        assert any(k.tile_m == 32 for k in pt)
+        if arch == "gfx942":
+            assert not any(k.use_async_copy for k in pt + bs)
+    assert not c.async_copy_supported_on_arch("gfx942")
+    assert c.async_copy_supported_on_arch("gfx950")
+
+
 def test_shuffle_weight_pad_k_to_pads_last_dim():
     weight = torch.zeros((16, 96), device="cuda", dtype=dtypes.fp8)
 

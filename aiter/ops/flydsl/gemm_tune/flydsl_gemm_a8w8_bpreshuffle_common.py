@@ -3,8 +3,8 @@
 
 """Tune spaces for every FlyDSL a8w8 (ptpc) bpreshuffle pipeline on CDNA.
 
-One operator, two pipelines, swept together under the same ``flydsl`` libtype so
-a single ``--libtype flydsl`` run picks one winner per shape:
+One operator, two pipelines, swept together under the same ``flydsl`` libtype
+so a single ``--libtype flydsl`` run picks one winner per shape:
 
 * ``preshuffle`` -- 4-wave MFMA, gfx942 + gfx950, fp8 or int8 weights.
 * ``8wave``      -- 8-wave CDNA4 ``MFMA_Scale``, gfx950 only, fp8 only.
@@ -20,11 +20,15 @@ The gfx1250 WMMA pipeline has its own file and is not part of PIPELINES yet.
 
 import math
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cache
 from typing import Any
 
-from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import (
+    get_gfx,
+    get_gfx_runtime,
+    get_lds_capacity_bytes,
+)
 
 _DTYPE_SHORT = {
     "fp8": "F8",
@@ -48,6 +52,9 @@ class kernelInstance:
     lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
     sScheduler: str = "Default"  # scheduler hints on; "Off" = compiler default
     k_split: int = 1  # >1 splits the K loop over gridDim.z (fp32 workspace + reduce)
+    # "blockscale" (per-128-K fp32 scales) is a different compiled kernel from the
+    # per-token "epilogue" one, so it carries a trailing ``_smbs`` name token.
+    scale_mode: str = "epilogue"
 
     @property
     def enable_scheduler(self) -> bool:
@@ -81,6 +88,7 @@ class kernelInstance:
                 self.sScheduler.lower(),
             ]
             + ([f"ks{self.k_split}"] if self.k_split > 1 else [])
+            + (["smbs"] if self.scale_mode == "blockscale" else [])
         )
 
 
@@ -112,6 +120,45 @@ def _ki(
         scheduler,
         k_split,
     )
+
+
+def async_a_copy_is_partial(
+    tile_m: int, tile_n: int, tile_k: int, elem_bytes: int = 1
+) -> bool:
+    """True when preshuffle_gemm's async A copy would leave part of A unwritten.
+
+    Single source of truth shared by the kernel's compile-time check and the
+    tuner filter. The async path issues only whole 16-byte-per-thread rounds
+    (``num_a_loads = A_bytes // (threads * 16)``), so any remainder is dropped.
+    Thread count mirrors the kernel: 4 waves, or ``tile_n // 16`` when tile_n < 64.
+    """
+    total_threads = (4 if tile_n >= 64 else tile_n // 16) * 64
+    return (tile_m * tile_k * elem_bytes) % (total_threads * 16) != 0
+
+
+def async_copy_supported_on_arch(arch: str) -> bool:
+    """Whether use_async_copy=1 can lower on ``arch``.
+
+    Single switch shared by the kernel's compile-time check and the tuner
+    filter. gfx942 lacks the 128-bit LDS-direct loads the async A copy needs;
+    flip this if partial-tile / 4-byte async support is added there.
+    """
+    return not str(arch).startswith("gfx942")
+
+
+def _tune_arch(arch: str | None = None) -> str:
+    """Target arch for candidate filtering.
+
+    An explicit ``arch`` (CPU AOT / offline naming) wins; otherwise the live
+    device, since runtime tuning must follow the GPU, not ``GPU_ARCHS``. Falls
+    back to ``get_gfx()`` on hosts with no device to detect.
+    """
+    if arch:
+        return arch
+    try:
+        return get_gfx_runtime()
+    except Exception:
+        return get_gfx()
 
 
 def _smem_align(ptr: int, align: int = 16) -> int:
@@ -166,14 +213,13 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
 
 
 @cache
-def max_lds_bytes_for_tune() -> int:
-    """Addressable LDS limit for current target.
+def _lds_bytes_for_arch(arch: str) -> int:
+    return get_lds_capacity_bytes(arch)
 
-    Cached because ``kernel_fits_shape`` calls it per candidate (thousands of
-    times per shape). The arch is resolved once at import below, so a
-    process-lifetime cache changes nothing.
-    """
-    return get_lds_capacity_bytes(get_gfx())
+
+def max_lds_bytes_for_tune(arch: str | None = None) -> int:
+    """Addressable LDS limit for the target (cached per arch: called per candidate)."""
+    return _lds_bytes_for_arch(_tune_arch(arch))
 
 
 def _padded_m(M: int) -> int:
@@ -192,7 +238,9 @@ def _padded_m(M: int) -> int:
         return (M + 127) // 128 * 128
 
 
-def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+def kernel_fits_shape(
+    ki: kernelInstance, M: int, N: int, K: int, arch: str | None = None
+) -> bool:
     """Whether a preshuffle candidate is worth tuning for this shape.
 
     Ragged M is legal: the device kernel bounds A, scale-A, and C buffer
@@ -201,19 +249,43 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     preshuffle group. K remains a tile-divisibility requirement. Changes here
     alter the tuner search space and therefore require affected model shapes to
     be re-tuned.
+
+    ``arch`` defaults to the runtime device; pass it explicitly for CPU-only
+    candidate enumeration.
     """
-    if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
+    arch = _tune_arch(arch)
+    if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune(arch):
+        return False
+    if ki.use_async_copy and not async_copy_supported_on_arch(arch):
         return False
     if N % 16 != 0 or K % ki.tile_k != 0:
         return False
+    if ki.use_async_copy and async_a_copy_is_partial(ki.tile_m, ki.tile_n, ki.tile_k):
+        return False
     if N % ki.tile_n != 0 and ki.k_split > 1:
         return False
-    if ki.k_split > 1 and (K // ki.tile_k) % ki.k_split != 0:
+    if ki.k_split < 1:
+        return False
+    if ki.scale_mode == "blockscale" and (
+        ki.q_dtype_a != "fp8"
+        or ki.q_dtype_w != "fp8"
+        or ki.tile_k % 128 != 0
+        or not arch.startswith(("gfx942", "gfx950"))
+    ):
+        return False
+    n_tiles = K // ki.tile_k
+    tiles_per_split = (n_tiles + ki.k_split - 1) // ki.k_split
+    if (ki.k_split - 1) * tiles_per_split >= n_tiles:
         return False
     # Preserve the bounded decode search space. Ragged-M candidates target the
-    # large-M wave-quantization cliffs where tile-row waste is small.
+    # large-M wave-quantization cliffs where tile-row waste is small. Exception:
+    # at M <= 16 a tile of at most 32 rows may overhang the padded M (the kernel
+    # masks the extra rows; verified for M=1/4/16 on 32-row tiles). Taller tiles
+    # would waste more than half the rows and stay excluded. tile_m is always a
+    # multiple of the 16-row MFMA granule in the tables.
     if M < 2048 and _padded_m(M) % ki.tile_m != 0:
-        return False
+        if not (M <= 16 and ki.tile_m <= 32 and ki.tile_m % 16 == 0):
+            return False
     num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * ((N + ki.tile_n - 1) // ki.tile_n)
     if num_ctas < max(4, min(16, N // 64)):
         return False
@@ -234,9 +306,19 @@ def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
 # Tiles shared by gfx942 and gfx950
 _base_tiles_common = [
     # small M (decode / token-gen)
+    # narrow tile_n for small-M fp8 decode; tile_m<=32 so the
+    # existing kernel_fits_shape M-gates (>=2048/4096/8192) auto-restrict these
+    # to the decode regime.
+    (16,  16,  256), (16,  16,  512),
+    (16,  32,  256), (16,  32,  512),
+    (32,  16,  256), (32,  16,  512),
+    (32,  32,  256), (32,  32,  512),
     (16,  64,  256), (16,  64,  512),
     (16,  128, 256), (16,  128, 512), (16,  256, 256), (16,  256, 512),
     (16,  512, 256), (16,  192, 256),
+    # tile_k=128 decode tiles: K such as 2176 (=17*128) is not divisible by 256.
+    (16,  32,  128), (16,  64,  128), (16,  128, 128), (16,  192, 128),
+    (16,  256, 128),
     # M=32
     (32,  64,  128), (32,  64,  256), (32,  64,  512), (32,  128, 128),
     (32,  128, 256), (32,  192, 128), (32,  192, 256), (32,  256, 128),
@@ -318,7 +400,7 @@ def _estimate_max_wpe(
     """
     padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
     padded_n = math.ceil(tile_n / _MFMA_N) * _MFMA_N
-    threads_per_tg = (2 if tile_n == 32 else _WAVES_PER_WG) * 64
+    threads_per_tg = min(_WAVES_PER_WG, tile_n // _MFMA_N) * 64
     c_per_thread = padded_m * padded_n // threads_per_tg
     if tile_n == 32 and tile_k >= 1024:
         # The 2-wave K=1024 path keeps two A-side and two B-side fragments
@@ -333,8 +415,7 @@ def _estimate_max_wpe(
     return int(total_vgpr / max(est_per_wave, 1))
 
 
-# Legal values are the divisors of K//tile_k, which is shape-dependent, so they
-# are enumerated rather than hardcoded.
+# Enumerate bounded split counts, including ragged slices, without empty splits.
 K_SPLIT_MIN_TILES_PER_SLICE = 2  # keep the ping-pong loop fed
 K_SPLIT_MAX_CTA_OVERSUBSCRIBE = 4  # no point going far past one CU each
 # Mirrors gemm_kernels.PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS without importing
@@ -366,7 +447,11 @@ def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[in
     )
     if max_split < 2:
         return []
-    return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
+    return [
+        d
+        for d in range(2, max_split + 1)
+        if (d - 1) * ((n_tiles + d - 1) // d) < n_tiles
+    ]
 
 
 def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):
@@ -402,6 +487,37 @@ kernels_list_950.update(
 )
 # fmt: on
 
+# Blockscale candidates: the gfx950 per-token tiles with tile_k % 128 == 0 plus
+# narrow tile_k=128 decode tiles (the per-token set only has tile_k >= 256 for
+# M=16, which cannot divide K such as 2176 = 17 * 128). gfx942 shares the tile
+# set but only its LDS-legal, non-async entries (see _blockscale_list).
+# kernel_fits_shape (incl. the async-copy gate) applies via ki.scale_mode.
+_base_tiles_blockscale = list(
+    dict.fromkeys(
+        t for t in _base_tiles_common + _base_tiles_950_extra if t[2] % 128 == 0
+    )
+)
+
+
+def _blockscale_list(arch: str) -> dict[int, kernelInstance]:
+    out = {
+        i: replace(ki, scale_mode="blockscale")
+        for i, ki in _build_kernels_list(
+            _base_tiles_blockscale, total_vgpr=_vgpr_per_simd(arch)
+        ).items()
+    }
+    limit = get_lds_capacity_bytes(arch)
+    return {
+        i: ki
+        for i, ki in out.items()
+        if (async_copy_supported_on_arch(arch) or not ki.use_async_copy)
+        and kernel_instance_estimated_lds_bytes(ki) <= limit
+    }
+
+
+kernels_list_blockscale_942 = _blockscale_list("gfx942")
+kernels_list_blockscale_950 = _blockscale_list("gfx950")
+
 default_kernels_dict_942 = {
     (-1): _ki(128, 128, 128, 0, 2, 0, 2, scheduler="Default"),
     (-2): _ki(16, 64, 512, 0, 2, 0, 2, scheduler="Default"),
@@ -422,9 +538,11 @@ default_kernels_dict_950 = {
 arch = get_gfx()
 if arch == "gfx942":
     kernels_list = kernels_list_942
+    kernels_list_blockscale = kernels_list_blockscale_942
     default_kernels_dict = default_kernels_dict_942
 else:
     kernels_list = kernels_list_950
+    kernels_list_blockscale = kernels_list_blockscale_950
     default_kernels_dict = default_kernels_dict_950
 
 
