@@ -6,6 +6,7 @@ import contextlib
 import pytest
 import torch
 
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -314,6 +315,89 @@ def test_mha_dao_ai_dropout_scores(dao_ai_impl, causal, window_size):
     )
     torch.testing.assert_close(out, ref_out, atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(lse, ref_lse.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("BWD_MODE", ["fused", "fused_atomic", "split"])
+@pytest.mark.parametrize("SEQLEN, SCALE", [(3, 30.0), (11, 30.0), (3, 1.0)])
+def test_mha_dao_ai_bwd_short_noncausal_varlen(
+    dao_ai_impl,
+    monkeypatch,
+    BWD_MODE: str,
+    SEQLEN: int,
+    SCALE: float,
+    dtype=torch.bfloat16,
+):
+    """Non-causal varlen backward on sequences shorter than one block.
+
+    With large logits a row's logsumexp can be very negative; the out-of-range
+    slots of the partial block then give exp(-lse) = inf unless the bounds mask
+    is applied, which turns dQ into NaN. Causal cases always masked, so only
+    non-causal ones exposed it.
+    """
+    monkeypatch.setattr(flash_attn_2, "BWD_MODE", BWD_MODE)
+    torch.cuda.empty_cache()
+    torch.manual_seed(20)
+    BATCH, NUM_HEADS, HEAD_SZ = 8, 8, 64
+    q, v = (
+        (torch.randn(BATCH, SEQLEN, NUM_HEADS, HEAD_SZ, device="cuda") * SCALE)
+        .to(dtype)
+        .requires_grad_()
+        for _ in range(2)
+    )
+    # k = -q makes each query's own key score -|q|^2 / sqrt(d), so the rows of
+    # the shortest sequences get a very negative logsumexp.
+    k = (-q).detach().requires_grad_()
+    padding_mask = generate_random_padding_mask(SEQLEN, BATCH, "cuda", mode="random")
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        q,
+        k,
+        v,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, padding_mask, padding_mask, kvpacked=False)
+    q_unpad.requires_grad_()
+    k_unpad.requires_grad_()
+    v_unpad.requires_grad_()
+
+    triton_out = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        causal=False,
+    )
+    do = torch.randn_like(q)
+    _, (torch_dq, torch_dk, torch_dv), _, bwd_tols = attention_ref_with_tol(
+        q,
+        k,
+        v,
+        do,
+        causal=False,
+        query_padding_mask=padding_mask,
+        key_padding_mask=padding_mask,
+    )
+    triton_dq, triton_dk, triton_dv = torch.autograd.grad(
+        output_pad_fn(triton_out), (q_unpad, k_unpad, v_unpad), do
+    )
+    for tri, ref, (atol, rtol), name in zip(
+        (dq_pad_fn(triton_dq), dk_pad_fn(triton_dk), dk_pad_fn(triton_dv)),
+        (torch_dq, torch_dk, torch_dv),
+        bwd_tols,
+        ("dq", "dk", "dv"),
+    ):
+        assert torch.isfinite(tri).all(), f"non-finite {name}"
+        torch.testing.assert_close(tri, ref, atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("default_device", ["cpu", "cuda"])
