@@ -17,6 +17,9 @@ Codes
   * FP6 (E2M3): a 32-value group is 24 bytes, value i at bits 6i..6i+5 little-endian. Bytes 0-15 of every group
     form plane C0, bytes 16-23 plane C1; both K128-blocked, in one buffer: C0 ``[R/16, K/128, 16, 64]`` then
     C1 ``[R/32, K/128, 32, 32]``, ``R*K*3/4`` bytes in total.
+  * FP8 (E4M3, one fp32 scale per tensor, no slab): a 32-value group is 32 bytes. Bytes 0-15 of every group form
+    plane P0, bytes 16-31 plane P1, both with C0's K128-blocked geometry, in one buffer: P0 ``[R/16, K/128, 16, 64]``
+    then P1 the same, ``R*K`` bytes in total. A kernel lane's 32-value fragment is then one 16-byte read from each.
 
 Scales: one E8M0 byte per 1x32 block, ``R*K/32`` bytes, in a slab tiled per 256 rows. The byte position of
 (row, k-block) is ``ts_scale_byte``; it depends on the operand role, on the parity of K/256 and, for role B only, on
@@ -199,6 +202,25 @@ def unpack_fp6_codes_ref(buf: torch.Tensor, rows: int, K: int) -> torch.Tensor:
     w = by[..., 0] | by[..., 1] << 8 | by[..., 2] << 16
     v = torch.stack([(w >> (6 * i)) & 63 for i in range(4)], -1)
     return v.reshape(rp, K)[:rows].to(torch.uint8).contiguous()
+
+
+def pack_fp8_codes_ref(codes: torch.Tensor) -> torch.Tensor:
+    """``[R, K]`` E4M3 codes (uint8 or float8 view) -> the tilescale FP8 buffer (uint8, ``R_pad*K``: P0 then P1)."""
+    c = _pad_rows(codes.view(torch.uint8))
+    R, K = c.shape
+    by = c.view(R, K // 32, 32)
+    p0 = by[..., :16].reshape(R, K // 2)
+    p1 = by[..., 16:].reshape(R, K // 2)
+    return torch.cat((_blocked(p0, 16, 64), _blocked(p1, 16, 64)))
+
+
+def unpack_fp8_codes_ref(buf: torch.Tensor, rows: int, K: int) -> torch.Tensor:
+    rp = _ceil(rows, TILE)
+    flat = buf.view(torch.uint8).reshape(-1)
+    n = rp * K // 2
+    p0 = _unblocked(flat[:n], rp, 16, 64, K // 128).view(rp, K // 32, 16)
+    p1 = _unblocked(flat[n : 2 * n], rp, 16, 64, K // 128).view(rp, K // 32, 16)
+    return torch.cat((p0, p1), -1).reshape(rp, K)[:rows].contiguous()
 
 
 def fp6_planes(buf: torch.Tensor, rows: int, K: int):

@@ -2,7 +2,8 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Tilescale GEMMs (aiter.ops.gemm_op_tilescale) against an fp64 reference, and A6W4 against A6W6 on the FP6
-re-encoding of B (every E2M1 value is an E2M3 value and the MFMA treats them alike, so the two are bitwise equal)."""
+re-encoding of B (every E2M1 value is an E2M3 value and the MFMA treats them alike, so the two are bitwise equal).
+FP8 (E4M3, tensorwise) rows against the fp64 product of their dequantized operands."""
 
 import csv
 import os
@@ -13,7 +14,13 @@ import torch
 import aiter.ops.tilescale as TS
 from aiter.jit.core import AITER_META_DIR
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.gemm_op_tilescale import gemm_a6w4_tilescale, gemm_mx_tilescale, tilescale_supported
+from aiter.ops.gemm_op_tilescale import (
+    fp8_tilescale_supported,
+    gemm_a6w4_tilescale,
+    gemm_fp8_tilescale,
+    gemm_mx_tilescale,
+    tilescale_supported,
+)
 
 
 def _is_gfx950() -> bool:
@@ -35,7 +42,9 @@ def _manifest():
                 for r in csv.DictReader(f)]
 
 
-ROWS = [r for r in _manifest() if r["abi"] not in (2, 3, 4, 5)]  # exact-shape rows
+ALL_ROWS = [r for r in _manifest() if r["abi"] not in (2, 3, 4, 5)]  # exact-shape rows
+ROWS = [r for r in ALL_ROWS if r["a_fmt"] != 8]  # MX rows
+FP8_ROWS = [r for r in ALL_ROWS if r["a_fmt"] == 8]
 SOFTMAX_D = [r for r in _manifest() if r["abi"] == 4]  # exact-shape rows emitting attention's softmax_d
 GENERIC_ROWS = [r for r in _manifest() if r["abi"] in (2, 3)]
 A6W4 = [r for r in ROWS if (r["a_fmt"], r["b_fmt"]) == (6, 4)]
@@ -270,3 +279,63 @@ def test_a4w4_softmax_d(row):
     ref = prod.sum(-1).permute(1, 2, 0)
     mag = prod.abs().sum(-1).permute(1, 2, 0)
     assert ((d.double() - ref).abs() / mag).max().item() < 1e-5
+
+
+# -- FP8 (E4M3, one fp32 scale per tensor) -------------------------------------------------------------------------
+
+
+def _fp8_operands(M, N, K, g):
+    """Random finite E4M3 codes (no NaN encodings) and their values."""
+    def codes(rows):
+        c = torch.randint(0, 256, (rows, K), dtype=torch.uint8, device="cuda", generator=g)
+        return torch.where((c & 0x7F) == 0x7F, c ^ 1, c)  # 0x7F / 0xFF are NaN in E4M3
+
+    a, b = codes(M), codes(N)
+    return a, b, a.view(torch.float8_e4m3fn).double(), b.view(torch.float8_e4m3fn).double()
+
+
+def test_fp8_pack_roundtrip():
+    g = torch.Generator(device="cuda").manual_seed(5)
+    c = torch.randint(0, 256, (300, 512), dtype=torch.uint8, device="cuda", generator=g)
+    buf = TS.pack_fp8_codes_ref(c)
+    assert buf.numel() == 512 * 512  # rows padded to 256
+    assert torch.equal(TS.unpack_fp8_codes_ref(buf, 300, 512), c)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("row", FP8_ROWS, ids=lambda r: r["knl_name"])
+def test_fp8_vs_fp64(row):
+    M, N, K, bias = row["M"], row["N"], row["K"], bool(row["bias"])
+    assert fp8_tilescale_supported(M, N, K, bias)
+    g = torch.Generator(device="cuda").manual_seed(M + 3 * N + K)
+    a, b, av, bv_ = _fp8_operands(M, N, K, g)
+    sa = torch.tensor([2.0**-9], device="cuda")
+    sb = torch.tensor([3.0 * 2.0**-11], device="cuda")
+    bias_t = torch.randn(N, dtype=torch.bfloat16, device="cuda", generator=g) if bias else None
+    out = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    gemm_fp8_tilescale(TS.pack_fp8_codes_ref(a), TS.pack_fp8_codes_ref(b), sa, sb, out, K, bias_t)
+    dt = torch.float64 if _small(row) else torch.float32  # fp32 on the GPU for the large shapes: exact enough here
+    ref = (av.to(dt) @ bv_.to(dt).t()) * (sa.double().item() * sb.double().item())
+    if bias_t is not None:
+        ref = ref + bias_t.to(dt)
+    err = (out.to(dt) - ref).abs()
+    assert float(err.max()) <= float(ref.abs().max()) * 2**-7, float(err.max())
+
+
+@requires_gfx950
+def test_fp8_out_row_slice():
+    """``out`` may be a contiguous row slice of a larger buffer (two streams' outputs in one tensor)."""
+    rows = [r for r in FP8_ROWS if _small(r) and not r["bias"]]
+    if not rows:
+        pytest.skip("no small FP8 row")
+    M, N, K = rows[0]["M"], rows[0]["N"], rows[0]["K"]
+    g = torch.Generator(device="cuda").manual_seed(9)
+    a, b, _, _ = _fp8_operands(M, N, K, g)
+    A, B = TS.pack_fp8_codes_ref(a), TS.pack_fp8_codes_ref(b)
+    s1 = torch.ones(1, device="cuda")
+    ref = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")
+    gemm_fp8_tilescale(A, B, s1, s1, ref, K)
+    big = torch.zeros(3 * M, N, dtype=torch.bfloat16, device="cuda")
+    gemm_fp8_tilescale(A, B, s1, s1, big[M : 2 * M], K)
+    assert torch.equal(big[M : 2 * M].view(torch.int16), ref.view(torch.int16))
+    assert not big[:M].any() and not big[2 * M :].any()

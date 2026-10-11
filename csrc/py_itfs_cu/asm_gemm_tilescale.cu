@@ -17,7 +17,10 @@
 // one E8M0 scale per 32 K in the tilescale slab. Operand formats per row of the manifest
 // (hsa/gfx950/tsgemm): a_fmt / b_fmt 4 (E2M1) or 6 (E2M3); FP6 codes are the K128-blocked C0 / C1
 // planes in one buffer; FP4 codes are row-major (b_codes 0) or K128-blocked (b_codes 1); b_ilv is
-// role B's scale interleave. Rows are selected by (formats, b_codes, b_ilv, bias, M, N, K); `abi`
+// role B's scale interleave. a_fmt = b_fmt = 8: E4M3 with one fp32 scale per tensor (the scale
+// arguments are the two fp32 dequantization factors, one element each); the codes are two K128-blocked
+// planes in one buffer, bytes 0-15 then 16-31 of every 32-value K group (aiter/ops/tilescale.py,
+// fp8_planes); out = (A @ B^T) * a_scale * b_scale (+ bias). Rows are selected by (formats, b_codes, b_ilv, bias, M, N, K); `abi`
 // selects the kernarg marshalling:
 //   0  the A4W4 160-byte kernarg (KernelArgsTs4)
 //   1  the A6W6 156-byte kernarg, 172 with bias (KernelArgsTs6): A6W6, and A6W4 with B's C1 slot
@@ -124,7 +127,7 @@ Memref memref(void* p, int64_t rows, int64_t row_bytes)
 
 int64_t code_bytes(int64_t fmt, int64_t rows, int64_t K)
 {
-    return fmt == 4 ? rows * K / 2 : rows * K * 3 / 4;
+    return fmt == 4 ? rows * K / 2 : fmt == 8 ? rows * K : rows * K * 3 / 4;
 }
 
 const tsgemmConfig* find_row(const std::string& arch,
@@ -214,9 +217,11 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     A->device_id == B_scale->device_id && A->device_id == out->device_id,
                 __func__,
                 " all tensors must be on the same GPU");
-    AITER_CHECK((a_fmt == 4 || a_fmt == 6) && (b_fmt == 4 || b_fmt == 6),
+    const bool fp8 = a_fmt == 8 || b_fmt == 8;
+    AITER_CHECK(fp8 ? (a_fmt == 8 && b_fmt == 8 && B_c1 == nullptr && epi_o == nullptr)
+                    : (a_fmt == 4 || a_fmt == 6) && (b_fmt == 4 || b_fmt == 6),
                 __func__,
-                " formats must be 4 (E2M1) or 6 (E2M3)");
+                " formats must be 4 (E2M1) or 6 (E2M3), or both 8 (E4M3, tensorwise)");
     const int64_t M = out->size(0), N = out->size(1);
     AITER_CHECK(K > 0 && K % 256 == 0 && M % 256 == 0 && N % 256 == 0,
                 __func__,
@@ -233,9 +238,15 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                     (B_c1 != nullptr || bytes(B) == code_bytes(b_fmt, N, K)),
                 __func__,
                 " A/B byte sizes do not match their formats");
-    AITER_CHECK(bytes(A_scale) == M * K / 32 && bytes(B_scale) == N * K / 32,
-                __func__,
-                " tilescale scale slabs must be rows*K/32 bytes");
+    if(fp8)
+        AITER_CHECK(A_scale->dtype() == AITER_DTYPE_fp32 && B_scale->dtype() == AITER_DTYPE_fp32 &&
+                        A_scale->numel() == 1 && B_scale->numel() == 1,
+                    __func__,
+                    " FP8 tensorwise scales must be one fp32 element each");
+    else
+        AITER_CHECK(bytes(A_scale) == M * K / 32 && bytes(B_scale) == N * K / 32,
+                    __func__,
+                    " tilescale scale slabs must be rows*K/32 bytes");
     const auto aligned = [](const aiter_tensor_t* t) {
         return reinterpret_cast<uintptr_t>(t->ptr) % kTensorAlignment == 0;
     };
@@ -324,13 +335,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     }
     else
     {
-        AITER_CHECK((cfg->abi == 1 || cfg->abi == 2) && a_fmt == 6,
+        AITER_CHECK((cfg->abi == 1 || cfg->abi == 2) && (a_fmt == 6 || a_fmt == 8),
                     __func__,
                     " unknown abi / format pairing");
         std::memset(&a6, 0, sizeof(a6));
         a6.A0 = memref(pa, M, K / 2);
-        a6.A1 = memref(pa + M * K / 2, M, K / 4);
-        if(b_fmt == 6)
+        a6.A1 = fp8 ? memref(pa + M * K / 2, M, K / 2) : memref(pa + M * K / 2, M, K / 4);
+        if(fp8)
+        {
+            a6.B0 = memref(pb, N, K / 2);
+            a6.B1 = memref(pb + N * K / 2, N, K / 2);
+        }
+        else if(b_fmt == 6)
         {
             a6.B0 = memref(pb, N, K / 2);
             a6.B1 = memref(B_c1 != nullptr ? static_cast<char*>(B_c1->ptr) : pb + N * K / 2, N, K / 4);

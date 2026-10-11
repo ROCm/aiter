@@ -3,7 +3,9 @@
 
 """MX GEMMs on the tilescale layout (``aiter.ops.tilescale``): ``out[M, N] = A @ B^T (+ bias)``, bf16 out.
 
-``a_fmt`` / ``b_fmt``: 4 (E2M1) or 6 (E2M3). FP6 operands are tilescale FP6 buffers (C0 then C1 planes), FP4
+``a_fmt`` / ``b_fmt``: 4 (E2M1) or 6 (E2M3); or both 8: E4M3 with one fp32 scale per tensor
+(``gemm_fp8_tilescale``: ``out = (A @ B^T) * a_scale * b_scale (+ bias)``, operands as ``pack_fp8_codes_ref`` lays
+them out). FP6 operands are tilescale FP6 buffers (C0 then C1 planes), FP4
 operands tilescale FP4 bytes in the ``b_codes`` layout (0 = "row", 1 = "k128", 2 = "kouter" with its K256-outer
 scale slab; A operands are "row"). Scales are tilescale slabs, role B with interleave ``b_ilv``. Kernels are selected from the ``tsgemm`` manifest;
 ``tilescale_supported`` says whether a call has one (pure Python on ints, safe inside compiled regions).
@@ -171,6 +173,18 @@ def gemm_mx_tilescale(
     _gemm_tilescale_asm(A, B, A_scale, B_scale, out, K, bias, a_fmt, b_fmt, b_codes, b_ilv, b_c1, epi_o, epi_delta,
                         epi_s0)
     return out
+
+
+def fp8_tilescale_supported(M: int, N: int, K: int, bias: bool = False) -> bool:
+    """Whether ``gemm_fp8_tilescale`` has a kernel for the call (pure Python on ints)."""
+    return tilescale_supported(M, N, K, 8, 8, bias)
+
+
+def gemm_fp8_tilescale(A, B, a_scale, b_scale, out, K, bias=None):
+    """``out[M, N] = (A @ B^T) * a_scale * b_scale (+ bias)``: A / B tilescale FP8 buffers (E4M3, P0 then P1),
+    ``a_scale`` / ``b_scale`` one-element fp32 tensors (the dequantization factors), bias bf16 [N]. ``out`` may be a
+    contiguous row slice of a larger buffer."""
+    return gemm_mx_tilescale(A, B, a_scale, b_scale, out, 8, 8, K, bias)
 
 
 def gemm_a6w4_tilescale(A, B, A_scale, B_scale, out, K, bias=None, b_codes=FP4_CODES["k128"]):
