@@ -30,7 +30,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import arith, const_expr, fastmath, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import ArithValue, CmpFPredicate
 from flydsl.expr.typing import Int32, Stream, T
@@ -157,7 +157,7 @@ def _wave_reduce_max(x, log2_block):
     for sh_exp in range_constexpr(log2_block):
         off = BLOCK_THREADS // (2 << sh_exp)
         peer = _to_raw(fx.Float32(w).shuffle_xor(off, BLOCK_THREADS))
-        w = arith.maximumf(w, peer)
+        w = fx.max(fx.Float32(w), fx.Float32(peer)).ir_value()
     return w
 
 
@@ -391,30 +391,33 @@ def _build_kernel(
                     w_old = w_lane[i]
                     kv_old = kv_lane[i]
 
-                    m_new = arith.maximumf(m_old, score)
-                    is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = _fexp_f32(arith.subf(m_old, m_new), c_log2e)
-                    scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = _fexp_f32(arith.subf(score, m_new), c_log2e)
+                    m_old_f = fx.Float32(m_old)
+                    score_f = fx.Float32(score)
+                    neg_inf_f = fx.Float32(c_neg_inf)
+                    m_new = fx.max(m_old_f, score_f).ir_value()
+                    # Keep the -inf sentinel comparisons outside ambient fastmath.
+                    with fastmath(None):
+                        is_first = m_old_f == neg_inf_f
+                    scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
+                    scale_v = is_first.select(c_zero_f32, scale_active)
+                    wk_active = _fexp_f32(score_f - m_new, c_log2e)
                     if const_expr(score_can_be_neg_inf):
-                        is_pad_score = arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
-                        w_k = arith.select(is_pad_score, c_zero_f32, wk_active)
+                        with fastmath(None):
+                            is_pad_score = score_f == neg_inf_f
+                        w_k = is_pad_score.select(c_zero_f32, wk_active)
                     else:
                         w_k = wk_active
                     new_m.append(m_new)
                     new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_old, scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_v, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(kv_old) * fx.Float32(scale_v)
+                            + fx.Float32(w_k) * fx.Float32(kv_v)
+                        )
                     )
                     new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_old, scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(w_old) * fx.Float32(scale_v) + fx.Float32(w_k)
+                        )
                     )
                 return new_m, new_kv, new_w
 
@@ -1186,7 +1189,7 @@ def _build_kernel(
                             ),
                         )
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, e8m0_v),
+                            fx.Uint8(e8m0_v).ir_value(),
                             scale_rsrc,
                             fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
                             + fx.Int32(tid) // NTG,
@@ -1225,7 +1228,6 @@ def _build_kernel(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = fx.Index(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -1255,7 +1257,7 @@ def _build_kernel(
             block_table_seq_stride,
         )
         k.launch(
-            grid=(idx_p, 1, 1),
+            grid=(plan_capacity, 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -1469,27 +1471,31 @@ def _build_kernel_ksplit(
                 for i in range_constexpr(VEC):
                     m_old = m_lane[i]
                     score = score_lane[i]
-                    m_new = arith.maximumf(m_old, score)
-                    is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = _fexp_f32(arith.subf(m_old, m_new), c_log2e)
-                    scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = _fexp_f32(arith.subf(score, m_new), c_log2e)
-                    is_pad = arith.cmpf(CmpFPredicate.OEQ, score, c_neg_inf)
-                    w_k = arith.select(is_pad, c_zero_f32, wk_active)
+                    m_old_f = fx.Float32(m_old)
+                    score_f = fx.Float32(score)
+                    neg_inf_f = fx.Float32(c_neg_inf)
+                    m_new = fx.max(m_old_f, score_f).ir_value()
+                    # Keep the -inf sentinel comparisons outside ambient fastmath.
+                    with fastmath(None):
+                        is_first = m_old_f == neg_inf_f
+                    scale_active = _fexp_f32(m_old_f - m_new, c_log2e)
+                    scale_v = is_first.select(c_zero_f32, scale_active)
+                    wk_active = _fexp_f32(score_f - m_new, c_log2e)
+                    with fastmath(None):
+                        is_pad = score_f == neg_inf_f
+                    w_k = is_pad.select(c_zero_f32, wk_active)
                     new_m.append(m_new)
                     new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_lane[i], scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_v_lane[i], fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(kv_lane[i]) * fx.Float32(scale_v)
+                            + fx.Float32(w_k) * fx.Float32(kv_v_lane[i])
+                        )
                     )
                     new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_lane[i], scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
+                        _to_raw(
+                            fx.Float32(w_lane[i]) * fx.Float32(scale_v)
+                            + fx.Float32(w_k)
+                        )
                     )
                 return new_m, new_kv, new_w
 
@@ -2014,7 +2020,7 @@ def _build_kernel_ksplit(
                             ),
                         )
                         buffer_ops.buffer_store(
-                            arith.trunci(T.i8, e8m0_v),
+                            fx.Uint8(e8m0_v).ir_value(),
                             scale_rsrc,
                             fx.Int32(slot_in_block) * (D // _FP4_GROUP_SIZE)
                             + fx.Int32(lid) // NTG,
@@ -2049,7 +2055,6 @@ def _build_kernel_ksplit(
         plan_capacity: fx.Int32,
         stream: fx.Stream,
     ):
-        idx_p = fx.Index(plan_capacity)
         k = kernel(
             kv_in,
             kv_in_row_stride,
@@ -2076,7 +2081,7 @@ def _build_kernel_ksplit(
             block_table_seq_stride,
         )
         k.launch(
-            grid=(idx_p, 1, 1),
+            grid=(plan_capacity, 1, 1),
             block=(BLOCK_TH, 1, 1),
             stream=stream,
         )
