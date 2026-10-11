@@ -538,6 +538,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     else 0
                 )
             )
+            # splitK >= 2 uses order-dependent atomic accumulation.
+            maxsplitK = min(maxsplitK, 1)
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "cktile", preshuffleB)
                 tasks_cktile.append(
@@ -610,6 +612,8 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
                     else 0
                 )
             )
+            # splitK >= 2 uses order-dependent atomic accumulation.
+            maxsplitK = min(maxsplitK, 1)
             for splitK in range(maxsplitK + 1):
                 info = (info_keys, i, splitK, "", "ck", preshuffleB)
                 tasks_ck.append(
