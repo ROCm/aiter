@@ -53,6 +53,21 @@ constexpr int kDynGqTdmKPT            = 2;  // staged steps per block (TDM kerne
 // (33.8 -> 35.4 us) and four tiles are slower for both.
 template <typename DTYPE_O>
 constexpr int kMx32TilesX = std::is_same_v<DTYPE_O, opus::fp8_t> ? 1 : 2;
+#if defined(__gfx942__)
+constexpr float kMxFp8Max = 240.0f;
+#else
+constexpr float kMxFp8Max = 448.0f;
+#endif
+
+// Multiplier for the MXFP8 software convert (scaled_cast_fp8_noclamp) of an e8m0 `scale`.
+// That convert has no +-max clamp: the RoundUp scale keeps finite values in range, and
+// without the clamp NaN converts to NaN (the clamp sent it to -max), as gfx1250's native
+// convert does. An Inf scale (a group holding an Inf) gives a NaN multiplier, so such a
+// group is NaN throughout, again as the native convert writes it.
+__device__ __forceinline__ float mxfp8_multiplier(float scale)
+{
+    return __builtin_isinf(scale) ? __builtin_nanf("") : 1.0f / scale;
+}
 
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
 // byte scale, fp8 / i8 output a continuous fp32 per-group scale.
@@ -313,7 +328,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
     const int32_t pair_stride = kColumnMajorGroups ? ori_cols : group_size;
 
     auto process = [&](vec_i thread_data, int64_t x, int32_t y, int64_t groupId) {
-        // MXFP8: any NaN or Inf makes its group invalid (E8M0 0xff scale, FP8 NaN data).
         static constexpr bool kMxFp8 = use_e8m0_scale && std::is_same_v<DTYPE_O, opus::fp8_t>;
         static constexpr bool kStoreTakesDivisor =
             kMxFp8 && opus::is_any_of_v<DTYPE_I, opus::bf16_t, opus::fp16_t> &&
@@ -336,11 +350,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                 asm("v_pk_max_u16 %0, %1, %2" : "=v"(packed_max) : "v"(packed_max), "v"(pair));
             }
             const uint32_t magnitude = opus::max(packed_max & 0xffffU, packed_max >> 16);
-            if constexpr(kMxFp8)
-                // Unsigned magnitude order puts NaN above Inf: fold both onto Inf.
-                absMax = max(absMax, __builtin_bit_cast(float, opus::min(magnitude, 0x7f80U) << 16));
-            else if(magnitude > 0x7f80U)
+            if(magnitude > 0x7f80U)
             {
+                // Unsigned ordering puts NaNs above infinity. Preserve the original
+                // reduction semantics when a lane contains a NaN.
                 for(size_t j = 0; j < thread_data_size; ++j)
                     absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
             }
@@ -350,13 +363,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         else
         {
             for(size_t j = 0; j < thread_data_size; ++j)
-            {
-                const float v = abs(static_cast<float>(thread_data[j]));
-                // NaN-propagating max; the cross-lane reduce below drops NaNs, so fold to Inf.
-                absMax = kMxFp8 ? __builtin_elementwise_maximum(absMax, v) : max(absMax, v);
-            }
-            if constexpr(kMxFp8)
-                absMax = __builtin_isnan(absMax) ? __builtin_inff() : absMax;
+                absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
         }
         absMax = multithread_reduce(absMax, aiter::Max(), num_thread_per_group);
 
@@ -379,12 +386,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #endif
             inverted_scale =
                 aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
-            if constexpr(kMxFp8 &&
-                         aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even)
-            {
-                if(!__builtin_isfinite(absMax))
-                    inverted_scale = __builtin_inff();
-            }
         }
         else
         {
@@ -461,11 +462,10 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             inverted_scale = 1.0f / inverted_scale;
         }
 
-        // The native convert does not saturate. Only RoundDown / Even can floor the scale
-        // enough for finite data to overflow; an invalid group's 0xff scale already yields NaN.
-        if constexpr(kHwConvertDiv && kScaleMayClip)
+        // Only RoundDown / Even can floor the scale enough for finite data to overflow.
+        if constexpr(kMxFp8 && kScaleMayClip)
         {
-            const float hi = 448.0f * inverted_scale;
+            const float hi = kMxFp8Max * row_scale;
             for(size_t j = 0; j < thread_data_size; j++)
             {
                 const float v = static_cast<float>(thread_data[j]);
@@ -479,7 +479,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         if constexpr(wide_group_stores && kTunedForThisArch)
         {
             // Regular stores only. Keep cache-policy experiments out of this path.
-            static_assert(thread_data_size==32 && group_size==128);
+            static_assert(thread_data_size==32 && group_size==128 && kHwConvertDiv);
             const auto converted=scaled_cast_div<opus::fp8_t>(thread_data,inverted_scale);
             const auto words=__builtin_bit_cast(opus::vector_t<uint32_t,8>,converted);
             opus::vector_t<uint32_t,4> first,second;
@@ -507,7 +507,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
         else if constexpr(full_group_stores && kTunedForThisArch)
         {
             static_assert(thread_data_size == 32 && group_size == 128 &&
-                          std::is_same_v<DTYPE_O, opus::fp8_t>);
+                          std::is_same_v<DTYPE_O, opus::fp8_t> && kHwConvertDiv);
             // Each store covers a complete 128B group across the lanes of groups gid and
             // gid ^ 1, so both must be live together.
             const auto converted = scaled_cast_div<opus::fp8_t>(thread_data, inverted_scale);
@@ -539,7 +539,15 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             using DTYPE_STORE = std::conditional_t<std::is_same_v<DTYPE_O, opus::fp4_t>, uint8_t, DTYPE_O>;
             auto* out_ptr     = reinterpret_cast<DTYPE_STORE*>(out);
             auto store_output = [&](auto& buffer_o, int64_t offset) __attribute__((always_inline)) {
-                if constexpr(kInterleavedChunks)
+                if constexpr(kMxFp8 && !kHwConvertDiv)
+                {
+                    store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT,
+                                 kInterleavedChunks,
+                                 kInterleavedChunks ? num_thread_per_group : WARP_SIZE,
+                                 kInterleavedChunks ? kChunks : 1, DTYPE_O, false, true>(
+                        buffer_o, thread_data, offset, mxfp8_multiplier(row_scale));
+                }
+                else if constexpr(kInterleavedChunks)
                 {
                     store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, true,
                                  num_thread_per_group, kChunks, DTYPE_O, kStoreTakesDivisor>(
@@ -550,29 +558,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                     store_vector<DTYPE_STORE, DTYPE_I, thread_data_size, RT, false, WARP_SIZE, 1,
                                  DTYPE_O, kStoreTakesDivisor>(
                         buffer_o, thread_data, offset, inverted_scale);
-                }
-                // Software converts saturate NaN to a finite value: rewrite an invalid group.
-                if constexpr(kMxFp8 && !kHwConvertDiv)
-                {
-                    if(!__builtin_isfinite(row_scale))
-                    {
-#if defined(__gfx942__)
-                        constexpr uint32_t kNaN = 0x80808080U;
-#else
-                        constexpr uint32_t kNaN = 0xffffffffU;
-#endif
-                        opus::vector_t<uint32_t, thread_data_size / 4> nan_words;
-                        opus::static_for<thread_data_size / 4>(
-                            [&](auto i) { nan_words[i.value] = kNaN; });
-                        store_vector<DTYPE_STORE, DTYPE_O, thread_data_size, RT,
-                                     kInterleavedChunks,
-                                     kInterleavedChunks ? num_thread_per_group : WARP_SIZE,
-                                     kInterleavedChunks ? kChunks : 1, DTYPE_O>(
-                            buffer_o,
-                            __builtin_bit_cast(opus::vector_t<DTYPE_O, thread_data_size>,
-                                               nan_words),
-                            offset);
-                    }
                 }
             };
 
@@ -1492,7 +1477,7 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
     using vec_i = opus::vector_t<DTYPE_I, kElems>;
     using vec_o = opus::vector_t<opus::fp8_t, kElems>;
 #if defined(__gfx1250__)
-    static constexpr bool kHwConvertDiv = std::is_same_v<DTYPE_I, opus::bf16_t>;
+    static constexpr bool kHwConvertDiv = opus::is_any_of_v<DTYPE_I, opus::bf16_t, opus::fp16_t>;
 #else
     static constexpr bool kHwConvertDiv = false;
 #endif
@@ -1527,31 +1512,22 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         const int r        = 4 * s.value + rsub; // row within the 32-row block
         const bool valid   = row0 + r < rows;
         vec_i thread_data  = data[s.value];
-        // MXFP8: any NaN or Inf makes its group invalid (E8M0 0xff scale, FP8 NaN data).
         float absMax       = 1e-10f;
         for(int j = 0; j < kElems; ++j)
-            absMax = __builtin_elementwise_maximum(absMax, abs(static_cast<float>(thread_data[j])));
-        // The cross-lane reduce drops NaNs, so fold them to Inf first.
-        absMax = __builtin_isnan(absMax) ? __builtin_inff() : absMax;
+            absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
         absMax = multithread_reduce(absMax, aiter::Max(), 2);
-        float row_scale =
+        const float row_scale =
             aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
-        if constexpr(aiter::kDefaultMxScaleRoundMode == aiter::MxScaleRoundMode::Even)
-        {
-            if(!__builtin_isfinite(absMax))
-                row_scale = __builtin_inff();
-        }
         if(lane % 2 == 0)
             scale_blk[r * 4 + (lane % 8) / 2] =
                 valid ? static_cast<uint8_t>((__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF)
                       : uint8_t{0x7F};
         if(!valid)
             return;
-        // The native convert does not saturate. Only RoundDown / Even can floor the scale
-        // enough for finite data to overflow; an invalid group's 0xff scale already yields NaN.
-        if constexpr(kHwConvertDiv && kScaleMayClip)
+        // Only RoundDown / Even can floor the scale enough for finite data to overflow.
+        if constexpr(kScaleMayClip)
         {
-            const float hi = 448.0f * row_scale;
+            const float hi = kMxFp8Max * row_scale;
             for(int j = 0; j < kElems; ++j)
             {
                 const float v = static_cast<float>(thread_data[j]);
@@ -1561,22 +1537,11 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
                     thread_data[j] = static_cast<DTYPE_I>(-hi);
             }
         }
-        vec_o q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
-        // Software converts saturate NaN to a finite value: rewrite an invalid group.
-        if constexpr(!kHwConvertDiv)
-        {
-            if(!__builtin_isfinite(row_scale))
-            {
-#if defined(__gfx942__)
-                constexpr uint8_t kNaN = 0x80;
-#else
-                constexpr uint8_t kNaN = 0xFF;
-#endif
-                opus::static_for<kElems>([&](auto j) {
-                    q[j.value] = __builtin_bit_cast(opus::fp8_t, kNaN);
-                });
-            }
-        }
+        vec_o q;
+        if constexpr(kHwConvertDiv)
+            q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
+        else
+            q = scaled_cast_fp8_noclamp(thread_data, mxfp8_multiplier(row_scale));
         *reinterpret_cast<vec_o*>(out + (row0 + r) * cols + col) = q;
     });
 }
