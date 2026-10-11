@@ -78,7 +78,7 @@ def grouped_gemm(
     block_size: int = 128,
     out_dtype: torch.dtype | None = None,
 ):
-    """Run grouped GEMM, optionally with 1x128 activation and 128x128 weight scales."""
+    """Run a Triton grouped GEMM, optionally with 1x128 activation and 128x128 weight scales."""
     if (A_scale is None) != (B_scale is None):
         raise ValueError("A_scale and B_scale must be provided together")
     if A_scale is not None and block_size != 128:
@@ -115,6 +115,12 @@ def grouped_gemm(
         out_dtype,
     )
     return out if out is not None else result
+
+
+def _call_grouped_gemm(*args, **kwargs):
+    from aiter.ops.sonicmoe import grouped_gemm as dispatch_grouped_gemm
+
+    return dispatch_grouped_gemm(*args, **kwargs)
 
 
 def _grouped_gemm_triton(
@@ -743,7 +749,7 @@ def _up_projection_backward_act(
         gemm_w1 = w1.permute(2, 0, 1)
     I = I_full // 2 if is_glu_activation else I_full
 
-    grouped_gemm(
+    _call_grouped_gemm(
         dh,
         gemm_w1,
         expert_frequency_offset,
@@ -800,7 +806,7 @@ def _down_projection_backward_act(
     # dot(dout, a @ w2) == dot(a, dout @ w2.T), while da = score * u.
     dout_gathered = dout[x_gather_idx]
     dh_unscaled = torch.empty(TK, I, dtype=dh.dtype, device=dh.device)
-    grouped_gemm(
+    _call_grouped_gemm(
         dout_gathered,
         gemm_w2,
         expert_frequency_offset,
@@ -1020,7 +1026,7 @@ class _UpProjection(torch.autograd.Function):
         TK = total_expert_freq
 
         h = torch.empty(TK, I_full, dtype=x.dtype, device=x.device)
-        grouped_gemm(
+        _call_grouped_gemm(
             x,
             gemm_w1,  # (E, H, I_full)
             expert_frequency_offset,
@@ -1102,7 +1108,7 @@ class _UpProjection(torch.autograd.Function):
             grouped_weight_layout=ctx.grouped_weight_layout,
         )
 
-        grouped_gemm(
+        _call_grouped_gemm(
             x,
             dh,
             expert_frequency_offset,
@@ -1169,7 +1175,7 @@ class _DownProjection(torch.autograd.Function):
             gemm_w2 = w2.permute(2, 1, 0)
 
         y = torch.empty(TK, H, dtype=a.dtype, device=a.device)
-        grouped_gemm(a, gemm_w2, expert_frequency_offset, out=y, bias=b2)
+        _call_grouped_gemm(a, gemm_w2, expert_frequency_offset, out=y, bias=b2)
 
         o = torch.empty(T, H, device=a.device, dtype=a.dtype)
         topk_scores_flat = topk_scores.view(-1)
@@ -1253,7 +1259,7 @@ class _DownProjection(torch.autograd.Function):
         dout_gathered = dout[x_gather_idx]
         dy = dout_gathered * s.unsqueeze(-1)
 
-        grouped_gemm(
+        _call_grouped_gemm(
             a_prime,
             dy,
             expert_frequency_offset,
@@ -1505,6 +1511,11 @@ def moe_pre_routed_inputs(
     if expert_frequency.sum().item() != T:
         raise ValueError("expert_frequency must sum to the number of input tokens")
 
+    host_expert_frequency = None
+    if expert_frequency.device.type == "cpu":
+        host_expert_frequency = expert_frequency.to(
+            dtype=torch.int64, copy=False
+        ).contiguous()
     expert_frequency = expert_frequency.to(device=x.device, dtype=torch.int32)
     expert_frequency_offset = torch.cat(
         (
@@ -1512,6 +1523,21 @@ def moe_pre_routed_inputs(
             expert_frequency.cumsum(dim=0, dtype=torch.int32),
         )
     )
+    from aiter.ops.sonicmoe import (
+        clear_registered_host_cu_seqlens,
+        register_host_cu_seqlens,
+    )
+
+    if host_expert_frequency is not None:
+        host_expert_frequency_offset = torch.cat(
+            (
+                torch.zeros(1, dtype=torch.int64, device="cpu"),
+                host_expert_frequency.cumsum(dim=0, dtype=torch.int64),
+            )
+        )
+        register_host_cu_seqlens(expert_frequency_offset, host_expert_frequency_offset)
+    else:
+        clear_registered_host_cu_seqlens(expert_frequency_offset)
     identity = torch.arange(T, dtype=torch.int32, device=x.device)
 
     a, h = _UpProjection.apply(
