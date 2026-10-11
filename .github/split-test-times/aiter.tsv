@@ -157,6 +157,7 @@ op_tests/test_topk_plain.py	64
 op_tests/test_topk_row_prefill.py	5
 op_tests/test_topk_select.py	45
 op_tests/test_topk_softmax.py	4
+op_tests/test_unified_attention.py	36
 op_tests/test_vsa_sparse_attention.py	4
 op_tests/tuning_tests/test_config_shape_collision.py	4
 op_tests/tuning_tests/test_csv_validation.py	4
