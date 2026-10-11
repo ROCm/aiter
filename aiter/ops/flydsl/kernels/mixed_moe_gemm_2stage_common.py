@@ -23,9 +23,9 @@ A8W4 path is selected by `a_dtype='fp8', b_dtype='fp4'` plus
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.compiler.kernel_function import CompilationContext
+from flydsl.compiler.mlir_utils import convert_to_mlir_attr
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -104,9 +104,7 @@ barrier = _barrier
 def _idx_to_fly_ptr(idx_val, value, alignment):
     """Build a typed global pointer with the access's proven byte alignment."""
     value_type = fx.as_ir_value(value).type
-    elem_type = (
-        value_type.element_type if isinstance(value_type, ir.VectorType) else value_type
-    )
+    elem_type = getattr(value_type, "element_type", value_type)
     ptr_ty = fx.PointerType.get(elem_type, fx.AddressSpace.Global, alignment)
     return fx.inttoptr(ptr_ty, fx.Int64(idx_val))
 
@@ -2381,11 +2379,7 @@ def compile_mixed_moe_gemm1_common(
                             nontemporal=True,
                         )
 
-                frag_elem = (
-                    ir.F32Type.get()
-                    if need_quant
-                    else (ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get())
-                )
+                frag_elem = T.f32 if need_quant else (T.bf16 if out_is_bf16 else T.f16)
 
                 if const_expr(kwave_fused):
                     slab_n = tile_m * tile_n
@@ -2815,7 +2809,7 @@ def compile_mixed_moe_gemm1_common(
                 tile_k_stage2 - (inter_dim - inter_dim_pad) % tile_k_stage2
             ) % tile_k_stage2
 
-        inter_in = fx.Index(i32_inter_in)
+        inter_in = fx.Int64(i32_inter_in)
         tile_n_index = tile_n
         if const_expr(mock_gate_only or gate_up_interleave):
             gx = (
@@ -2829,7 +2823,7 @@ def compile_mixed_moe_gemm1_common(
             )
 
         c_pm_l = persist_m
-        gy = (fx.Index(i32_size_expert_ids_in) + c_pm_l - 1) // c_pm_l
+        gy = (fx.Int64(i32_size_expert_ids_in) + c_pm_l - 1) // c_pm_l
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm1(
@@ -2883,7 +2877,7 @@ def compile_mixed_moe_gemm1_common(
             wpe = int(waves_per_eu)
             for op in ctx.gpu_module_body.operations:
                 if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
-                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, wpe)
+                    op.attributes["rocdl.waves_per_eu"] = convert_to_mlir_attr(wpe)
         launcher.launch(
             grid=(gx, gy, k_batch), block=(total_threads, 1, 1), stream=stream
         )
@@ -4782,9 +4776,7 @@ def compile_mixed_moe_gemm2_common(
                     by_n=body_by_n,
                     n_tile_base=n_tile_base,
                     lds_out=lds_out,
-                    frag_elem_type=(
-                        ir.BF16Type.get() if out_is_bf16 else ir.F16Type.get()
-                    ),
+                    frag_elem_type=(T.bf16 if out_is_bf16 else T.f16),
                     write_row_to_lds=write_row_to_lds,
                     precompute_row=precompute_row,
                     store_pair=store_pair,
@@ -5018,7 +5010,7 @@ def compile_mixed_moe_gemm2_common(
         # manual finalize is needed.
         ctx = CompilationContext.get_current()
 
-        n_in = fx.Index(i32_n_in)
+        n_in = fx.Int64(i32_n_in)
         tile_n_idx = tile_n
         model_dim_pad_idx = model_dim_pad
         gx = (n_in - model_dim_pad_idx + tile_n_idx - 1) // tile_n_idx
@@ -5026,7 +5018,7 @@ def compile_mixed_moe_gemm2_common(
             gy = cu_num
         else:
             c_pm_l = persist_m
-            gy = (fx.Index(i32_size_expert_ids_in) + c_pm_l - 1) // c_pm_l
+            gy = (fx.Int64(i32_size_expert_ids_in) + c_pm_l - 1) // c_pm_l
 
         if const_expr(heterogeneous_b):
             launcher = moe_gemm2(
@@ -5070,7 +5062,7 @@ def compile_mixed_moe_gemm2_common(
             wpe = int(waves_per_eu)
             for op in ctx.gpu_module_body.operations:
                 if hasattr(op, "attributes") and op.OPERATION_NAME == "gpu.func":
-                    op.attributes["rocdl.waves_per_eu"] = ir.IntegerAttr.get(T.i32, wpe)
+                    op.attributes["rocdl.waves_per_eu"] = convert_to_mlir_attr(wpe)
         launcher.launch(
             grid=(gx, gy, 1),
             block=(256, 1, 1),

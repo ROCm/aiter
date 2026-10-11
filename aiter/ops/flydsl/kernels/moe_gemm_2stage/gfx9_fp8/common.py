@@ -13,7 +13,6 @@ import flydsl.expr as fx
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl._mlir.dialects.fly_rocdl import TargetAddressSpace
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -519,7 +518,7 @@ class FlyObjCache:
     @flyc.jit
     def load_tiled_mma_frag(self, mm, src, slice_coord, dst, abc, copy_atom_bits=128):
         assert abc in ["A", "B", "C"]
-        if fx.const_expr(src.address_space == TargetAddressSpace.BufferDesc):
+        if fx.const_expr(src.address_space == rocdl.TargetAddressSpace.BufferDesc):
             copy_atom = self.get_buffer_copy_atom(src.dtype, copy_atom_bits)
         else:
             copy_atom = self.get_universal_copy_atom(src.dtype, copy_atom_bits)
@@ -573,7 +572,7 @@ class FlyObjCache:
     @local_cache
     def get_tiled_copy_coalesced_mn(self, tensor, copy_atom_bits=128, num_threads=256):
         """Build a coalesced copy for tensors whose two innermost modes are M, N."""
-        if fx.const_expr(tensor.address_space == TargetAddressSpace.BufferDesc):
+        if fx.const_expr(tensor.address_space == rocdl.TargetAddressSpace.BufferDesc):
             copy_atom = self.get_buffer_copy_atom(tensor.dtype, copy_atom_bits)
         else:
             copy_atom = self.get_universal_copy_atom(tensor.dtype, copy_atom_bits)
@@ -623,7 +622,6 @@ def dump_ir(enable_debug_info=True):
     import os
 
     import flydsl
-    from flydsl._mlir import ir
     from flydsl.utils.env import DebugEnvManager
 
     DebugEnvManager.enable_debug_info = enable_debug_info

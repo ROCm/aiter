@@ -3,7 +3,6 @@
 from collections import namedtuple
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import as_ir_value, gpu, rocdl
 from flydsl.expr.rocdl import cluster, tdm_ops
@@ -56,7 +55,7 @@ def make_sgpr_opaque(val_i32):
     Emits no instruction.
     """
     op = llvm_dialect.InlineAsmOp(
-        res=ir.IntegerType.get_signless(32),
+        res=T.i32,
         operands_=[as_ir_value(val_i32)],
         asm_string="",
         constraints="=s,s",
