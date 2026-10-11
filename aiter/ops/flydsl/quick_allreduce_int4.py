@@ -15,16 +15,20 @@ from flydsl.expr.typing import Int32, Int64, Stream
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.quick_allreduce_int4 import (
+    BLOCK,
+    DEFAULT_ATOMS,
     DEFAULT_GRID_CAP,
+    RANK_TILE_BYTES,
     SUPER_TILES,
     SUPPORTED_WORLDS,
     TILE_BYTES,
+    WAVE,
     WORLD,
     clamp_grid_cap,
     latency_max_tiles,
     make_quick_allreduce_int4_kernel,
     mxfp4_scale_shape,
-    rmsnorm_hidden_supported,
+    tile_atoms_for,
 )
 from .kernels.tensor_shim import _run_compiled
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
@@ -140,6 +144,7 @@ class _StEngine:
                 gemma_norm=key[2],
                 norm_latency=key[3],
                 norm_mxfp4=key[4],
+                tile_atoms=self.spec["tile_atoms"],
             )["launch"]
             self._norm_launch[key] = launch
         return launch
@@ -220,37 +225,14 @@ class QuickAllReduceInt4:
             torch.cuda.get_device_properties(self._device_index).multi_processor_count
         )
         self._latency_max_tiles = latency_max_tiles(cu_count)
+        self._arch = arch
+        self._grid_cap = cap
+        self._cu_count = cu_count
 
-        sts = [1]
-        if self.super_tile != 1:
-            sts.append(self.super_tile)
         self._by_st = {}
-        try:
-            with torch.cuda.device(self._device_index):
-                for st in sts:
-                    grid = clamp_grid_cap(
-                        cap,
-                        arch=arch,
-                        world_size=self.world_size,
-                        super_tile=st,
-                        cu_count=cu_count,
-                    )
-                    shared_grid = torch.tensor(grid, dtype=torch.int64)
-                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=group)
-                    spec = make_quick_allreduce_int4_kernel(
-                        world_size=self.world_size,
-                        super_tile=st,
-                        grid=int(shared_grid.item()),
-                    )
-                    self._by_st[st] = _StEngine(
-                        spec=spec,
-                        group=self.group,
-                        rank=self.rank,
-                        world_size=self.world_size,
-                    )
-        except Exception:
-            self.close()
-            raise
+        # tile_atoms -> {st: engine} for non-default widths; each owns an inbox.
+        self._by_atoms = {}
+        self._by_st = self._build_engines(DEFAULT_ATOMS)
 
         primary = self._by_st[self.super_tile]
         self.buf_bytes = primary.buf_bytes
@@ -260,10 +242,84 @@ class QuickAllReduceInt4:
         self.rank_tile_bytes = primary.rank_tile_bytes
         self.wire_tile_bytes = primary.wire_tile_bytes
 
-    def _pick_st(self, num_tiles: int) -> int:
+    def _build_engines(self, tile_atoms: int) -> dict:
+        """Build the engines for one tile width. Collective across the group."""
+        sts = [1]
+        if self.super_tile != 1:
+            sts.append(self.super_tile)
+        engines = {}
+        try:
+            with torch.cuda.device(self._device_index):
+                for st in sts:
+                    grid = clamp_grid_cap(
+                        self._grid_cap,
+                        arch=self._arch,
+                        world_size=self.world_size,
+                        super_tile=st,
+                        cu_count=self._cu_count,
+                    )
+                    if tile_atoms != DEFAULT_ATOMS:
+                        # Residency was measured on the 8-atom build; keep the
+                        # persistent grid resident under the wider LDS use.
+                        grid = min(grid, self._lds_resident_grid(tile_atoms))
+                    shared_grid = torch.tensor(grid, dtype=torch.int64)
+                    dist.all_reduce(shared_grid, op=dist.ReduceOp.MIN, group=self.group)
+                    spec = make_quick_allreduce_int4_kernel(
+                        world_size=self.world_size,
+                        super_tile=st,
+                        grid=int(shared_grid.item()),
+                        tile_atoms=tile_atoms,
+                    )
+                    engines[st] = _StEngine(
+                        spec=spec,
+                        group=self.group,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                    )
+        except Exception:
+            for eng in engines.values():
+                eng.close()
+            raise
+        return engines
+
+    def _lds_resident_grid(self, tile_atoms: int) -> int:
+        lds_per_cu = 160 * 1024 if self._arch == "gfx950" else 64 * 1024
+        # Pack buffer plus the fused-norm reduction (counted for every build).
+        wg_lds = tile_atoms * RANK_TILE_BYTES + (BLOCK // WAVE) * tile_atoms * 4
+        per_cu = max(1, lds_per_cu // wg_lds)
+        # A multiple of 8 keeps the flag prefix 64 B aligned at every TP size.
+        return max(8, (per_cu * self._cu_count) // 8 * 8)
+
+    def _engines_for(self, tile_atoms: int) -> dict:
+        if tile_atoms == DEFAULT_ATOMS:
+            return self._by_st
+        engines = self._by_atoms.get(tile_atoms)
+        if engines is None:
+            if torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    f"QuickAllReduceInt4: the {tile_atoms}-atom engines are "
+                    "built by a collective and cannot be created under CUDA "
+                    "graph capture; call prepare_rmsnorm(hidden) first"
+                )
+            engines = self._build_engines(tile_atoms)
+            self._by_atoms[tile_atoms] = engines
+        return engines
+
+    def prepare_rmsnorm(self, hidden: int) -> None:
+        """Build the engines ``allreduce_rmsnorm`` needs for ``hidden``.
+
+        Collective: call on every rank, before CUDA graph capture. Otherwise
+        the first ``allreduce_rmsnorm`` at a wide hidden size builds them.
+        """
+        atoms = tile_atoms_for(hidden, self.world_size)
+        if atoms is None:
+            raise ValueError(f"fused RMSNorm does not support hidden={hidden}")
+        self._engines_for(atoms)
+
+    def _pick_st(self, num_tiles: int, engines: dict) -> int:
         if self.super_tile == 1:
             return 1
-        st1 = self._by_st.get(1)
+        st1 = engines.get(1)
         if st1 is not None and num_tiles <= st1.grid:
             return 1
         return self.super_tile
@@ -342,7 +398,7 @@ class QuickAllReduceInt4:
         launch=None,
         norm_ptrs: tuple[int, ...] = (0,) * 5,
     ) -> None:
-        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
+        num_tiles = max(1, (live_bytes + eng.tile_bytes - 1) // eng.tile_bytes)
         args = self._launch_args(
             eng,
             inp,
@@ -371,16 +427,19 @@ class QuickAllReduceInt4:
             self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
 
     def close(self):
-        engines = getattr(self, "_by_st", None)
-        if not engines:
+        by_atoms = getattr(self, "_by_atoms", None) or {}
+        groups = [getattr(self, "_by_st", None) or {}, *by_atoms.values()]
+        if not any(groups):
             return
         with torch.cuda.device(self._device_index):
             if getattr(self, "_has_launched", False):
                 torch.cuda.synchronize(self._device_index)
                 self._has_launched = False
-            for eng in engines.values():
-                eng.close()
-            engines.clear()
+            for engines in groups:
+                for eng in engines.values():
+                    eng.close()
+                engines.clear()
+        by_atoms.clear()
 
     def __del__(self):
         try:
@@ -396,14 +455,16 @@ class QuickAllReduceInt4:
         """
         live_bytes = self._check_payload(inp, out)
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        st = self._pick_st(num_tiles)
+        st = self._pick_st(num_tiles, self._by_st)
         eng = self._by_st[st]
         self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
 
-    @staticmethod
-    def supports_rmsnorm(hidden: int, nbytes: int) -> bool:
-        """Whether ``allreduce_rmsnorm`` takes this row width and payload."""
-        return rmsnorm_hidden_supported(hidden) and nbytes < 1 << 31
+    def supports_rmsnorm(self, hidden: int, nbytes: int) -> bool:
+        """Whether ``allreduce_rmsnorm`` takes this row width and payload.
+
+        Hidden 6144 runs on a 48 KiB tile and needs world_size 2 or 4.
+        """
+        return tile_atoms_for(hidden, self.world_size) is not None and nbytes < 1 << 31
 
     @staticmethod
     def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
@@ -432,7 +493,7 @@ class QuickAllReduceInt4:
             inp: this rank's bf16 partial sum, ``rows x hidden`` elements.
             residual: bf16 residual, same number of elements as ``inp``.
             weight: bf16 RMSNorm weight of ``hidden`` elements; hidden must
-                be 2048, 4096, 8192 or 16384.
+                be 2048, 4096, 8192 or 16384, or 6144 at world_size 2 or 4.
             eps: RMSNorm epsilon.
             out: bf16 output for the normed rows, same size as ``inp``.
             residual_out: bf16 output for ``allreduce(inp) + residual``; may
@@ -501,9 +562,10 @@ class QuickAllReduceInt4:
         if not self.supports_rmsnorm(hidden, live_bytes):
             # Atom byte offsets travel in the signed 32-bit soffset.
             raise ValueError(
-                "fused RMSNorm supports hidden in (2048, 4096, 8192, 16384) "
-                f"and payloads under 2 GiB, got hidden={hidden}, "
-                f"{live_bytes} bytes"
+                "fused RMSNorm supports hidden in (2048, 4096, 8192, 16384), "
+                "and 6144 at world_size 2 or 4, with payloads under 2 GiB, got "
+                f"hidden={hidden}, {live_bytes} bytes at world_size="
+                f"{self.world_size}"
             )
         if int(inp.numel()) % hidden != 0:
             raise ValueError("numel must be a multiple of hidden")
@@ -551,9 +613,11 @@ class QuickAllReduceInt4:
                 if not t.is_contiguous() or t.numel() < nbytes:
                     raise ValueError(f"{name} must be contiguous with {nbytes} bytes")
             mxfp4_ptrs = (int(mxfp4[0].data_ptr()), int(mxfp4[1].data_ptr()))
-        num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
-        st = self._pick_st(num_tiles)
-        eng = self._by_st[st]
+        engines = self._engines_for(tile_atoms_for(hidden, self.world_size))
+        tile_bytes = next(iter(engines.values())).tile_bytes
+        num_tiles = max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
+        st = self._pick_st(num_tiles, engines)
+        eng = engines[st]
         # One tile per workgroup at <= 2 workgroups per CU: occupancy is
         # free, so take the low-latency build.
         latency = st == 1 and num_tiles <= min(eng.grid, self._latency_max_tiles)

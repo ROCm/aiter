@@ -287,6 +287,26 @@ class PackNormStorage:
     red: fx.Array[fx.Float32, NORM_RED_F32, 16]
 
 
+# A 12-atom (48 KiB) tile holds four 12 KiB rows (bf16 hidden 6144), which
+# never divide the default 32 KiB tile.
+DEFAULT_ATOMS = ATOMS
+WIDE_ATOMS = 12
+TILE_ATOMS = (DEFAULT_ATOMS, WIDE_ATOMS)
+PACK_I32_WIDE = WIDE_ATOMS * (RANK_TILE_BYTES // 4)
+NORM_RED_F32_WIDE = (BLOCK // WAVE) * WIDE_ATOMS
+
+
+@fx.struct
+class PackStorageWide:
+    pack: fx.Array[fx.Int32, PACK_I32_WIDE, 16]
+
+
+@fx.struct
+class PackNormStorageWide:
+    pack: fx.Array[fx.Int32, PACK_I32_WIDE, 16]
+    red: fx.Array[fx.Float32, NORM_RED_F32_WIDE, 16]
+
+
 NORM_LATENCY_WGS_PER_CU = 2
 
 
@@ -295,11 +315,23 @@ def latency_max_tiles(cu_count: int) -> int:
     return NORM_LATENCY_WGS_PER_CU * int(cu_count)
 
 
-def rmsnorm_hidden_supported(hidden: int) -> bool:
-    """Fused RMSNorm needs each 4 KiB atom inside one bf16 row of a 32 KiB tile."""
+def tile_atoms_for(hidden: int, world_size: int) -> int | None:
+    """Tile width in atoms that keeps every bf16 row of ``hidden`` in one tile.
+
+    Fused RMSNorm reduces a row inside one workgroup, so a tile must hold a
+    whole number of rows and split evenly across ranks. Returns ``None`` when
+    no supported width fits.
+    """
     row_bytes = int(hidden) * 2
     atom_bytes = BLOCK * 16
-    return row_bytes % atom_bytes == 0 and TILE_BYTES % row_bytes == 0
+    if row_bytes <= 0 or row_bytes % atom_bytes != 0:
+        return None
+    atoms_per_row = row_bytes // atom_bytes
+    if DEFAULT_ATOMS % atoms_per_row == 0:
+        return DEFAULT_ATOMS
+    if atoms_per_row == 3 and WIDE_ATOMS % int(world_size) == 0:
+        return WIDE_ATOMS
+    return None
 
 
 MXFP4_GROUP = 32
@@ -320,8 +352,13 @@ def make_quick_allreduce_int4_kernel(
     gemma_norm: bool = False,
     norm_latency: bool = False,
     norm_mxfp4: bool = False,
+    tile_atoms: int | None = None,
 ):
     """Build the INT4 all-reduce kernel.
+
+    ``tile_atoms`` (8 or 12) is the tile width in 4 KiB atoms. ``None`` picks
+    the width that keeps whole fused-RMSNorm rows in a tile (12 for hidden
+    6144), else 8. All ranks must build the same width.
 
     With ``norm_hidden`` set, the all-gather epilogue fuses
     ``residual_out = ar + residual`` and
@@ -344,15 +381,28 @@ def make_quick_allreduce_int4_kernel(
         raise ValueError("norm_mxfp4 needs norm_hidden")
     NORM_LATENCY = bool(norm_latency)
     NORM_MXFP4 = bool(norm_mxfp4)
-    if fuse_norm and not rmsnorm_hidden_supported(norm_hidden):
-        raise ValueError(
-            f"fused RMSNorm supports hidden in (2048, 4096, 8192, 16384), "
-            f"got {norm_hidden}"
-        )
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
         )
+    norm_atoms = tile_atoms_for(norm_hidden, world_size) if fuse_norm else None
+    if fuse_norm and norm_atoms is None:
+        raise ValueError(
+            "fused RMSNorm supports hidden in (2048, 4096, 8192, 16384), and "
+            f"6144 at world_size 2 or 4, got {norm_hidden} at {world_size}"
+        )
+    if tile_atoms is None:
+        tile_atoms = norm_atoms or DEFAULT_ATOMS
+    if tile_atoms not in TILE_ATOMS:
+        raise ValueError(f"tile_atoms must be one of {TILE_ATOMS}, got {tile_atoms}")
+    if fuse_norm and tile_atoms != norm_atoms:
+        raise ValueError(
+            f"hidden={norm_hidden} needs a {norm_atoms}-atom tile, got {tile_atoms}"
+        )
+    # Per-build tile width; the 8-atom build is the original kernel.
+    ATOMS = int(tile_atoms)
+    TILE_BYTES = BLOCK * ATOMS * 16
+    NORM_RED_F32 = (BLOCK // WAVE) * ATOMS
     if ATOMS % world_size != 0:
         raise ValueError(f"ATOMS={ATOMS} is not divisible by world_size={world_size}")
     if super_tile not in SUPER_TILES:
@@ -372,8 +422,8 @@ def make_quick_allreduce_int4_kernel(
     TILE_I32 = TILE_BYTES // 4
     TILE_FP16 = TILE_BYTES // 2
     LDS_BYTES = ATOMS * RANK_TILE_BYTES
-    # Each rank owns this many 16-byte atoms of a 32 KiB tile
-    # (8 GPUs → 1, 4 → 2, 2 → 4). LDS still holds all ATOMS atoms.
+    # Each rank owns ATOMS / world_size 4 KiB atoms of a tile; LDS holds all
+    # ATOMS atoms.
     rank_atoms = ATOMS // world_size
     # Last-sector pad is ST * rank_atoms * RANK_TILE_I32 after the ST tiles.
     rank_payload_i32 = rank_atoms * RANK_TILE_I32
@@ -406,9 +456,12 @@ def make_quick_allreduce_int4_kernel(
         NORM_GROUP = (
             ATOMS if NORM_LATENCY else 2 if (world_size, super_tile) == (8, 1) else 1
         )
-        storage_cls = PackNormStorage
+        storage_cls = {
+            DEFAULT_ATOMS: PackNormStorage,
+            WIDE_ATOMS: PackNormStorageWide,
+        }[ATOMS]
     else:
-        storage_cls = PackStorage
+        storage_cls = {DEFAULT_ATOMS: PackStorage, WIDE_ATOMS: PackStorageWide}[ATOMS]
 
     @flyc.kernel(known_block_size=[BLOCK, 1, 1])
     def quick_allreduce_int4(
@@ -1084,11 +1137,14 @@ def make_quick_allreduce_int4_kernel(
             f"_rms{norm_hidden}{'g' if gemma_norm else ''}"
             f"{'_mxfp4' if NORM_MXFP4 else ''}"
         )
+    atoms_tag = "" if ATOMS == DEFAULT_ATOMS else f"_a{ATOMS}"
     launch_quick_allreduce_int4.func.__name__ = (
-        f"launch_quick_allreduce_int4_ws{world_size}_st{super_tile}{norm_tag}"
+        f"launch_quick_allreduce_int4_ws{world_size}_st{super_tile}"
+        f"{atoms_tag}{norm_tag}"
     )
     return {
         "launch": launch_quick_allreduce_int4,
+        "tile_atoms": ATOMS,
         "flags_bytes": flags_i32 * 4,
         "data_bytes": PHASES * grid * world_size * wire_tile_bytes,
         "lds_bytes": LDS_BYTES + (NORM_RED_F32 * 4 if fuse_norm else 0),

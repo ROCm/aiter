@@ -43,7 +43,11 @@ from aiter.test_common import checkAllclose, run_perftest
 
 set_start_method("spawn", force=True)
 
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import WORLD, mxfp4_scale_shape
+from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+    WORLD,
+    mxfp4_scale_shape,
+    tile_atoms_for,
+)
 from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
 
 try:
@@ -73,6 +77,15 @@ _VALIDITY_CASES = [
     (4096, 8192, False, False),
     (4096, 8192, True, True),
     (16384, 8192, False, False),
+]
+# Hidden 6144 runs on the 48 KiB tile, which splits across TP 2 and 4 only.
+_WIDE_CASES = [
+    (1, 6144, True, False),
+    (37, 6144, True, True),
+    (37, 6144, False, False),
+    (512, 6144, True, False),
+    (4096, 6144, True, True),
+    (16384, 6144, True, False),
 ]
 
 
@@ -340,8 +353,11 @@ def main():
         aiter.logger.warning("need %s GPUs; skipping", args.tp)
         return
 
-    ranks = _spawn(args.tp, _VALIDITY_CASES, time_it=False, grid_cap=args.grid_cap)
-    _assert_valid(ranks, _VALIDITY_CASES)
+    cases = list(_VALIDITY_CASES)
+    if tile_atoms_for(6144, args.tp) is not None:
+        cases += _WIDE_CASES
+    ranks = _spawn(args.tp, cases, time_it=False, grid_cap=args.grid_cap)
+    _assert_valid(ranks, cases)
     aiter.logger.info(
         "validity (rank 0):\n%s", pd.DataFrame(ranks[0]).to_markdown(index=False)
     )
