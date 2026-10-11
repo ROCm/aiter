@@ -19,9 +19,6 @@ import math
 from dataclasses import dataclass
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import memref as memref_dialect
 from flydsl.expr import rocdl
 from flydsl.expr.meta import dsl_loc_tracing
 from flydsl.expr.typing import T
@@ -74,7 +71,7 @@ def _byte_offset_to_i64(offset):
     if isinstance(offset, int):
         return fx.Int64(offset)
     raw = fx.as_ir_value(offset)
-    if isinstance(raw.type, ir.IndexType):
+    if raw.type == T.index:
         return fx.Int64(raw)
     if raw.type == T.i64:
         return fx.Int64(raw)
@@ -102,7 +99,7 @@ def make_tensor_gather_descriptor(
     gather_tile_dim1=None,
     lds_byte_offset=None,
     global_byte_offset=None,
-    workgroup_mask: int | ir.Value = 0,
+    workgroup_mask=0,
 ) -> TDMGatherDescriptor:
     """Build a TDM gather descriptor addressing arbitrary rows by index.
 
@@ -256,38 +253,22 @@ def make_tensor_gather_dgroup0(
     Separating it lets kernels hoist static GROUP1/GROUP2/GROUP3 state and
     only rebuild the per-issue address group close to the TDM instruction.
     """
-    from flydsl._mlir.dialects import fly as _fly_d
-
     assert index_size in (16, 32), f"index_size must be 16 or 32, got {index_size}"
 
-    glb_ptr_type = ir.Type.parse("!llvm.ptr<1>")
-    i64 = ir.IntegerType.get_signless(64)
-    a_raw = global_ptr.__extract_to_ir_values__()[0]
-    glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
-    glb_base_i64 = fx.Int64(llvm_dialect.ptrtoint(i64, glb_ptr))
+    glb_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(global_ptr)))
     if global_byte_offset is not None:
         glb_base_i64 += fx.Int64(_byte_offset_to_i64(global_byte_offset))
 
-    # lds_memref accepts, in priority order:
-    #   * an already-resolved LDS base index (e.g. from a pointer-based
-    #     allocator via index_cast(index, ptrtoint(ptr))) -- used directly;
-    #   * a fly view (lds_view) -- handled symmetrically to global_ptr above,
-    #     extracting its aligned LDS pointer (addrspace 3) via the fly dialect;
-    #   * a std MLIR memref -- via memref.extract_aligned_pointer_as_index.
-    if hasattr(lds_memref, "type") and isinstance(lds_memref.type, ir.IndexType):
-        lds_base_idx = fx.Index(lds_memref)
+    # The callers pass either an LDS base index or a FlyDSL view.
+    if hasattr(lds_memref, "type") and lds_memref.type == T.index:
+        lds_base_i64 = fx.Int64(lds_memref)
     elif hasattr(lds_memref, "__extract_to_ir_values__"):
-        lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
-        lds_raw = lds_memref.__extract_to_ir_values__()[0]
-        lds_ptr = _fly_d.extract_aligned_pointer_as_index(lds_ptr_type, lds_raw)
-        lds_base_idx = fx.Index(llvm_dialect.ptrtoint(i64, lds_ptr))
+        lds_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(lds_memref)))
     else:
-        lds_base_idx = fx.Index(
-            memref_dialect.extract_aligned_pointer_as_index(lds_memref)
-        )
-    lds_total_off = lds_base_idx
+        raise TypeError("lds_memref must be an LDS base index or FlyDSL view")
+    lds_total_off = lds_base_i64
     if lds_byte_offset is not None:
-        lds_total_off += fx.Index(lds_byte_offset)
+        lds_total_off += fx.Int64(lds_byte_offset)
     lds_addr_i32 = fx.Int32(lds_total_off)
 
     gather_index_bit = 1 if index_size == 32 else 0
@@ -310,16 +291,11 @@ def tensor_store_gather(
 ) -> None:
     """Issue one TDM gather store (LDS -> Global) for the descriptor's rows."""
     dg4 = _zero_dgroup_v8i32()
-    cache_policy_attr = (
-        ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_policy)
-        if cache_policy
-        else None
-    )
     rocdl.tensor_store_from_lds(
         desc.dgroup0,
         desc.dgroup1,
         desc.dgroup2,
         desc.dgroup3,
         dg4,
-        cache_policy=cache_policy_attr,
+        cache_policy=cache_policy if cache_policy else None,
     )
