@@ -1956,6 +1956,35 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_mega_mhc": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": ["'-gline-tables-only'"],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
+    "module_mega_mhc_stream": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/mega_mhc_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/mega_mhc_stream.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-gline-tables-only'",
+            "'-DMHC_STREAM_VARIANT=13'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_mhc": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/pybind/mhc_pybind.cu'",

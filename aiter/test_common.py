@@ -54,9 +54,14 @@ def perftest(
     needTrace=False,
     use_cuda_event=False,
     profile_warm_iters=1,
+    prepare_func=None,
 ):
     def decorator(func):
         def wrapper(*args, **kwargs):
+            # Prepare the original inputs before memory sizing, then each
+            # rotated copy below. Packing/JIT/workspace setup stays untimed.
+            if prepare_func is not None:
+                prepare_func(*args, **kwargs)
             num = num_rotate_args
             if num < 1:
                 gpu_id = torch.cuda.current_device()
@@ -77,6 +82,9 @@ def perftest(
             rotate_args = [
                 (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
             ] + [(args, kwargs)]
+            if prepare_func is not None:
+                for rotated_args, rotated_kwargs in rotate_args[:-1]:
+                    prepare_func(*rotated_args, **rotated_kwargs)
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
@@ -250,8 +258,11 @@ def run_perftest(
     needTrace=False,
     use_cuda_event=False,
     profile_warm_iters=1,
+    prepare_func=None,
     **kwargs,
 ):
+    """Time rotated tensor arguments, optionally preparing each copy untimed."""
+
     @perftest(
         num_iters=num_iters,
         num_warmup=num_warmup,
@@ -260,6 +271,7 @@ def run_perftest(
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
         profile_warm_iters=profile_warm_iters,
+        prepare_func=prepare_func,
     )
     @wraps(func)
     def worker(*args, **kwargs):
