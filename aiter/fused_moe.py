@@ -1765,10 +1765,27 @@ def get_block_size_M(token, topk, expert, inter_dim):
     tmp = []
     for el in support_list:
         max_num_tokens = token * topk + expert * el - topk
-        tg_num = tgN * (max_num_tokens + el - 1) // el
+        m_tiles = (max_num_tokens + el - 1) // el
+        tg_num = tgN * m_tiles
         rnd = (tg_num + cu_num - 1) // cu_num
-        empty = cu_num - tg_num % cu_num
-        tmp.append((rnd, empty, el))
+        # Idle CUs in the last round: 0 when tg_num fills it exactly (the
+        # former `cu_num - tg_num % cu_num` counted that as a whole idle round).
+        empty = (-tg_num) % cu_num
+        # `rnd` counts rounds of tiles, but a tile of `el` rows costs about `el`
+        # units of MFMA work, so rounds are not comparable across block sizes.
+        # Ranking on `rnd` alone prices a 64-row tile like a 32-row one and so
+        # prefers the largest block exactly where it is mostly padding. With 8
+        # real rows per expert (token=32, topk=8, expert=32, inter_dim=4096, 256
+        # CUs), el=64 schedules 36 x 64 = 2304 rows for 256 real ones and el=32
+        # schedules 40 x 32 = 1280, yet the old ranking picked 64.
+        #
+        # Weight each round by the fraction of its rows that are real. The factor
+        # is ~1 for every candidate once padding is negligible (about a thousand
+        # rows per expert and up), so prefill-sized calls keep their choice.
+        padded_rows = m_tiles * el
+        useful_rows = max(token * topk, 1)
+        eff_rnd = rnd * padded_rows / useful_rows
+        tmp.append((eff_rnd, empty, el))
     return min(tmp, key=lambda x: x[:2])[-1]
 
 
