@@ -98,8 +98,8 @@ def derive_tolerance(
         num_accumulations: reduction length ``K``. Scales the accumulator term
             only; with an fp32 accumulator the quantization term dominates for
             any realistic ``K``.
-        max_value: magnitude of the largest reference value, used to place
-            ``atol`` in the right binary exponent band.
+        max_value: magnitude of the largest reference value. ``atol`` scales
+            linearly with it, as in CK.
         safety_factor: multiplier >= 1 for datapaths that are not
             round-to-nearest deterministic, e.g. stochastic rounding or an
             autotuner that reorders the reduction.
@@ -134,11 +134,15 @@ def derive_tolerance(
 
     rtol = safety_factor * max(u_compute, u_output, u_acc * num_accumulations)
 
+    # CK computes `pow(2, log2(|max|) - mant) * 0.5` with a real-valued
+    # exponent, which is just `|max| * u`. Rounding that exponent down to a
+    # power of two instead would hold atol flat across each binade and then
+    # double it at the boundary, so a test's headroom would depend on which
+    # side of a power of two the data happened to land.
     if max_value == 0.0 or not math.isfinite(max_value):
-        expo = 0
+        scale = 1.0
     else:
-        expo = math.floor(math.log2(abs(max_value)))
-    scale = math.ldexp(1.0, expo)
+        scale = abs(max_value)
 
     # The output-cast term uses a full ULP rather than half: hardware and
     # software rounding of the same fp32 value to bf16 can legitimately land on

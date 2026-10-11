@@ -28,10 +28,17 @@ def test_integer_compute_dtype_is_refused():
         raise AssertionError(f"{container} should have been refused")
 
 
-def test_atol_tracks_the_binary_exponent_of_the_data():
+def test_atol_scales_with_the_magnitude_of_the_data():
     # bf16 output, bf16 compute: the full-ULP output-cast term dominates, so
-    # atol is 2**-7 of the exponent band the data sits in.
-    for magnitude, expected in ((1.0, 2**-7), (2048.0, 16.0), (4096.0, 32.0)):
+    # atol is 2**-7 of the magnitude. 3000.0 is the case that distinguishes
+    # scaling by the magnitude from scaling by 2**floor(log2(magnitude)), which
+    # would floor it to 2048 and report 16.0 for everything in [2048, 4096).
+    for magnitude, expected in (
+        (1.0, 2**-7),
+        (2048.0, 16.0),
+        (3000.0, 3000.0 * 2**-7),
+        (4096.0, 32.0),
+    ):
         _, atol = derive_tolerance(
             torch.bfloat16,
             torch.bfloat16,
@@ -39,6 +46,14 @@ def test_atol_tracks_the_binary_exponent_of_the_data():
             max_value=magnitude,
         )
         assert atol == expected, f"{magnitude}: got {atol}, want {expected}"
+
+
+def test_atol_has_no_jump_at_a_binade_boundary():
+    # CK uses a real-valued log2, so atol is continuous in the magnitude.
+    below, above = 4095.99, 4096.0
+    _, atol_below = derive_tolerance(torch.bfloat16, torch.bfloat16, max_value=below)
+    _, atol_above = derive_tolerance(torch.bfloat16, torch.bfloat16, max_value=above)
+    assert atol_above / atol_below < 1.001, (atol_below, atol_above)
 
 
 def test_quantized_compute_dominates_the_bf16_output_cast():

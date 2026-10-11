@@ -207,10 +207,10 @@ def test_planted_offset_passes_the_hardcoded_atol():
     ``atol=100`` is a magic number: it is not derived from the dtype, the
     accumulator, or the reduction depth, so it has no relationship to the error
     the pipeline can actually produce. At this output magnitude the fp8 error
-    model justifies 64, and the gap between 64 and 100 is free space a broken
+    model justifies 75, and the gap between 75 and 100 is free space a broken
     kernel can sit in.
     """
-    ref = _moe_like_reference(max_abs=1928.0)
+    ref = _moe_like_reference(max_abs=1200.0)
     broken = (ref.float() + 99.0).to(torch.bfloat16)
 
     shipped = checkAllclose(
@@ -224,7 +224,7 @@ def test_planted_offset_passes_the_hardcoded_atol():
         num_accumulations=3840,
         max_value=ref.abs().max().item(),
     )
-    assert atol == 64.0, atol
+    assert atol == 75.0, atol
 
     derived = checkAllclose(broken, ref, rtol=rtol, atol=atol, printLog=False)
     assert (
@@ -236,21 +236,21 @@ def test_derived_tolerance_is_not_merely_tighter():
     """At a larger output magnitude the derivation is *looser* than 100.
 
     Worth asserting, because it shows the method is calibrating the gate rather
-    than cranking it down. The same fp8 algorithm lands at 64 or 256 depending
-    only on which binary exponent band ``max|ref|`` falls in, which is why one
+    than cranking it down. The same fp8 algorithm lands anywhere from 75 to 394
+    across output magnitudes a MoE test actually sees, which is why one
     constant cannot be right for every shape.
     """
-    bands = {
+    derived = {
         m: derive_tolerance(
             torch.float8_e4m3fnuz,
             torch.bfloat16,
             num_accumulations=3840,
             max_value=m,
         )[1]
-        for m in (1928.0, 2048.0, 6304.0)
+        for m in (1200.0, 2048.0, 6304.0)
     }
-    assert bands == {1928.0: 64.0, 2048.0: 128.0, 6304.0: 256.0}, bands
-    assert min(bands.values()) < SHIPPED_MOE_ATOL < max(bands.values())
+    assert derived == {1200.0: 75.0, 2048.0: 128.0, 6304.0: 394.0}, derived
+    assert min(derived.values()) < SHIPPED_MOE_ATOL < max(derived.values())
 
 
 # --------------------------------------------------------------------------
