@@ -189,6 +189,15 @@ class TestConfigShapeCollision(unittest.TestCase):
         )
         self.assertIn("duplicate shape", err.lower())
 
+    def test_duplicate_error_names_key_and_env_var(self):
+        """The collision error must say which key matched and which env var
+        selects tables explicitly, so users outside a source checkout have a
+        way out (ROCm/aiter#5184)."""
+        err = self._run_synthetic(dup=True)
+        self.assertIsNotNone(err)
+        self.assertIn("dedup key: ['M', 'N', 'K', 'cu_num', 'gfx']", err)
+        self.assertIn("AITER_CONFIG_GEMM_A8W8_BLOCKSCALE", err)
+
     def test_selfcheck_passes_on_clean(self):
         """Negative control: distinct shapes must NOT be flagged (no false
         positive)."""

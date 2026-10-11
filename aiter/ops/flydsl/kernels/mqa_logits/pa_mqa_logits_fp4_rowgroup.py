@@ -318,6 +318,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     out_nt: bool = False,
     wave_min_steps: int = 2,
     pages_per_block: int = 1,
+    packed_out: bool = False,
 ):
     """The MQA as a GEMM: M a sequence's query rows (query_start_loc's, any
     count, 0 included) times the heads, cut into tiles of ``tile_m`` (whole
@@ -325,7 +326,9 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     keys up to each row's bound (row_ends; a sequence's length its last
     row's). A workgroup scores one tile against a run of its sequence's keys,
     ``rows_per_wave`` rows a wave. ``pages_per_block``: a block-table entry
-    names that many consecutive pages (its first's id divided by it)."""
+    names that many consecutive pages (its first's id divided by it).
+    ``packed_out``: row r's logits at element ``out_offsets[r]`` of a flat out
+    rather than at ``r * stride_out``."""
     assert page_size in SUPPORTED_PAGE_SIZES, page_size
     assert heads % MFMA_M == 0 and heads // MFMA_M <= 8, heads
     assert head_dim % 128 == 0, head_dim
@@ -370,7 +373,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
     @flyc.kernel
     def pa_mqa_logits_fp4_rowgroup_kernel(
         # rows: query_start_loc[B]
-        out_ptr: fx.Int64,  # [rows, stride_out] f32
+        out_ptr: fx.Int64,  # [rows, stride_out] f32, or flat when packed_out
+        off_ptr: fx.Int64,  # [rows] i32 each row's first element (packed_out)
         q_ptr: fx.Int64,  # [rows, H, D / 2] u8
         qs_ptr: fx.Int64,  # [rows, K_TILES, 4, 16, qs_pad] u8
         kv_ptr: fx.Int64,  # [num_pages, kv_page] u8
@@ -393,7 +397,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         args_read = _read_all(
             out_ptr, q_ptr, qs_ptr, kv_ptr, kvs_ptr, bt_ptr, w_ptr, ends_ptr,
             qsl_ptr, stride_out, weight_scale, last_page, batch,
-            base_slots, max_steps,
+            base_slots, max_steps, *((off_ptr,) if packed_out else ()),
         )  # fmt: skip
         tid = gpu.thread_idx.x
         # (one allocator a kernel: the workgroup's shared assignment and rows)
@@ -511,6 +515,7 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         # This workgroup's work: one sequence's steps [s0, s_hi), shared out
         # by length -- a long sequence gets more workgroups than a short one
         ends_bt = _addr_i32_buffer(ends_ptr)
+        off_bt = _addr_i32_buffer(off_ptr) if packed_out else None
         qsl_bt = _addr_i32_buffer(qsl_ptr)
         # Sequences in chunks of WARP_SIZE, lane l holding chunk c's c * WARP_SIZE
         # + l (so the chunks in order are the sequences in order), at a
@@ -643,6 +648,12 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 fx.Int32(ends_bt[row_of(first, count, n0 + r)]) for r in range(rows)
             ]
 
+        def read_row_offsets(seq, tile):
+            """Where read_rows' rows start in a packed out, read with their
+            bounds: a store waiting on its offset's load costs up to 9 us."""
+            first, count = seq_rows(seq, tile)
+            return [fx.Int32(off_bt[row_of(first, count, n0 + r)]) for r in range(rows)]
+
         def first_pages(seq, start, stride):
             """The pages of the walk's first steps (the ones its first key
             reads wait on), stride steps apart."""
@@ -755,7 +766,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
         # (read here only by a wave walking its sequence alone, see below)
         rows_raw = read_rows(b, fx.Int32(0)) if streams == 1 else []
         row_ends_raw = read_row_ends(b, fx.Int32(0))
-        static_rows = list(rows_raw) + list(row_ends_raw)
+        row_offsets_raw = read_row_offsets(b, fx.Int32(0)) if packed_out else []
+        static_rows = list(rows_raw) + list(row_ends_raw) + list(row_offsets_raw)
         if fx.const_expr(num_warps == 1):
             b_c, t_c, s0_c, s_hi_c, deep_c, mult_c = choose_work(slot, chunk0, b_st)
         else:
@@ -836,6 +848,8 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
             if fx.const_expr(streams == 1):
                 rows_raw = read_rows(b_c, t_c)
             row_ends_raw = read_row_ends(b_c, t_c)
+            if fx.const_expr(packed_out):
+                row_offsets_raw = read_row_offsets(b_c, t_c)
         b, s0, s_hi, mult = b_c, s0_c, s_hi_c, mult_c
         tile = t_c
         deep = deep_c != fx.Int32(0)
@@ -1077,10 +1091,14 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
 
                 out_wins = []
                 for r in range_constexpr(rows):
-                    row_addr = (
-                        fx.Int64(out_ptr)
-                        + fx.Int64(row0 + r) * fx.Int64(stride_out) * 4
+                    # uniform: a per-lane base would make the window's
+                    # descriptor a VGPR value
+                    first = (
+                        fx.Int64(_uniform(row_offsets_raw[r]))
+                        if packed_out
+                        else fx.Int64(row0 + r) * fx.Int64(stride_out)
                     )
+                    row_addr = fx.Int64(out_ptr) + first * 4
                     out_wins.append(
                         fx.rocdl.make_buffer_tensor(
                             fx.make_view(
@@ -1295,6 +1313,7 @@ def compile_pa_mqa_logits_fp4_rowgroup(
     out_nt: bool,
     wave_min_steps: int,
     pages_per_block: int,
+    packed_out: bool = False,
 ):
     kfn, row_groups = build_pa_mqa_logits_fp4_rowgroup_module(
         page_size=page_size,
@@ -1312,12 +1331,14 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         out_nt=out_nt,
         wave_min_steps=wave_min_steps,
         pages_per_block=pages_per_block,
+        packed_out=packed_out,
     )
     block_threads = num_warps * WARP_SIZE
 
     @flyc.jit
     def launch_pa_mqa_logits_fp4_rowgroup(
         out: fx.Int64,
+        off: fx.Int64,
         q: fx.Int64,
         qs: fx.Int64,
         kv: fx.Int64,
@@ -1336,7 +1357,7 @@ def compile_pa_mqa_logits_fp4_rowgroup(
         stream: fx.Stream,
     ):
         kfn(
-            out, q, qs, kv, kvs, bt, w, ends, qsl, stride_out,
+            out, off, q, qs, kv, kvs, bt, w, ends, qsl, stride_out,
             weight_scale, last_page, batch, base_slots, max_steps,
         ).launch(
             grid=(fx.Int64(grid_x), 1, 1),
@@ -1602,6 +1623,7 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
     *,
     weight_scale: float = 1.0,
     out: torch.Tensor | None = None,
+    out_offsets: torch.Tensor | None = None,
     stream: torch.cuda.Stream | None = None,
 ) -> torch.Tensor:
     """Logits of every query row against its sequence's keys, from 8- or
@@ -1624,6 +1646,10 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
                     is its last row's
     out             [rows, >= plan.max_seq_len] f32. Columns past a row's
                     bound are left as they were.
+    out_offsets     [rows] i32: ``out`` is flat and row r's columns start at
+                    element out_offsets[r] (each row as long as its bound;
+                    the caller keeps the spans apart). Starts on a 256-byte
+                    boundary store as fast as the plane's rows.
 
     Work is shared out by length, a long sequence's M tiles getting more
     workgroups than a short one's, by each workgroup from the lengths: no
@@ -1664,21 +1690,31 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         out_nt=plan.out_nt,
         wave_min_steps=plan.wave_min_steps,
         pages_per_block=plan.pages_per_block,
+        packed_out=out_offsets is not None,
     )
-    if out is None:
-        out = torch.full(
-            (num_rows, plan.max_seq_len),
-            float("-inf"),
-            dtype=torch.float32,
-            device=q_fp4.device,
-        )
-    assert out.shape[0] >= num_rows and out.shape[1] >= plan.max_seq_len
-    assert out.stride(1) == 1
+    if out_offsets is not None:
+        assert out is not None and out.dim() == 1 and out.is_contiguous()
+        assert out.dtype == torch.float32
+        assert out_offsets.dtype == torch.int32 and out_offsets.shape == (num_rows,)
+        assert out_offsets.is_contiguous()
+        stride_out = 0
+    else:
+        if out is None:
+            out = torch.full(
+                (num_rows, plan.max_seq_len),
+                float("-inf"),
+                dtype=torch.float32,
+                device=q_fp4.device,
+            )
+        assert out.shape[0] >= num_rows and out.shape[1] >= plan.max_seq_len
+        assert out.stride(1) == 1
+        stride_out = out.stride(0)
     for t in (q_fp4, q_scale):
         assert t.is_contiguous(), "the kernel addresses its operands as dense"
     _run_compiled(
         launcher,
         out.data_ptr(),
+        0 if out_offsets is None else out_offsets.data_ptr(),
         q_fp4.data_ptr(),
         q_scale.data_ptr(),
         kv_cache.data_ptr(),
@@ -1687,7 +1723,7 @@ def flydsl_pa_mqa_logits_fp4_rowgroup(
         weights.data_ptr(),
         row_ends.data_ptr(),
         query_start_loc.data_ptr(),
-        out.stride(0),
+        stride_out,
         float(weight_scale),
         kv_cache.shape[0] - 1,
         batch,
