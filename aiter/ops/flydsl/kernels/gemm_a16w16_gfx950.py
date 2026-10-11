@@ -129,7 +129,8 @@ def make_gemm_a16w16_gfx950_param(
         raise ValueError("the workgroup cannot contain more than 16 waves")
     if group_m < 0:
         raise ValueError("group_m must be non-negative")
-    in_dbytes = 2  # Shared C remains in the 16-bit input dtype.
+    in_dbytes = 2
+    # Shared C uses the output dtype: fp32 output is never rounded to 16 bits.
     out_dbytes = 4 if out_dtype_id == GEMM_A16W16_DTYPE_FP32 else 2
     block_threads = m_waves * n_waves * k_waves * GFX950_WAVE_SIZE
     max_cshuffle_r2g_vec_size = 16 // out_dbytes
@@ -161,7 +162,7 @@ def make_gemm_a16w16_gfx950_param(
         )
         assert block_n % cshuffle_r2g_vec_size == 0
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
-    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * in_dbytes)
+    smem_bytes = max(smem_bytes, k_waves * block_m * block_n * out_dbytes)
     arch = get_rocm_arch()
     SMEM_CAPACITY_MAP = {
         "gfx942": 65536,
@@ -293,7 +294,9 @@ def make_gemm_a16w16_gfx950_param(
 
 def make_gemm_a16w16_gfx950_kernel_name(param: GemmA16W16Gfx950Param):
     dtype_str = "fp16" if param.in_dtype_id == GEMM_A16W16_DTYPE_FP16 else "bf16"
-    out_suffix = "_fp32" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
+    # "_fp32c" (fp32 C shuffle) changes FlyDSL's disk-cache key, which ignores
+    # @flyc.kernel bodies, so old bf16-rounding fp32 binaries are never reused.
+    out_suffix = "_fp32c" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     name = f"hgemm_{dtype_str}{out_suffix}_t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}"
     name += "_ksd" if param.is_split_k else "_ks1"
     name += f"_w{param.m_waves}x{param.n_waves}x{param.k_waves}"
@@ -553,7 +556,7 @@ def gemm_a16w16_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, k_waves * block_m * block_n, 16]
+        c: fx.Array[global_output_dtype, k_waves * block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -745,8 +748,8 @@ def gemm_a16w16_gfx950_kernel(
         compute_stage(current_stage, main_loop_end + s)
         current_stage = (current_stage + 1) % stages
 
-    frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-    frag_C_out.store(frag_C.load().to(elem_dtype))
+    frag_C_out = fx.make_fragment_like(frag_C, global_output_dtype)
+    frag_C_out.store(frag_C.load().to(global_output_dtype))
 
     gpu.barrier()
     for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
@@ -772,7 +775,9 @@ def gemm_a16w16_gfx950_kernel(
             if (global_row < m) and (global_col < n):
                 c_vec = fx.ptr_load(
                     smem_c + local_row * block_n + local_col,
-                    result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                    result_type=fx.Vector.make_type(
+                        cshuffle_r2g_vec_size, global_output_dtype
+                    ),
                 )
                 for k_slice in range_constexpr(1, k_waves):
                     peer_c_vec = fx.ptr_load(
@@ -781,7 +786,7 @@ def gemm_a16w16_gfx950_kernel(
                         + local_row * block_n
                         + local_col,
                         result_type=fx.Vector.make_type(
-                            cshuffle_r2g_vec_size, elem_dtype
+                            cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
                     c_vec = c_vec + peer_c_vec
@@ -872,7 +877,7 @@ def gemm_a16w16_hti_gfx950_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
+        c: fx.Array[global_output_dtype, block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -1029,8 +1034,8 @@ def gemm_a16w16_hti_gfx950_kernel(
 
     def store_half_tile_to_lds(m_part, n_part, frag_C):
         sC = fx.make_view(half_c_base(m_part, n_part), c_lds_layout)
-        frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-        frag_C_out.store(frag_C.load().to(elem_dtype))
+        frag_C_out = fx.make_fragment_like(frag_C, global_output_dtype)
+        frag_C_out.store(frag_C.load().to(global_output_dtype))
 
         for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
             row = fx.get_scalar(thr_mma_cRow[i])
@@ -1053,7 +1058,7 @@ def gemm_a16w16_hti_gfx950_kernel(
                     c_vec = fx.ptr_load(
                         sC_base + local_row * half_block_n + local_col,
                         result_type=fx.Vector.make_type(
-                            cshuffle_r2g_vec_size, elem_dtype
+                            cshuffle_r2g_vec_size, global_output_dtype
                         ),
                     )
                     global_offset = global_row * n + global_col

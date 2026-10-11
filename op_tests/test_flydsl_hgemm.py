@@ -14,6 +14,7 @@ Run:
     python op_tests/test_flydsl_hgemm.py
     python op_tests/test_flydsl_hgemm.py -s 128,4096,4096
     python op_tests/test_flydsl_hgemm.py -s 32,384,7168
+    python op_tests/test_flydsl_hgemm.py -o fp32   # fp32 out (DSv4 compressor wkv_gate)
 """
 
 import argparse
@@ -72,7 +73,14 @@ _TUNED = [
     (800, 384, 7168, 64, 96, 64, 4, 4, 2, 2, 1, 0, False),
     (32, 7168, 2048, 32, 32, 64, 8, 1, 2, 1, 1, 0, False),
     (32, 2880, 2048, 32, 32, 64, 8, 2, 1, 2, 1, 0, False),
+    # DSv4 compressor wkv_gate, fp32 out (-o fp32)
+    (8, 1024, 7168, 16, 64, 128, 4, 7, 1, 4, 1, 0, False),
+    (16, 2560, 7168, 16, 64, 128, 4, 4, 1, 2, 1, 0, False),
+    (32, 2560, 7168, 32, 32, 128, 4, 4, 2, 1, 1, 0, False),
 ]
+# Default shapes for -o fp32: the fp32 C tile doubles the LDS, so the large
+# bf16 tiles do not fit.
+_FP32_MNK = [(8, 1024, 7168), (16, 2560, 7168), (32, 2560, 7168)]
 
 
 def _policy(hti):
@@ -137,13 +145,17 @@ def run_torch(a, w, dtype):
 
 def _atol_rtol(k, split_k, k_waves, dtype):
     k_scale = (k / 8192) ** 0.5 * split_k * k_waves
+    if dtype is dtypes.fp32:
+        # fp32 accumulator end to end: a 16-bit rounding anywhere fails this.
+        return 1e-2, 1e-4
     if dtype is dtypes.bf16:
         return 2e-1 * k_scale, 2e-1
     return 5e-2 * k_scale, 5e-2
 
 
 @benchmark()
-def test_hgemm(m, n, k, dtype, policy, split_k):
+def test_hgemm(m, n, k, dtype, policy, split_k, otype=None):
+    otype = otype or dtype
     tile = _tile_for(m, n, k, policy, split_k)
     assert tile is not None, f"no tuned tile for {(m, n, k, policy, split_k)}"
 
@@ -151,8 +163,8 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     a = torch.empty((m, k), dtype=dtype, device="cuda").uniform_(-1, 1)
     w = torch.empty((n, k), dtype=dtype, device="cuda").uniform_(-1, 1)
     # Dirty preallocated C, as the model passes out= a buffer it owns.
-    out = torch.randn((m, n), dtype=dtype, device="cuda")
-    ref = run_torch(a, w, dtype)
+    out = torch.randn((m, n), dtype=otype, device="cuda")
+    ref = run_torch(a, w, otype)
 
     def _run_flydsl():
         return flydsl_hgemm(
@@ -169,11 +181,14 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
             k_waves=tile["k_waves"],
             group_m=tile["group_m"],
             policy=policy,
+            out_dtype=otype,
         )
 
     out_mm = torch.empty_like(out)
 
     def _run_torch_mm():
+        if otype != dtype:
+            return torch.mm(a, w.t(), out_dtype=otype)
         torch.mm(a, w.t(), out=out_mm)
         return out_mm
 
@@ -183,7 +198,7 @@ def test_hgemm(m, n, k, dtype, policy, split_k):
     nbytes = (
         m * k * a.element_size() + n * k * w.element_size() + m * n * out.element_size()
     )
-    atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], dtype)
+    atol, rtol = _atol_rtol(k, split_k, tile["k_waves"], otype)
     ret = {
         "gfx": get_gfx(),
         "tile": (
@@ -241,12 +256,24 @@ def main():
         "--mnk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=_default_mnk(),
+        default=None,
         help="""Shape of mnk.
         e.g.:   -s 128,4096,4096
                 --mnk 32,384,7168""",
     )
+    parser.add_argument(
+        "-o",
+        "--otype",
+        type=dtypes.str2Dtype,
+        choices=[dtypes.d_dtypes["bf16"], dtypes.d_dtypes["fp32"]],
+        default=None,
+        metavar="{bf16,fp32}",
+        help="""Output dtype (default: the input dtype).
+        e.g.: -o fp32""",
+    )
     args = parser.parse_args()
+    if args.mnk is None:
+        args.mnk = _FP32_MNK if args.otype == dtypes.fp32 else _default_mnk()
     wanted = set(args.mnk)
 
     for dtype in args.dtype:
@@ -255,8 +282,8 @@ def main():
             m, n, k, policy, split_k, _tile = _unpack(row)
             if (m, n, k) not in wanted:
                 continue
-            rows.append(test_hgemm(m, n, k, dtype, policy, split_k))
-        summarize(f"flydsl_hgemm {dtype}", rows)
+            rows.append(test_hgemm(m, n, k, dtype, policy, split_k, args.otype))
+        summarize(f"flydsl_hgemm {dtype} -> {args.otype or dtype}", rows)
 
 
 if __name__ == "__main__":
