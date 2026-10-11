@@ -183,8 +183,11 @@ __launch_bounds__(opus::get_warp_size() * MLA_V12_FILL_WARPS, 1) __global__
     int32_t* p_lds_reduce_before  = p_lds_works_before + kBatchChunk;
     int32_t* p_lds_partial_before = p_lds_reduce_before + kBatchChunk;
 
-    QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState qo_state(params.uni_seqlen_qo,
+                     ori_seqlen_qo,
+                     p_lds_seqlens_qo,
+                     params.p_seqlens_qo_indptr,
+                     params.qk_batch_ratio);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 
@@ -512,8 +515,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_seqlens_qo = reinterpret_cast<int32_t*>(p_smem);
     int32_t* p_lds_seqlens_kv = p_lds_seqlens_qo + (QoState::is_unique() ? 0 : num_batches);
 
-    QoState qo_state(
-        params.uni_seqlen_qo, ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState qo_state(params.uni_seqlen_qo,
+                     ori_seqlen_qo,
+                     p_lds_seqlens_qo,
+                     params.p_seqlens_qo_indptr,
+                     params.qk_batch_ratio);
 
     const int32_t lane_idx = opus::lane_id();
 
@@ -908,8 +914,11 @@ __launch_bounds__(opus::get_warp_size(), 1) __global__
     int32_t* p_lds_j0          = p_lds_lane_works + num_xcd;
     int32_t* p_lds_wb          = p_lds_j0 + num_xcd * (rows + 1);
 
-    QoState qo_state(
-        params.uni_seqlen_qo, params.ori_seqlen_qo, p_lds_seqlens_qo, params.p_seqlens_qo_indptr);
+    QoState qo_state(params.uni_seqlen_qo,
+                     params.ori_seqlen_qo,
+                     p_lds_seqlens_qo,
+                     params.p_seqlens_qo_indptr,
+                     params.qk_batch_ratio);
 
     MlaWorkInfo* p_work_info_set = reinterpret_cast<MlaWorkInfo*>(params.p_work_info_set_raw);
 

@@ -279,11 +279,13 @@ class QoState
     __device__ explicit QoState(const int32_t uni_seqlen_qo,
                                 const int32_t ori_seqlen_qo,
                                 const int32_t* p_lds_seqlens_qo,
-                                const int32_t* p_seqlens_qo_indptr)
+                                const int32_t* p_seqlens_qo_indptr,
+                                const int32_t qk_batch_ratio = 1)
         : uni_seqlen_qo_(uni_seqlen_qo),
           ori_seqlen_qo_(ori_seqlen_qo),
           p_lds_seqlens_qo_(p_lds_seqlens_qo),
-          p_seqlens_qo_indptr_(p_seqlens_qo_indptr)
+          p_seqlens_qo_indptr_(p_seqlens_qo_indptr),
+          qk_batch_ratio_(qk_batch_ratio)
     {
     }
 
@@ -314,8 +316,7 @@ class QoState
         }
         else if constexpr(Traits::kUniSeqlenQo <= -1)
         {
-            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
-            return p_seqlens_qo_indptr_[bid];
+            return get_folded_begin(batch_idx);
         }
         else
         {
@@ -331,8 +332,9 @@ class QoState
         }
         else if constexpr(Traits::kUniSeqlenQo <= -1)
         {
-            const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
-            return p_seqlens_qo_indptr_[bid + 1];
+            const int32_t bid = get_folded_bid(batch_idx);
+            return get_folded_begin(batch_idx) +
+                   (p_seqlens_qo_indptr_[bid + 1] - p_seqlens_qo_indptr_[bid]);
         }
         else
         {
@@ -347,10 +349,32 @@ class QoState
     }
 
     private:
+    // When the planner head-folds (num_heads -> 16, num_batches *= qk_batch_ratio)
+    // batch_idx addresses pseudo-batches, while p_seqlens_qo_indptr_ is still the
+    // caller's unfolded tensor. Map back before indexing it, and reproduce the
+    // folded row layout that aiter.mla._fold_seqlen_indptr builds for q/o:
+    //   begin(b) = f * indptr[b / f] + (b % f) * len[b / f]
+    // With qk_batch_ratio_ == 1 both helpers collapse to the unfolded indexing.
+    __device__ int32_t get_folded_bid(const int32_t batch_idx) const
+    {
+        const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
+        return bid / qk_batch_ratio_;
+    }
+
+    __device__ int32_t get_folded_begin(const int32_t batch_idx) const
+    {
+        const int32_t bid = Traits::kIsSparse ? (batch_idx / ori_seqlen_qo_) : batch_idx;
+        const int32_t ori = bid / qk_batch_ratio_;
+        const int32_t sub = bid - ori * qk_batch_ratio_;
+        const int32_t beg = p_seqlens_qo_indptr_[ori];
+        return qk_batch_ratio_ * beg + sub * (p_seqlens_qo_indptr_[ori + 1] - beg);
+    }
+
     const int32_t uni_seqlen_qo_;
     const int32_t ori_seqlen_qo_;
     const int32_t* const p_lds_seqlens_qo_;
     const int32_t* const p_seqlens_qo_indptr_;
+    const int32_t qk_batch_ratio_;
 };
 
 #define MLA_UNI_SEQLEN_QO_CASE(C_UNI_SEQLEN_QO, ...)      \
