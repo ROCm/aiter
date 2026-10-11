@@ -37,6 +37,8 @@ import torch
 
 from aiter.jit.core import AITER_ASM_DIR
 from aiter.ops.asm.asm_utils import (
+    current_raw_stream,
+    device_guard,
     dtype_str,
     get_function,
     get_gfx_from_device,
@@ -52,6 +54,7 @@ from aiter.ops.asm.asm_utils import (
 _KV4_DIM_NOPE = 448
 _KV4_DIM_ROPE = 64
 _KV4_HEAD_DIM = _KV4_DIM_NOPE + _KV4_DIM_ROPE
+_SCALAR_F = 1.0 / math.sqrt(float(_KV4_HEAD_DIM))
 
 _MLA_V4_SUBDIR = "mla_v4"
 _MLA_V4_CSV = "mla_v4_asm.csv"
@@ -257,8 +260,16 @@ def _get_heuristic_kernel(
     )
 
 
+@functools.cache
+def _device_info(device_index):
+    """(arch, warp_size) of a device; launch-path helper, not for traced code."""
+    return get_gfx_from_device(device_index), get_warp_size(device_index)
+
+
+@functools.cache
 def _select_nm_kernel(arch, q_type, kv_type, gqa_ratio, max_seqlen_q):
-    """Pick the non-persistent decode row and its per-WG Q tile ``sub_Q``.
+    """Pick the non-persistent decode row, its per-WG Q tile ``sub_Q`` and the
+    ``.co`` path.
 
     Serviceable fp8 (gqa, max_seqlen_q) pairs: gqa 16 with msq 1/2/4, gqa
     32/64/128 with msq 1. gfx950 ships one 64-row-tile kernel registered as
@@ -282,7 +293,8 @@ def _select_nm_kernel(arch, q_type, kv_type, gqa_ratio, max_seqlen_q):
         sub_Q = int(cfg["sub_Q"])
     else:
         sub_Q = min(64, gqa_ratio * max_seqlen_q) if supported else 64
-    return cfg, sub_Q
+    co_path = os.path.join(AITER_ASM_DIR, arch, _MLA_V4_SUBDIR, cfg["co_name"])
+    return cfg, sub_Q, co_path
 
 
 def _dump_kernarg(args, grid, block):
@@ -335,7 +347,8 @@ def mla_decode_v4_asm_eager(
     This is the raw launcher: lowest host overhead, but opaque to TorchDynamo.
     Prefer :func:`mla_decode_v4_asm`, the ``torch.compile``-safe custom op."""
     del softmax_scale  # kernel hardcodes 1/sqrt(512)
-    runtime_gfx = get_gfx_from_device(Q.device)
+    dev = Q.device.index
+    runtime_gfx, warp_size = _device_info(dev)
     preload = runtime_gfx == "gfx1250"
 
     out_16_nosplit = 1 if int(num_kv_splits) == 1 else 0
@@ -377,10 +390,9 @@ def mla_decode_v4_asm_eager(
     if not preload and split_indptr is None:
         raise ValueError(f"mla_decode_v4_asm: {runtime_gfx} requires split_indptr")
 
-    cfg, sub_Q = _select_nm_kernel(
+    cfg, sub_Q, co_path = _select_nm_kernel(
         runtime_gfx, q_type, kv_type, gqa_ratio, int(max_seqlen_q)
     )
-    co_path = os.path.join(AITER_ASM_DIR, runtime_gfx, _MLA_V4_SUBDIR, cfg["co_name"])
 
     args = MlaV4KernelArgsPreload() if preload else MlaV4KernelArgsLegacy()
     args.ptr_R = splitData.data_ptr()
@@ -396,7 +408,7 @@ def mla_decode_v4_asm_eager(
     args.ptr_QROPE = qrope.data_ptr()
     args.ptr_KVROPE = kvrope.data_ptr()
     args.ptr_sink = sink.data_ptr()
-    args.scalar_f = 1.0 / math.sqrt(float(_KV4_HEAD_DIM))
+    args.scalar_f = _SCALAR_F
     args.s_kv_split = int(num_kv_splits)
     args.out_16_nosplit = out_16_nosplit
     if preload:
@@ -437,11 +449,11 @@ def mla_decode_v4_asm_eager(
         num_seqs,
         int(num_kv_splits),
     )
-    block = (4 * get_warp_size(Q.device), 1, 1)
+    block = (4 * warp_size, 1, 1)
     _dump_kernarg(args, grid, block)
-    with torch.cuda.device(Q.device):
-        func = get_function(co_path, cfg["knl_name"])
-        launch_co(func, grid, block, args)
+    with device_guard(dev):
+        func = get_function(co_path, cfg["knl_name"], dev)
+        launch_co(func, grid, block, args, stream=current_raw_stream(dev))
 
 
 # Mutated buffers precede SymInt scalars so this implementation can be
@@ -472,6 +484,12 @@ _PS_ARANGE = 65537
 # [.., +4*1024) group counters.
 _PS_CNT_INTS = 2 * 65536 + 16 * 512 + 4 * 1024
 _PS_PLAN_CFG = 6 | (1 << 8)
+
+
+@functools.cache
+def _select_ps_kernel(arch):
+    cfg = _get_heuristic_kernel(arch, "fp8", "fp8", 64, 1, 0, 0, 1, 1)
+    return cfg, os.path.join(AITER_ASM_DIR, arch, _MLA_V4_SUBDIR, cfg["co_name"])
 
 
 def _ps_check_buf(t, dtype, name, device):
@@ -581,9 +599,7 @@ def mla_decode_v4_ps_asm_eager(
     if num_q == 0:
         return
 
-    arch = get_gfx_from_device(dev)
-    cfg = _get_heuristic_kernel(arch, "fp8", "fp8", 64, 1, 0, 0, 1, 1)
-    co_path = os.path.join(AITER_ASM_DIR, arch, _MLA_V4_SUBDIR, cfg["co_name"])
+    cfg, co_path = _select_ps_kernel(_device_info(dev.index)[0])
 
     args = MlaV4PsKernelArgs()
     args.ptr_O_acc = o_acc.data_ptr()
@@ -595,7 +611,7 @@ def mla_decode_v4_ps_asm_eager(
     args.ptr_LTP = kv_indptr.data_ptr()
     args.ptr_LTD = kv_page_indices.data_ptr()
     args.ptr_desc = desc.data_ptr()
-    args.scalar_f = 1.0 / math.sqrt(float(_KV4_HEAD_DIM))
+    args.scalar_f = _SCALAR_F
     args.s_gqa_ratio = _PS_HEADS
     args.s_kv_split = 1
     args.ptr_cnt = cnt.data_ptr()
@@ -609,9 +625,15 @@ def mla_decode_v4_ps_asm_eager(
     args.ptr_KVROPE = kvrope.data_ptr()
     args.ptr_sink = sink.data_ptr()
 
-    with torch.cuda.device(dev):
-        func = get_function(co_path, cfg["knl_name"])
-        launch_co(func, (2 * num_p, 1, 1), (256, 1, 1), args)
+    with device_guard(dev.index):
+        func = get_function(co_path, cfg["knl_name"], dev.index)
+        launch_co(
+            func,
+            (2 * num_p, 1, 1),
+            (256, 1, 1),
+            args,
+            stream=current_raw_stream(dev.index),
+        )
 
 
 mla_decode_v4_ps_asm = register_asm_custom_op(
@@ -666,7 +688,13 @@ def is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, num_kv_splits):
     Registry and filesystem validation intentionally happen inside the custom
     op's eager implementation, outside the Dynamo-traced region.
     """
-    if get_gfx_from_device(Q.device) != "gfx1250":
+    return _fused_eligible(
+        get_gfx_from_device(Q.device), Q, KV, max_seqlen_q, num_kv_splits
+    )
+
+
+def _fused_eligible(arch, Q, KV, max_seqlen_q, num_kv_splits):
+    if arch != "gfx1250":
         return False
     nsplit = int(num_kv_splits)
     if not (2 <= nsplit <= MLA_V4_FUSED_MAX_SPLITS):
@@ -703,9 +731,10 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
     ``splitData`` / ``splitLse`` are write-only scratch (no init needed; empty
     splits are never read back). The final bf16 result lands in ``output``."""
     nsplit = int(num_kv_splits)
-    runtime_gfx = get_gfx_from_device(Q.device)
+    dev = Q.device.index
+    runtime_gfx, warp_size = _device_info(dev)
     found = None
-    if is_mla_v4_fused_eligible(Q, KV, max_seqlen_q, nsplit):
+    if _fused_eligible(runtime_gfx, Q, KV, max_seqlen_q, nsplit):
         found = _fused_co_for(
             runtime_gfx,
             dtype_str(Q),
@@ -796,7 +825,7 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
     args.ptr_QTP = qo_indptr.data_ptr()
     args.ptr_QROPE = qrope.data_ptr()
     args.ptr_KVROPE = kvrope.data_ptr()
-    args.scalar_f = 1.0 / math.sqrt(float(_KV4_DIM_NOPE + _KV4_DIM_ROPE))
+    args.scalar_f = _SCALAR_F
     args.s_gqa_ratio = num_heads * max_seqlen_q
     args.s_kv_split = nsplit
     args.s_total_kv = KV.size(0) * KV.size(1)
@@ -808,14 +837,15 @@ def mla_decode_v4_fused_asm_gfx1250_eager(
     args.ptr_sink = sink.data_ptr()
 
     gdx = (num_heads * max_seqlen_q + sub_Q - 1) // sub_Q
-    with torch.cuda.device(Q.device):
-        func = get_function(co_path, cfg["knl_name"])
+    with device_guard(dev):
+        func = get_function(co_path, cfg["knl_name"], dev)
         launch_co_cluster(
             func,
             (nsplit * gdx, num_seqs, 1),
-            (4 * get_warp_size(Q.device), 1, 1),
+            (4 * warp_size, 1, 1),
             args,
             cluster_dim=(nsplit, 1, 1),
+            stream=current_raw_stream(dev),
         )
 
 

@@ -23,6 +23,7 @@ clashes with a second copy under /opt/rocm.
 Only depends on PyTorch (for device streams) + ctypes.
 """
 
+import contextlib
 import csv
 import ctypes
 import functools
@@ -210,14 +211,22 @@ _module_cache = {}
 _func_cache = {}
 
 
-def get_function(co_path, symbol):
+def get_function(co_path, symbol, device=None):
     """Load ``co_path`` once (process-cached) and resolve ``symbol`` to a
     function handle (also cached). Mirrors the ``AiterAsmKernel`` /
     ``SynchronizedCache`` behaviour of the C++ dispatcher: a given .co is mapped
     once per device context and reused across launches.
+
+    ``device`` (index) must be the current device; pass it when the caller
+    already knows it to skip the query.
     """
+    if device is None:
+        device = torch.cuda.current_device()
+    key = (device, co_path, symbol)
+    func = _func_cache.get(key)
+    if func is not None:
+        return func
     hip = _get_hip()
-    device = torch.cuda.current_device()
     module_key = (device, co_path)
     module = _module_cache.get(module_key)
     if module is None:
@@ -227,7 +236,6 @@ def get_function(co_path, symbol):
             "hipModuleLoad",
         )
         _module_cache[module_key] = module
-    key = (device, co_path, symbol)
     func = _func_cache.get(key)
     if func is None:
         func = ctypes.c_void_p()
@@ -237,6 +245,24 @@ def get_function(co_path, symbol):
         )
         _func_cache[key] = func
     return func
+
+
+_raw_stream_getter = getattr(torch._C, "_cuda_getCurrentRawStream", None)
+
+
+def current_raw_stream(device_index):
+    """Raw handle of the current torch stream on ``device_index``, without
+    constructing a ``torch.cuda.Stream`` object."""
+    if _raw_stream_getter is not None:
+        return _raw_stream_getter(device_index)
+    return torch.cuda.current_stream(device_index).cuda_stream
+
+
+def device_guard(device_index):
+    """Make ``device_index`` current for the block; free when it already is."""
+    if torch.cuda.current_device() == device_index:
+        return contextlib.nullcontext()
+    return torch.cuda.device(device_index)
 
 
 def launch_co(func, grid, block, kernarg, stream=None, shared_mem=0):
@@ -257,7 +283,7 @@ def launch_co(func, grid, block, kernarg, stream=None, shared_mem=0):
         HIP_LAUNCH_PARAM_END,
     )
     if stream is None:
-        stream = torch.cuda.current_stream().cuda_stream
+        stream = current_raw_stream(torch.cuda.current_device())
     gx, gy, gz = grid
     bx, by, bz = block
     hip_check(
@@ -308,7 +334,7 @@ def launch_co_cluster(
         HIP_LAUNCH_PARAM_END,
     )
     if stream is None:
-        stream = torch.cuda.current_stream().cuda_stream
+        stream = current_raw_stream(torch.cuda.current_device())
     attr = _HIPLaunchAttr()
     attr.id = HIP_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION
     attr.val.clusterDim.x = cx
