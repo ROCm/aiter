@@ -16,6 +16,7 @@ API (``flydsl_fp8_mqa_logits``, variant selection/registry) lives in
 # No `from __future__ import annotations`: FlyDSL arg typing needs real
 # annotation objects, not PEP 563 strings.
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -26,7 +27,7 @@ from flydsl.expr.typing import T
 
 from .. import buffer_ops
 from ..kernels_common import ceildiv, create_llvm_ptr
-from ..tensor_shim import GTensor
+from ..tensor_shim import GTensor, buf_base_i64
 
 Vec = fx.Vector
 
@@ -114,6 +115,61 @@ def _emit_col_sum(mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0):
     for sh in mfma.shuffle_offsets:
         col_sum = col_sum + col_sum.shuffle_xor(sh, 64)
     return col_sum
+
+
+def _emit_col_partial(mfma, mma, gemm_kw, a_row, b_pack, w_row, f32_0):
+    """This lane's un-reduced, un-scaled share of one (row, n-tile) logit.
+
+    ``_emit_col_sum`` minus the head butterfly and the ``kv_scale`` multiply:
+    the batched epilogue reduces several rows' partials together and scales
+    once after the reduction (``kv_scale`` depends only on the column).
+    """
+    col_sum = f32_0
+    for mi in range_constexpr(len(a_row)):
+        c_frag = fx.make_rmem_tensor(mfma.ACC_ELEMS, fx.Float32)
+        c_frag.store(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
+        for kk in range_constexpr(len(a_row[mi])):
+            fx.gemm(mma, c_frag, a_row[mi][kk], b_pack[kk], c_frag, **gemm_kw)
+        acc = c_frag.load()
+        for ii in range_constexpr(mfma.ACC_ELEMS):
+            col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
+    return col_sum
+
+
+def _reduce_scatter_rows(vals, g_bit1, g_bit0):
+    """Head-reduce ``len(vals)`` rows' partials across the 4 MFMA lane groups.
+
+    For the 16x16 atoms a column's heads are spread over the four lane groups
+    ``g = lane // 16``. Reducing each row separately costs 2 shuffles per row
+    and leaves the sum replicated in all 4 groups, so only 16 of 64 lanes store.
+    A reduce-scatter instead gives each group a different row:
+
+      * 4 rows: 3 shuffles total (vs 8); group g ends with row g's full sum.
+      * 2 rows: 2 shuffles total (vs 4); groups {0,1} hold row 0, {2,3} row 1.
+
+    ``g_bit1``/``g_bit0`` are the lane-group bits as i1 predicates. Returns the
+    reduced value; the row it belongs to is implied by the lane group.
+    """
+    if len(vals) == 4:
+        v0, v1, v2, v3 = vals
+        # Stage A (xor 32): keep the row pair selected by bit 1, send the other.
+        keep0 = g_bit1.select(v2, v0)
+        keep1 = g_bit1.select(v3, v1)
+        send0 = g_bit1.select(v0, v2)
+        send1 = g_bit1.select(v1, v3)
+        u0 = keep0 + send0.shuffle_xor(32, 64)
+        u1 = keep1 + send1.shuffle_xor(32, 64)
+        # Stage B (xor 16): keep the row selected by bit 0.
+        keep = g_bit0.select(u1, u0)
+        send = g_bit0.select(u0, u1)
+        return keep + send.shuffle_xor(16, 64)
+    if len(vals) == 2:
+        v0, v1 = vals
+        keep = g_bit1.select(v1, v0)
+        send = g_bit1.select(v0, v1)
+        u = keep + send.shuffle_xor(32, 64)
+        return u + u.shuffle_xor(16, 64)
+    raise ValueError(f"reduce-scatter supports 2 or 4 rows, got {len(vals)}")
 
 
 def _emit_row_neg_inf_fill(
@@ -348,8 +404,16 @@ def _build_kernel_mfma_r_w(
     convert_q_fn: bool = False,
     convert_kv_fn: bool = False,
     clean_logits: bool = True,
+    pipelined: bool | None = None,
 ):
     """Multi-row, multi-wave MFMA kernel.
+
+    ``pipelined`` (default: env ``FLYDSL_MQA_PIPELINED``, else True) selects the
+    software-pipelined tile loop. Each n-tile's B-fragments and kv_scale are
+    loaded one n-tile ahead of their use and carried through ``scf.for``
+    iter_args, so the global-load latency is covered by the previous n-tile's
+    MFMAs instead of being waited on in the same iteration. The head reduction
+    is a reduce-scatter across the RPB rows (see ``_reduce_scatter_rows``).
 
     ``rows_per_block`` query rows share one KV tile load (cuts KV traffic by RPB).
     ``waves_per_block`` waves execute per block; each wave owns a disjoint slice of
@@ -402,6 +466,18 @@ def _build_kernel_mfma_r_w(
     K_STEPS = D // MFMA_K  # MFMA K-steps over the head dim
     N_TILES_PER_WAVE = N_TILES // WPB  # column-tiles per wave
 
+    if pipelined is None:
+        pipelined = os.environ.get("FLYDSL_MQA_PIPELINED", "1") != "0"
+    # The pipelined path is written for the dense CDNA3 atom (8-byte frags,
+    # 4 lane groups of 16); the reduce-scatter needs RPB in {1, 2, 4}.
+    PIPE = bool(pipelined) and FRAG_BYTES == 8 and MFMA_N == 16 and RPB in (1, 2, 4)
+    # Prefetch distance in n-tiles. One n-tile is RPB*M_TILES*K_STEPS MFMAs of
+    # cover (64 at H=64, RPB=4), which already exceeds global-load latency.
+    # Each extra step keeps another n-tile of B live; at H=64 that pushes the
+    # kernel past 256 VGPRs and it spills, so deeper prefetch is slower.
+    PF_DIST = int(os.environ.get("FLYDSL_MQA_PF_DIST", "1"))
+    assert PF_DIST >= 1
+
     _cvt_tag = ""
     if convert_q_fn:
         _cvt_tag += "_cq"
@@ -413,7 +489,7 @@ def _build_kernel_mfma_r_w(
     _shape_tag = mfma.kname_tag or f"mfma{mfma.name}"
     _kname = (
         f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_{_shape_tag}_r{RPB}_w{WPB}"
-        f"{_cvt_tag}{_cl_tag}_flydsl"
+        f"{_cvt_tag}{_cl_tag}{'_pipe' if PIPE else ''}_flydsl"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[MR_BLOCK_THREADS, 1, 1])
@@ -566,7 +642,135 @@ def _build_kernel_mfma_r_w(
         tile_start = tile_start + by * split_cols
         tile_end = fx.min(tile_start + split_cols, tile_end)
 
-        for col0_iv in range(tile_start, tile_end, fx.Int32(BKV)):
+        wave_ni_base = wave * fx.Int32(N_TILES_PER_WAVE)
+        slk_m1 = seq_len_kv - fx.Int32(1)
+
+        def _load_ntile(col0, ni):
+            """One n-tile's B-frags (K_STEPS raw i64) + its kv_scale.
+
+            ``ni`` is this wave's static n-tile index within the BKV tile at
+            ``col0``. Loads past the window are harmless: the column is clamped
+            into [0, seq_len_kv) so the address is always valid, and the
+            epilogue masks the result. Returned as a flat list of IR values
+            (K_STEPS B-frags then the scale), the unit the pipeline carries.
+            """
+            col = col0 + (wave_ni_base + fx.Int32(ni)) * fx.Int32(MFMA_N) + lane_mod_N
+            col_cl = fx.min(col, slk_m1)
+            base_b = col_cl * fx.Int32(D)
+            out = []
+            for kk in range_constexpr(K_STEPS):
+                off = base_b + fx.Int32(kk * MFMA_K) + lane_frag_off
+                raw = _load_pack_i64(kv_i32, off)
+                out.append(_fn_to_fnuz_i64(raw) if convert_kv_fn else raw)
+            out.append(fx.Float32(sc_t[col_cl]).ir_value())
+            return out
+
+        if const_expr(PIPE):
+            # Lane-group bits for the reduce-scatter, and the row each lane
+            # group owns after it.
+            g = lane_div_N
+            g_bit1 = (g & fx.Int32(2)) != fx.Int32(0)
+            g_bit0 = (g & fx.Int32(1)) != fx.Int32(0)
+            if const_expr(RPB == 4):
+                my_j = g
+                is_writer_grp = fx.Int32(1) == fx.Int32(1)
+            elif const_expr(RPB == 2):
+                my_j = g // fx.Int32(2)
+                is_writer_grp = (g & fx.Int32(1)) == fx.Int32(0)
+            else:
+                my_j = fx.Int32(0)
+                is_writer_grp = g == fx.Int32(0)
+            # This lane's owned row: window + output row descriptor.
+            my_start = starts[0]
+            my_end = ends[0]
+            for j in range_constexpr(1, RPB):
+                sel = my_j == fx.Int32(j)
+                my_start = sel.select(starts[j], my_start)
+                my_end = sel.select(ends[j], my_end)
+            # The buffer descriptor base must stay wave-uniform (SGPR), so the
+            # base is row r0 and the per-lane row offset goes into the index.
+            # my_j <= 3, so my_j*stride + col stays far inside i32.
+            my_out = _make_out_row_t(logits, _stride_i64, r0)
+            my_row_off = my_j * stride_logits_s
+
+            n_iter = fx.Int32(
+                ceildiv(
+                    fx.Uint32(fx.max(tile_end - tile_start, fx.Int32(0))),
+                    fx.Uint32(BKV),
+                )
+            )
+            # Rolling software pipeline over this wave's n-tiles, flattened
+            # across BKV tiles: the carried ring holds the operands of the next
+            # PF_DIST n-tiles. Before computing n-tile ni of tile t, the load for
+            # flat position (ni + PF_DIST) is issued; it may belong to tile t+1.
+            # Prefetching per n-tile rather than per BKV tile keeps only
+            # (PF_DIST + 1) n-tiles of B live, which matters when Q and weights
+            # already occupy most of the register file (192 VGPRs at H=64, RPB=4).
+            NTW = N_TILES_PER_WAVE
+            SLOT = K_STEPS + 1
+            init_state = []
+            for p in range_constexpr(PF_DIST):
+                init_state += _load_ntile(
+                    tile_start + fx.Int32((p // NTW) * BKV), p % NTW
+                )
+
+            for t_iv, state in range(fx.Int32(0), n_iter, fx.Int32(1), init=init_state):
+                t = fx.Int32(t_iv)
+                col0 = tile_start + t * fx.Int32(BKV)
+                ring = [
+                    [state[p * SLOT + i] for i in range_constexpr(SLOT)]
+                    for p in range_constexpr(PF_DIST)
+                ]
+
+                for ni in range_constexpr(NTW):
+                    q = ni + PF_DIST
+                    ring.append(_load_ntile(col0 + fx.Int32((q // NTW) * BKV), q % NTW))
+                    cur = ring.pop(0)
+                    b_pack = [
+                        mfma.make_frag(cur[kk]) for kk in range_constexpr(K_STEPS)
+                    ]
+                    cur_scale = fx.Float32(cur[K_STEPS])
+                    parts = [
+                        _emit_col_partial(
+                            mfma, mma, gemm_kw, a_packs[j], b_pack, w_frag[j], f32_0
+                        )
+                        for j in range_constexpr(RPB)
+                    ]
+                    if const_expr(RPB == 1):
+                        red = parts[0]
+                        for sh in mfma.shuffle_offsets:
+                            red = red + red.shuffle_xor(sh, 64)
+                    else:
+                        red = _reduce_scatter_rows(parts, g_bit1, g_bit0)
+                    val = red * cur_scale
+                    col = (
+                        col0
+                        + (wave_ni_base + fx.Int32(ni)) * fx.Int32(MFMA_N)
+                        + lane_mod_N
+                    )
+                    in_window = (col >= my_start) & (col < my_end)
+                    is_writer = is_writer_grp & in_window
+
+                    out_idx = my_row_off + col
+
+                    def _store():
+                        my_out[out_idx] = val  # noqa: B023
+
+                    if is_writer:
+                        _store()
+
+                carried = []
+                for slot in ring:
+                    carried += [
+                        v.ir_value() if hasattr(v, "ir_value") else v for v in slot
+                    ]
+                # The yield must be an assignment for FlyDSL's loop rewriter to
+                # carry the state; the final loop value itself is not needed.
+                results = yield carried  # noqa: F841
+
+        # Legacy (unpipelined) loop: zero-trip when the pipelined loop ran.
+        legacy_end = (tile_end, tile_start)[int(PIPE)]
+        for col0_iv in range(tile_start, legacy_end, fx.Int32(BKV)):
             col0 = fx.Int32(col0_iv)
 
             # ---- Load B-frags: wave w owns its own disjoint slice of n-tiles
@@ -687,6 +891,450 @@ def _build_kernel_mfma_r_w(
         ).launch(grid=(gx, gy, 1), block=(MR_BLOCK_THREADS, 1, 1), stream=stream)
 
     return launch_fp8_mqa_logits_mfma_r_w
+
+
+def _build_kernel_mfma_lds_gfx942(
+    *,
+    num_heads: int,
+    head_size: int,
+    block_kv: int,
+    rows_per_block: int,
+    waves_per_block: int,
+    mfma: MfmaAtom = _MFMA16,
+    convert_q_fn: bool = False,
+    convert_kv_fn: bool = False,
+    clean_logits: bool = True,
+):
+    """gfx942 LDS-staged builder: one KV tile per block, rows split across waves.
+
+    ``rows_per_block`` is rows per WAVE (RPW); a block owns ``RPW * WPB`` rows.
+
+    Partitioning rows across waves instead of columns is what makes this
+    faster than ``_build_kernel_mfma_r_w``. When each wave owns a column slice
+    for all of the block's rows, every wave holds every row's Q and weights
+    (192 VGPRs at H=64, RPB=4, capping occupancy at 2 waves/SIMD) and issues its
+    own fine-grained global loads, which saturate the VMEM queue. Here the WPB
+    waves cooperatively DMA one BKV-column tile into LDS
+    (``buffer_load_dword ... lds``; gfx942 has no dwordx4 LDS DMA) and each
+    wave reads the whole tile back with ``ds_read_b64``, keeping only its own
+    RPW rows in registers. That fits 3 waves/SIMD and loads each KV tile once
+    per block instead of once per wave.
+
+    LDS slot layout (NUM_BUFFERS = 2 slots):
+      * KV: ``BKV * D`` bytes, column-major ``[col][d]`` in 8-byte chunks,
+        chunk index XOR-swizzled by ``col & (NCH-1)`` (NCH = D/8, capped at 16)
+        so the 16 lanes reading one k-chunk of 16 consecutive columns hit
+        distinct banks.
+      * scales: 64 f32 slots; the first ``BKV`` hold the tile's kv_scales.
+
+    Pipeline per tile t (one barrier per tile):
+      wait own DMA of tile t (exact vmcnt) -> s_barrier -> read all of tile t's
+      B-frags + scales from LDS -> DMA tile t+1 into the other slot -> MFMA +
+      epilogue. The slot overwritten at step 4 was last read in iteration t-1,
+      before this iteration's barrier, so one barrier suffices.
+
+    Exact vmcnt: every wave issues the same fixed number of DMA ops per tile
+    (KV_DMA + 1 scale DMA) and a fixed number of stores per tile (masked lanes
+    store to an out-of-range offset, which the descriptor drops), so the wait
+    at the top of the loop is a compile-time constant.
+    """
+    H = num_heads
+    D = head_size
+    BKV = block_kv
+    RPW = rows_per_block
+    WPB = waves_per_block
+    NT = 64 * WPB
+    ROWS_PER_BLOCK = RPW * WPB
+    MFMA_M, MFMA_N, MFMA_K = mfma.MFMA_M, mfma.MFMA_N, mfma.MFMA_K
+    assert (
+        mfma.frag_bytes == 8 and MFMA_N == 16
+    ), "gfx942 LDS builder needs the dense 16x16x32 atom"
+    assert H % MFMA_M == 0 and D % MFMA_K == 0 and BKV % MFMA_N == 0
+    assert RPW in (1, 2, 4), "reduce-scatter supports RPW in {1, 2, 4}"
+    N_TILES = BKV // MFMA_N
+    M_TILES = H // MFMA_M
+    K_STEPS = D // MFMA_K
+    NUM_BUFFERS = 2
+
+    # Swizzle: 8-byte chunks per column, XOR mask over the low chunk bits.
+    NCH = D // 8
+    SW = min(NCH, 16)
+    KV_BYTES = BKV * D
+    # The scale region is always 64 dwords because the scale DMA writes one
+    # dword per lane of a full wave; lanes >= BKV land in the unread tail.
+    SLOT_BYTES = KV_BYTES + 64 * 4
+    assert KV_BYTES % (NT * 4) == 0, "KV tile must split evenly into 4-byte DMA lanes"
+    KV_DMA = KV_BYTES // (NT * 4)  # dword DMA ops per thread per tile
+    assert BKV <= 64, "scale DMA covers one dword per lane of one wave"
+    # Stores per tile per wave: one buffer_store per n-tile (masked lanes are
+    # dropped by the descriptor bound, so the count is fixed).
+    STORES = N_TILES
+    # At the top of iteration t the only VMEM ops issued after tile t's DMA are
+    # iteration t-1's STORES stores, so vmcnt(STORES) retires the DMA exactly.
+    WAIT_TOP = STORES
+    assert KV_DMA + 1 + STORES <= 63, "vmcnt encoding limit"
+
+    _cvt_tag = ("_cq" if convert_q_fn else "") + ("_ck" if convert_kv_fn else "")
+    _cl_tag = "" if clean_logits else "_nocl"
+    _kname = (
+        f"fp8_mqa_logits_H{H}_D{D}_bkv{BKV}_mfma_r{RPW}_w{WPB}_ldsg"
+        f"{_cvt_tag}{_cl_tag}_flydsl"
+    )
+
+    @fx.struct
+    class SharedStorage:
+        slots: fx.Array[fx.Int32, NUM_BUFFERS * SLOT_BYTES // 4, 128]
+
+    @flyc.kernel(name=_kname, known_block_size=[NT, 1, 1])
+    def kernel(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        kv_scales: fx.Tensor,
+        weights: fx.Tensor,
+        cu_starts: fx.Tensor,
+        cu_ends: fx.Tensor,
+        logits: fx.Tensor,
+        seq_len: fx.Int32,  # padded to a multiple of ROWS_PER_BLOCK
+        seq_len_kv: fx.Int32,
+        stride_logits_s: fx.Int32,
+        num_splits: fx.Int32,
+    ):
+        f32_0 = fx.Float32(0.0)
+        mma = mfma.make_atom()
+        gemm_kw = mfma.gemm_kwargs()
+
+        tid = fx.thread_idx.x
+        bid = fx.block_idx.x
+        n_blocks = fx.Int32(ceildiv(fx.Uint32(seq_len), fx.Uint32(ROWS_PER_BLOCK)))
+        block_row0 = (n_blocks - bid - fx.Int32(1)) * fx.Int32(ROWS_PER_BLOCK)
+
+        # readfirstlane makes the wave index provably uniform, so the per-wave
+        # rows, output descriptor and DMA bases all stay in SGPRs (a divergent
+        # descriptor would make LLVM wrap every buffer op in a waterfall loop).
+        wave = fx.Int32(
+            rocdl.readfirstlane(fx.Int32.ir_type, (tid // fx.Int32(64)).ir_value())
+        )
+        lane = tid % fx.Int32(64)
+        g = lane // fx.Int32(MFMA_N)  # lane group 0..3
+        lane_mod_N = lane % fx.Int32(MFMA_N)
+        lane_frag_off = g * fx.Int32(8)
+        cp_4xfp32, tc_c_w = _make_weight_copy(mma, lane)
+        wave_row0 = block_row0 + wave * fx.Int32(RPW)
+
+        q_i32 = GTensor(Q, dtype=T.i32, shape=(-1,))
+        cs_t = GTensor(cu_starts, dtype=T.i32, shape=(-1,))
+        ce_t = GTensor(cu_ends, dtype=T.i32, shape=(-1,))
+        _stride_i64 = fx.Int64(fx.Uint32(stride_logits_s))
+
+        def _fix_i32(src):
+            result = fx.Int32(0)
+            for byte_idx in range_constexpr(4):
+                shift = fx.Int32(byte_idx * 8)
+                byte_val = (src >> shift) & fx.Int32(0xFF)
+                cleaned = (byte_val == fx.Int32(0x80)).select(fx.Int32(0), byte_val)
+                result = result | (cleaned << shift)
+            return result
+
+        def _fn_to_fnuz_i64(raw_i64):
+            raw = fx.Uint64(raw_i64)
+            lo_64 = fx.Int64(fx.Uint32(_fix_i32(fx.Int32(raw))))
+            hi_64 = fx.Int64(fx.Uint32(_fix_i32(fx.Int32(raw >> 32)))) << fx.Int64(32)
+            return (lo_64 | hi_64).ir_value()
+
+        def _load_q_frag(off):
+            v2 = q_i32.vec_load((off // fx.Int32(4),), vec_size=2)
+            raw = Vec(v2).bitcast(fx.Int64)[0].ir_value()
+            return mfma.make_frag(_fn_to_fnuz_i64(raw) if convert_q_fn else raw)
+
+        # ---- LDS ----
+        lds_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().slots.ptr
+        lds_base_i64 = fx.Int64(fx.Uint32(fx.ptrtoint(lds_ptr)))
+        lds_ptr0 = create_llvm_ptr(lds_base_i64, address_space=3)
+        _i64x1 = Vec.make_type(2, fx.Int32)
+
+        def _lds_read_b(slot_byte, col_local, kchunk):
+            """8-byte B fragment: column col_local, 8-byte chunk kchunk."""
+            phys = kchunk ^ (col_local & fx.Int32(SW - 1))
+            byte = slot_byte + col_local * fx.Int32(D) + phys * fx.Int32(8)
+            v = fx.ptr_load(lds_ptr + byte // fx.Int32(4), result_type=_i64x1)
+            raw = Vec(v).bitcast(fx.Int64)[0].ir_value()
+            return _fn_to_fnuz_i64(raw) if convert_kv_fn else raw
+
+        def _lds_read_scale(slot_byte, col_local):
+            byte = slot_byte + fx.Int32(KV_BYTES) + col_local * fx.Int32(4)
+            return fx.Float32(
+                fx.ptr_load(
+                    lds_ptr + byte // fx.Int32(4), result_type=fx.Float32.ir_type
+                )
+            )
+
+        # DMA addressing. Thread tid at DMA step i writes LDS dword (i*NT + tid)
+        # of the slot's KV region, i.e. physical byte p = 4*(i*NT + tid):
+        # column c = i*R + c0 (R = NT*4/D columns per step, c0 = tid*4//D), with
+        # physical chunk pc and dword h4 independent of i. It fetches logical
+        # chunk lc = pc ^ (c & (SW-1)) of KV[col0 + c].
+        #
+        # Bounds are enforced by the descriptor, not by a per-lane clamp: each
+        # step's descriptor is based at KV[col0 + i*R] (SGPRs) and its
+        # num_records ends at seq_len_kv, so columns past the end read as zero
+        # and are masked in the epilogue. The per-lane offset then depends only
+        # on (i*R) mod SW, i.e. 1-2 loop-invariant VGPRs. A per-lane clamp would
+        # need one offset VGPR per step, which LLVM hoists and spills.
+        R = NT * 4 // D
+        assert (NT * 4) % D == 0, "a DMA step must cover whole columns"
+        p0 = tid * fx.Int32(4)
+        c0 = p0 // fx.Int32(D)
+        within = p0 - c0 * fx.Int32(D)
+        pc = within // fx.Int32(8)
+        h4 = within - pc * fx.Int32(8)
+        lane_voff = {}
+        for i in range_constexpr(KV_DMA):
+            key = (i * R) % SW
+            if key not in lane_voff:
+                lc = pc ^ ((c0 + fx.Int32(key)) & fx.Int32(SW - 1))
+                lane_voff[key] = c0 * fx.Int32(D) + lc * fx.Int32(8) + h4
+        kv_base = buf_base_i64(KV)
+        sc_base = buf_base_i64(kv_scales)
+
+        def _dma_tile(slot_byte, col0):
+            """This wave's share of the KV tile at col0 + all BKV scales."""
+            for i in range_constexpr(KV_DMA):
+                cstep = col0 + fx.Int32(i * R)
+                rsrc = buffer_ops.create_buffer_resource_from_addr(
+                    (kv_base + fx.Int64(fx.Uint32(cstep)) * fx.Int64(D)).ir_value(),
+                    num_records_bytes=fx.max(seq_len_kv - cstep, fx.Int32(0))
+                    * fx.Int32(D),
+                )
+                wbase = slot_byte + fx.Int32(i * NT * 4) + wave * fx.Int32(256)
+                wbase_s = rocdl.readfirstlane(
+                    fx.Int64.ir_type, fx.Int64(fx.Uint32(wbase)).ir_value()
+                )
+                dst = buffer_ops.get_element_ptr(lds_ptr0, wbase_s)
+                rocdl.raw_ptr_buffer_load_lds(
+                    rsrc,
+                    dst,
+                    fx.Int32(4),
+                    fx.Int32(lane_voff[(i * R) % SW]),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                    fx.Int32(0),
+                )
+            # Scales: lane l writes the scale of column col0+l into scale[l];
+            # columns past seq_len_kv read as 0. Every wave writes identical
+            # bytes, so the overlap is benign, and it keeps every wave's VMEM
+            # op count equal, which the exact vmcnt wait relies on.
+            srsrc = buffer_ops.create_buffer_resource_from_addr(
+                (sc_base + fx.Int64(fx.Uint32(col0)) * fx.Int64(4)).ir_value(),
+                num_records_bytes=fx.max(seq_len_kv - col0, fx.Int32(0)) * fx.Int32(4),
+            )
+            sbase = slot_byte + fx.Int32(KV_BYTES)
+            sbase_s = rocdl.readfirstlane(
+                fx.Int64.ir_type, fx.Int64(fx.Uint32(sbase)).ir_value()
+            )
+            sdst = buffer_ops.get_element_ptr(lds_ptr0, sbase_s)
+            rocdl.raw_ptr_buffer_load_lds(
+                srsrc,
+                sdst,
+                fx.Int32(4),
+                lane * fx.Int32(4),
+                fx.Int32(0),
+                fx.Int32(0),
+                fx.Int32(0),
+            )
+
+        # ---- Per-wave rows: windows, Q frags, weights ----
+        starts = [None] * RPW
+        ends = [None] * RPW
+        a_packs = [None] * RPW
+        w_frag = [None] * RPW
+        for j in range_constexpr(RPW):
+            row = wave_row0 + fx.Int32(j)
+            starts[j] = fx.max(fx.Int32(cs_t[row]), fx.Int32(0))
+            ends[j] = fx.min(fx.Int32(ce_t[row]), seq_len_kv)
+            row_a = [[None] * K_STEPS for _ in range_constexpr(M_TILES)]
+            for mi in range_constexpr(M_TILES):
+                base_a = (
+                    row * fx.Int32(H) + fx.Int32(mi * MFMA_M) + lane_mod_N
+                ) * fx.Int32(D)
+                for kk in range_constexpr(K_STEPS):
+                    row_a[mi][kk] = _load_q_frag(
+                        base_a + fx.Int32(kk * MFMA_K) + lane_frag_off
+                    )
+            a_packs[j] = row_a
+            w_frag[j] = _load_row_weights(
+                weights, H, cp_4xfp32, tc_c_w, M_TILES, MFMA_N, row
+            )
+
+        # ---- Union window over ALL block rows (uniform trip count -> safe barriers) ----
+        u_start = None
+        u_end = None
+        for jj in range_constexpr(ROWS_PER_BLOCK):
+            rr = block_row0 + fx.Int32(jj)
+            ss = fx.max(fx.Int32(cs_t[rr]), fx.Int32(0))
+            ee = fx.min(fx.Int32(ce_t[rr]), seq_len_kv)
+            if jj == 0:
+                u_start, u_end = ss, ee
+            else:
+                u_start = fx.min(u_start, ss)
+                u_end = fx.max(u_end, ee)
+        tile_start = (u_start // fx.Int32(BKV)) * fx.Int32(BKV)
+        tile_end = fx.max(u_end, tile_start)
+        by = fx.block_idx.y
+        win_tiles = fx.Int32(ceildiv(fx.Uint32(tile_end - tile_start), fx.Uint32(BKV)))
+        split_cols = fx.Int32(
+            ceildiv(fx.Uint32(win_tiles), fx.Uint32(num_splits))
+        ) * fx.Int32(BKV)
+        tile_start = tile_start + by * split_cols
+        tile_end = fx.min(tile_start + split_cols, tile_end)
+        n_tiles = fx.Int32(
+            ceildiv(
+                fx.Uint32(fx.max(tile_end - tile_start, fx.Int32(0))), fx.Uint32(BKV)
+            )
+        )
+
+        # ---- Output ownership after the reduce-scatter ----
+        g_bit1 = (g & fx.Int32(2)) != fx.Int32(0)
+        g_bit0 = (g & fx.Int32(1)) != fx.Int32(0)
+        if const_expr(RPW == 4):
+            my_j = g
+            # Every lane group writes at RPW=4; this builds an all-true i1
+            # predicate with the same type as the other branches.
+            grp_writer = g == g  # noqa: PLR0124
+        elif const_expr(RPW == 2):
+            my_j = g // fx.Int32(2)
+            grp_writer = (g & fx.Int32(1)) == fx.Int32(0)
+        else:
+            my_j = fx.Int32(0)
+            grp_writer = g == fx.Int32(0)
+        my_start = starts[0]
+        my_end = ends[0]
+        for j in range_constexpr(1, RPW):
+            sel = my_j == fx.Int32(j)
+            my_start = sel.select(starts[j], my_start)
+            my_end = sel.select(ends[j], my_end)
+        # Output descriptor: base = this wave's first row, bounded to its RPW
+        # rows, so masked lanes can store to an out-of-range offset and be
+        # dropped by hardware (fixed store count per tile -> exact vmcnt).
+        out_base = buf_base_i64(logits) + fx.Int64(
+            fx.Uint32(wave_row0)
+        ) * _stride_i64 * fx.Int64(4)
+        out_rsrc = buffer_ops.create_buffer_resource_from_addr(
+            out_base.ir_value(),
+            num_records_bytes=(fx.Int32(RPW) * stride_logits_s * fx.Int32(4)),
+        )
+        my_row_off = my_j * stride_logits_s
+        OOB = fx.Int32(0x7FFFFFF0)
+
+        # ---- Prologue: DMA tile 0; drain everything (Q, weights, windows, tile 0) ----
+        _dma_tile(fx.Int32(0), tile_start)
+        rocdl.s_waitcnt(vmcnt=0)
+
+        for t_iv in range(fx.Int32(0), n_tiles, fx.Int32(1)):
+            t = fx.Int32(t_iv)
+            col0 = tile_start + t * fx.Int32(BKV)
+            slot = (t & fx.Int32(1)) * fx.Int32(SLOT_BYTES)
+            nslot = fx.Int32(SLOT_BYTES) - slot
+            # The only VMEM ops issued after tile t's DMA are the previous
+            # iteration's STORES stores, so vmcnt(STORES) retires exactly the DMA.
+            rocdl.s_waitcnt(vmcnt=WAIT_TOP)
+            gpu.barrier()
+
+            b_all = []
+            sc_all = []
+            for ni in range_constexpr(N_TILES):
+                cl = fx.Int32(ni * MFMA_N) + lane_mod_N
+                sc_all.append(_lds_read_scale(slot, cl))
+                b_all.append(
+                    [
+                        _lds_read_b(slot, cl, fx.Int32(kk * 4) + g)
+                        for kk in range_constexpr(K_STEPS)
+                    ]
+                )
+
+            # Prefetch tile t+1 into the other slot. On the last iteration this
+            # reads past the window; the descriptor bounds keep it in range and
+            # the data is never consumed.
+            _dma_tile(nslot, col0 + fx.Int32(BKV))
+
+            for ni in range_constexpr(N_TILES):
+                b_pack = [
+                    mfma.make_frag(b_all[ni][kk]) for kk in range_constexpr(K_STEPS)
+                ]
+                parts = [
+                    _emit_col_partial(
+                        mfma, mma, gemm_kw, a_packs[j], b_pack, w_frag[j], f32_0
+                    )
+                    for j in range_constexpr(RPW)
+                ]
+                if const_expr(RPW == 1):
+                    red = parts[0]
+                    for sh in mfma.shuffle_offsets:
+                        red = red + red.shuffle_xor(sh, 64)
+                else:
+                    red = _reduce_scatter_rows(parts, g_bit1, g_bit0)
+                val = red * sc_all[ni]
+                col = col0 + fx.Int32(ni * MFMA_N) + lane_mod_N
+                ok = grp_writer & (col >= my_start) & (col < my_end)
+                byte_off = ok.select((my_row_off + col) * fx.Int32(4), OOB)
+                buffer_ops.buffer_store(val, out_rsrc, byte_off, offset_is_bytes=True)
+
+        rocdl.s_waitcnt(vmcnt=0)
+
+        if const_expr(clean_logits):
+            neg_inf = fx.Float32(float("-inf"))
+
+            def _store_neg_inf(t, c):
+                t[c] = neg_inf
+
+            def _fill_range(out_row_t, lo_i32, hi_i32):
+                for c in range(lo_i32 + lane, hi_i32, fx.Int32(64)):
+                    _store_neg_inf(out_row_t, fx.Int32(c))
+
+            _emit_row_neg_inf_fill(
+                logits=logits,
+                stride_i64=_stride_i64,
+                rows=[wave_row0 + fx.Int32(j) for j in range_constexpr(RPW)],
+                starts=starts,
+                ends=ends,
+                seq_len_kv=seq_len_kv,
+                by_i32=by,
+                num_splits=num_splits,
+                fill_range=_fill_range,
+            )
+
+    @flyc.jit
+    def launch_fp8_mqa_logits_mfma_lds_gfx942(
+        Q: fx.Tensor,
+        KV: fx.Tensor,
+        kv_scales: fx.Tensor,
+        weights: fx.Tensor,
+        cu_starts: fx.Tensor,
+        cu_ends: fx.Tensor,
+        logits: fx.Tensor,
+        seq_len: fx.Int32,
+        seq_len_kv: fx.Int32,
+        stride_logits_s: fx.Int32,
+        num_splits: fx.Int32,
+        stream: fx.Stream,
+    ):
+        gx = fx.Int64(fx.Int32(ceildiv(fx.Uint32(seq_len), fx.Uint32(ROWS_PER_BLOCK))))
+        gy = fx.Int64(num_splits)
+        kernel._func.__name__ = _kname
+        kernel(
+            Q,
+            KV,
+            kv_scales,
+            weights,
+            cu_starts,
+            cu_ends,
+            logits,
+            seq_len,
+            seq_len_kv,
+            stride_logits_s,
+            num_splits,
+        ).launch(grid=(gx, gy, 1), block=(NT, 1, 1), stream=stream)
+
+    return launch_fp8_mqa_logits_mfma_lds_gfx942
 
 
 def _build_kernel_mfma_lds_pipe(

@@ -29,6 +29,7 @@ from .kernels.mqa_logits.fp8_mqa_logits import (
     _MFMA16,
     _MFMA16_K128,
     _MFMA32_K64,
+    _build_kernel_mfma_lds_gfx942,
     _build_kernel_mfma_lds_pipe,
     _build_kernel_mfma_r_w,
 )
@@ -209,10 +210,37 @@ def _register_variants(entries):
         _VARIANT_MFMA_M[tag] = mfma_m
 
 
+def _mk_lds942_builder(rpw, wpb, bkv):
+    """gfx942 LDS-staged builder: ``rpw`` rows per wave, ``wpb`` waves share one
+    KV tile of ``bkv`` columns (see ``_build_kernel_mfma_lds_gfx942``)."""
+    builder = lambda **kw: _build_kernel_mfma_lds_gfx942(
+        **{**kw, "block_kv": bkv}, rows_per_block=rpw, waves_per_block=wpb
+    )
+    return builder, _MFMA16.MFMA_M
+
+
+# Per-variant compile-hint overrides. The gfx942 LDS variants hold only RPW
+# rows of Q/weights plus one tile of B per wave, which fits in 168 VGPRs, so
+# they ask for 3 waves/SIMD instead of the default 2.
+_VARIANT_COMPILE_HINTS = {}
+
 if _ARCH == "gfx942":
     _register_variants(
         {f"mfma_r{r}_w{w}": _mk_builder(r, w) for r in (1, 2, 4) for w in (1, 2, 4)}
     )
+    _LDS942 = {
+        f"mfma_bkv64_r{r}_w4_lds2": _mk_lds942_builder(r, 4, 64) for r in (1, 2, 4)
+    }
+    _register_variants(_LDS942)
+    for _t in _LDS942:
+        _VARIANT_COMPILE_HINTS[_t] = {"waves_per_eu": 3}
+
+# gfx942 rows-per-wave for the auto-selected LDS variant, by num_heads. Q and
+# weights cost roughly 0.75 * RPW * H VGPRs at D=128, so RPW is the largest
+# value that stays within the 168-VGPR budget for 3 waves/SIMD. Chosen from
+# that arithmetic, not from a sweep. FLYDSL_MQA_LDS=0 restores the direct-load
+# selection.
+_GFX942_LDS_BY_H = {16: 4, 32: 4, 64: 2, 128: 1}
 
 if _ARCH == "gfx950":
     # CDNA4 scaled MFMA atoms (K=128/64): gfx950-only, since those instructions
@@ -396,11 +424,15 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
 
 def _resolve_variant(variant, seq_len, seq_len_kv, num_heads):
     """Effective variant: explicit ``variant=`` > env var > shape-adaptive."""
-    tag = (
-        variant
-        or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
-        or _auto_variant(seq_len, seq_len_kv, num_heads)
-    )
+    tag = variant or os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT")
+    if not tag:
+        tag = _auto_variant(seq_len, seq_len_kv, num_heads)
+        if (
+            _ARCH == "gfx942"
+            and os.environ.get("FLYDSL_MQA_LDS", "1") != "0"
+            and num_heads in _GFX942_LDS_BY_H
+        ):
+            tag = f"mfma_bkv64_r{_GFX942_LDS_BY_H[num_heads]}_w4_lds2"
     if tag not in _VARIANT_BUILDERS:
         raise ValueError(
             f"unknown fp8_mqa_logits variant {tag!r} for arch {_ARCH}; "
@@ -463,7 +495,10 @@ def compile_fp8_mqa_logits(
         convert_kv_fn=convert_kv_fn,
         clean_logits=clean_logits,
     )
-    launcher.compile_hints = dict(_DEFAULT_COMPILE_HINTS)
+    launcher.compile_hints = {
+        **_DEFAULT_COMPILE_HINTS,
+        **_VARIANT_COMPILE_HINTS.get(variant, {}),
+    }
     return launcher
 
 
