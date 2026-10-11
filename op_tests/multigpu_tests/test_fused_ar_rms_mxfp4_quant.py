@@ -125,6 +125,7 @@ def _run_mxfp4_case(
     eps: float,
     emit_bf16: bool,
     stage_override: str | None,
+    gemma_norm: bool,
 ):
     """Run one fused AR+RMSNorm+MXFP4 case on an initialized rank.
 
@@ -143,7 +144,13 @@ def _run_mxfp4_case(
     residual = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
     weight = torch.randn((shape[-1],), dtype=dtype, device="cuda", generator=gen)
     ref_residual = x * tp_size + residual
-    ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
+    if gemma_norm:
+        # Gemma RMSNorm scales by (1 + w); the kernel adds the 1 after widening w.
+        ref = F.rms_norm(
+            ref_residual.float(), (shape[-1],), weight=weight.float() + 1.0, eps=eps
+        ).to(dtype)
+    else:
+        ref = F.rms_norm(ref_residual, (shape[-1],), weight=weight, eps=eps)
     ref_fp4, ref_scale = dynamic_mxfp4_quant(ref)
     ref_dequant = _dequant_mxfp4(ref_fp4, ref_scale)
 
@@ -151,7 +158,13 @@ def _run_mxfp4_case(
     end = torch.cuda.Event(enable_timing=True)
     start.record()
     result = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-        x, residual, weight, eps, quant_type="mxfp4", emit_bf16=emit_bf16
+        x,
+        residual,
+        weight,
+        eps,
+        quant_type="mxfp4",
+        emit_bf16=emit_bf16,
+        gemma_norm=gemma_norm,
     )
     end.record()
     torch.cuda.synchronize()
@@ -163,23 +176,31 @@ def _run_mxfp4_case(
         bf16_out = None
 
     shapes_match = out_fp4.shape == ref_fp4.shape and scale.shape == ref_scale.shape
+    out_dequant = _dequant_mxfp4(out_fp4, scale) if shapes_match else None
     dequant_err = (
         checkAllclose(
             ref_dequant,
-            _dequant_mxfp4(out_fp4, scale),
-            msg=f"mxfp4 dequant {shape=} {emit_bf16=} {stage_override=} "
-            f"rank={rank} {us:.2f}us",
+            out_dequant,
+            msg=f"mxfp4 dequant {shape=} {gemma_norm=} {emit_bf16=} "
+            f"{stage_override=} rank={rank} {us:.2f}us",
             atol=1.5,
             rtol=5e-1,
         )
         if shapes_match
         else float("inf")
     )
+    # The elementwise tolerance above has to absorb FP4 rounding flips, so it
+    # cannot tell a wrong norm weight apart; the mean error can.
+    dequant_rel_l1 = (
+        ((out_dequant - ref_dequant).abs().mean() / ref_dequant.abs().mean()).item()
+        if shapes_match
+        else float("inf")
+    )
     residual_err = checkAllclose(
         ref_residual,
         res_out,
-        msg=f"residual output {shape=} {emit_bf16=} {stage_override=} "
-        f"rank={rank} {us:.2f}us",
+        msg=f"residual output {shape=} {gemma_norm=} {emit_bf16=} "
+        f"{stage_override=} rank={rank} {us:.2f}us",
         atol=1e-2,
         rtol=1e-2,
     )
@@ -188,7 +209,7 @@ def _run_mxfp4_case(
         bf16_err = checkAllclose(
             ref,
             bf16_out,
-            msg=f"bf16 side output {shape=} {stage_override=} "
+            msg=f"bf16 side output {shape=} {gemma_norm=} {stage_override=} "
             f"rank={rank} {us:.2f}us",
             atol=1e-2,
             rtol=1e-2,
@@ -199,6 +220,7 @@ def _run_mxfp4_case(
         "scale_shape": (tuple(scale.shape), tuple(ref_scale.shape)),
         "has_bf16_out": bf16_out is not None,
         "dequant_err": dequant_err,
+        "dequant_rel_l1": dequant_rel_l1,
         "residual_err": residual_err,
         "bf16_err": bf16_err,
     }
@@ -248,6 +270,7 @@ def _mxfp4_sweep(
             eps,
             case["emit_bf16"],
             stage_override,
+            case["gemma_norm"],
         )
         for case_idx, case in enumerate(cases)
     ]
@@ -337,12 +360,17 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
     rows = []
     for i, case in enumerate(cases):
         shape, emit_bf16 = case["shape"], case["emit_bf16"]
+        gemma_norm = case["gemma_norm"]
         results = [rank_results[i] for rank_results in per_rank]
         for r in results:
             out_shape, ref_shape = r["fp4_shape"]
             assert out_shape == ref_shape, f"{shape=}: {out_shape} != {ref_shape}"
             out_shape, ref_shape = r["scale_shape"]
             assert out_shape == ref_shape, f"{shape=}: {out_shape} != {ref_shape}"
+            assert r["dequant_rel_l1"] < 0.05, (
+                f"mxfp4 dequant rel L1 {r['dequant_rel_l1']:.4f} "
+                f"{shape=} {gemma_norm=} {emit_bf16=} {stage_override=}"
+            )
             if emit_bf16:
                 assert r["has_bf16_out"]
         expected_path = _expected_path(
@@ -354,11 +382,13 @@ def test_fused_ar_rmsnorm_mxfp4_quant(
                 "tp_size": tp_size,
                 "dtype": str(dtype).replace("torch.", ""),
                 "emit_bf16": emit_bf16,
+                "gemma_norm": gemma_norm,
                 "stage_override": stage_override or "auto",
                 "expected_path": expected_path,
                 "min_us": min(r["us"] for r in results),
                 "max_us": max(r["us"] for r in results),
                 "mxfp4_dequant_err": max(r["dequant_err"] for r in results),
+                "mxfp4_dequant_rel_l1": max(r["dequant_rel_l1"] for r in results),
                 "residual_err": max(r["residual_err"] for r in results),
                 "bf16_err": max(r["bf16_err"] for r in results),
             }
@@ -382,6 +412,7 @@ FULL_SHAPES = [
     (32, 7168),  # 2-stage at TP=8 (32*7168*2 = 448 KiB <= 512 KiB)
     (56, 7168),  # fallback at TP=8 (56*7168*2 = 784 KiB > 512 KiB)
     (16, 4096),  # 2-stage (block_size=512, 16*4096*2 = 128 KiB)
+    (8, 8192),  # 1-stage (K == 8192 -> M <= 8)
     (32, 8192),  # 2-stage at TP=8 (block_size=1024, 32*8192*2 = 512 KiB)
     (64, 7168),  # fallback (64*7168*2 = 896 KiB > 512 KiB)
     (128, 7168),  # fallback
@@ -440,6 +471,11 @@ def main():
         ),
     )
     parser.add_argument(
+        "--gemma-norm",
+        action="store_true",
+        help=("Also exercise the Gemma (1 + w) weight path; --full implies it."),
+    )
+    parser.add_argument(
         "--full",
         action="store_true",
         help=(
@@ -465,6 +501,7 @@ def main():
         shapes = args.shape if args.shape is not None else FULL_SHAPES
         emit_bf16_values = [False, True]
         stage_overrides = [None, "1", "0"]
+        gemma_norm_values = [False, True]
     else:
         shapes = args.shape if args.shape is not None else DEFAULT_SHAPES
         emit_bf16_values = [False, True] if args.emit_bf16 else [False]
@@ -473,6 +510,7 @@ def main():
             stage_overrides = [None, "1", "0"]
         else:
             stage_overrides = [stage_to_env[args.stage]]
+        gemma_norm_values = [False, True] if args.gemma_norm else [False]
 
     tp_sizes = [args.tp_size] if args.tp_size is not None else [2, 4, 8]
     element_size = torch.tensor([], dtype=dtype).element_size()
@@ -482,8 +520,10 @@ def main():
     rows = []
     for tp_size, stage_override in itertools.product(tp_sizes, stage_overrides):
         cases = [
-            {"shape": shape, "emit_bf16": emit_bf16}
-            for shape, emit_bf16 in itertools.product(shapes, emit_bf16_values)
+            {"shape": shape, "emit_bf16": emit_bf16, "gemma_norm": gemma_norm}
+            for shape, emit_bf16, gemma_norm in itertools.product(
+                shapes, emit_bf16_values, gemma_norm_values
+            )
             # When forcing a specific kernel, only exercise shapes that the
             # kernel actually supports. Fallbacks under override would just
             # silently re-test the unfused reference path.
