@@ -50,3 +50,4 @@ bf16,bf16,8,1,0,0,16,_ZN5aiter36pa_bf16_noquant_gqa8_1tg_4w_mtp_msk0E,pa_bf16_no
 fp16,fp8,8,0,0,2,16,_ZN5aiter35pa_fp16_pertokenFp8_gqa8_2tg_4w_uhpE,pa_fp16_pertokenFp8_gqa8_2tg_4w_uhp.co,0,0,0
 fp16,fp8,8,1,0,0,16,_ZN5aiter40pa_fp16_pertokenFp8_gqa8_1tg_4w_mtp_msk0E,pa_fp16_pertokenFp8_gqa8_1tg_4w_mtp_msk0.co,0,0,0
 bf16,int8,16,1,1,0,16,_ZN5aiter42pa_bf16_pertokenInt8_gqa16_1tg_4w_mtp_msk1E,pa_bf16_pertokenInt8_gqa16_1tg_4w_mtp_msk1.co,0,0,0
+bf16,fp8,16,1,1,0,16,_ZN5aiter31pa_a16w8_q16_d128_p16_mtp_splitE,pa_a16w8_q16_d128_p16_mtp_split.co,0,0,2
