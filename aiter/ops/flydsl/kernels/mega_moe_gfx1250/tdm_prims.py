@@ -44,8 +44,6 @@ from __future__ import annotations
 import math
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
-from flydsl.expr import arith
 from flydsl.expr.rocdl import readfirstlane, tdm_ops
 from flydsl.expr.typing import T
 
@@ -66,11 +64,11 @@ _TDM_ROW_LOG2_4B = TDM_ROW_ELEMS_4B.bit_length() - 1
 
 
 def _i32(v):
-    """i32 constant from a bit pattern that may set bit 31 (arith wants signed)."""
+    """i32 constant from a bit pattern that may set bit 31."""
     v &= 0xFFFFFFFF
     if v >= 1 << 31:
         v -= 1 << 32
-    return arith.constant(v, type=T.i32)
+    return fx.Int32(v)
 
 
 def tdm_group1(dim0, dim1, elem_bytes, stride=None):
@@ -116,8 +114,8 @@ def tdm_group1_rows_4b(rows):
     ``readfirstlane`` for the same reason :func:`tdm_group0` does it.
     """
     dim0 = TDM_ROW_ELEMS_4B
-    r = readfirstlane(T.i32, arith.unwrap(rows))
-    r_hi = arith.shli(r, _i32(16))
+    r = fx.Int32(readfirstlane(T.i32, fx.Int32(rows).ir_value()))
+    r_hi = r << 16
     return fx.Vector.from_elements(
         [
             _i32(2 << 16),  # data_size = log2(4B)
@@ -153,20 +151,19 @@ def tdm_plan_xfer_4b(src_addr, dst_addr, n_elems):
     not worth a descriptor once the head and tail are peeled off it.
     """
     row_mask = TDM_ROW_FLOOR_BYTES - 1
-    s_lo = arith.trunci(T.i32, arith.unwrap(src_addr))
-    d_lo = arith.trunci(T.i32, arith.unwrap(dst_addr))
-    skew = arith.andi(arith.xori(s_lo, d_lo), _i32(row_mask))
-    sub_dword = arith.andi(arith.ori(s_lo, d_lo), _i32(3))
-    phase = arith.shrui(arith.andi(s_lo, _i32(row_mask)), _i32(2))
-    head = arith.andi(
-        arith.subi(_i32(TDM_ROW_ELEMS_4B), phase), _i32(TDM_ROW_ELEMS_4B - 1)
-    )
-    head = arith.select(head > n_elems, n_elems, head)
-    rows = arith.shrui(arith.subi(n_elems, head), _i32(_TDM_ROW_LOG2_4B))
+    s_lo = fx.Int32(src_addr)
+    d_lo = fx.Int32(dst_addr)
+    count = fx.Int32(n_elems)
+    skew = (s_lo ^ d_lo) & _i32(row_mask)
+    sub_dword = (s_lo | d_lo) & _i32(3)
+    phase = (s_lo & _i32(row_mask)).shrui(_i32(2))
+    head = (_i32(TDM_ROW_ELEMS_4B) - phase) & _i32(TDM_ROW_ELEMS_4B - 1)
+    head = (head > count).select(count, head)
+    rows = (count - head).shrui(_i32(_TDM_ROW_LOG2_4B))
     usable = (skew == 0) & (sub_dword == 0) & (rows >= 2)
     return (
-        arith.select(usable, head, n_elems),
-        arith.select(usable, rows, arith.constant(0, type=T.i32)),
+        usable.select(head, count),
+        usable.select(rows, _i32(0)),
     )
 
 
@@ -181,19 +178,16 @@ def tdm_group0(lds_addr_i32, global_addr_i64):
     a VGPR moves the wrong bytes instead of failing to compile. Every caller is in
     a wave-uniform branch, so lane 0 is always active.
     """
-    i32 = ir.IntegerType.get_signless(32)
-    addr = arith.unwrap(global_addr_i64)
-    lo = arith.trunci(i32, addr)
-    hi = arith.ori(
-        arith.trunci(i32, arith.shrui(addr, arith.constant(32, type=T.i64))),
-        _i32(1 << 31),  # descriptor type field
-    )
+    lo = fx.Int32(global_addr_i64)
+    hi = fx.Int32(fx.Uint64(global_addr_i64) >> 32) | _i32(
+        1 << 31
+    )  # descriptor type field
     return fx.Vector.from_elements(
         [
             _i32(1),
-            readfirstlane(T.i32, arith.unwrap(lds_addr_i32)),
-            readfirstlane(T.i32, lo),
-            readfirstlane(T.i32, hi),
+            readfirstlane(T.i32, fx.Int32(lds_addr_i32).ir_value()),
+            readfirstlane(T.i32, lo.ir_value()),
+            readfirstlane(T.i32, hi.ir_value()),
         ],
         fx.Int32,
     ).ir_value()

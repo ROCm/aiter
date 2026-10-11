@@ -22,11 +22,9 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl._mlir.dialects import memref as memref_dialect
-from flydsl.expr import arith, rocdl
-from flydsl.expr.arith import _to_raw as _raw
+from flydsl.expr import rocdl
 from flydsl.expr.meta import dsl_loc_tracing
-from flydsl.expr.typing import T, as_ir_value
-from flydsl.expr.utils.arith import ArithValue as _ArithValue
+from flydsl.expr.typing import T
 
 
 def compute_padding_encoding(
@@ -75,7 +73,7 @@ def _byte_offset_to_i64(offset):
     """
     if isinstance(offset, int):
         return fx.Int64(offset)
-    raw = _raw(offset)
+    raw = fx.as_ir_value(offset)
     if isinstance(raw.type, ir.IndexType):
         return fx.Int64(raw)
     if raw.type == T.i64:
@@ -85,8 +83,7 @@ def _byte_offset_to_i64(offset):
 
 
 def _zero_dgroup_v8i32():
-    z = as_ir_value(arith.constant(0, type=T.i32))
-    return fx.Vector.from_elements([z, z, z, z, z, z, z, z], fx.Int32).ir_value()
+    return fx.Vector.filled(8, 0, fx.Int32).ir_value()
 
 
 @dsl_loc_tracing
@@ -157,7 +154,7 @@ def make_tensor_gather_descriptor(
             | (enc_interval << 22)
             | (enc_amount << 25)
         )
-        g1_s0 = arith.constant(g1_s0_val, type=T.i32)
+        g1_s0 = fx.Int32(g1_s0_val)
     else:
         upper = (
             (data_size_code << 16)
@@ -165,68 +162,56 @@ def make_tensor_gather_descriptor(
             | (enc_interval << 22)
             | (enc_amount << 25)
         )
-        g1_s0 = arith.ori(
-            arith.constant(upper, type=T.i32),
-            arith.andi(workgroup_mask, arith.constant(0xFFFF, type=T.i32)),
-        )
+        g1_s0 = fx.Int32(upper) | (fx.Int32(workgroup_mask) & fx.Int32(0xFFFF))
 
     # tensor_dim0 (32 bits) packed into sgpr1[31:16] and sgpr2[15:0];
     # tensor_dim1 (32 bits) into sgpr2[31:16] and sgpr3[15:0].
     _td1_is_runtime = not isinstance(tensor_dim1, int)
 
-    g1_s1 = arith.constant((tensor_dim0 & 0xFFFF) << 16, type=T.i32)
+    g1_s1 = fx.Int32((tensor_dim0 & 0xFFFF) << 16)
 
     if _td1_is_runtime:
-        _td0_hi = arith.constant((tensor_dim0 >> 16) & 0xFFFF, type=T.i32)
-        _td1_lo = arith.andi(tensor_dim1, arith.constant(0xFFFF, type=T.i32))
-        _td1_lo_shifted = arith.shli(_td1_lo, arith.constant(16, type=T.i32))
-        g1_s2 = arith.ori(_td0_hi, _td1_lo_shifted)
-
-        _td1_hi = arith.andi(
-            arith.shrui(tensor_dim1, arith.constant(16, type=T.i32)),
-            arith.constant(0xFFFF, type=T.i32),
+        td1 = fx.Int32(tensor_dim1)
+        g1_s2 = fx.Int32((tensor_dim0 >> 16) & 0xFFFF) | (
+            (td1 & fx.Int32(0xFFFF)) << 16
         )
-        g1_s3 = arith.ori(_td1_hi, arith.constant(row_width << 16, type=T.i32))
+        g1_s3 = (td1.shrui(fx.Int32(16)) & fx.Int32(0xFFFF)) | fx.Int32(row_width << 16)
     else:
-        g1_s2 = arith.constant(
-            ((tensor_dim0 >> 16) & 0xFFFF) | ((tensor_dim1 & 0xFFFF) << 16),
-            type=T.i32,
+        g1_s2 = fx.Int32(
+            ((tensor_dim0 >> 16) & 0xFFFF) | ((tensor_dim1 & 0xFFFF) << 16)
         )
-        g1_s3 = arith.constant(
-            ((tensor_dim1 >> 16) & 0xFFFF) | (row_width << 16),
-            type=T.i32,
-        )
+        g1_s3 = fx.Int32(((tensor_dim1 >> 16) & 0xFFFF) | (row_width << 16))
 
     # sgpr4: tile_dim1[15:0] — the number of indices consumed from groups 2/3.
     if gather_tile_dim1 is None:
-        g1_s4 = arith.constant(num_indices & 0xFFFF, type=T.i32)
+        g1_s4 = fx.Int32(num_indices & 0xFFFF)
     elif isinstance(gather_tile_dim1, int):
-        g1_s4 = arith.constant(gather_tile_dim1 & 0xFFFF, type=T.i32)
+        g1_s4 = fx.Int32(gather_tile_dim1 & 0xFFFF)
     else:
-        g1_s4 = arith.andi(gather_tile_dim1, arith.constant(0xFFFF, type=T.i32))
+        g1_s4 = fx.Int32(gather_tile_dim1) & fx.Int32(0xFFFF)
 
     # sgpr5: tensor_dim0_stride (dim0 stride = row stride in elements)
-    g1_s5 = arith.constant(stride & 0xFFFFFFFF, type=T.i32)
+    g1_s5 = fx.Int32(stride & 0xFFFFFFFF)
 
     # sgpr6-7: tensor_dim1_stride (ignored in gather mode)
-    g1_s6 = arith.constant(0, type=T.i32)
-    g1_s7 = arith.constant(0, type=T.i32)
+    g1_s6 = fx.Int32(0)
+    g1_s7 = fx.Int32(0)
 
     dgroup1 = fx.Vector.from_elements(
-        [
-            as_ir_value(v)
-            for v in [g1_s0, g1_s1, g1_s2, g1_s3, g1_s4, g1_s5, g1_s6, g1_s7]
-        ],
+        [g1_s0, g1_s1, g1_s2, g1_s3, g1_s4, g1_s5, g1_s6, g1_s7],
         fx.Int32,
     ).ir_value()
 
     # GROUP 2 & 3: row indices
-    zero = arith.constant(0, type=T.i32)
+    zero = fx.Int32(0)
 
     if index_size == 32:
-        g2_vals = [row_indices[i] if i < num_indices else zero for i in range(4)]
+        g2_vals = [
+            fx.Int32(row_indices[i]) if i < num_indices else zero for i in range(4)
+        ]
         g3_vals = [
-            row_indices[i + 4] if (i + 4) < num_indices else zero for i in range(4)
+            fx.Int32(row_indices[i + 4]) if (i + 4) < num_indices else zero
+            for i in range(4)
         ]
     else:
         # 16-bit mode packs 2 indices per word: [0..7] in group 2, [8..15] in 3.
@@ -234,33 +219,19 @@ def make_tensor_gather_descriptor(
         for w in range(4):
             lo_idx = w * 2
             hi_idx = w * 2 + 1
-            lo = row_indices[lo_idx] if lo_idx < num_indices else zero
-            hi = row_indices[hi_idx] if hi_idx < num_indices else zero
-            lo_masked = arith.andi(lo, arith.constant(0xFFFF, type=T.i32))
-            hi_shifted = arith.shli(
-                arith.andi(hi, arith.constant(0xFFFF, type=T.i32)),
-                arith.constant(16, type=T.i32),
-            )
-            g2_vals.append(arith.ori(lo_masked, hi_shifted))
+            lo = fx.Int32(row_indices[lo_idx]) if lo_idx < num_indices else zero
+            hi = fx.Int32(row_indices[hi_idx]) if hi_idx < num_indices else zero
+            g2_vals.append((lo & fx.Int32(0xFFFF)) | ((hi & fx.Int32(0xFFFF)) << 16))
         g3_vals = []
         for w in range(4):
             lo_idx = 8 + w * 2
             hi_idx = 8 + w * 2 + 1
-            lo = row_indices[lo_idx] if lo_idx < num_indices else zero
-            hi = row_indices[hi_idx] if hi_idx < num_indices else zero
-            lo_masked = arith.andi(lo, arith.constant(0xFFFF, type=T.i32))
-            hi_shifted = arith.shli(
-                arith.andi(hi, arith.constant(0xFFFF, type=T.i32)),
-                arith.constant(16, type=T.i32),
-            )
-            g3_vals.append(arith.ori(lo_masked, hi_shifted))
+            lo = fx.Int32(row_indices[lo_idx]) if lo_idx < num_indices else zero
+            hi = fx.Int32(row_indices[hi_idx]) if hi_idx < num_indices else zero
+            g3_vals.append((lo & fx.Int32(0xFFFF)) | ((hi & fx.Int32(0xFFFF)) << 16))
 
-    dgroup2 = fx.Vector.from_elements(
-        [as_ir_value(v) for v in g2_vals], fx.Int32
-    ).ir_value()
-    dgroup3 = fx.Vector.from_elements(
-        [as_ir_value(v) for v in g3_vals], fx.Int32
-    ).ir_value()
+    dgroup2 = fx.Vector.from_elements(g2_vals, fx.Int32).ir_value()
+    dgroup3 = fx.Vector.from_elements(g3_vals, fx.Int32).ir_value()
 
     return TDMGatherDescriptor(
         dgroup0=dgroup0,
@@ -293,9 +264,9 @@ def make_tensor_gather_dgroup0(
     i64 = ir.IntegerType.get_signless(64)
     a_raw = global_ptr.__extract_to_ir_values__()[0]
     glb_ptr = _fly_d.extract_aligned_pointer_as_index(glb_ptr_type, a_raw)
-    glb_base_i64 = _ArithValue(llvm_dialect.ptrtoint(i64, glb_ptr))
+    glb_base_i64 = fx.Int64(llvm_dialect.ptrtoint(i64, glb_ptr))
     if global_byte_offset is not None:
-        glb_base_i64 = glb_base_i64 + _byte_offset_to_i64(global_byte_offset)
+        glb_base_i64 += fx.Int64(_byte_offset_to_i64(global_byte_offset))
 
     # lds_memref accepts, in priority order:
     #   * an already-resolved LDS base index (e.g. from a pointer-based
@@ -304,41 +275,30 @@ def make_tensor_gather_dgroup0(
     #     extracting its aligned LDS pointer (addrspace 3) via the fly dialect;
     #   * a std MLIR memref -- via memref.extract_aligned_pointer_as_index.
     if hasattr(lds_memref, "type") and isinstance(lds_memref.type, ir.IndexType):
-        lds_base_idx = (
-            lds_memref
-            if isinstance(lds_memref, _ArithValue)
-            else _ArithValue(lds_memref)
-        )
+        lds_base_idx = fx.Index(lds_memref)
     elif hasattr(lds_memref, "__extract_to_ir_values__"):
         lds_ptr_type = ir.Type.parse("!llvm.ptr<3>")
         lds_raw = lds_memref.__extract_to_ir_values__()[0]
         lds_ptr = _fly_d.extract_aligned_pointer_as_index(lds_ptr_type, lds_raw)
-        lds_base_idx = _ArithValue(
-            arith.index_cast(T.index, llvm_dialect.ptrtoint(i64, lds_ptr))
-        )
+        lds_base_idx = fx.Index(llvm_dialect.ptrtoint(i64, lds_ptr))
     else:
-        lds_base_idx = _ArithValue(
+        lds_base_idx = fx.Index(
             memref_dialect.extract_aligned_pointer_as_index(lds_memref)
         )
     lds_total_off = lds_base_idx
     if lds_byte_offset is not None:
-        lds_total_off = lds_total_off + lds_byte_offset
-    lds_addr_i32 = arith.index_cast(T.i32, lds_total_off)
+        lds_total_off += fx.Index(lds_byte_offset)
+    lds_addr_i32 = fx.Int32(lds_total_off)
 
     gather_index_bit = 1 if index_size == 32 else 0
     g0_pred = 1 | (gather_index_bit << 30) | (1 << 31)
-    g0_s0 = arith.constant(g0_pred, type=T.i32)
+    g0_s0 = fx.Int32(g0_pred)
     g0_s1 = lds_addr_i32
 
-    g0_s2 = fx.Uint32(_raw(glb_base_i64))
-    g0_s3 = fx.Uint32(fx.Uint64(_raw(glb_base_i64)) >> 32) | fx.Uint32(1 << 31)
+    g0_s2 = fx.Uint32(glb_base_i64)
+    g0_s3 = fx.Uint32(fx.Uint64(glb_base_i64) >> 32) | fx.Uint32(1 << 31)
     return fx.Vector.from_elements(
-        [
-            as_ir_value(g0_s0),
-            as_ir_value(g0_s1),
-            as_ir_value(g0_s2),
-            as_ir_value(g0_s3),
-        ],
+        [g0_s0, g0_s1, g0_s2, g0_s3],
         fx.Int32,
     ).ir_value()
 
@@ -349,17 +309,17 @@ def tensor_store_gather(
     cache_policy: int = 0,
 ) -> None:
     """Issue one TDM gather store (LDS -> Global) for the descriptor's rows."""
-    dg4 = _raw(_zero_dgroup_v8i32())
+    dg4 = _zero_dgroup_v8i32()
     cache_policy_attr = (
         ir.IntegerAttr.get(ir.IntegerType.get_signless(32), cache_policy)
         if cache_policy
         else None
     )
     rocdl.tensor_store_from_lds(
-        _raw(desc.dgroup0),
-        _raw(desc.dgroup1),
-        _raw(desc.dgroup2),
-        _raw(desc.dgroup3),
+        desc.dgroup0,
+        desc.dgroup1,
+        desc.dgroup2,
+        desc.dgroup3,
         dg4,
         cache_policy=cache_policy_attr,
     )
