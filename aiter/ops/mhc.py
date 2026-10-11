@@ -412,6 +412,29 @@ def _mhc_fused_config_gfx942_80(m, hidden_size, num_cu):
     return splitk, tile_m, tile_n, tile_k
 
 
+def _mhc_fused_config_gfx942_304(m, hidden_size, num_cu):
+    # MI300X (gfx942, 304 CUs). Tuned with op_tests/test_mhc.py (fused post+pre,
+    # --fuse_rmsnorm, bf16) at hidden_size in {4096, 5120, 7168}, m in {1, 4, 64, 256}.
+    # Other hidden sizes and m > 128 keep the generic default (at m=256 the best
+    # config is within 0.6 us/call of it). The m cut-offs at 16 and 128 split the
+    # tuned buckets (4 | 64 | 256).
+    if hidden_size not in (4096, 5120, 7168) or m > 128:
+        return _mhc_fused_config_default(m, hidden_size, num_cu)
+
+    tile_k = 32
+    valid = _mhc_fused_valid_splitk(hidden_size, tile_k, num_cu)
+    if not valid:
+        return _mhc_fused_config_default(m, hidden_size, num_cu)
+    splitk = max(valid)  # deepest K split: hidden_size // (2 * tile_k)
+
+    if m <= 16:  # decode: one 16x16 tile, all the parallelism comes from split-k
+        tile_m, tile_n = 16, 16
+    else:  # small prefill: wider tile_n; tile_m=32 (fn-reuse) wins for hidden > 4096
+        tile_m = 16 if hidden_size <= 4096 else 32
+        tile_n = 32
+    return splitk, tile_m, tile_n, tile_k
+
+
 def _mhc_fused_config_gfx1250_256(m, hidden_size, num_cu):
     """Tuned on the pair (this gemm + the mhc_pre_big_fuse reduction that always
     follows it), not on the gemm alone. The reduction reads (split_k, m, hc_mult3)
@@ -536,6 +559,7 @@ def _mhc_fused_config_default(m, hidden_size, num_cu):
 _MHC_FUSED_POST_PRE_CONFIG = {
     ("gfx950", 256): _mhc_fused_config_gfx950_256,
     ("gfx942", 80): _mhc_fused_config_gfx942_80,
+    ("gfx942", 304): _mhc_fused_config_gfx942_304,
     ("gfx1250", 256): _mhc_fused_config_gfx1250_256,
 }
 
