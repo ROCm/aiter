@@ -203,8 +203,8 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
 # 13.6 MiB for relaying, half of it as bounces on a relay GPU. On gfx950 under
 # graph replay (INT4, hidden 5120), 3/8 is 1.43-1.53x direct at 20-120 MiB,
 # 1.32-1.37x at 5-10 MiB and 1.07-1.24x at 0.5-2.5 MiB, and breaks even near
-# 0.23 MiB. 1/2 is 1-7% slower than 3/8 at 2.5-10 MiB and 1-6% faster from
-# 20 MiB up; 3/8 stays because what 1/2 costs the relay GPUs is unmeasured.
+# 0.23 MiB. 1/2 is 1-7% faster than 3/8 from 20 MiB up, but slows a GEMM
+# on the relay GPUs by 9-11% at 10-80 MiB, where 3/8 costs it 1-6%.
 MESH_RELAY_DEFAULTS = {("xgmi", 2, "gfx950"): (480 << 10, (3, 8))}
 
 # Wire formats the mesh can build.
