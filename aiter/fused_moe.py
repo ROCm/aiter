@@ -3641,6 +3641,20 @@ def get_2stage_cfgs(
     # only when the target FlyDSL kernel accepts the shape and weight layout.
     # Calls with no safe fallback are rejected before the CK-Tile launch.
     cktile_mxfp4_ok = not (cktile_mxfp4_unsafe and flydsl_can_take_over)
+    # gfx942 CK-Tile stage-1 has no swiglu_limit argument. A SwiGLU shape the
+    # a16w4 FlyDSL port can run (inter_dim % 128 == 0, no bias / expert mask)
+    # uses that port, whose epilogue applies the clamp. gfx950 keeps CK-Tile
+    # for 256-aligned inter_dim. Bias and expert-parallel stay on CK-Tile:
+    # the a16w4 port does not implement them.
+    if (
+        get_gfx() == "gfx942"
+        and activation == ActivationType.Swiglu
+        and flydsl_can_take_over
+        and not has_stage1_bias
+        and not has_stage2_bias
+        and not is_ep
+    ):
+        cktile_mxfp4_ok = False
     if (
         gate_mode != GateMode.SEPARATED
         and dtype in [dtypes.bf16, dtypes.fp16]
