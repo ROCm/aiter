@@ -499,6 +499,7 @@ else:
         "einops",
         "psutil",
         "packaging",
+        "safetensors",
         *FLYDSL_REQUIRES,
     ]
 
