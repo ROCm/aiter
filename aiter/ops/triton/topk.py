@@ -52,7 +52,7 @@ def one_stage_topk(
         M=M,
         K=k,
         BLOCK=BLOCK,
-        FILL_VALUE=torch.finfo(torch.float32).min,
+        FILL_VALUE=float("-inf"),
         USE_TDM=is_tdm_avail(),
         num_warps=4,
         num_stages=2,
@@ -98,11 +98,7 @@ def two_stage_topk(x, k, dim=-1, largest=True):
         topk_elem_cnt,
         chunk_size,
         descending,
-        (
-            torch.finfo(torch.float32).min
-            if descending
-            else torch.finfo(torch.float32).max
-        ),
+        float("-inf") if descending else float("inf"),
         USE_TDM=is_tdm_avail(),
     )
     stage2_elem_cnt = chunk_num * k
@@ -118,12 +114,8 @@ def two_stage_topk(x, k, dim=-1, largest=True):
             stage2_elem_cnt,
             BLOCK_SIZE,
             descending,
-            (
-                torch.finfo(torch.float32).min
-                if descending
-                else torch.finfo(torch.float32).max
-            ),
-            torch.iinfo(torch.int32).min,
+            float("-inf") if descending else float("inf"),
+            torch.iinfo(torch.int32).max,
             USE_TDM=is_tdm_avail(),
         )
         if descending
