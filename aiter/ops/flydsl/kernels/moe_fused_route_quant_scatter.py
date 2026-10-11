@@ -62,9 +62,7 @@ from types import SimpleNamespace
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
-from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, T
 from flydsl.runtime.device import get_rocm_arch
@@ -1080,11 +1078,7 @@ def build_moe_fused_route_quant_scatter_module(
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-
-        grid_x = fx.Index(grid_blocks)
+        grid_x = fx.Int64(grid_blocks)
         fused_kernel(
             topk_ids,
             counter,
@@ -1312,8 +1306,8 @@ def build_moe_fused_route_quant_scatter_st_ksplit_module(
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        grid_x = fx.Index(grid_route_blocks)
-        grid_y = fx.Index(k_groups)
+        grid_x = fx.Int64(grid_route_blocks)
+        grid_y = fx.Int64(k_groups)
         fused_kernel(
             topk_ids,
             counter,
@@ -1545,7 +1539,7 @@ def build_moe_fused_quant_preshuffle_module(
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        grid_x = fx.Index(grid_blocks)
+        grid_x = fx.Int64(grid_blocks)
         fused_kernel(
             grouped_in,
             grouped_payload,
@@ -1936,8 +1930,8 @@ def build_moe_fused_quant_preshuffle_route_ksplit_module(
         grid_route_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        grid_x = fx.Index(grid_route_blocks)
-        grid_y = fx.Index(_grid_y_dim)
+        grid_x = fx.Int64(grid_route_blocks)
+        grid_y = fx.Int64(_grid_y_dim)
         fused_kernel(
             grouped_in,
             grouped_payload,
@@ -2304,8 +2298,8 @@ def build_moe_token_multidest_quant_module(
             hidden, grouped_payload, grouped_scale, topids_to_rows, token_num
         ).launch(
             grid=(
-                fx.Index(grid_blocks),
-                fx.Index(ksplit),
+                fx.Int64(grid_blocks),
+                fx.Int64(ksplit),
                 1,
             ),
             block=(BLOCK_THREADS, 1, 1),
@@ -2617,7 +2611,7 @@ def build_moe_token_multidest_compact_quant_module(
             token_num,
             grid_blocks,
         ).launch(
-            grid=(fx.Index(grid_blocks), 1, 1),
+            grid=(fx.Int64(grid_blocks), 1, 1),
             block=(BLOCK_THREADS, 1, 1),
             stream=stream,
         )
@@ -3146,11 +3140,7 @@ def build_moe_fused_route_psum_quant_scatter_module(
         grid_blocks: fx.Int32,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
-        ctx = CompilationContext.get_current()
-        with ir.InsertionPoint(ctx.gpu_module_body):
-            pass
-
-        grid_x = fx.Index(grid_blocks)
+        grid_x = fx.Int64(grid_blocks)
         fused_kernel(
             topk_ids,
             count,

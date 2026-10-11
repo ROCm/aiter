@@ -9,8 +9,8 @@ via per-expert atomicAdd. One thread per route, no host-side argsort.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import arith, const_expr, gpu, ptrtoint, range_constexpr
-from flydsl.expr.typing import Int32, T
+from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr
+from flydsl.expr.typing import Int32
 
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
@@ -208,10 +208,9 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
         max_m: Int32,
         n_buckets: Int32,  # sentinel value == dropped
     ):
-        i32 = T.i32
-        c0 = arith.constant(0, type=i32)
-        c1 = arith.constant(1, type=i32)
-        dropped_row = arith.constant(DROPPED_ROUTE_ROW, type=i32)
+        c0 = fx.Int32(0)
+        c1 = fx.Int32(1)
+        dropped_row = fx.Int32(DROPPED_ROUTE_ROW)
         w_fx = fx.BFloat16 if weight_dtype == "bf16" else fx.Float16
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + fx.Uint32(fx.thread_idx.x)
         # Dynamic EP token count: the dispatch buffer is padded to a static numel
@@ -249,7 +248,7 @@ def build_moe_topids_to_rows_g2l_module(weight_dtype="bf16"):
             # A dropped route that claimed a slot would still cost a grouped GEMM
             # row, and its computed row would alias the bucket-0 route holding
             # that slot -- hence incr 0 plus the sentinel.
-            incr = fx.Int32(is_drop.select(c0, c1))
+            incr = is_drop.select(c0, c1)
             slot = fx.atomic_add(
                 _i32_ptr(atomic_buffer) + eff_e,
                 incr,
@@ -346,11 +345,10 @@ def build_moe_route_g2l_lds_module(weight_dtype="bf16", direct_mask: bool = Fals
         ep_rowmap: fx.Pointer,  # (cap,2) i32 or null; sentinel-filled here
         ep_rowmap_cap: Int32,  # cap_rows_plus1; 0 when ep_rowmap is null
     ):
-        i32 = T.i32
         w_fx = fx.BFloat16 if weight_dtype == "bf16" else fx.Float16
-        c0 = arith.constant(0, type=i32)
-        c1 = arith.constant(1, type=i32)
-        dropped_row = arith.constant(DROPPED_ROUTE_ROW, type=i32)
+        c0 = fx.Int32(0)
+        c1 = fx.Int32(1)
+        dropped_row = fx.Int32(DROPPED_ROUTE_ROW)
         tid = fx.Uint32(fx.thread_idx.x)
         route = fx.Uint32(fx.block_idx.x) * BLOCK_THREADS + tid
 
@@ -635,11 +633,10 @@ def build_moe_route_g2l_fused_module(weight_dtype="bf16"):
         max_m: Int32,
         E: Int32,  # local bucket count / sentinel value
     ):
-        i32 = T.i32
         w_fx = fx.BFloat16 if weight_dtype == "bf16" else fx.Float16
-        c0 = arith.constant(0, type=i32)
-        c1 = arith.constant(1, type=i32)
-        dropped_row = arith.constant(DROPPED_ROUTE_ROW, type=i32)
+        c0 = fx.Int32(0)
+        c1 = fx.Int32(1)
+        dropped_row = fx.Int32(DROPPED_ROUTE_ROW)
         tid = fx.Uint32(fx.thread_idx.x)
         e_count = fx.Uint32(E)
 
