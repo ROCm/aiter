@@ -221,10 +221,32 @@ class StoreC:
 
 
 class Mfma16x16x128:
-    def __init__(self, n_tiles_a, n_tiles_b):
+    """``opsel_b_per_tile`` packs the B-tile scales four to a dword.
+
+    The scale operand is a 32-bit register and ``opsel_b`` names which of its
+    four bytes the instruction reads. So if the four B tiles' ue8m0 bytes are
+    packed into one dword, one load serves all four and the byte select costs
+    nothing -- it is the instruction's own field, not a shift. That needs one
+    atom per tile, since the attribute is baked in at atom construction. CK
+    does the same thing in ``preShuffleScaleBuffer_gfx950``.
+    """
+
+    def __init__(self, n_tiles_a, n_tiles_b, *, opsel_b_per_tile=False):
         self.atom = fx.make_mma_atom(
             fx.rocdl.cdna4.MFMA_Scale(16, 16, 128, fx.Float8E4M3FN)
         )
+        self.atoms_b = [
+            fx.make_mma_atom(
+                fx.rocdl.cdna4.MFMA_Scale(
+                    16,
+                    16,
+                    128,
+                    fx.Float8E4M3FN,
+                    opsel_b=(j if opsel_b_per_tile else 0),
+                )
+            )
+            for j in range_constexpr(n_tiles_b)
+        ]
         self.zero_value = Vec.filled(4, 0.0, fx.Float32)
         self.n_tiles_a = n_tiles_a
         self.n_tiles_b = n_tiles_b
@@ -249,10 +271,25 @@ class Mfma16x16x128:
         fx.gemm(self.atom, c_frag, a_frag, b_frag, c_frag)
         return c_frag.load().ir_value()
 
-    def call(self, a, b, c, *, set_prio=True):
+    def call(self, a, b, c, *, set_prio=True, scale_a=None, scale_b=None):
+        """``scale_a`` / ``scale_b``, when given, are per-tile ue8m0 operands.
+
+        ``v_mfma_scale_f32_16x16x128_f8f6f4`` carries one ue8m0 scale per 32 K
+        per row and gathers the four of them across lanes: lane ``16*s + r``
+        supplies block ``s`` of row ``r`` at op_sel 0. One MFMA therefore
+        consumes a whole K=128 step with its four 32-blocks already dequantised
+        in hardware, so there is no promote arithmetic to schedule.
+
+        Leaving both None keeps the unscaled call byte-for-byte as it was.
+        """
         assert len(a) == self.n_tiles_a
         assert len(b) == self.n_tiles_b
         assert len(c) == self.n_tiles_a * self.n_tiles_b
+        scaled = scale_a is not None
+        assert scaled == (scale_b is not None), "pass both scales or neither"
+        if scaled:
+            assert len(scale_a) == self.n_tiles_a
+            assert len(scale_b) == self.n_tiles_b
 
         a_frags = [
             self._make_operand_frag(a[idx]) for idx in range_constexpr(self.n_tiles_a)
@@ -269,7 +306,18 @@ class Mfma16x16x128:
         for i in range_constexpr(self.n_tiles_a):
             for j in range_constexpr(self.n_tiles_b):
                 cf = c_frags[self.idx(i, j)]
-                fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
+                if const_expr(scaled):
+                    fx.gemm(
+                        self.atoms_b[j],
+                        cf,
+                        a_frags[i],
+                        b_frags[j],
+                        cf,
+                        scale_a=scale_a[i],
+                        scale_b=scale_b[j],
+                    )
+                else:
+                    fx.gemm(self.atom, cf, a_frags[i], b_frags[j], cf)
         if const_expr(set_prio):
             rocdl.s_setprio(0)
             rocdl.s_barrier()
@@ -431,6 +479,14 @@ def compile_fp8_gemm_8w(
         b_g2s.load(b_cur1, B1_gl_offset + 0 * B_K_STEP)
         a_g2s.load(a_cur1, A1_gl_offset + 0 * BLOCK_K)
 
+        # Opens a deliberate half-wave stagger: this gives waves 4-7 one extra
+        # barrier, and since s_barrier is a counting rendezvous, waves 0-3 run
+        # one phase ahead from here on -- which is what the double-buffered
+        # main loop below wants. Do not make it unconditional; that destroys
+        # the stagger without fixing anything (still 3 of 6 runs wrong on
+        # M=32768 N=7168 K=1792 with the old wait count).
+        #
+        # It is never closed, though. See the note before the epilogue.
         if wave_m == 1:
             rocdl.s_barrier()
 
@@ -463,7 +519,9 @@ def compile_fp8_gemm_8w(
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(2 * N_LDS_STEPS_A + N_LDS_STEPS_B)
+            # Letting 2 * A + B loads stay outstanding here crosses the barrier
+            # with LDS writes still in flight that the next iteration reads.
+            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
 
@@ -524,6 +582,20 @@ def compile_fp8_gemm_8w(
         c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
         rocdl.s_setprio(0)
         rocdl.s_barrier()
+
+        # TODO: the half-wave stagger the prologue opened is never closed. The
+        # matching `if wave_m == 0: rocdl.s_barrier()` belongs here, before the
+        # epilogue, so the two halves are level again -- gcnasm closes it at
+        # the same point (opus_gemm_a2a_lsa, quad-subtile template) and so does
+        # mori's fused copy of this pipeline.
+        #
+        # Nothing follows store_c here, so the imbalance is not observable
+        # today and this is left as a note rather than a change. It does not
+        # stay unobservable: with the counts unbalanced, a `wait_barrier(0)`
+        # added after store_c does not mean "every wave's C tile has retired",
+        # it rendezvouses waves 0-3 with waves 4-7 still one barrier back and
+        # before their stores. Anything appended to this epilogue is silently
+        # wrong until the pair is closed.
 
         # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)

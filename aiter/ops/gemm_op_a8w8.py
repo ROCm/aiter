@@ -279,6 +279,32 @@ def gemm_a8w8_mxscale_preshuffle_flydsl(
     )
 
 
+def gemm_a8w8_mxfp8_8wave_flydsl(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Out: Tensor,
+    block_n: int | None = None,
+) -> Tensor:
+    """gfx950 FlyDSL 8-wave mxfp8 (1x32 ue8m0) GEMM.
+
+    A second gfx950 route for the same operand kind as
+    ``gemm_a8w8_mxscale_preshuffle_flydsl``, with a different pipeline and an
+    incompatible scale layout -- the scales must come from
+    ``shuffle_mxfp8_a_scale`` / ``shuffle_mxfp8_b_scale``, not from the
+    blockscale helpers. Not reachable from the tuned dispatch; callers select
+    it explicitly.
+    """
+    if get_gfx() != "gfx950":
+        raise RuntimeError(
+            "gemm_a8w8_mxfp8_8wave_flydsl is only supported on gfx950"
+        )
+    from .flydsl.gemm_a8w8_mxfp8_8wave import flydsl_8wave_gemm_mxfp8
+
+    return flydsl_8wave_gemm_mxfp8(XQ, WQ, x_scale, w_scale, Out, block_n)
+
+
 @compile_ops(
     "module_gemm_a8w8_asm",
     fc_name="gemm_a8w8_asm",
