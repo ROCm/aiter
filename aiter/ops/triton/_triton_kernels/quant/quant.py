@@ -707,8 +707,8 @@ def _dynamic_mxfp4_quant_blockscale_kernel(
 
 # MXFP8 (1x32 e8m0) quant: derives a per-block uint8 e8m0 scale + FP8 e4m3
 # values. The bit-trick (bitcast amax to int32, add 0x200000, mask 0xFF800000,
-# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() - 8
-# is the unbiased e8m0 exponent (dtypeMax = 2**8).
+# bitcast back to fp32) rounds amax up to a power of 2; log2(amax).floor() -
+# LOG2_DTYPE_MAX is the unbiased e8m0 exponent (8 for OCP e4m3fn, 7 for fnuz).
 
 
 @triton.jit
@@ -758,6 +758,7 @@ def _dynamic_mxfp8_quant_kernel(
     BLOCK_SIZE_N: tl.constexpr,  # power-of-2 covering full N
     QUANT_BLOCK_SIZE: tl.constexpr,  # =32
     NUM_PRGMS: tl.constexpr,  # row-loop range (usually =M)
+    LOG2_DTYPE_MAX: tl.constexpr = 8,
 ):
     """
     Per-1x32 MXFP8 quant. One program per row, holding the full row in
@@ -779,7 +780,9 @@ def _dynamic_mxfp8_quant_kernel(
 
         # (BLOCK_SIZE_N,) -> (n_groups, QUANT_BLOCK_SIZE)
         x_2d = tl.reshape(x, (n_groups, QUANT_BLOCK_SIZE))
-        scale_e8m0, quant_scale = _mxfp8_quant_op(x_2d, QUANT_AXIS=1)
+        scale_e8m0, quant_scale = _mxfp8_quant_op(
+            x_2d, QUANT_AXIS=1, LOG2_DTYPE_MAX=LOG2_DTYPE_MAX
+        )
 
         qx_2d = x_2d * quant_scale
         qx = tl.reshape(qx_2d, (BLOCK_SIZE_N,))

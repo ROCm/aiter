@@ -375,7 +375,9 @@ def _moe_gemm_a8w8(
         else:
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
-        if USE_FNUZ:
+        if USE_FNUZ and not is_x_microscaled and not is_w_microscaled:
+            acc += tl.dot(x, w, input_precision="ieee")
+        elif USE_FNUZ:
             # fnuz path (gfx942): manual E8M0→fp32, then tl.dot.
             # x_scales: [BLOCK_M, MX_SCALE_BLOCK_K], w_scales: [BLOCK_N, MX_SCALE_BLOCK_K]
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
@@ -456,7 +458,9 @@ def _moe_gemm_a8w8(
         else:
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
-        if USE_FNUZ:
+        if USE_FNUZ and not is_x_microscaled and not is_w_microscaled:
+            acc += tl.dot(x, w, input_precision="ieee")
+        elif USE_FNUZ:
             a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
             if MX_SCALE_BLOCK_K == 1:
