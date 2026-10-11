@@ -22,7 +22,6 @@ from typing import NamedTuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import CmpFPredicate
@@ -32,7 +31,6 @@ from aiter.ops.flydsl.kernels import buffer_ops
 
 from .fused_compress_attn_common import (
     _NEG_INF,
-    _fexp_f32,
     block_base_bytes_i64,
     emit_group_fp8_nm_asm_scatter,
     state_slot_byte_offset,
@@ -409,28 +407,26 @@ def _build_compress_forward_kernel(
                     kv_k = kv_k_list[i]
                     m_new = fx.max(fx.Float32(m_old), fx.Float32(score_k)).ir_value()
                     is_first = arith.cmpf(CmpFPredicate.OEQ, m_old, c_neg_inf)
-                    scale_active = _fexp_f32(arith.subf(m_old, m_new), c_log2e)
+                    scale_active = fmath.exp2(
+                        (fx.Float32(m_old) - fx.Float32(m_new)) * fx.Float32(c_log2e),
+                        fastmath="afn",
+                    ).ir_value()
                     scale_v = arith.select(is_first, c_zero_f32, scale_active)
-                    wk_active = _fexp_f32(arith.subf(score_k, m_new), c_log2e)
+                    wk_active = fmath.exp2(
+                        (fx.Float32(score_k) - fx.Float32(m_new)) * fx.Float32(c_log2e),
+                        fastmath="afn",
+                    ).ir_value()
                     is_pad_score = arith.cmpf(CmpFPredicate.OEQ, score_k, c_neg_inf)
                     w_k = arith.select(is_pad_score, c_zero_f32, wk_active)
-                    # Explicit fastmath float layer: fx `+`/`*` drop fastmath<fast>
-                    # here (the rocdl-fastmath pass does not re-add it on gfx1250)
-                    # -> ISA drift (fmac vs split add/mul). Kept raw arith.*FOp.
-                    new_kv.append(
-                        arith.AddFOp(
-                            arith.MulFOp(kv_old, scale_v, fastmath=fm_fast).result,
-                            arith.MulFOp(w_k, kv_k, fastmath=fm_fast).result,
-                            fastmath=fm_fast,
-                        ).result
-                    )
-                    new_w.append(
-                        arith.AddFOp(
-                            arith.MulFOp(w_old, scale_v, fastmath=fm_fast).result,
-                            w_k,
-                            fastmath=fm_fast,
-                        ).result
-                    )
+                    with arith.fastmath(fm_fast):
+                        kv_next = fx.Float32(kv_old) * fx.Float32(scale_v) + fx.Float32(
+                            w_k
+                        ) * fx.Float32(kv_k)
+                        w_next = fx.Float32(w_old) * fx.Float32(scale_v) + fx.Float32(
+                            w_k
+                        )
+                        new_kv.append(kv_next.ir_value())
+                        new_w.append(w_next.ir_value())
                     new_m.append(m_new)
                 return new_m, new_kv, new_w
 
@@ -553,7 +549,9 @@ def _build_compress_forward_kernel(
                         kv_w = fx.ptr_load(lds_kv_ptr + idx_w)
                         w_w = fx.ptr_load(lds_w_ptr + idx_w)
                         m_w = m_arr[w]
-                        scale_w = fx.Float32(_fexp_f32((m_w - m_g).ir_value(), c_log2e))
+                        scale_w = fmath.exp2(
+                            (m_w - m_g) * fx.Float32(c_log2e), fastmath="afn"
+                        )
                         kv_sum = kv_sum + kv_w * scale_w
                         w_sum = w_sum + w_w * scale_w
                     rcp_w = fx.Float32(fx.rocdl.rcp(f32, w_sum.ir_value()))
@@ -627,7 +625,9 @@ def _build_compress_forward_kernel(
                 # bs=64 Kernel A 7.4 -> 61us, bs=256 18 -> 345us). Device-scope
                 # visibility comes from the SCOPE_DEV bits on the store above
                 # and the readback below instead.
-                llvm.fence(llvm.AtomicOrdering.release, syncscope="workgroup")
+                fx.memory_fence(
+                    ordering=fx.AtomicOrdering.Release, syncscope="workgroup"
+                )
                 # SCOPE_DEV on the atomic is what makes the election work at
                 # all: gfx12 defaults atomics to CU scope, so without it each
                 # CU counts in its own cached copy and several blocks -- or
