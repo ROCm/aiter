@@ -25,7 +25,18 @@ def load_hip_runtime() -> ctypes.CDLL:
     `libamdhip64.so` symlink lives in the -devel package which need not be on
     LD_LIBRARY_PATH at runtime. Try the plain name first, then versioned
     sonames so it works regardless of which package is present.
+
+    If a HIP runtime is already mapped (torch's), bind to that copy instead.
+    When -devel is on LD_LIBRARY_PATH, the plain name maps a second runtime,
+    and other ctypes HIP users that pick the copy from /proc/self/maps (e.g.
+    SGLang's vattn_asm) can bind the wrong one: their launches on torch
+    streams fail with hipErrorContextIsDestroyed.
     """
+    with open("/proc/self/maps") as f:
+        for line in f:
+            path = line[line.find("/") :].strip().removesuffix(" (deleted)")
+            if "/" in line and os.path.basename(path).startswith("libamdhip64.so"):
+                return ctypes.CDLL(path)
     candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
     last_err = None
     for name in candidates:
