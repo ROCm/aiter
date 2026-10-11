@@ -3,6 +3,7 @@
 
 # user interface
 
+import functools
 import math
 
 import torch
@@ -17,7 +18,7 @@ from .topk import get_topk_scratch_workspace
 def _topk_plain(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
-    topk_out: torch.Tensor,
+    topk_out: torch.Tensor | None,
     topk: int,
     largest: bool = True,
     rowStarts: torch.Tensor = None,
@@ -29,26 +30,33 @@ def _topk_plain(
 
 
 @compile_ops("module_topk_plain")
+def topk_plain_use_mulblocks(
+    numRows: int, stride0: int, k: int, ragged: bool
+) -> bool: ...
+
+
+@compile_ops("module_topk_plain")
 def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
+
+
+@functools.lru_cache(maxsize=1024)
+def _workspace_size(device, rows: int, stride0: int, topk: int) -> int:
+    # A size query costs a call several microseconds. The size depends on
+    # nothing but these; the device is in the key because the radix plan reads
+    # its CU count.
+    return topk_plain_workspace_size(rows, stride0, topk)
 
 
 # Mirrors buffer_load_helpers::MAX_CAPACITY in csrc/kernels/topk_plain_kernels.cu.
 _MAX_CAPACITY = 2048
 
 
-def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
-    """Would a `rowStarts`/`rowEnds` call stay on the batched launcher?
+def _uses_radix(width: int, topk: int) -> bool:
+    """Mirrors `should_use_topk_radix` in csrc/kernels/topk_plain_kernels.cu.
 
-    Mirrors `should_use_topk_radix` in csrc/kernels/topk_plain_kernels.cu, which
-    the variable-length `AdaptiveTopK` consults. When it holds, one batched
-    launch serves every row. When it does not, that overload falls back to a
-    host-side loop calling the single-row selector once per row -- measured at
-    k=16, N=32768, M=16384 as 294918 profiler events per call against 25 for the
-    uniform form, and the cost grows with the row count while this test does not
-    look at the row count at all.
-
-    Exposed so a caller choosing between kernels can avoid that fallback rather
-    than discover it.
+    Both `AdaptiveTopK` overloads consult it to choose between the radix
+    selector and the block-sort fallback, and the two questions below are both
+    really this one.
     """
     if topk <= 1:
         return False
@@ -57,10 +65,41 @@ def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
     return topk * log_k * log_k >= (4.8 * width) / denom
 
 
+def topk_plain_batches_ragged_rows(width: int, topk: int) -> bool:
+    """Would a `rowStarts`/`rowEnds` call stay on the batched launcher?
+
+    When the radix path holds, one batched launch serves every row. When it does
+    not, the variable-length `AdaptiveTopK` falls back to a host-side loop
+    calling the single-row selector once per row -- measured at k=16, N=32768,
+    M=16384 as 294918 profiler events per call against 25 for the uniform form,
+    and the cost grows with the row count while this test does not look at the
+    row count at all.
+
+    Exposed so a caller choosing between kernels can avoid that fallback rather
+    than discover it.
+    """
+    return _uses_radix(width, topk)
+
+
+def topk_plain_values_optional(width: int, topk: int) -> bool:
+    """May `topk_out` be None for this geometry?
+
+    Only the radix path has a build that leaves the selected values unwritten;
+    the block-sort fallback writes them unconditionally. The other two
+    conditions -- fp32, largest-first -- are properties of the call rather than
+    the shape, so a caller doing a half-format or smallest-first selection has
+    to pass a buffer whatever this says.
+
+    Worth asking: writing values a caller discards costs 52us of the 741us
+    `topk_plain` takes at 4096 rows of 131072 at k=2048.
+    """
+    return _uses_radix(width, topk)
+
+
 def topk_plain(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
-    topk_out: torch.Tensor,
+    topk_out: torch.Tensor | None,
     topk: int,
     largest: bool = True,
     rowStarts: torch.Tensor = None,
@@ -74,6 +113,19 @@ def topk_plain(
     cached) here on the Python side via torch's caching allocator and passed into
     the kernel, so the C++ side never allocates device memory itself. Non-fp32
     inputs never reach the radix path, so no workspace is allocated for them.
+
+    `topk_out` may be None where `topk_plain_values_optional` holds; the C++
+    side refuses it elsewhere rather than writing through a null.
+
+    `x` may have any layout. With `stride0 < 0` the row pitch is taken from `x`
+    itself, not assumed to be the width.
+
+    NaN: on the radix path (fp32, `largest=True`, where
+    `topk_plain_values_optional` holds) +nan ranks above +inf, as in
+    `torch.topk`, and a NaN with the sign bit set ranks below -inf, so it is
+    selected only when fewer than `topk` other values exist. The block-sort
+    fallback, which serves every other call, compares scores as floats and
+    gives NaN no defined rank.
     """
     if topk > _MAX_CAPACITY:
         # `AdaptiveTopK` asserts this at its entry, ahead of any dtype branch,
@@ -83,11 +135,29 @@ def topk_plain(
         raise ValueError(
             f"topk={topk} exceeds this kernel's capacity of {_MAX_CAPACITY}"
         )
+    if not x.is_contiguous():
+        # Only the ranged form reads row r at `r * stride0`, and it also sizes
+        # its launch and scratch by `stride0`, so a strided row is read in place
+        # only there, at unit inner stride and a pitch at least the width. The
+        # uniform form reads rows `width` apart and takes no pitch at all; it,
+        # and every other layout, gets the rows densely.
+        ranged = (
+            rowStarts is not None
+            and rowEnds is not None
+            and rowStarts.numel() > 0
+            and rowEnds.numel() > 0
+        )
+        if ranged and x.stride(-1) == 1 and x.stride(0) >= x.shape[-1]:
+            if stride0 < 0:
+                stride0 = x.stride(0)
+        else:
+            x = x.contiguous()
+            stride0 = -1
     workspace = None
     if x.dtype == torch.float32:
         # Mirror the C++ default: stride0 < 0 means a contiguous last dim.
         s0 = stride0 if stride0 >= 0 else x.shape[-1]
-        size = topk_plain_workspace_size(x.shape[0], s0, topk)
+        size = _workspace_size(x.device, x.shape[0], s0, topk)
         workspace = get_topk_scratch_workspace(x.device, size)
     return _topk_plain(
         x,

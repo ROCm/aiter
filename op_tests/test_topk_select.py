@@ -28,6 +28,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import _LDS_CAPACITY_BYTES as LDS_CAPACITY
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.tensor_shim import wave_size_of
+from aiter.ops.topk import _device_arch, _sampled_on_device, _sampled_supports_cached
 from aiter.ops.topk_select import (
     _available,
     topk_select,
@@ -66,7 +67,7 @@ def test_topk_select(m, n, k, tie, deterministic):
     x = torch.randn(m, n, dtype=dtypes.fp32)
     row_lens = torch.full((m,), n, dtype=dtypes.i32)
     ref = run_torch(x, row_lens, k)
-    serving = _available(n, k, wave_size_of(x.device.index), False)
+    serving = _serving(m, n, k, wave_size_of(x.device.index), False, x.device.index)
 
     candidates = {
         "topk_select": lambda: topk_select(x, k, tie=tie, deterministic=deterministic)[
@@ -191,7 +192,33 @@ def test_half_invariants(m, n):
     return failures
 
 
-def _run_single_backend(x, row_lens, k, backend):
+def _serving(rows, width, k, wave, ragged, device):
+    """The backends that serve this shape on this device.
+
+    `_available` plus the row-count half of sampled's predicate, which it cannot
+    ask; off gfx950 that half declines every shape.
+    """
+    served = set(
+        _available(
+            width,
+            k,
+            wave,
+            ragged,
+            True,
+            _sampled_on_device(device),
+            _device_arch(device),
+        )
+    )
+    if "sampled" in served and not _sampled_supports_cached(rows, width, k, device):
+        served.discard("sampled")
+    return frozenset(served)
+
+
+class _NotServed(AssertionError):
+    """The backend asked for does not serve the shape on this device."""
+
+
+def _run_single_backend(x, row_lens, k, backend, end=None, output_idx=None):
     """Call one backend through the entry by hiding the others from it.
 
     Asserts that the entry really used it. It did not, once: the dispatch tail
@@ -212,14 +239,125 @@ def _run_single_backend(x, row_lens, k, backend):
     try:
         rows, width = x.shape
         wave = wave_size_of(x.device.index)
-        served = ts._available(width, k, wave, False) & {backend}
-        picked = ts.topk_select_backend(rows, width, k, served)
+        dev = x.device.index
+        served = _serving(rows, width, k, wave, end is not None, dev) & {backend}
+        if not served:
+            raise _NotServed(
+                f"{backend} does not serve {rows}x{width} k={k} on {get_gfx()}"
+            )
+        picked = ts.topk_select_backend(rows, width, k, served, device=dev)
         if picked != backend:
             raise AssertionError(f"asked for {backend}, the dispatch chose {picked}")
-        return topk_select(x, k)[1]
+        return topk_select(x, k, end=end, output_idx=output_idx)[1]
     finally:
         ts._BACKENDS_BY_TIE = keep
         ts._choose.cache_clear()
+
+
+# One shape per route, each forced onto the backend named.
+_STRIDED_ROUTES = (
+    ("argmax", 8, 4096, 1, dtypes.fp32),
+    ("argmax", 8, 4096, 1, dtypes.bf16),
+    ("small_k", 8, 4096, 16, dtypes.fp32),
+    ("plain", 8, 4096, 2048, dtypes.fp32),  # register copy, 4 per lane
+    ("plain", 64, 8192, 2048, dtypes.fp32),  # register copy, wide first digit
+    ("plain", 8, 16384, 2048, dtypes.fp32),  # LDS tail with the sampled stage
+    ("plain", 8, 32768, 2048, dtypes.fp32),  # LDS tail
+    ("plain", 64, 32768, 512, dtypes.fp32),  # generic radix
+    ("sampled", 64, 32768, 2048, dtypes.fp32),
+    ("stream", 64, 32768, 512, dtypes.fp32),
+    ("stream", 8, 2050, 2048, dtypes.fp32),  # small reject on gfx950
+    ("decode", 4, 32768, 2048, dtypes.fp32),
+)
+
+
+def test_strided_layouts():
+    """Row-strided `input`, `end` and `output_idx` on every route.
+
+    The entry checks their shapes and dtypes and nothing about their strides.
+    `plain` read a column slice of a wider tensor as dense rows, several
+    backends wrote dense rows into a strided `output_idx` or read a strided
+    `end` as dense, and all of them returned plausible tensors.
+    """
+    failures, not_served = [], set()
+    for backend, m, n, k, dtype in _STRIDED_ROUTES:
+        for layout in ("input", "input+end", "output", "end"):
+            torch.manual_seed(0)
+            x = torch.randn(m, n, dtype=dtype)
+            if layout.startswith("input"):
+                x = torch.zeros(m, n + 64, dtype=dtype)[:, :n].copy_(x)
+            ragged = layout in ("input+end", "end")
+            lens = (
+                torch.randint(k, n + 1, (m,), dtype=dtypes.i32)
+                if ragged
+                else torch.full((m,), n, dtype=dtypes.i32)
+            )
+            end = None
+            if ragged:
+                end = (
+                    lens
+                    if layout == "input+end"
+                    else torch.stack([lens, lens], 1)[:, 0]
+                )
+            guard, out = None, None
+            if layout == "output":
+                guard = torch.full((m, k + 32), -7, dtype=dtypes.i32)
+                out = guard[:, :k]
+            label = f"{backend} {m}x{n} k={k} {dtype} strided {layout}"
+            try:
+                idx = _run_single_backend(x, lens, k, backend, end=end, output_idx=out)
+                torch.cuda.synchronize()
+            except _NotServed:
+                # A route this device does not have, e.g. stream at these widths
+                # on gfx942; reported below rather than counted as a failure.
+                not_served.add(f"{backend} {m}x{n} k={k} {layout}")
+                continue
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{label}: {type(e).__name__}: {e}")
+                continue
+            if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+                failures.append(f"{label}: wrong selection")
+            if guard is not None and not (
+                bool((guard[:, k:] == -7).all()) and idx.data_ptr() == out.data_ptr()
+            ):
+                failures.append(f"{label}: not written into output_idx in place")
+    for label in failures:
+        aiter.logger.error("STRIDED LAYOUT FAILED: %s", label)
+    if not_served:
+        aiter.logger.warning(
+            "strided layouts: %d routes not served on %s, skipped: %s",
+            len(not_served),
+            get_gfx(),
+            sorted(not_served),
+        )
+    return failures
+
+
+def test_rejections():
+    """A wrong rank or dtype is refused with the ValueError that names the rule.
+
+    The entry's `sorted` flag keeps DeepSelect's name, so the message has to
+    reach the builtin some other way.
+    """
+    failures = []
+    for shape, dtype in (
+        ((4096,), dtypes.fp32),
+        ((2, 8, 4096), dtypes.fp32),
+        ((8, 4096), dtypes.i32),
+    ):
+        label = f"{shape} {dtype}"
+        try:
+            topk_select(torch.zeros(shape, dtype=dtype), 16)
+        except ValueError as e:
+            if "2-D" not in str(e):
+                failures.append(f"{label}: unexpected message: {e}")
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{label}: {type(e).__name__}: {e}")
+        else:
+            failures.append(f"{label}: accepted")
+    for label in failures:
+        aiter.logger.error("REJECTION FAILED: %s", label)
+    return failures
 
 
 def test_lds_sizing():
@@ -448,6 +586,13 @@ def main():
         default=["none"],
         choices=["none", "low", "high"],
     )
+    parser.add_argument(
+        "--include-large",
+        action="store_true",
+        help="also run fp32 shapes of 4 GiB or more (m * n * 4 >= 2**32),\n"
+        "which the sweep skips by default; each such shape is timed on\n"
+        "every backend that serves it, like any other shape",
+    )
     args = parser.parse_args()
 
     bad = test_lds_sizing()
@@ -463,6 +608,16 @@ def main():
         "half-format invariants: %s",
         "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
     )
+    bad = test_strided_layouts()
+    aiter.logger.info(
+        "strided layouts: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"strided layouts: {len(bad)} failed"
+    bad = test_rejections()
+    aiter.logger.info(
+        "rejections: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"rejections: {len(bad)} failed"
 
     df = [
         test_topk_argmax_half(m, n, dtype)
@@ -476,7 +631,7 @@ def main():
     for tie in args.tie:
         df = []
         for m, n, k in itertools.product(args.rows, args.width, args.topk):
-            if k > n or m * n * 4 >= 2**32:
+            if k > n or (m * n * 4 >= 2**32 and not args.include_large):
                 continue
             df.append(test_topk_select(m, n, k, None if tie == "none" else tie, False))
         df = pd.DataFrame(df)

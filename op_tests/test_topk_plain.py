@@ -88,6 +88,47 @@ def run_topk_case(batch_size, hiddensize, topk, largest, dtype):
     }
 
 
+def test_strided_rows():
+    """Rows that are not dense, through both forms, with stride0 left at -1 and
+    given explicitly: padded rows (a column slice of a wider tensor) and
+    broadcast rows (stride 0). The uniform form takes no row pitch at all, and
+    a padded row used to be read as the start of the next one."""
+    failures = []
+    for m, n, k in ((64, 8192, 2048), (8, 32768, 2048), (64, 4096, 16)):
+        torch.manual_seed(0)
+        x = torch.randn(m, n, dtype=dtypes.fp32)
+        layouts = {
+            "padded": torch.zeros(m, n + 64, dtype=dtypes.fp32)[:, :n].copy_(x),
+            "broadcast": x[:1].expand(m, n),
+        }
+        for name, src in layouts.items():
+            for ranged in (False, True):
+                for stride0 in (-1, src.stride(0)):
+                    if ranged:
+                        lens = torch.randint(k, n + 1, (m,), dtype=dtypes.i32)
+                        starts = torch.zeros(m, dtype=dtypes.i32)
+                        ends = lens
+                    else:
+                        lens = torch.full((m,), n, dtype=dtypes.i32)
+                        starts = ends = torch.tensor([], dtype=dtypes.i32)
+                    ids = torch.full((m, k), -1, dtype=dtypes.i32)
+                    vals = torch.empty(m, k, dtype=dtypes.fp32)
+                    topk_plain(src, ids, vals, k, True, starts, ends, stride0, 1)
+                    masked = src.clone()
+                    for r, e in enumerate(lens.tolist()):
+                        masked[r, e:] = float("-inf")
+                    ref = torch.topk(masked, k, dim=1).values.sort(dim=1).values
+                    got = src.gather(1, ids.long().clamp_min(0)).sort(dim=1).values
+                    if not torch.equal(got, ref):
+                        failures.append(
+                            f"{name} {'ranged' if ranged else 'uniform'} "
+                            f"stride0={stride0} {m}x{n} k={k}"
+                        )
+    for label in failures:
+        aiter.logger.error("STRIDED ROWS FAILED: %s", label)
+    return failures
+
+
 BATCH_SIZES = [3072]
 HIDDENSIZES = [3072, 4096, 8192, 16384, 32768, 65536, 131072]
 TOPKS = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
@@ -95,6 +136,8 @@ largest = True
 
 
 def main():
+    bad = test_strided_rows()
+    assert not bad, f"strided rows: {len(bad)} failed: {bad}"
     rows = []
     for batch_size in BATCH_SIZES:
         for hiddensize in HIDDENSIZES:
