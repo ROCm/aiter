@@ -22,7 +22,11 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DUALWAVE_SWP_BLOCK_M,
 )
 
-__all__ = ["dualwave_splitk_workspace_elems", "flydsl_flash_attn_fp8_func"]
+__all__ = [
+    "dualwave_splitk_workspace_elems",
+    "flydsl_flash_attn_fp8_func",
+    "flydsl_flash_attn_fp8_supported",
+]
 
 # Largest flat element count the fp8 C-ABI can address; see the split below.
 _FP8_MAX_FLAT_ELEMS = 2**31
@@ -83,6 +87,65 @@ def _gpu_arch(device: torch.device) -> str:
 
 def _num_cu(device: torch.device) -> int:
     return _num_cu_cached(device.index)
+
+
+@functools.lru_cache(maxsize=128)
+def _fp8_config_reason(
+    num_heads: int, num_kv_heads: int, head_dim: int, head_dim_v: int
+) -> str | None:
+    if num_heads <= 0 or num_kv_heads <= 0 or num_heads % num_kv_heads:
+        return "num_heads must be positive and divisible by positive num_kv_heads"
+    if head_dim < 64:
+        return "head_dim must be >= 64"
+
+    from .fmha_gfx950.pipeline import _make_dualwave_swp_fp8_traits
+
+    # The runtime may choose either tile as sequence lengths change. Reuse the
+    # builder's layout/LDS checks; constructing traits does not compile a kernel.
+    for block_m in (128, 256):
+        try:
+            _make_dualwave_swp_fp8_traits(
+                num_heads,
+                num_kv_heads,
+                head_dim,
+                6.0,
+                head_dim_v=head_dim_v,
+                block_m=block_m,
+            )
+        except RuntimeError as exc:
+            return str(exc)
+    return None
+
+
+def flydsl_flash_attn_fp8_supported(
+    device: torch.device,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    head_dim_v: int,
+    *,
+    dtype: torch.dtype = torch.float8_e4m3fn,
+) -> bool:
+    """Can FP8 FMHA serve this device and fixed attention configuration?
+
+    Takes metadata so a caller can decide BEFORE quantizing Q/K/V or writing
+    FP8 gather outputs over BF16 workspaces. No allocation, compilation, kernel
+    launch, or device-tensor read. Cache the result while device, dtype and head
+    dimensions stay fixed; varying token counts do not invalidate this check.
+
+    ``dtype`` is the intended quantized Q/K/V dtype, not the source activation
+    dtype. Checks the gfx950 architecture, head grouping, QK/V widths and LDS
+    limits for both automatic tile choices. Per-call argument validation
+    (descales, sequence metadata, buffers and explicit split/tile overrides)
+    remains the responsibility of :func:`flydsl_flash_attn_fp8_func`.
+    """
+    device = torch.device(device)
+    return (
+        device.type == "cuda"
+        and dtype == torch.float8_e4m3fn
+        and _gpu_arch(device) == "gfx950"
+        and _fp8_config_reason(num_heads, num_kv_heads, head_dim, head_dim_v) is None
+    )
 
 
 @functools.lru_cache(maxsize=256)

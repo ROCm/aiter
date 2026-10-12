@@ -401,9 +401,17 @@ def get_flydsl_stage2_v2_kernels(
     for tm in bms:
         for tn in tile_ns:
             for tk in tile_ks:
-                for epilog in ("atomic", "reduce"):
+                epilogs = (
+                    ("atomic", "reduce", "scatter")
+                    if tm == 128
+                    else ("atomic", "reduce")
+                )
+                for epilog in epilogs:
+                    if epilog == "scatter" and out_dtype != "bf16":
+                        continue
                     for use_nt in (True, False):
-                        for persist in persists:
+                        epilog_persists = (False,) if epilog == "scatter" else persists
+                        for persist in epilog_persists:
                             name = build_flydslv2_gemm2_name(
                                 a_dtype,
                                 b_dtype,
@@ -665,8 +673,9 @@ def compile_flydsl_moe_stage1(
             w_dtype=b_dtype,
             w_layout="standard",
             k_wave=k_wave,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
+            # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
+            # fp4 byte-LUT decode, LDS staging) from this arch string.
+            rocm_arch=str(get_rocm_arch()),
         )
     if b_dtype in ("fp4", "fp8"):
         from .kernels.mixed_moe_gemm_2stage import GateMode, compile_mixed_moe_gemm1
@@ -750,8 +759,9 @@ def compile_flydsl_moe_stage2(
             b_cache_mod=b_nt,
             waves_per_eu=waves_per_eu,
             w_dtype=b_dtype,
-            # gfx942 lacks K=32 bf16 MFMA + v_cvt_pk_bf16_f32 -> K=16 fallback.
-            use_k16="gfx95" not in str(get_rocm_arch()),
+            # The kernel derives its gfx942 fallbacks (K=16 MFMA split, bf16 pack,
+            # fp4 byte-LUT decode, atomic epilogue) from this arch string.
+            rocm_arch=str(get_rocm_arch()),
             epilog=("reduce" if b_dtype == "int4" and mode == "reduce" else "atomic"),
             topk=topk,
         )

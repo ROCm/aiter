@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import itertools
 import os
 import random
 
@@ -11,7 +12,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.test_common import benchmark, run_perftest
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
 torch.set_printoptions(sci_mode=False)
@@ -31,11 +32,27 @@ UNI_SEQLEN_QO = 1
 MAX_SPLIT_PER_BATCH = 16
 IS_CAUSAL = True
 
-# Default serving sweep (kimi Makefile / perf_sweep.sh).
-DEFAULT_BATCHES = [4, 8, 16, 32, 64, 128]
+# Default serving sweep (kimi Makefile / perf_sweep.sh), plus the batch counts
+# that only prefill reaches. num_batches is the concurrency for decode, so the
+# kimi row tops out at 128 -- but a DSA prefill chunk carries one batch per query
+# token, which puts --max-num-batched-tokens on this axis instead. Those large
+# counts are where the parallel planner chunks its LDS scratch, and 4096 / 8192 /
+# 16384 sit at one chunk, the old 8191-batch LDS cliff, and several chunks. Below
+# 4096 none of that code runs, so without these rows the default sweep cannot
+# tell a working chunk carry from a broken one.
+DEFAULT_BATCHES = [4, 8, 16, 32, 64, 128, 4096, 8192, 16384]
 DEFAULT_CTX_LENS = [2048, 4096, 8192]
 
 _PARALLEL_ENV = "AITER_MLA_META_USE_PARALLEL"
+# Lowering the planner's chunk ceiling forces the runtime-chunk kernel. A card
+# whose LDS fits the full chunk always gets the folded instantiation, so this is
+# the only way a gfx950 run reaches the path gfx942 takes in production.
+_CHUNK_ENV = "AITER_MLA_META_BATCH_CHUNK"
+# Mirrors MLA_V12_PARALLEL_BATCH_CHUNK; only ever a label in the table.
+MLA_V12_DEFAULT_CHUNK = 4096
+
+# Every card the MLA metadata planner is built and validated for.
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 
 def kimi_nhead(tp: int) -> int:
@@ -175,38 +192,66 @@ def compare_metadata(golden, test):
     """
     details = {}
 
+    def exact(name, g, t, mask=None):
+        # Planner output is indices, not arithmetic: any difference at all is a
+        # divergence, so compare to the bit (rtol=atol=tol_err_ratio=0).
+        details[name] = checkAllclose(
+            g, t, rtol=0, atol=0, tol_err_ratio=0, mask=mask, printLog=False
+        )
+
     wi_g = golden["work_indptr"]
     wi_t = test["work_indptr"]
-    details["work_indptr"] = int((wi_g != wi_t).sum().item())
+    exact("work_indptr", wi_g, wi_t)
 
     num_works = int(wi_g[-1].item())
-    wis_g = golden["work_info_set"][:num_works]
-    wis_t = test["work_info_set"][:num_works]
-    details["work_info_set"] = int((wis_g != wis_t).sum().item())
+    exact(
+        "work_info_set",
+        golden["work_info_set"][:num_works],
+        test["work_info_set"][:num_works],
+    )
 
     ri_g = golden["reduce_indptr"]
     ri_t = test["reduce_indptr"]
-    details["reduce_indptr"] = int((ri_g != ri_t).sum().item())
+    exact("reduce_indptr", ri_g, ri_t)
 
-    # Valid prefixes for the reduce maps, derived from the golden reduce_indptr.
+    # Valid regions for the reduce maps, derived from the golden reduce_indptr.
     steps = ri_g[1:] - ri_g[:-1]
     num_groups = int((steps > 0).sum().item())
     num_partial = int(ri_g[-1].item())
 
-    rfm_g = golden["reduce_final_map"][:num_groups]
-    rfm_t = test["reduce_final_map"][:num_groups]
-    details["reduce_final_map"] = int((rfm_g != rfm_t).sum().item())
+    # reduce_final_map is NOT a packed prefix. Both planners write row i only
+    # when tile i is split, at that tile's own index, so the written rows are
+    # scattered over the whole buffer. Taking the first num_groups rows compared
+    # memory neither planner wrote -- at batch=4096 with --jitter, 207 of those
+    # 218 rows, which is 414 of the elements. Since alloc_outputs() hands each
+    # run a fresh torch.empty buffer, that read whatever the two allocations
+    # happened to hold and reported a mismatch that no kernel produced. A split
+    # tile is exactly one whose reduce_indptr step is positive, so compare those
+    # rows and leave the untouched ones alone.
+    rfm_g = golden["reduce_final_map"].reshape(-1, 2)
+    rfm_t = test["reduce_final_map"].reshape(-1, 2)
+    written = (steps > 0)[: rfm_g.shape[0]].unsqueeze(1)
+    exact("reduce_final_map", rfm_g, rfm_t, mask=written)
 
-    rpm_g = golden["reduce_partial_map"][:num_partial]
-    rpm_t = test["reduce_partial_map"][:num_partial]
-    details["reduce_partial_map"] = int((rpm_g != rpm_t).sum().item())
+    exact(
+        "reduce_partial_map",
+        golden["reduce_partial_map"][:num_partial],
+        test["reduce_partial_map"][:num_partial],
+    )
 
     ok = all(v == 0 for v in details.values())
-    return ok, details, num_works, num_groups
+    return ok, details, num_works, num_groups, num_partial
 
 
 @benchmark()
-def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters):
+def test_metadata(
+    batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_iters, batch_chunk=0
+):
+    if batch_chunk:
+        os.environ[_CHUNK_ENV] = str(batch_chunk)
+    else:
+        os.environ.pop(_CHUNK_ENV, None)
+
     inputs, out_meta, _kv_lens = build_decode_inputs(
         batch_size, ctx_len, dtype, kvtype, nhead, jitter=jitter, seed=seed
     )
@@ -214,38 +259,68 @@ def test_metadata(batch_size, ctx_len, dtype, kvtype, nhead, jitter, seed, num_i
     # Golden (serial planner) vs parallel planner -- must be bit identical.
     golden = run_path(inputs, out_meta, dtype, kvtype, use_parallel=False)
     parallel = run_path(inputs, out_meta, dtype, kvtype, use_parallel=True)
-    ok, mism, num_works, num_groups = compare_metadata(golden, parallel)
+    ok, mism, num_works, num_groups, num_partial = compare_metadata(golden, parallel)
 
     if not ok:
         print(f"  [MISMATCH] bs={batch_size} ctx={ctx_len} nhead={nhead}: {mism}")
 
-    # Microbench both planners.
-    serial_outs = alloc_outputs(out_meta)
-    parallel_outs = alloc_outputs(out_meta)
-
-    os.environ[_PARALLEL_ENV] = "0"
-    _, us_serial = run_perftest(
-        call_metadata, inputs, serial_outs, dtype, kvtype, num_iters=num_iters
+    # The planner does no floating-point at all, so TFLOPS would be a column of
+    # zeros. Bytes are the metric that means something here: it reads three
+    # per-batch indptrs and writes the work/reduce descriptors, and the GB/s
+    # column against a card that does TB/s is the whole diagnosis -- this kernel
+    # is bound by a single-lane scan, not by traffic.
+    wis = golden["work_info_set"]
+    work_bytes = wis.element_size() * (wis[0].numel() if wis.dim() > 1 else 1)
+    nbytes = (
+        3 * (batch_size + 1) * 4  # qo_indptr, kv_indptr, kv_last_page_lens
+        + num_works * work_bytes  # work_info_set
+        + (batch_size + 1) * 4  # reduce_indptr
+        + num_groups * 2 * 4  # reduce_final_map, split tiles only
+        + num_partial * 4  # reduce_partial_map, one entry per partial fragment
     )
-    os.environ[_PARALLEL_ENV] = "1"
-    _, us_parallel = run_perftest(
-        call_metadata, inputs, parallel_outs, dtype, kvtype, num_iters=num_iters
-    )
-    os.environ.pop(_PARALLEL_ENV, None)
 
-    speedup = us_serial / us_parallel if us_parallel > 0 else float("nan")
+    # The serial planner is both the reference and a kernel under test: it is
+    # what runs today whenever the parallel path bails out, so it is timed.
+    candidates = {"serial": "0", "parallel": "1"}
 
-    return {
-        "match": ok,
+    ret = {
+        "gfx": get_gfx(),
+        "chunk": batch_chunk or MLA_V12_DEFAULT_CHUNK,
         "num_works": num_works,
         "num_split_groups": num_groups,
-        "serial_us": round(us_serial, 3),
-        "parallel_us": round(us_parallel, 3),
-        "speedup": round(speedup, 3),
     }
+    us = {}
+    for name, env in candidates.items():
+        os.environ[_PARALLEL_ENV] = env
+        _, us[name] = run_perftest(
+            call_metadata,
+            inputs,
+            alloc_outputs(out_meta),
+            dtype,
+            kvtype,
+            num_iters=num_iters,
+        )
+        ret[f"{name} us"] = round(us[name], 3)
+        ret[f"{name} GB/s"] = round(nbytes / us[name] / 1e3, 2)
+    os.environ.pop(_PARALLEL_ENV, None)
+
+    # Only the parallel path can diverge; serial is the reference it is checked
+    # against, so its err is 0 by construction and would be a noise column.
+    ret["parallel err"] = max(mism.values()) if mism else 0
+    ret["match"] = ok
+    ret["speedup"] = (
+        round(us["serial"] / us["parallel"], 3) if us["parallel"] else float("nan")
+    )
+    return ret
 
 
 def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "mla metadata planner unsupported on %s; skipping", get_gfx()
+        )
+        return
+
     parser = argparse.ArgumentParser(
         description=(
             "MLA metadata planner microbench/correctness test, with shapes "
@@ -269,7 +344,7 @@ def main():
         "-b",
         "--batch",
         type=int,
-        nargs="*",
+        nargs="+",
         default=DEFAULT_BATCHES,
         help="Batch sizes (== serving concurrency).",
     )
@@ -277,7 +352,7 @@ def main():
         "-c",
         "--ctx-len",
         type=int,
-        nargs="*",
+        nargs="+",
         default=DEFAULT_CTX_LENS,
         help="KV context lengths (== serving ISL).",
     )
@@ -285,6 +360,14 @@ def main():
         "--jitter",
         action="store_true",
         help="Randomize per-sequence KV length in [ctx/2, ctx] (decode spread).",
+    )
+    parser.add_argument(
+        "--batch-chunk",
+        type=int,
+        nargs="+",
+        default=[0],
+        help="Planner chunk ceilings to sweep; 0 leaves the built-in one. A value\n"
+        "below it forces the runtime-chunk kernel, which is what gfx942 runs.",
     )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num-iters", type=int, default=101)
@@ -305,38 +388,33 @@ def main():
 
     rows = []
     all_match = True
-    for ctx_len in args.ctx_len:
-        for batch_size in args.batch:
-            row = test_metadata(
-                batch_size,
-                ctx_len,
-                dtype,
-                kvtype,
-                nhead,
-                args.jitter,
-                args.seed,
-                args.num_iters,
-            )
-            rows.append(row)
-            all_match = all_match and row["match"]
+    for batch_chunk, ctx_len, batch_size in itertools.product(
+        args.batch_chunk, args.ctx_len, args.batch
+    ):
+        row = test_metadata(
+            batch_size,
+            ctx_len,
+            dtype,
+            kvtype,
+            nhead,
+            args.jitter,
+            args.seed,
+            args.num_iters,
+            batch_chunk,
+        )
+        rows.append(row)
+        all_match = all_match and row["match"]
 
     df = pd.DataFrame(rows)
-    cols = [
-        "batch_size",
-        "ctx_len",
-        "nhead",
-        "num_works",
-        "num_split_groups",
-        "match",
-        "serial_us",
-        "parallel_us",
-        "speedup",
-    ]
-    cols = [c for c in cols if c in df.columns]
-    print(df[cols].to_string(index=False))
+    aiter.logger.info(
+        "mla metadata planner summary (markdown):\n%s", df.to_markdown(index=False)
+    )
 
+    assert rows, (
+        "the sweep ran no shapes -- an empty axis would otherwise report a pass "
+        "without comparing anything"
+    )
     assert all_match, "parallel MLA metadata planner diverged from serial reference"
-    print("\nAll shapes: parallel planner matches serial reference. ✓")
 
 
 if __name__ == "__main__":

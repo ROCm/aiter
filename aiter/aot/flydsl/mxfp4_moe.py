@@ -183,7 +183,12 @@ def parse_csv(csv_path: str):
                                 "act": p1["act"],
                                 "situ_beta": situ_beta,
                                 "situ_linear_beta": situ_linear_beta,
-                                "swiglu_limit": 7.0,
+                                # The limit is a compile-time closure scalar in
+                                # MXMOE. +inf preserves historical unclamped
+                                # SiLU; SwiGLU retains its default limit of 7.
+                                "swiglu_limit": (
+                                    7.0 if p1["act"] == "swiglu" else float("inf")
+                                ),
                                 "enable_bias": p1["enable_bias"],
                                 "interleave": interleave,
                                 "native_scale_layout": native_scale_layout_for(
@@ -223,7 +228,7 @@ def parse_csv(csv_path: str):
                             "D_INTER": v2_d_inter,
                             "topk": topk,
                             "SBM": v2_g2["sort_block_m"] or bm,
-                            "persist": v2_g2["persist"],
+                            "persist": v2_g2["persist"] or v2_g2["epilog"] == "scatter",
                             "cu_num": int(row.get("cu_num", "0") or "0"),
                             "a_dtype": v2_g2["a_dtype"],
                             "b_dtype": v2_g2["b_dtype"],
@@ -363,7 +368,11 @@ def _compile_v2_stage2(job):
         max_sorted = max(max_sorted, job["cu_num"] * job["BM"])
     is_fp8_route_out = job["epilog"] == "reduce" and job["out_dtype"] == "fp8"
     out = torch.empty((job["BM"], job["N_OUT"]), dtype=torch.bfloat16, device="cpu")
-    if job["epilog"] == "reduce":
+    if job["epilog"] == "scatter":
+        target = torch.empty(
+            (max_sorted, job["N_OUT"]), dtype=torch.bfloat16, device="cpu"
+        )
+    elif job["epilog"] == "reduce":
         if is_fp8_route_out:
             from aiter.ops.flydsl.kernels.mxfp4_gemm_common import fp8out_row_bytes
 
