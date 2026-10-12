@@ -3,6 +3,8 @@
 
 """gfx1250 MLA gather + FlyDSL ptpc projection."""
 
+import functools
+
 import torch
 from torch import Tensor
 
@@ -11,9 +13,23 @@ _KV_PE = 64
 _NOPE = 128
 _V_DIM = 128
 
-_launch_projection = None
-_ptr_arg = None
-_fx = None
+
+@functools.lru_cache(maxsize=1)
+def _projection_runtime():
+    """Import the gfx1250 compiler path only when this specialization runs."""
+    import flydsl.expr as fx
+
+    from .kernels.gather_kv_b_proj_gfx1250 import (
+        launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250,
+    )
+    from .kernels.tensor_shim import ptr_arg
+
+    return launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250, ptr_arg, fx
+
+
+def _cluster_n(m: int, n_heads: int) -> int:
+    """Use A/RoPE multicast only after it amortizes cluster synchronization."""
+    return 4 if m >= 3072 and n_heads >= 96 and n_heads % 4 == 0 else 1
 
 
 def _run_projection(
@@ -26,37 +42,27 @@ def _run_projection(
     v_out: Tensor,
     n_heads: int,
     m: int,
+    cluster_n: int,
 ) -> None:
     """Launch the fixed-width indexed MLA WMMA kernel."""
-    global _launch_projection, _ptr_arg, _fx
-    if _launch_projection is None:
-        import flydsl.expr as fx
-
-        from .kernels.gather_kv_b_proj_gfx1250 import (
-            launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250,
-        )
-        from .kernels.tensor_shim import ptr_arg
-
-        _launch_projection = launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250
-        _ptr_arg = ptr_arg
-        _fx = fx
+    launch_projection, ptr_arg, fx = _projection_runtime()
 
     scale_is_ptr = activation_scale.device.type != "cpu"
     scale_ptr = activation_scale if scale_is_ptr else cache
     args = (
-        _ptr_arg(k_out),
-        _ptr_arg(v_out),
-        _ptr_arg(cache),
-        _ptr_arg(indices),
-        _ptr_arg(weight),
-        _ptr_arg(scale_ptr),
-        _ptr_arg(weight_scale.reshape(-1)),
+        ptr_arg(k_out),
+        ptr_arg(v_out),
+        ptr_arg(cache),
+        ptr_arg(indices),
+        ptr_arg(weight),
+        ptr_arg(scale_ptr),
+        ptr_arg(weight_scale.reshape(-1)),
         cache.shape[0],
         m,
         0.0 if scale_is_ptr else float(activation_scale),
-        _fx.Stream(torch.cuda.current_stream(device=cache.device)),
+        fx.Stream(torch.cuda.current_stream(device=cache.device)),
     )
-    _launch_projection(*args, n_heads, int(scale_is_ptr))
+    launch_projection(*args, n_heads, int(scale_is_ptr), cluster_n)
 
 
 def unsupported_reason(
@@ -166,4 +172,5 @@ def gather_kv_b_proj_flydsl_gfx1250(
         v_prefix,
         k_prefix.shape[1],
         m,
+        cluster_n=_cluster_n(m, k_prefix.shape[1]),
     )
