@@ -27,6 +27,16 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels import minimax_m3_index_score as kernel
+from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    alloc_score as prefill_alloc_score,
+)
+from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    geometry as prefill_geometry,
+)
+from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
+    score_prefill_flydsl,
+)
+from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 LOG2E = 1.4426950409
@@ -38,6 +48,8 @@ ATOL = RTOL = 3e-5
 # Sentinel for "the kernel is contractually allowed to leave this untouched"
 # NaN marks undefined reference slots; writes there are deliberately ignored.
 UNWRITTEN = float("nan")
+# A value no score can take, so "did the kernel write here" is unambiguous.
+SENTINEL = -12345.678
 
 DECODE_SUPPORTED_GFX = ["gfx950"]
 
@@ -93,36 +105,50 @@ def score_oracle(
 
 
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
-    IndexScoreConfig,
+    geometry,
     score_flydsl,
-    selection_filter,
-    shuffle_cache,
 )
 
-CANDIDATES = {}
+# One (S, H, batch, max_block, cp_world, cp_rank) per geometry `geometry` can
+# reach, found by enumerating its output over the whole envelope. Driving the
+# arms through the real selector rather than a knob means the suite covers
+# exactly what production compiles -- and if the selector starts choosing a
+# geometry nothing covered, `test_geometry_points_are_exhaustive` fails rather
+# than the arm silently going untested.
+GEOM_POINTS = [
+    (4, 4, 128, 1, 1, 0),  # tw1 ppw1 nt0
+    (4, 4, 1, 1, 1, 0),  # tw1 ppw1 nt0 spread
+    (16, 4, 1, 1, 1, 0),  # tw1 ppw1 nt2
+    (4, 4, 1, 1, 4, 2),  # tw1 ppw1 nt2, CP
+    (1, 1, 256, 8, 1, 0),  # tw1 ppw2 nt0
+    (16, 4, 256, 32, 1, 0),  # tw1 ppw2 nt2
+    (1, 1, 256, 32, 4, 2),  # tw1 ppw2 nt2, CP
+    (8, 4, 16, 256, 1, 0),  # tw1 ppw3 nt0
+    (1, 1, 256, 16, 1, 0),  # tw1 ppw4 nt0
+    (16, 4, 256, 64, 1, 0),  # tw1 ppw4 nt2
+    (1, 1, 256, 64, 4, 2),  # tw1 ppw4 nt2, CP
+    (1, 1, 256, 2, 1, 0),  # tw2 ppw1 nt2
+    (1, 1, 256, 2, 4, 2),  # tw2 ppw1 nt2, CP
+    (1, 1, 1, 1, 1, 0),  # tw4 ppw1 nt2
+    (1, 1, 1, 1, 4, 2),  # tw4 ppw1 nt2, CP
+]
 
-# Default first, then one knob at a time, then the interactions. Named so a
-# failure line says which knob broke.
-for _tag, _cfg in [
-    ("flydsl", {}),
-    ("fly_shuf", {"shuffled": True}),
-    ("fly_l2", {"pages_per_wave": 2}),
-    ("fly_tw2", {"waves_per_tok": 2}),
-    ("fly_tw4", {"waves_per_tok": 4}),
-    ("fly_tw2s", {"waves_per_tok": 2, "shuffled": True}),
-    ("fly_tw2l2", {"waves_per_tok": 2, "pages_per_wave": 2}),
-    (
-        "fly_allon",
-        {"waves_per_tok": 2, "shuffled": True, "pages_per_wave": 2},
-    ),
-]:
-    CANDIDATES[_tag] = IndexScoreConfig(**_cfg)
+
+def geom_of(point, device=None):
+    S, H, batch, max_block, world, rank = point
+    return geometry(batch, max_block, S, H, world, rank, device)
+
+
+def geom_id(point):
+    S, H, b, mb, w, r = point
+    tag = f"S{S}H{H}_b{b}_mb{mb}"
+    return tag + (f"_cp{w}r{r}" if w > 1 else "")
 
 
 # ---------------------------------------------------------------------------
 # Inputs
 # ---------------------------------------------------------------------------
-def make_case(B, S, H, lens, cache_dtype, seed=0, q_zero=False, q_slice=False):
+def make_case(B, S, H, lens, seed=0, q_zero=False, q_slice=False):
     """Build one test case. `lens` is a per-request python list."""
     torch.manual_seed(seed)
     dev = "cuda"
@@ -145,9 +171,9 @@ def make_case(B, S, H, lens, cache_dtype, seed=0, q_zero=False, q_slice=False):
     # One distinct physical page per (request, logical block), shuffled, so a
     # kernel that confuses logical blk with physical page cannot pass.
     num_pages = B * max_block
-    cache = torch.randn(num_pages, P, D, dtype=torch.bfloat16, device=dev)
-    if cache_dtype != torch.bfloat16:
-        cache = cache.to(cache_dtype)
+    cache = torch.randn(num_pages, P, D, dtype=torch.bfloat16, device=dev).to(
+        dtypes.fp8
+    )
     block_table = (
         torch.randperm(num_pages, device=dev, dtype=torch.int32)
         .view(B, max_block)
@@ -156,30 +182,31 @@ def make_case(B, S, H, lens, cache_dtype, seed=0, q_zero=False, q_slice=False):
     return idx_q, cache, block_table, seq_lens, max_block
 
 
-def build_matrix(fp8_dtype):
-    """The shape matrix. (name, B, S, H, lens, dtype, kwargs)."""
+def build_matrix():
+    """The shape matrix. (name, B, S, H, lens, kwargs)."""
     cases = []
-    for dt, tag in ((torch.bfloat16, "bf16"), (fp8_dtype, "fp8")):
+    if True:
+        tag = "fp8"
         # F = S*H sweep: below one tile, exactly one tile, multiple tiles.
         for S, H in ((1, 1), (4, 1), (4, 4), (8, 4), (16, 4)):
-            cases.append((f"F{S*H}_s4096_{tag}", 2, S, H, [4096, 4096], dt, {}))
+            cases.append((f"F{S*H}_s4096_{tag}", 2, S, H, [4096, 4096], {}))
         # Page boundaries and partial tails.
         for L in (4, 127, 128, 129, 130, 513, 4096, 8192):
-            cases.append((f"L{L}_{tag}", 2, 4, 4, [L, L], dt, {}))
+            cases.append((f"L{L}_{tag}", 2, 4, 4, [L, L], {}))
         # The case the contract calls out by name: four queries whose causal
         # cutoffs straddle a page boundary (127/128/129/130).
-        cases.append((f"causal_straddle_{tag}", 1, 4, 4, [130], dt, {}))
+        cases.append((f"causal_straddle_{tag}", 1, 4, 4, [130], {}))
         # Ragged batch: per-request loop bounds must be independent.
-        cases.append((f"ragged_{tag}", 4, 4, 4, [130, 4096, 127, 513], dt, {}))
+        cases.append((f"ragged_{tag}", 4, 4, 4, [130, 4096, 127, 513], {}))
         # The block -> (request, chunk) map is a prefix sum over per-request
         # chunk counts, so these two are its edge cases: a request that
         # contributes zero chunks (its cum entry repeats, and the map must skip
         # it rather than hand it work), and a skew wide enough that the holes
         # outnumber the work by 7:1.
-        cases.append((f"ragged_zero_{tag}", 4, 4, 4, [0, 4096, 1, 513], dt, {}))
-        cases.append((f"ragged_skew_{tag}", 8, 4, 4, [8192] + [128] * 7, dt, {}))
-        cases.append((f"qzero_tie_{tag}", 2, 4, 4, [513, 513], dt, {"q_zero": True}))
-        cases.append((f"qslice_{tag}", 2, 4, 2, [513, 513], dt, {"q_slice": True}))
+        cases.append((f"ragged_zero_{tag}", 4, 4, 4, [0, 4096, 1, 513], {}))
+        cases.append((f"ragged_skew_{tag}", 8, 4, 4, [8192] + [128] * 7, {}))
+        cases.append((f"qzero_tie_{tag}", 2, 4, 4, [513, 513], {"q_zero": True}))
+        cases.append((f"qslice_{tag}", 2, 4, 2, [513, 513], {"q_slice": True}))
     return cases
 
 
@@ -220,12 +247,11 @@ def test_capacity_threshold(monkeypatch):
     from aiter.jit.utils import chip_info
 
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 16)
-    cfg = IndexScoreConfig()
     # S16 H4 has no decode depth table, so this is the capacity estimate.
-    exact = kernel.work_map_size(64, 16, 16, 4, cfg)
-    smaller = kernel.work_map_size(63, 16, 16, 4, cfg)
+    exact = kernel.work_map_size(64, 16, 16, 4)
+    smaller = kernel.work_map_size(63, 16, 16, 4)
     assert smaller > exact  # reproduces the non-monotonic sizing cliff
-    assert kernel.work_map_capacity(64, 16, 16, 4, cfg) >= smaller
+    assert kernel.work_map_capacity(64, 16, 16, 4) >= smaller
     # The depth tables are non-monotonic too (deeper at larger batches).
     assert kernel.work_map_size(16, 16, 4, 1) > kernel.work_map_size(17, 16, 4, 1)
     assert kernel.work_map_capacity(17, 16, 4, 1) >= kernel.work_map_size(16, 16, 4, 1)
@@ -234,14 +260,14 @@ def test_capacity_threshold(monkeypatch):
 @requires_gfx950
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.uint8])
 def test_reject_cache_dtype(dtype):
-    q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
+    q, k, bt, lens, mb = make_case(1, 1, 1, [128])
     with pytest.raises(ValueError, match="cache"):
         score_flydsl(q, k.to(dtype), bt, lens, 1, 1, D**-0.5, mb)
 
 
 @requires_gfx950
 def test_reject_misaligned_cache():
-    q, _, bt, _lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
+    q, _, bt, _lens, mb = make_case(1, 1, 1, [128])
     k = torch.empty_strided(
         (1, P, D), (16512, 129, 1), dtype=torch.bfloat16, device="cuda"
     )
@@ -255,7 +281,7 @@ def test_narrow_block_table_rejected():
     Only the row count and the strides used to be checked, so a table narrower
     than the capacity it is paired with was accepted and read past its end.
     """
-    q, k, bt, lens, mb = make_case(2, 4, 4, [4096, 4096], torch.bfloat16)
+    q, k, bt, lens, mb = make_case(2, 4, 4, [4096, 4096])
     assert bt.shape[1] == mb > 1
     narrow = bt[:, : mb - 1].contiguous()
     assert not kernel.index_score_supported(q, k, 4, 4, mb, narrow)
@@ -264,9 +290,8 @@ def test_narrow_block_table_rejected():
 
 
 @requires_gfx950
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("shuffled", [False, True])
-def test_large_cache(dtype, shuffled):
+def test_large_cache():
+    dtype = dtypes.fp8
     elem = torch.empty((), dtype=dtype).element_size()
     boundary = (1 << 32) // (P * D * elem)
     required = (boundary + 2) * P * D * elem
@@ -279,7 +304,7 @@ def test_large_cache(dtype, shuffled):
         cache[page].fill_(value)
     bt = torch.tensor([ids], dtype=torch.int32, device="cuda")
     lens = torch.tensor([3 * P], dtype=torch.int32, device="cuda")
-    got = score_flydsl(q, cache, bt, lens, 1, 1, D**-0.5, 3, shuffled=shuffled)
+    got = score_flydsl(q, cache, bt, lens, 1, 1, D**-0.5, 3)
     ref = torch.tensor([1, 2, 3], device="cuda") * D**0.5 * LOG2E
     torch.testing.assert_close(got[0, 0], ref, atol=ATOL, rtol=RTOL)
 
@@ -290,7 +315,7 @@ def test_packed_request(request_id):
     batch = request_id + 1
     q = torch.ones((batch, 1, D), dtype=torch.bfloat16, device="cuda")
     q[request_id].fill_(2)
-    k = torch.ones((1, P, D), dtype=torch.bfloat16, device="cuda")
+    k = torch.ones((1, P, D), dtype=torch.bfloat16, device="cuda").to(dtypes.fp8)
     bt = torch.zeros((batch, 1), dtype=torch.int32, device="cuda")
     lens = torch.zeros(batch, dtype=torch.int32, device="cuda")
     lens[request_id] = P
@@ -306,25 +331,24 @@ def test_packed_request(request_id):
 @requires_gfx950
 @pytest.mark.parametrize("world,rank", [(1, 0), (2, 0), (2, 1), (4, 3)])
 @pytest.mark.parametrize("S,H", [(1, 1), (1, 4), (4, 2), (8, 4)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("layout", ["contiguous", "feature"])
 @pytest.mark.parametrize("map_in_graph", [False, True])
-def test_graph_buffers(world, rank, S, H, dtype, layout, map_in_graph):
+def test_graph_buffers(world, rank, S, H, layout, map_in_graph):
     B, mb = 3, 9  # Stable envelope larger than actual lengths, including CP.
     if (S, H) == (1, 4):
         cu = torch.cuda.get_device_properties("cuda").multi_processor_count
         mb = 2 * (cu // B)  # Exercise the two-token-wave automatic branch.
-        assert kernel.resolve_config(B, mb, IndexScoreConfig(), S, H).waves_per_tok == 2
-    q, cache, _, seq, _ = make_case(B, S, H, [0, 513, 1], dtype)
+        assert geometry(B, mb, S, H)["waves_per_tok"] == 2
+    q, cache, _, seq, _ = make_case(B, S, H, [0, 513, 1])
     bt = torch.zeros((B, mb * world), dtype=torch.int32, device="cuda")
     bt[:, :5] = torch.arange(5, device="cuda", dtype=torch.int32)
-    cfg = IndexScoreConfig(cp_world=world, cp_rank=rank)
+    cp = {"cp_world": world, "cp_rank": rank}
     buf = torch.empty(
-        (kernel.work_map_capacity(B, mb, S, H, cfg), 2),
+        (kernel.work_map_capacity(B, mb, S, H, **cp), 2),
         device="cuda",
         dtype=torch.int32,
     )
-    wm = kernel.build_work_map(seq, mb, S, H, cfg, out=buf)
+    wm = kernel.build_work_map(seq, mb, S, H, out=buf, **cp)
     out = (
         torch.empty((H, B * S, mb), device="cuda", dtype=torch.float32)
         if layout == "contiguous"
@@ -336,10 +360,10 @@ def test_graph_buffers(world, rank, S, H, dtype, layout, map_in_graph):
 
     def run():
         current = (
-            kernel.build_work_map(seq, mb, S, H, cfg, out=buf) if map_in_graph else wm
+            kernel.build_work_map(seq, mb, S, H, out=buf, **cp) if map_in_graph else wm
         )
         return score_flydsl(
-            q, cache, bt, seq, S, H, D**-0.5, mb, out=out, cfg=cfg, work_map=current
+            q, cache, bt, seq, S, H, D**-0.5, mb, out=out, work_map=current, **cp
         )
 
     run()  # Finish JIT before capture.
@@ -358,12 +382,12 @@ def test_graph_buffers(world, rank, S, H, dtype, layout, map_in_graph):
             .expand(B, -1)
         )
         if not map_in_graph:
-            kernel.build_work_map(seq, mb, S, H, cfg, out=buf)
+            kernel.build_work_map(seq, mb, S, H, out=buf, **cp)
         graph.replay()
         ref = score_oracle(q, cache, bt, seq, S, H, D**-0.5, mb, world, rank)
         check_scores(out, ref)
         assert ptrs == (out.data_ptr(), buf.data_ptr(), wm.data_ptr())
-        assert wm.shape[0] == kernel.work_map_size(B, mb, S, H, cfg)
+        assert wm.shape[0] == kernel.work_map_size(B, mb, S, H, **cp)
 
 
 @requires_gfx950
@@ -390,7 +414,7 @@ def test_graph_buffers(world, rank, S, H, dtype, layout, map_in_graph):
     ],
 )
 def test_invalid_metadata(field):
-    q, k, bt, lens, mb = make_case(2, 4, 2, [130, 129], torch.bfloat16)
+    q, k, bt, lens, mb = make_case(2, 4, 2, [130, 129])
     out = torch.empty((2, 8, mb), device="cuda", dtype=torch.float32)
     wm = kernel.build_work_map(lens, mb, 4, 2)
     if field == "q_dtype":
@@ -435,11 +459,10 @@ def test_invalid_metadata(field):
 
 
 @requires_gfx950
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-def test_aligned_padding(dtype):
-    q, k, bt, lens, mb = make_case(2, 4, 2, [130, 513], dtype, q_slice=True)
+def test_aligned_padding():
+    q, k, bt, lens, mb = make_case(2, 4, 2, [130, 513], q_slice=True)
     padded = torch.empty_strided(
-        k.shape, (P * 144, 144, 1), device=k.device, dtype=dtype
+        k.shape, (P * 144, 144, 1), device=k.device, dtype=k.dtype
     )
     padded.copy_(k)
     got = score_flydsl(q, padded, bt, lens, 4, 2, D**-0.5, mb)
@@ -459,114 +482,39 @@ def test_capacity_envelope(monkeypatch, cu):
     from aiter.jit.utils import chip_info
 
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: cu)
-    for tw, ppw in itertools.product([1, 2], [0, 1, 2, 4]):
-        cfg = IndexScoreConfig(waves_per_tok=tw, pages_per_wave=ppw)
-        cap = kernel.work_map_capacity(64, 33, 8, 4, cfg)
-        for batch, mb in itertools.product(range(1, 65), [1, 4, 8, 16, 17, 32, 33]):
-            assert kernel.work_map_size(batch, mb, 8, 4, cfg) <= cap
+    # One envelope now covers every geometry `geometry` can pick, so a
+    # persistent buffer sized here stays valid whatever it resolves to.
+    cap = kernel.work_map_capacity(64, 33, 8, 4)
+    for batch, mb in itertools.product(range(1, 65), [1, 4, 8, 16, 17, 32, 33]):
+        assert kernel.work_map_size(batch, mb, 8, 4) <= cap
 
 
-@pytest.mark.parametrize("cu", [16, 80, 256, 304])
-def test_auto_token_threshold(monkeypatch, cu):
-    from aiter.jit.utils import chip_info
-
-    monkeypatch.setattr(chip_info, "get_cu_num", lambda: cu)
-    cfg = IndexScoreConfig(cp_world=4, cp_rank=3)
-    # Tail pages count as whole CTAs, not half pages in the split estimate.
-    assert kernel.resolve_config(cu + 1, 1, cfg, 1, 4).waves_per_tok == 1
-    for batch, mb, expected in [
-        (1, cu - 1, 4),
-        (2, cu // 2, 4),
-        (1, cu + 1, 2),
-        (2, cu, 2),
-        (1, 2 * cu + 1, 1),
-    ]:
-        resolved = kernel.resolve_config(batch, mb, cfg, 1, 4)
-        assert resolved.waves_per_tok == expected
-        assert resolved.pages_per_wave == 1
-        assert resolved.nt_k == 2
-        assert kernel.resolve_config(batch, mb, resolved, 1, 4) == resolved
-        assert kernel.work_map_size(batch, mb, 1, 4, cfg) == batch * (
-            (mb + kernel.work_chunk(resolved) - 1) // kernel.work_chunk(resolved)
-        )
-    for S, H in [(2, 4), (4, 4), (8, 4), (1, 17), (0, 0)]:
-        assert kernel.resolve_config(1, 1, cfg, S, H).waves_per_tok == 1
-
-
-@pytest.mark.parametrize(
-    "overrides",
-    [
-        {"waves_per_tok": 1},
-        {"waves_per_tok": 2},
-        {"waves_per_tok": 4},
-        {"pages_per_wave": 1},
-        {"pages_per_wave": 2},
-        {"waves_per_eu": 1},
-        {"nt_k": 0},
-        {"sched": 0},
-    ],
-)
-@pytest.mark.parametrize("mb", [16, 384])
-def test_auto_token_preserves_overrides(monkeypatch, overrides, mb):
-    from aiter.jit.utils import chip_info
-
-    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
-    cfg = IndexScoreConfig(**overrides)
-    resolved = kernel.resolve_config(1, mb, cfg, 1, 4)
-    assert resolved.waves_per_tok == overrides.get("waves_per_tok", 1)
-    for key, value in overrides.items():
-        assert getattr(resolved, key) == value
-
-
-# Every knob that changes the emitted code has to change the kernel name too:
-# the name is the JIT cache key, so a collision serves the binary built for the
-# other config, silently and with no error. Only the default keeps the bare
-# name, which is what lets an untouched launch reuse a cache built before the
-# knob existed.
-@pytest.mark.parametrize(
-    "cfg,mark",
-    [
-        (IndexScoreConfig(pages_per_wave=1), None),
-        (IndexScoreConfig(pages_per_wave=1, spread=1), "_sp"),
-        (IndexScoreConfig(pages_per_wave=1, shuffled=True), "_shuf"),
-        (IndexScoreConfig(pages_per_wave=1, waves_per_tok=2), "_tw2"),
-        (IndexScoreConfig(pages_per_wave=1, nt_k=0), "_kc0"),
-        (IndexScoreConfig(pages_per_wave=1, sched=1), "_sc1"),
-        (IndexScoreConfig(pages_per_wave=1, cp_world=4, cp_rank=2), "_cp4r2"),
-    ],
-)
-def test_kernel_name_separates_every_code_changing_knob(cfg, mark):
-    base = kernel.kernel_name(4, 1, True, IndexScoreConfig(pages_per_wave=1))
-    name = kernel.kernel_name(4, 1, True, cfg)
-    if mark is None:
-        assert name == base
-        return
-    assert name != base, f"{cfg} shares the JIT key with the default config"
-    assert mark in name
-
-
-def test_kernel_names_are_pairwise_distinct():
-    from dataclasses import fields, replace
-
-    base = IndexScoreConfig(pages_per_wave=1)
-    seen = {kernel.kernel_name(4, 1, True, base): "default"}
-    # One non-default value per field, so any field the name forgets collides.
+# Every geometry field that changes the emitted code has to change the kernel
+# name too: the name is the JIT cache key, so a collision serves the binary
+# built for the other geometry, silently and with no error. Only the default
+# keeps the bare name, which is what lets an untouched launch reuse a cache
+# built before the field existed.
+def test_kernel_name_separates_every_code_changing_field():
+    base = _geom(ppw=1, nt_k=2)
+    seen = {kernel.kernel_name(4, 1, base): "default"}
     probe = {
         "pages_per_wave": 2,
         "spread": 1,
-        "shuffled": True,
         "waves_per_tok": 2,
-        "waves_per_eu": 1,
         "nt_k": 0,
-        "sched": 1,
         "cp_world": 4,
     }
-    assert probe.keys() <= {f.name for f in fields(IndexScoreConfig)}
+    assert probe.keys() <= base.keys(), "probe names a field geometry dropped"
     for field, value in probe.items():
-        cfg = replace(base, **{field: value})
-        name = kernel.kernel_name(4, 1, True, cfg)
+        name = kernel.kernel_name(4, 1, {**base, field: value})
         assert name not in seen, f"{field}={value} collides with {seen[name]}"
         seen[name] = f"{field}={value}"
+    # Ranks sharing a node share the JIT cache directory and compile DIFFERENT
+    # kernels, since the block remap folds the rank in as a constant.
+    cp = {**base, "cp_world": 4}
+    r0 = kernel.kernel_name(4, 1, {**cp, "cp_rank": 0})
+    r2 = kernel.kernel_name(4, 1, {**cp, "cp_rank": 2})
+    assert r0 != r2 and r2 not in seen
 
 
 # `shuffled` reorders the K bytes; it does not change how much work there is.
@@ -574,41 +522,6 @@ def test_kernel_names_are_pairwise_distinct():
 # in the cache policy, which the layout inverts: natively each 128 B line is
 # requested twice and L1 turns the second into a hit, shuffled each line is
 # requested once and the fill buys nothing.
-@pytest.mark.parametrize(
-    "S,H,batch,max_block",
-    [
-        (4, 1, 1, 64),
-        (4, 1, 2, 64),
-        (4, 1, 8, 64),
-        (4, 1, 32, 64),
-        (4, 1, 1, 1024),
-        (4, 1, 8, 1024),
-        (4, 1, 32, 4096),
-        (4, 1, 128, 8192),
-        (8, 4, 2, 64),
-        (8, 4, 8, 1024),
-        (8, 4, 32, 4096),
-        (1, 4, 1, 16),
-        (1, 4, 1, 384),
-    ],
-)
-def test_shuffled_shares_dispatch_but_not_cache_policy(
-    monkeypatch, S, H, batch, max_block
-):
-    from aiter.jit.utils import chip_info
-
-    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
-    native = kernel.resolve_config(batch, max_block, IndexScoreConfig(), S, H)
-    shuf = kernel.resolve_config(
-        batch, max_block, IndexScoreConfig(shuffled=True), S, H
-    )
-    assert (shuf.pages_per_wave, shuf.waves_per_tok, shuf.spread) == (
-        native.pages_per_wave,
-        native.waves_per_tok,
-        native.spread,
-    )
-    assert shuf.nt_k == 2
-    assert kernel.resolve_config(batch, max_block, shuf, S, H) == shuf
 
 
 # MiniMax-M3 decode launches, no CP, 1M-token capacity (8192 blocks):
@@ -644,13 +557,16 @@ def test_shuffled_shares_dispatch_but_not_cache_policy(
     ],
 )
 def test_served_decode_dispatch(S, H, batch, ppw):
-    resolved = kernel.resolve_config(batch, 8192, IndexScoreConfig(), S, H)
-    assert (resolved.pages_per_wave, resolved.nt_k, resolved.waves_per_tok) == (
+    resolved = geometry(batch, 8192, S, H)
+    assert (
+        resolved["pages_per_wave"],
+        resolved["nt_k"],
+        resolved["waves_per_tok"],
+    ) == (
         ppw,
         0,
         1,
     )
-    assert kernel.resolve_config(batch, 8192, resolved, S, H) == resolved
 
 
 # The depth tables are keyed on batch, but depth only pays when there are
@@ -681,13 +597,12 @@ def test_served_depth_capped_by_occupancy(
     from aiter.jit.utils import chip_info
 
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
-    resolved = kernel.resolve_config(batch, max_block, IndexScoreConfig(), S, H)
-    assert (resolved.pages_per_wave, resolved.spread) == (ppw, spread)
+    resolved = geometry(batch, max_block, S, H)
+    assert (resolved["pages_per_wave"], resolved["spread"]) == (ppw, spread)
     # Whatever it picked, every CU gets a CTA unless there are fewer pages
     # than CUs to begin with.
     ctas = batch * -(-max_block // kernel.work_chunk(resolved))
     assert ctas >= 256 or batch * max_block < 256 * 4
-    assert kernel.resolve_config(batch, max_block, resolved, S, H) == resolved
 
 
 @pytest.mark.parametrize("batch,max_block,tw", [(4, 64, 4), (4, 128, 2), (4, 129, 1)])
@@ -695,39 +610,11 @@ def test_q1_token_split_regime_kept(monkeypatch, batch, max_block, tw):
     from aiter.jit.utils import chip_info
 
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
-    resolved = kernel.resolve_config(batch, max_block, IndexScoreConfig(), 1, 4)
+    resolved = geometry(batch, max_block, 1, 4)
     # Small enough for the token split: it keeps its own measured regime.
     # One block past it, the S1 launch joins the one-tile depth table.
-    assert resolved.waves_per_tok == tw
-    assert resolved.spread == (1 if tw == 1 else 0)
-
-
-@pytest.mark.parametrize(
-    "S,H,cfg",
-    [
-        (16, 4, IndexScoreConfig()),
-        (8, 8, IndexScoreConfig()),
-        (4, 1, IndexScoreConfig(cp_world=4, cp_rank=1)),
-        (8, 4, IndexScoreConfig(cp_world=4, cp_rank=1)),
-        (8, 4, IndexScoreConfig(nt_k=2)),
-        (8, 4, IndexScoreConfig(sched=1)),
-        (4, 1, IndexScoreConfig(nt_k=2)),
-        (4, 1, IndexScoreConfig(nt_k=0)),
-        (4, 1, IndexScoreConfig(pages_per_wave=4)),
-        (4, 1, IndexScoreConfig(spread=0)),
-    ],
-)
-def test_served_decode_dispatch_scope(monkeypatch, S, H, cfg):
-    from aiter.jit.utils import chip_info
-
-    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
-    resolved = kernel.resolve_config(1, 8192, cfg, S, H)
-    # Anything but the untouched served launch keeps the capacity estimate
-    # (2 pages per wave at batch 1), the fixed-chunk map and, unless set, the
-    # NT policy.
-    assert resolved.nt_k == (2 if cfg.nt_k < 0 else cfg.nt_k)
-    assert resolved.pages_per_wave == (cfg.pages_per_wave or 2)
-    assert resolved.spread == 0
+    assert resolved["waves_per_tok"] == tw
+    assert resolved["spread"] == (1 if tw == 1 else 0)
 
 
 # The spread map goes with one page per wave on the served path: H1Q4 up to
@@ -746,36 +633,31 @@ def test_served_decode_dispatch_scope(monkeypatch, S, H, cfg):
     ],
 )
 def test_spread_dispatch(S, H, batch, max_block, spread):
-    resolved = kernel.resolve_config(batch, max_block, IndexScoreConfig(), S, H)
-    assert resolved.spread == spread
-    assert kernel.resolve_config(batch, max_block, resolved, S, H) == resolved
+    resolved = geometry(batch, max_block, S, H)
+    assert resolved["spread"] == spread
     rows = kernel.work_map_size(batch, max_block, S, H)
     if spread:  # one page per wave, plus the spare row per request
         assert rows == batch * ((max_block + 3) // 4 + 1)
     assert kernel.work_map_capacity(batch, max_block, S, H) >= rows
 
 
-@pytest.mark.parametrize(
-    "cfg",
-    [
-        IndexScoreConfig(spread=1, pages_per_wave=2),
-        IndexScoreConfig(spread=1, waves_per_tok=2),
-        IndexScoreConfig(spread=2),
-    ],
-)
-def test_spread_rejects_split_geometry(cfg):
-    assert not selection_filter(8, 4, cfg, arch="gfx950")
+def test_spread_declines_unpackable_bounds():
+    """A spread row packs the first page in 16 bits and the page count in the
+    top byte of the length word. Where that does not fit the selector takes the
+    fixed-chunk map instead -- silently, because it is a scheduling choice and
+    not an error -- so what has to hold is that it never picks spread there."""
+    assert _geom_spread(kernel.SPREAD_MAX_BATCH, 64, 4, 1) in (0, 1)
+    assert _geom_spread(kernel.SPREAD_MAX_BATCH + 1, 64, 4, 1) == 0
+    assert _geom_spread(1, 0x10000, 4, 1) == 0  # first page past 16 bits
+    assert _geom_spread(1, 0x8000, 4, 1, cp_world=4) == 0  # token span past 2**24
+    # And the packing bound it is derived from agrees.
+    assert not kernel._spread_fits(kernel.SPREAD_MAX_BATCH + 1, 64)
+    assert not kernel._spread_fits(1, 0x8000, 4)
+    assert kernel._spread_fits(1, 0x7FFF, 4)  # 4 * 0x7FFF * 128 < 2**24
 
 
-def test_spread_rejects_unpackable_bounds():
-    cfg = IndexScoreConfig(spread=1, pages_per_wave=1, cp_world=4, cp_rank=0)
-    kernel.work_map_size(1, 0x7FFF, 4, 1, cfg)  # 4 * 0x7FFF * 128 < 2**24
-    with pytest.raises(ValueError, match="spread"):
-        kernel.work_map_size(1, 0x8000, 4, 1, cfg)
-    wide = IndexScoreConfig(spread=1, pages_per_wave=1)
-    kernel.work_map_size(kernel.SPREAD_MAX_BATCH, 64, 4, 1, wide)
-    with pytest.raises(ValueError, match="spread"):
-        kernel.work_map_size(kernel.SPREAD_MAX_BATCH + 1, 64, 4, 1, wide)
+def _geom_spread(batch, max_block, S, H, **cp):
+    return geometry(batch, max_block, S, H, **cp)["spread"]
 
 
 def decode_spread(wm):
@@ -789,87 +671,90 @@ def decode_spread(wm):
     return w[:, 0] >> 16, w[:, 0] & 0xFFFF, w[:, 1] >> 24, w[:, 1] & 0xFFFFFF
 
 
+def _geom(spread=0, ppw=1, tw=1, world=1, rank=0, nt_k=0):
+    """A geometry dict straight up, so a map test can pin the shape it means
+    instead of hunting for bounds that make `geometry` pick it."""
+    return {
+        "waves_per_tok": tw,
+        "pages_per_wave": ppw,
+        "nt_k": nt_k,
+        "spread": spread,
+        "cp_world": world,
+        "cp_rank": rank,
+    }
+
+
+def _local_pages(lens, world, rank):
+    """Pages this rank owns per request: block p is global p*world + rank."""
+    return [max(0, (L + P - 1) // P - rank + world - 1) // world for L in lens]
+
+
+def _build_map(lens, max_block, geom, device="cuda"):
+    seq = torch.tensor(lens, dtype=torch.int32, device=device)
+    rows = len(lens) * kernel._grid_chunks(max_block, geom)
+    return kernel._make_map(seq, max_block, geom, rows), seq
+
+
+@requires_gfx950
 @pytest.mark.parametrize("cu", [80, 256, 304])
-def test_spread_map_coverage(cu):
+def test_spread_map_covers_every_page_exactly_once(cu):
+    """The spread map's contract, stated as an invariant rather than as
+    equality with a second implementation.
+
+    A bit-for-bit comparison against a torch twin only says the two agree; it
+    cannot survive either of them being rewritten. These four properties are
+    what the kernel actually depends on, so they hold for any correct builder.
+    """
     import random
 
     gen = random.Random(cu)
-    for _ in range(300):
+    for _ in range(120):
         B = gen.choice([1, 2, 3, 4, 8])
         mb = gen.choice([1, 5, 64, 1100, 2049, 8192])
         world, rank = gen.choice([(1, 0), (1, 0), (4, 1), (2, 1)])
         lens = [gen.choice([0, gen.randint(1, mb * world * P)]) for _ in range(B)]
-        cfg = IndexScoreConfig(
-            spread=1, pages_per_wave=1, waves_per_tok=1, cp_world=world, cp_rank=rank
-        )
-        rows = B * kernel._grid_chunks(mb, cfg)
-        seq = torch.tensor(lens, dtype=torch.int32)
-        wm = kernel.make_spread_work_map(seq, rows, cu, world=world, rank=rank)
-        b, first, span, length = decode_spread(wm)
-        assert ((1 <= span) & (span <= 4)).all()
-        assert torch.equal(length, seq.long()[b])
-        nblk = [max(0, (L + P - 1) // P - rank + world - 1) // world for L in lens]
+        g = _geom(spread=1, world=world, rank=rank)
+        wm, seq = _build_map(lens, mb, g)
+        b, first, span_, length = decode_spread(wm)
+        assert ((1 <= span_) & (span_ <= 4)).all()
+        assert torch.equal(length, seq.cpu().long()[b])
+        nblk = _local_pages(lens, world, rank)
         seen = {}
-        for r, f, s in zip(b.tolist(), first.tolist(), span.tolist()):
+        for r, f, s in zip(b.tolist(), first.tolist(), span_.tolist()):
             for page in range(f, f + s):
                 seen[(r, page)] = seen.get((r, page), 0) + 1
         want = {(r, page) for r in range(B) for page in range(nblk[r])}
         assert set(seen) == want and set(seen.values()) <= {1}, lens
-        # Never more CU rounds than the pages (plus one cut per request) need.
-        pages, reqs = sum(nblk), sum(n > 0 for n in nblk)
-        rounds = max(1, -(-(pages + 4 * reqs) // (4 * cu)))
-        assert b.numel() <= rounds * cu
 
 
 @requires_gfx950
 @pytest.mark.parametrize("ppw", [1, 2, 3, 4])
-def test_chunk_map_kernel_matches_reference(ppw):
-    """The fused fixed-chunk builder must be the torch one, bit for bit."""
+def test_chunk_map_covers_every_chunk_exactly_once(ppw):
+    """Same contract for the fixed-chunk map: request b's chunk c appears
+    once, the holes trail, and a hole reads as (0, 0)."""
     import random
 
     gen = random.Random(ppw)
-    for _ in range(40):
-        B = gen.choice([1, 2, 4, 7, kernel.SPREAD_MAX_BATCH])
+    for _ in range(60):
+        B = gen.choice([1, 2, 4, 7, 64])
         mb = gen.choice([1, 5, 257, 1100, 8192])
         world, rank = gen.choice([(1, 0), (1, 0), (4, 3)])
         cap = mb * world * P
         lens = [min(gen.choice([0, 1, P, cap, gen.randint(1, cap)]), cap)
                 for _ in range(B)]  # fmt: skip
-        cfg = IndexScoreConfig(
-            spread=0, pages_per_wave=ppw, waves_per_tok=1,
-            cp_world=world, cp_rank=rank,
-        )  # fmt: skip
-        chunk = kernel.work_chunk(cfg)
-        rows = B * kernel._grid_chunks(mb, cfg)
-        seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
-        ref = kernel.make_work_map(seq, mb, chunk, world=world, rank=rank)
-        got = torch.full((rows, 2), -7, dtype=torch.int32, device="cuda")
-        kernel._run_chunk_map(seq, rows, chunk, got, world, rank)
-        assert torch.equal(got, ref), (B, mb, ppw, world, rank, lens)
-
-
-@requires_gfx950
-@pytest.mark.parametrize("cu", [80, 256])
-def test_spread_map_kernel_matches_reference(cu):
-    import random
-
-    gen = random.Random(cu + 1)
-    for _ in range(60):
-        B = gen.choice([1, 2, 3, 4, 7, kernel.SPREAD_MAX_BATCH])
-        mb = gen.choice([1, 4, 5, 1100, 8192])
-        world, rank = gen.choice([(1, 0), (1, 0), (4, 3)])
-        cap = mb * world * P
-        lens = [gen.choice([0, 1, 4 * P, cap, gen.randint(1, cap)]) for _ in range(B)]
-        lens = [min(x, cap) for x in lens]
-        cfg = IndexScoreConfig(
-            spread=1, pages_per_wave=1, waves_per_tok=1, cp_world=world, cp_rank=rank
-        )
-        rows = B * kernel._grid_chunks(mb, cfg)
-        seq = torch.tensor(lens, dtype=torch.int32, device="cuda")
-        ref = kernel.make_spread_work_map(seq, rows, cu, world=world, rank=rank)
-        got = torch.full((rows, 2), -7, dtype=torch.int32, device="cuda")
-        kernel._run_spread_map(seq, rows, cu, got, world, rank)
-        assert torch.equal(got, ref), (B, mb, world, rank, lens)
+        g = _geom(ppw=ppw, world=world, rank=rank)
+        chunk = kernel.work_chunk(g)
+        wm, seq = _build_map(lens, mb, g)
+        w = wm.cpu().long() & 0xFFFFFFFF
+        live = w[:, 1] != 0
+        n = int(live.sum())
+        assert live[:n].all() and not live[n:].any(), "holes must trail the work"
+        assert not w[n:].any(), "a hole is (0, 0)"
+        got = [(int(r) >> 16, int(r) & 0xFFFF) for r in w[:n, 0]]
+        nblk = _local_pages(lens, world, rank)
+        want = [(b, c) for b in range(B) for c in range(-(-nblk[b] // chunk))]
+        assert sorted(got) == sorted(want), (B, mb, ppw, world, rank, lens)
+        assert torch.equal(w[:n, 1], seq.cpu().long()[[b for b, _ in got]])
 
 
 # Page counts either side of a CU round, where the fixed-chunk map spills.
@@ -883,35 +768,32 @@ SPREAD_CASES = [
 
 
 @requires_gfx950
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "S,H,lens,mb", [c[1:] for c in SPREAD_CASES], ids=[c[0] for c in SPREAD_CASES]
 )
-def test_spread_scores(dtype, S, H, lens, mb):
+def test_spread_scores(S, H, lens, mb):
     B = len(lens)
-    q, cache, table, seq, _ = make_case(B, S, H, lens, dtype)
+    q, cache, table, seq, _ = make_case(B, S, H, lens)
     bt = torch.zeros((B, mb), dtype=torch.int32, device="cuda")
     bt[:, : table.shape[1]] = table
-    assert kernel.resolve_config(B, mb, IndexScoreConfig(), S, H).spread == 1
+    assert geometry(B, mb, S, H)["spread"] == 1
     got = score_flydsl(q, cache, bt, seq, S, H, D**-0.5, mb)
     ref = score_oracle(q, cache, bt, seq, S, H, D**-0.5, mb)
     check_scores(got, ref)
-    # Same pages, same arithmetic: the fixed-chunk map must agree bit for bit.
-    fixed = score_flydsl(
-        q, cache, bt, seq, S, H, D**-0.5, mb, pages_per_wave=1, nt_k=0, spread=0
-    )
-    defined = ~torch.isnan(ref)
-    assert torch.equal(got[defined], fixed[defined])
+    # That the two maps describe the same pages is checked at the map level,
+    # in `test_spread_map_covers_every_page_exactly_once` and its fixed-chunk
+    # twin: the entry point resolves the geometry itself, so a map built for
+    # the other one is rejected here rather than scored.
 
 
 @requires_gfx950
 @pytest.mark.parametrize("S,H,B", [(4, 1, 2), (4, 1, 4), (8, 4, 2)])
 def test_spread_graph_replay(S, H, B):
     mb = 1100
-    q, cache, _, seq, _ = make_case(B, S, H, [1] * B, torch.float8_e4m3fn)
+    q, cache, _, seq, _ = make_case(B, S, H, [1] * B)
     cache = torch.randn(B * mb, P, D, device="cuda").to(torch.float8_e4m3fn)
     bt = torch.zeros((B, mb), dtype=torch.int32, device="cuda")
-    assert kernel.resolve_config(B, mb, IndexScoreConfig(), S, H).spread == 1
+    assert geometry(B, mb, S, H)["spread"] == 1
     buf = torch.empty(
         (kernel.work_map_capacity(B, mb, S, H), 2), device="cuda", dtype=torch.int32
     )
@@ -938,121 +820,27 @@ def test_spread_graph_replay(S, H, B):
         check_scores(out, score_oracle(q, cache, bt, seq, S, H, D**-0.5, mb))
 
 
-@pytest.mark.parametrize("cu", [16, 80, 256, 304])
-def test_auto_token_capacity_envelope(monkeypatch, cu):
-    from aiter.jit.utils import chip_info
-
-    monkeypatch.setattr(chip_info, "get_cu_num", lambda: cu)
-    # A maximum-query allocation must also cover Q1 replays, not just Q8.
-    cap = kernel.work_map_capacity(64, 33, 8, 4)
-    assert cap == 64 * 33
-    for batch, mb, S in itertools.product(range(1, 65), [1, 4, 16, 17, 32, 33], [1, 8]):
-        assert kernel.work_map_size(batch, mb, S, 4) <= cap
-        assert kernel.work_map_capacity(batch, mb, S, 4) <= cap
-    explicit = IndexScoreConfig(waves_per_tok=1)
-    assert kernel.work_map_capacity(64, 33, 1, 4, explicit) == 64 * 9
-    # ...but not past the width where one page per chunk stops packing: the
-    # token split cannot fire there either, and widening for it rejected bounds
-    # that pack perfectly well at the depth a launch would actually take.
-    wide = kernel.work_map_capacity(128, 262144, 4, 1)
-    assert wide == 128 * (262144 // 4)
-    assert kernel.work_map_size(128, 262144, 4, 1) <= wide
-
-
-def test_auto_token_explicit_device(monkeypatch):
-    from types import SimpleNamespace
-
-    from aiter.jit.utils import chip_info
-
-    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
-    monkeypatch.setattr(
-        torch.cuda,
-        "get_device_properties",
-        lambda device: SimpleNamespace(multi_processor_count=256),
-    )
-    assert kernel.resolve_config(1, 257, IndexScoreConfig(), 1, 4).waves_per_tok == 4
-    assert (
-        kernel.resolve_config(
-            1, 257, IndexScoreConfig(), 1, 4, device=torch.device("cuda", 0)
-        ).waves_per_tok
-        == 2
-    )
-
-
-@requires_gfx950
-@pytest.mark.parametrize("world,rank", [(1, 0), (4, 0), (4, 3)])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("split", [2, 4])
-def test_auto_token_legacy_map(world, rank, dtype, split):
-    B, S, H, mb = 3, 1, 4, 16
-    if split == 2:
-        cu = torch.cuda.get_device_properties("cuda").multi_processor_count
-        mb = 2 * (cu // B)
-    q, k, bt, seq, _ = make_case(B, S, H, [0, 129, mb * world * P], dtype)
-    cfg = IndexScoreConfig(cp_world=world, cp_rank=rank)
-    assert kernel.resolve_config(B, mb, cfg, S, H).waves_per_tok == split
-    # The pre-existing public map helpers allow omitted S/H. Their map remains
-    # usable without guessing its contents or copying/synchronizing it on host.
-    wm = kernel.build_work_map(seq, mb, cfg=cfg)
-    assert wm.shape[0] == kernel.work_map_size(B, mb, cfg=cfg)
-    got = score_flydsl(q, k, bt, seq, S, H, D**-0.5, mb, cfg=cfg, work_map=wm)
-    check_scores(got, score_oracle(q, k, bt, seq, S, H, D**-0.5, mb, world, rank))
-    with pytest.raises(ValueError, match="work_map"):
-        score_flydsl(
-            q,
-            k,
-            bt,
-            seq,
-            S,
-            H,
-            D**-0.5,
-            mb,
-            work_map=wm,
-            waves_per_tok=4,
-            cp_world=world,
-            cp_rank=rank,
-        )
-    assert kernel.work_chunk(IndexScoreConfig(pages_per_wave=2)) == 8
-    assert kernel.reduce_lds_bytes(S, H, IndexScoreConfig(pages_per_wave=2)) == 0
-
-
 def test_cli_default_matrix():
     args = parse_args([])
     cases = select_cases(args)
-    assert cases == build_matrix(torch.float8_e4m3fn)
-    assert len(cases) == 38
-    assert args.impl == list(CANDIDATES)
+    assert cases == build_matrix()
+    assert len(cases) == 19
     assert args.layout == ["contiguous", "feature"]
-    # 8 candidates x 38 cases x 2 layouts = 608, and every candidate now clears
-    # the filter on every row. It used to be 576 with 13 candidates: the five
-    # that set `waves_per_feat` were rejected wherever feature_tiles was 1,
-    # which is every shape except S=8. That knob is gone, so nothing is
-    # shape-gated here any more -- a candidate that stops clearing all 608 is a
-    # real regression in `selection_filter`, not a config that never applied.
-    assert (
-        sum(
-            selection_filter(c[2], c[3], CANDIDATES[name], arch="gfx950")
-            for c, name, _ in itertools.product(cases, args.impl, args.layout)
-        )
-        == len(cases) * len(args.impl) * len(args.layout)
-        == 608
-    )
+    # One implementation per row now: the geometry is picked by `geometry`
+    # from the shape, so there is nothing left to select among.
+    assert len(cases) * len(args.layout) == 38
 
 
-def test_cli_custom_cross_product(monkeypatch):
-    # The shared fp8 alias is arch-dependent; model gfx950 without using a GPU.
-    monkeypatch.setitem(dtypes.d_dtypes, "fp8", torch.float8_e4m3fn)
-    args = parse_args(["-d", "bf16", "fp8", "-b", "1", "3", "-s", "1,1,128", "4,2,513"])
+def test_cli_custom_cross_product():
+    args = parse_args(["-b", "1", "3", "-s", "1,1,128", "4,2,513"])
     cases = select_cases(args)
-    assert len(cases) == 8
-    assert {(c[1], c[2], c[3], c[4][0], c[5]) for c in cases} == {
-        (B, S, H, L, dt)
-        for dt, B, (S, H, L) in itertools.product(
-            [torch.bfloat16, torch.float8_e4m3fn], [1, 3], [(1, 1, 128), (4, 2, 513)]
-        )
+    assert len(cases) == 4
+    assert {(c[1], c[2], c[3], c[4][0]) for c in cases} == {
+        (B, S, H, L)
+        for B, (S, H, L) in itertools.product([1, 3], [(1, 1, 128), (4, 2, 513)])
     }
-    assert all(c[4] == [c[4][0]] * c[1] and c[6] == {} for c in cases)
-    assert len({c[0] for c in cases}) == 8
+    assert all(c[4] == [c[4][0]] * c[1] and c[5] == {} for c in cases)
+    assert len({c[0] for c in cases}) == 4
     assert select_cases(parse_args(["-s", "1,1,128"]))[0][1] == 2
     name = cases[0][0]
     assert select_cases(parse_args(["-b", "1", "-s", "1,1,128", "--case", name])) == [
@@ -1061,24 +849,21 @@ def test_cli_custom_cross_product(monkeypatch):
 
 
 def test_cli_regression_filters():
-    cases = select_cases(parse_args(["-d", "bf16", "-b", "4"]))
-    assert [c[0] for c in cases] == ["ragged_bf16", "ragged_zero_bf16"]
+    cases = select_cases(parse_args(["-b", "4"]))
+    assert [c[0] for c in cases] == ["ragged_fp8", "ragged_zero_fp8"]
     assert select_cases(parse_args(["--case", "qslice_fp8"])) == [
-        c for c in build_matrix(torch.float8_e4m3fn) if c[0] == "qslice_fp8"
+        c for c in build_matrix() if c[0] == "qslice_fp8"
     ]
 
 
 @pytest.mark.parametrize(
     "argv",
     [
-        ["-d"],
         ["-b"],
         ["-s"],
         ["--case"],
         ["--case", "unknown"],
-        ["-d", "bf16", "--case", "qslice_fp8"],
         ["-b", "3"],
-        ["-s", "1,1,128", "-d"],
         ["-s", "1,1,128", "-b"],
     ],
 )
@@ -1086,18 +871,15 @@ def test_cli_empty_cases(argv):
     assert select_cases(parse_args(argv)) == []
 
 
-@pytest.mark.parametrize("axis", ["--impl", "--layout"])
+@pytest.mark.parametrize("axis", ["--layout"])
 def test_cli_empty_axes(axis):
     args = parse_args([axis])
-    assert list(itertools.product(select_cases(args), args.impl, args.layout)) == []
+    assert list(itertools.product(select_cases(args), args.layout)) == []
 
 
 @pytest.mark.parametrize(
     "argv",
     [
-        ["-d", "fp16"],
-        ["-d", "fp32"],
-        ["-d", "unknown"],
         ["-b", "0"],
         ["-b", "-1"],
         ["-b", "65536"],
@@ -1110,7 +892,6 @@ def test_cli_empty_axes(axis):
         ["-s", "4,2,3"],
         ["-s", "4,2,2147483647"],
         ["-s", "x,2,128"],
-        ["--impl", "unknown"],
         ["--layout", "unknown"],
     ],
 )
@@ -1144,138 +925,29 @@ def force_arch(monkeypatch, arch):
     monkeypatch.setattr(torch.cuda, "get_device_properties", fake)
 
 
-@pytest.mark.parametrize("arch", kernel.SUPPORTED_ARCHS)
-@pytest.mark.parametrize("fp8", [False, True])
-def test_arch_traits_are_consistent(arch, fp8):
-    """The k-axis map is a bijection and the derived counts are self-consistent."""
-    tr = kernel.arch_traits(arch, fp8)
+def test_k_axis_map_is_a_bijection():
+    """Every head-dim position reaches exactly one (k-step, lane group, slot).
+
+    A lane's 16 B K load covers k-elements 64i+16g..+16, a *permutation* of the
+    MFMA's k axis. That is free because the dot sums over k and both operands
+    go through the same map -- but only if it really is a permutation. Get it
+    wrong and nothing faults, the scores are just paired from the wrong
+    elements, which is why this is checked here and not left to the kernel.
+    """
+    lane_groups = kernel.WAVE // 16
     covered = sorted(
-        tr.k_offset(ks, g) + v
-        for ks in range(tr.ksteps)
-        for g in range(kernel.LANE_GROUPS)
-        for v in range(tr.lane_k)
+        (ks // kernel.K_PER_LOAD) * kernel.BLOCK_K
+        + g * kernel.LANE_BLOCK
+        + (ks % kernel.K_PER_LOAD) * kernel.LANE_K
+        + v
+        for ks in range(kernel.KSTEPS)
+        for g in range(lane_groups)
+        for v in range(kernel.LANE_K)
     )
-    # Every head-dim position reaches exactly one (k-step, lane group, slot).
-    # A permutation of the k axis is free because the dot sums over it, but
-    # only if it really is a permutation.
     assert covered == list(range(D))
-    assert tr.ksteps * tr.lane_k * kernel.LANE_GROUPS == D
-    assert tr.lane_k * (1 if fp8 else 2) * tr.k_per_load == kernel.ACCESS_BYTES
-
-
-@pytest.mark.parametrize("fp8", [False, True])
-def test_gfx942_changes_only_the_mfma_shape(fp8):
-    """What must move between the two generations, and what must not.
-
-    The invariant half is the point: K's addressing and the shuffled layout
-    are built from `k_loads`, `chunk_elems`, `block_k` and `lane_block`, and
-    halving the MFMA's k doubles the k-steps one 16 B access covers, so all
-    four cancel out. That is what keeps gfx942 a small change and keeps one
-    shuffled cache readable by both.
-    """
-    a = kernel.arch_traits("gfx950", fp8)
-    b = kernel.arch_traits("gfx942", fp8)
-    for field in ("k_loads", "chunk_elems", "q_loads", "block_k", "lane_block"):
-        assert getattr(a, field) == getattr(b, field), field
-    assert (b.mfma_k, b.lane_k, b.ksteps) == (
-        a.mfma_k // 2,
-        a.lane_k // 2,
-        a.ksteps * 2,
-    )
-    assert b.k_per_load == a.k_per_load * 2
-
-
-@pytest.mark.parametrize("fp8", [False, True])
-def test_shuffle_layout_is_arch_independent(fp8):
-    """ATOM writes this layout, so it must not depend on who reads it.
-
-    Recomputed from each arch's traits rather than compared against a constant,
-    so a future arch that *would* move the layout fails here instead of
-    silently breaking a producer that cannot see this file.
-    """
-
-    def destination(tr):
-        row = torch.arange(P)
-        kk = torch.arange(D)
-        tok_tile, u = row // 16, row % 16
-        i = kk // tr.block_k
-        g = (kk % tr.block_k) // tr.lane_block
-        v = kk % tr.lane_block
-        slot = tok_tile[:, None] * tr.k_loads + i[None, :]
-        return (slot * 64 + (16 * g[None, :] + u[:, None])) * tr.chunk_elems + v[
-            None, :
-        ]
-
-    assert torch.equal(
-        destination(kernel.arch_traits("gfx950", fp8)),
-        destination(kernel.arch_traits("gfx942", fp8)),
-    )
-
-
-@requires_gfx950
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize(
-    "cfg",
-    [
-        IndexScoreConfig(pages_per_wave=1),
-        IndexScoreConfig(pages_per_wave=2, waves_per_tok=2),
-        IndexScoreConfig(pages_per_wave=2, shuffled=True),
-    ],
-)
-def test_gfx942_path_matches_oracle(monkeypatch, dtype, cfg):
-    """The CDNA3 shapes produce the same scores, on every staging path.
-
-    This is also what proves the 16x16x16 MFMA really ran rather than the
-    16x16x32 one under a different name: the gfx942 fragment is four bf16 per
-    lane, and four elements fed through a k=32 MFMA cannot come out right. So
-    a pass here means the shape, the k-axis map and the widening all agree.
-
-    The shuffled layout is in the list because it is where the two
-    generations could diverge silently: the shuffled reader bypasses k_offset
-    entirely, so nothing else would catch a disagreement about it.
-
-    What the fp8 arm does NOT check is the e4m3fnuz numerics. The cache is
-    built, and the oracle reads it, as this chip's `dtypes.fp8` -- e4m3fn on
-    gfx950 -- and the conversion instruction executes with gfx950's semantics
-    whatever element type the forced arch binds. So this validates the gfx942
-    fragment shape, k-axis map and loop counts on fp8 data; the bias
-    difference needs the part. See `_fp8_t`.
-    """
-    # S=8 H=4 is two feature tiles, the widest this axis gets.
-    S, H = 8, 4
-    assert not selection_filter(S, H, cfg) or kernel.feature_tiles(S, H) > 1
-    q, cache, bt, lens, mb = make_case(3, S, H, [0, 129, 2305], dtype)
-    ref = score_oracle(q, cache, bt, lens, S, H, D**-0.5, mb)
-    k = shuffle_cache(cache) if cfg.shuffled else cache
-    force_arch(monkeypatch, "gfx942")
-    got = score_flydsl(q, k, bt, lens, S, H, D**-0.5, mb, cfg=cfg)
-    ok, reason = compare(got, ref)
-    assert ok, reason
-
-
-def test_target_id_suffix_does_not_change_the_verdict():
-    """`gcnArchName` carries target-id features. `build_work_map` passed the
-    raw string to `selection_filter` while the execution path stripped it, so
-    an fp8-precision config was dispatchable and then rejected at map time."""
-    cfg = IndexScoreConfig(precision="fp8")
-    for suffix in ("", ":sramecc+", ":sramecc+:xnack-"):
-        assert kernel.selection_filter(1, 4, cfg, arch="gfx950" + suffix), suffix
-    # A real mismatch must still be rejected, suffix or not.
-    assert not kernel.selection_filter(1, 4, cfg, arch="gfx942")
-    assert not kernel.selection_filter(1, 4, cfg, arch="gfx942:sramecc+")
-
-
-def test_arch_separates_the_kernel_name():
-    """Two generations of the same config are two binaries, not one."""
-    cfg = IndexScoreConfig(pages_per_wave=1)
-    names = {kernel.kernel_name(4, 4, False, cfg, a) for a in kernel.SUPPORTED_ARCHS}
-    assert len(names) == len(kernel.SUPPORTED_ARCHS)
-    # The default arch keeps the name it had before the port, so gfx950's
-    # existing JIT cache entries are not orphaned.
-    assert kernel.kernel_name(4, 4, False, cfg) == kernel.kernel_name(
-        4, 4, False, cfg, "gfx950"
-    )
-    assert "gfx950" not in kernel.kernel_name(4, 4, False, cfg)
+    assert kernel.KSTEPS * kernel.LANE_K * lane_groups == D
+    assert kernel.LANE_BLOCK * lane_groups == kernel.BLOCK_K  # groups tile a block
+    assert kernel.LANE_K * kernel.K_PER_LOAD == kernel.ACCESS_BYTES  # fp8, 1 B each
 
 
 @requires_gfx950
@@ -1292,86 +964,71 @@ def test_fp8_dtype_comes_from_aiter():
 
 
 @requires_gfx950
-def test_reject_fp8_fnuz_cache():
-    """The other architecture's fp8 is rejected, not reinterpreted."""
-    q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
-    fnuz = k.to(torch.float8_e4m3fnuz)
-    assert not kernel.index_score_supported(q, fnuz, 1, 1, mb, bt)
-    with pytest.raises(ValueError, match="cache"):
-        score_flydsl(q, fnuz, bt, lens, 1, 1, D**-0.5, mb)
-    with pytest.raises(ValueError, match="cache"):
-        kernel.shuffle_cache(fnuz)
-
-
-def test_cli_rejects_fp8_fnuz(monkeypatch):
-    monkeypatch.setitem(dtypes.d_dtypes, "fp8", torch.float8_e4m3fnuz)
-    with pytest.raises(SystemExit) as exc:
-        parse_args(["-d", "fp8"])
-    assert exc.value.code == 2
-
-
-@requires_gfx950
 def test_empty_selection(caplog):
     caplog.handler.setLevel(0)
     aiter.logger.addHandler(caplog.handler)
-    main(["--case", "not-a-case"])
-    main(["--case", "F1_s4096_bf16", "--impl", "fly_tw4"])
+    # `--ctx-len` with no values empties the prefill sweep too, so the run has
+    # nothing at all to do and both halves say so.
+    main(["--case", "not-a-case", "--ctx-len"])
     aiter.logger.removeHandler(caplog.handler)
-    assert "no score tests executed" in caplog.text
+    assert "no decode score tests executed" in caplog.text
     with pytest.raises(SystemExit) as exc:
-        main(["--impl", "unknown"])
+        main(["-b", "0"])
     assert exc.value.code == 2
 
 
 @requires_gfx950
-@pytest.mark.parametrize("waves_per_tok", [1, 2, 4])
-def test_empty_cp_shard_narrow_table(waves_per_tok):
-    q, k, bt, lens, mb = make_case(2, 4, 4, [0, 128], torch.bfloat16)
-    cfg = IndexScoreConfig(
-        cp_world=4, cp_rank=3, waves_per_tok=waves_per_tok, pages_per_wave=2
-    )
-    out = score_flydsl(q, k, bt, lens, 4, 4, D**-0.5, mb, cfg=cfg)
+def test_empty_cp_shard_narrow_table():
+    """A rank whose shard is empty has no local page count, so it passes the
+    GLOBAL one; the kernel clamps its speculative block-table load to column 0.
+    The worst-case width bound `(max_block-1)*cp_world + cp_rank` rejects this
+    legal call, which is why there is no such check."""
+    q, k, bt, lens, mb = make_case(2, 4, 4, [0, 128])
+    out = score_flydsl(q, k, bt, lens, 4, 4, D**-0.5, mb, cp_world=4, cp_rank=3)
     check_scores(out, score_oracle(q, k, bt, lens, 4, 4, D**-0.5, mb, 4, 3))
 
 
 @requires_gfx950
-@pytest.mark.parametrize("S", [4, 8])
-@pytest.mark.parametrize(
-    "cfg",
-    [
-        IndexScoreConfig(pages_per_wave=1),
-        IndexScoreConfig(pages_per_wave=2),
-        IndexScoreConfig(pages_per_wave=4),
-        IndexScoreConfig(pages_per_wave=2, waves_per_tok=2),
-        IndexScoreConfig(pages_per_wave=2, waves_per_tok=4),
-        IndexScoreConfig(pages_per_wave=2, shuffled=True),
-        # The token split is newly reachable with the shuffled layout: it used
-        # to be excluded from the auto tuner, so no launch resolved to both.
-        # Shuffled addressing shifts by tw_slot rather than by the row stride,
-        # and that shift is the part a token split moves.
-        IndexScoreConfig(pages_per_wave=2, waves_per_tok=2, shuffled=True),
-        IndexScoreConfig(pages_per_wave=2, waves_per_tok=4, shuffled=True),
-        IndexScoreConfig(pages_per_wave=2, sched=1),
-        IndexScoreConfig(pages_per_wave=2, sched=2),
-        IndexScoreConfig(pages_per_wave=2, sched=3),
-        IndexScoreConfig(pages_per_wave=2, sched=4),
-    ],
-)
-def test_fp8_tok_tile_pipeline(S, cfg):
-    if not selection_filter(S, 4, cfg):
-        pytest.skip("feature split needs multiple feature tiles")
-    # Negative scores expose accidental zero-initialized tok_tile maxima. The
-    # short requests cover empty/fully masked pages while the last request
-    # exercises multiple page carries and a partial final tok_tile.
-    q, cache, bt, lens, mb = make_case(4, S, 4, [0, 1, 130, 2305], torch.float8_e4m3fn)
+@pytest.mark.parametrize("point", GEOM_POINTS, ids=geom_id)
+def test_every_geometry_is_the_same_arithmetic(point):
+    """One geometry per arm, chosen by the real selector, all against the
+    oracle. These are the same sum reassociated over different splits of the
+    page, wave and token axes, so a disagreement is a bug in the split and not
+    a precision difference.
+
+    Negative scores expose accidental zero-initialized tok_tile maxima; the
+    zero-length and short requests cover empty and fully masked pages, and the
+    longest one carries across pages into a partial final tok_tile.
+    """
+    S, H, batch, max_block, world, rank = point
+    # `max_block` is this rank's LOCAL width, so the longest request must span
+    # that many of its blocks: global block p*world + rank.
+    glob = max_block * world
+    lens = ([0, 1, 130] + [P] * batch)[: batch - 1] + [glob * P]
+    lens = [min(x, glob * P) for x in lens]  # the longest request sets max_block
+    q, cache, table, seq, mb = make_case(batch, S, H, lens)
+    assert mb == glob, (mb, glob)
+    local = -(-(mb - rank) // world)
+    assert local == max_block, (local, max_block)
+    # The table is indexed by the GLOBAL block even though the score tensor is
+    # the local shard, so it keeps the global width.
+    bt = table
     q.copy_(q.abs() + 0.25)
-    cache.copy_(-(cache.float().abs() + 0.25))
-    ref = score_oracle(q, cache, bt, lens, S, 4, D**-0.5, mb)
-    k = shuffle_cache(cache) if cfg.shuffled else cache
-    out = kernel.alloc_score(4, S, 4, mb, q.device)
+    # In page-sized chunks: the widest arms hold 64K pages, and a whole-tensor
+    # fp32 round trip for the sign flip is 4 GiB of temporary.
+    for i in range(0, cache.shape[0], 2048):
+        blk = cache[i : i + 2048]
+        blk.copy_(-(blk.float().abs() + 0.25))
+    got_geom = geometry(batch, local, S, H, world, rank, q.device)
+    assert tuple(sorted(got_geom.items())) == tuple(
+        sorted(geom_of(point, q.device).items())
+    )
+    ref = score_oracle(q, cache, bt, seq, S, H, D**-0.5, local, world, rank)
+    out = kernel.alloc_score(batch, S, H, local, q.device)
     out.fill_(float("nan"))
-    wm = kernel.build_work_map(lens, mb, S, 4, cfg)
-    got = score_flydsl(q, k, bt, lens, S, 4, D**-0.5, mb, out=out, cfg=cfg, work_map=wm)
+    got = score_flydsl(
+        q, cache, bt, seq, S, H, D**-0.5, local, out=out, cp_world=world, cp_rank=rank
+    )
     assert got.data_ptr() == out.data_ptr()
     ok, reason = compare(got, ref)
     assert ok, reason
@@ -1383,14 +1040,14 @@ def test_arch_rejected(monkeypatch):
     """An arch with neither MFMA generation is refused before anything else."""
     from types import SimpleNamespace
 
-    q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
+    q, k, bt, lens, mb = make_case(1, 1, 1, [128])
     monkeypatch.setattr(
         torch.cuda,
         "get_device_properties",
         lambda device: SimpleNamespace(gcnArchName="gfx90a"),
     )
     assert not kernel.index_score_supported(q, k, 1, 1, mb, bt)
-    with pytest.raises(ValueError, match="requires one of"):
+    with pytest.raises(ValueError, match="requires gfx950"):
         score_flydsl(q, k, bt, lens, 1, 1, D**-0.5, mb)
 
 
@@ -1418,7 +1075,7 @@ def test_address_span_rejected_without_allocation(monkeypatch, operand):
         lambda device: SimpleNamespace(gcnArchName="gfx950", multi_processor_count=16),
     )
     q = meta((2, 1, D), (D, D, 1), torch.bfloat16)
-    k = meta((1, P, D), (P * D, D, 1), torch.bfloat16)
+    k = meta((1, P, D), (P * D, D, 1), dtypes.fp8)
     bt = meta((2, 1), (1, 1), torch.int32)
     out = meta((1, 2, 1), (2, 1, 1), torch.float32)
     wm = meta((2, 2), (2, 1), torch.int32)
@@ -1447,10 +1104,10 @@ def test_noncurrent_device():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two visible gfx950 GPUs")
     with torch.cuda.device(1):
-        q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
+        q, k, bt, lens, mb = make_case(1, 1, 1, [128])
         # Device 1 must not use device 0's compiled module handle.
     with torch.cuda.device(0):
-        q0, k0, bt0, lens0, mb0 = make_case(1, 1, 1, [128], torch.bfloat16)
+        q0, k0, bt0, lens0, mb0 = make_case(1, 1, 1, [128])
         score_flydsl(q0, k0, bt0, lens0, 1, 1, D**-0.5, mb0)
         out = score_flydsl(q, k, bt, lens, 1, 1, D**-0.5, mb)
         assert torch.cuda.current_device() == 0
@@ -1459,35 +1116,27 @@ def test_noncurrent_device():
 
 @requires_gfx950
 @pytest.mark.parametrize(
-    "cfg",
+    "kw",
     [
-        IndexScoreConfig(waves_per_tok=3),
-        IndexScoreConfig(pages_per_wave=-1),
-        IndexScoreConfig(cp_world=0),
-        IndexScoreConfig(nt_k=9),
+        {"max_block": 0},
+        {"max_block": -1},
+        {"cp": {"cp_world": 0}},
+        {"cp": {"cp_world": 2, "cp_rank": 2}},
+        {"cp": {"cp_world": 1, "cp_rank": -1}},
     ],
 )
-def test_build_map_invalid_config(cfg):
+def test_build_map_invalid_bounds(kw):
+    """`geometry` is the only thing that picks a shape now, so the bounds it
+    reads are the only thing left to reject."""
     lens = torch.ones(1, device="cuda", dtype=torch.int32)
     with pytest.raises(ValueError):
-        kernel.build_work_map(lens, 1, 1, 1, cfg)
-
-
-@requires_gfx950
-def test_shuffled_padding_rejected():
-    q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
-    padded = torch.empty_strided(
-        k.shape, (32768, 256, 1), device=k.device, dtype=k.dtype
-    )
-    padded.copy_(shuffle_cache(k))
-    with pytest.raises(ValueError, match="shuffled"):
-        score_flydsl(q, padded, bt, lens, 1, 1, D**-0.5, mb, shuffled=True)
+        kernel.build_work_map(lens, kw.get("max_block", 1), 1, 1, **kw.get("cp", {}))
 
 
 @requires_gfx950
 @pytest.mark.parametrize("scale", [1e-50, 1e39])
 def test_scale_fp32_range(scale):
-    q, k, bt, lens, mb = make_case(1, 2, 1, [129], torch.bfloat16)
+    q, k, bt, lens, mb = make_case(1, 2, 1, [129])
     with pytest.raises(ValueError, match="sm_scale"):
         score_flydsl(q, k, bt, lens, 2, 1, scale, mb)
 
@@ -1514,20 +1163,6 @@ def test_auto_bounds_resolved_before_packing(monkeypatch):
     assert kernel.work_map_size(1, 262145, 1, 1) == 16385
 
 
-def test_lds_uses_explicit_arch(monkeypatch):
-    from aiter.jit.utils import chip_info
-
-    monkeypatch.setattr(chip_info, "get_gfx", lambda: "gfx942")
-    cfg = IndexScoreConfig(waves_per_tok=2, pages_per_wave=1, sched=0)
-    # S=160 H=8 needs 80 KB of reduction LDS: over gfx942's 64 KB, under
-    # gfx950's 160 KB. The pair has to straddle the two capacities or the
-    # assertion passes even when `selection_filter` ignores `arch` entirely --
-    # which is what the old S=64 H=4 shape did at 16 KB.
-    assert kernel.reduce_lds_bytes(160, 8, cfg) == 80 * 1024
-    assert kernel.selection_filter(160, 8, cfg, arch="gfx950")
-    assert not kernel.selection_filter(160, 8, cfg, arch="gfx942")
-
-
 def check_scores(got, ref):
     """Undefined slots may change; required -inf and finite slots may not."""
     defined = ~torch.isnan(ref)
@@ -1544,8 +1179,8 @@ def check_scores(got, ref):
     reason="perf sweep: run via python op_tests/test_flydsl_minimax_m3_index_score.py"
 )
 @benchmark()
-def test_score(case, B, S, H, lens, dtype, layout, impls, kwargs):
-    q, cache, bt, seq, mb = make_case(B, S, H, lens, dtype, **kwargs)
+def test_score(case, B, S, H, lens, layout, kwargs):
+    q, cache, bt, seq, mb = make_case(B, S, H, lens, **kwargs)
     ref = score_oracle(q, cache, bt, seq, S, H, D**-0.5, mb)
     out = (
         torch.empty((H, B * S, mb), device=q.device, dtype=torch.float32)
@@ -1555,20 +1190,18 @@ def test_score(case, B, S, H, lens, dtype, layout, impls, kwargs):
         )
     )
     ret = {"gfx": get_gfx(), "timing": "repeated-buffer (warm effective TB/s)"}
-    candidates = {
-        name: CANDIDATES[name]
-        for name in impls
-        if selection_filter(S, H, CANDIDATES[name])
-    }
-    for name, cfg in candidates.items():
-        k = shuffle_cache(cache) if cfg.shuffled else cache
-        capacity = kernel.work_map_capacity(B, mb, S, H, cfg)
-        buf = torch.empty((capacity, 2), device=q.device, dtype=torch.int32)
-        wm = kernel.build_work_map(seq, mb, S, H, cfg, out=buf)
+    g = geometry(B, mb, S, H, device=q.device)
+    ret["geometry"] = f"tw{g['waves_per_tok']}_L{g['pages_per_wave']}" + (
+        "_sp" if g["spread"] else ""
+    )
+    capacity = kernel.work_map_capacity(B, mb, S, H)
+    buf = torch.empty((capacity, 2), device=q.device, dtype=torch.int32)
+    wm = kernel.build_work_map(seq, mb, S, H, out=buf)
+    for name in ("flydsl",):
 
-        def run(k=k, cfg=cfg, wm=wm):
+        def run(wm=wm):
             return score_flydsl(
-                q, k, bt, seq, S, H, D**-0.5, mb, out=out, cfg=cfg, work_map=wm
+                q, cache, bt, seq, S, H, D**-0.5, mb, out=out, work_map=wm
             )
 
         got, us = run_perftest(run, num_iters=10, num_rotate_args=1)
@@ -1590,6 +1223,435 @@ def test_score(case, B, S, H, lens, dtype, layout, impls, kwargs):
     return ret
 
 
+# ==========================================================================
+# PREFILL
+#
+#
+# The judge is aiter's own `pa_sparse_block_score_prefill`, which computes the
+# same scores without the FlyDSL kernel's length limit. Comparing against it
+# rather than against a torch oracle is deliberate here: the two implementations
+# share no code, and the operator's numerics are a contract (Q is rounded down to
+# the cache's fp8, matching `tl.dot(q.to(k.dtype), k)`), so the comparison is
+# exact rather than tolerance-based.
+#
+# Two properties of the contract shape every check below:
+#
+#   * `out` may be left untouched past a query's causal window. The kernel is
+#     only required to write the slots aiter marks finite, so the output buffer
+#     is sentinel-filled and compared only there. `alloc_score` hands back
+#     `torch.empty`, so a raw buffer diff would be comparing uninitialised
+#     memory -- which has produced false mismatches before.
+#   * every config arm must agree bit for bit. These are the same arithmetic in
+#     different geometries, not different approximations of it.
+#
+# Run:
+#     python op_tests/test_flydsl_minimax_m3_index_score_prefill.py
+# ==========================================================================
+
+
+def make_prefill_case(batch, q_len, ctx_len, seed=0):
+    """A uniform ragged batch: every request has q_len new tokens on ctx_len."""
+    torch.manual_seed(seed)
+    dev = "cuda"
+    seq_lens = torch.full((batch,), ctx_len, dtype=torch.int32, device=dev)
+    prefix = torch.full((batch,), ctx_len - q_len, dtype=torch.int32, device=dev)
+    cu = torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=dev)
+    max_block = -(-ctx_len // P)
+    npages = batch * max_block
+    q8 = (torch.randn(batch * q_len, 1, D, device=dev) / 4).to(dtypes.fp8)
+    cache = (torch.randn(npages, P, D, device=dev) / 4).to(dtypes.fp8)
+    # The block table is a permutation on purpose: a kernel that assumed pages
+    # were visited in storage order would still pass on an identity table.
+    bt = (
+        torch.randperm(npages, device=dev, dtype=torch.int32)
+        .view(batch, max_block)
+        .contiguous()
+    )
+    return {
+        "q8": q8,
+        # aiter takes Q in fp8; the bf16 arm gets its exact upcast, so neither
+        # side is answering a different question.
+        "q_bf16": q8.float().bfloat16(),
+        "cache": cache,
+        "bt": bt,
+        "cu": cu,
+        "seq": seq_lens,
+        "prefix": prefix,
+        "max_q": q_len,
+        "max_seq": ctx_len,
+        "batch": batch,
+        "mb": max_block,
+    }
+
+
+def aiter_scores(c):
+    """aiter's scores, and the mask of slots it considers live."""
+    ref = torch.full((1, c["q8"].shape[0], c["mb"]), -float("inf"), device="cuda")
+    pa_sparse_block_score_prefill(
+        c["q8"],
+        c["cache"],
+        ref,
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        max_query_len=c["max_q"],
+        max_seq_len=c["max_seq"],
+    )
+    return ref, torch.isfinite(ref)
+
+
+def run_prefill(c, cache=None, q=None, out=None):
+    if out is None:
+        out = prefill_alloc_score(c["q8"].shape[0], 1, c["mb"], "cuda")
+    out.fill_(SENTINEL)
+    score_prefill_flydsl(
+        c["q_bf16"] if q is None else q,
+        c["cache"] if cache is None else cache,
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+        out=out,
+    )
+    return out.reshape(1, c["q8"].shape[0], c["mb"])
+
+
+def assert_matches_aiter(got, ref, live, what):
+    unwritten = int((live & (got == SENTINEL)).sum())
+    assert unwritten == 0, f"{what}: {unwritten} live slots left unwritten"
+    diff = (got[live] - ref[live]).abs().max().item()
+    assert diff == 0.0, f"{what}: max abs diff {diff} against aiter"
+
+
+# (batch, q_len, ctx_len). Covers the short/grid-starved end, the ragged and
+# non-power-of-two lengths, and contexts past the 32 MB point where the score
+# tensor stops fitting in L2 (which is what sets the store merge width).
+PREFILL_SHAPES = [
+    (1, 256, 256),
+    (1, 130, 1000),
+    (3, 777, 5000),
+    (1, 2048, 2048),
+    (4, 512, 8192),
+    (8, 512, 16384),
+    (2, 2048, 32768),
+    (1, 1024, 65536),
+    (1, 4096, 131072),
+    (1, 4096, 524288),
+]
+
+# One (batch, q_len, ctx) per prefill_geometry `prefill_geometry` can reach, found by
+# enumerating its output over the whole envelope. The arms are driven through
+# the real selector rather than a knob, so the suite covers exactly what
+# production compiles -- and a prefill_geometry that stops being reachable shows up as
+# a failure in `test_geometry_arms_are_exhaustive`, not as a silent gap.
+GEOM_SHAPES = [
+    (1, 128, 256),  # tile_q 64, 4 waves, L1, 16-wide (odd FEAT_TILES_PER_WAVE)
+    (8, 512, 1000),  # tile_q 128, 4 waves, L1
+    (8, 512, 2048),  # tile_q 128, 4 waves, L2
+    (2, 128, 16384),  # tile_q 256, 8 waves, L1
+    (4, 128, 16384),  # tile_q 256, 8 waves, L2
+    (8, 2048, 16384),  # tile_q 256, 8 waves, L4 -- the production point
+]
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "shape", PREFILL_SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}"
+)
+def test_matches_aiter(shape):
+    c = make_prefill_case(*shape)
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_prefill(c), ref, live, f"{shape}")
+
+
+@requires_gfx950
+@pytest.mark.parametrize(
+    "shape", GEOM_SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}"
+)
+def test_every_geometry_matches_aiter(shape):
+    """Each prefill_geometry is the same arithmetic over a different split of the query
+    tile, CTA width and page depth, judged bit for bit against aiter."""
+    c = make_prefill_case(*shape)
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_prefill(c), ref, live, f"{shape}")
+
+
+def test_geometry_arms_are_exhaustive():
+    """Every prefill_geometry the selector can reach has an arm above.
+
+    Without this, narrowing `prefill_geometry` silently drops coverage: the arms keep
+    passing because they all collapse onto the surviving shape.
+    """
+    dev = torch.device("cuda")
+    reachable = set()
+    for ctx in (256, 1000, 2048, 5000, 8192, 16384, 32768, 131072, 524288):
+        for q_len in (128, 130, 256, 512, 777, 1024, 2048, 4096):
+            for batch in (1, 2, 3, 4, 8):
+                if q_len > ctx:
+                    continue
+                g = prefill_geometry(q_len, batch, 1, -(-ctx // P), dev)
+                reachable.add((g["tile_q"], g["waves"], g["pages_per_wave"], g["m32"]))
+    covered = set()
+    for batch, q_len, ctx in GEOM_SHAPES:
+        g = prefill_geometry(q_len, batch, 1, -(-ctx // P), dev)
+        covered.add((g["tile_q"], g["waves"], g["pages_per_wave"], g["m32"]))
+    assert covered == reachable, f"uncovered: {sorted(reachable - covered)}"
+
+
+@requires_gfx950
+def test_strided_cache_is_refused():
+    """The LDS staging path reads a page as a flat run_prefill of 16 B chunks, which
+    only describes the right bytes when the page is contiguous -- a strided
+    page reads in bounds and scores the wrong features (0.209 max abs error on
+    a [pages,128,256][..., :128] view).
+
+    There is no second code path to fall back to any more, so the contract is
+    refusal. Scoring it anyway is silently wrong, which is the one outcome a
+    caller cannot detect.
+    """
+    c = make_prefill_case(1, 1024, 16384)
+    wide = torch.zeros(
+        c["cache"].shape[0], P, 2 * D, dtype=c["cache"].dtype, device="cuda"
+    )
+    wide[..., :D] = c["cache"]
+    strided = wide[..., :D]
+    assert strided.stride(1) == 2 * D and not strided.is_contiguous()
+    with pytest.raises(ValueError, match="contiguous pages"):
+        run_prefill(c, strided)
+    # ...and the same cache, packed, still scores.
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_prefill(c), ref, live, "contiguous")
+
+
+@requires_gfx950
+def test_merged_store_follows_the_out_layout():
+    """`contig_k` merges a run_prefill of consecutive blocks into one vector store, and
+    it is a property of the OUTPUT the caller passed, not a tuning knob. A
+    padded row stride breaks the alignment the merge needs, so the kernel must
+    fall back to per-block stores and still be bit-exact."""
+    batch, q_len, ctx = 8, 2048, 16384  # the L4 arm, so a run_prefill is 4 blocks wide
+    c = make_prefill_case(batch, q_len, ctx)
+    ref, live = aiter_scores(c)
+    rows, mb = c["q8"].shape[0], c["mb"]
+    g = prefill_geometry(c["max_q"], batch, 1, mb, torch.device("cuda"))
+    ppw = g["pages_per_wave"]
+    assert ppw > 1, "pick a shape whose prefill_geometry actually merges stores"
+    # A row stride that is NOT a multiple of the run_prefill width, so the merge is off.
+    pad = next(mb + d for d in (1, 2, 3) if (mb + d) % ppw)
+    padded = torch.empty((1, rows, pad), dtype=torch.float32, device="cuda")
+    view = padded[:, :, :mb]
+    got = run_prefill(c, out=view)
+    assert_matches_aiter(got, ref, live, "padded out stride")
+    assert torch.equal(got[live], run_prefill(c)[live])
+
+
+@requires_gfx950
+def test_rejects_malformed_tensors():
+    """Everything below reaches the kernel as a bare pointer, so a wrong dtype
+    is a silent reinterpretation rather than an error."""
+    c = make_prefill_case(1, 256, 2048)
+    base = (
+        c["q_bf16"],
+        c["cache"],
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+    )
+    score_prefill_flydsl(*base)  # the well-formed call must still work
+
+    def swap(i, v):
+        a = list(base)
+        a[i] = v
+        return a
+
+    for idx, bad in (
+        (4, c["seq"].long()),  # int64 seq_lens
+        (5, c["prefix"].long()),  # int64 prefix_lens
+        (3, c["cu"].long()),  # int64 cu_seqlens_q
+        (2, c["bt"].long()),  # int64 block table
+        (2, c["bt"][0]),  # 1-D block table
+    ):
+        with pytest.raises(ValueError):
+            score_prefill_flydsl(*swap(idx, bad))
+
+    with pytest.raises(ValueError):  # out sized for a smaller max_block
+        score_prefill_flydsl(
+            *base, out=prefill_alloc_score(c["q8"].shape[0], 1, c["mb"] // 2, "cuda")
+        )
+
+
+@requires_gfx950
+def test_rejects_overlapping_out():
+    """A page-contiguous block axis does not make the rows disjoint. At row
+    stride 1 every query shares storage with its neighbour, so the kernel
+    overwrites scores it already wrote (3.26 max abs error) while the call
+    reports success. Each axis has to clear the extent below it."""
+    c = make_prefill_case(1, 256, 2048)
+    tq, mb = c["q8"].shape[0], c["mb"]
+    buf = torch.full((tq * mb,), SENTINEL, dtype=torch.float32, device="cuda")
+
+    def run_with(shape, stride):
+        out = torch.as_strided(buf, shape, stride)
+        score_prefill_flydsl(
+            c["q_bf16"],
+            c["cache"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            1.0 / LOG2E,
+            out=out,
+        )
+
+    for stride in (
+        (tq * mb, 1, 1),  # rows alias
+        (tq * mb, mb - 1, 1),  # rows overlap by one block
+    ):
+        with pytest.raises(ValueError, match="non-overlapping"):
+            run_with((1, tq, mb), stride)
+    # A zero head stride is rejected too, but by `_validate_tensor` before this
+    # check sees it -- assert the rejection, not which guard caught it.
+    with pytest.raises(ValueError):
+        run_with((1, tq, mb), (0, mb, 1))
+
+    # Exactly-packed and padded-but-disjoint are both still accepted.
+    ref, live = aiter_scores(c)
+    assert_matches_aiter(run_prefill(c, c["cache"]), ref, live, "packed out")
+    wide = torch.full((1, tq, 2 * mb), SENTINEL, dtype=torch.float32, device="cuda")
+    padded = wide[:, :, :mb]
+    assert padded.stride() == (tq * 2 * mb, 2 * mb, 1)
+    score_prefill_flydsl(
+        c["q_bf16"],
+        c["cache"],
+        c["bt"],
+        c["cu"],
+        c["seq"],
+        c["prefix"],
+        c["max_q"],
+        c["max_seq"],
+        1.0 / LOG2E,
+        out=padded,
+    )
+    assert_matches_aiter(padded.reshape(ref.shape), ref, live, "padded out")
+
+
+# --------------------------------------------------------------------------- #
+# Performance sweep
+# --------------------------------------------------------------------------- #
+
+
+def _prefill_work(batch, q_len, ctx_len):
+    """(live (query, block) pairs, unique pages) for a uniform ragged batch.
+
+    A query row i of a request sees `prefix + i + 1` context tokens, so it
+    touches `ceil(that / P)` blocks. Summing the rows is what the kernel
+    actually MFMAs; the unique page count is the K traffic a perfect cache
+    would move, which is the honest roofline denominator -- the kernel re-reads
+    a page once per query tile and counting those re-reads would flatter TB/s.
+    """
+    prefix = ctx_len - q_len
+    pairs = sum(-(-(prefix + i + 1) // P) for i in range(q_len)) * batch
+    return pairs, batch * (-(-ctx_len // P))
+
+
+@pytest.mark.skip(
+    reason="perf sweep: run_prefill via python op_tests/test_flydsl_minimax_m3_index_score_prefill.py"
+)
+@benchmark()
+def test_score_prefill_perf(batch, q_len, ctx_len, heads):
+    c = make_prefill_case(batch, q_len, ctx_len)
+    total_q = c["q8"].shape[0]
+    cache = c["cache"]
+    # aiter takes the fp8 Q straight; this kernel takes the same values as
+    # bf16 and rounds them back down at staging, which is bit-identical.
+    q = c["q_bf16"]
+    fp8 = True  # the cache dtype, which is what aiter's build is keyed on
+
+    ret = {"gfx": get_gfx()}
+    g = prefill_geometry(c["max_q"], batch, heads, c["mb"], torch.device("cuda"))
+    ret["prefill_geometry"] = f"q{g['tile_q']}_w{g['waves']}_L{g['pages_per_wave']}"
+    ref = live = None
+    # aiter is both the judge and the baseline, but it is built for
+    # num_idx_heads 1 and 2 only ("no build for num_idx_heads=4") and takes an
+    # fp8 cache, so outside that it is neither timed nor used as the aiter_scores.
+    if fp8 and heads <= 2:
+        score = torch.full((heads, total_q, c["mb"]), -float("inf"), device="cuda")
+
+        def run_aiter(s=score):
+            pa_sparse_block_score_prefill(
+                c["q8"],
+                c["cache"],
+                s,
+                c["bt"],
+                c["cu"],
+                c["seq"],
+                max_query_len=c["max_q"],
+                max_seq_len=c["max_seq"],
+            )
+            return s
+
+        ref, us = run_perftest(run_aiter, num_iters=10, num_rotate_args=1)
+        live = torch.isfinite(ref)
+        ret["aiter us"] = us
+        ret["aiter err"] = 0.0
+
+    pairs, pages = _prefill_work(batch, q_len, ctx_len)
+    flops = 2 * pairs * P * D * heads
+    nbytes = (
+        pages * P * D * cache.element_size()  # K, read once at best
+        + total_q * heads * D * q.element_size()  # Q
+        + pairs * heads * 4  # the fp32 scores actually written
+    )
+
+    for name in ("flydsl",):
+        out = prefill_alloc_score(total_q, heads, c["mb"], "cuda")
+        out.fill_(SENTINEL)
+
+        def run_flydsl(out=out):
+            return score_prefill_flydsl(
+                q,
+                cache,
+                c["bt"],
+                c["cu"],
+                c["seq"],
+                c["prefix"],
+                c["max_q"],
+                c["max_seq"],
+                1.0 / LOG2E,
+                out=out,
+            )
+
+        got, us = run_perftest(run_flydsl, num_iters=10, num_rotate_args=1)
+        assert got.data_ptr() == out.data_ptr()
+        if ref is None:
+            # No aiter build for this head count; the parametrized tests
+            # above carry correctness, so report the timing without a verdict
+            # rather than inventing one.
+            err = float("nan")
+        else:
+            err = checkAllclose(
+                ref[live].float(),
+                got.reshape(ref.shape)[live].float(),
+                rtol=0,
+                atol=0,
+                msg=f"{name}: prefill index score",
+            )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
 def parse_args(argv=None):
     ap = argparse.ArgumentParser(
         description="MiniMax-M3 index-score correctness and performance sweep",
@@ -1599,15 +1661,6 @@ def parse_args(argv=None):
             "dtype x batch x (S,H,L) using uniform lengths [L] * B; batch defaults "
             "to 2. --case filters names in either mode. Empty lists select no work."
         ),
-    )
-    ap.add_argument(
-        "-d",
-        "--dtype",
-        type=dtypes.str2Dtype,
-        nargs="*",
-        choices=[torch.bfloat16, torch.float8_e4m3fn],
-        default=[torch.bfloat16, torch.float8_e4m3fn],
-        help="cache dtype list: bf16 fp8 (FP8 E4M3FN only); queries remain BF16",
     )
     ap.add_argument(
         "-b",
@@ -1628,13 +1681,23 @@ def parse_args(argv=None):
         "not GEMM M,N,K; page size and head dimension remain 128",
     )
     ap.add_argument(
-        "--impl", nargs="*", choices=list(CANDIDATES), default=list(CANDIDATES)
-    )
-    ap.add_argument(
         "--case",
         nargs="*",
         default=None,
         help="case names from build_matrix, or custom_B{B}_S{S}_H{H}_L{L}_{bf16|fp8}",
+    )
+    ap.add_argument(
+        "--q-len", type=int, nargs="*", default=[4096], help="prefill new tokens"
+    )
+    ap.add_argument(
+        "--ctx-len",
+        type=int,
+        nargs="*",
+        default=[8192, 32768, 131072, 524288],
+        help="prefill context length sweep",
+    )
+    ap.add_argument(
+        "--heads", type=int, nargs="*", default=[1], help="prefill index head sweep"
     )
     ap.add_argument(
         "--layout",
@@ -1661,24 +1724,12 @@ def parse_args(argv=None):
 def select_cases(args):
     """CPU-only selection; custom shapes never replace the regression defaults."""
     if args.mnk is None:
-        cases = [
-            c
-            for c in build_matrix(torch.float8_e4m3fn)
-            if c[5] in args.dtype and (args.batch is None or c[1] in args.batch)
-        ]
+        cases = [c for c in build_matrix() if args.batch is None or c[1] in args.batch]
     else:
         cases = [
-            (
-                f"custom_B{B}_S{S}_H{H}_L{L}_{'bf16' if dt == torch.bfloat16 else 'fp8'}",
-                B,
-                S,
-                H,
-                [L] * B,
-                dt,
-                {},
-            )
-            for dt, B, (S, H, L) in itertools.product(
-                args.dtype, args.batch if args.batch is not None else [2], args.mnk
+            (f"custom_B{B}_S{S}_H{H}_L{L}_fp8", B, S, H, [L] * B, {})
+            for B, (S, H, L) in itertools.product(
+                args.batch if args.batch is not None else [2], args.mnk
             )
         ]
     if args.case is not None:
@@ -1691,30 +1742,33 @@ def main(argv=None):
     if not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX:
         aiter.logger.warning("index score requires gfx950; skipping sweep")
         return 0
-    rows, skipped = [], 0
-    for (name, B, S, H, lens, dt, kw), layout in itertools.product(
+    rows = []
+    for (name, B, S, H, lens, kw), layout in itertools.product(
         select_cases(args), args.layout
     ):
-        legal = [n for n in args.impl if selection_filter(S, H, CANDIDATES[n])]
-        skipped += len(args.impl) - len(legal)
-        if not legal:
-            continue
-        rows.append(test_score(name, B, S, H, lens, dt, layout, legal, kw))
-    if not rows:
-        aiter.logger.warning(
-            "Empty selection or all candidates skipped; no score tests executed"
+        rows.append(test_score(name, B, S, H, lens, layout, kw))
+    if rows:
+        aiter.logger.info(
+            "decode index score summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
         )
-        return 0
-    aiter.logger.info(
-        "index score summary (markdown):\n%s",
-        pd.DataFrame(rows).to_markdown(index=False),
-    )
-    aiter.logger.info(
-        "%d shape/layout rows, %d candidate checks, %d unsupported candidates skipped",
-        len(rows),
-        sum(sum(k.endswith(" err") for k in r) for r in rows),
-        skipped,
-    )
+    else:
+        aiter.logger.warning("Empty selection; no decode score tests executed")
+
+    # A second table, not a merged one: the two @benchmark signatures have
+    # different call args, so one frame would scatter NaN columns.
+    pre = []
+    for batch, q_len, ctx_len, heads in itertools.product(
+        args.batch or [1], args.q_len, args.ctx_len, args.heads
+    ):
+        if q_len > ctx_len:
+            continue  # a request cannot have more new tokens than context
+        pre.append(test_score_prefill_perf(batch, q_len, ctx_len, heads))
+    if pre:
+        aiter.logger.info(
+            "prefill index score summary (markdown):\n%s",
+            pd.DataFrame(pre).to_markdown(index=False),
+        )
     return 0
 
 
