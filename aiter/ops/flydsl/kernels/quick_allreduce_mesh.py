@@ -30,8 +30,9 @@ At TP2 a fixed fraction of the blocks, the *relay* blocks, can write their
 packet into a bounce buffer on a third GPU instead of the peer's inbox, so a
 share of each direction's traffic takes the two xGMI links through that GPU.
 The peer reads it from the bounce in place of its inbox. Flags, colours and the
-reduction order are unchanged. Relay blocks read the bounce with plain loads
-behind an L1 invalidate; see ``_RELAY_RECV_CM``.
+reduction order are those of the direct path. Relay blocks read the bounce with
+plain loads behind an L1 invalidate; see ``_RELAY_RECV_CM``. Design notes and
+measurements: ``aiter/ops/flydsl/quick_allreduce_relay.md``.
 """
 
 import flydsl.compiler as flyc
@@ -196,23 +197,19 @@ def mesh_st_ladder(world_size: int, link: str = "pcie"):
 
 
 # ``(link, world_size, arch) -> (relay_min_bytes, (num, den))``: the payload
-# from which the relay engines run, and the share of blocks that relay. Used
+# from which the relay engines run, and the share of blocks that relay. Read
 # only when the caller passes ``relay_devices``; production dispatch does not,
-# because the relay GPUs may host other work and the context cost on them with
-# all four pairs relaying at once is unmeasured. At INT4 a rank allocates
-# 13.6 MiB for relaying, half of it as bounces on a relay GPU. On gfx950 under
-# graph replay (INT4, hidden 5120), 3/8 is 1.43-1.53x direct at 20-120 MiB,
-# 1.32-1.37x at 5-10 MiB and 1.07-1.24x at 0.5-2.5 MiB, and breaks even near
-# 0.23 MiB. 1/2 is 1-7% faster than 3/8 from 20 MiB up, but slows a GEMM
-# on the relay GPUs by 9-11% at 10-80 MiB, where 3/8 costs it 1-6%.
+# as the relay GPUs may belong to other work. An arch without an entry needs
+# both values from the caller. How they were chosen:
+# ``aiter/ops/flydsl/quick_allreduce_relay.md``.
 MESH_RELAY_DEFAULTS = {("xgmi", 2, "gfx950"): (480 << 10, (3, 8))}
 
 # Wire formats the mesh can build.
 MESH_CODECS = ("int4", "int5", "int6", "fp16")
 
 # Largest ``den`` of a relay fraction. Block ``b`` relays when ``b % den < num``,
-# and blocks reach XCDs round-robin, so at ``den = 8`` the relay blocks fill whole
-# XCDs. That placement measured faster than spreading them over every XCD.
+# and blocks reach the 8 XCDs round-robin, so a ``den`` that divides 8 keeps the
+# relay blocks on whole XCDs rather than spreading them over all of them.
 RELAY_MAX_DEN = 8
 
 # A relay block's payload stores go out at system scope (``sc0 sc1``). The
@@ -221,16 +218,12 @@ RELAY_MAX_DEN = 8
 _RELAY_STORE_CM = _CM_SC0 | _CM_SC1 | _CM_NT
 
 # A relay block reads the bounce with plain loads behind an agent-scope acquire
-# (`buffer_inv sc1`), where direct blocks read their inbox with `sc0 sc1` behind
-# a workgroup-scope acquire that emits no invalidate. Both are correct. On
-# gfx950 at 80 MiB the plain loads cut what relaying costs a GEMM on the relay
-# GPU from 24-26% to about 1% (4-5% at 10 MiB) and a copy from 14-17% to 4-5%,
-# and the relay itself runs 6-8% faster; why `sc0 sc1` costs that much is not
-# established. The invalidate is what makes plain loads correct: L1 holds UC
-# lines, and a block reads the same bounce slots on every tile, so a plain load
-# could otherwise be served the previous tile's packet. A workgroup-scope
-# acquire would invalidate nothing. gfx942 has the same acquire semantics but
-# has not been run.
+# (``buffer_inv sc1``), where direct blocks read their inbox with ``sc0 sc1``
+# behind a workgroup-scope acquire that emits no invalidate. The invalidate is
+# what makes plain loads correct: L1 can hold UC lines, and a block reads the
+# same bounce slots on every tile, so a plain load could otherwise be served
+# the previous tile's packet. A workgroup-scope acquire would invalidate
+# nothing. Why plain loads: ``aiter/ops/flydsl/quick_allreduce_relay.md``.
 _RELAY_RECV_CM = 0
 _RELAY_ACQUIRE_SCOPE = rocdl.SyncScope.AgentOneAs
 
