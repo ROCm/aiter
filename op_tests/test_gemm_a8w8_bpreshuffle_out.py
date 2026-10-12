@@ -75,8 +75,11 @@ _GFX950_ROWS = [
     "backend,m,n,k", _GFX950_ROWS, ids=[r[0] for r in _GFX950_ROWS]
 )
 def test_out_matches_allocating_op_per_backend(backend, m, n, k):
-    if _backend(m, n, k) != backend:
-        pytest.skip(f"M={m} N={n} K={k} now selects {_backend(m, n, k)}")
+    selected = _backend(m, n, k)
+    assert selected == backend, (
+        f"M={m} N={n} K={k} now selects {selected}, not {backend}; pick another "
+        f"tuned row that selects {backend} so this backend stays covered"
+    )
     xq, wq, x_scale, w_scale = _inputs(m, n, k)
     ref = aiter.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, None, dtypes.bf16)
     out = torch.full((m, n), float("nan"), dtype=dtypes.bf16, device="cuda")
@@ -91,6 +94,11 @@ def test_out_matches_allocating_op_per_backend(backend, m, n, k):
     ids=["untuned", "padded-k"],
 )
 def test_out_matches_allocating_op_untuned(m, n, k, w_k):
+    for kk in {k, w_k or k}:
+        assert _backend(m, n, kk) is None, (
+            f"M={m} N={n} K={kk} is now tuned; pick an untuned shape so the "
+            "default-kernel path stays covered"
+        )
     xq, wq, x_scale, w_scale = _inputs(m, n, k, w_k)
     ref = aiter.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, None, dtypes.bf16)
     out = torch.full((m, n), float("nan"), dtype=dtypes.bf16, device="cuda")
@@ -161,6 +169,18 @@ def test_out_rejected_before_launch(make_out):
     with pytest.raises(ValueError, match="out must be"):
         aiter.gemm_a8w8_bpreshuffle_out(out, xq, wq, x_scale, w_scale)
     assert torch.all(storage.view(torch.uint8) == 0xAB)
+
+
+@pytest.mark.parametrize("cpu_arg", ["WQ", "x_scale", "w_scale"])
+def test_input_on_another_device_rejected_before_launch(cpu_arg):
+    m, n, k = 32, 256, 512
+    args = dict(zip(("XQ", "WQ", "x_scale", "w_scale"), _inputs(m, n, k)))
+    args[cpu_arg] = args[cpu_arg].cpu()
+    out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+
+    with pytest.raises(ValueError, match="same device"):
+        aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.all(out == 3.0)
 
 
 def test_weight_k_below_activation_k_rejected():

@@ -835,7 +835,8 @@ def gemm_a8w8_bpreshuffle_out(
 ) -> None:
     """gemm_a8w8_bpreshuffle written into a caller-owned buffer.
 
-    ``out`` must be a contiguous bf16 [M, N] tensor on the inputs' device. Only
+    All tensors must be on one device, and ``out`` must be a contiguous bf16
+    [M, N] tensor. Only
     bf16 is accepted: the FlyDSL 8-wave kernels, which many tuned rows select,
     write bf16 only. CK and CKTile write a dense row-major [M, N], so a strided
     ``out`` (e.g. a column slice of a wider buffer) is rejected instead of being
@@ -845,11 +846,16 @@ def gemm_a8w8_bpreshuffle_out(
     n = WQ.shape[0]
     if out.dtype != dtypes.bf16:
         raise ValueError(f"out must be bf16, got {out.dtype}")
-    if out.shape != (m, n) or out.device != XQ.device or not out.is_contiguous():
+    if any(t.device != XQ.device for t in (out, WQ, x_scale, w_scale)):
         raise ValueError(
-            f"out must be a contiguous tensor of shape {(m, n)} on {XQ.device}; "
-            f"got shape {tuple(out.shape)}, stride {tuple(out.stride())}, "
-            f"device {out.device}"
+            "out, XQ, WQ, x_scale and w_scale must be on the same device; got "
+            f"out={out.device}, XQ={XQ.device}, WQ={WQ.device}, "
+            f"x_scale={x_scale.device}, w_scale={w_scale.device}"
+        )
+    if out.shape != (m, n) or not out.is_contiguous():
+        raise ValueError(
+            f"out must be a contiguous tensor of shape {(m, n)}; got shape "
+            f"{tuple(out.shape)}, stride {tuple(out.stride())}"
         )
     if WQ.dtype != dtypes.fp8:
         raise ValueError(f"WQ must be {dtypes.fp8}, got {WQ.dtype}")
