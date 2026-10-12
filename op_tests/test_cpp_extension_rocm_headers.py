@@ -116,7 +116,10 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
         self.assertIn("7.15", message)
         self.assertIn("7.14", message)
         self.assertIn(str(self.runtime.parent / "bin" / "hipcc"), message)
-        self.assertIn("rocm-sdk-devel==7.14.*", message)
+        # Both install paths must be offered: system dev packages via apt and
+        # the Python SDK devel wheel via pip.
+        self.assertIn("apt install rocprim-dev hipcub-dev rocthrust-dev", message)
+        self.assertIn("pip install rocm-sdk-devel==7.14.*", message)
 
     def test_unverifiable_versions_warn_once(self):
         with patch.object(self.cpp_extension.logger, "warning") as warning:

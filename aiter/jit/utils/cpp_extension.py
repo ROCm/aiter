@@ -345,9 +345,11 @@ def _find_matching_system_rocm_include() -> str | None:
             f"ROCm {header_version[0]}.{header_version[1]} but the build's hipcc "
             f"({hipcc}) is ROCm {compiler_version[0]}.{compiler_version[1]}. The "
             "build continues without the system headers; if it fails with "
-            "missing rocPRIM or hipcub headers, install the matching development "
-            f'components (e.g. pip install "rocm-sdk-devel=='
-            f'{compiler_version[0]}.{compiler_version[1]}.*").'
+            "missing rocPRIM or hipcub headers, install matching ROCm "
+            f"{compiler_version[0]}.{compiler_version[1]} development packages, "
+            'e.g. "apt install rocprim-dev hipcub-dev rocthrust-dev" or '
+            f'"pip install rocm-sdk-devel=={compiler_version[0]}.'
+            f'{compiler_version[1]}.*".'
         )
         return None
     return _SYSTEM_ROCM_INCLUDE
