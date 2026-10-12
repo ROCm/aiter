@@ -835,12 +835,13 @@ def gemm_a8w8_bpreshuffle_out(
 ) -> None:
     """gemm_a8w8_bpreshuffle written into a caller-owned buffer.
 
-    XQ and WQ must be 2-D, all tensors must be on one CUDA/HIP device, and ``out``
-    must be a contiguous bf16 [M, N] tensor. Only
-    bf16 is accepted: the FlyDSL 8-wave kernels, which many tuned rows select,
-    write bf16 only. CK and CKTile write a dense row-major [M, N], so a strided
-    ``out`` (e.g. a column slice of a wider buffer) is rejected instead of being
-    written past its bounds. Every check runs before any kernel launch.
+    XQ and WQ must be 2-D fp8, x_scale and w_scale contiguous fp32 with M and N
+    elements, all tensors must be on one CUDA/HIP device, and ``out`` must be a
+    contiguous bf16 [M, N] tensor. Only bf16 is accepted: the FlyDSL 8-wave
+    kernels, which many tuned rows select, write bf16 only. CK and CKTile write
+    a dense row-major [M, N], so a strided ``out`` (e.g. a column slice of a
+    wider buffer) is rejected instead of being written past its bounds. Every
+    check runs before any kernel launch.
     """
     # The dispatcher reads K from shape[-1] but the CK launcher reads size(1),
     # so any other rank would tune for one K and launch with another.
@@ -866,8 +867,22 @@ def gemm_a8w8_bpreshuffle_out(
             f"out must be a contiguous tensor of shape {(m, n)}; got shape "
             f"{tuple(out.shape)}, stride {tuple(out.stride())}"
         )
-    if WQ.dtype != dtypes.fp8:
-        raise ValueError(f"WQ must be {dtypes.fp8}, got {WQ.dtype}")
+    if XQ.dtype != dtypes.fp8 or WQ.dtype != dtypes.fp8:
+        raise ValueError(
+            f"XQ and WQ must be {dtypes.fp8}; got XQ {XQ.dtype}, WQ {WQ.dtype}"
+        )
+    # Every backend reads the scales as dense fp32 through raw pointers.
+    for name, scale, size in (("x_scale", x_scale, m), ("w_scale", w_scale, n)):
+        if (
+            scale.dtype != dtypes.fp32
+            or scale.numel() != size
+            or not scale.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must be a contiguous fp32 tensor of {size} elements; got "
+                f"dtype {scale.dtype}, shape {tuple(scale.shape)}, "
+                f"stride {tuple(scale.stride())}"
+            )
     if WQ.shape[-1] < XQ.shape[-1]:
         raise ValueError(
             f"gemm_a8w8_bpreshuffle_out requires WQ K >= XQ K, got WQ K="

@@ -3,34 +3,45 @@
 """Contract of gemm_a8w8_bpreshuffle_out: it writes into a caller-owned bf16
 [M, N] buffer, picks the same kernel as gemm_a8w8_bpreshuffle (so the result is
 bit-identical on every backend), declares only ``out`` as mutated, and rejects a
-buffer the kernels cannot write densely before any launch."""
+buffer the kernels cannot write densely before any launch.
 
+Run directly to benchmark it against gemm_a8w8_bpreshuffle on Kimi-K3
+shared-expert down-projection shapes."""
+
+import argparse
+import itertools
+
+import pandas as pd
 import pytest
 import torch
 
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA/HIP device"
 )
 
-
-def _gfx():
-    from aiter.jit.utils.chip_info import get_gfx_runtime
-
-    return get_gfx_runtime()
+SUPPORTED_GFX = ["gfx942", "gfx950"]
 
 
-def _inputs(m, n, k, w_k=None):
+def _quantized(m, n, k, w_k=None):
+    """(XQ, unshuffled WQ, x_scale, w_scale) from seeded random bf16 inputs."""
     torch.manual_seed(0)
     x = torch.randn((m, k), dtype=dtypes.bf16, device="cuda")
     w = torch.randn((n, w_k or k), dtype=dtypes.bf16, device="cuda")
     xq, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
     wq, w_scale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
+    return xq, wq, x_scale, w_scale
+
+
+def _inputs(m, n, k, w_k=None):
+    xq, wq, x_scale, w_scale = _quantized(m, n, k, w_k)
     return xq, shuffle_weight(wq, layout=(16, 16)), x_scale, w_scale
 
 
@@ -68,7 +79,7 @@ _GFX950_ROWS = [
 
 
 @pytest.mark.skipif(
-    torch.cuda.is_available() and _gfx() != "gfx950",
+    torch.cuda.is_available() and get_gfx() != "gfx950",
     reason="rows are picked from the gfx950 tuned tables",
 )
 @pytest.mark.parametrize(
@@ -215,3 +226,114 @@ def test_non_2d_operand_rejected_before_launch(arg):
     with pytest.raises(ValueError, match="must be 2-D"):
         aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
     assert torch.all(out == 3.0)
+
+
+def test_int8_activation_rejected_before_launch():
+    m, n, k = 32, 256, 512
+    xq, wq, x_scale, w_scale = _inputs(m, n, k)
+    out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+
+    with pytest.raises(ValueError, match="XQ and WQ must be"):
+        aiter.gemm_a8w8_bpreshuffle_out(out, xq.view(dtypes.i8), wq, x_scale, w_scale)
+    assert torch.all(out == 3.0)
+
+
+@pytest.mark.parametrize("arg", ["x_scale", "w_scale"])
+@pytest.mark.parametrize(
+    "bad",
+    [
+        pytest.param(lambda s: s.to(dtypes.bf16), id="bf16"),
+        pytest.param(lambda s: s[:-1], id="short"),
+        pytest.param(lambda s: s.repeat(1, 2)[:, :1], id="strided"),
+    ],
+)
+def test_bad_scale_rejected_before_launch(arg, bad):
+    m, n, k = 32, 256, 512
+    args = dict(zip(("XQ", "WQ", "x_scale", "w_scale"), _inputs(m, n, k)))
+    args[arg] = bad(args[arg])
+    out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+
+    with pytest.raises(ValueError, match=f"{arg} must be a contiguous fp32"):
+        aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.all(out == 3.0)
+
+
+def run_torch(xq, wq, x_scale, w_scale):
+    # Reference only: fp32 math on the unshuffled weight, cast to bf16.
+    x = xq.to(dtypes.fp32) * x_scale
+    w = wq.to(dtypes.fp32) * w_scale
+    return (x @ w.t()).to(dtypes.bf16)
+
+
+@benchmark()
+def bench_out(m, n, k):
+    xq, wq, x_scale, w_scale = _quantized(m, n, k)
+    wq_shuffled = shuffle_weight(wq, layout=(16, 16))
+    ref = run_torch(xq, wq, x_scale, w_scale)
+    out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
+
+    def run_out():
+        aiter.gemm_a8w8_bpreshuffle_out(out, xq, wq_shuffled, x_scale, w_scale)
+        return out
+
+    candidates = {
+        "bpreshuffle": lambda: aiter.gemm_a8w8_bpreshuffle(
+            xq, wq_shuffled, x_scale, w_scale, None, dtypes.bf16
+        ),
+        "bpreshuffle_out": run_out,
+    }
+    flops = 2 * m * n * k
+    nbytes = m * k * xq.element_size() + n * k * wq.element_size() + m * n * 2
+
+    ret = {"gfx": get_gfx(), "backend": _backend(m, n, k)}
+    for name, fn in candidates.items():
+        res, us = run_perftest(fn)
+        err = checkAllclose(
+            ref.to(dtypes.fp32), res.to(dtypes.fp32), msg=f"{name}: M={m} N={n} K={k}"
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning(
+            "gemm_a8w8_bpreshuffle_out unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Benchmark gemm_a8w8_bpreshuffle_out against gemm_a8w8_bpreshuffle",
+    )
+    parser.add_argument(
+        "-m",
+        type=int,
+        nargs="*",
+        default=[1, 4, 16, 64, 256, 1024, 4096],
+        help="M (tokens). e.g.: -m 1 4 16",
+    )
+    parser.add_argument(
+        "-s",
+        "--nk",
+        type=dtypes.str2tuple,
+        nargs="*",
+        default=[(7168, 2048)],
+        help="N,K pairs; the default is the Kimi-K3 shared-expert down projection."
+        " e.g.: -s 7168,2048",
+    )
+    args = parser.parse_args()
+
+    df = [bench_out(m, n, k) for m, (n, k) in itertools.product(args.m, args.nk)]
+    df = pd.DataFrame(df)
+    aiter.logger.info(
+        "gemm_a8w8_bpreshuffle_out summary (markdown):\n%s",
+        df.to_markdown(index=False),
+    )
+
+
+if __name__ == "__main__":
+    main()
