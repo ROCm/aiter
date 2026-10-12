@@ -2248,6 +2248,61 @@ def sliding_window_performance_test():
     parse_arg_and_run_test()
 
 
+@pytest.mark.parametrize(
+    "block_size,trans_v,query_length,max_context_partition_num",
+    [
+        (16, False, 1, 3),
+        (16, False, 1, 7),
+        (16, False, 1, 32),
+        (16, False, 3, 7),
+        # split_kv_blocks is 4 here, so these are 3 and 7 sequence splits.
+        (1024, True, 1, 12),
+        (1024, True, 1, 28),
+    ],
+)
+@pytest.mark.parametrize(
+    "num_heads,head_size,sinks", [((64, 8), 64, True), ((16, 1), 128, False)]
+)
+def test_ps_split_count(
+    monkeypatch,
+    block_size,
+    trans_v,
+    query_length,
+    max_context_partition_num,
+    num_heads,
+    head_size,
+    sinks,
+):
+    """PS decode at odd split counts and at more splits than context partitions.
+
+    Varied context lengths put split boundaries inside partitions.
+    """
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "USE_TORCH_FLASH_REF", False)
+    monkeypatch.setattr(
+        module, "get_recommended_splits", lambda *args: max_context_partition_num
+    )
+    result = run_pa_gluon_test(
+        context_length=4097,
+        batch_size=16,
+        num_heads=num_heads,
+        head_size=head_size,
+        block_size=block_size,
+        compute_type=dtypes.d_dtypes["bf16"],
+        query_length=query_length,
+        quant_mode="per_tensor",
+        context_partition_size=256,
+        trans_v=trans_v,
+        kv_varlen=True,
+        quant_q=False,
+        quant_kv=False,
+        use_sinks=sinks,
+        sliding_window=0,
+        ps=True,
+    )
+    assert result["err_gluon"] == 0
+
+
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
 def test_multi_case_set(case_set_name):
     if case_set_name == "normal_accuracy":

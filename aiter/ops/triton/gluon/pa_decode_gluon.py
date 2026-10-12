@@ -1447,9 +1447,15 @@ def paged_attention_decode_sliding_window_head_1(
         sequence_partition_start_idx = local_partition_start_idx + block_split_idx
         sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
+        # Whole partitions per split: a partition shared by two splits would be
+        # loaded twice. Trailing splits may be empty and return early.
+        split_alignment: gl.constexpr = (
+            CONTEXT_PARTITION_SIZE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
         )
+        page_size = gl.cdiv(page_size, split_alignment) * split_alignment
         sequence_start_idx = page_size * sequence_split_idx
 
         sequence_end_idx = gl.minimum(context_length, page_size + sequence_start_idx)
@@ -2537,9 +2543,15 @@ def paged_attention_decode_sliding_window(
         sequence_partition_start_idx = local_partition_start_idx + block_split_idx
         sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
+        # Whole partitions per split: a partition shared by two splits would be
+        # loaded twice. Trailing splits may be empty and return early.
+        split_alignment: gl.constexpr = (
+            CONTEXT_PARTITION_SIZE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
         )
+        page_size = gl.cdiv(page_size, split_alignment) * split_alignment
         sequence_start_idx = page_size * sequence_split_idx
 
         sequence_end_idx = gl.minimum(
