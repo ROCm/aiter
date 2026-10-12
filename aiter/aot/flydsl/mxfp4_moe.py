@@ -137,12 +137,13 @@ def parse_csv(csv_path):
         seen.add(key)
         jobs.append(job)
 
-    source = (
+    # ``csv_path`` is either a filesystem path or an already-open stream (the
+    # in-memory tuner candidate path), so the context manager is chosen inline.
+    with (
         nullcontext(csv_path)
         if hasattr(csv_path, "read")
         else open(csv_path, newline="")
-    )
-    with source as f:
+    ) as f:
         for row in csv.DictReader(f):
             token = int(row["token"])
             topk = int(row["topk"])

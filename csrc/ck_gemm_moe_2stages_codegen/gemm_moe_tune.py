@@ -371,9 +371,7 @@ def _select_mxfp4_performance_finalists(candidates, finalist_count):
     )[:finalist_count]
 
 
-def _select_mxfp4_finalist(
-    candidates, timing_gate=MXFP4_FINAL_GLOBAL_TIMING_GATE
-):
+def _select_mxfp4_finalist(candidates, timing_gate=MXFP4_FINAL_GLOBAL_TIMING_GATE):
     """Select the most accurate finalist inside a global fastest-latency band."""
     if not candidates:
         return None
@@ -381,9 +379,7 @@ def _select_mxfp4_finalist(
     performance_equivalent = [
         candidate
         for candidate in candidates
-        if _normalized_latency_difference(
-            float(candidate["us"]), fastest_latency
-        )
+        if _normalized_latency_difference(float(candidate["us"]), fastest_latency)
         <= timing_gate
     ]
     return min(
@@ -7106,7 +7102,11 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 data, topk, dtype, activation, swiglu_limit=swiglu_limit
             )
             err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
-            if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
+            if (
+                err is None
+                or not math.isfinite(float(err))
+                or float(err) > args.errRatio
+            ):
                 raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
             timed_warmup = requested_warmup
         timed_out, us = run_perftest(
@@ -7203,9 +7203,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 if not isinstance(results, list) or len(results) != len(batch):
                     failed += len(batch)
                     continue
-                failed += sum(
-                    result.get("compile_time") is None for result in results
-                )
+                failed += sum(result.get("compile_time") is None for result in results)
             print(
                 f"[mxfp4-port] precompiled {len(jobs) - failed}/{len(jobs)} "
                 "deduplicated FlyDSL kernels",
@@ -7316,9 +7314,7 @@ class Mxfp4FlydslTuner(FmoeTuner):
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: "
                     f"accuracy {exc}"
                 )
-                print(
-                    f"[mxfp4-port] candidate rejected: {failures[-1]}", flush=True
-                )
+                print(f"[mxfp4-port] candidate rejected: {failures[-1]}", flush=True)
             except Exception as exc:  # noqa: BLE001
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"

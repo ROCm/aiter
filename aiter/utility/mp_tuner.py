@@ -494,8 +494,7 @@ def mp_tuner(
     )
     pid_delay = 0 if mp_num == 1 else 3
     pids = [
-        pool.apply_async(get_pid, args=(pid_delay,))
-        for i in range(start_idx, mp_num)
+        pool.apply_async(get_pid, args=(pid_delay,)) for i in range(start_idx, mp_num)
     ]
     gpu_map = {el.get(): i + start_idx for i, el in enumerate(pids)}
     rets_dict = submit_tasks(pool, gpu_map, range(len(task_group)))
