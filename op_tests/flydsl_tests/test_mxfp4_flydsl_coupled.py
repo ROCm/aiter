@@ -962,6 +962,151 @@ def test_bm16_producer_consumer(
     )
 
 
+@benchmark()
+def test_stage1_large_payload(out_dtype: str) -> dict[str, Any]:
+    """Check GEMM1 stores on both sides of the signed 32-bit byte boundary."""
+    from aiter.ops.flydsl import mxfp4_gemm1_kernels
+
+    # DSV4 uses inter_dim=3072. Repeat a small input fixture to keep the torch
+    # reference cheap while the real producer writes a payload larger than 2 GiB.
+    model_dim, inter_dim, bm, fixture_rows = 512, 3072, 16, 16
+    row_bytes = inter_dim if out_dtype == "fp8" else inter_dim // 2
+    boundary_row = (1 << 31) // row_bytes
+    token = (boundary_row // bm + 2) * bm
+    data = Mxfp4FlydslTuner._prepare_case(
+        fixture_rows, model_dim, inter_dim, 1, 1, dtypes.bf16, a_dtype="fp8"
+    )
+    hidden = data["input"].repeat(token // fixture_rows, 1)
+    sorted_ids = torch.arange(token, dtype=dtypes.i32)
+    expert_ids = torch.zeros(token // bm, dtype=dtypes.i32)
+    num_valid = torch.tensor([token, token], dtype=dtypes.i32)
+    g1 = Mxfp4FlydslTuner._g1_kname(
+        bm, True, True, bn=128, a_dtype="fp8", out_dtype=out_dtype
+    )
+    launch_kwargs = {}
+    launcher = mxfp4_gemm1_kernels.flydsl_mxfp4_gemm1
+
+    def capture(**kwargs):
+        output = kwargs["inter_sorted_quant"]
+        # The broken signed offset writes before the payload. Keep those writes
+        # in a guard allocation so the failing test cannot corrupt HIP state.
+        guard_bytes = 1 << 31
+        backing = torch.empty(guard_bytes + output.numel(), dtype=torch.uint8)
+        kwargs["inter_sorted_quant"] = (
+            backing[guard_bytes:].view(output.dtype).view_as(output)
+        )
+        launch_kwargs.update(kwargs)
+
+    with patch.object(mxfp4_gemm1_kernels, "flydsl_mxfp4_gemm1", capture):
+        payload, scale = _mxfp4_a4w4_stage1_fw(
+            hidden,
+            data["w1_a16"],
+            data["w2_a16"],
+            sorted_ids,
+            expert_ids,
+            num_valid,
+            None,
+            1,
+            block_m=bm,
+            w1_scale=data["w1s_a16"],
+            kernelName1=g1,
+            m_indices=sorted_ids,
+            interleave=True,
+        )
+    payload = launch_kwargs["inter_sorted_quant"]
+
+    ref1 = FmoeTuner.run_torch_moe_stage1(
+        data["a1_qt"],
+        data["w1_qt"],
+        data["w2_qt"],
+        data["topk_weights"],
+        data["topk_ids"],
+        data["a1_scale"],
+        data["w1_scale"],
+        dtype=dtypes.bf16 if out_dtype == "fp8" else dtypes.fp32,
+        activation=ActivationType.Silu,
+        quant_type=QuantType.per_1x32,
+        doweight_stage1=False,
+        topk=1,
+    ).reshape(fixture_rows, inter_dim)
+    if out_dtype == "fp8":
+        ref_q, ref_s = per_1x32_f8_scale_f8_quant(ref1, scale_type=dtypes.fp8_e8m0)
+        ref_values = ref_q.float()
+    else:
+        ref_q, ref_s = per_1x32_f4_quant(ref1)
+        ref_values = fp4_utils.mxfp4_to_f32(ref_q)
+    reference = ref_values * fp4_utils.e8m0_to_f32(ref_s).repeat_interleave(32, 1)
+    rows = torch.tensor(
+        [0, bm - 1, boundary_row - 1, boundary_row, boundary_row + 1, token - 1],
+        dtype=torch.int64,
+    )
+    groups = torch.arange(inter_dim // 32, dtype=torch.int64)[None, :]
+    # BM16 has one padded 32-row scale chunk per block, as in production.
+    offsets = (
+        (rows[:, None] // bm) * (inter_dim // 32 * 32)
+        + (groups // 8) * 256
+        + (groups % 4) * 64
+        + (rows[:, None] % 16) * 4
+        + ((groups // 4) % 2) * 2
+    )
+
+    def replay():
+        launcher(**launch_kwargs)
+        return payload
+
+    candidates = {"GEMM1": replay}
+    flops = 6 * token * model_dim * inter_dim
+    nbytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in (hidden, data["w1_a16"], data["w1s_a16"], payload, scale)
+    )
+    ret = {"gfx": get_gfx(), "payload_bytes": payload.numel()}
+    for name, candidate in candidates.items():
+        for _ in range(2):
+            payload.view(torch.uint8).fill_(255)
+            scale.view(torch.uint8).fill_(255)
+            candidate()
+            actual_q = payload[rows]
+            actual_s = scale.view(torch.uint8).flatten()[offsets].view(dtypes.fp8_e8m0)
+            values = (
+                actual_q.float()
+                if out_dtype == "fp8"
+                else fp4_utils.mxfp4_to_f32(actual_q)
+            )
+            actual = values * fp4_utils.e8m0_to_f32(actual_s).repeat_interleave(32, 1)
+            assert torch.isfinite(
+                actual
+            ).all(), "GEMM1 left nonfinite payload above 2 GiB"
+            error = checkAllclose(
+                reference[rows % fixture_rows],
+                actual,
+                rtol=0.2,
+                atol=0.1,
+                msg=f"{g1}: 2 GiB payload boundary",
+                catastrophic_check=True,
+            )
+            assert error <= 0.05
+        _, us = run_perftest(candidate, num_warmup=2, num_iters=5)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = error
+    return ret
+
+
+test_stage1_large_payload.__test__ = False
+
+
+@pytest.mark.parametrize("out_dtype", ["fp8", "fp4"])
+def test_stage1_payload_byte_boundary(out_dtype: str) -> None:
+    with torch.device("cuda"):
+        result = test_stage1_large_payload(out_dtype)
+    aiter.logger.info(
+        "GEMM1 large payload summary (markdown):\n%s",
+        pd.DataFrame([result]).to_markdown(index=False),
+    )
+
+
 @pytest.mark.parametrize("precision", ["A4W4", "A8W4"])
 @pytest.mark.parametrize("activation", ["Silu", "Situv2", "Swiglu"])
 @pytest.mark.parametrize("block_m", [16, 32, 64, 128])

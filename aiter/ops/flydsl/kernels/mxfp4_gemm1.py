@@ -1191,7 +1191,6 @@ def _gemm1_body(
     scales_per_mr = [None] * EPILOGUE_M_REPS
 
     def run_epilogue(split):
-        aqout_layout = fx.make_layout((BM, OUT_ROW_BYTES), (OUT_ROW_BYTES, 1))
         aqout_tiles = _global_scalar_tiles(arg_aqout, fx.Int32, 1 << 24)
 
         def store_payload(payload_row, packed0, packed1):
@@ -1201,16 +1200,20 @@ def _gemm1_body(
                     + wave_grp * fx.Int32(32)
                     + kk * fx.Int32(8)
                 )
-                store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
+                # Sorted payloads can exceed 2 GiB. Keep the byte offset in
+                # i64 through division so global stores cannot sign-wrap.
+                store_off = fx.Int64(payload_row) * fx.Int64(OUT_ROW_BYTES) + fx.Int64(
+                    byte_pos
+                )
                 _scalar_store(
                     aqout_tiles,
-                    store_off // fx.Int32(4),
+                    store_off // fx.Int64(4),
                     packed0,
                     fx.Int32,
                 )
                 _scalar_store(
                     aqout_tiles,
-                    (store_off + fx.Int32(4)) // fx.Int32(4),
+                    (store_off + fx.Int64(4)) // fx.Int64(4),
                     packed1,
                     fx.Int32,
                 )
@@ -1220,10 +1223,12 @@ def _gemm1_body(
                     + wave_grp * fx.Int32(16)
                     + kk * fx.Int32(4)
                 )
-                store_off = _layout_idx(aqout_layout, payload_row, byte_pos)
+                store_off = fx.Int64(payload_row) * fx.Int64(OUT_ROW_BYTES) + fx.Int64(
+                    byte_pos
+                )
                 _scalar_store(
                     aqout_tiles,
-                    store_off // fx.Int32(4),
+                    store_off // fx.Int64(4),
                     packed0,
                     fx.Int32,
                 )
