@@ -730,7 +730,27 @@ def test_pa_decode_sparse_fp8_uniform_vs_reference(T, H, D, kv_len, var_len):
     )
 
 
-def make_packed_cache(num_tokens, D, dtype, page_size=256):
+def make_packed_cache(num_tokens, D, dtype, page_size=256, layout="trailer"):
+    """Build a packed fp8 KV pool in one of the two DSv4 cache layouts.
+
+    The two archs do NOT read the same bytes, so the layout is explicit:
+
+    ``"trailer"`` (default) -- vLLM's ``fp8_ds_mla``: per block, every token's
+        576 B of data (448 fp8 NoPE | 128 bf16 RoPE) laid out first, then a
+        TRAILER holding 8 scale bytes per token. Row stride 584. This is what
+        the gfx950 packed path reads.
+
+    ``"aligned"`` -- ATOM's 2buff record, 640 B per token with the 7 UE8M0
+        scales stored INSIDE the row (each duplicated) at [448, 462) and the
+        bf16 RoPE at [512, 640), so one row index addresses a token's data and
+        its scales together. Only the gfx1250 2buff kernel reads this.
+
+    Defaulting to "trailer" keeps every pre-existing caller on the bytes it was
+    written against; feeding a gfx950 kernel the aligned form makes it read the
+    pad region as exponents and the output comes back all-NaN.
+    """
+    if layout not in ("trailer", "aligned"):
+        raise ValueError(f"layout must be 'trailer' or 'aligned', got {layout!r}")
     device = "cuda"
     rope = 64  # DSv4 RoPE dim, stored bf16
     block = page_size  # packed cache page size; vLLM allocates 64
@@ -739,6 +759,35 @@ def make_packed_cache(num_tokens, D, dtype, page_size=256):
     if dtype == "bf16":
         cache = (torch.randn(nb, block, D, device=device) * 0.4).to(torch.bfloat16)
         return cache, cache.reshape(nb * block, D).float()
+
+    if layout == "trailer":
+        # per token: [nope fp8 (1B) | rope bf16 (2B)], scales in a per-block
+        # trailer after all the tokens' data.
+        data_bytes = nope + rope * 2
+        scale_bytes = 8
+        row_bytes = data_bytes + scale_bytes  # 584
+        cache = torch.zeros(nb, block, row_bytes, dtype=torch.uint8, device=device)
+        flat = cache.view(nb, block * row_bytes)
+        data = flat[:, : block * data_bytes].view(nb, block, data_bytes)
+        scales_region = flat[:, block * data_bytes :].view(nb, block, scale_bytes)
+        nope_fp8 = (torch.randn(nb, block, nope, device=device) * 0.4).to(
+            torch.float8_e4m3fn
+        )
+        data[:, :, :nope] = nope_fp8.view(torch.uint8)
+        rope_bf16 = (torch.randn(nb, block, rope, device=device) * 0.4).to(
+            torch.bfloat16
+        )
+        data[:, :, nope:data_bytes] = rope_bf16.view(torch.uint8).view(
+            nb, block, rope * 2
+        )
+        num_groups = nope // 64
+        exps = torch.randint(
+            124, 130, (nb, block, num_groups), device=device, dtype=torch.uint8
+        )
+        scales_region[:, :, :num_groups] = exps
+        scales = torch.exp2(exps.float() - 127.0).repeat_interleave(64, dim=2)
+        kv_deq = torch.cat([nope_fp8.float() * scales, rope_bf16.float()], dim=2)
+        return cache, kv_deq.reshape(nb * block, D)
 
     # per token, the ALIGNED record:
     #   [  0, 448)  fp8 NoPE
@@ -885,7 +934,12 @@ def test_pa_decode_sparse_with_extra(
     softmax_scale = float(D) ** -0.5
 
     # main = contiguous SWA window per query
-    main_cache, main_deq = make_packed_cache(T * main_len, D, dtype, page_size)
+    # gfx1250 reads the 640 B aligned record; gfx950 reads the 584 B trailer
+    # form. Same test, two layouts -- see make_packed_cache.
+    cache_layout = "aligned" if arch == "gfx1250" else "trailer"
+    main_cache, main_deq = make_packed_cache(
+        T * main_len, D, dtype, page_size, cache_layout
+    )
     query_base = (torch.arange(T, device=device) * main_len)[:, None]
     main_idx = (
         (query_base + torch.arange(main_len, device=device)).to(torch.int32).reshape(-1)
@@ -895,7 +949,9 @@ def test_pa_decode_sparse_with_extra(
     )
     # extra = scattered top-k over a pool
     extra_pool = T * extra_len
-    extra_cache, extra_deq = make_packed_cache(extra_pool, D, dtype, page_size)
+    extra_cache, extra_deq = make_packed_cache(
+        extra_pool, D, dtype, page_size, cache_layout
+    )
     if strided_cache:
         extra_cache, extra_deq = widen_to_int32_overflow(extra_cache, extra_deq)
     extra_idx = torch.randint(
