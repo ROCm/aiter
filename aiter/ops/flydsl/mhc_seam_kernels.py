@@ -20,6 +20,13 @@ _GFX = ("gfx942",)
 _N = 4
 # Last-level (Infinity) cache, which decides whether the staged collapse stays resident.
 _MALL_BYTES = 256 * 1024 * 1024
+# Split-K of the fused pass: the largest legal split that keeps the grid within
+# _SPLIT_TARGET_BLOCKS workgroups or _MAX_SPLITS splits, whichever allows more, preferring one
+# whose last round of workgroups is at least _MIN_ROUND_FILL full -- a nearly empty last round
+# costs most of a full one.
+_MIN_ROUND_FILL = 0.73
+_SPLIT_TARGET_BLOCKS = 512
+_MAX_SPLITS = 8
 
 # knob defaults merged under every policy decision and user override
 MHC_SEAM_DEFAULTS = {
@@ -38,22 +45,21 @@ MHC_SEAM_DEFAULTS = {
 }
 
 # Launch table from a sweep on 304-CU gfx942 parts at H = 5120, one row per token bucket:
-# (largest T, BLOCK_M, CHUNK_C, SPLITS, CACHE_NT). Past the last row its config holds. Up to
-# 384 tokens every segment is one or two chunks (40 splits); 512 tokens take 16 splits, and from
-# 1024 the fused grid is held at 512 workgroups, the splits halving as the token tiles double.
-# CACHE_NT pays once the seam's traffic no longer fits the MALL.
+# (largest T, BLOCK_M, CHUNK_C, CACHE_NT). Past the last row its config holds. SPLITS is not
+# tabled: get_mhc_seam_config derives it from the grid, which reproduces the sweep's choices up
+# to 4096 tokens. CACHE_NT pays once the seam's traffic no longer fits the MALL.
 _TABLE = (
-    (1, 16, 128, 40, False),
-    (32, 16, 128, 40, False),
-    (128, 32, 128, 40, False),
-    (384, 32, 64, 40, False),
-    (512, 32, 64, 16, False),
-    (1024, 32, 64, 16, False),
-    (2048, 64, 64, 16, False),
-    (4096, 64, 64, 8, False),
-    (8192, 64, 64, 4, True),
-    (16384, 64, 64, 2, True),
-    (32768, 64, 64, 1, True),
+    (1, 16, 128, False),
+    (32, 16, 128, False),
+    (128, 32, 128, False),
+    (384, 32, 64, False),
+    (512, 32, 64, False),
+    (1024, 32, 64, False),
+    (2048, 64, 64, False),
+    (4096, 64, 64, False),
+    (8192, 64, 64, True),
+    (16384, 64, 64, True),
+    (32768, 64, 64, True),
 )
 # (BLOCK_M, CHUNK_C) tried, in order, when a row's tile is illegal for H
 _FALLBACK_TILES = tuple((bm, cc) for cc in (64, 128, 256) for bm in (32, 64, 16))
@@ -116,14 +122,22 @@ def _stage_nt(T: int, H: int) -> bool:
     return T * H * 2 > _MALL_BYTES
 
 
+def _round_fill(grid: int, cu_num: int) -> float:
+    """Fraction of the workgroup slots a grid's rounds keep busy, at one workgroup per CU; its
+    last round decides it."""
+    return grid / (-(-grid // cu_num) * cu_num)
+
+
 def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
     """Launch policy keyed on (arch, cu_num) and T.
 
-    * ``BLOCK_M``, ``CHUNK_C``, ``SPLITS`` and ``CACHE_NT`` from the first ``_TABLE`` row whose
-      bucket holds ``T`` (the last row beyond it).
+    * ``BLOCK_M``, ``CHUNK_C`` and ``CACHE_NT`` from the first ``_TABLE`` row whose bucket holds
+      ``T`` (the last row beyond it).
     * Another ``H``: the row's tile if it is legal, else the first legal one in
-      ``_FALLBACK_TILES``; ``SPLITS`` becomes the largest divisor of the chunk count that is at
-      most the row's.
+      ``_FALLBACK_TILES``.
+    * ``SPLITS``: the largest divisor of the chunk count that keeps the fused grid within
+      ``_SPLIT_TARGET_BLOCKS`` workgroups or ``_MAX_SPLITS`` splits, whichever allows more,
+      preferring those whose last round is at least ``_MIN_ROUND_FILL`` full.
     * ``GATE_STEP`` from ``kernels.mhc_seam.gate_step``, which is what the table's sweep found
       (on up to 4096 tokens at 304 CUs, off from 8192).
     * ``STAGE_NT`` from ``_stage_nt``: the staged collapse's round trip stays cached while it
@@ -134,7 +148,7 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
     _require(arch in _GFX, f"unsupported arch {arch}", RuntimeError)
     lds = _lds_bytes(arch)
     row = next((r for r in _TABLE if T <= r[0]), _TABLE[-1])
-    _, bm, cc, splits, cache_nt = row
+    _, bm, cc, cache_nt = row
     for tile in ((bm, cc), *_FALLBACK_TILES):
         try:
             check_config(T, H, _N, *tile, 1, lds_bytes=lds)
@@ -145,7 +159,13 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
     else:
         raise ValueError(f"[flydsl_mhc_seam] no legal tile for H={H}")
     chunks = H // cc
-    splits = max(s for s in range(1, min(splits, chunks) + 1) if chunks % s == 0)
+    blocks = -(-T // bm)
+    target = max(_SPLIT_TARGET_BLOCKS, blocks * _MAX_SPLITS)
+    fitting = [
+        s for s in range(1, chunks + 1) if chunks % s == 0 and blocks * s <= target
+    ]
+    full = [s for s in fitting if _round_fill(blocks * s, cu_num) >= _MIN_ROUND_FILL]
+    splits = max(full or fitting)
     cfg = dict(
         MHC_SEAM_DEFAULTS, BLOCK_M=bm, CHUNK_C=cc, SPLITS=splits, CACHE_NT=cache_nt
     )
