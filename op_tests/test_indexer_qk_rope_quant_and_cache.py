@@ -717,8 +717,8 @@ def main():
         "--num_tokens",
         type=int,
         nargs="*",
-        default=[8, 32],
-        help="Number of tokens. e.g.: -n 8 32",
+        default=[8, 32, 512],
+        help="Number of tokens. e.g.: -n 8 32 512",
     )
     parser.add_argument(
         "--num_heads",

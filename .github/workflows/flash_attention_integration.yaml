@@ -164,14 +164,18 @@ jobs:
           RUN pip install --upgrade pip
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
-          # Install FA (setup.py handles submodule init and installs its pinned aiter)
+          COPY . /aiter
+
+          # Install FA with the PR aiter tree in place of FA's pinned submodule.
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
+              rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
+              cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
+              rm -rf /flash-attention/.git && \
               cd /flash-attention && \
               FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
               pip install --no-build-isolation .
 
-          # Override with PR aiter
-          COPY . /aiter
+          # Ensure the installed aiter points at the PR checkout.
           RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
 
           # Verify aiter is installed from PR branch
@@ -315,13 +319,17 @@ jobs:
           RUN pip install --upgrade pip
           RUN pip install pytest pytest-rerunfailures pytest-timeout einops
 
+          COPY . /aiter
+
           RUN git clone -b ${{ env.FA_BRANCH }} ${{ env.FA_REPOSITORY_URL }} /flash-attention && \
+              rm -rf /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
+              cp -a /aiter /flash-attention/${{ env.AITER_SUBMODULE_PATH }} && \
+              rm -rf /flash-attention/.git && \
               cd /flash-attention/hopper && \
               FLASH_ATTENTION_TRITON_AMD_ENABLE=TRUE \
               FLASH_ATTENTION_FORCE_BUILD=TRUE \
               pip install --no-build-isolation .
 
-          COPY . /aiter
           RUN pip uninstall -y amd-aiter && pip install --no-build-isolation -e /aiter
 
           RUN pip show flash-attn-3 && pip show amd-aiter && pip show triton && \

@@ -640,7 +640,9 @@ def fused_reduce_act_mul_fp8_group_quant(
             y2: (M, N2), dtype = dtype
     """
     _LOGGER.info(
-        f"FUSED_REDUCTION_ACT_MUL_FP8_GROUP_QUANT: x={tuple(x.shape)} activation={activation}"
+        "FUSED_REDUCTION_ACT_MUL_FP8_GROUP_QUANT: x=%s activation=%s",
+        tuple(x.shape),
+        activation,
     )
 
     assert (

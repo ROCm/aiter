@@ -11,6 +11,7 @@ import torch
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_cu_num, get_gfx
 from ..utility import dtypes
+from ..utility.graph_alloc import persistent_alloc
 
 
 # Raw binding: no argument validation, correction_bias must be a real tensor.
@@ -24,6 +25,7 @@ def topk_gating_fwd(
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
+    num_shared_experts: int = 0,
 ) -> None: ...
 
 
@@ -48,6 +50,7 @@ def topk_gating(
     need_renorm: bool = True,
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
+    num_shared_experts: int = 0,
 ) -> None:
     """Unified fused topk gating for MoE routing.
 
@@ -55,12 +58,23 @@ def topk_gating(
         score_func: one of {"sqrtsoftplus" (DeepSeek V4-Pro default),
                             "sigmoid" (Llama4),
                             "softmax" (DeepSeek V3 / classic MoE)}.
+            This scores the routed prefix only.
         correction_bias: optional bias tensor, pass None for no bias. Must be
-            float32, or bfloat16 when gating_output is not float16.
+            float32, or bfloat16 when gating_output is not float16. Sized to
+            the routed expert count, not the shared columns.
+        num_shared_experts: trailing columns of gating_output scored with
+            sigmoid and written after the routed top-k. 0, 1, 2, 4 or 8.
+            topk_weights must be wide enough for those columns, and it must
+            share its row stride with topk_indices. Shared-expert ids are not
+            written; the caller prefills them.
     """
     assert (
         score_func in _VALID_SCORE_FUNCS
     ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
+    if num_shared_experts not in (0, 1, 2, 4, 8):
+        raise ValueError(
+            f"num_shared_experts must be 0, 1, 2, 4 or 8, got {num_shared_experts}"
+        )
     if correction_bias is None:
         correction_bias = torch.empty(
             0, dtype=torch.float32, device=gating_output.device
@@ -79,6 +93,7 @@ def topk_gating(
         need_renorm,
         routed_scaling_factor,
         score_func,
+        num_shared_experts,
     )
 
 
@@ -335,7 +350,8 @@ def topk_use_mulblocks(numRows: int, stride0: int) -> bool: ...
 def _get_topk_mb_workspace_keyed(
     device: torch.device, stream_id: int, size: int
 ) -> torch.Tensor:
-    return torch.zeros(size, dtype=torch.uint8, device=device)
+    with persistent_alloc(device):
+        return torch.zeros(size, dtype=torch.uint8, device=device)
 
 
 def get_topk_mb_workspace(device: torch.device, size: int) -> torch.Tensor:
@@ -376,6 +392,11 @@ def get_topk_scratch_workspace(device: torch.device, size: int) -> torch.Tensor:
     return torch.empty(max(1, int(size)), dtype=torch.uint8, device=device)
 
 
+_FLYDSL_TOPK_PREFILL_DISABLED = os.environ.get(
+    "AITER_DISABLE_FLYDSL_TOPK_PREFILL", "0"
+) in ("1", "true", "True", "yes", "YES")
+
+
 def top_k_per_row_prefill(
     logits: torch.Tensor,
     rowStarts: torch.Tensor,
@@ -397,8 +418,40 @@ def top_k_per_row_prefill(
     When stable=True, the one-block path is forced with deterministic,
     ascending-index ordered, smallest-index tie-breaking emit so every
     tensor-parallel rank selects and orders an identical KV set; the caller sizes
-    the workspace for the ob path in that case."""
-    if not stable and topk_use_mulblocks(numRows, stride0):
+    the workspace for the ob path in that case.
+    """
+    use_mulblocks = not stable and topk_use_mulblocks(numRows, stride0)
+    # FlyDSL one-block outperforms HIP one-block on the remaining prefill cases.
+    if not use_mulblocks and not _FLYDSL_TOPK_PREFILL_DISABLED:
+        from .flydsl.topk.topk_per_row import (
+            _is_flydsl_radix_topk_one_block_supported,
+        )
+
+        if _is_flydsl_radix_topk_one_block_supported(
+            logits,
+            rowStarts,
+            rowEnds,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+        ):
+            return flydsl_radix_topk_one_block_prefill(
+                logits,
+                rowStarts,
+                rowEnds,
+                indices,
+                values,
+                numRows,
+                stride0,
+                stride1,
+                k,
+                stable,
+            )
+
+    if use_mulblocks:
         size = topk_mb_workspace_size(numRows, stride0, k, False)
         workspace = get_topk_mb_workspace(logits.device, size)
     else:
@@ -506,7 +559,11 @@ def _should_use_flydsl_topk_decode(
     k: int,
     stable: bool,
     values: torch.Tensor | None = None,
+    *,
+    width: int | None = None,
 ) -> bool:
+    """Whether the call goes to the FlyDSL decode top-k: gated by the row
+    width -- the logits' own, or the plane ``width`` packed rows stand for."""
     if (
         _FLYDSL_TOPK_DECODE_DISABLED
         or not isinstance(logits, torch.Tensor)
@@ -521,13 +578,13 @@ def _should_use_flydsl_topk_decode(
     if not _flydsl_topk_decode_shape_supported(
         arch,
         stable,
-        logits.shape[1],
+        logits.shape[1] if width is None else width,
         num_rows,
         k,
     ):
         return False
 
-    from .flydsl.topk_per_row import is_flydsl_top_k_per_row_decode_supported
+    from .flydsl.topk.topk_per_row import is_flydsl_top_k_per_row_decode_supported
 
     return is_flydsl_top_k_per_row_decode_supported(
         logits,
@@ -582,6 +639,9 @@ def top_k_per_row_decode(
     k: int = 2048,
     stable: bool = False,
     values: torch.Tensor | None = None,
+    *,
+    row_starts: torch.Tensor | None = None,
+    plane_width: int | None = None,
 ) -> None:
     """Per-row top-k (decode). Always uses the one-block kernel; the scratch
     workspace is allocated + cached on the Python side and passed in, so the C++
@@ -594,7 +654,18 @@ def top_k_per_row_decode(
     When `values` is given (float32, same shape as `indices`), each selected
     index's logit is written alongside it. Rows shorter than k pad the index
     with -1 and the score with -inf, so the padding sorts below every real
-    candidate and a consumer that ranks these scores needs no extra mask."""
+    candidate and a consumer that ranks these scores needs no extra mask.
+
+    Packed rows: ``logits`` is a flat buffer, row r's scores at element
+    ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the
+    indices relative to that start. ``plane_width`` is the width of the plane
+    the rows stand for: it bounds every row and picks the kernel exactly as
+    that plane would, so a packed call runs what its plane call runs."""
+    if row_starts is not None:
+        return _top_k_per_row_decode_packed(
+            logits, next_n, seqLens, indices, numRows, k, stable, values,
+            row_starts, plane_width,
+        )  # fmt: skip
     if _should_use_flydsl_topk_decode(
         logits,
         next_n,
@@ -619,6 +690,38 @@ def top_k_per_row_decode(
             stable,
             values,
         )
+
+    # FlyDSL one-block outperforms HIP one-block on the remaining decode cases.
+    if not _FLYDSL_TOPK_DECODE_DISABLED:
+        from .flydsl.topk.topk_per_row import (
+            _is_flydsl_radix_topk_one_block_supported,
+        )
+
+        if _is_flydsl_radix_topk_one_block_supported(
+            logits,
+            None,
+            seqLens,
+            indices,
+            values,
+            numRows,
+            stride0,
+            stride1,
+            k,
+            is_decode=True,
+            next_n=next_n,
+        ):
+            return flydsl_radix_topk_one_block_decode(
+                logits,
+                next_n,
+                seqLens,
+                indices,
+                numRows,
+                stride0,
+                stride1,
+                k,
+                stable,
+                values,
+            )
 
     if values is not None:
         # The C++ side takes values.data_ptr() as a raw float* and writes k
@@ -651,6 +754,48 @@ def top_k_per_row_decode(
         stable,
         values,
     )
+
+
+def _top_k_per_row_decode_packed(
+    flat: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    k: int,
+    stable: bool,
+    values: torch.Tensor | None,
+    row_starts: torch.Tensor,
+    plane_width: int | None,
+) -> None:
+    """`top_k_per_row_decode` on packed rows: the FlyDSL kernel a
+    ``plane_width`` plane would get, reading each row at its start. The HIP
+    kernels address rows by stride, so there is no fallback to them."""
+    if plane_width is None:
+        raise ValueError("packed rows need the plane width they stand for")
+    if flat.dim() != 1 or not flat.is_contiguous():
+        raise ValueError("packed logits must be a contiguous flat buffer")
+    if row_starts.dtype != torch.int32 or row_starts.shape != (num_rows,):
+        raise ValueError("row_starts must be int32 [num_rows]")
+    if _FLYDSL_TOPK_DECODE_DISABLED:
+        raise ValueError("packed rows need the FlyDSL decode top-k")
+    from .flydsl.topk import topk_per_row as flydsl_topk
+
+    # The kernels take their input as [rows, width] and validate it so; every
+    # row of this view is the buffer itself, a row's start added in-kernel.
+    view = flat.as_strided((num_rows, flat.numel()), (0, 1))
+    if _should_use_flydsl_topk_decode(
+        view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+        width=plane_width,
+    ):  # fmt: skip
+        return flydsl_topk.flydsl_top_k_per_row_decode(
+            view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
+            row_starts=row_starts, plane_width=plane_width,
+        )  # fmt: skip
+    return flydsl_topk.flydsl_radix_topk_one_block(
+        view, row_starts, seq_lens, indices, values, num_rows, 0, 1, k, stable,
+        is_decode=True, next_n=next_n, plane_width=plane_width, packed_rows=True,
+    )  # fmt: skip
 
 
 def flydsl_dcp_topk_merge(
@@ -690,6 +835,68 @@ def flydsl_dcp_topk_merge(
     )
 
 
+def flydsl_radix_topk_one_block_prefill(
+    logits: torch.Tensor,
+    row_starts: torch.Tensor,
+    row_ends: torch.Tensor,
+    indices: torch.Tensor,
+    values: torch.Tensor | None,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+) -> None:
+    """Prefill wrapper with the same argument order as HIP top_k_per_row_prefill."""
+    from .flydsl.topk.topk_per_row import flydsl_radix_topk_one_block
+
+    return flydsl_radix_topk_one_block(
+        logits,
+        row_starts,
+        row_ends,
+        indices,
+        values,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        is_decode=False,
+        next_n=1,
+    )
+
+
+def flydsl_radix_topk_one_block_decode(
+    logits: torch.Tensor,
+    next_n: int,
+    seq_lens: torch.Tensor,
+    indices: torch.Tensor,
+    num_rows: int,
+    stride0: int,
+    stride1: int,
+    k: int = 2048,
+    stable: bool = False,
+    values: torch.Tensor | None = None,
+) -> None:
+    """Decode wrapper with the same argument order as HIP top_k_per_row_decode."""
+    from .flydsl.topk.topk_per_row import flydsl_radix_topk_one_block
+
+    return flydsl_radix_topk_one_block(
+        logits,
+        seq_lens,
+        seq_lens,
+        indices,
+        values,
+        num_rows,
+        stride0,
+        stride1,
+        k,
+        stable,
+        is_decode=True,
+        next_n=next_n,
+    )
+
+
 def flydsl_top_k_per_row_decode(
     logits: torch.Tensor,
     next_n: int,
@@ -707,7 +914,7 @@ def flydsl_top_k_per_row_decode(
     This path is optimized for long-context decode, where its multi-CTA radix
     selection typically outperforms the HIP one-block implementation.
     """
-    from .flydsl.topk_per_row import (
+    from .flydsl.topk.topk_per_row import (
         flydsl_top_k_per_row_decode as _flydsl_top_k_per_row_decode,
     )
 

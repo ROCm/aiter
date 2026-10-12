@@ -1,0 +1,128 @@
+{
+    "M_LEQ_16": {
+        "NUM_KSPLIT": 160,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 1,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_64": {
+        "NUM_KSPLIT": 160,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 1,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_96": {
+        "NUM_KSPLIT": 40,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_192": {
+        "NUM_KSPLIT": 40,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 3,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_352": {
+        "NUM_KSPLIT": 40,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_512": {
+        "NUM_KSPLIT": 32,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_768": {
+        "NUM_KSPLIT": 20,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_1024": {
+        "NUM_KSPLIT": 16,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_1280": {
+        "NUM_KSPLIT": 40,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_2048": {
+        "NUM_KSPLIT": 8,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_2304": {
+        "NUM_KSPLIT": 16,
+        "BLOCK_M": 16,
+        "TILE_K": 32,
+        "num_warps": 2,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_14336": {
+        "NUM_KSPLIT": 16,
+        "BLOCK_M": 64,
+        "TILE_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "M_LEQ_16384": {
+        "NUM_KSPLIT": 1,
+        "BLOCK_M": 64,
+        "TILE_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    },
+    "any": {
+        "NUM_KSPLIT": 4,
+        "BLOCK_M": 64,
+        "TILE_K": 64,
+        "num_warps": 4,
+        "num_stages": 2,
+        "BLOCK_C": 1024,
+        "reduce_num_warps": 1
+    }
+}

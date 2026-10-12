@@ -9,11 +9,23 @@ from ..jit.core import compile_ops
 
 
 @compile_ops("module_hipbsolgemm")
-def hipb_create_extension() -> None: ...
+def hipb_create_extension() -> None:
+    """Initialize hipBLASLt resources for the current device.
+
+    Repeated calls on that device are no-ops. To change devices, synchronize
+    outstanding work and destroy the existing extension before initializing
+    again. Only one device's resources can be active in the module at a time.
+    """
 
 
 @compile_ops("module_hipbsolgemm")
-def hipb_destroy_extension() -> None: ...
+def hipb_destroy_extension() -> None:
+    """Release hipBLASLt resources, allowing a later initialization.
+
+    Synchronize outstanding GEMMs before calling. Destruction uses the owning
+    device and restores the caller's current device. Without an active
+    extension this is a no-op, including after a previous destruction.
+    """
 
 
 def gen_hipb_mm_fake_tensor(
