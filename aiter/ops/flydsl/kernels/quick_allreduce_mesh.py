@@ -526,7 +526,8 @@ def make_quick_allreduce_mesh_kernel(
             return own
 
         def _fanout(phase, inbox_src, sub, to_bounce):
-            """NT-store one rank-tile from LDS to every destination's inbox.
+            """NT-store one rank-tile from LDS to every destination's inbox, or,
+            with *to_bounce*, to this rank's bounce on the relay.
 
             Lockstep stripes of up to 8 sectors cover the rank-tile: at the
             default block INT4 is 8+8+2 (16 nibble sectors then the 2-sector
@@ -595,6 +596,11 @@ def make_quick_allreduce_mesh_kernel(
             payload too; ``vmcnt`` is per-wave, so without the join a
             wave-0 handshake could race stores still in flight. Neither
             can move after the color store, and neither can be dropped.
+
+            For a relay block the payload is in the bounce on the relay GPU,
+            while the flag still goes to the peer's inbox. Its payload stores
+            are system scope (``_RELAY_STORE_CM``), so the same ``vmcnt(0)`` is
+            what orders the payload on the relay before the flag.
 
             On a cacheable inbox retiring the stores is not enough -- they
             can be sitting in this XCD's L2. The release fence after the join
