@@ -33,7 +33,6 @@ from aiter.utility import dtypes as aiter_dtypes
 from .kernels_common import ceildiv, get_warp_size
 from .tensor_shim import _run_compiled
 
-
 WAVE = get_warp_size()
 _LOG2_WAVE = int(math.log2(WAVE))
 
@@ -133,6 +132,7 @@ def _fp8_range():
     fp8_max = float(torch.finfo(fp8_dtype).max)
     fp8_min = float(torch.finfo(fp8_dtype).min)
     return fp8_min, fp8_max
+
 
 # Q kernel
 # Upper bounds tuned on MI355X for D=128. Head batching amortizes the
@@ -1008,7 +1008,9 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"head_size*block_size ({head_size * block_size}) must be a "
             "multiple of 16 (dwordx4 K-cache run size)"
         )
-    lds_bytes = ceildiv(2 * head_size * block_size * k_cache.element_size() + 4, 16) * 16
+    lds_bytes = (
+        ceildiv(2 * head_size * block_size * k_cache.element_size() + 4, 16) * 16
+    )
     lds_limit = get_lds_capacity_bytes(get_gfx_runtime())
     if lds_bytes > lds_limit:
         raise ValueError(
