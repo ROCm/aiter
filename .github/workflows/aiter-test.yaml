@@ -498,14 +498,14 @@ jobs:
     permissions:
       contents: read
     steps:
+      # A shallow checkout, as in build_aiter_wheels: without tags,
+      # setuptools_scm gives the same version as the prebuilt wheel of this
+      # commit (0.1.1.dev1+g<sha>), which sorts below every release, so
+      # unpinned installs from the shared folder never select this wheel.
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          # setuptools_scm derives the version from the distance to the last
-          # release tag; without history it falls back to 0.1.1.dev1, which
-          # sorts below every release.
-          fetch-depth: 0
 
       - name: Sync submodules for wheel build
         run: |

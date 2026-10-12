@@ -3,6 +3,7 @@
 
 import glob
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -465,14 +466,19 @@ class PythonAgnosticBdistWheel(bdist_wheel):
     in-tree run, are packaged too and keep the interpreter-specific tag.
     """
 
+    # Compiled files: .so (also versioned, .so.N) on Linux; .pyd modules and
+    # .dll libraries on Windows.
+    _COMPILED = re.compile(r"\.(so(\.\d+)*|pyd|dll)$")
+
     def get_tag(self):
         impl, abi, plat = super().get_tag()
         # bdist_wheel stages the wheel's files in bdist_dir before asking for
         # the tag; if they are not there, keep the interpreter-specific tag.
-        staged = self.bdist_dir and os.path.isdir(self.bdist_dir)
-        pattern = os.path.join(self.bdist_dir or "", "**", "*.so")
-        if not staged or glob.glob(pattern, recursive=True):
+        if not (self.bdist_dir and os.path.isdir(self.bdist_dir)):
             return impl, abi, plat
+        for _, _, files in os.walk(self.bdist_dir):
+            if any(self._COMPILED.search(name) for name in files):
+                return impl, abi, plat
         return "py3", "none", plat
 
 
