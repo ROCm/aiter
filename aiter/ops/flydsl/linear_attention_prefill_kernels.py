@@ -155,12 +155,7 @@ _OPT_BV_ENV = os.environ.get("FLYDSL_K5_OPT_BV")
 _IS_GFX950 = _GFX_ARCH.startswith("gfx950")
 
 
-def _gdn_k5_target_segments() -> int:
-    target_segments = int(os.environ.get("AITER_GDN_K5_TARGET_SEGMENTS", "8"))
-    if target_segments <= 0:
-        raise ValueError("AITER_GDN_K5_TARGET_SEGMENTS must be positive.")
-    return target_segments
-
+_GDN_K5_TARGET_SEGMENTS = 8
 
 # Blocked-path scratch (maps, carry entries) is never returned to the caller, so it
 # is reused across calls. Reuse is only stream-ordered on the stream that allocated it.
@@ -1015,7 +1010,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
             all(length > 0 for length in lengths)
             and max(chunk_counts) >= _BLOCKED_MIN_CHUNKS
         ):
-            target_segments = _gdn_k5_target_segments()
+            target_segments = _GDN_K5_TARGET_SEGMENTS
             # K5 requires its own blocks when shared metadata uses scalar sizing.
             adaptive_metadata = _resolve_adaptive_k5_metadata(
                 cu_seqlens, T_flat, k.device, target_segments, lengths=lengths
