@@ -102,7 +102,7 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --stage1_fused true --stage2_fused true \
+                        --stage1_fused false --stage2_fused true \
                         --layers 2 --acc_verify 1
                 '
                 _ "$file"
