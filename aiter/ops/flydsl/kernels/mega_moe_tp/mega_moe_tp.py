@@ -62,7 +62,8 @@ class LaunchCfg:
     """One kernel variant: row tile 16 * mt; ll / llr: LL reduce-scatter packets / LL
     route rows too; npp: GEMM1 column blocks per A pass; ag8: MXFP8 all-reduce second
     hop; lb: large-batch schedule (pf: GEMM2 prefetch, lp: forced GEMM1 inter pieces);
-    tn: fused tail (1: FP8 rows, 2: + bf16 rows)."""
+    tn: fused tail (1: FP8 rows, 2: + bf16 rows); small_m_opt: tail-only optimizations
+    selected from the actual global token count, even in a larger-capacity engine."""
 
     mt: int
     ll: bool = False
@@ -71,6 +72,7 @@ class LaunchCfg:
     ag8: bool = False
     lb: bool = False
     tn: int = 0
+    small_m_opt: int = 0
     pf: bool = False
     lp: int = 0
 
@@ -306,6 +308,11 @@ class MegaMoeTPEngine:
             )
         self.mode = comm_mode
         self.check = os.environ.get("AITER_MEGAMOE_TP_CHECK", "0") == "1"
+        # Small fused tails: bit 0 fuses final RS with norm, bit 1 parallelizes
+        # LB finish, bit 2 shortens communication polling. Zero keeps the old path.
+        self.small_m_opt = int(os.environ.get("AITER_MEGAMOE_TP_SMALL_M_OPT", "3"))
+        if not 0 <= self.small_m_opt <= 7:
+            raise ValueError("AITER_MEGAMOE_TP_SMALL_M_OPT must be in [0, 7]")
         if schedule != "dynamic":
             raise ValueError(f'unknown schedule {schedule!r} (only "dynamic")')
         if act_dtype not in ("fp4", "fp8"):
@@ -528,6 +535,7 @@ class MegaMoeTPEngine:
                     lb=True,
                     pf=tot <= LB_PF_MAX,
                     lp=lp if self.I // 128 % max(lp, 1) == 0 else 0,
+                    small_m_opt=self.small_m_opt if tot <= 32 else 0,
                 )
             elif tot <= self.dyn_max:
                 cfg = LaunchCfg(
@@ -587,6 +595,7 @@ class MegaMoeTPEngine:
                 tn_gemma=self.tn_gemma,
                 lbpf=cfg.pf,
                 lbp=cfg.lp,
+                small_m_opt=cfg.small_m_opt if cfg.tn else 0,
             )
             self._launchers[self._key(cfg)] = fn
         return fn

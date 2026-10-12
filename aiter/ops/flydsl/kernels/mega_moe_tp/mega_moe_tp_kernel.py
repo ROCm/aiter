@@ -43,7 +43,9 @@ from .mega_moe_tp_config import (
     C_EPOCH,
     C_TNL,
     CTRL_TNC,
+    ERR_FLAG,
     ERR_YAG,
+    FLAG_RDY,
     FLAG_TN,
     NT,
     NTT,
@@ -88,6 +90,7 @@ def compile_mega_moe_tp(
     tn_gemma: bool = True,
     lbpf: bool = False,
     lbp: int = 0,
+    small_m_opt: int = 0,
 ):
     """Build the launcher of one (shape, variant) instance; LaunchCfg (host) picks them.
 
@@ -130,6 +133,7 @@ def compile_mega_moe_tp(
     peer_sel, poll_loop, poll_zero = kc.get("peer_sel poll_loop poll_zero")
     push_dll, quant_chunks, signal_loop = kc.get("push_dll quant_chunks signal_loop")
     yag_flush, yag_wait, zero_masked = kc.get("yag_flush yag_wait zero_masked")
+    SMALL_ROW, NV, part_sum, own_rs = kc.get("SMALL_ROW NV part_sum own_rs")
 
     TN_V = H // 8
     TN_IT = ceildiv(TN_V, NTT)
@@ -171,19 +175,35 @@ def compile_mega_moe_tp(
             gpu.barrier()
 
     @flyc.jit
-    def tn_row(L, tid, a, r, sysy):
+    def tn_row(L, tid, a, r, sysy, from_part=False):
         H8 = i32(TN_V)
         ry = rsrc(a["y"])
         rres = rsrc(a["tn_res"])
         rout = rsrc(a["tn_out"])
         rw = rsrc(a["tn_w"])
+        residuals, weights = [], []
+        if const_expr(from_part):
+            # Independent loads can overlap the final partial reads and reductions.
+            for k in range_constexpr(TN_IT):
+                q = fx.min(tid + i32(k * NTT), H8 - i32(1))
+                off = (r * i32(H) + q * i32(8)) * i32(2)
+                residuals.append(bld(rres, off, 0, V4I, 0))
+                weights.append(bld(rw, q * i32(16), 0, V4I, 0))
         f, ss = [], fx.Float32(0.0)
         for k in range_constexpr(TN_IT):
             q = tid + i32(k * NTT)
             qc = fx.min(q, H8 - i32(1))
             off = (r * i32(H) + qc * i32(8)) * i32(2)
-            yv = bf16x8_to_f32(bld(ry, off, 0, V4I, AUX_SYS if sysy else 0))
-            rv = bf16x8_to_f32(bld(rres, off, 0, V4I, 0))
+            if const_expr(from_part):
+                ypack = pack_bf16x8(part_sum(a, own_rs(a, "off_part"), r, qc * i32(8)))
+                yv = bf16x8_to_f32(ypack)
+                rv = bf16x8_to_f32(residuals[k])
+                if q < H8:
+                    # Preserve forward()'s y output, without reading it back for norm.
+                    bst(ypack, ry, off, 0, 0)
+            else:
+                yv = bf16x8_to_f32(bld(ry, off, 0, V4I, AUX_SYS if sysy else 0))
+                rv = bf16x8_to_f32(bld(rres, off, 0, V4I, 0))
             fk = [x + y for x, y in zip(yv, rv)]
             live = q < H8
             if live:
@@ -210,7 +230,9 @@ def compile_mega_moe_tp(
         xs, am = [], fx.Float32(0.0)
         for k in range_constexpr(TN_IT):
             q = fx.min(tid + i32(k * NTT), H8 - i32(1))
-            wv = bf16x8_to_f32(bld(rw, q * i32(16), 0, V4I, 0))
+            wv = bf16x8_to_f32(
+                weights[k] if from_part else bld(rw, q * i32(16), 0, V4I, 0)
+            )
             xk = [
                 fx.Float32(
                     fx.Float32(x * rcp * ((w + fx.Float32(1.0)) if tn_gemma else w))
@@ -225,9 +247,9 @@ def compile_mega_moe_tp(
             L,
             tid,
             am.bitcast(fx.Int32),
-            lambda x, y: x.bitcast(fx.Float32)
-            .maximumf(y.bitcast(fx.Float32))
-            .bitcast(fx.Int32),
+            lambda x, y: (
+                x.bitcast(fx.Float32).maximumf(y.bitcast(fx.Float32)).bitcast(fx.Int32)
+            ),
             1,
         )
         scale = amx.bitcast(fx.Float32).maximumf(fx.Float32(1e-10)) / fx.Float32(448.0)
@@ -276,6 +298,35 @@ def compile_mega_moe_tp(
         if tid < i32(TPC):
             fo = fx.Int64((i32(FLAG_TN) + a["rank"] * i32(TN_MAX) + r) * i32(4))
             g_st_sys(peer_sel(a, tid) + fx.Int64(a["off_flag"]) + fo, a["epoch"])
+
+    def tn_parts_pending(tid, a):
+        pending = i32(0)
+        for k in range_constexpr(ceildiv(NV * TPC, 64)):
+            idx = tid + i32(k * 64)
+            live = idx < i32(NV * TPC)
+            c = fx.min(idx // i32(TPC), i32(NV - 1))
+            p = idx % i32(TPC)
+            addr = (
+                a["mine"]
+                + fx.Int64(a["off_flag"])
+                + fx.Int64((i32(FLAG_RDY) + c * i32(MAX_TP) + p) * i32(4))
+            )
+            pending = fx.max(
+                pending,
+                (live & before(g_ld_sys(addr), a["epoch"])).select(i32(1), i32(0)),
+            )
+        return wave_red(pending, tid, fx.max)
+
+    @flyc.jit
+    def tn_small_rows(L, tid, a):
+        # Only row owners wait for all columns. Other CTAs finish their pushes and
+        # proceed to the existing tail-gather/epoch protocol without final RS work.
+        for r_ in range(i32(gpu.block_id("x")), a["m"], i32(gpu.grid_dim.x)):
+            if tid < i32(64):
+                poll_zero(lambda: tn_parts_pending(tid, a), a, tid, ERR_FLAG)
+            gpu.barrier()
+            tn_row(L, tid, a, i32(r_), False, True)
+            gpu.barrier()
 
     @flyc.jit
     def tn_wait(tid, a):
@@ -422,7 +473,10 @@ def compile_mega_moe_tp(
             yag_flush(L, tid, a)
             yag_wait(tid, a, epoch)
         if const_expr(TN):
-            tn_rows(L, tid, a)
+            if const_expr(SMALL_ROW):
+                tn_small_rows(L, tid, a)
+            else:
+                tn_rows(L, tid, a)
             tn_wait(tid, a)
         if const_expr(AG8):
             gpu.barrier()

@@ -112,7 +112,6 @@ from .mega_moe_tp_config import (
     NT,
     NTT,
     NW,
-    POLL_SLEEP,
     SC_ALL,
     SC_LINES,
     SC_PUSH,
@@ -132,6 +131,7 @@ def build_communication(kc: KernelCtx) -> dict:
     const_expr, lb, ll_rs, route_fp8 = kc.get("const_expr lb ll_rs route_fp8")
     situ_beta, situ_linear_beta = kc.get("situ_beta situ_linear_beta")
     swiglu_limit = kc.swiglu_limit
+    SMALL_ROW, COMM_SLEEP = kc.get("SMALL_ROW COMM_SLEEP")
 
     def ctrl_at(a, idx):
         return fx.Int64(a["ctrl"]) + fx.Int64(i32(idx) * i32(4))
@@ -500,6 +500,8 @@ def build_communication(kc: KernelCtx) -> dict:
                     )
 
     def fin_split(a):
+        if SMALL_ROW:
+            return i32(1)
         m = fx.max(a["m"], i32(1))
         nblk = i32(gpu.grid_dim.x)
         return (m < nblk).select(fx.min(i32(NV), nblk // m), i32(1))
@@ -509,6 +511,9 @@ def build_communication(kc: KernelCtx) -> dict:
         return (fin_split(a) > i32(1)).select(bid % fx.max(a["m"], i32(1)), bid)
 
     def fin_owned(a):
+        if SMALL_ROW:
+            # The row CTA performs final RS after roles(), together with norm.
+            return i32(0)
         bid = i32(gpu.block_id("x"))
         m = fx.max(a["m"], i32(1))
         S = fin_split(a)
@@ -549,25 +554,30 @@ def build_communication(kc: KernelCtx) -> dict:
             if const_expr(ll_rs):
                 _final_ll(tid, a, r_recv, row, c0, v, vc)
                 continue
-            acc = [fx.Float32(0.0)] * 8
-            if const_expr(comm_bf16):
-                pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
-                for p in range_constexpr(MAX_TP):
-                    acc = sum_live(acc, bf16x8_to_f32(pk[p]), i32(p) < a["tp"])
-            else:
-                lds_ = []
-                for p in range_constexpr(MAX_TP):
-                    pc = fx.min(i32(p), a["tp"] - i32(1))
-                    doff, soff = part_offs(a, pc * a["mmax"] + row, c0 + vc * i32(8))
-                    lds_.append(
-                        (
-                            bld(r_recv, doff, 0, V2I, AUX_SYS),
-                            bld(r_recv, soff, 0, T.i8, AUX_SYS),
-                        )
-                    )
-                for p in range_constexpr(MAX_TP):
-                    acc = sum_live(acc, fp8x8_decode(lds_[p]), i32(p) < a["tp"])
+            acc = part_sum(a, r_recv, row, c0 + vc * i32(8))
             _y_store(a, row, c0, v, acc)
+
+    def part_sum(a, r_recv, row, col):
+        """FP32 sum in rank order, shared by split final RS and the small tail."""
+        acc = [fx.Float32(0.0)] * 8
+        if comm_bf16:
+            pk = recv_pkts(a, r_recv, row, a["mmax"], col, i32(0))
+            for p in range_constexpr(MAX_TP):
+                acc = sum_live(acc, bf16x8_to_f32(pk[p]), i32(p) < a["tp"])
+        else:
+            lds_ = []
+            for p in range_constexpr(MAX_TP):
+                pc = fx.min(i32(p), a["tp"] - i32(1))
+                doff, soff = part_offs(a, pc * a["mmax"] + row, col)
+                lds_.append(
+                    (
+                        bld(r_recv, doff, 0, V2I, AUX_SYS),
+                        bld(r_recv, soff, 0, T.i8, AUX_SYS),
+                    )
+                )
+            for p in range_constexpr(MAX_TP):
+                acc = sum_live(acc, fp8x8_decode(lds_[p]), i32(p) < a["tp"])
+        return acc
 
     @flyc.jit
     def _final_ll(tid, a, r_recv, row, c0, v, vc):
@@ -756,10 +766,12 @@ def build_communication(kc: KernelCtx) -> dict:
             )
             & fx.Int64(VMASK)
         )
-        fm = i32(
-            fx.Int64(rocdl.ballot(T.i64, live & _final_ready(a, c, epoch)))
-            & fx.Int64(VMASK)
-        )
+        fm = i32(0)
+        if const_expr(not SMALL_ROW):
+            fm = i32(
+                fx.Int64(rocdl.ballot(T.i64, live & _final_ready(a, c, epoch)))
+                & fx.Int64(VMASK)
+            )
         pm = uni(pm)
         fm = uni(fm)
         old_p = lds_ld_acq(L, L_CTL + C_PRDY * 4)
@@ -792,7 +804,7 @@ def build_communication(kc: KernelCtx) -> dict:
             p1 = comm_signal(L, tid, a, epoch)
             p2 = poll_ready(L, tid % i32(64), a, epoch)
             if (p1 | p2) == i32(0):
-                rocdl.s_sleep(POLL_SLEEP)
+                rocdl.s_sleep(COMM_SLEEP)
         _report_if(
             a,
             (now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
@@ -947,7 +959,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 p1 = p1 | poll_ready(L, tid % i32(64), a, epoch)
             p2 = comm_work(L, tid, a, epoch)
             if (p1 | p2) == i32(0):
-                rocdl.s_sleep(POLL_SLEEP)
+                rocdl.s_sleep(COMM_SLEEP)
         _report_if(
             a,
             (now() - t0 >= fx.Int64(DEADLINE)) & ((tid % i32(64)) == i32(0)),
@@ -962,7 +974,7 @@ def build_communication(kc: KernelCtx) -> dict:
             | (lds_ld_acq(L, L_CTL + C_PULL * 4) < i32(NV))
         ) & alive(t0):
             if comm_work(L, tid, a, epoch) == i32(0):
-                rocdl.s_sleep(POLL_SLEEP)
+                rocdl.s_sleep(COMM_SLEEP)
 
     AG_SROW = XB
     AG_SCB = agr * AG_SROW

@@ -35,6 +35,9 @@ one, from ``lb_min`` (default 256) global tokens up the large-batch (LB) one; it
 is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_small`` up to
 ``lb_small_max`` tokens; ``lb_npp`` GEMM1 column blocks per A pass; ``lb_q`` output column
 chunks per GEMM2 unit. Unset fields fall back to ``AITER_MEGAMOE_TP_LB_*``.
+LB fused tails at up to 32 global tokens use a row CTA to combine final RS with
+norm/quant and parallel LB finish. ``AITER_MEGAMOE_TP_SMALL_M_OPT`` is a diagnostic
+bit mask (1: row fusion, 2: finish, 4: shorter polling; default 3, 0: original).
 """
 
 from __future__ import annotations

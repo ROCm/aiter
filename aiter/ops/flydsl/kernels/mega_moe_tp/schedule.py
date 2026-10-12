@@ -97,6 +97,7 @@ def build_schedule(kc: KernelCtx) -> dict:
     lb, lrdy_at, masked, meta_ll_wait = kc.get("lb lrdy_at masked meta_ll_wait")
     rch, report_chunk, spin_sys_ge = kc.get("rch report_chunk spin_sys_ge")
     unit_fields, zero_masked = kc.get("unit_fields zero_masked")
+    SMALL_FINISH = kc.SMALL_FINISH
 
     @flyc.jit
     def gemm2_dispatch(L, tid, a, expert, ks0, icnt, r0, rows, signal):
@@ -852,9 +853,18 @@ def build_schedule(kc: KernelCtx) -> dict:
     @flyc.jit
     def lb_finish(tid, a, L):
         lb_zero_next(tid, a, lb_bank(L))
-        if (tid == i32(0)) & (i32(gpu.block_id("x")) == i32(0)):
-            lb_lists_wait(a, lb_bank(L))
-            g_add_agent(ctrl_at(a, i32(CTRL_LBSEQ)), 1)
+        if const_expr(SMALL_FINISH):
+            if i32(gpu.block_id("x")) == i32(0):
+                # Keep the same all-CTA arrival guarantee before changing banks.
+                if tid < i32(N_XCD):
+                    lb_lbr_wait(a, lb_bank(L), tid)
+                gpu.barrier()
+                if tid == i32(0):
+                    g_add_agent(ctrl_at(a, i32(CTRL_LBSEQ)), 1)
+        else:
+            if (tid == i32(0)) & (i32(gpu.block_id("x")) == i32(0)):
+                lb_lists_wait(a, lb_bank(L))
+                g_add_agent(ctrl_at(a, i32(CTRL_LBSEQ)), 1)
 
     def xg_rs(a):
         rx = rsrc(a["xg"])

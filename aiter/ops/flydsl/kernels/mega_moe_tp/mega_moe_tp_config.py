@@ -261,12 +261,17 @@ def kernel_config(
     tn_gemma: bool = True,
     lbpf: bool = False,
     lbp: int = 0,
+    small_m_opt: int = 0,
 ):
     """The derived compile-time values of one compile_mega_moe_tp instance."""
     if swiglu_limit is None:
         swiglu_limit = 7.0 if act == "swiglu" else float("inf")
     TN = tn in (1, 2)
     assert not TN or not ar
+    assert not small_m_opt or (TN and lb and not ar and not ll_rs)
+    SMALL_ROW = bool(small_m_opt & 1)
+    SMALL_FINISH = bool(small_m_opt & 2)
+    COMM_SLEEP = 1 if small_m_opt & 4 else POLL_SLEEP
     nsk = NSK
     c = mega_moe_tp_consts(H, I, MT, TMAX, agr, E, nab, nch, a8, lb)
     RG, KS1, NCH, KS2, G2 = c["RG"], c["KS1"], c["NCH"], c["KS2"], c["G2"]
@@ -361,6 +366,7 @@ def kernel_config(
         + ("_mtskip" if MTSKIP else "")
         + (f"_ad{ADEPTH}" if ADEPTH != ALOAD_DEPTH else "")
         + ("_pf" if LBPF else "")
+        + (f"_sm{small_m_opt}" if small_m_opt else "")
     )
     const_expr = fx.const_expr
     layout_tag = f"{CTRL_INTS}/{FLAG_INTS}/{DEADLINE}/{NCTA_MAX}"
