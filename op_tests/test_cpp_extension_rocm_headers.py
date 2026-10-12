@@ -37,6 +37,9 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
+        # The compiler probe is cached per hipcc path, so start every test cold
+        # and let each case observe its own mocked `hipcc --version` output.
+        self.cpp_extension._probe_hipcc_version.cache_clear()
         tempdir = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.root = pathlib.Path(tempdir)
         self.runtime = self.root / "python-sdk" / "include"
@@ -96,6 +99,7 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
     def test_compiler_mismatch_overrides_matching_global_version(self):
         for version in ("7.14.0", "6.15.0"):
             with self.subTest(version=version):
+                self.cpp_extension._probe_hipcc_version.cache_clear()
                 self.compiler.return_value = f"HIP version: {version}\n"
                 self.assertNotIn(
                     str(self.system), self.cpp_extension.include_paths(cuda=True)
@@ -105,9 +109,38 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
         self.cpp_extension.ROCM_VERSION = (6, 0)
         self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
 
+    def test_repeated_discovery_reuses_cached_compiler_probe(self):
+        for _ in range(3):
+            self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
+        self.compiler.assert_called_once_with(
+            [str(self.runtime.parent / "bin" / "hipcc"), "--version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+
+    def test_compiler_probe_is_cached_per_hipcc_path(self):
+        self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
+        other_sdk = self.root / "other-sdk"
+        (other_sdk / "bin").mkdir(parents=True)
+        self.cpp_extension.ROCM_HOME = str(other_sdk)
+
+        self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
+
+        # A different ROCM_HOME selects a different hipcc, so it must probe that
+        # compiler instead of reusing the first compiler's cached version.
+        self.assertEqual(
+            [invocation.args[0] for invocation in self.compiler.call_args_list],
+            [
+                [str(self.runtime.parent / "bin" / "hipcc"), "--version"],
+                [str(other_sdk / "bin" / "hipcc"), "--version"],
+            ],
+        )
+
     def test_unknown_or_failed_compiler_is_rejected(self):
         for output in ("", "AMD clang version 7.15.0", "HIP version: unknown"):
             with self.subTest(output=output):
+                self.cpp_extension._probe_hipcc_version.cache_clear()
                 self.compiler.return_value = output
                 self.assertIsNone(
                     self.cpp_extension._find_matching_system_rocm_include()
@@ -118,6 +151,7 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
             subprocess.TimeoutExpired("hipcc", 10),
         ):
             with self.subTest(error=error):
+                self.cpp_extension._probe_hipcc_version.cache_clear()
                 self.compiler.side_effect = error
                 self.assertIsNone(
                     self.cpp_extension._find_matching_system_rocm_include()

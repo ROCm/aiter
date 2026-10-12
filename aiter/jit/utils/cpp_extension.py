@@ -6,6 +6,7 @@
 # We make slight changes to enable ninja response file
 # mypy: allow-untyped-defs
 import copy
+import functools
 import importlib
 import importlib.abc
 import importlib.util
@@ -267,6 +268,30 @@ def _read_hip_header_version(include_dir: str) -> tuple[int, int] | None:
     return int(major.group(1)), int(minor.group(1))
 
 
+# functools.cache is the unbounded form of functools.lru_cache.
+@functools.cache
+def _probe_hipcc_version(hipcc: str) -> tuple[int, int] | None:
+    """Return the HIP version reported by ``hipcc``, or None if unavailable.
+
+    Cached per compiler path: ``include_paths()`` runs several times per build
+    and spawning a compiler just to read its version is expensive, while the
+    path is what changes when the environment selects a different ROCm tree.
+    """
+    try:
+        output = subprocess.check_output(
+            [hipcc, "--version"],
+            text=True,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError, UnicodeError):
+        return None
+    version = re.search(r"HIP version:\s*(\d+)\.(\d+)\b", output)
+    if version is None:
+        return None
+    return int(version.group(1)), int(version.group(2))
+
+
 def _find_matching_system_rocm_include() -> str | None:
     """Use system rocPRIM headers only if their HIP version matches hipcc."""
     if not os.path.isfile(os.path.join(_SYSTEM_ROCM_INCLUDE, _ROCPRIM_HEADER)):
@@ -277,17 +302,7 @@ def _find_matching_system_rocm_include() -> str | None:
 
     # ROCM_VERSION can come from an unrelated hipconfig on PATH or even the
     # system headers themselves. Query the compiler used by the build instead.
-    try:
-        output = subprocess.check_output(
-            [_join_rocm_home("bin", "hipcc"), "--version"],
-            text=True,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return None
-    version = re.search(r"HIP version:\s*(\d+)\.(\d+)\b", output)
-    if version is None or header_version != tuple(map(int, version.groups())):
+    if header_version != _probe_hipcc_version(_join_rocm_home("bin", "hipcc")):
         return None
     return _SYSTEM_ROCM_INCLUDE
 
