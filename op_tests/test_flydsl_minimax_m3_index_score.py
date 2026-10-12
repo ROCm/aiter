@@ -1610,7 +1610,7 @@ def _prefill_work(batch, q_len, ctx_len):
 
 
 @pytest.mark.skip(
-    reason="perf sweep: run_prefill via python op_tests/test_flydsl_minimax_m3_index_score_prefill.py"
+    reason="perf sweep: run via python op_tests/test_flydsl_minimax_m3_index_score.py"
 )
 @benchmark()
 def test_score_prefill_perf(batch, q_len, ctx_len, heads):
