@@ -135,11 +135,7 @@ def _assert_query_ranges(works, qo_lens, ratio: int):
         )
         if qo_start == qo_end:
             continue
-        owners = [
-            span
-            for span in covered
-            if span[0] <= qo_start and qo_end <= span[1]
-        ]
+        owners = [span for span in covered if span[0] <= qo_start and qo_end <= span[1]]
         assert len(owners) == 1, (
             f"query range [{qo_start}, {qo_end}) does not sit inside exactly one "
             f"folded pseudo-batch: {owners}"
@@ -162,6 +158,8 @@ def _assert_query_ranges(works, qo_lens, ratio: int):
     [
         (96, [1, 1, 1, 1, 1, 1, 1, 0]),
         (96, [2, 1, 3]),
+        (96, [2, 2, 2, 0]),
+        (96, [4, 4, 4, 0]),
         (16, [2, 1, 3]),
     ],
 )
@@ -175,26 +173,38 @@ def test_nonuniform_query_ranges_stay_inside_folded_q(nhead, qo_lens):
     _assert_query_ranges(meta["works"], qo_lens, ratio)
 
 
-def _decode_reference(q, kv, kv_indptr, kv_indices, scale):
+def _decode_reference(q, kv, qo_lens, kv_indptr, kv_indices, scale):
+    """Causal: query i of an L-token request sees the first K - L + 1 + i keys."""
     outs = []
-    for token in range(q.shape[0]):
-        begin = int(kv_indptr[token].item())
-        end = int(kv_indptr[token + 1].item())
-        keys = kv[kv_indices[begin:end]].float()
-        scores = torch.matmul(q[token].float(), keys.transpose(0, 1)) * scale
-        probs = torch.softmax(scores, dim=-1)
-        outs.append(torch.matmul(probs, keys[:, :_DV]))
+    for batch, length in enumerate(qo_lens):
+        begin = int(kv_indptr[batch].item())
+        kv_len = int(kv_indptr[batch + 1].item()) - begin
+        for i in range(length):
+            visible = kv_len - length + 1 + i
+            keys = kv[kv_indices[begin : begin + visible]].float()
+            token = len(outs)
+            scores = torch.matmul(q[token].float(), keys.transpose(0, 1)) * scale
+            probs = torch.softmax(scores, dim=-1)
+            outs.append(torch.matmul(probs, keys[:, :_DV]))
     return torch.stack(outs)
 
 
-def test_folded_nonuniform_decode_matches_reference():
-    """The GSM8K tail: 7 real decode tokens plus one empty graph-padding row."""
+@pytest.mark.parametrize(
+    "qo_lens,kv_lens",
+    [
+        # The GSM8K tail: 7 real decode tokens plus one empty graph-padding row.
+        ([1, 1, 1, 1, 1, 1, 1, 0], [48, 64, 33, 80, 17, 96, 40, 0]),
+        # Spec decode plus padding. 300 forces KV splits, so the reduce maps of
+        # the requests before the empty row are exercised too.
+        ([2, 2, 2, 0], [48, 300, 33, 0]),
+        ([4, 4, 4, 0], [48, 300, 33, 0]),
+    ],
+)
+def test_folded_nonuniform_decode_matches_reference(qo_lens, kv_lens):
     if get_gfx() != "gfx942":
         pytest.skip("the 96-head fold is the gfx942 bf16 path")
 
     nhead = 96
-    qo_lens = [1, 1, 1, 1, 1, 1, 1, 0]
-    kv_lens = [48, 64, 33, 80, 17, 96, 40, 0]
     ratio = _fold_ratio(nhead)
     device = "cuda"
     scale = _D**-0.5
@@ -217,7 +227,7 @@ def test_folded_nonuniform_decode_matches_reference():
         meta["kv_indptr"],
         kv_indices,
         meta["last"],
-        1,
+        max(qo_lens),
         page_size=1,
         sm_scale=scale,
         return_lse=False,
@@ -229,5 +239,5 @@ def test_folded_nonuniform_decode_matches_reference():
         reduce_partial_map=buffers["reduce_partial_map"],
     )
     torch.cuda.synchronize()
-    reference = _decode_reference(q, kv, meta["kv_indptr"], kv_indices, scale)
+    reference = _decode_reference(q, kv, qo_lens, meta["kv_indptr"], kv_indices, scale)
     torch.testing.assert_close(out.float(), reference, atol=2e-2, rtol=2e-2)
