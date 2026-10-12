@@ -25,6 +25,7 @@ def topk_gating_fwd(
     need_renorm: bool,
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
+    num_shared_experts: int = 0,
 ) -> None: ...
 
 
@@ -49,6 +50,7 @@ def topk_gating(
     need_renorm: bool = True,
     routed_scaling_factor: float = 1.0,
     score_func: str = "sqrtsoftplus",
+    num_shared_experts: int = 0,
 ) -> None:
     """Unified fused topk gating for MoE routing.
 
@@ -56,12 +58,23 @@ def topk_gating(
         score_func: one of {"sqrtsoftplus" (DeepSeek V4-Pro default),
                             "sigmoid" (Llama4),
                             "softmax" (DeepSeek V3 / classic MoE)}.
+            This scores the routed prefix only.
         correction_bias: optional bias tensor, pass None for no bias. Must be
-            float32, or bfloat16 when gating_output is not float16.
+            float32, or bfloat16 when gating_output is not float16. Sized to
+            the routed expert count, not the shared columns.
+        num_shared_experts: trailing columns of gating_output scored with
+            sigmoid and written after the routed top-k. 0, 1, 2, 4 or 8.
+            topk_weights must be wide enough for those columns, and it must
+            share its row stride with topk_indices. Shared-expert ids are not
+            written; the caller prefills them.
     """
     assert (
         score_func in _VALID_SCORE_FUNCS
     ), f"Unknown score_func '{score_func}', expected one of {_VALID_SCORE_FUNCS}"
+    if num_shared_experts not in (0, 1, 2, 4, 8):
+        raise ValueError(
+            f"num_shared_experts must be 0, 1, 2, 4 or 8, got {num_shared_experts}"
+        )
     if correction_bias is None:
         correction_bias = torch.empty(
             0, dtype=torch.float32, device=gating_output.device
@@ -80,6 +93,7 @@ def topk_gating(
         need_renorm,
         routed_scaling_factor,
         score_func,
+        num_shared_experts,
     )
 
 

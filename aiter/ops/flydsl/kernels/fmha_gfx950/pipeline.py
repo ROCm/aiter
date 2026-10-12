@@ -202,13 +202,13 @@ def _exp2_score_slice(v_s, start):
         s_lo = [Vec(v_s[0])[r] for r in range_constexpr(16)]
         lo_partial = []
         for r in range_constexpr(16):
-            lo_partial.append(rocdl.exp2(T.f32, as_mlir_value(s_lo[r])))
+            lo_partial.append(fx.Float32(s_lo[r]).exp2(fastmath="afn"))
         return Vec.from_elements(lo_partial, fx.Float32).ir_value(), v_s[1]
 
     lo_partial = [Vec(v_s[0])[r] for r in range_constexpr(16)]
     hi_full = []
     for r in range_constexpr(16):
-        hi_full.append(rocdl.exp2(T.f32, as_mlir_value(Vec(v_s[1])[r])))
+        hi_full.append(fx.Float32(Vec(v_s[1])[r]).exp2(fastmath="afn"))
     return lo_partial, hi_full
 
 
@@ -771,11 +771,8 @@ class DualwaveFp8KernelContext:
         lds = fx.SharedAllocator().allocate(shared_storage).peek()
         self.lds = lds
         self.lds_kv_base_idx = fx.Index(fx.ptrtoint(lds.kv.ptr))
-        self.lds_kv_base_ptr = lds.kv.ptr.llvm_ptr
         self.lds_vt_base_idx = fx.Index(fx.ptrtoint(lds.vt.ptr))
-        self.lds_vt_base_ptr = lds.vt.ptr.llvm_ptr
         self.lds_q_base_idx = fx.Index(fx.ptrtoint(lds.q.ptr))
-        self.lds_q_base_ptr = lds.q.ptr.llvm_ptr
 
     def init_thread_mapping(self):
         _init_dualwave_thread_mapping(self)
@@ -911,15 +908,15 @@ class DualwaveFp8KernelContext:
             causal_num_tiles = (
                 fx.Index(causal_end_i32) + kv_tile_size - 1
             ) // kv_tile_size
-            max_num_tiles = fx.Index(
-                (causal_num_tiles < num_kv_tiles).select(causal_num_tiles, num_kv_tiles)
+            max_num_tiles = (causal_num_tiles < num_kv_tiles).select(
+                causal_num_tiles, num_kv_tiles
             )
         else:
             causal_end_raw_i32 = None
             max_num_tiles = num_kv_tiles
         # Pipeline needs an EVEN tile count >= 4; extra tiles read 0 (num_records) and are masked.
         max_num_tiles = ((max_num_tiles + 1) // 2) * 2
-        max_num_tiles = fx.Index((max_num_tiles < 4).select(4, max_num_tiles))
+        max_num_tiles = (max_num_tiles < 4).select(4, max_num_tiles)
         self.max_num_tiles = max_num_tiles
         if const_expr(traits.SPLITK):
             chunk = (
@@ -930,14 +927,14 @@ class DualwaveFp8KernelContext:
                 // 2
                 * 2
             )
-            chunk = fx.Index((chunk < 6).select(6, chunk))
+            chunk = (chunk < 6).select(6, chunk)
             split_t0 = self.split_idx * chunk
             split_t_end = split_t0 + chunk
-            split_t_end = fx.Index(
-                (split_t_end < max_num_tiles).select(split_t_end, max_num_tiles)
+            split_t_end = (split_t_end < max_num_tiles).select(
+                split_t_end, max_num_tiles
             )
-            split_t_end = fx.Index(
-                (max_num_tiles - split_t_end < 4).select(max_num_tiles, split_t_end)
+            split_t_end = (max_num_tiles - split_t_end < 4).select(
+                max_num_tiles, split_t_end
             )
             self.split_nonempty = split_t0 + 4 <= max_num_tiles
         else:
@@ -952,7 +949,7 @@ class DualwaveFp8KernelContext:
             if const_expr(traits.CAUSAL and traits.CROSS_SEQLEN):
                 in_mask = causal_end_raw_i32 > fx.Int32(0)
                 active = in_mask if active is None else (active & in_mask)
-            split_t_end = fx.Index(active.select(split_t_end, split_t0))
+            split_t_end = active.select(split_t_end, split_t0)
 
         self.split_t0 = split_t0
         self.split_t_end = split_t_end
@@ -1035,12 +1032,13 @@ class DualwaveFp8KernelContext:
         )
 
     def read_i32x8_lds(self, base_ptr, byte_row):
+        vec_ty = Vec.make_type(4, fx.Int32)
+        ptr_ty = fx.PointerType.get(
+            fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
+        )
+        base_ptr = fx.recast_iter(ptr_ty, base_ptr)
         halves = []
         for h in range_constexpr(2):
-            p = buffer_ops.get_element_ptr(
-                base_ptr, byte_offset=fx.Int32(byte_row + h * 16), elem_type=T.i8
-            )
-            halves.append(
-                Vec(llvm.LoadOp(Vec.make_type(4, fx.Int32), p, alignment=16).result)
-            )
+            p = fx.add_offset(base_ptr, fx.Int32(byte_row + h * 16))
+            halves.append(fx.ptr_load(p, result_type=vec_ty))
         return halves[0].shuffle(halves[1], [0, 1, 2, 3, 4, 5, 6, 7]).ir_value()
