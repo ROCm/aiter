@@ -94,6 +94,7 @@ def compile_pa_decode_tile(
     max_context_length: int | None = None,
     sliding_window: int = 0,
     nhd_layout: bool = False,
+    from_table_width: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -103,7 +104,9 @@ def compile_pa_decode_tile(
     for example D512/MTP4/GQA16 splits twice and D1024/MTP3/GQA16 splits three
     ways. Explicit BF16 splits must fit that limit as well.
     ``max_context_length`` bounds dense planned work for scheduling only; it does not
-    change the launch capacity, scratch layout, or single-tile guarantee.
+    change the launch capacity, scratch layout, or single-tile guarantee. Every
+    context length, including later graph replays, must be at most this value.
+    A smaller value reads past the staged page ids.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
     M-tiles. Partial output stays unsplit for the shared reducer.
 
@@ -149,6 +152,7 @@ def compile_pa_decode_tile(
         max_context_length=max_context_length,
         sliding_window=sliding_window,
         nhd_layout=nhd_layout,
+        from_table_width=from_table_width,
     )
     cached = _PA_DECODE_TILE_CACHE.get(schedule.cache_key)
     if cached is not None:

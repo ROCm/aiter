@@ -223,8 +223,9 @@ def pa_decode(
 
     ``max_context_length`` selects the scheduling bound, rounded up to
     whole pages as in tuning. This keeps the selected specialization independent
-    of extra block-table padding. Callers must ensure
-    every GPU context length is at most ``max_context_length`` when supplying it.
+    of extra block-table padding. It is the caller's contract, including for
+    graph replay: every context length that will run must be at most
+    ``max_context_length``. A smaller value reads past the staged page ids.
 
     GPU lengths and table entries are not checked. Callers must ensure
     0 <= context_lengths[i] <= block_tables.shape[1] * block_size and used
@@ -686,6 +687,7 @@ def pa_decode(
             kv_buffer_u32=kv_buffer_u32,
             work_capacity=work_plan.capacity,
             max_context_length=schedule_context_length,
+            from_table_width=max_context_length is None,
             sliding_window=sliding_window,
             nhd_layout=nhd_layout,
         )

@@ -23,6 +23,11 @@ LOG2E = 1.4426950408889634
 KV_COMPUTE_BLOCK = 256
 BF16_LDS_LIMIT_BYTES = 64 * 1024
 PAGE_ID_STAGE_LIMIT = 4096  # i32 page ids, 16 KiB of LDS.
+LDS_BYTES_PER_CU = 160 * 1024  # gfx950; NHD runs only there.
+# Q/P, scales, max/sum, and V page ids for every legal NHD shape (one M-tile,
+# page 64, head 256, per-tensor). PaDecodeTraits.create checks this prefix.
+_NHD_LDS_BEFORE_PAGES = 5072
+_NHD_V_BUF_BYTES = 4 * 64 * 256
 
 
 def d256_m1_pipe(
@@ -55,9 +60,9 @@ def _warn_unstaged_page_ids(pages: int) -> None:
     from aiter import logger
 
     logger.warning(
-        "pa_decode reads page ids inside the tile loop: a planned task may own "
-        "%d page ids, above the %d-id LDS limit. Lower max_context_length or "
-        "raise max_partitions and the workgroup budget to stage them first.",
+        "pa_decode reads page ids inside the tile loop: the block table allows "
+        "%d page ids per task, above the %d-id LDS limit. Pass max_context_length "
+        "to stage them.",
         pages,
         PAGE_ID_STAGE_LIMIT,
     )
@@ -75,16 +80,32 @@ def max_tiles_per_task(num_seqs, work_capacity, num_partitions, max_context_leng
     return min(max_tiles, max(-(-max_tiles // num_partitions), by_budget))
 
 
+def _nhd_single_cta_bytes(stage_pages: int) -> int:
+    """LDS bytes for one NHD CTA with a single V buffer."""
+    base = _NHD_LDS_BEFORE_PAGES + stage_pages * 4
+    return ((base + 15) & ~15) + _NHD_V_BUF_BYTES
+
+
 def stage_page_capacity(
-    num_seqs, work_capacity, num_partitions, max_context_length, block_size
+    num_seqs,
+    work_capacity,
+    num_partitions,
+    max_context_length,
+    block_size,
+    from_table_width=False,
 ) -> int:
-    """Page ids to stage per task, or 0 to keep table reads in the tile loop."""
+    """Page ids to stage per task, or 0 to keep table reads in the tile loop.
+
+    The warning fires only when the block-table width set the bound. A caller
+    who passed ``max_context_length`` already chose that bound.
+    """
     tiles = max_tiles_per_task(
         num_seqs, work_capacity, num_partitions, max_context_length
     )
     pages = tiles * (KV_COMPUTE_BLOCK // block_size)
     if pages > PAGE_ID_STAGE_LIMIT:
-        _warn_unstaged_page_ids(pages)
+        if from_table_width:
+            _warn_unstaged_page_ids(pages)
         return 0
     return max(256, 1 << max(pages - 1, 0).bit_length())
 
@@ -130,6 +151,7 @@ class PaDecodeSchedule:
         max_context_length: int | None = None,
         sliding_window: int = 0,
         nhd_layout: bool = False,
+        from_table_width: bool = False,
     ) -> PaDecodeSchedule:
         """Choose the existing policy from host-known grid and query bounds."""
         if isinstance(work_capacity, bool) or not isinstance(work_capacity, int):
@@ -283,12 +305,24 @@ class PaDecodeSchedule:
         stage_pages = 0
         if D256_M1_PIPE and max_context_length is not None:
             stage_pages = stage_page_capacity(
-                num_seqs, work_capacity, num_partitions, max_context_length, block_size
+                num_seqs,
+                work_capacity,
+                num_partitions,
+                max_context_length,
+                block_size,
+                from_table_width,
             )
-        # A second NHD V buffer lets the next tile's DMA overlap PV, but its LDS
-        # leaves room for only one CTA per CU; larger grids run faster with two
-        # single-buffered CTAs sharing each CU.
-        NHD_V_BUFS = 2 if nhd_layout and split_workgroups <= num_compute_units else 1
+        # Two V buffers overlap the next tile's DMA with PV. One buffer is
+        # faster only when the grid is wider than the CU count and two
+        # single-buffered CTAs still fit in LDS. Staged page ids can use the
+        # room the second CTA needs; then two buffers win.
+        wide_grid = nhd_layout and split_workgroups > num_compute_units
+        single_bytes = _nhd_single_cta_bytes(stage_pages)
+        NHD_V_BUFS = (
+            1
+            if wide_grid and 2 * single_bytes <= LDS_BYTES_PER_CU
+            else (2 if nhd_layout else 1)
+        )
 
         # Prefetch supported single-M query tiles independently of grid size.
         prefetch_v = (
@@ -695,6 +729,9 @@ class PaDecodeTraits:
             ), "NHD V DMA maps one 16-lane group to one 256-byte token row"
             assert block_size == TOK_PER_WARP, "NHD V DMA stages one page per warp"
             assert NHD_DMAS * WAVE * 16 == nhd_page_bytes
+            assert sVnhd_off + nhd_buf_bytes == _nhd_single_cta_bytes(
+                stage_page_capacity
+            ), "NHD single-buffer LDS no longer matches the buffer-count rule"
             total_bytes = sVnhd_off + NHD_V_BUFS * nhd_buf_bytes
 
         return cls(

@@ -91,17 +91,10 @@ class PaDecodeLds:
         fx.ptr_store(vec, self.pointer(byte_off, elem_ty))
 
     def barrier_keep_dma(self):
-        # gpu.barrier's workgroup fences make the waitcnt pass drain every
-        # in-flight LDS-DMA. Only this CTA's LDS writes must be visible, so
-        # retire them and sync; the memory clobber keeps the compiler from
-        # moving LDS accesses across.
-        llvm_d.inline_asm(
-            None,
-            [],
-            "s_waitcnt lgkmcnt(0)\n\ts_barrier",
-            "~{memory}",
-            has_side_effects=True,
-        )
+        # Retire this CTA's LDS writes, then sync. s_barrier does not wait for
+        # the in-flight V copy; fx.rocdl.barrier() would.
+        rocdl.s_waitcnt(lgkmcnt=0)
+        rocdl.s_barrier()
 
     def row_offset(self, byte_off, m_idx, width, elem_ty):
         return byte_off + m_idx * (width * dsl_size_of(elem_ty))
