@@ -170,6 +170,15 @@ def _get_alibi_slopes(total_num_heads: int, device: torch.Tensor) -> torch.Tenso
     return slopes
 
 
+@pytest.fixture(autouse=True)
+def _restore_default_device():
+    """input_helper sets the torch default device; restore it so tests that run
+    later in the same process keep allocating on CPU by default."""
+    prev_device = torch.get_default_device()
+    yield
+    torch.set_default_device(prev_device)
+
+
 def seed_everything(seed):
     random.seed(seed)
     torch.manual_seed(seed)

@@ -628,24 +628,27 @@ def test_fused_qk_norm_rope_gate_fp8_quant_decode_prefix_multiple_suffix_sequenc
 
 
 def test_fused_qk_norm_rope_gate_fp8_quant_rejects_cpu_inputs():
-    q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM)
-    key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM)
-    with pytest.raises(ValueError, match="requires a CUDA/HIP device"):
-        fused_qk_norm_rope_gate_fp8_quant(
-            q_gate,
-            key,
-            key,
-            torch.empty(HEAD_DIM),
-            torch.empty(HEAD_DIM),
-            torch.empty(1, ROTARY_DIM),
-            torch.zeros(1, dtype=torch.int64),
-            torch.tensor([0, 1], dtype=torch.int32),
-            num_actual_tokens=1,
-            num_query_heads=NUM_QUERY_HEADS,
-            num_kv_heads=NUM_KV_HEADS,
-            head_dim=HEAD_DIM,
-            rotary_dim=ROTARY_DIM,
-        )
+    # Pin CPU explicitly: another test module may leave the torch default device
+    # set to CUDA, which would put these "CPU" inputs on the GPU.
+    with torch.device("cpu"):
+        q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM)
+        key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM)
+        with pytest.raises(ValueError, match="requires a CUDA/HIP device"):
+            fused_qk_norm_rope_gate_fp8_quant(
+                q_gate,
+                key,
+                key,
+                torch.empty(HEAD_DIM),
+                torch.empty(HEAD_DIM),
+                torch.empty(1, ROTARY_DIM),
+                torch.zeros(1, dtype=torch.int64),
+                torch.tensor([0, 1], dtype=torch.int32),
+                num_actual_tokens=1,
+                num_query_heads=NUM_QUERY_HEADS,
+                num_kv_heads=NUM_KV_HEADS,
+                head_dim=HEAD_DIM,
+                rotary_dim=ROTARY_DIM,
+            )
 
 
 def test_fused_qk_norm_rope_gate_fp8_quant_rejects_non_gfx950(monkeypatch):
