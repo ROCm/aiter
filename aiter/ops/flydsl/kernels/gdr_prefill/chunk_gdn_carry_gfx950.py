@@ -73,7 +73,13 @@ def _affine_step(
     mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32, fx.Float32))
     thr_mma = tmma.get_slice(tid)
     copy_b = fx.make_tiled_copy_B(lds_cp, tmma).get_slice(tid)
-    b_view = fx.make_view(fx.get_iter(rhs), fx.make_layout((16, 128), (1, 16)))
+    b_view = fx.make_view(
+        fx.get_iter(rhs),
+        fx.make_composed_layout(
+            fx.static(fx.SwizzleType.get(2, 4, 2)),
+            fx.make_layout((16, 128), (1, 16)),
+        ),
+    )
     p_b = copy_b.partition_S(b_view)
     frag_b = fx.make_rmem_tensor(1, fx.Float32)
     a_view = fx.make_view(fx.get_iter(rhs), fx.make_layout((128, 32), (1, 128)))
@@ -179,7 +185,13 @@ def compile_chunk_gdn_carry(
             entry_tensor, head * K * V, (blocks, K, V, 1), (H * K * V, V, 1, 1)
         )
         shared = fx.SharedAllocator().allocate(SharedStorage).peek()
-        state = shared.state.view(fx.make_layout((K, BV), (BV, 1)))
+        # XOR row groups into bank bits to avoid four-way C-store conflicts.
+        state = shared.state.view(
+            fx.make_composed_layout(
+                fx.static(fx.SwizzleType.get(2, 4, 2)),
+                fx.make_layout((K, BV), (BV, 1)),
+            )
+        )
         seed = fx.Vector.filled(8, 0.0, fx.Float32)
         if const_expr(use_initial_state):
             # Public h0 [V,K] transposes into carry [K,V].
