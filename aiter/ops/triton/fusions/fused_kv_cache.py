@@ -157,8 +157,8 @@ def fused_qk_rope_cat_and_cache_mla(
       (e.g. a bf16-absorb k-up GEMM wrote q_nope straight into q_out), so this
       op only ropes q_pe into ``q_out[..., D1:]`` and writes the KV cache,
       skipping the q_nope read/copy. Restrictions (asserted below): requires
-      ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), and RoPE
-      inputs. gfx1250 pure decode uses a gluon head-tiled kernel; other archs
+      ``q_out`` is not None, a single KV head (KH==1, i.e. MLA), RoPE
+      inputs, and ``num_decode_toks_for_zeros == 0``. gfx1250 pure decode uses a gluon head-tiled kernel; other archs
       and mixed prefill + decode use a Triton head-tiled kernel.
 
     Models without a rotary embedding use fused_qk_cat_and_cache_mla instead.
@@ -466,12 +466,16 @@ def _cat_and_cache_mla(
         # kernel.
         assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
         assert apply_rope, "q_nope_prestored requires RoPE inputs"
+        # The prestored kernels write neither decode_q_pe_out nor
+        # q_nope_zeros_out, so reject a request for them.
+        assert (
+            num_decode_toks_for_zeros == 0
+        ), "q_nope_prestored does not produce decode_q_pe_out / q_nope_zeros_out"
         use_gluon_htile = (
             _QPE_ROPE_IMPL != "triton"
             and DEVICE_ARCH == "gfx1250"
             and gluon_qpe_htile_kernel is not None
             and b_slot == b
-            and num_decode_toks_for_zeros == 0
         )
         if not use_gluon_htile:
             block_h = _QPE_ROPE_BLOCK_H or (64 if b <= 256 else 128)

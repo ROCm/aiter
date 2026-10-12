@@ -1279,13 +1279,18 @@ _fused_qpe_rope_and_cache_mla_kernel_repr = make_kernel_repr(
     [
         "QH",
         "BLOCK_H",
+        "H_TILES",
         "BLOCK_D_nope",
         "BLOCK_D_pe",
         "BLOCK_SIZE",
         "REUSE_FREQS_FRONT_PART",
         "IS_NEOX",
         "SHUFFLED_KV_CACHE",
+        "SCALE_K_WIDTH_NOPE",
+        "SCALE_K_WIDTH_ROPE",
         "HAVE_K_SCALE",
+        "UPCAST_OPERAND",
+        "num_warps",
     ],
 )
 
@@ -1543,7 +1548,8 @@ def _fused_qpe_rope_and_cache_mla_kernel(
 
         # Rope k_pe with the 1-warp kernel's rounding,
         # bf16(fma(x, cos, bf16(rot * sin))), so the KV cache is bit-identical
-        # to the full-rope path (fp32 throughout with UPCAST_OPERAND).
+        # to the full-rope path. With UPCAST_OPERAND the full-rope path keeps
+        # the roped k_pe in fp32 until the KV-cache cast, so k_pe_r stays fp32.
         if FAST_ROPE:
             k0, k1 = tl.split(tl.reshape(k_pe.to(tl.float32), (BLOCK_D_HALF_pe, 2)))
             cf = cos.to(tl.float32)
@@ -1558,9 +1564,9 @@ def _fused_qpe_rope_and_cache_mla_kernel(
                 r1 = tl.fma(
                     k1, cf, (k0 * sf).to(k_pe_ptr.dtype.element_ty).to(tl.float32)
                 )
-            k_pe_r = tl.reshape(tl.join(r0, r1), (BLOCK_D_pe,)).to(
-                k_pe_ptr.dtype.element_ty
-            )
+            k_pe_r = tl.reshape(tl.join(r0, r1), (BLOCK_D_pe,))
+            if not UPCAST_OPERAND:
+                k_pe_r = k_pe_r.to(k_pe_ptr.dtype.element_ty)
         else:
             k_pe_f32 = k_pe.to(tl.float32)
             if IS_NEOX:
@@ -1572,9 +1578,9 @@ def _fused_qpe_rope_and_cache_mla_kernel(
                     k_pe_f32, d_pe_offs % 2 == 0, BLOCK_D_pe, BLOCK_D_HALF_pe
                 )
             if UPCAST_OPERAND:
-                k_pe_r = (
-                    k_pe_f32 * cos.to(tl.float32) + k_pe_rotated * sin.to(tl.float32)
-                ).to(k_pe_ptr.dtype.element_ty)
+                k_pe_r = k_pe_f32 * cos.to(tl.float32) + k_pe_rotated * sin.to(
+                    tl.float32
+                )
             else:
                 k_rs = (
                     (k_pe_rotated * sin.to(tl.float32))
@@ -1585,7 +1591,7 @@ def _fused_qpe_rope_and_cache_mla_kernel(
                     k_pe_ptr.dtype.element_ty
                 )
         # tokens >= B (k-only) are cached as given
-        k_pe = tl.where(is_q_tok, k_pe_r, k_pe)
+        k_pe = tl.where(is_q_tok, k_pe_r, k_pe.to(k_pe_r.dtype))
 
         has_slot = pid_slot >= 0
         slot = tl.maximum(pid_slot, 0)
