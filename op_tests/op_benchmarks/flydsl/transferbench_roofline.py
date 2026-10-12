@@ -15,7 +15,7 @@ What the roofline is
 ===============================
 
 The roof for a byte count is the **best over algorithms**, not the throughput of
-one. 
+one.
 
     one-shot  N parallel transfers, GPU i reduces all N buffers into its own:
               -N (G0..G(N-1) Gi Gi <cus> <bytes>)  for each i
@@ -296,7 +296,7 @@ def _ring(tp: int, nbytes: int, cus: int) -> list[str]:
     """One step of a ring all-reduce; the caller scales by ``_ring_steps``.
 
     Each rank sends its chunk to its successor and receives from its
-    predecessor -- point-to-point only, never a fan-in. 
+    predecessor -- point-to-point only, never a fan-in.
     """
     chunk = round16(nbytes // tp)
     return [
@@ -399,7 +399,7 @@ _ERR_RE = re.compile(r"^\s*\[ERROR\]\s*(.*)")
 
 
 def _duration_ms(gbps: float, ms: float, nbytes: int) -> float:
-    """Best available duration for one row, in ms. """
+    """Best available duration for one row, in ms."""
     if gbps > 0.0 and nbytes > 0 and gbps >= ms:
         return (nbytes / 1e6) / gbps
     if ms > 0.0:
@@ -505,7 +505,7 @@ def measure_floors(
     warmup: int = FLOOR_WARMUP,
     timeout: float = 900.0,
 ) -> dict:
-    """``{(algo, cus): [ms per test]}`` -- what a minimal test costs to run. """
+    """``{(algo, cus): [ms per test]}`` -- what a minimal test costs to run."""
     keys, config = [], []
     for name, emit, _steps, fanin, split in _ALGOS:
         if algos is not None and name not in algos:
@@ -556,9 +556,7 @@ def measure(
     if not plans:
         return {}
     floors = (
-        measure_floors(
-            tp_size, binary=binary, cus=cus, algos=algos, timeout=timeout
-        )
+        measure_floors(tp_size, binary=binary, cus=cus, algos=algos, timeout=timeout)
         if subtract_floor
         else {}
     )
@@ -602,9 +600,7 @@ def measure(
             # Per test: take off its own launch floor, and sum across the phases
             # of a multi-test plan (two-shot).
             bw_us = sum(t.slowest_exec_ms - f for t, f in zip(chunk, floor)) * 1e3
-            if not math.isfinite(bw_us) or bw_us < (
-                MIN_RESOLVED_US if floors else 0.0
-            ):
+            if not math.isfinite(bw_us) or bw_us < (MIN_RESOLVED_US if floors else 0.0):
                 unresolved.add(plan.nbytes)
                 continue
             # Scale by the step count (the ring runs one representative step),
@@ -630,6 +626,7 @@ def measure(
 # ---------------------------------------------------------------------------
 # Standalone entrypoint: dry-run the config, self-test the parser, or measure
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
     import argparse
