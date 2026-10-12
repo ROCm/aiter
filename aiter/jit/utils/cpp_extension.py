@@ -340,6 +340,9 @@ def _find_matching_system_rocm_include() -> str | None:
         )
         return None
     if header_version != compiler_version:
+        # The devel headers ship in AMD's `rocm-sdk-devel` wheel, which is only
+        # published on AMD's wheel index: the PyPI project of the same name is
+        # an unrelated placeholder, so the hint must pass --index-url.
         _warn_once(
             f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: they are "
             f"ROCm {header_version[0]}.{header_version[1]} but the build's hipcc "
@@ -348,8 +351,8 @@ def _find_matching_system_rocm_include() -> str | None:
             "missing rocPRIM or hipcub headers, install matching ROCm "
             f"{compiler_version[0]}.{compiler_version[1]} development packages, "
             'e.g. "apt install rocprim-dev hipcub-dev rocthrust-dev" or '
-            f'"pip install rocm-sdk-devel=={compiler_version[0]}.'
-            f'{compiler_version[1]}.*".'
+            '"pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ '
+            f'rocm-sdk-devel=={compiler_version[0]}.{compiler_version[1]}.*".'
         )
         return None
     return _SYSTEM_ROCM_INCLUDE
