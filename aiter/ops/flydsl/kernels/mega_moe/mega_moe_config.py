@@ -316,7 +316,17 @@ def _select_large_stage1(bucket: int, inter_dim: int) -> Stage1Config:
         use_tile_resource=True,
         b_nt=3 if 1 < bucket <= 256 else 0,
         work_shards=work_shards,
-        payload_chunk_rows=384,
+        # payload_chunk_rows is part of the dispatch wire protocol: senders
+        # chunk payload by it (emit_dispatch_payload) and receivers predict
+        # publisher counts by it (_initialize_section_ready).  Under uneven-rank
+        # dynamic prefill each rank picks its own token bucket within this
+        # MAX-MTPR (32768) class, so the value MUST be identical for every
+        # bucket or Stage1's equality wait deadlocks.  1536 is the value tuned
+        # for the largest bucket (16384): measured rank-invariant across the
+        # class it is a no-op on 2048/4096/8192 (within noise) while recovering
+        # ~14% e2e at bucket 16384 vs the 384 base, so it is the performant
+        # rank-invariant choice for the whole class.
+        payload_chunk_rows=1536,
         prepare_quant_cu=prepare_quant_cu,
     )
 
@@ -434,6 +444,7 @@ class _TuningContext:
     mtpr_class: int
     a_dtype: str
     apply_fp4: bool
+    fixed_slot: bool = False
 
 
 def _fp4_common_prelude(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
@@ -447,9 +458,11 @@ def _fp4_common_prelude(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoECo
         elif bucket == 16:
             config = _replace_config(config, stage1={"grid_mult": 3})
 
-    if bucket <= 128 and config.stage1.async_a_copy:
+    if bucket <= 128 and config.stage1.async_a_copy and not ctx.fixed_slot:
         # FP4 halves the A K-step bytes. SBM64 gives every thread at least one
         # 16-byte async copy unless a validated synchronous patch below applies.
+        # Skipped for fixed-slot (ll_cap=32 at mtpr 1/2/4 is not divisible by
+        # SBM64); those tiny profiles keep the legal SBM32 FP4 geometry.
         config = _replace_config(config, stage1={"sort_block_m": 64})
 
     if 256 <= tokens < 32768:
@@ -578,13 +591,19 @@ def _tune_r1(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                 stage1={"mfma_amajor": True, "b_nt": 0},
                 stage2={"block_n": 256, "block_m": 64, "skew_cu": 96},
             )
-    elif bucket == 16384:
-        config = _replace_config(config, stage1={"payload_chunk_rows": 1536})
     elif bucket == 32768:
-        config = _replace_config(
-            config,
-            stage1={"payload_chunk_rows": 384, "num_dispatch_cu": 64},
-        )
+        # num_dispatch_cu is a rank-local launch knob (main already tunes it
+        # per bucket, e.g. the mtpr==8192 table above), so varying it per rank
+        # is safe.  payload_chunk_rows is NOT: it is part of the dispatch wire
+        # protocol -- senders chunk payload by it (emit_dispatch_payload) and
+        # receivers predict publisher counts by it
+        # (_initialize_section_ready).  Each rank selects its own token bucket,
+        # so a per-bucket payload_chunk_rows makes a TPR16384 sender emit
+        # chunks a TPR128 receiver does not expect, deadlocking Stage1's
+        # equality wait.  It is kept at the rank-invariant class base (1536,
+        # set in _select_large_stage1) for every bucket; only tune the
+        # rank-local dispatch CU count here.
+        config = _replace_config(config, stage1={"num_dispatch_cu": 64})
     return config
 
 
@@ -899,13 +918,30 @@ def select_mega_moe_config(
     # base config, so they never inherit another network's tuning or base rules.
     profile = _match_network(experts_per_rank, model_dim, inter_dim)
     if profile is not None and profile.name == "r1" and bucket == 8192:
+        # Disable the aligned-pair Stage2 for R1 bucket 8192 on BOTH dtypes.
+        # Although a8w4's mtpr>=1024 p2p is fp8_blockwise (which aligned-pair
+        # nominally requires), the aligned-pair path is non-deterministic for
+        # a8w4 here: test_mega_moe_v2's slice_output consistency check
+        # (two forwards must return identical valid rows) fails intermittently
+        # at bs8192.  Keep the plain Stage2, which is deterministic for both
+        # dtypes.  (Do NOT FP4-gate this: that re-enables the flaky a8w4 path.)
         config = _replace_config(
             config,
             stage2={"aligned_pair": False, "pair_cu": 0},
         )
-    if a_dtype == ACTIVATION_FP4 and bucket <= 128 and config.stage1.async_a_copy:
+    if (
+        a_dtype == ACTIVATION_FP4
+        and bucket <= 128
+        and config.stage1.async_a_copy
+        and not fixed_slot_dispatch
+    ):
         # FP4 halves each A K-step. SBM64 keeps at least one 16-byte async
         # copy per thread in the eight-wave Stage1 configuration.
+        # Excluded for fixed-slot: its EP8 receive capacity is
+        # ll_cap=ceil(8*mtpr/32)*32, which is 32 at mtpr 1/2/4, so promoting
+        # sort_block_m to 64 breaks the Stage1 `fuse_cap % tile_m == 0` compile
+        # assert (and the fixed-slot required-cap check).  Those tiny profiles
+        # keep the legal SBM32 FP4 geometry.
         config = replace(
             config,
             stage1=replace(config.stage1, sort_block_m=64),
@@ -930,6 +966,7 @@ def select_mega_moe_config(
         mtpr_class=mtpr_class,
         a_dtype=a_dtype,
         apply_fp4=apply_fp4,
+        fixed_slot=fixed_slot_dispatch,
     )
     # FP4 common prelude applies to every matched non-K3 network, including the
     # V4-Pro EPLB redundant-expert profiles 52/56 that have no tuner; apply it as
