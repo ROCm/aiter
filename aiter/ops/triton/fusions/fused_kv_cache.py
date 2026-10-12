@@ -44,9 +44,14 @@ _LOGGER = AiterTritonLogger()
 DEVICE_ARCH = arch_info.get_arch()
 
 _BLOCK_H_MIN_TOKENS = int(os.environ.get("AITER_FUSED_KV_CACHE_MIN_TOKENS", "128"))
-# Head tile / warps of the Triton q_nope-prestored MLA rope kernel.
-_QPE_ROPE_BLOCK_H = int(os.environ.get("AITER_QPE_ROPE_BLOCK_H", "32"))
-_QPE_ROPE_NUM_WARPS = int(os.environ.get("AITER_QPE_ROPE_NUM_WARPS", "4"))
+# q_nope-prestored MLA rope kernel: "gluon" (gfx1250 pure-decode head-tiled
+# kernel, falls back to Triton when ineligible) or "triton" (always Triton).
+_QPE_ROPE_IMPL = os.environ.get("AITER_QPE_ROPE_IMPL", "gluon")
+# Head tile / warps of the Triton q_nope-prestored MLA rope kernel; 0 = pick by
+# token count (gfx1250 sweep: 64 heads / 4 warps up to 256 tokens, else 128
+# heads / 1 warp, 2 warps for NeoX).
+_QPE_ROPE_BLOCK_H = int(os.environ.get("AITER_QPE_ROPE_BLOCK_H", "0"))
+_QPE_ROPE_NUM_WARPS = int(os.environ.get("AITER_QPE_ROPE_NUM_WARPS", "0"))
 
 
 def fused_qk_rope_cat_and_cache_mla_fake_tensor(
@@ -462,16 +467,21 @@ def _cat_and_cache_mla(
         assert kh == 1, "q_nope_prestored supports a single KV head (MLA) only"
         assert apply_rope, "q_nope_prestored requires RoPE inputs"
         use_gluon_htile = (
-            DEVICE_ARCH == "gfx1250"
+            _QPE_ROPE_IMPL != "triton"
+            and DEVICE_ARCH == "gfx1250"
             and gluon_qpe_htile_kernel is not None
             and b_slot == b
             and num_decode_toks_for_zeros == 0
         )
         if not use_gluon_htile:
-            block_h = min(triton.next_power_of_2(qh), _QPE_ROPE_BLOCK_H)
-            triton_fused_qpe_rope_and_cache_mla_kernel[
-                (b_slot, triton.cdiv(qh, block_h))
-            ](
+            block_h = _QPE_ROPE_BLOCK_H or (64 if b <= 256 else 128)
+            block_h = min(triton.next_power_of_2(qh), block_h)
+            num_warps = _QPE_ROPE_NUM_WARPS or (
+                4 if b <= 256 else (2 if is_neox else 1)
+            )
+            h_tiles = triton.cdiv(qh, block_h)
+            # grid column h_tiles is the KV-cache writer for each token
+            triton_fused_qpe_rope_and_cache_mla_kernel[(b_slot, h_tiles + 1)](
                 q_pe,
                 k_nope,
                 k_pe,
@@ -500,6 +510,7 @@ def _cat_and_cache_mla(
                 k_scale_ptr=k_scale,
                 QH=qh,
                 BLOCK_H=block_h,
+                H_TILES=h_tiles,
                 REUSE_FREQS_FRONT_PART=reuse_freqs_front_part,
                 IS_NEOX=is_neox,
                 BLOCK_D_nope=d_nope,
@@ -511,7 +522,7 @@ def _cat_and_cache_mla(
                 SCALE_K_WIDTH_ROPE=SCALE_K_WIDTH_ROPE,
                 HAVE_K_SCALE=(k_scale is not None and apply_scale),
                 UPCAST_OPERAND=upcast_operand,
-                num_warps=_QPE_ROPE_NUM_WARPS,
+                num_warps=num_warps,
             )
             return q_out, decode_q_pe_out, k_pe_out, q_nope_zeros_out
         BLOCK_H_HT = 16
