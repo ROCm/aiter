@@ -149,7 +149,7 @@ _BACKWARD_COMPAT_MAP = {
     "device_info": "utils.device_info",
     "gmm_common": "utils.gmm_common",
     "logger": "utils.logger",
-    "mha_kernel_utils": "utils._triton.mha_kernel_utils",
+    "mha_kernel_utils": "_triton_kernels.common.mha_kernel_utils",
     "moe_common": "utils.moe_common",
     "types": "utils.types",
     # Quant modules (quant/)

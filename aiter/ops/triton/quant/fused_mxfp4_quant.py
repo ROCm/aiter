@@ -9,7 +9,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.quant.fused_mxfp4_quant import (
     _gluon_fused_reduce_rms_mxfp4_quant_kernel,
     _gluon_fused_rms_mxfp4_quant_kernel,
 )
-from aiter.ops.triton._triton_kernels.activation import (
+from aiter.ops.triton._triton_kernels.common.activation import (
     _get_activation_from_str,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_mxfp4_quant import (

@@ -1,8 +1,8 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import pid_grid_3d
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid_3d
 
 _mha_v4_per_tensor_amax_repr = make_kernel_repr(
     "mha_v4_per_tensor_amax_kernel",

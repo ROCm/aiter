@@ -4,7 +4,7 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.triton._triton_kernels.activation import (
+from aiter.ops.triton._triton_kernels.common.activation import (
     _get_activation_from_str,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
