@@ -531,17 +531,25 @@ def run_pa_sparse_prefill(
     backends: tuple = _BACKENDS,
     seed: int = 0,
     data_init: str = "norm",
+    num_kv_splits: int | None = None,
     verify: bool = True,
     bench: bool = True,
 ) -> dict | None:
     assert prec in _PRECS, f"unknown prec {prec!r}"
     if _skip_if_unsupported(d=d):
         return None
+    # A forced split count runs where split-K is built: bf16 OPUS, H <= 32,
+    # gfx950. None is the op's own choice, which is split-K for a few tokens.
+    if num_kv_splits is not None and (
+        prec != "bf16" or h > 32 or _get_gpu_arch() != "gfx950"
+    ):
+        return None
 
     softmax_scale = 1.0 / math.sqrt(d)
     msg = (
         f"[N={n} H={h} D={d} total_pages={total_pages} total_tokens={total_tokens} "
-        f"prec={prec} topk={topk} data_init={data_init} seed={seed}]"
+        f"prec={prec} topk={topk} data_init={data_init} seed={seed} "
+        f"num_kv_splits={num_kv_splits}]"
     )
     wanted = [b for b in _PREC_BACKENDS[prec] if b in backends]
 
@@ -596,7 +604,9 @@ def run_pa_sparse_prefill(
                 (
                     "opus",
                     lambda: pa_sparse_prefill_opus(
-                        **kernel_inputs, softmax_scale=softmax_scale
+                        **kernel_inputs,
+                        softmax_scale=softmax_scale,
+                        num_kv_splits=num_kv_splits,
                     ),
                 )
             )
@@ -710,8 +720,9 @@ parser.add_argument(
     "--n_tokens",
     type=int,
     nargs="*",
-    default=[1024, 4096],
-    help="number of query tokens N (default: [1024, 4096])",
+    default=[64, 1024, 4096],
+    help="number of query tokens N (default: [64, 1024, 4096]; 64 is few enough "
+    "that bf16 OPUS splits each token's keys at H=16)",
 )
 parser.add_argument(
     "--h_q",
@@ -793,6 +804,14 @@ parser.add_argument(
     default=["norm"],
     help="DATA initialization distribution(s) for Q, KV and attention sink",
 )
+parser.add_argument(
+    "--num_kv_splits",
+    type=lambda s: None if s == "auto" else int(s),
+    nargs="+",
+    default=[None],
+    help="bf16 OPUS split-K counts: auto (the op's own choice), 1, 2, 4 or 8; "
+    "a forced count runs on gfx950 with H <= 32 (default: auto)",
+)
 
 
 if __name__ == "__main__":
@@ -800,13 +819,14 @@ if __name__ == "__main__":
 
     rows = []
     # product varies its last argument fastest -> this is also the row order.
-    for prec, topk, h, n, total_pages, data_init in itertools.product(
+    for prec, topk, h, n, total_pages, data_init, splits in itertools.product(
         args.prec,
         args.topk,
         args.h_q,
         args.n_tokens,
         args.total_pages,
         args.data_init,
+        args.num_kv_splits,
     ):
         total_tokens = args.total_tokens if args.total_tokens is not None else n
         row = run_pa_sparse_prefill(
@@ -820,6 +840,7 @@ if __name__ == "__main__":
             backends=tuple(args.backend),
             seed=args.seed,
             data_init=data_init,
+            num_kv_splits=splits,
             verify=not args.no_verify,
             bench=not args.no_bench,
         )
@@ -834,7 +855,11 @@ if __name__ == "__main__":
         if drop_cols:
             df = df.drop(columns=drop_cols)
         # Column order otherwise follows whichever row first ran a backend.
-        lead = [c for c in ("prec", "topk", "data_init", "h", "n") if c in df.columns]
+        lead = [
+            c
+            for c in ("prec", "topk", "data_init", "h", "n", "num_kv_splits")
+            if c in df.columns
+        ]
         rest = [c for c in df.columns if c not in lead]
         metrics = [c for b in _BACKENDS for c in rest if c.startswith(f"{b} ")]
         df = df[lead + [c for c in rest if c not in metrics] + metrics]
