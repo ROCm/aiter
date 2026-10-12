@@ -562,17 +562,22 @@ def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
 
     Served by ``moe_2stage_a16wmix.gemm1_a8w4_gfx942`` (FP4 -> FP8 decode + fp8 MFMA,
     MX scales after the MFMA), not by the gfx950 mixed_moe kernels, so it gets its own
-    ``_g942`` name family: ``flydsl_moe1_afp8_wfp4_bf16_t{M}x{N}x{K}_g942[_bnt0][_kw{n}]``.
+    ``_g942`` name family:
+    ``flydsl_moe1_afp8_wfp4_bf16_t{M}x{N}x{K}_g942[_bnt0][_kw{n}][_qi]``.
     Standard (GGUU) gate/up layout; stage 2 is the a16w4 bf16-intermediate kernel.
+    ``_qi``: the kernel quantises the bf16 x to MXFP8 itself (``x_layout="bf16"``), so
+    fused_moe skips the separate quant launch -- a win at the smallest M only.
     """
     kernels = {}
 
-    def _emit(tm, tn, tk, *, kw=1, bnt=2):
+    def _emit(tm, tn, tk, *, kw=1, bnt=2, qi=False):
         name = flydsl_kernel_name(1, "fp8", "fp4", "bf16", tm, tn, tk) + "_g942"
         if bnt != 2:
             name += f"_bnt{bnt}"
         if kw != 1:
             name += f"_kw{kw}"
+        if qi:
+            name += "_qi"
         kernels[name] = {
             "stage": 1,
             "a_dtype": "fp8",
@@ -589,6 +594,7 @@ def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
             # compiler default, as fused_moe passes it (an absent key would make
             # callers that default to 3 time a different kernel)
             "waves_per_eu": None,
+            "x_layout": "bf16" if qi else "moe_sort",
         }
 
     for tm in (16, 32):
@@ -600,7 +606,8 @@ def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
                     if tn % (16 * (4 // kw)) or (tm * tk) % 1024:
                         continue
                     for bnt in (0, 2):
-                        _emit(tm, tn, tk, kw=kw, bnt=bnt)
+                        for qi in (False, True):
+                            _emit(tm, tn, tk, kw=kw, bnt=bnt, qi=qi)
     return kernels
 
 
@@ -1618,9 +1625,11 @@ def _flydsl_moe_stage1_impl(
     # gfx942 a8w4 (MXFP8 A x MXFP4 W). The gfx950 mixed_moe a8w4 kernels need the
     # gfx950-only scaled f8f6f4 MFMA; on gfx942 this port decodes FP4 -> FP8 and runs
     # the fp8 MFMA. `a` / `a1_scale` are fused_dynamic_mxfp8_quant_moe_sort's outputs
-    # (x_layout="moe_sort"); w1 / w1_scale must be the a16w4 preshuffle relaid by
-    # shuffle_{weight,scale}_a8w4_gfx942. Output is the a16w4 bf16 intermediate
-    # [sorted_size, inter_dim] by sorted position, so stage 2 is the a16w4 kernel.
+    # (x_layout="moe_sort"), or, for the `_qi` names, the bf16 x with no scale, which
+    # the kernel quantises itself (x_layout="bf16"); w1 / w1_scale must be the a16w4
+    # preshuffle relaid by shuffle_{weight,scale}_a8w4_gfx942. Output is the a16w4 bf16
+    # intermediate [sorted_size, inter_dim] by sorted position, so stage 2 is the a16w4
+    # kernel.
     if a_dtype == "fp8" and b_dtype == "fp4":
         from flydsl.runtime.device import get_rocm_arch
 
@@ -1641,9 +1650,12 @@ def _flydsl_moe_stage1_impl(
             inter_sorted = _alloc(
                 sorted_size, inter_dim, dtype=torch.bfloat16, device=dev
             )
+            _x_bf16 = a.dtype == torch.bfloat16
             flydsl_a8w4_gemm1_gfx942(
                 a_fp8=a.contiguous(),
-                a_scale_u8=a1_scale.view(torch.uint8).contiguous(),
+                a_scale_u8=(
+                    None if _x_bf16 else a1_scale.view(torch.uint8).contiguous()
+                ),
                 w1_u8=w1.view(torch.uint8).contiguous(),
                 w1_scale_u8=w1_scale.view(torch.uint8).contiguous().view(-1),
                 sorted_expert_ids=sorted_expert_ids,
@@ -1665,7 +1677,7 @@ def _flydsl_moe_stage1_impl(
                 situ_beta=situ_beta,
                 situ_linear_beta=situ_linear_beta,
                 swiglu_limit=runtime_swiglu_limit(swiglu_limit, _act),
-                x_layout="moe_sort",
+                x_layout="bf16" if _x_bf16 else "moe_sort",
             )
             return inter_sorted
     # The gate/up (N) axis tile must divide inter_dim; for non-256-aligned

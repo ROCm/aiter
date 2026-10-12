@@ -28,13 +28,17 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
+from flydsl._mlir import ir
+from flydsl._mlir.dialects import scf
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
+from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
 
 from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.act import gate_up_act, situ_params
+from aiter.ops.flydsl.kernels.dpp_utils import dpp_xor_f32
 from aiter.ops.flydsl.kernels.mxfp4_gemm_common import (
     _global_i32_buffer_tiles,
     lds_typed_ptr,
@@ -138,6 +142,12 @@ def _gemm1_body_a8w4(
     # sorting): x in natural K order, E8M0 scales per SORTED row in aiter's MX scale
     # swizzle. "a8w4": mxfp8_quant_a8w4_gfx942 (A8W4_K8_ORDER, [n_tokens, K/32]).
     _ms = x_layout == "moe_sort"
+    # x_layout="bf16": x is the bf16 activation [n_tokens, K]; each K tile is quantised to
+    # MXFP8 inside the kernel straight into the A LDS slot (A8W4_K8_ORDER) with the same
+    # exponent rule as the separate quantisers, and its block scales go to an f32 LDS
+    # area. Saves the separate quant launch, at the cost of every N-block re-quantising
+    # its rows -- for small M only.
+    _qi = x_layout == "bf16"
     _ms_npad = ((K // MX_BLOCK + 7) // 8) * 8  # aiter scaleN_pad
     N_OUT = 2 * INTER
     m_repeat = BM // 16
@@ -242,6 +252,157 @@ def _gemm1_body_a8w4(
     )
     lds_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
 
+    if const_expr(_qi):
+        # thread t of the k-group handles 8 consecutive K of one row; the 4 threads of an
+        # MX block are adjacent lanes, so the block amax is two DPP quad swaps.
+        _qg = num_n_waves * 64
+        _c8 = TILE_K // 8
+        _q_iters = (BM * _c8) // _qg
+        _xs_grp = A_LDS_STAGES * n_blk * BM * 4  # f32 block scales per k-group
+        q_tid = wave_n_id * fx.Int32(64) + lane
+        xs_lds_base = fx.Int32(k_wave * _A_GRP_BYTES) + wave_k_id * fx.Int32(_xs_grp)
+        x_tiles4 = _global_i32_buffer_tiles(
+            arg_x, fx.Int64(i32_ntok) * fx.Int64(K * 2), 4
+        )
+        x_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(0), fx.Int32)
+        lds_i32 = lds_typed_ptr(lds_base_i32, T.i32)
+        lds_f32 = lds_typed_ptr(lds_base_i32, T.f32)
+        _f0 = fx.Float32(0.0)
+        _half_sub = fx.Float32(2.0**-11)  # half the smallest FNUZ e4m3 subnormal
+
+        # row / chunk / x dwordx4 index of each of this thread's chunks: fixed over K
+        # q_tok: padding rows (token >= n_tokens) are never quantised -- the 4 threads of
+        # an MX block share a row, so whole quads skip and the DPP swaps stay in-quad;
+        # small M has mostly padding rows. Their A/scale LDS is zeroed once instead.
+        q_row, q_c8, q_x16, q_tok = [], [], [], []
+        for it in range_constexpr(_q_iters):
+            ch = fx.Int32(it * _qg) + q_tid
+            row = ch // fx.Int32(_c8)
+            c8 = ch % fx.Int32(_c8)
+            tok = fx.Int32(_global_i32_at(arg_mind, bx_m + row)) & fx.Int32(0x00FFFFFF)
+            q_row.append(row)
+            q_c8.append(c8)
+            q_x16.append(tok * fx.Int32(K // 8) + c8)
+            q_tok.append(tok)
+
+        def _a_quant_load(base_k):
+            """Issue the bf16 x loads of a K tile; returns the registers (no wait)."""
+            regs = []
+            for it in range_constexpr(_q_iters):
+                r = fx.make_rmem_tensor(fx.make_layout(4, 1), fx.Int32)
+                fx.copy(
+                    x_atom,
+                    fx.slice(x_tiles4, (None, q_x16[it] + base_k // fx.Int32(8))),
+                    r,
+                )
+                regs.append(r)
+            return regs
+
+        def _q_slot_bytes(it, slot):
+            byte = (
+                k_grp_base_bytes
+                + fx.Int32(slot * A_SLOT_BYTES)
+                + q_row[it] * fx.Int32(TILE_K)
+                + q_c8[it] * fx.Int32(8)
+            )
+            sc_byte = (
+                xs_lds_base
+                + (fx.Int32(slot * n_blk) + q_c8[it] // fx.Int32(4)) * fx.Int32(BM * 4)
+                + q_row[it] * fx.Int32(4)
+            )
+            return byte, sc_byte
+
+        def _if_then(cond, body):
+            # runtime `if` in a helper (the AST rewrite only covers the kernel body)
+            if_op = scf.IfOp(_raw(cond), [], has_else=False)
+            if len(if_op.regions[0].blocks) == 0:
+                if_op.regions[0].blocks.append(*[])
+            with ir.InsertionPoint(if_op.regions[0].blocks[0]):
+                body()
+                scf.YieldOp([])
+
+        def _a_quant_zero_pad():
+            for it in range_constexpr(_q_iters):
+
+                def _zero(it=it):
+                    for slot in range_constexpr(A_LDS_STAGES):
+                        byte, sc_byte = _q_slot_bytes(it, slot)
+                        lds_i32[byte // fx.Int32(4)] = fx.Int32(0)
+                        lds_i32[byte // fx.Int32(4) + fx.Int32(1)] = fx.Int32(0)
+                        lds_f32[sc_byte // fx.Int32(4)] = _f0
+
+                _if_then(q_tok[it] >= i32_ntok, _zero)
+
+        def _a_quant_one(it, v, slot):
+            xf = []
+            for d in range_constexpr(4):
+                w = fx.Int32(v[d])
+                xf.append((w << fx.Int32(16)).bitcast(fx.Float32))
+                xf.append((w & fx.Int32(-65536)).bitcast(fx.Float32))
+            # maxnum + DPP quad swaps: plain VALU (maximumf adds a NaN check per
+            # value, shuffle_xor is an LDS swizzle with a full lgkmcnt wait)
+            amax = fmath.absf(xf[0])
+            for xv in xf[1:]:
+                amax = fx.maxnumf(amax, fmath.absf(xv))
+            amax = fx.maxnumf(amax, dpp_xor_f32(amax, 1))
+            amax = fx.maxnumf(amax, dpp_xor_f32(amax, 2))
+            # _mxfp8_exponent on the float bits: E - 7, +1 if the mantissa > 1.875
+            bits = amax.bitcast(fx.Int32)
+            ex = (bits.shrui(fx.Int32(23)) & fx.Int32(0xFF)) - fx.Int32(134)
+            ex = ex + ((bits & fx.Int32(0x7FFFFF)) > fx.Int32(0x700000)).select(
+                fx.Int32(1), fx.Int32(0)
+            )
+            ex = fx.min(fx.max(ex, fx.Int32(-127)), fx.Int32(127))
+            inv = ((fx.Int32(127) - ex) << fx.Int32(23)).bitcast(fx.Float32)
+            q = []
+            for xv in xf:
+                # |v| <= 2^-11 rounds to 0, and -0 is NaN (0x80) in FNUZ -> force +0
+                sv = xv * inv
+                q.append(_raw((fmath.absf(sv) <= _half_sub).select(_f0, sv)))
+
+            def _pk(a0, a1, a2, a3):
+                pk = rocdl.cvt_pk_fp8_f32(T.i32, a0, a1, _raw(fx.Int32(0)), 0)
+                return fx.Int32(rocdl.cvt_pk_fp8_f32(T.i32, a2, a3, pk, 1))
+
+            # A8W4_K8_ORDER: (x0, x2, x4, x6) then (x1, x3, x5, x7)
+            byte, sc_byte = _q_slot_bytes(it, slot)
+            lds_i32[byte // fx.Int32(4)] = _pk(q[0], q[2], q[4], q[6])
+            lds_i32[byte // fx.Int32(4) + fx.Int32(1)] = _pk(q[1], q[3], q[5], q[7])
+            # all 4 threads of the block store the same scale (benign)
+            lds_f32[sc_byte // fx.Int32(4)] = (
+                (ex + fx.Int32(127)) << fx.Int32(23)
+            ).bitcast(fx.Float32)
+
+        def _a_quant_write(regs, slot):
+            for it in range_constexpr(_q_iters):
+                v = Vec(fx.memref_load_vec(regs[it]))
+                _if_then(
+                    q_tok[it] < i32_ntok, lambda it=it, v=v: _a_quant_one(it, v, slot)
+                )
+
+        def load_xs_lds(slot):
+            """xs[mi][b] = f32x4 block-b scales of this lane's 4 accumulator rows."""
+            out = []
+            for mi in range_constexpr(m_repeat):
+                r0 = fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4)
+                out.append(
+                    [
+                        Vec(
+                            lds_vec_load(
+                                lds_base_i32,
+                                xs_lds_base
+                                + fx.Int32((slot * n_blk + b) * BM * 4)
+                                + r0 * fx.Int32(4),
+                                Vec.make_type(4, fx.Float32),
+                                fx.Float32,
+                                align=16,
+                            )
+                        )
+                        for b in range_constexpr(n_blk)
+                    ]
+                )
+            return out
+
     # A scales; this lane needs the rows its accumulator holds. Padding rows (token >=
     # n_tokens) read past the resource -> 0 -> no contribution.
     #   "mx":  e8m0 [n_tokens, K/32], applied per MFMA together with the W scale.
@@ -253,7 +414,7 @@ def _gemm1_body_a8w4(
         1,
     )
     xs_row_base = []  # [mi][i]: "mx" dword index of the row's first scale; "row" f32
-    for mi in range_constexpr(0 if _ms else m_repeat):
+    for mi in range_constexpr(0 if (_ms or _qi) else m_repeat):
         bases = []
         for ii in range_constexpr(4):
             row = bx_m + fx.Int32(mi * 16) + lane_div_16 * fx.Int32(4) + fx.Int32(ii)
@@ -333,7 +494,7 @@ def _gemm1_body_a8w4(
 
     def load_x_scale(base_k):
         """xs[mi][i] = list of TILE_K/128 dwords (4 e8m0 bytes each) for that row."""
-        if const_expr(_row_xs):
+        if const_expr(_row_xs or _qi):
             return None
         if const_expr(_ms):
             return load_x_scale_moe_sort(base_k)
@@ -386,6 +547,8 @@ def _gemm1_body_a8w4(
             if const_expr(_ms):
                 fr = [_to_k8_order(v) for v in fr]
             frags.append(fr)
+        if const_expr(_qi):
+            return frags, load_xs_lds(slot)
         return frags
 
     zero4 = _raw(fx.Vector.filled(4, 0.0, fx.Float32))
@@ -402,6 +565,8 @@ def _gemm1_body_a8w4(
 
     def compute_tile(tile, a_frags):
         g_raw, u_raw, g_sc, u_sc, x_sc = tile
+        if const_expr(_qi):
+            a_frags, xs_q = a_frags
         # One 128-wide K group (4 MX blocks) at a time: issue all its MFMAs first, then
         # scale-accumulate, so no MFMA result is consumed right after it is produced.
         for k0i in range_constexpr(n_k0):
@@ -432,7 +597,9 @@ def _gemm1_body_a8w4(
                             )
                     continue
                 # x scales of this lane's 4 accumulator rows for block b, as one vector
-                if const_expr(_ms):
+                if const_expr(_qi):
+                    xs4 = [xs_q[mi][b] for mi in range_constexpr(m_repeat)]
+                elif const_expr(_ms):
                     xs_v, y0 = x_sc
                     xs4 = []
                     for mi in range_constexpr(m_repeat):
@@ -492,10 +659,15 @@ def _gemm1_body_a8w4(
 
     # ---- main K loop: A-LDS double buffer, W + scales for kt+1 in flight ---------
     def _a_store(base_k, slot):
+        if const_expr(_qi):
+            _a_quant_write(_a_quant_load(base_k), slot)
+            return
         # loader works in "bf16" units of 2 bytes
         a_loader.store_tile(base_k // fx.Int32(2), slot=slot)
 
     k_base = wave_k_id * fx.Int32(klen) if const_expr(k_wave > 1) else fx.Int32(0)
+    if const_expr(_qi):
+        _a_quant_zero_pad()
     if const_expr(not _PIPE):
         _a_store(k_base, 0)
         t0 = load_tile(k_base)
@@ -512,10 +684,16 @@ def _gemm1_body_a8w4(
             a_frags = load_a_frags(cur_slot)
             if const_expr(kt + 1 < K_TILES_TOTAL):
                 nk = k_base + fx.Int32((kt + 1) * TILE_K)
-                _a_store(nk, (kt + 1) % A_LDS_STAGES)
+                if const_expr(_qi):
+                    # x of kt+1 in flight over compute_tile(kt), quantised after it
+                    x_nxt = _a_quant_load(nk)
+                else:
+                    _a_store(nk, (kt + 1) % A_LDS_STAGES)
                 t_nxt = load_tile(nk)
             compute_tile(t_cur, a_frags)
             if const_expr(kt + 1 < K_TILES_TOTAL):
+                if const_expr(_qi):
+                    _a_quant_write(x_nxt, (kt + 1) % A_LDS_STAGES)
                 t_cur = t_nxt
 
     # ---- k_wave slice-K reduce: each wave parks its accumulators in LDS (the A region
@@ -708,7 +886,7 @@ def compile_gemm1_a8w4_gfx942(
     x_scale="mx",
     k_wave=1,
     x_layout="a8w4",
-    rev="r10",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
+    rev="r14",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
     rocm_arch,
 ):
     """Build the gfx942 a8w4 (MXFP8 A x MXFP4 W) fused stage1 (gate+up + act)."""
@@ -734,13 +912,15 @@ def compile_gemm1_a8w4_gfx942(
     assert (BM * TILE_K) % 1024 == 0, "BM*TILE_K must be a multiple of 1024"
     assert act in ("silu", "swiglu", "situv2"), f"bad act {act!r}"
     assert x_scale in ("mx", "row"), f"x_scale must be 'mx' or 'row', got {x_scale!r}"
-    assert x_layout in ("a8w4", "moe_sort"), f"bad x_layout {x_layout!r}"
+    assert x_layout in ("a8w4", "moe_sort", "bf16"), f"bad x_layout {x_layout!r}"
     assert (
         x_layout == "a8w4" or x_scale == "mx"
     ), "x_layout='moe_sort' carries MX scales"
     NUM_N_BLOCKS = _INTER // TILE_N
     _a_lds_stages = 2 if (_K // k_wave // TILE_K) > 1 else 1
     lds_bytes = k_wave * _a_lds_stages * BM * TILE_K
+    if x_layout == "bf16":  # f32 block scales of the in-kernel quant
+        lds_bytes += k_wave * _a_lds_stages * (TILE_K // MX_BLOCK) * BM * 4
     if (
         k_wave > 1
     ):  # reduce scratch reuses the A region: 4 waves x nm vec4-f32 x 64 lanes
@@ -754,7 +934,7 @@ def compile_gemm1_a8w4_gfx942(
     name_suffix = (
         f"a8w4_h{_K}_i{_INTER}_ne{NE}_bm{BM}_tn{TILE_N}_tk{TILE_K}"
         f"{_act_tag}{_bcm_tag}{_xcd_tag}{_wpe_tag}"
-        f"{'' if x_scale == 'mx' else '_xrow'}{f'_kw{k_wave}' if k_wave > 1 else ''}{'_ms' if x_layout == 'moe_sort' else ''}_{rev}"
+        f"{'' if x_scale == 'mx' else '_xrow'}{f'_kw{k_wave}' if k_wave > 1 else ''}{'_ms' if x_layout == 'moe_sort' else ''}{'_qi' if x_layout == 'bf16' else ''}_{rev}"
     )
 
     @fx.struct
@@ -918,8 +1098,10 @@ def flydsl_a8w4_gemm1_gfx942(
     """gfx942 a8w4 fused stage1. ``x_layout="moe_sort"``: ``a_fp8`` / ``a_scale_u8`` are
     the outputs of aiter's ``fused_dynamic_mxfp8_quant_moe_sort`` (as in fused_moe).
     ``x_layout="a8w4"``: ``a_fp8``: E4M3FNUZ ``[n_tokens, D_HIDDEN]``;
-    ``a_scale_u8``: E8M0 ``[n_tokens, D_HIDDEN/32]`` row-major. W1/scale: the a16w4
-    preshuffle relaid by ``shuffle_weight_a8w4_gfx942`` / ``shuffle_scale_a8w4_gfx942``.
+    ``a_scale_u8``: E8M0 ``[n_tokens, D_HIDDEN/32]`` row-major. ``x_layout="bf16"``:
+    ``a_fp8`` is the bf16 x ``[n_tokens, D_HIDDEN]``, quantised in-kernel; ``a_scale_u8``
+    is unused (may be None). W1/scale: the a16w4 preshuffle relaid by
+    ``shuffle_weight_a8w4_gfx942`` / ``shuffle_scale_a8w4_gfx942``.
     """
     launch = compile_gemm1_a8w4_gfx942(
         BM=tile_m,
@@ -944,7 +1126,7 @@ def flydsl_a8w4_gemm1_gfx942(
     _run_compiled(
         launch,
         a_fp8.data_ptr(),
-        a_scale_u8.data_ptr(),
+        (a_fp8 if a_scale_u8 is None else a_scale_u8).data_ptr(),
         w1_u8.data_ptr(),
         w1_scale_u8.data_ptr(),
         sorted_expert_ids.data_ptr(),

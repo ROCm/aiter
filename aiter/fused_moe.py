@@ -4159,8 +4159,21 @@ def fused_moe_2stages(
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1 on the default Opus auxiliary path.
         metadata = replace(metadata, prequant=True)
+    # gfx942 a8w4 (fp8 A x mxfp4 W, `_g942` stage-1 names): stage 1 is the a16w-mix
+    # port that also returns its own sorted bf16 intermediate, consumed by the a16w4
+    # stage 2 as is -- no out buffer, no inter-stage requant. Its `_qi` names quantise
+    # x in-kernel, so they take the bf16 x and skip the separate quant launch.
+    _s1_params = None
+    if getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper:
+        _s1_params = _get_flydsl_moe_kernels().get_flydsl_kernel_params(
+            metadata.stage1.keywords.get("kernelName", "")
+        )
+    _is_a8w4_g942 = bool(_s1_params) and _s1_params.get("in_dtype") == "a8w4_gfx942"
     if not metadata.prequant:
         a1 = hidden_states
+        a1_scale = None
+    elif _is_a8w4_g942 and _s1_params.get("x_layout") == "bf16":
+        a1 = hidden_states.to(dtypes.bf16)
         a1_scale = None
     elif (
         quant_type == QuantType.per_1x32
@@ -4270,15 +4283,6 @@ def fused_moe_2stages(
         and q_dtype_a == dtypes.bf16
         and getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper
     )
-    # gfx942 a8w4 (fp8 A x mxfp4 W, `_g942` stage-1 names): stage 1 is the a16w-mix
-    # port that also returns its own sorted bf16 intermediate, consumed by the a16w4
-    # stage 2 as is -- no out buffer, no inter-stage requant.
-    _is_a8w4_g942 = False
-    if getattr(metadata.stage1, "func", metadata.stage1) is _flydsl_stage1_wrapper:
-        _s1_params = _get_flydsl_moe_kernels().get_flydsl_kernel_params(
-            metadata.stage1.keywords.get("kernelName", "")
-        )
-        _is_a8w4_g942 = bool(_s1_params) and _s1_params.get("in_dtype") == "a8w4_gfx942"
     if _is_a16w4_port or _is_a8w4_g942:
         a2 = None
     elif quant_type == QuantType.per_1x128 and metadata.stage1.func is asm_stage1:
