@@ -6,6 +6,7 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.common.rmsnorm import _rmsnorm_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
 _fused_rmsnorm_add_rmsnorm_repr = make_kernel_repr(
@@ -27,7 +28,6 @@ def _fused_rmsnorm_add_rmsnorm_kernel(
     BLOCK_SIZE_N: tl.constexpr,
 ):
     row = tl.program_id(0)
-    inv_width = 1.0 / width
     col = tl.arange(0, BLOCK_SIZE_N)
     valid = col < width
     offset = row * width + col
@@ -37,11 +37,9 @@ def _fused_rmsnorm_add_rmsnorm_kernel(
     post_weight = tl.load(post_weight_ptr + col, valid, other=0).to(tl.float32)
     pre_weight = tl.load(pre_weight_ptr + col, valid, other=0).to(tl.float32)
 
-    post_rsqrt = tl.rsqrt(tl.sum(x * x, 0) * inv_width + post_eps)
-    post_norm = x * post_rsqrt * (post_weight + 1.0)
+    post_norm = _rmsnorm_op(x, post_weight + 1.0, width, post_eps, USE_RECIPROCAL=True)
     added = post_norm + residual
-    pre_rsqrt = tl.rsqrt(tl.sum(added * added, 0) * inv_width + pre_eps)
-    pre_norm = added * pre_rsqrt * (pre_weight + 1.0)
+    pre_norm = _rmsnorm_op(added, pre_weight + 1.0, width, pre_eps, USE_RECIPROCAL=True)
 
     tl.store(residual_out_ptr + offset, added.to(tl.bfloat16), valid)
     tl.store(pre_norm_ptr + offset, pre_norm.to(tl.bfloat16), valid)
