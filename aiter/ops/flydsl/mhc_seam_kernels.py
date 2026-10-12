@@ -37,7 +37,7 @@ MHC_SEAM_DEFAULTS = {
     "FINISH_WAVES_PER_EU": 2,  # occupancy hint of the finish pass
     "FAST_FP_MATH": True,
     "FAST_NARROW": True,  # bf16 rounding in integer ops; required by FAST_FP_MATH
-    # nt hint on the residual / sublayer_out loads and the residual_out / layer_input stores
+    # nt hint on the residual / sublayer_out loads; the two stores are always streamed
     "CACHE_NT": False,
     # nt hint on the staged collapse's store and its reload; None: _stage_nt
     "STAGE_NT": None,
@@ -353,7 +353,7 @@ def flydsl_mhc_seam(
         fast_fp_math=cfg["FAST_FP_MATH"],
         fast_narrow=cfg["FAST_NARROW"],
         load_nt=cfg["CACHE_NT"],
-        store_nt=cfg["CACHE_NT"],
+        store_nt=True,
         stage_nt=bool(stage_nt),
         waves_per_eu=cfg["WAVES_PER_EU"],
     )
@@ -371,7 +371,7 @@ def flydsl_mhc_seam(
         fast_fp_math=cfg["FAST_FP_MATH"],
         fast_narrow=cfg["FAST_NARROW"],
         norm_load_nt=bool(stage_nt),
-        norm_store_nt=cfg["CACHE_NT"],
+        norm_store_nt=True,
         waves_per_eu=cfg["FINISH_WAVES_PER_EU"],
         gate_only=bool(gate_only),
     )
