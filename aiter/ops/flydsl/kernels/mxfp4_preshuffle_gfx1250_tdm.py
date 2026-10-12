@@ -201,9 +201,9 @@ def launch_gemm_a8w4_tdm(
     if persistent_workers:
         assert cluster_m == 1, "persistent workers require cluster_m=1"
         assert persistent_workers % cluster_n == 0
-        assert not (enable_ep_scatter and ep_quant_bits), (
-            "persistent EP scatter requires an unquantized combine wire"
-        )
+        assert not (
+            enable_ep_scatter and ep_quant_bits
+        ), "persistent EP scatter requires an unquantized combine wire"
     # Resolve per-row settings before specializing the layout and cache key.
     lds_soa_load_interleave_on = (
         lds_soa_load_interleave
