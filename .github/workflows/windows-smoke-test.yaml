@@ -47,6 +47,7 @@ jobs:
       ROCM_VERSION: 10.1.0
       TORCH_VERSION: 2.14.0+rocm10.1.0
       AITER_USE_SYSTEM_TRITON: "1"
+      # CK does not build on Windows yet; this smoke test covers JIT/Triton ops.
       ENABLE_CK: "0"
       PREBUILD_KERNELS: "0"
 
@@ -93,7 +94,6 @@ jobs:
 
           & $python -m pip install `
             --index-url "$env:ROCM_INDEX" `
-            --extra-index-url https://pypi.org/simple `
             "torch[device-$env:GFX]==$env:TORCH_VERSION" `
             "rocm[devel,device-$env:GFX]==$env:ROCM_VERSION"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
