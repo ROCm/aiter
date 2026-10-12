@@ -894,7 +894,7 @@ def _build_kernel_mfma_lds_pipe(
     """LDS multi-buffered variant for gfx950 MfmaAtoms (scaled CDNA4 atoms).
 
     Parallel to ``_build_kernel_mfma_r_w`` but stages KV through a multi-slot LDS
-    buffer filled by async global->LDS DMA (``BufferCopyLDS`` atoms),
+    buffer filled by async global->LDS DMA (``BufferLoadAsyncLDS`` atoms),
     with an explicit software pipeline (prefetch tile 0..PD-1, then per-tile
     ``s_waitcnt`` + prefetch(i+PD) + compute).
 
@@ -1140,8 +1140,11 @@ def _build_kernel_mfma_lds_pipe(
             return [frag[None, 0, kk] for kk in range_constexpr(K_STEPS)]
 
         # Global->LDS DMA atoms: 16 bytes of KV / one f32 kv_scale per lane.
-        kv_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), 128)
-        sc_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
+        # Async: the backend does not track these copies, so it adds no drain
+        # of its own before the LDS reads or the barrier; the per-tile
+        # s_waitcnt below is what orders them.
+        kv_dma = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS128b(), 128)
+        sc_dma = fx.make_copy_atom(fx.rocdl.cdna4.BufferLoadAsyncLDS32b(), 32)
 
         def _tile_view(it, col0_i32, col_elems, elem_bytes, swizzle=None):
             """Flat buffer view of a per-KV-column array, starting at ``col0``.
