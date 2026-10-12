@@ -104,7 +104,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
     out_cls = fx.BFloat16
     C_LDS_ROW = tile_n + 8
     C_STORE_B = (tile_m * C_LDS_ROW * 2 + 127) // 128 * 128
-    ROPE_LDS_PAD = 4
+    ROPE_LDS_PAD = 0
     ROPE_LDS_ROW = _ROPE_WIDTH + ROPE_LDS_PAD
     ROPE_STORE_B = tile_m * ROPE_LDS_ROW
     ARENA_B = max(num_buffers * PITCH, C_STORE_B + ROPE_STORE_B)
@@ -178,6 +178,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
             return fx.Tensor(fx.make_view(ptr, fx.make_layout(shape, stride)))
 
         lds_load_b128, _ = make_lds_copy_ops(128)
+        lds_load_b64, _ = make_lds_copy_ops(64)
 
         gA_base = fx.recast_iter(fx.Int8, arg_cache)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
@@ -471,8 +472,8 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
 
         # RoPE occupies the tail of the arena, so its gather can overlap the
         # scale/C-store epilogue without clobbering the accumulator staging.
-        # A 68-byte row advances LDS banks by 17 dwords, distributing one
-        # thread-per-row reads across all banks instead of aliasing at pitch 64.
+        # Eight lanes cooperate on each 64-element row, so four rows cover the
+        # 64 LDS banks exactly without padding.
         rope_zero_indices = [fx.Int32(0) for _ in range_constexpr(A_GATHER_ROWS)]
         rope_template = make_tensor_gather_descriptor(
             global_ptr=cache_rows,
@@ -537,33 +538,35 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
 
         head = bid_y
         lds_base = _bidx(base_ptr)
-        rope_row = tid
-        rope_out_row = fx.Int64(blk_m + rope_row)
         rope_scale = Vec.filled(8, activation_scale, fx.Float32)
-        for sub in range_constexpr(_ROPE_WIDTH // 16):
-            words = Vec(
-                lds_load_b128(
-                    lds_base,
-                    fx.Int64(C_STORE_B + rope_row * ROPE_LDS_ROW + sub * 16),
-                )
-            )
-            for half in range_constexpr(2):
-                packed_fp8 = Vec.from_elements(
-                    [words[2 * half], words[2 * half + 1]], fx.Int32
+        rope_lanes_per_row = _ROPE_WIDTH // 8
+        rope_rows_per_wave = WAVE // rope_lanes_per_row
+        rope_row_in_wave = lane // rope_lanes_per_row
+        rope_col = (lane % rope_lanes_per_row) * 8
+        for group in range_constexpr(A_GATHER_GROUPS):
+            rope_group_base = group * num_waves * A_GATHER_ROWS + wave * A_GATHER_ROWS
+            for sub in range_constexpr(A_GATHER_ROWS // rope_rows_per_wave):
+                rope_row = rope_group_base + sub * rope_rows_per_wave + rope_row_in_wave
+                words = Vec(
+                    lds_load_b64(
+                        lds_base,
+                        fx.Int64(C_STORE_B + rope_row * ROPE_LDS_ROW + rope_col),
+                    )
                 )
                 values = Vec(
                     cvt_scale_pk8_f32_fp8(
                         T.vec(8, T.f32),
-                        packed_fp8.ir_value(),
+                        words.ir_value(),
                         fx.Int32(127).ir_value(),
                         0,
                     )
                 )
                 packed = (values * rope_scale).to(fx.BFloat16)
                 if rope_row < mn_oob:
+                    rope_out_row = fx.Int64(blk_m + rope_row)
                     rope_offset = (
                         rope_out_row * fx.Int64(ldk)
-                        + fx.Int64(head * 192 + 128 + sub * 16 + half * 8)
+                        + fx.Int64(head * 192 + 128 + rope_col)
                     ) * 2
                     fx.ptr_store(packed.bitcast(fx.Int8), gK_base + rope_offset)
         vectors_per_row = 128 // 8
