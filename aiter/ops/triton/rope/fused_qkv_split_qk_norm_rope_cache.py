@@ -56,6 +56,12 @@ def fused_qkv_split_qk_norm_rope_cache(
     kv_cache_layout: str = "HND",
     q_scale: float = 1.0,
     block_t: int | None = None,
+    mrope_section: tuple[int, int, int] | list[int] | None = None,
+    mrope_interleaved: bool = True,
+    return_gate: bool = True,
+    return_v: bool = True,
+    q_out: torch.Tensor | None = None,
+    k_out: torch.Tensor | None = None,
 ):
     """Split packed ``qkv``, RMSNorm Q and K, apply RoPE, write K/V into paged caches.
 
@@ -64,6 +70,10 @@ def fused_qkv_split_qk_norm_rope_cache(
 
     - ``"HND"``: ``[num_blocks, num_kv_heads, block_size, head_dim]`` (default).
     - ``"NHD"``: ``[num_blocks, block_size, num_kv_heads, head_dim]``.
+    - ``"SHUFFLE"``: the x-interleaved layout read by the AITER shuffle paged-attention
+      kernels, stored in a ``[num_blocks, block_size, num_kv_heads, head_dim]`` buffer
+      (``x = 16 B / element``): K as ``[blocks, kv_heads, head_dim // x, block_size, x]``,
+      V as ``[blocks, kv_heads, block_size // x, head_dim, x]``.
 
     For RoPE, ``rotary_dim_half`` refers
     to the half-width of the rotated subspace. The required ``cos`` / ``sin`` last-dim
@@ -102,16 +112,30 @@ def fused_qkv_split_qk_norm_rope_cache(
             corresponds to ``cos.shape[-1]`` only in reuse mode; in non-reuse mode the
             table last dim is the full rotary width, ``2 * rotary_dim_half``.
         gated_qkv_layout: ``"interleaved"`` or ``"blocked"`` when ``attn_output_gate``.
-        kv_cache_layout: ``"HND"`` or ``"NHD"`` (case-insensitive).
+        kv_cache_layout: ``"HND"``, ``"NHD"`` or ``"SHUFFLE"`` (case-insensitive).
+        mrope_section: ``(t, h, w)`` rotary-frequency counts for multimodal RoPE;
+            requires ``positions`` of shape ``[3, T]`` and
+            ``reuse_freqs_front_part=True``; ``offsets`` must be ``None``. The
+            sections sum to half the rotary span.
+        mrope_interleaved: Interleaved sections (frequency ``j`` belongs to h when
+            ``j % 3 == 1`` and ``j < 3 h``, to w when ``j % 3 == 2`` and ``j < 3 w``,
+            else t) when True; contiguous ``[t | h | w]`` sections otherwise.
+        return_gate: Copy the gate into its own ``[T, qh, head_dim]`` output (gated
+            layouts only). ``False`` skips the copy and returns ``None`` in its place.
+        return_v: Write V in token order to its own output as well as to the cache.
+            ``False`` skips that write and returns ``None`` in its place.
+        q_out, k_out: Optional preallocated ``[T, qh, head_dim]`` / ``[T, kvh, head_dim]``
+            outputs (any strides) used instead of fresh allocations.
     """
     T = qkv.shape[0]
     q_size = qh * head_dim
     kv_size = kvh * head_dim
 
     layout = kv_cache_layout.upper()
-    if layout not in ("HND", "NHD"):
+    if layout not in ("HND", "NHD", "SHUFFLE"):
         raise ValueError(
-            'kv_cache_layout must be "HND" or "NHD" ' f"(got {kv_cache_layout!r})."
+            'kv_cache_layout must be "HND", "NHD" or "SHUFFLE" '
+            f"(got {kv_cache_layout!r})."
         )
     if key_cache.shape != value_cache.shape:
         raise ValueError(
@@ -138,7 +162,7 @@ def fused_qkv_split_qk_norm_rope_cache(
     else:
         if key_cache.shape[2] != kvh or key_cache.shape[3] != head_dim:
             raise ValueError(
-                "NHD key_cache expected "
+                f"{layout} key_cache expected "
                 f"[num_blocks, block_size, {kvh}, {head_dim}], "
                 f"got {tuple(key_cache.shape)}."
             )
@@ -154,15 +178,51 @@ def fused_qkv_split_qk_norm_rope_cache(
 
     total_num_kv_cache_tokens = num_blocks * block_size
 
-    assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
-    q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
-    k = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
-    v = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
+    shuffle = layout == "SHUFFLE"
+    shuffle_x = 16 // key_cache.element_size()
+    if shuffle and (block_size % shuffle_x or head_dim % shuffle_x):
+        raise ValueError(
+            f"SHUFFLE layout needs block_size ({block_size}) and head_dim "
+            f"({head_dim}) divisible by x={shuffle_x}."
+        )
 
-    if attn_output_gate:
+    assert qh >= kvh and qh % kvh == 0, "qh must be multiple of kvh"
+    if q_out is None:
+        q = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
+    else:
+        assert q_out.shape == (T, qh, head_dim), "q_out must be [T, qh, head_dim]"
+        q = q_out
+    if k_out is None:
+        k = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
+    else:
+        assert k_out.shape == (T, kvh, head_dim), "k_out must be [T, kvh, head_dim]"
+        k = k_out
+    if return_v:
+        v = torch.empty((T, kvh, head_dim), dtype=qkv.dtype, device=qkv.device)
+    else:
+        v = None
+
+    if attn_output_gate and return_gate:
         gate = torch.empty((T, qh, head_dim), dtype=qkv.dtype, device=qkv.device)
     else:
         gate = None
+
+    has_mrope = mrope_section is not None
+    if has_mrope:
+        assert (
+            positions is not None and positions.ndim == 2 and positions.shape[0] == 3
+        ), "mrope_section requires positions of shape [3, T]"
+        assert offsets is None, "offsets are not supported with mrope_section"
+        assert reuse_freqs_front_part, "mrope_section requires reuse_freqs_front_part"
+        assert len(mrope_section) == 3, "mrope_section must be (t, h, w)"
+        stride_pos_m = positions.stride(0)
+        stride_pos_t = positions.stride(1)
+        sec_t, sec_h, sec_w = (int(x) for x in mrope_section)
+    else:
+        assert positions is None or positions.ndim == 1, "positions must be [T]"
+        stride_pos_m = 0
+        stride_pos_t = positions.stride(0) if positions is not None else 1
+        sec_t = sec_h = sec_w = 0
 
     if attn_output_gate:
         assert qkv.shape[-1] == 2 * q_size + 2 * kv_size, "Shape error"
@@ -180,6 +240,10 @@ def fused_qkv_split_qk_norm_rope_cache(
     rotary_span = ROTARY_DIM_EFFECTIVE * (2 if reuse_freqs_front_part else 1)
     if q_scale != 1.0 and rotary_span != head_dim:
         raise ValueError("q_scale currently requires full-head RoPE")
+    if has_mrope:
+        assert (
+            sec_t + sec_h + sec_w == ROTARY_DIM_EFFECTIVE
+        ), "mrope_section must sum to the number of rotary frequencies"
 
     # Logic for dimension splitting
     BLOCK_D = head_dim
@@ -222,7 +286,8 @@ def fused_qkv_split_qk_norm_rope_cache(
         stride_qkv_d=qkv.stride(1),
         stride_cos_t=cos.stride(0),
         stride_cos_d=cos.stride(-1),
-        stride_pos_t=positions.stride(0),
+        stride_pos_t=stride_pos_t,
+        stride_pos_m=stride_pos_m,
         stride_q_t=q.stride(0),
         stride_q_h=q.stride(1),
         stride_q_d=q.stride(2),
@@ -252,6 +317,15 @@ def fused_qkv_split_qk_norm_rope_cache(
         BLOCKED_GATED_LAYOUT=(attn_output_gate and gated_qkv_layout == "blocked"),
         HAVE_K_SCALE=k_scale is not None,
         HAVE_V_SCALE=v_scale is not None,
+        WRITE_GATE=gate is not None,
+        WRITE_V=v is not None,
+        HAS_MROPE=has_mrope,
+        MROPE_INTERLEAVED=mrope_interleaved,
+        MROPE_SECTION_T=sec_t,
+        MROPE_SECTION_H=sec_h,
+        MROPE_SECTION_W=sec_w,
+        KV_CACHE_SHUFFLE=shuffle,
+        SHUFFLE_X=shuffle_x,
         total_num_kv_cache_tokens=total_num_kv_cache_tokens,
         num_warps=num_warps,
     )
