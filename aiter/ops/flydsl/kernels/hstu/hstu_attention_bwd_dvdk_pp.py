@@ -87,6 +87,21 @@ PREFETCH_W = 15
 # Operand groups per MFMA phase: 4 GEMMs x (head_dim / MFMA_M) chunks.
 NUM_OPERAND_GROUPS = 16
 
+# Issue order of those groups, as a permutation.
+#
+# In natural order the four chunks of one GEMM run back to back, and GEMM0 /
+# GEMM2 accumulate over `ks` into the SAME register per `og` -- a 4-deep
+# dependency chain with only KV_OWNED_SUBTILES (3) independent MFMAs between
+# consecutive links. At ~4 cy of issue each that is 12 cy against a ~16 cy MFMA
+# result latency, so every link stalls.
+#
+# Interleaving the two independent GEMMs of each pair (0 with 2, 1 with 3)
+# doubles the spacing to 6 MFMAs, which covers the latency. Pure reordering:
+# every accumulator still sees its `ks` steps in the same sequence, so the
+# arithmetic is unchanged.
+GROUP_ORDER = [0, 4, 1, 5, 2, 6, 3, 7, 8, 12, 9, 13, 10, 14, 11, 15]
+assert sorted(GROUP_ORDER) == list(range(NUM_OPERAND_GROUPS))
+
 
 def validate_hstu_attention_bwd_dvdk_pp(
     num_heads: int,
@@ -634,10 +649,13 @@ def build_hstu_attention_bwd_dvdk_pp(
             # issues the read for g + PREFETCH_W into the slot it just freed.
             # The last slot is filled at g == 0, before its first use at
             # g == PREFETCH_W.
-            win = [read_operand(g, rm_cur, t_prev) for g in range_constexpr(PREFETCH_W)]
-            win.append(None)
+            win = [None for _ in range_constexpr(PREFETCH_W + 1)]
+            for _s in range_constexpr(PREFETCH_W):
+                _g = GROUP_ORDER[_s]
+                win[_g % (PREFETCH_W + 1)] = read_operand(_g, rm_cur, t_prev)
 
-            for g in range_constexpr(NUM_OPERAND_GROUPS):
+            for step in range_constexpr(NUM_OPERAND_GROUPS):
+                g = GROUP_ORDER[step]
                 rocdl.sched_barrier(0)
                 op = win[g % (PREFETCH_W + 1)]
                 for og in range_constexpr(KV_OWNED_SUBTILES):
@@ -656,8 +674,9 @@ def build_hstu_attention_bwd_dvdk_pp(
                             op, v_packs[g - 3 * D_CHUNKS][og], da_accs[og]
                         )
 
-                gn = g + PREFETCH_W
-                if const_expr(gn < NUM_OPERAND_GROUPS):
+                sn = step + PREFETCH_W
+                if const_expr(sn < NUM_OPERAND_GROUPS):
+                    gn = GROUP_ORDER[sn]
                     win[gn % (PREFETCH_W + 1)] = read_operand(gn, rm_cur, t_prev)
 
                 # The DMA fire is spread through the burst's slack; it is VMEM,
@@ -665,12 +684,12 @@ def build_hstu_attention_bwd_dvdk_pp(
                 # The duty branch is wave-uniform (`is_g0` comes from
                 # readfirstlane) and side-effect-only, so it lowers to a scalar
                 # branch.
-                if const_expr(g == 2):
+                if const_expr(step == 2):
                     if is_g0:
                         dma_q(rm_fill, q_start + fx.Int32(BLOCK_N), 0)
                     else:
                         dma_do(rm_fill, q_start + fx.Int32(BLOCK_N), 0)
-                if const_expr(g == 6):
+                if const_expr(step == 6):
                     if is_g0:
                         dma_q(rm_fill, q_start + fx.Int32(BLOCK_N), 1)
                     else:
