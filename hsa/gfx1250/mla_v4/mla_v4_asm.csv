@@ -8,7 +8,9 @@
 //   qh128 32mx4_32nx1_sparse_pfl <- my_agent_skills/0805_base/32mx4_32nx1.sp3
 //     (the .sp3 keeps its tile-shape name; the .co/symbol follow the aiter
 //      naming convention here)
-qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
-fp8,fp8,64,0,1,0,0,0,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
-fp8,fp8,16,0,4,0,0,0,_ZN5aiter35mla_a8w8_qh16_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh16_1tg_16mx4_64nx1_sparse.co
-fp8,fp8,128,0,1,1,0,0,_ZN5aiter40mla_a8w8_qh128_1tg_32mx4_32nx1_sparse_pflE,mla_a8w8_qh128_1tg_32mx4_32nx1_sparse_pfl.co
+qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,sub_Q,knl_name,co_name
+fp8,fp8,64,0,1,0,0,0,64,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
+fp8,fp8,128,0,1,0,0,0,64,_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh64_1tg_16mx4_64nx1_sparse.co
+fp8,fp8,16,0,4,0,0,0,64,_ZN5aiter35mla_a8w8_qh16_1tg_16mx4_64nx1_sparseE,mla_a8w8_qh16_1tg_16mx4_64nx1_sparse.co
+fp8,fp8,32,0,1,0,0,0,32,_ZN5aiter35mla_a8w8_qh32_1tg_32mx1_16nx4_sparseE,mla_a8w8_qh32_1tg_32mx1_16nx4_sparse.co
+fp8,fp8,128,0,1,1,0,0,32,_ZN5aiter40mla_a8w8_qh128_1tg_32mx4_32nx1_sparse_pflE,mla_a8w8_qh128_1tg_32mx4_32nx1_sparse_pfl.co

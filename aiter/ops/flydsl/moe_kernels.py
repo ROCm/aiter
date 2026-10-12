@@ -3192,6 +3192,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     prequantized: bool = False,
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
+    row_major_scale: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -3207,6 +3208,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         prequantized=prequantized,
         src_scale_bytes_per_row=src_scale_bytes_per_row,
         fuse_ep_psum=fuse_ep_psum,
+        row_major_scale=row_major_scale,
     )
 
 
@@ -3266,6 +3268,10 @@ def flydsl_moe_fused_quant_preshuffle(
     # caller rebuilds the GEMM's layout with flydsl_moe_scatter_preshuffle_scale.
     row_to_token: torch.Tensor | None = None,
     ep_psum_params: dict | None = None,
+    # Prequantized full-row path only. Writes e8m0 as (row, K/32) instead of
+    # the interleaved GEMM layout. The caller must launch gemm1 with
+    # row_major_ascale=1. Off for the quantizing path: that still preshuffles.
+    row_major_scale: bool = False,
 ):
     """Fused grouped quant + e8m0 scale-preshuffle.
 
@@ -3324,10 +3330,17 @@ def flydsl_moe_fused_quant_preshuffle(
     Ws = feat_dim // 32
     if out_payload is None:
         out_payload = torch.empty((E, max_m, Pb), dtype=torch.uint8, device=device)
+    if row_major_scale and not prequantized:
+        raise ValueError("row_major_scale requires a prequantized payload")
     if out_scale is None:
-        out_scale = torch.empty(
-            (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
-        )
+        if row_major_scale:
+            # Flat (row, K/32). E is 1 on the contiguous grouped path; a masked
+            # (E, max_m) row index still addresses this buffer as E*max_m rows.
+            out_scale = torch.empty((E * max_m, Ws), dtype=torch.uint8, device=device)
+        else:
+            out_scale = torch.empty(
+                (E, max_m // wmma_rep, Ws * wmma_rep), dtype=torch.uint8, device=device
+            )
 
     skip_padding = masked_m is not None
     if skip_padding:
@@ -3434,7 +3447,10 @@ def flydsl_moe_fused_quant_preshuffle(
                 stream=torch.cuda.current_stream(),
             )
             return out_payload, out_scale
-        use_ksplit = grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        # Row-major stores are emitted only by the full-row prequant copy.
+        use_ksplit = (
+            not row_major_scale and grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
+        )
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
@@ -3447,6 +3463,7 @@ def flydsl_moe_fused_quant_preshuffle(
                 int(prequantized_scale.shape[-1]) if prequantized else 0
             ),
             fuse_ep_psum=fuse_ep_psum,
+            row_major_scale=row_major_scale,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
