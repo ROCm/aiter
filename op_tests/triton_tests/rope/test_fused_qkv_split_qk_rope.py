@@ -1,5 +1,3 @@
-import itertools
-
 import pytest
 import torch
 
@@ -338,56 +336,7 @@ def run_torch_with_cache(
         return q, k, v, k_cache, v_cache
 
 
-# Keep the existing coverage grid and append a few scale/weightless cases to
-# this same test. A separate cross-product would multiply the full grid.
-_cache_case_grid = itertools.product(
-    [4],  # tokens
-    [1, 4],  # query heads per KV head
-    [1, 4],  # KV heads
-    [64, 128],  # head dim
-    [16],  # cache block size
-    [RotateStyle.GPTJ, RotateStyle.NEOX],
-    [131072],  # position table length
-    [False, True],  # frequency reuse
-    [False, True],  # attention output gate
-    [False, True],  # KV scales
-    [torch.bfloat16],
-    ["interleaved", "blocked"],  # packed QKV layout
-    ["HND", "NHD"],  # cache layout
-    [None, 32],  # rotary span: full or partial
-)
-_cache_cases = [(*case, 1.0, False) for case in _cache_case_grid]
-_cache_cases += [
-    pytest.param(
-        tokens,
-        16,
-        2,
-        128,
-        16,
-        RotateStyle.NEOX,
-        256,
-        True,
-        False,
-        False,
-        torch.bfloat16,
-        "interleaved",
-        "NHD",
-        None,
-        3.87,
-        True,
-        id=f"scaled-weightless-{tokens}-tokens",
-    )
-    for tokens in (1, 64, 1024)
-]
-
-
-@pytest.mark.parametrize(
-    "B,QH_PER_KH,KH,D,block_size,rotate_style,max_embed_positions,"
-    "reuse_freqs_front_part,attn_output_gate,use_kv_scale,dtype,qkv_layout,"
-    "cache_layout,rotary_dim,q_scale,weightless_norm",
-    _cache_cases,
-)
-def test_fused_qkv_split_qk_rope_with_cache(
+def _check_fused_qkv_split_qk_rope_with_cache(
     B,
     QH_PER_KH,
     KH,
@@ -564,3 +513,77 @@ def test_fused_qkv_split_qk_rope_with_cache(
     # Verify Paged Cache
     torch.testing.assert_close(k_cache, k_cache_ref, atol=atol, rtol=rtol)
     torch.testing.assert_close(v_cache, v_cache_ref, atol=atol, rtol=rtol)
+
+
+# Keep the existing grid for the general cache path. Query scaling gets
+# separate cases below so it does not multiply the full parameter grid.
+@pytest.mark.parametrize("B", [4])
+@pytest.mark.parametrize("QH_PER_KH", [1, 4])
+@pytest.mark.parametrize("KH", [1, 4])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("block_size", [16])
+@pytest.mark.parametrize("rotate_style", [RotateStyle.GPTJ, RotateStyle.NEOX])
+@pytest.mark.parametrize("max_embed_positions", [131072])
+@pytest.mark.parametrize("reuse_freqs_front_part", [False, True])
+@pytest.mark.parametrize("attn_output_gate", [False, True])
+@pytest.mark.parametrize("use_kv_scale", [False, True])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("qkv_layout", ["interleaved", "blocked"])
+@pytest.mark.parametrize("cache_layout", ["HND", "NHD"])
+@pytest.mark.parametrize("rotary_dim", [None, 32], ids=["full", "32"])
+def test_fused_qkv_split_qk_rope_with_cache(
+    B,
+    QH_PER_KH,
+    KH,
+    D,
+    block_size,
+    rotate_style,
+    max_embed_positions,
+    reuse_freqs_front_part,
+    attn_output_gate,
+    use_kv_scale,
+    dtype,
+    qkv_layout,
+    cache_layout,
+    rotary_dim,
+):
+    _check_fused_qkv_split_qk_rope_with_cache(
+        B,
+        QH_PER_KH,
+        KH,
+        D,
+        block_size,
+        rotate_style,
+        max_embed_positions,
+        reuse_freqs_front_part,
+        attn_output_gate,
+        use_kv_scale,
+        dtype,
+        qkv_layout,
+        cache_layout,
+        rotary_dim,
+        q_scale=1.0,
+        weightless_norm=False,
+    )
+
+
+@pytest.mark.parametrize("B", [1, 64, 1024])
+def test_fused_qkv_split_qk_rope_with_cache_scaled(B):
+    _check_fused_qkv_split_qk_rope_with_cache(
+        B=B,
+        QH_PER_KH=16,
+        KH=2,
+        D=128,
+        block_size=16,
+        rotate_style=RotateStyle.NEOX,
+        max_embed_positions=256,
+        reuse_freqs_front_part=True,
+        attn_output_gate=False,
+        use_kv_scale=False,
+        dtype=torch.bfloat16,
+        qkv_layout="interleaved",
+        cache_layout="NHD",
+        rotary_dim=None,
+        q_scale=3.87,
+        weightless_norm=True,
+    )
