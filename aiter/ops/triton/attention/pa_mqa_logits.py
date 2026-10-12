@@ -82,11 +82,24 @@ else:
     enable_jit_gluon_pa_mqa_logits_kernel = False
 
 
-def _context_lens_and_stride(context_lens: torch.Tensor, batch_size: int):
+def _context_lens_and_stride(
+    context_lens: torch.Tensor, batch_size: int, device: torch.device | None = None
+):
     # The kernels read sequence b's length at b * stride + stride - 1: element b
     # of [B], or the last entry of row b of a contiguous (B, n) per-row table.
     # A strided input is rejected rather than copied: a hidden copy allocates on
-    # every call, and the kernels would otherwise read it as dense.
+    # every call, and the kernels would otherwise read it as dense. The Gluon
+    # kernels take context_len_ptr as *i32, so other dtypes are rejected too.
+    on_device = (
+        context_lens.device == device
+        if device is not None
+        else context_lens.device.type == "cuda"
+    )
+    if context_lens.dtype != torch.int32 or not on_device:
+        raise ValueError(
+            f"context_lens must be int32 on {device or 'the GPU'}, got "
+            f"{context_lens.dtype} on {context_lens.device}"
+        )
     if context_lens.dim() not in (1, 2) or not context_lens.is_contiguous():
         raise ValueError(
             "context_lens must be a contiguous [B] or [B, n], got shape "
@@ -231,7 +244,9 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         f"got q hidden_dim={hidden_dim} and packed KV dim={packed_dim}."
     )
 
-    context_lens, ctx_stride = _context_lens_and_stride(context_lens, batch_size)
+    context_lens, ctx_stride = _context_lens_and_stride(
+        context_lens, batch_size, q_fp8.device
+    )
 
     TileQCount = batch_size * next_n * (heads // ChunkQ)
     SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU
@@ -617,7 +632,9 @@ def deepgemm_fp8_paged_mqa_logits(
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
-    context_lens, ctx_stride = _context_lens_and_stride(context_lens, batch_size)
+    context_lens, ctx_stride = _context_lens_and_stride(
+        context_lens, batch_size, q_fp8.device
+    )
 
     Persistent = PersistentSchedule is not None
     if Persistent:
