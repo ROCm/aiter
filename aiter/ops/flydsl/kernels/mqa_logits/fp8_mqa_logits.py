@@ -91,29 +91,33 @@ def _load_row_weights(weights, H, cp_atom, tc_c, m_tiles, mfma_n, row):
     return [Vec(frag[None, mi, 0].load()) for mi in range_constexpr(m_tiles)]
 
 
-def _emit_col_sum(
-    mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0, reduce=True
-):
-    """One lane's logit contribution for a single (query row, n-tile) pair.
+def _issue_mfmas(mfma, mma, gemm_kw, a_mi, b_pack):
+    """Zero an accumulator and issue one M-tile's K-step MFMAs into it."""
+    c_frag = fx.make_rmem_tensor(mfma.ACC_ELEMS, fx.Float32)
+    c_frag.store(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
+    for kk in range_constexpr(len(a_mi)):
+        fx.gemm(mma, c_frag, a_mi[kk], b_pack[kk], c_frag, **gemm_kw)
+    return c_frag
 
-    ``a_row``/``w_row`` are that row's per-(mi, kk) A-fragments and per-(mi, ii)
-    weights; ``b_pack`` is the n-tile's per-kk B-fragments.
+
+def _accumulate_heads(mfma, c_frag, w_mi, col_sum, f32_0):
+    """Add one M-tile's ReLU(acc) * weight terms to this lane's column sum."""
+    acc = c_frag.load()
+    for ii in range_constexpr(mfma.ACC_ELEMS):
+        col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_mi[ii]
+    return col_sum
+
+
+def _finish_col_sum(mfma, col_sum, kv_scale, reduce):
+    """Scale and (optionally) head-reduce a lane's accumulated column sum.
+
     ``kv_scale`` (>=0) is hoisted out of the head sum: ReLU is
     positive-homogeneous, so ReLU(s*x) = s*ReLU(x) and the whole column sum is
     scaled once instead of every head term -- drops M_TILES*ACC_ELEMS muls to one.
-    ``reduce=False`` skips the cross-lane head reduce and returns this lane's
-    scaled partial, for ``warp_reduce_scatter_strided``. ``kv_scale=None``
-    leaves the sum unscaled, for a caller that scales after the reduce.
+    ``kv_scale=None`` leaves the sum unscaled, for a caller that scales after
+    the reduce. ``reduce=False`` skips the cross-lane head reduce and returns
+    this lane's scaled partial, for ``warp_reduce_scatter_strided``.
     """
-    col_sum = f32_0
-    for mi in range_constexpr(len(a_row)):
-        c_frag = fx.make_rmem_tensor(mfma.ACC_ELEMS, fx.Float32)
-        c_frag.store(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
-        for kk in range_constexpr(len(a_row[mi])):
-            fx.gemm(mma, c_frag, a_row[mi][kk], b_pack[kk], c_frag, **gemm_kw)
-        acc = c_frag.load()
-        for ii in range_constexpr(mfma.ACC_ELEMS):
-            col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
     if kv_scale is not None:
         col_sum = col_sum * kv_scale
     if not reduce:
@@ -124,15 +128,26 @@ def _emit_col_sum(
     return warp_reduce_strided(col_sum, fx.ReductionOp.ADD, stride=mfma.MFMA_N)
 
 
+def _emit_col_sum(
+    mfma, mma, gemm_kw, a_row, b_pack, w_row, kv_scale, f32_0, reduce=True
+):
+    """One lane's logit contribution for a single (query row, n-tile) pair.
+
+    ``a_row``/``w_row`` are that row's per-(mi, kk) A-fragments and per-(mi, ii)
+    weights; ``b_pack`` is the n-tile's per-kk B-fragments.
+    """
+    col_sum = f32_0
+    for mi in range_constexpr(len(a_row)):
+        c_frag = _issue_mfmas(mfma, mma, gemm_kw, a_row[mi], b_pack)
+        col_sum = _accumulate_heads(mfma, c_frag, w_row[mi], col_sum, f32_0)
+    return _finish_col_sum(mfma, col_sum, kv_scale, reduce)
+
+
 def _emit_acc_issue(mfma, mma, gemm_kw, a_row, b_pack):
     """Phase 1 of a software-pipelined ``_emit_col_sum``: issue the MFMAs only."""
     c_frags = [None] * len(a_row)
     for mi in range_constexpr(len(a_row)):
-        c_frag = fx.make_rmem_tensor(mfma.ACC_ELEMS, fx.Float32)
-        c_frag.store(Vec.filled(mfma.ACC_ELEMS, 0.0, fx.Float32))
-        for kk in range_constexpr(len(a_row[mi])):
-            fx.gemm(mma, c_frag, a_row[mi][kk], b_pack[kk], c_frag, **gemm_kw)
-        c_frags[mi] = c_frag
+        c_frags[mi] = _issue_mfmas(mfma, mma, gemm_kw, a_row[mi], b_pack)
     return c_frags
 
 
@@ -140,14 +155,8 @@ def _emit_acc_reduce(mfma, c_frags, w_row, kv_scale, f32_0, reduce=True):
     """Phase 2 of a software-pipelined ``_emit_col_sum``: consume the accumulators."""
     col_sum = f32_0
     for mi in range_constexpr(len(c_frags)):
-        acc = c_frags[mi].load()
-        for ii in range_constexpr(mfma.ACC_ELEMS):
-            col_sum = col_sum + Vec(acc)[ii].maximumf(f32_0) * w_row[mi][ii]
-    if kv_scale is not None:
-        col_sum = col_sum * kv_scale
-    if not reduce:
-        return col_sum
-    return warp_reduce_strided(col_sum, fx.ReductionOp.ADD, stride=mfma.MFMA_N)
+        col_sum = _accumulate_heads(mfma, c_frags[mi], w_row[mi], col_sum, f32_0)
+    return _finish_col_sum(mfma, col_sum, kv_scale, reduce)
 
 
 # ---- LDS-builder epilogues ----
@@ -460,7 +469,6 @@ class MfmaAtom:
     def ACC_ELEMS(self) -> int:
         """f32 accumulator elements per lane (``vec<ACC_ELEMS x f32>``)."""
         return self.MFMA_M * self.MFMA_N // 64
-
 
 
 #: gfx942/CDNA3 dense MFMA: 16x16 output tile, K=32 fp8 elements/step.
@@ -943,8 +951,9 @@ def _build_kernel_mfma_lds_pipe(
     # Unroll the tile loop by NUM_BUFFERS so each slot's LDS offset is a
     # compile-time constant.
     UNROLL_KV_TILE_LOOP = rs_head and not sw_pipe and not lds_scales
-    # Hand the sw_pipe MFMA/reduce interleave to the AMDGPU pipeline solver on
-    # the low-occupancy routes.
+    # rocdl.iglp_opt(0) at the sw_pipe loop head keeps each item's reduce VALU
+    # behind the next item's MFMA issue, which the default scheduler collapses
+    # (exposed s_nop).
     IGLP_SW_PIPE = sw_pipe and WPB <= 2
     K_STEPS = D // mfma.MFMA_K
     # n-tiles per reduce-scatter group: one per MFMA_N-lane group of the wave.
@@ -954,7 +963,10 @@ def _build_kernel_mfma_lds_pipe(
         f"64 // MFMA_N ({RS_GROUP})"
     )
     if sw_pipe:
-        _mfma_and_epilogue = lambda ctx, tile: _mfma_and_epilogue_pipelined(ctx, tile, rs_head)  # noqa: E731
+
+        def _mfma_and_epilogue(ctx, tile):
+            _mfma_and_epilogue_pipelined(ctx, tile, rs_head)
+
     elif rs_head:
         _mfma_and_epilogue = _mfma_and_reduce_scatter_epilogue
     else:
@@ -1008,7 +1020,7 @@ def _build_kernel_mfma_lds_pipe(
 
     # XOR swizzle (bank-conflict avoidance) of the [BKV, D] fp8 tile, as a
     # SwizzleType over the slot's byte (fp8 element) offsets. The DMA writes LDS
-    # lane-linearly, so the swizzle is applied on the global source side 
+    # lane-linearly, so the swizzle is applied on the global source side
     # and on the read view.
     #
     # gfx950 LDS is 64 banks x 4 B, and a ds_read_b128 serves 16 lanes per
@@ -1039,8 +1051,8 @@ def _build_kernel_mfma_lds_pipe(
         f"n-tile ({NTILE_BYTES} bytes) must be a multiple of the swizzle period"
     )
 
-    # The global->LDS DMA requires its destination LDS address to be at
-    # least 128-byte aligned
+    # The DMA's 128-byte LDS alignment must sit on the fx.Array type:
+    # SharedAllocator.allocate(alignment=) is only bookkeeping.
     @fx.struct
     class SharedStorage:
         slots: fx.Array[fx.Int32, NUM_BUFFERS * SLOT_I32, 128]

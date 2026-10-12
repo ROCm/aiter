@@ -17,6 +17,7 @@ Wraps the gfx942/gfx950 kernel builders in
 
 from __future__ import annotations
 
+import itertools
 import math
 import os
 import re
@@ -606,6 +607,23 @@ def _auto_variant(seq_len, seq_len_kv, num_heads):
         f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
         "supported: gfx942, gfx950"
     )
+
+
+def _auto_variants():
+    """Get all available auto-selected variants"""
+    if _ARCH == "gfx942":
+        return [f"mfma_r{rpb}_w{wpb}" for rpb, wpb in itertools.product((1,2,4), (2,4))]
+    elif _ARCH == "gfx950":
+        return [
+                "mfma32x32x64_bkv64_r2_w4_lds3_rs",
+                "mfma32x32x64_bkv64_r2_w4_lds3_swp_rs",
+                "mfma32x32x64_bkv64_r1_w2_lds3_swp_rs_ls",
+                "mfma32x32x64_bkv64_r2_w2_lds3_swp_rs_ls"]
+    else:
+        raise NotImplementedError(
+                f"fp8_mqa_logits has no FlyDSL variants for arch {_ARCH!r}; "
+                "supported: gfx942, gfx950"
+            )
 
 
 def _resolve_variant(variant, seq_len, seq_len_kv, num_heads):

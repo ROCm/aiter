@@ -68,9 +68,15 @@ REF_IMPL = (
 
 try:
     from aiter.ops.flydsl import flydsl_fp8_mqa_logits
-    from aiter.ops.flydsl.fp8_mqa_logits_kernels import _auto_variant
+    from aiter.ops.flydsl.fp8_mqa_logits_kernels import (
+        _VARIANT_MFMA_M,
+        _auto_variant,
+        _auto_variants,
+        _resolve_variant,
+    )
 except ImportError:
-    flydsl_fp8_mqa_logits = _auto_variant = None
+    flydsl_fp8_mqa_logits = _auto_variant = _auto_variants = None
+    _resolve_variant = _VARIANT_MFMA_M = None
 
 # Bench timing knobs, set from argv in main(), read by _time_us.
 BENCH_WARMUP = 10
@@ -435,6 +441,77 @@ def verify_auto_variant(s_q, s_k, num_heads):
     return {"gfx": get_gfx(), "variant": variant, "status": "ok"}
 
 
+# Small odd shape: a clamped tail tile and a partial row block, so each
+# variant's epilogue and window handling is reached.
+_PRODUCTION_CASE = {"s_q": 67, "s_k": 1500}
+_PRODUCTION_WINDOWS = ("causal", "past_end")
+
+
+@contextlib.contextmanager
+def _forced_variant(tag):
+    """Route every flydsl_fp8_mqa_logits call to `tag`."""
+    key = "FLYDSL_FP8_MQA_LOGITS_VARIANT"
+    prev = os.environ.get(key)
+    os.environ[key] = tag
+    try:
+        yield
+    finally:
+        if prev is None:
+            del os.environ[key]
+        else:
+            os.environ[key] = prev
+
+
+def verify_production_variants(num_heads, head_dims, clean_logits):
+    """Force each variant in `_auto_variants()` on a small odd shape.
+
+    Auto-routing is shape-dependent, so the reduced/full sweeps reach a given
+    production variant only by chance; this pins each one down across the
+    num_heads, head-dim, clean_logits and window axes. Heads the variant's MFMA
+    atom cannot tile are skipped. Returns (rows, failures) in the shape main()
+    reports them.
+    """
+    rows, failures = [], []
+    for tag, nh, hd, cl, window in itertools.product(
+        _auto_variants(),
+        num_heads,
+        head_dims,
+        clean_logits,
+        _PRODUCTION_WINDOWS,
+    ):
+        if nh % _VARIANT_MFMA_M[tag]:
+            continue
+        case = {
+            **_PRODUCTION_CASE,
+            "num_heads": nh,
+            "head_dim": hd,
+            "q_dtype": _DEFAULT_Q_DTYPES[0],
+            "kv_dtype": _DEFAULT_KV_DTYPES[0],
+            "clean_logits": bool(cl),
+            "window": window,
+        }
+        label = f"{tag} nh={nh} hd={hd} clean_logits={bool(cl)} window={window}"
+        try:
+            with _forced_variant(tag):
+                verify_fp8_mqa_logits(**case)
+            status = "ok"
+        except Exception as exc:  # noqa: BLE001 - record, keep sweeping
+            aiter.logger.error("FAILED production_variant case: %s", label)
+            failures.append(("production_variant", label, exc))
+            status = "FAIL"
+        rows.append(
+            {
+                "variant": tag,
+                "num_heads": nh,
+                "head_dim": hd,
+                "clean_logits": bool(cl),
+                "window": window,
+                "status": status,
+            }
+        )
+    return rows, failures
+
+
 _FLUSH_CACHE = None
 
 
@@ -565,7 +642,12 @@ def bench_fp8_mqa_logits(
     graded = _grade_all(outs, inp, s_q, s_k, num_heads, clean_logits, tag)
     del outs  # the graded buffers are dead; the timed replays allocate their own
 
-    ret = {"shape": _shape_label(s_q, s_k, batch), "gfx": get_gfx(), "status": "ok"}
+    ret = {
+        "shape": _shape_label(s_q, s_k, batch),
+        "gfx": get_gfx(),
+        "variant": _resolve_variant(None, s_q, s_k, num_heads),
+        "status": "ok",
+    }
     times = {}
     for name, fn in candidates.items():
         err, rel = graded[name]
@@ -928,6 +1010,11 @@ def main():
     aiter.logger.info("fp8_mqa_logits: %d cases x %s", len(cases), "+".join(scenarios))
 
     if "bench" in scenarios:
+        if os.environ.get("FLYDSL_FP8_MQA_LOGITS_VARIANT"):
+            aiter.logger.warning(
+                "FLYDSL_FP8_MQA_LOGITS_VARIANT is set: bench measures that variant, "
+                "not the auto-selected one"
+            )
         global BENCH_WARMUP, BENCH_SAMPLES, BENCH_REPLAYS
         BENCH_WARMUP = args.warmup
         BENCH_SAMPLES = args.bench_samples
@@ -961,6 +1048,16 @@ def main():
     elif "verify" in scenarios:
         aiter.logger.warning(
             "%s: skipping the auto_variant pins, which are gfx942-only", get_gfx()
+        )
+    if "verify" in scenarios:
+        rows, variant_failures = verify_production_variants(
+            args.num_heads, args.head_dim, args.clean_logits
+        )
+        failures.extend(variant_failures)
+        total += len(rows)
+        aiter.logger.info(
+            "fp8_mqa_logits production_variant summary (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
         )
 
     for scenario in scenarios:
