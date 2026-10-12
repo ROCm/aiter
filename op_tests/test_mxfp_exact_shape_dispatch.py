@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Numerical coverage for Flux shape-specialized MXFP tuning rows."""
+"""Numerical coverage for exact-shape MXFP assembly tuning rows."""
 
 import csv
 import gc
@@ -84,7 +84,7 @@ def _load_cases():
         ]
         if len(family_cases) != expected_count:
             raise RuntimeError(
-                f"{family}: expected {expected_count} Flux tuning rows, "
+                f"{family}: expected {expected_count} exact-shape tuning rows, "
                 f"found {len(family_cases)}"
             )
         cases.extend(
@@ -102,7 +102,7 @@ def _load_cases():
 @pytest.mark.parametrize("family,shape,candidate_kernel", _load_cases())
 @torch.no_grad()
 @requires_gfx950
-def test_flux_tuned_dispatch_matches_generic_kernel(family, shape, candidate_kernel):
+def test_exact_shape_dispatch_matches_generic_kernel(family, shape, candidate_kernel):
     M, N, K = shape
     torch.manual_seed(20261012 + M + N + K)
     x = torch.randn((M, K), dtype=torch.bfloat16, device="cuda")
