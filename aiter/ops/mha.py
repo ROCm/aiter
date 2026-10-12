@@ -3337,11 +3337,11 @@ def _flash_attn_varlen_forward_functional(
         zero_tensors=zero_tensors,
         sink_ptr=sink_ptr,
     )
-    # Without dropout the kernels never fill rng_state, and the unused dropout mask
-    # comes back with a backend-dependent dtype. Pin both so the op's outputs match
-    # its fake and never expose uninitialized memory. The gfx1250 ASM path likewise
-    # always produces an LSE, so drop it when the caller did not ask for one.
-    rng_state.zero_()
+    # Do not call rng_state.zero_() in this inference-only path. Zeroing would
+    # be an extra launch on every call. The unused dropout mask comes back with a
+    # backend-dependent dtype, so pin it to the empty fp32 tensor the fake models.
+    # The gfx1250 ASM path likewise always produces an LSE, so drop it when the
+    # caller did not ask for one.
     dropout_randval = torch.empty((0,), dtype=torch.float32, device=q.device)
     if not return_lse:
         softmax_lse = torch.empty((0,), dtype=torch.float32, device=q.device)
@@ -3681,7 +3681,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         # gains nothing because it writes dq/dk/dv in place, and padded cu_seqlens are
         # validated by a host-side read that a capturing graph forbids.
         capturable_inference = (
-            out is None
+            torch.compiler.is_compiling()
+            and out is None
             and dropout_p == 0.0
             and not is_grad
             and cu_seqlens_q_padded is None
