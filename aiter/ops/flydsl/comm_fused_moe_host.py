@@ -25,6 +25,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4 import (
     direct,
     megakernel,
+    producer,
     window,
 )
 from aiter.ops.flydsl.kernels.comm_fused_moe.gfx950.a8w4.collectives import (
@@ -268,6 +269,13 @@ def _config(entry: dict, shape: Shape, m: int, mode: str) -> PipelineConfig:
     config_type = _CONFIG_FAMILIES.get(family)
     if config_type is None:
         raise ValueError(f"unsupported comm_fused family {family!r}")
+    if mode not in _COMM_MODES:
+        raise ValueError(f"unsupported comm_fused mode {mode!r}")
+    required_mode = {DirectConfig: "rs", MegakernelConfig: "ar"}.get(config_type)
+    if required_mode is not None and mode != required_mode:
+        raise ValueError(
+            f"comm_fused family {family!r} requires mode={required_mode!r}"
+        )
     params = entry.get("params")
     if not isinstance(params, dict):
         raise TypeError("comm_fused config params must be a JSON object")
@@ -664,6 +672,40 @@ def _stage2_args(args, kwargs, config):
     )
 
 
+def _clear_missing_routes(runner, stage2_args, routes, payload_bytes: int) -> None:
+    """Make omitted routes zero before any producer/consumer uses its scratch.
+
+    All Window slots use the same sorting result, including when a slot is
+    reused for a later column window. Only the private route storage is touched;
+    shared contributions, peer payloads and synchronization words are preserved.
+    """
+
+    config = runner.config
+    rows = config.m * config.shape.topk
+    validity = getattr(runner, "_route_validity", None)
+    if validity is None:
+        validity = torch.empty(rows, dtype=torch.int32, device=runner.device)
+        runner._route_validity = validity
+    validity.zero_()
+    stream = torch.cuda.current_stream(runner.device)
+    _run_compiled(
+        producer.compile_mark_written_routes(config.m, config.shape.topk),
+        ptr_arg(validity),
+        ptr_arg(stage2_args[3]),
+        ptr_arg(stage2_args[5]),
+        stream,
+    )
+    for route in routes:
+        _run_compiled(
+            producer.compile_clear_missing_routes(
+                rows, route.nbytes // rows, payload_bytes
+            ),
+            ptr_arg(route),
+            ptr_arg(validity),
+            stream,
+        )
+
+
 class _RuntimeLayoutRunner:
     """Common model-runtime contract independent of collective type."""
 
@@ -678,6 +720,15 @@ class _RuntimeLayoutRunner:
     @property
     def supports_external_reuse_sync(self) -> bool:
         return False
+
+    @property
+    def requires_reuse_wait_before_stage2_write(self) -> bool:
+        return False
+
+    def wait_for_stage2_destination_reuse(self) -> None:
+        raise RuntimeError(
+            f"{type(self).__name__} has no pre-overwrite reuse synchronization"
+        )
 
     def prepare_padded_shared_partial(
         self, shared_partial: torch.Tensor, input_rows: int
@@ -768,6 +819,10 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
     ) -> None:
         if self.comm is not None:
             raise RuntimeError("megakernel runner communicator already registered")
+        if workspace_base is None:
+            # The CPU rank barrier cannot complete asynchronous workspace clears.
+            # The packed arena path supplies a base after its unified device sync.
+            torch.cuda.synchronize(self.device)
         self.comm = communicator
         if self.comm is None:
             self.comm = _create_communicator(
@@ -809,8 +864,25 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
         shared_partial,
         ordinary_stage2,
         before_shared_add=None,
+        routes_may_be_missing: bool = False,
     ):
         _bind_inter_layout(self, ordinary_stage2)
+        common = _stage2_args(stage2_args, stage2_kwargs, self.config)
+        if (
+            routes_may_be_missing
+            or stage2_kwargs.get("expert_mask") is not None
+            or stage2_kwargs.get("num_local_tokens") is not None
+        ):
+            _clear_missing_routes(
+                self,
+                stage2_args,
+                (
+                    self.workspace.narrow(
+                        0, self.config.route_offset, self.config.route_bytes
+                    ),
+                ),
+                self.config.shape.model_dim * 2,
+            )
         stream = torch.cuda.current_stream(self.device)
         shared_waited = before_shared_add is None or not self.config.shape.add_shared
 
@@ -828,7 +900,6 @@ class _MegakernelRunner(_RuntimeLayoutRunner):
                 self.output.copy_(shared_partial)
             shared_partial = self.output
         wait_for_shared()
-        common = _stage2_args(stage2_args, stage2_kwargs, self.config)
         _run_compiled(
             megakernel.compile_megakernel(self.config, self.rank),
             ptr_arg(self.workspace),
@@ -1054,6 +1125,7 @@ class _WindowRunner(_RuntimeLayoutRunner):
         before_shared_add=None,
         local_rows: int | None = None,
         rank_offset: int | None = None,
+        routes_may_be_missing: bool = False,
     ):
         k = window
         _bind_inter_layout(self, ordinary_stage2)
@@ -1076,6 +1148,12 @@ class _WindowRunner(_RuntimeLayoutRunner):
         phase_count = workspace.phase_count
         stream = torch.cuda.current_stream(self.device)
         common = _stage2_args(stage2_args, stage2_kwargs, config)
+        if (
+            routes_may_be_missing
+            or stage2_kwargs.get("expert_mask") is not None
+            or stage2_kwargs.get("num_local_tokens") is not None
+        ):
+            _clear_missing_routes(self, stage2_args, self.routes, config.window)
         _run_compiled(
             k.compile_compute(config, 0),
             ptr_arg(self.routes[0]),
@@ -1244,11 +1322,7 @@ class _DirectRunner(_RuntimeLayoutRunner):
         self.comm = None
         self.windows = ()
         self.workspace_base = 0
-        self.wait_for_reuse = direct.compile_wait_for_reuse(config)
         self.reduce_scatter_add = direct.compile_reduce_scatter_add(config)
-        self.reduce_scatter_add_external_sync = direct.compile_reduce_scatter_add(
-            config, protect_reuse=False
-        )
         if not defer_registration:
             self.register_communicator(tp_group)
 
@@ -1262,6 +1336,10 @@ class _DirectRunner(_RuntimeLayoutRunner):
     ) -> None:
         if self.comm is not None:
             raise RuntimeError("direct runner communicator already registered")
+        if workspace_base is None:
+            # Finish initialization before making epoch words visible to peers.
+            # Packed arenas already synchronize before registering their window.
+            torch.cuda.synchronize(self.device)
         self.comm = communicator
         if self.comm is None:
             self.comm = _create_communicator(
@@ -1286,6 +1364,27 @@ class _DirectRunner(_RuntimeLayoutRunner):
     def supports_external_reuse_sync(self) -> bool:
         return True
 
+    @property
+    def requires_reuse_wait_before_stage2_write(self) -> bool:
+        return True
+
+    def wait_for_stage2_destination_reuse(self) -> None:
+        """Synchronize ranks before sorting or Stage2 overwrites the partial."""
+
+        # Each rank reaches this barrier only after its preceding Direct kernel
+        # has finished reading every peer partial on the same stream.  Once all
+        # ranks publish the next i64 epoch, every previous read is complete and
+        # the destination can be safely cleared or overwritten.  The external
+        # reuse path skips this barrier because its caller already proves the
+        # same condition through the input-gather phase.
+        _barrier(
+            self.workspace,
+            self.workspace_base,
+            self.config.reuse_epoch_offset,
+            self.config.shape.tp_size,
+            torch.cuda.current_stream(self.device),
+        )
+
     def __call__(
         self,
         *,
@@ -1295,6 +1394,7 @@ class _DirectRunner(_RuntimeLayoutRunner):
         ordinary_stage2,
         before_shared_add=None,
         reuse_is_synchronized: bool = False,
+        reuse_waited_before_stage2_write: bool = False,
     ) -> torch.Tensor:
         from aiter.fused_moe import stage2_uses_route_reduce
 
@@ -1307,14 +1407,12 @@ class _DirectRunner(_RuntimeLayoutRunner):
         if shared_partial is None:
             raise RuntimeError("direct collective requires shared output")
 
-        stream = torch.cuda.current_stream(self.device)
-        if not reuse_is_synchronized:
-            _run_compiled(
-                self.wait_for_reuse,
-                ptr_arg(self.workspace),
-                fx.Int64(self.workspace_base),
-                stream,
+        if not reuse_is_synchronized and not reuse_waited_before_stage2_write:
+            raise RuntimeError(
+                "Direct reuse must be synchronized before sorting or Stage2 "
+                "writes its destination"
             )
+        stream = torch.cuda.current_stream(self.device)
         ordinary_stage2(
             *stage2_args[:6],
             self.partial,
@@ -1324,11 +1422,7 @@ class _DirectRunner(_RuntimeLayoutRunner):
         if before_shared_add is not None:
             before_shared_add()
         _run_compiled(
-            (
-                self.reduce_scatter_add_external_sync
-                if reuse_is_synchronized
-                else self.reduce_scatter_add
-            ),
+            self.reduce_scatter_add,
             ptr_arg(self.workspace),
             fx.Int64(self.workspace_base),
             ptr_arg(self.output),

@@ -5,11 +5,18 @@ import functools
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
+from flydsl.expr import gpu, ptrtoint, range_constexpr, rocdl
 from flydsl.expr.typing import T
 
 from .... import communication_ops_utils as comm_ops
-from .collectives import buffer_tensor_from_addr, load_bf16, peer_base, store_bf16
+from .collectives import (
+    buffer_tensor_from_addr,
+    load_bf16,
+    peer_base,
+    spin_until_epoch_i32_agent,
+    spin_until_epoch_i32_system,
+    store_bf16,
+)
 from .config import DIRECT_BLOCK, DirectConfig
 
 
@@ -32,54 +39,8 @@ def _reduce(partials, vector, vector_width: fx.Constexpr[int]):
 
 
 @functools.cache
-def compile_wait_for_reuse(config: DirectConfig):
-    """Wait until every rank finished reading the previous Stage2 partial."""
-
-    tp = config.shape.tp_size
-
-    @fx.struct
-    class ReuseWaitStorage:
-        epoch: fx.Array[fx.Int64, 1, 8]
-
-    @flyc.kernel(
-        name=f"comm_fused_moe_direct_reuse_wait_v2_{config.shape.tag}_m{config.m}",
-        known_block_size=[64, 1, 1],
-    )
-    def kernel(workspace: fx.Pointer, workspace_base: fx.Int64):
-        tid = fx.Int32(gpu.thread_id("x"))
-        local_base = fx.Int64(ptrtoint(workspace))
-        epoch = (
-            fx.SharedAllocator()
-            .allocate(ReuseWaitStorage)
-            .epoch.peek()
-            .view(fx.make_layout(1, 1))
-        )
-        if tid == fx.Int32(0):
-            epoch[0] = fx.Int64(
-                comm_ops.load_i64_global(
-                    local_base + fx.Int64(config.done_epoch_offset)
-                )
-            )
-        gpu.barrier()
-        if tid < fx.Int32(tp):
-            comm_ops.spin_until_ge_i64(
-                peer_base(workspace_base, tid) + fx.Int64(config.done_epoch_offset),
-                epoch[0],
-            )
-            comm_ops.fence_system_acquire()
-
-    @flyc.jit
-    def launch(workspace, workspace_base, stream):
-        kernel(workspace, workspace_base).launch(
-            grid=(1, 1, 1), block=(64, 1, 1), stream=stream
-        )
-
-    return launch
-
-
-@functools.cache
-def compile_reduce_scatter_add(config: DirectConfig, protect_reuse: bool = True):
-    """Reduce one BF16 row shard, add shared output, and protect input reuse."""
+def compile_reduce_scatter_add(config: DirectConfig):
+    """Reduce one BF16 row shard after the caller made partial reuse safe."""
 
     shape = config.shape
     tp = shape.tp_size
@@ -98,7 +59,7 @@ def compile_reduce_scatter_add(config: DirectConfig, protect_reuse: bool = True)
         name=(
             f"comm_fused_moe_direct_{shape.tag}_m{config.m}_g{grid}"
             + (f"_v{vector_width}" if vector_width != 8 else "")
-            + ("_deferred_reuse_v2" if protect_reuse else "_external_sync")
+            + "_external_sync"
         ),
         known_block_size=[DIRECT_BLOCK, 1, 1],
     )
@@ -118,11 +79,6 @@ def compile_reduce_scatter_add(config: DirectConfig, protect_reuse: bool = True)
         ready_epoch_address = local_base + fx.Int64(config.ready_offset)
         ready_gate_address = ready_epoch_address + fx.Int64(4)
         ready_arrival_address = ready_gate_address + fx.Int64(4)
-        completion_counter_address = local_base + fx.Int64(
-            config.completion_counter_offset
-        )
-        done_epoch_address = local_base + fx.Int64(config.done_epoch_offset)
-
         if tid == fx.Int32(0):
             epoch[0] = fx.Int32(
                 comm_ops.load_i32_global_agent(ready_gate_address)
@@ -150,7 +106,7 @@ def compile_reduce_scatter_add(config: DirectConfig, protect_reuse: bool = True)
                 comm_ops.store_i32_global_system_release(ready_epoch_address, expected)
             gpu.barrier()
             if tid < fx.Int32(tp):
-                comm_ops.spin_until_ge_i32_system(
+                spin_until_epoch_i32_system(
                     peer_base(workspace_base, tid) + fx.Int64(config.ready_offset),
                     expected,
                     acquire=True,
@@ -161,7 +117,7 @@ def compile_reduce_scatter_add(config: DirectConfig, protect_reuse: bool = True)
                 comm_ops.store_i32_global_agent_release(ready_gate_address, expected)
 
         if tid == fx.Int32(0):
-            comm_ops.spin_until_ge_i32_agent(ready_gate_address, expected)
+            spin_until_epoch_i32_agent(ready_gate_address, expected)
             comm_ops.fence_agent_acquire()
         gpu.barrier()
 
@@ -225,28 +181,6 @@ def compile_reduce_scatter_add(config: DirectConfig, protect_reuse: bool = True)
                 acc.to(fx.BFloat16),
                 vector_width,
             )
-
-        if const_expr(protect_reuse):
-            # Publish completion after every CTA has consumed its portion of all
-            # peer partials.  The next invocation waits on this i64 epoch just
-            # before Stage2 overwrites the partial, overlapping the wait with
-            # all intervening model work.
-            gpu.barrier()
-            if tid == fx.Int32(0):
-                comm_ops.fence_agent_release()
-                arrival[0] = fx.Int32(
-                    comm_ops.atomic_add_agent_one_as(
-                        completion_counter_address, fx.Int32(1)
-                    )
-                )
-            gpu.barrier()
-
-            if (arrival[0] == fx.Int32(grid - 1)) & (tid == fx.Int32(0)):
-                comm_ops.fence_agent_acquire()
-                comm_ops.store_i32_global_agent_release(
-                    completion_counter_address, fx.Int32(0)
-                )
-                comm_ops.store_i64_global_system(done_epoch_address, fx.Int64(expected))
 
     @flyc.jit
     def launch(

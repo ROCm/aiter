@@ -21,6 +21,32 @@ def peer_base(flat_base, peer):
     return flat_base + fx.Int64(peer) * fx.Int64(FLAT_VA_RANK_STRIDE)
 
 
+@flyc.jit
+def spin_until_epoch_i32_system(addr_i64, val, *, acquire=False, sleep=True):
+    """Wait for a wrapping system-visible epoch owned by this protocol."""
+
+    expected = fx.Uint32(val)
+    cur = fx.Int32(comm_ops.load_i32_global_system(addr_i64, acquire=acquire))
+    while fx.Uint32(cur) - expected >= fx.Uint32(0x80000000):
+        if fx.const_expr(sleep):
+            fx.rocdl.s_sleep(1)
+        cur = fx.Int32(comm_ops.load_i32_global_system(addr_i64, acquire=acquire))
+    return cur
+
+
+@flyc.jit
+def spin_until_epoch_i32_agent(addr_i64, val, *, sleep=True):
+    """Wait for a wrapping agent-visible epoch owned by this protocol."""
+
+    expected = fx.Uint32(val)
+    cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
+    while fx.Uint32(cur) - expected >= fx.Uint32(0x80000000):
+        if fx.const_expr(sleep):
+            fx.rocdl.s_sleep(1)
+        cur = fx.Int32(comm_ops.load_i32_global_agent(addr_i64))
+    return cur
+
+
 def buffer_tensor_from_addr(addr, elem, num_records_bytes):
     """Create a bounded flat V# view over a raw global address."""
     return ptr_buf_tensor(

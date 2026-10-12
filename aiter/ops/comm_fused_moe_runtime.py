@@ -74,6 +74,7 @@ class CommFusedMoeRuntime:
         stage2_stream: torch.cuda.Stream | None = None,
         reduce_scatter_sizes: list[int] | tuple[int, ...] | None = None,
         reuse_is_synchronized: bool = False,
+        routes_may_be_missing: bool = False,
         **moe_args: Any,
     ) -> torch.Tensor:
         """Run ordinary MoE through Stage1 and fuse Stage2 with TP reduction.
@@ -87,7 +88,12 @@ class CommFusedMoeRuntime:
         first consumes the shared output; no standalone ready kernel is used.
         ``reuse_is_synchronized`` lets an enclosing collective prove that all
         ranks finished the preceding Direct read before its Stage2 destination
-        is overwritten. Other callers retain Direct's explicit deferred wait.
+        is overwritten. Other callers use Direct's pre-overwrite rank barrier.
+        ``routes_may_be_missing`` declares custom routing that can omit slots
+        (for example, sentinel expert IDs or capacity drops). Expert masks and
+        valid-token limits enable this protection automatically. Route-backed
+        runners then define missing contributions as zero using the actual
+        sorted work; full-topk calls do not launch this preparation.
         """
 
         if before_stage2 is not None and before_stage2_for_rows is not None:
@@ -125,8 +131,6 @@ class CommFusedMoeRuntime:
                 f"({raw_tokens} compact rows)"
             )
         runner = self.runners[bucket]
-        if reuse_is_synchronized and runner.supports_external_reuse_sync:
-            runner_kwargs["reuse_is_synchronized"] = True
         if reduce_scatter_sizes is None:
             output_rows = self.runners.output_rows_for(bucket, raw_tokens)
         else:
@@ -150,6 +154,12 @@ class CommFusedMoeRuntime:
                 rank_offset=rank_offset,
             )
         stage2_destination = runner.stage2_destination
+        if stage2_destination is None and (
+            routes_may_be_missing
+            or moe_args.get("expert_mask") is not None
+            or moe_args.get("num_local_tokens") is not None
+        ):
+            runner_kwargs["routes_may_be_missing"] = True
         final_output = None
         if stage2_destination is not None:
             if moe_args.get("output") is not None:
@@ -170,10 +180,20 @@ class CommFusedMoeRuntime:
             moe_args["topk_weight"] = padded_weight
             moe_args["topk_ids"] = padded_ids
 
+        if reuse_is_synchronized and runner.supports_external_reuse_sync:
+            runner_kwargs["reuse_is_synchronized"] = True
+        elif runner.requires_reuse_wait_before_stage2_write:
+            # Validate the layout and arguments before enqueueing a collective.
+            # Sorting clears the Direct destination, so this barrier must still
+            # precede _fused_moe_impl rather than run in the Stage2 override.
+            runner.wait_for_stage2_destination_reuse()
+            runner_kwargs["reuse_waited_before_stage2_write"] = True
+
         def stage2_override(**kwargs: Any):
             def launch():
                 nonlocal final_output
                 current_shared = shared_partial
+                shared_join = before_shared_add
                 if before_stage2_for_rows is not None:
                     shared_rows = (
                         output_rows
@@ -192,6 +212,11 @@ class CommFusedMoeRuntime:
                     and bucket != raw_tokens
                     and current_shared.shape[0] != runner.config.output_rows
                 ):
+                    # Padding is already a shared-output read. Join its producer
+                    # before the copy and do not repeat the join in the runner.
+                    if shared_join is not None:
+                        shared_join()
+                        shared_join = None
                     current_shared = runner.prepare_padded_shared_partial(
                         current_shared, raw_tokens
                     )
@@ -199,7 +224,7 @@ class CommFusedMoeRuntime:
                     current_shared = runner.prepare_shared_partial(current_shared)
                 final_output = runner(
                     shared_partial=current_shared,
-                    before_shared_add=before_shared_add,
+                    before_shared_add=shared_join,
                     **runner_kwargs,
                     **kwargs,
                 )

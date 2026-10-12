@@ -912,6 +912,10 @@ def _run_stage2_case(
 
     def run_comm_fused():
         case = fixture.case
+        runner_kwargs = {}
+        if runner.requires_reuse_wait_before_stage2_write:
+            runner.wait_for_stage2_destination_reuse()
+            runner_kwargs["reuse_waited_before_stage2_write"] = True
         stage2_destination = runner.stage2_destination
         if fixture.requires_output_zero and stage2_destination is not None:
             stage2_destination.zero_()
@@ -935,6 +939,7 @@ def _run_stage2_case(
             },
             shared_partial=prepared_shared,
             ordinary_stage2=fixture.metadata.stage2,
+            **runner_kwargs,
         )
 
     flops, nbytes = _stage2_work(fixture.case, session.world)
@@ -980,6 +985,10 @@ def _run_stage2_rs_case(
     reference.add_(shared_partial)
 
     def run_comm_fused():
+        runner_kwargs = {}
+        if runner.requires_reuse_wait_before_stage2_write:
+            runner.wait_for_stage2_destination_reuse()
+            runner_kwargs["reuse_waited_before_stage2_write"] = True
         stage2_destination = runner.stage2_destination
         if fixture.requires_output_zero and stage2_destination is not None:
             stage2_destination.zero_()
@@ -1003,6 +1012,7 @@ def _run_stage2_rs_case(
             },
             shared_partial=prepared_shared,
             ordinary_stage2=fixture.metadata.stage2,
+            **runner_kwargs,
         )
 
     flops, nbytes = _stage2_work(case, session.world)

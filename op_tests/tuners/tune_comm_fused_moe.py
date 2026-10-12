@@ -13,6 +13,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+import torch.distributed._symmetric_memory as symm_mem
 
 from aiter import ActivationType, QuantType, dtypes
 from aiter.dist.parallel_state import (
@@ -342,6 +343,7 @@ PROFILE_FIELDS = (
     "max_abs",
     "rel_l2",
 )
+_DIRECT_TUNER_WORKSPACE_BYTES = 8 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -362,30 +364,63 @@ def _graph_latency_us(
     warmup_replays,
     rounds,
     iterations,
+    synchronize_each_replay=False,
 ):
-    dist.barrier(group=process_group)
+    def synchronize_reuse():
+        # Direct's production caller reaches Stage2 only after input-gather has
+        # proved that every rank consumed the previous partial.  The standalone
+        # tuner has no input-gather, so establish the same precondition outside
+        # the measured graph before allowing its destination to be overwritten.
+        torch.cuda.synchronize(device)
+        dist.barrier(group=process_group)
+
+    if synchronize_each_replay:
+        synchronize_reuse()
+    else:
+        dist.barrier(group=process_group)
     graph = torch.cuda.CUDAGraph()
     with tp_group.graph_capture() as capture, torch.cuda.graph(
         graph, stream=capture.stream
     ):
         run()
-    for _ in range(warmup_replays):
-        graph.replay()
-    torch.cuda.synchronize(device)
-    dist.barrier(group=process_group)
+
+    if synchronize_each_replay:
+        for _ in range(warmup_replays):
+            synchronize_reuse()
+            graph.replay()
+        synchronize_reuse()
+    else:
+        for _ in range(warmup_replays):
+            graph.replay()
+        torch.cuda.synchronize(device)
+        dist.barrier(group=process_group)
 
     world = dist.get_world_size(process_group)
     samples = []
     for _ in range(rounds):
-        start = torch.cuda.Event(enable_timing=True)
-        end = torch.cuda.Event(enable_timing=True)
-        start.record()
-        for _ in range(iterations):
-            graph.replay()
-        end.record()
-        end.synchronize()
+        if synchronize_each_replay:
+            elapsed_us = 0.0
+            for _ in range(iterations):
+                synchronize_reuse()
+                start = torch.cuda.Event(enable_timing=True)
+                end = torch.cuda.Event(enable_timing=True)
+                start.record()
+                graph.replay()
+                end.record()
+                end.synchronize()
+                elapsed_us += start.elapsed_time(end) * 1000.0
+            latency_us = elapsed_us / iterations
+        else:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(iterations):
+                graph.replay()
+            end.record()
+            end.synchronize()
+            latency_us = start.elapsed_time(end) * 1000.0 / iterations
         local = torch.tensor(
-            [start.elapsed_time(end) * 1000.0 / iterations],
+            [latency_us],
             dtype=torch.float64,
             device=device,
         )
@@ -430,14 +465,33 @@ def benchmark(
     warmup_replays: int = 100,
     rounds: int = 3,
     iterations: int = 20,
+    external_reuse_sync: bool = False,
 ) -> TuningResult:
     """Measure one fused Stage2 + TP communication candidate."""
 
-    runner = create_runner(tp_group, config)
+    direct_candidate = isinstance(config, DirectConfig)
+    direct_external_reuse_sync = external_reuse_sync and direct_candidate
+    workspace = None
+    if direct_candidate:
+        # Production carves Direct buffers from a larger packed symmetric arena.
+        # Match that peer-window footprint for both reuse protocols in this
+        # single-runner tuner without changing the production allocation policy.
+        workspace = symm_mem.empty(
+            (max(config.workspace_bytes, _DIRECT_TUNER_WORKSPACE_BYTES),),
+            dtype=torch.uint8,
+            device=reference.device,
+        )
+    runner = create_runner(tp_group, config, workspace=workspace)
     runner.output.fill_(float("nan"))
     candidate_shared = shared_partial.clone() if shared_partial is not None else None
 
     def run():
+        runner_kwargs = {}
+        if direct_external_reuse_sync:
+            runner_kwargs["reuse_is_synchronized"] = True
+        elif isinstance(config, DirectConfig):
+            runner.wait_for_stage2_destination_reuse()
+            runner_kwargs["reuse_waited_before_stage2_write"] = True
         stage2_destination = runner.stage2_destination
         if stage2_destination is not None:
             stage2_destination.zero_()
@@ -451,6 +505,7 @@ def benchmark(
             stage2_kwargs=stage2_kwargs,
             shared_partial=prepared_shared,
             ordinary_stage2=ordinary_stage2,
+            **runner_kwargs,
         )
 
     reference_f32 = reference.float()
@@ -472,6 +527,7 @@ def benchmark(
         warmup_replays=warmup_replays,
         rounds=rounds,
         iterations=iterations,
+        synchronize_each_replay=external_reuse_sync,
     )
     graph_diff = output.float() - reference_f32
     graph_error = torch.stack(
@@ -806,6 +862,14 @@ def _parse_args():
         action="store_true",
         help="Measure the matching ordinary Stage2 + TP collective and exit.",
     )
+    parser.add_argument(
+        "--external-reuse-sync",
+        action="store_true",
+        help=(
+            "Benchmark Direct with the production external-reuse contract; "
+            "synchronize ranks before each replay outside the timed graph."
+        ),
+    )
     parser.add_argument("--profile-output", type=Path)
     parser.add_argument("--winner-output", type=Path)
     return parser.parse_args()
@@ -864,6 +928,7 @@ def main():
             warmup_replays=args.warmup,
             rounds=args.rounds,
             iterations=args.iterations,
+            synchronize_each_replay=args.external_reuse_sync,
         )
         if rank == 0:
             print(
@@ -940,6 +1005,7 @@ def main():
                 warmup_replays=args.warmup,
                 rounds=args.rounds,
                 iterations=args.iterations,
+                external_reuse_sync=args.external_reuse_sync,
             )
             results.append(result)
             if rank == 0:

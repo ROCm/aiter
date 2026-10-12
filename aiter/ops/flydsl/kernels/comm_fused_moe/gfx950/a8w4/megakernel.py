@@ -29,6 +29,8 @@ from .collectives import (
     load_fp8_words,
     pack_fp8_words,
     peer_base,
+    spin_until_epoch_i32_agent,
+    spin_until_epoch_i32_system,
     store_bf16,
     store_buffer,
     store_fp8_words,
@@ -252,7 +254,7 @@ def emit_service_tile(
     if const_expr(config.uses_rsag):
         if tid < fx.Int32(tp_size):
             gather_slot = state_n_tile * fx.Int32(tp_size) + tid
-            comm_ops.spin_until_ge_i32_system(
+            spin_until_epoch_i32_system(
                 local_workspace_base
                 + fx.Int64(config.gather_done_offset)
                 + fx.Int64(gather_slot) * fx.Int64(4),
@@ -756,7 +758,7 @@ def emit_service_tile(
                     expected_i32,
                 )
                 local_slot = state_n_tile * fx.Int32(tp_size) + tid
-                comm_ops.spin_until_ge_i32_system(
+                spin_until_epoch_i32_system(
                     local_workspace_base
                     + fx.Int64(config.owner_ready_offset)
                     + fx.Int64(local_slot) * fx.Int64(4),
@@ -804,7 +806,7 @@ def emit_service_tile(
                     )
 
             if tid == fx.Int32(0):
-                comm_ops.spin_until_ge_i32_agent(
+                spin_until_epoch_i32_agent(
                     local_workspace_base
                     + fx.Int64(config.reduced_collective_ready_offset)
                     + fx.Int64(state_n_tile) * fx.Int64(4),
@@ -950,14 +952,14 @@ def emit_service_tile(
                 + fx.Int64(local_slot) * fx.Int64(4)
             )
             if const_expr(config.single_pass_direct):
-                comm_ops.spin_until_ge_i32_system(
+                spin_until_epoch_i32_system(
                     ready_address,
                     expected_i32,
                     acquire=not config.coherent_direct_handoff,
                     sleep=False,
                 )
             else:
-                comm_ops.spin_until_ge_i32_system(
+                spin_until_epoch_i32_system(
                     ready_address,
                     expected_i32,
                 )
@@ -997,7 +999,7 @@ def emit_service_tile(
 
                 if tid < fx.Int32(tp_size):
                     peer_ready_slot = state_n_tile * fx.Int32(tp_size) + tid
-                    comm_ops.spin_until_ge_i32_system(
+                    spin_until_epoch_i32_system(
                         peer_base(workspace_flat_base, tid)
                         + fx.Int64(config.rank_ready_offset)
                         + fx.Int64(peer_ready_slot) * fx.Int64(4),
@@ -1017,7 +1019,7 @@ def emit_service_tile(
 
         def wait_for_collective():
             if tid == fx.Int32(0):
-                comm_ops.spin_until_ge_i32_agent(
+                spin_until_epoch_i32_agent(
                     local_workspace_base
                     + fx.Int64(config.collective_ready_offset)
                     + fx.Int64(state_n_tile) * fx.Int64(4),

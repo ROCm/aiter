@@ -729,17 +729,14 @@ class DirectConfig:
         return _align_up(self.partial_bytes, 256)
 
     @property
-    def completion_counter_offset(self) -> int:
-        # The direct readiness protocol owns three i32 words at ready_offset.
-        return self.ready_offset + 12
-
-    @property
-    def done_epoch_offset(self) -> int:
-        return _align_up(self.completion_counter_offset + 4, 8)
+    def reuse_epoch_offset(self) -> int:
+        # The readiness protocol owns three i32 words at ready_offset.  Keep a
+        # separate aligned i64 epoch for the optional pre-overwrite barrier.
+        return _align_up(self.ready_offset + 12, 8)
 
     @property
     def workspace_bytes(self) -> int:
-        return _align_up(self.done_epoch_offset + 8, 256)
+        return _align_up(self.reuse_epoch_offset + 8, 256)
 
 
 PipelineConfig = MegakernelConfig | WindowConfig | DirectConfig
