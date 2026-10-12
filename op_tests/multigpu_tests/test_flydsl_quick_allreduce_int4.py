@@ -110,17 +110,14 @@ from aiter.test_common import benchmark, checkAllclose
 set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
+from aiter.ops.flydsl.allreduce_policy import mesh_st_ladder, ring_st_ladder
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     ATOMS,
     DEFAULT_GRID_CAP,
     SUPPORTED_WORLDS,
 )
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import SUPPORTED_BLOCKS
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import (
-    clamp_grid_cap,
-    mesh_st_ladder,
-)
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4_ring import ring_st_ladder
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import clamp_grid_cap
 from aiter.ops.flydsl.quick_allreduce_int4 import (
     _resolve_inbox_flags,
     batches_publishes,
@@ -1100,8 +1097,9 @@ def bench_quick_allreduce_int4(
 ):
     """Each FlyDSL schedule against the HIP quick all-reduce.
 
-    *route* is the schedule production dispatch picks for the payload, or
-    ``oneshot`` where the quantized slot declines it.
+    *route* is the kernel production dispatch picks for the payload, from
+    ``allreduce_policy.route``: ``mesh``, ``ring``, or ``oneshot`` or
+    ``fallback`` where the quantized slot declines it.
     """
     rows = _result(_bench_key(tp, algorithms, grid_cap, block), (tokens, hidden))
     names = [n for n in (*algorithms, "hip") if n in rows[0]["candidates"]]
@@ -1385,16 +1383,6 @@ def _verify(args, tps, algos, dts, link) -> None:
     )
 
 
-def _route(nbytes: int, policy) -> str:
-    """The schedule production dispatch picks for *nbytes*: ``mesh``,
-    ``ring``, ``oneshot`` below the quantized window, ``-`` above it."""
-    if nbytes <= policy.floor:
-        return "oneshot"
-    if nbytes > policy.max_bytes:
-        return "-"
-    return fly_policy.pick_quant_family(nbytes, policy)
-
-
 def _bench(args, tps, algos, link) -> None:
     algos = tuple(a for a in ALGORITHMS if a in algos)
     rows = []
@@ -1404,7 +1392,6 @@ def _bench(args, tps, algos, link) -> None:
         else:
             payloads = {n for a in algos for n in _ship_payloads(tp, a, link)[0]}
             shapes = [(n // _ROW_BYTES, HIDDEN) for n in sorted(payloads)]
-        policy = fly_policy.resolve_quant(link, tp)
         for grid_cap, block in itertools.product(args.grid_cap, args.block):
             # Every case of a spawn is registered before its first result.
             for shape in shapes:
@@ -1415,7 +1402,9 @@ def _bench(args, tps, algos, link) -> None:
                     hidden,
                     tp,
                     algos,
-                    route=_route(tokens * hidden * 2, policy),
+                    route=fly_policy.route(
+                        tokens * hidden * 2, link, tp, quantized=True
+                    ),
                     grid_cap=grid_cap,
                     block=block,
                 )

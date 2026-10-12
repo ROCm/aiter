@@ -30,6 +30,7 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
 
+from .allreduce_policy import mesh_st_ladder, ring_st_ladder
 from .allreduce_shared import (
     _SUPPORTED_ARCHS,
     _cuda_index,
@@ -56,14 +57,12 @@ from .kernels.comm.quick_allreduce_int4 import (
     SUPER_TILES,
     clamp_grid_cap,
     make_quick_allreduce_int4_kernel,
-    mesh_st_ladder,
 )
 from .kernels.comm.quick_allreduce_int4_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
     make_quick_allreduce_int4_ring_kernel,
-    ring_st_ladder,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 

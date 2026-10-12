@@ -109,41 +109,45 @@ def pick_rung(ladder, nbytes: int):
 
 @dataclass(frozen=True)
 class FamilyPolicy:
-    """Family boundaries for one ``(link, world_size)``, in payload bytes.
+    """The FlyDSL family boundaries for one cell, in payload bytes.
 
-    ``min_bytes`` is where this whole path starts being worth taking; below it
-    the caller should fall through to other alternatives.
+    The fields are in payload order. The two exact boundaries are for the
+    custom-all-reduce slot, the three quantized ones for the quick-reduce slot
+    (refer to ``allreduce_policy``):
 
-    The two one-shot ceilings are measured against *different* alternatives and
-    so do not order against each other:
+    * ``oneshot_min`` and ``oneshot_max`` (both inclusive): the one-shot's
+      window. Outside it, the payload goes to ``cross_device_reduce`` or RCCL.
+    * ``quant_min`` (exclusive): where the quantized mesh overtakes the fastest
+      exact kernel, the one-shot or ``cross_device_reduce``.
+    * ``mesh_max`` (inclusive): where the ring overtakes the mesh.
+    * ``quant_max`` (inclusive): the largest payload for the quantized
+      families.
 
-    * ``oneshot_max`` is where the quantized **mesh** overtakes the fastest
-      exact kernel: the one-shot, or ``cross_device_reduce`` where that is
-      faster. It is the quick-reduce slot's exclusive floor.
-    * ``oneshot_max_exact`` is where ``cross_device_reduce``/RCCL -- what the
-      payload reaches if every FlyDSL family declines -- overtakes it. It is the
-      custom-all-reduce slot's ceiling.
+    ``oneshot_max`` and ``quant_min`` are measured against different kernels,
+    so they do not order against each other. Where ``cross_device_reduce`` is
+    faster than both FlyDSL families, ``quant_min`` is above ``oneshot_max``,
+    and the payloads between the two stay exact.
     """
 
     oneshot_max: int
-    oneshot_max_exact: int
+    quant_min: int
     mesh_max: int
-    min_bytes: int = 0
-    max_bytes: int = NO_MAX
+    oneshot_min: int = 0
+    quant_max: int = NO_MAX
 
     def __post_init__(self):
-        if self.oneshot_max <= 0 or self.oneshot_max_exact <= 0:
+        if self.oneshot_max <= 0 or self.quant_min <= 0:
             raise ValueError(
-                f"oneshot_max ({self.oneshot_max}) and oneshot_max_exact "
-                f"({self.oneshot_max_exact}) must be positive"
+                f"oneshot_max ({self.oneshot_max}) and quant_min "
+                f"({self.quant_min}) must be positive"
             )
-        if self.mesh_max < self.oneshot_max:
+        if self.mesh_max < self.quant_min:
             raise ValueError(
-                f"mesh_max ({self.mesh_max}) must be >= oneshot_max "
-                f"({self.oneshot_max}); the families partition by size"
+                f"mesh_max ({self.mesh_max}) must be >= quant_min "
+                f"({self.quant_min}); the families partition by size"
             )
-        if self.min_bytes < 0:
-            raise ValueError(f"min_bytes ({self.min_bytes}) must be non-negative")
+        if self.oneshot_min < 0:
+            raise ValueError(f"oneshot_min ({self.oneshot_min}) must be non-negative")
 
 
 @dataclass(frozen=True)

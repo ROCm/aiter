@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Which FlyDSL all-reduce schedule to run, as a function of payload size.
+"""Every tuned decision of the FlyDSL all-reduce: which kernel runs a payload,
+and in which configuration.
 
-There are three schedules and the fastest one is a function of how many bytes
-are being reduced:
+Kernels
+=======
 
 * **one-shot** (``OneShotAllReduce``) -- one round, no grid-wide barrier, wire
   volume ``(N-1)*S``. Exact: fp32 accumulate, one bf16 rounding.
@@ -13,12 +14,48 @@ are being reduced:
 * **ring** (``QuickAllReduceInt4(algorithm="ring")``) -- two-shot, ``2(N-1)``
   hops, same wire volume as the mesh, traded for per-destination locality.
 
-They do not share a dispatcher. Each lives in the aiter slot whose accuracy
-contract it already matches, and this module hands each slot its own view of
-one shared table row:
+The decisions come in two levels.
 
-* ``resolve_oneshot`` -> ``CustomAllreduce``, which is exact.
-* ``resolve_quant``   -> ``QuickAllReduce``, which is allowed to quantize.
+Level 1: which kernel
+=====================
+
+The kernel is a function of the payload size, and the boundaries are a
+``FamilyPolicy`` row per ``(link, world_size)`` cell: ``FAMILY_POLICY``, or
+``ARCH_FAMILY_POLICY`` on an arch with its own measurements. On the payload
+axis, a row reads::
+
+    exact (quick reduce off):
+      0 --- one-shot --- oneshot_max --- cross_device_reduce / RCCL ------->
+
+    quantized (AITER_QUICK_REDUCE_QUANTIZATION=INT4):
+      0 --- one-shot --- oneshot_max --- cdr --- quant_min --- mesh
+                                                     --- mesh_max --- ring --->
+
+The kernels do not share a dispatcher. Each lives in the aiter slot whose
+accuracy contract it matches, and this module gives each slot its own view of
+the row:
+
+* ``resolve_oneshot`` -> ``CustomAllreduce``, which is exact: the one-shot
+  window.
+* ``resolve_quant`` -> ``QuickAllReduce``, which can quantize: the mesh and
+  ring windows.
+
+``CudaCommunicator.all_reduce`` tries ``QuickAllReduce`` first, so a payload
+above ``quant_min`` goes to the mesh or the ring, and the rest go to
+``CustomAllreduce``. ``route`` is that composition in one function.
+``cross_device_reduce`` can be faster than both FlyDSL families, so
+``quant_min`` can be above ``oneshot_max``: the payloads between the two then
+go to ``cross_device_reduce`` and stay exact.
+
+Level 2: which configuration
+============================
+
+Each kernel has a tuning ladder per ``(link, world_size)``: ``ONESHOT_LADDER``,
+``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a tuple of rungs in
+ascending ``min_bytes`` order, and a payload runs on the last rung whose
+``min_bytes`` is at most its size (``pick_rung``). The host builds one engine
+per rung. The mesh and ring hosts then refine the super-tile at launch, from
+the tile count of the payload; refer to ``QuickAllReduceInt4._pick_cfg``.
 """
 
 from __future__ import annotations
@@ -28,10 +65,19 @@ import logging
 import os
 
 from .kernels.comm.allreduce_shared import (
+    BLOCK,
     NO_MAX,
     FamilyPolicy,
     OneShotPolicy,
+    OneShotRung,
     QuantPolicy,
+    TwoShotRung,
+)
+from .kernels.comm.one_shot_allreduce import (
+    DEFAULT_ATOMS,
+    DEFAULT_BLOCK,
+    DEFAULT_FANOUT,
+    DEFAULT_GRID_CAP,
 )
 
 logger = logging.getLogger("aiter")
@@ -41,33 +87,41 @@ LINKS = ("pcie", "xgmi")
 
 SUPPORTED_WORLDS = (2, 4, 8)
 
+
+# Level 1: kernel boundaries
+# ==========================
+
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
-    # --- PCIe: Policy from measurements (on gfx950/MI350P) --------
+    # --- PCIe: measured on gfx950 (MI350P) -----------------------------------
     ("pcie", 2): FamilyPolicy(
-        oneshot_max=384 << 10,
-        oneshot_max_exact=64 << 20,
+        oneshot_max=64 << 20,
+        quant_min=384 << 10,
         mesh_max=NO_MAX,
     ),
     ("pcie", 4): FamilyPolicy(
-        oneshot_max=128 << 10, oneshot_max_exact=1 << 20, mesh_max=16 << 20
+        oneshot_max=1 << 20,
+        quant_min=128 << 10,
+        mesh_max=16 << 20,
     ),
     ("pcie", 8): FamilyPolicy(
-        oneshot_max=96 << 10, oneshot_max_exact=1 << 20, mesh_max=24 << 20
+        oneshot_max=1 << 20,
+        quant_min=96 << 10,
+        mesh_max=24 << 20,
     ),
-    # --- xGMI: Policy from measurements (on gfx942) --------------------
+    # --- xGMI: measured on gfx942 (MI300X) -----------------------------------
     ("xgmi", 2): FamilyPolicy(
-        oneshot_max=384 << 10,
-        oneshot_max_exact=1536 << 10,
+        oneshot_max=1536 << 10,
+        quant_min=384 << 10,
         mesh_max=128 << 20,
     ),
     ("xgmi", 4): FamilyPolicy(
         oneshot_max=384 << 10,
-        oneshot_max_exact=384 << 10,
+        quant_min=384 << 10,
         mesh_max=128 << 20,
     ),
     ("xgmi", 8): FamilyPolicy(
-        oneshot_max=256 << 10,
-        oneshot_max_exact=168 << 10,
+        oneshot_max=168 << 10,
+        quant_min=256 << 10,
         mesh_max=128 << 20,
     ),
 }
@@ -80,32 +134,168 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
 #
 # * The ring never wins: it is 1.03x-1.16x slower than the mesh at TP2 up to
 #   512 MiB, and 2.2x-5.7x slower at TP4 and TP8. ``mesh_max`` is unbounded.
-# * ``oneshot_max_exact`` is where ``cross_device_reduce`` overtakes the
-#   one-shot. At TP4 and TP8 that is where it switches to its 2-stage kernel
-#   (160 KiB and 80 KiB), which is fast on this fabric.
-# * ``oneshot_max`` is where the mesh overtakes the fastest exact kernel. At
-#   TP4 and TP8 that kernel is ``cross_device_reduce``'s 2-stage, not the
-#   one-shot, so the mesh starts well above the one-shot ceiling and the payloads
-#   between the two stay exact.
+# * ``oneshot_max`` is where ``cross_device_reduce`` overtakes the one-shot.
+#   At TP4 and TP8 that is where it switches to its 2-stage kernel (160 KiB
+#   and 80 KiB), which is fast on this fabric.
+# * ``quant_min`` is where the mesh overtakes the fastest exact kernel. At TP4
+#   and TP8 that kernel is ``cross_device_reduce``'s 2-stage, so the mesh
+#   starts well above the one-shot ceiling.
 ARCH_FAMILY_POLICY: dict[tuple[str, str, int], FamilyPolicy] = {
     ("gfx950", "xgmi", 2): FamilyPolicy(
-        oneshot_max=448 << 10,
-        oneshot_max_exact=3 << 20,
+        oneshot_max=3 << 20,
+        quant_min=448 << 10,
         mesh_max=NO_MAX,
     ),
     ("gfx950", "xgmi", 4): FamilyPolicy(
-        oneshot_max=960 << 10,
         # Every payload below the 160 KiB 2-stage switch: payloads are whole
         # multiples of 16 B.
-        oneshot_max_exact=(160 << 10) - 16,
+        oneshot_max=(160 << 10) - 16,
+        quant_min=960 << 10,
         mesh_max=NO_MAX,
     ),
     ("gfx950", "xgmi", 8): FamilyPolicy(
-        oneshot_max=1600 << 10,
-        oneshot_max_exact=96 << 10,
+        oneshot_max=96 << 10,
+        quant_min=1600 << 10,
         mesh_max=NO_MAX,
     ),
 }
+
+
+# Level 2: configuration ladders
+# ==============================
+#
+# The ladders were measured on gfx942 for xGMI and on gfx950 for PCIe.
+
+# One-shot, ``OneShotRung``.
+#
+#   PCIe
+#
+#     TP2  b256 a1 cap128 -- the 4 KiB tile to 384 KiB, then b512 a4 cap128,
+#                            the 32 KiB tile, over the rest of the exact-mode
+#                            window, which runs to 64 MiB.
+#     TP4  b128 a1 cap128 -- the 2 KiB tile to 96 KiB, then b512 a2 cap64, the
+#                            16 KiB tile, to the 1 MiB exact-mode ceiling.
+#     TP8  b64 a1 cap64   -- the 1 KiB tile, except b256 a1 cap64, the 4 KiB
+#                            tile, from 48 to 192 KiB.
+#
+#   xGMI
+#
+#     TP2  atoms=1 cap128 b128/b256 -- the 2 KiB tile to 256 KiB, the most it
+#                               covers in one round, then the 4 KiB tile.
+#     TP4  atoms=1 cap128 b256 -- one rung over the whole window
+#     TP8  atoms=1 cap128 b128 -- one rung over the whole window
+ONESHOT_LADDER: dict[tuple[str, int], tuple[OneShotRung, ...]] = {
+    ("pcie", 2): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
+        OneShotRung(
+            min_bytes=384 << 10, atoms=4, grid_cap=128, fanout="peer", block=512
+        ),
+    ),
+    ("pcie", 4): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+        OneShotRung(min_bytes=96 << 10, atoms=2, grid_cap=64, fanout="peer", block=512),
+    ),
+    ("pcie", 8): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=64, fanout="peer", block=64),
+        OneShotRung(min_bytes=48 << 10, atoms=1, grid_cap=64, fanout="peer", block=256),
+        OneShotRung(min_bytes=192 << 10, atoms=1, grid_cap=64, fanout="peer", block=64),
+    ),
+    ("xgmi", 2): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+        OneShotRung(
+            min_bytes=256 << 10, atoms=1, grid_cap=128, fanout="peer", block=256
+        ),
+    ),
+    ("xgmi", 4): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
+    ),
+    ("xgmi", 8): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+    ),
+}
+
+# Mesh, ``TwoShotRung``.
+#
+#   xGMI  ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
+#         Block 512 from 4 MiB.
+#   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
+#         TP8 ST=8 everywhere.
+MESH_ST_LADDER: dict[tuple[str, int], tuple[TwoShotRung, ...]] = {
+    ("xgmi", 2): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
+    ),
+    ("xgmi", 4): (
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
+    ),
+    ("xgmi", 8): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=6 << 20, super_tile=8, grid_cap=128, block=512),
+    ),
+    ("pcie", 2): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=4 << 20, super_tile=8, grid_cap=128, block=512),
+    ),
+    ("pcie", 4): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=768 << 10, super_tile=8, grid_cap=128, block=512),
+    ),
+    ("pcie", 8): (TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),),
+}
+
+# Ring, ``TwoShotRung``. The ring publishes ``2(N-1)`` times per super-tile, so
+# a larger payload wants a larger super-tile.
+RING_ST_LADDER: dict[tuple[str, int], tuple[TwoShotRung, ...]] = {
+    ("xgmi", 2): (
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=24 << 20, super_tile=16, grid_cap=128, block=BLOCK),
+    ),
+    ("xgmi", 4): (
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=24 << 20, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=48 << 20, super_tile=32, grid_cap=128, block=BLOCK),
+    ),
+    ("xgmi", 8): (
+        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=48 << 20, super_tile=32, grid_cap=128, block=BLOCK),
+    ),
+    ("pcie", 2): (TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=512),),
+    ("pcie", 4): (TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),),
+    ("pcie", 8): (TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),),
+}
+
+
+def oneshot_ladder(world_size: int, link: str = "pcie") -> tuple[OneShotRung, ...]:
+    """Rungs for *(link, world_size)*, or a single default rung if unlisted.
+
+    *link* defaults to ``"pcie"`` so a caller that has not resolved the fabric
+    gets the conservative table: its fatter tiles cost throughput on xGMI but
+    are never wrong in the sense of failing.
+    """
+    default = OneShotRung(
+        min_bytes=0,
+        atoms=DEFAULT_ATOMS,
+        grid_cap=DEFAULT_GRID_CAP,
+        fanout=DEFAULT_FANOUT,
+        block=DEFAULT_BLOCK,
+    )
+    return ONESHOT_LADDER.get((str(link), int(world_size)), (default,))
+
+
+def mesh_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ...]:
+    """Rungs for *(link, world_size)*, or ``()`` when there is no ladder."""
+    return MESH_ST_LADDER.get((str(link), int(world_size)), ())
+
+
+def ring_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ...]:
+    """Rungs for *(link, world_size)*, or the PCIe TP4 shape for an unlisted one."""
+    return RING_ST_LADDER.get((str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)])
+
+
+# Host and environment
+# ====================
 
 
 def _env_int(name: str) -> int | None:
@@ -154,6 +344,10 @@ def detect_link() -> str:
     return "xgmi" if has_xgmi_peer_links() else "pcie"
 
 
+# Level 1: resolution
+# ===================
+
+
 def family_policy(link: str, world_size: int, arch: str | None = None) -> FamilyPolicy:
     """The table row for *(arch, link, world_size)*, without overrides.
 
@@ -172,14 +366,6 @@ def family_policy(link: str, world_size: int, arch: str | None = None) -> Family
     return FAMILY_POLICY[(link, int(world_size))] if row is None else row
 
 
-def _oneshot_boundary(base: FamilyPolicy) -> int:
-    """The measured one-shot/mesh crossover, ``AITER_FLY_AR_ONESHOT_MAX_BYTES``
-    applied."""
-
-    override = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
-    return base.oneshot_max if override is None else override
-
-
 def resolve_oneshot(
     link: str, world_size: int, arch: str | None = None
 ) -> OneShotPolicy:
@@ -187,43 +373,45 @@ def resolve_oneshot(
 
     *arch* defaults to this host's; refer to ``family_policy``.
 
-    ``AITER_FLY_AR_ONESHOT_MIN_BYTES`` overrides the small-payload floor below
-    which the one-shot declines (the custom-AR slot then falls through to
-    ``cdr``); ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides the ceiling. ``-1``
-    on either means "use the table".
+    ``AITER_FLY_AR_ONESHOT_MIN_BYTES`` overrides ``oneshot_min`` and
+    ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides ``oneshot_max``. ``-1`` on
+    either means "use the table".
     """
-
-    base = family_policy(link, world_size, arch)
+    row = family_policy(link, world_size, arch)
     max_override = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
     min_override = _env_int("AITER_FLY_AR_ONESHOT_MIN_BYTES")
     return OneShotPolicy(
-        max_bytes=base.oneshot_max_exact if max_override is None else max_override,
-        min_bytes=base.min_bytes if min_override is None else min_override,
+        max_bytes=row.oneshot_max if max_override is None else max_override,
+        min_bytes=row.oneshot_min if min_override is None else min_override,
     )
 
 
 def resolve_quant(link: str, world_size: int, arch: str | None = None) -> QuantPolicy:
-    """The mesh/ring window for a rank, environment overrides applied.
+    """The mesh and ring windows for a rank, environment overrides applied.
 
     *arch* defaults to this host's; refer to ``family_policy``.
-    """
 
-    base = family_policy(link, world_size, arch)
-    floor = _oneshot_boundary(base)
-    mesh = base.mesh_max
-    override_mesh = _env_int("AITER_FLY_AR_MESH_MAX_BYTES")
-    if override_mesh is not None:
-        mesh = override_mesh
+    ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides ``quant_min`` too, so that one
+    override moves the one boundary between the one-shot and the mesh.
+    ``AITER_FLY_AR_MESH_MAX_BYTES`` overrides ``mesh_max``.
+    """
+    row = family_policy(link, world_size, arch)
+    floor = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
+    if floor is None:
+        floor = row.quant_min
+    mesh = _env_int("AITER_FLY_AR_MESH_MAX_BYTES")
+    if mesh is None:
+        mesh = row.mesh_max
     # The families partition by size; an override must not invert them.
     mesh = max(mesh, floor)
-    return QuantPolicy(floor=floor, mesh_max=mesh, max_bytes=base.max_bytes)
+    return QuantPolicy(floor=floor, mesh_max=mesh, max_bytes=row.quant_max)
 
 
 def pick_quant_family(nbytes: int, policy: QuantPolicy) -> str:
     """``"mesh"`` | ``"ring"`` for a payload of *nbytes*.
 
     Assumes ``nbytes > policy.floor``; below that the caller should have
-    declined so the exact one-shot gets the payload.
+    declined so the payload reaches an exact kernel.
     """
     return "mesh" if nbytes <= policy.mesh_max else "ring"
 
@@ -233,8 +421,6 @@ def quant_family_range(family: str, policy: QuantPolicy) -> tuple[int, int]:
     if family == "mesh":
         return policy.floor + 1, min(policy.mesh_max, policy.max_bytes)
     if family == "ring":
-        # The ring algorithm is beneficial for large messages, i.e.,
-        # it comes after the mesh with increasing message size.
         return policy.mesh_max + 1, policy.max_bytes
     raise ValueError(f"family must be 'mesh' or 'ring', got {family!r}")
 
@@ -247,3 +433,31 @@ def quant_families_reachable(policy: QuantPolicy) -> tuple[str, ...]:
     if policy.max_bytes > policy.mesh_max:
         out.append("ring")
     return tuple(out)
+
+
+def route(
+    nbytes: int,
+    link: str,
+    world_size: int,
+    *,
+    quantized: bool,
+    arch: str | None = None,
+) -> str:
+    """The kernel production dispatch runs for a payload of *nbytes*.
+
+    ``"oneshot"``, ``"mesh"``, ``"ring"``, or ``"fallback"`` for
+    ``cross_device_reduce`` and RCCL. *quantized* is whether the quick-reduce
+    slot is open (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``).
+
+    The slots are tried in the order of ``CudaCommunicator.all_reduce``:
+    quick reduce, then custom all-reduce. Only the payload size is
+    considered; the slots also check dtype, alignment and contiguity.
+    """
+    if quantized:
+        quant = resolve_quant(link, world_size, arch)
+        if quant.floor < nbytes <= quant.max_bytes:
+            return pick_quant_family(nbytes, quant)
+    one = resolve_oneshot(link, world_size, arch)
+    if one.min_bytes <= nbytes <= one.max_bytes:
+        return "oneshot"
+    return "fallback"

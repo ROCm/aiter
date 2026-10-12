@@ -18,7 +18,7 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .allreduce_policy import family_policy
+from .allreduce_policy import family_policy, oneshot_ladder
 from .allreduce_shared import (
     _SUPPORTED_ARCHS,
     _cuda_index,
@@ -38,7 +38,6 @@ from .kernels.comm.one_shot_allreduce import (
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
     make_one_shot_allreduce_kernel,
-    oneshot_ladder,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
@@ -49,8 +48,8 @@ def max_payload_bytes(
     world_size: int, link: str = "pcie", arch: str | None = None
 ) -> int:
     """Largest payload this kernel should be asked to move: the policy's
-    ``oneshot_max_exact`` for *(arch, link, world_size)*."""
-    return family_policy(str(link), int(world_size), arch).oneshot_max_exact
+    ``oneshot_max`` for *(arch, link, world_size)*."""
+    return family_policy(str(link), int(world_size), arch).oneshot_max
 
 
 class OneShotAllReduce:

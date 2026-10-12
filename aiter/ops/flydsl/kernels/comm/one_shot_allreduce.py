@@ -32,7 +32,6 @@ from .allreduce_shared import (
     _CM_SC1,
     _INBOX_POLICY,
     SUPPORTED_WORLDS,
-    OneShotRung,
     _buffer_load,
     _buffer_ptr,
     _buffer_store,
@@ -62,74 +61,6 @@ DEFAULT_ATOMS = 1
 # tile.
 SUPPORTED_ATOMS = (1, 2, 4)
 DEFAULT_GRID_CAP = 64
-
-# Per-``(link, world_size)`` tuning ladder of ``OneShotRung``. The host builds
-# one engine per rung and selects by payload size at launch. Created from a
-# tuning sweep.
-#
-#   PCIe
-#
-#     TP2  b256 a1 cap128 -- the 4 KiB tile to 384 KiB, then b512 a4 cap128,
-#                            the 32 KiB tile, over the rest of the exact-mode
-#                            window, which runs to 64 MiB.
-#     TP4  b128 a1 cap128 -- the 2 KiB tile to 96 KiB, then b512 a2 cap64, the
-#                            16 KiB tile, to the 1 MiB exact-mode ceiling.
-#     TP8  b64 a1 cap64   -- the 1 KiB tile, except b256 a1 cap64, the 4 KiB
-#                            tile, from 48 to 192 KiB.
-#
-#   xGMI
-#
-#     TP2  atoms=1 cap128 b128/b256 -- the 2 KiB tile to 256 KiB, the most it
-#                               covers in one round, then the 4 KiB tile.
-#     TP4  atoms=1 cap128 b256 -- one rung over the whole window
-#     TP8  atoms=1 cap128 b128 -- one rung over the whole window
-ONESHOT_LADDER: dict[tuple[str, int], tuple[OneShotRung, ...]] = {
-    ("pcie", 2): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
-        OneShotRung(
-            min_bytes=384 << 10, atoms=4, grid_cap=128, fanout="peer", block=512
-        ),
-    ),
-    ("pcie", 4): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
-        OneShotRung(min_bytes=96 << 10, atoms=2, grid_cap=64, fanout="peer", block=512),
-    ),
-    ("pcie", 8): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=64, fanout="peer", block=64),
-        OneShotRung(min_bytes=48 << 10, atoms=1, grid_cap=64, fanout="peer", block=256),
-        OneShotRung(min_bytes=192 << 10, atoms=1, grid_cap=64, fanout="peer", block=64),
-    ),
-    ("xgmi", 2): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
-        OneShotRung(
-            min_bytes=256 << 10, atoms=1, grid_cap=128, fanout="peer", block=256
-        ),
-    ),
-    ("xgmi", 4): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
-    ),
-    ("xgmi", 8): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
-    ),
-}
-
-
-def oneshot_ladder(world_size: int, link: str = "pcie") -> tuple[OneShotRung, ...]:
-    """Rungs for *(link, world_size)*, or a single default rung if unlisted.
-
-    *link* defaults to ``"pcie"`` so a caller that has not resolved the fabric
-    gets the conservative table: its fatter tiles cost throughput on xGMI but
-    are never wrong in the sense of failing.
-    """
-    default = OneShotRung(
-        min_bytes=0,
-        atoms=DEFAULT_ATOMS,
-        grid_cap=DEFAULT_GRID_CAP,
-        fanout=DEFAULT_FANOUT,
-        block=DEFAULT_BLOCK,
-    )
-    return ONESHOT_LADDER.get((str(link), int(world_size)), (default,))
-
 
 # Read our own inbox with the caches bypassed: a peer wrote these lines
 # microseconds ago and an L1 hit here is a stale hit. Same reasoning as the

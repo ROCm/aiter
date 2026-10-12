@@ -92,15 +92,25 @@ quantization regime is set.
 
 The communicator tries `QuickAllReduce` first, then `CustomAllreduce`. For
 this reason, a payload goes to the mesh or the ring if it is larger than the
-one-shot boundary. Other payloads go to `CustomAllreduce`, which can then use the
-one-shot.
+mesh floor. Other payloads go to `CustomAllreduce`, which uses the one-shot up
+to the one-shot ceiling and `cross_device_reduce` or RCCL above it.
 
-The payload-size boundaries for each link type and world size are in
-`FAMILY_POLICY` in `aiter/ops/flydsl/allreduce_policy.py`. On an arch that has
-its own measurements, a row of `ARCH_FAMILY_POLICY` replaces the
-`FAMILY_POLICY` row. gfx950 with xGMI has its own rows: the ring is never used
-there, and at TP4 and TP8 the payloads between the one-shot and the mesh go to
-the 2-stage `cross_device_reduce` kernel, which is faster than both there.
+`aiter/ops/flydsl/allreduce_policy.py` contains every tuned value, in two
+levels:
+
+1. Which kernel runs a payload. The boundaries for each link type and world
+   size are a row of `FAMILY_POLICY`. On an arch that has its own
+   measurements, a row of `ARCH_FAMILY_POLICY` replaces it. The fields are in
+   payload order: `oneshot_min` and `oneshot_max` (the one-shot), `quant_min`
+   (the mesh floor), `mesh_max` and `quant_max`. `route()` gives the kernel
+   for a payload size.
+2. Which configuration of that kernel runs. Each kernel has a tuning ladder
+   per link type and world size: `ONESHOT_LADDER`, `MESH_ST_LADDER` and
+   `RING_ST_LADDER`.
+
+gfx950 with xGMI has its own rows: the ring is never used there, and at TP4
+and TP8 the payloads between the one-shot and the mesh go to the 2-stage
+`cross_device_reduce` kernel, which is faster than both there.
 
 ## Environment variables
 
@@ -132,12 +142,12 @@ the value from the table.
 | `AITER_FLY_AR_ONESHOT_MAX_BYTES` | The one-shot boundary. This variable sets two values. In `CustomAllreduce`, it is the largest payload for the one-shot (inclusive). In `QuickAllReduce`, it is the floor of the mesh (exclusive). |
 | `AITER_FLY_AR_MESH_MAX_BYTES` | The largest payload for the mesh (inclusive). Larger payloads go to the ring. If this value is less than the one-shot boundary, the code uses the one-shot boundary. |
 
-Without `AITER_FLY_AR_ONESHOT_MAX_BYTES`, the two one-shot values come from
-different columns of `FAMILY_POLICY`:
+Without `AITER_FLY_AR_ONESHOT_MAX_BYTES`, the two values come from different
+fields of the policy row:
 
-* `oneshot_max_exact` is the one-shot ceiling in `CustomAllreduce`. Above it,
+* `oneshot_max` is the one-shot ceiling in `CustomAllreduce`. Above it,
   `cross_device_reduce` or RCCL is faster.
-* `oneshot_max` is the mesh floor in `QuickAllReduce`. Above it, the mesh is
+* `quant_min` is the mesh floor in `QuickAllReduce`. Above it, the mesh is
   faster than the fastest exact kernel.
 
 ### Related aiter variables

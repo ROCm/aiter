@@ -44,7 +44,6 @@ from .allreduce_shared import (
     QUAD_LANES,
     QUADS_PER_WAVE,
     SUPPORTED_WORLDS,
-    TwoShotRung,
     _acquire_inbox,
     _buffer_load,
     _buffer_ptr,
@@ -83,7 +82,7 @@ from .quick_allreduce_codec import (
 # ``_grid_x`` derives blocks from ``num_tiles / ST``.
 #
 # The optimum is payload-dependent, so it is not a single value -- see
-# ``RING_ST_LADDER`` below, which is what the host actually selects from. These
+# ``RING_ST_LADDER`` in ``allreduce_policy``, which is what the host selects from. These
 # are the values a caller may pin with ``super_tile=``.
 #
 # The buffer size is
@@ -92,32 +91,6 @@ from .quick_allreduce_codec import (
 # an INT6 reduce-scatter lap, against 28/35 MB at cap 128.
 # Pin ``grid_cap`` alongside ``super_tile``.
 RING_SUPER_TILES = (1, 8, 16, 32)
-
-# Per-``(link, world_size)`` tuning ladder of ``TwoShotRung``.
-RING_ST_LADDER: dict[tuple[str, int], tuple[TwoShotRung, ...]] = {
-    ("xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 << 20, super_tile=16, grid_cap=128, block=BLOCK),
-    ),
-    ("xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 << 20, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 << 20, super_tile=32, grid_cap=128, block=BLOCK),
-    ),
-    ("xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 << 20, super_tile=32, grid_cap=128, block=BLOCK),
-    ),
-    ("pcie", 2): (TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=512),),
-    ("pcie", 4): (TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),),
-    ("pcie", 8): (TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),),
-}
-
-
-def ring_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ...]:
-    """Rungs for *(link, world_size)*, or the PCIe TP4 shape for an unlisted one."""
-    return RING_ST_LADDER.get((str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)])
-
 
 # Wire formats accepted per lap.
 #

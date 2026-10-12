@@ -41,7 +41,6 @@ from .allreduce_shared import (
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
-    TwoShotRung,
     _acquire_inbox,
     _buffer_load,
     _buffer_ptr,
@@ -77,7 +76,6 @@ from .quick_allreduce_codec import (
 __all__ = [
     "DEFAULT_GRID_CAP",
     "MESH_CODECS",
-    "MESH_ST_LADDER",
     "SUPER_TILES",
     "SUPPORTED_BLOCKS",
     "SUPPORTED_WORLDS",
@@ -85,7 +83,6 @@ __all__ = [
     "WORLD",
     "clamp_grid_cap",
     "make_quick_allreduce_int4_kernel",
-    "mesh_st_ladder",
 ]
 
 PHASES = 2
@@ -143,43 +140,6 @@ def clamp_grid_cap(
     if block > BLOCK:
         resident = max(1, (resident * BLOCK) // int(block))
     return min(int(requested), resident * int(cu_count))
-
-
-# Per-``(link, world_size)`` tuning ladder of ``TwoShotRung``.
-#
-#   xGMI  ST=1 everywhere, except TP4 below 4 MiB and TP8 from 6 MiB (ST=8).
-#         Block 512 from 4 MiB.
-#   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
-#         TP8 ST=8 everywhere.
-MESH_ST_LADDER: dict[tuple[str, int], tuple[TwoShotRung, ...]] = {
-    ("xgmi", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
-    ),
-    ("xgmi", 4): (
-        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
-    ),
-    ("xgmi", 8): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
-        TwoShotRung(min_bytes=6 << 20, super_tile=8, grid_cap=128, block=512),
-    ),
-    ("pcie", 2): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=8, grid_cap=128, block=512),
-    ),
-    ("pcie", 4): (
-        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=768 << 10, super_tile=8, grid_cap=128, block=512),
-    ),
-    ("pcie", 8): (TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),),
-}
-
-
-def mesh_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ...]:
-    """Rungs for *(link, world_size)*, or ``()`` when there is no ladder."""
-    return MESH_ST_LADDER.get((str(link), int(world_size)), ())
 
 
 # Wire formats the mesh can build.
