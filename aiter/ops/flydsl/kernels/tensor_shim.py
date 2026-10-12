@@ -13,6 +13,7 @@ import numpy as np
 import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
+from flydsl.compiler.jit_argument import PointerJitArg
 from flydsl.compiler.protocol import extract_to_ir_values
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr.typing import T
@@ -274,10 +275,18 @@ def ptr_arg(t: torch.Tensor, dtype=None):
 
 
 def _compile_and_run(exe, *args):
-    """``flyc.compile(exe, *args)``: compiles **and** executes the kernel, and
-    returns its ``CompiledFunction`` (None under compile-only)."""
+    """Compile and execute once, returning the callable (None under compile-only)."""
     try:
-        return flyc.compile(exe, *args)
+        cf = flyc.compile(exe, *args)
+        # FlyDSL 0.4 treats null pointers as compile placeholders and skips its
+        # initial launch. AITER also uses them for disabled optional inputs
+        # (e.g. PA decode's KV scales/sinks), so explicitly launch that case.
+        # COMPILE_ONLY still returns None and must never dispatch a kernel.
+        if cf is not None and any(
+            isinstance(arg, PointerJitArg) and arg.pointer.value is None for arg in args
+        ):
+            cf(*args)
+        return cf
     except Exception:
         # flyc.compile leaks ir.Context on failure; pop it so a retry takes the right path.
         try:
@@ -289,7 +298,7 @@ def _compile_and_run(exe, *args):
 
 
 def _run_compiled(exe, *args, specialization_key=None):
-    """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
+    """First call: compile and execute the kernel once, including with null inputs.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
 
     A specialization key gives a multi-constexpr JitFunction one compiled
