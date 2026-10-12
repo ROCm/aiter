@@ -41,6 +41,7 @@ from flydsl.expr import (
 
 from aiter.ops.flydsl.kernels.kernels_common import get_warp_size, kernel_signature
 from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
+from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_base_i64,
@@ -154,12 +155,39 @@ def _dense_indexer_strides(page_size: int) -> tuple[int, int, int]:
     return (page_size * _KV_HEADS * _D, _KV_HEADS * _D, _D)
 
 
-def _span_bytes(t: torch.Tensor) -> int:
-    """Bytes from ``t``'s first element to one past its last, for any strides."""
-    if t.numel() == 0:
-        return 0
-    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
-    return (last + 1) * t.element_size()
+def _k_page_row(
+    k_base,
+    phys,
+    page_off,
+    page_elems64,
+    token_elems64,
+    head_elems64,
+    zero,
+    row_ptr_ty,
+    vec_layout,
+):
+    """Wide indexer row: page, token, and head 0, then a unit-stride D view."""
+    addr = k_base + (
+        Int64(phys) * page_elems64
+        + Int64(page_off) * token_elems64
+        + Int64(zero) * head_elems64
+    ) * Int64(2)
+    flat = fx.Tensor(
+        fx.make_view(
+            fx.inttoptr(row_ptr_ty, addr),
+            fx.make_layout((_D,), (1,)),
+        )
+    )
+    return fx.logical_divide(flat, vec_layout)
+
+
+def _qk_mfma(qk_mma, qk_a, qk_b, qk_c, a_vec, b_vec, c_vec):
+    """One K1 QK atom. Fragments are the caller's, reused across K steps."""
+    fx.memref_store_vec(a_vec, qk_a)
+    fx.memref_store_vec(b_vec, qk_b)
+    fx.memref_store_vec(c_vec, qk_c)
+    fx.gemm(qk_mma, qk_c, qk_a, qk_b, qk_c)
+    return fx.memref_load_vec(qk_c)
 
 
 def build_qsa_k1_scores_module(
@@ -268,20 +296,6 @@ def build_qsa_k1_scores_module(
             token_elems64 = Int64(k_strides[1])
             head_elems64 = Int64(k_strides[2])
 
-            def k_page_row(phys, page_off):
-                addr = k_base + (
-                    Int64(phys) * page_elems64
-                    + Int64(page_off) * token_elems64
-                    + Int64(zero) * head_elems64
-                ) * Int64(2)
-                flat = fx.Tensor(
-                    fx.make_view(
-                        fx.inttoptr(row_ptr_ty, addr),
-                        fx.make_layout((_D,), (1,)),
-                    )
-                )
-                return fx.logical_divide(flat, vec_layout)
-
         else:
             k_buf = fx.rocdl.make_buffer_tensor(k_cache)
 
@@ -299,13 +313,6 @@ def build_qsa_k1_scores_module(
         qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_b = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_c = fx.make_rmem_tensor(fx.make_layout(4, 1), Float32)
-
-        def qk_mfma(a_vec, b_vec, c_vec):
-            fx.memref_store_vec(a_vec, qk_a)
-            fx.memref_store_vec(b_vec, qk_b)
-            fx.memref_store_vec(c_vec, qk_c)
-            fx.gemm(qk_mma, qk_c, qk_a, qk_b, qk_c)
-            return fx.memref_load_vec(qk_c)
 
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
@@ -352,7 +359,17 @@ def build_qsa_k1_scores_module(
             safe_phys = phys_live.select(phys, zero)
             col_live = col_live & phys_live
             if const_expr(wide_cache):
-                k_row = k_page_row(safe_phys, off)
+                k_row = _k_page_row(
+                    k_base,
+                    safe_phys,
+                    off,
+                    page_elems64,
+                    token_elems64,
+                    head_elems64,
+                    zero,
+                    row_ptr_ty,
+                    vec_layout,
+                )
             else:
                 k_row = fx.logical_divide(
                     fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
@@ -387,7 +404,9 @@ def build_qsa_k1_scores_module(
                         [k_lds[n_row, md0 + Int32(i)] for i in range_constexpr(qk_vec)],
                         BFloat16,
                     )
-                    acc4 = fx.Vector(qk_mfma(a_vec, b_vec, acc4))
+                    acc4 = fx.Vector(
+                        _qk_mfma(qk_mma, qk_a, qk_b, qk_c, a_vec, b_vec, acc4)
+                    )
                 for i in range_constexpr(4):
                     c_lds[ng, wave, lane, i] = acc4[i]
             gpu.barrier()
@@ -555,20 +574,6 @@ def build_qsa_k1_prefill_scores_module(
             token_elems64 = Int64(k_strides[1])
             head_elems64 = Int64(k_strides[2])
 
-            def k_page_row(phys, page_off):
-                addr = k_base + (
-                    Int64(phys) * page_elems64
-                    + Int64(page_off) * token_elems64
-                    + Int64(zero) * head_elems64
-                ) * Int64(2)
-                flat = fx.Tensor(
-                    fx.make_view(
-                        fx.inttoptr(row_ptr_ty, addr),
-                        fx.make_layout((_D,), (1,)),
-                    )
-                )
-                return fx.logical_divide(flat, vec_layout)
-
         else:
             k_buf = fx.rocdl.make_buffer_tensor(k_cache)
 
@@ -594,13 +599,6 @@ def build_qsa_k1_prefill_scores_module(
         qk_a = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_b = fx.make_rmem_tensor(fx.make_layout(qk_vec, 1), BFloat16)
         qk_c = fx.make_rmem_tensor(fx.make_layout(4, 1), Float32)
-
-        def qk_mfma(a_vec, b_vec, c_vec):
-            fx.memref_store_vec(a_vec, qk_a)
-            fx.memref_store_vec(b_vec, qk_b)
-            fx.memref_store_vec(c_vec, qk_c)
-            fx.gemm(qk_mma, qk_c, qk_a, qk_b, qk_c)
-            return fx.memref_load_vec(qk_c)
 
         if tid < Int32(block_m):
             row = row_tile * Int32(block_m) + tid
@@ -662,7 +660,17 @@ def build_qsa_k1_prefill_scores_module(
                 safe_phys = phys_live.select(phys, zero)
                 col_live = col_live & phys_live
                 if const_expr(wide_cache):
-                    k_row = k_page_row(safe_phys, off)
+                    k_row = _k_page_row(
+                        k_base,
+                        safe_phys,
+                        off,
+                        page_elems64,
+                        token_elems64,
+                        head_elems64,
+                        zero,
+                        row_ptr_ty,
+                        vec_layout,
+                    )
                 else:
                     k_row = fx.logical_divide(
                         fx.slice(k_buf, (safe_phys, off, zero, None)), vec_layout
@@ -701,7 +709,9 @@ def build_qsa_k1_prefill_scores_module(
                             ],
                             BFloat16,
                         )
-                        acc4 = fx.Vector(qk_mfma(a_vec, b_vec, acc4))
+                        acc4 = fx.Vector(
+                            _qk_mfma(qk_mma, qk_a, qk_b, qk_c, a_vec, b_vec, acc4)
+                        )
                     for i in range_constexpr(4):
                         c_lds[head, ng, wave, lane, i] = acc4[i]
             gpu.barrier()
@@ -962,7 +972,7 @@ def qsa_k1_score_and_select(
     score_tiles = (n_columns + score_block_n - 1) // score_block_n
     # numel() is the packed page. A vLLM layer view pads the page stride,
     # so the bytes the descriptor has to cover are the span.
-    wide_cache = _span_bytes(k_cache) > (1 << 32)
+    wide_cache = span_bytes(k_cache) > (1 << 32)
     k_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     if _k1_uses_prefill_scorer(int(context_lens.shape[0]), m, n_heads, arch):
         _run_compiled(
