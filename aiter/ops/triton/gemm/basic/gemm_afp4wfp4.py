@@ -159,11 +159,12 @@ def gemm_afp4wfp4_(
         "gluon",
     ), f"Unknown backend '{backend}', must be 'triton' or 'gluon'"
 
-    # gfx1151 can lower this Triton dot_scaled kernel without native FP4
-    # instructions. Keep the exception local: other FP4 entry points need
-    # their own configs and validation before they can run on this target.
+    # gfx1150 and gfx1151 (RDNA3.5) can lower this Triton dot_scaled kernel
+    # without native FP4 instructions. Keep the exception local: other FP4
+    # entry points need their own configs and validation before they can run
+    # on these targets.
     assert arch_info.is_fp4_avail() or (
-        backend == "triton" and arch_info.get_arch() == "gfx1151"
+        backend == "triton" and arch_info.get_arch() in ("gfx1150", "gfx1151")
     ), "MXFP4 is not available on your device"
 
     if backend == "gluon":
