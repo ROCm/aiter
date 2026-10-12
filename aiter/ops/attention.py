@@ -831,6 +831,37 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
+@compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps1_fp8_asm_fwd(
+    # [num_partials, num_heads, 512] fp32
+    split_data: torch.Tensor,
+    # [num_partials, num_heads] fp32
+    split_lse: torch.Tensor,
+    # [total_q, num_heads, 512] bf16
+    final_output: torch.Tensor,
+    # [total_q, num_heads] fp32; None skips the un-split rows' LSE
+    final_lse: torch.Tensor | None,
+    # [total_q, num_heads, 576] fp8
+    q: torch.Tensor,
+    # [num_pages, 1, 1, 576] fp8
+    kv_buffer: torch.Tensor,
+    kv_page_indices: torch.Tensor,
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
+    softmax_scale: float,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    # round-robin CP only (cp_world_size > 1 and causal)
+    qo_indptr: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    g_kv_indptr: torch.Tensor | None = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
+) -> None: ...
+
+
 MD_NAME_V4 = "module_mla_v4_asm"
 
 
@@ -881,6 +912,41 @@ def mla_decode_v4_asm(
     # nullptr; the host guards the deref (asm_mla_v4.cu) and the kernel never loads
     # through it. Placed at the tail because it carries no data on this path.
     kv_last_page_lens: torch.Tensor | None = None,
+) -> None: ...
+
+
+@compile_ops(MD_NAME_V4, ffi_type="ctypes")
+def mla_decode_v4_ps_asm(
+    # [N, 128, 512] FP8 packed Q + e8m0 scale region
+    Q: torch.Tensor,
+    # [N, 128, 64] BF16
+    qrope: torch.Tensor,
+    # [rows, ..., 512] FP8 packed KV pool (row-dense, page_size 1)
+    KV: torch.Tensor,
+    # [rows, ..., 64] BF16
+    kvrope: torch.Tensor,
+    # [>= N+1] int32
+    kv_indptr: torch.Tensor,
+    # [*] int32
+    kv_page_indices: torch.Tensor,
+    # [128] FP32 attention sink logit
+    sink: torch.Tensor,
+    # workspace (aiter.mla.get_mla_v4_nm_ps_workspace); P = desc.size(0)
+    # [2P, 128, 512] FP32
+    o_acc: torch.Tensor,
+    # [2P, 128] FP32
+    lse_acc: torch.Tensor,
+    # [P, 8] int32
+    desc: torch.Tensor,
+    # int32 counters, zero at rest
+    cnt: torch.Tensor,
+    # int32 arange
+    arange: torch.Tensor,
+    # outputs
+    # [N, 128, 512] BF16
+    output: torch.Tensor,
+    # [N, 128] FP32 natural-log LSE (sink included); None = not written
+    lse: torch.Tensor | None = None,
 ) -> None: ...
 
 
@@ -1270,6 +1336,13 @@ def get_mla_metadata_info_v1(
             and num_head_qo == 12
             and packed_qo_len <= 128
             and fast_mode
+        )
+        or (
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
         )
     ):
         if num_head_qo * 2 > 128:

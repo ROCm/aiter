@@ -128,6 +128,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
         out_logits.stride(0),
         max_model_len,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -179,6 +180,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         out_qk.stride(1),
         max_model_len,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -253,6 +255,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         waves_per_eu=WavePerEU,
         **config,
         KVBlockSize=block_size,
+        enable_fp_fusion=True,
     )
 
 
@@ -337,6 +340,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "waves_per_eu": effective_wave_per_eu,
         "num_stages": 2,
         "num_ctas": 1,
+        "enable_fp_fusion": True,
         "cluster_dims": [1, 1, 1],
         "arch": gfx_version,
         "backend_name": "hip",
@@ -458,6 +462,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         align_power_of_2_batch,
         TryCount,
         waves_per_eu=schedule_waves_per_eu,
+        enable_fp_fusion=True,
     )
     return safe_chunks_per_cta
 

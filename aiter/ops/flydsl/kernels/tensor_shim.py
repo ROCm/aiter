@@ -157,21 +157,14 @@ def buf_scalar_load(t, index, cache_modifier=0):
 
     The layout API has no scalar spelling: ``t[i]`` and every ``BufferCopy*``
     atom lower to ``rocdl.raw.ptr.buffer.load`` (VGPR), and ROCDL exposes no
-    ``s.buffer.load`` op to wrap. Hence the raw intrinsic, whose resource
-    operand is a v4i32 rather than the opaque buffer descriptor pointer.
+    ``s.buffer.load`` op to wrap. Reuse the scalar buffer path, which emits the
+    intrinsic with its required v4i32 resource operand.
     """
-    rsrc = _to_raw(fx.rocdl.get_buffer_rsrc(fx.get_iter(t)))
-    rsrc_v4 = llvm.bitcast(
-        ir.VectorType.get([4], T.i32),
-        llvm.ptrtoint(ir.IntegerType.get_signless(128), rsrc),
-    )
-    return llvm.call_intrinsic(
-        T.i32,
-        "llvm.amdgcn.s.buffer.load.i32",
-        # The intrinsic offset is in bytes; `index` counts dwords.
-        [rsrc_v4, _to_raw(fx.Int32(index) * 4), _to_raw(fx.Int32(cache_modifier))],
-        [],
-        [],
+    from aiter.ops.flydsl.kernels import buffer_ops
+
+    rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(t))
+    return buffer_ops.buffer_load(
+        rsrc, index, vec_width=1, is_scalar=True, cache_modifier=cache_modifier
     )
 
 
@@ -295,15 +288,28 @@ def _compile_and_run(exe, *args):
         raise
 
 
-def _run_compiled(exe, *args):
+def _run_compiled(exe, *args, specialization_key=None):
     """First call: ``flyc.compile(exe, *args)`` compiles **and** executes the kernel.
     Subsequent calls: fast dispatch via the cached ``CompiledFunction``.
+
+    A specialization key gives a multi-constexpr JitFunction one compiled
+    callable per configuration. Factory-style launchers should leave it unset.
     """
-    cf = getattr(exe, "_cf", None)
+    if specialization_key is None:
+        cf = getattr(exe, "_cf", None)
+    else:
+        cache = getattr(exe, "_cf_by_specialization", None)
+        cf = cache.get(specialization_key) if cache is not None else None
     if cf is not None:
         cf(*args)
         return
-    exe._cf = _compile_and_run(exe, *args)
+    cf = _compile_and_run(exe, *args)
+    if specialization_key is None:
+        exe._cf = cf
+    else:
+        if not hasattr(exe, "_cf_by_specialization"):
+            exe._cf_by_specialization = {}
+        exe._cf_by_specialization[specialization_key] = cf
 
 
 def _preload_compiled(exe, *args):
