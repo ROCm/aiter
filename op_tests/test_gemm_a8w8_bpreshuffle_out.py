@@ -5,8 +5,7 @@
 bit-identical on every backend), declares only ``out`` as mutated, and rejects a
 buffer the kernels cannot write densely before any launch.
 
-Run directly to benchmark it against gemm_a8w8_bpreshuffle on Kimi-K3
-shared-expert down-projection shapes."""
+Run directly to benchmark it against gemm_a8w8_bpreshuffle."""
 
 import argparse
 import itertools
@@ -18,16 +17,19 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops import gemm_op_a8w8
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="requires a CUDA/HIP device"
-)
-
 SUPPORTED_GFX = ["gfx942", "gfx950"]
+
+# get_gfx is get_gfx_runtime: gemm_op_a8w8 dispatches and looks up tuned rows
+# with it, so the gates below and the selected backends always agree.
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX,
+    reason=f"requires a CUDA/HIP device of {SUPPORTED_GFX}",
+)
 
 
 def _quantized(m, n, k, w_k=None):
@@ -105,6 +107,8 @@ def test_out_matches_allocating_op_per_backend(backend, m, n, k):
     ids=["untuned", "padded-k"],
 )
 def test_out_matches_allocating_op_untuned(m, n, k, w_k):
+    # Checks that both ops pick the same default kernel; the padded-K numerics
+    # of that kernel are gemm_a8w8_bpreshuffle's own contract.
     for kk in {k, w_k or k}:
         assert _backend(m, n, kk) is None, (
             f"M={m} N={n} K={kk} is now tuned; pick an untuned shape so the "
@@ -119,7 +123,7 @@ def test_out_matches_allocating_op_untuned(m, n, k, w_k):
 
 
 def test_out_into_a_dense_view_of_a_larger_buffer():
-    # The SGLang Kimi-K3 shared-down output is buf[offset:].view(M, N).
+    # A caller may pass a dense view into a larger buffer: buf[offset:].view(M, N).
     m, n, k, offset = 37, 1280, 512, 37 * 512
     xq, wq, x_scale, w_scale = _inputs(m, n, k)
     ref = aiter.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, None, dtypes.bf16)
@@ -244,7 +248,6 @@ def test_int8_activation_rejected_before_launch():
     [
         pytest.param(lambda s: s.to(dtypes.bf16), id="bf16"),
         pytest.param(lambda s: s[:-1], id="short"),
-        pytest.param(lambda s: s.repeat(1, 2)[:, :1], id="strided"),
     ],
 )
 def test_bad_scale_rejected_before_launch(arg, bad):
@@ -253,53 +256,75 @@ def test_bad_scale_rejected_before_launch(arg, bad):
     args[arg] = bad(args[arg])
     out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
 
-    with pytest.raises(ValueError, match=f"{arg} must be a contiguous fp32"):
+    with pytest.raises(ValueError, match=f"{arg} must be an fp32"):
         aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
     assert torch.all(out == 3.0)
+
+
+def _row_strided(t):
+    return torch.cat([t, t], 1)[:, : t.shape[1]]
+
+
+def _strided_row(t):
+    return _row_strided(t).t()
 
 
 @pytest.mark.parametrize(
     "arg,make",
     [
         pytest.param("XQ", lambda t: t.t().contiguous().t(), id="column-major-XQ"),
-        pytest.param(
-            "XQ", lambda t: torch.cat([t, t], 1)[:, : t.shape[1]], id="row-strided-XQ"
-        ),
-        pytest.param(
-            "WQ", lambda t: torch.cat([t, t], 1)[:, : t.shape[1]], id="row-strided-WQ"
-        ),
+        pytest.param("XQ", _row_strided, id="row-strided-XQ"),
+        pytest.param("WQ", _row_strided, id="row-strided-WQ"),
+        pytest.param("x_scale", _row_strided, id="strided-x_scale"),
+        pytest.param("w_scale", _row_strided, id="strided-w_scale"),
+        pytest.param("x_scale", _strided_row, id="strided-1xM-x_scale"),
     ],
 )
-def test_non_contiguous_operand_rejected_before_launch(arg, make):
-    # On the untuned CK path a column-major XQ or a row-strided WQ is misread.
+def test_strided_operand_matches_dense(arg, make):
+    # The untuned CK path reads only row strides and would misread these as-is.
     m, n, k = 37, 1280, 512
     args = dict(zip(("XQ", "WQ", "x_scale", "w_scale"), _inputs(m, n, k)))
+    ref = aiter.gemm_a8w8_bpreshuffle(*args.values(), None, dtypes.bf16)
     args[arg] = make(args[arg])
-    out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+    assert not args[arg].is_contiguous()
+    out = torch.full((m, n), float("nan"), dtype=dtypes.bf16, device="cuda")
 
-    with pytest.raises(ValueError, match="XQ and WQ must be contiguous"):
-        aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
-    assert torch.all(out == 3.0)
+    aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.equal(out, ref)
 
 
 @pytest.mark.skipif(
     torch.cuda.device_count() < 2, reason="requires two CUDA/HIP devices"
 )
-def test_non_current_device_rejected_before_launch():
-    # The launchers would use cuda:0's stream on cuda:1 tensors and fault.
+def test_operands_on_non_current_device():
+    # Without a guard the launchers use cuda:0's stream on cuda:1 tensors. An
+    # untuned CK shape: FlyDSL caches compiled kernels per process, not device.
     m, n, k = 37, 1280, 512
     with torch.cuda.device(1):
         args = _inputs(m, n, k)
         ref = aiter.gemm_a8w8_bpreshuffle(*args, None, dtypes.bf16)
-        out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+    out = torch.full((m, n), float("nan"), dtype=dtypes.bf16, device="cuda:1")
 
-    with torch.cuda.device(0), pytest.raises(ValueError, match="is cuda:0"):
+    with torch.cuda.device(0):
         aiter.gemm_a8w8_bpreshuffle_out(out, *args)
-    assert torch.all(out == 3.0)
+        assert torch.cuda.current_device() == 0
+    torch.cuda.synchronize(1)
+    assert torch.equal(out, ref)
 
-    with torch.cuda.device(1):
-        aiter.gemm_a8w8_bpreshuffle_out(out, *args)
-        assert torch.equal(out, ref)
+
+@pytest.mark.parametrize("m,n,k", [(0, 4096, 4096), (0, 1280, 512), (16, 0, 512)])
+def test_empty_output_is_a_no_op(m, n, k):
+    # M=0 matches tuned rows, but no launcher accepts an empty grid. On gfx950
+    # the first shape selects FlyDSL, whose failed launch is deferred.
+    if (m, n, k) == (0, 4096, 4096) and get_gfx() == "gfx950":
+        assert _backend(m, n, k) == "flydsl", "pick an M=0 shape that selects FlyDSL"
+    xq, wq, x_scale, w_scale = _inputs(max(m, 16), max(n, 16), k)
+    xq, x_scale, wq, w_scale = xq[:m], x_scale[:m], wq[:n], w_scale[:n]
+    out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
+
+    aiter.gemm_a8w8_bpreshuffle_out(out, xq, wq, x_scale, w_scale)
+    # A failed FlyDSL launch only surfaces on the next op.
+    assert torch.ones(1, device="cuda").add_(1).item() == 2
 
 
 def run_torch(xq, wq, x_scale, w_scale):
@@ -357,7 +382,7 @@ def main():
         "-m",
         type=int,
         nargs="*",
-        default=[1, 4, 16, 64, 256, 1024, 4096],
+        default=[1, 16, 64, 256, 1024, 4096],
         help="M (tokens). e.g.: -m 1 4 16",
     )
     parser.add_argument(
@@ -365,9 +390,8 @@ def main():
         "--nk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[(7168, 2048)],
-        help="N,K pairs; the default is the Kimi-K3 shared-expert down projection."
-        " e.g.: -s 7168,2048",
+        default=[(4096, 4096), (7168, 2048), (2112, 7168), (8192, 1024)],
+        help="N,K pairs. e.g.: -s 4096,4096",
     )
     args = parser.parse_args()
 

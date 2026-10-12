@@ -829,15 +829,17 @@ def _gemm_a8w8_bpreshuffle_into(
 def gemm_a8w8_bpreshuffle_out(
     out: Tensor,  # [M, N] bf16, contiguous, caller-owned
     XQ: Tensor,  # [M, K] fp8
-    WQ: Tensor,  # [N, K_w] fp8 preshuffled, K_w >= K
+    WQ: Tensor,  # [N, K_w] fp8 preshuffled, K_w >= K (as gemm_a8w8_bpreshuffle)
     x_scale: Tensor,  # [M, 1] fp32
     w_scale: Tensor,  # [N, 1] fp32
 ) -> None:
     """gemm_a8w8_bpreshuffle written into a caller-owned buffer.
 
-    XQ and WQ must be contiguous 2-D fp8, x_scale and w_scale contiguous fp32
-    with M and N elements, all tensors must be on the current CUDA/HIP device,
-    and ``out`` must be a contiguous bf16 [M, N] tensor. Only bf16 is accepted:
+    XQ and WQ must be 2-D fp8, x_scale and w_scale fp32 with M and N elements,
+    all tensors must be on one CUDA/HIP device, and ``out`` must be a contiguous
+    bf16 [M, N] tensor that does not overlap any input. Strided XQ, WQ and
+    scales are made contiguous before dispatch. A K-padded WQ (K_w > K) gets
+    gemm_a8w8_bpreshuffle's padded-K handling unchanged. Only bf16 is accepted:
     the FlyDSL 8-wave kernels, which many tuned rows select, write bf16 only.
     CK and CKTile write a dense row-major [M, N], so a strided ``out`` (e.g. a
     column slice of a wider buffer) is rejected instead of being written past
@@ -862,12 +864,6 @@ def gemm_a8w8_bpreshuffle_out(
             f"out={out.device}, XQ={XQ.device}, WQ={WQ.device}, "
             f"x_scale={x_scale.device}, w_scale={w_scale.device}"
         )
-    # The launchers use the current device's stream without a device guard.
-    if XQ.device.index != torch.cuda.current_device():
-        raise ValueError(
-            f"operands are on {XQ.device} but the current device is "
-            f"cuda:{torch.cuda.current_device()}; call under torch.cuda.device"
-        )
     if out.shape != (m, n) or not out.is_contiguous():
         raise ValueError(
             f"out must be a contiguous tensor of shape {(m, n)}; got shape "
@@ -877,30 +873,37 @@ def gemm_a8w8_bpreshuffle_out(
         raise ValueError(
             f"XQ and WQ must be {dtypes.fp8}; got XQ {XQ.dtype}, WQ {WQ.dtype}"
         )
-    # CK and CKTile assume a unit column stride and misread a row-strided WQ.
-    if not XQ.is_contiguous() or not WQ.is_contiguous():
-        raise ValueError(
-            f"XQ and WQ must be contiguous; got XQ stride {tuple(XQ.stride())}, "
-            f"WQ stride {tuple(WQ.stride())}"
-        )
-    # Every backend reads the scales as dense fp32 through raw pointers.
+    # Every backend reads the scales as fp32 through raw pointers.
     for name, scale, size in (("x_scale", x_scale, m), ("w_scale", w_scale, n)):
-        if (
-            scale.dtype != dtypes.fp32
-            or scale.numel() != size
-            or not scale.is_contiguous()
-        ):
+        if scale.dtype != dtypes.fp32 or scale.numel() != size:
             raise ValueError(
-                f"{name} must be a contiguous fp32 tensor of {size} elements; got "
-                f"dtype {scale.dtype}, shape {tuple(scale.shape)}, "
-                f"stride {tuple(scale.stride())}"
+                f"{name} must be an fp32 tensor of {size} elements; got "
+                f"dtype {scale.dtype}, shape {tuple(scale.shape)}"
             )
     if WQ.shape[-1] < XQ.shape[-1]:
         raise ValueError(
             f"gemm_a8w8_bpreshuffle_out requires WQ K >= XQ K, got WQ K="
             f"{WQ.shape[-1]}, XQ K={XQ.shape[-1]}"
         )
-    _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
+    # Tuned rows exist for M=0, but no launcher accepts an empty grid.
+    if out.numel() == 0:
+        return
+    # CK and CKTile take only the row stride of XQ/WQ and raw scale pointers,
+    # so strided inputs are copied; dense ones pass through untouched.
+    if not XQ.is_contiguous():
+        XQ = XQ.contiguous()
+    if not WQ.is_contiguous():
+        WQ = WQ.contiguous()
+    if x_scale.shape != (m, 1) or not x_scale.is_contiguous():
+        x_scale = x_scale.reshape(m, 1).contiguous()
+    if w_scale.shape != (n, 1) or not w_scale.is_contiguous():
+        w_scale = w_scale.reshape(n, 1).contiguous()
+    # The launchers use the current device's stream.
+    if XQ.device.index == torch.cuda.current_device():
+        _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
+    else:
+        with torch.cuda.device(XQ.device):
+            _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
 
 
 # M at or above which the triton kernel beats the untuned CK fallback, which
