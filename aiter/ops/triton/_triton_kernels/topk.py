@@ -84,8 +84,11 @@ def _topk_kernel(
     # unrolled exactly K iterations -- no break/continue needed
     for j in core.static_range(0, K):
         vmax = tl.max(vals, axis=0)
-        # lowest index among the remaining candidates equal to the max
-        arg = tl.min(tl.where(valid & (vals == vmax), idxs, BLOCK), axis=0)
+        # lowest index among the remaining candidates equal to the max. Compare
+        # bit patterns, not values, so that -0.0 and +0.0 are told apart and the
+        # stored value always comes from the element at the stored index.
+        is_max = vals.to(tl.int32, bitcast=True) == vmax.to(tl.int32, bitcast=True)
+        arg = tl.min(tl.where(valid & is_max, idxs, BLOCK), axis=0)
 
         tl.store(out_v_ptr + j, vmax)
         tl.store(out_i_ptr + j, arg)
@@ -145,10 +148,12 @@ def topk_stage1_kernel(
         # lowest index among the remaining candidates equal to the extremum.
         # Only the last chunk can run out of candidates (CHUNK_SIZE >= k); it
         # then yields CHUNK_SIZE, i.e. a global index >= N, which stage 2
-        # ranks below every in-range index of equal value.
-        chunk_select_idx = tl.min(
-            tl.where(valid & (x_val == chunk_select_val), cols, CHUNK_SIZE), axis=0
+        # ranks below every in-range index of equal value. Bit patterns are
+        # compared so that -0.0 and +0.0 are told apart, as in _topk_kernel.
+        is_sel = x_val.to(tl.int32, bitcast=True) == chunk_select_val.to(
+            tl.int32, bitcast=True
         )
+        chunk_select_idx = tl.min(tl.where(valid & is_sel, cols, CHUNK_SIZE), axis=0)
 
         tl.store(y_ptr + k_idx, chunk_select_val)
         tl.store(index_ptr + k_idx, chunk_select_idx + chunk_offset)

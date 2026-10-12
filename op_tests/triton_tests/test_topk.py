@@ -141,5 +141,9 @@ def test_topk_inf_and_extrema(batch_size, hiddensize, topk, case, dtype):
     assert bool(((res_index >= 0) & (res_index < hiddensize)).all())
     sorted_index = res_index.sort(dim=1).values
     assert bool((sorted_index[:, 1:] != sorted_index[:, :-1]).all())
-    TEST_assert_equal(res_value.float(), torch.gather(x, 1, res_index).float().cpu())
+    gathered = torch.gather(x, 1, res_index).float().cpu()
+    TEST_assert_equal(res_value.float(), gathered)
+    # == treats -0.0 and +0.0 as equal, so also check that each value keeps the
+    # sign of the element its index points at
+    assert torch.equal(torch.signbit(res_value.float().cpu()), torch.signbit(gathered))
     TEST_assert_equal(res_value.float(), ref_value.cpu())
