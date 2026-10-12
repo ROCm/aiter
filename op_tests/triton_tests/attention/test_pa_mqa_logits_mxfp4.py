@@ -11,7 +11,13 @@ from aiter.ops.triton.attention.pa_mqa_logits_mxfp4 import (
     mfma_nonk_dim,
     paged_mxfp4_mqa_logits,
 )
+from aiter.ops.triton.utils._triton import arch_info
 from op_tests.triton_tests.utils.pa_mqa_logits_mxfp4_ref import preshuffle_cache
+
+pytestmark = pytest.mark.skipif(
+    arch_info.get_arch() != "gfx950",
+    reason="paged MXFP4 MQA logits is gfx950 only",
+)
 
 SCALE_GROUP = 32
 TOL = 1e-12

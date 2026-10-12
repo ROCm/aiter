@@ -1,0 +1,183 @@
+{
+  "_comment": "Autotune configs for SonicMoE grouped GEMM kernels on MI308X (gfx942), BF16.",
+  "_grouped_gemm_kernel": {
+    "_bounds": {
+      "small": [256, 256, 8],
+      "medium": [2048, 2048, 32]
+    },
+    "_specialized": {
+      "N=1536,K=2048,E=16,gather=1": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "N=1536,K=2048,E=16,gather=0": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "N=2048,K=768,E=16,gather=0": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "N=768,K=2048,E=16,gather=0": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "N=2048,K=1536,E=16,gather=0": {
+        "BLOCK_M": 128,
+        "BLOCK_N": 128,
+        "BLOCK_K": 64,
+        "GROUP_SIZE_M": 8,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    "small_NK": {
+      "BLOCK_M": 64,
+      "BLOCK_N": 64,
+      "BLOCK_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N<=256, K<=256, E<=8"
+    },
+    "medium_NK": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 8,
+      "num_stages": 2,
+      "_note": "N<=2048, K<=2048, E<=32"
+    },
+    "large_NK": {
+      "BLOCK_M": 128,
+      "BLOCK_N": 128,
+      "BLOCK_K": 64,
+      "GROUP_SIZE_M": 8,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N>=4096 or K>=4096, E>=64"
+    }
+  },
+  "_grouped_gemm_dw_kernel": {
+    "_bounds": {
+      "small": [128, 128, 4],
+      "medium": [2048, 2048, 32]
+    },
+    "_specialized": {
+      "N=1536,K=2048,E=16,gather=1": {
+        "BLOCK_K": 128,
+        "BLOCK_N": 128,
+        "BLOCK_T": 64,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "N=1536,K=2048,E=16,gather=0": {
+        "BLOCK_K": 128,
+        "BLOCK_N": 128,
+        "BLOCK_T": 64,
+        "num_warps": 4,
+        "num_stages": 2
+      },
+      "N=2048,K=768,E=16,gather=0": {
+        "BLOCK_K": 128,
+        "BLOCK_N": 128,
+        "BLOCK_T": 32,
+        "num_warps": 4,
+        "num_stages": 2
+      }
+    },
+    "small_NK": {
+      "BLOCK_K": 64,
+      "BLOCK_N": 64,
+      "BLOCK_T": 16,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N<=128, K<=128, E<=4"
+    },
+    "medium_NK": {
+      "BLOCK_K": 128,
+      "BLOCK_N": 128,
+      "BLOCK_T": 16,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N<=2048, K<=2048, E<=32"
+    },
+    "large_NK": {
+      "BLOCK_K": 128,
+      "BLOCK_N": 128,
+      "BLOCK_T": 16,
+      "num_warps": 4,
+      "num_stages": 2,
+      "_note": "N>=4096, E>=64"
+    }
+  },
+  "token_gather_sum_kernel": {
+    "_bounds": [256, 1024],
+    "small_H": {
+      "BLOCK_H": 256,
+      "BLOCK_K": 1,
+      "num_warps": 4,
+      "num_stages": 4,
+      "_note": "H<=256"
+    },
+    "medium_H": {
+      "BLOCK_H": 1024,
+      "BLOCK_K": 1,
+      "num_warps": 4,
+      "num_stages": 4,
+      "_note": "H<=1024"
+    },
+    "large_H": {
+      "BLOCK_H": 4096,
+      "BLOCK_K": 4,
+      "num_warps": 4,
+      "num_stages": 4,
+      "_note": "H>=4096"
+    }
+  },
+  "db2_and_ds_kernel": {
+    "BLOCK_H_MAX": 2048,
+    "BLOCK_TK": 32,
+    "BLOCK_OLD_DS_PARTIAL_N": 1,
+    "num_warps": 8,
+    "num_stages": 4
+  },
+  "db1_kernel": {
+    "BLOCK_I": 128,
+    "BLOCK_TK": 32,
+    "num_warps": 8,
+    "num_stages": 4
+  },
+  "activation_kernel": {
+    "BLOCK_M": 32,
+    "BLOCK_I_MAX": 1024,
+    "num_warps": 4,
+    "num_stages": 2
+  },
+  "topk_routing": {
+    "ENTRIES_PER_TILE": 1024,
+    "PREFIX_BLOCK_M": 128
+  },
+  "general_routing": {
+    "BLOCK_SIZE": 1024,
+    "PREFIX_BLOCK_M": 128,
+    "TOKEN_SEARCH_BLOCK": 1024
+  }
+}

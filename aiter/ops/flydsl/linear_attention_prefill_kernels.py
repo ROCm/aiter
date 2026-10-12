@@ -32,7 +32,7 @@ from flydsl.utils.env import runtime as flydsl_runtime_env
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.prefill_batch_metadata import PrefillBatchLayout, _tensor_version
 
-from ..triton._triton_kernels.gated_delta_rule.utils import (
+from ..triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
     prepare_chunk_offsets,

@@ -143,7 +143,17 @@ Real examples: ATOM#1423 "not always bf16"; ATOM#1458 "hard code to fp8_e8m0?"
 Trigger (only after self-check passes): a new `+` line introduces an arch string literal in a dispatch condition (`if arch == 'gfx1250':`, `if 'gfx950' in arch_name:`), rather than routing through the central kernel registry or a named constant.
 Also exempt: arch strings used only in comments, docstrings, or directory path strings; arch strings imported from a central registry module; arch strings used as **capability guards inside a kernel-specific wrapper function** (not in the centralized dispatch layer) — e.g., `get_gfx() == 'gfx1250'` inside `flydsl_flash_attn_batch_func` determines whether the FlyDSL variant is available; that check belongs in the wrapper, not in the central registry, and does not trigger C4 (aiter#3870).
 Real examples: `'gfx1250'` new to `fused_mxfp4_quant.py` dispatch logic where no prior arch literals existed (aiter#3937 → fire C4); `'gfx1201'` added to `unified_attention.py` where `'gfx1250'` was already on line 79 (aiter#3956 → skip, pre-existing style); `get_gfx() == "gfx1250"` inside FlyDSL wrapper `flydsl_flash_attn_batch_func` (aiter#3870 → skip, capability guard not centralized dispatch).
+C4 judges only the arch literal. Which helper a runtime wrapper calls is C5's question: a newly added runtime `get_gfx()` like the aiter#3870 guard fires C5, even though it skips C4.
 → `⚠️ C4: new arch string '[gfxNNNN]' hardcoded in dispatch — route through arch registry or named constant`
+
+**C5 — Shared chip_info helpers are the ISA gate** ⚠️
+Policy: `.github/instructions/aiter-ops-flydsl.instructions.md`. Do not invent a mixed-device, process-global, or first-`rocminfo`-agent finding against `get_gfx_runtime()` / `get_gfx()`.
+The context picks the helper. Runtime dispatch (wrappers, launchers, kernel or tuned-config selection) uses `get_gfx_runtime()`, which detects the live GPU. Tests and build-time codegen (`gen_instances`, AOT, module-level `csrc` selection) use `get_gfx()`, which follows `GPU_ARCHS` and returns its last entry when that lists several targets, so on a multi-target build it can name an ISA other than the one installed.
+**FP self-check first:** only `+` lines count. `get_gfx()` or `gcnArchName` on unchanged lines is pre-existing style, not a new violation.
+FIRE when a `+` line adds (a) a local ISA probe instead of the helpers (`gcnArchName`, `get_device_properties` read for architecture, a `rocminfo` parse), or (b) `get_gfx()` in a runtime dispatch path. One such line fires even when other added lines use the right helper.
+CLEAR only when every added architecture check uses the helper that fits its context.
+Real examples (synthetic): `torch.cuda.get_device_properties(0).gcnArchName` added to `aiter/ops/mha.py` → fire (a); `get_gfx() == "gfx950"` added to kernel selection in an `aiter/ops/flydsl/` launcher → fire (b); `get_gfx()` added to `main()` of `op_tests/test_flydsl_<op>.py` → clear; `get_gfx_runtime()` added to a wrapper plus a new `gcnArchName` read in another file of the same PR → fire (a).
+→ `⚠️ C5: new local ISA probe or runtime get_gfx() — use get_gfx_runtime() for dispatch, get_gfx() for tests and codegen`
 
 ---
 
