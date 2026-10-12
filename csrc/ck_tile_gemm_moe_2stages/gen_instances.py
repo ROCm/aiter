@@ -101,7 +101,7 @@ torch::Tensor
     int KBatch = k_batch.has_value() ? k_batch.value() : 1;
     int stride_A = K;
     int stride_B = K;
-    int stride_C = KBatch > 1 ? N : N / {3 - k.stage}; //gemm1 gate+up need / 2.
+    int stride_C = KBatch > 1 ? N : N / {2 if (k.stage == 1 and k.ActOP != "relu2") else 1}; //gemm1 gate+up need / 2; relu2 is gate-only (non-gated), needs full-width N.
     void *sorted_weights_ptr = topk_weight.has_value() ? topk_weight.value().data_ptr() : nullptr;
 
     {{INSTANCE_CONTENT}}
@@ -190,6 +190,7 @@ torch::Tensor
                 ck_tile::tuple<>,
                 row_major,
                 {"ck_tile::MoeFlatmmKind::kFFN_gemm1_split_k" if self.is_split_k else
+                "ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_only" if (k.stage == 1 and self.activation == act_dict["relu2"]) else
                 "ck_tile::MoeFlatmmKind::kFFN_gemm1_gate_up" if k.stage == 1 else
                 "ck_tile::MoeFlatmmKind::kFFN_gemm2"},
                 ck_tile::element_wise::PassThrough,
@@ -283,7 +284,9 @@ template torch::Tensor
                 "(acc_data_type)": dtype_dict[self.acc_dtype],
                 "(c_data_type)": dtype_dict[self.c_dtype],
                 "(activation)": self.activation,
-                "(has_bias)": "true" if self.activation == 2 else "false",
+                "(has_bias)": (
+                    "true" if self.activation == 2 and not self.is_split_k else "false"
+                ),
                 "(split_k)": "true" if self.is_split_k else "false",
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
@@ -619,7 +622,7 @@ if __name__ == "__main__":
     quant_type = "1x32"
 
     acc_type = "float"
-    act_types = ["silu", "swiglu"]
+    act_types = ["silu", "swiglu", "relu2"]
     c_dtypes = ["bf16"]
     is_split_k_l = [True, False]
 
@@ -650,10 +653,12 @@ if __name__ == "__main__":
     for a_type, c_dtype, act_type, is_split_k in itertools.product(
         a_types, c_dtypes, act_types, is_split_k_l
     ):
-        has_bias = act_type == "swiglu"
+        has_bias = act_type == "swiglu" and not is_split_k
 
         # a8w8 do not support
         if a_type in ["fp8", "bf8"] and is_split_k:
+            continue
+        if act_type == "relu2" and is_split_k:
             continue
         codegen = cktile_moe_2stage_gemm_codegen(
             args.working_path,

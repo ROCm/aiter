@@ -30,14 +30,27 @@ generation, so the tags here carry the generation instead:
     "fp8_dsv32_mla"   DeepSeek-V3.2 (also Kimi-K3), 656 B per token, token-major
                       records: 512 fp8 | 4 f32 per-128 scales | 64 bf16 rope.
                       Rope is appended, so this requires ROPE_SEPARATE.
+
+Tile walks, per segment (_segment):
+
+    _dsv4_segment     fp8_dsv4_mla: slot ids a tile ahead, 16 lanes x 32 B per row,
+                      softmax row reductions through LDS (_row_reduce_lds)
+    _async_segment    ASYNC_LDS: the tile copied straight into LDS (fp8 dots)
+    _staged_segment   the other formats: gathered into registers, dequantized,
+                      stored to LDS; fp8 tiles are gathered a tile ahead
+
+Output: the attention kernel without SPLIT_K, else _sparse_mla_reduce. Either store
+can apply the inverse RoPE + MXFP8 epilogue (_epilogue_store).
 """
 
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
+from triton.language.target_info import is_hip_cdna4
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 # Triton's default max ignores NaN, which on AMD costs a canonicalize per
@@ -57,6 +70,55 @@ def _max2(a, b):
 @gluon.jit
 def _rmax(x, axis):
     return gl.reduce(x, axis, _max2)
+
+
+@gluon.constexpr_function
+def _row_partials_layout(lin, n_warps):
+    """Layout that reads per-warp row partials back from LDS."""
+    reg = [[0, 1 << i] for i in range(n_warps.bit_length() - 1)]
+    reg += [[b[0], 0] for b in lin.reg_bases if b[0] != 0]
+    lane = [[b[0], 0] for b in lin.lane_bases]
+    warp = [[b[0], 0] for b in lin.warp_bases]
+    return gl.DistributedLinearLayout(
+        reg_bases=reg,
+        lane_bases=lane,
+        warp_bases=warp,
+        block_bases=[],
+        shape=[lin.shape[0], n_warps],
+    )
+
+
+@gluon.jit
+def _row_reduce_lds(cfg, x, red_smem, IS_MAX: gl.constexpr):
+    """Row max or sum across the key warps through red_smem: one barrier,
+    and gl.reduce's summation order."""
+    NW: gl.constexpr = cfg.N_WARPS
+    BM: gl.constexpr = cfg.BLOCK_M
+    BK: gl.constexpr = cfg.BLOCK_K
+    # The 16-key MFMA columns are dealt to the key warps in turn: key = (rep, warp, 16).
+    REP: gl.constexpr = BK // (16 * NW)
+    gl.static_assert(BK == 16 * NW * REP, "16-key MFMA columns per key warp")
+    lin: gl.constexpr = gl.to_linear_layout(cfg.qk_layout, [BM, BK])
+    if REP == 1:
+        x3 = gl.reshape(gl.convert_layout(x, lin), [BM, NW, BK // NW])
+        if IS_MAX:
+            part = _rmax(x3, 2)
+        else:
+            part = gl.sum(x3, axis=2)
+    else:
+        x4 = gl.reshape(gl.convert_layout(x, lin), [BM, REP, NW, 16])
+        if IS_MAX:
+            part = _rmax(_rmax(x4, 3), 1)
+        else:
+            part = gl.sum(gl.sum(x4, axis=3), axis=1)
+    red_smem.store(part)
+    LD: gl.constexpr = _row_partials_layout(lin, NW)
+    allp = red_smem.load(LD)
+    if IS_MAX:
+        r = _rmax(allp, 1)
+    else:
+        r = gl.sum(allp, axis=1)
+    return gl.convert_layout(r, gl.SliceLayout(1, cfg.qk_layout))
 
 
 @gluon.jit
@@ -113,6 +175,8 @@ def _scale_load(
     W_FULL: gl.constexpr,
     MASKED: gl.constexpr,
     OTHER: gl.constexpr,
+    CACHE: gl.constexpr = _CG,
+    RAW: gl.constexpr = False,
 ):
     """Gather the NG per-group scales of each token and broadcast to W_FULL
     columns. Indexing the full row with offs // GROUP would build a
@@ -121,7 +185,8 @@ def _scale_load(
     the broadcast lands on gather_l as a register rename (assert_trivial
     proves it).
     Element type follows ptr: u8 E8M0 bytes (OTHER=127 -> 2^0) or f32
-    (OTHER=0.0 -> masked lanes dequant to 0)."""
+    (OTHER=0.0 -> masked lanes dequant to 0). RAW returns the [BLOCK_K, NG]
+    scales unbroadcast."""
     cols = gl.arange(0, NG, layout=gl.SliceLayout(0, scl_l))
     rows = gl.convert_layout(row, gl.SliceLayout(1, scl_l))
     if MASKED:
@@ -132,27 +197,36 @@ def _scale_load(
                 offsets=rows.to(gl.int32)[:, None] + cols[None, :],
                 mask=m,
                 other=OTHER,
-                cache=".cg",
+                cache=CACHE,
             )
         else:
             sc = gl.load(
                 (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
                 mask=m,
                 other=OTHER,
-                cache_modifier=".cg",
+                cache_modifier=CACHE,
             )
     else:
         if USE_BUFFER_LOAD:
             sc = gl.amd.cdna4.buffer_load(
                 ptr=ptr,
                 offsets=rows.to(gl.int32)[:, None] + cols[None, :],
-                cache=".cg",
+                cache=CACHE,
             )
         else:
             sc = gl.load(
                 (ptr + rows.to(gl.int64))[:, None] + cols[None, :],
-                cache_modifier=".cg",
+                cache_modifier=CACHE,
             )
+    if not RAW:
+        sc = _widen_scales(sc, gather_l, NG, W_FULL)
+    return sc
+
+
+@gluon.jit
+def _widen_scales(sc, gather_l: gl.constexpr, NG: gl.constexpr, W_FULL: gl.constexpr):
+    """Broadcast [BLOCK_K, NG] group scales to [BLOCK_K, W_FULL] in gather_l
+    (a register rename)."""
     wide = gl.expand_dims(sc, 2).broadcast_to([sc.shape[0], NG, W_FULL // NG])
     return gl.convert_layout(
         wide.reshape([sc.shape[0], W_FULL]), gather_l, assert_trivial=True
@@ -194,7 +268,7 @@ def _split_ax(x, AXIS: gl.constexpr):
 
 
 @gluon.jit
-def _deq_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
+def _scaled_upcast_asm(x16, e_u8, W8: gl.constexpr, out_l: gl.constexpr):
     """[BLOCK_K, W8/2] int16 (4 packed fp8) + raw E8M0 byte -> [BLOCK_K, W8] bf16.
 
     The hardware reads only bits [30:23] of the scale operand, i.e. bits [14:7]
@@ -242,7 +316,10 @@ class Cfg:
     QK_DIM: gl.constexpr  # q row width: KV_DIM (+ ROPE_DIM if separate)
     MFMA_K: gl.constexpr
     NUM_WARPS: gl.constexpr
+    N_WARPS: gl.constexpr  # warps along the dots' N (keys for QK)
     GATHER_TW1: gl.constexpr
+    GSPT: gl.constexpr  # elements per lane per gathered row span
+    SCL_DWORD: gl.constexpr  # page pitch 4-aligned: exponents readable as dwords
     LDS_PAD: gl.constexpr
     # behavior knobs
     UNI_TILE: gl.constexpr
@@ -260,6 +337,8 @@ class Cfg:
     ASYNC_LDS: gl.constexpr
     RELAXED_LOAD: gl.constexpr  # read LDS with the syncedViaAsyncWait hint
     ROPE_VEC: gl.constexpr  # bytes per lane in the rope buffer's copy
+    SLOT_U32: gl.constexpr  # pitches < 16 MB; -1 sentinels are clamped before the split
+    UNPEEL: gl.constexpr  # the last tile runs in the loop body, not a peeled copy
     # operator layouts
     qk_layout: gl.constexpr
     pv_layout: gl.constexpr
@@ -278,6 +357,8 @@ class Cfg:
     slot_l: gl.constexpr
     blocked_q: gl.constexpr
     kv_shared: gl.constexpr
+    Q_LDS: gl.constexpr
+    q_shared: gl.constexpr
     rope_shared: gl.constexpr
 
     @gluon.constexpr_function
@@ -299,6 +380,12 @@ class Cfg:
         ASYNC_LDS=False,
         RELAXED_LOAD=True,
         PAD_INTERVAL=1024,
+        SLOT_U32=False,
+        KV_LDS_PAD=0,
+        UNPEEL=False,
+        DSV4_WALK=False,
+        SCL_DWORD=False,
+        STAGED_K32=False,
     ):
         self.BLOCK_M = gl.constexpr(BLOCK_M)
         self.BLOCK_K = gl.constexpr(BLOCK_K)
@@ -307,9 +394,12 @@ class Cfg:
         self.ROPE_SEPARATE = gl.constexpr(ROPE_SEPARATE)
         self.QK_DIM = gl.constexpr(KV_DIM + (ROPE_DIM if ROPE_SEPARATE else 0))
         self.NUM_WARPS = gl.constexpr(NUM_WARPS)
-        # Threads the row gather spends on the head dim
-        GATHER_TW1 = 32
+        # Lanes per gathered 512 B row: 32 x 16 B, or 16 x 32 B on the dsv4 walk.
+        GATHER_TW1 = 16 if DSV4_WALK else 32
         self.GATHER_TW1 = gl.constexpr(GATHER_TW1)
+        GSPT = 16 * (32 // GATHER_TW1)
+        self.GSPT = gl.constexpr(GSPT)
+        self.SCL_DWORD = gl.constexpr(SCL_DWORD)
         LDS_PAD = 16 if FP8_MFMA else 8
         self.LDS_PAD = gl.constexpr(LDS_PAD)
         self.UNI_TILE = gl.constexpr(UNI_TILE)
@@ -321,17 +411,23 @@ class Cfg:
         self.IDX_CACHE = gl.constexpr(IDX_CACHE)
         self.ASYNC_LDS = gl.constexpr(ASYNC_LDS)
         self.RELAXED_LOAD = gl.constexpr(RELAXED_LOAD)
+        self.SLOT_U32 = gl.constexpr(SLOT_U32)
+        self.UNPEEL = gl.constexpr(UNPEEL)
         ROPE_VEC = 16
         self.ROPE_VEC = gl.constexpr(ROPE_VEC)
-        MFMA_K = 32 if FP8_MFMA else 16
+        # bf16 dots on 16x16x32 (gfx950's full rate) on the dsv4 and STAGED_K32 walks.
+        MFMA_K = 32 if FP8_MFMA or DSV4_WALK or STAGED_K32 else 16
         self.MFMA_K = gl.constexpr(MFMA_K)
 
+        # Warps tile N; past 16 heads they also tile M, 16 heads per warp.
+        M_WARPS = max(1, min(BLOCK_M // 16, NUM_WARPS))
+        self.N_WARPS = gl.constexpr(NUM_WARPS // M_WARPS)
         self.qk_layout = gl.constexpr(
             gl.amd.AMDMFMALayout(
                 version=4,
                 instr_shape=[16, 16, MFMA_K],
                 transposed=True,
-                warps_per_cta=[1, NUM_WARPS],
+                warps_per_cta=[M_WARPS, NUM_WARPS // M_WARPS],
             )
         )
         self.pv_layout = gl.constexpr(
@@ -339,7 +435,7 @@ class Cfg:
                 version=4,
                 instr_shape=[16, 16, MFMA_K],
                 transposed=True,
-                warps_per_cta=[1, NUM_WARPS],
+                warps_per_cta=[M_WARPS, NUM_WARPS // M_WARPS],
             )
         )
         KW = MFMA_K // 2
@@ -348,10 +444,7 @@ class Cfg:
         self.p_layout = gl.constexpr(gl.DotOperandLayout(0, self.pv_layout, KW))
         self.v_layout = gl.constexpr(gl.DotOperandLayout(1, self.pv_layout, KW))
 
-        # 16 uint8 per thread = 128-bit gather loads. GATHER_TW1 lanes span a row,
-        # so one gather covers GATHER_TW1 * 16 = 512 B of it, at the cost of a
-        # longer slot vector.
-        GSPT = 16
+        # GSPT bytes per lane: one 128-bit load, two on the 16-lane gather.
         self.gather_l = gl.constexpr(
             gl.BlockedLayout(
                 size_per_thread=[1, GSPT],
@@ -370,8 +463,7 @@ class Cfg:
                 order=[1, 0],
             )
         )
-        # gather_l with 2-byte elements: same 16-byte per-lane run, half the
-        # columns (for the fused-dequant int16 view).
+        # gather_l over 2-byte elements (the int16 view _scaled_upcast_asm reads).
         self.gather16_l = gl.constexpr(
             gl.BlockedLayout(
                 size_per_thread=[1, GSPT // 2],
@@ -389,11 +481,38 @@ class Cfg:
                 order=[1, 0],
             )
         )
-        # Row pitch (KV_DIM + LDS_PAD) decides which banks the transposed K
-        # read (walks down a column) lands on.
-        self.kv_shared = gl.constexpr(
+        if DSV4_WALK:
+            # Pad 8 (16 B, keeps 128-bit accesses aligned) every 128 elements: spreads
+            # the 64 B-per-lane row stores and the 16x16x32 K / V reads over the banks.
+            self.kv_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[128, 8]], [BLOCK_K, KV_DIM], [1, 0]
+                )
+            )
+        elif STAGED_K32 and not FP8_MFMA:
+            # Stores of 32 B per lane, 32 lanes per row: pad 8 every 256 and 64 every
+            # 8,192 (16 rows) for conflict-free 16x16x32 V reads.
+            self.kv_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[256, 8], [8192, 64]], [BLOCK_K, KV_DIM], [1, 0]
+                )
+            )
+        else:
+            # Row pitch (KV_DIM + LDS_PAD) decides which banks the transposed K
+            # read (walks down a column) lands on. KV_LDS_PAD 16 removes those
+            # conflicts; it only pays when the loop is LDS-bound.
+            self.kv_shared = gl.constexpr(
+                gl.PaddedSharedLayout.with_identity_for(
+                    [[KV_DIM, KV_LDS_PAD or LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+                )
+            )
+        # 64-head programs with bf16 dots keep Q in LDS (one copy per program); a
+        # separate rope part stays in registers.
+        Q_LDS = BLOCK_M >= 64 and not FP8_MFMA
+        self.Q_LDS = gl.constexpr(Q_LDS)
+        self.q_shared = gl.constexpr(
             gl.PaddedSharedLayout.with_identity_for(
-                [[KV_DIM, LDS_PAD]], [BLOCK_K, KV_DIM], [1, 0]
+                [[128, 8]], [BLOCK_M, KV_DIM], [1, 0]
             )
         )
         # The rope buffer (K-only) exists when ROPE_SEPARATE, dead otherwise.
@@ -501,7 +620,7 @@ class Fmt:
         # groups, dim 2 the columns inside a group, so the [BLOCK_K, NG, GROUP]
         # -> 2-D reshape reproduces gather_l exactly. Legal only when a group's
         # columns fill whole threads.
-        GSPT = 16
+        GSPT = cfg.GSPT.value
         TW1 = cfg.GATHER_TW1.value
         NARROW_SCALE = TW1 % NG == 0 and GSPT * (TW1 // NG) == GROUP
         self.NARROW_SCALE = gl.constexpr(NARROW_SCALE)
@@ -562,10 +681,20 @@ class Seg:
     seg_start: gl.tensor
     cs0: gl.tensor
     num_rows: gl.tensor
+    target: gl.tensor  # HAS_INVALID: the slot invalid lanes gather
 
     @gluon.constexpr_function
     def __init__(
-        self, fmt, cache_ptr, alt_ptr, scl_ptr, indices_ptr, seg_start, cs0, num_rows
+        self,
+        fmt,
+        cache_ptr,
+        alt_ptr,
+        scl_ptr,
+        indices_ptr,
+        seg_start,
+        cs0,
+        num_rows,
+        target,
     ):
         self.fmt = fmt
         self.cache_ptr = cache_ptr
@@ -575,6 +704,7 @@ class Seg:
         self.seg_start = seg_start
         self.cs0 = cs0
         self.num_rows = num_rows
+        self.target = target
 
 
 @gluon.jit
@@ -583,13 +713,15 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
     (gfx950 has no bf16 multiply). sc: raw UE8M0 byte (dsv4), f32 scale
     (uniform/dsmla), or unused ("fp8_scalar": bare fp8 -> bf16 convert)."""
     if fmt.DEQ == "asm":
-        # x_u8 is the int16 view here (see _gather_full), so its column count is W8/2.
+        # x_u8 is the int16 view here, so it has W8 / 2 columns.
         W8: gl.constexpr = x_u8.shape[1] * 2
         # Adjacent fp8 columns share a scale (groups are even), so dropping
         # every other broadcast column is exact.
         s_even, _ = gl.split(sc.reshape(sc.shape[0], sc.shape[1] // 2, 2))
         s_even = gl.convert_layout(s_even, x_u8.type.layout)
-        val = _deq_asm(x_u8.to(gl.int16, bitcast=True), s_even, W8, cfg.gather_l)
+        val = _scaled_upcast_asm(
+            x_u8.to(gl.int16, bitcast=True), s_even, W8, cfg.gather_l
+        )
         if AXIS == 1:
             kv_smem.slice(off, W8, dim=1).store(val)
         else:
@@ -597,7 +729,7 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
     else:
         if fmt.DEQ == "upcast":
             # Upstream fused fp8 x E8M0 -> bf16 upcast; the driver only asks for
-            # it when cdna4.scaled_upcast exists, else DEQ="asm" (_deq_asm).
+            # it when cdna4.scaled_upcast exists, else DEQ="asm" (_scaled_upcast_asm).
             # sc is the raw E8M0 byte, already in x_u8's shape and layout.
             val = gl.amd.cdna4.scaled_upcast(
                 x_u8.to(gl.float8e4nv, bitcast=True), sc, gl.bfloat16
@@ -605,11 +737,11 @@ def _deq_store(x_u8, sc, kv_smem, off, cfg, fmt, AXIS: gl.constexpr):
         elif fmt.KIND == "fp8_scalar":
             val = _fp8_to_bf16(x_u8)
         else:
-            if fmt.KIND == "fp8_g64" or fmt.KIND == "fp8_dsv32_mla":
-                scale = sc
-            else:
-                scale = gl.exp2(sc.to(gl.float32) - 127.0)
-            val = (_fp8_to_f32(x_u8) * scale).to(gl.bfloat16)
+            gl.static_assert(
+                fmt.KIND == "fp8_g64" or fmt.KIND == "fp8_dsv32_mla",
+                "fp8_dsv4_mla dequantizes with DEQ upcast or asm",
+            )
+            val = (_fp8_to_f32(x_u8) * sc).to(gl.bfloat16)
         if AXIS == 1:
             kv_smem.slice(off, x_u8.shape[1], dim=1).store(val)
         else:
@@ -666,6 +798,26 @@ def _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt):
 
 
 @gluon.jit
+def _read_slots_at(cfg, base, off):
+    """Slot ids base[off], base = indices_ptr + the segment's start."""
+    if cfg.IDX_BUFFER_LOAD:
+        return gl.amd.cdna4.buffer_load(ptr=base, offsets=off, cache=cfg.IDX_CACHE)
+    return gl.load(base + off, cache_modifier=cfg.IDX_CACHE)
+
+
+@gluon.jit
+def _read_slots(cfg, seg, off):
+    return _read_slots_at(cfg, seg.indices_ptr + seg.seg_start, off)
+
+
+@gluon.jit
+def _split_slot(cfg, slot, BLOCK_SIZE: gl.constexpr):
+    if cfg.SLOT_U32:
+        slot = slot.to(gl.uint32)
+    return (slot // BLOCK_SIZE).to(gl.int32), (slot % BLOCK_SIZE).to(gl.int32)
+
+
+@gluon.jit
 def _slots(
     cfg,
     seg,
@@ -678,7 +830,7 @@ def _slots(
     """Index-list read -> (block, pos, valid), in whatever layout k_pos carries.
     A masked gl.load predicates on exec while a masked buffer_load folds the
     mask into the offset, so the unmasked paths clamp the read in-range and
-    mask the score instead (UNI_TILE); -1 sentinels are handled the same way."""
+    mask the score instead (UNI_TILE); -1 sentinels gather seg.target."""
     indices_ptr = seg.indices_ptr
     seg_start = seg.seg_start
     BLOCK_SIZE: gl.constexpr = seg.fmt.BLOCK_SIZE
@@ -706,39 +858,73 @@ def _slots(
     else:
         # hi >= 1 whenever UNI_TILE runs (guarded by n_full > 0).
         off = gl.minimum(k_pos, hi - 1) if UNI_TILE else k_pos
-        if IDX_BUFFER_LOAD:
-            slot = gl.amd.cdna4.buffer_load(
-                ptr=indices_ptr + seg_start, offsets=off, cache=cfg.IDX_CACHE
-            )
-        else:
-            slot = gl.load(indices_ptr + seg_start + off, cache_modifier=cfg.IDX_CACHE)
+        slot = _read_slots(cfg, seg, off)
         valid = (k_pos < hi) if UNI_TILE else (slot >= 0)
         if HAS_INVALID:
             if UNI_TILE:
                 valid = valid & (slot >= 0)
-            slot = gl.where(valid, slot, 0)  # -1 sentinels: clamp, mask score below
-    return (slot // BLOCK_SIZE).to(gl.int32), (slot % BLOCK_SIZE).to(gl.int32), valid
+            # Invalid lanes gather a key this range attends anyway, so no load
+            # needs a mask and the score mask drops them. Slot 0 is not safe:
+            # it can hold NaN (the null block), which 0 * NaN carries into V.
+            slot = gl.where(valid, slot, seg.target)
+    block, pos = _split_slot(cfg, slot, BLOCK_SIZE)
+    return block, pos, valid
+
+
+@gluon.jit
+def _first_valid_slot(cfg, seg, target, k, hi):
+    """While target < 0, read the slot ids from k on a tile at a time: the
+    largest id of the first tile holding a valid one, or -1."""
+    SEARCH_L: gl.constexpr = gl.BlockedLayout([1], [64], [cfg.NUM_WARPS], [0])
+    rng_s = gl.arange(0, cfg.BLOCK_K, layout=SEARCH_L)
+    while (target < 0) & (k < hi):
+        first = _read_slots(cfg, seg, gl.minimum(k + rng_s, hi - 1))
+        target = gl.max(first, axis=0)
+        k += cfg.BLOCK_K
+    return target
+
+
+@gluon.jit
+def _with_target(seg, target):
+    """seg with the slot its -1 sentinels gather."""
+    return Seg(
+        seg.fmt,
+        seg.cache_ptr,
+        seg.alt_ptr,
+        seg.scl_ptr,
+        seg.indices_ptr,
+        seg.seg_start,
+        seg.cs0,
+        seg.num_rows,
+        target,
+    )
 
 
 @gluon.jit
 def _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem):
     """QK scores for one tile; ROPE_SEPARATE chains a second MFMA over the rope
     buffer (MFMA accumulates natively, so KV_DIM + ROPE_DIM is two dots)."""
-    if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
-        # the async_wait already ordered the copy; stops the backend re-inserting
-        # a conservative vmcnt(0) before every LDS read
-        k = gl.amd.cdna4.async_copy.load_shared_relaxed(
-            kv_smem.permute([1, 0]), cfg.k_layout
-        )
+    S = gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout)
+    if cfg.Q_LDS:
+        # 128-dim chunks of Q and the matching K slice (one chunk below 128).
+        QC: gl.constexpr = min(128, cfg.KV_DIM)
+        gl.static_assert(cfg.KV_DIM % QC == 0, "Q_LDS chunks must tile KV_DIM")
+        for c in gl.static_range(cfg.KV_DIM // QC):
+            q_c = q_dot.slice(c * QC, QC, dim=1).load(cfg.q_layout)
+            k_c = kv_smem.slice(c * QC, QC, dim=1).permute([1, 0]).load(cfg.k_layout)
+            S = gl.amd.cdna4.mfma(q_c, k_c, S)
     else:
-        k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
-    if cfg.ASYNC_LDS:
-        k = k.to(gl.float8e4nv, bitcast=True)  # raw cache bytes; layout-preserving
-    S = gl.amd.cdna4.mfma(
-        q_dot,
-        k,
-        gl.zeros([cfg.BLOCK_M, cfg.BLOCK_K], gl.float32, layout=cfg.qk_layout),
-    )
+        if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
+            # the async_wait already ordered the copy; stops the backend re-inserting
+            # a conservative vmcnt(0) before every LDS read
+            k = gl.amd.cdna4.async_copy.load_shared_relaxed(
+                kv_smem.permute([1, 0]), cfg.k_layout
+            )
+        else:
+            k = kv_smem.permute([1, 0]).load(cfg.k_layout)  # [KV_DIM, BLOCK_K]
+        if cfg.ASYNC_LDS:
+            k = k.to(gl.float8e4nv, bitcast=True)  # raw cache bytes; layout-preserving
+        S = gl.amd.cdna4.mfma(q_dot, k, S)
     if cfg.ROPE_SEPARATE:
         if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
             k_rope = gl.amd.cdna4.async_copy.load_shared_relaxed(
@@ -874,7 +1060,6 @@ def _gather_full(
     k_start,
     seg_hi,
     offs_full,
-    offs_full16,
     offs_rope,
     k_rng_slot,
     k_rng_rope,
@@ -882,7 +1067,8 @@ def _gather_full(
     """Gather one full fp8 tile, split from the LDS-write/MFMA so it issues an
     iteration early. The prefetch stays in raw fp8: dequantizing here would
     double the loop-carried registers, so the consumer dequants in chunks.
-    Returns (x, sc, k_rope, valid); unused slots carry a duplicate DCE removes."""
+    Returns (x, sc, k_rope, valid); unused slots carry a duplicate DCE removes.
+    fp8_dsv4_mla segments take _dsv4_segment instead."""
     fmt = seg.fmt
     cs0 = seg.cs0
     if not fmt.USE_BUFFER_LOAD:
@@ -943,7 +1129,10 @@ def _gather_full(
             )
         else:
             k_rope = x_u8  # rope lives inside the KV buffer -> DCE'd
-    elif fmt.KIND == "fp8_dsv32_mla":
+    else:
+        gl.static_assert(
+            fmt.KIND == "fp8_dsv32_mla", "fp8_dsv4_mla takes _dsv4_segment"
+        )
         nope_row = bg * cs0 + pg * fmt.TOK_U8
         scl_row = bg * (cs0 // 4) + pg * fmt.TOK_F32 + fmt.SCL_F32_OFF
         # Scales issue before the bulk fp8: vmcnt is one in-order FIFO, so
@@ -961,6 +1150,7 @@ def _gather_full(
                 cfg.KV_DIM,
                 False,
                 0.0,
+                CACHE=cfg.GATHER_CACHE,
             )
         else:
             sc = _cache_load(
@@ -977,67 +1167,6 @@ def _gather_full(
             fmt.USE_BUFFER_LOAD,
             CACHE=cfg.GATHER_CACHE,
         )
-        bgr, pgr, _ = _slots(
-            cfg,
-            seg,
-            k_start + k_rng_rope,
-            seg_hi,
-            0,
-            False,
-            cfg.UNI_TILE,
-        )
-        k_rope = _cache_load(
-            seg.alt_ptr,
-            bgr * (cs0 // 2) + pgr * fmt.TOK_U16 + fmt.ROPE_U16_OFF,
-            offs_rope,
-            fmt.USE_BUFFER_LOAD,
-            CACHE=cfg.GATHER_CACHE,
-        )
-    else:  # "fp8_dsv4_mla"
-        nope_row = bg * cs0 + pg * fmt.TOK_U8
-        scl_row = bg * cs0 + fmt.BLOCK_SIZE * fmt.TOK_U8 + pg * fmt.SCL_TRAILER_U8
-        # Scales first (vmcnt FIFO; see the dsmla branch).
-        if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
-            sc = _scale_load(
-                seg.cache_ptr,
-                scl_row,
-                scl_row,
-                fmt.USE_BUFFER_LOAD,
-                cfg.gather_l,
-                fmt.scl_l,
-                fmt.NG,
-                cfg.KV_DIM,
-                False,
-                127,
-            )
-        else:
-            sc = _cache_load(
-                seg.cache_ptr,
-                scl_row,
-                offs_full // 64,
-                fmt.USE_BUFFER_LOAD,
-                CACHE=cfg.GATHER_CACHE,
-            )
-        if fmt.DEQ == "asm":
-            # 2-byte elements: <2 x i16> = 4 packed fp8 per VGPR out of one
-            # dword load. Same byte as nope_row (both even), addressed through
-            # the bf16 view; the layout convert is a rename (shared dim-0 tiling).
-            row16 = gl.convert_layout(nope_row >> 1, gl.SliceLayout(1, cfg.gather16_l))
-            x_u8 = _cache_load(
-                seg.alt_ptr,
-                row16,
-                offs_full16,
-                fmt.USE_BUFFER_LOAD,
-                CACHE=cfg.GATHER_CACHE,
-            )
-        else:
-            x_u8 = _cache_load(
-                seg.cache_ptr,
-                nope_row,
-                offs_full,
-                fmt.USE_BUFFER_LOAD,
-                CACHE=cfg.GATHER_CACHE,
-            )
         bgr, pgr, _ = _slots(
             cfg,
             seg,
@@ -1141,8 +1270,10 @@ def _qkpv_lds(
     rope_smem,
     k_start=0,
     seg_hi=0,
+    red_smem=None,
 ):
-    """QK -> softmax -> PV over a tile already resident in LDS."""
+    """QK -> softmax -> PV over a tile already resident in LDS. red_smem, if
+    given, holds the row max / sum exchanges; otherwise gl.reduce is used."""
     neg_inf = float("-inf")
     S = _qk_scores(cfg, q_dot, q_rope_dot, kv_smem, rope_smem)
     # UNI_TILE folds the tile's range test into the score mask, which is what
@@ -1180,12 +1311,22 @@ def _qkpv_lds(
     # (= scale * log2e [* k_scale for "fp8_scalar"]). max commutes with a positive
     # scale, so scale the row max instead of every element of S; what is left,
     # S * qk_scale - m_new, lowers to one FMA, and -inf columns stay -inf.
-    m_block = _rmax(S, 1) * qk_scale
+    if red_smem is not None:
+        m_block = (
+            _row_reduce_lds(cfg, S, red_smem.slice(0, cfg.BLOCK_M), True) * qk_scale
+        )
+    else:
+        m_block = _rmax(S, 1) * qk_scale
     m_new = _max2(m_i, m_block)
     m_new = gl.where(m_new > neg_inf, m_new, 0.0)
     p = gl.exp2(S * qk_scale - m_new[:, None])
     alpha = gl.exp2(m_i - m_new)
-    l_new = l_i * alpha + gl.sum(p, axis=1)
+    if red_smem is not None:
+        l_new = l_i * alpha + _row_reduce_lds(
+            cfg, p, red_smem.slice(cfg.BLOCK_M, cfg.BLOCK_M), False
+        )
+    else:
+        l_new = l_i * alpha + gl.sum(p, axis=1)
     if cfg.ASYNC_LDS and cfg.RELAXED_LOAD:
         v = gl.amd.cdna4.async_copy.load_shared_relaxed(kv_smem, cfg.v_layout)
     else:
@@ -1208,7 +1349,7 @@ def _qkpv_lds(
 
 # ---------------------------------------------------------------------------
 # Non-prefetched path: bf16 segments, and the peeled masked tail when UNI_TILE
-# is off (dsv4/uniform only; tensor/dsmla require UNI_TILE).
+# is off (uniform only; tensor/dsmla require UNI_TILE, dsv4 takes _dsv4_segment).
 # ---------------------------------------------------------------------------
 
 
@@ -1229,15 +1370,14 @@ def _decode_tile(
     kv_smem,
     rope_smem,
     offs_full,
-    offs_full16,
     offs_rope,
     k_rng_slot,
     k_rng_rope,
     MASKED: gl.constexpr,
 ):
     """One KV tile -> online-softmax update. MASKED=True is the peeled tail
-    (fully predicated); full tiles clamp -1 sentinels and mask scores when
-    HAS_INVALID."""
+    (fully predicated); full tiles send -1 sentinels to seg.target and mask
+    scores when HAS_INVALID."""
     neg_inf = float("-inf")
     fmt = seg.fmt
     cs0 = seg.cs0
@@ -1296,132 +1436,7 @@ def _decode_tile(
                 CACHE=cfg.GATHER_CACHE,
             )
         _deq_store_tile(x_u8, sc, kv_smem, cfg, fmt)
-    elif fmt.KIND == "fp8_dsv4_mla":
-        nope_row = block_idx_g * cs0 + pos_g * fmt.TOK_U8
-        scl_row = (
-            block_idx_g * cs0 + fmt.BLOCK_SIZE * fmt.TOK_U8 + pos_g * fmt.SCL_TRAILER_U8
-        )
-        scl_col = offs_full // 64
-        if MASKED:  # scales first: see _gather_full
-            if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
-                exps = _scale_load(
-                    seg.cache_ptr,
-                    scl_row,
-                    valid1d,
-                    fmt.USE_BUFFER_LOAD,
-                    cfg.gather_l,
-                    fmt.scl_l,
-                    fmt.NG,
-                    cfg.KV_DIM,
-                    True,
-                    127,
-                )
-            else:
-                exps = _cache_load(
-                    seg.cache_ptr,
-                    scl_row,
-                    scl_col,
-                    fmt.USE_BUFFER_LOAD,
-                    mask=valid_g[:, None],
-                    other=127,
-                    CACHE=cfg.GATHER_CACHE,
-                )
-            if fmt.DEQ == "asm":
-                row16 = gl.convert_layout(
-                    nope_row >> 1, gl.SliceLayout(1, cfg.gather16_l)
-                )
-                x_u8 = _cache_load(
-                    seg.alt_ptr,
-                    row16,
-                    offs_full16,
-                    fmt.USE_BUFFER_LOAD,
-                    mask=gl.convert_layout(valid1d, gl.SliceLayout(1, cfg.gather16_l))[
-                        :, None
-                    ],
-                    other=0.0,
-                    CACHE=cfg.GATHER_CACHE,
-                )
-            else:
-                x_u8 = _cache_load(
-                    seg.cache_ptr,
-                    nope_row,
-                    offs_full,
-                    fmt.USE_BUFFER_LOAD,
-                    mask=valid_g[:, None],
-                    other=0,
-                    CACHE=cfg.GATHER_CACHE,
-                )
-        else:
-            if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
-                exps = _scale_load(
-                    seg.cache_ptr,
-                    scl_row,
-                    scl_row,
-                    fmt.USE_BUFFER_LOAD,
-                    cfg.gather_l,
-                    fmt.scl_l,
-                    fmt.NG,
-                    cfg.KV_DIM,
-                    False,
-                    127,
-                )
-            else:
-                exps = _cache_load(
-                    seg.cache_ptr,
-                    scl_row,
-                    scl_col,
-                    fmt.USE_BUFFER_LOAD,
-                    CACHE=cfg.GATHER_CACHE,
-                )
-            if fmt.DEQ == "asm":
-                row16 = gl.convert_layout(
-                    nope_row >> 1, gl.SliceLayout(1, cfg.gather16_l)
-                )
-                x_u8 = _cache_load(
-                    seg.alt_ptr,
-                    row16,
-                    offs_full16,
-                    fmt.USE_BUFFER_LOAD,
-                    CACHE=cfg.GATHER_CACHE,
-                )
-            else:
-                x_u8 = _cache_load(
-                    seg.cache_ptr,
-                    nope_row,
-                    offs_full,
-                    fmt.USE_BUFFER_LOAD,
-                    CACHE=cfg.GATHER_CACHE,
-                )
-        _deq_store_tile(x_u8, exps, kv_smem, cfg, fmt)
-        block_idx_gr, pos_gr, valid_gr = _slots(
-            cfg,
-            seg,
-            k_start + k_rng_rope,
-            hi,
-            seg.num_rows,
-            MASKED,
-        )
-        rope_row = block_idx_gr * (cs0 // 2) + pos_gr * fmt.TOK_U16 + fmt.ROPE_U16_OFF
-        if MASKED:
-            k_rope = _cache_load(
-                seg.alt_ptr,
-                rope_row,
-                offs_rope,
-                fmt.USE_BUFFER_LOAD,
-                mask=valid_gr[:, None],
-                other=0.0,
-                CACHE=cfg.GATHER_CACHE,
-            )
-        else:
-            k_rope = _cache_load(
-                seg.alt_ptr,
-                rope_row,
-                offs_rope,
-                fmt.USE_BUFFER_LOAD,
-                CACHE=cfg.GATHER_CACHE,
-            )
-        kv_smem.slice(fmt.NOPE_DIM, cfg.ROPE_DIM, dim=1).store(k_rope)
-    else:  # "bf16" (tensor/dsmla require UNI_TILE, so they never come here)
+    else:  # "bf16" (tensor/dsmla require UNI_TILE, dsv4 takes _dsv4_segment)
         kv_row2 = block_idx_g * cs0 + pos_g * fmt.TOK_EL
         if MASKED:
             kv = _cache_load(
@@ -1513,7 +1528,7 @@ def _decode_tile(
 
 
 @gluon.jit
-def _process_segment(
+def _staged_segment(
     cfg,
     seg,
     q_dot,
@@ -1530,12 +1545,17 @@ def _process_segment(
     rope_smem,
 ):
     offs_full = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.gather_l))
-    offs_full16 = gl.arange(
-        0, cfg.KV_DIM // 2, layout=gl.SliceLayout(0, cfg.gather16_l)
-    )
     offs_rope = gl.arange(0, cfg.ROPE_L, layout=gl.SliceLayout(0, cfg.gather_rope_l))
     k_rng_slot = gl.arange(0, cfg.BLOCK_K, layout=cfg.slot_l)
     k_rng_rope = gl.arange(0, cfg.BLOCK_K, layout=gl.SliceLayout(1, cfg.gather_rope_l))
+
+    if cfg.HAS_INVALID:
+        # The first valid slot of this program's range is the key invalid lanes
+        # gather. A range with none adds nothing, so it is skipped.
+        target = _first_valid_slot(cfg, seg, seg.seg_start * 0 - 1, lo, hi)
+        if target < 0:
+            hi = lo
+        seg = _with_target(seg, target)
 
     # [lo, hi_full) are full mask-free tiles; only the peeled tail is masked.
     hi_full = lo + ((hi - lo) // cfg.BLOCK_K) * cfg.BLOCK_K
@@ -1554,19 +1574,23 @@ def _process_segment(
                 lo,
                 hi,
                 offs_full,
-                offs_full16,
                 offs_rope,
                 k_rng_slot,
                 k_rng_rope,
             )
-            for i in range(1, n_full):
+            # UNPEEL: one more trip instead of the peeled stage + dots of the last
+            # tile after the loop. That trip prefetches past hi, which the
+            # clamped slot reads keep in range, and nothing consumes it.
+            n_trips = n_full
+            if cfg.UNPEEL:
+                n_trips = n_full + 1
+            for i in range(1, n_trips):
                 kn2, ks2, kr2, vld2 = _gather_full(
                     cfg,
                     seg,
                     lo + i * cfg.BLOCK_K,
                     hi,
                     offs_full,
-                    offs_full16,
                     offs_rope,
                     k_rng_slot,
                     k_rng_rope,
@@ -1592,26 +1616,27 @@ def _process_segment(
                     hi,
                 )
                 kn, ks, kr, vld = kn2, ks2, kr2, vld2
-            m_i, l_i, acc = _qkpv(
-                cfg,
-                seg,
-                kn,
-                ks,
-                kr,
-                vld,
-                q_dot,
-                q_rope_dot,
-                m_i,
-                l_i,
-                acc,
-                head_mask,
-                qk_scale,
-                v_scale,
-                kv_smem,
-                rope_smem,
-                lo + (n_full - 1) * cfg.BLOCK_K,
-                hi,
-            )
+            if not cfg.UNPEEL:
+                m_i, l_i, acc = _qkpv(
+                    cfg,
+                    seg,
+                    kn,
+                    ks,
+                    kr,
+                    vld,
+                    q_dot,
+                    q_rope_dot,
+                    m_i,
+                    l_i,
+                    acc,
+                    head_mask,
+                    qk_scale,
+                    v_scale,
+                    kv_smem,
+                    rope_smem,
+                    lo + (n_full - 1) * cfg.BLOCK_K,
+                    hi,
+                )
     else:
         for k_start in range(lo, hi_full, cfg.BLOCK_K):
             m_i, l_i, acc = _decode_tile(
@@ -1630,7 +1655,6 @@ def _process_segment(
                 kv_smem,
                 rope_smem,
                 offs_full,
-                offs_full16,
                 offs_rope,
                 k_rng_slot,
                 k_rng_rope,
@@ -1654,7 +1678,6 @@ def _process_segment(
             kv_smem,
             rope_smem,
             offs_full,
-            offs_full16,
             offs_rope,
             k_rng_slot,
             k_rng_rope,
@@ -1663,13 +1686,477 @@ def _process_segment(
     return m_i, l_i, acc
 
 
+# The fp8_dsv4_mla walk and its helpers.
+
+
+@gluon.jit
+def _dsv4_slot_ids(cfg, base, k_start, seg_hi, k_rng_slot, k_rng_rope, k_rng_col):
+    """Slot ids of one tile in every layout it uses, in one round trip.
+
+    Clamped into range like _slots; the score mask drops the duplicates."""
+    last = seg_hi - 1
+    s_g = _read_slots_at(cfg, base, gl.minimum(k_start + k_rng_slot, last))
+    s_r = _read_slots_at(cfg, base, gl.minimum(k_start + k_rng_rope, last))
+    if cfg.HAS_INVALID:
+        s_c = _read_slots_at(cfg, base, gl.minimum(k_start + k_rng_col, last))
+    else:
+        s_c = k_rng_col  # unread
+    return s_g, s_r, s_c
+
+
+@gluon.jit
+def _split_slot_pow2(cfg, slot, SHIFT: gl.constexpr):
+    """_split_slot by shifts; slots are non-negative here."""
+    if cfg.SLOT_U32:
+        slot = slot.to(gl.uint32)
+    blk = slot >> SHIFT
+    return blk.to(gl.int32), (slot - (blk << SHIFT)).to(gl.int32)
+
+
+@gluon.jit
+def _dsv4_gather(
+    cfg,
+    seg,
+    k_start,
+    seg_hi,
+    offs_full,
+    offs_rope,
+    k_rng_slot,
+    k_rng_rope,
+    k_rng_col,
+    slots,
+):
+    """Issue one fp8_dsv4_mla tile's gathers from slot ids read a tile earlier.
+    Returns (x, sc, k_rope, valid), valid in the score-column layout."""
+    SHIFT: gl.constexpr = seg.fmt.BLOCK_SIZE.bit_length() - 1
+    gl.static_assert(
+        seg.fmt.BLOCK_SIZE == 1 << SHIFT, "fp8_dsv4_mla pages must be a power of two"
+    )
+    fmt = seg.fmt
+    cache_ptr = seg.cache_ptr
+    cs0 = seg.cs0
+    s_g, s_r, s_c = slots
+    if not fmt.USE_BUFFER_LOAD:
+        cs0 = cs0.to(gl.int64)  # >2 GB cache: 64-bit gather offsets
+    if cfg.HAS_INVALID:
+        # as in _slots: sentinels gather the target, the score mask drops them
+        v_g = (k_start + k_rng_slot < seg_hi) & (s_g >= 0)
+        s_g = gl.where(v_g, s_g, seg.target)
+        v_r = (k_start + k_rng_rope < seg_hi) & (s_r >= 0)
+        s_r = gl.where(v_r, s_r, seg.target)
+        valid = (k_start + k_rng_col < seg_hi) & (s_c >= 0)
+    else:
+        valid = k_start + k_rng_col < seg_hi
+    # carried as i32: a loop-carried i1 vector is repacked every iteration
+    valid = valid.to(gl.int32)
+    bg, pg = _split_slot_pow2(cfg, s_g, SHIFT)
+    bgr, pgr = _split_slot_pow2(cfg, s_r, SHIFT)
+    nope_row = bg * cs0 + pg * fmt.TOK_U8
+    scl_row = bg * cs0 + (fmt.TOK_U8 << SHIFT) + pg * fmt.SCL_TRAILER_U8
+    # Scales first (vmcnt counts in order), as the dwords holding each exponent
+    # byte (_dsv4_scales extracts it; carried i8 would be repacked).
+    if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD and cfg.SCL_DWORD:
+        cols = gl.arange(0, fmt.NG, layout=gl.SliceLayout(0, fmt.scl_l))
+        rows = gl.convert_layout(scl_row, gl.SliceLayout(1, fmt.scl_l))
+        p32 = cache_ptr.to(gl.pointer_type(gl.int32), bitcast=True)
+        sc = gl.load(
+            p32 + ((rows[:, None] + (cols & -4)[None, :]) >> 2),
+            cache_modifier=cfg.GATHER_CACHE,
+        )
+    elif fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
+        # pitch not 4-aligned: byte loads
+        sc = _scale_load(
+            cache_ptr,
+            scl_row,
+            scl_row,
+            fmt.USE_BUFFER_LOAD,
+            cfg.gather_l,
+            fmt.scl_l,
+            fmt.NG,
+            cfg.KV_DIM,
+            False,
+            127,
+            CACHE=cfg.GATHER_CACHE,
+            RAW=True,
+        )
+    else:
+        sc = _cache_load(
+            cache_ptr,
+            scl_row,
+            offs_full // 64,
+            fmt.USE_BUFFER_LOAD,
+            CACHE=cfg.GATHER_CACHE,
+        )
+    if fmt.DEQ == "asm":
+        # _scaled_upcast_asm reads the same bytes as int16 (4 packed fp8 per VGPR).
+        offs_full16 = gl.arange(
+            0, cfg.KV_DIM // 2, layout=gl.SliceLayout(0, cfg.gather16_l)
+        )
+        x_u8 = _cache_load(
+            seg.alt_ptr,
+            gl.convert_layout(nope_row >> 1, gl.SliceLayout(1, cfg.gather16_l)),
+            offs_full16,
+            fmt.USE_BUFFER_LOAD,
+            CACHE=cfg.GATHER_CACHE,
+        )
+    else:
+        x_u8 = _cache_load(
+            cache_ptr,
+            nope_row,
+            offs_full,
+            fmt.USE_BUFFER_LOAD,
+            CACHE=cfg.GATHER_CACHE,
+        )
+    k_rope = _cache_load(
+        seg.alt_ptr,
+        bgr * (cs0 // 2) + pgr * fmt.TOK_U16 + fmt.ROPE_U16_OFF,
+        offs_rope,
+        fmt.USE_BUFFER_LOAD,
+        CACHE=cfg.GATHER_CACHE,
+    )
+    return x_u8, sc, k_rope, valid
+
+
+@gluon.jit
+def _dsv4_scales(cfg, seg, sc):
+    """A _dsv4_gather tile's exponents as u8 in gather_l: [BLOCK_K, NG] dwords or
+    bytes are unpacked and widened; the buffer-load gather is already wide."""
+    fmt = seg.fmt
+    if fmt.NARROW_SCALE and not fmt.USE_BUFFER_LOAD:
+        if cfg.SCL_DWORD:
+            cols = gl.arange(0, fmt.NG, layout=gl.SliceLayout(0, fmt.scl_l))
+            sc = ((sc >> ((cols & 3) * 8)[None, :]) & 0xFF).to(gl.uint8)
+        sc = _widen_scales(sc, cfg.gather_l, fmt.NG, cfg.KV_DIM)
+    return sc
+
+
+@gluon.jit
+def _dsv4_segment(
+    cfg,
+    seg,
+    q_dot,
+    q_rope_dot,
+    lo,
+    hi,
+    m_i,
+    l_i,
+    acc,
+    head_mask,
+    qk_scale,
+    v_scale,
+    kv_smem,
+    rope_smem,
+    red_smem=None,
+    PREFETCH: gl.constexpr = False,
+):
+    """The fp8_dsv4_mla walk (UNI_TILE). A tile's slot ids are read a tile ahead
+    of its gathers; PREFETCH also issues the gathers a tile ahead, after staging
+    the current tile, so the in-flight tile needs no back-edge copy."""
+    BK: gl.constexpr = cfg.BLOCK_K
+    offs_full = gl.arange(0, cfg.KV_DIM, layout=gl.SliceLayout(0, cfg.gather_l))
+    offs_rope = gl.arange(0, cfg.ROPE_L, layout=gl.SliceLayout(0, cfg.gather_rope_l))
+    k_rng_slot = gl.arange(0, BK, layout=cfg.slot_l)
+    k_rng_rope = gl.arange(0, BK, layout=gl.SliceLayout(1, cfg.gather_rope_l))
+    k_rng_col = gl.arange(0, BK, layout=gl.SliceLayout(0, cfg.qk_layout))
+    n = (hi - lo + BK - 1) // BK
+    if n > 0:
+        base = seg.indices_ptr + seg.seg_start
+        ids = _dsv4_slot_ids(cfg, base, lo, hi, k_rng_slot, k_rng_rope, k_rng_col)
+        if PREFETCH:
+            ids1 = _dsv4_slot_ids(
+                cfg, base, lo + BK, hi, k_rng_slot, k_rng_rope, k_rng_col
+            )
+        if cfg.HAS_INVALID:
+            # Sentinels gather the first tile's largest slot id; only an all-sentinel
+            # first tile searches further.
+            target = _first_valid_slot(cfg, seg, gl.max(ids[0], axis=0), lo + BK, hi)
+            n = gl.where(target < 0, 0, n)
+            seg = _with_target(seg, target)
+        if n > 0:
+            if PREFETCH:
+                tile = _dsv4_gather(
+                    cfg,
+                    seg,
+                    lo,
+                    hi,
+                    offs_full,
+                    offs_rope,
+                    k_rng_slot,
+                    k_rng_rope,
+                    k_rng_col,
+                    ids,
+                )
+                ids = ids1
+            for t in range(n):
+                k_t = lo + t * BK
+                if not PREFETCH:
+                    tile = _dsv4_gather(
+                        cfg,
+                        seg,
+                        k_t,
+                        hi,
+                        offs_full,
+                        offs_rope,
+                        k_rng_slot,
+                        k_rng_rope,
+                        k_rng_col,
+                        ids,
+                    )
+                _stage(
+                    cfg,
+                    seg,
+                    tile[0],
+                    _dsv4_scales(cfg, seg, tile[1]),
+                    tile[2],
+                    kv_smem,
+                    rope_smem,
+                )
+                valid = tile[3] != 0
+                # In flight during this tile's dots; past the range the ids clamp to
+                # the last one.
+                if PREFETCH:
+                    tile = _dsv4_gather(
+                        cfg,
+                        seg,
+                        k_t + BK,
+                        hi,
+                        offs_full,
+                        offs_rope,
+                        k_rng_slot,
+                        k_rng_rope,
+                        k_rng_col,
+                        ids,
+                    )
+                    ids = _dsv4_slot_ids(
+                        cfg, base, k_t + 2 * BK, hi, k_rng_slot, k_rng_rope, k_rng_col
+                    )
+                else:
+                    ids = _dsv4_slot_ids(
+                        cfg, base, k_t + BK, hi, k_rng_slot, k_rng_rope, k_rng_col
+                    )
+                m_i, l_i, acc = _qkpv_lds(
+                    cfg,
+                    seg,
+                    valid,
+                    q_dot,
+                    q_rope_dot,
+                    m_i,
+                    l_i,
+                    acc,
+                    head_mask,
+                    qk_scale,
+                    v_scale,
+                    kv_smem,
+                    rope_smem,
+                    k_t,
+                    hi,
+                    red_smem,
+                )
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def _segment(
+    cfg,
+    seg,
+    q_dot,
+    q_rope_dot,
+    lo,
+    hi,
+    m_i,
+    l_i,
+    acc,
+    head_mask,
+    qk_scale,
+    v_scale,
+    kv_smem,
+    rope_smem,
+    red_smem,
+    DSV4_PREFETCH: gl.constexpr,
+):
+    """Walk keys [lo, hi) of one segment with its format's walk."""
+    if seg.fmt.KIND == "fp8_dsv4_mla":
+        m_i, l_i, acc = _dsv4_segment(
+            cfg,
+            seg,
+            q_dot,
+            q_rope_dot,
+            lo,
+            hi,
+            m_i,
+            l_i,
+            acc,
+            head_mask,
+            qk_scale,
+            v_scale,
+            kv_smem,
+            rope_smem,
+            red_smem,
+            DSV4_PREFETCH,
+        )
+    elif cfg.ASYNC_LDS:
+        m_i, l_i, acc = _async_segment(
+            cfg,
+            seg,
+            q_dot,
+            q_rope_dot,
+            lo,
+            hi,
+            m_i,
+            l_i,
+            acc,
+            head_mask,
+            qk_scale,
+            v_scale,
+            kv_smem,
+            rope_smem,
+        )
+    else:
+        m_i, l_i, acc = _staged_segment(
+            cfg,
+            seg,
+            q_dot,
+            q_rope_dot,
+            lo,
+            hi,
+            m_i,
+            l_i,
+            acc,
+            head_mask,
+            qk_scale,
+            v_scale,
+            kv_smem,
+            rope_smem,
+        )
+    return m_i, l_i, acc
+
+
+@gluon.jit
+def _inv_rope(x, cs_row, ROPE_DIM: gl.constexpr):
+    """Inverse GPT-J RoPE on the trailing ROPE_DIM lanes of x [M, D] f32, with
+    the row's cos | sin at cs_row: even * cos + odd * sin, odd * cos - even * sin.
+    NoPE pairs take cos 1 and sin 0, so one expression covers the row."""
+    M: gl.constexpr = x.shape[0]
+    D: gl.constexpr = x.shape[1]
+    even, odd = gl.split(gl.reshape(x, [M, D // 2, 2]))
+    k = gl.arange(0, D // 2, layout=gl.SliceLayout(0, even.type.layout))
+    k = k - (D - ROPE_DIM) // 2
+    # buffer_load folds the mask into the offset; a masked gl.load branches on exec.
+    cos = gl.amd.cdna4.buffer_load(ptr=cs_row, offsets=k, mask=k >= 0, other=1.0)
+    sin = gl.amd.cdna4.buffer_load(
+        ptr=cs_row + ROPE_DIM // 2, offsets=k, mask=k >= 0, other=0.0
+    )
+    cos, sin = cos[None, :], sin[None, :]
+    return gl.reshape(gl.join(even * cos + odd * sin, odd * cos - even * sin), [M, D])
+
+
+@gluon.jit
+def _mxfp8(x, scale_ptr, h0, num_heads):
+    """MXFP8 of x [M, D] f32, heads h0 onwards of one row: one E8M0 byte per 32
+    lanes, stored to scale_ptr [H, D // 32]. Returns the values to store as e4m3."""
+    M: gl.constexpr = x.shape[0]
+    D: gl.constexpr = x.shape[1]
+    blocks = gl.reshape(x, [M, D // 32, 32])
+    amax = gl.maximum(gl.max(gl.abs(blocks), axis=2), 1.1754943508222875e-38)
+    bits = gl.ceil(gl.log2(amax / 448.0)) + 127.0
+    bits = gl.minimum(gl.maximum(bits, 0.0), 254.0)
+    scl_l: gl.constexpr = bits.type.layout
+    hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, scl_l))
+    gs = gl.arange(0, D // 32, layout=gl.SliceLayout(0, scl_l))
+    gl.amd.cdna4.buffer_store(
+        bits.to(gl.uint8),
+        ptr=scale_ptr,
+        offsets=(hs[:, None] * (D // 32) + gs[None, :]).to(gl.int32),
+        mask=(hs < num_heads)[:, None],
+    )
+    # The reciprocal, since a divisor of 2^-127 would flush to zero.
+    return gl.reshape(blocks * gl.exp2(127.0 - bits)[:, :, None], [M, D])
+
+
+@gluon.jit
+def _epilogue_store(
+    x,
+    out_ptr,
+    out_stride0,
+    out_stride1,
+    row,
+    h0,
+    num_heads,
+    work_l: gl.constexpr,
+    pos_ptr,
+    cs_ptr,
+    cs_stride,
+    scale_ptr,
+    scale_stride0,
+    ROPE_DIM: gl.constexpr,
+    INV_ROPE: gl.constexpr,
+    OUT_MXFP8: gl.constexpr,
+):
+    """Store x [M, D] (one query row, heads h0 onwards) as vLLM's pre-wo_a passes
+    would: inverse RoPE (INV_ROPE), then e4m3 with an E8M0 byte per 32 lanes
+    (OUT_MXFP8). Rows are rounded to bf16 first, as the unfused path stores them."""
+    M: gl.constexpr = x.shape[0]
+    D: gl.constexpr = x.shape[1]
+    if INV_ROPE:
+        # Read the position before the move into work_l to hide its latency.
+        cs_row = cs_ptr + gl.load(pos_ptr + row).to(gl.int64) * cs_stride
+    x = gl.convert_layout(x.to(gl.bfloat16), work_l).to(gl.float32)
+    if INV_ROPE:
+        x = _inv_rope(x, cs_row, ROPE_DIM)
+    if OUT_MXFP8:
+        x = _mxfp8(x, scale_ptr + row * scale_stride0, h0, num_heads)
+    hs = h0 + gl.arange(0, M, layout=gl.SliceLayout(1, x.type.layout))
+    ds = gl.arange(0, D, layout=gl.SliceLayout(0, x.type.layout))
+    gl.amd.cdna4.buffer_store(
+        x.to(out_ptr.dtype.element_ty),
+        ptr=out_ptr,
+        offsets=(row * out_stride0 + hs[:, None] * out_stride1 + ds[None, :]).to(
+            gl.int32
+        ),
+        mask=(hs < num_heads)[:, None],
+    )
+
+
+@gluon.jit
+def _xcd_work(GRID_ORDER: gl.constexpr, NUM_XCDS: gl.constexpr, SPLIT_K: gl.constexpr):
+    """(query, split, head block) of this program, remapped with remap_xcd so
+    the programs that read the same KV rows share an XCD and its L2."""
+    n0 = gl.num_programs(0)
+    n1 = gl.num_programs(1)
+    n2 = gl.num_programs(2)
+    lid = gl.program_id(0) + n0 * (gl.program_id(1) + n1 * gl.program_id(2))
+    w = remap_xcd(lid, n0 * n1 * n2, NUM_XCDS)
+    nh = gl.num_programs(GRID_ORDER.index("h"))
+    ns = gl.num_programs(GRID_ORDER.index("s"))
+    if SPLIT_K:
+        # Rows in blocks of ceil(nq / NUM_XCDS), about one per XCD; split-major
+        # inside a block, head block fastest.
+        nq = gl.num_programs(GRID_ORDER.index("q"))
+        t = (nq + NUM_XCDS - 1) // NUM_XCDS
+        per = t * ns * nh
+        blk = w // per
+        i = w % per
+        rows = gl.minimum(t, nq - blk * t)
+        r = i % (rows * nh)
+        q, s, h = blk * t + r // nh, i // (rows * nh), r % nh
+    else:
+        # One split per row: row-major is the same order.
+        q, s, h = w // (nh * ns), (w // nh) % ns, w % nh
+    return q, s, h
+
+
 _sparse_mla_repr = make_kernel_repr(
     "_sparse_mla",
-    ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "NUM_SPLITS", "MAIN_FMT", "ROPE_SEPARATE"],
+    ["BLOCK_M", "BLOCK_K", "HEAD_SIZE", "SPLIT_K", "MAIN_FMT", "ROPE_SEPARATE"],
 )
 
 
-@gluon.jit(repr=_sparse_mla_repr)
+# Split counts follow the batch, so they (and the stride they scale) stay out of the
+# compile key.
+@gluon.jit(
+    repr=_sparse_mla_repr,
+    do_not_specialize=["pm_stride0", "num_splits", "main_num_splits"],
+)
 def _sparse_mla(
     # Shapes below: C = queries, H = num_heads, S = HEAD_SIZE (the V width),
     # R = ROPE_DIM, nnz = total gathered tokens in a segment's index list.
@@ -1688,12 +2175,12 @@ def _sparse_mla(
     extra_indices_ptr,  # [nnz_extra] int32
     extra_indptr_ptr,  # [C + 1] int32
     attn_sink_ptr,  # [H] f32, HAS_SINK only
-    out_ptr,  # [C, H, S] bf16, written when NUM_SPLITS == 1
-    # Split-K partials, written instead of out_ptr when NUM_SPLITS > 1 (unused
-    # placeholders otherwise).
-    part_m_ptr,  # [C, NUM_SPLITS, H] f32 row max, base-2 domain
-    part_l_ptr,  # [C, NUM_SPLITS, H] f32 row sum
-    part_acc_ptr,  # [C, NUM_SPLITS, H, S] bf16 or f32, un-normalized
+    out_ptr,  # [C, H, S] bf16, written without SPLIT_K
+    # Split-K partials, one slot per launched split program (P >= num_splits),
+    # written instead of out_ptr with SPLIT_K (unused placeholders otherwise).
+    part_m_ptr,  # [C, P, H] f32 row max, base-2 domain
+    part_l_ptr,  # [C, P, H] f32 row sum
+    part_acc_ptr,  # [C, P, H, S] bf16 or f32, un-normalized
     # f32 side-channel per segment: scalar k_scale ("fp8_scalar") or f32 cache view
     # ("fp8_dsv32_mla"). None elides the argument, keeping other formats' kernarg
     # layouts unchanged.
@@ -1708,9 +2195,9 @@ def _sparse_mla(
     extra_cs0,
     main_num_rows,
     extra_num_rows,
-    pm_stride0: gl.constexpr,
+    pm_stride0,
     pm_stride_s: gl.constexpr,
-    pa_stride0: gl.constexpr,
+    pa_stride0,
     pa_stride_s: gl.constexpr,
     pa_stride_h: gl.constexpr,
     num_heads: gl.constexpr,
@@ -1727,7 +2214,8 @@ def _sparse_mla(
     ROPE_SEPARATE: gl.constexpr,
     BLOCK_M: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    NUM_SPLITS: gl.constexpr,
+    num_splits,
+    SPLIT_K: gl.constexpr,
     HEAD_ALIGNED: gl.constexpr,
     # NOPE_CHUNK: extent of one dequant piece along CHUNK_AXIS (0 = rows,
     # 1 = columns); >= the tile's extent means one shot.
@@ -1737,10 +2225,10 @@ def _sparse_mla(
     UNI_TILE: gl.constexpr,
     GRID_ORDER: gl.constexpr,
     Q_CACHE: gl.constexpr,
-    # MAIN_SPLITS <= NUM_SPLITS: splitting the SWA window past its tile count
+    # main_num_splits <= num_splits: splitting the SWA window past its tile count
     # only manufactures masked partial tiles, so main stops early and extra
     # keeps all programs (surplus ones get an empty main range).
-    MAIN_SPLITS: gl.constexpr,
+    main_num_splits,
     # ADAPTIVE_SPLITS: re-decide the useful split count per query at runtime.
     ADAPTIVE_SPLITS: gl.constexpr,
     DEQ: gl.constexpr,  # see Fmt.DEQ
@@ -1765,11 +2253,47 @@ def _sparse_mla(
     ASYNC_LDS: gl.constexpr = False,
     RELAXED_LOAD: gl.constexpr = True,
     PAD_INTERVAL: gl.constexpr = 1024,
+    SLOT_U32: gl.constexpr = False,
+    KV_LDS_PAD: gl.constexpr = 0,
+    UNPEEL: gl.constexpr = False,
+    # XCD count to remap program ids over (see _xcd_work); 0 keeps grid order.
+    XCD_REMAP: gl.constexpr = 0,
+    # fp8_dsv4_mla walk: gather a tile ahead (see _dsv4_segment)
+    DSV4_PREFETCH: gl.constexpr = False,
+    # Output epilogue (no SPLIT_K; else the reduce's): INV_ROPE un-rotates the
+    # trailing ROPE_DIM lanes (pos_ptr [C], cos_sin_ptr [P, ROPE_DIM] f32 cos | sin);
+    # OUT_MXFP8 stores e4m3 plus an E8M0 byte per 32 lanes (out_scale_ptr [C, H*S/32]).
+    pos_ptr=None,
+    cos_sin_ptr=None,
+    cs_stride: gl.constexpr = 0,
+    out_scale_ptr=None,
+    os_stride0: gl.constexpr = 0,
+    INV_ROPE: gl.constexpr = False,
+    OUT_MXFP8: gl.constexpr = False,
 ):
     """One program = (query, split, head-block). Two-loop: main (SWA) then
-    extra (top-k). NUM_SPLITS==1 writes the output directly; otherwise stores
-    un-normalized partials for the reduce kernel."""
+    extra (top-k). Without SPLIT_K it writes the output directly; otherwise it
+    stores un-normalized partials for the reduce kernel."""
     NUM_WARPS: gl.constexpr = gl.num_warps()
+    # Some segment takes _dsv4_segment (see _segment).
+    DSV4_WALK: gl.constexpr = MAIN_FMT == "fp8_dsv4_mla" or (
+        HAS_EXTRA and EXTRA_FMT == "fp8_dsv4_mla"
+    )
+    # Staged walks on 16x16x32: per-tensor fp8, and bf16 with the rope inside.
+    # Rope-appended rows with sentinels keep 16x16x16 up to 16 heads (register-bound).
+    # bf16 16x16x32 is gfx950's; gfx942 tops out at 16x16x16.
+    STAGED_K32: gl.constexpr = is_hip_cdna4() and (
+        (
+            MAIN_FMT == "fp8_scalar"
+            and ((not HAS_EXTRA) or EXTRA_FMT == "fp8_scalar")
+            and not (ROPE_SEPARATE and HAS_INVALID and BLOCK_M <= 16)
+        )
+        or (
+            MAIN_FMT == "bf16"
+            and not ROPE_SEPARATE
+            and ((not HAS_EXTRA) or EXTRA_FMT == "bf16")
+        )
+    )
     gl.static_assert(
         UNI_TILE or (MAIN_FMT != "fp8_scalar" and MAIN_FMT != "fp8_dsv32_mla"),
         "tensor/dsmla formats require UNI_TILE=1",
@@ -1821,9 +2345,21 @@ def _sparse_mla(
         "ASYNC_LDS requires FP8_MFMA + UNI_TILE, no -1 sentinels, one segment",
     )
     gl.static_assert(
-        not (FP8_MFMA and HAS_EXTRA),
-        "FP8_MFMA defers the V-side scale to the epilogue, so it needs one segment",
+        (not UNPEEL) or UNI_TILE,
+        "UNPEEL prefetches past the last tile, which only UNI_TILE's clamp keeps in range",
     )
+    gl.static_assert(
+        (not DSV4_WALK) or (UNI_TILE and not ASYNC_LDS and not FP8_MFMA),
+        "fp8_dsv4_mla takes the pipelined UNI_TILE walk (bf16 dots)",
+    )
+    gl.static_assert(
+        (not INV_ROPE) or (ROPE_DIM > 0 and not ROPE_SEPARATE),
+        "INV_ROPE needs the rope lanes inside the output row",
+    )
+    if SLOT_U32:
+        # No-op given the pitch guarantee; lets block * cs0 use a 24-bit multiply.
+        main_cs0 = main_cs0 & 0xFFFFFF
+        extra_cs0 = extra_cs0 & 0xFFFFFF
     # Row bases are block*cs0 + pos*TOK with runtime block/pos, so divisibility
     # analysis sees 1-byte alignment unless the driver vouches for cs0.
     if CS0_ALIGN > 1:
@@ -1831,9 +2367,12 @@ def _sparse_mla(
         extra_cs0 = gl.multiple_of(extra_cs0, CS0_ALIGN)
     # GRID_ORDER names the launch axes in grid-dim order; dim 0 varies fastest,
     # which decides XCD/L2 sharing.
-    query_idx = gl.program_id(GRID_ORDER.index("q"))
-    split_id = gl.program_id(GRID_ORDER.index("s"))
-    pid_h = gl.program_id(GRID_ORDER.index("h"))
+    if XCD_REMAP > 0:
+        query_idx, split_id, pid_h = _xcd_work(GRID_ORDER, XCD_REMAP, SPLIT_K)
+    else:
+        query_idx = gl.program_id(GRID_ORDER.index("q"))
+        split_id = gl.program_id(GRID_ORDER.index("s"))
+        pid_h = gl.program_id(GRID_ORDER.index("h"))
 
     cfg = Cfg(
         BLOCK_M,
@@ -1852,6 +2391,12 @@ def _sparse_mla(
         ASYNC_LDS,
         RELAXED_LOAD,
         PAD_INTERVAL,
+        SLOT_U32,
+        KV_LDS_PAD,
+        UNPEEL,
+        DSV4_WALK,
+        CS0_ALIGN >= 4,
+        STAGED_K32,
     )
     main_fmt = Fmt(
         cfg,
@@ -1923,7 +2468,13 @@ def _sparse_mla(
         # (nope and rope), so the fold below is one extra factor on qk_scale.
         E4M3_MAX: gl.constexpr = 448.0
         q_amax = gl.max(gl.max(gl.abs(q).to(gl.float32), axis=1), axis=0)
-    q_dot = gl.convert_layout(q, cfg.q_layout)
+    if cfg.Q_LDS:
+        q_dot = gl.allocate_shared_memory(
+            gl.bfloat16, [BLOCK_M, HEAD_SIZE], cfg.q_shared
+        )
+        q_dot.store(q.to(gl.bfloat16))
+    else:
+        q_dot = gl.convert_layout(q, cfg.q_layout)
     if ROPE_SEPARATE:
         offs_d_qr = gl.arange(0, ROPE_DIM, layout=gl.SliceLayout(0, cfg.blocked_q))
         qr_off = (
@@ -1943,8 +2494,9 @@ def _sparse_mla(
         # Nothing to quantize
         q_scale = gl.load(q_scl_ptr)
         if not FP8_MFMA:
-            # fp8 -> bf16 is exact (3 mantissa bits into 8)
-            q_dot = gl.convert_layout(q.to(gl.bfloat16), cfg.q_layout)
+            # fp8 -> bf16 is exact; Q_LDS stored it as bf16 already.
+            if not cfg.Q_LDS:
+                q_dot = gl.convert_layout(q.to(gl.bfloat16), cfg.q_layout)
             if ROPE_SEPARATE:
                 q_rope_dot = gl.convert_layout(q_rope.to(gl.bfloat16), cfg.q_layout)
             else:
@@ -1995,17 +2547,27 @@ def _sparse_mla(
         )
     else:
         rope_smem = kv_smem  # never read as the rope buffer in this geometry
+    # _dsv4_segment's row max / sum exchange.
+    if DSV4_WALK:
+        red_smem = gl.allocate_shared_memory(
+            gl.float32,
+            [2 * BLOCK_M, cfg.N_WARPS],
+            gl.SwizzledSharedLayout(vec=1, per_phase=1, max_phase=1, order=[1, 0]),
+        )
+    else:
+        red_smem = None
 
     # ADAPTIVE_SPLITS: the host split count is sized for batch averages; in a
     # ragged batch the surplus programs would each gather a mostly-masked tile
     # and write a full partial. Recompute from this query's own lengths and let
     # those programs write a neutral partial (m = -inf) and leave. The reduce
-    # skips them, so their part_acc never has to be written.
+    # skips them, so their part_acc never has to be written. Programs past
+    # num_splits, which pad the launch, leave the same way.
     if ADAPTIVE_SPLITS:
         m_tiles = (main_len + BLOCK_K - 1) // BLOCK_K
         e_tiles = (extra_len + BLOCK_K - 1) // BLOCK_K
         work_splits = gl.minimum(
-            gl.maximum(gl.maximum(m_tiles, e_tiles), 1), NUM_SPLITS
+            gl.maximum(gl.maximum(m_tiles, e_tiles), 1), num_splits
         )
         main_splits = gl.minimum(gl.maximum(m_tiles, 1), work_splits)
         if split_id >= work_splits:
@@ -2030,9 +2592,12 @@ def _sparse_mla(
                 mask=head_mask_pv,
             )
             return
+    elif SPLIT_K:
+        work_splits = num_splits
+        main_splits = main_num_splits
     else:
-        work_splits = NUM_SPLITS
-        main_splits = MAIN_SPLITS
+        work_splits = 1
+        main_splits = 1
 
     # main (SWA) segment
     main_seg = Seg(
@@ -2044,46 +2609,35 @@ def _sparse_mla(
         main_start,
         main_cs0,
         main_num_rows,
+        main_start,
     )
     main_chunk = (main_len + main_splits - 1) // main_splits
     main_lo = gl.minimum(split_id * main_chunk, main_len)
     main_hi = gl.minimum(main_lo + main_chunk, main_len)
-    if ASYNC_LDS:
-        m_i, l_i, acc = _async_segment(
-            cfg,
-            main_seg,
-            q_dot,
-            q_rope_dot,
-            main_lo,
-            main_hi,
-            m_i,
-            l_i,
-            acc,
-            head_mask_pv,
-            main_qk_scale,
-            main_v_scale,
-            kv_smem,
-            rope_smem,
-        )
-    else:
-        m_i, l_i, acc = _process_segment(
-            cfg,
-            main_seg,
-            q_dot,
-            q_rope_dot,
-            main_lo,
-            main_hi,
-            m_i,
-            l_i,
-            acc,
-            head_mask_pv,
-            main_qk_scale,
-            main_v_scale,
-            kv_smem,
-            rope_smem,
-        )
+    m_i, l_i, acc = _segment(
+        cfg,
+        main_seg,
+        q_dot,
+        q_rope_dot,
+        main_lo,
+        main_hi,
+        m_i,
+        l_i,
+        acc,
+        head_mask_pv,
+        main_qk_scale,
+        main_v_scale,
+        kv_smem,
+        rope_smem,
+        red_smem,
+        DSV4_PREFETCH,
+    )
 
     if HAS_EXTRA:
+        if FP8_MFMA:
+            # fp8 PV accumulates raw code points and the epilogue applies the extra
+            # segment's V scale: rebase the main segment's sum onto it (exact).
+            acc = acc * (main_v_scale / extra_v_scale)
         extra_seg = Seg(
             extra_fmt,
             extra_cache_ptr,
@@ -2093,11 +2647,12 @@ def _sparse_mla(
             extra_start,
             extra_cs0,
             extra_num_rows,
+            extra_start,
         )
         extra_chunk = (extra_len + work_splits - 1) // work_splits
         extra_lo = split_id * extra_chunk
         extra_hi = gl.minimum(extra_lo + extra_chunk, extra_len)
-        m_i, l_i, acc = _process_segment(
+        m_i, l_i, acc = _segment(
             cfg,
             extra_seg,
             q_dot,
@@ -2112,19 +2667,21 @@ def _sparse_mla(
             extra_v_scale,
             kv_smem,
             rope_smem,
+            red_smem,
+            DSV4_PREFETCH,
         )
 
     if FP8_MFMA:
         # The fp8 PV dot ran on raw code points, so the V-side scale comes off
         # here, once per program instead of once per tile. l is untouched, so
         # out = acc*s/l is what the bf16 path computes.
-        acc = acc * main_v_scale
+        acc = acc * (extra_v_scale if HAS_EXTRA else main_v_scale)
 
     # Move the row reductions into pv-slice space for output/partials.
     m_pv = gl.convert_layout(m_i, gl.SliceLayout(1, cfg.pv_layout))
     l_pv = gl.convert_layout(l_i, gl.SliceLayout(1, cfg.pv_layout))
 
-    if NUM_SPLITS == 1:
+    if not SPLIT_K:
         if HAS_SINK:
             # m_pv is in the base-2 exponent domain; lift the sink into it.
             sink = (
@@ -2145,16 +2702,43 @@ def _sparse_mla(
             l_final = l_pv
         one_over_l = 1.0 / l_final
         out = acc * one_over_l[:, None]
-        offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
-        o_off = (
-            query_idx * out_stride0 + h_pv[:, None] * out_stride1 + offs_d_o[None, :]
-        ).to(gl.int32)
-        gl.amd.cdna4.buffer_store(
-            out.to(out_ptr.dtype.element_ty),
-            ptr=out_ptr,
-            offsets=o_off,
-            mask=head_mask_pv[:, None],
-        )
+        if INV_ROPE or OUT_MXFP8:
+            # The epilogue works on 32 consecutive lanes per thread, so lane pairs
+            # and scale groups stay in registers.
+            EPI_L: gl.constexpr = gl.BlockedLayout(
+                [1, 32], [16, 4], [NUM_WARPS // cfg.N_WARPS, cfg.N_WARPS], [1, 0]
+            )
+            _epilogue_store(
+                out,
+                out_ptr,
+                out_stride0,
+                out_stride1,
+                query_idx,
+                h_off,
+                num_heads,
+                EPI_L,
+                pos_ptr,
+                cos_sin_ptr,
+                cs_stride,
+                out_scale_ptr,
+                os_stride0,
+                ROPE_DIM,
+                INV_ROPE,
+                OUT_MXFP8,
+            )
+        else:
+            offs_d_o = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, cfg.pv_layout))
+            o_off = (
+                query_idx * out_stride0
+                + h_pv[:, None] * out_stride1
+                + offs_d_o[None, :]
+            ).to(gl.int32)
+            gl.amd.cdna4.buffer_store(
+                out.to(out_ptr.dtype.element_ty),
+                ptr=out_ptr,
+                offsets=o_off,
+                mask=head_mask_pv[:, None],
+            )
         if HAS_LSE:
             # m is base-2, so sum_j exp(s_j) = 2^m * l and ln of it is
             # (m + log2 l) * ln2. A fully masked row keeps -inf, not NaN.
@@ -2195,6 +2779,11 @@ def _sparse_mla(
         )
 
 
+@gluon.constexpr_function
+def _next_pow2(n):
+    return 1 << (n - 1).bit_length()
+
+
 _sparse_mla_reduce_repr = make_kernel_repr(
     "_sparse_mla_reduce",
     ["BLOCK_M", "HEAD_SIZE", "NUM_SPLITS"],
@@ -2224,6 +2813,15 @@ def _sparse_mla_reduce(
     ADAPTIVE_SPLITS: gl.constexpr,
     lse_ptr=None,
     HAS_LSE: gl.constexpr = False,
+    # Output epilogue, as in _sparse_mla
+    pos_ptr=None,
+    cos_sin_ptr=None,
+    cs_stride: gl.constexpr = 0,
+    out_scale_ptr=None,
+    os_stride0: gl.constexpr = 0,
+    ROPE_DIM: gl.constexpr = 0,
+    INV_ROPE: gl.constexpr = False,
+    OUT_MXFP8: gl.constexpr = False,
 ):
     """Split-KV combine: merge per-split partials, fold the sink, write the
     output. Identical for both geometries (partials are HEAD_SIZE = V wide).
@@ -2235,106 +2833,100 @@ def _sparse_mla_reduce(
     query_idx = gl.program_id(0)
     pid_h = gl.program_id(1)
 
-    # Lay the 64 lanes out so a small BLOCK_M spends them on the head dim.
-    TPW0: gl.constexpr = min(8, BLOCK_M)
-    TPW1: gl.constexpr = 64 // TPW0
-    BLK: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[TPW0, TPW1],
+    # Splits run along dim 0 of one [SPLITS_PAD, HEAD_SIZE] tile, so every
+    # split's partial is loaded at once and summed across lanes: one memory
+    # round trip per head, where walking the splits paid one per split.
+    SPLITS_PAD: gl.constexpr = _next_pow2(NUM_SPLITS)
+    TS: gl.constexpr = min(8, SPLITS_PAD)
+    TILE: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[SPLITS_PAD // TS, 8],
+        threads_per_warp=[TS, 64 // TS],
         warps_per_cta=[1, NUM_WARPS],
         order=[1, 0],
     )
-    row_l: gl.constexpr = gl.SliceLayout(1, BLK)  # [BLOCK_M]
-
-    h_off = pid_h * BLOCK_M
-    offs_m = gl.arange(0, BLOCK_M, layout=row_l)
-    h = h_off + offs_m
-    head_mask = h < num_heads
-    offs_d = gl.arange(0, HEAD_SIZE, layout=gl.SliceLayout(0, BLK))
+    split_l: gl.constexpr = gl.SliceLayout(1, TILE)  # [SPLITS_PAD]
+    dim_l: gl.constexpr = gl.SliceLayout(0, TILE)  # [HEAD_SIZE]
+    offs_s = gl.arange(0, SPLITS_PAD, layout=split_l)
+    offs_d = gl.arange(0, HEAD_SIZE, layout=dim_l)
+    split_ok = offs_s < NUM_SPLITS
 
     neg_inf = float("-inf")
-    # Deliberately NOT bounded by the per-query split count: that would make
-    # these dynamic loops and lose the static unroll
-    m_final = gl.full([BLOCK_M], neg_inf, gl.float32, layout=row_l)
-    # pass 1: global max over splits
-    for s in range(NUM_SPLITS):
-        base = query_idx * pm_stride0 + s * pm_stride_s
+    # The epilogue spreads the row over every lane: the summed tile repeats it
+    # on every split lane.
+    EPI_L: gl.constexpr = gl.BlockedLayout(
+        [1, max(2, HEAD_SIZE // (64 * NUM_WARPS))], [1, 64], [1, NUM_WARPS], [1, 0]
+    )
+    for mi in gl.static_range(BLOCK_M):
+        h = pid_h * BLOCK_M + mi
+        live = split_ok & (h < num_heads)
+        stat_off = query_idx * pm_stride0 + offs_s * pm_stride_s + h
         m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-        )
-        m_final = _max2(m_final, m_s)  # m_s already in base-2 exponent domain
-    if HAS_SINK:
-        sink = gl.amd.cdna4.buffer_load(
-            ptr=attn_sink_ptr,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-            cache=".cg",
-        ).to(gl.float32)
-        scaled_sink = sink * RCP_LN2
-        m_final = _max2(m_final, scaled_sink)  # lift sink to base-2
-
-    # pass 2: weighted sums
-    l_final = gl.zeros([BLOCK_M], gl.float32, layout=row_l)
-    acc = gl.zeros([BLOCK_M, HEAD_SIZE], gl.float32, layout=BLK)
-    for s in range(NUM_SPLITS):
-        base = query_idx * pm_stride0 + s * pm_stride_s
-        m_s = gl.amd.cdna4.buffer_load(
-            ptr=part_m_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=neg_inf,
-            cache=".cg",
+            ptr=part_m_ptr, offsets=stat_off, mask=live, other=neg_inf, cache=".cg"
         )
         l_s = gl.amd.cdna4.buffer_load(
-            ptr=part_l_ptr + base,
-            offsets=h,
-            mask=head_mask,
-            other=0.0,
-            cache=".cg",
+            ptr=part_l_ptr, offsets=stat_off, mask=live, other=0.0, cache=".cg"
         )
-        w = gl.exp2(m_s - m_final)
-        l_final = l_final + w * l_s
-        a_base = query_idx * pa_stride0 + s * pa_stride_s
-        a_off = (a_base + h[:, None] * pa_stride_h + offs_d[None, :]).to(gl.int32)
-        # split's part_acc can be uninitialized, so mask the load
-        if ADAPTIVE_SPLITS:
-            acc_mask = head_mask[:, None] & (m_s > neg_inf)[:, None]
-        else:
-            acc_mask = head_mask[:, None]
+        # Issued before the weights exist: nothing in the address depends on them.
+        a_off = (
+            query_idx * pa_stride0
+            + offs_s[:, None] * pa_stride_s
+            + h * pa_stride_h
+            + offs_d[None, :]
+        ).to(gl.int32)
         acc_s = gl.amd.cdna4.buffer_load(
             ptr=part_acc_ptr,
             offsets=a_off,
-            mask=acc_mask,
+            mask=live[:, None],
             other=0.0,
             cache=".cg",
         )
-        acc = acc + w[:, None] * acc_s.to(gl.float32)
 
-    if HAS_SINK:
-        l_final = l_final + gl.exp2(scaled_sink - m_final)
+        m_final = gl.max(m_s, axis=0)  # base-2 exponent domain
+        if HAS_SINK:
+            scaled_sink = gl.load(attn_sink_ptr + h).to(gl.float32) * RCP_LN2
+            m_final = _max2(m_final, scaled_sink)
+        # A split the adaptive count left unused keeps m = -inf and an
+        # uninitialized part_acc, so it must add exactly zero, not 0 * garbage.
+        used = m_s > neg_inf
+        w = gl.where(used, gl.exp2(m_s - m_final), 0.0)
+        l_final = gl.sum(w * l_s, axis=0)
+        if HAS_SINK:
+            l_final = l_final + gl.exp2(scaled_sink - m_final)
+        part = gl.where(used[:, None], w[:, None] * acc_s.to(gl.float32), 0.0)
+        acc = gl.sum(part, axis=0)
 
-    if HAS_LSE:
-        # Same base-2 -> natural conversion as the no-split epilogue.
-        gl.amd.cdna4.buffer_store(
-            (m_final + gl.log2(l_final)) * LN2,
-            ptr=lse_ptr + query_idx * num_heads,
-            offsets=h.to(gl.int32),
-            mask=head_mask,
-        )
-
-    # One reciprocal per row instead of a per-element f32 divide.
-    one_over_l = 1.0 / l_final
-    out = acc * one_over_l[:, None]
-    o_off = (query_idx * out_stride0 + h[:, None] * out_stride1 + offs_d[None, :]).to(
-        gl.int32
-    )
-    gl.amd.cdna4.buffer_store(
-        out.to(out_ptr.dtype.element_ty),
-        ptr=out_ptr,
-        offsets=o_off,
-        mask=head_mask[:, None],
-    )
+        if HAS_LSE:
+            gl.store(
+                lse_ptr + query_idx * num_heads + h,
+                (m_final + gl.log2(l_final)) * LN2,
+                mask=h < num_heads,
+            )
+        # One reciprocal per row instead of a per-element f32 divide.
+        out = acc * (1.0 / l_final)
+        if INV_ROPE or OUT_MXFP8:
+            _epilogue_store(
+                gl.expand_dims(out, 0),
+                out_ptr,
+                out_stride0,
+                out_stride1,
+                query_idx,
+                h,
+                num_heads,
+                EPI_L,
+                pos_ptr,
+                cos_sin_ptr,
+                cs_stride,
+                out_scale_ptr,
+                os_stride0,
+                ROPE_DIM,
+                INV_ROPE,
+                OUT_MXFP8,
+            )
+        else:
+            o_off = (query_idx * out_stride0 + h * out_stride1 + offs_d).to(gl.int32)
+            gl.amd.cdna4.buffer_store(
+                out.to(out_ptr.dtype.element_ty),
+                ptr=out_ptr,
+                offsets=o_off,
+                mask=(offs_d < HEAD_SIZE) & (h < num_heads),
+            )

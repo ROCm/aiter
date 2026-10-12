@@ -831,56 +831,34 @@ def mla_decode_stage1_asm_fwd(
 ) -> None: ...
 
 
-MD_NAME_V4 = "module_mla_v4_asm"
-
-
-@compile_ops(MD_NAME_V4, ffi_type="ctypes")
-def mla_decode_v4_asm(
-    # [total_query_len, num_heads, head_size]   FP8 packed Q + e8m0 scale region
-    Q: torch.Tensor,
-    # [total_query_len, num_heads, kv_rotary]   BF16
-    qrope: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, head_size]  FP8
-    KV: torch.Tensor,
-    # [num_page, page_size, num_kv_heads, kv_rotary]  BF16
-    kvrope: torch.Tensor,
-    # [num_seqs+1]
-    qo_indptr: torch.Tensor,
-    # [num_seqs+1]
-    kv_indptr: torch.Tensor,
-    # [num_page_used]
+@compile_ops(MD_NAME, ffi_type="ctypes")
+def mla_ps1_fp8_asm_fwd(
+    # [num_partials, num_heads, 512] fp32
+    split_data: torch.Tensor,
+    # [num_partials, num_heads] fp32
+    split_lse: torch.Tensor,
+    # [total_q, num_heads, 512] bf16
+    final_output: torch.Tensor,
+    # [total_q, num_heads] fp32; None skips the un-split rows' LSE
+    final_lse: torch.Tensor | None,
+    # [total_q, num_heads, 576] fp8
+    q: torch.Tensor,
+    # [num_pages, 1, 1, 576] fp8
+    kv_buffer: torch.Tensor,
     kv_page_indices: torch.Tensor,
-    # [num_seqs+1]
-    split_indptr: torch.Tensor,
-    # [num_heads] FP32 -- attention sink logit. Loaded by the kernel via
-    # kernarg slot 18 (byte offset 0x120). Caller must ALWAYS pass a real
-    # tensor; there is no nullable-sink convention on the C ABI. Pass
-    # torch.full((num_heads,), float("-inf")) for "no sink" math.
-    sink: torch.Tensor,
-    max_seqlen_q: int,
-    # ignored on v4 nm; kernel hardcodes 1/sqrt(kV4DimNope+kV4DimRope)=1/sqrt(512)
+    work_indptr: torch.Tensor,
+    work_info_set: torch.Tensor,
     softmax_scale: float,
-    # 0 = fp32 split-out path; 1 = bf16 nosplit reduce path
-    out_16_nosplit: int,
-    num_kv_splits: int,
-    # outputs
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, v_head_dim] FP32
-    splitData: torch.Tensor,
-    # [num_seqs, num_kv_splits, num_kv_heads, gqa*max_seqlen_q, 1]          FP32
-    splitLse: torch.Tensor,
-    # [total_query_len, num_heads, v_head_dim] BF16 (used when out_16_nosplit==1)
-    output: torch.Tensor,
-    # [num_seqs] int32 scratch for gfx1250 packed MLA kernels. Holds the
-    # per-request valid kv-split count the kernel writes (slot 19). Pass a
-    # real tensor when use_valid_split_count_reduce != 0; otherwise the
-    # kernel skips the write and nullptr is fine.
-    valid_split_count: torch.Tensor | None = None,
-    use_valid_split_count_reduce: int = 0,
-    # [num_seqs] int32. Unused on the v4 nm path (page_size=1 -> the kernel derives
-    # kv_seq_len from the token-level kv_indptr). Optional/nullable: None sends a
-    # nullptr; the host guards the deref (asm_mla_v4.cu) and the kernel never loads
-    # through it. Placed at the tail because it carries no data on this path.
-    kv_last_page_lens: torch.Tensor | None = None,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    max_seqlen_q: int,
+    causal: bool,
+    # round-robin CP only (cp_world_size > 1 and causal)
+    qo_indptr: torch.Tensor | None = None,
+    kv_indptr: torch.Tensor | None = None,
+    g_kv_indptr: torch.Tensor | None = None,
+    cp_world_size: int = 1,
+    cp_rank: int = 0,
 ) -> None: ...
 
 
@@ -1009,15 +987,24 @@ def get_ps_metadata_info_v1(
     num_head_k: int,
     max_qlen: int,
     qlen_granularity: int = 256,
+    total_qlen: int | None = None,
 ):
     """
+    Args:
+        total_qlen: Upper bound on the sum of query lengths over the batch of a
+            single call, e.g. the serving engine's token budget. None means
+            unknown, in which case every batch is assumed to carry max_qlen query
+            tokens.
     Returns:
         1. Shape of work_metadata_ptrs followed by its scalar type.
         2. Shape of work_indptr followed by its scalar type.
         3. Shape of work_info followed by its scalar type.
         4. Shape of reduce_indptr followed by its scalar type.
         5. Shape of reduce_final_map followed by its scalar type.
-        6. Shape of reduce_partial_map followed by its scalar type.
+        6. Shape of reduce_partial_map followed by its scalar type. Its entries
+           index a partial pool of reduce_partial_map_size * qlen_granularity
+           rows, so allocate the partial logits as (rows, num_head_q,
+           v_head_dim) and the partial lse as (rows, num_head_q).
     """
 
     device = torch.cuda.current_device()
@@ -1030,6 +1017,12 @@ def get_ps_metadata_info_v1(
     max_qo_split_per_batch = math.ceil(max_qlen / qlen_granularity)
 
     qo_tile_cnt = batch_size * max_qo_split_per_batch
+    if total_qlen is not None:
+        assert total_qlen > 0, "total_qlen must be positive, use None if unknown"
+        # sum_i ceil(qlen_i / g) <= ceil(sum_i qlen_i / g) + (batch_size - 1),
+        # since only the last tile of each batch is a partially filled one.
+        budget_qo_tile_cnt = math.ceil(total_qlen / qlen_granularity) + batch_size - 1
+        qo_tile_cnt = min(qo_tile_cnt, max(budget_qo_tile_cnt, max_qo_split_per_batch))
     # a work item is created either
     #   1. for every qo tile (no split)
     #   2. every split qo tile, which can be done at most #TG times in total
@@ -1159,7 +1152,7 @@ def get_mla_metadata_info_v1(
         6. Shape of reduce_partial_map followed by its scalar type.
     """
 
-    assert num_head_qo % 8 == 0
+    assert num_head_qo % 4 == 0
     max_splits = get_mla_decode_fwd_max_splits(
         num_head_qo, max_seqlen_qo, q_dtype, kv_dtype
     )
@@ -1234,17 +1227,35 @@ def get_mla_metadata_info_v1(
     ):
         max_qo_tiles_per_batch = math.ceil(packed_qo_len / 128)
     elif (
-        get_gfx() == "gfx950"
-        and (packed_qo_len >= 128 or num_head_qo > 64)
-        and kv_dtype == dtypes.bf16
-        and q_dtype == dtypes.bf16
-        and num_head_qo != 48
-    ) or (
-        get_gfx() == "gfx950"
-        and q_dtype == dtypes.fp8
-        and kv_dtype == dtypes.fp8
-        and num_head_qo == 96
-        and effective_seqlen_qo <= 6
+        (
+            get_gfx() == "gfx950"
+            and (packed_qo_len >= 128 or num_head_qo > 64)
+            and kv_dtype == dtypes.bf16
+            and q_dtype == dtypes.bf16
+            and num_head_qo != 48
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
+            and effective_seqlen_qo <= 6
+        )
+        or (
+            get_gfx() == "gfx950"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 12
+            and packed_qo_len <= 128
+            and fast_mode
+        )
+        or (
+            get_gfx() == "gfx1250"
+            and os.environ.get("AITER_MLA_DECODE_PS1_FLYDSL", "0") == "1"
+            and q_dtype == dtypes.fp8
+            and kv_dtype == dtypes.fp8
+            and num_head_qo == 96
+        )
     ):
         if num_head_qo * 2 > 128:
             max_qo_tiles_per_batch = effective_seqlen_qo
@@ -1669,6 +1680,13 @@ def decode_update_mla_metadata_v1(
             and kv_is_fp8
             and num_heads_per_head_k in (32, 64, 128)
             and max_seqlen_qo == 1
+        )
+        or (
+            arch_id == "gfx950"
+            and q_is_fp8
+            and kv_is_fp8
+            and num_heads_per_head_k == 12
+            and num_heads_per_head_k * max_seqlen_qo <= 128
         )
     )
     cu_num = work_indptr.shape[0] - 1

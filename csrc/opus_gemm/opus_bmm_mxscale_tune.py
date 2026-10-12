@@ -14,10 +14,11 @@ in both directions -- it hid kid326, which is really arbitrary-M, from every
 unaligned shape while the runtime dispatched it there anyway.
 
 Runtime schema (what the tuner emits, and what the runtime reads back):
-    gfx,b,m,n,k,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
-``aiter/ops/batched_gemm_op_a8w8.py:lookup_mxscale_bmm_config`` indexes on
-``["gfx","b","m","n","k"]``, dispatches to a backend on the winning row's
-``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
+    gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+``aiter/ops/opus/policy.py:lookup_mxscale_bmm_config`` indexes on
+``["gfx","b","m","n","k","w_scale_block"]`` (OPUS kernels read a 128x128
+w_scale, so every row this tuner writes is 128x128), dispatches to a backend
+on the winning row's ``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
 the batch-first ``opus_bmm`` entry, so
 those columns must match exactly.
 
@@ -206,6 +207,8 @@ SHIPPED_CSV = os.path.join(
     "dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
 )
 DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
+# The w_scale block every OPUS MXFP8 BMM kernel reads (a tuned-CSV key column).
+W_SCALE_BLOCK = "128x128"
 
 
 def _read_shape_csv(path):
@@ -356,7 +359,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
     }
 
-    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k"]
+    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "w_scale_block"]
     RESULTS: ClassVar[list[str]] = [
         "libtype",
         "kernelId",
@@ -380,7 +383,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             description="Tune opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a)",
         )
         # sort N before M like the GEMM tuners (cosmetic ordering of the CSV).
-        self.sort_keys = ["gfx", "b", "n", "m", "k"]
+        self.sort_keys = ["gfx", "b", "n", "m", "k", "w_scale_block"]
 
     # --- schema helpers -----------------------------------------------------
     def getKernelName(self, kernelId):
@@ -391,7 +394,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         info, time, _err = results
         if time == self.INVALID_TIME:
             return 0, 0
-        _gfx, b, m, n, k = info[0]
+        _gfx, b, m, n, k, _w_scale_block = info[0]
         us_s = time * 1e-6
         tflops = round(2 * b * m * n * k / us_s / 1e12, 1)
         # fp8 A + fp8 W + bf16 out.
@@ -509,10 +512,23 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
         shapes = _validate_tune_shapes(shapes)
 
         self.untunedf = pd.DataFrame(
-            [{"gfx": gfx, "b": g, "m": m, "n": n, "k": k} for (g, m, n, k) in shapes],
+            [
+                {
+                    "gfx": gfx,
+                    "b": g,
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "w_scale_block": W_SCALE_BLOCK,
+                }
+                for (g, m, n, k) in shapes
+            ],
             columns=self.keys,
         )
         self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+        if len(self.tunedf) and "w_scale_block" not in self.tunedf.columns:
+            # A tuned CSV from before the column holds only OPUS 128x128 rows.
+            self.tunedf = self.tunedf.assign(w_scale_block=W_SCALE_BLOCK)
 
         # Skip shapes already present in the tuned CSV (unless --all forces retune).
         if not args.all and len(self.tunedf) and len(self.untunedf):
@@ -680,7 +696,7 @@ class OpusBmmMxscaleTuner(GemmCommonTuner):
             m = int(untunedf.loc[i, "m"])
             n = int(untunedf.loc[i, "n"])
             k = int(untunedf.loc[i, "k"])
-            info_keys = (gfx, b, m, n, k)
+            info_keys = (gfx, b, m, n, k, W_SCALE_BLOCK)
 
             n_cand = 0
             for kid in _TUNE_POLICY:

@@ -10,7 +10,7 @@ import re
 import torch
 from torch import Tensor
 
-from .mxfp8_128_bpreshuffle_gemm_gfx1250 import BLOCK_K as SCALE_BLOCK_SIZE
+from .mxfp8_bpreshuffle_gemm_gfx1250 import BLOCK_K as SCALE_BLOCK_SIZE
 
 # Lazily bound flydsl symbols (kept out of import path when flydsl is absent).
 _launch_gemm_a8w8 = None
