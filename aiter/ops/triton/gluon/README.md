@@ -61,7 +61,7 @@ Some features (e.g., scheduling hints like `sched_barrier`) require the [AMD Glu
   <td><code>paged_attention_output_gate</code></td><td>Paged Attn<br>Decode<br>+ Gate<br>+ FP8 Quant</td><td>CDNA4</td>
   <td nowrap>Q: bf16 [T, H, 256]<br>KV: fp8_e4m3<br>Out: bf16 (+ optional fp8<br>and fp32 group scales)<br>PAGE_SIZE=1 (CSR<br>kv_indptr/kv_indices)<br>HEAD_DIM=256<br>nhead &le; 16<br>Per-tensor k_scale/v_scale<br>Two bodies, selected by<br>max_context &le; 32768</td>
   <td>python op_tests/op_benchmarks/<br>triton/bench_paged_attention_<br>output_gate.py \<br>--context 8192 --compare</td>
-  <td>~6.53<br>TB/s</td><td>&mdash;</td><td>&mdash;</td>
+  <td>~6.47<br>TB/s</td><td>&mdash;</td><td>&mdash;</td>
 </tr>
 </table>
 </small>
