@@ -36,7 +36,6 @@ from flydsl.expr import (
     range_constexpr,
 )
 from flydsl.expr import math as fxmath
-from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
 from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
 from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
@@ -89,17 +88,27 @@ def _neg_inf():
 
 
 def _exp2(x):
+    """Approximate ``v_exp_f32`` for the log2-space online softmax.
+
+    The running-max scale and the probabilities both use this intrinsic.
+    """
     return Float32(fx.rocdl.exp2(Float32.ir_type, Float32(x).ir_value()))
 
 
 def _ds_write2st64_b64(addr, data0, data1, offset0=0, offset1=16):
-    """Store two BF16x4 vectors in gfx950 LDS. Offsets are st64 units (512 B)."""
+    """Store two BF16x4 vectors with one gfx950 ``ds_write2st64_b64``.
+
+    Offsets are st64 units (512 B). Pinned FlyDSL has no atom for this
+    paired LDS write, so the instruction and its memory clobber stay raw.
+    Two scalar ``ds_store_b64`` would split the one base register this V
+    layout addresses.
+    """
     off = f"offset0:{offset0} offset1:{offset1}"
     if offset0 == 0:
         off = f"offset1:{offset1}"
     llvm.inline_asm(
         ir.Type.parse("!llvm.void"),
-        [as_mlir_value(addr), as_mlir_value(data0), as_mlir_value(data1)],
+        [addr.ir_value(), data0.ir_value(), data1.ir_value()],
         f"ds_write2st64_b64 $0, $1, $2 {off}\n",
         "v,v,v,~{memory}",
         has_side_effects=True,
@@ -554,7 +563,7 @@ def build_qsa_k2_module(
         def load_amd_k8(n_tok, d0):
             src = fx.make_view(k_arr.ptr + amd_k_off(n_tok, d0), fx.make_layout(8, 1))
             frag = fx.make_rmem_tensor(fx.make_layout(8, 1), BFloat16)
-            fx.copy_atom_call(lds_copy, src, frag)
+            fx.copy(lds_copy, src, frag)
             return fx.Vector(fx.memref_load_vec(frag))
 
         def store_amd_v4(elem_off, vec4):
@@ -564,7 +573,7 @@ def build_qsa_k2_module(
             )
             frag = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
             fx.memref_store_vec(vec4, frag)
-            fx.copy_atom_call(lds_copy64, frag, dst)
+            fx.copy(lds_copy64, frag, dst)
 
         req = token_to_req[row]
         valid_req = (req >= zero) & (req < n_req)
@@ -803,7 +812,7 @@ def build_qsa_k2_module(
                             fx.make_layout(8, 1), BFloat16
                         )
                         fx.memref_store_vec(k_vec, k_store_frag)
-                        fx.copy_atom_call(lds_copy, k_store_frag, k_dst)
+                        fx.copy(lds_copy, k_store_frag, k_dst)
                     else:
                         k_tile = make_k_lds_view(
                             k_arr,
@@ -895,7 +904,7 @@ def build_qsa_k2_module(
                     ng_rt = wave * Int32(qk_sub_per_wave) + Int32(ngl)
                     sc_frag = fx.make_rmem_tensor(score_layout, Float32)
                     fx.memref_store_vec(qk_local[ngl], sc_frag)
-                    fx.copy_atom_call(
+                    fx.copy(
                         score_copy,
                         sc_frag,
                         fx.make_view(
@@ -1017,7 +1026,7 @@ def build_qsa_k2_module(
                 qk_accs = []
                 for ng in range_constexpr(n_subtiles):
                     sc_frag = fx.make_rmem_tensor(score_layout, Float32)
-                    fx.copy_atom_call(
+                    fx.copy(
                         score_copy,
                         fx.make_view(
                             score_arr.ptr + Int32(ng * 256) + lane * Int32(4),
@@ -1133,7 +1142,7 @@ def build_qsa_k2_module(
                                 fx.make_layout(4, 1),
                             )
                             b_frag = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
-                            fx.copy_atom_call(pv_b_atom, src, b_frag)
+                            fx.copy(pv_b_atom, src, b_frag)
                             v_ops.append(b_frag)
                         else:
                             # ds_read_tr16 transposes a 16-lane x 4-bf16
@@ -1159,7 +1168,7 @@ def build_qsa_k2_module(
                                 k_arr.ptr + src_off, fx.make_layout(4, 1)
                             )
                             b_frag = fx.make_rmem_tensor(fx.make_layout(4, 1), BFloat16)
-                            fx.copy_atom_call(pv_b_atom, src, b_frag)
+                            fx.copy(pv_b_atom, src, b_frag)
                             v_ops.append(b_frag)
                     else:
                         v_ops.append(
