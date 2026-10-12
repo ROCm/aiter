@@ -639,13 +639,18 @@ def _mla_decode_fwd_kernel(
         acc,
         mask=query_mask_0[:, None] & query_mask_1[:, None],
     )
-    segm_offset = (
-        query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
-        + query_offset_1 * NUM_SEGMENTS_PER_SEQ
-        + segm_idx
-    )
-    tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
-    tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
+    # Same guard as the gfx1250 Gluon kernel. select_3d_config floors this
+    # branch at MIN_SEGMENTS >= 8 so one segment is unreachable from here
+    # today, but the aliasing is shared: at one segment the host hands both
+    # pointers the output buffer.
+    if NUM_SEGMENTS_PER_SEQ > 1:
+        segm_offset = (
+            query_offset_0.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+            + query_offset_1 * NUM_SEGMENTS_PER_SEQ
+            + segm_idx
+        )
+        tl.store(segm_max_ptr + segm_offset, M, mask=query_mask_0 & query_mask_1)
+        tl.store(segm_expsum_ptr + segm_offset, L, mask=query_mask_0 & query_mask_1)
 
 
 _mla_decode_fwd_reduce_kernel_repr = make_kernel_repr(

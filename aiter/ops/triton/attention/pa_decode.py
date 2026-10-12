@@ -7,6 +7,7 @@ import torch
 import triton
 
 from aiter.ops.triton._triton_kernels.attention.pa_decode import (
+    _get_dispatch_config,
     _paged_attn_decode_v1_w_dot_kernel,
     _paged_attn_decode_v1_w_dot_kernel_per_token_quant,
     _paged_attn_decode_v1_wo_dot_kernel,
@@ -29,6 +30,8 @@ _LOGGER = AiterTritonLogger()
 
 _SEQ_PARTITION_SIZE = 1024  # HIP
 
+_KV_DTYPE_NAMES = {torch.bfloat16: "bf16", torch.float16: "fp16"}
+
 
 def paged_attention_decode(
     output: torch.Tensor,  # [num_seqs, num_kv_heads*query_grp_sz, head_sz]
@@ -47,7 +50,10 @@ def paged_attention_decode(
 ) -> None:
     """
     Paged attention decode with automatic V1/V2 dispatch and quantization support.
-    V1 for short sequences (<=8192), V2 with sequence partitioning for longer sequences.
+
+    If the arch has a PA-DECODE config, bf16/fp16 caches with scalar scales use V1 only
+    up to ``v1_max_partitions`` partitions. Other cases use V1 up to 8192 tokens when
+    there is one partition or num_seqs * num_q_heads > 512, and V2 otherwise.
 
     Args:
         output (torch.Tensor): Pre-allocated output with shape (num_seqs, num_q_heads, head_dim).
@@ -70,7 +76,10 @@ def paged_attention_decode(
     """
 
     _LOGGER.info(
-        f"PA_DECODE: q={tuple(query.shape)} key_cache={tuple(key_cache.shape)} value_cache={tuple(value_cache.shape)}"
+        "PA_DECODE: q=%s key_cache=%s value_cache=%s",
+        tuple(query.shape),
+        tuple(key_cache.shape),
+        tuple(value_cache.shape),
     )
     # get num_seqs, num_kv_heads, kv_blk_sz, head_sz and query_grp_sz
     num_seqs = query.shape[0]
@@ -79,9 +88,15 @@ def paged_attention_decode(
 
     max_num_partitions = (max_seq_len + _SEQ_PARTITION_SIZE - 1) // _SEQ_PARTITION_SIZE
 
-    use_v1 = max_seq_len <= 8192 and (
-        max_num_partitions == 1 or num_seqs * num_q_heads > 512
-    )
+    dispatch = None
+    if k_scale.numel() == 1 and key_cache.dtype in _KV_DTYPE_NAMES:
+        dispatch = _get_dispatch_config(_KV_DTYPE_NAMES[key_cache.dtype])
+    if dispatch is not None:
+        use_v1 = max_num_partitions <= dispatch["v1_max_partitions"]
+    else:
+        use_v1 = max_seq_len <= 8192 and (
+            max_num_partitions == 1 or num_seqs * num_q_heads > 512
+        )
     if k_scale.numel() > 1:
         if use_v1:
             paged_attn_decode_v1_per_token_quant(
@@ -249,12 +264,8 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
-            # triton 3.8 inflated this GQA dot kernel to 202 VGPR (occ 3->2).
-            # Raising the VGPR budget to 256 (waves_per_eu=2) lets regalloc pipeline
-            # LDS reads deeper: s_waitcnt lgkmcnt(0) 72->50, s_nop 36->9, ~+42% on
-            # llama3 decode. NOTE: v2_w_dot is intentionally NOT changed -- there
-            # waves_per_eu=2 spills and regresses ~-15% on llama3-405B.
-            waves_per_eu=2,
+            waves_per_eu=3 if query_grp_sz > 1 else 0,
+            num_stages=1,
         )
 
 
@@ -542,10 +553,8 @@ def paged_attn_decode_v1_per_token_quant(
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
             KV_BLK_SZ_POW2=kv_blk_sz,
-            # Same VGPR-budget fix as the non-quant v1_w_dot path above: this is the
-            # identical GQA dot compute kernel (per-token FP8 scale loads only), so
-            # the occ 3->2 inflation and the waves_per_eu=2 recovery apply equally.
-            waves_per_eu=2,
+            waves_per_eu=3 if query_grp_sz > 1 else 0,
+            num_stages=1,
         )
 
 

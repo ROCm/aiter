@@ -50,8 +50,11 @@ def cat_and_cache_mla(
     - kv_cache: The output matrix with shape (B_max, KH, D1 + D2) (inplace).
     """
     _LOGGER.info(
-        f"CAT_AND_CACHE_MLA: k_nope={tuple(k_nope.shape)} k_pe={tuple(k_pe.shape)} "
-        + f"kv_cache={tuple(kv_cache.shape)} slot_mapping={tuple(slot_mapping.shape)}"
+        "CAT_AND_CACHE_MLA: k_nope=%s k_pe=%s kv_cache=%s slot_mapping=%s",
+        tuple(k_nope.shape),
+        tuple(k_pe.shape),
+        tuple(kv_cache.shape),
+        tuple(slot_mapping.shape),
     )
 
     b, kh, d_nope = k_nope.shape

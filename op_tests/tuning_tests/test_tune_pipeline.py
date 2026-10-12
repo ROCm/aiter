@@ -352,6 +352,20 @@ class TestTunePipeline(unittest.TestCase):
                 "keys": ["M", "N", "K"],
                 "timeout": 300,
             },
+            "a6w4_asm": {
+                "script": "csrc/gemm_a6w4/gemm_a6w4_tune.py",
+                "header": ["M", "N", "K"],
+                "shapes": [(512, 5120, 5120)],
+                "keys": ["M", "N", "K"],
+                "timeout": 300,
+            },
+            "a4w6_asm": {
+                "script": "csrc/gemm_a4w6/gemm_a4w6_tune.py",
+                "header": ["M", "N", "K"],
+                "shapes": [(512, 5120, 5120)],
+                "keys": ["M", "N", "K"],
+                "timeout": 300,
+            },
             "csrc_bf16": {
                 "script": "csrc/gemm_a16w16/gemm_a16w16_tune.py",
                 "header": [
@@ -575,6 +589,18 @@ class TestTunePipeline(unittest.TestCase):
 
     def test_a6w6_blockscale_mp_default(self):
         self._run_one("a6w6_blockscale", mp=None)
+
+    def test_a6w4_asm_mp1(self):
+        self._run_one("a6w4_asm", mp=1)
+
+    def test_a6w4_asm_mp_default(self):
+        self._run_one("a6w4_asm", mp=None)
+
+    def test_a4w6_asm_mp1(self):
+        self._run_one("a4w6_asm", mp=1)
+
+    def test_a4w6_asm_mp_default(self):
+        self._run_one("a4w6_asm", mp=None)
 
     def test_csrc_bf16_mp1(self):
         self._run_one("csrc_bf16", mp=1)

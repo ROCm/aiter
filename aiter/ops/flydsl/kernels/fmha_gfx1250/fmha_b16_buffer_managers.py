@@ -24,7 +24,6 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import rocdl
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -95,6 +94,14 @@ def _as_bases(ptr_lds):
 # scheduling mode); LLVM then inserts every dependency cover itself, so this file emits
 # only ordinary flydsl intrinsics in both modes. False -> mode 0.
 ENABLE_SCHED_MODE2 = True
+
+
+def _lds_ptr_b128(addr):
+    """A 16-byte-aligned byte pointer for one LDS b128 access."""
+    ptr_ty = fx.PointerType.get(
+        fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=_CHUNK_BYTES
+    )
+    return fx.inttoptr(ptr_ty, fx.Int32(addr))
 
 
 def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
@@ -646,8 +653,8 @@ class QManager16bV1:
             slot = tile % self.lds_tiles  # match global_load_ptrs ring slot
             lo = lds_q_base + self._lds_byte(row, klane, slot)
             hi = lds_q_base + self._lds_byte(row, klane + 2, slot)
-            ptrs.append(create_llvm_ptr(lo, address_space=3))
-            ptrs.append(create_llvm_ptr(hi, address_space=3))
+            ptrs.append(_lds_ptr_b128(lo))
+            ptrs.append(_lds_ptr_b128(hi))
         return ptrs
 
     def load_q_to_vgpr_part1(
@@ -720,8 +727,8 @@ class QManager16bV1:
             return v if scale_bf16 is None else v * scale_bf16
 
         def _read_tile(ds_ptrs, tile):
-            lo = fx.Vector(llvm_dialect.load(v8_ty, ds_ptrs[2 * tile]))
-            hi = fx.Vector(llvm_dialect.load(v8_ty, ds_ptrs[2 * tile + 1]))
+            lo = fx.ptr_load(ds_ptrs[2 * tile], result_type=v8_ty)
+            hi = fx.ptr_load(ds_ptrs[2 * tile + 1], result_type=v8_ty)
             return lo, hi
 
         if lds_tiles == k_tiles:
@@ -844,11 +851,10 @@ class KManager16bV1(_AsyncTransport):
         ``l%16``, d-byte ``(l//16)*16``. Every fragment ``(kv, dt, half)`` is its split's
         base plus a lane-independent compile-time immediate."""
         return [
-            create_llvm_ptr(
+            _lds_ptr_b128(
                 base
                 + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
-                + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES),
-                address_space=3,
+                + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
             )
             for base in _as_bases(ptr_lds)
         ]
@@ -887,8 +893,8 @@ class KManager16bV1(_AsyncTransport):
         base_idx, imm = self._ds_load_plan(len(base_ptrs), lds_imm_offset)[j]
         p = base_ptrs[base_idx]
         if imm:
-            p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
-        return fx.Vector(llvm_dialect.load(v8_ty, p))
+            p = fx.add_offset(p, imm)
+        return fx.ptr_load(p, result_type=v8_ty)
 
     def load_all_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all K ``ds_load_b128`` for the resident block, in ``_pv_qk_gemm``'s K
@@ -1151,20 +1157,16 @@ class QManager16bV2:
             + (lane % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base = create_llvm_ptr(lane_base, address_space=3)
+        base = _lds_ptr_b128(lane_base)
         q_frags_list = [[] for _ in range(self.q_tiles_per_wave)]
         for qt in range(self.q_tiles_per_wave):
             for tile in range(self.k_tiles):
                 imm_lo = qt * _WMMA_M * self.row_bytes + tile * _WMMA_K * _BF16_BYTES
                 imm_hi = imm_lo + _WMMA_M * _BF16_BYTES
-                p_lo = (
-                    base
-                    if imm_lo == 0
-                    else buffer_ops.get_element_ptr(base, static_byte_offset=imm_lo)
-                )
-                p_hi = buffer_ops.get_element_ptr(base, static_byte_offset=imm_hi)
-                lo = fx.Vector(llvm_dialect.load(v8_ty, p_lo))
-                hi = fx.Vector(llvm_dialect.load(v8_ty, p_hi))
+                p_lo = base if imm_lo == 0 else fx.add_offset(base, imm_lo)
+                p_hi = fx.add_offset(base, imm_hi)
+                lo = fx.ptr_load(p_lo, result_type=v8_ty)
+                hi = fx.ptr_load(p_hi, result_type=v8_ty)
                 frag = lo.shuffle(hi, list(range(16)))
                 q_frags_list[qt].append(
                     frag if scale_bf16 is None else frag * scale_bf16
@@ -1355,8 +1357,8 @@ class OManager16bV1:
                 d_col = d_half + fx.Int32(kk * _WMMA_M)  # slot-local column
                 bf = o_frags[k].to(self.elem_dtype)
                 addr = lds_warp + self._lds_byte(slot, q_st, d_col)
-                lds_ptr = create_llvm_ptr(addr, address_space=3)
-                llvm_dialect.store(_ir(bf), lds_ptr, alignment=_CHUNK_BYTES)
+                lds_ptr = _lds_ptr_b128(addr)
+                fx.ptr_store(_ir(bf), lds_ptr)
                 last = issued
                 issued += 1
             unit_last_store[u] = last
@@ -1376,8 +1378,8 @@ class OManager16bV1:
                 q_out = f // G  # q-row within this warp [0,16)
                 d_local = (f % G) * _CHUNK_ELEMS
                 addr = lds_warp + self._lds_byte(slot, q_out, d_local)
-                lds_ptr = create_llvm_ptr(addr, address_space=3)
-                data = fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
+                lds_ptr = _lds_ptr_b128(addr)
+                data = fx.ptr_load(lds_ptr, result_type=v8_ty)
                 loaded.append((data, q_out, d_local))
                 gidxs.append(issued)
                 issued += 1
@@ -1500,16 +1502,12 @@ class OManager16bV2:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base_ptr = create_llvm_ptr(lane_base, address_space=3)
+        base_ptr = _lds_ptr_b128(lane_base)
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)
             imm = k * _WMMA_M * _BF16_BYTES
-            p = (
-                base_ptr
-                if imm == 0
-                else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
-            )
-            llvm_dialect.store(_ir(bf), p, alignment=_CHUNK_BYTES)
+            p = base_ptr if imm == 0 else fx.add_offset(base_ptr, imm)
+            fx.ptr_store(_ir(bf), p)
         rocdl.s_wait_dscnt(0)  # drain b128 stores so the TDM read sees coherent LDS
 
         # (2) TDM store: private padded LDS tile -> global O (HW OOB drop on the seq axis).
@@ -1671,16 +1669,12 @@ class OManager16bV3:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base_ptr = create_llvm_ptr(lane_base, address_space=3)
+        base_ptr = _lds_ptr_b128(lane_base)
         ds_ops = []
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)  # cvt
             imm = k * _WMMA_M * _BF16_BYTES
-            p = (
-                base_ptr
-                if imm == 0
-                else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
-            )
+            p = base_ptr if imm == 0 else fx.add_offset(base_ptr, imm)
             ds_ops.append((bf, p))
         self._pending.append(ds_ops)
         if qtile == 0:
@@ -1706,7 +1700,7 @@ class OManager16bV3:
         rocdl.sched_barrier(0)
         for ds_ops in self._pending:
             for bf, p in ds_ops:
-                llvm_dialect.store(_ir(bf), p, alignment=_CHUNK_BYTES)
+                fx.ptr_store(_ir(bf), p)
         addrs, valid_rows = self._warp_addrs(
             self._warp_region, self._warp_base, **self._cfg
         )

@@ -4476,8 +4476,10 @@ def compile_mixed_moe_gemm2_common(
                                 & (fx.Uint32(t_pre) < fx.Uint32(tokens_i32_guard))
                                 & (s_pre < fx.Uint32(topk))
                             )
+                            # OOB under the output < 4 GiB - 1 MiB contract.
+                            # Reserve 64 KiB for columns without uint32 wrap.
                             stored_val = valid.select(
-                                fx.Int32(row_byte_off), fx.Int32(0x7FFF0000)
+                                fx.Int32(row_byte_off), fx.Int32(0xFFFF0000)
                             )
                         else:
                             stored_val = tid_val

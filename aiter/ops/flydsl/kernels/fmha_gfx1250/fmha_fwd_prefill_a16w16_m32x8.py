@@ -52,7 +52,7 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 from aiter.jit.utils.chip_info import get_cu_num, get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from ..kernels_common import LOG2E, create_llvm_ptr
+from ..kernels_common import LOG2E
 from ..tensor_shim import _run_compiled
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
@@ -276,11 +276,7 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     """Load this lane's per-head sink logit from the 1-D fp32 ``sink[num_heads_q]`` — one
     extra ``exp(sink)`` term in the softmax denominator, in the scaled-score domain."""
     del num_heads_q  # in-bounds by construction; no buffer bounds check needed
-    sink_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_sink)))
-    byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
-    addr = sink_base_i64 + byte_off
-    gptr = create_llvm_ptr(addr, address_space=1)
-    return fx.Float32(llvm_dialect.load(T.f32, gptr))
+    return fx.Float32(fx.ptr_load(fx.get_iter(ptr_sink) + fx.Int64(q_head_idx)))
 
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx, num_q_tiles_per_wave):
@@ -529,10 +525,10 @@ def _softmax(
     _defer = ENABLE_DEFER_RESCALE and RESCALE_THRESHOLD >= 0.0
 
     def fmax(a, b):
-        return fx.Float32(arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fast).result)
+        return fx.maxnumf(a, b, fastmath=fast)
 
     def fadd(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=fast))
+        return a.addf(b, fastmath=fast)
 
     # fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the
     # sum tree back into a serial chain (max survives — Reassociate ignores maxnum).
@@ -547,19 +543,21 @@ def _softmax(
     )
 
     def fadd_t(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=_no_reassoc))
+        return a.addf(b, fastmath=_no_reassoc)
 
     def fsub(a, b):
-        return fx.Float32(arith.subf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a - b
 
     def fmul(a, b):
-        return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a * b
 
     def fsub_inf(a, b):  # masked s is -inf and must stay -inf: no ninf fast-math here
         return fx.Float32(arith.subf(_raw(a), _raw(b)))
 
     def exp2(x):
-        return fx.Float32(rocdl.exp2(f32, _raw(x)))
+        return fx.exp2(x, fastmath="afn")
 
     # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
     sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))

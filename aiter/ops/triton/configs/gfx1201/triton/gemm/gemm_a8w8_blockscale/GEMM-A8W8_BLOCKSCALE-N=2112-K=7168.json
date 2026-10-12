@@ -9,8 +9,7 @@
         "waves_per_eu": 4,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
-        "NUM_KSPLIT": 4,
-        "kpack": 2
+        "NUM_KSPLIT": 4
     },
     "M_LEQ_8": {
         "BLOCK_SIZE_M": 16,
@@ -22,8 +21,7 @@
         "waves_per_eu": 4,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_16": {
         "BLOCK_SIZE_M": 16,
@@ -34,8 +32,7 @@
         "num_stages": 2,
         "waves_per_eu": 2,
         "cache_modifier": ".cg",
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_32": {
         "BLOCK_SIZE_M": 32,
@@ -47,8 +44,7 @@
         "waves_per_eu": 8,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_64": {
         "BLOCK_SIZE_M": 64,
@@ -60,8 +56,7 @@
         "waves_per_eu": 8,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_128": {
         "BLOCK_SIZE_M": 64,
@@ -73,8 +68,7 @@
         "waves_per_eu": 8,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_256": {
         "BLOCK_SIZE_M": 128,
@@ -86,8 +80,7 @@
         "waves_per_eu": 6,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": ".cg",
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     },
     "M_LEQ_512": {
         "BLOCK_SIZE_M": 64,
@@ -99,8 +92,7 @@
         "waves_per_eu": 4,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     },
     "any": {
         "BLOCK_SIZE_M": 128,
@@ -112,7 +104,6 @@
         "waves_per_eu": 6,
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
-        "NUM_KSPLIT": 1,
-        "kpack": 2
+        "NUM_KSPLIT": 1
     }
 }

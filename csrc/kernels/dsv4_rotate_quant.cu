@@ -529,7 +529,8 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                                         const int32_t stride,
                                                                         const int32_t out_stride,
                                                                         const bool shuffle_scale,
-                                                                        const int32_t group_size)
+                                                                        const int32_t group_size,
+                                                                        const bool round_rope)
 {
     constexpr int warp_size = opus::get_warp_size();
     static_assert(vec_size * warp_size % dim == 0, "vec_size * warp_size must be divisible by dim");
@@ -581,6 +582,13 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
             const float s  = static_cast<float>(s_vec[i]);
             af[even]       = x * c - y * s;
             af[odd]        = y * c + x * s;
+            // round_rope: the rotated value as the input dtype holds it, as a
+            // RoPE that writes its output back (a bf16 model's) leaves it
+            if(round_rope)
+            {
+                af[even] = static_cast<float>(static_cast<DTYPE_I>(af[even]));
+                af[odd]  = static_cast<float>(static_cast<DTYPE_I>(af[odd]));
+            }
         }
     }
     else
@@ -703,7 +711,7 @@ __global__ void rope_hadamard_rotate_activation_fp4quant_kernel(DTYPE_O* __restr
                                                         reinterpret_cast<DTYPE_I const*>(cos.data_ptr()), \
                                                         reinterpret_cast<DTYPE_I const*>(sin.data_ptr()), \
                                                         reinterpret_cast<int64_t const*>(positions.data_ptr()), \
-                                                        m, head_num, rope_dim, stride, out_stride, shuffle_scale, group_size); \
+                                                        m, head_num, rope_dim, stride, out_stride, shuffle_scale, group_size, round_rope); \
                                             });
 
 #define ROPE_ROTATE_ACTIVATION_FP4QUANT_KERNEL_IMPL(dim, fp4quant, vec_size, name) \
@@ -722,7 +730,8 @@ void rope_rotate_activation_fp4quant(aiter_tensor_t& out,
                                      const int32_t rope_dim,
                                      const int32_t group_size,
                                      const bool shuffle_scale,
-                                     const bool do_rotate_act)
+                                     const bool do_rotate_act,
+                                     const bool round_rope)
 {
     AITER_CHECK(group_size > 0 && (group_size & (group_size - 1)) == 0,
                 "group_size must be a power of 2");
@@ -817,6 +826,8 @@ void rope_rotate_activation(aiter_tensor_t& out,
                             const int32_t rope_dim,
                             const bool do_rotate_act)
 {
+    // the output is the input dtype: stored, it is rounded there anyway
+    const bool round_rope = false;
     AITER_CHECK(input.dim() >= 2, "input must have at least 2 dims [..., head_num, dim]");
     AITER_CHECK(out.numel() == input.numel(), "input and out must have the same numel");
     AITER_CHECK(out.dtype() == input.dtype(), "input and out dtype must be the same");
