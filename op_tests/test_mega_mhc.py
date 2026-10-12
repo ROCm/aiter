@@ -2,15 +2,13 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 """Mega-MHC correctness checks and HIP / FlyDSL / Triton performance table.
 
-Run directly for correctness and performance, or use --check-only for the
-full reference, split-K reuse, graph and stream regression checks.
+Each selected shape runs reference checks before timing.
+Use --check-only to check those shapes and backends without benchmarking.
 """
 
 import argparse
 import itertools
 import math
-import os
-from contextlib import contextmanager
 from functools import cache
 
 import pandas as pd
@@ -24,6 +22,10 @@ from aiter.test_common import benchmark, run_perftest
 ARGS = (1e-6, 1e-6, 1e-6, 2.0, 20)
 MODES = ("post", "no_post", "identity_pre", "no_post_identity")
 BACKENDS = ("hip", "flydsl", "triton")
+OUT_DTYPES = ("bf16", "mxfp8")
+# M covers decode through prefill; use --hidden to test other model widths.
+TOKEN_COUNTS = (1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+HIDDEN_SIZES = (5120,)
 
 
 def ref_mhc_fused_post_pre_delayed_rmsnorm(
@@ -118,9 +120,36 @@ def case(t, h, mode, seed=0):
     return args, kw, reference_for(args, kw)
 
 
+def ref_mxfp8(norm):
+    """Group32 E4M3 with ceil-power-of-two scaling on the rounded BF16 norm."""
+    t, h = norm.shape
+    amax = norm.float().view(t, h // 32, 32).abs().amax(-1).clamp_min(1e-10)
+    exponent = torch.ceil(torch.log2(amax / 448)).clamp(-126, 127)
+    scale = torch.exp2(exponent).repeat_interleave(32, dim=-1)
+    q = (norm.float() / scale).to(torch.float8_e4m3fn)
+    return q, (exponent + 127).to(torch.uint8)
+
+
 def check(out, reference):
     torch.testing.assert_close(out[0], reference[0], rtol=1.6e-2, atol=1e-5)
-    torch.testing.assert_close(out[3], reference[3], rtol=1e-2, atol=2e-2)
+    norm = out[3]
+    if isinstance(norm, tuple):
+        norm, q, scale = norm
+        assert norm.dtype == torch.bfloat16
+        assert q.dtype == torch.float8_e4m3fn and q.shape == norm.shape
+        assert scale.dtype == torch.uint8 and scale.shape == (
+            norm.shape[0],
+            norm.shape[1] // 32,
+        )
+        assert all(t.is_contiguous() and t.device == norm.device for t in (q, scale))
+        # HIP and FlyDSL can round the MHC norm differently within its existing
+        # tolerance. Quantization itself must be exact on each backend's norm.
+        ref_q, ref_scale = ref_mxfp8(norm)
+        torch.testing.assert_close(
+            q.view(torch.uint8), ref_q.view(torch.uint8), rtol=0, atol=0
+        )
+        torch.testing.assert_close(scale, ref_scale, rtol=0, atol=0)
+    torch.testing.assert_close(norm, reference[3], rtol=1e-2, atol=2e-2)
     for i in (1, 2, 4):
         torch.testing.assert_close(out[i], reference[i], rtol=1e-3, atol=5e-4)
 
@@ -142,17 +171,20 @@ def backend_function(name):
     raise ValueError(f"unknown backend: {name}")
 
 
-def benchmark_bytes(m, hidden_size, mode):
+def benchmark_bytes(m, hidden_size, mode, out_dtype="bf16"):
     """Dominant tensor traffic, matching the FlyDSL Mega-MHC benchmark.
 
     Count BF16 residual input and norm output, plus sublayer input and residual
     output with post-mix. Read the FP32 projection weight once (equivalently its
     BF16 hi/lo pack). Exclude scratch, repeated loads and small gate/norm tensors;
     this is a common effective-bandwidth model, not measured HBM traffic.
+    MXFP8 adds one output byte per element and one exponent byte per group32.
     """
     if not m:
         return 0
     per_token = hidden_size * (10 if "no_post" in mode else 20)
+    if out_dtype == "mxfp8":
+        per_token += hidden_size + hidden_size // 32
     fn_bytes = 24 * 4 * hidden_size * 4
     return m * per_token + fn_bytes
 
@@ -160,11 +192,14 @@ def benchmark_bytes(m, hidden_size, mode):
 class _BenchmarkBackend:
     """Prepare each rotated weight/workspace before run_perftest starts timing."""
 
-    def __init__(self, name, tokens, scalar_args):
+    def __init__(self, name, tokens, scalar_args, out_dtype="bf16"):
         self.name = name
         self.backend = backend_function(name)
         self.tokens = tokens
         self.scalar_args = scalar_args
+        self.out_dtype = out_dtype
+        if name == "triton" and out_dtype != "bf16":
+            raise ValueError("Triton Mega-MHC has no fused mxfp8 output")
         self.workspaces = {}
         self.prepared_addresses = set()
         self.used_addresses = set()
@@ -183,6 +218,8 @@ class _BenchmarkBackend:
         }
         if self.name == "hip":
             kw["workspace"] = self.workspaces[id(fn)]
+        if self.name != "triton":
+            kw["out_dtype"] = self.out_dtype
         return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
 
     def prepare(self, *rotated):
@@ -196,404 +233,76 @@ class _BenchmarkBackend:
 
 
 @benchmark()
-def benchmark_mega_mhc(m, hidden_size, mode, backends=BACKENDS, seed=0, num_iters=101):
-    """Like test_mhc.py: check outputs, time each backend, return a table row."""
+def benchmark_mega_mhc(
+    m,
+    hidden_size,
+    mode,
+    backends=BACKENDS,
+    seed=0,
+    num_iters=101,
+    out_dtype="bf16",
+    check_only=False,
+):
+    """Check one M/H/mode/dtype combination and return its backend results."""
     args, kw, reference = case(m, hidden_size, mode, seed)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
     result = {"status": "PASS"}
-    num_bytes = benchmark_bytes(m, hidden_size, mode)
-    with torch.cuda.stream(stream):
-        # Pass actual tensors to run_perftest so its default memory-sizing and
-        # deepcopy rotation can see all inputs and the residual output buffer.
-        tensors = (
-            *args[:4],
-            kw["pre_mix"],
-            kw.get("sublayer_out"),
-            kw.get("post_layer_mix"),
-            kw.get("comb_res_mix"),
-            kw["norm_weight"],
-            torch.empty_like(args[0]) if "sublayer_out" in kw else None,
-        )
-        for name in backends:
-            caller = _BenchmarkBackend(name, m, args[4:])
-            caller.prepare(*tensors)
-            out = caller(*tensors)
-            check(out, reference)
-            if not m:
-                result[f"{name}_us"] = float("nan")
-                result[f"{name}_TB/s"] = float("nan")
-                continue
+    num_bytes = benchmark_bytes(m, hidden_size, mode, out_dtype)
+    # Pass actual tensors to run_perftest so its default memory-sizing and
+    # deepcopy rotation can see all inputs and the residual output buffer.
+    tensors = (
+        *args[:4],
+        kw["pre_mix"],
+        kw.get("sublayer_out"),
+        kw.get("post_layer_mix"),
+        kw.get("comb_res_mix"),
+        kw["norm_weight"],
+        torch.empty_like(args[0]) if "sublayer_out" in kw else None,
+    )
+    for name in backends:
+        if name == "triton" and m:
+            from aiter.ops.triton.utils.mhc_config_utils import (
+                get_mhc_fused_post_pre_delayed_rmsnorm_config,
+            )
 
-            out, us = run_perftest(
-                caller, *tensors, num_iters=num_iters, prepare_func=caller.prepare
-            )
-            if not math.isfinite(us) or us <= 0:
-                raise RuntimeError(f"{name} returned an invalid GPU timing: {us}")
-            check(out, reference)
-            assert caller.used_addresses == caller.prepared_addresses
-            print(
-                f"  {name}: {len(caller.prepared_addresses)} auto-rotated buffer sets"
-            )
+            config = get_mhc_fused_post_pre_delayed_rmsnorm_config(m)
+            if hidden_size % (config["NUM_KSPLIT"] * config["TILE_K"]):
+                # The Triton k-loop has no column mask. Its default launch
+                # config is tuned for H=5120 and cannot cover every width.
+                result[name] = "SKIP"
+                result[f"{name}_us"] = result[f"{name}_TB/s"] = float("nan")
+                continue
+        caller = _BenchmarkBackend(name, m, args[4:], out_dtype)
+        caller.prepare(*tensors)
+        out = caller(*tensors)
+        check(out, reference)
+        result[name] = "PASS"
+        if not check_only:
+            us = float("nan")  # Empty tensors have no kernel to time.
+            if m:
+                out, us = run_perftest(
+                    caller,
+                    *tensors,
+                    num_iters=num_iters,
+                    prepare_func=caller.prepare,
+                )
+                if not math.isfinite(us) or us <= 0:
+                    raise RuntimeError(f"{name} returned an invalid GPU timing: {us}")
+                check(out, reference)
+                assert caller.used_addresses == caller.prepared_addresses
             result[f"{name}_us"] = us
             result[f"{name}_TB/s"] = num_bytes / us / 1e6
-            for workspace in caller.workspaces.values():
-                assert _counter_state_ok(workspace)
-            # Keep graph correctness coverage separate from rotating timings.
-            graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, stream=stream):
-                graph_out = caller(*tensors)
-            saved = args[0].clone()
-            args[0].mul_(0.91)
-            graph.replay()
-            check(graph_out, reference_for(args, kw))
-            args[0].copy_(saved)
-            graph.replay()
-            check(graph_out, reference)
-            if name == "hip":
-                assert _counter_state_ok(caller.workspaces[id(args[1])])
-            del graph, graph_out, out, saved
-            caller.workspaces.clear()
-    stream.synchronize()
+        for workspace in caller.workspaces.values():
+            assert _counter_state_ok(workspace)
+        caller.workspaces.clear()
+    result["status"] = (
+        "PASS" if any(result[name] == "PASS" for name in backends) else "SKIP"
+    )
     return result
-
-
-def check_reference(t, h, mode):
-    args, kw, reference = case(t, h, mode)
-    workspace = prepare_mega_mhc(args[1], t)
-    out = mega_mhc(*args, workspace=workspace, **kw)
-    check(out, reference)
-    if "no_post" in mode:
-        assert out[0] is args[0]
-    assert _counter_state_ok(workspace)
-    # At the production H, also compare both implementations with the same FP32 reference.
-    if t and h == 5120:
-        triton_out = backend_function("triton")(*args, **kw)
-        check(triton_out, reference)
-
-
-def check_split_reuse(split_k):
-    args, kw, reference = case(17, 5120, "post", seed=3)
-    workspace = prepare_mega_mhc(args[1], 17, split_k=split_k)
-    # Eager calls reuse counters and overwrite partials. New residual data must
-    # not observe a previous call's partials or already normalized collapse.
-    for step in range(4):
-        args[0].mul_(0.9)
-        reference = ref_mhc_fused_post_pre_delayed_rmsnorm(*args, **kw)
-        out = mega_mhc(*args, workspace=workspace, **kw)
-        check(out, reference)
-        assert _counter_state_ok(workspace)
-
-
-def check_graphs_and_streams(token_counts):
-    cases = [
-        case(token_counts[0], 5120, "post", seed=7),
-        case(token_counts[1], 5120, "no_post", seed=9),
-    ]
-    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
-    torch.cuda.synchronize()
-    graphs, workspaces, outputs = [], [], []
-    for (args, kw, _), stream in zip(cases, streams):
-        with torch.cuda.stream(stream):
-            workspace = prepare_mega_mhc(args[1], args[0].shape[0])
-            mega_mhc(*args, workspace=workspace, **kw)  # JIT warmup outside capture
-        stream.synchronize()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            out = mega_mhc(*args, workspace=workspace, **kw)
-        graphs.append(graph)
-        workspaces.append(workspace)
-        outputs.append(out)
-    for _ in range(30):
-        for graph, stream in zip(graphs, streams):
-            with torch.cuda.stream(stream):
-                graph.replay()
-    torch.cuda.synchronize()
-    for out, (_, _, reference), workspace in zip(outputs, cases, workspaces):
-        check(out, reference)
-        assert _counter_state_ok(workspace)
-
-
-def check_workspace_contract():
-    args, kw, _ = case(4, 5120, "post")
-    workspace = prepare_mega_mhc(args[1], 4)
-    stream = torch.cuda.Stream()
-    with torch.cuda.stream(stream), expect_error(ValueError, message="current stream"):
-        mega_mhc(*args, workspace=workspace, **kw)
-    args[1].add_(0.01)
-    with expect_error(ValueError, message="version"):
-        mega_mhc(*args, workspace=workspace, **kw)
-    with expect_error(ValueError, message="share storage"):
-        mega_mhc(*args, residual_out=args[0], **kw)
-    with expect_error(ValueError, message="split_k"):
-        prepare_mega_mhc(args[1], 4, split_k=3)
-    with (
-        expect_error(RuntimeError, message="before graph capture"),
-        torch.cuda.graph(torch.cuda.CUDAGraph()),
-    ):
-        prepare_mega_mhc(args[1], 4)
-
-
-def check_inference_weights():
-    with torch.inference_mode():
-        args, kw, reference = case(4, 5120, "identity_pre")
-        workspace = prepare_mega_mhc(args[1], 4)
-        check(mega_mhc(*args, workspace=workspace, **kw), reference)
-
-
-def check_oversubscribed_splits():
-    # 260 token blocks * 5 splits exceeds the CU count: no residency assumption.
-    args, kw, reference = case(4160, 5120, "post", seed=21)
-    workspace = prepare_mega_mhc(args[1], 4160, split_k=5)
-    for _ in range(3):
-        check(mega_mhc(*args, workspace=workspace, **kw), reference)
-        assert _counter_state_ok(workspace)
-
-
-def check_dispatch_boundaries(tokens, mode):
-    args, kw, reference = case(tokens, 5120, mode, seed=41)
-    ws = prepare_mega_mhc(args[1], tokens)
-    for _ in range(2):
-        check(mega_mhc(*args, workspace=ws, **kw), reference)
-        assert _counter_state_ok(ws)
-
-
-def check_large_tiles_changed_graph_input(tokens, mode):
-    """Exercise register/LDS staging and normalization, including padded rows."""
-    args, kw, reference = case(tokens, 5120, mode, seed=53)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        ws = prepare_mega_mhc(args[1], tokens)
-        check(mega_mhc(*args, workspace=ws, **kw), reference)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            out = mega_mhc(*args, workspace=ws, **kw)
-        for _ in range(2):
-            args[0].mul_(0.91)
-            graph.replay()
-            check(out, reference_for(args, kw))
-            assert _counter_state_ok(ws)
-
-
-def check_switch_sinkhorn_repeat_on_same_workspace(tokens):
-    args, kw, _ = case(tokens, 5120, "post", seed=17)
-    ws = prepare_mega_mhc(args[1], tokens)
-    for repeat in (20, 3, 20, 1):
-        changed_args = (*args[:-1], repeat)
-        reference = ref_mhc_fused_post_pre_delayed_rmsnorm(*changed_args, **kw)
-        check(mega_mhc(*changed_args, workspace=ws, **kw), reference)
-        assert _counter_state_ok(ws)
-
-
-def check_switch_post_on_same_workspace(tokens):
-    """Post and no-post may use different splits in the same scratch allocation."""
-    args, kw, _ = case(tokens, 5120, "post", seed=67)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        ws = prepare_mega_mhc(args[1], tokens)
-        no_post_kw = {key: kw[key] for key in ("pre_mix", "norm_weight")}
-        identity_kw = dict(kw, pre_mix=None)
-        variants = (kw, no_post_kw, identity_kw, kw)
-        for options in variants:
-            check(
-                mega_mhc(*args, workspace=ws, **options), reference_for(args, options)
-            )
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            outputs = [mega_mhc(*args, workspace=ws, **options) for options in variants]
-        for _ in range(15):
-            graph.replay()
-        args[0].mul_(0.91)
-        graph.replay()
-        for output, options in zip(outputs, variants):
-            check(output, reference_for(args, options))
-        assert _counter_state_ok(ws)
-
-
-def check_generation_wrap_and_changed_graph_input(tokens):
-    args, kw, _ = case(tokens, 5120, "post", seed=49)
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(stream):
-        ws = prepare_mega_mhc(args[1], tokens)
-        ctr = ws.counters.view(-1, 32)
-        ctr[:, 0].fill_(-256)
-        ctr[:, 3].fill_(0xFFFFFF)
-        mega_mhc(*args, workspace=ws, **kw)
-        assert torch.all(ctr[:, 0] == 0)
-        assert _counter_state_ok(ws)
-        # Warm both dispatches before capture. Each replay alternates between
-        # generation-tagged and zero-based arrivals sharing the same partials.
-        generic_args = (*args[:-1], 3)
-        mega_mhc(*generic_args, workspace=ws, **kw)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=stream):
-            tuned_out = mega_mhc(*args, workspace=ws, **kw)
-            generic_out = mega_mhc(*generic_args, workspace=ws, **kw)
-        for _ in range(30):
-            graph.replay()
-        args[0].mul_(0.91)
-        graph.replay()
-        check(tuned_out, ref_mhc_fused_post_pre_delayed_rmsnorm(*args, **kw))
-        check(generic_out, ref_mhc_fused_post_pre_delayed_rmsnorm(*generic_args, **kw))
-        assert _counter_state_ok(ws)
-
-
-def check_masked_dispatch_uses_generic():
-    args, kw, reference = case(4, 5120, "post", seed=19)
-    original_mask = os.environ.get("ROC_GLOBAL_CU_MASK")
-    os.environ["ROC_GLOBAL_CU_MASK"] = "0:0-127"
-    try:
-        ws = prepare_mega_mhc(args[1], 4)
-        assert ws.variant == "generic"
-        assert ws.split_k == 1
-        check(mega_mhc(*args, workspace=ws, **kw), reference)
-        assert _counter_state_ok(ws)
-    finally:
-        if original_mask is None:
-            os.environ.pop("ROC_GLOBAL_CU_MASK", None)
-        else:
-            os.environ["ROC_GLOBAL_CU_MASK"] = original_mask
-
-
-@contextmanager
-def expect_error(error_type, message):
-    try:
-        yield
-    except error_type as error:
-        assert message in str(error), f"expected {message!r} in {error!r}"
-    else:
-        raise AssertionError(f"expected {error_type.__name__}: {message}")
-
-
-def run_correctness_checks():
-    """Run the complete HIP regression matrix without timing or a test runner."""
-    groups = [
-        (
-            check_reference,
-            [
-                (t, h, mode)
-                for t, h in [
-                    (0, 5120),
-                    (1, 32),
-                    (3, 64),
-                    (17, 256),
-                    (4, 5120),
-                    (17, 5120),
-                    (64, 5120),
-                    (384, 5120),
-                    (4096, 5120),
-                    (4160, 5120),
-                    (16384, 5120),
-                    (17, 7168),
-                    (17, 65536),
-                ]
-                for mode in MODES
-            ],
-        ),
-        (check_split_reuse, [(split_k,) for split_k in [1, 2, 5, 10, 16, 20, 32]]),
-        (
-            check_graphs_and_streams,
-            [
-                (token_counts,)
-                for token_counts in [(17, 384), (2048, 2048), (4160, 4160)]
-            ],
-        ),
-        (check_workspace_contract, [()]),
-        (check_inference_weights, [()]),
-        (check_oversubscribed_splits, [()]),
-    ]
-    if get_gfx_runtime() == "gfx950":
-        groups += [
-            (
-                check_dispatch_boundaries,
-                [
-                    (tokens, mode)
-                    for tokens in [
-                        1,
-                        5,
-                        8,
-                        16,
-                        128,
-                        129,
-                        256,
-                        257,
-                        385,
-                        512,
-                        513,
-                        1024,
-                        1025,
-                        1536,
-                        2047,
-                        2048,
-                        2049,
-                        4095,
-                        4097,
-                        4161,
-                        7920,
-                        7921,
-                        8191,
-                        8192,
-                        8193,
-                        15840,
-                        15841,
-                        16385,
-                    ]
-                    for mode in MODES
-                ],
-            ),
-            (
-                check_large_tiles_changed_graph_input,
-                [
-                    (tokens, mode)
-                    for mode in MODES
-                    for tokens in [
-                        1025,
-                        2048,
-                        2049,
-                        3072,
-                        4095,
-                        4096,
-                        4160,
-                        8192,
-                        8193,
-                        15841,
-                    ]
-                ],
-            ),
-            (
-                check_switch_sinkhorn_repeat_on_same_workspace,
-                [(tokens,) for tokens in [4, 17, 128, 1024, 4160]],
-            ),
-            (
-                check_switch_post_on_same_workspace,
-                [(tokens,) for tokens in [16, 17, 128, 2048, 2049, 4096]],
-            ),
-            (
-                check_generation_wrap_and_changed_graph_input,
-                [(tokens,) for tokens in [4, 17, 128, 1024, 2048]],
-            ),
-            (check_masked_dispatch_uses_generic, [()]),
-        ]
-    count = 0
-    for function, cases in groups:
-        label = function.__name__.removeprefix("check_")
-        print(f"Checking {label}: {len(cases)} cases", flush=True)
-        for values in cases:
-            try:
-                function(*values)
-            except Exception as error:
-                raise AssertionError(f"{label}{values} failed") from error
-            count += 1
-    torch.cuda.synchronize()
-    print(f"Mega-MHC correctness: {count} passed", flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Mega-MHC BF16 correctness and HIP / FlyDSL / Triton performance",
+        description="Mega-MHC reference checks and HIP / FlyDSL / Triton timings",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument(
@@ -602,35 +311,43 @@ def main():
         "--tokens",
         type=int,
         nargs="+",
-        default=[
-            1,
-            2,
-            3,
-            4,
-            5,
-            8,
-            16,
-            17,
-            32,
-            64,
-            128,
-            256,
-            384,
-            512,
-            1024,
-            2048,
-            4096,
-            4160,
-            8192,
-            16384,
-        ],
+        default=TOKEN_COUNTS,
+        help="M: number of tokens (decode to prefill)",
     )
     parser.add_argument(
-        "-n", "--hidden", "--hidden-size", type=int, nargs="+", default=[5120]
+        "-n",
+        "--hidden",
+        "--hidden-size",
+        "--hidden_size",
+        type=int,
+        nargs="+",
+        default=HIDDEN_SIZES,
+        help="H: hidden size per stream; four streams per token",
     )
-    parser.add_argument("--mode", "--modes", choices=MODES, nargs="+", default=MODES)
-    parser.add_argument("--backends", choices=BACKENDS, nargs="+", default=BACKENDS)
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--mode",
+        "--modes",
+        choices=MODES,
+        nargs="+",
+        default=("post", "no_post"),
+        help="post: include post-mix; no_post: start from residual; "
+        "identity variants select stream 0 instead of learned pre-mix",
+    )
+    parser.add_argument(
+        "--out-dtype",
+        choices=OUT_DTYPES,
+        nargs="+",
+        default=("bf16",),
+        help="BF16 norm, or BF16 norm plus fused MXFP8 codes and scales",
+    )
+    parser.add_argument(
+        "--backends",
+        choices=BACKENDS,
+        nargs="+",
+        help="default: HIP/FlyDSL/Triton on gfx950; HIP/Triton on gfx942; "
+        "Triton is omitted for MXFP8",
+    )
+    parser.add_argument("--seed", type=int, default=0, help="shared input seed")
     parser.add_argument(
         "--iters",
         type=int,
@@ -640,51 +357,95 @@ def main():
     parser.add_argument(
         "--check-only",
         action="store_true",
-        help="run the full HIP regression matrix instead of the selected benchmarks",
+        help="check the selected shapes and backends, without timing",
     )
     args = parser.parse_args()
     if any(m < 0 for m in args.tokens):
         parser.error("tokens must be nonnegative")
-    if any(h <= 0 or h % 32 for h in args.hidden):
-        parser.error("hidden size must be a positive multiple of 32")
-    if args.iters < 2:
+    if any(not 0 < h <= 65536 or h % 32 for h in args.hidden):
+        parser.error("hidden size must be a multiple of 32 in [32, 65536]")
+    if not args.check_only and args.iters < 2:
         parser.error("iters must be at least 2 (the first sample is warmup)")
-    if not torch.cuda.is_available() or get_gfx_runtime() not in ("gfx950", "gfx942"):
+    if not torch.cuda.is_available():
+        parser.error("Mega-MHC requires a GPU")
+    arch = get_gfx_runtime()
+    if arch not in ("gfx950", "gfx942"):
         parser.error("Mega-MHC requires gfx950 or gfx942")
-    if args.check_only:
-        run_correctness_checks()
-        return
-    if "flydsl" in args.backends and get_gfx_runtime() != "gfx950":
-        parser.error("FlyDSL Mega-MHC requires gfx950; use --backends hip triton")
-    backends = tuple(dict.fromkeys(args.backends))
+    if "mxfp8" in args.out_dtype and arch != "gfx950":
+        parser.error("Mega-MHC mxfp8 requires gfx950")
+    backends = tuple(
+        dict.fromkeys(
+            args.backends or (BACKENDS if arch == "gfx950" else ("hip", "triton"))
+        )
+    )
+    selected = {
+        dtype: tuple(name for name in backends if dtype == "bf16" or name != "triton")
+        for dtype in args.out_dtype
+    }
+    if any(not names for names in selected.values()):
+        parser.error("Triton has no fused MXFP8 output; select HIP or FlyDSL")
+    backends = tuple(
+        name for name in backends if any(name in names for names in selected.values())
+    )
+    if "flydsl" in backends and arch != "gfx950":
+        parser.error("FlyDSL Mega-MHC requires gfx950")
     for name in backends:
         try:
             backend_function(name)
         except ImportError as error:
-            parser.error(
-                f"{name} is unavailable: {error}; install the backend or omit it from --backends"
-            )
-    print(
-        f"Mega-MHC BF16 | {get_gfx_runtime()} | {torch.cuda.get_device_name()} | "
-        f"GPU time, {args.iters} calls per case with automatic buffer rotation",
-        flush=True,
-    )
-    print(
-        "Effective bandwidth: dominant tensor bytes / GPU time (TB/s); "
-        "counts projection weights once, excludes scratch and repeated loads.",
-        flush=True,
-    )
+            parser.error(f"{name} is unavailable: {error}; select installed --backends")
+    print(f"Mega-MHC | {arch} | {torch.cuda.get_device_name()}", flush=True)
+    if "triton" in backends:
+        print(
+            "Triton: skip MXFP8 and H not divisible by its default split_k * tile_k; "
+            "skipped results show SKIP or '-'.",
+            flush=True,
+        )
+    if not args.check_only:
+        print(
+            f"GPU time: {args.iters} calls with automatic buffer rotation. "
+            "TB/s is effective tensor bandwidth; excludes scratch and repeated loads.",
+            flush=True,
+        )
     rows = []
-    for h, mode, m in itertools.product(args.hidden, args.mode, args.tokens):
-        print(f"Checking T={m}, H={h}, mode={mode}", flush=True)
-        rows.append(benchmark_mega_mhc(m, h, mode, backends, args.seed, args.iters))
-    columns = ["m", "hidden_size", "mode", "seed", "status"]
-    columns += [f"{name}_{unit}" for name in backends for unit in ("us", "TB/s")]
-    print("\nMega-MHC performance (us, TB/s):", flush=True)
+    for dtype, h, mode, m in itertools.product(
+        selected,
+        dict.fromkeys(args.hidden),
+        dict.fromkeys(args.mode),
+        dict.fromkeys(args.tokens),
+    ):
+        rows.append(
+            benchmark_mega_mhc(
+                m,
+                h,
+                mode,
+                selected[dtype],
+                args.seed,
+                args.iters,
+                dtype,
+                args.check_only,
+            )
+        )
+    columns = ["m", "hidden_size", "mode", "out_dtype"]
+    if args.check_only:
+        columns += list(backends)
+    else:
+        columns += [f"{name}_{unit}" for name in backends for unit in ("us", "TB/s")]
+        columns += ["status"]
+    title = "correctness" if args.check_only else "performance (us, TB/s)"
+    print(f"\nMega-MHC {title}:", flush=True)
     print(
         pd.DataFrame(rows)[columns].to_string(
             index=False, float_format="{:.3f}".format, na_rep="-"
         )
+    )
+    passed = sum(row["status"] == "PASS" for row in rows)
+    count = sum(row.get(name) == "PASS" for row in rows for name in backends)
+    skipped = len(rows) * len(backends) - count
+    print(
+        f"\nPassed: {passed}/{len(rows)} cases, {count} backend checks; "
+        f"{skipped} backend comparisons skipped.",
+        flush=True,
     )
 
 

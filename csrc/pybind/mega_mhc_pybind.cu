@@ -13,6 +13,8 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("post_out"),
           py::arg("comb_out"),
           py::arg("layer_input"),
+          py::arg("quant_out"),
+          py::arg("quant_scale"),
           py::arg("next_pre"),
           py::arg("residual"),
           py::arg("fn_packed"),
@@ -33,5 +35,7 @@ PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
           py::arg("sinkhorn_repeat"),
           py::arg("split_k"),
           py::arg("has_post"),
-          py::arg("identity_pre"));
+          py::arg("identity_pre"),
+          py::arg("variant"),
+          py::arg("mxfp8"));
 }

@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
-"""BF16 HIP delayed Mega-mHC. Prepare a workspace once for single-launch replay."""
+"""HIP delayed Mega-mHC with BF16 or fused MXFP8 output in a single launch."""
 
 import os
 from dataclasses import dataclass
@@ -11,10 +11,11 @@ from torch import Tensor
 
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
-from .mhc import mhc_shuffle_fn
 
 __all__ = ["MegaMHCWorkspace", "mega_mhc", "prepare_mega_mhc"]
 
+
+_STREAM_HIDDEN_SIZES = (4096, 5120, 6144, 7168)
 
 _STREAM_VARIANTS = (
     "decode4",
@@ -50,7 +51,7 @@ _DISTRIBUTED_VARIANTS = frozenset(
 )
 
 
-def _select_stream_variant(tokens):
+def _select_stream_variant(tokens, hidden=5120):
     if tokens == 0:
         return "generic", 1
     if tokens == 4:
@@ -67,6 +68,8 @@ def _select_stream_variant(tokens):
         return "small", 32
     for limit, split in ((256, 16), (384, 10), (512, 8), (1024, 4), (2048, 2)):
         if tokens <= limit:
+            if limit == 384 and hidden != 5120:
+                split = 8
             return f"mid{limit}", split
     if tokens == 4160:
         return "tail", 1
@@ -80,13 +83,14 @@ def _pack_stream_fn(fn):
     halves of one operand. This reduces four MFMA instructions to three.
     """
     with torch.no_grad():
+        hidden = fn.shape[1] // 4
         hi = fn.to(torch.bfloat16)
         lo = (fn - hi.float()).to(torch.bfloat16)
-        hi = hi.view(24, 4, 5120)
-        lo = lo.view(24, 4, 5120)
+        hi = hi.view(24, 4, hidden)
+        lo = lo.view(24, 4, hidden)
         operands = torch.stack([hi[:16], lo[:16], torch.cat([hi[16:], lo[16:]])])
         return (
-            operands.view(3, 16, 4, 160, 4, 8)
+            operands.view(3, 16, 4, hidden // 32, 4, 8)
             .permute(3, 2, 0, 4, 1, 5)
             .contiguous()
             .view(torch.int32)
@@ -94,17 +98,20 @@ def _pack_stream_fn(fn):
 
 
 @cache
-def _native_launcher(variant):
-    # Separate lazy JIT modules preserve each tuned kernel's resource layout
-    # and avoid compiling every token specialization on first use.
-    if variant not in _STREAM_VARIANTS and variant != "legacy":
-        raise ValueError(f"unknown Mega-MHC stream variant: {variant}")
+def _native_launcher(hidden=5120, arch="gfx950"):
+    # Compile all token/output specializations once for this H and architecture.
+    if not 0 < hidden <= 65536 or hidden % 32:
+        raise ValueError(f"unsupported Mega-MHC hidden size: {hidden}")
+    if arch not in ("gfx950", "gfx942"):
+        raise ValueError(f"unsupported Mega-MHC architecture: {arch}")
 
     def launch(
         residual_out: Tensor,
         post_out: Tensor,
         comb_out: Tensor,
         layer_input: Tensor,
+        quant_out: Tensor,
+        quant_scale: Tensor,
         next_pre: Tensor,
         residual: Tensor,
         fn_packed: Tensor,
@@ -126,36 +133,32 @@ def _native_launcher(variant):
         split_k: int,
         has_post: bool,
         identity_pre: bool,
+        variant: int,
+        mxfp8: bool,
     ) -> None: ...
 
-    launch.__name__ = (
-        "_mega_mhc_bf16" if variant == "legacy" else f"_mega_mhc_stream_{variant}"
-    )
+    base_module = "module_mega_mhc_stream"
+    module = f"{base_module}_h{hidden}_{arch}"
+    launch.__name__ = "_" + module.removeprefix("module_")
     launch.__qualname__ = launch.__name__
-    if variant == "legacy":
-        return compile_ops("module_mega_mhc", fc_name="mega_mhc_bf16", develop=True)(
-            launch
-        )
-    variant_id = _STREAM_VARIANTS.index(variant)
 
     def build_args(*args, **kwargs):
+        flags = [
+            "-gline-tables-only",
+            f"-DMHC_HIDDEN={hidden}",
+            f"-DMHC_ARCH_GFX950={int(arch == 'gfx950')}",
+        ]
         return {
-            "md_name": f"module_mega_mhc_stream_{variant}",
-            "flags_extra_hip": [
-                "-gline-tables-only",
-                f"-DMHC_STREAM_VARIANT={variant_id}",
-            ],
+            "md_name": module,
+            "flags_extra_hip": flags,
         }
 
     return compile_ops(
-        "module_mega_mhc_stream",
+        base_module,
         fc_name="mega_mhc_bf16",
         gen_func=build_args,
         develop=True,
     )(launch)
-
-
-_mega_mhc_bf16 = _native_launcher("legacy")
 
 
 @dataclass(frozen=True)
@@ -180,7 +183,7 @@ class MegaMHCWorkspace:
     hidden: int
     split_k: int
     stream: int
-    variant: str = "legacy"
+    variant: str = "generic"
     generic_partials: Tensor | None = None
     generic_counters: Tensor | None = None
 
@@ -199,10 +202,10 @@ def _fn_version(fn):
 def prepare_mega_mhc(fn: Tensor, tokens: int, *, split_k: int | None = None):
     """Pack FP32 fn and initialize per-stream scratch outside graph capture.
 
-    H=5120 on gfx950 uses the tuned stream kernels. Explicit split_k selects
-    their generic path. Other H and gfx942 retain the original weight layout
-    and kernel. The workspace also supports non-default Sinkhorn repeats via
-    the generic path, sharing the weight pack without allocating in capture.
+    H=4096/5120/6144/7168 on gfx950 uses the tuned stream kernels. Explicit split_k,
+    other H and gfx942 select the portable generic kernel with the same weight
+    layout. The workspace also supports non-default Sinkhorn repeats via the
+    generic path, sharing the weight pack without allocating in capture.
     """
     if not fn.is_cuda or fn.dtype != torch.float32 or fn.ndim != 2:
         raise ValueError("fn must be a GPU FP32 matrix")
@@ -223,80 +226,61 @@ def prepare_mega_mhc(fn: Tensor, tokens: int, *, split_k: int | None = None):
         if arch not in ("gfx950", "gfx942"):
             raise RuntimeError(f"mega_mhc requires gfx950 or gfx942, got {arch}")
         blocks = (tokens + 15) // 16
-        if arch == "gfx950" and hidden == 5120:
-            variant, selected_split = _select_stream_variant(tokens)
-            if split_k is not None:
-                variant, selected_split = "generic", split_k
-            distributed = variant in _DISTRIBUTED_VARIANTS
-            masked = any(
-                os.environ.get(name) is not None
-                for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
-            )
-            cu = torch.cuda.get_device_properties(fn.device).multi_processor_count
-            if distributed and (cu < 256 or masked):
-                variant, selected_split, distributed = "generic", 1, False
-            split_k = selected_split
-            if (
-                not isinstance(split_k, int)
-                or not 1 <= split_k <= 32
-                or hidden % (32 * split_k)
-            ):
-                raise ValueError("split_k must be 1..32 and H divisible by 32*split_k")
-            # The distributed kernels have a bounded wait and handoff path;
-            # still keep the tuned grid at no more than one WG per CU.
-            if distributed and ((blocks + 7) // 8) * split_k > 32:
-                raise ValueError("distributed split grid exceeds one workgroup per CU")
-            generic_partials = torch.empty(
-                (split_k, blocks, 16, 32), device=fn.device, dtype=torch.float32
-            )
-            partials = (
-                generic_partials.view(-1)[: split_k * tokens * 32]
-                if distributed
-                else generic_partials
-            )
-            counters = torch.zeros(blocks * 32, device=fn.device, dtype=torch.int32)
-            # Generation-tagged counters cannot be reused by the generic
-            # zero-based arrival protocol. Both sets belong to this workspace.
-            generic_counters = torch.zeros_like(counters) if distributed else counters
-            return MegaMHCWorkspace(
-                fn,
-                _fn_version(fn),
-                _pack_stream_fn(fn),
-                partials,
-                counters,
-                tokens,
-                hidden,
-                split_k,
-                torch.cuda.current_stream(fn.device).cuda_stream,
-                variant,
-                generic_partials,
-                generic_counters,
-            )
-        if split_k is None:
-            cu = torch.cuda.get_device_properties(fn.device).multi_processor_count
-            split_k = max(
+        cu = torch.cuda.get_device_properties(fn.device).multi_processor_count
+        if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
+            variant, selected_split = _select_stream_variant(tokens, hidden)
+        else:
+            variant = "generic"
+            selected_split = max(
                 k
                 for k in range(1, 21)
                 if hidden % (32 * k) == 0 and (k == 1 or max(blocks, 1) * k <= cu)
             )
+        if split_k is not None:
+            variant, selected_split = "generic", split_k
+        distributed = variant in _DISTRIBUTED_VARIANTS
+        masked = any(
+            os.environ.get(name) is not None
+            for name in ("HSA_CU_MASK", "ROC_GLOBAL_CU_MASK")
+        )
+        if distributed and (cu < 256 or masked):
+            variant, selected_split, distributed = "generic", 1, False
+        split_k = selected_split
         if (
             not isinstance(split_k, int)
             or not 1 <= split_k <= 32
             or hidden % (32 * split_k)
         ):
             raise ValueError("split_k must be 1..32 and H divisible by 32*split_k")
+        # The distributed kernels have a bounded wait and handoff path;
+        # still keep the tuned grid at no more than one WG per CU.
+        if distributed and ((blocks + 7) // 8) * split_k > 32:
+            raise ValueError("distributed split grid exceeds one workgroup per CU")
+        generic_partials = torch.empty(
+            (split_k, blocks, 16, 32), device=fn.device, dtype=torch.float32
+        )
+        partials = (
+            generic_partials.view(-1)[: split_k * tokens * 32]
+            if distributed
+            else generic_partials
+        )
+        counters = torch.zeros(blocks * 32, device=fn.device, dtype=torch.int32)
+        # Generation-tagged counters cannot be reused by the generic
+        # zero-based arrival protocol. Both sets belong to this workspace.
+        generic_counters = torch.zeros_like(counters) if distributed else counters
         return MegaMHCWorkspace(
             fn,
             _fn_version(fn),
-            mhc_shuffle_fn(fn, arch=arch),
-            torch.empty(
-                (split_k, blocks, 16, 32), device=fn.device, dtype=torch.float32
-            ),
-            torch.zeros((blocks,), device=fn.device, dtype=torch.int32),
+            _pack_stream_fn(fn),
+            partials,
+            counters,
             tokens,
             hidden,
             split_k,
             torch.cuda.current_stream(fn.device).cuda_stream,
+            variant,
+            generic_partials,
+            generic_counters,
         )
 
 
@@ -339,6 +323,7 @@ def mega_mhc(
     *,
     residual_out: Tensor | None = None,
     workspace: MegaMHCWorkspace | None = None,
+    out_dtype: str = "bf16",
 ):
     """Delayed post/pre/RMSNorm seam, returning (R, post, comb, norm, next_pre).
 
@@ -349,13 +334,22 @@ def mega_mhc(
     With a prepared workspace this launches exactly one HIP kernel. Without
     one, this convenience wrapper also packs fn and initializes scratch on
     every call. Prepare once and warm up on the capture stream before capture.
-    H=5120/gfx950 defaults to the tuned stream dispatch for Sinkhorn=20; other
+    H=4096/5120/6144/7168 on gfx950 uses stream dispatch for Sinkhorn=20; other
     positive repeat counts use the generic stream kernel with the same pack.
+
+    out_dtype="mxfp8" (gfx950 only) returns (norm, q, e8m0) in place of norm:
+    BF16 norm (T, H), float8_e4m3fn q (T, H), and uint8 exponent bytes (T, H/32).
+    Quantization uses the rounded BF16 norm and group32 power-of-two scales,
+    ceil_pow2(max(amax, 1e-10) / 448), matching FlyDSL Mega-MHC. Reinterpret
+    scale bytes with .view(torch.float8_e8m0fnu) for consumers requiring E8M0.
+    The same workspace supports both output modes, including graph replay.
     """
     if not residual.is_cuda or residual.ndim != 3 or residual.shape[1] != 4:
         raise ValueError("residual must be a GPU (T, 4, H) tensor")
     t, _, h = residual.shape
     device = residual.device
+    if out_dtype not in ("bf16", "mxfp8"):
+        raise ValueError("out_dtype must be 'bf16' or 'mxfp8'")
     _require_tensor(residual, "residual", (t, 4, h), torch.bfloat16, device)
     _require_tensor(fn, "fn", (24, 4 * h), torch.float32, device)
     _require_tensor(hc_scale, "hc_scale", (3,), torch.float32, device)
@@ -400,6 +394,8 @@ def mega_mhc(
             )
         residual_out = residual
     with torch.cuda.device(device):
+        if out_dtype == "mxfp8" and get_gfx_runtime() != "gfx950":
+            raise RuntimeError("Mega-MHC mxfp8 requires gfx950")
         if workspace is None:
             workspace = prepare_mega_mhc(fn, t)
         if (
@@ -415,22 +411,28 @@ def mega_mhc(
         norm = torch.empty((t, h), device=device, dtype=torch.bfloat16)
         next_pre = torch.empty((t, 4), device=device, dtype=torch.float32)
         dummy = hc_base
+        quant_out, quant_scale = dummy, dummy
+        layer_input = norm
+        if out_dtype == "mxfp8":
+            quant_out = torch.empty((t, h), device=device, dtype=torch.float8_e4m3fn)
+            quant_scale = torch.empty((t, h // 32), device=device, dtype=torch.uint8)
+            layer_input = (norm, quant_out, quant_scale)
         partials, counters = workspace.partials, workspace.counters
-        launch = _mega_mhc_bf16
-        if workspace.variant != "legacy":
-            variant = workspace.variant
-            if sinkhorn_repeat != 20:
-                variant = "generic"
-                partials, counters = (
-                    workspace.generic_partials,
-                    workspace.generic_counters,
-                )
-            launch = _native_launcher(variant)
+        variant = workspace.variant
+        if sinkhorn_repeat != 20:
+            variant = "generic"
+            partials, counters = (
+                workspace.generic_partials,
+                workspace.generic_counters,
+            )
+        launch = _native_launcher(h, get_gfx_runtime())
         launch(
             residual_out,
             post_out,
             comb_out,
             norm,
+            quant_out,
+            quant_scale,
             next_pre,
             residual,
             workspace.fn_packed,
@@ -452,5 +454,7 @@ def mega_mhc(
             workspace.split_k,
             has_post,
             pre_mix is None,
+            _STREAM_VARIANTS.index(variant),
+            out_dtype == "mxfp8",
         )
-    return residual_out, post_out, comb_out, norm, next_pre
+    return residual_out, post_out, comb_out, layer_input, next_pre
