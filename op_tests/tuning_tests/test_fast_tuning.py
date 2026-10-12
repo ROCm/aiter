@@ -583,6 +583,58 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(limits, [3.5, 3.5])
         self.assertEqual(torch_ref.call_args.kwargs["swiglu_limit"], 3.5)
 
+    def test_finalist_retime_preserves_unrounded_coarse_error(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(
+            gemm_moe_tune.Mxfp4FlydslTuner
+        )
+        tuner.keys = [
+            "token",
+            "model_dim",
+            "inter_dim",
+            "expert",
+            "topk",
+            "act_type",
+        ]
+        args = SimpleNamespace(fast_scan=False, errRatio=0.1, warmup=1, iters=10)
+        row = {
+            "token": 1,
+            "model_dim": 256,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+        }
+        candidate = self._candidate("fastest")
+        candidate.update(
+            block_m=16,
+            err1="1.1%",
+            err2="1.1%",
+            _err=0.01149,
+        )
+        with (
+            mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
+            mock.patch.object(tuner, "_port_e2e", return_value="out"),
+            mock.patch.object(tuner, "_torch_ref", return_value="ref"),
+            mock.patch.object(
+                gemm_moe_tune, "cosine_diff_compare", return_value=0.010
+            ),
+            mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
+            mock.patch(
+                "aiter.test_common.run_perftest",
+                side_effect=lambda operation, **kwargs: (operation(), 5.0),
+            ),
+        ):
+            tuner._run_candidate(row, candidate, args, data="fixture")
+
+        # The retime measured 0.010, but the coarse pass already saw 0.01149.
+        # Keeping the raw value stops a 1.1% display string (0.011) from
+        # rounding the candidate below a slower one with a true 0.01120.
+        self.assertEqual(candidate["_err"], 0.01149)
+        self.assertEqual(candidate["err1"], "1.1%")
+        self.assertEqual(candidate["err2"], "1.1%")
+
     def test_accuracy_failure_rejects_only_the_candidate(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
@@ -808,6 +860,44 @@ class TestParallelMxfp4Precompile(unittest.TestCase):
             os.environ, {"AITER_FLYDSL_AOT_WORKERS": "7"}, clear=False
         ):
             self.assertEqual(common.get_max_workers(23), 7)
+
+    def test_precompile_applies_tuning_swiglu_limit_to_stage1_jobs(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(
+            gemm_moe_tune.Mxfp4FlydslTuner
+        )
+        jobs = [
+            {"stage": 1, "act": "swiglu", "swiglu_limit": 7.0},
+            {"stage": 1, "act": "silu", "swiglu_limit": float("inf")},
+            {"stage": 2},
+        ]
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"},
+                clear=False,
+            ),
+            mock.patch(
+                "aiter.aot.flydsl.mxfp4_moe.jobs_from_rows", return_value=jobs
+            ),
+            mock.patch(
+                "aiter.aot.flydsl.common.run_jobs_parallel",
+                return_value=[{"results": []}],
+            ) as run_jobs_parallel,
+            mock.patch(
+                "aiter.aot.flydsl.common.get_max_workers", return_value=1
+            ),
+            mock.patch("builtins.print"),
+        ):
+            tuner._precompile_candidates({}, [{}])
+
+        # The scan JITs on a cache miss, so the precompiled closure scalar must
+        # match the runtime launch limit instead of jobs_from_rows' defaults.
+        precompiled = run_jobs_parallel.call_args.args[1][0]["jobs"]
+        self.assertEqual(precompiled[0]["swiglu_limit"], 3.5)
+        self.assertEqual(precompiled[1]["swiglu_limit"], 3.5)
+        self.assertNotIn("swiglu_limit", precompiled[2])
 
 
 if __name__ == "__main__":

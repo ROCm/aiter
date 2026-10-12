@@ -65,6 +65,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_kernels,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
+    runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
@@ -7039,12 +7040,18 @@ class Mxfp4FlydslTuner(FmoeTuner):
         swiglu_limit = None if limit_env in (None, "") else float(limit_env)
         fast_scan = bool(getattr(args, "fast_scan", False))
         # Never let a finalist retime erase a larger error already observed for
-        # this candidate during the coarse pass.
+        # this candidate during the coarse pass. `_err` holds the exact ratio;
+        # err1/err2 are the rounded display strings, so only fall back to them
+        # when the raw value is unavailable.
         previously_observed_errors = []
-        for field in ("err1", "err2"):
-            observed = _parse_candidate_accuracy(candidate.get(field))
-            if observed is not None:
-                previously_observed_errors.append(observed)
+        raw_error = _parse_candidate_accuracy(candidate.get("_err"))
+        if raw_error is not None:
+            previously_observed_errors.append(raw_error)
+        else:
+            for field in ("err1", "err2"):
+                observed = _parse_candidate_accuracy(candidate.get(field))
+                if observed is not None:
+                    previously_observed_errors.append(observed)
         if data is None:
             data = self._prepare_case(token, h, e, ne, topk, dtype)
         requested_warmup = int(args.warmup if num_warmup is None else num_warmup)
@@ -7166,6 +7173,17 @@ class Mxfp4FlydslTuner(FmoeTuner):
             jobs = jobs_from_rows(candidate_rows, include_bias_variants=False)
             if not jobs:
                 return 0, 0
+            # jobs_from_rows always compiles the unclamped defaults (+inf for
+            # SiLU, 7.0 for SwiGLU). Runtime launches pass the tuned clamp
+            # instead, so without this the cache misses and the scan JITs
+            # during scoring.
+            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+            if limit_env not in (None, ""):
+                for job in jobs:
+                    if job["stage"] == 1:
+                        job["swiglu_limit"] = runtime_swiglu_limit(
+                            float(limit_env), job["act"]
+                        )
             worker_count = get_max_workers(len(jobs))
             batches = [jobs[index::worker_count] for index in range(worker_count)]
             batch_results = run_jobs_parallel(
