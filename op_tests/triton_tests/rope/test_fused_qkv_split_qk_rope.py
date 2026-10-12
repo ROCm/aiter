@@ -188,6 +188,40 @@ def rounded_neox_rope(x, cos, sin, positions):
     return torch.cat((first, second), dim=-1).to(x.dtype)
 
 
+def to_shuffle_layout(k_cache_nhd, v_cache_nhd):
+    """Re-order NHD ``[blocks, block_size, kvh, D]`` caches into the AITER shuffle
+    layout (K ``[blocks, kvh, D // x, block_size, x]``, V ``[blocks, kvh, block_size // x,
+    D, x]``, ``x = 16 B / element``), returned in the same ``[blocks, block_size, kvh, D]``
+    storage shape the kernels address."""
+    nb, bs, kvh, d = k_cache_nhd.shape
+    x = 16 // k_cache_nhd.element_size()
+    k = k_cache_nhd.permute(0, 2, 3, 1).reshape(nb, kvh, d // x, x, bs)
+    k = k.permute(0, 1, 2, 4, 3).reshape(nb, bs, kvh, d)
+    v = v_cache_nhd.permute(0, 2, 1, 3).reshape(nb, kvh, bs // x, x, d)
+    v = v.permute(0, 1, 2, 4, 3).reshape(nb, bs, kvh, d)
+    return k.contiguous(), v.contiguous()
+
+
+def mrope_ref_freqs(freqs, pos3, mrope_section, interleaved):
+    """Per-token, per-frequency RoPE angles for 3-D positions ``[3, B]``: frequency
+    ``j`` reads the t / h / w position row of its section (interleaved: h when
+    ``j % 3 == 1 and j < 3 h``, w when ``j % 3 == 2 and j < 3 w``, else t; contiguous:
+    ``[t | h | w]``). Returns ``[B, 1, n_freqs]`` like ``freqs[pos].squeeze(-2)``."""
+    table = freqs.reshape(freqs.shape[0], -1)  # [max_pos, n_freqs]
+    n = table.shape[1]
+    sec_t, sec_h, sec_w = mrope_section
+    j = torch.arange(n, device=pos3.device)
+    if interleaved:
+        is_h = (j % 3 == 1) & (j < 3 * sec_h)
+        is_w = (j % 3 == 2) & (j < 3 * sec_w)
+    else:
+        is_h = (j >= sec_t) & (j < sec_t + sec_h)
+        is_w = (j >= sec_t + sec_h) & (j < sec_t + sec_h + sec_w)
+    row = torch.where(is_h, 1, torch.where(is_w, 2, 0))  # [n]
+    pos_sel = pos3[row, :].T  # [B, n]
+    return table[pos_sel, j[None, :]].unsqueeze(1)
+
+
 def run_torch_with_cache(
     qkv,
     q_weight,
@@ -238,6 +272,8 @@ def run_torch_with_cache(
         cache_layout: ``"HND"`` or ``"NHD"`` paged KV tensor layout for the reference caches.
         q_scale: Optional query scale applied after RMSNorm's output cast.
         cos, sin, positions: RoPE tables and positions for the BF16-rounded scale path.
+        cache_layout: ``"HND"``, ``"NHD"`` or ``"SHUFFLE"`` layout for the reference
+            caches (``"SHUFFLE"`` is the NHD reference re-ordered by ``to_shuffle_layout``).
     """
     QH = QH_PER_KH * KH
     q_size = QH * D
@@ -313,7 +349,7 @@ def run_torch_with_cache(
                 s = slot % block_size
                 k_cache[b, :, s, :] = k_descaled[i]
                 v_cache[b, :, s, :] = v_descaled[i]
-    elif cl == "NHD":
+    elif cl in ("NHD", "SHUFFLE"):
         k_cache = torch.zeros(
             (num_blocks, block_size, KH, D), dtype=qkv.dtype, device="cuda"
         )
@@ -327,6 +363,8 @@ def run_torch_with_cache(
                 s = slot % block_size
                 k_cache[b, s, :, :] = k_descaled[i]
                 v_cache[b, s, :, :] = v_descaled[i]
+        if cl == "SHUFFLE":
+            k_cache, v_cache = to_shuffle_layout(k_cache, v_cache)
     else:
         raise ValueError(cache_layout)
 
@@ -587,3 +625,108 @@ def test_fused_qkv_split_qk_rope_with_cache_scaled(B):
         q_scale=3.87,
         weightless_norm=True,
     )
+
+
+# Qwen3.5-style attention prologue: head 256, 6 q heads per kv head, gated q
+# (interleaved [q | gate] per head), partial NeoX rotation over 64 dims, optional
+# interleaved / contiguous 3-D MRoPE positions, NHD or AITER shuffle cache layout,
+# outputs written into preallocated buffers with the gate copy and the token-order
+# V skipped (what a serving engine's fused prologue needs: q, k in token order plus
+# the cache).
+@pytest.mark.parametrize("B", [1, 61, 1024])
+@pytest.mark.parametrize("mrope", ["none", "interleaved", "contiguous"])
+@pytest.mark.parametrize("cache_layout", ["NHD", "SHUFFLE"])
+@pytest.mark.parametrize("prealloc", [False, True])
+def test_fused_qkv_split_qk_rope_with_cache_qwen35(B, mrope, cache_layout, prealloc):
+    dtype = torch.bfloat16
+    QH_PER_KH, KH, D, rotary_dim, block_size = 6, 4, 256, 64, 16
+    QH = QH_PER_KH * KH
+    eps = 1e-6
+    max_embed_positions = 131072
+    mrope_section = (11, 11, 10)
+    torch.manual_seed(2)
+    qkv = generate_qkv_inputs(B, QH_PER_KH, KH, D, False, True, dtype, "interleaved")
+    pos, freqs, cos, sin = generate_rope_cached_freqs(
+        B, max_embed_positions, rotary_dim // 2, dtype
+    )
+    if mrope == "none":
+        positions, section, interleaved = pos, None, True
+        ref_freqs = freqs[pos].squeeze(-2)
+    else:
+        interleaved = mrope == "interleaved"
+        positions = torch.randint(
+            0, max_embed_positions, (3, B), device="cuda", dtype=torch.int64
+        )
+        section = mrope_section
+        ref_freqs = mrope_ref_freqs(freqs, positions, section, interleaved)
+    q_weight = torch.randn((D,), dtype=dtype, device="cuda")
+    k_weight = torch.randn((D,), dtype=dtype, device="cuda")
+    num_blocks = (B + block_size - 1) // block_size + 2
+    k_cache = torch.zeros((num_blocks, block_size, KH, D), dtype=dtype, device="cuda")
+    v_cache = torch.zeros_like(k_cache)
+    slot_mapping = torch.randperm(num_blocks * block_size)[:B].to(torch.int32).cuda()
+    if prealloc:
+        # flat [T, QH * D] / [T, KH * D] rows viewed by head, as a serving engine holds them
+        q_out = torch.empty((B, QH * D), dtype=dtype, device="cuda").view(B, QH, D)
+        k_out = torch.empty((B, KH * D), dtype=dtype, device="cuda").view(B, KH, D)
+    else:
+        q_out = k_out = None
+
+    q_tri, gate_tri, k_tri, v_tri = fused_qkv_split_qk_norm_rope_cache(
+        qkv,
+        q_weight,
+        k_weight,
+        cos,
+        sin,
+        positions,
+        k_cache,
+        v_cache,
+        slot_mapping,
+        QH,
+        KH,
+        D,
+        is_neox=True,
+        reuse_freqs_front_part=True,
+        attn_output_gate=True,
+        eps=eps,
+        gated_qkv_layout="interleaved",
+        kv_cache_layout=cache_layout,
+        mrope_section=section,
+        mrope_interleaved=interleaved,
+        return_gate=not prealloc,
+        return_v=not prealloc,
+        q_out=q_out,
+        k_out=k_out,
+    )
+    if prealloc:
+        assert gate_tri is None and v_tri is None
+        assert q_tri is q_out and k_tri is k_out
+
+    q_ref, gate_ref, k_ref, v_ref, k_cache_ref, v_cache_ref = run_torch_with_cache(
+        qkv,
+        q_weight,
+        k_weight,
+        QH_PER_KH,
+        KH,
+        D,
+        True,
+        ref_freqs,
+        RotateStyle.NEOX,
+        True,
+        eps,
+        slot_mapping,
+        num_blocks,
+        block_size,
+        None,
+        None,
+        qkv_layout="interleaved",
+        cache_layout=cache_layout,
+    )
+    atol, rtol = 2e-2, 2e-2
+    torch.testing.assert_close(q_tri, q_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(k_tri, k_ref, atol=atol, rtol=rtol)
+    if not prealloc:
+        torch.testing.assert_close(gate_tri, gate_ref, atol=atol, rtol=rtol)
+        torch.testing.assert_close(v_tri, v_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(k_cache, k_cache_ref, atol=atol, rtol=rtol)
+    torch.testing.assert_close(v_cache, v_cache_ref, atol=atol, rtol=rtol)
