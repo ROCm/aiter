@@ -94,6 +94,42 @@ def test_pa_decode_plan(device, batch, max_parts, budget, window, query_length):
         assert (plan.work_info.data_ptr(), plan.reduce_info.data_ptr()) == pointers
 
 
+@pytest.mark.parametrize(
+    "arch,num_seqs,expected_splits",
+    [
+        ("gfx950", 1, 8),
+        ("gfx950", 8, 8),
+        ("gfx950", 16, 4),
+        ("gfx950", 32, 4),
+        ("gfx950", 64, 2),
+        ("gfx950", 128, 1),
+        ("gfx942", 8, 1),
+    ],
+)
+def test_bf16_draft_query_split_schedule(monkeypatch, arch, num_seqs, expected_splits):
+    """The tuned Draft grid tapers query duplication as batch work grows."""
+    traits = importlib.import_module("aiter.ops.flydsl.kernels.pa_decode.traits")
+    monkeypatch.setattr(traits, "get_rocm_arch", lambda: arch)
+    schedule = traits.PaDecodeSchedule.select(
+        head_dim=128,
+        value_dim=128,
+        query_group_size=16,
+        block_size=64,
+        num_seqs=num_seqs,
+        num_kv_heads=1,
+        num_compute_units=256,
+        work_capacity=num_seqs * 8,
+        num_partitions=8,
+        query_dtype="bf16",
+        kv_dtype="bf16",
+        query_length=8,
+        trans_v=True,
+        max_context_length=8192,
+        sliding_window=1024,
+    )
+    assert traits.PaDecodeTraits.create(schedule).query_splits == expected_splits
+
+
 def _reference(query, key, value, table, lengths, query_length, window, sinks):
     """FP32 attention over logical KV, independent of kernel Q/P rounding."""
     batch = lengths.numel()

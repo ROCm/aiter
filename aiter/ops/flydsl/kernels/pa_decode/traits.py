@@ -118,6 +118,17 @@ class PaDecodeSchedule:
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         # Scalar KV scheduling also supports FP16 queries and multiple query rows.
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
+        TUNED_BF16_DRAFT = (
+            is_bf16_kv
+            and is_gfx950
+            and not asymmetric_value
+            and head_dim == 128
+            and query_length == 8
+            and query_group_size == 16
+            and num_kv_heads == 1
+            and block_size == 64
+            and sliding_window == 1024
+        )
 
         partition_workgroups = num_seqs * num_kv_heads * num_partitions
         assert query_length >= 1, f"query_length must be >= 1, got {query_length}"
@@ -169,6 +180,17 @@ class PaDecodeSchedule:
                     )
                 )
                 query_splits = 4 if large_full_grid else query_length
+            elif TUNED_BF16_DRAFT:
+                # Splitting reduces the eight-M-tile BF16 CTA's LDS and VGPR
+                # footprint. Bound the duplicated W1024 KV work by the active
+                # task grid: small grids use one query per CTA, while larger
+                # batches taper to four, two, or one query split.
+                if query_length * split_workgroups <= 2 * num_compute_units:
+                    query_splits = query_length
+                elif 4 * split_workgroups <= 3 * num_compute_units:
+                    query_splits = 4
+                elif 2 * split_workgroups <= 3 * num_compute_units:
+                    query_splits = 2
             elif (
                 TUNED_PER_TOKEN
                 and (num_kv_heads == 1 or sliding_window == 0)
