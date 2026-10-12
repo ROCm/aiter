@@ -125,25 +125,25 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           $verifyRocm = @'
-import os
-import sys
+          import os
+          import sys
 
-sys.path.insert(0, os.path.join(os.getcwd(), "aiter", "jit", "utils"))
-from cpp_extension import HIP_VERSION, IS_HIP_EXTENSION, ROCM_HOME, executable_path
+          sys.path.insert(0, os.path.join(os.getcwd(), "aiter", "jit", "utils"))
+          from cpp_extension import HIP_VERSION, IS_HIP_EXTENSION, ROCM_HOME, executable_path
 
-print(f"ROCM_HOME={ROCM_HOME!r}")
-print(f"HIP_VERSION={HIP_VERSION!r}")
-print(f"IS_HIP_EXTENSION={IS_HIP_EXTENSION}")
+          print(f"ROCM_HOME={ROCM_HOME!r}")
+          print(f"HIP_VERSION={HIP_VERSION!r}")
+          print(f"IS_HIP_EXTENSION={IS_HIP_EXTENSION}")
 
-if not ROCM_HOME or not IS_HIP_EXTENSION:
-    raise SystemExit(
-        "ROCm toolchain was not detected after rocm_sdk init; "
-        "expected rocm[devel] to expose a usable HIP SDK."
-    )
+          if not ROCM_HOME or not IS_HIP_EXTENSION:
+              raise SystemExit(
+                  "ROCm toolchain was not detected after rocm_sdk init; "
+                  "expected rocm[devel] to expose a usable HIP SDK."
+              )
 
-for tool in ("hipconfig", "hipcc"):
-    print(f"{tool}={executable_path(tool)}")
-'@
+          for tool in ("hipconfig", "hipcc"):
+              print(f"{tool}={executable_path(tool)}")
+          '@
 
           $verifyRocm | & $python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
