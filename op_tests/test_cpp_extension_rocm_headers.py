@@ -40,6 +40,7 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
         # The compiler probe is cached per hipcc path, so start every test cold
         # and let each case observe its own mocked `hipcc --version` output.
         self.cpp_extension._probe_hipcc_version.cache_clear()
+        self.cpp_extension._warn_rocm_include_once.cache_clear()
         tempdir = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.root = pathlib.Path(tempdir)
         self.runtime = self.root / "python-sdk" / "include"
@@ -86,15 +87,60 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
         )
 
     def test_matching_system_headers_are_appended(self):
-        paths = self.cpp_extension.include_paths(cuda=True)
+        with patch.object(self.cpp_extension.logger, "warning") as warning:
+            paths = self.cpp_extension.include_paths(cuda=True)
         self.assertEqual(paths[-2:], [str(self.runtime), str(self.system)])
         self.assertEqual(paths.count(str(self.system)), 1)
+        warning.assert_not_called()
         self.compiler.assert_called_once_with(
             [str(self.runtime.parent / "bin" / "hipcc"), "--version"],
             text=True,
             stderr=subprocess.STDOUT,
             timeout=10,
         )
+
+    def test_version_mismatch_warns_once_with_versions_and_install_hint(self):
+        self.compiler.return_value = "HIP version: 7.14.60000\n"
+        with patch.object(self.cpp_extension.logger, "warning") as warning:
+            for _ in range(3):
+                self.assertNotIn(
+                    str(self.system), self.cpp_extension.include_paths(cuda=True)
+                )
+
+        # include_paths() runs several times per build and once per JIT module,
+        # so the mismatch must be reported once, not once per call.
+        warning.assert_called_once()
+        message = warning.call_args.args[0]
+        self.assertIn(str(self.system), message)
+        self.assertIn("7.15", message)
+        self.assertIn("7.14", message)
+        self.assertIn(str(self.runtime.parent / "bin" / "hipcc"), message)
+        self.assertIn("rocm-sdk-devel==7.14.*", message)
+
+    def test_unverifiable_versions_warn_once(self):
+        with patch.object(self.cpp_extension.logger, "warning") as warning:
+            self.version_header.write_bytes(b"")
+            for _ in range(2):
+                self.assertIsNone(
+                    self.cpp_extension._find_matching_system_rocm_include()
+                )
+            warning.assert_called_once()
+            self.assertIn(str(self.system), warning.call_args.args[0])
+
+            # A failed compiler probe is likewise reported once, and a distinct
+            # reason gets its own warning instead of being suppressed.
+            self.cpp_extension._warn_rocm_include_once.cache_clear()
+            warning.reset_mock()
+            self.version_header.write_text(
+                "#define HIP_VERSION_MAJOR 7\n#define HIP_VERSION_MINOR 15\n"
+            )
+            self.compiler.side_effect = FileNotFoundError()
+            for _ in range(2):
+                self.assertIsNone(
+                    self.cpp_extension._find_matching_system_rocm_include()
+                )
+            warning.assert_called_once()
+            self.assertIn("hipcc", warning.call_args.args[0])
 
     def test_compiler_mismatch_overrides_matching_global_version(self):
         for version in ("7.14.0", "6.15.0"):
@@ -159,7 +205,12 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
 
     def test_missing_rocprim_skips_compiler_probe(self):
         (self.system / "rocprim" / "rocprim.hpp").unlink()
-        self.assertNotIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
+        with patch.object(self.cpp_extension.logger, "warning") as warning:
+            self.assertNotIn(
+                str(self.system), self.cpp_extension.include_paths(cuda=True)
+            )
+        # Nothing to compare against, so no warning either.
+        warning.assert_not_called()
         self.compiler.assert_not_called()
 
     def test_unreadable_or_incomplete_header_skips_compiler_probe(self):

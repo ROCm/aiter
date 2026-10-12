@@ -10,6 +10,7 @@ import functools
 import importlib
 import importlib.abc
 import importlib.util
+import logging
 import os
 import re
 import shlex
@@ -26,6 +27,8 @@ from hipify import hipify_python
 from hipify.hipify_python import GeneratedFileCleaner
 from packaging.version import Version
 from setuptools.command.build_ext import build_ext
+
+logger = logging.getLogger("aiter")
 
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
@@ -299,17 +302,52 @@ def _probe_hipcc_version(hipcc: str) -> tuple[int, int] | None:
     return int(version.group(1)), int(version.group(2))
 
 
+# functools.cache keeps the warning to one emission per distinct message:
+# include_paths() runs several times per build and again for every JIT module,
+# so a plain logger.warning here would repeat on each call.
+@functools.cache
+def _warn_rocm_include_once(message: str) -> None:
+    """Emit ``message`` once per distinct text."""
+    logger.warning(message)
+
+
 def _find_matching_system_rocm_include() -> str | None:
     """Use system rocPRIM headers only if their HIP version matches hipcc."""
     if not os.path.isfile(os.path.join(_SYSTEM_ROCM_INCLUDE, _ROCPRIM_HEADER)):
+        # No rocPRIM in the system tree (e.g. runtime-only installs): there is
+        # nothing to compare and nothing to warn about.
         return None
+
     header_version = _read_hip_header_version(_SYSTEM_ROCM_INCLUDE)
     if header_version is None:
+        _warn_rocm_include_once(
+            f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: cannot read "
+            f"their HIP version from {os.path.join(_SYSTEM_ROCM_INCLUDE, 'hip', 'hip_version.h')}. "
+            "The build continues without them."
+        )
         return None
 
     # ROCM_VERSION can come from an unrelated hipconfig on PATH or even the
     # system headers themselves. Query the compiler used by the build instead.
-    if header_version != _probe_hipcc_version(_join_rocm_home("bin", "hipcc")):
+    hipcc = _join_rocm_home("bin", "hipcc")
+    compiler_version = _probe_hipcc_version(hipcc)
+    if compiler_version is None:
+        _warn_rocm_include_once(
+            f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: cannot "
+            f"determine the HIP version of {hipcc}. The build continues without "
+            "them."
+        )
+        return None
+    if header_version != compiler_version:
+        _warn_rocm_include_once(
+            f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: they are "
+            f"ROCm {header_version[0]}.{header_version[1]} but the build's hipcc "
+            f"({hipcc}) is ROCm {compiler_version[0]}.{compiler_version[1]}. The "
+            "build continues without the system headers; if it fails with "
+            "missing rocPRIM or hipcub headers, install the matching development "
+            f'components (e.g. pip install "rocm-sdk-devel=='
+            f'{compiler_version[0]}.{compiler_version[1]}.*").'
+        )
         return None
     return _SYSTEM_ROCM_INCLUDE
 
