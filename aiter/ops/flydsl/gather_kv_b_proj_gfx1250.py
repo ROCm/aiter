@@ -4,8 +4,6 @@
 """gfx1250 MLA gather + FlyDSL ptpc projection."""
 
 import torch
-import triton
-import triton.language as tl
 from torch import Tensor
 
 _KV_C = 512
@@ -19,15 +17,17 @@ _fx = None
 
 
 def _run_projection(
-    xq: Tensor,
+    cache: Tensor,
+    indices: Tensor,
+    activation_scale: Tensor,
     weight: Tensor,
-    x_scale: Tensor,
     weight_scale: Tensor,
     k_out: Tensor,
     v_out: Tensor,
     n_heads: int,
+    m: int,
 ) -> None:
-    """Launch the fixed-width MLA WMMA kernel without using the GEMM ABI."""
+    """Launch the fixed-width indexed MLA WMMA kernel."""
     global _launch_projection, _ptr_arg, _fx
     if _launch_projection is None:
         import flydsl.expr as fx
@@ -41,22 +41,22 @@ def _run_projection(
         _ptr_arg = ptr_arg
         _fx = fx
 
-    sa = x_scale.reshape(-1).to(torch.float32).contiguous()
-    sb = weight_scale.reshape(-1).to(torch.float32).contiguous()
+    scale_is_ptr = activation_scale.device.type != "cpu"
+    scale_ptr = activation_scale if scale_is_ptr else cache
     args = (
         _ptr_arg(k_out),
         _ptr_arg(v_out),
-        _ptr_arg(xq),
+        _ptr_arg(cache),
+        _ptr_arg(indices),
         _ptr_arg(weight),
-        _ptr_arg(sa),
-        _ptr_arg(sb),
-        xq.shape[0],
-        _fx.Stream(torch.cuda.current_stream(device=xq.device)),
+        _ptr_arg(scale_ptr),
+        _ptr_arg(weight_scale.reshape(-1)),
+        cache.shape[0],
+        m,
+        0.0 if scale_is_ptr else float(activation_scale),
+        _fx.Stream(torch.cuda.current_stream(device=cache.device)),
     )
-    if n_heads == 96:
-        _launch_projection(*args)
-    else:
-        _launch_projection(*args, n_heads)
+    _launch_projection(*args, n_heads, int(scale_is_ptr))
 
 
 def unsupported_reason(
@@ -75,10 +75,14 @@ def unsupported_reason(
         return f"k_buffer must be [num_blocks, 1, {_KV_C + _KV_PE}]"
     if k_buffer.dtype != torch.float8_e4m3fn:
         return f"k_buffer must be torch.float8_e4m3fn, got {k_buffer.dtype}"
+    if not k_buffer.is_contiguous():
+        return "k_buffer must be contiguous"
     if kv_proj_weight.dtype != torch.float8_e4m3fn:
         return f"kv_proj_weight must be torch.float8_e4m3fn, got {kv_proj_weight.dtype}"
     if not getattr(kv_proj_weight, "is_shuffled", False):
         return "kv_proj_weight must use the 16x16 preshuffled layout"
+    if not kv_proj_weight.is_contiguous():
+        return "kv_proj_weight must be contiguous"
     if (
         k_prefix.dim() != 3
         or v_prefix.dim() != 3
@@ -96,6 +100,8 @@ def unsupported_reason(
         return f"kv_proj_weight must be [{weight_n}, {_KV_C}]"
     if kv_proj_scale is None or kv_proj_scale.numel() != weight_n:
         return f"kv_proj_scale must have {weight_n} per-output-row elements"
+    if kv_proj_scale.dtype != torch.float32 or not kv_proj_scale.is_contiguous():
+        return "kv_proj_scale must be contiguous float32"
     if k_prefix.dtype != torch.bfloat16 or v_prefix.dtype != torch.bfloat16:
         return "outputs must both be bfloat16"
     if not k_prefix.is_contiguous() or not v_prefix.is_contiguous():
@@ -104,81 +110,6 @@ def unsupported_reason(
     if any(t.device != k_buffer.device for t in tensors):
         return "all tensors must be on the cache device"
     return None
-
-
-@triton.jit
-def _gather_latent(
-    cache,
-    indices,
-    xq,
-    x_scale,
-    cache_scale,
-    M: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_K: tl.constexpr,
-    SCALE_IS_PTR: tl.constexpr,
-):
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    cols = tl.arange(0, BLOCK_K)
-    row_mask = rows < M
-    safe_rows = tl.where(row_mask, rows, 0)
-    slots = tl.load(indices + safe_rows, mask=row_mask, other=0)
-    values = tl.load(
-        cache + slots[:, None] * 576 + cols[None, :],
-        mask=row_mask[:, None],
-        other=0.0,
-    )
-    x_off = (
-        (safe_rows[:, None] // 2) * 1024
-        + (cols[None, :] // 128) * 256
-        + (safe_rows[:, None] % 2) * 128
-        + cols[None, :] % 128
-    )
-    tl.store(xq + x_off, values, mask=row_mask[:, None])
-    scale = tl.load(cache_scale) if SCALE_IS_PTR else cache_scale
-    tl.store(x_scale + safe_rows, scale, mask=row_mask)
-
-
-@triton.jit
-def _copy_rope(
-    cache,
-    indices,
-    cache_scale,
-    k_out,
-    M: tl.constexpr,
-    BLOCK_M: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    HEADS: tl.constexpr,
-    SCALE_IS_PTR: tl.constexpr,
-):
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    heads = tl.program_id(1) * BLOCK_H + tl.arange(0, BLOCK_H)
-    cols = tl.arange(0, BLOCK_D)
-    row_mask = rows < M
-    safe_rows = tl.where(row_mask, rows, 0)
-    rope_mask = row_mask[:, None] & (cols[None, :] < 64)
-    slots = tl.load(indices + safe_rows, mask=row_mask, other=0)
-    rope = tl.load(
-        cache + slots[:, None] * 576 + 512 + cols[None, :],
-        mask=rope_mask,
-        other=0.0,
-    ).to(tl.float32)
-    scale = tl.load(cache_scale) if SCALE_IS_PTR else cache_scale
-    rope *= scale
-    out = (
-        k_out
-        + safe_rows[:, None, None] * (HEADS * 192)
-        + heads[None, :, None] * 192
-        + 128
-        + cols[None, None, :]
-    )
-    out_mask = (
-        row_mask[:, None, None]
-        & (heads[None, :, None] < HEADS)
-        & (cols[None, None, :] < 64)
-    )
-    tl.store(out, rope[:, None, :], mask=out_mask)
 
 
 def gather_kv_b_proj_flydsl_gfx1250(
@@ -197,19 +128,10 @@ def gather_kv_b_proj_flydsl_gfx1250(
     shuffled_kv_cache: bool = False,
 ) -> None:
     """Use the dedicated gfx1250 FlyDSL WMMA path for 128+128 MLA prefixes."""
-    reason = unsupported_reason(
-        k_buffer,
-        kv_proj_weight,
-        kv_proj_scale,
-        k_prefix,
-        v_prefix,
-        shuffled_kv_cache=shuffled_kv_cache,
-    )
-    if reason is not None or not weight_preshuffle:
+    if not weight_preshuffle:
         raise ValueError(
-            f"[gfx1250 FlyDSL gather_kv_b_proj] {reason or 'weight layout'}"
+            "[gfx1250 FlyDSL gather_kv_b_proj] preshuffled weight required"
         )
-
     total_kv = k_prefix.shape[0]
     m = int(total_kv if num_tokens is None else num_tokens)
     if m < 0:
@@ -220,47 +142,28 @@ def gather_kv_b_proj_flydsl_gfx1250(
         return
     if kv_indices.numel() < m:
         raise ValueError(f"kv_indices has {kv_indices.numel()} entries, need {m}")
+    if (
+        kv_indices.dtype != torch.int32
+        or kv_indices.device != k_buffer.device
+        or not kv_indices.is_contiguous()
+    ):
+        raise ValueError("kv_indices must be contiguous int32 on the cache device")
     if k_scale.numel() != 1 or k_scale.device not in (
         k_buffer.device,
         torch.device("cpu"),
     ):
         raise ValueError("k_scale must be one element on the CPU or cache device")
-    scale_is_ptr = k_scale.device.type != "cpu"
-    scale_arg = k_scale if scale_is_ptr else float(k_scale)
+    if k_scale.dtype != torch.float32:
+        raise ValueError(f"k_scale must be float32, got {k_scale.dtype}")
 
-    n_heads = k_prefix.shape[1]
-    xq = torch.empty((m, _KV_C), dtype=torch.float8_e4m3fn, device=k_buffer.device)
-    x_scale = torch.empty((m, 1), dtype=torch.float32, device=k_buffer.device)
-
-    _gather_latent[(triton.cdiv(m, 16),)](
+    _run_projection(
         k_buffer,
         kv_indices,
-        xq,
-        x_scale,
-        scale_arg,
-        M=m,
-        BLOCK_M=16,
-        BLOCK_K=_KV_C,
-        SCALE_IS_PTR=scale_is_ptr,
-    )
-    _run_projection(
-        xq,
+        k_scale,
         kv_proj_weight,
-        x_scale,
         kv_proj_scale,
         k_prefix,
         v_prefix,
-        n_heads,
-    )
-    _copy_rope[(triton.cdiv(m, 16), triton.cdiv(n_heads, 8))](
-        k_buffer,
-        kv_indices,
-        scale_arg,
-        k_prefix,
-        M=m,
-        BLOCK_M=16,
-        BLOCK_D=64,
-        BLOCK_H=8,
-        HEADS=n_heads,
-        SCALE_IS_PTR=scale_is_ptr,
+        k_prefix.shape[1],
+        m,
     )
