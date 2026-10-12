@@ -239,9 +239,9 @@ def mhc_res_shuffle_enabled(m: int, arch: str | None = None) -> bool:
     return arch == "gfx1250" and 0 < m < fused_m_upper_bound
 
 
-# Hidden sizes the gfx1250 Gluon mhc_post_pre kernels are tuned for (DSV4-Pro);
-# other hidden sizes keep the HIP kernels.
-MHC_GLUON_POST_PRE_HIDDEN_SIZES = (7168,)
+# Hidden sizes the gfx1250 Gluon mhc_post_pre kernels are tuned for (DSV4-Flash 4096,
+# DSV4-Pro 7168); other hidden sizes keep the HIP kernels.
+MHC_GLUON_POST_PRE_HIDDEN_SIZES = (4096, 7168)
 
 
 def _mhc_res_gluon(m: int, hidden_size: int, arch: str | None = None) -> bool:
