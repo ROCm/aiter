@@ -1,5 +1,6 @@
-"""Focused tests for PA-Gluon's centralized worker policy."""
+"""AOT driver coverage: MLA config wiring and PA-Gluon's GPU worker policy."""
 
+import inspect
 import pathlib
 import sys
 import unittest
@@ -11,8 +12,19 @@ if str(_REPO_ROOT) not in sys.path:
 
 import torch
 
+from aiter.aot import asm_mla_decode_fwd as driver
 from csrc.cpp_itfs import utils as cpp_itfs_utils
+from csrc.cpp_itfs.mla import asm_mla_decode_fwd as compile_module
 from csrc.cpp_itfs.pa_gluon_aot import pa_decode_gluon_aot_prebuild as pa_gluon
+
+
+class AsmMlaDecodeAotTest(unittest.TestCase):
+    def test_config_fields_match_compile_api(self):
+        compile_parameters = tuple(
+            inspect.signature(compile_module.compile).parameters
+        )[:6]
+
+        self.assertEqual(driver.MLAConfig._fields, compile_parameters)
 
 
 class PaGluonProcessLimitTest(unittest.TestCase):
@@ -123,7 +135,3 @@ class PaGluonProcessLimitTest(unittest.TestCase):
             ):
                 self.assertEqual(cpp_itfs_utils._build_command(3), [*command, "-j1"])
         self.assertEqual(worker_count.call_args_list, [call(3), call(3)])
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
