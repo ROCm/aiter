@@ -290,6 +290,10 @@ class AttentionProgram:
         stride_lse_b,
         stride_lse_h,
         stride_lse_t,
+        stride_q_b,
+        stride_k_b,
+        stride_v_b,
+        stride_o_b,
     ):
         batch = gl.program_id(0)
         q_head = gl.program_id(1)
@@ -305,10 +309,15 @@ class AttentionProgram:
             kv_len = gl.load(cu_seqlens_k_ptr + batch + 1) - kv_base
             lse_row = seq_base
         else:
-            # Dense batches are packed along tokens: batch b starts at b * S.
-            seq_base = batch * seqlen_q
+            # Dense batches start at their own batch stride, so the batch and
+            # token strides are independent.
+            q_ptr += batch.to(gl.int64) * stride_q_b
+            k_ptr += batch.to(gl.int64) * stride_k_b
+            v_ptr += batch.to(gl.int64) * stride_v_b
+            output_ptr += batch.to(gl.int64) * stride_o_b
+            seq_base = gl.to_tensor(0)
             seq_len = gl.to_tensor(seqlen_q)
-            kv_base = batch * seqlen_k
+            kv_base = gl.to_tensor(0)
             kv_len = gl.to_tensor(seqlen_k)
             lse_row = 0
         # Q, O and LSE are based at this program's query tile, so their 32-bit
@@ -729,6 +738,10 @@ def _mha_prefill_gfx1250(
     stride_lse_b,
     stride_lse_h,
     stride_lse_t,
+    stride_q_b,
+    stride_k_b,
+    stride_v_b,
+    stride_o_b,
     Q_STRIDE_T: gl.constexpr,
     Q_STRIDE_H: gl.constexpr,
     Q_STRIDE_D: gl.constexpr,
@@ -804,6 +817,10 @@ def _mha_prefill_gfx1250(
         stride_lse_b,
         stride_lse_h,
         stride_lse_t,
+        stride_q_b,
+        stride_k_b,
+        stride_v_b,
+        stride_o_b,
     )
     if program.q_start < program.seq_len:
         # Key index that the block's first query row lines up with.

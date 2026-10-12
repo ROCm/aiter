@@ -26,18 +26,6 @@ from aiter.ops.triton.utils._triton.arch_info import get_arch
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
-# gfx1250
-try:
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_prefill import (
-        _get_config as _get_gfx1250_gluon_config,
-    )
-    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_prefill import (
-        _mha_prefill_gfx1250,
-    )
-except Exception:  # noqa: BLE001
-    _get_gfx1250_gluon_config = None
-    _mha_prefill_gfx1250 = None
-
 _LOGGER = AiterTritonLogger()
 
 # ---------------------------------------------------------------------------
@@ -64,8 +52,6 @@ def is_gluon_available() -> bool:
     """True when the Gluon MHA forward kernel can actually run on this device."""
     if not _TRITON_GE_36:
         return False
-    if _is_gfx1250():
-        return _mha_prefill_gfx1250 is not None
     arch = get_arch() or ""
     return any(supported in arch for supported in _GLUON_SUPPORTED_ARCHS)
 
@@ -558,15 +544,6 @@ _INT32_MAX = (1 << 31) - 1
 _GFX1250_INV_LN2 = 1.4426950408889634
 
 
-def _gfx1250_fold_batch(x: torch.Tensor) -> torch.Tensor:
-    """The gfx1250 kernel walks bshd as packed tokens (batch b starts at token
-    b * seqlen), so batch and sequence must share one token stride."""
-    batch, seqlen = x.shape[:2]
-    if x.stride(-1) != 1 or (batch > 1 and x.stride(0) != seqlen * x.stride(1)):
-        x = x.contiguous()
-    return x
-
-
 def _gfx1250_fp8_descale(
     descale: torch.Tensor, batch: int, heads: int, name: str
 ) -> tuple[torch.Tensor, tuple[int, int]]:
@@ -600,6 +577,12 @@ def _get_gfx1250_launch_config(
     config: dict | None,
 ) -> tuple[tuple[int, int, int], dict]:
     """Grid and kernel knobs. Tiles and thresholds live in the JSON config."""
+    # gfx1250-only imports: the kernel module needs Triton's gfx1250 Gluon API,
+    # which other archs' Triton builds may lack.
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_prefill import (
+        _get_config as _get_gfx1250_gluon_config,
+    )
+
     table = _get_gfx1250_gluon_config()
     dispatch = table["dispatch"]
     num_cus = get_num_sms()
@@ -707,13 +690,13 @@ def _gluon_gfx1250_flash_attn_forward(
             raise TypeError("cu_seqlens_q/cu_seqlens_k must be int32")
         batch = cu_seqlens_q.numel() - 1
         seqlen_q, seqlen_k = int(max_seqlen_q), int(max_seqlen_k)
-        q, k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (q, k, v))
     else:
         batch, seqlen_q = q.shape[:2]
         seqlen_k = k.shape[1]
         if k.shape[0] != batch:
             raise ValueError(f"q has batch {batch} but k/v have batch {k.shape[0]}")
-        q, k, v = (_gfx1250_fold_batch(x) for x in (q, k, v))
+    # K/V go through TDM, which needs a unit head_dim stride; Q takes any stride.
+    k, v = (x if x.stride(-1) == 1 else x.contiguous() for x in (k, v))
 
     if sink is not None:
         if sink.dim() != 1 or sink.shape[0] != num_q_heads:
@@ -747,8 +730,6 @@ def _gluon_gfx1250_flash_attn_forward(
             f"and unit head_dim stride, got {tuple(o.shape)} {o.dtype} "
             f"strides {o.stride()}"
         )
-    elif not varlen and batch > 1 and o.stride(0) != seqlen_q * o.stride(1):
-        raise ValueError("Gluon MHA out must fold batch and sequence into tokens")
 
     if return_lse:
         if varlen:
@@ -775,8 +756,16 @@ def _gluon_gfx1250_flash_attn_forward(
             "Gluon MHA on gfx1250 addresses one out tile with 32-bit byte "
             f"offsets; out strides {o.stride()} are too large"
         )
+    if varlen:
+        batch_strides = (0, 0, 0, 0)
+    else:
+        batch_strides = (q.stride(0), k.stride(0), v.stride(0), o.stride(0))
     num_warps = launch.pop("num_warps")
     llvm_fn_attrs = launch.pop("llvm_fn_attrs", None)
+    from aiter.ops.triton._gluon_kernels.gfx1250.attention.mha_prefill import (
+        _mha_prefill_gfx1250,
+    )
+
     _mha_prefill_gfx1250[grid](
         q,
         k,
@@ -795,6 +784,7 @@ def _gluon_gfx1250_flash_attn_forward(
         *k_ds,
         *v_ds,
         *lse_strides,
+        *batch_strides,
         Q_STRIDE_T=q.stride(-3),
         Q_STRIDE_H=q.stride(-2),
         Q_STRIDE_D=q.stride(-1),
