@@ -19,7 +19,8 @@ _GLUON_REPR_KEYS = [
 ]
 
 _batched_gemm_bf16_bandwidth_bound_repr = make_kernel_repr(
-    "_batched_gemm_bf16_gfx1250_bandwidth_bound_kernel", _GLUON_REPR_KEYS
+    "_batched_gemm_bf16_gfx1250_bandwidth_bound_kernel",
+    _GLUON_REPR_KEYS + ["TDM_STORE"],
 )
 
 _batched_gemm_bf16_compute_bound_repr = make_kernel_repr(
@@ -344,7 +345,7 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
         # for wide-N outputs; staging through LDS lets TDM write full rows.
         # Requires NUM_KSPLIT == 1 and a unit-stride output N dim.
         # Pad one 16-byte bank group per row regardless of element width.
-        C_PAD: gl.constexpr = 16 // c_ptr.type.element_ty.primitive_bitwidth * 8
+        C_PAD: gl.constexpr = 128 // c_ptr.type.element_ty.primitive_bitwidth
         SHARED_LAYOUT_C: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
             [[BLOCK_N, C_PAD]], [BLOCK_M, BLOCK_N], [1, 0]
         )
