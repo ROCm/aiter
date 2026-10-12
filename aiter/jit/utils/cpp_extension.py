@@ -303,11 +303,12 @@ def _probe_hipcc_version(hipcc: str) -> tuple[int, int] | None:
 
 
 # functools.cache keeps the warning to one emission per distinct message:
-# include_paths() runs several times per build and again for every JIT module,
-# so a plain logger.warning here would repeat on each call.
+# callers such as include_paths() run several times per build and again for
+# every JIT module, so a plain logger.warning from those paths would repeat
+# on each call.
 @functools.cache
-def _warn_rocm_include_once(message: str) -> None:
-    """Emit ``message`` once per distinct text."""
+def _warn_once(message: str) -> None:
+    """Emit ``message`` once per distinct text, however often it is asked for."""
     logger.warning(message)
 
 
@@ -320,7 +321,7 @@ def _find_matching_system_rocm_include() -> str | None:
 
     header_version = _read_hip_header_version(_SYSTEM_ROCM_INCLUDE)
     if header_version is None:
-        _warn_rocm_include_once(
+        _warn_once(
             f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: cannot read "
             f"their HIP version from {os.path.join(_SYSTEM_ROCM_INCLUDE, 'hip', 'hip_version.h')}. "
             "The build continues without them."
@@ -332,14 +333,14 @@ def _find_matching_system_rocm_include() -> str | None:
     hipcc = _join_rocm_home("bin", "hipcc")
     compiler_version = _probe_hipcc_version(hipcc)
     if compiler_version is None:
-        _warn_rocm_include_once(
+        _warn_once(
             f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: cannot "
             f"determine the HIP version of {hipcc}. The build continues without "
             "them."
         )
         return None
     if header_version != compiler_version:
-        _warn_rocm_include_once(
+        _warn_once(
             f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: they are "
             f"ROCm {header_version[0]}.{header_version[1]} but the build's hipcc "
             f"({hipcc}) is ROCm {compiler_version[0]}.{compiler_version[1]}. The "

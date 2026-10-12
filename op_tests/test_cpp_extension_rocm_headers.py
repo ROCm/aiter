@@ -40,7 +40,8 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
         # The compiler probe is cached per hipcc path, so start every test cold
         # and let each case observe its own mocked `hipcc --version` output.
         self.cpp_extension._probe_hipcc_version.cache_clear()
-        self.cpp_extension._warn_rocm_include_once.cache_clear()
+        # Same for the warn-once cache: each case must observe its own warning.
+        self.cpp_extension._warn_once.cache_clear()
         tempdir = self.stack.enter_context(tempfile.TemporaryDirectory())
         self.root = pathlib.Path(tempdir)
         self.runtime = self.root / "python-sdk" / "include"
@@ -129,7 +130,7 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
 
             # A failed compiler probe is likewise reported once, and a distinct
             # reason gets its own warning instead of being suppressed.
-            self.cpp_extension._warn_rocm_include_once.cache_clear()
+            self.cpp_extension._warn_once.cache_clear()
             warning.reset_mock()
             self.version_header.write_text(
                 "#define HIP_VERSION_MAJOR 7\n#define HIP_VERSION_MINOR 15\n"
