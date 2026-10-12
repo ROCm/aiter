@@ -9,6 +9,7 @@ zero while the FP32 denominator still includes their mass.
 """
 
 import argparse
+import sys
 
 import torch
 
@@ -103,7 +104,9 @@ def _run_aiter_rank(case, *, persistent, return_lse, cp_world_size, cp_rank):
             [0, kv_indices.numel()], dtype=torch.int32, device=q.device
         )
     q_len, nhead = q.shape[:2]
-    out = torch.empty((q_len, nhead, _KV_LORA_RANK), dtype=torch.bfloat16, device=q.device)
+    out = torch.empty(
+        (q_len, nhead, _KV_LORA_RANK), dtype=torch.bfloat16, device=q.device
+    )
     metadata_args = {}
     if persistent:
         metadata = [
@@ -152,14 +155,14 @@ def _run_aiter_rank(case, *, persistent, return_lse, cp_world_size, cp_rank):
             dtype_kv_nope=kv.dtype,
             is_cp_round_robin=cp_world_size > 1,
         )
-        metadata_args = dict(
-            work_meta_data=work_meta_data,
-            work_indptr=work_indptr,
-            work_info_set=work_info_set,
-            reduce_indptr=reduce_indptr,
-            reduce_final_map=reduce_final_map,
-            reduce_partial_map=reduce_partial_map,
-        )
+        metadata_args = {
+            "work_meta_data": work_meta_data,
+            "work_indptr": work_indptr,
+            "work_info_set": work_info_set,
+            "reduce_indptr": reduce_indptr,
+            "reduce_final_map": reduce_final_map,
+            "reduce_partial_map": reduce_partial_map,
+        }
 
     _, final_lse = aiter.mla.mla_decode_fwd(
         q,
@@ -228,9 +231,11 @@ def test_mla_fp8_softmax_underflow(
     if cp_world_size > 1:
         persistent = True
         return_lse = True
-    run_args = dict(
-        persistent=persistent, return_lse=return_lse, cp_world_size=cp_world_size
-    )
+    run_args = {
+        "persistent": persistent,
+        "return_lse": return_lse,
+        "cp_world_size": cp_world_size,
+    }
     print(
         f"Case: {nhead=}, {q_len=}, {persistent=}, {return_lse=}, {cp_world_size=}",
         flush=True,
@@ -284,16 +289,40 @@ def test_mla_fp8_softmax_underflow(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("-n", "--nhead", type=int, choices=[8, 16, 32, 64], default=_HEADS)
+    parser.add_argument(
+        "-n", "--nhead", type=int, choices=[8, 16, 32, 64], default=_HEADS
+    )
     parser.add_argument("-q", "--q-len", type=int, choices=[1, 2, 4], default=1)
     parser.add_argument("--persistent", action="store_true")
     parser.add_argument("-lse", "--return-lse", action="store_true")
     parser.add_argument("--cp-world-size", type=int, choices=[1, 2], default=1)
     args = parser.parse_args()
-    test_mla_fp8_softmax_underflow(
-        nhead=args.nhead,
-        q_len=args.q_len,
-        persistent=args.persistent,
-        return_lse=args.return_lse,
-        cp_world_size=args.cp_world_size,
-    )
+    if len(sys.argv) == 1:
+        cases = (
+            (16, 1, False, False, 1),
+            (16, 4, False, False, 1),
+            (16, 1, True, False, 1),
+            (16, 1, True, True, 1),
+            (16, 4, True, False, 1),
+            (16, 4, True, True, 1),
+            (64, 1, True, False, 1),
+            (64, 1, True, True, 1),
+            (16, 4, True, True, 2),
+            (32, 4, True, True, 2),
+        )
+        for nhead, q_len, persistent, return_lse, cp_world_size in cases:
+            test_mla_fp8_softmax_underflow(
+                nhead=nhead,
+                q_len=q_len,
+                persistent=persistent,
+                return_lse=return_lse,
+                cp_world_size=cp_world_size,
+            )
+    else:
+        test_mla_fp8_softmax_underflow(
+            nhead=args.nhead,
+            q_len=args.q_len,
+            persistent=args.persistent,
+            return_lse=args.return_lse,
+            cp_world_size=args.cp_world_size,
+        )
