@@ -12,6 +12,15 @@ POST_EPS = 1e-8
 PRE_EPS = 1e-5
 
 
+def generate_fused_rmsnorm_add_rmsnorm_inputs(rows, width):
+    torch.manual_seed(1064)
+    x = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
+    post_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
+    pre_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
+    return x, residual, post_weight, pre_weight
+
+
 def reference(x, residual, post_weight, pre_weight):
     x_f32 = x.float()
     post = (
@@ -30,11 +39,9 @@ def reference(x, residual, post_weight, pre_weight):
 
 @pytest.mark.parametrize("rows, width", [(1, 6656), (64, 6656), (4096, 6656), (7, 257)])
 def test_fused_rmsnorm_add_rmsnorm(rows, width):
-    torch.manual_seed(1064)
-    x = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn((rows, width), device="cuda", dtype=torch.bfloat16)
-    post_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
-    pre_weight = torch.randn(width, device="cuda", dtype=torch.bfloat16) * 0.1
+    x, residual, post_weight, pre_weight = generate_fused_rmsnorm_add_rmsnorm_inputs(
+        rows, width
+    )
 
     expected_residual, expected_norm = reference(x, residual, post_weight, pre_weight)
     residual_out = torch.empty_like(x)
