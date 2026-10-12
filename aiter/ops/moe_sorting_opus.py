@@ -55,7 +55,7 @@ def mxfp4_moe_sort_quant_fwd(
 ) -> None:
     """Fused route sort + compact MXFP4 activation quantization.
 
-    gfx950 only, ``model_dim=7168``, ``block_m=32``, ``M`` in ``[1, 128]``.
-    ``(num_experts, topk)`` must be one of ``(256, 8)``, ``(384, 8)`` or
-    ``(385, 9)`` -- the expert histogram is a kernel template parameter.
+    gfx950 only, ``model_dim=4096``, ``block_m=32``, ``M`` in ``[1, 128]``.
+    ``(num_experts, topk)`` must be one of ``(512, 10)`` or ``(513, 11)``
+    -- the expert histogram is a kernel template parameter.
     """

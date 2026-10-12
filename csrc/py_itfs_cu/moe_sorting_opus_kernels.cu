@@ -452,7 +452,7 @@ void mxfp4_moe_sort_quant_fwd(aiter_tensor_t& hidden_states,
                     route_supported,
                 __func__,
                 ": only H=4096 with (num_experts, topk) in "
-                "{(256,8), (384,8), (385,9)} is supported");
+                "{(512,10), (513,11)} is supported");
     AITER_CHECK(hidden_states.is_contiguous() && topk_ids.is_contiguous() &&
                     topk_weights.is_contiguous() && sorted_token_ids.is_contiguous() &&
                     sorted_weights.is_contiguous() && sorted_expert_ids.is_contiguous() &&

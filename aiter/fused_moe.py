@@ -154,7 +154,7 @@ def _is_fused_decode_sort_quant_enabled(
 ) -> bool:
     """Gate the direct-scale HIP route-sort/quant kernel to supported decode.
 
-    The shape bounds mirror the kernel's own contract (``model_dim=7168``,
+    The shape bounds mirror the kernel's own contract (``model_dim=4096``,
     ``block_m=32``, ``M`` in ``[1, 128]``, an instantiated ``(E, topk)``
     route). The remaining conditions are integration requirements: they
     describe the stage-1 path whose activation quantization this kernel
