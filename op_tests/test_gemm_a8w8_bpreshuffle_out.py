@@ -201,3 +201,17 @@ def test_weight_k_below_activation_k_rejected():
 
     with pytest.raises(ValueError, match="WQ K >= XQ K"):
         aiter.gemm_a8w8_bpreshuffle_out(out, xq, wq, x_scale, w_scale)
+
+
+@pytest.mark.parametrize("arg", ["XQ", "WQ"])
+def test_non_2d_operand_rejected_before_launch(arg):
+    # A rank-3 [M, 2, K/2] XQ keeps out at (M, N) and would otherwise dispatch on
+    # K/2 while CK launches with K=2.
+    m, n, k = 32, 256, 512
+    args = dict(zip(("XQ", "WQ", "x_scale", "w_scale"), _inputs(m, n, k)))
+    args[arg] = args[arg].view(args[arg].shape[0], 2, k // 2)
+    out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+
+    with pytest.raises(ValueError, match="must be 2-D"):
+        aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.all(out == 3.0)

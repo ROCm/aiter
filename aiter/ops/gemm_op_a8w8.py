@@ -835,13 +835,19 @@ def gemm_a8w8_bpreshuffle_out(
 ) -> None:
     """gemm_a8w8_bpreshuffle written into a caller-owned buffer.
 
-    All tensors must be on one CUDA/HIP device, and ``out`` must be a contiguous bf16
-    [M, N] tensor. Only
+    XQ and WQ must be 2-D, all tensors must be on one CUDA/HIP device, and ``out``
+    must be a contiguous bf16 [M, N] tensor. Only
     bf16 is accepted: the FlyDSL 8-wave kernels, which many tuned rows select,
     write bf16 only. CK and CKTile write a dense row-major [M, N], so a strided
     ``out`` (e.g. a column slice of a wider buffer) is rejected instead of being
     written past its bounds. Every check runs before any kernel launch.
     """
+    # The dispatcher reads K from shape[-1] but the CK launcher reads size(1),
+    # so any other rank would tune for one K and launch with another.
+    if XQ.ndim != 2 or WQ.ndim != 2:
+        raise ValueError(
+            f"XQ and WQ must be 2-D; got XQ {tuple(XQ.shape)}, WQ {tuple(WQ.shape)}"
+        )
     m = XQ.shape[0]
     n = WQ.shape[0]
     if out.dtype != dtypes.bf16:
