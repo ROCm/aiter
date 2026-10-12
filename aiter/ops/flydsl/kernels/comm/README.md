@@ -155,6 +155,42 @@ If the `AITER_CUSTOM_AR_*` window and the one-shot window do not overlap,
 |---|---|
 | `FLYDSL_EXTRA_SOURCE_DIRS` | Adds directories to the FlyDSL JIT cache key. Refer to [The JIT cache does not see changes in shared modules](#the-jit-cache-does-not-see-changes-in-shared-modules). |
 
+## Tests and benchmarks
+
+Two multi-GPU tests check and time the kernels. The `--scenario` option selects
+what a test does:
+
+- `verify` is the default. It checks correctness and times the FlyDSL kernels.
+- `bench` compares the FlyDSL kernels with the stock kernels on the same
+  payloads.
+
+| Test | FlyDSL kernels | Stock kernels in `bench` |
+|---|---|---|
+| `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
+| `op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+
+```bash
+python3 op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py --scenario bench --tp 4
+python3 op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py --scenario bench \
+    --tp 4 --report /tmp/int4.md
+```
+
+The one-shot bench has two comparisons:
+
+- `flydsl vs prod` compares with the kernel that production runs when the
+  FlyDSL path is off.
+- `flydsl vs best` compares with the fastest stock kernel.
+
+The `variant` columns show which kernel each candidate ran. For `cdr` this is
+`ll`, `ll128_<block>`, `1stage` or `2stage`. The INT4 bench compares each
+schedule with `hip`. A ratio above 1.0 means that the FlyDSL kernel is faster.
+
+All candidates are timed with the same method, on the same input, in the same
+process. Each candidate is a CUDA graph of 10 back-to-back calls. The test
+times the replays in rounds and rotates the order of the candidates in each
+round. `op_tests/multigpu_tests/flydsl_allreduce_bench.py` describes the method
+and how it prevents bias in the comparison.
+
 ## Notes
 
 ### The JIT cache does not see changes in shared modules

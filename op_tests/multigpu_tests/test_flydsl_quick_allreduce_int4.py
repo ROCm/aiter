@@ -3,16 +3,19 @@
 
 """Runtime correctness and timing for FlyDSL quick all-reduce (``QuickAllReduceInt4``).
 
-A default run covers what production dispatch can run on this host, and each
+``--scenario`` selects what a run does: ``verify`` (the default) checks the
+kernels, and ``bench`` compares them with aiter's HIP quick all-reduce.
+
+**verify** covers what production dispatch can run on this host, and each
 sweep ends in a markdown table:
 
 * ``test_quick_allreduce_int4`` -- the shipping configuration (codecs and
   super-tile left to the per-world defaults and ladders, as production dispatch
-  constructs the engine), timed with ``run_perftest``. The payloads come from
-  ``allreduce_policy``: for every schedule it routes to at each world size, the
-  smallest payload that reaches each kernel it can select there, plus the top
-  of its window. One row per schedule and world size captures the all-reduce
-  into a CUDA graph and replays it. A schedule the policy never selects on this
+  constructs the engine), timed on a CUDA graph of ``GRAPH_INNER``
+  back-to-back calls and checked again after every replay. The payloads come
+  from ``allreduce_policy``: for every schedule it routes to at each world
+  size, the smallest payload that reaches each kernel it can select there,
+  plus the top of its window. A schedule the policy never selects on this
   host (the ring on xGMI) gets one row, for a user who moves the boundary with
   ``AITER_FLY_AR_MESH_MAX_BYTES``.
 * ``test_quick_allreduce_int4_coverage`` -- the kernels those rows ran include
@@ -40,6 +43,22 @@ from the packet it sent, since it never round-trips through its own inbox.
 The ring's owner stores its chunk before the all-gather quantization, so
 its ranks legitimately differ and only report the count.
 
+**bench** times each FlyDSL schedule (``mesh``, ``ring``) against the one
+stock kernel of the INT4 regime: ``hip``, aiter's HIP quick all-reduce
+(``QuickAllReduce`` with ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), on the
+same payloads. The comparison is ``hip us / <schedule> us``, so above 1.0 the
+FlyDSL schedule is faster; ``flydsl vs hip`` is the schedule the policy routes
+the payload to (``route``), where that is a quantized one. The HIP kernel runs
+below its production floor (``QuickAllReduce._QR_MIN_SIZE``) too: that floor
+is a speed policy, and the comparison is between kernels. ``hip prod`` says
+whether production would run it on the payload.
+
+``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
+The default payloads are the verify sweep's shipping payloads of both
+schedules; ``-s`` or ``--shape-csv`` replace them, ``-a`` picks the schedules,
+and ``--grid-cap`` and ``--block`` pin their geometry. ``--report``,
+``--csv`` and ``-o`` save the tables.
+
 Every rank is a ``multiprocessing`` spawn worker that builds its own engine.
 All rows that share an engine configuration ride one spawn. The oracle is an
 untimed fp32 NCCL all-reduce of the same per-rank inputs. INT4/INT6 are lossy,
@@ -62,18 +81,31 @@ import os
 import sys
 from multiprocessing import Pool, freeze_support, set_start_method
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+# The repo root for ``aiter``, this directory for ``flydsl_allreduce_bench``.
+# The ranks are spawned, so they re-import this file and need the same paths.
+for _path in (_REPO_ROOT, _HERE):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
+import flydsl_allreduce_bench as fab
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
+from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    get_tp_group,
+    init_distributed_environment,
+    set_custom_all_reduce,
+)
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose
 
 set_start_method("spawn", force=True)
 
@@ -131,6 +163,14 @@ CLOSE_ERR_RATIO = 0.5
 # slot, so a graph that froze either would pass the first replay and fail a
 # later one. Four covers both parities twice.
 GRAPH_REPLAYS = 4
+
+# Calls captured in each timed CUDA graph.
+GRAPH_INNER = fab.GRAPH_INNER
+
+# bench: the regime of the HIP quick all-reduce, and its accuracy floor. It
+# measures ~18.3 dB; the floor leaves ~4 dB of headroom.
+HIP_QR_REGIME = "INT4"
+HIP_SQNR_FLOOR_DB = 14.0
 
 # Shipping payloads are derived from the dispatch policy (``_ship_payloads``)
 # and laid out at this width. A row is 8 KiB and every policy and ladder
@@ -558,39 +598,29 @@ def _worst(a: dict, b: dict) -> dict:
     return out
 
 
-def _run_rank(
-    rank: int,
-    tp: int,
-    init_method: str,
-    engine_kw: dict,
-    cases: list[tuple],
-    window: tuple[int, int] | None = None,
-) -> list[dict]:
-    """One rank of one spawn: build the engine, then run every case on it.
+def _init_dist(rank: int, tp: int, init_method: str, hip: bool):
+    """Join a TP group as production does. Returns the ``GroupCoordinator``.
 
-    A case is ``(tokens, hidden, fill, graph, time_it)``. The engine is built
-    once, so every case shares its compiled binaries and IPC inbox. *window*
-    is the payload range production dispatch routes to this engine, if any;
-    every row then carries the kernels the engine itself says that range
-    selects.
+    ``QuickAllReduce`` is built only if *hip* is set: its IPC buffer is large,
+    and only the bench scenario runs its kernel.
     """
-    import torch.distributed as dist
-
-    from aiter.ops.flydsl import QuickAllReduceInt4
-
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="nccl",
-        init_method=init_method,
-        world_size=tp,
-        rank=rank,
-        device_id=device,
+    # This test builds its own FlyDSL engines. The dispatcher must not build
+    # more into ``QuickAllReduce``, which would then send the HIP kernel's
+    # payloads to FlyDSL.
+    os.environ["AITER_FLY_AR"] = "0"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME if hip else "NONE"
+    # No candidate here uses CustomAllreduce.
+    set_custom_all_reduce(False)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
     )
-    # QuickAllReduceInt4 exchanges IPC metadata over a non-NCCL group; NCCL
-    # stays for the fp32 reference all-reduce.
-    gloo = dist.new_group(backend="gloo")
-    group = dist.group.WORLD
+    ensure_model_parallel_initialized(tp, 1)
+    return get_tp_group()
+
+
+def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
+    """A ``QuickAllReduceInt4`` with every binary compiled."""
+    from aiter.ops.flydsl import QuickAllReduceInt4
 
     fly = QuickAllReduceInt4(
         group=gloo,
@@ -598,22 +628,65 @@ def _run_rank(
         rank=rank,
         world_size=tp,
         # The cases deliberately include sub-threshold shapes (8x1024 is
-        # 16 KiB, well under the default floor) to cover the partial-tile path.
+        # 16 KiB, well under the default floor) to cover the partial-tile
+        # path, and the bench times every payload it is given.
         min_bytes=0,
         **engine_kw,
     )
     fly.preload()
+    return fly
+
+
+def _teardown(engines, gloo) -> None:
+    import torch.distributed as dist
+
+    torch.cuda.synchronize()
+    dist.barrier(group=gloo)
+    for fly in engines:
+        fly.close()
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+def _run_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    engine_kw: dict,
+    cases: list[tuple],
+    timing: tuple[int, int],
+    window: tuple[int, int] | None = None,
+) -> list[dict]:
+    """One rank of one verify spawn: build the engine, then run every case.
+
+    A case is ``(tokens, hidden, fill, time_it)``. The engine is built once, so
+    every case shares its compiled binaries and IPC inbox. *timing* is
+    ``(reps, rounds)`` for ``fab.time_graphs``. *window* is the payload range
+    production dispatch routes to this engine, if any; every row then carries
+    the kernels the engine itself says that range selects.
+    """
+    import torch.distributed as dist
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    tp_group = _init_dist(rank, tp, init_method, hip=False)
+    # QuickAllReduceInt4 exchanges IPC metadata over the gloo group; NCCL stays
+    # for the fp32 reference all-reduce.
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    fly = _engine(rank, tp, gloo, device, engine_kw)
     production_cfgs = None
     if window is not None:
         production_cfgs = [(int(st), int(b)) for st, b in fly.cfgs_for(*window)]
+    reps, rounds = timing
 
     rows = []
     try:
-        for ntok, hidden, fill, graph, time_it in cases:
+        for ntok, hidden, fill, time_it in cases:
             inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
-            dist.barrier()
+            dist.barrier(group=group)
 
             nbytes = int(inp.numel()) * int(inp.element_size())
             cfg_used, _ = fly._pick_cfg(nbytes)
@@ -622,73 +695,157 @@ def _run_rank(
             out = torch.zeros_like(inp)
             fly.allreduce(inp, out)
             torch.cuda.synchronize()
-            dist.barrier()
+            dist.barrier(group=group)
             m = _metrics(out, ref, rank, tile_bytes, group)
 
-            g = None
-            if graph:
-                # Captured on the current stream, which allreduce() launches on
-                # when it is given none; the IPC inbox is allocated at init, so
-                # the captured launch is safe to replay.
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    fly.allreduce(inp, out)
+            us = None
+            if time_it:
+                # The IPC inbox is allocated at init, so the captured launch is
+                # safe to replay.
+                g = fab.capture(lambda src=inp, dst=out: fly.allreduce(src, dst))
                 for _ in range(GRAPH_REPLAYS):
                     out.zero_()
                     g.replay()
                     torch.cuda.synchronize()
-                    dist.barrier()
+                    dist.barrier(group=group)
                     m = _worst(m, _metrics(out, ref, rank, tile_bytes, group))
+                us = fab.time_graphs({"flydsl": g}, gloo, reps=reps, rounds=rounds)[
+                    "flydsl"
+                ]
+                del g
 
             st_used, block_used = cfg_used
-            row = {
-                **m,
-                "link": fly.link,
-                "inbox_memory": fly.inbox_memory,
-                # Resolved, not requested: these come from the per-world-size
-                # default unless the caller pinned a lap, and a regression
-                # should name the codec that produced it.
-                "rs_codec": fly.rs_codec,
-                "ag_codec": fly.ag_codec,
-                "st_used": int(st_used),
-                "block_used": int(block_used),
-                "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
-                "production_cfgs": production_cfgs,
-                "us": None,
-            }
-            if time_it:
-                dist.barrier(group=group)
-                torch.cuda.synchronize()
-                if g is not None:
-                    fn = g.replay
-                else:
-
-                    def fn(eng=fly, src=inp, dst=out):
-                        eng.allreduce(src, dst)
-                        return dst
-
-                # cuda.Event timing, not run_perftest's default profiler timer:
-                # `import aiter` creates a GPU context in the parent, and on
-                # some ROCm/torch builds a child spawned after that records no
-                # GPU events in torch.profiler, so the default timer fails
-                # reducing an empty trace.
-                _, us = run_perftest(fn, use_cuda_event=True)
-                row["us"] = float(us)
-            rows.append(row)
-            del inp, out, ref, g
+            rows.append(
+                {
+                    **m,
+                    "link": fly.link,
+                    "inbox_memory": fly.inbox_memory,
+                    # Resolved, not requested: these come from the
+                    # per-world-size default unless the caller pinned a lap,
+                    # and a regression should name the codec that produced it.
+                    "rs_codec": fly.rs_codec,
+                    "ag_codec": fly.ag_codec,
+                    "st_used": int(st_used),
+                    "block_used": int(block_used),
+                    "grid_by_cfg": {cfg: int(e.grid) for cfg, e in fly._by_cfg.items()},
+                    "production_cfgs": production_cfgs,
+                    "us": us,
+                }
+            )
+            del inp, out, ref
             torch.cuda.empty_cache()
     finally:
-        fly.close()
-        dist.destroy_process_group()
+        _teardown([fly], gloo)
     return rows
 
 
-def _spawn(
-    world_size: int,
+def _hip_runs(qr, nbytes: int) -> bool:
+    """Whether the HIP quick all-reduce can run a bf16 payload of *nbytes*.
+
+    ``QuickAllReduce._should_hip`` without the production size floor.
+    """
+    return qr is not None and nbytes % 16 == 0 and nbytes <= qr.qr_max_size
+
+
+def _bench_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    algorithms: tuple[str, ...],
     engine_kw: dict,
     cases: list[tuple],
-    window: tuple[int, int] | None = None,
-) -> list[list[dict]]:
+    timing: tuple[int, int],
+) -> list[dict]:
+    """One rank of one bench spawn: every candidate on every case.
+
+    One engine per schedule in *algorithms*, each with *engine_kw*, and the
+    HIP quick all-reduce. A case is ``(tokens, hidden)``. Returns, per case,
+    whether production would run the HIP kernel on it and each candidate's
+    per-rank result.
+    """
+    import torch.distributed as dist
+
+    from aiter.dist.device_communicators.quick_all_reduce import QuickReduceRegime
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    tp_group = _init_dist(rank, tp, init_method, hip=True)
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    qr = tp_group.device_communicator.qr_comm
+    if qr is not None and qr.disabled:
+        qr = None
+    level = QuickReduceRegime[HIP_QR_REGIME]
+    # Built in a fixed order: each engine's IPC exchange is a collective.
+    engines = {
+        a: _engine(rank, tp, gloo, device, {"algorithm": a, **engine_kw})
+        for a in algorithms
+    }
+    reps, rounds = timing
+
+    # The input and every candidate's output, for the whole spawn. Refer to
+    # flydsl_allreduce_bench for why the addresses must not change.
+    names = (*algorithms, "hip")
+    max_bytes = max(m * hidden * 2 for m, hidden in cases)
+    bufs = {
+        name: torch.empty(max_bytes, dtype=torch.uint8, device=device)
+        for name in ("inp", *names)
+    }
+
+    def _view(name, m, hidden):
+        return bufs[name][: m * hidden * 2].view(torch.bfloat16).view(m, hidden)
+
+    def _fly(eng, x, out):
+        return lambda: eng.allreduce(x, out)
+
+    def _hip(x, out):
+        def thunk():
+            # Set in the thunk, as production sets it once at init: nothing
+            # else here changes it, but nothing then depends on that.
+            qr.qr_quant_level = level
+            qr.quick_all_reduce(x, out=out)
+
+        return thunk
+
+    rows = []
+    try:
+        for m, hidden in cases:
+            x = _view("inp", m, hidden)
+            x.copy_(_make_inp(m, hidden, "normal", rank=rank, device=device))
+            ref = x.to(torch.float32)
+            dist.all_reduce(ref, group=group)
+            nbytes = m * hidden * 2
+            outs = {name: _view(name, m, hidden) for name in names}
+
+            thunks = {a: _fly(eng, x, outs[a]) for a, eng in engines.items()}
+            hip_prod = False
+            if _hip_runs(qr, nbytes):
+                thunks["hip"] = _hip(x, outs["hip"])
+                qr.qr_quant_level = level
+                hip_prod = qr._should_hip(x)
+
+            graphs, res = {}, {}
+            for name, thunk in thunks.items():
+                graphs[name] = fab.capture(thunk)
+                got = fab.graded_replay(graphs[name], outs[name], gloo).float()
+                res[name] = {"sqnr_db": _sqnr_db(got, ref)}
+            times = fab.time_graphs(graphs, gloo, reps=reps, rounds=rounds)
+            for name, us in times.items():
+                res[name]["us"] = us
+            for algorithm, eng in engines.items():
+                res[algorithm]["variant"] = eng.variant(nbytes)
+            if "hip" in res:
+                wire = "fp16" if qr.use_fp16_kernels else "bf16"
+                res["hip"]["variant"] = f"{HIP_QR_REGIME.lower()}/{wire}"
+            rows.append({"hip prod": hip_prod, "candidates": res})
+            del graphs
+    finally:
+        _teardown(engines.values(), gloo)
+    return rows
+
+
+def _spawn(target, world_size: int, **kwds) -> list:
+    """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -696,14 +853,12 @@ def _spawn(
     try:
         results = [
             pool.apply_async(
-                _run_rank,
+                target,
                 kwds={
                     "rank": rank,
                     "tp": world_size,
                     "init_method": init_method,
-                    "engine_kw": engine_kw,
-                    "cases": cases,
-                    "window": window,
+                    **kwds,
                 },
             )
             for rank in range(world_size)
@@ -722,13 +877,16 @@ def _spawn(
 # Rows are registered up front, grouped by the engine they need, so that each
 # engine is built by exactly one spawn however many tables read from it.
 # A spawn key is ``(tp, sorted engine kwargs)``; a case is
-# ``(tokens, hidden, fill, graph, time_it)``.
+# ``(tokens, hidden, fill, time_it)``, or ``(tokens, hidden)`` in a bench
+# spawn, whose key also names its schedules.
 _CASES: dict[tuple, list[tuple]] = {}
 # Production dispatch window of a shipping engine whose kernel coverage is
 # checked, per spawn key.
 _WINDOWS: dict[tuple, tuple[int, int]] = {}
 _RESULTS: dict[tuple, dict[tuple, list[dict]]] = {}
 _FAILURES: list[str] = []
+# ``(reps, rounds)`` for every timed graph; set by ``main()``.
+_TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
 
 
 def _key(tp: int, **engine_kw) -> tuple:
@@ -745,7 +903,25 @@ def _result(key: tuple, case: tuple) -> list[dict]:
     """Per-rank rows for *case*, spawning *key*'s engine on first use."""
     if key not in _RESULTS:
         cases = _CASES[key]
-        ranks = _spawn(key[0], dict(key[1]), cases, _WINDOWS.get(key))
+        kw = dict(key[1])
+        if "algorithms" in kw:
+            ranks = _spawn(
+                _bench_rank,
+                key[0],
+                algorithms=kw.pop("algorithms"),
+                engine_kw=kw,
+                cases=cases,
+                timing=_TIMING,
+            )
+        else:
+            ranks = _spawn(
+                _run_rank,
+                key[0],
+                engine_kw=kw,
+                cases=cases,
+                timing=_TIMING,
+                window=_WINDOWS.get(key),
+            )
         _RESULTS[key] = {
             c: [rank_rows[i] for rank_rows in ranks] for i, c in enumerate(cases)
         }
@@ -872,17 +1048,16 @@ def test_quick_allreduce_int4(
     tp,
     algorithm,
     grid_cap=None,
-    graph=False,
     block=None,
 ):
     """Shipping configuration: no codec or super-tile pinned."""
     rows = _result(
         _ship_key(tp, algorithm, grid_cap, block),
-        (tokens, hidden, "normal", graph, True),
+        (tokens, hidden, "normal", True),
     )
     nbytes = tokens * hidden * 2
     _check_sqnr(
-        f"tp={tp} {algorithm} {tokens}x{hidden} graph={graph} block={block}",
+        f"tp={tp} {algorithm} {tokens}x{hidden} block={block}",
         rows,
         floor=SQNR_MIN_DB,
         expected_st=_shipping_st(rows, nbytes, algorithm, tp, block),
@@ -890,6 +1065,7 @@ def test_quick_allreduce_int4(
     )
     # (tp - 1) adds per element; codec ALU work is not counted.
     flops = tokens * hidden * (tp - 1)
+    # The slowest rank is when the collective finishes.
     us = max(r["us"] for r in rows)
     ret = _summary(rows)
     ret.update(
@@ -903,10 +1079,62 @@ def test_quick_allreduce_int4(
     return ret
 
 
+def _bench_key(tp: int, algorithms, grid_cap, block) -> tuple:
+    kw = {"algorithms": tuple(algorithms)}
+    for name, val in (("grid_cap", grid_cap), ("block", block)):
+        if val is not None:
+            kw[name] = val
+    return _key(tp, **kw)
+
+
+@benchmark()
+def bench_quick_allreduce_int4(
+    tokens,
+    hidden,
+    tp,
+    algorithms,
+    route,
+    grid_cap=None,
+    block=None,
+):
+    """Each FlyDSL schedule against the HIP quick all-reduce.
+
+    *route* is the schedule production dispatch picks for the payload, or
+    ``oneshot`` where the quantized slot declines it.
+    """
+    rows = _result(_bench_key(tp, algorithms, grid_cap, block), (tokens, hidden))
+    names = [n for n in (*algorithms, "hip") if n in rows[0]["candidates"]]
+    got = {n: fab.collapse([r["candidates"][n] for r in rows]) for n in names}
+
+    fails = []
+    for name, c in got.items():
+        floor = HIP_SQNR_FLOOR_DB if name == "hip" else SQNR_MIN_DB
+        if c["SQNR dB"] < floor:
+            fails.append(f"{name}: SQNR {c['SQNR dB']:.2f} dB below {floor} dB")
+        if c["variant"] is not None and c["variant"].startswith("MIXED"):
+            fails.append(f"{name}: ranks ran different kernels: {c['variant']}")
+    _check(f"tp={tp} {tokens}x{hidden} grid_cap={grid_cap} block={block}", fails)
+
+    hip_us = got["hip"]["us"] if "hip" in got else None
+    ret = {
+        "gfx": ARCH,
+        "KiB": tokens * hidden * 2 / 1024,
+        "hip prod": rows[0]["hip prod"],
+        "flydsl vs hip": (
+            fab.speedup(hip_us, got[route]["us"]) if route in got else None
+        ),
+    }
+    for algorithm in algorithms:
+        ret[f"{algorithm} vs hip"] = fab.speedup(hip_us, got[algorithm]["us"])
+    for name, c in got.items():
+        ret.update({f"{name} {field}": v for field, v in c.items()})
+    return ret
+
+
 @benchmark()
 def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
     """Edge-case payloads on the shipping engine; correctness only."""
-    rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False))
+    rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
     label = f"tp={tp} {algorithm} {tokens}x{hidden} fill={fill}"
     if fill == "degenerate":
         # A group whose extremum is zero decodes to a zero scale, so the encode
@@ -937,7 +1165,7 @@ def test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill):
 def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_codec):
     """The ring with both laps' wire formats pinned; correctness only."""
     key = _key(tp, algorithm="ring", rs_codec=rs_codec, ag_codec=ag_codec)
-    rows = _result(key, (tokens, hidden, "normal", False, False))
+    rows = _result(key, (tokens, hidden, "normal", False))
     label = f"tp={tp} ring {tokens}x{hidden} rs={rs_codec} ag={ag_codec}"
     _check_sqnr(
         label,
@@ -968,7 +1196,7 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, bl
     """
     rows = _result(
         _transport_key(tp, algorithm, super_tile, block),
-        (tokens, hidden, "exact", False, False),
+        (tokens, hidden, "exact", False),
     )
     _check(
         f"tp={tp} {algorithm} {tokens}x{hidden} st={super_tile} block={block} "
@@ -1028,6 +1256,220 @@ def _summarize(name: str, rows: list[dict]) -> None:
         )
 
 
+def _verify(args, tps, algos, dts, link) -> None:
+    # Payloads, and the production window when there is one, per schedule.
+    plans = {
+        (tp, algorithm): _ship_payloads(tp, algorithm, link)
+        for tp, algorithm in itertools.product(tps, algos)
+    }
+    # Engines exactly as production builds them: only these are checked for
+    # kernel coverage.
+    shipping_engine = (
+        args.mnk is None and args.grid_cap == [None] and args.block == [None]
+    )
+
+    # Register every row before running any, so rows sharing an engine share
+    # a spawn.
+    ship = []
+    coverage = []
+    for (tp, algorithm), (payloads, window) in plans.items():
+        if args.mnk is not None:
+            shapes = [(int(t), int(h)) for t, h in args.mnk]
+        else:
+            shapes = [(nbytes // _ROW_BYTES, HIDDEN) for nbytes in payloads]
+            if args.extended:
+                shapes += [
+                    s for s in LEGACY_SHAPES_PER_WORLD_SIZE[tp] if s not in shapes
+                ]
+        for grid_cap, block in itertools.product(args.grid_cap, args.block):
+            for tokens, hidden in shapes:
+                row = (tokens, hidden, tp, algorithm, grid_cap, block)
+                if row not in ship:
+                    ship.append(row)
+        if window is not None and shipping_engine:
+            _WINDOWS[_ship_key(tp, algorithm, None)] = window
+            lo, hi = window
+            label = f"({_fmt_bytes(lo - 1)}, {_fmt_bytes(hi)}]"
+            coverage.append((tp, algorithm, label))
+    # Knob rows only in a default run: pinning --block already sweeps it over
+    # the shipping shapes.
+    knobs = []
+    if args.block == [None]:
+        knobs = [
+            (tokens, hidden, tp, algorithm, None, block)
+            for tp, algorithm, tokens, hidden, block in (
+                KNOB_CASES + (EXTENDED_KNOB_CASES if args.extended else ())
+            )
+            if tp in tps and algorithm in algos
+        ]
+    if dts:
+        for tokens, hidden, tp, algorithm, grid_cap, block in ship + knobs:
+            _register(
+                _ship_key(tp, algorithm, grid_cap, block),
+                (tokens, hidden, "normal", True),
+            )
+    edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
+    for tp, algorithm, tokens, hidden, fill in edge:
+        _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
+    pinned = []
+    if args.extended:
+        pinned = [c for c in PINNED_CODEC_CASES if c[0] in tps and "ring" in algos]
+    for tp, tokens, hidden, rs, ag in pinned:
+        _register(
+            _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
+            (tokens, hidden, "normal", False),
+        )
+    # The fp16 wire through each production schedule's own ladder, on the
+    # payloads that reach its kernels, plus one a single block owns.
+    transport = [
+        (tp, algorithm, *shape, None, None)
+        for (tp, algorithm), (payloads, window) in plans.items()
+        if window is not None
+        for shape in [SUB_TILE_SHAPE] + [(n // _ROW_BYTES, HIDDEN) for n in payloads]
+    ]
+    if args.extended:
+        transport += [c for c in TRANSPORT_CASES if c[0] in tps and c[1] in algos]
+    for tp, algorithm, tokens, hidden, st, block in transport:
+        _register(
+            _transport_key(tp, algorithm, st, block),
+            (tokens, hidden, "exact", False),
+        )
+
+    def _int4_rows(cases):
+        return [
+            test_quick_allreduce_int4(
+                tokens,
+                hidden,
+                dtype,
+                tp,
+                algorithm,
+                grid_cap=grid_cap,
+                block=block,
+            )
+            for tokens, hidden, tp, algorithm, grid_cap, block in cases
+        ]
+
+    for dtype in dts:
+        rows = _int4_rows(ship)
+        _summarize("flydsl quick allreduce INT4", rows)
+        _summarize(
+            "flydsl quick allreduce INT4 production kernel coverage",
+            [
+                test_quick_allreduce_int4_coverage(tp, algorithm, window)
+                for tp, algorithm, window in coverage
+            ],
+        )
+        _summarize("flydsl quick allreduce INT4 block", _int4_rows(knobs))
+        _write_json(args.out, rows)
+    _summarize(
+        "flydsl quick allreduce INT4 edge inputs",
+        [
+            test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
+            for tp, algorithm, tokens, hidden, fill in edge
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce INT4 pinned codec",
+        [
+            test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs, ag)
+            for tp, tokens, hidden, rs, ag in pinned
+        ],
+    )
+    _summarize(
+        "flydsl quick allreduce transport (fp16 wire, bit-exact)",
+        [
+            test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
+            for tp, algorithm, tokens, hidden, st, block in transport
+        ],
+    )
+
+
+def _route(nbytes: int, policy) -> str:
+    """The schedule production dispatch picks for *nbytes*: ``mesh``,
+    ``ring``, ``oneshot`` below the quantized window, ``-`` above it."""
+    if nbytes <= policy.floor:
+        return "oneshot"
+    if nbytes > policy.max_bytes:
+        return "-"
+    return fly_policy.pick_quant_family(nbytes, policy)
+
+
+def _bench(args, tps, algos, link) -> None:
+    algos = tuple(a for a in ALGORITHMS if a in algos)
+    rows = []
+    for tp in tps:
+        if args.mnk is not None:
+            shapes = [(int(t), int(h)) for t, h in args.mnk]
+        else:
+            payloads = {n for a in algos for n in _ship_payloads(tp, a, link)[0]}
+            shapes = [(n // _ROW_BYTES, HIDDEN) for n in sorted(payloads)]
+        policy = fly_policy.resolve_quant(link, tp)
+        for grid_cap, block in itertools.product(args.grid_cap, args.block):
+            # Every case of a spawn is registered before its first result.
+            for shape in shapes:
+                _register(_bench_key(tp, algos, grid_cap, block), shape)
+            rows += [
+                bench_quick_allreduce_int4(
+                    tokens,
+                    hidden,
+                    tp,
+                    algos,
+                    route=_route(tokens * hidden * 2, policy),
+                    grid_cap=grid_cap,
+                    block=block,
+                )
+                for tokens, hidden in shapes
+            ]
+
+    drop = ["algorithms"]
+    drop += [k for k in ("grid_cap", "block") if getattr(args, k) == [None]]
+    tables = fab.bench_tables(
+        rows,
+        candidates=(*algos, "hip"),
+        drop=drop,
+        title="flydsl quick allreduce INT4 vs hip",
+    )
+    for title, df in tables:
+        aiter.logger.info("%s (markdown):\n%s", title, fab.to_markdown(df))
+    cast = os.environ.get("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16", "1")
+    header = fab.provenance(
+        args,
+        link,
+        [
+            (
+                f"- hip: QuickAllReduce at {HIP_QR_REGIME}, "
+                f"AITER_QUICK_REDUCE_CAST_BF16_TO_FP16={cast}"
+            ),
+            "- `X vs hip` is `hip us / X us`: above 1.0 the schedule is faster",
+        ],
+    )
+    fab.write_outputs(args, "FlyDSL quick all-reduce INT4 bench", header, tables, rows)
+    _write_json(args.out, rows)
+
+
+def _write_json(path: str | None, rows: list[dict]) -> None:
+    """``-o``: the main table's rows as JSON."""
+    if not path or not rows:
+        return
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(
+            {
+                "meta": {
+                    "gfx": ARCH,
+                    "timer": f"CUDA graph of {GRAPH_INNER} calls, "
+                    f"{_TIMING[0]} replays per sample, median of {_TIMING[1]} "
+                    "rounds",
+                },
+                "rows": rows,
+            },
+            fh,
+            indent=2,
+            default=str,
+        )
+    aiter.logger.info("wrote %s", path)
+
+
 def main():
     if ARCH not in SUPPORTED_ARCHS:
         aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
@@ -1036,7 +1478,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="config input of test",
+        description=__doc__,
     )
     parser.add_argument(
         "-d",
@@ -1095,7 +1537,8 @@ def main():
         "-o",
         "--out",
         default=None,
-        help="Optional JSON output path for the shipping-sweep rows.",
+        help="Optional JSON output path for the shipping-sweep rows, or for\n"
+        "the bench rows.",
     )
     parser.add_argument(
         "--extended",
@@ -1104,7 +1547,11 @@ def main():
         "shipping shapes, the full block sweep, the pinned-codec ring and the\n"
         "pinned-geometry fp16 transport matrix.",
     )
+    fab.add_bench_args(parser)
     args = parser.parse_args()
+    fab.check_bench_args(parser, args)
+    global _TIMING
+    _TIMING = (args.reps, args.rounds)
 
     tps = []
     for tp in args.tp:
@@ -1126,149 +1573,18 @@ def main():
             if not isinstance(mnk, tuple) or len(mnk) != 2:
                 raise ValueError(f"-s expects tokens,hidden; got {mnk!r}")
     link = fly_policy.detect_link()
-    # Payloads, and the production window when there is one, per schedule.
-    plans = {
-        (tp, algorithm): _ship_payloads(tp, algorithm, link)
-        for tp, algorithm in itertools.product(tps, algos)
-    }
-    # Engines exactly as production builds them: only these are checked for
-    # kernel coverage.
-    shipping_engine = (
-        args.mnk is None and args.grid_cap == [None] and args.block == [None]
-    )
 
-    # Register every row before running any, so rows sharing an engine share
-    # a spawn.
-    ship = []
-    coverage = []
-    for (tp, algorithm), (payloads, window) in plans.items():
-        if args.mnk is not None:
-            shapes = [(int(t), int(h)) for t, h in args.mnk]
-        else:
-            shapes = [(nbytes // _ROW_BYTES, HIDDEN) for nbytes in payloads]
-            if args.extended:
-                shapes += [
-                    s for s in LEGACY_SHAPES_PER_WORLD_SIZE[tp] if s not in shapes
-                ]
-        for grid_cap, block in itertools.product(args.grid_cap, args.block):
-            for tokens, hidden in shapes:
-                row = (tokens, hidden, tp, algorithm, grid_cap, False, block)
-                if row not in ship:
-                    ship.append(row)
-        if window is not None:
-            # Captured into a CUDA graph at every world size, on the smallest
-            # shape, as a serving framework replays it.
-            tokens, hidden = shapes[0]
-            ship.append((tokens, hidden, tp, algorithm, args.grid_cap[0], True, None))
-            if shipping_engine:
-                _WINDOWS[_ship_key(tp, algorithm, None)] = window
-                lo, hi = window
-                label = f"({_fmt_bytes(lo - 1)}, {_fmt_bytes(hi)}]"
-                coverage.append((tp, algorithm, label))
-    # Knob rows only in a default run: pinning --block already sweeps it over
-    # the shipping shapes.
-    knobs = []
-    if args.block == [None]:
-        knobs = [
-            (tokens, hidden, tp, algorithm, None, False, block)
-            for tp, algorithm, tokens, hidden, block in (
-                KNOB_CASES + (EXTENDED_KNOB_CASES if args.extended else ())
-            )
-            if tp in tps and algorithm in algos
-        ]
-    if dts:
-        for tokens, hidden, tp, algorithm, grid_cap, graph, block in ship + knobs:
-            _register(
-                _ship_key(tp, algorithm, grid_cap, block),
-                (tokens, hidden, "normal", graph, True),
-            )
-    edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
-    for tp, algorithm, tokens, hidden, fill in edge:
-        _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False, False))
-    pinned = []
-    if args.extended:
-        pinned = [c for c in PINNED_CODEC_CASES if c[0] in tps and "ring" in algos]
-    for tp, tokens, hidden, rs, ag in pinned:
-        _register(
-            _key(tp, algorithm="ring", rs_codec=rs, ag_codec=ag),
-            (tokens, hidden, "normal", False, False),
-        )
-    # The fp16 wire through each production schedule's own ladder, on the
-    # payloads that reach its kernels, plus one a single block owns.
-    transport = [
-        (tp, algorithm, *shape, None, None)
-        for (tp, algorithm), (payloads, window) in plans.items()
-        if window is not None
-        for shape in [SUB_TILE_SHAPE] + [(n // _ROW_BYTES, HIDDEN) for n in payloads]
-    ]
-    if args.extended:
-        transport += [c for c in TRANSPORT_CASES if c[0] in tps and c[1] in algos]
-    for tp, algorithm, tokens, hidden, st, block in transport:
-        _register(
-            _transport_key(tp, algorithm, st, block),
-            (tokens, hidden, "exact", False, False),
-        )
-
-    def _int4_rows(cases):
-        return [
-            test_quick_allreduce_int4(
-                tokens,
-                hidden,
-                dtype,
-                tp,
-                algorithm,
-                grid_cap=grid_cap,
-                graph=graph,
-                block=block,
-            )
-            for tokens, hidden, tp, algorithm, grid_cap, graph, block in cases
-        ]
-
-    for dtype in dts:
-        rows = _int4_rows(ship)
-        _summarize("flydsl quick allreduce INT4", rows)
-        _summarize(
-            "flydsl quick allreduce INT4 production kernel coverage",
-            [
-                test_quick_allreduce_int4_coverage(tp, algorithm, window)
-                for tp, algorithm, window in coverage
-            ],
-        )
-        _summarize("flydsl quick allreduce INT4 block", _int4_rows(knobs))
-        if args.out and rows:
-            os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
-            with open(args.out, "w") as fh:
-                json.dump(
-                    {
-                        "meta": {"gfx": ARCH, "timer": "run_perftest cuda_event"},
-                        "rows": rows,
-                    },
-                    fh,
-                    indent=2,
-                    default=str,
-                )
-            aiter.logger.info("wrote %s", args.out)
-    _summarize(
-        "flydsl quick allreduce INT4 edge inputs",
-        [
-            test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
-            for tp, algorithm, tokens, hidden, fill in edge
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce INT4 pinned codec",
-        [
-            test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs, ag)
-            for tp, tokens, hidden, rs, ag in pinned
-        ],
-    )
-    _summarize(
-        "flydsl quick allreduce transport (fp16 wire, bit-exact)",
-        [
-            test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
-            for tp, algorithm, tokens, hidden, st, block in transport
-        ],
-    )
+    if args.scenario == "bench":
+        if dts:
+            # quick_all_reduce.py reads this variable at import time, and
+            # disables QuickAllReduce for the whole process if it does not
+            # name a regime. The spawned ranks inherit it. Build the HIP
+            # module here, not in every rank at once.
+            os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
+            aiter.qr_max_size()
+            _bench(args, tps, algos, link)
+    else:
+        _verify(args, tps, algos, dts, link)
 
     if _FAILURES:
         raise SystemExit(

@@ -340,7 +340,7 @@ class QuickAllReduceInt4:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
         # ``None`` means "use the schedule's own policy", which for both is
         # the payload-size ladder. Passing a value pins one super-tile for
-        # every size, which is what the benchmark variants and the tuning
+        # every size, which is what the pinned test cases and the tuning
         # sweeps do.
         pinned_st = super_tile is not None
         if super_tile is None:
@@ -663,9 +663,9 @@ class QuickAllReduceInt4:
 
         Local to this rank, not a collective. ``QuickAllReduce`` calls it once
         at init, via ``preload_fly_engines``, to keep JIT compiles out of CUDA
-        graph capture; ``bench_comm_allreduce.py`` and the op tests call it
-        before timing or correctness checks begin. The HIP module load still happens
-        on each binary's first launch.
+        graph capture; the op tests call it before timing or correctness
+        checks begin. The HIP module load still happens on each binary's first
+        launch.
         """
         keys = self._by_cfg if payload_range is None else self.cfgs_for(*payload_range)
         for key in keys:

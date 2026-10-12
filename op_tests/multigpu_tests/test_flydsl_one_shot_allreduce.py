@@ -3,14 +3,17 @@
 
 """Correctness and timing for the exact one-shot (1-stage) all-reduce (``OneShotAllReduce``).
 
-``python3`` this file runs three sweeps, each ending in a markdown table. A
-default run drives the engine as production does -- no tuning knob pinned, so
-it walks ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads
-derived from ``allreduce_policy``: at every world size, both ends of each
-rung's slice of the window the policy routes to the one-shot. Next to it, a
-few spot checks run pinned configurations no shipped rung uses, one world size
-each. ``--atoms``, ``--grid-cap``, ``--fanout`` or ``--block`` pin a
-configuration instead.
+``--scenario`` selects what a run does: ``verify`` (the default) checks the
+kernel, and ``bench`` compares it with the stock kernels production runs today.
+
+**verify** runs four sweeps, each ending in a markdown table. A default run
+drives the engine as production does -- no tuning knob pinned, so it walks
+``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads derived from
+``allreduce_policy``: at every world size, both ends of each rung's slice of
+the window the policy routes to the one-shot. Next to it, a few spot checks
+run pinned configurations no shipped rung uses, one world size each.
+``--atoms``, ``--grid-cap``, ``--fanout`` or ``--block`` pin a configuration
+instead.
 
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
@@ -19,9 +22,8 @@ matters more than the first:
 2. The result is **bit-identical on every rank**. The kernel accumulates in a
    fixed rank order for exactly this reason, and an SQNR check cannot see an
    ordering bug -- both answers would be equally "accurate".
-3. It is timed with ``run_perftest``. One row per world size captures the
-   all-reduce into a CUDA graph and replays it, checking 1 and 2 after every
-   replay.
+3. It is timed on a CUDA graph of ``GRAPH_INNER`` back-to-back calls, and 1
+   and 2 are checked again after every replay.
 
 ``test_one_shot_allreduce_coverage`` checks that those rows ran every rung the
 engine's own ``cfgs_for`` says the production window selects, so a retuned
@@ -44,6 +46,38 @@ NaN pattern it uses as a sentinel.
 ``--extended`` runs the spot-check configurations at every world size, and the
 spot-check shapes on the production engine too.
 
+**bench** times the one-shot (``flydsl``) against the stock kernels on the
+same payloads, all exact:
+
+* ``cdr`` -- ``CustomAllreduce`` with ``use_new`` on, what production runs.
+  Its C++ dispatch picks the kernel by world size and payload, so the
+  ``variant`` column names the one that ran: ``ll``, ``ll128_<block>``,
+  ``1stage`` or ``2stage``.
+* ``cdr_naive`` -- ``CustomAllreduce`` with ``use_new`` off: ``1stage``,
+  ``1stage_naive`` or ``2stage_naive``.
+* ``rccl`` -- PyNccl, production's fallback.
+
+The ``cdr`` kernels use their input in place under capture, registered when
+the capture ends, as production does. Where production disables that
+(``enable_register_for_capturing``: gfx1250, or PyTorch expandable segments),
+they copy the input into the IPC pool as production does, and the variant
+ends in ``+staged``.
+
+Each row has two comparisons, both as ``other us / flydsl us``, so above 1.0
+means the one-shot is faster:
+
+* ``flydsl vs prod`` -- against the kernel ``CudaCommunicator.all_reduce``
+  dispatches with the FlyDSL path off and quick reduce at its default
+  (``NONE``): ``cdr`` where ``should_custom_ar`` accepts the payload, ``rccl``
+  otherwise.
+* ``flydsl vs best`` -- against the fastest stock kernel that clears its
+  accuracy floor, which need not be the one production runs.
+
+``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
+The default payloads are the verify sweep's plus the DeepSeek-V4 decode
+shapes; ``-s`` or ``--shape-csv`` replace them, and the knob options pin the
+one-shot's configuration. ``--report`` and ``--csv`` save the tables.
+
 Every rank is a ``multiprocessing`` spawn worker; one spawn per engine
 configuration and world size runs every sweep. OneShotAllReduce runs on
 gfx942/gfx950 at TP in {2, 4, 8}; other archs skip, and ``main()`` skips a
@@ -58,18 +92,31 @@ import os
 import sys
 from multiprocessing import Pool, freeze_support, set_start_method
 
-_REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-if _REPO_ROOT not in sys.path:
-    sys.path.insert(0, _REPO_ROOT)
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+# The repo root for ``aiter``, this directory for ``flydsl_allreduce_bench``.
+# The ranks are spawned, so they re-import this file and need the same paths.
+for _path in (_REPO_ROOT, _HERE):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
+import flydsl_allreduce_bench as fab
 import pandas as pd
 import torch
 
 import aiter
 from aiter import dtypes
+from aiter.dist.parallel_state import (
+    destroy_distributed_environment,
+    destroy_model_parallel,
+    ensure_model_parallel_initialized,
+    get_tp_group,
+    init_distributed_environment,
+    set_custom_all_reduce,
+)
 from aiter.dist.utils import get_distributed_init_method, get_ip, get_open_port
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.test_common import benchmark, checkAllclose, run_perftest
+from aiter.test_common import benchmark, checkAllclose
 
 set_start_method("spawn", force=True)
 
@@ -109,6 +156,19 @@ SPOT_SHAPES = [(m, HIDDEN) for m in (1, 3, 5, 8, 16)] + [
 # only repeated replays show the captured launch advancing that state
 # rather than freezing it.
 GRAPH_REPLAYS = 4
+
+# Calls captured in each timed CUDA graph.
+GRAPH_INNER = fab.GRAPH_INNER
+
+# bench: the ``CustomAllreduce`` kernels, as column prefix -> ``use_new``.
+CDR_KERNELS = {"cdr": True, "cdr_naive": False}
+# bench: every stock candidate, in the order each spawn captures and times them.
+STOCK = (*CDR_KERNELS, "rccl")
+# bench: the accuracy floor of the stock kernels. All are exact, at the bf16
+# rounding floor (~55 dB; RCCL a little lower, since it reduces in bf16).
+STOCK_SQNR_FLOOR_DB = 40.0
+# bench: DeepSeek-V4 decode shapes, timed next to the policy-derived payloads.
+BENCH_SHAPES = [(m, HIDDEN) for m in (1, 2, 4, 8)]
 
 # (tp, knobs): pinned configurations a default run spot-checks next to the
 # shipped ladder, one world size each, for widths no shipped rung uses yet.
@@ -204,15 +264,18 @@ def _parts(m: int, hidden: int, tp: int, seed: int, device) -> list[torch.Tensor
     ]
 
 
-def _metrics(out, ref, tp: int) -> dict:
-    """Accuracy against fp32, then bit-identity across ranks."""
+def _metrics(out, ref, tp: int, group) -> dict:
+    """Accuracy against fp32, then bit-identity across ranks.
+
+    *group* is a gloo group: the bits are gathered on the host.
+    """
     import torch.distributed as dist
 
     # Widened to int32 because gloo rejects int16 ("Invalid scalar type"); the
     # widening is exact, so the comparison is still on bits.
     bits = out.view(torch.int16).to(torch.int32).cpu()
     gathered = [torch.empty_like(bits) for _ in range(tp)]
-    dist.all_gather(gathered, bits)
+    dist.all_gather(gathered, bits, group=group)
     lanes_differing = max(int((g != gathered[0]).sum()) for g in gathered)
     err = checkAllclose(
         ref, out.float(), printLog=False, msg="one_shot_allreduce vs fp32"
@@ -272,33 +335,33 @@ def _worst(a: dict, b: dict) -> dict:
     }
 
 
-def _run_rank(
-    rank: int,
-    tp: int,
-    init_method: str,
-    engine_kw: dict,
-    cases: list[tuple],
-    window: tuple[int, int] | None = None,
-) -> dict:
-    """One rank of one spawn: every case, then the run-ahead loop.
+def _init_dist(rank: int, tp: int, init_method: str, stock: bool):
+    """Join a TP group as production does. Returns the ``GroupCoordinator``.
 
-    A case is ``(tokens, hidden, graph)``. The engine is built once, so every
-    case shares its compiled rungs and IPC inboxes. *window* is the payload
-    range production dispatch routes to this engine, if any; the result then
-    carries the rungs the engine itself says that range selects.
+    ``CustomAllreduce`` is built only if *stock* is set: its IPC pool is
+    large, and only the bench scenario runs its kernels.
     """
-    import torch.distributed as dist
+    # This test builds its own FlyDSL engine. The dispatcher must not build a
+    # second one into ``CustomAllreduce``, which would then send the ``cdr``
+    # payloads to FlyDSL.
+    os.environ["AITER_FLY_AR"] = "0"
+    # No candidate here uses quick reduce, so do not allocate its IPC buffer.
+    # That is also production's default, so ``prod`` is the default path.
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "NONE"
+    set_custom_all_reduce(stock)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    return get_tp_group()
 
+
+def _engine(rank: int, tp: int, group, device, engine_kw: dict):
+    """The one-shot engine, every rung compiled."""
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
 
-    device = torch.device(f"cuda:{rank}")
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        backend="gloo", init_method=init_method, world_size=tp, rank=rank
-    )
-
     eng = OneShotAllReduce(
-        group=dist.group.WORLD,
+        group=group,
         device=device,
         rank=rank,
         world_size=tp,
@@ -310,49 +373,67 @@ def _run_rank(
         **engine_kw,
     )
     eng.preload()
+    return eng
+
+
+def _teardown(eng, group) -> None:
+    import torch.distributed as dist
+
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    eng.close()
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+def _run_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    engine_kw: dict,
+    cases: list[tuple],
+    timing: tuple[int, int],
+    window: tuple[int, int] | None = None,
+) -> dict:
+    """One rank of one verify spawn: every case, then the run-ahead loop.
+
+    A case is ``(tokens, hidden)``. The engine is built once, so every case
+    shares its compiled rungs and IPC inboxes. *timing* is ``(reps, rounds)``
+    for ``fab.time_graphs``. *window* is the payload range production dispatch
+    routes to this engine, if any; the result then carries the rungs the
+    engine itself says that range selects.
+    """
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    cpu_group = _init_dist(rank, tp, init_method, stock=False).cpu_group
+    eng = _engine(rank, tp, cpu_group, device, engine_kw)
     production_cfgs = None if window is None else eng.cfgs_for(*window)
+    reps, rounds = timing
 
     rows = []
     try:
-        for m, hidden, graph in cases:
+        for m, hidden in cases:
             parts = _parts(m, hidden, tp, 1234 + m * 8191 + hidden, device)
             inp = parts[rank].contiguous()
             ref = torch.stack(parts).float().sum(0)
             out = torch.zeros_like(inp)
             eng.allreduce(inp, out)
             torch.cuda.synchronize()
-            res = _metrics(out, ref, tp)
+            res = _metrics(out, ref, tp, cpu_group)
 
-            if graph:
-                # Captured on the current stream, which allreduce() launches on
-                # when it is given none.
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g):
-                    eng.allreduce(inp, out)
-                for _ in range(GRAPH_REPLAYS):
-                    out.zero_()
-                    g.replay()
-                    torch.cuda.synchronize()
-                    res = _worst(res, _metrics(out, ref, tp))
-                fn = g.replay
-            else:
-
-                def fn(e=eng, src=inp, dst=out):
-                    e.allreduce(src, dst)
-                    return dst
-
-            dist.barrier()
-            torch.cuda.synchronize()
-            # cuda.Event timing, not run_perftest's default profiler timer:
-            # `import aiter` creates a GPU context in the parent, and on some
-            # ROCm/torch builds a child spawned after that records no GPU
-            # events in torch.profiler, so the default timer fails reducing an
-            # empty trace.
-            _, us = run_perftest(fn, use_cuda_event=True)
+            g = fab.capture(lambda e=eng, src=inp, dst=out: e.allreduce(src, dst))
+            for _ in range(GRAPH_REPLAYS):
+                out.zero_()
+                g.replay()
+                torch.cuda.synchronize()
+                res = _worst(res, _metrics(out, ref, tp, cpu_group))
             nbytes = inp.numel() * inp.element_size()
-            res["us"] = float(us)
+            res["us"] = fab.time_graphs(
+                {"flydsl": g}, cpu_group, reps=reps, rounds=rounds
+            )["flydsl"]
             res["variant"] = eng.variant(nbytes)
             res["cfg"] = eng._pick_cfg(nbytes)
+            del g
             rows.append(res)
 
         # Run-ahead: many back-to-back calls with rank 0 deliberately late, so
@@ -379,9 +460,7 @@ def _run_rank(
         run_ahead = {"checks": checks, "bad_checks": bad}
         fresh = _fresh_inputs(eng, rank, tp, device)
     finally:
-        dist.barrier()
-        eng.close()
-        dist.destroy_process_group()
+        _teardown(eng, cpu_group)
     return {
         "rows": rows,
         "run_ahead": run_ahead,
@@ -390,12 +469,112 @@ def _run_rank(
     }
 
 
-def _spawn(
-    world_size: int,
+def _bench_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
     engine_kw: dict,
     cases: list[tuple],
-    window: tuple[int, int] | None = None,
+    timing: tuple[int, int],
 ) -> list[dict]:
+    """One rank of one bench spawn: every candidate on every case.
+
+    A case is ``(tokens, hidden)``. Returns, per case, the production
+    candidate's name and each candidate's per-rank result.
+    """
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    tp_group = _init_dist(rank, tp, init_method, stock=True)
+    cpu_group = tp_group.cpu_group
+    comm = tp_group.device_communicator
+    ca = comm.ca_comm
+    if ca is not None and ca.disabled:
+        ca = None
+    nccl = comm.pynccl_comm
+    if nccl is not None and nccl.disabled:
+        nccl = None
+    eng = _engine(rank, tp, cpu_group, device, engine_kw)
+    reps, rounds = timing
+
+    # The input and every candidate's output, for the whole spawn. Refer to
+    # flydsl_allreduce_bench for why the addresses must not change.
+    max_bytes = max(m * hidden * 2 for m, hidden in cases)
+    bufs = {
+        name: torch.empty(max_bytes, dtype=torch.uint8, device=device)
+        for name in ("inp", "flydsl", *STOCK)
+    }
+
+    def _view(name, m, hidden):
+        return bufs[name][: m * hidden * 2].view(torch.bfloat16).view(m, hidden)
+
+    def _cdr(x, out, use_new):
+        def thunk():
+            # As CustomAllreduce.custom_all_reduce: in place under capture,
+            # through the pre-registered pool otherwise.
+            reg = (
+                ca.enable_register_for_capturing
+                and torch.cuda.is_current_stream_capturing()
+            )
+            ca.all_reduce(x, out=out, use_new=use_new, registered_input=reg)
+
+        return thunk
+
+    rows = []
+    try:
+        for m, hidden in cases:
+            parts = _parts(m, hidden, tp, 1234 + m * 8191 + hidden, device)
+            x = _view("inp", m, hidden)
+            x.copy_(parts[rank])
+            ref = torch.stack(parts).float().sum(0)
+            nbytes = m * hidden * 2
+            outs = {name: _view(name, m, hidden) for name in ("flydsl", *STOCK)}
+
+            thunks = {"flydsl": lambda x=x, o=outs["flydsl"]: eng.allreduce(x, o)}
+            # The same gate production applies before it runs a cdr kernel;
+            # where it rejects the payload, production runs RCCL.
+            custom = ca is not None and ca.should_custom_ar(x)
+            if custom:
+                for name, use_new in CDR_KERNELS.items():
+                    thunks[name] = _cdr(x, outs[name], use_new)
+            if nccl is not None:
+                # What CudaCommunicator.all_reduce falls back to: an
+                # out-of-place ncclAllReduce on the current stream.
+                thunks["rccl"] = lambda x=x, o=outs["rccl"]: nccl.all_reduce(x, o)
+
+            graphs, res = {}, {}
+            for name, thunk in thunks.items():
+                graphs[name] = fab.capture(thunk)
+                got = fab.graded_replay(graphs[name], outs[name], cpu_group)
+                res[name] = {
+                    "sqnr_db": _sqnr_db(ref, got),
+                    "err": float(
+                        checkAllclose(
+                            ref, got.float(), printLog=False, msg=f"{name} vs fp32"
+                        )
+                    ),
+                }
+            times = fab.time_graphs(graphs, cpu_group, reps=reps, rounds=rounds)
+            for name, us in times.items():
+                res[name]["us"] = us
+            res["flydsl"]["variant"] = eng.variant(nbytes)
+            for name, use_new in CDR_KERNELS.items():
+                if name in res:
+                    res[name]["variant"] = fab.cdr_variant(
+                        tp, nbytes, use_new=use_new, arch=ARCH
+                    )
+                    if not ca.enable_register_for_capturing:
+                        res[name]["variant"] += "+staged"
+            if "rccl" in res:
+                res["rccl"]["variant"] = "pynccl"
+            rows.append({"prod": "cdr" if custom else "rccl", "candidates": res})
+            del graphs
+    finally:
+        _teardown(eng, cpu_group)
+    return rows
+
+
+def _spawn(target, world_size: int, **kwds) -> list:
+    """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
     init_method = get_distributed_init_method(get_ip(), get_open_port())
@@ -403,14 +582,12 @@ def _spawn(
     try:
         results = [
             pool.apply_async(
-                _run_rank,
+                target,
                 kwds={
                     "rank": rank,
                     "tp": world_size,
                     "init_method": init_method,
-                    "engine_kw": engine_kw,
-                    "cases": cases,
-                    "window": window,
+                    **kwds,
                 },
             )
             for rank in range(world_size)
@@ -428,13 +605,15 @@ def _spawn(
 
 # Rows are registered up front, grouped by engine, so each engine is built by
 # exactly one spawn. A spawn key is ``(tp, sorted engine kwargs)``; a case is
-# ``(tokens, hidden, graph)``.
+# ``(tokens, hidden)``.
 _CASES: dict[tuple, list[tuple]] = {}
 # Production dispatch window of an unpinned engine whose rung coverage is
 # checked, per spawn key.
 _WINDOWS: dict[tuple, tuple[int, int]] = {}
-_RESULTS: dict[tuple, list[dict]] = {}
+_RESULTS: dict[tuple, list] = {}
 _FAILURES: list[str] = []
+# ``(reps, rounds)`` for every timed graph; set by ``main()``.
+_TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
 
 # Tuning knobs the command line can pin. They are test-function arguments, so
 # they select the engine, but not table columns: the ``variant`` column names
@@ -459,7 +638,26 @@ def _key(tp: int, engine_kw: dict) -> tuple:
 
 def _ranks(key: tuple) -> list[dict]:
     if key not in _RESULTS:
-        _RESULTS[key] = _spawn(key[0], dict(key[1]), _CASES[key], _WINDOWS.get(key))
+        _RESULTS[key] = _spawn(
+            _run_rank,
+            key[0],
+            engine_kw=dict(key[1]),
+            cases=_CASES[key],
+            timing=_TIMING,
+            window=_WINDOWS.get(key),
+        )
+    return _RESULTS[key]
+
+
+def _bench_ranks(key: tuple) -> list[list[dict]]:
+    if key not in _RESULTS:
+        _RESULTS[key] = _spawn(
+            _bench_rank,
+            key[0],
+            engine_kw=dict(key[1]),
+            cases=_CASES[key],
+            timing=_TIMING,
+        )
     return _RESULTS[key]
 
 
@@ -476,7 +674,6 @@ def test_one_shot_allreduce(
     hidden,
     dtype,
     tp,
-    graph=False,
     atoms=None,
     grid_cap=None,
     fanout=None,
@@ -484,7 +681,7 @@ def test_one_shot_allreduce(
 ):
     engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
     key = _key(tp, engine_kw)
-    i = _CASES[key].index((tokens, hidden, graph))
+    i = _CASES[key].index((tokens, hidden))
     rows = [r["rows"][i] for r in _ranks(key)]
     fails = []
     for rank, row in enumerate(rows):
@@ -498,10 +695,11 @@ def test_one_shot_allreduce(
                 f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between "
                 "ranks (accumulation order is not rank-stable)"
             )
-    _check(f"tp={tp} {tokens}x{hidden} graph={graph} {engine_kw}", fails)
+    _check(f"tp={tp} {tokens}x{hidden} {engine_kw}", fails)
     nbytes = tokens * hidden * 2
     # (tp - 1) adds per element.
     flops = tokens * hidden * (tp - 1)
+    # The slowest rank is when the collective finishes.
     us = max(r["us"] for r in rows)
     return {
         "gfx": ARCH,
@@ -513,6 +711,61 @@ def test_one_shot_allreduce(
         "flydsl TB/s": nbytes / us / 1e6,
         "flydsl err": max(r["err"] for r in rows),
     }
+
+
+@benchmark()
+def bench_one_shot_allreduce(
+    tokens,
+    hidden,
+    tp,
+    atoms=None,
+    grid_cap=None,
+    fanout=None,
+    block=None,
+):
+    """The one-shot against production's kernel and the best stock kernel."""
+    engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
+    key = _key(tp, engine_kw)
+    i = _CASES[key].index((tokens, hidden))
+    per_rank = [r[i] for r in _bench_ranks(key)]
+    names = [n for n in ("flydsl", *STOCK) if n in per_rank[0]["candidates"]]
+    got = {n: fab.collapse([r["candidates"][n] for r in per_rank]) for n in names}
+
+    label = f"tp={tp} {tokens}x{hidden} {engine_kw}"
+    fails = []
+    for name, c in got.items():
+        floor = SQNR_FLOOR_DB if name == "flydsl" else STOCK_SQNR_FLOOR_DB
+        if c["SQNR dB"] < floor:
+            fails.append(f"{name}: SQNR {c['SQNR dB']:.2f} dB below {floor} dB")
+        if c["variant"] is not None and c["variant"].startswith("MIXED"):
+            fails.append(f"{name}: ranks ran different kernels: {c['variant']}")
+    _check(label, fails)
+
+    def _name(n):
+        return n if n == "rccl" else f"{n}:{got[n]['variant']}"
+
+    fly_us = got["flydsl"]["us"]
+    prod = per_rank[0]["prod"]
+    prod_us = got[prod]["us"] if prod in got else None
+    # A stock kernel below its floor failed above, and cannot be the best.
+    passing = [
+        n for n in STOCK if n in got and got[n]["SQNR dB"] >= STOCK_SQNR_FLOOR_DB
+    ]
+    best = min(passing, key=lambda n: got[n]["us"], default=None)
+    best_us = got[best]["us"] if best else None
+    ret = {
+        "gfx": ARCH,
+        "KiB": tokens * hidden * 2 / 1024,
+        "prod": _name(prod) if prod in got else prod,
+        "prod us": prod_us,
+        "flydsl vs prod": fab.speedup(prod_us, fly_us),
+        "best stock": _name(best) if best else None,
+        "best stock us": best_us,
+        "flydsl vs best": fab.speedup(best_us, fly_us),
+    }
+    for name, c in got.items():
+        ret.update({f"{name} {field}": v for field, v in c.items()})
+    return ret
 
 
 @benchmark()
@@ -602,6 +855,99 @@ def _summarize(name: str, rows: list[dict]) -> None:
         )
 
 
+def _verify(args, tps, dts, configs, given, link) -> None:
+    ladder = configs == [dict.fromkeys(KNOBS)]
+    # Register every row before running any, so each (tp, config) is one spawn.
+    # Each entry of ``spawns`` is ``(tp, knobs, shapes)``.
+    spawns = []
+    coverage = []
+    for tp, knobs in itertools.product(tps, configs):
+        payloads, window = _production_payloads(tp, link)
+        shapes = given or [(nbytes // _ROW_BYTES, ROW) for nbytes in payloads]
+        if given is None and args.extended:
+            shapes += [s for s in SPOT_SHAPES if s not in shapes]
+        spawns.append((tp, knobs, shapes))
+        if ladder and given is None:
+            _WINDOWS[_key(tp, {})] = window
+            coverage.append((tp, f"{window[0]}..{window[1]} B"))
+    # Nothing pinned on the command line: the shipped ladder, plus spot checks
+    # of the widths it does not use yet.
+    if ladder:
+        spot = [(tp, knobs) for tp, knobs in SPOT_CONFIGS if tp in tps]
+        if args.extended:
+            spot = [(tp, knobs) for tp in tps for _tp, knobs in SPOT_CONFIGS]
+        spawns += [(tp, dict(knobs), given or SPOT_SHAPES) for tp, knobs in spot]
+    rows = []
+    for tp, knobs, shapes in spawns:
+        _CASES[_key(tp, _engine_kw(**knobs))] = list(shapes)
+        rows += [(tp, knobs, shape) for shape in shapes]
+
+    for dtype in dts:
+        _summarize(
+            "flydsl one-shot allreduce",
+            [
+                test_one_shot_allreduce(t, h, dtype, tp, **knobs)
+                for tp, knobs, (t, h) in rows
+            ],
+        )
+    _summarize(
+        "flydsl one-shot allreduce production rung coverage",
+        [test_one_shot_allreduce_coverage(tp, window) for tp, window in coverage],
+    )
+    _summarize(
+        "flydsl one-shot allreduce run-ahead",
+        [
+            test_one_shot_allreduce_run_ahead(
+                RUN_AHEAD_M, HIDDEN, tp, RUN_AHEAD_ITERS, **knobs
+            )
+            for tp, knobs, _shapes in spawns
+        ],
+    )
+    _summarize(
+        "flydsl one-shot allreduce fresh inputs",
+        [
+            test_one_shot_allreduce_fresh_inputs(tp, FRESH_ITERS, **knobs)
+            for tp, knobs, _shapes in spawns
+        ],
+    )
+
+
+def _bench(args, tps, configs, given, link) -> None:
+    rows = []
+    for tp, knobs in itertools.product(tps, configs):
+        if given is None:
+            payloads, _window = _production_payloads(tp, link)
+            shapes = [(nbytes // _ROW_BYTES, ROW) for nbytes in payloads]
+            shapes = sorted(
+                dict.fromkeys(shapes + BENCH_SHAPES), key=lambda s: s[0] * s[1]
+            )
+        else:
+            shapes = given
+        _CASES[_key(tp, _engine_kw(**knobs))] = list(shapes)
+        rows += [bench_one_shot_allreduce(t, h, tp, **knobs) for t, h in shapes]
+
+    tables = fab.bench_tables(
+        rows,
+        candidates=("flydsl", *STOCK),
+        drop=KNOBS,
+        title="flydsl one-shot allreduce vs stock",
+    )
+    for title, df in tables:
+        aiter.logger.info("%s (markdown):\n%s", title, fab.to_markdown(df))
+    header = fab.provenance(
+        args,
+        link,
+        [
+            (
+                "- prod: CudaCommunicator.all_reduce with AITER_FLY_AR=0 and "
+                "AITER_QUICK_REDUCE_QUANTIZATION=NONE"
+            ),
+            "- `flydsl vs X` is `X us / flydsl us`: above 1.0 the one-shot is faster",
+        ],
+    )
+    fab.write_outputs(args, "FlyDSL one-shot all-reduce bench", header, tables, rows)
+
+
 def main():
     if ARCH not in SUPPORTED_ARCHS:
         aiter.logger.warning("OneShotAllReduce unsupported on %s; skipping", ARCH)
@@ -610,7 +956,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="config input of test",
+        description=__doc__,
     )
     parser.add_argument(
         "-d",
@@ -636,7 +982,8 @@ def main():
         default=None,
         help="(tokens, hidden) pairs, on every engine. Default: derived from\n"
         "the dispatch policy for the shipped ladder, SPOT_SHAPES for the spot\n"
-        "checks.\n    e.g.: -s 1,7168 8,7168",
+        "checks, and also BENCH_SHAPES in the bench scenario.\n"
+        "    e.g.: -s 1,7168 8,7168",
     )
     # Unset by default, so the engine walks the shipped ladder, which is what
     # production runs. Any value pins every rung to it.
@@ -655,10 +1002,14 @@ def main():
     parser.add_argument(
         "--extended",
         action="store_true",
-        help="Run the spot-check configurations at every world size, and the\n"
-        "spot-check shapes on the shipped ladder too.",
+        help="verify: run the spot-check configurations at every world size,\n"
+        "and the spot-check shapes on the shipped ladder too.",
     )
+    fab.add_bench_args(parser)
     args = parser.parse_args()
+    fab.check_bench_args(parser, args)
+    global _TIMING
+    _TIMING = (args.reps, args.rounds)
 
     tps = []
     for tp in args.tp:
@@ -687,67 +1038,14 @@ def main():
             args.atoms, args.grid_cap, args.fanout, args.block
         )
     ]
-    ladder = configs == [dict.fromkeys(KNOBS)]
     given = None if args.mnk is None else [(int(t), int(h)) for t, h in args.mnk]
     link = fly_policy.detect_link()
 
-    # Register every row before running any, so each (tp, config) is one spawn.
-    # Each entry of ``spawns`` is ``(tp, knobs, shapes, graph)``.
-    spawns = []
-    coverage = []
-    for tp, knobs in itertools.product(tps, configs):
-        payloads, window = _production_payloads(tp, link)
-        shapes = given or [(nbytes // _ROW_BYTES, ROW) for nbytes in payloads]
-        if given is None and args.extended:
-            shapes += [s for s in SPOT_SHAPES if s not in shapes]
-        spawns.append((tp, knobs, shapes, True))
-        if ladder and given is None:
-            _WINDOWS[_key(tp, {})] = window
-            coverage.append((tp, f"{window[0]}..{window[1]} B"))
-    # Nothing pinned on the command line: the shipped ladder, plus spot checks
-    # of the widths it does not use yet.
-    if ladder:
-        spot = [(tp, knobs) for tp, knobs in SPOT_CONFIGS if tp in tps]
-        if args.extended:
-            spot = [(tp, knobs) for tp in tps for _tp, knobs in SPOT_CONFIGS]
-        spawns += [(tp, dict(knobs), given or SPOT_SHAPES, False) for tp, knobs in spot]
-    rows = []
-    for tp, knobs, shapes, graph in spawns:
-        cases = [(t, h, False) for t, h in shapes]
-        if graph:
-            # Captured at every world size, on the smallest shape.
-            cases.append((*shapes[0], True))
-        _CASES[_key(tp, _engine_kw(**knobs))] = cases
-        rows += [(tp, knobs, case) for case in cases]
-
-    for dtype in dts:
-        _summarize(
-            "flydsl one-shot allreduce",
-            [
-                test_one_shot_allreduce(t, h, dtype, tp, graph=graph, **knobs)
-                for tp, knobs, (t, h, graph) in rows
-            ],
-        )
-    _summarize(
-        "flydsl one-shot allreduce production rung coverage",
-        [test_one_shot_allreduce_coverage(tp, window) for tp, window in coverage],
-    )
-    _summarize(
-        "flydsl one-shot allreduce run-ahead",
-        [
-            test_one_shot_allreduce_run_ahead(
-                RUN_AHEAD_M, HIDDEN, tp, RUN_AHEAD_ITERS, **knobs
-            )
-            for tp, knobs, _shapes, _graph in spawns
-        ],
-    )
-    _summarize(
-        "flydsl one-shot allreduce fresh inputs",
-        [
-            test_one_shot_allreduce_fresh_inputs(tp, FRESH_ITERS, **knobs)
-            for tp, knobs, _shapes, _graph in spawns
-        ],
-    )
+    if args.scenario == "bench":
+        if dts:
+            _bench(args, tps, configs, given, link)
+    else:
+        _verify(args, tps, dts, configs, given, link)
 
     if _FAILURES:
         raise SystemExit(
