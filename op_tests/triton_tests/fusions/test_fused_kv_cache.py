@@ -316,8 +316,9 @@ def test_fused_qk_rope_cat_and_cache_mla_partial_decode_zeros(
     ).squeeze(0)
 
     # decode_q_pe_out is a view of the first rows of a NaN-filled buffer; the
-    # extra rows act as guard rows that must stay untouched.
-    num_guard_rows = 2
+    # extra rows act as guard rows that must stay untouched. They cover every
+    # row up to T + 1, since a wrong gate can write any token row below T.
+    num_guard_rows = T - num_decode_toks_for_zeros + 2
     decode_q_pe_buf = torch.full(
         (num_decode_toks_for_zeros + num_guard_rows, QH, D_pe),
         float("nan"),
