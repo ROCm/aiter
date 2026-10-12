@@ -64,9 +64,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
                 src_elem = (
                     self.kv_gmem_elem_offset + n_in_tile * self.stride_kv_n_v + global_d
                 )
-                lds_addr = band_base + fx.Index(
-                    pas * traits.WARP_SIZE * traits.VEC_KV * eb
-                )
+                lds_addr = band_base + pas * traits.WARP_SIZE * traits.VEC_KV * eb
                 active = min(slots - pas * traits.WARP_SIZE, traits.WARP_SIZE)
                 if const_expr(active == traits.WARP_SIZE):
                     self.buffer_load_lds_128(
@@ -109,7 +107,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
         for pas in range_constexpr(passes):
             dma_id = self.wave_id_uni + (pas * traits.NUM_WAVES)
             slot = dma_id * traits.WARP_SIZE + self.lane
-            lds_addr = aligned_base + fx.Index(buf_off) + dma_id * per_dma
+            lds_addr = aligned_base + buf_off + dma_id * per_dma
             grp = slot // slots_per_group
             rem = slot % slots_per_group
             dest_n = fx.Int32(grp * 8 + rem % 8)
@@ -170,7 +168,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 addr = (
                     k_base + traits.K_BAND_BASE[b] + row + traits.K_WS_OFF[ws] + d_base
                 )
-                out.append(self.read_i32x8_lds(self.lds_kv_base_ptr, addr))
+                out.append(self.read_i32x8_lds(self.lds.kv.ptr, addr))
             return out
 
         return (_read_strip(n_lo), _read_strip(n_hi))
