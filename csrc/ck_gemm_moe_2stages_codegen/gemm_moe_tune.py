@@ -301,7 +301,6 @@ class Mxfp4AccuracyError(RuntimeError):
     """An MXFP4 candidate failed its numerical accuracy gate."""
 
 
-MXFP4_COARSE_TIMING_TIE_RATIO = 0.01
 MXFP4_FINAL_GLOBAL_TIMING_GATE = 0.01
 
 
@@ -357,45 +356,6 @@ def _candidate_accuracy_error(candidate):
             if value is not None:
                 return value
     return math.inf
-
-
-def _rank_mxfp4_candidates(
-    candidates, timing_tie_ratio=MXFP4_COARSE_TIMING_TIE_RATIO
-):
-    """Rank by latency, using accuracy inside anchored timing-tie buckets."""
-    by_latency = sorted(candidates, key=lambda candidate: float(candidate["us"]))
-    ranked = []
-    bucket = []
-    bucket_fastest = None
-
-    def flush_bucket():
-        ranked.extend(
-            sorted(
-                bucket,
-                key=lambda candidate: (
-                    _candidate_accuracy_error(candidate),
-                    float(candidate["us"]),
-                    candidate["kernelName1"],
-                    candidate["kernelName2"],
-                ),
-            )
-        )
-
-    for candidate in by_latency:
-        latency = float(candidate["us"])
-        if bucket_fastest is None:
-            bucket_fastest = latency
-        normalized_difference = _normalized_latency_difference(
-            latency, bucket_fastest
-        )
-        if bucket and normalized_difference >= timing_tie_ratio:
-            flush_bucket()
-            bucket = []
-            bucket_fastest = latency
-        bucket.append(candidate)
-    if bucket:
-        flush_bucket()
-    return ranked
 
 
 def _select_mxfp4_performance_finalists(candidates, finalist_count):
@@ -7293,10 +7253,19 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "swiglu": ActivationType.Swiglu,
                 "silu": ActivationType.Silu,
             }[self._row_act(row)]
+            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
             # Build the expensive torch reference once per shape. Every coarse
             # warm-up and every final measured output is checked against it.
+            # Apply the same swiglu clamp _run_candidate applies per candidate:
+            # a reference built without the limit would reject every candidate
+            # whenever AITER_MXFP4_TUNE_SWIGLU_LIMIT is set.
             scan_reference = self._torch_ref(
-                scan_data, int(row["topk"]), dtypes.bf16, activation
+                scan_data,
+                int(row["topk"]),
+                dtypes.bf16,
+                activation,
+                swiglu_limit=swiglu_limit,
             )
         accuracy_checks = max(
             0, int(getattr(args, "fast_scan_warmup_accuracy_checks", 1))
@@ -7345,17 +7314,12 @@ class Mxfp4FlydslTuner(FmoeTuner):
             finalist_iters = _parse_fast_scan_iters(
                 getattr(args, "fast_scan_final_iters", 100)
             )
-            # Keep the accuracy-aware bucket rank available for diagnostics, but
-            # use one stable latency ordering for both the initial performance
+            # One stable latency ordering drives both the initial performance
             # finalists and all later backfill. This preserves the fastest
-            # remaining coarse survivor when a finalist fails final validation.
-            performance_order = sorted(
-                successful,
-                key=lambda candidate: (
-                    float(candidate["us"]),
-                    candidate["kernelName1"],
-                    candidate["kernelName2"],
-                ),
+            # remaining coarse survivor when a finalist fails final validation;
+            # the separate accuracy promotion below covers the accuracy side.
+            performance_order = _select_mxfp4_performance_finalists(
+                successful, len(successful)
             )
             performance_finalists = performance_order[:finalist_count]
             accuracy_promotion = _select_mxfp4_accuracy_promotion(

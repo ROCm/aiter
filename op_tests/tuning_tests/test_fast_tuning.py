@@ -80,26 +80,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
     def _candidate(name):
         return {"kernelName1": f"g1_{name}", "kernelName2": f"g2_{name}", "us": 0}
 
-    def test_normalized_timing_ties_prefer_accuracy(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        fastest = self._candidate("fastest")
-        fastest.update(us=100.0, err1=0.03)
-        accurate_tie = self._candidate("accurate_tie")
-        accurate_tie.update(us=100.99, err1=0.01)
-        outside_tie = self._candidate("outside_tie")
-        outside_tie.update(us=101.0, err1=0.001)
-
-        ranked = gemm_moe_tune._rank_mxfp4_candidates(
-            [outside_tie, fastest, accurate_tie]
-        )
-
-        self.assertEqual(
-            [candidate["kernelName1"] for candidate in ranked],
-            ["g1_accurate_tie", "g1_fastest", "g1_outside_tie"],
-        )
-
-    def test_performance_finalists_keep_global_fastest_in_oversized_bucket(self):
+    def test_performance_finalists_keep_global_fastest(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
         candidates = [self._candidate(f"candidate_{i}") for i in range(6)]
@@ -418,17 +399,45 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
     def test_warmup_outputs_are_accuracy_checks_outside_timing(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
 
-        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(
-            gemm_moe_tune.Mxfp4FlydslTuner
+        # _run_candidate finishes by building the tuned row through calculate(),
+        # which needs the real 14-column key layout.
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner(
+            "testMxfp4",
+            [
+                "gfx",
+                "cu_num",
+                "token",
+                "model_dim",
+                "inter_dim",
+                "expert",
+                "topk",
+                "act_type",
+                "dtype",
+                "q_dtype_a",
+                "q_dtype_w",
+                "q_type",
+                "use_g1u1",
+                "doweight_stage1",
+            ],
+            [],
+            "test parser",
         )
         args = SimpleNamespace(fast_scan=True, errRatio=0.1, warmup=1, iters=10)
         row = {
+            "gfx": "gfx950",
+            "cu_num": 256,
             "expert": 8,
             "model_dim": 256,
             "inter_dim": 256,
             "token": 1,
             "topk": 2,
             "act_type": "ActivationType.Silu",
+            "dtype": "torch.bfloat16",
+            "q_dtype_a": "torch.float4_e2m1fn_x2",
+            "q_dtype_w": "torch.float4_e2m1fn_x2",
+            "q_type": "QuantType.per_1x32",
+            "use_g1u1": 1,
+            "doweight_stage1": 0,
         }
 
         def run_perftest(operation, **kwargs):
@@ -451,7 +460,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
             mock.patch("aiter.test_common.run_perftest", side_effect=run_perftest),
         ):
             candidate = self._candidate("accurate")
-            candidate.update(err1=0.03, err2=0.025)
+            candidate.update(err1=0.03, err2=0.025, block_m=16)
             tuner._run_candidate(
                 row,
                 candidate,
@@ -469,6 +478,110 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
         self.assertEqual(candidate["err1"], "3.0%")
         self.assertEqual(candidate["err2"], "3.0%")
         self.assertEqual(candidate["_err"], 0.03)
+
+    def test_shared_reference_uses_tuned_swiglu_limit(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(
+            gemm_moe_tune.Mxfp4FlydslTuner
+        )
+        args = SimpleNamespace(
+            fast_scan=True,
+            fast_scan_warmup_accuracy_checks=1,
+            fast_scan_iters=10,
+            fast_scan_final_iters=100,
+            fast_scan_finalists=1,
+            timeout=0,
+            errRatio=0.1,
+            warmup=2,
+            iters=101,
+        )
+        row = {
+            "token": 1,
+            "model_dim": 256,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+        }
+        limits = []
+
+        def torch_ref(_data, _topk, _dtype, _activation, swiglu_limit=None):
+            limits.append(swiglu_limit)
+            return "reference"
+
+        def run_candidate(_row, candidate, _args, **kwargs):
+            candidate["us"] = 1.0
+            return 1.0
+
+        with (
+            mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
+            mock.patch.object(
+                tuner, "_candidate_rows", return_value=[self._candidate("accurate")]
+            ),
+            mock.patch.object(tuner, "_precompile_candidates", return_value=(1, 0)),
+            mock.patch.object(tuner, "_prepare_case", return_value="fixture"),
+            mock.patch.object(tuner, "_torch_ref", side_effect=torch_ref),
+            mock.patch.object(tuner, "_run_candidate", side_effect=run_candidate),
+            mock.patch("builtins.print"),
+        ):
+            tuner._tune_one_shape(row, args)
+
+        # The shared fast-scan reference must apply the same clamp that every
+        # candidate's kernel launch applies, or setting the tuning limit rejects
+        # all candidates against an unclamped reference.
+        self.assertEqual(limits, [3.5])
+
+    def test_candidate_kernel_and_reference_share_the_tuned_swiglu_limit(self):
+        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
+
+        tuner = gemm_moe_tune.Mxfp4FlydslTuner.__new__(
+            gemm_moe_tune.Mxfp4FlydslTuner
+        )
+        tuner.keys = [
+            "token",
+            "model_dim",
+            "inter_dim",
+            "expert",
+            "topk",
+            "act_type",
+        ]
+        args = SimpleNamespace(fast_scan=False, errRatio=0.1, warmup=1, iters=10)
+        row = {
+            "token": 1,
+            "model_dim": 256,
+            "inter_dim": 256,
+            "expert": 8,
+            "topk": 2,
+            "act_type": "ActivationType.Silu",
+        }
+        limits = []
+
+        def port_e2e(*_args, **kwargs):
+            limits.append(kwargs.get("swiglu_limit"))
+            return "out"
+
+        with (
+            mock.patch.dict(os.environ, {"AITER_MXFP4_TUNE_SWIGLU_LIMIT": "3.5"}),
+            mock.patch.object(tuner, "_port_e2e", side_effect=port_e2e),
+            mock.patch.object(tuner, "_torch_ref", return_value="ref") as torch_ref,
+            mock.patch.object(
+                gemm_moe_tune, "cosine_diff_compare", return_value=0.01
+            ),
+            mock.patch.object(tuner, "calculate", return_value=(0.0, 0.0)),
+            mock.patch(
+                "aiter.test_common.run_perftest",
+                side_effect=lambda operation, **kwargs: (operation(), 5.0),
+            ),
+        ):
+            candidate = self._candidate("accurate")
+            candidate.update(block_m=16)
+            tuner._run_candidate(row, candidate, args, data="fixture")
+
+        # Kernel launch and reference must clamp identically, otherwise the
+        # accuracy gate compares two different functions.
+        self.assertEqual(limits, [3.5, 3.5])
+        self.assertEqual(torch_ref.call_args.kwargs["swiglu_limit"], 3.5)
 
     def test_accuracy_failure_rejects_only_the_candidate(self):
         from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
@@ -587,6 +700,31 @@ class TestGlm53TunedArtifact(unittest.TestCase):
         self.assertEqual(float(token_one["us2"]), 0.0)
         self.assertGreater(float(token_one["err1"]), 0.0)
         self.assertGreater(float(token_one["err2"]), 0.0)
+
+    def test_in_memory_jobs_match_file_parser(self):
+        from aiter.aot.flydsl.mxfp4_moe import _job_key, jobs_from_rows, parse_csv
+
+        repo = Path(__file__).resolve().parents[2]
+        config = repo / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
+        with config.open(newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        file_jobs = parse_csv(str(config))
+        row_jobs = jobs_from_rows(rows)
+
+        # The tuner feeds candidate rows through jobs_from_rows instead of a CSV
+        # file, so the in-memory path must select exactly the jobs the shipped
+        # file parser selects, stage-2 bias variants included.
+        self.assertEqual(
+            [_job_key(job) for job in row_jobs],
+            [_job_key(job) for job in file_jobs],
+        )
+        no_bias_jobs = jobs_from_rows(rows, include_bias_variants=False)
+        self.assertLess(len(no_bias_jobs), len(file_jobs))
+        self.assertLessEqual(
+            {_job_key(job) for job in no_bias_jobs},
+            {_job_key(job) for job in file_jobs},
+        )
 
 
 class TestParallelMxfp4Precompile(unittest.TestCase):

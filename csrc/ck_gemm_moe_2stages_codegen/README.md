@@ -213,15 +213,12 @@ candidate is already a performance finalist, the next-most-accurate unselected
 candidate is promoted instead, so one independent accuracy candidate always
 reaches the final stage when one is available. Every requested profiler sample
 is included in the active-kernel average. The final measured output is checked
-after timing as an additional stability guard. During coarse finalist
-selection, candidates whose normalized latency difference from the fastest
-member of a timing bucket is less than 0.01 (1%) are treated as tied.
-Final-winner selection does not chain buckets: it finds the globally fastest
-finalist, includes every finalist within 1% of that latency, and selects the
-lowest worst-case cosine error in that global performance-equivalent set.
-Latency breaks an exact accuracy tie. A shape is marked failed only when no
-candidate survives its accuracy and launch checks; otherwise the best valid
-final retime is emitted.
+after timing as an additional stability guard. Final-winner selection finds the
+globally fastest finalist, includes every finalist within 1% of that latency,
+and selects the lowest worst-case cosine error in that global
+performance-equivalent set. Latency breaks an exact accuracy tie. A shape is
+marked failed only when no candidate survives its accuracy and launch checks;
+otherwise the best valid final retime is emitted.
 
 The funnel checks kernel-level correctness at every stage. Still validate the
 selected rows through the production operator before using or committing the
