@@ -65,8 +65,8 @@ def _as_bool(value, default: bool) -> bool:
 def _as_int(value, default: int | None) -> int | None:
     # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
     # cell can come back as the literal "nan"; read those as unset like _cell.
-    # Merging the model_configs/ CSVs through pandas also turns an int column
-    # with blank cells into float, so a "32" cell comes back as "32.0".
+    # The model_configs/ merge goes through pandas, which stores an int column
+    # with blank cells as float; accept such integral floats, reject the rest.
     text = "" if value is None else str(value).strip()
     if text == "" or text.lower() in ("nan", "none"):
         return default
