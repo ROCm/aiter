@@ -7,32 +7,54 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr
 
-from ..gdr_common import _gview, _load_vec, _store_vec
+from ..gdr_common import _gview, _load_vec
 
 
-def _prefetch_a(maps, block, k_base, col, group, wave):
+def _tiled_mma():
+    mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32, fx.Float32))
+    return fx.make_tiled_mma(mma, fx.make_layout((4, 1, 1), (1, 0, 0)))
+
+
+def _prefetch_a(maps, block, k_base, tid):
     cp = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+    tmma = _tiled_mma()
+    copy_a = fx.make_tiled_copy_A(cp, tmma).get_slice(tid)
+    a = fx.make_view(
+        fx.get_iter(fx.slice(maps, (block, k_base, 0, None))),
+        fx.make_layout((128, 32), (1, 128)),
+    )
+    fragment = tmma.get_slice(tid).make_fragment_A(a)
+    fx.copy(cp, copy_a.partition_S(a), copy_a.retile(fragment))
+    return fragment.load()
+
+
+def _load_c(atom, view, tid, numeric):
+    copy_c = fx.make_tiled_copy_C(atom, _tiled_mma()).get_slice(tid)
+    partition = copy_c.partition_S(view)
     return fx.Vector.from_elements(
         [
-            _load_vec(
-                cp,
-                fx.slice(
-                    maps,
-                    (
-                        block,
-                        k_base + kk * 4 + group,
-                        panel * 64 + wave * 16 + col,
-                        None,
-                    ),
-                ),
-                1,
-                fx.Float32,
-            )
-            for kk in range(8)
+            _load_vec(atom, partition[(None, j), panel, 0], 1, numeric)
             for panel in range(2)
+            for j in range(4)
         ],
-        dtype=fx.Float32,
+        dtype=numeric,
     )
+
+
+def _store_c(atom, view, values, tid):
+    tmma = _tiled_mma()
+    copy_c = fx.make_tiled_copy_C(atom, tmma).get_slice(tid)
+    partition = copy_c.partition_D(view)
+    fragment = tmma.get_slice(tid).make_fragment_C(view)
+    fragment.store(values)
+    retiled = copy_c.retile(fragment)
+    for panel in range_constexpr(2):
+        for j in range_constexpr(4):
+            fx.copy(
+                atom,
+                retiled[(None, j), panel, 0],
+                partition[(None, j), panel, 0],
+            )
 
 
 @flyc.jit
@@ -43,66 +65,69 @@ def _affine_step(
     next_block: fx.Int32,
     first_a: fx.Vector,
     c_values: fx.Vector,
-    col: fx.Int32,
-    group: fx.Int32,
-    wave: fx.Int32,
+    tid: fx.Int32,
 ):
     """Advance affine carry with an LDS RHS and prefetched maps."""
     lds_cp = fx.make_copy_atom(fx.UniversalCopy32b(), fx.Float32)
+    tmma = _tiled_mma()
     mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 4, fx.Float32, fx.Float32))
-    frag_a = fx.make_rmem_tensor(1, fx.Float32)
+    thr_mma = tmma.get_slice(tid)
+    copy_b = fx.make_tiled_copy_B(lds_cp, tmma).get_slice(tid)
+    b_view = fx.make_view(fx.get_iter(rhs), fx.make_layout((16, 128), (1, 16)))
+    p_b = copy_b.partition_S(b_view)
     frag_b = fx.make_rmem_tensor(1, fx.Float32)
-    frag_c = fx.make_rmem_tensor(4, fx.Float32)
-    acc_count = 2
+    a_view = fx.make_view(fx.get_iter(rhs), fx.make_layout((128, 32), (1, 128)))
+    frag_a = fx.make_rmem_tensor(
+        fx.size(thr_mma.partition_A(a_view)[None, 0, 0]), fx.Float32
+    )
+    c_view = fx.make_view(fx.get_iter(rhs), fx.make_layout((128, 16), (16, 1)))
+    frag_c = thr_mma.make_fragment_C(c_view)
+    c_panel = fx.make_rmem_tensor(
+        fx.size(thr_mma.partition_C(c_view)[None, 0, None]), fx.Float32
+    )
 
     def multiply(a_values, k_base, accumulators):
-        values = list(accumulators)
-        for kk in range_constexpr(8):
-            sv = _load_vec(
-                lds_cp,
-                fx.slice(rhs, (k_base + kk * 4 + group, col, None)),
-                1,
-                fx.Float32,
+        acc = fx.Vector(accumulators)
+        values = [
+            fx.Vector.from_elements(
+                [acc[panel * 4 + j] for j in range(4)], dtype=fx.Float32
             )
-            frag_b.store(fx.Vector.from_elements([sv], dtype=fx.Float32))
+            for panel in range(2)
+        ]
+        for kk in range_constexpr(8):
+            fx.copy(lds_cp, p_b[None, None, k_base // 4 + kk], frag_b)
             for panel in range_constexpr(2):
                 frag_a.store(
                     fx.Vector.from_elements(
                         [a_values[kk * 2 + panel]], dtype=fx.Float32
                     )
                 )
-                frag_c.store(fx.Vector(values[panel]))
-                fx.gemm(mma, frag_c, frag_a, frag_b, frag_c)
-                values[panel] = frag_c.load()
-        return values
+                c_panel.store(fx.Vector(values[panel]))
+                fx.gemm(mma, c_panel, frag_a, frag_b, c_panel)
+                values[panel] = c_panel.load()
+        frag_c.store(
+            fx.Vector.from_elements(
+                [fx.Vector(values[panel])[j] for panel in range(2) for j in range(4)],
+                dtype=fx.Float32,
+            )
+        )
+        return frag_c.load()
 
     for chunk, carried in range(
         fx.Int32(0),
         fx.Int32(3),
         fx.Int32(1),
-        init=[fx.Vector.filled(4, 0.0, fx.Float32) for _ in range(acc_count)]
-        + [first_a],
+        init=[fx.Vector.filled(8, 0.0, fx.Float32), first_a],
     ):
         k_base = fx.Int32(chunk) * 32
-        next_a = _prefetch_a(maps, block, k_base + 32, col, group, wave)
-        accumulators = multiply(
-            fx.Vector(carried[acc_count]), k_base, carried[:acc_count]
-        )
-        result = yield accumulators + [next_a]
+        next_a = _prefetch_a(maps, block, k_base + 32, tid)
+        accumulators = multiply(fx.Vector(carried[1]), k_base, carried[0])
+        result = yield [accumulators, next_a]
 
     # The last prefetch must remain in bounds.
-    next_a = _prefetch_a(maps, next_block, fx.Int32(0), col, group, wave)
-    accumulators = multiply(
-        fx.Vector(result[acc_count]), fx.Int32(96), result[:acc_count]
-    )
-    output = fx.Vector.from_elements(
-        [
-            fx.Vector(accumulators[slot])[j] + c_values[slot * 4 + j]
-            for slot in range(acc_count)
-            for j in range(4)
-        ],
-        dtype=fx.Float32,
-    )
+    next_a = _prefetch_a(maps, next_block, fx.Int32(0), tid)
+    accumulators = multiply(fx.Vector(result[1]), fx.Int32(96), result[0])
+    output = fx.Vector(accumulators) + c_values
     return output, next_a
 
 
@@ -131,11 +156,7 @@ def compile_chunk_gdn_carry(
         request_head = fx.Int32(gpu.block_id("y"))
         head = request_head % H
         request = request_head // H
-        lane = tid % 64
-        wave = tid // 64
-        col = lane % 16
-        group = lane // 16
-        v = tile_v * BV + col
+        v_base = tile_v * BV
         cp_i32 = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Int32)
         prefix = _gview(block_prefix_tensor, None, (requests + 1, 1), (1, 1))
         first = _load_vec(cp_i32, fx.slice(prefix, (request, None)), 1, fx.Int32)
@@ -158,50 +179,39 @@ def compile_chunk_gdn_carry(
             entry_tensor, head * K * V, (blocks, K, V, 1), (H * K * V, V, 1, 1)
         )
         shared = fx.SharedAllocator().allocate(SharedStorage).peek()
-        state = shared.state.view(fx.make_layout((K, BV, 1), (BV, 1, 1)))
-        for panel in range_constexpr(2):
-            for j in range_constexpr(4):
-                row = panel * 64 + wave * 16 + group * 4 + j
-                seed = fx.Float32(0.0)
-                if const_expr(use_initial_state):
-                    # Public h0 [V,K] transposes into carry [K,V].
-                    h0 = _gview(h0_tensor, request_head * V * K, (V, K, 1), (K, 1, 1))
-                    loaded_seed = _load_vec(
-                        cp_state, fx.slice(h0, (v, row, None)), 1, state_num
-                    )
-                    if const_expr(state_num == fx.BFloat16):
-                        loaded_seed = loaded_seed.to(fx.Float32)
-                    seed = loaded_seed
-                _store_vec(
-                    lds_cp, fx.slice(state, (row, col, None)), seed, 1, fx.Float32
-                )
-                if first < end:
-                    _store_vec(
-                        cp, fx.slice(entry, (first, row, v, None)), seed, 1, fx.Float32
-                    )
+        state = shared.state.view(fx.make_layout((K, BV), (BV, 1)))
+        seed = fx.Vector.filled(8, 0.0, fx.Float32)
+        if const_expr(use_initial_state):
+            # Public h0 [V,K] transposes into carry [K,V].
+            h0 = _gview(
+                h0_tensor,
+                request_head * V * K + K * v_base,
+                (K, BV),
+                (1, K),
+            )
+            loaded_seed = _load_c(cp_state, h0, tid, state_num)
+            if const_expr(state_num == fx.BFloat16):
+                loaded_seed = loaded_seed.to(fx.Float32)
+            seed = loaded_seed
+        _store_c(lds_cp, state, seed, tid)
+        if first < end:
+            entry_first = fx.make_view(
+                fx.get_iter(fx.slice(entry, (first, 0, v_base, None))),
+                fx.make_layout((K, BV), (V, 1)),
+            )
+            _store_c(cp, entry_first, seed, tid)
         gpu.barrier()
 
         # Empty requests still prefetch one map.
         seed_block = (first < end).select(first, fx.Int32(0))
-        first_a = _prefetch_a(maps, seed_block, fx.Int32(0), col, group, wave)
+        first_a = _prefetch_a(maps, seed_block, fx.Int32(0), tid)
         for block, carried_a in range(first, end - 1, fx.Int32(1), init=[first_a]):
             b = fx.Int32(block)
-            c_values = fx.Vector.from_elements(
-                [
-                    _load_vec(
-                        cp,
-                        fx.slice(
-                            maps,
-                            (b, K + v, panel * 64 + wave * 16 + group * 4 + j, None),
-                        ),
-                        1,
-                        fx.Float32,
-                    )
-                    for panel in range(2)
-                    for j in range(4)
-                ],
-                dtype=fx.Float32,
+            c_view = fx.make_view(
+                fx.get_iter(fx.slice(maps, (b, K + v_base, 0, None))),
+                fx.make_layout((K, BV), (1, K)),
             )
+            c_values = _load_c(cp, c_view, tid, fx.Float32)
             # At the last block (b + 1 == end - 1) reuse b: one redundant affine step
             # is cheaper than branching around it.
             next_block = (b + 1 < end - 1).select(b + 1, b)
@@ -212,29 +222,15 @@ def compile_chunk_gdn_carry(
                 next_block,
                 fx.Vector(carried_a[0]),
                 c_values,
-                col,
-                group,
-                wave,
+                tid,
             )
             gpu.barrier()
-            for panel in range_constexpr(2):
-                for j in range_constexpr(4):
-                    row = panel * 64 + wave * 16 + group * 4 + j
-                    next_state = values[panel * 4 + j]
-                    _store_vec(
-                        lds_cp,
-                        fx.slice(state, (row, col, None)),
-                        next_state,
-                        1,
-                        fx.Float32,
-                    )
-                    _store_vec(
-                        cp,
-                        fx.slice(entry, (b + 1, row, v, None)),
-                        next_state,
-                        1,
-                        fx.Float32,
-                    )
+            _store_c(lds_cp, state, values, tid)
+            entry_next = fx.make_view(
+                fx.get_iter(fx.slice(entry, (b + 1, 0, v_base, None))),
+                fx.make_layout((K, BV), (V, 1)),
+            )
+            _store_c(cp, entry_next, values, tid)
             gpu.barrier()
             _carried_result = yield [next_a]
 
