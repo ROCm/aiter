@@ -390,10 +390,10 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
             len(head) == num_prefetch
         ), f"head has {len(head)} loads, expected NP={num_prefetch}"
         for i, v in enumerate(head):
-            a[i] = v
+            a[i] = schedule_bank(v, bank=1, reason="ring_frag")
     else:
         for i in range(num_prefetch):
-            a[i] = emit(i)
+            a[i] = schedule_bank(emit(i), bank=1, reason="ring_frag")
             rocdl.sched_barrier(0)
         rocdl.sched_barrier(0)  # pin the num_prefetch-deep burst above the stream
 
@@ -407,7 +407,7 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
         for k in range(2):
             j = 2 * i + num_prefetch + k
             if j < num_ld:
-                a[j % ring] = emit(j)
+                a[j % ring] = schedule_bank(emit(j), bank=1, reason="ring_frag")
                 rocdl.sched_barrier(0)
 
     def _release(i):
@@ -1244,6 +1244,34 @@ def _prologue_attention(
     }
 
 
+def schedule_bank(value, bank=0, soft=False, reason=None):
+    """gfx1250 VGPR bank hint: ask the allocator to place ``value`` in ``bank``."""
+    if schedule_bank.initialized is False:
+        try:  # gfx1250 VGPR bank hint; absent on older FlyDSL
+            from flydsl.expr.rocdl import schedule_bank as func
+        except ImportError:  # pragma: no cover
+            func = None
+        schedule_bank.func = func
+        schedule_bank.initialized = True
+
+    reasons = {
+        "oaccu": True,
+        "ring_frag": False,
+        "ring_lds_addr": False,
+    }
+    func = schedule_bank.func
+    if func and (reason not in reasons or reasons[reason]):
+        try:
+            return func(value, bank, soft)
+        except Exception:  # noqa: BLE001 - any binding failure degrades to identity
+            schedule_bank.func = None
+    return value
+
+
+schedule_bank.initialized = False
+schedule_bank.func = None
+
+
 def _o_pack(o_list):
     """Fold the per-d-tile O accumulators into ONE vector value."""
     cur = list(o_list)
@@ -1259,7 +1287,11 @@ def _o_pack(o_list):
 def _o_unpack(wide, num_tiles):
     width = wide.numel // num_tiles
     return [
-        wide.shuffle(wide, list(range(i * width, (i + 1) * width)))
+        schedule_bank(
+            wide.shuffle(wide, list(range(i * width, (i + 1) * width))),
+            bank=1,
+            reason="oaccu",
+        )
         for i in range(num_tiles)
     ]
 
@@ -1535,8 +1567,13 @@ def _core_attention_multi_kv_tiles(
         head_carry = [
             fx.Vector(state[_head_carry_idx + i]) for i in range(_num_head_carry)
         ]
-        v_curr = v_slots[0]  # tile tile_idx-1: this body's PV
-        k_curr = k_slots[1]  # tile tile_idx:   this body's QK
+        # The ring's LDS base pointers: banked with the fragments they feed.
+        v_curr = [
+            schedule_bank(p, bank=1, reason="ring_lds_addr") for p in v_slots[0]
+        ]  # tile tile_idx-1: this body's PV
+        k_curr = [
+            schedule_bank(p, bank=1, reason="ring_lds_addr") for p in k_slots[1]
+        ]  # tile tile_idx:   this body's QK
 
         # Tile prefetched by this body, CLAMPED to the last tile rather than guarded off
         # past the end. Every body then issues exactly one tile's copies, so the fence
