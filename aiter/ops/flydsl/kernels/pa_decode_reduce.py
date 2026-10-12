@@ -155,9 +155,10 @@ def compile_pa_decode_ps_reduce(
     parts_per_group = (
         max_context_partition_num + parallel_groups - 1
     ) // parallel_groups
+    weight_chunks = (max_context_partition_num + warp_size - 1) // warp_size
 
     # SharedStorage is allocated only by the parallel branch.
-    shared_weight_elems = max_context_partition_num if use_parallel_lds else 1
+    shared_weight_elems = weight_chunks * warp_size if use_parallel_lds else 1
     shared_partial_elems = (parallel_groups - 1) * head_size if use_parallel_lds else 1
 
     @fx.struct
@@ -475,9 +476,7 @@ def compile_pa_decode_ps_reduce(
             lds_partials = lds.partials
 
             if worker == zero_i:
-                partitions_per_lane = (
-                    max_context_partition_num + warp_size - 1
-                ) // warp_size
+                partitions_per_lane = weight_chunks
                 part_sums = []
                 part_maxes = []
                 lane_max = neg_inf
@@ -539,9 +538,10 @@ def compile_pa_decode_ps_reduce(
                     lane_in_range = (lane < fx.Int32(chunk_size)) & (
                         part_idx < c_part_num
                     )
+                    weight = zero_f
                     if lane_in_range:
                         weight = scaled_sums[chunk_idx] * parallel_inv_exp_sum
-                        lds_weights[part_idx] = weight
+                    lds_weights[part_idx] = weight
 
             fx.gpu.barrier()
 
@@ -554,11 +554,10 @@ def compile_pa_decode_ps_reduce(
             if group_in_range:
                 for local_part in fx.range_constexpr(parts_per_group):
                     part_idx = group_part_begin + fx.Int32(local_part)
-                    # Clamp and select instead of branching so the partition
-                    # loads are not serialized by a per-partition branch.
-                    part_in_range = part_idx < c_part_num
-                    safe_part_idx = part_in_range.select(part_idx, zero_i)
-                    weight = fx.Float32(lds_weights[safe_part_idx])
+                    # Inactive weights are zero. Clamp only the logits address
+                    # to a finite active row so zero-weight products stay finite.
+                    safe_part_idx = fx.min(part_idx, c_part_num - fx.Int32(1))
+                    weight = fx.Float32(lds_weights[part_idx])
                     logits_offset = (
                         logits_seq_offset
                         + kv_head_idx * stride_logits_head
@@ -567,7 +566,7 @@ def compile_pa_decode_ps_reduce(
                         + output_element
                     )
                     part_logits = fx.Float32(logits[logits_offset])
-                    acc = acc + part_in_range.select(part_logits * weight, zero_f)
+                    acc = acc + part_logits * weight
 
             if partition_group > zero_i:  # noqa: SIM102 - Preserve FlyDSL branches.
                 if group_in_range:
