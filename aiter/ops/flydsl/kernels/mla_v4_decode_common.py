@@ -5,6 +5,7 @@
 intrinsics, cross-lane butterflies, the global atomics / loads / fences of the
 cross-split merge protocol, and the mxfp8 (ceil-e8m0) block scale."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _llvm_d
 from flydsl.expr import arith as _arith
@@ -148,8 +149,7 @@ def pin_v64(x):
 
 
 def gload(addr_i64, n):
-    ty = T.f32 if n == 1 else fx.Vector.make_type(n, fx.Float32)
-    return _llvm_d.LoadOp(ty, cu._to_ptr_global(addr_i64), alignment=4 * n).result
+    return fx.generic_load(cu._to_ptr_global(addr_i64, fx.Float32, 4 * n), count=n)
 
 
 def inv_l1():
@@ -157,40 +157,29 @@ def inv_l1():
 
 
 def rmw_add64_agent(addr_i64, val):
-    return fx.Int64(
-        _llvm_d.AtomicRMWOp(
-            _llvm_d.AtomicBinOp.add,
-            cu._to_ptr_global(addr_i64),
-            _arith.unwrap(fx.Int64(val)),
-            _llvm_d.AtomicOrdering.monotonic,
-            syncscope="agent",
-        ).res
+    return fx.atomic_add(
+        cu._to_ptr_global(addr_i64, fx.Int64, 8), fx.Int64(val), syncscope="agent"
     )
 
 
 def ld64_agent(addr_i64, volatile=True):
-    return fx.Int64(
-        _llvm_d.LoadOp(
-            T.i64,
-            cu._to_ptr_global(addr_i64),
-            alignment=8,
-            volatile_=volatile,
-            ordering=_llvm_d.AtomicOrdering.monotonic,
-            syncscope=fx.rocdl.SyncScope.AgentOneAs,
-        ).res
+    return fx.generic_load(
+        cu._to_ptr_global(addr_i64, fx.Int64, 8),
+        volatile=volatile,
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
     )
 
 
 def st_raw(addr_i64, value, align):
-    _llvm_d.StoreOp(_arith.unwrap(value), cu._to_ptr_global(addr_i64), alignment=align)
+    fx.generic_store(cu._to_ptr_global(addr_i64, alignment=align), value)
 
 
 def st_agent(addr_i64, value, align):
-    _llvm_d.StoreOp(
-        _arith.unwrap(value),
-        cu._to_ptr_global(addr_i64),
-        alignment=align,
-        ordering=_llvm_d.AtomicOrdering.monotonic,
+    fx.generic_store(
+        cu._to_ptr_global(addr_i64, alignment=align),
+        value,
+        memory_order=fx.AtomicOrdering.Monotonic,
         syncscope=fx.rocdl.SyncScope.AgentOneAs,
     )
 
@@ -223,7 +212,7 @@ def ld_agent_f32(addr_i64, n):
     return fx.Vector.from_elements(parts, fx.Int64).bitcast(fx.Float32)
 
 
-@cu.traced
+@flyc.jit
 def spin_all_arrived(addr_i64, full, bit):
     cur = ld64_agent(addr_i64)
     while ((cur & full) != full) & ((cur & bit) != fx.Int64(0)):
@@ -232,15 +221,11 @@ def spin_all_arrived(addr_i64, full, bit):
 
 
 def ld_agent_i32(addr_i64, volatile=True):
-    return fx.Int32(
-        _llvm_d.LoadOp(
-            T.i32,
-            cu._to_ptr_global(addr_i64),
-            alignment=4,
-            volatile_=volatile,
-            ordering=_llvm_d.AtomicOrdering.monotonic,
-            syncscope=fx.rocdl.SyncScope.AgentOneAs,
-        ).res
+    return fx.generic_load(
+        cu._to_ptr_global(addr_i64),
+        volatile=volatile,
+        memory_order=fx.AtomicOrdering.Monotonic,
+        syncscope=fx.rocdl.SyncScope.AgentOneAs,
     )
 
 
@@ -252,7 +237,7 @@ def tickets_state(v, want):
     )
 
 
-@cu.traced
+@flyc.jit
 def spin_tickets_state(addr_lane_i64, v, max_polls, want):
     r = tickets_state(v, want)
     k = fx.Int32(0)

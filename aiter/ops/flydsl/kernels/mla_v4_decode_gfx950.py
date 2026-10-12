@@ -694,11 +694,9 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
 
             def ld_idx(off):
                 return fx.Int32(
-                    _llvm_d.LoadOp(
-                        T.i32,
-                        cu._to_ptr_global(ibase + fx.Int64(off) * fx.Int64(4)),
-                        alignment=4,
-                    ).result
+                    fx.generic_load(
+                        cu._to_ptr_global(ibase + fx.Int64(off) * fx.Int64(4))
+                    )
                 )
 
             rb_qrow, rb_h0, rb_ok = [], [], []
@@ -1135,7 +1133,7 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
 
                 def dma16(gaddr, off, nt=False):
                     _rocdl_d.global_load_lds(
-                        cu._to_ptr_global(gaddr),
+                        fx.to_llvm_ptr(cu._to_ptr_global(gaddr)),
                         fx.to_llvm_ptr(p_rq + off),
                         16,
                         0,
@@ -1243,7 +1241,7 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
                             ok = (kidx < kvlen) & (t < t1)
                             ga = ibase + fx.Int64(ok.select(kidx, zero_i)) * fx.Int64(4)
                             _rocdl_d.global_load_lds(
-                                cu._to_ptr_global(ga),
+                                fx.to_llvm_ptr(cu._to_ptr_global(ga)),
                                 fx.to_llvm_ptr(
                                     p_rq
                                     + (
@@ -1846,7 +1844,7 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
                         ok = (kidx < kvlen) & (t < t1)
                         ga = ibase + fx.Int64(ok.select(kidx, zero_i)) * fx.Int64(4)
                         _rocdl_d.global_load_lds(
-                            cu._to_ptr_global(ga),
+                            fx.to_llvm_ptr(cu._to_ptr_global(ga)),
                             fx.to_llvm_ptr(
                                 p_rq
                                 + (ix_off(t) + fx.Int32(256 * u) + lane * fx.Int32(4))
@@ -2068,9 +2066,7 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
                                     + ri * fx.Int64(2 * ROPE),
                                 )
                                 acc = acc ^ fx.Int32(
-                                    _llvm_d.LoadOp(
-                                        T.i32, cu._to_ptr_global(qa), alignment=4
-                                    ).result
+                                    fx.generic_load(cu._to_ptr_global(qa))
                                 )
                             ki = gl * fx.Int32(32)
                             kic = ((ki < kvln) & (gl < fx.Int32(8))).select(ki, zero_i)
@@ -2080,11 +2076,7 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
                                 fx.Int64(fx.ptrtoint(indptr_ptr))
                                 + fx.Int64(sq) * fx.Int64(4),
                             )
-                            acc = acc ^ fx.Int32(
-                                _llvm_d.LoadOp(
-                                    T.i32, cu._to_ptr_global(ia), alignment=4
-                                ).result
-                            )
+                            acc = acc ^ fx.Int32(fx.generic_load(cu._to_ptr_global(ia)))
                             if (nseq < zero_i) & (acc == fx.Int32(1)):
                                 fx.ptr_store(fx.Float32(0.0), sink_ptr)
 
@@ -3027,7 +3019,7 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
                         for u, kk in enumerate(kd_list):
                             ga = ibase + fx.Int64(ix_clamp(ptile(q), kk)) * fx.Int64(4)
                             _rocdl_d.global_load_lds(
-                                cu._to_ptr_global(ga),
+                                fx.to_llvm_ptr(cu._to_ptr_global(ga)),
                                 fx.to_llvm_ptr(
                                     p_rq
                                     + at(
@@ -4201,11 +4193,9 @@ def _emitter(cfg: V4Cfg, ws_prev=(0, 0)):
                 if fx.const_expr(WTP):
                     v = (ld64_agent if EPT == 4 else ld_agent_i32)(addr, False)
                     return fx.Vector.from_elements([v], type(v)).bitcast(fx.Float16)
-                return _llvm_d.LoadOp(
-                    fx.Vector.make_type(EPT, fx.Float16),
-                    cu._to_ptr_global(addr),
-                    alignment=2 * EPT,
-                ).result
+                return fx.generic_load(
+                    cu._to_ptr_global(addr, fx.Float16, 2 * EPT), count=EPT
+                )
 
             def merged_epi():
                 tkv = zero_i
