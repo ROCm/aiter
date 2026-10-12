@@ -37,8 +37,9 @@ from flydsl.expr import (
 )
 from flydsl.expr import math as fxmath
 
-from aiter.ops.flydsl.kernels.kernels_common import kernel_signature
+from aiter.ops.flydsl.kernels.kernels_common import LOG2E, kernel_signature
 from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
+from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
 from aiter.ops.flydsl.kernels.tensor_shim import (
     _run_compiled,
     buf_base_i64,
@@ -76,7 +77,6 @@ _NARROW_HEAD_DIM = 128
 _DECODE_BANDS_NARROW = (4, 16)
 _DECODE_BANDS_WIDE = (2, 12)
 _LSE_EMPTY = -1.0e20
-_LOG2E = 1.4426950408889634
 
 
 def _idiv(a, b):
@@ -1253,7 +1253,7 @@ def build_qsa_k2_module(
             den = l_final
             has = den > Float32(0.0)
             lse = has.select(
-                m_final + fxmath.log(den) * Float32(_LOG2E),
+                m_final + fxmath.log(den) * Float32(LOG2E),
                 Float32(_LSE_EMPTY),
             )
             partial_lse[split, row, head] = lse
@@ -1395,14 +1395,6 @@ def _plan(
         wide_cache,
         kv_strides,
     )
-
-
-def _span_bytes(t: torch.Tensor) -> int:
-    """Bytes from ``t``'s first element to one past its last, for any strides."""
-    if t.numel() == 0:
-        return 0
-    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
-    return (last + 1) * t.element_size()
 
 
 def qsa_k2_serves(
@@ -1552,7 +1544,7 @@ def qsa_k2(
     # Unsigned 32-bit V# span. Exactly 4 GiB still fits: the last byte
     # offset is 2^32 - 1. Python ints do not wrap. A strided view spans
     # more than its numel.
-    wide_cache = _span_bytes(k_cache) > (1 << 32)
+    wide_cache = span_bytes(k_cache) > (1 << 32)
     kv_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
     page_size = k_cache.shape[1]
     use_k32 = arch == "gfx950"
@@ -1601,7 +1593,7 @@ def qsa_k2(
         int(page_table.shape[0]),
         int(page_table.shape[1]),
         int(k_cache.shape[0]),
-        float(softmax_scale * _LOG2E),
+        float(softmax_scale * LOG2E),
         int(rows),
         int(n_kv_heads),
         int(n_q_heads),
