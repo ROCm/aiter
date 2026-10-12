@@ -474,6 +474,9 @@ def test_mxscale_bpreshuffle_mid_dword_scale_rows(monkeypatch, m, k, config):
     [
         (300, 1536, 1024, "t256x192x128_w1x4_nb3_sk1_bd2_xcd_sps"),
         (5, 1536, 6144, "t16x32x256_w1x2_nb4_sk4"),
+        (1024, 1024, 1024, "t64x128x128_w1x4_nb4_sk1_bd2_xcd4"),
+        # 5 M tiles leave a 1-tile swizzle group; 12 N tiles pad the grid.
+        (300, 1536, 1024, "t64x128x128_w1x4_nb4_sk1_xcd4"),
     ],
 )
 def test_mxscale_bpreshuffle_1x32_weight_scales(monkeypatch, m, n, k, config):
