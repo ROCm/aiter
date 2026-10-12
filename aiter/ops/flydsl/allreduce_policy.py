@@ -108,13 +108,6 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     ),
 }
 
-# --- environment variables ---------------------------------------------------------
-
-ENABLE_VAR = "AITER_FLY_AR"
-ONESHOT_MAX_VAR = "AITER_FLY_AR_ONESHOT_MAX_BYTES"
-ONESHOT_MIN_VAR = "AITER_FLY_AR_ONESHOT_MIN_BYTES"
-MESH_MAX_VAR = "AITER_FLY_AR_MESH_MAX_BYTES"
-
 
 def _env_int(name: str) -> int | None:
     """A non-negative override from *name*, or None. ``-1`` means "use the table"."""
@@ -135,7 +128,7 @@ def enabled() -> bool:
     Opt-in only, and only ``"1"`` opts in -- unset, ``"0"`` and anything else
     means disabled.
     """
-    return os.environ.get(ENABLE_VAR, "").strip() == "1"
+    return os.environ.get("AITER_FLY_AR", "").strip() == "1"
 
 
 @functools.lru_cache(maxsize=1)
@@ -162,9 +155,10 @@ def _base(link: str, world_size: int) -> FamilyPolicy:
 
 
 def _oneshot_boundary(base: FamilyPolicy) -> int:
-    """The measured one-shot/mesh crossover, ``ONESHOT_MAX_VAR`` applied."""
+    """The measured one-shot/mesh crossover, ``AITER_FLY_AR_ONESHOT_MAX_BYTES``
+    applied."""
 
-    override = _env_int(ONESHOT_MAX_VAR)
+    override = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
     return base.oneshot_max if override is None else override
 
 
@@ -193,15 +187,15 @@ class QuantPolicy:
 def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
     """The one-shot's window for a rank, environment overrides applied.
 
-    ``ONESHOT_MIN_VAR`` overrides the small-payload floor below which the
-    one-shot declines (the custom-AR slot then falls through to ``cdr``);
-    ``ONESHOT_MAX_VAR`` overrides the ceiling. ``-1`` on either means "use the
-    table".
+    ``AITER_FLY_AR_ONESHOT_MIN_BYTES`` overrides the small-payload floor below
+    which the one-shot declines (the custom-AR slot then falls through to
+    ``cdr``); ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides the ceiling. ``-1``
+    on either means "use the table".
     """
 
     base = _base(link, world_size)
-    max_override = _env_int(ONESHOT_MAX_VAR)
-    min_override = _env_int(ONESHOT_MIN_VAR)
+    max_override = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
+    min_override = _env_int("AITER_FLY_AR_ONESHOT_MIN_BYTES")
     return OneShotPolicy(
         max_bytes=base.oneshot_max_exact if max_override is None else max_override,
         min_bytes=base.min_bytes if min_override is None else min_override,
@@ -214,7 +208,7 @@ def resolve_quant(link: str, world_size: int) -> QuantPolicy:
     base = _base(link, world_size)
     floor = _oneshot_boundary(base)
     mesh = base.mesh_max
-    override_mesh = _env_int(MESH_MAX_VAR)
+    override_mesh = _env_int("AITER_FLY_AR_MESH_MAX_BYTES")
     if override_mesh is not None:
         mesh = override_mesh
     # The families partition by size; an override must not invert them.

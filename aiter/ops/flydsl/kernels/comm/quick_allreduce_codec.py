@@ -14,11 +14,7 @@ reduce-scatter/all-gather transport in isolation from the codec.
 many blocks a payload gets.
 
 Imported by the mesh and ring kernels, which must agree on it byte for byte.
-Depends on ``quick_allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
-
-Note: Editing the shared modules doesn't invalidate the FlyDSL compiler cache.
-Hence, one may end up running stake kernels unless one sets
-export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels at the repo root.
+Depends on ``allreduce_shared`` for ``BLOCK``, ``WAVE`` and ``I32_BYTES``.
 """
 
 import functools

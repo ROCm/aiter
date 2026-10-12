@@ -22,19 +22,19 @@ from aiter.dist.device_communicators.custom_all_reduce import (
 )
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
-from aiter.ops.flydsl.kernels.one_shot_allreduce import (
+from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
     SUPPORTED_ATOMS,
     SUPPORTED_BLOCKS,
     oneshot_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import (
     SUPPORTED_BLOCKS as TWO_STAGE_BLOCKS,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import (
     SUPER_TILES,
     mesh_st_ladder,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_int4_ring import (
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4_ring import (
     RING_SUPER_TILES,
     ring_st_ladder,
 )

@@ -29,6 +29,7 @@ from .allreduce_shared import (
     kernel_symbol,
     payload_probes,
 )
+from .kernels.comm.allreduce_shared import SUPPORTED_WORLDS
 from .kernels.comm.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
@@ -39,7 +40,6 @@ from .kernels.comm.one_shot_allreduce import (
     make_one_shot_allreduce_kernel,
     oneshot_ladder,
 )
-from .kernels.comm.allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
@@ -134,7 +134,7 @@ class OneShotAllReduce:
             )
         if group_rank != int(rank):
             raise ValueError(f"rank={rank} does not match group rank {group_rank}")
-        _validate_ipc_process_group(group, rank=int(rank))
+        _validate_ipc_process_group(group, rank=int(rank), owner="OneShotAllReduce")
         arch = get_gfx_runtime()
         if arch not in _SUPPORTED_ARCHS:
             raise RuntimeError(
@@ -145,7 +145,7 @@ class OneShotAllReduce:
             raise ValueError(f"grid_cap must be positive, got {cap}")
 
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
-        self._device_index = _cuda_index(device)
+        self._device_index = _cuda_index(device, owner="OneShotAllReduce")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self._has_launched = False

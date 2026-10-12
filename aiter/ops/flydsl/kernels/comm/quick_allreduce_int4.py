@@ -12,9 +12,8 @@ Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``ATOMS / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
 stays ``ATOMS * rank_tile_bytes``.
 
-Geometry, cache policy and the wire codec live in
-``quick_allreduce_shared`` and ``quick_allreduce_codec``, which the ring
-and one-shot schedules share byte for byte.
+The geometry and the cache policy are in ``allreduce_shared``.
+The wire codec is in ``quick_allreduce_codec``.
 
 One tuning knob besides the super-tile: ``block``, threads per workgroup. It
 sets the tile (``block * ATOMS * 16 B``), hence how many blocks a payload gets
@@ -30,22 +29,6 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
-from .quick_allreduce_codec import (
-    SUPER_TILES,
-    SUPPORTED_BLOCKS,
-    _atom_bf16_to_f16,
-    _atom_f16_to_bf16,
-    _clamp_fp16_overflow,
-    _codec_dequant,
-    _codec_load,
-    _codec_quant,
-    _f16x2,
-    _i32,
-    _scale_from_word,
-    codecs_for_block,
-    scale_slot_of,
-    thread_lane,
-)
 from .allreduce_shared import (
     _INBOX_POLICY,
     ATOMS,
@@ -71,6 +54,22 @@ from .allreduce_shared import (
     _store_v4i32_peer,
     _to_sgpr_i64,
     make_pack_storage,
+)
+from .quick_allreduce_codec import (
+    SUPER_TILES,
+    SUPPORTED_BLOCKS,
+    _atom_bf16_to_f16,
+    _atom_f16_to_bf16,
+    _clamp_fp16_overflow,
+    _codec_dequant,
+    _codec_load,
+    _codec_quant,
+    _f16x2,
+    _i32,
+    _scale_from_word,
+    codecs_for_block,
+    scale_slot_of,
+    thread_lane,
 )
 
 # Re-exported for the host, which imports its tile math from this module.

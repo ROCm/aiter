@@ -1,14 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Transport assets shared by every quick-allreduce/one-shot-all-reduce implementations.
+"""Transport parts that the one-shot, mesh and ring all-reduce kernels share.
 
-Tile geometry, the inbox cache-policy table, the peer store/load primitives and
-the LDS staging factory.
-
-Note: Editing the shared modules doesn't invalidate the FlyDSL compiler cache.
-Hence, one may end up running stake kernels unless one sets
-export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels/comm at the repo root.
+This module contains the tile geometry, the inbox cache-policy table, the peer
+store and load primitives, and the LDS staging factory.
 """
 
 import logging
@@ -48,66 +44,78 @@ _CM_SC0 = 1
 _CM_NT = 2
 _CM_SC1 = 16
 
-# Cache policy for the peer stores in _fanout_nt / _publish, per inbox memory
-# type.
+# Cache policy for each inbox memory type
+# =======================================
 #
-# On an uncached inbox the memory type does all the work: a store cannot sit in
-# any cache, so every peer sees the payload as soon as `vmcnt(0)` retires and
-# the release needs nothing beyond that.
+# Each entry of ``_INBOX_POLICY`` has these keys:
 #
+#   payload  Keyword arguments for ``fx.generic_store`` on the payload stores
+#            to a peer.
+#   flag     Keyword arguments for ``fx.generic_store`` on the flag stores to
+#            a peer.
+#   release  The sync scope of the release fence before the flag store, or
+#            None for no fence.
+#   acquire  The sync scope of the acquire fence after the flag spin and
+#            before the payload loads.
+#   fanout   The axis of the (peer, sector) fanout that changes fastest
+#            between consecutive quads. Refer to the layouts in the mesh kernel.
+#   recv     The ``_CM_*`` cache-modifier bits on the payload loads of the
+#            reader.
 #
-# ``payload`` and ``flag`` are keyword arguments for ``fx.generic_store``, as
-# ``(name, value)`` tuples rather than dicts: the kernel factories capture them,
-# and FlyDSL folds a captured tuple into its compile-cache key but silently
-# leaves a dict out. On gfx942/gfx950 they lower to:
+# The store keyword arguments are tuples of ``(name, value)`` pairs, not dicts.
+# The kernel factories capture them. FlyDSL adds a captured tuple to the
+# compile-cache key, but it does not add a captured dict.
+#
+# On gfx942/gfx950, the stores lower as follows:
 #
 #   _ST_NT      global_store_* ... nt
 #   _ST_SYSTEM  global_store_* ... sc0 sc1   (a relaxed system-scope atomic)
 #
-# ``release`` is the sync scope of the release fence that precedes the flag, or
-# None for none. System scope: the peers are other GPUs, and
-# only a system-scope release orders the payload before the flag for them.
+# Uncached inbox
+# --------------
+# A store to this memory type cannot stay in a cache. When ``vmcnt(0)`` retires
+# a store, all peers can see the data.
 #
-# ``acquire`` is the sync scope of the acquire fence between the flag spin and
-# the payload loads. At system scope it lowers to ``buffer_inv sc0 sc1``, a full
-# L1+L2 invalidate, which only a cached inbox needs. Every kernel takes it from
-# here; the ring additionally writes back before a system-scope acquire.
+# * payload, flag: ``nt``.
+# * release: none. The ``vmcnt(0)`` before the flag store is enough.
+# * acquire: workgroup scope. This fence does not invalidate a cache. It is a
+#   compiler barrier only: it stops the compiler from moving the payload loads
+#   above the flag spin.
+# * recv: ``sc0 sc1``. The payload loads go past L1 and L2 to memory.
+# * fanout: "sector".
 #
-# ``acquire`` and ``recv`` are one decision and must change together. A
-# workgroup-scope acquire invalidates nothing, so it is only safe when ``recv``
-# makes every payload load bypass L1 and L2 (``sc0 sc1``) -- ``nt`` is a reuse
-# hint, not a bypass, and could be answered from a line cached by an earlier
-# call into the same slot. A system-scope acquire is what makes ``nt`` safe.
+# Fine-grained inbox
+# ------------------
+# This memory type is cacheable. A retired store can stay in the L2 of the
+# writer, where the peers cannot see it.
 #
-# ``fanout`` picks which axis of the (peer, sector) fanout runs fastest across
-# consecutive quads; see the layouts in the kernel body.
+# * payload: ``nt``.
+# * release: system scope. The fence writes the payload back from L2 before the
+#   flag store. The peers are other GPUs. Only a system-scope release puts the
+#   payload before the flag for them.
+# * flag: ``sc0 sc1``, which writes through to memory.
+# * acquire: system scope. It lowers to ``buffer_inv sc0 sc1``, which
+#   invalidates L1 and L2 of the reader.
+# * recv: ``nt``.
+# * fanout: "peer".
 #
-# ``recv`` is the cache modifier the *reader* uses on its payload loads. It is
-# part of the same policy because it is the other half of the same decision: the
-# more the writer is allowed to cache, the harder the reader has to work to
-# avoid a stale line.
 _ST_NT = (("nontemporal", True),)
 _ST_SYSTEM = (("memory_order", fx.AtomicOrdering.Monotonic),)
-_SYSTEM_SYNC_SCOPE = rocdl.SyncScope.OneAs
-# The acquire for an un-cached inbox no cache: a compiler barrier, so
-# the payload loads cannot be hoisted above the flag spin. Do not replace it
-# with no fence at all, which drops that barrier.
-_WORKGROUP_SYNC_SCOPE = rocdl.SyncScope.WorkgroupOneAs
 
 _INBOX_POLICY = {
     "uncached": {
         "payload": _ST_NT,
         "flag": _ST_NT,
         "release": None,
-        "acquire": _WORKGROUP_SYNC_SCOPE,
+        "acquire": rocdl.SyncScope.WorkgroupOneAs,
         "fanout": "sector",
         "recv": _CM_SC0 | _CM_SC1,
     },
     "finegrained": {
         "payload": _ST_NT,
         "flag": _ST_SYSTEM,
-        "release": _SYSTEM_SYNC_SCOPE,
-        "acquire": _SYSTEM_SYNC_SCOPE,
+        "release": rocdl.SyncScope.OneAs,
+        "acquire": rocdl.SyncScope.OneAs,
         "fanout": "peer",
         "recv": _CM_NT,
     },
@@ -312,8 +320,8 @@ def _payload_io(
     return load, store
 
 
-def _acquire_inbox(scope=_SYSTEM_SYNC_SCOPE):
-    """Acquire fence over global memory at *scope*, system scope by default."""
+def _acquire_inbox(scope):
+    """Acquire fence over global memory at *scope*."""
     fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=scope)
 
 

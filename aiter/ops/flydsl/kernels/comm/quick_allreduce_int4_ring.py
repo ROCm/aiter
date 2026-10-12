@@ -13,15 +13,18 @@ contiguous run into exactly one peer's inbox:
   and a ring step writes ``rank_atoms * rank_tile B`` to one peer, in address
   order, with no destination switch.
 
-The ring pays for that schedule is accuracy: its reduce-scatter lap
-requantizes the *running partial sum* ``N-1`` times where the mesh requantizes
-once, and the partial's extremum grows with the number of contributions folded
-into it. Hence the two codec knobs. Widening the reduce-scatter lap to INT6 improves
-accuracy with the cost of using slightly more bandwidth. The all-gather lap forwards
-the bytes it received untouched, so it contributes exactly one quantization and stays
-INT4 unless the caller pins it via the ``ag_codec`` argument.
+The ring schedule has a cost in accuracy. The reduce-scatter lap quantizes the
+*running partial sum* again at each of its ``N-1`` hops. The maximum absolute
+value of the partial sum increases with each contribution that the lap adds.
+For this reason, the kernel has two codec arguments, one for each lap. An INT6
+reduce-scatter lap gives better accuracy and uses slightly more bandwidth.
 
-A third wire format, ``"fp16"``, is a lossless passthrough. Mainly for testing.
+The all-gather lap sends the bytes that it receives without a change. For this
+reason, it adds only one quantization. It stays INT4 unless the caller sets
+``ag_codec``.
+
+The third wire format, ``"fp16"``, sends the values without quantization.
+This is used in testing.
 """
 
 import flydsl.compiler as flyc
@@ -29,25 +32,10 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
-from .quick_allreduce_codec import (
-    GROUP,
-    SUPPORTED_BLOCKS,
-    _atom_bf16_to_f16,
-    _atom_f16_to_bf16,
-    _clamp_fp16_overflow,
-    _codec_dequant,
-    _codec_load,
-    _codec_quant,
-    _scale_from_word,
-    codecs_for_block,
-    scale_slot_of,
-    thread_lane,
-)
 from .allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
-    _SYSTEM_SYNC_SCOPE,
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,  # noqa: F401  -- re-exported for host symmetry
@@ -69,6 +57,20 @@ from .allreduce_shared import (
     _store_v4i32_peer,
     _to_sgpr_i64,
     make_pack_storage,
+)
+from .quick_allreduce_codec import (
+    GROUP,
+    SUPPORTED_BLOCKS,
+    _atom_bf16_to_f16,
+    _atom_f16_to_bf16,
+    _clamp_fp16_overflow,
+    _codec_dequant,
+    _codec_load,
+    _codec_quant,
+    _scale_from_word,
+    codecs_for_block,
+    scale_slot_of,
+    thread_lane,
 )
 
 # Super-tile values the ring accepts.
@@ -126,11 +128,11 @@ def ring_st_ladder(world_size: int, link: str = "pcie"):
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
-# Cache policy for reading a rank-tile out of our own inbox, on every inbox
-# type. The mesh takes the policy's ``recv`` instead, which is `nt` on a
-# fine-grained inbox -- only a non-temporal hint, not a bypass. For the ring
-# algorithm a hint is never enough: `sc0 sc1` makes the load actually go to
-# memory.
+# Cache policy for the loads of a rank-tile from our own inbox. The ring uses
+# this policy for all inbox types. It does not use the ``recv`` entry of
+# ``_INBOX_POLICY``, which is ``nt`` on a fine-grained inbox. ``nt`` is only a
+# reuse hint, and the ring needs a cache bypass. With ``sc0 sc1``, the load
+# goes to memory.
 _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 
@@ -169,16 +171,9 @@ def make_quick_allreduce_int4_ring_kernel(
 ):
     """Build the ring kernel for one *rank*.
 
-    ``rank`` is a **compile-time** parameter here, unlike the mesh kernel
-    where it is a runtime argument. At op ``k`` the chunk a block works on is
-    ``(rank - k) % N``, and that index selects from a Python list of
-    register-resident atom fragments -- it has to be a Python constant. Baking
-    it in costs nothing: a rank only ever compiles its own binary, so the
-    variant count per process is unchanged. It does have to reach the JIT symbol
-    name, which ``tag`` below handles.
-
-    The kernel *signature* keeps its ``rank`` argument, unused, so the host's
-    ``_launch_eng`` is identical for both schedules.
+    ``rank`` is a **compile-time** parameter. At op ``k``, a block operates on
+    chunk ``(rank - k) % N``. This index selects an item from a Python list of
+    atom fragments in registers, so the index must be a Python constant.
 
     ``block`` is threads per workgroup.
     """
@@ -245,17 +240,15 @@ def make_quick_allreduce_int4_ring_kernel(
         _acc += grid * w
     inbox_bytes = _acc * 4
 
-    # Every slot has exactly one writer -- the ring predecessor -- so the mesh's
-    # per-sender axis collapses away entirely. That is what keeps the
-    # atomics-free design sound here (there are no peer atomics over PCIe), and
-    # it makes the buffer (N-1)/N of the mesh's rather than larger.
+    # Each slot has only one writer, the ring predecessor. For this reason, the
+    # inbox has no sender axis and the design does not need atomics. PCIe has
+    # no peer atomics.
     total_sectors = [rank_atoms * c.n_sectors for c in step_codec]
     fanout_rounds = [-(-t // quads_per_block) for t in total_sectors]
 
-    # One staging buffer, sized for whichever codec needs more. Only
-    # ``rank_atoms`` rows: a ring stages one destination's packet, not every
-    # destination's, so this is 1664 B at TP8 against the mesh's 9216 B -- an
-    # INT6 ring costs less LDS than an INT4 mesh.
+    # One staging buffer, with the size for the larger of the two codecs. It
+    # has only ``rank_atoms`` rows, because a ring step stages the packet for
+    # one destination only. At TP8 with INT6, this is 1664 B.
     pack_row_i32 = max(rs.rank_tile_i32, ag.rank_tile_i32)
     pack_i32 = rank_atoms * pack_row_i32
     lds_bytes = pack_i32 * 4
@@ -305,11 +298,7 @@ def make_quick_allreduce_int4_ring_kernel(
         }
 
         peers = _load_peers(peer_ptrs, world_size)
-        # A ring only ever names two of the peers, and ``rank`` is compile-time,
-        # so both are plain Python indices into the loaded pointers. The
-        # mesh packs these into an fx.Vector because its fanout selects a
-        # peer with a *runtime* lane-dependent index; doing that here would put
-        # a dynamic extract in front of a constant and get the wrong element.
+        # The ring uses only two peers: this rank and its successor.
         self_base = peers[rank]
         next_base = peers[nxt]
         # Bounded on purpose. Every ring access is in range by construction,
@@ -352,13 +341,7 @@ def make_quick_allreduce_int4_ring_kernel(
             )
 
         def _load_chunk_atoms(tile, chunk):
-            """This rank's own bf16 data for *chunk*, as fp16 register atoms.
-
-            Only ``rank_atoms`` of the tile, not all 8: a ring touches one chunk
-            per op, and across the reduce-scatter lap it visits every chunk
-            exactly once -- so total HBM traffic matches the mesh's single
-            bulk load, with far fewer values live across the spin-waits.
-            """
+            """This rank's own bf16 data for *chunk*, as fp16 register atoms."""
             return [
                 _load_atom(tile, chunk * rank_atoms + j)
                 for j in range_constexpr(rank_atoms)
@@ -405,8 +388,8 @@ def make_quick_allreduce_int4_ring_kernel(
 
             One destination, sectors in address order, so the whole
             ``rank_atoms * rank_tile B`` lands as a single contiguous run. Quads
-            past the sector count sit idle rather than branching -- ``safe``
-            keeps their address arithmetic in range, mirroring the mesh.
+            past the sector count do not store. ``safe`` keeps their address
+            arithmetic in range.
 
             INT6 is 26 sectors to INT4's 18, so a TP8 hop drives 26 of the 64
             quads rather than 18: the wider codec uses the fanout better.
@@ -442,12 +425,12 @@ def make_quick_allreduce_int4_ring_kernel(
         def _publish(step, color):
             """Drain the payload, make it visible, then colour the slot tail.
 
-            Identical in shape to the mesh's publish and for the same
-            reasons -- ``vmcnt`` is per-wave so the workgroup has to join before
-            the flag goes out, and on a cacheable inbox a retired store is not
-            yet a visible one, so the release needs an explicit L2 writeback.
-            What differs is the width: one quad, one destination, where the mesh
-            needs one quad per peer.
+            ``vmcnt`` counts the stores of one wave only. For this reason, all
+            waves of the workgroup must join at a barrier before the flag
+            store. On a cacheable inbox, a retired store can stay in L2, where
+            the peer cannot see it. For this reason, the release must write
+            back L2. There is only
+            one destination, so the first ``FLAG_LANES`` lanes write the flag.
             """
             rocdl.s_waitcnt(vmcnt=0)
             gpu.barrier()
@@ -464,8 +447,8 @@ def make_quick_allreduce_int4_ring_kernel(
         def _wait(step, color):
             """Spin until the predecessor has coloured *step*'s slot in our inbox.
 
-            One source, so one thread spins where the mesh needs one per
-            peer. The poll must bypass the caches (``_load_flag`` is ``sc0
+            There is only one source, so only one thread spins. The poll
+            must bypass the caches (``_load_flag`` is ``sc0
             sc1``): a load answered from a stale line would spin forever, which
             is a hang rather than a slowdown.
 
@@ -514,9 +497,9 @@ def make_quick_allreduce_int4_ring_kernel(
             # discarding them silently loses whole chunks. A workgroup-scope
             # acquire invalidates nothing, so it needs neither the writeback
             # nor the drain before it.
-            if const_expr(acquire_scope == _SYSTEM_SYNC_SCOPE):
+            if const_expr(acquire_scope == rocdl.SyncScope.OneAs):
                 rocdl.s_waitcnt(vmcnt=0)
-                _release_inbox(_SYSTEM_SYNC_SCOPE)
+                _release_inbox(rocdl.SyncScope.OneAs)
             _acquire_inbox(acquire_scope)
 
         def _op_substep(k, tile, sub):

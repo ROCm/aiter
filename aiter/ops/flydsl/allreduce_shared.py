@@ -21,12 +21,13 @@ _SUPPORTED_ARCHS = ("gfx942", "gfx950")
 INBOX_MEMORY_MODES = ("auto", "uncached", "finegrained")
 
 
-def _cuda_index(device) -> int:
+def _cuda_index(device, *, owner: str) -> int:
+    """The CUDA device index of *device*. *owner* names the caller in errors."""
     if isinstance(device, str):
         device = torch.device(device)
     if isinstance(device, torch.device):
         if device.type != "cuda":
-            raise ValueError(f"QuickAllReduceInt4 requires a CUDA device, got {device}")
+            raise ValueError(f"{owner} requires a CUDA device, got {device}")
         if device.index is None:
             return int(torch.cuda.current_device())
         return int(device.index)
@@ -153,7 +154,7 @@ class _StEngine:
             self._buf_ptr = None
 
 
-def _validate_ipc_process_group(group, *, rank: int) -> None:
+def _validate_ipc_process_group(group, *, rank: int, owner: str) -> None:
     """Reject groups that cannot exchange HIP IPC handles or CPU-side metadata."""
     # Keep parallel_state lazy: this module is imported while aiter's AOT setup
     # is still initializing the top-level package.
@@ -162,7 +163,7 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
     backend = dist.get_backend(group)
     if backend == dist.Backend.NCCL:
         raise ValueError(
-            f"QuickAllReduceInt4 does not support NCCL process groups (got "
+            f"{owner} does not support NCCL process groups (got "
             f"{backend!r} on group rank {rank}): IPC handle exchange requires "
             "CPU-side broadcast_object_list."
         )
@@ -171,7 +172,7 @@ def _validate_ipc_process_group(group, *, rank: int) -> None:
     if not all(same_node):
         off_node = [r for r, ok in enumerate(same_node) if not ok]
         raise RuntimeError(
-            "QuickAllReduceInt4 does not support multi-node process groups: HIP "
+            f"{owner} does not support multi-node process groups: HIP "
             f"IPC handles are node-local (ranks not on rank 0's node: {off_node})."
         )
 
@@ -219,7 +220,7 @@ def has_xgmi_peer_links() -> bool:
         return False
     except (OSError, ValueError):
         logger.debug(
-            "QuickAllReduceInt4: cannot read KFD topology; assuming xGMI",
+            "FlyDSL all-reduce: cannot read KFD topology; assuming xGMI",
             exc_info=True,
         )
         return True
@@ -234,13 +235,11 @@ def kernel_symbol(launch) -> str:
 
 
 def payload_probes(floors, lo: int, hi: int) -> tuple[int, ...]:
-    """Payload sizes that between them select every config a ladder with rung
-    *floors* assigns to ``lo..hi`` bytes (inclusive); ``()`` if none fit.
+    """Sample payload sizes that select all the configs a ladder can use for a
+    payload of ``lo..hi`` bytes (inclusive).
 
-    Within one rung the choice is monotone in the payload -- a fixed config, or
-    a super-tile taken once the tile count reaches a threshold -- so the two
-    ends of each rung's slice of the range reach everything in it. Payloads are
-    whole multiples of 16 B, so the probes are too.
+    *floors* are the ``min_bytes`` values of the ladder rungs. The function
+    returns ``()`` if no payload size in the range is valid.
     """
     step = 16
     lo = max(step, -(-int(lo) // step) * step)

@@ -39,6 +39,14 @@ from .allreduce_shared import (
     kernel_symbol,
     payload_probes,
 )
+from .kernels.comm.allreduce_shared import (
+    ATOMS,
+    BLOCK,
+    DEFAULT_GRID_CAP,
+    SUPPORTED_WORLDS,
+    WORLD,
+    has_release_fence,
+)
 from .kernels.comm.quick_allreduce_codec import SUPPORTED_BLOCKS
 from .kernels.comm.quick_allreduce_int4 import (
     MESH_CODECS,
@@ -53,14 +61,6 @@ from .kernels.comm.quick_allreduce_int4_ring import (
     RS_CODECS,
     make_quick_allreduce_int4_ring_kernel,
     ring_st_ladder,
-)
-from .kernels.comm.allreduce_shared import (
-    ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,
-    SUPPORTED_WORLDS,
-    WORLD,
-    has_release_fence,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
@@ -359,7 +359,7 @@ class QuickAllReduceInt4:
             )
         if group_rank != int(rank):
             raise ValueError(f"rank={rank} does not match group rank {group_rank}")
-        _validate_ipc_process_group(group, rank=int(rank))
+        _validate_ipc_process_group(group, rank=int(rank), owner="QuickAllReduceInt4")
         arch = get_gfx_runtime()
         if arch not in _SUPPORTED_ARCHS:
             raise RuntimeError(
@@ -391,7 +391,7 @@ class QuickAllReduceInt4:
         else:
             ladder = ((0, int(super_tile), cap, _block(BLOCK)),)
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
-        self._device_index = _cuda_index(device)
+        self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
         self.rank = int(rank)
