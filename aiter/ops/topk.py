@@ -988,11 +988,9 @@ def top_k_per_row_decode(
     the rows stand for: it bounds every row and picks the kernel exactly as
     that plane would, so a packed call runs what its plane call runs."""
     if row_starts is not None:
-        if max_row_len is not None:
-            raise ValueError("packed rows do not take max_row_len")
         return _top_k_per_row_decode_packed(
             logits, next_n, seqLens, indices, numRows, k, stable, values,
-            row_starts, plane_width,
+            row_starts, plane_width, max_row_len,
         )  # fmt: skip
     backend = decode_backend_for_call(
         logits,
@@ -1101,6 +1099,7 @@ def _top_k_per_row_decode_packed(
     values: torch.Tensor | None,
     row_starts: torch.Tensor,
     plane_width: int | None,
+    max_row_len: int | None = None,
 ) -> None:
     """`top_k_per_row_decode` on packed rows: the FlyDSL kernel a
     ``plane_width`` plane would get, reading each row at its start. The HIP
@@ -1120,12 +1119,12 @@ def _top_k_per_row_decode_packed(
     view = flat.as_strided((num_rows, flat.numel()), (0, 1))
     backend = decode_backend_for_call(
         view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
-        width=plane_width,
+        max_row_len=max_row_len, width=plane_width,
     )  # fmt: skip
     if backend != BACKEND_DEFAULT:
-        return flydsl_topk.flydsl_top_k_per_row_decode(
+        return flydsl_topk._decode_with_backend(
             view, next_n, seq_lens, indices, num_rows, 0, 1, k, stable, values,
-            row_starts=row_starts, plane_width=plane_width,
+            backend, max_row_len, row_starts=row_starts, plane_width=plane_width,
         )  # fmt: skip
     return flydsl_topk.flydsl_radix_topk_one_block(
         view, row_starts, seq_lens, indices, values, num_rows, 0, 1, k, stable,

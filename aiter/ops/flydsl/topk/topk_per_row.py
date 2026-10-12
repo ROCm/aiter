@@ -395,6 +395,7 @@ def _run_adaptive(
     stable,
     stream,
     cfg_width=None,
+    row_starts=None,
 ):
     """Launch the adaptive kernel for a shape the gate has already chosen it for.
 
@@ -407,6 +408,7 @@ def _run_adaptive(
     workgroups as that row's own `seq_lens` entry needs.
 
     `cfg_width` defaults to `width` for a caller that states no bound.
+    `row_starts` makes the rows packed, `width` then being the plane's.
     """
     from aiter.ops import topk as _gate
 
@@ -422,7 +424,10 @@ def _run_adaptive(
         cu_count=_gate._decode_cu_count(logits.device.index),
     )
     kw = cfg["kw"]
-    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(top_k=k, **kw)
+    packed = row_starts is not None
+    launcher = _adaptive.create_topk_per_row_decode_adaptive_kernel(
+        top_k=k, packed_rows=packed, **kw
+    )
     workspace = _get_adaptive_workspace(
         logits.device,
         stream.cuda_stream,
@@ -453,6 +458,8 @@ def _run_adaptive(
         logits,
         next_n,
         seq_lens,
+        # unread unless packed; seq_lens keeps the launch's signature
+        row_starts if packed else seq_lens,
         indices,
         workspace,
         rows,
@@ -559,13 +566,9 @@ def _decode_with_backend(
             k,
             stable,
             values,
-            # The adaptive kernel addresses rows by stride, so no bound reaches
-            # the gate for packed rows and it declines that kernel.
-            max_row_len=None if packed else max_row_len,
+            max_row_len=max_row_len,
             width=plane_width,
         )
-    if packed and backend == BACKEND_ADAPTIVE:
-        raise ValueError("the adaptive kernel does not read packed rows")
 
     if backend == BACKEND_ADAPTIVE:
         # Only the adaptive path takes a host-side config, and it is reached only
@@ -588,6 +591,7 @@ def _decode_with_backend(
             stable,
             stream,
             cfg_width=cfg_width,
+            row_starts=row_starts,
         )
         return
 

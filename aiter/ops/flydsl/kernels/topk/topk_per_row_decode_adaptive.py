@@ -16,6 +16,8 @@ Inputs/outputs:
   - seq_lens: int32 causal lengths per sequence; row r scores sequence r // next_n at
     decode slot r % next_n, valid length seq_len - next_n + slot + 1 clamped to
     [0, L].
+  - row_starts: int32 element offset of each row in a flat logits buffer, read only
+    under packed_rows (stride0 is then ignored).
   - indices: flattened int32 output with shape (num_rows, top_k); each row writes its
     unordered Top-K index set. A row with fewer than top_k valid entries is
     identity-filled and padded with -1.
@@ -462,6 +464,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     spin_sleep: int = 1,
     poll_then_acquire: bool = False,
     histogram_certificate: bool = False,
+    packed_rows: bool = False,
 ) -> Any:
     """Build a launcher selecting the Top-K largest values' column indices per decode
     row, matching torch.topk by value -- an unordered set by default, ascending with
@@ -481,6 +484,8 @@ def create_topk_per_row_decode_adaptive_kernel(
       where the last pass reads the candidate buffer rather than the row. The
       short tier takes it whenever it is compiled in.
     - `mid_cap` / `long_cap` are clamped to `blocks_per_row`.
+    - `packed_rows` reads row r from element row_starts[r] of a flat input, with
+      `width` then the plane's; otherwise row_starts is not read.
 
     The module docstring describes what each tier, the candidate buffer and the
     histogram certificate actually do.
@@ -619,6 +624,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         f"{f'_sl{spin_sleep}' if spin_sleep != 1 else ''}"
         f"{'_poll1acq' if poll_then_acquire else ''}"
         f"{'_cert' if histogram_certificate else ''}"
+        f"{'_packed' if packed_rows else ''}"
     )
 
     @fx.struct
@@ -635,6 +641,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         logits: fx.Tensor,
         next_n: fx.Int32,
         seq_lens: fx.Tensor,
+        row_starts: fx.Tensor,
         indices: fx.Tensor,
         workspace: fx.Tensor,
         stride0: fx.Int32,
@@ -699,11 +706,20 @@ def create_topk_per_row_decode_adaptive_kernel(
         # One descriptor per row, based at the row and sized to its live length, so
         # no stride0 can move the bound and the vec4 tail reads zeros past the row.
         # The base is 64-bit, which keeps a tensor past 4 GiB addressable.
+        if const_expr(packed_rows):
+            row_starts_rsrc = buffer_ops.create_buffer_resource(
+                row_starts, max_size=True
+            )
+            row_base = fx.Int64(
+                buffer_ops.buffer_load(row_starts_rsrc, row, vec_width=1, dtype=T.i32)
+            )
+        else:
+            row_base = fx.Int64(row) * fx.Int64(stride0)
         logits_rsrc = buffer_ops.create_buffer_resource(
             logits,
             max_size=False,
             num_records_bytes=fx.Int64(row_len) * fx.Int64(4),
-            base_byte_offset=fx.Int64(row) * fx.Int64(stride0) * fx.Int64(4),
+            base_byte_offset=row_base * fx.Int64(4),
         )
         row_out = row * c_top_k
         row_ws_base = row * c_row_ws
@@ -2232,6 +2248,7 @@ def create_topk_per_row_decode_adaptive_kernel(
         logits: fx.Tensor,
         next_n: fx.Int32,
         seq_lens: fx.Tensor,
+        row_starts: fx.Tensor,
         indices: fx.Tensor,
         workspace: fx.Tensor,
         num_rows: fx.Int32,
@@ -2242,7 +2259,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     ) -> None:
         grid_y = fx.Index(num_rows)
         topk_per_row_decode_adaptive_kernel(
-            logits, next_n, seq_lens, indices, workspace, stride0, width
+            logits, next_n, seq_lens, row_starts, indices, workspace, stride0, width
         ).launch(
             grid=(blocks_per_row, grid_y, 1),
             block=(block_threads, 1, 1),

@@ -224,6 +224,8 @@ def run_top_k_per_row_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
     max_row_len: int | None = None,
+    row_starts: torch.Tensor | None = None,
+    plane_width: int | None = None,
 ) -> None:
     """
     Run the top_k_per_row kernel.
@@ -272,6 +274,8 @@ def run_top_k_per_row_decode(
             stable=stable,
             values=values,
             max_row_len=max_row_len,
+            row_starts=row_starts,
+            plane_width=plane_width,
         )
 
 
@@ -461,6 +465,24 @@ def create_planted_logits(seq_lens: torch.Tensor, width: int, top_k: int):
     return logits
 
 
+def pack_rows(logits: torch.Tensor, row_ends: torch.Tensor, flat=None):
+    """Each row's live part laid end to end in `flat`, between gaps of padding
+    that outranks every planted key and whose random lengths put most starts off
+    a 16-byte boundary. Returns the buffer and the int32 starts."""
+    lens = row_ends.tolist()
+    starts, pos = [], 0
+    for n, gap in zip(lens, torch.randint(1, 68, (len(lens),)).tolist()):
+        starts.append(pos + gap)
+        pos += gap + n
+    if flat is None:
+        flat = torch.empty(pos + 67, device="cuda")
+    assert flat.numel() >= pos + 67, "packed buffer too small"
+    flat.fill_(1e4)
+    for r, (s, n) in enumerate(zip(starts, lens)):
+        flat[s : s + n] = logits[r, :n]
+    return flat, torch.tensor(starts, dtype=torch.int32, device="cuda")
+
+
 @benchmark()
 def test_top_k_per_row_decode_bounded(
     batch_size: int,
@@ -468,11 +490,13 @@ def test_top_k_per_row_decode_bounded(
     top_k: int,
     stable: bool = False,
     next_n: int = 1,
+    packed: bool = False,
 ) -> dict:
     """Decode rows of ragged length in a buffer 4x the bound, the longest row on
     the bound, called with `max_row_len` as a serving stack would. With
     `next_n > 1` each sequence owns `next_n` rows, slot `s` ending at
-    `seq_len - next_n + s + 1`."""
+    `seq_len - next_n + s + 1`. `packed` hands the same rows over as a flat
+    buffer with `row_starts`, the plane's width as `plane_width`."""
     seq_lens = torch.randint(
         top_k + next_n - 1,
         context_len + 1,
@@ -487,10 +511,18 @@ def test_top_k_per_row_decode_bounded(
     logits = create_planted_logits(row_ends, 4 * context_len, top_k)
     indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
     args = (logits, next_n, seq_lens, indices, rows, *logits.stride())
+    call_args, gate_args = args, args
+    gate_kw = {"max_row_len": context_len}
+    call_kw = {"k": top_k, "stable": stable, "max_row_len": context_len}
+    if packed:
+        flat, starts = pack_rows(logits, row_ends)
+        view = flat.as_strided((rows, flat.numel()), (0, 1))
+        call_args = (flat, next_n, seq_lens, indices, rows, 0, 1)
+        gate_args = (view, *call_args[1:])
+        gate_kw["width"] = logits.shape[1]
+        call_kw.update(row_starts=starts, plane_width=logits.shape[1])
 
-    _, us = run_top_k_per_row_decode(
-        *args, False, k=top_k, stable=stable, max_row_len=context_len
-    )
+    _, us = run_top_k_per_row_decode(*call_args, False, **call_kw)
     torch.cuda.synchronize()
 
     # The reference sees each row's live part only.
@@ -500,9 +532,7 @@ def test_top_k_per_row_decode_bounded(
     torch_indices = masked.topk(top_k, dim=-1)[1]
 
     return {
-        "backend": topk.decode_backend_for_call(
-            *args, top_k, stable, max_row_len=context_len
-        ),
+        "backend": topk.decode_backend_for_call(*gate_args, top_k, stable, **gate_kw),
         "all_close": compare_topk_results(
             masked, indices, torch_indices, row_starts, row_ends, top_k, stable=stable
         ),
@@ -517,18 +547,29 @@ def test_top_k_per_row_decode_bounded_graph(
     top_k: int,
     stable: bool = False,
     replays: int = 3,
+    packed: bool = False,
 ) -> dict:
     """The bounded decode captured once in a CUDAGraph, then replayed on logits and
-    `seq_lens` rewritten in place, as a serving stack replays its decode step."""
+    `seq_lens` rewritten in place, as a serving stack replays its decode step.
+    `packed` also rewrites `row_starts` and the flat buffer, sized at capture."""
     width = 4 * context_len
     seq_lens = torch.full((batch_size,), context_len, dtype=torch.int32, device="cuda")
     logits = create_planted_logits(seq_lens, width, top_k)
     indices = torch.empty((batch_size, top_k), dtype=torch.int32, device="cuda")
     args = (logits, 1, seq_lens, indices, batch_size, *logits.stride())
+    gate_args, gate_kw, call_args, call_kw = args, {}, args, {}
+    if packed:
+        flat = torch.empty(batch_size * (context_len + 67) + 67, device="cuda")
+        _, starts = pack_rows(logits, seq_lens, flat)
+        view = flat.as_strided((batch_size, flat.numel()), (0, 1))
+        call_args = (flat, 1, seq_lens, indices, batch_size, 0, 1)
+        gate_args = (view, *call_args[1:])
+        gate_kw = {"width": width}
+        call_kw = {"row_starts": starts, "plane_width": width}
 
     def decode():
         aiter.top_k_per_row_decode(
-            *args, k=top_k, stable=stable, max_row_len=context_len
+            *call_args, k=top_k, stable=stable, max_row_len=context_len, **call_kw
         )
 
     # Compile outside the capture, which cannot record a JIT build.
@@ -549,6 +590,8 @@ def test_top_k_per_row_decode_bounded_graph(
         )
         seq_lens.copy_(fresh)
         logits.copy_(create_planted_logits(fresh, width, top_k))
+        if packed:
+            starts.copy_(pack_rows(logits, fresh, flat)[1])
         indices.fill_(-1)
         graph.replay()
         torch.cuda.synchronize()
@@ -561,7 +604,7 @@ def test_top_k_per_row_decode_bounded_graph(
 
     return {
         "backend": topk.decode_backend_for_call(
-            *args, top_k, stable, max_row_len=context_len
+            *gate_args, top_k, stable, max_row_len=context_len, **gate_kw
         ),
         "replays": replays,
         "all_close": all_close,
@@ -1229,6 +1272,24 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
                 max(1, m // 2), n, k, s, next_n=2
             ),
         ),
+        (
+            "bounded packed",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded(
+                m, n, k, s, packed=True
+            ),
+        ),
+        (
+            "bounded packed next_n=2",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded(
+                max(1, m // 2), n, k, s, next_n=2, packed=True
+            ),
+        ),
+        (
+            "bounded packed graph",
+            lambda m, n, k, s: test_top_k_per_row_decode_bounded_graph(
+                m, n, k, s, packed=True
+            ),
+        ),
     ):
         torch.manual_seed(0)
         df = pd.DataFrame([run(*c) for c in adaptive_band_cells(card)])
@@ -1238,6 +1299,26 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
         assert (
             df["backend"] == topk.BACKEND_ADAPTIVE
         ).all(), f"{name} decode left the adaptive kernel:\n{df_md}"
+    # Band corners can be single-row; packing only matters once ragged rows sit at
+    # different starts in one launch.
+    torch.manual_seed(0)
+    df = pd.DataFrame(
+        [
+            run(batch, _BOUNDED_CONTEXT, k, stable, packed=True)
+            for run in (
+                test_top_k_per_row_decode_bounded,
+                test_top_k_per_row_decode_bounded_graph,
+            )
+            for batch, k in itertools.product(_BOUNDED_BATCH, _BOUNDED_KS)
+            for stable in (False, True)
+        ]
+    )
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_decode packed rows summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"packed-row decode mismatch:\n{df_md}"
+    assert (
+        df["backend"] == topk.BACKEND_ADAPTIVE
+    ).all(), f"packed-row decode left the adaptive kernel:\n{df_md}"
     # The short tier is unordered only, so it runs under the unstable bands.
     rows, context_len, top_k, _ = next(c for c in adaptive_band_cells(card) if not c[3])
     torch.manual_seed(0)
