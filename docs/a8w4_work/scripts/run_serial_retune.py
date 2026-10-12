@@ -458,7 +458,7 @@ def check_coverage(
     # This parser module has only a stdlib re import. Load its exact shared
     # code without importing aiter's HIP/JIT package during CPU preparation.
     parser_path = (
-        Path(__file__).resolve().parents[2] / "aiter/ops/flydsl/mxfp4_kname.py"
+        Path(__file__).resolve().parents[3] / "aiter/ops/flydsl/mxfp4_kname.py"
     )
     spec = importlib.util.spec_from_file_location("a8w4_shared_kname", parser_path)
     parser = importlib.util.module_from_spec(spec)
@@ -698,7 +698,7 @@ def run_models(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--repo", type=Path, default=Path(__file__).resolve().parents[2]
+        "--repo", type=Path, default=Path(__file__).resolve().parents[3]
     )
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument(
@@ -723,7 +723,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.batch <= 0:
         parser.error("--batch must be positive")
-    output_dir = args.output_dir or args.repo / "docs/a8w4_work"
+    output_dir = args.output_dir or args.repo / "docs/a8w4_work/runs/new_retune"
     if not args.prepare and not args.run:
         parser.error("specify --prepare and/or --run")
     if args.prepare:

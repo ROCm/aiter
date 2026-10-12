@@ -16,7 +16,9 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).resolve().parents[2] / "docs/a8w4_work/run_serial_retune.py"
+SCRIPT = (
+    Path(__file__).resolve().parents[2] / "docs/a8w4_work/scripts/run_serial_retune.py"
+)
 
 
 def load_workflow() -> Any:

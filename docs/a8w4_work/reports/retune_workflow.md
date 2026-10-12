@@ -3,14 +3,17 @@
 Prepare input snapshots after merging and validating the implementation:
 
 ```bash
-python docs/a8w4_work/run_serial_retune.py --prepare
+python docs/a8w4_work/scripts/run_serial_retune.py --prepare \
+  --output-dir docs/a8w4_work/runs/new_retune
 ```
 
 This reads each model's untuned header for shape identity and includes the
 untuned/tuned union: DeepSeek-V4 187, Kimi-K3 35, GPT-OSS 16. It saves raw
 source snapshots, hashes, tags and input token versus public lookup token.
 Repeated timing and flydsl_fallback tags do not add workloads. These outputs
-live in this work directory; official model CSVs are not modified.
+live in the selected run subdirectory; official model CSVs are not modified.
+The work-directory root contains only the final DeepSeek-V4 and GPT-OSS
+configs. Directory navigation and provenance are in reports/README.md.
 
 Run one actual tuning trial at a time through the central execution wrapper,
 then validate its new CSV with the public call harness:
@@ -21,7 +24,7 @@ AITER_CONFIG_FMOE=/absolute/path/to/trial_tuned.csv \
   AITER_FLYDSL_STAGE2_FP8=0 AITER_MXFP4_INTERMEDIATE=0 \
   python op_tests/test_mxfp4_flydsl_public_csv.py \
     --csv /absolute/path/to/trial_tuned.csv --rows 0 1 2 \
-    --report docs/a8w4_work/public_trial_report.json
+    --report docs/a8w4_work/validation/public_trial_report.json
 ```
 
 Select the GPU centrally and set `HIP_VISIBLE_DEVICES` for that command. The
@@ -42,7 +45,8 @@ Once prerequisites and public integration pass, recheck external tune jobs
 and idle GPUs and invoke the scheduler directly:
 
 ```bash
-python docs/a8w4_work/run_serial_retune.py --run --gpus 4 5 6 7 --batch 4
+python docs/a8w4_work/scripts/run_serial_retune.py --run \
+  --output-dir docs/a8w4_work/runs/new_retune --gpus 0 1 2 3 4 5 --batch 6
 ```
 
 GPU IDs above are examples. Use freshly verified physical HIP IDs and unset
@@ -60,12 +64,13 @@ end before the next fixed-order model starts. No watchdog, reset, kill or
 automatic candidate/shape retry is added.
 
 The fixed order is DeepSeek-V4 → Kimi-K3 → GPT-OSS. Each invokes full search
-with `--timeout 300 --errRatio 0.1 --batch 4`, `--mp` equal to selected GPU
+with `--timeout 300 --errRatio 0.1`, `--mp` equal to selected GPU
 count, and default warmup 5/iters 101. Inputs/reference still prepare per
 candidate. Large sweeps can take a long time; timeout is per candidate.
-The scheduler's `--batch` defaults to 4, following the user's latest request;
-this supersedes the earlier batch 6 specification. Actual batch is recorded
-in every model's startup/completion JSON.
+The scheduler's `--batch` defaults to 4. The completed six-GPU DeepSeek-V4
+resume and GPT-OSS runs explicitly used `--batch 6 --mp 6`. Actual batch is
+recorded in every model's startup/completion JSON. Future outputs default to
+the runs/new_retune subdirectory and do not populate the work-directory root.
 
 Every model writes tuned/profile/failed_shapes/log and startup/completion
 JSON. Startup JSON exists before the blocking wait and records source hashes,
