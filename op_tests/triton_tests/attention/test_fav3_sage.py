@@ -52,6 +52,51 @@ RTOL_fp8 = 2.5e-1
             4117, -8, False, True, True, torch.float8_e4m3fnuz, id="sparse-tail"
         ),
         pytest.param(4117, -8, False, False, False, torch.bfloat16, id="bf16-v"),
+        pytest.param(
+            4096,
+            "spread",
+            False,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-full",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-tail",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            True,
+            False,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-causal",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            True,
+            False,
+            torch.float8_e4m3fnuz,
+            id="spread-later-max",
+        ),
+        pytest.param(
+            4117,
+            "spread",
+            False,
+            True,
+            True,
+            torch.float8_e4m3fnuz,
+            id="spread-sparse-tail",
+        ),
     ],
 )
 def test_sage_small_probabilities(
@@ -68,16 +113,31 @@ def test_sage_small_probabilities(
     num_k_blocks = (seqlen + block_n - 1) // block_n
     q = torch.zeros((1, seqlen_q, 1, 128), dtype=torch.int8, device="cuda")
     k = torch.zeros((1, seqlen, 1, 128), dtype=torch.int8, device=q.device)
-    q[..., 0] = 1
-    k[..., 0] = tail_logit
     max_position = seqlen - 1 if later_max else 0
-    k[:, max_position, :, 0] = 0
+    if tail_logit == "spread":
+        # Encode logits -7 - code/64 exactly using integer dot products.
+        q[..., :7] = torch.tensor([64, 32, 16, 8, 4, 2, 1], device=q.device)
+        codes = torch.linspace(0, 128, seqlen - 1, device=q.device).round().int()
+        shifts = torch.arange(5, -1, -1, device=q.device)
+        encoded_k = torch.cat(
+            (-7 - codes[:, None] // 64, -((codes[:, None] >> shifts) & 1)), dim=1
+        ).to(torch.int8)
+        tail_start = 0 if later_max else 1
+        k[:, tail_start : tail_start + seqlen - 1, 0, :7] = encoded_k
+        logit_scale = 1 / 64
+    else:
+        q[..., 0] = 1
+        k[..., 0] = tail_logit
+        k[:, max_position, :, 0] = 0
+        logit_scale = 1
     head_dim_v = 64 if v_dtype == torch.bfloat16 else 128
     v = torch.ones((1, seqlen, 1, head_dim_v), dtype=torch.float32, device=q.device).to(
         v_dtype
     )
     # QK descaling includes the conversion from natural logits to exp2 units.
-    q_descale = torch.full((1, 1, num_q_blocks), math.log2(math.e), device=q.device)
+    q_descale = torch.full(
+        (1, 1, num_q_blocks), math.log2(math.e) * logit_scale, device=q.device
+    )
     k_descale = torch.ones((1, 1, num_k_blocks), device=q.device)
     v_descale = torch.ones((1, 1, head_dim_v), device=q.device)
     sparse_args = {}
@@ -104,13 +164,13 @@ def test_sage_small_probabilities(
         return_lse=True,
         **sparse_args,
     )
-    torch.testing.assert_close(out, torch.ones_like(out), atol=0.01, rtol=0)
+    atol = 0.05 if v_dtype == torch.float8_e4m3fnuz and tail_logit != 0 else 0.01
+    torch.testing.assert_close(out, torch.ones_like(out), atol=atol, rtol=0)
+    logits = (k[0, :, 0].float() @ q[0, 0, 0].float()) * logit_scale
     if causal:
-        key_count = torch.arange(1, seqlen_q + 1, device=q.device)
+        expected_lse = torch.logcumsumexp(logits, dim=0)
     else:
-        key_count = torch.full((seqlen_q,), seqlen, device=q.device)
-    # Every visible row has one zero logit and key_count - 1 tail logits.
-    expected_lse = torch.log1p((key_count.float() - 1) * math.exp(tail_logit))
+        expected_lse = torch.logsumexp(logits, dim=0).expand(seqlen_q)
     torch.testing.assert_close(lse[0, 0], expected_lse, atol=2e-5, rtol=2e-5)
 
 
