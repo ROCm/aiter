@@ -39,22 +39,22 @@ from .allreduce_shared import (
     kernel_symbol,
     payload_probes,
 )
-from .kernels.quick_allreduce_codec import SUPPORTED_BLOCKS
-from .kernels.quick_allreduce_int4 import (
+from .kernels.comm.quick_allreduce_codec import SUPPORTED_BLOCKS
+from .kernels.comm.quick_allreduce_int4 import (
     MESH_CODECS,
     SUPER_TILES,
     clamp_grid_cap,
     make_quick_allreduce_int4_kernel,
     mesh_st_ladder,
 )
-from .kernels.quick_allreduce_int4_ring import (
+from .kernels.comm.quick_allreduce_int4_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
     make_quick_allreduce_int4_ring_kernel,
     ring_st_ladder,
 )
-from .kernels.quick_allreduce_shared import (
+from .kernels.comm.allreduce_shared import (
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,

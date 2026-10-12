@@ -29,7 +29,7 @@ from .allreduce_shared import (
     kernel_symbol,
     payload_probes,
 )
-from .kernels.one_shot_allreduce import (
+from .kernels.comm.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
     DEFAULT_FANOUT,
@@ -39,7 +39,7 @@ from .kernels.one_shot_allreduce import (
     make_one_shot_allreduce_kernel,
     oneshot_ladder,
 )
-from .kernels.quick_allreduce_shared import SUPPORTED_WORLDS
+from .kernels.comm.allreduce_shared import SUPPORTED_WORLDS
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")

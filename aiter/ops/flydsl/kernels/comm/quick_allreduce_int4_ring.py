@@ -43,7 +43,7 @@ from .quick_allreduce_codec import (
     scale_slot_of,
     thread_lane,
 )
-from .quick_allreduce_shared import (
+from .allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,

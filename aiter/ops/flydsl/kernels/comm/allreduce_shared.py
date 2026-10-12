@@ -8,7 +8,7 @@ the LDS staging factory.
 
 Note: Editing the shared modules doesn't invalidate the FlyDSL compiler cache.
 Hence, one may end up running stake kernels unless one sets
-export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels at the repo root.
+export FLYDSL_EXTRA_SOURCE_DIRS=$PWD/aiter/ops/flydsl/kernels/comm at the repo root.
 """
 
 import logging

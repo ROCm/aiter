@@ -27,7 +27,7 @@ from flydsl.expr.typing import Int32, Int64, Stream, T
 
 # The peer-store/load primitives, the cache-policy table and the inbox-memory
 # taxonomy are shared with the quantized kernels verbatim.
-from .quick_allreduce_shared import (
+from .allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,

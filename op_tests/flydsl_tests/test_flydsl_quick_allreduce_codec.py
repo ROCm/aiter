@@ -45,7 +45,7 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, rocdl
 from flydsl.expr.typing import Int32, Int64, Stream, T
 
-from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
+from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import (
     CODECS,
     SECTOR_I32,
     SUPPORTED_BLOCKS,
@@ -60,7 +60,7 @@ from aiter.ops.flydsl.kernels.quick_allreduce_codec import (
     scale_slot_of,
     thread_lane,
 )
-from aiter.ops.flydsl.kernels.quick_allreduce_shared import BLOCK, make_pack_storage
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import BLOCK, make_pack_storage
 
 ARCH = get_gfx_runtime()
 SUPPORTED_ARCHS = ("gfx942", "gfx950")
