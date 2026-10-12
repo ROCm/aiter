@@ -506,7 +506,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
 
     safe_chunks_per_cta = torch.empty(
         (1,),
-        device="cuda",
+        device=context_lens.device,
         dtype=torch.int32,
     )
     _deepgemm_fp8_paged_mqa_logits_varctx_schedule[grid](
