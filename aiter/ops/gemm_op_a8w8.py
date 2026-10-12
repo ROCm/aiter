@@ -738,8 +738,31 @@ def gemm_a8w8_bpreshuffle_fake(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
+    if out is not None:
+        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
+
+
+def _check_gemm_a8w8_bpreshuffle_out(
+    out: Tensor, m: int, n: int, dtype: torch.dtype, device: torch.device
+) -> Tensor:
+    """Validate a caller-owned output. CK and CKTile write a dense row-major
+    [M, N], so a strided view (e.g. a column slice of a wider buffer) is
+    rejected instead of being overwritten past its bounds."""
+    if (
+        out.shape != (m, n)
+        or out.dtype != dtype
+        or out.device != device
+        or not out.is_contiguous()
+    ):
+        raise ValueError(
+            f"out must be a contiguous tensor of shape {(m, n)}, dtype {dtype}, "
+            f"device {device}; got shape {tuple(out.shape)}, stride "
+            f"{tuple(out.stride())}, dtype {out.dtype}, device {out.device}"
+        )
+    return out
 
 
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
@@ -751,7 +774,10 @@ def gemm_a8w8_bpreshuffle(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
+    out: Tensor | None = None,
 ) -> Tensor:
+    """``out`` is an optional caller-owned contiguous [M, N] buffer of ``dtype``;
+    when given, the result is written into it and returned."""
     assert dtype in [
         torch.bfloat16,
         torch.float16,
@@ -776,7 +802,10 @@ def gemm_a8w8_bpreshuffle(
     #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
-    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    if out is None:
+        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    else:
+        Y = _check_gemm_a8w8_bpreshuffle_out(out, m, n, dtype, XQ.device)
 
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
