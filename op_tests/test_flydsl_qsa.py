@@ -1416,6 +1416,10 @@ def test_k1_serves_padded_page_and_rejects_misaligned():
     reason = k1_kernel.qsa_k1_serves(q, strided_d, table, (4,))
     if reason is None or "unit D" not in reason:
         raise AssertionError(f"strided D was served: {reason}")
+    zero_page = torch.zeros(1, 0, 1, d, dtype=torch.bfloat16)
+    reason = k1_kernel.qsa_k1_serves(q, zero_page, table, (4,))
+    if reason is None or "page_size" not in reason:
+        raise AssertionError(f"zero page size was served: {reason}")
 
 
 def _indexer_cache_with_page_gap(cache, gap_elems: int) -> torch.Tensor:
@@ -1878,11 +1882,81 @@ def test_k2_default_out_ignores_query_strides():
             )
 
 
+def test_k1_empty_or_short_request_geometry():
+    """Empty K1 geometry writes -1 without launching.
+
+    A context longer than the page table is rejected before launch. An
+    empty context, cache, or table used to clamp the index to 0 and load.
+    """
+    q = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 16, 1, 128, dtype=torch.bfloat16)
+    short_table = torch.zeros(1, 1, dtype=torch.int32)
+    context = torch.zeros(2, dtype=torch.int32)
+    positions = torch.zeros(1, dtype=torch.int32)
+    requests = torch.zeros(1, dtype=torch.int32)
+    try:
+        k1_kernel.qsa_k1_block_ids(q, cache, short_table, requests, positions, context)
+    except ValueError as exc:
+        if "context lengths" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a page table shorter than context_lens launched")
+    no_rows = torch.empty(0, 1, dtype=torch.int32)
+    one_context = torch.zeros(1, dtype=torch.int32)
+    try:
+        k1_kernel.qsa_k1_block_ids(q, cache, no_rows, requests, positions, one_context)
+    except ValueError as exc:
+        if "context lengths" not in str(exc):
+            raise
+    else:
+        raise AssertionError("a page table with no request rows launched")
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    device = torch.device("cuda")
+    q = q.to(device)
+    cache = cache.to(device)
+    positions = positions.to(device)
+    requests = requests.to(device)
+    one_context = torch.zeros(1, dtype=torch.int32, device=device)
+    one_table = torch.zeros(1, 1, dtype=torch.int32, device=device)
+    empty_context = torch.empty(0, dtype=torch.int32, device=device)
+    empty_cache = torch.empty(0, 16, 1, 128, dtype=torch.bfloat16, device=device)
+    no_requests = torch.empty(0, 1, dtype=torch.int32, device=device)
+    no_pages = torch.empty(1, 0, dtype=torch.int32, device=device)
+    cases = (
+        ("empty context", cache, one_table, empty_context),
+        ("empty cache", empty_cache, one_table, one_context),
+        ("no request rows", cache, no_requests, empty_context),
+        ("no logical pages", cache, no_pages, one_context),
+    )
+    launched = []
+
+    def _record_launch(*_args, **_kwargs):
+        launched.append(1)
+        raise AssertionError("qsa_k1 launched on empty geometry")
+
+    original = k1_kernel._run_compiled
+    k1_kernel._run_compiled = _record_launch
+    try:
+        for name, k_cache, page_table, lengths in cases:
+            launched.clear()
+            out = k1_kernel.qsa_k1_block_ids(
+                q, k_cache, page_table, requests, positions, lengths
+            )
+            if launched:
+                raise AssertionError(f"K1 launched for {name}")
+            if not torch.equal(out, torch.full_like(out, -1)):
+                raise AssertionError(f"K1 {name} output was not -1")
+    finally:
+        k1_kernel._run_compiled = original
+
+
 def test_k2_empty_cache_or_table_returns_zeros():
     """No pages and a nonempty index list returns zeros without launching.
 
     The cache geometry has zero physical pages. The table geometry has
-    zero logical pages. Either one used to clamp the index to 0 and load.
+    zero logical pages, or columns but no request row. Any of those used
+    to clamp the index to 0 and load.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
@@ -1901,9 +1975,11 @@ def test_k2_empty_cache_or_table_returns_zeros():
     )
     one_page = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
     no_pages = torch.empty(1, 0, dtype=dtypes.i32, device=device)
+    no_requests = torch.empty(0, 1, dtype=dtypes.i32, device=device)
     cases = (
         ("empty cache", empty_cache, empty_cache, one_page),
         ("empty table", pages, pages, no_pages),
+        ("no requests", pages, pages, no_requests),
     )
     launched = []
 
