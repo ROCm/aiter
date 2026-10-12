@@ -311,12 +311,11 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
     // A column-major block's scale bytes are adjacent: gather them in LDS and store them
     // as words, rather than having every wave write single bytes into one scale line.
-    // The barrier only pays off once the kernel is bandwidth bound: at 32768-57344 groups
-    // it cost 6-11% (1024x4096 bf16: 2.69 -> 2.91 us), from 65536 it gains (4096x4096: 11%).
+    // The barrier only pays off once the kernel is bandwidth bound.
     static constexpr bool kScaleRunInLds =
         kColumnMajorGroups && !kUseTdmShape && !grid_2d && use_e8m0_scale;
     static constexpr int kScaleRun = block_size / num_thread_per_group;
-    static constexpr int64_t kScaleRunMinGroups = 65536;
+    static constexpr int64_t kScaleRunMinGroups = 32768;
     const bool scale_run_in_lds =
         kScaleRunInLds && static_cast<int64_t>(gridDim.x) * kScaleRun >= kScaleRunMinGroups;
     __shared__ uint32_t s_scale_run[kScaleRunInLds ? (kScaleRun + 3) / 4 : 1];
@@ -477,18 +476,6 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
             }
         }
 
-        // Off gfx1250 (which defers it, below) a shuffled scale goes out ahead of the data: its
-        // bytes are scattered, and issued behind the data stores they cost gfx942 up to 4% at
-        // 2048 rows (2048x4096 bf16 shuffled: 17.5 -> 16.4 us).
-        if constexpr(!kTunedForThisArch && shuffle_scale)
-        {
-            if(scale_dst != nullptr)
-            {
-                *scale_dst = scale_val;
-                scale_dst  = nullptr;
-            }
-        }
-
         if constexpr(wide_group_stores && kTunedForThisArch)
         {
             // Regular stores only. Keep cache-policy experiments out of this path.
@@ -593,7 +580,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 
         }
 
-        // gfx1250 scale write, deferred to last on purpose: address and value were resolved above, so
+        // Scale write, deferred to last on purpose: address and value were resolved above, so
         // this is a bare store with no arithmetic after it competing for the data stores'
         // registers. See the note at `scale_dst`.
         if(scale_dst != nullptr)
@@ -1684,17 +1671,11 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
             // No TDM staging here: the unstaged path is faster wherever it applied.
             static constexpr int32_t kBlkTuned = 256;
             const int simds_bs = dev.num_cu * 4;
-            // MXFP8 group 128 wants 64-thread blocks up to 48 groups per SIMD, 64 with
-            // shuffled scales (4096x1536 bf16 shuffled: 3.30 -> 2.99 us, 2048x2048: 2.65 -> 2.53).
-            constexpr bool kMxFp8G128 = std::is_same_v<out_t, opus::fp8_t> && ee && _GS == 128;
             const bool wide_ok =
                 dev.tuned &&
-                (kMxFp8G128
-                     ? static_cast<int64_t>(rows) * scaleN >=
-                           static_cast<int64_t>(ss ? 64 : 48) * simds_bs
-                     : (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) *
-                               kDynGqWideBlkPerSimdDenom >=
-                           static_cast<int64_t>(simds_bs));
+                (static_cast<int64_t>(rows) * scaleN * num_thread_per_group / kBlkTuned) *
+                        kDynGqWideBlkPerSimdDenom >=
+                    static_cast<int64_t>(simds_bs);
             const int32_t blk_rt = wide_ok ? kBlkTuned : 64;
             const int num_group_per_tg = blk_rt / num_thread_per_group;
             dim3 const block(blk_rt);
@@ -1771,8 +1752,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     // 16x512 tiles staged by TDM, with 256B row stores; the kernel maps
                     // tiles so each XCD owns whole 256B spans of the scale output. It wins
                     // once there are two tiles per SIMD at cols >= 12288, or three at
-                    // cols >= 7168 -- four with shuffled scales (4096x7168 at 3.5:
-                    // bf16 8.00 -> 8.43 us). The stores address the output in 32 bits.
+                    // cols >= 7168. The stores address the output in 32 bits.
                     if constexpr(std::is_same_v<out_t, opus::fp8_t> && _GS == 128 && ee)
                     {
                         constexpr bool kBf16 = std::is_same_v<input_dtype, opus::bf16_t>;
@@ -1783,7 +1763,7 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                             row_stride % 8 == 0 &&
                             reinterpret_cast<uintptr_t>(input.data_ptr()) % 16 == 0 &&
                             rows % 16 == 0 && cols % 512 == 0 && cols >= 7168 &&
-                            tiles_total >= (cols >= 12288 ? 2 : ss ? 4 : 3) * simds_bs &&
+                            tiles_total >= (cols >= 12288 ? 2 : 3) * simds_bs &&
                             oob_size <= std::numeric_limits<int32_t>::max();
                         if(tiled)
                         {
@@ -1822,16 +1802,12 @@ void dynamic_per_group_scaled_quant(aiter_tensor_t& out,         // [..., d]
                     // full_group_stores: both groups of a pair must be live together, so
                     // rows (column-major) or groups per row (row-major) must be even. The
                     // store addresses the output in 32 bits and needs kStoreTakesDivisor.
-                    // Row-major it wins only from 262144 groups (16384x4096: 10%) and
-                    // loses below (512x12288: 2.85 -> 3.26 us).
                     constexpr bool kFgsType = std::is_same_v<out_t, opus::fp8_t> &&
                                               std::is_same_v<input_dtype, opus::bf16_t> &&
                                               ee && _GS == 128;
                     const bool fgs_pairs = kColMajor ? (num_rows_ptr == nullptr && rows % 2 == 0)
                                                      : scaleN % 2 == 0;
-                    const bool fgs_size =
-                        kColMajor || static_cast<int64_t>(rows) * scaleN >= 262144;
-                    const bool fgs = kFgsType && dev.tuned && fgs_pairs && fgs_size &&
+                    const bool fgs = kFgsType && dev.tuned && fgs_pairs &&
                                      oob_size <= std::numeric_limits<int32_t>::max();
                     auto dispatch = [&](auto blk_tag) {
                         if constexpr(kFgsType)
