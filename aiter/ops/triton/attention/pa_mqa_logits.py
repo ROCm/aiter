@@ -92,12 +92,11 @@ def _context_lens_and_stride(context_lens: torch.Tensor, batch_size: int):
             "context_lens must be a contiguous [B] or [B, n], got shape "
             f"{tuple(context_lens.shape)} with strides {context_lens.stride()}"
         )
-    if context_lens.dim() == 1:
-        return context_lens, 1
-    rows, cols = context_lens.shape
+    rows = context_lens.shape[0]
+    cols = context_lens.shape[1] if context_lens.dim() == 2 else 1
     if rows < batch_size or cols < 1:
         raise ValueError(
-            f"a [B, n] context_lens needs at least B={batch_size} rows and one "
+            f"context_lens needs at least B={batch_size} rows and, if 2D, one "
             f"column, got shape {tuple(context_lens.shape)}"
         )
     return context_lens, cols

@@ -488,6 +488,7 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
     assert torch.equal(run(seq_lens[:, None]), expected)
     # Too few rows, no columns, or a strided [B] or [B, n] are rejected.
     for bad in (
+        seq_lens[:-1],
         row_lens[:-1],
         row_lens[:, :0],
         row_lens[:, -1],

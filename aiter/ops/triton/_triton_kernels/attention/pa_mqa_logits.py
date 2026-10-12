@@ -233,6 +233,7 @@ _deepgemm_fp8_paged_mqa_logits_stage1_repr = make_kernel_repr(
         "HiddenDim",
         "KVBlockSize",
         "SplitKV",
+        "ContextLenStride",
     ],
 )
 
@@ -356,6 +357,7 @@ _deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr = make_kernel_repr(
         "ChunkK",
         "AlignedBatchSize",
         "TryCount",
+        "ContextLenStride",
     ],
 )
 
@@ -506,6 +508,7 @@ _deepgemm_fp8_paged_mqa_logits_repr = make_kernel_repr(
         "HiddenDim",
         "KVBlockSize",
         "SplitKV",
+        "ContextLenStride",
     ],
 )
 
