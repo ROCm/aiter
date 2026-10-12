@@ -791,10 +791,12 @@ def _compile_bmm_mfma_to_cache(
     run_bmm_a8w8_mxfp8_gfx950 hits this cache entry."""
     del kwargs
     rows, cols = (int(v) for v in w_scale_block.split("x"))
-    if rows != cols:
+    if rows != cols and w_scale_block != "1x32":
         raise ValueError(f"{kernel_name}: no AOT wiring for a {w_scale_block} w_scale")
     with compile_only_env():
-        compile_bmm_a8w8_mxfp8_gfx950(kernel_name, b, n, k, rows, x_scale_transposed)
+        compile_bmm_a8w8_mxfp8_gfx950(
+            kernel_name, b, n, k, cols, x_scale_transposed, w_scale_n=rows
+        )
 
 
 def _compile_mxfp8_wmma_to_cache(

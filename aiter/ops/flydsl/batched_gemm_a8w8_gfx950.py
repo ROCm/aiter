@@ -9,7 +9,7 @@ operand      shape                          notes
 ``XQ``       ``[M, B, K]`` fp8              M-outer, K-contiguous
 ``WQ``       ``[B, N, K]`` fp8              16x16 preshuffled (ops.shuffle.shuffle_weight)
 ``x_scale``  ``[M, B, K//XK]`` e8m0         row-major, XK = 32 or 128
-``w_scale``  ``[B, N//WN, K//WK]`` e8m0     WN x WK = 32x32 or 128x128
+``w_scale``  ``[B, N//WN, K//WK]`` e8m0     WN x WK = 32x32, 128x128 or 1x32
 ``Out``      ``[M, B, N]`` bf16
 ===========  =============================  ================================
 
@@ -36,6 +36,7 @@ from aiter.utility.graph_alloc import persistent_alloc
 
 from .kernels.bmm_a8w8_mxscale_gfx950 import (
     SCALE_BLOCKS,
+    W_SCALE_ROWS,
     check_bmm_config,
     launch_bmm_a8w8_mxscale,
 )
@@ -218,13 +219,13 @@ def _split_counters(device: int, stream: int) -> Tensor:
         return torch.zeros(_SPLIT_COUNTERS, dtype=torch.int32, device=device)
 
 
-def _scale_block(extent: int, blocks: int, what: str) -> int:
-    """The block edge that splits extent into blocks: 32 or 128."""
-    if blocks and extent % blocks == 0 and extent // blocks in SCALE_BLOCKS:
+def _scale_block(extent: int, blocks: int, what: str, edges=SCALE_BLOCKS) -> int:
+    """The block edge that splits extent into blocks: one of edges."""
+    if blocks and extent % blocks == 0 and extent // blocks in edges:
         return extent // blocks
     raise RuntimeError(
         f"[FlyDSL gfx950 bmm] {what} of {extent} in {blocks} scale blocks is not "
-        f"a {SCALE_BLOCKS} block"
+        f"a {edges} block"
     )
 
 
@@ -285,14 +286,23 @@ def compile_bmm_a8w8_mxfp8_gfx950(
     k: int,
     scale_block: int,
     x_scale_transposed: bool = False,
+    w_scale_n: int | None = None,
 ) -> None:
     """Compile ``kernel_name`` for ``[B, N, K]`` with square ``scale_block``
     e8m0 blocks (1 x block for x_scale, column-major if x_scale_transposed),
     as run_bmm_a8w8_mxfp8_gfx950 would launch it. M is a runtime argument, so
     this serves every M. Call it under
-    ``aiter.aot.flydsl.common.compile_only_env``."""
+    ``aiter.aot.flydsl.common.compile_only_env``.
+    w_scale_n overrides the w_scale block's rows (1 for a scale per B row)."""
     constexprs = _constexprs(
-        kernel_name, n, k, b, scale_block, scale_block, scale_block, x_scale_transposed
+        kernel_name,
+        n,
+        k,
+        b,
+        scale_block,
+        w_scale_n or scale_block,
+        scale_block,
+        x_scale_transposed,
     )
     placeholder = torch.empty(0, dtype=torch.uint8)
     _launch((placeholder,) * 7, 1, fx.Stream(0), constexprs)
@@ -311,6 +321,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
     and returns it. The e8m0 block edges (1x32 or 1x128 for ``x_scale``, 32x32
     or 128x128 for ``w_scale``) are read off the scale shapes. ``kernel_name``
     is a tuned row's kernelName, else :func:`pick_bmm_kernel_name` chooses.
+    A ``w_scale`` block may also be a single row, 1x32 only.
     x_scale_transposed (B = 1, 1x128 blocks) reads ``x_scale``'s bytes
     column-major, [K / 128, M], the blockscale convention, under its
     [M, 1, K / 128] shape; a single row takes the row-major kernel."""
@@ -350,7 +361,7 @@ def run_bmm_a8w8_mxfp8_gfx950(
     check_e8m0(w_scale, "w_scale", "FlyDSL gfx950 bmm")
     scale_args = (
         _scale_block(k, x_scale.shape[2], "x_scale K"),
-        _scale_block(n, w_scale.shape[1], "w_scale N"),
+        _scale_block(n, w_scale.shape[1], "w_scale N", W_SCALE_ROWS),
         _scale_block(k, w_scale.shape[2], "w_scale K"),
         _x_scale_column_major(m, x_scale_transposed),
     )
