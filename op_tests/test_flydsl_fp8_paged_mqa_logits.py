@@ -716,10 +716,24 @@ def test_fp8_paged_mqa_logits_2d_context_lens(batch, next_n, kv_len, split_kv):
         return out.clone()
 
     expected = run(seq_lens)
-    assert torch.equal(run(row_lens), expected)
-    assert torch.equal(run(seq_lens[:, None]), expected)
-    # Wrong row count, no columns, or a strided [B] or [B, n] are rejected.
-    bad_inputs = [row_lens[:-1], torch.cat([row_lens, row_lens[:1]]), row_lens[:, :0]]
+    for name, context_lens in (
+        ("(B, next_n)", row_lens),
+        ("(B, 1)", seq_lens[:, None]),
+    ):
+        msg = f"2d context_lens {name} vs [B]: "
+        err = checkAllclose(
+            run(context_lens), expected, rtol=0, atol=0, tol_err_ratio=0, msg=msg
+        )
+        assert err == 0, f"{msg}{err:.2%} of the logits differ"
+    # Wrong row count, no columns, a strided [B] or [B, n], a dtype other than
+    # int32, or a tensor on another device are rejected.
+    bad_inputs = [
+        row_lens[:-1],
+        torch.cat([row_lens, row_lens[:1]]),
+        row_lens[:, :0],
+        row_lens.long(),
+        row_lens.cpu(),
+    ]
     if next_n > 1:
         bad_inputs += [row_lens[:, -1], row_lens.t().contiguous().t()]
     for bad in bad_inputs:
@@ -727,7 +741,9 @@ def test_fp8_paged_mqa_logits_2d_context_lens(batch, next_n, kv_len, split_kv):
             run(bad)
         except ValueError:
             continue
-        raise AssertionError(f"context_lens of shape {tuple(bad.shape)} was accepted")
+        raise AssertionError(
+            f"context_lens {bad.dtype} {tuple(bad.shape)} on {bad.device} was accepted"
+        )
     aiter.logger.info(
         "fp8_paged_mqa_logits 2d context_lens ok: batch=%d next_n=%d kv_len=%d "
         "split_kv=%d",

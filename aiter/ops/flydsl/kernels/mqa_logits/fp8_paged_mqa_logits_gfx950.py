@@ -531,6 +531,11 @@ def flydsl_fp8_paged_mqa_logits(
     # element b of [B], or the last entry of row b of a (B, n) per-row table.
     # A strided input is rejected rather than copied: a hidden copy allocates on
     # every call, and the kernel would otherwise read it as dense.
+    if context_lens.dtype != torch.int32 or context_lens.device != q_fp8.device:
+        raise ValueError(
+            "context_lens must be int32 on the same device as q_fp8, got "
+            f"{context_lens.dtype} on {context_lens.device}"
+        )
     if (
         context_lens.dim() not in (1, 2)
         or not context_lens.is_contiguous()
