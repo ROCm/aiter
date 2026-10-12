@@ -16,6 +16,18 @@ import torch
 from aiter.ops.flydsl.kernels.kernels_common import ceildiv
 
 
+def span_bytes(t: torch.Tensor) -> int:
+    """Bytes from ``t``'s first element to one past its last, for any strides.
+
+    An empty tensor spans nothing. A view with gaps counts those gaps, which
+    is how a cache past 4 GiB selects the wide gather.
+    """
+    if t.numel() == 0:
+        return 0
+    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+    return (last + 1) * t.element_size()
+
+
 def pack_paged_cache(
     dense: torch.Tensor,
     page_size: int,
