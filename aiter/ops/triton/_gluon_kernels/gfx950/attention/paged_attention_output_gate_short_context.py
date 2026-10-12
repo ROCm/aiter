@@ -129,7 +129,7 @@ def _prefetch_cache(
     columns = gl.multiple_of(base, [1, vector]) + dims[None, :] % vector
     columns = gl.max_contiguous(columns, [1, vector])
     linear: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    copy_smem = cache_smem._reinterpret(layout=linear)
+    copy_smem = cache_smem.reinterpret(layout=linear)
     ptrs = cache_ptr + _cache_offsets(
         page_slots, columns, ROW_STRIDE, DIM_STRIDE, NARROW_OFFSETS
     )

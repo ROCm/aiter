@@ -24,6 +24,7 @@ import torch
 
 from aiter.ops.triton.attention.paged_attention_output_gate import (
     _SHORT_CONTEXT_MAX,
+    _gluon_supported,
     _short_body_selected,
     paged_attention_output_gate_group_fp8_quant,
     paged_attention_output_gate_supported,
@@ -333,6 +334,71 @@ def test_supported_predicate_rejects_and_explains():
     assert strided_q.shape == q.shape and strided_q.stride(2) != 1
     ok, reason = paged_attention_output_gate_supported(strided_q, kc, vc, gate, dtype)
     assert not ok and "query" in reason and "stride" in reason
+
+
+def test_module_imports_without_the_gluon_dialect():
+    """Importing the wrapper must not pull in Gluon.
+
+    The support probe exists so callers "fall back rather than assert" -- but a
+    top-level Gluon import would raise before any caller could reach the probe,
+    making it unreachable on exactly the builds it is meant to protect. The
+    kernel imports are therefore deferred to the launch sites, and this pins
+    that: with `triton.experimental.gluon` made unimportable, importing the
+    wrapper still has to succeed.
+    """
+    import importlib
+    import sys
+
+    module = "aiter.ops.triton.attention.paged_attention_output_gate"
+    blocked = "triton.experimental.gluon"
+
+    class _BlockGluon:
+        def find_spec(self, name, path=None, target=None):
+            if name == blocked or name.startswith(blocked + "."):
+                raise ImportError(f"blocked for test: {name}")
+
+    saved = {
+        k: v
+        for k, v in sys.modules.items()
+        if k == module or k.startswith((blocked, "aiter.ops.triton._gluon_kernels"))
+    }
+    for k in saved:
+        del sys.modules[k]
+    sys.meta_path.insert(0, _BlockGluon())
+    try:
+        importlib.import_module(module)  # must not raise
+    finally:
+        sys.meta_path.pop(0)
+        sys.modules.update(saved)
+
+
+def test_gluon_probe_is_satisfied_here():
+    """On a gfx950 box with a supported Triton the probe must pass.
+
+    Guards against the probe silently turning the whole suite into fallbacks:
+    if this ever fails, every other test here is testing nothing.
+    """
+    ok, reason = _gluon_supported()
+    assert isinstance(ok, bool) and isinstance(reason, str)
+    assert ok, f"gluon probe rejected this toolchain: {reason}"
+    assert reason == ""
+
+
+def test_predicate_surfaces_the_gluon_reason(monkeypatch):
+    """A failing dialect probe must decline through the public predicate.
+
+    The version/API gate is only useful if it reaches the caller as a reason
+    rather than an exception from somewhere deeper.
+    """
+    import aiter.ops.triton.attention.paged_attention_output_gate as mod
+
+    dtype = torch.float8_e4m3fn
+    q, kc, vc, _, _, gate = _make_inputs(4, 256, 4, dtype, seed=17)
+    monkeypatch.setattr(
+        mod, "_gluon_supported", lambda: (False, "synthetic: old dialect")
+    )
+    ok, reason = mod.paged_attention_output_gate_supported(q, kc, vc, gate, dtype)
+    assert not ok and "synthetic: old dialect" in reason
 
 
 def test_csr_inputs_must_be_contiguous():

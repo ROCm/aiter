@@ -237,8 +237,8 @@ def _attention_partials(
     # the original descriptor to recover the logical K/V tile. XOR preserves each
     # aligned copy_width-element contiguous group.
     linear_shared: gl.constexpr = gl.SwizzledSharedLayout(1, 1, 1, [1, 0])
-    key_copy_smem = key_smem._reinterpret(layout=linear_shared)
-    value_copy_smem = value_smem._reinterpret(layout=linear_shared)
+    key_copy_smem = key_smem.reinterpret(layout=linear_shared)
+    value_copy_smem = value_smem.reinterpret(layout=linear_shared)
     cache_dims = gl.max_contiguous(
         gl.multiple_of(
             dims[None, :] ^ ((tokens[:, None] & (SWIZZLE_PHASES - 1)) * copy_width),

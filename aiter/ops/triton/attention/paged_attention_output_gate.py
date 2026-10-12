@@ -39,17 +39,12 @@ a compile-time constant and never clamps the live length. Passing a capacity
 smaller than the real context is a performance mistake, never a correctness one.
 """
 
+import functools
+import re
+
 import torch
 import triton
 
-from aiter.ops.triton._gluon_kernels.gfx950.attention.paged_attention_output_gate import (
-    _attention_partials,
-    _merge_gate_quantize,
-)
-from aiter.ops.triton._gluon_kernels.gfx950.attention.paged_attention_output_gate_short_context import (
-    _short_attention_partials,
-    _short_finish,
-)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -71,6 +66,45 @@ _SHORT_CONTEXT_MAX = 32768
 _SHORT_HEADS = (4, 8, 16)
 
 
+@functools.lru_cache(maxsize=1)
+def _gluon_supported() -> tuple[bool, str]:
+    """Cached probe: can this Triton compile and launch these Gluon bodies?
+
+    Two independent gates, because neither alone is sufficient.
+
+    **Version.** The bodies are written against the Gluon dialect as it stands
+    in Triton **3.8**. ROCm backported an earlier, incompatible Gluon into some
+    3.7 builds where ``triton.experimental.gluon`` imports fine and the kernel
+    then miscompiles, so an import probe cannot catch it -- mirrors
+    ``fused_gdn_prefill_qkvz._gluon_supported``.
+
+    **API.** Version is still not enough here. ``shared_memory_descriptor``
+    gained a public ``reinterpret`` partway through 3.8 development (it was
+    ``_reinterpret`` before), and these bodies use it. Builds on either side of
+    that rename both report ``3.8.0``, so the only way to tell them apart is to
+    look for the attribute. Without this check a pre-rename 3.8 build passes the
+    version gate and fails at compile time with an ``AttributeError``.
+    """
+    try:
+        import triton
+    except ImportError as exc:
+        return False, f"triton not importable ({exc})"
+    version = triton.__version__
+    matched = re.match(r"(\d+)\.(\d+)", version or "")
+    if matched is None or (int(matched.group(1)), int(matched.group(2))) < (3, 8):
+        return False, f"Triton >= 3.8 required for this Gluon dialect, got {version}"
+    try:
+        from triton.experimental.gluon.language import shared_memory_descriptor
+    except ImportError:
+        return False, f"triton.experimental.gluon unavailable (Triton {version})"
+    if not hasattr(shared_memory_descriptor, "reinterpret"):
+        return False, (
+            "this Gluon build predates shared_memory_descriptor.reinterpret "
+            f"(Triton {version})"
+        )
+    return True, ""
+
+
 def paged_attention_output_gate_supported(
     query: torch.Tensor,
     key_cache: torch.Tensor,
@@ -81,6 +115,9 @@ def paged_attention_output_gate_supported(
     """(ok, reason). Callers should fall back rather than assert on False."""
     if arch_info.get_arch() != "gfx950":
         return False, f"gluon body is gfx950 only, got {arch_info.get_arch()}"
+    gluon_ok, gluon_reason = _gluon_supported()
+    if not gluon_ok:
+        return False, gluon_reason
     if query.ndim != 3 or query.shape[2] != HEAD_DIM:
         return False, f"query must be [T, H, {HEAD_DIM}], got {tuple(query.shape)}"
     heads = query.shape[1]
@@ -257,6 +294,15 @@ def paged_attention_output_gate_group_fp8_quant(
         quantized_arg, scales_arg = quantized, scales
 
     if short:
+        # Imported here, not at module scope: the body modules pull in the Gluon
+        # dialect, so a top-level import would raise on any build without it and
+        # a caller could never reach `paged_attention_output_gate_supported()`
+        # to fall back. Same pattern as `fused_gdn_prefill_qkvz`.
+        from aiter.ops.triton._gluon_kernels.gfx950.attention.paged_attention_output_gate_short_context import (
+            _short_attention_partials,
+            _short_finish,
+        )
+
         # Offsets the two kernels would otherwise have to widen defensively.
         # The short body proves nothing about capacity itself -- it has no
         # capacity -- so these are the host's job.
@@ -325,6 +371,11 @@ def paged_attention_output_gate_group_fp8_quant(
             num_warps=finish_warps,
         )
         return gated, quantized, scales
+
+    from aiter.ops.triton._gluon_kernels.gfx950.attention.paged_attention_output_gate import (
+        _attention_partials,
+        _merge_gate_quantize,
+    )
 
     _attention_partials[(rows, splits)](
         query,
