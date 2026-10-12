@@ -30,17 +30,17 @@ pd.set_option("display.max_colwidth", 30)
 SPECIALIZED_CASES = (
     (
         (9450, 5120, 5120),
-        "aiter_a6w6_m9472_n5120_k5120_m82",
+        "_ZN5aiter44f6gemm_bf16_per1x32Fp6_m9472_n5120_k5120_m82E",
         "f6gemm_dmabig_kernel_func",
     ),
     (
         (9450, 13824, 5120),
-        "aiter_a6w6_m9472_n13824_k5120_m82",
+        "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82E",
         "f6gemm_dmabig_kernel_func",
     ),
     (
         (9450, 5120, 13824),
-        "aiter_a6w6_m9472_n5120_k13824_m82",
+        "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82E",
         "f6gemm_dmabig_allk_kernel_func",
     ),
 )
@@ -155,11 +155,11 @@ def test_specialized_dispatch_matches_safe_kernel(
 
 def test_manifest_excludes_shape_guarded_kernels_from_incompatible_sweeps():
     small = _manifest_kernel_names(257, 513, 129)
-    assert not any("a6w6_m9472_" in name for name in small)
+    assert not any("f6gemm_bf16_per1x32Fp6_m9472_" in name for name in small)
     square = _manifest_kernel_names(9450, 5120, 5120)
     assert SPECIALIZED_SQUARE_KERNEL in square
-    assert "aiter_a6w6_m9472_n13824_k5120_m82" not in square
-    assert "aiter_a6w6_m9472_n5120_k13824_m82" not in square
+    assert "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n13824_k5120_m82E" not in square
+    assert "_ZN5aiter45f6gemm_bf16_per1x32Fp6_m9472_n5120_k13824_m82E" not in square
 
 
 @torch.no_grad()
