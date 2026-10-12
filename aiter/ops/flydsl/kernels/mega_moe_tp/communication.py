@@ -7,6 +7,7 @@ final sums, LL packets, comm wave roles and the per-launch init / finish."""
 
 from __future__ import annotations
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -59,7 +60,6 @@ from .common import (
     scales4,
     spin0,
     sum_live,
-    traced,
     uni,
     wait_lgkm0,
     wait_vm,
@@ -212,7 +212,7 @@ def build_communication(kc: KernelCtx) -> dict:
             swiglu_limit=swiglu_limit,
         )
 
-    @traced
+    @flyc.jit
     def cbar(L, tid):
         wait_lgkm0()
         if (tid % i32(64)) == i32(0):
@@ -231,12 +231,12 @@ def build_communication(kc: KernelCtx) -> dict:
     def report(a, code):
         g_or_agent(ctrl_at(a, CTRL_ERR), code)
 
-    @traced
+    @flyc.jit
     def _report_if(a, bad, code):
         if bad:
             report(a, code)
 
-    @traced
+    @flyc.jit
     def poll_zero(fn, a=None, lane=None, err=0):
         pend = fn()
         t0 = now()
@@ -246,7 +246,7 @@ def build_communication(kc: KernelCtx) -> dict:
         if const_expr(err != 0):
             _report_if(a, (pend != i32(0)) & (lane == i32(0)), err)
 
-    @traced
+    @flyc.jit
     def spin_sys_ge(addr, target, a=None):
         cur = poll_sys_ge(addr, target)
         if const_expr(a is not None):
@@ -255,7 +255,7 @@ def build_communication(kc: KernelCtx) -> dict:
     def masked(e):
         return fx.Int32(e).bitcast(fx.Uint32) >= fx.Uint32(E)
 
-    @traced
+    @flyc.jit
     def gather_routes_chunk(L, tid, a, expert, cc, ce):
         key = expert + i32(1) + (cc << i32(12)) + (ce << i32(20))
         if lds_ld_i32(L, L_CTL + C_GEXP * 4) != key:
@@ -274,7 +274,7 @@ def build_communication(kc: KernelCtx) -> dict:
         q = ((t.to(fx.Float32) + fx.Float32(0.5)) * inv).to(fx.Int32)
         return (t - q * ce) == cc
 
-    @traced
+    @flyc.jit
     def _gather_scan(L, tid, a, expert, key, chunk=None):
         ids_addr, tw_addr, ttot = a["ids"], a["tw"], a["ttot"]
         cbar(L, tid)
@@ -328,7 +328,7 @@ def build_communication(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_GEXP * 4, key)
         cbar(L, tid)
 
-    @traced
+    @flyc.jit
     def zero_masked(L, lane, a, w0, nw):
         n = a["ttot"] * i32(TOPK)
         nblk = i32(gpu.grid_dim.x)
@@ -350,7 +350,7 @@ def build_communication(kc: KernelCtx) -> dict:
                         _zero_route(a, lane, i32(b_) + j)
                 wait_vm(0)
 
-    @traced
+    @flyc.jit
     def _zero_route(a, lane, ridx):
         rb = route_region_bytes(a["ttot"])
         z = fx.Vector.from_elements([i32(0)] * 4, fx.Int32)
@@ -371,14 +371,14 @@ def build_communication(kc: KernelCtx) -> dict:
                 else:
                     bst(z, rs, base + (ridx * i32(H) + q * i32(8)) * i32(2), 0, AUX_SC1)
 
-    @traced
+    @flyc.jit
     def _wave_claim(L, tid, n):
         got = i32(0)
         if ((tid % i32(64)) == i32(0)) & (n > i32(0)):
             got = lds_atomic_add(L, L_CTL + C_CNT * 4, n)
         return uni(got)
 
-    @traced
+    @flyc.jit
     def _gather_one(L, idx, hit, wv):
         if hit:
             slot = lds_atomic_add(L, L_CTL + C_CNT * 4, 1)
@@ -418,7 +418,7 @@ def build_communication(kc: KernelCtx) -> dict:
                     )
             _q0_store(L, q4, row, nb, w, e8)
 
-    @traced
+    @flyc.jit
     def _q0_store(L, q4, row, nb, w, e8):
         if q4 == i32(0):
             lds_st(
@@ -429,7 +429,7 @@ def build_communication(kc: KernelCtx) -> dict:
         bank = (a["epoch"] + i32(bank_off)) & i32(1)
         return ctrl_at(a, i32(CTRL_CLM) + bank * i32(LRDY_STRIDE))
 
-    @traced
+    @flyc.jit
     def col_claim(L, tid, a):
         cbar(L, tid)
         if tid == i32(0):
@@ -456,7 +456,7 @@ def build_communication(kc: KernelCtx) -> dict:
         soff = a["tp"] * a["mmax"] * i32(H) + prow * i32(H // 32) + col // i32(32)
         return prow * i32(H) + col, soff
 
-    @traced
+    @flyc.jit
     def _push_store(a, r_dst, prow, c0, v, acc, ok):
         col = c0 + v * i32(8)
         if const_expr(comm_bf16):
@@ -465,7 +465,7 @@ def build_communication(kc: KernelCtx) -> dict:
         else:
             _push_store_fp8(a, r_dst, prow, col, v, acc, ok)
 
-    @traced
+    @flyc.jit
     def _push_store_fp8(a, r_dst, prow, col, v, acc, ok):
         d0, d1, e8i = mxfp8x8(acc)
         if const_expr(ll_rs):
@@ -487,7 +487,7 @@ def build_communication(kc: KernelCtx) -> dict:
             a, i32(CTRL_SC) + (cidx * i32(SC_LINES) + slot) * i32(LRDY_STRIDE)
         )
 
-    @traced
+    @flyc.jit
     def _push_done_all(a, epoch, cidx, target, n):
         cnt_addr = sc_addr(a, cidx, i32(SC_PUSH))
         if g_add_agent(cnt_addr, n) + n == target:
@@ -526,7 +526,7 @@ def build_communication(kc: KernelCtx) -> dict:
             out.append(fx.Vector(bld(r_recv, off, 0, V4I, AUX_SYS)))
         return out
 
-    @traced
+    @flyc.jit
     def final_chunk(L, tid, a, cidx):
         lane = tid % i32(64)
         nblk = gpu.grid_dim.x
@@ -540,7 +540,7 @@ def build_communication(kc: KernelCtx) -> dict:
             if lane == i32(0):
                 lds_atomic_or(L, L_CTL + C_YAGM * 4, i32(1) << cidx)
 
-    @traced
+    @flyc.jit
     def _final_row(L, tid, a, r_recv, row, c0):
         lane = tid % i32(64)
         for j in range_constexpr(VPL):
@@ -569,7 +569,7 @@ def build_communication(kc: KernelCtx) -> dict:
                     acc = sum_live(acc, fp8x8_decode(lds_[p]), i32(p) < a["tp"])
             _y_store(a, row, c0, v, acc)
 
-    @traced
+    @flyc.jit
     def _final_ll(tid, a, r_recv, row, c0, v, vc):
         lane = tid % i32(64)
         pk = recv_pkts(a, r_recv, row, a["mmax"], c0, vc)
@@ -586,14 +586,14 @@ def build_communication(kc: KernelCtx) -> dict:
             acc = sum_live(acc, ll_vals(pk[p]), i32(p) < a["tp"])
         _y_store(a, row, c0, v, acc)
 
-    @traced
+    @flyc.jit
     def _y_store(a, row, c0, v, acc):
         if const_expr(AG8):
             _y_store_ag8(a, row, c0, v, acc)
         else:
             _y_store_bf16(a, row, c0, v, pack_bf16x8(acc))
 
-    @traced
+    @flyc.jit
     def _y_store_bf16(a, row, c0, v, o):
         if v < i32(CW // 8):
             if const_expr(ar):
@@ -609,7 +609,7 @@ def build_communication(kc: KernelCtx) -> dict:
                     AUX_SYS if TN else 0,
                 )
 
-    @traced
+    @flyc.jit
     def _y_store_ag8(a, row, c0, v, acc):
         col = c0 + v * i32(8)
         grow = a["rank"] * a["m"] + row
@@ -627,7 +627,7 @@ def build_communication(kc: KernelCtx) -> dict:
                     if (v & i32(15)) == i32(0):
                         bst(sc, rd, soff, 0, AUX_SYS)
 
-    @traced
+    @flyc.jit
     def ag8_convert(tid, a):
         bid = i32(gpu.block_id("x"))
         if bid < a["m"]:
@@ -656,7 +656,7 @@ def build_communication(kc: KernelCtx) -> dict:
                             0,
                         )
 
-    @traced
+    @flyc.jit
     def yag_flush(L, tid, a):
         if tid < i32(64):
             mask = lds_ld_i32(L, L_CTL + C_YAGM * 4)
@@ -673,7 +673,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 ok = (v < i32(NV)) & (((mask >> vc) & i32(1)) == i32(1))
                 _yag_post(a, p, idx, ok)
 
-    @traced
+    @flyc.jit
     def _yag_post(a, p, idx, ok):
         if ok:
             fo = fx.Int64(a["off_flag"]) + fx.Int64(idx * i32(4))
@@ -697,7 +697,7 @@ def build_communication(kc: KernelCtx) -> dict:
             pend = fx.max(pend, (ok & before(f, epoch)).select(i32(1), i32(0)))
         return wave_red(pend, lane, fx.max)
 
-    @traced
+    @flyc.jit
     def yag_wait(tid, a, epoch):
         if (tid < i32(64)) & (i32(gpu.block_id("x")) < a["m"]):
             lane = tid % i32(64)
@@ -714,7 +714,7 @@ def build_communication(kc: KernelCtx) -> dict:
     def _lowest(v):
         return _ctpop((v & (i32(0) - v)) - i32(1))
 
-    @traced
+    @flyc.jit
     def _claim_bit(L, rdy_off, bits_off, cnt_off, w):
         res = i32(-1)
         n = lds_ld_acq(L, L_CTL + cnt_off * 4)
@@ -731,21 +731,21 @@ def build_communication(kc: KernelCtx) -> dict:
                 res = c
         lds_st(L, L_CTL + (C_MBOX * 4) + w * i32(4), res)
 
-    @traced
+    @flyc.jit
     def claim_push(L, lane, w):
         if lane == i32(0):
             _claim_bit(L, C_PRDY, C_PBITS, C_LRED, w)
         rocdl.sched_barrier(0)
         return uni(lds_ld_acq(L, L_CTL + (C_MBOX * 4) + w * i32(4)))
 
-    @traced
+    @flyc.jit
     def claim_final(L, lane, w):
         if lane == i32(0):
             _claim_bit(L, C_FRDY, C_FBITS, C_PULL, w)
         rocdl.sched_barrier(0)
         return uni(lds_ld_acq(L, L_CTL + (C_MBOX * 4) + w * i32(4)))
 
-    @traced
+    @flyc.jit
     def poll_ready(L, lane, a, epoch):
         c = fx.min(lane, i32(NV - 1))
         live = lane < i32(NV)
@@ -785,7 +785,7 @@ def build_communication(kc: KernelCtx) -> dict:
         )
         return (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) | push | fin
 
-    @traced
+    @flyc.jit
     def poll_loop(L, tid, a, epoch):
         t0 = now()
         while _comm_pending(L) & alive(t0):
@@ -821,7 +821,7 @@ def build_communication(kc: KernelCtx) -> dict:
             r1 = r1 & ((i32(p) >= a["tp"]) | (before(f, epoch) == fx.Boolean(False)))
         return r1
 
-    @traced
+    @flyc.jit
     def push_chunk_dyn(L, tid, a, epoch, cidx):
         lane = tid % i32(64)
         ttot = a["ttot"]
@@ -868,7 +868,7 @@ def build_communication(kc: KernelCtx) -> dict:
             if (lane == i32(0)) & (n > i32(0)):
                 _push_done_all(a, epoch, cidx, ns, n)
 
-    @traced
+    @flyc.jit
     def comm_work(L, tid, a, epoch):
         lane = tid % i32(64)
         w = tid // i32(64)
@@ -880,7 +880,7 @@ def build_communication(kc: KernelCtx) -> dict:
             push_chunk_dyn(L, tid, a, epoch, cr)
         return ((cr >= i32(0)) | (cp >= i32(0))).select(i32(1), i32(0))
 
-    @traced
+    @flyc.jit
     def comm_signal(L, tid, a, epoch):
         lane = tid % i32(64)
         w = tid // i32(64)
@@ -898,7 +898,7 @@ def build_communication(kc: KernelCtx) -> dict:
         rocdl.sched_barrier(0)
         return (end > start).select(i32(1), i32(0))
 
-    @traced
+    @flyc.jit
     def _signal_claim(L, lane, w, start, end):
         if lane == i32(0):
             won = i32(0)
@@ -912,14 +912,14 @@ def build_communication(kc: KernelCtx) -> dict:
         x = i32(gpu.block_id("x")) % i32(N_XCD)
         _signal_part(a, epoch, cidx, x, ceildiv(nblk - x, i32(N_XCD)))
 
-    @traced
+    @flyc.jit
     def _signal_part(a, epoch, cidx, slot, target):
         xa = sc_addr(a, cidx, slot)
         if g_add_agent(xa, 1) + i32(1) == target:
             g_st_sys(xa, i32(0))
             _signal_count(a, epoch, cidx)
 
-    @traced
+    @flyc.jit
     def _signal_count(a, epoch, cidx):
         cnt_addr = sc_addr(a, cidx, i32(SC_ALL))
         parts = fx.min(i32(gpu.grid_dim.x), i32(N_XCD))
@@ -927,14 +927,14 @@ def build_communication(kc: KernelCtx) -> dict:
             g_st_sys(cnt_addr, i32(0))
             g_st_sys(lrdy_at(a, cidx), epoch)
 
-    @traced
+    @flyc.jit
     def signal_loop(L, tid, a, epoch):
         t0 = now()
         while (lds_ld_acq(L, L_CTL + C_NSIG * 4) < i32(NCK)) & alive(t0):
             if comm_signal(L, tid, a, epoch) == i32(0):
                 rocdl.s_sleep(1)
 
-    @traced
+    @flyc.jit
     def comm_wave(L, tid, a, epoch):
         t0 = now()
         while (
@@ -954,7 +954,7 @@ def build_communication(kc: KernelCtx) -> dict:
             ERR_COMM,
         )
 
-    @traced
+    @flyc.jit
     def comm_help(L, tid, a, epoch):
         t0 = now()
         while (
@@ -1007,7 +1007,7 @@ def build_communication(kc: KernelCtx) -> dict:
     def ag_row_vals(a, rxl, i, g):
         return _row32(rxl, (a["rank"] * a["m"] if ar else i32(0)) + i, g, 0)
 
-    @traced
+    @flyc.jit
     def quant_chunks(L, t0, stride, a, k_lo, k_hi):
         row0, stride_r, nrows, qb, qstep, cnt = ag_rows(a)
         k_hi = fx.min(k_hi, cnt)
@@ -1034,7 +1034,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 L, L_INTER + i32(AG_SCB) + r * i32(H // 32) + g, fx.Int8(e8), align=1
             )
 
-    @traced
+    @flyc.jit
     def ag_send(L, lane, a):
         row0, stride, nrows, qb, qs, cnt = ag_rows(a)
         rank = a["rank"]
@@ -1076,7 +1076,7 @@ def build_communication(kc: KernelCtx) -> dict:
         if i32(NCHA - 1) < cnt:
             _ag_bump(a, lane, qb + i32(NCHA - 1) * qs)
 
-    @traced
+    @flyc.jit
     def ag_chunk(L, lane, a, q, r, j, rok, gslot, rx, rs, x_bytes, xs_bytes):
         rr = fx.min(r, i32(agr - 1))
         cb = q * i32(XLPR * 16) + j * i32(16)
@@ -1088,7 +1088,7 @@ def build_communication(kc: KernelCtx) -> dict:
             bst(dv, rx[p], doff, 0, AUX_SYS)
             bst(sv, rs[p], soff, 0, AUX_SYS)
 
-    @traced
+    @flyc.jit
     def ag_stage_free(L, lane, a):
         spin0(L, lane, L_CTL + C_AGFREE * 4, i32(1))
 
@@ -1099,7 +1099,7 @@ def build_communication(kc: KernelCtx) -> dict:
         hi = (S > i32(1)).select(lo + m, i32(gpu.grid_dim.x))
         return ceildiv(hi - x, i32(N_XCD)) - ceildiv(lo - x, i32(N_XCD))
 
-    @traced
+    @flyc.jit
     def _ag_bump(a, lane, q):
         if lane == i32(0):
             x = i32(gpu.block_id("x")) % i32(N_XCD)
@@ -1108,7 +1108,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 g_st_sys(xa, i32(0))
                 _ag_bump_rank(a, q)
 
-    @traced
+    @flyc.jit
     def _ag_bump_rank(a, q):
         ga = ctrl_at(a, i32(CTRL_AGG) + q * i32(LRDY_STRIDE))
         m = fx.max(a["m"], i32(1))
@@ -1122,7 +1122,7 @@ def build_communication(kc: KernelCtx) -> dict:
     def _ag_nmeta(a):
         return fx.max(ceildiv(a["m"] * i32(TOPK) // i32(4), i32(64)), i32(1))
 
-    @traced
+    @flyc.jit
     def _ag_send_meta(lane, a):
         bid = i32(gpu.block_id("x"))
         if bid < _ag_nmeta(a):
@@ -1155,7 +1155,7 @@ def build_communication(kc: KernelCtx) -> dict:
                     if i32(p) != a["rank"]:
                         bst(a["epoch"], peer_rs(a, p, "off_flag"), fo, 0, AUX_SYS)
 
-    @traced
+    @flyc.jit
     def _ag_send_meta_ll(lane, a):
         n = a["m"] * i32(TOPK)
         rid = rsrc(a["ids_in"], n * i32(4))
@@ -1172,7 +1172,7 @@ def build_communication(kc: KernelCtx) -> dict:
             for p in range_constexpr(TPC):
                 bst(pkt, peer_rs(a, p, "off_ids", big), off, 0, AUX_SYS)
 
-    @traced
+    @flyc.jit
     def meta_ll_wait(tid, a):
         n = a["ttot"] * i32(TOPK)
         rid = rsrc(a["ids"])
@@ -1202,7 +1202,7 @@ def build_communication(kc: KernelCtx) -> dict:
             pend = fx.max(pend, (ok & before(f, epoch)).select(i32(1), i32(0)))
         return wave_red(pend, lane, fx.max)
 
-    @traced
+    @flyc.jit
     def ag_wait_meta(a, tid, epoch):
         if tid < i32(64):
             lane = tid % i32(64)
@@ -1221,7 +1221,7 @@ def build_communication(kc: KernelCtx) -> dict:
             first = fx.min(first, ((cc < end) & before(f, epoch)).select(cc, end))
         return wave_red(first, lane, fx.min)
 
-    @traced
+    @flyc.jit
     def ag_wait_chunk(L, lane, a, epoch, cc):
         rdy = _ag_first_pending(lane, a, epoch, cc, AG_WIN)
         if cc == i32(0):
@@ -1235,7 +1235,7 @@ def build_communication(kc: KernelCtx) -> dict:
             lds_st(L, L_CTL + C_ARDY * 4, rdy)
         rocdl.sched_barrier(0)
 
-    @traced
+    @flyc.jit
     def finish(tid, a, epoch):
         if tid == i32(0):
             bid = i32(gpu.block_id("x"))
@@ -1247,7 +1247,7 @@ def build_communication(kc: KernelCtx) -> dict:
                 g_st_sys(xc, i32(0))
                 fx.memory_fence(syncscope="one-as", ordering=ACQ)
 
-    @traced
+    @flyc.jit
     def _dyn_zero(L, tid):
         if (tid >= i32(NT + 64)) & (tid < i32(NT + 64 + NBW)):
             lds_st(L, L_DYN + (tid - i32(NT + 64)) * i32(4), i32(0))
@@ -1257,7 +1257,7 @@ def build_communication(kc: KernelCtx) -> dict:
             for e_ in range(tid, i32(E), i32(NTT)):
                 lds_st(L, L_DPRE + i32(e_) * i32(4), i32(0))
 
-    @traced
+    @flyc.jit
     def init_lds(L, tid, a):
         bid = i32(gpu.block_id("x"))
         if tid < i32(C_UL):
@@ -1294,7 +1294,7 @@ def build_communication(kc: KernelCtx) -> dict:
         nblk = i32(gpu.grid_dim.x)
         return i32(gpu.block_id("x")) + i32(ws) * nblk, nblk * i32(4)
 
-    @traced
+    @flyc.jit
     def push_dll(L, tid, a, ws=0):
         lane = tid % i32(64)
         spin0(L, lane, L_CTL + C_CDONE * 4, i32(1))
@@ -1351,7 +1351,7 @@ def build_communication(kc: KernelCtx) -> dict:
         if const_expr(ARLL):
             final_all_ll(tid, a, ws)
 
-    @traced
+    @flyc.jit
     def final_all_ll(tid, a, ws=0):
         lane = tid % i32(64)
         ttot = a["ttot"]
