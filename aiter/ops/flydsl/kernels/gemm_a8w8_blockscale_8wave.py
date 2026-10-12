@@ -685,11 +685,25 @@ def compile_gemm_fp8_8wave(
             fifo_scale_b_0 = fx.Float32(0)
             kiter = fx.Int32(kidx)
 
-            # Each K128 tile: TL[s0] -> TR[s0] -> BL[s0] -> BR[s0],
-            #                TL[s1] -> TR[s1] -> BL[s1] -> BR[s1].
-            # Each phase retires old fragP with its saved scales and produces new fragP
-            # Based on 8 wave gemm implmentation, M is divided into 2 slices per tile futher.
-            # Also the async reading and lds loading has some changes compare with the original 8 wave gemm implementation.
+            # one K128 tile k (repeat for both unroll_idx values).
+            # Ahs = A[half h, M-slice s]; B0/B1 = left/right; SA = ScaleA.
+            # t = tick (k%2), u = tock; operands use tile k unless noted.
+            # Each DOT phase: 4 MFMA + 16 FMA retiring the previous frag_P.
+            # LDS reads / AC below precede that phase's begin barrier.
+            # | MFMA Phase | MFMA/DOT | DQ phase(VALU)   | LDS read (slot) | AC (slot,tile) / wait |
+            # |-------|----------|-------------|-----------------|----------------------|
+            # | TL s0 | A00*B0   | BR s1 (k-1) | A00, SA00 (t)   | A1 (u,k+1)           |
+            # | TR s0 | A00*B1   | TL s0       | B1 (t)          | -                    |
+            # | BL s0 | A10*B0   | TR s0       | A10, SA10 (t)   | B0 (t,k+2)           |
+            # | BR s0 | A10*B1   | BL s0       | -               | B1 (t,k+2)           |
+            # | TL s1 | A01*B0   | BR s0       | A01, SA01 (t)   | -                    |
+            # | TR s1 | A01*B1   | TL s1       | -               | A0 (t,k+2)           |
+            # | BL s1 | A11*B0   | TR s1       | A11, SA11 (t)   | vmcnt(6)             |
+            # | BR s1 | A11*B1   | BL s1       | B0 (u,k+1)      | SA (t,k+2), before LR|
+            # Every phase: LR/AC/wait -> lgkmcnt(0) -> s_barrier -> DOT -> s_barrier.
+            # TL s0 also loads two ScaleB SGPRs (SMEM, not LDS/AC).
+            # B0(k=0) is read in the prologue; the first DQ retires zero.
+            # BR s1's pending partial is retired by the next TL s0, or the epilogue.
 
             for unroll_idx in range_constexpr(2):
                 tick = unroll_idx
