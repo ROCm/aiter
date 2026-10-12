@@ -1080,10 +1080,10 @@ def derive(files, title="", raw_diff=""):
         hit("dispatch-change", "B1 B3 B4 A3")
     # Tier-1 proper: break it and `import aiter` is dead, which earns a full Step 4
     if any(p in ("aiter/__init__.py", "aiter/jit/core.py") for p in paths):
-        hit("tier1-import-chain", "STEP4 E5")
+        hit("tier1-import-chain", "STEP4 E5 C5")
     # Tier-2 backbone: dispatch shared across model families; needs an owner's sign-off
     elif any(p in TIER for p in paths):
-        hit("tier2-dispatch", "E5 E4")
+        hit("tier2-dispatch", "E5 E4 C5")
     # Any other op wrapper: confirm the exported symbols still resolve; no full Step 4
     elif any(p.startswith(("aiter/ops/", "aiter/jit/")) or
              (p.startswith("aiter/") and p.count("/") == 1 and p.endswith(".py"))

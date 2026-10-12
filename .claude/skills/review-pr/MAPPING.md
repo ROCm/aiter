@@ -17,8 +17,8 @@ disagreement between this file and the deriver is caught.
 | `new-routing-value`     | B4 C4 |
 | `tuning-config`         | D3 HK4 |
 | `dispatch-change`       | B1 B3 B4 A3 |
-| `tier1-import-chain`    | STEP4 E5 |
-| `tier2-dispatch`        | E5 E4 |
+| `tier1-import-chain`    | STEP4 E5 C5 |
+| `tier2-dispatch`        | E5 E4 C5 |
 | `ops-wrapper`           | B6 C5 |
 | `api-signature`         | B6 E1 E5 |
 | `fp8-quant`             | C1 C2 D1 |
