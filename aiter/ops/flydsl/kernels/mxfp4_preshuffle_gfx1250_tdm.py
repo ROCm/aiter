@@ -54,9 +54,9 @@ def is_fx_set_register_available():
 
 
 TDM_DESCRIPTOR_VERSION = 1
-MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
-MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
-DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
+MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "11"))
+MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", "13"))
+DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "16"))
 EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
