@@ -287,14 +287,15 @@ def gemm_a4w4_out(
 ) -> None:
     """gemm_a4w4 into a caller-owned buffer. The kernels write whole 32-row
     tiles, so ``out`` is [ceil(M / 32) * 32, N] and the result is out[:M].
-    Output dtype is ``out.dtype``. gfx950 MXFP4 only."""
+    ``out`` must be bf16: shapes without a CK tuned row run gemm_a4w4_asm, which
+    only writes bf16. gfx950 MXFP4 only."""
     if get_gfx() in ["gfx1250"]:
         raise NotImplementedError("gemm_a4w4_out is not supported on gfx1250")
     m = A.numel() // A.shape[-1]
     n = B.shape[0]
     m_padded = (m + 31) // 32 * 32
-    if out.dtype not in (dtypes.bf16, dtypes.fp16):
-        raise ValueError(f"out dtype must be bf16 or fp16, got {out.dtype}")
+    if out.dtype != dtypes.bf16:
+        raise ValueError(f"out dtype must be bf16, got {out.dtype}")
     if out.shape != (m_padded, n) or out.device != A.device or not out.is_contiguous():
         raise ValueError(
             f"out must be a contiguous tensor of shape {(m_padded, n)} "

@@ -175,6 +175,9 @@ def test_a4w4_padded_out_under_torch_compile():
             lambda m, n: torch.empty((m, n), dtype=dtypes.bf16), id="unpadded"
         ),
         pytest.param(lambda m, n: torch.empty((64, n), dtype=dtypes.fp32), id="dtype"),
+        # gemm_a4w4_asm only writes bf16, and it serves every shape without a
+        # CK tuned row, so fp16 is rejected up front instead of failing at launch.
+        pytest.param(lambda m, n: torch.empty((64, n), dtype=dtypes.fp16), id="fp16"),
         pytest.param(
             lambda m, n: torch.empty((64, 2 * n), dtype=dtypes.bf16)[:, :n],
             id="column-slice",
