@@ -48,7 +48,7 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
-from aiter.ops.flydsl.kernels.qsa.k2 import qsa_k2_serves
+from aiter.ops.flydsl.kernels.qsa.k2 import build_qsa_k2_module, qsa_k2_serves
 from aiter.ops.flydsl.qsa import (
     gather_paged_cache,
     gather_qsa_caches,
@@ -3213,32 +3213,51 @@ def test_k2_serves_rejects_shapes_the_builder_rejects():
 
     ``auto`` selects FlyDSL only when this predicate accepts the tensors.
     An indivisible group, a group past the MFMA M=16 tile, a head_dim that
-    is not a multiple of 32, or a zero page size must stay on Triton.
+    is not a multiple of 32, a head the selected gather or merge cannot
+    cover, or a zero page size must stay on Triton.
     """
 
-    def tensors(hq, hkv, d, page):
-        q = torch.zeros(1, hq, d, dtype=torch.bfloat16)
+    def tensors(hq, hkv, d, page, rows=1, width=8):
+        q = torch.zeros(rows, hq, d, dtype=torch.bfloat16)
         k = torch.zeros(1, page, hkv, d, dtype=torch.bfloat16)
-        indices = torch.zeros(1, 8, dtype=torch.int32)
+        indices = torch.zeros(rows, width, dtype=torch.int32)
         table = torch.zeros(1, 1, dtype=torch.int32)
         return q, k, torch.zeros_like(k), indices, table
 
     if qsa_k2_serves(*tensors(24, 2, 256, 16)) is not None:
         raise AssertionError("family A GQA was rejected")
-    if qsa_k2_serves(*tensors(16, 1, 32, 16)) is not None:
-        raise AssertionError("a group of 16 at head_dim 32 was rejected")
+    if qsa_k2_serves(*tensors(16, 1, 128, 16)) is not None:
+        raise AssertionError("a group of 16 at head_dim 128 was rejected")
+    # (Hq, Hkv, D, page, rows, width, needle). D=32/D=96 are the decode
+    # gather (BN16 x 128). D=192 at W=32 splits, so the merge runs and
+    # writes 128 of 192. The same D at 32 rows is prefill, whose K map
+    # radix does not divide 6 rounds.
     rejected = (
-        (24, 5, 256, 16, "do not group"),
-        (24, 0, 256, 16, "do not group"),
-        (24, 1, 256, 16, "MFMA"),
-        (17, 1, 128, 16, "MFMA"),
-        (24, 2, 80, 16, "multiple of 32"),
-        (24, 2, 256, 0, "page_size"),
+        (24, 5, 256, 16, 1, 8, "do not group"),
+        (24, 0, 256, 16, 1, 8, "do not group"),
+        (24, 1, 256, 16, 1, 8, "MFMA"),
+        (17, 1, 128, 16, 1, 8, "MFMA"),
+        (24, 2, 80, 16, 1, 8, "multiple of 32"),
+        (24, 2, 256, 0, 1, 8, "page_size"),
+        (16, 1, 32, 16, 1, 8, "gather"),
+        (16, 1, 96, 16, 1, 8, "gather"),
+        (16, 1, 192, 16, 1, 32, "merge"),
+        (24, 2, 192, 16, 32, 8, "K LDS"),
     )
-    for hq, hkv, d, page, needle in rejected:
-        reason = qsa_k2_serves(*tensors(hq, hkv, d, page))
+    for hq, hkv, d, page, rows, width, needle in rejected:
+        reason = qsa_k2_serves(*tensors(hq, hkv, d, page, rows, width))
         if reason is None or needle not in reason:
-            raise AssertionError(f"Hq={hq} Hkv={hkv} D={d} page={page} -> {reason!r}")
+            raise AssertionError(
+                f"Hq={hq} Hkv={hkv} D={d} page={page} rows={rows} "
+                f"width={width} -> {reason!r}"
+            )
+    try:
+        build_qsa_k2_module(16, 1, 32, 16, True, 16, 128, 1, False)
+    except ValueError as exc:
+        if "gather" not in str(exc):
+            raise AssertionError(f"builder D=32 reason was {exc}") from exc
+    else:
+        raise AssertionError("builder compiled a D=32 decode gather")
     measured = _policy_args(1, 24, 256, 128, 16, 4, 128)
     q_indexer, index_cache, index_table, q_gqa, _, _, kv_table, indices = measured
     indivisible = torch.zeros(8, 16, 5, 256, dtype=torch.bfloat16)
