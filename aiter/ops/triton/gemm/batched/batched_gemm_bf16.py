@@ -122,6 +122,15 @@ def batched_gemm_bf16(
         waves_per_eu = config["waves_per_eu"]
         cache_modifier = config.get("cache_modifier", None)
         NUM_KSPLIT = config.get("NUM_KSPLIT", 1)
+        # An fp8 (8-bit) YQ relies on the GEMM epilogue's fp32 -> bf16 -> fp8
+        # round to stay bit-identical to the split path (bf16 epilogue + fp8
+        # rope cast) -- the bf16-absorb MLA q_nope-into-q_out case. Split-K
+        # instead writes fp32 partials and the shared reduce kernel casts
+        # fp32 -> fp8 directly, bypassing that round, so force a single K-slice
+        # for fp8 outputs. The affected GEMM's K (kv_lora_rank) is small, so
+        # disabling split-K here costs no measurable perf.
+        if NUM_KSPLIT > 1 and YQ is not None and YQ.element_size() == 1:
+            NUM_KSPLIT = 1
         SPLITK_BLOCK_SIZE = triton.cdiv(K, NUM_KSPLIT)
 
         num_k_tiles = triton.cdiv(SPLITK_BLOCK_SIZE, BLOCK_K)
