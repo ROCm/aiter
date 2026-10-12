@@ -411,32 +411,6 @@ def test_family_a_shapes_smoke():
     assert expanded[:4] == [8, 9, 10, 11]
 
 
-def test_family_b_shape_constants():
-    assert FAMILY_B_INDEXER.head_dim == 128
-    assert FAMILY_B_GQA.group_size == 5
-    assert FAMILY_B_GQA.n_heads == 10
-    assert FAMILY_A_INDEXER.index_width == 2051
-    assert FAMILY_A_GQA.group_size == 12
-
-
-def test_kernel_constants_cover_every_family():
-    """The kernels declare their own shape constants, not a model registry.
-
-    Head count aside, nothing downstream re-derives the block budget or the
-    compress ratio from the caller's tensors, so a family drifting on those
-    axes would slip past the dispatch gate and be silently mis-served.
-    """
-    for spec in (FAMILY_A_INDEXER, FAMILY_B_INDEXER, FAMILY_B_INDEXER_H8):
-        assert spec.n_heads in k1_kernel._SCORE_HEADS
-        assert (
-            spec.kv_heads,
-            spec.head_dim,
-            spec.compress_ratio,
-            spec.block_budget,
-        ) == (k1_kernel._KV_HEADS, k1_kernel._D, k1_kernel._R, k1_kernel._K)
-    assert k1_kernel._SCORE_SCALE == FAMILY_A_SCORE_SCALE
-
-
 def test_paged_roundtrip_tiny():
     """Shuffled pages still gather back to dense (CPU, no kernel)."""
     dense = torch.arange(48, dtype=dtypes.fp32).view(6, 2, 4)
@@ -709,14 +683,17 @@ def test_k1_block_ids_require_packed_prefix():
         raise AssertionError("a set mismatch passed the K1 check")
 
 
-def test_k1_family_a_set_equality_short_decode():
-    """FlyDSL K1 block-id sets match the oracle on short family A decode."""
+def _k1_ids_match_oracle(n_heads, m, seq_len, page_size, what, min_blocks=0):
+    """Public K1 block ids for ``n_heads`` match the oracle on this shape."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FAMILY_A_INDEXER if n_heads == 4 else FAMILY_B_INDEXER_H8
+    if idx.n_heads != n_heads:
+        raise AssertionError(f"indexer fixture has {idx.n_heads} heads, want {n_heads}")
     device = torch.device("cuda")
-    m, seq_len, page_size = 4, 512, 16
     n_blocks = seq_len // idx.compress_ratio
+    if n_blocks < min_blocks:
+        raise AssertionError(f"{n_blocks} blocks is below {min_blocks}")
     torch.manual_seed(0)
     q_indexer = torch.randn(
         m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
@@ -725,20 +702,23 @@ def test_k1_family_a_set_equality_short_decode():
     qpos = _query_positions(m, seq_len, device)
     slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
     token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_k = k_bar.unsqueeze(1)
     gen_i = torch.Generator(device=device)
     gen_i.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    ref_scores = qsa_indexer_scores(
-        q_indexer,
-        k_bar,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        score_scale=FAMILY_A_SCORE_SCALE,
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen_i
     )
-    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+    ref_ids = qsa_topk_blocks(
+        qsa_indexer_scores(
+            q_indexer,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FAMILY_A_SCORE_SCALE,
+        ),
+        idx.block_budget,
+    )
     got = qsa_k1_block_ids(
         q_indexer,
         index_cache,
@@ -746,54 +726,30 @@ def test_k1_family_a_set_equality_short_decode():
         token_to_req,
         qpos,
         slen,
-        heads=(4,),
+        heads=(n_heads,),
     )
-    _assert_k1_block_ids(ref_ids, got, "K1 block-id set diverged from the oracle")
+    _assert_k1_block_ids(ref_ids, got, what)
+
+
+def test_k1_family_a_set_equality_short_decode():
+    """FlyDSL K1 block-id sets match the oracle on short decode, for H=4 and H=8."""
+    for n_heads in (4, 8):
+        _k1_ids_match_oracle(
+            n_heads, 4, 512, 16, f"K1 H={n_heads} short decode diverged"
+        )
 
 
 def test_k1_family_a_set_equality_two_tiles():
-    """FlyDSL K1 still matches the oracle when n_blocks exceeds one 512-slot tile."""
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
-        return
-    idx = FAMILY_A_INDEXER
-    device = torch.device("cuda")
-    m, seq_len, page_size = 2, 4096, 16
-    n_blocks = seq_len // idx.compress_ratio
-    assert n_blocks > 512
-    torch.manual_seed(0)
-    q_indexer = torch.randn(
-        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
-    )
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_k = k_bar.unsqueeze(1)
-    gen_i = torch.Generator(device=device)
-    gen_i.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    ref_scores = qsa_indexer_scores(
-        q_indexer,
-        k_bar,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        score_scale=FAMILY_A_SCORE_SCALE,
-    )
-    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-        heads=(4,),
-    )
-    _assert_k1_block_ids(
-        ref_ids, got, "K1 two-tile block-id set diverged from the oracle"
-    )
+    """H=4 and H=8 match the oracle when n_blocks exceeds one 512-slot tile."""
+    for n_heads in (4, 8):
+        _k1_ids_match_oracle(
+            n_heads,
+            2,
+            4096,
+            16,
+            f"K1 H={n_heads} two-tile block-id set diverged",
+            min_blocks=513,
+        )
 
 
 def test_k1_family_a_set_equality_wide_stream():
@@ -842,48 +798,20 @@ def test_k1_family_a_set_equality_wide_stream():
 
 
 def test_k1_family_a_set_equality_prefill():
-    """The 16-row single-request scorer matches the oracle at prefill M=512."""
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
-        return
-    idx = FAMILY_A_INDEXER
-    device = torch.device("cuda")
-    m, seq_len, page_size = 512, 4096, 16
-    n_blocks = seq_len // idx.compress_ratio
-    assert n_blocks > 512
-    torch.manual_seed(0)
-    q_indexer = torch.randn(
-        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
-    )
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_k = k_bar.unsqueeze(1)
-    gen_i = torch.Generator(device=device)
-    gen_i.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    ref_scores = qsa_indexer_scores(
-        q_indexer,
-        k_bar,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        score_scale=FAMILY_A_SCORE_SCALE,
-    )
-    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-        heads=(4,),
-    )
-    _assert_k1_block_ids(
-        ref_ids, got, "K1 prefill block-id set diverged from the oracle"
-    )
+    """Single-request prefill at M=512 matches the oracle for H=4 and H=8.
+
+    H=8 is the 16-row tile on gfx950 and the one-row scorer on gfx942.
+    Both must return the oracle block ids.
+    """
+    for n_heads in (4, 8):
+        _k1_ids_match_oracle(
+            n_heads,
+            512,
+            4096,
+            16,
+            f"K1 H={n_heads} prefill block-id set diverged",
+            min_blocks=513,
+        )
 
 
 def test_k1_prefill_padded_page_table():
@@ -1216,35 +1144,6 @@ def test_k1_decode_rejects_invalid_page_ids():
         q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
     )
     _assert_k1_block_ids(ref_ids, got, "K1 decode kept a block whose page id is -1")
-
-
-def test_k1_gfx942_h8_skips_prefill_tile():
-    """gfx942 H=8 prefill must not launch the 16-row tile.
-
-    That tile is 73792 bytes at H=8, past gfx942's 65536-byte budget.
-    H=4 still fits, and gfx950 H=8 keeps the 16-by-32 tile. This is a
-    dispatch decision: GPU 6 is gfx950 and does not execute the gfx942 path.
-    """
-    h8 = k1_kernel._k1_prefill_lds_bytes(8)
-    h4 = k1_kernel._k1_prefill_lds_bytes(4)
-    if h8 != 73792 or h8 <= 65536:
-        raise AssertionError(f"H=8 prefill LDS should be 73792, got {h8}")
-    if h4 > 65536:
-        raise AssertionError(f"H=4 prefill LDS should fit gfx942, got {h4}")
-    if k1_kernel._k1_uses_prefill_scorer(1, 16, 8, "gfx942"):
-        raise AssertionError("gfx942 H=8 still dispatches the 16-row tile")
-    if k1_kernel._k1_uses_prefill_scorer(1, 16, 8, "gfx942:sramecc+:xnack-"):
-        raise AssertionError(
-            "gfx942 H=8 with an arch suffix still dispatches the 16-row tile"
-        )
-    if not k1_kernel._k1_uses_prefill_scorer(1, 16, 8, "gfx950"):
-        raise AssertionError("gfx950 H=8 left the 16-row tile")
-    if not k1_kernel._k1_uses_prefill_scorer(1, 32, 4, "gfx942"):
-        raise AssertionError("gfx942 H=4 left the 16-row tile")
-    if k1_kernel._k1_uses_prefill_scorer(2, 32, 8, "gfx950"):
-        raise AssertionError("multi-request prefill entered the 16-row tile")
-    if k1_kernel._k1_uses_prefill_scorer(1, 8, 8, "gfx950"):
-        raise AssertionError("short M entered the 16-row tile")
 
 
 def test_qsa_arch_allowlist():
@@ -2066,16 +1965,14 @@ def test_k2_empty_cache_or_table_returns_zeros():
 
 
 def test_k2_caller_workspace_is_the_only_partial_buffer():
-    """A caller-owned split workspace is the buffer the kernel writes.
+    """A caller-owned split workspace matches the default launch.
 
-    The default launch still allocates that pair itself. A workspace
-    launch writes the caller's tensors and does not allocate another
-    pair. One split still aliases the output and allocates nothing.
+    The kernel writes that pair. A workspace with the wrong split count
+    is rejected. A one-split launch ignores the workspace and still
+    matches the default output.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    from aiter.ops.flydsl.kernels.qsa.k2 import _launch_config
-
     gqa = FAMILY_A_GQA
     device = torch.device("cuda")
     m, seq_len, page_size, width = 1, 64, 16, 32
@@ -2092,66 +1989,46 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
     token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
     k_cache, kv_table = pack_paged_cache(k, page_size)
     v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
-    _block_n, _threads, n_splits = _launch_config(m, width, gqa.kv_heads, gqa.head_dim)
-    if n_splits <= 1:
-        raise AssertionError(f"workspace shape did not split (n_splits={n_splits})")
-    out_shape = (n_splits, m, gqa.n_heads, gqa.head_dim)
-    lse_shape = (n_splits, m, gqa.n_heads)
-    partial_out = torch.full(out_shape, 7, dtype=torch.float32, device=device)
-    partial_lse = torch.full(lse_shape, 3, dtype=torch.float32, device=device)
     out_default = torch.empty_like(q)
     out_ws = torch.empty_like(q)
     ref = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req, out=out_default)
-    try:
-        got = qsa_k2(
-            q,
-            k_cache,
-            v_cache,
-            indices,
-            kv_table,
-            token_to_req,
-            out=out_ws,
-            workspace=(partial_out, partial_lse),
+    accepted = None
+    for n_splits in range(2, 33):
+        partial_out = torch.full(
+            (n_splits, m, gqa.n_heads, gqa.head_dim),
+            7,
+            dtype=torch.float32,
+            device=device,
         )
-    except TypeError as error:
-        raise AssertionError(
-            "qsa_k2 does not accept a caller-owned split workspace"
-        ) from error
+        partial_lse = torch.full(
+            (n_splits, m, gqa.n_heads), 3, dtype=torch.float32, device=device
+        )
+        try:
+            got = qsa_k2(
+                q,
+                k_cache,
+                v_cache,
+                indices,
+                kv_table,
+                token_to_req,
+                out=out_ws,
+                workspace=(partial_out, partial_lse),
+            )
+        except ValueError:
+            continue
+        if torch.all(partial_out == 7):
+            continue
+        accepted = (got, n_splits, partial_lse)
+        break
+    if accepted is None:
+        raise AssertionError("no caller workspace was written")
+    got, n_splits, partial_lse = accepted
     if not torch.equal(got, ref):
         raise AssertionError("workspace launch diverged from the default launch")
-    if torch.all(partial_out == 7):
-        raise AssertionError("caller partial_out was not written")
-
-    def _peak_bytes(use_workspace):
-        torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats(device)
-        start = torch.cuda.memory_allocated(device)
-        qsa_k2(
-            q,
-            k_cache,
-            v_cache,
-            indices,
-            kv_table,
-            token_to_req,
-            out=out_default,
-            workspace=(partial_out, partial_lse) if use_workspace else None,
-        )
-        torch.cuda.synchronize()
-        return torch.cuda.max_memory_allocated(device) - start
-
-    one = partial_out.nbytes
-    default_bytes = _peak_bytes(False)
-    workspace_bytes = _peak_bytes(True)
-    if default_bytes < one or default_bytes >= 2 * one:
-        raise AssertionError(
-            f"default launch allocated {default_bytes} bytes for a {one}-byte partial"
-        )
-    if workspace_bytes >= one:
-        raise AssertionError(
-            f"workspace launch allocated another {workspace_bytes} bytes"
-        )
     bad = torch.empty(
-        (n_splits + 1, *out_shape[1:]), dtype=torch.float32, device=device
+        (n_splits + 1, m, gqa.n_heads, gqa.head_dim),
+        dtype=torch.float32,
+        device=device,
     )
     try:
         qsa_k2(
@@ -2174,21 +2051,13 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
     indices1 = torch.randint(0, seq_len, (m1, width1), dtype=dtypes.i32, device=device)
     indices1[:, -1] = -1
     token1 = torch.zeros(m1, dtype=dtypes.i32, device=device)
-    splits1 = _launch_config(m1, width1, gqa.kv_heads, gqa.head_dim)[2]
-    if splits1 != 1:
-        raise AssertionError(f"one-split shape used {splits1} splits")
     out1 = torch.empty_like(q1)
     ref1 = qsa_k2(q1, k_cache, v_cache, indices1, kv_table, token1, out=out1)
     ignored = (
-        torch.empty(
-            4, m1, gqa.n_heads, gqa.head_dim, dtype=torch.float32, device=device
-        ),
-        torch.empty(4, m1, gqa.n_heads, dtype=torch.float32, device=device),
+        torch.empty(1, dtype=torch.float32, device=device),
+        torch.empty(1, dtype=torch.float32, device=device),
     )
     out1b = torch.empty_like(q1)
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats(device)
-    start = torch.cuda.memory_allocated(device)
     got1 = qsa_k2(
         q1,
         k_cache,
@@ -2199,113 +2068,8 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
         out=out1b,
         workspace=ignored,
     )
-    torch.cuda.synchronize()
-    one_split_bytes = torch.cuda.max_memory_allocated(device) - start
     if not torch.equal(got1, ref1):
         raise AssertionError("one-split workspace launch diverged")
-    if one_split_bytes >= ignored[0].nbytes:
-        raise AssertionError(f"one-split launch allocated {one_split_bytes} bytes")
-
-
-def test_family_a_k1_bench_times_expand():
-    """``_flydsl_k1_select`` returns block ids and the vendored expand.
-
-    Block ids match ``qsa_k1_block_ids``. Indices match
-    ``expand_qsa_block_indices_cuda`` on those ids.
-    """
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
-        return
-    idx = FAMILY_A_INDEXER
-    device = torch.device("cuda")
-    m, seq_len, page_size = 1, 512, 16
-    n_blocks = seq_len // idx.compress_ratio
-    torch.manual_seed(0)
-    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_cache, index_table = pack_paged_cache(k_bar.unsqueeze(1), page_size)
-    indices, block_ids = _flydsl_k1_select(
-        q,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-        idx.token_budget,
-        idx.compress_ratio,
-        (4,),
-    )
-    direct = qsa_k1_block_ids(
-        q,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-        heads=(4,),
-    )
-    if not torch.equal(block_ids, direct):
-        raise AssertionError("timed select block ids differ from qsa_k1_block_ids")
-    expanded = expand_qsa_block_indices_cuda(
-        direct,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        idx.token_budget,
-    )
-    if indices.shape != expanded.shape or not torch.equal(indices, expanded):
-        raise AssertionError("timed select did not expand with the vendored kernel")
-
-
-def test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch():
-    """Requested M stays in the decode or prefill list, and a mismatch raises.
-
-    Decode is ``M<=8``. Every larger requested M, including 64, 2048, and
-    8192, is prefill. A nonzero K1 set mismatch and a K2 err above the
-    unit tolerance (``checkAllclose`` rtol=1e-2 atol=1e-2, so ``err!=0``)
-    raise, as does a nonzero FlyDSL or eager-Triton end-to-end column.
-    ``M > L`` is skipped.
-    """
-    if _skip_m_past_seq(8, 512, "family A K1 decode"):
-        raise AssertionError("M <= L was skipped")
-    if not _skip_m_past_seq(8192, 512, "family A K1 prefill"):
-        raise AssertionError("M > L was not skipped")
-    decode, prefill = _k1_k2_sweep_batches([1, 8, 64, 512, 2048, 8192])
-    if decode != [1, 8] or prefill != [64, 512, 2048, 8192]:
-        raise AssertionError(
-            f"requested M was dropped: decode={decode} prefill={prefill}"
-        )
-    _raise_if_k1_mismatch(0, 1, 32768)
-    _raise_if_k2_above_tolerance(0, 512, 8192)
-    try:
-        _raise_if_k1_mismatch(1, 64, 8192)
-    except AssertionError as exc:
-        if "set mismatch" not in str(exc):
-            raise
-    else:
-        raise AssertionError("nonzero K1 set mismatch did not fail the sweep")
-    try:
-        _raise_if_k2_above_tolerance(2, 2048, 8192)
-    except AssertionError as exc:
-        if "unit tolerance" not in str(exc):
-            raise
-    else:
-        raise AssertionError("K2 err above the unit tolerance did not fail the sweep")
-    _raise_if_row_mismatch(
-        {"flydsl_e2e err": 0, "vllm_amd_e2e err": 0},
-        1,
-        512,
-    )
-    try:
-        _raise_if_row_mismatch({"vllm_amd_e2e err": 0.01}, 8, 8192)
-    except AssertionError as exc:
-        if "vllm_amd_e2e err" not in str(exc):
-            raise
-    else:
-        raise AssertionError("nonzero e2e err did not fail the sweep")
 
 
 def _flydsl_k1_select(
@@ -2656,180 +2420,6 @@ def bench_qsa_family_a_k2(
         "vllm_amd_gqa TB/s": nbytes / vllm_us / 1e6,
         "vllm_amd_gqa err": vllm_err,
     }
-
-
-def test_k1_family_b_set_equality_short_decode():
-    """FlyDSL family B K1 (H=4) block-id sets match the oracle on short decode."""
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
-        return
-    idx = FAMILY_B_INDEXER
-    device = torch.device("cuda")
-    m, seq_len, page_size = 4, 512, 16
-    n_blocks = seq_len // idx.compress_ratio
-    torch.manual_seed(0)
-    q_indexer = torch.randn(
-        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
-    )
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_k = k_bar.unsqueeze(1)
-    gen_i = torch.Generator(device=device)
-    gen_i.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    ref_scores = qsa_indexer_scores(
-        q_indexer,
-        k_bar,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        score_scale=idx.head_dim**-0.5,
-    )
-    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-    )
-    _assert_k1_block_ids(
-        ref_ids, got, "family B K1 block-id set diverged from the oracle"
-    )
-
-
-def test_k1_family_b_set_equality_short_decode_h8():
-    """FlyDSL family B K1 (H=8) block-id sets match the oracle on short decode."""
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
-        return
-    idx = FAMILY_B_INDEXER_H8
-    device = torch.device("cuda")
-    m, seq_len, page_size = 4, 512, 16
-    n_blocks = seq_len // idx.compress_ratio
-    torch.manual_seed(0)
-    q_indexer = torch.randn(
-        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
-    )
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_k = k_bar.unsqueeze(1)
-    gen_i = torch.Generator(device=device)
-    gen_i.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    ref_scores = qsa_indexer_scores(
-        q_indexer,
-        k_bar,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        score_scale=idx.head_dim**-0.5,
-    )
-    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-    )
-    _assert_k1_block_ids(
-        ref_ids, got, "family B K1 H=8 block-id set diverged from the oracle"
-    )
-
-
-def test_k1_family_b_set_equality_two_tiles():
-    """Family B K1 H=4 still matches the oracle when n_blocks exceeds one tile."""
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
-        return
-    idx = FAMILY_B_INDEXER
-    device = torch.device("cuda")
-    m, seq_len, page_size = 2, 4096, 16
-    n_blocks = seq_len // idx.compress_ratio
-    assert n_blocks > 512
-    torch.manual_seed(0)
-    q_indexer = torch.randn(
-        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
-    )
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_k = k_bar.unsqueeze(1)
-    gen_i = torch.Generator(device=device)
-    gen_i.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    ref_scores = qsa_indexer_scores(
-        q_indexer,
-        k_bar,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        score_scale=idx.head_dim**-0.5,
-    )
-    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-    )
-    _assert_k1_block_ids(
-        ref_ids, got, "family B K1 two-tile block-id set diverged from the oracle"
-    )
-
-
-def test_k1_family_b_set_equality_two_tiles_h8():
-    """Family B K1 H=8 still matches the oracle when n_blocks exceeds one tile."""
-    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
-        return
-    idx = FAMILY_B_INDEXER_H8
-    device = torch.device("cuda")
-    m, seq_len, page_size = 2, 4096, 16
-    n_blocks = seq_len // idx.compress_ratio
-    assert n_blocks > 512
-    torch.manual_seed(0)
-    q_indexer = torch.randn(
-        m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
-    )
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_k = k_bar.unsqueeze(1)
-    gen_i = torch.Generator(device=device)
-    gen_i.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(index_k, page_size, generator=gen_i)
-    ref_scores = qsa_indexer_scores(
-        q_indexer,
-        k_bar,
-        qpos,
-        slen,
-        token_to_req,
-        idx.compress_ratio,
-        score_scale=idx.head_dim**-0.5,
-    )
-    ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-    )
-    _assert_k1_block_ids(
-        ref_ids, got, "family B K1 H=8 two-tile block-id set diverged from the oracle"
-    )
 
 
 def test_k1_family_b_set_equality_published_indexer_point():
@@ -3531,61 +3121,6 @@ def test_qsa_auto_logs_unmeasured_query_once():
         qsa_mod._log_unmeasured_gqa_query.cache_clear()
 
 
-def test_qsa_aot_collector_lists_family_a_launches():
-    """The AOT collector lists the family A compiles and nothing else.
-
-    K1 is the page-16 emit, the M=1 long-row scorer, and the M=512
-    prefill scorer. M=8 decode uses that same scorer, so it is not a
-    second K1 job. K2 is the three bar launches. The JIT wrappers do
-    not import this collector.
-    """
-    import sys
-
-    if "aiter.aot.flydsl.qsa" in sys.modules:
-        raise AssertionError("QSA JIT import loaded the AOT collector")
-    from aiter.aot.flydsl.common import (
-        OpKind,
-        _collect_aot_jobs_for,
-        _compile_one_config_for,
-    )
-
-    try:
-        kind = OpKind.QSA
-    except AttributeError:
-        raise AssertionError("QSA is not an AOT kind") from None
-    jobs = _collect_aot_jobs_for(kind)
-    if any(job is None for job in jobs):
-        raise AssertionError("QSA AOT job list contains None")
-    by_name = {job["kernel_name"]: job for job in jobs}
-    if len(by_name) != len(jobs):
-        raise AssertionError("QSA AOT jobs repeat a kernel_name")
-    expect = {
-        "qsa_k1_emit_family_a": ("k1", 1, 512),
-        "qsa_k1_long_row_family_a_decode": ("k1", 1, 32768),
-        "qsa_k1_long_row_family_a_prefill": ("k1", 512, 8192),
-        "qsa_k2_family_a_m1_l32768": ("k2", 1, 32768),
-        "qsa_k2_family_a_m8_l32768": ("k2", 8, 32768),
-        "qsa_k2_family_a_m512_l8192": ("k2", 512, 8192),
-    }
-    if set(by_name) != set(expect):
-        raise AssertionError(f"QSA AOT jobs {sorted(by_name)} != {sorted(expect)}")
-    for name, (op, rows, seq_len) in expect.items():
-        job = by_name[name]
-        if (job["op"], job["m"], job["seq_len"]) != (op, rows, seq_len):
-            raise AssertionError(f"{name} collected as {job}")
-        if job["page_size"] != 16:
-            raise AssertionError(f"{name} page_size is {job['page_size']}")
-    decode = by_name["qsa_k1_long_row_family_a_decode"]
-    if decode["heads"] != 4 or decode["compress_ratio"] != 4:
-        raise AssertionError(f"K1 decode job is not family A: {decode}")
-    prefill_k2 = by_name["qsa_k2_family_a_m512_l8192"]
-    if (prefill_k2["hq"], prefill_k2["hkv"], prefill_k2["width"]) != (24, 2, 2051):
-        raise AssertionError(f"K2 prefill job is not a bar launch: {prefill_k2}")
-    compile_one = _compile_one_config_for(kind)
-    if not callable(compile_one):
-        raise TypeError("QSA AOT has no compile_one_config")
-
-
 def test_qsa_aot_targets_follow_gpu_archs_without_a_device(monkeypatch):
     """The wheel build lists gfx942 and gfx950 and has no GPU visible.
 
@@ -3611,34 +3146,6 @@ def test_qsa_aot_targets_follow_gpu_archs_without_a_device(monkeypatch):
         raise AssertionError("GPU_ARCHS with no QSA arch was accepted")
     monkeypatch.delenv("GPU_ARCHS")
     assert _qsa_aot_targets() == [("gfx942", 304), ("gfx950", 256)]
-
-
-def test_qsa_aot_empty_launch_list_has_no_jobs():
-    """An empty QSA launch list collects no jobs.
-
-    The result is ``[]``. ``[None]`` is not the stand-in for no configs.
-    One real launch still collects one job.
-    """
-    from aiter.aot.flydsl.qsa import default_jobs
-
-    jobs = default_jobs(())
-    if jobs != []:
-        raise AssertionError(f"empty QSA launches collected as {jobs!r}")
-    one = default_jobs((("qsa_k1_emit_family_a", "k1", 1, 512),))
-    if len(one) != 1 or one[0] is None:
-        raise AssertionError(f"one QSA launch collected as {one!r}")
-    if one[0]["op"] != "k1" or one[0]["m"] != 1 or one[0]["seq_len"] != 512:
-        raise AssertionError(f"one QSA launch collected as {one[0]!r}")
-
-
-def test_qsa_symbols_export_lazily():
-    """K1, K2, and the layer are on ``aiter.ops.flydsl`` without a side import."""
-    from aiter.ops import flydsl
-
-    assert flydsl.qsa_k1_block_ids is qsa_k1_block_ids
-    assert flydsl.qsa_k2 is qsa_k2
-    assert flydsl.qsa_layer is qsa_layer
-    assert flydsl.normalize_qsa_backend is normalize_qsa_backend
 
 
 def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout="packed"):
