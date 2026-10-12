@@ -22,12 +22,19 @@ from unittest import mock
 
 
 class _Stream:
-    """Stand-in for ``torch.cuda.current_stream()``; launches never happen."""
+    """Stand-in for a ``torch.cuda`` stream; launches never happen."""
 
     cuda_stream = 0
 
-    def __init__(self, device):
+    def __init__(self, device=None, priority=0):
         self.device = device
+
+
+class _Event:
+    """Stand-in for ``torch.cuda.Event``; nothing is ever recorded."""
+
+    def __init__(self, *_args, **_kwargs):
+        pass
 
 
 def _forbid(*_args, **_kwargs):
@@ -54,8 +61,10 @@ def _register_stream_stub() -> None:
 
 
 @contextmanager
-def dry_run(arch: str, cu_num: int) -> Iterator[None]:
-    """Make the current process look like an ``arch`` GPU with ``cu_num`` CUs."""
+def dry_run(arch: str, cu_num: int, name: str | None = None) -> Iterator[None]:
+    """Make the current process look like an ``arch`` GPU with ``cu_num`` CUs.
+    ``name`` is the device name host code reads, e.g. to pick a per-GPU-model
+    tuning table; it defaults to ``arch``."""
     import torch
     from flydsl.compiler.jit_executor import CompiledArtifact
     from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
@@ -66,7 +75,7 @@ def dry_run(arch: str, cu_num: int) -> Iterator[None]:
     _register_stream_stub()
     stream = _Stream(torch.device("cuda", 0))
     properties = SimpleNamespace(
-        name=arch, gcnArchName=arch, multi_processor_count=cu_num
+        name=name or arch, gcnArchName=arch, multi_processor_count=cu_num
     )
     real_data_ptr = torch.Tensor.data_ptr
 
@@ -101,10 +110,12 @@ def dry_run(arch: str, cu_num: int) -> Iterator[None]:
         for function in cached:
             function.cache_clear()
             stack.callback(function.cache_clear)
-        for owner, name, value in (
+        for owner, attribute, value in (
             (torch.cuda, "_lazy_init", _forbid),
             (CompiledArtifact, "_ensure_engine", _forbid),
             (torch.cuda, "current_stream", lambda *_a, **_k: stream),
+            (torch.cuda, "Stream", _Stream),
+            (torch.cuda, "Event", _Event),
             (torch.cuda, "current_device", lambda: 0),
             (torch.cuda, "get_device_properties", lambda *_a, **_k: properties),
             (torch.cuda, "synchronize", lambda *_a, **_k: None),
@@ -116,7 +127,7 @@ def dry_run(arch: str, cu_num: int) -> Iterator[None]:
                 (convert, tensor_cls, lambda _index: 0, lambda: 0),
             ),
         ):
-            stack.enter_context(mock.patch.object(owner, name, value))
+            stack.enter_context(mock.patch.object(owner, attribute, value))
         for module in _torch_guard_modules():
             previous = module.run_host_scalar_ops_for_real(True)
             stack.callback(module.run_host_scalar_ops_for_real, previous)

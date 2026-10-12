@@ -12,7 +12,7 @@ the JIT path hits the cache instead of compiling again.
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
-| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
+| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 | `dry_run.py` | — | Runs aiter's real host code on CPU (FakeTensors, `COMPILE_ONLY=1`, GPU runtime forbidden) |
@@ -45,6 +45,22 @@ need no AOT change.
   compile once. `AITER_FLYDSL_AOT_TIMEOUT` applies to the worker's whole batch.
 - `--check` compiles nothing and fails on any kernel the replay would need but
   the cache lacks; it is the CPU-side counterpart of the step-2 test below.
+
+### How `mega_moe.py` works
+
+`mega_moe.py` does not restate MegaMoE's kernel selection either. For each rank
+of each deployment profile it builds the runtime's own `MegaMoEV2` inside
+`dry_run`, with FakeTensor expert weights, and calls `preload_aot_bundles()`:
+the method serving uses to load every Stage1/prepare, Stage2 and combine
+variant of the profile's bundle plan.
+
+- mori shmem, through which `MegaMoEV2` allocates its symmetric buffers and
+  exchanges peer pointers, hands out FakeTensors and fake addresses, so no GPU,
+  process group or mori install is needed.
+- The device reports itself as an MI355X, because the combine launch geometry
+  is tuned per GPU model.
+- `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
+  fixed-slot `forward` and the per-stage benchmarks call it.
 
 ---
 
@@ -105,9 +121,10 @@ python -m aiter.aot.flydsl.fmha_fp8
 python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
 ```
 
-MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
-(`experts_per_rank=48/52/56`). The expert count is part of the compiled ABI, so
-one profile cannot safely reuse another profile's bundle.
+MegaMoE defaults to every profile the service ships: DeepSeek-V4-Pro r0/r32/r64
+(`experts_per_rank=48/52/56`) and Kimi-K3 (`experts_per_rank=112`). The expert
+count is part of the compiled ABI, so one profile cannot safely reuse another
+profile's bundle.
 
 ### Common arguments
 

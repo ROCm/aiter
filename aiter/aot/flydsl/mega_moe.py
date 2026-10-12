@@ -3,23 +3,43 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT profile bundles for MegaMoE A8W4 deployment shapes."""
+"""AOT pre-compilation for the MegaMoE A8W4 deployment profiles.
+
+Each job builds the runtime's own ``MegaMoEV2`` for one rank of a deployment
+profile and calls its ``preload_aot_bundles()``. The runtime derives the bundle
+plan, sizes its buffers and loads every production Stage1/prepare, Stage2 and
+combine variant itself; inside :func:`aiter.aot.flydsl.dry_run.dry_run` those
+kernels are compiled into the cache instead of launched. mori shmem, through
+which the runtime allocates symmetric buffers and exchanges peer pointers, hands
+out FakeTensors and fake addresses, so no GPU or process group is needed. This
+module only owns the deployment profiles.
+
+Usage:
+    # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
+    python -m aiter.aot.flydsl.mega_moe
+
+    # One custom profile
+    python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48 --mtpr 8192
+"""
 
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import sys
 import time
-from dataclasses import replace
-from pathlib import Path
+from contextlib import contextmanager
+from types import ModuleType
+from unittest import mock
 
-import flydsl.expr as fx
 import torch
 
-from aiter.aot.flydsl.common import compile_only_env, override_env, run_jobs_parallel
-from aiter.ops.flydsl.kernels.mega_moe.mega_moe_config import (
-    build_mega_moe_bundle_plan,
-)
+from aiter.aot.flydsl.common import run_jobs_parallel
 
+ARCH = "gfx950"
+# The combine launch geometry is tuned per GPU model, read from the device name.
+DEVICE_NAME = "AMD Instinct MI355X"
+NUM_CU = 256
 DEFAULT_MTPRS = (8192, 16384, 32768)
 DEFAULT_QUANTS = ("a8w4",)
 # DeepSeek-V4-Pro deployment profiles: r0, r32, and r64 redundant experts.
@@ -34,8 +54,7 @@ K3_MODEL_DIM = 3584
 K3_INTER_DIM = 3072
 # K3 uses SiTUv2 (hidden_act="situ"); tanh self-saturates so no hard clamp.
 # beta=4.0 / linear_beta=25.0 are the K3 checkpoint constants the MegaMoE SiTU
-# kernel bakes in (SGLang kimi_k3.py asserts exactly these); they MUST match
-# op_tests kimi_k3_route or the AOT bundle name will not match at serving.
+# kernel bakes in (SGLang kimi_k3.py asserts exactly these).
 K3_ACT = "situv2"
 K3_SITU_BETA = 4.0
 K3_SITU_LINEAR_BETA = 25.0
@@ -43,30 +62,7 @@ WORLD_SIZE = 8
 TOPK = 6
 MODEL_DIM = 7168
 INTER_DIM = 3072
-NUM_CU = 256
 SWIGLU_LIMIT = 10.0
-_DEFAULT_COMBINE_BLOCK_NUM = 128
-_DEFAULT_COMBINE_WARP_NUM = 8
-
-
-def _group_major_geometry(
-    mtpr,
-    experts_per_rank,
-    *,
-    world_size=WORLD_SIZE,
-    topk=TOPK,
-    fixed_slot_dispatch=False,
-):
-    """Match the runtime group-major capacity and metadata allocation."""
-    unit = 32 if fixed_slot_dispatch else 128
-    max_tokens_per_expert = world_size * mtpr
-    ll_cap = (max_tokens_per_expert + unit - 1) // unit * unit
-    if fixed_slot_dispatch:
-        num_valid_max = experts_per_rank * ll_cap + 256
-    else:
-        num_valid_max = world_size * mtpr * topk + (experts_per_rank + 2) * unit
-    tile_state_stride = (num_valid_max + 31) // 32
-    return ll_cap, num_valid_max, tile_state_stride
 
 
 def default_jobs(
@@ -83,6 +79,8 @@ def default_jobs(
     situ_beta=1.0,
     situ_linear_beta=1.0,
 ):
+    """One job per rank of every (max tokens per rank, experts per rank) pair;
+    rank is a compile-time parameter of the kernels."""
     shape_suffix = ""
     if (world_size, topk, model_dim, inter_dim) != (
         WORLD_SIZE,
@@ -91,17 +89,14 @@ def default_jobs(
         INTER_DIM,
     ):
         shape_suffix = f"_w{world_size}_k{topk}_d{model_dim}_i{inter_dim}"
-    # Activation is baked into the Stage1 epilogue, so a non-default act needs a
-    # distinct AOT artifact name (mirrors the runtime kernel-name act suffix).
     act_suffix = "" if act == "silu" else f"_{act}"
     return [
         {
             "kernel_name": (
-                f"mega_moe_{quant}_stage{stage}_bundle_mtpr{mtpr}_epr{experts_per_rank}"
+                f"mega_moe_{quant}_mtpr{mtpr}_epr{experts_per_rank}"
                 f"_rank{rank}{shape_suffix}{act_suffix}"
             ),
             "quant": quant,
-            "stage": stage,
             "mtpr": mtpr,
             "experts_per_rank": experts_per_rank,
             "rank": rank,
@@ -118,7 +113,6 @@ def default_jobs(
         for experts_per_rank in experts_per_ranks
         for quant in quants
         for rank in range(world_size)
-        for stage in (1, 2)
     ]
 
 
@@ -145,8 +139,6 @@ def production_jobs(
         topk=K3_TOPK,
         model_dim=K3_MODEL_DIM,
         inter_dim=K3_INTER_DIM,
-        # SiTUv2 self-saturates -> no hard clamp; keep swiglu_limit at 0 so the
-        # kernel name matches the runtime kimi_k3_route (swiglu_limit=0.0).
         swiglu_limit=0.0,
         act=K3_ACT,
         situ_beta=K3_SITU_BETA,
@@ -155,375 +147,98 @@ def production_jobs(
     return jobs
 
 
-def _tensor(shape, dtype):
-    return torch.empty(shape, dtype=dtype, device="cpu")
+def _mori_unavailable(*_args, **_kwargs):
+    raise RuntimeError("mori is not installed")
 
 
-def _compile_stage1(
-    mtpr,
-    experts_per_rank,
-    rank,
-    plan,
-    *,
-    a_dtype,
-    world_size,
-    topk,
-    model_dim,
-    inter_dim,
-    swiglu_limit,
-    act="silu",
-    situ_beta=1.0,
-    situ_linear_beta=1.0,
-):
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_prepare import (
-        preload_mega_moe_prepare,
-    )
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage1 import (
-        compile_mega_moe_stage1_bundle,
-    )
-    from aiter.ops.flydsl.kernels.mega_moe.quant import _get_launcher
+@contextmanager
+def _fake_shmem(device):
+    """mori shmem that hands out FakeTensors and fake peer addresses."""
+    if importlib.util.find_spec("mori") is None:
+        # The replay never reaches mori itself, so a build host need not have it.
+        package, shmem = ModuleType("mori"), ModuleType("mori.shmem")
+        package.shmem = shmem
+        shmem.shmem_barrier_all = _mori_unavailable
+        shmem.shmem_ptr_p2p = _mori_unavailable
+        shmem.mori_shmem_create_tensor = _mori_unavailable
+        sys.modules.update({"mori": package, "mori.shmem": shmem})
+    import mori.shmem as ms
 
-    fuse_cap, _, tile_state_stride = _group_major_geometry(
-        mtpr,
-        experts_per_rank,
-        world_size=world_size,
-        topk=topk,
-        fixed_slot_dispatch=plan.fixed_slot_dispatch,
-    )
-    scale_dim = model_dim // 32
-    seen_prepare = set()
-    prepare_entries = () if plan.fixed_slot_dispatch else plan.entries
-    for entry in prepare_entries:
-        config = entry.config.stage1
-        prepare_blocks = max(
-            1, min(config.num_dispatch_cu, (entry.token_bucket + 63) // 64)
-        )
-        quant_groups = entry.token_bucket * scale_dim
-        quant_blocks = min(
-            NUM_CU,
-            config.prepare_quant_cu,
-            (quant_groups + 511) // 512,
-        )
-        for num_quant_cu in sorted({0, quant_blocks}):
-            identity = (
-                config.sort_block_m,
-                config.num_dispatch_cu,
-                prepare_blocks,
-                num_quant_cu,
-                config.payload_chunk_rows,
-            )
-            if identity in seen_prepare:
-                continue
-            seen_prepare.add(identity)
-            preload_mega_moe_prepare(
-                fx.Int64(0),
-                fx.Int32(1),
-                fx.Int64(0),
-                fx.Int64(0),
-                fx.Int64(0),
-                fx.Int64(0),
-                fx.Int64(0),
-                fx.Int64(0),
-                fx.Stream(None),
-                rank=rank,
-                experts_per_rank=experts_per_rank,
-                fuse_npes=world_size,
-                fuse_topk=topk,
-                fuse_mtpr=mtpr,
-                sort_block_m=config.sort_block_m,
-                num_dispatch_cu=config.num_dispatch_cu,
-                num_prepare_cu=prepare_blocks,
-                num_quant_cu=num_quant_cu,
-                quant_cu_capacity=NUM_CU,
-                model_dim=model_dim,
-                payload_chunk_rows=config.payload_chunk_rows,
-                tile_state_stride=tile_state_stride,
-            )
-
-    # The production E2E path quantizes inside prepare.  Keep the public
-    # standalone quantize() launcher in the same AOT profile as well because
-    # the validation/per-stage benchmark invokes it to isolate Stage1 timing.
-    quant_rows = 2
-    quant_groups = quant_rows * scale_dim
-    _get_launcher(model_dim, a_dtype)(
-        _tensor((quant_rows, model_dim), torch.bfloat16),
-        _tensor((quant_rows, model_dim), torch.float8_e4m3fn),
-        _tensor((quant_rows, scale_dim), torch.uint8),
-        quant_rows,
-        (quant_groups + 63) // 64,
-        fx.Stream(None),
+    from aiter.ops.flydsl.kernels import (
+        flydsl_dispatch_combine_intranode_op as dispatch_combine,
     )
 
-    launch = compile_mega_moe_stage1_bundle(
-        model_dim=model_dim,
-        inter_dim=inter_dim,
-        rank=rank,
-        experts_per_rank=experts_per_rank,
-        fuse_npes=world_size,
-        fuse_topk=topk,
-        fuse_cap=fuse_cap,
-        fuse_mtpr=mtpr,
-        fuse_scale_dim=model_dim // 32,
-        fixed_slot_dispatch=plan.fixed_slot_dispatch,
-        num_cu=NUM_CU,
-        tile_state_stride=tile_state_stride,
-        variants=plan.stage1_variants,
-        swiglu_limit=swiglu_limit,
-        act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
-    )
-    launch(
-        _tensor((1, inter_dim), torch.float8_e4m3fn),
-        _tensor((1, model_dim), torch.float8_e4m3fn),
-        # Keep every non-unit dimension larger than one so FlyDSL records the
-        # same contiguous-stride signature as the runtime weight tensor.  An
-        # all-ones placeholder makes the first dimension look unit-strided and
-        # produces an AOT cache key that the real tensor can never reuse.
-        _tensor((2, 2, 2), torch.uint8),
-        _tensor((1, model_dim // 128), torch.int32),
-        _tensor((2, 2), torch.uint8),
-        _tensor((1,), torch.int32),
-        _tensor((1,), torch.int32),
-        _tensor((2,), torch.int32),
-        _tensor((1,), torch.uint8),
-        fx.Int32(1),
-        fx.Int64(0),
-        fx.Int32(1),
-        *([fx.Int64(0)] * 6),
-        fx.Int32(0),
-        fx.Stream(None),
-    )
+    def create_tensor(shape, dtype):
+        return torch.empty(shape, dtype=dtype, device=device)
+
+    with (
+        mock.patch.object(ms, "shmem_barrier_all", lambda: None),
+        mock.patch.object(ms, "shmem_ptr_p2p", lambda ptr, _rank, _pe: ptr),
+        mock.patch.object(dispatch_combine, "mori_shmem_create_tensor", create_tensor),
+    ):
+        yield
 
 
-def _compile_stage2(
-    mtpr,
-    experts_per_rank,
-    rank,
-    plan,
-    *,
-    a_dtype,
-    world_size,
-    topk,
-    model_dim,
-    inter_dim,
-):
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage2 import (
-        preload_mega_moe_stage2,
-    )
-    from aiter.ops.flydsl.kernels.mega_moe.mega_moe_stage2_aligned_pair import (
-        ALIGNED_PAIR_SCATTER_VEC,
-        preload_mega_moe_stage2_aligned_pair,
-    )
+def _weights(job: dict, device) -> dict:
+    """Expert weights as the runtime takes them: preshuffled MXFP4 values with
+    E8M0 scales."""
+    from aiter import dtypes
+    from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
-    _, num_valid_max, _ = _group_major_geometry(
-        mtpr,
-        experts_per_rank,
-        world_size=world_size,
-        topk=topk,
-        fixed_slot_dispatch=plan.fixed_slot_dispatch,
-    )
-    for key in plan.stage2_variants:
-        stage2 = key.config
-        row_bytes = (
-            model_dim + model_dim // 32
-            if key.p2p_quant == "fp8_blockwise_1x32"
-            else model_dim * 2
-        )
-        common = {
-            "model_dim": model_dim,
-            "inter_dim": inter_dim,
-            "experts": experts_per_rank,
-            "topk": topk,
-            "rank": rank,
-            "npes": world_size,
-            "max_tok": mtpr,
-            "recv_cap": world_size * mtpr,
-            "comb_inp_nbytes": mtpr * topk * row_bytes,
-            "HIDDEN_MAX": model_dim,
-            "INTER_MAX": inter_dim,
-            "cu_num": NUM_CU,
-            "p2p_quant_type": key.p2p_quant,
-            "fixed_slot_dispatch": plan.fixed_slot_dispatch,
-            "a_dtype": a_dtype,
-        }
-        residual = (
-            replace(stage2, skew_cu=stage2.persist_cu)
-            if stage2.aligned_pair
-            else stage2
-        )
-        preload_mega_moe_stage2(
-            *([fx.Int64(0)] * 15),
-            num_valid_max,
-            fx.Int32(inter_dim),
-            fx.Int32(model_dim),
-            fx.Stream(None),
-            BM=residual.block_m,
-            SBM=key.sbm,
-            BN=residual.block_n,
-            BK=residual.block_k,
-            use_nt=residual.use_nt,
-            g2_bhoist=residual.b_hoist,
-            g2_b2stage=residual.b2stage,
-            g2_ascale_pf=residual.ascale_prefetch,
-            g2_spart=residual.spatial_partition,
-            g2_deep_a_pipeline=residual.deep_a_pipeline,
-            persist=residual.persist,
-            persist_cu=residual.persist_cu,
-            persist_strided=residual.persist_strided,
-            skew_cu=residual.skew_cu,
-            g2_bf16_lds=residual.bf16_lds,
-            runtime_pair_skip=stage2.aligned_pair,
-            scatter_vec=ALIGNED_PAIR_SCATTER_VEC if stage2.aligned_pair else 8,
-            **common,
-        )
-        if not stage2.aligned_pair:
-            continue
-        preload_mega_moe_stage2_aligned_pair(
-            *([fx.Int64(0)] * 11),
-            num_valid_max,
-            fx.Int32(inter_dim),
-            fx.Int32(model_dim),
-            fx.Stream(None),
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            experts=experts_per_rank,
-            topk=topk,
-            rank=rank,
-            npes=world_size,
-            max_tok=mtpr,
-            recv_cap=world_size * mtpr,
-            comb_inp_nbytes=mtpr * topk * row_bytes,
-            BM=stage2.pair_block_m,
-            SBM=key.sbm,
-            BN=stage2.pair_block_n,
-            BK=stage2.block_k,
-            INTER_MAX=inter_dim,
-            use_nt=stage2.use_nt,
-            cu_num=stage2.pair_cu,
-            g2_bhoist=stage2.b_hoist,
-            g2_b2stage=stage2.b2stage,
-            g2_ascale_pf=stage2.ascale_prefetch,
-            g2_deep_a_pipeline=stage2.deep_a_pipeline,
-            a_dtype=a_dtype,
-        )
+    experts = job["experts_per_rank"]
+    model_dim, inter_dim = job["model_dim"], job["inter_dim"]
 
-    # Stage2's production bundle includes the terminal fused combine kernels.
-    # Compile them here as well; otherwise a clean AOT-only service still falls
-    # back to JIT after all GEMM2 variants have loaded successfully.
-    from aiter.jit.core import AITER_CONFIGS
-    from aiter.ops.flydsl.kernels.communication_ops_utils import (
-        GeometryTuningTable,
-    )
-    from aiter.ops.flydsl.kernels.flydsl_dispatch_combine_intranode_kernel import (
-        make_combine_jit,
-    )
+    def empty(*shape, dtype):
+        return torch.empty(shape, dtype=dtype, device=device)
 
-    tuning = GeometryTuningTable()
-    tuning_path = Path(AITER_CONFIGS.AITER_CONFIG_DISPATCH_COMBINE_INTRANODE_FILE)
-    if tuning_path.is_file():
-        tuning = GeometryTuningTable.from_tuning_file(
-            tuning_path,
-            ep_size=world_size,
-            gfx="gfx950",
-            gpu_model="mi355x",
-            dtype="fp8_ocp",
-            hidden_dim=model_dim,
-            zero_copy=False,
-            topk=topk,
-            local_expert_num=experts_per_rank,
-            combine_dtype="bf16",
-        )
-    seen_combine = set()
-    for entry in plan.entries:
-        geometry = tuning.lookup("combine", entry.token_bucket)
-        block_num, warp_num = geometry or (
-            _DEFAULT_COMBINE_BLOCK_NUM,
-            _DEFAULT_COMBINE_WARP_NUM,
-        )
-        blockwise_fp8 = entry.config.p2p_quant == "fp8_blockwise_1x32"
-        identity = (block_num, warp_num, blockwise_fp8)
-        if identity in seen_combine:
-            continue
-        seen_combine.add(identity)
-        launch = make_combine_jit(
-            rank=rank,
-            npes=world_size,
-            experts_per_token=topk,
-            hidden_dim=model_dim,
-            max_tok_per_rank=mtpr,
-            block_num=block_num,
-            warp_num_per_block=warp_num,
-            data_type=torch.bfloat16,
-            enable_weights=False,
-            enable_std_moe=False,
-            zero_copy=False,
-            skip_stage1=True,
-            fp8_direct_cast=False,
-            blockwise_fp8_transport=blockwise_fp8,
-            # MegaMoE uses the fixed destination-slot contract and only needs
-            # one receive-count slot per peer for combine metadata.
-            max_recv=world_size,
-        )
-        launch(
-            *([fx.Int64(0)] * 18),
-            fx.Int32(entry.token_bucket),
-            fx.Stream(None),
-        )
+    w1 = empty(experts, 2 * inter_dim, model_dim // 2, dtype=dtypes.fp4x2)
+    w1_scale = empty(experts * 2 * inter_dim, model_dim // 32, dtype=dtypes.fp8_e8m0)
+    w2 = empty(experts, model_dim, inter_dim // 2, dtype=dtypes.fp4x2)
+    w2_scale = empty(experts * model_dim, inter_dim // 32, dtype=dtypes.fp8_e8m0)
+    return {
+        "w1": shuffle_weight_a16w4(w1, 16, True),
+        "w1_scale": shuffle_scale_a16w4(w1_scale, experts, True),
+        "w2": shuffle_weight_a16w4(w2, 16, False),
+        "w2_scale": shuffle_scale_a16w4(w2_scale, experts, False),
+    }
 
 
 def compile_one_config(**job):
+    """Build one rank of a profile and leave its production kernels in the cache."""
+    from aiter.aot.flydsl.dry_run import dry_run
+
     result = {**job, "compile_time": None}
     started = time.time()
     try:
-        world_size = job.get("world_size", WORLD_SIZE)
-        topk = job.get("topk", TOPK)
-        model_dim = job.get("model_dim", MODEL_DIM)
-        inter_dim = job.get("inter_dim", INTER_DIM)
-        swiglu_limit = job.get("swiglu_limit", SWIGLU_LIMIT)
-        act = job.get("act", "silu")
-        situ_beta = job.get("situ_beta", 1.0)
-        situ_linear_beta = job.get("situ_linear_beta", 1.0)
-        a_dtype = "fp8"
-        plan = build_mega_moe_bundle_plan(
-            job["mtpr"],
-            experts_per_rank=job["experts_per_rank"],
-            model_dim=model_dim,
-            inter_dim=inter_dim,
-            world_size=world_size,
-        )
-        with compile_only_env(), override_env("FLYDSL_GPU_ARCH", "gfx950"):
-            if job["stage"] == 1:
-                _compile_stage1(
-                    job["mtpr"],
-                    job["experts_per_rank"],
-                    job["rank"],
-                    plan,
-                    a_dtype=a_dtype,
-                    world_size=world_size,
-                    topk=topk,
-                    model_dim=model_dim,
-                    inter_dim=inter_dim,
-                    swiglu_limit=swiglu_limit,
-                    act=act,
-                    situ_beta=situ_beta,
-                    situ_linear_beta=situ_linear_beta,
-                )
-            else:
-                _compile_stage2(
-                    job["mtpr"],
-                    job["experts_per_rank"],
-                    job["rank"],
-                    plan,
-                    a_dtype=a_dtype,
-                    world_size=world_size,
-                    topk=topk,
-                    model_dim=model_dim,
-                    inter_dim=inter_dim,
-                )
+        device = torch.device("cuda", job["rank"])
+        with dry_run(ARCH, NUM_CU, name=DEVICE_NAME), _fake_shmem(device):
+            # Imported only now: without mori, its stand-in must be in place.
+            from aiter.ops.flydsl.kernels.mega_moe.mega_moe_v2 import MegaMoEV2
+
+            moe = MegaMoEV2(
+                rank=job["rank"],
+                world_size=job["world_size"],
+                model_dim=job["model_dim"],
+                inter_dim=job["inter_dim"],
+                experts=job["experts_per_rank"] * job["world_size"],
+                topk=job["topk"],
+                quant=job["quant"],
+                max_tok_per_rank=job["mtpr"],
+                swiglu_limit=job["swiglu_limit"],
+                act=job["act"],
+                situ_beta=job["situ_beta"],
+                situ_linear_beta=job["situ_linear_beta"],
+                **_weights(job, device),
+            )
+            moe.preload_aot_bundles()
+            # preload_aot_bundles() leaves out quantize(), which fixed-slot
+            # forward and the per-stage benchmarks call.
+            moe.quantize(
+                torch.empty((2, job["model_dim"]), dtype=torch.bfloat16, device=device)
+            )
         result["compile_time"] = time.time() - started
     except Exception as error:  # noqa: BLE001
-        print(f"  [FAIL] {job['kernel_name']}: {error}")
+        print(f"  [FAIL] {job['kernel_name']}: {type(error).__name__}: {error}")
     return result
 
 
