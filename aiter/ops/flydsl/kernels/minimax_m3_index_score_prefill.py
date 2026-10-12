@@ -356,6 +356,12 @@ def build_prefill_score(g):
     # them. That is what lets tile_q grow: per wave Q costs FEAT_TILES_PER_WAVE
     # fragments rather than FEAT_TILES, and K costs PER_THREAD staging
     # registers rather than a page of MFMA fragments.
+    # The CTA width is not a free parameter: `stage_q_lds` assigns rows by
+    # `wave` and the LDS page buffers are sized for these two shapes only.
+    # `geometry` is the only producer, but it is worth stating here rather
+    # than leaving a wrong value to overrun the Q staging silently.
+    if NWAVES not in (WAVES, _WIDE_CTA_WAVES):
+        raise ValueError(f"waves must be {WAVES} or {_WIDE_CTA_WAVES}, got {NWAVES}")
     if FEAT_TILES % NWAVES:
         raise ValueError(
             f"tile_q {TILE_Q} gives {FEAT_TILES} tiles, not a multiple of {NWAVES}"
@@ -1268,6 +1274,31 @@ def score_prefill_flydsl(
             f"cache needs contiguous pages: stride(1) must be {HEAD_DIM} and "
             f"stride(2) 1, got {cache.stride(1)} and {cache.stride(2)}"
         )
+    # Only stride(0)/stride(1) reach the kernel; every innermost index below is
+    # built as an element offset, so a non-unit feature stride is read as if it
+    # were 1 and silently scores the wrong features. Same contract the decode
+    # scorer states, and the reason it states it rather than threading the
+    # stride through every load.
+    if idx_q.stride(2) != 1 or idx_q.stride(1) < HEAD_DIM:
+        raise ValueError(
+            f"idx_q: feature stride must be 1 and heads must not overlap, got "
+            f"stride {idx_q.stride()}"
+        )
+    # `block_table` reaches the kernel as `b * stride(0) + column`, so the
+    # column axis is assumed packed; the three length arrays are indexed by
+    # `b` (and `b+1`) straight off `.data_ptr()`.
+    if block_table.stride(1) != 1 or block_table.stride(0) < block_table.shape[1]:
+        raise ValueError(
+            f"block_table: columns must be contiguous and rows must not "
+            f"overlap, got stride {block_table.stride()}"
+        )
+    for t, name in (
+        (cu_seqlens_q, "cu_seqlens_q"),
+        (seq_lens, "seq_lens"),
+        (prefix_lens, "prefix_lens"),
+    ):
+        if t.stride() != (1,):
+            raise ValueError(f"{name}: expected a contiguous vector")
     geom = geometry(max_query_len, batch, heads, max_block, idx_q.device)
     if out is None:
         out = alloc_score(total_q, heads, max_block, idx_q.device)

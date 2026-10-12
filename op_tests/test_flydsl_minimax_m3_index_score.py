@@ -1471,12 +1471,29 @@ def test_rejects_malformed_tensors():
         a[i] = v
         return a
 
+    # Only stride(0)/stride(1) reach the kernel; every other index is built as
+    # a packed element offset. A strided view of the right dtype and shape is
+    # therefore read as if it were contiguous -- in bounds, wrong values -- so
+    # each of these must be refused rather than scored.
+    wide_q = torch.zeros(
+        c["q_bf16"].shape[0], 1, 2 * D, dtype=c["q_bf16"].dtype, device="cuda"
+    )
+    wide_q[..., :D] = c["q_bf16"]
+    wide_bt = torch.zeros(
+        c["bt"].shape[0], 2 * c["bt"].shape[1], dtype=torch.int32, device="cuda"
+    )
+    wide_bt[:, ::2] = c["bt"]
     for idx, bad in (
         (4, c["seq"].long()),  # int64 seq_lens
         (5, c["prefix"].long()),  # int64 prefix_lens
         (3, c["cu"].long()),  # int64 cu_seqlens_q
         (2, c["bt"].long()),  # int64 block table
         (2, c["bt"][0]),  # 1-D block table
+        (0, wide_q[..., ::2]),  # non-unit Q feature stride
+        (2, wide_bt[:, ::2]),  # non-unit block-table column stride
+        (3, c["cu"].repeat_interleave(2)[::2]),  # strided cu_seqlens_q
+        (4, c["seq"].repeat_interleave(2)[::2]),  # strided seq_lens
+        (5, c["prefix"].repeat_interleave(2)[::2]),  # strided prefix_lens
     ):
         with pytest.raises(ValueError):
             score_prefill_flydsl(*swap(idx, bad))
@@ -1650,6 +1667,29 @@ def test_score_prefill_perf(batch, q_len, ctx_len, heads):
         ret[f"{name} TB/s"] = nbytes / us / 1e6
         ret[f"{name} err"] = err
     return ret
+
+
+def test_every_lazy_export_resolves():
+    """`aiter.ops.flydsl` exports these lazily, so a name that stopped
+    existing is an AttributeError at the caller's import rather than here.
+
+    `MiniMaxM3IndexScoreConfig` pointed at a class this file deleted and
+    nothing noticed, because the module imports fine until someone asks for
+    that attribute -- and the consumer is in another repository.
+    """
+    import aiter.ops.flydsl as F
+    from aiter.ops.flydsl import _LAZY_IMPORTS
+
+    for name in _LAZY_IMPORTS:
+        getattr(F, name)  # raises if the target moved or was removed
+    assert set(_LAZY_IMPORTS) <= set(F.__all__)
+    for name in (
+        "minimax_m3_index_score_flydsl",
+        "minimax_m3_index_score_prefill_flydsl",
+        "minimax_m3_index_score_alloc",
+        "minimax_m3_index_score_prefill_alloc",
+    ):
+        assert name in _LAZY_IMPORTS, f"{name} is not reachable from the package"
 
 
 def parse_args(argv=None):

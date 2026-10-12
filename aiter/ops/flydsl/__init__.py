@@ -122,10 +122,6 @@ _LAZY_IMPORTS = {
         ".gather_kv_b_proj",
         "gather_kv_b_proj_flydsl_fp8_supported",
     ),
-    "MiniMaxM3IndexScoreConfig": (
-        ".kernels.minimax_m3_index_score",
-        "IndexScoreConfig",
-    ),
     "minimax_m3_index_score_flydsl": (
         ".kernels.minimax_m3_index_score",
         "score_flydsl",
@@ -150,6 +146,16 @@ _LAZY_IMPORTS = {
         ".kernels.minimax_m3_index_score",
         "work_map_size",
     ),
+    "minimax_m3_index_score_prefill_flydsl": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "score_prefill_flydsl",
+    ),
+    # Its own, not the decode scorer's: prefill's output is
+    # [heads, total_q, max_block] and is sized from the ragged batch.
+    "minimax_m3_index_score_prefill_alloc": (
+        ".kernels.minimax_m3_index_score_prefill",
+        "alloc_score",
+    ),
 }
 
 __all__ = [
@@ -157,7 +163,6 @@ __all__ = [
     "FP8_MQA_LOGITS_VARIANTS",
     "Fp4MqaPlan",
     "GateMode",
-    "MiniMaxM3IndexScoreConfig",
     "QuickAllReduceInt4",
     "compute_varqlen_windows",
     "flydsl_conv_implicit",
@@ -188,6 +193,8 @@ __all__ = [
     "minimax_m3_index_score_alloc",
     "minimax_m3_index_score_flydsl",
     "minimax_m3_index_score_flydsl_supported",
+    "minimax_m3_index_score_prefill_alloc",
+    "minimax_m3_index_score_prefill_flydsl",
     "minimax_m3_index_score_work_map",
     "minimax_m3_index_score_work_map_capacity",
     "minimax_m3_index_score_work_map_size",
