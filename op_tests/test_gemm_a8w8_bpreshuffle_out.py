@@ -258,6 +258,50 @@ def test_bad_scale_rejected_before_launch(arg, bad):
     assert torch.all(out == 3.0)
 
 
+@pytest.mark.parametrize(
+    "arg,make",
+    [
+        pytest.param("XQ", lambda t: t.t().contiguous().t(), id="column-major-XQ"),
+        pytest.param(
+            "XQ", lambda t: torch.cat([t, t], 1)[:, : t.shape[1]], id="row-strided-XQ"
+        ),
+        pytest.param(
+            "WQ", lambda t: torch.cat([t, t], 1)[:, : t.shape[1]], id="row-strided-WQ"
+        ),
+    ],
+)
+def test_non_contiguous_operand_rejected_before_launch(arg, make):
+    # On the untuned CK path a column-major XQ or a row-strided WQ is misread.
+    m, n, k = 37, 1280, 512
+    args = dict(zip(("XQ", "WQ", "x_scale", "w_scale"), _inputs(m, n, k)))
+    args[arg] = make(args[arg])
+    out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+
+    with pytest.raises(ValueError, match="XQ and WQ must be contiguous"):
+        aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.all(out == 3.0)
+
+
+@pytest.mark.skipif(
+    torch.cuda.device_count() < 2, reason="requires two CUDA/HIP devices"
+)
+def test_non_current_device_rejected_before_launch():
+    # The launchers would use cuda:0's stream on cuda:1 tensors and fault.
+    m, n, k = 37, 1280, 512
+    with torch.cuda.device(1):
+        args = _inputs(m, n, k)
+        ref = aiter.gemm_a8w8_bpreshuffle(*args, None, dtypes.bf16)
+        out = torch.full((m, n), 3.0, dtype=dtypes.bf16, device="cuda")
+
+    with torch.cuda.device(0), pytest.raises(ValueError, match="is cuda:0"):
+        aiter.gemm_a8w8_bpreshuffle_out(out, *args)
+    assert torch.all(out == 3.0)
+
+    with torch.cuda.device(1):
+        aiter.gemm_a8w8_bpreshuffle_out(out, *args)
+        assert torch.equal(out, ref)
+
+
 def run_torch(xq, wq, x_scale, w_scale):
     # Reference only: fp32 math on the unshuffled weight, cast to bf16.
     x = xq.to(dtypes.fp32) * x_scale

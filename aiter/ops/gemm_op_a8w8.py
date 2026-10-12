@@ -835,13 +835,13 @@ def gemm_a8w8_bpreshuffle_out(
 ) -> None:
     """gemm_a8w8_bpreshuffle written into a caller-owned buffer.
 
-    XQ and WQ must be 2-D fp8, x_scale and w_scale contiguous fp32 with M and N
-    elements, all tensors must be on one CUDA/HIP device, and ``out`` must be a
-    contiguous bf16 [M, N] tensor. Only bf16 is accepted: the FlyDSL 8-wave
-    kernels, which many tuned rows select, write bf16 only. CK and CKTile write
-    a dense row-major [M, N], so a strided ``out`` (e.g. a column slice of a
-    wider buffer) is rejected instead of being written past its bounds. Every
-    check runs before any kernel launch.
+    XQ and WQ must be contiguous 2-D fp8, x_scale and w_scale contiguous fp32
+    with M and N elements, all tensors must be on the current CUDA/HIP device,
+    and ``out`` must be a contiguous bf16 [M, N] tensor. Only bf16 is accepted:
+    the FlyDSL 8-wave kernels, which many tuned rows select, write bf16 only.
+    CK and CKTile write a dense row-major [M, N], so a strided ``out`` (e.g. a
+    column slice of a wider buffer) is rejected instead of being written past
+    its bounds. Every check runs before any kernel launch.
     """
     # The dispatcher reads K from shape[-1] but the CK launcher reads size(1),
     # so any other rank would tune for one K and launch with another.
@@ -862,6 +862,12 @@ def gemm_a8w8_bpreshuffle_out(
             f"out={out.device}, XQ={XQ.device}, WQ={WQ.device}, "
             f"x_scale={x_scale.device}, w_scale={w_scale.device}"
         )
+    # The launchers use the current device's stream without a device guard.
+    if XQ.device.index != torch.cuda.current_device():
+        raise ValueError(
+            f"operands are on {XQ.device} but the current device is "
+            f"cuda:{torch.cuda.current_device()}; call under torch.cuda.device"
+        )
     if out.shape != (m, n) or not out.is_contiguous():
         raise ValueError(
             f"out must be a contiguous tensor of shape {(m, n)}; got shape "
@@ -870,6 +876,12 @@ def gemm_a8w8_bpreshuffle_out(
     if XQ.dtype != dtypes.fp8 or WQ.dtype != dtypes.fp8:
         raise ValueError(
             f"XQ and WQ must be {dtypes.fp8}; got XQ {XQ.dtype}, WQ {WQ.dtype}"
+        )
+    # CK and CKTile assume a unit column stride and misread a row-strided WQ.
+    if not XQ.is_contiguous() or not WQ.is_contiguous():
+        raise ValueError(
+            f"XQ and WQ must be contiguous; got XQ stride {tuple(XQ.stride())}, "
+            f"WQ stride {tuple(WQ.stride())}"
         )
     # Every backend reads the scales as dense fp32 through raw pointers.
     for name, scale, size in (("x_scale", x_scale, m), ("w_scale", w_scale, n)):
