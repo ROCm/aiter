@@ -121,7 +121,8 @@ STREAMS = 4
 # A floor, not the part's: the smallest arch this runs on, so taking it never admits a geometry
 # that does not fit. gfx950 holds 160 KB and a caller there should pass its own.
 DEFAULT_LDS_BYTES = 64 * 1024
-# Every index the kernels compute is int32, which caps the elements they can address.
+# Every index the kernels compute is int32, which caps the elements they can address. The same cap
+# keeps the split-K partials, stored through a buffer descriptor, inside its 32-bit byte offset.
 MAX_FLAT_ELEMENTS = 2**31 - 1
 
 

@@ -67,12 +67,18 @@ def _clone_inputs(args, kw):
     return tuple(clone(a) for a in args), {k: clone(v) for k, v in kw.items()}
 
 
-def _graph_us(op, args, kw, T, H, mode, replays=10):
+def _graph_us(op, args, kw, T, replays=10):
     """Per-call latency as an inference graph sees it: `calls` seams captured into one CUDA
     graph, replayed and timed with events. Unlike the profiler's summed kernel time this
     includes the idle gap between the two launches; host time is excluded either way."""
-    n_sets = max(1, min(16, -(-_ROTATE_BYTES // _traffic(T, H, mode))))
-    calls = 20 if T <= 4096 else 4
+    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+
+    per_set = sum(
+        v.nbytes for v in (*args, *kw.values()) if isinstance(v, torch.Tensor)
+    )
+    n_sets = ceildiv(_ROTATE_BYTES, per_set)
+    # Whole passes over the sets, so the wrap from one replay to the next revisits none early.
+    calls = n_sets * ceildiv(20 if T <= 4096 else 4, n_sets)
     sets = [(args, kw)] + [_clone_inputs(args, kw) for _ in range(n_sets - 1)]
     s = torch.cuda.Stream()
     s.wait_stream(torch.cuda.current_stream())
@@ -119,7 +125,7 @@ def test_mhc_seam(T, H, mode):
             continue
         # graph us: replayed CUDA graph, both launches and the gap between them;
         # kernel us: the profiler's summed kernel time of eager calls
-        ret[f"{name} graph us"] = _graph_us(op, args, kw, T, H, mode)
+        ret[f"{name} graph us"] = _graph_us(op, args, kw, T)
         out, us = run_perftest(op, *args, **kw)
         ret[f"{name} kernel us"] = us
         ret[f"{name} err"] = check_outputs(name, out, ref, "bf16", mode)

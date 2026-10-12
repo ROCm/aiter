@@ -125,7 +125,9 @@ def _stage_nt(T: int, H: int) -> bool:
 def _round_fill(grid: int, cu_num: int) -> float:
     """Fraction of the workgroup slots a grid's rounds keep busy, at one workgroup per CU; its
     last round decides it."""
-    return grid / (-(-grid // cu_num) * cu_num)
+    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+
+    return grid / (ceildiv(grid, cu_num) * cu_num)
 
 
 def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
@@ -143,6 +145,7 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
     * ``STAGE_NT`` from ``_stage_nt``: the staged collapse's round trip stays cached while it
       fits the last-level cache, whatever ``CACHE_NT`` says.
     """
+    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
     from aiter.ops.flydsl.kernels.mhc_seam import check_config, gate_step
 
     _require(arch in _GFX, f"unsupported arch {arch}", RuntimeError)
@@ -159,7 +162,7 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
     else:
         raise ValueError(f"[flydsl_mhc_seam] no legal tile for H={H}")
     chunks = H // cc
-    blocks = -(-T // bm)
+    blocks = ceildiv(T, bm)
     target = max(_SPLIT_TARGET_BLOCKS, blocks * _MAX_SPLITS)
     fitting = [
         s for s in range(1, chunks + 1) if chunks % s == 0 and blocks * s <= target
@@ -229,6 +232,10 @@ def flydsl_mhc_seam(
     )
     _require(fn.dtype == torch.float32, "fn must be fp32", TypeError)
     _require(fn.is_contiguous(), "fn must be contiguous")
+    _require(
+        k.PAD_ROWS * fn.shape[1] * fn.element_size() < 2**31,
+        "fn exceeds the 2 GiB buffer descriptor offset window",
+    )
     _require(
         hc_scale.shape == (3,) and hc_base.shape == (24,),
         "hc_scale (3,) and hc_base (24,)",
