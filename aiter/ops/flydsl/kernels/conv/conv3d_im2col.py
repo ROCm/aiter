@@ -10,7 +10,9 @@ from flydsl.expr import const_expr, range_constexpr
 
 from .conv3d_gfx950_utils import (
     BF16_BYTES,
+    KW_REUSE_STAGES,
     LDG_VEC,
+    LDS_BYTES_PER_CU,
     OOB_SENTINEL_BYTES,
     OOB_SENTINEL_ELEM,
     TileConfig,
@@ -78,6 +80,16 @@ class Im2colPlan(NamedTuple):
     big_in_nm: bool
     t_aligned: bool
 
+    # kW reuse: the KW taps of one (kt, kh, channel block) share a single LDS
+    # strip of input pixels, read back at a row shift of kw*dw. The strip
+    # holds the block's rows plus a halo per output-row segment; tile_m <= Wo
+    # keeps that to two segments. Only the boolean may follow the resolution;
+    # the strip sizes come from the filter and tile alone.
+    kw_reuse: bool
+    strip_halo: int
+    strip_rows: int
+    strip_ldg: int
+
 
 def make_im2col_plan(param, geom, cfg):
     """Im2colPlan, or an assertion about gather reach."""
@@ -131,6 +143,32 @@ def make_im2col_plan(param, geom, cfg):
             f"over N, or pass a narrower tile=(TILE_M, ...)."
         )
 
+    scalar_k = geom.cgp % tile_k == 0
+    kw_layer_ok = bool(
+        param.kw_reuse
+        and kw > 1
+        and sw == 1
+        and scalar_k
+        and pad_mode == "zeros"
+        and groups == 1
+        and param.splitk <= 1
+    )
+    strip_halo = (kw - 1) * dw if kw_layer_ok else 0
+    strip_rows = tile_m + 2 * strip_halo if kw_layer_ok else 0
+    strip_vecs = strip_rows * (tile_k // LDG_VEC)
+    strip_ldg = -(-strip_vecs // cfg.block_threads)
+    # The KW B tiles per stage can push LDS past what keeps the default path's
+    # blocks resident (128x192: 80 KB -> 96 KB, two blocks per CU -> one), and
+    # measured on the VAE layers that loses more than the cut L2 traffic buys.
+    reuse_lds = (
+        KW_REUSE_STAGES
+        * BF16_BYTES
+        * (strip_ldg * cfg.block_threads * LDG_VEC + kw * cfg.tile_n * tile_k)
+    )
+    base_lds = BF16_BYTES * (cfg.lds_a_elems + cfg.lds_b_elems)
+    keeps_occupancy = LDS_BYTES_PER_CU // reuse_lds >= LDS_BYTES_PER_CU // base_lds
+    kw_reuse = kw_layer_ok and keeps_occupancy and not big_in and wo >= tile_m
+
     return Im2colPlan(
         c=c,
         kh=kh,
@@ -167,12 +205,109 @@ def make_im2col_plan(param, geom, cfg):
         # A K tile that never straddles a channel boundary makes the channel and
         # the filter tap uniform across the tile, so they are hoisted per tile
         # rather than recomputed per tap.
-        scalar_k=geom.cgp % tile_k == 0,
+        scalar_k=scalar_k,
         big_in=big_in,
         big_in_n1=big_in_n1,
         big_in_nm=big_in_nm,
         t_aligned=t_aligned,
+        kw_reuse=kw_reuse,
+        strip_halo=strip_halo,
+        strip_rows=strip_rows,
+        strip_ldg=strip_ldg,
     )
+
+
+def strip_elems(plan):
+    """Elements of one LDS strip stage, padded to whole DMA rounds."""
+    return plan.strip_ldg * plan.cfg.block_threads * LDG_VEC
+
+
+class StripGather:
+    """kW-reuse gather: one LDS strip per (kt, kh, channel block).
+
+    Strip row r holds 32 channels of one input pixel. The block's GEMM rows
+    m = 0..tile_m-1 are consecutive output positions; they wrap to the next
+    output row at m_w = Wo - ow0 at most once (tile_m <= Wo). Segment 0 fills
+    strip rows [0, m_w + halo), segment 1 the rows after, so tap kw of row m
+    reads strip row s(m) + kw*dw with s(m) = m + halo * (m >= m_w).
+    """
+
+    def __init__(self, plan, x, ext):
+        assert plan.kw_reuse
+        self._plan = plan
+        self._ext = ext
+        self._x_src = flat_buffer_view(
+            fx.get_iter(x), ext.x_elems, _bytes_of(ext.x_elems)
+        )
+        self._m_w = None
+        self._vecs = None
+
+    def bind_block(self, tid, m_offset):
+        plan, ext, cfg = self._plan, self._ext, self._plan.cfg
+        halo = plan.strip_halo
+        m0 = fx.Int64(m_offset)
+        n0, rem = ext.div_dhw.divmod(m0)
+        ot0, rem = ext.div_hw_o.divmod(rem)
+        oh0, ow0 = ext.div_wo.divmod(rem)
+        m_w = fx.Int64(ext.wo) - ow0
+        m1 = m0 + m_w
+        n1, rem = ext.div_dhw.divmod(m1)
+        ot1, rem = ext.div_hw_o.divmod(rem)
+        oh1 = ext.div_wo.div(rem)
+        npq = fx.Int64(ext.npq)
+        exists0 = m0 < npq
+        exists1 = m1 < npq
+        r1 = m_w + fx.Int64(halo)
+        d, h, w = fx.Int64(ext.d), fx.Int64(ext.h), fx.Int64(ext.w)
+
+        vecs_per_row = cfg.tile_k // LDG_VEC
+        self._vecs = []
+        for i in range_constexpr(plan.strip_ldg):
+            v = fx.Int64(tid) + fx.Int64(i * cfg.block_threads)
+            r = v // vecs_per_row
+            q = v % vecs_per_row
+            seg1 = r >= r1
+            n = seg1.select(n1, n0)
+            ot = seg1.select(ot1, ot0)
+            oh = seg1.select(oh1, oh0)
+            iw = seg1.select(r - r1, ow0 + r) - fx.Int64(plan.pw)
+            it0 = ot * plan.st - plan.pt
+            ih0 = oh * plan.sh - plan.ph
+            base = (((n * d + it0) * h + ih0) * w + iw) * plan.c + q * LDG_VEC
+            ok = (
+                seg1.select(exists1, exists0)
+                & in_range(iw, w)
+                & (r < fx.Int64(plan.strip_rows))
+            )
+            self._vecs.append((base, ok, it0, ih0))
+        self._m_w = m_w
+
+    def taps(self, kt, kh, cc):
+        """Yield ``(i, src, voff)`` per strip vector of group (kt, kh, cc)."""
+        assert self._vecs is not None, "bind_block() before taps()"
+        plan, ext = self._plan, self._ext
+        t_off = dil(kt, plan.dt)
+        h_off = dil(kh, plan.dh)
+        delta = (fx.Int64(t_off) * fx.Int64(ext.h) + fx.Int64(h_off)) * fx.Int64(
+            ext.w
+        ) * plan.c + cc * plan.cfg.tile_k
+        for i in range_constexpr(plan.strip_ldg):
+            base, ok, it0, ih0 = self._vecs[i]
+            valid = gather_valid(
+                ok,
+                in_range(it0 + fx.Int64(t_off), ext.d),
+                in_range(ih0 + fx.Int64(h_off), ext.h),
+            )
+            yield i, self._x_src, valid.select(
+                fx.Int32(base + delta), fx.Int32(OOB_SENTINEL_ELEM)
+            )
+
+    def row_offset(self, m):
+        """Strip element offset of GEMM row ``m`` at tap kw = 0."""
+        halo = self._plan.strip_halo
+        m = fx.Int64(m)
+        s = m + (m >= self._m_w).select(fx.Int64(halo), fx.Int64(0))
+        return s * self._plan.cfg.tile_k
 
 
 class Im2colGather:

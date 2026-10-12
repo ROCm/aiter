@@ -39,7 +39,7 @@ from .conv3d_gfx950_utils import (
     unit_divisors,
     weight_bytes,
 )
-from .conv3d_im2col import Im2colGather, make_im2col_plan
+from .conv3d_im2col import Im2colGather, StripGather, make_im2col_plan, strip_elems
 
 
 @fx.struct
@@ -73,6 +73,8 @@ class Conv3dImplicitParam:
     out_ndhwc: fx.Constexpr[bool]
     # Runtime D/H/W; host still uses d/h/w to build geometry. Closure must not capture extents.
     dyn_hw: fx.Constexpr[bool]
+    # Request the kW-reuse A path; make_im2col_plan decides whether it applies.
+    kw_reuse: fx.Constexpr[bool]
 
 
 def make_conv3d_implicit_param(
@@ -102,6 +104,7 @@ def make_conv3d_implicit_param(
     groups=1,
     out_ndhwc=False,
     dyn_hw=False,
+    kw_reuse=False,
 ):
     """Defaults for ``Conv3dImplicitParam`` (fx.struct has none)."""
     return Conv3dImplicitParam(
@@ -131,6 +134,7 @@ def make_conv3d_implicit_param(
         groups=groups,
         out_ndhwc=out_ndhwc,
         dyn_hw=dyn_hw,
+        kw_reuse=kw_reuse,
     )
 
 
@@ -189,6 +193,7 @@ def _assert_shape_agnostic(param, cfg, kernel_grid, im2col_plan, scatter_plan, u
         param.groups,
         param.out_ndhwc,
         param.dyn_hw,
+        param.kw_reuse,
     )
     try:
         probe_geom = make_conv_geometry(probe)
@@ -277,7 +282,83 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         static_in_ext = static_input_extents(param)
 
     elem_ty = fx.BFloat16
-    SharedStorage = make_shared_storage(elem_ty, cfg)
+    if const_expr(im2col_plan.kw_reuse):
+        assert not grid.use_splitk, "kW reuse walks whole groups; split-K is ruled out"
+        STRIP_ELEMS = strip_elems(im2col_plan)
+        SharedStorage = make_shared_storage(elem_ty, cfg, STRIP_ELEMS, param.kw)
+        # One group = one (kt, kh, channel block); its KW taps share a strip.
+        N_CC = geom.cgp // cfg.tile_k
+        GROUPS = [
+            (kt_i, kh_i, cc)
+            for kt_i in range(param.kt)
+            for kh_i in range(param.kh)
+            for cc in range(N_CC)
+        ]
+    else:
+        SharedStorage = make_shared_storage(elem_ty, cfg)
+
+    def _body_kw_reuse(y, x, weight, bias, ext, grid_m):
+        KW, CGP = param.kw, geom.cgp
+        strip = StripGather(im2col_plan, x, ext)
+        weights = WeightLoader(cfg, kernel_grid, CRS, weight, W_BYTES)
+        scatter = OutputScatter(scatter_plan, y, bias, elem_ty, ext)
+        lds = fx.SharedAllocator(static=False).allocate(SharedStorage).peek()
+        tid = fx.Int32(gpu.thread_id("x"))
+        blk = block_coords(kernel_grid, grid_m)
+
+        mma = MmaTiling(cfg, elem_ty, tid, lds, scratch=y)
+        acc = mma.acc
+        strip.bind_block(tid, blk.m_offset)
+        weights.bind_block(tid, blk.n_offset, blk.n_local)
+        stager = LdsStager(cfg, elem_ty, tid)
+        a_offs = [strip.row_offset(row) + col for row, col in mma.a_rows()]
+
+        def b_stage(gs, kw_i):
+            return gs * KW + kw_i
+
+        def load_group(g, gs):
+            kt_i, kh_i, cc = GROUPS[g]
+            for i, src, voff in strip.taps(kt_i, kh_i, cc):
+                stager.copy(src, stager.dst(lds.a, gs * STRIP_ELEMS, i), voff)
+            for kw_i in range_constexpr(KW):
+                k_base = ((kt_i * param.kh + kh_i) * KW + kw_i) * CGP + cc * cfg.tile_k
+                b_tile = b_stage(gs, kw_i) * cfg.tile_n * cfg.tile_k
+                for i, src, voff in weights.taps(k_base):
+                    stager.copy(src, stager.dst(lds.b, b_tile, i), voff)
+
+        def read_tap(gs, kw_i):
+            a = mma.read_a_at(a_offs, gs * STRIP_ELEMS + kw_i * param.dw * cfg.tile_k)
+            b = mma.read_b(b_stage(gs, kw_i))
+            return a, b
+
+        load_group(0, 0)
+        for g in range_constexpr(len(GROUPS)):
+            gs = g % 2
+            # Group g has landed, and every wave is done reading stage gs ^ 1,
+            # which the DMA below overwrites.
+            barrier(vmcnt=0, lgkmcnt=0)
+            # All of this group's LDS reads are issued ahead of the next DMA;
+            # at most two taps' fragments are live at once.
+            pending = []
+            for kw_i in range_constexpr(KW):
+                pending.append(read_tap(gs, kw_i))
+                if const_expr(len(pending) == 2 and kw_i < KW - 1):
+                    a, b = pending.pop(0)
+                    acc = mma.compute(acc, a, b)
+            if const_expr(g + 1 < len(GROUPS)):
+                load_group(g + 1, (g + 1) % 2)
+                fx.rocdl.sched_vmem(im2col_plan.strip_ldg + KW * cfg.ldg_b_count)
+            for a, b in pending:
+                acc = mma.compute(acc, a, b)
+
+        scatter.store(
+            acc,
+            m_offset=blk.m_offset,
+            n_offset=blk.n_offset,
+            n_local=blk.n_local,
+            c_row=mma.c_row,
+            c_col=mma.c_col,
+        )
 
     def _body(y, x, weight, bias, ext, grid_m):
         # A's whole convolution: which input element each A vector taps, and
@@ -356,6 +437,8 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             c_col=mma.c_col,
         )
 
+    body = _body_kw_reuse if im2col_plan.kw_reuse else _body
+
     if const_expr(param.dyn_hw):
         # The extents arrive as scalars. FlyDSL binds kernel parameters by
         # name, so the fourteen are spelled out rather than packed behind a
@@ -398,7 +481,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
                 x_elems,
                 x_sample_elems,
             )
-            _body(y, x, weight, bias, dyn_extents(s, dyn_unit), s.grid_m)
+            body(y, x, weight, bias, dyn_extents(s, dyn_unit), s.grid_m)
 
         @flyc.jit
         def launch(
@@ -456,7 +539,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
         def conv3d_implicit_kernel(
             y: fx.Tensor, x: fx.Tensor, weight: fx.Tensor, bias: fx.Tensor
         ):
-            _body(y, x, weight, bias, static_extents(static_in_ext, geom), None)
+            body(y, x, weight, bias, static_extents(static_in_ext, geom), None)
 
         @flyc.jit
         def launch(

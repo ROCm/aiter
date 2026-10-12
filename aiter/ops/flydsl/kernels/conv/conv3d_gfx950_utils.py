@@ -179,6 +179,13 @@ TILES_PER_BARRIER = 2
 
 DEFAULT_TILE = (128, 128, 2, 4)
 
+# kW reuse double-buffers whole (kt, kh, channel block) groups.
+KW_REUSE_STAGES = 2
+
+# Per-CU LDS on gfx950, the only target of this kernel. Sizes how many blocks
+# an LDS footprint leaves resident.
+LDS_BYTES_PER_CU = 160 * 1024
+
 
 def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
     """Why this tile cannot compile, or None. Problem-shape asserts stay at use sites."""
@@ -313,13 +320,22 @@ class WeightLoader:
 # ---------------------------------------------------------------------------
 
 
-def make_shared_storage(elem_ty, cfg):
-    """The LDS struct one block allocates: ``pipe_stages`` tiles of A and of B."""
+def make_shared_storage(elem_ty, cfg, strip_stage_elems=0, kw=0):
+    """The LDS struct one block allocates.
+
+    Default: ``pipe_stages`` tiles of A and of B. kW reuse: two strip stages
+    for A and, per stage, the ``kw`` B tiles that strip feeds.
+    """
+    if strip_stage_elems:
+        a_elems = KW_REUSE_STAGES * strip_stage_elems
+        b_elems = KW_REUSE_STAGES * kw * cfg.tile_n * cfg.tile_k
+    else:
+        a_elems, b_elems = cfg.lds_a_elems, cfg.lds_b_elems
 
     @fx.struct
     class SharedStorage:
-        a: fx.Array[elem_ty, cfg.lds_a_elems, 16]
-        b: fx.Array[elem_ty, cfg.lds_b_elems, 16]
+        a: fx.Array[elem_ty, a_elems, 16]
+        b: fx.Array[elem_ty, b_elems, 16]
 
     return SharedStorage
 
@@ -386,6 +402,9 @@ class MmaTiling:
         ).get_slice(tid)
 
         self._a_lds, self._b_lds = lds.a, lds.b
+        self._lds_vec_ptr_ty = fx.PointerType.get(
+            elem_ty.ir_type, fx.AddressSpace.Shared, LDG_VEC * BF16_BYTES
+        )
         self._a_layout = fx.make_layout((cfg.tile_m, cfg.tile_k), (cfg.tile_k, 1))
         self._b_layout = fx.make_layout((cfg.tile_n, cfg.tile_k), (cfg.tile_k, 1))
 
@@ -422,6 +441,46 @@ class MmaTiling:
             self._thr_copy_a.retile(frag_a),
         )
         fx.rocdl.sched_dsrd(self._cfg.mi_m)
+        return frag_a
+
+    def a_rows(self):
+        """Per MFMA atom along M: (row, k offset) of this lane's A vector."""
+        cfg = self._cfg
+        rows = self._thr_mma.partition_A(
+            fx.make_view(0, fx.make_layout((cfg.tile_m, cfg.tile_k), (1, 0)))
+        )
+        cols = self._thr_mma.partition_A(
+            fx.make_view(0, fx.make_layout((cfg.tile_m, cfg.tile_k), (0, 1)))
+        )
+        return [
+            (
+                fx.Int64(fx.get_scalar(rows[LDG_VEC * mi])),
+                fx.Int64(fx.get_scalar(cols[LDG_VEC * mi])),
+            )
+            for mi in range_constexpr(cfg.mi_m)
+        ]
+
+    def read_a_at(self, lane_offs, const_off):
+        """Read A from LDS at per-lane element offsets, one per MFMA atom.
+
+        ``lane_offs[mi] + const_off`` is where this lane's 8-element vector of
+        atom ``mi`` starts in the A array; the address is the lane's own, so
+        the rows need not form an affine tile.
+        """
+        cfg = self._cfg
+        frag_a = self._thr_mma.make_fragment_A(
+            fx.make_view(self._a_lds.ptr, self._a_layout)
+        )
+        dst = self._thr_copy_a.retile(frag_a)
+        base = fx.Int64(fx.ptrtoint(self._a_lds.ptr))
+        for mi in range_constexpr(cfg.mi_m):
+            addr = base + (lane_offs[mi] + fx.Int64(const_off)) * fx.Int64(BF16_BYTES)
+            src = fx.make_view(
+                fx.inttoptr(self._lds_vec_ptr_ty, addr),
+                fx.make_layout((LDG_VEC, 1), (1, 0)),
+            )
+            fx.copy(self._lds_copy, src, dst[None, mi, 0])
+        fx.rocdl.sched_dsrd(cfg.mi_m)
         return frag_a
 
     def read_b(self, stage):

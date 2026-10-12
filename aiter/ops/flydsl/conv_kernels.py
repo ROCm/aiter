@@ -179,8 +179,11 @@ def _implicit_param_from_problem(
     out_ndhwc,
     pad_mode="zeros",
     dyn_hw=False,
+    kw_reuse=None,
 ):
     """Compile param for a caller-facing problem (unpadded ``C``)."""
+    if kw_reuse is None:
+        kw_reuse = bool(AITER_CONV3D_KW_REUSE)
     return make_conv3d_implicit_param(
         n,
         groups * _pad_channels(c // groups),
@@ -208,8 +211,13 @@ def _implicit_param_from_problem(
         groups,
         out_ndhwc,
         dyn_hw,
+        kw_reuse,
     )
 
+
+# Share one LDS strip across the kW taps of a (kt, kh, channel block) when the
+# layer allows it (see make_im2col_plan); part of the compile key.
+AITER_CONV3D_KW_REUSE = int(os.environ.get("AITER_CONV3D_KW_REUSE", "0"))
 
 # Runtime D/H/W so one artifact serves every resolution. Set 0 to compile per
 # size (tiny fixed-shape workloads). BIG_IN/BIG_OUT/M-chunking stay static.
