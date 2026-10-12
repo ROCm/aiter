@@ -46,6 +46,7 @@ import math as host_math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -67,11 +68,16 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
     exp2_f32,
     grouped_loader,
     make_lds_dma,
-    pack_mfma_frag,
     phase_barrier,
     swz_col,
 )
 
+# NOTE: these are read inside the traced kernel body. FlyDSL's disk cache keys
+# on the kernel function's source text and its closure values -- a module global
+# is NEITHER, so editing one here does NOT invalidate a cached binary and the
+# next run silently measures the old schedule. When tuning them, either
+# `rm -rf ~/.flydsl/cache` or set FLYDSL_RUNTIME_ENABLE_CACHE=0.
+#
 # Depth of the rolling LDS operand window, in operand groups.  The MFMA at group
 # `g` consumes the pack read at `g - PREFETCH_W`, so each read has
 # PREFETCH_W * KV_OWNED_SUBTILES MFMAs of cover.  The fp8 reference uses depth 2
@@ -432,6 +438,9 @@ def build_hstu_attention_bwd_dvdk_pp(
         c_neg_log2e = fx.Float32(-_LOG2E)
         c_one_f = fx.Float32(1.0)
         c_zero_f = fx.Float32(0.0)
+        # dS no longer carries 1/N (see gate_phase), so the dK store applies
+        # alpha/N in the one multiply it was already doing.
+        c_dk_scale = fx.Float32(alpha / max_seq_len)
         c_zero_v4f32 = Vec.filled(MFMA_ELEMS_PER_LANE, 0.0, fx.Float32).ir_value()
         c_zero_pack = Vec.filled(MFMA_LANE_K, 0.0, elem_dtype).ir_value()
 
@@ -566,6 +575,34 @@ def build_hstu_attention_bwd_dvdk_pp(
             )
             view = do_views[rm_slot]
             return view[q_row, col // fx.Int32(MFMA_DA_LANE_K), None].load().ir_value()
+
+        def pack_bf16_perm(vals):
+            """Pack 4 fp32 lane values into a bf16 MFMA operand in 2 `v_perm_b32`.
+
+            `pack_mfma_frag` spends shift+and+or per pair (3 VALU x 2 pairs = 6).
+            `v_perm_b32` selects 4 arbitrary bytes out of the {src0, src1} pair
+            in one instruction, and bf16 truncation IS a byte selection: the
+            high halves of the two f32s, i.e. bytes 7,6 and 3,2. Bit-for-bit the
+            same result as the shift/mask path -- gfx942 has no
+            `v_cvt_pk_bf16_f32` (CDNA4 only), so this is the cheapest form.
+            """
+            sel = fx.Int32(0x07060302)
+            words = []
+            for i in range_constexpr(MFMA_ELEMS_PER_LANE // 2):
+                lo = fx.Float32(vals[2 * i]).bitcast(fx.Int32)
+                hi = fx.Float32(vals[2 * i + 1]).bitcast(fx.Int32)
+                words.append(
+                    fx.Int32(
+                        llvm.call_intrinsic(
+                            fx.Int32.ir_type,
+                            "llvm.amdgcn.perm",
+                            [hi.ir_value(), lo.ir_value(), sel.ir_value()],
+                            [],
+                            [],
+                        )
+                    )
+                )
+            return Vec.from_elements(words, fx.Int32).bitcast(elem_dtype).ir_value()
 
         def keep_masks(q_start, og):
             q_base = q_start + lane_div_16 * fx.Int32(MFMA_LANE_K)
@@ -707,17 +744,24 @@ def build_hstu_attention_bwd_dvdk_pp(
                 emu = [exp2_f32(sc[j] * c_neg_log2e) for j in rng]
                 sig = [c_one_f / (c_one_f + emu[j]) for j in rng]
                 silu = [sc[j] * sig[j] for j in rng]
-                grad = [sig[j] * (c_one_f + sc[j] * (c_one_f - sig[j])) for j in rng]
-                gated = [c_inv_n * grad[j] * da[j] for j in rng]
+                # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
+                # The second form is a subtract plus an FMA, against the first
+                # form's sub/mul/add/mul -- 2 VALU per element instead of 4, and
+                # it reuses `silu`, which is already live.
+                grad = [sig[j] + silu[j] * (c_one_f - sig[j]) for j in rng]
+                # No `c_inv_n` here: dS is linear in it, so it rides along to the
+                # dK epilogue and is folded into that store's existing scale.
+                # Saves one multiply per element.
+                gated = [grad[j] * da[j] for j in rng]
                 p_vals = [flat_keep[j].select(silu[j], c_zero_f) for j in rng]
                 ds_vals = [flat_keep[j].select(gated[j], c_zero_f) for j in rng]
             e = MFMA_ELEMS_PER_LANE
             p_packs = [
-                pack_mfma_frag(p_vals[og * e : og * e + e], is_bf16, elem_dtype)
+                pack_bf16_perm(p_vals[og * e : og * e + e])
                 for og in range_constexpr(KV_OWNED_SUBTILES)
             ]
             ds_packs = [
-                pack_mfma_frag(ds_vals[og * e : og * e + e], is_bf16, elem_dtype)
+                pack_bf16_perm(ds_vals[og * e : og * e + e])
                 for og in range_constexpr(KV_OWNED_SUBTILES)
             ]
             return p_packs, ds_packs
@@ -816,7 +860,7 @@ def build_hstu_attention_bwd_dvdk_pp(
                             for c in range_constexpr(HC_CHUNKS):
                                 ov = results[N_ACC_DV + c * KV_OWNED_SUBTILES + og]
                                 col = fx.Int32(c * MFMA_M) + lane_mod_16
-                                val = (Vec(ov)[e] * c_alpha).to(elem_dtype)
+                                val = (Vec(ov)[e] * c_dk_scale).to(elem_dtype)
                                 out_dk[
                                     fx.Int64(seq_start + kv_row_e), head_idx, col
                                 ] = val
