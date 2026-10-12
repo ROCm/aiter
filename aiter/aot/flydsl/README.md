@@ -30,7 +30,11 @@ need no AOT change.
 
 - Each row is replayed at its tuned token count and at the smallest M that
   `get_padded_M` maps to it, because some compile-time parameters follow the
-  actual M. `--row-tokens-only` replays the tuned count only.
+  actual M. Where the two request different FlyDSL kernels, the replay bisects
+  the M between them down to every M at which the runtime switches kernels,
+  since a row can switch more than once in its bucket (e.g. the gfx1250
+  stage-1 quant's K split). These extra replays are reported as `[BISECT]`.
+  `--row-tokens-only` replays the tuned count only.
 - Caller-side choices a row does not fix are enumerated: expert bias where the
   quant family supports it (on both stages, and on stage 1 alone, since a
   stage-2 bias makes the runtime re-select configs whose stage 2 cannot take

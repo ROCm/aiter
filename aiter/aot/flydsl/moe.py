@@ -20,7 +20,10 @@ layout, SiTUv2 betas).
 
 A row tuned at token count T also serves smaller M that ``get_padded_M`` maps
 to T, and some compile-time parameters follow the actual M, so each row is
-replayed at the smallest such M as well as at T.
+replayed at the smallest such M as well as at T. Where those two request
+different kernels, the M between them are bisected down to every M at which
+the runtime switches kernels: a row can switch more than once in its bucket
+(the gfx1250 stage-1 quant's K split steps through several values).
 
 aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so the
 replay runs in one process per target arch, with the GPUs hidden and
@@ -493,11 +496,64 @@ def _load_host_helpers(arch: str, cu_num: int) -> None:
         _mxfp4_moe_sort_internal_is_supported(256, 8, 7168, 32, True)
 
 
+@contextmanager
+def _requested_kernels():
+    """Collect the cache identity of every FlyDSL launch a replay reaches."""
+    from flydsl.compiler.jit_function import JitFunction
+
+    kernels = set()
+    build_key = JitFunction._build_full_cache_key
+
+    def record(self, *args, **kwargs):
+        key = build_key(self, *args, **kwargs)
+        kernels.add((self.manager_key, key))
+        return key
+
+    with mock.patch.object(JitFunction, "_build_full_cache_key", record):
+        yield kernels
+
+
+def _replay_recorded(job: dict) -> tuple[dict, frozenset | None]:
+    with _requested_kernels() as kernels:
+        result = compile_one_config(**job)
+    return result, (None if result["compile_time"] is None else frozenset(kernels))
+
+
+def _bisect(job: dict, kernels: dict, low: int, high: int) -> list[dict]:
+    """Replay the M between ``low`` and ``high`` at which the requested kernels
+    change. Each choice the runtime makes from M is monotonic, so two M that
+    request the same kernels bound a run that requests nothing else."""
+    if high - low < 2 or kernels[low] == kernels[high]:
+        return []
+    middle = (low + high) // 2
+    result, kernels[middle] = _replay_recorded({**job, "m": middle})
+    if kernels[middle] is None:
+        return [result]
+    return [
+        result,
+        *_bisect(job, kernels, low, middle),
+        *_bisect(job, kernels, middle, high),
+    ]
+
+
 def _replay_batch(jobs: list[dict], kernel_name: str) -> dict:
+    """Replay the jobs, then bisect each variant's bucket where its two token
+    counts request different kernels: a row can switch kernels more than once
+    inside its bucket."""
+    results, probes, variants = [], [], {}
+    for job in jobs:
+        result, kernels = _replay_recorded(job)
+        results.append(result)
+        variant = tuple(sorted((k, v) for k, v in job.items() if k != "m"))
+        variants.setdefault(variant, (job, {}))[1][job["m"]] = kernels
+    for job, kernels in variants.values():
+        if len(kernels) == 2 and None not in kernels.values():
+            probes += _bisect(job, kernels, *sorted(kernels))
     return {
         "kernel_name": kernel_name,
         "compile_time": 0.0,
-        "results": [compile_one_config(**job) for job in jobs],
+        "results": results,
+        "probes": probes,
     }
 
 
@@ -533,10 +589,11 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
         _replay_batch,
         [{"jobs": batch, "kernel_name": batch[0]["kernel_name"]} for batch in batches],
     )
-    results = []
+    results, probes = [], []
     for batch, outcome in zip(batches, outcomes):
         # A worker that died takes its whole batch with it.
         results += outcome.get("results") or [{"compile_time": None}] * len(batch)
+        probes += outcome.get("probes") or []
     failed = sum(1 for r in results if r["compile_time"] is None)
     rejected = Counter(r["unsupported"] for r in results if r.get("unsupported"))
     unsupported = sum(rejected.values())
@@ -547,7 +604,14 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
     )
     for reason, count in rejected.most_common():
         print(f"  [SKIP] {count} x {reason}", flush=True)
-    return failed
+    probes_failed = sum(1 for r in probes if r["compile_time"] is None)
+    if probes:
+        print(
+            f"  [BISECT] {len(probes)} token counts inside buckets, "
+            f"{probes_failed} failed",
+            flush=True,
+        )
+    return failed + probes_failed
 
 
 def _arch_env(arch: str, workers: int) -> dict:
