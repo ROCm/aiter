@@ -401,9 +401,17 @@ def get_flydsl_stage2_v2_kernels(
     for tm in bms:
         for tn in tile_ns:
             for tk in tile_ks:
-                for epilog in ("atomic", "reduce"):
+                epilogs = (
+                    ("atomic", "reduce", "scatter")
+                    if tm == 128
+                    else ("atomic", "reduce")
+                )
+                for epilog in epilogs:
+                    if epilog == "scatter" and out_dtype != "bf16":
+                        continue
                     for use_nt in (True, False):
-                        for persist in persists:
+                        epilog_persists = (False,) if epilog == "scatter" else persists
+                        for persist in epilog_persists:
                             name = build_flydslv2_gemm2_name(
                                 a_dtype,
                                 b_dtype,

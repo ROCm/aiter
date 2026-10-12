@@ -33,7 +33,7 @@ configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 | ----------- | ----------------------------------------------------------- |
 | `<arch>`    | `gfx942`, `gfx950`, `gfx1100`, `gfx1101`, `gfx1150`, `gfx1151`, `gfx1200`, `gfx1201`, `gfx1250` |
 | `<backend>` | `triton` or `gluon`                                          |
-| `<op>`      | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`  |
+| `<op>`      | `gemm`, `moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions`, `quant` |
 | `<d_type>`  | `config_name.lower().replace("-", "_")` — `GEMM-AFP4WFP4` → `gemm_afp4wfp4`. The transform is `config_utils._dtype_dir()` |
 | filename    | **no arch prefix** — the arch is the directory. The default is literally `DEFAULT.json`; specialized files keep the `<CONFIG_NAME>-` stem |
 
@@ -123,6 +123,13 @@ selects the smallest numeric upper bound containing `value`, then falls back
 to `fallback_key`. It returns a shallow copy so callers may consume the flat
 config without mutating the cached table.
 
+For tables keyed on several axes, pass `axes=("M", "N")` and one keyword value
+per axis, for example `select_leq_config(table, axes=("M", "N"), M=m, N=n)`.
+A key joins one `<axis>_LEQ_<n>` or `<axis>_GEQ_<n>` part per constrained axis
+with `.`, for example `M_LEQ_32.N_LEQ_1024`. Per axis, in `axes` order
+(leftmost wins ties), the lookup tries LEQ bounds ascending, then GEQ bounds
+descending, then `any`. The `any` key is required.
+
 ---
 
 ## 3. Loader modules
@@ -140,6 +147,7 @@ exactly one home; there is no facade or re-export layer.
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config`, `hip_post_dispatch_block` | `<arch>/triton/mhc/<d_type>/` (gfx942 fallback) |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` | `<arch>/<backend>/moe/<d_type>/` |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config` | `<arch>/<backend>/<op>/<d_type>/DEFAULT.json` |
+| `utils/quant_config_utils.py` | `get_quant_config` | `<arch>/gluon/quant/<d_type>/DEFAULT.json` |
 
 Attention and GMM kernels have no family module: they call
 `resolve_config_dir()` + `load_config_json()` directly from their kernel file,
@@ -409,7 +417,8 @@ MOE dispatch, the `fallback` tile for `get_tuned_kernel_config()`. Where that
 is not acceptable, seed the directory with a **byte-identical copy** from the
 closest measured arch and say so in the commit message.
 
-The one seeding rule currently in force: **gfx950 → gfx1250, triton only.**
+The seeding rules currently in force: **gfx950 → gfx1250, triton only**, and
+**gfx1151 → gfx1150, triton only**.
 Never seed a gluon directory from another arch (gluon configs carry
 arch-specific tile and buffer counts), and never seed backwards into gfx950.
 A seed is a placeholder that unblocks the caller-declared backend policy — it
