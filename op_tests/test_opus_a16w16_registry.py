@@ -3,10 +3,10 @@
 """CPU-only coverage for OPUS split-barrier cache-policy registrations."""
 
 import ast
-from dataclasses import replace
-from pathlib import Path
 import sys
 import unittest
+from dataclasses import replace
+from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
