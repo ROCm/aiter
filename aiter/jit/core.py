@@ -430,7 +430,9 @@ class AITER_CONFIG:
             "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
 
-    def update_config_files(self, file_path: str, merge_name: str):
+    def update_config_files(
+        self, file_path: str, merge_name: str, env_name: str | None = None
+    ):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
@@ -507,12 +509,22 @@ class AITER_CONFIG:
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())
                 dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+                dup_header = (
+                    f"Found {dup_count} duplicate shape entries during merge of "
+                    f"'{merge_name}' (dedup key: {dedup_keys}).\n"
+                )
+                env_hint = (
+                    f"To use only specific tables, set {env_name or 'the matching AITER_CONFIG_* env var'} "
+                    f"to their paths, separated by '{os.pathsep}'; this also skips the "
+                    f"model_configs/ scan.\n"
+                )
                 if "us" not in merge_df.columns:
                     raise RuntimeError(
-                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                        f"No 'us' column to determine best performing entry. "
-                        f"Please remove duplicates manually.\n"
-                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+                        dup_header
+                        + "No 'us' column to determine best performing entry. "
+                        "Please remove duplicates manually.\n"
+                        + env_hint
+                        + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
                     )
 
                 # Auto-dedup: globally determine best row (lowest 'us') per shape
@@ -540,10 +552,14 @@ class AITER_CONFIG:
                     "\n".join(saved_files) if saved_files else "  (no files updated)"
                 )
                 raise RuntimeError(
-                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+                    dup_header
+                    + "Auto-resolved by keeping best performing (lowest 'us') for each "
+                    "key and saved back to source config files.\n"
+                    "In a source checkout, re-run and commit the updated files. "
+                    "In an installed package or container the rewritten files may not "
+                    "persist, so re-running can hit the same duplicates.\n"
+                    + env_hint
+                    + f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
                     f"Updated files:\n{saved_info}"
                 )
         else:
@@ -586,14 +602,19 @@ class AITER_CONFIG:
             if not op_tuned_file_list:
                 config_file = default_file
             else:
-                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
-                tuned_files = default_file + ":" + tuned_files
+                tuned_files = os.pathsep.join(
+                    [default_file] + [str(p) for p in op_tuned_file_list]
+                )
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
-                config_file = self.update_config_files(tuned_files, tuned_file_name)
+                config_file = self.update_config_files(
+                    tuned_files, tuned_file_name, env_name
+                )
         else:
-            config_file = self.update_config_files(config_env_file, tuned_file_name)
+            config_file = self.update_config_files(
+                config_env_file, tuned_file_name, env_name
+            )
             # print(f"get config file from environment ", config_file)
         return config_file
 

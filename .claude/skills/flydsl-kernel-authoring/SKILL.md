@@ -12,24 +12,16 @@ allowed-tools: Read Edit Bash Grep Glob Agent
 
 ## Overview
 
-FlyDSL is a Python DSL and MLIR-based compiler for writing high-performance GPU kernels on AMD GPUs (MI300X/MI350). It provides explicit layout algebra for controlling data movement, tiling, and memory access patterns. The layout system is the core abstraction that distinguishes FlyDSL from Triton/Gluon.
+FlyDSL is a Python DSL and MLIR-based compiler for writing AMD GPU kernels. It provides explicit layout algebra for controlling data movement, tiling, and memory access patterns.
 
-**Repository**: `/FlyDSL/` (installed in editable mode)
-**Target GPU**: gfx942 (MI300X, CDNA3), gfx950 (MI350, CDNA4)
-**Python**: 3.12, ROCm 7.2
+**Aiter dependency**: check `requirements.txt` first (`flydsl==0.3.4.1` as of this update). Use `python -c 'import flydsl; print(flydsl.__file__)'` to find the imported package; an editable checkout may differ from the pinned wheel.
+**Targets in aiter**: gfx942 (CDNA3), gfx950 (CDNA4), and gfx1250 (wave32). Check the chosen operation on the target architecture; not every `fx.rocdl` wrapper supports all three.
 
-**Scope (read this first)**: This skill is the **reference** — the full layout-algebra API
-surface, per-op tables, MFMA/copy-atom catalogs, environment variables, and an exhaustive
-troubleshooting list. Reach for it to *look something up* while writing or reviewing kernel
-code. If instead you want a *guided, step-by-step procedure* that turns a kernel requirement
-into a finished, tested kernel (classify -> skeleton -> compute -> control flow -> test), use
-the **flydsl-tile-programming** skill, which is the wizard companion to this reference. For
-diagnosing a kernel that already compiles but produces NaN/inf/wrong results, use the
-**debug-flydsl-kernel** skill. When modernizing or cleaning up an *existing* kernel —
-replacing legacy/deprecated constructs (`ArithValue`, `fx.Index`, `buffer_ops`, raw
-MLIR dialects, `SmemPtr`, per-tile `*_atom_call`, raw `rocdl.mfma_*`) with the current
-`fx.*` surface, trimming comments/dead code, or applying the `_run_compiled` fast launch
-path — use the **flydsl-kernel-code-cleanup** skill.
+**Scope (read this first)**: This skill is the authoring reference for aiter's
+pinned FlyDSL API. For migration of an existing kernel from raw dialects,
+`ArithValue`, `buffer_ops`, or `SmemPtr`, use the in-tree
+**flydsl-kernel-code-cleanup** skill. Keep `fx.Index` where an API requires MLIR
+`index`; it is not a blanket migration target.
 
 ---
 
@@ -57,12 +49,11 @@ Pipeline is built by `RocmBackend._pipeline_parts()` and split into three stages
 - `python/flydsl/expr/` - DSL expression API (primitive.py, derived.py, typing.py)
 - `python/flydsl/expr/primitive.py` - All layout algebra functions
 - `python/flydsl/expr/derived.py` - CopyAtom, MmaAtom, TiledCopy, TiledMma wrappers
-- `python/flydsl/expr/gpu.py` - GPU operations (thread_idx, block_idx, barrier)
-- `python/flydsl/expr/buffer_ops.py` - AMD buffer load/store intrinsics
+- `python/flydsl/expr/gpu.py` - typed `thread_idx`/`block_idx`, raw `thread_id`/`block_id`, `barrier`, and `SharedAllocator`
+- `python/flydsl/expr/llvm.py` and `expr/rocdl/universal.py` - typed memory operations and buffer-resource views
 - `python/flydsl/expr/rocdl/` - MFMA/WMMA and other ROCm intrinsics (package: cdna4, cluster, inline_asm, tdm_ops, universal)
-- `python/flydsl/expr/gpu.py` - `SharedAllocator` for LDS (shared memory), `thread_id`/`block_id`, `barrier`
 - `python/flydsl/utils/smem_allocator.py` - legacy `SmemAllocator` (un-migrated kernels only)
-- `kernels/` - Pre-built kernels, organized into subpackages: `gemm/` (preshuffle_gemm.py, mxfp4_preshuffle.py, ...), `norm/` (layernorm/softmax/rmsnorm), `attention/`, `moe/`, `mma/`, `common/`, `comm/`, `conv/`
+- `aiter/ops/flydsl/kernels/` - aiter's kernel examples and its legacy `buffer_ops.py` compatibility layer
 
 ---
 
@@ -176,7 +167,6 @@ fx.slice(src, coord)                       # Slice at coordinate (None = keep mo
 ```python
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 
 @flyc.kernel
 def my_kernel(
@@ -184,8 +174,8 @@ def my_kernel(
     B: fx.Tensor,
     N: fx.Constexpr[int], # Compile-time constant
 ):
-    tid = gpu.thread_id("x")
-    bid = gpu.block_id("x")
+    tid = fx.thread_idx.x  # fx.Int32
+    bid = fx.block_idx.x   # fx.Int32
     # ... kernel body ...
 
 @flyc.jit
@@ -208,14 +198,15 @@ launch(A, B, 1024)
 
 ### Current Syntax Quick Reference
 
-Use the current public FlyDSL surface from `kernels/gemm/preshuffle_gemm.py` when writing new kernels:
+Use the public FlyDSL surface and aiter's
+`aiter/ops/flydsl/kernels/preshuffle_gemm.py` when writing new kernels:
 
 ```python
 Vec = fx.Vector
 
-tx = gpu.thread_id("x")
-bx = gpu.block_id("x")
-by = gpu.block_id("y")
+tx = fx.thread_idx.x
+bx = fx.block_idx.x
+by = fx.block_idx.y
 
 i32_m: fx.Int32
 c_m = fx.Int64(i32_m)
@@ -233,10 +224,15 @@ elem0 = v_i64[0]
 
 buf = fx.rocdl.make_buffer_tensor(tensor)          # preferred buffer-resource view
 tA  = fx.make_view(fx.get_iter(buf), fx.make_layout((M, N), (N, 1)))
-# load/store tA via copy atoms (fx.copy_atom_call); raw buffer_ops is legacy
+# load/store tA via copy atoms (`fx.copy` when the operands are supported)
 ```
 
-Older code may use `gpu.thread_idx.x`, `gpu.block_idx.x`, `arith.constant(...)`, `T.i32`, raw `vector.*` helpers, the `ArithValue` wrapper, and `buffer_ops`. Keep those when editing existing code that already uses them heavily, but prefer `gpu.thread_id/block_id`, `fx.Int64`/`fx.Int32`/`fx.Float32`, `fx.Vector`, and `fx.rocdl.make_buffer_tensor` for new code. `ArithValue`, `fx.Index`, and `buffer_ops` are deprecated/legacy — for migrating an existing kernel see the **flydsl-kernel-code-cleanup** skill.
+`fx.thread_idx`/`fx.block_idx` and `gpu.thread_idx`/`gpu.block_idx` are
+the same typed accessors. `gpu.thread_id("x")` and `gpu.block_id("x")` are
+available lower-level calls returning raw MLIR values; wrap them with
+`fx.Int32(...)` before typed arithmetic. `fx.Index` remains necessary at APIs
+whose contract is MLIR `index`. For migrating `ArithValue`, raw `vector.*`,
+and `buffer_ops`, see the **flydsl-kernel-code-cleanup** skill.
 
 ### Parameter Types
 | Type | Description | At host boundary |
@@ -248,15 +244,18 @@ Older code may use `gpu.thread_idx.x`, `gpu.block_idx.x`, `arith.constant(...)`,
 
 ### Thread/Block Hierarchy
 ```python
+import flydsl.expr as fx
 from flydsl.expr import gpu
 
-tid_x = gpu.thread_id("x")   # Preferred current spelling
-bid_x = gpu.block_id("x")
-bid_y = gpu.block_id("y")
+tid_x = fx.thread_idx.x       # fx.Int32; preferred for typed arithmetic
+bid_x = fx.block_idx.x        # fx.Int32
+bid_y = fx.block_idx.y
 
-# Legacy spelling still appears in older kernels:
-tid_x = gpu.thread_idx.x
-bid_x = gpu.block_idx.x
+# `gpu.thread_idx.x` / `gpu.block_idx.x` are equivalent typed accessors.
+# Direct calls are lower-level and return raw MLIR values:
+raw_tid_x = gpu.thread_id("x")
+raw_bid_x = gpu.block_id("x")
+tid_x = fx.Int32(raw_tid_x)   # if a direct call is needed
 
 gpu.barrier()                # Workgroup synchronization
 ```
@@ -279,10 +278,10 @@ for i in range(runtime_value):
 Use Python/DSL operators for runtime SSA comparisons. The AST rewriter lowers dynamic `if` conditions to `scf.IfOp`, and comparison operators like `==`, `<`, `>=` generate the needed MLIR predicates.
 
 ```python
-tid = gpu.thread_id("x")
-lane = tid % fx.Int64(64)
-c_zero = fx.Int64(0)
-c_limit = fx.Int64(8)
+tid = fx.thread_idx.x
+lane = tid % fx.Int32(64)
+c_zero = fx.Int32(0)
+c_limit = fx.Int32(8)
 
 # Preferred: readable DSL comparisons
 if lane == c_zero:
@@ -318,15 +317,18 @@ if lane == c_zero:
 ```
 
 ### Frontend Semantic Restrictions
-When writing or reviewing `@flyc.kernel` / `@flyc.jit` code, proactively avoid these patterns because they can conflict with MLIR construction even if they look valid in plain Python.
+When writing or reviewing `@flyc.kernel` / `@flyc.jit` code, check these
+frontend contracts rather than applying ordinary Python control-flow rules.
 
-1. **Do not define values inside `if/else` and use them later outside the branch.** Keep a single explicit definition path.
+1. **Runtime branches can carry values out.** Initialize a value before the
+   branch when the rewriter must carry it through both paths, and keep the
+   resulting types consistent. A branch-local value with no use outside needs
+   no carried state.
    ```python
+   dst = a
    if cond:
-       dst = a
-   else:
        dst = b
-   use(dst)  # avoid this pattern
+   use(dst)
    ```
 
 2. **Do not mutate captured outer variables inside nested helper functions.** Read-only closure capture is acceptable, but writes should go through explicit parameters and return values.
@@ -352,7 +354,10 @@ When writing or reviewing `@flyc.kernel` / `@flyc.jit` code, proactively avoid t
 
 4. **Compile-time conditions must use `const_expr(...)`.** Use `if const_expr(flag): ...` for constexpr flags and other static decisions. A plain Python `if` is only safe when the condition is already a Python `bool`.
 
-5. **Runtime branches inside helper functions should be dispatched via local `@flyc.jit`.** When a branch body has side effects, loop-carried values, or branch-local definitions, split the branch bodies into local helpers and wrap the `if` in a local JIT helper:
+5. **Plain helpers outside a rewritten body need `@flyc.jit` for runtime
+   branches.** A runtime `if` already inside a `@flyc.kernel` or `@flyc.jit`
+   body is rewritten; do not add a second decorator just for that branch.
+   For a separate helper that needs AST rewriting, use the public decorator:
    ```python
    def then_path():
        ...
@@ -381,7 +386,7 @@ tile_0 = prefetch(0)
 init_state = [acc_init, tile_0_flat_val1, tile_0_flat_val2, ...]
 
 # Runtime loop with loop-carried state
-# Use typed DSL integer bounds (fx.Int64) so the AST rewriter does not treat this as a Python unrolled range.
+# `init=` selects a runtime scf.for even with Python integer bounds.
 _start = fx.Int64(0)
 _stop = fx.Int64(N - 1)
 _step = fx.Int64(1)
@@ -410,7 +415,12 @@ compute(acc_final, tile_final)
 
 **Three critical pitfalls (all verified by debugging):**
 
-1. **Loop bounds must be a typed DSL integer such as `fx.Int64(...)`, NOT a plain Python int.** A plain int makes the AST rewriter unroll the loop and silently ignore `init=`. If you write `range(0, 15, 1, init=...)`, the AST rewriter treats the constant bounds as a Python `range` and unrolls; only plain Python-int bounds are unrolled, so a typed bound still produces a runtime `scf.for`. Use `fx.Int64(0)`, `fx.Int64(15)`, `fx.Int64(1)` instead.
+1. **`init=` selects the explicit-carried-state `scf.for` path.** Python-int
+   bounds are accepted and converted to MLIR `index`; they do not make this
+   loop unroll or discard `init`. Typed bounds also work here. For a loop
+   without `init`, the automatic-carried-state path expects `i32` bounds
+   (`index` is cast to `i32`; `i64` is rejected). Use `range_constexpr` to
+   request Python unrolling.
 
 2. **Prefer internal types, but unwrap at hard boundaries.** Most `range(..., init=...)` uses accept DSL numeric/vector values. If a lower-level helper explicitly expects raw `ir.Value`, unwrap with `v.ir_value()` / `_raw(v)` at that boundary only.
 
@@ -460,7 +470,7 @@ result = (val * scale_a) * scale_b
 zeros = Vec.filled(N, 0.0, fx.Float32)
 
 # Index cast — use fx.Int32 instead of arith.index_cast
-idx = fx.Int32(gpu.block_id("x") * tile_m)
+idx = fx.block_idx.x * tile_m
 ```
 
 **Prefer internal types over raw ops:**
@@ -484,8 +494,8 @@ Use `Vec.filled(...)` for splats and `Vec.from_elements(...)` for vectors from s
 | Max | `a.maximumf(b)` | Yes | Good for ReLU |
 | Compare | `a < b`, `a == b`, `a > b` | Yes | Boolean result (i1 / vec<i1>) |
 | Select | `cond.select(t, f)` | Yes | |
-| Abs | no direct helper | Use `-v`, comparison, and `cond.select(...)` |
-| FMA | `a * b + c` | Yes | Use direct FOp only when explicit fastmath is needed |
+| Abs | `fx.absf(v)` | Yes | Check signed-zero/NaN behavior before replacing a hand-written select |
+| FMA | `fx.fma(a, b, c)` | Yes | Fused rounding; `a * b + c` may round twice |
 | Splat const | `Vec.filled(width, val, dtype)` | Creates vector | For scalar broadcast |
 
 ### Printf Debugging
@@ -524,9 +534,9 @@ def my_kernel(A: fx.Tensor, B: fx.Tensor, BLOCK_DIM: fx.Constexpr[int]):
     rA = fx.make_rmem_tensor(1, fx.Float32)
 
     # 5. Copy: global -> register -> compute -> global
-    fx.copy_atom_call(copyAtom, fx.slice(tA, (None, tid)), rA)
+    fx.copy(copyAtom, fx.slice(tA, (None, tid)), rA)
     # ... compute on register values ...
-    fx.copy_atom_call(copyAtom, rA, fx.slice(tB, (None, tid)))
+    fx.copy(copyAtom, rA, fx.slice(tB, (None, tid)))
 ```
 
 ### Vectorized Loads (Wide Copies)
@@ -539,7 +549,7 @@ rA = fx.make_rmem_tensor(VEC_WIDTH, fx.Float32)
 
 # Divide for VEC_WIDTH elements per thread
 tA = fx.logical_divide(tA, fx.make_layout(VEC_WIDTH, 1))
-fx.copy_atom_call(copyAtom, fx.slice(tA, (None, tid)), rA)
+fx.copy(copyAtom, fx.slice(tA, (None, tid)), rA)
 
 # Load/store as vectors
 vec = fx.memref_load_vec(rA)     # Load vector from register memref
@@ -555,10 +565,9 @@ val_layout = fx.make_layout((1, 8), (1, 1))    # 8 values per thread
 # Create copy atom
 copy_atom = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
 
-# Build tiled copy with raked product layout
-layout_thr_val = fx.raked_product(thr_layout, val_layout)
-tile_mn = fx.make_tile(4, 8)
-tiled_copy = fx.make_tiled_copy(copy_atom, layout_thr_val, tile_mn)
+# Build the thread-value (TV) layout and its tiler
+tile_mn, tv_layout = fx.make_layout_tv(thr_layout, val_layout)
+tiled_copy = fx.make_tiled_copy(copy_atom, tv_layout, tile_mn)
 
 # Get this thread's slice and partition
 thr_copy = tiled_copy.get_slice(tid)
@@ -573,13 +582,15 @@ fx.copy(copy_atom, frag, partition_dst)
 
 ### Buffer Load/Store
 
-Preferred: build a buffer-resource view with `make_buffer_tensor` and move data
-through copy atoms — the OOB-checked V# descriptor is built for you.
+Build a buffer-resource view with `make_buffer_tensor` and move data through
+copy atoms. Its default `max_size=True` does not enforce a finite record bound;
+pass `max_size=False` or `num_records_bytes=` when hardware OOB checking is
+required.
 ```python
 buf = fx.rocdl.make_buffer_tensor(tensor)
 tA  = fx.make_view(fx.get_iter(buf), fx.make_layout((M, N), (N, 1)))
 copy = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.Float32)
-fx.copy_atom_call(copy, fx.slice(tA, (None, tid)), rA)   # after partitioning tA
+fx.copy(copy, fx.slice(tA, (None, tid)), rA)   # after partitioning tA
 ```
 
 Legacy raw intrinsics (`buffer_ops.create_buffer_resource` / `buffer_load` /
@@ -658,19 +669,14 @@ prefer `SharedAllocator` for anything new.
 
 ## 6. MFMA Integration (Matrix Math)
 
-### Available MFMA Instructions
+### MFMA atoms on gfx942/gfx950
 ```python
-from flydsl.expr import rocdl
-
-# FP16/BF16 MFMA
-result = rocdl.mfma_f32_16x16x16_f16(a, b, acc)
-
-# FP8 MFMA
-result = rocdl.mfma_f32_16x16x32_fp8(a, b, acc)
-
-# INT8 MFMA
-result = rocdl.mfma_i32_16x16x32i8(a, b, acc)
+mma = fx.make_mma_atom(fx.rocdl.MFMA(16, 16, 16, fx.Float16))
+fx.gemm(mma, frag_C, frag_A, frag_B, frag_C)  # d, a, b, c
 ```
+
+Pick the supported shape and dtype for the target. Keep a raw MFMA intrinsic
+only when the atom API cannot express its operand form or scheduling contract.
 
 ### gfx1250 WMMA (wave32)
 
@@ -703,7 +709,8 @@ fx.gemm(mma, frag_C, frag_A, frag_B, frag_C)
 ```
 
 ### GEMM Pattern (Preshuffle)
-The preshuffle GEMM pattern in `kernels/gemm/preshuffle_gemm.py`:
+The preshuffle GEMM pattern in
+`aiter/ops/flydsl/kernels/preshuffle_gemm.py`:
 1. B matrix is pre-shuffled to layout: (N/16, K/64, 4, 16, kpack_bytes)
 2. A tiles loaded from global to LDS with XOR16 swizzle for bank-conflict avoidance
 3. K64-byte micro-steps: each step issues 2x K32 MFMA operations
@@ -751,12 +758,12 @@ def elementwise_kernel(In: fx.Tensor, Out: fx.Tensor, BLOCK: fx.Constexpr[int], 
     copy = fx.make_copy_atom(fx.UniversalCopy(VEC * 32), fx.Float32)
     rIn = fx.make_rmem_tensor(VEC, fx.Float32)
     rOut = fx.make_rmem_tensor(VEC, fx.Float32)
-    fx.copy_atom_call(copy, fx.slice(tIn, (None, tid)), rIn)
+    fx.copy(copy, fx.slice(tIn, (None, tid)), rIn)
     # Transform
-v = Vec(fx.memref_load_vec(rIn))
-v = v * v  # example: square
+    v = fx.Vector(fx.memref_load_vec(rIn))
+    v = v * v  # example: square
     fx.memref_store_vec(v, rOut)
-    fx.copy_atom_call(copy, rOut, fx.slice(tOut, (None, tid)))
+    fx.copy(copy, rOut, fx.slice(tOut, (None, tid)))
 ```
 
 ### Element-wise Kernel Cookbook (GPU-Verified)
@@ -772,21 +779,19 @@ vC = vA * scale
 # --- Multiply: C = A * B ---
 vC = Vec(fx.memref_load_vec(rA)) * Vec(fx.memref_load_vec(rB))
 
-# --- FMA: D = A * B + C ---
-vAB = Vec(fx.memref_load_vec(rA)) * Vec(fx.memref_load_vec(rB))
-vD = vAB + Vec(fx.memref_load_vec(rC))
+# --- Fused FMA: D = A * B + C with one rounding ---
+vD = fx.fma(Vec(fx.memref_load_vec(rA)), Vec(fx.memref_load_vec(rB)),
+            Vec(fx.memref_load_vec(rC)))
+# Retain `a * b + c` when separate multiplication and addition are required.
 
 # --- ReLU: C = max(A, 0) ---
 vA = Vec(fx.memref_load_vec(rA))
 zero_vec = Vec.filled(vec_width, 0.0, fx.Float32)
 vC = vA.maximumf(zero_vec)
 
-# --- Abs: C = |A| (arith.absf does NOT exist) ---
-vA = fx.memref_load_vec(rA)
-zero_vec = Vec.filled(vec_width, 0.0, fx.Float32)
-neg_vA = -vA
-is_neg = vA < zero_vec
-vC = is_neg.select(neg_vA, vA)
+# --- Abs: C = |A| ---
+vA = Vec(fx.memref_load_vec(rA))
+vC = fx.absf(vA)
 ```
 
 ### Naive GEMM Template (for understanding, not performance)
@@ -795,7 +800,7 @@ vC = is_neg.select(neg_vA, vA)
 def naive_gemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,
                M: fx.Constexpr[int], N: fx.Constexpr[int], K: fx.Constexpr[int],
                BM: fx.Constexpr[int], BN: fx.Constexpr[int]):
-    tid, bid = gpu.thread_id("x"), gpu.block_id("x")
+    tid, bid = fx.thread_idx.x, fx.block_idx.x
     bm, bn = bid // (N // BN), bid % (N // BN)
     tm, tn = tid // BN, tid % BN
     row, col = bm * BM + tm, bn * BN + tn
@@ -826,7 +831,8 @@ def naive_gemm(A: fx.Tensor, B: fx.Tensor, C: fx.Tensor,
 ```bash
 FLYDSL_DUMP_IR=1 FLYDSL_DUMP_DIR=./dumps python my_kernel.py
 ```
-Produces numbered `.mlir` files per pipeline stage plus `final_isa.s`.
+Produces numbered `.mlir` files per pipeline stage plus `22_final_isa.s`
+for each compiled specialization in the pinned release.
 
 ### Key Environment Variables
 | Variable | Default | Description |
@@ -836,7 +842,7 @@ Produces numbered `.mlir` files per pipeline stage plus `final_isa.s`.
 | `FLYDSL_RUNTIME_ENABLE_CACHE` | true | Enable kernel disk caching (in-memory cache is always active) |
 | `FLYDSL_RUNTIME_CACHE_DIR` | ~/.flydsl/cache | Cache directory |
 | `FLYDSL_COMPILE_OPT_LEVEL` | 2 | Optimization level (0-3) |
-| `ARCH` | auto-detect | Override GPU architecture |
+| `FLYDSL_GPU_ARCH` | auto-detect | Override the FlyDSL compile target, e.g. `gfx1250` |
 
 ### Disk Cache Invalidation
 The JIT disk cache auto-invalidates when kernel source or closure values change. Set `FLYDSL_RUNTIME_ENABLE_CACHE=0` only when modifying C++ passes or non-closure helper functions:
@@ -862,7 +868,7 @@ FlyDSL supports source-to-assembly mapping for rocprofv3 ATT traces via the MLIR
     -> gpu-module-to-binary{format=fatbin opts=-g}
 ```
 
-**Verification**: With `FLYDSL_DUMP_IR=1`, check `final_isa.s` for `.file` and `.loc` directives.
+**Verification**: With `FLYDSL_DUMP_IR=1`, check `22_final_isa.s` for `.file` and `.loc` directives.
 The PA decode kernel achieves 99.9% coverage (1109/1110 ISA instructions mapped to source).
 
 **Key insight**: Without this pass, MLIR `loc()` metadata is silently dropped during MLIR-to-LLVM-IR
@@ -871,7 +877,7 @@ without the DI scope pass.
 
 ### Autotune Module
 
-FlyDSL includes a Triton-style autotune module at `/FlyDSL/python/flydsl/autotune.py`:
+FlyDSL includes a Triton-style `flydsl.autotune` module in its installed package:
 
 ```python
 from flydsl.autotune import autotune, Config, do_bench
@@ -912,7 +918,7 @@ Pass raw `torch.Tensor` objects instead.
 
 ### Common Issues
 
-1. **Constants/casts**: Prefer `fx.Int32(...)`, `fx.Int64(...)`, and `fx.Float32(...)` (`fx.Index(...)` is being deprecated in favor of `fx.Int64(...)`). Use `arith.constant(...)` only at low-level boundaries.
+1. **Constants/casts**: Prefer `fx.Int32(...)`, `fx.Int64(...)`, and `fx.Float32(...)` for fixed-width arithmetic. Keep `fx.Index(...)` where a layout, loop, or launch API requires MLIR `index`; it is not interchangeable with `fx.Int64`.
 
 2. **`buffer_ops.buffer_load` offset**: The `offset` parameter is in ELEMENTS, not bytes.
 
@@ -928,13 +934,15 @@ Pass raw `torch.Tensor` objects instead.
 
 8. **AMD wavefront size**: Always 64 on gfx9xx. Use shifts [32, 16, 8, 4, 2, 1] for full-wave reduction.
 
-9. **tile_k alignment for GEMM**: `tile_k * elem_bytes` must be divisible by 64 (K64-byte micro-step).
+9. **tile_k alignment for GEMM**: Check the selected MMA atom and kernel's K-step constraints. The preshuffle GEMM's K64-byte path requires `tile_k * elem_bytes` divisible by 64; this is not a universal FlyDSL GEMM rule.
 
 10. **INT4 (W4A8)**: A matrix is int8, B matrix is packed int4 (2 values/byte), unpacked to int8 in-kernel.
 
-11. **`arith.absf` does not exist**: Prefer `fx.Vector` / typed `fx` operators (not the deprecated `ArithValue`): `neg = -v`, `is_neg = v < zero`, `out = is_neg.select(neg, v)`.
+11. **Absolute value and FMA**: `fx.absf(v)` and `fx.fma(a, b, c)` exist in pinned 0.3.4.1. FMA has fused rounding, unlike an assumed two-step multiply and add. Check signed-zero/NaN behavior before replacing a hand-written absolute-value select.
 
 12. **Scalar broadcast to vector**: Use `Vec.filled(width, value, fx.Float32)` to create a splat constant vector. Do NOT use raw vector ops for ordinary arithmetic.
+
+13. **gfx1250 wait counters**: In pinned FlyDSL 0.3.4.1, the keyword form of `fx.rocdl.s_waitcnt` supports gfx942/gfx950/gfx11xx/gfx120x but rejects gfx1250. Check the target's wait instructions and ordering before replacing a gfx1250 wait; an offline compile failure on both revisions does not prove identical ISA.
 
 ---
 
@@ -945,7 +953,7 @@ Pass raw `torch.Tensor` objects instead.
 | Layout control | Explicit layout algebra (Shape, Stride, Layout) | Implicit via block pointers | Implicit |
 | Tiling | Manual via divide/product operations | Auto-tiling with `tl.program_id` | Auto-tiling |
 | Memory access | Copy atoms, buffer load/store, TiledCopy | `tl.load`/`tl.store` | `gluon.load`/`gluon.store` |
-| MFMA | Direct `rocdl.mfma_*` intrinsics | `tl.dot` | `gluon.dot` |
+| Matrix math | `fx.rocdl.MFMA` / `WMMA` atoms with `fx.gemm` | `tl.dot` | `gluon.dot` |
 | Shared memory | SharedAllocator + `@fx.struct` explicit management | Implicit scratchpad | Implicit |
 | Abstraction level | Low (near hardware) | Medium | Medium-High |
 | Compilation | MLIR (Fly dialect -> LLVM -> HSACO) | MLIR (Triton dialect -> LLVM) | MLIR |
@@ -957,14 +965,9 @@ FlyDSL gives maximum control at the cost of verbosity. The layout algebra is the
 
 ## 12. Running Kernels
 
-### SSH to Remote Host
-```bash
-# Run a kernel
-ssh -o LogLevel=ERROR hjbog-srdc-39.amd.com 'docker exec hungry_dijkstra bash -c "cd /FlyDSL && python3 my_kernel.py"'
-
-# Run existing tests
-ssh -o LogLevel=ERROR hjbog-srdc-39.amd.com 'docker exec hungry_dijkstra bash -c "cd /FlyDSL && python3 tests/kernels/test_vec_add.py"'
-
-# Run benchmarks
-ssh -o LogLevel=ERROR hjbog-srdc-39.amd.com 'docker exec hungry_dijkstra bash -c "cd /FlyDSL && bash scripts/run_benchmark.sh"'
-```
+Run the aiter test for the kernel on a host with the target GPU. For an
+offline ISA comparison, use a separate dump directory per revision and set
+`COMPILE_ONLY=1` with `FLYDSL_GPU_ARCH=<target>`. Offline compilation does not
+exercise device behavior; compare the same specialization, compiler version,
+and final ISA on both revisions. A pinned compiler limitation that occurs on
+both trees cannot establish ISA equivalence for that specialization.
