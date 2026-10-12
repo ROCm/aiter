@@ -309,9 +309,7 @@ def test_paged_attn_v2(
 # to the denominator and shrinks the output. The other tests only use
 # power-of-two block sizes, which have no padding lanes.
 # The V2 wrappers are called directly with a single partition: the public
-# dispatcher only picks V2 for multi-partition sequences, and the GQA V1
-# wrappers pass KV_BLK_SZ_POW2=KV_BLK_SZ, so they only accept power-of-two
-# block sizes and are not covered here.
+# dispatcher only picks V2 for multi-partition sequences.
 @pytest.mark.parametrize(
     "B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, NUM_BLK, version",
     [
@@ -319,6 +317,8 @@ def test_paged_attn_v2(
         (4, 16, 16, 3, 1000, 64, "v1"),
         (4, 16, 16, 5, 1000, 64, "v1"),
         (4, 16, 16, 48, 1000, 32, "v1"),
+        (4, 32, 8, 3, 1000, 64, "v1"),  # GQA
+        (4, 32, 8, 48, 1000, 32, "v1"),
         (4, 16, 16, 3, 1000, 64, "v2"),
         (4, 16, 16, 48, 1000, 32, "v2"),
         (4, 32, 8, 3, 1000, 64, "v2"),

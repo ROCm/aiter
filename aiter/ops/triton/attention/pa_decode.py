@@ -263,7 +263,7 @@ def paged_attn_decode_v1(
             QUERY_GRP_SZ=query_grp_sz,
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz,
+            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             waves_per_eu=3 if query_grp_sz > 1 else 0,
             num_stages=1,
         )
@@ -552,7 +552,7 @@ def paged_attn_decode_v1_per_token_quant(
             QUERY_GRP_SZ=query_grp_sz,
             QUERY_GRP_SZ_POW2=query_grp_sz_pow2,
             KV_BLK_SZ=kv_blk_sz,
-            KV_BLK_SZ_POW2=kv_blk_sz,
+            KV_BLK_SZ_POW2=kv_blk_sz_pow2,
             waves_per_eu=3 if query_grp_sz > 1 else 0,
             num_stages=1,
         )
