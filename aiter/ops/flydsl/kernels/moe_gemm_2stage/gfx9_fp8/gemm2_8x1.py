@@ -520,12 +520,10 @@ def output_quarter(k, stage, k_widths=None):
 
 @cache
 def vmem_wait_schedule(k, n_tiles, ptpc=True, k_widths=None):
-    """Count one event per ordinary buffer/global instruction; issue the next B load after waiting.
+    """Per-step vmcnt budgets, counting one event per buffer/global load.
 
-    The budget is the minimum age of all B/scale values about to be consumed.
-    Counting only B is insufficient: some K256 packets use the preceding step's
-    scale, tightening 9 to 7. K192 has independent accounting; K320 requires the
-    explicit and unique partition (128, 192).
+    A budget is the minimum age of the B and scale loads consumed next; scales
+    count because some K256 packets use the previous step's scale.
     """
     assert (
         k in (256, 320, 384, 512, 640) and n_tiles >= 1
@@ -1359,15 +1357,10 @@ def run_8x1_tile(
     k_widths=None,
     prepare_b_addresses=None,
 ):
-    """q = 2*KS*n + step is only a time coordinate; n may be dynamic, but step is unrolled.
+    """Run one N tile; q = 2*KS*n + step orders events and packing_events drives packing.
 
-    Every N starts at step0; first=True marks only N0, with staggering already established.
-    Complete previous_packed in place. The clear/mma/pack closures update FP32 c,
-    which is not returned. packed/scales belong to the current N; scales returns
-    all four records. previous_scales contains only the tail, indexed by record-FIRST_UNPACKED.
-    K128n packs old C3 at step0 and new C0/C1/C2 at KS-1/KS/the final step.
-    K320 packs old C2/C3 at step0 and new C0/C1 at step2.
-    Only the rules in packing_events are executed below.
+    Completes previous_packed in place and returns the current N's packed records and
+    all four scales; previous_scales holds only the tail, indexed by record - FIRST_UNPACKED.
     """
     widths = k_widths or (128,) * (k // 128)
     KS = len(widths)
@@ -2065,13 +2058,10 @@ def run_k192_tile(
     schedule_pack,
     prepare_b_addresses,
 ):
-    """q = 2*n + half is only a time label; stagger before N0, then run L/H for every N.
+    """Run one K192 N tile as L/H halves (q = 2*n + half), completing old C2/C3 in place.
 
-    Each P slot holds 16B+8B; addresses holds current-N reads and current-N.H/next-N.L writes.
-    Complete old C2/C3 in previous_packed in place; closures update FP32 c. Return
-    current-N packed C0/C1 and all four scale records; advance addresses unless last.
-    previous_scales contains only old scale2/scale3. Prune the final two N independently,
-    without using the shared BK128 tail.
+    Returns the current N's packed C0/C1 and all four scales; previous_scales holds
+    old scale2/scale3 only.
     """
     budgets = k192_wait_schedule(n_tiles, ptpc)
     body_budgets = tuple(

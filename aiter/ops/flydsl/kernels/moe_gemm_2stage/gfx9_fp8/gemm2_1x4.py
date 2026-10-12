@@ -459,9 +459,7 @@ def _build_moe_gemm2_1x4_n256(
 ):
     assert stage == "down"
     assert down_path == "1x4_64x256"
-    # weight_quant_type governs the WEIGHT scale form; act_quant_type governs the ACTIVATION
-    # scale form (native-fp8 prefill only) and defaults to weight_quant_type (previous behavior
-    # where a single quant_type drove both).
+    # Activation scale form (native-fp8 prefill only); defaults to the weight scale form.
     if act_quant_type is None:
         act_quant_type = weight_quant_type
     assert (

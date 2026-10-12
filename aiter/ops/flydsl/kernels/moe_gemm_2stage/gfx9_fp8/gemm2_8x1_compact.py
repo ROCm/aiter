@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Build M256 full tasks and M64 tails from unchanged M64 sorted metadata.
+"""Split M64 sorted metadata into M256 full and M64 tail tasks [row_begin, expert_id].
 
-Each task stores [physical_row_begin, expert_id]. Full and tail kernels keep
-the original physical row numbering, so Gate/Up and inverse routing do not
-change. Sorting must place each expert in a single contiguous run.
+Rows keep their original positions; each expert must be one contiguous run of blocks.
 """
 
 from fractions import Fraction
