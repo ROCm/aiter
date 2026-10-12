@@ -151,7 +151,7 @@ def bench_mlp_single_weight_init(
 
     group_shape_m, group_shape_n, group_shape_k = group_shape
 
-    wg = torch.randn((dim1, n_expts_tot), device=dev)
+    wg = torch.randn((dim1, n_expts_tot), dtype=torch.bfloat16, device=dev)
     w1 = (
         torch.randn((n_expts_tot, dim1, dim2 // TP), dtype=torch.bfloat16, device=dev)
         / 10
@@ -180,7 +180,7 @@ def bench_mlp_single_weight_init(
     x = (torch.randn((batch, dim1), dtype=torch.bfloat16, device=dev) / 10).to(
         torch.float8_e4m3fn
     )
-    xg = x.to(torch.float32)
+    xg = x.to(torch.bfloat16)
 
     def num_blocks(length, block):
         return (length + block - 1) // block

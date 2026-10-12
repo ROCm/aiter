@@ -13,15 +13,20 @@
 //   qType    : Q dtype string (fp8 / bf16)
 //   kvType   : KV dtype string (fp8 / bf16)
 //   Gqa      : gqa_ratio
-//   ps       : persistent scheduling flag (0 = non-persistent; v4 nm only
-//              ships non-persistent today)
+//   ps       : persistent scheduling flag (0 = non-persistent, served by
+//              mla_decode_v4_asm; 1 = persistent, served by
+//              mla_decode_v4_ps_asm: in-kernel split plan + merge, one launch)
 //   qSeqLen  : max_seqlen_q (post-padding) baked into the kernel binary
 //              (4 for the qseqlen4 variant)
 //   prefill  : 0 for decode, reserved for future prefill variants
 //   causal   : 0 for non-causal, reserved
-//   lse      : final-LSE export flag (0 = no, v4 nm always 0 today)
+//   lse      : final-LSE export flag (0 = no; the ps=1 kernel exports it when
+//              given an lse buffer)
 //   knl_name : kernel symbol in the .co
 //   co_name  : .co file path relative to this CSV's directory
+//
+// The ps=1 row is looked up by mla_decode_v4_ps_asm only (gqa=128, qSeqLen=1
+// callers, normalized to the same (Gqa=64, qSeqLen=1) key).
 //
 // Dispatcher keys lookup on (qType, kvType, Gqa, ps, qSeqLen, prefill,
 // causal, lse) — exactly the same set as v3.
@@ -32,3 +37,4 @@
 // Required columns last (per codegen.py convention): knl_name, co_name.
 qType,kvType,Gqa,ps,qSeqLen,prefill,causal,lse,knl_name,co_name
 fp8,fp8,64,0,1,0,0,0,_ZN5aiter36mla_a8w8_qh64_qseqlen1_gqaratio64_nmE,mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co
+fp8,fp8,64,1,1,0,0,1,_ZN5aiter39mla_a8w8_qh64_qseqlen1_gqaratio64_nm_psE,mla_a8w8_qh64_qseqlen1_gqaratio64_nm_ps.co

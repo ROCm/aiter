@@ -90,9 +90,12 @@ def pa_prefill_sparse(
             avg_prefix_len = kv_indices_prefix.numel() / max(T, 1)
             has_invalid = not (0 < avg_prefix_len <= 16)
         _LOGGER.info(
-            f"PA_PREFILL_SPARSE T={T} H={H} D={D} "
-            f"prefix_indices={kv_indices_prefix.shape[0]} "
-            f"extend_indices={kv_indices_extend.shape[0]}"
+            "PA_PREFILL_SPARSE T=%d H=%d D=%d prefix_indices=%d extend_indices=%d",
+            T,
+            H,
+            D,
+            kv_indices_prefix.shape[0],
+            kv_indices_extend.shape[0],
         )
 
         out = torch.empty_like(q)

@@ -24,6 +24,55 @@ def _arch() -> str:
         return ""
 
 
+@pytest.mark.parametrize(
+    "arch,heads,kv_heads,dim,vdim,dtype,supported",
+    [
+        ("gfx950", 12, 12, 192, 128, torch.float8_e4m3fn, True),
+        ("gfx950", 12, 3, 128, 128, torch.float8_e4m3fn, True),
+        ("gfx950", 12, 12, 256, 160, torch.float8_e4m3fn, True),
+        ("gfx942", 12, 12, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx1201", 12, 12, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 192, 256, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 256, 192, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 384, 64, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 96, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 0, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 5, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 0, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 0, 12, 192, 128, torch.float8_e4m3fn, False),
+        ("gfx950", 12, 12, 192, 128, torch.float8_e4m3fnuz, False),
+        ("gfx950", 12, 12, 192, 128, torch.bfloat16, False),
+    ],
+)
+def test_fp8_supported_config(
+    monkeypatch, arch, heads, kv_heads, dim, vdim, dtype, supported
+):
+    """The pre-quantization capability query needs only metadata, even for gfx942."""
+    from aiter.ops.flydsl import flydsl_flash_attn_fp8_supported
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    monkeypatch.setattr(fa, "_gpu_arch", lambda device: arch)
+    monkeypatch.setattr(
+        fa, "_build_fp8", lambda **kw: pytest.fail("capability check compiled a kernel")
+    )
+    assert (
+        flydsl_flash_attn_fp8_supported(
+            torch.device("cuda:0"), heads, kv_heads, dim, vdim, dtype=dtype
+        )
+        is supported
+    )
+
+
+def test_fp8_supported_cpu_does_not_query_gpu(monkeypatch):
+    from aiter.ops.flydsl import flydsl_flash_attn_fp8_supported
+    from aiter.ops.flydsl.kernels import flash_attn_func_fp8_gfx950 as fa
+
+    monkeypatch.setattr(
+        fa, "_gpu_arch", lambda device: pytest.fail("queried GPU for CPU")
+    )
+    assert not flydsl_flash_attn_fp8_supported(torch.device("cpu"), 12, 12, 192, 128)
+
+
 _gfx1201_only = pytest.mark.skipif(
     not _arch().startswith("gfx1201"),
     reason="flydsl_flash_attn_func is gfx1201/RDNA4 only",
