@@ -95,7 +95,7 @@ def matmul_launch_metadata(grid, kernel, args):
     return ret
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_prefill(
     BLOCK_M,
     BLOCK_N,
@@ -338,7 +338,7 @@ def get_moe_a4w4_layouts_prefill(
     return layouts
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=None)  # noqa: UP033
 def get_moe_a4w4_layouts_decode(
     BLOCK_M,
     BLOCK_N,
