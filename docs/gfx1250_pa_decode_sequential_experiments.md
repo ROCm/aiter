@@ -5,6 +5,10 @@ four query splits for transposed page 128 native BF16 D1024/G16/MTP4 full
 attention. Separate K/V waits and shorter V operand lifetimes did not show a
 repeatable streaming improvement. The default partition budget remains unchanged.
 
+This report records the state committed as `db4b45de8`. The subsequent
+[FP8 QL4 optimization](gfx1250_pa_decode_ql4.md) extends packed pages to two fused
+query tiles and supersedes the QL4 performance numbers below.
+
 All decision timings use `op_tests/op_benchmarks/flydsl/bench_pa_decode.py`
 directly. Each source snapshot runs in a separate process, with seed 0,
 U(-0.5,0.5) inputs, separate shuffled physical pages, seven timing rounds,

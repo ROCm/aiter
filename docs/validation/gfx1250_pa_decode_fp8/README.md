@@ -1,5 +1,10 @@
 # gfx1250 FP8 PA decode evidence
 
+The [QL4 packed-page optimization](../../gfx1250_pa_decode_ql4.md) extends the
+packed 128-token path to fused FP8 D256/G8/QL4, with sequential experiments and
+shorter-context controls against `db4b45de8`. Its
+[timing and counter summary](ql4-20261012-summary.json) includes final validation.
+
 The [2026-10-12 sequential experiments](../../gfx1250_pa_decode_sequential_experiments.md)
 use the repository benchmark directly. Their [timing summary](sequential-20261012-summary.json)
 and [resource summary](sequential-20261012-resources.json) cover direct output,

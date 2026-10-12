@@ -130,6 +130,9 @@ def _make_inputs(
         pytest.param(3, 2, 4, 64, 64, 3, 0, torch.float16, "random", id="mtp"),
         pytest.param(4, 1, 16, 128, 128, 7, 257, torch.float32, "random", id="window"),
         pytest.param(2, 2, 8, 256, 16, 7, 0, None, "random", id="head256"),
+        pytest.param(
+            4, 2, 8, 256, 128, 7, 0, torch.float32, "random", id="packed-mtp4"
+        ),
         pytest.param(1, 1, 16, 128, 128, None, 0, None, "random", id="default-cap"),
         pytest.param(1, 1, 4, 1024, 128, 1, 0, torch.bfloat16, "random", id="head1024"),
         *[
@@ -237,8 +240,11 @@ def test_pa_decode(
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
-@pytest.mark.parametrize("query_length", [1, 2], ids=["decode", "mtp2"])
-@pytest.mark.parametrize("head_dim", [128, 256], ids=["d128", "d256"])
+@pytest.mark.parametrize(
+    "query_length,head_dim",
+    [(1, 128), (1, 256), (2, 128), (2, 256), (4, 256)],
+    ids=["decode-d128", "decode-d256", "mtp2-d128", "mtp2-d256", "mtp4-d256"],
+)
 @pytest.mark.parametrize("max_partitions", [1, 7], ids=["direct", "partitioned"])
 def test_pa_decode_packed_page_boundaries(
     dtype, query_length, head_dim, max_partitions, device

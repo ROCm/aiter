@@ -5,7 +5,8 @@
 
 Four waves split 64- or 128-token compute tiles within each 256-token plan tile.
 FP8 D128/D256/page128+ full attention uses 128-token tiles and K128 QK/PV WMMA.
-Per-token FP8 D128/D256 transposed caches with one query tile keep their packed
+Per-token FP8 D128/D256 transposed caches with one query tile, and
+D256/G8/MTP4/page128 full attention with two query tiles, keep their packed
 layout without TDM transposition or row padding. D256/page128 full attention
 uses two buffers and asynchronous scale copies to overlap memory transfers.
 WMMA accumulates into a rescaled running output; empty tiles retain its scale.
@@ -108,13 +109,24 @@ class Gfx1250Traits:
 
     @property
     def packed_lds(self):
+        # Two fused query tiles reuse the packed page and K128 WMMA path for
+        # measured D256/G8/MTP4 full attention, without extra KV fetches.
         return (
             not self.bf16
             and self.per_token_kv
             and self.head_dim in (128, 256)
             and self.block_size >= 64
             and self.trans_v
-            and self.m_tiles == 1
+            and (
+                self.m_tiles == 1
+                or (
+                    self.head_dim == 256
+                    and self.block_size == 128
+                    and self.query_length == 4
+                    and self.query_group_size == 8
+                    and self.sliding_window == 0
+                )
+            )
         )
 
     @property
