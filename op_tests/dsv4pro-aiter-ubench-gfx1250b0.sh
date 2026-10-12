@@ -279,28 +279,42 @@ echo "[11/13] exit=${PIPESTATUS[0]}" >> $SUMMARY
 echo ""
 
 # 12. EP dispatch/combine (hip, 4 GPUs) — requires mori + torchrun
-echo "=== [12/13] EP dispatch/combine (hip, 4 GPUs) ==="
+echo "=== [12/13] EP dispatch/combine (hip, 4 GPUs, dispatch dtype fp4 + bf16) ==="
 if [ -d "$MORI_DIR" ]; then
   cd $MORI_DIR
-  MORI_SOCKET_IFNAME=lo \
-  GLOO_SOCKET_IFNAME=lo \
-  BACKENDS=hip \
-  MORI_V2_KERNEL_BACKEND=hip \
-  HIDDEN=7168 \
-  TOPK=6 \
-  EPR=96 \
-  SWEEP=64,128,256,512,1024,2048,4096,8192,16384 \
-  ITERS=200 \
-  WARMUP=10 \
-  MODES=eager,graph \
-  COMBINE_IN=inplace \
-  CHECK=1 \
-  DATA_INIT=norm \
-  DISP=fp4 \
-    torchrun --standalone --nproc_per_node=$NUM_GPUS \
-      tests/python/ops/dispatch_combine_v2/bench_ep.py \
-    2>&1 | tee $LOGDIR/12_ep_dispatch_combine.log || true
-  echo "[12/13] exit=$?" >> $SUMMARY
+  # fp4: fp4 dispatch + fp4 push combine (COMB_MODE=push). bf16: bf16 dispatch +
+  # bf16 pull combine (COMB_MODE=pull); push is bench_ep's default and quantizes
+  # the combine to fp4 even when DISP=bf16.
+  for disp in fp4 bf16; do
+    if [ "$disp" = "fp4" ]; then
+      comb_mode=push
+      ep_log=$LOGDIR/12_ep_dispatch_combine.log
+    else
+      comb_mode=pull
+      ep_log=$LOGDIR/12_ep_dispatch_combine_${disp}.log
+    fi
+    echo "--- DISP=$disp COMB_MODE=$comb_mode ---"
+    MORI_SOCKET_IFNAME=lo \
+    GLOO_SOCKET_IFNAME=lo \
+    BACKENDS=hip \
+    MORI_V2_KERNEL_BACKEND=hip \
+    HIDDEN=7168 \
+    TOPK=6 \
+    EPR=96 \
+    SWEEP=64,128,256,512,1024,2048,4096,8192,16384 \
+    ITERS=200 \
+    WARMUP=10 \
+    MODES=eager,graph \
+    COMBINE_IN=inplace \
+    CHECK=1 \
+    DATA_INIT=norm \
+    DISP=$disp \
+    COMB_MODE=$comb_mode \
+      torchrun --standalone --nproc_per_node=$NUM_GPUS \
+        tests/python/ops/dispatch_combine_v2/bench_ep.py \
+      2>&1 | tee $ep_log
+    echo "[12/13] DISP=$disp COMB_MODE=$comb_mode exit=${PIPESTATUS[0]}" >> $SUMMARY
+  done
   cd $AITER_DIR
 else
   echo "SKIP: $MORI_DIR not found"
