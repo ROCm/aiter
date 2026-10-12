@@ -31,14 +31,14 @@ class PaDecodeEpilogue:
                 pout_slot = fx.Int64(self.ctx.kv_h) * fx.Int64(
                     gpu.grid_dim.x
                 ) + fx.Int64(self.ctx.part)
-            pout_slot_bytes = self.traits.TOTAL_ROWS * self.traits.head_dim * 2
+            pout_slot_bytes = self.traits.TOTAL_ROWS * self.traits.value_dim * 2
             pout_base = buf_base_i64(self.ctx.pout_ptr) + pout_slot * fx.Int64(
                 pout_slot_bytes
             )
             self.pout_buffer = ptr_buf_tensor(
                 pout_base,
                 self.traits.Q_DTYPE,
-                n=self.traits.TOTAL_ROWS * self.traits.head_dim,
+                n=self.traits.TOTAL_ROWS * self.traits.value_dim,
                 unit_elems=self.traits.OP_ELEMS,
                 # BF16 views may be only 2-byte aligned, even for 8-byte stores.
                 unit_stride=1,
@@ -48,7 +48,9 @@ class PaDecodeEpilogue:
     def _emit(self, o_norm, sub, global_row):
         if const_expr(self.traits.buffer_plan_output):
             # Row guards keep the full 8-byte store within this slot.
-            pout_offset = global_row * self.traits.head_dim + sub * self.traits.OP_ELEMS
+            pout_offset = (
+                global_row * self.traits.value_dim + sub * self.traits.OP_ELEMS
+            )
             buf_copy_store(
                 self.pout_buffer,
                 pout_offset,
@@ -59,7 +61,7 @@ class PaDecodeEpilogue:
             )
         else:
             base = self.ctx.partial_slot * self.traits.TOTAL_ROWS + global_row
-            pout_offset = base * self.traits.head_dim + sub * self.traits.OP_ELEMS
+            pout_offset = base * self.traits.value_dim + sub * self.traits.OP_ELEMS
             fx.ptr_store(o_norm, fx.add_offset(self.pout, pout_offset))
 
     @flyc.jit

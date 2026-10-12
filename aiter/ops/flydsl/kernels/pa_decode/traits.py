@@ -45,6 +45,7 @@ class PaDecodeSchedule:
         cls,
         *,
         head_dim: int,
+        value_dim: int | None = None,
         query_group_size: int,
         block_size: int,
         num_seqs: int,
@@ -71,6 +72,7 @@ class PaDecodeSchedule:
             raise ValueError("work_capacity must be positive")
         arch = str(get_rocm_arch()).split(":", 1)[0]
         is_gfx950 = "gfx95" in arch
+        value_dim = head_dim if value_dim is None else value_dim
         if kv_dtype not in ("fp8", "bf16"):
             raise ValueError(f"Unsupported PA KV dtype {kv_dtype!r}")
         is_bf16_kv = kv_dtype == "bf16"
@@ -85,9 +87,33 @@ class PaDecodeSchedule:
                 raise ValueError("BF16 KV does not use quantization scales")
             if not trans_v:
                 raise ValueError("BF16 KV requires a vectorized-5D value cache")
+        asymmetric_value = value_dim != head_dim
+        if asymmetric_value and not (
+            is_gfx950
+            and query_dtype == "bf16"
+            and head_dim == 192
+            and value_dim == 128
+            and block_size == 64
+            and query_group_size == 16
+            and num_kv_heads == 1
+            and query_length == 8
+            and trans_v
+            and not per_token_kv
+            and sliding_window in (0, 128)
+            and (not is_bf16_kv or sliding_window == 128)
+        ):
+            raise ValueError(
+                "asymmetric V requires gfx950 BF16 Q/O, scalar FP8 or BF16 KV, "
+                "Qlen8/GQA16/page64 D192/V128, and full attention (FP8 only) "
+                "or W128"
+            )
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
-            not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
+            not asymmetric_value
+            and not is_bf16_kv
+            and is_gfx950
+            and head_dim == 128
+            and block_size in (16, 128)
         )
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         # Scalar KV scheduling also supports FP16 queries and multiple query rows.
@@ -130,7 +156,20 @@ class PaDecodeSchedule:
                 else query_length
             )
             query_splits = 1
-            if (
+            if asymmetric_value:
+                # W128 and small full-attention grids need one query position
+                # per CTA for occupancy. Larger full-attention grids use four
+                # splits to reduce duplicated KV work.
+                large_full_grid = sliding_window == 0 and (
+                    num_seqs >= 16
+                    or (
+                        num_seqs >= 8
+                        and max_context_length is not None
+                        and max_context_length >= 16384
+                    )
+                )
+                query_splits = 4 if large_full_grid else query_length
+            elif (
                 TUNED_PER_TOKEN
                 and (num_kv_heads == 1 or sliding_window == 0)
                 and query_length in (2, 4)
@@ -170,7 +209,12 @@ class PaDecodeSchedule:
         if is_bf16_kv:
             assert query_splits >= 1, "query_splits must be positive"
         else:
-            assert query_splits in (1, 2, 4), "query_splits must be one of 1, 2, 4"
+            assert query_splits in (
+                1,
+                2,
+                4,
+                8,
+            ), "query_splits must be one of 1, 2, 4, 8"
         assert query_length % query_splits == 0, "query_splits must divide query_length"
         if is_bf16_kv:
             lds_bytes = _bf16_lds_bytes(
@@ -188,7 +232,7 @@ class PaDecodeSchedule:
         WIDE_FP8_MFMA = (
             TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
         )
-        MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
+        MTP4_FUSED = TUNED_PER_TOKEN and WIDE_FP8_MFMA and M_TILES == 4
         BUFFER_KV = (
             kv_buffer_u32 and MTP4_FUSED and wide_kv_addressing and block_size == 128
         )
@@ -229,6 +273,7 @@ class PaDecodeSchedule:
         )
         cache_key = (
             head_dim,
+            value_dim,
             query_group_size,
             block_size,
             num_partitions,
@@ -266,6 +311,7 @@ class PaDecodeTraits:
 
     # Selected specialization and query shape.
     head_dim: int
+    value_dim: int
     query_group_size: int
     block_size: int
     softmax_scale: float
@@ -361,6 +407,7 @@ class PaDecodeTraits:
         cache_key = schedule.cache_key
         (
             head_dim,
+            value_dim,
             query_group_size,
             block_size,
             _num_partitions,
@@ -383,18 +430,25 @@ class PaDecodeTraits:
         is_bf16_kv = kv_dtype == "bf16"
         IS_BF16 = query_dtype == "bf16"
         TUNED_SHAPE = (
-            not is_bf16_kv and is_gfx950 and head_dim == 128 and block_size in (16, 128)
+            value_dim == head_dim
+            and not is_bf16_kv
+            and is_gfx950
+            and head_dim == 128
+            and block_size in (16, 128)
         )
         TUNED_PER_TOKEN = TUNED_SHAPE and IS_BF16 and per_token_kv
         TUNED_SCALAR = TUNED_SHAPE and trans_v and not per_token_kv
+        ASYMMETRIC_FP8 = (
+            value_dim != head_dim and not is_bf16_kv and sliding_window == 0
+        )
         QUERIES_PER_CTA = query_length // query_splits
         TOTAL_ROWS = query_length * query_group_size
 
         buffer_plan_output = (
             is_gfx950
-            and head_dim == 128
+            and value_dim == 128
             and IS_BF16
-            and 0 < TOTAL_ROWS * head_dim * 2 <= 0x7FFFFFFF
+            and 0 < TOTAL_ROWS * value_dim * 2 <= 0x7FFFFFFF
         )
         # Larger windows have identical visibility for int32 context lengths.
         sliding_window = min(sliding_window, 2**31 - 1)
@@ -442,11 +496,11 @@ class PaDecodeTraits:
         # K128 consumes four K32 packs without changing cache/LDS layouts.
         WIDE_FP8_MFMA = (
             TUNED_PER_TOKEN and query_length in (3, 4) and query_group_size == 16
-        )
+        ) or ASYMMETRIC_FP8
         PACK_K = BF16_PACK_K if is_bf16_kv else FP8_PACK_K
         MFMA_K = 128 if WIDE_FP8_MFMA else PACK_K
         PACKS_PER_MFMA = MFMA_K // PACK_K
-        MTP4_FUSED = WIDE_FP8_MFMA and M_TILES == 4
+        MTP4_FUSED = TUNED_PER_TOKEN and WIDE_FP8_MFMA and M_TILES == 4
         MTP4_PREFETCH_V = MTP4_FUSED and (
             block_size == 16 or not wide_kv_addressing or BUFFER_KV
         )
@@ -474,8 +528,8 @@ class PaDecodeTraits:
         PAGES_PER_CHUNK = (TOK_PER_WARP + block_size - 1) // block_size
         KV_EXTENT = (1 << 42) if wide_kv_addressing else (1 << 30)
         assert (
-            head_dim % (NWARP * MFMA_MNK) == 0
-        ), "head_dim must split across the 4 warps for PV"
+            value_dim % (NWARP * MFMA_MNK) == 0
+        ), "value_dim must split across the 4 warps for PV"
 
         # Four 16-element QK loads form each 64-element fetch group.
         RGROUP_QUARTERS = 4
@@ -485,7 +539,11 @@ class PaDecodeTraits:
             QKHE_LOOP >= 1
         ), f"head_dim {head_dim} must be at least {RGROUP_QUARTERS * QK_CHUNK_ELEMS}"
         # QK operand-pack count, not the number of MFMA instructions.
-        N_SUBCHUNKS = head_dim // PACK_K
+        N_SUBCHUNKS = (
+            ((head_dim + MFMA_K - 1) // MFMA_K) * PACKS_PER_MFMA
+            if WIDE_FP8_MFMA
+            else head_dim // PACK_K
+        )
         assert N_SUBCHUNKS % PACKS_PER_MFMA == 0, "QK packs must fill whole MFMA atoms"
         assert TILE_TOK % MFMA_K == 0, "PV tokens must fill whole MFMA atoms"
 
@@ -493,19 +551,20 @@ class PaDecodeTraits:
         NQCHUNK = 16
         QCHUNK = (
             head_dim // NQCHUNK
-        )  # f16 elements per lane's load chunk (8 for head_dim=128, 4 for head_dim=64)
-        # Loads are at most 128 bits; larger chunks must not leave an unloaded tail.
-        assert is_bf16_kv or QCHUNK <= 8 or QCHUNK % 8 == 0, (
+        )  # 16-bit query elements per lane (8 for D128, 4 for D64, 12 for D192).
+        # D192 uses three 64-bit loads. Other loads are at most 128 bits, and
+        # larger chunks must not leave an unloaded tail.
+        assert is_bf16_kv or QCHUNK <= 8 or QCHUNK % 8 == 0 or QCHUNK == 12, (
             f"head_dim {head_dim} is unsupported: head_dim//{NQCHUNK} ({QCHUNK}) must "
-            f"be <= 8 or a multiple of 8"
+            f"be <= 8, a multiple of 8, or 12"
         )
         QLOAD_UNIT = min(8, QCHUNK) if QCHUNK % 8 == 0 or QCHUNK <= 8 else 4
         N_QLOADS = QCHUNK // QLOAD_UNIT
 
-        VHE_CHUNKS = head_dim // (
+        VHE_CHUNKS = value_dim // (
             NWARP * MFMA_MNK
-        )  # 2 for head_dim=128, 1 for head_dim=64
-        VHE_SIZE = head_dim // VHE_CHUNKS
+        )  # 2 for value_dim=128, 1 for value_dim=64
+        VHE_SIZE = value_dim // VHE_CHUNKS
         OP_ELEMS = MFMA_ACC_ELEMS  # PV C-fragment elements/lane/chunk
         # BF16 has sixteen K16 packs; FP8 has eight K32 or two K128 instructions.
         NVOPS = TILE_TOK // PACK_K
@@ -557,6 +616,7 @@ class PaDecodeTraits:
         return cls(
             cache_key=cache_key,
             head_dim=head_dim,
+            value_dim=value_dim,
             query_group_size=query_group_size,
             block_size=block_size,
             softmax_scale=softmax_scale,

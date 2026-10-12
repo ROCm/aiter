@@ -101,7 +101,10 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
     kv_heads, page_size = key.shape[1:3]
     group = heads // kv_heads
     queries = query.float().reshape(batch, query_length, kv_heads, group, dim)
-    output = torch.zeros_like(queries)
+    value_dim = value.shape[-1]
+    output = torch.zeros(
+        (*queries.shape[:-1], value_dim), dtype=torch.float32, device=query.device
+    )
     positions = torch.arange(query_length, device=query.device)
 
     for seq, length in enumerate(lengths.cpu().tolist()):
@@ -126,11 +129,20 @@ def _reference(query, key, value, table, lengths, query_length, window, sinks):
         # Empty query rows have no attention mass, including with -inf sinks.
         probs.masked_fill_(visible[:, None, None, None] <= 0, 0)
         output[seq] = torch.einsum("qhgk,khd->qhgd", probs, values)
-    return output.reshape_as(query)
+    return output.reshape(batch * query_length, heads, value_dim)
 
 
 def _make_inputs(
-    query_length, kv_heads, group_size, dim, page_size, dtype, pattern, device, lengths
+    query_length,
+    kv_heads,
+    group_size,
+    head_dim,
+    value_dim,
+    page_size,
+    dtype,
+    pattern,
+    device,
+    lengths,
 ):
     if lengths is None:
         lengths = (0, 1, 255, 256, 257, 1027) if pattern == "random" else (1024,)
@@ -141,12 +153,16 @@ def _make_inputs(
         batch, pages_per_seq
     )
     query = torch.empty(
-        (batch * query_length, kv_heads * group_size, dim), dtype=dtype, device=device
+        (batch * query_length, kv_heads * group_size, head_dim),
+        dtype=dtype,
+        device=device,
     ).uniform_(-0.5, 0.5)
     key = torch.empty(
-        (num_pages, kv_heads, page_size, dim), dtype=dtype, device=device
+        (num_pages, kv_heads, page_size, head_dim), dtype=dtype, device=device
     ).uniform_(-0.5, 0.5)
-    value = torch.empty_like(key).uniform_(-0.5, 0.5)
+    value = torch.empty(
+        (num_pages, kv_heads, page_size, value_dim), dtype=dtype, device=device
+    ).uniform_(-0.5, 0.5)
 
     if pattern == "constant":
         query.zero_()
@@ -215,6 +231,51 @@ _COMMON_CASES = [
 ]
 _FP8_CASES = _COMMON_CASES + [
     (
+        "qlen8-full-d192-v128",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "scale_mode": "per-tensor",
+            "trans_v": True,
+            "lengths": (1027, 769),
+        },
+    ),
+    (
+        "qlen8-full-d192-v128-long",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "scale_mode": "per-tensor",
+            "trans_v": True,
+            "lengths": (16384,) * 8,
+        },
+    ),
+    (
+        "qlen8-w128-d192-v128",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "scale_mode": "per-tensor",
+            "trans_v": True,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "capture": True,
+            "lengths": (127, 128, 129, 257, 515),
+        },
+    ),
+    (
         "mtp",
         {
             "query_length": 3,
@@ -241,6 +302,20 @@ _FP8_CASES = _COMMON_CASES + [
     ),
 ]
 _BF16_CASES = _COMMON_CASES + [
+    (
+        "qlen8-w128-d192-v128",
+        {
+            "query_length": 8,
+            "group_size": 16,
+            "head_dim": 192,
+            "value_dim": 128,
+            "block_size": 64,
+            "max_partitions": 8,
+            "window": 128,
+            "sink_dtype": torch.float32,
+            "lengths": (127, 128, 129, 257, 515),
+        },
+    ),
     (
         "mtp",
         {
@@ -347,6 +422,8 @@ def _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch):
                 ("per-tensor", "per-token"),
                 (False, True),
             )
+            if geometry.get("value_dim") is None
+            or (dtype == torch.bfloat16 and scale_mode == "per-tensor" and trans_v)
         ],
         *[pytest.param(geometry, id=f"bf16-{name}") for name, geometry in _BF16_CASES],
         *[
@@ -371,6 +448,7 @@ def test_pa_decode(case, device, monkeypatch):
             "kv_heads": 1,
             "group_size": 8,
             "head_dim": 128,
+            "value_dim": None,
             "block_size": 64,
             "max_partitions": 1,
             "window": 0,
@@ -386,7 +464,7 @@ def test_pa_decode(case, device, monkeypatch):
         **case,
     )
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    query_length, kv_heads, group_size, dim, page, window = (
+    query_length, kv_heads, group_size, head_dim, page, window = (
         case[name]
         for name in (
             "query_length",
@@ -397,12 +475,14 @@ def test_pa_decode(case, device, monkeypatch):
             "window",
         )
     )
+    value_dim = head_dim if case["value_dim"] is None else case["value_dim"]
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
         kv_heads,
         group_size,
-        dim,
+        head_dim,
+        value_dim,
         page,
         case["query_dtype"],
         case["pattern"],
@@ -432,12 +512,12 @@ def test_pa_decode(case, device, monkeypatch):
     logical_value = value.float() * (1.0 if value_scale is None else value_scale)
     pages = key.shape[0]
     key_cache = (
-        key.reshape(pages, kv_heads, page, dim // vector, vector)
+        key.reshape(pages, kv_heads, page, head_dim // vector, vector)
         .permute(0, 1, 3, 2, 4)
         .contiguous()
     )
     value_cache = (
-        value.reshape(pages, kv_heads, page // vector, vector, dim)
+        value.reshape(pages, kv_heads, page // vector, vector, value_dim)
         .permute(0, 1, 2, 4, 3)
         .contiguous()
         if case["trans_v"]
@@ -457,7 +537,15 @@ def test_pa_decode(case, device, monkeypatch):
         "sliding_window": window,
         "max_context_length": context.max().item(),
     }
-    arguments = (query, key_cache, value_cache, context, table, dim**-0.5, query_length)
+    arguments = (
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        head_dim**-0.5,
+        query_length,
+    )
     plan = pa.plan_pa_decode(
         context,
         kv_heads,
@@ -469,7 +557,12 @@ def test_pa_decode(case, device, monkeypatch):
         _check_unsupported_input(pa, arguments, options, plan, case, monkeypatch)
         return
 
-    output = torch.full_like(query, float("nan"))
+    output = torch.full(
+        (*query.shape[:-1], value_dim),
+        float("nan"),
+        dtype=query.dtype,
+        device=device,
+    )
     workspace = {}
     if case["capture"]:
         scalar_shape = (kv_heads, plan.capacity, query_length * group_size)
@@ -477,7 +570,7 @@ def test_pa_decode(case, device, monkeypatch):
             "exp_sums": torch.empty(scalar_shape, dtype=torch.float32, device=device),
             "max_logits": torch.empty(scalar_shape, dtype=torch.float32, device=device),
             "temporary_output": torch.empty(
-                (*scalar_shape, dim), dtype=query.dtype, device=device
+                (*scalar_shape, value_dim), dtype=query.dtype, device=device
             ),
         }
 
