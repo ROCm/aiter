@@ -26,7 +26,13 @@ from __future__ import annotations
 import functools
 import logging
 import os
-from dataclasses import dataclass
+
+from .kernels.comm.allreduce_shared import (
+    NO_MAX,
+    FamilyPolicy,
+    OneShotPolicy,
+    QuantPolicy,
+)
 
 logger = logging.getLogger("aiter")
 
@@ -34,49 +40,6 @@ logger = logging.getLogger("aiter")
 LINKS = ("pcie", "xgmi")
 
 SUPPORTED_WORLDS = (2, 4, 8)
-
-# No ceiling. The ring's inbox is a fixed ring of wire slots sized by ``ST * grid``.
-NO_MAX = 1 << 62
-
-
-@dataclass(frozen=True)
-class FamilyPolicy:
-    """Family boundaries for one ``(link, world_size)``, in payload bytes.
-
-    ``min_bytes`` is where this whole path starts being worth taking; below it
-    the caller should fall through to other alternatives.
-
-    The two one-shot ceilings are measured against *different* alternatives and
-    so do not order against each other:
-
-    * ``oneshot_max`` is where the quantized **mesh** overtakes the fastest
-      exact kernel: the one-shot, or ``cross_device_reduce`` where that is
-      faster. It is the quick-reduce slot's exclusive floor.
-    * ``oneshot_max_exact`` is where ``cross_device_reduce``/RCCL -- what the
-      payload reaches if every FlyDSL family declines -- overtakes it. It is the
-      custom-all-reduce slot's ceiling.
-    """
-
-    oneshot_max: int
-    oneshot_max_exact: int
-    mesh_max: int
-    min_bytes: int = 0
-    max_bytes: int = NO_MAX
-
-    def __post_init__(self):
-        if self.oneshot_max <= 0 or self.oneshot_max_exact <= 0:
-            raise ValueError(
-                f"oneshot_max ({self.oneshot_max}) and oneshot_max_exact "
-                f"({self.oneshot_max_exact}) must be positive"
-            )
-        if self.mesh_max < self.oneshot_max:
-            raise ValueError(
-                f"mesh_max ({self.mesh_max}) must be >= oneshot_max "
-                f"({self.oneshot_max}); the families partition by size"
-            )
-        if self.min_bytes < 0:
-            raise ValueError(f"min_bytes ({self.min_bytes}) must be non-negative")
-
 
 FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     # --- PCIe: Policy from measurements (on gfx950/MI350P) --------
@@ -215,28 +178,6 @@ def _oneshot_boundary(base: FamilyPolicy) -> int:
 
     override = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
     return base.oneshot_max if override is None else override
-
-
-@dataclass(frozen=True)
-class OneShotPolicy:
-    """The exact one-shot's window, as the custom-all-reduce slot sees it."""
-
-    max_bytes: int
-    min_bytes: int = 0
-
-
-@dataclass(frozen=True)
-class QuantPolicy:
-    """The quantized families' window, as the quick-reduce slot sees it.
-
-    ``floor`` is **exclusive**: dispatch only when ``nbytes > floor``. At or
-    below it the exact one-shot is faster, and declining is what lets the
-    payload reach the custom-all-reduce slot that hosts it.
-    """
-
-    floor: int
-    mesh_max: int
-    max_bytes: int
 
 
 def resolve_oneshot(

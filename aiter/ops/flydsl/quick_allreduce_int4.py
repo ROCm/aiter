@@ -19,6 +19,7 @@ which sets the tile). Ladders are keyed on ``(link, world_size)``.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -45,7 +46,9 @@ from .kernels.comm.allreduce_shared import (
     DEFAULT_GRID_CAP,
     SUPPORTED_WORLDS,
     WORLD,
+    TwoShotRung,
     has_release_fence,
+    pick_rung,
 )
 from .kernels.comm.quick_allreduce_codec import SUPPORTED_BLOCKS
 from .kernels.comm.quick_allreduce_int4 import (
@@ -132,8 +135,8 @@ class _Algorithm:
     def floor_bytes(self, world_size: int) -> int:
         return dict(self.min_bytes_by_world).get(int(world_size), self.min_bytes)
 
-    # ``(world_size, link) -> ((min_payload_bytes, super_tile, grid_cap,
-    # block), ...)``, ascending. When the caller did not pin ``super_tile``,
+    # ``(world_size, link) -> (TwoShotRung, ...)``, ascending. When the caller
+    # did not pin ``super_tile``,
     # ``QuickAllReduceInt4`` builds an engine per rung and selects by payload
     # size at launch.
     #
@@ -143,9 +146,11 @@ class _Algorithm:
     # are tuned separately. An empty ladder means "one super-tile for every
     # size"; no schedule uses that any more, but the code path stays because
     # pinning ``super_tile`` still collapses to it.
-    st_ladder: Callable[[int, str], tuple] | None = None
+    st_ladder: Callable[[int, str], tuple[TwoShotRung, ...]] | None = None
 
-    def ladder_for(self, world_size: int, link: str = "pcie") -> tuple:
+    def ladder_for(
+        self, world_size: int, link: str = "pcie"
+    ) -> tuple[TwoShotRung, ...]:
         """Rungs for *(link, world_size)*; ``()`` when there is no ladder."""
         if self.st_ladder is None:
             return ()
@@ -373,8 +378,7 @@ class QuickAllReduceInt4:
             """A rung's ``block`` with the caller's override."""
             return int(rung_block if block is None else block)
 
-        # Rungs to build, each ``(min_bytes, super_tile, grid_cap, block)``.
-        # Pinning ``super_tile`` collapses the ladder to that one rung -- a
+        # Rungs to build. Pinning ``super_tile`` collapses the ladder to that one rung -- a
         # caller who named a super-tile gets exactly it, at every size.
         #
         # ``grid_cap`` is a *ceiling*, not a pin: it bounds every rung rather
@@ -385,11 +389,20 @@ class QuickAllReduceInt4:
         world_ladder = algo.ladder_for(world_size, link)
         if world_ladder and not pinned_st:
             ladder = tuple(
-                (floor, st, min(rung_cap, cap), _block(b))
-                for floor, st, rung_cap, b in world_ladder
+                dataclasses.replace(
+                    r, grid_cap=min(r.grid_cap, cap), block=_block(r.block)
+                )
+                for r in world_ladder
             )
         else:
-            ladder = ((0, int(super_tile), cap, _block(BLOCK)),)
+            ladder = (
+                TwoShotRung(
+                    min_bytes=0,
+                    super_tile=int(super_tile),
+                    grid_cap=cap,
+                    block=_block(BLOCK),
+                ),
+            )
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")
         self.group = group
@@ -435,12 +448,12 @@ class QuickAllReduceInt4:
         # built a 194 MiB inbox to launch at most 32 blocks into, and did it on
         # every object ever constructed.
         caps = {}
-        for _floor, st, rung_cap, b in ladder:
-            caps.setdefault((st, b), rung_cap)
+        for r in ladder:
+            caps.setdefault((r.super_tile, r.block), r.grid_cap)
         for b in {b for _st, b in list(caps)}:
             caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
         self._ladder = ladder if (world_ladder and not pinned_st) else ()
-        self._primary = ladder[0][1:2] + ladder[0][3:]
+        self._primary = (ladder[0].super_tile, ladder[0].block)
         self._by_cfg = {}
         try:
             with torch.cuda.device(self._device_index):
@@ -517,11 +530,10 @@ class QuickAllReduceInt4:
         and the measurements behind them are in ``MESH_ST_LADDER`` and
         ``RING_ST_LADDER``.
         """
-        cfg = self._primary
-        for floor, st, _cap, b in self._ladder:
-            if live_bytes >= floor:
-                cfg = (st, b)
-        return cfg
+        if not self._ladder:
+            return self._primary
+        rung = pick_rung(self._ladder, live_bytes)
+        return (rung.super_tile, rung.block)
 
     @staticmethod
     def _num_tiles(live_bytes: int, block: int) -> int:
@@ -649,7 +661,7 @@ class QuickAllReduceInt4:
     def cfgs_for(self, lo: int, hi: int) -> list[tuple[int, int]]:
         """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
         select, in build order."""
-        floors = [rung[0] for rung in self._ladder]
+        floors = [rung.min_bytes for rung in self._ladder]
         picked = {self._pick_cfg(n)[0] for n in payload_probes(floors, lo, hi)}
         return [key for key in self._by_cfg if key in picked]
 

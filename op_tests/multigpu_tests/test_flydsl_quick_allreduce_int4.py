@@ -372,9 +372,9 @@ def _expected_cfg(
     and the clamped value is what the selection compares against.
     """
     want, b = 1, None
-    for floor, rung_st, _cap, rung_b in ladder:
-        if nbytes >= floor:
-            want, b = rung_st, rung_b
+    for rung in ladder:
+        if nbytes >= rung.min_bytes:
+            want, b = rung.super_tile, rung.block
     b = b if block is None else block
     if want == 1:
         return 1, b
@@ -415,16 +415,16 @@ def _rung_grids(world_size: int, ladder: tuple) -> dict[tuple, int]:
     """
     cu_count = int(torch.cuda.get_device_properties(0).multi_processor_count)
     grids = {}
-    for _floor, st, cap, b in ladder:
+    for rung in ladder:
         grids.setdefault(
-            (st, b),
+            (rung.super_tile, rung.block),
             clamp_grid_cap(
-                min(cap, DEFAULT_GRID_CAP),
+                min(rung.grid_cap, DEFAULT_GRID_CAP),
                 arch=ARCH,
                 world_size=world_size,
-                super_tile=st,
+                super_tile=rung.super_tile,
                 cu_count=cu_count,
-                block=b,
+                block=rung.block,
             ),
         )
     return grids
@@ -445,10 +445,11 @@ def _kernel_payloads(
     inbox_memory = _resolve_inbox_flags("auto", world_size)[1]
     batched = batches_publishes(inbox_memory, algorithm, link)
     grids = _rung_grids(world_size, ladder)
-    ends = [floor - 1 for floor, *_ in ladder[1:]] + [hi]
+    ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
     out: dict[tuple, int] = {}
-    for (floor, st, _cap, b), end in zip(ladder, ends):
-        start, end = max(lo, floor), min(hi, end)
+    for rung, end in zip(ladder, ends):
+        st, b = rung.super_tile, rung.block
+        start, end = max(lo, rung.min_bytes), min(hi, end)
         probes = [start]
         if st > 1:
             # The first payload with a whole super-tile when batched, and with
@@ -487,8 +488,8 @@ def _ship_payloads(
     by_cfg = _kernel_payloads(
         world_size, algorithm, link, policy.floor + 1, policy.max_bytes
     )
-    _floor, st, _cap, b = _ladder(algorithm, world_size, link)[0]
-    return [by_cfg.get((st, b), min(by_cfg.values()))], None
+    first = _ladder(algorithm, world_size, link)[0]
+    return [by_cfg.get((first.super_tile, first.block), min(by_cfg.values()))], None
 
 
 def _fmt_bytes(nbytes: int) -> str:

@@ -29,7 +29,7 @@ from .allreduce_shared import (
     kernel_symbol,
     payload_probes,
 )
-from .kernels.comm.allreduce_shared import SUPPORTED_WORLDS
+from .kernels.comm.allreduce_shared import SUPPORTED_WORLDS, OneShotRung, pick_rung
 from .kernels.comm.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
@@ -154,19 +154,17 @@ class OneShotAllReduce:
         )
 
         if pinned:
-            self._ladder = ((0, int(atoms), cap, fanout, int(block)),)
-        else:
-            ceiling = cap if grid_cap is not None else None
-            self._ladder = tuple(
-                (
-                    floor,
-                    a,
-                    rung_cap if ceiling is None else min(rung_cap, ceiling),
-                    f,
-                    b,
-                )
-                for floor, a, rung_cap, f, b in oneshot_ladder(world_size, link)
+            self._ladder = (
+                OneShotRung(
+                    min_bytes=0,
+                    atoms=int(atoms),
+                    grid_cap=cap,
+                    fanout=fanout,
+                    block=int(block),
+                ),
             )
+        else:
+            self._ladder = oneshot_ladder(world_size, link)
 
         # One engine per distinct rung config, built in a fixed sorted order:
         # each does its own IPC handle exchange, which is a collective, so ranks
@@ -180,7 +178,7 @@ class OneShotAllReduce:
         try:
             with torch.cuda.device(self._device_index):
                 for rung in self._ladder:
-                    key = self._cfg_of(rung)
+                    key = rung.cfg
                     if key in self._by_cfg:
                         continue
                     spec = make_one_shot_allreduce_kernel(
@@ -210,7 +208,7 @@ class OneShotAllReduce:
         # config that is the only rung and these are exact; with a ladder they
         # describe the smallest payloads, which is what a caller inspecting
         # ``tile_bytes`` is almost always asking about.
-        first = self._cfg_of(self._ladder[0])
+        first = self._ladder[0].cfg
         eng, spec = self._by_cfg[first]
         self.atoms = first[0]
         self.grid_cap = first[1]
@@ -225,20 +223,10 @@ class OneShotAllReduce:
         """IPC inbox bytes this object holds on this rank, across every rung."""
         return sum(eng.buf_bytes for eng, _ in self._by_cfg.values())
 
-    @staticmethod
-    def _cfg_of(rung) -> tuple:
-        """A ladder rung's engine key: everything but its ``min_bytes``."""
-        _floor, atoms, cap, fanout, block = rung
-        return (int(atoms), int(cap), fanout, int(block))
-
     def _pick_cfg(self, live_bytes: int) -> tuple:
         """``(atoms, grid_cap, fanout, block)`` the ladder assigns to
         *live_bytes*."""
-        chosen = self._ladder[0]
-        for rung in self._ladder:
-            if live_bytes >= rung[0]:
-                chosen = rung
-        return self._cfg_of(chosen)
+        return pick_rung(self._ladder, live_bytes).cfg
 
     def _num_tiles(self, live_bytes: int, tile_bytes: int | None = None) -> int:
         tb = self.tile_bytes if tile_bytes is None else tile_bytes
@@ -322,7 +310,7 @@ class OneShotAllReduce:
     def cfgs_for(self, lo: int, hi: int) -> list[tuple]:
         """``_by_cfg`` keys a payload of ``lo..hi`` bytes (inclusive) can
         select, in build order."""
-        floors = [rung[0] for rung in self._ladder]
+        floors = [rung.min_bytes for rung in self._ladder]
         picked = {self._pick_cfg(n) for n in payload_probes(floors, lo, hi)}
         return [key for key in self._by_cfg if key in picked]
 

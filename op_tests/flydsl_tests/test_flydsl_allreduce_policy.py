@@ -97,22 +97,24 @@ def test_ladders_are_well_formed(ws):
             ("ring", ring_st_ladder(ws, link), RING_SUPER_TILES),
         ):
             assert rungs, (name, link)
-            assert rungs[0][0] == 0, (name, link)
-            assert [r[0] for r in rungs] == sorted(r[0] for r in rungs), (name, link)
-            for _floor, st, cap, block in rungs:
-                assert st in valid_st, (name, link, st)
-                assert cap >= 1, (name, link, cap)
-                assert block in TWO_STAGE_BLOCKS, (name, link, block)
+            assert rungs[0].min_bytes == 0, (name, link)
+            floors = [r.min_bytes for r in rungs]
+            assert floors == sorted(floors), (name, link)
+            for r in rungs:
+                assert r.super_tile in valid_st, (name, link, r)
+                assert r.grid_cap >= 1, (name, link, r)
+                assert r.block in TWO_STAGE_BLOCKS, (name, link, r)
 
     for link in P.LINKS:
         one = oneshot_ladder(ws, link)
-        assert one and one[0][0] == 0, link
-        assert [r[0] for r in one] == sorted(r[0] for r in one), link
-        for _floor, atoms, cap, fanout, block in one:
-            assert atoms in SUPPORTED_ATOMS, (link, atoms)
-            assert cap >= 1, (link, cap)
-            assert fanout in ("peer", "atom"), (link, fanout)
-            assert block in SUPPORTED_BLOCKS, (link, block)
+        assert one and one[0].min_bytes == 0, link
+        floors = [r.min_bytes for r in one]
+        assert floors == sorted(floors), link
+        for r in one:
+            assert r.atoms in SUPPORTED_ATOMS, (link, r)
+            assert r.grid_cap >= 1, (link, r)
+            assert r.fanout in ("peer", "atom"), (link, r)
+            assert r.block in SUPPORTED_BLOCKS, (link, r)
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -159,10 +161,10 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws, arch):
         # open, the payloads between that ceiling and the quant floor fall
         # through to ``cross_device_reduce``.
         one_hi = P.resolve_oneshot(link, ws, arch).max_bytes
-        for _floor, *_ in oneshot_ladder(ws, link)[1:]:
-            assert _floor < one_hi, ("oneshot", link, ws, _floor)
-        for floor, *_ in mesh_st_ladder(ws, link)[1:]:
-            assert floor < quant.mesh_max, ("mesh", link, ws, floor)
+        for r in oneshot_ladder(ws, link)[1:]:
+            assert r.min_bytes < one_hi, ("oneshot", link, ws, r)
+        for r in mesh_st_ladder(ws, link)[1:]:
+            assert r.min_bytes < quant.mesh_max, ("mesh", link, ws, r)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.
 

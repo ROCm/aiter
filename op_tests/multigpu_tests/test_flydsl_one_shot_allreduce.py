@@ -231,10 +231,10 @@ def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]
     policy = fly_policy.resolve_oneshot(link, tp)
     lo, hi = policy.min_bytes, policy.max_bytes
     ladder = oneshot_ladder(tp, link)
-    ends = [floor - 1 for floor, *_ in ladder[1:]] + [hi]
+    ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
     payloads = set()
-    for (floor, *_rung), end in zip(ladder, ends):
-        first = -(-max(lo, floor, 1) // _ROW_BYTES) * _ROW_BYTES
+    for rung, end in zip(ladder, ends):
+        first = -(-max(lo, rung.min_bytes, 1) // _ROW_BYTES) * _ROW_BYTES
         last = min(hi, end) // _ROW_BYTES * _ROW_BYTES
         if first <= last:
             payloads.update((first, last))

@@ -4,10 +4,13 @@
 """Transport parts that the one-shot, mesh and ring all-reduce kernels share.
 
 This module contains the tile geometry, the inbox cache-policy table, the peer
-store and load primitives, and the LDS staging factory.
+store and load primitives, and the LDS staging factory. It also contains the
+records that the kernels, their hosts and the dispatch policy share: the
+ladder rungs and the policy rows.
 """
 
 import logging
+from dataclasses import dataclass
 
 import flydsl.expr as fx
 from flydsl.expr import rocdl
@@ -35,6 +38,135 @@ I32_BYTES = 4
 # backend performs atomically.
 FLAG_LANES = 8
 FLAG_I32_PER_LANE = 2
+
+# No ceiling, as a payload size in bytes.
+NO_MAX = 1 << 62
+
+
+# Tuning ladders
+# ==============
+#
+# A ladder is a tuple of rungs in ascending ``min_bytes`` order, and the first
+# rung has ``min_bytes == 0``. The host builds one engine per distinct rung
+# and, at launch, runs a payload on the last rung whose ``min_bytes`` is at
+# most the payload size. ``pick_rung`` makes that choice.
+
+
+@dataclass(frozen=True)
+class OneShotRung:
+    """The one-shot kernel configuration for payloads of at least ``min_bytes``.
+
+    ``atoms`` and ``block`` both scale the tile, and their product sets the
+    block count. They are separate knobs because only ``block`` also changes
+    the workgroup size, and only ``atoms`` also changes how many stores one
+    thread has in flight. ``grid_cap`` bounds the block count. ``fanout``
+    selects the order of the stores to the peers.
+    """
+
+    min_bytes: int
+    atoms: int
+    grid_cap: int
+    fanout: str
+    block: int
+
+    @property
+    def cfg(self) -> tuple[int, int, str, int]:
+        """The engine key: every field except ``min_bytes``."""
+        return (self.atoms, self.grid_cap, self.fanout, self.block)
+
+
+@dataclass(frozen=True)
+class TwoShotRung:
+    """The mesh or ring kernel configuration for payloads of at least
+    ``min_bytes``.
+
+    ``super_tile`` is the number of tiles a block publishes at once, and
+    ``block`` sets the tile. ``grid_cap`` bounds the block count, and with
+    ``super_tile`` it sets the size of the IPC inbox.
+    """
+
+    min_bytes: int
+    super_tile: int
+    grid_cap: int
+    block: int
+
+
+def pick_rung(ladder, nbytes: int):
+    """The rung of *ladder* that runs a payload of *nbytes*."""
+    chosen = ladder[0]
+    for rung in ladder:
+        if nbytes >= rung.min_bytes:
+            chosen = rung
+    return chosen
+
+
+# Dispatch policy records
+# =======================
+#
+# ``allreduce_policy`` keeps the tables of these records and the functions
+# that resolve them.
+
+
+@dataclass(frozen=True)
+class FamilyPolicy:
+    """Family boundaries for one ``(link, world_size)``, in payload bytes.
+
+    ``min_bytes`` is where this whole path starts being worth taking; below it
+    the caller should fall through to other alternatives.
+
+    The two one-shot ceilings are measured against *different* alternatives and
+    so do not order against each other:
+
+    * ``oneshot_max`` is where the quantized **mesh** overtakes the fastest
+      exact kernel: the one-shot, or ``cross_device_reduce`` where that is
+      faster. It is the quick-reduce slot's exclusive floor.
+    * ``oneshot_max_exact`` is where ``cross_device_reduce``/RCCL -- what the
+      payload reaches if every FlyDSL family declines -- overtakes it. It is the
+      custom-all-reduce slot's ceiling.
+    """
+
+    oneshot_max: int
+    oneshot_max_exact: int
+    mesh_max: int
+    min_bytes: int = 0
+    max_bytes: int = NO_MAX
+
+    def __post_init__(self):
+        if self.oneshot_max <= 0 or self.oneshot_max_exact <= 0:
+            raise ValueError(
+                f"oneshot_max ({self.oneshot_max}) and oneshot_max_exact "
+                f"({self.oneshot_max_exact}) must be positive"
+            )
+        if self.mesh_max < self.oneshot_max:
+            raise ValueError(
+                f"mesh_max ({self.mesh_max}) must be >= oneshot_max "
+                f"({self.oneshot_max}); the families partition by size"
+            )
+        if self.min_bytes < 0:
+            raise ValueError(f"min_bytes ({self.min_bytes}) must be non-negative")
+
+
+@dataclass(frozen=True)
+class OneShotPolicy:
+    """The exact one-shot's window, as the custom-all-reduce slot sees it."""
+
+    max_bytes: int
+    min_bytes: int = 0
+
+
+@dataclass(frozen=True)
+class QuantPolicy:
+    """The quantized families' window, as the quick-reduce slot sees it.
+
+    ``floor`` is **exclusive**: dispatch only when ``nbytes > floor``. At or
+    below it an exact kernel is faster, and declining is what lets the payload
+    reach the custom-all-reduce slot that hosts the exact kernels.
+    """
+
+    floor: int
+    mesh_max: int
+    max_bytes: int
+
 
 # Buffer aux bits on gfx942/gfx950. This is LLVM's CPol encoding, which the
 # backend renames for CDNA: bit 0 (GLC) prints as `sc0`, bit 1 (SLC) as `nt`,
