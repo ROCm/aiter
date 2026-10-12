@@ -3,12 +3,12 @@
 
 """Fused split-K reduction shared by the K-split workgroups in one cluster."""
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
 
-from .communication_ops_utils import traced
 from .gemm_common_gfx1250 import workgroup_barrier
 from .tensor_shim import buf_copy_load, buf_copy_store, ptr_buf_tensor
 
@@ -19,7 +19,7 @@ UNROLL = 32
 MAX_PARTIAL_VECTORS = 128  # 512 dwords per load batch, including split-K 8.
 
 
-@traced
+@flyc.jit
 def emit_fused_splitk_epilogue(
     *,
     elem,

@@ -27,7 +27,7 @@ def _gview64(tensor, base, shape, stride):
 
 
 def _fast_exp(x):
-    return rocdl.exp2(T.f32, _to_raw(fx.Float32(x) * _LOG2E))
+    return fx.exp2(fx.Float32(x) * _LOG2E, fastmath="afn")
 
 
 @functools.lru_cache(maxsize=1024)
