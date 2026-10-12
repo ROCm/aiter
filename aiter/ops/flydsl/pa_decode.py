@@ -77,11 +77,11 @@ def launch_pa_decode_ps_reduce(
             f"FlyDSL pa_decode reduce supports at most {partition_limit} partitions"
         )
     use_sinks = sink_token is not None
-    # Bound all attempted i32 byte offsets, including inactive partitions,
-    # so out-of-bounds reads cannot wrap back into valid data.
-    bounded_plan_logits = (
-        context_partition_num <= 64
-        and query_seq_len > 0
+    # A per-sequence span <= INT32_MAX keeps every attempted byte offset,
+    # including inactive partitions, below 2**32, so out-of-bounds reads
+    # cannot wrap back into valid data.
+    bounded_logits = (
+        query_seq_len > 0
         and query_group_size > 0
         and 0 <= stride_logits_head <= 2**31 - 1
         and stride_logits_group == head_size
@@ -92,7 +92,8 @@ def launch_pa_decode_ps_reduce(
     )
     # Paired loads need dword alignment; scalar output stores do not.
     vectorize_plan_logits = (
-        bounded_plan_logits
+        bounded_logits
+        and context_partition_num <= 64
         and head_size == 128
         and logits.dtype in (torch.bfloat16, torch.float16)
         and logits.data_ptr() % 4 == 0
@@ -110,7 +111,7 @@ def launch_pa_decode_ps_reduce(
         ),
         use_sinks=use_sinks,
         query_group_size=query_group_size,
-        bounded_plan_logits=bounded_plan_logits,
+        bounded_logits=bounded_logits,
         vectorize_plan_logits=vectorize_plan_logits,
         compact_plan=(
             head_size == 128

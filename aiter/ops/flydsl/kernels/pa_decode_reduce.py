@@ -74,7 +74,7 @@ def compile_pa_decode_ps_reduce(
     sink_dtype_str: str,
     use_sinks: bool,
     query_group_size: int | None = None,
-    bounded_plan_logits: bool = False,
+    bounded_logits: bool = False,
     vectorize_plan_logits: bool = False,
     compact_plan: bool = False,
     parallel_d256: bool = False,
@@ -87,12 +87,13 @@ def compile_pa_decode_ps_reduce(
     Sinks are per-head zero-value logits: include them in the shared maximum
     for stability and add their denominator mass once after summing KV.
     ``query_group_size`` is None for runtime GQA, or a matching positive value.
-    ``bounded_plan_logits`` requires planned NP<=64, packed contiguous rows
-    and a positive NP-part byte span <= INT32_MAX. Per-sequence bounds
-    zero-fill inactive loads without reading adjacent sequences.
-    ``vectorize_plan_logits`` also requires D128 bf16/f16 logits, a four-byte
-    aligned base and even head/part/group strides. Output stores retain
-    scalar alignment.
+    ``bounded_logits`` declares packed contiguous logits rows and a positive
+    NP-part byte span <= INT32_MAX. Per-sequence bounds then zero-fill
+    inactive loads without reading adjacent sequences. The NP<=64 planned
+    reducer uses it when set; the LDS reducer requires it.
+    ``vectorize_plan_logits`` also requires NP<=64, D128 bf16/f16 logits, a
+    four-byte aligned base and even head/part/group strides. Output stores
+    retain scalar alignment.
     """
     _validate_pa_decode_ps_reduce_config(
         max_context_partition_num=max_context_partition_num,
@@ -103,8 +104,7 @@ def compile_pa_decode_ps_reduce(
     )
     if query_group_size is not None and query_group_size <= 0:
         raise ValueError("query_group_size must be positive when specified")
-    if bounded_plan_logits and max_context_partition_num > 64:
-        raise ValueError("bounded_plan_logits requires a planned NP<=64 reducer")
+    bounded_plan_logits = bounded_logits and max_context_partition_num <= 64
     if vectorize_plan_logits and (
         not bounded_plan_logits
         or head_size != 128
@@ -139,6 +139,11 @@ def compile_pa_decode_ps_reduce(
     use_parallel_lds = (
         head_size == 128 and max_context_partition_num > warp_size and not compact_plan
     ) or parallel_d256
+    if use_parallel_lds and not bounded_logits:
+        raise ValueError(
+            "the NP>64 LDS reducer requires bounded_logits "
+            "(packed contiguous logits rows)"
+        )
     parallel_groups = 1
     if use_parallel_lds:
         if parallel_d256:
@@ -213,10 +218,10 @@ def compile_pa_decode_ps_reduce(
         first_part = (c_part_num > zero_i).select(first_part, zero_i)
         stats_seq_offset = first_part * stride_exp_sums_part
         logits_seq_offset = first_part * stride_logits_part
-        if fx.const_expr(bounded_plan_logits):
+        if fx.const_expr(bounded_logits):
             # Rebase in i64 before narrowing: packed storage can exceed 2 GiB.
             logits_item_bytes = logits_dtype.width // 8
-            planned_logits_base = (
+            bounded_logits_base = (
                 buf_base_i64(logits_ptr)
                 + (
                     fx.Int64(first_part) * fx.Int64(stride_logits_part)
@@ -224,15 +229,15 @@ def compile_pa_decode_ps_reduce(
                 )
                 * logits_item_bytes
             )
-            planned_logits_bytes = (
+            bounded_logits_bytes = (
                 fx.Int64(c_part_num) * fx.Int64(stride_logits_part) * logits_item_bytes
             )
-            planned_logits_buffer = ptr_buf_tensor(
-                planned_logits_base,
+            bounded_logits_buffer = ptr_buf_tensor(
+                bounded_logits_base,
                 logits_dtype,
                 unit_elems=planned_elements_per_thread,
                 unit_stride=1,
-                num_records_bytes=planned_logits_bytes,
+                num_records_bytes=bounded_logits_bytes,
             )
         c_four = fx.Int32(4)
         lane = tid & c_wave_mask
@@ -298,7 +303,7 @@ def compile_pa_decode_ps_reduce(
                     # unit_stride=1 uses element offsets; D128 pairs stay in-row.
                     # A zero-sized descriptor suppresses the entire dword load.
                     planned_loaded_logits = buf_copy_load(
-                        planned_logits_buffer,
+                        bounded_logits_buffer,
                         planned_logits_offset,
                         logits_dtype,
                         unit_elems=planned_elements_per_thread,
@@ -554,18 +559,19 @@ def compile_pa_decode_ps_reduce(
             if group_in_range:
                 for local_part in fx.range_constexpr(parts_per_group):
                     part_idx = group_part_begin + fx.Int32(local_part)
-                    # Inactive weights are zero. Clamp only the logits address
-                    # to a finite active row so zero-weight products stay finite.
-                    safe_part_idx = fx.min(part_idx, c_part_num - fx.Int32(1))
+                    # Inactive slots have zero weight and load zero from past
+                    # the per-sequence bound, so they add exactly +0.
                     weight = fx.Float32(lds_weights[part_idx])
                     logits_offset = (
-                        logits_seq_offset
-                        + kv_head_idx * stride_logits_head
-                        + safe_part_idx * stride_logits_part
+                        part_idx * stride_logits_part
                         + eqgs_idx * stride_logits_group
                         + output_element
                     )
-                    part_logits = fx.Float32(logits[logits_offset])
+                    part_logits = fx.Float32(
+                        buf_copy_load(
+                            bounded_logits_buffer, logits_offset, logits_dtype
+                        )
+                    )
                     acc = acc + part_logits * weight
 
             if partition_group > zero_i:  # noqa: SIM102 - Preserve FlyDSL branches.
