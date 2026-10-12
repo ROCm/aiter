@@ -484,6 +484,10 @@ def _bwd_dq_inner(
             causal_mask = (offs_m[:, None] - delta_qk) >= offs_n[None, :]
             mask = causal_mask & mask_mn
             p = tl.where(mask, p, 0.0)
+        else:
+            # Keys past end_n are loaded as 0, so p = exp(-m) there, which overflows to inf when every
+            # logit of the row is very negative (m < -88). inf * kT(=0) would then put NaN in dq.
+            p = tl.where(mask_n[None, :], p, 0.0)
         if SLIDING_WINDOW > 0:
             window_mask = offs_n[None, :] >= (
                 offs_m[:, None] - delta_qk - SLIDING_WINDOW

@@ -9,6 +9,7 @@ from aiter import logger
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
+    mha_set_impl,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
@@ -989,6 +990,66 @@ def test_mha_backward_varlen(
     tols = [fwd_tol] + bwd_tols
     for tri, ref, (atol, rtol) in zip(triton_vals, ref_vals, tols):
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
+
+
+@pytest.mark.parametrize("impl", ["default", "dao_ai"])
+def test_mha_backward_varlen_very_negative_logits(impl: str):
+    # Rows whose logits are all very negative (logsumexp < -88) used to overflow exp(0 - lse) to inf
+    # on the zero-loaded keys of the last partial key block of the unmasked dq loop, and inf * 0 put
+    # NaN in dq. Seen on real Qwen2.5-1.5B activations. The sequence lengths are not block multiples
+    # so that partial block exists.
+    torch.cuda.empty_cache()
+    torch.manual_seed(0)
+    mha_set_use_fused_bwd_kernel(False)
+    NUM_HEADS, HEAD_SZ = 4, 128
+    seqlens = [300, 250]
+    total = sum(seqlens)
+    u = torch.nn.functional.normalize(torch.randn(HEAD_SZ, device="cuda"), dim=0)
+    a = 34.0  # q . k ~ -a^2, so logits ~ -a^2 / sqrt(HEAD_SZ) ~ -102
+    q = (-a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
+        torch.bfloat16
+    )
+    k = (a * u + 0.5 * torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda")).to(
+        torch.bfloat16
+    )
+    v = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
+    do = torch.randn(total, NUM_HEADS, HEAD_SZ, device="cuda", dtype=torch.bfloat16)
+    q.requires_grad = True
+    k.requires_grad = True
+    v.requires_grad = True
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+
+    mha_set_impl(impl)
+    try:
+        triton_out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=True
+        )
+        triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
+    finally:
+        mha_set_impl("default")
+
+    # Reference: fp32 attention per sequence.
+    q_ref, k_ref, v_ref = (t.detach().float().requires_grad_(True) for t in (q, k, v))
+    ref_out = torch.cat(
+        [
+            attention_ref(
+                q_ref[s:e][None], k_ref[s:e][None], v_ref[s:e][None], causal=True
+            )[0][0]
+            for s, e in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist())
+        ]
+    )
+    torch_dq, torch_dk, torch_dv = torch.autograd.grad(
+        ref_out, (q_ref, k_ref, v_ref), do.float()
+    )
+
+    for tri, ref in zip(
+        (triton_dq, triton_dk, triton_dv), (torch_dq, torch_dk, torch_dv)
+    ):
+        assert torch.isfinite(tri).all()
+        # |q| and |k| are ~34 here, so bf16 rounding alone gives ~2% error (the fused backward matches it).
+        torch.testing.assert_close(tri, ref.to(tri.dtype), atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.parametrize(
