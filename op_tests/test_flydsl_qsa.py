@@ -2202,7 +2202,8 @@ def test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch():
     Decode is ``M<=8``. Every larger requested M, including 64, 2048, and
     8192, is prefill. A nonzero K1 set mismatch and a K2 err above the
     unit tolerance (``checkAllclose`` rtol=1e-2 atol=1e-2, so ``err!=0``)
-    raise. ``M > L`` is skipped.
+    raise, as does a nonzero FlyDSL or eager-Triton end-to-end column.
+    ``M > L`` is skipped.
     """
     if _skip_m_past_seq(8, 512, "family A K1 decode"):
         raise AssertionError("M <= L was skipped")
@@ -2229,6 +2230,18 @@ def test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch():
             raise
     else:
         raise AssertionError("K2 err above the unit tolerance did not fail the sweep")
+    _raise_if_row_mismatch(
+        {"flydsl_e2e err": 0, "vllm_amd_e2e err": 0},
+        1,
+        512,
+    )
+    try:
+        _raise_if_row_mismatch({"vllm_amd_e2e err": 0.01}, 8, 8192)
+    except AssertionError as exc:
+        if "vllm_amd_e2e err" not in str(exc):
+            raise
+    else:
+        raise AssertionError("nonzero e2e err did not fail the sweep")
 
 
 def _flydsl_k1_select(
@@ -4017,6 +4030,19 @@ def _raise_if_k2_above_tolerance(err, m, seq_len):
         )
 
 
+def _raise_if_row_mismatch(row, m, seq_len):
+    """Fail when a gated candidate's ``checkAllclose`` fraction is nonzero.
+
+    ``err != 0`` is one element outside the rtol/atol already passed to
+    ``checkAllclose``.
+    """
+    for key, err in row.items():
+        if key.endswith(" err") and err != 0:
+            raise AssertionError(
+                f"{key}={err} at M={m} L={seq_len} is above that column's tolerance"
+            )
+
+
 def main():
     _run_unit_cases()
 
@@ -4441,11 +4467,11 @@ def main():
         ):
             if m > seq_len:
                 continue
-            rows.append(
-                bench_qsa_family_a_e2e(
-                    m, seq_len, page_size, dtype, rotate, cache_layout
-                )
+            row = bench_qsa_family_a_e2e(
+                m, seq_len, page_size, dtype, rotate, cache_layout
             )
+            _raise_if_row_mismatch(row, m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -4462,9 +4488,11 @@ def main():
         ):
             if m > seq_len:
                 continue
-            rows.append(
-                bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout)
+            row = bench_qsa_family_a_e2e_graph(
+                m, seq_len, page_size, dtype, cache_layout
             )
+            _raise_if_row_mismatch(row, m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
@@ -4490,17 +4518,17 @@ def main():
         ):
             if m > seq_len:
                 continue
-            rows.append(
-                bench_qsa_family_b_e2e(
-                    m,
-                    seq_len,
-                    page_size,
-                    dtype,
-                    index_heads,
-                    rotate,
-                    cache_layout,
-                )
+            row = bench_qsa_family_b_e2e(
+                m,
+                seq_len,
+                page_size,
+                dtype,
+                index_heads,
+                rotate,
+                cache_layout,
             )
+            _raise_if_row_mismatch(row, m, seq_len)
+            rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
