@@ -44,7 +44,9 @@ What this file does instead
    gives the same effect as upstream's compaction -- dead slots cost one
    wave-uniform branch for the whole block -- without a shared-memory table.
    Every block still works on every live slot, so each one keeps full grid
-   parallelism.
+   parallelism.  Blocks start on different slots, though: with every block on
+   the same slot the grid reads one owner, over one xGMI link, at a time.
+   DSv4-Pro EP8, 8 slots from 7 owners: 102 -> 178 GB/s per rank.
 2. **Batched issue instead of a warp split.**  The reference pairs each remote
    ``buffer_load`` with the ``buffer_store`` that consumes it, exposing one full
    remote latency per 16 B.  Here a whole batch of loads is issued before any
@@ -129,7 +131,7 @@ def make_moonep_weight_prefetch_fast_jit(
     # The layout is part of the cache key: the kernel arguments are only addresses.
     layout = "_".join(f"{b}o{o}" for b, o in zip(part_row_bytes, part_offsets))
     name = (
-        f"moonep_weight_prefetch_parts_{'rc' if track_resident else 'r0'}"
+        f"moonep_weight_prefetch_rot_{'rc' if track_resident else 'r0'}"
         f"_epr{experts_per_rank}_b{prefetch_slots}_s{segment_bytes}_p{layout}"
         f"_g{block_num}_t{block_threads}_f{loads_in_flight}"
     )
@@ -147,8 +149,11 @@ def make_moonep_weight_prefetch_fast_jit(
         experts_rsrc = create_buffer_resource_from_addr(addr_experts_to_copy)
 
         # Slots on the outside: an idle slot costs one wave-uniform branch for
-        # the whole block instead of 1/B of every thread's iterations.
-        for slot in range(0, prefetch_slots, 1):
+        # the whole block instead of 1/B of every thread's iterations.  Each
+        # block starts on its own slot, so the grid reads from several owners,
+        # over several xGMI links, at once.
+        for step in range(0, prefetch_slots, 1):
+            slot = (fx.Int32(fx.block_idx.x) + step) % fx.Int32(prefetch_slots)
             expert = buffer_load(experts_rsrc, slot, vec_width=1, dtype=T.i32)
             # Depends only on the slot, so this is block-uniform and compiles to
             # a scalar branch -- an idle slot issues no memory traffic at all.
