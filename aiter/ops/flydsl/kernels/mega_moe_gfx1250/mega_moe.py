@@ -481,6 +481,11 @@ class MegaMoEConfig:
             self.schedule = tuned["schedule"]
 
     @property
+    def dispatch_backend(self) -> str:
+        """The dispatch stage1_fused picks, under the name callers used to pass."""
+        return "flydsl" if self.stage1_fused else "mori"
+
+    @property
     def max_recv(self) -> int:
         return self.world_size * self.max_tokens_per_rank
 
@@ -660,6 +665,7 @@ class MegaMoEGfx1250:
         stage1_fused: bool = False,
         stage2_fused: bool = True,
         combine_quant: str | None = None,
+        dispatch_backend: str | None = None,
     ):
         """Everything here is fixed for the whole model; forward() takes the rest.
 
@@ -694,6 +700,20 @@ class MegaMoEGfx1250:
             )
         if swiglu_limit < 0:
             raise ValueError(f"swiglu_limit must be non-negative, got {swiglu_limit}")
+        # Accepted for callers that still name the dispatch; stage1_fused decides.
+        if dispatch_backend is not None:
+            if dispatch_backend not in ("flydsl", "mori"):
+                raise ValueError(
+                    "dispatch_backend must be 'flydsl' or 'mori', "
+                    f"got {dispatch_backend!r}"
+                )
+            if (dispatch_backend == "flydsl") != bool(stage1_fused):
+                raise ValueError(
+                    f"dispatch_backend={dispatch_backend!r} does not match "
+                    f"stage1_fused={bool(stage1_fused)}: the flydsl dispatch runs "
+                    "only as the compact plan (stage1_fused=True), and "
+                    "stage1_fused=False dispatches through mori"
+                )
         if hidden_pad < 0 or intermediate_pad < 0:
             raise ValueError(
                 f"padding must be non-negative, got {hidden_pad}, {intermediate_pad}"
