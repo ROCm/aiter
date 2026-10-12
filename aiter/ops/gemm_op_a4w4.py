@@ -18,25 +18,6 @@ from ..ops.gemm_op_common import get_padded_m
 from ..utility import dtypes
 
 
-def _check_gemm_a4w4_out(
-    out: Tensor, m_padded: int, n: int, dtype: torch.dtype, device: torch.device
-) -> Tensor:
-    """Validate a caller-owned output. The kernels write whole 32-row tiles, so
-    ``out`` must hold the M rows padded up to a multiple of 32."""
-    if (
-        out.shape != (m_padded, n)
-        or out.dtype != dtype
-        or out.device != device
-        or not out.is_contiguous()
-    ):
-        raise ValueError(
-            f"out must be a contiguous tensor of shape {(m_padded, n)} "
-            f"(M padded to a multiple of 32), dtype {dtype}, device {device}; got "
-            f"shape {tuple(out.shape)}, dtype {out.dtype}, device {out.device}"
-        )
-    return out
-
-
 @functools.lru_cache(maxsize=1024)
 def compute_gemm_SplitK(M: int, N: int, K: int, tile_m: int, tile_n: int, tile_k: int):
     cu_num = get_cu_num()
@@ -169,16 +150,12 @@ def gemm_a4w4_fake(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
-    out: Tensor | None = None,  # [ceil(M / 32) * 32, N], see gemm_a4w4
 ) -> torch.Tensor:
     if dtype == dtypes.fp8:
         raise NotImplementedError(
             "gemm_a4w4 returns one plain-dtype tensor; use gemm_a4w4o8"
         )
     n = B.shape[0]
-    if out is not None:
-        m = A.numel() // A.shape[-1]
-        return out[:m].view(*A.shape[:-1], n)
     return torch.empty((*A.shape[:-1], n), dtype=dtype, device=A.device)
 
 
@@ -196,16 +173,12 @@ def gemm_a4w4(
     apreshuffle: bool | None = False,
     global_A_scale: Tensor | None = None,  # NVFP4 per-tensor
     global_B_scale: Tensor | None = None,  # NVFP4 per-tensor
-    out: Tensor | None = None,  # [ceil(M / 32) * 32, N] caller-owned output
 ) -> torch.Tensor:
     """A4W4 GEMM (4-bit quantized matmul) returning one plain-dtype tensor.
 
     On gfx1250 the call is dispatched to the dedicated F4GEMM asm path.
     MXFP4 vs NVFP4 is selected by the presence of ``global_A_scale``/
     ``global_B_scale`` (NVFP4 per-tensor global scales).
-
-    ``out`` (gfx950 only) is an optional caller-owned buffer of shape
-    ``[ceil(M / 32) * 32, N]``; the result is its first M rows.
     """
     # Low-precision output has a different return arity/shape (mxfp8 is a
     # (data, scale) tuple), so it lives on a separate fixed-arity op.
@@ -216,11 +189,8 @@ def gemm_a4w4(
         )
     m = A.numel() // A.shape[-1]
     n = B.shape[0]
-    k = A.shape[-1] * 2
     gfx_arch = get_gfx()
     if gfx_arch in ["gfx1250"]:
-        if out is not None:
-            raise NotImplementedError("gemm_a4w4 out= is not supported on gfx1250")
         require_gfx1250_asm("gemm_a4w4")
         out = _f4gemm_asm_dispatch(
             A,
@@ -236,11 +206,26 @@ def gemm_a4w4(
             beta=beta,
         )
         return out.view(*A.shape[:-1], out.shape[-1])
-    m_padded = (m + 31) // 32 * 32
-    if out is None:
-        out = torch.empty((m_padded, n), dtype=dtype, device=A.device)
-    else:
-        out = _check_gemm_a4w4_out(out, m_padded, n, dtype, A.device)
+    out = torch.empty(((m + 31) // 32 * 32, n), dtype=dtype, device=A.device)
+    return _gemm_a4w4_into(A, B, A_scale, B_scale, out, bias, alpha, beta, bpreshuffle)
+
+
+def _gemm_a4w4_into(
+    A: Tensor,
+    B: Tensor,
+    A_scale: Tensor,
+    B_scale: Tensor,
+    out: Tensor,  # [ceil(M / 32) * 32, N]
+    bias: Tensor | None,
+    alpha: float | None,
+    beta: float | None,
+    bpreshuffle: bool | None,
+) -> Tensor:
+    """Run the gfx950 A4W4 kernels into ``out``; returns the first M rows."""
+    m = A.numel() // A.shape[-1]
+    n = B.shape[0]
+    k = A.shape[-1] * 2
+    gfx_arch = get_gfx()
     if gfx_arch in ["gfx942"]:
         raise RuntimeError(
             f"A4W4 GEMM kernel is not supported on gfx942, but got {gfx_arch}!"
@@ -284,6 +269,39 @@ def gemm_a4w4(
         log2_k_split=splitK,
     )
     return out[:m].view(*A.shape[:-1], n)
+
+
+# Only ``out`` is written, so it is the only argument declared mutable. Returning
+# nothing keeps the op free of outputs that alias an input under torch.compile.
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def gemm_a4w4_out(
+    out: Tensor,  # [ceil(M / 32) * 32, N] caller-owned output
+    A: Tensor,  # A:[M, K/2] f4x2
+    B: Tensor,  # B:[N, K/2] f4x2
+    A_scale: Tensor,  # A_scale:[M, K/32] e8m0 padded
+    B_scale: Tensor,  # B_scale:[N, K/32] e8m0 padded
+    bias: Tensor | None = None,  # bias:[1, N] f32
+    alpha: float | None = 1.0,
+    beta: float | None = 0.0,
+    bpreshuffle: bool | None = True,
+) -> None:
+    """gemm_a4w4 into a caller-owned buffer. The kernels write whole 32-row
+    tiles, so ``out`` is [ceil(M / 32) * 32, N] and the result is out[:M].
+    Output dtype is ``out.dtype``. gfx950 MXFP4 only."""
+    if get_gfx() in ["gfx1250"]:
+        raise NotImplementedError("gemm_a4w4_out is not supported on gfx1250")
+    m = A.numel() // A.shape[-1]
+    n = B.shape[0]
+    m_padded = (m + 31) // 32 * 32
+    if out.dtype not in (dtypes.bf16, dtypes.fp16):
+        raise ValueError(f"out dtype must be bf16 or fp16, got {out.dtype}")
+    if out.shape != (m_padded, n) or out.device != A.device or not out.is_contiguous():
+        raise ValueError(
+            f"out must be a contiguous tensor of shape {(m_padded, n)} "
+            f"(M padded to a multiple of 32) on {A.device}; got shape "
+            f"{tuple(out.shape)}, stride {tuple(out.stride())}, device {out.device}"
+        )
+    _gemm_a4w4_into(A, B, A_scale, B_scale, out, bias, alpha, beta, bpreshuffle)
 
 
 @compile_ops(

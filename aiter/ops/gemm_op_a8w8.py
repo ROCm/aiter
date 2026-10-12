@@ -738,31 +738,8 @@ def gemm_a8w8_bpreshuffle_fake(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
-    out: Tensor | None = None,
 ) -> Tensor:
-    if out is not None:
-        return out
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
-
-
-def _check_gemm_a8w8_bpreshuffle_out(
-    out: Tensor, m: int, n: int, dtype: torch.dtype, device: torch.device
-) -> Tensor:
-    """Validate a caller-owned output. CK and CKTile write a dense row-major
-    [M, N], so a strided view (e.g. a column slice of a wider buffer) is
-    rejected instead of being overwritten past its bounds."""
-    if (
-        out.shape != (m, n)
-        or out.dtype != dtype
-        or out.device != device
-        or not out.is_contiguous()
-    ):
-        raise ValueError(
-            f"out must be a contiguous tensor of shape {(m, n)}, dtype {dtype}, "
-            f"device {device}; got shape {tuple(out.shape)}, stride "
-            f"{tuple(out.stride())}, dtype {out.dtype}, device {out.device}"
-        )
-    return out
 
 
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
@@ -774,10 +751,7 @@ def gemm_a8w8_bpreshuffle(
     bias: Tensor | None = None,
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
-    out: Tensor | None = None,
 ) -> Tensor:
-    """``out`` is an optional caller-owned contiguous [M, N] buffer of ``dtype``;
-    when given, the result is written into it and returned."""
     assert dtype in [
         torch.bfloat16,
         torch.float16,
@@ -802,10 +776,19 @@ def gemm_a8w8_bpreshuffle(
     #         return res
     assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
     assert bias is None, "gemm_a8w8_bpreshuffle does not support bias now"
-    if out is None:
-        Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
-    else:
-        Y = _check_gemm_a8w8_bpreshuffle_out(out, m, n, dtype, XQ.device)
+    Y = torch.empty(m, n, dtype=dtype, device=XQ.device)
+    return _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, Y)
+
+
+def _gemm_a8w8_bpreshuffle_into(
+    XQ: Tensor, WQ: Tensor, x_scale: Tensor, w_scale: Tensor, Y: Tensor
+) -> Tensor:
+    """Run the tuned (or default) bpreshuffle kernel into the dense [M, N] ``Y``."""
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    k = XQ.shape[-1]
+    w_k = WQ.shape[-1]
+    dtype = Y.dtype
 
     # CKTile only supports bf16 dtype
     config = get_GEMM_config_with_quant_type(
@@ -865,6 +848,38 @@ def gemm_a8w8_bpreshuffle(
             f"gemm_a8w8_bpreshuffle failed for shape M={m}, N={n}, K={k}, "
             f"{dtype=}, config={config}: {e}"
         ) from e
+
+
+# Only ``out`` is written, so it is the only argument declared mutable. Returning
+# nothing keeps the op free of outputs that alias an input under torch.compile.
+@torch_compile_guard(mutates_args=["out"], gen_fake=lambda *args, **kwargs: None)
+def gemm_a8w8_bpreshuffle_out(
+    out: Tensor,  # [M, N] caller-owned output, bf16 or fp16
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+) -> None:
+    """gemm_a8w8_bpreshuffle into a caller-owned contiguous [M, N] buffer.
+    Output dtype is ``out.dtype``. CK and CKTile write a dense row-major [M, N],
+    so a strided ``out`` (e.g. a column slice of a wider buffer) is rejected."""
+    m = XQ.shape[0]
+    n = WQ.shape[0]
+    if out.dtype not in (dtypes.bf16, dtypes.fp16):
+        raise ValueError(f"out dtype must be bf16 or fp16, got {out.dtype}")
+    if out.shape != (m, n) or out.device != XQ.device or not out.is_contiguous():
+        raise ValueError(
+            f"out must be a contiguous tensor of shape {(m, n)} on {XQ.device}; "
+            f"got shape {tuple(out.shape)}, stride {tuple(out.stride())}, "
+            f"device {out.device}"
+        )
+    if WQ.shape[-1] < XQ.shape[-1]:
+        raise RuntimeError(
+            f"gemm_a8w8_bpreshuffle requires WQ K >= XQ K, got WQ K={WQ.shape[-1]}, "
+            f"XQ K={XQ.shape[-1]}"
+        )
+    assert WQ.dtype == dtypes.fp8, "gemm_a8w8_bpreshuffle only support fp8 now"
+    _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)
 
 
 # M at or above which the triton kernel beats the untuned CK fallback, which
