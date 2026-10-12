@@ -835,7 +835,7 @@ def gemm_a8w8_bpreshuffle_out(
 ) -> None:
     """gemm_a8w8_bpreshuffle written into a caller-owned buffer.
 
-    All tensors must be on one device, and ``out`` must be a contiguous bf16
+    All tensors must be on one CUDA/HIP device, and ``out`` must be a contiguous bf16
     [M, N] tensor. Only
     bf16 is accepted: the FlyDSL 8-wave kernels, which many tuned rows select,
     write bf16 only. CK and CKTile write a dense row-major [M, N], so a strided
@@ -846,6 +846,9 @@ def gemm_a8w8_bpreshuffle_out(
     n = WQ.shape[0]
     if out.dtype != dtypes.bf16:
         raise ValueError(f"out must be bf16, got {out.dtype}")
+    # Every backend is a GPU kernel that receives raw data pointers.
+    if not XQ.is_cuda:
+        raise ValueError(f"XQ must be a CUDA/HIP tensor, got device {XQ.device}")
     if any(t.device != XQ.device for t in (out, WQ, x_scale, w_scale)):
         raise ValueError(
             "out, XQ, WQ, x_scale and w_scale must be on the same device; got "

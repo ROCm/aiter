@@ -183,6 +183,16 @@ def test_input_on_another_device_rejected_before_launch(cpu_arg):
     assert torch.all(out == 3.0)
 
 
+def test_all_cpu_operands_rejected():
+    m, n, k = 32, 256, 512
+    args = [t.cpu() for t in _inputs(m, n, k)]
+    out = torch.full((m, n), 3.0, dtype=dtypes.bf16)
+
+    with pytest.raises(ValueError, match="CUDA/HIP tensor"):
+        gemm_op_a8w8.gemm_a8w8_bpreshuffle_out(out, *args)
+    assert torch.all(out == 3.0)
+
+
 def test_weight_k_below_activation_k_rejected():
     m, n = 32, 256
     xq, _, x_scale, _ = _inputs(m, n, 512)
