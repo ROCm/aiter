@@ -55,7 +55,6 @@ from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
     "flash_attn_varlen_bwd_gfx942",
-    "flash_attn_varlen_bwd_d192_gfx942",
     "flydsl_bwd_shape_supported",
 ]
 
@@ -117,18 +116,9 @@ def _split(interleave: int, est_wgs: int, d_qk: int, ncu: int) -> int:
 
 
 # ---- FUSED SPLIT-K: a COMPUTED makespan predicate --------------------------------------------
-# The fused role's grid is the dK/dV block list, and the per-workgroup trip count of key block kb
-# is ceil((s - kb*KEYS_PER_WG) / QUERY_TILE): causal makes the block list a LINEAR RAMP of work.
-# A kernel's makespan is at least max(L, A): L the LONGEST workgroup, A the total work spread over
-# the co-resident slots.  When L > A the ramp's head is the critical path and slots idle behind
-# it however many workgroups there are (1x8192h8 d64: 512 WGs on 608 slots, the kb = 0 block runs
-# 256 iterations against a 111 average -- 43 % slot efficiency).  Splitting each block's streamed
-# query range n ways divides L by n and adds only per-workgroup fixed cost to A, at the price of
-# one bf16 dK/dV partial slab per split and a `k_red` pass.  The split factor is the SMALLEST n
-# that brings L down to A (more splits only add reduction traffic and fixed cost; measured
-# 1x8192h8 / 2x6000h6 d64: n = 2 / 3 / 4 -> 0.512 / 0.493 / 0.499 and 0.418 / 0.406 / 0.411 ms
-# against 0.618 / 0.474 unsplit), and a split is taken only when the modelled time it saves beats
-# the reduction's cost.  Everything is priced from host-side shapes alone.
+# Causal makes the dK/dV block list a linear ramp of work, so when the longest workgroup exceeds
+# the average work per co-resident slot, each block's query range is split into the smallest n
+# (<= _SPLIT_MAX) that removes that critical path, but only when the modelled saving beats `k_red`.
 _SPLIT_MAX = 4
 # The unsplit grid must be critical-path-bound by at least this margin to be considered.
 _SPLIT_MIN_GAIN = 0.03
@@ -464,8 +454,3 @@ def flash_attn_varlen_bwd_gfx942(
         stream,
     )
     return dq, dk, dv, delta
-
-
-# The name this entry point shipped under while d_qk = 192 was the only shape it served.  Kept
-# because the GEAK task loader and `op_tests/test_mha_flydsl_varlen_bwd.py` resolve it by name.
-flash_attn_varlen_bwd_d192_gfx942 = flash_attn_varlen_bwd_gfx942
