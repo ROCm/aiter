@@ -83,7 +83,7 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_common import (
 # PREFETCH_W * KV_OWNED_SUBTILES MFMAs of cover.  The fp8 reference uses depth 2
 # against a 32-cycle `32x32x64`; `16x16x16_bf16` is only ~16 cycles, so the
 # depth has to be larger here to hide the same ~130-cycle ds_read.
-PREFETCH_W = 3
+PREFETCH_W = 15
 # Operand groups per MFMA phase: 4 GEMMs x (head_dim / MFMA_M) chunks.
 NUM_OPERAND_GROUPS = 16
 
