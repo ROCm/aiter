@@ -3612,6 +3612,9 @@ constexpr int    kLL128LineElems = 16;
 constexpr int    kLL128DataElems = 15;
 constexpr int    kLL128FlagElem  = 15;
 constexpr int    kLL128Lanes     = 16;
+// Per-rank slot stride in uint32 words, sized for kLL128PocCapBytes so that
+// consecutive calls of different sizes never overlap a peer's unread slots.
+constexpr int    kLL128SlotStride = (int)((kLL128PocCapBytes + 239) / 240) * 128 * 2 / 4;
 
 struct LLLine128
 {
@@ -3809,7 +3812,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 
   __shared__ uint32_t s_flag;
   const uint32_t flag = ll128EpochBegin(graph_safe_flag, blockIdx.x, s_flag);
-  int bank_offset = (flag & 1u) * ngpus * (total_group * 128 * 2 / 4);
+  int bank_offset = (flag & 1u) * ngpus * kLL128SlotStride;
 
   for (int idx = g_index; idx < total_group; idx += stride)
   {
@@ -3821,7 +3824,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
       int peer = (self_rank + i) % ngpus;
       uint32_t* scratch_dst = reinterpret_cast<uint32_t*>(peer_scratch[peer])
                               + bank_offset
-                              + self_rank * (total_group * 128 * 2 / 4)
+                              + self_rank * kLL128SlotStride
                               + idx * 8 * 2 * 4 + lane_id * 4;
       ll128_store_b128<T>(inp_reg[0], scratch_dst);
       ll128_store_b128<T>(inp_reg[1], scratch_dst + 8 * 4);
@@ -3845,7 +3848,7 @@ __global__ void __launch_bounds__(block_size) ar_ll128_unroll2(
 #pragma unroll
     for (int i = 1; i < ngpus; ++i)
     {
-      scratch_base[i - 1] = self_scratch + ((self_rank + i) % ngpus) * (total_group * 128 * 2 / 4) + idx * 8 * 2 * 4;
+      scratch_base[i - 1] = self_scratch + ((self_rank + i) % ngpus) * kLL128SlotStride + idx * 8 * 2 * 4;
       scratch_flag_addr[0][i - 1] = scratch_base[i - 1] + 7 * 4;
       scratch_flag_addr[1][i - 1] = scratch_flag_addr[0][i - 1] + 8 * 4;
     }
@@ -4432,8 +4435,8 @@ class CustomAllreduce
     }
 
     // LL128 unroll2 1-shot all-reduce. 2-byte dtype only (fp16 / bf16). The
-    // kernel sizes its scratch from the message internally (per total_group);
-    // the cap bounds it to the LL128 sub-region of the reused tmp buffer.
+    // scratch uses a fixed per-rank stride sized for kLL128PocCapBytes, so it
+    // spans 2 * ngpus * kLL128SlotStride words of the reused tmp buffer.
     template <typename T>
     void allreduce_ll128_unroll2(hipStream_t stream, const T* input, T* output,
                                  int numel, int threads_per_block = 512)
