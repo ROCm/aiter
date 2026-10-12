@@ -8,6 +8,7 @@ Usage: python3 .claude/skills/review-pr/lost_review_test.py
 """
 
 import contextlib
+import os
 import io
 import sys
 import types
@@ -145,6 +146,24 @@ def suite(src):
     return out
 
 
+def entry_point(src):
+    """See watchdog_test.py: main() is where the environment variable names actually land."""
+    mod = load(src)
+    mod.GitHub = type("Fake", (mod.GitHub,), {
+        "_get": lambda self, path: {},
+        "_post": lambda self, *a, **k: 201})
+    saved = dict(os.environ)
+    os.environ.update({"GH_TOKEN": "t", "AITER_BOT_TOKEN": "b", "PR": "42",
+                       "GITHUB_REPOSITORY": REPO, "REVIEW_RESULT": "success", "NOTIFIED": ""})
+    try:
+        with contextlib.redirect_stdout(io.StringIO()):     # its workflow commands are not ours
+            rc = mod.main()
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
+    return [("main() runs and returns a status", rc == 0)]
+
+
 def main():
     src = SRC.read_text(encoding="utf-8")
     ok = bad = 0
@@ -168,6 +187,13 @@ def main():
         t('breaking %s turns "%s" red' % (why, breaks),
           None if suite(src.replace(find, repl, 1))[breaks]
           else "it stayed green, so that check proves nothing")
+
+    print("[entry point]")
+    try:
+        for name, good in entry_point(src):
+            t(name, None if good else "main() did not wire up")
+    except Exception as e:                                  # noqa: BLE001 - report, not raise
+        t("main() runs", "threw: %s: %s" % (type(e).__name__, e))
 
     print("=== %d green / %d red ===" % (ok, bad))
     return 1 if bad else 0
