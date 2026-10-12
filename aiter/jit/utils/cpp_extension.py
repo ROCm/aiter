@@ -1601,7 +1601,28 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
 
         extra_ldflags.append(f'-L{_posix_path(_join_rocm_home("lib"))}')
         extra_ldflags.append("-lamdhip64")
+    if IS_WINDOWS:
+        extra_ldflags = _resolve_mingw_import_libs(extra_ldflags)
     return extra_ldflags
+
+
+def _resolve_mingw_import_libs(ldflags):
+    # lld-link misses MinGW-style lib<name>.dll.a import libraries for -l<name>.
+    lib_dirs = [f[2:] for f in ldflags if f.startswith("-L")]
+    resolved = []
+    for flag in ldflags:
+        if flag.startswith("-l"):
+            name = flag[2:]
+            if not any(
+                os.path.isfile(os.path.join(d, f"{name}.lib")) for d in lib_dirs
+            ):
+                for d in lib_dirs:
+                    mingw_lib = os.path.join(d, f"lib{name}.dll.a")
+                    if os.path.isfile(mingw_lib):
+                        flag = _posix_path(mingw_lib)
+                        break
+        resolved.append(flag)
+    return resolved
 
 
 def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
