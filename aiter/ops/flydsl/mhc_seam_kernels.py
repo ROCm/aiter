@@ -18,6 +18,8 @@ __all__ = ["MHC_SEAM_DEFAULTS", "flydsl_mhc_seam", "get_mhc_seam_config"]
 
 _GFX = ("gfx942",)
 _N = 4
+# Last-level (Infinity) cache, which decides whether the staged collapse stays resident.
+_MALL_BYTES = 256 * 1024 * 1024
 
 # knob defaults merged under every policy decision and user override
 MHC_SEAM_DEFAULTS = {
@@ -28,10 +30,10 @@ MHC_SEAM_DEFAULTS = {
     "FINISH_WAVES_PER_EU": 2,  # occupancy hint of the finish pass
     "FAST_FP_MATH": True,
     "FAST_NARROW": True,  # bf16 rounding in integer ops; required by FAST_FP_MATH
-    # nt hint on every streamed access: the residual / sublayer_out loads, the residual_out
-    # and staged-collapse stores, and the finish pass's staged-collapse loads and layer_input
-    # stores
+    # nt hint on the residual / sublayer_out loads and the residual_out / layer_input stores
     "CACHE_NT": False,
+    # nt hint on the staged collapse's store and its reload; None: _stage_nt
+    "STAGE_NT": None,
     "GATE_STEP": None,  # finish pass gives the gates a column step; None: kernels.gate_step
 }
 
@@ -103,6 +105,17 @@ def _check_config(T: int, H: int, cfg: dict, arch: str) -> None:
         raise ValueError(f"[flydsl_mhc_seam] {e}") from None
 
 
+def _stage_nt(T: int, H: int) -> bool:
+    """Whether the staged collapse's round trip overruns the last-level cache.
+
+    It is the one streamed buffer whose writer and reader are the same call: the fused pass
+    writes ``T * H`` bf16 and the finish pass reads back exactly those lines, so while it fits
+    it never reaches HBM. At ``_N + 1`` times smaller than the read set ``CACHE_NT`` is tuned
+    against, it fits where that set does not.
+    """
+    return T * H * 2 > _MALL_BYTES
+
+
 def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
     """Launch policy keyed on (arch, cu_num) and T.
 
@@ -113,6 +126,8 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
       most the row's.
     * ``GATE_STEP`` from ``kernels.mhc_seam.gate_step``, which is what the table's sweep found
       (on up to 4096 tokens at 304 CUs, off from 8192).
+    * ``STAGE_NT`` from ``_stage_nt``: the staged collapse's round trip stays cached while it
+      fits the last-level cache, whatever ``CACHE_NT`` says.
     """
     from aiter.ops.flydsl.kernels.mhc_seam import check_config, gate_step
 
@@ -135,6 +150,7 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
         MHC_SEAM_DEFAULTS, BLOCK_M=bm, CHUNK_C=cc, SPLITS=splits, CACHE_NT=cache_nt
     )
     cfg["GATE_STEP"] = gate_step(T, H, cu_num)
+    cfg["STAGE_NT"] = _stage_nt(T, H)
     return cfg
 
 
@@ -301,6 +317,9 @@ def flydsl_mhc_seam(
     gate_only = cfg["GATE_STEP"]
     if gate_only is None:
         gate_only = k.gate_step(T, H, _cu_num())
+    stage_nt = cfg["STAGE_NT"]
+    if stage_nt is None:
+        stage_nt = _stage_nt(T, H)
 
     bm, splits = cfg["BLOCK_M"], cfg["SPLITS"]
     fused = k.compile_mhc_seam_fused(
@@ -315,7 +334,7 @@ def flydsl_mhc_seam(
         fast_narrow=cfg["FAST_NARROW"],
         load_nt=cfg["CACHE_NT"],
         store_nt=cfg["CACHE_NT"],
-        stage_nt=cfg["CACHE_NT"],
+        stage_nt=bool(stage_nt),
         waves_per_eu=cfg["WAVES_PER_EU"],
     )
     finish = k.compile_mhc_seam_finish(
@@ -331,7 +350,7 @@ def flydsl_mhc_seam(
         sinkhorn_repeat=int(sinkhorn_repeat),
         fast_fp_math=cfg["FAST_FP_MATH"],
         fast_narrow=cfg["FAST_NARROW"],
-        norm_load_nt=cfg["CACHE_NT"],
+        norm_load_nt=bool(stage_nt),
         norm_store_nt=cfg["CACHE_NT"],
         waves_per_eu=cfg["FINISH_WAVES_PER_EU"],
         gate_only=bool(gate_only),
