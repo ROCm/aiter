@@ -677,6 +677,67 @@ def _summarize(name, rows):
     aiter.logger.info("%s summary (markdown):\n%s", name, table)
 
 
+def test_fp8_paged_mqa_logits_2d_context_lens(batch, next_n, kv_len, split_kv):
+    """A (B, next_n) per-row table, the layout DeepGEMM takes and vLLM passes,
+    gives the same logits as the per-sequence lengths it ends with."""
+    inp = _build_inputs(
+        batch,
+        next_n,
+        HEADS,
+        HEAD_DIM,
+        kv_len,
+        _E4M3_NATIVE,
+        block_size=KV_BLOCK_SIZE,
+        var_ratio=0.9,
+    )
+    kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+    seq_lens = inp.context_lens
+    row_lens = (
+        seq_lens[:, None]
+        - next_n
+        + 1
+        + torch.arange(next_n, dtype=torch.int32, device="cuda")
+    )
+
+    def run(context_lens):
+        out.fill_(float("-inf"))
+        flydsl_fp8_paged_mqa_logits(
+            inp.q_fp8,
+            kv_cache_kernel,
+            inp.weights,
+            out,
+            context_lens,
+            inp.block_tables,
+            inp.max_model_len,
+            Preshuffle=True,
+            KVBlockSize=KV_BLOCK_SIZE,
+            SplitKV=_split_arg(split_kv),
+        )
+        return out.clone()
+
+    expected = run(seq_lens)
+    assert torch.equal(run(row_lens), expected)
+    assert torch.equal(run(seq_lens[:, None]), expected)
+    # Wrong row count, no columns, or a strided [B] or [B, n] are rejected.
+    bad_inputs = [row_lens[:-1], torch.cat([row_lens, row_lens[:1]]), row_lens[:, :0]]
+    if next_n > 1:
+        bad_inputs += [row_lens[:, -1], row_lens.t().contiguous().t()]
+    for bad in bad_inputs:
+        try:
+            run(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"context_lens of shape {tuple(bad.shape)} was accepted")
+    aiter.logger.info(
+        "fp8_paged_mqa_logits 2d context_lens ok: batch=%d next_n=%d kv_len=%d "
+        "split_kv=%d",
+        batch,
+        next_n,
+        kv_len,
+        split_kv,
+    )
+
+
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning(
@@ -799,6 +860,9 @@ def main():
         "    e.g.: --hist-kv-len 8192 131072",
     )
     args = parser.parse_args()
+
+    for next_n, split_kv in itertools.product((1, 3), (0, 3)):
+        test_fp8_paged_mqa_logits_2d_context_lens(4, next_n, 3000, split_kv)
 
     compact = [
         test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype)
