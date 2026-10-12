@@ -1402,6 +1402,35 @@ def test_geometry_arms_are_exhaustive():
 
 
 @requires_gfx950
+@pytest.mark.parametrize(
+    "max_q,max_seq",
+    [(0, 2048), (-1, 2048), (128, 0), (128, -1), (128.0, 2048), (128, 2048.0)],
+)
+def test_rejects_non_positive_launch_bounds(max_q, max_seq):
+    """The grid is sized from these two and nothing downstream re-checks them.
+
+    `max_query_len=0` used to launch an empty query grid and return silently --
+    the worst outcome, since the caller gets a buffer of sentinels and no
+    signal. `max_seq_len=0` reached `hipModuleLaunchKernel` as a zero dimension
+    and surfaced as `hipErrorInvalidValue`, which says nothing about which
+    argument was wrong.
+    """
+    c = make_prefill_case(1, 128, 2048)
+    with pytest.raises(ValueError, match="must be positive"):
+        score_prefill_flydsl(
+            c["q_bf16"],
+            c["cache"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            max_q,
+            max_seq,
+            1.0 / LOG2E,
+        )
+
+
+@requires_gfx950
 def test_strided_cache_is_refused():
     """The LDS staging path reads a page as a flat run_prefill of 16 B chunks, which
     only describes the right bytes when the page is contiguous -- a strided

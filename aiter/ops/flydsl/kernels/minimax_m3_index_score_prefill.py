@@ -1263,6 +1263,17 @@ def score_prefill_flydsl(
     # narrowed to int32 (see `k_unit`), so one page's byte stride has to fit --
     # which it does for free: the cache is fp8, so a byte stride IS the element
     # stride that `_validate_tensor` already bounds at 2**31-1.
+    # The grid is sized from these two and nothing downstream re-checks them:
+    # `max_query_len=0` launched an empty query grid and returned silently,
+    # and `max_seq_len=0` reached hipModuleLaunchKernel as a zero dimension and
+    # surfaced as `hipErrorInvalidValue`. The decode scorer already rejects its
+    # equivalents; this states the same contract.
+    if not isinstance(max_query_len, int) or max_query_len < 1:
+        raise ValueError(f"max_query_len must be positive, got {max_query_len}")
+    if not isinstance(max_seq_len, int) or max_seq_len < 1:
+        raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+    if heads < 1:
+        raise ValueError(f"heads must be positive, got {heads}")
     batch = cu_seqlens_q.shape[0] - 1
     max_block = -(-max_seq_len // PAGE)
     # The LDS staging path indexes a page as token*8 + block, which describes
