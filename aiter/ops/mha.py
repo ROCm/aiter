@@ -22,8 +22,10 @@ from ..jit.utils.asm_guard import is_gfx1250_asm_supported, require_gfx1250_asm
 # second copy of the module (chip_info.py and mha_recipes.py import it flat),
 # giving two distinct copies of every symbol. Do not let isort reorder this.
 from build_targets import (
+    CkFmhaNotSelected,
     ck_fmha_batch_prefill_gen_targets,
     ck_fmha_factory_key,
+    ck_fmha_runtime_enabled,
     ck_fmha_targets,
 )
 from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
@@ -46,6 +48,11 @@ def _fmha_kv_byte_extent_ge_u32(
     k_bytes = int(max_seqlen_k) * int(k.stride(-3)) * k.element_size()
     v_bytes = int(max_seqlen_k) * int(v.stride(-3)) * v.element_size()
     return k_bytes >= (1 << 32) or v_bytes >= (1 << 32)
+
+
+def _ck_fmha_selected() -> bool:
+    """True when ENABLE_CK and both build and live device permit CK fmha."""
+    return bool(ENABLE_CK) and ck_fmha_runtime_enabled()
 
 
 def _check_fp8_factory(gfx: str, dtype) -> None:
@@ -2923,7 +2930,7 @@ def flash_attn_func(
         if _flydsl_result is not None:
             return _flydsl_result
 
-    if not ENABLE_CK:
+    def _triton_flash_attn():
         from .triton.attention.mha import flash_attn_func as flash_attn_func_triton
 
         return flash_attn_func_triton(
@@ -2941,27 +2948,36 @@ def flash_attn_func(
             return_attn_probs=return_attn_probs,
             sink=sink_ptr,
         )
-    return FlashAttnFunc.apply(
-        q,
-        k,
-        v,
-        dropout_p,
-        softmax_scale,
-        causal,
-        window_size,
-        bias,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-        torch.is_grad_enabled(),
-        True,  # is_v3_atomic_fp32
-        how_v3_bf16_cvt,
-        cu_seqlens_q,
-        cu_seqlens_kv,
-        sink_ptr,
-        num_splits,
-    )
+
+    # Backward is CK mha_bwd, so a grad region stays on Triton when CK fmha
+    # is not selected. No-grad still enters FlashAttnFunc: ASM/v3 run there,
+    # and compile_ops raises before CK codegen.
+    if not ENABLE_CK or (torch.is_grad_enabled() and not ck_fmha_runtime_enabled()):
+        return _triton_flash_attn()
+    try:
+        return FlashAttnFunc.apply(
+            q,
+            k,
+            v,
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            bias,
+            alibi_slopes,
+            deterministic,
+            return_lse,
+            return_attn_probs,
+            torch.is_grad_enabled(),
+            True,  # is_v3_atomic_fp32
+            how_v3_bf16_cvt,
+            cu_seqlens_q,
+            cu_seqlens_kv,
+            sink_ptr,
+            num_splits,
+        )
+    except CkFmhaNotSelected:
+        return _triton_flash_attn()
 
 
 def _flash_attn_varlen_forward(
@@ -3823,10 +3839,8 @@ def flash_attn_varlen_func(
         raise ValueError(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
         )
-    if has_all_descales and not ENABLE_CK:
-        raise RuntimeError(
-            "prequantized FP8 attention with descales requires ENABLE_CK=1"
-        )
+    if has_all_descales and not _ck_fmha_selected():
+        raise RuntimeError("prequantized FP8 attention with descales requires CK fmha")
 
     # Try the PR3039 gfx1250 prefill ASM path before FlyDSL can claim it.
     def can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
@@ -3867,38 +3881,77 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    if not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
-        return FlashAttnVarlenFunc.apply(
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            min_seqlen_q,
-            dropout_p,
-            softmax_scale,
-            logits_soft_cap,
-            causal,
-            window_size,
-            bias,
-            alibi_slopes,
-            deterministic,
-            return_lse,
-            return_attn_probs,
-            block_table,
-            out,
-            torch.is_grad_enabled(),
-            cu_seqlens_q_padded,
-            cu_seqlens_k_padded,
-            True,
-            how_v3_bf16_cvt,
-            sink_ptr,
-            q_descale,
-            k_descale,
-            v_descale,
+    def _triton_varlen():
+        from .triton.attention.mha import (
+            flash_attn_varlen_func as flash_attn_varlen_func_triton,
         )
+
+        return flash_attn_varlen_func_triton(
+            q=q,
+            k=k,
+            v=v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            dropout_p=dropout_p,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            deterministic=deterministic,
+            return_lse=return_lse,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            out=out,
+            sink=sink_ptr,
+        )
+
+    def _varlen_or_triton():
+        try:
+            return FlashAttnVarlenFunc.apply(
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                min_seqlen_q,
+                dropout_p,
+                softmax_scale,
+                logits_soft_cap,
+                causal,
+                window_size,
+                bias,
+                alibi_slopes,
+                deterministic,
+                return_lse,
+                return_attn_probs,
+                block_table,
+                out,
+                torch.is_grad_enabled(),
+                cu_seqlens_q_padded,
+                cu_seqlens_k_padded,
+                True,
+                how_v3_bf16_cvt,
+                sink_ptr,
+                q_descale,
+                k_descale,
+                v_descale,
+            )
+        except CkFmhaNotSelected:
+            return _triton_varlen()
+
+    # Grad uses this autograd Function's CK backward. Skip ASM when that
+    # module is not selected and let the Triton path own fwd and bwd.
+    if (
+        not has_all_descales
+        and not (torch.is_grad_enabled() and not ck_fmha_runtime_enabled())
+        and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm()
+    ):
+        return _varlen_or_triton()
 
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
@@ -3932,63 +3985,9 @@ def flash_attn_varlen_func(
         if _flydsl_result is not None:
             return _flydsl_result
 
-    if not ENABLE_CK:
-        from .triton.attention.mha import (
-            flash_attn_varlen_func as flash_attn_varlen_func_triton,
-        )
-
-        return flash_attn_varlen_func_triton(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            deterministic=deterministic,
-            return_lse=return_lse,
-            return_attn_probs=return_attn_probs,
-            block_table=block_table,
-            out=out,
-            sink=sink_ptr,
-        )
-    return FlashAttnVarlenFunc.apply(
-        q,
-        k,
-        v,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        max_seqlen_q,
-        max_seqlen_k,
-        min_seqlen_q,
-        dropout_p,
-        softmax_scale,
-        logits_soft_cap,
-        causal,
-        window_size,
-        bias,
-        alibi_slopes,
-        deterministic,
-        return_lse,
-        return_attn_probs,
-        block_table,
-        out,
-        torch.is_grad_enabled(),
-        cu_seqlens_q_padded,
-        cu_seqlens_k_padded,
-        True,
-        how_v3_bf16_cvt,
-        sink_ptr,
-        q_descale,
-        k_descale,
-        v_descale,
-    )
+    if not ENABLE_CK or (torch.is_grad_enabled() and not ck_fmha_runtime_enabled()):
+        return _triton_varlen()
+    return _varlen_or_triton()
 
 
 def mha_batch_prefill_fake_tensors(
@@ -4299,7 +4298,7 @@ def flash_attn_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
-    if not ENABLE_CK and sink_ptr is None:
+    if sink_ptr is None and not _ck_fmha_selected():
         from .triton.attention.mha_v3 import (
             flash_attn_func as flash_attn_func_v3_triton,
         )
@@ -4366,7 +4365,7 @@ def flash_attn_varlen_fp8_pertensor_func(
     softmax_scale=None,
     sink_ptr=None,
 ):
-    if not ENABLE_CK and sink_ptr is None:
+    if sink_ptr is None and not _ck_fmha_selected():
         from .triton.attention.mha_v3 import (
             flash_attn_varlen_func as flash_attn_varlen_func_v3_triton,
         )

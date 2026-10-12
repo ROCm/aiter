@@ -23,7 +23,11 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
 # json blob_gen_cmd eval() needs these names in module globals.
 from build_targets import (  # noqa: F401
+    CK_FMHA_MODULES,
+    CkFmhaNotSelected,
     ck_fmha_batch_prefill_gen_targets,
+    ck_fmha_enabled,
+    ck_fmha_runtime_enabled,
     ck_fmha_targets,
 )
 from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
@@ -1694,6 +1698,11 @@ def get_args_of_build(ops_name: str, exclude=None):
                 return d_opt_build_args
             # parser single opt
             else:
+                # Same opt-out as setup.get_exclude_ops. Returning the empty
+                # arg set skips convert(), so ck_fmha_targets() does not run
+                # and cannot fall back to gfx9,gfx950.
+                if ops_name in CK_FMHA_MODULES and not ck_fmha_enabled():
+                    return d_opt_build_args
                 compile_ops_ = data.get(ops_name)
                 return convert(compile_ops_)
         else:
@@ -2103,6 +2112,13 @@ def compile_ops(
 
             @functools.wraps(func)
             def wrapper(*args, custom_build_args=None, **kwargs):
+                # gen_func overwrites get_args_of_build, so a gfx1250-only
+                # cache miss would still run 01_fmha/generate.py.
+                if _md_name in CK_FMHA_MODULES and not ck_fmha_runtime_enabled():
+                    raise CkFmhaNotSelected(
+                        f"{_md_name} is not selected; CK fmha is disabled "
+                        "for this build or device"
+                    )
 
                 if custom_build_args is None:
                     custom_build_args = {}

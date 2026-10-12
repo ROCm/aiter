@@ -159,16 +159,30 @@ def ck_fmha_enabled_for(archs: list[str]) -> bool:
     return not all(name in _CK_FMHA_EXCLUDED_ARCHS for name in names)
 
 
+class CkFmhaNotSelected(RuntimeError):
+    """A CK fmha module was not selected for this build or device."""
+
+
 def ck_fmha_enabled() -> bool:
     """ck_fmha_enabled_for() against the current GPU_ARCHS / live GPU list.
 
-    Consumed by setup.py's PREBUILD module selection. The plain JIT path does
-    not consult this yet -- see PR #5786 discussion -- so a gfx1250 JIT build
-    still reaches ck_fmha_targets()'s CK-default fallback.
+    PREBUILD and get_args_of_build skip CK fmha modules when this is False,
+    so a gfx1250-only build does not fall through to ck_fmha_targets()'s
+    gfx9,gfx950 default. Mixed wheels still check the live device via
+    ck_fmha_runtime_enabled().
     """
     from chip_info import get_gfx_list  # lazy: chip_info imports this module
 
     return ck_fmha_enabled_for(get_gfx_list())
+
+
+def ck_fmha_runtime_enabled() -> bool:
+    """False when the build or the live device opted out of CK fmha."""
+    if not ck_fmha_enabled():
+        return False
+    from chip_info import get_gfx_runtime
+
+    return ck_fmha_enabled_for([get_gfx_runtime()])
 
 
 def map_gpu_archs_to_ck_fmha_targets(archs: list[str]) -> list[str]:

@@ -233,3 +233,105 @@ def test_setup_get_exclude_ops_excludes_ck_fmha_modules_on_gfx1250_only_builds()
 
 def test_setup_get_exclude_ops_keeps_ck_fmha_modules_on_supported_arches():
     assert _ck_fmha_excludes_for("gfx942;gfx950") == []
+
+
+# Plain JIT (PREBUILD_KERNELS=0). get_args_of_build must not emit a CK fmha
+# command, and compile_ops must reject the module before gen_func. gen_func's
+# blob_gen_cmd overwrites an empty get_args_of_build result.
+_PLAIN_JIT_SELECT = f"""
+import json, sys
+sys.path.insert(0, {os.path.join(_REPO_ROOT, "aiter", "jit")!r})
+import core
+from build_targets import CK_FMHA_MODULES, CkFmhaNotSelected, ck_fmha_enabled
+
+assert ck_fmha_enabled() is False
+rejected = []
+for name in CK_FMHA_MODULES:
+    args = core.get_args_of_build(name)
+    blob = args.get("blob_gen_cmd") or ""
+    if isinstance(blob, list):
+        blob = " ".join(str(part) for part in blob)
+    blob = str(blob)
+    if args.get("srcs") or "generate.py" in blob or "gfx9,gfx950" in blob:
+        raise SystemExit(f"{{name}} still has a CK fmha build: {{args}}")
+    rejected.append(name)
+
+gen_calls = []
+
+def gen_func(*args, **kwargs):
+    gen_calls.append(1)
+    return {{"md_name": "module_mha_fwd"}}
+
+@core.compile_ops("module_mha_fwd", gen_func=gen_func)
+def mha_fwd(*args, **kwargs):
+    raise SystemExit("mha_fwd body ran")
+
+try:
+    mha_fwd()
+except CkFmhaNotSelected:
+    pass
+else:
+    raise SystemExit("compile_ops selected module_mha_fwd")
+if gen_calls:
+    raise SystemExit("gen_func ran before the CK fmha gate")
+print(json.dumps(sorted(rejected)))
+"""
+
+
+def test_gfx1250_plain_jit_does_not_select_ck_fmha():
+    bt = _load_build_targets()
+    out = _run_subprocess(
+        _PLAIN_JIT_SELECT,
+        "gfx1250",
+        PREBUILD_KERNELS="0",
+    )
+    assert json.loads(out) == sorted(bt.CK_FMHA_MODULES)
+
+
+_MIXED_JIT_SELECT = f"""
+import os, sys
+sys.path.insert(0, {os.path.join(_REPO_ROOT, "aiter", "jit")!r})
+import core
+import chip_info
+from build_targets import CK_FMHA_MODULES, CkFmhaNotSelected
+
+# Replace hardware detection only; keep module selection and compile_ops real.
+chip_info.get_gfx_runtime = lambda: os.environ["AITER_TEST_RUNTIME_GFX"]
+blocked = chip_info.get_gfx_runtime() == "gfx1250"
+cmd = core.get_args_of_build("module_mha_fwd")["blob_gen_cmd"]
+assert "--targets gfx9,gfx950" in (cmd if isinstance(cmd, str) else " ".join(cmd))
+
+class GenReached(Exception):
+    pass
+
+def gen_func(*args, **kwargs):
+    raise GenReached
+
+for name in CK_FMHA_MODULES:
+    @core.compile_ops(name, gen_func=gen_func)
+    def mha_fwd(*args, **kwargs):
+        raise AssertionError("operator body ran")
+
+    try:
+        mha_fwd()
+    except CkFmhaNotSelected:
+        assert blocked, name
+    except GenReached:
+        assert not blocked, name
+    else:
+        raise AssertionError(name)
+print("OK")
+"""
+
+
+@pytest.mark.parametrize("runtime_gfx", ["gfx1250", "gfx942", "gfx950"])
+def test_mixed_arch_plain_jit_selects_by_live_device(runtime_gfx):
+    assert (
+        _run_subprocess(
+            _MIXED_JIT_SELECT,
+            "gfx942;gfx950;gfx1250",
+            PREBUILD_KERNELS="0",
+            AITER_TEST_RUNTIME_GFX=runtime_gfx,
+        )
+        == "OK"
+    )
