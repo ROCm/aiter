@@ -221,6 +221,7 @@ class Case:
 @pytest.mark.parametrize("has_y_gammas", [False, True])
 @pytest.mark.parametrize("apply_swiglu", [False, True])
 @pytest.mark.parametrize("fused_quant", [False, True])
+@pytest.mark.parametrize("token_expt_scales", [False, True])
 def test_op(
     m,
     n,
@@ -230,6 +231,7 @@ def test_op(
     has_y_gammas,
     apply_swiglu,
     fused_quant,
+    token_expt_scales,
     n_expts_tot,
     n_expts_act,
     act_dtype_str,
@@ -263,6 +265,9 @@ def test_op(
     if act_mxfp8:
         act_dtype_str = act_dtype_str[2:]
 
+    if token_expt_scales and (act_mxfp8 or weight_mxfp8):
+        pytest.skip("token/expert scales are tested on the plain-fp8 path")
+
     weight_dtype = dtype_str_to_torch(weight_dtype_str)
     act_dtype = dtype_str_to_torch(act_dtype_str)
     m, rdata, gindx, sindx = init_routing_data(
@@ -282,6 +287,8 @@ def test_op(
         device=device,
     )
     x_ref, w_ref, bias_ref = x_tri.clone(), w_tri.clone(), bias_tri.clone()
+    x_token_scale = None
+    w_expt_scale = None
 
     if weight_mxfp8:
         w_tri, w_scale_tri = downcast_to_mxfp(w_tri, weight_dtype, axis=1)
@@ -300,9 +307,15 @@ def test_op(
     else:
         w_scale_tri = None
         swizzle_mx_scale = None
-        w_static_scale = w_tri.abs().max().float() / 448.0
-        w_tri = downcast_to_static_fp8_3d(w_tri, w_static_scale)
-        w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
+        if token_expt_scales:
+            w_static_scale = None
+            w_expt_scale = w_tri.abs().amax(dim=(1, 2)).float() / 448.0
+            w_tri = (w_tri / w_expt_scale[:, None, None]).to(weight_dtype)
+            w_ref = (w_tri.float() * w_expt_scale[:, None, None]).to(torch.bfloat16)
+        else:
+            w_static_scale = w_tri.abs().max().float() / 448.0
+            w_tri = downcast_to_static_fp8_3d(w_tri, w_static_scale)
+            w_ref = (w_tri.float() * w_static_scale).to(torch.bfloat16)
 
     if act_mxfp8:
         x_tri, x_mx_scales_tri = downcast_to_mxfp(x_tri, act_dtype, axis=-1)
@@ -311,9 +324,15 @@ def test_op(
         out_dtype = torch.bfloat16
     else:
         x_mx_scales_tri = None
-        x_static_scale = x_tri.abs().max().float() / 448.0
-        x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
-        x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
+        if token_expt_scales:
+            x_static_scale = None
+            x_token_scale = x_tri.abs().amax(dim=-1).float() / 448.0
+            x_tri = (x_tri / x_token_scale[:, None]).to(act_dtype)
+            x_ref = (x_tri.float() * x_token_scale[:, None]).to(torch.bfloat16)
+        else:
+            x_static_scale = x_tri.abs().max().float() / 448.0
+            x_tri = downcast_to_static_fp8(x_tri, x_static_scale)
+            x_ref = (x_tri.float() * x_static_scale).to(torch.bfloat16)
         out_dtype = torch.float8_e4m3fn
 
     ref_y = moe_gemm_torch(
@@ -345,6 +364,8 @@ def test_op(
         swizzle_mx_scale,
         out_dtype,
         apply_swiglu,
+        x_token_scale=x_token_scale,
+        w_expt_scale=w_expt_scale,
     )
     if not act_mxfp8 and fused_quant:
         tri_y = (tri_y.float() * quant_static_scale).to(ref_y.dtype)

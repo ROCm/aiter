@@ -86,8 +86,15 @@ def _get_gemm_config_cached(
             config_dict, is_tuned = specialized_config, True
             break
 
-    # use standard bounds unless custom bounds are passed
-    search_bounds = bounds if bounds is not None else STANDARD_M_BOUNDS
+    # Explicit bounds override file-defined bounds; legacy files use the standard bounds.
+    search_bounds = (
+        bounds if bounds is not None else config_dict.get("M_BOUNDS", STANDARD_M_BOUNDS)
+    )
+    assert (
+        len(search_bounds) > 0
+        and all(type(x) is int and x > 0 for x in search_bounds)
+        and all(x < y for x, y in itertools.pairwise(search_bounds))
+    ), "M_BOUNDS must be a non-empty sequence of strictly increasing positive integers"
 
     # Search for M_LEQ_x keys
     for bound in search_bounds:
@@ -110,6 +117,18 @@ def _get_gemm_config_cached(
     )
 
 
+def _copy_gemm_config(config: dict) -> dict:
+    # JSON leaves are immutable. Avoid deepcopy's per-scalar overhead on the
+    # GEMM launch path while keeping nested variant configs safe to mutate.
+    result = config.copy()
+    for key, value in config.items():
+        if isinstance(value, dict):
+            result[key] = _copy_gemm_config(value)
+        elif isinstance(value, list):
+            result[key] = copy.deepcopy(value)
+    return result
+
+
 def get_gemm_config(
     config_name: str,
     M: int,
@@ -129,7 +148,7 @@ def get_gemm_config(
     2. If B, N and K are provided, try B-specialized config: {config_name}-B={B}-N={N}-K={K}.json
     3. If N and K are provided, try to load specialized config: {config_name}-N={N}-K={K}.json
        Or if specialized_filename is provided, use: {config_name}-{specialized_filename}.json
-    4. Search for M_LEQ_x keys in order of bounds (default: STANDARD_M_BOUNDS)
+    4. Search M_LEQ_x using explicit bounds, file M_BOUNDS or STANDARD_M_BOUNDS
     5. If no M_LEQ_x matches, search for M_GEQ_x keys in reverse order
     6. Fall back to "any" if no bounds match
 
@@ -138,7 +157,7 @@ def get_gemm_config(
         M: M dimension of the GEMM
         N: N dimension of the GEMM (optional)
         K: K dimension of the GEMM (optional)
-        bounds: Custom bounds to use instead of STANDARD_M_BOUNDS (optional)
+        bounds: Override the file M_BOUNDS or STANDARD_M_BOUNDS (optional)
         specialized_filename: Custom specialized filename suffix (optional)
         backend: Backend whose config directory to read, "triton" (default)
             or "gluon". Declared by the caller; there is no fallback to
@@ -152,7 +171,7 @@ def get_gemm_config(
     config, is_tuned = _get_gemm_config_cached(
         config_name, M, N, K, bounds, specialized_filename, backend, B
     )
-    return copy.deepcopy(config), is_tuned
+    return _copy_gemm_config(config), is_tuned
 
 
 def add_default_gemm_config_params(config: dict) -> dict:

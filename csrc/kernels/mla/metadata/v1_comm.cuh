@@ -87,6 +87,10 @@ struct MlaMetadataV1KernelParameter
     int32_t topk;
     int32_t qk_batch_ratio;
     int32_t num_splits;
+    // Batches the parallel planner scans per pass, chosen by the dispatch as the
+    // most whose LDS scratch fits this card. Read only by that planner; the
+    // serial and xcd paths ignore it.
+    int32_t batch_chunk = 0;
     // auto_split (caller passed max_split_per_batch < 0): device derives the
     // split count from workload; num_splits is only the upper bound.
     // See mla_v12_effective_splits.

@@ -941,6 +941,10 @@ def _get_config(
     dtype: torch.dtype,
     has_pe: bool = False,
     head_dim_v: int | None = None,
+    causal: bool = False,
+    max_seqlen_q: int | None = None,
+    max_seqlen_k: int | None = None,
+    batch_heads: int | None = None,
 ):
     cfg_dir = resolve_config_dir("attention", "MHA", backend="triton")
     config = load_config_json(f"{cfg_dir}/DEFAULT.json")
@@ -959,5 +963,27 @@ def _get_config(
         # recovers performance and is numerically verified for these dims, but
         # regresses d128 and miscompiles d<=16, so only 16 < d <= 64 uses this path.
         return fwd_cfg["small_head"]
+    elif (
+        head_dim_v is not None
+        and 64 < head_dim_v <= 128
+        and dtype in (torch.float16, torch.bfloat16)
+        and "mid_head" in fwd_cfg
+    ):
+        # 128x128 tiles run out of LDS above d128, so larger heads keep "default".
+        # "mid_head_skip" rules send short-KV, large-grid shapes back to
+        # "default"; a rule matches when every key it sets is satisfied.
+        if None not in (max_seqlen_q, max_seqlen_k, batch_heads):
+            programs = batch_heads * triton.cdiv(
+                max_seqlen_q, fwd_cfg["mid_head"]["BLOCK_M"]
+            )
+            for rule in fwd_cfg.get("mid_head_skip", []):
+                if (
+                    rule.get("causal", causal) == causal
+                    and head_dim_v >= rule.get("min_head_dim_v", 0)
+                    and max_seqlen_k <= rule.get("max_seqlen_k", max_seqlen_k)
+                    and programs >= rule.get("min_programs", 0)
+                ):
+                    return fwd_cfg["default"]
+        return fwd_cfg["mid_head"]
     else:
         return fwd_cfg["default"]

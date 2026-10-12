@@ -162,13 +162,15 @@ template <int Q_TILE_SIZE_  = 16,
           typename D_K_     = fp8_t,
           typename D_OUT_   = bf16_t,
           bool CAUSAL_      = false,
-          bool LARGE_KV_    = false>
+          bool LARGE_KV_          = false,
+          bool WAVE_SPANS_TOKENS_ = false>
 struct opus_mla_decode_fp8_16mx8_32nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
     static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool CAUSAL      = CAUSAL_;
+    static constexpr bool WAVE_SPANS_TOKENS = WAVE_SPANS_TOKENS_;
     // KV cache past the 4 GiB a buffer descriptor can address; see the KV load in
     // mla_decode_fp8_16mx8_32nx1.hpp. Costs ~1-2% and 3 spilled VGPR, so
     // the host only turns it on for the caches that need it.
