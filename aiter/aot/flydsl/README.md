@@ -7,10 +7,9 @@ the JIT path hits the cache instead of compiling again.
 
 | Module | OpKind | Description |
 | --- | --- | --- |
-| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE rows reach, by replaying `fused_moe` itself (see below) |
+| `moe.py` | `MOE` | Every FlyDSL kernel the tuned fused-MoE / FHMoE / gfx1250 grouped rows reach, by replaying `fused_moe` itself (see below) |
 | `gemm.py` | `GEMM` | GEMM kernels |
 | `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
-| `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
 | `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
 | `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 bundles of every deployment profile, by preloading `MegaMoEV2` itself (see below) |
 | `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
@@ -37,6 +36,12 @@ need no AOT change.
   stage-2 bias makes the runtime re-select configs whose stage 2 cannot take
   one), both gate/up layouts for MXMOE stage-1 rows, and the default and model
   SiTUv2 betas. Combinations the runtime rejects are reported as `[SKIP]`.
+- Rows of the gfx1250 grouped table replay with the gate/up-interleaved
+  weights and n32k4 scales gfx1250 callers pass; `_fused_moe_impl` hands them
+  to FlyDSL's grouped GEMM. Grouped rows tuned for EP only (`topk` -1, or
+  `ep_fused`) are skipped: the runtime picks them only under a caller's expert
+  mask or MegaMoE's stage-2 scatter, and the table records neither the global
+  expert count nor the real topk.
 - aiter fixes some arch-dependent values at import, so the replay runs in one
   process per target arch with the GPUs hidden and `GPU_ARCHS` set before
   aiter is imported. `python -m aiter.aot.flydsl.moe` starts those processes
@@ -93,9 +98,6 @@ python -m aiter.aot.flydsl.gemm
 
 # conv3d
 python -m aiter.aot.flydsl.conv
-
-# grouped MoE (gfx1250)
-python -m aiter.aot.flydsl.grouped_moe
 
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h

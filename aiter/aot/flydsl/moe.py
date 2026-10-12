@@ -7,7 +7,9 @@
 
 Each tuned row is replayed through the runtime's own implementation --
 ``_fused_moe_impl``, or ``_fhmoe_impl`` for heterogeneous shared-expert rows --
-on FakeTensors inside :func:`aiter.aot.flydsl.dry_run.dry_run`. The runtime
+on FakeTensors inside :func:`aiter.aot.flydsl.dry_run.dry_run`. On gfx1250,
+``_fused_moe_impl`` serves the grouped table's rows through FlyDSL's grouped
+GEMM. The runtime
 looks the row up, selects and parameterizes its kernels, sizes intermediate
 buffers and runs its auxiliary kernels exactly as it does at inference, and
 every FlyDSL launch on that path is compiled into the cache instead. This
@@ -66,6 +68,7 @@ from aiter.jit.core import AITER_CONFIGS
 DEFAULT_CSVS = [
     AITER_CONFIGS.AITER_CONFIG_FMOE_FILE,
     AITER_CONFIGS.AITER_CONFIG_FHMOE_FILE,
+    AITER_CONFIGS.AITER_CONFIG_GROUPED_FMOE_FILE,
 ]
 MOE_AOT_ARCH_DEFAULT = "gfx950"
 
@@ -85,6 +88,7 @@ _ROW_FIELDS = (
     "use_g1u1",
     "doweight_stage1",
     "shared_expert_id",
+    "ep_fused",
     "hidden_pad",
     "intermediate_pad",
     "gate_mode",
@@ -118,11 +122,20 @@ def job_arch(job: dict) -> str:
     return job["gfx"] or cu_num_to_arch(_int(job["cu_num"]), MOE_AOT_ARCH_DEFAULT)
 
 
+def _is_grouped(row: dict) -> bool:
+    """A row of the gfx1250 grouped table, served by FlyDSL's grouped GEMM."""
+    return (row.get("kernelName1") or "").strip().startswith("grouped_gemm")
+
+
 def _reaches_flydsl(row: dict) -> bool:
     kernel1 = (row.get("kernelName1") or "").strip()
     kernel2 = (row.get("kernelName2") or "").strip()
     # A cktile stage1 finishes with a FlyDSL activation epilogue.
-    return kernel1.startswith(("flydsl_", "cktile_")) or kernel2.startswith("flydsl_")
+    return (
+        kernel1.startswith(("flydsl_", "cktile_"))
+        or kernel2.startswith("flydsl_")
+        or _is_grouped(row)
+    )
 
 
 def _token_points(token: int, edges: bool) -> list[int]:
@@ -133,9 +146,12 @@ def _token_points(token: int, edges: bool) -> list[int]:
 
 def _caller_gate_mode(row: dict):
     """Gate/up weight layout serving uses for a quant family (gu-interleaved
-    for fp8 activations, as with ATOM_MOE_GU_ITLV=1)."""
+    for fp8 activations, as with ATOM_MOE_GU_ITLV=1). gfx1250 takes only the
+    gu-interleaved layout."""
     from aiter.ops.flydsl.moe_common import GateMode
 
+    if job_arch(row) == "gfx1250":
+        return GateMode.INTERLEAVE
     q_dtype_a, q_dtype_w = _name(row["q_dtype_a"]), _name(row["q_dtype_w"])
     mxfp8 = q_dtype_w in _FP8 and _name(row["q_type"]) == "per_1x32"
     if q_dtype_a in _FP8 and (q_dtype_w == _FP4 or mxfp8):
@@ -199,6 +215,11 @@ def parse_csv(csv_path: str, edges: bool = True) -> list[dict]:
                 continue
             if not _reaches_flydsl(row):
                 continue
+            # The runtime picks these grouped rows only under a caller's expert
+            # mask (topk -1) or MegaMoE's stage-2 scatter (ep_fused); the table
+            # records neither the global expert count nor the real topk.
+            if _int(row.get("topk")) < 0 or _flag(row.get("ep_fused")):
+                continue
             shape = {field: (row.get(field) or "").strip() for field in _ROW_FIELDS}
             label = f"{shape['kernelName1'] or '-'} | {shape['kernelName2'] or '-'}"
             for index, variant in enumerate(_variants(shape)):
@@ -229,6 +250,8 @@ def _caller_inputs(job: dict) -> dict:
 
     from aiter import QuantType, dtypes
     from aiter.ops.shuffle import (
+        moe_shuffle_scale,
+        moe_shuffle_weight,
         pack_int8_to_packed_int4,
         shuffle_scale_a16w4,
         shuffle_scale_for_int4,
@@ -247,7 +270,31 @@ def _caller_inputs(job: dict) -> dict:
     q_dtype_a = _dtype(job["q_dtype_a"])
     q_dtype_w = _dtype(job["q_dtype_w"])
 
-    if q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
+    if (
+        job_arch(job) == "gfx1250"
+        and q_type == QuantType.per_1x32
+        and q_dtype_w == dtypes.fp4x2
+    ):
+        # gu-interleaved (GUGU) weights with n32k4 scales, from raw GGUU rows.
+        w1 = moe_shuffle_weight(
+            empty(experts, w1_rows, model_dim // 2, dtype=dtypes.u8),
+            experts,
+            is_guinterleave=True,
+            gate_up=True,
+        ).view(q_dtype_w)
+        w2 = moe_shuffle_weight(
+            empty(experts, model_dim, inter_dim // 2, dtype=dtypes.u8), experts
+        ).view(q_dtype_w)
+        w1_scale = moe_shuffle_scale(
+            empty(experts, w1_rows, model_dim // 32, dtype=dtypes.u8),
+            experts,
+            is_guinterleave=True,
+            gate_up=True,
+        )
+        w2_scale = moe_shuffle_scale(
+            empty(experts, model_dim, inter_dim // 32, dtype=dtypes.u8), experts
+        )
+    elif q_type == QuantType.per_1x32 and q_dtype_w == dtypes.fp4x2:
         w1 = empty(experts, w1_rows, model_dim // 2, dtype=q_dtype_w)
         w2 = empty(experts, model_dim, inter_dim // 2, dtype=q_dtype_w)
         w1_scale = empty(experts * w1_rows, model_dim // 32, dtype=dtypes.fp8_e8m0)
@@ -370,11 +417,16 @@ def _without_device_queries():
 
 
 @contextmanager
-def _runtime_reads(csv_path: str, shared_expert: bool):
+def _runtime_reads(job: dict):
     """Point the runtime's tuned-config lookup at the row's own table."""
-    env_name = "AITER_CONFIG_FHMOE" if shared_expert else "AITER_CONFIG_FMOE"
+    if _is_grouped(job):
+        env_name = "AITER_CONFIG_GROUPED_FMOE"
+    elif _int(job["shared_expert_id"], -1) >= 0:
+        env_name = "AITER_CONFIG_FHMOE"
+    else:
+        env_name = "AITER_CONFIG_FMOE"
     get_config_file = type(AITER_CONFIGS).get_config_file
-    with mock.patch.dict(os.environ, {env_name: csv_path}):
+    with mock.patch.dict(os.environ, {env_name: job["csv_path"]}):
         get_config_file.cache_clear()
         try:
             yield
@@ -410,7 +462,7 @@ def compile_one_config(**job) -> dict:
     started = time.time()
     try:
         with (
-            _runtime_reads(job["csv_path"], _int(job["shared_expert_id"], -1) >= 0),
+            _runtime_reads(job),
             dry_run(arch, _int(job["cu_num"])),
             _without_device_queries(),
         ):
@@ -473,7 +525,9 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
             f"replaying {arch} jobs needs GPU_ARCHS={arch} set before aiter is "
             "imported; run through `python -m aiter.aot.flydsl.moe`"
         )
-    _load_host_helpers(arch, _int(jobs[0]["cu_num"]))
+    # Only the two-stage path queries it; the gfx1250 grouped path never does.
+    if not all(_is_grouped(job) for job in jobs):
+        _load_host_helpers(arch, _int(jobs[0]["cu_num"]))
     batches = _batches(jobs)
     outcomes = run_jobs_parallel(
         _replay_batch,
