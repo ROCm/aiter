@@ -779,7 +779,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-D__HIPCC_RTC__'"
+            "'-D__HIPCC_RTC__'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -795,7 +796,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -811,7 +812,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
