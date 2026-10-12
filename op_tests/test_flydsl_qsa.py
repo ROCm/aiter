@@ -36,10 +36,12 @@ and K2 use for a serving KV pool.
 from __future__ import annotations
 
 import argparse
+import inspect
 import itertools
 import math
 import os
 import sys
+import types
 
 import pandas as pd
 import torch
@@ -1027,45 +1029,99 @@ def test_k1_padded_decode_graph_capture():
     """Decode on a max_model_len table captures into a HIP graph and replays.
 
     vLLM captures decode into full graphs, where the padded-table width
-    readback is not allowed. Replays twice, the second time with new queries
-    written into the captured buffer, against the oracle.
+    readback is not allowed. One live row is longer than the compact
+    selector's minimum, so replay finishes the later radix passes from
+    the first-pass candidates. Another row repeats one K vector: the
+    top-512 cut sits inside a tie wider than that candidate buffer, so
+    the same kernel falls back to the full-row passes and keeps the
+    smaller block indexes. Replays twice, the second time with new
+    queries written into the captured buffer, against the oracle.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
+    from aiter.ops.flydsl.kernels.topk.topk_per_row_decode_persistent import (
+        _COMPACT_LIMIT,
+        _COMPACT_MIN_ROW,
+    )
+    from aiter.ops.flydsl.topk.topk_per_row import _ONE_WORKGROUP_MAX_ROW_WIDTH
+
     idx = FAMILY_A_INDEXER
     device = torch.device("cuda")
-    page_size, max_pages, context = 16, 4096, 65536
+    page_size, max_pages = 16, 4096
+    # 81920 / compress_ratio 4 = 20480 visible columns, above the compact cutoff.
+    context = 81920
     n_blocks = context // idx.compress_ratio
+    n_columns = max_pages * page_size
+    if n_columns <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
+        raise AssertionError(
+            f"padded table has {n_columns} columns, at or under the "
+            "one-workgroup cutoff"
+        )
+    if n_blocks <= _COMPACT_MIN_ROW or n_blocks <= _COMPACT_LIMIT:
+        raise AssertionError(
+            f"{n_blocks} visible columns does not cross the compact selector"
+        )
     torch.manual_seed(0)
     k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
     gen = torch.Generator(device=device)
     gen.manual_seed(1)
-    index_cache, index_table = pack_paged_cache(
+    random_cache, random_table = pack_paged_cache(
         k_bar.unsqueeze(1), page_size, generator=gen
     )
-    decode_lens = [3000, 9000, 30000, context]
+    # One repeated key: every complete block scores the same, so the
+    # top-512 cut is inside a tie as wide as the row.
+    tie_key = torch.ones(idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_tie = tie_key.unsqueeze(0).expand(n_blocks, -1).contiguous()
+    tie_cache, tie_table = pack_paged_cache(k_tie.unsqueeze(1), page_size)
+    index_cache = torch.cat((random_cache, tie_cache), dim=0)
+    varied_lens = [3000, 9000, 30000, context]
+    decode_lens = varied_lens + [context]
     m = len(decode_lens)
+    n_varied = len(varied_lens)
     slen = torch.tensor(decode_lens, dtype=dtypes.i32, device=device)
     t2r = torch.arange(m, dtype=dtypes.i32, device=device)
     qpos = slen - 1
+    visible = qsa_visible_blocks(qpos, slen, t2r, idx.compress_ratio)
+    if int(visible[n_varied - 1]) <= _COMPACT_MIN_ROW:
+        raise AssertionError("the long random row never reaches compact select")
+    if int(visible[n_varied]) <= _COMPACT_LIMIT:
+        raise AssertionError("the exact-tie row fits in the compact candidate buffer")
     table = torch.zeros(m, max_pages, dtype=dtypes.i32, device=device)
-    table[:, : index_table.shape[1]] = index_table
+    table[:n_varied, : random_table.shape[1]] = random_table
+    table[n_varied, : tie_table.shape[1]] = tie_table + random_cache.shape[0]
     q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
     out = torch.empty(m, k1_kernel._K, dtype=dtypes.i32, device=device)
+    tie_req = torch.zeros(1, dtype=dtypes.i32, device=device)
 
     def oracle():
-        return qsa_topk_blocks(
+        varied = qsa_topk_blocks(
             qsa_indexer_scores(
-                q,
+                q[:n_varied],
                 k_bar,
-                qpos,
-                slen,
-                t2r,
+                qpos[:n_varied],
+                slen[:n_varied],
+                t2r[:n_varied],
                 idx.compress_ratio,
                 score_scale=FAMILY_A_SCORE_SCALE,
             ),
             idx.block_budget,
         )
+        tied = qsa_topk_blocks(
+            qsa_indexer_scores(
+                q[n_varied:],
+                k_tie,
+                qpos[n_varied:],
+                slen[n_varied:],
+                tie_req,
+                idx.compress_ratio,
+                score_scale=FAMILY_A_SCORE_SCALE,
+            ),
+            idx.block_budget,
+        )
+        smallest = torch.arange(idx.block_budget, device=device, dtype=dtypes.i32)
+        if not torch.equal(tied[0], smallest):
+            raise AssertionError("exact tie did not keep the smaller block indexes")
+        return varied, tied
 
     def launch():
         qsa_k1_block_ids(q, index_cache, table, t2r, qpos, slen, out=out, heads=(4,))
@@ -1081,8 +1137,16 @@ def test_k1_padded_decode_graph_capture():
         out.fill_(-2)
         graph.replay()
         torch.cuda.synchronize()
+        varied, tied = oracle()
         _assert_k1_block_ids(
-            oracle(), out, f"K1 padded decode graph replay {replay} diverged"
+            varied,
+            out[:n_varied],
+            f"K1 padded decode graph replay {replay} diverged",
+        )
+        _assert_k1_block_ids(
+            tied,
+            out[n_varied:],
+            f"K1 exact-tie graph replay {replay} diverged",
         )
 
 
@@ -3922,58 +3986,43 @@ def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout="pac
 
 
 def _run_unit_cases():
-    test_indexer_hand_checked_one_row()
-    test_topk_smaller_index_wins_ties()
-    test_incomplete_blocks_not_selected()
-    test_gqa_matches_dense_on_selected()
-    test_family_a_shapes_smoke()
-    test_family_b_shape_constants()
-    test_paged_roundtrip_tiny()
-    test_k1_family_a_set_equality_short_decode()
-    test_k1_block_ids_require_packed_prefix()
-    test_k1_family_a_set_equality_two_tiles()
-    test_k1_family_a_set_equality_wide_stream()
-    test_k1_family_a_set_equality_prefill()
-    test_k1_prefill_padded_page_table()
-    test_k1_decode_rejects_invalid_page_ids()
-    test_k1_gfx942_h8_skips_prefill_tile()
-    test_family_a_k1_bench_times_expand()
-    test_k1_k2_sweep_keeps_requested_m_and_fails_on_mismatch()
-    test_qsa_arch_allowlist()
-    test_k1_page_past_4gib()
-    test_expand_rejects_out_that_cannot_hold_the_stores()
-    test_sparse_attention_rejects_out_that_does_not_match_q()
-    test_k1_serves_padded_page_and_rejects_misaligned()
-    test_k1_padded_page_stride_matches_packed()
-    test_k1_wide_padded_page_does_not_alias()
-    test_wide_cache_layout_spans_past_4gib()
-    test_k1_family_b_set_equality_short_decode()
-    test_k1_family_b_set_equality_short_decode_h8()
-    test_k1_family_b_set_equality_two_tiles()
-    test_k1_family_b_set_equality_two_tiles_h8()
-    test_k1_family_b_set_equality_published_indexer_point()
-    test_k2_family_a_decode_matches_oracle()
-    test_k2_family_a_prefill_matches_oracle()
-    test_k2_page_past_4gib()
-    test_k2_interleaved_kv_view_matches_contiguous()
-    test_k2_interleaved_kv_page_past_4gib()
-    test_k2_empty_first_tile_keeps_later_token()
-    test_k2_default_out_ignores_query_strides()
-    test_k2_empty_cache_or_table_returns_zeros()
-    test_k2_caller_workspace_is_the_only_partial_buffer()
-    test_qsa_backend_default_is_auto()
-    test_qsa_auto_admits_only_measured_pairs()
-    test_qsa_auto_rejects_a_selection_k1_cannot_build()
-    test_qsa_layer_triton_threads_scales()
-    test_qsa_metadata_strided_view_matches_packed()
-    test_k2_serves_rejects_shapes_the_builder_rejects()
-    test_qsa_auto_logs_unmeasured_query_once()
-    test_qsa_aot_collector_lists_family_a_launches()
-    test_qsa_aot_empty_launch_list_has_no_jobs()
-    test_qsa_symbols_export_lazily()
-    test_qsa_layer_family_a_matches_oracle()
-    test_qsa_layer_family_b_matches_oracle()
-    test_qsa_layer_decode_graph_replays()
+    """Run every ``test_*`` in this module. CI calls the file as a script.
+
+    Pytest collects the same functions. A hand list here drifted: the
+    padded-table, capture, and AOT-target cases never ran on that path.
+    """
+    cases = [
+        value
+        for name, value in globals().items()
+        if name.startswith("test_")
+        and isinstance(value, types.FunctionType)
+        and value.__module__ == __name__
+    ]
+    for case in cases:
+        params = [
+            param
+            for param in inspect.signature(case).parameters.values()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        ]
+        if not params:
+            case()
+            continue
+        if [param.name for param in params] != ["monkeypatch"]:
+            raise AssertionError(
+                f"{case.__name__} needs fixtures the script runner does not provide"
+            )
+        import pytest
+
+        patch = pytest.MonkeyPatch()
+        try:
+            case(patch)
+        finally:
+            patch.undo()
     aiter.logger.info("QSA oracle + K1 + K2 + layer unit cases passed")
 
 
