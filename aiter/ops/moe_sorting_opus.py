@@ -14,6 +14,7 @@ def moe_sorting_opus_get_workspace_size(
     num_experts: int,
     topk: int,
     dispatch_policy: int = 0,
+    device_id: int = -1,
 ) -> int: ...
 
 
