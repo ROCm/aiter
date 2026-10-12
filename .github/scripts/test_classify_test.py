@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
@@ -23,7 +22,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPTS_DIR.parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from classify_test import classify_test_file  # noqa: E402
+from classify_test import classify_test_file
 
 
 class TestClassifyTestSynthetic(unittest.TestCase):
@@ -167,6 +166,7 @@ def test_canary():
                 [sys.executable, "-m", "pytest", tmp_path, "-q"],
                 capture_output=True,
                 text=True,
+                check=False,
             )
             self.assertEqual(res.returncode, 1)
             self.assertIn("AssertionError", res.stdout + res.stderr)

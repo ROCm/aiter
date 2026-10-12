@@ -22,10 +22,9 @@ from __future__ import annotations
 
 import ast
 import sys
-from typing import Set
 
 # Standard pytest built-in fixtures recognized across all test suites
-STANDARD_FIXTURES: Set[str] = {
+STANDARD_FIXTURES: set[str] = {
     "self",
     "cls",
     "monkeypatch",
@@ -62,7 +61,7 @@ def classify_test_file(filepath: str) -> str:
         with open(filepath, "r", encoding="utf-8") as f:
             source = f.read()
         tree = ast.parse(source, filename=filepath)
-    except Exception:
+    except (OSError, SyntaxError, ValueError):
         # Fall back to python3 to surface syntax or encoding errors
         return "PYTHON"
 
@@ -92,7 +91,7 @@ def classify_test_file(filepath: str) -> str:
         return "PYTHON"
 
     # 3. Discover local fixture definitions in the file
-    local_fixtures: Set[str] = set()
+    local_fixtures: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef):
             for dec in node.decorator_list:
@@ -108,11 +107,11 @@ def classify_test_file(filepath: str) -> str:
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
             test_function_nodes.append(node)
-        elif isinstance(node, ast.ClassDef):
-            if node.name.startswith("Test") or any(
-                "TestCase" in ast.unparse(b) for b in node.bases
-            ):
-                has_test_classes = True
+        elif isinstance(node, ast.ClassDef) and (
+            node.name.startswith("Test")
+            or any("TestCase" in ast.unparse(b) for b in node.bases)
+        ):
+            has_test_classes = True
 
     # If there are no test functions and no test classes, it's not a pytest suite
     if not test_function_nodes and not has_test_classes:
