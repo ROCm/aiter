@@ -51,6 +51,7 @@ from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
 from aiter.ops.flydsl.kernels.qsa.k2 import build_qsa_k2_module, qsa_k2_serves
+from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
 from aiter.ops.flydsl.qsa import (
     gather_paged_cache,
     normalize_qsa_backend,
@@ -88,14 +89,6 @@ from op_tests.qsa_shapes import (
 SUPPORTED_GFX = ["gfx942", "gfx950"]
 # Exactly 4 GiB still fits in a V# offset. The wide compile starts past that.
 _FOUR_GIB = 1 << 32
-
-
-def _span_bytes(t: torch.Tensor) -> int:
-    """Bytes from ``t``'s first element to one past its last, for any strides."""
-    if t.numel() == 0:
-        return 0
-    last = sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
-    return (last + 1) * t.element_size()
 
 
 def _storage_tensor(view: torch.Tensor) -> torch.Tensor:
@@ -151,8 +144,8 @@ def _widen_cache(cache: torch.Tensor) -> torch.Tensor:
         (view_pages, page_size, n_heads, head_dim),
         (page_stride, token_stride, head_stride, 1),
     )
-    if _span_bytes(view) <= _FOUR_GIB:
-        raise RuntimeError(f"wide cache span {_span_bytes(view)} did not pass 4 GiB")
+    if span_bytes(view) <= _FOUR_GIB:
+        raise RuntimeError(f"wide cache span {span_bytes(view)} did not pass 4 GiB")
     return view
 
 
@@ -166,7 +159,7 @@ def _apply_cache_layout(cache: torch.Tensor, layout: str) -> torch.Tensor:
 
 
 def _span_gib(cache: torch.Tensor) -> float:
-    return _span_bytes(cache) / (1 << 30)
+    return span_bytes(cache) / (1 << 30)
 
 
 def test_wide_cache_layout_spans_past_4gib():
@@ -203,11 +196,11 @@ def test_wide_cache_layout_spans_past_4gib():
             page_size,
         )
         packed = _apply_cache_layout(cache, "packed")
-        if _span_bytes(packed) > _FOUR_GIB:
+        if span_bytes(packed) > _FOUR_GIB:
             raise AssertionError("packed layout crossed 4 GiB")
         view = _apply_cache_layout(cache, "wide")
-        if _span_bytes(view) <= _FOUR_GIB:
-            raise AssertionError(f"wide span {_span_bytes(view)} did not pass 4 GiB")
+        if span_bytes(view) <= _FOUR_GIB:
+            raise AssertionError(f"wide span {span_bytes(view)} did not pass 4 GiB")
         if n_pages == 1 and view.shape[0] != 2:
             raise AssertionError(f"one-page cache stayed at {view.shape[0]} pages")
         if n_pages > 1 and view.shape[0] != n_pages:
@@ -223,10 +216,10 @@ def test_wide_cache_layout_spans_past_4gib():
         reason = k1_kernel.qsa_k1_serves(q, view, table, (4,))
         if reason is not None:
             raise AssertionError(f"wide indexer cache was rejected: {reason}")
-        if _span_bytes(view.clone()) > _FOUR_GIB:
+        if span_bytes(view.clone()) > _FOUR_GIB:
             raise AssertionError("cloning the view kept the wide span")
         restored = _storage_tensor(view).clone().as_strided(view.shape, view.stride())
-        if _span_bytes(restored) <= _FOUR_GIB:
+        if span_bytes(restored) <= _FOUR_GIB:
             raise AssertionError("storage copy dropped the wide span")
         if not torch.equal(restored[:n_pages], cache):
             raise AssertionError("storage copy changed the packed pages")
@@ -255,7 +248,7 @@ def _time(fn, *args, rotate, **kwargs):
     wide = [
         i
         for i, arg in enumerate(args)
-        if isinstance(arg, torch.Tensor) and _span_bytes(arg) > _FOUR_GIB
+        if isinstance(arg, torch.Tensor) and span_bytes(arg) > _FOUR_GIB
     ]
     if not wide:
         return run_perftest(fn, *args, num_rotate_args=rotate, **kwargs)
@@ -1286,7 +1279,7 @@ def test_k1_serves_padded_page_and_rejects_misaligned():
         raise AssertionError("padded page stride should not be contiguous")
     if k1_kernel.qsa_k1_serves(q, view, table, (4,)) is not None:
         raise AssertionError(f"padded page stride was rejected: {view.stride()}")
-    span = k1_kernel._span_bytes(view)
+    span = span_bytes(view)
     packed = view.numel() * view.element_size()
     if span <= packed:
         raise AssertionError(f"span {span} did not exceed packed bytes {packed}")
@@ -1404,7 +1397,7 @@ def test_k1_wide_padded_page_does_not_alias():
         (view_pages, page_size, 1, idx.head_dim),
         (2 * page_elems, idx.head_dim, idx.head_dim, 1),
     )
-    span = k1_kernel._span_bytes(view)
+    span = span_bytes(view)
     packed = view.numel() * view.element_size()
     if span <= (1 << 32) or packed > (1 << 32):
         raise AssertionError(f"span {span} packed {packed} is not the wide-view case")
