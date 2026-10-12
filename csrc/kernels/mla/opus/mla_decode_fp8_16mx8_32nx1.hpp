@@ -46,7 +46,7 @@
 #if !defined(__HIP_DEVICE_COMPILE__) || !defined(__gfx950__)
 
 template <class Traits>
-__global__ void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_fp8_kargs)
+__global__ void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_kargs)
 {
 }
 
@@ -669,7 +669,7 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, opus::u32_t ne
 // the same accumulator.
 template <class Traits, bool STAGGER, class VQN, class VQR, class VO>
 __device__ __attribute__((always_inline)) void
-mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
+mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
                          int kv_ind_ptr_s,
                          int valid_kv_len,
                          int tile_begin,
@@ -700,7 +700,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
         diag_kv_bound = causal_kv_bound<T>(causal_diagonal, kargs.H, warp_id, lane_id);
     }
 
-    const D_K* kv_base = reinterpret_cast<const D_K*>(kargs.kv_buffer_ptr);
+    const D_K* kv_base = reinterpret_cast<const D_K*>(kargs.kv_ptr);
     // kv_indices always stays on a descriptor -- it is int-indexed and never large.
     auto g_kv_indices = make_gmem(kargs.kv_indices + kv_ind_ptr_s, valid_kv_len * sizeof(int));
 
@@ -1221,7 +1221,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_fp8_kargs kargs,
 // split-KV partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits, bool STAGGER>
 __device__ __attribute__((always_inline)) void
-mla_decode_fwd_one_req(opus_mla_decode_fp8_kargs kargs, int w, char* smem_kv, float temperature_scale)
+mla_decode_fwd_one_req(opus_mla_decode_kargs kargs, int w, char* smem_kv, float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1269,10 +1269,10 @@ mla_decode_fwd_one_req(opus_mla_decode_fp8_kargs kargs, int w, char* smem_kv, fl
     const float qk_scale = readfirstlane_f32(temperature_scale * descale_q * descale_k);
 
     const int q_gmem_offset = q_len_ptr_s * kargs.stride_q_b;
-    auto g_q_nope = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_buffer_ptr) + q_gmem_offset,
+    auto g_q_nope = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
                               q_len * kargs.stride_q_b * sizeof(D_Q));
     auto g_q_rope =
-        make_gmem(reinterpret_cast<const D_Q*>(kargs.q_buffer_ptr) + q_gmem_offset + T::D_NOPE_SIZE,
+        make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset + T::D_NOPE_SIZE,
                   q_len * kargs.stride_q_b * sizeof(D_Q));
     auto u_q_nope = make_layout_q_nope<T>(warp_id, lane_id);
     auto v_q_nope = load<T::VEC_Q_NOPE>(g_q_nope, u_q_nope);
@@ -1352,7 +1352,7 @@ mla_decode_fwd_one_req(opus_mla_decode_fp8_kargs kargs, int w, char* smem_kv, fl
 // occupancy-2 launch bound is what caps the whole kernel at 256 VGPR.
 template <class Traits>
 __global__ __launch_bounds__(Traits::BLOCK_SIZE,
-                             2) void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_fp8_kargs kargs)
+                             2) void opus_mla_decode_fp8_16mx8_32nx1_kernel(opus_mla_decode_kargs kargs)
 {
     using namespace opus;
     using namespace mla_decode_fwd_16mx8_32nx1_fp8fp8;

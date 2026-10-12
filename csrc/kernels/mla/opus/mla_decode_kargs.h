@@ -45,7 +45,13 @@ struct opus_mla_decode_kargs
     int stride_o_h;
     int stride_kv_page;
     float softmax_scale;
+    const void* __restrict__ q_scale_ptr;
+    const void* __restrict__ kv_scale_ptr;
+    const int* __restrict__ kv_last_page_lens;
 };
+
+// The bf16 code objects have no source in this tree, so their prefix cannot move.
+constexpr size_t opus_mla_decode_bf16_kargs_bytes = offsetof(opus_mla_decode_kargs, q_scale_ptr);
 
 struct opus_mla_decode_mxfp8_kargs
 {
@@ -83,9 +89,10 @@ struct opus_mla_decode_mxfp8_kargs
 };
 
 static_assert(sizeof(opus_mla_decode_work_info) == 32);
-static_assert(sizeof(opus_mla_decode_kargs) == 120);
+static_assert(sizeof(opus_mla_decode_kargs) == 144);
 static_assert(offsetof(opus_mla_decode_kargs, work_info_set) == 80);
 static_assert(offsetof(opus_mla_decode_kargs, softmax_scale) == 116);
+static_assert(opus_mla_decode_bf16_kargs_bytes == 120);
 static_assert(sizeof(opus_mla_decode_mxfp8_kargs) == 176);
 static_assert(offsetof(opus_mla_decode_mxfp8_kargs, work_info_set) == 112);
 static_assert(offsetof(opus_mla_decode_mxfp8_kargs, softmax_scale) == 172);
