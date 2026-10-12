@@ -89,6 +89,10 @@ class TestCSVValidation(unittest.TestCase):
             / 1e9
         )
         error = (df["bw"] - expected.round(2)).abs()
+        self.assertFalse(
+            error.isna().any(),
+            f"{name}: bw validation contains missing values",
+        )
         self.assertLessEqual(
             float(error.max()),
             0.02,
