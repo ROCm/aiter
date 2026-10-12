@@ -24,6 +24,36 @@ ENTRY_POINTS = [
     "layernorm2d_fwd_with_add_smoothquant",
 ]
 
+PUBLIC_SCHEMAS = {
+    "layer_norm": (
+        "aiter::layer_norm(Tensor(a0!) input, Tensor(a1!)? weight=None, "
+        "Tensor(a2!)? bias=None, float epsilon=1.0000000000000001e-05, "
+        "Tensor(a4!)? x_bias=None) -> Tensor"
+    ),
+    "layernorm2d_fwd": (
+        "aiter::layernorm2d_fwd(Tensor(a0!) input, Tensor(a1!) weight, "
+        "Tensor(a2!) bias, float epsilon=1.0000000000000001e-05, "
+        "Tensor(a4!)? x_bias=None) -> Tensor"
+    ),
+    "layernorm2d_fwd_with_add": (
+        "aiter::layernorm2d_fwd_with_add(Tensor(a0!) out, Tensor(a1!) input, "
+        "Tensor(a2!) residual_in, Tensor(a3!) residual_out, Tensor(a4!) weight, "
+        "Tensor(a5!) bias, float epsilon, Tensor(a7!)? x_bias=None) -> ()"
+    ),
+    "layernorm2d_fwd_with_smoothquant": (
+        "aiter::layernorm2d_fwd_with_smoothquant(Tensor(a0!) out, "
+        "Tensor(a1!) input, Tensor(a2!) xscale, Tensor(a3!) yscale, "
+        "Tensor(a4!) weight, Tensor(a5!) bias, float epsilon, "
+        "Tensor(a7!)? x_bias=None) -> ()"
+    ),
+    "layernorm2d_fwd_with_add_smoothquant": (
+        "aiter::layernorm2d_fwd_with_add_smoothquant(Tensor(a0!) out, "
+        "Tensor(a1!) input, Tensor(a2!) residual_in, Tensor(a3!) residual_out, "
+        "Tensor(a4!) xscale, Tensor(a5!) yscale, Tensor(a6!) weight, "
+        "Tensor(a7!) bias, float epsilon, Tensor(a9!)? x_bias=None) -> ()"
+    ),
+}
+
 TRITON_NAME = {
     "layer_norm": "layer_norm",
     "layernorm2d_fwd": "layer_norm",
@@ -68,24 +98,24 @@ def _make_inputs():
     }
 
 
-def _call(entry, t, x_bias):
+def _call(entry, t, x_bias, api=norm):
     """Calls an entry point; returns (result, out) where out is the caller's output tensor or None."""
     x, w, b = t["x"], t["weight"], t["bias"]
     if entry in ("layer_norm", "layernorm2d_fwd"):
-        return getattr(norm, entry)(x, w, b, EPS, x_bias), None
+        return getattr(api, entry)(x, w, b, EPS, x_bias), None
     if entry == "layernorm2d_fwd_with_add":
         out = torch.zeros_like(x)
-        norm.layernorm2d_fwd_with_add(
+        api.layernorm2d_fwd_with_add(
             out, x, t["residual"], torch.zeros_like(x), w, b, EPS, x_bias
         )
         return None, out
     out = torch.zeros(B, S, N, dtype=torch.int8)
     if entry == "layernorm2d_fwd_with_smoothquant":
-        norm.layernorm2d_fwd_with_smoothquant(
+        api.layernorm2d_fwd_with_smoothquant(
             out, x, t["xscale"], t["yscale"], w, b, EPS, x_bias
         )
     else:
-        norm.layernorm2d_fwd_with_add_smoothquant(
+        api.layernorm2d_fwd_with_add_smoothquant(
             out,
             x,
             t["residual"],
@@ -107,6 +137,104 @@ def triton_recorder(monkeypatch):
     for name in set(TRITON_NAME.values()) - {"layer_norm"}:
         monkeypatch.setattr(triton_norm, name, rec.make(name))
     return rec
+
+
+def test_public_custom_op_names_and_schemas():
+    for name, schema in PUBLIC_SCHEMAS.items():
+        assert str(getattr(torch.ops.aiter, name).default._schema) == schema
+        assert hasattr(torch.ops.aiter, f"{name}_ck")
+
+
+@pytest.mark.parametrize("enable_ck", [False, True])
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_public_custom_ops_dispatch(monkeypatch, triton_recorder, entry, enable_ck):
+    monkeypatch.setattr(norm, "ENABLE_CK", enable_ck)
+    rec = Recorder()
+    for name in ENTRY_POINTS:
+        monkeypatch.setattr(
+            norm,
+            f"{name}_ck",
+            rec.make(name, returns=name in ("layer_norm", "layernorm2d_fwd")),
+        )
+    if enable_ck:
+        for name in set(TRITON_NAME.values()):
+            monkeypatch.setattr(triton_norm, name, _forbid(f"triton {name}"))
+
+    ret, out = _call(entry, _make_inputs(), None, api=torch.ops.aiter)
+
+    if enable_ck:
+        assert [c[0] for c in rec.calls] == [entry]
+        assert triton_recorder.calls == []
+    else:
+        assert rec.calls == []
+        assert [c[0] for c in triton_recorder.calls] == [TRITON_NAME[entry]]
+    result = ret if out is None else out
+    assert bool((result == MARK).all())
+
+
+@pytest.mark.parametrize("enable_ck", [False, True])
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_public_custom_ops_compile_fullgraph(monkeypatch, entry, enable_ck):
+    monkeypatch.setattr(norm, "ENABLE_CK", enable_ck)
+
+    def fake(*args, **kwargs):
+        if entry in ("layer_norm", "layernorm2d_fwd"):
+            return torch.full_like(args[0], MARK)
+        args[0].fill_(MARK)
+        if entry in (
+            "layernorm2d_fwd_with_add",
+            "layernorm2d_fwd_with_smoothquant",
+        ):
+            args[3].fill_(MARK + 1)
+        elif entry == "layernorm2d_fwd_with_add_smoothquant":
+            args[3].fill_(MARK + 1)
+            args[5].fill_(MARK + 2)
+
+    monkeypatch.setattr(norm, f"{entry}_ck", fake)
+    monkeypatch.setattr(triton_norm, TRITON_NAME[entry], fake)
+
+    def call(x, residual, weight, bias, xscale, yscale, out, residual_out):
+        op = getattr(torch.ops.aiter, entry)
+        if entry in ("layer_norm", "layernorm2d_fwd"):
+            return op(x, weight, bias, EPS, None)
+        if entry == "layernorm2d_fwd_with_add":
+            op(out, x, residual, residual_out, weight, bias, EPS, None)
+            return out, residual_out
+        if entry == "layernorm2d_fwd_with_smoothquant":
+            op(out, x, xscale, yscale, weight, bias, EPS, None)
+            return out, yscale
+        op(
+            out,
+            x,
+            residual,
+            residual_out,
+            xscale,
+            yscale,
+            weight,
+            bias,
+            EPS,
+            None,
+        )
+        return out, residual_out, yscale
+
+    t = _make_inputs()
+    out_dtype = torch.bfloat16 if entry == "layernorm2d_fwd_with_add" else torch.int8
+    args = (
+        t["x"],
+        t["residual"],
+        t["weight"],
+        t["bias"],
+        t["xscale"],
+        t["yscale"],
+        torch.zeros(B, S, N, dtype=out_dtype),
+        torch.zeros_like(t["x"]),
+    )
+    torch._dynamo.reset()
+    result = torch.compile(call, backend="eager", fullgraph=True)(*args)
+
+    results = result if isinstance(result, tuple) else (result,)
+    for i, tensor in enumerate(results):
+        assert bool((tensor == MARK + i).all())
 
 
 @pytest.mark.parametrize("use_x_bias", [False, True])

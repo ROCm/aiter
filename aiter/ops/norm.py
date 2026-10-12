@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import ENABLE_CK, compile_ops
+from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_norm"
 
@@ -138,6 +139,7 @@ def _check_affine(weight: Tensor | None, bias: Tensor | None) -> None:
         raise TypeError("LayerNorm requires weight and bias tensors")
 
 
+@torch_compile_guard(gen_fake=gen_layer_norm_fake_tensors)
 def layer_norm(
     input: Tensor,
     weight: Tensor | None = None,
@@ -154,6 +156,7 @@ def layer_norm(
     return layer_norm_ck(input, weight, bias, epsilon, x_bias)
 
 
+@torch_compile_guard(gen_fake=gen_layer_norm_fake_tensors)
 def layernorm2d_fwd(
     input: Tensor,
     weight: Tensor,
@@ -162,10 +165,15 @@ def layernorm2d_fwd(
     x_bias: Tensor | None = None,
 ) -> Tensor:
     if not ENABLE_CK:
-        return layer_norm(input, weight, bias, epsilon, x_bias)
+        _check_affine(weight, bias)
+        from .triton.normalization.norm import layer_norm as layer_norm_triton
+
+        out = layer_norm_triton(_triton_rows(input, x_bias), weight, bias, epsilon)
+        return out.view(input.shape)
     return layernorm2d_fwd_ck(input, weight, bias, epsilon, x_bias)
 
 
+@torch_compile_guard(gen_fake=lambda *args, **kwargs: None)
 def layernorm2d_fwd_with_add(
     out: Tensor,
     input: Tensor,
@@ -193,6 +201,7 @@ def layernorm2d_fwd_with_add(
     )
 
 
+@torch_compile_guard(gen_fake=lambda *args, **kwargs: None)
 def layernorm2d_fwd_with_smoothquant(
     out: Tensor,
     input: Tensor,
@@ -226,6 +235,7 @@ def layernorm2d_fwd_with_smoothquant(
     )
 
 
+@torch_compile_guard(gen_fake=lambda *args, **kwargs: None)
 def layernorm2d_fwd_with_add_smoothquant(
     out: Tensor,
     input: Tensor,
