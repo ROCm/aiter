@@ -458,45 +458,12 @@ def _build_kv_kernel(
         layout_pair_cols = fx.slice(layout_pair_tv, (None, (None, 0)))
         pairs_per_lane = layout_pair_cols.shape[1].unpack()
         layout_stage = fx.make_ordered_layout((block_size, D), (1, 0))
-        # Group D or the token axis of layout_stage into x-runs.
-        layout_d_runs = fx.make_ordered_layout((D // x, x), (1, 0))
-        # Per-head cache layouts are the source of truth for the nested shape
-        # and physical strides: x is fastest, followed by token/D, then the
-        # outer D/token tile.
-        layout_k_head = fx.make_ordered_layout(((D // x, x), block_size), ((2, 0), 1))
-        layout_v_head = fx.make_ordered_layout(((block_size // x, x), D), ((2, 0), 1))
-        # Keep each physical x-run nested inside its logical D/token mode and
-        # encode the possibly-strided physical block mode in the same view.
-        # K is indexed as [block, head, d, token], and V as
-        # [block, head, token, d].
-        layout_k_cache = fx.make_layout(
-            (
-                k_cache.shape[0],
-                H_KV,
-                layout_k_head.shape[0],
-                layout_k_head.shape[1],
-            ),
-            stride=(
-                k_cache_block_stride,
-                fx.cosize(layout_k_head),
-                layout_k_head.stride[0],
-                layout_k_head.stride[1],
-            ),
-        )
-        layout_v_cache = fx.make_layout(
-            (
-                v_cache.shape[0],
-                H_KV,
-                layout_v_head.shape[0],
-                layout_v_head.shape[1],
-            ),
-            stride=(
-                v_cache_block_stride,
-                fx.cosize(layout_v_head),
-                layout_v_head.stride[0],
-                layout_v_head.stride[1],
-            ),
-        )
+        # Per-head page layouts are the source of truth for the shuffle cache's
+        # nested shape and physical strides. They are logical [token, D]
+        # pages with the x-run split out of D (K) or token (V); x is
+        # fastest, followed by token/D, then the outer D/token tile.
+        layout_k_page = fx.make_ordered_layout((block_size, (x, D // x)), (1, (0, 2)))
+        layout_v_page = fx.make_ordered_layout(((x, block_size // x), D), ((0, 2), 1))
 
         def make_linear_tv(item_layout):
             """Map each thread/iteration pair over an item's layout."""
@@ -580,8 +547,25 @@ def _build_kv_kernel(
         v_lds = lds.v_lds
         k_lds_view = k_lds.view(layout_stage)
         v_lds_view = v_lds.view(layout_stage)
-        k_cache_view = fx.Tensor(fx.make_view(fx.get_iter(k_cache), layout_k_cache))
-        v_cache_view = fx.Tensor(fx.make_view(fx.get_iter(v_cache), layout_v_cache))
+
+        def make_slot_view(cache, page, block_stride):
+            """[slot, head, D | token]: the slot mode is (token-in-page, block)."""
+            return fx.Tensor(
+                fx.make_view(
+                    fx.get_iter(cache),
+                    fx.make_layout(
+                        ((page.shape[0], cache.shape[0]), H_KV, page.shape[1]),
+                        stride=(
+                            (page.stride[0], block_stride),
+                            STAGE_ELEMS,
+                            page.stride[1],
+                        ),
+                    ),
+                )
+            )
+
+        k_slot_view = make_slot_view(k_cache, layout_k_page, k_cache_block_stride)
+        v_slot_view = make_slot_view(v_cache, layout_v_page, v_cache_block_stride)
         mapping_ok = lds.mapping_ok
 
         tok0 = (blk + page_block_offset) * block_size
@@ -723,36 +707,21 @@ def _build_kv_kernel(
 
         if can_coalesce:
             block_id = slot_mapping[tok0] // block_size
-            # Use one logical ((D/x, token), x-run) domain for both LDS and cache
+            # Use one logical [token, D] page domain for both LDS and cache.
             # Only the strides differ: LDS is row-major [token, D], while the
             # shuffle cache is [D/x, token, x]. This lets the tiled copy own
             # the complete page without per-run slicing or coordinate walks.
-            k_copy_shape = ((D // x, block_size), x)
-            k_src_layout = fx.make_layout(k_copy_shape, stride=((x, D), 1))
+            k_src_layout = fx.make_layout(layout_k_page.shape, stride=(D, (1, x)))
             k_src = fx.Tensor(fx.make_view(fx.get_iter(k_lds_view), k_src_layout))
-            k_cache_copy_view = fx.Tensor(
-                fx.make_view(
-                    fx.get_iter(k_cache),
-                    fx.make_layout(
-                        (k_cache.shape[0], H_KV, *k_copy_shape),
-                        stride=(
-                            k_cache_block_stride,
-                            fx.cosize(layout_k_head),
-                            (block_size * x, x),
-                            1,
-                        ),
-                    ),
-                )
-            )
-            k_dst = fx.slice(k_cache_copy_view, (block_id, head, None, None))
+            k_dst = fx.slice(k_slot_view, ((None, block_id), head, None))
 
             k_thread_chunks = min(D // x, KV_THREADS // block_size)
             k_value_chunks = (D // x) // k_thread_chunks
             k_thread_layout = fx.make_ordered_layout(
-                ((k_thread_chunks, block_size), 1), ((1, 0), 2)
+                (block_size, k_thread_chunks), (1, 0)
             )
             k_value_layout = fx.make_ordered_layout(
-                ((k_value_chunks, 1), x), ((1, 2), 0)
+                (1, (x, k_value_chunks)), (2, (0, 1))
             )
             k_tile, k_tv = fx.make_layout_tv(k_thread_layout, k_value_layout)
             k_copy_threads = k_thread_chunks * block_size
@@ -764,36 +733,18 @@ def _build_kv_kernel(
                 fx.copy(copy_128b, part_k_src, frag_k)
                 fx.copy(copy_128b, frag_k, part_k_dst)
 
-            # V uses the analogous ((token/x, D), x-run) domain. Its LDS run
+            # V uses the analogous [token, D] page domain. Its LDS run
             # is strided by D, so scalar copies gather into a fragment before
             # the destination tiled copy emits one contiguous 16-byte store.
-            v_copy_shape = ((block_size // x, D), x)
-            v_src_layout = fx.make_layout(v_copy_shape, stride=((x * D, 1), D))
+            v_src_layout = fx.make_layout(layout_v_page.shape, stride=((D, x * D), 1))
             v_src = fx.Tensor(fx.make_view(fx.get_iter(v_lds_view), v_src_layout))
-
-            v_cache_copy_view = fx.Tensor(
-                fx.make_view(
-                    fx.get_iter(v_cache),
-                    fx.make_layout(
-                        (v_cache.shape[0], H_KV, *v_copy_shape),
-                        stride=(
-                            v_cache_block_stride,
-                            fx.cosize(layout_v_head),
-                            (D * x, x),
-                            1,
-                        ),
-                    ),
-                )
-            )
-            v_dst = fx.slice(v_cache_copy_view, (block_id, head, None, None))
+            v_dst = fx.slice(v_slot_view, ((None, block_id), head, None))
 
             v_thread_tiles = min(block_size // x, KV_THREADS // D)
             v_value_tiles = (block_size // x) // v_thread_tiles
-            v_thread_layout = fx.make_ordered_layout(
-                ((v_thread_tiles, D), 1), ((1, 0), 2)
-            )
+            v_thread_layout = fx.make_ordered_layout((v_thread_tiles, D), (0, 1))
             v_value_layout = fx.make_ordered_layout(
-                ((v_value_tiles, 1), x), ((1, 2), 0)
+                ((x, v_value_tiles), 1), ((0, 1), 2)
             )
             v_tile, v_tv = fx.make_layout_tv(v_thread_layout, v_value_layout)
             v_copy_threads = v_thread_tiles * D
@@ -816,19 +767,8 @@ def _build_kv_kernel(
                 if tok < num_tokens:
                     slot = slot_mapping[tok]
                     if slot >= 0:
-                        block_id = slot // block_size
-                        block_off = slot % block_size
-                        d_coord = fx.idx2crd(d, layout_d_runs)
-                        token_coord = fx.idx2crd(
-                            block_off,
-                            fx.make_ordered_layout(layout_v_head.shape[0], (1, 0)),
-                        )
-                        k_cache_view[block_id, head, d_coord, block_off] = k_lds_view[
-                            token_local, d
-                        ]
-                        v_cache_view[block_id, head, token_coord, d] = v_lds_view[
-                            token_local, d
-                        ]
+                        k_slot_view[slot, head, d] = k_lds_view[token_local, d]
+                        v_slot_view[slot, head, d] = v_lds_view[token_local, d]
 
     @flyc.jit
     def launch(
