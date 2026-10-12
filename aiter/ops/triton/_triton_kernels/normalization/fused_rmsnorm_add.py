@@ -8,7 +8,6 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.common.rmsnorm import _rmsnorm_op
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-
 _triton_fused_rms_kernel_repr = make_kernel_repr(
     "_triton_fused_rms_kernel",
     [
