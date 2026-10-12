@@ -65,10 +65,15 @@ def _as_bool(value, default: bool) -> bool:
 def _as_int(value, default: int | None) -> int | None:
     # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
     # cell can come back as the literal "nan"; read those as unset like _cell.
+    # Merging the model_configs/ CSVs through pandas also turns an int column
+    # with blank cells into float, so a "32" cell comes back as "32.0".
     text = "" if value is None else str(value).strip()
     if text == "" or text.lower() in ("nan", "none"):
         return default
-    return int(text)
+    number = float(text)
+    if not number.is_integer():
+        raise ValueError(f"expected an integer config value, got {text!r}")
+    return int(number)
 
 
 def _dtype_name(dtype) -> str:
