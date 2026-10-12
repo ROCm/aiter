@@ -373,6 +373,39 @@ def test_ck_free_permuted_outputs(monkeypatch, entry):
         )
 
 
+DENSE_NON_CONTIGUOUS = {
+    "permuted_3d": lambda: torch.randn(S, B, N).permute(1, 0, 2),
+    "transposed_2d": lambda: torch.randn(N, B * S).t(),
+}
+
+
+@pytest.mark.parametrize("layout", DENSE_NON_CONTIGUOUS)
+@pytest.mark.parametrize("entry", ["layer_norm", "layernorm2d_fwd"])
+def test_ck_free_result_layout_matches_fake(monkeypatch, entry, layout):
+    # The registered fake reports empty_like(input) strides; Inductor generates
+    # the downstream kernels against them.
+    monkeypatch.setattr(norm, "ENABLE_CK", False)
+
+    def fake(x, weight, bias, eps=EPS, x_bias=None):
+        assert x.dim() == 2 and x.stride(-1) == 1
+        return torch.nn.functional.layer_norm(x, (x.shape[-1],), weight, bias, eps)
+
+    monkeypatch.setattr(triton_norm, "layer_norm", fake)
+    torch.manual_seed(0)
+    x = DENSE_NON_CONTIGUOUS[layout]()
+    w, b = torch.randn(x.shape[-1]), torch.randn(x.shape[-1])
+
+    def call(x, w, b):
+        return getattr(torch.ops.aiter, entry)(x, w, b, EPS, None) * 2 + 1
+
+    y = getattr(torch.ops.aiter, entry)(x, w, b, EPS, None)
+    assert y.stride() == torch.empty_like(x).stride()
+    want = call(x, w, b)
+    torch._dynamo.reset()
+    got = torch.compile(call, backend="inductor", fullgraph=True)(x, w, b)
+    torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("entry", ENTRY_POINTS)
 def test_ck_calls_ck(monkeypatch, entry):
     monkeypatch.setattr(norm, "ENABLE_CK", True)

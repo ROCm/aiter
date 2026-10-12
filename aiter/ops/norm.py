@@ -119,6 +119,19 @@ def _copy_back(out: Tensor, rows: Tensor) -> None:
         out.copy_(rows.view(out.shape))
 
 
+# The CK binding and the registered fake allocate the result with
+# empty_like(input), which keeps a dense permuted layout; the Triton kernel
+# returns contiguous rows.
+def _like_input(input: Tensor, rows: Tensor) -> Tensor:
+    y = rows.view(input.shape)
+    if input.is_contiguous():
+        return y
+    out = torch.empty_like(input)
+    if out.stride() == y.stride():
+        return y
+    return out.copy_(y)
+
+
 # The Triton fused-add kernels index residual_in and residual_out with the input
 # row stride, while CK takes one stride per tensor, so all three are passed as
 # contiguous rows.
@@ -152,7 +165,7 @@ def layer_norm(
         from .triton.normalization.norm import layer_norm as layer_norm_triton
 
         out = layer_norm_triton(_triton_rows(input, x_bias), weight, bias, epsilon)
-        return out.view(input.shape)
+        return _like_input(input, out)
     return layer_norm_ck(input, weight, bias, epsilon, x_bias)
 
 
@@ -169,7 +182,7 @@ def layernorm2d_fwd(
         from .triton.normalization.norm import layer_norm as layer_norm_triton
 
         out = layer_norm_triton(_triton_rows(input, x_bias), weight, bias, epsilon)
-        return out.view(input.shape)
+        return _like_input(input, out)
     return layernorm2d_fwd_ck(input, weight, bias, epsilon, x_bias)
 
 
