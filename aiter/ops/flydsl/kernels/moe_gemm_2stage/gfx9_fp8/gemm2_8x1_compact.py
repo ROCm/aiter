@@ -233,42 +233,38 @@ def _build_moe_gemm2_8x1_compact(
     assert stage == "down" and alg == "prefill_1x4" and down_path == "8x1_compact"
     assert BLOCK_TILE_SIZE_M == 64 and BLOCK_TILE_SIZE_N == 128
     assert E is not None and 0 < E <= 2048
-    assert K in (192, 256, 320, 384, 512, 640)
-    assert N > 0 and N % 256 == 0
+    assert K in (192, 256, 384, 512, 640)
+    # 8x1 runs N0, N1, an N loop and tail tiles, so it needs at least four N128 tiles.
+    assert N >= 512 and N % 256 == 0
     assert not USE_ATOMIC_WRITE
     assert down_output_padding_bytes in (0, 32, 64, 128)
-    shared_args = {
-        "N": N,
-        "K": K,
-        "weight_dtype": weight_dtype,
-        "weight_quant_type": weight_quant_type,
-        "act_quant_type": act_quant_type,
-        "TOPK": TOPK,
-        "stage": stage,
-        "alg": alg,
-        "E": E,
-        "USE_ATOMIC_WRITE": USE_ATOMIC_WRITE,
-        "tile_k": tile_k,
-        "activation": activation,
-        "swiglu_limit": swiglu_limit,
-        "down_output_padding_bytes": down_output_padding_bytes,
-        "_task_table": True,
-        "_store_cache": _store_cache,
-    }
-    full = _build_moe_gemm2_8x1(
-        **shared_args,
-        BLOCK_TILE_SIZE_M=256,
-        BLOCK_TILE_SIZE_N=128,
-        down_path="8x1",
-    )
+    # The M64 tail builder also validates the dtype and quant combination of the full tasks.
     tail = _build_moe_gemm2_1x4_n256(
-        **{
-            **shared_args,
-            "tile_k": 128 if K in (192, 320) and tile_k == 192 else tile_k,
-        },
+        N=N,
+        K=K,
+        weight_dtype=weight_dtype,
+        weight_quant_type=weight_quant_type,
+        TOPK=TOPK,
         BLOCK_TILE_SIZE_M=64,
         BLOCK_TILE_SIZE_N=256,
+        alg=alg,
+        act_quant_type=act_quant_type,
+        activation=activation,
+        swiglu_limit=swiglu_limit,
         down_path="1x4_64x256",
+        down_output_padding_bytes=down_output_padding_bytes,
+        _task_table=True,
+        _store_cache=_store_cache,
+    )
+    full = _build_moe_gemm2_8x1(
+        N=N,
+        K=K,
+        weight_quant_type=weight_quant_type,
+        act_quant_type=act_quant_type or weight_quant_type,
+        TOPK=TOPK,
+        tile_k=tile_k,
+        padding=down_output_padding_bytes,
+        store_cache=_store_cache,
     )
     build = build_task_table(E)
 

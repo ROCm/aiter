@@ -69,10 +69,10 @@ class Config:
             if problem.quant_type not in ("", "ptpc", "per_tensor"):
                 return "specialized Down paths require FP8 weights"
             if self.down_path == "8x1_compact":
-                if problem.inter_dim not in (192, 256, 320, 384, 512, 640):
-                    return (
-                        "compact Down requires inter_dim in {192,256,320,384,512,640}"
-                    )
+                if problem.inter_dim not in (192, 256, 384, 512, 640):
+                    return "compact Down requires inter_dim in {192,256,384,512,640}"
+                if problem.model_dim < 512:
+                    return "compact Down requires model_dim >= 512"
                 if not 0 < problem.experts <= 2048:
                     return "compact Down requires 1 to 2048 experts"
             scale_bytes = 0 if problem.quant_type == "per_tensor" else 256 * 4
