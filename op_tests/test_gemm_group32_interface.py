@@ -462,6 +462,58 @@ def test_mxscale_bpreshuffle_mid_dword_scale_rows(monkeypatch, m, k, config):
     _assert_matches(*_mxscale_gemm_vs_dequant(m, 7168, k, 128))
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or gemm_op_a8w8.get_gfx() != "gfx950",
+    reason="the preshuffled e8m0 GEMM runs on gfx950",
+)
+@pytest.mark.parametrize(
+    "m,n,k,config",
+    [
+        (1024, 1024, 1024, "t64x128x128_w1x4_nb4_sk1_bd2_xcd4"),
+        # 5 M tiles leave a 1-tile swizzle group; 12 N tiles pad the grid.
+        (300, 1536, 1024, "t64x128x128_w1x4_nb4_sk1_xcd4"),
+    ],
+)
+def test_mxscale_bpreshuffle_xcd_swizzle(monkeypatch, m, n, k, config):
+    """The grouped XCD order only moves tiles: each output tile must still be
+    computed exactly once, from its own A rows and B columns."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import parse_bmm_kernel_name
+    from aiter.ops.flydsl.kernels.bmm_a8w8_mxscale_gfx950 import check_bmm_config
+
+    name = f"flydsl_bmm_mxfp8_mfma_{config}"
+    blocks = dict.fromkeys(("x_scale_k", "w_scale_n", "w_scale_k"), 32)
+    check_bmm_config(n, k, 1, **parse_bmm_kernel_name(name), **blocks)
+    row = {**BMM_ROW, "kernelName": name}
+    monkeypatch.setattr(
+        gemm_op_a8w8, "get_mxscale_bpreshuffle_config", lambda *a, **kw: row
+    )
+    _assert_matches(*_mxscale_gemm_vs_dequant(m, n, k, 32))
+
+
+@pytest.mark.parametrize(
+    "config, swizzle",
+    [("t64x128x128_w1x4_nb4_sk1_bd2_xcd", 0), ("t64x128x128_w1x4_nb4_sk1_xcd4", 4)],
+)
+def test_bmm_kernel_name_xcd_swizzle_round_trip(config, swizzle):
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import (
+        bmm_kernel_name,
+        parse_bmm_kernel_name,
+    )
+
+    name = f"flydsl_bmm_mxfp8_mfma_{config}"
+    cfg = parse_bmm_kernel_name(name)
+    assert cfg["xcd_order"] and cfg["xcd_swizzle"] == swizzle
+    assert bmm_kernel_name(**cfg) == name
+
+
+def test_bmm_kernel_name_rejects_xcd_swizzle_without_xcd_order():
+    """Without _xcd the swizzle digits would parse back as part of _sk."""
+    from aiter.ops.flydsl.batched_gemm_a8w8_gfx950 import bmm_kernel_name
+
+    with pytest.raises(ValueError, match="xcd_swizzle"):
+        bmm_kernel_name(64, 128, 128, 1, 4, 4, splits=1, xcd_swizzle=4)
+
+
 def _bmm_legal(n, k, block, **cfg):
     from aiter.ops.flydsl.kernels.bmm_a8w8_mxscale_gfx950 import check_bmm_config
 
