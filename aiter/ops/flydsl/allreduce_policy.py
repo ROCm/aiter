@@ -49,8 +49,9 @@ class FamilyPolicy:
     The two one-shot ceilings are measured against *different* alternatives and
     so do not order against each other:
 
-    * ``oneshot_max`` is where the quantized **mesh** overtakes the one-shot.
-      It is the quick-reduce slot's exclusive floor.
+    * ``oneshot_max`` is where the quantized **mesh** overtakes the fastest
+      exact kernel: the one-shot, or ``cross_device_reduce`` where that is
+      faster. It is the quick-reduce slot's exclusive floor.
     * ``oneshot_max_exact`` is where ``cross_device_reduce``/RCCL -- what the
       payload reaches if every FlyDSL family declines -- overtakes it. It is the
       custom-all-reduce slot's ceiling.
@@ -108,6 +109,41 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
     ),
 }
 
+# Rows measured on one arch, keyed ``(arch, link, world_size)``. On that arch
+# they replace the ``FAMILY_POLICY`` row for the same ``(link, world_size)``.
+#
+# gfx950/xGMI (MI355X), measured with the ``bench`` scenario of the FlyDSL
+# all-reduce op tests:
+#
+# * The ring never wins: it is 1.03x-1.16x slower than the mesh at TP2 up to
+#   512 MiB, and 2.2x-5.7x slower at TP4 and TP8. ``mesh_max`` is unbounded.
+# * ``oneshot_max_exact`` is where ``cross_device_reduce`` overtakes the
+#   one-shot. At TP4 and TP8 that is where it switches to its 2-stage kernel
+#   (160 KiB and 80 KiB), which is fast on this fabric.
+# * ``oneshot_max`` is where the mesh overtakes the fastest exact kernel. At
+#   TP4 and TP8 that kernel is ``cross_device_reduce``'s 2-stage, not the
+#   one-shot, so the mesh starts well above the one-shot ceiling and the payloads
+#   between the two stay exact.
+ARCH_FAMILY_POLICY: dict[tuple[str, str, int], FamilyPolicy] = {
+    ("gfx950", "xgmi", 2): FamilyPolicy(
+        oneshot_max=448 << 10,
+        oneshot_max_exact=3 << 20,
+        mesh_max=NO_MAX,
+    ),
+    ("gfx950", "xgmi", 4): FamilyPolicy(
+        oneshot_max=960 << 10,
+        # Every payload below the 160 KiB 2-stage switch: payloads are whole
+        # multiples of 16 B.
+        oneshot_max_exact=(160 << 10) - 16,
+        mesh_max=NO_MAX,
+    ),
+    ("gfx950", "xgmi", 8): FamilyPolicy(
+        oneshot_max=1600 << 10,
+        oneshot_max_exact=96 << 10,
+        mesh_max=NO_MAX,
+    ),
+}
+
 
 def _env_int(name: str) -> int | None:
     """A non-negative override from *name*, or None. ``-1`` means "use the table"."""
@@ -132,6 +168,17 @@ def enabled() -> bool:
 
 
 @functools.lru_cache(maxsize=1)
+def detect_arch() -> str | None:
+    """This host's ``gfx`` arch, or None if it cannot be read."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    try:
+        return get_gfx_runtime()
+    except (KeyError, RuntimeError):
+        return None
+
+
+@functools.lru_cache(maxsize=1)
 def detect_link() -> str:
     """``"xgmi"`` or ``"pcie"`` for this host, probed once per process.
 
@@ -144,14 +191,22 @@ def detect_link() -> str:
     return "xgmi" if has_xgmi_peer_links() else "pcie"
 
 
-def _base(link: str, world_size: int) -> FamilyPolicy:
+def family_policy(link: str, world_size: int, arch: str | None = None) -> FamilyPolicy:
+    """The table row for *(arch, link, world_size)*, without overrides.
+
+    *arch* defaults to this host's. An arch with no row of its own for the
+    cell gets the ``FAMILY_POLICY`` row.
+    """
     if link not in LINKS:
         raise ValueError(f"link must be one of {LINKS}, got {link!r}")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
         )
-    return FAMILY_POLICY[(link, int(world_size))]
+    if arch is None:
+        arch = detect_arch()
+    row = ARCH_FAMILY_POLICY.get((arch, link, int(world_size)))
+    return FAMILY_POLICY[(link, int(world_size))] if row is None else row
 
 
 def _oneshot_boundary(base: FamilyPolicy) -> int:
@@ -184,8 +239,12 @@ class QuantPolicy:
     max_bytes: int
 
 
-def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
+def resolve_oneshot(
+    link: str, world_size: int, arch: str | None = None
+) -> OneShotPolicy:
     """The one-shot's window for a rank, environment overrides applied.
+
+    *arch* defaults to this host's; refer to ``family_policy``.
 
     ``AITER_FLY_AR_ONESHOT_MIN_BYTES`` overrides the small-payload floor below
     which the one-shot declines (the custom-AR slot then falls through to
@@ -193,7 +252,7 @@ def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
     on either means "use the table".
     """
 
-    base = _base(link, world_size)
+    base = family_policy(link, world_size, arch)
     max_override = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
     min_override = _env_int("AITER_FLY_AR_ONESHOT_MIN_BYTES")
     return OneShotPolicy(
@@ -202,10 +261,13 @@ def resolve_oneshot(link: str, world_size: int) -> OneShotPolicy:
     )
 
 
-def resolve_quant(link: str, world_size: int) -> QuantPolicy:
-    """The mesh/ring window for a rank, environment overrides applied."""
+def resolve_quant(link: str, world_size: int, arch: str | None = None) -> QuantPolicy:
+    """The mesh/ring window for a rank, environment overrides applied.
 
-    base = _base(link, world_size)
+    *arch* defaults to this host's; refer to ``family_policy``.
+    """
+
+    base = family_policy(link, world_size, arch)
     floor = _oneshot_boundary(base)
     mesh = base.mesh_max
     override_mesh = _env_int("AITER_FLY_AR_MESH_MAX_BYTES")

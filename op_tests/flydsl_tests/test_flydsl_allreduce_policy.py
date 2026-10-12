@@ -41,7 +41,9 @@ from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4_ring import (
 from aiter.ops.flydsl.one_shot_allreduce import max_payload_bytes
 
 WORLDS = P.SUPPORTED_WORLDS
-CELLS = [(link, ws) for link in P.LINKS for ws in WORLDS]
+# Every arch with policy rows of its own, and one without (``FAMILY_POLICY``).
+ARCHES = ("gfx942", "gfx950")
+CELLS = [(link, ws, arch) for arch in ARCHES for link in P.LINKS for ws in WORLDS]
 
 
 @pytest.mark.parametrize("cell", CELLS)
@@ -58,8 +60,10 @@ def test_resolved_slots_partition_by_size(cell):
     assert 0 < quant.floor <= quant.mesh_max <= quant.max_bytes
 
 
+@pytest.mark.parametrize("arch", ARCHES)
+@pytest.mark.parametrize("link", P.LINKS)
 @pytest.mark.parametrize("ws", WORLDS)
-def test_dispatch_is_monotone(ws):
+def test_dispatch_is_monotone(ws, link, arch):
     """The path choice must never go backwards as the payload grows.
 
     Composed across both slots, in the order ``CudaCommunicator.all_reduce``
@@ -67,12 +71,15 @@ def test_dispatch_is_monotone(ws):
     Below ``min_bytes`` the payload falls back by design (the Aiter kernel is
     faster there); above it the order must hold.
     """
-    order = {"oneshot": 0, "mesh": 1, "ring": 2, "fallback": 3}
-    floor = P.resolve_oneshot("pcie", ws).min_bytes
+    # ``fallback`` sits between the one-shot and the mesh: where
+    # ``cross_device_reduce`` beats both FlyDSL families, the payload falls
+    # through to it, and only larger payloads reach the mesh.
+    order = {"oneshot": 0, "fallback": 1, "mesh": 2, "ring": 3}
+    floor = P.resolve_oneshot(link, ws, arch).min_bytes
     sizes = [1 << k for k in range(4, 31)]
-    below = [_slot_of("pcie", ws, n) for n in sizes if n < floor]
+    below = [_slot_of(link, ws, n, arch) for n in sizes if n < floor]
     assert set(below) <= {"fallback"}
-    seen = [order[_slot_of("pcie", ws, n)] for n in sizes if n >= floor]
+    seen = [order[_slot_of(link, ws, n, arch)] for n in sizes if n >= floor]
     assert seen == sorted(seen)
 
 
@@ -115,20 +122,28 @@ def test_oneshot_ladder_unknown_fabric_falls_back(ws):
     assert len(oneshot_ladder(ws, "nosuchlink")) == 1
 
 
-def test_max_payload_bytes_is_keyed_on_the_fabric():
+@pytest.mark.parametrize("cell", CELLS)
+def test_max_payload_bytes_is_keyed_on_the_fabric(cell):
     """The default ceiling is where the fallback overtakes the one-shot, which
-    is a property of the fabric.
+    is a property of the arch and the fabric.
     """
-    for ws in WORLDS:
-        for link in P.LINKS:
-            assert (
-                max_payload_bytes(ws, link)
-                == P.FAMILY_POLICY[(link, ws)].oneshot_max_exact
-            )
+    link, ws, arch = cell
+    assert (
+        max_payload_bytes(ws, link, arch)
+        == P.family_policy(link, ws, arch).oneshot_max_exact
+    )
 
 
+def test_arch_rows_override_only_their_arch():
+    """An arch row replaces the default row on that arch alone."""
+    for (arch, link, ws), row in P.ARCH_FAMILY_POLICY.items():
+        assert P.family_policy(link, ws, arch) == row
+        assert P.family_policy(link, ws, "gfx942") == P.FAMILY_POLICY[(link, ws)]
+
+
+@pytest.mark.parametrize("arch", ARCHES)
 @pytest.mark.parametrize("ws", WORLDS)
-def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
+def test_ladder_rungs_fall_inside_their_dispatch_window(ws, arch):
     """A rung above its family's window is an engine and an IPC inbox built for
     payloads that can never arrive.
 
@@ -139,11 +154,11 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws):
     The one-shot window is the wider of the two ceilings.
     """
     for link in P.LINKS:
-        quant = P.resolve_quant(link, ws)
-        # The one-shot's window is the wider of the two ceilings: it serves up
-        # to its own ceiling when the quant slot is closed, and up to the quant
-        # floor when that slot is open.
-        one_hi = max(P.resolve_oneshot(link, ws).max_bytes, quant.floor)
+        quant = P.resolve_quant(link, ws, arch)
+        # The one-shot never serves above its own ceiling: with the quant slot
+        # open, the payloads between that ceiling and the quant floor fall
+        # through to ``cross_device_reduce``.
+        one_hi = P.resolve_oneshot(link, ws, arch).max_bytes
         for _floor, *_ in oneshot_ladder(ws, link)[1:]:
             assert _floor < one_hi, ("oneshot", link, ws, _floor)
         for floor, *_ in mesh_st_ladder(ws, link)[1:]:
@@ -156,17 +171,17 @@ def _env(**kw):
     return mock.patch.dict(os.environ, {k: v for k, v in kw.items()}, clear=False)
 
 
-def _slot_of(link: str, ws: int, nbytes: int) -> str:
+def _slot_of(link: str, ws: int, nbytes: int, arch: str) -> str:
     """Which path *nbytes* reaches, composed in real dispatch order.
 
     ``CudaCommunicator.all_reduce`` tries the quick-reduce slot, then the
     custom-all-reduce slot, then RCCL. Assumes the quantized slot is open
     (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``).
     """
-    quant = P.resolve_quant(link, ws)
+    quant = P.resolve_quant(link, ws, arch)
     if quant.floor < nbytes <= quant.max_bytes:
         return P.pick_quant_family(nbytes, quant)
-    one = P.resolve_oneshot(link, ws)
+    one = P.resolve_oneshot(link, ws, arch)
     if one.min_bytes <= nbytes <= one.max_bytes:
         return "oneshot"
     return "fallback"
@@ -174,18 +189,22 @@ def _slot_of(link: str, ws: int, nbytes: int) -> str:
 
 @pytest.mark.parametrize("cell", CELLS)
 def test_slots_share_one_boundary(cell):
-    """The quick-reduce floor *is* the one-shot/mesh crossover.
+    """The quick-reduce floor is the table's ``oneshot_max``, and one override
+    moves it and the one-shot ceiling together.
 
     One number read from two sides. If they ever drift apart, payloads either
     get double-claimed (the floor drops below the crossover) or fall into a hole
     neither family serves.
     """
-    link, ws = cell
-    assert P.resolve_quant(link, ws).floor == P.FAMILY_POLICY[cell].oneshot_max
+    link, ws, arch = cell
+    assert (
+        P.resolve_quant(link, ws, arch).floor
+        == P.family_policy(link, ws, arch).oneshot_max
+    )
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
-        assert P.resolve_quant(link, ws).floor == 65536
+        assert P.resolve_quant(link, ws, arch).floor == 65536
         # The override moves both readings, or the boundary splits in two.
-        assert P.resolve_oneshot(link, ws).max_bytes == 65536
+        assert P.resolve_oneshot(link, ws, arch).max_bytes == 65536
 
 
 def test_enable_flag_is_opt_in_only():
@@ -200,46 +219,47 @@ def test_enable_flag_is_opt_in_only():
 
 
 def test_byte_overrides():
-    table_one = P.FAMILY_POLICY[("pcie", 8)].oneshot_max_exact
-    table_floor = P.FAMILY_POLICY[("pcie", 8)].oneshot_max
+    table_one = P.family_policy("pcie", 8, "gfx942").oneshot_max_exact
+    table_floor = P.family_policy("pcie", 8, "gfx942").oneshot_max
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
-        assert P.resolve_oneshot("pcie", 8).max_bytes == 65536
-        assert P.resolve_quant("pcie", 8).floor == 65536
+        assert P.resolve_oneshot("pcie", 8, "gfx942").max_bytes == 65536
+        assert P.resolve_quant("pcie", 8, "gfx942").floor == 65536
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
-        assert P.resolve_quant("pcie", 4).mesh_max == 1048576
+        assert P.resolve_quant("pcie", 4, "gfx942").mesh_max == 1048576
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="-1"):
-        assert P.resolve_oneshot("pcie", 8).max_bytes == table_one
-        assert P.resolve_quant("pcie", 8).floor == table_floor
+        assert P.resolve_oneshot("pcie", 8, "gfx942").max_bytes == table_one
+        assert P.resolve_quant("pcie", 8, "gfx942").floor == table_floor
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="lots"):
-        assert P.resolve_oneshot("pcie", 8).max_bytes == table_one
-        assert P.resolve_quant("pcie", 8).floor == table_floor
+        assert P.resolve_oneshot("pcie", 8, "gfx942").max_bytes == table_one
+        assert P.resolve_quant("pcie", 8, "gfx942").floor == table_floor
 
 
 def test_oneshot_min_override():
     """``AITER_FLY_AR_ONESHOT_MIN_BYTES`` moves only the one-shot's small-payload
     floor; the ceiling and the quant floor are untouched."""
-    table_min = P.FAMILY_POLICY[("xgmi", 8)].min_bytes
+    table_min = P.family_policy("xgmi", 8, "gfx942").min_bytes
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="65536"):
-        assert P.resolve_oneshot("xgmi", 8).min_bytes == 65536
+        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == 65536
         # ceiling and quant slot are independent of the min override
         assert (
-            P.resolve_oneshot("xgmi", 8).max_bytes
-            == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max_exact
+            P.resolve_oneshot("xgmi", 8, "gfx942").max_bytes
+            == P.family_policy("xgmi", 8, "gfx942").oneshot_max_exact
         )
         assert (
-            P.resolve_quant("xgmi", 8).floor == P.FAMILY_POLICY[("xgmi", 8)].oneshot_max
+            P.resolve_quant("xgmi", 8, "gfx942").floor
+            == P.family_policy("xgmi", 8, "gfx942").oneshot_max
         )
     # 0 is a valid override: accept every size down to the custom-AR floor.
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="0"):
-        assert P.resolve_oneshot("xgmi", 8).min_bytes == 0
+        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == 0
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="-1"):
-        assert P.resolve_oneshot("xgmi", 8).min_bytes == table_min
+        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == table_min
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="lots"):
-        assert P.resolve_oneshot("xgmi", 8).min_bytes == table_min
+        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == table_min
 
 
 def test_override_cannot_invert_the_partition():
@@ -256,15 +276,15 @@ def test_override_cannot_invert_the_partition():
     ]
     if not cells:
         pytest.skip("no (link, world) in the table reaches the ring")
-    link, ws = cells[0]
-    mesh_max = P.resolve_quant(link, ws).mesh_max
+    link, ws, arch = cells[0]
+    mesh_max = P.resolve_quant(link, ws, arch).mesh_max
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(mesh_max + 16)):
-        p = P.resolve_quant(link, ws)
+        p = P.resolve_quant(link, ws, arch)
         assert p.mesh_max >= p.floor
         assert P.quant_families_reachable(p) == ("ring",)
         # A payload under the raised ceiling now reaches the one-shot, because
         # the quant slot's floor moved with it.
-        assert _slot_of(link, ws, mesh_max) == "oneshot"
+        assert _slot_of(link, ws, mesh_max, arch) == "oneshot"
 
 
 def test_resolvers_reject_unknown_keys():
@@ -300,7 +320,7 @@ def test_selectors_reject_non_contiguous():
     contiguous copy of the same payload is accepted, which shows the refusal
     comes from contiguity rather than from size, dtype or alignment.
     """
-    quant = P.resolve_quant("pcie", 4)
+    quant = P.resolve_quant("pcie", 4, "gfx942")
     qr = SimpleNamespace(
         _fly_policy=quant, _fly_engines={"mesh": object(), "ring": object()}
     )
@@ -308,7 +328,7 @@ def test_selectors_reject_non_contiguous():
     assert QuickAllReduce._should_fly(qr, t.contiguous())
     assert not QuickAllReduce._should_fly(qr, t)
 
-    one = P.resolve_oneshot("pcie", 4)
+    one = P.resolve_oneshot("pcie", 4, "gfx942")
     ca = SimpleNamespace(
         _fly_oneshot=object(), _fly_policy=one, device=torch.device("cpu")
     )

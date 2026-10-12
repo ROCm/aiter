@@ -96,7 +96,11 @@ one-shot boundary. Other payloads go to `CustomAllreduce`, which can then use th
 one-shot.
 
 The payload-size boundaries for each link type and world size are in
-`FAMILY_POLICY` in `aiter/ops/flydsl/allreduce_policy.py`.
+`FAMILY_POLICY` in `aiter/ops/flydsl/allreduce_policy.py`. On an arch that has
+its own measurements, a row of `ARCH_FAMILY_POLICY` replaces the
+`FAMILY_POLICY` row. gfx950 with xGMI has its own rows: the ring is never used
+there, and at TP4 and TP8 the payloads between the one-shot and the mesh go to
+the 2-stage `cross_device_reduce` kernel, which is faster than both there.
 
 ## Environment variables
 
@@ -134,7 +138,7 @@ different columns of `FAMILY_POLICY`:
 * `oneshot_max_exact` is the one-shot ceiling in `CustomAllreduce`. Above it,
   `cross_device_reduce` or RCCL is faster.
 * `oneshot_max` is the mesh floor in `QuickAllReduce`. Above it, the mesh is
-  faster.
+  faster than the fastest exact kernel.
 
 ### Related aiter variables
 

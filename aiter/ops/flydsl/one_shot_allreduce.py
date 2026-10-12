@@ -18,7 +18,7 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
-from .allreduce_policy import FAMILY_POLICY
+from .allreduce_policy import family_policy
 from .allreduce_shared import (
     _SUPPORTED_ARCHS,
     _cuda_index,
@@ -44,16 +44,13 @@ from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
 
-# Largest payload this kernel should be asked to move, per (link, world size).
-MAX_PAYLOAD_BYTES = {
-    (link, ws): FAMILY_POLICY[(link, ws)].oneshot_max_exact
-    for link in ("pcie", "xgmi")
-    for ws in SUPPORTED_WORLDS
-}
 
-
-def max_payload_bytes(world_size: int, link: str = "pcie") -> int:
-    return MAX_PAYLOAD_BYTES[(str(link), int(world_size))]
+def max_payload_bytes(
+    world_size: int, link: str = "pcie", arch: str | None = None
+) -> int:
+    """Largest payload this kernel should be asked to move: the policy's
+    ``oneshot_max_exact`` for *(arch, link, world_size)*."""
+    return family_policy(str(link), int(world_size), arch).oneshot_max_exact
 
 
 class OneShotAllReduce:
@@ -67,7 +64,7 @@ class OneShotAllReduce:
     from above.
 
     ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
-    defaulting to this ``(link, world_size)``'s entry in ``MAX_PAYLOAD_BYTES``.
+    defaulting to ``max_payload_bytes`` for this arch, link and world size.
     That ceiling is the point of the class: wire volume is ``(N-1)*S`` against a
     two-shot's ``2(N-1)/N*S``, so where it stops paying is a function of ``N``.
 
