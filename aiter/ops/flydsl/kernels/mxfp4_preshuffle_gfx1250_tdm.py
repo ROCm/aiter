@@ -57,11 +57,26 @@ TDM_DESCRIPTOR_VERSION = 1
 MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
 MMA_FIRST_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", MMA_GROUP))
 DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
+# Pin the WMMA scales too (only when EXPLICIT_VGPR_PARTITION is on). Costs
+# register budget, so leave a toggle to trade it for backend scheduling slack.
+PIN_SCALES = int(os.environ.get("AITER_FLYDSL_PIN_SCALES", "1"))
 EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
 INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
+# EXPERIMENT: software I-cache prefetch of the activation/quant epilogue. The
+# kernel .text (~35 KiB) overflows the 32 KiB L1 I-cache, so the epilogue
+# demand-misses on first touch each tile-group. Value = number of 4 KiB chunks
+# to prefetch ahead (PC-relative) at the drain entry; 0 disables.
+INST_PREFETCH_EPILOGUE = int(
+    os.environ.get("AITER_FLYDSL_INST_PREFETCH_EPILOGUE", "0")
+)
+# First 4 KiB chunk (PC-relative, from the prefetch site) to start prefetching
+# at. Use it to target only the icache OVERFLOW tail instead of the whole
+# epilogue, which thrashes the still-resident hot code. Max PC+offset must stay
+# inside the kernel .text or s_prefetch_inst page-faults.
+INST_PREFETCH_START = int(os.environ.get("AITER_FLYDSL_INST_PREFETCH_START", "0"))
 LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
 if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
@@ -87,6 +102,30 @@ if DISABLE_CLUSTER_SYNC not in (0, 1):
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
 )
+
+
+def _emit_epilogue_inst_prefetch(n_chunks):
+    """EXPERIMENT: software L1 I-cache prefetch of the activation/quant epilogue.
+    Takes the current PC via ``s_getpc`` and issues ``n_chunks`` scalar
+    ``s_prefetch_inst`` (``llvm.amdgcn.s.prefetch.inst``, 4 KiB each, len=31) at
+    PC + i*4 KiB, so the epilogue code is warm by the time the drain's WMMA
+    compute finishes. Kernel .text (~35 KiB) overflows the 32 KiB L1 I-cache."""
+    from flydsl._mlir import ir
+
+    code_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
+    pc = fx.Int64(
+        llvm_dialect.call_intrinsic(T.i64, "llvm.amdgcn.s.getpc", [], [], [])
+    )
+    for i in range(n_chunks):
+        off = 0x1000 * (INST_PREFETCH_START + i)
+        ptr = llvm_dialect.inttoptr(code_ptr_ty, _raw(pc + fx.Int64(off)))
+        llvm_dialect.call_intrinsic(
+            None,
+            "llvm.amdgcn.s.prefetch.inst.p1",
+            [ptr, _raw(fx.Int32(31))],
+            [],
+            [],
+        )
 
 # MXFP8 combine wire format (``ep_quant_bits``): a slot holds two planes, N
 # payload bytes followed by N/32 e8m0 scale bytes. The block is 32 elements,
@@ -439,6 +478,11 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _iprefetch = (
+        f"_iprefetch{INST_PREFETCH_EPILOGUE}s{INST_PREFETCH_START}"
+        if INST_PREFETCH_EPILOGUE
+        else ""
+    )
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -448,7 +492,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_iprefetch}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -1088,13 +1132,28 @@ def launch_gemm_a8w4_tdm(
             fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Float32)
             for _ in range_constexpr(n_acc)
         ]
+        # Explicit VGPR layout: pack the two A/B prefetch slots and the C
+        # accumulators into the top of the register file, leaving the low
+        # region for scales, LDS addresses and scratch. One A/B slot needs
+        # ab_slot_width dwords, which exceeds the legacy 128 for tall warps
+        # (e.g. 160 at wmma_m_rep=16), so C is placed after both slots rather
+        # than at a fixed 512.
+        VGPR_PARTITION_TOTAL = 1024
+        ab_slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
+        cfrag_width = n_acc * WMMA_VECTOR_DWORDS
+        ab_partition_base = VGPR_PARTITION_TOTAL - cfrag_width - 2 * ab_slot_width
+        cfrag_partition_base = ab_partition_base + 2 * ab_slot_width
         if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
-            assert n_acc * WMMA_VECTOR_DWORDS <= 512
+            assert ab_partition_base >= 0, (
+                ab_partition_base,
+                ab_slot_width,
+                cfrag_width,
+            )
             for idx in range_constexpr(n_acc):
                 fx.set_register(
                     c_frags[idx],
                     register_class=fx.rocdl.VGPR,
-                    start=512 + idx * WMMA_VECTOR_DWORDS,
+                    start=cfrag_partition_base + idx * WMMA_VECTOR_DWORDS,
                 )
         for cf in c_frags:
             cf.store(fx.constant_vector(0.0, T.vec(WMMA_VECTOR_DWORDS, T.f32)))
@@ -1169,23 +1228,29 @@ def launch_gemm_a8w4_tdm(
                 fx.make_rmem_tensor(WMMA_VECTOR_DWORDS, fx.Int32)
                 for _ in range_constexpr(wmma_n_rep)
             ]
+            sa = fx.make_rmem_tensor(SA_WIDTH, fx.Int32)
+            sb = fx.make_rmem_tensor(SB_WIDTH, fx.Int32)
             if const_expr(SUPPORT_EXPLICIT_VGPR_PARTITION):
-                slot_width = wmma_m_rep * ACT_NDW + wmma_n_rep * WMMA_VECTOR_DWORDS
-                assert slot_width <= 128
-                reg = 256 + slot_idx * 128
+                reg = ab_partition_base + slot_idx * ab_slot_width
                 for wm in range_constexpr(wmma_m_rep):
                     fx.set_register(a[wm], register_class=fx.rocdl.VGPR, start=reg)
                     reg += ACT_NDW
                 for wn in range_constexpr(wmma_n_rep):
                     fx.set_register(b[wn], register_class=fx.rocdl.VGPR, start=reg)
                     reg += WMMA_VECTOR_DWORDS
-                assert reg <= 256 + (slot_idx + 1) * 128
-            return RmemSlot(
-                a=a,
-                b=b,
-                sa=fx.make_rmem_tensor(SA_WIDTH, fx.Int32),
-                sb=fx.make_rmem_tensor(SB_WIDTH, fx.Int32),
-            )
+                assert reg <= ab_partition_base + (slot_idx + 1) * ab_slot_width
+                if const_expr(PIN_SCALES):
+                    # Pin the scales in the low region just below A/B, one block
+                    # per slot, so the WMMA scale operands stop aliasing recycled
+                    # VGPRs. Costs 2*(SA_WIDTH+SB_WIDTH) of the register budget.
+                    scale_width = SA_WIDTH + SB_WIDTH
+                    sreg = ab_partition_base - (slot_idx + 1) * scale_width
+                    assert sreg >= 0
+                    fx.set_register(sa, register_class=fx.rocdl.VGPR, start=sreg)
+                    fx.set_register(
+                        sb, register_class=fx.rocdl.VGPR, start=sreg + SA_WIDTH
+                    )
+            return RmemSlot(a=a, b=b, sa=sa, sb=sb)
 
         # Two slots: the k-tile loop is a runtime scf.for, so the tile boundary
         # cannot carry a Python value, and a prefetch needs a slot no WMMA reads.
@@ -1384,18 +1449,27 @@ def launch_gemm_a8w4_tdm(
                 )
                 # One region per k128: sched_group_barrier only partitions
                 # within a region, and only sched_barrier delimits one.
-                emit_hints(
-                    ksl,
-                    (
-                        FENCE_COVER_MMA
-                        if (
-                            tile_m > 32
-                            and not is_last
-                            and next_stage_lds_addr is not None
-                        )
-                        else 0
-                    ),
-                )
+                # emit_hints(
+                #     ksl,
+                #     (
+                #         FENCE_COVER_MMA
+                #         if (
+                #             tile_m > 32
+                #             and not is_last
+                #             and next_stage_lds_addr is not None
+                #         )
+                #         else 0
+                #     ),
+                # )
+
+
+                for i in range_constexpr(5):
+                    rocdl.sched_dsrd(1)
+                    rocdl.sched_mfma(1)
+                for i in range_constexpr(16):
+                    rocdl.sched_mfma(1)
+                    rocdl.sched_dsrd(3)
+                rocdl.sched_mfma(16)
                 rocdl.sched_barrier(0)
 
         # Skip padding tiles; uniform across every workgroup and cluster.
@@ -1470,7 +1544,9 @@ def launch_gemm_a8w4_tdm(
             def run_mainloop(interleaved_lds_load):
                 # Post-compute wins for decode and for shallow pipelines: at
                 # num_buffers<=2 mid-compute prefetches one tile and under-overlaps.
-                if const_expr(tile_m <= 32 or num_buffers <= 2):
+                # if const_expr(tile_m <= 32 or num_buffers <= 2):
+                # if const_expr(True):
+                if const_expr(False):
                     # Post-compute issue: better for decode (small tile_m).
                     for i in range_constexpr(num_buffers):
                         issue(i, i)
@@ -1650,6 +1726,11 @@ def launch_gemm_a8w4_tdm(
                     # but must neither fence nor load a nonexistent next tile.
                     # Peel it to avoid a runtime branch around the full compute
                     # body, which causes VGPR spills with the carried rmem state.
+                    # Only the large GEMM1 (w1x4 K7168) overflows the 32 KiB
+                    # I-cache; w2x2 is small, so prefetching past its .text
+                    # page-faults. Gate to the big kernel.
+                    if INST_PREFETCH_EPILOGUE > 0 and m_warp == 1 and n_warp == 4:
+                        _emit_epilogue_inst_prefetch(INST_PREFETCH_EPILOGUE)
                     drain_tiles = PRE - 1 if next_stage_on else PRE
                     if const_expr(rolled_drain):
                         for j in range(drain_tiles):
