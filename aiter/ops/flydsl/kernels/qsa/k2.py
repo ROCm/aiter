@@ -324,19 +324,11 @@ def build_qsa_k2_module(
     qk_score_slots = n_subtiles * 64 * 4 if qk_split else 1
 
     def make_k_lds_view(k_arr, offset, shape):
-        # gfx950 XOR on stride D. Prefill V overlay reuses this map;
-        # decode V uses the AMD 8 KiB b64 XOR map, not this swizzle.
-        if use_k32:
-            layout = fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(3, 3, 3)),
-                offset,
-                fx.make_layout(shape, (head_dim, 1)),
-            )
-            ptr = k_arr.ptr
-        else:
-            layout = fx.make_layout(shape, (k_stride, 1))
-            ptr = k_arr.ptr + offset
-        return fx.make_view(ptr, layout)
+        # gfx942 K tile. The offset selects this gather chunk.
+        return fx.make_view(
+            k_arr.ptr + offset,
+            fx.make_layout(shape, (k_stride, 1)),
+        )
 
     if use_k32:
 
@@ -346,7 +338,6 @@ def build_qsa_k2_module(
             scores: fx.Array[Float32, qk_score_slots, 16]
             partial: fx.Array[Int32, num_waves, 4]
 
-        _k_field, _v_field = "kv", "kv"
     else:
 
         @fx.struct
@@ -354,8 +345,6 @@ def build_qsa_k2_module(
             kv: fx.Array[BFloat16, block_n * k_stride, 16]
             scores: fx.Array[Float32, qk_score_slots, 16]
             partial: fx.Array[Int32, num_waves, 4]
-
-        _k_field, _v_field = "kv", "kv"
 
     @fx.struct
     class MergeStorage:
@@ -464,11 +453,11 @@ def build_qsa_k2_module(
             v_buf = fx.rocdl.make_buffer_tensor(v_cache)
 
         storage = fx.SharedAllocator().allocate(SharedStorage).peek()
-        k_arr = getattr(storage, _k_field)
+        k_arr = storage.kv
         score_arr = storage.scores
         score_copy = fx.make_copy_atom(fx.UniversalCopy128b(), Float32)
         score_layout = fx.make_layout(4, 1)
-        v_lds = getattr(storage, _v_field).view(
+        v_lds = storage.kv.view(
             fx.make_layout(
                 (block_n, k_stride if not use_k32 else head_dim),
                 (k_stride if not use_k32 else head_dim, 1),
@@ -869,7 +858,7 @@ def build_qsa_k2_module(
                             )
                         acc4 = qk_mfma(a_vec, fx.Vector(q_regs[ks]), acc4)
                 else:
-                    k_row_bytes = Int32(head_dim if use_k32 else k_stride)
+                    k_row_bytes = Int32(k_stride)
                     sA = make_k_lds_view(k_arr, n0 * k_row_bytes, (16, qk_k))
                     a_src = qk_a_copy.partition_S(sA)
                     a_frag = fx.make_fragment_like(a_src)
@@ -991,7 +980,6 @@ def build_qsa_k2_module(
                             fx.Vector(fx.memref_load_vec(v_chunk[j])),
                             fx.Vector.filled(vec, 0.0, BFloat16),
                         )
-                        fx.memref_store_vec(v_vec, v_chunk[j])
                         v_tile = fx.make_view(
                             fx.get_iter(v_lds) + Int32(gr * gather_span),
                             fx.make_layout((block_n, gather_span), (k_stride, 1)),
@@ -1011,7 +999,6 @@ def build_qsa_k2_module(
                         fx.Vector(fx.memref_load_vec(v_frag)),
                         fx.Vector.filled(vec, 0.0, BFloat16),
                     )
-                    fx.memref_store_vec(v_vec, v_frag)
                     v_tile = fx.make_view(
                         fx.get_iter(v_lds) + Int32(gr * gather_span),
                         fx.make_layout((block_n, gather_span), (k_stride, 1)),
