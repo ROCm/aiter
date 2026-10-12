@@ -353,7 +353,16 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
             shape=[BLOCK_M, BLOCK_N],
             layout=SHARED_LAYOUT_C,
         )
-        c_buffer.store(accumulator.to(c_ptr.type.element_ty))
+        # When the output is fp8 (8-bit), round the fp32 accumulator through bf16
+        # first (fp32 -> bf16 -> fp8). This keeps a bf16-absorb MLA q_nope that is
+        # written straight into an fp8 q_out bit-identical to the two-step split
+        # path (bf16 GEMM epilogue + fp8 rope cast). 16-bit outputs (bf16/fp16)
+        # store directly, unchanged.
+        if c_ptr.type.element_ty.primitive_bitwidth == 8:
+            c_out = accumulator.to(gl.bfloat16).to(c_ptr.type.element_ty)
+        else:
+            c_out = accumulator.to(c_ptr.type.element_ty)
+        c_buffer.store(c_out)
         # All waves must finish their LDS writes before TDM reads the tile.
         gl.barrier()
         c_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
@@ -385,9 +394,16 @@ def _batched_gemm_bf16_bandwidth_bound_kernel(
 
         mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-        gl.amd.gfx1250.buffer_store(
-            accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
-        )
+        # When the output is fp8 (8-bit), round the fp32 accumulator through bf16
+        # first (fp32 -> bf16 -> fp8). This keeps a bf16-absorb MLA q_nope that is
+        # written straight into an fp8 q_out bit-identical to the two-step split
+        # path (bf16 GEMM epilogue + fp8 rope cast). 16-bit outputs (bf16/fp16)
+        # store directly, unchanged.
+        if c_ptr.type.element_ty.primitive_bitwidth == 8:
+            c_out = accumulator.to(gl.bfloat16).to(c_ptr.type.element_ty)
+        else:
+            c_out = accumulator.to(c_ptr.type.element_ty)
+        gl.amd.gfx1250.buffer_store(c_out, c_ptr, offs_c, mask=mask_c)
 
 
 @gluon.jit(repr=_batched_gemm_bf16_compute_bound_repr)
@@ -807,9 +823,16 @@ def _batched_gemm_bf16_compute_bound_kernel(
 
     mask_c = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
 
-    gl.amd.gfx1250.buffer_store(
-        accumulator.to(c_ptr.type.element_ty), c_ptr, offs_c, mask=mask_c
-    )
+    # When the output is fp8 (8-bit), round the fp32 accumulator through bf16
+    # first (fp32 -> bf16 -> fp8). This keeps a bf16-absorb MLA q_nope that is
+    # written straight into an fp8 q_out bit-identical to the two-step split
+    # path (bf16 GEMM epilogue + fp8 rope cast). 16-bit outputs (bf16/fp16)
+    # store directly, unchanged.
+    if c_ptr.type.element_ty.primitive_bitwidth == 8:
+        c_out = accumulator.to(gl.bfloat16).to(c_ptr.type.element_ty)
+    else:
+        c_out = accumulator.to(c_ptr.type.element_ty)
+    gl.amd.gfx1250.buffer_store(c_out, c_ptr, offs_c, mask=mask_c)
 
 
 _KERNEL_MAP = {

@@ -237,6 +237,24 @@ def test_relu2(m, n, dtype, output_dtype=None):
     return ret
 
 
+@benchmark()
+def test_relu2_bounds(numel, dtype):
+    ret = {
+        "numel": numel,
+        "dtype": {torch.float16: "fp16", torch.bfloat16: "bf16"}.get(dtype, str(dtype)),
+    }
+    input = torch.randn(1, numel, dtype=dtype, device="cuda")
+    out = torch.empty_like(input)
+    aiter.relu2(out, input)
+    if numel == 0:
+        assert out.numel() == 0
+        ret["err"] = 0.0
+        return ret
+    ref = torch_relu2_ref(input).to(dtype)
+    ret["err"] = checkAllclose(ref, out)
+    return ret
+
+
 def _dequant_fp8_group(q, s, group_size):
     m, n = q.shape
     return (
@@ -638,3 +656,11 @@ df = df[
 ]
 df_md = df.to_markdown(index=False)
 aiter.logger.info("relu2 summary (markdown):\n%s", df_md)
+df = []
+for dtype in args.dtype:
+    for numel in [0, 1, 2, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63]:
+        ret = test_relu2_bounds(numel, dtype)
+        df.append(ret)
+df = pd.DataFrame(df)
+df_md = df.to_markdown(index=False)
+aiter.logger.info("relu2_bounds summary (markdown):\n%s", df_md)
