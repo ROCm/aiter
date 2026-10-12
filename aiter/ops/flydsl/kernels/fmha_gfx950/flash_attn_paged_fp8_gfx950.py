@@ -9,6 +9,7 @@ import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.common import daz_denormal_attr
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_epilog import DualwaveFp8StoreHelper
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_gemm import DualwaveFp8GemmHelper
 from aiter.ops.flydsl.kernels.fmha_gfx950.paged_op_lds import (
@@ -522,7 +523,6 @@ def build_flash_attn_paged_fp8_module(
 
         passthrough_entries = (
             [
-                ["denormal-fp-math-f32", "preserve-sign,preserve-sign"],
                 ["no-nans-fp-math", "true"],
                 ["unsafe-fp-math", "true"],
             ]
@@ -533,6 +533,7 @@ def build_flash_attn_paged_fp8_module(
             "rocdl.waves_per_eu": waves_per_eu,
             "rocdl.flat_work_group_size": f"{BLOCK_SIZE},{BLOCK_SIZE}",
             "passthrough": passthrough_entries,
+            "llvm.denormal_fpenv": (daz_denormal_attr() if const_expr(daz) else None),
         }
         flash_attn_paged_fp8_bn128_kernel(
             Q,

@@ -26,12 +26,9 @@ from .common import (
     _buffer_load_lds_128,
     _buffer_store_128,
     _cu_load,
-)
-from .common import (
-    _p_headroom_log2 as _p_headroom_log2,  # noqa: PLC0414 - shared FP8 contract
-)
-from .common import (
-    _read_exec_i64 as _read_exec_i64,  # noqa: PLC0414 - compatibility re-export
+    _init_dualwave_q_row,
+    _lane_pair_reduce,
+    _p_headroom_log2,
 )
 
 LDS_BYTES_GFX950 = 160 * 1024
@@ -85,15 +82,6 @@ def _attn_mask_vec2_imm(rel_i32, neg_inf_i32, thr_x, thr_y, x_ref_i32, y_ref_i32
     return out_x.ir_value(), out_y.ir_value()
 
 
-def _reduction_pair(v_f32):
-    v_i32 = _bitcast_i32(v_f32)
-    pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
-    lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
-    rhs_i32 = llvm.extractvalue(T.i32, swapped, [1])
-    return _bitcast_f32(lhs_i32), _bitcast_f32(rhs_i32)
-
-
 def _anchor_scalar_f32(x):
     """Pin a scalar f32 at the current source position (no-op asm)."""
     x_ir = as_mlir_value(x)
@@ -128,22 +116,6 @@ def _anchor_v_o(traits, v_o):
     ]
 
 
-def _score_pair_to_lists(v_s):
-    s_lo, s_hi = v_s
-    return (
-        [Vec(s_lo)[r] for r in range_constexpr(16)],
-        [Vec(s_hi)[r] for r in range_constexpr(16)],
-    )
-
-
-def _score_lists_to_vecs(v_s_lists):
-    s_lo, s_hi = v_s_lists
-    return (
-        Vec.from_elements([as_mlir_value(v) for v in s_lo], fx.Float32).ir_value(),
-        Vec.from_elements([as_mlir_value(v) for v in s_hi], fx.Float32).ir_value(),
-    )
-
-
 def _reduce_score_pair(v_s, initial, reducer, fm_fast):
     s_lo, s_hi = v_s
     acc = initial
@@ -154,24 +126,10 @@ def _reduce_score_pair(v_s, initial, reducer, fm_fast):
     return acc
 
 
-def _lane_pair_reduce(v, reducer, fm_fast):
-    lhs, rhs = _reduction_pair(v)
-    return reducer(lhs, rhs, fm_fast)
-
-
 def _score_pair_max(v_s, neg_inf, fm_fast):
     reducer = lambda a, b, _fm: fx.maxnumf(a, b)
     return _lane_pair_reduce(
         _reduce_score_pair(v_s, neg_inf, reducer, fm_fast), reducer, fm_fast
-    )
-
-
-def _score_pair_sum(v_s, zero_f, fm_fast):
-    s_lo, s_hi = _score_lists_to_vecs(v_s)
-    tile = Vec(s_lo) + Vec(s_hi)
-    reducer = lambda a, b, _fm: a + b
-    return _lane_pair_reduce(
-        tile.reduce("add", init_val=zero_f, fastmath=fm_fast), reducer, fm_fast
     )
 
 
@@ -213,12 +171,6 @@ def _exp2_score_slice(v_s, start):
     for r in range_constexpr(16):
         hi_full.append(fx.Float32(Vec(v_s[1])[r]).exp2(fastmath="afn"))
     return lo_partial, hi_full
-
-
-def _scale_o_accs(v_o, scale_scalar, traits):
-    scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)
-    for dc in range_constexpr(traits.D_CHUNKS):
-        v_o[dc] = Vec(v_o[dc]) * scale_vec
 
 
 def _causal_pair_thresholds(kv_vectorized):
@@ -618,15 +570,6 @@ def _init_dualwave_thread_mapping(ctx):
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
     ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
     ctx.kv_head_idx = ctx.h_kv_idx
-
-
-def _init_dualwave_q_row(ctx):
-    """Set q_row / q_row_i32 / q_start_pos_i32 on a dualwave-style context."""
-    traits = ctx.traits
-    ctx.q_row_in_block = ctx.wave_q_offset + ctx.lane_mod_32
-    ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
-    ctx.q_row = ctx.q_start + ctx.q_row_in_block
-    ctx.q_row_i32 = fx.Int32(ctx.q_row)
 
 
 class DualwaveFp8KernelContext:

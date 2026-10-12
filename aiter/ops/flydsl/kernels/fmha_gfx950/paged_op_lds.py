@@ -64,9 +64,6 @@ def _transpose_v_fp8_16x16(source, lane, stages=4):
 
 
 class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
-    def __init__(self, ctx):
-        super().__init__(ctx)
-
     def load_k(self, tile_start, buf_id, page_id=None):
         """Stage native K pages in the retained MFMA operand layout."""
         traits = self.traits
@@ -556,9 +553,6 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8KernelContext):
 
 
 class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
-    def __init__(self, ctx):
-        super().__init__(ctx)
-
     def load_k(self, buf_id):
         # Read K in the wide 32x32x64 QK operand layout (32 contiguous head-dim/lane,
         # two N-strips, two head-dim halves).

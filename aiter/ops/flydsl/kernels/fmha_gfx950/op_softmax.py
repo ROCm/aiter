@@ -11,6 +11,14 @@ from flydsl.expr import range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as as_mlir_value
 
+from aiter.ops.flydsl.kernels.fmha_gfx950.common import (
+    _p_headroom_log2,
+    _read_exec_i64,
+    _scale_o_accs,
+    _score_lists_to_vecs,
+    _score_pair_sum,
+    _score_pair_to_lists,
+)
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
     _anchor_scalar_f32,
@@ -19,14 +27,8 @@ from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     _attn_mask_vec2_imm,
     _causal_pair_thresholds,
     _exp2_score_slice,
-    _p_headroom_log2,
-    _read_exec_i64,
-    _scale_o_accs,
     _scale_sub_score_pair,
-    _score_lists_to_vecs,
     _score_pair_max,
-    _score_pair_sum,
-    _score_pair_to_lists,
 )
 
 

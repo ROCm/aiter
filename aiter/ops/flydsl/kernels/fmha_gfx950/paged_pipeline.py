@@ -5,7 +5,6 @@
 from dataclasses import dataclass
 
 import flydsl.expr as fx
-from flydsl._mlir import ir
 from flydsl._mlir.dialects import fly, llvm
 from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import T
@@ -17,6 +16,7 @@ from .common import (
     _buffer_load_lds_128,
     _buffer_store_128,
     _cu_load,
+    _init_dualwave_q_row,
     _p_headroom_log2,
 )
 
@@ -33,45 +33,6 @@ def _tree_reduce(vals, binop):
             nxt.append(items[-1])
         items = nxt
     return items[0]
-
-
-def _reduction_pair(v_f32):
-    v_i32 = fx.Float32(v_f32).bitcast(fx.Int32).ir_value()
-    pair_ty = ir.Type.parse("!llvm.struct<(i32, i32)>")
-    swapped = rocdl.permlane32_swap(pair_ty, v_i32, v_i32, False, True)
-    lhs_i32 = llvm.extractvalue(T.i32, swapped, [0])
-    rhs_i32 = llvm.extractvalue(T.i32, swapped, [1])
-    return fx.Int32(lhs_i32).bitcast(fx.Float32), fx.Int32(rhs_i32).bitcast(fx.Float32)
-
-
-def _score_pair_to_lists(v_s):
-    s_lo, s_hi = v_s
-    return (
-        [Vec(s_lo)[r] for r in range_constexpr(16)],
-        [Vec(s_hi)[r] for r in range_constexpr(16)],
-    )
-
-
-def _score_lists_to_vecs(v_s_lists):
-    s_lo, s_hi = v_s_lists
-    return (
-        Vec.from_elements(s_lo, fx.Float32).ir_value(),
-        Vec.from_elements(s_hi, fx.Float32).ir_value(),
-    )
-
-
-def _lane_pair_reduce(v, reducer, fm_fast):
-    lhs, rhs = _reduction_pair(v)
-    return reducer(lhs, rhs, fm_fast)
-
-
-def _score_pair_sum(v_s, zero_f, fm_fast):
-    s_lo, s_hi = _score_lists_to_vecs(v_s)
-    tile = Vec(s_lo) + Vec(s_hi)
-    reducer = lambda a, b, _fm: a + b
-    return _lane_pair_reduce(
-        tile.reduce("add", init_val=zero_f, fastmath=fm_fast), reducer, fm_fast
-    )
 
 
 def _scale_sub_score_pair(v_s, row_max_raw, scale, zero_f, bias=None):
@@ -130,12 +91,6 @@ def _exp2_score_slice(v_s, start):
 def _safe_l_inv(l_row, zero_f):
     l_inv = rocdl.rcp(T.f32, fx.as_ir_value(l_row))
     return (fx.Float32(l_row) > zero_f).select(l_inv, zero_f)
-
-
-def _scale_o_accs(v_o, scale_scalar, traits):
-    scale_vec = Vec.from_elements([scale_scalar], fx.Float32).broadcast_to(16)
-    for dc in range_constexpr(traits.D_CHUNKS):
-        v_o[dc] = Vec(v_o[dc]) * scale_vec
 
 
 def _vec_k_dma_oct_idx(traits, d, wave_id_uni, lane_in_warp):
@@ -199,15 +154,6 @@ def _init_dualwave_thread_mapping(ctx):
     ctx.group_id = ctx.h_idx // traits.NUM_HEADS_KV
     ctx.q_head_idx = ctx.h_kv_idx * traits.GQA_GROUP_SIZE + ctx.group_id
     ctx.kv_head_idx = ctx.h_kv_idx
-
-
-def _init_dualwave_q_row(ctx):
-    """Set q_row / q_row_i32 / q_start_pos_i32 on a dualwave-style context."""
-    traits = ctx.traits
-    ctx.q_row_in_block = ctx.wave_q_offset + ctx.lane_mod_32
-    ctx.q_start_pos_i32 = fx.Int32(ctx.q_start + ctx.wave_id_uni * traits.ROWS_PER_WAVE)
-    ctx.q_row = ctx.q_start + ctx.q_row_in_block
-    ctx.q_row_i32 = fx.Int32(ctx.q_row)
 
 
 @dataclass(frozen=True)
