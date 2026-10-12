@@ -196,8 +196,8 @@ def pa_decode(
     windowed plans, query_length. Scratch is [KV heads, capacity, query rows
     (, D)], with query rows = query_length * query_group_size.
 
-    ``max_context_length`` selects the scheduling bound, rounded up to
-    whole pages as in tuning. This keeps the selected specialization independent
+    ``max_context_length`` bounds scheduling and reducer unrolling, rounded up
+    to whole pages as in tuning. This keeps the selected specialization independent
     of extra block-table padding. Callers must ensure
     every GPU context length is at most ``max_context_length`` when supplying it.
 
@@ -670,7 +670,12 @@ def pa_decode(
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )
-        reduce_partitions = num_partitions
+        # A task contains at least one 256-token tile. Bound reducer unrolling
+        # with host metadata while keeping the reusable plan and scratch intact.
+        context_tiles = max(
+            1, (schedule_context_length + KV_COMPUTE_BLOCK - 1) // KV_COMPUTE_BLOCK
+        )
+        reduce_partitions = min(num_partitions, work_plan.capacity, context_tiles)
         if sliding_window > 0:
             # Bound the unaligned MTP window without shrinking the reusable plan.
             window_tiles = (

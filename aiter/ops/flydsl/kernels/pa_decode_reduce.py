@@ -582,15 +582,36 @@ def compile_pa_decode_ps_reduce(
             else:
                 acc = zero_f
             if fx.const_expr(max_context_partition_num > 8):
-                # Count is CTA-uniform; keep short-path loads and math inside it.
-                if c_part_num <= c_four:
-                    acc = _reduce_planned_wave(4, (2, 1))
-                elif c_part_num <= fx.Int32(8):
-                    acc = _reduce_planned_wave(8, (4, 2, 1))
+                # Count is CTA-uniform. Select an unrolled bucket once instead
+                # of branching around every partition load, shuffle and MAC.
+                if c_part_num > fx.Int32(8):
+                    if fx.const_expr(
+                        max_context_partition_num > 32
+                    ) and c_part_num > fx.Int32(32):
+                        acc = _reduce_planned_wave(
+                            max_context_partition_num, reduce_shuffle_offsets
+                        )
+                    elif fx.const_expr(
+                        max_context_partition_num > 16
+                    ) and c_part_num > fx.Int32(16):
+                        acc = _reduce_planned_wave(
+                            min(32, max_context_partition_num),
+                            tuple(o for o in reduce_shuffle_offsets if o < 32),
+                        )
+                    else:
+                        acc = _reduce_planned_wave(
+                            min(16, max_context_partition_num),
+                            tuple(o for o in reduce_shuffle_offsets if o < 16),
+                        )
                 else:
-                    acc = _reduce_planned_wave(
-                        max_context_partition_num, reduce_shuffle_offsets
-                    )
+                    if c_part_num > c_four:
+                        acc = _reduce_planned_wave(8, (4, 2, 1))
+                    elif c_part_num > fx.Int32(2):
+                        acc = _reduce_planned_wave(4, (2, 1))
+                    elif c_part_num > fx.Int32(1):
+                        acc = _reduce_planned_wave(2, (1,))
+                    else:
+                        acc = _reduce_planned_wave(1, ())
             else:
                 acc = _reduce_planned_wave(
                     max_context_partition_num, reduce_shuffle_offsets
@@ -598,10 +619,16 @@ def compile_pa_decode_ps_reduce(
         else:
             acc = zero_f
             if fx.const_expr(compact_plan) and c_part_num <= fx.Int32(32):
-                if c_part_num <= c_four:
+                if c_part_num <= fx.Int32(1):
+                    acc = _reduce_planned_wave(1, ())
+                elif c_part_num <= fx.Int32(2):
+                    acc = _reduce_planned_wave(2, (1,))
+                elif c_part_num <= c_four:
                     acc = _reduce_planned_wave(4, (2, 1))
                 elif c_part_num <= fx.Int32(8):
                     acc = _reduce_planned_wave(8, (4, 2, 1))
+                elif c_part_num <= fx.Int32(16):
+                    acc = _reduce_planned_wave(16, (8, 4, 2, 1))
                 else:
                     acc = _reduce_planned_wave(32, (16, 8, 4, 2, 1))
             else:
