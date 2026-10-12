@@ -837,6 +837,21 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_gate_prefill_kernel(
 #endif
 }
 
+// Row-predicated output store without a branch. A row past row_count gets an
+// offset beyond the buffer's num_records (0x3fffffff bf16 is 0x7ffffffe bytes),
+// so the buffer store's range check drops it.
+//
+// Keep these stores branch-free. The ROCm 7.2 compiler (LLVM 22) does not mark
+// the gfx950 scaled MFMAs (v_mfma_scale_f32_*) convergent, so machine-sink moves
+// an MFMA whose result is only used under a lane-dependent if into that branch,
+// together with its operand setup. The setup then runs for the active lanes
+// only, but the MFMA reads all 64 and the output turns NaN. Fixed upstream in
+// llvm/llvm-project#178627.
+__device__ __forceinline__ int glm53_row_offset(bool valid,int offset)
+{
+    return valid?offset:0x3fffffff;
+}
+
 // Codebook bytes are sign-free (bit 7 clear), so OR applies the sign planes
 // and folds into a single v_and_or_b32.
 __device__ __forceinline__ uint64_t glm53_apply_signs(uint64_t magnitude,uint32_t signs)
@@ -1042,7 +1057,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_tp4_kernel(
                         opus::vector_t<opus::bf16_t,4> packed; \
                         _Pragma("unroll") \
                         for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(sum[m][c])); \
-                        if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col); \
+                        out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(row_base+out_r)*6144+out_col)); \
                     } \
                 }
                 GLM53_DOWN_TP4_ATOM(0) GLM53_DOWN_TP4_ATOM(1) GLM53_DOWN_TP4_ATOM(2)
@@ -1198,7 +1213,7 @@ __global__ __launch_bounds__(64*Waves,Occupancy) void glm53_down_prefill_tp4_ker
                         opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
                         for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(sum[m][atom][c]));
-                        if(out_r<row_count)out_buffer.template store<4>(packed,((out_col/384)*M+row_base+out_r)*384+out_col%384);
+                        out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,((out_col/384)*M+row_base+out_r)*384+out_col%384));
                     }
                 }
             }
@@ -1354,7 +1369,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     {
                         packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(first[m][c]+second[c]));
                     }
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col));
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col)));
                 }
             }
             {
@@ -1395,7 +1410,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     {
                         packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(first[m][c]+second[c]));
                     }
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col));
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col)));
                 }
             }
             {
@@ -1436,7 +1451,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_prefill_tp8_kernel(
                     {
                         packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(first[m][c]+second[c]));
                     }
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col));
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(Tiled?(n_tile*M+row_base+out_r)*Columns+out_col%Columns:(row_base+out_r)*6144+out_col)));
                 }
             }
             }
@@ -1496,7 +1511,9 @@ __global__ __launch_bounds__(576,1) void glm53_down_route9_kernel(
     constexpr int Atoms=3,N=6144,K=KT*128;
     struct Storage {
         alignas(16) uint64_t codebook[9][kCodebookBytes/8];
-        alignas(16) __hip_bfloat16 routes[9][Atoms*16];
+        // Atoms*16 results per route, then a spare slot (padded to 16 bytes)
+        // that lane groups 1-3 write.
+        alignas(16) __hip_bfloat16 routes[9][Atoms*16+8];
     };
     __shared__ Storage shared;
     const int lane=threadIdx.x,route=threadIdx.y;
@@ -1537,17 +1554,17 @@ __global__ __launch_bounds__(576,1) void glm53_down_route9_kernel(
             asm volatile("" : "+v"(sa));
             iq2r_triplet_mfma<0>(a.words,b,k_sums[ktile],sa*0x01010101u,sb);
         }
-        if(lane_group==0)
+        // Every lane group stores, not only lane group 0, so the MFMAs above are
+        // not sunk into a lane_group==0 branch (see glm53_row_offset). Lane
+        // groups 1-3 write the spare slot, which is never read.
+#pragma unroll
+        for(int atom=0;atom<Atoms;++atom)
         {
+            // ((k0+k1)+k2)+k3 in K-tile order.
+            float value=k_sums[0][atom][0];
 #pragma unroll
-            for(int atom=0;atom<Atoms;++atom)
-            {
-                // ((k0+k1)+k2)+k3 in K-tile order.
-                float value=k_sums[0][atom][0];
-#pragma unroll
-                for(int ktile=1;ktile<KT;++ktile)value+=k_sums[ktile][atom][0];
-                shared.routes[route][atom*16+lane_row]=__float2bfloat16(value);
-            }
+            for(int ktile=1;ktile<KT;++ktile)value+=k_sums[ktile][atom][0];
+            shared.routes[route][lane_group==0?atom*16+lane_row:Atoms*16]=__float2bfloat16(value);
         }
     }
     else if(lane_group==0)
@@ -1768,7 +1785,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
                     for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(second[c]));
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(row_base+out_r)*6144+out_col));
                 }
             }
             {
@@ -1806,7 +1823,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
                     for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(second[c]));
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(row_base+out_r)*6144+out_col));
                 }
             }
             {
@@ -1844,7 +1861,7 @@ __global__ __launch_bounds__(64*Waves,1) void glm53_down_tp8_ordered_kernel(
                     opus::vector_t<opus::bf16_t,4> packed;
 #pragma unroll
                     for(int c=0;c<4;++c)packed[c]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(second[c]));
-                    if(out_r<row_count)out_buffer.template store<4>(packed,(row_base+out_r)*6144+out_col);
+                    out_buffer.template store<4>(packed,glm53_row_offset(out_r<row_count,(row_base+out_r)*6144+out_col));
                 }
             }
             }
