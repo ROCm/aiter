@@ -40,7 +40,7 @@ def fused_rmsnorm_add_rmsnorm(
     """Write BF16 residual sum to ``residual_out`` and return BF16 pre-norm.
 
     The norm and residual inputs are BF16 ``(M, N)`` and both weights are
-    ``(N,)``. Weights use the Muse/Gemma ``1 + weight`` convention. The first
+    BF16 or FP32 ``(N,)``. Weights use the Muse/Gemma ``1 + weight`` convention. The first
     norm and residual add remain FP32 in the kernel; both outputs are
     rounded to BF16 at their stores. ``residual_out`` is a caller-owned BF16
     ``(M, N)`` tensor. Inputs and buffers are expected to be contiguous on the
@@ -49,6 +49,23 @@ def fused_rmsnorm_add_rmsnorm(
     assert x.ndim == 2
     assert x.dtype == torch.bfloat16
     M, N = x.shape
+    if not x.is_cuda or not x.is_contiguous():
+        raise ValueError("x must be a contiguous GPU tensor")
+    for name, tensor, shape, dtypes in (
+        ("residual", residual, x.shape, (torch.bfloat16,)),
+        ("residual_out", residual_out, x.shape, (torch.bfloat16,)),
+        ("post_weight", post_weight, (N,), (torch.bfloat16, torch.float32)),
+        ("pre_weight", pre_weight, (N,), (torch.bfloat16, torch.float32)),
+    ):
+        if (
+            tensor.shape != shape
+            or tensor.dtype not in dtypes
+            or tensor.device != x.device
+            or not tensor.is_contiguous()
+        ):
+            raise ValueError(
+                f"{name} must have shape {shape}, dtype {dtypes}, and be contiguous on {x.device}"
+            )
     out = torch.empty_like(x)
     block = triton.next_power_of_2(N)
     num_warps = 4 if M <= 128 else 8

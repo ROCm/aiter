@@ -69,3 +69,52 @@ def test_fused_rmsnorm_add_rmsnorm_torch_compile(rows, width):
     )
     torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
     torch.testing.assert_close(compiled_residual, eager_residual, atol=0.02, rtol=0.02)
+
+
+@pytest.mark.parametrize(
+    "case,name",
+    [
+        ("fp32_output", "residual_out"),
+        ("strided_output", "residual_out"),
+        ("short_post_weight", "post_weight"),
+        ("short_pre_weight", "pre_weight"),
+        ("short_residual", "residual"),
+        ("cpu_weight", "pre_weight"),
+    ],
+)
+def test_fused_rmsnorm_add_rmsnorm_rejects_invalid_inputs(case, name):
+    x, residual, post_weight, pre_weight = generate_fused_rmsnorm_add_rmsnorm_inputs(
+        2, 16
+    )
+    args = {
+        "x": x,
+        "residual": residual,
+        "post_weight": post_weight,
+        "pre_weight": pre_weight,
+        "residual_out": torch.empty_like(x),
+    }
+    if case == "fp32_output":
+        args["residual_out"] = torch.empty_like(x, dtype=torch.float32)
+    elif case == "strided_output":
+        args["residual_out"] = torch.empty((2, 32), device="cuda", dtype=x.dtype)[
+            :, ::2
+        ]
+    elif case == "short_post_weight":
+        args["post_weight"] = post_weight[:-1]
+    elif case == "short_pre_weight":
+        args["pre_weight"] = pre_weight[:-1]
+    elif case == "short_residual":
+        args["residual"] = residual[:1]
+    else:
+        args["pre_weight"] = pre_weight.cpu()
+
+    with pytest.raises(ValueError, match=name):
+        fused_rmsnorm_add_rmsnorm(
+            args["x"],
+            args["residual"],
+            args["post_weight"],
+            args["pre_weight"],
+            POST_EPS,
+            PRE_EPS,
+            args["residual_out"],
+        )
