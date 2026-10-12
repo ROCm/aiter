@@ -146,7 +146,7 @@ def compile_chunk_gdn_carry(
 
     @fx.struct
     class SharedStorage:
-        state: fx.Array[fx.Float32, K * BV, 16]
+        state: fx.Array[fx.Float32, 2 * K * BV, 16]
 
     @flyc.kernel
     def carry_kernel(
@@ -186,12 +186,11 @@ def compile_chunk_gdn_carry(
         )
         shared = fx.SharedAllocator().allocate(SharedStorage).peek()
         # XOR row groups into bank bits to avoid four-way C-store conflicts.
-        state = shared.state.view(
-            fx.make_composed_layout(
-                fx.static(fx.SwizzleType.get(2, 4, 2)),
-                fx.make_layout((K, BV), (BV, 1)),
-            )
+        state_layout = fx.make_composed_layout(
+            fx.static(fx.SwizzleType.get(2, 4, 2)),
+            fx.make_layout((K, BV), (BV, 1)),
         )
+        state = shared.state.view(state_layout)
         seed = fx.Vector.filled(8, 0.0, fx.Float32)
         if const_expr(use_initial_state):
             # Public h0 [V,K] transposes into carry [K,V].
@@ -219,6 +218,13 @@ def compile_chunk_gdn_carry(
         first_a = _prefetch_a(maps, seed_block, fx.Int32(0), tid)
         for block, carried_a in range(first, end - 1, fx.Int32(1), init=[first_a]):
             b = fx.Int32(block)
+            parity = (b - first) % 2
+            state_read = fx.make_view(
+                fx.add_offset(fx.get_iter(state), parity * K * BV), state_layout
+            )
+            state_write = fx.make_view(
+                fx.add_offset(fx.get_iter(state), (1 - parity) * K * BV), state_layout
+            )
             c_view = fx.make_view(
                 fx.get_iter(fx.slice(maps, (b, K + v_base, 0, None))),
                 fx.make_layout((K, BV), (1, K)),
@@ -229,20 +235,20 @@ def compile_chunk_gdn_carry(
             next_block = (b + 1 < end - 1).select(b + 1, b)
             values, next_a = _affine_step(
                 maps,
-                state,
+                state_read,
                 b,
                 next_block,
                 fx.Vector(carried_a[0]),
                 c_values,
                 tid,
             )
-            gpu.barrier()
-            _store_c(lds_cp, state, values, tid)
+            _store_c(lds_cp, state_write, values, tid)
             entry_next = fx.make_view(
                 fx.get_iter(fx.slice(entry, (b + 1, 0, v_base, None))),
                 fx.make_layout((K, BV), (V, 1)),
             )
             _store_c(cp, entry_next, values, tid)
+            # Publish the new state and finish all reads before recycling the old buffer.
             gpu.barrier()
             _carried_result = yield [next_a]
 
