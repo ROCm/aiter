@@ -11,7 +11,9 @@ loop over blocks is far too slow to be a useful check at these context lengths.
 A last sweep scores the same decode shapes with the block axis partitioned, to
 put the per-rank cost of context parallelism beside the unpartitioned one. It
 needs no second process: the pass is rank-local, so a shard costs the same
-whether its peers are running or not.
+whether its peers are running or not. The selector that merges those shards is
+not rank-local and is not covered here; it needs real peers to exchange with,
+so it lives in ``op_tests/multigpu_tests/test_msa_block_select_cp.py``.
 """
 
 import argparse
