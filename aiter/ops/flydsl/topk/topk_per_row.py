@@ -224,8 +224,10 @@ def _validate_radix_topk_one_block_call(
     *,
     is_decode: bool,
     next_n: int,
+    width: int | None = None,
 ) -> None:
-    """Raise if this call cannot run the one-block radix kernel."""
+    """Raise if this call cannot run the one-block radix kernel. ``width``: a
+    row's bound, the logits' width unless packed rows stand for a plane."""
     _validate_flydsl_topk_call(
         logits, next_n, row_ends, indices, num_rows, stride0, stride1, k, values
     )
@@ -233,7 +235,7 @@ def _validate_radix_topk_one_block_call(
         _validate_flydsl_topk_call(
             logits, next_n, row_starts, indices, num_rows, stride0, stride1, k, values
         )
-    if logits.shape[1] > _MAX_ROW_ELEMENTS:
+    if (logits.shape[1] if width is None else width) > _MAX_ROW_ELEMENTS:
         raise ValueError("one logits row exceeds the AMD buffer descriptor span")
 
 
@@ -473,12 +475,21 @@ def flydsl_top_k_per_row_decode(
     stable: bool = False,
     values: torch.Tensor | None = None,
     max_row_len: int | None = None,
+    *,
+    row_starts: torch.Tensor | None = None,
+    plane_width: int | None = None,
 ) -> None:
     """Write per-row TopK indices using each request's effective context length.
 
     `max_row_len` must be at least every `seq_lens` entry; if not, the result is
     wrong. Pass `None` when unsure. `aiter.ops.topk.top_k_per_row_decode` holds
     the full contract.
+
+    `row_starts` [rows] i32: row r's scores start at element row_starts[r]
+    of `logits`' first row (a packed buffer viewed with stride0 0), the
+    indices still relative to that start. `plane_width` (default the
+    logits' width) bounds every row and picks the kernel and its chunking,
+    as that plane's width would.
     """
     _decode_with_backend(
         logits,
@@ -493,6 +504,8 @@ def flydsl_top_k_per_row_decode(
         values,
         None,
         max_row_len,
+        row_starts=row_starts,
+        plane_width=plane_width,
     )
 
 
@@ -509,6 +522,9 @@ def _decode_with_backend(
     values: torch.Tensor | None,
     backend: str | None,
     max_row_len: int | None,
+    *,
+    row_starts: torch.Tensor | None = None,
+    plane_width: int | None = None,
 ) -> None:
     """Run the decode on `backend`, which must be the gate's answer or None to ask it.
 
@@ -520,9 +536,14 @@ def _decode_with_backend(
     )
 
     rows, width = logits.shape
+    width = width if plane_width is None else plane_width
     arch = torch.cuda.get_device_properties(logits.device).gcnArchName
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
+    packed = row_starts is not None
+    # unread unless packed: any int32 tensor keeps the launch's signature,
+    # and seq_lens is one
+    starts = row_starts if packed else seq_lens
 
     if backend is None:
         from aiter.ops.topk import decode_backend_for_call
@@ -538,8 +559,13 @@ def _decode_with_backend(
             k,
             stable,
             values,
-            max_row_len=max_row_len,
+            # The adaptive kernel addresses rows by stride, so no bound reaches
+            # the gate for packed rows and it declines that kernel.
+            max_row_len=None if packed else max_row_len,
+            width=plane_width,
         )
+    if packed and backend == BACKEND_ADAPTIVE:
+        raise ValueError("the adaptive kernel does not read packed rows")
 
     if backend == BACKEND_ADAPTIVE:
         # Only the adaptive path takes a host-side config, and it is reached only
@@ -567,11 +593,12 @@ def _decode_with_backend(
 
     if width <= _ONE_WORKGROUP_MAX_ROW_WIDTH:
         launcher = build_topk_per_row_decode_one_workgroup_module(
-            k, wave_size=wave_size, write_values=values is not None
+            k, wave_size=wave_size, write_values=values is not None, packed_rows=packed
         )
         _run_compiled(
             launcher,
             logits,
+            starts,
             seq_lens,
             indices,
             values if values is not None else logits,
@@ -598,10 +625,12 @@ def _decode_with_backend(
         wave_size=wave_size,
         write_values=values is not None,
         chunks_per_row=chunks,
+        packed_rows=packed,
     )
     _run_compiled(
         launcher,
         logits,
+        starts,
         seq_lens,
         indices,
         values if values is not None else logits,
@@ -629,8 +658,18 @@ def flydsl_radix_topk_one_block(
     *,
     is_decode: bool = False,
     next_n: int = 1,
+    plane_width: int | None = None,
+    packed_rows: bool = False,
 ) -> None:
-    """Launch the one-block radix TopK kernel for one prefill or decode call."""
+    """Launch the one-block radix TopK kernel for one prefill or decode call.
+
+    ``packed_rows`` (decode): row r is read from element row_starts[r] of
+    ``logits``' first row (a packed buffer viewed with stride0 0), its
+    indices relative to that start. Explicit, because decode callers pass
+    their lengths as row_starts too. ``plane_width`` (default the logits'
+    width) bounds every row and picks the variant, as that plane's would."""
+    if packed_rows and (not is_decode or row_starts is None):
+        raise ValueError("packed rows are a decode call with row_starts")
     if row_starts is None:
         if not is_decode:
             raise ValueError("row_starts is required for prefill")
@@ -647,12 +686,13 @@ def flydsl_radix_topk_one_block(
         k,
         is_decode=is_decode,
         next_n=next_n,
+        width=plane_width,
     )
     if num_rows == 0:
         return
 
     arch = get_gfx_runtime()
-    width = logits.shape[1]
+    width = logits.shape[1] if plane_width is None else plane_width
     wave_size = get_warp_size(arch)
     stream = torch.cuda.current_stream(logits.device)
     short_rows = width <= _COMPACT_CAPACITY
@@ -668,6 +708,7 @@ def flydsl_radix_topk_one_block(
         is_decode=is_decode,
         wave_size=wave_size,
         arch=arch,
+        packed_rows=packed_rows,
     )
     _run_compiled(
         launcher,

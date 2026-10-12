@@ -18,6 +18,16 @@ SLIDING_WINDOW = [128, 2048]
 KV_CACHE_DTYPES = ["auto", "fp8e4m3"]
 
 
+@pytest.fixture(autouse=True)
+def restore_torch_devices():
+    default_device = torch.get_default_device()
+    cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    yield
+    torch.set_default_device(default_device)
+    if cuda_device is not None:
+        torch.cuda.set_device(cuda_device)
+
+
 def context_attention_fwd_torch(
     query,  # [num_tokens, H, D]
     k,  # [num_tokens, Hkv, D]

@@ -70,6 +70,25 @@ def pa_sparse_prefill_gfx950_opus_fwd(
 
 
 @compile_ops(MD_NAME, develop=True)
+def pa_sparse_prefill_gfx950_opus_split_fwd(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices_prefix: torch.Tensor,
+    kv_indptr_prefix: torch.Tensor,
+    kv: torch.Tensor,
+    kv_indices_extend: torch.Tensor,
+    kv_indptr_extend: torch.Tensor,
+    attn_sink: torch.Tensor,
+    partial_o: torch.Tensor,
+    partial_max: torch.Tensor,
+    partial_sum: torch.Tensor,
+    out: torch.Tensor,
+    softmax_scale: float,
+    num_splits: int,
+) -> None: ...
+
+
+@compile_ops(MD_NAME, develop=True)
 def pa_sparse_prefill_gfx1250_opus_fwd(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -84,6 +103,22 @@ def pa_sparse_prefill_gfx1250_opus_fwd(
 ) -> None: ...
 
 
+# Split-K by the unsplit grid's blocks (a token per 16 heads): fewer than the
+# CUs leave them idle through each token's serial key loop. Measured on MI355X
+# (256 CUs; 640 keys a token, H=16, perftest): 4 splits are best up to 120
+# blocks, none beyond.
+_KV_SPLIT_STEPS = ((120, 4),)
+
+
+def _auto_kv_splits(gfx: str, n: int, h: int) -> int:
+    """The split count for ``n`` tokens of ``h`` heads: host scalars only, so
+    a captured graph's choice is its shape's."""
+    if gfx != "gfx950" or h > 32:
+        return 1
+    blocks = n * -(-h // 16)
+    return next((s for limit, s in _KV_SPLIT_STEPS if blocks <= limit), 1)
+
+
 def _pa_sparse_prefill_opus_fake(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -95,6 +130,7 @@ def _pa_sparse_prefill_opus_fake(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     return out if out is not None else torch.empty_like(q)
 
@@ -111,6 +147,7 @@ def pa_sparse_prefill_opus(
     attn_sink: torch.Tensor,
     softmax_scale: float,
     out: torch.Tensor | None = None,
+    num_kv_splits: int | None = None,
 ) -> torch.Tensor:
     """Sparse prefill attention over two KV sources (paged ``unified_kv`` +
     flat per-fwd ``kv``), backed by the OPUS gfx950 HIP kernel.
@@ -134,6 +171,11 @@ def pa_sparse_prefill_opus(
       softmax_scale:     float scalar applied to the QK^T scores.
       out:               Optional ``[T, H, D]`` output buffer; allocated if
         ``None``.
+      num_kv_splits:     split each token's keys (prefix, then extend) over
+        this many blocks (split 0 counting the sink), then fold them in a
+        second launch (pa_decode_ps_reduce): parallelism for few tokens.
+        1 (the unsplit kernel), or 2, 4, 8 on gfx950 with H <= 32. ``None``
+        picks it from the token count (``_auto_kv_splits``).
 
     Returns:
       ``out`` (``[T, H, D]`` same dtype as ``q``).
@@ -168,6 +210,43 @@ def pa_sparse_prefill_opus(
             f"expected shape={tuple(q.shape)} dtype={q.dtype}"
         )
 
+    if num_kv_splits is None:
+        num_kv_splits = _auto_kv_splits(gfx, *q.shape[:2])
+    elif num_kv_splits not in (1, 2, 4, 8):
+        # here: past it the kernel's check aborts the process; and a
+        # ValueError, a caller's error, not a configuration this GPU lacks
+        # (RuntimeError, which callers take as their cue to fall back)
+        raise ValueError(f"num_kv_splits must be 1, 2, 4 or 8, got {num_kv_splits}")
+    if num_kv_splits > 1:
+        if gfx != "gfx950" or q.size(1) > 32:
+            raise RuntimeError(
+                f"num_kv_splits > 1 runs on gfx950 with H <= 32, got {gfx} H={q.size(1)}"
+            )
+        n, h, d = q.shape
+        partial_o = torch.empty(
+            n, num_kv_splits, h, d, dtype=torch.float32, device=q.device
+        )
+        partial_max = torch.empty(
+            n, num_kv_splits, h, dtype=torch.float32, device=q.device
+        )
+        partial_sum = torch.empty_like(partial_max)
+        pa_sparse_prefill_gfx950_opus_split_fwd(
+            q,
+            unified_kv,
+            kv_indices_prefix,
+            kv_indptr_prefix,
+            kv,
+            kv_indices_extend,
+            kv_indptr_extend,
+            attn_sink,
+            partial_o,
+            partial_max,
+            partial_sum,
+            out,
+            float(softmax_scale),
+            int(num_kv_splits),
+        )
+        return out
     fwd(
         q,
         unified_kv,
@@ -330,6 +409,7 @@ __all__ = [
     "pa_sparse_prefill_fp8_gfx1250_opus_fwd",
     "pa_sparse_prefill_fp8_opus",
     "pa_sparse_prefill_gfx950_opus_fwd",
+    "pa_sparse_prefill_gfx950_opus_split_fwd",
     "pa_sparse_prefill_gfx1250_opus_fwd",
     "pa_sparse_prefill_opus",
 ]
