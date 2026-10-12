@@ -221,6 +221,9 @@ def _compact_gemm_align_m(
         q_dtype_a=q_dtype_a,
         q_dtype_w=dtypes.fp4x2,
         quant_type=quant_type,
+        # The compact plan only runs with gemm2's EP scatter, so key the row
+        # the way fused_moe will for this GEMM.
+        ep_fused=True,
     )
     tile_m = 64
     tile_m2 = 64
@@ -1309,10 +1312,23 @@ class MegaMoEGfx1250:
             inter_dim=self.inter_dim,
             recv_bound=bound,
         )
-        # The arena holds rows for _compact_tile_m, and the CSV tiles are not
-        # monotonic in the token bucket, so a smaller bound can still name a
-        # wider tile. Clamping keeps every step inside the allocated rows.
-        self._compact_step_align_m = min(int(align_m), self._compact_tile_m)
+        # The arena holds rows for _compact_tile_m at max_recv, and the CSV tiles
+        # are not monotonic in the token bucket, so a smaller bound can still
+        # name a wider tile. Keep it when this step's padded rows fit the arena:
+        # the plan drops any route past compact_cap. Otherwise fall back to the
+        # arena's tile, which always fits because bound <= max_recv.
+        align_m = int(align_m)
+        if (
+            compact_row_capacity(
+                max_recv=bound,
+                topk=config.topk,
+                experts_per_rank=config.experts_per_rank,
+                tile_m=align_m,
+            )
+            > self._compact_cap
+        ):
+            align_m = self._compact_tile_m
+        self._compact_step_align_m = align_m
         self._compact_step_recv_bound = bound
         self._compact_step_rows = min(
             compact_row_capacity(
