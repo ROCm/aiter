@@ -134,11 +134,6 @@ def _fp8_range():
     fp8_min = float(torch.finfo(fp8_dtype).min)
     return fp8_min, fp8_max
 
-
-def _align_up(value: int, alignment: int) -> int:
-    return ((value + alignment - 1) // alignment) * alignment
-
-
 # Q kernel
 # Upper bounds tuned on MI355X for D=128. Head batching amortizes the
 # head-independent position and cos/sin loads.
@@ -1013,7 +1008,7 @@ def flydsl_fused_qk_norm_mrope_3d_cache_pts_quant_shuffle(
             f"head_size*block_size ({head_size * block_size}) must be a "
             "multiple of 16 (dwordx4 K-cache run size)"
         )
-    lds_bytes = _align_up(2 * head_size * block_size * k_cache.element_size() + 4, 16)
+    lds_bytes = ceildiv(2 * head_size * block_size * k_cache.element_size() + 4, 16) * 16
     lds_limit = get_lds_capacity_bytes(get_gfx_runtime())
     if lds_bytes > lds_limit:
         raise ValueError(
