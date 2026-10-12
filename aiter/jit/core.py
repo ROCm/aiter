@@ -8,7 +8,6 @@ import logging
 import multiprocessing
 import os
 import re
-import shlex
 import shutil
 import sys
 import time
@@ -22,7 +21,7 @@ from packaging.version import Version, parse
 
 this_dir = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, f"{this_dir}/utils/")
-from chip_info import get_gfx, get_gfx_list, get_gfx_runtime
+from chip_info import _detect_native, get_gfx, get_gfx_list, get_gfx_runtime
 from cpp_extension import _jit_compile, executable_path, get_hip_version
 from file_baton import FileBaton
 from jit_cache import (
@@ -93,6 +92,13 @@ logger = logging.getLogger("aiter")
 
 PY = sys.executable
 this_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Platform helpers to keep aiter importable and buildable on Windows.
+IS_WINDOWS = sys.platform == "win32"
+NULL_DEVICE = "NUL" if IS_WINDOWS else "/dev/null"
+# Suffix for built JIT modules. Linux extensions ship as `.so`; on Windows
+# Python loads `.pyd` (which is just a renamed `.dll`).
+JIT_LIB_EXT = ".pyd" if IS_WINDOWS else ".so"
 
 AITER_ROOT_DIR = os.path.abspath(f"{this_dir}/../../")
 AITER_LOG_MORE = int(os.getenv("AITER_LOG_MORE", "0"))
@@ -424,7 +430,9 @@ class AITER_CONFIG:
             "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
 
-    def update_config_files(self, file_path: str, merge_name: str):
+    def update_config_files(
+        self, file_path: str, merge_name: str, env_name: str | None = None
+    ):
         path_list = file_path.split(os.pathsep) if file_path else []
         if len(path_list) <= 1:
             return file_path
@@ -501,12 +509,22 @@ class AITER_CONFIG:
             if duplicated_mask.any():
                 dup_count = int(duplicated_mask.sum())
                 dup_rows = merge_df[duplicated_mask].sort_values(dedup_keys)
+                dup_header = (
+                    f"Found {dup_count} duplicate shape entries during merge of "
+                    f"'{merge_name}' (dedup key: {dedup_keys}).\n"
+                )
+                env_hint = (
+                    f"To use only specific tables, set {env_name or 'the matching AITER_CONFIG_* env var'} "
+                    f"to their paths, separated by '{os.pathsep}'; this also skips the "
+                    f"model_configs/ scan.\n"
+                )
                 if "us" not in merge_df.columns:
                     raise RuntimeError(
-                        f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                        f"No 'us' column to determine best performing entry. "
-                        f"Please remove duplicates manually.\n"
-                        f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
+                        dup_header
+                        + "No 'us' column to determine best performing entry. "
+                        "Please remove duplicates manually.\n"
+                        + env_hint
+                        + f"Duplicate rows:\n{dup_rows.to_string(index=False)}"
                     )
 
                 # Auto-dedup: globally determine best row (lowest 'us') per shape
@@ -534,23 +552,27 @@ class AITER_CONFIG:
                     "\n".join(saved_files) if saved_files else "  (no files updated)"
                 )
                 raise RuntimeError(
-                    f"Found {dup_count} duplicate shape entries during merge of '{merge_name}'. "
-                    f"Auto-resolved by keeping best performing (lowest 'us') for each shape "
-                    f"and saved back to source config files. Please re-run.\n"
-                    f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
+                    dup_header
+                    + "Auto-resolved by keeping best performing (lowest 'us') for each "
+                    "key and saved back to source config files.\n"
+                    "In a source checkout, re-run and commit the updated files. "
+                    "In an installed package or container the rewritten files may not "
+                    "persist, so re-running can hit the same duplicates.\n"
+                    + env_hint
+                    + f"Duplicate rows:\n{dup_rows.to_string(index=False)}\n"
                     f"Updated files:\n{saved_info}"
                 )
         else:
             logger.warning(
                 f"Untuned config file not found: {untuned_path}. Using all columns for deduplication."
             )
-
+        import tempfile
         from pathlib import Path
 
-        config_path = Path("/tmp/aiter_configs/")
+        config_path = Path(tempfile.gettempdir()) / "aiter_configs"
         if not config_path.exists():
             config_path.mkdir(parents=True, exist_ok=True)
-        new_file_path = f"{config_path}/{merge_name}.csv"
+        new_file_path = str(config_path / f"{merge_name}.csv")
         lock_path = f"{new_file_path}.lock"
         tmp_file_path = f"{new_file_path}.tmp"
 
@@ -580,14 +602,19 @@ class AITER_CONFIG:
             if not op_tuned_file_list:
                 config_file = default_file
             else:
-                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
-                tuned_files = default_file + ":" + tuned_files
+                tuned_files = os.pathsep.join(
+                    [default_file] + [str(p) for p in op_tuned_file_list]
+                )
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )
-                config_file = self.update_config_files(tuned_files, tuned_file_name)
+                config_file = self.update_config_files(
+                    tuned_files, tuned_file_name, env_name
+                )
         else:
-            config_file = self.update_config_files(config_env_file, tuned_file_name)
+            config_file = self.update_config_files(
+                config_env_file, tuned_file_name, env_name
+            )
             # print(f"get config file from environment ", config_file)
         return config_file
 
@@ -686,6 +713,12 @@ if multiprocessing.current_process().name == "MainProcess":
 def validate_and_update_archs():
     archs = os.getenv("GPU_ARCHS", "native").split(";")
     archs = [arch.strip() for arch in archs]
+
+    # clang's `--offload-arch=native` shells out to offload-arch, which cannot
+    # detect the GPU on Windows, so resolve the arch ourselves instead.
+    if IS_WINDOWS and archs == ["native"]:
+        archs = _detect_native()
+
     # List of allowed architectures
     allowed_archs = [
         "native",
@@ -722,11 +755,11 @@ def hip_flag_checker(flag_hip: str) -> bool:
     cmd = (
         [executable_path("hipcc")]
         + flag_hip.split()
-        + ["-x", "hip", "-E", "-P", "/dev/null", "-o", "/dev/null"]
+        + ["-x", "hip", "-E", "-P", NULL_DEVICE, "-o", NULL_DEVICE]
     )
     try:
         subprocess.check_output(cmd, stderr=subprocess.DEVNULL)
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, FileNotFoundError):
         logger.warning(f"Current hipcc not support: {flag_hip}, skip it.")
         return False
     return True
@@ -741,14 +774,46 @@ def check_LLVM_MAIN_REVISION():
     #else
     #define CK_TILE_HOST_DEVICE_EXTERN"""
     import subprocess
+    import tempfile
 
+    # Compile a probe file rather than piping the source through the shell:
+    # the `echo ... | hipcc -` idiom quotes differently under cmd.exe, so the
+    # probe silently always failed on Windows. The standard is pinned to the
+    # one the modules are built with, otherwise the compiler default decides
+    # whether the probe's CTAD is even legal and the answer stops being about
+    # __host__ __device__ at all.
+    probe_src = (
+        "#include <tuple>\n"
+        "__host__ __device__ void func(){"
+        "std::tuple<int, int> t = std::tuple(1, 1);"
+        "}\n"
+    )
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".cpp", delete=False) as tf:
+        tf.write(probe_src)
+        probe_path = tf.name
     try:
-        hipcc = shlex.quote(executable_path("hipcc"))
-        cmd = f"""echo "#include <tuple>
-__host__ __device__ void func(){{std::tuple<int, int> t = std::tuple(1, 1);}}" | {hipcc} -x hip -P -c -Wno-unused-command-line-argument -o /dev/null -"""
-        subprocess.check_output(cmd, shell=True, text=True, stderr=subprocess.STDOUT)
+        subprocess.check_output(
+            [
+                executable_path("hipcc"),
+                "-x",
+                "hip",
+                "-std=c++20",
+                "-P",
+                "-c",
+                "-Wno-unused-command-line-argument",
+                "-o",
+                NULL_DEVICE,
+                probe_path,
+            ],
+            stderr=subprocess.STDOUT,
+        )
     except (subprocess.CalledProcessError, AssertionError):
         return 554785
+    finally:
+        try:
+            os.remove(probe_path)
+        except OSError:
+            pass
     return 554785 - 1
 
 
@@ -783,11 +848,11 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
         if hipify:
             if name.endswith((".cpp", ".cu")):
                 newName = name.replace(".cpp", ".cu")
-                ret.append(f"{dst}/{newName}")
-            shutil.copy(f"{src}/{name}", f"{dst}/{newName}")
+                ret.append(os.path.join(dst, newName))
+            shutil.copy(os.path.join(src, name), os.path.join(dst, newName))
         else:
             if name.endswith((".cpp", ".cu")):
-                ret.append(f"{src}/{newName}")
+                ret.append(os.path.join(src, newName))
 
     ret = []
     for el in els:
@@ -796,11 +861,10 @@ def rename_cpp_to_cu(els, dst, hipify, recursive=False):
             continue
         if os.path.isdir(el):
             for entry in os.listdir(el):
-                if os.path.isdir(f"{el}/{entry}"):
+                child = os.path.join(el, entry)
+                if os.path.isdir(child):
                     if recursive:
-                        ret += rename_cpp_to_cu(
-                            [f"{el}/{entry}"], dst, hipify, recursive
-                        )
+                        ret += rename_cpp_to_cu([child], dst, hipify, recursive)
                     continue
                 do_rename_and_mv(entry, el, dst, ret)
         else:
@@ -830,7 +894,14 @@ def _stage_blob_sources(
 
 @torch_compile_guard()
 def check_numa_custom_op() -> None:
-    numa_balance_set = os.popen("cat /proc/sys/kernel/numa_balancing").read().strip()
+    # /proc/sys/kernel/numa_balancing is Linux-only.
+    if not sys.platform.startswith("linux"):
+        return
+    try:
+        with open("/proc/sys/kernel/numa_balancing") as f:
+            numa_balance_set = f.read().strip()
+    except OSError:
+        return
     if numa_balance_set == "1":
         logger.warning(
             "WARNING: NUMA balancing is enabled, which may cause errors. "
@@ -957,7 +1028,7 @@ def _needs_arch_rebuild(md_name):
     except Exception:  # noqa: BLE001
         # running arch undetectable (e.g. no GPU) -> keep normal behaviour
         return False
-    so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+    so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
     built = _so_offload_archs(so_path)
     if not built or cur in built:
         return False
@@ -1106,11 +1177,19 @@ def clone_3rdparty(third_party: str) -> None:
 
 
 def rm_module(md_name):
-    os.system(f"rm -rf {get_user_jit_dir()}/{md_name}.so")
+    path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Failed to remove {path}: {e}")
 
 
 def clear_build(md_name):
-    os.system(f"rm -rf {bd_dir}/{md_name}")
+    path = os.path.join(bd_dir, md_name)
+    if os.path.isdir(path):
+        shutil.rmtree(path, ignore_errors=True)
 
 
 def build_module(
@@ -1133,7 +1212,7 @@ def build_module(
     os.makedirs(bd_dir, exist_ok=True)
     lock_path = f"{bd_dir}/lock_{md_name}"
     startTS = time.perf_counter()
-    target_name = f"{md_name}.so" if not is_standalone else md_name
+    target_name = f"{md_name}{JIT_LIB_EXT}" if not is_standalone else md_name
 
     for tp in third_party:
         clone_3rdparty(tp)
@@ -1684,7 +1763,7 @@ def _ctypes_call(func, fc_name, md_name):
     def _ensure_loaded():
         if _cache:
             return
-        so_path = os.path.join(get_user_jit_dir(), f"{md_name}.so")
+        so_path = os.path.join(get_user_jit_dir(), f"{md_name}{JIT_LIB_EXT}")
         if not os.path.exists(so_path) or _needs_arch_rebuild(md_name):
             d_args = get_args_of_build(md_name)
             d_args["torch_exclude"] = True

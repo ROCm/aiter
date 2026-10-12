@@ -1444,6 +1444,7 @@ namespace py = pybind11;
           py::arg("need_renorm"),                            \
           py::arg("routed_scaling_factor") = 1.0,            \
           py::arg("score_func")            = "sqrtsoftplus", \
+          py::arg("num_shared_experts")    = 0,              \
           "Fused topk gating: score_func='sqrtsoftplus'|'sigmoid'|'softmax'.");
 
 #define MOE_TOPK_CK_PYBIND          \
@@ -1476,7 +1477,8 @@ namespace py = pybind11;
           py::arg("tokens"),                           \
           py::arg("num_experts"),                      \
           py::arg("topk"),                             \
-          py::arg("dispatch_policy") = 0);             \
+          py::arg("dispatch_policy") = 0,              \
+          py::arg("device_id")       = -1);            \
     m.def("moe_sorting_opus_fwd",                      \
           &moe_sorting_opus_fwd,                       \
           py::arg("topk_ids"),                         \
@@ -1509,6 +1511,22 @@ namespace py = pybind11;
           py::arg("attn_sink"),                     \
           py::arg("out"),                           \
           py::arg("softmax_scale"));                \
+    m.def("pa_sparse_prefill_gfx950_opus_split_fwd", \
+          &opus_mla_v4_prefill_a16w16_gfx950_split_fwd, \
+          py::arg("q"),                             \
+          py::arg("unified_kv"),                    \
+          py::arg("kv_indices_prefix"),             \
+          py::arg("kv_indptr_prefix"),              \
+          py::arg("kv"),                            \
+          py::arg("kv_indices_extend"),             \
+          py::arg("kv_indptr_extend"),              \
+          py::arg("attn_sink"),                     \
+          py::arg("partial_o"),                     \
+          py::arg("partial_max"),                   \
+          py::arg("partial_sum"),                   \
+          py::arg("out"),                           \
+          py::arg("softmax_scale"),                 \
+          py::arg("num_splits"));                   \
     m.def("pa_sparse_prefill_gfx1250_opus_fwd",     \
           &opus_mla_v4_prefill_a16w16_gfx1250_fwd,  \
           py::arg("q"),                             \
@@ -2121,7 +2139,9 @@ namespace py = pybind11;
           py::arg("block_size"),                                       \
           py::arg("x"),                                                \
           py::arg("rotary_dim") = 0,                                   \
-          py::arg("v_norm")     = false);                              \
+          py::arg("v_norm")     = false,                              \
+          py::arg("q_out_fp8")  = py::none(),                          \
+          py::arg("per_tensor_q_scale") = py::none());                 \
     m.def("fused_qk_norm_rope_cache_block_quant_shuffle",              \
           &aiter::fused_qk_norm_rope_cache_block_quant_shuffle,        \
           py::arg("qkv"),                                              \
@@ -2562,6 +2582,7 @@ namespace py = pybind11;
           py::arg("z"),                                    \
           py::arg("weight"),                               \
           py::arg("epsilon"),                              \
+          py::arg("use_sigmoid") = false,                  \
           "Fused Gated RMSNorm + FP8 Per-Token Quantization");
 
 #define MHC_PYBIND                                \

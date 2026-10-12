@@ -11,6 +11,7 @@ import torch.nn.functional as F
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops import gemm_op_a4w6 as a4w6_ops
 from aiter.ops.gemm_op_a4w6 import (
     _select_gemm_a4w6_kernel,
     gemm_a4w6,
@@ -33,6 +34,10 @@ MFMA32_SMALL_KERNEL = "_ZN5aiter40f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a5_ntE"
 MFMA32_SWZ0_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s0_a4_tE"
 MFMA32_GROUPED_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a5_tE"
 MFMA32_LONG_K_KERNEL = "_ZN5aiter39f4f6gemm_bf16_per1x32Fp4Fp6_m32_s3_a6_tE"
+SPECIALIZED_UP_KERNEL = "_ZN5aiter50f4f6gemm_bf16_per1x32Fp4Fp6_m9472_n13824_k5120_m82E"
+SPECIALIZED_DOWN_KERNEL = (
+    "_ZN5aiter50f4f6gemm_bf16_per1x32Fp4Fp6_m9472_n5120_k13824_m82E"
+)
 
 
 def _is_gfx950() -> bool:
@@ -283,13 +288,16 @@ def test_a4w6_long_k_path_matches_swizzle0_bitwise():
     assert torch.equal(actual, baseline)
 
 
-def test_a4w6_dispatch_respects_grouped_kernel_bounds():
+@requires_gfx950
+def test_a4w6_dispatch_uses_specialized_kernels_and_respects_default_bounds():
     assert _select_gemm_a4w6_kernel(512, 5120, 5120, None) == MFMA32_SMALL_KERNEL
-    # Equality is intentionally format-specific: A4W6's tuned square default
-    # is natural order, while A6W4's is grouped.
     assert _select_gemm_a4w6_kernel(9450, 5120, 5120, None) == MFMA32_SWZ0_KERNEL
-    assert _select_gemm_a4w6_kernel(9450, 13824, 5120, None) == MFMA32_GROUPED_KERNEL
-    assert _select_gemm_a4w6_kernel(9450, 5120, 13824, None) == MFMA32_LONG_K_KERNEL
+    assert (
+        a4w6_ops._default_gemm_a4w6_kernel(9450, 13824, 5120) == MFMA32_GROUPED_KERNEL
+    )
+    assert a4w6_ops._default_gemm_a4w6_kernel(9450, 5120, 13824) == MFMA32_LONG_K_KERNEL
+    assert _select_gemm_a4w6_kernel(9450, 13824, 5120, None) == SPECIALIZED_UP_KERNEL
+    assert _select_gemm_a4w6_kernel(9450, 5120, 13824, None) == SPECIALIZED_DOWN_KERNEL
     assert _select_gemm_a4w6_kernel(9450, 27648, 5120, None) == MFMA32_SWZ0_KERNEL
     assert _select_gemm_a4w6_kernel(131073, 13824, 5120, None) == MFMA32_SWZ0_KERNEL
 
@@ -320,6 +328,16 @@ def test_a4w6_asm_rejects_malformed_or_misaligned_buffers():
     misaligned_x.copy_(x_packed)
     with pytest.raises(RuntimeError, match="aligned to 16 bytes"):
         gemm_a4w6_asm(misaligned_x, w_packed, x_scales, w_scales, out, K)
+    with pytest.raises(RuntimeError, match="requested physical shape"):
+        gemm_a4w6_asm(
+            x_packed,
+            w_packed,
+            x_scales,
+            w_scales,
+            out,
+            K,
+            SPECIALIZED_UP_KERNEL,
+        )
 
 
 @torch.no_grad()

@@ -12,8 +12,6 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import builtin
 from flydsl._mlir.dialects import gpu as _gpu
-from flydsl._mlir.dialects import llvm as _llvm
-from flydsl.expr import as_ir_value
 from flydsl.expr.typing import T
 from flydsl.runtime.device import get_rocm_arch, is_rdna_arch
 
@@ -86,28 +84,20 @@ def uint32_to_int32(x: int) -> int:
     return x - (1 << 32) if x >= (1 << 31) else x
 
 
-def _atomic_rmw_i32(binop, memref, val, offset, syncscope):
-    ptr = fx.to_llvm_ptr(fx.get_iter(memref) + offset)
+def _atomic_rmw_i32(atomic_op, memref, val, offset, syncscope):
+    ptr = fx.get_iter(memref) + offset
     val = fx.Int32(val) if isinstance(val, int) else val
-    old = _llvm.AtomicRMWOp(
-        binop,
-        ptr,
-        as_ir_value(val),
-        _llvm.AtomicOrdering.monotonic,
-        syncscope=syncscope,
-        alignment=4,
-    ).result
-    return fx.Int32(old)
+    return atomic_op(ptr, val, syncscope=syncscope)
 
 
 def atomic_add_i32(memref, val, offset, syncscope):
     """Atomically add an int32 value and return the previous value."""
-    return _atomic_rmw_i32(_llvm.AtomicBinOp.add, memref, val, offset, syncscope)
+    return _atomic_rmw_i32(fx.atomic_add, memref, val, offset, syncscope)
 
 
 def atomic_or_i32(memref, val, offset, syncscope):
     """Atomically OR an int32 value in and return the previous value."""
-    return _atomic_rmw_i32(_llvm.AtomicBinOp._or, memref, val, offset, syncscope)
+    return _atomic_rmw_i32(fx.atomic_or, memref, val, offset, syncscope)
 
 
 def atomic_max_i32(memref, val, offset, syncscope):
@@ -116,7 +106,7 @@ def atomic_max_i32(memref, val, offset, syncscope):
     Unlike a fetch-and-add, the result does not depend on the order the lanes
     are served, so a reduction built on this is reproducible.
     """
-    return _atomic_rmw_i32(_llvm.AtomicBinOp.max, memref, val, offset, syncscope)
+    return _atomic_rmw_i32(fx.atomic_max, memref, val, offset, syncscope)
 
 
 def get_warp_size(arch=None):
