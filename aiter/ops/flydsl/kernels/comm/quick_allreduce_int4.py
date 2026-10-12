@@ -38,6 +38,7 @@ from .allreduce_shared import (
     FLAG_LANES,
     QUAD_LANES,
     QUADS_PER_WAVE,
+    SUPPORTED_ARCHS,
     SUPPORTED_WORLDS,
     TILE_BYTES,
     WORLD,
@@ -123,7 +124,7 @@ def clamp_grid_cap(
         raise ValueError("grid_cap and cu_count must be positive")
     if block < 1:
         raise ValueError("block must be positive")
-    if arch not in ("gfx942", "gfx950"):
+    if arch not in SUPPORTED_ARCHS:
         raise ValueError(
             f"quick_allreduce_int4 has no residency measurement for {arch!r}"
         )

@@ -47,10 +47,6 @@ except Exception:  # noqa: BLE001
     OneShotAllReduce = None
     _FLY_IMPORT_OK = False
 
-_FLY_SUPPORTED_ARCHS = ("gfx942", "gfx950")
-# CustomAllreduce supports world size 6; no FlyDSL schedule does.
-_FLY_SUPPORTED_WORLDS = (2, 4, 8)
-
 
 def _close_quietly(engine):
     if engine is None:
@@ -978,13 +974,14 @@ class CustomAllreduce:
         if self.disabled or not _FLY_IMPORT_OK or not fly_policy.enabled():
             return
 
-        if self.world_size not in _FLY_SUPPORTED_WORLDS:
+        # CustomAllreduce supports world size 6; no FlyDSL schedule does.
+        if self.world_size not in fly_policy.SUPPORTED_WORLDS:
             return
 
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         arch = get_gfx_runtime()
-        if arch not in _FLY_SUPPORTED_ARCHS:
+        if arch not in fly_policy.SUPPORTED_ARCHS:
             logger.debug("FlyDSL one-shot disabled: unsupported arch %s.", arch)
             return
 

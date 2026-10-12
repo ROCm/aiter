@@ -125,7 +125,8 @@ The code reads `AITER_FLY_AR` when it creates `CustomAllreduce` and
 
 `AITER_FLY_AR=1` does not enable a kernel on an unsupported system. The
 kernels need gfx942 or gfx950, a world size of 2, 4 or 8, and the `flydsl`
-package.
+package. These limits, and the other shared constants of the kernels, are in
+the "Limits" section of `aiter/ops/flydsl/kernels/comm/allreduce_shared.py`.
 
 ### Change the payload-size boundaries
 

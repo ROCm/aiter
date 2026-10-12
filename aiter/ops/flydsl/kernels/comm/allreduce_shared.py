@@ -18,8 +18,31 @@ from flydsl.expr.typing import T, as_ir_value
 
 logger = logging.getLogger("aiter")
 
-WORLD = 8  # Default value for world size
+# Limits
+# ======
+#
+# What the FlyDSL all-reduce kernels and their hosts support. The other
+# modules import these instead of restating them.
+
+SUPPORTED_ARCHS = ("gfx942", "gfx950")
 SUPPORTED_WORLDS = (2, 4, 8)
+# Fabric between GPUs.
+LINKS = ("pcie", "xgmi")
+# Threads per workgroup that every kernel can build. The block sets the tile.
+SUPPORTED_BLOCKS = (64, 128, 256, 512)
+# Payload and buffer address alignment, in bytes: one 16 B store per lane.
+PAYLOAD_ALIGN_BYTES = 16
+# Largest payload, in bytes: the window of a buffer descriptor.
+MAX_PAYLOAD_BYTES = 0xFFFFFFFF
+# Smallest payload a quantized schedule accepts when it is used on its own. At
+# decode sizes it saves a few microseconds on a collective that is not the
+# bottleneck, and costs ~36 dB of SQNR. Production dispatch sets its own floor
+# (``allreduce_policy``) and passes ``min_bytes=0``.
+QUANT_MIN_PAYLOAD_BYTES = 128 << 10
+# No ceiling, as a payload size in bytes.
+NO_MAX = 1 << 62
+
+WORLD = 8  # Default value for world size
 BLOCK = 256
 ATOMS = 8
 TILE_BYTES = BLOCK * ATOMS * 16
@@ -38,10 +61,6 @@ I32_BYTES = 4
 # backend performs atomically.
 FLAG_LANES = 8
 FLAG_I32_PER_LANE = 2
-
-# No ceiling, as a payload size in bytes.
-NO_MAX = 1 << 62
-
 
 # Tuning ladders
 # ==============

@@ -25,14 +25,14 @@ from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, range_constexpr
 
 from ..kernels_common import ceildiv
-from .allreduce_shared import BLOCK, I32_BYTES, WAVE
+from .allreduce_shared import BLOCK, I32_BYTES, SUPPORTED_BLOCKS, WAVE
 
 SUPER_TILES = (1, 8)
 # Two threads (PAIR) share one E4M3; GROUP threads share the i32 slot.
 GROUP = 8
 PAIR = 2
 
-# Workgroup widths a codec can be built for.
+# Every workgroup width in ``SUPPORTED_BLOCKS`` can build a codec.
 #
 # Every region of a rank-tile has to be a whole number of 64 B fabric sectors:
 # the fanout moves one sector per quad, so a region ending mid-sector would
@@ -40,7 +40,6 @@ PAIR = 2
 # The nibble and 2-bit planes are 4*block and 2*block bytes, whole sectors at
 # every width here. The scale region is block/2 bytes, a whole sector only from
 # block 128 up; at 64 it is padded, see :func:`codecs_for_block`.
-SUPPORTED_BLOCKS = (64, 128, 256, 512)
 # i32 per 64 B fabric sector.
 SECTOR_I32 = 16
 

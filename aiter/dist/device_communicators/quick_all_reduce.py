@@ -51,7 +51,6 @@ except Exception:  # noqa: BLE001
     QuickAllReduceInt4 = None
     _FLY_IMPORT_OK = False
 
-_FLY_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # Quantization regimes the FlyDSL backend can serve, mapped to the wire formats
 # to pin on the ring's two laps. ``None`` means "use the schedule's own per-world
@@ -216,7 +215,7 @@ class QuickAllReduce:
         from aiter.jit.utils.chip_info import get_gfx_runtime
 
         arch = get_gfx_runtime()
-        if arch not in _FLY_SUPPORTED_ARCHS:
+        if arch not in fly_policy.SUPPORTED_ARCHS:
             logger.debug(
                 "FlyDSL quick-reduce backend disabled: unsupported arch %s.", arch
             )

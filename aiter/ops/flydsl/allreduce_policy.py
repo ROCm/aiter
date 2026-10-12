@@ -66,7 +66,10 @@ import os
 
 from .kernels.comm.allreduce_shared import (
     BLOCK,
+    LINKS,
     NO_MAX,
+    SUPPORTED_ARCHS,  # noqa: F401  -- re-exported for the dispatchers
+    SUPPORTED_WORLDS,
     FamilyPolicy,
     OneShotPolicy,
     OneShotRung,
@@ -81,11 +84,6 @@ from .kernels.comm.one_shot_allreduce import (
 )
 
 logger = logging.getLogger("aiter")
-
-# Fabric between GPUs.
-LINKS = ("pcie", "xgmi")
-
-SUPPORTED_WORLDS = (2, 4, 8)
 
 
 # Level 1: kernel boundaries
@@ -294,6 +292,19 @@ def ring_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ..
     return RING_ST_LADDER.get((str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)])
 
 
+# Floor on the block count of the mesh and the ring when they batch publishes
+# into super-tiles; refer to ``QuickAllReduceInt4._grid_x``. Shrinking the grid
+# trades parallelism for fewer release fences, which is only a good trade once
+# there are enough fences to matter.
+MIN_BATCH_BLOCKS = 32
+
+# World size from which the ring's reduce-scatter lap defaults to INT6, to
+# clear the 18 dB SQNR floor the schedules are held to. The ring requantizes
+# the running partial at every hop, and the partial's extremum grows with the
+# contributions folded in, so unlike the mesh its error grows with N.
+RS_INT6_MIN_WORLD = 8
+
+
 # Host and environment
 # ====================
 
@@ -331,6 +342,15 @@ def detect_arch() -> str | None:
         return None
 
 
+def resolve_link(link: str | None) -> str:
+    """*link*, or this host's when it is None. Raises on an unknown link."""
+    if link is None:
+        link = detect_link()
+    if link not in LINKS:
+        raise ValueError(f"link must be one of {LINKS}, got {link!r}")
+    return link
+
+
 @functools.lru_cache(maxsize=1)
 def detect_link() -> str:
     """``"xgmi"`` or ``"pcie"`` for this host, probed once per process.
@@ -339,7 +359,7 @@ def detect_link() -> str:
     assumption that makes that safe.
     """
 
-    from .quick_allreduce_int4 import has_xgmi_peer_links
+    from .allreduce_shared import has_xgmi_peer_links
 
     return "xgmi" if has_xgmi_peer_links() else "pcie"
 

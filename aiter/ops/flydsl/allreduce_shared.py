@@ -10,11 +10,15 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from .kernels.comm.allreduce_shared import (
+    MAX_PAYLOAD_BYTES,
+    PAYLOAD_ALIGN_BYTES,
+    SUPPORTED_ARCHS,
+    SUPPORTED_WORLDS,
+)
 from .quick_allreduce_int4_ipc import UncachedIpcHeap
 
 logger = logging.getLogger("aiter")
-
-_SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 # How the IPC inbox is allocated. The wire protocol is identical in every
 # mode; only the memory type changes.
@@ -154,11 +158,75 @@ class _StEngine:
             self._buf_ptr = None
 
 
-def _validate_ipc_process_group(group, *, rank: int, owner: str) -> None:
-    """Reject groups that cannot exchange HIP IPC handles or CPU-side metadata."""
+def require_arch(*, owner: str) -> str:
+    """This device's ``gfx`` arch. Raises if the kernels do not support it."""
+    from aiter.jit.utils.chip_info import get_gfx_runtime
+
+    arch = get_gfx_runtime()
+    if arch not in SUPPORTED_ARCHS:
+        raise RuntimeError(f"{owner} supports {', '.join(SUPPORTED_ARCHS)}, got {arch}")
+    return arch
+
+
+def check_world_size(world_size: int) -> None:
+    if world_size not in SUPPORTED_WORLDS:
+        raise ValueError(
+            f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
+        )
+
+
+def check_payload(inp, out, *, device_index: int, owner: str) -> int:
+    """The payload size of an all-reduce of *inp* into *out*, in bytes.
+
+    Raises unless both are contiguous bf16 CUDA tensors on *device_index*, of
+    the same size, aligned, not overlapping, and within ``MAX_PAYLOAD_BYTES``.
+    """
+    align = PAYLOAD_ALIGN_BYTES
+    if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
+        raise TypeError(f"{owner} requires torch.Tensor input/output")
+    if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
+        raise ValueError(f"{owner} supports bf16 input/output")
+    if not inp.is_cuda or not out.is_cuda:
+        raise ValueError(f"{owner} requires CUDA tensors")
+    if inp.device.index != device_index or out.device.index != device_index:
+        raise ValueError(
+            f"inp/out must be on cuda:{device_index}, got {inp.device} / {out.device}"
+        )
+    if not inp.is_contiguous() or not out.is_contiguous():
+        raise ValueError(f"{owner} requires contiguous input/output")
+    inp_ptr = int(inp.data_ptr())
+    out_ptr = int(out.data_ptr())
+    if inp_ptr % align != 0 or out_ptr % align != 0:
+        raise ValueError(f"{owner} requires {align}-byte-aligned input/output")
+    live_bytes = int(inp.numel()) * int(inp.element_size())
+    if live_bytes > MAX_PAYLOAD_BYTES:
+        raise ValueError(f"{owner} payload must not exceed the 4 GiB buffer window")
+    if live_bytes % align != 0:
+        raise ValueError(f"byte size must be a multiple of {align} ({align // 2} bf16)")
+    if int(out.numel()) * int(out.element_size()) != live_bytes:
+        raise ValueError("inp/out byte size mismatch")
+    if max(inp_ptr, out_ptr) < min(inp_ptr + live_bytes, out_ptr + live_bytes):
+        raise ValueError(f"{owner} requires non-overlapping input/output")
+    return live_bytes
+
+
+def _validate_ipc_process_group(
+    group, *, rank: int, world_size: int, owner: str
+) -> None:
+    """Reject groups that do not match *rank* and *world_size*, or that cannot
+    exchange HIP IPC handles or CPU-side metadata."""
     # Keep parallel_state lazy: this module is imported while aiter's AOT setup
     # is still initializing the top-level package.
     from aiter.dist.parallel_state import in_the_same_node_as
+
+    group_world = dist.get_world_size(group=group)
+    group_rank = dist.get_rank(group=group)
+    if group_world != int(world_size):
+        raise ValueError(
+            f"world_size={world_size} does not match group size {group_world}"
+        )
+    if group_rank != int(rank):
+        raise ValueError(f"rank={rank} does not match group rank {group_rank}")
 
     backend = dist.get_backend(group)
     if backend == dist.Backend.NCCL:

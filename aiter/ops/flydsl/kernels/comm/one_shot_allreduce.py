@@ -31,6 +31,7 @@ from .allreduce_shared import (
     _CM_SC0,
     _CM_SC1,
     _INBOX_POLICY,
+    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
     _buffer_load,
     _buffer_ptr,
@@ -45,13 +46,13 @@ from .allreduce_shared import (
     _to_sgpr_i64,
 )
 
-DEFAULT_BLOCK = 256
 # Threads per block, which sets the tile width: ``tile = block * atoms * 16 B``.
-# It sets the parallelism floor at a given payload.
+# It sets the parallelism floor at a given payload. ``SUPPORTED_BLOCKS`` lists
+# the values.
 #
 # The trade is per-block fixed cost: every block polls and re-arms its own
 # slots, so that work rises by the same factor the block count does.
-SUPPORTED_BLOCKS = (64, 128, 256, 512)
+DEFAULT_BLOCK = 256
 # 16 B per thread per atom -- one ``global_store_dwordx4``.
 ATOM_BYTES = 16
 ATOM_I32 = ATOM_BYTES // 4

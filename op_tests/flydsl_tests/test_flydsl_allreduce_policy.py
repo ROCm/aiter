@@ -27,20 +27,15 @@ from aiter.ops.flydsl.allreduce_policy import (
     oneshot_ladder,
     ring_st_ladder,
 )
-from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
-    SUPPORTED_ATOMS,
-    SUPPORTED_BLOCKS,
-)
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import (
-    SUPPORTED_BLOCKS as TWO_STAGE_BLOCKS,
-)
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import SUPPORTED_BLOCKS
+from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import SUPER_TILES
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4_ring import RING_SUPER_TILES
 from aiter.ops.flydsl.one_shot_allreduce import max_payload_bytes
 
 WORLDS = P.SUPPORTED_WORLDS
 # Every arch with policy rows of its own, and one without (``FAMILY_POLICY``).
-ARCHES = ("gfx942", "gfx950")
+ARCHES = P.SUPPORTED_ARCHS
 CELLS = [(link, ws, arch) for arch in ARCHES for link in P.LINKS for ws in WORLDS]
 
 
@@ -101,7 +96,7 @@ def test_ladders_are_well_formed(ws):
             for r in rungs:
                 assert r.super_tile in valid_st, (name, link, r)
                 assert r.grid_cap >= 1, (name, link, r)
-                assert r.block in TWO_STAGE_BLOCKS, (name, link, r)
+                assert r.block in SUPPORTED_BLOCKS, (name, link, r)
 
     for link in P.LINKS:
         one = oneshot_ladder(ws, link)

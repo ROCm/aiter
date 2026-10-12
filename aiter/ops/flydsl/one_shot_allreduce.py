@@ -13,30 +13,27 @@ from __future__ import annotations
 import logging
 
 import torch
-import torch.distributed as dist
 from flydsl.expr.typing import Int32, Int64, Stream
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
-
-from .allreduce_policy import family_policy, oneshot_ladder
+from .allreduce_policy import family_policy, oneshot_ladder, resolve_link
 from .allreduce_shared import (
-    _SUPPORTED_ARCHS,
     _cuda_index,
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
-    has_xgmi_peer_links,
+    check_payload,
+    check_world_size,
     kernel_symbol,
     payload_probes,
+    require_arch,
 )
-from .kernels.comm.allreduce_shared import SUPPORTED_WORLDS, OneShotRung, pick_rung
+from .kernels.comm.allreduce_shared import SUPPORTED_BLOCKS, OneShotRung, pick_rung
 from .kernels.comm.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
     DEFAULT_FANOUT,
     DEFAULT_GRID_CAP,
     SUPPORTED_ATOMS,
-    SUPPORTED_BLOCKS,
     make_one_shot_allreduce_kernel,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
@@ -97,14 +94,8 @@ class OneShotAllReduce:
         max_bytes: int | None = None,
         link: str | None = None,
     ):
-        if world_size not in SUPPORTED_WORLDS:
-            raise ValueError(
-                f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
-            )
-        if link is None:
-            link = "xgmi" if has_xgmi_peer_links() else "pcie"
-        if link not in ("pcie", "xgmi"):
-            raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
+        check_world_size(world_size)
+        link = resolve_link(link)
         self.link = link
         pinned = (
             atoms is not None
@@ -122,20 +113,10 @@ class OneShotAllReduce:
             raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
         if block not in SUPPORTED_BLOCKS:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
-        group_world = dist.get_world_size(group=group)
-        group_rank = dist.get_rank(group=group)
-        if group_world != int(world_size):
-            raise ValueError(
-                f"world_size={world_size} does not match group size {group_world}"
-            )
-        if group_rank != int(rank):
-            raise ValueError(f"rank={rank} does not match group rank {group_rank}")
-        _validate_ipc_process_group(group, rank=int(rank), owner="OneShotAllReduce")
-        arch = get_gfx_runtime()
-        if arch not in _SUPPORTED_ARCHS:
-            raise RuntimeError(
-                f"OneShotAllReduce supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
-            )
+        _validate_ipc_process_group(
+            group, rank=int(rank), world_size=world_size, owner="OneShotAllReduce"
+        )
+        require_arch(owner="OneShotAllReduce")
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
@@ -234,40 +215,6 @@ class OneShotAllReduce:
     def _grid_x(self, num_tiles: int, grid_cap: int | None = None) -> int:
         return max(1, min(num_tiles, self.grid_cap if grid_cap is None else grid_cap))
 
-    def _check_payload(self, inp, out) -> int:
-        if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
-            raise TypeError("OneShotAllReduce requires torch.Tensor input/output")
-        if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-            raise ValueError("OneShotAllReduce supports bf16 input/output")
-        if not inp.is_cuda or not out.is_cuda:
-            raise ValueError("OneShotAllReduce requires CUDA tensors")
-        if (
-            inp.device.index != self._device_index
-            or out.device.index != self._device_index
-        ):
-            raise ValueError(
-                f"inp/out must be on cuda:{self._device_index}, "
-                f"got {inp.device} / {out.device}"
-            )
-        if not inp.is_contiguous() or not out.is_contiguous():
-            raise ValueError("OneShotAllReduce requires contiguous input/output")
-        inp_ptr = int(inp.data_ptr())
-        out_ptr = int(out.data_ptr())
-        if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
-            raise ValueError("OneShotAllReduce requires 16-byte-aligned input/output")
-        live_bytes = int(inp.numel()) * int(inp.element_size())
-        if live_bytes > 0xFFFFFFFF:
-            raise ValueError(
-                "OneShotAllReduce payload must not exceed the 4 GiB buffer window"
-            )
-        if live_bytes % 16 != 0:
-            raise ValueError("byte size must be a multiple of 16 (8 bf16)")
-        if int(out.numel()) * int(out.element_size()) != live_bytes:
-            raise ValueError("inp/out byte size mismatch")
-        if max(inp_ptr, out_ptr) < min(inp_ptr + live_bytes, out_ptr + live_bytes):
-            raise ValueError("OneShotAllReduce requires non-overlapping input/output")
-        return live_bytes
-
     def _launch_args(self, eng, spec, inp_ptr, out_ptr, stream, *, live_bytes):
         num_tiles = self._num_tiles(live_bytes, spec["tile_bytes"])
         grid_x = self._grid_x(num_tiles, spec["grid"])
@@ -342,7 +289,9 @@ class OneShotAllReduce:
         return int(nbytes) <= self.max_bytes
 
     def allreduce(self, inp, out, stream=None):
-        live_bytes = self._check_payload(inp, out)
+        live_bytes = check_payload(
+            inp, out, device_index=self._device_index, owner="OneShotAllReduce"
+        )
         if not self.is_beneficial(live_bytes):
             raise ValueError(
                 f"OneShotAllReduce got a {live_bytes} B payload, above the "

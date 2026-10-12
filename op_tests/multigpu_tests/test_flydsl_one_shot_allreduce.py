@@ -122,14 +122,16 @@ set_start_method("spawn", force=True)
 
 from aiter.ops.flydsl import allreduce_policy as fly_policy
 from aiter.ops.flydsl.allreduce_policy import oneshot_ladder
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import SUPPORTED_WORLDS
-from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_BLOCKS
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
+    SUPPORTED_ARCHS,
+    SUPPORTED_BLOCKS,
+    SUPPORTED_WORLDS,
+)
 
 try:
     ARCH = get_gfx_runtime()
 except (KeyError, RuntimeError):
     ARCH = None
-SUPPORTED_ARCHS = ("gfx942", "gfx950")
 
 HIDDEN = 7168
 

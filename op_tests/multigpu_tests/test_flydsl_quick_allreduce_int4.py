@@ -114,9 +114,10 @@ from aiter.ops.flydsl.allreduce_policy import mesh_st_ladder, ring_st_ladder
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     ATOMS,
     DEFAULT_GRID_CAP,
+    SUPPORTED_ARCHS,
+    SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
 )
-from aiter.ops.flydsl.kernels.comm.quick_allreduce_codec import SUPPORTED_BLOCKS
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import clamp_grid_cap
 from aiter.ops.flydsl.quick_allreduce_int4 import (
     _resolve_inbox_flags,
@@ -127,7 +128,6 @@ try:
     ARCH = get_gfx_runtime()
 except (KeyError, RuntimeError):
     ARCH = None
-SUPPORTED_ARCHS = ("gfx942", "gfx950")
 ALGORITHMS = ("mesh", "ring")
 
 # One SQNR floor for both schedules, in their shipping configuration.

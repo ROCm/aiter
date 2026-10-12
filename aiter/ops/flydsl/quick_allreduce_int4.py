@@ -28,30 +28,37 @@ import torch
 import torch.distributed as dist
 from flydsl.expr.typing import Int32, Int64, Stream
 
-from aiter.jit.utils.chip_info import get_gfx_runtime, get_lds_capacity_bytes
+from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .allreduce_policy import mesh_st_ladder, ring_st_ladder
+from .allreduce_policy import (
+    MIN_BATCH_BLOCKS,
+    RS_INT6_MIN_WORLD,
+    mesh_st_ladder,
+    resolve_link,
+    ring_st_ladder,
+)
 from .allreduce_shared import (
-    _SUPPORTED_ARCHS,
     _cuda_index,
     _resolve_inbox_flags,
     _StEngine,
     _validate_ipc_process_group,
-    has_xgmi_peer_links,
+    check_payload,
+    check_world_size,
     kernel_symbol,
     payload_probes,
+    require_arch,
 )
 from .kernels.comm.allreduce_shared import (
     ATOMS,
     BLOCK,
     DEFAULT_GRID_CAP,
-    SUPPORTED_WORLDS,
+    QUANT_MIN_PAYLOAD_BYTES,
+    SUPPORTED_BLOCKS,
     WORLD,
     TwoShotRung,
     has_release_fence,
     pick_rung,
 )
-from .kernels.comm.quick_allreduce_codec import SUPPORTED_BLOCKS
 from .kernels.comm.quick_allreduce_int4 import (
     MESH_CODECS,
     SUPER_TILES,
@@ -68,34 +75,6 @@ from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
 logger = logging.getLogger("aiter")
 
-# Smallest payload sent through this kernel, in bytes.
-MIN_PAYLOAD_BYTES = 128 << 10
-
-# Floor on the block count when batching publishes into super-tiles; see
-# ``QuickAllReduceInt4._grid_x``. Shrinking the grid trades parallelism for
-# fewer release fences, which is only a good trade once there are enough fences
-# to matter.
-_MIN_BATCH_BLOCKS = 32
-
-# Size floor for the ring schedule, i.e. where the mesh stops winning.
-#
-# Keyed on world size rather than on the reduce-scatter codec: measurement says
-# the codec is not the variable that moves this boundary, N is. See
-# ``allreduce_policy.FAMILY_POLICY``, whose ``mesh_max`` these mirror; the
-# numbers come from the same fit.
-#
-# This is only the *standalone* guard rail -- what ``QuickAllReduceInt4``
-# refuses below when someone constructs one directly with ``algorithm="ring"``.
-# Production dispatch does not consult it; the FlyDSL backend inside
-# ``QuickAllReduce`` owns the real boundary via ``allreduce_policy.resolve_quant``,
-# which is additionally keyed on link type.
-_RING_MIN_PAYLOAD_BYTES_BY_WORLD = {
-    2: 4 << 20,
-    4: 12 << 20,
-    8: 12 << 20,
-}
-_RING_DEFAULT_MIN_PAYLOAD_BYTES = 12 << 20
-
 
 @dataclass(frozen=True)
 class _Algorithm:
@@ -104,8 +83,8 @@ class _Algorithm:
     Everything ``QuickAllReduceInt4`` does *around* the kernel -- IPC setup,
     payload validation, one engine per super-tile, launch -- is identical
     across schedules and stays on the class. What differs is which kernel
-    factory to call, which super-tile values and wire formats that factory
-    accepts, and where the size floor sits. That is this record.
+    factory to call, and which super-tile values and wire formats that factory
+    accepts. That is this record.
 
     ``build`` is keyword-only and always receives ``rank``, ``rs_codec``,
     ``ag_codec`` and ``block``, whether or not a given schedule uses them. Both
@@ -121,18 +100,7 @@ class _Algorithm:
     super_tiles: tuple[int, ...]
     rs_codecs: tuple[str, ...]
     ag_codecs: tuple[str, ...]
-    min_bytes: int
-    min_batch_blocks: int
     default_super_tile: int
-    # Per-world-size override of ``min_bytes``. Empty means the world does not
-    # move this schedule's floor, which is true of the mesh -- it is gated from
-    # below by accuracy, which does not depend on N. The ring's floor is where
-    # the mesh stops winning, which very much does. See
-    # ``_RING_MIN_PAYLOAD_BYTES_BY_WORLD``.
-    min_bytes_by_world: tuple[tuple[int, int], ...] = ()
-
-    def floor_bytes(self, world_size: int) -> int:
-        return dict(self.min_bytes_by_world).get(int(world_size), self.min_bytes)
 
     # ``(world_size, link) -> (TwoShotRung, ...)``, ascending. When the caller
     # did not pin ``super_tile``,
@@ -190,8 +158,6 @@ ALGORITHMS = {
         super_tiles=SUPER_TILES,
         rs_codecs=MESH_CODECS,
         ag_codecs=MESH_CODECS,
-        min_bytes=MIN_PAYLOAD_BYTES,
-        min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=mesh_st_ladder,
     ),
@@ -201,22 +167,11 @@ ALGORITHMS = {
         super_tiles=RING_SUPER_TILES,
         rs_codecs=RS_CODECS,
         ag_codecs=AG_CODECS,
-        min_bytes=_RING_DEFAULT_MIN_PAYLOAD_BYTES,
-        min_batch_blocks=_MIN_BATCH_BLOCKS,
         default_super_tile=8,
         st_ladder=ring_st_ladder,
-        min_bytes_by_world=tuple(_RING_MIN_PAYLOAD_BYTES_BY_WORLD.items()),
     ),
 }
 DEFAULT_ALGORITHM = "mesh"
-
-# World size at which a schedule's reduce-scatter lap needs INT6 to clear the
-# 18 dB SQNR floor the schedules are held to.
-#
-# The ring's error grows with N -- it requantizes the running partial at every
-# hop, and the partial's extremum grows with the contributions folded in -- so
-# unlike the mesh it does not have one SQNR for every world size.
-_RS_INT6_MIN_WORLD = 8
 
 
 def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
@@ -232,7 +187,7 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     silently narrows to what the schedule supports -- the mesh has no INT6
     path, so TP8's INT6 reduce-scatter default does not leak into it.
     """
-    rs_default = "int6" if world_size >= _RS_INT6_MIN_WORLD else "int4"
+    rs_default = "int6" if world_size >= RS_INT6_MIN_WORLD else "int4"
 
     # The all-gather lap forwards bytes verbatim and so contributes exactly one
     # quantization. It is the dominant error term if the RS lap is INT6.
@@ -302,7 +257,7 @@ class QuickAllReduceInt4:
       before the flag goes out write-through (``sc0 sc1``).
 
     ``min_bytes`` is the payload below which ``allreduce`` refuses to run,
-    defaulting to ``MIN_PAYLOAD_BYTES``.
+    defaulting to ``QUANT_MIN_PAYLOAD_BYTES``.
 
     ``link`` selects the tuning ladder and is detected from the KFD topology
     when not given. ``block`` overrides that knob on every rung, ``None``
@@ -327,19 +282,13 @@ class QuickAllReduceInt4:
         link: str | None = None,
         block: int | None = None,
     ):
-        if world_size not in SUPPORTED_WORLDS:
-            raise ValueError(
-                f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
-            )
+        check_world_size(world_size)
         if algorithm not in ALGORITHMS:
             raise ValueError(
                 f"algorithm must be one of {tuple(ALGORITHMS)}, got {algorithm!r}"
             )
         algo = ALGORITHMS[algorithm]
-        if link is None:
-            link = "xgmi" if has_xgmi_peer_links() else "pcie"
-        if link not in ("pcie", "xgmi"):
-            raise ValueError(f"link must be 'pcie' or 'xgmi', got {link!r}")
+        link = resolve_link(link)
         if block is not None and block not in SUPPORTED_BLOCKS:
             raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
         # ``None`` means "use the schedule's own policy", which for both is
@@ -355,20 +304,10 @@ class QuickAllReduceInt4:
                 f"algorithm={algorithm!r}, got {super_tile!r}"
             )
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
-        group_world = dist.get_world_size(group=group)
-        group_rank = dist.get_rank(group=group)
-        if group_world != int(world_size):
-            raise ValueError(
-                f"world_size={world_size} does not match group size {group_world}"
-            )
-        if group_rank != int(rank):
-            raise ValueError(f"rank={rank} does not match group rank {group_rank}")
-        _validate_ipc_process_group(group, rank=int(rank), owner="QuickAllReduceInt4")
-        arch = get_gfx_runtime()
-        if arch not in _SUPPORTED_ARCHS:
-            raise RuntimeError(
-                f"QuickAllReduceInt4 supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}"
-            )
+        _validate_ipc_process_group(
+            group, rank=int(rank), world_size=world_size, owner="QuickAllReduceInt4"
+        )
+        arch = require_arch(owner="QuickAllReduceInt4")
         cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
         if cap < 1:
             raise ValueError(f"grid_cap must be positive, got {cap}")
@@ -424,7 +363,7 @@ class QuickAllReduceInt4:
         self._batch_publishes = batches_publishes(resolved_inbox, algorithm, link)
 
         self.min_bytes = (
-            algo.floor_bytes(self.world_size) if min_bytes is None else int(min_bytes)
+            QUANT_MIN_PAYLOAD_BYTES if min_bytes is None else int(min_bytes)
         )
         if self.min_bytes < 0:
             raise ValueError(f"min_bytes must be non-negative, got {self.min_bytes}")
@@ -578,49 +517,15 @@ class QuickAllReduceInt4:
         publishes per tile. Hand each block a full super-tile instead, which
         cuts publishes to ``num_tiles / ST`` per phase.
 
-        Bounded below by ``_MIN_BATCH_BLOCKS``, because that trade inverts at
+        Bounded below by ``MIN_BATCH_BLOCKS``, because that trade inverts at
         small sizes: 14 tiles over 2 blocks saves a handful of fences and gives
         up the whole machine to do it. Measured on MI350P at 32x7168, TP4,
         61.95 us unbounded against 23.98 with the grid left alone.
         """
         if self._batch_publishes and super_tile != 1:
-            batched = max(-(-num_tiles // super_tile), self._algo.min_batch_blocks)
+            batched = max(-(-num_tiles // super_tile), MIN_BATCH_BLOCKS)
             num_tiles = min(num_tiles, batched)
         return max(1, min(num_tiles, self._grid if grid is None else grid))
-
-    def _check_payload(self, inp, out) -> int:
-        if not isinstance(inp, torch.Tensor) or not isinstance(out, torch.Tensor):
-            raise TypeError("QuickAllReduceInt4 requires torch.Tensor input/output")
-        if inp.dtype != torch.bfloat16 or out.dtype != torch.bfloat16:
-            raise ValueError("QuickAllReduceInt4 supports bf16 input/output")
-        if not inp.is_cuda or not out.is_cuda:
-            raise ValueError("QuickAllReduceInt4 requires CUDA tensors")
-        if (
-            inp.device.index != self._device_index
-            or out.device.index != self._device_index
-        ):
-            raise ValueError(
-                f"inp/out must be on cuda:{self._device_index}, "
-                f"got {inp.device} / {out.device}"
-            )
-        if not inp.is_contiguous() or not out.is_contiguous():
-            raise ValueError("QuickAllReduceInt4 requires contiguous input/output")
-        inp_ptr = int(inp.data_ptr())
-        out_ptr = int(out.data_ptr())
-        if inp_ptr % 16 != 0 or out_ptr % 16 != 0:
-            raise ValueError("QuickAllReduceInt4 requires 16-byte-aligned input/output")
-        live_bytes = int(inp.numel()) * int(inp.element_size())
-        if live_bytes > 0xFFFFFFFF:
-            raise ValueError(
-                "QuickAllReduceInt4 payload must not exceed the 4 GiB buffer window"
-            )
-        if live_bytes % 16 != 0:
-            raise ValueError("byte size must be a multiple of 16 (8 bf16)")
-        if int(out.numel()) * int(out.element_size()) != live_bytes:
-            raise ValueError("inp/out byte size mismatch")
-        if max(inp_ptr, out_ptr) < min(inp_ptr + live_bytes, out_ptr + live_bytes):
-            raise ValueError("QuickAllReduceInt4 requires non-overlapping input/output")
-        return live_bytes
 
     def _launch_args(
         self, eng: _StEngine, inp_ptr, out_ptr, stream, *, live_bytes, num_tiles
@@ -714,7 +619,7 @@ class QuickAllReduceInt4:
         """Whether *nbytes* is large enough for this kernel to be worth using.
 
         Callers with a fallback should route anything smaller to it; see
-        ``MIN_PAYLOAD_BYTES``. ``allreduce`` refuses payloads below the
+        ``QUANT_MIN_PAYLOAD_BYTES``. ``allreduce`` refuses payloads below the
         threshold rather than silently running them slowly.
         """
         return int(nbytes) >= self.min_bytes
@@ -724,7 +629,9 @@ class QuickAllReduceInt4:
 
         ``stream=None`` uses the current PyTorch stream on this device.
         """
-        live_bytes = self._check_payload(inp, out)
+        live_bytes = check_payload(
+            inp, out, device_index=self._device_index, owner="QuickAllReduceInt4"
+        )
         if not self.is_beneficial(live_bytes):
             raise ValueError(
                 f"QuickAllReduceInt4.allreduce got a {live_bytes} B payload, "
