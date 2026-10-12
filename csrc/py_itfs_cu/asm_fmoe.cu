@@ -188,13 +188,45 @@ class FMoeKernel
         int gdy;
         int gdz;
         // flat_mode==1: one-TG-per-(token,topk) grid; no host moe_sort.
-        // flat_mode==2: emsort persistent grid; no host moe_sort, same grid as ps.
+        // flat_mode==2: EMSORT consumes raw topk and uses the configured persistent
+        // TG pool as a 2D grid: hidden slices on X, expert owners on Y. The shader
+        // derives expert ownership from tgy and loops over its compacted queue.
         if(this->flat_mode == 1)
         {
             bdx = 256;
             gdx = ((inter_dim + sub_GU - 1) / sub_GU);
             gdy = static_cast<int>(topk);
             gdz = static_cast<int>(token_cnt);
+        }
+        else if(this->flat_mode == 2)
+        {
+            AITER_CHECK(static_cast<uint64_t>(token_cnt) * topk <= 512,
+                        __func__,
+                        ": EMSORT supports token_cnt*topk <= 512; got ",
+                        static_cast<uint64_t>(token_cnt) * topk);
+            AITER_CHECK(eprt <= 1024,
+                        __func__,
+                        ": EMSORT supports at most 1024 experts; got ",
+                        eprt);
+            AITER_CHECK(inter_dim % sub_GU == 0,
+                        __func__,
+                        ": EMSORT requires inter_dim divisible by sub_GU; got inter_dim=",
+                        inter_dim,
+                        ", sub_GU=",
+                        sub_GU);
+            gdx = inter_dim / sub_GU;
+            const int emsort_tgs = args.total_tgs > 0
+                                       ? static_cast<int>(args.total_tgs)
+                                       : 256;
+            AITER_CHECK(gdx > 0 && (emsort_tgs % gdx) == 0,
+                        __func__,
+                        ": EMSORT requires total_tgs divisible by inter_dim/sub_GU; got total_tgs=",
+                        emsort_tgs,
+                        ", slices=",
+                        gdx);
+            bdx = 256;
+            gdy = emsort_tgs / gdx;
+            gdz = 1;
         }
         else if(this->num_persistent_tgs != 0 && args.total_tgs > 0 &&
                 (args.total_tgs % args.ps_deno) == 0) // ps
@@ -241,7 +273,7 @@ class FMoeKernel
 };
 
 FMoeKernel* get_heuristic_kernel(
-    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32, int flat_mode = 0)
+    int inter_dim, int sub_X_cnt, CFG* cfgs, int smf = 0, std::string kernel_name = "", int block_size_M = 32)
 {
     FMoeKernel* impl_ptr        = nullptr;
     uint32_t num_cu             = get_num_cu_func();
@@ -265,7 +297,7 @@ FMoeKernel* get_heuristic_kernel(
                 continue;
             const auto& cfg = el.second;
             if(cfg.vskip == vskip && cfg.smf == smf && block_size_M == cfg.subGU_m &&
-               cfg.flat == flat_mode)
+               cfg.flat == 0)
             {
                 if((inter_dim % cfg.subGU_n) == 0)
                 {
@@ -299,9 +331,7 @@ FMoeKernel* get_heuristic_kernel(
                     ", smf: ",
                     smf,
                     ", vskip: ",
-                    vskip,
-                    ", flat_mode: ",
-                    flat_mode);
+                    vskip);
     }
     auto it = cfgs->find(selectedKl);
     if(it != cfgs->end())
@@ -314,14 +344,6 @@ FMoeKernel* get_heuristic_kernel(
         else
             num_persistent_tgs = 0;
 
-        AITER_CHECK(cfg.flat == flat_mode,
-                    __func__,
-                    ": kernel ",
-                    selectedKl,
-                    " flat=",
-                    cfg.flat,
-                    " but flat_mode=",
-                    flat_mode);
         impl_ptr = &impl_ptr_map.get_or_create(name, [&]() {
             return FMoeKernel(name, co_name, cfg.subGU_n, num_persistent_tgs, cfg.flat);
         });
@@ -567,6 +589,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     FMoeKernel* impl_ptr = nullptr;
     CFG* config_map      = nullptr;
     int smf              = 0;
+    bool is_mxfp4        = false;
     int model_dim        = down->size(1);
     int inter_dim        = down->size(2);
     inter_dim *= model_dim / gate->size(2);
@@ -615,10 +638,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1. ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
+        is_mxfp4 = true;
     }
     else if((input->dtype() == AITER_DTYPE_bf16 || input->dtype() == AITER_DTYPE_fp16) &&
             gate->dtype() == AITER_DTYPE_fp4x2) // bf16/fp16 X + MXFP4 weights (in-kernel X quant)
@@ -634,10 +660,13 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_silu;
         else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Gelu)
             config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_gelu;
+        else if(out->dtype() == AITER_DTYPE_bf16 && act == ActivationType::Situv2)
+            config_map = &cfg_fmoe_bf16_pertokenMXfp4_g1u1_situv2;
         else
             AITER_CHECK(false, __func__, " Not find proper cfg in pertokenMXfp4_g1u1 (bf16 X). ");
         impl_ptr = get_heuristic_kernel(inter_dim, sub_X_cnt, config_map, smf, kernel_name_str);
         impl_ptr->set_4bit(true);
+        is_mxfp4 = true;
     }
     else if(input->dtype() == AITER_DTYPE_i8 || input->dtype() == AITER_DTYPE_u8) // int8
     {
@@ -674,6 +703,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     else
     {
         AITER_CHECK(false, __func__, ": unsupport current input type:", AiterDtype_to_str(input->dtype()));
+    }
+
+    // The asm MXFP4 O-flush walks full 1024-dim blocks, then waves 0/1 drain a
+    // 512-dim tail when dim bit 9 is set. That covers every multiple of 512
+    // (dim=512 is tail-only). A 256 remainder is unwritten, so reject it.
+    if(is_mxfp4)
+    {
+        AITER_CHECK(model_dim >= 512 && (model_dim % 512) == 0,
+                    __func__,
+                    " asm MXFP4 kernels require model_dim to be a positive "
+                    "multiple of 512; got model_dim=" +
+                        std::to_string(model_dim));
     }
 
     impl_ptr->launch_kernel<1, 2>(out,
@@ -921,9 +962,8 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     aiter_tensor_t* fc2_smooth_scale,  // [expert, 1, inter_dim]
     int activation,
     int block_size_M,
-    int flat_mode,
     hipStream_t stream),
-    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc_scale_blkn, fc_scale_blkk, fc2_smooth_scale, activation, block_size_M, flat_mode, stream))
+    (out, input, gate, down, sorted_token_ids, sorted_weights, sorted_expert_ids, num_valid_ids, topk, input_scale, fc1_scale, fc2_scale, kernel_name, fc_scale_blkn, fc_scale_blkk, fc2_smooth_scale, activation, block_size_M, stream))
 {
     const HipDeviceGuard device_guard(input->device_id);
     ActivationType act = static_cast<ActivationType>(activation);
@@ -947,7 +987,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
                 false, __func__, "Unsupported activation type for fmoe_fp8_blockscale_g1u1");
 
         impl_ptr =
-            get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 0, kernel_name_str, block_size_M, flat_mode);
+            get_heuristic_kernel(inter_dim, sorted_expert_ids->size(0), config_map, 0, kernel_name_str, block_size_M);
         impl_ptr->launch_kernel<1, 2, false>(out,
                                              input,
                                              gate,

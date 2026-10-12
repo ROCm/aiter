@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib
+import sys
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -9,9 +12,6 @@ from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale import (
     gemm_a8w8_blockscale,
     gemm_a8w8_blockscale_preshuffle,
-)
-from aiter.ops.triton.gluon.gemm_a8w8_blockscale import (
-    gemm_a8w8_blockscale as gluon_gfx950_gemm_a8w8_blockscale,
 )
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.types import get_fp8_dtypes, str_to_torch_dtype
@@ -185,21 +185,30 @@ def test_gemm(dtype, M, N, K, layout, output, backend, shuffle):
 
     a = run_torch(x, weight, x_scale, w_scale, dtype)
 
-    if not shuffle and backend == "gluon" and DEVICE_ARCH == "gfx950":
-        impl = gluon_gfx950_gemm_a8w8_blockscale
+    if shuffle:
+
+        def impl(x, w, xs, ws, dt, y):
+            return gemm_a8w8_blockscale_preshuffle(x, w, xs, ws, dt, y, backend=backend)
+
     else:
-        if shuffle:
 
-            def impl(x, w, xs, ws, dt, y):
-                return gemm_a8w8_blockscale_preshuffle(
-                    x, w, xs, ws, dt, y, backend=backend
-                )
-
-        else:
-
-            def impl(x, w, xs, ws, dt, y):
-                return gemm_a8w8_blockscale(x, w, xs, ws, dt, y, backend=backend)
+        def impl(x, w, xs, ws, dt, y):
+            return gemm_a8w8_blockscale(x, w, xs, ws, dt, y, backend=backend)
 
     b = run_triton(x, weight_triton, x_scale_shuffled, w_scale, dtype, y, impl)
 
     torch.testing.assert_close(a, b, atol=0.01, rtol=1e-2)
+
+
+def test_legacy_gluon_import_path_warns():
+    """The pre-move path still resolves here, but tells callers to move on."""
+    legacy = "aiter.ops.triton.gluon.gemm_a8w8_blockscale"
+    sys.modules.pop(legacy, None)
+
+    with pytest.warns(DeprecationWarning, match="has moved to"):
+        mod = importlib.import_module(legacy)
+
+    assert (
+        mod.gemm_a8w8_blockscale.__module__
+        == "aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale"
+    )

@@ -736,7 +736,7 @@ parser.add_argument(
     type=dtypes.str2tuple,
     nargs="*",
     const=None,
-    default=[(16, 4), (32, 3), (64, 1), (64, 2), (128, 2), (16, 8), (64, 17)],
+    default=[(16, 4), (32, 3), (64, 1), (64, 2), (128, 2), (16, 8), (96, 8), (64, 17)],
     help="""Number of heads, decode_qlen pairs.
     e.g.: -n 16,4""",
 )

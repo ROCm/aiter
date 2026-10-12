@@ -578,7 +578,19 @@ def _fused_gemm_afp4wfp4_preshuffle_split_cat(
             tl.store(c1_ptrs, c, mask=c1_mask)
 
 
-@triton.jit
+_fused_gemm_afp4wfp4_split_cat_reduce_repr = make_kernel_repr(
+    "_fused_gemm_afp4wfp4_split_cat_reduce",
+    [
+        "BLOCK_SIZE_M",
+        "BLOCK_SIZE_N",
+        "BLOCK_SIZE_S3",
+        "ACTUAL_KSPLIT",
+        "MAX_KSPLIT",
+    ],
+)
+
+
+@triton.jit(repr=_fused_gemm_afp4wfp4_split_cat_reduce_repr)
 def _fused_gemm_afp4wfp4_split_cat_reduce(
     c_ptr,
     c1_ptr,

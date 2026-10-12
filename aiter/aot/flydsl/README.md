@@ -9,8 +9,11 @@ the JIT path hits the cache instead of compiling again.
 | --- | --- | --- |
 | `moe.py` | `MOE` | MoE / Mixed-MoE kernels (stage1 + stage2) |
 | `gemm.py` | `GEMM` | GEMM kernels |
+| `conv.py` | `CONV` | conv3d implicit-GEMM kernels, plus the NCDHW->NDHWC pre-transpose each NCDHW caller reaches first |
 | `grouped_moe.py` | `GROUPED_MOE` | gfx1250 grouped MoE GEMM kernels |
-| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h kernels |
+| `chunk_gdn_h.py` | `CHUNK_GDN_H` | chunk-gdn-h opt (K5) kernels |
+| `mega_moe.py` | `MEGA_MOE` | MegaMoE A8W4 profile bundles for MTPR 8192/16384/32768 |
+| `fmha_fp8.py` | `FMHA_FP8` | gfx950 FP8 flash-attention forward, per head shape in `DEFAULT_SHAPES` |
 | `common.py` | — | Shared job collection, the deadlock-free fork pool, and cache-hit checking logic |
 
 ---
@@ -42,21 +45,46 @@ python -m aiter.aot.flydsl.moe
 # GEMM
 python -m aiter.aot.flydsl.gemm
 
+# conv3d
+python -m aiter.aot.flydsl.conv
+
 # grouped MoE (gfx1250)
 python -m aiter.aot.flydsl.grouped_moe
 
 # chunk-gdn-h
 python -m aiter.aot.flydsl.chunk_gdn_h
+
+# MegaMoE profile bundles (all token buckets and all eight ranks)
+python -m aiter.aot.flydsl.mega_moe
+
+# Restrict the deployment profiles when building a smaller custom image.
+python -m aiter.aot.flydsl.mega_moe --experts-per-rank 48
 ```
+
+The FP8 flash-attention kernel picks its tile, rescale threshold and split-K
+factor per call, so a serving process JIT-compiles each new combination on the
+request path. `fmha_fp8` enumerates every combination the wrapper's heuristics
+can reach for each head shape in its `DEFAULT_SHAPES` table. Add a model by
+adding an entry (`num_heads, num_kv_heads, head_dim, head_dim_v, layout`, heads
+per rank, layout `varlen_cross` for the chunked-prefill serving path).
+
+```bash
+# every configured shape (Kimi-K3 at TP8: 12:12:192:128 -> 92 kernels)
+python -m aiter.aot.flydsl.fmha_fp8
+# ad hoc shape, without editing DEFAULT_SHAPES
+python -m aiter.aot.flydsl.fmha_fp8 --shape 12:12:192:128
+```
+
+MegaMoE defaults to all three DeepSeek-V4-Pro deployment profiles: r0/r32/r64
+(`experts_per_rank=48/52/56`). The expert count is part of the compiled ABI, so
+one profile cannot safely reuse another profile's bundle.
 
 ### Common arguments
 
 ```bash
 # Custom CSV(s) — every module supports --csv and accepts multiple paths
 python -m aiter.aot.flydsl.moe --csv /path/to/config1.csv /path/to/config2.csv
-
-# chunk_gdn_h also supports overriding the arch column for cross-compiling
-python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
+python -m aiter.aot.flydsl.chunk_gdn_h --csv /path/to/tuned.csv
 ```
 
 ### Environment variables
@@ -70,15 +98,14 @@ python -m aiter.aot.flydsl.chunk_gdn_h --target-arch gfx942
 | `AITER_FLYDSL_AOT_TIMEOUT` | Per-kernel wall-clock cap (seconds). A worker stuck *alive* past this is killed (and retried); `0` disables. | `1200` |
 | `AITER_FLYDSL_AOT_MAX_RETRIES` | Retries for a worker that **died abnormally** (OOM-kill / segfault / timeout-kill). A clean compile error is never retried. `0` disables. | `2` |
 | `AITER_CONFIGS` | Resolves the default CSV lookup path (same as the runtime JIT) | repo built-in |
-| `ARCH` / `GPU_ARCHS` | **Banner/logging only** — printed as the "Target arch" line. Does **not** control the compiled target. | auto-detect |
+| `ARCH` / `GPU_ARCHS` | Selects which jobs to build, not what arch a job compiles *for* (that comes from the CSV's `cu_num`). `conv.py` applies it inside `parse_csv`, so both `python -m` and the `setup.py` path (`run_aot`) honour it. `gemm.py` still filters in `main()` only, so `run_aot` builds all of its archs. | auto-detect |
 
 > **About the compile target arch.** The arch each kernel is actually compiled
 > for is derived per-job from the CSV's `cu_num` column (`cu_num_to_arch(...)`)
 > and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
-> does **not** change what gets built. To cross-compile, use
-> `chunk_gdn_h --target-arch <arch>` (the only module that exposes an override),
-> or edit the `cu_num` column in the CSV.
+> does **not** change what gets built. To cross-compile, edit the `cu_num`
+> column in the CSV.
 
 Example:
 

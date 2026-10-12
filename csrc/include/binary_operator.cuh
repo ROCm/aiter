@@ -1581,10 +1581,13 @@ struct BinaryOperationPattern<2, Operation, _T0, _T1>
             {
                 VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
                     output.dtype(), "operator_bcast_tile_kernel", [&] {
-                        aiter::
-                            operator_bcast_tile_kernel<scalar_t, rows, Operation, false, _T1, _T0>
+                        // Do not reformat: `aiter::` must stay on the same line as the
+                        // kernel name, otherwise PyTorch fails to hipify this file.
+                        // clang-format off
+                        aiter::operator_bcast_tile_kernel<scalar_t, rows, Operation, false, _T1, _T0>
                             <<<grid_dim, block_dim, 0, stream>>>(
                                 buf_b, buf_a, buf_c, M, N, K, types_match);
+                        // clang-format on
                     });
             }
         }
@@ -2204,10 +2207,13 @@ struct BinaryOperationPattern<4, Operation, _T0, _T1>
             const dim3 block_dim(wg, 1, 1);
             VLLM_DISPATCH_FLOATING_TYPES_rmTorch(
                 output.dtype(), "operator_contiguous_kernel_naive", [&] {
-                    aiter::
-                        operator_contiguous_kernel_naive<scalar_t, rows, Operation, true, _T0, _T1>
+                    // Do not reformat: `aiter::` must stay on the same line as the
+                    // kernel name, otherwise PyTorch fails to hipify this file.
+                    // clang-format off
+                    aiter::operator_contiguous_kernel_naive<scalar_t, rows, Operation, true, _T0, _T1>
                         <<<grid_dim, block_dim, 0, stream>>>(
                             buf_a, buf_b, buf_c, num_elements, types_match);
+                    // clang-format on
                 });
         }
         else if(N % rows == 0 && K % vec == 0)

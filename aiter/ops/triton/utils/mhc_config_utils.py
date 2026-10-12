@@ -1,30 +1,48 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+"""MHC config loading: ``get_mhc_config()`` / ``get_mhc_post_config()`` /
+``get_mhc_fused_post_pre_delayed_rmsnorm_config()``, with the documented gfx942 arch fallback,
+and the gfx1250 Gluon ``get_mhc_post_pre_gluon_gfx1250_config()`` (no fallback), on top
+of the shared core in ``config_utils``.
+"""
+
 import functools
 import glob
 import os
 import re
 
 from aiter.ops.triton.utils._triton import arch_info
-from aiter.ops.triton.utils.core import (
-    AITER_TRITON_CONFIGS_PATH,
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
+
+from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
+    resolve_config_dir,
+    select_leq_config,
 )
 
 _FALLBACK_DEV = "gfx942"
 
 
-def _load_with_fallback(dev: str, fname: str, required: bool = False) -> dict | None:
-    """Load ``{dev}-{fname}``, falling back to the gfx942 copy for arches
-    without tuned MHC configs (may be suboptimal)."""
+def _mhc_config_dir(dev: str, config_name: str) -> str:
+    """``dev``'s nested config directory for the ``config_name`` family."""
+    return resolve_config_dir("mhc", config_name, backend="triton", arch=dev)
+
+
+def _load_with_fallback(
+    dev: str, config_name: str, fname: str, required: bool = False
+) -> dict | None:
+    """Load ``fname`` from ``dev``'s ``config_name`` directory, falling back to
+    the gfx942 copy for arches without tuned MHC configs (may be suboptimal)."""
     config = load_config_json(
-        f"{AITER_TRITON_CONFIGS_PATH}/{dev}-{fname}", required=False
+        f"{_mhc_config_dir(dev, config_name)}/{fname}", required=False
     )
     if config is None:
         config = load_config_json(
-            f"{AITER_TRITON_CONFIGS_PATH}/{_FALLBACK_DEV}-{fname}", required=required
+            f"{_mhc_config_dir(_FALLBACK_DEV, config_name)}/{fname}", required=required
         )
     return config
 
@@ -35,7 +53,8 @@ def _c_thresholds(dev: str, actual_config_name: str) -> tuple[int, ...]:
     gfx942 fallback), sorted ascending."""
     thresholds = set()
     for d in {dev, _FALLBACK_DEV}:
-        pattern = f"{AITER_TRITON_CONFIGS_PATH}/{d}-{actual_config_name}-C=*.json"
+        cfg_dir = _mhc_config_dir(d, actual_config_name)
+        pattern = f"{cfg_dir}/{actual_config_name}-C=*.json"
         for fpath in glob.glob(pattern):
             match = re.search(r"-C=(\d+)\.json$", os.path.basename(fpath))
             if match:
@@ -55,7 +74,8 @@ def get_mhc_config(
 
     Selection logic:
     - C: Finds the largest C-specific config file threshold <= input C value.
-      Available C configs are discovered from files named {arch}-{config}-C={value}.json.
+      Available C configs are discovered from the files named
+      {config}-C={value}.json in the arch's config directory.
     - M: Within the selected config, finds the largest M_LEQ_x threshold <= input M value.
 
     Architecture fallback:
@@ -64,7 +84,7 @@ def get_mhc_config(
 
     Config file naming convention:
     - For MHC_FUSED: mode is required ("sinkhorn")
-      - e.g., gfx942-MHC_FUSED_SINKHORN-C=128.json
+      - e.g., gfx942/triton/mhc/mhc_fused_sinkhorn/MHC_FUSED_SINKHORN-C=128.json
 
     Args:
         config_name: Base name of the config (e.g., "MHC_FUSED")
@@ -87,14 +107,16 @@ def get_mhc_config(
     actual_config_name = f"{config_name}_{mode.upper()}"
 
     # Default config (must exist for the arch or the gfx942 fallback)
-    config_dict = _load_with_fallback(dev, f"{actual_config_name}.json", required=True)
+    config_dict = _load_with_fallback(
+        dev, actual_config_name, "DEFAULT.json", required=True
+    )
     used_specialized = False
 
     # C-specific config: largest discovered threshold <= input C wins
     for c_threshold in reversed(_c_thresholds(dev, actual_config_name)):
         if C >= c_threshold:
             specialized = _load_with_fallback(
-                dev, f"{actual_config_name}-C={c_threshold}.json"
+                dev, actual_config_name, f"{actual_config_name}-C={c_threshold}.json"
             )
             if specialized is not None:
                 config_dict = specialized
@@ -134,12 +156,13 @@ def get_mhc_config(
 
 @functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
 def get_mhc_post_config(M: int, C: int) -> dict:
-    """Pick the mhc_post config for ``(M, C)`` from ``{arch}-MHC_POST.json``.
+    """Pick the mhc_post config for ``(M, C)`` from the arch's ``mhc_post``
+    ``DEFAULT.json``.
 
     Picks the largest ``C_<value> <= C``, else ``"default"``.
     """
     dev = arch_info.get_arch()
-    cfg = load_config_json(f"{AITER_TRITON_CONFIGS_PATH}/{dev}-MHC_POST.json")
+    cfg = load_config_json(f"{_mhc_config_dir(dev, 'MHC_POST')}/DEFAULT.json")
 
     c_thresholds = sorted(
         int(k[2:]) for k in cfg if k.startswith("C_") and k[2:].isdigit()
@@ -152,6 +175,58 @@ def get_mhc_post_config(M: int, C: int) -> dict:
         return dict(cfg["default"])
 
     raise KeyError(f"No matching config for M={M}, C={C} in 'MHC_POST'")
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_mhc_fused_post_pre_delayed_rmsnorm_config(M: int) -> dict:
+    """Pick the mhc_fused_post_pre_delayed_rmsnorm launch config for ``M`` tokens from the
+    arch's ``mhc_fused_post_pre_delayed_rmsnorm`` ``DEFAULT.json`` (gfx942 fallback).
+
+    Picks the smallest ``M_LEQ_<x>`` with ``M <= x``, else ``"any"``. The shipped
+    tables are for DeepSeek-V4.1 (hidden size 5120); the kernel requires
+    ``NUM_KSPLIT * TILE_K`` to divide the hidden size.
+    """
+    dev = arch_info.get_arch()
+    cfg = _load_with_fallback(
+        dev, "MHC_FUSED_POST_PRE_DELAYED_RMSNORM", "DEFAULT.json", required=True
+    )
+
+    m_bounds = sorted(
+        int(k[6:]) for k in cfg if k.startswith("M_LEQ_") and k[6:].isdigit()
+    )
+    for m_bound in m_bounds:
+        if M <= m_bound:
+            return dict(cfg[f"M_LEQ_{m_bound}"])
+
+    if "any" in cfg:
+        return dict(cfg["any"])
+
+    raise KeyError(
+        f"No matching config for M={M} in 'MHC_FUSED_POST_PRE_DELAYED_RMSNORM'"
+    )
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_mhc_post_pre_gluon_gfx1250_config(M: int) -> dict:
+    """Pick the gfx1250 Gluon ``mhc_post_pre`` launch config for ``M`` tokens from
+    the arch's ``gluon/mhc/mhc_post_pre/DEFAULT.json``: the smallest
+    ``M_LEQ_<x>`` with ``M <= x``, else ``"any"``. Gluon tables are not borrowed
+    from another arch, so there is no gfx942 fallback.
+
+    Keys: ``SPLIT_BLOCK_M`` / ``SPLIT_NUM_WARPS`` (1, 2 or 4) / ``SPLIT_NUM_STAGES``
+    for the post + split-K GEMM/sqrsum kernel; ``SPLIT_MAX_CTAS_PER_CU``, its LDS
+    residency (workgroups per CU), caps the split-K count to one round (see
+    ``_mhc_post_pre_gluon_split_k``) and gates the deeper ``SPLIT_DEEP_NUM_STAGES``
+    ring (see ``_gluon_split_num_stages``); ``RA_NORM_NUM_WARPS`` (fused
+    RMSNorm) and ``RA_ROWS`` / ``RA_NUM_WARPS`` / ``RA_CTAS_PER_CU`` (without it)
+    for the pre reduce/apply kernel. The split-K count is not here: it follows
+    the HIP ``get_mhc_fused_post_pre_config`` policy, capped as above.
+
+    The returned dict is cached and shared -- read-only.
+    """
+    cfg_dir = resolve_config_dir("mhc", "MHC_POST_PRE", backend="gluon")
+    cfg = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    return select_leq_config(cfg, M, prefix="M_LEQ_")
 
 
 def hip_post_dispatch_block(C: int, arch_id: str) -> int | None:

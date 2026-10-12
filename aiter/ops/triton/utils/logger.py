@@ -3,6 +3,8 @@ import os
 
 
 # AITER Triton Logger which is singleton object around python logging.
+# `*args` is forwarded so callers can use lazy %-style formatting rather than
+# building an f-string that is thrown away below the configured level.
 # Note: Python logging is also a singleton object, but we want to read the
 # env var AITER_LOG_LEVEL once at the beginning. Another alternative is to do
 # this in __init__.py. In fact, that's how CK logger is setup. We can look at
@@ -31,17 +33,17 @@ class AiterTritonLogger:
     def get_logger(self):
         return self._logger
 
-    def debug(self, msg):
-        self._logger.debug(msg)
+    def debug(self, msg, *args):
+        self._logger.debug(msg, *args)
 
-    def info(self, msg):
-        self._logger.info(msg)
+    def info(self, msg, *args):
+        self._logger.info(msg, *args)
 
-    def warning(self, msg):
-        self._logger.warning(msg)
+    def warning(self, msg, *args):
+        self._logger.warning(msg, *args)
 
-    def error(self, msg):
-        self._logger.error(msg)
+    def error(self, msg, *args):
+        self._logger.error(msg, *args)
 
-    def critical(self, msg):
-        self._logger.critical(msg)
+    def critical(self, msg, *args):
+        self._logger.critical(msg, *args)

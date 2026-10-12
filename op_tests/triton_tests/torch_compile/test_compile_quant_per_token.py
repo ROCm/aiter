@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from . import _get_compiled
+from op_tests.triton_tests.torch_compile import _get_compiled
 
 FP8_MAX = torch.finfo(torch.float8_e4m3fnuz).max
 

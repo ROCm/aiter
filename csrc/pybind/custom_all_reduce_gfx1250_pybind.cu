@@ -1,14 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+#include "rocm_ops.hpp"
 #include "aiter_stream.h"
 #include "custom_all_reduce_gfx1250.h"
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
-#include <torch/extension.h>
 
-namespace py = pybind11;
-
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     m.def("_set_current_hip_stream",
           [](int64_t stream_ptr) { aiter::setCurrentHIPStream((hipStream_t)stream_ptr); },

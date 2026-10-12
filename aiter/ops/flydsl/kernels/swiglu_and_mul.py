@@ -24,6 +24,8 @@ import flydsl.expr as fx
 from flydsl.expr import gpu, ptrtoint, range_constexpr
 from flydsl.expr.typing import T
 
+from .act import clamp_gate_up, sigmoid_f32
+
 NLANE = 16
 ALPHA = 1.702
 LIMIT = 7.0
@@ -86,17 +88,12 @@ def build_swiglu_and_mul_module(inter_dim: int):
 
         f32 = T.f32
         neg_limit, one = fx.Float32(-LIMIT), fx.Float32(1.0)
-        neg_alpha_log2e = fx.Float32(-ALPHA * 1.4426950408889634)
         gv = fx.Vector(fx.memref_load_vec(gf)).extf(T.vec(V, f32))
         uv = fx.Vector(fx.memref_load_vec(uf)).extf(T.vec(V, f32))
         outs = []
         for i in range_constexpr(V):
-            # clamp: min(x, limit) == -max(-x, -limit) (fx has maximumf, not minimumf)
-            g = -((-gv[i]).maximumf(neg_limit))
-            u = (-((-uv[i]).maximumf(neg_limit))).maximumf(neg_limit)
-            # sigmoid(alpha*g) via exp2/rcp: 1/(1+exp2(g*-alpha*log2e)).
-            emu = fx.Float32(fx.rocdl.exp2(f32, (g * neg_alpha_log2e).ir_value()))
-            sig = fx.Float32(fx.rocdl.rcp(f32, (one + emu).ir_value()))
+            g, u = clamp_gate_up(gv[i], uv[i], neg_limit)
+            sig = sigmoid_f32(g, alpha=ALPHA)
             outs.append((g * sig * (u + one)).to(fx.BFloat16))
         of = fx.make_fragment_like(p_out)
         fx.memref_store_vec(fx.Vector.from_elements(outs, fx.BFloat16), of)

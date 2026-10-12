@@ -1,0 +1,744 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+"""Framework tuner for the opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a).
+
+Wired into the canonical :class:`GemmCommonTuner`, so it runs like the other
+aiter GEMM tuners: multi-GPU via ``mp_tuner``, standard ``-i/--untune_file`` /
+``-o/--tune_file`` CLI, batching, and the shared post-process / CSV writer.
+
+The candidate pool lives here (``_TUNE_POLICY``). Per kid it holds only the
+split-K factors to sweep; tile geometry, kernelName and the M alignment come from
+the codegen instance table, so a kid cannot be tuned on a shape its launcher
+rejects. That alignment used to be a second hand-maintained column and was wrong
+in both directions -- it hid kid326, which is really arbitrary-M, from every
+unaligned shape while the runtime dispatched it there anyway.
+
+Runtime schema (what the tuner emits, and what the runtime reads back):
+    gfx,b,m,n,k,w_scale_block,libtype,kernelId,splitK,us,kernelName,tflops,bw,errRatio
+``aiter/ops/opus/policy.py:lookup_mxscale_bmm_config`` indexes on
+``["gfx","b","m","n","k","w_scale_block"]`` (OPUS kernels read a 128x128
+w_scale, so every row this tuner writes is 128x128), dispatches to a backend
+on the winning row's ``libtype``, and the existing A8W8 caller passes ``kernelId`` / ``splitK`` to
+the batch-first ``opus_bmm`` entry, so
+those columns must match exactly.
+
+The shipped schema has no output-dtype key. This tuner deliberately measures
+the production BF16 route; FP32 production calls can execute the selected kid,
+but do not have an independently tuned winner in this CSV format.
+
+Verification (the part that catches column-transpose / scale defects):
+  * inputs are *signed* and have *per-128-K-block varied magnitude*
+    (``randn * 2**randint(-4,4)`` per block) so the e8m0 128-block scales span
+    many exponents. Uniform non-negative ``rand()/10`` data hides a pure output
+    column permutation (kid312/313 measured ~0.007 there but ~0.7-1.0 on real
+    signed data) -- see the opus_bmm.md root-cause note.
+  * reference is a dequantized fp32 einsum.
+  * output is allocated as contiguous ``[M,G,N]`` exactly like production and
+    passed to the batch-first public API through a transpose view. The existing
+    batch-first activation/scale storage is retained, matching the canonical
+    production transpose-view inputs.
+  * gate: ``mp_tuner`` runs ``checkAllclose(rtol=1e-2, atol=1e-2)`` and
+    ``post_process`` keeps the fastest candidate whose mismatch fraction is
+    ``<= --errRatio`` (default 0.02). A still-broken tileN COM_REP_N>1 kernel
+    measures ~0.5 here and is rejected; the fp8 e8m0 quant floor is ~1e-4.
+
+Usage (gfx950 only; the repo root must be on PYTHONPATH so the edited/rebuilt
+tree wins over any installed aiter):
+    cd <repo> && PYTHONPATH=$PWD \\
+        python3 csrc/opus_gemm/opus_bmm_mxscale_tune.py -g 16 -m 1,16,64 -n 1024 -k 4096
+
+    # tune shipped shapes not already present in the diffable output copy;
+    # add --all to force every shipped shape to be measured again:
+    ... opus_bmm_mxscale_tune.py
+
+    # overwrite the shipped tuned CSV in place (--apply implies --all):
+    ... opus_bmm_mxscale_tune.py --apply
+
+    # from an untuned CSV (columns: b,m,n,k -- or g,m,n,k), 8-way parallel:
+    ... opus_bmm_mxscale_tune.py -i my_untuned.csv -o /tmp/out.csv --mp 8
+"""
+
+import math
+import os
+import sys
+from typing import Any, ClassVar
+
+import pandas as pd
+import torch
+
+from aiter import dtypes, logger
+from aiter.ops.opus import opus_bmm
+from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
+from aiter.utility.mp_tuner import mp_tuner
+
+# Neither op_tests nor this directory is a package, so put both on sys.path. This
+# also has to hold in the spawned mp_tuner subprocesses, which re-import this
+# module top-to-bottom.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.abspath(os.path.join(_HERE, "..", ".."))
+_OPTESTS = os.path.join(_REPO, "op_tests")
+for _p in (_HERE, _OPTESTS):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+# opus_gemm_common is pure python (stdlib only), so importing the codegen kid
+# table here does not pull in the build.
+from opus_gemm_common import (
+    a8w8_mxscale_bmm_kernel_lists,
+    bmm_mxscale_global_kid,
+)
+from test_opus_a8w8_bmm import (
+    GROUP,
+    _quant_block_e8m0,
+    _quant_per_token_e8m0,
+    run_torch,
+)
+
+# kid -> OpusGemmInstance. Kids are disjoint across the BMM families today;
+# assert so a future collision (which the codegen dedups by launcher name
+# downstream) is caught here instead of silently tuning one of the two.
+_CODEGEN_BMM = {}
+for _fam in a8w8_mxscale_bmm_kernel_lists:
+    for _kid, _inst in _fam.items():
+        assert (
+            _kid not in _CODEGEN_BMM
+        ), f"bmm kid {_kid} collides across codegen families; disambiguate by name"
+        _CODEGEN_BMM[_kid] = _inst
+
+# Split-K sweep for the flatmm_splitk family. Small-M / few-tile shapes (the G16
+# wo_a decode: 16 batch * n1024 * k4096) underfill the CUs at splitK=1, so split-K
+# (fp32-workspace partials + fused reduce tail) can win by exposing parallelism
+# along K. The correctness gate drops any combo a kernel mishandles, so an
+# over-broad sweep is safe, just slower.
+_SK = [1, 2, 4, 8]
+
+# Tuning policy: kid -> splitK list. The ONLY hand-maintained per-kid metadata --
+# it decides which kids to sweep and with which split-K factors, not their
+# geometry and not their M alignment. Tile shape, kernelName and m_align all come
+# from the codegen instance, so this cannot drift from what compiles. kid 8000 (the
+# heuristic default) is intentionally not tuned.
+_TUNE_POLICY = {
+    # flatmm_splitk family: the M=16/32 last-mile tiles, the mid-M SFA/SFB-preload
+    # tiles and the 64x* tiles. All are split-K capable via the fused reduce tail,
+    # except kid646 whose persistent DIRECT_ONLY schedule requires splitK == 1.
+    8032: _SK,
+    8064: _SK,
+    8138: _SK,
+    8139: _SK,
+    8256: _SK,
+    8311: _SK,
+    8312: _SK,
+    8313: _SK,
+    8314: _SK,
+    8316: _SK,
+    8317: _SK,
+    8318: _SK,
+    8319: _SK,
+    8320: _SK,
+    8321: _SK,
+    8322: _SK,
+    8323: _SK,
+    8324: _SK,
+    8326: _SK,
+    8327: _SK,
+    8640: _SK,
+    8642: _SK,
+    8646: [1],
+    8650: _SK,
+    8653: _SK,
+    # fused single-tile launcher.
+    8100: [1],
+    # pipeline family; kid158 preloads both the per-token SFA and the block SFB
+    # panel into LDS.
+    8149: [1],
+    8150: [1],
+    8151: [1],
+    8152: [1],
+    8158: [1],
+    # monolithic mouter / wave pipelines.
+    8131: [1],
+    8132: [1],
+    8134: [1],
+    8142: [1],
+    8144: [1],
+    8148: [1],
+    8160: [1],
+    8161: [1],
+    # minterleave only exists in split-K form.
+    8162: [1],
+    8163: [1],
+    # 128x128x128 tiles, splitK=1 only and deliberately so. They are the largest
+    # BMM tile (COM_REP_M=4 x COM_REP_N=8 -> 32 C fragments, 128 fp32 C values per
+    # lane) at 512 VGPRs / occupancy 1. At splitK=1 they run the Cbf16
+    # direct-output kernel and are strong -- kid325 wins 5 shipped wo_a rows. At
+    # splitK>1 they switch to the Cvoid fp32-workspace kernel, which spills and has
+    # never won (g2/m256: best kid325 split-K is 23.6us against the 14.5us winner),
+    # and which is also where the clang-22 gfx950 greedy-VGPR miscompile lives (one
+    # C-fragment dword left unmaterialized under --amdgpu-mfma-vgpr-form).
+    8128: [1],
+    8137: [1],
+    8325: [1],
+}
+
+# Only non-direct flatmm split-K launchers are swept with splitK>1.
+# Any other family sweeping it is a policy bug, so fail loudly at import.
+for _kid, _sks in _TUNE_POLICY.items():
+    if any(s > 1 for s in _sks):
+        _tag = _CODEGEN_BMM[_kid].kernel_tag
+        assert (
+            _tag == "a8w8_mxscale_bmm_flatmm_splitk"
+            and not _CODEGEN_BMM[_kid].direct_only
+        ), f"kid {_kid} ({_tag}) is not split-K capable but sweeps {_sks}"
+
+
+def _applicable(kid, g, m, n, k):
+    """Split-K factors worth trying for this kid on this shape ([] == skip it)."""
+    k_inst = _CODEGEN_BMM[kid]
+    if n % k_inst.B_N or k % k_inst.B_K or m % k_inst.m_align:
+        return []
+    return _TUNE_POLICY[kid]
+
+
+SHIPPED_CSV = os.path.join(
+    _REPO,
+    "aiter",
+    "configs",
+    "model_configs",
+    "dsv4_batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
+)
+DEFAULT_OUT = os.path.join(_REPO, "dsv4_bmm_mxscale_retuned.csv")
+# The w_scale block every OPUS MXFP8 BMM kernel reads (a tuned-CSV key column).
+W_SCALE_BLOCK = "128x128"
+
+
+def _read_shape_csv(path):
+    """Read ``b/g,m,n,k`` shape rows with a clear schema error."""
+    try:
+        df = pd.read_csv(path)
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(f"MXFP8 BMM shape CSV does not exist: {path}") from exc
+
+    df.columns = [str(column).strip().lower() for column in df.columns]
+    bcol = "b" if "b" in df.columns else "g" if "g" in df.columns else None
+    required = {"m", "n", "k"}
+    missing = sorted(required.difference(df.columns))
+    if bcol is None or missing:
+        expected = "b,m,n,k (or g,m,n,k)"
+        raise ValueError(
+            f"MXFP8 BMM shape CSV {path!r} must contain {expected}; "
+            f"got columns {list(df.columns)}"
+        )
+    return [
+        (int(row[bcol]), int(row["m"]), int(row["n"]), int(row["k"]))
+        for _, row in df.iterrows()
+    ]
+
+
+def _validate_tune_shapes(shapes):
+    """Normalize, deduplicate and enforce the global MXFP8 BMM contract."""
+    valid = []
+    seen = set()
+    for raw_shape in shapes:
+        try:
+            g, m, n, k = map(int, raw_shape)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"MXFP8 BMM shape must be (G,M,N,K), got {raw_shape!r}"
+            ) from exc
+        shape = (g, m, n, k)
+        if min(shape) <= 0:
+            raise ValueError(
+                "MXFP8 BMM requires positive G, M, N and K; "
+                f"got G={g}, M={m}, N={n}, K={k}"
+            )
+        if n % GROUP or k % GROUP:
+            raise ValueError(
+                f"MXFP8 BMM requires N and K to be multiples of {GROUP}; "
+                f"got G={g}, M={m}, N={n}, K={k}"
+            )
+        if shape not in seen:
+            seen.add(shape)
+            valid.append(shape)
+    if not valid:
+        raise ValueError("no MXFP8 BMM shapes were provided for tuning")
+    return valid
+
+
+# ---------------------------------------------------------------------------
+# mp_tuner hooks (module-level so the spawn workers can import them by name).
+# ---------------------------------------------------------------------------
+def _gen_varied(shape, k, device):
+    """Signed, per-128-K-block varied-magnitude bf16 (mirrors _block_varied)."""
+    x = torch.randn(shape, dtype=dtypes.fp32, device=device)
+    amp = torch.exp2(torch.randint(-4, 4, (k // GROUP,), device=device).float())
+    return (x * amp.repeat_interleave(GROUP)).to(dtypes.bf16)
+
+
+def _workspace_numel(kernel_id, split_k, batch, m, n):
+    instance = _CODEGEN_BMM[int(kernel_id)]
+    if split_k <= 1 or instance.kernel_tag not in {
+        "a8w8_mxscale_bmm_flatmm_splitk",
+        "a8w8_mxscale_bmm_fused",
+    }:
+        return 0
+    tiles_m = (m + instance.B_M - 1) // instance.B_M
+    tiles_n = (n + instance.B_N - 1) // instance.B_N
+    partial_numel = split_k * batch * tiles_m * instance.B_M * tiles_n * instance.B_N
+    if instance.kernel_tag != "a8w8_mxscale_bmm_fused":
+        return partial_numel
+    counter_offset = (partial_numel * 4 + 255) & ~255
+    counter_bytes = batch * tiles_m * tiles_n * 4
+    return (counter_offset + counter_bytes + 3) // 4
+
+
+def gen_bmm_mxscale_data(
+    batch, m, n, k, seed, out_dtype, kernel_id, split_k, device="cuda"
+):
+    """Return the 7-tuple mp_tuner indexes into:
+
+    0 O_mx   [g,m,k]     fp8 batch-first contiguous input
+    1 W_mx   [g,n,k]     fp8 (batch-major)
+    2 Y       [m,g,n]     contiguous production-layout output buffer
+    3 xs_mx  [g,m,k/128] uint8 e8m0 batch-first contiguous scale
+    4 ws_mx  [g,n/128,k/128] uint8 e8m0 128x128-block scale
+    5 workspace optional caller-owned FP32 split-K buffer
+    6 ref     [m,g,n]     out_dtype dequant fp32 einsum reference
+    """
+    torch.manual_seed(seed)
+    O_bf16 = _gen_varied((batch, m, k), k, device)
+    W_bf16 = _gen_varied((batch, n, k), k, device)
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(O_bf16)
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(W_bf16)
+    Y = torch.empty((m, batch, n), dtype=out_dtype, device=device)
+
+    workspace_numel = _workspace_numel(kernel_id, split_k, batch, m, n)
+    workspace = (
+        torch.empty(workspace_numel, dtype=torch.float32, device=device)
+        if workspace_numel
+        else None
+    )
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1).to(out_dtype)
+    return (O_mx, W_mx, Y, xs_mx, ws_mx, workspace, ref)
+
+
+def run_bmm_mxscale_bench(O_mx, W_mx, Y, xs_mx, ws_mx, workspace, kernelId, splitK):
+    """Tuner bench func: run the kid in-place, return Y for checkAllclose."""
+    # Production owns contiguous token-major Y. Expose its batch-first view to
+    # the public API; the adapter transposes it back before the raw launch.
+    opus_bmm(
+        O_mx,
+        W_mx,
+        Y.transpose(0, 1),
+        kid=int(kernelId),
+        layout="mxscale_bmm",
+        x_scale=xs_mx,
+        w_scale=ws_mx,
+        split_k=int(splitK),
+        workspace=workspace,
+    )
+    return Y
+
+
+def _bmm_ref_passthrough(ref):
+    """ref_func: the fp32 reference is precomputed in gen_data (slot 6)."""
+    return ref
+
+
+# ---------------------------------------------------------------------------
+# Tuner
+# ---------------------------------------------------------------------------
+class OpusBmmMxscaleTuner(GemmCommonTuner):
+    ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
+        **GemmCommonTuner.ARG_DEFAULTS,
+        "tune_file": DEFAULT_OUT,
+        "untune_file": "",
+        # Fraction-of-mismatch (rtol=atol=1e-2) accept threshold. Correct kids
+        # sit at the ~1e-4 fp8 e8m0 quant floor; a column-transposed kid is ~0.5.
+        "errRatio": 0.02,
+        "batch": 100,
+        "config_env_name": "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE",
+    }
+
+    KEYS: ClassVar[list[str]] = ["gfx", "b", "m", "n", "k", "w_scale_block"]
+    RESULTS: ClassVar[list[str]] = [
+        "libtype",
+        "kernelId",
+        "splitK",
+        "us",
+        "kernelName",
+        "tflops",
+        "bw",
+        "errRatio",
+    ]
+
+    def __init__(self):
+        # Bypass GemmCommonTuner.__init__ (it force-swaps "M"/"N" in the key,
+        # which assumes the uppercase gptoss schema). Go straight to the
+        # grandparent with our lowercase batched schema.
+        TunerCommon.__init__(
+            self,
+            "OpusBmmMxscaleTuner",
+            self.KEYS,
+            self.RESULTS,
+            description="Tune opus fp8 e8m0 mxscale flatmm split-K BMM (DSV4 wo_a)",
+        )
+        # sort N before M like the GEMM tuners (cosmetic ordering of the CSV).
+        self.sort_keys = ["gfx", "b", "n", "m", "k", "w_scale_block"]
+
+    # --- schema helpers -----------------------------------------------------
+    def getKernelName(self, kernelId):
+        k_inst = _CODEGEN_BMM.get(int(kernelId))
+        return k_inst.name if k_inst else None
+
+    def calculate(self, results, bpes=None):
+        info, time, _err = results
+        if time == self.INVALID_TIME:
+            return 0, 0
+        _gfx, b, m, n, k, _w_scale_block = info[0]
+        us_s = time * 1e-6
+        tflops = round(2 * b * m * n * k / us_s / 1e12, 1)
+        # fp8 A + fp8 W + bf16 out.
+        bw = round((b * m * k + b * n * k + 2 * b * m * n) / us_s / 1e9, 2)
+        return tflops, bw
+
+    def result_to_df(self, results):
+        rows = []
+        for info, time, err in results:
+            keys, kernelId, splitK, kernelName = info
+            resolved = kernelName or self.getKernelName(kernelId)
+            tflops, bw = self.calculate((info, time, err))
+            row = dict(zip(self.keys, keys))
+            row.update(
+                {
+                    "libtype": "opus",
+                    "kernelId": int(kernelId),
+                    "splitK": int(splitK),
+                    "us": time,
+                    "kernelName": "None" if resolved is None else str(resolved),
+                    "tflops": tflops,
+                    "bw": bw,
+                    "errRatio": err,
+                }
+            )
+            rows.append(row)
+        return pd.DataFrame(rows, columns=self.columns)
+
+    # --- CLI ----------------------------------------------------------------
+    def _setup_specific_arguments(self):
+        # Free the base "-k/--splitK" store_true so we can reuse -k for the K dim.
+        for action in list(self.parser._actions):
+            if "-k" in action.option_strings or "--splitK" in action.option_strings:
+                self.parser._actions.remove(action)
+                for s in action.option_strings:
+                    self.parser._option_string_actions.pop(s, None)
+                for grp in self.parser._action_groups:
+                    if action in grp._group_actions:
+                        grp._group_actions.remove(action)
+                break
+
+        def _intlist(s):
+            return [int(x) for x in str(s).split(",") if x != ""]
+
+        self.parser.add_argument(
+            "-g",
+            "--batch_g",
+            type=_intlist,
+            default=None,
+            help="comma list of batch g (e.g. 2,8,16)",
+        )
+        self.parser.add_argument(
+            "-m",
+            "--M",
+            type=_intlist,
+            default=None,
+            help="comma list of M (e.g. 1,16,64)",
+        )
+        self.parser.add_argument(
+            "-n",
+            "--N",
+            type=_intlist,
+            default=[1024],
+            help="comma list of N (default 1024)",
+        )
+        self.parser.add_argument(
+            "-k",
+            "--K",
+            type=_intlist,
+            default=[4096],
+            help="comma list of K (default 4096)",
+        )
+        self.parser.add_argument(
+            "--apply",
+            action="store_true",
+            default=False,
+            help="overwrite the shipped tuned CSV in place (implies --all)",
+        )
+
+    # --- shape sourcing -----------------------------------------------------
+    def _shapes_from_shipped(self):
+        return sorted(set(_read_shape_csv(SHIPPED_CSV)))
+
+    def pre_process(self, args):
+        if args.apply:
+            args.tune_file = SHIPPED_CSV
+            # Reading and writing the shipped CSV otherwise makes every source
+            # shape look already tuned and silently produces zero tasks.
+            args.all = True
+
+        gfx = self.get_gfx()
+        if gfx != "gfx950":
+            raise RuntimeError(f"MXFP8 BMM tuning is gfx950-only; detected {gfx!r}")
+
+        manual_g = args.batch_g is not None
+        manual_m = args.M is not None
+        if manual_g != manual_m:
+            raise ValueError("-g/--batch_g and -m/--M must be provided together")
+
+        if manual_g:
+            shapes = [
+                (g, m, n, k)
+                for g in args.batch_g
+                for m in args.M
+                for n in args.N
+                for k in args.K
+            ]
+        elif args.untune_file:
+            shapes = _read_shape_csv(args.untune_file)
+        else:
+            logger.info(
+                "no -g/-m and no untune_file; re-tuning shapes from %s", SHIPPED_CSV
+            )
+            shapes = self._shapes_from_shipped()
+        shapes = _validate_tune_shapes(shapes)
+
+        self.untunedf = pd.DataFrame(
+            [
+                {
+                    "gfx": gfx,
+                    "b": g,
+                    "m": m,
+                    "n": n,
+                    "k": k,
+                    "w_scale_block": W_SCALE_BLOCK,
+                }
+                for (g, m, n, k) in shapes
+            ],
+            columns=self.keys,
+        )
+        self.tunedf = self.get_tuned_gemm_list(args.tune_file)
+        if len(self.tunedf) and "w_scale_block" not in self.tunedf.columns:
+            # A tuned CSV from before the column holds only OPUS 128x128 rows.
+            self.tunedf = self.tunedf.assign(w_scale_block=W_SCALE_BLOCK)
+
+        # Skip shapes already present in the tuned CSV (unless --all forces retune).
+        if not args.all and len(self.tunedf) and len(self.untunedf):
+            td = self.tunedf
+            if "gfx" not in td.columns:
+                td = td.assign(gfx=gfx)
+            have = set(td[self.keys].apply(lambda r: tuple(r), axis=1).tolist())
+            mask = self.untunedf.apply(lambda r: tuple(r) in have, axis=1)
+            if args.verbose and mask.any():
+                logger.info("skipping %d already-tuned shapes", int(mask.sum()))
+            self.untunedf = self.untunedf[~mask].reset_index(drop=True)
+
+    # --- saved exact-kid benchmark ------------------------------------------
+    def _clear_op_caches(self):
+        from aiter.ops import batched_gemm_op_a8w8
+        from aiter.ops.opus import policy
+
+        policy._load_mxscale_bmm_tuned.cache_clear()
+        policy.lookup_mxscale_bmm_config.cache_clear()
+        batched_gemm_op_a8w8._get_mxscale_bmm_launch_plan.cache_clear()
+
+    def run_config(self, args):
+        from aiter.test_common import checkAllclose, run_perftest
+
+        required = {"libtype", "kernelId", "splitK"}
+        missing = required.difference(self.untunedf.columns)
+        if missing:
+            if missing == required:
+                return self._run_default_config(args)
+            raise ValueError(
+                f"--run_config requires a tuned CSV with {sorted(missing)}"
+            )
+
+        results = []
+        for seed, (_, row) in enumerate(self.untunedf.iterrows(), start=1):
+            b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+            if str(row["libtype"]).strip().lower() != "opus":
+                raise ValueError(
+                    "MXFP8 BMM --run_config only supports libtype=opus; "
+                    f"got {row['libtype']!r} for B={b}, M={m}, N={n}, K={k}"
+                )
+
+            saved_kid = int(row["kernelId"])
+            kernel_id = saved_kid
+            if kernel_id not in _CODEGEN_BMM:
+                legacy_global_kid = bmm_mxscale_global_kid(saved_kid)
+                if legacy_global_kid in _CODEGEN_BMM:
+                    kernel_id = legacy_global_kid
+            if kernel_id not in _CODEGEN_BMM:
+                raise ValueError(
+                    f"saved MXFP8 BMM kid {saved_kid} is not registered on gfx950"
+                )
+
+            split_k = int(row["splitK"])
+            if split_k not in _applicable(kernel_id, b, m, n, k):
+                raise ValueError(
+                    f"saved MXFP8 BMM kid {saved_kid} (global {kernel_id}) with "
+                    f"splitK={split_k} is incompatible with "
+                    f"B={b}, M={m}, N={n}, K={k}"
+                )
+
+            shape_str = f"B={b},M={m},N={n},K={k},kid={kernel_id},splitK={split_k}"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            data = gen_bmm_mxscale_data(
+                b,
+                m,
+                n,
+                k,
+                seed,
+                dtypes.bf16,
+                kernel_id,
+                split_k,
+            )
+            data[2].fill_(float("nan"))
+            out, us = run_perftest(
+                run_bmm_mxscale_bench,
+                *data[:6],
+                kernel_id,
+                split_k,
+                num_warmup=args.warmup,
+                num_iters=args.iters,
+            )
+            err_ratio = checkAllclose(
+                out,
+                data[6],
+                rtol=1e-2,
+                atol=1e-2,
+                tol_err_ratio=allowed,
+                msg=f"run_config {shape_str}",
+                printLog=args.verbose,
+            )
+            if (
+                not math.isfinite(us)
+                or us <= 0
+                or not math.isfinite(err_ratio)
+                or err_ratio > allowed
+            ):
+                raise RuntimeError(
+                    f"saved MXFP8 BMM kid {kernel_id} failed: "
+                    f"us={us}, errRatio={err_ratio} (>{allowed_desc})"
+                )
+            results.append({"shape": shape_str, "e2e_us": us, "status": "ok"})
+        return results
+
+    def _run_default_config(self, args):
+        """Keep shape-only ``--run_config``/``--compare`` on production policy."""
+        from aiter.ops.batched_gemm_op_a8w8 import batched_gemm_a8w8_mxscale
+        from aiter.test_common import checkAllclose, run_perftest
+
+        results = []
+        for seed, (_, row) in enumerate(self.untunedf.iterrows(), start=1):
+            b, m, n, k = (int(row[name]) for name in ("b", "m", "n", "k"))
+            shape_str = f"({b}, {m}, {n}, {k})"
+            allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
+            try:
+                O_mx, W_mx, _Y, xs_mx, ws_mx, _workspace, ref = gen_bmm_mxscale_data(
+                    b,
+                    m,
+                    n,
+                    k,
+                    seed,
+                    dtypes.bf16,
+                    8000,
+                    1,
+                )
+                out, us = run_perftest(
+                    batched_gemm_a8w8_mxscale,
+                    O_mx.transpose(0, 1),
+                    W_mx,
+                    xs_mx.transpose(0, 1),
+                    ws_mx,
+                    dtype=dtypes.bf16,
+                    num_warmup=args.warmup,
+                    num_iters=args.iters,
+                )
+                err_ratio = checkAllclose(
+                    out,
+                    ref,
+                    rtol=1e-2,
+                    atol=1e-2,
+                    msg=f"run_config {shape_str}",
+                )
+                status = (
+                    "ok"
+                    if err_ratio <= allowed
+                    else f"mismatch:err_ratio={err_ratio:.6g}(>{allowed_desc})"
+                )
+                results.append({"shape": shape_str, "e2e_us": us, "status": status})
+            except Exception as exc:  # noqa: BLE001
+                results.append(
+                    {"shape": shape_str, "e2e_us": -1, "status": f"error:{exc}"}
+                )
+        return results
+
+    # --- tuning -------------------------------------------------------------
+    def tune(self, untunedf, tunedf, args):
+        gfx = self.get_gfx()
+        out_dtype = dtypes.bf16
+        perf_kwargs = {"num_warmup": args.warmup, "num_iters": args.iters}
+
+        task = []
+        tasks_data = []
+        for seed, i in enumerate(range(len(untunedf)), start=1):
+            b = int(untunedf.loc[i, "b"])
+            m = int(untunedf.loc[i, "m"])
+            n = int(untunedf.loc[i, "n"])
+            k = int(untunedf.loc[i, "k"])
+            info_keys = (gfx, b, m, n, k, W_SCALE_BLOCK)
+
+            n_cand = 0
+            for kid in _TUNE_POLICY:
+                for sk in _applicable(kid, b, m, n, k):
+                    info = (info_keys, kid, sk, "")
+                    task.append(
+                        (
+                            info,
+                            gen_bmm_mxscale_data,
+                            (b, m, n, k, seed, out_dtype, kid, sk),
+                            run_bmm_mxscale_bench,
+                            ([0, 1, 2, 3, 4, 5], kid, sk),
+                            perf_kwargs,
+                            _bmm_ref_passthrough,
+                            ([6],),
+                            {},
+                            None,
+                            1e-2,  # rtol
+                            1e-2,  # atol
+                            None,  # compare_fn
+                            None,  # max_abs_delta
+                            [2],  # output_keys: NaN-init Y to catch partial writes
+                        )
+                    )
+                    n_cand += 1
+            tasks_data.append((n_cand, ()))
+
+        if not task:
+            return []
+        return mp_tuner(
+            task,
+            tasks_data,
+            args.mp,
+            False,
+            args.shape_grouped,
+            args.errRatio,
+            timeout=args.timeout,
+            verbose=args.verbose,
+        )
+
+
+if __name__ == "__main__":
+    tuner = OpusBmmMxscaleTuner()
+    _args = tuner.parse_args()
+    tuner.run(_args, False)

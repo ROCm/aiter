@@ -1,29 +1,30 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Tune spaces for every FlyDSL a8w8 (ptpc) bpreshuffle pipeline on CDNA.
+
+One operator, two pipelines, swept together under the same ``flydsl`` libtype so
+a single ``--libtype flydsl`` run picks one winner per shape:
+
+* ``preshuffle`` -- 4-wave MFMA, gfx942 + gfx950, fp8 or int8 weights.
+* ``8wave``      -- 8-wave CDNA4 ``MFMA_Scale``, gfx950 only, fp8 only.
+
+Each exposes the same pair -- a ``{kernelId: instance}`` table and a
+``fits(ki, M, N, K)`` predicate -- and both are listed in :data:`PIPELINES`, so
+the tuner iterates instead of carrying one hand-written branch per pipeline.
+Runners stay on the tuner side: this module must remain importable without
+flydsl (the tuner reads it to name candidates on hosts that cannot compile).
+
+The gfx1250 WMMA pipeline has its own file and is not part of PIPELINES yet.
+"""
+
 import math
-import os
+from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cache
+from typing import Any
 
-from aiter.ops.flydsl.utils import (
-    addressable_lds_bytes_for_gfx as _addressable_lds_bytes_for_gfx,
-)
-from aiter.ops.flydsl.utils import (
-    get_shared_memory_per_block,
-)
-
-
-def get_gfx():
-    """Detect GPU arch: honour GPU_ARCHS env, fall back to chip_info, default gfx942."""
-    env = os.environ.get("GPU_ARCHS", "")
-    if env and env != "native":
-        return env.split(";")[-1].strip()
-    try:
-        from aiter.jit.utils.chip_info import get_gfx as _get_gfx
-
-        return _get_gfx()
-    except Exception:  # noqa: BLE001
-        return "gfx942"
-
+from aiter.jit.utils.chip_info import get_gfx, get_lds_capacity_bytes
 
 _DTYPE_SHORT = {
     "fp8": "F8",
@@ -46,6 +47,7 @@ class kernelInstance:
     xcd_swizzle: int  # 0=off, >0=group size for XCD remap
     lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
     sScheduler: str = "Default"  # scheduler hints on; "Off" = compiler default
+    k_split: int = 1  # >1 splits the K loop over gridDim.z (fp32 workspace + reduce)
 
     @property
     def enable_scheduler(self) -> bool:
@@ -78,6 +80,7 @@ class kernelInstance:
                 ),
                 self.sScheduler.lower(),
             ]
+            + ([f"ks{self.k_split}"] if self.k_split > 1 else [])
         )
 
 
@@ -93,6 +96,7 @@ def _ki(
     q_dtype_w="fp8",
     dtype="bf16",
     scheduler="Default",
+    k_split=1,
 ):
     return kernelInstance(
         tile_m,
@@ -106,6 +110,7 @@ def _ki(
         xcd_swizzle,
         lds_stage,
         scheduler,
+        k_split,
     )
 
 
@@ -160,13 +165,65 @@ def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
     )
 
 
-def addressable_lds_bytes_for_gfx(gfx: str) -> int:
-    return _addressable_lds_bytes_for_gfx(gfx)
-
-
+@cache
 def max_lds_bytes_for_tune() -> int:
-    """Addressable LDS limit for current target."""
-    return get_shared_memory_per_block(fallback_gfx=get_gfx())
+    """Addressable LDS limit for current target.
+
+    Cached because ``kernel_fits_shape`` calls it per candidate (thousands of
+    times per shape). The arch is resolved once at import below, so a
+    process-lifetime cache changes nothing.
+    """
+    return get_lds_capacity_bytes(get_gfx())
+
+
+def _padded_m(M: int) -> int:
+    """Round M up to the bucket the tuner tunes at.
+
+    Moved verbatim from ``GemmA8W8BpreShuffleTuner`` (was ``_get_padded_m``); it
+    had no other caller there.
+    """
+    if M <= 256:
+        return (M + 15) // 16 * 16
+    elif M <= 1024:
+        return (M + 31) // 32 * 32
+    elif M <= 4096:
+        return (M + 63) // 64 * 64
+    else:
+        return (M + 127) // 128 * 128
+
+
+def kernel_fits_shape(ki: kernelInstance, M: int, N: int, K: int) -> bool:
+    """Whether a preshuffle candidate is worth tuning for this shape.
+
+    Ragged M is legal: the device kernel bounds A, scale-A, and C buffer
+    descriptors to the runtime M extent and masks overhanging rows. Ragged N is
+    legal for non-split kernels when N remains a multiple of the 16-column
+    preshuffle group. K remains a tile-divisibility requirement. Changes here
+    alter the tuner search space and therefore require affected model shapes to
+    be re-tuned.
+    """
+    if kernel_instance_estimated_lds_bytes(ki) > max_lds_bytes_for_tune():
+        return False
+    if N % 16 != 0 or K % ki.tile_k != 0:
+        return False
+    if N % ki.tile_n != 0 and ki.k_split > 1:
+        return False
+    if ki.k_split > 1 and (K // ki.tile_k) % ki.k_split != 0:
+        return False
+    # Preserve the bounded decode search space. Ragged-M candidates target the
+    # large-M wave-quantization cliffs where tile-row waste is small.
+    if M < 2048 and _padded_m(M) % ki.tile_m != 0:
+        return False
+    num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * ((N + ki.tile_n - 1) // ki.tile_n)
+    if num_ctas < max(4, min(16, N // 64)):
+        return False
+    if ki.tile_m == 16 and ki.tile_n == 512:
+        return False
+    if M >= 8192 and ki.tile_m < 64:
+        return False
+    if M >= 4096 and ki.tile_m < 32:
+        return False
+    return not (M >= 2048 and ki.tile_m == 16 and ki.tile_n <= 128)
 
 
 # fmt: off
@@ -218,6 +275,13 @@ _base_tiles_950_extra = [
     (256, 256, 128),
 ]
 
+_base_tiles_950_2wave = [
+    (16, 32, 512),
+    (32, 32, 512),
+    (16, 32, 1024),
+    (32, 32, 1024),
+]
+
 # ---------------------------------------------------------------------------
 # Combo sweep: lds_stage x waves_per_eu x async_copy x xcd_swizzle
 # ---------------------------------------------------------------------------
@@ -239,34 +303,84 @@ def _vgpr_per_simd(gfx: str) -> int:
 
 _MFMA_M = 16
 _MFMA_N = 16
-_THREADS_PER_TG = _WAVES_PER_WG * 64
 
 
-def _estimate_max_wpe(tile_m: int, tile_n: int, total_vgpr: int = 512) -> int:
+def _estimate_max_wpe(
+    tile_m: int, tile_n: int, tile_k: int, total_vgpr: int = 512
+) -> int:
     """Estimate max achievable waves_per_eu from C-accumulator VGPR pressure.
 
     Preshuffle GEMM always uses 16x16 MFMA (4 VGPRs per thread per block).
-    Per-thread accum VGPRs = round_up(tile_m, 16) * round_up(tile_n, 16) / 256.
+    Per-thread accum VGPRs divide by the actual workgroup size: tile_n=32 uses
+    two waves (128 threads), while the standard path uses four (256 threads).
     Estimated total ~= accum * 1.5 (pipeline overhead for A/B buffers).
     Returns the max waves_per_eu that the register file can support.
     """
     padded_m = math.ceil(tile_m / _MFMA_M) * _MFMA_M
     padded_n = math.ceil(tile_n / _MFMA_N) * _MFMA_N
-    c_per_thread = padded_m * padded_n // _THREADS_PER_TG
+    threads_per_tg = (2 if tile_n == 32 else _WAVES_PER_WG) * 64
+    c_per_thread = padded_m * padded_n // threads_per_tg
+    if tile_n == 32 and tile_k >= 1024:
+        # The 2-wave K=1024 path keeps two A-side and two B-side fragments
+        # live. Model those operands explicitly so wpe=3/4 candidates that
+        # must spill are pruned before compilation.
+        operand_vgpr = (
+            2 * (tile_m + tile_n) * tile_k // threads_per_tg // 4
+        )
+        est_per_wave = operand_vgpr + c_per_thread * 1.5 + 32
+        return int(total_vgpr / max(est_per_wave, 1))
     est_per_wave = c_per_thread * 1.5
     return int(total_vgpr / max(est_per_wave, 1))
 
 
-def _build_kernels_list(tiles, total_vgpr=512):
+# Legal values are the divisors of K//tile_k, which is shape-dependent, so they
+# are enumerated rather than hardcoded.
+K_SPLIT_MIN_TILES_PER_SLICE = 2  # keep the ping-pong loop fed
+K_SPLIT_MAX_CTA_OVERSUBSCRIBE = 4  # no point going far past one CU each
+# Mirrors gemm_kernels.PRESHUFFLE_SPLIT_K_WORKSPACE_ELEMS without importing
+# the runtime launcher (which would create a tune-space import cycle).
+K_SPLIT_WORKSPACE_ELEMS = 4 * 256 * 32 * 128
+
+
+def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[int]:
+    """Split-K values worth benchmarking; 1 is excluded, the caller has it.
+
+    Empty once the tile grid already fills the GPU -- splitting would only add
+    the reduce pass. That bound also caps the fp32 workspace, since for a given
+    tile grid it caps M.
+    """
+    if ki.k_split != 1 or K % ki.tile_k:
+        return []
+    if N % ki.tile_n:
+        return []
+    base_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * (
+        (N + ki.tile_n - 1) // ki.tile_n
+    )
+    if base_ctas >= cu_num:
+        return []
+    n_tiles = K // ki.tile_k
+    max_split = min(
+        n_tiles // K_SPLIT_MIN_TILES_PER_SLICE,
+        max(2, cu_num * K_SPLIT_MAX_CTA_OVERSUBSCRIBE // base_ctas),
+        K_SPLIT_WORKSPACE_ELEMS // (M * N),
+    )
+    if max_split < 2:
+        return []
+    return [d for d in range(2, max_split + 1) if n_tiles % d == 0]
+
+
+def _build_kernels_list(tiles, total_vgpr=512, start_idx=0):
     kl = {}
-    idx = 0
+    idx = start_idx
 
     for lds in _LDS_STAGES:
         for wpe in _WAVES_PER_EU:
             for acp in _ASYNC_COPY_VALS:
                 for xcd in _XCD_SWIZZLE_VALS:
                     for tm, tn, tk in tiles:
-                        if wpe > 0 and wpe > _estimate_max_wpe(tm, tn, total_vgpr):
+                        if wpe > 0 and wpe > _estimate_max_wpe(
+                            tm, tn, tk, total_vgpr
+                        ):
                             continue
                         kl[idx] = _ki(tm, tn, tk, acp, wpe, xcd, lds_stage=lds)
                         idx += 1
@@ -279,6 +393,13 @@ kernels_list_942 = _build_kernels_list(
 kernels_list_950 = _build_kernels_list(
     _base_tiles_common + _base_tiles_950_extra,
     total_vgpr=_vgpr_per_simd("gfx950"))
+kernels_list_950.update(
+    _build_kernels_list(
+        _base_tiles_950_2wave,
+        total_vgpr=_vgpr_per_simd("gfx950"),
+        start_idx=max(kernels_list_950) + 1,
+    )
+)
 # fmt: on
 
 default_kernels_dict_942 = {
@@ -305,3 +426,139 @@ if arch == "gfx942":
 else:
     kernels_list = kernels_list_950
     default_kernels_dict = default_kernels_dict_950
+
+
+# ===========================================================================
+# Pipeline 2: 8wave (CDNA4 MFMA_Scale), gfx950 only
+# ===========================================================================
+
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    BLOCK_K as BLOCK_K_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    MIN_K as MIN_K_8WAVE,
+)
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
+    lds_bytes as _lds_bytes_8wave,
+)
+
+NAME_PREFIX_8WAVE = "flydsl_bpreshuffle_8w"
+
+# 8wave ids share the ``flydsl`` libtype with the preshuffle pipeline and can
+# co-occur on the same arch, so they are offset out of that pipeline's dense
+# 0-based range. Routing is by Pipeline, not by id range -- the offset only
+# keeps CSV rows unambiguous to a human.
+KERNEL_ID_BASE_8WAVE = 1_000_000
+
+LDS_BYTES_8WAVE = get_lds_capacity_bytes(get_gfx())
+_I32_MAX = 2**31
+
+_TILES_8WAVE = ((128, 256), (128, 512), (256, 256))
+# The kernel always emits the rocdl.waves_per_eu attribute, so 0 ("no hint",
+# as used by the preshuffle pipeline) is not expressible here.
+_WAVES_PER_EU_8WAVE = (1, 2, 3, 4)
+_XCD_SWIZZLE_VALS_8WAVE = (0, 4, 8)
+
+
+@dataclass
+class EightWaveKernelInstance:
+    block_m: int
+    block_n: int
+    waves_per_eu: int
+    xcd_swizzle: int
+    q_dtype_a: str = "fp8"
+    q_dtype_w: str = "fp8"
+    dtype: str = "bf16"
+
+    @property
+    def name(self) -> str:
+        return (
+            f"{NAME_PREFIX_8WAVE}_{self.block_m}x{self.block_n}x{BLOCK_K_8WAVE}_"
+            f"F8_F8_B16_{self.waves_per_eu}x{self.xcd_swizzle}"
+        )
+
+
+def kernel_instance_estimated_lds_bytes_8wave(ki: EightWaveKernelInstance) -> int:
+    """Exact (not estimated) LDS footprint for a candidate."""
+    return _lds_bytes_8wave(ki.block_m, ki.block_n)
+
+
+def kernel_fits_shape_8wave(
+    ki: EightWaveKernelInstance, M: int, N: int, K: int
+) -> bool:
+    """Whether a candidate can run this shape at all.
+
+    Deliberately does NOT require ``M % block_m == 0`` or ``N % block_n == 0``:
+    the 8-wave kernel handles ragged M and N through its buffer descriptors and
+    an explicit column guard, and the best tile for e.g. M=11256 is ragged.
+    """
+    if M <= 0 or N <= 0 or K <= 0:
+        return False
+    if K % BLOCK_K_8WAVE != 0 or K < MIN_K_8WAVE:
+        return False
+    # shuffle_weight(layout=(16, 16)) precondition, and the kernel's B swizzle
+    # addresses B in 16-row groups.
+    if N % 16 != 0:
+        return False
+    if kernel_instance_estimated_lds_bytes_8wave(ki) > LDS_BYTES_8WAVE:
+        return False
+    # Buffer descriptors index in 32 bits; C is bf16 so its byte count doubles.
+    return not (M * N * 2 >= _I32_MAX or M * K >= _I32_MAX or N * K >= _I32_MAX)
+
+
+def is_8wave_enabled() -> bool:
+    """8wave candidates are gfx950-only (the MMA atom is CDNA4).
+
+    No env kill switch on purpose: this gates the tuner's candidate list only,
+    so it could not stop a tuned CSV row from running 8wave in production --
+    ``gemm_a8w8_bpreshuffle_flydsl`` dispatches on the kernelName prefix alone.
+    To exclude the pipeline, drop its rows from the tuned CSV.
+    """
+    return get_gfx().startswith("gfx950")
+
+
+def _build_kernels_list_8wave() -> dict[int, EightWaveKernelInstance]:
+    kl: dict[int, EightWaveKernelInstance] = {}
+    idx = KERNEL_ID_BASE_8WAVE
+    for block_m, block_n in _TILES_8WAVE:
+        if _lds_bytes_8wave(block_m, block_n) > LDS_BYTES_8WAVE:
+            continue
+        for wpe in _WAVES_PER_EU_8WAVE:
+            for xcd in _XCD_SWIZZLE_VALS_8WAVE:
+                kl[idx] = EightWaveKernelInstance(block_m, block_n, wpe, xcd)
+                idx += 1
+    return kl
+
+
+kernels_list_8wave: dict[int, EightWaveKernelInstance] = (
+    _build_kernels_list_8wave() if is_8wave_enabled() else {}
+)
+
+
+# ===========================================================================
+# The protocol the tuner iterates
+# ===========================================================================
+
+
+@dataclass(frozen=True)
+class Pipeline:
+    """One tunable backend of the a8w8 bpreshuffle operator.
+
+    ``q_dtypes_w`` is spelled with plain strings rather than ``torch.dtype`` so
+    this module stays importable without torch/flydsl; the tuner maps its
+    ``dtypes.fp8`` / ``dtypes.i8`` onto these names.
+    """
+
+    name: str
+    kernels_list: dict[int, Any]
+    fits: Callable[[Any, int, int, int], bool]
+    q_dtypes_w: tuple[str, ...]
+
+
+# Order is load-bearing: it is the order candidates are emitted per shape, and
+# preshuffle-before-8wave matches what the tuner produced before PIPELINES
+# existed.
+PIPELINES: tuple[Pipeline, ...] = (
+    Pipeline("preshuffle", kernels_list, kernel_fits_shape, ("fp8", "int8")),
+    Pipeline("8wave", kernels_list_8wave, kernel_fits_shape_8wave, ("fp8",)),
+)

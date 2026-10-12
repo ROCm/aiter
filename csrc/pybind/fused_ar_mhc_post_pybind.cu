@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2025-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-#include <torch/extension.h>
 #include "aiter_stream.h"
 #include "fused_ar_mhc_post.h"
 #include "rocm_ops.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND;
     m.def("fused_allreduce_mhc_post_only",

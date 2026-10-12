@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# Copyright (c) 2025 FlyDSL Project Contributors
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
 """Ordinary MoE facades for the shared MXFP4/FP8 kernel builders."""
 
@@ -41,8 +41,6 @@ def compile_mixed_moe_gemm1(
     b_dtype: str = "fp4",
     out_dtype: str = "f16",
     act: str = "silu",
-    situ_beta: float = 1.0,
-    situ_linear_beta: float = 1.0,
     use_cshuffle_epilog: bool | None = None,
     enable_bias: bool = False,
     model_dim_pad: int = 0,
@@ -72,8 +70,6 @@ def compile_mixed_moe_gemm1(
         b_dtype=b_dtype,
         out_dtype=out_dtype,
         act=act,
-        situ_beta=situ_beta,
-        situ_linear_beta=situ_linear_beta,
         use_cshuffle_epilog=use_cshuffle_epilog,
         enable_bias=enable_bias,
         model_dim_pad=model_dim_pad,
@@ -117,6 +113,7 @@ def compile_mixed_moe_gemm2(
     cu_num_mul: int = 1,
     b_nt: int = 0,
     xcd_swizzle: int = 0,
+    use_global_a: bool = True,
 ):
     """Compile an ordinary stage2 MoE kernel."""
     return compile_mixed_moe_gemm2_common(
@@ -140,6 +137,7 @@ def compile_mixed_moe_gemm2(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=use_global_a,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,

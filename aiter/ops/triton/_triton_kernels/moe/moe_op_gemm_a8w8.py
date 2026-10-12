@@ -7,6 +7,7 @@ import triton.language as tl
 
 from aiter.ops.triton._triton_kernels.moe.activations import _swiglu
 from aiter.ops.triton._triton_kernels.moe.quant_moe import _compute_static_fp8_quant
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
 
 
@@ -104,7 +105,27 @@ def unswizzle_mx_scale_cdna4(
     return x
 
 
-@triton.jit(launch_metadata=matmul_launch_metadata)
+_moe_gemm_a8w8_repr = make_kernel_repr(
+    "_moe_gemm_a8w8",
+    [
+        "BLOCK_M",
+        "BLOCK_N",
+        "BLOCK_K",
+        "GROUP_M",
+        "SPLIT_K",
+        "XCD_SWIZZLE",
+        "EVEN_K",
+        "SWIZZLE_MX_SCALE",
+        "W_CACHE_MODIFIER",
+        "N_EXPTS_ACT",
+        "APPLY_SWIGLU",
+        "SWIGLU_ADD_RESIDUAL",
+        "USE_FNUZ",
+    ],
+)
+
+
+@triton.jit(repr=_moe_gemm_a8w8_repr, launch_metadata=matmul_launch_metadata)
 def _moe_gemm_a8w8(
     Y,
     stride_y_k,
@@ -127,6 +148,8 @@ def _moe_gemm_a8w8(
     X_static_scale,
     W_static_scale,
     Quant_static_scale,
+    X_token_scale,
+    W_expt_scale,
     B,
     stride_b_e,  # Bias
     Gammas,
@@ -162,6 +185,9 @@ def _moe_gemm_a8w8(
     SPLIT_K: tl.constexpr,
     W_CACHE_MODIFIER: tl.constexpr,
     UPCAST_INDICES: tl.constexpr = False,
+    # Use fnuz FP8 (float8_e4m3fnuz / gfx942) instead of OCP FP8 (float8e4nv / gfx950).
+    # When True, replaces tl.dot_scaled with manual E8M0→fp32 dequant + tl.dot.
+    USE_FNUZ: tl.constexpr = False,
 ):
     tl.assume(stride_y_k >= 0)
     tl.assume(stride_y_m >= 0)
@@ -191,7 +217,10 @@ def _moe_gemm_a8w8(
     MX_PACK_DIVISOR: tl.constexpr = 32
     w_type: tl.constexpr = W.dtype.element_ty
     if is_w_microscaled:
-        tl.static_assert(w_type == tl.float8e4nv, "mx_weight_ptr must be float8e4nv")
+        tl.static_assert(
+            w_type == tl.float8e4nv or (USE_FNUZ and w_type == tl.float8e4b8),
+            "mx_weight_ptr must be float8e4nv (OCP) or float8e4b8/fnuz when USE_FNUZ=True",
+        )
         tl.static_assert(
             WMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
         )
@@ -201,7 +230,10 @@ def _moe_gemm_a8w8(
         )
     x_type: tl.constexpr = X.dtype.element_ty
     if is_x_microscaled:
-        tl.static_assert(x_type == tl.float8e4nv, "mx_act_ptr must be float8e4nv")
+        tl.static_assert(
+            x_type == tl.float8e4nv or (USE_FNUZ and x_type == tl.float8e4b8),
+            "mx_act_ptr must be float8e4nv (OCP) or float8e4b8/fnuz when USE_FNUZ=True",
+        )
         tl.static_assert(
             XMxScale.dtype.element_ty == tl.uint8, "mx_scale_ptr must be uint8"
         )
@@ -258,6 +290,11 @@ def _moe_gemm_a8w8(
         GatherIndx += start_m
         # no needs to bounds-check here because `offs_x_m` wraps around M dim
         offs_x_m = tl.load(GatherIndx + offs_x_m) // N_EXPTS_ACT
+    if X_token_scale is not None:
+        if GatherIndx is None:
+            offs_x_scale_m = start_m + offs_x_m
+        else:
+            offs_x_scale_m = offs_x_m
     offs_x_k = BLOCK_K * pid_k + tl.arange(0, BLOCK_K)
     XPtrs = (
         X
@@ -338,9 +375,49 @@ def _moe_gemm_a8w8(
         else:
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
-        acc = tl.dot_scaled(
-            x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
-        )
+        if USE_FNUZ:
+            # fnuz path (gfx942): manual E8M0→fp32, then tl.dot.
+            # x_scales: [BLOCK_M, MX_SCALE_BLOCK_K], w_scales: [BLOCK_N, MX_SCALE_BLOCK_K]
+            a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+            b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+            if MX_SCALE_BLOCK_K == 1:
+                # One scale per operand per K-step, so it is constant across the
+                # dot: scaling the result is equivalent to scaling the operands,
+                # and the MFMA stays FP8 instead of being promoted to FP32.
+                acc += (
+                    tl.dot(x, w, input_precision="ieee")
+                    * tl.reshape(a_sc, (BLOCK_M, 1))
+                    * tl.reshape(b_sc, (1, BLOCK_N))
+                )
+            else:
+                # Broadcast each block-scale across its MX_PACK_DIVISOR elements.
+                # a_sc: [BLOCK_M, MX_SCALE_BLOCK_K] -> [BLOCK_M, BLOCK_K]
+                # b_sc: [BLOCK_N, MX_SCALE_BLOCK_K]; w is [K, N], so b_sc_full
+                # is transposed to [BLOCK_K, BLOCK_N].
+                a_f32 = x.to(tl.float32)
+                b_f32 = w.to(tl.float32)
+                a_sc_full = tl.reshape(
+                    tl.broadcast_to(
+                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_M, BLOCK_K),
+                )
+                b_sc_t = tl.reshape(
+                    tl.broadcast_to(
+                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
+                acc += tl.dot(
+                    a_f32 * a_sc_full,
+                    b_f32 * b_sc_full,
+                    input_precision="ieee",
+                )
+        else:
+            acc = tl.dot_scaled(
+                x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            )
 
         if is_w_microscaled:
             WMxScalePtrs += (PACKED_MX_BLOCK * SPLIT_K) * stride_w_mx_k
@@ -379,15 +456,53 @@ def _moe_gemm_a8w8(
         else:
             w_scales = tl.full((BLOCK_N, MX_SCALE_BLOCK_K), 127, dtype=tl.uint8)
 
-        acc = tl.dot_scaled(
-            x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
-        )
+        if USE_FNUZ:
+            a_sc = (x_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+            b_sc = (w_scales.to(tl.uint32) << 23).to(tl.float32, bitcast=True)
+            if MX_SCALE_BLOCK_K == 1:
+                # Same accumulator-side scaling as the EVEN_K branch above.
+                acc += (
+                    tl.dot(x, w, input_precision="ieee")
+                    * tl.reshape(a_sc, (BLOCK_M, 1))
+                    * tl.reshape(b_sc, (1, BLOCK_N))
+                )
+            else:
+                a_f32 = x.to(tl.float32)
+                b_f32 = w.to(tl.float32)
+                a_sc_full = tl.reshape(
+                    tl.broadcast_to(
+                        a_sc[:, :, None], (BLOCK_M, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_M, BLOCK_K),
+                )
+                b_sc_t = tl.reshape(
+                    tl.broadcast_to(
+                        b_sc[:, :, None], (BLOCK_N, MX_SCALE_BLOCK_K, MX_PACK_DIVISOR)
+                    ),
+                    (BLOCK_N, BLOCK_K),
+                )
+                b_sc_full = tl.trans(b_sc_t)  # [BLOCK_K, BLOCK_N]
+                acc += tl.dot(
+                    a_f32 * a_sc_full,
+                    b_f32 * b_sc_full,
+                    input_precision="ieee",
+                )
+        else:
+            acc = tl.dot_scaled(
+                x, x_scales, "e4m3", w, w_scales, "e4m3", acc=acc, fast_math=True
+            )
 
     # scalar fp8 scale
     if X_static_scale is not None:
         acc = acc * tl.load(X_static_scale)
     if W_static_scale is not None:
         acc = acc * tl.load(W_static_scale)
+    # per-token / per-expert fp8 scales
+    if X_token_scale is not None:
+        x_token_sc = tl.load(X_token_scale + offs_x_scale_m.to(index_type))
+        acc = acc * x_token_sc[:, None]
+    if W_expt_scale is not None:
+        acc = acc * tl.load(W_expt_scale + expt_id)
     # bias
     offs_m = BLOCK_M * block_id + tl.arange(0, BLOCK_M)
     offs_y_n = BLOCK_N * pid_n + tl.arange(0, BLOCK_N)
@@ -398,8 +513,8 @@ def _moe_gemm_a8w8(
         if pid_k == 0:
             bias = tl.load(BPtrs, mask=mask_n, other=0, cache_modifier=W_CACHE_MODIFIER)
         else:
-            bias = tl.full([BLOCK_N], 0, dtype=tl.float32)
-        acc = acc + bias[None, :]
+            bias = tl.zeros([BLOCK_N], dtype=B.dtype.element_ty)
+        acc = acc + bias.to(tl.float32)[None, :]
     if APPLY_SWIGLU and SPLIT_K == 1:
         out = _swiglu(acc, alpha, limit, ADD_RESIDUAL=SWIGLU_ADD_RESIDUAL)
         tl.static_assert(

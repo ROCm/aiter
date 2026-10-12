@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import functools
 
@@ -16,7 +16,16 @@ from ..jit.core import (
 )
 from ..jit.utils.chip_info import get_cu_num
 from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
+from ..jit.utils.torch_guard import torch_compile_guard
 from ..utility import dtypes
+from .gemm_op_common import (
+    find_padded_m_row,
+    mxscale_w_scale_block,
+    with_mxscale_w_scale_block,
+)
+from .opus.policy import (
+    resolve_a8w8_mxscale_bmm_plan as _resolve_a8w8_mxscale_bmm_plan,
+)
 
 
 def gen_batched_gemm_a8w8_fake_tensors(
@@ -86,7 +95,7 @@ def get_CKBatchedGEMM_config(
             get_CKBatchedGEMM_config.has_gfx = True
         else:
             logger.warning(
-                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column — "
+                f"{AITER_CONFIGS.AITER_CONFIG_A8W8_BATCHED_GEMM_FILE} has no 'gfx' column; "
                 "falling back to cu_num-only key. Re-run the tuner or migrate the CSV."
             )
             get_CKBatchedGEMM_config.ck_batched_gemm_dict = (
@@ -145,6 +154,274 @@ def batched_gemm_a8w8_CK(
             splitK = 0
     Y = torch.empty(b, m, n, dtype=dtype, device=XQ.device)
     return batched_gemm_a8w8(XQ, WQ, x_scale, w_scale, Y, bias, splitK)
+
+
+# ---------------------------------------------------------------------------
+# gfx950 MXFP8 BMM high-level caller. Tuned-row and heuristic selection live
+# in ``opus.policy``; this module owns only the hot launch cache,
+# output allocation and split-one/workspace execution choice.
+_TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
+
+
+def _mxscale_bmm_tuned_path(bpreshuffle: bool) -> str:
+    """Tuned table for one weight layout; preshuffled rows live in their own CSV."""
+    return (
+        AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE
+        if bpreshuffle
+        else AITER_CONFIGS.AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_FILE
+    )
+
+
+@functools.cache
+def _get_mxscale_bmm_launchers():
+    """Resolve the checked split-1 launcher and workspace planner once."""
+    from .opus import opus_bmm
+    from .opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
+
+    return _opus_gemm_a8w8_mxscale_bmm_launch_raw, opus_bmm
+
+
+_MXSCALE_BMM_KEYS = ["gfx", "b", "m", "n", "k", "w_scale_block"]
+
+
+@functools.cache
+def _load_mxscale_bmm_tuned(
+    libtype: str | None = None, bpreshuffle: bool = False
+) -> dict:
+    """{(gfx,b,m,n,k,w_scale_block): row} from the mxscale BMM tuned CSV; {} if
+    it is missing. A CSV that predates the w_scale_block column holds only
+    128x128 rows."""
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
+    try:
+        df = pd.read_csv(path).drop_duplicates()
+    except FileNotFoundError:
+        logger.warning("mxscale BMM tuned CSV not found at %s", path)
+        return {}
+    df = with_mxscale_w_scale_block(df, path)
+    if libtype is not None and "libtype" in df.columns:
+        df = df[df["libtype"] == libtype]
+    return df.set_index(_MXSCALE_BMM_KEYS).to_dict("index")
+
+
+@functools.lru_cache(maxsize=1024)
+def lookup_mxscale_bmm_config(
+    b: int,
+    m: int,
+    n: int,
+    k: int,
+    *,
+    w_scale_block: str = "128x128",
+    libtype: str | None = None,
+    bpreshuffle: bool = False,
+):
+    """Exact tuned row for this shape and weight-scale block, else one at a
+    padded M.
+
+    Same exact-then-two-granularities walk over the shared C++ getPaddedM that
+    the CK / asm / a16w16 lookups use. A bucket table built from the CSV's own M
+    values was the alternative and bought nothing: over every M up to the
+    largest tuned one, both cover the same shapes and reach the same kernel on
+    131070 of 131072 M, so this keeps the one rounding rule the repo already has.
+
+    Cached per shape like get_CKGEMM_config, and for the same reason: getPaddedM
+    is a ctypes hop into C++ at ~10us, and the padded levels run on every call
+    whose M is not itself a tuned row. DPA+MTP decode is exactly that case (M is
+    the ragged token count a rank happened to get), and paying it once per layer
+    per step cost ~1% end-to-end before this. The row is shared, so callers must
+    treat it as read-only.
+
+    Returns the row, or None when no level hits. The log prints the row whole
+    instead of named fields, so a backend gets its own kernel identifier
+    reported without this layer knowing which column holds it.
+    """
+    gfx = get_gfx()
+    path = _mxscale_bmm_tuned_path(bpreshuffle)
+    tuned = _load_mxscale_bmm_tuned(libtype, bpreshuffle)
+
+    row, padded_m = find_padded_m_row(
+        tuned, lambda pm: (gfx, b, pm, n, k, w_scale_block), m, n, k
+    )
+
+    if row is None:
+        logger.info(
+            f"shape is B:{b}, M:{m}, N:{n}, K:{k}, w_scale {w_scale_block}, not "
+            f"found tuned/padded config in {path}, the caller will fall back!"
+        )
+        return None
+
+    if AITER_LOG_TUNED_CONFIG:
+        cfg = {c: v for c, v in row.items() if c not in _TUNED_PERF_COLUMNS}
+        if padded_m == m:
+            logger.info(
+                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, w_scale {w_scale_block}, is "
+                f"tuned on gfx = {gfx} in {path}, config is {cfg}!"
+            )
+        else:
+            logger.info(
+                f"shape is B:{b}, M:{m}, N:{n}, K:{k}, w_scale {w_scale_block}, exact "
+                f"miss on gfx = {gfx}; using padded_M: {padded_m} config {cfg} from "
+                f"{path}!"
+            )
+    return row
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_mxscale_bmm_launch_plan(
+    g: int,
+    m: int,
+    n: int,
+    k: int,
+) -> tuple[int, int]:
+    return _resolve_a8w8_mxscale_bmm_plan(g, m, n, k)
+
+
+def _batched_gemm_a8w8_mxscale_impl(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    # This body executes behind the public custom-op boundary, so real eager
+    # tensors carry concrete integer dimensions here.  Avoid four redundant
+    # Python int() conversions on every short BMM launch.
+    m, g, k = x.shape
+    n = wo_a.shape[1]
+    raw_launch, opus_bmm = _get_mxscale_bmm_launchers()
+    kid, split_k = _get_mxscale_bmm_launch_plan(g, m, n, k)
+
+    Y = torch.empty((m, g, n), dtype=dtype, device=x.device)
+    if split_k <= 1:
+        # The shape resolver already returns a final canonical global kid.
+        # Enter the checked C++ launcher directly for the common no-workspace
+        # path instead of repeating the unified public routing contract.  The
+        # C++ boundary still validates dtype, shape, device, stride, arch and
+        # exact kid.  Workspace cases retain the unified Python planner below.
+        raw_launch(
+            x,
+            wo_a,
+            Y,
+            x_scale,
+            w_scale,
+            None,
+            kid,
+            max(1, split_k),
+        )
+        return Y
+    opus_bmm(
+        x.transpose(0, 1),
+        wo_a,
+        Y.transpose(0, 1),
+        kid=kid,
+        layout="mxscale_bmm",
+        x_scale=x_scale.transpose(0, 1),
+        w_scale=w_scale,
+        split_k=split_k,
+    )
+    return Y
+
+
+def _batched_gemm_a8w8_mxscale_fake(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    return torch.empty(
+        (x.shape[0], x.shape[1], wo_a.shape[1]),
+        dtype=dtype,
+        device=x.device,
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+def batched_gemm_a8w8_mxscale(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """Run gfx950 E8M0 MXFP8 BMM and return token-major ``[M,G,N]``."""
+    return _batched_gemm_a8w8_mxscale_impl(x, wo_a, x_scale, w_scale, dtype=dtype)
+
+
+# Same family, preshuffled weight.
+def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """Eager tuned-CSV lookup + libtype dispatch; returns token-major [M, G, N].
+
+    The arch and the w_scale block pick the kernel (flydsl.batched_gemm_a8w8),
+    and the block the tuned rows: gfx950 reads 32x32 and 128x128, gfx1250
+    128x128.
+    """
+    from .flydsl.batched_gemm_a8w8 import bmm_a8w8_mxfp8_supported, run_bmm_a8w8_mxfp8
+
+    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    n = int(wo_a.shape[1])
+    w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), n, k)
+    if not bmm_a8w8_mxfp8_supported(w_scale_block):
+        raise NotImplementedError(
+            f"no preshuffled mxscale BMM kernel reads a {w_scale_block} w_scale "
+            f"on {get_gfx()}"
+        )
+
+    cfg = lookup_mxscale_bmm_config(
+        g, m, n, k, w_scale_block=w_scale_block, bpreshuffle=True
+    )
+    libtype = cfg["libtype"] if cfg is not None else "flydsl"
+    if libtype != "flydsl":
+        raise NotImplementedError(
+            f"tuned row for B:{g}, M:{m}, N:{n}, K:{k} wants libtype "
+            f"{libtype!r}, which takes a raw [G, N, K] weight; {libtype!r} rows "
+            "are served by batched_gemm_a8w8_mxscale"
+        )
+
+    return run_bmm_a8w8_mxfp8(
+        x,
+        wo_a,
+        x_scale,
+        w_scale,
+        torch.empty((m, g, n), dtype=dtype, device=x.device),
+        kernel_name=str(cfg["kernelName"]) if cfg is not None else None,
+    )
+
+
+@torch_compile_guard(mutates_args=[], gen_fake=_batched_gemm_a8w8_mxscale_fake)
+def batched_gemm_a8w8_mxscale_bpreshuffle(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype = dtypes.bf16,
+) -> Tensor:
+    """fp8 e8m0 mxscale batched GEMM with a preshuffled weight.
+
+    * ``x``       : [M, G, K] fp8 activation, token-major and contiguous.
+    * ``wo_a``    : [G, N, K] fp8 weight, ``shuffle_weight(w, layout=(16, 16))``.
+    * ``x_scale`` : [M, G, K/block] uint8 e8m0, row-major.
+    * ``w_scale`` : [G, N/block, K/block] uint8 e8m0.
+
+    The arch and the w_scale block select the kernel:
+
+    * gfx950, 32x32 or 128x128 with a 1x32 or 1x128 ``x_scale``: DeepSeek-V4.1's
+      original wo_a weight (32x32) and V4's (128x128) both run as is.
+    * gfx1250, 128x128: ``x_scale`` is 1x128 -- exactly what
+      ``inverse_rope_group_quant(..., quant_group_size=128, scale_layout="row")``
+      emits, so no transpose on this path.
+
+    Returns a fresh token-major [M, G, N]. A caller that must write into its own
+    buffer calls the arch's ``run_bmm_a8w8_mxfp8_*`` directly (it keeps ``out=``).
+    """
+    return _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
+        x, wo_a, x_scale, w_scale, dtype=dtype
+    )
 
 
 def gen_batched_gemm_a8w8_tune_fake_tensors(

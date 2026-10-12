@@ -1,4 +1,5 @@
 import argparse
+import math
 
 import torch
 import triton
@@ -46,6 +47,10 @@ def get_x_vals():
         (4096, 1280),
         (8192, 1280),
         (16384, 1280),
+        # Large-M / small-N: exercises _rmsnorm_bwd_kernel_large_m_small_n
+        (16384, 128),
+        (32768, 128),
+        (16384, 512),
     ]
     return x_vals
 
@@ -59,6 +64,9 @@ def run_benchmark(args):
     if args.shape is not None:
         M, N = args.shape
         x_vals_list = [("custom", M, N)]
+    elif args.model is None and args.M is None:
+        # Default: sweep get_x_vals() which covers both standard and large-M/small-N
+        x_vals_list = [("custom", M, N) for M, N in get_x_vals()]
     else:
         x_vals_list = model_benchmark_shapes(args)
 
@@ -87,6 +95,9 @@ def run_benchmark(args):
 
     quant = args.quant
     add_residual = args.add_residual
+    do_backward = args.backward
+    if do_backward and quant != "none":
+        raise ValueError("--backward cannot be combined with --quant")
 
     @triton.testing.perf_report([benchmark])
     def bench_rmsnorm(M, N, metric, model_name=None, **kwargs):
@@ -108,6 +119,36 @@ def run_benchmark(args):
                 mem_write += M * N * x.element_size()
             mem = mem_read + mem_write
             flops = 4 * M * N  # dominated by the norm; quant is elementwise
+        elif do_backward:
+            # Backward only: build y once, reuse the retained graph each trial.
+            x.requires_grad_(True)
+            w.requires_grad_(True)
+            y = rms_norm(x, w, eps)
+            dy = torch.randn_like(y)
+
+            def fn():
+                x.grad, w.grad = None, None
+                y.backward(dy, retain_graph=True)
+
+            BLOCK_N = triton.next_power_of_2(N)
+            BLOCK_M = max(min(16384 // BLOCK_N, 32), 8)
+            num_prgms_large = math.ceil(M / BLOCK_M)
+            num_sms = min(M, torch.cuda.get_device_properties(0).multi_processor_count)
+            use_large_m = M > 8192 and N <= 1024
+            # x, dy: input dtype; rsigma: fp32 (4 bytes)
+            mem_read = (2 * M * N) * x.element_size() + M * 4 + N * x.element_size()
+            # dx: input dtype; dg: input dtype
+            mem_write = (M * N + N) * x.element_size()
+            if use_large_m:
+                # dg_tmp: written by bwd kernel, read by reduction (fp32)
+                mem_read += num_prgms_large * N * 4
+                mem_write += num_prgms_large * N * 4
+            elif N > 1:
+                # generic path also writes/reads dg_tmp (fp32, num_sms rows)
+                mem_read += num_sms * N * 4
+                mem_write += num_sms * N * 4
+            mem = mem_read + mem_write
+            flops = 8 * M * N
         else:
             fn = lambda: rms_norm(x, w, eps)
             # memory transfer
@@ -193,6 +234,15 @@ def parse_args(args: list[str] | None = None):
         action="store_true",
         default=False,
         help="Print VGPR usage for Triton kernels.",
+    )
+    parser.add_argument(
+        "--backward",
+        action="store_true",
+        default=False,
+        help=(
+            "Benchmark the backward pass instead of forward. Exercises "
+            "_rmsnorm_bwd_kernel_large_m_small_n for M>8192,N<=1024 shapes."
+        ),
     )
     parser.add_argument(
         "-o", action="store_true", help="Write performance results to CSV file"

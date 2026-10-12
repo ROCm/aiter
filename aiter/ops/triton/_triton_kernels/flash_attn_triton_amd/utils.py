@@ -139,8 +139,10 @@ try:
             num_stages=conf.pop("num_stages", 1),
             num_warps=conf.pop("num_warps", 4),
         )
-except Exception as e:  # noqa: BLE001
-    logger.warning(f"FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON parse error: {e}")
+except Exception:
+    logger.warning(
+        "FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON parse error", exc_info=True
+    )
 
 # Unified debug level:
 #   0 = off (default)
@@ -149,7 +151,8 @@ except Exception as e:  # noqa: BLE001
 #
 # Set via: FLASH_ATTENTION_TRITON_AMD_DEBUG=0|1|2
 DEBUG: int = int(os.environ.get("FLASH_ATTENTION_TRITON_AMD_DEBUG", "0"))
-if AUTOTUNE != "off" or DEBUG > 0:
+# Printing every autotune result is debug output; it must not be forced on for the whole process.
+if DEBUG > 0:
     os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 if DEBUG >= 2:
     os.environ["TRITON_INTERPRET"] = "1"

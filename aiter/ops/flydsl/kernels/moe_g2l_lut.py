@@ -4,8 +4,8 @@
 """EP global->local expert LUT build (FlyDSL), single-block parallel scan.
 
 Collapses the host ``ne + cumsum + sub + where`` chain (6 elementwise/scan
-launches) into one kernel: read the (E_global,) 0/1 ``expert_mask``, do an
-inclusive Hillis-Steele prefix sum in LDS, and write
+launches) into one kernel: read the (E_global,) 0/1 ``expert_mask``, scan first
+within each wave and then across wave totals, and write
 ``g2l_lut[i] = mask[i] ? prefix_incl[i]-1 : E`` (sentinel ``E`` = dropped route).
 
 Mirrors ``moe_contiguous_psum`` (same single-block scan idiom) so the whole
@@ -20,38 +20,47 @@ increments) into this same pre-route kernel.
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import buffer_ops, const_expr, gpu, range_constexpr
-from flydsl.expr.typing import T
+from flydsl.expr import const_expr, gpu
 
+from aiter.ops.flydsl.kernels.kernels_common import get_warp_size
 from aiter.ops.flydsl.kernels.tensor_shim import (
     AITER_FLYDSL_KERNARG_PRELOAD,
     AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
-    ptr_rsrc,
+    ptr_buf_tensor,
+)
+from aiter.ops.flydsl.kernels.topk.topk_per_row_decode import (
+    _warp_inclusive_prefix_i32,
 )
 
-MAX_G2L_EXPERTS = 512
+MAX_G2L_EXPERTS = 1024
 
 
-def _lds_load(mr, idx):
-    """Load i32 from an LDS pointer at element offset ``idx``."""
-    return fx.ptr_load(mr + fx.Int64(idx))
-
-
-def _lds_store(mr, val, idx):
-    """Store i32 to an LDS pointer at element offset ``idx``."""
-    fx.ptr_store(val, mr + fx.Int64(idx))
-
-
-def build_moe_g2l_lut_module():
+def build_moe_g2l_lut_module(
+    clear_counter: bool = True,
+    max_experts: int = 512,
+):
     """JIT launcher: single-block build of the EP global->local expert LUT."""
+    wave_size = get_warp_size()
+    max_scan_experts = min(MAX_G2L_EXPERTS, wave_size * wave_size)
+    if not (
+        wave_size <= max_experts <= max_scan_experts
+        and max_experts & (max_experts - 1) == 0
+    ):
+        raise ValueError(
+            f"max_experts must be a power of two in "
+            f"[{wave_size}, {max_scan_experts}], "
+            f"got {max_experts}"
+        )
+    num_waves = max_experts // wave_size
 
-    # Double-buffered LDS for the Hillis-Steele scan (ping-pong between passes).
     @fx.struct
     class SharedStorage:
-        buf0: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
-        buf1: fx.Array[fx.Int32, MAX_G2L_EXPERTS, 16]
+        wave_prefix: fx.Array[fx.Int32, num_waves, 16]
 
-    @flyc.kernel(name="moe_g2l_lut", known_block_size=[MAX_G2L_EXPERTS, 1, 1])
+    @flyc.kernel(
+        name=f"moe_g2l_lut_n{max_experts}_w{wave_size}",
+        known_block_size=[max_experts, 1, 1],
+    )
     def g2l_kernel(
         mask: fx.Pointer,  # (n,) int32 0/1 expert mask
         lut: fx.Pointer,  # (n,) int32 out: global->local, sentinel E
@@ -65,60 +74,51 @@ def build_moe_g2l_lut_module():
         c0 = fx.Int32(0)
         c1 = fx.Int32(1)
         tid = gpu.thread_idx.x
+        lane = tid % fx.Int32(wave_size)
+        wave = tid // fx.Int32(wave_size)
 
-        m_rsrc = ptr_rsrc(mask)
-        l_rsrc = ptr_rsrc(lut)
+        mask_p = ptr_buf_tensor(mask)
+        lut_p = ptr_buf_tensor(lut)
 
-        # Fold num_valid_routes = num_local_tokens * topk (the EP dead-tail route
-        # bound) into this pre-route single-block kernel: thread 0 reads the (1,)
-        # int32 total_recv scalar and writes nvt*topk to nvr_out. This removes the
-        # standalone torch ``_ep_nvt * topk`` elementwise launch on the decode hot
-        # path; the route / psum-remap / quant kernels consume nvr_out as-is.
+        # num_valid_routes = num_local_tokens * topk (the EP dead-tail bound),
+        # folded in here to drop a standalone torch elementwise launch at decode.
         if tid == c0:
-            nvt_val = buffer_ops.buffer_load(
-                ptr_rsrc(nvt), c0, vec_width=1, dtype=T.i32
-            )
-            buffer_ops.buffer_store(nvt_val * topk, ptr_rsrc(nvr_out), c0)
+            ptr_buf_tensor(nvr_out)[0] = ptr_buf_tensor(nvt)[0] * topk
 
-        # Fold the route atomic-counter zero-init into this pre-route kernel:
-        # bucket count E <= n <= block size, so thread tid<E clears counter[tid],
-        # removing the separate host torch.zeros(E) launch before moe_route_g2l.
-        if tid < E:
-            buffer_ops.buffer_store(c0, ptr_rsrc(counter), tid)
-
-        lds = fx.SharedAllocator().allocate(SharedStorage).peek()
-        mr0 = lds.buf0.ptr
-        mr1 = lds.buf1.ptr
+        # Generic grouped-MoE owns this reset. MegaMoE's TDM dispatch can
+        # instead fold it into its existing tail and compile these stores
+        # away while keeping this kernel available to other callers.
+        if const_expr(clear_counter) and tid < E:
+            ptr_buf_tensor(counter)[tid] = c0
 
         in_range = tid < n
-
-        # Load 0/1 into LDS.
+        enabled = c0
         if in_range:
-            m = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=T.i32)
-            _lds_store(mr0, (m != c0).select(c1, c0), tid)
+            enabled = (mask_p[tid] != c0).select(c1, c0)
+        inclusive = _warp_inclusive_prefix_i32(enabled, lane, wave_size)
 
+        storage = fx.SharedAllocator().allocate(SharedStorage)
+        wave_prefix = storage.wave_prefix.peek().view(fx.make_layout(num_waves, 1))
+        if lane == fx.Int32(wave_size - 1):
+            wave_prefix[wave] = inclusive
         gpu.barrier()
 
-        # Inclusive Hillis-Steele scan (identical to moe_contiguous_psum).
-        src, dst = mr0, mr1
-        for offset in range_constexpr(1, MAX_G2L_EXPERTS):
-            if const_expr((offset & (offset - 1)) != 0):
-                continue
-            if in_range:
-                val = _lds_load(src, tid)
-                has_prev = tid >= fx.Int32(offset)
-                rd_idx = has_prev.select(tid - fx.Int32(offset), tid)
-                prev = has_prev.select(_lds_load(src, rd_idx), c0)
-                _lds_store(dst, val + prev, tid)
-            gpu.barrier()
-            src, dst = dst, src
+        # The capacity check keeps num_waves within one wave, so wave 0 can
+        # turn all wave totals into exclusive offsets in one more wave scan.
+        if wave == c0:
+            active = lane < fx.Int32(num_waves)
+            safe_lane = active.select(lane, c0)
+            wave_total = active.select(wave_prefix[safe_lane], c0)
+            prefix = (
+                _warp_inclusive_prefix_i32(wave_total, lane, wave_size) - wave_total
+            )
+            if active:
+                wave_prefix[lane] = prefix
+        gpu.barrier()
 
-        # lut[i] = enabled ? incl_prefix[i]-1 : E
         if in_range:
-            incl = _lds_load(src, tid)
-            m2 = buffer_ops.buffer_load(m_rsrc, tid, vec_width=1, dtype=T.i32)
-            local = incl - c1
-            buffer_ops.buffer_store((m2 != c0).select(local, E), l_rsrc, tid)
+            local = wave_prefix[wave] + inclusive - c1
+            lut_p[tid] = (enabled != c0).select(local, E)
 
     @flyc.jit
     def launch_g2l(
@@ -134,7 +134,7 @@ def build_moe_g2l_lut_module():
     ):
         g2l_kernel(mask, lut, counter, nvt, nvr_out, n, E, topk).launch(
             grid=(1, 1, 1),
-            block=(MAX_G2L_EXPERTS, 1, 1),
+            block=(max_experts, 1, 1),
             stream=stream,
         )
 

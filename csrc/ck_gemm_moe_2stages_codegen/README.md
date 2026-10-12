@@ -30,6 +30,60 @@ If you have built moe kernels before tuning new MoE shapes, please add `AITER_RE
 
 ### Tuning Scope
 
+#### `--mxfp4-flydsl` and `--mxfp4-search-mode`
+
+The dedicated gfx950 A4W4 MXMOE tuner prunes legal GEMM1 candidates by default
+using `M_est = ceil(token * topk / expert)`, before generating routing data.
+It keeps overlapping BM families: BM16 for `M_est < 16`, BM32 for
+`4 <= M_est <= 128`, BM64 for `M_est >= 16`, and BM128 for `M_est >= 64`.
+Above `M_est = 32`, BM32 keeps only 4-wave, `k_wave=1`, non-NT candidates.
+Above `M_est = 64`, BM64 keeps only non-NT candidates. All legal BN,
+`xcd_swizzle`, and BM16 `prefetch_hidden` choices remain available.
+
+`--mxfp4-search-mode {prune,full}` selects the GEMM1 search mode. It defaults
+to `prune`; `full` enumerates every statically supported GEMM1 candidate:
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode prune
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode full
+```
+
+Switching the mode alone does not re-tune shapes already written to the output
+CSV: `pre_process` skips them by shape key, and the search mode does not change
+that dedup rule. To re-check tuned shapes with full search, either add `--all`
+to re-tune and overwrite them, or point `-o` at a new file to keep the pruned
+results for comparison:
+
+```bash
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned.csv> --mxfp4-flydsl --mxfp4-search-mode full --all
+
+python3 csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py \
+  -i <untuned.csv> -o <tuned_full.csv> --mxfp4-flydsl --mxfp4-search-mode full
+```
+
+An explicit `--mxfp4-search-mode` requires `--mxfp4-flydsl` and cannot be
+combined with `--grouped-gemm`. Both serial and multi-GPU shape workers use the same choice.
+When pruning removes candidates, the tuner prints one summary containing the
+pid, the shape fields that identify the row, `M_est`, the legal G1 count, and
+the retained G1 count, even without `--verbose`. The pid and shape fields keep
+the line attributable when `--mp` workers interleave their stdout.
+Full search and shapes with no removed candidates omit that summary.
+
+Pruning reduces candidate evaluation work and is expected to shorten tuning
+wall time. The actual wall time of `full` and `prune` has not been compared, so
+no measured speedup is reported. The performance of the selected kernels and
+winner retention on unseen shapes require separate validation; use full search
+to investigate those shapes. GEMM2 enumeration and the same-BM pairing rule are
+unchanged, but dropping a GEMM1 BM family also drops every pipeline pair under
+it.
+
+See [the pruning method and tuner changes](../../docs/a4w4_mxmoe_gemm1_pruning.md)
+for a worked example and static validation results.
+
 #### `--last`
 - **Type**: Flag (boolean)
 - **Default**: `False`

@@ -36,6 +36,14 @@ def switch_to_contiguous_if_needed(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous()
 
 
+def max_addressable_bytes(t: torch.Tensor) -> int:
+    span = 1
+    for size, stride in zip(t.shape, t.stride()):
+        if size > 1:
+            span += (size - 1) * stride
+    return span * t.element_size()
+
+
 def serialize_dict(d: dict) -> str:
     return json.dumps(d)
 

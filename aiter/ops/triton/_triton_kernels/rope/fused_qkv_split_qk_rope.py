@@ -2,9 +2,27 @@ import triton
 import triton.language as tl
 
 from aiter.ops.triton.rope.rope import _get_gptj_rotated_x, _get_neox_rotated_x
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+
+_fused_qkv_split_qk_rope_kernel_repr = make_kernel_repr(
+    "_fused_qkv_split_qk_rope_kernel",
+    [
+        "HAVE_NOPE",
+        "NOPE_FIRST",
+        "REUSE_FREQS_FRONT_PART",
+        "IS_NEOX",
+        "HAVE_POS",
+        "HAVE_OFFS",
+        "QH",
+        "KVH",
+        "BLOCK_T",
+        "BLOCK_D",
+        "BLOCK_D_HALF",
+    ],
+)
 
 
-@triton.jit
+@triton.jit(repr=_fused_qkv_split_qk_rope_kernel_repr)
 def _fused_qkv_split_qk_rope_kernel(
     qkv_ptr,
     cos_ptr,

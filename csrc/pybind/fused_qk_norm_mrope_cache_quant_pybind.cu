@@ -4,7 +4,7 @@
 #include "fused_qk_norm_mrope_cache_quant.h"
 #include "rocm_ops.hpp"
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
+PYBIND11_MODULE(AITER_EXTENSION_NAME, m)
 {
     AITER_SET_STREAM_PYBIND
     FUSED_QKNORM_MROPE_CACHE_QUANT_PYBIND;

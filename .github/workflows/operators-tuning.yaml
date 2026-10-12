@@ -17,6 +17,9 @@ concurrency:
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 jobs:
+  ci_config:
+    uses: ./.github/workflows/ci-config.yaml
+
   operators_tuning:
     strategy:
       fail-fast: false
@@ -24,6 +27,9 @@ jobs:
         runner: [linux-aiter-oci-mi300x-1] # TODO: add more runners
     name: Operators tuning
     runs-on: ${{ matrix.runner }}
+    needs: ci_config
+    env:
+      DOCKER_IMAGE: ${{ needs.ci_config.outputs.pytorch_py312_image }}
 
     steps:
       - name: Checkout aiter repo
@@ -52,7 +58,7 @@ jobs:
           -v "${{ github.workspace }}:/workspace" \
           -w /workspace \
           --name operators_tuning_test \
-          rocm/pytorch:latest
+          $DOCKER_IMAGE
 
       - name: Setup Aiter and Triton
         run: |

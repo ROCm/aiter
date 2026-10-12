@@ -63,6 +63,9 @@ def _install_stubs():
         "aiter", dtypes=dtypes_mod, logger=logging.getLogger("aiter")
     )
 
+    def _empty_flydsl_catalog(*args, **kwargs):
+        return {}
+
     stubs = {
         "aiter": aiter_mod,
         "aiter.dtypes": dtypes_mod,
@@ -81,9 +84,10 @@ def _install_stubs():
         ),
         "aiter.ops": _make_stub("aiter.ops"),
         "aiter.ops.flydsl": _make_stub("aiter.ops.flydsl"),
-        "aiter.ops.flydsl.utils": _make_stub(
-            "aiter.ops.flydsl.utils",
-            is_flydsl_available=lambda: False,
+        "aiter.ops.flydsl.gemm_kernels": _make_stub(
+            "aiter.ops.flydsl.gemm_kernels",
+            flydsl_hgemm=lambda *a, **kw: None,
+            get_flydsl_splitk_hgemm_kernels=_empty_flydsl_catalog,
         ),
         "aiter.ops.gemm_op_a16w16": _make_stub(
             "aiter.ops.gemm_op_a16w16",

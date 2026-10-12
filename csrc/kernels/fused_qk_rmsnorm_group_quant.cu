@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+// This translation unit is torch-free: define AITER_NO_TORCH_TYPES before any
+// aiter header so aiter_opus_plus.h does not pull in the c10 half/bfloat16
+// headers. The kernels use aiter::hip2opus + the _rmTorch dispatch macros, never
+// the t2opus<c10::*> specializations, so nothing here needs torch/ATen/c10.
+#define AITER_NO_TORCH_TYPES
 #include "aiter_hip_common.h"
 #include "aiter_opus_plus.h"
 #include "mx_quant_utils.h"
@@ -8,7 +13,6 @@
 #include "aiter_stream.h"
 #include "fused_qk_rmsnorm_group_quant.h"
 #include "rocprim/rocprim.hpp"
-#include <hipcub/hipcub.hpp>
 #include <type_traits>
 
 namespace aiter {
@@ -272,7 +276,7 @@ __global__ void fused_qk_rmsnorm_group_quant_kernel(
             float quant_scale = 0.0f;
             if constexpr(PER_TOKEN_QUANT)
             {
-                float max = block_reduce<float, hipcub::Max, BlockSize, true>(thread_max, hipcub::Max());
+                float max = block_reduce<float, aiter::Max, BlockSize, true>(thread_max, aiter::Max());
                 quant_scale = max * inverted_dtype_max;
                 if(tid == 0)
                 {

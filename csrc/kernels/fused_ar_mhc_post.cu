@@ -6,38 +6,11 @@
 #include "mhc.h"
 #include "aiter_enum.h"
 #include "aiter_hip_common.h"
-#include "py_itfs_common.h"
-#include <ATen/hip/impl/HIPGuardImplMasqueradingAsCUDA.h>
-#include <c10/core/ScalarType.h>
+#include "aiter_stream.h"
 
 namespace aiter {
 
 namespace {
-
-aiter_tensor_t make_aiter_tensor(const torch::Tensor& t)
-{
-    AITER_CHECK(t.is_cuda(), "fused AR+MHC requires CUDA tensors");
-    AITER_CHECK(t.dim() <= 8, "tensor rank too large for aiter_tensor_t");
-
-    aiter_tensor_t at{};
-    at.ptr     = t.data_ptr();
-    at.numel_  = static_cast<size_t>(t.numel());
-    at.ndim    = t.dim();
-    for(int i = 0; i < t.dim(); ++i)
-    {
-        at.shape[i]   = t.size(i);
-        at.strides[i] = t.stride(i);
-    }
-    at.device_id = static_cast<int>(t.device().index());
-    switch(t.scalar_type())
-    {
-    case at::ScalarType::Float: at.dtype_ = AITER_DTYPE_fp32; break;
-    case at::ScalarType::Half: at.dtype_ = AITER_DTYPE_fp16; break;
-    case at::ScalarType::BFloat16: at.dtype_ = AITER_DTYPE_bf16; break;
-    default: throw std::runtime_error("fused AR+MHC only supports fp32/fp16/bf16");
-    }
-    return at;
-}
 
 void copy_input_to_registered_buffer(const aiter_tensor_t& inp,
                                      int m,
@@ -56,18 +29,18 @@ void copy_input_to_registered_buffer(const aiter_tensor_t& inp,
 }
 
 template <typename T>
-c10::ScalarType scalar_type_for_ar_mhc_post()
+AiterDtype aiter_dtype_for_ar_mhc_post()
 {
     if constexpr(std::is_same_v<T, opus::bf16_t>)
-        return c10::ScalarType::BFloat16;
+        return AITER_DTYPE_bf16;
     else
-        return c10::ScalarType::Half;
+        return AITER_DTYPE_fp16;
 }
 
 template <typename T>
 void run_ar_mhc_post_split(CustomAllreduce* fa,
                            hipStream_t stream,
-                           c10::ScalarType dtype,
+                           AiterDtype dtype,
                            T* inp_ptr,
                            T* next_residual_ptr,
                            T* residual_ptr,
@@ -101,7 +74,7 @@ void run_ar_mhc_post_large_m(CustomAllreduce* fa,
     {
         run_ar_mhc_post_split(fa,
                               stream,
-                              scalar_type_for_ar_mhc_post<T>(),
+                              aiter_dtype_for_ar_mhc_post<T>(),
                               inp_ptr,
                               next_residual_ptr,
                               residual_ptr,
@@ -134,7 +107,7 @@ void run_ar_mhc_post_large_m(CustomAllreduce* fa,
 template <typename T>
 void run_ar_mhc_post_split(CustomAllreduce* fa,
                            hipStream_t stream,
-                           c10::ScalarType dtype,
+                           AiterDtype dtype,
                            T* inp_ptr,
                            T* next_residual_ptr,
                            T* residual_ptr,
@@ -206,11 +179,11 @@ void run_ar_mhc_post_1stage(CustomAllreduce* fa,
 } // namespace
 
 void fused_allreduce_mhc_post_only(fptr_t _fa,
-                                   torch::Tensor& inp,
-                                   torch::Tensor& next_residual,
-                                   torch::Tensor& residual_in,
-                                   torch::Tensor& post_layer_mix,
-                                   torch::Tensor& comb_res_mix,
+                                   aiter_tensor_t& inp,
+                                   aiter_tensor_t& next_residual,
+                                   aiter_tensor_t& residual_in,
+                                   aiter_tensor_t& post_layer_mix,
+                                   aiter_tensor_t& comb_res_mix,
                                    bool use_new,
                                    bool open_fp8_quant,
                                    int64_t reg_ptr,
@@ -218,21 +191,20 @@ void fused_allreduce_mhc_post_only(fptr_t _fa,
 {
     (void)use_new;
     (void)open_fp8_quant;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa            = reinterpret_cast<CustomAllreduce*>(_fa);
-    auto inp_at        = make_aiter_tensor(inp);
 
-    const int m       = static_cast<int>(inp_at.numel() / inp_at.size(-1));
-    const int input_n = static_cast<int>(inp_at.size(-1));
+    const int m       = static_cast<int>(inp.numel() / inp.size(-1));
+    const int input_n = static_cast<int>(inp.size(-1));
     const int hidden  = static_cast<int>(residual_in.size(-1));
     const int stride  = static_cast<int>(residual_in.stride(0));
 
-    copy_input_to_registered_buffer(inp_at, m, input_n, stream, reg_ptr, reg_bytes);
+    copy_input_to_registered_buffer(inp, m, input_n, stream, reg_ptr, reg_bytes);
 
-    switch(inp.scalar_type())
+    switch(inp.dtype())
     {
-    case at::ScalarType::BFloat16: {
+    case AITER_DTYPE_bf16: {
         run_ar_mhc_post_large_m<opus::bf16_t>(
             fa,
             stream,
@@ -249,7 +221,7 @@ void fused_allreduce_mhc_post_only(fptr_t _fa,
             reg_bytes);
         break;
     }
-    case at::ScalarType::Half: {
+    case AITER_DTYPE_fp16: {
         run_ar_mhc_post_large_m<opus::fp16_t>(
             fa,
             stream,
@@ -272,11 +244,11 @@ void fused_allreduce_mhc_post_only(fptr_t _fa,
 }
 
 void fused_allreduce_mhc_post_one_stage(fptr_t _fa,
-                                        torch::Tensor& inp,
-                                        torch::Tensor& next_residual,
-                                        torch::Tensor& residual_in,
-                                        torch::Tensor& post_layer_mix,
-                                        torch::Tensor& comb_res_mix,
+                                        aiter_tensor_t& inp,
+                                        aiter_tensor_t& next_residual,
+                                        aiter_tensor_t& residual_in,
+                                        aiter_tensor_t& post_layer_mix,
+                                        aiter_tensor_t& comb_res_mix,
                                         bool use_new,
                                         bool open_fp8_quant,
                                         int64_t reg_ptr,
@@ -284,21 +256,20 @@ void fused_allreduce_mhc_post_one_stage(fptr_t _fa,
 {
     (void)use_new;
     (void)open_fp8_quant;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa            = reinterpret_cast<CustomAllreduce*>(_fa);
-    auto inp_at        = make_aiter_tensor(inp);
 
-    const int m       = static_cast<int>(inp_at.numel() / inp_at.size(-1));
-    const int input_n = static_cast<int>(inp_at.size(-1));
+    const int m       = static_cast<int>(inp.numel() / inp.size(-1));
+    const int input_n = static_cast<int>(inp.size(-1));
     const int hidden  = static_cast<int>(residual_in.size(-1));
     const int stride  = static_cast<int>(residual_in.stride(0));
 
-    copy_input_to_registered_buffer(inp_at, m, input_n, stream, reg_ptr, reg_bytes);
+    copy_input_to_registered_buffer(inp, m, input_n, stream, reg_ptr, reg_bytes);
 
-    switch(inp.scalar_type())
+    switch(inp.dtype())
     {
-    case at::ScalarType::BFloat16: {
+    case AITER_DTYPE_bf16: {
         run_ar_mhc_post_1stage<opus::bf16_t>(
             fa,
             stream,
@@ -315,7 +286,7 @@ void fused_allreduce_mhc_post_one_stage(fptr_t _fa,
             reg_bytes);
         break;
     }
-    case at::ScalarType::Half: {
+    case AITER_DTYPE_fp16: {
         run_ar_mhc_post_1stage<opus::fp16_t>(
             fa,
             stream,
@@ -338,11 +309,11 @@ void fused_allreduce_mhc_post_one_stage(fptr_t _fa,
 }
 
 void fused_allreduce_mhc_post_split(fptr_t _fa,
-                                    torch::Tensor& inp,
-                                    torch::Tensor& next_residual,
-                                    torch::Tensor& residual_in,
-                                    torch::Tensor& post_layer_mix,
-                                    torch::Tensor& comb_res_mix,
+                                    aiter_tensor_t& inp,
+                                    aiter_tensor_t& next_residual,
+                                    aiter_tensor_t& residual_in,
+                                    aiter_tensor_t& post_layer_mix,
+                                    aiter_tensor_t& comb_res_mix,
                                     bool use_new,
                                     bool open_fp8_quant,
                                     int64_t reg_ptr,
@@ -350,25 +321,24 @@ void fused_allreduce_mhc_post_split(fptr_t _fa,
 {
     (void)use_new;
     (void)open_fp8_quant;
-    const at::hip::OptionalHIPGuardMasqueradingAsCUDA device_guard(device_of(inp));
-    hipStream_t stream = at::hip::getCurrentHIPStream();
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa            = reinterpret_cast<CustomAllreduce*>(_fa);
-    auto inp_at        = make_aiter_tensor(inp);
 
-    const int m       = static_cast<int>(inp_at.numel() / inp_at.size(-1));
-    const int input_n = static_cast<int>(inp_at.size(-1));
+    const int m       = static_cast<int>(inp.numel() / inp.size(-1));
+    const int input_n = static_cast<int>(inp.size(-1));
     const int hidden  = static_cast<int>(residual_in.size(-1));
     const int stride  = static_cast<int>(residual_in.stride(0));
 
-    copy_input_to_registered_buffer(inp_at, m, input_n, stream, reg_ptr, reg_bytes);
+    copy_input_to_registered_buffer(inp, m, input_n, stream, reg_ptr, reg_bytes);
 
-    switch(inp.scalar_type())
+    switch(inp.dtype())
     {
-    case at::ScalarType::BFloat16: {
+    case AITER_DTYPE_bf16: {
         run_ar_mhc_post_split<opus::bf16_t>(
             fa,
             stream,
-            at::ScalarType::BFloat16,
+            AITER_DTYPE_bf16,
             reinterpret_cast<opus::bf16_t*>(inp.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(next_residual.data_ptr()),
             reinterpret_cast<opus::bf16_t*>(residual_in.data_ptr()),
@@ -382,11 +352,11 @@ void fused_allreduce_mhc_post_split(fptr_t _fa,
             reg_bytes);
         break;
     }
-    case at::ScalarType::Half: {
+    case AITER_DTYPE_fp16: {
         run_ar_mhc_post_split<opus::fp16_t>(
             fa,
             stream,
-            at::ScalarType::Half,
+            AITER_DTYPE_fp16,
             reinterpret_cast<opus::fp16_t*>(inp.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(next_residual.data_ptr()),
             reinterpret_cast<opus::fp16_t*>(residual_in.data_ptr()),

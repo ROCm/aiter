@@ -94,4 +94,14 @@ inline __device__ void scale_c_tile(
     });
 }
 
+// Broadcast one e8m0 exponent byte across all four 32-block slots of a packed
+// scale word (128-block DSV4 scale -> 32-block gfx950 scaled-MFMA semantics).
+// Shared by the a8w8_mxscale BMM pipeline and the flatmm split-K pipeline (both
+// #included in opus_bmm.cu), so it lives here once instead of a per-header copy.
+template<typename S>
+OPUS_D int pack_e8m0x4(S scale) {
+    const int e = static_cast<int>(scale);
+    return e * 0x01010101;
+}
+
 #endif // __HIP_DEVICE_COMPILE__

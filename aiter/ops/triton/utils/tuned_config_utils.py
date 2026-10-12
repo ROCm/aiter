@@ -1,0 +1,126 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
+
+"""Tuned kernel entries: ``get_tuned_kernel_config()`` for kernels whose
+autotune search space lives in Python and only need one pinned tile per
+device, on top of the shared core in ``config_utils``.
+"""
+
+import functools
+import os
+
+import triton
+
+from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.logger import AiterTritonLogger
+
+logger = AiterTritonLogger()
+
+from aiter.ops.triton.utils.config_utils import (
+    AITER_TRITON_CONFIGS_PATH,
+    USE_LRU_CACHE,
+    _dtype_dir,
+    load_config_json,
+)
+
+
+def autotune_enabled(family: str, env: str | None = None, default: str = "0") -> bool:
+    """``<FAMILY>_TRITON_AUTOTUNE=1`` opts a kernel family into runtime tuning; off by default.
+
+    ``env`` names the variable instead, for a family that already had one before
+    this convention existed and whose name is published elsewhere. ``default``
+    is what an unset variable means, so such a family keeps whatever it did
+    before rather than changing behaviour by being routed through here.
+    """
+    return os.getenv(env or f"{family}_TRITON_AUTOTUNE", default).strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def autotune_configs(
+    family: str,
+    configs: list[triton.Config],
+    default_config: triton.Config | None = None,
+    env: str | None = None,
+    default: str = "0",
+) -> list[triton.Config]:
+    """Config list for ``@triton.autotune``: every candidate while the family tunes, else
+    only ``default_config`` (or ``configs[0]``) so nothing is benchmarked at launch."""
+    # An empty list would hand Triton nothing to tune and make the configs[0] fallback raise.
+    assert configs, f"{family}: autotune_configs called with an empty config list"
+    if autotune_enabled(family, env, default):
+        return configs
+    return [default_config if default_config is not None else configs[0]]
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def _get_tuned_kernel_entry(
+    op: str, config_name: str, kernel_name: str, backend: str
+) -> tuple[str, dict | None]:
+    """Internal cached lookup returning ``(config path, entry or None)``.
+
+    Do NOT use this directly — the entry is the shared cached object, so
+    ``get_tuned_kernel_config()`` copies it before handing it out.
+    """
+    arch = arch_info.get_arch()
+    # Nested layout of configs/CLAUDE.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
+    # <d_type> being the config name lowercased with dashes folded to underscores.
+    dtype_dir = _dtype_dir(config_name)
+    config_path = (
+        f"{AITER_TRITON_CONFIGS_PATH}/{arch}/{backend}/{op}/{dtype_dir}/DEFAULT.json"
+    )
+    published = load_config_json(config_path, required=False) or {}
+    return config_path, published.get(kernel_name)
+
+
+def get_tuned_kernel_config(
+    op: str,
+    config_name: str,
+    kernel_name: str,
+    fallback: triton.Config,
+    backend: str = "triton",
+) -> triton.Config:
+    """The tile pinned for this device, or ``fallback`` where none is published.
+
+    What fits is not portable: the same tile can compile to 16KB of LDS on one
+    arch and to more than the 64KB another one has. A device nobody has measured
+    therefore gets the fallback, which has to be launchable anywhere rather than
+    fastest somewhere, and stays on it until a measured entry is published.
+
+    Args:
+        op: Op family directory, e.g. ``"attention"``.
+        config_name: Config family, e.g. ``"CHUNK_DELTA_ATTN"``.
+        kernel_name: Key of the kernel's entry within the config file.
+        fallback: Config to register when this device has no published entry.
+        backend: ``"triton"`` or ``"gluon"``.
+    """
+    try:
+        config_path, entry = _get_tuned_kernel_entry(
+            op, config_name, kernel_name, backend
+        )
+    except BaseException:  # noqa: BLE001 -- no accelerator/unreadable file
+        # AiterTritonLogger forwards only *args, so exc_info goes to the
+        # underlying stdlib logger; it renders the traceback for us.
+        logger.get_logger().warning(
+            "Unable to load tuned Triton config '%s' for kernel '%s'; using fallback %s",
+            config_name,
+            kernel_name,
+            fallback,
+            exc_info=True,
+        )
+        return fallback
+    if not entry:
+        logger.warning(
+            "No tuned Triton config for kernel '%s' in '%s'; using fallback %s",
+            kernel_name,
+            config_path,
+            fallback,
+        )
+        return fallback
+    entry = dict(entry)
+    num_warps = entry.pop("num_warps", fallback.num_warps)
+    num_stages = entry.pop("num_stages", fallback.num_stages)
+    return triton.Config(entry, num_warps=num_warps, num_stages=num_stages)

@@ -44,6 +44,9 @@
 #ifndef __shared__
 #define __shared__      __attribute__((shared))
 #endif
+#ifndef __align__
+#define __align__(x)    __attribute__((aligned(x)))
+#endif
 #ifndef __device__
 #define __device__      __attribute__((device))
 #endif
