@@ -322,6 +322,24 @@ def test_gather_kv_b_proj_flydsl_gfx1250_ptpc(num_tokens, n_heads, alloc):
         assert torch.isnan(case["v_prefix"][num_tokens:]).all()
 
 
+def test_gather_kv_b_proj_gfx1250_cluster_config_validation():
+    from aiter.ops.flydsl.gather_kv_b_proj_gfx1250 import _run_projection
+
+    with pytest.raises(ValueError, match="cluster_n"):
+        _run_projection(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            n_heads=12,
+            m=1,
+            cluster_n=8,
+        )
+
+
 @_SKIP
 @pytest.mark.parametrize("dims", [DIMS_DEEPSEEK, DIMS_GLM])
 @pytest.mark.parametrize(

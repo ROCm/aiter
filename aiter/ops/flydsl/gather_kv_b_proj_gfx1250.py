@@ -10,6 +10,8 @@ _KV_C = 512
 _KV_PE = 64
 _NOPE = 128
 _V_DIM = 128
+# Private tuning surface. Production remains cluster_n=1 until GPU validation.
+_CLUSTER_N_CANDIDATES = (1, 2, 4, 8)
 
 _launch_projection = None
 _ptr_arg = None
@@ -26,8 +28,14 @@ def _run_projection(
     v_out: Tensor,
     n_heads: int,
     m: int,
+    cluster_n: int = 1,
 ) -> None:
     """Launch the fixed-width indexed MLA WMMA kernel."""
+    if cluster_n not in _CLUSTER_N_CANDIDATES or n_heads % cluster_n != 0:
+        raise ValueError(
+            f"cluster_n must be one of {_CLUSTER_N_CANDIDATES} and divide "
+            f"n_heads={n_heads}, got {cluster_n}"
+        )
     global _launch_projection, _ptr_arg, _fx
     if _launch_projection is None:
         import flydsl.expr as fx
@@ -56,7 +64,7 @@ def _run_projection(
         0.0 if scale_is_ptr else float(activation_scale),
         _fx.Stream(torch.cuda.current_stream(device=cache.device)),
     )
-    _launch_projection(*args, n_heads, int(scale_is_ptr))
+    _launch_projection(*args, n_heads, int(scale_is_ptr), cluster_n)
 
 
 def unsupported_reason(
@@ -166,4 +174,5 @@ def gather_kv_b_proj_flydsl_gfx1250(
         v_prefix,
         k_prefix.shape[1],
         m,
+        cluster_n=1,
     )

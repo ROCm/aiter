@@ -12,7 +12,7 @@ the 512-wide FP8 latent by a ptpc-preshuffled FP8 weight, and writes BF16
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp8, tdm_ops
+from flydsl.expr.rocdl import cluster, cvt_scale_pk8_f32_fp8, tdm_ops
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -22,6 +22,7 @@ from aiter.ops.flydsl.kernels.gemm_common_gfx1250 import (
     make_lds_copy_ops,
     pipeline_fence,
 )
+from aiter.ops.flydsl.kernels.gfx1250_cluster import compute_mcast_masks
 from aiter.ops.flydsl.kernels.kernels_common import format_kernel_name
 from aiter.ops.flydsl.kernels.mega_moe_gfx1250.tdm_gather_shim import (
     TDMGatherDescriptor,
@@ -63,6 +64,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
     stream: fx.Stream,
     n_heads: Constexpr[int] = 96,
     scale_a_is_ptr: Constexpr[int] = 1,
+    cluster_n: Constexpr[int] = 1,
 ):
     tile_m, tile_n, tile_k = _TILE_M, _TILE_N, _TILE_K
     m_warp, n_warp = _M_WARP, _N_WARP
@@ -81,6 +83,9 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
     n_acc = wmma_m_rep * wmma_n_rep
     num_waves = m_warp * n_warp
     block = num_waves * WAVE
+    use_cluster = cluster_n > 1
+    if n_heads % cluster_n != 0:
+        raise ValueError("n_heads must be divisible by cluster_n")
 
     LDS_PAD_A = 16
     A_GATHER_ROWS = 8
@@ -114,6 +119,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
         "gather_kv_b_proj_ptpc"
         f"_t{tile_m}x{tile_n}x{tile_k}"
         f"_mw{m_warp}_nw{n_warp}_nb{num_buffers}_h{n_heads}_tdmgather"
+        + (f"_cn{cluster_n}" if use_cluster else "")
     )
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
@@ -140,6 +146,11 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
+        if const_expr(use_cluster):
+            local_x, local_y = cluster.compute_cluster_position()
+            a_mask, _ = compute_mcast_masks(local_x, local_y, 1, cluster_n)
+        else:
+            a_mask = 0
         b_mask = 0
         blk_m = bid_x * tile_m
         blk_n = bid_y * tile_n
@@ -196,6 +207,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
             index_size=32,
             gather_tile_dim1=A_GATHER_ROWS,
             lds_byte_offset=fx.index_cast(T.index, fx.Int32(0)),
+            workgroup_mask=a_mask,
         )
 
         # Partition B evenly too: each wave issues one B TDM plus four A
@@ -415,6 +427,8 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
             return accs
 
         TDM_PER = A_GATHER_GROUPS + 1
+        if const_expr(use_cluster):
+            cluster.cluster_barrier()
         for i in range_constexpr(num_buffers - 1):
             issue(i, i)
         n_steady = K_TILES - (num_buffers - 1)
@@ -422,8 +436,13 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
             s = kt % num_buffers
             pbuf = _buf_ptr(s)
             buf = _bidx(pbuf)
-            pipeline_fence(outstanding=TDM_PER * (num_buffers - 2), use_cluster=False)
+            pipeline_fence(
+                outstanding=TDM_PER * (num_buffers - 2),
+                use_cluster=False,
+            )
             compute_ktile(buf, kt + (num_buffers - 1))
+            if const_expr(use_cluster) and kt % num_buffers == num_buffers - 1:
+                cluster.cluster_barrier()
         scale_regs = None
         for j in range_constexpr(num_buffers - 1):
             kt = n_steady + j
@@ -431,13 +450,14 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
             pbuf = _buf_ptr(s)
             buf = _bidx(pbuf)
             pipeline_fence(
-                outstanding=TDM_PER * (num_buffers - 2 - j), use_cluster=False
+                outstanding=TDM_PER * (num_buffers - 2 - j),
+                use_cluster=False,
             )
             if const_expr(j == num_buffers - 2):
                 scale_regs = issue_weight_scale_loads()
             compute_ktile(buf, None)
 
-        pipeline_fence(outstanding=0, use_cluster=False)
+        pipeline_fence(outstanding=0, use_cluster=use_cluster)
         activation_scale = (
             ptr_buf_tensor(
                 arg_scale_a,
@@ -469,6 +489,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
             gather_tile_dim1=A_GATHER_ROWS,
             lds_byte_offset=fx.index_cast(T.index, fx.Int32(C_STORE_B)),
             global_byte_offset=_ROPE_OFFSET,
+            workgroup_mask=a_mask,
         )
         rocdl.sched_barrier(0)
         for group in range_constexpr(A_GATHER_GROUPS):
@@ -512,7 +533,7 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
                     h.bitcast(fx.Int8),
                     base_ptr + (row_rel * C_LDS_ROW + col_rel) * 2,
                 )
-        pipeline_fence(outstanding=0, use_cluster=False)
+        pipeline_fence(outstanding=0, use_cluster=use_cluster)
 
         head = bid_y
         lds_base = _bidx(base_ptr)
@@ -561,22 +582,42 @@ def launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250(
                 fx.ptr_store(v_vec.bitcast(fx.Int8), gV_base + v_offset)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
-    kernel_gather_kv_b_proj(
-        arg_k,
-        arg_v,
-        arg_cache,
-        arg_indices,
-        arg_b,
-        arg_scale_a,
-        arg_scale_b,
-        i32_num_blocks,
-        i32_m,
-        f32_scale_a,
-    ).launch(
-        grid=(gx, n_heads, 1),
-        block=(block, 1, 1),
-        stream=stream,
-    )
+    if const_expr(use_cluster):
+        kernel_gather_kv_b_proj(
+            arg_k,
+            arg_v,
+            arg_cache,
+            arg_indices,
+            arg_b,
+            arg_scale_a,
+            arg_scale_b,
+            i32_num_blocks,
+            i32_m,
+            f32_scale_a,
+            value_attrs={"rocdl.cluster_dims": f"1,{cluster_n},1"},
+        ).launch(
+            grid=(gx, n_heads, 1),
+            block=(block, 1, 1),
+            stream=stream,
+            cluster=(1, cluster_n, 1),
+        )
+    else:
+        kernel_gather_kv_b_proj(
+            arg_k,
+            arg_v,
+            arg_cache,
+            arg_indices,
+            arg_b,
+            arg_scale_a,
+            arg_scale_b,
+            i32_num_blocks,
+            i32_m,
+            f32_scale_a,
+        ).launch(
+            grid=(gx, n_heads, 1),
+            block=(block, 1, 1),
+            stream=stream,
+        )
 
 
 launch_kimi_k3_gather_kv_b_proj_8wave_gfx1250.compile_hints["llvm_options"] = {
