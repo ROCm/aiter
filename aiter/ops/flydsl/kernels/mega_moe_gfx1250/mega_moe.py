@@ -1197,6 +1197,7 @@ class MegaMoEGfx1250:
         # tokoff-ext slot allocator (built in _build_mori_dispatch when dispatch
         # runs through mori); None otherwise so close() is uniform.
         self._tokoff_ext = None
+        self._mori_dispatch_staging = None
         self._mori_plans = {}
         self._mori_combine_plans = {}
         device = torch.device("cuda", torch.cuda.current_device())
@@ -1672,6 +1673,23 @@ class MegaMoEGfx1250:
                 "needs mori's aggregated dispatch reservation, which "
                 "MORI_EP_TOKOFF_EXT=1 turns off"
             )
+        # Since ROCm/mori#703 the dispatch stages through a buffer its caller
+        # binds; one serves every plan, as only one launches at a time.
+        try:
+            from mori.ops.dispatch_combine_v2.hip_backend import ep_staging_bytes
+        except ImportError:
+            ep_staging_bytes = None
+        if ep_staging_bytes is not None:
+            self._mori_dispatch_staging = torch.zeros(
+                ep_staging_bytes(
+                    config.world_size,
+                    config.max_recv,
+                    scale_kw.get("scale_bytes", 0),
+                    config.max_tokens_per_rank,
+                ),
+                dtype=torch.uint8,
+                device=self._total_recv.device,
+            )
         plans = {}
         for spec in self._dispatch_specs:
             plan = EpDispatchPlan(
@@ -1693,6 +1711,8 @@ class MegaMoEGfx1250:
                 region_names=_MORI_REGION_NAMES,
             )
             plan.bind(rank=config.rank)
+            if self._mori_dispatch_staging is not None:
+                plan.bind(staging_base=self._mori_dispatch_staging.data_ptr())
             plans[spec] = plan
         # The kernels dereference the window, so the plans have to outlive them.
         self._mori_plans = plans
@@ -2082,6 +2102,8 @@ class MegaMoEGfx1250:
         # go before the arena does.
         for plan in (*self._mori_plans.values(), *self._mori_combine_plans.values()):
             plan.close()
+        # After the plans, which hold its address.
+        self._mori_dispatch_staging = None
         self._arena.close()
         if self._tokoff_ext is not None:
             self._tokoff_ext.close()
