@@ -42,6 +42,13 @@ else:
     CLIB_EXT = ".so"
     SHARED_FLAG = "-shared"
 
+# Fixed path on purpose, not derived from ROCM_HOME: when hipcc comes from the
+# Python ROCm SDK it searches only its own venv-local include tree, while the
+# rocPRIM dev headers are installed by the system packages under /opt/rocm.
+# Without this fallback, kernels that include "rocprim/rocprim.hpp" (directly,
+# or through hipcub) fail to compile with "'rocprim/rocprim.hpp' file not
+# found". Used only when the resolved include paths lack rocPRIM and the system
+# headers' HIP version matches the selected hipcc.
 _SYSTEM_ROCM_INCLUDE = "/opt/rocm/include"
 _ROCPRIM_HEADER = os.path.join("rocprim", "rocprim.hpp")
 
