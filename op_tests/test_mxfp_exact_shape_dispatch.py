@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.gemm_op_a4w6 import (
     _default_gemm_a4w6_kernel,
     _select_gemm_a4w6_kernel,
@@ -51,7 +51,11 @@ SPECS = {
 
 def _is_gfx950():
     try:
-        return torch.cuda.is_available() and get_gfx_runtime() == "gfx950"
+        return (
+            torch.cuda.is_available()
+            and get_gfx_runtime() == "gfx950"
+            and get_cu_num() == 256
+        )
     except (KeyError, RuntimeError):
         return False
 
