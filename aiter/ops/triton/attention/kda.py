@@ -382,6 +382,7 @@ def fused_recurrent_kda(
         USE_RMS_GATE=use_rms_gate,
         **({"RESIDENT_STATE": bool(resident_state)} if _ARCH == "gfx950" else {}),
         num_warps=num_warps,
+        enable_fp_fusion=True,
         **(
             {"llvm_fn_attrs": f"amdgpu-sched-strategy={sched_strategy}"}
             if sched_strategy

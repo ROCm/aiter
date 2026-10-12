@@ -33,7 +33,6 @@ from .common import (
     lds_st,
     pack_bf16x8,
     rsrc,
-    traced,
     uni,
     wait_vm,
     wave_red,
@@ -135,7 +134,7 @@ def compile_mega_moe_tp(
     TN_V = H // 8
     TN_IT = ceildiv(TN_V, NTT)
 
-    @traced
+    @flyc.jit
     def blk_red(L, tid, v, op, slot):
         r = wave_red(v, tid % i32(64), op)
         if (tid % i32(64)) == i32(0):
@@ -148,7 +147,7 @@ def compile_mega_moe_tp(
             t = op(t, lds_ld_i32(L, i32(L_RING) + i32((slot * (NTT // 64) + k) * 4)))
         return t
 
-    @traced
+    @flyc.jit
     def tn_rows(L, tid, a):
         m = a["m"]
         S = fin_split(a)
@@ -171,7 +170,7 @@ def compile_mega_moe_tp(
                 tn_row(L, tid, a, r, True)
             gpu.barrier()
 
-    @traced
+    @flyc.jit
     def tn_row(L, tid, a, r, sysy):
         H8 = i32(TN_V)
         ry = rsrc(a["y"])
@@ -278,7 +277,7 @@ def compile_mega_moe_tp(
             fo = fx.Int64((i32(FLAG_TN) + a["rank"] * i32(TN_MAX) + r) * i32(4))
             g_st_sys(peer_sel(a, tid) + fx.Int64(a["off_flag"]) + fo, a["epoch"])
 
-    @traced
+    @flyc.jit
     def tn_wait(tid, a):
         if tid < i32(64):
             nblk = i32(gpu.grid_dim.x)
@@ -303,7 +302,7 @@ def compile_mega_moe_tp(
                 ERR_YAG,
             )
 
-    @traced
+    @flyc.jit
     def roles(L, tid, a, epoch):
         if tid < i32(NT):
             compute_units(L, tid, a)
