@@ -50,7 +50,7 @@ from aiter.ops.flydsl.kernels.quick_allreduce_int4 import (
     TILE_BYTES,
     WORLD,
 )
-from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_GRID_CAP
+from aiter.ops.flydsl.quick_allreduce_int4 import DEFAULT_DIVISOR, DEFAULT_GRID_CAP
 
 try:
     ARCH = get_gfx_runtime()
@@ -164,7 +164,7 @@ def _run_rank(
     grid_cap: int,
     fill: str,
     time_it: bool,
-    divisor: float = 1.0,
+    divisor: float = DEFAULT_DIVISOR,
 ) -> list[dict]:
     import torch.distributed as dist
 
@@ -267,7 +267,7 @@ def _spawn(
     super_tile: int = SUPER_TILE,
     grid_cap: int = DEFAULT_GRID_CAP,
     fill: str = "normal",
-    divisor: float = 1.0,
+    divisor: float = DEFAULT_DIVISOR,
 ) -> list[list[dict]]:
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(f"unsupported world_size={world_size}")
@@ -446,8 +446,14 @@ def main():
     else:
         codec_pairs = [(16, 1024)]
         for fill, label in _CODEC_FILL_CASES:
+            # Divisor 1 so these hit the E4M3 encoder bounds directly.
             ranks = _spawn(
-                2, codec_pairs, time_it=False, fill=fill, grid_cap=args.grid_cap
+                2,
+                codec_pairs,
+                time_it=False,
+                fill=fill,
+                grid_cap=args.grid_cap,
+                divisor=1.0,
             )
             _assert_validity(ranks, pairs=codec_pairs, world_size=2, label=label)
 

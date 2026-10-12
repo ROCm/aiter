@@ -15,6 +15,7 @@ from flydsl.expr.typing import Float32, Int32, Int64, Stream
 from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.quick_allreduce_int4 import (
+    DEFAULT_DIVISOR,
     DEFAULT_GRID_CAP,
     SUPER_TILES,
     SUPPORTED_WORLDS,
@@ -34,7 +35,7 @@ DIVISOR_MAX = 2.0**14
 
 
 def _check_divisor(divisor: float) -> float:
-    """One shared positive divisor. ``1`` leaves the INT4 result unchanged."""
+    """One shared positive divisor. ``1`` disables the scaling."""
     msg = (
         f"QuickAllReduceInt4 divisor must be a finite float in "
         f"[{DIVISOR_MIN:g}, {DIVISOR_MAX:g}], got {divisor!r}"
@@ -299,7 +300,7 @@ class QuickAllReduceInt4:
         live_bytes: int,
         num_tiles: int,
         grid_x: int,
-        divisor: float = 1.0,
+        divisor: float = DEFAULT_DIVISOR,
     ):
         if stream is None:
             stream = Stream(torch.cuda.current_stream(self._device_index))
@@ -326,7 +327,7 @@ class QuickAllReduceInt4:
         stream,
         *,
         live_bytes: int,
-        divisor: float = 1.0,
+        divisor: float = DEFAULT_DIVISOR,
     ) -> None:
         num_tiles = max(1, (live_bytes + TILE_BYTES - 1) // TILE_BYTES)
         args = self._launch_args(
@@ -375,13 +376,14 @@ class QuickAllReduceInt4:
             # Destructors must not raise, especially during interpreter shutdown.
             return
 
-    def allreduce(self, inp, out, stream=None, divisor: float = 1.0):
+    def allreduce(self, inp, out, stream=None, divisor: float = DEFAULT_DIVISOR):
         """Two-shot INT4 all-reduce into ``out``.
 
         ``stream=None`` uses the current PyTorch stream on this device.
-        ``divisor`` is the same on every GPU and defaults to 1, which keeps
-        the current INT4 result. Loaded values are divided by it before the
-        first pack, and the finished sum is multiplied by it once.
+        ``divisor`` is the same on every GPU and defaults to
+        ``DEFAULT_DIVISOR`` (8); ``1`` disables the scaling. Loaded values
+        are divided by it before the first pack, and the finished sum is
+        multiplied by it once.
         """
         divisor = _check_divisor(divisor)
         live_bytes = self._check_payload(inp, out)

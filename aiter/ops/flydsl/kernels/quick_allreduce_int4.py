@@ -10,9 +10,10 @@ Payload HBM is bf16; in-kernel math is packed fp16. Each rank owns
 ``atoms / world_size`` atoms of a tile (8 GPUs → 1, 4 → 2, 2 → 4); LDS
 stays ``atoms * 1152``.
 
-``divisor`` defaults to 1. Loaded fp16 is divided by it before the first
-pack; the gathered sum is multiplied by it once, through the all-gather
-dequant scale, before the bf16 store. The second pack is left unchanged.
+``divisor`` defaults to ``DEFAULT_DIVISOR``. Loaded fp16 is divided by it
+before the first pack; the gathered sum is multiplied by it once, through
+the all-gather dequant scale, before the bf16 store. The second pack is
+left unchanged.
 """
 
 import flydsl.compiler as flyc
@@ -28,6 +29,9 @@ WORLD = 8
 SUPPORTED_WORLDS = (2, 4, 8)
 SUPER_TILES = (1, 8)
 DEFAULT_GRID_CAP = 304 * 4
+# Power of two, so the fp16 divide and multiply are exact. Covers a per-GPU
+# max up to 480 at TP 8 (TP * max / 480).
+DEFAULT_DIVISOR = 8.0
 
 # Shared by host tile math, LDS PackStorage, and the kernel factory.
 BLOCK = 256
@@ -336,7 +340,7 @@ def make_quick_allreduce_int4_kernel(
         out_ptr: Int64,
         peer_ptrs: Int64,
         colors_ptr: Int64,
-        divisor: Float32 = Float32(1.0),  # noqa: B008
+        divisor: Float32 = Float32(DEFAULT_DIVISOR),  # noqa: B008
     ):
         _clamp_fp16_overflow()
         tid = fx.Int32(gpu.thread_id("x"))
@@ -730,7 +734,7 @@ def make_quick_allreduce_int4_kernel(
         peer_ptrs: Int64,
         colors_ptr: Int64,
         grid_x: Int32,
-        divisor: Float32 = 1.0,
+        divisor: Float32 = DEFAULT_DIVISOR,
         stream: Stream = Stream(None),  # noqa: B008
     ):
         quick_allreduce_int4(
