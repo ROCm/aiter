@@ -158,8 +158,8 @@ def _pa_decode_configs(*args, resources, num_cu, **kwargs):
     return list(capacities.values())
 
 
-def _pa_decode_default(
-    *args,
+def _default_workgroup_budget(
+    *,
     num_cu,
     arch,
     head_dim,
@@ -170,9 +170,8 @@ def _pa_decode_default(
     query_length,
     query_group_size,
     sliding_window,
-    **kwargs,
 ):
-    # The head-256 pipe is tuned for one CTA per CU; other shapes use two.
+    """CU count for the head-256 pipe, otherwise two CTAs per CU."""
     one_cta_per_cu = d256_m1_pipe(
         arch,
         "fp8" if "float8" in kv_dtype else "bf16",
@@ -184,7 +183,29 @@ def _pa_decode_default(
         query_group_size,
         sliding_window,
     )
-    return Config(workgroup_budget=num_cu if one_cta_per_cu else 2 * num_cu)
+    return num_cu if one_cta_per_cu else 2 * num_cu
+
+
+def _pa_decode_default(*args, **kwargs):
+    return Config(
+        workgroup_budget=_default_workgroup_budget(
+            **{
+                name: kwargs[name]
+                for name in (
+                    "num_cu",
+                    "arch",
+                    "head_dim",
+                    "block_size",
+                    "kv_dtype",
+                    "per_token_kv",
+                    "trans_v",
+                    "query_length",
+                    "query_group_size",
+                    "sliding_window",
+                )
+            }
+        )
+    )
 
 
 @contextmanager
@@ -318,11 +339,32 @@ def prepare_pa_decode_plan(
         num_cu = properties.multi_processor_count
         limit = num_cu if max_partitions is None else max_partitions
         num_kv_heads, block_size, layout = _cache_geometry(key_cache)
+        arch = properties.gcnArchName.split(":", 1)[0]
+        window = (
+            max(sliding_window, 0)
+            if isinstance(sliding_window, int)
+            else sliding_window
+        )
+        default_budget = _default_workgroup_budget(
+            num_cu=num_cu,
+            arch=arch,
+            head_dim=query.shape[-1],
+            block_size=block_size,
+            kv_dtype=str(key_cache.dtype),
+            per_token_kv=(
+                isinstance(key_scale, torch.Tensor) and key_scale.numel() > 1
+            ),
+            trans_v=value_cache.ndim == 5,
+            query_length=query_length,
+            query_group_size=query.shape[1] // num_kv_heads,
+            sliding_window=window,
+        )
         # Validate plan geometry even when native autotune takes the default.
         default_plan = plan_pa_decode(
             context_lengths,
             num_kv_heads,
             max_partitions=limit,
+            workgroup_budget=default_budget,
             sliding_window=sliding_window,
             query_length=query_length,
         )
@@ -348,7 +390,6 @@ def prepare_pa_decode_plan(
             limit,
         )
 
-        arch = properties.gcnArchName.split(":", 1)[0]
         config_dir = None if config_dir is None else Path(config_dir)
         tuner = _get_pa_decode_autotuner(arch, config_dir)
         tuning_args = {
@@ -394,7 +435,7 @@ def prepare_pa_decode_plan(
             or config.pre_hook is not None
         ):
             raise ValueError("Invalid PA workgroup budget in FlyDSL autotune cache")
-        if budget == 2 * num_cu:
+        if budget == default_budget:
             return default_plan
         return plan_pa_decode(
             context_lengths,

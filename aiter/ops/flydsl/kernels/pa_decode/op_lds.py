@@ -770,15 +770,16 @@ class PaDecodeKVLoader:
         n_records = fx.Int32(
             rocdl.readfirstlane(T.i32, fx.as_ir_value(live * self.ctx.stride_v_token))
         )
-        v_head_off = (
-            fx.Int64(self.ctx.kv_h) * fx.Int64(self.ctx.stride_v_head)
-            if const_expr(traits.wide_kv_addressing)
-            else fx.Int64(self.ctx.kv_h * self.ctx.stride_v_head)
+        page_base = self.nhd_byte(
+            page,
+            0,
+            0,
+            self.ctx.stride_v_block,
+            self.ctx.stride_v_token,
+            self.ctx.stride_v_head,
         )
         v_page = buffer_ops.create_buffer_resource_from_addr(
-            buf_base_i64(self.ctx.value_cache_ptr)
-            + fx.Int64(page) * fx.Int64(self.ctx.stride_v_block)
-            + v_head_off,
+            buf_base_i64(self.ctx.value_cache_ptr) + fx.Int64(page_base),
             num_records_bytes=n_records,
         )
         region = (
