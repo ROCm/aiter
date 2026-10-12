@@ -570,12 +570,12 @@ def _set_mismatch_ratio(
 ) -> float:
     """Fraction of rows whose selected ids are not the oracle top-k.
 
-    Without ``scores`` the id sets must be equal. With ``scores`` (the
-    oracle row that produced ``ref``), a different id is accepted when
-    its score is at least one fp32 ulp below the worst score ``ref``
-    kept and every strictly better id is still kept. That is an exact
-    tie, or the one-ulp boundary a bf16 dot can land on either side of.
-    A block any lower still counts as a miss.
+    Without ``scores`` the id sets must be equal. With ``scores``, every
+    id strictly above the worst score ``ref`` kept must be selected. An
+    id whose score equals that cutoff must be one ``ref`` kept: equal
+    scores keep the smaller block index. An id whose score differs from
+    the cutoff is accepted only when it is finite and at least one fp32
+    ulp below the cutoff. A block any lower still counts as a miss.
     """
     if scores is None:
         miss = 0
@@ -601,7 +601,17 @@ def _set_mismatch_ratio(
     floor = torch.nextafter(kth, torch.full_like(kth, float("-inf")))
     got_scores = scores.gather(1, got_idx)
     got_valid = got >= 0
-    bad_score = got_valid & (
+    kth_col = kth.unsqueeze(1)
+    # Equal scores keep the smaller index, so a tie id has to be one the
+    # oracle kept. A different id is only the one-ulp boundary below kth.
+    ref_kept = torch.zeros(rows, n_blocks, dtype=torch.bool, device=scores.device)
+    ref_safe = (ref >= 0) & (ref < n_blocks)
+    ref_rows = torch.arange(rows, device=scores.device).unsqueeze(1).expand_as(ref)
+    ref_kept[ref_rows[ref_safe], ref[ref_safe]] = True
+    equal_tie = got_valid & (got_scores == kth_col)
+    bad_tie = equal_tie & ~ref_kept.gather(1, got_idx)
+    boundary = got_valid & (got_scores != kth_col)
+    bad_score = boundary & (
         ~torch.isfinite(got_scores) | (got_scores < floor.unsqueeze(1))
     )
     selected = torch.zeros(rows, n_blocks, dtype=torch.bool, device=scores.device)
@@ -615,7 +625,7 @@ def _set_mismatch_ratio(
     count_bad = (selected.sum(dim=1) != n_got) | (n_got != n_ref)
     required = torch.isfinite(scores) & (scores > kth.unsqueeze(1))
     missing = (required & ~selected).any(dim=1)
-    miss = bad_score.any(dim=1) | ~in_range | count_bad | missing
+    miss = bad_score.any(dim=1) | bad_tie.any(dim=1) | ~in_range | count_bad | missing
     return float(miss.sum().item()) / rows
 
 
@@ -649,7 +659,8 @@ def test_k1_block_ids_require_packed_prefix():
     """A K1 id row is unique valid ids, then only ``-1``.
 
     Order may differ from the oracle. A duplicate, a valid id after
-    ``-1``, or a different id set fails.
+    ``-1``, or a different id set fails. With scores, an exact tie must
+    keep the smaller indexes; only a one-ulp-lower id may substitute.
     """
     ref = torch.tensor([[0, 1, -1]], dtype=torch.int32)
     _assert_k1_block_ids(ref, torch.tensor([[1, 0, -1]], dtype=torch.int32), "order")
@@ -681,6 +692,23 @@ def test_k1_block_ids_require_packed_prefix():
             raise
     else:
         raise AssertionError("a set mismatch passed the K1 check")
+    n, k = 1024, 512
+    tied = torch.ones(1, n)
+    smaller = torch.arange(k, dtype=torch.int32).unsqueeze(0)
+    upper = torch.arange(k, n, dtype=torch.int32).unsqueeze(0)
+    if _set_mismatch_ratio(smaller, smaller, tied) != 0.0:
+        raise AssertionError("the smaller-index half of an exact tie failed")
+    if _set_mismatch_ratio(smaller, upper, tied) == 0.0:
+        raise AssertionError("the upper half of an exact tie passed")
+    one = smaller.clone()
+    one[0, -1] = k
+    boundary = tied.clone()
+    boundary[0, k] = torch.nextafter(tied[0, 0], tied.new_tensor(float("-inf")))
+    if _set_mismatch_ratio(smaller, one, boundary) != 0.0:
+        raise AssertionError("a one-ulp boundary swap was rejected")
+    boundary[0, k] = torch.nextafter(boundary[0, k], tied.new_tensor(float("-inf")))
+    if _set_mismatch_ratio(smaller, one, boundary) == 0.0:
+        raise AssertionError("a two-ulp substitution passed")
 
 
 def _k1_ids_match_oracle(n_heads, m, seq_len, page_size, what, min_blocks=0):
