@@ -1205,14 +1205,14 @@ OPUS_D constexpr unsigned short fp32_to_bf16_rtn_raw(float f)
     else if(bits & 0xffff) { bits |= 0x10000; /* Preserve signaling NaN */ }
     return static_cast<unsigned short>(bits >> 16);
 }
+
 // Optimized software RNE, selected with rounding mode 5. Canonicalizes NaNs to 0x7fff.
 OPUS_D constexpr unsigned short fp32_to_bf16_rtn_fast_raw(float f)
 {
-    const unsigned int bits = __builtin_bit_cast(unsigned int, f);
+    const unsigned int bits    = __builtin_bit_cast(unsigned int, f);
     const unsigned int rounded = bits + 0x7fffu + ((bits >> 16) & 1u);
     // Fast-math builds may optimize away NaN handling.
-    const unsigned int result =
-        ((bits & 0x7fffffffu) > 0x7f800000u) ? 0x7fff0000u : rounded;
+    const unsigned int result  = ((bits & 0x7fffffffu) > 0x7f800000u) ? 0x7fff0000u : rounded;
     return static_cast<unsigned short>(result >> 16);
 }
 #if (defined(__gfx950__) || defined(__gfx1250__) || defined(__gfx1201__) || defined(__gfx1200__)) && __clang_major__ >= 20
