@@ -18,6 +18,16 @@ SLIDING_WINDOW = [128, 2048]
 KV_CACHE_DTYPES = ["auto", "fp8e4m3"]
 
 
+@pytest.fixture(autouse=True)
+def restore_torch_devices():
+    default_device = torch.get_default_device()
+    cuda_device = torch.cuda.current_device() if torch.cuda.is_available() else None
+    yield
+    torch.set_default_device(default_device)
+    if cuda_device is not None:
+        torch.cuda.set_device(cuda_device)
+
+
 def context_attention_fwd_torch(
     query,  # [num_tokens, H, D]
     k,  # [num_tokens, Hkv, D]
@@ -168,15 +178,6 @@ def _get_alibi_slopes(total_num_heads: int, device: torch.Tensor) -> torch.Tenso
         )
         slopes = torch.cat([slopes, torch.pow(extra_base, extra_powers)], dim=0)
     return slopes
-
-
-@pytest.fixture(autouse=True)
-def _restore_default_device():
-    """input_helper sets the torch default device; restore it so tests that run
-    later in the same process keep allocating on CPU by default."""
-    prev_device = torch.get_default_device()
-    yield
-    torch.set_default_device(prev_device)
 
 
 def seed_everything(seed):
