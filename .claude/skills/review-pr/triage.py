@@ -2590,7 +2590,7 @@ if __name__ == "__main__":
                   file=sys.stderr)
             raise SystemExit(1)
         if not want:
-            print(f"CORE FILES: none in this diff, declared")
+            print("CORE FILES: none in this diff, declared")
         else:
             print(f"CORE FILES ASSESSED: {len(want)}/{len(want)} backbone files "
                   f"({sum(1 for _, t in want if t == '1')} tier-1), "
@@ -2657,9 +2657,9 @@ if __name__ == "__main__":
             print(f"PINNED-LAYOUT: {name} gains or loses a field")
             print(f"  {n} assertion(s) in {where} fix its size and field offsets, and this"
                   f" diff changes none of them")
-            print(f"  appending at the end shifts nothing; inserting anywhere else shifts"
-                  f" every offset after it, and the code objects those assertions guard"
-                  f" must be rebuilt")
+            print("  appending at the end shifts nothing; inserting anywhere else shifts"
+                  " every offset after it, and the code objects those assertions guard"
+                  " must be rebuilt")
         raise SystemExit(0)
 
     if mode == "perfclaims":
@@ -2697,8 +2697,8 @@ if __name__ == "__main__":
         for new, old, ratio in pairs:
             print(f"TWIN: {new}")
             print(f"  {ratio:.0%} of its substantive lines already appear in {old}")
-            print(f"  diff the two and look for the asymmetry: dtype width, a mask on one"
-                  f" side only, a flipped stride order, a bound the copy did not adapt")
+            print("  diff the two and look for the asymmetry: dtype width, a mask on one"
+                  " side only, a flipped stride order, a bound the copy did not adapt")
         raise SystemExit(0)
 
     if mode == "testquality":
