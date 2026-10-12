@@ -35,6 +35,9 @@ import argparse
 import os
 import sys
 
+# Direct execution adds op_tests/ to sys.path; shared helpers need its parent.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 import pytest
 import torch
 
@@ -45,7 +48,7 @@ from aiter.ops.opus import opus_bmm, policy
 from aiter.ops.opus.gemm_op_a8w8 import (
     _mxscale_bmm_workspace,
     _opus_gemm_a8w8_mxscale_bmm_launch_raw,
-    bmm_a8w8_mxscale_opus,
+    bmm_a8w8_mxscale_opus_bpreshuffle,
 )
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant
 from aiter.ops.shuffle import shuffle_weight
@@ -705,13 +708,12 @@ def test_public_entry_1x32():
     stale_square_kid = next(
         kid for kid in KIDS_BPRESHUFFLE if policy.mxscale_bmm_kid_block(kid) == "32x32"
     )
-    fallback = bmm_a8w8_mxscale_opus(
+    fallback = bmm_a8w8_mxscale_opus_bpreshuffle(
         x,
         w,
         xs,
         ws,
         kernelId=stale_square_kid,
-        b_preshuffled=True,
         group_n=1,
         group_size=32,
     )

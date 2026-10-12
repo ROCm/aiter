@@ -336,14 +336,14 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
     )
 
     if libtype == "opus":
-        from .opus.gemm_op_a8w8 import bmm_a8w8_mxscale_opus
+        from .opus.gemm_op_a8w8 import bmm_a8w8_mxscale_opus_bpreshuffle
         from .opus.policy import mxscale_bmm_groups_of_block
 
         group_n, group_k = mxscale_bmm_groups_of_block(w_scale_block)
 
         # Whether the tuned kernel can run this M, whether it reads B in the
         # declared layout, and what to do when it cannot, is the backend's job.
-        return bmm_a8w8_mxscale_opus(
+        return bmm_a8w8_mxscale_opus_bpreshuffle(
             x,
             wo_a,
             x_scale,
@@ -352,7 +352,6 @@ def _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
             dtype=dtype,
             kernelId=int(cfg["kernelId"]) if cfg is not None else None,
             splitK=int(cfg["splitK"]) if cfg is not None else None,
-            b_preshuffled=True,
             group_size=group_k,
             group_n=group_n,
         )
@@ -421,7 +420,7 @@ def batched_gemm_a8w8_mxscale_bpreshuffle(
 
     Returns a fresh token-major [M, G, N]. A caller that must write into its own
     buffer calls a backend directly (both keep ``out=``): the arch's
-    ``run_bmm_a8w8_mxfp8_*`` or ``aiter.ops.opus.gemm_op_a8w8.bmm_a8w8_mxscale_opus``.
+    ``run_bmm_a8w8_mxfp8_*`` or ``aiter.ops.opus.gemm_op_a8w8.bmm_a8w8_mxscale_opus_bpreshuffle``.
     """
     return _batched_gemm_a8w8_mxscale_bpreshuffle_impl(
         x, wo_a, x_scale, w_scale, dtype=dtype

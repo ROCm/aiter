@@ -569,42 +569,83 @@ def bmm_a8w8_mxscale_opus(
     dtype: torch.dtype = torch.bfloat16,
     kernelId: int | None = None,
     splitK: int | None = None,
-    b_preshuffled: bool = False,
+    *,
+    group_size: int = 128,
+) -> Tensor:
+    """Run OPUS MXFP8 BMM with a row-major weight.
+
+    ``x`` is [M, G, K], ``wo_a`` is [G, N, K], ``x_scale`` is
+    [M, G, K/group_size], and ``w_scale`` is
+    [G, N/group_size, K/group_size]. Scales are ordinary E8M0 blocks;
+    ``group_size`` is 32 or 128. Returns ``out`` [M, G, N], allocating it
+    with ``dtype`` when omitted.
+
+    ``kernelId=None`` selects the shape heuristic. An incompatible tuned id
+    falls back to a compatible kernel and drops its splitK. ``splitK=None``,
+    0 and 1 all mean no split. Use :func:`bmm_a8w8_mxscale_opus_bpreshuffle`
+    for a weight already in the (16, 16) MFMA-fragment layout.
+    """
+    from .policy import (
+        _heuristic_mxscale_bmm_kid,
+        _validate_mxscale_bmm_group_size,
+        mxscale_bmm_kid_block,
+        mxscale_bmm_kid_runs_m,
+        mxscale_bmm_kid_takes_b_layout,
+        mxscale_bmm_kid_takes_plain_scales,
+    )
+
+    _validate_mxscale_bmm_group_size(group_size)
+    block = f"{group_size}x{group_size}"
+    m, g, k = map(int, x.shape)
+    n = int(wo_a.shape[1])
+    Y = out if out is not None else torch.empty((m, g, n), dtype=dtype, device=x.device)
+
+    # A stale tuned row may name a different layout, scale block or M alignment.
+    # Discard its splitK along with the id before choosing a row-major fallback.
+    if kernelId is not None and not (
+        mxscale_bmm_kid_takes_b_layout(int(kernelId), False)
+        and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
+        and mxscale_bmm_kid_block(int(kernelId)) == block
+        and mxscale_bmm_kid_runs_m(int(kernelId), m)
+    ):
+        kernelId = splitK = None
+    if kernelId is None:
+        kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
+
+    return _launch_bmm_a8w8_mxscale_opus(
+        x, wo_a, x_scale, w_scale, Y, kid=int(kernelId), split_k=splitK
+    )
+
+
+def bmm_a8w8_mxscale_opus_bpreshuffle(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    out: Tensor | None = None,
+    dtype: torch.dtype = torch.bfloat16,
+    kernelId: int | None = None,
+    splitK: int | None = None,
+    *,
     group_size: int = 128,
     group_n: int | None = None,
 ) -> Tensor:
-    """Opus fp8 e8m0 mxscale BMM by kernel id, with admissibility checks.
+    """Run OPUS MXFP8 BMM with an already preshuffled weight.
 
-    mmajor DSV4 wo_a layout: ``x`` [M, G, K] fp8, ``wo_a`` [G, N, K] fp8,
-    ``x_scale`` [M, G, K/group_size], ``w_scale`` [G, N/group_n,
-    K/group_size], ``out`` optional [M, G, N]. Returns the [M, G, N] output.
+    ``wo_a`` [G, N, K] must come from ``shuffle_weight(w, layout=(16, 16))``;
+    this entry does not shuffle it. ``x`` is [M, G, K], ``x_scale`` is
+    [M, G, K/group_size], and ``w_scale`` is
+    [G, N/group_n, K/group_size]. Scales keep their ordinary E8M0 layout.
+    ``group_n`` defaults to ``group_size``; supported weight-scale blocks are
+    32x32, 128x128 and 1x32 (``group_n=1, group_size=32``).
 
-    ``group_n`` defaults to ``group_size``. For per-row K32 weight scales,
-    pass ``group_n=1, group_size=32, b_preshuffled=True``.
-
-    This sits above :func:`_launch_a8w8_mxscale_bmm` rather than inside it
-    because it answers a different question: not "how do I launch this kid" but
-    "may this kid be launched on these tensors at all". ``kernelId`` None falls
-    back to the shape heuristic; the tuned CSV is read one layer up, in
-    batched_gemm_a8w8_mxscale, which hands the tuned id down.
-
-    ``b_preshuffled`` declares that ``wo_a`` arrives in the (16,16)
-    MFMA-fragment layout (``aiter.ops.shuffle.shuffle_weight``), which a serving
-    stack bakes into the weight offline. It has to be declared because it is not
-    observable: the shuffled weight is the same shape, dtype and strides as the
-    row-major one, so a mismatched kid returns a plausible wrong answer instead
-    of failing. An id whose layout disagrees is dropped like one that cannot run
-    this M, and the fallback for the declared layout answers instead: the shape
-    heuristic for row-major B, the first preshuffled kid that runs the shape for
-    preshuffled B. Only a shape no preshuffled kid runs raises.
-
-    Scales are always passed through as given, so an id wanting them rearranged
-    on the host is dropped too, and so is one tuned for the other
-    ``group_size``, which would read the scales at the wrong stride.
+    Returns ``out`` [M, G, N], allocating it with ``dtype`` when omitted.
+    ``kernelId=None`` selects a compatible preshuffled kernel. An incompatible
+    tuned id falls back to one and drops its splitK. ``splitK=None``, 0 and 1
+    all mean no split.
     """
     from .policy import (
         _heuristic_mxscale_bmm_bpreshuffle_kid,
-        _heuristic_mxscale_bmm_kid,
         mxscale_bmm_groups_of_block,
         mxscale_bmm_kid_block,
         mxscale_bmm_kid_runs_m,
@@ -615,40 +656,48 @@ def bmm_a8w8_mxscale_opus(
     group_n = group_size if group_n is None else group_n
     block = f"{group_n}x{group_size}"
     mxscale_bmm_groups_of_block(block)
-    if group_n != group_size and not b_preshuffled:
-        raise ValueError("1x32 OPUS BMM requires b_preshuffled=True")
-    m, g, k = int(x.shape[0]), int(x.shape[1]), int(x.shape[2])
+    m, g, k = map(int, x.shape)
     n = int(wo_a.shape[1])
     Y = out if out is not None else torch.empty((m, g, n), dtype=dtype, device=x.device)
 
-    # A tuned row found at a padded M can name a kernel whose launcher rejects
-    # the real, smaller M; drop its splitK along with it and let the heuristic
-    # pick instead of letting the launcher throw. A kernel wanting the other B
-    # layout, or scales this entry does not rearrange, is dropped the same way --
-    # and those two would not throw, they would answer wrongly.
+    # The preshuffled entry accepts only matching B and ordinary scale layouts.
+    # A padded-M tuned row can also require an alignment the real M lacks.
     if kernelId is not None and not (
-        mxscale_bmm_kid_runs_m(int(kernelId), m)
-        and mxscale_bmm_kid_takes_b_layout(int(kernelId), b_preshuffled)
+        mxscale_bmm_kid_takes_b_layout(int(kernelId), True)
         and mxscale_bmm_kid_takes_plain_scales(int(kernelId))
         and mxscale_bmm_kid_block(int(kernelId)) == block
+        and mxscale_bmm_kid_runs_m(int(kernelId), m)
     ):
         kernelId = splitK = None
     if kernelId is None:
-        if b_preshuffled:
-            kernelId = _heuristic_mxscale_bmm_bpreshuffle_kid(
-                g, m, n, k, group_size=group_size, group_n=group_n, output_dtype=Y.dtype
+        kernelId = _heuristic_mxscale_bmm_bpreshuffle_kid(
+            g, m, n, k, group_size=group_size, group_n=group_n, output_dtype=Y.dtype
+        )
+        if kernelId is None:
+            raise ValueError(
+                f"no preshuffled-B kid runs (g={g}, m={m}, n={n}, k={k}, "
+                f"group_size={group_size}): the tuned row is absent or "
+                f"unusable and no fallback tile divides this N and K "
+                f"for weight scale block {block}."
             )
-            if kernelId is None:
-                raise ValueError(
-                    f"no preshuffled-B kid runs (g={g}, m={m}, n={n}, k={k}, "
-                    f"group_size={group_size}): the tuned row is absent or "
-                    f"unusable and no fallback tile divides this N and K "
-                    f"for weight scale block {block}."
-                )
-        else:
-            kernelId = _heuristic_mxscale_bmm_kid(g, m, n, k, group_size=group_size)
 
-    split_k = int(splitK if splitK is not None else 1)
+    return _launch_bmm_a8w8_mxscale_opus(
+        x, wo_a, x_scale, w_scale, Y, kid=int(kernelId), split_k=splitK
+    )
+
+
+def _launch_bmm_a8w8_mxscale_opus(
+    x: Tensor,
+    wo_a: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    Y: Tensor,
+    *,
+    kid: int,
+    split_k: int | None,
+) -> Tensor:
+    """Allocate split-K workspace and launch the entry's already selected kid."""
+    split_k = int(split_k if split_k is not None else 1)
     if split_k == 0:  # Public no-split convention; launchers require one.
         split_k = 1
     _opus_gemm_a8w8_mxscale_bmm_launch_raw(
@@ -657,8 +706,8 @@ def bmm_a8w8_mxscale_opus(
         Y,
         x_scale,
         w_scale,
-        workspace=_mxscale_bmm_workspace(x, wo_a, Y, int(kernelId), split_k),
-        kid=int(kernelId),
+        workspace=_mxscale_bmm_workspace(x, wo_a, Y, kid, split_k),
+        kid=kid,
         split_k=split_k,
     )
     return Y
@@ -681,5 +730,6 @@ def _mxscale_bmm_workspace(
 
 __all__ = [
     "bmm_a8w8_mxscale_opus",
+    "bmm_a8w8_mxscale_opus_bpreshuffle",
     "opus_gemm_a8w8_blockscale_bpreshuffle_tune",
 ]

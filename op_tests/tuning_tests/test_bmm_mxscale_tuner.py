@@ -319,14 +319,14 @@ def test_1x32_public_dispatch_propagates_both_groups(monkeypatch):
     monkeypatch.setattr(ops, "get_gfx", lambda: "gfx950")
     monkeypatch.setattr(ops, "lookup_mxscale_bmm_config", lambda *a, **kw: None)
     launch = Mock(return_value=object())
-    monkeypatch.setattr(backend, "bmm_a8w8_mxscale_opus", launch)
+    monkeypatch.setattr(backend, "bmm_a8w8_mxscale_opus_bpreshuffle", launch)
     x, w, xs, ws = (
         Mock(shape=s) for s in [(17, 2, 512), (2, 48, 512), (17, 2, 16), (2, 48, 16)]
     )
     ops._batched_gemm_a8w8_mxscale_bpreshuffle_impl(x, w, xs, ws)
     assert launch.call_args.kwargs["group_size"] == 32
     assert launch.call_args.kwargs["group_n"] == 1
-    assert launch.call_args.kwargs["b_preshuffled"] is True
+    launch.assert_called_once()
 
 
 def test_1x32_cpu_quantization_and_reference():
@@ -428,11 +428,86 @@ def test_bmm_no_split_convention(monkeypatch, kid, preshuffled, split_k, expecte
     ws = torch.empty((2, 8, 32), dtype=torch.uint8, device="meta")
     launch = Mock()
     monkeypatch.setattr(backend, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", launch)
-    result = backend.bmm_a8w8_mxscale_opus(
-        x, w, xs, ws, kernelId=kid, splitK=split_k, b_preshuffled=preshuffled
+    run = (
+        backend.bmm_a8w8_mxscale_opus_bpreshuffle
+        if preshuffled
+        else backend.bmm_a8w8_mxscale_opus
     )
+    result = run(x, w, xs, ws, kernelId=kid, splitK=split_k)
     launch.assert_called_once()
     assert launch.call_args.args[2] is result
     assert launch.call_args.kwargs["kid"] == kid
     assert launch.call_args.kwargs["split_k"] == expected
     assert launch.call_args.kwargs["workspace"] is None
+
+
+@pytest.mark.parametrize("preshuffled", [False, True])
+def test_bmm_entry_rejects_tuned_kid_for_other_b_layout(monkeypatch, preshuffled):
+    import torch
+
+    from aiter.ops.opus import gemm_op_a8w8 as backend
+    from aiter.ops.opus import policy
+
+    monkeypatch.setattr(policy, "get_gfx", lambda: "gfx950")
+    x = torch.empty((128, 2, 4096), dtype=torch.float8_e4m3fn, device="meta")
+    w = torch.empty((2, 1024, 4096), dtype=x.dtype, device="meta")
+    xs = torch.empty((128, 2, 32), dtype=torch.uint8, device="meta")
+    ws = torch.empty((2, 8, 32), dtype=torch.uint8, device="meta")
+    out = torch.empty((128, 2, 1024), dtype=torch.float32, device="meta")
+    launch = Mock()
+    monkeypatch.setattr(backend, "_opus_gemm_a8w8_mxscale_bmm_launch_raw", launch)
+    wrong_kid = 8320 if preshuffled else 8179
+    run = (
+        backend.bmm_a8w8_mxscale_opus_bpreshuffle
+        if preshuffled
+        else backend.bmm_a8w8_mxscale_opus
+    )
+    result = run(x, w, xs, ws, out=out, kernelId=wrong_kid, splitK=4)
+    launch.assert_called_once()
+    assert result is out
+    assert launch.call_args.args == (x, w, out, xs, ws)
+    selected = launch.call_args.kwargs["kid"]
+    assert selected != wrong_kid
+    assert policy.mxscale_bmm_kid_takes_b_layout(selected, preshuffled)
+    assert launch.call_args.kwargs["split_k"] == 1
+    assert launch.call_args.kwargs["workspace"] is None
+
+
+def test_bpreshuffle_script_help_without_repo_on_path(tmp_path):
+    # Emulate an installed aiter package plus a script launched by file path:
+    # aiter/csrc can be imported, but the repository's op_tests package cannot.
+    script = textwrap.dedent("""
+        import os
+        import runpy
+        import sys
+        from pathlib import Path
+
+        root = Path(sys.argv[1]).resolve()
+        sys.path.insert(0, str(root))
+        import aiter
+        import csrc.opus_gemm.opus_gemm_common
+
+        installed_aiter = aiter.__file__
+        sys.path[:] = [str(root / "op_tests")] + [
+            p for p in sys.path if Path(p or os.getcwd()).resolve() != root
+        ]
+        sys.argv = [
+            str(root / "op_tests/test_batched_gemm_a8w8_mxscale_bpreshuffle.py"),
+            "--help",
+        ]
+        try:
+            runpy.run_path(sys.argv[0], run_name="__main__")
+        except SystemExit as exc:
+            assert exc.code == 0
+        assert aiter.__file__ == installed_aiter
+        """)
+    result = subprocess.run(
+        [sys.executable, "-c", script, str(_ROOT)],
+        cwd=tmp_path,
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "--split-k" in result.stdout
