@@ -2,6 +2,7 @@ name: Windows Smoke Test
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
       - ".github/workflows/windows-smoke-test.yaml"
@@ -22,6 +23,7 @@ concurrency:
 jobs:
   jit-op-smoke:
     name: JIT op smoke (gfx1201)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.draft == false }}
     runs-on: windows-gfx1201-gpu-rocm
     timeout-minutes: 90
     env:
