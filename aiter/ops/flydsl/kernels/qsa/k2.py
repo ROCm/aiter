@@ -144,6 +144,53 @@ def _launch_config(
     return block_n, threads, min(max_useful_splits, target_splits)
 
 
+def _merge_threads(head_dim: int, n_splits: int) -> int:
+    """Workgroup width of the split merge.
+
+    Each thread walks every split for its own D element. Past ~128 deep the
+    scheduler serializes that chain, so the workgroup widens instead. It
+    stops at one element per thread: further threads would own no D.
+    """
+    merge_threads = min(128, head_dim)
+    while merge_threads < head_dim and n_splits * (head_dim // merge_threads) > 128:
+        merge_threads *= 2
+    return merge_threads
+
+
+def _k2_coverage_reason(
+    head_dim: int,
+    block_n: int,
+    block_threads: int,
+    n_splits: int,
+) -> str | None:
+    """Why this launch drops a tail of D, or None when every dimension is covered.
+
+    The gather issues eight-element chunks, ``block_threads // block_n`` of
+    them per round, and integer division drops a short round (D=32 has no
+    round and the builder's ``next`` raises; D=96 gathers 64). The K image
+    splits those rounds by a quarter radix of at most 4, so a remainder
+    aliases. A split merge writes ``head_dim // merge_threads`` strides of
+    its workgroup; a one-split launch stores from the split kernel and
+    skips that merge.
+    """
+    col_owners = block_threads // block_n
+    d_chunks = head_dim // 8
+    if col_owners < 1 or d_chunks < col_owners or d_chunks % col_owners:
+        return f"head_dim {head_dim} does not fill the {block_n}x{block_threads} gather"
+    gather_rounds = d_chunks // col_owners
+    quarter = min(4, gather_rounds)
+    if gather_rounds % quarter:
+        return f"head_dim {head_dim} does not fill the K LDS map"
+    num_waves = block_threads // 64
+    if num_waves < 1 or head_dim % (num_waves * 16):
+        return f"head_dim {head_dim} does not fill the PV tile"
+    if n_splits > 1:
+        merge_threads = _merge_threads(head_dim, n_splits)
+        if merge_threads < 1 or head_dim % merge_threads:
+            return f"head_dim {head_dim} leaves a merge tail at {merge_threads} threads"
+    return None
+
+
 def build_qsa_k2_module(
     n_q_heads: int,
     n_kv_heads: int,
@@ -193,14 +240,13 @@ def build_qsa_k2_module(
     # The merge reduces LSE in one wave, so a lane owns this many splits.
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
-    # Each thread walks every split for its own D element, so the unrolled
-    # load chain is n_splits * (head_dim / merge_threads) deep. Past ~128 the
-    # scheduler serializes it, so widen the workgroup instead of deepening the
-    # chain -- but stop at one element per thread, past which the extra
-    # threads own no D and the merge would write nothing.
-    merge_threads = min(128, head_dim)
-    while merge_threads < head_dim and n_splits * (head_dim // merge_threads) > 128:
-        merge_threads *= 2
+    merge_threads = _merge_threads(head_dim, n_splits)
+    # Same predicate qsa_k2_serves applies to the selected launch. Raising
+    # here keeps a direct builder call from StopIteration on an empty gather
+    # or from compiling a kernel that writes only a prefix of D.
+    coverage = _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)
+    if coverage is not None:
+        raise ValueError(coverage)
 
     num_waves = block_threads // 64
     n_subtiles = block_n // 16
@@ -1381,10 +1427,10 @@ def qsa_k2_serves(
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
     if k_cache.shape[3] != q.shape[2]:
         return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
-    # The same geometries build_qsa_k2_module rejects. BLOCK_N, the workgroup,
-    # and the split count come from _launch_config inside that builder's
-    # ranges, so they are not properties of these tensors. A reason here is
-    # what keeps auto on Triton instead of launching a compile that raises.
+    # The same geometries build_qsa_k2_module rejects for the launch
+    # _launch_config would compile from these tensors. A reason here keeps
+    # auto on Triton instead of compiling a kernel that raises or drops a
+    # tail of D. BLOCK_N and the workgroup still come from that policy.
     n_q_heads = int(q.shape[1])
     n_kv_heads = int(k_cache.shape[2])
     head_dim = int(q.shape[2])
@@ -1418,7 +1464,10 @@ def qsa_k2_serves(
         return (
             f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
         )
-    return None
+    block_n, block_threads, n_splits = _launch_config(
+        int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim
+    )
+    return _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)
 
 
 def _take_k2_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
