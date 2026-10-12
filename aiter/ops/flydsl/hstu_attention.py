@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import functools
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -22,6 +23,10 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dq import (
     build_hstu_attention_bwd_dq,
+)
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dvdk_pp import (
+    build_hstu_attention_bwd_dvdk_pp,
+    validate_hstu_attention_bwd_dvdk_pp,
 )
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_fwd import (
     build_hstu_attention_fwd,
@@ -493,7 +498,20 @@ def _validate_bwd_inputs(
 # CSV tags identify the fused dV+dK kernel and the dQ kernel.
 _BWD_KERNEL_DVDK = "dvdk"
 _BWD_KERNEL_DQ = "dq"
-_BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ)
+# Ping-pong dV/dK variant. Opt-in only: it is reached when a tuned CSV row
+# carries this discriminator, or via AITER_HSTU_BWD_PINGPONG=1 during
+# development. It is never a default or a fallback, so a shape with no such row
+# keeps the shipping `dvdk` kernel.
+_BWD_KERNEL_DVDK_PP = "dvdk_pp"
+_BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ, _BWD_KERNEL_DVDK_PP)
+# The only tile the ping-pong kernel is built for: 8 waves give 2 per SIMD
+# inside one barrier domain, and 384 keeps 48 KV rows per wave.
+_BWD_PINGPONG_TILES = {
+    "block_m": 384,
+    "block_n": 16,
+    "num_waves": 8,
+    "waves_per_eu": 2,
+}
 
 _BWD_CSV_COLUMNS: list[str] = [
     "arch",
@@ -780,7 +798,39 @@ def _compile_bwd_launcher(
     dvdk_config = _resolve(_BWD_KERNEL_DVDK)
     dq_config = _resolve(_BWD_KERNEL_DQ)
 
-    dvdk_launcher = build_hstu_attention_bwd_dvdk(**common_kwargs, **dvdk_config)
+    # Opt-in ping-pong dV/dK. Reached only when a tuned row carries the
+    # `dvdk_pp` discriminator, or the development env var is set -- and only if
+    # the strict shape gate then passes. It is never a default and never a
+    # fallback, so a shape with no such row keeps the shipping `dvdk` kernel.
+    dvdk_builder = build_hstu_attention_bwd_dvdk
+    pp_tuned = _get_bwd_tuned_config(
+        kernel=_BWD_KERNEL_DVDK_PP,
+        dtype_str=dtype_str,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        max_seq_len=max_seq_len,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        has_targets=has_targets,
+    )
+    if pp_tuned or os.environ.get("AITER_HSTU_BWD_PINGPONG", "") in ("1", "true"):
+        # The env-var path supplies the one tile this kernel is specialized for;
+        # a tuned row brings its own and has to match the gate anyway.
+        pp_config = {**_BWD_PINGPONG_TILES, **pp_tuned, **custom_config}
+        try:
+            validate_hstu_attention_bwd_dvdk_pp(
+                **{k: v for k, v in common_kwargs.items() if k != "has_perm"},
+                **pp_config,
+            )
+        except ValueError as exc:
+            logger.warning("hstu bwd dvdk ping-pong not applicable, using dvdk: %s", exc)
+        else:
+            dvdk_builder = build_hstu_attention_bwd_dvdk_pp
+            dvdk_config = pp_config
+
+    dvdk_launcher = dvdk_builder(**common_kwargs, **dvdk_config)
     dq_launcher = build_hstu_attention_bwd_dq(**common_kwargs, **dq_config)
     return dvdk_launcher, dq_launcher
 

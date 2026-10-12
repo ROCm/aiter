@@ -121,6 +121,21 @@ def exp2_f32(x):
     )
 
 
+def phase_barrier():
+    """Workgroup barrier that the machine scheduler may not move code across.
+
+    Used by the ping-pong backward kernel to separate its MFMA and VALU phases.
+    The ``sched_barrier`` fences are load-bearing: ``s_barrier`` alone does not
+    stop pure VALU sinking, so part of the gate migrates into the next MFMA
+    phase and the two phases stop being disjoint. This is deliberately not
+    ``gpu.barrier()``, whose memory fence adds an ``s_waitcnt lgkmcnt(0)`` --
+    this kernel places its waits by hand.
+    """
+    fx.rocdl.sched_barrier(0)
+    fx.rocdl.s_barrier()
+    fx.rocdl.sched_barrier(0)
+
+
 def make_mfma_acc(mfma_k: int, lane_k: int, elem_dtype, c_rmem):
     """Build one ``acc(a_pack, b_pack, c) -> c'`` for an MFMA of depth ``mfma_k``.
 
