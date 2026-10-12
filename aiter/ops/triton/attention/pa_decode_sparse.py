@@ -255,8 +255,22 @@ def pa_decode_sparse(
     # Its first 512 bytes are byte-identical to an ATOM 2buff row and the last
     # 128 are its RoPE row, so a one-tensor paged cache is simply sliced into
     # the two buffers the 2buff kernel already reads -- no separate kernel.
+    #
+    # gfx1250 ONLY, and the arch test is load-bearing: gfx950's packed path
+    # takes a cache in the SAME layout (3-D, 640-byte rows, fp8/uint8 -- see
+    # op_tests/.../test_pa_decode_sparse.py::make_packed_cache, which serves
+    # both). Shape and dtype therefore cannot tell the two apart. Without the
+    # arch test this sniff claims every gfx950 fp8 call and routes it into
+    # _pa_decode_sparse_v4_2buff, which raises "gfx1250-only" -- that is what
+    # broke the gfx950 CI, including upstream's own
+    # test_pa_decode_sparse_inv_rope_mxfp8_epilogue.
+    #
+    # Only the implicit sniff is gated. An explicit unified_kv_rope on gfx950
+    # still reaches the raise below, which is right: that is a caller asking
+    # for the 2buff path by name on an arch that has no such kernel.
     if (
-        unified_kv_rope is None
+        DEVICE_ARCH == "gfx1250"
+        and unified_kv_rope is None
         and unified_kv.dim() == 3
         and unified_kv.shape[-1] == _V4_REC_ALIGNED
         and unified_kv.dtype in _V4_PACKED_FP8_DTYPES
