@@ -1094,6 +1094,8 @@ def qsa_k1_serves(
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
     if k_cache.shape[2] != _KV_HEADS or k_cache.shape[3] != _D:
         return f"k_cache KV/D must be ({_KV_HEADS}, {_D}), got {k_cache.shape[2:]}"
+    if k_cache.shape[1] < 1:
+        return f"page_size must be positive, got {int(k_cache.shape[1])}"
     # Read in place. vLLM's per-layer view keeps D contiguous and the token
     # stride at D; the page stride is padded. The gather is a 16-byte load,
     # so that stride has to be a multiple of 8 elements. A copy is not.
@@ -1145,7 +1147,9 @@ def qsa_k1_block_ids(
     16 query rows, except gfx942 H=8; other inputs use one row per
     workgroup. Selection is the stable decode radix below 32768 columns
     and streaming radix (``tie='low'``) at or above that width.
-    Expand+tail is still separate.
+    Expand+tail is still separate. An empty context, cache, or page table
+    writes ``-1`` and does not launch. A page table with fewer request
+    rows than ``context_lens`` is rejected.
 
     ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
     narrow; the ``(4, 8)`` default also admits the 8-head indexer.
@@ -1160,6 +1164,11 @@ def qsa_k1_block_ids(
         raise ValueError(f"query_positions must be int32 [{m}]")
     if context_lens.dim() != 1 or context_lens.dtype != torch.int32:
         raise ValueError("context_lens must be 1-D int32")
+    if context_lens.shape[0] > page_table.shape[0]:
+        raise ValueError(
+            f"page_table has {int(page_table.shape[0])} request rows for "
+            f"{int(context_lens.shape[0])} context lengths"
+        )
     if out is None:
         out = torch.empty(m, _K, dtype=torch.int32, device=q.device)
     elif out.shape != (m, _K) or out.dtype != torch.int32:
@@ -1172,6 +1181,16 @@ def qsa_k1_block_ids(
     if any(t.device != q.device for t in tensors[1:]):
         raise ValueError("every tensor must be on the same GPU")
     qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
+    # The scorers clamp a missing request or page to 0 and still load it.
+    # An empty axis has no such element, and every selection is -1.
+    if (
+        m == 0
+        or context_lens.shape[0] == 0
+        or k_cache.shape[0] == 0
+        or page_table.shape[0] == 0
+        or page_table.shape[1] == 0
+    ):
+        return out.fill_(-1)
     q = q.contiguous()
     # Leave k_cache strided. contiguous() would copy a vLLM layer view into
     # every captured decode graph.
