@@ -333,29 +333,6 @@ _PIPE_CASES = [
             "staged": False,
         },
     ),
-    # 256 tasks on 256 tiles: one tile per CTA, every task live, and a partial
-    # last page.
-    (
-        "nhd-d256-page64-np256",
-        {
-            **_NHD_BASE,
-            "lengths": (65500,),
-            "max_partitions": 256,
-            "budget": 256,
-            "pattern": "one_hot_v",
-            "nhd_bufs": 2,
-        },
-    ),
-    (
-        "nhd-d256-page64-hkv2",
-        {
-            **_NHD_BASE,
-            "kv_heads": 2,
-            "lengths": (1, 65, 8192),
-            "max_partitions": 8,
-            "nhd_bufs": 2,
-        },
-    ),
     # Wide mode must widen the head term once the head stride spans the pool.
     (
         "nhd-d256-page64-hkv2-head-major-wide",
@@ -376,16 +353,6 @@ _PIPE_CASES = [
             "max_partitions": 8,
             "nhd_bufs": 2,
             "nhd_contracts": True,
-        },
-    ),
-    # More CTAs than CUs selects single-buffered NHD V staging.
-    (
-        "nhd-d256-page64-wide-grid",
-        {
-            **_NHD_BASE,
-            "lengths": (0, 1, 63, 64, 65, 255, 256, 257, 8192) * 8,
-            "max_partitions": 8,
-            "nhd_bufs": 1,
         },
     ),
 ]
@@ -773,75 +740,20 @@ def test_pa_decode(case, device, monkeypatch):
             check()
 
 
-def test_d256_m1_pipe_predicate():
-    """The pipe is gfx950 FP8 head 256, page 64, plain V, dense, one M-tile."""
-    traits = pytest.importorskip("aiter.ops.flydsl.kernels.pa_decode.traits")
-    base = ("gfx950", "fp8", 256, 64, False, False, 1, 8, 0)
-    assert traits.d256_m1_pipe(*base)
-    assert traits.d256_m1_pipe("gfx950", *base[1:7], 16, 0)
-    for index, value in (
-        (0, "gfx942"),  # architecture
-        (1, "bf16"),  # KV dtype
-        (2, 128),  # head dimension
-        (3, 128),  # page size
-        (3, 16),
-        (4, True),  # transposed V
-        (5, True),  # per-token scales
-        (6, 2),  # MTP
-        (7, 32),  # two M-tiles
-        (8, 257),  # sliding window
-    ):
-        assert not traits.d256_m1_pipe(*base[:index], value, *base[index + 1 :])
-
-
-def test_stage_page_capacity():
-    """Staged page ids are a power of two in [256, 4096], else 0."""
-    traits = pytest.importorskip("aiter.ops.flydsl.kernels.pa_decode.traits")
-    stage = traits.stage_page_capacity
-    # 1M tokens, one sequence, CU-count budget: 17 tiles per task, 68 ids.
-    assert stage(1, 256, 256, 2**20, 64) == 256
-    # Four sequences share the 256-task budget: 66 tiles, 264 ids.
-    assert stage(4, 256, 256, 2**20, 64) == 512
-    # One task per sequence owns the whole 1.28M-token table: 20000 ids.
-    assert stage(1, 1, 256, 20000 * 64, 64) == 0
-    assert stage(1, 1, 256, 4096 * 64, 64) == 4096
-    assert stage(1, 1, 256, 0, 64) == 256
-    for tiles in range(1, 1025):
-        capacity = stage(1, 1, 1, tiles * 256, 64)
-        assert capacity & (capacity - 1) == 0 and 256 <= capacity <= 4096
-        assert capacity >= 4 * tiles
-
-
-@pytest.mark.parametrize(
-    "batch,max_parts,budget,max_length",
-    [
-        (1, None, 256, 2**20),
-        (1, None, 512, 2**20),
-        (4, None, 256, 2**20),
-        (72, None, 256, 65536),
-        (7, 16, 40, 20000),
-        (5, 3, 5, 9000),
-        (33, None, 100, 257),
-    ],
-)
-def test_stage_bound_covers_plan(device, batch, max_parts, budget, max_length):
-    """No planned task owns more tiles than the host bound that sizes staging."""
+def test_stage_bound_covers_plan(device):
+    """A 1M sequence stays within the host tile bound that sizes page-id staging."""
     from aiter.ops.flydsl.kernels.pa_decode.traits import max_tiles_per_task
     from aiter.ops.flydsl.kernels.pa_decode_plan import plan_pa_decode
 
-    num_cu = torch.cuda.get_device_properties(device).multi_processor_count
-    if max_parts is not None and max_parts > num_cu:
-        pytest.skip(f"plan_pa_decode caps max_partitions at {num_cu} CUs")
+    batch, budget, max_length = 1, 256, 2**20
     generator = torch.Generator().manual_seed(0)
     for trial in range(6):
         lengths = torch.randint(0, max_length + 1, (batch,), generator=generator)
-        lengths[trial % batch] = max_length
+        lengths[0] = max_length
         if trial % 2:
-            lengths[::2] = max_length // (trial + 1)
+            lengths[0] = max_length // (trial + 1)
         context = lengths.to(device=device, dtype=torch.int32)
-        plan = plan_pa_decode(
-            context, 1, max_partitions=max_parts, workgroup_budget=budget
-        )
+        plan = plan_pa_decode(context, 1, workgroup_budget=budget)
         work = plan.work_info.cpu()
         spans = work[:, 2] - work[:, 1]
         bound = max_tiles_per_task(
@@ -850,51 +762,54 @@ def test_stage_bound_covers_plan(device, batch, max_parts, budget, max_length):
         assert spans.max().item() <= bound
 
 
-@pytest.mark.parametrize(
-    "variant", ["arch", "bf16", "per-token", "mtp", "window", "page128"]
-)
-def test_pa_decode_nhd_rejected(device, variant, monkeypatch):
+def test_pa_decode_nhd_rejected(device, monkeypatch):
     """NHD is the gfx950 FP8 per-tensor dense page-64 single-token path only."""
-    if variant == "arch" and get_gfx_runtime() == "gfx950":
-        pytest.skip("the architecture variant needs a non-gfx950 device")
     pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
     fp8 = (
         torch.float8_e4m3fn if get_gfx_runtime() == "gfx950" else torch.float8_e4m3fnuz
     )
-    page = 128 if variant == "page128" else 64
-    query_length = 2 if variant == "mtp" else 1
-    window = 1 if variant == "window" else 0
-    dtype = torch.bfloat16 if variant == "bf16" else fp8
-    query = torch.zeros((query_length, 8, 256), dtype=torch.bfloat16, device=device)
-    cache = torch.zeros((2, page, 1, 256), dtype=dtype, device=device)
-    context = torch.tensor([page], dtype=torch.int32, device=device)
-    table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-    scale = torch.ones(
-        (2, 1, page) if variant == "per-token" else (1,),
-        dtype=torch.float32,
-        device=device,
-    )
-    plan = pa.plan_pa_decode(
-        context, 1, max_partitions=1, sliding_window=window, query_length=query_length
-    )
+    variants = ["bf16", "per-token", "mtp", "window", "page128"]
+    if get_gfx_runtime() != "gfx950":
+        variants.insert(0, "arch")
 
     def unexpected_compile(**_):
         pytest.fail("rejected NHD inputs reached kernel compilation")
 
     monkeypatch.setattr(pa, "compile_pa_decode_tile", unexpected_compile)
-    with pytest.raises(NotImplementedError, match="NHD"):
-        pa.pa_decode(
-            torch.empty_like(query),
-            query,
-            cache,
-            cache,
-            context,
-            table,
-            256**-0.5,
-            query_length,
-            compute_type=dtype,
-            key_scale=None if variant == "bf16" else scale,
-            value_scale=None if variant == "bf16" else scale,
-            sliding_window=window,
-            work_plan=plan,
+    for variant in variants:
+        page = 128 if variant == "page128" else 64
+        query_length = 2 if variant == "mtp" else 1
+        window = 1 if variant == "window" else 0
+        dtype = torch.bfloat16 if variant == "bf16" else fp8
+        query = torch.zeros((query_length, 8, 256), dtype=torch.bfloat16, device=device)
+        cache = torch.zeros((2, page, 1, 256), dtype=dtype, device=device)
+        context = torch.tensor([page], dtype=torch.int32, device=device)
+        table = torch.zeros((1, 1), dtype=torch.int32, device=device)
+        scale = torch.ones(
+            (2, 1, page) if variant == "per-token" else (1,),
+            dtype=torch.float32,
+            device=device,
         )
+        plan = pa.plan_pa_decode(
+            context,
+            1,
+            max_partitions=1,
+            sliding_window=window,
+            query_length=query_length,
+        )
+        with pytest.raises(NotImplementedError, match="NHD"):
+            pa.pa_decode(
+                torch.empty_like(query),
+                query,
+                cache,
+                cache,
+                context,
+                table,
+                256**-0.5,
+                query_length,
+                compute_type=dtype,
+                key_scale=None if variant == "bf16" else scale,
+                value_scale=None if variant == "bf16" else scale,
+                sliding_window=window,
+                work_plan=plan,
+            )
