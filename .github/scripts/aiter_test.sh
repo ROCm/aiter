@@ -151,6 +151,21 @@ for file in "${sharded_files[@]}"; do
         op_tests/test_flydsl_pa_decode.py)
             test_cmd=(timeout 60m python3 -m pytest -q "$file")
             ;;
+        op_tests/test_flydsl_qsa.py)
+            {
+                echo "Running QSA unit cases with pytest, then the perf sweep"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    python3 -m pytest -q "$test_file"
+                    python3 "$test_file"
+                '
+                _ "$file"
+            )
+            ;;
         op_tests/test_gemm_a6w6.py)
             {
                 echo "Running tuned dispatch plus every compatible A6W6 ASM kernel"

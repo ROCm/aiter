@@ -1,18 +1,20 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA oracle, family A plumbing, live vLLM AMD, FlyDSL K1/K2.
+"""QSA oracle, live vLLM AMD, and FlyDSL K1/K2.
 
 Two layers:
-  * Correctness (pytest gate): ``test_*`` unit cases.
-  * Perf sweep (``__main__``): ``bench_qsa_family_a_plumbing``,
-    ``bench_qsa_family_a_vllm_amd``,
+  * Correctness (pytest): ``test_*`` unit cases. CI runs pytest on this
+    file, then this script for the sweep. ``main`` only sweeps.
+  * Perf sweep (``__main__``): ``bench_qsa_family_a_vllm_amd``,
     ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table;
     HIP-graph select columns for FlyDSL and live AMD when the table is
     wider than 20000 columns and ``M<=64``),
-    ``bench_qsa_family_b_k1`` (emit; long-``L`` uses family A scorer; published point),
+    ``bench_qsa_family_b_k1`` (H=8 emit; long-``L`` is H=8; the published
+    page-size-8 point stays H=4),
     ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table),
-    ``bench_qsa_family_a_e2e`` / ``bench_qsa_family_b_e2e`` (indexer through GQA),
+    ``bench_qsa_family_a_e2e`` / ``bench_qsa_family_b_e2e`` (indexer through
+    GQA; family B keeps both head counts),
     ``bench_qsa_family_a_e2e_graph`` (HIP graph replay at decode).
 
 Usage::
@@ -36,12 +38,10 @@ and K2 use for a serving KV pool.
 from __future__ import annotations
 
 import argparse
-import inspect
 import itertools
 import math
 import os
 import sys
-import types
 
 import pandas as pd
 import torch
@@ -53,7 +53,6 @@ from aiter.ops.flydsl.kernels.qsa import k1 as k1_kernel
 from aiter.ops.flydsl.kernels.qsa.k2 import build_qsa_k2_module, qsa_k2_serves
 from aiter.ops.flydsl.qsa import (
     gather_paged_cache,
-    gather_qsa_caches,
     normalize_qsa_backend,
     pack_paged_cache,
     qsa_auto_uses_flydsl,
@@ -456,111 +455,6 @@ def _pack_family_a(k_bar, k, v, page_size, device):
     if not torch.equal(kv_table, kv_table_v):
         raise RuntimeError("K and V page tables diverged")
     return index_cache, index_table, k_cache, v_cache, kv_table
-
-
-@benchmark()
-def bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate=0):
-    """Paged family A tensors + block tables; oracle on gather vs dense.
-
-    No competitor kernel. ``paged_gather`` is the only timed candidate (copy
-    through the page table). The oracle is the reference and is not timed.
-    """
-    idx = FAMILY_A_INDEXER
-    gqa = FAMILY_A_GQA
-    device = torch.device("cuda")
-    n_blocks = seq_len // idx.compress_ratio
-    torch.manual_seed(0)
-    q_indexer = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtype, device=device)
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
-    q_gqa = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device)
-    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
-    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-
-    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
-        k_bar, k, v, page_size, device
-    )
-    assert index_cache.shape[2] == idx.kv_heads
-    assert k_cache.shape[2] == gqa.kv_heads
-    assert k_cache.shape[-1] == gqa.head_dim
-
-    (k_bar_g, k_g, v_g), us = _time(
-        gather_qsa_caches,
-        index_cache,
-        index_table,
-        k_cache,
-        v_cache,
-        kv_table,
-        n_blocks,
-        seq_len,
-        rotate=rotate,
-    )
-    err_kbar = checkAllclose(
-        k_bar.to(dtypes.fp32),
-        k_bar_g.to(dtypes.fp32),
-        rtol=0,
-        atol=0,
-        msg="paged gather index-K",
-    )
-    err_k = checkAllclose(
-        k.to(dtypes.fp32), k_g.to(dtypes.fp32), rtol=0, atol=0, msg="paged gather K"
-    )
-    err_v = checkAllclose(
-        v.to(dtypes.fp32), v_g.to(dtypes.fp32), rtol=0, atol=0, msg="paged gather V"
-    )
-
-    dense = qsa_oracle(
-        q_indexer,
-        k_bar,
-        q_gqa,
-        k,
-        v,
-        qpos,
-        slen,
-        token_to_req,
-        idx,
-        gqa,
-        score_scale=FAMILY_A_SCORE_SCALE,
-        out_dtype=dtypes.fp32,
-    )
-    paged = qsa_oracle(
-        q_indexer,
-        k_bar_g,
-        q_gqa,
-        k_g,
-        v_g,
-        qpos,
-        slen,
-        token_to_req,
-        idx,
-        gqa,
-        score_scale=FAMILY_A_SCORE_SCALE,
-        out_dtype=dtypes.fp32,
-    )
-    err_o = checkAllclose(
-        dense.output, paged.output, rtol=1e-2, atol=1e-2, msg="oracle dense vs paged"
-    )
-    blocks_match = torch.equal(dense.block_ids, paged.block_ids)
-    indices_match = torch.equal(dense.indices, paged.indices)
-    if not blocks_match or not indices_match:
-        raise AssertionError("oracle block_ids/indices diverged after paged gather")
-
-    elem = dtype.itemsize
-    nbytes = (
-        n_blocks * idx.kv_heads * idx.head_dim
-        + 2 * seq_len * gqa.kv_heads * gqa.head_dim
-    ) * elem
-    return {
-        "gfx": get_gfx(),
-        "n_blocks": n_blocks,
-        "index_width": idx.index_width,
-        "paged_gather us": us,
-        "paged_gather TFLOPS": 0.0,
-        "paged_gather TB/s": nbytes / us / 1e6,
-        "paged_gather err": max(err_kbar, err_k, err_v, err_o),
-    }
 
 
 def _set_mismatch_ratio(
@@ -2220,54 +2114,48 @@ def bench_qsa_family_a_k1(
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
-    (_indices, block_ids), k1_us = _time(
-        _flydsl_k1_select,
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-        idx.token_budget,
-        idx.compress_ratio,
-        rotate=rotate,
-        heads=(4,),
-    )
-    k1_err = _set_mismatch_ratio(ref_ids, block_ids, ref_scores)
-
-    (_indices, vllm_ids), vllm_us = _time(
-        qsa_select_paged_tokens,
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-        idx.token_budget,
-        idx.compress_ratio,
-        rotate=rotate,
-    )
-    vllm_err = _set_mismatch_ratio(ref_ids, vllm_ids, ref_scores)
-
     flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
     nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
+    select_args = (
+        q_indexer,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        idx.token_budget,
+        idx.compress_ratio,
+    )
+    # Paged caches stay positional so ``_time`` can rotate them.
+    candidates = {
+        "flydsl_k1": (_flydsl_k1_select, {"heads": (4,)}),
+        "vllm_amd_select": (qsa_select_paged_tokens, {}),
+    }
+    ret = {
+        "gfx": get_gfx(),
+        "n_blocks": n_blocks,
+        "n_pages": int(index_table.shape[1]),
+        "cache_span_gib": _span_gib(index_cache),
+    }
+    for name, (fn, extra) in candidates.items():
+        got, us = _time(fn, *select_args, rotate=rotate, **extra)
+        err = _set_mismatch_ratio(ref_ids, got[1], ref_scores)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
     # Capture takes the one-workgroup radix on a padded decode table.
     # The eager column above readbacks and streams once the live width
     # crosses 32768 columns, so the two FlyDSL times are the two selectors.
     n_columns = int(index_table.shape[1]) * int(page_size)
-    graph_select = (
+    if (
         m <= k1_kernel._DECODE_MAX_ROWS
         and n_columns > k1_kernel._ONE_WORKGROUP_MAX_ROW_WIDTH
-    )
-    graph_us = None
-    graph_err = None
-    amd_graph_us = None
-    amd_graph_err = None
-    if graph_select:
+    ):
         block_ids_g = torch.empty(m, idx.block_budget, dtype=dtypes.i32, device=device)
         indices_g = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
 
-        def launch():
+        def flydsl_graph():
             qsa_k1_block_ids(
                 q_indexer,
                 index_cache,
@@ -2288,13 +2176,10 @@ def bench_qsa_family_a_k1(
                 out=indices_g,
             )
 
-        graph_us = _capture_replay_us(launch)
-        graph_err = _set_mismatch_ratio(ref_ids, block_ids_g, ref_scores)
-
         amd_indices = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
         amd_blocks: dict[str, torch.Tensor] = {}
 
-        def amd_launch():
+        def amd_graph():
             _out, blocks = qsa_select_paged_tokens(
                 q_indexer,
                 index_cache,
@@ -2308,31 +2193,17 @@ def bench_qsa_family_a_k1(
             )
             amd_blocks["ids"] = blocks
 
-        amd_graph_us = _capture_replay_us(amd_launch)
-        amd_graph_err = _set_mismatch_ratio(ref_ids, amd_blocks["ids"], ref_scores)
-    ret = {
-        "gfx": get_gfx(),
-        "n_blocks": n_blocks,
-        "n_pages": int(index_table.shape[1]),
-        "cache_span_gib": _span_gib(index_cache),
-        "flydsl_k1 us": k1_us,
-        "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
-        "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
-        "flydsl_k1 err": k1_err,
-        "vllm_amd_select us": vllm_us,
-        "vllm_amd_select TFLOPS": flops / vllm_us / 1e6,
-        "vllm_amd_select TB/s": nbytes / vllm_us / 1e6,
-        "vllm_amd_select err": vllm_err,
-    }
-    if graph_us is not None:
-        ret["flydsl_k1_graph us"] = graph_us
-        ret["flydsl_k1_graph TFLOPS"] = flops / graph_us / 1e6
-        ret["flydsl_k1_graph TB/s"] = nbytes / graph_us / 1e6
-        ret["flydsl_k1_graph err"] = graph_err
-        ret["vllm_amd_select_graph us"] = amd_graph_us
-        ret["vllm_amd_select_graph TFLOPS"] = flops / amd_graph_us / 1e6
-        ret["vllm_amd_select_graph TB/s"] = nbytes / amd_graph_us / 1e6
-        ret["vllm_amd_select_graph err"] = amd_graph_err
+        graph_candidates = {
+            "flydsl_k1_graph": (flydsl_graph, lambda: block_ids_g),
+            "vllm_amd_select_graph": (amd_graph, lambda: amd_blocks["ids"]),
+        }
+        for name, (launch, ids) in graph_candidates.items():
+            us = _capture_replay_us(launch)
+            err = _set_mismatch_ratio(ref_ids, ids(), ref_scores)
+            ret[f"{name} us"] = us
+            ret[f"{name} TFLOPS"] = flops / us / 1e6
+            ret[f"{name} TB/s"] = nbytes / us / 1e6
+            ret[f"{name} err"] = err
     return ret
 
 
@@ -2391,63 +2262,38 @@ def bench_qsa_family_a_k2(
     )
     indices = ref.indices.contiguous()
 
-    out, k2_us = _time(
-        qsa_k2,
-        q_gqa,
-        k_cache,
-        v_cache,
-        indices,
-        kv_table,
-        token_to_req,
-        rotate=rotate,
-    )
-    k2_err = checkAllclose(
-        ref.output,
-        out.to(dtypes.fp32),
-        rtol=1e-2,
-        atol=1e-2,
-        msg="flydsl K2 vs oracle GQA",
-    )
-
-    vllm_out, vllm_us = _time(
-        qsa_sparse_paged_attention,
-        q_gqa,
-        k_cache,
-        v_cache,
-        indices,
-        kv_table,
-        token_to_req,
-        rotate=rotate,
-    )
-    vllm_err = checkAllclose(
-        ref.output,
-        vllm_out.to(dtypes.fp32),
-        rtol=1e-2,
-        atol=1e-2,
-        msg="vllm_amd GQA vs oracle",
-    )
-
     w_alloc = indices.shape[1]
     w = _selected_width(indices)
     flops = 4 * m * gqa.n_heads * gqa.head_dim * w
     nbytes = (
         m * gqa.n_heads * gqa.head_dim * 2 + 2 * w * gqa.kv_heads * gqa.head_dim
     ) * dtype.itemsize
-    return {
+    gqa_args = (q_gqa, k_cache, v_cache, indices, kv_table, token_to_req)
+    candidates = {
+        "flydsl_k2": (qsa_k2, "flydsl K2 vs oracle GQA"),
+        "vllm_amd_gqa": (qsa_sparse_paged_attention, "vllm_amd GQA vs oracle"),
+    }
+    ret = {
         "gfx": get_gfx(),
         "n_blocks": n_blocks,
         "width": w_alloc,
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(k_cache),
-        "flydsl_k2 us": k2_us,
-        "flydsl_k2 TFLOPS": flops / k2_us / 1e6,
-        "flydsl_k2 TB/s": nbytes / k2_us / 1e6,
-        "flydsl_k2 err": k2_err,
-        "vllm_amd_gqa us": vllm_us,
-        "vllm_amd_gqa TFLOPS": flops / vllm_us / 1e6,
-        "vllm_amd_gqa TB/s": nbytes / vllm_us / 1e6,
-        "vllm_amd_gqa err": vllm_err,
     }
+    for name, (fn, msg) in candidates.items():
+        out, us = _time(fn, *gqa_args, rotate=rotate)
+        err = checkAllclose(
+            ref.output,
+            out.to(dtypes.fp32),
+            rtol=1e-2,
+            atol=1e-2,
+            msg=msg,
+        )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
 
 
 def test_k1_family_b_set_equality_published_indexer_point():
@@ -2550,32 +2396,39 @@ def bench_qsa_family_b_k1(
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
-    block_ids, k1_us = _time(
-        qsa_k1_block_ids,
+    flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
+    nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
+    select_args = (
         q_indexer,
         index_cache,
         index_table,
         token_to_req,
         qpos,
         slen,
-        rotate=rotate,
-        score_scale=score_scale,
     )
-    k1_err = _set_mismatch_ratio(ref_ids, block_ids, ref_scores)
-
-    flops = 2 * m * idx.n_heads * idx.head_dim * n_blocks
-    nbytes = (m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim) * dtype.itemsize
-    return {
+    candidates = {
+        "flydsl_k1": qsa_k1_block_ids,
+    }
+    ret = {
         "gfx": get_gfx(),
         "index_heads": idx.n_heads,
         "n_blocks": n_blocks,
         "n_pages": int(index_table.shape[1]),
         "cache_span_gib": _span_gib(index_cache),
-        "flydsl_k1 us": k1_us,
-        "flydsl_k1 TFLOPS": flops / k1_us / 1e6,
-        "flydsl_k1 TB/s": nbytes / k1_us / 1e6,
-        "flydsl_k1 err": k1_err,
     }
+    for name, fn in candidates.items():
+        block_ids, us = _time(
+            fn,
+            *select_args,
+            rotate=rotate,
+            score_scale=score_scale,
+        )
+        err = _set_mismatch_ratio(ref_ids, block_ids, ref_scores)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
 
 
 @benchmark()
@@ -3414,15 +3267,10 @@ def bench_qsa_family_a_e2e(
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
-
-    fly, fly_us = _time_layer(case, idx, "flydsl", rotate)
-    fly_err = checkAllclose(
-        ref, fly.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="flydsl e2e vs oracle"
-    )
-    amd, amd_us = _time_layer(case, idx, "triton", rotate)
-    amd_err = checkAllclose(
-        ref, amd.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="vllm amd e2e vs oracle"
-    )
+    candidates = {
+        "flydsl_e2e": ("flydsl", "flydsl e2e vs oracle"),
+        "vllm_amd_e2e": ("triton", "vllm amd e2e vs oracle"),
+    }
     ret = {
         "gfx": get_gfx(),
         "n_blocks": case["n_blocks"],
@@ -3430,8 +3278,10 @@ def bench_qsa_family_a_e2e(
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(case["k_cache"]),
     }
-    ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
-    ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
+    for name, (backend, msg) in candidates.items():
+        out, us = _time_layer(case, idx, backend, rotate)
+        err = checkAllclose(ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg=msg)
+        ret.update(_e2e_cells(name, us, err, flops, nbytes))
     return ret
 
 
@@ -3449,14 +3299,10 @@ def bench_qsa_family_b_e2e(
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
-    fly, fly_us = _time_layer(case, idx, "flydsl", rotate)
-    fly_err = checkAllclose(
-        ref, fly.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="flydsl family B e2e"
-    )
-    amd, amd_us = _time_layer(case, idx, "triton", rotate)
-    amd_err = checkAllclose(
-        ref, amd.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="vllm amd family B e2e"
-    )
+    candidates = {
+        "flydsl_e2e": ("flydsl", "flydsl family B e2e"),
+        "vllm_amd_e2e": ("triton", "vllm amd family B e2e"),
+    }
     ret = {
         "gfx": get_gfx(),
         "index_heads": idx.n_heads,
@@ -3465,8 +3311,10 @@ def bench_qsa_family_b_e2e(
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(case["k_cache"]),
     }
-    ret.update(_e2e_cells("flydsl_e2e", fly_us, fly_err, flops, nbytes))
-    ret.update(_e2e_cells("vllm_amd_e2e", amd_us, amd_err, flops, nbytes))
+    for name, (backend, msg) in candidates.items():
+        out, us = _time_layer(case, idx, backend, rotate)
+        err = checkAllclose(ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg=msg)
+        ret.update(_e2e_cells(name, us, err, flops, nbytes))
     return ret
 
 
@@ -3507,58 +3355,20 @@ def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout="pac
         )
         return us, err
 
-    fly_us, fly_err = _replay("flydsl", torch.empty_like(case["q_gqa"]))
-    amd_us, amd_err = _replay("triton", torch.empty_like(case["q_gqa"]))
+    candidates = {
+        "flydsl_graph": "flydsl",
+        "vllm_amd_graph": "triton",
+    }
     ret = {
         "gfx": get_gfx(),
         "n_blocks": case["n_blocks"],
         "valid%": 100.0 * w / width,
         "cache_span_gib": _span_gib(case["k_cache"]),
     }
-    ret.update(_e2e_cells("flydsl_graph", fly_us, fly_err, flops, nbytes))
-    ret.update(_e2e_cells("vllm_amd_graph", amd_us, amd_err, flops, nbytes))
+    for name, backend in candidates.items():
+        us, err = _replay(backend, torch.empty_like(case["q_gqa"]))
+        ret.update(_e2e_cells(name, us, err, flops, nbytes))
     return ret
-
-
-def _run_unit_cases():
-    """Run every ``test_*`` in this module. CI calls the file as a script.
-
-    Pytest collects the same functions. A hand list here drifted: the
-    padded-table, capture, and AOT-target cases never ran on that path.
-    """
-    cases = [
-        value
-        for name, value in globals().items()
-        if name.startswith("test_")
-        and isinstance(value, types.FunctionType)
-        and value.__module__ == __name__
-    ]
-    for case in cases:
-        params = [
-            param
-            for param in inspect.signature(case).parameters.values()
-            if param.kind
-            in (
-                inspect.Parameter.POSITIONAL_ONLY,
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            )
-        ]
-        if not params:
-            case()
-            continue
-        if [param.name for param in params] != ["monkeypatch"]:
-            raise AssertionError(
-                f"{case.__name__} needs fixtures the script runner does not provide"
-            )
-        import pytest
-
-        patch = pytest.MonkeyPatch()
-        try:
-            case(patch)
-        finally:
-            patch.undo()
-    aiter.logger.info("QSA oracle + K1 + K2 + layer unit cases passed")
 
 
 def _k1_k2_sweep_batches(batches):
@@ -3628,8 +3438,6 @@ def _raise_if_row_mismatch(row, m, seq_len):
 
 
 def main():
-    _run_unit_cases()
-
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="Family A/B QSA sweeps, FlyDSL K1/K2, and the end-to-end layer opt-in",
@@ -3711,31 +3519,13 @@ def main():
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
-        aiter.logger.warning("no CUDA; skipping family A plumbing sweep")
+        aiter.logger.warning("no CUDA; skipping QSA sweep")
         return
     if get_gfx() not in SUPPORTED_GFX:
-        aiter.logger.warning("QSA plumbing unsupported on %s; skipping", get_gfx())
+        aiter.logger.warning("QSA unsupported on %s; skipping", get_gfx())
         return
 
     for dtype in args.dtype:
-        rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
-            args.batch, args.seq, args.page_size, args.rotate
-        ):
-            if m > seq_len:
-                aiter.logger.warning(
-                    "skip m=%s seq_len=%s (M must fit in L)", m, seq_len
-                )
-                continue
-            rows.append(
-                bench_qsa_family_a_plumbing(m, seq_len, page_size, dtype, rotate)
-            )
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "QSA family A plumbing summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
-
         rows = []
         for m, seq_len, page_size, rotate in itertools.product(
             args.batch, args.seq, args.page_size, args.rotate
@@ -3907,44 +3697,6 @@ def main():
             cache_layout,
         ) in itertools.product(
             args.batch,
-            [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio <= 512],
-            args.page_size,
-            args.rotate,
-            args.pad_pages,
-            args.cache_layout,
-        ):
-            if _skip_m_past_seq(m, seq_len, "family B K1 H=4"):
-                continue
-            if _skip_pad_narrower_than_context(
-                seq_len,
-                page_size,
-                pad_pages,
-                FAMILY_B_INDEXER.compress_ratio,
-                "family B K1 H=4",
-            ):
-                continue
-            row = bench_qsa_family_b_k1(
-                m, seq_len, page_size, dtype, 4, rotate, pad_pages, cache_layout
-            )
-            _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
-            rows.append(row)
-        if rows:
-            df = pd.DataFrame(rows)
-            aiter.logger.info(
-                "QSA family B FlyDSL K1 H=4 summary (markdown):\n%s",
-                df.to_markdown(index=False),
-            )
-
-        rows = []
-        for (
-            m,
-            seq_len,
-            page_size,
-            rotate,
-            pad_pages,
-            cache_layout,
-        ) in itertools.product(
-            args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER_H8.compress_ratio <= 512],
             args.page_size,
             args.rotate,
@@ -4011,7 +3763,7 @@ def main():
             args.batch,
             [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio > 512],
             args.page_size,
-            (4, 8),
+            (8,),
             args.rotate,
             args.pad_pages,
             args.cache_layout,
