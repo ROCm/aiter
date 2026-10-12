@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-from contextlib import ExitStack
 import importlib.util
 import os
 import pathlib
@@ -10,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+from contextlib import ExitStack
 from unittest.mock import patch
 
 
