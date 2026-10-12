@@ -2,7 +2,11 @@
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #pragma once
 
+#ifdef _WIN32
+#define AITER_C_ITFS extern "C" __declspec(dllexport)
+#else
 #define AITER_C_ITFS extern "C" __attribute__((visibility("default")))
+#endif
 
 #include "aiter_enum.h"
 #include "aiter_logger.h"

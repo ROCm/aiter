@@ -1,0 +1,40 @@
+# The GPU suite deliberately skips `.claude/` (see detect_aiter_test_scope in aiter-test.yaml):
+# the review bot's tooling never enters the wheel or the runtime, so building it proves nothing.
+# That would leave the tooling with no check at all, so run its own guards here instead --
+# seconds on a hosted runner, no GPU, no wheel.
+#
+# aiter-review-bot.yml is watched too: check_prompts.py asserts across the two files (the run
+# budget must fit the review job's timeout-minutes, the watchdog's owner must match _notify.py,
+# the runner label must be exclusive), so a change there can break a guard that lives here.
+name: review-bot selftest
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml']
+  push:
+    branches: [main]
+    paths: ['.claude/skills/review-pr/**', '.github/workflows/aiter-review-bot.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  selftest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Shell syntax
+        run: |
+          for f in .claude/skills/review-pr/*.sh; do bash -n "$f"; done
+
+      - name: Prompts match SKILL.md, and fail classes match _notify.py
+        run: python3 .claude/skills/review-pr/check_prompts.py
+
+      - name: Guards — failure triage, run budget, refuter call site, watchdog
+        run: bash .claude/skills/review-pr/selftest.sh

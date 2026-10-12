@@ -55,7 +55,7 @@ forwards to another module, or a copy of a core helper inside a family module.
 ## Folder structure and imports
 
 The layout is: public wrapper modules in category folders
-(`gemm/{basic,batched,feed_forward,fused}/`, `attention/`, `moe/`,
+(`gemm/{basic,batched,feed_forward,fused,grouped}/`, `attention/`, `moe/`,
 `normalization/`, `quant/`, `rope/`, `fusions/`, `comms/`, `conv/`,
 `gated_delta_net/`, `kimi_delta_attn/`, `gluon/`), kernel bodies under
 `_triton_kernels/` at the same relative category path, or under
