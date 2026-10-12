@@ -39,10 +39,10 @@ def _lds_byte_ptr(ptr, byte_offset):
     )
 
 
-def encode_waitcnt_950(vmcnt=63, expcnt=7, lgkmcnt=63):
-    vm_lo = vmcnt & 0xF
-    vm_hi = (vmcnt >> 4) & 0x3
-    return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
+# def encode_waitcnt_950(vmcnt=63, expcnt=7, lgkmcnt=63):
+#     vm_lo = vmcnt & 0xF
+#     vm_hi = (vmcnt >> 4) & 0x3
+#     return vm_lo | (expcnt << 4) | (lgkmcnt << 8) | (vm_hi << 14)
 
 
 def compile_gemm_fp8_8wave(
@@ -462,7 +462,7 @@ def compile_gemm_fp8_8wave(
 
         def begin_compute_phase():
             rocdl.sched_barrier(0)
-            rocdl.s_waitcnt(encode_waitcnt_950(lgkmcnt=0))
+            rocdl.s_waitcnt(lgkmcnt=0)
             rocdl.s_barrier()
             rocdl.sched_barrier(0)
 
@@ -653,7 +653,7 @@ def compile_gemm_fp8_8wave(
         vm_load_cnt_scale_a = 1
 
         vmcnt = vm_load_cnt_a + vm_load_cnt_b
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
+        rocdl.s_waitcnt(vmcnt=vmcnt)
         rocdl.s_barrier()
 
         rocdl.sched_barrier(0)
@@ -667,7 +667,7 @@ def compile_gemm_fp8_8wave(
         rocdl.sched_barrier(0)
 
         vmcnt = vm_load_cnt_a + vm_load_cnt_b * 2 + vm_load_cnt_scale_a
-        rocdl.s_waitcnt(encode_waitcnt_950(vmcnt=vmcnt))
+        rocdl.s_waitcnt(vmcnt=vmcnt)
         rocdl.s_barrier()
         rocdl.sched_barrier(0)
 
@@ -756,9 +756,7 @@ def compile_gemm_fp8_8wave(
                         # Six k+2 A/B loads follow all k+1 loads; ScaleA(k+2)
                         # has not issued yet. W6 before BL[s1].begin lets
                         # L.BL[s1].end confirm every producer's completion.
-                        rocdl.s_waitcnt(
-                            encode_waitcnt_950(vmcnt=vm_load_cnt_a + vm_load_cnt_b * 2)
-                        )
+                        rocdl.s_waitcnt(vmcnt=vm_load_cnt_a + vm_load_cnt_b * 2)
 
                     fifo_scale_a_0, fifo_scale_b_0 = mfma_scaleA, mfma_scaleB[0]
                     begin_compute_phase()
