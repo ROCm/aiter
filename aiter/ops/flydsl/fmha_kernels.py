@@ -33,7 +33,7 @@ from functools import lru_cache
 import torch
 import torch.nn.functional as F
 
-from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_d192_gfx942
+from .fmha_bwd_gfx942 import flash_attn_varlen_bwd_gfx942
 from .kernels.flash_attn_func_gfx1201 import build_flash_attn_func_module
 from .kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
     flash_attn_batch_m32x8,
@@ -548,6 +548,7 @@ def flydsl_flash_attn_varlen_bwd(
     max_seqlen_q: int,
     max_seqlen_k: int,
     softmax_scale: float,
+    deterministic: bool = False,
 ):
     """FlyDSL MHA backward, varlen THD layout.
 
@@ -556,16 +557,21 @@ def flydsl_flash_attn_varlen_bwd(
     in -- the kernel fills them in place -- and ``softmax_d`` is the ``[H, T]``
     fp32 ``rowsum(dO*O)`` those two also return.
 
+    ``deterministic=True`` keeps every head dim on the two-role kernel, in which
+    each gradient element has exactly one writer.  Otherwise head dims up to 128
+    run the fused single-role kernel, whose ``dq`` is accumulated with bf16
+    atomics across key blocks and is not bit-reproducible run to run.
+
     PRECONDITION: the caller has established this configuration is supported --
-    causal varlen THD self-attention, d_qk=192 / d_v=128, bf16, no GQA,
-    contiguous, ``[H, T]`` fp32 LSE, no dropout / sliding window / alibi / sink /
-    padded cu_seqlens, on gfx942.  The authoritative gate is
+    causal varlen THD self-attention, ``64 <= d_v <= d_qk <= 192`` with both a
+    multiple of 8, bf16, no GQA, contiguous, ``[H, T]`` fp32 LSE, no dropout /
+    sliding window / alibi / sink / padded cu_seqlens, on gfx942.  The authoritative gate is
     ``can_impl_fmha_bwd_flydsl`` inside ``_flash_attn_varlen_backward`` in
     ``aiter/ops/mha.py``; the screened feature arguments are absent from this
     signature precisely because that gate has already established they are unset,
     leaving no configuration for this function to branch on.
     """
-    dq, dk, dv, softmax_d = flash_attn_varlen_bwd_d192_gfx942(
+    dq, dk, dv, softmax_d = flash_attn_varlen_bwd_gfx942(
         dout,
         q,
         k,
@@ -579,5 +585,6 @@ def flydsl_flash_attn_varlen_bwd(
         dq=dq,
         dk=dk,
         dv=dv,
+        deterministic=deterministic,
     )
     return dq, dk, dv, softmax_d

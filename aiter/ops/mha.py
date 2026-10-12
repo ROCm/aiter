@@ -3320,10 +3320,7 @@ def _flash_attn_varlen_backward(
         return ret
 
     def can_impl_fmha_bwd_flydsl():
-        # d_qk=192 / d_v=128 causal varlen self-attention -- the shape family both
-        # `can_impl_fmha_v3_bwd*` gates exclude by requiring hdim_q == hdim_v.
-        # `deterministic` is absent on purpose: the kernel uses no atomics and
-        # writes each of dq/dk/dv exactly once, so it is deterministic either way.
+        # is deterministic either way.
         ret = get_gfx() == "gfx942"
         ret &= alibi_slopes is None
         ret &= dropout_p == 0.0
@@ -3333,15 +3330,10 @@ def _flash_attn_varlen_backward(
         ret &= causal
         ret &= sink is None and d_sink is None
         ret &= cu_seqlens_q_padded is None and cu_seqlens_k_padded is None
-        # Self-attention: one cu_seqlens drives both bounds. Comparing values
-        # would need a device sync, so distinct-but-equal tensors are rejected
-        # rather than synced on.
         ret &= cu_seqlens_q.data_ptr() == cu_seqlens_k.data_ptr()
         ret &= max_seqlen_q == max_seqlen_k
         ret &= all(x.dtype == dtypes.bf16 for x in (q, k, v, out, dout))
         ret &= all(x.is_contiguous() for x in (q, k, v, out, dout))
-        # dq/dk/dv are optional here; the launcher allocates contiguous ones when
-        # they are None.
         ret &= all(x is None or x.is_contiguous() for x in (dq, dk, dv))
 
         return ret
@@ -3377,6 +3369,7 @@ def _flash_attn_varlen_backward(
             max_seqlen_q,
             max_seqlen_k,
             softmax_scale,
+            deterministic,
         )
     elif can_impl_fmha_v3_bwd_:
         (

@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL varlen FMHA backward (d_qk=192, d_v=128, causal, bf16, THD) on gfx942.
+"""FlyDSL varlen FMHA backward (causal, bf16, THD) on gfx942.
 
-Validates the FlyDSL backward -- the kernel native to the unpadded d_v = 128
-shape -- against an fp32 torch reference, and times it.  Cross-backend
+Validates the FlyDSL backward over its head-dim range -- ``64 <= d_v <= d_qk <=
+192``, both multiples of 8; the square shapes plus the MLA-style d_qk=192 /
+d_v=128 -- against an fp32 torch reference, in both its fused (atomic dQ) and
+deterministic modes, and times it.  Cross-backend
 performance against CK and the v-padded ASM v3 path lives in
 op_tests/op_benchmarks/flydsl/bench_mha_bwd.py, which reuses this module's input
 builder, reference and roofline helpers.
@@ -27,6 +29,11 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
+from aiter.ops.flydsl.kernels.fmha_bwd_gfx942.fmha_bwd_core import (
+    D_MAX,
+    D_MIN,
+    D_STEP,
+)
 from aiter.ops.mha import flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -37,6 +44,11 @@ SUPPORTED_GFX = ["gfx942"]
 
 HEAD_DIM_QK = 192
 HEAD_DIM_V = 128
+
+# (d_qk, d_v) pairs the pytest collection covers: every square head dim the backward
+# supports (each compiles its own kernel set, so a spill or miscompile at one d is not
+# caught by its neighbours), plus the MLA shape.
+HEAD_DIMS = [(d, d) for d in range(D_MIN, D_MAX + 1, D_STEP)] + [(192, 128)]
 
 # Accuracy gate.
 RTOL = ATOL = 2e-2
@@ -200,8 +212,10 @@ def mean_rel(ref, got):
 
 
 @benchmark()
-def run_fmha_varlen_bwd(case, nheads, dtype):
-    x = make_varlen_inputs(SEQLEN_CASES[case], nheads, dtype)
+def run_fmha_varlen_bwd(
+    case, nheads, dtype, d_qk=HEAD_DIM_QK, d_v=HEAD_DIM_V, deterministic=False
+):
+    x = make_varlen_inputs(SEQLEN_CASES[case], nheads, dtype, d_qk=d_qk, d_v=d_v)
     ref_dq, ref_dk, ref_dv = run_torch(
         x.dout, x.q, x.k, x.v, x.out, x.lse, x.cu_seqlens, x.scale
     )
@@ -228,6 +242,7 @@ def run_fmha_varlen_bwd(case, nheads, dtype):
             x.max_seqlen,
             x.max_seqlen,
             x.scale,
+            deterministic=deterministic,
         )
         return dq, dk, dv
 
@@ -235,7 +250,7 @@ def run_fmha_varlen_bwd(case, nheads, dtype):
     # are timed against it in op_benchmarks/flydsl/bench_mha_bwd.py.
     candidates = {"flydsl": _flydsl}
 
-    flops, nbytes = flops_bytes(x.seqlens, nheads, x.q.element_size())
+    flops, nbytes = flops_bytes(x.seqlens, nheads, x.q.element_size(), d_qk, d_v)
 
     ret = {
         "gfx": get_gfx(),
@@ -266,30 +281,122 @@ def run_fmha_varlen_bwd(case, nheads, dtype):
         for tag, ref, got in grads:
             ret[f"{name} d{tag} mean_rel"] = mean_rel(ref, got)
         ret[f"{name} err"] = err
+    if deterministic:
+        again = [t.clone() for t in (got_dq, got_dk, got_dv)]
+        _flydsl()
+        ret["bitwise repeatable"] = all(
+            torch.equal(a, b) for a, b in zip(again, (dq, dk, dv))
+        )
     return ret
 
 
-# The (case, nheads) pairs pytest collects.
-_PYTEST_CASES = [(c, 2) for c in SEQLEN_CASES] + [("small", 16)]
+# The (case, nheads) pairs pytest collects.  "small" at 2 heads takes the co-resident
+# split-K path; "main" at 2 heads and "small" at 16 heads take the n_split == 1 kernel,
+# which is the fused single-role one for d_qk <= 128 unless `deterministic`.
+_PYTEST_CASES = [
+    (c, h, d_qk, d_v, det)
+    for c, h in (("small", 2), ("main", 2), ("small", 16))
+    for d_qk, d_v in HEAD_DIMS
+    for det in (False, True)
+]
 
 
 @pytest.mark.skipif(
     get_gfx() not in SUPPORTED_GFX,
     reason="flydsl varlen fmha backward requires gfx942",
 )
-@pytest.mark.parametrize("case, nheads", _PYTEST_CASES)
-def test_fmha_varlen_bwd(case, nheads):
+@pytest.mark.parametrize("case, nheads, d_qk, d_v, deterministic", _PYTEST_CASES)
+def test_fmha_varlen_bwd(case, nheads, d_qk, d_v, deterministic):
     """pytest entry point: the same row the CLI tabulates, gated on the accuracy
     thresholds.  ``checkAllclose`` only raises on a catastrophic delta, so the
     mismatch ratio and the aggregate relative error are asserted here."""
-    ret = run_fmha_varlen_bwd(case, nheads, dtypes.bf16)
-    where = f"{case}/nheads={nheads}"
+    ret = run_fmha_varlen_bwd(case, nheads, dtypes.bf16, d_qk, d_v, deterministic)
+    where = f"{case}/nheads={nheads}/d={d_qk}x{d_v}/det={deterministic}"
     assert ret["flydsl err"] <= TOL_ERR_RATIO, (
         f"{where}: {ret['flydsl err']:.2%} of gradient elements outside "
         f"rtol={RTOL} atol={ATOL}"
     )
     for tag in "qkv":
         rel = ret[f"flydsl d{tag} mean_rel"]
+        assert rel <= TOL_MEAN_REL, f"{where}: d{tag} mean_rel {rel:.3e}"
+    if deterministic:
+        assert ret["bitwise repeatable"], f"{where}: two runs differ bitwise"
+
+
+# Through the public entry point: `flash_attn_varlen_func` autograd ->
+# `can_impl_fmha_bwd_flydsl` in aiter/ops/mha.py.  (case, nheads, d_qk, d_v,
+# deterministic, whether the gate is expected to pick FlyDSL.)
+_ROUTE_CASES = [
+    ("small", 2, 192, 128, False, True),  # no v3 kernel for d_qk != d_v
+    ("small", 2, 192, 128, True, True),
+    # d_qk == d_v stays on the existing ASM / CK backwards.
+    ("small", 2, 96, 96, False, False),
+    ("small", 16, 160, 160, False, False),
+    ("small", 2, 64, 64, True, False),
+    ("uniform", 16, 128, 128, False, False),
+]
+
+
+@pytest.mark.skipif(
+    get_gfx() not in SUPPORTED_GFX,
+    reason="flydsl varlen fmha backward requires gfx942",
+)
+@pytest.mark.parametrize(
+    "case, nheads, d_qk, d_v, deterministic, expect_flydsl", _ROUTE_CASES
+)
+def test_varlen_func_routing(
+    monkeypatch, case, nheads, d_qk, d_v, deterministic, expect_flydsl
+):
+    import aiter.ops.flydsl.fmha_kernels as fmha_kernels
+
+    calls = []
+    real = fmha_kernels.flydsl_flash_attn_varlen_bwd
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs.get("deterministic", args[13] if len(args) > 13 else None))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(fmha_kernels, "flydsl_flash_attn_varlen_bwd", spy)
+
+    seqlens = SEQLEN_CASES[case]
+    max_seqlen = max(seqlens)
+    scale = 1.0 / math.sqrt(d_qk)
+    torch.manual_seed(0)
+    cu_seqlens = torch.tensor(
+        [0] + list(itertools.accumulate(seqlens)), dtype=dtypes.i32, device=DEVICE
+    )
+    total = sum(seqlens)
+    q, k = (
+        torch.randn((total, nheads, d_qk), dtype=dtypes.bf16).requires_grad_()
+        for _ in range(2)
+    )
+    v = torch.randn((total, nheads, d_v), dtype=dtypes.bf16).requires_grad_()
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens,
+        cu_seqlens,
+        max_seqlen,
+        max_seqlen,
+        softmax_scale=scale,
+        causal=True,
+        deterministic=deterministic,
+        return_lse=True,
+    )
+    dout = torch.randn_like(out)
+    out.backward(dout)
+
+    where = f"{case}/nheads={nheads}/d={d_qk}x{d_v}/det={deterministic}"
+    assert bool(calls) == expect_flydsl, f"{where}: FlyDSL routed={bool(calls)}"
+    if not expect_flydsl:
+        return
+    assert calls == [deterministic], f"{where}: deterministic not forwarded"
+    refs = run_torch(
+        dout, q.detach(), k.detach(), v.detach(), out.detach(), lse, cu_seqlens, scale
+    )
+    for tag, ref, got in zip("qkv", refs, (q.grad, k.grad, v.grad)):
+        rel = mean_rel(ref, got)
         assert rel <= TOL_MEAN_REL, f"{where}: d{tag} mean_rel {rel:.3e}"
 
 
@@ -332,12 +439,32 @@ def main():
         default=[2],
         help="number of attention heads.\ne.g.: -nh 2 8",
     )
+    parser.add_argument(
+        "-hd",
+        "--head_dim",
+        type=str,
+        nargs="*",
+        default=[f"{HEAD_DIM_QK}x{HEAD_DIM_V}"],
+        help="head dims as d_qk or d_qk x d_v.\ne.g.: -hd 64 128 192x128",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="run the deterministic (two-role, no-atomic) kernel.",
+    )
     args = parser.parse_args()
+
+    head_dims = []
+    for hd in args.head_dim:
+        d_qk, _, d_v = hd.partition("x")
+        head_dims.append((int(d_qk), int(d_v or d_qk)))
 
     for dtype in args.dtype:
         df = [
-            run_fmha_varlen_bwd(case, nheads, dtype)
-            for case, nheads in itertools.product(args.case, args.nheads)
+            run_fmha_varlen_bwd(case, nheads, dtype, d_qk, d_v, args.deterministic)
+            for case, nheads, (d_qk, d_v) in itertools.product(
+                args.case, args.nheads, head_dims
+            )
         ]
         aiter.logger.info(
             "flydsl varlen fmha backward summary (markdown):\n%s",
