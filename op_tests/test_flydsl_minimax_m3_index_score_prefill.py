@@ -24,11 +24,14 @@ Run:
     python op_tests/test_flydsl_minimax_m3_index_score_prefill.py
 """
 
-import sys
+import argparse
+import itertools
 
+import pandas as pd
 import pytest
 import torch
 
+import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import shuffle_cache
@@ -41,6 +44,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score_prefill import (
     score_prefill_flydsl,
 )
 from aiter.ops.msa_block_select import pa_sparse_block_score_prefill
+from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 LOG2E = 1.4426950409
 PAGE = 128  # operator contract, not a kernel constant
@@ -48,8 +52,14 @@ HEAD_DIM = 128
 # A value no score can take, so "did the kernel write here" is unambiguous.
 SENTINEL = -12345.678
 
-pytestmark = pytest.mark.skipif(
-    get_gfx() != "gfx950", reason="prefill index scorer is built for gfx950"
+PREFILL_SUPPORTED_GFX = ["gfx950"]
+
+# Applied per test rather than as a module-level `pytestmark`: `main()` gates the
+# sweep on the same allow-list, and a mark on each test is the form that cannot
+# silently miss one when a test is added.
+requires_gfx950 = pytest.mark.skipif(
+    get_gfx() not in PREFILL_SUPPORTED_GFX,
+    reason="prefill index scorer is built for gfx950",
 )
 
 
@@ -160,6 +170,7 @@ CONFIGS = [
 ]
 
 
+@requires_gfx950
 @pytest.mark.parametrize("shape", SHAPES, ids=lambda s: f"b{s[0]}_q{s[1]}_ctx{s[2]}")
 @pytest.mark.parametrize("name,kw", CONFIGS, ids=[c[0] for c in CONFIGS])
 def test_matches_aiter(shape, name, kw):
@@ -169,6 +180,7 @@ def test_matches_aiter(shape, name, kw):
     assert_matches(run(c, cache, **kw), ref, live, f"{name} {shape}")
 
 
+@requires_gfx950
 def test_shuffled_and_rowmajor_agree():
     """The two cache layouts are a permutation of each other, nothing more."""
     c = make_case(1, 1024, 65536)
@@ -180,6 +192,7 @@ def test_shuffled_and_rowmajor_agree():
     assert torch.equal(a[live], b[live])
 
 
+@requires_gfx950
 @pytest.mark.parametrize("shuffled", [True, False])
 def test_fp8_q_is_exact(shuffled):
     """An fp8 Q must give what a bf16 Q holding the same values gives.
@@ -197,6 +210,7 @@ def test_fp8_q_is_exact(shuffled):
     assert torch.equal(bf16[live], fp8[live])
 
 
+@requires_gfx950
 def test_strided_cache_is_handled_on_every_entry_form():
     """A non-contiguous page must be correct however the config was supplied.
 
@@ -244,6 +258,7 @@ def test_strided_cache_is_handled_on_every_entry_form():
     assert_matches(run(c, c["cache"], k_lds=1), ref, live, "contiguous k_lds=1")
 
 
+@requires_gfx950
 @pytest.mark.parametrize("shape", [(1, 128, 384), (1, 256, 256), (2, 128, 512)])
 def test_stages_on_padded_chunk_axis(shape):
     """`chunks` is rounded up for the XCD swizzle, so a CTA can draw an empty
@@ -259,6 +274,7 @@ def test_stages_on_padded_chunk_axis(shape):
         )
 
 
+@requires_gfx950
 def test_cdna4_only_knobs_are_arch_gated():
     """k128 and m32 lower to `rocdl.cdna4.MFMA_Scale`, which gfx942 lacks, and
     this entry accepts gfx942. Auto must not select them there, and an explicit
@@ -311,6 +327,7 @@ def test_cdna4_only_knobs_are_arch_gated():
         )
 
 
+@requires_gfx950
 def test_rejects_cache_page_span_past_int32():
     """Each page descriptor narrows `num_records_bytes` to int32, so one page's
     byte stride has to fit even though the cache is addressed page by page.
@@ -342,6 +359,7 @@ def test_rejects_cache_page_span_past_int32():
     score_prefill_flydsl(q, cache, bt, cu, seq, prefix, q_len, ctx, 1.0 / LOG2E)
 
 
+@requires_gfx950
 def test_gfx942_fp8_cache_is_widened_not_fp8_mfma():
     """gfx942 must not take the fp8 operand path, and must still be correct.
 
@@ -399,6 +417,7 @@ def test_gfx942_fp8_cache_is_widened_not_fp8_mfma():
     assert diff < 1e-3, f"gfx942 widened path: max abs diff {diff}"
 
 
+@requires_gfx950
 def test_rejects_malformed_tensors():
     """Everything below reaches the kernel as a bare pointer, so a wrong dtype
     is a silent reinterpretation rather than an error."""
@@ -437,6 +456,7 @@ def test_rejects_malformed_tensors():
         )
 
 
+@requires_gfx950
 def test_shuffled_cache_must_be_packed():
     """A shuffled page is read as a flat run of 16 B units, so a strided view
     describes the wrong bytes. The strided guard used to exclude `shuffled`,
@@ -457,6 +477,7 @@ def test_shuffled_cache_must_be_packed():
     assert_matches(run(c, shuf, shuffled=True), ref, live, "packed shuffled")
 
 
+@requires_gfx950
 def test_rejects_overlapping_out():
     """A page-contiguous block axis does not make the rows disjoint. At row
     stride 1 every query shares storage with its neighbour, so the kernel
@@ -513,6 +534,7 @@ def test_rejects_overlapping_out():
     assert_matches(padded.reshape(ref.shape), ref, live, "padded out")
 
 
+@requires_gfx950
 def test_bf16_cache_path():
     """A bf16 cache takes a different arithmetic path, and nothing else here
     builds one -- `make_case` is fp8 only, so `score_page`'s non-k128 tail and
@@ -562,6 +584,7 @@ def test_bf16_cache_path():
             ), f"row {row} blk {blk}: got {mine}, torch {ref}"
 
 
+@requires_gfx950
 def test_resolve_config_is_idempotent():
     dev = torch.device("cuda")
     for kw in ({}, {"shuffled": True}, {"shuffled": True, "tile_q": 128}):
@@ -571,5 +594,166 @@ def test_resolve_config_is_idempotent():
         assert resolve_config(4096, 1, 1, 1024, cfg=once, device=dev) == once
 
 
+# --------------------------------------------------------------------------- #
+# Performance sweep
+# --------------------------------------------------------------------------- #
+
+
+def _work(batch, q_len, ctx_len):
+    """(live (query, block) pairs, unique pages) for a uniform ragged batch.
+
+    A query row i of a request sees `prefix + i + 1` context tokens, so it
+    touches `ceil(that / PAGE)` blocks. Summing the rows is what the kernel
+    actually MFMAs; the unique page count is the K traffic a perfect cache
+    would move, which is the honest roofline denominator -- the kernel re-reads
+    a page once per query tile and counting those re-reads would flatter TB/s.
+    """
+    prefix = ctx_len - q_len
+    pairs = sum(-(-(prefix + i + 1) // PAGE) for i in range(q_len)) * batch
+    return pairs, batch * (-(-ctx_len // PAGE))
+
+
+@pytest.mark.skip(
+    reason="perf sweep: run via python op_tests/test_flydsl_minimax_m3_index_score_prefill.py"
+)
+@benchmark()
+def test_score_prefill_perf(batch, q_len, ctx_len, heads, dtype):
+    c = make_case(batch, q_len, ctx_len)
+    total_q = c["q8"].shape[0]
+    fp8 = dtype is dtypes.fp8
+    cache = c["cache"] if fp8 else c["cache"].float().bfloat16()
+    q = c["q8"] if fp8 else c["q_bf16"]
+
+    candidates = {
+        # The production pair: same arithmetic, the cache layout is the choice.
+        "flydsl": (shuffle_cache(cache), PrefillScoreConfig(shuffled=True)),
+        "flydsl_rowmajor": (cache, PrefillScoreConfig()),
+    }
+
+    ret = {"gfx": get_gfx()}
+    ref = live = None
+    # aiter is both the judge and the baseline, but it is built for
+    # num_idx_heads 1 and 2 only ("no build for num_idx_heads=4") and takes an
+    # fp8 cache, so outside that it is neither timed nor used as the reference.
+    if fp8 and heads <= 2:
+        score = torch.full((heads, total_q, c["mb"]), -float("inf"), device="cuda")
+
+        def run_aiter(s=score):
+            pa_sparse_block_score_prefill(
+                c["q8"],
+                c["cache"],
+                s,
+                c["bt"],
+                c["cu"],
+                c["seq"],
+                max_query_len=c["max_q"],
+                max_seq_len=c["max_seq"],
+            )
+            return s
+
+        ref, us = run_perftest(run_aiter, num_iters=10, num_rotate_args=1)
+        live = torch.isfinite(ref)
+        ret["aiter us"] = us
+        ret["aiter err"] = 0.0
+
+    pairs, pages = _work(batch, q_len, ctx_len)
+    flops = 2 * pairs * PAGE * HEAD_DIM * heads
+    nbytes = (
+        pages * PAGE * HEAD_DIM * cache.element_size()  # K, read once at best
+        + total_q * heads * HEAD_DIM * q.element_size()  # Q
+        + pairs * heads * 4  # the fp32 scores actually written
+    )
+
+    for name, (k, cfg) in candidates.items():
+        out = alloc_score(total_q, heads, c["mb"], "cuda")
+        out.fill_(SENTINEL)
+
+        def run_flydsl(k=k, cfg=cfg, out=out):
+            return score_prefill_flydsl(
+                q,
+                k,
+                c["bt"],
+                c["cu"],
+                c["seq"],
+                c["prefix"],
+                c["max_q"],
+                c["max_seq"],
+                1.0 / LOG2E,
+                out=out,
+                cfg=cfg,
+            )
+
+        got, us = run_perftest(run_flydsl, num_iters=10, num_rotate_args=1)
+        assert got.data_ptr() == out.data_ptr()
+        if ref is None:
+            # No aiter build for this (dtype, heads); the parametrized tests
+            # above carry correctness, so report the timing without a verdict
+            # rather than inventing one.
+            err = float("nan")
+        else:
+            err = checkAllclose(
+                ref[live].float(),
+                got.reshape(ref.shape)[live].float(),
+                rtol=0,
+                atol=0,
+                msg=f"{name}: prefill index score",
+            )
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = err
+    return ret
+
+
+def main():
+    if get_gfx() not in PREFILL_SUPPORTED_GFX:
+        aiter.logger.warning(
+            "minimax_m3 prefill index score unsupported on %s; skipping", get_gfx()
+        )
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="MiniMax-M3 prefill index-score perf sweep",
+    )
+    parser.add_argument(
+        "-d",
+        "--dtype",
+        type=dtypes.str2Dtype,
+        nargs="*",
+        default=[dtypes.fp8],
+        help="index cache dtype sweep (fp8, bf16)",
+    )
+    parser.add_argument(
+        "-b", "--batch", type=int, nargs="*", default=[1], help="batch sweep"
+    )
+    parser.add_argument(
+        "--q-len", type=int, nargs="*", default=[4096], help="new tokens per request"
+    )
+    parser.add_argument(
+        "--ctx-len",
+        type=int,
+        nargs="*",
+        default=[8192, 32768, 131072, 524288],
+        help="context length sweep",
+    )
+    parser.add_argument(
+        "--heads", type=int, nargs="*", default=[1], help="index head sweep"
+    )
+    args = parser.parse_args()
+
+    rows = []
+    for dtype, batch, q_len, ctx_len, heads in itertools.product(
+        args.dtype, args.batch, args.q_len, args.ctx_len, args.heads
+    ):
+        if q_len > ctx_len:
+            continue  # a request cannot have more new tokens than context
+        rows.append(test_score_prefill_perf(batch, q_len, ctx_len, heads, dtype))
+    aiter.logger.info(
+        "minimax_m3 prefill index score summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+
 if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
+    main()

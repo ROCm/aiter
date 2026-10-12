@@ -39,6 +39,16 @@ ATOL = RTOL = 3e-5
 # NaN marks undefined reference slots; writes there are deliberately ignored.
 UNWRITTEN = float("nan")
 
+DECODE_SUPPORTED_GFX = ["gfx950"]
+
+# One mark per test rather than an autouse fixture consulting a list of test
+# objects: that list had to be kept in step by hand and had already missed
+# several CUDA-allocating tests. A decorator cannot be forgotten the same way.
+requires_gfx950 = pytest.mark.skipif(
+    not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX,
+    reason="GPU execution requires gfx950",
+)
+
 
 # ---------------------------------------------------------------------------
 # Oracle -- transcribed from the contract, rule by rule.
@@ -221,6 +231,7 @@ def test_capacity_threshold(monkeypatch):
     assert kernel.work_map_capacity(17, 16, 4, 1) >= kernel.work_map_size(16, 16, 4, 1)
 
 
+@requires_gfx950
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32, torch.uint8])
 def test_reject_cache_dtype(dtype):
     q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
@@ -228,6 +239,7 @@ def test_reject_cache_dtype(dtype):
         score_flydsl(q, k.to(dtype), bt, lens, 1, 1, D**-0.5, mb)
 
 
+@requires_gfx950
 def test_reject_misaligned_cache():
     q, _, bt, _lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
     k = torch.empty_strided(
@@ -236,6 +248,7 @@ def test_reject_misaligned_cache():
     assert not kernel.index_score_supported(q, k, 1, 1, mb, bt)
 
 
+@requires_gfx950
 def test_narrow_block_table_rejected():
     """Fewer columns than max_block is an out-of-bounds table load.
 
@@ -250,6 +263,7 @@ def test_narrow_block_table_rejected():
         score_flydsl(q, k, narrow, lens, 4, 4, D**-0.5, mb)
 
 
+@requires_gfx950
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("shuffled", [False, True])
 def test_large_cache(dtype, shuffled):
@@ -270,6 +284,7 @@ def test_large_cache(dtype, shuffled):
     torch.testing.assert_close(got[0, 0], ref, atol=ATOL, rtol=RTOL)
 
 
+@requires_gfx950
 @pytest.mark.parametrize("request_id", [32767, 32768, 65534])
 def test_packed_request(request_id):
     batch = request_id + 1
@@ -288,6 +303,7 @@ def test_packed_request(request_id):
     )
 
 
+@requires_gfx950
 @pytest.mark.parametrize("world,rank", [(1, 0), (2, 0), (2, 1), (4, 3)])
 @pytest.mark.parametrize("S,H", [(1, 1), (1, 4), (4, 2), (8, 4)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
@@ -350,6 +366,7 @@ def test_graph_buffers(world, rank, S, H, dtype, layout, map_in_graph):
         assert wm.shape[0] == kernel.work_map_size(B, mb, S, H, cfg)
 
 
+@requires_gfx950
 @pytest.mark.parametrize(
     "field",
     [
@@ -417,6 +434,7 @@ def test_invalid_metadata(field):
         score_flydsl(q, k, bt, lens, 4, 2, D**-0.5, mb, out=out, work_map=wm)
 
 
+@requires_gfx950
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 def test_aligned_padding(dtype):
     q, k, bt, lens, mb = make_case(2, 4, 2, [130, 513], dtype, q_slice=True)
@@ -803,6 +821,7 @@ def test_spread_map_coverage(cu):
         assert b.numel() <= rounds * cu
 
 
+@requires_gfx950
 @pytest.mark.parametrize("ppw", [1, 2, 3, 4])
 def test_chunk_map_kernel_matches_reference(ppw):
     """The fused fixed-chunk builder must be the torch one, bit for bit."""
@@ -829,6 +848,7 @@ def test_chunk_map_kernel_matches_reference(ppw):
         assert torch.equal(got, ref), (B, mb, ppw, world, rank, lens)
 
 
+@requires_gfx950
 @pytest.mark.parametrize("cu", [80, 256])
 def test_spread_map_kernel_matches_reference(cu):
     import random
@@ -862,6 +882,7 @@ SPREAD_CASES = [
 ]
 
 
+@requires_gfx950
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "S,H,lens,mb", [c[1:] for c in SPREAD_CASES], ids=[c[0] for c in SPREAD_CASES]
@@ -883,6 +904,7 @@ def test_spread_scores(dtype, S, H, lens, mb):
     assert torch.equal(got[defined], fixed[defined])
 
 
+@requires_gfx950
 @pytest.mark.parametrize("S,H,B", [(4, 1, 2), (4, 1, 4), (8, 4, 2)])
 def test_spread_graph_replay(S, H, B):
     mb = 1100
@@ -957,6 +979,7 @@ def test_auto_token_explicit_device(monkeypatch):
     )
 
 
+@requires_gfx950
 @pytest.mark.parametrize("world,rank", [(1, 0), (4, 0), (4, 3)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("split", [2, 4])
@@ -1189,6 +1212,7 @@ def test_shuffle_layout_is_arch_independent(fp8):
     )
 
 
+@requires_gfx950
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "cfg",
@@ -1254,6 +1278,7 @@ def test_arch_separates_the_kernel_name():
     assert "gfx950" not in kernel.kernel_name(4, 4, False, cfg)
 
 
+@requires_gfx950
 def test_fp8_dtype_comes_from_aiter():
     """The accepted fp8 flavour is the arch's, not a literal in the kernel.
 
@@ -1266,6 +1291,7 @@ def test_fp8_dtype_comes_from_aiter():
     assert dtypes.fp8 is torch.float8_e4m3fn
 
 
+@requires_gfx950
 def test_reject_fp8_fnuz_cache():
     """The other architecture's fp8 is rejected, not reinterpreted."""
     q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
@@ -1284,6 +1310,7 @@ def test_cli_rejects_fp8_fnuz(monkeypatch):
     assert exc.value.code == 2
 
 
+@requires_gfx950
 def test_empty_selection(caplog):
     caplog.handler.setLevel(0)
     aiter.logger.addHandler(caplog.handler)
@@ -1296,6 +1323,7 @@ def test_empty_selection(caplog):
     assert exc.value.code == 2
 
 
+@requires_gfx950
 @pytest.mark.parametrize("waves_per_tok", [1, 2, 4])
 def test_empty_cp_shard_narrow_table(waves_per_tok):
     q, k, bt, lens, mb = make_case(2, 4, 4, [0, 128], torch.bfloat16)
@@ -1306,6 +1334,7 @@ def test_empty_cp_shard_narrow_table(waves_per_tok):
     check_scores(out, score_oracle(q, k, bt, lens, 4, 4, D**-0.5, mb, 4, 3))
 
 
+@requires_gfx950
 @pytest.mark.parametrize("S", [4, 8])
 @pytest.mark.parametrize(
     "cfg",
@@ -1349,6 +1378,7 @@ def test_fp8_tok_tile_pipeline(S, cfg):
     assert bool((got[torch.isfinite(ref)] < 0).all())
 
 
+@requires_gfx950
 def test_arch_rejected(monkeypatch):
     """An arch with neither MFMA generation is refused before anything else."""
     from types import SimpleNamespace
@@ -1412,6 +1442,7 @@ def test_strided_span_metadata():
     assert kernel._span(x) == (1 << 30) + 128
 
 
+@requires_gfx950
 def test_noncurrent_device():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires two visible gfx950 GPUs")
@@ -1426,6 +1457,7 @@ def test_noncurrent_device():
     check_scores(out, score_oracle(q, k, bt, lens, 1, 1, D**-0.5, mb))
 
 
+@requires_gfx950
 @pytest.mark.parametrize(
     "cfg",
     [
@@ -1441,6 +1473,7 @@ def test_build_map_invalid_config(cfg):
         kernel.build_work_map(lens, 1, 1, 1, cfg)
 
 
+@requires_gfx950
 def test_shuffled_padding_rejected():
     q, k, bt, lens, mb = make_case(1, 1, 1, [128], torch.bfloat16)
     padded = torch.empty_strided(
@@ -1451,6 +1484,7 @@ def test_shuffled_padding_rejected():
         score_flydsl(q, padded, bt, lens, 1, 1, D**-0.5, mb, shuffled=True)
 
 
+@requires_gfx950
 @pytest.mark.parametrize("scale", [1e-50, 1e39])
 def test_scale_fp32_range(scale):
     q, k, bt, lens, mb = make_case(1, 2, 1, [129], torch.bfloat16)
@@ -1506,6 +1540,9 @@ def check_scores(got, ref):
     return err
 
 
+@pytest.mark.skip(
+    reason="perf sweep: run via python op_tests/test_flydsl_minimax_m3_index_score.py"
+)
 @benchmark()
 def test_score(case, B, S, H, lens, dtype, layout, impls, kwargs):
     q, cache, bt, seq, mb = make_case(B, S, H, lens, dtype, **kwargs)
@@ -1551,10 +1588,6 @@ def test_score(case, B, S, H, lens, dtype, layout, impls, kwargs):
             }
         )
     return ret
-
-
-# The standardized benchmark takes sweep arguments, not pytest fixtures.
-test_score.__test__ = False
 
 
 def parse_args(argv=None):
@@ -1655,7 +1688,7 @@ def select_cases(args):
 
 def main(argv=None):
     args = parse_args(argv)
-    if not torch.cuda.is_available() or get_gfx() not in ["gfx950"]:
+    if not torch.cuda.is_available() or get_gfx() not in DECODE_SUPPORTED_GFX:
         aiter.logger.warning("index score requires gfx950; skipping sweep")
         return 0
     rows, skipped = [], 0
@@ -1683,49 +1716,6 @@ def main(argv=None):
         skipped,
     )
     return 0
-
-
-_GPU_TESTS = (
-    test_reject_cache_dtype,
-    test_reject_misaligned_cache,
-    test_large_cache,
-    test_packed_request,
-    test_graph_buffers,
-    test_invalid_metadata,
-    test_aligned_padding,
-    test_empty_cp_shard_narrow_table,
-    test_fp8_tok_tile_pipeline,
-    test_arch_rejected,
-    test_shuffled_padding_rejected,
-    test_scale_fp32_range,
-    test_noncurrent_device,
-    test_build_map_invalid_config,
-    test_narrow_block_table_rejected,
-    test_reject_fp8_fnuz_cache,
-    # Asserts which fp8 flavour this chip speaks, so it is arch-dependent even
-    # though it allocates nothing.
-    test_fp8_dtype_comes_from_aiter,
-    # Builds and runs the CDNA3 shapes on whatever part is present; see
-    # force_arch for what that does and does not establish.
-    test_gfx942_path_matches_oracle,
-    # These build their inputs on the device even though what they assert is a
-    # host-side property (map equality, spread coverage), so they need the gate
-    # just as much as the tests that launch the scorer.
-    test_chunk_map_kernel_matches_reference,
-    test_spread_map_kernel_matches_reference,
-    test_spread_scores,
-    test_spread_graph_replay,
-    test_auto_token_legacy_map,
-)
-
-
-@pytest.fixture(autouse=True)
-def _gpu_test_gate(request):
-    gpu_names = {test.__name__ for test in _GPU_TESTS} | {"test_empty_selection"}
-    if request.node.originalname in gpu_names and (
-        not torch.cuda.is_available() or get_gfx() != "gfx950"
-    ):
-        pytest.skip("GPU execution requires gfx950")
 
 
 if __name__ == "__main__":
