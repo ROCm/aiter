@@ -165,7 +165,8 @@ def test_bf16_cache(
 
 
 @pytest.mark.parametrize("trans_v", [False, True])
-def test_bf16_graph_refresh(trans_v, device):
+@pytest.mark.parametrize("max_partitions", [1, 8])
+def test_bf16_graph_refresh(trans_v, max_partitions, device):
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
     q, k, v, kc, vc, table, lengths = _inputs(
@@ -178,7 +179,7 @@ def test_bf16_graph_refresh(trans_v, device):
         cache_dtype=torch.bfloat16,
     )
     plan = plan_pa_decode(
-        lengths, 1, max_partitions=8, sliding_window=257, query_length=4
+        lengths, 1, max_partitions=max_partitions, sliding_window=257, query_length=4
     )
     rows = 32
     sums = torch.empty((1, plan.capacity, rows), device=device)
@@ -297,3 +298,63 @@ def test_bf16_large_mtp(trans_v, device):
     pa_decode(out, q, kc, vc, lengths, table, 1024**-0.5, 4, work_plan=plan)
     expected = _reference(q, k, v, table, lengths, 4, 0, None)
     torch.testing.assert_close(out.float(), expected, atol=0.002, rtol=0.01)
+
+
+@pytest.mark.parametrize("parts", [1, 7])
+def test_bf16_split_mtp_graph_refresh(parts, device):
+    """Split queries preserve causal rows, packed slots, and empty output on replay."""
+    from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
+
+    q, k, v, table, lengths = _make_inputs(
+        4,
+        2,
+        16,
+        1024,
+        128,
+        torch.bfloat16,
+        "random",
+        device,
+        lengths=(0, 1, 257),
+    )
+    kc, vc = _pack(k, v, True)
+    plan = plan_pa_decode(lengths, 2, max_partitions=parts, query_length=4)
+    # Matching odd query/output strides exercise the direct vector epilogue.
+    strides = (32 * 1025 + 3, 1025, 1)
+    query = torch.empty_strided(q.shape, strides, dtype=q.dtype, device=device)
+    query.copy_(q)
+    output = torch.empty_strided(q.shape, strides, dtype=q.dtype, device=device)
+    shape = (2, plan.capacity, 64)
+    sums = torch.empty(shape, device=device)
+    maxima = torch.empty_like(sums)
+    partial = torch.empty((*shape, 1024), dtype=q.dtype, device=device)
+
+    def launch():
+        pa_decode(
+            output,
+            query,
+            kc,
+            vc,
+            lengths,
+            table,
+            1024**-0.5,
+            4,
+            work_plan=plan,
+            exp_sums=sums,
+            max_logits=maxima,
+            temporary_output=partial,
+        )
+
+    launch()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        launch()
+    for active in ((0, 1, 257), (257, 0, 129), (257, 129, 0), (0, 0, 0), (1, 257, 256)):
+        lengths.copy_(torch.tensor(active, device=device, dtype=torch.int32))
+        plan_pa_decode(lengths, 2, plan=plan, query_length=4)
+        output.fill_(float("nan"))
+        sums.fill_(float("nan"))
+        maxima.fill_(float("nan"))
+        partial.fill_(float("nan"))
+        graph.replay()
+        expected = _reference(q, k.float(), v.float(), table, lengths, 4, 0, None)
+        torch.testing.assert_close(output.float(), expected, atol=0.002, rtol=0.01)

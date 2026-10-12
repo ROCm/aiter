@@ -511,6 +511,9 @@ def main():
     ):
         raise ValueError("max-partitions must be between 1 and the device CU count")
     torch.backends.cuda.matmul.allow_tf32 = False
+    timed_operations = (
+        "decode" if arch == "gfx1250" and args.max_partitions == 1 else "decode+reduce"
+    )
     metadata = {
         "gpu": props.name,
         "architecture": arch,
@@ -519,7 +522,7 @@ def main():
         "hip": torch.version.hip,
         "flydsl": version("flydsl"),
         "timed_operations": (
-            "plan+decode+reduce" if args.include_plan else "decode+reduce"
+            "plan+" + timed_operations if args.include_plan else timed_operations
         ),
         "cache_policy": "repeated graph replays on the same inputs",
         "args": {

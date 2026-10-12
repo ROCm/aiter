@@ -180,8 +180,11 @@ def pa_decode(
     returns twice the device CU count on a miss and never benchmarks. BF16 plans
     use the default budget or an explicitly measured ``workgroup_budget``.
     Build the plan before graph capture; decode does not access the tuning cache.
-    Set its partition cap with ``plan_pa_decode(max_partitions=...)``; even a cap of one
-    uses packed scratch and reduction.
+    Set its partition cap with ``plan_pa_decode(max_partitions=...)``. On gfx1250,
+    a cap of one writes output directly when sinks are absent and query/output
+    strides match. Other plans use packed scratch and reduction. Native BF16
+    D1024/G16/MTP4 with transposed page128 caches and full attention splits its
+    query positions into separate CTAs to reduce accumulator pressure.
 
     ``sinks`` is a contiguous [num_query_heads] BF16/FP16/FP32 tensor on the
     query device: unscaled zero-value logits shared across batch/MTP positions.
@@ -535,6 +538,12 @@ def pa_decode(
     pmax = max_logits
     psum = exp_sums
     pout = temporary_output
+    direct_output = (
+        arch == "gfx1250"
+        and num_partitions == 1
+        and sinks is None
+        and output.stride() == query.stride()
+    )
 
     cache_extent = max(key_cache.nbytes, value_cache.nbytes)
     wide_kv_addressing = cache_extent >= 2**31
@@ -563,6 +572,7 @@ def pa_decode(
             max_context_length=schedule_context_length,
             sliding_window=sliding_window,
             compute_dtype="bf16" if bf16_compute else "fp8",
+            direct_output=direct_output,
         )
 
     total_rows = query_length * query_group_size
@@ -622,9 +632,15 @@ def pa_decode(
         s = torch.cuda.current_stream(dev)
         _run_compiled(
             compiled["launch"],
-            ptr_arg(pmax, fx.Float32),
+            (
+                ptr_arg(work_plan.reduce_info, fx.Float32)
+                if direct_output
+                else ptr_arg(pmax, fx.Float32)
+            ),
             ptr_arg(psum, fx.Float32),
-            ptr_arg(pout, _flydsl_pointer_dtype(pout.dtype)),
+            ptr_arg(
+                output if direct_output else pout, _flydsl_pointer_dtype(pout.dtype)
+            ),
             ptr_arg(query, _flydsl_pointer_dtype(query.dtype)),
             ptr_arg(key_cache, _flydsl_pointer_dtype(key_cache.dtype)),
             ptr_arg(value_cache, _flydsl_pointer_dtype(value_cache.dtype)),
@@ -650,6 +666,8 @@ def pa_decode(
             work_plan.capacity,
             s,
         )
+        if direct_output:
+            return
         output_5d = output.reshape(
             num_seqs, query_length, num_kv_heads, query_group_size, head_dim
         )

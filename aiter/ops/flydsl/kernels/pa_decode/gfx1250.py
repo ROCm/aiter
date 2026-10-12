@@ -46,6 +46,8 @@ class Gfx1250Traits:
     trans_v: bool
     sliding_window: int
     compute_dtype: str = "fp8"
+    direct_output: bool = False
+    query_splits: int = 1
 
     WAVE = 32
     NWARP = 4
@@ -82,7 +84,7 @@ class Gfx1250Traits:
 
     @property
     def rows(self):
-        return self.query_length * self.query_group_size
+        return self.query_length * self.query_group_size // self.query_splits
 
     @property
     def m_tiles(self):
@@ -676,6 +678,7 @@ class Gfx1250Memory:
                 qoff = (
                     (
                         fx.Int64(ctx.planned_seq) * t.query_length
+                        + ctx.query_begin
                         + flat // t.query_group_size
                     )
                     * ctx.stride_q_row
@@ -765,8 +768,11 @@ class Gfx1250Pipeline:
         ctx.tid = fx.Int32(gpu.thread_id("x"))
         ctx.warp, ctx.lane = ctx.tid // t.WAVE, ctx.tid % t.WAVE
         ctx.lane16, ctx.half = ctx.lane % 16, ctx.lane // 16
-        ctx.kv_h = fx.Int32(gpu.block_id("y"))
-        ctx.n_kv = fx.Int32(gpu.grid_dim.y)
+        ctx.kv_h = fx.Int32(gpu.block_id("y")) // t.query_splits
+        ctx.query_begin = (fx.Int32(gpu.block_id("y")) % t.query_splits) * (
+            t.query_length // t.query_splits
+        )
+        ctx.n_kv = fx.Int32(gpu.grid_dim.y) // t.query_splits
         self.mem.allocate()
         if const_expr(t.q_tiles == t.m_tiles):
             self.mem.stage_query()
@@ -876,7 +882,11 @@ class Gfx1250Pipeline:
                     ks = fx.recast_iter(fx.Float32, ctx.key_scale_ptr)
                     scale = scale * fx.Float32(ks[0])
                 upper = (
-                    ctx.planned_context - t.query_length + row // t.query_group_size + 1
+                    ctx.planned_context
+                    - t.query_length
+                    + ctx.query_begin
+                    + row // t.query_group_size
+                    + 1
                 )
                 units, values = [], []
                 qk_k = 32 if t.bf16 else (128 if t.head_dim % 128 == 0 else 64)
@@ -1104,6 +1114,8 @@ class Gfx1250Pipeline:
         )
         for m in range_constexpr(t.m_tiles):
             row = m * 16 + ctx.lane16
+            output_row = ctx.query_begin * t.query_group_size + row
+            partial_row = slot * (t.rows * t.query_splits) + output_row
             denom = final[m * state_stride + 1]
             inv = fx.Float32(rcp_f32((denom > 0.0).select(denom, fx.Float32(1.0))))
             if row < t.rows:
@@ -1118,13 +1130,31 @@ class Gfx1250Pipeline:
                     ).to(t.q_dtype)
                     fx.ptr_store(
                         value,
-                        fx.add_offset(pout, (slot * t.rows + row) * t.head_dim + d),
+                        fx.add_offset(
+                            pout,
+                            (
+                                (
+                                    fx.Int64(ctx.planned_seq) * t.query_length
+                                    + output_row // t.query_group_size
+                                )
+                                * ctx.stride_q_row
+                                + (
+                                    ctx.kv_h * t.query_group_size
+                                    + output_row % t.query_group_size
+                                )
+                                * ctx.stride_q_head
+                                + d
+                                if t.direct_output
+                                else partial_row * t.head_dim + d
+                            ),
+                        ),
                     )
-                if ctx.warp == 0 and ctx.half == 0:
-                    pmax[slot * t.rows + row] = final[m * state_stride] * fx.Float32(
-                        1.0 / LOG2E
-                    )
-                    psum[slot * t.rows + row] = denom
+                if const_expr(not t.direct_output):  # noqa: SIM102
+                    if ctx.warp == 0 and ctx.half == 0:
+                        pmax[partial_row] = final[m * state_stride] * fx.Float32(
+                            1.0 / LOG2E
+                        )
+                        psum[partial_row] = denom
 
 
 def compile_gfx1250_pa_decode(
@@ -1139,7 +1169,11 @@ def compile_gfx1250_pa_decode(
     trans_v,
     sliding_window,
     compute_dtype="fp8",
+    direct_output=False,
+    query_splits=1,
 ):
+    if query_splits not in (1, 2, 4) or query_length % query_splits:
+        raise ValueError("query_splits must be 1, 2, or 4 and divide query_length")
     t = Gfx1250Traits(
         head_dim,
         query_group_size,
@@ -1151,6 +1185,8 @@ def compile_gfx1250_pa_decode(
         trans_v,
         sliding_window,
         compute_dtype,
+        direct_output,
+        query_splits,
     )
     if compute_dtype not in ("fp8", "bf16"):
         raise ValueError(f"Unsupported gfx1250 PA compute dtype: {compute_dtype}")
@@ -1191,11 +1227,22 @@ def compile_gfx1250_pa_decode(
         sequences: fx.Int32,
     ):
         _ = tag
+        task_slot = fx.Int32(gpu.block_id("x"))
+        if const_expr(t.direct_output):
+            # One task per nonempty sequence; reduce_info supplies its packed slot.
+            info = fx.recast_iter(fx.Int32, pmax)
+            count = fx.Int32(info[task_slot * 2 + 1])
+            # A trailing empty sequence's start can equal capacity. Its dummy
+            # task read must stay in bounds even though no compute consumes it.
+            task_slot = (count > 0).select(fx.Int32(info[task_slot * 2]), fx.Int32(0))
         task = fx.ptr_load(
-            fx.add_offset(fx.recast_iter(fx.Int32, work), gpu.block_id("x") * 4),
+            fx.add_offset(fx.recast_iter(fx.Int32, work), task_slot * 4),
             result_type=fx.Vector.make_type(4, fx.Int32),
         )
-        if fx.Int32(task[1]) < fx.Int32(task[2]):
+        active = fx.Int32(task[1]) < fx.Int32(task[2])
+        if const_expr(t.direct_output):
+            active = count > 0
+        if active:
             ctx = PaDecodeContext(
                 t,
                 SharedStorage,
@@ -1220,6 +1267,29 @@ def compile_gfx1250_pa_decode(
                 fx.Int32(task[3]),
             )
             Gfx1250Pipeline(ctx).run()
+        elif const_expr(t.direct_output):
+            output = fx.recast_iter(t.q_dtype, pout)
+            tid = fx.Int32(gpu.thread_id("x"))
+            for i in range_constexpr((t.rows * t.head_dim + 127) // 128):
+                index = i * 128 + tid
+                if index < t.rows * t.head_dim:
+                    row, d = index // t.head_dim, index % t.head_dim
+                    kv_query = fx.Int32(gpu.block_id("y"))
+                    row = row + (kv_query % t.query_splits) * t.rows
+                    offset = (
+                        (
+                            fx.Int64(gpu.block_id("x")) * t.query_length
+                            + row // t.query_group_size
+                        )
+                        * sq_row
+                        + (
+                            (kv_query // t.query_splits) * t.query_group_size
+                            + row % t.query_group_size
+                        )
+                        * sq_head
+                        + d
+                    )
+                    output[offset] = t.q_dtype(0.0)
 
     @flyc.jit
     def launch(
@@ -1261,7 +1331,15 @@ def compile_gfx1250_pa_decode(
             sq_head,
             work,
             sequences,
-        ).launch(grid=(capacity, kv_heads, 1), block=(128, 1, 1), stream=stream)
+        ).launch(
+            grid=(
+                sequences if t.direct_output else capacity,
+                kv_heads * t.query_splits,
+                1,
+            ),
+            block=(128, 1, 1),
+            stream=stream,
+        )
 
     compiled = {"launch": launch, "kernel": kernel}
     return _CACHE.setdefault(t, compiled)

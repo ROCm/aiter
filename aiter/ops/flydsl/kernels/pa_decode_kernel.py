@@ -95,6 +95,7 @@ def compile_pa_decode_tile(
     max_context_length: int | None = None,
     sliding_window: int = 0,
     compute_dtype: str = "fp8",
+    direct_output: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
@@ -131,9 +132,21 @@ def compile_pa_decode_tile(
     if architecture == "gfx1250":
         from .pa_decode.gfx1250 import compile_gfx1250_pa_decode
 
-        if query_splits not in (None, 1):
-            raise NotImplementedError(
-                "gfx1250 PA decode currently uses fused query rows"
+        if direct_output and num_partitions != 1:
+            raise ValueError("direct_output requires a one-partition plan")
+        if query_splits is None:
+            # Split the measured spilling BF16 specialization into one Q tile
+            # per CTA. Other shapes retain fused queries and their KV reuse.
+            query_splits = (
+                4
+                if compute_dtype == "bf16"
+                and head_dim == 1024
+                and query_group_size == 16
+                and query_length == 4
+                and block_size == 128
+                and trans_v
+                and sliding_window == 0
+                else 1
             )
         return compile_gfx1250_pa_decode(
             head_dim=head_dim,
@@ -146,7 +159,11 @@ def compile_pa_decode_tile(
             trans_v=trans_v,
             sliding_window=sliding_window,
             compute_dtype=compute_dtype,
+            direct_output=direct_output,
+            query_splits=query_splits,
         )
+    if direct_output:
+        raise NotImplementedError("direct_output requires gfx1250")
     if compute_dtype != "fp8":
         raise NotImplementedError(
             f"{compute_dtype} PA decode is only supported on gfx1250"

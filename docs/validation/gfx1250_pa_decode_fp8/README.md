@@ -1,5 +1,10 @@
 # gfx1250 FP8 PA decode evidence
 
+The [2026-10-12 sequential experiments](../../gfx1250_pa_decode_sequential_experiments.md)
+use the repository benchmark directly. Their [timing summary](sequential-20261012-summary.json)
+and [resource summary](sequential-20261012-resources.json) cover direct output,
+query splitting, partition-budget controls, and rejected transfer experiments.
+
 These compact results support the [optimization report](../../gfx1250_pa_decode_fp8_optimization.md).
 The baseline was a saved workspace kernel based on
 `fae4e8c61ebc7e41d205c6764240e13027cc8160`, including the earlier D128

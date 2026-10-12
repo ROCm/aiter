@@ -239,7 +239,10 @@ def test_pa_decode(
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16], ids=["bf16", "fp16"])
 @pytest.mark.parametrize("query_length", [1, 2], ids=["decode", "mtp2"])
 @pytest.mark.parametrize("head_dim", [128, 256], ids=["d128", "d256"])
-def test_pa_decode_packed_page_boundaries(dtype, query_length, head_dim, device):
+@pytest.mark.parametrize("max_partitions", [1, 7], ids=["direct", "partitioned"])
+def test_pa_decode_packed_page_boundaries(
+    dtype, query_length, head_dim, max_partitions, device
+):
     """Page-sized FP8 tiles must zero-fill tails and survive plan refresh."""
     from aiter.ops.flydsl.pa_decode import pa_decode, plan_pa_decode
 
@@ -315,7 +318,7 @@ def test_pa_decode_packed_page_boundaries(dtype, query_length, head_dim, device)
     plan = plan_pa_decode(
         context,
         heads,
-        max_partitions=7,
+        max_partitions=max_partitions,
         workgroup_budget=128,
         query_length=query_length,
     )

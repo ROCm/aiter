@@ -60,10 +60,14 @@ including D384/768/1024, use vector DMA. Double buffering overlaps the next K/V
 loads with current compute when LDS capacity permits. Byte extents determine
 wide-address dispatch, including BF16 caches crossing 2/4 GiB.
 
-The widest BF16 MTP case reuses one Q tile and one K/V buffer to fit in 320 KiB
-LDS. D1024/G16/MTP4 passes correctness for both V layouts, but its large
-accumulator state spills registers (1508 private bytes per work-item in the
-checked specialization). Its performance needs further tuning.
+The widest fused BF16 MTP case reuses one Q tile and one K/V buffer to fit in
+320 KiB LDS. D1024/G16/MTP4 passes correctness for both V layouts, but its large
+fused accumulator state spills registers. Transposed page128 full attention now
+splits the four query positions into separate CTAs: a fresh compiler check
+reduces private bytes from 2208 to 0, and B4/1K improves about 292→58 µs with a
+partitioned plan. Other layouts retain fused queries. See the
+[sequential experiment report](gfx1250_pa_decode_sequential_experiments.md)
+for measurements and selection limits.
 
 Build the plan before graph capture and supply scratch buffers during capture.
 Refresh the plan after changing lengths, as for FP8. The current
