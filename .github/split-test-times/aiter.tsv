@@ -121,6 +121,7 @@ op_tests/test_moe_tkw1.py	19
 op_tests/test_moe_topk_gating.py	282
 op_tests/test_msa_block_select.py	40
 op_tests/test_mxfp8fp4gemm.py	4
+op_tests/test_mxfp_exact_shape_dispatch.py	20
 op_tests/test_opus_a16w16_gemm.py	7
 op_tests/test_opus_a16w16_policy_parity.py	6
 op_tests/test_opus_a8w8_bmm.py	5
