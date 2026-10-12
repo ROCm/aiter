@@ -849,6 +849,15 @@ def build_hstu_attention_bwd_dvdk(
                 gpu.barrier()  # dO^T / Q^T published
             dv_acc = accum_dv_tile(dv_acc, p_packs)
             dk_acc = accum_dk_tile(dk_acc, compute_ds_packs(s_meta))
+            # Pin the dV/dK accumulation above the closing barrier. These MFMAs read
+            # and write only registers, so the scheduler is free to sink them past the
+            # barrier (it moves ~20 of them), which reaches the barrier sooner but
+            # leaves early-arriving waves idle through the wait.
+            # NOTE: measured 302.7 ms vs 289.4 ms baseline on gfx942 at
+            # B=1024/H=4/N=16384/d=64 (+4.6%) -- the strict fence also blocks
+            # VALU/LDS/VMEM interleaving. sched_barrier(0xFF7) pins only MFMA and
+            # measures 291.3 ms if the ordering is wanted at lower cost.
+            rocdl.sched_barrier(0)
             # Prevent the next DMA from overwriting Q LDS while another wave reads it.
             gpu.barrier()
             return dv_acc + dk_acc
