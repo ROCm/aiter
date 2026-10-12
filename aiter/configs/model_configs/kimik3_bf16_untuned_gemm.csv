@@ -445,7 +445,6 @@ M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
 7803,2304,1536,False,torch.bfloat16,torch.bfloat16,False,False
 7803,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 7803,6144,7168,False,torch.bfloat16,torch.bfloat16,False,False
-7803,7168,1536,False,torch.bfloat16,torch.bfloat16,False,False
 7803,7168,4224,False,torch.bfloat16,torch.bfloat16,False,False
 7803,8448,7168,False,torch.bfloat16,torch.bfloat16,False,False
 7877,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
@@ -577,14 +576,11 @@ M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle
 18246,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18252,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18278,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
-18281,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18292,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
-18370,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18396,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18442,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18464,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18496,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
-18521,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18564,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18920,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
 18929,3072,512,False,torch.bfloat16,torch.bfloat16,False,False
