@@ -7,8 +7,7 @@ Family A is Flash-Next production (must win). Family B is #4882 Gluon-parity
 only -- Gluon sparse GQA does not auto-dispatch on family A (group 12, D=256).
 
 These are test fixtures. The kernels declare their own structural constants
-so they do not depend on a model registry; ``test_flydsl_qsa`` asserts those
-constants still cover every family here.
+so they do not depend on a model registry.
 """
 
 from __future__ import annotations
