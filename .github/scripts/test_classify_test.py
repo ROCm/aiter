@@ -163,7 +163,11 @@ def test_canary():
             # 1. Must be classified as PYTEST
             self.assertEqual(classify_test_file(tmp_path), "PYTEST")
             # 2. Must fail loudly with exit code 1 under pytest
-            res = subprocess.run([sys.executable, "-m", "pytest", tmp_path, "-q"], capture_output=True, text=True)
+            res = subprocess.run(
+                [sys.executable, "-m", "pytest", tmp_path, "-q"],
+                capture_output=True,
+                text=True,
+            )
             self.assertEqual(res.returncode, 1)
             self.assertIn("AssertionError", res.stdout + res.stderr)
         finally:
@@ -244,6 +248,7 @@ class TestDiscoveryLogic(unittest.TestCase):
 
     def test_targeted_discovery_inventory(self):
         import glob
+
         test_dir = os.path.join(REPO_ROOT, "op_tests")
 
         # 1. Root tests
@@ -251,7 +256,9 @@ class TestDiscoveryLogic(unittest.TestCase):
         self.assertEqual(len(root_tests), 162)
 
         # 2. FlyDSL tests
-        flydsl_tests = sorted(glob.glob(os.path.join(test_dir, "flydsl_tests", "test_*.py")))
+        flydsl_tests = sorted(
+            glob.glob(os.path.join(test_dir, "flydsl_tests", "test_*.py"))
+        )
         self.assertEqual(len(flydsl_tests), 5)
         # Verify PR #5232 test exists in FlyDSL
         self.assertIn(

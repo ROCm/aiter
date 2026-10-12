@@ -109,7 +109,9 @@ def classify_test_file(filepath: str) -> str:
         if isinstance(node, ast.FunctionDef) and node.name.startswith("test_"):
             test_function_nodes.append(node)
         elif isinstance(node, ast.ClassDef):
-            if node.name.startswith("Test") or any("TestCase" in ast.unparse(b) for b in node.bases):
+            if node.name.startswith("Test") or any(
+                "TestCase" in ast.unparse(b) for b in node.bases
+            ):
                 has_test_classes = True
 
     # If there are no test functions and no test classes, it's not a pytest suite
@@ -123,7 +125,9 @@ def classify_test_file(filepath: str) -> str:
         num_pos_no_default = len(fn.args.args) - len(fn.args.defaults)
         if num_pos_no_default > 0:
             # Check if covered by @pytest.mark.parametrize
-            is_parametrized = any("parametrize" in ast.unparse(d) for d in fn.decorator_list)
+            is_parametrized = any(
+                "parametrize" in ast.unparse(d) for d in fn.decorator_list
+            )
             if not is_parametrized:
                 pos_arg_names = [a.arg for a in fn.args.args[:num_pos_no_default]]
                 unresolved = [a for a in pos_arg_names if a not in recognized_fixtures]
