@@ -628,7 +628,16 @@ def test_mla(
         and not (nhead == 64 and decode_qlen > 1)
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [8, 16, 32, 128]:
+    elif kvtype == dtypes.fp8 and (
+        nhead in [8, 16, 32, 128]
+        # non-persistent qt64 kernel: gfx950 fp8/fp8 nhead=64 qlen=1 only
+        or (
+            nhead == 64
+            and dtype == dtypes.fp8
+            and decode_qlen == 1
+            and get_gfx() == "gfx950"
+        )
+    ):
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
