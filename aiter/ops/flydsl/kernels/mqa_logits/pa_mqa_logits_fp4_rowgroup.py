@@ -50,8 +50,7 @@ from functools import lru_cache
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir import ir
-from flydsl._mlir.dialects import llvm, vector
+from flydsl._mlir.dialects import llvm
 from flydsl.expr import gpu, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.primitive import range_constexpr
@@ -174,11 +173,13 @@ def _global_i32(addr, words, nt=False):
     """``words`` i32 at the 64-bit global address ``addr``, a vector; a pool
     past 4 GiB is reached only this way (a buffer load's offset, index x stride
     included, is 32 bits). ``nt``: nontemporal."""
-    vt = ir.VectorType.get([words], T.i32)
-    ptr = llvm.IntToPtrOp(
-        ir.Type.parse("!llvm.ptr<1>"), as_ir_value(fx.Int64(addr))
-    ).result
-    return llvm.LoadOp(vt, ptr, alignment=4 * words, nontemporal=nt or None).result
+    ptr = fx.inttoptr(
+        fx.PointerType.get(T.i32, fx.AddressSpace.Global, 4 * words),
+        fx.Int64(addr),
+    )
+    return fx.generic_load(
+        ptr, dtype=fx.Vector[fx.Int32, words], nontemporal=nt
+    ).ir_value()
 
 
 def _addr_i32_buffer(addr, width=1, records=None):
@@ -292,9 +293,9 @@ def _lds_barrier():
     s_barrier. gpu.barrier also waits on every global read in flight, and
     the reads issued ahead of a hand-off are exactly the ones meant to stay
     in flight across it."""
-    llvm.fence(llvm.AtomicOrdering.release, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Release, syncscope="workgroup")
     rocdl.s_barrier()
-    llvm.fence(llvm.AtomicOrdering.acquire, syncscope="workgroup")
+    fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope="workgroup")
 
 
 def _add(a, b):
@@ -918,17 +919,13 @@ def build_pa_mqa_logits_fp4_rowgroup_module(
                 # (in the loop body's first wait as well, which also covers its
                 # entry)
                 kvs = [
-                    fx.Int32(
-                        vector.ExtractOp(
-                            _global_i32(
-                                kvs_page_base
-                                + fx.Int64(lane_kvs_off + fx.Int32(kt * 4 * page_size)),
-                                1,
-                            ),
-                            [],
-                            [0],
-                        ).result
-                    )
+                    fx.Vector(
+                        _global_i32(
+                            kvs_page_base
+                            + fx.Int64(lane_kvs_off + fx.Int32(kt * 4 * page_size)),
+                            1,
+                        )
+                    )[0]
                     for kt in range(k_tiles)
                 ]
                 kv = []
