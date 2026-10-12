@@ -104,23 +104,64 @@ def check_budget_fits():
     return 0
 
 
-def check_watchdog_owner():
-    """Every message but one routes through _notify.py's class->owner map. The watchdog posts its
-    stuck-runner page itself and carries its own copy of the handle, so the two drift apart in
-    silence: the next owner updates _notify.py and still never hears that the runner is down."""
+def check_owner_fallbacks():
+    """Every message but two routes through _notify.py's class->owner map. The watchdog and the
+    lost-review report post their own comments and carry their own copy of a handle, so they
+    drift from the map in silence: the next owner updates _notify.py and still never hears that
+    the runner is down, or that a review vanished."""
     wf = WORKFLOW.read_text(encoding="utf-8")
-    wd = (HERE / "watchdog.py").read_text(encoding="utf-8")
-    m = re.search(r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"', wd)
-    v = re.search(r"OWNER_OVERRIDE: \$\{\{ vars\.([A-Z_]+) \}\}", wf)
-    if not m or not v:
-        print("\u274c cannot read the watchdog's owner fallback from watchdog.py")
+    classes = _notify_mod().CLASSES
+    rows = [
+        ("watchdog.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
+        ("lost_review.py", "flow",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
+        ("queue_gate.py", "env",
+         r'OWNER_OVERRIDE"\) or ""\)\.strip\(\) or "([A-Za-z0-9-]+)"'),
+    ]
+    bad = 0
+    for filename, cls, pattern in rows:
+        m = re.search(pattern, (HERE / filename).read_text(encoding="utf-8"))
+        var, default = classes[cls][:2]
+        if not m:
+            print(f"\u274c cannot read {filename}'s owner fallback")
+            bad += 1
+            continue
+        if m.group(1) != default:
+            print(f"\u274c {filename} pages '{m.group(1)}', but _notify.py's {cls} class is "
+                  f"'{default}'")
+            bad += 1
+            continue
+        if not re.search(r"OWNER_OVERRIDE: \$\{\{ vars\." + var + r" \}\}", wf):
+            print(f"\u274c {filename} defaults to _notify.py's {cls} owner but the workflow does "
+                  f"not pass {var}")
+            bad += 1
+            continue
+        print(f"\u2705 {filename} matches _notify.py's {cls} class: {default} via {var}")
+    return 1 if bad else 0
+
+
+def check_notified_handoff():
+    """The report job stays quiet when the review job says it already spoke. That answer travels
+    _notify.py -> step output -> job output -> the report job's env, and every link is a string
+    that something else has to spell the same way. Break one and nothing errors: the flag simply
+    arrives empty, the report fires on every failed review, and the duplicate notice looks like
+    the bot being broken rather than the wiring being broken."""
+    wf = WORKFLOW.read_text(encoding="utf-8")
+    notify = (HERE / "_notify.py").read_text(encoding="utf-8")
+    links = [
+        ("_notify.py writes the flag", 'fh.write("notified=true' in notify),
+        ("the review job has a step to write it", re.search(r"^\s+id: notify\s*$", wf, re.M)),
+        ("the review job exports it",
+         re.search(r"^\s+notified: \$\{\{ steps\.notify\.outputs\.notified \}\}", wf, re.M)),
+        ("the report job reads it",
+         re.search(r"^\s+NOTIFIED: \$\{\{ needs\.review\.outputs\.notified \}\}", wf, re.M)),
+    ]
+    broken = [name for name, found in links if not found]
+    if broken:
+        print("\u274c the notified handoff is broken at: %s" % "; ".join(broken))
         return 1
-    var, default = _notify_mod().CLASSES["env"][:2]
-    if (m.group(1), v.group(1)) != (default, var):
-        print(f"\u274c watchdog pages '{m.group(1)}' via {v.group(1)}, but _notify.py's env class "
-              f"is '{default}' via {var}")
-        return 1
-    print(f"\u2705 watchdog owner matches _notify.py's env class: {default} via {var}")
+    print("\u2705 notified handoff intact: _notify.py -> step -> job output -> report")
     return 0
 
 
@@ -160,7 +201,8 @@ def main():
             bad += 1
     bad += check_fail_classes()
     bad += check_budget_fits()
-    bad += check_watchdog_owner()
+    bad += check_owner_fallbacks()
+    bad += check_notified_handoff()
     bad += check_runner_label_exclusive()
     print(f"{'OK' if bad == 0 else 'DRIFT'}: {bad} drift(s)")
     return bad
