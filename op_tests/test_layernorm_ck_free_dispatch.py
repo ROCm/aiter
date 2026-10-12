@@ -193,6 +193,58 @@ def test_ck_free_add_rows_share_stride(monkeypatch, entry):
     assert bool((backing[:, :N] == 0).all())
 
 
+@pytest.mark.parametrize("entry", ENTRY_POINTS[2:])
+def test_ck_free_permuted_outputs(monkeypatch, entry):
+    # Permuted 3-D out / residual_out have no (-1, N) view.
+    monkeypatch.setattr(norm, "ENABLE_CK", False)
+    has_residual = "add" in entry
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append(args)
+        rows = torch.arange(args[0].shape[0]).unsqueeze(1)
+        args[0].copy_(rows.expand_as(args[0]))
+        if has_residual:
+            args[3].copy_((rows + 10).expand_as(args[3]))
+
+    monkeypatch.setattr(triton_norm, entry, fake)
+    t = _make_inputs()
+    out_dtype = torch.bfloat16 if entry == "layernorm2d_fwd_with_add" else torch.int8
+    out = torch.zeros(S, B, N, dtype=out_dtype).permute(1, 0, 2)
+    residual_out = torch.zeros(S, B, N, dtype=torch.bfloat16).permute(1, 0, 2)
+    w, b = t["weight"], t["bias"]
+    if entry == "layernorm2d_fwd_with_add":
+        norm.layernorm2d_fwd_with_add(
+            out, t["x"], t["residual"], residual_out, w, b, EPS
+        )
+    elif entry == "layernorm2d_fwd_with_smoothquant":
+        norm.layernorm2d_fwd_with_smoothquant(
+            out, t["x"], t["xscale"], t["yscale"], w, b, EPS
+        )
+    else:
+        norm.layernorm2d_fwd_with_add_smoothquant(
+            out,
+            t["x"],
+            t["residual"],
+            residual_out,
+            t["xscale"],
+            t["yscale"],
+            w,
+            b,
+            EPS,
+        )
+
+    (args,) = calls
+    assert args[0].dim() == 2 and args[0].stride(-1) == 1
+    want = torch.arange(B * S).view(B, S, 1).expand(B, S, N)
+    torch.testing.assert_close(out, want.to(out_dtype), rtol=0, atol=0)
+    if has_residual:
+        assert args[3].is_contiguous()
+        torch.testing.assert_close(
+            residual_out, (want + 10).to(torch.bfloat16), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize("entry", ENTRY_POINTS)
 def test_ck_calls_ck(monkeypatch, entry):
     monkeypatch.setattr(norm, "ENABLE_CK", True)

@@ -92,35 +92,44 @@ def layernorm2d_fwd_with_add_smoothquant_ck(
 ) -> None: ...
 
 
-# The Triton kernels take 2-D rows and have no x_bias input; the CK kernels add
-# x_bias to the input and treat any shape as (numel / N, N).
+# The Triton kernels take 2-D rows with unit column stride and have no x_bias
+# input; the CK kernels add x_bias to the input and treat any shape as
+# (numel / N, N).
 def _triton_rows(input: Tensor, x_bias: Tensor | None) -> Tensor:
     if x_bias is not None:
         input = input + x_bias
-    return input.reshape(-1, input.shape[-1])
+    rows = input.reshape(-1, input.shape[-1])
+    return rows if rows.stride(-1) == 1 else rows.contiguous()
+
+
+# A caller-provided output that has no such row view (for example a permuted
+# 3-D tensor), or is not contiguous when contiguous=True, is written through a
+# contiguous temporary; _copy_back then copies it into the caller's tensor.
+def _out_rows(out: Tensor, n: int, contiguous: bool = False) -> Tensor:
+    if out.is_contiguous() or (
+        not contiguous and out.dim() == 2 and out.stride(-1) == 1
+    ):
+        return out.view(-1, n)
+    return torch.empty((out.numel() // n, n), dtype=out.dtype, device=out.device)
+
+
+def _copy_back(out: Tensor, rows: Tensor) -> None:
+    if rows.data_ptr() != out.data_ptr():
+        out.copy_(rows.view(out.shape))
 
 
 # The Triton fused-add kernels index residual_in and residual_out with the input
 # row stride, while CK takes one stride per tensor, so all three are passed as
-# contiguous rows; residual_out goes through a temporary when it is not.
+# contiguous rows.
 def _triton_add_rows(
     input: Tensor, residual_in: Tensor, residual_out: Tensor, x_bias: Tensor | None
 ) -> tuple[Tensor, Tensor, Tensor]:
     n = input.shape[-1]
-    res_out = residual_out.view(-1, n)
-    if not res_out.is_contiguous():
-        res_out = torch.empty(res_out.shape, dtype=res_out.dtype, device=res_out.device)
     return (
         _triton_rows(input, x_bias).contiguous(),
         residual_in.reshape(-1, n).contiguous(),
-        res_out,
+        _out_rows(residual_out, n, contiguous=True),
     )
-
-
-def _copy_back(residual_out: Tensor, res_out: Tensor) -> None:
-    dst = residual_out.view(-1, res_out.shape[-1])
-    if res_out.data_ptr() != dst.data_ptr():
-        dst.copy_(res_out)
 
 
 # The CK binding rejects None for weight / bias; reject it the same way here.
@@ -174,15 +183,9 @@ def layernorm2d_fwd_with_add(
         )
 
         x, res_in, res_out = _triton_add_rows(input, residual_in, residual_out, x_bias)
-        layernorm2d_fwd_with_add_triton(
-            out.view(-1, input.shape[-1]),
-            x,
-            res_in,
-            res_out,
-            weight,
-            bias,
-            epsilon,
-        )
+        y = _out_rows(out, input.shape[-1])
+        layernorm2d_fwd_with_add_triton(y, x, res_in, res_out, weight, bias, epsilon)
+        _copy_back(out, y)
         _copy_back(residual_out, res_out)
         return
     layernorm2d_fwd_with_add_ck(
@@ -206,9 +209,9 @@ def layernorm2d_fwd_with_smoothquant(
             layernorm2d_fwd_with_smoothquant as layernorm2d_fwd_with_smoothquant_triton,
         )
 
-        n = input.shape[-1]
+        y = _out_rows(out, input.shape[-1])
         layernorm2d_fwd_with_smoothquant_triton(
-            out.view(-1, n),
+            y,
             _triton_rows(input, x_bias),
             xscale,
             yscale,
@@ -216,6 +219,7 @@ def layernorm2d_fwd_with_smoothquant(
             bias,
             epsilon,
         )
+        _copy_back(out, y)
         return
     layernorm2d_fwd_with_smoothquant_ck(
         out, input, xscale, yscale, weight, bias, epsilon, x_bias
@@ -241,8 +245,9 @@ def layernorm2d_fwd_with_add_smoothquant(
         )
 
         x, res_in, res_out = _triton_add_rows(input, residual_in, residual_out, x_bias)
+        y = _out_rows(out, input.shape[-1])
         layernorm2d_fwd_with_add_smoothquant_triton(
-            out.view(-1, input.shape[-1]),
+            y,
             x,
             res_in,
             res_out,
@@ -252,6 +257,7 @@ def layernorm2d_fwd_with_add_smoothquant(
             bias,
             epsilon,
         )
+        _copy_back(out, y)
         _copy_back(residual_out, res_out)
         return
     layernorm2d_fwd_with_add_smoothquant_ck(
