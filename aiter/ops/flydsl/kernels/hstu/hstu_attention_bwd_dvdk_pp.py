@@ -451,6 +451,7 @@ def build_hstu_attention_bwd_dvdk_pp(
         c_alpha = fx.Float32(alpha)
         c_inv_n = fx.Float32(1.0 / max_seq_len)
         c_neg_log2e = fx.Float32(-_LOG2E)
+        c_alpha_neg_log2e = fx.Float32(alpha * -_LOG2E)
         c_one_f = fx.Float32(1.0)
         c_zero_f = fx.Float32(0.0)
         # dS no longer carries 1/N (see gate_phase), so the dK store applies
@@ -759,8 +760,12 @@ def build_hstu_attention_bwd_dvdk_pp(
                      for j in rng]
                 da = [Vec(da_accs[j // MFMA_ELEMS_PER_LANE])[j % MFMA_ELEMS_PER_LANE]
                       for j in rng]
+                # Both derived straight from `s`, not `emu` from `sc`: that
+                # serialised two multiplies at the head of a chain whose next
+                # link is a 16-cycle transcendental. Same op count, one less
+                # link, and the two multiplies now issue in parallel.
                 sc = [s[j] * c_alpha for j in rng]
-                emu = [exp2_f32(sc[j] * c_neg_log2e) for j in rng]
+                emu = [exp2_f32(s[j] * c_alpha_neg_log2e) for j in rng]
                 sig = [c_one_f / (c_one_f + emu[j]) for j in rng]
                 silu = [sc[j] * sig[j] for j in rng]
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
