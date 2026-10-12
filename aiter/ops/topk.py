@@ -46,35 +46,42 @@ def _can_use_gfx1250_exact_sigmoid_topk(
     topk_ids: torch.Tensor,
 ) -> bool:
     """Whether tensors satisfy a measured gfx1250 sigmoid top-k contract."""
+    if not gating_output.is_cuda or gating_output.ndim != 2:
+        return False
+    rows, experts = gating_output.shape
+    if topk_ids.ndim != 2 or topk_ids.shape[0] != rows:
+        return False
+    topk = topk_ids.shape[1]
     if (
-        not gating_output.is_cuda
-        or gating_output.ndim != 2
-        or gating_output.shape[0] == 0
-        or gating_output.shape[1] not in _GFX1250_SIGMOID_EXPERTS
-        or gating_output.dtype != torch.bfloat16
-        or gating_output.stride(1) != 1
-        or gating_output.stride(0) < gating_output.shape[1]
-        or correction_bias.shape != (gating_output.shape[1],)
-        or correction_bias.dtype != torch.bfloat16
-        or correction_bias.stride(0) != 1
-        or topk_ids.ndim != 2
-        or topk_ids.shape[0] != gating_output.shape[0]
-        or topk_ids.shape[1] not in _GFX1250_SIGMOID_TOPKS
-        or topk_weights.shape != topk_ids.shape
-        or topk_weights.dtype != torch.float32
-        or topk_weights.stride(1) != 1
-        or topk_weights.stride(0) < topk_ids.shape[1]
-        or topk_ids.dtype != torch.int32
-        or topk_ids.stride(1) != 1
-        or topk_ids.stride(0) < topk_ids.shape[1]
+        rows == 0
+        or experts not in _GFX1250_SIGMOID_EXPERTS
+        or topk not in _GFX1250_SIGMOID_TOPKS
     ):
         return False
-    if not (
+    input_ok = (
+        gating_output.dtype == torch.bfloat16
+        and gating_output.stride(1) == 1
+        and gating_output.stride(0) >= experts
+    )
+    bias_ok = (
+        correction_bias.shape == (experts,)
+        and correction_bias.dtype == torch.bfloat16
+        and correction_bias.stride(0) == 1
+    )
+    outputs_ok = (
+        topk_weights.shape == topk_ids.shape == (rows, topk)
+        and (topk_weights.dtype, topk_ids.dtype) == (torch.float32, torch.int32)
+        and topk_weights.stride(1) == topk_ids.stride(1) == 1
+        and topk_weights.stride(0) >= topk
+        and topk_ids.stride(0) >= topk
+    )
+    same_device = (
         correction_bias.device
         == topk_weights.device
         == topk_ids.device
         == gating_output.device
-    ):
+    )
+    if not input_ok or not bias_ok or not outputs_ok or not same_device:
         return False
     device_index = gating_output.device.index
     if device_index is None:
