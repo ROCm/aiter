@@ -23,8 +23,6 @@ from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Float8E4M3FN, Float32, T
 from flydsl.expr.typing import Vector as Vec
 
-from aiter.ops.flydsl.kernels import buffer_ops
-
 
 def div_up(x, y):
     return (x + y - 1) // y
@@ -348,17 +346,23 @@ def compile_gemm_fp8_8wave(
             )
 
         def load_scale_b(ki):
-            offset = fx.Int32(bid_y * scaleB_elems + ki)
-            scale_l = buffer_ops.buffer_load(
-                scaleB_rsrc, offset, vec_width=1, is_scalar=True
-            )
-            scale_r = buffer_ops.buffer_load(
-                scaleB_rsrc, offset + scaleA_stride, vec_width=1, is_scalar=True
+            addr = fx.Int32((bid_y * scaleB_elems + ki) * 4)
+            result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
+            result = _llvm.inline_asm(
+                result_type,
+                [
+                    arith._to_raw(scaleB_rsrc),
+                    arith._to_raw(addr),
+                    arith._to_raw(addr + scaleA_stride * 4),
+                ],
+                "s_buffer_load_dword $0, $2, $3\n" "s_buffer_load_dword $1, $2, $4",
+                "=&s,=&s,s,s,s,~{memory}",
+                has_side_effects=True,
             )
             return Vec.from_elements(
                 [
-                    fx.Int32(scale_l).bitcast(fx.Float32),
-                    fx.Int32(scale_r).bitcast(fx.Float32),
+                    fx.Float32(_llvm.extractvalue(T.f32, result, [0])),
+                    fx.Float32(_llvm.extractvalue(T.f32, result, [1])),
                 ],
                 fx.Float32,
             )
