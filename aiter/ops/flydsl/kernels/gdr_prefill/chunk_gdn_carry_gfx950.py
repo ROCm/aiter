@@ -202,6 +202,8 @@ def compile_chunk_gdn_carry(
                 ],
                 dtype=fx.Float32,
             )
+            # At the last block (b + 1 == end - 1) reuse b: one redundant affine step
+            # is cheaper than branching around it.
             next_block = (b + 1 < end - 1).select(b + 1, b)
             values, next_a = _affine_step(
                 maps,

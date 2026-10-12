@@ -7,16 +7,21 @@
 
 from __future__ import annotations
 
+import argparse
 import csv
+import os
+import sys
 import time
 from typing import Any
 
 import flydsl.expr as fx
 
 from aiter.aot.flydsl.common import (
+    collect_aot_jobs,
     compile_only_env,
     job_identity,
     override_env,
+    run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
 from aiter.ops.flydsl.kernels.gdr_prefill import compile_chunk_gated_delta_h
@@ -342,3 +347,68 @@ def compile_one_config(*, cu_num: int = 0, phase: str, **kwargs) -> dict[str, An
         print(f"  [FAIL] compile  {shape_str}  arch={aot_arch}: {e}")
 
     return result
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="AOT pre-compile blocked GDN prefill kernels from aiter CSV config",
+        formatter_class=argparse.RawTextHelpFormatter,
+    )
+    parser.add_argument(
+        "--csv",
+        type=str,
+        nargs="+",
+        default=DEFAULT_CSVS,
+        help="Path(s) to tuned CSV config file(s); defaults come from AITER_CONFIGS",
+    )
+    args = parser.parse_args()
+
+    csv_paths = [os.path.abspath(p) for p in args.csv]
+    for csv_path in csv_paths:
+        if not os.path.isfile(csv_path):
+            print(f"Error: CSV file not found: {csv_path}")
+            sys.exit(1)
+
+    cache_dir = os.path.expanduser(
+        os.environ.get("FLYDSL_RUNTIME_CACHE_DIR", "~/.flydsl/cache")
+    )
+    arch = os.environ.get("ARCH") or os.environ.get("GPU_ARCHS") or "(auto-detect)"
+
+    jobs = collect_aot_jobs(csv_paths, parse_csv)
+
+    print("=" * 72)
+    print("FlyDSL blocked GDN prefill AOT Pre-compilation")
+    print("=" * 72)
+    for csv_path in csv_paths:
+        print(f"  CSV:          {csv_path}")
+    print(f"  Total jobs:   {len(jobs)}")
+    print(f"  Compile arch: {CHUNK_GDN_BLOCKED_AOT_ARCH_DEFAULT}")
+    print(f"  Cache dir:    {cache_dir}")
+    print(f"  Target arch:  {arch}")
+    print("=" * 72)
+
+    total_t0 = time.time()
+    print(f"\n--- Compiling {len(jobs)} kernels ---")
+    results = run_jobs_parallel(compile_one_config, jobs)
+    total_elapsed = time.time() - total_t0
+
+    ok = sum(1 for r in results if r["compile_time"] is not None)
+    fail = sum(1 for r in results if r["compile_time"] is None)
+
+    print("\n" + "=" * 72)
+    print("Summary")
+    print("=" * 72)
+    print(f"  Total time:   {total_elapsed:.1f}s")
+    print(f"  Compiled:     {ok} ok, {fail} failed")
+    print(f"  Cache dir:    {cache_dir}")
+    print()
+
+    if fail > 0:
+        print("Some compilations failed. Check output above for details.")
+        sys.exit(1)
+    print("All compilations succeeded. Cache is ready.")
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

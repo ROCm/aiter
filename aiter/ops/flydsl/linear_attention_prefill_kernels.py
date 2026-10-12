@@ -152,6 +152,9 @@ _IS_GFX942 = _GFX_ARCH.startswith("gfx942")
 _OPT_BV_ENV = os.environ.get("FLYDSL_K5_OPT_BV")
 
 
+_IS_GFX950 = _GFX_ARCH.startswith("gfx950")
+
+
 def _gdn_k5_target_segments() -> int:
     target_segments = int(os.environ.get("AITER_GDN_K5_TARGET_SEGMENTS", "8"))
     if target_segments <= 0:
@@ -159,32 +162,26 @@ def _gdn_k5_target_segments() -> int:
     return target_segments
 
 
-@functools.cache
-def _is_gfx950_device(device: torch.device) -> bool:
-    # get_device_properties costs several us per call; the arch is fixed per device.
-    return (
-        torch.cuda.get_device_properties(device).gcnArchName.split(":")[0] == "gfx950"
-    )
-
-
 # Blocked-path scratch (maps, carry entries) is never returned to the caller, so it
 # is reused across calls. Reuse is only stream-ordered on the stream that allocated it.
-_BLOCKED_SCRATCH: dict = {}
-_BLOCKED_SCRATCH_MAX = 8
+_BLOCKED_SCRATCH_MAX = 16
+_BLOCKED_SCRATCH = OrderedDict()
 
 
 def _blocked_scratch(device, blocks, H, packed_v, K, stream):
     key = (device, blocks, H, packed_v, K)
     cached = _BLOCKED_SCRATCH.get(key)
     if cached is not None and cached[0] == stream:
+        _BLOCKED_SCRATCH.move_to_end(key)
         return cached[1], cached[2]
     maps = torch.empty((blocks, H, packed_v, K), device=device, dtype=torch.float32)
     entry = torch.empty(
         (blocks, H, K, packed_v - K), device=device, dtype=torch.float32
     )
-    if len(_BLOCKED_SCRATCH) >= _BLOCKED_SCRATCH_MAX and key not in _BLOCKED_SCRATCH:
-        _BLOCKED_SCRATCH.pop(next(iter(_BLOCKED_SCRATCH)))
     _BLOCKED_SCRATCH[key] = (stream, maps, entry)
+    _BLOCKED_SCRATCH.move_to_end(key)
+    if len(_BLOCKED_SCRATCH) > _BLOCKED_SCRATCH_MAX:
+        _BLOCKED_SCRATCH.popitem(last=False)
     return maps, entry
 
 
@@ -339,15 +336,13 @@ def _tuned_bv(
 _INT32_ATTR = "_flydsl_int32_view"
 _PROLOGUE_ATTR = "_flydsl_prologue_cache"
 _ADAPTIVE_K5_META_ATTR = "_aiter_gdn_k5_adaptive_meta"
-# Keeps dense offsets alive so the attribute cache above can hit; LRU-bounded
-# because each tensor retains its uploaded schedule.
+# Keeps dense offsets alive so the attr cache can hit; LRU-bounded.
 _DENSE_K5_OFFSETS_MAX = 32
 _DENSE_K5_OFFSETS = OrderedDict()
-# Serial K5 cost scales with the longest sequence's chunks (~1.6 us/chunk);
-# blocked scales with total_blocks * H (~0.18 us/block/head) plus a fixed carry
-# pass (~25 chunks). gfx950 break-even is ratio ~9, so 6 leaves margin and
-# bounds the maps/entry scratch. Blocked loses to serial on balanced
-# two-sequence splits under ~96 chunks ([4064,4065], [3000,5129]); wins from 97.
+# Serial K5 ~1.6 us/chunk of the longest sequence; blocked ~0.18 us/block/head
+# plus a ~25-chunk carry pass. gfx950 break-even is work ratio ~9; 6 leaves
+# margin and bounds scratch. Blocked loses on balanced two-sequence splits
+# under ~96 chunks ([4064,4065], [3000,5129]), wins from 97.
 _BLOCKED_MIN_CHUNKS = 96
 _BLOCKED_MAX_WORK_PER_CHUNK = 6
 
@@ -1011,7 +1006,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         and use_exp2
         and bf16_convert_trunc
         and k.is_cuda
-        and _is_gfx950_device(k.device)
+        and _IS_GFX950
         and not torch.cuda.is_current_stream_capturing()
     ):
         lengths = _gdn_k5_sequence_lengths(cu_seqlens, T, prefill_metadata)
@@ -1209,7 +1204,7 @@ def _carry_chunk_gdn_block_maps(
         raise ValueError("Carry requires packed maps with K=V=128.")
     if maps.dtype != torch.float32:
         raise ValueError("Carry maps must be fp32 tensors.")
-    if not maps.is_cuda or not _is_gfx950_device(maps.device):
+    if not maps.is_cuda or not _IS_GFX950:
         raise ValueError("Block-map carry currently supports gfx950 only.")
     maps = _require_contiguous(maps, "maps")
     if initial_state is not None:
