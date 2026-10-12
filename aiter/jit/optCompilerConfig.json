@@ -31,6 +31,22 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "''"
     },
+    "module_fused_indexed_gated_residual": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/pybind/fused_indexed_gated_residual_pybind.cu'",
+            "f'{AITER_CSRC_DIR}/kernels/fused_indexed_gated_residual.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [
+            "'-ffp-contract=off'",
+            "'-fno-gpu-flush-denormals-to-zero'"
+        ],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": "''"
+    },
     "module_attention": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_ck/attention_kernels.cu'",
