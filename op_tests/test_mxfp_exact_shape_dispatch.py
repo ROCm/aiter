@@ -138,3 +138,7 @@ def test_exact_shape_dispatch_matches_generic_kernel(family, shape, candidate_ke
     del x, weight, A, A_scale, B, B_scale, out_ref, out
     gc.collect()
     torch.cuda.empty_cache()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
