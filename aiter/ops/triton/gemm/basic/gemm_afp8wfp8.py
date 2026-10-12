@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 
+import os
 import copy
 import math
 
@@ -499,6 +500,11 @@ def gemm_afp8wfp8_preshuffle(
         warp_bases = [(0, 1)]
         for i in range(int(math.log2(config["num_warps"] // 2))):
             warp_bases.append((1 << i, 0))
+        # LOCAL HACK: MXFP8_WARPS_ALL_N=1 puts every warp along N, giving each
+        # wave a (BLOCK_SIZE_M, BLOCK_SIZE_N // num_warps) tile like the skewed
+        # bf16 compute_bound configs.
+        if os.environ.get("MXFP8_WARPS_ALL_N", "0") == "1":
+            warp_bases = [(0, 1 << i) for i in range(int(math.log2(config["num_warps"])))]
 
         _PRESHUFFLE_KERNEL_MAP[kernel_type][grid](
             x,
