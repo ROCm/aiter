@@ -304,7 +304,7 @@ def build_qsa_k1_scores_module(
             fx.memref_store_vec(a_vec, qk_a)
             fx.memref_store_vec(b_vec, qk_b)
             fx.memref_store_vec(c_vec, qk_c)
-            fx.mma_atom_call(qk_mma, qk_c, qk_a, qk_b, qk_c)
+            fx.gemm(qk_mma, qk_c, qk_a, qk_b, qk_c)
             return fx.memref_load_vec(qk_c)
 
         req = token_to_req[row]
@@ -599,7 +599,7 @@ def build_qsa_k1_prefill_scores_module(
             fx.memref_store_vec(a_vec, qk_a)
             fx.memref_store_vec(b_vec, qk_b)
             fx.memref_store_vec(c_vec, qk_c)
-            fx.mma_atom_call(qk_mma, qk_c, qk_a, qk_b, qk_c)
+            fx.gemm(qk_mma, qk_c, qk_a, qk_b, qk_c)
             return fx.memref_load_vec(qk_c)
 
         if tid < Int32(block_m):
