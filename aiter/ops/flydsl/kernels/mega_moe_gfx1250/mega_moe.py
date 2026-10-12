@@ -285,6 +285,25 @@ def _mori_fp4_push_wire_nbytes(config) -> int:
     )
 
 
+def _mori_push_land_rows(config) -> int | None:
+    """Landing rows of mori's push combine, one per (token, destination rank).
+
+    None for a mori from before ROCm/mori#745, whose push combine lands a row per
+    (source peer, recv slot) and does not read its offsets off the dispatch.
+    """
+    try:
+        from mori.ops.dispatch_combine_v2.hip_backend import push_land_rows
+    except ImportError:
+        return None
+    return push_land_rows(
+        SimpleNamespace(
+            max_num_inp_token_per_rank=config.max_tokens_per_rank,
+            world_size=config.world_size,
+            num_experts_per_token=config.topk,
+        )
+    )
+
+
 def _mori_combine_schedule(config, quant_bits: int = 0) -> tuple:
     """The combine half of mori's tuned buckets for the ``quant_bits`` wire, as
     (bound, block, warp)."""
@@ -785,6 +804,9 @@ class MegaMoEGfx1250:
         Omitting it means bf16 -- naming a format at construction only builds
         it, each step still has to ask for it. With ``stage2_fused=False`` the
         mori combine offers bf16 and mxfp4.
+
+        ``recv_counter_is_zero`` is accepted and ignored: the dispatch
+        overwrites the received count, so there is no reset to skip.
         """
         combine_quant_bits = self._resolve_combine_quant(combine_quant)
         if hidden_states.dtype != torch.bfloat16 or not hidden_states.is_contiguous():
@@ -1217,7 +1239,8 @@ class MegaMoEGfx1250:
         self._compact_max_routes = max_routes
         arena_regions = [
             ("tok_off", 4),
-            ("recv_num", config.world_size * 4),
+            # mori's gfx1250 dispatch signals 8 bytes a source (ROCm/mori#745).
+            ("recv_num", 2 * config.world_size * 4),
             ("recv_to_src_token", max_recv * 4),
             ("out_idx", max_recv * config.topk * 4),
             ("out_wts", max_recv * config.topk * 4),
@@ -1247,12 +1270,14 @@ class MegaMoEGfx1250:
             )
         else:
             # mori's outTok: one bf16 staging row per recv slot, then, for the
-            # fp4 push combine, one landing row per (source peer, recv slot) and,
-            # from four ranks up, a u64 flag per landing row for the overlapped
-            # combine (EpFp4Ovl) -- the same three parts mori's own out_tok sizes.
+            # fp4 push combine, its landing rows and, from four ranks up, a u64
+            # flag per landing row for the overlapped combine (EpFp4Ovl) -- the
+            # same three parts mori's own out_tok sizes.
             comb_inp_nbytes = max_recv * config.hidden_dim * 2
             if config.combine_quant_bits:
-                landing_rows = config.world_size * max_recv
+                landing_rows = _mori_push_land_rows(config)
+                if landing_rows is None:
+                    landing_rows = config.world_size * max_recv
                 comb_inp_nbytes += landing_rows * _mori_fp4_push_wire_nbytes(config)
                 if config.world_size >= 4:
                     comb_inp_nbytes += landing_rows * 8
@@ -1326,8 +1351,10 @@ class MegaMoEGfx1250:
             # inside graph capture is not allowed.
             for slot in range(self._COMPACT_PLAN_SLOTS):
                 self._compact_plan_for(self._compact_tile_m, slot)
+        # Send counts, then per destination mori's reservation base and push
+        # landing offset (ROCm/mori#745).
         self._destination_peer_counter = torch.zeros(
-            config.world_size, dtype=torch.int32, device=device
+            2 * config.world_size, dtype=torch.int32, device=device
         )
         self._dispatch_barrier = torch.zeros(1, dtype=torch.int32, device=device)
         # Quantized dispatch reuses fixed buffers across layers and graph
@@ -1610,11 +1637,12 @@ class MegaMoEGfx1250:
         # Driving EpDispatchPlan directly bypasses mori's op layer
         # (EpDispatchCombineOpHip), so take its decisions from mori rather than
         # keep a copy that drifts: whether the slot allocator word moves out of
-        # the cco window into tokoff-ext memory, and selfFirst, which follows
-        # from where the word lives. Since ROCm/mori#726 the plan takes where the
-        # word lives (tok_off_ext) and derives selfFirst itself. A mori from before
-        # selfFirst has neither helper and rejects the kwarg; its op layer kept
-        # tokoff-ext on unless MORI_EP_TOKOFF_EXT=0/false/no/off.
+        # the cco window into tokoff-ext memory, and how the dispatch reserves
+        # slots, which follows from where the word lives. Since ROCm/mori#726 the
+        # plan takes where the word lives (tok_off_ext) and derives the rest
+        # itself (selfFirst, since #745 the aggregated reservation). A mori from
+        # before selfFirst has neither helper and rejects the kwarg; its op layer
+        # kept tokoff-ext on unless MORI_EP_TOKOFF_EXT=0/false/no/off.
         from mori.ops.dispatch_combine_v2 import ep_plans
         from mori.ops.dispatch_combine_v2.hip_backend import TokOffExt
 
@@ -1630,6 +1658,20 @@ class MegaMoEGfx1250:
             env = os.environ.get("MORI_EP_TOKOFF_EXT", "1").strip().lower()
             tokoff_ext = env not in ("0", "false", "no", "off")
             slot_word_kw = {}
+        # The push combine finds its landing offsets in the aggregated
+        # reservation's signal, which tok_off_ext turns off; mori's op layer
+        # refuses the pair the same way.
+        if (
+            tokoff_ext
+            and not config.stage2_fused
+            and config.combine_quant_bits
+            and _mori_push_land_rows(config) is not None
+        ):
+            raise ValueError(
+                f"combine_quant={config.combine_quant!r} with stage2_fused=False "
+                "needs mori's aggregated dispatch reservation, which "
+                "MORI_EP_TOKOFF_EXT=1 turns off"
+            )
         plans = {}
         for spec in self._dispatch_specs:
             plan = EpDispatchPlan(
@@ -1675,12 +1717,8 @@ class MegaMoEGfx1250:
                 my_lsa_rank,
                 inp_cur_tok,
                 stream,
-                reset_recv=True,
             ):
-                # mori's dispatch only accumulates into total_recv (this package's
-                # zeroes it in Phase 2), so without this it grows every forward.
-                if reset_recv:
-                    self._total_recv.zero_()
+                # No total_recv.zero_(): mori's gfx1250 dispatch overwrites it.
                 plan.launch(
                     stream=torch.cuda.current_stream().cuda_stream,
                     token_indices=addr_inp_idx,
@@ -1771,6 +1809,8 @@ class MegaMoEGfx1250:
             "out_token_buf": self._combine_output.data_ptr(),
             "out_weights_buf": None,
             "disp_dest_tok_id_map": self._token_destination_map.data_ptr(),
+            # The push combine's landing offsets, which the dispatch wrote.
+            "dest_pe_token_counter": self._destination_peer_counter.data_ptr(),
             "total_recv_token_num": self._total_recv.data_ptr(),
             "grid_barrier": self._combine_grid_barrier.data_ptr(),
             "xdb_flag": self._cross_device_flag.data_ptr(),
@@ -1925,10 +1965,6 @@ class MegaMoEGfx1250:
             self._compact_psum = self._psums[self._compact_slot]
         else:
             tok_map = self._token_destination_map
-        reset_args = {}
-        if recv_counter_is_zero:
-            assert self._config.dispatch_backend == "mori"
-            reset_args["reset_recv"] = False
         self._dispatch_variants[spec](
             self._arena.handle,
             payload.data_ptr(),
@@ -1941,7 +1977,6 @@ class MegaMoEGfx1250:
             self._config.rank,
             token_count,
             stream,
-            **reset_args,
         )
         reverse_source_view = _from_gpu_ptr(
             self._arena.local_ptr("recv_to_src_token"),
