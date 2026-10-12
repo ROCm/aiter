@@ -400,7 +400,9 @@ def flydsl_flash_attn_varlen_func(
 
     # gfx1250 — varlen THD, bf16/fp16
     if out is None:
-        out = torch.empty_like(q[:, :, : v.shape[-1]])
+        # Slicing q cannot widen it: at qk_hdim < v_hdim, q[..., :v_hdim] clamps back
+        # to qk_hdim and the kernel would write v_hdim values into a narrower buffer.
+        out = q.new_empty((*q.shape[:-1], _v_hdim))
 
     # Clean-DSL 8-wave prefill kernel (m32x8), D_qk/D_v per the routing above.
     return flash_attn_varlen_m32x8(

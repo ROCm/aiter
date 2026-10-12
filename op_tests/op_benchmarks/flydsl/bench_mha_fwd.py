@@ -110,10 +110,28 @@ def _verify_dispatch(layout):
 # ============================================================================
 
 
-def _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal):
-    """Forward FLOPs: QK^T + PV over B uniform-length sequences; causal halves it."""
-    f = B * Hq * (2 * sq * sk * d_qk + 2 * sq * sk * d_v)
-    return f // 2 if causal else f
+def _attended_pairs(sq, sk, causal, window):
+    """(query, key) pairs inside the bottom-right aligned band, matching
+    ``_local_mask``/``_effective_window`` in test_mha_flydsl.py: query ``s`` attends
+    ``s + (sk - sq) - left <= j <= s + (sk - sq) + right``, where ``-1`` is infinite
+    on that side and ``causal`` pins ``right`` to 0."""
+    left, right = window
+    if causal:
+        right = 0
+    offset = sk - sq
+    total = 0
+    for s in range(sq):
+        lo = 0 if left < 0 else max(0, s + offset - left)
+        hi = sk - 1 if right < 0 else min(sk - 1, s + offset + right)
+        if hi >= lo:
+            total += hi - lo + 1
+    return total
+
+
+def _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal, window=(-1, -1)):
+    """Forward FLOPs: QK^T + PV, counting only the pairs the mask geometry attends.
+    Halving sq*sk is wrong whenever sq != sk or a finite window is set."""
+    return B * Hq * 2 * _attended_pairs(sq, sk, causal, window) * (d_qk + d_v)
 
 
 def _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse):
@@ -242,7 +260,7 @@ def run_perf(case, warmup, repeat, fix_init=None):
         avg_ms = _time_fn(_run, warmup, repeat)
         _run()  # one more inside the spy to confirm dispatch
 
-    flop = _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal)
+    flop = _fwd_flops(B, sq, sk, Hq, d_qk, d_v, causal, window)
     nbytes = _fwd_bytes(B, sq, sk, Hq, Hkv, d_qk, d_v, lse)
     avg_us = avg_ms * 1000
     tflops = _tflops(flop, avg_ms)
@@ -653,10 +671,12 @@ def main():
     print("=" * 70)
 
     rows = []
+    failed = []
     for case in selected:
         try:
             rows.append(run_perf(case, args.warmup, args.repeat, args.fix_init))
         except Exception as e:  # noqa: BLE001 - per-case guard, continue suite
+            failed.append(case.get("id", "?"))
             print(f"  [id={case.get('id', '?')} {case['layout']}] ERROR: {e}")
             import traceback
 
@@ -666,6 +686,12 @@ def main():
         df = pd.DataFrame(rows)
         aiter.logger.info("flydsl_mha_perf summary:\n%s", df.to_string(index=False))
 
+    if failed:
+        # Includes the dispatch assertion, so a silent fall-through to CK fails the run.
+        print(f"FAILED {len(failed)}/{len(selected)} case(s): {failed}")
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
