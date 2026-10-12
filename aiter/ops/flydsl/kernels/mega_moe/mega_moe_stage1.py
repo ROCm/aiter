@@ -606,9 +606,7 @@ def compile_mega_moe_stage1(
                     if const_expr(fixed_slot_dispatch):
                         fx.barrier()
                     elif not use_ready_order:
-                        # The ready-order path waits for the tile payload in
-                        # the scheduler block below, before its barrier and
-                        # system acquire, so it needs no second round here.
+                        # Ready-order waits for the tile in the scheduler block.
                         if tid == fx.Int32(0):
                             _wait_tile_payload(work)
                         fx.barrier()
@@ -677,11 +675,6 @@ def compile_mega_moe_stage1(
                         scheduled_first = (
                             ready_m_tile * fx.Int32(N_TILES) + first_n_tile
                         )
-                        # A queued tile's per-tile metadata (tile_input_base,
-                        # ...) is published by the planner, not by the queue
-                        # producer: wait for the tile payload before the
-                        # barrier and the system acquire that follow, so no
-                        # consumer reads stale metadata under skew.
                         _wait_tile_payload(scheduled_first)
                         fx.ptr_store(
                             Vec.from_elements([scheduled_first], fx.Int32),
