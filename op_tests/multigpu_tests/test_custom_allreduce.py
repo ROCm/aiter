@@ -2,8 +2,12 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
 import argparse
+import ctypes
 import logging
+import mmap
 import os
+import threading
+import time
 from multiprocessing import Pool, freeze_support, set_start_method
 
 import pandas as pd
@@ -282,6 +286,103 @@ def test_allreduce_tail_regression(tp_size, dtype, iterations=20, shapes=None):
     )
 
 
+# Back-to-back LL128 messages of different sizes per TP size (see the LL / LL128
+# dispatch in custom_all_reduce.cuh). Three calls per round alternate the bank
+# each size lands in, which the overlap needs. TP8 has no LL128 range.
+_LL128_MIXED_SIZES = {
+    2: [16 * 7168, 16 * 7168, 8 * 7168],
+    4: [4 * 8192, 4 * 8192, 28800],
+}
+
+
+def _start_queue_evictions(stop):
+    """Repeatedly evict this process's GPU queues so its kernels pause mid-flight.
+
+    Toggling the protection of registered host memory makes KFD preempt every
+    queue of the process, which lets the peers run ahead as on a busy host.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    hip = ctypes.CDLL("libamdhip64.so")
+    buf = mmap.mmap(-1, 256 << 20)
+    buf.write(b"\1" * len(buf))
+    view = ctypes.c_char.from_buffer(buf)
+    nbytes = ctypes.c_size_t(len(buf))
+    assert hip.hipHostRegister(ctypes.c_void_p(ctypes.addressof(view)), nbytes, 0) == 0
+
+    def evict():
+        # Referencing view keeps the mapping alive for the thread's lifetime.
+        addr = ctypes.c_void_p(ctypes.addressof(view))
+        while not stop.is_set():
+            assert libc.mprotect(addr, ctypes.c_size_t(2 << 20), 1) == 0
+            assert libc.mprotect(addr, ctypes.c_size_t(2 << 20), 3) == 0
+            time.sleep(0.002)
+
+    threading.Thread(target=evict, daemon=True).start()
+
+
+def _allreduce_ll128_mixed_size_regression(
+    rank, tp_size, sizes, iterations, distributed_init_method
+):
+    from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
+
+    torch.cuda.set_device(rank)
+    device = torch.device(f"cuda:{rank}")
+    dist.init_process_group(
+        "gloo", world_size=tp_size, rank=rank, init_method=distributed_init_method
+    )
+    ca_comm = CustomAllreduce(dist.group.WORLD, device)
+    assert not ca_comm.disabled, "The LL128 regression requires custom allreduce"
+    generator = torch.Generator().manual_seed(2026)
+    inputs, refs = [], []
+    for n in sizes:
+        x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
+        inputs.append(x[rank].to(device, torch.bfloat16))
+        refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
+    stop = threading.Event()
+    # Rank 1 reads the peer slots that a faster rank's next call overlaps.
+    if rank == 1:
+        _start_queue_evictions(stop)
+    dist.barrier()
+    done = torch.cuda.Event()
+    for iteration in range(iterations):
+        outs = [ca_comm.custom_all_reduce(x, use_new=True) for x in inputs]
+        if iteration % 100 != 99:
+            continue
+        done.record()
+        deadline = time.time() + 30
+        while not done.query():
+            if time.time() > deadline:
+                logger.error(f"{rank=} LL128 hang before {iteration=} {sizes=}")
+                os._exit(1)
+            time.sleep(0.001)
+        for out, ref in zip(outs, refs):
+            torch.testing.assert_close(out, ref, rtol=0, atol=0)
+    stop.set()
+    torch.cuda.synchronize()
+    dist.barrier()
+    ca_comm.close()
+    dist.destroy_process_group()
+
+
+def test_allreduce_ll128_mixed_size_regression(tp_size, iterations=1000):
+    # A rank that finished one call used to overwrite a slower peer's unread
+    # LL128 slots when the next call had a different size, hanging both ranks.
+    sizes = _LL128_MIXED_SIZES.get(tp_size)
+    if sizes is None:
+        return
+    torch.multiprocessing.spawn(
+        _allreduce_ll128_mixed_size_regression,
+        args=(
+            tp_size,
+            sizes,
+            iterations,
+            get_distributed_init_method(get_ip(), get_open_port()),
+        ),
+        nprocs=tp_size,
+        join=True,
+    )
+
+
 # Custom-AR size cutoff (bytes). Mirrors _DEFAULT_CAR_MAX_SIZE in
 # aiter/dist/device_communicators/custom_all_reduce.py and honors the same
 # AITER_CUSTOM_AR_MAX_SIZE override. Inputs at or below this run on the custom
@@ -386,6 +487,8 @@ if __name__ == "__main__":
             args.iterations,
             shapes=[args.shape] if args.shape is not None else None,
         )
+        if dtype == torch.bfloat16:
+            test_allreduce_ll128_mixed_size_regression(args.tp_size)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"
