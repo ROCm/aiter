@@ -1,0 +1,20 @@
+{
+  "pipelined_unshuffled": {
+    "fp8_fp8": {
+      "H_LEQ_32": {},
+      "H_LEQ_64.B_LEQ_16.KV_GEQ_131072": {
+        "NUM_SEGMENTS_PER_SEQ": 32
+      },
+      "H_LEQ_64.B_LEQ_32.KV_LEQ_32768": {
+        "NUM_SEGMENTS_PER_SEQ": 8
+      },
+      "H_LEQ_64.B_LEQ_32.KV_LEQ_131072": {
+        "NUM_SEGMENTS_PER_SEQ": 8
+      },
+      "H_LEQ_64.B_LEQ_128.KV_LEQ_32768": {
+        "NUM_SEGMENTS_PER_SEQ": 2
+      },
+      "any": {}
+    }
+  }
+}
