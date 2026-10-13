@@ -163,12 +163,11 @@ def _validate(
             f"[FlyDSL mxfp8 8wave] N={N} must be a multiple of {MXFP8_BLOCK} "
             "(the weight's ue8m0 block along N)"
         )
-    if M is not None and N is not None:
-        if max(M * K, N * K, M * N) >= _I32_MAX:
-            raise ValueError(
-                f"[FlyDSL mxfp8 8wave] M={M} N={N} K={K} overflows 32-bit "
-                "buffer indexing"
-            )
+    if M is not None and N is not None and max(M * K, N * K, M * N) >= _I32_MAX:
+        raise ValueError(
+            f"[FlyDSL mxfp8 8wave] M={M} N={N} K={K} overflows 32-bit "
+            "buffer indexing"
+        )
 
 
 @functools.lru_cache(maxsize=1024)

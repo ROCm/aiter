@@ -297,9 +297,7 @@ def gemm_a8w8_mxfp8_8wave_flydsl(
     it explicitly.
     """
     if get_gfx() != "gfx950":
-        raise RuntimeError(
-            "gemm_a8w8_mxfp8_8wave_flydsl is only supported on gfx950"
-        )
+        raise RuntimeError("gemm_a8w8_mxfp8_8wave_flydsl is only supported on gfx950")
     from .flydsl.gemm_a8w8_mxfp8_8wave import flydsl_8wave_gemm_mxfp8
 
     return flydsl_8wave_gemm_mxfp8(XQ, WQ, x_scale, w_scale, Out, block_n)

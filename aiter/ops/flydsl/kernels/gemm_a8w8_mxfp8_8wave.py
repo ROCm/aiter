@@ -484,18 +484,14 @@ def compile_mxfp8_gemm_8w(
         # idx(tj, ti). With the swap the instruction's B is our A, so the
         # per-tile opsel that selects a packed A byte is opsel_b on the raw
         # atom.
-        mfma = _SwappedMfma(
-            Mfma16x16x128(N_TILES_B, N_TILES_A, opsel_b_per_tile=True)
-        )
+        mfma = _SwappedMfma(Mfma16x16x128(N_TILES_B, N_TILES_A, opsel_b_per_tile=True))
 
         a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
         b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
         if const_expr(lane_transpose):
-            store_c = _LaneTransposeStoreC(
-                C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
-            )
+            store_c = _LaneTransposeStoreC(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
         elif const_expr(permlane):
             store_c = _PermlaneStoreC(C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
         else:
@@ -547,34 +543,26 @@ def compile_mxfp8_gemm_8w(
             a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
             rocdl.s_barrier()
 
-            c00_frag = mfma.call(
-                a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0
-            )
+            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, scale_a=msa0, scale_b=msb0)
 
             b1_frag = b_s2r.load(b_cur1, preshuffled=True)
             b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
             rocdl.s_barrier()
 
-            c01_frag = mfma.call(
-                a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1
-            )
+            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, scale_a=msa0, scale_b=msb1)
 
             a1_frag = a_s2r.load(a_cur1)
             a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
             rocdl.s_barrier()
 
-            c10_frag = mfma.call(
-                a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0
-            )
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, scale_a=msa1, scale_b=msb0)
 
             b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
             # Letting 2 * A + B loads stay outstanding here crosses the barrier
             # with LDS writes still in flight that the next iteration reads.
             wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B - 1)
 
-            c11_frag = mfma.call(
-                a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1
-            )
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, scale_a=msa1, scale_b=msb1)
 
             # Swap cur and next
             a_cur0, a_next0 = a_next0, a_cur0

@@ -59,9 +59,9 @@ def _operands(m, n, k, seed=0):
     a_sc = torch.pow(2.0, (ae.int() - 127).float())
     b_sc = torch.pow(2.0, (be.int() - 127).float())
     aq = (a / a_sc.repeat_interleave(BLOCK, dim=1)).to(torch.float8_e4m3fn)
-    bq = (
-        b / b_sc.repeat_interleave(BLOCK, dim=1).repeat_interleave(BLOCK, dim=0)
-    ).to(torch.float8_e4m3fn)
+    bq = (b / b_sc.repeat_interleave(BLOCK, dim=1).repeat_interleave(BLOCK, dim=0)).to(
+        torch.float8_e4m3fn
+    )
     return aq, bq, ae, be, a_sc, b_sc
 
 
