@@ -4,6 +4,8 @@
 import importlib.util
 import os
 import pathlib
+import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,7 +31,7 @@ def _load_cpp_extension():
     return module
 
 
-class RocmHeaderDiscoveryTest(unittest.TestCase):
+class RocmHeaderTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.cpp_extension = _load_cpp_extension()
@@ -37,225 +39,213 @@ class RocmHeaderDiscoveryTest(unittest.TestCase):
     def setUp(self):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        # The compiler probe is cached per hipcc path, so start every test cold
-        # and let each case observe its own mocked `hipcc --version` output.
-        self.cpp_extension._probe_hipcc_version.cache_clear()
-        # Same for the warn-once cache: each case must observe its own warning.
-        self.cpp_extension._warn_once.cache_clear()
-        tempdir = self.stack.enter_context(tempfile.TemporaryDirectory())
-        self.root = pathlib.Path(tempdir)
+        self.root = pathlib.Path(
+            self.stack.enter_context(tempfile.TemporaryDirectory())
+        )
         self.runtime = self.root / "python-sdk" / "include"
         self.runtime.mkdir(parents=True)
-        self.system = self.root / "system" / "include"
-        (self.system / "hip").mkdir(parents=True)
-        (self.system / "rocprim").mkdir()
-        self.version_header = self.system / "hip" / "hip_version.h"
-        self.version_header.write_text(
-            "#define HIP_VERSION_MAJOR 7\n#define HIP_VERSION_MINOR 15\n"
-        )
-        (self.system / "rocprim" / "rocprim.hpp").touch()
+        self.hipcc = str(self.root / "selected-compiler" / "bin" / "hipcc")
         self.stack.enter_context(
             patch.multiple(
                 self.cpp_extension,
                 ROCM_HOME=str(self.runtime.parent),
                 IS_HIP_EXTENSION=True,
-                ROCM_VERSION=(7, 15),
-                _SYSTEM_ROCM_INCLUDE=str(self.system),
             )
+        )
+        self.compiler = self.stack.enter_context(
+            patch.object(self.cpp_extension, "executable_path", return_value=self.hipcc)
         )
         self.devel = self.stack.enter_context(
             patch.object(
                 self.cpp_extension, "_find_rocm_devel_include", return_value=None
             )
         )
-        self.compiler = self.stack.enter_context(
-            patch.object(
-                self.cpp_extension.subprocess,
-                "check_output",
-                return_value="HIP version: 7.15.60401\nAMD clang version 22.0.0\n",
-            )
-        )
-        self.torch_include = self.root / "torch" / "include"
+        self.stack.enter_context(patch.dict(os.environ))
+        for name in ("CPATH", "CPLUS_INCLUDE_PATH", "AITER_JIT_VERBOSE"):
+            os.environ.pop(name, None)
         self.stack.enter_context(
-            patch.dict(
-                sys.modules,
-                {
-                    "torch": types.SimpleNamespace(
-                        __file__=str(self.root / "torch" / "__init__.py")
-                    )
-                },
-            )
+            patch.object(self.cpp_extension, "_get_num_workers", return_value=1)
         )
 
-    def test_matching_system_headers_are_appended(self):
-        with patch.object(self.cpp_extension.logger, "warning") as warning:
-            paths = self.cpp_extension.include_paths(cuda=True)
-        self.assertEqual(paths[-2:], [str(self.runtime), str(self.system)])
-        self.assertEqual(paths.count(str(self.system)), 1)
-        warning.assert_not_called()
-        self.compiler.assert_called_once_with(
-            [str(self.runtime.parent / "bin" / "hipcc"), "--version"],
-            text=True,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-        )
-
-    def test_version_mismatch_warns_once_with_versions_and_install_hint(self):
-        self.compiler.return_value = "HIP version: 7.14.60000\n"
-        with patch.object(self.cpp_extension.logger, "warning") as warning:
-            for _ in range(3):
-                self.assertNotIn(
-                    str(self.system), self.cpp_extension.include_paths(cuda=True)
-                )
-
-        # include_paths() runs several times per build and once per JIT module,
-        # so the mismatch must be reported once, not once per call.
-        warning.assert_called_once()
-        message = warning.call_args.args[0]
-        self.assertIn(str(self.system), message)
-        self.assertIn("7.15", message)
-        self.assertIn("7.14", message)
-        self.assertIn(str(self.runtime.parent / "bin" / "hipcc"), message)
-        # Both install paths must be offered: system dev packages via apt, and
-        # AMD's devel wheel via pip, which needs its own index because the PyPI
-        # project of that name is an unrelated placeholder.
-        self.assertIn("apt install rocprim-dev hipcub-dev rocthrust-dev", message)
+    def assert_header_diagnostic(self, message):
+        self.assertIn("rocprim/rocprim.hpp", message)
+        self.assertIn(f"Selected ROCM_HOME: {self.runtime.parent}", message)
+        self.assertIn(f"Selected hipcc: {self.hipcc}", message)
+        self.assertIn("https://rocm.docs.amd.com/en/latest/install/rocm.html", message)
         self.assertIn(
-            "pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ "
-            "rocm-sdk-devel==7.14.*",
-            message,
+            "ROCm/TheRock/blob/main/docs/packaging/python_packaging.md", message
         )
+        self.assertIn("Install and initialize", message)
 
-    def test_unverifiable_versions_warn_once(self):
-        with patch.object(self.cpp_extension.logger, "warning") as warning:
-            self.version_header.write_bytes(b"")
-            for _ in range(2):
-                self.assertIsNone(
-                    self.cpp_extension._find_matching_system_rocm_include()
-                )
-            warning.assert_called_once()
-            self.assertIn(str(self.system), warning.call_args.args[0])
 
-            # A failed compiler probe is likewise reported once, and a distinct
-            # reason gets its own warning instead of being suppressed.
-            self.cpp_extension._warn_once.cache_clear()
-            warning.reset_mock()
-            self.version_header.write_text(
-                "#define HIP_VERSION_MAJOR 7\n#define HIP_VERSION_MINOR 15\n"
-            )
-            self.compiler.side_effect = FileNotFoundError()
-            for _ in range(2):
-                self.assertIsNone(
-                    self.cpp_extension._find_matching_system_rocm_include()
-                )
-            warning.assert_called_once()
-            self.assertIn("hipcc", warning.call_args.args[0])
-
-    def test_compiler_mismatch_overrides_matching_global_version(self):
-        for version in ("7.14.0", "6.15.0"):
-            with self.subTest(version=version):
-                self.cpp_extension._probe_hipcc_version.cache_clear()
-                self.compiler.return_value = f"HIP version: {version}\n"
-                self.assertNotIn(
-                    str(self.system), self.cpp_extension.include_paths(cuda=True)
-                )
-
-    def test_matching_compiler_overrides_unrelated_global_version(self):
-        self.cpp_extension.ROCM_VERSION = (6, 0)
-        self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
-
-    def test_repeated_discovery_reuses_cached_compiler_probe(self):
-        for _ in range(3):
-            self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
-        self.compiler.assert_called_once_with(
-            [str(self.runtime.parent / "bin" / "hipcc"), "--version"],
-            text=True,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-        )
-
-    def test_compiler_probe_is_cached_per_hipcc_path(self):
-        self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
-        other_sdk = self.root / "other-sdk"
-        (other_sdk / "bin").mkdir(parents=True)
-        self.cpp_extension.ROCM_HOME = str(other_sdk)
-
-        self.assertIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
-
-        # A different ROCM_HOME selects a different hipcc, so it must probe that
-        # compiler instead of reusing the first compiler's cached version.
-        self.assertEqual(
-            [invocation.args[0] for invocation in self.compiler.call_args_list],
-            [
-                [str(self.runtime.parent / "bin" / "hipcc"), "--version"],
-                [str(other_sdk / "bin" / "hipcc"), "--version"],
-            ],
-        )
-
-    def test_unknown_or_failed_compiler_is_rejected(self):
-        for output in ("", "AMD clang version 7.15.0", "HIP version: unknown"):
+class RocmHeaderDiagnosticsTest(RocmHeaderTestCase):
+    def test_compiler_missing_header_diagnostics(self):
+        for output in (
+            "test.hip:1:10: fatal error: 'rocprim/rocprim.hpp' file not found",
+            "test.hip:1:10: fatal error: rocprim/rocprim.hpp: No such file or directory",
+            'test.hip:1:10: error: "rocprim/rocprim.hpp" file not found',
+            "test.hip:1:10: fatal error: 'rocprim\\rocprim.hpp' file not found",
+        ):
             with self.subTest(output=output):
-                self.cpp_extension._probe_hipcc_version.cache_clear()
-                self.compiler.return_value = output
-                self.assertIsNone(
-                    self.cpp_extension._find_matching_system_rocm_include()
+                self.assert_header_diagnostic(
+                    self.cpp_extension._rocm_header_build_hint(output)
                 )
-        for error in (
-            FileNotFoundError(),
-            subprocess.CalledProcessError(1, "hipcc"),
-            subprocess.TimeoutExpired("hipcc", 10),
+
+    def test_unrelated_errors_do_not_get_installation_advice(self):
+        for output in (
+            "fatal error: 'other.hpp' file not found\n#include <rocprim/rocprim.hpp>",
+            "rocprim/rocprim.hpp:10: error: unknown type name 'T'",
+            "fatal error: 'rocprim/rocprim.hpp.detail' file not found",
+            "undefined reference to rocprim::foo()",
+            "",
         ):
-            with self.subTest(error=error):
-                self.cpp_extension._probe_hipcc_version.cache_clear()
-                self.compiler.side_effect = error
-                self.assertIsNone(
-                    self.cpp_extension._find_matching_system_rocm_include()
-                )
-
-    def test_missing_rocprim_skips_compiler_probe(self):
-        (self.system / "rocprim" / "rocprim.hpp").unlink()
-        with patch.object(self.cpp_extension.logger, "warning") as warning:
-            self.assertNotIn(
-                str(self.system), self.cpp_extension.include_paths(cuda=True)
-            )
-        # Nothing to compare against, so no warning either.
-        warning.assert_not_called()
+            with self.subTest(output=output):
+                self.assertEqual(self.cpp_extension._rocm_header_build_hint(output), "")
         self.compiler.assert_not_called()
 
-    def test_unreadable_or_incomplete_header_skips_compiler_probe(self):
-        for content in (b"", b"#define HIP_VERSION_MAJOR 7\n", b"\xff"):
-            with self.subTest(content=content):
-                self.version_header.write_bytes(content)
-                self.assertIsNone(
-                    self.cpp_extension._find_matching_system_rocm_include()
-                )
-        self.version_header.unlink()
-        self.assertIsNone(self.cpp_extension._find_matching_system_rocm_include())
-        self.compiler.assert_not_called()
-
-    def test_existing_rocprim_skips_system_fallback(self):
-        for include in (
-            self.runtime,
-            self.root / "devel" / "include",
-            self.torch_include,
-        ):
-            with self.subTest(include=include):
-                (include / "rocprim").mkdir(parents=True)
-                header = include / "rocprim" / "rocprim.hpp"
-                header.touch()
-                self.devel.return_value = str(include)
-                self.assertNotIn(
-                    str(self.system), self.cpp_extension.include_paths(cuda=True)
-                )
-                header.unlink()
-        self.compiler.assert_not_called()
-
-    def test_cpu_and_non_hip_builds_skip_discovery(self):
-        self.assertNotIn(str(self.system), self.cpp_extension.include_paths(cuda=False))
+    def test_non_hip_error_does_not_get_rocm_advice(self):
         self.cpp_extension.IS_HIP_EXTENSION = False
-        self.assertNotIn(str(self.system), self.cpp_extension.include_paths(cuda=True))
-        self.devel.assert_not_called()
+        self.assertEqual(
+            self.cpp_extension._rocm_header_build_hint(
+                "fatal error: 'rocprim/rocprim.hpp' file not found"
+            ),
+            "",
+        )
         self.compiler.assert_not_called()
+
+    def test_hipcc_falls_back_to_selected_rocm_home(self):
+        self.compiler.side_effect = AssertionError("hipcc is not on PATH")
+        self.hipcc = str(self.runtime.parent / "bin" / "hipcc")
+        self.assert_header_diagnostic(
+            self.cpp_extension._rocm_header_build_hint(
+                "fatal error: 'rocprim/rocprim.hpp' file not found"
+            )
+        )
+
+    def test_include_discovery_does_not_probe_or_append_system_headers(self):
+        torch = types.SimpleNamespace(__file__=str(self.root / "torch" / "__init__.py"))
+        devel = str(self.root / "sdk-devel" / "include")
+        with patch.dict(sys.modules, {"torch": torch}), patch.object(
+            self.cpp_extension.os.path, "isfile", return_value=True
+        ) as header_lookup, patch.object(
+            self.cpp_extension.subprocess, "check_output"
+        ) as probe:
+            for sdk_devel in (None, devel):
+                with self.subTest(sdk_devel=sdk_devel):
+                    self.devel.return_value = sdk_devel
+                    paths = self.cpp_extension.include_paths(cuda=True)
+                    self.assertIn(str(self.runtime), paths)
+                    self.assertNotIn("/opt/rocm/include", paths)
+                    if sdk_devel:
+                        self.assertIn(devel, paths)
+            header_lookup.assert_not_called()
+            probe.assert_not_called()
+        self.compiler.assert_not_called()
+
+
+@unittest.skipUnless(
+    sys.platform != "win32" and shutil.which("ninja") and shutil.which("c++"),
+    "requires Ninja and a POSIX C++ compiler (no ROCm/GPU needed)",
+)
+class RocmHeaderBuildTest(RocmHeaderTestCase):
+    def setUp(self):
+        super().setUp()
+        # Exercise real compiler include resolution with a tiny stand-in header.
+        # The host compiler is used only as a CPU test double for hipcc.
+        compiler = pathlib.Path(self.hipcc)
+        compiler.parent.mkdir(parents=True)
+        compiler.symlink_to(shutil.which("c++"))
+        self.source = self.root / "test.cpp"
+        self.source.write_text(
+            "#include <rocprim/rocprim.hpp>\nint value = ROCPRIM_TEST;\n"
+        )
+        self.obj = self.root / "test.o"
+        self.headers = self.root / "explicit includes"
+        (self.headers / "rocprim").mkdir(parents=True)
+        (self.headers / "rocprim" / "rocprim.hpp").write_text(
+            "#define ROCPRIM_TEST 1\n"
+        )
+        self.stack.enter_context(
+            patch.object(
+                self.cpp_extension, "get_cxx_compiler", return_value=self.hipcc
+            )
+        )
+        self.output = self.stack.enter_context(
+            patch.object(self.cpp_extension.os, "write")
+        )
+
+    def build(self, *, verbose=False, flags=()):
+        if self.obj.exists():
+            self.obj.unlink()
+        self.cpp_extension._write_ninja_file(
+            path=str(self.root / "build.ninja"),
+            cflags=[],
+            post_cflags=[],
+            cuda_cflags=list(flags),
+            cuda_post_cflags=[],
+            cuda_dlink_post_cflags=[],
+            sources=[str(self.source)],
+            objects=[str(self.obj)],
+            ldflags=[],
+            library_target=None,
+            with_cuda=True,
+        )
+        self.cpp_extension._run_ninja_build(
+            str(self.root), verbose=verbose, error_prefix="Error building header test"
+        )
+
+    def test_failed_build_reports_toolchain_in_quiet_and_verbose_modes(self):
+        for mode in ("quiet", "verbose", "env_verbose"):
+            with self.subTest(mode=mode):
+                self.output.reset_mock()
+                os.environ["AITER_JIT_VERBOSE"] = "1" if mode == "env_verbose" else "0"
+                with self.assertRaises(RuntimeError) as error:
+                    self.build(verbose=mode == "verbose")
+                message = str(error.exception)
+                self.assertTrue(message.startswith("Error building header test"))
+                self.assert_header_diagnostic(message)
+                self.assertIn("fatal error:", message)
+                self.assertIsInstance(
+                    error.exception.__cause__, subprocess.CalledProcessError
+                )
+                if mode == "quiet":
+                    self.output.assert_not_called()
+                else:
+                    streamed = b"".join(
+                        call.args[1] for call in self.output.call_args_list
+                    )
+                    self.assertIn(b"fatal error:", streamed)
+
+    def test_explicit_include_configuration_succeeds_without_rocm_home_header(self):
+        for mode in ("CPATH", "CPLUS_INCLUDE_PATH", "-I", "-isystem"):
+            for verbose in (False, True):
+                with self.subTest(mode=mode, verbose=verbose), patch.dict(os.environ):
+                    flags = []
+                    if mode in ("CPATH", "CPLUS_INCLUDE_PATH"):
+                        os.environ[mode] = str(self.headers)
+                    else:
+                        flags = [mode, shlex.quote(str(self.headers))]
+                    self.assertFalse(
+                        (self.runtime / "rocprim" / "rocprim.hpp").exists()
+                    )
+                    with patch.object(
+                        self.cpp_extension, "_rocm_header_build_hint"
+                    ) as hint:
+                        self.build(verbose=verbose, flags=flags)
+                    self.assertTrue(self.obj.is_file())
+                    hint.assert_not_called()
+
+    def test_unrelated_build_failure_keeps_original_error(self):
+        self.source.write_text('#error "unrelated compiler failure"\n')
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose), self.assertRaises(
+                RuntimeError
+            ) as error:
+                self.build(verbose=verbose)
+            message = str(error.exception)
+            self.assertIn("unrelated compiler failure", message)
+            self.assertNotIn("Selected ROCM_HOME:", message)
+            self.assertNotIn("rocm.docs.amd.com", message)
 
 
 if __name__ == "__main__":

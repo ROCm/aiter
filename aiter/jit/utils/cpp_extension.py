@@ -6,11 +6,9 @@
 # We make slight changes to enable ninja response file
 # mypy: allow-untyped-defs
 import copy
-import functools
 import importlib
 import importlib.abc
 import importlib.util
-import logging
 import os
 import re
 import shlex
@@ -28,8 +26,6 @@ from hipify.hipify_python import GeneratedFileCleaner
 from packaging.version import Version
 from setuptools.command.build_ext import build_ext
 
-logger = logging.getLogger("aiter")
-
 IS_WINDOWS = sys.platform == "win32"
 IS_LINUX = sys.platform.startswith("linux")
 if IS_WINDOWS:
@@ -44,16 +40,6 @@ else:
     CLIB_PREFIX = "lib"
     CLIB_EXT = ".so"
     SHARED_FLAG = "-shared"
-
-# Fixed path on purpose, not derived from ROCM_HOME: when hipcc comes from the
-# Python ROCm SDK it searches only its own venv-local include tree, while the
-# rocPRIM dev headers are installed by the system packages under /opt/rocm.
-# Without this fallback, kernels that include "rocprim/rocprim.hpp" (directly,
-# or through hipcub) fail to compile with "'rocprim/rocprim.hpp' file not
-# found". Used only when the resolved include paths lack rocPRIM and the system
-# headers' HIP version matches the selected hipcc.
-_SYSTEM_ROCM_INCLUDE = "/opt/rocm/include"
-_ROCPRIM_HEADER = os.path.join("rocprim", "rocprim.hpp")
 
 SUBPROCESS_DECODE_ARGS = ()
 MINIMUM_GCC_VERSION = (5, 0, 0)
@@ -256,106 +242,6 @@ def _find_rocm_devel_include() -> str | None:
         if os.path.isdir(inc):
             return inc
     return None
-
-
-def _read_hip_header_version(include_dir: str) -> tuple[int, int] | None:
-    """Read the HIP major/minor version from a ROCm include tree."""
-    version_header = os.path.join(include_dir, "hip", "hip_version.h")
-    try:
-        with open(version_header) as header:
-            content = header.read()
-    except (OSError, UnicodeError):
-        return None
-
-    major = re.search(
-        r"^\s*#\s*define\s+HIP_VERSION_MAJOR\s+(\d+)", content, re.MULTILINE
-    )
-    minor = re.search(
-        r"^\s*#\s*define\s+HIP_VERSION_MINOR\s+(\d+)", content, re.MULTILINE
-    )
-    if major is None or minor is None:
-        return None
-    return int(major.group(1)), int(minor.group(1))
-
-
-# functools.cache is the unbounded form of functools.lru_cache.
-@functools.cache
-def _probe_hipcc_version(hipcc: str) -> tuple[int, int] | None:
-    """Return the HIP version reported by ``hipcc``, or None if unavailable.
-
-    Cached per compiler path: ``include_paths()`` runs several times per build
-    and spawning a compiler just to read its version is expensive, while the
-    path is what changes when the environment selects a different ROCm tree.
-    """
-    try:
-        output = subprocess.check_output(
-            [hipcc, "--version"],
-            text=True,
-            stderr=subprocess.STDOUT,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError, UnicodeError):
-        return None
-    version = re.search(r"HIP version:\s*(\d+)\.(\d+)\b", output)
-    if version is None:
-        return None
-    return int(version.group(1)), int(version.group(2))
-
-
-# functools.cache keeps the warning to one emission per distinct message:
-# callers such as include_paths() run several times per build and again for
-# every JIT module, so a plain logger.warning from those paths would repeat
-# on each call.
-@functools.cache
-def _warn_once(message: str) -> None:
-    """Emit ``message`` once per distinct text, however often it is asked for."""
-    logger.warning(message)
-
-
-def _find_matching_system_rocm_include() -> str | None:
-    """Use system rocPRIM headers only if their HIP version matches hipcc."""
-    if not os.path.isfile(os.path.join(_SYSTEM_ROCM_INCLUDE, _ROCPRIM_HEADER)):
-        # No rocPRIM in the system tree (e.g. runtime-only installs): there is
-        # nothing to compare and nothing to warn about.
-        return None
-
-    header_version = _read_hip_header_version(_SYSTEM_ROCM_INCLUDE)
-    if header_version is None:
-        _warn_once(
-            f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: cannot read "
-            f"their HIP version from {os.path.join(_SYSTEM_ROCM_INCLUDE, 'hip', 'hip_version.h')}. "
-            "The build continues without them."
-        )
-        return None
-
-    # ROCM_VERSION can come from an unrelated hipconfig on PATH or even the
-    # system headers themselves. Query the compiler used by the build instead.
-    hipcc = _join_rocm_home("bin", "hipcc")
-    compiler_version = _probe_hipcc_version(hipcc)
-    if compiler_version is None:
-        _warn_once(
-            f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: cannot "
-            f"determine the HIP version of {hipcc}. The build continues without "
-            "them."
-        )
-        return None
-    if header_version != compiler_version:
-        # The devel headers ship in AMD's `rocm-sdk-devel` wheel, which is only
-        # published on AMD's wheel index: the PyPI project of the same name is
-        # an unrelated placeholder, so the hint must pass --index-url.
-        _warn_once(
-            f"Ignoring the rocPRIM headers in {_SYSTEM_ROCM_INCLUDE}: they are "
-            f"ROCm {header_version[0]}.{header_version[1]} but the build's hipcc "
-            f"({hipcc}) is ROCm {compiler_version[0]}.{compiler_version[1]}. The "
-            "build continues without the system headers; if it fails with "
-            "missing rocPRIM or hipcub headers, install matching ROCm "
-            f"{compiler_version[0]}.{compiler_version[1]} development packages, "
-            'e.g. "apt install rocprim-dev hipcub-dev rocthrust-dev" or '
-            '"pip install --index-url https://repo.amd.com/rocm/whl-multi-arch/ '
-            f'rocm-sdk-devel=={compiler_version[0]}.{compiler_version[1]}.*".'
-        )
-        return None
-    return _SYSTEM_ROCM_INCLUDE
 
 
 def _join_rocm_home(*paths) -> str:
@@ -1199,16 +1085,6 @@ def include_paths(cuda: bool = False) -> list[str]:
         devel_include = _find_rocm_devel_include()
         if devel_include is not None and devel_include != rocm_include:
             paths.append(devel_include)
-        # In mixed installations, hipcc may come from the Python ROCm SDK while
-        # rocPRIM and the other development headers come from matching system
-        # packages. Add that tree only when the selected paths lack rocPRIM and
-        # the system headers match the active compiler version.
-        if not any(
-            os.path.isfile(os.path.join(path, _ROCPRIM_HEADER)) for path in paths
-        ):
-            system_include = _find_matching_system_rocm_include()
-            if system_include is not None:
-                paths.append(system_include)
     return paths
 
 
@@ -1802,6 +1678,35 @@ def _get_num_workers(verbose: bool) -> int | None:
     return int(max_jobs)
 
 
+def _get_hipcc_path() -> str:
+    # Keep diagnostics and Ninja's compiler selection in sync, including Windows.
+    try:
+        return executable_path("hipcc")
+    except AssertionError:
+        return _join_rocm_home("bin", "hipcc")
+
+
+def _rocm_header_build_hint(output: str) -> str:
+    # Diagnose a compiler failure, not a missing file under ROCM_HOME: the
+    # compiler may resolve headers through environment variables or build flags.
+    if not IS_HIP_EXTENSION or not re.search(
+        r"(?:fatal )?error:\s*['\"<]?rocprim[/\\]rocprim\.hpp['\">]?"
+        r"(?::|\s)\s*(?:file not found|No such file or directory)",
+        output,
+    ):
+        return ""
+    return (
+        "\nAITER: the selected ROCm compiler could not resolve 'rocprim/rocprim.hpp'.\n"
+        f"Selected ROCM_HOME: {ROCM_HOME}\n"
+        f"Selected hipcc: {_get_hipcc_path()}\n"
+        "Install and initialize the development components for the intended ROCm "
+        "toolchain, and ensure ROCM_HOME/ROCM_PATH and PATH select that installation. "
+        "Follow the official guidance for your ROCm release:\n"
+        "  Installation: https://rocm.docs.amd.com/en/latest/install/rocm.html\n"
+        "  Python SDK: https://github.com/ROCm/TheRock/blob/main/docs/packaging/python_packaging.md"
+    )
+
+
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
     # Stream compiler progress without changing the application logger format.
     verbose = verbose or os.getenv("AITER_JIT_VERBOSE", "0") == "1"
@@ -1814,36 +1719,39 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        # Warning: don't pass stdout=None to subprocess.run to get output.
-        # subprocess.run assumes that sys.__stdout__ has not been modified and
-        # attempts to write to it by default.  However, when we call _run_ninja_build
-        # from ahead-of-time cpp extensions, the following happens:
-        # 1) If the stdout encoding is not utf-8, setuptools detachs __stdout__.
-        #    https://github.com/pypa/setuptools/blob/7e97def47723303fafabe48b22168bbc11bb4821/setuptools/dist.py#L1110
-        #    (it probably shouldn't do this)
-        # 2) subprocess.run (on POSIX, with no stdout override) relies on
-        #    __stdout__ not being detached:
-        #    https://github.com/python/cpython/blob/c352e6c7446c894b13643f538db312092b351789/Lib/subprocess.py#L1214
-        # To work around this, we pass in the fileno directly and hope that
-        # it is valid.
-        stdout_fileno = 1
-        subprocess.run(
+        # Capture failures even in verbose mode while keeping live progress.
+        # Write to fd 1 because setuptools can detach sys.__stdout__ in AOT builds.
+        with subprocess.Popen(
             command,
-            stdout=stdout_fileno if verbose else subprocess.PIPE,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             cwd=build_directory,
-            check=True,
             env=env,
-        )
+        ) as process:
+            try:
+                if verbose:
+                    chunks = []
+                    for line in process.stdout:
+                        chunks.append(line)
+                        os.write(1, line)
+                    output = b"".join(chunks)
+                    process.wait()
+                else:
+                    output, _ = process.communicate()
+            except BaseException:
+                # Match subprocess.run's cleanup if streaming is interrupted.
+                process.kill()
+                raise
+            if process.returncode:
+                raise subprocess.CalledProcessError(
+                    process.returncode, command, output=output
+                )
     except subprocess.CalledProcessError as e:
-        # Python 2 and 3 compatible way of getting the error object.
-        _, error, _ = sys.exc_info()
-        # error.output contains the stdout and stderr of the build attempt.
         message = error_prefix
-        # `error` is a CalledProcessError (which has an `output`) attribute, but
-        # mypy thinks it's Optional[BaseException] and doesn't narrow
-        if hasattr(error, "output") and error.output:  # type: ignore[union-attr]
-            message += f": {error.output.decode(*SUBPROCESS_DECODE_ARGS)}"  # type: ignore[union-attr]
+        if e.output:
+            output = e.output.decode(*SUBPROCESS_DECODE_ARGS, errors="replace")
+            message += f": {output}"
+            message += _rocm_header_build_hint(output)
         raise RuntimeError(message) from e
 
 
@@ -2039,11 +1947,7 @@ def _write_ninja_file(
     config = ["ninja_required_version = 1.3"]
     config.append(f"cxx = {_posix_path(compiler)}")
     if with_cuda or cuda_dlink_post_cflags:
-        # Resolve through executable_path so Windows layouts (hipcc.exe) work.
-        try:
-            nvcc = executable_path("hipcc")
-        except AssertionError:
-            nvcc = _join_rocm_home("bin", "hipcc")
+        nvcc = _get_hipcc_path()
         config.append(f"nvcc = {_posix_path(nvcc)}")
 
     if IS_HIP_EXTENSION:
