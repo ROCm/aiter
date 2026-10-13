@@ -951,8 +951,10 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
-        self.enable_register_for_capturing = False
+        self._register_for_capturing = False
+        self._register_for_capturing_init = False
         self._register_for_capturing_requested = False
+        self._register_for_capturing_opt_out = False
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
         self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
@@ -1098,7 +1100,8 @@ class CustomAllreduce:
                     "(issue #4174). Re-checked when capture() is entered."
                 )
             enable_register_for_capturing = False
-        self.enable_register_for_capturing = enable_register_for_capturing
+        self._register_for_capturing = enable_register_for_capturing
+        self._register_for_capturing_init = enable_register_for_capturing
         # This is a buffer for storing the tuples of pointers pointing to
         # IPC buffers from all ranks. Each registered tuple has size of
         # 8*world_size bytes where world_size is at most 8. Allocating 8MB
@@ -1459,6 +1462,29 @@ class CustomAllreduce:
             offsets,
         )
 
+    @property
+    def enable_register_for_capturing(self) -> bool:
+        """Whether a collective captured now binds its input directly (the
+        registered path) instead of staging it through the copy-in pool.
+        Outside capture() this is the __init__ decision, or False once a host
+        has opted out."""
+        return self._register_for_capturing
+
+    @enable_register_for_capturing.setter
+    def enable_register_for_capturing(self, value: bool) -> None:
+        # A host may opt out after __init__; ATOM forces copy-in for PIECEWISE
+        # graphs. capture() keeps that choice instead of re-deriving the path
+        # from the constructor argument. Setting True only withdraws the
+        # opt-out: it cannot enable a path __init__ ruled out.
+        if self._IS_CAPTURING:
+            raise RuntimeError(
+                "Set enable_register_for_capturing before capture(): changing "
+                "it inside the capture window would switch this rank's path "
+                "without the other ranks."
+            )
+        self._register_for_capturing_opt_out = not value
+        self._register_for_capturing = bool(value) and self._register_for_capturing_init
+
     @contextmanager
     def capture(self):
         """
@@ -1466,9 +1492,9 @@ class CustomAllreduce:
         flush_graph_buffers call at the end of the context.
         It records all the buffer addresses used in the CUDA graph.
         """
-        prev_register = self.enable_register_for_capturing
+        prev_register = self._register_for_capturing
         if not self.disabled and not self._use_vmm:
-            self.enable_register_for_capturing = self._agree_capture_path()
+            self._register_for_capturing = self._agree_capture_path()
         try:
             self._IS_CAPTURING = True
             try:
@@ -1480,26 +1506,32 @@ class CustomAllreduce:
             if not self.disabled:
                 self._pool.flush_graph_buffers(self._ptr)
         finally:
-            self.enable_register_for_capturing = prev_register
+            self._register_for_capturing = prev_register
 
     def _agree_capture_path(self) -> bool:
-        """Decide the capture path from the live allocator state, on every rank.
+        """Decide the capture path from the live allocator state and any host
+        opt-out, on every rank.
 
         The registered path is used only if every rank can take it: the choice
         changes the kernel's input source and the graph-buffer count, so ranks
         that split would mismatch at flush and read the wrong peer buffers on
         replay. Copy-in is always safe, so any dissent falls back to it.
         """
-        # Set from constructor arguments and arch, so the same on every rank.
+        # Set from the constructor argument and arch, so every rank takes part
+        # in the exchange or none does. A host opt-out is only a vote: ranks
+        # that differ on it fall back to copy-in instead of hanging.
         if not self._register_for_capturing_requested:
             return False
-        decisions = self._pool.all_gather_object(not _expandable_segments_enabled())
+        decisions = self._pool.all_gather_object(
+            not self._register_for_capturing_opt_out
+            and not _expandable_segments_enabled()
+        )
         agreed = all(decisions)
         if len(set(decisions)) > 1:
             logger.warning(
                 "Ranks disagree on the custom-allreduce capture path "
                 "(registered per rank: %s; expandable_segments off and "
-                "registration requested). Using copy-in on every rank.",
+                "no host opt-out). Using copy-in on every rank.",
                 decisions,
             )
         elif agreed and not self.enable_register_for_capturing:

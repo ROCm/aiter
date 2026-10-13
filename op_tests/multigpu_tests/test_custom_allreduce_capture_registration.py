@@ -13,7 +13,10 @@ expandable segments only for the duration of CUDA graph capture -- so that the
 graph pool's activations *are* exportable -- got no benefit from it, because
 the decision had already been made. capture() now re-reads the live allocator
 state, agrees on the result across ranks, and refuses a captured input that
-cannot be exported.
+cannot be exported. A host that opts out after __init__ by setting
+enable_register_for_capturing to False (ATOM forces copy-in for PIECEWISE
+graphs) must keep that choice; setting it True only withdraws the opt-out,
+and setting it inside the capture window is refused.
 
 Two axes that no existing test covers together: test_init_dist_env.py sets
 expandable segments but captures no graph, and test_custom_allreduce.py
@@ -28,14 +31,16 @@ from multiprocessing import Pool, freeze_support, set_start_method
 import torch
 
 from aiter.dist.utils import get_open_port
-from aiter.test_common import checkAllclose
+from aiter.test_common import assertAllclose
 
 logger = logging.getLogger("aiter")
 
 set_start_method("spawn", force=True)
 
 # scenario -> (expandable_segments at __init__, which ranks flip them for
-# capture, expected registered path inside capture()).
+# capture, which ranks the host opts out of the registered path after
+# __init__ ("withdraw": every rank opts out, then withdraws it), expected
+# registered path inside capture()).
 #   keep:    left on, the copy-in path is kept.
 #   toggle:  the host turns them off for capture, the registered path is used.
 #   mixed:   only rank 0 turns them off; ranks must agree, so all use copy-in.
@@ -43,13 +48,28 @@ set_start_method("spawn", force=True)
 #   stale:   turned off for capture, but the input was allocated before, so it
 #            is VMM-backed; the captured collective must raise, not abort, and
 #            leave the process usable.
+#   optout:  off throughout, but the host turns registration off after
+#            __init__ (as ATOM does for PIECEWISE graphs); capture() must
+#            not turn it back on.
+#   optout_toggle: as toggle, but the host opted out; copy-in is kept.
+#   optout_mixed:  only rank 0 opts out; all use copy-in, none hangs.
+#   optout_withdraw: as toggle, but the host opts out and withdraws it; the
+#            flag reads the __init__ veto again, and capture() registers.
 SCENARIOS = {
-    "keep": (True, "none", False),
-    "toggle": (True, "all", True),
-    "mixed": (True, "rank0", False),
-    "reverse": (False, "all", False),
-    "stale": (True, "all", True),
+    "keep": (True, "none", "none", False),
+    "toggle": (True, "all", "none", True),
+    "mixed": (True, "rank0", "none", False),
+    "reverse": (False, "all", "none", False),
+    "stale": (True, "all", "none", True),
+    "optout": (False, "none", "all", False),
+    "optout_toggle": (True, "all", "all", False),
+    "optout_mixed": (False, "none", "rank0", False),
+    "optout_withdraw": (True, "all", "withdraw", True),
 }
+
+
+def _selected(ranks: str, rank: int) -> bool:
+    return ranks == "all" or (ranks == "rank0" and rank == 0)
 
 
 def _set_expandable_segments(enabled: bool) -> None:
@@ -62,7 +82,7 @@ def _set_expandable_segments(enabled: bool) -> None:
 
 
 def _worker(tp_size, rankID, scenario, shape):
-    at_init, flip_ranks, _ = SCENARIOS[scenario]
+    at_init, flip_ranks, opt_out_ranks, _ = SCENARIOS[scenario]
     # Programmatic, not just the environment: importing aiter has already
     # initialized CUDA in this process, so the allocator config is parsed and
     # a late PYTORCH_HIP_ALLOC_CONF write would be ignored.
@@ -88,8 +108,15 @@ def _worker(tp_size, rankID, scenario, shape):
     requested = getattr(ca_comm, "_register_for_capturing_requested", None)
     # The allocator snapshot reports whether expandable_segments took effect.
     at_init_seen = _expandable_segments_enabled()
+    if opt_out_ranks == "withdraw":
+        ca_comm.enable_register_for_capturing = False
+        ca_comm.enable_register_for_capturing = True
+    elif _selected(opt_out_ranks, rankID):
+        ca_comm.enable_register_for_capturing = False
+    opted_out = _selected(opt_out_ranks, rankID)
+    before = ca_comm.enable_register_for_capturing
 
-    flip = flip_ranks == "all" or (flip_ranks == "rank0" and rankID == 0)
+    flip = _selected(flip_ranks, rankID)
     fill = float(rankID + 1)
     x = None
     if scenario == "stale":
@@ -97,6 +124,7 @@ def _worker(tp_size, rankID, scenario, shape):
 
     graph = torch.cuda.CUDAGraph()
     registered_during_capture = None
+    in_window_write_refused = None
     error = None
     out_t = None
     if flip:
@@ -108,6 +136,11 @@ def _worker(tp_size, rankID, scenario, shape):
         # Allocate inside the toggled window, like a graph-pool activation.
         with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
             registered_during_capture = ca_comm.enable_register_for_capturing
+            try:
+                ca_comm.enable_register_for_capturing = False
+                in_window_write_refused = False
+            except RuntimeError:
+                in_window_write_refused = True
             if x is None:
                 x = torch.full(shape, fill, dtype=torch.bfloat16, device=device)
             out_t = tensor_model_parallel_all_reduce(x)
@@ -135,6 +168,9 @@ def _worker(tp_size, rankID, scenario, shape):
     return {
         "latched": latched,
         "requested": requested,
+        "before": before,
+        "opted_out": opted_out,
+        "in_window_write_refused": in_window_write_refused,
         "seen": (at_init_seen, at_capture_seen),
         "flip": flip,
         "during_capture": registered_during_capture,
@@ -160,7 +196,7 @@ def test_capture_registration(tp_size, shape, scenario):
     rets = [r.get(timeout=600) for r in rets]
     pool.join()
 
-    at_init, _, expected = SCENARIOS[scenario]
+    at_init, _, _, expected = SCENARIOS[scenario]
     tag = f"{tp_size=} {scenario=}"
     disabled = all(r["disabled"] for r in rets)
     # No veto to exercise: gfx1250 and the VMM transport never register
@@ -171,8 +207,9 @@ def test_capture_registration(tp_size, shape, scenario):
     )
     raises = scenario == "stale" and exercised
 
-    # sum over ranks of full(rank+1) = n(n+1)/2; for "stale", from the eager
-    # all-reduce run after the refused capture.
+    # sum over ranks of full(rank+1) = n(n+1)/2, exact in bf16, so every
+    # element must match; for "stale", from the eager all-reduce run after
+    # the refused capture.
     ref = torch.full(shape, float(tp_size * (tp_size + 1) // 2), dtype=torch.bfloat16)
     for i, r in enumerate(rets):
         if raises:
@@ -182,7 +219,18 @@ def test_capture_registration(tp_size, shape, scenario):
             )
         else:
             assert r["error"] is None, f"{tag} rank {i}: {r['error']}"
-        checkAllclose(ref, r["out"], msg=f"allreduce: {tag} rank={i}")
+        assertAllclose(
+            ref,
+            r["out"],
+            rtol=0,
+            atol=0,
+            tol_err_ratio=0,
+            msg=f"allreduce: {tag} rank={i}",
+        )
+        assert r["in_window_write_refused"], (
+            f"{tag} rank {i}: setting enable_register_for_capturing inside the "
+            "capture window must raise"
+        )
 
     if disabled:
         return {"disabled": True}
@@ -204,7 +252,11 @@ def test_capture_registration(tp_size, shape, scenario):
             f"{tag} rank {i}: expected enable_register_for_capturing="
             f"{expected} inside capture(), saw {r['during_capture']}"
         )
-        assert r["restored"] is r["latched"], (
+        assert r["before"] is (r["latched"] and not r["opted_out"]), (
+            f"{tag} rank {i}: outside capture() the flag must read the __init__ "
+            f"decision, or False after an opt-out; saw {r['before']}"
+        )
+        assert r["restored"] is r["before"], (
             f"{tag} rank {i}: the capture-time decision must not leak out of "
             "capture()"
         )
