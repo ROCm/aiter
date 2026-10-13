@@ -22,8 +22,8 @@ fp8_dtype = aiter.dtypes.fp8
 _LOGGER = AiterTritonLogger()
 
 
-def _get_silu_and_mul_backward_config(n_cols: int) -> dict:
-    config_dir = resolve_config_dir("fusions", "SILU-AND-MUL-BACKWARD")
+def _get_silu_and_mul_backward_config(n_cols: int, arch: str) -> dict:
+    config_dir = resolve_config_dir("fusions", "SILU-AND-MUL-BACKWARD", arch=arch)
     configs = load_config_json(f"{config_dir}/DEFAULT.json", required=True)
     return select_leq_config(configs, n_cols)
 
@@ -363,6 +363,14 @@ def silu_and_mul_backward(
     assert grad_output.dtype == x.dtype, "grad_output dtype must match x dtype"
     assert grad_output.device == x.device, "grad_output device must match x device"
 
+    arch = str(
+        getattr(torch.cuda.get_device_properties(x.device), "gcnArchName", "")
+    ).split(":", 1)[0]
+    if arch != "gfx950":
+        raise RuntimeError(
+            f"silu_and_mul_backward requires gfx950, got {arch or 'unknown'}"
+        )
+
     if out is None:
         out = torch.empty_like(x)
     else:
@@ -384,7 +392,7 @@ def silu_and_mul_backward(
         tuple(grad_output.shape),
     )
     with torch.cuda.device(x.device):
-        config = _get_silu_and_mul_backward_config(n_cols)
+        config = _get_silu_and_mul_backward_config(n_cols, arch)
         block_m = min(config.pop("BLOCK_M"), triton.next_power_of_2(n_rows))
         block_n = config.pop("BLOCK_N")
         grid = (triton.cdiv(n_rows, block_m), triton.cdiv(n_cols, block_n))
