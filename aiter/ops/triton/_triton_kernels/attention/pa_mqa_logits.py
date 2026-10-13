@@ -361,8 +361,8 @@ _deepgemm_fp8_paged_mqa_logits_varctx_schedule_repr = make_kernel_repr(
 def _deepgemm_fp8_paged_mqa_logits_persistent_schedule(
     context_len_ptr,
     cta_info_ptr,
-    batch_size: tl.constexpr,
-    slots: tl.constexpr,
+    batch_size,
+    slots,
     max_model_len,
     ChunkK: tl.constexpr,
     NEXT_N: tl.constexpr,
@@ -383,9 +383,7 @@ def _deepgemm_fp8_paged_mqa_logits_persistent_schedule(
     max_chunks = tl.max(chunks, 0)
     min_chunks = tl.min(tl.where(b < batch_size, chunks, max_chunks), 0)
     if (min_chunks == max_chunks) & (max_chunks >= slots // batch_size):
-        # Enough uniform chunks to fill the grid: all divisors are compile-time
-        # constants. Contexts can still differ within their final chunk.
-        per_seq: tl.constexpr = slots // batch_size
+        per_seq = slots // batch_size
         batch = slot // per_seq
         split = slot % per_seq
         valid = (slot < per_seq * batch_size) & (slot < slots)
