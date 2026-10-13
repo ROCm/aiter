@@ -91,22 +91,30 @@ operations. `QuickAllReduce` uses the mesh and the ring when the INT4
 quantization regime is set.
 
 The communicator tries `QuickAllReduce` first, then `CustomAllreduce`. For
-this reason, a payload goes to the mesh or the ring if it is larger than the
-mesh floor. Other payloads go to `CustomAllreduce`, which uses the one-shot up
-to the one-shot ceiling and `cross_device_reduce` or RCCL above it.
+this reason, a payload goes to the mesh or the ring if it is in the mesh or
+ring window. Other payloads go to `CustomAllreduce`, which uses the one-shot in
+the one-shot window and `cross_device_reduce` or RCCL outside it.
 
 `aiter/ops/flydsl/allreduce_policy.py` contains every tuned value, in two
 levels:
 
-1. Which kernel runs a payload. The boundaries for each link type and world
-   size are a row of `FAMILY_POLICY`. On an arch that has its own
-   measurements, a row of `ARCH_FAMILY_POLICY` replaces it. The fields are in
-   payload order: `oneshot_min` and `oneshot_max` (the one-shot), `quant_min`
-   (the mesh floor), `mesh_max` and `quant_max`. `route()` gives the kernel
-   for a payload size.
-2. Which configuration of that kernel runs. Each kernel has a tuning ladder
-   per link type and world size: `ONESHOT_LADDER`, `MESH_ST_LADDER` and
-   `RING_ST_LADDER`.
+1. Which algorithm runs a payload. `FAMILY_POLICIES` has one `FamilyPolicy`
+   for each arch, link type and world size. A policy has one payload-size
+   window for each algorithm (`AllReduceAlgorithm`): `oneshot`, `mesh` and
+   `ring`. A window includes its minimum and excludes its maximum, and a
+   maximum of `None` means no upper limit. A missing or empty window disables
+   the algorithm. The windows do not overlap, and a payload that is in no
+   window goes to `cross_device_reduce` or RCCL. `FamilyPolicy.select()` gives
+   the algorithm for a payload size.
+
+   These windows apply with the INT4 quantization regime. Without it, only
+   the one-shot runs, in the `exact_oneshot` window if the policy has one.
+   This window can be larger, because without the mesh the one-shot is the
+   fastest kernel up to a larger payload.
+2. Which configuration of that algorithm runs. Each algorithm has a tuning
+   ladder for each arch, link type and world size: `ONESHOT_LADDER`,
+   `MESH_ST_LADDER` and `RING_ST_LADDER`.
+
 
 ## Environment variables
 
@@ -124,28 +132,38 @@ kernels need gfx942 or gfx950, a world size of 2, 4 or 8, and the `flydsl`
 package. These limits, and the other shared constants of the kernels, are in
 the "Limits" section of `aiter/ops/flydsl/kernels/comm/allreduce_shared.py`.
 
-### Change the payload-size boundaries
+### Change the payload-size windows
 
-These variables replace values from `FAMILY_POLICY`. Each value is a number of
-bytes.
-
-If a variable is not set, is empty, or is `-1`, the code uses the value from
-the table. If the value is not an integer, the code logs a warning and uses
-the value from the table.
+These variables replace the bounds of the windows in `FAMILY_POLICIES`. Each
+value is a number of bytes. A minimum is included in the window, and a maximum
+is not.
 
 | Variable | Effect |
 |---|---|
-| `AITER_FLY_AR_ONESHOT_MIN_BYTES` | The smallest payload for the one-shot (inclusive). `CustomAllreduce` does not send smaller payloads to the one-shot. The default is 0. |
-| `AITER_FLY_AR_ONESHOT_MAX_BYTES` | The one-shot boundary. This variable sets two values. In `CustomAllreduce`, it is the largest payload for the one-shot (inclusive). In `QuickAllReduce`, it is the floor of the mesh (exclusive). |
-| `AITER_FLY_AR_MESH_MAX_BYTES` | The largest payload for the mesh (inclusive). Larger payloads go to the ring. If this value is less than the one-shot boundary, the code uses the one-shot boundary. |
+| `AITER_FLY_AR_ONESHOT_MIN_BYTES` | The minimum of the one-shot window. |
+| `AITER_FLY_AR_ONESHOT_MAX_BYTES` | The maximum of the one-shot window. |
+| `AITER_FLY_AR_MESH_MIN_BYTES` | The minimum of the mesh window. |
+| `AITER_FLY_AR_MESH_MAX_BYTES` | The maximum of the mesh window. |
+| `AITER_FLY_AR_RING_MIN_BYTES` | The minimum of the ring window. |
+| `AITER_FLY_AR_RING_MAX_BYTES` | The maximum of the ring window. |
 
-Without `AITER_FLY_AR_ONESHOT_MAX_BYTES`, the two values come from different
-fields of the policy row:
+* If a variable is not set, is empty, or is `-1`, the code uses the value from
+  the table.
+* `none` or `inf` sets no upper limit. Only the `MAX` variables accept it.
+* A maximum of `0` disables the algorithm. A minimum that is equal to the
+  maximum also disables it.
+* If an algorithm has no window in the table, a variable creates one. The
+  other bound is then `0` for the minimum, or no upper limit for the maximum.
+* The `ONESHOT` variables also change the one-shot window without
+  quantization (`exact_oneshot`).
+* If a value is not valid, the code logs a warning and uses the value from the
+  table.
+* If the windows overlap after the change, the code logs a warning and does
+  not use the FlyDSL kernels.
 
-* `oneshot_max` is the one-shot ceiling in `CustomAllreduce`. Above it,
-  `cross_device_reduce` or RCCL is faster.
-* `quant_min` is the mesh floor in `QuickAllReduce`. Above it, the mesh is
-  faster than the fastest exact kernel.
+The windows are independent. To move the boundary between the one-shot and
+the mesh, set both `AITER_FLY_AR_ONESHOT_MAX_BYTES` and
+`AITER_FLY_AR_MESH_MIN_BYTES`.
 
 ### Related aiter variables
 

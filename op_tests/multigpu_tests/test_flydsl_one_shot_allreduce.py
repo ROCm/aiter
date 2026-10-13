@@ -126,6 +126,13 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
+    OneShotRung,
+)
+from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+    DEFAULT_ATOMS,
+    DEFAULT_BLOCK,
+    DEFAULT_FANOUT,
+    DEFAULT_GRID_CAP,
 )
 
 try:
@@ -228,9 +235,11 @@ def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]
     slice of the window; both ends of every slice are taken, which reaches
     every rung and the largest payload each is asked to move.
     """
-    policy = fly_policy.resolve_oneshot_policy(link, tp)
-    lo, hi = policy.min_bytes, policy.max_bytes
-    ladder = oneshot_ladder(tp, link)
+    window = fly_policy.resolve_family_policy(world_size=tp, link=link).window(
+        fly_policy.AllReduceAlgorithm.OneShot, quantized=False
+    )
+    lo, hi = window.inclusive_range()
+    ladder = oneshot_ladder(world_size=tp, link=link)
     ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]
     payloads = set()
     for rung, end in zip(ladder, ends):
@@ -356,8 +365,26 @@ def _init_dist(rank: int, tp: int, init_method: str, stock: bool):
     return get_tp_group()
 
 
+def _test_ladder(atoms=None, grid_cap=None, fanout=None, block=None) -> tuple:
+    """One rung with the knobs this test pins, for every payload size. An
+    unpinned knob takes the kernel's default."""
+    return (
+        OneShotRung(
+            min_bytes=0,
+            atoms=DEFAULT_ATOMS if atoms is None else atoms,
+            grid_cap=DEFAULT_GRID_CAP if grid_cap is None else grid_cap,
+            fanout=DEFAULT_FANOUT if fanout is None else fanout,
+            block=DEFAULT_BLOCK if block is None else block,
+        ),
+    )
+
+
 def _engine(rank: int, tp: int, group, device, engine_kw: dict):
-    """The one-shot engine, every rung compiled."""
+    """The one-shot engine, every rung compiled.
+
+    With no knob pinned in *engine_kw*, it walks the production ladder;
+    otherwise it runs ``_test_ladder``.
+    """
     from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduce
 
     eng = OneShotAllReduce(
@@ -370,7 +397,7 @@ def _engine(rank: int, tp: int, group, device, engine_kw: dict):
         # covers. Lifted so the shape list stays free to include sizes
         # production would route elsewhere.
         max_bytes=1 << 30,
-        **engine_kw,
+        ladder=_test_ladder(**engine_kw) if engine_kw else None,
     )
     eng.preload()
     return eng

@@ -74,6 +74,7 @@ and ``main()`` skips a world size when fewer GPUs are visible than TP.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import itertools
 import json
 import math
@@ -113,10 +114,13 @@ from aiter.ops.flydsl import allreduce_policy as fly_policy
 from aiter.ops.flydsl.allreduce_policy import mesh_st_ladder, ring_st_ladder
 from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     ATOMS,
+    BLOCK,
     DEFAULT_GRID_CAP,
+    MAX_PAYLOAD_BYTES,
     SUPPORTED_ARCHS,
     SUPPORTED_BLOCKS,
     SUPPORTED_WORLDS,
+    TwoShotRung,
 )
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import clamp_grid_cap
 from aiter.ops.flydsl.quick_allreduce_int4 import (
@@ -341,8 +345,8 @@ def _num_tiles(nbytes: int, block: int) -> int:
 
 def _ladder(algorithm: str, world_size: int, link: str) -> tuple:
     if algorithm == "mesh":
-        return mesh_st_ladder(world_size, link)
-    return ring_st_ladder(world_size, link)
+        return mesh_st_ladder(world_size=world_size, link=link)
+    return ring_st_ladder(world_size=world_size, link=link)
 
 
 def _expected_cfg(
@@ -474,23 +478,32 @@ def _ship_payloads(
     at ``TOP_PAYLOAD_BYTES``) for a production-scale timing row. The window
     comes back so the run can check that kernel list against the engine's own.
     """
-    policy = fly_policy.resolve_quant_policy(link, world_size)
-    if algorithm in fly_policy.quant_families_reachable(policy):
-        lo, hi = fly_policy.quant_family_range(algorithm, policy)
+    policy = fly_policy.resolve_family_policy(world_size=world_size, link=link)
+    window = policy.window(fly_policy.AllReduceAlgorithm(algorithm), quantized=True)
+    if window is not None:
+        lo, hi = window.inclusive_range()
         payloads = set(_kernel_payloads(world_size, algorithm, link, lo, hi).values())
         top = min(hi, TOP_PAYLOAD_BYTES) // _ROW_BYTES * _ROW_BYTES
         if top >= lo:
             payloads.add(top)
         return sorted(payloads), (lo, hi)
-    by_cfg = _kernel_payloads(
-        world_size, algorithm, link, policy.floor + 1, policy.max_bytes
-    )
+    # Every payload a quantized algorithm runs, from the smallest.
+    quant = [
+        w
+        for alg in (
+            fly_policy.AllReduceAlgorithm.TwoShotMesh,
+            fly_policy.AllReduceAlgorithm.TwoShotRing,
+        )
+        if (w := policy.window(alg, quantized=True)) is not None
+    ]
+    lo = min((w.min for w in quant), default=0)
+    by_cfg = _kernel_payloads(world_size, algorithm, link, lo, MAX_PAYLOAD_BYTES)
     first = _ladder(algorithm, world_size, link)[0]
     return [by_cfg.get((first.super_tile, first.block), min(by_cfg.values()))], None
 
 
 def _fmt_bytes(nbytes: int) -> str:
-    if nbytes >= fly_policy.NO_MAX:
+    if nbytes >= MAX_PAYLOAD_BYTES:
         return "inf"
     for unit, shift in (("MiB", 20), ("KiB", 10)):
         if nbytes >= 1 << shift:
@@ -616,10 +629,60 @@ def _init_dist(rank: int, tp: int, init_method: str, hip: bool):
     return get_tp_group()
 
 
+def _test_ladder(
+    algorithm: str,
+    world_size: int,
+    *,
+    super_tile: int | None = None,
+    grid_cap: int | None = None,
+    block: int | None = None,
+) -> tuple:
+    """The ladder of a test engine, from the knobs this test pins.
+
+    *super_tile* pins that super-tile for every payload size, as one rung at
+    *grid_cap* (default ``DEFAULT_GRID_CAP``) and *block* (default ``BLOCK``).
+    Otherwise the production ladder runs, with *block* overriding and
+    *grid_cap* bounding every rung.
+    """
+    if super_tile is not None:
+        return (
+            TwoShotRung(
+                min_bytes=0,
+                super_tile=int(super_tile),
+                grid_cap=DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap),
+                block=BLOCK if block is None else int(block),
+            ),
+        )
+    link = fly_policy.detect_link()
+    ladder = _ladder(algorithm, world_size, link)
+    return tuple(
+        dataclasses.replace(
+            r,
+            grid_cap=r.grid_cap if grid_cap is None else min(r.grid_cap, grid_cap),
+            block=r.block if block is None else int(block),
+        )
+        for r in ladder
+    )
+
+
 def _engine(rank: int, tp: int, gloo, device, engine_kw: dict):
-    """A ``QuickAllReduceInt4`` with every binary compiled."""
+    """A ``QuickAllReduceInt4`` with every binary compiled.
+
+    The ``super_tile``, ``grid_cap`` and ``block`` keys of *engine_kw* become
+    the engine's ladder; refer to ``_test_ladder``.
+    """
     from aiter.ops.flydsl import QuickAllReduceInt4
 
+    engine_kw = dict(engine_kw)
+    knobs = {
+        k: engine_kw.pop(k)
+        for k in ("super_tile", "grid_cap", "block")
+        if k in engine_kw
+    }
+    if knobs:
+        engine_kw["ladder"] = _test_ladder(
+            engine_kw.get("algorithm", "mesh"), tp, **knobs
+        )
     fly = QuickAllReduceInt4(
         group=gloo,
         device=device,
@@ -1097,9 +1160,9 @@ def bench_quick_allreduce_int4(
 ):
     """Each FlyDSL schedule against the HIP quick all-reduce.
 
-    *route* is the kernel production dispatch picks for the payload, from
-    ``allreduce_policy.route``: ``mesh``, ``ring``, or ``oneshot`` or
-    ``fallback`` where the quantized slot declines it.
+    *route* is the algorithm production dispatch picks for the payload:
+    ``mesh``, ``ring``, ``oneshot``, or ``fallback`` for
+    ``cross_device_reduce`` and RCCL.
     """
     rows = _result(_bench_key(tp, algorithms, grid_cap, block), (tokens, hidden))
     names = [n for n in (*algorithms, "hip") if n in rows[0]["candidates"]]
@@ -1288,7 +1351,7 @@ def _verify(args, tps, algos, dts, link) -> None:
         if window is not None and shipping_engine:
             _WINDOWS[_ship_key(tp, algorithm, None)] = window
             lo, hi = window
-            label = f"({_fmt_bytes(lo - 1)}, {_fmt_bytes(hi)}]"
+            label = f"[{_fmt_bytes(lo)}, {_fmt_bytes(hi)}]"
             coverage.append((tp, algorithm, label))
     # Knob rows only in a default run: pinning --block already sweeps it over
     # the shipping shapes.
@@ -1383,6 +1446,13 @@ def _verify(args, tps, algos, dts, link) -> None:
     )
 
 
+def _route(policy, nbytes: int) -> str:
+    """The algorithm production dispatch runs *nbytes* on with quantization
+    on, or ``fallback`` for ``cross_device_reduce`` and RCCL."""
+    alg = policy.select(nbytes, quantized=True)
+    return "fallback" if alg is None else alg.value
+
+
 def _bench(args, tps, algos, link) -> None:
     algos = tuple(a for a in ALGORITHMS if a in algos)
     rows = []
@@ -1392,6 +1462,7 @@ def _bench(args, tps, algos, link) -> None:
         else:
             payloads = {n for a in algos for n in _ship_payloads(tp, a, link)[0]}
             shapes = [(n // _ROW_BYTES, HIDDEN) for n in sorted(payloads)]
+        policy = fly_policy.resolve_family_policy(world_size=tp, link=link)
         for grid_cap, block in itertools.product(args.grid_cap, args.block):
             # Every case of a spawn is registered before its first result.
             for shape in shapes:
@@ -1402,9 +1473,7 @@ def _bench(args, tps, algos, link) -> None:
                     hidden,
                     tp,
                     algos,
-                    route=fly_policy.route(
-                        tokens * hidden * 2, link, tp, quantized=True
-                    ),
+                    route=_route(policy, tokens * hidden * 2),
                     grid_cap=grid_cap,
                     block=block,
                 )

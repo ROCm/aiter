@@ -1,8 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for the exact one-shot (1-stage) all-reduce.
-"""
+"""Host launch for the exact one-shot (1-stage) all-reduce."""
 
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import logging
 import torch
 from flydsl.expr.typing import Int32, Int64, Stream
 
-from .allreduce_policy import family_policy, oneshot_ladder, resolve_link
+from .allreduce_policy import oneshot_ladder, resolve_family_policy, resolve_link
 from .allreduce_shared import (
     _cuda_index,
     _resolve_inbox_flags,
@@ -23,13 +22,12 @@ from .allreduce_shared import (
     payload_probes,
     require_arch,
 )
-from .kernels.comm.allreduce_shared import SUPPORTED_BLOCKS, OneShotRung, select_rung
+from .kernels.comm.allreduce_shared import (
+    AllReduceAlgorithm,
+    OneShotRung,
+    select_rung,
+)
 from .kernels.comm.one_shot_allreduce import (
-    DEFAULT_ATOMS,
-    DEFAULT_BLOCK,
-    DEFAULT_FANOUT,
-    DEFAULT_GRID_CAP,
-    SUPPORTED_ATOMS,
     make_one_shot_allreduce_kernel,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
@@ -37,27 +35,34 @@ from .kernels.tensor_shim import _preload_compiled, _run_compiled
 logger = logging.getLogger("aiter")
 
 
-def max_payload_bytes(
-    world_size: int, link: str = "pcie", arch: str | None = None
+def resolve_oneshot_max_bytes(
+    *, world_size: int, link: str | None = None, arch: str | None = None
 ) -> int:
-    """Largest payload this kernel should be asked to move"""
-    return family_policy(str(link), int(world_size), arch).oneshot_max
+    """Largest payload this kernel should be asked to move, inclusive.
+
+    The maximum of the exact-mode one-shot window of this rank's policy, with
+    the environment overrides applied.
+    """
+    window = resolve_family_policy(
+        world_size=int(world_size), arch=arch, link=link
+    ).window(AllReduceAlgorithm.OneShot, quantized=False)
+    return 0 if window is None else window.inclusive_range()[1]
 
 
 class OneShotAllReduce:
     """IPC inbox + launch wrapper for ``one_shot_allreduce``.
 
-    ``atoms``, ``grid_cap``, ``fanout`` and ``block`` are the tuning surface.
-    ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it
-    from above.
+    The kernel configuration comes from the one-shot tuning ladder of the
+    policy (``oneshot_ladder``). ``ladder`` overrides it.
 
-    ``max_bytes`` is the payload above which this ``allreduce`` refuses to run.
+    ``max_bytes`` is the payload above which this ``allreduce`` refuses to run,
+    defaulting to ``resolve_oneshot_max_bytes``.
 
-    ``link`` is the interconnect type and it is detected from the KFD topology 
+    ``link`` is the interconnect type and it is detected from the KFD topology
     when not explicitly given.
 
     ``inbox_memory`` type: ``"auto"`` picks ``uncached`` on xGMI
-    hosts and ``finegrained`` on PCIe ones. One exception: at TP2 it picks 
+    hosts and ``finegrained`` on PCIe ones. One exception: at TP2 it picks
     ``uncached`` on PCIe too, since a single remote destination cannot collapse.
 
     A rank never round-trips through its own inbox: its own contribution stays
@@ -72,40 +77,23 @@ class OneShotAllReduce:
         device,
         rank: int,
         world_size: int,
-        atoms: int | None = None,
-        grid_cap: int | None = None,
         inbox_memory: str = "auto",
-        fanout: str | None = None,
-        block: int | None = None,
         max_bytes: int | None = None,
         link: str | None = None,
+        ladder: tuple[OneShotRung, ...] | None = None,
     ):
         check_world_size(world_size)
         link = resolve_link(link)
         self.link = link
-        pinned = (
-            atoms is not None
-            or grid_cap is not None
-            or fanout is not None
-            or block is not None
-        )
-        if atoms is None:
-            atoms = DEFAULT_ATOMS
-        if fanout is None:
-            fanout = DEFAULT_FANOUT
-        if block is None:
-            block = DEFAULT_BLOCK
-        if atoms not in SUPPORTED_ATOMS:
-            raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
-        if block not in SUPPORTED_BLOCKS:
-            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
         _validate_ipc_process_group(
             group, rank=int(rank), world_size=world_size, owner="OneShotAllReduce"
         )
-        require_arch(owner="OneShotAllReduce")
-        cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
-        if cap < 1:
-            raise ValueError(f"grid_cap must be positive, got {cap}")
+        arch = require_arch(owner="OneShotAllReduce")
+        if ladder is None:
+            ladder = oneshot_ladder(world_size=world_size, link=link, arch=arch)
+        if not ladder:
+            raise ValueError("ladder must have at least one rung")
+        self._ladder = tuple(ladder)
 
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device, owner="OneShotAllReduce")
@@ -116,21 +104,10 @@ class OneShotAllReduce:
         self.world_size = int(world_size)
         self.inbox_memory = resolved_inbox
         self.max_bytes = (
-            max_payload_bytes(world_size, link) if max_bytes is None else int(max_bytes)
+            resolve_oneshot_max_bytes(world_size=world_size, link=link, arch=arch)
+            if max_bytes is None
+            else int(max_bytes)
         )
-
-        if pinned:
-            self._ladder = (
-                OneShotRung(
-                    min_bytes=0,
-                    atoms=int(atoms),
-                    grid_cap=cap,
-                    fanout=fanout,
-                    block=int(block),
-                ),
-            )
-        else:
-            self._ladder = oneshot_ladder(world_size, link)
 
         # One engine per distinct rung config, built in a fixed sorted order:
         # each does its own IPC handle exchange, which is a collective, so ranks
@@ -170,10 +147,8 @@ class OneShotAllReduce:
             self.close()
             raise
 
-        # Lowest rung's shape, reported as this object's own. With a pinned
-        # config that is the only rung and these are exact; with a ladder they
-        # describe the smallest payloads, which is what a caller inspecting
-        # ``tile_bytes`` is almost always asking about.
+        # The first rung's shape, reported as this object's own: it describes
+        # the smallest payloads.
         first = self._ladder[0].cfg
         eng, spec = self._by_cfg[first]
         self.atoms = first[0]
@@ -194,12 +169,13 @@ class OneShotAllReduce:
         *live_bytes*."""
         return select_rung(self._ladder, live_bytes).cfg
 
-    def _num_tiles(self, live_bytes: int, tile_bytes: int | None = None) -> int:
-        tb = self.tile_bytes if tile_bytes is None else tile_bytes
-        return max(1, (live_bytes + tb - 1) // tb)
+    @staticmethod
+    def _num_tiles(live_bytes: int, tile_bytes: int) -> int:
+        return max(1, (live_bytes + tile_bytes - 1) // tile_bytes)
 
-    def _grid_x(self, num_tiles: int, grid_cap: int | None = None) -> int:
-        return max(1, min(num_tiles, self.grid_cap if grid_cap is None else grid_cap))
+    @staticmethod
+    def _grid_x(num_tiles: int, grid_cap: int) -> int:
+        return max(1, min(num_tiles, grid_cap))
 
     def _launch_args(self, eng, spec, inp_ptr, out_ptr, stream, *, live_bytes):
         num_tiles = self._num_tiles(live_bytes, spec["tile_bytes"])

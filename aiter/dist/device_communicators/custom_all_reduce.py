@@ -961,7 +961,7 @@ class CustomAllreduce:
             self._init_ipc(rank, world_size, max_size)
 
         self._fly_oneshot = None
-        self._fly_policy = None
+        self._fly_window = None
         self._init_fly_oneshot()
 
     def _init_fly_oneshot(self):
@@ -986,23 +986,34 @@ class CustomAllreduce:
             return
 
         link = fly_policy.detect_link()
+        try:
+            policy = fly_policy.resolve_family_policy(
+                world_size=self.world_size, arch=arch, link=link
+            )
+        except fly_policy.NoPolicyError as e:
+            logger.debug("FlyDSL one-shot disabled: %s", e)
+            return
+        except ValueError as e:
+            logger.warning("FlyDSL one-shot disabled: %s", e)
+            return
+        
+        window = policy.window(fly_policy.AllReduceAlgorithm.OneShot, quantized=False)
+        if window is None:
+            logger.debug("FlyDSL one-shot disabled by the policy.")
+            return
+
         engine = None
-        policy = None
-        payload_range = None
+        payload_range = self._fly_oneshot_range(window)
         ok = True
         try:
-            policy = fly_policy.resolve_oneshot_policy(link, self.world_size)
-            payload_range = self._fly_oneshot_range(policy)
-            # The range comes from the policy table and env, identical on every
-            # rank, so all ranks skip together and no IPC exchange is left
-            # waiting on a peer.
+            # The range is identical on every rank, so all ranks skip together.
             if payload_range[0] <= payload_range[1]:
                 engine = OneShotAllReduce(
                     group=self.group,
                     device=self.device,
                     rank=self.rank,
                     world_size=self.world_size,
-                    max_bytes=policy.max_bytes,
+                    max_bytes=window.inclusive_range()[1],
                     link=link,
                 )
         except Exception:  # noqa: BLE001
@@ -1042,17 +1053,17 @@ class CustomAllreduce:
             return
 
         self._fly_oneshot = engine
-        self._fly_policy = policy
+        self._fly_window = window
         logger.info(
             "Custom all-reduce slot: FlyDSL exact one-shot serves plain bf16 "
-            "all-reduce up to %d KiB (TP%d on %s, %.1f MiB of IPC inbox).",
-            policy.max_bytes >> 10,
+            "all-reduce in %s (TP%d on %s, %.1f MiB of IPC inbox).",
+            window,
             self.world_size,
             link,
             engine.inbox_bytes / 2**20,
         )
 
-    def _fly_oneshot_range(self, policy) -> tuple[int, int]:
+    def _fly_oneshot_range(self, window) -> tuple[int, int]:
         """Payload bytes (inclusive) ``custom_all_reduce`` routes to the
         one-shot: ``should_custom_ar`` on its decode path, then
         ``_should_fly_oneshot``. Empty (``lo > hi``) when it routes none."""
@@ -1061,9 +1072,8 @@ class CustomAllreduce:
             self.world_size == 2 or self.fully_connected
         ):
             return 1, 0
-        lo = max(policy.min_bytes, self._car_min_size + 1)
-        hi = min(policy.max_bytes, self._car_max_size)
-        return lo, hi
+        first, last = window.inclusive_range()
+        return max(first, self._car_min_size + 1), min(last, self._car_max_size)
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
@@ -1324,7 +1334,7 @@ class CustomAllreduce:
         if inp.device.index != self.device.index:
             return False
         nbytes = inp.numel() * inp.element_size()
-        return self._fly_policy.min_bytes <= nbytes <= self._fly_policy.max_bytes
+        return self._fly_window.contains(nbytes)
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):
         return self._fits_custom_ar_size(inp, prefill_support) and is_weak_contiguous(

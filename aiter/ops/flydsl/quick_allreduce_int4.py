@@ -13,13 +13,12 @@ they are named for the topology of each lap instead:
 Super-tile ST∈{1,8} on the mesh, ST∈{1,8,16,32} on the ring. INT4 nibble or
 INT6 bit-plane pair, both with group-16 E4M3 scales. Payload HBM is bf16.
 
-One more tuning knob rides every ladder rung: ``block`` (threads per workgroup,
-which sets the tile). Ladders are keyed on ``(link, world_size)``.
+The kernel configuration comes from a tuning ladder of ``TwoShotRung``, keyed
+on ``(arch, link, world_size)`` in ``allreduce_policy``.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,10 +49,7 @@ from .allreduce_shared import (
 )
 from .kernels.comm.allreduce_shared import (
     ATOMS,
-    BLOCK,
-    DEFAULT_GRID_CAP,
     QUANT_MIN_PAYLOAD_BYTES,
-    SUPPORTED_BLOCKS,
     WORLD,
     TwoShotRung,
     has_release_fence,
@@ -78,50 +74,15 @@ logger = logging.getLogger("aiter")
 
 @dataclass(frozen=True)
 class _Algorithm:
-    """One all-reduce schedule, plus the host-side policy that tunes it.
-
-    Everything ``QuickAllReduceInt4`` does *around* the kernel -- IPC setup,
-    payload validation, one engine per super-tile, launch -- is identical
-    across schedules and stays on the class. What differs is which kernel
-    factory to call, and which super-tile values and wire formats that factory
-    accepts. That is this record.
-
-    ``build`` is keyword-only and always receives ``rank``, ``rs_codec``,
-    ``ag_codec`` and ``block``, whether or not a given schedule uses them. Both
-    bake ``rank`` in at compile time. The ring needs it because the chunk a
-    step operates on is ``(rank - step) % N``, which has to be a Python
-    constant to index a register-resident atom list. The mesh needs it to keep
-    its own share of every tile in registers instead of round-tripping it
-    through its own inbox.
-    """
+    """One all-reduce schedule, plus the host-side policy that tunes it."""
 
     name: str
     build: Callable[..., dict]
     super_tiles: tuple[int, ...]
     rs_codecs: tuple[str, ...]
     ag_codecs: tuple[str, ...]
-    default_super_tile: int
-
-    # ``(world_size, link) -> (TwoShotRung, ...)``, ascending. When the caller
-    # did not pin ``super_tile``,
-    # ``QuickAllReduceInt4`` builds an engine per rung and selects by payload
-    # size at launch.
-    #
-    # Keyed on world size because the rungs genuinely move with it: publishes
-    # per rank are ``num_tiles / ST * 2(N-1)``, so the batching crossover
-    # arrives sooner the wider the world. Keyed on link because PCIe and xGMI
-    # are tuned separately. An empty ladder means "one super-tile for every
-    # size"; no schedule uses that any more, but the code path stays because
-    # pinning ``super_tile`` still collapses to it.
-    st_ladder: Callable[[int, str], tuple[TwoShotRung, ...]] | None = None
-
-    def ladder_for(
-        self, world_size: int, link: str = "pcie"
-    ) -> tuple[TwoShotRung, ...]:
-        """Rungs for *(link, world_size)*; ``()`` when there is no ladder."""
-        if self.st_ladder is None:
-            return ()
-        return tuple(self.st_ladder(int(world_size), str(link)))
+    # ``(*, world_size, link, arch) -> (TwoShotRung, ...)``: the tuning ladder.
+    st_ladder: Callable[..., tuple[TwoShotRung, ...]]
 
 
 def _build_mesh(
@@ -158,7 +119,6 @@ ALGORITHMS = {
         super_tiles=SUPER_TILES,
         rs_codecs=MESH_CODECS,
         ag_codecs=MESH_CODECS,
-        default_super_tile=8,
         st_ladder=mesh_st_ladder,
     ),
     "ring": _Algorithm(
@@ -167,7 +127,6 @@ ALGORITHMS = {
         super_tiles=RING_SUPER_TILES,
         rs_codecs=RS_CODECS,
         ag_codecs=AG_CODECS,
-        default_super_tile=8,
         st_ladder=ring_st_ladder,
     ),
 }
@@ -229,22 +188,17 @@ class QuickAllReduceInt4:
     ``algorithm`` selects the schedule. Both are two-shot -- reduce-scatter
     then all-gather -- so they are named for the topology of each lap:
 
-    * ``"mesh"`` (default) -- each rank pushes to every one of the ``N-1``
+    * ``"mesh"`` (default): each rank pushes to every one of the ``N-1``
       peers, twice. Two hops. Optimal on a meshed xGMI node.
-    * ``"ring"`` -- ``2(N-1)`` hops, each a single contiguous run into exactly
+    * ``"ring"``: ``2(N-1)`` hops, each a single contiguous run into exactly
       one peer's inbox. Same wire volume (``2(N-1)/N`` of the payload), traded
-      for per-destination locality. Structurally worse at decode sizes and on
-      xGMI -- opt in deliberately.
+      for per-destination locality. Optimal for large messages on PCIe.
 
     ``rs_codec`` and ``ag_codec`` are the wire formats of the ring's two laps.
-    The reduce-scatter lap is the only place the ring loses accuracy the mesh
-    does not -- it requantizes ``N-1`` times where the mesh requantizes once --
-    so it defaults to ``"int6"`` at TP8, where INT4 would cost too much
-    accuracy. The all-gather lap forwards bytes verbatim and contributes a
-    single quantization, so it defaults to ``"int4"`` everywhere and widens
-    only by request.
-
-    Leave both ``None`` to get those defaults.
+    The reduce-scatter lap requantizes ``N-1`` times and it defaults to ``"int6"``
+    at TP8, where INT4 would cost too much accuracy. The all-gather lap forwards
+    bytes verbatim and contributes a single quantization, so it defaults to ``"int4"``
+    everywhere.
 
     ``inbox_memory`` selects how the IPC inbox is allocated:
 
@@ -260,9 +214,9 @@ class QuickAllReduceInt4:
     defaulting to ``QUANT_MIN_PAYLOAD_BYTES``.
 
     ``link`` selects the tuning ladder and is detected from the KFD topology
-    when not given. ``block`` overrides that knob on every rung, ``None``
-    leaving each rung's own value. Both schedules specialise their binary to
-    this rank, so the JIT symbol carries an ``_r<n>_`` field.
+    when not given. ``ladder`` replaces the tuning ladder of the policy, for
+    tests that run other configurations. Both schedules specialise their
+    binary to this rank, so the JIT symbol carries an ``_r<n>_`` field.
     """
 
     def __init__(
@@ -272,15 +226,13 @@ class QuickAllReduceInt4:
         device,
         rank: int,
         world_size: int = WORLD,
-        super_tile: int | None = None,
-        grid_cap: int | None = None,
         inbox_memory: str = "auto",
         min_bytes: int | None = None,
         algorithm: str = DEFAULT_ALGORITHM,
         rs_codec: str | None = None,
         ag_codec: str | None = None,
         link: str | None = None,
-        block: int | None = None,
+        ladder: tuple[TwoShotRung, ...] | None = None,
     ):
         check_world_size(world_size)
         if algorithm not in ALGORITHMS:
@@ -289,58 +241,15 @@ class QuickAllReduceInt4:
             )
         algo = ALGORITHMS[algorithm]
         link = resolve_link(link)
-        if block is not None and block not in SUPPORTED_BLOCKS:
-            raise ValueError(f"block must be one of {SUPPORTED_BLOCKS}, got {block!r}")
-        # ``None`` means "use the schedule's own policy", which for both is
-        # the payload-size ladder. Passing a value pins one super-tile for
-        # every size, which is what the pinned test cases and the tuning
-        # sweeps do.
-        pinned_st = super_tile is not None
-        if super_tile is None:
-            super_tile = algo.default_super_tile
-        if super_tile not in algo.super_tiles:
-            raise ValueError(
-                f"super_tile must be one of {algo.super_tiles} for "
-                f"algorithm={algorithm!r}, got {super_tile!r}"
-            )
         rs_codec, ag_codec = _resolve_codecs(algo, int(world_size), rs_codec, ag_codec)
         _validate_ipc_process_group(
             group, rank=int(rank), world_size=world_size, owner="QuickAllReduceInt4"
         )
         arch = require_arch(owner="QuickAllReduceInt4")
-        cap = DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap)
-        if cap < 1:
-            raise ValueError(f"grid_cap must be positive, got {cap}")
-
-        def _block(rung_block):
-            """A rung's ``block`` with the caller's override."""
-            return int(rung_block if block is None else block)
-
-        # Rungs to build. Pinning ``super_tile`` collapses the ladder to that one rung -- a
-        # caller who named a super-tile gets exactly it, at every size.
-        #
-        # ``grid_cap`` is a *ceiling*, not a pin: it bounds every rung rather
-        # than disabling size-dependent selection. Raising it above a rung's own
-        # cap is a no-op (the rung cap is already sized so ``_grid_x`` never
-        # binds over that rung's payload range), while lowering it constrains
-        # the wire buffer, which is what a caller passing it usually wants.
-        world_ladder = algo.ladder_for(world_size, link)
-        if world_ladder and not pinned_st:
-            ladder = tuple(
-                dataclasses.replace(
-                    r, grid_cap=min(r.grid_cap, cap), block=_block(r.block)
-                )
-                for r in world_ladder
-            )
-        else:
-            ladder = (
-                TwoShotRung(
-                    min_bytes=0,
-                    super_tile=int(super_tile),
-                    grid_cap=cap,
-                    block=_block(BLOCK),
-                ),
-            )
+        if ladder is None:
+            ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
+        if not ladder:
+            raise ValueError("ladder must have at least one rung")
         inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
         self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")
         self.group = group
@@ -348,7 +257,6 @@ class QuickAllReduceInt4:
         self.rank = int(rank)
         self.world_size = int(world_size)
         self.link = link
-        self._grid = cap
         self.inbox_memory = resolved_inbox
         self.algorithm = algorithm
         self.rs_codec = rs_codec
@@ -390,8 +298,7 @@ class QuickAllReduceInt4:
             caps.setdefault((r.super_tile, r.block), r.grid_cap)
         for b in {b for _st, b in list(caps)}:
             caps.setdefault((1, b), min(c for (_st, cb), c in caps.items() if cb == b))
-        self._ladder = ladder if (world_ladder and not pinned_st) else ()
-        self._primary = (ladder[0].super_tile, ladder[0].block)
+        self._ladder = ladder
         self._by_cfg = {}
         try:
             with torch.cuda.device(self._device_index):
@@ -437,8 +344,9 @@ class QuickAllReduceInt4:
             self.close()
             raise
 
-        primary = self._by_cfg[self._primary]
-        self.super_tile, self.block = self._primary
+        # The first rung's shape, reported as this object's own.
+        self.super_tile, self.block = ladder[0].super_tile, ladder[0].block
+        primary = self._by_cfg[(self.super_tile, self.block)]
         self.buf_bytes = primary.buf_bytes
         self.lds_bytes = primary.lds_bytes
         self.tile_bytes = primary.tile_bytes
@@ -468,8 +376,6 @@ class QuickAllReduceInt4:
         and the measurements behind them are in ``MESH_ST_LADDER`` and
         ``RING_ST_LADDER``.
         """
-        if not self._ladder:
-            return self._primary
         rung = select_rung(self._ladder, live_bytes)
         return (rung.super_tile, rung.block)
 
@@ -485,16 +391,8 @@ class QuickAllReduceInt4:
         count; the tile count then only has to confirm there is a whole
         super-tile to take, falling back to the same block's ST=1 engine when
         there is not.
-
-        Without a release fence a publish is nearly free, so the only reason to
-        batch tiles is when there are more of them than blocks -- prefer ST=1
-        and the parallelism it buys.
-
-        With one, that trade inverts: every publish costs a full L2 writeback,
-        and ST=1 pays one per tile per phase. Take a super-tile as soon as
-        there is a whole one to take. Measured on MI350P at 1024x7168, TP4:
-        577.71 us at ST=1 against 269.01 at ST=8.
         """
+
         want, b = self._ladder_cfg(live_bytes)
         num_tiles = self._num_tiles(live_bytes, b)
         if want == 1:
@@ -505,7 +403,7 @@ class QuickAllReduceInt4:
             st = want if num_tiles > self._by_cfg[(want, b)].grid else 1
         return (st, b), num_tiles
 
-    def _grid_x(self, num_tiles: int, super_tile: int, grid: int | None = None) -> int:
+    def _grid_x(self, num_tiles: int, super_tile: int, grid: int) -> int:
         """Blocks to launch for *num_tiles* tiles under *super_tile*.
 
         *grid* is the compile-time cap of the engine that will run, which is
@@ -516,16 +414,11 @@ class QuickAllReduceInt4:
         worth of work: ST=8 across 448 blocks holding one tile each still
         publishes per tile. Hand each block a full super-tile instead, which
         cuts publishes to ``num_tiles / ST`` per phase.
-
-        Bounded below by ``MIN_BATCH_BLOCKS``, because that trade inverts at
-        small sizes: 14 tiles over 2 blocks saves a handful of fences and gives
-        up the whole machine to do it. Measured on MI350P at 32x7168, TP4,
-        61.95 us unbounded against 23.98 with the grid left alone.
         """
         if self._batch_publishes and super_tile != 1:
             batched = max(-(-num_tiles // super_tile), MIN_BATCH_BLOCKS)
             num_tiles = min(num_tiles, batched)
-        return max(1, min(num_tiles, self._grid if grid is None else grid))
+        return max(1, min(num_tiles, grid))
 
     def _launch_args(
         self, eng: _StEngine, inp_ptr, out_ptr, stream, *, live_bytes, num_tiles

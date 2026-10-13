@@ -8,8 +8,10 @@ store and load primitives, and the LDS staging factory. It also contains the
 dataclass definitions for heuristics, i.e., policy definitions for kernel selection.
 """
 
+import enum
 import logging
 from dataclasses import dataclass
+from itertools import pairwise
 
 import flydsl.expr as fx
 from flydsl.expr import rocdl
@@ -35,8 +37,6 @@ PAYLOAD_ALIGN_BYTES = 16
 MAX_PAYLOAD_BYTES = 0xFFFFFFFF
 # Smallest payload a quantized schedule accepts when it is used on its own.
 QUANT_MIN_PAYLOAD_BYTES = 128 << 10
-# No ceiling, as a payload size in bytes.
-NO_MAX = 1 << 62
 
 WORLD = 8  # Default value for world size
 BLOCK = 256
@@ -72,8 +72,8 @@ class OneShotRung:
     """The one-shot kernel configuration for payloads of at least ``min_bytes``.
 
     ``atoms`` and ``block`` both scale the tile, and their product sets the
-    block count. In addition, ``block`` also changes the workgroup size, and ``atoms`` 
-    also changes how many stores one thread has in flight. ``grid_cap`` bounds 
+    block count. In addition, ``block`` also changes the workgroup size, and ``atoms``
+    also changes how many stores one thread has in flight. ``grid_cap`` bounds
     the block count. ``fanout``selects the order of the stores to the peers.
     """
 
@@ -121,68 +121,196 @@ def select_rung(ladder, nbytes: int):
 # that resolve them.
 
 
+class AllReduceAlgorithm(enum.Enum):
+    """The FlyDSL all-reduce algorithms."""
+
+    OneShot = "oneshot"
+    TwoShotMesh = "mesh"
+    TwoShotRing = "ring"
+
+
 @dataclass(frozen=True)
-class FamilyPolicy:
-    """The FlyDSL family boundaries for one cell, in payload bytes.
+class Window:
+    """A range of payload sizes in bytes: ``min`` inclusive, ``max`` exclusive.
 
-    We have three families of all-reduce kernels: one-shot, mesh, and ring.
-    Depending on the interconnect type (PCIe or xGMI), the one-shot is best 
-    for smaller messages, mesh overtakes for bigger messages, and finally ring
-    is the choice for very large messages on PCIe. On xGMI, the ring algorithm
-    is never used. The message size at which the transitions take place depend on 
-    architecture, world size, and interconnect tyope. The FamilyPolicy captures 
-    this.
-
-    * ``oneshot_min`` and ``oneshot_max`` (both inclusive): the one-shot 
-    algorithms's applicability window. 
-    * ``quant_min`` (exclusive): where the quantized mesh overtakes the fastest
-      exact kernel.
-    * ``mesh_max`` (inclusive): where the ring overtakes the mesh.
-    * ``quant_max`` (inclusive): the largest payload for the quantized
-      families.
+    ``max=None`` means no upper limit. ``min == max`` is an empty window, which
+    disables the algorithm it belongs to.
     """
 
-    oneshot_max: int
-    quant_min: int
-    mesh_max: int
-    oneshot_min: int = 0
-    quant_max: int = NO_MAX
+    min: int
+    max: int | None = None
 
     def __post_init__(self):
-        if self.oneshot_max <= 0 or self.quant_min <= 0:
-            raise ValueError(
-                f"oneshot_max ({self.oneshot_max}) and quant_min "
-                f"({self.quant_min}) must be positive"
-            )
-        if self.mesh_max < self.quant_min:
-            raise ValueError(
-                f"mesh_max ({self.mesh_max}) must be >= quant_min "
-                f"({self.quant_min}); the families partition by size"
-            )
-        if self.oneshot_min < 0:
-            raise ValueError(f"oneshot_min ({self.oneshot_min}) must be non-negative")
+        if self.min < 0:
+            raise ValueError(f"window min ({self.min}) must be non-negative")
+        if self.max is not None and self.max < self.min:
+            raise ValueError(f"window max ({self.max}) must be >= min ({self.min})")
+
+    @property
+    def is_empty(self) -> bool:
+        return self.max is not None and self.max <= self.min
+
+    def contains(self, nbytes: int) -> bool:
+        return self.min <= nbytes and (self.max is None or nbytes < self.max)
+
+    def inclusive_range(self) -> tuple[int, int]:
+        """``(first, last)`` payload sizes, both inclusive, for the callers
+        that need finite bounds. An unbounded window ends at
+        ``MAX_PAYLOAD_BYTES``."""
+        return self.min, MAX_PAYLOAD_BYTES if self.max is None else self.max - 1
+
+    def __str__(self) -> str:
+        return f"[{_fmt_bytes(self.min)}, {_fmt_bytes(self.max)})"
+
+
+def _fmt_bytes(nbytes: int | None) -> str:
+    if nbytes is None:
+        return "inf"
+    for unit, shift in (("MiB", 20), ("KiB", 10)):
+        if nbytes >= 1 << shift and nbytes % (1 << shift) == 0:
+            return f"{nbytes >> shift} {unit}"
+    return f"{nbytes} B"
+
+
+def _covered(lo: int, hi: int | None, windows) -> bool:
+    """Whether the union of *windows* covers ``[lo, hi)``."""
+    cur = lo
+    for w in sorted(windows, key=lambda w: w.min):
+        if hi is not None and cur >= hi:
+            return True
+        if w.min <= cur and (w.max is None or cur < w.max):
+            if w.max is None:
+                return True
+            cur = w.max
+    return hi is not None and cur >= hi
 
 
 @dataclass(frozen=True)
-class OneShotPolicy:
-    """The exact one-shot's window, as the custom-all-reduce slot sees it."""
+class FamilyPolicy:
+    """Which algorithm runs which payload sizes, on one platform.
 
-    max_bytes: int
-    min_bytes: int = 0
+    We have three families of all-reduce kernels: one-shot, mesh and ring.
+    Depending on the interconnect type (PCIe or xGMI), the one-shot is best for
+    smaller messages, the mesh overtakes for bigger messages, and finally the
+    ring is the choice for very large messages on PCIe. On xGMI, the ring
+    algorithm is never used. The message sizes at which the transitions take
+    place depend on the architecture, the world size and the interconnect type,
+    so a policy belongs to one ``(arch, link, world_size)``.
 
+    Each algorithm has a ``Window`` of payload sizes. ``None`` or an empty
+    window disables the algorithm. The windows do not overlap. A payload in no
+    window goes to ``cross_device_reduce`` or RCCL.
 
-@dataclass(frozen=True)
-class QuantPolicy:
-    """The quantized families' window, as the quick-reduce slot sees it.
-
-    ``floor`` is **exclusive**: dispatch only when ``nbytes > floor``. At or
-    below it an exact kernel is faster, and declining is what lets the payload
-    reach the custom-all-reduce slot that hosts the exact kernels.
+    ``oneshot``, ``mesh`` and ``ring`` apply with quantization on
+    (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``). With quantization off, only
+    the one-shot runs, in ``exact_oneshot``, or in ``oneshot`` when
+    ``exact_oneshot`` is None. ``exact_oneshot`` exists because the one-shot
+    beats ``cross_device_reduce`` well past the point where the mesh takes
+    over.
     """
 
-    floor: int
-    mesh_max: int
-    max_bytes: int
+    arch: str
+    link: str
+    world_size: int
+    oneshot: Window | None
+    mesh: Window | None
+    ring: Window | None
+    exact_oneshot: Window | None = None
+
+    def __post_init__(self):
+        if self.arch not in SUPPORTED_ARCHS:
+            raise ValueError(
+                f"arch must be one of {SUPPORTED_ARCHS}, got {self.arch!r}"
+            )
+        if self.link not in LINKS:
+            raise ValueError(f"link must be one of {LINKS}, got {self.link!r}")
+        if self.world_size not in SUPPORTED_WORLDS:
+            raise ValueError(
+                f"world_size must be one of {SUPPORTED_WORLDS}, got {self.world_size}"
+            )
+        live = sorted(
+            (
+                (alg, w)
+                for alg, w in self._quantized_windows()
+                if w is not None and not w.is_empty
+            ),
+            key=lambda aw: aw[1].min,
+        )
+        for (a, wa), (b, wb) in pairwise(live):
+            if wa.max is None or wa.max > wb.min:
+                raise ValueError(
+                    f"{self._cell()}: the {a.value} window {wa} overlaps the "
+                    f"{b.value} window {wb}"
+                )
+        exact = self.exact_oneshot
+        if exact is not None and not exact.is_empty:
+            one = self.oneshot
+            quant = [w for _alg, w in live if _alg != AllReduceAlgorithm.OneShot]
+            if one is None or one.is_empty:
+                extra = [(exact.min, exact.max)]
+            elif one.min != exact.min or not (
+                exact.max is None or (one.max is not None and one.max <= exact.max)
+            ):
+                raise ValueError(
+                    f"{self._cell()}: exact_oneshot {exact} must start where "
+                    f"oneshot {one} starts and end at or above it"
+                )
+            else:
+                extra = [(one.max, exact.max)] if one.max != exact.max else []
+            for lo, hi in extra:
+                if not _covered(lo, hi, quant):
+                    raise ValueError(
+                        f"{self._cell()}: exact_oneshot {exact} adds payloads "
+                        f"[{_fmt_bytes(lo)}, {_fmt_bytes(hi)}) that the mesh "
+                        "and ring windows do not cover"
+                    )
+
+    def _cell(self) -> str:
+        return f"{self.arch}/{self.link}/TP{self.world_size}"
+
+    def _quantized_windows(self):
+        return (
+            (AllReduceAlgorithm.OneShot, self.oneshot),
+            (AllReduceAlgorithm.TwoShotMesh, self.mesh),
+            (AllReduceAlgorithm.TwoShotRing, self.ring),
+        )
+
+    def window(
+        self, algorithm: AllReduceAlgorithm, *, quantized: bool
+    ) -> Window | None:
+        """The window of *algorithm*, or None if it is disabled."""
+        if quantized:
+            w = dict(self._quantized_windows())[algorithm]
+        elif algorithm == AllReduceAlgorithm.OneShot:
+            w = self.exact_oneshot if self.exact_oneshot is not None else self.oneshot
+        else:
+            w = None
+        return None if w is None or w.is_empty else w
+
+    def algorithms(self, *, quantized: bool) -> tuple[AllReduceAlgorithm, ...]:
+        """The enabled algorithms, in payload order."""
+        enabled = [
+            (w.min, alg)
+            for alg in AllReduceAlgorithm
+            if (w := self.window(alg, quantized=quantized)) is not None
+        ]
+        return tuple(alg for _min, alg in sorted(enabled, key=lambda e: e[0]))
+
+    def select(self, nbytes: int, *, quantized: bool) -> AllReduceAlgorithm | None:
+        """The algorithm that runs *nbytes*, or None for
+        ``cross_device_reduce`` or RCCL."""
+        for alg in self.algorithms(quantized=quantized):
+            if self.window(alg, quantized=quantized).contains(nbytes):
+                return alg
+        return None
+
+    def describe(self, *, quantized: bool) -> str:
+        """The enabled windows, for logs."""
+        parts = [
+            f"{alg.value} {self.window(alg, quantized=quantized)}"
+            for alg in self.algorithms(quantized=quantized)
+        ]
+        return ", ".join(parts) or "no FlyDSL algorithm"
 
 
 # Buffer aux bits on gfx942/gfx950. This is LLVM's CPol encoding, which the

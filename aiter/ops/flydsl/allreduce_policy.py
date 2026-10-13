@@ -16,50 +16,38 @@ Kernels
 
 The decisions come in two levels.
 
-Level 1: which kernel
-=====================
+Level 1: which algorithm
+========================
 
-The kernel is a function of the payload size, and the boundaries are a
-``FamilyPolicy`` row per ``(link, world_size)`` cell: ``FAMILY_POLICY``, or
-``ARCH_FAMILY_POLICY`` on an arch with its own measurements. On the payload
-axis, a row reads::
-
-    exact (quick reduce off):
-      0 --- one-shot --- oneshot_max --- cross_device_reduce / RCCL ------->
+``FAMILY_POLICIES`` has one ``FamilyPolicy`` per ``(arch, link,
+world_size)``. A policy has one ``Window`` of payload sizes per algorithm
+(``AllReduceAlgorithm``): ``min`` inclusive, ``max`` exclusive, ``max=None``
+for no upper limit. A missing or empty window disables the algorithm, and a
+payload in no window goes to other Aiter all-reduce implementations.
+On the payload axis, a policy reads::
 
     quantized (AITER_QUICK_REDUCE_QUANTIZATION=INT4):
-      0 --- one-shot --- oneshot_max --- cdr --- quant_min --- mesh
-                                                     --- mesh_max --- ring --->
+      0 --- oneshot ---)    (gap)    [--- mesh ---)[--- ring --->
 
-The kernels do not share a dispatcher. Each lives in the aiter slot whose
-accuracy contract it matches, and this module gives each slot its own view of
-the row:
+    exact (quick reduce off):
+      0 --- exact_oneshot ---)    cross_device_reduce / RCCL --->
 
-* ``resolve_oneshot`` -> ``CustomAllreduce``, which is exact: the one-shot
-  window.
-* ``resolve_quant`` -> ``QuickAllReduce``, which can quantize: the mesh and
-  ring windows.
-
-``CudaCommunicator.all_reduce`` tries ``QuickAllReduce`` first, so a payload
-above ``quant_min`` goes to the mesh or the ring, and the rest go to
-``CustomAllreduce``. ``route`` is that composition in one function.
-``cross_device_reduce`` can be faster than both FlyDSL families, so
-``quant_min`` can be above ``oneshot_max``: the payloads between the two then
-go to ``cross_device_reduce`` and stay exact.
-
+``resolve_family_policy`` gives the policy for a given rank: the table row for the
+host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
+overrides applied.
 Level 2: which configuration
 ============================
 
-Each kernel has a tuning ladder per ``(link, world_size)``: ``ONESHOT_LADDER``,
-``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a tuple of rungs in
-ascending ``min_bytes`` order, and a payload runs on the last rung whose
-``min_bytes`` is at most its size (``pick_rung``). The host builds one engine
-per rung. The mesh and ring hosts then refine the super-tile at launch, from
-the tile count of the payload; refer to ``QuickAllReduceInt4._pick_cfg``.
+Each algorithm has a tuning ladder per ``(arch, link, world_size)``:
+``ONESHOT_LADDER``, ``MESH_ST_LADDER`` and ``RING_ST_LADDER``. A ladder is a
+tuple of rungs in ascending ``min_bytes`` order, and a payload runs on the last
+rung whose ``min_bytes`` is at most its size (``select_rung``). The host builds
+one engine per rung.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import logging
 import os
@@ -67,92 +55,136 @@ import os
 from .kernels.comm.allreduce_shared import (
     BLOCK,
     LINKS,
-    NO_MAX,
     SUPPORTED_ARCHS,  # noqa: F401  -- re-exported for the dispatchers
     SUPPORTED_WORLDS,
+    AllReduceAlgorithm,
     FamilyPolicy,
-    OneShotPolicy,
     OneShotRung,
-    QuantPolicy,
     TwoShotRung,
-)
-from .kernels.comm.one_shot_allreduce import (
-    DEFAULT_ATOMS,
-    DEFAULT_BLOCK,
-    DEFAULT_FANOUT,
-    DEFAULT_GRID_CAP,
+    Window,
 )
 
 logger = logging.getLogger("aiter")
 
 
-# Level 1: kernel boundaries
-# ==========================
+# Level 1: algorithm boundaries
+# ==============================
 
-FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
-    # --- PCIe: measured on gfx950 (MI350P) -----------------------------------
-    ("pcie", 2): FamilyPolicy(
-        oneshot_max=64 << 20,
-        quant_min=384 << 10,
-        mesh_max=NO_MAX,
+KiB = 1 << 10
+MiB = 1 << 20
+
+FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=2,
+        oneshot=Window(0, 384 * KiB),
+        mesh=Window(384 * KiB, 128 * MiB),
+        ring=Window(128 * MiB, None),
+        exact_oneshot=Window(0, 1536 * KiB),
     ),
-    ("pcie", 4): FamilyPolicy(
-        oneshot_max=1 << 20,
-        quant_min=128 << 10,
-        mesh_max=16 << 20,
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=4,
+        oneshot=Window(0, 384 * KiB),
+        mesh=Window(384 * KiB, 128 * MiB),
+        ring=Window(128 * MiB, None),
     ),
-    ("pcie", 8): FamilyPolicy(
-        oneshot_max=1 << 20,
-        quant_min=96 << 10,
-        mesh_max=24 << 20,
+    FamilyPolicy(
+        arch="gfx942",
+        link="xgmi",
+        world_size=8,
+        oneshot=Window(0, 168 * KiB),
+        mesh=Window(256 * KiB, 128 * MiB),
+        ring=Window(128 * MiB, None),
     ),
-    # --- xGMI: measured on gfx942 (MI300X) -----------------------------------
-    ("xgmi", 2): FamilyPolicy(
-        oneshot_max=1536 << 10,
-        quant_min=384 << 10,
-        mesh_max=128 << 20,
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=2,
+        oneshot=Window(0, 448 * KiB),
+        mesh=Window(448 * KiB, None),
+        ring=None,
+        exact_oneshot=Window(0, 3 * MiB),
     ),
-    ("xgmi", 4): FamilyPolicy(
-        oneshot_max=384 << 10,
-        quant_min=384 << 10,
-        mesh_max=128 << 20,
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=4,
+        oneshot=Window(0, 160 * KiB),
+        mesh=Window(960 * KiB, None),
+        ring=None,
     ),
-    ("xgmi", 8): FamilyPolicy(
-        oneshot_max=168 << 10,
-        quant_min=256 << 10,
-        mesh_max=128 << 20,
+    FamilyPolicy(
+        arch="gfx950",
+        link="xgmi",
+        world_size=8,
+        oneshot=Window(0, 96 * KiB),
+        mesh=Window(1600 * KiB, None),
+        ring=None,
     ),
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=2,
+        oneshot=Window(0, 384 * KiB),
+        mesh=Window(384 * KiB, None),
+        ring=None,
+        exact_oneshot=Window(0, 64 * MiB),
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=4,
+        oneshot=Window(0, 128 * KiB),
+        mesh=Window(128 * KiB, 16 * MiB),
+        ring=Window(16 * MiB, None),
+        exact_oneshot=Window(0, 1 * MiB),
+    ),
+    FamilyPolicy(
+        arch="gfx950",
+        link="pcie",
+        world_size=8,
+        oneshot=Window(0, 96 * KiB),
+        mesh=Window(96 * KiB, 24 * MiB),
+        ring=Window(24 * MiB, None),
+        exact_oneshot=Window(0, 1 * MiB),
+    ),
+)
+
+
+class NoPolicyError(ValueError):
+    """There is no FlyDSL all-reduce policy for the platform."""
+
+
+# Platforms that are not supported, ``(arch, link)``. A lookup raises for them.
+NOT_SUPPORTED_PLATFORMS: dict[tuple[str, str], str] = {
+    ("gfx942", "pcie"): "gfx942 has no PCIe-only device",
 }
 
-# Rows measured on one arch, keyed ``(arch, link, world_size)``. On that arch
-# they replace the ``FAMILY_POLICY`` row for the same ``(link, world_size)``.
-#
-# * on xGMI, the mesh algorithm is always faster than the ring algorithm.
-# * ``oneshot_max`` is where ``cross_device_reduce`` overtakes the one-shot.
-# * ``quant_min`` is where the mesh overtakes the fastest exact kernel.
-ARCH_FAMILY_POLICY: dict[tuple[str, str, int], FamilyPolicy] = {
-    ("gfx950", "xgmi", 2): FamilyPolicy(
-        oneshot_max=3 << 20,
-        quant_min=448 << 10,
-        mesh_max=NO_MAX,
-    ),
-    ("gfx950", "xgmi", 4): FamilyPolicy(
-        oneshot_max=(160 << 10) - 16,
-        quant_min=960 << 10,
-        mesh_max=NO_MAX,
-    ),
-    ("gfx950", "xgmi", 8): FamilyPolicy(
-        oneshot_max=96 << 10,
-        quant_min=1600 << 10,
-        mesh_max=NO_MAX,
-    ),
-}
+
+def _index(rows):
+    index = {}
+    for row in rows:
+        key = (row.arch, row.link, row.world_size)
+        if key in index:
+            raise ValueError(f"duplicate table entry for {key}")
+        index[key] = row
+    return index
+
+
+_POLICY_BY_KEY = _index(FAMILY_POLICIES)
 
 
 # Level 2: configuration ladders
 # ==============================
 #
-# The ladders were measured on gfx942 for xGMI and on gfx950 for PCIe.
+# The ladders are keyed by ``(arch, link, world_size)``.
+
 
 # One-shot, ``OneShotRung``.
 #
@@ -172,33 +204,49 @@ ARCH_FAMILY_POLICY: dict[tuple[str, str, int], FamilyPolicy] = {
 #                               covers in one round, then the 4 KiB tile.
 #     TP4  atoms=1 cap128 b256 -- one rung over the whole window
 #     TP8  atoms=1 cap128 b128 -- one rung over the whole window
-ONESHOT_LADDER: dict[tuple[str, int], tuple[OneShotRung, ...]] = {
-    ("pcie", 2): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
+ONESHOT_LADDER: dict[tuple[str, str, int], tuple[OneShotRung, ...]] = {
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    ("gfx942", "xgmi", 2): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
         OneShotRung(
-            min_bytes=384 << 10, atoms=4, grid_cap=128, fanout="peer", block=512
+            min_bytes=256 * KiB, atoms=1, grid_cap=128, fanout="peer", block=256
         ),
     ),
-    ("pcie", 4): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
-        OneShotRung(min_bytes=96 << 10, atoms=2, grid_cap=64, fanout="peer", block=512),
+    ("gfx942", "xgmi", 4): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
     ),
-    ("pcie", 8): (
+    ("gfx942", "xgmi", 8): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+    ),
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # TODO: measured on gfx942; tune on gfx950.
+    ("gfx950", "xgmi", 2): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+        OneShotRung(
+            min_bytes=256 * KiB, atoms=1, grid_cap=128, fanout="peer", block=256
+        ),
+    ),
+    ("gfx950", "xgmi", 4): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
+    ),
+    ("gfx950", "xgmi", 8): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+    ),
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    ("gfx950", "pcie", 2): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
+        OneShotRung(
+            min_bytes=384 * KiB, atoms=4, grid_cap=128, fanout="peer", block=512
+        ),
+    ),
+    ("gfx950", "pcie", 4): (
+        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+        OneShotRung(min_bytes=96 * KiB, atoms=2, grid_cap=64, fanout="peer", block=512),
+    ),
+    ("gfx950", "pcie", 8): (
         OneShotRung(min_bytes=0, atoms=1, grid_cap=64, fanout="peer", block=64),
-        OneShotRung(min_bytes=48 << 10, atoms=1, grid_cap=64, fanout="peer", block=256),
-        OneShotRung(min_bytes=192 << 10, atoms=1, grid_cap=64, fanout="peer", block=64),
-    ),
-    ("xgmi", 2): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
-        OneShotRung(
-            min_bytes=256 << 10, atoms=1, grid_cap=128, fanout="peer", block=256
-        ),
-    ),
-    ("xgmi", 4): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=256),
-    ),
-    ("xgmi", 8): (
-        OneShotRung(min_bytes=0, atoms=1, grid_cap=128, fanout="peer", block=128),
+        OneShotRung(min_bytes=48 * KiB, atoms=1, grid_cap=64, fanout="peer", block=256),
+        OneShotRung(min_bytes=192 * KiB, atoms=1, grid_cap=64, fanout="peer", block=64),
     ),
 }
 
@@ -208,82 +256,130 @@ ONESHOT_LADDER: dict[tuple[str, int], tuple[OneShotRung, ...]] = {
 #         Block 512 from 4 MiB.
 #   PCIe  TP2 ST=1, then ST=8 from 4 MiB. TP4 ST=1, then ST=8 from 768 KiB.
 #         TP8 ST=8 everywhere.
-MESH_ST_LADDER: dict[tuple[str, int], tuple[TwoShotRung, ...]] = {
-    ("xgmi", 2): (
+MESH_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    ("gfx942", "xgmi", 2): (
         TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
     ),
-    ("xgmi", 4): (
+    ("gfx942", "xgmi", 4): (
         TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
     ),
-    ("xgmi", 8): (
+    ("gfx942", "xgmi", 8): (
         TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=1, grid_cap=128, block=512),
-        TwoShotRung(min_bytes=6 << 20, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
     ),
-    ("pcie", 2): (
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # TODO: measured on gfx942; tune on gfx950.
+    ("gfx950", "xgmi", 2): (
         TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=4 << 20, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
     ),
-    ("pcie", 4): (
+    ("gfx950", "xgmi", 4): (
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+    ),
+    ("gfx950", "xgmi", 8): (
         TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
-        TwoShotRung(min_bytes=768 << 10, super_tile=8, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=1, grid_cap=128, block=512),
+        TwoShotRung(min_bytes=6 * MiB, super_tile=8, grid_cap=128, block=512),
     ),
-    ("pcie", 8): (TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),),
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    ("gfx950", "pcie", 2): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=4 * MiB, super_tile=8, grid_cap=128, block=512),
+    ),
+    ("gfx950", "pcie", 4): (
+        TwoShotRung(min_bytes=0, super_tile=1, grid_cap=128, block=256),
+        TwoShotRung(min_bytes=768 * KiB, super_tile=8, grid_cap=128, block=512),
+    ),
+    ("gfx950", "pcie", 8): (
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=512),
+    ),
 }
 
 # Ring, ``TwoShotRung``. The ring publishes ``2(N-1)`` times per super-tile, so
 # a larger payload wants a larger super-tile.
-RING_ST_LADDER: dict[tuple[str, int], tuple[TwoShotRung, ...]] = {
-    ("xgmi", 2): (
+RING_ST_LADDER: dict[tuple[str, str, int], tuple[TwoShotRung, ...]] = {
+    # --- gfx942 (MI300X) / xGMI ----------------------------------------------
+    ("gfx942", "xgmi", 2): (
         TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 << 20, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
     ),
-    ("xgmi", 4): (
+    ("gfx942", "xgmi", 4): (
         TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=24 << 20, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 << 20, super_tile=32, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
     ),
-    ("xgmi", 8): (
+    ("gfx942", "xgmi", 8): (
         TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
-        TwoShotRung(min_bytes=48 << 20, super_tile=32, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
     ),
-    ("pcie", 2): (TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=512),),
-    ("pcie", 4): (TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),),
-    ("pcie", 8): (TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),),
+    # --- gfx950 (MI355X) / xGMI ----------------------------------------------
+    # TODO: measured on gfx942; tune on gfx950.
+    ("gfx950", "xgmi", 2): (
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
+    ),
+    ("gfx950", "xgmi", 4): (
+        TwoShotRung(min_bytes=0, super_tile=8, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=24 * MiB, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
+    ),
+    ("gfx950", "xgmi", 8): (
+        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=BLOCK),
+        TwoShotRung(min_bytes=48 * MiB, super_tile=32, grid_cap=128, block=BLOCK),
+    ),
+    # --- gfx950 (MI350P) / PCIe ----------------------------------------------
+    ("gfx950", "pcie", 2): (
+        TwoShotRung(min_bytes=0, super_tile=16, grid_cap=128, block=512),
+    ),
+    ("gfx950", "pcie", 4): (
+        TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),
+    ),
+    ("gfx950", "pcie", 8): (
+        TwoShotRung(min_bytes=0, super_tile=32, grid_cap=128, block=512),
+    ),
 }
 
 
-def oneshot_ladder(world_size: int, link: str = "pcie") -> tuple[OneShotRung, ...]:
-    """Rungs for *(link, world_size)*, or a single default rung if unlisted.
-
-    *link* defaults to ``"pcie"`` so a caller that has not resolved the fabric
-    gets the conservative table: its fatter tiles cost throughput on xGMI but
-    are never wrong in the sense of failing.
-    """
-    default = OneShotRung(
-        min_bytes=0,
-        atoms=DEFAULT_ATOMS,
-        grid_cap=DEFAULT_GRID_CAP,
-        fanout=DEFAULT_FANOUT,
-        block=DEFAULT_BLOCK,
-    )
-    return ONESHOT_LADDER.get((str(link), int(world_size)), (default,))
+def _ladder(table: dict, name: str, arch, link: str, world_size: int):
+    arch = detect_arch() if arch is None else arch
+    _check_platform(arch, link, int(world_size))
+    rungs = table.get((arch, link, int(world_size)))
+    if rungs is None:
+        raise NoPolicyError(f"no {name} ladder for {arch}/{link}/TP{world_size}")
+    return rungs
 
 
-def mesh_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ...]:
-    """Rungs for *(link, world_size)*, or ``()`` when there is no ladder."""
-    return MESH_ST_LADDER.get((str(link), int(world_size)), ())
+def oneshot_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[OneShotRung, ...]:
+    """The one-shot rungs for *(arch, link, world_size)*. *arch* defaults to
+    this host's."""
+    return _ladder(ONESHOT_LADDER, "one-shot", arch, link, world_size)
 
 
-def ring_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ...]:
-    """Rungs for *(link, world_size)*, or the PCIe TP4 shape for an unlisted one."""
-    return RING_ST_LADDER.get((str(link), int(world_size)), RING_ST_LADDER[("pcie", 4)])
+def mesh_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[TwoShotRung, ...]:
+    """The mesh rungs for *(arch, link, world_size)*. *arch* defaults to this
+    host's."""
+    return _ladder(MESH_ST_LADDER, "mesh", arch, link, world_size)
+
+
+def ring_st_ladder(
+    *, world_size: int, link: str, arch: str | None = None
+) -> tuple[TwoShotRung, ...]:
+    """The ring rungs for *(arch, link, world_size)*. *arch* defaults to this
+    host's."""
+    return _ladder(RING_ST_LADDER, "ring", arch, link, world_size)
 
 
 # Floor on the block count of the mesh and the ring when they batch publishes
-# into super-tiles. Shrinking the grid trades parallelism for fewer release fences, 
+# into super-tiles. Shrinking the grid trades parallelism for fewer release fences,
 # which is only a good trade once there are enough fences to matter.
 MIN_BATCH_BLOCKS = 32
 
@@ -298,17 +394,83 @@ RS_INT6_MIN_WORLD = 8
 # ====================
 
 
-def _env_int(name: str) -> int | None:
-    """A non-negative override from *name*, or None. ``-1`` means "use the table"."""
+_UNSET = object()
+
+
+def _env_bound(name: str, *, is_max: bool):
+    """The window bound that the variable *name* sets, or ``_UNSET``.
+
+    Unset, empty or ``-1``: ``_UNSET``. ``none`` or ``inf``: None, no upper
+    limit, for a maximum only. Anything else that is not a non-negative
+    integer: a warning, and ``_UNSET``.
+    """
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
-        return None
+        return _UNSET
+    text = raw.strip().lower()
+    if text in ("none", "inf"):
+        if is_max:
+            return None
+        logger.warning(
+            "FlyDSL all-reduce: ignoring %s=%r, a minimum is a number", name, raw
+        )
+        return _UNSET
     try:
-        val = int(raw)
+        val = int(text)
     except ValueError:
-        logger.warning("FlyDSL QR: ignoring %s=%r, expected an integer", name, raw)
-        return None
-    return None if val < 0 else val
+        val = -2
+    if val == -1:
+        return _UNSET
+    if val < 0:
+        logger.warning(
+            "FlyDSL all-reduce: ignoring %s=%r, expected bytes, -1, none or inf",
+            name,
+            raw,
+        )
+        return _UNSET
+    return val
+
+
+# The environment variables that override each window, as their infix.
+_WINDOW_ENV = {
+    AllReduceAlgorithm.OneShot: "ONESHOT",
+    AllReduceAlgorithm.TwoShotMesh: "MESH",
+    AllReduceAlgorithm.TwoShotRing: "RING",
+}
+
+
+def _override(window: Window | None, lo, hi) -> Window | None:
+    if lo is _UNSET and hi is _UNSET:
+        return window
+    if hi == 0:
+        # A maximum of 0 disables the algorithm, whatever its minimum.
+        return Window(0, 0)
+    base = Window(0, None) if window is None else window
+    return Window(base.min if lo is _UNSET else lo, base.max if hi is _UNSET else hi)
+
+
+def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
+    """*policy* with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES`` overrides."""
+
+    bounds = {
+        alg: (
+            _env_bound(f"AITER_FLY_AR_{infix}_MIN_BYTES", is_max=False),
+            _env_bound(f"AITER_FLY_AR_{infix}_MAX_BYTES", is_max=True),
+        )
+        for alg, infix in _WINDOW_ENV.items()
+    }
+    one_lo, one_hi = bounds[AllReduceAlgorithm.OneShot]
+    return dataclasses.replace(
+        policy,
+        oneshot=_override(policy.oneshot, one_lo, one_hi),
+        mesh=_override(policy.mesh, *bounds[AllReduceAlgorithm.TwoShotMesh]),
+        ring=_override(policy.ring, *bounds[AllReduceAlgorithm.TwoShotRing]),
+        exact_oneshot=(
+            None
+            if policy.exact_oneshot is None
+            else _override(policy.exact_oneshot, one_lo, one_hi)
+        ),
+    )
 
 
 def enabled() -> bool:
@@ -357,108 +519,36 @@ def detect_link() -> str:
 # ===================
 
 
-def family_policy(link: str, world_size: int, arch: str | None = None) -> FamilyPolicy:
-    """The table row for *(arch, link, world_size)*, without overrides."""
+def _check_platform(arch: str, link: str, world_size: int) -> None:
     if link not in LINKS:
         raise ValueError(f"link must be one of {LINKS}, got {link!r}")
     if world_size not in SUPPORTED_WORLDS:
         raise ValueError(
             f"world_size must be one of {SUPPORTED_WORLDS}, got {world_size}"
         )
-    if arch is None:
-        arch = detect_arch()
-    row = ARCH_FAMILY_POLICY.get((arch, link, int(world_size)))
-    return FAMILY_POLICY[(link, int(world_size))] if row is None else row
+    reason = NOT_SUPPORTED_PLATFORMS.get((arch, link))
+    if reason is not None:
+        raise NoPolicyError(f"no FlyDSL all-reduce for {arch}/{link}: {reason}")
 
 
-def resolve_oneshot_policy(
-    link: str, world_size: int, arch: str | None = None
-) -> OneShotPolicy:
-    """The one-shot's window for a rank, environment overrides applied.
+def family_policy(*, arch: str, link: str, world_size: int) -> FamilyPolicy:
+    """The table row for *(arch, link, world_size)*, without overrides."""
+    _check_platform(arch, link, int(world_size))
+    row = _POLICY_BY_KEY.get((arch, link, int(world_size)))
+    if row is None:
+        raise NoPolicyError(
+            f"no FlyDSL all-reduce policy for {arch}/{link}/TP{world_size}"
+        )
+    return row
 
-    ``AITER_FLY_AR_ONESHOT_MIN_BYTES`` overrides ``oneshot_min`` and
-    ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides ``oneshot_max``. ``-1`` on
-    either means "use the table".
-    """
-    row = family_policy(link, world_size, arch)
-    max_override = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
-    min_override = _env_int("AITER_FLY_AR_ONESHOT_MIN_BYTES")
-    return OneShotPolicy(
-        max_bytes=row.oneshot_max if max_override is None else max_override,
-        min_bytes=row.oneshot_min if min_override is None else min_override,
+
+def resolve_family_policy(
+    *, world_size: int, arch: str | None = None, link: str | None = None
+) -> FamilyPolicy:
+    """The policy of this rank, with the environment overrides applied."""
+    row = family_policy(
+        arch=detect_arch() if arch is None else arch,
+        link=resolve_link(link),
+        world_size=world_size,
     )
-
-
-def resolve_quant_policy(link: str, world_size: int, arch: str | None = None) -> QuantPolicy:
-    """The mesh and ring windows for a rank, environment overrides applied.
-
-    ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides ``quant_min`` too, so that one
-    override moves the one boundary between the one-shot and the mesh.
-    ``AITER_FLY_AR_MESH_MAX_BYTES`` overrides ``mesh_max``.
-    """
-    row = family_policy(link, world_size, arch)
-    floor = _env_int("AITER_FLY_AR_ONESHOT_MAX_BYTES")
-    if floor is None:
-        floor = row.quant_min
-    mesh = _env_int("AITER_FLY_AR_MESH_MAX_BYTES")
-    if mesh is None:
-        mesh = row.mesh_max
-    # The families partition by size; an override must not invert them.
-    mesh = max(mesh, floor)
-    return QuantPolicy(floor=floor, mesh_max=mesh, max_bytes=row.quant_max)
-
-
-def resolve_quant_family(nbytes: int, policy: QuantPolicy) -> str:
-    """``"mesh"`` | ``"ring"`` for a payload of *nbytes*.
-
-    Assumes ``nbytes > policy.floor``; below that the caller should have
-    declined so the payload reaches an exact kernel.
-    """
-    return "mesh" if nbytes <= policy.mesh_max else "ring"
-
-
-def quant_family_range(family: str, policy: QuantPolicy) -> tuple[int, int]:
-    """Payload bytes (inclusive) ``pick_quant_family`` sends to *family*."""
-    if family == "mesh":
-        return policy.floor + 1, min(policy.mesh_max, policy.max_bytes)
-    if family == "ring":
-        return policy.mesh_max + 1, policy.max_bytes
-    raise ValueError(f"family must be 'mesh' or 'ring', got {family!r}")
-
-
-def quant_families_reachable(policy: QuantPolicy) -> tuple[str, ...]:
-    """Quantized families a *policy* can ever select, in size order."""
-    out = []
-    if policy.mesh_max > policy.floor:
-        out.append("mesh")
-    if policy.max_bytes > policy.mesh_max:
-        out.append("ring")
-    return tuple(out)
-
-
-def route(
-    nbytes: int,
-    link: str,
-    world_size: int,
-    *,
-    quantized: bool,
-    arch: str | None = None,
-) -> str:
-    """The kernel production dispatch runs for a payload of *nbytes*.
-
-    ``"oneshot"``, ``"mesh"``, ``"ring"``, or ``"fallback"`` for
-    ``cross_device_reduce`` and RCCL. *quantized* is whether the quick-reduce
-    slot is open (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``).
-
-    The slots are tried in the order of ``CudaCommunicator.all_reduce``:
-    quick reduce, then custom all-reduce. Only the payload size is
-    considered; the slots also check dtype, alignment and contiguity.
-    """
-    if quantized:
-        quant = resolve_quant_policy(link, world_size, arch)
-        if quant.floor < nbytes <= quant.max_bytes:
-            return resolve_quant_family(nbytes, quant)
-    one = resolve_oneshot_policy(link, world_size, arch)
-    if one.min_bytes <= nbytes <= one.max_bytes:
-        return "oneshot"
-    return "fallback"
+    return apply_env_overrides(row)

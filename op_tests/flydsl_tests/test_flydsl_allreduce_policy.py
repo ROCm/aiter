@@ -27,136 +27,239 @@ from aiter.ops.flydsl.allreduce_policy import (
     oneshot_ladder,
     ring_st_ladder,
 )
-from aiter.ops.flydsl.kernels.comm.allreduce_shared import SUPPORTED_BLOCKS
+from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
+    SUPPORTED_BLOCKS,
+    AllReduceAlgorithm,
+    FamilyPolicy,
+    Window,
+)
 from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4 import SUPER_TILES
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_int4_ring import RING_SUPER_TILES
-from aiter.ops.flydsl.one_shot_allreduce import max_payload_bytes
+from aiter.ops.flydsl.one_shot_allreduce import resolve_oneshot_max_bytes
 
 WORLDS = P.SUPPORTED_WORLDS
-# Every arch with policy rows of its own, and one without (``FAMILY_POLICY``).
 ARCHES = P.SUPPORTED_ARCHS
-CELLS = [(link, ws, arch) for arch in ARCHES for link in P.LINKS for ws in WORLDS]
+# Every platform that exists, as ``(link, world_size, arch)``.
+CELLS = [
+    (link, ws, arch)
+    for arch in ARCHES
+    for link in P.LINKS
+    for ws in WORLDS
+    if (arch, link) not in P.NOT_SUPPORTED_PLATFORMS
+]
+ONESHOT = AllReduceAlgorithm.OneShot
+MESH = AllReduceAlgorithm.TwoShotMesh
+RING = AllReduceAlgorithm.TwoShotRing
+
+
+def _row(link, ws, arch):
+    return P.family_policy(arch=arch, link=link, world_size=ws)
+
+
+def test_every_platform_has_one_policy():
+    """One row per existing ``(arch, link, world_size)``, and none for a
+    platform that does not exist."""
+    keys = [(r.arch, r.link, r.world_size) for r in P.FAMILY_POLICIES]
+    assert len(keys) == len(set(keys))
+    assert sorted(keys) == sorted((a, link, ws) for link, ws, a in CELLS)
+
+
+def test_no_such_platform_raises():
+    for (arch, link), reason in P.NOT_SUPPORTED_PLATFORMS.items():
+        with pytest.raises(ValueError, match=reason):
+            P.family_policy(arch=arch, link=link, world_size=4)
+
+
+def _policy(**windows):
+    return FamilyPolicy(arch="gfx950", link="pcie", world_size=4, **windows)
+
+
+def test_window_bounds():
+    w = Window(16, 64)
+    assert not w.contains(0) and w.contains(16) and w.contains(48)
+    assert not w.contains(64)
+    assert Window(16, None).contains(1 << 40)
+    assert Window(32, 32).is_empty and not Window(32, 32).contains(32)
+    with pytest.raises(ValueError):
+        Window(64, 16)
+    with pytest.raises(ValueError):
+        Window(-16, None)
+
+
+def test_windows_must_not_overlap():
+    with pytest.raises(ValueError, match="overlaps"):
+        _policy(oneshot=Window(0, 256), mesh=Window(128, None), ring=None)
+    with pytest.raises(ValueError, match="overlaps"):
+        # An unbounded window must be the last one.
+        _policy(oneshot=None, mesh=Window(0, None), ring=Window(1 << 20, None))
+    # Gaps and disabled algorithms are fine.
+    p = _policy(oneshot=Window(0, 64), mesh=Window(128, None), ring=Window(5, 5))
+    assert p.algorithms(quantized=True) == (ONESHOT, MESH)
+    assert p.window(RING, quantized=True) is None
+    assert p.select(96, quantized=True) is None
+
+
+def test_exact_oneshot_must_extend_into_the_quantized_windows():
+    # The extension lies in the mesh window: fine.
+    p = _policy(
+        oneshot=Window(0, 128),
+        mesh=Window(128, None),
+        ring=None,
+        exact_oneshot=Window(0, 1024),
+    )
+    assert p.select(512, quantized=True) == MESH
+    assert p.select(512, quantized=False) == ONESHOT
+    assert p.select(2048, quantized=False) is None
+    assert p.window(MESH, quantized=False) is None
+    # The extension reaches a gap that CustomAllreduce would serve with the
+    # one-shot while select() says cross_device_reduce: rejected.
+    with pytest.raises(ValueError, match="do not cover"):
+        _policy(
+            oneshot=Window(0, 128),
+            mesh=Window(512, None),
+            ring=None,
+            exact_oneshot=Window(0, 1024),
+        )
 
 
 @pytest.mark.parametrize("cell", CELLS)
-def test_resolved_slots_partition_by_size(cell):
-    """Each slot's own view must be internally ordered.
+def test_quantized_algorithms_cover_the_axis_in_order(cell):
+    """With quantization on, the enabled windows read one-shot, mesh, ring in
+    payload order."""
+    order = _row(*cell).algorithms(quantized=True)
+    assert list(order) == [a for a in (ONESHOT, MESH, RING) if a in order]
 
-    The two views do not have to meet -- where ``cross_device_reduce`` beats
-    both FlyDSL families they may leave a gap -- but neither may be inverted.
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_dispatch_is_monotone(cell):
+    """The algorithm never goes backwards as the payload grows.
+
+    ``fallback`` (``cross_device_reduce``) sits between the one-shot and the
+    mesh: where it beats both FlyDSL families, the payload falls through to
+    it, and only larger payloads reach the mesh.
     """
-    one = P.resolve_oneshot_policy(*cell)
-    quant = P.resolve_quant_policy(*cell)
-    assert 0 < one.max_bytes
-    assert one.min_bytes <= one.max_bytes
-    assert 0 < quant.floor <= quant.mesh_max <= quant.max_bytes
+    row = _row(*cell)
+    order = {ONESHOT: 0, None: 1, MESH: 2, RING: 3}
+    for quantized in (False, True):
+        first = min(
+            (
+                w.min
+                for a in AllReduceAlgorithm
+                if (w := row.window(a, quantized=quantized)) is not None
+            ),
+            default=0,
+        )
+        sizes = [1 << k for k in range(4, 33) if 1 << k >= first]
+        seen = [order[row.select(n, quantized=quantized)] for n in sizes]
+        assert seen == sorted(seen), quantized
 
 
-@pytest.mark.parametrize("arch", ARCHES)
-@pytest.mark.parametrize("link", P.LINKS)
-@pytest.mark.parametrize("ws", WORLDS)
-def test_dispatch_is_monotone(ws, link, arch):
-    """The path choice must never go backwards as the payload grows.
-
-    Composed across both slots, in the order ``CudaCommunicator.all_reduce``
-    consults them, so this is the ordering a payload actually experiences.
-    Below ``min_bytes`` the payload falls back by design (the Aiter kernel is
-    faster there); above it the order must hold.
-    """
-    # ``fallback`` sits between the one-shot and the mesh: where
-    # ``cross_device_reduce`` beats both FlyDSL families, the payload falls
-    # through to it, and only larger payloads reach the mesh.
-    order = {"oneshot": 0, "fallback": 1, "mesh": 2, "ring": 3}
-    floor = P.resolve_oneshot_policy(link, ws, arch).min_bytes
-    sizes = [1 << k for k in range(4, 31)]
-    below = [_slot_of(link, ws, n, arch) for n in sizes if n < floor]
-    assert set(below) <= {"fallback"}
-    seen = [order[_slot_of(link, ws, n, arch)] for n in sizes if n >= floor]
-    assert seen == sorted(seen)
+@pytest.mark.parametrize("cell", CELLS)
+def test_exact_mode_runs_only_the_one_shot(cell):
+    row = _row(*cell)
+    assert row.algorithms(quantized=False) in ((), (ONESHOT,))
 
 
-@pytest.mark.parametrize("ws", WORLDS)
-def test_ladders_are_well_formed(ws):
+def test_every_platform_has_one_ladder_per_algorithm():
+    keys = sorted((a, link, ws) for link, ws, a in CELLS)
+    for table in (P.ONESHOT_LADDER, P.MESH_ST_LADDER, P.RING_ST_LADDER):
+        assert sorted(table) == keys
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_ladders_are_well_formed(cell):
     """Every ladder starts at 0, ascends, and names values its kernel accepts.
 
-    A ladder that does not start at 0 leaves the smallest payloads with no rung;
-    one that is not ascending makes ``_pick_st``/``_pick_cfg`` -- which take the
-    *last* rung at or below the payload -- select something arbitrary.
+    A ladder that does not start at 0 leaves the smallest payloads with no
+    rung; one that is not ascending makes ``select_rung``, which takes the
+    *last* rung at or below the payload, select something arbitrary.
     """
-    for link in P.LINKS:
-        for name, rungs, valid_st in (
-            ("mesh", mesh_st_ladder(ws, link), SUPER_TILES),
-            ("ring", ring_st_ladder(ws, link), RING_SUPER_TILES),
-        ):
-            assert rungs, (name, link)
-            assert rungs[0].min_bytes == 0, (name, link)
-            floors = [r.min_bytes for r in rungs]
-            assert floors == sorted(floors), (name, link)
-            for r in rungs:
-                assert r.super_tile in valid_st, (name, link, r)
-                assert r.grid_cap >= 1, (name, link, r)
-                assert r.block in SUPPORTED_BLOCKS, (name, link, r)
+    link, ws, arch = cell
+    kw = {"world_size": ws, "link": link, "arch": arch}
+    for name, rungs, valid_st in (
+        ("mesh", mesh_st_ladder(**kw), SUPER_TILES),
+        ("ring", ring_st_ladder(**kw), RING_SUPER_TILES),
+    ):
+        assert rungs, name
+        assert rungs[0].min_bytes == 0, name
+        floors = [r.min_bytes for r in rungs]
+        assert floors == sorted(floors), name
+        for r in rungs:
+            assert r.super_tile in valid_st, (name, r)
+            assert r.grid_cap >= 1, (name, r)
+            assert r.block in SUPPORTED_BLOCKS, (name, r)
 
-    for link in P.LINKS:
-        one = oneshot_ladder(ws, link)
-        assert one and one[0].min_bytes == 0, link
-        floors = [r.min_bytes for r in one]
-        assert floors == sorted(floors), link
-        for r in one:
-            assert r.atoms in SUPPORTED_ATOMS, (link, r)
-            assert r.grid_cap >= 1, (link, r)
-            assert r.fanout in ("peer", "atom"), (link, r)
-            assert r.block in SUPPORTED_BLOCKS, (link, r)
+    one = oneshot_ladder(**kw)
+    assert one and one[0].min_bytes == 0
+    floors = [r.min_bytes for r in one]
+    assert floors == sorted(floors)
+    for r in one:
+        assert r.atoms in SUPPORTED_ATOMS, r
+        assert r.grid_cap >= 1, r
+        assert r.fanout in ("peer", "atom"), r
+        assert r.block in SUPPORTED_BLOCKS, r
 
 
-@pytest.mark.parametrize("ws", WORLDS)
-def test_oneshot_ladder_unknown_fabric_falls_back(ws):
-    """An unknown fabric gets a single conservative rung rather than silently
-    borrowing another fabric's table."""
-    assert len(oneshot_ladder(ws, "nosuchlink")) == 1
+def test_ladder_lookup_rejects_unknown_keys():
+    """No fallback rungs: an unknown platform raises."""
+    for ladder in (oneshot_ladder, mesh_st_ladder, ring_st_ladder):
+        with pytest.raises(P.NoPolicyError):
+            ladder(world_size=4, link="pcie", arch="gfx942")
+        with pytest.raises(ValueError):
+            ladder(world_size=4, link="nosuchlink", arch="gfx950")
+        with pytest.raises(P.NoPolicyError):
+            ladder(world_size=4, link="xgmi", arch="gfx1250")
 
 
 @pytest.mark.parametrize("cell", CELLS)
-def test_max_payload_bytes_is_keyed_on_the_fabric(cell):
+def test_oneshot_max_bytes_is_keyed_on_the_fabric(cell):
     """The default ceiling is where the fallback overtakes the one-shot, which
     is a property of the arch and the fabric.
     """
     link, ws, arch = cell
-    assert (
-        max_payload_bytes(ws, link, arch) == P.family_policy(link, ws, arch).oneshot_max
-    )
+    one = _row(*cell).window(ONESHOT, quantized=False)
+    got = resolve_oneshot_max_bytes(world_size=ws, link=link, arch=arch)
+    assert got == one.max - 1
 
 
-def test_arch_rows_override_only_their_arch():
-    """An arch row replaces the default row on that arch alone."""
-    for (arch, link, ws), row in P.ARCH_FAMILY_POLICY.items():
-        assert P.family_policy(link, ws, arch) == row
-        assert P.family_policy(link, ws, "gfx942") == P.FAMILY_POLICY[(link, ws)]
+def test_oneshot_max_bytes_follows_the_overrides():
+    """The standalone default ceiling is the one CustomAllreduce serves."""
+    kw = {"world_size": 4, "link": "pcie", "arch": "gfx950"}
+    with _env(
+        AITER_FLY_AR_ONESHOT_MAX_BYTES="65536", AITER_FLY_AR_MESH_MIN_BYTES="65536"
+    ):
+        assert resolve_oneshot_max_bytes(**kw) == 65536 - 1
+    # A maximum of 0 disables the one-shot.
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="0"):
+        assert resolve_oneshot_max_bytes(**kw) == 0
+    # Invalid overrides raise, as they do in the dispatchers.
+    with (
+        _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(1 << 20)),
+        pytest.raises(ValueError, match="overlaps"),
+    ):
+        resolve_oneshot_max_bytes(**kw)
 
 
-@pytest.mark.parametrize("arch", ARCHES)
-@pytest.mark.parametrize("ws", WORLDS)
-def test_ladder_rungs_fall_inside_their_dispatch_window(ws, arch):
-    """A rung above its family's window is an engine and an IPC inbox built for
-    payloads that can never arrive.
+@pytest.mark.parametrize("cell", CELLS)
+def test_ladder_rungs_fall_inside_their_dispatch_window(cell):
+    """A rung above its algorithm's window is an engine and an IPC inbox built
+    for payloads that can never arrive.
 
-    This is exactly the bug the windowed refit removed: fitted over the whole
-    sweep, the TP8 one-shot ladder wanted a second rung at 192 KiB, four times
-    above anything that schedule is dispatched at.
-
-    The one-shot window is the wider of the two ceilings.
+    This is the bug the windowed refit removed: fitted over the whole sweep,
+    the TP8 one-shot ladder wanted a second rung at 192 KiB, four times above
+    anything that schedule is dispatched at.
     """
-    for link in P.LINKS:
-        quant = P.resolve_quant_policy(link, ws, arch)
-        # The one-shot never serves above its own ceiling: with the quant slot
-        # open, the payloads between that ceiling and the quant floor fall
-        # through to ``cross_device_reduce``.
-        one_hi = P.resolve_oneshot_policy(link, ws, arch).max_bytes
-        for r in oneshot_ladder(ws, link)[1:]:
-            assert r.min_bytes < one_hi, ("oneshot", link, ws, r)
-        for r in mesh_st_ladder(ws, link)[1:]:
-            assert r.min_bytes < quant.mesh_max, ("mesh", link, ws, r)
+    link, ws, _arch = cell
+    row = _row(*cell)
+    one = row.window(ONESHOT, quantized=False)
+    kw = {"world_size": ws, "link": link, "arch": _arch}
+    for r in oneshot_ladder(**kw)[1:]:
+        assert one.contains(r.min_bytes), ("oneshot", cell, r)
+    mesh = row.window(MESH, quantized=True)
+    if mesh is not None and mesh.max is not None:
+        for r in mesh_st_ladder(**kw)[1:]:
+            assert r.min_bytes < mesh.max, ("mesh", cell, r)
     # Ring rungs are offsets into an unbounded window, so only the ordering
     # above constrains them.
 
@@ -165,44 +268,23 @@ def _env(**kw):
     return mock.patch.dict(os.environ, {k: v for k, v in kw.items()}, clear=False)
 
 
-def _slot_of(link: str, ws: int, nbytes: int, arch: str) -> str:
-    """Which kernel *nbytes* reaches with the quantized slot open."""
-    return P.route(nbytes, link, ws, quantized=True, arch=arch)
-
-
-@pytest.mark.parametrize("cell", CELLS)
-def test_slots_share_one_boundary(cell):
-    """The quick-reduce floor is the table's ``quant_min``, and one override
-    moves it and the one-shot ceiling together.
-
-    One number read from two sides. If they ever drift apart, payloads either
-    get double-claimed (the floor drops below the crossover) or fall into a hole
-    neither family serves.
-    """
-    link, ws, arch = cell
-    assert (
-        P.resolve_quant_policy(link, ws, arch).floor
-        == P.family_policy(link, ws, arch).quant_min
-    )
-    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
-        assert P.resolve_quant_policy(link, ws, arch).floor == 65536
-        # The override moves both readings, or the boundary splits in two.
-        assert P.resolve_oneshot_policy(link, ws, arch).max_bytes == 65536
+def _resolve(link="pcie", ws=4, arch="gfx950"):
+    return P.resolve_family_policy(world_size=ws, arch=arch, link=link)
 
 
 @pytest.mark.parametrize("ws", WORLDS)
-def test_route_on_gfx950_xgmi(ws):
-    """On gfx950/xGMI: the ring is never chosen, and the payloads between the
-    one-shot ceiling and the mesh floor stay exact."""
-    row = P.family_policy("xgmi", ws, "gfx950")
-    for k in range(4, 34):
-        nbytes = 1 << k
-        got = P.route(nbytes, "xgmi", ws, quantized=True, arch="gfx950")
-        assert got != "ring", nbytes
-        if row.oneshot_max < nbytes <= row.quant_min:
-            assert got == "fallback", nbytes
-    # Quick reduce off: nothing quantized.
-    assert P.route(1 << 30, "xgmi", ws, quantized=False, arch="gfx950") == "fallback"
+def test_gfx950_xgmi_never_rings(ws):
+    """On gfx950/xGMI the ring is disabled, and the payloads between the
+    one-shot and the mesh windows go to ``cross_device_reduce``."""
+    row = _row("xgmi", ws, "gfx950")
+    assert row.window(RING, quantized=True) is None
+    one = row.window(ONESHOT, quantized=True)
+    mesh = row.window(MESH, quantized=True)
+    for k in range(4, 33):
+        got = row.select(1 << k, quantized=True)
+        assert got != RING
+        if one.max <= 1 << k < mesh.min:
+            assert got is None
 
 
 def test_enable_flag_is_opt_in_only():
@@ -216,81 +298,81 @@ def test_enable_flag_is_opt_in_only():
         assert P.enabled() is False
 
 
-def test_byte_overrides():
-    table_one = P.family_policy("pcie", 8, "gfx942").oneshot_max
-    table_floor = P.family_policy("pcie", 8, "gfx942").quant_min
-    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
-        assert P.resolve_oneshot_policy("pcie", 8, "gfx942").max_bytes == 65536
-        assert P.resolve_quant_policy("pcie", 8, "gfx942").floor == 65536
-    with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
-        assert P.resolve_quant_policy("pcie", 4, "gfx942").mesh_max == 1048576
-    # -1 is the house sentinel for "unset, use the table".
-    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="-1"):
-        assert P.resolve_oneshot_policy("pcie", 8, "gfx942").max_bytes == table_one
-        assert P.resolve_quant_policy("pcie", 8, "gfx942").floor == table_floor
-    # Garbage warns and is ignored.
-    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="lots"):
-        assert P.resolve_oneshot_policy("pcie", 8, "gfx942").max_bytes == table_one
-        assert P.resolve_quant_policy("pcie", 8, "gfx942").floor == table_floor
+def test_no_overrides_is_the_table():
+    assert _resolve() == _row("pcie", 4, "gfx950")
 
 
-def test_oneshot_min_override():
-    """``AITER_FLY_AR_ONESHOT_MIN_BYTES`` moves only the one-shot's small-payload
-    floor; the ceiling and the quant floor are untouched."""
-    table_min = P.family_policy("xgmi", 8, "gfx942").oneshot_min
-    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="65536"):
-        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == 65536
-        # ceiling and quant slot are independent of the min override
-        assert (
-            P.resolve_oneshot_policy("xgmi", 8, "gfx942").max_bytes
-            == P.family_policy("xgmi", 8, "gfx942").oneshot_max
-        )
-        assert (
-            P.resolve_quant_policy("xgmi", 8, "gfx942").floor
-            == P.family_policy("xgmi", 8, "gfx942").quant_min
-        )
-    # 0 is a valid override: accept every size down to the custom-AR floor.
-    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="0"):
-        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == 0
-    # -1 is the house sentinel for "unset, use the table".
-    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="-1"):
-        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == table_min
-    # Garbage warns and is ignored.
-    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="lots"):
-        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == table_min
+def test_window_overrides():
+    table = _row("pcie", 4, "gfx950")
+    # Move the one-shot/mesh boundary: it takes both variables.
+    with _env(
+        AITER_FLY_AR_ONESHOT_MAX_BYTES="65536", AITER_FLY_AR_MESH_MIN_BYTES="65536"
+    ):
+        p = _resolve()
+        assert p.window(ONESHOT, quantized=True) == Window(0, 65536)
+        # The ONESHOT variables set the exact-mode window too.
+        assert p.window(ONESHOT, quantized=False) == Window(0, 65536)
+        assert p.window(MESH, quantized=True) == Window(65536, table.mesh.max)
+    # No upper limit, and a maximum of 0 disables the ring.
+    with _env(AITER_FLY_AR_MESH_MAX_BYTES="inf", AITER_FLY_AR_RING_MAX_BYTES="0"):
+        p = _resolve()
+        assert p.window(MESH, quantized=True).max is None
+        assert p.window(RING, quantized=True) is None
+    # gfx950/PCIe TP8 has a ring: an unbounded mesh would overlap it.
+    with _env(AITER_FLY_AR_MESH_MAX_BYTES="None", AITER_FLY_AR_RING_MAX_BYTES="0"):
+        p = _resolve(ws=8)
+        assert p.window(MESH, quantized=True).max is None
 
 
-def test_override_cannot_invert_the_partition():
-    """Pushing the one-shot ceiling past the mesh window means "give me the
-    one-shot up to here", not "crash" -- the mesh window closes instead.
-
-    Run on any cell whose table reaches the ring, with the ceiling placed just
-    past that cell's own mesh window, so no tuned value is assumed.
-    """
-    cells = [
-        c
-        for c in CELLS
-        if P.resolve_quant_policy(*c).mesh_max + 16 < P.resolve_quant_policy(*c).max_bytes
-    ]
-    if not cells:
-        pytest.skip("no (link, world) in the table reaches the ring")
-    link, ws, arch = cells[0]
-    mesh_max = P.resolve_quant_policy(link, ws, arch).mesh_max
-    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(mesh_max + 16)):
-        p = P.resolve_quant_policy(link, ws, arch)
-        assert p.mesh_max >= p.floor
-        assert P.quant_families_reachable(p) == ("ring",)
-        # A payload under the raised ceiling now reaches the one-shot, because
-        # the quant slot's floor moved with it.
-        assert _slot_of(link, ws, mesh_max, arch) == "oneshot"
+def test_override_enables_a_disabled_algorithm():
+    """gfx950/xGMI has no ring. Overriding its window creates one, with the
+    other bound unbounded."""
+    with _env(
+        AITER_FLY_AR_MESH_MAX_BYTES=str(512 << 20),
+        AITER_FLY_AR_RING_MIN_BYTES=str(512 << 20),
+    ):
+        p = _resolve("xgmi", 4)
+        assert p.window(RING, quantized=True) == Window(512 << 20, None)
+        assert p.select(1 << 30, quantized=True) == RING
 
 
-def test_resolvers_reject_unknown_keys():
-    for resolve in (P.resolve_oneshot_policy, P.resolve_quant_policy):
-        with pytest.raises(ValueError):
-            resolve("infiniband", 4)
-        with pytest.raises(ValueError):
-            resolve("pcie", 3)
+def test_equal_bounds_disable():
+    with _env(
+        AITER_FLY_AR_RING_MIN_BYTES=str(1 << 30),
+        AITER_FLY_AR_RING_MAX_BYTES=str(1 << 30),
+    ):
+        assert _resolve(ws=8).window(RING, quantized=True) is None
+
+
+def test_ignored_overrides():
+    table = _resolve()
+    for value in ("-1", "", "lots", "-7"):
+        with _env(AITER_FLY_AR_MESH_MIN_BYTES=value):
+            assert _resolve() == table, value
+    # A minimum cannot be unbounded.
+    with _env(AITER_FLY_AR_MESH_MIN_BYTES="inf"):
+        assert _resolve() == table
+
+
+def test_overlapping_overrides_raise():
+    # Raising the one-shot ceiling without moving the mesh floor.
+    with (
+        _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(1 << 20)),
+        pytest.raises(ValueError, match="overlaps"),
+    ):
+        _resolve()
+    # A mesh floor above the mesh ceiling.
+    with _env(AITER_FLY_AR_MESH_MIN_BYTES=str(1 << 30)), pytest.raises(ValueError):
+        _resolve()
+
+
+def test_resolve_rejects_unknown_keys():
+    with pytest.raises(ValueError):
+        _resolve(link="infiniband")
+    with pytest.raises(ValueError):
+        _resolve(ws=3)
+    with pytest.raises(P.NoPolicyError):
+        _resolve(link="pcie", arch="gfx942")
 
 
 def _full_storage_transpose(nbytes: int) -> torch.Tensor:
@@ -318,19 +400,19 @@ def test_selectors_reject_non_contiguous():
     contiguous copy of the same payload is accepted, which shows the refusal
     comes from contiguity rather than from size, dtype or alignment.
     """
-    quant = P.resolve_quant_policy("pcie", 4, "gfx942")
+    policy = _row("pcie", 4, "gfx950")
     qr = SimpleNamespace(
-        _fly_policy=quant, _fly_engines={"mesh": object(), "ring": object()}
+        _fly_policy=policy, _fly_engines={MESH: object(), RING: object()}
     )
-    t = _full_storage_transpose(quant.floor + (64 << 10))
+    t = _full_storage_transpose(policy.window(MESH, quantized=True).min + (64 << 10))
     assert QuickAllReduce._should_fly(qr, t.contiguous())
     assert not QuickAllReduce._should_fly(qr, t)
 
-    one = P.resolve_oneshot_policy("pcie", 4, "gfx942")
+    one = policy.window(ONESHOT, quantized=False)
     ca = SimpleNamespace(
-        _fly_oneshot=object(), _fly_policy=one, device=torch.device("cpu")
+        _fly_oneshot=object(), _fly_window=one, device=torch.device("cpu")
     )
-    t = _full_storage_transpose(max(one.min_bytes, 1 << 12))
+    t = _full_storage_transpose(max(one.min, 1 << 12))
     assert CustomAllreduce._should_fly_oneshot(ca, t.contiguous(), True, False)
     assert not CustomAllreduce._should_fly_oneshot(ca, t, True, False)
 

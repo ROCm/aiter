@@ -223,16 +223,31 @@ class QuickAllReduce:
 
         rs_codec, ag_codec = _FLY_REGIMES[self.qr_quant_level]
         link = fly_policy.detect_link()
+        # The policy is identical on every rank, so all ranks decline together.
+        try:
+            policy = fly_policy.resolve_family_policy(
+                world_size=self.world_size, arch=arch, link=link
+            )
+        except fly_policy.NoPolicyError as e:
+            logger.debug("FlyDSL quick-reduce backend disabled: %s", e)
+            return
+        except ValueError as e:
+            logger.warning("FlyDSL quick-reduce backend disabled: %s", e)
+            return
+        algorithms = [
+            alg
+            for alg in policy.algorithms(quantized=True)
+            if alg != fly_policy.AllReduceAlgorithm.OneShot
+        ]
         ok = True
         try:
-            policy = fly_policy.resolve_quant_policy(link, self.world_size)
-            for family in fly_policy.quant_families_reachable(policy):
-                self._fly_engines[family] = QuickAllReduceInt4(
+            for alg in algorithms:
+                self._fly_engines[alg] = QuickAllReduceInt4(
                     group=self.group,
                     device=self.device,
                     rank=self.rank,
                     world_size=self.world_size,
-                    algorithm=family,
+                    algorithm=alg.value,
                     rs_codec=rs_codec,
                     ag_codec=ag_codec,
                     min_bytes=0,
@@ -257,8 +272,8 @@ class QuickAllReduce:
         ok = True
         try:
             preload_fly_engines(
-                (engine, fly_policy.quant_family_range(family, policy))
-                for family, engine in self._fly_engines.items()
+                (engine, policy.window(alg, quantized=True).inclusive_range())
+                for alg, engine in self._fly_engines.items()
             )
         except Exception:
             logger.warning(
@@ -275,18 +290,18 @@ class QuickAllReduce:
             self._close_fly_engines()
             return
 
+        if not self._fly_engines:
+            logger.debug("FlyDSL quick-reduce backend disabled by the policy.")
+            return
         self._fly_policy = policy
         logger.info(
-            "Quick-reduce slot: FlyDSL %s serves plain all-reduce (TP%d on %s, "
-            "%d KiB < bytes <= %s, %.1f MiB of IPC inbox).",
-            "+".join(self._fly_engines),
+            "Quick-reduce slot: FlyDSL serves plain all-reduce (TP%d on %s: %s, "
+            "%.1f MiB of IPC inbox).",
             self.world_size,
             link,
-            policy.floor >> 10,
-            (
-                "no limit"
-                if policy.mesh_max >= fly_policy.NO_MAX
-                else f"{policy.mesh_max >> 10} KiB"
+            ", ".join(
+                f"{alg.value} {policy.window(alg, quantized=True)}"
+                for alg in self._fly_engines
             ),
             sum(e.inbox_bytes for e in self._fly_engines.values()) / 2**20,
         )
@@ -382,11 +397,8 @@ class QuickAllReduce:
         nbytes = inp.numel() * inp.element_size()
         if nbytes % 16:
             return False
-        p = self._fly_policy
-        if not p.floor < nbytes <= p.max_bytes:
-            return False
-
-        return fly_policy.resolve_quant_family(nbytes, p) in self._fly_engines
+        alg = self._fly_policy.select(nbytes, quantized=True)
+        return alg in self._fly_engines
 
     def should_quick_allreduce(self, inp: torch.Tensor):
         """
@@ -429,8 +441,8 @@ class QuickAllReduce:
             out = torch.empty_like(inp)
         if self._should_fly(inp):
             nbytes = inp.numel() * inp.element_size()
-            family = fly_policy.resolve_quant_family(nbytes, self._fly_policy)
-            self._fly_engines[family].allreduce(inp, out)
+            alg = self._fly_policy.select(nbytes, quantized=True)
+            self._fly_engines[alg].allreduce(inp, out)
             return out
         ops.qr_all_reduce(
             self._ptr, inp, out, self.qr_quant_level.value, self.use_fp16_kernels
