@@ -524,7 +524,7 @@ def _use_a8w4_fused_sort_quant(
         and topk_weight.dtype == dtypes.fp32
         and topk_weight.is_contiguous()
         # The MXFP8 conversion is gfx950-only.
-        and get_gfx() == "gfx950"
+        and get_gfx_runtime() == "gfx950"
         and _a8w4_sort_quant_instance_supported(num_experts, topk, model_dim, block_m)
     )
 

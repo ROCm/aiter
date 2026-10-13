@@ -1862,11 +1862,22 @@ def test_a8w4_fused_sort_quant_e2e(inter_dim):
                 out_fp8 = fused_moe(a1, *args, a1_scale=a1_scale, dtype=dtype, **kwargs)
                 torch.cuda.synchronize()
                 for name, other in (("unfused", out_unfused), ("fp8 input", out_fp8)):
-                    assert not other.isnan().any(), f"token={token}: {name} gave NaN"
+                    tag = f"inter_dim={inter_dim} token={token}: fused vs {name}"
+                    assert not other.isnan().any(), f"{tag}: NaN"
+                    # Atomic bf16 accumulation reorders run to run: even two calls
+                    # on the same path differ by up to 0.375 at |out| ~ 32 (bf16
+                    # step 0.25). atol is two such steps; every element must pass.
+                    mismatch = checkAllclose(
+                        out,
+                        other,
+                        rtol=1e-2,
+                        atol=0.5,
+                        tol_err_ratio=0.0,
+                        msg=f"{tag} ",
+                    )
+                    assert mismatch == 0, f"{tag}: elementwise mismatch {mismatch}"
                     diff = calc_diff(out, other)
-                    assert (
-                        diff < 1e-3
-                    ), f"inter_dim={inter_dim} token={token}: fused vs {name} diff {diff}"
+                    assert diff < 1e-3, f"{tag}: diff {diff}"
         finally:
             fm._a8w4_fused_sort_quant = real_fused
     aiter.logger.info(
