@@ -105,6 +105,7 @@ def test_fmoe(
     kernel_bench=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
+    block_size_M=None,
 ):
     if get_gfx() not in ["gfx950"] and qType in [aiter.QuantType.per_1x32]:
         return
@@ -484,6 +485,8 @@ def test_fmoe(
         "linear_beta": linear_beta,
         "gate_mode": gateMode,
     }
+    if block_size_M is not None:
+        _fused_moe_kwargs["block_size_M"] = block_size_M
 
     if kernel_bench:
         # Kernel-bench: time the stage1 / stage2 kernels in isolation. One eager
@@ -1471,6 +1474,84 @@ def test_output_buffer_contract():
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
 
+# Rebuilt gfx950 fp8 block-scale SiLU kernels. The symbols are the tuned-CSV names.
+_FMOE_64XN = {
+    "64x128": "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x128E",
+    "64x256": "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E",
+    "64x384": "_ZN5aiter50fmoe_bf16_blockscaleFp8_g1u1_vs_silu_1tg_ps_64x384E",
+}
+
+
+def _run_blockscale_case(expect_symbol, force_symbol=None, **case):
+    """Run one per-128x128 SiLU case and require the rebuilt kernel to launch."""
+    launched = []
+    orig = aiter.fmoe_fp8_blockscale_g1u1
+
+    def wrap(*args, **kwargs):
+        if force_symbol is not None:
+            if len(args) >= 13:
+                args = (*args[:12], force_symbol, *args[13:])
+            else:
+                kwargs["kernelName"] = force_symbol
+        name = args[12] if len(args) >= 13 else kwargs.get("kernelName", "")
+        launched.append(name)
+        return orig(*args, **kwargs)
+
+    aiter.fmoe_fp8_blockscale_g1u1 = wrap
+    torch.manual_seed(0)
+    try:
+        test_fmoe(
+            dtype=dtypes.bf16,
+            actType=aiter.ActivationType.Silu,
+            gateMode=GateMode.SEPARATED.value,
+            qType=aiter.QuantType.per_128x128,
+            AQDType=dtypes.fp8,
+            WQDType=dtypes.fp8,
+            use_g1u1=True,
+            doweight_stage1=False,
+            strict_accuracy=True,
+            check_aot_cache=False,
+            **case,
+        )
+    finally:
+        aiter.fmoe_fp8_blockscale_g1u1 = orig
+    assert launched, f"fp8 block-scale kernel was not launched for {case}"
+    assert set(launched) == {expect_symbol}, (
+        f"dispatched {launched}, expected {expect_symbol} for {case}"
+    )
+
+
+def test_gfx950_blockscale_64xn():
+    """Correctness for the rebuilt 64x128 / 64x256 / 64x384 SiLU code objects.
+
+    Two tuned rows have inter_dim=1536, so the persistent launch's tile count
+    is not a multiple of 8 and is smaller than the CU count. Those rows name
+    the 64x256 kernel. model_dim=512 is the short-K case: no tuned row has
+    that K, so the kernel name and block size are passed in directly.
+    """
+    if get_gfx() != "gfx950":
+        return
+
+    for case in (
+        dict(token=256, model_dim=4096, inter_dim=1536, E=16, topk=8),
+        dict(token=1024, model_dim=3072, inter_dim=1536, E=64, topk=8),
+    ):
+        _run_blockscale_case(_FMOE_64XN["64x256"], **case)
+
+    for tile, inter_dim in (("64x128", 128), ("64x256", 256), ("64x384", 384)):
+        _run_blockscale_case(
+            _FMOE_64XN[tile],
+            force_symbol=_FMOE_64XN[tile],
+            token=64,
+            model_dim=512,
+            inter_dim=inter_dim,
+            E=8,
+            topk=2,
+            block_size_M=64,
+        )
+    aiter.logger.info("moe_2stage: gfx950 block-scale 64xN coverage passed")
+
+
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
@@ -1488,6 +1569,7 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    test_gfx950_blockscale_64xn()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
