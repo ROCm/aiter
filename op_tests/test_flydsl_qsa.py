@@ -1,15 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""QSA oracle, live vLLM AMD, and FlyDSL K1/K2.
+"""QSA oracle and FlyDSL K1/K2.
 
 Two layers:
   * Correctness (pytest): ``test_*`` unit cases. CI runs pytest on this
     file, then this script for the sweep. ``main`` only sweeps.
-  * Perf sweep (``__main__``): ``bench_qsa_family_a_vllm_amd``,
-    ``bench_qsa_family_a_k1`` (decode ``M<=8`` and a separate prefill table;
-    HIP-graph select columns for FlyDSL and live AMD when the table is
-    wider than 20000 columns and ``M<=64``),
+  * Perf sweep (``__main__``): ``bench_qsa_family_a_k1`` (decode ``M<=8``
+    and a separate prefill table; HIP-graph select column for FlyDSL when
+    the table is wider than 20000 columns and ``M<=64``),
     ``bench_qsa_family_b_k1`` (H=8 emit; long-``L`` is H=8; the published
     page-size-8 point stays H=4),
     ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table),
@@ -54,9 +53,7 @@ from aiter.ops.flydsl.kernels.qsa.k2 import build_qsa_k2_module, qsa_k2_serves
 from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
 from aiter.ops.flydsl.qsa import (
     gather_paged_cache,
-    normalize_qsa_backend,
     pack_paged_cache,
-    qsa_auto_uses_flydsl,
     qsa_expand_tail,
     qsa_indexer_scores,
     qsa_k1_block_ids,
@@ -67,12 +64,7 @@ from aiter.ops.flydsl.qsa import (
     qsa_topk_blocks,
     qsa_visible_blocks,
 )
-from aiter.ops.triton.attention.qsa_vllm_amd import (
-    VLLM_AMD_QSA_PIN,
-    expand_qsa_block_indices_cuda,
-    qsa_select_paged_tokens,
-    qsa_sparse_paged_attention,
-)
+from aiter.ops.triton.attention.qsa_vllm_amd import expand_qsa_block_indices_cuda
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1210,59 +1202,12 @@ def test_expand_rejects_out_that_cannot_hold_the_stores():
         raise AssertionError("a matching caller out was replaced")
 
 
-def test_sparse_attention_rejects_out_that_does_not_match_q():
-    """The GQA store writes ``HEAD_DIM`` elements at unit stride.
-
-    A caller ``out`` has to be the contiguous ``q`` tensor: same shape, dtype,
-    and GPU. ``[M, Hq, 1]`` is rejected before launch.
-    """
-    if not torch.cuda.is_available():
-        return
-    device = torch.device("cuda")
-    rows, n_heads, head_dim = 2, 2, 16
-    q = torch.empty((rows, n_heads, head_dim), dtype=torch.bfloat16, device=device)
-    k_cache = torch.empty((1, 16, 1, head_dim), dtype=torch.bfloat16, device=device)
-    indices = torch.zeros((rows, 4), dtype=torch.int32, device=device)
-    block_table = torch.zeros((1, 1), dtype=torch.int32, device=device)
-    token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
-    strided = torch.empty(
-        (rows, n_heads, head_dim * 2), dtype=torch.bfloat16, device=device
-    )[..., ::2]
-
-    def attend(query, idx, req, out):
-        return qsa_sparse_paged_attention(
-            query, k_cache, k_cache.clone(), idx, block_table, req, out
-        )
-
-    rejected = (
-        torch.empty((rows, n_heads, 1), dtype=torch.bfloat16, device=device),
-        torch.empty((rows, n_heads, head_dim), dtype=torch.float32, device=device),
-        torch.empty((rows, n_heads, head_dim), dtype=torch.bfloat16),
-        strided,
-    )
-    for out in rejected:
-        try:
-            attend(q, indices, token_to_req, out)
-        except ValueError as exc:
-            if "QSA sparse attention out" not in str(exc):
-                raise
-        else:
-            raise AssertionError(
-                f"accepted out {out.dtype} {tuple(out.shape)} {out.device}"
-            )
-    empty_out = torch.empty((0, n_heads, head_dim), dtype=torch.bfloat16, device=device)
-    got = attend(q[:0], indices[:0], token_to_req[:0], empty_out)
-    if got.data_ptr() != empty_out.data_ptr():
-        raise AssertionError("a matching caller out was replaced")
-
-
 def test_k1_serves_padded_page_and_rejects_misaligned():
     """A padded page stride is in contract; a 16-byte gather that cannot align is not.
 
     vLLM keeps D contiguous and the token stride at D, and pads the page
     stride. ``numel()`` undercounts that view. A D stride other than 1, or a
-    page/token/head stride that is not a multiple of 8 elements, is rejected
-    so ``auto`` stays on Triton.
+    page/token/head stride that is not a multiple of 8 elements, is rejected.
     """
     page_size, d = 16, 128
     n_pages = 3
@@ -1998,11 +1943,9 @@ def _flydsl_k1_select(
     compress_ratio,
     heads,
 ):
-    """Block ids plus the vendored Triton expand live AMD select includes.
+    """Block ids plus the vendored Triton expand.
 
-    The live AMD column times ``qsa_select_paged_tokens``, which expands
-    inside the call. This is that same span for FlyDSL. Set equality uses
-    the block ids.
+    Set equality uses the block ids.
     """
     block_ids = qsa_k1_block_ids(
         q,
@@ -2055,25 +1998,24 @@ def _pad_index_table(index_table, pad_pages):
 def bench_qsa_family_a_k1(
     m, seq_len, page_size, dtype, rotate=0, pad_pages=0, cache_layout="packed"
 ):
-    """Family A FlyDSL K1 vs oracle set equality; us vs live AMD.
+    """Family A FlyDSL K1 vs oracle set equality.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
     and streaming radix at or above that width. Single-request prefill scores
     16 query rows per workgroup. The FlyDSL column times block ids and then
-    the vendored Triton expand, the same expand live AMD select includes.
-    Set equality stays on block ids. Same ``rotate`` on every select column.
+    the vendored Triton expand. Set equality stays on block ids. Same
+    ``rotate`` on every select column.
     ``pad_pages`` widens the block table every column sees; ``0`` keeps it
     packed to the context. ``cache_layout="wide"`` gives every column the
     serving cache span. The layer bench takes the same layout.
 
-    When ``M`` is at most 64 and the table is wider than 20000 columns, two
-    more columns replay the select under HIP-graph capture. FlyDSL capture
+    When ``M`` is at most 64 and the table is wider than 20000 columns, one
+    more column replays the select under HIP-graph capture. FlyDSL capture
     selects the one-workgroup radix; the eager FlyDSL column readbacks the
-    live width and streams past 32768 columns. Live AMD is the same
-    ``qsa_select_paged_tokens`` call as the eager column, captured and
-    replayed hot. Both replays use one hot buffer set and do not follow
-    ``rotate``. Shorter tables leave both columns out.
+    live width and streams past 32768 columns. The replay uses one hot
+    buffer set and does not follow ``rotate``. Shorter tables leave the
+    graph column out.
     ``--batch 4 16 64 --seq 131072 263424 --page-size 392`` is the long
     decode: 263424 tokens fill 65856 columns, 168 pages of 392. Batches
     above 8 print in the prefill table.
@@ -2122,7 +2064,6 @@ def bench_qsa_family_a_k1(
     # Paged caches stay positional so ``_time`` can rotate them.
     candidates = {
         "flydsl_k1": (_flydsl_k1_select, {"heads": (4,)}),
-        "vllm_amd_select": (qsa_select_paged_tokens, {}),
     }
     ret = {
         "gfx": get_gfx(),
@@ -2169,26 +2110,8 @@ def bench_qsa_family_a_k1(
                 out=indices_g,
             )
 
-        amd_indices = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
-        amd_blocks: dict[str, torch.Tensor] = {}
-
-        def amd_graph():
-            _out, blocks = qsa_select_paged_tokens(
-                q_indexer,
-                index_cache,
-                index_table,
-                token_to_req,
-                qpos,
-                slen,
-                idx.token_budget,
-                idx.compress_ratio,
-                out=amd_indices,
-            )
-            amd_blocks["ids"] = blocks
-
         graph_candidates = {
             "flydsl_k1_graph": (flydsl_graph, lambda: block_ids_g),
-            "vllm_amd_select_graph": (amd_graph, lambda: amd_blocks["ids"]),
         }
         for name, (launch, ids) in graph_candidates.items():
             us = _capture_replay_us(launch)
@@ -2204,7 +2127,7 @@ def bench_qsa_family_a_k1(
 def bench_qsa_family_a_k2(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
-    """Family A FlyDSL K2 vs oracle GQA; us vs live AMD.
+    """Family A FlyDSL K2 vs oracle GQA.
 
     3d: live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
     log2 online softmax, direct output at one split, and a two-wave merge.
@@ -2264,7 +2187,6 @@ def bench_qsa_family_a_k2(
     gqa_args = (q_gqa, k_cache, v_cache, indices, kv_table, token_to_req)
     candidates = {
         "flydsl_k2": (qsa_k2, "flydsl K2 vs oracle GQA"),
-        "vllm_amd_gqa": (qsa_sparse_paged_attention, "vllm_amd GQA vs oracle"),
     }
     ret = {
         "gfx": get_gfx(),
@@ -2424,113 +2346,6 @@ def bench_qsa_family_b_k1(
     return ret
 
 
-@benchmark()
-def bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate=0):
-    """Live AMD path (vLLM Triton MQA + HIP top-k + Triton GQA) vs the oracle.
-
-    Indexer chain and sparse GQA are timed separately. Oracle is not timed.
-    Same ``rotate`` on select and GQA.
-    """
-    idx = FAMILY_A_INDEXER
-    gqa = FAMILY_A_GQA
-    device = torch.device("cuda")
-    n_blocks = seq_len // idx.compress_ratio
-    torch.manual_seed(0)
-    q_indexer = torch.randn(
-        m, idx.n_heads, idx.head_dim, dtype=dtype, device=device
-    ).contiguous()
-    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtype, device=device)
-    q_gqa = torch.randn(
-        m, gqa.n_heads, gqa.head_dim, dtype=dtype, device=device
-    ).contiguous()
-    k = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
-    v = torch.randn(seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtype, device=device)
-    qpos = _query_positions(m, seq_len, device)
-    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
-    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-
-    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
-        k_bar, k, v, page_size, device
-    )
-    index_cache = index_cache.contiguous()
-    k_cache = k_cache.contiguous()
-    v_cache = v_cache.contiguous()
-    index_table = index_table.contiguous()
-    kv_table = kv_table.contiguous()
-
-    ref = qsa_oracle(
-        q_indexer,
-        k_bar,
-        q_gqa,
-        k,
-        v,
-        qpos,
-        slen,
-        token_to_req,
-        idx,
-        gqa,
-        score_scale=FAMILY_A_SCORE_SCALE,
-        out_dtype=dtypes.fp32,
-    )
-
-    (indices, block_ids), select_us = _time(
-        qsa_select_paged_tokens,
-        q_indexer,
-        index_cache,
-        index_table,
-        token_to_req,
-        qpos,
-        slen,
-        idx.token_budget,
-        idx.compress_ratio,
-        rotate=rotate,
-    )
-    block_err = _set_mismatch_ratio(ref.block_ids, block_ids)
-    index_err = _set_mismatch_ratio(ref.indices, indices)
-
-    out, gqa_us = _time(
-        qsa_sparse_paged_attention,
-        q_gqa,
-        k_cache,
-        v_cache,
-        indices,
-        kv_table,
-        token_to_req,
-        rotate=rotate,
-    )
-    gqa_err = checkAllclose(
-        ref.output,
-        out.to(dtypes.fp32),
-        rtol=1e-2,
-        atol=1e-2,
-        msg="vllm_amd GQA vs oracle",
-    )
-
-    w = _selected_width(indices)
-    flops_select = 2 * m * idx.n_heads * idx.head_dim * n_blocks
-    flops_gqa = 4 * m * gqa.n_heads * gqa.head_dim * w
-    bytes_select = (
-        m * idx.n_heads * idx.head_dim + n_blocks * idx.head_dim
-    ) * dtype.itemsize
-    bytes_gqa = (
-        m * gqa.n_heads * gqa.head_dim * 2 + 2 * seq_len * gqa.kv_heads * gqa.head_dim
-    ) * dtype.itemsize
-    return {
-        "gfx": get_gfx(),
-        "vllm_pin": VLLM_AMD_QSA_PIN,
-        "n_blocks": n_blocks,
-        "valid%": 100.0 * w / idx.index_width,
-        "vllm_amd_select us": select_us,
-        "vllm_amd_select TFLOPS": flops_select / select_us / 1e6,
-        "vllm_amd_select TB/s": bytes_select / select_us / 1e6,
-        "vllm_amd_select err": max(block_err, index_err),
-        "vllm_amd_gqa us": gqa_us,
-        "vllm_amd_gqa TFLOPS": flops_gqa / gqa_us / 1e6,
-        "vllm_amd_gqa TB/s": bytes_gqa / gqa_us / 1e6,
-        "vllm_amd_gqa err": gqa_err,
-    }
-
-
 def _family_b_indexer(index_heads):
     if index_heads == FAMILY_B_INDEXER.n_heads:
         return FAMILY_B_INDEXER
@@ -2539,99 +2354,23 @@ def _family_b_indexer(index_heads):
     raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
 
 
-def _policy_args(m, hq, d_gqa, n_columns, page_size, n_heads, d_idx, kv_heads=2):
-    """Host-only tensors for the auto-backend predicate. Nothing is launched."""
-    n_pages = n_columns // page_size
-    q_indexer = torch.zeros(m, n_heads, d_idx, dtype=torch.bfloat16)
-    q_gqa = torch.zeros(m, hq, d_gqa, dtype=torch.bfloat16)
-    index_cache = torch.zeros(n_pages, page_size, 1, d_idx, dtype=torch.bfloat16)
-    index_table = torch.zeros(1, n_pages, dtype=torch.int32)
-    k_cache = torch.zeros(n_pages, page_size, kv_heads, d_gqa, dtype=torch.bfloat16)
-    v_cache = torch.zeros_like(k_cache)
-    kv_table = torch.zeros(1, n_pages, dtype=torch.int32)
-    indices = torch.zeros(m, 2051, dtype=torch.int32)
-    return (
-        q_indexer,
-        index_cache,
-        index_table,
-        q_gqa,
-        k_cache,
-        v_cache,
-        kv_table,
-        indices,
-    )
-
-
-def test_qsa_backend_default_is_auto():
-    """The opt-in defaults to auto, and unknown names are rejected."""
-    assert normalize_qsa_backend(None) == "auto"
-    assert normalize_qsa_backend("TRITON") == "triton"
-    assert normalize_qsa_backend("FlyDSL") == "flydsl"
-    assert normalize_qsa_backend("auto") == "auto"
-    try:
-        normalize_qsa_backend("gluon")
-    except ValueError:
-        return
-    raise AssertionError("gluon is not a qsa_layer backend")
-
-
-def test_qsa_auto_admits_only_measured_pairs():
-    """auto admits the swept (GQA query, indexer heads) pairs and no others.
-
-    Loosened, auto serves an untuned shape at whatever speed the K2 band
-    table happens to give; narrowed, it drops a measured shape back to
-    Triton. Neither is a wrong result. K2 serves any structurally valid
-    shape, so the table in ``qsa.py`` is the only thing doing the rejecting.
-    """
-    page = 16
-    n_columns = 128
-    for hq, d_gqa, kv_heads, heads in (
-        (24, 256, 2, 4),
-        (24, 256, 2, 8),
-        (12, 256, 1, 4),
-        (12, 256, 1, 8),
-        (6, 256, 1, 4),
-        (6, 256, 1, 8),
-        (3, 256, 1, 4),
-        (3, 256, 1, 8),
-        (10, 128, 2, 4),
-        (10, 128, 2, 8),
-    ):
-        swept = _policy_args(1, hq, d_gqa, n_columns, page, heads, 128, kv_heads)
-        assert qsa_auto_uses_flydsl(*swept) is True
-    # An untuned GQA query stays on Triton however it is indexed.
-    untuned = _policy_args(1, 16, 128, n_columns, page, 4, 128)
-    assert qsa_auto_uses_flydsl(*untuned) is False
-
-
-def test_qsa_auto_rejects_a_selection_k1_cannot_build():
+def test_qsa_layer_rejects_a_selection_k1_cannot_build():
     """K1 writes 512 block ids and divides positions by 4.
 
     ``token_topk=1024`` at ratio 4 asks expand for 256 columns.
     ``token_topk=4096`` at ratio 8 still has 512 columns, so expand would
-    accept K1's ratio-4 ids. auto stays on Triton. Explicit flydsl raises.
+    accept K1's ratio-4 ids. The layer raises before launch.
     """
-    measured = _policy_args(1, 24, 256, 128, 16, 4, 128)
-    if not qsa_auto_uses_flydsl(*measured, token_topk=2048, compress_ratio=4):
-        raise AssertionError("the K1 selection contract was rejected")
+    q_indexer = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    index_cache = torch.zeros(8, 16, 1, 128, dtype=torch.bfloat16)
+    index_table = torch.zeros(1, 8, dtype=torch.int32)
+    q_gqa = torch.zeros(1, 24, 256, dtype=torch.bfloat16)
+    k_cache = torch.zeros(8, 16, 2, 256, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    kv_table = torch.zeros(1, 8, dtype=torch.int32)
+    indices = torch.zeros(1, 2051, dtype=torch.int32)
     rows = torch.zeros(1, dtype=torch.int32)
     for token_topk, compress_ratio in ((1024, 4), (4096, 8)):
-        if qsa_auto_uses_flydsl(
-            *measured, token_topk=token_topk, compress_ratio=compress_ratio
-        ):
-            raise AssertionError(
-                f"auto accepted token_topk={token_topk} compress_ratio={compress_ratio}"
-            )
-        (
-            q_indexer,
-            index_cache,
-            index_table,
-            q_gqa,
-            k_cache,
-            v_cache,
-            kv_table,
-            indices,
-        ) = measured
         try:
             qsa_layer(
                 q_indexer,
@@ -2647,69 +2386,41 @@ def test_qsa_auto_rejects_a_selection_k1_cannot_build():
                 indices=indices,
                 token_topk=token_topk,
                 compress_ratio=compress_ratio,
-                backend="flydsl",
             )
         except ValueError as exc:
             if "FlyDSL K1 selects" not in str(exc):
                 raise
         else:
             raise AssertionError(
-                f"flydsl accepted token_topk={token_topk} compress_ratio={compress_ratio}"
+                f"layer accepted token_topk={token_topk} compress_ratio={compress_ratio}"
             )
 
 
-def test_qsa_layer_triton_threads_scales():
-    """Triton must apply the same multipliers FlyDSL does.
+def test_qsa_layer_warns_once_for_an_unswept_pair():
+    """An unswept rank-3 pair logs once and still runs.
 
-    MQA divides, so a layer ``score_scale`` of 0.5 arrives as the divisor 2.
-    ``softmax_scale=0`` stays zero instead of falling back to ``D**-0.5``.
+    A measured pair does not log. A query that is not rank 3 does not
+    log; K1 reports an indexer that is not rank 3. Host tensors stop at
+    the device check after a shape K1 accepts, so nothing launches.
     """
-    import aiter.ops.triton.attention.qsa_vllm_amd as amd
+    import logging
 
-    seen = {}
+    from aiter.ops.flydsl import qsa as qsa_mod
 
-    def select(
-        q,
-        k_cache,
-        page_table,
-        token_to_req,
-        query_positions,
-        sequence_lengths,
-        token_topk,
-        compress_ratio,
-        out=None,
-        score_scale=None,
-    ):
-        seen["divisor"] = score_scale
-        rows = q.shape[0]
-        width = token_topk + compress_ratio - 1
-        blocks = token_topk // compress_ratio
-        return (
-            torch.zeros(rows, width, dtype=torch.int32),
-            torch.zeros(rows, blocks, dtype=torch.int32),
-        )
+    messages = []
 
-    def attend(
-        q,
-        k_cache,
-        v_cache,
-        logical_indices,
-        block_table,
-        token_to_req,
-        out=None,
-        softmax_scale=None,
-    ):
-        seen["softmax"] = softmax_scale
-        return q
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
 
-    measured = _policy_args(1, 24, 256, 128, 16, 4, 128)
-    rows = torch.zeros(1, dtype=torch.int32)
-    old_select = amd.qsa_select_paged_tokens
-    old_attend = amd.qsa_sparse_paged_attention
-    amd.qsa_select_paged_tokens = select
-    amd.qsa_sparse_paged_attention = attend
-    try:
-        (
+    def _layer_tensors(hq, index_heads, gqa_rows=1, indexer_rows=1):
+        q_indexer = torch.zeros(indexer_rows, index_heads, 128, dtype=torch.bfloat16)
+        q_gqa = torch.zeros(gqa_rows, hq, 256 if hq != 16 else 128, dtype=torch.bfloat16)
+        return q_indexer, q_gqa
+
+    def _run(q_indexer, q_gqa):
+        rows = torch.zeros(q_indexer.shape[0], dtype=torch.int32)
+        qsa_layer(
             q_indexer,
             index_cache,
             index_table,
@@ -2717,66 +2428,115 @@ def test_qsa_layer_triton_threads_scales():
             k_cache,
             v_cache,
             kv_table,
-            indices,
-        ) = measured
+            rows,
+            rows,
+            torch.ones(1, dtype=torch.int32),
+        )
 
-        def run(score_scale, softmax_scale):
-            seen.clear()
+    def _expect(q_indexer, q_gqa, needle):
+        try:
+            _run(q_indexer, q_gqa)
+        except ValueError as exc:
+            if needle not in str(exc):
+                raise AssertionError(f"expected {needle!r} in {exc}") from exc
+        else:
+            raise AssertionError("layer returned")
+
+    index_cache = torch.zeros(8, 16, 1, 128, dtype=torch.bfloat16)
+    index_table = torch.zeros(1, 8, dtype=torch.int32)
+    k_cache = torch.zeros(8, 16, 2, 256, dtype=torch.bfloat16)
+    v_cache = torch.zeros_like(k_cache)
+    kv_table = torch.zeros(1, 8, dtype=torch.int32)
+    handler = _Capture()
+    qsa_mod._log_unmeasured_gqa_query.cache_clear()
+    aiter.logger.addHandler(handler)
+    try:
+        untuned = _layer_tensors(16, 4)
+        _expect(*untuned, "every tensor must be on the GPU")
+        _expect(*untuned, "every tensor must be on the GPU")
+        wide = _layer_tensors(24, 16)
+        _expect(*wide, "heads must be a non-empty subset")
+        _expect(*wide, "heads must be a non-empty subset")
+        if messages != [
+            (
+                "QSA: query pair (GQA (16, 128), indexer heads 4) "
+                "is not in the measured table"
+            ),
+            (
+                "QSA: query pair (GQA (24, 256), indexer heads 16) "
+                "is not in the measured table"
+            ),
+        ]:
+            raise AssertionError(f"table-miss log was {messages}")
+
+        messages.clear()
+        _expect(*_layer_tensors(24, 4), "every tensor must be on the GPU")
+        _expect(*_layer_tensors(24, 8, indexer_rows=2), "every tensor must be on the GPU")
+        if messages:
+            raise AssertionError(f"a measured pair logged {messages}")
+
+        messages.clear()
+        scalar = torch.zeros((), dtype=torch.bfloat16)
+        measured_indexer, measured_gqa = _layer_tensors(24, 4)
+        try:
             qsa_layer(
-                q_indexer,
+                scalar,
                 index_cache,
                 index_table,
-                q_gqa,
+                measured_gqa,
                 k_cache,
                 v_cache,
                 kv_table,
-                rows,
-                rows,
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
                 torch.ones(1, dtype=torch.int32),
-                indices=indices,
-                score_scale=score_scale,
-                softmax_scale=softmax_scale,
-                backend="triton",
             )
-
-        run(0.5, 0.0)
-        if seen["divisor"] != 2.0 or seen["softmax"] != 0.0:
-            raise AssertionError(f"scales arrived as {seen}")
-        run(None, None)
-        if seen["divisor"] is not None or seen["softmax"] is not None:
-            raise AssertionError(f"defaults arrived as {seen}")
-        run(0.0, None)
-        if seen["divisor"] != float("inf"):
-            raise AssertionError(f"zero indexer scale arrived as {seen['divisor']}")
-        run(-0.25, None)
-        if seen["divisor"] != -4.0:
-            raise AssertionError(f"negative indexer scale arrived as {seen['divisor']}")
+        except ValueError as exc:
+            if "q must be" not in str(exc):
+                raise AssertionError(f"K1 did not report the indexer: {exc}") from exc
+        else:
+            raise AssertionError("a scalar indexer was accepted")
+        try:
+            qsa_layer(
+                measured_indexer,
+                index_cache,
+                index_table,
+                scalar,
+                k_cache,
+                v_cache,
+                kv_table,
+                torch.zeros(1, dtype=torch.int32),
+                torch.zeros(1, dtype=torch.int32),
+                torch.ones(1, dtype=torch.int32),
+            )
+        except ValueError as exc:
+            if "every tensor must be on the GPU" not in str(exc):
+                raise AssertionError(f"scalar GQA was not left to K1: {exc}") from exc
+        else:
+            raise AssertionError("a scalar GQA query was accepted")
+        if messages:
+            raise AssertionError(f"a non-rank-3 query logged {messages}")
     finally:
-        amd.qsa_select_paged_tokens = old_select
-        amd.qsa_sparse_paged_attention = old_attend
+        aiter.logger.removeHandler(handler)
+        qsa_mod._log_unmeasured_gqa_query.cache_clear()
 
 
 def test_qsa_metadata_strided_view_matches_packed():
     """Request and position vectors are loaded as ``ptr + index``.
 
-    A view such as ``base[::2]`` has to score the same request as its
+    A view such as ``base[::2]`` has to expand the same request as its
     packed copy. A non-int32 vector is rejected before launch.
     """
-    from aiter.ops.triton.attention.qsa_vllm_amd import qsa_mqa_paged
-
-    q = torch.zeros(2, 1, 16, dtype=torch.bfloat16)
-    cache = torch.zeros(1, 16, 1, 16, dtype=torch.bfloat16)
-    table = torch.zeros(2, 1, dtype=torch.int32)
+    blocks = torch.zeros(2, 1, dtype=torch.int32)
     positions = torch.zeros(2, dtype=torch.int32)
     lengths = torch.zeros(2, dtype=torch.int32)
     try:
-        qsa_mqa_paged(
-            q,
-            cache,
-            table,
-            torch.zeros(2, dtype=torch.int64),
+        expand_qsa_block_indices_cuda(
+            blocks,
             positions,
             lengths,
+            torch.zeros(2, dtype=torch.int64),
+            4,
             4,
         )
     except ValueError as exc:
@@ -2788,28 +2548,11 @@ def test_qsa_metadata_strided_view_matches_packed():
         return
 
     device = torch.device("cuda")
-    q = torch.zeros(2, 1, 16, dtype=torch.bfloat16, device=device)
-    cache = torch.zeros(1, 16, 1, 16, dtype=torch.bfloat16, device=device)
-    table = torch.zeros(2, 1, dtype=torch.int32, device=device)
     requests = torch.tensor([0, 9, 1, 9], dtype=torch.int32, device=device)[::2]
     positions = torch.tensor([7, 0, 3, 0], dtype=torch.int32, device=device)[::2]
     lengths = torch.tensor([20, 1, 8, 1], dtype=torch.int32, device=device)[::2]
     if requests.is_contiguous():
         raise AssertionError("the metadata fixture is already packed")
-    _logits, visible = qsa_mqa_paged(q, cache, table, requests, positions, lengths, 4)
-    _logits, visible_ref = qsa_mqa_paged(
-        q,
-        cache,
-        table,
-        requests.contiguous(),
-        positions.contiguous(),
-        lengths.contiguous(),
-        4,
-    )
-    if not torch.equal(visible, visible_ref) or not torch.equal(
-        visible, torch.tensor([2, 1], dtype=torch.int32, device=device)
-    ):
-        raise AssertionError(f"strided metadata scored {visible.tolist()}")
 
     blocks = torch.zeros(2, 1, dtype=torch.int32, device=device)
     expanded = expand_qsa_block_indices_cuda(blocks, positions, lengths, requests, 4, 4)
@@ -2828,10 +2571,9 @@ def test_qsa_metadata_strided_view_matches_packed():
 def test_k2_serves_rejects_shapes_the_builder_rejects():
     """A geometry ``build_qsa_k2_module`` raises on is a reason here.
 
-    ``auto`` selects FlyDSL only when this predicate accepts the tensors.
     An indivisible group, a group past the MFMA M=16 tile, a head_dim that
     is not a multiple of 32, a head the selected gather or merge cannot
-    cover, or a zero page size must stay on Triton.
+    cover, or a zero page size is rejected.
     """
 
     def tensors(hq, hkv, d, page, rows=1, width=8):
@@ -2875,124 +2617,6 @@ def test_k2_serves_rejects_shapes_the_builder_rejects():
             raise AssertionError(f"builder D=32 reason was {exc}") from exc
     else:
         raise AssertionError("builder compiled a D=32 decode gather")
-    measured = _policy_args(1, 24, 256, 128, 16, 4, 128)
-    q_indexer, index_cache, index_table, q_gqa, _, _, kv_table, indices = measured
-    indivisible = torch.zeros(8, 16, 5, 256, dtype=torch.bfloat16)
-    if qsa_auto_uses_flydsl(
-        q_indexer,
-        index_cache,
-        index_table,
-        q_gqa,
-        indivisible,
-        indivisible.clone(),
-        kv_table,
-        indices,
-    ):
-        raise AssertionError(
-            "auto selected FlyDSL for a GQA group the kernel cannot build"
-        )
-
-
-def test_qsa_auto_logs_unmeasured_query_once():
-    """auto logs a table miss once per GQA query, then stays on Triton.
-
-    The predicate itself stays quiet: only ``qsa_layer`` falls back.
-    A measured query, an M mismatch on a measured query, and an explicit
-    backend do not log. The Triton and FlyDSL launches are replaced so
-    this stays on the host.
-    """
-    import logging
-
-    from aiter.ops.flydsl import qsa as qsa_mod
-
-    messages = []
-
-    class _Capture(logging.Handler):
-        def emit(self, record):
-            messages.append(record.getMessage())
-
-    def _call(args, backend="auto", indexer_rows=None):
-        (
-            q_indexer,
-            index_cache,
-            index_table,
-            q_gqa,
-            k_cache,
-            v_cache,
-            kv_table,
-            indices,
-        ) = args
-        if indexer_rows is not None:
-            q_indexer = torch.zeros(
-                indexer_rows,
-                *q_indexer.shape[1:],
-                dtype=q_indexer.dtype,
-            )
-        rows = q_gqa.shape[0]
-        return qsa_layer(
-            q_indexer,
-            index_cache,
-            index_table,
-            q_gqa,
-            k_cache,
-            v_cache,
-            kv_table,
-            torch.zeros(rows, dtype=torch.int32),
-            torch.zeros(rows, dtype=torch.int32),
-            torch.ones(1, dtype=torch.int32),
-            indices=indices,
-            backend=backend,
-        )
-
-    paths = []
-
-    def _triton(*args, **kwargs):
-        paths.append("triton")
-        return args[3]
-
-    def _flydsl(*args, **kwargs):
-        paths.append("flydsl")
-        return args[3]
-
-    page = 16
-    n_columns = 128
-    handler = _Capture()
-    old_triton = qsa_mod._qsa_layer_triton
-    old_flydsl = qsa_mod._qsa_layer_flydsl
-    qsa_mod._log_unmeasured_gqa_query.cache_clear()
-    qsa_mod._qsa_layer_triton = _triton
-    qsa_mod._qsa_layer_flydsl = _flydsl
-    aiter.logger.addHandler(handler)
-    try:
-        untuned = _policy_args(1, 16, 128, n_columns, page, 4, 128)
-        _call(untuned)
-        _call(untuned)
-        other = _policy_args(1, 32, 64, n_columns, page, 4, 128)
-        _call(other)
-        if messages != [
-            "QSA auto: GQA query shape (16, 128) is not in the measured table; using Triton",
-            "QSA auto: GQA query shape (32, 64) is not in the measured table; using Triton",
-        ]:
-            raise AssertionError(f"table-miss log was {messages}")
-        if paths != ["triton", "triton", "triton"]:
-            raise AssertionError(f"unmeasured auto took {paths}")
-
-        messages.clear()
-        paths.clear()
-        swept = _policy_args(1, 24, 256, n_columns, page, 4, 128)
-        _call(swept)
-        _call(untuned, backend="triton")
-        _call(untuned, backend="flydsl")
-        _call(swept, indexer_rows=2)
-        if messages:
-            raise AssertionError(f"measured or explicit backend logged {messages}")
-        if paths != ["flydsl", "triton", "flydsl", "triton"]:
-            raise AssertionError(f"backend choice was {paths}")
-    finally:
-        aiter.logger.removeHandler(handler)
-        qsa_mod._qsa_layer_triton = old_triton
-        qsa_mod._qsa_layer_flydsl = old_flydsl
-        qsa_mod._log_unmeasured_gqa_query.cache_clear()
 
 
 def test_qsa_aot_targets_follow_gpu_archs_without_a_device(monkeypatch):
@@ -3095,44 +2719,31 @@ def _layer_args(case):
     )
 
 
-def _layer_kwargs(idx, backend, **extra):
+def _layer_kwargs(idx, **extra):
     return {
         "token_topk": idx.token_budget,
         "compress_ratio": idx.compress_ratio,
         "score_scale": idx.head_dim**-0.5,
-        "backend": backend,
         **extra,
     }
 
 
 def test_qsa_layer_family_a_matches_oracle():
-    """FlyDSL, the default auto path, and named Triton all match the oracle.
-
-    This family A shape is a measured pair, so auto selects FlyDSL.
-    """
+    """The QSA layer matches the oracle on family A."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
     case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
-    ref = case["ref"].output
-    fly = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, "flydsl"))
+    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
     err = checkAllclose(
-        ref, fly.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="flydsl layer vs oracle"
+        case["ref"].output,
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="layer vs oracle",
     )
     if err != 0:
-        raise AssertionError(f"FlyDSL QSA layer diverged from the oracle (err={err})")
-    default = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, None))
-    named = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, "triton"))
-    for label, out in (("default", default), ("triton", named)):
-        err = checkAllclose(
-            ref,
-            out.to(dtypes.fp32),
-            rtol=1e-2,
-            atol=1e-2,
-            msg=f"{label} layer vs oracle",
-        )
-        if err != 0:
-            raise AssertionError(f"{label} QSA layer diverged (err={err})")
+        raise AssertionError(f"QSA layer diverged from the oracle (err={err})")
 
 
 def test_qsa_layer_family_b_matches_oracle():
@@ -3141,7 +2752,7 @@ def test_qsa_layer_family_b_matches_oracle():
         return
     idx, gqa = FAMILY_B_INDEXER, FAMILY_B_GQA
     case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
-    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx, "flydsl"))
+    out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
     err = checkAllclose(
         case["ref"].output,
         out.to(dtypes.fp32),
@@ -3193,7 +2804,7 @@ def test_qsa_layer_decode_graph_replays():
             indices=indices,
             block_ids=block_ids,
             out=out,
-            **_layer_kwargs(idx, "flydsl"),
+            **_layer_kwargs(idx),
         )
 
     _capture_replay_us(launch)
@@ -3235,12 +2846,12 @@ def _e2e_cells(name, us, err, flops, nbytes):
     }
 
 
-def _time_layer(case, idx, backend, rotate):
+def _time_layer(case, idx, rotate):
     out, us = _time(
         qsa_layer,
         *_layer_args(case),
         rotate=rotate,
-        **_layer_kwargs(idx, backend),
+        **_layer_kwargs(idx),
     )
     return out, us
 
@@ -3249,7 +2860,7 @@ def _time_layer(case, idx, backend, rotate):
 def bench_qsa_family_a_e2e(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
-    """One family A QSA layer: FlyDSL K1+expand+K2 vs live AMD.
+    """One family A QSA layer: FlyDSL K1+expand+K2.
 
     Expand stays the vendored Triton kernel. Oracle is not timed. Same
     ``rotate`` on every column. HIP graph replay is a separate table.
@@ -3260,10 +2871,6 @@ def bench_qsa_family_a_e2e(
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
-    candidates = {
-        "flydsl_e2e": ("flydsl", "flydsl e2e vs oracle"),
-        "vllm_amd_e2e": ("triton", "vllm amd e2e vs oracle"),
-    }
     ret = {
         "gfx": get_gfx(),
         "n_blocks": case["n_blocks"],
@@ -3271,10 +2878,11 @@ def bench_qsa_family_a_e2e(
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(case["k_cache"]),
     }
-    for name, (backend, msg) in candidates.items():
-        out, us = _time_layer(case, idx, backend, rotate)
-        err = checkAllclose(ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg=msg)
-        ret.update(_e2e_cells(name, us, err, flops, nbytes))
+    out, us = _time_layer(case, idx, rotate)
+    err = checkAllclose(
+        ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="e2e vs oracle"
+    )
+    ret.update(_e2e_cells("flydsl_e2e", us, err, flops, nbytes))
     return ret
 
 
@@ -3282,20 +2890,15 @@ def bench_qsa_family_a_e2e(
 def bench_qsa_family_b_e2e(
     m, seq_len, page_size, dtype, index_heads, rotate=0, cache_layout="packed"
 ):
-    """One family B QSA layer vs live AMD.
+    """One family B QSA layer.
 
-    Separate table from family A. Live AMD is the column ``auto`` decides
-    against, so it is the one that governs the gate.
+    Separate table from family A.
     """
     idx = _family_b_indexer(index_heads)
     gqa = FAMILY_B_GQA
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
-    candidates = {
-        "flydsl_e2e": ("flydsl", "flydsl family B e2e"),
-        "vllm_amd_e2e": ("triton", "vllm amd family B e2e"),
-    }
     ret = {
         "gfx": get_gfx(),
         "index_heads": idx.n_heads,
@@ -3304,10 +2907,11 @@ def bench_qsa_family_b_e2e(
         "valid%": 100.0 * w / w_alloc,
         "cache_span_gib": _span_gib(case["k_cache"]),
     }
-    for name, (backend, msg) in candidates.items():
-        out, us = _time_layer(case, idx, backend, rotate)
-        err = checkAllclose(ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg=msg)
-        ret.update(_e2e_cells(name, us, err, flops, nbytes))
+    out, us = _time_layer(case, idx, rotate)
+    err = checkAllclose(
+        ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="family B e2e"
+    )
+    ret.update(_e2e_cells("flydsl_e2e", us, err, flops, nbytes))
     return ret
 
 
@@ -3325,7 +2929,7 @@ def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout="pac
     device = case["q_gqa"].device
     width = idx.index_width
 
-    def _replay(backend, out):
+    def _replay(out):
         indices = torch.empty((m, width), dtype=dtypes.i32, device=device)
         block_ids = torch.empty((m, idx.block_budget), dtype=dtypes.i32, device=device)
 
@@ -3335,7 +2939,7 @@ def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout="pac
                 indices=indices,
                 block_ids=block_ids,
                 out=out,
-                **_layer_kwargs(idx, backend),
+                **_layer_kwargs(idx),
             )
 
         us = _capture_replay_us(launch)
@@ -3344,24 +2948,18 @@ def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout="pac
             out.to(dtypes.fp32),
             rtol=1e-2,
             atol=1e-2,
-            msg=f"{backend} graph replay vs oracle",
+            msg="graph replay vs oracle",
         )
         return us, err
 
-    candidates = {
-        "flydsl_graph": "flydsl",
-        "vllm_amd_graph": "triton",
-    }
-    ret = {
+    us, err = _replay(torch.empty_like(case["q_gqa"]))
+    return {
         "gfx": get_gfx(),
         "n_blocks": case["n_blocks"],
         "valid%": 100.0 * w / width,
         "cache_span_gib": _span_gib(case["k_cache"]),
+        **_e2e_cells("flydsl_graph", us, err, flops, nbytes),
     }
-    for name, backend in candidates.items():
-        us, err = _replay(backend, torch.empty_like(case["q_gqa"]))
-        ret.update(_e2e_cells(name, us, err, flops, nbytes))
-    return ret
 
 
 def _k1_k2_sweep_batches(batches):
@@ -3519,21 +3117,6 @@ def main():
         return
 
     for dtype in args.dtype:
-        rows = []
-        for m, seq_len, page_size, rotate in itertools.product(
-            args.batch, args.seq, args.page_size, args.rotate
-        ):
-            if m > seq_len:
-                continue
-            rows.append(
-                bench_qsa_family_a_vllm_amd(m, seq_len, page_size, dtype, rotate)
-            )
-        df = pd.DataFrame(rows)
-        aiter.logger.info(
-            "QSA family A vLLM AMD summary (markdown):\n%s",
-            df.to_markdown(index=False),
-        )
-
         decode_m, prefill_m = _k1_k2_sweep_batches(args.batch)
 
         rows = []
@@ -3575,12 +3158,6 @@ def main():
             if "flydsl_k1_graph err" in row:
                 _raise_if_k1_mismatch(
                     row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL K1 graph"
-                )
-                _raise_if_k1_mismatch(
-                    row["vllm_amd_select_graph err"],
-                    m,
-                    seq_len,
-                    where="live AMD select graph",
                 )
             rows.append(row)
         if rows:
@@ -3647,12 +3224,6 @@ def main():
             if "flydsl_k1_graph err" in row:
                 _raise_if_k1_mismatch(
                     row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL K1 graph"
-                )
-                _raise_if_k1_mismatch(
-                    row["vllm_amd_select_graph err"],
-                    m,
-                    seq_len,
-                    where="live AMD select graph",
                 )
             rows.append(row)
         if rows:
