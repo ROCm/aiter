@@ -1,46 +1,57 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Accuracy and timing tests for gfx1250 FlyDSL MLA decode kernels.
+"""Accuracy and timing tests for the gfx1250 MLA decode kernels written in FlyDSL.
+
+Backends:
+
+* PS1: persistent page-size-1 FP8 decode. :func:`aiter.mla.mla_decode_fwd` runs
+  it on code objects exported from FlyDSL (``aiter.mla_ps1_fp8_asm_fwd``,
+  hsa/gfx1250/mla_dsl). "jit" below is FlyDSL JIT of the PS1 kernel in this
+  repository (aiter/ops/flydsl/kernels/mla_gfx1250/mla_pagesize1_fp8_fp8.py),
+  a different build of the same computation.
+* PS64: the page-size-64 FlyDSL kernel, and the hand-written ASM PS64 kernel
+  (``asm_ps64``) both are compared with.
 
 Modes:
 
-* ``ps1`` validates persistent page-size-1 FlyDSL through
-  :func:`aiter.mla.mla_decode_fwd`.
-* ``ps64`` compares the dedicated page-size-64 FlyDSL kernel with ASM PS64.
-* ``ps1-vs-asm`` compares persistent FlyDSL PS1 with ASM PS64 using the same
-  logical Q/KV values packed into each backend's native layout. Head counts ASM
-  has no kernel for run there padded up to one it does, so read ``speedup``
-  against the ``asm_heads`` column: at 96 heads ASM is doing 128 heads of work.
-* ``cp`` validates persistent page-size-1 FlyDSL under round-robin context
-  parallelism: global KV position ``p`` lives on rank ``p % W``, each rank is run
-  on its own shard with the causal mask applied on global positions, and the
-  ranks' LSE-merged output is compared with plain full-KV attention.
-* ``ps1-asm`` checks the interface to the code objects exported from the FlyDSL
-  PS1 kernel (``aiter.mla_ps1_fp8_asm_fwd``, hsa/gfx1250/mla_dsl): every case
-  runs through :func:`aiter.mla.mla_decode_fwd` once on FlyDSL JIT and once on
-  the code object, the two must agree in output and LSE (bit for bit where the
-  code objects come from this kernel source, to rounding otherwise), and the
-  code object output is checked against the torch reference. Causal masking and
-  the returned LSE are swept, since each selects its own code object.
+* ``ps1`` checks PS1 through :func:`aiter.mla.mla_decode_fwd` against the torch
+  reference.
+* ``cp`` does the same under round-robin context parallelism: global KV
+  position ``p`` lives on rank ``p % W``, each rank runs on its own shard with
+  the causal mask applied on global positions, and the ranks' LSE-merged output
+  is compared with full-KV attention.
+* ``ps1-asm`` checks the PS1 code objects against FlyDSL JIT: every case runs
+  once with the code object entry point stood in for by JIT and once on the code
+  object; output and LSE must agree to bf16 / fp32 rounding, and the code object
+  output must match the reference. Causal masking and the returned LSE are
+  swept, since each selects its own code object.
 * ``cp-asm`` does the same for round-robin CP, rank by rank.
+* ``ps1-vs-asm`` times PS1 against ASM PS64 on the same logical Q/KV, each
+  packed into its native layout. Head counts ASM PS64 has no kernel for run
+  padded up to one it does (see the ``asm heads`` column: at 96 heads ASM does
+  128 heads of work).
+* ``ps64`` checks and times the FlyDSL PS64 kernel against ASM PS64.
+
+Every mode sweeps the product of its arguments and skips the combinations its
+backends do not support (reported at the end).
 
 Examples:
 
   python3 op_tests/test_mla_flydsl.py --mode ps1
   python3 op_tests/test_mla_flydsl.py --mode ps1 -b 1 -c 1 63 64 65
-  python3 op_tests/test_mla_flydsl.py --mode ps64 --split-kv 0 1 2
-  python3 op_tests/test_mla_flydsl.py --mode ps1-vs-asm \
-      --num-heads 32 --q-seq-len 1 --varlen
-  python3 op_tests/test_mla_flydsl.py --mode ps1-vs-asm \
-      --num-heads 96 -b 64 -c 8192 --varlen --varlen-min-ratio 0.1
-  python3 op_tests/test_mla_flydsl.py --mode cp --num-heads 16 96 \
+  python3 op_tests/test_mla_flydsl.py --mode ps1 --varlen --varlen-min-ratio 0.1
+  python3 op_tests/test_mla_flydsl.py --mode cp --num-heads 16 96 \\
       --q-seq-len 2 4 --cp-world-size 2 4 8 -c 3 64 1200 --varlen
   python3 op_tests/test_mla_flydsl.py --mode ps1-asm -c 65 2048 8192 --varlen
-  python3 op_tests/test_mla_flydsl.py --mode cp-asm --q-seq-len 1 4 \
+  python3 op_tests/test_mla_flydsl.py --mode cp-asm --q-seq-len 1 4 \\
       --cp-world-size 2 4 8 -c 64 2048
+  python3 op_tests/test_mla_flydsl.py --mode ps1-vs-asm --num-heads 96 \\
+      -b 64 -c 8192 --varlen --varlen-min-ratio 0.1
+  python3 op_tests/test_mla_flydsl.py --mode ps64 --split-kv 0 1 2
 """
 
 import argparse
+import collections
 import contextlib
 import itertools
 import os
@@ -57,16 +68,15 @@ from aiter.test_common import checkAllclose, run_perftest
 os.environ.setdefault("AITER_MLA_DECODE_PS1_FLYDSL", "1")
 torch.set_default_device("cuda")
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
 SUPPORTED_GFX = ("gfx1250",)
-MODES = ("ps1", "ps64", "ps1-vs-asm", "cp", "ps1-asm", "cp-asm")
-# Head counts with PS1 code objects in hsa/gfx1250/mla_dsl/mla_dsl.csv.
-PS1_ASM_NUM_Q_HEADS = (96, 128)
-# The 128-head code objects come from a kernel revision with lazy softmax
-# rescaling, so they match FlyDSL JIT only to rounding, not bit for bit.
-PS1_ASM_BIT_EXACT_Q_HEADS = (96,)
-PS1_ASM_ENV = "AITER_MLA_DECODE_PS1_ASM"
+MODES = ("ps1", "cp", "ps1-asm", "cp-asm", "ps1-vs-asm", "ps64")
+
 SUPPORTED_NUM_Q_HEADS = (16, 32, 64, 96, 128)
-NHEAD96 = 96
+# Query lengths PS1 serves per head count.
 PS1_Q_SEQ_LENS = {
     16: (1, 2, 3, 4),
     32: (1,),
@@ -74,6 +84,7 @@ PS1_Q_SEQ_LENS = {
     96: (1, 2, 3, 4, 6, 8),
     128: (1,),
 }
+# Query lengths ps1-vs-asm compares at (those ASM PS64 has kernels for).
 COMPARE_Q_SEQ_LENS = {
     16: (1, 2, 4),
     32: (1,),
@@ -81,12 +92,20 @@ COMPARE_Q_SEQ_LENS = {
     96: (1,),
     128: (1,),
 }
+# Code objects and FlyDSL JIT are separate builds that round probabilities to
+# FP8 at different points, so the odd value lands one FP8 step apart.
+JIT_MISMATCH_RATIO = 1e-3
+# Head counts ASM PS64 runs padded up to.
 ASM_PADDED_HEADS = {96: 128}
+# The PS1 metadata planner packs nhead * q_seq query rows per work item up to
+# this many; beyond it every work item holds one query position.
+PLANNER_PACKED_Q_BUDGET = 128
 
 QK_NOPE_HEAD_DIM = 512
 QK_ROPE_HEAD_DIM = 64
 QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM
 V_HEAD_DIM = QK_NOPE_HEAD_DIM
+SOFTMAX_SCALE = 1.0 / (QK_HEAD_DIM**0.5)
 
 PS64_PAGE_SIZE = 64
 PS64_NUM_Q_HEADS = 128
@@ -98,6 +117,10 @@ SCALE_MODES = ("unit", "poc")
 _SEED = 20260909
 _PERF_NUM_ITERS = 101
 _PERF_NUM_WARMUP = 5
+
+# ---------------------------------------------------------------------------
+# Cases: sequence lengths, Q/KV, backend layouts and metadata
+# ---------------------------------------------------------------------------
 
 
 def _make_fp8_scales(device, mode):
@@ -307,10 +330,10 @@ def _build_ps1_metadata(
 
     num_works = int(work_indptr[-1].item())
     work_info = work_info_set[:num_works]
-    qo_tile_size = 1 if nhead == NHEAD96 else q_seq_len
+    qo_tile_size = 1 if nhead * 2 > PLANNER_PACKED_Q_BUDGET else q_seq_len
     if bool((work_info[:, 3] - work_info[:, 2] != qo_tile_size).any()):
         raise RuntimeError(
-            f"FlyDSL PS1 nhead={nhead} expects qo tiles of {qo_tile_size}, "
+            f"PS1 nhead={nhead} expects qo tiles of {qo_tile_size}, "
             f"got {sorted(set((work_info[:, 3] - work_info[:, 2]).tolist()))}"
         )
 
@@ -356,6 +379,16 @@ def _build_logical_case(seq_lens, q_seq_len, nhead, scales):
         "nhead": nhead,
         "total_kv": total_kv,
     }
+
+
+def _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales):
+    if batch < 1 or ctx_len < 1:
+        raise ValueError(
+            f"batch and ctx_len must be positive, got {batch=}, {ctx_len=}"
+        )
+    torch.manual_seed(_seed_for(batch, ctx_len, q_seq_len, varlen, min_ratio, nhead))
+    seq_lens = _make_seq_lens(batch, ctx_len, varlen, min_ratio)
+    return _build_logical_case(seq_lens, q_seq_len, nhead, scales)
 
 
 def _add_ps1_layout(case, causal=True):
@@ -428,6 +461,22 @@ def _add_ps64_layout(case, num_splits, asm_heads=None):
     )
 
 
+def _decode_output(case, nhead=None):
+    return torch.empty(
+        (
+            len(case["seq_lens"]) * case["q_seq_len"],
+            case["nhead"] if nhead is None else nhead,
+            V_HEAD_DIM,
+        ),
+        dtype=torch.bfloat16,
+    )
+
+
+# ---------------------------------------------------------------------------
+# References and checks
+# ---------------------------------------------------------------------------
+
+
 def _torch_reference(case, softmax_scale, causal=True, return_lse=False):
     query = case["query"].float()
     kv_logical = case["kv_logical"].float()
@@ -466,15 +515,123 @@ def _torch_reference(case, softmax_scale, causal=True, return_lse=False):
     return (output, lse) if return_lse else output
 
 
-def _decode_output(case, nhead=None):
-    return torch.empty(
-        (
-            len(case["seq_lens"]) * case["q_seq_len"],
-            case["nhead"] if nhead is None else nhead,
-            V_HEAD_DIM,
-        ),
-        dtype=torch.bfloat16,
+def _cp_local_positions(seq_len, cp_world_size, cp_rank, device):
+    """Global positions of one request's tokens held by ``cp_rank``, in order."""
+    return torch.arange(seq_len, device=device)[cp_rank::cp_world_size]
+
+
+def _torch_reference_cp_rank(case, softmax_scale, cp_world_size, cp_rank):
+    """One rank's partial attention under round-robin CP.
+
+    Query row ``i`` of a request sits at global position ``seq_len - q_seq + i``
+    and sees the rank's tokens at or before it. Rows that see none of them come
+    back as out=0, lse=-inf, which is what the kernel writes for them.
+    """
+    query = case["query"].float()
+    kv_logical = case["kv_logical"].float()
+    q_scale = float(case["q_scale"][0])
+    kv_scale = float(case["kv_scale"][0])
+    score_scale = softmax_scale * q_scale * kv_scale
+    q_seq_len = case["q_seq_len"]
+    rows = len(case["seq_lens"]) * q_seq_len
+    output = torch.zeros(
+        (rows, case["nhead"], V_HEAD_DIM), dtype=torch.float32, device=query.device
     )
+    lse = torch.full(
+        (rows, case["nhead"]), float("-inf"), dtype=torch.float32, device=query.device
+    )
+
+    for batch_id, seq_len in enumerate(case["seq_lens"]):
+        positions = _cp_local_positions(seq_len, cp_world_size, cp_rank, query.device)
+        kv = kv_logical[case["kv_offsets"][batch_id] + positions]
+        for q_pos in range(q_seq_len):
+            q_row = batch_id * q_seq_len + q_pos
+            visible = positions <= seq_len - q_seq_len + q_pos
+            if not bool(visible.any()):
+                continue
+            valid_kv = kv[visible]
+            logits = torch.matmul(query[q_row], valid_kv.transpose(0, 1)) * score_scale
+            lse[q_row] = torch.logsumexp(logits, dim=-1)
+            output[q_row] = (
+                torch.matmul(torch.softmax(logits, dim=-1), valid_kv[:, :V_HEAD_DIM])
+                * kv_scale
+            )
+    return output, lse
+
+
+def _merge_cp_ranks(outputs, lses):
+    """Combine per-rank partial attention with the standard LSE merge."""
+    lse = torch.stack(lses)
+    weights = torch.exp(lse - lse.max(0).values).nan_to_num(0.0)
+    merged = (torch.stack([out.float() for out in outputs]) * weights[..., None]).sum(0)
+    return merged / weights.sum(0)[..., None]
+
+
+def _check_output(name, reference, output):
+    """Mismatch ratio of ``output`` against ``reference``; at most 5% may differ."""
+    assert torch.isfinite(output).all(), f"{name}: non-finite output"
+    error = checkAllclose(
+        reference,
+        output.float(),
+        rtol=6e-2,
+        atol=6e-2,
+        tol_err_ratio=0.05,
+        msg=f"{name}: MLA decode output",
+    )
+    assert error <= 0.05, f"{name}: mismatch ratio {error:.2%} exceeds 5%"
+    return error
+
+
+def _check_lse(name, reference, output):
+    finite = torch.isfinite(reference)
+    assert bool(
+        torch.isneginf(output[~finite]).all()
+    ), f"{name}: rows that see no local KV must report lse=-inf"
+    if not bool(finite.any()):
+        return 0.0
+    # Absolute and tight on purpose: one token wrongly let through the round-robin
+    # mask moves a row's LSE by roughly 1/(visible tokens), which a relative
+    # tolerance on LSE values of ~log(len) would swallow at long context.
+    error = checkAllclose(
+        reference[finite],
+        output[finite],
+        rtol=0.0,
+        atol=1e-3,
+        tol_err_ratio=0.05,
+        msg=f"{name}: MLA decode LSE",
+    )
+    assert error <= 0.05, f"{name}: LSE mismatch ratio {error:.2%} exceeds 5%"
+    return error
+
+
+def _assert_matches_jit(name, jit_tensors, asm_tensors):
+    """The code object's output and LSE against FlyDSL JIT's: -inf in the same
+    places, and at most JIT_MISMATCH_RATIO of the finite values apart by more
+    than bf16 output / fp32 LSE rounding."""
+    for index, (jit, asm) in enumerate(zip(jit_tensors, asm_tensors, strict=True)):
+        if jit is None or asm is None:
+            assert jit is None and asm is None, f"{name}: tensor {index} is missing"
+            continue
+        tol = 2e-2 if jit.dtype == torch.bfloat16 else 1e-4
+        jit, asm = jit.float(), asm.float()
+        assert torch.equal(
+            torch.isneginf(jit), torch.isneginf(asm)
+        ), f"{name}: code object output {index} has -inf where FlyDSL JIT does not"
+        finite = torch.isfinite(jit)
+        if not bool(finite.any()):
+            continue
+        close = torch.isclose(asm[finite], jit[finite], atol=tol, rtol=tol)
+        ratio = 1.0 - close.float().mean().item()
+        assert ratio <= JIT_MISMATCH_RATIO, (
+            f"{name}: code object output {index} vs FlyDSL JIT: {ratio:.2e} of "
+            f"values differ by more than {tol} (max "
+            f"{(asm[finite] - jit[finite]).abs().max().item():.4f})"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Launchers
+# ---------------------------------------------------------------------------
 
 
 def _run_ps1(case, softmax_scale, output, causal=True, return_lse=False):
@@ -526,28 +683,92 @@ def _run_asm_ps64(case, num_splits, softmax_scale, output):
     )
 
 
-def _check_output(name, reference, output):
-    assert torch.isfinite(output).all(), f"{name}: non-finite output"
-    error = checkAllclose(
-        reference,
-        output.float(),
-        rtol=6e-2,
-        atol=6e-2,
-        tol_err_ratio=0.05,
-        msg=f"{name}: MLA decode output",
-    )
-    assert error <= 0.05, f"{name}: mismatch ratio {error:.2%} exceeds 5%"
-    return error
+@contextlib.contextmanager
+def _ps1_stage1_backend(use_asm):
+    """mla_decode_fwd runs PS1 stage 1 on the exported code objects; with
+    ``use_asm=False`` the code object entry point is stood in for by FlyDSL JIT
+    of the repository's PS1 kernel. Fails if no launch lands on the backend
+    asked for."""
+    import aiter.ops.flydsl.mla_kernels as flydsl_mla
 
+    calls = {"asm": 0, "jit": 0}
+    asm_fn = aiter.mla_ps1_fp8_asm_fwd
 
-def _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales):
-    if batch < 1 or ctx_len < 1:
-        raise ValueError(
-            f"batch and ctx_len must be positive, got {batch=}, {ctx_len=}"
+    def asm(*args, **kwargs):
+        calls["asm"] += 1
+        return asm_fn(*args, **kwargs)
+
+    def jit(
+        split_data,
+        split_lse,
+        final_output,
+        final_lse,
+        q,
+        kv_buffer,
+        kv_page_indices,
+        work_indptr,
+        work_info,
+        softmax_scale,
+        q_scale,
+        kv_scale,
+        max_seqlen_q,
+        causal,
+        qo_indptr,
+        kv_indptr,
+        g_kv_indptr,
+        cp_world_size,
+        cp_rank,
+    ):
+        calls["jit"] += 1
+        flydsl_mla.flydsl_mla_pagesize1_fp8_fp8(
+            split_data,
+            split_lse,
+            final_output,
+            q,
+            kv_buffer,
+            kv_page_indices,
+            work_indptr,
+            work_info,
+            softmax_scale,
+            q_scale=q_scale,
+            kv_scale=kv_scale,
+            final_lse=final_lse,
+            max_seqlen_q=max_seqlen_q,
+            causal=causal,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            g_kv_indptr=g_kv_indptr,
+            cp_world_size=cp_world_size,
+            cp_rank=cp_rank,
         )
-    torch.manual_seed(_seed_for(batch, ctx_len, q_seq_len, varlen, min_ratio, nhead))
-    seq_lens = _make_seq_lens(batch, ctx_len, varlen, min_ratio)
-    return _build_logical_case(seq_lens, q_seq_len, nhead, scales)
+
+    aiter.mla_ps1_fp8_asm_fwd = asm if use_asm else jit
+    try:
+        yield calls
+    finally:
+        aiter.mla_ps1_fp8_asm_fwd = asm_fn
+    expected, other = ("asm", "jit") if use_asm else ("jit", "asm")
+    assert (
+        calls[expected] > 0 and calls[other] == 0
+    ), f"PS1 stage 1 expected on {expected}, dispatched {calls}"
+
+
+# ---------------------------------------------------------------------------
+# Mode drivers: each runs one case and returns its summary row
+# ---------------------------------------------------------------------------
+
+
+def _row(mode, case, nhead, q_seq_len, **columns):
+    """A summary row: the columns every mode shares, then the mode's own."""
+    return {
+        "mode": mode,
+        "batch": len(case["seq_lens"]),
+        "min_ctx": min(case["seq_lens"]),
+        "max_ctx": max(case["seq_lens"]),
+        "nhead": nhead,
+        "q_seq": q_seq_len,
+        **columns,
+    }
 
 
 def _test_ps1(
@@ -563,91 +784,21 @@ def _test_ps1(
 ):
     case = _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales)
     _add_ps1_layout(case)
-    softmax_scale = 1.0 / (QK_HEAD_DIM**0.5)
-    reference = _torch_reference(case, softmax_scale)
+    reference = _torch_reference(case, SOFTMAX_SCALE)
     output = _decode_output(case)
 
     def run():
-        _run_ps1(case, softmax_scale, output)
+        _run_ps1(case, SOFTMAX_SCALE, output)
 
-    _, total_us = run_perftest(run, num_iters=num_iters, num_warmup=num_warmup)
-    return {
-        "mode": "ps1",
-        "batch": batch,
-        "min_ctx": min(case["seq_lens"]),
-        "max_ctx": max(case["seq_lens"]),
-        "nhead": nhead,
-        "q_seq": q_seq_len,
-        "total us": total_us,
-        "err": _check_output("ps1", reference, output),
-    }
-
-
-@contextlib.contextmanager
-def _ps1_stage1_backend(use_asm):
-    """Route mla_decode_fwd's PS1 stage 1 to the exported code objects or to
-    FlyDSL JIT, and fail if any launch lands on the other one."""
-    import aiter.ops.flydsl.mla_kernels as flydsl_mla
-
-    calls = {"asm": 0, "jit": 0}
-    asm_fn = aiter.mla_ps1_fp8_asm_fwd
-    jit_fn = flydsl_mla.flydsl_mla_pagesize1_fp8_fp8
-
-    def counted(name, fn):
-        def wrapper(*args, **kwargs):
-            calls[name] += 1
-            return fn(*args, **kwargs)
-
-        return wrapper
-
-    saved_env = os.environ.get(PS1_ASM_ENV)
-    os.environ[PS1_ASM_ENV] = "1" if use_asm else "0"
-    aiter.mla_ps1_fp8_asm_fwd = counted("asm", asm_fn)
-    flydsl_mla.flydsl_mla_pagesize1_fp8_fp8 = counted("jit", jit_fn)
-    try:
-        yield calls
-    finally:
-        aiter.mla_ps1_fp8_asm_fwd = asm_fn
-        flydsl_mla.flydsl_mla_pagesize1_fp8_fp8 = jit_fn
-        if saved_env is None:
-            os.environ.pop(PS1_ASM_ENV, None)
-        else:
-            os.environ[PS1_ASM_ENV] = saved_env
-    expected, other = ("asm", "jit") if use_asm else ("jit", "asm")
-    assert (
-        calls[expected] > 0 and calls[other] == 0
-    ), f"PS1 stage 1 expected on {expected}, dispatched {calls}"
-
-
-def _assert_matches_jit(name, nhead, jit_tensors, asm_tensors):
-    """Code object output and LSE against FlyDSL JIT: bit for bit for
-    PS1_ASM_BIT_EXACT_Q_HEADS, else to bf16 output / fp32 LSE rounding."""
-    bit_exact = nhead in PS1_ASM_BIT_EXACT_Q_HEADS
-    for index, (jit, asm) in enumerate(zip(jit_tensors, asm_tensors, strict=True)):
-        if jit is None or asm is None:
-            assert jit is None and asm is None, f"{name}: tensor {index} is missing"
-            continue
-        if bit_exact:
-            view = {4: torch.int32, 2: torch.int16}[jit.element_size()]
-            assert torch.equal(
-                jit.view(view), asm.view(view)
-            ), f"{name}: code object output {index} differs from FlyDSL JIT"
-            continue
-        jit, asm = jit.float(), asm.float()
-        assert torch.equal(
-            torch.isneginf(jit), torch.isneginf(asm)
-        ), f"{name}: code object output {index} has -inf where FlyDSL JIT does not"
-        finite = torch.isfinite(jit)
-        tol = 2e-2 if jit_tensors[index].dtype == torch.bfloat16 else 1e-4
-        torch.testing.assert_close(
-            asm[finite],
-            jit[finite],
-            atol=tol,
-            rtol=tol,
-            msg=lambda m, index=index: (
-                f"{name}: code object output {index} vs FlyDSL JIT: {m}"
-            ),
-        )
+    _, us = run_perftest(run, num_iters=num_iters, num_warmup=num_warmup)
+    return _row(
+        "ps1",
+        case,
+        nhead,
+        q_seq_len,
+        us=us,
+        err=_check_output("ps1", reference, output),
+    )
 
 
 def _test_ps1_asm(
@@ -665,9 +816,8 @@ def _test_ps1_asm(
 ):
     case = _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales)
     _add_ps1_layout(case, causal=causal)
-    softmax_scale = 1.0 / (QK_HEAD_DIM**0.5)
     reference, reference_lse = _torch_reference(
-        case, softmax_scale, causal=causal, return_lse=True
+        case, SOFTMAX_SCALE, causal=causal, return_lse=True
     )
 
     results, timings = {}, {}
@@ -675,7 +825,7 @@ def _test_ps1_asm(
         output = _decode_output(case)
 
         def run(output=output):
-            return _run_ps1(case, softmax_scale, output, causal, return_lse)
+            return _run_ps1(case, SOFTMAX_SCALE, output, causal, return_lse)
 
         with _ps1_stage1_backend(use_asm=backend == "asm"):
             _, timings[backend] = run_perftest(
@@ -685,99 +835,22 @@ def _test_ps1_asm(
         results[backend] = (output, final_lse)
 
     name = f"ps1-asm causal={int(causal)} lse={int(return_lse)}"
-    _assert_matches_jit(name, nhead, results["jit"], results["asm"])
+    _assert_matches_jit(name, results["jit"], results["asm"])
     output, final_lse = results["asm"]
     err = _check_output(name, reference, output)
     if return_lse:
         _check_lse(name, reference_lse, final_lse.float())
-    return {
-        "mode": "ps1-asm",
-        "batch": batch,
-        "min_ctx": min(case["seq_lens"]),
-        "max_ctx": max(case["seq_lens"]),
-        "nhead": nhead,
-        "q_seq": q_seq_len,
-        "causal": int(causal),
-        "lse": int(return_lse),
-        "jit us": timings["jit"],
-        "asm us": timings["asm"],
-        "asm/jit": timings["asm"] / timings["jit"],
-        "err": err,
-    }
-
-
-def _cp_local_positions(seq_len, cp_world_size, cp_rank, device):
-    """Global positions of one request's tokens held by ``cp_rank``, in order."""
-    return torch.arange(seq_len, device=device)[cp_rank::cp_world_size]
-
-
-def _torch_reference_cp_rank(case, softmax_scale, cp_world_size, cp_rank):
-    """One rank's partial attention under round-robin CP.
-
-    Query row ``i`` of a request sits at global position ``seq_len - q_seq + i``
-    and sees the rank's tokens at or before it. Rows that see none of them come
-    back as out=0, lse=-inf, which is what the kernel writes for them.
-    """
-    query = case["query"].float()
-    kv_logical = case["kv_logical"].float()
-    q_scale = float(case["q_scale"][0])
-    kv_scale = float(case["kv_scale"][0])
-    score_scale = softmax_scale * q_scale * kv_scale
-    q_seq_len = case["q_seq_len"]
-    rows = len(case["seq_lens"]) * q_seq_len
-    output = torch.zeros(
-        (rows, case["nhead"], V_HEAD_DIM), dtype=torch.float32, device=query.device
+    return _row(
+        "ps1-asm",
+        case,
+        nhead,
+        q_seq_len,
+        causal=int(causal),
+        lse=int(return_lse),
+        **{"jit us": timings["jit"], "asm us": timings["asm"]},
+        **{"asm/jit": timings["asm"] / timings["jit"]},
+        err=err,
     )
-    lse = torch.full(
-        (rows, case["nhead"]), float("-inf"), dtype=torch.float32, device=query.device
-    )
-
-    for batch_id, seq_len in enumerate(case["seq_lens"]):
-        positions = _cp_local_positions(seq_len, cp_world_size, cp_rank, query.device)
-        kv = kv_logical[case["kv_offsets"][batch_id] + positions]
-        for q_pos in range(q_seq_len):
-            q_row = batch_id * q_seq_len + q_pos
-            visible = positions <= seq_len - q_seq_len + q_pos
-            if not bool(visible.any()):
-                continue
-            valid_kv = kv[visible]
-            logits = torch.matmul(query[q_row], valid_kv.transpose(0, 1)) * score_scale
-            lse[q_row] = torch.logsumexp(logits, dim=-1)
-            output[q_row] = (
-                torch.matmul(torch.softmax(logits, dim=-1), valid_kv[:, :V_HEAD_DIM])
-                * kv_scale
-            )
-    return output, lse
-
-
-def _check_lse(name, reference, output):
-    finite = torch.isfinite(reference)
-    assert bool(
-        torch.isneginf(output[~finite]).all()
-    ), f"{name}: rows that see no local KV must report lse=-inf"
-    if not bool(finite.any()):
-        return 0.0
-    # Absolute and tight on purpose: one token wrongly let through the round-robin
-    # mask moves a row's LSE by roughly 1/(visible tokens), which a relative
-    # tolerance on LSE values of ~log(len) would swallow at long context.
-    error = checkAllclose(
-        reference[finite],
-        output[finite],
-        rtol=0.0,
-        atol=1e-3,
-        tol_err_ratio=0.05,
-        msg=f"{name}: MLA decode LSE",
-    )
-    assert error <= 0.05, f"{name}: LSE mismatch ratio {error:.2%} exceeds 5%"
-    return error
-
-
-def _merge_cp_ranks(outputs, lses):
-    """Combine per-rank partial attention with the standard LSE merge."""
-    lse = torch.stack(lses)
-    weights = torch.exp(lse - lse.max(0).values).nan_to_num(0.0)
-    merged = (torch.stack([out.float() for out in outputs]) * weights[..., None]).sum(0)
-    return merged / weights.sum(0)[..., None]
 
 
 def _test_cp(
@@ -795,10 +868,10 @@ def _test_cp(
     return_tensors=False,
     return_lse=True,
 ):
-    """``use_asm`` pins the PS1 stage 1 backend (None leaves it to the
-    environment); ``return_tensors`` also returns every rank's output and LSE.
-    Without ``return_lse`` the kernel writes no LSE, so the ranks are merged
-    with the reference LSE and the returned LSEs are None."""
+    """``use_asm`` pins the PS1 stage 1 backend (None leaves mla_decode_fwd's);
+    ``return_tensors`` also returns every rank's output and LSE. Without
+    ``return_lse`` the kernel writes no LSE, so the ranks are merged with the
+    reference LSE and the returned LSEs are None."""
     case = _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales)
     min_len = min(case["seq_lens"])
     if min_len < q_seq_len:
@@ -814,7 +887,6 @@ def _test_cp(
         )
     kv_buffer, kv_indices = _pack_kv_ps1(case["kv_logical"])
     g_kv_indptr = _prefix_sum(case["seq_lens"], kv_buffer.device)
-    softmax_scale = 1.0 / (QK_HEAD_DIM**0.5)
 
     backend = (
         contextlib.nullcontext() if use_asm is None else _ps1_stage1_backend(use_asm)
@@ -859,7 +931,7 @@ def _test_cp(
                     q_seq_len,
                     page_size=1,
                     nhead_kv=1,
-                    sm_scale=softmax_scale,
+                    sm_scale=SOFTMAX_SCALE,
                     work_meta_data=metadata["work_meta_data"],
                     work_indptr=metadata["work_indptr"],
                     work_info_set=metadata["work_info_set"],
@@ -878,7 +950,7 @@ def _test_cp(
             _, us = run_perftest(run, num_iters=num_iters, num_warmup=num_warmup)
             _, final_lse = run()
             reference, reference_lse = _torch_reference_cp_rank(
-                case, softmax_scale, cp_world_size, cp_rank
+                case, SOFTMAX_SCALE, cp_world_size, cp_rank
             )
             name = f"cp W={cp_world_size} rank={cp_rank} lse={int(return_lse)}"
             rank_errs.append(_check_output(name, reference, output))
@@ -895,20 +967,21 @@ def _test_cp(
             merge_lses.append(lses[-1] if return_lse else reference_lse)
             rank_us.append(us)
 
-    reference = _torch_reference(case, softmax_scale)
+    reference = _torch_reference(case, SOFTMAX_SCALE)
     merged = _merge_cp_ranks(outputs, merge_lses)
-    row = {
-        "mode": "cp",
-        "batch": batch,
-        "min_ctx": min(case["seq_lens"]),
-        "max_ctx": max(case["seq_lens"]),
-        "nhead": nhead,
-        "q_seq": q_seq_len,
-        "cp_world": cp_world_size,
-        "max rank us": max(rank_us),
-        "max rank err": max(rank_errs),
-        "merged err": _check_output(f"cp W={cp_world_size} merged", reference, merged),
-    }
+    row = _row(
+        "cp",
+        case,
+        nhead,
+        q_seq_len,
+        cp_world=cp_world_size,
+        **{"max rank us": max(rank_us), "max rank err": max(rank_errs)},
+        **{
+            "merged err": _check_output(
+                f"cp W={cp_world_size} merged", reference, merged
+            )
+        },
+    )
     return (row, outputs, lses) if return_tensors else row
 
 
@@ -937,18 +1010,13 @@ def _test_cp_asm(
     for cp_rank in range(cp_world_size):
         _assert_matches_jit(
             f"cp-asm W={cp_world_size} rank={cp_rank} lse={int(return_lse)}",
-            nhead,
             (jit_outputs[cp_rank], jit_lses[cp_rank]),
             (asm_outputs[cp_rank], asm_lses[cp_rank]),
         )
+    shared = ("batch", "min_ctx", "max_ctx", "nhead", "q_seq", "cp_world")
     return {
         "mode": "cp-asm",
-        "batch": batch,
-        "min_ctx": asm_row["min_ctx"],
-        "max_ctx": asm_row["max_ctx"],
-        "nhead": nhead,
-        "q_seq": q_seq_len,
-        "cp_world": cp_world_size,
+        **{key: asm_row[key] for key in shared},
         "lse": int(return_lse),
         "jit max rank us": jit_row["max rank us"],
         "asm max rank us": asm_row["max rank us"],
@@ -957,162 +1025,53 @@ def _test_cp_asm(
     }
 
 
-def test_ps1_asm_matches_flydsl(
-    batch=4,
-    ctx_len=2048,
-    q_seq_len=4,
-    nhead=96,
-    causal=True,
-    return_lse=True,
-    varlen=True,
-    varlen_min_ratio=0.5,
-    num_iters=_PERF_NUM_ITERS,
-    num_warmup=_PERF_NUM_WARMUP,
-    scales="poc",
-):
-    if nhead not in PS1_ASM_NUM_Q_HEADS:
-        raise ValueError(f"PS1 code objects ship for nhead={PS1_ASM_NUM_Q_HEADS}")
-    return _test_ps1_asm(
-        batch,
-        ctx_len,
-        nhead,
-        q_seq_len,
-        causal,
-        return_lse,
-        num_iters,
-        num_warmup,
-        scales,
-        varlen,
-        varlen_min_ratio,
-    )
-
-
-def test_cp_asm_matches_flydsl(
-    batch=4,
-    ctx_len=64,
-    q_seq_len=4,
-    nhead=96,
-    cp_world_size=4,
-    varlen=True,
-    varlen_min_ratio=0.5,
-    num_iters=_PERF_NUM_ITERS,
-    num_warmup=_PERF_NUM_WARMUP,
-    scales="poc",
-    return_lse=True,
-):
-    if nhead not in PS1_ASM_NUM_Q_HEADS:
-        raise ValueError(f"PS1 code objects ship for nhead={PS1_ASM_NUM_Q_HEADS}")
-    return _test_cp_asm(
-        batch,
-        ctx_len,
-        nhead,
-        q_seq_len,
-        cp_world_size,
-        num_iters,
-        num_warmup,
-        scales,
-        varlen,
-        varlen_min_ratio,
-        return_lse,
-    )
-
-
-def test_cp_asm_no_lse_matches_flydsl():
-    return test_cp_asm_matches_flydsl(return_lse=False)
-
-
-def test_ps1_cp_round_robin(
-    batch=4,
-    ctx_len=64,
-    q_seq_len=4,
-    nhead=96,
-    cp_world_size=4,
-    varlen=True,
-    varlen_min_ratio=0.5,
-    num_iters=_PERF_NUM_ITERS,
-    num_warmup=_PERF_NUM_WARMUP,
-    scales="poc",
-):
-    if q_seq_len not in PS1_Q_SEQ_LENS[nhead]:
-        raise ValueError(
-            f"PS1 supports q_seq={PS1_Q_SEQ_LENS[nhead]} "
-            f"for nhead={nhead}, got {q_seq_len}"
-        )
-    return _test_cp(
-        batch,
-        ctx_len,
-        nhead,
-        q_seq_len,
-        cp_world_size,
-        num_iters,
-        num_warmup,
-        scales,
-        varlen,
-        varlen_min_ratio,
-    )
-
-
-def test_ps1_persistent_vs_asm_ps64(
-    batch=4,
-    ctx_len=4096,
-    q_seq_len=1,
+def _test_ps1_vs_asm_ps64(
+    batch,
+    ctx_len,
+    nhead,
+    q_seq_len,
+    num_splits,
+    num_iters,
+    num_warmup,
+    scales,
     varlen=False,
-    varlen_min_ratio=0.5,
-    num_splits=0,
-    num_iters=_PERF_NUM_ITERS,
-    num_warmup=_PERF_NUM_WARMUP,
-    nhead=16,
-    scales="unit",
+    min_ratio=0.5,
 ):
-    if q_seq_len not in COMPARE_Q_SEQ_LENS[nhead]:
-        raise ValueError(
-            f"PS1-vs-ASM supports q_seq={COMPARE_Q_SEQ_LENS[nhead]} "
-            f"for nhead={nhead}, got {q_seq_len}"
-        )
-    case = _prepare_case(
-        batch,
-        ctx_len,
-        q_seq_len,
-        nhead,
-        varlen,
-        varlen_min_ratio,
-        scales,
-    )
+    case = _prepare_case(batch, ctx_len, q_seq_len, nhead, varlen, min_ratio, scales)
     asm_heads = ASM_PADDED_HEADS.get(nhead, nhead)
     if not num_splits:
         num_splits = _auto_num_splits(batch, case["seq_lens"], q_seq_len, asm_heads)
     _add_ps1_layout(case)
     _add_ps64_layout(case, num_splits, asm_heads)
 
-    softmax_scale = 1.0 / (QK_HEAD_DIM**0.5)
-    reference = _torch_reference(case, softmax_scale)
+    reference = _torch_reference(case, SOFTMAX_SCALE)
     ps1_output = _decode_output(case)
     asm_output = _decode_output(case, nhead=asm_heads)
 
     def run_ps1():
-        _run_ps1(case, softmax_scale, ps1_output)
+        _run_ps1(case, SOFTMAX_SCALE, ps1_output)
 
     def run_asm():
-        _run_asm_ps64(case, num_splits, softmax_scale, asm_output)
+        _run_asm_ps64(case, num_splits, SOFTMAX_SCALE, asm_output)
 
     _, ps1_us = run_perftest(run_ps1, num_iters=num_iters, num_warmup=num_warmup)
     _, asm_us = run_perftest(run_asm, num_iters=num_iters, num_warmup=num_warmup)
-    return {
-        "mode": "ps1-vs-asm",
-        "batch": batch,
-        "min_ctx": min(case["seq_lens"]),
-        "max_ctx": max(case["seq_lens"]),
-        "nhead": nhead,
-        "asm_heads": asm_heads,
-        "q_seq": q_seq_len,
-        "asm_splits": num_splits,
-        "ps1_works": case["num_works"],
-        "ps1 total us": ps1_us,
-        "asm total us": asm_us,
-        "speedup": asm_us / ps1_us,
-        "ps1 err": _check_output("ps1", reference, ps1_output),
-        "asm err": _check_output("asm_ps64", reference, asm_output[:, :nhead]),
-    }
+    return _row(
+        "ps1-vs-asm",
+        case,
+        nhead,
+        q_seq_len,
+        **{
+            "asm heads": asm_heads,
+            "asm splits": num_splits,
+            "ps1 works": case["num_works"],
+            "ps1 us": ps1_us,
+            "asm us": asm_us,
+            "speedup": asm_us / ps1_us,
+            "ps1 err": _check_output("ps1", reference, ps1_output),
+            "asm err": _check_output("asm_ps64", reference, asm_output[:, :nhead]),
+        },
+    )
 
 
 def _test_ps64(
@@ -1142,8 +1101,7 @@ def _test_ps64(
     if not num_splits:
         num_splits = _auto_num_splits(batch, case["seq_lens"], 1, PS64_NUM_Q_HEADS)
     _add_ps64_layout(case, num_splits)
-    softmax_scale = 1.0 / (QK_HEAD_DIM**0.5)
-    reference = _torch_reference(case, softmax_scale)
+    reference = _torch_reference(case, SOFTMAX_SCALE)
 
     output_shape = (batch, PS64_NUM_Q_HEADS, V_HEAD_DIM)
     split_data = torch.empty(
@@ -1177,7 +1135,7 @@ def _test_ps64(
             case["num_kv_splits_indptr"],
             case["q_scale"],
             case["kv_scale"],
-            softmax_scale,
+            SOFTMAX_SCALE,
             num_splits,
             page_size=PS64_PAGE_SIZE,
         )
@@ -1192,22 +1150,48 @@ def _test_ps64(
             )
 
     def run_asm():
-        _run_asm_ps64(case, num_splits, softmax_scale, asm_output)
+        _run_asm_ps64(case, num_splits, SOFTMAX_SCALE, asm_output)
 
     _, flydsl_us = run_perftest(run_flydsl, num_iters=num_iters, num_warmup=num_warmup)
     _, asm_us = run_perftest(run_asm, num_iters=num_iters, num_warmup=num_warmup)
-    return {
-        "mode": "ps64",
-        "batch": batch,
-        "min_ctx": min(case["seq_lens"]),
-        "max_ctx": max(case["seq_lens"]),
-        "splits": num_splits,
-        "flydsl total us": flydsl_us,
-        "asm total us": asm_us,
-        "speedup": asm_us / flydsl_us,
-        "flydsl err": _check_output("flydsl_ps64", reference, flydsl_output),
-        "asm err": _check_output("asm_ps64", reference, asm_output),
-    }
+    return _row(
+        "ps64",
+        case,
+        PS64_NUM_Q_HEADS,
+        1,
+        splits=num_splits,
+        **{
+            "flydsl us": flydsl_us,
+            "asm us": asm_us,
+            "speedup": asm_us / flydsl_us,
+            "flydsl err": _check_output("flydsl_ps64", reference, flydsl_output),
+            "asm err": _check_output("asm_ps64", reference, asm_output),
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# pytest entry points
+# ---------------------------------------------------------------------------
+
+
+def _skip(reason):
+    import pytest
+
+    pytest.skip(reason)
+
+
+def _require_gfx():
+    if get_gfx() not in SUPPORTED_GFX:
+        _skip(f"FlyDSL MLA tests need {SUPPORTED_GFX}, running on {get_gfx()}")
+
+
+def _require_ps1(nhead, q_seq_len):
+    if q_seq_len not in PS1_Q_SEQ_LENS[nhead]:
+        raise ValueError(
+            f"PS1 supports q_seq={PS1_Q_SEQ_LENS[nhead]} "
+            f"for nhead={nhead}, got {q_seq_len}"
+        )
 
 
 def test_mla_flydsl(
@@ -1220,40 +1204,152 @@ def test_mla_flydsl(
     num_iters=_PERF_NUM_ITERS,
     num_warmup=_PERF_NUM_WARMUP,
 ):
-    """Backward-compatible entry point for the original PS1/PS64 test."""
+    """PS1 (``page_size=1``) or FlyDSL PS64 (``page_size=64``) against the reference."""
+    _require_gfx()
     if page_size == 1:
-        if q_seq_len not in PS1_Q_SEQ_LENS[num_q_heads]:
-            raise ValueError(
-                f"PS1 supports q_seq={PS1_Q_SEQ_LENS[num_q_heads]} "
-                f"for nhead={num_q_heads}, got {q_seq_len}"
-            )
-        return _test_ps1(
-            batch,
-            ctx_len,
-            num_q_heads,
-            q_seq_len,
-            num_iters,
-            num_warmup,
-            "poc",
-        )
-    if page_size == PS64_PAGE_SIZE:
+        _require_ps1(num_q_heads, q_seq_len)
+        _test_ps1(batch, ctx_len, num_q_heads, q_seq_len, num_iters, num_warmup, "poc")
+    elif page_size == PS64_PAGE_SIZE:
         if num_q_heads != PS64_NUM_Q_HEADS or q_seq_len != 1:
             raise ValueError("PS64 FlyDSL requires nhead=128 and q_seq_len=1")
-        return _test_ps64(
-            batch,
-            ctx_len,
-            num_splits,
-            num_iters,
-            num_warmup,
-            "poc",
+        _test_ps64(batch, ctx_len, num_splits, num_iters, num_warmup, "poc")
+    else:
+        raise ValueError(f"unsupported page_size={page_size}; expected 1 or 64")
+
+
+def test_ps1_asm_matches_flydsl(
+    batch=4,
+    ctx_len=2048,
+    nhead=96,
+    q_seq_len=4,
+    causal=True,
+    return_lse=True,
+    varlen=True,
+    varlen_min_ratio=0.5,
+    scales="poc",
+    num_iters=_PERF_NUM_ITERS,
+    num_warmup=_PERF_NUM_WARMUP,
+):
+    _require_gfx()
+    _require_ps1(nhead, q_seq_len)
+    _test_ps1_asm(
+        batch,
+        ctx_len,
+        nhead,
+        q_seq_len,
+        causal,
+        return_lse,
+        num_iters,
+        num_warmup,
+        scales,
+        varlen,
+        varlen_min_ratio,
+    )
+
+
+def test_cp_asm_matches_flydsl(
+    batch=4,
+    ctx_len=64,
+    nhead=96,
+    q_seq_len=4,
+    cp_world_size=4,
+    return_lse=True,
+    varlen=True,
+    varlen_min_ratio=0.5,
+    scales="poc",
+    num_iters=_PERF_NUM_ITERS,
+    num_warmup=_PERF_NUM_WARMUP,
+):
+    _require_gfx()
+    _require_ps1(nhead, q_seq_len)
+    _test_cp_asm(
+        batch,
+        ctx_len,
+        nhead,
+        q_seq_len,
+        cp_world_size,
+        num_iters,
+        num_warmup,
+        scales,
+        varlen,
+        varlen_min_ratio,
+        return_lse,
+    )
+
+
+def test_cp_asm_no_lse_matches_flydsl():
+    test_cp_asm_matches_flydsl(return_lse=False)
+
+
+def test_ps1_cp_round_robin(
+    batch=4,
+    ctx_len=64,
+    nhead=96,
+    q_seq_len=4,
+    cp_world_size=4,
+    varlen=True,
+    varlen_min_ratio=0.5,
+    scales="poc",
+    num_iters=_PERF_NUM_ITERS,
+    num_warmup=_PERF_NUM_WARMUP,
+):
+    _require_gfx()
+    _require_ps1(nhead, q_seq_len)
+    _test_cp(
+        batch,
+        ctx_len,
+        nhead,
+        q_seq_len,
+        cp_world_size,
+        num_iters,
+        num_warmup,
+        scales,
+        varlen,
+        varlen_min_ratio,
+    )
+
+
+def test_ps1_persistent_vs_asm_ps64(
+    batch=4,
+    ctx_len=4096,
+    nhead=16,
+    q_seq_len=1,
+    num_splits=0,
+    varlen=False,
+    varlen_min_ratio=0.5,
+    scales="unit",
+    num_iters=_PERF_NUM_ITERS,
+    num_warmup=_PERF_NUM_WARMUP,
+):
+    _require_gfx()
+    if q_seq_len not in COMPARE_Q_SEQ_LENS[nhead]:
+        raise ValueError(
+            f"ps1-vs-asm supports q_seq={COMPARE_Q_SEQ_LENS[nhead]} "
+            f"for nhead={nhead}, got {q_seq_len}"
         )
-    raise ValueError(f"unsupported page_size={page_size}; expected 1 or 64")
+    _test_ps1_vs_asm_ps64(
+        batch,
+        ctx_len,
+        nhead,
+        q_seq_len,
+        num_splits,
+        num_iters,
+        num_warmup,
+        scales,
+        varlen,
+        varlen_min_ratio,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Command line
+# ---------------------------------------------------------------------------
 
 
 def _parse_args():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Validate and compare gfx1250 FlyDSL MLA decode kernels.",
+        description=__doc__,
     )
     parser.add_argument("--mode", choices=MODES, default="ps1")
     parser.add_argument(
@@ -1272,7 +1368,8 @@ def _parse_args():
         type=int,
         nargs="+",
         choices=SUPPORTED_NUM_Q_HEADS,
-        default=[16, 32, 64, 96, 128],
+        default=list(SUPPORTED_NUM_Q_HEADS),
+        help="Query head counts (ps64 always runs 128).",
     )
     parser.add_argument(
         "--q-seq-len",
@@ -1280,27 +1377,98 @@ def _parse_args():
         nargs="+",
         choices=(1, 2, 3, 4, 6, 8),
         default=[1, 2, 3, 4],
+        help="Query lengths; each head count runs the ones it supports.",
     )
     parser.add_argument(
         "--split-kv",
         type=int,
         nargs="+",
         default=[0],
-        help="ASM/PS64 split counts; 0 selects automatically.",
+        help="ASM/FlyDSL PS64 split counts (ps1-vs-asm, ps64); 0 selects them.",
     )
     parser.add_argument(
         "--cp-world-size",
         type=int,
         nargs="+",
         default=[2, 4, 8],
-        help="Round-robin CP world sizes for --mode cp.",
+        help="Round-robin CP world sizes (cp, cp-asm).",
     )
-    parser.add_argument("--varlen", action="store_true")
-    parser.add_argument("--varlen-min-ratio", type=float, default=0.5)
+    parser.add_argument(
+        "--varlen",
+        action="store_true",
+        help="Vary the lengths around the mean (see --varlen-min-ratio).",
+    )
+    parser.add_argument(
+        "--varlen-min-ratio",
+        type=float,
+        default=0.5,
+        help="With --varlen, the shortest length as a fraction of the mean.",
+    )
     parser.add_argument("--scales", choices=SCALE_MODES, default="unit")
     parser.add_argument("--num-iters", type=int, default=_PERF_NUM_ITERS)
     parser.add_argument("--num-warmup", type=int, default=_PERF_NUM_WARMUP)
     return parser.parse_args()
+
+
+def _cases(args):
+    """A runner for every combination the arguments ask for that the mode's
+    backends support, and how many were skipped for each reason."""
+    timing = (args.num_iters, args.num_warmup, args.scales)
+    lengths = (args.varlen, args.varlen_min_ratio)
+    cases, skipped = [], collections.Counter()
+
+    if args.mode == "ps64":
+        for batch, ctx_len, num_splits in itertools.product(
+            args.batch, args.ctx_len, args.split_kv
+        ):
+            cases.append(
+                lambda b=batch, c=ctx_len, s=num_splits: _test_ps64(
+                    b, c, s, *timing, *lengths
+                )
+            )
+        return cases, skipped
+
+    supported = COMPARE_Q_SEQ_LENS if args.mode == "ps1-vs-asm" else PS1_Q_SEQ_LENS
+    for nhead, q_seq_len, batch, ctx_len in itertools.product(
+        args.num_heads, args.q_seq_len, args.batch, args.ctx_len
+    ):
+        if q_seq_len not in supported[nhead]:
+            skipped[f"q_seq={q_seq_len} unsupported at nhead={nhead}"] += 1
+            continue
+        shape = (batch, ctx_len, nhead, q_seq_len)
+        if args.mode == "ps1":
+            cases.append(lambda s=shape: _test_ps1(*s, *timing, *lengths))
+        elif args.mode == "ps1-asm":
+            for causal, return_lse in itertools.product((True, False), (False, True)):
+                cases.append(
+                    lambda s=shape, c=causal, r=return_lse: _test_ps1_asm(
+                        *s, c, r, *timing, *lengths
+                    )
+                )
+        elif args.mode == "ps1-vs-asm":
+            for num_splits in args.split_kv:
+                cases.append(
+                    lambda s=shape, n=num_splits: _test_ps1_vs_asm_ps64(
+                        *s, n, *timing, *lengths
+                    )
+                )
+        else:
+            min_len = _min_seq_len(batch, ctx_len, *lengths)
+            for cp_world_size in args.cp_world_size:
+                # A request needs at least q_seq tokens, and at q_seq=1 every
+                # rank must hold one of them (see _test_cp).
+                if min_len < q_seq_len or (q_seq_len == 1 and min_len < cp_world_size):
+                    skipped["KV too short for q_seq / cp_world_size"] += 1
+                    continue
+                cp_args = (*shape, cp_world_size, *timing, *lengths)
+                if args.mode == "cp":
+                    cases.append(lambda a=cp_args: _test_cp(*a))
+                    continue
+                for return_lse in (True, False):
+                    cases.append(
+                        lambda a=cp_args, r=return_lse: _test_cp_asm(*a, return_lse=r)
+                    )
+    return cases, skipped
 
 
 def main():
@@ -1309,127 +1477,14 @@ def main():
         return
 
     args = _parse_args()
-    rows = []
-    if args.mode == "ps64":
-        for batch, ctx_len, num_splits in itertools.product(
-            args.batch, args.ctx_len, args.split_kv
-        ):
-            rows.append(
-                _test_ps64(
-                    batch,
-                    ctx_len,
-                    num_splits,
-                    args.num_iters,
-                    args.num_warmup,
-                    args.scales,
-                    args.varlen,
-                    args.varlen_min_ratio,
-                )
-            )
-    elif args.mode == "ps1-asm":
-        for nhead, q_seq_len, batch, ctx_len, causal, return_lse in itertools.product(
-            args.num_heads,
-            args.q_seq_len,
-            args.batch,
-            args.ctx_len,
-            (True, False),
-            (False, True),
-        ):
-            if (
-                nhead not in PS1_ASM_NUM_Q_HEADS
-                or q_seq_len not in PS1_Q_SEQ_LENS[nhead]
-            ):
-                continue
-            rows.append(
-                _test_ps1_asm(
-                    batch,
-                    ctx_len,
-                    nhead,
-                    q_seq_len,
-                    causal,
-                    return_lse,
-                    args.num_iters,
-                    args.num_warmup,
-                    args.scales,
-                    args.varlen,
-                    args.varlen_min_ratio,
-                )
-            )
-    elif args.mode in ("cp", "cp-asm"):
-        for nhead, q_seq_len, cp_world_size, batch, ctx_len in itertools.product(
-            args.num_heads,
-            args.q_seq_len,
-            args.cp_world_size,
-            args.batch,
-            args.ctx_len,
-        ):
-            if q_seq_len not in PS1_Q_SEQ_LENS[nhead]:
-                continue
-            if args.mode == "cp-asm" and nhead not in PS1_ASM_NUM_Q_HEADS:
-                continue
-            # A request needs at least q_seq tokens, and at q_seq=1 every rank
-            # must hold one of them (see _test_cp).
-            min_len = _min_seq_len(batch, ctx_len, args.varlen, args.varlen_min_ratio)
-            if min_len < q_seq_len or (q_seq_len == 1 and min_len < cp_world_size):
-                continue
-            case_args = (
-                batch,
-                ctx_len,
-                nhead,
-                q_seq_len,
-                cp_world_size,
-                args.num_iters,
-                args.num_warmup,
-                args.scales,
-                args.varlen,
-                args.varlen_min_ratio,
-            )
-            if args.mode == "cp":
-                rows.append(_test_cp(*case_args))
-                continue
-            for return_lse in (True, False):
-                rows.append(_test_cp_asm(*case_args, return_lse=return_lse))
-    else:
-        supported = PS1_Q_SEQ_LENS if args.mode == "ps1" else COMPARE_Q_SEQ_LENS
-        for nhead, q_seq_len, batch, ctx_len, num_splits in itertools.product(
-            args.num_heads,
-            args.q_seq_len,
-            args.batch,
-            args.ctx_len,
-            args.split_kv if args.mode == "ps1-vs-asm" else [0],
-        ):
-            if q_seq_len not in supported[nhead]:
-                continue
-            if args.mode == "ps1":
-                rows.append(
-                    _test_ps1(
-                        batch,
-                        ctx_len,
-                        nhead,
-                        q_seq_len,
-                        args.num_iters,
-                        args.num_warmup,
-                        args.scales,
-                        args.varlen,
-                        args.varlen_min_ratio,
-                    )
-                )
-            else:
-                rows.append(
-                    test_ps1_persistent_vs_asm_ps64(
-                        batch,
-                        ctx_len,
-                        q_seq_len,
-                        args.varlen,
-                        args.varlen_min_ratio,
-                        num_splits,
-                        args.num_iters,
-                        args.num_warmup,
-                        nhead,
-                        args.scales,
-                    )
-                )
-
+    cases, skipped = _cases(args)
+    rows = [run() for run in cases]
+    if skipped:
+        aiter.logger.info(
+            "FlyDSL MLA %s skipped: %s",
+            args.mode,
+            ", ".join(f"{reason} (x{count})" for reason, count in skipped.items()),
+        )
     aiter.logger.info(
         "FlyDSL MLA %s summary:\n%s",
         args.mode,

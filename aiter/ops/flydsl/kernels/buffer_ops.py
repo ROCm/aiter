@@ -416,7 +416,7 @@ def buffer_load(
                       extra VGPR address arithmetic.
         is_scalar: Emit a uniform/SGPR scalar load (llvm.amdgcn.s.buffer.load) instead of the
                       vector buffer load. Use only for wave-uniform addresses to route through the
-                      SMEM cache and land the result directly in SGPRs. Restricted to vec_width 1 or 4;
+                      SMEM cache and land the result directly in SGPRs. Restricted to vec_width 1, 4, 8 or 16;
                       dtype is forced to i32 (the result is raw i32 dwords). mask and soffset_bytes
                       are not supported in this mode and raise ValueError if provided.
 
@@ -433,7 +433,7 @@ def buffer_load(
     # Scalar (uniform) loads return raw i32 dwords; force the element type so the
     # element->byte offset math below uses 4 and the result type is i32 / v4i32.
     if is_scalar:
-        if vec_width not in (1, 4):
+        if vec_width not in (1, 4, 8, 16):
             raise ValueError(
                 f"buffer_load(is_scalar=True): unsupported vec_width={vec_width}"
             )
@@ -468,11 +468,11 @@ def buffer_load(
         result_type = ir.VectorType.get([vec_width], dtype)
 
     # Scalar/uniform load path: emit s.buffer.load with a v4i32 resource and the
-    # byte offset computed above. Returns i32 (vec_width 1) or v4i32 (vec_width 4).
+    # byte offset computed above. Returns i32 (vec_width 1) or v4i32 / v8i32.
     if is_scalar:
         rsrc_v4 = _ptr8_to_v4i32(rsrc)
         cache_policy = fx.Int32(cache_modifier).ir_value()
-        suffix = "i32" if vec_width == 1 else "v4i32"
+        suffix = "i32" if vec_width == 1 else f"v{vec_width}i32"
         return llvm.call_intrinsic(
             result_type,
             f"llvm.amdgcn.s.buffer.load.{suffix}",
