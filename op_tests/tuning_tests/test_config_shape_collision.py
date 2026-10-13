@@ -118,6 +118,9 @@ _GROUPED_INT_COLUMNS = (
     "tdm_as_in_prologue",
     "tdm_b_th",
     "lds_soa_load_interleave",
+    "rolled_drain",
+    "persistent_workers",
+    "persistent_workers2",
 )
 
 
@@ -349,6 +352,21 @@ class TestConfigShapeCollision(unittest.TestCase):
             for col in _GROUPED_INT_COLUMNS:
                 with self.subTest(line=line, column=col):
                     grouped._as_int(row.get(col), None)
+
+    def test_grouped_int_cells_parse_exactly(self):
+        """Only an all-zero fraction is dropped from an integer cell, so a value
+        is kept digit for digit or rejected, never rounded through a float."""
+        try:
+            from aiter.aot.flydsl.grouped_moe import _as_int as aot_as_int
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import _as_int as runtime_as_int
+        except Exception as e:  # noqa: BLE001
+            self.skipTest(f"grouped MoE modules not importable: {e}")
+        for as_int in (aot_as_int, runtime_as_int):
+            with self.subTest(module=as_int.__module__):
+                self.assertEqual(as_int("16.0", None), 16)
+                self.assertEqual(as_int("9007199254740993.0", None), 9007199254740993)
+                with self.assertRaises(ValueError):
+                    as_int("1.0000000000000001", None)
 
     def test_grouped_fmoe_merged_ep_row_matches(self):
         """An ep_fused row must still win the EP lookup once the merge has

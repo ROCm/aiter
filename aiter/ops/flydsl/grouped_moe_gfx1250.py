@@ -62,21 +62,26 @@ def _as_bool(value, default: bool) -> bool:
     return str(value).strip() in _TRUTHY_ENV
 
 
+def _integral_text(value: str) -> str:
+    # The model_configs/ merge goes through pandas, which writes the integers of
+    # a column that has a blank cell as floats ("16.0"). Only an all-zero
+    # fraction is dropped, so a value is never rounded through a binary float.
+    whole, dot, frac = value.partition(".")
+    if dot and frac.strip("0") == "" and whole.lstrip("+-").isdigit():
+        return whole
+    return value
+
+
 def _as_int(value, default: int | None) -> int | None:
     # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
     # cell can come back as the literal "nan"; read those as unset like _cell.
-    # The default config is merged with pandas too, which writes the integers of
-    # a column that has a blank cell as floats ("16.0").
     text = "" if value is None else str(value).strip()
     if text == "" or text.lower() in ("nan", "none"):
         return default
     try:
-        return int(text)
+        return int(_integral_text(text))
     except ValueError:
-        number = float(text)
-        if not number.is_integer():
-            raise
-        return int(number)
+        raise ValueError(f"expected an integer config value, got {text!r}") from None
 
 
 def _dtype_name(dtype) -> str:
@@ -181,10 +186,7 @@ def _find_grouped_config(
         value = str(row.get(k) or "").strip()
         if value.lower() in ("nan", "none"):
             return ""
-        whole, dot, frac = value.partition(".")
-        if dot and frac.strip("0") == "" and whole.lstrip("-").isdigit():
-            return whole
-        return value
+        return _integral_text(value)
 
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():

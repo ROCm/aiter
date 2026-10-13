@@ -47,15 +47,16 @@ def _as_int(value, default: int | None = None) -> int | None:
     if value is None or str(value).strip() == "":
         return default
     # The default config is merged with pandas, which writes the integers of a
-    # column that has a blank cell as floats ("16.0").
+    # column that has a blank cell as floats ("16.0"). Only an all-zero fraction
+    # is dropped, so a value is never rounded through a binary float.
     text = str(value).strip()
+    whole, dot, frac = text.partition(".")
+    if dot and frac.strip("0") == "":
+        text = whole
     try:
         return int(text)
     except ValueError:
-        number = float(text)
-        if not number.is_integer():
-            raise
-        return int(number)
+        raise ValueError(f"expected an integer config value, got {value!r}") from None
 
 
 def _as_float(value, default: float) -> float:
