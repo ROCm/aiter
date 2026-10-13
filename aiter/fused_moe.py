@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+import subprocess
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import IntEnum
@@ -3592,6 +3593,68 @@ def _require_shuffled_gfx950_fp8(gfx, q_dtype_w, q_type, weights_shuffled):
         )
 
 
+_UNTUNED_FMOE_HEADER = (
+    "token,model_dim,inter_dim,expert,topk,act_type,dtype,"
+    "q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
+)
+
+
+def _online_tune_fmoe(
+    untune_file,
+    tune_file,
+    profile_file,
+    token,
+    model_dim,
+    inter_dim,
+    expert,
+    topk,
+    activation,
+    dtype,
+    q_dtype_a,
+    q_dtype_w,
+    q_type,
+    use_g1u1,
+    doweight_stage1,
+):
+    """Append one shape to untune_file and tune it into tune_file.
+
+    Shared by the AITER_ONLINE_TUNE paths of fused_moe and
+    fused_moe_dp_shared_expert. Raises RuntimeError if gemm_moe_tune.py exits
+    non-zero; callers catch it so inference falls back to the default configs.
+    """
+    with open(untune_file, "a") as f:
+        if os.path.getsize(untune_file) == 0:
+            f.write(_UNTUNED_FMOE_HEADER)
+        q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
+        f.write(
+            f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
+        )
+    logger.info("\033[34m Start tuning fmoe")
+    cmd = [
+        PY,
+        f"{AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py",
+        "-i",
+        untune_file,
+        "-o",
+        tune_file,
+        "-o2",
+        profile_file,
+        "--last",
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"[fused_moe] online tune exited {e.returncode}; {tune_file} "
+            "may not contain this shape, falling back to default configs"
+        ) from e
+    finally:
+        logger.info("\033[0m")
+    logger.info(
+        f"[Hint] tuned configs are saved in {tune_file}, you can set AITER_CONFIG_FMOE to this file to use tuned configs"
+    )
+
+
 @functools.lru_cache(maxsize=2048)
 def get_2stage_cfgs(
     token,
@@ -3811,25 +3874,23 @@ def get_2stage_cfgs(
         keys_disabled += fhmoe_keys
 
     def MainFunc():
-        with open(untune_file, "a") as f:
-            if os.path.getsize(untune_file) == 0:
-                f.write(
-                    "token,model_dim,inter_dim,expert,topk,act_type,dtype,q_dtype_a,q_dtype_w,q_type,use_g1u1,doweight_stage1"
-                )
-            q_dtype_ws = q_dtype_w if q_dtype_w != torch.uint32 else "torch.int4"
-            f.write(
-                f"\n{token},{model_dim},{inter_dim},{expert},{topk},{activation},{dtype},{q_dtype_a},{q_dtype_ws},{q_type},{int(use_g1u1)},{int(doweight_stage1)}"
-            )
-        logger.info("\033[34m Start tuning fmoe")
-        os.system(
-            f"{PY} {AITER_CSRC_DIR}/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py -i {untune_file} -o {tune_file} -o2 {profile_file} --last"
+        _online_tune_fmoe(
+            untune_file,
+            tune_file,
+            profile_file,
+            token,
+            model_dim,
+            inter_dim,
+            expert,
+            topk,
+            activation,
+            dtype,
+            q_dtype_a,
+            q_dtype_w,
+            q_type,
+            use_g1u1,
+            doweight_stage1,
         )
-
-    def FinalFunc():
-        logger.info(
-            f"[Hint] tuned configs are saved in {tune_file}, you can set AITER_CONFIG_FMOE to this file to use tuned configs"
-        )
-        logger.info("\033[0m")
 
     def _lookup_cfg(c2s):
         if not c2s:
@@ -3863,11 +3924,20 @@ def get_2stage_cfgs(
     ):
         lock_name = re.sub(r"[^\w.\-]", "_", str(keys))
         lock_path = os.path.join(bd_dir, f"lock_fmoe_tune_{lock_name}")
-        mp_lock(lock_path, MainFunc=MainFunc, FinalFunc=FinalFunc)
-        cfg_2stages = get_cfg_2stages(tune_file)
-        cfg = _lookup_cfg(cfg_2stages)
-        if cfg is None:
-            logger.warning(f"Fmoe tuning not support for {keys}")
+        try:
+            mp_lock(lock_path, MainFunc=MainFunc)
+        except RuntimeError as e:
+            logger.error(str(e))
+        else:
+            # Processes that waited on the lock never see the tuner's exit
+            # status, so a missing row here can also mean the tuner failed.
+            cfg_2stages = get_cfg_2stages(tune_file)
+            cfg = _lookup_cfg(cfg_2stages)
+            if cfg is None:
+                logger.warning(
+                    f"[fused_moe] no tuned row for {keys} after online tune "
+                    "(tuner failed or found no kernel); using default configs"
+                )
 
     if cfg is not None:
         kn1 = str(cfg.get("kernelName1", "") or "").strip()
