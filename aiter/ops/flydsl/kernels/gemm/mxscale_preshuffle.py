@@ -32,8 +32,20 @@ from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
 )
 from aiter.ops.flydsl.kernels.communication_ops_utils import (
     atomic_add_agent,
-    load_i32_nt,
+    load_i32_global_agent,
 )
+
+# Buffer-store cache policy SC1 (device scope): a fused split-K partial is
+# written through to the level every XCD shares, since a tile's splits run on
+# different XCDs, whose L2s are not coherent with each other.
+_SC1 = 16
+
+
+def _load_partial(base_i64, dword_off):
+    """Device-scope i32 load of a split-K partial at base + dword_off * 4: the
+    last-arriving block may sit on another XCD than the block that wrote it."""
+    return load_i32_global_agent(fx.Int64(base_i64) + fx.Int64(dword_off) * fx.Int64(4))
+
 
 _A_ELEM = {"fp4": Float4E2M1FN, "fp6": Float6E2M3FN, "fp8": Float8E4M3FN}
 _B_ELEM = {"fp4": Float4E2M1FN, "fp8": Float8E4M3FN}
@@ -136,6 +148,7 @@ def _launch_gemm_impl(
     multi_row_tile: Constexpr[bool] = False,
     a_scale_layout: Constexpr[str] = "mfma_tile",
     b_scale_layout: Constexpr[str] = "mfma_tile",
+    fused_split_k: Constexpr[bool] = False,
 ):
     """Direct @flyc.jit launcher. Operands are fx.Pointer (pass ptr_arg(t): raw data_ptr, no
     per-launch DLPack). Compile once with flyc.compile, then cf(*runtime). a_dtype fp4/fp6/fp8
@@ -178,6 +191,22 @@ def _launch_gemm_impl(
         and c_batch_stride < 0
     )
     splitk_fused = small_m_bf16 and k_batch > 1 and BN <= 128
+    # fused_split_k (row-layout 1x32 scales, gemm_a8w8_mxfp8_bpreshuffle): split K
+    # in-kernel at any tile -- fp32 partials, which the dynamically last block of
+    # each output tile sums over its own rows in split order: the separate reduce
+    # kernel's numbers without its launch. A tunable: one block reducing a large
+    # tile over many splits can cost more than the launch it saves.
+    fused_f32 = (
+        fused_split_k
+        and k_batch > 1
+        and _row_a
+        and _row_b
+        and out_dtype == "bf16"
+        and batch == 1
+        and c_row_stride < 0
+        and c_batch_stride < 0
+    )
+    splitk_fused = splitk_fused or fused_f32
     if const_expr(out_dtype == "bf16"):
         out_elem = BFloat16
     else:
@@ -215,8 +244,15 @@ def _launch_gemm_impl(
     assert K_TILES % k_batch == 0, "K_TILES must be divisible by k_batch"
     k_tiles_local = K_TILES // k_batch
     k_halves = BK // 128  # 16x16x128 MFMA k-steps per K-tile
+    # Packed scale words per row/col pair: a word holds two 128-K MFMA steps.
+    SC_NW = max(1, k_halves // 2)
+    # tile_k=512 only reads row-layout scales, which pack a word per 256 K of the
+    # K-tile; a mfma_tile scale word covers 256 K, at most one K-tile.
+    assert BK in (128, 256) or (
+        BK == 512 and _row_a and _row_b
+    ), f"tile_k {BK}: 512 needs row-layout scales on both operands"
     # e8m0 scales are 256-K granular, B 128-K: tiles_per_chunk K-tiles share a word (hi/lo 16b = 128-K half).
-    tiles_per_chunk = 256 // BK  # 1 for tile_k=256, 2 for tile_k=128
+    tiles_per_chunk = max(1, 256 // BK)  # 1 for tile_k>=256, 2 for tile_k=128
     m_chunks = BM // 16
     num_waves = min(4, BN // 16)
     num_threads = num_waves * 64
@@ -636,7 +672,12 @@ def _launch_gemm_impl(
                 sc_panels.append((sb_row, by_n, SC_RS_B, SC_PASS_B, SC_PANEL_A))
             sc_dma = fx.make_copy_atom(fx.rocdl.BufferCopyLDS32b(), 32)
             sc_row_copy = fx.make_copy_atom(
-                fx.UniversalCopy64b() if SC_WPR == 2 else fx.UniversalCopy32b(), Int32
+                {
+                    1: fx.UniversalCopy32b,
+                    2: fx.UniversalCopy64b,
+                    4: fx.UniversalCopy128b,
+                }[SC_WPR](),
+                Int32,
             )
             sS0_i8 = fx.recast_iter(_i8s, lds.s0.ptr)
             sS0_i32 = fx.recast_iter(Int32, lds.s0.ptr)
@@ -694,22 +735,28 @@ def _launch_gemm_impl(
                 )
                 return Vec(fx.memref_load_vec(t))
 
-            def _sc_pack(r0, r1):
-                # The shuffled-layout word: byte kh*2 + i = row (r + 16*i)'s scale for
-                # MFMA step kh, so the opsel atoms and one VGPR per row pair are kept.
-                w = fx.Int32(rocdl.perm_b32(r0[0], r1[0], sc_sel))
-                if const_expr(k_halves == 2):
-                    w = w | (fx.Int32(rocdl.perm_b32(r0[1], r1[1], sc_sel)) << 16)
+            def _sc_pack(r0, r1, w_):
+                # The shuffled-layout word: byte (kh%2)*2 + i = row (r + 16*i)'s scale
+                # for MFMA step kh = 2*w_ + kh%2, so the opsel atoms and one VGPR per
+                # row pair (per 256 K) are kept.
+                kh0 = 2 * w_
+                w = fx.Int32(rocdl.perm_b32(r0[kh0], r1[kh0], sc_sel))
+                if const_expr(k_halves > 1):
+                    w = w | (
+                        fx.Int32(rocdl.perm_b32(r0[kh0 + 1], r1[kh0 + 1], sc_sel)) << 16
+                    )
                 return w
 
             def _sc_pairs(buf, j, lrow, n_tiles, base):
+                # SC_NW words per pair, pair-major (compute's sa_v[mp * SC_NW + w]).
                 words = []
                 for p_ in range_constexpr(max(1, n_tiles // 2)):
                     r0 = _sc_row(buf, j, lrow, p_ * 32, base)
                     r1 = r0
                     if const_expr(2 * p_ + 1 < n_tiles):
                         r1 = _sc_row(buf, j, lrow, p_ * 32 + 16, base)
-                    words.append(_sc_pack(r0, r1))
+                    for w_ in range_constexpr(SC_NW):
+                        words.append(_sc_pack(r0, r1, w_))
                 return words
 
             def load_sc_row(buf, j):
@@ -838,20 +885,22 @@ def _launch_gemm_impl(
             c_frags = [fx.make_rmem_tensor(4, Float32) for _ in range_constexpr(n_acc)]
             for idx in range_constexpr(n_acc):
                 c_frags[idx].store(Vec(accs[idx]))
+            # tile_k=512: steps kh>=2 read the pair's next word (SC_NW per pair).
             for kh in range_constexpr(k_halves):
+                kw, ks = kh // 2, kh % 2
                 for ni in range_constexpr(num_acc_n):
                     np_i, in_b = ni // 2, ni % 2
                     for mi in range_constexpr(m_chunks):
                         mp_i, im = mi // 2, mi % 2
                         cf = c_frags[mi * num_acc_n + ni]
                         fx.gemm(
-                            scale_atoms[(kh * 2 + im, kh * 2 + in_b)],
+                            scale_atoms[(ks * 2 + im, ks * 2 + in_b)],
                             cf,
                             av[mi * k_halves + kh],
                             bv[ni * k_halves + kh],
                             cf,
-                            scale_a=sa_v[mp_i],
-                            scale_b=sb_v[np_i],
+                            scale_a=sa_v[mp_i * SC_NW + kw],
+                            scale_b=sb_v[np_i * SC_NW + kw],
                         )
             for idx in range_constexpr(n_acc):
                 accs[idx] = c_frags[idx].load().ir_value()
@@ -933,7 +982,7 @@ def _launch_gemm_impl(
         c_stride = N if c_row_stride < 0 else c_row_stride
         # Regular split-K writes fp32 partial slabs. The small-M fused path writes
         # BF16 partials; no-split writes directly to the requested output type.
-        if const_expr(splitk_fused):
+        if const_expr(splitk_fused and not fused_f32):
             store_elem = BFloat16
             _ebytes = 2
             c_addr = arg_c + fx.Int64(bid_z) * fx.Int64(i32_m) * fx.Int64(N) * fx.Int64(
@@ -984,11 +1033,16 @@ def _launch_gemm_impl(
             fx.make_layout(1, 1),
         )
         if const_expr(
-            (k_batch > 1 and not splitk_fused) or (small_m_bf16 and not multi_row_tile)
+            (k_batch > 1 and (fused_f32 or not splitk_fused))
+            or (small_m_bf16 and not multi_row_tile)
         ):
-            c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), store_elem)
+            c_copy = fx.make_copy_atom(
+                fx.rocdl.BufferCopy32b(_SC1 if splitk_fused else 0), store_elem
+            )
         else:
-            c_copy = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), store_elem)
+            c_copy = fx.make_copy_atom(
+                fx.rocdl.BufferCopy16b(_SC1 if splitk_fused else 0), store_elem
+            )
         c_rstride = fx.Int32(c_stride)
         col_w = by_n + wave * (BN // num_waves) + lane_mod_16
         if const_expr(small_m_bf16 and not multi_row_tile):
@@ -1031,10 +1085,12 @@ def _launch_gemm_impl(
             # Publish this block's complete BF16 partial before joining the
             # per-output-tile arrival counter. The dynamically last block owns
             # reduction, so no block spins and oversized grids cannot deadlock.
-            # Every lane drains its workspace stores before the block barrier;
-            # the last block then reads partials non-temporally from the shared
-            # agent L2.  A release fence would unnecessarily write back the
-            # whole L2, while an acquire fence would invalidate unrelated cache.
+            # Every lane drains its workspace stores before the block barrier.
+            # The partials were stored SC1 (device scope) and the last block
+            # reads them device-scope: a tile's splits land on different XCDs,
+            # whose L2s are not coherent, so neither side may stop at its own
+            # L2. Per-access scope avoids a release fence's whole-L2 writeback
+            # and an acquire fence's invalidation of unrelated cache.
             rocdl.s_waitcnt(0)
             gpu.barrier()
             arrival = fx.Int32(-1)
@@ -1045,7 +1101,7 @@ def _launch_gemm_impl(
                         arg_semaphore + fx.Int64(tile_idx) * fx.Int64(4), fx.Int32(1)
                     )
                 )
-            if const_expr(multi_row_tile):
+            if const_expr(multi_row_tile or fused_f32):
                 # Reuse A LDS after the GEMM to broadcast the winning arrival
                 # to every wave.  All waves then share the M*BN reduction; a
                 # single wave becomes the bottleneck by M=8/16.
@@ -1089,7 +1145,60 @@ def _launch_gemm_impl(
                 # Follow the existing AITER split-K reduce's numeric path:
                 # extend BF16 partials to FP32, accumulate there, then truncate
                 # only the final result. Sequential loads minimize live VGPRs.
-                if const_expr(multi_row_tile):
+                if const_expr(fused_f32):
+                    # This tile's rows only (a ragged last M tile has fewer). A
+                    # thread sums 4 adjacent outputs' fp32 partials in split
+                    # order, as launch_splitk_reduce does, one SC1 (device-scope)
+                    # 128-bit load per split: other XCDs wrote them.
+                    quad = 4
+                    quad_l = fx.make_layout(quad, 1)
+
+                    def _quads(addr, elem, nbytes):
+                        ptr_ty = fx.PointerType.get(
+                            elem.ir_type,
+                            address_space=fx.AddressSpace.Global,
+                            alignment=quad * elem.width // 8,
+                        )
+                        view = fx.make_view(
+                            fx.inttoptr(ptr_ty, addr), fx.make_layout(1 << 30, 1)
+                        )
+                        buf = fx.rocdl.make_buffer_tensor(
+                            fx.Tensor(view), max_size=False, num_records_bytes=nbytes
+                        )
+                        return fx.logical_divide(buf, quad_l)
+
+                    mn = fx.Int64(i32_m) * fx.Int64(N)
+                    part_q = _quads(arg_c, Float32, mn * fx.Int64(4 * k_batch))
+                    out_q = _quads(arg_out, BFloat16, mn * fx.Int64(2))
+                    part_copy = fx.make_copy_atom(
+                        fx.rocdl.BufferCopy128b(_SC1), Float32
+                    )
+                    out_copy = fx.make_copy_atom(fx.rocdl.BufferCopy64b(), BFloat16)
+                    quads_per_row = BN // quad
+                    slab_quads = i32_m * fx.Int32(N // quad)
+                    reduce_quads = fx.Int32(_rows_wg) * fx.Int32(quads_per_row)
+                    for q_idx in range(tid, reduce_quads, fx.Int32(num_threads)):
+                        q_off = (
+                            (bx_m + q_idx // fx.Int32(quads_per_row))
+                            * fx.Int32(N // quad)
+                            + by_n // fx.Int32(quad)
+                            + q_idx % fx.Int32(quads_per_row)
+                        )
+                        reduced = Vec.filled(quad, 0.0, Float32)
+                        for sk in range_constexpr(k_batch):
+                            frag = fx.make_rmem_tensor(quad_l, Float32)
+                            fx.copy_atom_call(
+                                part_copy,
+                                fx.slice(
+                                    part_q, (None, q_off + fx.Int32(sk) * slab_quads)
+                                ),
+                                frag,
+                            )
+                            reduced = reduced + frag.load()
+                        res = fx.make_rmem_tensor(quad_l, BFloat16)
+                        res.store(reduced.to(BFloat16))
+                        fx.copy_atom_call(out_copy, res, fx.slice(out_q, (None, q_off)))
+                elif const_expr(multi_row_tile):
                     pairs_per_row = BN // reduce_vec
                     reduce_pairs = i32_m * fx.Int32(pairs_per_row)
                     for pair_idx in range(tid, reduce_pairs, fx.Int32(num_threads)):
@@ -1103,7 +1212,7 @@ def _launch_gemm_impl(
                         reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
                         for sk in range_constexpr(k_batch):
                             partial_dw = fx.Int32(
-                                load_i32_nt(
+                                _load_partial(
                                     arg_c,
                                     (out_off + fx.Int32(sk) * slab_stride)
                                     // fx.Int32(2),
@@ -1121,7 +1230,7 @@ def _launch_gemm_impl(
                     reduced = fx.Vector.filled(reduce_vec, 0.0, Float32)
                     for sk in range_constexpr(k_batch):
                         partial_dw = fx.Int32(
-                            load_i32_nt(
+                            _load_partial(
                                 arg_c,
                                 (out_off + fx.Int32(sk) * slab_stride) // fx.Int32(2),
                             )
@@ -1274,6 +1383,7 @@ def launch_gemm(
     multi_row_tile: Constexpr[bool] = False,
     a_scale_layout: Constexpr[str] = "mfma_tile",
     b_scale_layout: Constexpr[str] = "mfma_tile",
+    fused_split_k: Constexpr[bool] = False,
 ):
     """Launch the established non-fused GEMM ABI used by existing configs."""
     _launch_gemm_impl(
@@ -1310,6 +1420,7 @@ def launch_gemm(
         multi_row_tile,
         a_scale_layout,
         b_scale_layout,
+        fused_split_k,
     )
 
 
@@ -1348,6 +1459,7 @@ def launch_gemm_fused(
     multi_row_tile: Constexpr[bool] = False,
     a_scale_layout: Constexpr[str] = "mfma_tile",
     b_scale_layout: Constexpr[str] = "mfma_tile",
+    fused_split_k: Constexpr[bool] = False,
 ):
     """Launch the M<=16 split-K GEMM with its fused reduction arguments."""
     _launch_gemm_impl(
@@ -1384,6 +1496,7 @@ def launch_gemm_fused(
         multi_row_tile,
         a_scale_layout,
         b_scale_layout,
+        fused_split_k,
     )
 
 

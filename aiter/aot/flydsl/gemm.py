@@ -20,6 +20,7 @@ Supported kernel families:
   - ``flydsl_mxfp8_128_bpreshuffle_compute_wmma_*`` gfx1250 compute-bound mxfp8_128 kernels
   - ``flydsl_mxfp8_32_bpreshuffle_{,compute_}wmma_*`` the same kernels on 1x32 scales
   - ``flydsl_mxpsh_*``                        gfx950 MX-microscale preshuffle GEMM
+  - ``flydsl_mxfp8_8w_*``                     gfx950 8-wave mxfp8 (1x32 row scales) GEMM
   - ``flydsl_bmm_mxfp8_mfma_*``               gfx950 mxscale batched GEMM kernels
 
 Usage:
@@ -68,6 +69,11 @@ from aiter.ops.flydsl.bpreshuffle_gemm_gfx1250 import (
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import (
     compile_8wave_gemm,
     parse_8wave_kernel_name,
+)
+from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import NAME_PREFIX as MXFP8_8WAVE_PREFIX
+from aiter.ops.flydsl.gemm_a8w8_mxfp8_8wave import (
+    compile_mxfp8_8wave_gemm,
+    parse_mxfp8_8wave_kernel_name,
 )
 from aiter.ops.flydsl.gemm_kernels import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
@@ -291,6 +297,11 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "8wave"
+            elif kernel_name.startswith(f"{MXFP8_8WAVE_PREFIX}_"):
+                params = parse_mxfp8_8wave_kernel_name(kernel_name)
+                if params is not None:
+                    params = dict(params)
+                    params["kind"] = "mxfp8_8wave"
             elif kernel_name.startswith(
                 (
                     f"{MXFP8_128_WMMA_PREFIX}_",
@@ -697,6 +708,7 @@ def _compile_mxscale_preshuffle_to_cache(
     b_scale_block: str = "128x128",
     a_scale_layout: str = "mfma_tile",
     b_scale_layout: str = "mfma_tile",
+    fused_split_k: bool = False,
     **kwargs,
 ):
     """gfx950 MX-microscale preshuffle GEMM (``flydsl_mxpsh_*``).
@@ -767,6 +779,7 @@ def _compile_mxscale_preshuffle_to_cache(
             b_scale_block=b_scale_block,
             a_scale_layout=a_scale_layout,
             b_scale_layout=b_scale_layout,
+            fused_split_k=fused_split_k,
         )
 
 
@@ -801,6 +814,38 @@ def _compile_8wave_to_cache(
     )
     # NOTE: the 8-wave launcher takes (A, B, C, ...), not the preshuffle
     # launcher's (C, A, B, ...).
+    _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, n, fx.Stream(0))
+
+
+def _compile_mxfp8_8wave_to_cache(
+    *,
+    m: int,
+    n: int,
+    k: int,
+    waves_per_eu: int,
+    xcd_swizzle: int,
+    **kwargs,
+):
+    """gfx950 8-wave mxfp8 GEMM (``flydsl_mxfp8_8w_*``) on 1x32 row scales,
+    with the dtypes flydsl_mxfp8_8wave_gemm launches it with."""
+    del kwargs
+
+    import torch
+
+    dev = torch.device("cpu")
+    a = torch.empty((m * k,), device=dev, dtype=torch.uint8)
+    b = torch.empty((n * k,), device=dev, dtype=torch.uint8)
+    out = torch.empty((m * n,), device=dev, dtype=torch.bfloat16)
+    scale_a = torch.empty((m * k // 32,), device=dev, dtype=torch.uint8)
+    scale_b = torch.empty((n * k // 32,), device=dev, dtype=torch.uint8)
+
+    exe = compile_mxfp8_8wave_gemm(
+        K=k,
+        waves_per_eu=waves_per_eu,
+        xcd_swizzle=int(xcd_swizzle),
+        scale_preshuffled=False,
+    )
+    # The 8-wave launcher takes (A, B, C, ...), as _compile_8wave_to_cache.
     _compile_executable_to_cache(exe, a, b, out, scale_a, scale_b, m, n, fx.Stream(0))
 
 
@@ -1067,6 +1112,8 @@ def compile_one_config(
                 _compile_mxscale_preshuffle_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "8wave":
                 _compile_8wave_to_cache(m=m, n=n, k=k, **kwargs)
+            elif kind == "mxfp8_8wave":
+                _compile_mxfp8_8wave_to_cache(m=m, n=n, k=k, **kwargs)
             elif kind == "mxfp8_wmma":
                 _compile_mxfp8_wmma_to_cache(
                     kernel_name=kernel_name,

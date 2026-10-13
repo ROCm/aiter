@@ -2,10 +2,10 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """Tune gemm_a8w8_mxfp8_bpreshuffle (FP8 GEMM, 1x32 e8m0 scales) on gfx950.
 
-gfx950 runs the FlyDSL mxpsh kernel on unshuffled row-major scales
-(x_scale [M, K/32], w_scale [N, K/32]); every mxpsh tile that fits the shape is
-timed and the fastest lands in the same table the gfx1250 rows live in, keyed
-by gfx:
+gfx950 runs two FlyDSL pipelines on unshuffled row-major scales (x_scale
+[M, K/32], w_scale [N, K/32]): the mxpsh kernel and the 8-wave 256x256 one
+(ids from 1_000_000). Every candidate of both that fits the shape is timed and
+the fastest lands in the same table the gfx1250 rows live in, keyed by gfx:
 
     python3 csrc/gemm_a8w8_mxfp8_bpreshuffle/gemm_a8w8_mxfp8_bpreshuffle_tune.py \\
         -i aiter/configs/a8w8_mxfp8_bpreshuffle_untuned_gemm.csv \\
@@ -20,10 +20,8 @@ import torch.nn.functional as F
 
 from aiter import dtypes, logger
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
-    candidates_for,
-    kernels_list,
+    MXFP8_ROW_PIPELINES,
 )
-from aiter.ops.flydsl.mxscale_preshuffle_kernels import MXFP8_ROW_SCALES
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
@@ -77,8 +75,11 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
     }
 
     def getKernelName(self, kernelId):
-        ki = kernels_list.get(kernelId)
-        return None if ki is None else ki.name
+        # Pipeline id ranges are disjoint (8-wave ids start at 1_000_000).
+        for pipe in MXFP8_ROW_PIPELINES:
+            if kernelId in pipe.kernels_list:
+                return pipe.kernels_list[kernelId].name
+        return None
 
     def _clear_op_caches(self):
         from aiter.ops import gemm_op_a8w8 as _op
@@ -153,10 +154,17 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             N = int(untunedf.loc[i, "N"])
             K = int(untunedf.loc[i, "K"])
             info_keys = (gfx, cu_num, M, N, K)
-            cands = candidates_for("fp8", "fp8", M, N, K, **dict(MXFP8_ROW_SCALES))
+            # One pass per pipeline, in MXFP8_ROW_PIPELINES order.
+            cands = [
+                (kernel_id, ki)
+                for pipe in MXFP8_ROW_PIPELINES
+                for kernel_id, ki in pipe.kernels_list.items()
+                if pipe.fits(ki, M, N, K)
+            ]
             for kernel_id, ki in cands:
-                # kernelName carries the full launch config (incl. split-K), so
-                # dispatch never needs kernelId -- it is recorded for reference.
+                # kernelName carries the full launch config (incl. split-K and
+                # the pipeline), so dispatch never needs kernelId -- it is
+                # recorded for reference.
                 info = (info_keys, kernel_id, ki.split_k, ki.name, "flydsl")
                 task.append(
                     (
@@ -178,7 +186,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     )
                 )
             if not cands:
-                logger.warning(f"no mxpsh 1x32 tile fits M={M} N={N} K={K}")
+                logger.warning(f"no mxfp8 1x32 kernel fits M={M} N={N} K={K}")
             tasks_data.append((len(cands), ()))
 
         if not task:
