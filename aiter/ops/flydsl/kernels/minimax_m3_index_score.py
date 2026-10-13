@@ -294,7 +294,7 @@ def _cu_count(device=None) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def geometry(batch, max_block, S=0, H=0, cp_world=1, cp_rank=0, device=None):
+def geometry(batch, max_block, S, H, cp_world=1, cp_rank=0, device=None):
     """Pick the launch geometry from the BOUNDS -- never seq_lens contents, so
     the grid stays valid across a cudagraph replay. Returns a plain dict.
 
@@ -1052,21 +1052,22 @@ def _run_chunk_map(seq_lens, rows, chunks, chunk, out, world, rank):
 
 
 def work_map_size(
-    batch: int, max_block: int, S: int = 0, H: int = 0, *, device=None, **cp
+    batch: int, max_block: int, S: int, H: int, *, device=None, **cp
 ) -> int:
     """Rows the work map will have: the grid, one row per CTA.
 
     A cudagraph caller sizes its persistent buffer with `work_map_capacity`
     instead -- the exact grid is non-monotonic in the bounds -- and passes a
-    `buf[:rows]` slice. Omitting S/H keeps the legacy unsplit map, which
-    `score_flydsl` accepts with the matching geometry.
+    `buf[:rows]` slice. S/H must match the `score_flydsl` call the map is for:
+    they change the geometry, and a map built for a different one is a map the
+    kernel would index with the wrong stride.
     """
     return _validate_bounds(
         batch, max_block, geometry(batch, max_block, S, H, device=device, **cp)
     )
 
 
-def work_map_capacity(max_batch: int, max_block: int, S: int = 0, H: int = 0, **cp):
+def work_map_capacity(max_batch: int, max_block: int, S: int, H: int, **cp):
     """Persistent rows covering every batch/block bound within the envelope.
 
     Sizes for the smallest CTA chunk `geometry` can reach, independent of CU
@@ -1103,7 +1104,7 @@ def work_map_capacity(max_batch: int, max_block: int, S: int = 0, H: int = 0, **
     return rows
 
 
-def build_work_map(seq_lens, max_block, S: int = 0, H: int = 0, out=None, **cp):
+def build_work_map(seq_lens, max_block, S: int, H: int, out=None, **cp):
     """The work map with the geometry resolved for you.
 
     Resolving it here and in `score_flydsl` separately would mean keeping two
@@ -1171,6 +1172,31 @@ def _validate_tensor(t, name, dtype, ndim, device, alignment=4, bounded=True):
         raise ValueError(f"{name}: base must be {alignment}-byte aligned")
     if bounded and (_span(t) > 0x7FFFFFFF or _span(t) * t.element_size() > 0xFFFFFFFF):
         raise ValueError(f"{name}: strided address span exceeds 32-bit addressing")
+
+
+def _validate_rows(t, name):
+    """The row/head stride rule for a [rows, heads, 128] bf16 or fp8 operand.
+
+    Only stride(0)/stride(1) reach the kernel and every innermost index is an
+    element offset, so a non-unit feature stride silently scores the wrong
+    features. Alignment matters too, not just overlap: the loaders turn an
+    element offset into a dword offset and vector-load it, so an odd row or
+    head stride drops a feature. Both scorers hold the same contract.
+    """
+    if (
+        t.stride(2) != 1
+        or t.stride(1) < HEAD_DIM
+        or t.stride(0) < (t.shape[1] - 1) * t.stride(1) + HEAD_DIM
+    ):
+        raise ValueError(
+            f"{name}: feature stride must be 1 and neither heads nor rows may "
+            f"overlap, got stride {t.stride()} for shape {tuple(t.shape)}"
+        )
+    if any(st * t.element_size() % 16 for st in t.stride()[:2]):
+        raise ValueError(
+            f"{name}: rows and heads must be 16-byte aligned, got stride "
+            f"{t.stride()} for a {t.element_size()}-byte element"
+        )
 
 
 def _validate_map(out, rows, device, exact=False):
@@ -1251,26 +1277,9 @@ def _validate_metadata(
     if cache.shape[1:] != (PAGE, HEAD_DIM) or cache.shape[0] > 0x7FFFFFFF:
         raise ValueError("cache: expected [pages, 128, 128] with int32 page IDs")
     for t, name in ((idx_q, "idx_q"), (cache, "cache")):
-        if t.stride(2) != 1 or any(st * t.element_size() % 16 for st in t.stride()[:2]):
-            raise ValueError(f"{name}: rows and heads/pages must be 16-byte aligned")
-        if (
-            t.stride(1) < HEAD_DIM
-            or t.stride(0) < (t.shape[1] - 1) * t.stride(1) + HEAD_DIM
-        ):
-            raise ValueError(f"{name}: overlapping rows are unsupported")
+        _validate_rows(t, name)
     batch = idx_q.shape[0] // S
     geom = geometry(batch, max_block, S, H, device=device, **cp)
-    # A map built by the legacy two-argument `build_work_map` has no query
-    # dimensions and so uses unsplit geometry. Honour such a map rather than
-    # rejecting it, by scoring with the geometry it was actually built for.
-    # Ask `geometry` for that map's shape rather than open-coding one field of
-    # it: S/H can change `spread` as well as `waves_per_tok`, and a rescue that
-    # knows only the wave split rejects every spread case.
-    if isinstance(work_map, torch.Tensor) and work_map.ndim == 2:
-        legacy = geometry(batch, max_block, device=device, **cp)
-        rows_legacy = batch * _grid_chunks(max_block, legacy)
-        if work_map.shape[0] == rows_legacy != batch * _grid_chunks(max_block, geom):
-            geom = legacy
     rows = _validate_bounds(batch, max_block, geom)
     if block_table is not None:
         _validate_tensor(block_table, "block_table", (torch.int32,), 2, device)
@@ -1315,9 +1324,9 @@ def index_score_supported(
     S: int,
     H: int,
     max_block: int,
-    block_table=None,
+    block_table,
     *,
-    seq_lens=None,
+    seq_lens,
     sm_scale=1.0,
     out=None,
     work_map=None,
@@ -1332,7 +1341,7 @@ def index_score_supported(
     are checked here.
     """
     if block_table is None or seq_lens is None:
-        return False
+        return False  # explicit None, which the entry point also refuses
     try:
         _validate_metadata(
             idx_q, cache, S, H, max_block, block_table, seq_lens, out, work_map, **cp

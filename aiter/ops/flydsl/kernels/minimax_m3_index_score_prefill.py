@@ -50,6 +50,7 @@ from flydsl.expr.typing import T
 
 from aiter import dtypes
 from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
+    _CTA_OVERSUBSCRIBE,
     ACCESS_BYTES,
     HEAD_DIM,
     K_LOADS,
@@ -61,6 +62,8 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     TOK_TILES,
     WAVE,
     WAVES,
+    _cu_count,
+    _validate_rows,
     _validate_tensor,
     bf16_dwords_to_fp8,
 )
@@ -92,7 +95,6 @@ XCD_COUNT = 8
 # CTAs to aim for, as a multiple of the CU count. The block axis is the only
 # one that can be split without re-reading a page, so oversubscribing it is how
 # a causal window's uneven per-tile work gets balanced.
-_CTA_OVERSUBSCRIBE = 4
 _MIN_CHUNKS = 8
 
 # The 32x32x64 K read-ahead queue, as (depth, flush distance). 0 depth means no
@@ -225,23 +227,6 @@ def geometry(max_query_len, batch, heads, max_block, device=None):
         "m32": int(bool(ftpw and ftpw % 2 == 0)),
         "contig_k": 1,
     }
-
-
-@cache
-def _cu_count(device=None) -> int:
-    """CU count, memoised: the tile_q search asks for it once per candidate,
-    and at a 22 us kernel that host-side query measured 1.7x the kernel."""
-    import os
-
-    import torch
-
-    from aiter.jit.utils.chip_info import get_cu_num
-
-    # `CU_NUM` wins over the device here too, or this module and the decode
-    # module resolve different geometries from the same bounds.
-    if device is None or os.environ.get("CU_NUM"):
-        return get_cu_num()
-    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
 def chunk_blocks(
@@ -1247,26 +1232,7 @@ def score_prefill_flydsl(
             f"{HEAD_DIM}, stride(2) 1 and stride(0) at least "
             f"{cache.shape[1] * HEAD_DIM}, got {cache.stride()}"
         )
-        # Only stride(0)/stride(1) reach the kernel and every innermost index is an
-        # element offset, so a non-unit feature stride silently scores the wrong
-        # features. Alignment matters too, not just overlap: `q_fp8_at` turns a bf16
-        # element offset into a dword offset and vector-loads it, so an odd row or
-        # head stride drops a feature. Decode states the same contract.
-    if (
-        idx_q.stride(2) != 1
-        or idx_q.stride(1) < HEAD_DIM
-        or idx_q.stride(0) < (idx_q.shape[1] - 1) * idx_q.stride(1) + HEAD_DIM
-    ):
-        raise ValueError(
-            f"idx_q: feature stride must be 1 and neither heads nor rows may "
-            f"overlap, got stride {idx_q.stride()} for shape "
-            f"{tuple(idx_q.shape)}"
-        )
-    if any(st * idx_q.element_size() % 16 for st in idx_q.stride()[:2]):
-        raise ValueError(
-            f"idx_q: rows and heads must be 16-byte aligned, got stride "
-            f"{idx_q.stride()} for a {idx_q.element_size()}-byte element"
-        )
+    _validate_rows(idx_q, "idx_q")
     # `block_table` reaches the kernel as `b * stride(0) + column`, so the
     # column axis is assumed packed; the three length arrays are indexed by
     # `b` (and `b+1`) straight off `.data_ptr()`.

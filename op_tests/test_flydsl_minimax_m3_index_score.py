@@ -1163,39 +1163,43 @@ def test_cu_override_reaches_both_sizing_paths(monkeypatch):
     assert kernel.build_work_map(lens, 128, 1, 1, out=buf).shape[0] == rows
 
 
-@requires_gfx950
-@pytest.mark.parametrize("batch,mb,S,H", [(4, 1024, 4, 1), (1, 1024, 4, 1)])
-def test_legacy_map_is_honoured_under_spread(batch, mb, S, H):
-    """A map from the two-argument `build_work_map` has unsplit geometry.
-
-    The rescue that honours it only knew about `waves_per_tok`, so a geometry
-    that differs by `spread` instead was rejected: `work_map_size(4, 1024)` is
-    1024 rows where S=4,H=1 wants 1028 -- one spare row per request -- and the
-    scorer raised "expected exact grid slice" on a map it had just been told
-    how to read.
+def test_prefill_reads_the_same_cu_override(monkeypatch):
+    """Both scorers size their grids from the CU count, so an override that
+    only one of them sees makes them disagree about the same machine. Prefill
+    used to memoise its own copy, which froze whatever `CU_NUM` was at the
+    first call -- and that copy was redundant: the `_auto_*` helpers that ask
+    for it are themselves memoised, so the warm path never calls it at all.
     """
-    legacy = kernel.work_map_size(batch, mb)
-    split = kernel.work_map_size(batch, mb, S, H)
-    assert legacy != split, "pick a shape where the geometries actually differ"
-    lens = torch.full((batch,), mb * P, dtype=torch.int32, device="cuda")
-    wm = kernel.build_work_map(lens, mb)
-    assert wm.shape[0] == legacy
-    q, k, bt, _l, _mb = make_case(batch, S, H, [mb * P] * batch)
-    assert kernel.index_score_supported(q, k, S, H, mb, bt, seq_lens=lens, work_map=wm)
+    from aiter.ops.flydsl.kernels import minimax_m3_index_score_prefill as pf
+
+    assert pf._cu_count is kernel._cu_count
+    from aiter.jit.utils import chip_info
+
+    monkeypatch.setenv("CU_NUM", "64")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 64)
+    assert pf._cu_count() == 64
+    # A later override has to be seen too, which a cached read would not be.
+    monkeypatch.setenv("CU_NUM", "256")
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 256)
+    assert pf._cu_count() == 256
 
 
 def test_supported_answers_for_the_whole_entry_point():
     """A dispatcher that trusts the predicate and routes here must not then
     take a raise. `_validate_metadata` skips `block_table`/`seq_lens` when they
-    are None and never sees the scale, so the predicate has to check both
-    itself -- it used to return True and let `score_flydsl` raise."""
+    are None and never sees the scale, so the predicate checks both itself --
+    it used to return True and let `score_flydsl` raise."""
     q = torch.empty(1, 1, D, dtype=torch.bfloat16)
     k = torch.empty(1, P, D, dtype=torch.bfloat16)
     bt = torch.zeros(1, 1, dtype=torch.int32)
     lens = torch.zeros(1, dtype=torch.int32)
-    assert not kernel.index_score_supported(q, k, 1, 1, 1)
-    assert not kernel.index_score_supported(q, k, 1, 1, 1, bt)
-    assert not kernel.index_score_supported(q, k, 1, 1, 1, seq_lens=lens)
+    # Omitting them is a TypeError now, which is the right place to find out.
+    with pytest.raises(TypeError):
+        kernel.index_score_supported(q, k, 1, 1, 1)
+    # Passing them as None explicitly still has to be a refusal, not a crash:
+    # that is what a dispatcher holding an optional does.
+    assert not kernel.index_score_supported(q, k, 1, 1, 1, None, seq_lens=lens)
+    assert not kernel.index_score_supported(q, k, 1, 1, 1, bt, seq_lens=None)
     # And the scale, which the entry point rejects outside FP32's normal range.
     assert not kernel.index_score_supported(
         q, k, 1, 1, 1, bt, seq_lens=lens, sm_scale=1e39
