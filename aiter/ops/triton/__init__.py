@@ -140,6 +140,7 @@ _BACKWARD_COMPAT_MAP = {
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
     "fused_rmsnorm_add": "normalization.fused_rmsnorm_add",
+    "fused_rmsnorm_add_rmsnorm": "normalization.fused_rmsnorm_add_rmsnorm",
     "norm": "normalization.norm",
     "rmsnorm": "normalization.rmsnorm",
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",

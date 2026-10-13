@@ -267,8 +267,16 @@ def _should_use_vmm(is_gfx1250: bool) -> bool:
     return use_vmm
 
 
+# Env var to request the torch.symm_mem transport (mori backend) instead of
+# IPC/VMM. Only a request: the probe can still turn it down.
+_USE_SYMM_MEM_ENV = "AITER_CUSTOM_AR_USE_SYMM_MEM"
+
 _is_gfx1250 = _detect_gfx1250()
 _use_vmm = _should_use_vmm(_is_gfx1250)
+# gfx1250 only. symm_mem gives out raw peer pointers, and init_custom_ar_gfx1250
+# is the only op taking a pointer list — the old-arch ops want IPC handles plus
+# offsets. symm_mem itself is not arch-specific.
+_use_symm_mem = env_flag(_USE_SYMM_MEM_ENV) and _is_gfx1250
 
 try:
     if _is_gfx1250:
@@ -725,8 +733,90 @@ class _GFX1250BufferProxy:
         return ptrs
 
 
+class _SymmMemBufferProxy:
+    """Pool-like access for torch.symm_mem buffers, so the rest of
+    CustomAllreduce can use self._pool["meta"] etc.
+
+    Not a subclass of _GFX1250BufferProxy on purpose. The two look alike today,
+    but they own their buffers differently, and inheriting would hand this one
+    whatever the VMM path grows next.
+    """
+
+    class _Entry:
+        def __init__(self, tensor):
+            self._tensor = tensor
+
+        @property
+        def tensor(self):
+            return self._tensor
+
+        @property
+        def data_ptr(self):
+            return self._tensor.data_ptr()
+
+        @property
+        def max_size(self):
+            return self._tensor.numel() * self._tensor.element_size()
+
+    def __init__(self, meta_tensor, input_tensor, handles, ca):
+        self._meta = meta_tensor
+        self._input = input_tensor
+        # Nothing reads these after init. They are kept so the peer mappings
+        # stay valid while the kernel uses the buffers: whether dropping a
+        # handle unmaps its peers is up to the backend.
+        self._hdls = handles
+        self._ca = ca
+
+    def __getitem__(self, key):
+        if key == "meta":
+            return self._Entry(self._meta)
+        elif key == "input":
+            return self._Entry(self._input)
+        raise KeyError(key)
+
+    def flush_graph_buffers(self, ar_ptr):
+        count = self._ca._ops_get_graph_buffer_count(ar_ptr)
+        if count > 0:
+            logger.warning(
+                "symm_mem: CUDA graph buffer registration not yet "
+                "supported (%d buffers skipped)",
+                count,
+            )
+
+    def close(self):
+        # torch has no free API: mori frees a buffer on the last reference to
+        # its tensor, and deregisters the window on the last one to its handle.
+        # This proxy holds the only ones. Dropping _ca also breaks the cycle.
+        self._meta = self._input = self._hdls = self._ca = None
+
+    def get_external_ipc_meta(self, tensor):
+        """Unsupported on this transport.
+
+        The tensor is outside the symmetric heap, so peers could only get a
+        copy of it made at registration time. The kernel re-reads peer pointers
+        every round, so each rank would reduce its own live data against
+        everyone else's stale copy: wrong results, no error.
+        """
+        raise NotImplementedError(
+            "get_external_ipc_meta is not supported on the torch.symm_mem "
+            "transport: sharing an external tensor needs a registration-time "
+            "copy, which would make peers reduce stale data. "
+            "register_input_buffer/register_output_buffer skip it."
+        )
+
+
 class CustomAllreduce:
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 6, 8]
+
+    def _meta_size(self) -> int:
+        """Bytes of shared meta buffer this group needs.
+
+        gfx1250 sizes its LL scratch by world_size (2 banks x world_size
+        slots), so its op takes an argument. The old-arch one does not.
+        """
+        if self._is_gfx1250:
+            return self._ops_meta_size(self.world_size)
+        return self._ops_meta_size()
 
     def _select_ops(self):
         """Select the ops backend.
@@ -754,7 +844,8 @@ class CustomAllreduce:
             self._ops_get_graph_buffer_ptrs = ops.get_graph_buffer_ptrs_gfx1250
             self._ops_register_graph_buffers = ops.register_graph_buffers_gfx1250
             # transport-coupled ops (init / register)
-            if self._use_vmm:
+            # symm_mem provides raw VA pointers (same as VMM), so use ptr-list ops.
+            if self._use_symm_mem or self._use_vmm:
                 self._ops_init_custom_ar = ops.init_custom_ar_gfx1250
                 self._ops_register_input_buffer = ops.register_input_buffer_gfx1250
                 self._ops_register_output_buffer = ops.register_output_buffer_gfx1250
@@ -799,6 +890,7 @@ class CustomAllreduce:
         self.disabled = True
         self._is_gfx1250 = _is_gfx1250  # kernel dimension (arch)
         self._use_vmm = _use_vmm  # transport dimension (arch + ROCm version)
+        self._use_symm_mem = _use_symm_mem  # torch.symm_mem transport (mori backend)
         self._select_ops()
 
         if not custom_ar:
@@ -812,13 +904,18 @@ class CustomAllreduce:
             dist.get_backend(group) != dist.Backend.NCCL
         ), "CustomAllreduce should be attached to a non-NCCL group."
 
-        if not all(in_the_same_node_as(group, source_rank=0)):
-            # No need to initialize custom allreduce for multi-node case.
+        self._same_node = all(in_the_same_node_as(group, source_rank=0))
+        if not self._same_node and not self._use_symm_mem:
             logger.warning(
                 "Custom allreduce is disabled because this process group"
                 " spans across nodes."
             )
             return
+        if not self._same_node and self._use_symm_mem:
+            logger.info(
+                "Custom allreduce: group spans nodes; disabled if symm_mem "
+                "cannot map peers on other nodes."
+            )
 
         rank = dist.get_rank(group=self.group)
         world_size = dist.get_world_size(group=self.group)
@@ -836,14 +933,10 @@ class CustomAllreduce:
             )
             return
 
-        props = torch.cuda.get_device_properties(device)
-        gcn_arch = getattr(props, "gcnArchName", "")
-        if "gfx1250" in gcn_arch and world_size > 4:
-            raise RuntimeError(
-                f"gfx1250 (MI450) custom allreduce only supports "
-                f"world_size <= 4, got world_size={world_size}. "
-                f"RCCL fallback is also not available on this platform."
-            )
+        # Set before `disabled` goes False so no reader observes a live
+        # communicator without them.
+        self.rank = rank
+        self.world_size = world_size
 
         if isinstance(device, int):
             device = torch.device(f"cuda:{device}")
@@ -887,6 +980,25 @@ class CustomAllreduce:
         #         "warning, specify disable_custom_all_reduce=True explicitly.")
         #     return
 
+        # Pick the transport before the guards below, which branch on it. This
+        # is the last place symm_mem can switch to another transport.
+        if self._use_symm_mem and not self._probe_symm_mem():
+            logger.warning(
+                "symm_mem probe failed, falling back to %s transport",
+                "VMM" if self._use_vmm else "IPC",
+            )
+            self._use_symm_mem = False
+            self._select_ops()
+
+        # Only symm_mem can map across nodes; IPC and VMM handles are node-local.
+        # Rechecked here because the probe may have just dropped symm_mem.
+        if not self._same_node and not self._use_symm_mem:
+            logger.warning(
+                "Custom allreduce is disabled because this process group"
+                " spans across nodes."
+            )
+            return
+
         self.disabled = False
         # gfx1250 (MI450) cannot register CUDA-graph-captured buffers across
         # ranks yet: cross-rank graph-buffer exchange is unimplemented for both
@@ -905,7 +1017,11 @@ class CustomAllreduce:
         # it would fail. Force the copy-in path, which stages into the plain
         # hipMalloc input pool (IPC-exportable). The VMM transport does its own
         # pointer exchange and is unaffected, so only guard the IPC path.
-        if not self._use_vmm and _expandable_segments_enabled():
+        if (
+            not self._use_vmm
+            and not self._use_symm_mem
+            and _expandable_segments_enabled()
+        ):
             if enable_register_for_capturing:
                 logger.warning(
                     "PyTorch expandable_segments is enabled; forcing custom "
@@ -932,15 +1048,176 @@ class CustomAllreduce:
         # to RCCL. Default 0 (no lower bound). Overridable via
         # AITER_CUSTOM_AR_MIN_SIZE. Custom AR runs only in (min, max].
         self._car_min_size = _resolve_car_min_size()
-        self.rank = rank
-        self.world_size = world_size
 
         self.fully_connected = fully_connected
 
-        if self._use_vmm:
+        # No fallback past here, same as the VMM path, except a cross-node
+        # symm_mem group that cannot map its peers. The probe already showed
+        # symm_mem is there, so failing now means a broken setup, not an
+        # unsupported one, and it raises.
+        if self._use_symm_mem:
+            self._init_symm_mem(rank, world_size, max_size)
+        elif self._use_vmm:
             self._init_gfx1250(rank, world_size, max_size)
         else:
             self._init_ipc(rank, world_size, max_size)
+
+    def _all_reduce_and(self, value: bool, require: str = "") -> bool:
+        """Logical AND of a per-rank verdict across the group (MIN on 0/1).
+
+        Anything that can fail on a single rank goes through this before the
+        next collective. Otherwise the ranks that voted True block there,
+        waiting for the one that gave up. self.group is gloo, so this is a CPU
+        collective.
+
+        With *require*, a False verdict raises on every rank instead of being
+        returned. Same reason: one rank raising alone would hang the others.
+
+        The exception is a failure inside another collective (mori's
+        rendezvous): the peers are blocked there, not here, so voting cannot
+        reach them. See _rendezvous.
+        """
+        vote = torch.tensor([1 if value else 0], dtype=torch.int32, device="cpu")
+        dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=self.group)
+        agreed = bool(vote.item())
+        if not agreed and require:
+            raise RuntimeError(
+                f"custom allreduce: symm_mem transport could not {require}. "
+                f"Unset {_USE_SYMM_MEM_ENV} to use the default transport instead."
+            )
+        return agreed
+
+    def _rendezvous(self, tensor, what: str):
+        """rendezvous a tensor and check that every rank can reach every peer.
+
+        An exception from mori is not caught, same as vmm_exchange on the VMM
+        path. mori runs its own collectives inside rendezvous (ccoCommCreate,
+        ccoWindowRegister) over sockets with no receive timeout, so a rank that
+        fails there must not move on to a vote: its peers may still be blocked
+        in mori, and only this process exiting, which closes its sockets, frees
+        them. If the caller catches the exception and keeps the process alive,
+        the peers stay blocked (or, if they already got past mori, wait in the
+        next vote until the gloo timeout).
+
+        Once mori has returned on every rank, a peer it could not map shows up
+        as a null pointer. That is voted on: within a node it raises on every
+        rank; across nodes every rank gets None and the caller falls back.
+        """
+        import torch.distributed._symmetric_memory as symm_mem
+
+        hdl = symm_mem.rendezvous(tensor, self.group)
+        # init_custom_ar takes world_size from this list and never null-checks
+        # it, so validate it here.
+        peers_mapped = len(hdl.buffer_ptrs) == self.world_size and all(hdl.buffer_ptrs)
+        if not peers_mapped:
+            logger.error("symm_mem rendezvous returned unusable peer pointers")
+        if self._same_node:
+            self._all_reduce_and(peers_mapped, f"map its {what} buffer across peers")
+            return hdl
+        return hdl if self._all_reduce_and(peers_mapped) else None
+
+    def _probe_symm_mem(self) -> bool:
+        """Is the mori symm_mem backend available? Answered by every rank.
+
+        This is the only symm_mem failure that switches transport, because no
+        version check can answer it the way _should_use_vmm answers VMM. After
+        it, failures raise, except a cross-node group whose peers cannot be
+        mapped, which falls back to RCCL (see _init_symm_mem).
+
+        It only checks that the backend loads and can allocate locally, which
+        also test-exports a fabric handle. Mapping peers (cco comm creation,
+        handle import, peers on other nodes) is left to _init_symm_mem: symm_mem
+        was asked for explicitly, so a failure there is a broken setup and
+        raises rather than quietly switching transport.
+        """
+        buf = None
+        prev_backend = None
+        # Allocate before the vote: like the import, it can fail on one rank
+        # alone, and every rank must see that before the next collective.
+        try:
+            import mori.allocator  # noqa: F401
+            import torch.distributed._symmetric_memory as symm_mem
+
+            # set_backend is process-global, so remember what to put back.
+            prev_backend = symm_mem.get_backend(self.device)
+            symm_mem.set_backend("MORI")
+            buf = symm_mem.empty(64, dtype=torch.uint8, device=self.device)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("symm_mem unavailable: %s", e)
+
+        available = self._all_reduce_and(buf is not None)
+        del buf
+        if not available and prev_backend is not None:
+            # Leaving MORI installed would re-point other symm_mem users in
+            # this process. Best effort: failing here changes nothing.
+            try:
+                symm_mem.set_backend(prev_backend)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("could not restore symm_mem backend: %s", e)
+        return available
+
+    def _init_symm_mem(self, rank: int, world_size: int, max_size: int):
+        """Init using torch.symm_mem (mori allocator backend).
+
+        Raises on every rank if the real buffers cannot be allocated, or if a
+        peer within the node cannot be mapped. If a cross-node group cannot map
+        its peers, disables custom allreduce on every rank instead. Errors
+        inside mori's own rendezvous are raised on the failing rank only; see
+        _rendezvous.
+        """
+        import torch.distributed._symmetric_memory as symm_mem
+
+        # register_*_buffer and flush_graph_buffers are no-ops here, which is
+        # only safe while every call goes through the copy-in pool. Allowing
+        # registered capture needs both implemented first.
+        assert (
+            not self.enable_register_for_capturing
+        ), "symm_mem transport requires copy-in; see register_input_buffer"
+
+        meta = inp = None
+        try:
+            meta = symm_mem.empty(
+                self._meta_size(), dtype=torch.uint8, device=self.device
+            )
+            meta.zero_()
+            inp = symm_mem.empty(max_size, dtype=torch.uint8, device=self.device)
+        except Exception as e:  # noqa: BLE001
+            logger.error("symm_mem allocation failed at full size: %s", e)
+        # inp is assigned last, so it standing means both buffers are there.
+        self._all_reduce_and(inp is not None, "allocate its buffers")
+
+        # zero_() is stream-ordered but rendezvous runs on the host, so drain
+        # the stream first. Otherwise peers can map the meta buffer before it
+        # is cleared, and LL reads a nonzero flag word as a published line.
+        torch.cuda.synchronize()
+
+        meta_hdl = self._rendezvous(meta, "meta")
+        inp_hdl = self._rendezvous(inp, "input") if meta_hdl is not None else None
+        if inp_hdl is None:
+            # Only a cross-node group gets here, and every rank agreed. The
+            # buffers and handles go with this frame.
+            logger.warning(
+                "Custom allreduce is disabled because symm_mem could not map "
+                "peers on other nodes."
+            )
+            self.disabled = True
+            return
+
+        logger.info("Custom allreduce: using torch.symm_mem transport (mori backend)")
+
+        self._ptr = self._ops_init_custom_ar(
+            meta.data_ptr(),
+            self.rank_data.data_ptr(),
+            self.rank_data.numel(),
+            list(meta_hdl.buffer_ptrs),
+            rank,
+            self.fully_connected,
+        )
+        self._ops_register_input_buffer(
+            self._ptr, inp.data_ptr(), list(inp_hdl.buffer_ptrs)
+        )
+        # Sole owner from here on, so its close() releases the buffers.
+        self._pool = _SymmMemBufferProxy(meta, inp, (meta_hdl, inp_hdl), self)
 
     def _init_gfx1250(self, rank: int, world_size: int, max_size: int):
         """gfx1250 VMM init: used when hipIpc is unusable (ROCm < 7.15). Shares
@@ -948,7 +1225,7 @@ class CustomAllreduce:
         socket) instead of IPC handles."""
         from .vmm_allocator import VMMBuffer, load_hip_runtime, vmm_exchange
 
-        meta_sz = self._ops_meta_size()
+        meta_sz = self._meta_size()
         # gfx1250 is 1-stage only — no tmp buffer after Signal needed
         total_meta = meta_sz
         device_id = self.device.index
@@ -1041,8 +1318,9 @@ class CustomAllreduce:
         # old arch: meta_size() + 2x tmp region (2-stage kernel) is GB-scale, so
         # it lands in the first regime and exports fine despite meta_size()=5504
         # (not a page multiple).
-        # gfx1250: meta_size_gfx1250() = Signal (~34 KB) + LL staging scratch
-        # (~4 MiB, see kLLScratchOffset/llScratchBytes). That is already well
+        # gfx1250: meta_size_gfx1250(world_size) = Signal (~34 KB) + LL staging
+        # scratch (2 banks x world_size slots: 32 MiB at TP=2, 128 MiB at
+        # TP=8, see kLLScratchOffset/llScratchBytes). Even the smallest is well
         # above 2 MB, so it lands in the always-safe coarse-grained regime; the
         # round-up to a 2 MB multiple below is a no-op guard that also keeps the
         # allocation 2 MB-aligned. The kernel touches the leading Signal struct
@@ -1050,10 +1328,10 @@ class CustomAllreduce:
         _COARSE_GRAIN = 2 * 1024 * 1024
         if self._is_gfx1250:
             meta_size = (
-                (self._ops_meta_size() + _COARSE_GRAIN - 1) // _COARSE_GRAIN
+                (self._meta_size() + _COARSE_GRAIN - 1) // _COARSE_GRAIN
             ) * _COARSE_GRAIN
         else:
-            meta_size = self._ops_meta_size() + max_size * 2
+            meta_size = self._meta_size() + max_size * 2
         # Wire the pool's graph helpers to the kernel-matching ops so that
         # flush_graph_buffers() during capture never reinterpret_casts a gfx1250
         # `fa` through the old-arch graph ops. Graph-buffer registration itself
@@ -1130,8 +1408,16 @@ class CustomAllreduce:
 
     def register_input_buffer(self, inp: torch.Tensor):
         """Register an external tensor as an IPC input buffer."""
-        # Branch on transport: VMM returns a raw peer-ptr list; IPC (both
-        # old-arch and gfx1250 kernels) returns handles + offsets.
+        # No-op on symm_mem: it cannot share an external tensor (see
+        # _SymmMemBufferProxy.get_external_ipc_meta), and gfx1250 always
+        # reduces through the copy-in pool, which never looks up an externally
+        # registered buffer. Callers that register anyway, such as ATOM's
+        # signal tensor, keep working.
+        if self._use_symm_mem:
+            logger.warning("symm_mem: register_input_buffer is a no-op")
+            return
+        # Branch on transport: VMM returns a raw peer-ptr list; IPC (old-arch
+        # and gfx1250 kernels) returns handles + offsets.
         if self._use_vmm:
             all_ptrs = self._pool.get_external_ipc_meta(inp)
             self._ops_register_input_buffer(self._ptr, inp.data_ptr(), all_ptrs)
@@ -1143,6 +1429,9 @@ class CustomAllreduce:
 
     def register_output_buffer(self, out: torch.Tensor):
         """Register an external tensor as an IPC output buffer."""
+        if self._use_symm_mem:  # no-op, see register_input_buffer
+            logger.warning("symm_mem: register_output_buffer is a no-op")
+            return
         if self._use_vmm:
             all_ptrs = self._pool.get_external_ipc_meta(out)
             self._ops_register_output_buffer(self._ptr, out.data_ptr(), all_ptrs)

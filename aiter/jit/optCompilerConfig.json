@@ -434,6 +434,20 @@
         "torch_exclude": "True",
         "blob_gen_cmd": "f'{AITER_META_DIR}/hsa/codegen.py -m bf16gemm --output_dir {{}}'"
     },
+    "module_gemm_a16w8_asm": {
+        "srcs": [
+            "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a16w8.cu'"
+        ],
+        "flags_extra_cc": [],
+        "flags_extra_hip": [],
+        "extra_ldflags": "None",
+        "extra_include": [],
+        "verbose": "False",
+        "torch_exclude": "True",
+        "blob_gen_cmd": [
+            "f'{AITER_META_DIR}/hsa/codegen.py -m a16w8gemm --output_dir {{}}'"
+        ]
+    },
     "module_gemm_a4w4_asm": {
         "srcs": [
             "f'{AITER_CSRC_DIR}/py_itfs_cu/asm_gemm_a4w4.cu'"
@@ -793,7 +807,8 @@
         ],
         "flags_extra_cc": [],
         "flags_extra_hip": [
-            "'-D__HIPCC_RTC__'"
+            "'-D__HIPCC_RTC__'",
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={int(os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5))}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -809,7 +824,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [],
@@ -825,7 +840,7 @@
         "flags_extra_cc": [],
         "flags_extra_hip": [
             "'-ffast-math'",
-            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 2)}'"
+            "f'-DOPUS_FP32_to_BF16_DEFAULT={os.environ.get(\"OPUS_FP32_to_BF16_DEFAULT\", 5)}'"
         ],
         "extra_ldflags": "None",
         "extra_include": [
