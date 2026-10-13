@@ -898,6 +898,13 @@ def gemm_a8w8_bpreshuffle_out(
         x_scale = x_scale.reshape(m, 1).contiguous()
     if w_scale.shape != (n, 1) or not w_scale.is_contiguous():
         w_scale = w_scale.reshape(n, 1).contiguous()
+    # Every operand is dense now, so [data_ptr, data_ptr + nbytes) is its exact
+    # byte range. The kernel would overwrite an input it is still reading, and
+    # the schema tells torch.compile that only out is written.
+    out_begin, out_end = out.data_ptr(), out.data_ptr() + out.nbytes
+    for name, t in (("XQ", XQ), ("WQ", WQ), ("x_scale", x_scale), ("w_scale", w_scale)):
+        if t.data_ptr() < out_end and out_begin < t.data_ptr() + t.nbytes:
+            raise ValueError(f"out must not overlap {name}")
     # The launchers use the current device's stream.
     if XQ.device.index == torch.cuda.current_device():
         _gemm_a8w8_bpreshuffle_into(XQ, WQ, x_scale, w_scale, out)

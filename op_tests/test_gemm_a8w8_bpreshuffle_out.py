@@ -261,6 +261,24 @@ def test_bad_scale_rejected_before_launch(arg, bad):
     assert torch.all(out == 3.0)
 
 
+@pytest.mark.parametrize("arg", ["XQ", "WQ", "x_scale", "w_scale"])
+def test_out_overlapping_an_input_rejected_before_launch(arg):
+    m, n, k = 32, 256, 512
+    args = dict(zip(("XQ", "WQ", "x_scale", "w_scale"), _inputs(m, n, k)))
+    # One byte buffer holds the input and, through a bf16 view, out.
+    src = args[arg]
+    out_nbytes = m * n * dtypes.bf16.itemsize
+    buf = torch.zeros(max(src.nbytes, out_nbytes), dtype=torch.uint8, device="cuda")
+    args[arg] = buf[: src.nbytes].view(src.dtype).view(src.shape)
+    args[arg].copy_(src)
+    out = buf[:out_nbytes].view(dtypes.bf16).view(m, n)
+    before = buf.clone()
+
+    with pytest.raises(ValueError, match=f"out must not overlap {arg}"):
+        aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.equal(buf, before)
+
+
 def _row_strided(t):
     return torch.cat([t, t], 1)[:, : t.shape[1]]
 
