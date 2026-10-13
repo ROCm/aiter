@@ -11,11 +11,6 @@ import sys
 from setuptools import Distribution, setup
 from setuptools.command.build_ext import build_ext
 
-try:
-    from setuptools.command.bdist_wheel import bdist_wheel
-except ImportError:  # setuptools < 70.1
-    from wheel.bdist_wheel import bdist_wheel
-
 this_dir = os.path.dirname(os.path.abspath(__file__))
 OPT_COMPILER_CONFIG = os.path.join(this_dir, "aiter", "jit", "optCompilerConfig.json")
 PACKAGE_NAME = "amd-aiter"
@@ -24,6 +19,9 @@ FLYDSL_VERSION = "flydsl==0.3.4.1"
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 PREBUILD_KERNELS = int(os.environ.get("PREBUILD_KERNELS", "0"))
+# Opt-in: tag a wheel without compiled modules py3-none (see
+# _python_agnostic_bdist_wheel). Unset, wheels are tagged as before.
+AITER_PY3_WHEEL = os.environ.get("AITER_PY3_WHEEL", "0") == "1"
 PRETUNE_MODULES = os.environ.get("PRETUNE_MODULES", "")
 ENABLE_CK = int(os.environ.get("ENABLE_CK", "1"))
 IS_WINDOWS = sys.platform == "win32"
@@ -455,31 +453,39 @@ class NinjaBuildExtension(build_ext):
         super().run()
 
 
-class PythonAgnosticBdistWheel(bdist_wheel):
-    """Tag the wheel ``py3-none-<platform>`` when it holds no compiled modules.
+def _python_agnostic_bdist_wheel():
+    """Return a bdist_wheel that tags wheels without compiled modules py3-none.
 
-    Such a wheel carries only Python, C++/CK sources and ASM code objects, and
-    every host module is JIT-built on first use against the running
-    interpreter, so it is valid for any CPython 3 on the platform. The decision
-    is made from the files staged for the wheel, not from PREBUILD_KERNELS:
-    modules from a targeted prebuild, or JIT output left in aiter/jit/ by an
-    in-tree run, are packaged too and keep the interpreter-specific tag.
+    Used only with AITER_PY3_WHEEL=1. A wheel without compiled modules carries
+    only Python, C++/CK sources and ASM code objects, and every host module is
+    JIT-built on first use against the running interpreter, so it is valid for
+    any CPython 3 on the platform. The decision is made from the files staged
+    for the wheel, not from PREBUILD_KERNELS: modules from a targeted prebuild,
+    or JIT output left in aiter/jit/ by an in-tree run, are packaged too and
+    keep the interpreter-specific tag.
     """
+    try:
+        from setuptools.command.bdist_wheel import bdist_wheel
+    except ImportError:  # setuptools < 70.1
+        from wheel.bdist_wheel import bdist_wheel
 
     # Compiled files: .so (also versioned, .so.N) on Linux; .pyd modules and
     # .dll libraries on Windows.
-    _COMPILED = re.compile(r"\.(so(\.\d+)*|pyd|dll)$")
+    compiled = re.compile(r"\.(so(\.\d+)*|pyd|dll)$")
 
-    def get_tag(self):
-        impl, abi, plat = super().get_tag()
-        # bdist_wheel stages the wheel's files in bdist_dir before asking for
-        # the tag; if they are not there, keep the interpreter-specific tag.
-        if not (self.bdist_dir and os.path.isdir(self.bdist_dir)):
-            return impl, abi, plat
-        for _, _, files in os.walk(self.bdist_dir):
-            if any(self._COMPILED.search(name) for name in files):
+    class PythonAgnosticBdistWheel(bdist_wheel):
+        def get_tag(self):
+            impl, abi, plat = super().get_tag()
+            # bdist_wheel stages the wheel's files in bdist_dir before asking
+            # for the tag; if they are not there, keep the interpreter tag.
+            if not (self.bdist_dir and os.path.isdir(self.bdist_dir)):
                 return impl, abi, plat
-        return "py3", "none", plat
+            for _, _, files in os.walk(self.bdist_dir):
+                if any(compiled.search(name) for name in files):
+                    return impl, abi, plat
+            return "py3", "none", plat
+
+    return PythonAgnosticBdistWheel
 
 
 setup_requires = [
@@ -526,7 +532,7 @@ setup(
     ],
     cmdclass={
         "build_ext": NinjaBuildExtension,
-        "bdist_wheel": PythonAgnosticBdistWheel,
+        **({"bdist_wheel": _python_agnostic_bdist_wheel()} if AITER_PY3_WHEEL else {}),
     },
     # 3.8/3.9 have not actually worked for a long time: 81 modules already use
     # PEP 604 annotations (`X | None`) without `from __future__ import

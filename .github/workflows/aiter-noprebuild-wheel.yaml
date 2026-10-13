@@ -87,7 +87,9 @@ jobs:
                 *) version="${version}+noprebuild" ;;
               esac
               echo "Building amd-aiter ${version} with PREBUILD_KERNELS=0"
-              PREBUILD_KERNELS=0 SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMD_AITER="${version}" \
+              # AITER_PY3_WHEEL=1 tags the wheel py3-none (see setup.py).
+              PREBUILD_KERNELS=0 AITER_PY3_WHEEL=1 \
+                SETUPTOOLS_SCM_PRETEND_VERSION_FOR_AMD_AITER="${version}" \
                 python -m build --wheel
               ls -lh dist/*.whl
             '
@@ -222,6 +224,16 @@ jobs:
             "${S3_STAGING}/commits/${GITHUB_SHA}/latest-noprebuild.json" \
             --content-type application/json \
             --cache-control "public, max-age=31536000, immutable"
+
+          # Runs for consecutive commits can finish out of order: only move
+          # main/latest-noprebuild.json if this commit is still the head of
+          # main. If the lookup fails, update it as usual.
+          head=$(GIT_TERMINAL_PROMPT=0 timeout 60 \
+            git ls-remote "https://github.com/${GITHUB_REPOSITORY}" refs/heads/main | cut -f1) || head=""
+          if [ -n "${head}" ] && [ "${head}" != "${GITHUB_SHA}" ]; then
+            echo "::notice::main has moved on to ${head}; leaving main/latest-noprebuild.json to that commit's run"
+            exit 0
+          fi
 
           aws s3 cp latest-noprebuild.json \
             "${S3_STAGING}/main/latest-noprebuild.json" \
