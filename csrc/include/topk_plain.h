@@ -5,6 +5,7 @@
 #include "aiter_tensor.h"
 #include <cstdint>
 #include <optional>
+#include <string>
 
 // `topk_out` is optional where `topk_plain_values_optional` in topk_plain.py
 // says so: the fp32 largest-first radix path has a build that never writes the
@@ -31,3 +32,8 @@ bool topk_plain_use_mulblocks(int64_t numRows, int64_t stride0, int64_t k, bool 
 // Workspace sizing for the fp32 radix path, exposed to Python so the scratch can
 // be allocated + cached on the Python side and passed into topk_plain.
 int64_t topk_plain_workspace_size(int64_t numRows, int64_t stride0, int64_t k);
+
+// The row lengths bounding the gfx950 one-block kernels -- "any_rows_min",
+// "any_rows_max", "lds_tail_max" -- for the tests that hold topk_select's copies
+// to them; -1 for any other name.
+int64_t topk_plain_gfx950_width(const std::string& name);

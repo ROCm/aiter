@@ -39,6 +39,10 @@ def topk_plain_use_mulblocks(
 def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 
 
+@compile_ops("module_topk_plain")
+def topk_plain_gfx950_width(name: str) -> int: ...
+
+
 @functools.lru_cache(maxsize=1024)
 def _workspace_plan(device, rows: int, stride0: int, width: int, topk: int):
     # A size query costs a call several microseconds. The size depends on

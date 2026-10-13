@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <optional>
+#include <string>
 #include <type_traits>
 #include <vector>
 
@@ -5474,6 +5475,20 @@ bool topk_plain_use_mulblocks(int64_t numRows, int64_t stride0, int64_t k, bool 
                                              ragged,
                                              /*write_values=*/false,
                                              /*select_min=*/false);
+}
+
+// The row lengths that bound the gfx950 one-block kernels, by name, which
+// topk_select's router keeps copies of; its tests hold those copies to these.
+// -1 for a name it does not know.
+int64_t topk_plain_gfx950_width(const std::string& name)
+{
+    if(name == "any_rows_min")
+        return aiter::ob::kTopkPlainGfx950AnyRowsMinLen;
+    if(name == "any_rows_max")
+        return aiter::ob::kTopkPlainGfx950AnyRowsMaxLen;
+    if(name == "lds_tail_max")
+        return aiter::ob::kTopkPlainGfx950LdsTailMaxLen;
+    return -1;
 }
 
 // Raw-pointer entry called by topk_plain_kernels.cu via topk_per_row_kernel_launcher.

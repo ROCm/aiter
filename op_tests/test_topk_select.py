@@ -497,6 +497,29 @@ def test_lds_sizing():
     return failures
 
 
+def test_plain_gfx950_widths():
+    """The router's copies of the row lengths that bound plain's gfx950
+    one-block kernels equal the kernels' own, so retuning one side without the
+    other fails here rather than sending rows to a slower kernel."""
+    import aiter.ops.topk_select as ts
+    from aiter.ops.topk_plain import topk_plain_gfx950_width
+
+    # The router serves from k+1 columns, `width - k > 0`, at k=2048.
+    copies = {
+        "any_rows_min": 2048 + 1,
+        "any_rows_max": ts._PLAIN_K2048_FEW_ROWS_MAX_WIDTH,
+        "lds_tail_max": ts._PLAIN_K2048_LDS_TAIL_MAX_WIDTH,
+    }
+    failures = []
+    for name, copy in copies.items():
+        kernel = topk_plain_gfx950_width(name)
+        if kernel != copy:
+            failures.append(f"{name}: the kernels say {kernel}, the router {copy}")
+    for label in failures:
+        aiter.logger.error("PLAIN GFX950 WIDTHS FAILED: %s", label)
+    return failures
+
+
 def test_terminal_window():
     """`stream` drops its loop past the initial window (`terminal`) only for
     rows that fit it. The width the dispatch decides on and the width the
@@ -687,6 +710,12 @@ def main():
     aiter.logger.info(
         "LDS sizing: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
+    bad = test_plain_gfx950_widths()
+    aiter.logger.info(
+        "plain gfx950 widths: %s",
+        "all hold" if not bad else f"{len(bad)} FAILED: {bad}",
+    )
+    assert not bad, f"plain gfx950 widths: {len(bad)} failed"
     bad = test_terminal_window()
     aiter.logger.info(
         "terminal window: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"

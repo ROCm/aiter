@@ -207,6 +207,8 @@ _PLAIN_K2048_SMALL_CU_NARROW_MIN_ROWS = 128
 _PLAIN_K2048_SMALL_REJECT_YIELD_MAX = 2
 _PLAIN_K2048_NARROW_WIDTH = 8192
 _PLAIN_K2048_FEW_ROWS = 128
+# `kTopkPlainGfx950AnyRowsMaxLen` in csrc/kernels/topk_per_row_kernels.cu;
+# test_plain_gfx950_widths holds the copy to it.
 _PLAIN_K2048_FEW_ROWS_MAX_WIDTH = 80 * 1024
 _PLAIN_K2048_MAX_WIDTH = 131071
 # Below sampled's width door these kernels beat `sampled` on every measured
@@ -240,7 +242,8 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # of 131072 columns 405 against 420us). The edges are where that stopped:
 # 2816 rows reached 0.998x at 131104 columns, 2048 rows 0.979x at 131072, and
 # 4096 rows 0.978x at 131999 and 0.983x at 132000 columns. Mirrors
-# `kTopkPlainGfx950LdsTailMaxLen` in csrc/kernels/topk_per_row_kernels.cu.
+# `kTopkPlainGfx950LdsTailMaxLen` in csrc/kernels/topk_per_row_kernels.cu;
+# test_plain_gfx950_widths holds the copy to it.
 _PLAIN_K2048_LDS_TAIL_MIN_ROWS = 3000
 _PLAIN_K2048_LDS_TAIL_MAX_WIDTH = 128 * 1024 + 768
 # Rows that select all of their columns skip the backends (`_whole_row_takes`).
