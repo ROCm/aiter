@@ -395,7 +395,7 @@ def build_moe_contiguous_psum_remap_module():
     return launch_psum_remap
 
 
-def build_moe_contiguous_psum_remap_ep_module():
+def build_moe_contiguous_psum_remap_ep_module(dedup: bool = False):
     """psum + masked->contiguous remap, fused with the gemm2 EP ep_rowmap build.
 
     Same prefix-sum and in-place row remap as
@@ -404,10 +404,14 @@ def build_moe_contiguous_psum_remap_ep_module():
     origin_lid*topk + k) plus f32 weight bits into ep_rowmap[final_row], reusing
     the row it just computed. ep_rowmap is a flat (cap_rows+1, 2) i32 tensor;
     rows no kept route claims keep the -1 sentinel the host memset wrote.
+
+    ``dedup`` packs ``t | c << 24`` instead of the dest: the recv slot ``t`` and
+    the count ``c`` of its routes that landed on this rank. The dedup pushers
+    derive the dest themselves; gemm2 only needs to know when ``t`` is complete.
     """
 
     @flyc.kernel(
-        name="moe_contiguous_psum_remap_ep",
+        name="moe_contiguous_psum_remap_ep" + ("_dedup" if dedup else ""),
         known_block_size=[MAX_EXPERTS_PER_BLOCK, 1, 1],
     )
     def psum_remap_ep_kernel(
@@ -519,10 +523,21 @@ def build_moe_contiguous_psum_remap_ep_module():
                 w_f32 = w_p[route].to(fx.Float32)
                 t = fx.Uint32(route) // topk_v
                 k = fx.Uint32(route) - t * topk_v
-                enc = fx.Uint32(tis_p[t])
-                origin_pe = enc // max_tok_v
-                origin_lid = enc - origin_pe * max_tok_v
-                packed = origin_pe * fx.Uint32(slot_stride) + origin_lid * topk_v + k
+                if const_expr(dedup):
+                    # Sibling routes are being remapped concurrently, but only
+                    # between non-negative rows, so their sign is stable.
+                    c = fx.Uint32(0)
+                    for kk in range(topk_v):
+                        sib = fx.Int32(rows_p[t * topk_v + kk])
+                        c = c + (sib >= fx.Int32(0)).select(fx.Uint32(1), fx.Uint32(0))
+                    packed = t | (c << fx.Uint32(24))
+                else:
+                    enc = fx.Uint32(tis_p[t])
+                    origin_pe = enc // max_tok_v
+                    origin_lid = enc - origin_pe * max_tok_v
+                    packed = (
+                        origin_pe * fx.Uint32(slot_stride) + origin_lid * topk_v + k
+                    )
                 ep_base = final_row * 2
                 ep_p[ep_base] = packed
                 ep_p[ep_base + 1] = w_f32.bitcast(fx.Int32)

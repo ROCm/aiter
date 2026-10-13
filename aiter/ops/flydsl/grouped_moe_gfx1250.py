@@ -612,6 +612,20 @@ def _grouped_a8w4_tdm_moe(
     )
     if _compact:
         stage2_scatter = _compact_ctx
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
+        dedup_state_buffer,
+        ep_dedup_enabled,
+        ep_dedup_pushers,
+    )
+
+    # Dedup'd push (AITER_EP_DEDUP): gemm2 stages rows locally and one summed row
+    # per (token, rank) goes out. MegaMoE's combine reads the same switch.
+    _ep_dedup = (
+        enable_ep_scatter
+        and not _compact
+        and not stage2_scatter.combine_quant_bits
+        and ep_dedup_enabled()
+    )
     if tile_m2 is None:
         tile_m2 = tile_m
     if tile_n2 is None:
@@ -719,6 +733,7 @@ def _grouped_a8w4_tdm_moe(
         _fuse_ep_route_quant = (
             _direct_ep_mask
             and enable_ep_scatter
+            and not _ep_dedup
             and int(E) <= 256
             and a1_scale is not None
             and hidden_states.dtype
@@ -794,10 +809,12 @@ def _grouped_a8w4_tdm_moe(
                 "topk": int(topk),
                 "max_tok": int(stage2_scatter.max_tokens_per_rank),
                 "slot_stride": int(stage2_scatter.max_tokens_per_rank) * int(topk),
+                "dedup": _ep_dedup,
             }
     _fuse_psum_quant = (
         _is_ep
         and enable_ep_scatter
+        and not _ep_dedup
         and not _compact
         and not _fuse_ep_route_quant
         and int(E) <= 256
@@ -856,6 +873,35 @@ def _grouped_a8w4_tdm_moe(
         if enable_ep_scatter
         else {}
     )
+    _dedup_pushers = ep_dedup_pushers() if _ep_dedup else 0
+    if _ep_dedup:
+        _max_recv = int(stage2_scatter.max_tokens_per_rank) * int(
+            stage2_scatter.world_size
+        )
+        _ep_gemm2_kwargs["ep_dedup"] = {
+            # AITER_EP_DEDUP_MODE=1 without pushers: count tiles nobody consumes,
+            # to time the in-grid epilogue on all CUs.
+            "mode": int(os.environ.get("AITER_EP_DEDUP_MODE", 1 if _dedup_pushers else 2)),
+            "pushers": _dedup_pushers,
+            "max_recv": _max_recv,
+            "topk": int(topk),
+            # Remapped in place above: each route's final gemm2 row, < 0 if remote.
+            "rows": topids_to_rows,
+            "nvt": _ep_nvt,
+            "tis": stage2_scatter.source_token_map,
+            "state": dedup_state_buffer(str(device)),
+        }
+    if _ep_dedup and os.environ.get("AITER_EP_DEDUP_TIMING", "0") == "1":
+        assert _ep_gemm2_kwargs["ep_dedup"]["mode"] == 2
+        _ep_gemm2_kwargs["ep_dedup"]["state"] = _dedup_timing_slot(str(device))
+    _dedup_atomic = os.environ.get("AITER_EP_DEDUP_ATOMIC", "") if _ep_dedup else ""
+    if _dedup_atomic:
+        assert not _dedup_pushers, "the atomic gemm2 experiment runs without pushers"
+        _ep_gemm2_kwargs["ep_dedup"]["mode"] = {"bf16": 3, "f32": 4, "store": 5}[_dedup_atomic]
+        _ep_gemm2_kwargs["ep_dedup"]["state"] = _dedup_sum_buffer(
+            str(device), _max_recv, int(model_dim),
+            torch.float32 if _dedup_atomic == "f32" else torch.bfloat16,
+        )
 
     out_is_f16 = 1 if (dtype == torch.float16 or dtype == dtypes.fp16) else 0
     two_inter = 2 * inter_dim
@@ -1115,36 +1161,91 @@ def _grouped_a8w4_tdm_moe(
     grouped_out = torch.empty((1, contiguous_m, model_dim), dtype=dtype, device=device)
     w2_u8 = _grouped_weight_uint8(w2)
     w2s_i32 = w2_scale.reshape(-1).view(torch.int32)
-    flydsl_grouped_gemm_a8w4_masked(
-        grouped_out,
-        a2_payload,
-        w2_u8,
-        a2_scale,
-        w2s_i32,
-        psum,
-        n_experts=E,
-        contiguous_m=contiguous_m,
-        N=model_dim,
-        K=inter_dim,
-        tile_m=tile_m2,
-        tile_n=tile_n2,
-        tile_k=tile_k2,
-        m_warp=m_warp2,
-        n_warp=n_warp2,
-        out_is_f16=out_is_f16,
-        a_is_fp4=_a_is_fp4,
-        stage1_act=0,
-        bias=_b2,
-        num_buffers=num_buffers2,
-        cluster_m=cluster_m2,
-        cluster_n=cluster_n2,
-        waves_per_tensor_tdm=waves_per_tensor_tdm2,
-        next_stage_prefetch=next_stage_prefetch,
-        tdm_as_in_prologue=tdm_as_in_prologue,
-        tdm_b_th=tdm_b_th,
-        lds_soa_load_interleave=lds_soa_load_interleave,
-        **_ep_gemm2_kwargs,
+
+    def _run_gemm2(out, dedup_mode=None, dedup_state=None):
+        kwargs = _ep_gemm2_kwargs
+        if dedup_mode is not None:
+            kwargs = dict(kwargs, ep_dedup=dict(kwargs["ep_dedup"], mode=dedup_mode))
+            kwargs["ep_dedup"]["state"] = (
+                dedup_state if dedup_state is not None else dedup_state_buffer(str(device))
+            )
+        flydsl_grouped_gemm_a8w4_masked(
+            out,
+            a2_payload,
+            w2_u8,
+            a2_scale,
+            w2s_i32,
+            psum,
+            n_experts=E,
+            contiguous_m=contiguous_m,
+            N=model_dim,
+            K=inter_dim,
+            tile_m=tile_m2,
+            tile_n=tile_n2,
+            tile_k=tile_k2,
+            m_warp=m_warp2,
+            n_warp=n_warp2,
+            out_is_f16=out_is_f16,
+            a_is_fp4=_a_is_fp4,
+            stage1_act=0,
+            bias=_b2,
+            num_buffers=num_buffers2,
+            cluster_m=cluster_m2,
+            cluster_n=cluster_n2,
+            waves_per_tensor_tdm=waves_per_tensor_tdm2,
+            next_stage_prefetch=next_stage_prefetch,
+            tdm_as_in_prologue=tdm_as_in_prologue,
+            tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            **kwargs,
+        )
+
+    _atomic_check = (
+        _dedup_atomic
+        and os.environ.get("AITER_EP_DEDUP_ATOMIC_CHECK", "0") == "1"
+        and not _DEDUP_ATOMIC_CHECKED[0]
+        and not torch.cuda.is_current_stream_capturing()
     )
+    if _atomic_check:
+        _ep_gemm2_kwargs["ep_dedup"]["state"].zero_()
+    _run_gemm2(grouped_out)
+    if _atomic_check:
+        _check_dedup_atomic(
+            _run_gemm2,
+            torch.empty_like(grouped_out),
+            _ep_gemm2_kwargs["ep_dedup"]["state"],
+            ep_rowmap,
+            _ep_nvt,
+            int(contiguous_m),
+        )
+    if _ep_dedup and not _dedup_pushers and not _dedup_atomic:
+        _push_args = (
+            int(stage2_scatter.arena_handle),
+            int(stage2_scatter.combine_input_offset),
+            int(stage2_scatter.slot_stride_bytes),
+            int(topk),
+            int(stage2_scatter.max_tokens_per_rank),
+            int(model_dim),
+        )
+        _impl = os.environ.get("AITER_EP_DEDUP_PUSH_IMPL", "wave")
+        if _impl in ("reduce", "batch", "lds", "pair", "step"):
+            _get_dedup_reduce_push(*_push_args, int(stage2_scatter.world_size), _impl)(
+                grouped_out.data_ptr(),
+                int(contiguous_m),
+                topids_to_rows.data_ptr(),
+                _ep_nvt.data_ptr(),
+                stage2_scatter.source_token_map.data_ptr(),
+                stream=torch.cuda.current_stream(),
+            )
+        else:
+            _get_dedup_push(*_push_args)(
+                grouped_out.data_ptr(),
+                grouped_out.numel() * grouped_out.element_size(),
+                topids_to_rows.data_ptr(),
+                _ep_nvt.data_ptr(),
+                stage2_scatter.source_token_map.data_ptr(),
+                stream=torch.cuda.current_stream(),
+            )
 
     if kernel_bench_callable is not None:
         kernel_bench_callable.append(
@@ -1809,13 +1910,160 @@ def contiguous_psum(masked_m: torch.Tensor, experts: int, tile_m: int):
 
 
 @functools.cache
-def _get_compiled_contiguous_psum_remap_ep():
+def _get_dedup_reduce_push(
+    arena_handle, combine_input_offset, slot_stride, topk, max_tok, hidden, world_size,
+    impl="reduce",
+):
+    """A gather-and-sum dedup push run after gemm2 (reduce- or batch-shaped)."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
+        build_dedup_batch_push_module,
+        build_dedup_reduce_push_module,
+    )
+
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
+        build_dedup_lds_push_module,
+        build_dedup_pair_push_module,
+        build_dedup_step_push_module,
+    )
+
+    build = {
+        "batch": build_dedup_batch_push_module,
+        "lds": build_dedup_lds_push_module,
+        "pair": build_dedup_pair_push_module,
+        "step": build_dedup_step_push_module,
+    }.get(impl, build_dedup_reduce_push_module)
+    return build(
+        arena_handle=arena_handle,
+        combine_input_offset=combine_input_offset,
+        slot_stride_bytes=slot_stride,
+        topk=topk,
+        max_tok=max_tok,
+        hidden=hidden,
+        world_size=world_size,
+        block_num=int(os.environ.get("AITER_EP_DEDUP_PUSH_BLOCKS", "64")),
+    )
+
+
+@functools.cache
+def _dedup_sum_buffer(device, rows, hidden, dtype):
+    """sum[t] rows the atomic gemm2 timing experiment adds into."""
+    return torch.zeros((rows, hidden), dtype=dtype, device=device)
+
+
+_DEDUP_ATOMIC_CHECKED = [False]
+
+# AITER_EP_DEDUP_TIMING: per-tile steady-clock stamps of the ep_dedup=2 gemm2,
+# one slot per call, so a captured 8-layer graph keeps one slot per layer.
+_DEDUP_TIMING_SLOTS = 8
+_DEDUP_TIMING_BLOCKS = 1 << 18
+_dedup_timing_calls = [0]
+
+
+def _report_dedup_timing(buf):
+    t = buf.cpu()
+    out = []
+    for s in range(t.shape[0]):
+        e = t[s]
+        m = e[:, 1] > 0
+        if m.any():
+            # The steady counter runs at 100 MHz.
+            span = (e[m, 1].max() - e[m, 0].min()).item() / 100.0
+            tile = (e[m, 1] - e[m, 0]).double().mean().item() / 100.0
+            out.append(f"{span:.1f}us({int(m.sum())} tiles, {tile:.1f}us/tile)")
+    print(f"[dedup-timing] rank={os.environ.get('RANK')} " + " ".join(out), flush=True)
+
+
+@functools.cache
+def _dedup_timing_buffer(device):
+    import atexit
+
+    buf = torch.zeros(
+        (_DEDUP_TIMING_SLOTS, _DEDUP_TIMING_BLOCKS, 2), dtype=torch.int64, device=device
+    )
+    atexit.register(_report_dedup_timing, buf)
+    return buf
+
+
+def _dedup_timing_slot(device):
+    buf = _dedup_timing_buffer(device)
+    i = _dedup_timing_calls[0] % _DEDUP_TIMING_SLOTS
+    _dedup_timing_calls[0] += 1
+    return buf[i]
+
+
+def _check_dedup_atomic(run_gemm2, ref_out, sum_buf, ep_rowmap, nvt_t, contiguous_m):
+    """Compare sum[t] against the staged rows of the same gemm2 summed in torch."""
+    if _DEDUP_ATOMIC_CHECKED[0]:
+        return
+    _DEDUP_ATOMIC_CHECKED[0] = True
+    run_gemm2(ref_out, 2, None)
+    torch.cuda.synchronize()
+    nvt = int(nvt_t.item())
+    dw = ep_rowmap.view(-1, 2)[:contiguous_m, 0]
+    keep = dw >= 0
+    t = (dw & 0xFFFFFF).long()[keep]
+    ref = torch.zeros((nvt, sum_buf.shape[1]), dtype=torch.float32, device=sum_buf.device)
+    ref.index_add_(0, t, ref_out[0, :contiguous_m][keep].float())
+    got = sum_buf[:nvt].float()
+    err = (got - ref).abs()
+    rel = err.max().item() / max(ref.abs().max().item(), 1e-30)
+    logger.warning(
+        f"[dedup-atomic] nvt={nvt} rows={int(keep.sum().item())} "
+        f"max_abs_err={err.max().item():.4g} max_ref={ref.abs().max().item():.4g} "
+        f"rel={rel:.3g} mean_abs_err={err.mean().item():.4g}"
+    )
+    # Zeroing cost of the nvt rows the next layer would need cleared.
+    ev0 = torch.cuda.Event(enable_timing=True)
+    ev1 = torch.cuda.Event(enable_timing=True)
+    for _ in range(3):
+        sum_buf[:nvt].zero_()
+    ev0.record()
+    for _ in range(10):
+        sum_buf[:nvt].zero_()
+    ev1.record()
+    torch.cuda.synchronize()
+    logger.warning(
+        f"[dedup-atomic] zero {nvt} rows ({sum_buf[:nvt].numel() * sum_buf.element_size() / 1e6:.1f} MB): "
+        f"{ev0.elapsed_time(ev1) * 100:.1f} us"
+    )
+
+
+@functools.cache
+def _get_dedup_order(topk, tile_m):
+    """Sorts the recv slots by the gemm2 M tile they wait for."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
+        build_dedup_order_module,
+    )
+
+    return build_dedup_order_module(topk=topk, tile_m=tile_m)
+
+
+@functools.cache
+def _get_dedup_push(arena_handle, combine_input_offset, slot_stride, topk, max_tok, hidden):
+    """The dedup'd push run after gemm2 when no pushers ride in its grid."""
+    from aiter.ops.flydsl.kernels.mega_moe_gfx1250.dedup_push import (
+        build_dedup_push_module,
+    )
+
+    return build_dedup_push_module(
+        arena_handle=arena_handle,
+        combine_input_offset=combine_input_offset,
+        slot_stride_bytes=slot_stride,
+        topk=topk,
+        max_tok=max_tok,
+        hidden=hidden,
+        block_num=int(os.environ.get("AITER_EP_DEDUP_PUSH_BLOCKS", "256")),
+    )
+
+
+@functools.cache
+def _get_compiled_contiguous_psum_remap_ep(dedup: bool = False):
     """psum + remap fused with the gemm2 EP ep_rowmap build."""
     from aiter.ops.flydsl.kernels.moe_contiguous_psum import (
         build_moe_contiguous_psum_remap_ep_module,
     )
 
-    return build_moe_contiguous_psum_remap_ep_module()
+    return build_moe_contiguous_psum_remap_ep_module(dedup=dedup)
 
 
 def contiguous_psum_remap(
@@ -1853,7 +2101,9 @@ def contiguous_psum_remap(
             .contiguous()
         )
     if ep_scatter_params is not None:
-        launch = _get_compiled_contiguous_psum_remap_ep()
+        launch = _get_compiled_contiguous_psum_remap_ep(
+            bool(ep_scatter_params.get("dedup", False))
+        )
         # ep_rowmap sentinel fill was done by the route kernel (g2l_lds),
         # interleaved with route work for free.  No host .fill_() needed.
         launch(

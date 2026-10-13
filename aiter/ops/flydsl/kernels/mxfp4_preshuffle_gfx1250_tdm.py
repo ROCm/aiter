@@ -18,7 +18,7 @@ from flydsl.expr.typing import Vector as Vec
 
 from aiter.utility.mx_types import MxDtypeInt as MxDtype
 
-from .buffer_ops import buffer_store, create_buffer_resource_from_addr
+from .buffer_ops import buffer_load, buffer_store, create_buffer_resource_from_addr
 from .gemm_common_gfx1250 import (
     batched_silu_swiglu,
     batched_situv2,
@@ -33,6 +33,27 @@ from .kernels_common import ceildiv
 from .mega_moe_gfx1250.tdm_gather_shim import (
     make_tensor_gather_descriptor,
     tensor_store_gather,
+)
+from .mega_moe_gfx1250.dedup_push import (
+    SCOPE_DEV as DEDUP_SCOPE_DEV,
+)
+from .mega_moe_gfx1250.dedup_push import MAX_RECV_CAP as DEDUP_MAX_RECV_CAP
+from .mega_moe_gfx1250.dedup_push import COL_NBUF as DEDUP_COL_NBUF
+from .mega_moe_gfx1250.dedup_push import COLS_PER_PUSH as DEDUP_COLS_PER_PUSH
+from .mega_moe_gfx1250.dedup_push import GROUP as DEDUP_COL_GROUP
+from .mega_moe_gfx1250.dedup_push import (
+    emit_column_pusher as emit_dedup_column_pusher,
+)
+from .mega_moe_gfx1250.dedup_push import (
+    emit_column_tile_done as emit_dedup_column_tile_done,
+)
+from .mega_moe_gfx1250.dedup_push import (
+    emit_pusher_loop as emit_dedup_pusher_loop,
+)
+from .mega_moe_gfx1250.dedup_push import KNOBS_TAG as DEDUP_KNOBS
+from .mega_moe_gfx1250.dedup_push import NBUF as DEDUP_NBUF
+from .mega_moe_gfx1250.dedup_push import (
+    push_lds_bytes as dedup_push_lds_bytes,
 )
 from .mega_moe_gfx1250.types import COMBINE_SCALE_BLOCK
 from .quant_utils import (
@@ -66,6 +87,21 @@ LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
 if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
+# M tiles per swizzle group of the gemm2 EP-scatter GEMM.
+EP_TILES_PER_GROUP = int(os.environ.get("AITER_TDM_EP_TILES_PER_GROUP", "16"))
+# Timing experiment for ep_dedup=2: every GEMM tile records its start / end on the
+# steady clock into arg_dedup_state, and pushers, if any, only sleep to hold
+# their CUs, so the GEMM runs on the rest without any barrier or counting.
+DEDUP_TIMING = os.environ.get("AITER_EP_DEDUP_TIMING", "0") == "1"
+DEDUP_IDLE_SLEEPS = 80  # x s_sleep 127, longer than the GEMM
+# ep_dedup=2 staging store, timing only: "dev" (SCOPE_DEV), "plain" (default
+# cpol) or "none" (no store at all).
+DEDUP_STAGE = os.environ.get("AITER_EP_DEDUP_STAGE", "dev")
+assert DEDUP_STAGE in ("dev", "plain", "none")
+
+
+def _steady_clock():
+    return fx.Int64(llvm_dialect.call_intrinsic(T.i64, "llvm.readsteadycounter", [], [], []))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
 if MMA_GROUP < 1 or MMA_FIRST_GROUP < 1:
     raise ValueError("AITER_FLYDSL_MMA_GROUP values must be positive")
@@ -169,8 +205,25 @@ def launch_gemm_a8w4_tdm(
     a_row_stride_bytes: Constexpr[int] = 0,
     a_scale_row_stride_bytes: Constexpr[int] = 0,
     lds_soa_load_interleave: Constexpr[int] = 0,
+    ep_dedup: Constexpr[int] = 0,
+    ep_dedup_pushers: Constexpr[int] = 0,
+    ep_dedup_max_recv: Constexpr[int] = 0,
+    ep_dedup_topk: Constexpr[int] = 0,
+    ep_dedup_hidden: Constexpr[int] = 0,
+    arg_dedup_rows: fx.Tensor = None,
+    arg_dedup_nvt: fx.Tensor = None,
+    arg_dedup_tis: fx.Tensor = None,
+    arg_dedup_state: fx.Tensor = None,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
+
+    ``ep_dedup`` replaces the fused scatter with the dedup'd push
+    (``mega_moe_gfx1250/dedup_push.py``): the epilogue stages the weighted tile in
+    ``arg_c`` and, at 1, counts each row's arrival so the ``ep_dedup_pushers``
+    workgroups leading the grid can send each recv slot as one summed row once
+    it is complete. At 2 it only stages; a separate push runs after the GEMM.
+    At 3 / 4 (timing experiment) it instead adds the tile into ``sum[t]`` at
+    ``arg_dedup_state`` with device-scope bf16-pair / f32 atomics.
 
     ``cluster_m`` and ``cluster_n`` explicitly select the physical workgroup
     cluster. Peers along N share A, while expert-compatible peers along M can
@@ -222,6 +275,27 @@ def launch_gemm_a8w4_tdm(
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
+    if ep_dedup:
+        assert enable_ep_scatter and not ep_quant_bits, "dedup needs the bf16 scatter"
+        assert ep_dedup in (1, 2, 3, 4, 5) and ep_dedup_max_recv > 0
+        assert ep_dedup_topk > 0 and ep_dedup_hidden > 0
+        assert ep_dedup == 1 or not ep_dedup_pushers or (ep_dedup == 2 and DEDUP_TIMING), (
+            "pushers consume the counts"
+        )
+    DEDUP_COL_MAX_TOK = DEDUP_COL_META_BYTES = DEDUP_COL_OUT_BYTES = 0
+    if ep_dedup_pushers:
+        # The pushers shift every GEMM block id, which a cluster cannot follow.
+        assert cluster_m == 1 and cluster_n == 1
+        DEDUP_COL_MAX_TOK = ceildiv(ep_dedup_max_recv, ep_dedup_pushers * m_warp * n_warp)
+        # A pusher wave keeps one slot per lane.
+        assert DEDUP_COL_MAX_TOK <= 32, "too few pushers for max_recv"
+        DEDUP_COL_META_BYTES = ceildiv(DEDUP_COL_MAX_TOK * (ep_dedup_topk + 2) * 4, 512) * 512
+        DEDUP_COL_OUT_BYTES = (
+            DEDUP_COL_NBUF * DEDUP_COL_GROUP * tile_n * DEDUP_COLS_PER_PUSH * 2
+        )
+        DEDUP_COL_META_BYTES = 0  # the slot metadata lives in lanes
+        assert (ep_dedup_hidden // tile_n) % DEDUP_COLS_PER_PUSH == 0
+        assert ep_dedup_max_recv <= DEDUP_MAX_RECV_CAP
     cache_tag = (
         K,
         tile_m,
@@ -261,6 +335,13 @@ def launch_gemm_a8w4_tdm(
         a_row_stride_bytes,
         a_scale_row_stride_bytes,
         ep_quant_bits,
+        ep_dedup,
+        ep_dedup_pushers,
+        ep_dedup_max_recv,
+        ep_dedup_topk,
+        ep_dedup_hidden,
+        DEDUP_KNOBS,
+        EP_TILES_PER_GROUP if enable_ep_scatter else 16,
     )
     _ = cache_tag
     if enable_ep_scatter:
@@ -389,6 +470,9 @@ def launch_gemm_a8w4_tdm(
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    if ep_dedup_pushers:
+        # The pushers live in the GEMM's arena, one slice per wave.
+        assert ARENA_B >= m_warp * n_warp * (DEDUP_COL_META_BYTES + DEDUP_COL_OUT_BYTES)
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -435,6 +519,10 @@ def launch_gemm_a8w4_tdm(
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
         f"{_interleaved_lds_load}"
+        f"{f'_dedup{ep_dedup}p{ep_dedup_pushers}{DEDUP_KNOBS}' if ep_dedup else ''}"
+        f"{'_tm' if ep_dedup == 2 and DEDUP_TIMING else ''}"
+        f"{f'_st{DEDUP_STAGE}' if ep_dedup == 2 and DEDUP_STAGE != 'dev' else ''}"
+        f"{f'_tpg{EP_TILES_PER_GROUP}' if enable_ep_scatter and EP_TILES_PER_GROUP != 16 else ''}"
     )
 
     @flyc.kernel(name=_kname, known_block_size=[block, 1, 1])
@@ -453,6 +541,10 @@ def launch_gemm_a8w4_tdm(
         f32_swiglu_limit: fx.Float32,
         f32_situ_beta: fx.Float32,
         f32_situ_linear_beta: fx.Float32,
+        arg_dedup_rows: fx.Pointer,
+        arg_dedup_nvt: fx.Pointer,
+        arg_dedup_tis: fx.Pointer,
+        arg_dedup_state: fx.Pointer,
     ):
         K_TILES = K // tile_k
         A_KROW = K // A_PACK
@@ -461,6 +553,13 @@ def launch_gemm_a8w4_tdm(
 
         tid = fx.thread_idx.x
         bid_x = fx.block_idx.x
+        if const_expr(ep_dedup == 2 and DEDUP_TIMING):
+            _t_start = _steady_clock()
+        if const_expr(ep_dedup_pushers):
+            # The pushers lead the grid, so they are dispatched first and hold
+            # their CUs; the GEMM tiles follow and never wait on them.
+            is_pusher = bid_x < fx.Int32(ep_dedup_pushers)
+            bid_x = is_pusher.select(fx.Int32(0), bid_x - fx.Int32(ep_dedup_pushers))
         wave = rocdl.readfirstlane(T.i32, tid // WAVE)
         lane = tid % WAVE
         lane16 = lane % 16
@@ -469,7 +568,12 @@ def launch_gemm_a8w4_tdm(
         wave_n = wave % n_warp
 
         # DeepGEMM contiguous-M swizzle, run at physical-cluster granularity.
-        TILES_PER_GROUP = 16
+        # A group as wide as every M tile walks the grid column by column.
+        TILES_PER_GROUP = (
+            4096
+            if ep_dedup_pushers
+            else (EP_TILES_PER_GROUP if enable_ep_scatter else 16)
+        )
         assert TILES_PER_GROUP % cluster_m == 0
         total_n_tiles = ceildiv(i32_n, tile_n)
         total_m_tiles = ceildiv(i32_m, tile_m)
@@ -512,6 +616,8 @@ def launch_gemm_a8w4_tdm(
         )
         tile_map = fx.recast_iter(i32_ptr, arg_m_tile_map)
         has_work = blk_m < tile_map[n_experts - 1]
+        if const_expr(ep_dedup_pushers):
+            has_work = has_work & (fx.block_idx.x >= fx.Int32(ep_dedup_pushers))
 
         # In-kernel bisect: find the expert owning this valid M-tile.  Seed the
         # result with the padding sentinel so it remains defined outside the
@@ -1372,6 +1478,71 @@ def launch_gemm_a8w4_tdm(
                 )
                 rocdl.sched_barrier(0)
 
+        def _ptr_rsrc(p, nbytes=None):
+            return create_buffer_resource_from_addr(
+                fx.Int64(fx.ptrtoint(fx.recast_iter(fx.Int8, p))).ir_value(),
+                num_records_bytes=nbytes,
+            )
+
+        if const_expr(ep_dedup):
+            _dedup_state_addr = fx.Int64(
+                fx.ptrtoint(fx.recast_iter(fx.Int8, arg_dedup_state))
+            )
+        if const_expr(ep_dedup_pushers and ep_dedup == 2):
+            if is_pusher:
+                for _s in range_constexpr(DEDUP_IDLE_SLEEPS):
+                    rocdl.s_sleep(127)
+        elif const_expr(ep_dedup_pushers):
+            if is_pusher:
+                _dedup_n_waves = ep_dedup_pushers * num_waves
+                _pw_bytes = DEDUP_COL_META_BYTES + DEDUP_COL_OUT_BYTES
+                _wave_base = base_ptr + wave * fx.Int32(_pw_bytes)
+                emit_dedup_column_pusher(
+                    fx.block_idx.x * fx.Int32(num_waves) + wave,
+                    _dedup_n_waves,
+                    lane,
+                    fx.recast_iter(
+                        fx.PointerType.get(
+                            T.i32, address_space=fx.AddressSpace.Shared, alignment=16
+                        ),
+                        _wave_base,
+                    ),
+                    fx.recast_iter(
+                        fx.PointerType.get(
+                            T.i16, address_space=fx.AddressSpace.Shared, alignment=16
+                        ),
+                        _wave_base + fx.Int32(DEDUP_COL_META_BYTES),
+                    ),
+                    fx.Int32(
+                        buffer_load(
+                            _ptr_rsrc(arg_dedup_nvt),
+                            fx.Int32(0),
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
+                    ),
+                    total_n_tiles,
+                    # A column holds one tile per M tile with work.
+                    (tile_map[n_experts - 1] + fx.Int32(tile_m - 1)) // fx.Int32(tile_m),
+                    state_addr=_dedup_state_addr,
+                    out_rsrc=_ptr_rsrc(
+                        arg_c, (fx.Int64(i32_m) * n64 * fx.Int64(2)).ir_value()
+                    ),
+                    rows_rsrc=_ptr_rsrc(arg_dedup_rows),
+                    tis_rsrc=_ptr_rsrc(arg_dedup_tis),
+                    lsa0=_ep_lsa0,
+                    peer_stride=_ep_lsa1 - _ep_lsa0,
+                    combine_input_offset=ep_combine_input_offset,
+                    slot_stride_bytes=ep_slot_stride_bytes,
+                    world_size=ep_world_size,
+                    topk=ep_dedup_topk,
+                    max_tok=ep_dedup_max_recv // ep_world_size,
+                    hidden=ep_dedup_hidden,
+                    seg_elems=tile_n,
+                    max_tokens_per_wave=DEDUP_COL_MAX_TOK,
+                )
+
         # Skip padding tiles; uniform across every workgroup and cluster.
         if has_work:
             if const_expr(enable_ep_scatter):
@@ -2014,7 +2185,115 @@ def launch_gemm_a8w4_tdm(
                 rocdl.s_barrier_wait(-1)
             else:
                 workgroup_barrier()
-            if const_expr(enable_ep_scatter):
+            if const_expr(enable_ep_scatter and ep_dedup >= 3):
+                from flydsl._mlir import ir as _ir
+
+                # Row r's tile slice goes into sum[t]: a wave per row, a b128 chunk
+                # per lane, over the rows the scatter path gives this wave, whose
+                # row-map words were loaded ahead of the mainloop.
+                assert STORE_N == WAVE * 8
+                _gptr = llvm_dialect.PointerType.get(address_space=1)
+                _bf16x2 = _ir.VectorType.get([2], _ir.BF16Type.get())
+
+                def _atomic_fadd(addr, val):
+                    llvm_dialect.AtomicRMWOp(
+                        llvm_dialect.AtomicBinOp.fadd,
+                        llvm_dialect.IntToPtrOp(_gptr, _raw(addr)).result,
+                        val,
+                        llvm_dialect.AtomicOrdering.monotonic,
+                        syncscope="agent",
+                        alignment=4,
+                    )
+
+                _ch = fx.Int32(lane)
+                for _j, _i in [(j, i) for j in range(scatter_passes) for i in range(SCATTER_GROUP_ROWS)]:
+                    _group = fx.Int32(wave) + fx.Int32(_j * num_waves)
+                    _row = _group * fx.Int32(SCATTER_GROUP_ROWS) + fx.Int32(_i)
+                    _in = (_group < fx.Int32(scatter_groups)) & (_row < mn_oob)
+                    _srow = _in.select(_row, fx.Int32(0))
+                    _dw = fx.Int32(
+                        rocdl.readlane(
+                            T.i32,
+                            _raw(_rm_dst_lanes[_j // SCATTER_PASSES_PER_VECTOR]),
+                            _raw(fx.Int32((_j % SCATTER_PASSES_PER_VECTOR) * SCATTER_GROUP_ROWS + _i)),
+                        )
+                    )
+                    _chunk = Vec(
+                        lds_load_b128(
+                            stC_idx,
+                            (_srow * fx.Int32(STORE_PITCH) + _ch * fx.Int32(8)) * fx.Int32(2),
+                        )
+                    )
+                    if _in & (_dw >= fx.Int32(0)):
+                        _el = (
+                            fx.Int64(_dw & fx.Int32(0xFFFFFF)) * n64
+                            + blk_n64
+                            + fx.Int64(_ch * fx.Int32(8))
+                        )
+                        if const_expr(ep_dedup == 5):
+                            # Control: the same per-lane path with plain stores.
+                            llvm_dialect.StoreOp(
+                                _raw(_chunk),
+                                llvm_dialect.IntToPtrOp(
+                                    _gptr, _raw(_dedup_state_addr + _el * fx.Int64(2))
+                                ).result,
+                                alignment=16,
+                            )
+                        elif const_expr(ep_dedup == 3):
+                            _a = _dedup_state_addr + _el * fx.Int64(2)
+                            for _p in range_constexpr(4):
+                                _atomic_fadd(
+                                    _a + fx.Int64(_p * 4),
+                                    llvm_dialect.bitcast(_bf16x2, _raw(fx.Int32(_chunk[_p]))),
+                                )
+                        else:
+                            _a = _dedup_state_addr + _el * fx.Int64(4)
+                            _f = _chunk.bitcast(fx.BFloat16).to(fx.Float32)
+                            for _q in range_constexpr(8):
+                                _atomic_fadd(_a + fx.Int64(_q * 4), _raw(fx.Float32(_f[_q])))
+            elif const_expr(enable_ep_scatter and ep_dedup):
+                # Dedup'd push: stage the weighted tile in this rank's grouped_out
+                # at device scope, so a pusher on any XCD can read it back.
+                c_iter = fx.recast_iter(oc, arg_c)
+                gtC = tensor_view(
+                    c_iter + (c_outer_off * fx.Int64(c_stride) + c_inner_off),
+                    (tile_m, STORE_PITCH),
+                    (c_stride, 1),
+                )
+                atomC = fx.rocdl.make_tdm_atom(
+                    gtC,
+                    [mn_oob, STORE_N],
+                    strides=[c_stride, None],
+                    num_warps=num_waves,
+                    cache_modifier=(
+                        0 if ep_dedup == 2 and DEDUP_STAGE == "plain" else DEDUP_SCOPE_DEV
+                    ),
+                )
+                src = tensor_view(
+                    fx.recast_iter(oc, base_ptr),
+                    (tile_m, STORE_PITCH),
+                    (STORE_PITCH, 1),
+                )
+                if const_expr(not (ep_dedup == 2 and DEDUP_STAGE == "none")):
+                    fx.copy(atomC, src, gtC)
+                tdm_ops.tensor_wait(0)
+                if const_expr(ep_dedup == 2 and DEDUP_TIMING):
+                    if fx.Int32(tid) == fx.Int32(0):
+                        _slot = _dedup_state_addr + fx.Int64(fx.block_idx.x) * fx.Int64(16)
+                        _gp = llvm_dialect.PointerType.get(address_space=1)
+                        for _o, _v in ((0, _t_start), (8, _steady_clock())):
+                            llvm_dialect.StoreOp(
+                                _raw(_v),
+                                llvm_dialect.IntToPtrOp(_gp, _raw(_slot + fx.Int64(_o))).result,
+                                alignment=8,
+                            )
+                if const_expr(ep_dedup == 1):
+                    # Every wave's share of the tile has landed before the tile is
+                    # counted, so a complete M tile means readable rows.
+                    workgroup_barrier()
+                    if tid == fx.Int32(0):
+                        emit_dedup_column_tile_done(n_unit, state_addr=_dedup_state_addr)
+            elif const_expr(enable_ep_scatter):
                 # EP gemm2-fused scatter via TDM gather-store. cco's flat symmetric
                 # VA is peer_va = winBase + pe*perRankSize + off, and comb_inp slots
                 # are padded to a pow2 so perRankSize divides by the slot stride
@@ -2200,6 +2479,8 @@ def launch_gemm_a8w4_tdm(
         arg_ep_row_map = arg_c
     if arg_quant_scale is None:
         arg_quant_scale = arg_c
+    if arg_dedup_rows is None:
+        arg_dedup_rows = arg_dedup_nvt = arg_dedup_tis = arg_dedup_state = arg_c
     kargs = (
         fx.get_iter(arg_c),
         arg_a,
@@ -2215,8 +2496,16 @@ def launch_gemm_a8w4_tdm(
         f32_swiglu_limit,
         f32_situ_beta,
         f32_situ_linear_beta,
+        fx.get_iter(arg_dedup_rows),
+        fx.get_iter(arg_dedup_nvt),
+        fx.get_iter(arg_dedup_tis),
+        fx.get_iter(arg_dedup_state),
     )
-    grid = (((m_tiles + cluster_m - 1) // cluster_m) * n_tiles, cluster_m, 1)
+    grid = (
+        ((m_tiles + cluster_m - 1) // cluster_m) * n_tiles + ep_dedup_pushers,
+        cluster_m,
+        1,
+    )
     if cluster_m > 1 or cluster_n > 1:
         # Geometry must reach BOTH the definition and the launch site, or the
         # cluster never forms and the TDM loads silently fall back to per-load.

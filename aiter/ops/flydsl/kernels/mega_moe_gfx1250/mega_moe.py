@@ -18,6 +18,7 @@ from aiter.ops.flydsl.moe_common import GateMode
 from .combine import (
     CHUNK_ELEMS as _COMBINE_CHUNK_ELEMS,
 )
+from .dedup_push import ep_dedup_enabled
 from .combine import (
     COMBINE_LDS_BUDGET,
     _make_combine_fused_reduce,
@@ -597,6 +598,8 @@ class MegaMoEConfig:
 class Routing:
     token_count: int
     reverse_source_view: torch.Tensor
+    # This rank's own routing; the dedup'd combine derives its lead slots from it.
+    topk_ids: torch.Tensor | None = None
 
     @property
     def source_token_map(self) -> torch.Tensor:
@@ -1384,6 +1387,11 @@ class MegaMoEGfx1250:
             return
 
         self._cross_device_flag = torch.ones(1, dtype=torch.int64, device=device)
+        # Must agree with grouped_moe_gfx1250, which reads the same switch to make
+        # gemm2 push one summed row per (token, rank) instead of scattering.
+        self._ep_dedup = ep_dedup_enabled()
+        if self._ep_dedup and self._compact_plan:
+            raise ValueError("AITER_EP_DEDUP supports stage1_fused=False only")
         # Keep the cross-device barrier in its own 1-block kernel so the reduce
         # grid is unconstrained. Both wires stage through LDS, so the block is
         # sized to the lane tile (T*C*256/16 lanes) -- which differs per wire,
@@ -1404,6 +1412,9 @@ class MegaMoEGfx1250:
                 quant_bits=_bits,
                 tokens_per_block=_toks,
                 chunks_per_iter=_chunks,
+                dedup_experts_per_rank=(
+                    config.experts_per_rank if self._ep_dedup and _bits == 0 else 0
+                ),
             )
         self._combine_sync = _make_combine_fused_sync(
             rank=config.rank,
@@ -1928,6 +1939,7 @@ class MegaMoEGfx1250:
         routing = Routing(
             token_count=token_count,
             reverse_source_view=reverse_source_view,
+            topk_ids=topk_ids,
         )
         return (
             self._recv_tokens(),
@@ -1998,10 +2010,13 @@ class MegaMoEGfx1250:
                 self._config.rank,
                 stream,
             )
+            if self._ep_dedup and combine_quant_bits:
+                raise ValueError("AITER_EP_DEDUP runs the bf16 combine wire only")
             self._combine_variants[combine_quant_bits](
                 self._arena.local_ptr("comb_inp"),
                 self._combine_output.data_ptr(),
                 count,
+                routing.topk_ids.data_ptr() if self._ep_dedup else 0,
                 stream,
             )
         return (
