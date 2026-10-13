@@ -15,9 +15,11 @@ them before you change or review code here.
 | `.github/instructions/aiter-ops-triton.instructions.md` | Code review checks |
 
 Do not copy rules into this file. To change a rule, edit the file that has it.
-Do not add more `CLAUDE.md` files. The `CLAUDE.md` in this folder only imports
-the `AGENTS.md` files for Claude Code. When you add an `AGENTS.md` file, import
-it there.
+
+`aiter/ops/triton/CLAUDE.md` is the only `CLAUDE.md` file, and it must stay.
+It imports the `AGENTS.md` files for Claude Code. When you add an `AGENTS.md`
+file, add an import for it there. Do not add a `CLAUDE.md` file in a different
+folder.
 
 Claude Code loads the two README files through these imports:
 

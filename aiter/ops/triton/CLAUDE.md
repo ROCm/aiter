@@ -1,3 +1,4 @@
+This is the only `CLAUDE.md` file for the Triton folders, and it must stay.
 Claude Code reads the rules in the `AGENTS.md` files through these imports.
 The imports also work when Claude Code does not read `AGENTS.md` files itself,
 for example when the repository root has a `CLAUDE.md`.

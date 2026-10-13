@@ -279,6 +279,16 @@ A PR that changes a convention under `aiter/ops/triton/` must update
 change to the config layout or the loaders, or new folders. Flag a PR that
 does not.
 
-Flag a new `CLAUDE.md` file. Put agent instructions in `AGENTS.md`, so that
-all coding agents read them. `aiter/ops/triton/CLAUDE.md` only imports the
-`AGENTS.md` files. Flag a new `AGENTS.md` file that it does not import.
+## Agent instruction files
+
+Agent instructions go in `AGENTS.md` files, so that all coding agents read
+them. `aiter/ops/triton/CLAUDE.md` is the only `CLAUDE.md` file. It is
+correct and must stay: it imports the `AGENTS.md` files for Claude Code. Do
+not flag it and do not ask to remove it.
+
+Flag:
+
+- A `CLAUDE.md` file in a different folder.
+- Coding rules in `aiter/ops/triton/CLAUDE.md`. It only has a short note and
+  the imports. Rules go in an `AGENTS.md` file or in a README.
+- A new `AGENTS.md` file without an import in `aiter/ops/triton/CLAUDE.md`.

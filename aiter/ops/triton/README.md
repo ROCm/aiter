@@ -129,8 +129,12 @@ Each tuned config file is in this path:
 
 ```text
 configs/<arch>/<backend>/<op>/<d_type>/DEFAULT.json
-configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-N=<N>-K=<K>.json
+configs/<arch>/<backend>/<op>/<d_type>/<CONFIG_NAME>-<suffix>.json
 ```
+
+The suffix depends on the family. For example, GEMM files use
+`N=<N>-K=<K>`, batched GEMM files use `B=<B>-N=<N>-K=<K>` and MHC files use
+`C=<C>`. Some families use a custom suffix.
 
 Example: `configs/gfx950/triton/gemm/gemm_a16w16/GEMM-A16W16-N=256-K=7168.json`.
 `<d_type>` is the config name in lowercase, with `_` in place of `-`. A GEMM
@@ -141,9 +145,9 @@ def _get_config(M: int, N: int, K: int):
     return get_gemm_config("GEMM-A16W16", M, N, K)  # returns (config, is_tuned)
 ```
 
-[`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the loaders, the
-JSON format and the steps to add a config. The manual tuning flow is in
-[`utils/_triton/tuning/README.md`](utils/_triton/tuning/README.md).
+[`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the file names, the
+loaders, the JSON format and the steps to add a config. The manual tuning
+flow is in [`utils/_triton/tuning/README.md`](utils/_triton/tuning/README.md).
 
 ### Config-aware kernel names in traces
 
