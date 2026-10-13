@@ -819,7 +819,10 @@ def _precompile_to_cache(
             # kernel inside the runtime stage2 wrapper. Precompile it via the
             # same shared helper the runtime uses so the cache key matches.
             # Single-GPU path uses use_mask=False (plain); EP/masked reduction
-            # is a multi-GPU path (separately gated) and not covered here.
+            # is a multi-GPU path (separately gated) and not covered here. The
+            # runtime always forwards topk_ids, which enables the dropped-route
+            # guard, so the placeholder has to be a real int32 tensor to
+            # precompile that same specialization.
             if not accumulate:
                 from aiter.ops.flydsl.moe_kernels import _run_moe_reduction
 
@@ -830,7 +833,7 @@ def _precompile_to_cache(
                     topk,
                     model_dim,
                     expert_mask=None,
-                    topk_ids=None,
+                    topk_ids=torch.zeros((tokens, topk), dtype=torch.int32, device=dev),
                     stream=0,
                 )
 

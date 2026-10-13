@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 import re
 
 _MXMOE_NUMERIC_TOKENS = {
@@ -171,6 +172,41 @@ def parse_flydsl_v2_gemm2_kernel(name):
         "bf16_lds": True if m.group("bf16lds") else None,
         "spart": int(m.group("sp")) if m.group("sp") else None,
     }
+
+
+def deterministic_v2_gemm2_name(name):
+    """Return the order-stable ``reduce`` sibling of a v2 GEMM2 kernel name.
+
+    The epilogue is a compile-time parameter of the same ``flydsl_moe2_layout``
+    GEMM2 builder, so a name that differs only in its epilogue compiles from
+    the same tile and dtype parameters. The ``atomic`` epilogue accumulates the
+    routed contributions of one token with BF16 read-modify-write adds into a
+    shared output row, which makes the rounding of every partial sum depend on
+    the order in which the contributing workgroups reach that row; two launches
+    with identical inputs can therefore return different bits. The ``reduce``
+    epilogue writes one private row per (token, route) and reduces them in
+    fixed top-k order instead.
+
+    The substitution keeps the name inside ``_FLYDSL_V2_GEMM2_RE`` because the
+    epilogue alternation is the only part of the grammar that changes, so the
+    returned name always parses. Returns ``None`` when ``name`` is not a v2
+    GEMM2 kernel or does not use the atomic epilogue.
+    """
+    m = _FLYDSL_V2_GEMM2_RE.match(name or "")
+    if m is None or m.group("epilog") != "atomic":
+        return None
+    return f"{name[: m.start('epilog')]}reduce{name[m.end('epilog') :]}"
+
+
+# Rollback switch for the stage2 epilogue policy: the atomic epilogue's
+# accumulation order is launch-order dependent, so its deterministic reduce
+# sibling is the default and this env var only exists to re-enable atomic.
+ATOMIC_STAGE2_ENV = "AITER_MXFP4_ATOMIC_STAGE2"
+
+
+def atomic_stage2_opt_in() -> bool:
+    """True when the caller asked for the order-dependent atomic stage2 epilogue."""
+    return os.environ.get(ATOMIC_STAGE2_ENV, "0") == "1"
 
 
 def parse_g2_kname_any(kname) -> dict:
