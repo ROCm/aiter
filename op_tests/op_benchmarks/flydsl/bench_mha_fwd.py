@@ -40,8 +40,9 @@ import math
 import os
 import sys
 
-# The m32x8 (hdim 128/128) path is gated behind AITER_ENABLE_EXPERIMENTAL; this
-# harness targets exactly that kernel, so enable it automatically. Must be set
+# AITER_ENABLE_EXPERIMENTAL makes the gfx1250 ASM path decline the shapes it would
+# otherwise claim, yielding them to m32x8; this harness targets exactly that kernel,
+# so enable it automatically. Must be set
 # BEFORE aiter is imported so both the Python gate (is_experimental_enabled reads
 # os.environ live) and the C++ side see it. Force it on rather than setdefault:
 # the test cannot run the kernel under test without it.
@@ -534,7 +535,7 @@ def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
         description="Perf-only benchmark for the FlyDSL m32x8 MHA kernel (gfx1250, "
-        "bf16, hdim 128/128).\nNo reference / no correctness check.",
+        "bf16).\nNo reference / no correctness check.",
     )
     parser.add_argument(
         "--layout",
@@ -613,10 +614,10 @@ def main():
         const=0.25,
         default=None,
         metavar="VALUE",
-        help="Fill q/k/v with a constant instead of random normal (default when "
-        "the flag is absent). Bare --fix-init uses 0.25; --fix-init VALUE uses "
-        "VALUE. A constant fill stops the operand buses toggling, so the clock "
-        "does not throttle -- a stable, data-independent perf ceiling.",
+        help="Fill q/k/v with a constant. Without this flag the inputs are "
+        "random normal. Bare --fix-init uses 0.25; --fix-init VALUE uses VALUE. "
+        "A constant fill stops the operand buses toggling, so the clock does not "
+        "throttle -- a stable, data-independent perf ceiling.",
     )
     args = parser.parse_args()
 
