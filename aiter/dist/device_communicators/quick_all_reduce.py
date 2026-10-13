@@ -225,7 +225,7 @@ class QuickAllReduce:
         link = fly_policy.detect_link()
         ok = True
         try:
-            policy = fly_policy.resolve_quant(link, self.world_size)
+            policy = fly_policy.resolve_quant_policy(link, self.world_size)
             for family in fly_policy.quant_families_reachable(policy):
                 self._fly_engines[family] = QuickAllReduceInt4(
                     group=self.group,
@@ -386,7 +386,7 @@ class QuickAllReduce:
         if not p.floor < nbytes <= p.max_bytes:
             return False
 
-        return fly_policy.pick_quant_family(nbytes, p) in self._fly_engines
+        return fly_policy.resolve_quant_family(nbytes, p) in self._fly_engines
 
     def should_quick_allreduce(self, inp: torch.Tensor):
         """
@@ -429,7 +429,7 @@ class QuickAllReduce:
             out = torch.empty_like(inp)
         if self._should_fly(inp):
             nbytes = inp.numel() * inp.element_size()
-            family = fly_policy.pick_quant_family(nbytes, self._fly_policy)
+            family = fly_policy.resolve_quant_family(nbytes, self._fly_policy)
             self._fly_engines[family].allreduce(inp, out)
             return out
         ops.qr_all_reduce(

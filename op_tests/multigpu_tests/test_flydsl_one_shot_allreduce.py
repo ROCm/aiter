@@ -228,7 +228,7 @@ def _production_payloads(tp: int, link: str) -> tuple[list[int], tuple[int, int]
     slice of the window; both ends of every slice are taken, which reaches
     every rung and the largest payload each is asked to move.
     """
-    policy = fly_policy.resolve_oneshot(link, tp)
+    policy = fly_policy.resolve_oneshot_policy(link, tp)
     lo, hi = policy.min_bytes, policy.max_bytes
     ladder = oneshot_ladder(tp, link)
     ends = [rung.min_bytes - 1 for rung in ladder[1:]] + [hi]

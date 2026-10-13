@@ -57,7 +57,7 @@ from .kernels.comm.allreduce_shared import (
     WORLD,
     TwoShotRung,
     has_release_fence,
-    pick_rung,
+    select_rung,
 )
 from .kernels.comm.quick_allreduce_int4 import (
     MESH_CODECS,
@@ -470,7 +470,7 @@ class QuickAllReduceInt4:
         """
         if not self._ladder:
             return self._primary
-        rung = pick_rung(self._ladder, live_bytes)
+        rung = select_rung(self._ladder, live_bytes)
         return (rung.super_tile, rung.block)
 
     @staticmethod

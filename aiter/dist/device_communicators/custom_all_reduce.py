@@ -991,7 +991,7 @@ class CustomAllreduce:
         payload_range = None
         ok = True
         try:
-            policy = fly_policy.resolve_oneshot(link, self.world_size)
+            policy = fly_policy.resolve_oneshot_policy(link, self.world_size)
             payload_range = self._fly_oneshot_range(policy)
             # The range comes from the policy table and env, identical on every
             # rank, so all ranks skip together and no IPC exchange is left

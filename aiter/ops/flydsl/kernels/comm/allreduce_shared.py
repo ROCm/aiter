@@ -5,8 +5,7 @@
 
 This module contains the tile geometry, the inbox cache-policy table, the peer
 store and load primitives, and the LDS staging factory. It also contains the
-records that the kernels, their hosts and the dispatch policy share: the
-ladder rungs and the policy rows.
+dataclass definitions for heuristics, i.e., policy definitions for kernel selection.
 """
 
 import logging
@@ -34,10 +33,7 @@ SUPPORTED_BLOCKS = (64, 128, 256, 512)
 PAYLOAD_ALIGN_BYTES = 16
 # Largest payload, in bytes: the window of a buffer descriptor.
 MAX_PAYLOAD_BYTES = 0xFFFFFFFF
-# Smallest payload a quantized schedule accepts when it is used on its own. At
-# decode sizes it saves a few microseconds on a collective that is not the
-# bottleneck, and costs ~36 dB of SQNR. Production dispatch sets its own floor
-# (``allreduce_policy``) and passes ``min_bytes=0``.
+# Smallest payload a quantized schedule accepts when it is used on its own.
 QUANT_MIN_PAYLOAD_BYTES = 128 << 10
 # No ceiling, as a payload size in bytes.
 NO_MAX = 1 << 62
@@ -68,7 +64,7 @@ FLAG_I32_PER_LANE = 2
 # A ladder is a tuple of rungs in ascending ``min_bytes`` order, and the first
 # rung has ``min_bytes == 0``. The host builds one engine per distinct rung
 # and, at launch, runs a payload on the last rung whose ``min_bytes`` is at
-# most the payload size. ``pick_rung`` makes that choice.
+# most the payload size.
 
 
 @dataclass(frozen=True)
@@ -76,10 +72,9 @@ class OneShotRung:
     """The one-shot kernel configuration for payloads of at least ``min_bytes``.
 
     ``atoms`` and ``block`` both scale the tile, and their product sets the
-    block count. They are separate knobs because only ``block`` also changes
-    the workgroup size, and only ``atoms`` also changes how many stores one
-    thread has in flight. ``grid_cap`` bounds the block count. ``fanout``
-    selects the order of the stores to the peers.
+    block count. In addition, ``block`` also changes the workgroup size, and ``atoms`` 
+    also changes how many stores one thread has in flight. ``grid_cap`` bounds 
+    the block count. ``fanout``selects the order of the stores to the peers.
     """
 
     min_bytes: int
@@ -110,7 +105,7 @@ class TwoShotRung:
     block: int
 
 
-def pick_rung(ladder, nbytes: int):
+def select_rung(ladder, nbytes: int):
     """The rung of *ladder* that runs a payload of *nbytes*."""
     chosen = ladder[0]
     for rung in ladder:
@@ -130,22 +125,21 @@ def pick_rung(ladder, nbytes: int):
 class FamilyPolicy:
     """The FlyDSL family boundaries for one cell, in payload bytes.
 
-    The fields are in payload order. The two exact boundaries are for the
-    custom-all-reduce slot, the three quantized ones for the quick-reduce slot
-    (refer to ``allreduce_policy``):
+    We have three families of all-reduce kernels: one-shot, mesh, and ring.
+    Depending on the interconnect type (PCIe or xGMI), the one-shot is best 
+    for smaller messages, mesh overtakes for bigger messages, and finally ring
+    is the choice for very large messages on PCIe. On xGMI, the ring algorithm
+    is never used. The message size at which the transitions take place depend on 
+    architecture, world size, and interconnect tyope. The FamilyPolicy captures 
+    this.
 
-    * ``oneshot_min`` and ``oneshot_max`` (both inclusive): the one-shot's
-      window. Outside it, the payload goes to ``cross_device_reduce`` or RCCL.
+    * ``oneshot_min`` and ``oneshot_max`` (both inclusive): the one-shot 
+    algorithms's applicability window. 
     * ``quant_min`` (exclusive): where the quantized mesh overtakes the fastest
-      exact kernel, the one-shot or ``cross_device_reduce``.
+      exact kernel.
     * ``mesh_max`` (inclusive): where the ring overtakes the mesh.
     * ``quant_max`` (inclusive): the largest payload for the quantized
       families.
-
-    ``oneshot_max`` and ``quant_min`` are measured against different kernels,
-    so they do not order against each other. Where ``cross_device_reduce`` is
-    faster than both FlyDSL families, ``quant_min`` is above ``oneshot_max``,
-    and the payloads between the two stay exact.
     """
 
     oneshot_max: int

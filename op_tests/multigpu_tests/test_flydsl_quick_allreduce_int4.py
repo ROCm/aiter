@@ -474,7 +474,7 @@ def _ship_payloads(
     at ``TOP_PAYLOAD_BYTES``) for a production-scale timing row. The window
     comes back so the run can check that kernel list against the engine's own.
     """
-    policy = fly_policy.resolve_quant(link, world_size)
+    policy = fly_policy.resolve_quant_policy(link, world_size)
     if algorithm in fly_policy.quant_families_reachable(policy):
         lo, hi = fly_policy.quant_family_range(algorithm, policy)
         payloads = set(_kernel_payloads(world_size, algorithm, link, lo, hi).values())

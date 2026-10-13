@@ -108,10 +108,6 @@ levels:
    per link type and world size: `ONESHOT_LADDER`, `MESH_ST_LADDER` and
    `RING_ST_LADDER`.
 
-gfx950 with xGMI has its own rows: the ring is never used there, and at TP4
-and TP8 the payloads between the one-shot and the mesh go to the 2-stage
-`cross_device_reduce` kernel, which is faster than both there.
-
 ## Environment variables
 
 ### Enable the FlyDSL kernels

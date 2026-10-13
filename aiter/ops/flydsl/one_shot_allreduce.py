@@ -2,10 +2,6 @@
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 """Host launch for the exact one-shot (1-stage) all-reduce.
-
-Public type ``OneShotAllReduce``. Decode-only by policy: one round and no
-grid-wide barrier, paid for with ``(N-1)*S`` of wire volume against the
-mesh's ``2(N-1)/N*S``.
 """
 
 from __future__ import annotations
@@ -27,7 +23,7 @@ from .allreduce_shared import (
     payload_probes,
     require_arch,
 )
-from .kernels.comm.allreduce_shared import SUPPORTED_BLOCKS, OneShotRung, pick_rung
+from .kernels.comm.allreduce_shared import SUPPORTED_BLOCKS, OneShotRung, select_rung
 from .kernels.comm.one_shot_allreduce import (
     DEFAULT_ATOMS,
     DEFAULT_BLOCK,
@@ -44,39 +40,29 @@ logger = logging.getLogger("aiter")
 def max_payload_bytes(
     world_size: int, link: str = "pcie", arch: str | None = None
 ) -> int:
-    """Largest payload this kernel should be asked to move: the policy's
-    ``oneshot_max`` for *(arch, link, world_size)*."""
+    """Largest payload this kernel should be asked to move"""
     return family_policy(str(link), int(world_size), arch).oneshot_max
 
 
 class OneShotAllReduce:
     """IPC inbox + launch wrapper for ``one_shot_allreduce``.
 
-    Requires a non-NCCL, single-node process group for IPC metadata exchange,
-    the same constraint ``QuickAllReduceInt4`` has and for the same reason.
-
     ``atoms``, ``grid_cap``, ``fanout`` and ``block`` are the tuning surface.
     ``atoms`` and ``block`` both set the tile width, ``grid_cap`` bounds it
     from above.
 
-    ``max_bytes`` is the payload above which ``allreduce`` refuses to run,
-    defaulting to ``max_payload_bytes`` for this arch, link and world size.
-    That ceiling is the point of the class: wire volume is ``(N-1)*S`` against a
-    two-shot's ``2(N-1)/N*S``, so where it stops paying is a function of ``N``.
+    ``max_bytes`` is the payload above which this ``allreduce`` refuses to run.
 
-    ``link`` selects both the tuning ladder and that default ceiling, and is
-    detected from the KFD topology when not given.
+    ``link`` is the interconnect type and it is detected from the KFD topology 
+    when not explicitly given.
 
-    ``inbox_memory`` follows ``QuickAllReduceInt4``: ``"auto"`` picks ``uncached`` on xGMI
-    hosts and ``finegrained`` on PCIe ones from the KFD topology, because
-    MI350X and MI350P both report ``gfx950`` and want opposite answers.
-    One exception: at TP2 it picks ``uncached`` on PCIe too, since a single
-    remote destination cannot collapse.
+    ``inbox_memory`` type: ``"auto"`` picks ``uncached`` on xGMI
+    hosts and ``finegrained`` on PCIe ones. One exception: at TP2 it picks 
+    ``uncached`` on PCIe too, since a single remote destination cannot collapse.
 
     A rank never round-trips through its own inbox: its own contribution stays
     in registers. That specialises the kernel to this rank, so the JIT symbol
-    carries an ``_r<n>_`` field and the binary is not shared across ranks -- one
-    compile per process, not per world.
+    carries an ``_r<n>_`` field and the binary is not shared across ranks.
     """
 
     def __init__(
@@ -206,7 +192,7 @@ class OneShotAllReduce:
     def _pick_cfg(self, live_bytes: int) -> tuple:
         """``(atoms, grid_cap, fanout, block)`` the ladder assigns to
         *live_bytes*."""
-        return pick_rung(self._ladder, live_bytes).cfg
+        return select_rung(self._ladder, live_bytes).cfg
 
     def _num_tiles(self, live_bytes: int, tile_bytes: int | None = None) -> int:
         tb = self.tile_bytes if tile_bytes is None else tile_bytes

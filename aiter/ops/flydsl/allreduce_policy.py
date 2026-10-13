@@ -127,17 +127,9 @@ FAMILY_POLICY: dict[tuple[str, int], FamilyPolicy] = {
 # Rows measured on one arch, keyed ``(arch, link, world_size)``. On that arch
 # they replace the ``FAMILY_POLICY`` row for the same ``(link, world_size)``.
 #
-# gfx950/xGMI (MI355X), measured with the ``bench`` scenario of the FlyDSL
-# all-reduce op tests:
-#
-# * The ring never wins: it is 1.03x-1.16x slower than the mesh at TP2 up to
-#   512 MiB, and 2.2x-5.7x slower at TP4 and TP8. ``mesh_max`` is unbounded.
+# * on xGMI, the mesh algorithm is always faster than the ring algorithm.
 # * ``oneshot_max`` is where ``cross_device_reduce`` overtakes the one-shot.
-#   At TP4 and TP8 that is where it switches to its 2-stage kernel (160 KiB
-#   and 80 KiB), which is fast on this fabric.
-# * ``quant_min`` is where the mesh overtakes the fastest exact kernel. At TP4
-#   and TP8 that kernel is ``cross_device_reduce``'s 2-stage, so the mesh
-#   starts well above the one-shot ceiling.
+# * ``quant_min`` is where the mesh overtakes the fastest exact kernel.
 ARCH_FAMILY_POLICY: dict[tuple[str, str, int], FamilyPolicy] = {
     ("gfx950", "xgmi", 2): FamilyPolicy(
         oneshot_max=3 << 20,
@@ -145,8 +137,6 @@ ARCH_FAMILY_POLICY: dict[tuple[str, str, int], FamilyPolicy] = {
         mesh_max=NO_MAX,
     ),
     ("gfx950", "xgmi", 4): FamilyPolicy(
-        # Every payload below the 160 KiB 2-stage switch: payloads are whole
-        # multiples of 16 B.
         oneshot_max=(160 << 10) - 16,
         quant_min=960 << 10,
         mesh_max=NO_MAX,
@@ -293,9 +283,8 @@ def ring_st_ladder(world_size: int, link: str = "pcie") -> tuple[TwoShotRung, ..
 
 
 # Floor on the block count of the mesh and the ring when they batch publishes
-# into super-tiles; refer to ``QuickAllReduceInt4._grid_x``. Shrinking the grid
-# trades parallelism for fewer release fences, which is only a good trade once
-# there are enough fences to matter.
+# into super-tiles. Shrinking the grid trades parallelism for fewer release fences, 
+# which is only a good trade once there are enough fences to matter.
 MIN_BATCH_BLOCKS = 32
 
 # World size from which the ring's reduce-scatter lap defaults to INT6, to
@@ -369,11 +358,7 @@ def detect_link() -> str:
 
 
 def family_policy(link: str, world_size: int, arch: str | None = None) -> FamilyPolicy:
-    """The table row for *(arch, link, world_size)*, without overrides.
-
-    *arch* defaults to this host's. An arch with no row of its own for the
-    cell gets the ``FAMILY_POLICY`` row.
-    """
+    """The table row for *(arch, link, world_size)*, without overrides."""
     if link not in LINKS:
         raise ValueError(f"link must be one of {LINKS}, got {link!r}")
     if world_size not in SUPPORTED_WORLDS:
@@ -386,12 +371,10 @@ def family_policy(link: str, world_size: int, arch: str | None = None) -> Family
     return FAMILY_POLICY[(link, int(world_size))] if row is None else row
 
 
-def resolve_oneshot(
+def resolve_oneshot_policy(
     link: str, world_size: int, arch: str | None = None
 ) -> OneShotPolicy:
     """The one-shot's window for a rank, environment overrides applied.
-
-    *arch* defaults to this host's; refer to ``family_policy``.
 
     ``AITER_FLY_AR_ONESHOT_MIN_BYTES`` overrides ``oneshot_min`` and
     ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides ``oneshot_max``. ``-1`` on
@@ -406,10 +389,8 @@ def resolve_oneshot(
     )
 
 
-def resolve_quant(link: str, world_size: int, arch: str | None = None) -> QuantPolicy:
+def resolve_quant_policy(link: str, world_size: int, arch: str | None = None) -> QuantPolicy:
     """The mesh and ring windows for a rank, environment overrides applied.
-
-    *arch* defaults to this host's; refer to ``family_policy``.
 
     ``AITER_FLY_AR_ONESHOT_MAX_BYTES`` overrides ``quant_min`` too, so that one
     override moves the one boundary between the one-shot and the mesh.
@@ -427,7 +408,7 @@ def resolve_quant(link: str, world_size: int, arch: str | None = None) -> QuantP
     return QuantPolicy(floor=floor, mesh_max=mesh, max_bytes=row.quant_max)
 
 
-def pick_quant_family(nbytes: int, policy: QuantPolicy) -> str:
+def resolve_quant_family(nbytes: int, policy: QuantPolicy) -> str:
     """``"mesh"`` | ``"ring"`` for a payload of *nbytes*.
 
     Assumes ``nbytes > policy.floor``; below that the caller should have
@@ -474,10 +455,10 @@ def route(
     considered; the slots also check dtype, alignment and contiguity.
     """
     if quantized:
-        quant = resolve_quant(link, world_size, arch)
+        quant = resolve_quant_policy(link, world_size, arch)
         if quant.floor < nbytes <= quant.max_bytes:
-            return pick_quant_family(nbytes, quant)
-    one = resolve_oneshot(link, world_size, arch)
+            return resolve_quant_family(nbytes, quant)
+    one = resolve_oneshot_policy(link, world_size, arch)
     if one.min_bytes <= nbytes <= one.max_bytes:
         return "oneshot"
     return "fallback"

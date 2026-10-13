@@ -46,8 +46,8 @@ def test_resolved_slots_partition_by_size(cell):
     The two views do not have to meet -- where ``cross_device_reduce`` beats
     both FlyDSL families they may leave a gap -- but neither may be inverted.
     """
-    one = P.resolve_oneshot(*cell)
-    quant = P.resolve_quant(*cell)
+    one = P.resolve_oneshot_policy(*cell)
+    quant = P.resolve_quant_policy(*cell)
     assert 0 < one.max_bytes
     assert one.min_bytes <= one.max_bytes
     assert 0 < quant.floor <= quant.mesh_max <= quant.max_bytes
@@ -68,7 +68,7 @@ def test_dispatch_is_monotone(ws, link, arch):
     # ``cross_device_reduce`` beats both FlyDSL families, the payload falls
     # through to it, and only larger payloads reach the mesh.
     order = {"oneshot": 0, "fallback": 1, "mesh": 2, "ring": 3}
-    floor = P.resolve_oneshot(link, ws, arch).min_bytes
+    floor = P.resolve_oneshot_policy(link, ws, arch).min_bytes
     sizes = [1 << k for k in range(4, 31)]
     below = [_slot_of(link, ws, n, arch) for n in sizes if n < floor]
     assert set(below) <= {"fallback"}
@@ -148,11 +148,11 @@ def test_ladder_rungs_fall_inside_their_dispatch_window(ws, arch):
     The one-shot window is the wider of the two ceilings.
     """
     for link in P.LINKS:
-        quant = P.resolve_quant(link, ws, arch)
+        quant = P.resolve_quant_policy(link, ws, arch)
         # The one-shot never serves above its own ceiling: with the quant slot
         # open, the payloads between that ceiling and the quant floor fall
         # through to ``cross_device_reduce``.
-        one_hi = P.resolve_oneshot(link, ws, arch).max_bytes
+        one_hi = P.resolve_oneshot_policy(link, ws, arch).max_bytes
         for r in oneshot_ladder(ws, link)[1:]:
             assert r.min_bytes < one_hi, ("oneshot", link, ws, r)
         for r in mesh_st_ladder(ws, link)[1:]:
@@ -181,13 +181,13 @@ def test_slots_share_one_boundary(cell):
     """
     link, ws, arch = cell
     assert (
-        P.resolve_quant(link, ws, arch).floor
+        P.resolve_quant_policy(link, ws, arch).floor
         == P.family_policy(link, ws, arch).quant_min
     )
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
-        assert P.resolve_quant(link, ws, arch).floor == 65536
+        assert P.resolve_quant_policy(link, ws, arch).floor == 65536
         # The override moves both readings, or the boundary splits in two.
-        assert P.resolve_oneshot(link, ws, arch).max_bytes == 65536
+        assert P.resolve_oneshot_policy(link, ws, arch).max_bytes == 65536
 
 
 @pytest.mark.parametrize("ws", WORLDS)
@@ -220,18 +220,18 @@ def test_byte_overrides():
     table_one = P.family_policy("pcie", 8, "gfx942").oneshot_max
     table_floor = P.family_policy("pcie", 8, "gfx942").quant_min
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
-        assert P.resolve_oneshot("pcie", 8, "gfx942").max_bytes == 65536
-        assert P.resolve_quant("pcie", 8, "gfx942").floor == 65536
+        assert P.resolve_oneshot_policy("pcie", 8, "gfx942").max_bytes == 65536
+        assert P.resolve_quant_policy("pcie", 8, "gfx942").floor == 65536
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="1048576"):
-        assert P.resolve_quant("pcie", 4, "gfx942").mesh_max == 1048576
+        assert P.resolve_quant_policy("pcie", 4, "gfx942").mesh_max == 1048576
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="-1"):
-        assert P.resolve_oneshot("pcie", 8, "gfx942").max_bytes == table_one
-        assert P.resolve_quant("pcie", 8, "gfx942").floor == table_floor
+        assert P.resolve_oneshot_policy("pcie", 8, "gfx942").max_bytes == table_one
+        assert P.resolve_quant_policy("pcie", 8, "gfx942").floor == table_floor
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="lots"):
-        assert P.resolve_oneshot("pcie", 8, "gfx942").max_bytes == table_one
-        assert P.resolve_quant("pcie", 8, "gfx942").floor == table_floor
+        assert P.resolve_oneshot_policy("pcie", 8, "gfx942").max_bytes == table_one
+        assert P.resolve_quant_policy("pcie", 8, "gfx942").floor == table_floor
 
 
 def test_oneshot_min_override():
@@ -239,25 +239,25 @@ def test_oneshot_min_override():
     floor; the ceiling and the quant floor are untouched."""
     table_min = P.family_policy("xgmi", 8, "gfx942").oneshot_min
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="65536"):
-        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == 65536
+        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == 65536
         # ceiling and quant slot are independent of the min override
         assert (
-            P.resolve_oneshot("xgmi", 8, "gfx942").max_bytes
+            P.resolve_oneshot_policy("xgmi", 8, "gfx942").max_bytes
             == P.family_policy("xgmi", 8, "gfx942").oneshot_max
         )
         assert (
-            P.resolve_quant("xgmi", 8, "gfx942").floor
+            P.resolve_quant_policy("xgmi", 8, "gfx942").floor
             == P.family_policy("xgmi", 8, "gfx942").quant_min
         )
     # 0 is a valid override: accept every size down to the custom-AR floor.
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="0"):
-        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == 0
+        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == 0
     # -1 is the house sentinel for "unset, use the table".
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="-1"):
-        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == table_min
+        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == table_min
     # Garbage warns and is ignored.
     with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="lots"):
-        assert P.resolve_oneshot("xgmi", 8, "gfx942").min_bytes == table_min
+        assert P.resolve_oneshot_policy("xgmi", 8, "gfx942").min_bytes == table_min
 
 
 def test_override_cannot_invert_the_partition():
@@ -270,14 +270,14 @@ def test_override_cannot_invert_the_partition():
     cells = [
         c
         for c in CELLS
-        if P.resolve_quant(*c).mesh_max + 16 < P.resolve_quant(*c).max_bytes
+        if P.resolve_quant_policy(*c).mesh_max + 16 < P.resolve_quant_policy(*c).max_bytes
     ]
     if not cells:
         pytest.skip("no (link, world) in the table reaches the ring")
     link, ws, arch = cells[0]
-    mesh_max = P.resolve_quant(link, ws, arch).mesh_max
+    mesh_max = P.resolve_quant_policy(link, ws, arch).mesh_max
     with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(mesh_max + 16)):
-        p = P.resolve_quant(link, ws, arch)
+        p = P.resolve_quant_policy(link, ws, arch)
         assert p.mesh_max >= p.floor
         assert P.quant_families_reachable(p) == ("ring",)
         # A payload under the raised ceiling now reaches the one-shot, because
@@ -286,7 +286,7 @@ def test_override_cannot_invert_the_partition():
 
 
 def test_resolvers_reject_unknown_keys():
-    for resolve in (P.resolve_oneshot, P.resolve_quant):
+    for resolve in (P.resolve_oneshot_policy, P.resolve_quant_policy):
         with pytest.raises(ValueError):
             resolve("infiniband", 4)
         with pytest.raises(ValueError):
@@ -318,7 +318,7 @@ def test_selectors_reject_non_contiguous():
     contiguous copy of the same payload is accepted, which shows the refusal
     comes from contiguity rather than from size, dtype or alignment.
     """
-    quant = P.resolve_quant("pcie", 4, "gfx942")
+    quant = P.resolve_quant_policy("pcie", 4, "gfx942")
     qr = SimpleNamespace(
         _fly_policy=quant, _fly_engines={"mesh": object(), "ring": object()}
     )
@@ -326,7 +326,7 @@ def test_selectors_reject_non_contiguous():
     assert QuickAllReduce._should_fly(qr, t.contiguous())
     assert not QuickAllReduce._should_fly(qr, t)
 
-    one = P.resolve_oneshot("pcie", 4, "gfx942")
+    one = P.resolve_oneshot_policy("pcie", 4, "gfx942")
     ca = SimpleNamespace(
         _fly_oneshot=object(), _fly_policy=one, device=torch.device("cpu")
     )
