@@ -461,7 +461,7 @@ def test_auto_backend_falls_back_to_triton(monkeypatch):
 
 
 @pytest.mark.parametrize("backend", ("hipblaslt", "multistream", "auto"))
-def test_pre_routed_backend_matches_triton(monkeypatch, backend):
+def test_triton_pre_routed_ignores_backend_selection(monkeypatch, backend):
     torch.manual_seed(43)
     counts = [8, 0, 16]
     tokens, experts, hidden, intermediate = sum(counts), len(counts), 64, 64
@@ -484,16 +484,6 @@ def test_pre_routed_backend_matches_triton(monkeypatch, backend):
     def run(selected):
         cloned = tuple(leaf.detach().clone().requires_grad_() for leaf in leaves)
         monkeypatch.setenv("SONIC_MOE_GROUPED_GEMM_BACKEND", selected)
-        seen_host = {}
-        if selected == "multistream":
-            real_lookup = sonicmoe_dispatch._registered_host_cu_seqlens
-
-            def spy(cu_seqlens):
-                host = real_lookup(cu_seqlens)
-                seen_host["value"] = host
-                return host
-
-            monkeypatch.setattr(sonicmoe_dispatch, "_registered_host_cu_seqlens", spy)
         out, _ = moe_pre_routed_inputs(
             cloned[0],
             cloned[1],
@@ -506,13 +496,16 @@ def test_pre_routed_backend_matches_triton(monkeypatch, backend):
             ActivationType.SWIGLU,
         )
         grads = torch.autograd.grad(out, cloned, upstream)
-        return out.detach(), grads, seen_host
+        return out.detach(), grads
 
-    expected, expected_grads, _ = run("triton")
-    actual, actual_grads, seen_host = run(backend)
-    if backend == "multistream":
-        assert seen_host["value"] is not None
-        assert seen_host["value"].device.type == "cpu"
-    torch.testing.assert_close(actual, expected, rtol=7e-2, atol=7e-2)
+    expected, expected_grads = run("triton")
+
+    def unavailable(*_args, **_kwargs):
+        raise AssertionError("the Triton MoE must not select another backend")
+
+    monkeypatch.setattr(sonicmoe_dispatch, "_grouped_gemm_hipblaslt", unavailable)
+    monkeypatch.setattr(sonicmoe_dispatch, "_grouped_gemm_multistream", unavailable)
+    actual, actual_grads = run(backend)
+    torch.testing.assert_close(actual, expected)
     for actual_grad, expected_grad in zip(actual_grads, expected_grads):
-        torch.testing.assert_close(actual_grad, expected_grad, rtol=7e-2, atol=7e-2)
+        torch.testing.assert_close(actual_grad, expected_grad)
