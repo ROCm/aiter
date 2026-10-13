@@ -176,8 +176,8 @@ _LAZY_IMPORTS = {
     ),
     "normalize_qsa_backend": (".qsa", "normalize_qsa_backend"),
     "qsa_auto_uses_flydsl": (".qsa", "qsa_auto_uses_flydsl"),
-    "qsa_k1_block_ids": (".qsa", "qsa_k1_block_ids"),
-    "qsa_k2": (".qsa", "qsa_k2"),
+    "qsa_indexer_block_ids": (".qsa", "qsa_indexer_block_ids"),
+    "qsa_sparse_gqa": (".qsa", "qsa_sparse_gqa"),
     "qsa_layer": (".qsa", "qsa_layer"),
 }
 
@@ -230,9 +230,9 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
-    "qsa_k1_block_ids",
-    "qsa_k2",
+    "qsa_indexer_block_ids",
     "qsa_layer",
+    "qsa_sparse_gqa",
 ]
 
 _fused_moe_impl_path = "aiter.ops.flydsl.fused_moe_gfx942:run_flydsl_moe_gfx942_impl"
