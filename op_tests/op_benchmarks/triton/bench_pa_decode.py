@@ -181,7 +181,9 @@ def paged_attn_decode(
             block_tables=block_tables,
             softmax_scale=attn_scale,
             query_length=1,
-            max_context_partition_num=get_recommended_splits(BS, H_KV),
+            max_context_partition_num=get_recommended_splits(
+                BS, H_KV, max_context_length=max_context_len
+            ),
             compute_type=compute_type,
             key_scale=scale,
             value_scale=scale,

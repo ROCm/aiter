@@ -6,6 +6,7 @@ import hashlib
 import os
 import random
 import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pandas as pd
@@ -1440,7 +1441,11 @@ def run_pa_gluon_test(
     if ps and not (sliding_window > 0 and block_size == 1024):
         split_kv_blocks = triton.cdiv(block_size, context_partition_size)
         max_context_partition_num = get_recommended_splits(
-            num_seqs, num_kv_heads, split_kv_blocks
+            num_seqs,
+            num_kv_heads,
+            split_kv_blocks,
+            query_length=query_length,
+            max_context_length=max_context_length,
         )
     elif sliding_window > 0 and block_size == 1024:
         max_context_partition_num = (
@@ -2246,6 +2251,88 @@ def sliding_window_performance_test():
     BLOCK_SIZE_OPTIONS = [16]
     PS_OPTIONS = [True]
     parse_arg_and_run_test()
+
+
+@pytest.mark.parametrize(
+    "num_seqs, num_kv_heads, kwargs, expected",
+    [
+        (1, 8, {}, 8),
+        (1, 8, {"max_context_length": 32768}, 64),
+        (1, 8, {"max_context_length": 1024}, 8),
+        (2, 8, {"max_context_length": 32768}, 32),
+        (1, 2, {"max_context_length": 8192}, 32),
+        (4, 8, {"max_context_length": 32768}, 8),
+        (1, 8, {"max_context_length": 32768, "query_length": 4}, 8),
+        (1, 8, {"max_context_length": 32768, "split_kv_blocks": 4}, 8),
+    ],
+)
+def test_get_recommended_splits(monkeypatch, num_seqs, num_kv_heads, kwargs, expected):
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_properties",
+        lambda *a, **k: SimpleNamespace(multi_processor_count=256),
+    )
+    assert get_recommended_splits(num_seqs, num_kv_heads, **kwargs) == expected
+
+
+def test_ps_recommended_splits_match_reference():
+    torch.manual_seed(0)
+    kv_heads, group, head_size, page, ctx_len, x = 8, 8, 64, 16, 8192, 8
+    pages = ctx_len // page
+    kwargs = {"device": "cuda", "dtype": torch.bfloat16}
+    query = torch.randn(1, kv_heads * group, head_size, **kwargs)
+    key_cache = torch.randn(pages, kv_heads, head_size // x, page, x, **kwargs)
+    value_cache = torch.randn(pages, kv_heads, page // x, head_size, x, **kwargs)
+    context_lengths = torch.tensor([ctx_len], dtype=torch.int32, device="cuda")
+    block_tables = torch.arange(pages, dtype=torch.int32, device="cuda")[None]
+    scale = head_size**-0.5
+
+    splits = get_recommended_splits(1, kv_heads, max_context_length=ctx_len)
+    assert splits > 8
+    shape = (1, kv_heads, splits, group)
+    exp_sums = torch.empty(shape, dtype=torch.float32, device="cuda")
+    max_logits = torch.empty_like(exp_sums)
+    temporary_output = torch.empty((*shape, head_size), **kwargs)
+    output = torch.zeros_like(query)
+    pa_decode_gluon(
+        output=output,
+        query=query,
+        key_cache=key_cache,
+        value_cache=value_cache,
+        context_lengths=context_lengths,
+        block_tables=block_tables,
+        softmax_scale=scale,
+        query_length=1,
+        max_context_partition_num=splits,
+        context_partition_size=256,
+        compute_type=query.dtype,
+        exp_sums=exp_sums,
+        max_logits=max_logits,
+        temporary_output=temporary_output,
+        ps=True,
+    )
+
+    def unpack(cache, order):
+        return cache.permute(order).reshape(pages, kv_heads, page, head_size)
+
+    k = (
+        unpack(key_cache, (0, 1, 3, 2, 4))
+        .transpose(0, 1)
+        .reshape(kv_heads, -1, head_size)
+    )
+    v = (
+        unpack(value_cache, (0, 1, 2, 4, 3))
+        .transpose(0, 1)
+        .reshape(kv_heads, -1, head_size)
+    )
+    probs = torch.softmax(
+        query.view(kv_heads, group, head_size).float()
+        @ k.float().transpose(1, 2)
+        * scale,
+        dim=-1,
+    )
+    reference = (probs @ v.float()).reshape(1, kv_heads * group, head_size)
+    torch.testing.assert_close(output.float(), reference, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
