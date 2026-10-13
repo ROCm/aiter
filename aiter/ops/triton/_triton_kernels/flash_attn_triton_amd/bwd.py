@@ -3509,6 +3509,20 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
             mask_d_v = offs_d_v < ACTUAL_HEAD_DIM_V
             mask_v &= mask_d_v[None, :]
 
+        # Packed sequences use global token rows; dense tensors use a batch offset.
+        kv_rows = k_start + offs_n
+        dk_base = DK + hkid * stride_dkh
+        dv_base = DV + hkid * stride_dvh
+        if not IS_VARLEN:
+            dk_base += bid * stride_dkb
+            dv_base += bid * stride_dvb
+        dk_ptrs = (
+            dk_base + kv_rows[:, None] * stride_dkn + offs_d_qk[None, :] * stride_dkd
+        )
+        dv_ptrs = (
+            dv_base + kv_rows[:, None] * stride_dvn + offs_d_v[None, :] * stride_dvd
+        )
+
         # K/V tensors not changed for the group
         adj_k = (
             bid * stride_kb
@@ -3720,15 +3734,9 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
                 DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
             )
         # end of GQA/MQA of dkdv
-        # Write back dV
-        adj_dv = bid * stride_dvb + hkid * stride_dvh + k_start * stride_dvn
-        offs_dv = offs_n[:, None] * stride_dvn + offs_d_v[None, :] * stride_dvd
-        tl.store(DV + adj_dv + offs_dv, dv, mask=mask_v)
-        # write back dk
-        adj_dk = bid * stride_dkb + hkid * stride_dkh + k_start * stride_dkn
-        offs_dk = offs_n[:, None] * stride_dkn + offs_d_qk[None, :] * stride_dkd
+        tl.store(dv_ptrs, dv, mask=mask_v)
         dk *= sm_scale
-        tl.store(DK + adj_dk + offs_dk, dk, mask=mask_k)
+        tl.store(dk_ptrs, dk, mask=mask_k)
 
     # This part does dq
     start_m = pid * BLOCK_M2
