@@ -106,34 +106,5 @@
         "matrix_instr_nonkdim": 16,
         "cache_modifier": null,
         "NUM_KSPLIT": 1
-    },
-    "M_BOUNDS": [
-        1,
-        4,
-        8,
-        9,
-        16,
-        32,
-        40,
-        64,
-        128,
-        256,
-        512,
-        1024,
-        2048,
-        4096,
-        8192
-    ],
-    "M_LEQ_9": {
-        "BLOCK_SIZE_M": 16,
-        "BLOCK_SIZE_N": 64,
-        "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,
-        "num_warps": 4,
-        "num_stages": 3,
-        "waves_per_eu": 4,
-        "matrix_instr_nonkdim": 16,
-        "cache_modifier": ".cg",
-        "NUM_KSPLIT": 4
     }
 }
