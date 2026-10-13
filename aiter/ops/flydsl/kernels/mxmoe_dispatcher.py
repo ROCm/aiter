@@ -140,6 +140,7 @@ def compile_gemm2_a4w4_port(
     _reduce_store_cache_modifier=None,
     _input_row_resolver=None,
     _output_n_range=None,
+    use_valid_token_count=False,
 ):
     """Compile gemm2 a4w4 down-proj; epilog 'atomic' (weighted atomic-fadd) or 'reduce' (store into out[token_id*topk+slot]). INTER_MAX must equal the runtime inter_dim (unrolled K-loop); SBM None -> SBM==BM byte-identical."""
     SBM = _norm_sbm(SBM, BM)
@@ -166,6 +167,10 @@ def compile_gemm2_a4w4_port(
         raise AssertionError(f"epilog='scatter' supports only BM=128 (got BM={BM})")
     if use_scatter and _composition is not None:
         raise ValueError("epilog='scatter' does not support a composition")
+    # Composed tiles have no count pointer; their cumsum argument is a placeholder.
+    use_valid_token_count = bool(
+        use_valid_token_count and epilog == "atomic" and _composition is None
+    )
     out_dtype = str(out_dtype).strip().lower()
     if out_dtype not in ("bf16", "fp8", "fp4"):
         raise AssertionError(
@@ -308,11 +313,14 @@ def compile_gemm2_a4w4_port(
     out_tag = "_fp8out" if route_out_fp8 else ("_f4out" if scatter_out_fp4 else "")
     compact_tag = "_weighted_compact_s8" if compact_route else ""
     route_guard_tag = "_routeguard" if use_reduce else ""
+    valid_tokens_tag = "_valid_tokens" if use_valid_token_count else ""
     tile_tag = "" if (BN, BK) == (256, 256) else f"_bn{BN}_bk{BK}"
     bias_tag = "_bias" if enable_bias else ""
     g2_epi_lanes = _pick_epi_lanes(BM, BN, route_out_fp8, g2_scale_blk)
     tag = f"hmax{HIDDEN_MAX}_imax{INTER_MAX}_bm{BM}{tile_tag}{'_nt' if use_nt else ''}_{etag}{atag}{btag}{sbm_tag}{shared_scale_tag}{persist_tag}{bh_tag}{apf_tag}{spart_tag}{bf16lds_tag}{noil_tag}{dw_tag}{pitch_tag}{sblk_tag}{out_tag}{compact_tag}{bias_tag}{output_range_tag}_v2_biasabi7{route_guard_tag}"
-    name = f"gemm2_a4w4_port_{tag}" + ("_idpf" if g2_prefetch_ids else "")
+    name = f"gemm2_a4w4_port_{tag}{valid_tokens_tag}" + (
+        "_idpf" if g2_prefetch_ids else ""
+    )
 
     @fx.struct
     class SharedStorage:
@@ -392,6 +400,13 @@ def compile_gemm2_a4w4_port(
                     resolved_rows=resolved_input_rows,
                 )
 
+        # Keep capacity for addressing and scheduling. Only atomic writes use
+        # the EP valid token count, read on device on every Graph replay.
+        write_limit = i32_M
+        if const_expr(use_valid_token_count):
+            valid_tokens = global_typed_ptr(arg_cumsum, T.i32)[1]
+            write_limit = (valid_tokens < i32_M).select(valid_tokens, i32_M)
+
         def run_unit(unit_bx, mn_idx=None):
             gemm2_body_v2(
                 lds_base_i32,
@@ -442,6 +457,7 @@ def compile_gemm2_a4w4_port(
                 resolved_input_rows=resolved_input_rows,
                 output_n_base=output_n_base,
                 output_width=output_width,
+                write_limit=write_limit,
             )
 
         if const_expr(mn_idx is not None):
@@ -702,6 +718,7 @@ def get_g2(
     g2_spart=None,
     enable_bias=False,
     g2_prefetch_ids=False,
+    use_valid_token_count=False,
 ):
     # Cache key uses compile-time buckets; runtime model_dim shares a launcher
     # within HIDDEN_MAX (INTER_MAX is the exact inter_dim: the K-loop is unrolled).
@@ -709,6 +726,7 @@ def get_g2(
     out_dtype = str(out_dtype).strip().lower()
     topk_key = topk if epilog == "reduce" else 1
     persist = bool(persist or epilog == "scatter")
+    use_valid_token_count = bool(use_valid_token_count and epilog == "atomic")
     cu_key = cu_num if persist else 0
     # gemm2 perf knobs enter the key; defaults ON (env override), matching compile_gemm2_a4w4_port.
     g2_bhoist = os.environ.get("MXFP4_G2_BHOIST", "1") == "1"
@@ -740,6 +758,7 @@ def get_g2(
         out_dtype,
         enable_bias,
         g2_prefetch_ids,
+        use_valid_token_count,
     )
     launch = G2_CACHE.get(key)
     if launch is None:
@@ -764,6 +783,7 @@ def get_g2(
             out_dtype=out_dtype,
             enable_bias=enable_bias,
             g2_prefetch_ids=g2_prefetch_ids,
+            use_valid_token_count=use_valid_token_count,
         )
         G2_CACHE[key] = launch
     return launch
@@ -805,11 +825,15 @@ def mxfp4_moe_gemm2(
     bias=None,
     is_ep=False,
     out_scale=None,
+    use_valid_token_count=False,
 ):
     """Stage-2 down-proj gemm for unpadded dimensions.
 
     out_dtype='fp4' (epilog='scatter' only): ``out`` is uint8 [max_sorted, D_HIDDEN//2]
     packed fp4 and ``out_scale`` is uint8 [max_sorted, D_HIDDEN//32] e8m0, both unweighted.
+
+    Atomic callers may enable use_valid_token_count when cumsum_tensor[1]
+    contains the current device valid-token count (item 0 is padded sorted rows).
     """
     import torch
 
@@ -901,6 +925,7 @@ def mxfp4_moe_gemm2(
         g2_spart=g2_spart,
         enable_bias=bias is not None,
         g2_prefetch_ids=g2_prefetch_ids,
+        use_valid_token_count=use_valid_token_count,
     )
     max_m_blocks = (max_sorted + BM - 1) // BM
     if persist:
