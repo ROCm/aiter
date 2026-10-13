@@ -27,7 +27,6 @@ from aiter.ops.opus.gemm_op_a8w8 import _opus_gemm_a8w8_mxscale_bmm_launch_raw
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner, TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
-from csrc.opus_gemm._scale_layouts import shuffle_scale_a, shuffle_scale_b
 
 # Neither op_tests nor this directory is a package, so put both on sys.path. This
 # also has to hold in the spawned mp_tuner subprocesses, which re-import this
@@ -391,6 +390,91 @@ _SHUF_FAMILIES = frozenset(
 SHUF_SUB = _opus_sf_shuf_sub()
 
 
+# --- host-side scale producers for the relaid-scale kids (disabled) ---------
+# These build the two layouts the shuffle_scale / mpacked-SFA kids read. They
+# are parked here rather than live because no such kid is currently built:
+# opus_gemm_common.BMM_BUILD_RELAID_SCALE_KIDS is False, so _globalize_bmm_kids
+# drops all of them and _SHUF_POLICY above comes out empty. Keeping them as
+# code would mean shipping an untested, unlinted path with no caller.
+#
+# To re-enable: flip BMM_BUILD_RELAID_SCALE_KIDS to True, uncomment this block,
+# and restore the two call sites -- gen_bmm_mxscale_data has to add the shuffled
+# A/B scales to the tuple it returns (as slots 8 and 9, with BMM_BENCH_KEYS
+# widened to match), and run_bmm_mxscale_bench has to select them when
+# inst.needs_shuffle_scale. op_tests/test_opus_a8w8_bmm.py needs the mirror of
+# that in _scale_picker, plus shuffle_scale_mxsk_mpack for the mpack_sfa kids.
+# The pre-removal form of all of it, including the host-side index/byte guards,
+# is at commit fb06b88cab; the helper file itself is blob 6ff7dc2c82.
+#
+# Note both functions are layout-defining: a kid handed the plain scale does not
+# raise, it returns wrong numbers (mpacked-SFA reads past the end and faults).
+# So if this is revived, revive its guards with it.
+#
+# def _shuf_kblock_pairs(s, K):
+#     """Pad K128 blocks to pairs with E8M0 1.0 (0x7F)."""
+#     K1 = (K + 255) // 256
+#     if s.shape[-1] < 2 * K1:
+#         s = F.pad(s, (0, 2 * K1 - s.shape[-1]), value=0x7F)
+#     return s, K1
+#
+#
+# def shuffle_scale_a(a_scale, K, sub):
+#     """Pack two M subtiles crossed with two K128 blocks into each scale word.
+#
+#     sub is the M-subtile distance read from _opus_sf_shuf_sub()."""
+#     s = a_scale.view(torch.uint8)
+#     *lead, rows, ksc = s.shape
+#     if ksc != K // 128:
+#         raise ValueError(
+#             f"a_scale must be (..., rows, K//128)=(..., {K // 128}); "
+#             f"got {tuple(a_scale.shape)}"
+#         )
+#     if rows % (2 * sub):
+#         # Pad partial row blocks because every lane reads whole scale words.
+#         s = F.pad(s, (0, 0, 0, (-rows) % (2 * sub)), value=0x7F)
+#         rows = s.shape[-2]
+#     s, K1 = _shuf_kblock_pairs(s, K)
+#     nd = len(lead)
+#     # (..., rows, 2*K1) -> [n1, np, nl, k1, kp] -> [n1, k1, nl, kp, np]
+#     s = s.view(*lead, rows // (2 * sub), 2, sub, K1, 2)
+#     perm = (*range(nd), nd, nd + 3, nd + 2, nd + 4, nd + 1)
+#     return s.permute(*perm).contiguous().view(*lead, -1).view(a_scale.dtype)
+#
+#
+# def shuffle_scale_b(b_scale, N, K):
+#     """Pack K128 scale pairs as duplicated bytes (k, k, k+1, k+1)."""
+#     s = b_scale.view(torch.uint8)
+#     *lead, nblk, ksc = s.shape
+#     if (nblk, ksc) != (N // 128, K // 128):
+#         raise ValueError(
+#             f"b_scale must be (..., N//128, K//128)=(..., {N // 128}, "
+#             f"{K // 128}); got {tuple(b_scale.shape)}"
+#         )
+#     s, K1 = _shuf_kblock_pairs(s, K)
+#     out = s.view(*lead, nblk, K1, 2, 1).expand(*lead, nblk, K1, 2, 2)
+#     return out.contiguous().view(*lead, -1).view(b_scale.dtype)
+#
+#
+# def shuffle_scale_mxsk_mpack(a_scale, b_m, sfa_mb):
+#     """Pack A-scale M subtiles into adjacent bytes; pad M to b_m."""
+#     s = a_scale.view(torch.uint8)
+#     *lead, rows, ksc = s.shape
+#     com_rep_m = b_m // sfa_mb
+#     if b_m != sfa_mb * com_rep_m:
+#         raise ValueError(f"b_m={b_m} must be a multiple of sfa_mb={sfa_mb}")
+#     if rows % b_m:
+#         # Pad partial M tiles with E8M0 1.0; all lanes read the scale panel.
+#         s = F.pad(s, (0, 0, 0, (-rows) % b_m), value=0x7F)
+#         rows = s.shape[-2]
+#     s = s.view(*lead, rows // b_m, com_rep_m, sfa_mb, ksc)
+#     nd = len(lead)
+#     perm = (*range(nd), nd, nd + 2, nd + 3, nd + 1)
+#     out = s.permute(*perm).contiguous().view(*lead, rows * ksc)
+#     return out.view(a_scale.dtype)
+#
+# (F above is torch.nn.functional, which this module does not otherwise import.)
+
+
 def _shuf_sub(inst):
     """``SHUF_SUB`` if this kid's tile can read the shipped layout, else None.
 
@@ -566,8 +650,6 @@ def gen_bmm_mxscale_data(
     5 workspace            caller-owned FP32 split-K buffer, or None
     6 ref     [m,g,n]       reference from dequantized FP32 operands
     7 W_sh    [g,n,k]       weight in the (16,16) preshuffled layout
-    8 xs_sh                shuffled A scales for group128
-    9 ws_sh                shuffled B scales for group128
 
     Prepare layouts and workspace outside the timed region. Pass all operands
     as benchmark arguments so run_perftest can rotate their buffers."""
@@ -595,27 +677,15 @@ def gen_bmm_mxscale_data(
     # reference above covers both forms. Building it here rather than in the bench
     # keeps it out of what is timed.
     W_sh = shuffle_weight(W_mx, layout=(16, 16))
-    # The shuffled A-scale view has stride(0)=0: kernel addressing uses only
-    # its per-batch slab. Buffer rotation preserves that view's storage/strides.
-    # This packed layout is defined only for group128; group32 candidates keep
-    # ordinary scales in these tuple slots.
-    if group == 128:
-        _slab = shuffle_scale_a(xs_mx, k, SHUF_SUB)
-        xs_sh = _slab.as_strided((m, batch, _slab.shape[1]), (0, _slab.shape[1], 1))
-        # Kept 3-D with the N-block axis in the middle so stride(0) is the
-        # per-batch slab, the only term the shuffled path reads.
-        ws_sh = shuffle_scale_b(ws_mx, n, k).view(batch, n // 128, -1)
-    else:
-        xs_sh, ws_sh = xs_mx, ws_mx
     # Materialize token-major A and scales after reference/shuffle preparation.
     # Both backends receive the same contiguous layout, with copies outside timing.
     A_mx = O_mx.transpose(0, 1).contiguous()
     A_scale = xs_mx.transpose(0, 1).contiguous()
-    return (A_mx, W_mx, Y, A_scale, ws_mx, workspace, ref, W_sh, xs_sh, ws_sh)
+    return (A_mx, W_mx, Y, A_scale, ws_mx, workspace, ref, W_sh)
 
 
 def run_bmm_mxscale_bench(
-    A_mx, W_mx, Y, A_scale, ws_mx, workspace, W_sh, xs_sh, ws_sh, kernelId, splitK
+    A_mx, W_mx, Y, A_scale, ws_mx, workspace, W_sh, kernelId, splitK
 ):
     """Select the kernel's weight/scale layouts, launch it, and return Y.
 
@@ -624,13 +694,8 @@ def run_bmm_mxscale_bench(
     inst = _CODEGEN_BMM[kernelId]
     Wb = W_sh if inst.needs_preshuffled_b else W_mx
     # A, its plain scale and Y all arrive [M, batch, ...] contiguous, which is
-    # both what the launcher takes and what a serving stack holds. The shuffled
-    # scale is the exception: shuffle_scale_a builds its slab batch-first, so
-    # that one is still flipped into place here.
-    if inst.needs_shuffle_scale:
-        sfa, sfb = xs_sh.transpose(0, 1), ws_sh
-    else:
-        sfa, sfb = A_scale, ws_mx
+    # both what the launcher takes and what a serving stack holds.
+    sfa, sfb = A_scale, ws_mx
     _opus_gemm_a8w8_mxscale_bmm_launch_raw(
         A_mx,
         Wb,
@@ -652,7 +717,7 @@ def _bmm_ref_passthrough(ref):
 # ---------------------------------------------------------------------------
 # Tuner
 # ---------------------------------------------------------------------------
-BMM_BENCH_KEYS = (0, 1, 2, 3, 4, 5, 7, 8, 9)
+BMM_BENCH_KEYS = (0, 1, 2, 3, 4, 5, 7)
 BMM_DATA_KIDS = {128: 8179, 32: 9179}
 BMM_BLOCK_DATA_KIDS = {"128x128": 8179, "32x32": 9179, "1x32": 9704}
 

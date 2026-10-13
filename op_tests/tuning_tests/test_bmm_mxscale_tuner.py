@@ -112,7 +112,7 @@ def test_invalid_shapes_rejected(tuner, column, value):
 
 
 def mock_data():
-    return tuple(Mock(name=f"tensor_{i}") for i in range(10))
+    return tuple(Mock(name=f"tensor_{i}") for i in range(8))
 
 
 def saved_row(kid=8477, block="128x128"):
@@ -134,7 +134,7 @@ def test_saved_opus_passes_all_operands(tuner, monkeypatch):
     monkeypatch.setattr(opus, "gen_bmm_mxscale_data", Mock(return_value=data))
     run, operands, ref = tuner._saved_benchmark(saved_row(), 7)
     assert run is opus.run_bmm_mxscale_bench
-    assert operands == tuple(data[i] for i in (0, 1, 2, 3, 4, 5, 7, 8, 9)) + (8477, 1)
+    assert operands == tuple(data[i] for i in (0, 1, 2, 3, 4, 5, 7)) + (8477, 1)
     assert ref is data[6]
     data[2].fill_.assert_called_once()
 
@@ -244,7 +244,7 @@ def test_task_operands_and_outputs(tuner, tmp_path):
     fly_tasks = [task for task in tasks if task[0][1] == -1]
     assert len(opus_tasks) == 1
     assert fly_tasks
-    assert opus_tasks[0][4] == ((0, 1, 2, 3, 4, 5, 7, 8, 9), 8477, 1)
+    assert opus_tasks[0][4] == ((0, 1, 2, 3, 4, 5, 7), 8477, 1)
     assert opus_tasks[0][7] == ([6],)
     assert opus_tasks[0][-1] == [2]
     assert all(task[7] == ([5],) and task[-1] == [4] for task in fly_tasks)
