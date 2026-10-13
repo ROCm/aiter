@@ -677,6 +677,48 @@ def build_hstu_attention_bwd_dvdk_pp(
                 )
             )
 
+        def addone_scalar(x):
+            """`1 + x` as a scalar `v_add_f32`, via inline asm.
+
+            There is no non-packable f32 add: `v_add_f32` pairs fold into
+            `v_pk_add_f32`, and every FMA/legacy rewrite folds back to the same
+            add. Inline asm is the only way to pin it scalar.
+
+            This one op is worth pinning. Measured in the V phase, `1 + emu` is
+            6 x `v_pk_add_f32` carrying 75.6 cy of stall each -- 451 cy of a
+            2356 cy phase (19%) -- while the OTHER packed opcode in the same
+            phase, on the same datapath, stalls 2.1 cy. The difference is not
+            the datapath, it is that a packed op is a JOIN: it cannot issue
+            until BOTH halves' `v_exp_f32` retire. Scalar, element j's add
+            fires on its own exp alone.
+            """
+            from flydsl._mlir import ir
+            from flydsl._mlir.dialects import llvm as _llvm
+
+            return fx.Float32(
+                _llvm.inline_asm(
+                    ir.F32Type.get(),
+                    [fx.Float32(x).ir_value()],
+                    # The `s_nop 0` is LOAD-BEARING. The operand is always a
+                    # `v_exp_f32` result, and a VALU trans op needs one
+                    # software wait state before a consumer reads it. The
+                    # compiler inserts that automatically -- but its hazard
+                    # recognizer treats INLINEASM as opaque and cannot see that
+                    # this block reads the exp's destination. Without the nop
+                    # the kernel reads a stale register: dv/dk max|err|/peak
+                    # 0.33 on ~0.3% of elements under the causal mask, while
+                    # the hstu mask still passed, so it is easy to miss.
+                    #
+                    # One wait state is exactly what is required, confirmed by
+                    # asking the compiler: llc -mcpu=gfx942 on
+                    # `fadd (llvm.amdgcn.exp2.f32 x), 1.0` emits
+                    # `v_exp_f32 / s_nop 0 / v_add_f32`.
+                    "s_nop 0\n\tv_add_f32 $0, 1.0, $1",
+                    "=v,v",
+                    has_side_effects=False,
+                )
+            )
+
         def rcp_scalar(x):
             """Scalar reciprocal, kept off the packed datapath."""
             return fx.Float32(
@@ -870,7 +912,7 @@ def build_hstu_attention_bwd_dvdk_pp(
                 # link, and the two multiplies now issue in parallel.
                 sc = [fmul_scalar(s[j], c_alpha) for j in rng]
                 emu = [exp2_f32(fmul_scalar(s[j], c_alpha_neg_log2e)) for j in rng]
-                sig = [rcp_scalar(c_one_f + emu[j]) for j in rng]
+                sig = [rcp_scalar(addone_scalar(emu[j])) for j in rng]
                 silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
                 # The second form is a subtract plus an FMA, against the first
