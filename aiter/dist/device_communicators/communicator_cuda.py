@@ -413,9 +413,9 @@ class CudaCommunicator(DeviceCommunicatorBase):
     ):
         # quant_type arrives already canonicalized to a string ("per_token"/
         # "per_group"/"mxfp4") from the public API.
-        if gemma_norm and quant_type != "per_token":
+        if gemma_norm and quant_type not in ("per_token", "per_group"):
             raise NotImplementedError(
-                "gemma_norm fused quant currently supports per-token FP8 only"
+                "gemma_norm fused quant supports per-token and per-group FP8 only"
             )
         if quant_type == "per_group":
             return self.fused_allreduce_rmsnorm_quant_per_group(
@@ -427,6 +427,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 prefill_support=prefill_support,
                 emit_bf16=emit_bf16,
                 transpose_scale=transpose_scale,
+                gemma_norm=gemma_norm,
             )
         if quant_type == "mxfp4":
             return self.fused_allreduce_rmsnorm_mxfp4_quant(
@@ -517,9 +518,13 @@ class CudaCommunicator(DeviceCommunicatorBase):
         prefill_support: bool = False,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
         """Fused AR+RMSNorm+per-group FP8 quant, optionally also emitting the
         pre-quantization bf16/fp16 normed output.
+
+        ``gemma_norm`` normalizes with ``x * (1 + w)`` (Gemma / Qwen3.5 style)
+        from the raw ``weight_``; the ``+ 1`` happens in fp32 inside the kernel.
 
         When ``emit_bf16=False`` returns ``(fp8, residual_out, scale)``.
         When ``emit_bf16=True`` returns ``(fp8, residual_out, scale, bf16)`` —
@@ -556,6 +561,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                     use_1stage,
                     emit_bf16=emit_bf16,
                     transpose_scale=transpose_scale,
+                    gemma_norm=gemma_norm,
                 )
                 if result is not None:
                     if emit_bf16:
@@ -567,7 +573,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 pass
         if not fused_ok:
             out_, res_out = self.fused_allreduce_rmsnorm(
-                input_, res_inp_, weight_, eps, prefill_support
+                input_, res_inp_, weight_, eps, prefill_support, gemma_norm=gemma_norm
             )
             hip_quant = get_hip_quant(QuantType.per_1x128)
             # The fused path and the registered op's fake return the per-group

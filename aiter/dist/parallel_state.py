@@ -259,6 +259,7 @@ def fused_allreduce_rmsnorm_quant_per_group_fake(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Meta/fake for the fused AR+RMSNorm+per-group-FP8-quant op.
 
@@ -275,6 +276,7 @@ def fused_allreduce_rmsnorm_quant_per_group_fake(
     """
     from aiter.utility.dtypes import fp8
 
+    del gemma_norm
     M = inp.shape[0]
     K = inp.shape[-1]
     num_groups = K // group_size
@@ -299,13 +301,21 @@ def fused_allreduce_rmsnorm_quant_per_group_(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
     if group is None:
         raise ValueError(f"Group {group_name} is destroyed.")
     return group._fused_allreduce_rmsnorm_quant_per_group_out_place(
-        inp, res_inp, w, eps, group_size, prefill_support, transpose_scale
+        inp,
+        res_inp,
+        w,
+        eps,
+        group_size,
+        prefill_support,
+        transpose_scale,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -318,6 +328,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Meta/fake for fused AR+RMSNorm+per-group-FP8-quant with emit_bf16.
 
@@ -328,6 +339,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_fake(
     """
     from aiter.utility.dtypes import fp8
 
+    del gemma_norm
     M = inp.shape[0]
     K = inp.shape[-1]
     num_groups = K // group_size
@@ -353,6 +365,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
     group_size: int = 128,
     prefill_support: bool = False,
     transpose_scale: bool = False,
+    gemma_norm: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     assert group_name in _groups, f"Group {group_name} is not found."
     group = _groups[group_name]()
@@ -367,6 +380,7 @@ def fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
         prefill_support,
         transpose_scale,
         emit_bf16=True,
+        gemma_norm=gemma_norm,
     )
 
 
@@ -865,6 +879,7 @@ class GroupCoordinator:
         prefill_support: bool = False,
         emit_bf16: bool = False,
         transpose_scale: bool = False,
+        gemma_norm: bool = False,
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -889,6 +904,7 @@ class GroupCoordinator:
                 group_size=group_size,
                 prefill_support=prefill_support,
                 transpose_scale=transpose_scale,
+                gemma_norm=gemma_norm,
             )
         return fused_allreduce_rmsnorm_quant_per_group_emit_bf16_(
             input_,
@@ -899,6 +915,7 @@ class GroupCoordinator:
             group_size=group_size,
             prefill_support=prefill_support,
             transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
 
     def fused_qknorm_allreduce(
@@ -1012,6 +1029,7 @@ class GroupCoordinator:
         prefill_support: bool = False,
         transpose_scale: bool = False,
         emit_bf16: bool = False,
+        gemma_norm: bool = False,
     ):
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
@@ -1024,6 +1042,7 @@ class GroupCoordinator:
             prefill_support=prefill_support,
             transpose_scale=transpose_scale,
             emit_bf16=emit_bf16,
+            gemma_norm=gemma_norm,
         )
 
     def _fused_qknorm_allreduce_out_place(

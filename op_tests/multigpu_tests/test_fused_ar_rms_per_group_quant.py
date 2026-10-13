@@ -216,6 +216,7 @@ def _run_per_group_quant_case(
     group_size,
     emit_bf16,
     transpose_scale,
+    gemma_norm=False,
 ):
     """Run one fused AR+RMSNorm+per-group-quant case on an initialized rank.
 
@@ -242,12 +243,22 @@ def _run_per_group_quant_case(
     gen = torch.Generator(device="cuda").manual_seed(case_idx)
     x = torch.randn(shape, dtype=dtype, device="cuda", generator=gen)
     weight = torch.randn((shape[1],), dtype=dtype, device="cuda", generator=gen)
-    ref = F.rms_norm(
-        input=x * tp_size + x,
-        normalized_shape=(shape[1],),
-        weight=weight,
-        eps=eps,
-    )
+    if gemma_norm:
+        # Gemma / Qwen3.5 norm: x * (1 + w) from the raw weight, the + 1 in fp32
+        # as the kernel does it.
+        ref = F.rms_norm(
+            input=(x * tp_size + x).float(),
+            normalized_shape=(shape[1],),
+            weight=weight.float() + 1.0,
+            eps=eps,
+        ).to(dtype)
+    else:
+        ref = F.rms_norm(
+            input=x * tp_size + x,
+            normalized_shape=(shape[1],),
+            weight=weight,
+            eps=eps,
+        )
 
     @perftest()
     def run_fused(x):
@@ -260,6 +271,7 @@ def _run_per_group_quant_case(
             group_size=group_size,
             emit_bf16=emit_bf16,
             transpose_scale=transpose_scale,
+            gemma_norm=gemma_norm,
         )
         if emit_bf16:
             out, res_out, scale_out, bf16_out = res
@@ -308,7 +320,7 @@ def _run_per_group_quant_case(
     msg = (
         f"test_fused_ar_rmsnorm_per_group_quant: rank={rankID} "
         f"{shape=} {dtype=} {group_size=} "
-        f"{emit_bf16=} {transpose_scale=} {us:>8.2f}"
+        f"{emit_bf16=} {transpose_scale=} {gemma_norm=} {us:>8.2f}"
     )
     err = checkAllclose(ref, dequant.to(dtype), msg=msg, atol=5e-2, rtol=5e-2)
     return {
@@ -361,6 +373,7 @@ def fused_ar_rmsnorm_per_group_quant_sweep(
             case["group_size"],
             case["emit_bf16"],
             case["transpose_scale"],
+            case.get("gemma_norm", False),
         )
         for case_idx, case in enumerate(cases)
     ]
@@ -425,6 +438,7 @@ def check_per_group_quant_case(tp_size, dtype, case, rank_results):
         "withGraph": case["withGraph"],
         "emit_bf16": emit_bf16,
         "transpose_scale": transpose_scale,
+        "gemma_norm": case.get("gemma_norm", False),
         "per_group_min_us": min(all_us),
         "per_group_max_us": max(all_us),
         "per_group_err": max_err,
@@ -503,6 +517,9 @@ l_emit_bf16 = [False, True]
 # column-major (transpose_scale=True, what gemm_a8w8_blockscale_preshuffle
 # consumes). Both must reproduce the same reference dequant.
 l_transpose_scale = [False, True]
+# Plain RMSNorm (x * w) and Gemma RMSNorm (x * (1 + w), Qwen3.5) from the raw
+# weight; every kernel path (1-stage / 2-stage / split) takes either.
+l_gemma_norm = [False, True]
 
 parser = argparse.ArgumentParser(
     description="Test fused AR+RMSNorm+per-group FP8 quant"
@@ -583,6 +600,16 @@ parser.add_argument(
         "(transpose_scale) only. Default sweeps both."
     ),
 )
+parser.add_argument(
+    "--gemma-norm",
+    type=int,
+    choices=[0, 1],
+    nargs="?",
+    const=None,
+    default=None,
+    help="Pin the norm: 0 = x * w only, 1 = Gemma x * (1 + w) only. "
+    "Default sweeps both.",
+)
 
 if __name__ == "__main__":
     freeze_support()
@@ -610,6 +637,8 @@ if __name__ == "__main__":
         l_group_size = [args.group_size]
     if args.transpose_scale is not None:
         l_transpose_scale = [bool(args.transpose_scale)]
+    if args.gemma_norm is not None:
+        l_gemma_norm = [bool(args.gemma_norm)]
 
     # ``--sweep-group-size`` replaces the default matrix with the cross
     # product of every supported group_size (power-of-two tpg on bf16)
@@ -630,9 +659,17 @@ if __name__ == "__main__":
             "group_size": gs,
             "emit_bf16": emit_bf16,
             "transpose_scale": transpose_scale,
+            "gemma_norm": gemma_norm,
         }
-        for shape, graph_on, gs, emit_bf16, transpose_scale in itertools.product(
-            l_shape, l_graph, l_group_size, l_emit_bf16, l_transpose_scale
+        for shape, graph_on, gs, emit_bf16, transpose_scale, gemma_norm in (
+            itertools.product(
+                l_shape,
+                l_graph,
+                l_group_size,
+                l_emit_bf16,
+                l_transpose_scale,
+                l_gemma_norm,
+            )
         )
     ]
     df = []
@@ -648,6 +685,7 @@ if __name__ == "__main__":
         "withGraph",
         "emit_bf16",
         "transpose_scale",
+        "gemma_norm",
         "per_group_min_us",
         "per_group_max_us",
         "per_group_err",
