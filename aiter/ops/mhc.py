@@ -121,26 +121,32 @@ def mhc_pre_big_fuse_rmsnorm(
 # its next_residual write use this layout, so it stays internal to a stack of layers:
 # only the first residual in and the last one out need converting.
 MHC_RES_KS = 32
+# Block width of the residual layout the gfx1250 Gluon mhc_post_pre path reads and
+# writes (its k-step); the HIP kernels keep MHC_RES_KS. Shuffle with ks= this value
+# for the Gluon path.
+MHC_RES_KS_GLUON = 64
 
 
-def _validate_mhc_res_input(x: torch.Tensor) -> tuple[int, int, int]:
+def _validate_mhc_res_input(
+    x: torch.Tensor, ks: int = MHC_RES_KS
+) -> tuple[int, int, int]:
     assert x.dim() == 3, f"expected a 3D residual, got {x.dim()}D"
     assert x.is_cuda, "residual must be on GPU"
     assert x.is_contiguous(), "residual must be contiguous"
     assert x.dtype in (torch.bfloat16, torch.float16)
     m, hc_mult, hidden_size = x.shape
     assert m > 0 and hc_mult > 0
-    assert hidden_size % MHC_RES_KS == 0
+    assert hidden_size % ks == 0
     return m, hc_mult, hidden_size
 
 
 @functools.cache
 def _get_compiled_mhc_res_layout(
-    kind: str, hidden_size: int, hc_mult: int, itemsize: int
+    kind: str, hidden_size: int, hc_mult: int, itemsize: int, ks: int = MHC_RES_KS
 ):
     from aiter.ops.flydsl.kernels.mhc_res_layout import build_mhc_res_layout_module
 
-    return build_mhc_res_layout_module(kind, hidden_size, hc_mult, MHC_RES_KS, itemsize)
+    return build_mhc_res_layout_module(kind, hidden_size, hc_mult, ks, itemsize)
 
 
 def _run_mhc_res_layout(
@@ -150,6 +156,7 @@ def _run_mhc_res_layout(
     m: int,
     hc_mult: int,
     hidden_size: int,
+    ks: int = MHC_RES_KS,
 ) -> None:
     from aiter.ops.flydsl.kernels.mhc_res_layout import to_shuffled_row_blocks
     from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
@@ -159,13 +166,13 @@ def _run_mhc_res_layout(
     assert (
         m * hc_mult * hidden_size * itemsize < 2**32
     ), "residual exceeds the 4GiB a buffer descriptor can address"
-    launcher = _get_compiled_mhc_res_layout(kind, hidden_size, hc_mult, itemsize)
+    launcher = _get_compiled_mhc_res_layout(kind, hidden_size, hc_mult, itemsize, ks)
     _run_compiled(
         launcher,
         src,
         dst,
         m,
-        to_shuffled_row_blocks(m, MHC_RES_KS, itemsize),
+        to_shuffled_row_blocks(m, ks, itemsize),
         torch.cuda.current_stream(src.device),
     )
 
@@ -173,6 +180,7 @@ def _run_mhc_res_layout(
 def mhc_res_repeat_flydsl(
     hidden_states: torch.Tensor,
     hc_mult: int,
+    ks: int = MHC_RES_KS,
 ) -> torch.Tensor:
     assert hidden_states.dim() == 2
     assert hidden_states.is_cuda
@@ -180,7 +188,7 @@ def mhc_res_repeat_flydsl(
     assert hidden_states.dtype in (torch.bfloat16, torch.float16)
     m, hidden_size = hidden_states.shape
     assert m > 0 and hc_mult > 0
-    assert hidden_size % MHC_RES_KS == 0
+    assert hidden_size % ks == 0
 
     out = torch.empty(
         m,
@@ -189,21 +197,25 @@ def mhc_res_repeat_flydsl(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    _run_mhc_res_layout("repeat", hidden_states, out, m, hc_mult, hidden_size)
+    _run_mhc_res_layout("repeat", hidden_states, out, m, hc_mult, hidden_size, ks)
     return out
 
 
-def mhc_res_shuffle_flydsl(residual: torch.Tensor) -> torch.Tensor:
-    m, hc_mult, hidden_size = _validate_mhc_res_input(residual)
+def mhc_res_shuffle_flydsl(
+    residual: torch.Tensor, ks: int = MHC_RES_KS
+) -> torch.Tensor:
+    m, hc_mult, hidden_size = _validate_mhc_res_input(residual, ks)
     out = torch.empty_like(residual)
-    _run_mhc_res_layout("shuffle", residual, out, m, hc_mult, hidden_size)
+    _run_mhc_res_layout("shuffle", residual, out, m, hc_mult, hidden_size, ks)
     return out
 
 
-def mhc_res_unshuffle_flydsl(shuffled: torch.Tensor) -> torch.Tensor:
-    m, hc_mult, hidden_size = _validate_mhc_res_input(shuffled)
+def mhc_res_unshuffle_flydsl(
+    shuffled: torch.Tensor, ks: int = MHC_RES_KS
+) -> torch.Tensor:
+    m, hc_mult, hidden_size = _validate_mhc_res_input(shuffled, ks)
     out = torch.empty_like(shuffled)
-    _run_mhc_res_layout("unshuffle", shuffled, out, m, hc_mult, hidden_size)
+    _run_mhc_res_layout("unshuffle", shuffled, out, m, hc_mult, hidden_size, ks)
     return out
 
 
@@ -235,20 +247,22 @@ def _check_mhc_res_preshuffle_arch(shuffled: bool, arch: str) -> None:
         )
 
 
-def mhc_res_layout_fake(residual: torch.Tensor) -> torch.Tensor:
+def mhc_res_layout_fake(residual: torch.Tensor, ks: int = MHC_RES_KS) -> torch.Tensor:
     return torch.empty_like(residual)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
-def mhc_res_shuffle(residual: torch.Tensor) -> torch.Tensor:
-    """res[row][head][k] -> resS[k//KS][head][row][k%KS], same shape."""
-    return mhc_res_shuffle_flydsl(residual)
+def mhc_res_shuffle(residual: torch.Tensor, ks: int = MHC_RES_KS) -> torch.Tensor:
+    """res[row][head][k] -> resS[k//ks][head][row][k%ks], same shape. ks: the
+    consumer's block width (MHC_RES_KS for HIP, MHC_RES_KS_GLUON for Gluon)."""
+    return mhc_res_shuffle_flydsl(residual, ks)
 
 
 def mhc_res_repeat_fake(
     hidden_states: torch.Tensor,
     hc_mult: int,
     res_preshuffle: bool = False,
+    ks: int = MHC_RES_KS,
 ) -> torch.Tensor:
     return torch.empty(
         hidden_states.size(0),
@@ -264,6 +278,7 @@ def mhc_res_repeat(
     hidden_states: torch.Tensor,
     hc_mult: int,
     res_preshuffle: bool = False,
+    ks: int = MHC_RES_KS,
 ) -> torch.Tensor:
     """Repeat ``[m, hidden]`` into an mHC residual, optionally pre-shuffled.
 
@@ -279,13 +294,13 @@ def mhc_res_repeat(
     if not res_preshuffle or not mhc_res_shuffle_enabled(m):
         return hidden_states.unsqueeze(-2).repeat(1, hc_mult, 1)
 
-    return mhc_res_repeat_flydsl(hidden_states, hc_mult)
+    return mhc_res_repeat_flydsl(hidden_states, hc_mult, ks)
 
 
 @torch_compile_guard(mutates_args=[], gen_fake=mhc_res_layout_fake)
-def mhc_res_unshuffle(shuffled: torch.Tensor) -> torch.Tensor:
-    """Inverse of :func:`mhc_res_shuffle`."""
-    return mhc_res_unshuffle_flydsl(shuffled)
+def mhc_res_unshuffle(shuffled: torch.Tensor, ks: int = MHC_RES_KS) -> torch.Tensor:
+    """Inverse of :func:`mhc_res_shuffle` (same ks)."""
+    return mhc_res_unshuffle_flydsl(shuffled, ks)
 
 
 @functools.lru_cache(maxsize=1024)
