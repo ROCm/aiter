@@ -538,6 +538,11 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 continue
             for i in sorted(pipe.kernels_list.keys()):
                 ki = pipe.kernels_list[i]
+                # Existing preshuffle instances are dtype-generic despite their
+                # legacy fp8 name tokens.  Explicit INT8-only instances (the
+                # experimental LDS-stage-3 path) must not enter an fp8 tune.
+                if getattr(ki, "q_dtype_w", None) == "int8" and q_dtype_name != "int8":
+                    continue
                 if not pipe.fits(ki, M, N, K):
                     continue
                 for ks in [1] + (

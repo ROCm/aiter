@@ -45,7 +45,7 @@ class kernelInstance:
     use_async_copy: int  # 0 or 1
     waves_per_eu: int  # 0=no hint, 1-4=occupancy limit
     xcd_swizzle: int  # 0=off, >0=group size for XCD remap
-    lds_stage: int = 2  # 2=double-buffer ping-pong, 1=single A-LDS buffer (half LDS)
+    lds_stage: int = 2  # 1=single, 2=ping-pong, 3=experimental gfx950 INT8 ring
     sScheduler: str = "Default"  # scheduler hints on; "Off" = compiler default
     k_split: int = 1  # >1 splits the K loop over gridDim.z (fp32 workspace + reduce)
 
@@ -140,17 +140,15 @@ def preshuffle_gemm_estimated_lds_bytes(
     """Estimated total LDS (bytes) for preshuffle_gemm: sum of smem globals.
 
     Mirrors ``preshuffle_gemm.py`` A-tile allocation (``SharedStorage`` holds
-    ``lds_stage`` × ``tile_m x tile_k`` buffers: 2 for ping-pong, 1 for the
-    single-buffer path); used to skip tune instances that exceed AMDGPU
-    per-kernel LDS limits (e.g. 64 KiB on gfx942).
+    one, two, or three ``tile_m x tile_k`` buffers); used to skip tune instances
+    that exceed AMDGPU per-kernel LDS limits (e.g. 64 KiB on gfx942).
     """
     elem_bytes = 1 if in_dtype in ("fp8", "int8") else 2
     a_tile_bytes = int(tile_m) * int(tile_k) * elem_bytes
 
-    # lds_stage A-tile buffers, each finalized to a 128B-aligned smem global.
-    return _smem_finalize_size(_smem_align(a_tile_bytes)) * (
-        2 if int(lds_stage) == 2 else 1
-    )
+    # Each A-tile array is finalized to a 128B-aligned smem global.
+    stage_count = 3 if int(lds_stage) == 3 else (2 if int(lds_stage) == 2 else 1)
+    return _smem_finalize_size(_smem_align(a_tile_bytes)) * stage_count
 
 
 def kernel_instance_estimated_lds_bytes(ki: kernelInstance) -> int:
@@ -349,7 +347,7 @@ def k_split_candidates(ki, M: int, N: int, K: int, cu_num: int = 256) -> list[in
     the reduce pass. That bound also caps the fp32 workspace, since for a given
     tile grid it caps M.
     """
-    if ki.k_split != 1 or K % ki.tile_k:
+    if ki.k_split != 1 or ki.lds_stage == 3 or K % ki.tile_k:
         return []
     if N % ki.tile_n:
         return []
@@ -399,6 +397,20 @@ kernels_list_950.update(
         total_vgpr=_vgpr_per_simd("gfx950"),
         start_idx=max(kernels_list_950) + 1,
     )
+)
+# One deliberately narrow experimental candidate.  It is not a default and
+# cannot affect dispatch until a tuning result explicitly names it.
+_stage3_kernel_id = max(kernels_list_950) + 1
+kernels_list_950[_stage3_kernel_id] = _ki(
+    128,
+    128,
+    128,
+    async_copy=1,
+    waves_per_eu=0,
+    xcd_swizzle=8,
+    lds_stage=3,
+    q_dtype_a="int8",
+    q_dtype_w="int8",
 )
 # fmt: on
 

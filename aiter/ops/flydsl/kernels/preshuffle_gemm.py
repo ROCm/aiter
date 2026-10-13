@@ -162,8 +162,8 @@ def compile_preshuffle_gemm(
         raise ValueError(
             f"epilogue must be none/bias/bias_relu/bias_silu/bias_gelu, got {epilogue!r}"
         )
-    if lds_stage not in (1, 2):
-        raise ValueError(f"lds_stage must be 1 or 2, got {lds_stage}")
+    if lds_stage not in (1, 2, 3):
+        raise ValueError(f"lds_stage must be 1, 2, or 3, got {lds_stage}")
     if N % 16 != 0:
         raise ValueError(f"N must be a multiple of 16 for preshuffled B, got N={N}")
     if tile_n != 32 and tile_n % 64 != 0:
@@ -196,6 +196,19 @@ def compile_preshuffle_gemm(
     gpu_arch = get_rocm_arch()
     is_gfx942 = str(gpu_arch).startswith("gfx942")
     is_gfx950 = str(gpu_arch).startswith("gfx950")
+    if lds_stage == 3 and not (
+        is_gfx950
+        and is_int8
+        and tile_m in (128, 256)
+        and (tile_n, tile_k) == (128, 128)
+        and use_async_copy
+        and split_k == 1
+    ):
+        raise ValueError(
+            "lds_stage=3 is experimental and requires gfx950 true INT8, "
+            "tile_m=128|256, tile_n/tile_k=128/128, "
+            "use_async_copy=True, and split_k=1"
+        )
     use_mfma_scale_128 = is_fp8 and is_gfx950 and (tile_k % 128 == 0)
     use_mfma_k32 = is_f16_or_bf16 and is_gfx950
 
@@ -240,6 +253,9 @@ def compile_preshuffle_gemm(
         a0: fx.Array[layout_elem, a_lds_elems, 16]
         if lds_stage == 2:
             a1: fx.Array[layout_elem, a_lds_elems, 16]
+        if lds_stage == 3:
+            a1: fx.Array[layout_elem, a_lds_elems, 16]
+            a2: fx.Array[layout_elem, a_lds_elems, 16]
         if split_k > 1:
             split_flag: fx.Array[Int32, 1, 4]
 
@@ -361,8 +377,10 @@ def compile_preshuffle_gemm(
 
         if const_expr(lds_stage == 1):
             sA_stages = [_make_sA(lds.a0)]
-        else:
+        elif const_expr(lds_stage == 2):
             sA_stages = [_make_sA(lds.a0), _make_sA(lds.a1)]
+        else:
+            sA_stages = [_make_sA(lds.a0), _make_sA(lds.a1), _make_sA(lds.a2)]
 
         # Partitions
         pA_g = thr_g2s.partition_S(tA)
@@ -407,6 +425,9 @@ def compile_preshuffle_gemm(
             sA_i8_ptr = [fx.recast_iter(Int8, lds.a0.ptr)]
             if const_expr(lds_stage == 2):
                 sA_i8_ptr.append(fx.recast_iter(Int8, lds.a1.ptr))
+            elif const_expr(lds_stage == 3):
+                sA_i8_ptr.append(fx.recast_iter(Int8, lds.a1.ptr))
+                sA_i8_ptr.append(fx.recast_iter(Int8, lds.a2.ptr))
             bx_m = bid_x * tile_m
             wave_id = tid // 64
             step_bytes = total_threads * a_load_bytes
@@ -550,6 +571,48 @@ def compile_preshuffle_gemm(
 
             rocdl.sched_barrier(0)
 
+        def hot_loop_scheduler_3stage(stage_gmem_loads: int):
+            # Stage 3 is gfx950 INT8-only.  A steady-state scheduling region
+            # contains the B refill emitted after the preceding region plus the
+            # current two-ahead A DMA.  The first region contains only the A DMA.
+            mfma_group = num_acc_n
+            num_mfma_per_tile_k = tile_k // 32
+            mfma_total = num_mfma_per_tile_k * m_repeat * mfma_group
+            dsrd_preload_eff = min(int(dsrd_preload), num_ds_load)
+            dvmem_preload_eff = min(int(dvmem_preload), stage_gmem_loads)
+            vmem_remaining = stage_gmem_loads - dvmem_preload_eff
+            dsrd_remaining = num_ds_load - dsrd_preload_eff
+            if const_expr(vmem_remaining > 0 and vmem_remaining < mfma_total):
+                vmem_schedule = build_scheduler(vmem_remaining, vmem_remaining) + [
+                    0
+                ] * (mfma_total - vmem_remaining)
+            else:
+                vmem_schedule = build_scheduler(vmem_remaining, mfma_total)
+            dsrd_schedule = build_scheduler(dsrd_remaining, mfma_total)
+            idx_ds_read = dsrd_preload_eff
+            idx_gmem_load = dvmem_preload_eff
+            if const_expr(dvmem_preload_eff):
+                rocdl.sched_vmem(dvmem_preload_eff)
+            if const_expr(dsrd_preload_eff):
+                rocdl.sched_dsrd(dsrd_preload_eff)
+            for mfma_idx in range_constexpr(mfma_total):
+                rocdl.sched_mfma(1)
+                n_dsrd = dsrd_schedule[mfma_idx]
+                if const_expr(n_dsrd and (idx_ds_read < num_ds_load)):
+                    if const_expr(idx_ds_read + n_dsrd > num_ds_load):
+                        n_dsrd = num_ds_load - idx_ds_read
+                    if const_expr(n_dsrd):
+                        rocdl.sched_dsrd(n_dsrd)
+                        idx_ds_read += n_dsrd
+                n_vmem = vmem_schedule[mfma_idx]
+                if const_expr(n_vmem and (idx_gmem_load < stage_gmem_loads)):
+                    if const_expr(idx_gmem_load + n_vmem > stage_gmem_loads):
+                        n_vmem = stage_gmem_loads - idx_gmem_load
+                    if const_expr(n_vmem):
+                        rocdl.sched_vmem(n_vmem)
+                        idx_gmem_load += n_vmem
+            rocdl.sched_barrier(0)
+
         # ── Pipeline stage (double-buffered B via split fragments) ─
         def mma_kloop(a_stage, cur_frag_B):
             for ki in range_constexpr(k_iters):
@@ -604,6 +667,34 @@ def compile_preshuffle_gemm(
             if const_expr(do_next):
                 gpu.barrier()
 
+        def pipeline_3stage(tile_idx: int):
+            # A is two tiles ahead in a three-slot LDS ring.  B remains a
+            # two-fragment ping-pong: refill the current fragment only after its
+            # final MFMA use, then carry that VMEM through the next scheduling
+            # region.  The preceding workgroup barrier makes the recycled A slot
+            # safe before this iteration starts its direct HBM->LDS DMA.
+            refill_tile = tile_idx + 2
+            a_read_stage = tile_idx % 3
+            a_write_stage = refill_tile % 3
+            b_stage = tile_idx % 2
+            dma_a_to_lds(fx.Int32(refill_tile), a_write_stage)
+            mma_kloop(a_read_stage, frag_B_stages[b_stage])
+            if const_expr(enable_scheduler):
+                hot_loop_scheduler_3stage(
+                    num_a_loads if tile_idx == 0 else num_gmem_loads
+                )
+            else:
+                rocdl.sched_barrier(0)
+            fx.copy(
+                buf_copy,
+                pB_g[None, None, None, k_off + fx.Int32(refill_tile)],
+                frag_B_retile_stages[b_stage],
+            )
+            # The B refill is newest, so leaving num_b_loads outstanding drains
+            # the A DMA before the barrier while retaining B overlap.
+            rocdl.s_waitcnt(num_b_loads)
+            gpu.barrier()
+
         # ── Prologue ──────────────────────────────────────────────
         acc_zero = (
             Vec.filled(acc_size, 0, Int32)
@@ -611,11 +702,33 @@ def compile_preshuffle_gemm(
             else Vec.filled(acc_size, 0.0, Float32)
         )
         if const_expr(use_async_copy):
-            dma_a_to_lds(fx.Int32(0), 0)
-            fx.copy(buf_copy, pB_g[None, None, None, k_off], frag_B_retile_stages[0])
-            frag_C.store(acc_zero)
-            rocdl.s_waitcnt(num_b_loads)
-            gpu.barrier()
+            if const_expr(lds_stage == 3):
+                dma_a_to_lds(fx.Int32(0), 0)
+                fx.copy(
+                    buf_copy,
+                    pB_g[None, None, None, k_off],
+                    frag_B_retile_stages[0],
+                )
+                if const_expr(num_tiles > 1):
+                    dma_a_to_lds(fx.Int32(1), 1)
+                    fx.copy(
+                        buf_copy,
+                        pB_g[None, None, None, k_off + fx.Int32(1)],
+                        frag_B_retile_stages[1],
+                    )
+                frag_C.store(acc_zero)
+                rocdl.s_waitcnt(0)
+                gpu.barrier()
+            else:
+                dma_a_to_lds(fx.Int32(0), 0)
+                fx.copy(
+                    buf_copy,
+                    pB_g[None, None, None, k_off],
+                    frag_B_retile_stages[0],
+                )
+                frag_C.store(acc_zero)
+                rocdl.s_waitcnt(num_b_loads)
+                gpu.barrier()
         else:
             fx.copy(buf_copy, pA_g[None, None, None, k_off], frag_copy_A)
             fx.copy(buf_copy, pB_g[None, None, None, k_off], frag_B_retile_stages[0])
@@ -677,6 +790,25 @@ def compile_preshuffle_gemm(
                 pipeline_2stage(
                     read_stage=(k_tail0 + j) % 2, next_k_val=fx.Int32(k_tail0 + j + 1)
                 )
+        elif const_expr(lds_stage == 3):
+            # Leave the final tile for the epilogue-overlap point below.  The
+            # steady state computes tile i while filling A/B for tile i+2.
+            for tile_idx in range_constexpr(max(num_tiles - 2, 0)):
+                pipeline_3stage(tile_idx)
+            if const_expr(num_tiles > 1):
+                penultimate = num_tiles - 2
+                mma_kloop(
+                    penultimate % 3,
+                    frag_B_stages[penultimate % 2],
+                )
+                if const_expr(enable_scheduler):
+                    hot_loop_scheduler_3stage(num_b_loads if num_tiles > 2 else 0)
+                else:
+                    rocdl.sched_barrier(0)
+                if const_expr(num_tiles > 2):
+                    # The final B refill followed the last steady-state scheduling
+                    # barrier; drain it before the epilogue-overlapped final MMA.
+                    rocdl.s_waitcnt(0)
 
         # ── Epilogue-operand preloads (scale_a / scale_b / bias) ─────────
         bx_m = bid_x * tile_m
@@ -775,8 +907,13 @@ def compile_preshuffle_gemm(
         # Final MMA stage — overlaps the epilogue-operand loads when issued above.
         if const_expr(lds_stage == 1):
             mma_kloop(0, frag_B_stages[0])
-        else:
+        elif const_expr(lds_stage == 2):
             pipeline_2stage(read_stage=(num_tiles - 1) % 2, read_next=False)
+        else:
+            mma_kloop(
+                (num_tiles - 1) % 3,
+                frag_B_stages[(num_tiles - 1) % 2],
+            )
 
         # ── Epilogue ─────────────────────────────────────────────
         if const_expr(not is_8bit and not _has_epilogue):
