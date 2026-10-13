@@ -356,6 +356,13 @@ def topk_per_row_radix_stream_lds_plan(
     return None
 
 
+def _window_cap(k: int, block_threads: int, vec: int, unroll: int, soft_trigger: int):
+    """The initial candidate window: k plus the arrivals region, rounded down
+    to whole vectors (the build says why down). One derivation, which both the
+    build and `topk_per_row_radix_stream_window_cap` take."""
+    return ((k + soft_trigger + unroll * block_threads * vec) // vec) * vec
+
+
 def topk_per_row_radix_stream_window_cap(
     k: int,
     block_threads: int = _BLOCK_THREADS,
@@ -363,7 +370,9 @@ def topk_per_row_radix_stream_window_cap(
     vec: int = _VEC,
     lds_plan: tuple[int, int] | None = None,
 ) -> int:
-    """Maximum row width that completes in the initial candidate window."""
+    """Maximum row width that completes in the initial candidate window, the
+    widest a `terminal` build may be given; its `topk_stream_config` reports
+    the same `window_cap`."""
     lds_budgets = lds_budgets or _lds_budgets()
     resolved = _resolve_lds(k, block_threads, lds_budgets, vec, plan=lds_plan)
     if resolved is None:
@@ -372,8 +381,7 @@ def topk_per_row_radix_stream_window_cap(
             f"k={k}, block_threads={block_threads}"
         )
     unroll, soft_trigger = resolved
-    capacity = k + soft_trigger + unroll * block_threads * vec
-    return (capacity // vec) * vec
+    return _window_cap(k, block_threads, vec, unroll, soft_trigger)
 
 
 @lru_cache(maxsize=64)
@@ -449,7 +457,9 @@ def build_topk_per_row_radix_stream_module(
     the two modes are exclusive.
 
     `terminal` is for an unsplit row that fits wholly in the initial candidate
-    window. There is no later tile to consume the selected keys, so compact can
+    window, at most `topk_per_row_radix_stream_window_cap` columns: it has no
+    loop past the window, so a wider row would lose its tail. There is no later
+    tile to consume the selected keys, so compact can
     write each winning column directly to the output and omit the survivor
     copy, threshold publication, final coalesced copy, and their two barriers.
     """
@@ -487,7 +497,7 @@ def build_topk_per_row_radix_stream_module(
     # was exactly the k whose `capacity` was not: k=1, 2, 3, 5, 6, 7 returned 56
     # to 64 wrong rows in 64 at 32768 columns, and k=4, 8, 12, 16 were clean.
     # Rounding down rather than up keeps it inside the buffer.
-    window_cap = (capacity // vec) * vec
+    window_cap = _window_cap(k, block_threads, vec, unroll, soft_trigger)
 
     @fx.struct
     class SharedStorage:

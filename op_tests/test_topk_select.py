@@ -497,6 +497,48 @@ def test_lds_sizing():
     return failures
 
 
+def test_terminal_window():
+    """`stream` drops its loop past the initial window (`terminal`) only for
+    rows that fit it. The width the dispatch decides on and the width the
+    build holds come from one derivation; this holds them to each other and
+    checks the selection on both sides of the edge."""
+    import aiter.ops.topk_select as ts
+
+    failures = []
+    if get_gfx() != "gfx950":
+        return failures
+    k, dev = 2048, torch.cuda.current_device()
+    budgets = ts._lds_budgets(_device_arch(dev))
+    for rows in (8, 64, 512):
+        bt = st.topk_per_row_radix_stream_block_threads(rows, k)
+        plan = st.topk_per_row_radix_stream_lds_plan(rows, 4 * k, k)
+        cap = st.topk_per_row_radix_stream_window_cap(k, bt, budgets, lds_plan=plan)
+        cfg = st.build_topk_per_row_radix_stream_module(
+            k, 64, terminal=True, block_threads=bt, lds_budgets=budgets, lds_plan=plan
+        ).topk_stream_config
+        whole = cfg["capacity"] // cfg["vec"] * cfg["vec"]
+        if not cap == cfg["window_cap"] == whole:
+            failures.append(
+                f"{rows} rows: dispatch asks {cap}, build holds {cfg['window_cap']}, "
+                f"its buffer {cfg['capacity']} rounds to {whole}"
+            )
+        for width in (cap, cap + st._VEC):
+            if st.topk_per_row_radix_stream_lds_plan(rows, width, k) != plan:
+                continue  # another plan, another window; not this edge
+            torch.manual_seed(width)
+            x = torch.randn(rows, width, dtype=dtypes.fp32)
+            lens = torch.full((rows,), width, dtype=dtypes.i32)
+            try:
+                idx = _run_single_backend(x, lens, k, "stream")
+            except _NotServed:
+                continue
+            if not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+                failures.append(f"{rows}x{width} (cap {cap}): wrong selection")
+    for label in failures:
+        aiter.logger.error("TERMINAL WINDOW FAILED: %s", label)
+    return failures
+
+
 def test_invariants(m, n, k):
     """The properties a value comparison cannot see."""
     failures = []
@@ -645,6 +687,11 @@ def main():
     aiter.logger.info(
         "LDS sizing: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
+    bad = test_terminal_window()
+    aiter.logger.info(
+        "terminal window: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"terminal window: {len(bad)} failed"
     bad = test_invariants(64, 32768, 512)
     aiter.logger.info(
         "invariants: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
