@@ -37,7 +37,7 @@ def gen_flydsl_bmm_data(b, m, n, k, seed, out_dtype, group, device="cuda"):
     data = opus_tune.gen_bmm_mxscale_data(
         b, m, n, k, seed, out_dtype, _DATA_KID[group], 1, device=device
     )
-    A_mx, _W_mx, Y, A_scale, ws_mx, _ws, ref, W_sh, _xs_sh, _ws_sh = data
+    A_mx, _W_mx, Y, A_scale, ws_mx, _ws, ref, W_sh = data
     return A_mx, W_sh, A_scale, ws_mx, Y, ref
 
 
