@@ -138,11 +138,16 @@ def _affine_step(
 
 
 def compile_chunk_gdn_carry(
-    *, H: int, use_initial_state: bool, STATE_DTYPE_BF16: bool = False
+    *,
+    H: int,
+    use_initial_state: bool,
+    STATE_DTYPE_BF16: bool = False,
+    NUM_XCDS: int,
 ):
     K = V = 128
     BV = 16
     THREADS = 256
+    GRID_V = V // BV
 
     @fx.struct
     class SharedStorage:
@@ -158,8 +163,28 @@ def compile_chunk_gdn_carry(
         requests: fx.Int32,
     ):
         tid = fx.Int32(gpu.thread_id("x"))
-        tile_v = fx.Int32(gpu.block_id("x"))
-        request_head = fx.Int32(gpu.block_id("y"))
+        # The GRID_V V-tiles of one (request, head) read the same packed A
+        # maps; give them consecutive logical ids on one XCD (see gdn_h_kernel).
+        if const_expr(NUM_XCDS > 1 and GRID_V > 1):
+            xcd_cycle = fx.Int32(NUM_XCDS * GRID_V)
+            grid_total = fx.Int32(GRID_V) * requests * fx.Int32(H)
+            full = (grid_total // xcd_cycle) * xcd_cycle
+            xy = fx.Int32(gpu.block_id("x")) + fx.Int32(GRID_V) * fx.Int32(
+                gpu.block_id("y")
+            )
+            xcd = xy % fx.Int32(NUM_XCDS)
+            local_id = xy // fx.Int32(NUM_XCDS)
+            remapped = (
+                (local_id // fx.Int32(GRID_V)) * xcd_cycle
+                + xcd * fx.Int32(GRID_V)
+                + local_id % fx.Int32(GRID_V)
+            )
+            logical = (xy < full).select(remapped, xy)
+            tile_v = logical % fx.Int32(GRID_V)
+            request_head = logical // fx.Int32(GRID_V)
+        else:
+            tile_v = fx.Int32(gpu.block_id("x"))
+            request_head = fx.Int32(gpu.block_id("y"))
         head = request_head % H
         request = request_head // H
         v_base = tile_v * BV

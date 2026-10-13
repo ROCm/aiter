@@ -30,6 +30,10 @@ from aiter.ops.flydsl.kernels.gdr_prefill.chunk_gdn_carry_gfx950 import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
+# AOT compiles without a device; identity work-group order. Runtime kernels
+# specialize on the queried XCD count, so they miss this cache entry.
+AOT_NUM_XCDS = 1
+
 CHUNK_GDN_BLOCKED_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_blocked"
 
@@ -152,6 +156,7 @@ def _compile_build_map_to_cache(*, arch: str, H: int, Hg: int, **kwargs) -> None
         BF16_CONVERT_TRUNC=True,
         PHASE="build_map",
         BLOCK_ENTRY_SEED=False,
+        NUM_XCDS=AOT_NUM_XCDS,
     )
     with compile_only_env():
         _run_compiled(
@@ -237,6 +242,7 @@ def _compile_emit_to_cache(
         BF16_CONVERT_TRUNC=True,
         PHASE="emit",
         BLOCK_ENTRY_SEED=True,
+        NUM_XCDS=AOT_NUM_XCDS,
     )
     with compile_only_env():
         _run_compiled(
@@ -289,6 +295,7 @@ def _compile_carry_to_cache(
         H=H,
         use_initial_state=use_initial_state,
         STATE_DTYPE_BF16=state_bf16,
+        NUM_XCDS=AOT_NUM_XCDS,
     )
     with compile_only_env():
         _run_compiled(

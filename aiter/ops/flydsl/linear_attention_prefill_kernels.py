@@ -518,6 +518,36 @@ def _resolve_snapshot_dtype(snapshot_dtype, input_dtype):
     return resolved
 
 
+# hipDeviceAttributeNumberOfXccs from hip_runtime_api.h (ROCm 7.x). The XCD
+# count is a device property (MI350P is gfx950 with 4, MI355X has 8), so it is
+# queried rather than derived from the arch.
+_HIP_ATTR_NUM_XCCS = 10018
+
+
+@functools.cache
+def _device_num_xcds(device_index: int) -> int:
+    """XCD count of a HIP device; 1 (identity work-group order) if unknown."""
+    try:
+        import ctypes
+
+        from aiter.dist.device_communicators.vmm_allocator import load_hip_runtime
+
+        value = ctypes.c_int(0)
+        err = load_hip_runtime().hipDeviceGetAttribute(
+            ctypes.byref(value), _HIP_ATTR_NUM_XCCS, int(device_index)
+        )
+        if err == 0 and value.value in (1, 2, 4, 8):
+            return value.value
+    except (ImportError, OSError, AttributeError, RuntimeError):
+        pass
+    return 1
+
+
+def _tensor_num_xcds(t: torch.Tensor) -> int:
+    index = t.device.index
+    return _device_num_xcds(torch.cuda.current_device() if index is None else index)
+
+
 @functools.cache
 def _get_or_compile_opt(
     K,
@@ -542,6 +572,7 @@ def _get_or_compile_opt(
     snapshot_bf16=True,
     phase="emit",
     block_entry_seed=False,
+    num_xcds=1,
 ):
     """Compile (and cache) the K5 opt kernel: 16x16x16 bf16
     MFMA + HIP-matching warp partition, writing the public VK layout [..., V, K].
@@ -595,6 +626,7 @@ def _get_or_compile_opt(
         BF16_CONVERT_TRUNC=bf16_convert_trunc,
         PHASE=phase,
         BLOCK_ENTRY_SEED=block_entry_seed,
+        NUM_XCDS=num_xcds,
     )
 
 
@@ -934,6 +966,7 @@ def chunk_gated_delta_rule_fwd_h_flydsl_opt(
         bf16_convert_trunc=bf16_convert_trunc,
         snapshot_bf16=snapshot_bf16,
         phase="emit",
+        num_xcds=_tensor_num_xcds(k),
     )
 
     dummy, int32_dummy = _placeholder_pair(k.device)
@@ -1135,6 +1168,7 @@ def _build_chunk_gdn_block_maps(
         g_head_major=True,
         g_log2_scaled=True,
         phase="build_map",
+        num_xcds=_tensor_num_xcds(k),
     )
     _run_compiled(
         launch,
@@ -1166,7 +1200,7 @@ def _build_chunk_gdn_block_maps(
 
 @functools.lru_cache(maxsize=32)
 def _get_or_compile_chunk_gdn_carry(
-    heads: int, use_initial_state: bool, state_bf16: bool = False
+    heads: int, use_initial_state: bool, state_bf16: bool = False, num_xcds: int = 1
 ):
     from .kernels.gdr_prefill.chunk_gdn_carry_gfx950 import compile_chunk_gdn_carry
 
@@ -1174,6 +1208,7 @@ def _get_or_compile_chunk_gdn_carry(
         H=heads,
         use_initial_state=use_initial_state,
         STATE_DTYPE_BF16=state_bf16,
+        NUM_XCDS=num_xcds,
     )
 
 
@@ -1223,6 +1258,7 @@ def _carry_chunk_gdn_block_maps(
         heads,
         initial_state is not None,
         initial_state is not None and initial_state.dtype is torch.bfloat16,
+        _tensor_num_xcds(maps),
     )
     _run_compiled(
         launch,
@@ -1331,6 +1367,7 @@ def _chunk_gated_delta_rule_fwd_h_blocked(
         g_log2_scaled=True,
         block_entry_seed=True,
         state_bf16=(state_dtype is torch.bfloat16),
+        num_xcds=_tensor_num_xcds(k),
     )
     _run_compiled(
         launch,

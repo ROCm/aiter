@@ -64,6 +64,7 @@ def compile_chunk_gated_delta_h(
     BF16_CONVERT_TRUNC: bool = _BF16_CONVERT_TRUNC_DEFAULT,
     PHASE: str = PHASE_EMIT,
     BLOCK_ENTRY_SEED: bool = False,
+    NUM_XCDS: int,
 ):
     """Compile GDN K5; BF16-rounded basis states approximate serial carry.
 
@@ -177,8 +178,30 @@ def compile_chunk_gated_delta_h(
         phase: fx.Constexpr[str],
     ):
         assert phase in (PHASE_EMIT, PHASE_BUILD_MAP)
-        i_v = fx.block_idx.x
-        i_nh = fx.block_idx.y
+        # Work-group xy = x + GRID_V * y runs on XCD xy % NUM_XCDS, so the
+        # GRID_V V-tiles of one (block, head) would each fetch its k/w/g into a
+        # different L2. Give them consecutive logical ids on one XCD. Ids past
+        # the last full NUM_XCDS * GRID_V cycle keep the identity, so this is a
+        # bijection for any NB_val * H.
+        GRID_V = (V + BV - 1) // BV
+        if const_expr(NUM_XCDS > 1 and GRID_V > 1):
+            xcd_cycle = fx.Int32(NUM_XCDS * GRID_V)
+            grid_total = fx.Int32(GRID_V) * NB_val * fx.Int32(H)
+            full = (grid_total // xcd_cycle) * xcd_cycle
+            xy = fx.block_idx.x + fx.Int32(GRID_V) * fx.block_idx.y
+            xcd = xy % fx.Int32(NUM_XCDS)
+            local_id = xy // fx.Int32(NUM_XCDS)
+            remapped = (
+                (local_id // fx.Int32(GRID_V)) * xcd_cycle
+                + xcd * fx.Int32(GRID_V)
+                + local_id % fx.Int32(GRID_V)
+            )
+            logical = (xy < full).select(remapped, xy)
+            i_v = logical % fx.Int32(GRID_V)
+            i_nh = logical // fx.Int32(GRID_V)
+        else:
+            i_v = fx.block_idx.x
+            i_nh = fx.block_idx.y
         i_n = i_nh // H
         i_h = i_nh % H
 
