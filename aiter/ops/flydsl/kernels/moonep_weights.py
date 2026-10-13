@@ -1,25 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
-"""Expert-weight pool for MoonEP: one layer's weights ("parts", e.g. w1, its
-scale, w2 and its scale) for every rank in one virtual range.
+"""Symmetric expert-weight storage for MoonEP.
 
-Each part has a ``[epn + B]`` window per rank
-(``aiter.ops.flydsl.moonep_vmm_pool.MoonEPVmmPool``)::
+Every rank collectively allocates one byte buffer containing each weight part
+as a contiguous ``[experts_per_rank + prefetch_slots]`` window::
 
-    local[i][:epn]   home experts of part i
-    local[i][epn:]   its prefetch slots
+    local[i][:experts_per_rank]   home experts of part i
+    local[i][experts_per_rank:]   local prefetch slots
 
-``local[i]`` is the weight tensor of a ``moonep_slots=B`` MegaMoE instance and
-``home[i]`` the owner-only one.  Other ranks' segments are *their* memory,
-mapped here over XGMI, so one prefetch launch pulls every part of the selected
-experts by offset arithmetic.  ATOM's weights are ordinary local tensors and are
-not reachable by peers, so they must be staged into ``home`` once after loading.
+Mori supplies the P2P address of the same allocation on every peer. The
+prefetch kernel reads a selected expert from its owner's home rows and copies
+it into this rank's slot rows. Slots are not read remotely, but keeping them
+next to the home rows preserves MegaMoE's contiguous expert-window ABI.
 
-The pool is dtype-transparent: staging and prefetch are byte copies, so it
-holds the weights in whatever layout and dtype the experts kernel already
-expects -- shuffled fp4 slabs and their block scales -- without unshuffling or
-dequantising anything.
+The pool is dtype-transparent: shuffle output and prefetch both write bytes, so
+it holds exactly the fp4/e8m0 layout the experts kernel consumes.
 """
 
 from __future__ import annotations
@@ -29,16 +25,16 @@ import math
 import flydsl.expr as fx
 import mori.shmem as ms
 import torch
+from mori.shmem import mori_shmem_create_tensor
 
 from aiter.ops.flydsl.kernels.moonep_weight_prefetch_fast import (
     make_moonep_weight_prefetch_fast_jit,
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
-from aiter.ops.flydsl.moonep_vmm_pool import MoonEPVmmPool
 
 
 class MoonEPWeightPool:
-    """One layer's ``[epn | B]`` part windows on every rank + prefetch launcher."""
+    """One layer's symmetric ``[home | prefetch]`` expert windows."""
 
     def __init__(
         self,
@@ -50,18 +46,28 @@ class MoonEPWeightPool:
         parts: list[tuple[tuple[int, ...], torch.dtype]],
         block_num: int = 1024,
         block_threads: int = 256,
-        group=None,
     ) -> None:
-        """``parts`` lists each tensor's per-expert ``(shape, dtype)``;
-        ``rank``/``world_size`` are positions in ``group``, the EP process group
-        whose ranks map each other's segments (None: the default group)."""
+        """Create one collective Mori allocation.
+
+        ``parts`` lists each tensor's per-expert ``(shape, dtype)``. ``rank``
+        and ``world_size`` must describe the already-initialized Mori shmem
+        group.
+        """
+        if world_size <= 0 or not 0 <= rank < world_size:
+            raise ValueError(f"invalid rank/world_size: {rank}/{world_size}")
+        if experts_per_rank <= 0 or prefetch_slots < 0:
+            raise ValueError(
+                "experts_per_rank must be positive and prefetch_slots non-negative"
+            )
+
         row_bytes = tuple(
             math.prod(shape) * torch.empty(0, dtype=dtype).element_size()
             for shape, dtype in parts
         )
-        if any(b % 16 for b in row_bytes):
-            raise ValueError(f"expert rows must be 16-byte aligned, got {row_bytes}")
-        # MegaMoE reads each weight window through 32-bit buffer offsets.
+        if not row_bytes or any(b <= 0 or b % 16 for b in row_bytes):
+            raise ValueError(
+                f"expert rows must be positive 16-byte multiples, got {row_bytes}"
+            )
         window = experts_per_rank + prefetch_slots
         if any(window * b > 1 << 32 for b in row_bytes):
             raise ValueError(
@@ -69,42 +75,48 @@ class MoonEPWeightPool:
                 "4 GiB; use more ranks or fewer prefetch slots"
             )
 
+        offsets, used = [], 0
+        for row_bytes_i in row_bytes:
+            offsets.append(used)
+            used += window * row_bytes_i
+
         self.rank = rank
         self.world_size = world_size
         self.experts_per_rank = experts_per_rank
         self.prefetch_slots = prefetch_slots
         self.parts = [(tuple(shape), dtype) for shape, dtype in parts]
+        self.part_row_bytes = row_bytes
+        self.part_offsets = tuple(offsets)
+        self.storage_bytes = used
         self.device = torch.device("cuda", torch.cuda.current_device())
         self._staged = False
         self._closed = False
 
-        self._vmm = MoonEPVmmPool(
-            part_row_bytes=row_bytes,
-            experts_per_rank=experts_per_rank,
-            prefetch_slots=prefetch_slots,
-            rank=rank,
-            world_size=world_size,
-            device=self.device,
-            group=group,
-        )
+        # All ranks must create symmetric tensors in the same order and with
+        # the same size. Only this rank's tensor is a torch object; peer_bases
+        # supplies the corresponding address in every other rank.
+        self._storage = mori_shmem_create_tensor((used,), torch.uint8)
         self.local = [
-            self._vmm.part(i, dtype, shape) for i, (shape, dtype) in enumerate(parts)
+            self._part(i, dtype, shape) for i, (shape, dtype) in enumerate(parts)
         ]
-        self.home = [window[:experts_per_rank] for window in self.local]
-        self.prefetched = [window[experts_per_rank:] for window in self.local]
-        # Zero only our own segment -- the rest of the range is peer memory and
-        # clearing it would wipe their weights. Through bytes: the narrow dtypes
-        # this pool carries (fp4x2, e8m0) have no fill_ kernel in torch.
-        self._vmm.local_segment.zero_()
+        self.home = [part[:experts_per_rank] for part in self.local]
+        self.prefetched = [part[experts_per_rank:] for part in self.local]
+        self._storage.zero_()
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
+
+        self._peer_bases = torch.empty(
+            (world_size,), dtype=torch.int64, device=self.device
+        )
+        for pe in range(world_size):
+            self._peer_bases[pe] = ms.shmem_ptr_p2p(self._storage.data_ptr(), rank, pe)
+        torch.cuda.synchronize(self.device)
 
         self._jit = make_moonep_weight_prefetch_fast_jit(
             experts_per_rank=experts_per_rank,
             prefetch_slots=prefetch_slots,
             part_row_bytes=row_bytes,
-            part_offsets=self._vmm.part_offsets,
-            segment_bytes=self._vmm.segment_bytes,
+            part_offsets=self.part_offsets,
             block_num=block_num,
             block_threads=block_threads,
             track_resident=True,
@@ -114,8 +126,33 @@ class MoonEPWeightPool:
             (prefetch_slots,), -1, dtype=torch.int32, device=self.device
         )
 
+    def _part(
+        self, index: int, dtype: torch.dtype, row_shape: tuple[int, ...]
+    ) -> torch.Tensor:
+        row_bytes = self.part_row_bytes[index]
+        want = math.prod(row_shape) * torch.empty(0, dtype=dtype).element_size()
+        if want != row_bytes:
+            raise ValueError(
+                f"row_shape {row_shape} of {dtype} spans {want} B but part "
+                f"{index} rows hold {row_bytes} B"
+            )
+        window = self.experts_per_rank + self.prefetch_slots
+        start = self.part_offsets[index]
+        raw = self._storage[start : start + window * row_bytes]
+        return raw.view(dtype).view(window, *row_shape)
+
+    def finish_home(self) -> None:
+        """Publish home rows written directly by caller-owned shuffle outputs."""
+        if self._closed:
+            raise RuntimeError("weight pool is closed")
+        if self._staged:
+            raise RuntimeError("weight pool home rows were already published")
+        torch.cuda.synchronize(self.device)
+        ms.shmem_barrier_all()
+        self._staged = True
+
     def stage_home(self, weights: list[torch.Tensor]) -> None:
-        """Copy this rank's expert weights, one tensor per part, into its home rows."""
+        """Compatibility path: copy ordinary tensors into this rank's home rows."""
         if self._closed:
             raise RuntimeError("weight pool is closed")
         if len(weights) != len(self.parts):
@@ -128,45 +165,35 @@ class MoonEPWeightPool:
                     f"{tuple(weight.shape)} {weight.dtype}; the pool is a byte "
                     "copy and must match the experts kernel's layout exactly"
                 )
-            # Copy as bytes: fp4x2/e8m0 lack complete elementwise coverage in
-            # torch, and the pool only ever needs the bytes anyway.
             self.home[i].view(torch.uint8).copy_(weight.contiguous().view(torch.uint8))
-        torch.cuda.synchronize(self.device)
-        ms.shmem_barrier_all()
-        self._staged = True
+        self.finish_home()
 
     def prefetch(
         self,
         experts_to_copy_row: torch.Tensor,
         resident: torch.Tensor | None = None,
     ) -> None:
-        """Pull every part of the selected remote experts into the prefetch slots.
-
-        ``resident[slot]`` names the expert a slot already holds; such slots
-        are skipped.  The caller owns updating it after the copy.
-        """
+        """Pull every part of selected remote experts into the prefetch slots."""
         if self._closed:
             raise RuntimeError("weight pool is closed")
         if not self._staged:
             raise RuntimeError(
-                "stage_home() must run on every rank before prefetch: peers "
-                "read the home rows directly, so an unstaged rank serves "
-                "zeros without any error"
+                "finish_home() must run on every rank before prefetch: peers "
+                "read the home rows directly"
             )
         if experts_to_copy_row.dtype != torch.int32:
             raise ValueError("experts_to_copy must be int32")
         stream = torch.cuda.current_stream(self.device)
-        sel = experts_to_copy_row.contiguous()
+        selected = experts_to_copy_row.contiguous()
         if resident is None:
             resident = self._no_resident
         elif resident.dtype != torch.int32 or resident.numel() != self.prefetch_slots:
             raise ValueError("resident must be int32 with one entry per slot")
-        # The first call compiles and runs the kernel, later ones only run it.
         _run_compiled(
             self._jit,
-            fx.Int64(sel.data_ptr()),
-            fx.Int64(self._vmm.base),
-            fx.Int64(self._vmm.local_segment.data_ptr()),
+            fx.Int64(selected.data_ptr()),
+            fx.Int64(self._peer_bases.data_ptr()),
+            fx.Int64(self._storage.data_ptr()),
             fx.Int64(resident.data_ptr()),
             fx.Stream(stream.cuda_stream),
         )
@@ -176,9 +203,9 @@ class MoonEPWeightPool:
             return
         torch.cuda.synchronize(self.device)
         ms.shmem_barrier_all()
-        # Drop the views before the mapping they borrow from.
         self.home = self.prefetched = self.local = None
-        self._vmm.close()
+        self._peer_bases = None
+        self._storage = None
         self._closed = True
 
 

@@ -7,6 +7,34 @@ import torch.nn.functional as F
 from aiter.jit.utils.chip_info import get_gfx
 
 
+def _materialize_permutation(
+    permuted: torch.Tensor,
+    *,
+    out: torch.Tensor | None,
+    shape: tuple[int, ...] | torch.Size,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Materialize a permuted view, optionally into caller-owned storage."""
+    shape = tuple(shape)
+    if out is None:
+        return permuted.contiguous().view(*shape).view(dtype)
+    if tuple(out.shape) != shape:
+        raise ValueError(f"out must have shape {shape}, got {tuple(out.shape)}")
+    if out.dtype != dtype:
+        raise ValueError(f"out must have dtype {dtype}, got {out.dtype}")
+    if out.device != permuted.device:
+        raise ValueError(f"out must be on {permuted.device}, got device {out.device}")
+    if not out.is_contiguous():
+        raise ValueError("out must be contiguous")
+
+    # float4_e2m1fn_x2 is shuffled through its uint8 view. Both are one byte
+    # wide, so the destination can be viewed as the permutation's dtype and
+    # populated without allocating the usual contiguous result tensor.
+    dst = out if out.dtype == permuted.dtype else out.view(permuted.dtype)
+    dst.view(permuted.shape).copy_(permuted)
+    return out
+
+
 def _moe_tile_shuffle(
     src: torch.Tensor, tile_minor: int, tile_major: int
 ) -> torch.Tensor:
@@ -153,6 +181,7 @@ def shuffle_weight(
     is_guinterleave=False,
     gate_up: bool = False,
     pad_k_to: int = 0,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     x_type = x.dtype
     if hasattr(torch, "float4_e2m1fn_x2") and x_type == torch.float4_e2m1fn_x2:
@@ -182,11 +211,11 @@ def shuffle_weight(
         K0 = K_pk // (KLane * KPack)
         if gate_up:
             x_ = x.view(experts_cnt, 2, N0, NLane, K0, KLane, KPack)
-            x_ = x_.permute(0, 2, 1, 4, 5, 3, 6).contiguous()
+            x_ = x_.permute(0, 2, 1, 4, 5, 3, 6)
         else:
             x_ = x.view(experts_cnt, N0, NLane, K0, KLane, KPack)
-            x_ = x_.permute(0, 1, 3, 4, 2, 5).contiguous()
-        x_ = x_.view(*x.shape).contiguous().view(x_type)
+            x_ = x_.permute(0, 1, 3, 4, 2, 5)
+        x_ = _materialize_permutation(x_, out=out, shape=x.shape, dtype=x_type)
         x_.is_shuffled = True
         return x_
 
@@ -200,9 +229,7 @@ def shuffle_weight(
     x_ = x
     x_ = x_.view(-1, x.shape[-2] // BN, BN, x.shape[-1] // BK, BK // K, K)
     x_ = x_.permute(0, 1, 3, 4, 2, 5)
-    x_ = x_.contiguous()
-    x_ = x_.view(*x.shape)
-    x_ = x_.view(x_type)
+    x_ = _materialize_permutation(x_, out=out, shape=x.shape, dtype=x_type)
     x_.is_shuffled = True
     if pad_k_to:
         x_.aiter_original_k = original_k
@@ -210,10 +237,19 @@ def shuffle_weight(
     return x_
 
 
-def shuffle_weight_a16w4(src: torch.Tensor, NLane: int, gate_up: bool) -> torch.Tensor:
+def shuffle_weight_a16w4(
+    src: torch.Tensor,
+    NLane: int,
+    gate_up: bool,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Backward-compatible wrapper around `shuffle_weight(..., is_guinterleave=True)`."""
     return shuffle_weight(
-        src, layout=(NLane, 16), is_guinterleave=True, gate_up=gate_up
+        src,
+        layout=(NLane, 16),
+        is_guinterleave=True,
+        gate_up=gate_up,
+        out=out,
     )
 
 
@@ -344,6 +380,7 @@ def shuffle_scale(
     experts_cnt: int | None = None,
     is_guinterleave: bool = False,
     gate_up: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     if src is None:
         return src
@@ -371,8 +408,8 @@ def shuffle_scale(
         scale = scale_padded
         sm, sn = scale.shape
         scale = scale.view(sm // 32, 2, 16, sn // 8, 2, 4)
-        scale = scale.permute(0, 3, 5, 2, 4, 1).contiguous()
-        return scale.view(sm, sn)
+        scale = scale.permute(0, 3, 5, 2, 4, 1)
+        return _materialize_permutation(scale, out=out, shape=(sm, sn), dtype=src.dtype)
 
     if experts_cnt is None:
         raise ValueError("experts_cnt is required when is_guinterleave=True")
@@ -409,14 +446,16 @@ def shuffle_scale(
         # Reshape to: [E, N_Pack, N1, N_Lane, K1, K_Pack, K_Lane]
         shfl_scale = src.view(experts_cnt, N_Pack, N1, N_Lane, K1, K_Pack, K_Lane)
         # Permute to: [E, N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]
-        shfl_scale = shfl_scale.permute(0, 2, 4, 6, 3, 5, 1).contiguous()
+        shfl_scale = shfl_scale.permute(0, 2, 4, 6, 3, 5, 1)
     else:
         # Reshape to: [E, K1, K_Pack, K_Lane, N1, N_Pack, N_Lane]
         shfl_scale = src.view(experts_cnt, N1, N_Pack, N_Lane, K1, K_Pack, K_Lane)
         # Permute to: [E, N1, K1, K_Lane, N_Lane, K_Pack, N_Pack]
-        shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2).contiguous()
+        shfl_scale = shfl_scale.permute(0, 1, 4, 6, 3, 5, 2)
     # print("shf_scale shape:", shfl_scale.shape)
-    return shfl_scale.view(*src.shape).contiguous()
+    return _materialize_permutation(
+        shfl_scale, out=out, shape=src.shape, dtype=src.dtype
+    )
 
 
 def moe_shuffle_scale(
@@ -442,11 +481,18 @@ def moe_shuffle_scale(
 
 
 def shuffle_scale_a16w4(
-    src: torch.Tensor, experts_cnt: int, gate_up: bool
+    src: torch.Tensor,
+    experts_cnt: int,
+    gate_up: bool,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Backward-compatible wrapper around `shuffle_scale(..., is_guinterleave=True)`."""
     return shuffle_scale(
-        src, experts_cnt=experts_cnt, is_guinterleave=True, gate_up=gate_up
+        src,
+        experts_cnt=experts_cnt,
+        is_guinterleave=True,
+        gate_up=gate_up,
+        out=out,
     )
 
 
