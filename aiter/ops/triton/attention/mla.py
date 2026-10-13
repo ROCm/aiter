@@ -269,9 +269,11 @@ def mla_prefill_fwd(
 def _pipelined_unshuffled_lds_bytes(
     block_size, block_m, kv_lora_rank, qk_rope_head_dim, kv_elem_size, q_elem_size
 ):
-    # Two padded TDM stages of KV plus the padded Q tile; each row is padded by 8.
-    padded_row = (kv_lora_rank + 8) + (qk_rope_head_dim + 8)
-    return padded_row * (2 * block_size * kv_elem_size + block_m * q_elem_size)
+    # Two TDM stages of KV, whose LoRA and RoPE rows are each padded by 16 bytes,
+    # plus the Q tile, whose rows are padded by 8 elements.
+    kv_row = (kv_lora_rank + qk_rope_head_dim) * kv_elem_size + 2 * 16
+    q_row = (kv_lora_rank + 8 + qk_rope_head_dim + 8) * q_elem_size
+    return 2 * block_size * kv_row + block_m * q_row
 
 
 def _tuned_decode_config(

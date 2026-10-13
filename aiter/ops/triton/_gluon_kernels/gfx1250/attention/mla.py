@@ -115,6 +115,7 @@ class MLAConfig:
         SCALE_K_WIDTH_ROPE,
         BLOCK_SCALES_SIZE,
         USE_LDS_PIPELINE=False,
+        KV_ROW_PAD=8,
     ):
         self.USE_LDS_PIPELINE = gl.constexpr(USE_LDS_PIPELINE)
         # Constants
@@ -430,14 +431,14 @@ class MLAConfig:
         else:
             self.KV_LORA_SHARED_LAYOUT = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    interval_padding_pairs=[[KV_LORA_RANK, 8]],
+                    interval_padding_pairs=[[KV_LORA_RANK, KV_ROW_PAD]],
                     shape=([BLOCK_SIZE, KV_LORA_RANK]),
                     order=[1, 0],
                 )
             )
             self.K_ROPE_SHARED_LAYOUT = gl.constexpr(
                 gl.PaddedSharedLayout.with_identity_for(
-                    interval_padding_pairs=[[QK_ROPE_HEAD_DIM, 8]],
+                    interval_padding_pairs=[[QK_ROPE_HEAD_DIM, KV_ROW_PAD]],
                     shape=[BLOCK_SIZE, QK_ROPE_HEAD_DIM],
                     order=[1, 0],
                 )
@@ -1848,6 +1849,8 @@ def _mla_decode_fwd_kernel(
     FP8_MIN: tl.constexpr = float8_info.min,
     FP8_MAX: tl.constexpr = float8_info.max,
 ):
+    # Unshuffled KV rows are padded by 16 bytes so b128 LDS reads stay aligned.
+    KV_ROW_PAD: gl.constexpr = 16 if KV_CACHE_DTYPE == "fp8" else 8
     cfg = MLAConfig(
         KV_LORA_RANK,
         QK_ROPE_HEAD_DIM,
@@ -1873,6 +1876,7 @@ def _mla_decode_fwd_kernel(
         SCALE_K_WIDTH_ROPE,
         BLOCK_SCALES_SIZE,
         USE_LDS_PIPELINE,
+        KV_ROW_PAD,
     )
 
     if USE_LDS_PIPELINE:
