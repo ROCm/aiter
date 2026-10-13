@@ -739,20 +739,25 @@ def build_hstu_attention_bwd_dvdk_pp(
 
             # Prime the rolling window before the first MFMA.  Group 0 is GEMM1,
             # whose dO^T operand was published at the earliest barrier.
-            # Ring of PREFETCH_W + 1 slots: group g consumes win[g % N] and then
-            # issues the read for g + PREFETCH_W into the slot it just freed.
-            # The last slot is filled at g == 0, before its first use at
-            # g == PREFETCH_W.
+            # Ring of PREFETCH_W + 1 slots indexed by STEP, not by group value.
+            # `g % (W+1)` is only correct when the ring is as wide as
+            # GROUP_ORDER: the order is an interleaved permutation, so for
+            # W <= 11 a later group's read lands in a slot whose occupant has
+            # not been consumed yet -- at W=9, g12's read is issued at step 0
+            # into g2's slot and g2 is not consumed until step 4, which gives
+            # silently wrong results with no compile error. Keyed by step, the
+            # slot reuse distance is exactly W+1 against a W lookahead, so
+            # every W is correct.
             win = [None for _ in range_constexpr(PREFETCH_W + 1)]
             halves = {}
             for _s in range_constexpr(PREFETCH_W):
                 _g = GROUP_ORDER[_s]
-                win[_g % (PREFETCH_W + 1)] = read_operand(_g, rm_cur, t_prev, halves)
+                win[_s % (PREFETCH_W + 1)] = read_operand(_g, rm_cur, t_prev, halves)
 
             for step in range_constexpr(NUM_OPERAND_GROUPS):
                 g = GROUP_ORDER[step]
                 rocdl.sched_barrier(0)
-                op = win[g % (PREFETCH_W + 1)]
+                op = win[step % (PREFETCH_W + 1)]
                 for og in range_constexpr(KV_OWNED_SUBTILES):
                     if const_expr(g < D_CHUNKS):
                         off = g * KV_OWNED_SUBTILES + og
@@ -772,7 +777,7 @@ def build_hstu_attention_bwd_dvdk_pp(
                 sn = step + PREFETCH_W
                 if const_expr(sn < NUM_OPERAND_GROUPS):
                     gn = GROUP_ORDER[sn]
-                    win[gn % (PREFETCH_W + 1)] = read_operand(
+                    win[sn % (PREFETCH_W + 1)] = read_operand(
                         gn, rm_cur, t_prev, halves
                     )
 
