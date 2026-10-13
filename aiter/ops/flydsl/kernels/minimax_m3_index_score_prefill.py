@@ -54,6 +54,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     ACCESS_BYTES,
     HEAD_DIM,
     K_LOADS,
+    LOG2E,
     MFMA_M,
     MFMA_N,
     NEG_INF,
@@ -63,6 +64,7 @@ from aiter.ops.flydsl.kernels.minimax_m3_index_score import (
     WAVE,
     WAVES,
     _cu_count,
+    _validate_arch,
     _validate_rows,
     _validate_tensor,
     bf16_dwords_to_fp8,
@@ -73,10 +75,6 @@ from aiter.ops.flydsl.kernels.tensor_shim import (
     ptr_arg,
     ptr_buf_tensor,
 )
-
-SUPPORTED_ARCHS = ("gfx950",)
-
-LOG2E = 1.4426950409
 
 # Query rows one CTA scores. The tunable this kernel exists for; see the header
 # for why it is the dial onto arithmetic intensity and what bounds it.
@@ -1140,10 +1138,19 @@ def _get(g, device):
 
 
 def alloc_score(total_q: int, heads: int, max_block: int, device):
-    """Score buffer in the layout the Triton kernel produced: [H, total_q, mb]."""
+    """Score buffer in the layout the Triton kernel produced: [H, total_q, mb].
+
+    Filled with -inf, not left as `empty`: the kernel writes only the pages
+    inside a row's causal window, so at q256/ctx256 a quarter of the slots are
+    never stored to. Uninitialised, those reach the top-k selector as arbitrary
+    memory and can win a block that does not exist. A caller passing its own
+    `out` owes it the same sentinel.
+    """
     import torch
 
-    return torch.empty((heads, total_q, max_block), dtype=torch.float32, device=device)
+    return torch.full(
+        (heads, total_q, max_block), -float("inf"), dtype=torch.float32, device=device
+    )
 
 
 def score_prefill_flydsl(
@@ -1178,9 +1185,7 @@ def score_prefill_flydsl(
         raise ValueError(f"index head_dim must be {HEAD_DIM}, got {head_dim}")
     if cache.ndim != 3 or cache.shape[1] != PAGE or cache.shape[2] != HEAD_DIM:
         raise ValueError(f"cache must be [pages, {PAGE}, {HEAD_DIM}]")
-    arch = torch.cuda.get_device_properties(idx_q.device).gcnArchName.split(":")[0]
-    if arch not in SUPPORTED_ARCHS:
-        raise ValueError(f"index score requires one of {SUPPORTED_ARCHS}, got {arch}")
+    _validate_arch(idx_q.device)
     # Everything below reaches the kernel as a bare `.data_ptr()`. Unchecked,
     # an int64 `seq_lens` is read as int32 and silently gives a garbage causal
     # window, and an `out` sized for a smaller max_block is addressed with its
@@ -1232,6 +1237,10 @@ def score_prefill_flydsl(
             f"{HEAD_DIM}, stride(2) 1 and stride(0) at least "
             f"{cache.shape[1] * HEAD_DIM}, got {cache.stride()}"
         )
+    # Clearing a page is not enough: `ptr_buf_tensor` declares 16-byte
+    # alignment and the copy atom takes 16 B at a time, so an outer stride of
+    # 16385 fp8 elements leaves every page after the first unaligned.
+    _validate_rows(cache, "cache")
     _validate_rows(idx_q, "idx_q")
     # `block_table` reaches the kernel as `b * stride(0) + column`, so the
     # column axis is assumed packed; the three length arrays are indexed by

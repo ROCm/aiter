@@ -1174,6 +1174,29 @@ def _validate_tensor(t, name, dtype, ndim, device, alignment=4, bounded=True):
         raise ValueError(f"{name}: strided address span exceeds 32-bit addressing")
 
 
+SUPPORTED_ARCHS = ("gfx950",)
+
+
+def _validate_arch(device):
+    """Both scorers' arch gate.
+
+    The device TYPE is checked before the driver query: `get_device_properties`
+    initialises the driver, so on a machine with no GPU the probe raised
+    `RuntimeError: No HIP GPUs are available` instead of a rejection -- which
+    `index_score_supported`, documented as metadata-only, is the one entry a
+    dispatcher may call anywhere.
+    """
+    import torch
+
+    if device.type != "cuda":
+        raise ValueError(f"index score requires CUDA tensors, got {device.type}")
+    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
+    if arch not in SUPPORTED_ARCHS:
+        raise ValueError(
+            f"index score requires {'/'.join(SUPPORTED_ARCHS)}, got {arch}"
+        )
+
+
 def _validate_rows(t, name):
     """The row/head stride rule for a [rows, heads, 128] bf16 or fp8 operand.
 
@@ -1258,16 +1281,7 @@ def _validate_metadata(
     if not isinstance(S, int) or not isinstance(H, int) or S < 1 or H < 1:
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
-    # Device TYPE first: `get_device_properties` initialises the driver, so on a
-    # machine with no GPU this raised RuntimeError straight through
-    # `index_score_supported` -- which is documented as metadata-only and is the
-    # one entry a dispatcher is allowed to call anywhere. A CPU tensor is a plain
-    # rejection, not a driver question.
-    if device.type != "cuda":
-        raise ValueError(f"index score requires CUDA tensors, got {device.type}")
-    arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-    if arch != "gfx950":
-        raise ValueError(f"index score requires gfx950, got {arch}")
+    _validate_arch(device)
     # Q is bf16 and the cache is fp8: this scores what
     # `fused_qknorm_idxrqknorm` writes, and the launch binds those two types.
     _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
@@ -1368,6 +1382,11 @@ def alloc_score(batch, S, H, max_block, device):
     shapes already declines on its LDS budget -- but a caller with a small
     max_block should check rather than assume. Below F = 16 the store is at
     most 16 B, so those shapes stay contiguous.
+
+    Filled with -inf rather than left as `empty`: a request shorter than
+    `max_block` never stores to its tail pages, so on a ragged batch a third of
+    the buffer can stay whatever was in it. A caller passing its own `out` owes
+    it the same sentinel.
     """
     import torch
 
@@ -1375,10 +1394,12 @@ def alloc_score(batch, S, H, max_block, device):
     if S * H >= TRANSPOSE_MIN_F:
         # [max_block, total_q, H] viewed as [H, total_q, max_block]: strides
         # (1, H, total_q*H), i.e. feature-contiguous.
-        return torch.empty(
-            (max_block, total_q, H), dtype=torch.float32, device=device
+        return torch.full(
+            (max_block, total_q, H), NEG_INF, dtype=torch.float32, device=device
         ).permute(2, 1, 0)
-    return torch.empty((H, total_q, max_block), dtype=torch.float32, device=device)
+    return torch.full(
+        (H, total_q, max_block), NEG_INF, dtype=torch.float32, device=device
+    )
 
 
 def score_flydsl(

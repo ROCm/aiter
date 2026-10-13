@@ -245,6 +245,12 @@ def test_metadata_rejects_cpu():
     # Supplied so the refusal is about the device, not about the two tensors
     # the predicate now requires in its own right.
     assert not kernel.index_score_supported(q, k, 1, 1, 1, bt, seq_lens=lens)
+    # Prefill shares the gate, so it owes the same answer: it used to reach the
+    # driver query first and raise `RuntimeError: No HIP GPUs are available` on
+    # a runner with no card.
+    cu = torch.tensor([0, 1], dtype=torch.int32)
+    with pytest.raises(ValueError, match="requires CUDA tensors"):
+        score_prefill_flydsl(q, k.to(dtypes.fp8), bt, cu, lens, lens, 1, P, 1.0)
 
 
 def test_capacity_threshold(monkeypatch):
@@ -1545,6 +1551,53 @@ def test_prefill_refuses_overlapping_pages():
     overlap = torch.as_strided(flat, (c["mb"], P, D), (1, D, 1))
     with pytest.raises(ValueError, match="non-overlapping pages"):
         run_prefill(c, cache=overlap)
+
+
+@requires_gfx950
+def test_prefill_refuses_misaligned_pages():
+    """Clearing a whole page is not the same as starting on a 16-byte boundary.
+    `ptr_buf_tensor` declares 16-byte alignment and the copy atom moves 16 B at
+    a time, so an outer stride of 16385 fp8 elements leaves every page after
+    the first unaligned -- in bounds, so only the alignment rule catches it.
+    Decode already refused this; prefill accepted it."""
+    c = make_prefill_case(1, 128, 512)
+    flat = torch.empty(c["mb"] * 16385 + 16385, dtype=dtypes.fp8, device="cuda")
+    skew = torch.as_strided(flat, (c["mb"], P, D), (16385, D, 1))
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        run_prefill(c, cache=skew)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("kernel_kind", ["decode", "prefill"])
+def test_default_score_buffer_reads_as_minus_inf(kernel_kind):
+    """Both kernels store only the pages inside a row's window, so the rest of
+    the buffer is whatever was there. Allocated with `empty` that is arbitrary
+    memory, and the top-k selector downstream can pick a block that does not
+    exist. The slots the kernel skips have to read as the sentinel."""
+    neg_inf = -float("inf")
+    if kernel_kind == "prefill":
+        # q256/ctx256 leaves a quarter of the buffer unstored. Called directly
+        # rather than through `run_prefill`, which fills its own sentinel and
+        # would hide exactly what this is checking.
+        c = make_prefill_case(1, 256, 256)
+        out = score_prefill_flydsl(
+            c["q_bf16"],
+            c["cache"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            1.0 / LOG2E,
+        )
+    else:
+        # A ragged batch: the short requests never store to their tail pages.
+        lens = [512, 256, 128, 512]
+        q, cache, bt, seq, mb = make_case(len(lens), 1, 1, lens)
+        out = score_flydsl(q, cache, bt, seq, 1, 1, D**-0.5, mb)
+    assert (out == neg_inf).any(), "nothing was skipped; the case proves nothing"
+    assert torch.isfinite(out[out != neg_inf]).all()
 
 
 @requires_gfx950
