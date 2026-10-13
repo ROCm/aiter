@@ -35,36 +35,6 @@ def compile_moe_gemm2(
     down_path="default",
     down_output_padding_bytes=0,
 ):
-    if down_path != "default":
-        from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
-        from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
-
-        builders = {
-            "1x4_64x256": _build_moe_gemm2_1x4_n256,
-            "8x1_compact": _build_moe_gemm2_8x1_compact,
-        }
-        if down_path not in builders:
-            raise ValueError(f"Unsupported Down path: {down_path}")
-        return builders[down_path](
-            N=N,
-            K=K,
-            weight_dtype=weight_dtype,
-            weight_quant_type=weight_quant_type,
-            TOPK=TOPK,
-            BLOCK_TILE_SIZE_M=BLOCK_TILE_SIZE_M,
-            BLOCK_TILE_SIZE_N=BLOCK_TILE_SIZE_N,
-            alg=alg,
-            E=E,
-            USE_ATOMIC_WRITE=USE_ATOMIC_WRITE,
-            act_quant_type=act_quant_type,
-            tile_k=tile_k,
-            activation=activation,
-            swiglu_limit=swiglu_limit,
-            down_path=down_path,
-            down_output_padding_bytes=down_output_padding_bytes,
-        )
-    if down_output_padding_bytes != 0:
-        raise ValueError("The default Down path does not support output padding")
     TILE_K = 64
     act_quant_type, swiglu_limit = validate_gemm_options(
         weight_dtype,
@@ -81,6 +51,28 @@ def compile_moe_gemm2(
             f"down prefill requires N to be divisible by 256 for paired "
             f"128-wide tiles, got N={N}"
         )
+    if down_path != "default":
+        assert alg == "prefill_1x4" and BLOCK_TILE_SIZE_M == 64
+        assert weight_dtype == "fp8"
+        options = {
+            "N": N,
+            "K": K,
+            "weight_quant_type": weight_quant_type,
+            "act_quant_type": act_quant_type,
+            "TOPK": TOPK,
+            "padding": down_output_padding_bytes,
+        }
+        if down_path == "1x4_64x256":
+            from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
+
+            return _build_moe_gemm2_1x4_n256(**options)
+        if down_path == "8x1_compact":
+            from .gemm2_8x1_compact import _build_moe_gemm2_8x1_compact
+
+            return _build_moe_gemm2_8x1_compact(E=E, **options)
+        raise ValueError(f"Unsupported Down path: {down_path}")
+    if down_output_padding_bytes != 0:
+        raise ValueError("The default Down path does not support output padding")
 
     if alg == "splitk":
         assert (

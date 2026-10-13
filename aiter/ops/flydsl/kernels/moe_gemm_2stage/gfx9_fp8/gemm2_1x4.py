@@ -14,14 +14,11 @@ from flydsl.expr.typing import Vector as Vec
 
 from . import common as fxh
 from .common import (
+    DOWN_STORE_CACHE_MODIFIER,
     FlyObjCache,
     _f32_to_bf16,
     get_down_device_config,
-    validate_gemm_options,
 )
-
-# gfx942 raw-buffer aux bit 1 selects the non-temporal policy.
-_DOWN_STORE_CACHE_MODIFIER = 2
 
 # ==================== Task setup helpers ====================
 
@@ -141,7 +138,6 @@ def _store_cshuffle_row_pair(
     lds,
     copy_atom,
     store_rsrc,
-    store_cache,
     wave_lds_base,
     lane_id,
     wave_id,
@@ -184,57 +180,25 @@ def _store_cshuffle_row_pair(
             store_rsrc,
             byte_offsets[index].ir_value(),
             fx.Int32(0).ir_value(),
-            aux=ir.IntegerAttr.get(fx.Int32.ir_type, store_cache),
+            aux=ir.IntegerAttr.get(fx.Int32.ir_type, DOWN_STORE_CACHE_MODIFIER),
         )
 
 
 def _build_moe_gemm2_1x4_n256(
-    N,
-    K,
-    weight_dtype,
-    weight_quant_type,
-    TOPK,
-    BLOCK_TILE_SIZE_M,
-    BLOCK_TILE_SIZE_N,
-    stage="down",
-    alg="splitk",
-    E=None,
-    USE_ATOMIC_WRITE=True,
-    act_quant_type=None,
-    tile_k=None,
-    activation="silu",
-    swiglu_limit=None,
-    down_path="default",
-    down_output_padding_bytes=None,
-    _task_table=False,
-    _store_cache=_DOWN_STORE_CACHE_MODIFIER,
+    *, N, K, weight_quant_type, act_quant_type, TOPK, padding, _task_table=False
 ):
-    assert stage == "down" and alg == "prefill_1x4" and down_path == "1x4_64x256"
-    assert weight_dtype == "fp8"
-    # Activation scales default to the weight form; shared checks cover the supported combos.
-    act_quant_type, _ = validate_gemm_options(
-        weight_dtype,
-        weight_quant_type,
-        act_quant_type,
-        BLOCK_TILE_SIZE_M,
-        alg,
-        activation,
-        swiglu_limit,
-    )
-    assert BLOCK_TILE_SIZE_M == 64 and BLOCK_TILE_SIZE_N == 256
-    assert N % BLOCK_TILE_SIZE_N == 0 and K % 64 == 0
-    assert down_output_padding_bytes in (0, 32, 64, 128)
+    assert padding in (0, 32, 64, 128)
     _, generic_xcd_count = get_down_device_config()
     block_m_per_4wave_group = 64
     activation_bytes = block_m_per_4wave_group * K
-    scale_bytes = BLOCK_TILE_SIZE_N * 4 if weight_quant_type == "ptpc" else 0
+    scale_bytes = 256 * 4 if weight_quant_type == "ptpc" else 0
     cshuffle_bytes = 4 * 16 * 64 * (fx.BFloat16.width // 8)
     assert activation_bytes + scale_bytes + cshuffle_bytes <= 64 * 1024, (
         "1x4_64x256 exceeds gfx942 LDS capacity; "
         f"activation={activation_bytes}B, scale={scale_bytes}B, "
         f"cshuffle={cshuffle_bytes}B"
     )
-    output_row_stride = N + down_output_padding_bytes // (fx.BFloat16.width // 8)
+    output_row_stride = N + padding // (fx.BFloat16.width // 8)
 
     weight_dtype = fx.Float8E4M3FNUZ
     down_ops = FlyObjCache(cache_ir=False)
@@ -479,7 +443,6 @@ def _build_moe_gemm2_1x4_n256(
                 cshuffle_lds,
                 cshuffle_copy_atom,
                 output_store_rsrc,
-                _store_cache,
                 block_n_size=BLOCK_N,
                 wave_n=WAVE_N,
                 row_stride=output_row_stride,

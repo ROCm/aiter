@@ -9,6 +9,7 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
+from flydsl._mlir.dialects import vector as vector_dialect
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import arith, const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
@@ -16,11 +17,11 @@ from flydsl.expr.typing import as_ir_value
 
 from . import common as fxh
 from .common import (
+    DOWN_STORE_CACHE_MODIFIER,
     BufferTensor,
     FlyObjCache,
     LdsTensor,
     _f32_to_bf16,
-    eltwise_op,
     get_down_device_config,
 )
 
@@ -103,22 +104,45 @@ def read_8x1_scale_g2r(n, pair, *, weight_quant_type, scale_buffer, mm, ops):
         return fx.Float32(1.0)
 
 
+def _fma_f32(a, b):
+    # Per-element inline v_fma_f32(a, b, 0.0) pins the explicit f32 instruction order.
+    a, b, zero = as_ir_value(a), as_ir_value(b), as_ir_value(fx.Float32(0.0))
+    f32 = ir.F32Type.get()
+    lanes = []
+    for i in range(a.type.shape[0]):
+        operands = [
+            vector_dialect.extract(x, static_position=[i], dynamic_position=[])
+            for x in (a, b)
+        ]
+        lanes.append(
+            llvm.inline_asm(
+                f32,
+                operands + [zero],
+                "v_fma_f32 $0, $1, $2, $3",
+                "=v,v,v,v",
+                has_side_effects=False,
+            )
+        )
+    return Vec(
+        vector_dialect.from_elements(ir.VectorType.get([len(lanes)], f32), lanes)
+    )
+
+
 def pack_8x1_record(pair, scale, *, c, row_scale, weight_quant_type):
     weighted, rows = [], []
     for row in range_constexpr(2):
         for ng in range_constexpr(2 * pair, 2 * pair + 2):
             if const_expr(weight_quant_type == "ptpc"):
                 weighted.append(
-                    eltwise_op(
-                        "v_fma_f32",
+                    _fma_f32(
                         Vec(c[None, ng, row].load()),
                         Vec(scale[None, ng % 2, row].load()),
-                        fx.Float32(0.0),
                     )
                 )
             else:
                 weighted.append(Vec(c[None, ng, row].load()))
-            rows.append(Vec(row_scale[None, ng, row].load()))
+            # Row scales vary only by token row; one shared scalar avoids spilled splat copies.
+            rows.append(Vec(row_scale[None, 0, row].load())[0])
     records = [[], []]
     for index in range_constexpr(4):
         packed = _f32_to_bf16(weighted[index] * rows[index]).bitcast(fx.Uint32)
@@ -682,17 +706,8 @@ def _run_8x1_pipeline(
 
 
 # ==================== Entry point ====================
-def _build_moe_gemm2_8x1(
-    *, N, K, weight_quant_type, act_quant_type, TOPK, tile_k, padding, store_cache
-):
+def _build_moe_gemm2_8x1(*, N, K, weight_quant_type, act_quant_type, TOPK, padding):
     """M256 full-task kernel of the compact Down path; the compact builder validates shapes."""
-    assert tile_k in (None, 128) or (
-        K == 192 and tile_k == 192
-    ), "8x1 keeps one K192 block of 192 and BK128 for other K values"
-    # K192 uses one block of 192; accept callers passing tile_k=128.
-    tile_k = 192 if K == 192 else 128
-    assert store_cache in (0, 2), "store aux: 0=normal, 2=SLC"
-
     BM = 256
     ops = FlyObjCache(cache_ir=False)
     topology, xcc_count = get_down_device_config()
@@ -757,11 +772,9 @@ def _build_moe_gemm2_8x1(
                 N,
                 K,
                 TOPK,
-                tile_k,
                 padding,
                 weight_quant_type,
                 act_quant_type,
-                store_cache,
                 ops,
             )
 
@@ -821,16 +834,14 @@ def _emit_k128n_body(
     N,
     K,
     TOPK,
-    tile_k,
     padding,
     weight_quant_type,
     act_quant_type,
-    _store_cache,
     ops,
 ):
     BM = 256
     BN = 128
-    BK = tile_k
+    BK = 128
     NUM_WAVES = 8
     WAVE_M = BM // NUM_WAVES
     KS = K // BK
@@ -1074,7 +1085,7 @@ def _emit_k128n_body(
     cshuffle_write_atom = ops.get_universal_copy_atom(fx.BFloat16, 128)
     cshuffle_read_atom = ops.get_universal_copy_atom(fx.BFloat16, 64)
     output_store_atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy128b(cache_modifier=_store_cache), fx.BFloat16
+        fx.rocdl.BufferCopy128b(cache_modifier=DOWN_STORE_CACHE_MODIFIER), fx.BFloat16
     )
     lane_group = lane // 16
     lane_row = lane % 16
@@ -1303,11 +1314,9 @@ def _emit_k192_body(
     N,
     K,
     TOPK,
-    tile_k,
     padding,
     weight_quant_type,
     act_quant_type,
-    _store_cache,
     ops,
 ):
     BM, BN = 256, 128
@@ -1440,7 +1449,7 @@ def _emit_k192_body(
     ]
     out = _output_tensor(p_output, row_begin, N, BM, STRIDE)
     store_atom = fx.make_copy_atom(
-        fx.rocdl.BufferCopy128b(cache_modifier=_store_cache), fx.BFloat16
+        fx.rocdl.BufferCopy128b(cache_modifier=DOWN_STORE_CACHE_MODIFIER), fx.BFloat16
     )
     scratch_write = ops.get_universal_copy_atom(fx.BFloat16, 128)
     scratch_read = ops.get_universal_copy_atom(fx.BFloat16, 64)

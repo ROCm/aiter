@@ -6,15 +6,16 @@
 Rows keep their original positions; each expert must be one contiguous run of blocks.
 """
 
-from fractions import Fraction
-
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl.expr import const_expr, gpu, range_constexpr
+from flydsl.expr import gpu, range_constexpr
 
 from .gemm2_1x4 import _build_moe_gemm2_1x4_n256
 from .gemm2_8x1 import _build_moe_gemm2_8x1
+
+# Split the final full-task CU round into M64 tails when it fills under 3/5 of the CUs.
+_SPLIT_NUM, _SPLIT_DEN = 3, 5
 
 
 def device_cu_count():
@@ -25,24 +26,11 @@ def device_cu_count():
     )
 
 
-def _balance_parameters(cu_count, min_tail_utilization):
-    assert 0 <= min_tail_utilization <= 1
-    threshold = Fraction(str(min_tail_utilization)).limit_denominator(1_000_000)
-    if cu_count is None:
-        cu_count = device_cu_count()
-    assert isinstance(cu_count, int) and not isinstance(cu_count, bool) and cu_count > 0
-    numerator, denominator = threshold.numerator, threshold.denominator
-    max_split = max(0, (cu_count * numerator - 1) // denominator)
-    return cu_count, numerator, denominator, max_split
-
-
-def task_capacities(
-    metadata_capacity, experts, *, cu_count=None, min_tail_utilization=0.6
-):
+def task_capacities(metadata_capacity, experts):
     assert metadata_capacity >= 0 and 0 < experts <= 2048
-    _, _, _, max_split = _balance_parameters(cu_count, min_tail_utilization)
     # An expert has at most three native tails. Each split full task adds four
     # tails, and total tail tasks cannot exceed the number of metadata blocks.
+    max_split = (device_cu_count() * _SPLIT_NUM - 1) // _SPLIT_DEN
     max_split = min(metadata_capacity // 4, max_split)
     return max(1, (metadata_capacity + 3) // 4), max(
         1, min(metadata_capacity, 3 * experts + 4 * max_split)
@@ -50,7 +38,7 @@ def task_capacities(
 
 
 def allocate_task_buffers(sorted_expert_ids, experts):
-    """Allocate from tensor sizes using the compact launcher's default policy."""
+    """Allocate from tensor sizes using the compact launcher's split policy."""
     full, tail = task_capacities(sorted_expert_ids.numel(), experts)
     return (
         torch.empty((full, 2), dtype=torch.int32, device=sorted_expert_ids.device),
@@ -59,11 +47,9 @@ def allocate_task_buffers(sorted_expert_ids, experts):
     )
 
 
-def build_task_table(experts, *, cu_count=None, min_tail_utilization=0.6):
+def build_task_table(experts):
     assert 0 < experts <= 2048
-    cu_count, threshold_numerator, threshold_denominator, _ = _balance_parameters(
-        cu_count, min_tail_utilization
-    )
+    cu_count = device_cu_count()
     width = max(256, 1 << (experts - 1).bit_length())
     threads = 256
     rounds = width // threads
@@ -127,19 +113,14 @@ def build_task_table(experts, *, cu_count=None, min_tail_utilization=0.6):
             gpu.barrier()
         original_full = shared[3 * width - 1]
         original_tail = shared[4 * width - 1]
-        if const_expr(threshold_numerator > 0):
-            remainder = original_full % cu_count
-            # Split a sparsely occupied final CU round; a complete round stays.
-            split_full = fx.arith.select(
-                (remainder > 0)
-                & (remainder * threshold_denominator < cu_count * threshold_numerator),
-                remainder,
-                fx.Int32(0),
-            )
-            keep_full = original_full - split_full
-        else:
-            split_full = fx.Int32(0)
-            keep_full = original_full
+        remainder = original_full % cu_count
+        # Split a sparsely occupied final CU round; a complete round stays.
+        split_full = fx.arith.select(
+            (remainder > 0) & (remainder * _SPLIT_DEN < cu_count * _SPLIT_NUM),
+            remainder,
+            fx.Int32(0),
+        )
+        keep_full = original_full - split_full
         if tid == 0:
             counts[0] = keep_full * 256
             counts[1] = (original_tail + 4 * split_full) * 64
@@ -151,46 +132,33 @@ def build_task_table(experts, *, cu_count=None, min_tail_utilization=0.6):
                 full_count, tail_count = size // 4, size % 4
                 full_begin = shared[2 * width + expert] - full_count
                 tail_begin = shared[3 * width + expert] - tail_count
-                if const_expr(threshold_numerator > 0):
-                    # Convert a suffix of the full-task table, preserving rows.
-                    split_before = fx.arith.select(
-                        full_begin > keep_full, full_begin - keep_full, fx.Int32(0)
-                    )
-                    split_through = fx.arith.select(
-                        full_begin + full_count > keep_full,
-                        full_begin + full_count - keep_full,
-                        fx.Int32(0),
-                    )
-                    split_here = split_through - split_before
-                    tail_begin += 4 * split_before
+                # Convert a suffix of the full-task table, preserving rows.
+                split_before = fx.arith.select(
+                    full_begin > keep_full, full_begin - keep_full, fx.Int32(0)
+                )
+                split_through = fx.arith.select(
+                    full_begin + full_count > keep_full,
+                    full_begin + full_count - keep_full,
+                    fx.Int32(0),
+                )
+                split_here = split_through - split_before
+                tail_begin += 4 * split_before
                 for index in range(fx.Int32(0), full_count, 1):
                     slot = full_begin + index
-                    if const_expr(threshold_numerator > 0):
-                        if slot < keep_full:
-                            full_tasks[2 * slot] = (start + 4 * index) * 64
-                            full_tasks[2 * slot + 1] = expert
-                        else:
-                            converted_index = slot - keep_full - split_before
-                            for part64 in range_constexpr(4):
-                                tail_slot = tail_begin + 4 * converted_index + part64
-                                tail_tasks[2 * tail_slot] = (
-                                    start + 4 * index + part64
-                                ) * 64
-                                tail_tasks[2 * tail_slot + 1] = expert
-                    else:
+                    if slot < keep_full:
                         full_tasks[2 * slot] = (start + 4 * index) * 64
                         full_tasks[2 * slot + 1] = expert
+                    else:
+                        converted_index = slot - keep_full - split_before
+                        for part64 in range_constexpr(4):
+                            tail_slot = tail_begin + 4 * converted_index + part64
+                            tail_tasks[2 * tail_slot] = (
+                                start + 4 * index + part64
+                            ) * 64
+                            tail_tasks[2 * tail_slot + 1] = expert
                 for index in range_constexpr(3):
                     if index < tail_count:
-                        slot = (
-                            tail_begin
-                            + (
-                                4 * split_here
-                                if const_expr(threshold_numerator > 0)
-                                else 0
-                            )
-                            + index
-                        )
+                        slot = tail_begin + 4 * split_here + index
                         tail_tasks[2 * slot] = (start + 4 * full_count + index) * 64
                         tail_tasks[2 * slot + 1] = expert
 
@@ -211,60 +179,28 @@ def build_task_table(experts, *, cu_count=None, min_tail_utilization=0.6):
 
 
 def _build_moe_gemm2_8x1_compact(
-    N,
-    K,
-    weight_dtype,
-    weight_quant_type,
-    TOPK,
-    BLOCK_TILE_SIZE_M,
-    BLOCK_TILE_SIZE_N,
-    stage="down",
-    alg="splitk",
-    E=None,
-    USE_ATOMIC_WRITE=True,
-    act_quant_type=None,
-    tile_k=None,
-    activation="silu",
-    swiglu_limit=None,
-    down_path="default",
-    down_output_padding_bytes=None,
-    _store_cache=2,
+    *, N, K, E, weight_quant_type, act_quant_type, TOPK, padding
 ):
-    assert stage == "down" and alg == "prefill_1x4" and down_path == "8x1_compact"
-    assert BLOCK_TILE_SIZE_M == 64 and BLOCK_TILE_SIZE_N == 128
     assert E is not None and 0 < E <= 2048
     assert K in (192, 256, 384, 512, 640)
     # 8x1 runs N0, N1, an N loop and tail tiles, so it needs at least four N128 tiles.
     assert N >= 512 and N % 256 == 0
-    assert not USE_ATOMIC_WRITE
-    assert down_output_padding_bytes in (0, 32, 64, 128)
-    # The M64 tail builder also validates the dtype and quant combination of the full tasks.
     tail = _build_moe_gemm2_1x4_n256(
         N=N,
         K=K,
-        weight_dtype=weight_dtype,
         weight_quant_type=weight_quant_type,
-        TOPK=TOPK,
-        BLOCK_TILE_SIZE_M=64,
-        BLOCK_TILE_SIZE_N=256,
-        alg=alg,
         act_quant_type=act_quant_type,
-        activation=activation,
-        swiglu_limit=swiglu_limit,
-        down_path="1x4_64x256",
-        down_output_padding_bytes=down_output_padding_bytes,
+        TOPK=TOPK,
+        padding=padding,
         _task_table=True,
-        _store_cache=_store_cache,
     )
     full = _build_moe_gemm2_8x1(
         N=N,
         K=K,
         weight_quant_type=weight_quant_type,
-        act_quant_type=act_quant_type or weight_quant_type,
+        act_quant_type=act_quant_type,
         TOPK=TOPK,
-        tile_k=tile_k,
-        padding=down_output_padding_bytes,
-        store_cache=_store_cache,
+        padding=padding,
     )
     build = build_task_table(E)
 
