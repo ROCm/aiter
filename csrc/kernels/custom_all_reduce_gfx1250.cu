@@ -20,6 +20,7 @@
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
 #include <cstring>
+#include <limits>
 
 using fptr_t = int64_t;
 static_assert(sizeof(void*) == sizeof(fptr_t));
@@ -36,10 +37,7 @@ fptr_t init_custom_ar(int64_t meta_ptr,
                       bool fully_connected)
 {
     int world_size = all_meta_ptrs.size();
-    if(world_size > 4)
-        throw std::invalid_argument("gfx1250 custom allreduce: world size > 4 is not supported");
-    if(world_size % 2 != 0)
-        throw std::invalid_argument("Odd num gpus is not supported for now");
+    aiter::check_ngpus(world_size);
     if(rank < 0 || rank >= world_size)
         throw std::invalid_argument("invalid rank passed in");
 
@@ -63,16 +61,13 @@ fptr_t init_custom_ar_ipc(int64_t meta_ptr,
                           bool fully_connected)
 {
     int world_size = offsets.size();
-    if(world_size > 4)
-        throw std::invalid_argument("gfx1250 custom allreduce: world size > 4 is not supported");
-    if(world_size % 2 != 0)
-        throw std::invalid_argument("Odd num gpus is not supported for now");
+    aiter::check_ngpus(world_size);
     if(world_size != (int)ipc_handle_ptrs.size())
         throw std::invalid_argument("handles length should equal to offsets length");
     if(rank < 0 || rank >= world_size)
         throw std::invalid_argument("invalid rank passed in");
 
-    hipIpcMemHandle_t ipc_handles[4];
+    hipIpcMemHandle_t ipc_handles[aiter::kMaxNgpus];
     for(int i = 0; i < world_size; i++)
     {
         std::memcpy(&ipc_handles[i], (void*)ipc_handle_ptrs[i], sizeof(hipIpcMemHandle_t));
@@ -96,9 +91,12 @@ void dispose(fptr_t _fa)
 // The LL fast path derives each peer's scratch base as (peer meta) +
 // kLLScratchOffset, reusing the existing cross-rank meta exchange. The whole
 // region is zero-initialized by the caller (which also resets the LL flags).
-int64_t meta_size()
+// Takes world_size because the LL scratch is sized by it. Reserving
+// kLLMaxRanks slots unconditionally made TP=2 pay for eight ranks' worth.
+int64_t meta_size(int64_t world_size)
 {
-    return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes());
+    aiter::check_ngpus((int)world_size);
+    return (int64_t)(aiter::kLLScratchOffset + aiter::llScratchBytes((int)world_size));
 }
 
 // ---- Internal dispatch helper ----
@@ -292,6 +290,18 @@ static void _all_gather(fptr_t _fa, void* inp, void* out,
     hipStream_t stream = aiter::getCurrentHIPStream();
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
 
+    // The allgather kernels index their output with int, and that index scales
+    // with world_size. Checked here while numel is still int64_t, which covers
+    // all four kernels plus the narrowing below. Needed because all_gather_reg
+    // and custom_all_gather never consult should_custom_ag.
+    const int64_t out_numel = numel * fa->world_size_;
+    if(out_numel > std::numeric_limits<int>::max())
+        throw std::runtime_error(
+            "gfx1250 allgather: output element count " + std::to_string(out_numel) +
+            " (numel " + std::to_string(numel) + " x world_size " +
+            std::to_string(fa->world_size_) + ") exceeds the int32 index range; "
+            "route this size through should_custom_ag / RCCL instead");
+
 #define AG_DISPATCH_DIM0(T)                                         \
     do {                                                            \
         auto d = 16 / sizeof(T);                                    \
@@ -471,12 +481,11 @@ void start_sync_latency(fptr_t _fa, int64_t blocks)
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     int ws = fa->world_size_;
     constexpr int threads = 256;
-    if(ws == 2)
-        aiter::start_sync_latency<2><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
-    else
-        aiter::start_sync_latency<4><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
+#define LAUNCH_START_SYNC(NG) \
+    aiter::start_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+        fa->sg_, fa->self_sg_, fa->rank_)
+    DISPATCH_NGPUS_1250(ws, LAUNCH_START_SYNC);
+#undef LAUNCH_START_SYNC
 }
 
 void end_sync_latency(fptr_t _fa, int64_t blocks)
@@ -485,12 +494,11 @@ void end_sync_latency(fptr_t _fa, int64_t blocks)
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     int ws = fa->world_size_;
     constexpr int threads = 256;
-    if(ws == 2)
-        aiter::end_sync_latency<2><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
-    else
-        aiter::end_sync_latency<4><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
+#define LAUNCH_END_SYNC(NG) \
+    aiter::end_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+        fa->sg_, fa->self_sg_, fa->rank_)
+    DISPATCH_NGPUS_1250(ws, LAUNCH_END_SYNC);
+#undef LAUNCH_END_SYNC
 }
 
 void two_sync_latency(fptr_t _fa, int64_t blocks)
@@ -499,12 +507,11 @@ void two_sync_latency(fptr_t _fa, int64_t blocks)
     auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
     int ws = fa->world_size_;
     constexpr int threads = 256;
-    if(ws == 2)
-        aiter::two_sync_latency<2><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
-    else
-        aiter::two_sync_latency<4><<<blocks, threads, 0, stream>>>(
-            fa->sg_, fa->self_sg_, fa->rank_);
+#define LAUNCH_TWO_SYNC(NG) \
+    aiter::two_sync_latency<NG><<<blocks, threads, 0, stream>>>( \
+        fa->sg_, fa->self_sg_, fa->rank_)
+    DISPATCH_NGPUS_1250(ws, LAUNCH_TWO_SYNC);
+#undef LAUNCH_TWO_SYNC
 }
 
 } // namespace aiter
