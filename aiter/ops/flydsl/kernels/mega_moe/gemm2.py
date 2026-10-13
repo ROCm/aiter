@@ -182,12 +182,16 @@ def gemm2_compute_v2(
     SBM=None,
     g2_bhoist=True,
     g2_ascale_pf=True,
+    g2_b2stage=False,
+    g2_deep_a_pipeline=False,
     expert_offset=0,
     explicit_m_row=None,
     explicit_n_block=None,
     explicit_expert=None,
 ):
     """Run GEMM2, optionally using an explicitly selected expert row/tile."""
+    assert aStages == (4 if g2_deep_a_pipeline else kStages + 1)
+    assert not g2_deep_a_pipeline or g2_b2stage
     # SBM is the sort padding unit; BM is the compute tile and must divide SBM.
     if SBM is None:
         SBM = BM
@@ -219,6 +223,8 @@ def gemm2_compute_v2(
     num_n_blocks = N_OUT_rt // fx.Int32(BN)
     KH4 = K_rt // fx.Int32(8)  # i32 col stride (= K_HALF//4)
     K_SCALE_CHUNKS_MAX = INTER_MAX // 256
+    kFenceEvery = (aStages - kStages) if g2_deep_a_pipeline else 1
+    assert kFenceEvery >= 1
 
     # Padded shapes mask weight tiles beyond the real K/N extents.
     N_real = None
@@ -516,7 +522,7 @@ def gemm2_compute_v2(
                 n += 1
         return n
 
-    if const_expr(BM == 64 and BN == 256):
+    if const_expr(BM == 64 and BN == 256 and not g2_b2stage):
         # BM64/BN256 uses the 1-stage B path unconditionally.
         for kt_iv, state in range(
             fx.Int32(0),
@@ -650,9 +656,13 @@ def gemm2_compute_v2(
             kt_rt = fx.Int32(kt_iv)
             if const_expr(g2_bhoist):
                 prefetch_next_b(kt_rt)
-            gpu.barrier()
-            issue_a_ds_read(kt_rt % fx.Int32(aStages))
+            if const_expr(g2_deep_a_pipeline):
+                if (kt_rt % fx.Int32(kFenceEvery)) == fx.Int32(0):
+                    gpu.barrier()
+            else:
+                gpu.barrier()
             nxt_a = kt_rt + fx.Int32(kStages)
+            issue_a_ds_read(kt_rt % fx.Int32(aStages))
             if nxt_a < K_TILES_RT:
                 issue_a_load_lds(nxt_a % fx.Int32(aStages), nxt_a)
             # A-scale from the prefetch carry (g2_ascale_pf) or loaded synchronously here.

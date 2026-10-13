@@ -18,12 +18,13 @@ post_j, comb[h][j] and pre_j were produced by the previous seam; pre', post' and
 comb' are consumed by the next one.
 
 Two launches. The main kernel is a split-K GEMM over the hidden dimension: a program
-owns 16 tokens and a slice of columns of all four streams, post-mixes them in fp32,
+owns BLOCK_M tokens and a slice of columns of all four streams, post-mixes them in fp32,
 stores the bf16 residual, writes the collapse un-normalised while the tile is in
-registers, and accumulates its slice of the projection (fp32 MFMA) and of the two
-square sums into one partial row per (token, slice). The reduce kernel finishes one
-token per program: it sums the partial rows, computes the gates (Sinkhorn with the
-hardware reciprocal) and applies the RMSNorm to the staged collapse in place.
+registers, and accumulates its slice of the projection (bf16 MFMA against fn split into
+bf16 hi + lo) and of the two square sums into one partial row per (token, slice). The
+reduce kernel finishes one token per program: it sums the partial rows, computes the
+gates (Sinkhorn with the hardware reciprocal) and applies the RMSNorm to the staged
+collapse in place.
 """
 
 import triton
@@ -70,8 +71,8 @@ def _mhc_fused_post_pre_delayed_rmsnorm_main_kernel(
     H / NUM_KSPLIT hidden columns of all four streams, walked in k-steps of TILE_K columns.
 
     Each k-step loads the four stream tiles and the x tile, post-mixes them in fp32,
-    stores the bf16 residual and the collapse, and feeds one fp32 MFMA dot with the
-    streams concatenated along K (k = 4 * column + stream).
+    stores the bf16 residual and the collapse, and feeds two bf16 MFMA dots (fn hi, fn lo)
+    with the streams concatenated along K (k = stream * TILE_K + column).
     """
     tl.static_assert(BLOCK_M % 16 == 0, "BLOCK_M is the M dimension of the MFMA dot")
     tl.static_assert(H % (NUM_KSPLIT * TILE_K) == 0, "the k-loop has no column mask")
@@ -185,9 +186,11 @@ def _mhc_fused_post_pre_delayed_rmsnorm_main_kernel(
         tl.store(layer_input_ptr + rm[:, None] * H + rc[None, :], x1, mask=m2)
         x1f = x1.to(tl.float32)
         sq_x += x1f * x1f
-        # projection: A = the four stream tiles interleaved along K (k = 4*c + stream),
-        # B = the matching fn columns; Triton loads fn straight into the MFMA B layout
-        a = tl.reshape(tl.join(tl.join(g0, g2), tl.join(g1, g3)), (BLOCK_M, 4 * TILE_K))
+        # concatanate the fours streams along K, k = stream * TILE_K + column, same as fn_t
+        a = tl.reshape(
+            tl.permute(tl.join(tl.join(r0, r2), tl.join(r1, r3)), (0, 2, 3, 1)),
+            (BLOCK_M, 4 * TILE_K),
+        )
         fn_t = tl.load(
             fn_ptr
             + rn[:, None, None] * (4 * H)
@@ -196,8 +199,14 @@ def _mhc_fused_post_pre_delayed_rmsnorm_main_kernel(
             mask=n_mask[:, None, None],
             other=0.0,
         )  # (32, 4, TILE_K) fp32
-        b = tl.reshape(tl.permute(fn_t, (0, 2, 1)), (32, 4 * TILE_K))
-        acc = tl.dot(a, tl.trans(b), acc=acc, input_precision="ieee")
+        b = tl.reshape(fn_t, (32, 4 * TILE_K))
+
+        # split fn into two bf16s: hi = bf16(fn), lo = bf16(fn - hi) (what hi lost)
+        # both products accumulate into acc
+        b_hi = b.to(tl.bfloat16)
+        b_lo = (b - b_hi.to(tl.float32)).to(tl.bfloat16)
+        acc = tl.dot(a, tl.trans(b_hi), acc=acc)
+        acc = tl.dot(a, tl.trans(b_lo), acc=acc)
 
     vals = tl.where(
         rn[None, :] == 24,

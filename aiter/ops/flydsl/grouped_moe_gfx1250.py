@@ -65,10 +65,15 @@ def _as_bool(value, default: bool) -> bool:
 def _as_int(value, default: int | None) -> int | None:
     # The tuner rewrites its frame through pandas' ``astype(str)``, so a blank
     # cell can come back as the literal "nan"; read those as unset like _cell.
+    # The model_configs/ merge goes through pandas, which stores an int column
+    # with blank cells as float; accept such integral floats, reject the rest.
     text = "" if value is None else str(value).strip()
     if text == "" or text.lower() in ("nan", "none"):
         return default
-    return int(text)
+    number = float(text)
+    if not number.is_integer():
+        raise ValueError(f"expected an integer config value, got {text!r}")
+    return int(number)
 
 
 def _dtype_name(dtype) -> str:
@@ -185,9 +190,9 @@ def _find_grouped_config(
     if not matches:
         matches = [row for row in rows if _matches(row, require_cu_num=False)]
     # A row that names ep_fused explicitly was tuned for that path, so it wins
-    # over an otherwise equal row that serves both. These are hand-picked, not
-    # tuned: measuring the fused path needs a live multi-rank arena for gemm2's
-    # scatter epilogue, which the single-GPU bench cannot stand up.
+    # over an otherwise equal row that serves both. Measuring the fused path
+    # needs a live multi-rank arena for GEMM2's scatter epilogue, so its tuning
+    # must use the multi-GPU benchmark.
     ep_specific = [row for row in matches if _cell(row, "ep_fused")]
     if ep_specific:
         matches = ep_specific
@@ -364,16 +369,18 @@ def _use_fused_quant_preshuffle(
 
 
 @functools.cache
-def _get_compiled_g2l_lut(clear_counter: bool = True):
+def _get_compiled_g2l_lut(max_experts: int = 512, clear_counter: bool = True):
     """Compile and cache the single-block FlyDSL g2l-LUT builder."""
     from aiter.ops.flydsl.kernels.moe_g2l_lut import build_moe_g2l_lut_module
 
-    return build_moe_g2l_lut_module(clear_counter=clear_counter)
+    return build_moe_g2l_lut_module(
+        clear_counter=clear_counter, max_experts=max_experts
+    )
 
 
 # Single-workgroup scan ceiling (matches moe_g2l_lut.MAX_G2L_EXPERTS); larger
 # masks fall back to the torch chain.
-_G2L_MAX_N = 512
+_G2L_MAX_N = 1024
 
 
 _G2L_COUNTER_CACHE: dict[tuple[int, str], torch.Tensor] = {}
@@ -472,11 +479,12 @@ def _build_g2l_lut(
             )
             nvr = torch.empty(1, dtype=torch.int32, device=device)
             _get_compiled_g2l_lut(
+                max_experts=512 if n <= 512 else 1024,
                 clear_counter=not (
                     _flydsl_dispatch_context() is not None
                     and os.environ.get("AITER_TDM_DIRECT_EP_MASK", "1")
                     in ("1", "true", "True")
-                )
+                ),
             )(
                 ptr_arg(mask),
                 ptr_arg(lut),
@@ -574,12 +582,19 @@ def _grouped_a8w4_tdm_moe(
     m_warp2=None,
     n_warp2=None,
     num_buffers2=None,
+    cluster_m=-1,
     cluster_n=-1,
+    cluster_m2=-1,
     cluster_n2=None,
     waves_per_tensor_tdm=-1,
+    waves_per_tensor_tdm2=None,
     next_stage_prefetch=0,
     tdm_as_in_prologue=0,
     tdm_b_th=0,
+    lds_soa_load_interleave=0,
+    rolled_drain=0,
+    persistent_workers=0,
+    persistent_workers2=0,
     data_format="a8w4",
     expert_mask=None,
     num_local_tokens=None,
@@ -616,6 +631,8 @@ def _grouped_a8w4_tdm_moe(
         tile_k2 = tile_k
     if num_buffers2 is None:
         num_buffers2 = num_buffers
+    if waves_per_tensor_tdm2 is None:
+        waves_per_tensor_tdm2 = waves_per_tensor_tdm
     if m_warp2 is None:
         m_warp2 = m_warp
     if n_warp2 is None:
@@ -912,10 +929,29 @@ def _grouped_a8w4_tdm_moe(
             f"row at model_dim {model_dim}, got {_src_width}"
         )
 
-    # A quantizing TDM dispatch lands the e8m0 row on the wire row-major, one row
-    # per dest row: nothing local re-lays it out, so gemm1 takes the 16-row
-    # interleave on its LDS->register read instead.
-    _row_major_ascale = _compact and _prequantized
+    # A quantizing TDM dispatch lands the e8m0 row on the wire row-major.
+    # Compact dispatch is already in GEMM row order, so gemm1 interleaves on
+    # the LDS read. The mori path still has to gather into grouped rows; it
+    # writes those scales row-major too. Scattering them into the interleaved
+    # layout in this kernel, then having gemm1 read that layout, was slower
+    # than one coalesced store plus the row-major LDS read -- BUT only on the
+    # decode kernel (tile_m=256, wmma_rep=8). gemm1's row-major A-scale read is
+    # a strided ds_read with a 2-way bank conflict; on the prefill tile
+    # (tile_m=64, m_warp=1) that conflict costs more than the preshuffle saves
+    # (measured: gemm1 +18%, net +9us/layer at 4k tokens), and on tiny decode
+    # batches (<~1k tokens) the small-M gemm1 regresses too. Gate on both so
+    # prefill and ramp steps keep the original interleaved store untouched.
+    _rm_min_tokens = int(os.environ.get("AITER_TDM_ROW_MAJOR_A1_MIN_TOKENS", "1024"))
+    _row_major_a1 = (
+        _prequantized
+        and not _compact
+        and not _fuse_ep_route_quant
+        and ep_psum_params is None
+        and int(tile_m) >= 256
+        and int(token_num) >= _rm_min_tokens
+        and os.environ.get("AITER_TDM_ROW_MAJOR_A1_SCALE", "1") in ("1", "true", "True")
+    )
+    _row_major_ascale = (_compact and _prequantized) or _row_major_a1
     # Local quant instead writes one compact row-major row per token and rebuilds
     # the interleaved layout gemm1 reads in a second pass, so neither write lands
     # 4 B per cache line. A compact plan drives the GEMM off recv rows and passes
@@ -985,6 +1021,7 @@ def _grouped_a8w4_tdm_moe(
             out_scale=_compact_ascale_buf,
             row_to_token=_row_to_token,
             ep_psum_params=ep_psum_params,
+            row_major_scale=_row_major_a1,
         )
         if _compact_ascale:
             a1_scale = flydsl_moe_scatter_preshuffle_scale(
@@ -999,7 +1036,10 @@ def _grouped_a8w4_tdm_moe(
     # Fuse gemm1 activation + MX quantization + scale preshuffle into the
     # kernel epilogue, eliminating the standalone
     # flydsl_moe_fused_quant_preshuffle call between gemm1 and gemm2.
-    _fuse_quant = _b1 is None
+    disable_gemm1_requant = _as_bool(
+        os.environ.get("AITER_FLYDSL_DISABLE_GEMM1_REQUANT"), False
+    )
+    _fuse_quant = _b1 is None and not disable_gemm1_requant
     w1_u8 = _grouped_weight_uint8(w1)
     w1s_i32 = w1_scale.reshape(-1).view(torch.int32)
 
@@ -1044,11 +1084,15 @@ def _grouped_a8w4_tdm_moe(
             stage1_quant_out=1,
             quant_scale=a2_scale,
             quant_wmma_rep=wmma_rep2,
+            persistent_workers=persistent_workers,
+            cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1079,11 +1123,15 @@ def _grouped_a8w4_tdm_moe(
             bias=_b1,
             swiglu_limit=sl,
             num_buffers=num_buffers,
+            persistent_workers=persistent_workers,
+            cluster_m=cluster_m,
             cluster_n=cluster_n,
             waves_per_tensor_tdm=waves_per_tensor_tdm,
             next_stage_prefetch=next_stage_prefetch,
             tdm_as_in_prologue=tdm_as_in_prologue,
             tdm_b_th=tdm_b_th,
+            lds_soa_load_interleave=lds_soa_load_interleave,
+            rolled_drain=rolled_drain,
             row_major_ascale=int(_row_major_ascale),
             a_row_stride_bytes=_a1_wire_stride,
             a_scale_row_stride_bytes=_a1_wire_stride,
@@ -1123,11 +1171,15 @@ def _grouped_a8w4_tdm_moe(
         stage1_act=0,
         bias=_b2,
         num_buffers=num_buffers2,
+        persistent_workers=persistent_workers2,
+        cluster_m=cluster_m2,
         cluster_n=cluster_n2,
-        waves_per_tensor_tdm=waves_per_tensor_tdm,
+        waves_per_tensor_tdm=waves_per_tensor_tdm2,
         next_stage_prefetch=next_stage_prefetch,
         tdm_as_in_prologue=tdm_as_in_prologue,
         tdm_b_th=tdm_b_th,
+        lds_soa_load_interleave=lds_soa_load_interleave,
+        rolled_drain=rolled_drain,
         **_ep_gemm2_kwargs,
     )
 
@@ -1149,6 +1201,7 @@ def _grouped_a8w4_tdm_moe(
                     prequantized_scale=src_a1_scale if _prequantized else None,
                     out_payload=a1_payload,
                     out_scale=a1_scale,
+                    row_major_scale=_row_major_a1,
                 ),
             )
         )
@@ -1200,11 +1253,16 @@ def _grouped_a8w4_tdm_moe(
                         stage1_quant_out=1,
                         quant_scale=a2_scale,
                         quant_wmma_rep=wmma_rep2,
+                        persistent_workers=persistent_workers,
+                        cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        row_major_ascale=int(_row_major_ascale),
+                        rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
                 )
@@ -1236,11 +1294,16 @@ def _grouped_a8w4_tdm_moe(
                         bias=_b1,
                         swiglu_limit=sl,
                         num_buffers=num_buffers,
+                        persistent_workers=persistent_workers,
+                        cluster_m=cluster_m,
                         cluster_n=cluster_n,
                         waves_per_tensor_tdm=waves_per_tensor_tdm,
                         next_stage_prefetch=next_stage_prefetch,
                         tdm_as_in_prologue=tdm_as_in_prologue,
                         tdm_b_th=tdm_b_th,
+                        lds_soa_load_interleave=lds_soa_load_interleave,
+                        row_major_ascale=int(_row_major_ascale),
+                        rolled_drain=rolled_drain,
                         **_situ_kw,
                     ),
                 )
@@ -1270,11 +1333,15 @@ def _grouped_a8w4_tdm_moe(
                     stage1_act=0,
                     bias=_b2,
                     num_buffers=num_buffers2,
+                    persistent_workers=persistent_workers2,
+                    cluster_m=cluster_m2,
                     cluster_n=cluster_n2,
-                    waves_per_tensor_tdm=waves_per_tensor_tdm,
+                    waves_per_tensor_tdm=waves_per_tensor_tdm2,
                     next_stage_prefetch=next_stage_prefetch,
                     tdm_as_in_prologue=tdm_as_in_prologue,
                     tdm_b_th=tdm_b_th,
+                    lds_soa_load_interleave=lds_soa_load_interleave,
+                    rolled_drain=rolled_drain,
                 ),
             )
         )
@@ -1531,12 +1598,18 @@ def grouped_gemm_gfx1250_a8w4(
             _tdm_kw["num_buffers2"] = _as_int(
                 cfg_row.get("num_buffer_stage2"), _tdm_kw["num_buffers"]
             )
+            _tdm_kw["cluster_m"] = _as_int(cfg_row.get("cluster_m"), -1)
             _tdm_kw["cluster_n"] = _as_int(cfg_row.get("cluster_n"), -1)
+            _tdm_kw["cluster_m2"] = _as_int(cfg_row.get("cluster_m2"), -1)
             _tdm_kw["cluster_n2"] = _as_int(
                 cfg_row.get("cluster_n2"), _tdm_kw["cluster_n"]
             )
             _tdm_kw["waves_per_tensor_tdm"] = _as_int(
                 cfg_row.get("waves_per_tensor_tdm"), -1
+            )
+            _tdm_kw["waves_per_tensor_tdm2"] = _as_int(
+                cfg_row.get("waves_per_tensor_tdm2"),
+                _tdm_kw["waves_per_tensor_tdm"],
             )
             _tdm_kw["next_stage_prefetch"] = _as_int(
                 cfg_row.get("next_stage_prefetch"), 0
@@ -1545,6 +1618,21 @@ def grouped_gemm_gfx1250_a8w4(
                 cfg_row.get("tdm_as_in_prologue"), 0
             )
             _tdm_kw["tdm_b_th"] = _as_int(cfg_row.get("tdm_b_th"), 0)
+            _tdm_kw["lds_soa_load_interleave"] = _as_int(
+                cfg_row.get("lds_soa_load_interleave"), 0
+            )
+            _tdm_kw["rolled_drain"] = _as_int(cfg_row.get("rolled_drain"), 0)
+            # GEMM1 always has a local epilogue; stage2_scatter only changes
+            # GEMM2, so it does not restrict GEMM1's persistent scheduler.
+            _tdm_kw["persistent_workers"] = _as_int(
+                cfg_row.get("persistent_workers"), 0
+            )
+            # The persistent GEMM2 scheduler supports an ordinary EP scatter,
+            # but quantized scatter requires the nonpersistent grid.
+            if stage2_scatter is None or not stage2_scatter.combine_quant_bits:
+                _tdm_kw["persistent_workers2"] = _as_int(
+                    cfg_row.get("persistent_workers2"), 0
+                )
 
         # Env overrides for tuning (present-check so any set value wins over CSV /
         # defaults). Stage2 (*2) falls back to the stage1 value when unset. Set
