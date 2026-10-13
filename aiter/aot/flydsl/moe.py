@@ -16,7 +16,7 @@ every FlyDSL launch on that path is compiled into the cache instead. This
 module only builds what a caller passes in: activations, routing, and weights
 quantized and preshuffled the way ``op_tests/test_moe_2stage.py`` prepares
 them, plus the caller-side choices a row does not pin down (bias, gate/up
-layout, SiTUv2 betas).
+layout, SiTUv2 betas, ``num_local_tokens``).
 
 A row tuned at token count T also serves smaller M that ``get_padded_M`` maps
 to T, and some compile-time parameters follow the actual M, so each row is
@@ -194,13 +194,16 @@ def _variants(row: dict) -> list[dict]:
         # Unset betas launch with the model defaults; plain SiTU (1.0) must be
         # passed explicitly.
         betas += [(1.0, 1.0), (DEFAULT_SITUV2_BETA, DEFAULT_SITUV2_LINEAR_BETA)]
+    # Callers behind an EP dispatch pass the received token count.
     return [
         {
             "gate_mode": gate_mode.value,
             "bias": bias,
             "beta": beta,
             "linear_beta": linear_beta,
+            "local_tokens": local_tokens,
         }
+        for local_tokens in (False, True)
         for gate_mode in gate_modes
         for bias in biases
         for beta, linear_beta in betas
@@ -360,6 +363,8 @@ def _caller_inputs(job: dict) -> dict:
         "w1_scale": w1_scale,
         "w2_scale": w2_scale,
     }
+    if job["local_tokens"]:
+        inputs["num_local_tokens"] = empty(1, dtype=dtypes.i32)
     if job["bias"] in ("both", "stage1"):
         inputs["bias1"] = empty(experts, w1_rows, dtype=dtypes.fp32)
     if job["bias"] == "both":
@@ -443,6 +448,8 @@ def _describe(job: dict) -> str:
         variant.append(f"bias={job['bias']}")
     if job["beta"] is not None:
         variant.append(f"beta={job['beta']:g}/{job['linear_beta']:g}")
+    if job["local_tokens"]:
+        variant.append("num_local_tokens")
     return (
         f"{job['kernel_name']}  token={job['token']} m={job['m']} "
         f"dims=({job['model_dim']},{job['inter_dim']}) E={job['expert']} "

@@ -38,8 +38,10 @@ need no AOT change.
 - Caller-side choices a row does not fix are enumerated: expert bias where the
   quant family supports it (on both stages, and on stage 1 alone, since a
   stage-2 bias makes the runtime re-select configs whose stage 2 cannot take
-  one), both gate/up layouts for MXMOE stage-1 rows, and the default and model
-  SiTUv2 betas. Combinations the runtime rejects are reported as `[SKIP]`.
+  one), both gate/up layouts for MXMOE stage-1 rows, the default and model
+  SiTUv2 betas, and a received token count (`num_local_tokens`, as callers
+  behind an EP dispatch pass). Combinations the runtime rejects are reported
+  as `[SKIP]`.
 - Rows of the gfx1250 grouped table replay with the gate/up-interleaved
   weights and n32k4 scales gfx1250 callers pass; `_fused_moe_impl` hands them
   to FlyDSL's grouped GEMM. Grouped rows tuned for EP only (`topk` -1, or
