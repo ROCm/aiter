@@ -489,14 +489,7 @@ def _moe_sorting_impl(
         aux_m_indices = torch.empty(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
-        # The sort writes local routes only; EP leaves remote routes at -1,
-        # which the scatter reduce skips.
-        if expert_mask is not None:
-            aux_reverse_sorted = torch.full(
-                (M * topk,), -1, dtype=dtypes.i32, device=device
-            )
-        else:
-            aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+        aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(
