@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import triton
 import triton.language as tl
 from triton.experimental import gluon
@@ -15,6 +17,10 @@ SCALE_GROUP_SIZE = 32
 # B (weights) are blockscale: one e8m0 byte per 128(N) x 128(K) block.
 B_SCALE_N_GROUP = 128
 B_SCALE_K_GROUP = 128
+# LOCAL HACK: MXFP8_DUMMY_SCALES=1 replaces the compute_bound loop's scale reads
+# with a constant e8m0 1.0 (0x7f) to test whether they block wmma/ds_load
+# interleaving. Results are numerically wrong.
+_DUMMY_SCALES = gl.constexpr(os.environ.get("MXFP8_DUMMY_SCALES", "0") == "1")
 
 _PRESHUFFLE_GLUON_REPR_KEYS = [
     "BLOCK_SIZE_M",
@@ -358,6 +364,12 @@ def _read_tile(
         ),
         dot_b_layout,
     )
+    if _DUMMY_SCALES:
+        a_s = (as_zeros_m[:, None] + offs_as_kg[None, :] * 0 + 127).to(
+            a_scale_ptr.dtype.element_ty
+        )
+        b_s = bs_zeros_tile + 127
+        return a, b, a_s, b_s
     if A_SCALE_IN_LDS:
         a_s = _gather_scale_tile(
             as_slab.permute((1, 0)),
@@ -1143,6 +1155,9 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
     LOOP_UNROLL_FACTOR: gl.constexpr = 1,
     B_SCALE_TDM: gl.constexpr = True,
     waves_per_eu: gl.constexpr = 0,
+    CTAS_M: gl.constexpr = 1,
+    CTAS_N: gl.constexpr = 1,
+    num_ctas: gl.constexpr = 1,
 ):
     """
     Gluon gfx1250 kernel for FP8 x FP8 GEMM with preshuffled weights.
@@ -1597,7 +1612,66 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
         cache_modifier=cache_modifier,
     )
 
-    for _ in range(NUM_K_ITER - (NUM_BUFFERS - 1)):
+    # ---- Peeled first main-loop iteration ----
+    # Mirrors gemm_a16w16's compute_bound kernel: one copy of the loop body
+    # ahead of the loop, which then runs one fewer time. Like a16w16, this
+    # assumes NUM_K_ITER >= NUM_BUFFERS.
+    acc = gl.amd.gfx1250.wmma_scaled(
+        cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
+    )
+
+    slot = num_loads % NUM_BUFFERS
+    gl.amd.gfx1250.tdm.async_load(
+        a_desc,
+        [off_am_tdm, num_loads * BLOCK_SIZE_K],
+        tdm_smem_a.index(slot),
+        pred=1,
+    )
+    gl.amd.gfx1250.tdm.async_load(
+        b_desc,
+        [off_bn_tdm, num_loads * BLOCK_SIZE_K * 16],
+        tdm_smem_b.index(slot),
+        pred=1,
+    )
+    gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 2) * 2)
+    num_loads += 1
+    num_computes += 1
+
+    next_a, next_b, next_as, next_bs = _read_tile(
+        tdm_smem_a,
+        tdm_smem_b,
+        num_computes % NUM_BUFFERS,
+        num_computes,
+        as_slab,
+        a_scale_ptr,
+        as_zeros_m,
+        offs_as_kg,
+        as_row_off,
+        stride_ask,
+        bs_flat,
+        bs_zeros_tile,
+        bs_grp_n,
+        offs_bs_kg,
+        k_split_offset,
+        K,
+        BLOCK_SIZE_N=BLOCK_SIZE_N,
+        BLOCK_SIZE_K=BLOCK_SIZE_K,
+        dot_a_layout=dot_a_layout,
+        dot_b_layout=dot_b_layout,
+        A_SCALE_IN_LDS=A_SCALE_IN_LDS,
+        A_SCALE_K_GROUP=A_SCALE_K_GROUP,
+        A_SCALE_COLS=A_SCALE_COLS,
+        B_SCALE_K_GROUP=B_SCALE_K_GROUP,
+        B_SCALE_COLS=B_SCALE_COLS,
+        BS_N_GROUPS=BS_N_GROUPS,
+        cache_modifier=cache_modifier,
+    )
+    cur_a = next_a
+    cur_b = next_b
+    cur_as = next_as
+    cur_bs = next_bs
+
+    for _ in range(NUM_K_ITER - NUM_BUFFERS):
         acc = gl.amd.gfx1250.wmma_scaled(
             cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
         )
@@ -1619,7 +1693,7 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
         num_loads += 1
         num_computes += 1
 
-        cur_a, cur_b, cur_as, cur_bs = _read_tile(
+        next_a, next_b, next_as, next_bs = _read_tile(
             tdm_smem_a,
             tdm_smem_b,
             num_computes % NUM_BUFFERS,
@@ -1648,6 +1722,10 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
             BS_N_GROUPS=BS_N_GROUPS,
             cache_modifier=cache_modifier,
         )
+        cur_a = next_a
+        cur_b = next_b
+        cur_as = next_as
+        cur_bs = next_bs
 
     # ---------------- Epilogue drain ----------------
     # No TDM left to issue; each pass still reads one tile ahead of its wmma so
