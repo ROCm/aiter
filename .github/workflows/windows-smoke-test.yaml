@@ -12,6 +12,9 @@ on:
       - "requirements.txt"
       - "setup.py"
   workflow_dispatch:
+  schedule:
+    # Run daily at 9 PM Beijing Time (UTC+8)
+    - cron: '0 13 * * *'
 
 permissions:
   actions: read
