@@ -31,6 +31,7 @@ from triton.backends.compiler import GPUTarget
 
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.config_utils import AITER_TRITON_CONFIGS_PATH
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.utility.triton.triton_metadata_redirect import AOTMetadataContext
@@ -269,6 +270,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     is_padded_mode: bool,
     WavePerEU: int = 2,
     VarCtxOpt: bool = False,
+    UseBufferLoad: bool = True,
 ):
     gfx_version = get_gfx()
     assert gfx_version in _GLUON_PA_MQA_LOGITS_ARCHS
@@ -332,6 +334,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
     fn_signature["HiddenDim"] = "constexpr"
     fn_signature["CDNA_VERSION"] = "constexpr"
     fn_signature["ARCH"] = "constexpr"
+    if VarCtxOpt and triton_version >= Version("3.5.0"):
+        fn_signature["UseBufferLoad"] = "constexpr"
 
     effective_wave_per_eu = 1 if is_gfx1250 and not Preshuffle else WavePerEU
     effective_num_warps = 1 if is_gfx1250 and Preshuffle else 4
@@ -379,6 +383,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
             "HiddenDim": HiddenDim,
             "CDNA_VERSION": cdna_version,
             "ARCH": gfx_version,
+            **(
+                {"UseBufferLoad": UseBufferLoad}
+                if VarCtxOpt and triton_version >= Version("3.5.0")
+                else {}
+            ),
         },
         attrs={
             (2,): [["tt.divisibility", 16]],  # heads_num
@@ -416,6 +425,8 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         preshuffle_suffix = "_preshuffle" if Preshuffle else ""
         varctx_suffix = "_varctx" if VarCtxOpt else ""
         kernel_str = f"paged_mqa_logits{preshuffle_suffix}{varctx_suffix}_{ChunkQ}x{ChunkK}x{HiddenDim}_B{KVBlockSize}P{padded_str}W{WavePerEU}"
+        if VarCtxOpt and triton_version >= Version("3.5.0") and not UseBufferLoad:
+            kernel_str += "_kv64"
         metadata_pth = f"{AITER_TRITON_CONFIGS_PATH}/paged_mqa_logits/aot/{kernel_str}"
         with AOTMetadataContext(
             kernel_fn.fn.__name__,
@@ -539,6 +550,8 @@ def deepgemm_fp8_paged_mqa_logits(
         VarCtxSchedule = None
 
     VarCtxOpt = VarCtxSchedule is not None
+    # buffer_load uses 32-bit offsets; the packed cache span covers K and scales.
+    use_buffer_load = max_addressable_bytes(kv_cache) < 2**31 - 1 if VarCtxOpt else True
     if VarCtxOpt:
         grid = (TotalCuCount * WavePerEU, 1, 1)
     else:
@@ -555,6 +568,7 @@ def deepgemm_fp8_paged_mqa_logits(
             is_padded_mode=is_padded_mode,
             WavePerEU=WavePerEU,
             VarCtxOpt=VarCtxOpt,
+            UseBufferLoad=use_buffer_load,
         )
         if triton_version >= Version("3.5.0"):
             cdna_version = get_cdna_version()
@@ -587,6 +601,7 @@ def deepgemm_fp8_paged_mqa_logits(
                 hidden_dim,
                 cdna_version,
                 get_gfx(),
+                *((use_buffer_load,) if VarCtxOpt else ()),
             )
         else:  #  load AOT compiled gluon kernel
             assert triton_version < Version(
