@@ -1791,18 +1791,19 @@ def test_a8w4_sort_quant_kernel():
     aiter.logger.info("moe_2stage: a8w4 sort_quant kernel passed")
 
 
-def test_a8w4_fused_sort_quant_e2e():
+def test_a8w4_fused_sort_quant_e2e(inter_dim):
     """fused_moe with the fused sort+quant against the separate launches.
 
-    Kimi-K3 A8W4 TP=8 shape. The fused path must be taken up to the token cap and
-    skipped above it, and must match the unfused path. fp8 input with an unsorted
-    e8m0 a1_scale (MXFP8 dispatch) must still get its scales sorted.
+    Kimi-K3 A8W4 shape (inter_dim 384 at TP=8, 512 at TP=6). The fused path must
+    be taken up to the token cap and skipped above it, and must match the
+    unfused path. fp8 input with an unsorted e8m0 a1_scale (MXFP8 dispatch)
+    must still get its scales sorted.
     """
     if get_gfx() != "gfx950":
         aiter.logger.info("skip a8w4 fused sort_quant test on %s", get_gfx())
         return
     torch.manual_seed(0)
-    E, topk, model_dim, inter_dim = 896, 16, 3584, 384
+    E, topk, model_dim = 896, 16, 3584
     dtype = dtypes.bf16
     torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
     w1 = torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10
@@ -1849,7 +1850,7 @@ def test_a8w4_fused_sort_quant_e2e():
                 out = fused_moe(hidden, *args, **kwargs)
                 assert calls == (
                     [token] if token <= cap else []
-                ), f"token={token}: fused sort_quant calls {calls}"
+                ), f"inter_dim={inter_dim} token={token}: fused calls {calls}"
                 fm._MOE_A8W4_FUSED_SORT_QUANT = False
                 try:
                     out_unfused = fused_moe(hidden, *args, **kwargs)
@@ -1863,10 +1864,14 @@ def test_a8w4_fused_sort_quant_e2e():
                 for name, other in (("unfused", out_unfused), ("fp8 input", out_fp8)):
                     assert not other.isnan().any(), f"token={token}: {name} gave NaN"
                     diff = calc_diff(out, other)
-                    assert diff < 1e-3, f"token={token}: fused vs {name} diff {diff}"
+                    assert (
+                        diff < 1e-3
+                    ), f"inter_dim={inter_dim} token={token}: fused vs {name} diff {diff}"
         finally:
             fm._a8w4_fused_sort_quant = real_fused
-    aiter.logger.info("moe_2stage: a8w4 fused sort_quant passed")
+    aiter.logger.info(
+        "moe_2stage: a8w4 fused sort_quant passed (inter_dim=%d)", inter_dim
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1886,13 +1891,15 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 elif args.a8w4_sort_quant:
     test_a8w4_sort_quant_kernel()
-    test_a8w4_fused_sort_quant_e2e()
+    for _inter_dim in (384, 512):
+        test_a8w4_fused_sort_quant_e2e(_inter_dim)
 else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
     test_a8w4_sort_quant_kernel()
-    test_a8w4_fused_sort_quant_e2e()
+    for _inter_dim in (384, 512):
+        test_a8w4_fused_sort_quant_e2e(_inter_dim)
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
