@@ -288,28 +288,67 @@ def _unsupported_arch() -> str | None:
 
 
 @lru_cache(maxsize=8)
-def _full_rows(rows: int, width: int, device: torch.device) -> torch.Tensor:
-    """The default `end`: every row live to the full width.
+def _cached_bounds(rows: int, width: int, device: int):
+    return (
+        torch.zeros(rows, dtype=torch.int32, device=device),
+        torch.full((rows,), width, dtype=torch.int32, device=device),
+    )
 
-    Cached because it is a constant the kernels only read, and building it per
-    call is an allocation and a fill launch -- 6us against 7-10us of device time
-    for the selection.
+
+def _default_bounds(rows: int, width: int, device: int):
+    """`(starts, ends)` of a call that gave no `end`: every row from column 0
+    to the full width.
+
+    Cached because they are constants the kernels only read. Building the ends
+    per call is an allocation and a fill launch -- 6us against 7-10us of device
+    time for the selection. `sampled` is the only backend that takes a start per
+    row, and it built both per call until it was measured: two fill launches for
+    a pair of constants, worth 8.1us at 4096 rows and a fifth of the whole call
+    at 64. Calling the kernel directly rather than through this entry measured
+    1.20x at m=64 n=524288 and 1.13x at m=64 n=1048576, and this pair is that
+    gap.
+
+    Not cached while a CUDA graph is capturing: there the fills are only
+    recorded, so a pair cached then would stay unfilled for the eager calls
+    after it, and a graph must not hold tensors the cache can later free.
     """
-    return torch.full((rows,), width, dtype=torch.int32, device=device)
+    if torch.cuda.is_current_stream_capturing():
+        return _cached_bounds.__wrapped__(rows, width, device)
+    return _cached_bounds(rows, width, device)
+
+
+class _GrowDuringCapture(Exception):
+    """The zero buffer would have to grow while a CUDA graph captures."""
+
+
+# Per GPU, every zero buffer `_zero_rows` has cut views from, the last the
+# largest. Never freed: a captured graph may still read any of them.
+_ZERO_BUFFERS: dict[int, list[torch.Tensor]] = {}
 
 
 @lru_cache(maxsize=8)
-def _zero_rows(rows: int, device: torch.device) -> torch.Tensor:
-    """The default `begin`: every row starting at column 0.
+def _cached_zero_rows(rows: int, device: int) -> torch.Tensor:
+    buffers = _ZERO_BUFFERS.setdefault(device, [])
+    if not buffers or buffers[-1].numel() < rows:
+        if torch.cuda.is_current_stream_capturing():
+            raise _GrowDuringCapture
+        size = max(rows, 2 * buffers[-1].numel()) if buffers else rows
+        buffers.append(torch.zeros(size, dtype=torch.int32, device=device))
+    return buffers[-1][:rows]
 
-    The `_full_rows` argument applied to the other end of the range. `sampled`
-    is the only backend that takes a start per row, and it built this per call
-    until it was measured: two fill launches for a pair of constants, worth 8.1us
-    at 4096 rows and a fifth of the whole call at 64. Calling the kernel directly
-    rather than through this entry measured 1.20x at m=64 n=524288 and 1.13x at
-    m=64 n=1048576, and this pair is that gap.
+
+def _zero_rows(rows: int, device: int) -> torch.Tensor:
+    """The starts of a call that gave its own `end`: every row from column 0.
+
+    A view of a zero buffer that is never freed, so the cache may drop it while
+    a captured graph still reads it, and no capture check is paid per call. A
+    buffer that would have to grow during a capture, where its fill would only
+    be recorded, is replaced by a tensor of the graph's own.
     """
-    return torch.zeros(rows, dtype=torch.int32, device=device)
+    try:
+        return _cached_zero_rows(rows, device)
+    except _GrowDuringCapture:
+        return torch.zeros(rows, dtype=torch.int32, device=device)
 
 
 @lru_cache(maxsize=8)
@@ -1151,11 +1190,15 @@ def topk_select(
     device = input.device
     dev = device.index
 
-    row_lens = _full_rows(rows, width, device) if end is None else end
-    if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
-        raise ValueError(f"end must be int32 [{rows}], got {tuple(row_lens.shape)}")
-    # Every backend reads the row ends as one dense array.
-    row_lens = row_lens.contiguous()
+    if end is None:
+        # Built in `_dispatch`, by the backends that read row ends.
+        row_lens = None
+    else:
+        row_lens = end
+        if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
+            raise ValueError(f"end must be int32 [{rows}], got {tuple(row_lens.shape)}")
+        # Every backend reads the row ends as one dense array.
+        row_lens = row_lens.contiguous()
     idx = (
         torch.empty((rows, topk), dtype=torch.int32, device=device)
         if output_idx is None
@@ -1330,6 +1373,11 @@ def _stream_scratch(input, dtype=None):
 def _dispatch(
     backend, input, row_lens, idx, topk, rows, ragged, tie=None, deterministic=False
 ):
+    # `row_lens` is None when the caller gave no `end`; the backends that read
+    # row ends get `_default_bounds`. plain and the small-reject stream do not.
+    starts = None
+    if row_lens is None and backend != "plain" and backend != "stream":
+        starts, row_lens = _default_bounds(rows, input.shape[1], input.get_device())
     if backend == "argmax":
         topk_per_row_argmax(input, row_lens, idx)
     elif backend == "sampled":
@@ -1338,13 +1386,13 @@ def _dispatch(
         # so `values=None` here rather than scratch nobody reads.
         #
         # Neither end of that pair is built here any more. `row_lens` already IS
-        # the per-row end -- `_full_rows` when the caller gave no `end`, the
-        # caller's own tensor otherwise -- and the entry has already refused
-        # anything that is not int32 `[rows]`, so the old `.to(torch.int32)` was
-        # a no-op and the `torch.full` beside it rebuilt, every call, the tensor
-        # `_full_rows` was cached to avoid. The starts are the same constant at
-        # the other end of the range.
-        starts = _zero_rows(rows, input.device)
+        # the per-row end -- `_default_bounds` when the caller gave no `end`,
+        # with `starts` beside it, the caller's own tensor otherwise -- and the
+        # entry has already refused anything that is not int32 `[rows]`, so the
+        # old `.to(torch.int32)` was a no-op and the `torch.full` beside it
+        # rebuilt, every call, the tensor `_default_bounds` was cached to avoid.
+        if starts is None:
+            starts = _zero_rows(rows, input.get_device())
         ends = row_lens
         # `ragged` is `end is not None` -- whether the CALLER gave row bounds.
         # When it did not, the pair above is 0 and the full width for every row,
@@ -1457,6 +1505,8 @@ def _dispatch(
             # stream in the seed-0 MI355X ABBA crossover sweep.
             _select_small_reject(input, idx, rejects, dev)
             return
+        if row_lens is None:
+            _, row_lens = _default_bounds(rows, input.shape[1], dev)
         parts = _stream_split_parts(rows, input.shape[1], topk, ragged)
         if parts > 1:
             # Stage 1 launches `rows * parts` blocks and stage 2 launches
