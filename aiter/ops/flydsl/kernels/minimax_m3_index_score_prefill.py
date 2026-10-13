@@ -1143,8 +1143,12 @@ def build_prefill_score(g):
 _CACHE = {}
 
 
-def _get(g):
-    key = tuple(sorted(g.items()))
+def _get(g, device):
+    # Keyed on the device as well as the geometry: the launcher memoises its
+    # compiled handle, so one shared across two gfx950 devices would dispatch
+    # the first device's handle on the second. The decode scorer keys the same
+    # way and has `test_noncurrent_device` for it.
+    key = (tuple(sorted(g.items())), device)
     if key not in _CACHE:
         _CACHE[key] = build_prefill_score(g)
     return _CACHE[key]
@@ -1169,7 +1173,19 @@ def score_prefill_flydsl(
     sm_scale,
     out=None,
 ):
-    """Block scores for a ragged prefill batch."""
+    """Block scores for a ragged prefill batch.
+
+    Shapes, dtypes, strides and the launch bounds are checked here. The ragged
+    arrays' CONTENTS are a caller contract, as they are for the decode scorer:
+    `cu_seqlens_q` is non-decreasing and ends at `idx_q.shape[0]`, every
+    `seq_lens[b]` is within `max_seq_len`, every `prefix_lens[b]` within its
+    own `seq_lens[b]`, and every referenced page id is inside `cache`. They
+    stay a contract rather than a check because reading them means a device
+    synchronisation, and the grid is deliberately sized from the bounds alone
+    so that it survives a cudagraph replay -- a validator that read the
+    lengths would both stall the launch and make the grid depend on data that
+    may change between replays.
+    """
     import torch
 
     total_q, heads, head_dim = idx_q.shape
@@ -1218,20 +1234,33 @@ def score_prefill_flydsl(
     # the same bytes only when the page is contiguous. A strided page reads in
     # bounds and scores the wrong features (0.209 max abs error on a
     # [pages,128,256][..., :128] view), so it is refused rather than served.
-    if cache.stride(1) != HEAD_DIM or cache.stride(2) != 1:
+    # The page stride has to clear a whole page too: `page_buffer` advances by
+    # stride(0), so a smaller one overlaps successive pages and scores the wrong
+    # ones with no error. Decode bounds its outer extent the same way.
+    if (
+        cache.stride(1) != HEAD_DIM
+        or cache.stride(2) != 1
+        or cache.stride(0) < cache.shape[1] * HEAD_DIM
+    ):
         raise ValueError(
-            f"cache needs contiguous pages: stride(1) must be {HEAD_DIM} and "
-            f"stride(2) 1, got {cache.stride(1)} and {cache.stride(2)}"
+            f"cache needs contiguous non-overlapping pages: stride(1) must be "
+            f"{HEAD_DIM}, stride(2) 1 and stride(0) at least "
+            f"{cache.shape[1] * HEAD_DIM}, got {cache.stride()}"
         )
         # Only stride(0)/stride(1) reach the kernel and every innermost index is an
         # element offset, so a non-unit feature stride silently scores the wrong
         # features. Alignment matters too, not just overlap: `q_fp8_at` turns a bf16
         # element offset into a dword offset and vector-loads it, so an odd row or
         # head stride drops a feature. Decode states the same contract.
-    if idx_q.stride(2) != 1 or idx_q.stride(1) < HEAD_DIM:
+    if (
+        idx_q.stride(2) != 1
+        or idx_q.stride(1) < HEAD_DIM
+        or idx_q.stride(0) < (idx_q.shape[1] - 1) * idx_q.stride(1) + HEAD_DIM
+    ):
         raise ValueError(
-            f"idx_q: feature stride must be 1 and heads must not overlap, got "
-            f"stride {idx_q.stride()}"
+            f"idx_q: feature stride must be 1 and neither heads nor rows may "
+            f"overlap, got stride {idx_q.stride()} for shape "
+            f"{tuple(idx_q.shape)}"
         )
     if any(st * idx_q.element_size() % 16 for st in idx_q.stride()[:2]):
         raise ValueError(
@@ -1298,7 +1327,7 @@ def score_prefill_flydsl(
     # The XCD remap is a bijection only over whole XCD rounds; rounding up is
     # free, as those CTAs exit on the first bound check.
     chunks = -(-chunks // XCD_COUNT) * XCD_COUNT
-    launch = _get(geom)
+    launch = _get(geom, idx_q.device)
     with torch.cuda.device(idx_q.device):
         _run_compiled(
             launch,

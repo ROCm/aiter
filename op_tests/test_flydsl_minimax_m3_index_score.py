@@ -1531,6 +1531,58 @@ def test_trailing_empty_request_stays_in_bounds():
 
 
 @requires_gfx950
+def test_prefill_refuses_overlapping_pages():
+    """`page_buffer` advances by `cache.stride(0)`, so a page stride under one
+    whole page makes every page overlap the one before it. The rows inside a
+    page are still contiguous, so the per-page checks pass and the kernel
+    quietly scores the wrong pages."""
+    c = make_prefill_case(1, 128, 2048)
+    flat = c["cache"].reshape(-1)
+    overlap = torch.as_strided(flat, (c["mb"], P, D), (1, D, 1))
+    with pytest.raises(ValueError, match="non-overlapping pages"):
+        run_prefill(c, cache=overlap)
+
+
+@requires_gfx950
+def test_prefill_refuses_overlapping_q_rows():
+    """A head stride large enough is not enough: the ROW stride has to clear
+    every head. `[rows, 2, 128]` strided (128, 128, 1) passes the head check
+    while row 1 aliases head 1 of row 0."""
+    c = make_prefill_case(1, 128, 2048, 2)
+    rows = c["q8"].shape[0]
+    flat = torch.empty(rows * 2 * D, dtype=torch.bfloat16, device="cuda")
+    alias = torch.as_strided(flat, (rows, 2, D), (D, D, 1))
+    out = prefill_alloc_score(rows, 2, c["mb"], "cuda")
+    with pytest.raises(ValueError, match="may overlap"):
+        score_prefill_flydsl(
+            alias,
+            c["cache"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            1.0 / LOG2E,
+            out=out,
+        )
+
+
+@requires_gfx950
+def test_prefill_launcher_cache_is_per_device():
+    """The launcher memoises its compiled handle, so one shared between two
+    devices would dispatch the first device's handle on the second."""
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires two visible gfx950 GPUs")
+    from aiter.ops.flydsl.kernels import minimax_m3_index_score_prefill as pf
+
+    g = prefill_geometry(128, 1, 1, 16, torch.device("cuda", 0))
+    a = pf._get(g, torch.device("cuda", 0))
+    b = pf._get(g, torch.device("cuda", 1))
+    assert a is not b
+
+
+@requires_gfx950
 @pytest.mark.parametrize("stride1", [129, 130])
 def test_prefill_refuses_misaligned_q_rows(stride1):
     """Non-overlapping is not enough: `q_fp8_at` turns the bf16 element offset
@@ -1614,7 +1666,7 @@ def test_rejects_non_positive_launch_bounds(max_q, max_seq):
 
 @requires_gfx950
 def test_strided_cache_is_refused():
-    """The LDS staging path reads a page as a flat run_prefill of 16 B chunks, which
+    """The LDS staging path reads a page as a flat run of 16 B chunks, which
     only describes the right bytes when the page is contiguous -- a strided
     page reads in bounds and scores the wrong features (0.209 max abs error on
     a [pages,128,256][..., :128] view).
@@ -1630,7 +1682,7 @@ def test_strided_cache_is_refused():
     wide[..., :D] = c["cache"]
     strided = wide[..., :D]
     assert strided.stride(1) == 2 * D and not strided.is_contiguous()
-    with pytest.raises(ValueError, match="contiguous pages"):
+    with pytest.raises(ValueError, match="contiguous non-overlapping pages"):
         run_prefill(c, strided)
     # ...and the same cache, packed, still scores.
     ref, live = aiter_scores(c)
@@ -1639,18 +1691,18 @@ def test_strided_cache_is_refused():
 
 @requires_gfx950
 def test_merged_store_follows_the_out_layout():
-    """`contig_k` merges a run_prefill of consecutive blocks into one vector store, and
+    """`contig_k` merges a run of consecutive blocks into one vector store, and
     it is a property of the OUTPUT the caller passed, not a tuning knob. A
     padded row stride breaks the alignment the merge needs, so the kernel must
     fall back to per-block stores and still be bit-exact."""
-    batch, q_len, ctx = 8, 2048, 16384  # the L4 arm, so a run_prefill is 4 blocks wide
+    batch, q_len, ctx = 8, 2048, 16384  # the L4 arm, so a run is 4 blocks wide
     c = make_prefill_case(batch, q_len, ctx)
     ref, live = aiter_scores(c)
     rows, mb = c["q8"].shape[0], c["mb"]
     g = prefill_geometry(c["max_q"], batch, 1, mb, torch.device("cuda"))
     ppw = g["pages_per_wave"]
     assert ppw > 1, "pick a shape whose prefill_geometry actually merges stores"
-    # A row stride that is NOT a multiple of the run_prefill width, so the merge is off.
+    # A row stride that is NOT a multiple of the run width, so the merge is off.
     pad = next(mb + d for d in (1, 2, 3) if (mb + d) % ppw)
     padded = torch.empty((1, rows, pad), dtype=torch.float32, device="cuda")
     view = padded[:, :, :mb]

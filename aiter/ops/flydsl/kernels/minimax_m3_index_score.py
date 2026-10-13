@@ -1242,8 +1242,8 @@ def _validate_metadata(
     arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
     if arch != "gfx950":
         raise ValueError(f"index score requires gfx950, got {arch}")
-    # Q may arrive bf16 or already fp8; 16 B alignment covers both widths. The
-    # cache is fp8: this scores what `fused_qknorm_idxrqknorm` writes.
+    # Q is bf16 and the cache is fp8: this scores what
+    # `fused_qknorm_idxrqknorm` writes, and the launch binds those two types.
     _validate_tensor(idx_q, "idx_q", (torch.bfloat16,), 3, device, 16)
     _validate_tensor(cache, "cache", (dtypes.fp8,), 3, device, 16, False)
     if idx_q.shape[1:] != (H, HEAD_DIM) or idx_q.shape[0] % S:
