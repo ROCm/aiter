@@ -2206,13 +2206,7 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
                                                    IdxT k)
 {
     constexpr int num_buckets = calc_num_buckets<BitsPerPass>();
-    // Staging area for the compacted candidates. See the comment on the
-    // compact branch below: the candidates are far too sparse to write
-    // straight out, so they are collected here and flushed as one contiguous
-    // run per block.
-    constexpr int kStageCap = 2 * BlockSize;
-    __shared__ T stage_val[kStageCap];
-    __shared__ IdxT stage_idx[kStageCap];
+    // Candidates staged by the compact branch below; its arrays live there.
     __shared__ IdxT stage_cnt;
     __shared__ IdxT stage_base;
 
@@ -2262,6 +2256,12 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
     else
     {
         // Compact enabled path.
+        // Staging area for the compacted candidates: they are far too sparse
+        // to write straight out (see below), so they are collected here and
+        // flushed as one contiguous run per block.
+        constexpr int kStageCap = 2 * BlockSize;
+        __shared__ T stage_val[kStageCap];
+        __shared__ IdxT stage_idx[kStageCap];
         IdxT* p_out_cnt              = &counter->out_cnt;
         auto const kth_value_bits    = counter->kth_value_bits;
         int const previous_start_bit = calc_start_bit<T, BitsPerPass>(pass - 1);
@@ -4541,6 +4541,14 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     // costs more than compaction saves -- measured at M=4096 it regressed every
     // N, e.g. N=131072 820us -> 1110us.
     constexpr bool kCompact = COMPACT && !STABLE;
+    // The launcher chooses COMPACT on the padded length, which a ragged or
+    // decode row can be far short of; such a row keeps the re-scan. Measured
+    // per row on MI355X (k=2048, rows 2^12..2^15 long in a 163840 pitch), the
+    // re-scan is 0.94x-0.99x of compaction to 16384 columns and compaction
+    // 0.91x-0.99x of the re-scan from 24576. Tested inside the passes' own
+    // runtime branches: wrapping set_buf_pointers in it instead cost uniform
+    // rows 1.23x (M=4096 N=131072).
+    const bool compact_row = row_len >= 16384 && row_len >= IdxT(12) * k;
 
     T const* in_buf        = in;
     IdxT const* in_idx_buf = in_idx;
@@ -4567,7 +4575,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             // staged into it. Pass 0 cannot compact (the pivot is unknown), and
             // a candidate set larger than buf_len is left unstaged, so both fall
             // back to re-scanning the row.
-            if(pass > 1 && counter.previous_len <= buf_len)
+            if(pass > 1 && compact_row && counter.previous_len <= buf_len)
             {
                 previous_len = counter.previous_len;
             }
@@ -4576,7 +4584,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
                 in_buf     = in;
                 in_idx_buf = in_idx;
             }
-            if(current_len > buf_len)
+            if(current_len > buf_len || !compact_row)
             {
                 out_buf     = nullptr;
                 out_idx_buf = nullptr;
@@ -4876,6 +4884,8 @@ void standalone_stable_radix_topk_(void* buf,
     }
 }
 
+inline bool topk_oneblock_is_gfx950();
+
 // One-block host entry: two-phase workspace query / kernel launch.
 template <typename T,
           typename IdxT,
@@ -4929,22 +4939,26 @@ void standalone_stable_radix_topk_one_block_(void* buf,
     //   k=1024  N= 8192  94-> 96   16384 131->130   32768 234->202
     //   k= 512  N= 8192  92-> 95   16384 127->123   32768 229->196
     //   k= 128  N= 8192  90-> 90   16384 122->115   32768 222->175
-    // so require the row to be long both absolutely and relative to k. Ragged
-    // rows are gated on the padded length, which only affects speed.
-    if(!STABLE && len >= 16384 && len >= int64_t(16) * k)
+    // so require the row to be long both absolutely and relative to k. The
+    // padded length picks the build, and the kernel holds each row to its own
+    // length (compact_row). Measured on MI355X only: elsewhere the build's
+    // staging can halve the blocks a CU holds (BPP=11, 64 KB of LDS), so other
+    // targets keep the re-scan build.
+    if constexpr(!STABLE)
     {
-        radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
-                                    false, phase, STABLE, /*COMPACT=*/true>
-            <<<batch_size, BlockSize, 0, stream>>>(
-                in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
+        if(len >= 16384 && len >= int64_t(16) * k && topk_oneblock_is_gfx950())
+        {
+            radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
+                                        false, phase, STABLE, /*COMPACT=*/true>
+                <<<batch_size, BlockSize, 0, stream>>>(
+                    in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
+            return;
+        }
     }
-    else
-    {
-        radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
-                                    false, phase, STABLE, /*COMPACT=*/false>
-            <<<batch_size, BlockSize, 0, stream>>>(
-                in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
-    }
+    radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase,
+                                STABLE, /*COMPACT=*/false>
+        <<<batch_size, BlockSize, 0, stream>>>(
+            in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
 }
 
 // The properties the one-block dispatch decides on.  They are per device: one
