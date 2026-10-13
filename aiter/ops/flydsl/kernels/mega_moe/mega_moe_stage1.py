@@ -605,14 +605,8 @@ def compile_mega_moe_stage1(
                 if work < total_work:
                     if const_expr(fixed_slot_dispatch):
                         fx.barrier()
-                    else:
-                        # Both the sequential and the ready-order compact paths
-                        # must wait for the tile to be published and acquire
-                        # before reading its per-tile metadata.  The ready-order
-                        # path previously skipped this, so a consumer could read
-                        # tile_input_base (and the other per-tile metadata) before
-                        # the planner's store was visible, feeding a stale/garbage
-                        # row into the A-scale gather and faulting under skew.
+                    elif not use_ready_order:
+                        # Ready-order waits for the tile in the scheduler block.
                         if tid == fx.Int32(0):
                             _wait_tile_payload(work)
                         fx.barrier()
@@ -681,6 +675,7 @@ def compile_mega_moe_stage1(
                         scheduled_first = (
                             ready_m_tile * fx.Int32(N_TILES) + first_n_tile
                         )
+                        _wait_tile_payload(scheduled_first)
                         fx.ptr_store(
                             Vec.from_elements([scheduled_first], fx.Int32),
                             sched_scratch,
