@@ -14,6 +14,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include <optional>
 #include "custom_all_reduce.cuh"
 #include "aiter_stream.h"
 #include "aiter_tensor.h"
@@ -495,6 +496,44 @@ void all_gather_reg(fptr_t _fa,
     int64_t last_dim_size = inp.size(-1);
     _all_gather(_fa, inp.data_ptr(), out.data_ptr(), inp.numel(), inp.dtype(),
                 last_dim_size, dim);
+}
+
+void all_gather_lastdim_add(fptr_t _fa,
+                            const aiter_tensor_t& inp,
+                            const aiter_tensor_t& out,
+                            const aiter_tensor_t& add_b,
+                            std::optional<aiter_tensor_t> add_c,
+                            int64_t reg_ptr,
+                            int64_t reg_bytes)
+{
+    HipDeviceGuard device_guard(inp.device_id);
+    hipStream_t stream = aiter::getCurrentHIPStream();
+    auto fa = reinterpret_cast<aiter::CustomAllreduce*>(_fa);
+    int64_t last_dim_size = inp.size(-1);
+    if(inp.dtype() != AITER_DTYPE_bf16)
+        throw std::runtime_error("all_gather_lastdim_add supports bfloat16 only");
+    if(inp.dim() != 2 || out.dim() != 2 || add_b.dim() != 2 ||
+       (add_c.has_value() && add_c->dim() != 2))
+        throw std::runtime_error("all_gather_lastdim_add supports 2D tensors only");
+    void* src = inp.data_ptr();
+    if(reg_ptr != 0)
+    {
+        // unregistered input: stage it into the registered pool first
+        int64_t data_bytes = inp.numel() * inp.element_size();
+        if(data_bytes > reg_bytes)
+            throw std::runtime_error("registered buffer is too small to contain the input");
+        HIP_CALL(hipMemcpyAsync(
+            (void*)reg_ptr, inp.data_ptr(), data_bytes, hipMemcpyDeviceToDevice, stream));
+        src = (void*)reg_ptr;
+    }
+    fa->dispatchAllGatherLastDimAdd<opus::bf16_t>(
+        stream,
+        reinterpret_cast<opus::bf16_t*>(src),
+        reinterpret_cast<opus::bf16_t*>(out.data_ptr()),
+        inp.numel(),
+        last_dim_size,
+        reinterpret_cast<const opus::bf16_t*>(add_b.data_ptr()),
+        add_c.has_value() ? reinterpret_cast<const opus::bf16_t*>(add_c->data_ptr()) : nullptr);
 }
 
 void all_gather_unreg(fptr_t _fa,

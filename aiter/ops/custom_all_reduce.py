@@ -3,6 +3,7 @@
 
 
 import torch
+from typing import Optional
 
 from ..jit.core import compile_ops
 
@@ -55,6 +56,18 @@ def all_gather_reg(
     inp: torch.Tensor,
     out: torch.Tensor,
     dim: int,
+) -> None: ...
+
+
+@compile_ops("module_custom_all_reduce", develop=True)
+def all_gather_lastdim_add(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    add_b: torch.Tensor,
+    add_c: Optional[torch.Tensor] = None,
+    reg_ptr: int = 0,
+    reg_bytes: int = 0,
 ) -> None: ...
 
 

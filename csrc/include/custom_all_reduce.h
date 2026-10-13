@@ -16,6 +16,7 @@
  * limitations under the License.
  */
 #include <cstdint>
+#include <optional>
 #include <vector>
 #include "aiter_tensor.h"
 
@@ -58,6 +59,13 @@ void all_gather_reg(fptr_t _fa,
                     const aiter_tensor_t& inp,
                     const aiter_tensor_t& out,
                     int64_t dim);
+void all_gather_lastdim_add(fptr_t _fa,
+                            const aiter_tensor_t& inp,
+                            const aiter_tensor_t& out,
+                            const aiter_tensor_t& add_b,
+                            std::optional<aiter_tensor_t> add_c,
+                            int64_t reg_ptr,
+                            int64_t reg_bytes);
 void all_gather_unreg(fptr_t _fa,
                       const aiter_tensor_t& inp,
                       int64_t reg_buffer,

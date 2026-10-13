@@ -912,6 +912,7 @@ class CustomAllreduce:
             self._ops_meta_size = ops.meta_size_gfx1250
             self._ops_all_reduce = ops.all_reduce_gfx1250
             self._ops_all_gather = ops.all_gather_gfx1250
+            self._ops_all_gather_lastdim_add = None
             self._ops_reduce_scatter = ops.reduce_scatter_gfx1250
             self._ops_dispose = ops.dispose_gfx1250
             self._ops_get_graph_buffer_count = ops.get_graph_buffer_count_gfx1250
@@ -934,6 +935,7 @@ class CustomAllreduce:
             self._ops_init_custom_ar = ops.init_custom_ar
             self._ops_all_reduce = ops.all_reduce
             self._ops_all_gather = None
+            self._ops_all_gather_lastdim_add = ops.all_gather_lastdim_add
             self._ops_reduce_scatter = ops.reduce_scatter
             self._ops_dispose = ops.dispose
             self._ops_register_input_buffer = ops.register_input_buffer
@@ -1886,6 +1888,42 @@ class CustomAllreduce:
                 out,
                 dim,
             )
+        return out
+
+    def all_gather_lastdim_add(
+        self,
+        inp: torch.Tensor,
+        add_b: torch.Tensor,
+        add_c: torch.Tensor | None = None,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """out = bf16(bf16(allgather(inp, dim=-1) + add_b) [+ add_c]) in one
+        launch (the add3 double rounding), for 2D [rows, n] shards. Under graph
+        capture with enable_register_for_capturing, inp is read in place
+        (capture registers it); otherwise it is staged into the registered
+        input pool first."""
+        if self._ops_all_gather_lastdim_add is None:
+            raise NotImplementedError(
+                "all_gather_lastdim_add is not supported on gfx1250"
+            )
+        assert inp.dim() == 2, "all_gather_lastdim_add only supports 2D tensors"
+        shape = (inp.shape[0], inp.shape[1] * self.world_size)
+        if out is None:
+            out = torch.empty(shape, dtype=inp.dtype, device=inp.device)
+        for t in (add_b, add_c, out):
+            assert t is None or (
+                t.shape == shape and t.is_contiguous()
+            ), f"all_gather_lastdim_add expects contiguous {shape} add/out tensors"
+        registered = (
+            self._IS_CAPTURING
+            and torch.cuda.is_current_stream_capturing()
+            and self.enable_register_for_capturing
+        )
+        reg = 0 if registered else self._pool["input"].data_ptr
+        reg_bytes = 0 if registered else self._pool["input"].max_size
+        self._ops_all_gather_lastdim_add(
+            self._ptr, inp, out, add_b, add_c, reg, reg_bytes
+        )
         return out
 
     def all_gather_unreg(

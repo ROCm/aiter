@@ -93,6 +93,56 @@ def _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, grap
     return {"us": us, "err": checkAllclose(ref, out, msg=msg)}
 
 
+def _run_all_gather_lastdim_add_case(
+    rankID, tp_size, case_idx, shape, dtype, withGraph, graphs
+):
+    """Run ``all_gather_lastdim_add`` on one ``[rows, n]`` shard per rank and
+    check it bit-exactly against ``cat(shards, -1) + add_b + add_c``.
+
+    The kernel rounds to ``dtype`` after each add, like the unfused sequence,
+    so the comparison uses ``atol=rtol=0``. Graph mode keeps the captured
+    graph alive in ``graphs`` for the same reason as the all-reduce sweep.
+    """
+    rows, n = shape
+    gen = torch.Generator(device="cuda").manual_seed(case_idx)
+    shards = [
+        torch.randn((rows, n), dtype=dtype, device="cuda", generator=gen)
+        for _ in range(tp_size)
+    ]
+    full = (rows, n * tp_size)
+    add_b = torch.randn(full, dtype=dtype, device="cuda", generator=gen)
+    add_c = torch.randn(full, dtype=dtype, device="cuda", generator=gen)
+    ref = torch.cat(shards, dim=-1) + add_b + add_c
+    x = shards[rankID]
+    ca = get_tp_group().device_communicator.ca_comm
+
+    if withGraph:
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            out = ca.all_gather_lastdim_add(x, add_b, add_c)
+        out.fill_(0)
+        graphs.append((graph, x, add_b, add_c, out))
+
+        @perftest()
+        def run_ca():
+            graph.replay()
+
+        _, us = run_ca()
+    else:
+
+        @perftest()
+        def run_ca(x):
+            return ca.all_gather_lastdim_add(x, add_b, add_c)
+
+        out, us = run_ca(x)
+
+    msg = (
+        f"test_all_gather_lastdim_add: rank={rankID} {shape=} {dtype=} "
+        f"{withGraph=} {us:>8.2f}"
+    )
+    return {"us": us, "err": checkAllclose(ref, out, rtol=0, atol=0, msg=msg)}
+
+
 def allreduce_custom_sweep(
     tp_size,
     pp_size,
@@ -101,6 +151,7 @@ def allreduce_custom_sweep(
     dtype,
     withGraph=False,
     distributed_init_method: str | None = None,
+    case_fn=_run_allreduce_case,
 ):
     """Run every shape on one rank inside a single distributed init.
 
@@ -126,7 +177,7 @@ def allreduce_custom_sweep(
 
     graphs = []
     results = [
-        _run_allreduce_case(rankID, tp_size, case_idx, shape, dtype, withGraph, graphs)
+        case_fn(rankID, tp_size, case_idx, shape, dtype, withGraph, graphs)
         for case_idx, shape in enumerate(shapes)
     ]
 
@@ -140,7 +191,9 @@ def allreduce_custom_sweep(
     return results
 
 
-def test_allreduce_custom(tp_size, pp_size, shapes, dtype, withGraph=False):
+def test_allreduce_custom(
+    tp_size, pp_size, shapes, dtype, withGraph=False, case_fn=_run_allreduce_case
+):
     """Sweep ``shapes`` on one TP group and return one summary row per shape."""
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "49373"
@@ -149,7 +202,16 @@ def test_allreduce_custom(tp_size, pp_size, shapes, dtype, withGraph=False):
         rets = [
             pool.apply_async(
                 allreduce_custom_sweep,
-                args=(tp_size, pp_size, rank, shapes, dtype, withGraph, init_method),
+                args=(
+                    tp_size,
+                    pp_size,
+                    rank,
+                    shapes,
+                    dtype,
+                    withGraph,
+                    init_method,
+                    case_fn,
+                ),
             )
             for rank in range(tp_size)
         ]
@@ -512,6 +574,14 @@ parser.add_argument(
     help="single shape override, e.g. -s 128,8192 (default: swept size list)",
 )
 parser.add_argument(
+    "--op",
+    type=str,
+    nargs="*",
+    choices=["all_reduce", "all_gather_lastdim_add"],
+    default=["all_reduce", "all_gather_lastdim_add"],
+    help="collectives to sweep (default: all_reduce all_gather_lastdim_add)",
+)
+parser.add_argument(
     "--regression",
     action="store_true",
     help="run only the correctness checks: tail (eager and graph), LL128 and "
@@ -563,10 +633,32 @@ if __name__ == "__main__":
         l_shape = [args.shape]
     else:
         l_shape = gen_sizes(dtype)
-    df = pd.DataFrame(
-        test_allreduce_custom(args.tp_size, 1, l_shape, dtype, withGraph=with_graph)
-    )
+    rows = []
+    if "all_reduce" in args.op:
+        rows += test_allreduce_custom(
+            args.tp_size, 1, l_shape, dtype, withGraph=with_graph
+        )
+    if "all_gather_lastdim_add" in args.op and dtype == dtypes.bf16:
+        # [rows, n] per-rank shards; Kimi-K3 TP8 uses n=896 (up-proj) and the
+        # vocab shard for logits.
+        ag_shapes = (
+            [args.shape]
+            if args.shape is not None and len(args.shape) == 2
+            else [(1, 896), (8, 896), (64, 896), (256, 896), (8, 20480)]
+        )
+        for row in test_allreduce_custom(
+            args.tp_size,
+            1,
+            ag_shapes,
+            dtype,
+            withGraph=with_graph,
+            case_fn=_run_all_gather_lastdim_add_case,
+        ):
+            row["op"] = "all_gather_lastdim_add"
+            rows.append(row)
+    df = pd.DataFrame(rows)
     show_cols = [
+        "op",
         "tp_size",
         "shape",
         "dtype",

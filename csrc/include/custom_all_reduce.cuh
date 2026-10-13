@@ -823,6 +823,60 @@ __global__ void __launch_bounds__(512, 1)
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
+// allgather along the last dim fused with the residual adds that follow it:
+// result = T(T(gathered + b) [+ c]), the same double rounding as the unfused
+// add-then-add (sglang add3). b and c are [rows, ngpus * last_dim] like result.
+template <typename T, int ngpus, bool kHasC>
+__global__ void __launch_bounds__(512, 1) allgather_lastdim_add(RankData* _dp,
+                                                                RankSignals sg,
+                                                                Signal* self_sg,
+                                                                T* __restrict__ result,
+                                                                int rank,
+                                                                int size,
+                                                                int last_dim_size,
+                                                                const T* __restrict__ add_b,
+                                                                const T* __restrict__ add_c)
+{
+    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
+    constexpr int pack_size = 16 / sizeof(T);
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int warp_id             = threadIdx.x / tnum_gpu;
+    int lane_id             = threadIdx.x % tnum_gpu;
+    int tid                 = blockIdx.x * tnum_gpu + lane_id;
+    int stride              = gridDim.x * tnum_gpu;
+
+    last_dim_size /= pack_size;
+    const P* ptrs[ngpus];
+
+#pragma unroll
+    for(int i = 0; i < ngpus; ++i)
+    {
+        ptrs[i] = (const P*)_dp->ptrs[i];
+    }
+    const P* bp = reinterpret_cast<const P*>(add_b);
+    const P* cp = reinterpret_cast<const P*>(add_c);
+    start_sync<ngpus>(sg, self_sg, rank);
+
+    for(int idx = tid; idx < size; idx += stride)
+    {
+        int y         = idx / last_dim_size;
+        int x         = idx % last_dim_size;
+        int write_idx = (ngpus * y + warp_id) * last_dim_size + x;
+        A acc         = upcast(ptrs[warp_id][idx]);
+        packed_assign_add<opus::fp32_t, pack_size>(acc, upcast(bp[write_idx]));
+        P out = downcast<P>(acc);
+        if constexpr(kHasC)
+        {
+            A acc2 = upcast(out);
+            packed_assign_add<opus::fp32_t, pack_size>(acc2, upcast(cp[write_idx]));
+            out = downcast<P>(acc2);
+        }
+        *(reinterpret_cast<P*>(&result[0]) + write_idx) = out;
+    }
+    end_sync<ngpus, true>(sg, self_sg, rank);
+}
+
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(512, 1) allgather_lastdim(RankData* _dp,
                                                             RankSignals sg,
@@ -5041,6 +5095,43 @@ void dispatchAllGatherV(hipStream_t stream,
     case 2: allgatherv<2><<<grid, block, 0, stream>>>(args, sg_, self_sg_, rank_); break;
     default: throw std::runtime_error("allgatherv world_size error");
     }
+}
+
+template <typename T>
+void dispatchAllGatherLastDimAdd(hipStream_t stream,
+                                 T* input,
+                                 T* output,
+                                 int size,
+                                 int last_dim_size,
+                                 const T* add_b,
+                                 const T* add_c)
+{
+    RankData* ptrs = get_buffer_RD(stream, input);
+    auto d         = 16 / sizeof(T);
+    if(size % d != 0 || last_dim_size % d != 0)
+        throw std::runtime_error("allgather_lastdim_add needs 16-byte aligned rows");
+    size /= d;
+    dim3 block(512);
+    int tnum_per_block = 512 / world_size_;
+    int block_num      = (size + tnum_per_block - 1) / tnum_per_block;
+    dim3 grid(std::min(block_num, 80));
+#define AG_ADD_CASE(ngpus)                                                                  \
+    case ngpus:                                                                            \
+        if(add_c != nullptr)                                                               \
+            allgather_lastdim_add<T, ngpus, true><<<grid, block, 0, stream>>>(             \
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, add_b, add_c);    \
+        else                                                                               \
+            allgather_lastdim_add<T, ngpus, false><<<grid, block, 0, stream>>>(            \
+                ptrs, sg_, self_sg_, output, rank_, size, last_dim_size, add_b, add_c);    \
+        break;
+    switch(world_size_)
+    {
+        AG_ADD_CASE(8)
+        AG_ADD_CASE(4)
+        AG_ADD_CASE(2)
+    default: throw std::runtime_error("allgather_lastdim_add world_size error");
+    }
+#undef AG_ADD_CASE
 }
 
 template <typename T>
