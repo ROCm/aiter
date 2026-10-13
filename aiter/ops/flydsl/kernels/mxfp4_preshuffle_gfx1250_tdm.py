@@ -359,6 +359,8 @@ def launch_gemm_a8w4_tdm(
     warp_tile_m = tile_m // m_warp
     warp_tile_n = tile_n // n_warp
     wmma_m_rep = warp_tile_m // WMMA_M
+    # Front/back split used by the f32 rolled-quant epilogue (larger half).
+    HALF_WMMA_M_REP = (wmma_m_rep + 1) // 2
     wmma_n_rep = warp_tile_n // WMMA_N
     n_acc = wmma_m_rep * wmma_n_rep
     output_n_rep = warp_tile_n // 16
@@ -460,7 +462,12 @@ def launch_gemm_a8w4_tdm(
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
     if ROLL_QUANT_EPILOGUE and stage1_quant_out and stage1_act:
-        ACC_STAGE_B = num_waves * wmma_m_rep * output_n_rep * WAVE * 16
+        # f32 staging keeps full accumulator precision (no bf16 round-trip), but
+        # a full tile of f32 is 2x the LDS of bf16. Split tile_m into two halves
+        # of HALF_WMMA_M_REP fragments each and reuse ONE region across both
+        # passes: HALF fragments * f32 (32 B/lane) == wmma_m_rep * bf16 (16 B/
+        # lane), so the footprint is unchanged.
+        ACC_STAGE_B = num_waves * HALF_WMMA_M_REP * output_n_rep * WAVE * 32
         ARENA_B = max(ARENA_B, C_STORE_B + ACC_STAGE_B)
 
     # Quant epilogue compile-time constants.
@@ -501,7 +508,9 @@ def launch_gemm_a8w4_tdm(
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _rollq = (
-        "_rollq" if (ROLL_QUANT_EPILOGUE and stage1_quant_out and stage1_act) else ""
+        "_rollqf32"
+        if (ROLL_QUANT_EPILOGUE and stage1_quant_out and stage1_act)
+        else ""
     )
     if _rollq and ACC_SWIZZLE:
         _rollq += "_swz"
@@ -1853,58 +1862,40 @@ def launch_gemm_a8w4_tdm(
                 v2i32_ty = T.vec(2, T.i32)
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
 
-                # Stage accumulators as bf16 into the same LDS block as the C
+                # Stage accumulators as FULL f32 into the same LDS block as the C
                 # output (just behind it). The wm loop then reads them with a
                 # runtime index via ds_load so it rolls into one scf.for; each
                 # lane owns a private slot (write then read on the same lane),
-                # so a dscnt wait suffices. Defined unconditionally because names
-                # set inside an AST-rewritten branch do not escape it.
-                ACC_WN_STRIDE = WAVE * 16
+                # so a dscnt wait suffices. Keeping f32 (no bf16 round-trip)
+                # preserves the accumulator precision of the unrolled path; the
+                # f32 cost is paid by processing only HALF the tile's fragments
+                # per pass and reusing ONE region across the two halves (see the
+                # half loop at the rolled dispatch below). Each f32 fragment is
+                # vec(8,f32) == 32 B/lane == two b128 (lo/hi).
+                ACC_WN_STRIDE = WAVE * 32
                 ACC_WM_STRIDE = output_n_rep * ACC_WN_STRIDE
-                ACC_WAVE_STRIDE = wmma_m_rep * ACC_WM_STRIDE
+                ACC_WAVE_STRIDE = HALF_WMMA_M_REP * ACC_WM_STRIDE
                 # Per-lane slot. The swizzle keeps all 32 lane slots distinct and
-                # inside the 512 B block, but forces 4-way LDS bank collisions:
-                # lanes {4k..4k+3} share banks (the *128 term is 32 dwords = a
-                # whole bank cycle, so it does not spread banks).
+                # inside the block, but forces 4-way LDS bank collisions: lanes
+                # {4k..4k+3} share banks. Offsets are the bf16 layout scaled x2
+                # for the wider f32 slot.
                 if const_expr(ACC_SWIZZLE):
-                    _lane_off = (lane % 4) * 128 + (lane // 4) * 16
+                    _lane_off = (lane % 4) * 256 + (lane // 4) * 32
                 else:
-                    _lane_off = lane * 16
+                    _lane_off = lane * 32
                 acc_lane_base = C_STORE_B + wave * ACC_WAVE_STRIDE + _lane_off
-                if const_expr(ROLL_QUANT_EPILOGUE):
-                    # Keep the runtime lane/wave part in the base index so each
-                    # ds_write encodes its (wm, wn) step as an immediate offset
-                    # (the backend only folds a compile-time byte_offset into
-                    # ds offset:N), matching the compute body's base+imm stores.
-                    _acc_store_idx = stC_idx + acc_lane_base
-                    for _wm in range_constexpr(wmma_m_rep):
-                        for _wn in range_constexpr(output_n_rep):
-                            lds_store_b128(
-                                _acc_store_idx,
-                                _wm * ACC_WM_STRIDE + _wn * ACC_WN_STRIDE,
-                                Vec(accs[_wm * output_n_rep + _wn])
-                                .to(fx.BFloat16)
-                                .bitcast(fx.Int32),
-                            )
-                    rocdl.s_wait_dscnt(0)
-
-                # Runtime count of valid 16-row blocks (wmb + wm*16 < mn_oob).
-                # A RUNTIME upper bound is what keeps the loop rolled: LLVM fully
-                # unrolls a constant-trip scf.for, collapsing the roll, but cannot
-                # unroll an unknown trip count -- so the whole activation/quant
-                # body is emitted ONCE instead of wmma_m_rep times.
-                _d = mn_oob - wmb
-                _nvalid = (_d + 15) >> 4
-                _nvalid = (_d > fx.Int32(0)).select(_nvalid, fx.Int32(0))
-                _nvalid = (_nvalid < fx.Int32(wmma_m_rep)).select(
-                    _nvalid, fx.Int32(wmma_m_rep)
-                )
                 # Shared body for both the rolled (runtime bound) and the legacy
                 # unrolled (range_constexpr) dispatch below. range() must appear
                 # DIRECTLY in the for (the AST rewriter only turns
                 # `for x in range(...)` into an scf.for; assigning it to a
                 # variable falls back to Python's builtin range).
-                def _emit_quant_wm(wm):
+                def _emit_quant_wm(wm, wm_lds=None):
+                    # ``wm`` is the GLOBAL fragment index (row/scale/activation
+                    # math); ``wm_lds`` is its slot WITHIN the current half's
+                    # staged region (rolled readback offset). They differ because
+                    # the two halves reuse one LDS region: half 1's fragment wm=8
+                    # lives at slot 0. The unrolled path reads registers and
+                    # leaves wm_lds unused.
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
                     # this costs one scalar branch instead of per-lane masking.
@@ -1936,7 +1927,7 @@ def launch_gemm_a8w4_tdm(
                             # immediate offset (compile-time byte_offset -> ds
                             # offset:N), like the compute body's base+imm reads.
                             _acc_row_idx = (
-                                stC_idx + acc_lane_base + wm * ACC_WM_STRIDE
+                                stC_idx + acc_lane_base + wm_lds * ACC_WM_STRIDE
                             )
 
                         e8m0_bytes = []
@@ -1951,13 +1942,26 @@ def launch_gemm_a8w4_tdm(
                                 # arms, and the register arm indexes the Python
                                 # ``accs`` list with the now-runtime ``wm``.
                                 if const_expr(ROLL_QUANT_EPILOGUE):
+                                    # Each f32 fragment is vec(8,f32) == two b128
+                                    # (lo/hi, 16 B apart). Read both and shuffle
+                                    # back to vec(8,f32) -- exact, no bf16 cast.
                                     acc = (
-                                        lds_load_b128(
-                                            _acc_row_idx,
-                                            wn * ACC_WN_STRIDE,
+                                        Vec(
+                                            lds_load_b128(
+                                                _acc_row_idx,
+                                                wn * ACC_WN_STRIDE,
+                                            )
                                         )
-                                        .bitcast(fx.BFloat16)
-                                        .to(fx.Float32)
+                                        .shuffle(
+                                            Vec(
+                                                lds_load_b128(
+                                                    _acc_row_idx,
+                                                    wn * ACC_WN_STRIDE + 16,
+                                                )
+                                            ),
+                                            list(range(8)),
+                                        )
+                                        .bitcast(fx.Float32)
                                     )
                                 else:
                                     acc = Vec(accs[wm * output_n_rep + wn])
@@ -2075,10 +2079,58 @@ def launch_gemm_a8w4_tdm(
                             )
 
                 if const_expr(ROLL_QUANT_EPILOGUE):
-                    # Runtime trip count keeps the scf.for rolled (LLVM cannot
-                    # fully unroll an unknown bound), folding the epilogue body.
-                    for wm in range(_nvalid):
-                        _emit_quant_wm(wm)
+                    # Two passes over the tile's fragments (front/back half),
+                    # reusing one f32 LDS region. ``half`` must be compile-time
+                    # because staging indexes the Python ``accs`` list; the inner
+                    # trip count is runtime so the activation/quant body stays
+                    # rolled (LLVM cannot fully unroll an unknown bound).
+                    for half in range_constexpr(2):
+                        wm_lo = half * HALF_WMMA_M_REP
+                        n_this = (
+                            min((half + 1) * HALF_WMMA_M_REP, wmma_m_rep) - wm_lo
+                        )
+                        if const_expr(n_this <= 0):
+                            continue
+                        if const_expr(half > 0):
+                            # Half 0's readback (same lane) must retire before its
+                            # slots are overwritten; a dscnt wait suffices (no
+                            # cross-lane sharing, so no barrier).
+                            rocdl.s_wait_dscnt(0)
+                        # Stage this half's fragments as f32 (two b128 lo/hi each).
+                        # Runtime lane/wave stays in the base so each ds_write
+                        # folds its (wm, wn) step into an immediate ds offset.
+                        _acc_store_idx = stC_idx + acc_lane_base
+                        for _wm in range_constexpr(n_this):
+                            wm_g = wm_lo + _wm
+                            for _wn in range_constexpr(output_n_rep):
+                                v = Vec(accs[wm_g * output_n_rep + _wn])
+                                _off = _wm * ACC_WM_STRIDE + _wn * ACC_WN_STRIDE
+                                lds_store_b128(
+                                    _acc_store_idx,
+                                    _off,
+                                    Vec.from_elements(
+                                        [v[i] for i in range_constexpr(4)],
+                                        fx.Float32,
+                                    ).bitcast(fx.Int32),
+                                )
+                                lds_store_b128(
+                                    _acc_store_idx,
+                                    _off + 16,
+                                    Vec.from_elements(
+                                        [v[i] for i in range_constexpr(4, 8)],
+                                        fx.Float32,
+                                    ).bitcast(fx.Int32),
+                                )
+                        rocdl.s_wait_dscnt(0)
+                        # Runtime count of this half's valid 16-row blocks.
+                        _d = mn_oob - (wmb + wm_lo * 16)
+                        _nv = (_d + 15) >> 4
+                        _nv = (_d > fx.Int32(0)).select(_nv, fx.Int32(0))
+                        _nv = (_nv < fx.Int32(n_this)).select(
+                            _nv, fx.Int32(n_this)
+                        )
+                        for wm_local in range(_nv):
+                            _emit_quant_wm(wm_lo + wm_local, wm_local)
                 else:
                     for wm in range_constexpr(wmma_m_rep):
                         _emit_quant_wm(wm)
