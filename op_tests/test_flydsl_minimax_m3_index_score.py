@@ -1880,6 +1880,7 @@ def test_score_prefill_perf(batch, q_len, ctx_len, heads):
     return ret
 
 
+@requires_gfx950
 def test_every_lazy_export_resolves():
     """`aiter.ops.flydsl` exports these lazily, so a name that stopped
     existing is an AttributeError at the caller's import rather than here.
@@ -1887,6 +1888,9 @@ def test_every_lazy_export_resolves():
     `MiniMaxM3IndexScoreConfig` pointed at a class this file deleted and
     nothing noticed, because the module imports fine until someone asks for
     that attribute -- and the consumer is in another repository.
+
+    Needs a GPU despite touching no kernel: resolving every name imports
+    modules outside M3 whose own import queries the arch.
     """
     import aiter.ops.flydsl as F
     from aiter.ops.flydsl import _LAZY_IMPORTS

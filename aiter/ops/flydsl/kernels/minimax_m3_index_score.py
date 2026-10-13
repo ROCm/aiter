@@ -1227,6 +1227,13 @@ def _validate_metadata(
     if not isinstance(S, int) or not isinstance(H, int) or S < 1 or H < 1:
         raise ValueError("S and H must be positive integers")
     device = idx_q.device
+    # Device TYPE first: `get_device_properties` initialises the driver, so on a
+    # machine with no GPU this raised RuntimeError straight through
+    # `index_score_supported` -- which is documented as metadata-only and is the
+    # one entry a dispatcher is allowed to call anywhere. A CPU tensor is a plain
+    # rejection, not a driver question.
+    if device.type != "cuda":
+        raise ValueError(f"index score requires CUDA tensors, got {device.type}")
     arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
     if arch != "gfx950":
         raise ValueError(f"index score requires gfx950, got {arch}")
