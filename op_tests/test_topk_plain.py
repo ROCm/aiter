@@ -8,7 +8,7 @@ import torch
 
 import aiter
 from aiter import dtypes
-from aiter.ops.topk_plain import topk_plain
+from aiter.ops.topk_plain import topk_plain, topk_plain_values_optional
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 torch.set_default_device("cuda")
@@ -129,6 +129,37 @@ def test_strided_rows():
     return failures
 
 
+def test_values_optional():
+    """`topk_out=None` runs where `topk_plain_values_optional` holds and raises
+    TypeError everywhere else, rather than reaching the C++ check, which aborts
+    the process."""
+    failures = []
+    n, k = 8192, 2048
+    ids = torch.empty(4, k, dtype=dtypes.i32)
+    refused = (
+        ("bf16", torch.randn(4, n, dtype=dtypes.bf16), True, k),
+        ("largest=False", torch.randn(4, n, dtype=dtypes.fp32), False, k),
+        ("block-sort shape", torch.randn(4, n, dtype=dtypes.fp32), True, 16),
+    )
+    for label, x, largest_, k_ in refused:
+        try:
+            topk_plain(x, ids[:, :k_].contiguous(), None, k_, largest_)
+            failures.append(f"{label}: accepted topk_out=None")
+        except TypeError:
+            pass
+    x = torch.randn(4, n, dtype=dtypes.fp32)
+    if not topk_plain_values_optional(n, k):
+        failures.append(f"{n} wide k={k} is expected to take topk_out=None")
+    else:
+        topk_plain(x, ids, None, k, True)
+        ref = torch.topk(x, k, dim=1).values.sort(dim=1).values
+        if not torch.equal(x.gather(1, ids.long()).sort(dim=1).values, ref):
+            failures.append("topk_out=None: wrong selection")
+    for label in failures:
+        aiter.logger.error("VALUES OPTIONAL FAILED: %s", label)
+    return failures
+
+
 BATCH_SIZES = [3072]
 HIDDENSIZES = [3072, 4096, 8192, 16384, 32768, 65536, 131072]
 TOPKS = [2048, 1024, 512, 256, 128, 64, 32, 16, 8, 4, 2, 1]
@@ -138,6 +169,8 @@ largest = True
 def main():
     bad = test_strided_rows()
     assert not bad, f"strided rows: {len(bad)} failed: {bad}"
+    bad = test_values_optional()
+    assert not bad, f"values optional: {len(bad)} failed: {bad}"
     rows = []
     for batch_size in BATCH_SIZES:
         for hiddensize in HIDDENSIZES:

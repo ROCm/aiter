@@ -40,17 +40,19 @@ def topk_plain_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 
 
 @functools.lru_cache(maxsize=1024)
-def _workspace_size(device, rows: int, stride0: int, topk: int) -> int:
+def _workspace_plan(device, rows: int, stride0: int, width: int, topk: int):
     # A size query costs a call several microseconds. The size depends on
     # nothing but these; the device is in the key because the radix plan reads
-    # its CU count.
-    return topk_plain_workspace_size(rows, stride0, topk)
+    # its CU count. Beside it, whether the radix path serves the width, which
+    # decides whether `topk_out` may be None.
+    return topk_plain_workspace_size(rows, stride0, topk), _uses_radix(width, topk)
 
 
 # Mirrors buffer_load_helpers::MAX_CAPACITY in csrc/kernels/topk_plain_kernels.cu.
 _MAX_CAPACITY = 2048
 
 
+@functools.lru_cache(maxsize=1024)
 def _uses_radix(width: int, topk: int) -> bool:
     """Mirrors `should_use_topk_radix` in csrc/kernels/topk_plain_kernels.cu.
 
@@ -96,6 +98,16 @@ def topk_plain_values_optional(width: int, topk: int) -> bool:
     return _uses_radix(width, topk)
 
 
+def _refuse_no_values(x, largest, topk):
+    # The C++ side refuses it too, but its check aborts the process under
+    # pybind; refused here, the caller gets an exception it can handle.
+    raise TypeError(
+        "topk_plain: topk_out may be None only for float32 input with "
+        "largest=True where topk_plain_values_optional() holds; got "
+        f"{x.dtype}, largest={largest}, width={x.shape[-1]}, topk={topk}"
+    )
+
+
 def topk_plain(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -114,8 +126,9 @@ def topk_plain(
     the kernel, so the C++ side never allocates device memory itself. Non-fp32
     inputs never reach the radix path, so no workspace is allocated for them.
 
-    `topk_out` may be None where `topk_plain_values_optional` holds; the C++
-    side refuses it elsewhere rather than writing through a null.
+    `topk_out` may be None for fp32 input with `largest=True` where
+    `topk_plain_values_optional` holds; elsewhere it raises TypeError, as a
+    None did before the argument became optional.
 
     `x` may have any layout. With `stride0 < 0` the row pitch is taken from `x`
     itself, not assumed to be the width.
@@ -155,10 +168,15 @@ def topk_plain(
             stride0 = -1
     workspace = None
     if x.dtype == torch.float32:
+        device, width = x.device, x.shape[-1]
         # Mirror the C++ default: stride0 < 0 means a contiguous last dim.
-        s0 = stride0 if stride0 >= 0 else x.shape[-1]
-        size = _workspace_size(x.device, x.shape[0], s0, topk)
-        workspace = get_topk_scratch_workspace(x.device, size)
+        s0 = stride0 if stride0 >= 0 else width
+        size, radix = _workspace_plan(device, x.shape[0], s0, width, topk)
+        if topk_out is None and not (largest and radix):
+            _refuse_no_values(x, largest, topk)
+        workspace = get_topk_scratch_workspace(device, size)
+    elif topk_out is None:
+        _refuse_no_values(x, largest, topk)
     return _topk_plain(
         x,
         topk_ids,
