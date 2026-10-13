@@ -55,11 +55,11 @@ constexpr float kMxFp8Max = 240.0f;
 constexpr float kMxFp8Max = 448.0f;
 #endif
 
-// Multiplier for the unclamped MXFP8 software convert, matching gfx1250's native one:
-// NaN stays NaN, and an Inf scale (a group holding an Inf) makes the whole group NaN.
-__device__ __forceinline__ float mxfp8_multiplier(float scale)
+// A group holding an Inf (the amax skips NaN) gets the largest finite scale, 2^127 (0xFE).
+// The unclamped convert then turns its Inf into NaN and its finite elements mostly to 0.
+__device__ __forceinline__ float mxfp8_cap_scale(float scale)
 {
-    return __builtin_isinf(scale) ? __builtin_nanf("") : 1.0f / scale;
+    return fminf(scale, 0x1.0p127f);
 }
 
 // emit_e8m0_scale = false (default): legacy behaviour — fp4 outputs an e8m0
@@ -404,6 +404,8 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
 #endif
             inverted_scale =
                 aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
+            if constexpr(kMxFp8)
+                inverted_scale = mxfp8_cap_scale(inverted_scale);
         }
         else
         {
@@ -564,7 +566,7 @@ dynamic_per_group_scaled_quant_kernel(DTYPE_O* __restrict__ out,
                                  kInterleavedChunks,
                                  kInterleavedChunks ? num_thread_per_group : WARP_SIZE,
                                  kInterleavedChunks ? kChunks : 1, DTYPE_O, false, true>(
-                        buffer_o, thread_data, offset, mxfp8_multiplier(row_scale));
+                        buffer_o, thread_data, offset, 1.0f / row_scale);
                 }
                 else if constexpr(kInterleavedChunks)
                 {
@@ -1533,8 +1535,8 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         for(int j = 0; j < kElems; ++j)
             absMax = max(absMax, abs(static_cast<float>(thread_data[j])));
         absMax = multithread_reduce(absMax, aiter::Max(), 2);
-        const float row_scale =
-            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax);
+        const float row_scale = mxfp8_cap_scale(
+            aiter::fp_f32_to_e8m0_scale<aiter::kDefaultMxScaleRoundMode, kMxDtype>(absMax));
         if(lane % 2 == 0)
             scale_blk[r * 4 + (lane % 8) / 2] =
                 valid ? static_cast<uint8_t>((__builtin_bit_cast(uint32_t, row_scale) >> 23) & 0xFF)
@@ -1558,7 +1560,7 @@ dynamic_per_group_quant_m32k4_kernel(opus::fp8_t* __restrict__ out,
         if constexpr(kHwConvertDiv)
             q = scaled_cast_div<opus::fp8_t>(thread_data, row_scale);
         else
-            q = scaled_cast_fp8_noclamp(thread_data, mxfp8_multiplier(row_scale));
+            q = scaled_cast_fp8_noclamp(thread_data, 1.0f / row_scale);
         *reinterpret_cast<vec_o*>(out + (row0 + r) * cols + col) = q;
     });
 }
