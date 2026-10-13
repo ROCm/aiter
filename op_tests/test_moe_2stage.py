@@ -1712,7 +1712,8 @@ def test_presorted_moe_hook():
     Kimi-K3 A4W4 TP=8 decode (BM=16 aux sort). The registered sort must be used
     instead of moe_sorting and give the same result. A registration that does
     not match the call is ignored and still consumed, so it never leaks into a
-    later call. A caller-zeroed output buffer is used as is.
+    later call, even when fused_moe exits before sorting. A caller-zeroed output
+    buffer is used as is.
     """
     if get_gfx() != "gfx950":
         aiter.logger.info("skip presorted MoE hook test on %s", get_gfx())
@@ -1758,6 +1759,7 @@ def test_presorted_moe_hook():
             "m_indices": m_indices,
             "reverse_sorted": reverse,
             "topk_ids_ptr": topk_ids.data_ptr(),
+            "topk_weights_ptr": topk_weights.data_ptr(),
             "M": token,
             "block_m": 16,
             "num_experts": E,
@@ -1798,13 +1800,27 @@ def test_presorted_moe_hook():
         diff = calc_diff(ref, out)
         assert diff < 1e-4, f"caller-zeroed output diff {diff}"
 
-        # Registered for another topk_ids tensor: ignored, and consumed.
-        aux = presort()
-        aux["topk_ids_ptr"] = topk_ids.clone().data_ptr()
-        fm.register_presorted_moe(aux)
-        fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
-        assert len(sort_calls) == 1, "a mismatched presort was used"
-        assert getattr(fm._PRESORTED_MOE, "aux", None) is None, "not consumed"
+        # Registered for another topk_ids or topk_weights tensor: ignored, and
+        # consumed.
+        for key in ("topk_ids_ptr", "topk_weights_ptr"):
+            sort_calls.clear()
+            aux = presort()
+            aux[key] = topk_ids.clone().data_ptr()
+            fm.register_presorted_moe(aux)
+            fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+            assert len(sort_calls) == 1, f"a presort with a stale {key} was used"
+            assert getattr(fm._PRESORTED_MOE, "aux", None) is None, "not consumed"
+
+        # A call that fails before sorting still consumes the registration.
+        fm.register_presorted_moe(presort())
+        bad = torch.empty((token + 1, model_dim), dtype=dtype)
+        try:
+            fused_moe(hidden, w1, w2, topk_weights, topk_ids, output=bad, **kwargs)
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("a wrong-shape output was accepted")
+        assert getattr(fm._PRESORTED_MOE, "aux", None) is None, "not consumed on error"
     finally:
         fm.moe_sorting = real_sorting
         fm.register_presorted_moe(None)

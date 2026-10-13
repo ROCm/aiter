@@ -276,21 +276,28 @@ def register_presorted_moe(aux: dict | None) -> None:
 
     ``aux`` holds the sort outputs (sorted_token_ids, sorted_weights,
     sorted_expert_ids, num_valid_ids, m_indices, reverse_sorted) and the keys
-    they were computed for (topk_ids_ptr, M, block_m, num_experts, topk). Set
-    moe_buf_zeroed and moe_buf_ptr when the caller already zeroed the buffer it
-    will pass as ``output``. The next fused_moe consumes it whether or not it
-    matches, so a stale registration never applies to a later call.
+    they were computed for (topk_ids_ptr, topk_weights_ptr, M, block_m,
+    num_experts, topk). Set moe_buf_zeroed and moe_buf_ptr when the caller
+    already zeroed the buffer it will pass as ``output``. The next fused_moe
+    consumes it on every path, whether or not it matches or is used, so a stale
+    registration never applies to a later call.
     """
     _PRESORTED_MOE.aux = aux
 
 
-def _take_presorted_moe(topk_ids, *, block_m, num_experts, topk):
+def _pop_presorted_moe():
     aux = getattr(_PRESORTED_MOE, "aux", None)
     _PRESORTED_MOE.aux = None
+    return aux
+
+
+def _match_presorted_moe(aux, topk_ids, topk_weight, *, block_m, num_experts, topk):
     if not aux:
         return None
     if (
         int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
+        # sorted_weights were gathered from this tensor.
+        or int(aux.get("topk_weights_ptr", 0)) != int(topk_weight.data_ptr())
         or int(aux.get("M", -1)) != int(topk_ids.shape[0])
         or int(aux.get("block_m", -1)) != int(block_m)
         or int(aux.get("num_experts", -1)) != int(num_experts)
@@ -1493,6 +1500,9 @@ def _fused_moe_impl(
     _stage2_override: Callable | None = None,
     _enforce_metadata_block_size: bool = False,
 ) -> torch.Tensor:
+    # Consume a caller's presort first, so every path (including early returns
+    # and errors) clears it.
+    presorted_aux = _pop_presorted_moe()
     # We do such convert since custom_op schema restriction on block_size_M, and Enum type
     activation = ActivationType(activation)
     quant_type = QuantType(quant_type)
@@ -1867,8 +1877,10 @@ def _fused_moe_impl(
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        presorted = _take_presorted_moe(
+        presorted = _match_presorted_moe(
+            presorted_aux,
             topk_ids,
+            topk_weight,
             block_m=block_size_M,
             num_experts=global_E,
             topk=topk,
