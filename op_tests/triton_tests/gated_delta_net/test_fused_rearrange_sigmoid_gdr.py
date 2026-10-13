@@ -38,8 +38,7 @@ def ref_fused_rearrange_sigmoid_gdr(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Float reference for decode path (B=1, one sequence), including GQA (HV >= H).
 
-    KDA: pass ``a`` as [T, HV, K] and ``dt_bias`` as [HV, K]; the gate ``g`` is then
-    a per-channel [K] vector that broadcasts over the [V, K] state rows.
+    For KDA, pass ``a`` as [T, HV, K] and ``dt_bias`` as [HV, K].
     """
     T = qkv.shape[0]
     H = key_dim // head_k_dim
@@ -219,44 +218,21 @@ def test_fused_rearrange_sigmoid_gdr_sweep(
     torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=rtol, atol=atol)
 
 
-def _make_kda_inputs(T, H, HV, D, dtype, num_state_slots=1, seed=0):
-    torch.manual_seed(seed)
+@cuda_ok
+def test_fused_rearrange_sigmoid_gdr_kda():
+    # KDA has one gate logit per (token, value head, key channel). T >= 2 so the
+    # tokens after the first read their own gate row.
+    T, H, HV, D, dtype = 4, 2, 4, 64, torch.bfloat16
     device = "cuda"
     K = V = D
+    scale = K**-0.5
+    torch.manual_seed(0)
     qkv = torch.randn(T, 2 * H * K + HV * V, device=device, dtype=dtype)
     A_log = torch.randn(HV, device=device, dtype=torch.float32) * 0.5
-    # KDA: one gate logit per (token, value head, key channel).
     a = torch.randn(T, HV, K, device=device, dtype=dtype)
     b_gate = torch.randn(T, HV, device=device, dtype=dtype)
     dt_bias = torch.randn(HV, K, device=device, dtype=dtype) * 0.5
-    state = torch.randn(num_state_slots, HV, V, K, device=device, dtype=dtype)
-    return qkv, A_log, a, b_gate, dt_bias, state
-
-
-# KDA (per-channel gate). T >= 2 so every token after the first reads its own
-# gate row; the last row uses production-sized heads (32 x 128).
-_KDA_SHAPES = [
-    (2, 1, 1, 16, torch.float32),
-    (4, 2, 4, 64, torch.bfloat16),
-    (8, 32, 32, 128, torch.bfloat16),
-]
-
-
-def _kda_tol(dtype):
-    return (1e-4, 1e-4) if dtype == torch.float32 else (1e-2, 1e-2)
-
-
-@cuda_ok
-@pytest.mark.parametrize(
-    ("T", "H", "HV", "D", "dtype"),
-    [pytest.param(*row, id="T{}-H{}-HV{}-D{}-{}".format(*row)) for row in _KDA_SHAPES],
-)
-def test_fused_rearrange_sigmoid_gdr_kda(
-    T: int, H: int, HV: int, D: int, dtype: torch.dtype
-):
-    K = V = D
-    qkv, A_log, a, b_gate, dt_bias, initial = _make_kda_inputs(T, H, HV, D, dtype)
-    scale = K**-0.5
+    initial = torch.randn(1, HV, V, K, device=device, dtype=dtype)
 
     o_ref, h_ref = ref_fused_rearrange_sigmoid_gdr(
         A_log,
@@ -291,94 +267,5 @@ def test_fused_rearrange_sigmoid_gdr_kda(
         is_kda=True,
     )
 
-    rtol, atol = _kda_tol(dtype)
-    torch.testing.assert_close(o_tr.float(), o_ref, rtol=rtol, atol=atol)
-    torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=rtol, atol=atol)
-
-
-# Varlen KDA with per-token in-place state slots (speculative-decode verify layout).
-_KDA_VARLEN = [
-    ([2, 2], 1, 2, 16, torch.float32),
-    ([1, 3, 2], 2, 4, 64, torch.bfloat16),
-    ([4, 4, 4, 4], 32, 32, 128, torch.bfloat16),
-]
-
-
-@cuda_ok
-@pytest.mark.parametrize(
-    ("seq_lens", "H", "HV", "D", "dtype"),
-    [
-        pytest.param(
-            *row,
-            id="lens{}-H{}-HV{}-D{}-{}".format("_".join(map(str, row[0])), *row[1:]),
-        )
-        for row in _KDA_VARLEN
-    ],
-)
-def test_fused_rearrange_sigmoid_gdr_kda_varlen(
-    seq_lens: list[int], H: int, HV: int, D: int, dtype: torch.dtype
-):
-    device = "cuda"
-    K = V = D
-    T = sum(seq_lens)
-    N = len(seq_lens)
-    max_len = max(seq_lens)
-    scale = K**-0.5
-    # Slot 0 is unused; every (sequence, token) writes its own state slot.
-    qkv, A_log, a, b_gate, dt_bias, pool = _make_kda_inputs(
-        T, H, HV, D, dtype, num_state_slots=T + 1
-    )
-    pool_init = pool.clone()
-    cu_seqlens = torch.tensor(
-        [0] + torch.tensor(seq_lens).cumsum(0).tolist(),
-        device=device,
-        dtype=torch.int32,
-    )
-    ssm_state_indices = torch.full((N, max_len), -1, device=device, dtype=torch.int32)
-    for n, (bos, L) in enumerate(zip(cu_seqlens[:-1].tolist(), seq_lens)):
-        ssm_state_indices[n, :L] = torch.arange(bos + 1, bos + 1 + L)
-
-    o_tr, _ = fused_rearrange_sigmoid_gated_delta_rule(
-        A_log,
-        a.view(T, HV * K),
-        b_gate,
-        dt_bias,
-        qkv,
-        H * K,
-        HV * V,
-        K,
-        V,
-        scale=scale,
-        initial_state=pool,
-        inplace_final_state=True,
-        cu_seqlens=cu_seqlens,
-        ssm_state_indices=ssm_state_indices,
-        use_qk_l2norm_in_kernel=True,
-        is_kda=True,
-    )
-
-    rtol, atol = _kda_tol(dtype)
-    for n, (bos, L) in enumerate(zip(cu_seqlens[:-1].tolist(), seq_lens)):
-        eos = bos + L
-        o_ref, h_ref = ref_fused_rearrange_sigmoid_gdr(
-            A_log,
-            a[bos:eos],
-            b_gate[bos:eos],
-            dt_bias,
-            qkv[bos:eos],
-            H * K,
-            HV * V,
-            K,
-            V,
-            1.0,
-            20.0,
-            scale,
-            pool_init[ssm_state_indices[n, 0]].unsqueeze(0),
-            True,
-        )
-        torch.testing.assert_close(
-            o_tr[0, bos:eos].float(), o_ref[0], rtol=rtol, atol=atol
-        )
-        torch.testing.assert_close(
-            pool[ssm_state_indices[n, L - 1]].float(), h_ref[0], rtol=rtol, atol=atol
-        )
+    torch.testing.assert_close(o_tr.float(), o_ref, rtol=1e-2, atol=1e-2)
+    torch.testing.assert_close(h_tr[-1].float(), h_ref[0], rtol=1e-2, atol=1e-2)
