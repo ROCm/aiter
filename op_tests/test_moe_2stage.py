@@ -1472,6 +1472,7 @@ def test_output_buffer_contract():
 
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
+
 def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     if get_gfx() != "gfx950":
         aiter.logger.info(
@@ -1545,6 +1546,7 @@ def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
     aiter.logger.info(
         "moe_2stage: SwiGLU MXFP4 non-split no-bias dispatch regression test passed"
     )
+
 
 # ---------------------------------------------------------------------------
 # Run

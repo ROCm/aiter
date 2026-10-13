@@ -702,7 +702,13 @@ if __name__ == "__main__":
             # Collect kernel names with their C++ type arguments for name dispatch
             for k in kernel_dict_merge.values():
                 name_lookup_entries.append(
-                    (k.name, codegen.a_dtype, "pk_fp4", codegen.acc_dtype, codegen.c_dtype)
+                    (
+                        k.name,
+                        codegen.a_dtype,
+                        "pk_fp4",
+                        codegen.acc_dtype,
+                        codegen.c_dtype,
+                    )
                 )
 
     generate_common_header(args.working_path, gen_dispatch_files, gen_manifest_files)
