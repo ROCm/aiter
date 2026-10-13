@@ -7,7 +7,7 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import assertAllclose
@@ -250,10 +250,11 @@ _PADDED_K_CASES = [
     ids=[c[0] for c in _PADDED_K_CASES],
 )
 def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(backend, m, n, k, w_k):
-    # Dispatch keys the tuned CSV with get_gfx(), and the untuned fallback is
-    # arch-specific too, so every row only holds for a gfx950 target.
-    if get_gfx() != "gfx950":
-        pytest.skip("rows are picked from the gfx950 tuned tables")
+    # Dispatch keys the tuned CSV with (get_gfx(), get_cu_num()), and the
+    # untuned fallback is arch-specific too, so every row only holds for a
+    # full 256-CU gfx950 device, not a partitioned one.
+    if (get_gfx(), get_cu_num()) != ("gfx950", 256):
+        pytest.skip("rows are picked from the gfx950 cu_num=256 tuned tables")
     assert (
         _padded_k_backend(m, n, k, w_k) == backend
     ), f"M={m} N={n} K={k}->{w_k} no longer selects {backend}; pick another row"
