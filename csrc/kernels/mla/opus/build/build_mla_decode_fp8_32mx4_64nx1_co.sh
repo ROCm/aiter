@@ -25,7 +25,7 @@ HIP_CLANG_PATH="$PIN_LLVM" /opt/rocm/bin/hipcc -x hip "$OPUS/mla_decode_fp8_32mx
     -mllvm -amdgpu-early-inline-all=true -mllvm -amdgpu-function-calls=false \
     -mllvm -enable-post-misched=0 \
     -Rpass-analysis=kernel-resource-usage ${EXTRA_FLAGS:-} \
-    --genco -o "$OUT" 2>&1 | grep -E "error|Function Name|VGPRs:|AGPRs:|ScratchSize|Occupancy|SGPRs:" || true
+    --genco -o "$OUT" 2>&1 | { grep -E "error|Function Name|VGPRs:|AGPRs:|ScratchSize|Occupancy|SGPRs:" || true; }
 
 [ -s "$OUT" ] || { echo "build failed" >&2; exit 1; }
 echo "wrote $OUT"

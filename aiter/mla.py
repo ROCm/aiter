@@ -1028,37 +1028,15 @@ def mla_decode_fwd(
             and is_experimental_enabled()
         )
 
-        # Opt-in opus merged-buffer fp8 path (gfx950). Requires a single
-        # merged d=576 fp8 q/kv buffer and per-tensor scalar float q/kv scales,
-        # or a bf16 q/kv buffer of the same shape.
-        # Shapes with an opus fp8 build: what asm runs on its qh32 / qseqlen4 kernel goes to
-        # 32mx4, what it runs on qh16 / qseqlen4 to 32mx2, and nhead 16 x 1 to 32nx4 -- the
-        # table in opus_fp8_route (csrc/kernels/mla/opus_mla_decode_fwd.cu). Anything else
-        # stays on the asm path. nhead is the folded one here.
-        opus_fp8_shape = (
-            (nhead == 32 and max_seqlen_q >= 2)
-            or nhead == 64
-            or nhead == 128
-            or (nhead == 96 and max_seqlen_q <= 6)
-            or (nhead == 16 and max_seqlen_q in (1, 3, 4))
-        )
-        opus_is_fp8 = (
-            q.dtype == dtypes.fp8
-            and kv_buffer.dtype == dtypes.fp8
-            and opus_fp8_shape
-            # No opus fp8 build addresses a real block table: none has been ported past one
-            # token per page.
-            and page_size == 1
-            and q_scale is not None
-            and kv_scale is not None
-        )
-        opus_is_bf16 = (
-            q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16 and page_size == 1
-        )
         use_opus = (
             os.environ.get("AITER_MLA_USE_OPUS", "0") == "1"
             and get_gfx() == "gfx950"
-            and (opus_is_fp8 or opus_is_bf16)
+            and page_size == 1
+            and (
+                (q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16) 
+                or 
+                (q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8)
+            )
         )
 
         # Head counts with code objects exported from the FlyDSL PS1 kernel
@@ -1124,16 +1102,16 @@ def mla_decode_fwd(
                 kv_indices,
                 work_indptr,
                 work_info_set,
-                max_seqlen_q,
                 page_size,
                 sm_scale,
                 logits,
                 attn_lse,
                 o,
                 final_lse,
-                q_scale,
-                kv_scale,
-                causal,
+                q_scale=q_scale,
+                kv_scale=kv_scale,
+                max_seqlen_q=max_seqlen_q,
+                causal=causal,
             )
         elif use_hk:
             aiter.hk_mla_v32_decode_fwd(

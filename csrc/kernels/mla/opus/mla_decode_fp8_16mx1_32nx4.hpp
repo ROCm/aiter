@@ -675,7 +675,7 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
                  "v_cmp_lt_i32_e64 %1, %6, %9\n\t"
                  "v_cndmask_b32_e64 %2, %4, %8, %0\n\t"
                  "v_cndmask_b32_e64 %3, %5, %8, %1\n\t"
-                 : "=s"(x_mask), "=s"(y_mask), "=v"(x_ref), "=v"(y_ref)
+                 : "=s"(x_mask), "=s"(y_mask), "=&v"(x_ref), "=v"(y_ref)
                  : "v"(x_ref), "v"(y_ref), "v"(rel_vgpr), "n"(THR_X), "v"(neg_inf_vgpr), "n"(THR_Y)
                  : "vcc");
 }

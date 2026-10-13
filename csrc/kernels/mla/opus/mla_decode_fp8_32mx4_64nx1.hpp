@@ -1270,7 +1270,8 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     // split into two arms, all 256 O registers stay live across both and the allocator spills.
     const bool is_final     = slot < 0;
     const int o_gmem_offset = q_len_ptr_s * kargs.stride_o_b;
-    const int oa_offset     = slot * kargs.stride_o_b;
+    // partial_slot is negative on the final path; keep the unused o_accum address in bounds.
+    const int oa_offset     = is_final ? 0 : slot * kargs.stride_o_b;
     auto g_o                = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
                          q_len * kargs.stride_o_b * sizeof(D_OUT));
     auto g_oa               = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
@@ -1286,9 +1287,12 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     });
     // lse_ptr is null when the caller did not ask for LSE; lse_accum in the split-KV case is
     // always allocated, so only the final side needs the guard.
-    D_ACC* lse_base = is_final ? reinterpret_cast<D_ACC*>(kargs.lse_ptr) + q_len_ptr_s * kargs.H
-                               : reinterpret_cast<D_ACC*>(kargs.lse_accum) + slot * kargs.H;
-    if((!is_final || kargs.lse_ptr != nullptr) && lane_id < T::W_N)
+    D_ACC* lse_base = nullptr;
+    if(!is_final)
+        lse_base = reinterpret_cast<D_ACC*>(kargs.lse_accum) + slot * kargs.H;
+    else if(kargs.lse_ptr != nullptr)
+        lse_base = reinterpret_cast<D_ACC*>(kargs.lse_ptr) + q_len_ptr_s * kargs.H;
+    if(lse_base != nullptr && lane_id < T::W_N)
     {
         auto g_lse = make_gmem(lse_base, q_len * kargs.H * sizeof(D_ACC));
         g_lse.store(lse, warp_id * T::Q_TILE_SIZE + lane_id);

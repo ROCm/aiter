@@ -1977,7 +1977,6 @@ def opus_mla_decode_fwd(
     kv_indices: torch.Tensor,
     work_indptr: torch.Tensor,
     work_info_set: torch.Tensor,
-    max_seqlen_q: int,
     page_size: int,
     softmax_scale: float,
     logits: torch.Tensor,  # aiter split_output [num_partials,1,H,512] fp32
@@ -1986,5 +1985,6 @@ def opus_mla_decode_fwd(
     final_lse: torch.Tensor | None = None,  # [total_q, H] fp32
     q_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
     kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
+    max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
     causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
 ) -> None: ...

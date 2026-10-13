@@ -121,7 +121,7 @@ inline OpusFp8Route opus_fp8_route(int nhead, int max_seqlen_q)
 {
     const int q = max_seqlen_q;
     if((nhead == 32 && q >= 4) || (nhead == 64 && q >= 2) || nhead == 128 ||
-       (nhead == 96 && q <= 6))
+       (nhead == 96 && q <= 6) || (nhead == 16 && q > 4))
         return OpusFp8Route::k32mx4;
     if((nhead == 16 && (q == 3 || q == 4)) || (nhead == 32 && (q == 2 || q == 3)) ||
        (nhead == 64 && q == 1))
@@ -217,6 +217,7 @@ void opus_mla_decode_fp8(opus_mla_decode_kargs kargs,
                          int num_workers,
                          hipStream_t stream)
 {
+    AITER_CHECK(max_seqlen_q >= 1, kFwdName, ": fp8 needs max_seqlen_q, got ", max_seqlen_q);
     const OpusFp8Route route = opus_fp8_route(kargs.H, max_seqlen_q);
     AITER_CHECK(route != OpusFp8Route::kNone,
                 kFwdName,
@@ -315,16 +316,18 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv_indices,    // [num_page_used]
      aiter_tensor_t* work_indptr,   // metadata
      aiter_tensor_t* work_info_set, // metadata
-     int max_seqlen_q,
      int page_size,
      float softmax_scale,
      aiter_tensor_t* logits,    // split_output [num_partials, 1, H, 512] fp32
      aiter_tensor_t* attn_lse,  // split_lse    [num_partials, 1, H, 1]   fp32
      aiter_tensor_t* out,       // final [total_q, H, 512] bf16
      aiter_tensor_t* final_lse, // [total_q, H] fp32 (nullable)
+     // Everything below was added when the fp8 entry point folded into this one; the bf16
+     // arguments above keep their old positions.
      aiter_tensor_t* q_scale,   // fp8: float[1] per-tensor descale; bf16: unused (nullable)
      aiter_tensor_t* kv_scale,  // fp8: float[1] per-tensor descale; bf16: unused (nullable)
-     int causal,                // fp8: apply the causal mask across the query tokens
+     int max_seqlen_q,          // fp8: required, picks the build; bf16: unused
+     bool causal,               // fp8: apply the causal mask across the query tokens
      hipStream_t stream),
     (q,
      kv,
@@ -333,7 +336,6 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      kv_indices,
      work_indptr,
      work_info_set,
-     max_seqlen_q,
      page_size,
      softmax_scale,
      logits,
@@ -342,6 +344,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      final_lse,
      q_scale,
      kv_scale,
+     max_seqlen_q,
      causal,
      stream))
 {
@@ -385,7 +388,7 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
         opus_mla_decode_bf16(kargs, num_workers, stream);
     else if(q->dtype() == AITER_DTYPE_fp8)
         opus_mla_decode_fp8(
-            kargs, q_scale, kv_scale, max_seqlen_q, causal != 0, num_workers, stream);
+            kargs, q_scale, kv_scale, max_seqlen_q, causal, num_workers, stream);
     else
         AITER_CHECK(false, __func__, ": q/kv must be bf16 or fp8.");
 }
