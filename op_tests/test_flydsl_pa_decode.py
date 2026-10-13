@@ -512,6 +512,8 @@ def test_pa_decode(case, device, monkeypatch):
         )
     )
     value_dim = head_dim if case["value_dim"] is None else case["value_dim"]
+    if value_dim != head_dim and get_gfx_runtime() != "gfx950":
+        pytest.skip("asymmetric Q/K and V widths require gfx950")
     torch.manual_seed(0)
     query, key, value, table, context = _make_inputs(
         query_length,
