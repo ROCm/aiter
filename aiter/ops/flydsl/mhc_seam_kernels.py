@@ -1,16 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host wrapper for the FlyDSL delayed mHC seam with RMSNorm (gfx942), two launches.
+"""Host wrapper for the FlyDSL delayed mHC seam with RMSNorm (gfx942), two launches, or three
+with the separate RMSNorm.
 
 Same arguments and returns as the Triton seam
 ``aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm``. A fused pass post-mixes the
 streams, stages the un-normalised collapse in ``layer_input`` and publishes the split-K gate
 projection and both sums of squares; a finish pass folds them, forms the gates and rescales
-``layer_input`` in place. See ``aiter/ops/flydsl/kernels/mhc_seam.py`` for the kernels.
+``layer_input`` in place. With ``NORM="separate"`` the kernels of
+``aiter/ops/flydsl/kernels/mhc_seam_nonorm.py`` produce the un-normalised collapse and
+``aiter.rms_norm`` applies the RMSNorm after it. See ``aiter/ops/flydsl/kernels/mhc_seam.py``
+for the fused-norm kernels.
 """
 
 import functools
+import weakref
 
 import torch
 
@@ -42,7 +47,12 @@ MHC_SEAM_DEFAULTS = {
     # nt hint on the staged collapse's store and its reload; None: _stage_nt
     "STAGE_NT": None,
     "GATE_STEP": None,  # finish pass gives the gates a column step; None: kernels.gate_step
+    # "fused": the finish pass applies the RMSNorm; "separate": aiter.rms_norm after the seam
+    "NORM": "fused",
+    # nt hint on the sublayer_out load of the NORM="separate" kernels; None: CACHE_NT
+    "CACHE_NT_X": None,
 }
+_NORMS = ("fused", "separate")
 
 # Launch table from a sweep on 304-CU gfx942 parts at H = 5120, one row per token bucket:
 # (largest T, BLOCK_M, CHUNK_C, CACHE_NT). Past the last row its config holds. SPLITS is not
@@ -60,6 +70,16 @@ _TABLE = (
     (8192, 64, 64, True),
     (16384, 64, 64, True),
     (32768, 64, 64, True),
+)
+# The NORM="separate" path's table, same sweep: (largest T, BLOCK_M, CHUNK_C, CACHE_NT,
+# CACHE_NT_X), for T above _SEPARATE_NORM_ABOVE. Up to there the fused norm is faster: the
+# separate RMSNorm costs a launch the short call cannot hide. SPLITS follows the same rule.
+_SEPARATE_NORM_ABOVE = 128
+_SEPARATE_NORM_TABLE = (
+    (384, 16, 256, True, False),
+    (1024, 16, 128, False, True),
+    (2048, 32, 128, False, True),
+    (32768, 32, 128, True, False),
 )
 # (BLOCK_M, CHUNK_C) tried, in order, when a row's tile is illegal for H
 _FALLBACK_TILES = tuple((bm, cc) for cc in (64, 128, 256) for bm in (32, 64, 16))
@@ -93,7 +113,14 @@ def _lds_bytes(arch: str) -> int:
 
 
 def _check_config(T: int, H: int, cfg: dict, arch: str) -> None:
-    from aiter.ops.flydsl.kernels.mhc_seam import check_config
+    _require(
+        cfg["NORM"] in _NORMS,
+        f"[flydsl_mhc_seam] NORM must be one of {_NORMS}, got {cfg['NORM']!r}",
+    )
+    if cfg["NORM"] == "separate":
+        from aiter.ops.flydsl.kernels.mhc_seam_nonorm import check_config
+    else:
+        from aiter.ops.flydsl.kernels.mhc_seam import check_config
 
     try:
         check_config(
@@ -109,6 +136,40 @@ def _check_config(T: int, H: int, cfg: dict, arch: str) -> None:
         )
     except ValueError as e:
         raise ValueError(f"[flydsl_mhc_seam] {e}") from None
+
+
+_FN_CACHE: dict = {}
+
+
+def _pack_fn_nonorm(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
+    """fn (24, 4H) fp32 -> the no-norm fused pass's bf16 [hi; lo] rows in MFMA B lane order,
+    cached per weight tensor.
+
+    Keyed on the tensor object (dropped when it is freed, so a new weight at a recycled
+    address never hits a stale pack) and checked against its address and version counter, so
+    an in-place update repacks. Packing only runs eagerly: during capture it would be
+    recorded, not computed.
+    """
+    key = id(fn)
+    hit = _FN_CACHE.get(key)
+    stamp = (fn.data_ptr(), fn._version)
+    if hit is not None and hit[0] == stamp:
+        return hit[1]
+    _require(
+        not capturing,
+        "[flydsl_mhc_seam] fn is not packed for NORM='separate' during CUDA-graph capture: "
+        "run one eager call with the same fn before capturing",
+        RuntimeError,
+    )
+    hi = fn.to(torch.bfloat16)
+    lo = (fn - hi.float()).to(torch.bfloat16)
+    rows = torch.cat([hi, lo])  # row-product n = 24 * limb + row
+    # (n, k) -> (k // 16, n // 16, k % 16 // 4, n % 16, k % 4); see kernels/mhc_seam_nonorm.py
+    packed = rows.view(3, 16, -1, 4, 4).permute(2, 0, 3, 1, 4).contiguous()
+    if hit is None:
+        weakref.finalize(fn, _FN_CACHE.pop, key, None)
+    _FN_CACHE[key] = (stamp, packed)
+    return packed
 
 
 def _stage_nt(T: int, H: int) -> bool:
@@ -130,8 +191,91 @@ def _round_fill(grid: int, cu_num: int) -> float:
     return grid / (ceildiv(grid, cu_num) * cu_num)
 
 
-def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
-    """Launch policy keyed on (arch, cu_num) and T.
+def _splits(T: int, H: int, bm: int, cc: int, cu_num: int) -> int:
+    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
+
+    chunks = H // cc
+    blocks = ceildiv(T, bm)
+    target = max(_SPLIT_TARGET_BLOCKS, blocks * _MAX_SPLITS)
+    fitting = [
+        s for s in range(1, chunks + 1) if chunks % s == 0 and blocks * s <= target
+    ]
+    full = [s for s in fitting if _round_fill(blocks * s, cu_num) >= _MIN_ROUND_FILL]
+    return max(full or fitting)
+
+
+def _mode(has_post: bool, identity_pre: bool) -> str:
+    """The policy's mode of a call. The API's fourth combination, no post-mix with the
+    identity pre gate, takes the fused-norm policy like ``no_post``."""
+    if has_post:
+        return "identity_pre" if identity_pre else "post"
+    return "no_post_identity_pre" if identity_pre else "no_post"
+
+
+def get_mhc_seam_config(
+    T: int, H: int, arch: str, cu_num: int, mode: str = "post", *, norm=None
+) -> dict:
+    """Launch policy keyed on (arch, cu_num), H, T and the seam's mode (``post``, ``no_post``,
+    ``identity_pre``; see ``_mode``).
+
+    * ``NORM="separate"`` above ``_SEPARATE_NORM_ABOVE`` tokens in ``post`` mode, the only one
+      the no-norm kernels serve, from ``_separate_norm_policy``; ``_fused_norm_policy``
+      otherwise.
+    * ``norm`` restricts the policy to one path, ``"fused"`` or ``"separate"``.
+    * ``GATE_STEP`` and ``STAGE_NT`` of the fused-norm path from their rules (see
+      ``_fused_norm_policy``).
+    """
+    from aiter.ops.flydsl.kernels.mhc_seam import gate_step
+
+    _require(arch in _GFX, f"unsupported arch {arch}", RuntimeError)
+    _require(norm in (None, *_NORMS), f"norm must be one of {_NORMS}, got {norm!r}")
+    _require(
+        norm != "separate" or mode == "post",
+        f"NORM='separate' serves the post mode only, got {mode!r}",
+    )
+    cfg = None
+    if cfg is None and (
+        norm == "separate"
+        or (norm is None and mode == "post" and T > _SEPARATE_NORM_ABOVE)
+    ):
+        cfg = _separate_norm_policy(T, H, arch, cu_num)
+        _require(
+            cfg is not None or norm != "separate",
+            f"[flydsl_mhc_seam] no legal NORM='separate' tile for H={H}",
+        )
+    if cfg is None:
+        cfg = _fused_norm_policy(T, H, arch, cu_num)
+    if cfg["NORM"] == "fused":
+        cfg["GATE_STEP"] = gate_step(T, H, cu_num)
+        cfg["STAGE_NT"] = _stage_nt(T, H)
+    return cfg
+
+
+def _separate_norm_policy(T: int, H: int, arch: str, cu_num: int) -> dict | None:
+    """In-code policy of the separate-norm path: ``BLOCK_M``, ``CHUNK_C``, ``CACHE_NT`` and
+    ``CACHE_NT_X`` from the ``_SEPARATE_NORM_TABLE`` row whose bucket holds ``T``, ``SPLITS``
+    by ``_splits``. ``None`` when the row's tile is illegal for ``H``."""
+    from aiter.ops.flydsl.kernels.mhc_seam_nonorm import check_config
+
+    row = next((r for r in _SEPARATE_NORM_TABLE if T <= r[0]), _SEPARATE_NORM_TABLE[-1])
+    _, bm, cc, cache_nt, cache_nt_x = row
+    try:
+        check_config(T, H, _N, bm, cc, 1, lds_bytes=_lds_bytes(arch))
+    except ValueError:
+        return None
+    return dict(
+        MHC_SEAM_DEFAULTS,
+        NORM="separate",
+        BLOCK_M=bm,
+        CHUNK_C=cc,
+        SPLITS=_splits(T, H, bm, cc, cu_num),
+        CACHE_NT=cache_nt,
+        CACHE_NT_X=cache_nt_x,
+    )
+
+
+def _fused_norm_policy(T: int, H: int, arch: str, cu_num: int) -> dict:
+    """In-code policy of the fused-norm path.
 
     * ``BLOCK_M``, ``CHUNK_C`` and ``CACHE_NT`` from the first ``_TABLE`` row whose bucket holds
       ``T`` (the last row beyond it).
@@ -140,15 +284,13 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
     * ``SPLITS``: the largest divisor of the chunk count that keeps the fused grid within
       ``_SPLIT_TARGET_BLOCKS`` workgroups or ``_MAX_SPLITS`` splits, whichever allows more,
       preferring those whose last round is at least ``_MIN_ROUND_FILL`` full.
-    * ``GATE_STEP`` from ``kernels.mhc_seam.gate_step``, which is what the table's sweep found
-      (on up to 4096 tokens at 304 CUs, off from 8192).
-    * ``STAGE_NT`` from ``_stage_nt``: the staged collapse's round trip stays cached while it
-      fits the last-level cache, whatever ``CACHE_NT`` says.
+    * ``GATE_STEP`` (set by ``get_mhc_seam_config``) from ``kernels.mhc_seam.gate_step``,
+      which is what the table's sweep found (on up to 4096 tokens at 304 CUs, off from 8192).
+    * ``STAGE_NT`` (likewise) from ``_stage_nt``: the staged collapse's round trip stays cached
+      while it fits the last-level cache, whatever ``CACHE_NT`` says.
     """
-    from aiter.ops.flydsl.kernels.kernels_common import ceildiv
-    from aiter.ops.flydsl.kernels.mhc_seam import check_config, gate_step
+    from aiter.ops.flydsl.kernels.mhc_seam import check_config
 
-    _require(arch in _GFX, f"unsupported arch {arch}", RuntimeError)
     lds = _lds_bytes(arch)
     row = next((r for r in _TABLE if T <= r[0]), _TABLE[-1])
     _, bm, cc, cache_nt = row
@@ -161,20 +303,13 @@ def get_mhc_seam_config(T: int, H: int, arch: str, cu_num: int) -> dict:
         break
     else:
         raise ValueError(f"[flydsl_mhc_seam] no legal tile for H={H}")
-    chunks = H // cc
-    blocks = ceildiv(T, bm)
-    target = max(_SPLIT_TARGET_BLOCKS, blocks * _MAX_SPLITS)
-    fitting = [
-        s for s in range(1, chunks + 1) if chunks % s == 0 and blocks * s <= target
-    ]
-    full = [s for s in fitting if _round_fill(blocks * s, cu_num) >= _MIN_ROUND_FILL]
-    splits = max(full or fitting)
-    cfg = dict(
-        MHC_SEAM_DEFAULTS, BLOCK_M=bm, CHUNK_C=cc, SPLITS=splits, CACHE_NT=cache_nt
+    return dict(
+        MHC_SEAM_DEFAULTS,
+        BLOCK_M=bm,
+        CHUNK_C=cc,
+        SPLITS=_splits(T, H, bm, cc, cu_num),
+        CACHE_NT=cache_nt,
     )
-    cfg["GATE_STEP"] = gate_step(T, H, cu_num)
-    cfg["STAGE_NT"] = _stage_nt(T, H)
-    return cfg
 
 
 def flydsl_mhc_seam(
@@ -197,16 +332,21 @@ def flydsl_mhc_seam(
     residual_out: torch.Tensor | None = None,
     config: dict | None = None,
 ):
-    """Delayed mHC seam with RMSNorm, two launches.
+    """Delayed mHC seam with RMSNorm, two launches, or three with the separate RMSNorm.
 
     Returns ``(residual_out, post_mix (T, 4, 1), comb_mix (T, 4, 4), layer_input (T, H) bf16,
     next_pre_mix (T, 4))``; the gates are fp32. ``pre_mix=None`` is the identity pre gate (the
     collapse is stream 0). With no post-mix (``sublayer_out=None``) the residual is returned as
     is and ``residual_out`` must not be passed; otherwise it is allocated when not given.
 
+    Above 128 tokens with the post-mix and a carried ``pre_mix``, the policy runs the no-norm
+    kernels and ``aiter.rms_norm`` instead (``NORM="separate"``).
+
     Invalid inputs raise ``ValueError`` / ``TypeError`` (not ``assert``). The scratch is
-    allocated per call from the caching allocator, so CUDA-graph capture needs no warm-up beyond
-    the kernels' first compile.
+    allocated per call from the caching allocator, so CUDA-graph capture of the fused-norm path
+    needs no warm-up beyond the kernels' first compile. The separate path packs ``fn`` once per
+    weight and refuses to pack during capture, so it needs one eager call with the same ``fn``
+    before capturing.
     """
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -333,7 +473,7 @@ def flydsl_mhc_seam(
         return residual_out, post_out, comb_out, layer_input, next_pre
 
     if config is None:
-        cfg = get_mhc_seam_config(T, H, arch, _cu_num())
+        cfg = get_mhc_seam_config(T, H, arch, _cu_num(), _mode(has_post, identity_pre))
     else:
         unknown = sorted(set(config) - set(MHC_SEAM_DEFAULTS))
         if unknown:
@@ -341,6 +481,79 @@ def flydsl_mhc_seam(
         cfg = dict(MHC_SEAM_DEFAULTS)
         cfg.update(config)
     _check_config(T, H, cfg, arch)
+    bm, splits = cfg["BLOCK_M"], cfg["SPLITS"]
+    stream = torch.cuda.current_stream(device)
+    bf16, f32 = fx.BFloat16, fx.Float32
+    if cfg["NORM"] == "separate":
+        # The no-norm kernels write the bf16 collapse and the gates; aiter.rms_norm
+        # normalises the collapse after them.
+        from aiter.ops.flydsl.kernels import mhc_seam_nonorm as nn
+        from aiter.ops.rmsnorm import rms_norm
+
+        _require(
+            has_post and not identity_pre,
+            "[flydsl_mhc_seam] NORM='separate' needs the post-mix and a carried pre_mix",
+        )
+        load_nt_x = cfg["CACHE_NT_X"]
+        if load_nt_x is None:
+            load_nt_x = cfg["CACHE_NT"]
+        fused = nn.compile_mhc_seam_fused_nonorm(
+            hidden=H,
+            block_m=bm,
+            chunk_c=cfg["CHUNK_C"],
+            splits=splits,
+            load_nt=cfg["CACHE_NT"],
+            load_nt_x=bool(load_nt_x),
+            store_nt=True,
+            fast_fp_math=cfg["FAST_FP_MATH"],
+            fast_narrow=cfg["FAST_NARROW"],
+            waves_per_eu=cfg["WAVES_PER_EU"],
+        )
+        finish = nn.compile_mhc_seam_finish_nonorm(
+            hidden=H,
+            splits=splits,
+            rms_eps=float(rms_eps),
+            hc_pre_eps=float(hc_pre_eps),
+            hc_sinkhorn_eps=float(hc_sinkhorn_eps),
+            hc_post_mult_value=float(hc_post_mult_value),
+            sinkhorn_repeat=int(sinkhorn_repeat),
+            fast_fp_math=cfg["FAST_FP_MATH"],
+        )
+        packed = _pack_fn_nonorm(fn, torch.cuda.is_current_stream_capturing())
+        part = torch.empty(
+            nn.part_elements(T, splits), dtype=torch.float32, device=device
+        )
+        part_p = ptr_arg(part, f32)
+        _run_compiled(
+            fused,
+            ptr_arg(residual, bf16),
+            ptr_arg(sublayer_out, bf16),
+            ptr_arg(post_layer_mix, f32),
+            ptr_arg(comb_res_mix, f32),
+            ptr_arg(pre_mix, f32),
+            ptr_arg(packed, bf16),
+            ptr_arg(residual_out, bf16),
+            ptr_arg(layer_input, bf16),
+            part_p,
+            T,
+            ceildiv(T, bm),
+            stream,
+        )
+        _run_compiled(
+            finish,
+            part_p,
+            ptr_arg(hc_scale, f32),
+            ptr_arg(hc_base, f32),
+            ptr_arg(post_out, f32),
+            ptr_arg(comb_out, f32),
+            ptr_arg(next_pre, f32),
+            T,
+            nn.finish_blocks(T),
+            stream,
+        )
+        layer_input = rms_norm(layer_input, norm_weight, float(norm_eps))
+        return residual_out, post_out, comb_out, layer_input, next_pre
+
     gate_only = cfg["GATE_STEP"]
     if gate_only is None:
         gate_only = k.gate_step(T, H, _cu_num())
@@ -348,7 +561,6 @@ def flydsl_mhc_seam(
     if stage_nt is None:
         stage_nt = _stage_nt(T, H)
 
-    bm, splits = cfg["BLOCK_M"], cfg["SPLITS"]
     fused = k.compile_mhc_seam_fused(
         streams=_N,
         hidden=H,
@@ -387,8 +599,6 @@ def flydsl_mhc_seam(
         k.part_elements(T, splits, bm), dtype=torch.float32, device=device
     )
     sums = torch.empty(k.sums_elements(T, splits), dtype=torch.float32, device=device)
-    stream = torch.cuda.current_stream(device)
-    bf16, f32 = fx.BFloat16, fx.Float32
     # The flags the kernels were built with keep them off the null pointers.
     stage_p = ptr_arg(layer_input, bf16)
     part_p, sums_p = ptr_arg(part, f32), ptr_arg(sums, f32)

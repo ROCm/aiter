@@ -3,13 +3,18 @@
 
 """FlyDSL two-launch delayed mHC seam with RMSNorm (gfx942) vs fp32 torch.
 
-Four tables:
+Tables:
   test_mhc_seam          flydsl (policy config) and the Triton seam against the fp32
                          reference, plus a CUDA-graph replay check of the flydsl launches.
                          "graph us" is the replayed-graph latency per call (both launches
                          and the gap between them); "kernel us" the profiler's summed
                          kernel time of eager calls.
-  test_mhc_seam_config   one row per legal knob set (the tuning sweep).
+  test_mhc_seam_config   the tuning sweep, post mode: one row per legal knob set of either
+                         NORM path, with the nt hints, timed as graph replay; then the
+                         fastest set per (T, NORM).
+  test_mhc_seam_norm     the policy config with each NORM path forced, post mode (the one
+                         the separate path serves): where the RMSNorm runs faster, in the
+                         finish pass or as aiter.rms_norm after it.
   test_mhc_seam_streams  two seams on two streams at once.
   test_mhc_seam_errors   invalid inputs raise ValueError / TypeError.
 
@@ -18,6 +23,7 @@ The reference, inputs and output checks are the Mega-mHC test's
 """
 
 import argparse
+import functools
 import itertools
 
 import pandas as pd
@@ -58,6 +64,17 @@ def _graph_err(fn, ref, mode):
 # Input sets the graph timing rotates through: enough that one pass over them overflows the
 # 256 MB MALL, so a replay reads its inputs from HBM as an inference step would.
 _ROTATE_BYTES = 512 * 2**20
+
+
+def _with_fn(op, fn):
+    """``op`` with the weight bound outside its arguments. run_perftest's rotation deep-copies
+    every argument, and a copied ``fn`` makes the separate path repack it on every call, which
+    a model's one weight never does."""
+
+    def call(residual, *rest, **kw):
+        return op(residual, fn, *rest, **kw)
+
+    return call
 
 
 def _clone_inputs(args, kw):
@@ -126,7 +143,7 @@ def test_mhc_seam(T, H, mode):
         # graph us: replayed CUDA graph, both launches and the gap between them;
         # kernel us: the profiler's summed kernel time of eager calls
         ret[f"{name} graph us"] = _graph_us(op, args, kw, T)
-        out, us = run_perftest(op, *args, **kw)
+        out, us = run_perftest(_with_fn(op, args[1]), args[0], *args[2:], **kw)
         ret[f"{name} kernel us"] = us
         ret[f"{name} err"] = check_outputs(name, out, ref, "bf16", mode)
     if T:
@@ -138,22 +155,50 @@ def test_mhc_seam(T, H, mode):
 
 
 @benchmark()
-def test_mhc_seam_config(T, H, block_m, chunk_c, splits):
+def test_mhc_seam_config(T, H, norm, block_m, chunk_c, splits, cache_nt, cache_nt_x):
     from aiter.jit.utils.chip_info import get_cu_num
     from aiter.ops.flydsl import flydsl_mhc_seam
     from aiter.ops.flydsl.mhc_seam_kernels import get_mhc_seam_config
 
-    cfg = {"BLOCK_M": block_m, "CHUNK_C": chunk_c, "SPLITS": splits}
+    cfg = {"NORM": norm, "BLOCK_M": block_m, "CHUNK_C": chunk_c, "SPLITS": splits}
+    cfg.update(CACHE_NT=cache_nt, CACHE_NT_X=cache_nt_x)
+    cfg = {k: v for k, v in cfg.items() if v is not None}
     args, kw, ref = _call_kwargs("post", T, H)
-    out, us = run_perftest(lambda: flydsl_mhc_seam(*args, config=cfg, **kw))
+    op = functools.partial(flydsl_mhc_seam, config=cfg)
+    us = _graph_us(op, args, kw, T)
+    out = op(*args, **kw)
     policy = get_mhc_seam_config(T, H, get_gfx(), get_cu_num())
     return {
         "gfx": get_gfx(),
-        "us": us,
+        "graph us": us,
         "TB/s": _traffic(T, H, "post") / us / 1e6,
         "policy": all(policy[k] == v for k, v in cfg.items()),
         "err": check_outputs(f"config {cfg}", out, ref, "bf16", "post"),
     }
+
+
+@benchmark()
+def test_mhc_seam_norm(T, H, mode, norms):
+    from aiter.jit.utils.chip_info import get_cu_num
+    from aiter.ops.flydsl import flydsl_mhc_seam
+    from aiter.ops.flydsl.mhc_seam_kernels import get_mhc_seam_config
+
+    args, kw, ref = _call_kwargs(mode, T, H)
+    policy = get_mhc_seam_config(T, H, get_gfx(), get_cu_num())
+    ret = {"gfx": get_gfx(), "policy": policy["NORM"]}
+    for norm in norms:
+        # each path at its own policy config; fused below the separate threshold
+        cfg = get_mhc_seam_config(T, H, get_gfx(), get_cu_num(), norm=norm)
+        op = functools.partial(flydsl_mhc_seam, config=dict(cfg, NORM=norm))
+        ret[f"{norm} graph us"] = _graph_us(op, args, kw, T)
+        out = op(*args, **kw)
+        ret[f"{norm} err"] = check_outputs(f"NORM={norm}", out, ref, "bf16", mode)
+        ret[f"{norm} graph err"] = _graph_err(
+            functools.partial(op, *args, **kw), ref, mode
+        )
+    if {"fused", "separate"} <= set(norms):
+        ret["separate speedup"] = ret["fused graph us"] / ret["separate graph us"]
+    return ret
 
 
 def test_mhc_seam_streams(T, H, splits):
@@ -203,6 +248,7 @@ def test_mhc_seam_errors(H):
         "no norm_weight": (with_kw(norm_weight=None), ValueError),
         "post w/o comb": (with_kw(comb_res_mix=None), ValueError),
         "unknown knob": (with_kw(config={"TILE_K": 64}), ValueError),
+        "unknown norm": (with_kw(config={"NORM": "post"}), ValueError),
         "illegal chunk": (with_kw(config={"CHUNK_C": 96}), ValueError),
         "splits not dividing": (with_kw(config={"SPLITS": 7}), ValueError),
         "chunk lanes not 2^k": (with_kw(config={"CHUNK_C": 320}), ValueError),
@@ -242,11 +288,19 @@ def main():
     parser.add_argument(
         "--mode", nargs="*", default=["post", "no_post", "identity_pre"]
     )
-    # knob sweep axes (test_mhc_seam_config); empty --block_m skips the sweep
+    # knob sweep axes (test_mhc_seam_config, post mode); empty --block_m skips the sweep
     parser.add_argument("--block_m", type=int, nargs="*", default=[32])
     parser.add_argument("--chunk_c", type=int, nargs="*", default=[64])
     parser.add_argument("--splits", type=int, nargs="*", default=[16, 40])
+    parser.add_argument(
+        "--sweep_norm", nargs="*", default=["fused"], choices=["fused", "separate"]
+    )
+    # 0 / 1; the default sweeps neither and leaves the hint to the wrapper's default
+    parser.add_argument("--cache_nt", type=int, nargs="*", default=[])
+    parser.add_argument("--cache_nt_x", type=int, nargs="*", default=[])
     parser.add_argument("--stream_splits", type=int, nargs="*", default=[1, 10])
+    # NORM paths timed side by side (test_mhc_seam_norm); empty skips the table
+    parser.add_argument("--norm", nargs="*", default=[], choices=["fused", "separate"])
     args = parser.parse_args()
 
     rows = [
@@ -257,27 +311,54 @@ def main():
         "mhc seam summary (markdown):\n%s", pd.DataFrame(rows).to_markdown(index=False)
     )
 
+    if args.norm:
+        rows = [
+            test_mhc_seam_norm(T, H, "post", args.norm)
+            for T, H in itertools.product(
+                [t for t in args.tokens if t > 0], args.hidden
+            )
+        ]
+        aiter.logger.info(
+            "mhc seam NORM paths (markdown):\n%s",
+            pd.DataFrame(rows).to_markdown(index=False),
+        )
+
     if args.block_m:
         from aiter.jit.utils.chip_info import get_lds_capacity_bytes
-        from aiter.ops.flydsl.kernels.mhc_seam import check_config
+        from aiter.ops.flydsl.kernels import mhc_seam, mhc_seam_nonorm
 
         lds = get_lds_capacity_bytes(get_gfx())
+        checks = {
+            "fused": mhc_seam.check_config,
+            "separate": mhc_seam_nonorm.check_config,
+        }
+        flags = lambda v: [bool(x) for x in v] or [None]
         rows = []
-        for T, H, bm, cc, sp in itertools.product(
+        for T, H, norm, bm, cc, sp, nt in itertools.product(
             [t for t in args.tokens if t > 0],
             args.hidden,
+            args.sweep_norm,
             args.block_m,
             args.chunk_c,
             args.splits,
+            flags(args.cache_nt),
         ):
             try:
-                check_config(T, H, 4, bm, cc, sp, lds_bytes=lds)
+                checks[norm](T, H, 4, bm, cc, sp, lds_bytes=lds)
             except ValueError:
                 continue
-            rows.append(test_mhc_seam_config(T, H, bm, cc, sp))
+            # the fused-norm kernels have no separate sublayer_out hint
+            for ntx in flags(args.cache_nt_x) if norm == "separate" else [None]:
+                rows.append(test_mhc_seam_config(T, H, norm, bm, cc, sp, nt, ntx))
+        sweep = pd.DataFrame(rows)
         aiter.logger.info(
-            "mhc seam config sweep (markdown):\n%s",
-            pd.DataFrame(rows).to_markdown(index=False),
+            "mhc seam config sweep (markdown):\n%s", sweep.to_markdown(index=False)
+        )
+        # fastest config per (T, H, NORM): the rows a policy table is made from
+        best = sweep.loc[sweep.groupby(["T", "H", "norm"])["graph us"].idxmin()]
+        aiter.logger.info(
+            "mhc seam config sweep, best per T (markdown):\n%s",
+            best.to_markdown(index=False),
         )
 
     rows = [
