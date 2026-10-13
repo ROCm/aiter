@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import importlib.metadata
 import importlib.util
 import os
 import pathlib
@@ -66,16 +67,42 @@ class RocmHeaderTestCase(unittest.TestCase):
         self.stack.enter_context(
             patch.object(self.cpp_extension, "_get_num_workers", return_value=1)
         )
+        self.distributions = {}
+
+        def distribution(name):
+            if name not in self.distributions:
+                raise importlib.metadata.PackageNotFoundError(name)
+            return self.distributions[name]
+
+        self.metadata = self.stack.enter_context(
+            patch.object(
+                self.cpp_extension.importlib.metadata,
+                "distribution",
+                side_effect=distribution,
+            )
+        )
+
+    def install_sdk_metadata(self, name="rocm-sdk-core", version="7.15.0a20261013"):
+        # Real wheel metadata, including the venv console-script RECORD entry.
+        site = self.root / "venv" / "lib" / "site-packages"
+        info = site / f"{name.replace('-', '_')}-{version}.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(f"Name: {name}\nVersion: {version}\n")
+        (info / "RECORD").write_text("../../bin/hipcc,,\n")
+        compiler = site.parent.parent / "bin" / "hipcc"
+        compiler.parent.mkdir(parents=True, exist_ok=True)
+        compiler.touch()
+        dist = importlib.metadata.PathDistribution(info)
+        self.distributions[name] = dist
+        return site, dist
 
     def assert_header_diagnostic(self, message):
         self.assertIn("rocprim/rocprim.hpp", message)
         self.assertIn(f"Selected ROCM_HOME: {self.runtime.parent}", message)
         self.assertIn(f"Selected hipcc: {self.hipcc}", message)
         self.assertIn("https://rocm.docs.amd.com/en/latest/install/rocm.html", message)
-        self.assertIn(
-            "ROCm/TheRock/blob/main/docs/packaging/python_packaging.md", message
-        )
-        self.assertIn("Install and initialize", message)
+        self.assertNotIn("docs/packaging/python_packaging.md", message)
+        self.assertIn("development", message)
 
 
 class RocmHeaderDiagnosticsTest(RocmHeaderTestCase):
@@ -102,6 +129,7 @@ class RocmHeaderDiagnosticsTest(RocmHeaderTestCase):
             with self.subTest(output=output):
                 self.assertEqual(self.cpp_extension._rocm_header_build_hint(output), "")
         self.compiler.assert_not_called()
+        self.metadata.assert_not_called()
 
     def test_non_hip_error_does_not_get_rocm_advice(self):
         self.cpp_extension.IS_HIP_EXTENSION = False
@@ -141,6 +169,108 @@ class RocmHeaderDiagnosticsTest(RocmHeaderTestCase):
             header_lookup.assert_not_called()
             probe.assert_not_called()
         self.compiler.assert_not_called()
+        self.metadata.assert_not_called()
+
+    def test_sdk_hint_pins_full_installed_version_for_selected_trampoline(self):
+        for version in ("7.2.1", "7.15.0a20261013", "7.15.0a20261013+build.42"):
+            with self.subTest(version=version):
+                site, _ = self.install_sdk_metadata(version=version)
+                self.hipcc = str(site.parent.parent / "bin" / "hipcc")
+                self.compiler.return_value = self.hipcc
+                message = self.cpp_extension._rocm_header_build_hint(
+                    "fatal error: 'rocprim/rocprim.hpp' file not found"
+                )
+                self.assert_header_diagnostic(message)
+                self.assertIn(f"rocm-sdk-core=={version}", message)
+                self.assertIn(f'pip install "rocm[devel]=={version}"', message)
+                self.assertIn("original-SDK-index-URL", message)
+                self.assertIn("-m rocm_sdk init", message)
+                self.assertIn("-m rocm_sdk path --root", message)
+                self.assertIn("ROCm/TheRock/blob/main/RELEASES.md", message)
+                self.assertNotIn("rocprim-dev (", message)
+
+    def test_sdk_hint_recognizes_lazy_devel_tree_without_compiler_record(self):
+        site, dist = self.install_sdk_metadata(name="rocm-sdk-devel")
+        dist._path.joinpath("RECORD").unlink()
+        for suffix in ("", ".exe", ".bat"):
+            with self.subTest(suffix=suffix):
+                hipcc = str(site / "_rocm_sdk_devel" / "bin" / f"hipcc{suffix}")
+                hint = self.cpp_extension._rocm_devel_install_hint(hipcc)
+                self.assertIn("rocm-sdk-devel==7.15.0a20261013", hint)
+                self.assertIn('"rocm[devel]==7.15.0a20261013"', hint)
+
+        other = site / "_rocm_sdk_devel-other" / "bin" / "hipcc"
+        self.assertNotIn(
+            "pip install", self.cpp_extension._rocm_devel_install_hint(str(other))
+        )
+
+    def test_sdk_command_quotes_python_executable(self):
+        site, _ = self.install_sdk_metadata()
+        hipcc = str(site.parent.parent / "bin" / "hipcc")
+        for windows, executable, quoted in (
+            (False, "/venv with spaces/bin/python", "'/venv with spaces/bin/python'"),
+            (True, r"C:\Python Env\python.exe", '"C:\\Python Env\\python.exe"'),
+        ):
+            with self.subTest(windows=windows), patch.object(
+                self.cpp_extension, "IS_WINDOWS", windows
+            ), patch.object(sys, "executable", executable):
+                hint = self.cpp_extension._rocm_devel_install_hint(hipcc)
+                self.assertIn(f"{quoted} -m pip install", hint)
+                self.assertIn(f"{quoted} -m rocm_sdk init", hint)
+
+    def test_system_release_comes_from_compiler_not_unrelated_sdk_or_rocm_home(self):
+        self.install_sdk_metadata()
+        compiler_root = pathlib.Path(self.hipcc).parent.parent
+        (compiler_root / ".info").mkdir(parents=True)
+        (self.runtime.parent / ".info").mkdir()
+        (self.runtime.parent / ".info" / "version").write_text("6.4.0")
+        for name in ("version", "version-dev"):
+            with self.subTest(name=name):
+                info = compiler_root / ".info" / name
+                info.write_text("7.2.0-43\n")
+                hint = self.cpp_extension._rocm_devel_install_hint(self.hipcc)
+                self.assertIn("Selected compiler ROCm release: 7.2.0-43", hint)
+                self.assertIn("packages for ROCm 7.2.0-43", hint)
+                self.assertIn("rocprim-dev (Debian/Ubuntu)", hint)
+                self.assertIn("rocprim-devel (RPM)", hint)
+                self.assertNotIn("6.4.0", hint)
+                self.assertNotIn("7.15.0", hint)
+                self.assertNotIn("pip install", hint)
+                info.unlink()
+
+    def test_system_release_follows_compiler_symlink_and_legacy_hip_bin(self):
+        root = self.root / "system-rocm"
+        compiler = root / "hip" / "bin" / "hipcc"
+        compiler.parent.mkdir(parents=True)
+        compiler.touch()
+        (root / ".info").mkdir()
+        (root / ".info" / "version").write_text("6.4.3")
+        link = self.root / "hipcc"
+        link.symlink_to(compiler)
+        hint = self.cpp_extension._rocm_devel_install_hint(str(link))
+        self.assertIn(f"6.4.3 (root: {root})", hint)
+
+    def test_unknown_or_malformed_metadata_does_not_invent_package_pin(self):
+        root = pathlib.Path(self.hipcc).parent.parent
+        (root / ".info").mkdir(parents=True)
+        for value in ("", "7.2", "not a release", "7.2.0\n7.1.0", "\ufffd"):
+            with self.subTest(value=value):
+                (root / ".info" / "version").write_text(value)
+                hint = self.cpp_extension._rocm_devel_install_hint(self.hipcc)
+                self.assertIn("Selected compiler ROCm release: unknown", hint)
+                self.assertNotIn("pip install", hint)
+                # The import-time HIP_VERSION is not a package release pin.
+                self.assertNotIn("7.15.0", hint)
+
+    def test_unreadable_metadata_keeps_missing_header_diagnostic(self):
+        for error in (OSError("unreadable"), ValueError("invalid metadata")):
+            with self.subTest(error=error):
+                self.metadata.side_effect = error
+                self.assert_header_diagnostic(
+                    self.cpp_extension._rocm_header_build_hint(
+                        "fatal error: 'rocprim/rocprim.hpp' file not found"
+                    )
+                )
 
 
 @unittest.skipUnless(

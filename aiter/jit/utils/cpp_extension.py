@@ -8,6 +8,7 @@
 import copy
 import importlib
 import importlib.abc
+import importlib.metadata
 import importlib.util
 import os
 import re
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import sysconfig
 import warnings
+from pathlib import Path
 
 import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
@@ -1686,6 +1688,88 @@ def _get_hipcc_path() -> str:
         return _join_rocm_home("bin", "hipcc")
 
 
+def _rocm_sdk_for_compiler(hipcc: str):
+    # Installed SDK metadata is relevant only if it owns the selected compiler.
+    # RECORD covers venv trampolines; the devel tree is expanded lazily by the SDK.
+    compiler = Path(hipcc).resolve()
+    for name in ("rocm-sdk-core", "rocm-sdk-devel"):
+        try:
+            dist = importlib.metadata.distribution(name)
+            if any(
+                Path(dist.locate_file(file)).resolve() == compiler
+                for file in dist.files or ()
+                if file.name in ("hipcc", "hipcc.exe", "hipcc.bat")
+            ) or compiler.is_relative_to(
+                Path(dist.locate_file("_" + name.replace("-", "_"))).resolve()
+            ):
+                return dist
+        except (importlib.metadata.PackageNotFoundError, OSError, ValueError):
+            continue
+    return None
+
+
+def _rocm_devel_install_hint(hipcc: str) -> str:
+    sdk = _rocm_sdk_for_compiler(hipcc)
+    if sdk is not None:
+        # Validate before putting metadata into a suggested shell command.
+        try:
+            version = str(Version(sdk.version))
+        except (TypeError, ValueError):
+            version = None
+        if version:
+            python = (
+                subprocess.list2cmdline([sys.executable])
+                if IS_WINDOWS
+                else shlex.quote(sys.executable)
+            )
+            return (
+                f"Selected Python SDK: {sdk.metadata['Name']}=={version}\n"
+                "Add the development extra at this exact SDK version, using the same "
+                "package index or wheel source as the installed SDK "
+                "(pip does not record the original index URL):\n"
+                f'  {python} -m pip install "rocm[devel]=={version}" '
+                '--index-url "<original-SDK-index-URL>"\n'
+                "Replace the index placeholder with the original SDK index.\n"
+                "After installation (or if already installed), initialize the "
+                "development package before retrying:\n"
+                f"  {python} -m rocm_sdk init\n"
+                f"  {python} -m rocm_sdk path --root\n"
+                "Set ROCM_HOME/ROCM_PATH to that SDK root and put its bin directory "
+                "first on PATH. Keep the SDK packages on the same full version.\n"
+                "Prebuilt SDK packages and initialization: "
+                "https://rocm.docs.amd.com/en/latest/install/rocm.html\n"
+                "Prebuilt nightly/preview packages and indexes: "
+                "https://github.com/ROCm/TheRock/blob/main/RELEASES.md"
+            )
+
+    # A HIP version (or torch.version.hip) is not a ROCm/package release pin.
+    # Read the release only from the selected compiler's installation.
+    root = Path(hipcc).resolve().parent.parent
+    if root.name == "hip":
+        root = root.parent
+    release = None
+    for name in ("version", "version-dev"):
+        try:
+            value = (root / ".info" / name).read_text().strip()
+        except (OSError, UnicodeError):
+            continue
+        if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", value):
+            release = value
+            break
+    target = f"ROCm {release}" if release else "the selected ROCm release"
+    return (
+        f"Selected compiler ROCm release: {release or 'unknown'} (root: {root})\n"
+        f"Install the prebuilt development packages for {target} from the same "
+        "repository/build as that installation. For split system packages, "
+        "rocPRIM headers are in rocprim-dev (Debian/Ubuntu) or rocprim-devel (RPM); "
+        "for the combined Core SDK, use amdrocm-core-sdk. "
+        "rocPRIM package versions differ from ROCm release numbers; select the "
+        "package version from the matching release repository.\n"
+        "Ensure ROCM_HOME/ROCM_PATH and PATH select that complete installation.\n"
+        "Prebuilt ROCm installation: https://rocm.docs.amd.com/en/latest/install/rocm.html"
+    )
+
+
 def _rocm_header_build_hint(output: str) -> str:
     # Diagnose a compiler failure, not a missing file under ROCM_HOME: the
     # compiler may resolve headers through environment variables or build flags.
@@ -1695,15 +1779,11 @@ def _rocm_header_build_hint(output: str) -> str:
         output,
     ):
         return ""
+    hipcc = _get_hipcc_path()
     return (
         "\nAITER: the selected ROCm compiler could not resolve 'rocprim/rocprim.hpp'.\n"
         f"Selected ROCM_HOME: {ROCM_HOME}\n"
-        f"Selected hipcc: {_get_hipcc_path()}\n"
-        "Install and initialize the development components for the intended ROCm "
-        "toolchain, and ensure ROCM_HOME/ROCM_PATH and PATH select that installation. "
-        "Follow the official guidance for your ROCm release:\n"
-        "  Installation: https://rocm.docs.amd.com/en/latest/install/rocm.html\n"
-        "  Python SDK: https://github.com/ROCm/TheRock/blob/main/docs/packaging/python_packaging.md"
+        f"Selected hipcc: {hipcc}\n" + _rocm_devel_install_hint(hipcc)
     )
 
 
