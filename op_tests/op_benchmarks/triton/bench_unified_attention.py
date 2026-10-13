@@ -499,7 +499,7 @@ def parse_args(args: list[str] | None = None) -> argparse.Namespace:
         "--shuffled_kv_cache",
         "-shuffled_kv_cache",
         action="store_true",
-        default=True,
+        default=False
         help="Pre-shuffle the KV cache into the layout the gluon kernels expect",
     )
 
