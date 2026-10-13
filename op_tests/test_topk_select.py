@@ -127,24 +127,63 @@ def test_topk_argmax_half(m, n, dtype):
 def test_zero_rows():
     """An empty batch selects nothing and leaves no launch error behind.
 
-    Rows ride a grid dimension, so a zero-row call used to launch a zero-sized
-    grid: HIP rejected it, and the next kernel on the stream raised. The probe
-    after each call is that next kernel.
+    Every backend puts rows on a grid dimension, so a zero-row call used to
+    launch a zero-sized grid: HIP rejected it, and the next kernel on the
+    stream raised. The probe after each call is that next kernel. Each shape is
+    first run at one row, so the empty call takes the cached launch a server
+    hits rather than the first-call compile.
     """
+    i32 = torch.int32
+    cases = [
+        # (name, dtype, width, k, kwargs)
+        *(
+            (f"argmax {dt} n={n}", dt, n, 1, dict(tie="low"))
+            for dt in (dtypes.fp32, dtypes.bf16, dtypes.fp16)
+            # 2048 takes the single-pass launch, 129280 the split one.
+            for n in (2048, 129280)
+        ),
+        ("small_k", dtypes.fp32, 2048, 16, {}),
+        ("stream", dtypes.fp32, 32768, 512, {}),
+        # The form a relaxed-acceptance rejection sampler asks for.
+        (
+            "decode sorted+values",
+            dtypes.fp32,
+            129280,
+            10,
+            dict(sorted=True, tie="low", return_value=True),
+        ),
+        (
+            "output_idx+offset+end",
+            dtypes.fp32,
+            2048,
+            16,
+            dict(
+                output_idx=torch.empty(0, 16, dtype=i32),
+                output_idx_offset=torch.empty(0, dtype=i32),
+                end=torch.empty(0, dtype=i32),
+                sorted_index=True,
+            ),
+        ),
+    ]
     failures = []
-    for dtype in (dtypes.fp32, dtypes.bf16, dtypes.fp16):
-        # 2048 takes the single-pass launch, 129280 the split one.
-        for n in (2048, 129280):
-            name = f"{dtype} n={n}"
-            try:
-                _, idx = topk_select(torch.empty(0, n, dtype=dtype), 1, tie="low")
-                torch.ones(1).add_(1)
-                torch.cuda.synchronize()
-            except Exception as e:  # noqa: BLE001
-                failures.append(f"{name}: {e!r}")
-                continue
-            if idx.shape != (0, 1):
-                failures.append(f"{name}: idx shape {tuple(idx.shape)}")
+    for name, dtype, n, k, kwargs in cases:
+        try:
+            warm = {kk: v for kk, v in kwargs.items() if not torch.is_tensor(v)}
+            topk_select(torch.randn(1, n, dtype=dtype), k, **warm)
+            torch.cuda.synchronize()
+            vals, idx = topk_select(torch.empty(0, n, dtype=dtype), k, **kwargs)
+            torch.ones(1).add_(1)
+            torch.cuda.synchronize()
+        except Exception as e:  # noqa: BLE001
+            failures.append(f"{name}: {e!r}"[:200])
+            continue
+        if idx.shape != (0, k):
+            failures.append(f"{name}: idx shape {tuple(idx.shape)}")
+        if "output_idx" in kwargs and idx.data_ptr() != kwargs["output_idx"].data_ptr():
+            failures.append(f"{name}: output_idx not returned")
+        if kwargs.get("return_value") and (vals is None or vals.shape != (0, k)):
+            got = None if vals is None else tuple(vals.shape)
+            failures.append(f"{name}: values {got}")
     return failures
 
 
