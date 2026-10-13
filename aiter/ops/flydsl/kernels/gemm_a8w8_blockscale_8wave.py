@@ -345,7 +345,7 @@ def compile_gemm_fp8_8wave(
                 fx.Int32(0),
             )
 
-        def load_scale_b(ki):
+        def load_scale_b_inline(ki):
             addr = fx.Int32((bid_y * scaleB_elems + ki) * 4)
             result_type = ir.Type.parse("!llvm.struct<(f32, f32)>")
             result = _llvm.inline_asm(
@@ -366,6 +366,32 @@ def compile_gemm_fp8_8wave(
                 ],
                 fx.Float32,
             )
+
+        from aiter.ops.flydsl.kernels import buffer_ops
+
+        def load_scale_b_buffer(ki):
+            offset = fx.Int32(bid_y * scaleB_elems + ki)
+            scale_l = buffer_ops.buffer_load(
+                scaleB_rsrc, offset, vec_width=1, is_scalar=True
+            )
+            scale_r = buffer_ops.buffer_load(
+                scaleB_rsrc, offset + scaleA_stride, vec_width=1, is_scalar=True
+            )
+            return Vec.from_elements(
+                [
+                    fx.Int32(scale_l).bitcast(fx.Float32),
+                    fx.Int32(scale_r).bitcast(fx.Float32),
+                ],
+                fx.Float32,
+            )
+
+        # Default use the s_buffer_load_dword inline version because of current LLVM version bug.
+        # scalar buffer lowering pass: SITargetLowering::lowerSBuffer()  can't accept MachineMemOperand argument
+        # LLVM can't know the buffer source location. So extra waitcnt would be added by LLVM later and perf drop greatly.
+        # LLVM upstreaming version llvm.amdgcn.ptr.s.buffer.load can handle this.
+        # WA: use the inline for now and avoid the performance drop caused by the current LLVM bug.
+
+        load_scale_b = load_scale_b_inline
 
         def lds_rd_scale_a(buf, bottom, m_slice=0):
             half_offset = bottom * BLOCK_M
