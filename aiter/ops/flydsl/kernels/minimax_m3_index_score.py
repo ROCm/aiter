@@ -333,11 +333,16 @@ def geometry(batch, max_block, S=0, H=0, cp_world=1, cp_rank=0, device=None):
         served = False
     waves_per_tok, spread = 1, 0
     if served:
-        # Past the tabled batches the ladder's default of 4 is right only once
-        # a request is long enough to keep its own CTAs busy. Below that a
-        # shallower loop wins -- most of a page's cost is the K stream, and a
-        # deep per-wave loop just serialises more of it behind one CTA. The
-        # crossover was swept and sits above max_block 256.
+        # Past the tabled batches a shallower loop wins while the request is
+        # short: most of a page's cost is the K stream, and a deep per-wave loop
+        # just serialises more of it behind one CTA. That is worth 5-19% across
+        # max_block 48-128.
+        #
+        # Above max_block 256 the depth stops mattering -- swept to 8192, all of
+        # 1, 2 and 4 land within 2% of each other. By then the kernel is reading
+        # at 90-95% of this part's HBM ceiling, so there is nothing for the loop
+        # shape to win. 4 is kept there because it is what shipped; 2 would do
+        # as well.
         depth = 2 if max_block <= 256 else 4
         for limit, tabled in _decode_depth_table(S, H):
             if batch <= limit:
