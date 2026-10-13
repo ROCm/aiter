@@ -19,6 +19,7 @@ recorded as not O0-quality in every layer file.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -33,7 +34,13 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
-from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_pack
+from aiter.iq2r_glm53 import (
+    EXPERTS,
+    HIDDEN,
+    TOPK,
+    iq2r_glm53_gate_bytes,
+    iq2r_glm53_pack,
+)
 from aiter.ops.iq2r import iq2r_encode_device
 from aiter.ops.iq2r_encoder import iq2r_learn_codebook
 from aiter.ops.iq2r_format import (
@@ -50,6 +57,14 @@ _TARGET_PATTERN = re.compile(
     r"(gate_up|down)_proj\.weight$"
 )
 LAYOUT = "glm53-packed-v1"
+# The serving kernels are built for this shape. ATOM slices the 2048-wide
+# experts into the TP4 (512) and TP8 (256) shards they cover.
+_GLM53_SHAPE = {
+    "hidden_size": HIDDEN,
+    "moe_intermediate_size": 2048,
+    "n_routed_experts": EXPERTS - 1,
+    "num_experts_per_tok": TOPK - 1,
+}
 _SHARD_BYTES = 5 << 30
 _PROJECTIONS = {"gate_up": "gate-up", "down": "down"}
 _MODEL_FILES = (
@@ -140,7 +155,10 @@ class GLM5Layout:
 
 @dataclass(frozen=True, slots=True)
 class GLM5Importance:
-    """Per-MoE-layer importance: routed [layers, experts, K], shared [layers, K]."""
+    """Per-MoE-layer importance: routed [layers, experts, K], shared [layers, K].
+
+    ``sha256`` identifies the calibration ("uniform" for the diagnostic mode).
+    """
 
     gate_up: Tensor
     down: Tensor
@@ -148,6 +166,7 @@ class GLM5Importance:
     shared_down: Tensor
     first_moe_layer: int
     quality: str
+    sha256: str
 
     def for_projection(self, layer: int, projection: str, expert: int) -> Tensor:
         index = layer - self.first_moe_layer
@@ -195,12 +214,18 @@ def glm5_source_layout(config: dict[str, Any]) -> GLM5Layout:
     )
     if not (0 <= layout.first_moe_layer < layout.layer_count):
         raise ValueError("GLM-5 config has an invalid routed-MoE layer range")
-    if not (0 < layout.expert_count <= 512):
-        raise ValueError("GLM-5 config has an invalid routed expert count")
     if config.get("n_shared_experts") != 1:
         raise ValueError("GLM-5 IQ2R requires exactly one shared expert")
-    if layout.hidden_size <= 0 or layout.intermediate_size <= 0:
-        raise ValueError("GLM-5 config has invalid expert dimensions")
+    mismatched = {
+        name: config.get(name)
+        for name, value in _GLM53_SHAPE.items()
+        if config.get(name) != value
+    }
+    if mismatched:
+        raise ValueError(
+            f"the GLM-5.3 IQ2R kernels need {_GLM53_SHAPE}; this config has "
+            f"{mismatched}"
+        )
     return layout
 
 
@@ -212,6 +237,13 @@ def _validate_importance(name: str, value: Tensor, shape: tuple[int, ...]) -> No
         )
     if not bool(torch.isfinite(value).all()) or bool(torch.lt(value, 0).any()):
         raise ValueError(f"IQ2R {name} importance has non-finite or negative values")
+
+
+def _importance_sha256(tensors: list[Tensor]) -> str:
+    digest = hashlib.sha256()
+    for tensor in tensors:
+        digest.update(tensor.contiguous().view(torch.uint8).numpy())
+    return digest.hexdigest()
 
 
 def _load_calibration_artifact(
@@ -272,6 +304,7 @@ def _load_calibration_artifact(
         stacked["shared_experts", "down"][:, 0],
         layout.first_moe_layer,
         "calibrated-o0",
+        _importance_sha256(list(stacked.values())),
     )
 
 
@@ -298,6 +331,7 @@ def load_glm5_importance(
             torch.ones(layers, layout.intermediate_size),
             layout.first_moe_layer,
             "diagnostic-uniform-not-o0-quality",
+            "uniform",
         )
     if diagnostic_uniform_importance:
         raise ValueError(
@@ -428,14 +462,32 @@ def _projection_metadata(layout: GLM5Layout, projection: str) -> IQ2RMetadata:
     raise ValueError(f"unknown projection {projection!r}")
 
 
-def _layer_file_metadata(layer: int, projection: str, quality: str) -> dict[str, str]:
+def _encoding_metadata(
+    importance: GLM5Importance, iterations: int, sample_vectors: int
+) -> dict[str, str]:
+    """What decides the encoded bytes besides the source weights.
+
+    Every layer file records it, so ``--resume`` keeps only layers built the same way.
+    """
+
+    return {
+        "iq2r_quality": importance.quality,
+        "iq2r_calibration_sha256": importance.sha256,
+        "iq2r_codebook_iterations": str(iterations),
+        "iq2r_codebook_sample_vectors": str(sample_vectors),
+    }
+
+
+def _layer_file_metadata(
+    layer: int, projection: str, encoding: dict[str, str]
+) -> dict[str, str]:
     return {
         "format": "pt",
         "iq2r_format": IQ2R_FORMAT_NAME,
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": str(layer),
         "iq2r_projection": projection,
-        "iq2r_quality": quality,
+        **encoding,
         "iq2r_layout": LAYOUT,
     }
 
@@ -482,7 +534,7 @@ def _validate_projection_shard(
     layout: GLM5Layout,
     layer: int,
     projection: str,
-    quality: str,
+    encoding: dict[str, str],
 ) -> None:
     """Validate a packed layer file for ``--resume``."""
 
@@ -502,7 +554,7 @@ def _validate_projection_shard(
         ),
         keys["tile_n"]: ([1], "I32"),
     }
-    expected_metadata = _layer_file_metadata(layer, projection, quality)
+    expected_metadata = _layer_file_metadata(layer, projection, encoding)
     try:
         with safe_open(shard_path, framework="pt", device="cpu") as handle:
             actual_keys = set(handle.keys())
@@ -629,7 +681,11 @@ def _compile_layer(
                 keys["tile_n"]: torch.tensor([128], dtype=torch.int32),
             },
             temporary,
-            metadata=_layer_file_metadata(layer, projection, importance.quality),
+            metadata=_layer_file_metadata(
+                layer,
+                projection,
+                _encoding_metadata(importance, iterations, sample_vectors),
+            ),
         )
         os.replace(temporary, path)
 
@@ -772,6 +828,16 @@ def compile_glm5_iq2r(
 
     model_dir = Path(model_dir).resolve()
     output_dir = Path(output_dir).resolve()
+    # Writing into the source would replace its index and config.json.
+    if (
+        output_dir == model_dir
+        or model_dir in output_dir.parents
+        or output_dir in model_dir.parents
+    ):
+        raise ValueError(
+            f"the output dir {output_dir} and the model dir {model_dir} must not "
+            "be the same or nested"
+        )
     index_path = model_dir / "model.safetensors.index.json"
     config = _read_json(model_dir / "config.json")
     layout = glm5_source_layout(config)
@@ -790,6 +856,7 @@ def compile_glm5_iq2r(
         layout,
         diagnostic_uniform_importance=diagnostic_uniform_importance,
     )
+    encoding = _encoding_metadata(importance, iterations, sample_vectors)
     moe_layers = list(range(layout.first_moe_layer, layout.layer_count))
     selected_layers = (
         moe_layers if layer_indices is None else sorted(set(layer_indices))
@@ -818,7 +885,7 @@ def compile_glm5_iq2r(
             if len(existing) == len(paths):
                 for projection, path in paths.items():
                     _validate_projection_shard(
-                        path, layout, layer, projection, importance.quality
+                        path, layout, layer, projection, encoding
                     )
                 continue
         with _TensorReader(model_dir, weight_map) as reader:

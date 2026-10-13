@@ -38,6 +38,24 @@ def test_device_encoder_matches_reference(k):
     torch.testing.assert_close(actual_auxiliary, expected_auxiliary, rtol=0, atol=0)
 
 
+def test_device_encoder_matches_reference_with_zero_blocks():
+    weight, importance = _weights(48, 256, 0x2E80)
+    weight[0, 32:64] = 0
+    weight[16:32] = 0  # one band with every block zero
+    codebook = iq2r_initial_codebook("cuda")
+    expected_data, expected_auxiliary = iq2r_encode_reference(
+        weight, importance, codebook
+    )
+    actual_data, actual_auxiliary = iq2r_encode_device(weight, importance, codebook)
+    torch.testing.assert_close(actual_data, expected_data, rtol=0, atol=0)
+    torch.testing.assert_close(actual_auxiliary, expected_auxiliary, rtol=0, atol=0)
+    metadata = IQ2RMetadata(48, 256)
+    decoded = iq2r_materialize_device(
+        actual_data.reshape(1, -1), actual_auxiliary.reshape(1, -1), metadata
+    )
+    assert torch.count_nonzero(decoded[weight == 0]).item() == 0
+
+
 def test_device_kernels_honor_noncurrent_gpu():
     if torch.cuda.device_count() < 2:
         pytest.skip("requires at least two visible GPUs")

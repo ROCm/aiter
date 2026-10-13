@@ -168,12 +168,18 @@ def iq2r_glm53_down_reduce_out(
 
 
 def _validate_gpu_weights(
-    data: Tensor, auxiliary: Tensor, metadata: IQ2RMetadata
+    data: Tensor, auxiliary: Tensor, metadata: IQ2RMetadata, *, expert_count: int
 ) -> None:
     # Reserved-zero verification belongs at checkpoint-load time.  Reading a
     # device tensor with ``.item()`` here would add a synchronization and make
     # an otherwise graph-safe out-op impossible to capture.
-    iq2r_validate_expert_weights(data, auxiliary, metadata, verify_reserved_zero=False)
+    iq2r_validate_expert_weights(
+        data,
+        auxiliary,
+        metadata,
+        expert_count=expert_count,
+        verify_reserved_zero=False,
+    )
     if data.device.type != "cuda":
         raise ValueError("IQ2R compiled operations require GPU tensors")
 
@@ -257,9 +263,9 @@ def iq2r_materialize_out(
     metadata: IQ2RMetadata,
     output: Tensor,
 ) -> None:
-    """Materialize expert 0 into caller-owned FP32 ``[N,K]`` storage."""
+    """Materialize one expert (``[1, bytes]`` buffers) into FP32 ``[N,K]`` storage."""
 
-    _validate_gpu_weights(data, auxiliary, metadata)
+    _validate_gpu_weights(data, auxiliary, metadata, expert_count=1)
     if output.dtype != torch.float32 or tuple(output.shape) != (
         metadata.logical_n,
         metadata.logical_k,

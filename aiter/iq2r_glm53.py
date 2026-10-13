@@ -16,8 +16,8 @@ a tensor-parallel shard (``iq2r_glm53_slice_gate``, ``iq2r_slice_output_auxiliar
 ``iq2r_slice_input_data``) equals packing that shard.
 
 Launch choices per token count come from ``aiter/configs/iq2r_glm53_tuned.csv``
-(override with ``AITER_CONFIG_IQ2R_GLM53``); shapes missing from the table use
-the defaults in :func:`_default_config`.
+(override with ``AITER_CONFIG_IQ2R_GLM53``). Other token counts use the next
+tuned row up that can run them, else the defaults in :func:`_default_config`.
 """
 
 from __future__ import annotations
@@ -96,30 +96,33 @@ def _atoms(src: Tensor, dst: Tensor, experts: int, k_tiles: int):
             yield record, out, third, dst_third, atom
 
 
+# The record transforms below rewrite ``data`` in place: each atom's new bytes
+# depend only on that atom's old bytes, which are read first.
+
+
 def _normalize_codebook_signs(
     data: Tensor, auxiliary: Tensor, logical_k: int
-) -> tuple[Tensor, Tensor]:
+) -> Tensor:
+    """Folds the codebook signs into the record signs; returns the new auxiliary."""
     experts, k_tiles = _geometry(data, logical_k)
-    result = data.clone()
     aux = auxiliary.clone()
     book = auxiliary[:, :4096].reshape(experts, 512, 8)
     signs = torch.zeros((experts, 512), device=data.device, dtype=torch.int64)
     for byte in range(8):
         signs |= (book[:, :, byte].to(torch.int64) >> 7) << byte
-    for record, out, third, _, atom in _atoms(data, result, experts, k_tiles):
+    for record, out, third, _, atom in _atoms(data, data, experts, k_tiles):
         metadata = third[..., 8 + atom].to(torch.int64)
         for word in range(4):
             index = record[..., word].to(torch.int64) + (((metadata >> word) & 1) << 8)
             flip = signs.gather(1, index.flatten(1)).reshape_as(index).to(torch.uint8)
             out[..., 4 + word].copy_(record[..., 4 + word] ^ flip)
     aux[:, :4096] &= 127
-    return result, aux
+    return aux
 
 
-def _pack_indices(data: Tensor, logical_k: int) -> Tensor:
+def _pack_indices(data: Tensor, logical_k: int) -> None:
     experts, k_tiles = _geometry(data, logical_k)
-    result = data.clone()
-    for record, out, third, dst_third, atom in _atoms(data, result, experts, k_tiles):
+    for record, out, third, dst_third, atom in _atoms(data, data, experts, k_tiles):
         metadata = third[..., 8 + atom].to(torch.int64)
         packed = torch.zeros_like(metadata)
         for word in range(4):
@@ -130,20 +133,17 @@ def _pack_indices(data: Tensor, logical_k: int) -> Tensor:
         dst_third[..., 8 + atom].copy_(
             ((metadata & 240) | ((packed >> 32) & 15)).to(torch.uint8)
         )
-    return result
 
 
-def _transpose_signs(data: Tensor, logical_k: int) -> Tensor:
+def _transpose_signs(data: Tensor, logical_k: int) -> None:
     experts, k_tiles = _geometry(data, logical_k)
-    result = data.clone()
-    for record, out, _, _, _ in _atoms(data, result, experts, k_tiles):
+    for record, out, _, _, _ in _atoms(data, data, experts, k_tiles):
         old = sum(record[..., 4 + j].to(torch.int64) << (8 * j) for j in range(4))
         new = torch.zeros_like(old)
         for bit in range(32):
             new |= ((old >> bit) & 1) << ((bit % 4) * 8 + bit // 4)
         for j in range(4):
             out[..., 4 + j].copy_(((new >> (8 * j)) & 255).to(torch.uint8))
-    return result
 
 
 def _quad_gate(data: Tensor, logical_n: int) -> Tensor:
@@ -194,14 +194,16 @@ def iq2r_glm53_pack(
 
     Returns ``(gate_quad, gate_auxiliary, down_data, down_auxiliary)``.
     """
-    gate, gate_aux = _normalize_codebook_signs(gate_up_data, gate_up_auxiliary, HIDDEN)
-    gate = _transpose_signs(_pack_indices(gate, HIDDEN), HIDDEN)
+    gate = gate_up_data.clone(memory_format=torch.contiguous_format)
+    gate_aux = _normalize_codebook_signs(gate, gate_up_auxiliary, HIDDEN)
+    _pack_indices(gate, HIDDEN)
+    _transpose_signs(gate, HIDDEN)
     quad = _quad_gate(gate, 2 * intermediate_size)
     del gate
-    down, down_aux = _normalize_codebook_signs(
-        down_data, down_auxiliary, intermediate_size
-    )
-    return quad, gate_aux, _pack_indices(down, intermediate_size), down_aux
+    down = down_data.clone(memory_format=torch.contiguous_format)
+    down_aux = _normalize_codebook_signs(down, down_auxiliary, intermediate_size)
+    _pack_indices(down, intermediate_size)
+    return quad, gate_aux, down, down_aux
 
 
 def iq2r_glm53_gate_bytes(logical_n: int) -> int:
@@ -246,38 +248,97 @@ def _default_config(tokens: int) -> IQ2RGlm53Config:
     return IQ2RGlm53Config("decode", 2, down, 4, 1)
 
 
+def _config_problem(
+    config: IQ2RGlm53Config, tokens: int, intermediate_size: int
+) -> str | None:
+    """Why ``config`` cannot run ``tokens`` tokens as written, or None.
+
+    The fields each path reads: M1 only the down kernel (route9); decode
+    (gate ``decode``/``nobarrier``, M2..1024) all but ``down_chunks``, and
+    ``down_grid`` only for a non-route9 down; prefill (gate and down
+    ``prefill``) the gate grid and ``down_chunks``.
+    """
+    if tokens == 1:
+        return None if config.down_kernel == "route9" else "M1 needs down route9"
+    if config.gate_kernel not in GATE_KERNELS:
+        return f"unknown gate kernel {config.gate_kernel!r}"
+    if not 1 <= config.gate_grid <= 8:
+        return "gate_grid must be 1..8"
+    if config.gate_kernel == "prefill":
+        if config.down_kernel != "prefill":
+            return "the prefill gate runs only with down prefill"
+        return None if config.down_chunks in (1, 2) else "down_chunks must be 1 or 2"
+    if tokens > MAX_DECODE_TOKENS:
+        return f"decode kernels cover M2..{MAX_DECODE_TOKENS}"
+    if config.down_kernel == "route9":
+        return None if tokens in (2, 4) else "route9 covers M1, M2 and M4"
+    if config.down_kernel not in DOWN_KERNELS:
+        return f"unknown decode down kernel {config.down_kernel!r}"
+    if config.down_kernel == "ordered" and intermediate_size != 256:
+        return "the ordered down kernel is TP8 (intermediate 256) only"
+    return None if 1 <= config.down_grid <= 16 else "down_grid must be 1..16"
+
+
 _TUNED: dict[str, dict] = {}
 
 
 def _tuned_table(tuned_file: str) -> dict:
+    """(gfx, cu_num, intermediate) -> [(token, config)] sorted by token."""
     if tuned_file not in _TUNED:
         table = pd.read_csv(tuned_file).drop_duplicates()
-        _TUNED[tuned_file] = table.set_index(
-            ["gfx", "cu_num", "token", "inter_dim"]
-        ).to_dict("index")
+        # Other model families may share the file; keep only this shape.
+        table = table[
+            (table.model_dim == HIDDEN)
+            & (table.expert == EXPERTS)
+            & (table.topk == TOPK)
+        ]
+        keys = ["gfx", "cu_num", "token", "inter_dim"]
+        duplicate = table[table.duplicated(keys, keep=False)]
+        if len(duplicate):
+            raise ValueError(
+                f"{tuned_file}: more than one GLM-5.3 IQ2R row for\n"
+                f"{duplicate[keys].drop_duplicates().to_string(index=False)}"
+            )
+        shapes: dict = {}
+        for row in table.sort_values("token").itertuples(index=False):
+            config = IQ2RGlm53Config(
+                str(row.gate_kernel),
+                int(row.gate_grid),
+                str(row.down_kernel),
+                int(row.down_grid),
+                int(row.down_chunks),
+            )
+            problem = _config_problem(config, int(row.token), int(row.inter_dim))
+            if problem is not None:
+                raise ValueError(
+                    f"{tuned_file}: M={row.token} I={row.inter_dim} {config}: {problem}"
+                )
+            key = (row.gfx, int(row.cu_num), int(row.inter_dim))
+            shapes.setdefault(key, []).append((int(row.token), config))
+        _TUNED[tuned_file] = shapes
     return _TUNED[tuned_file]
 
 
 @functools.lru_cache(maxsize=1024)
 def iq2r_glm53_config(tokens: int, intermediate_size: int) -> IQ2RGlm53Config:
+    """Config of the smallest tuned M >= ``tokens`` that can run ``tokens``.
+
+    Tuned rows are powers of two; rounding up skips rows that cannot run the
+    real M (M3 skips the route9 M4 row).
+    """
     tuned_file = AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE
-    row = _tuned_table(tuned_file).get(
-        (get_gfx(), get_cu_num(), tokens, intermediate_size)
-    )
-    if row is None:
-        return _default_config(tokens)
-    if AITER_LOG_TUNED_CONFIG:
-        logger.info(
-            f"IQ2R GLM-5.3 M={tokens} I={intermediate_size}: tuned {row} "
-            f"from {tuned_file}"
-        )
-    return IQ2RGlm53Config(
-        str(row["gate_kernel"]),
-        int(row["gate_grid"]),
-        str(row["down_kernel"]),
-        int(row["down_grid"]),
-        int(row["down_chunks"]),
-    )
+    rows = _tuned_table(tuned_file).get((get_gfx(), get_cu_num(), intermediate_size))
+    for tuned_tokens, config in rows or ():
+        if tuned_tokens >= tokens and not _config_problem(
+            config, tokens, intermediate_size
+        ):
+            if AITER_LOG_TUNED_CONFIG:
+                logger.info(
+                    f"IQ2R GLM-5.3 M={tokens} I={intermediate_size}: tuned "
+                    f"M={tuned_tokens} {config} from {tuned_file}"
+                )
+            return config
+    return _default_config(tokens)
 
 
 # --------------------------------------------------------------------------
@@ -291,7 +352,10 @@ def _task_capacity(routes: int, rows: int) -> int:
 
 @dataclass(slots=True)
 class IQ2RGlm53Workspace:
-    """Fixed-capacity buffers shared by every MoE layer on one device."""
+    """Fixed-capacity buffers shared by every MoE layer on one device.
+
+    Every launch writes these buffers, so use one workspace per stream.
+    """
 
     max_tokens: int
     intermediate_size: int
@@ -363,8 +427,10 @@ def iq2r_glm53_moe_out(
 
     ``hidden_states`` is BF16 [tokens, 6144]; ``topk_ids``/``topk_weights``
     are int32/float32 [tokens, 9] (eight routed experts plus the fused shared
-    expert 256); the weights come from :func:`iq2r_glm53_pack`. ``config``
-    overrides the tuned launch choice (used by the tuner).
+    expert 256); the weights come from :func:`iq2r_glm53_pack`. Routes with an
+    id outside 0..256 contribute nothing. ``config`` overrides the tuned launch
+    choice (used by the tuner); it must fit ``tokens``, and ``tokens`` must fit
+    the workspace.
     """
     # The gate and down kernel bodies are built for gfx950 only and are empty
     # on other targets, which would leave ``output`` unwritten.
@@ -373,6 +439,12 @@ def iq2r_glm53_moe_out(
         raise RuntimeError(f"GLM-5.3 IQ2R MoE requires gfx950, not {gfx}")
     tokens = hidden_states.shape[0]
     if tokens > workspace.max_tokens:
+        if config is not None:
+            # Each chunk needs its own launch choice (the tail may be M1).
+            raise ValueError(
+                f"an explicit config runs one launch, but {tokens} tokens exceed "
+                f"the workspace's {workspace.max_tokens}"
+            )
         for begin in range(0, tokens, workspace.max_tokens):
             rows = slice(begin, min(begin + workspace.max_tokens, tokens))
             iq2r_glm53_moe_out(
@@ -385,7 +457,6 @@ def iq2r_glm53_moe_out(
                 topk_ids[rows],
                 output[rows],
                 workspace,
-                config,
             )
         return
     if tokens == 0:
@@ -396,6 +467,10 @@ def iq2r_glm53_moe_out(
         raise ValueError("topk_weights must be contiguous float32")
     if config is None:
         config = iq2r_glm53_config(tokens, workspace.intermediate_size)
+    else:
+        problem = _config_problem(config, tokens, workspace.intermediate_size)
+        if problem is not None:
+            raise ValueError(f"{config} cannot run M={tokens}: {problem}")
     routes = tokens * TOPK
     ids = topk_ids.reshape(-1)
     gather = workspace.gather_indices[:routes]

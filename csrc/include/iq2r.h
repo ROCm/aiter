@@ -7,6 +7,9 @@
 
 namespace aiter {
 
+// Raises unless the current GPU is gfx950; the IQ2R kernels are built for gfx950 only.
+void iq2r_check_gfx950();
+
 void iq2r_encode_out(const aiter_tensor_t& weight,
                      const aiter_tensor_t& importance,
                      const aiter_tensor_t& codebook,

@@ -92,6 +92,7 @@ __global__ __launch_bounds__(64) void iq2r_encode_assign_kernel(
     uint8_t* __restrict__ data,
     uint8_t* __restrict__ scales)
 {
+#if defined(__gfx950__)
     const int logical = static_cast<int>(blockIdx.x);
     const int lane = static_cast<int>(threadIdx.x);
     const int blocks_per_row = valid_K / kScaleBlock;
@@ -171,8 +172,10 @@ __global__ __launch_bounds__(64) void iq2r_encode_assign_kernel(
     const int logical_block = block_k % 4;
     const int k_tiles = storage_K / kTileK;
     const int64_t tile = physical_tile(n_block, k_tile, k_tiles);
+    // An all-zero block is exact with codeword 0 at any scale. Scale byte 0
+    // marks it and keeps it out of its band's base exponent.
     scales[tile * 64 + logical_block * 16 + row_in_tile] =
-        static_cast<uint8_t>(best_exponent + 127);
+        maximum == 0.0f ? 0 : static_cast<uint8_t>(best_exponent + 127);
 #pragma unroll
     for(int group = 0; group < 4; ++group)
     {
@@ -191,6 +194,7 @@ __global__ __launch_bounds__(64) void iq2r_encode_assign_kernel(
         }
         data[lane_record_offset(tile, physical_lane) + 4 + physical_slot] = sign;
     }
+#endif
 }
 
 __global__ __launch_bounds__(256) void iq2r_encode_base_kernel(
@@ -200,6 +204,7 @@ __global__ __launch_bounds__(256) void iq2r_encode_base_kernel(
     int valid_K,
     uint8_t* __restrict__ base_exponents)
 {
+#if defined(__gfx950__)
     const int n_block = static_cast<int>(blockIdx.x);
     const int thread = static_cast<int>(threadIdx.x);
     const int n_blocks = N / kTileN;
@@ -219,9 +224,8 @@ __global__ __launch_bounds__(256) void iq2r_encode_base_kernel(
         const int k_tile = block_k / 4;
         const int logical_block = block_k % 4;
         const int64_t tile = physical_tile(n_block, k_tile, k_tiles);
-        minimum = min(minimum,
-                      static_cast<uint32_t>(
-                          scales[tile * 64 + logical_block * 16 + row_in_tile]));
+        const uint32_t scale = scales[tile * 64 + logical_block * 16 + row_in_tile];
+        minimum = min(minimum, scale == 0 ? 255u : scale);
     }
 #pragma unroll
     for(int offset = 32; offset > 0; offset >>= 1)
@@ -236,9 +240,10 @@ __global__ __launch_bounds__(256) void iq2r_encode_base_kernel(
 #pragma unroll
         for(int offset = 32; offset > 0; offset >>= 1)
             minimum = min(minimum, __shfl_down(minimum, offset));
-        if(thread == 0)
-            base_exponents[n_block] = static_cast<uint8_t>(minimum);
+        if(thread == 0)  // 255: every block of the band is zero
+            base_exponents[n_block] = static_cast<uint8_t>(minimum == 255 ? 127 : minimum);
     }
+#endif
 }
 
 __global__ __launch_bounds__(256) void iq2r_encode_pack_kernel(
@@ -252,6 +257,7 @@ __global__ __launch_bounds__(256) void iq2r_encode_pack_kernel(
     uint8_t* __restrict__ data,
     int32_t* __restrict__ scale_delta_overflow)
 {
+#if defined(__gfx950__)
     const int64_t item = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if(item >= triplets * 64)
         return;
@@ -297,6 +303,7 @@ __global__ __launch_bounds__(256) void iq2r_encode_pack_kernel(
     data[destination] = static_cast<uint8_t>(metadata);
     data[destination + 1] = static_cast<uint8_t>(metadata >> 8);
     data[destination + 2] = static_cast<uint8_t>(metadata >> 16);
+#endif
 }
 
 __device__ __forceinline__ float decode_fp8(uint8_t bits)
@@ -311,6 +318,7 @@ __global__ void iq2r_materialize_kernel(const uint8_t* __restrict__ data,
                                         int N,
                                         int K)
 {
+#if defined(__gfx950__)
     const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t elements = static_cast<int64_t>(N) * K;
     if(index >= elements)
@@ -347,6 +355,7 @@ __global__ void iq2r_materialize_kernel(const uint8_t* __restrict__ data,
     const int exponent = static_cast<int>(auxiliary[kCodebookBytes + n_block]) + delta;
     const float scale = exponent == 0 ? 0.0f : ldexpf(1.0f, exponent - 127);
     output[index] = decode_fp8(signed_value) * scale;
+#endif
 }
 
 struct IQ2RCompressedTriplet
@@ -1469,6 +1478,7 @@ __global__ __launch_bounds__(128) void glm53_reduce_chunk_kernel(
     const float* __restrict__ route_weights,const int32_t* __restrict__ scatter,
     __hip_bfloat16* __restrict__ output,int tokens,int chunk)
 {
+#if defined(__gfx950__)
     constexpr int Width=6144/Chunks,Tiles=(Width+1023)/1024;
     const int token=blockIdx.x/Tiles,tile=blockIdx.x%Tiles;
     const int local=tile*1024+threadIdx.x*8;
@@ -1479,6 +1489,7 @@ __global__ __launch_bounds__(128) void glm53_reduce_chunk_kernel(
     for(int route=0;route<9;++route)
     {
         const int sorted=__builtin_amdgcn_readfirstlane(scatter[token*9+route]);
+        if(sorted<0)continue;  // invalid expert id: the route contributes nothing
         const float weight=__builtin_bit_cast(float,__builtin_amdgcn_readfirstlane(__builtin_bit_cast(uint32_t,route_weights[token*9+route])));
         const int64_t address=(static_cast<int64_t>(col/384)*tokens*9+sorted)*384+col%384;
         opus::vector_t<opus::bf16_t,8> values;
@@ -1490,6 +1501,7 @@ __global__ __launch_bounds__(128) void glm53_reduce_chunk_kernel(
 #pragma unroll
     for(int i=0;i<8;++i)packed[i]=__builtin_bit_cast(opus::bf16_t,__float2bfloat16(sums[i]));
     *reinterpret_cast<uint4*>(output+static_cast<int64_t>(token)*6144+col)=*reinterpret_cast<const uint4*>(&packed);
+#endif
 }
 
 // Down for M<=4: one CTA per (48-column block, token) and one wave per route.
@@ -2246,6 +2258,13 @@ __global__ __launch_bounds__(512,1) void glm53_gate_decode_nobarrier_kernel(
 
 } // namespace
 
+void iq2r_check_gfx950()
+{
+    // The IQ2R kernel bodies are compiled for gfx950 only; elsewhere they are empty.
+    static const std::string arch = get_gpu_arch();
+    AITER_CHECK(arch == "gfx950", "IQ2R kernels require gfx950, not ", arch);
+}
+
 void iq2r_encode_out(const aiter_tensor_t& weight,
                      const aiter_tensor_t& importance,
                      const aiter_tensor_t& codebook,
@@ -2258,6 +2277,7 @@ void iq2r_encode_out(const aiter_tensor_t& weight,
                      int64_t exponent_radius,
                      double codebook_max)
 {
+    iq2r_check_gfx950();
     AITER_CHECK(weight.is_gpu() && importance.is_gpu() && codebook.is_gpu() &&
                     indices.is_gpu() && scales.is_gpu() && data.is_gpu() &&
                     auxiliary.is_gpu() && scale_delta_overflow.is_gpu(),
@@ -2356,6 +2376,7 @@ void iq2r_materialize_out(const aiter_tensor_t& data,
                           int64_t logical_n,
                           int64_t logical_k)
 {
+    iq2r_check_gfx950();
     validate_weights(data, auxiliary, logical_n, logical_k);
     AITER_CHECK(output.is_gpu() && output.device_id == data.device_id,
                 "IQ2R materialized output must be on the same GPU");
@@ -2402,9 +2423,9 @@ int glm53_tp4_from_gate(const aiter_tensor_t& data, const aiter_tensor_t& auxili
 
 void glm53_check_device(std::initializer_list<const aiter_tensor_t*> tensors, const aiter_tensor_t& data)
 {
-    // The GLM-5.3 kernel bodies are compiled for gfx950 only; elsewhere they are empty.
-    static const std::string arch = get_gpu_arch();
-    AITER_CHECK(arch == "gfx950", "GLM-5.3 IQ2R kernels require gfx950, not ", arch);
+    iq2r_check_gfx950();
+    AITER_CHECK(data.is_gpu() && data.is_contiguous(),
+                "GLM-5.3 IQ2R packed weights must be contiguous on the GPU");
     for(const auto* tensor : tensors)
         AITER_CHECK(tensor->is_gpu() && tensor->device_id == data.device_id && tensor->is_contiguous(),
                     "GLM-5.3 IQ2R tensors must be contiguous on the weight GPU");

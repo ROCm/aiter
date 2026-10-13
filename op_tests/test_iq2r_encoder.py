@@ -64,6 +64,39 @@ def test_reference_encode_decode_round_trip_and_physical_padding(n):
     assert relative_l2.item() < 0.7
 
 
+def _with_zero_blocks(weight):
+    """Zero one 32-wide block in row 0 and every block of rows 16..31."""
+    zeroed = weight.clone()
+    zeroed[0, 32:64] = 0
+    zeroed[16:32] = 0
+    mask = zeroed == 0
+    return zeroed, mask
+
+
+def test_reference_encoder_keeps_zero_blocks_exact():
+    weight, importance = _inputs(n=48, k=256)
+    zeroed, mask = _with_zero_blocks(weight)
+    codebook = iq2r_initial_codebook()
+    metadata = IQ2RMetadata(48, 256)
+
+    def decode(matrix):
+        data, auxiliary = iq2r_encode_reference(matrix, importance, codebook)
+        return iq2r_materialize(data.unsqueeze(0), auxiliary.unsqueeze(0), metadata)[0]
+
+    decoded = decode(zeroed)
+    assert torch.count_nonzero(decoded[mask]).item() == 0
+    # Every other block keeps its codewords and scale.
+    torch.testing.assert_close(decoded[~mask], decode(weight)[~mask], rtol=0, atol=0)
+
+
+def test_encoder_rejects_codebooks_outside_e4m3():
+    weight, importance = _inputs(n=16)
+    codebook = iq2r_initial_codebook()
+    codebook[1, 0] = 0.3
+    with pytest.raises(ValueError, match="E4M3"):
+        iq2r_encode_reference(weight, importance, codebook)
+
+
 def test_reference_encoder_preserves_zero_padded_k():
     weight, importance = _inputs(n=16, k=160)
     data, auxiliary = iq2r_encode_reference(weight, importance, iq2r_initial_codebook())

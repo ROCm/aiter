@@ -74,6 +74,11 @@ def iq2r_initial_codebook(device: torch.device | str = "cpu") -> Tensor:
 def iq2r_reserve_zero_codeword(codebook: Tensor) -> Tensor:
     if tuple(codebook.shape) != (IQ2R_CODEBOOK_ENTRIES, IQ2R_VECTOR_SIZE):
         raise ValueError("IQ2R codebook must have shape [512,8]")
+    # The encoders pick codewords with these values and store them as E4M3.
+    if not torch.equal(
+        codebook.float().to(torch.float8_e4m3fn).float(), codebook.float()
+    ):
+        raise ValueError("IQ2R codebook values must be exact FP8 E4M3 values")
     result = codebook.clone()
     result[0].zero_()
     return result
@@ -262,9 +267,11 @@ def iq2r_encode_reference(
                     atom_metadata, lane, word | (high_nibble << (atom * 8))
                 )
 
+    # An all-zero block is exact with codeword 0 at any scale. Scale byte 0
+    # marks it and keeps it out of its band's base exponent below.
+    zero_block = fragments.abs().amax(dim=-1) == 0
     logical_scales = (
-        (best_exp + 127)
-        .clamp(0, 254)
+        torch.where(zero_block, 0, (best_exp + 127).clamp(0, 254))
         .to(torch.uint8)
         .cpu()
         .reshape(logical_tile_count, 64)
@@ -286,7 +293,9 @@ def iq2r_encode_reference(
                     logical_block * 16 : (logical_block + 1) * 16,
                 ]
             )
-        base_exponent = int(torch.cat(valid_exponents).min())
+        valid_exponents = torch.cat(valid_exponents)
+        valid_exponents = valid_exponents[valid_exponents > 0]
+        base_exponent = int(valid_exponents.min()) if valid_exponents.numel() else 127
         base_exponents[n_block] = base_exponent
         for k_tile in range(k_tiles):
             logical_tile = n_block * k_tiles + k_tile

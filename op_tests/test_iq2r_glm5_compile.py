@@ -4,6 +4,7 @@
 import fnmatch
 import functools
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,12 @@ _INTERMEDIATE = 2048
 _EXPERTS = 2
 _LAYERS = 5
 _QUALITY = "diagnostic-uniform-not-o0-quality"
+_ENCODING = {
+    "iq2r_quality": _QUALITY,
+    "iq2r_calibration_sha256": "uniform",
+    "iq2r_codebook_iterations": "4",
+    "iq2r_codebook_sample_vectors": "65536",
+}
 
 
 def _layout() -> GLM5Layout:
@@ -61,6 +68,7 @@ def test_source_layout_reads_glm53_config():
         "first_k_dense_replace": 3,
         "n_routed_experts": 256,
         "n_shared_experts": 1,
+        "num_experts_per_tok": 8,
         "hidden_size": 6144,
         "moe_intermediate_size": 2048,
         "quantization_config": {
@@ -75,6 +83,15 @@ def test_source_layout_reads_glm53_config():
         glm5_source_layout({**config, "architectures": [], "model_type": "llama"})
     with pytest.raises(ValueError, match="one shared expert"):
         glm5_source_layout({**config, "n_shared_experts": 2})
+    # Other GLM MoE DSA shapes would compile but not serve.
+    for name, value in (
+        ("hidden_size", 5120),
+        ("moe_intermediate_size", 1536),
+        ("n_routed_experts", 160),
+        ("num_experts_per_tok", 6),
+    ):
+        with pytest.raises(ValueError, match=re.escape(f"has {{{name!r}: {value}}}")):
+            glm5_source_layout({**config, name: value})
 
 
 def test_source_keys_match_glm53_checkpoint_names():
@@ -147,6 +164,7 @@ def test_loads_calibration_artifact(tmp_path):
 
     loaded = load_glm5_importance(path, layout)
     assert loaded.quality == "calibrated-o0"
+    assert len(loaded.sha256) == 64
     assert torch.equal(loaded.gate_up[:, 0, 0], torch.tensor([4.0, 5.0]))
     assert loaded.down.shape == (2, 2, 2)
     assert loaded.shared_gate_up.shape == (2, 4)
@@ -154,6 +172,11 @@ def test_loads_calibration_artifact(tmp_path):
     # Each vector is normalized to mean 1; expert 2 is the fused shared expert.
     for expert in range(layout.compiled_experts):
         assert torch.equal(loaded.for_projection(3, "gate_up", expert), torch.ones(4))
+
+    # Any change to the importance changes the identity --resume checks.
+    targets["model.layers.3.mlp.experts.down_proj.weight"]["importance"][1, 0] += 1
+    torch.save(artifact, path)
+    assert load_glm5_importance(path, layout).sha256 != loaded.sha256
 
     del targets["model.layers.4.mlp.shared_experts.down_proj.weight"]
     torch.save(artifact, path)
@@ -168,7 +191,21 @@ def test_uniform_importance_requires_explicit_diagnostic_mode():
 
     loaded = load_glm5_importance(None, layout, diagnostic_uniform_importance=True)
     assert loaded.quality == "diagnostic-uniform-not-o0-quality"
+    assert loaded.sha256 == "uniform"
     assert loaded.shared_down.shape == (2, 2)
+
+
+def test_compile_refuses_to_write_into_the_source(tmp_path):
+    source = tmp_path / "source"
+    for output in (source, source / "out", tmp_path):
+        with pytest.raises(ValueError, match="same or nested"):
+            compile_glm5_iq2r(source, output, diagnostic_uniform_importance=True)
+
+
+@pytest.fixture
+def two_experts(monkeypatch):
+    # Two routed experts instead of 256 keep the checkpoint tests small.
+    monkeypatch.setitem(compile_module._GLM53_SHAPE, "n_routed_experts", _EXPERTS)
 
 
 def _has_gfx950() -> bool:
@@ -207,6 +244,7 @@ def _write_source_model(path: Path) -> dict[str, torch.Tensor]:
         "first_k_dense_replace": 3,
         "n_routed_experts": _EXPERTS,
         "n_shared_experts": 1,
+        "num_experts_per_tok": 8,
         "hidden_size": _HIDDEN,
         "moe_intermediate_size": _INTERMEDIATE,
         "quantization_config": {
@@ -238,7 +276,7 @@ def _compiled_source_keys(layers) -> set[str]:
     }
 
 
-def test_checkpoint_files_replace_compiled_experts(tmp_path, monkeypatch):
+def test_checkpoint_files_replace_compiled_experts(tmp_path, monkeypatch, two_experts):
     source, output = tmp_path / "source", tmp_path / "out"
     tensors = _write_source_model(source)
     output.mkdir()
@@ -327,7 +365,7 @@ def test_resume_validates_existing_layer_file(tmp_path):
         "iq2r_activation_basis": IQ2R_ACTIVATION_BASIS,
         "iq2r_layer": "3",
         "iq2r_projection": "gate_up",
-        "iq2r_quality": _QUALITY,
+        **_ENCODING,
         "iq2r_layout": LAYOUT,
     }
     tensors = {
@@ -338,22 +376,24 @@ def test_resume_validates_existing_layer_file(tmp_path):
         keys["tile_n"]: torch.tensor([128], dtype=torch.int32),
     }
     save_file(tensors, shard, metadata=file_metadata)
-    _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY)
+    _validate_projection_shard(shard, layout, 3, "gate_up", _ENCODING)
 
     # Unpacked gate/up records have a different size.
     unpacked = dict(tensors)
     unpacked[keys["data"]] = torch.zeros((3, metadata.data_bytes), dtype=torch.uint8)
     save_file(unpacked, shard, metadata=file_metadata)
     with pytest.raises(ValueError, match="invalid compiled shard.*expected U8"):
-        _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY)
+        _validate_projection_shard(shard, layout, 3, "gate_up", _ENCODING)
 
-    save_file(tensors, shard, metadata={**file_metadata, "iq2r_quality": "other"})
-    with pytest.raises(ValueError, match="metadata 'iq2r_quality'"):
-        _validate_projection_shard(shard, layout, 3, "gate_up", _QUALITY)
+    # A layer encoded with another calibration or codebook setting is rejected.
+    for name in _ENCODING:
+        save_file(tensors, shard, metadata={**file_metadata, name: "other"})
+        with pytest.raises(ValueError, match=f"metadata '{name}'"):
+            _validate_projection_shard(shard, layout, 3, "gate_up", _ENCODING)
 
 
 @pytest.mark.skipif(not _has_gfx950(), reason="requires gfx950")
-def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch):
+def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch, two_experts):
     source, output = tmp_path / "source", tmp_path / "out"
     _write_source_model(source)
     generator = torch.Generator().manual_seed(0x5310)
@@ -382,6 +422,8 @@ def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch):
     config_path = run(resume=True)
     # The resumed run validates layer 3 and only encodes layer 4.
     assert calls == [3, 3, 4, 4]
+    with pytest.raises(ValueError, match="metadata 'iq2r_codebook_iterations'"):
+        run(resume=True, iterations=5)
 
     for layer in (3, 4):
         expected = iq2r_glm53_pack(
@@ -399,8 +441,8 @@ def test_compile_packs_layers_and_writes_checkpoint(tmp_path, monkeypatch):
             keys = iq2r_compiled_tensor_keys(layer, projection)
             path = output / f"iq2r-layer-{layer:04d}-{suffix}.safetensors"
             with safe_open(path, "pt") as handle:
-                assert handle.metadata()["iq2r_layout"] == LAYOUT
-                assert handle.metadata()["iq2r_quality"] == _QUALITY
+                metadata = handle.metadata()
+                assert metadata.items() >= {**_ENCODING, "iq2r_layout": LAYOUT}.items()
                 assert torch.equal(handle.get_tensor(keys["data"]), values[0].cpu())
                 assert torch.equal(
                     handle.get_tensor(keys["auxiliary"]), values[1].cpu()

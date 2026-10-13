@@ -21,7 +21,8 @@ rank with contiguous slices (`iq2r_glm53_slice_gate`, and the generic
 ## Building the checkpoint
 
 Two tools turn the block-FP8 GLM-5.3 checkpoint into the packed checkpoint
-ATOM serves.
+ATOM serves. They need `safetensors` (`pip install safetensors`, or the
+`iq2r` extra).
 
 1. `aiter.quantization.iq2r.glm5.calibrate` runs the FP8 model in Hugging Face
    Transformers (5.16 or newer, plus `kernels` for the FP8 matmul) over a
@@ -68,9 +69,11 @@ ATOM serves.
            --output-dir $OUT --calibration-cache calibration.pt --resume
 
    The last run covers every layer. Instead of re-encoding the existing layer
-   files it checks their tensor keys, shapes, dtypes, format metadata and
-   quality string. It then copies the remaining FP8 tensors into new shards
-   and writes the index, config and tokenizer. The config lists
+   files it checks their tensor keys, shapes, dtypes and format metadata,
+   and that they were encoded with the same calibration (its sha256),
+   `--iterations` and `--sample-vectors`. It then copies the remaining FP8
+   tensors into new shards and writes the index, config and tokenizer. The
+   config lists
    `iq2r_modules` patterns for the routed and shared experts of each compiled
    layer, so the experts of the MTP layer (78) stay FP8.
 
@@ -81,7 +84,8 @@ load-time relayout.
 
 `iq2r_glm53_moe_out` looks up the launch choice for the token count in
 `aiter/configs/iq2r_glm53_tuned.csv` (keyed on gfx, cu_num, token and
-inter_dim). Token counts without a row use `_default_config`.
+inter_dim). Other token counts use the next tuned row up that can run
+them, else `_default_config`.
 `AITER_LOG_TUNED_CONFIG=1` logs the choice once per shape. Each row names:
 
 - the gate kernel (`decode`, `nobarrier`, `prefill`) and its grid;

@@ -10,9 +10,12 @@ import pytest
 import torch
 
 from aiter.iq2r_glm53 import (
+    MAX_CHUNK_TOKENS,
     IQ2RGlm53Config,
     IQ2RGlm53Workspace,
+    _config_problem,
     _default_config,
+    _tuned_table,
     iq2r_glm53_config,
     iq2r_glm53_moe_out,
     iq2r_glm53_pack,
@@ -145,6 +148,16 @@ def _reference_moe(layer, hidden, topk_weights, topk_ids):
     return output.to(torch.bfloat16)
 
 
+def _check_moe(actual: torch.Tensor, expected: torch.Tensor) -> None:
+    assert torch.isfinite(actual).all()
+    relative_rmse, cosine = _relative_metrics(actual, expected)
+    # The intermediate activation is requantized to FP8 E4M3, so small GEMM
+    # differences flip a few elements per row to the neighbouring FP8 value
+    # (measured: relative RMSE <= 1.7e-2, cosine >= 0.99985).
+    assert relative_rmse < 3e-2
+    assert cosine > 0.9995
+
+
 @pytest.mark.parametrize("tokens", [1, 2, 4, 8, 24, 64, 100, 128, 256, 2048, 3000])
 def test_glm53_moe_matches_reference(glm53_layer, tokens):
     layer = glm53_layer
@@ -154,13 +167,7 @@ def test_glm53_moe_matches_reference(glm53_layer, tokens):
     actual = torch.empty_like(hidden)
     workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
     iq2r_glm53_moe_out(hidden, *layer.packed, topk_weights, topk_ids, actual, workspace)
-    assert torch.isfinite(actual).all()
-    relative_rmse, cosine = _relative_metrics(actual, expected)
-    # The intermediate activation is requantized to FP8 E4M3, so small GEMM
-    # differences flip a few elements per row to the neighbouring FP8 value
-    # (measured: relative RMSE <= 1.7e-2, cosine >= 0.99985).
-    assert relative_rmse < 3e-2
-    assert cosine > 0.9995
+    _check_moe(actual, expected)
 
 
 def test_glm53_moe_chunks_long_prefill(glm53_layer):
@@ -195,6 +202,50 @@ def test_glm53_moe_chunks_long_prefill(glm53_layer):
     torch.testing.assert_close(chunked, halves, rtol=0, atol=0)
     relative_rmse, _ = _relative_metrics(chunked, whole)
     assert relative_rmse < 1e-6
+
+
+@pytest.mark.parametrize("tokens", [1, 3, 4, 64, 1024])
+def test_glm53_moe_drops_invalid_routes(glm53_layer, tokens):
+    """Routes with ids outside 0..256 contribute nothing on every path."""
+    layer = glm53_layer
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x53E0 + tokens)
+    topk_ids[:, 0] = -1
+    topk_ids[1::2, 3] = _EXPERTS
+    valid = (topk_ids >= 0) & (topk_ids < _EXPERTS)
+    expected = _reference_moe(
+        layer, hidden, topk_weights * valid, topk_ids.clamp(0, _EXPERTS - 1)
+    )
+
+    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    workspace.route_output.fill_(float("nan"))  # a dropped route must not be read
+    actual = torch.empty_like(hidden)
+    iq2r_glm53_moe_out(hidden, *layer.packed, topk_weights, topk_ids, actual, workspace)
+    _check_moe(actual, expected)
+
+
+def test_glm53_moe_rejects_unfit_configs(glm53_layer):
+    layer = glm53_layer
+    hidden, topk_weights, topk_ids = _routing(9, 0x53B0)
+    output = torch.zeros_like(hidden)
+    workspace = IQ2RGlm53Workspace.allocate(8, layer.intermediate, device="cuda")
+
+    def run(tokens, config):
+        rows = slice(0, tokens)
+        iq2r_glm53_moe_out(
+            hidden[rows], *layer.packed, topk_weights[rows], topk_ids[rows],
+            output[rows], workspace, config,
+        )  # fmt: skip
+
+    with pytest.raises(ValueError, match="M1 needs down route9"):
+        run(1, IQ2RGlm53Config("decode", 2, "single", 4, 1))
+    with pytest.raises(ValueError, match="unknown decode down kernel"):
+        run(8, IQ2RGlm53Config("decode", 2, "prefill", 0, 1))
+    with pytest.raises(ValueError, match="route9 covers"):
+        run(3, IQ2RGlm53Config("decode", 2, "route9", 4, 1))
+    # The 1-token tail of a chunked batch cannot reuse an M8 config.
+    with pytest.raises(ValueError, match="exceed"):
+        run(9, _default_config(8))
+    assert not output.any()
 
 
 def test_glm53_moe_rejects_other_archs(glm53_layer, monkeypatch):
@@ -291,7 +342,8 @@ def _slice_rows(data, metadata, start, length):
 
 
 def test_glm53_tuned_config():
-    """Tuned rows are used as written; other token counts get the defaults."""
+    """Tuned rows are used as written; other token counts round up to a row
+    that can run them."""
     table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
     rows = table[(table.gfx == get_gfx_runtime()) & (table.cu_num == get_cu_num())]
     for row in rows.itertuples():
@@ -303,7 +355,41 @@ def test_glm53_tuned_config():
             row.down_chunks,
         )
     for intermediate in (256, 512):
-        assert iq2r_glm53_config(77, intermediate) == _default_config(77)
+        assert iq2r_glm53_config(77, intermediate) == iq2r_glm53_config(
+            128, intermediate
+        )
+        # route9 cannot run M3, so M3 rounds up past a route9 M4 row.
+        m4 = iq2r_glm53_config(4, intermediate)
+        assert iq2r_glm53_config(3, intermediate) == (
+            iq2r_glm53_config(8, intermediate) if m4.down_kernel == "route9" else m4
+        )
+        for tokens in range(1, MAX_CHUNK_TOKENS + 1):
+            for config in (
+                iq2r_glm53_config(tokens, intermediate),
+                _default_config(tokens),
+            ):
+                assert _config_problem(config, tokens, intermediate) is None
+
+
+def test_glm53_tuned_table_checks(tmp_path):
+    table = pd.read_csv(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
+    shipped = _tuned_table(AITER_CONFIGS.AITER_CONFIG_IQ2R_GLM53_FILE)
+
+    # Rows of another model family in the same file are ignored.
+    path = tmp_path / "families.csv"
+    other = table.assign(expert=129, down_kernel="other")
+    pd.concat([table, other]).to_csv(path, index=False)
+    assert _tuned_table(str(path)) == shipped
+
+    path = tmp_path / "duplicate.csv"
+    pd.concat([table, table.head(1).assign(us=1.0)]).to_csv(path, index=False)
+    with pytest.raises(ValueError, match="more than one"):
+        _tuned_table(str(path))
+
+    path = tmp_path / "unfit.csv"
+    table.assign(down_kernel="single").to_csv(path, index=False)
+    with pytest.raises(ValueError, match="M1 needs down route9"):
+        _tuned_table(str(path))
 
 
 if __name__ == "__main__":
