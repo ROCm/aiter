@@ -57,6 +57,7 @@ from aiter.dist.parallel_state import (
     destroy_model_parallel,
     ensure_model_parallel_initialized,
     get_tp_group,
+    graph_capture,
     init_distributed_environment,
     set_custom_all_reduce,
 )
@@ -217,6 +218,7 @@ def _run_per_group_quant_case(
     emit_bf16,
     transpose_scale,
     gemma_norm=False,
+    with_graph=False,
 ):
     """Run one fused AR+RMSNorm+per-group-quant case on an initialized rank.
 
@@ -235,6 +237,11 @@ def _run_per_group_quant_case(
     keeps the logical ``(M, num_groups)`` shape but column-major storage, so
     the dequant must still reproduce the reference -- proving the kernel wrote
     each group's scale to the correct transposed slot.
+
+    When ``with_graph=True`` the call is captured once under ``graph_capture()``
+    (custom all-reduce in capture mode, registered buffers), every output is
+    zeroed, and the graph is replayed: the checks below then read what the
+    replay wrote, so a flag lost on the capture path fails the comparison.
     """
     from aiter.dist.communication_op import (
         tensor_model_parallel_fused_allreduce_rmsnorm_quant,
@@ -260,8 +267,7 @@ def _run_per_group_quant_case(
             eps=eps,
         )
 
-    @perftest()
-    def run_fused(x):
+    def fused(x):
         res = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
             x,
             x,
@@ -279,7 +285,21 @@ def _run_per_group_quant_case(
         out, res_out, scale_out = res
         return out, scale_out, res_out
 
-    result, us = run_fused(x)
+    if with_graph:
+        graph = torch.cuda.CUDAGraph()
+        with graph_capture() as gc, torch.cuda.graph(graph, stream=gc.stream):
+            result = fused(x)
+        for t in result:
+            t.zero_()
+
+        @perftest()
+        def run_graph():
+            graph.replay()
+
+        _, us = run_graph()
+        torch.cuda.synchronize()
+    else:
+        result, us = perftest()(fused)(x)
     if emit_bf16:
         out_fp8, scale_out, _res_out, bf16_out = result
     else:
@@ -320,7 +340,7 @@ def _run_per_group_quant_case(
     msg = (
         f"test_fused_ar_rmsnorm_per_group_quant: rank={rankID} "
         f"{shape=} {dtype=} {group_size=} "
-        f"{emit_bf16=} {transpose_scale=} {gemma_norm=} {us:>8.2f}"
+        f"{emit_bf16=} {transpose_scale=} {gemma_norm=} {with_graph=} {us:>8.2f}"
     )
     err = checkAllclose(ref, dequant.to(dtype), msg=msg, atol=5e-2, rtol=5e-2)
     return {
@@ -374,6 +394,7 @@ def fused_ar_rmsnorm_per_group_quant_sweep(
             case["emit_bf16"],
             case["transpose_scale"],
             case.get("gemma_norm", False),
+            case.get("withGraph", False),
         )
         for case_idx, case in enumerate(cases)
     ]
@@ -420,6 +441,15 @@ def check_per_group_quant_case(tp_size, dtype, case, rank_results):
         )
 
     max_err = max(r["err"] for r in rank_results)
+    # checkAllclose only logs a mismatch and returns the mismatched fraction;
+    # fail the case at its own threshold (tol_err_ratio=0.05) so a wrong output
+    # -- e.g. a flag lost on the CUDA-graph capture path -- fails the sweep.
+    assert max_err < 0.05, (
+        f"fused output disagrees with the reference on {max_err:.1%} of elements "
+        f"({shape=} emit_bf16={emit_bf16} transpose_scale={transpose_scale} "
+        f"gemma_norm={case.get('gemma_norm', False)} "
+        f"withGraph={case.get('withGraph', False)})"
+    )
 
     # bf16 side-output correctness: should agree with fp8+scale dequant to
     # within at most one FP8 quantization step (~3% relative).
@@ -508,7 +538,9 @@ l_shape = [
 ]
 l_tp = [8]
 l_pp = [1]
-l_graph = [False]
+# Eager calls and a CUDA-graph capture + replay of the same call: the capture
+# path takes the custom all-reduce's registered-buffer branch.
+l_graph = [False, True]
 l_group_size = [128]
 # Cover both the fp8-only output (keep_bf16=False, std-attention layers)
 # and the fp8+bf16 dual-output (keep_bf16=True, GDN-style layers).
