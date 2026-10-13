@@ -1181,8 +1181,10 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
 // this item owns the whole request and writes the real output; otherwise it is one split-KV
 // partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
-    opus_mla_decode_kargs kargs, int w, char* smem_buffer, float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_decode_kargs kargs,
+                                                                      int w,
+                                                                      char* smem_buffer,
+                                                                      float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1211,8 +1213,10 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     int causal_diagonal = 0;
     if constexpr(T::CAUSAL)
     {
-        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s +
-                          __builtin_amdgcn_readfirstlane(kargs.kv_indptr[batch_idx + 1]) -
+        // kv_end + kv_offset is the batch's KV end. kv_indptr[batch_idx + 1] is not: when
+        // mla.py folds the heads into pseudo-batches, batch_idx counts those and indexes the
+        // folded q_indptr, but kv_indptr stays per original batch.
+        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s + kv_ind_ptr_e + work_item.kv_offset -
                           __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
     }
 
@@ -1225,9 +1229,9 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     const float qk_scale = readfirstlane_f32(temperature_scale * descale_q * descale_k);
 
     const int q_gmem_offset = q_len_ptr_s * kargs.stride_q_b;
-    auto g_q = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
+    auto g_q                = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
                          q_len * kargs.stride_q_b * sizeof(D_Q));
-    auto v_q = load<T::VEC_Q>(g_q, make_layout_q<T>(warp_id, lane_id));
+    auto v_q                = load<T::VEC_Q>(g_q, make_layout_q<T>(warp_id, lane_id));
 
     using o_tile_t = vector_t<D_ACC, T::O_TILE_REGS>;
     o_tile_t v_o_tiles[T::GEMM1_E_M];
@@ -1271,13 +1275,13 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     const bool is_final     = slot < 0;
     const int o_gmem_offset = q_len_ptr_s * kargs.stride_o_b;
     // partial_slot is negative on the final path; keep the unused o_accum address in bounds.
-    const int oa_offset     = is_final ? 0 : slot * kargs.stride_o_b;
-    auto g_o                = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
+    const int oa_offset = is_final ? 0 : slot * kargs.stride_o_b;
+    auto g_o            = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
                          q_len * kargs.stride_o_b * sizeof(D_OUT));
-    auto g_oa               = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
+    auto g_oa           = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
                           q_len * kargs.stride_o_b * sizeof(D_ACC));
-    auto u_o                = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
-    auto u_oa               = make_layout_o<T>(warp_id, lane_id, T::D_NOPE_SIZE);
+    auto u_o            = make_layout_o<T>(warp_id, lane_id, kargs.stride_o_h);
+    auto u_oa           = make_layout_o<T>(warp_id, lane_id, T::D_NOPE_SIZE);
     static_for<T::GEMM1_E_M>([&](auto dt) {
         const o_tile_t v = v_o_tiles[dt.value] * o_scale;
         if(is_final)

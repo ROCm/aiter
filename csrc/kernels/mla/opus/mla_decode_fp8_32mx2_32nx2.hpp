@@ -437,15 +437,15 @@ __device__ inline void attn_mask_vec2_imm(opus::u32_t rel_vgpr,
 // Masks every score column past the lane's `last_valid_kv_pos` to -inf. Element e of lane l
 // is token 32 half + 8 (e / 4) + 4 (l / 32) + e % 4 of the tile, the MFMA's own C layout.
 template <typename T, typename V>
-__device__ inline void attn_mask_kv_tile(
-    V& v_s, int last_valid_kv_pos, int kv_tile_idx, int half, opus::u32_t neg_inf_v)
+__device__ inline void
+attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_tile_idx, int half, opus::u32_t neg_inf_v)
 {
     using D_ACC_X2 = opus::vector_t<typename T::D_ACC, 2>;
     using U32_X2   = opus::vector_t<opus::u32_t, 2>;
 
     int lane_id = opus::thread_id_x() % T::WARP_SIZE;
     asm volatile("" : "+v"(lane_id));
-    const int k_pos = kv_tile_idx * T::KV_TILE_SIZE + half * T::W_M + (lane_id / T::W_N) * 4;
+    const int k_pos       = kv_tile_idx * T::KV_TILE_SIZE + half * T::W_M + (lane_id / T::W_N) * 4;
     const opus::u32_t rel = static_cast<opus::u32_t>(last_valid_kv_pos - k_pos);
 
     opus::static_for<T::O_TILE_REGS / 4>([&](auto a) {
@@ -461,8 +461,10 @@ __device__ inline void attn_mask_kv_tile(
             attn_mask_vec2_imm<thr_x, thr_y>(rel, neg_inf_v, x_ref, y_ref);
             pair_bits[0] = x_ref;
             pair_bits[1] = y_ref;
-            opus::set_slice(
-                v_s, __builtin_bit_cast(D_ACC_X2, pair_bits), opus::number<idx>{}, opus::number<idx + 2>{});
+            opus::set_slice(v_s,
+                            __builtin_bit_cast(D_ACC_X2, pair_bits),
+                            opus::number<idx>{},
+                            opus::number<idx + 2>{});
         });
     });
 }
@@ -546,8 +548,7 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
 
     const D_K* kv_base = reinterpret_cast<const D_K*>(kargs.kv_ptr);
     auto g_kv_indices  = make_gmem(kargs.kv_indices + kv_ind_ptr_s, valid_kv_len * sizeof(int));
-    auto g_q           = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) +
-                             q_len_ptr_s * kargs.stride_q_b,
+    auto g_q = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_len_ptr_s * kargs.stride_q_b,
                          static_cast<unsigned>(q_len * kargs.stride_q_b * sizeof(D_Q)));
 
     const auto lds              = make_smem(smem_buffer);
@@ -611,7 +612,9 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     op_t v_q[T::GEMM0_E_K];
 
     auto pin_q = [&]() { static_for<T::GEMM0_E_K>([&](auto i) { anchor_agpr(v_q[i.value]); }); };
-    auto pin_o = [&]() { static_for<T::GEMM1_E_M>([&](auto i) { anchor_vgpr(v_o_tiles[i.value]); }); };
+    auto pin_o = [&]() {
+        static_for<T::GEMM1_E_M>([&](auto i) { anchor_vgpr(v_o_tiles[i.value]); });
+    };
 
     // Inside a slot: k-step ks is chunk ks / 2 and 64 d on for odd ks, the operand's second
     // pass 32 d on. PV d-tile dt (of the wave's half) is chunk dt / 4 plus 2 slots per tile;
@@ -639,7 +642,8 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     };
     auto load_k_all = [&](smem<D_K> kv) {
         static_for<T::K_DEPTH>([&](auto ks) {
-            load_op(v_kv[ks.value], kv, u_rk, ks, number<KV_AGPR_BASE<T> + ks.value * T::OP_REGS>{});
+            load_op(
+                v_kv[ks.value], kv, u_rk, ks, number<KV_AGPR_BASE<T> + ks.value * T::OP_REGS>{});
         });
     };
 
@@ -936,64 +940,64 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     stage_end();
 
     // kv_prev: slot t-1 (its V read this phase, then DMA(t+2) into it), kv_cur: slot t.
-    auto run_phase = [&](auto& vs_cur, auto& vs_prev, smem<D_K> kv_prev, smem<D_K> kv_cur, int t,
-                         auto sbuf) {
-        // stage0 [mem]: wait out DMA(t) and the index DMA of t+2, leaving DMA(t+1) and the
-        // index DMA of t+3 in flight. B0 publishes K(t) and the pair's row maxima of S(t-1).
-        s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + T::kv_index_load_insts>{});
-        lds_barrier();
-        pin_q();
-        read_peer_max();
-        const auto pages = load_kv_pages(t + 2);
-        load_k_all(kv_cur);
-        stage_end();
+    auto run_phase =
+        [&](auto& vs_cur, auto& vs_prev, smem<D_K> kv_prev, smem<D_K> kv_cur, int t, auto sbuf) {
+            // stage0 [mem]: wait out DMA(t) and the index DMA of t+2, leaving DMA(t+1) and the
+            // index DMA of t+3 in flight. B0 publishes K(t) and the pair's row maxima of S(t-1).
+            s_waitcnt_vmcnt(number<T::kv_buffer_load_insts + T::kv_index_load_insts>{});
+            lds_barrier();
+            pin_q();
+            read_peer_max();
+            const auto pages = load_kv_pages(t + 2);
+            load_k_all(kv_cur);
+            stage_end();
 
-        // stage1 [compute]: gemm0 QK(t) [9 MFMA] || softmax tail(t-1) -> P half to LDS
-        // || V(t-1) d-tile ks into the ring entry step ks has just finished with.
-        __builtin_amdgcn_s_setprio(1);
-        clear_s(vs_cur, sbuf);
-        compute_qk(vs_cur, sbuf, [&](auto ks) {
-            if constexpr(ks.value < TAIL_CHUNKS)
-                tail_chunk(vs_prev, ks);
-            if constexpr(ks.value < T::V_DEPTH)
-                load_v(kv_prev, ks);
-        });
-        __builtin_amdgcn_s_setprio(0);
-        stage_end();
+            // stage1 [compute]: gemm0 QK(t) [9 MFMA] || softmax tail(t-1) -> P half to LDS
+            // || V(t-1) d-tile ks into the ring entry step ks has just finished with.
+            __builtin_amdgcn_s_setprio(1);
+            clear_s(vs_cur, sbuf);
+            compute_qk(vs_cur, sbuf, [&](auto ks) {
+                if constexpr(ks.value < TAIL_CHUNKS)
+                    tail_chunk(vs_prev, ks);
+                if constexpr(ks.value < T::V_DEPTH)
+                    load_v(kv_prev, ks);
+            });
+            __builtin_amdgcn_s_setprio(0);
+            stage_end();
 
-        // stage2 [mem]: mask S(t); bring O to the new max; B1 publishes P(t-1), and every wave
-        // has V(t-1) home, so slot t-1 is free for DMA(t+2).
-        mask_oob_scores(vs_cur, t);
-        rescale_o();
-        const auto po = dma_offsets(pages);
-        s_waitcnt_lgkmcnt(0_I);
-        lds_barrier();
-        read_p();
-        stage_end();
+            // stage2 [mem]: mask S(t); bring O to the new max; B1 publishes P(t-1), and every wave
+            // has V(t-1) home, so slot t-1 is free for DMA(t+2).
+            mask_oob_scores(vs_cur, t);
+            rescale_o();
+            const auto po = dma_offsets(pages);
+            s_waitcnt_lgkmcnt(0_I);
+            lds_barrier();
+            read_p();
+            stage_end();
 
-        // stage3 [compute]: gemm1 PV(t-1) [8 MFMA] || DMA(t+2) into slot t-1, then the index
-        // DMA of t+4 || the row max of S(t).
-        __builtin_amdgcn_s_setprio(1);
-        pin_o();
-        compute_pv([&](auto dt) {
-            constexpr int d     = dt.value;
-            constexpr int n     = T::kv_buffer_load_insts;
-            constexpr int first = d * n / T::GEMM1_E_M;
-            constexpr int last  = (d + 1) * n / T::GEMM1_E_M;
-            static_for<last - first>(
-                [&](auto j) { async_load_kv_chunk(kv_prev, po, number<first + j.value>{}); });
-            if constexpr(d == T::GEMM1_E_M - 1)
-                async_load_kv_indices(t + T::IDX_RING);
-            head_chunk(vs_cur, dt);
-        });
-        // The max store must land before B0 publishes it; the P read before B0 lets the
-        // partner overwrite P.
-        s_waitcnt_lgkmcnt(0_I);
-        pin_o();
-        anchor_vgpr(vs_cur);
-        __builtin_amdgcn_s_setprio(0);
-        stage_end();
-    };
+            // stage3 [compute]: gemm1 PV(t-1) [8 MFMA] || DMA(t+2) into slot t-1, then the index
+            // DMA of t+4 || the row max of S(t).
+            __builtin_amdgcn_s_setprio(1);
+            pin_o();
+            compute_pv([&](auto dt) {
+                constexpr int d     = dt.value;
+                constexpr int n     = T::kv_buffer_load_insts;
+                constexpr int first = d * n / T::GEMM1_E_M;
+                constexpr int last  = (d + 1) * n / T::GEMM1_E_M;
+                static_for<last - first>(
+                    [&](auto j) { async_load_kv_chunk(kv_prev, po, number<first + j.value>{}); });
+                if constexpr(d == T::GEMM1_E_M - 1)
+                    async_load_kv_indices(t + T::IDX_RING);
+                head_chunk(vs_cur, dt);
+            });
+            // The max store must land before B0 publishes it; the P read before B0 lets the
+            // partner overwrite P.
+            s_waitcnt_lgkmcnt(0_I);
+            pin_o();
+            anchor_vgpr(vs_cur);
+            __builtin_amdgcn_s_setprio(0);
+            stage_end();
+        };
 
     // --- Main loop: tiles tile_begin+1 .. tile_end-1, two phases unrolled per iteration so the
     //     two score buffers alternate as compile-time indices. The slot handles rotate
@@ -1051,8 +1055,10 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
 // A negative `slot` means this item owns the whole request and writes the real output;
 // otherwise it is one split-KV partial and writes o_accum / lse_accum for the reduce kernel.
 template <class Traits>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
-    opus_mla_decode_kargs kargs, int w, char* smem_buffer, float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_decode_kargs kargs,
+                                                                      int w,
+                                                                      char* smem_buffer,
+                                                                      float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1082,8 +1088,10 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     int causal_diagonal = 0;
     if constexpr(T::CAUSAL)
     {
-        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s +
-                          __builtin_amdgcn_readfirstlane(kargs.kv_indptr[batch_idx + 1]) -
+        // kv_end + kv_offset is the batch's KV end. kv_indptr[batch_idx + 1] is not: when
+        // mla.py folds the heads into pseudo-batches, batch_idx counts those and indexes the
+        // folded q_indptr, but kv_indptr stays per original batch.
+        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s + kv_ind_ptr_e + work_item.kv_offset -
                           __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
     }
 
@@ -1132,16 +1140,16 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     constexpr float INV_LOG2_E = 0.69314718055994531f; // ln(2)
     const D_ACC lse            = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E)
                                                        : opus::numeric_limits<D_ACC>::lowest();
-    const bool is_final     = slot < 0;
-    const int o_gmem_offset = q_len_ptr_s * kargs.stride_o_b;
+    const bool is_final        = slot < 0;
+    const int o_gmem_offset    = q_len_ptr_s * kargs.stride_o_b;
     // partial_slot is negative on the final path; keep the unused o_accum address in bounds.
-    const int oa_offset     = is_final ? 0 : slot * kargs.stride_o_b;
-    auto g_o                = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
+    const int oa_offset = is_final ? 0 : slot * kargs.stride_o_b;
+    auto g_o            = make_gmem(reinterpret_cast<D_OUT*>(kargs.out_ptr) + o_gmem_offset,
                          q_len * kargs.stride_o_b * sizeof(D_OUT));
-    auto g_oa               = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
+    auto g_oa           = make_gmem(reinterpret_cast<D_ACC*>(kargs.o_accum) + oa_offset,
                           q_len * kargs.stride_o_b * sizeof(D_ACC));
-    auto u_o                = make_layout_o<T>(pair, lane_id, kargs.stride_o_h) + half * T::WAVE_D;
-    auto u_oa               = make_layout_o<T>(pair, lane_id, T::D_NOPE_SIZE) + half * T::WAVE_D;
+    auto u_o            = make_layout_o<T>(pair, lane_id, kargs.stride_o_h) + half * T::WAVE_D;
+    auto u_oa           = make_layout_o<T>(pair, lane_id, T::D_NOPE_SIZE) + half * T::WAVE_D;
     static_for<T::GEMM1_E_M>([&](auto dt) {
         const o_tile_t v = v_o_tiles[dt.value] * o_scale;
         if(is_final)

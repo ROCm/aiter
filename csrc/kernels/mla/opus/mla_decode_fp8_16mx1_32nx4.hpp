@@ -734,20 +734,19 @@ attn_mask_kv_tile(V& v_s, int last_valid_kv_pos, int kv_base_pos, opus::u32_t ne
 // and passed by reference, so a split-KV request can run several tile ranges into the same
 // accumulator.
 template <class Traits, class VO>
-__device__ __attribute__((always_inline)) void
-mla_decode_fwd_simple(opus_mla_decode_kargs kargs,
-                      int kv_ind_ptr_s,
-                      int valid_kv_len,
-                      int tile_begin,
-                      int tile_end,
-                      char* smem_buffer,
-                      int q_len_ptr_s,
-                      int q_len,
-                      VO& v_o,
-                      typename Traits::D_ACC& m_row,
-                      typename Traits::D_ACC& l_row,
-                      float temperature_scale,
-                      int causal_diagonal)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_simple(opus_mla_decode_kargs kargs,
+                                                                     int kv_ind_ptr_s,
+                                                                     int valid_kv_len,
+                                                                     int tile_begin,
+                                                                     int tile_end,
+                                                                     char* smem_buffer,
+                                                                     int q_len_ptr_s,
+                                                                     int q_len,
+                                                                     VO& v_o,
+                                                                     typename Traits::D_ACC& m_row,
+                                                                     typename Traits::D_ACC& l_row,
+                                                                     float temperature_scale,
+                                                                     int causal_diagonal)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -769,7 +768,7 @@ mla_decode_fwd_simple(opus_mla_decode_kargs kargs,
     }
 
     const int q_gmem_offset = q_len_ptr_s * kargs.stride_q_b;
-    auto g_q_nope = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
+    auto g_q_nope           = make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset,
                               q_len * kargs.stride_q_b * sizeof(D_Q));
     auto g_q_rope =
         make_gmem(reinterpret_cast<const D_Q*>(kargs.q_ptr) + q_gmem_offset + T::D_NOPE_SIZE,
@@ -1203,8 +1202,10 @@ mla_decode_fwd_simple(opus_mla_decode_kargs kargs,
 // this item owns the whole request and writes the real output; otherwise it is one split-KV
 // partial and writes o_accum / lse_accum for the reduce kernel to merge.
 template <class Traits>
-__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
-    opus_mla_decode_kargs kargs, int w, char* smem_buffer, float temperature_scale)
+__device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_decode_kargs kargs,
+                                                                      int w,
+                                                                      char* smem_buffer,
+                                                                      float temperature_scale)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -1234,8 +1235,10 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(
     int causal_diagonal = 0;
     if constexpr(T::CAUSAL)
     {
-        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s +
-                          __builtin_amdgcn_readfirstlane(kargs.kv_indptr[batch_idx + 1]) -
+        // kv_end + kv_offset is the batch's KV end. kv_indptr[batch_idx + 1] is not: when
+        // mla.py folds the heads into pseudo-batches, batch_idx counts those and indexes the
+        // folded q_indptr, but kv_indptr stays per original batch.
+        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s + kv_ind_ptr_e + work_item.kv_offset -
                           __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
     }
 
@@ -1330,9 +1333,9 @@ __launch_bounds__(Traits::BLOCK_SIZE,
     const int work_id = block_id_x();
 
     // Two KV slots (128 tokens at d = 576, 74 KB each with the line padding) plus P and the
-    // softmax scratch: 155 KB, one block per CU. The alignment is load-bearing: make_layout_rv folds the bank swizzle's XOR
-    // into a +/- SWZ_D_BYTES stride, which is only equivalent while bit 4 of the block's base
-    // address is zero.
+    // softmax scratch: 155 KB, one block per CU. The alignment is load-bearing: make_layout_rv
+    // folds the bank swizzle's XOR into a +/- SWZ_D_BYTES stride, which is only equivalent while
+    // bit 4 of the block's base address is zero.
     __shared__ __align__(128) char smem_buffer[T::smem_bytes()];
 
     const int work_idx_start = kargs.work_indptr[work_id];
