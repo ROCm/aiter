@@ -1554,7 +1554,17 @@ class OManager16bV2:
             )
         else:
             # GQA: packed row pr -> seq pr//gqa, head kv_head*gqa + pr%gqa -> 3-D descriptor.
-            num_seq = _WMMA_M // gqa
+            # A tile is _WMMA_M packed rows: whole seqs when gqa <= _WMMA_M, otherwise a
+            # _WMMA_M-head SLICE of one seq, which carries a within-group head offset.
+            assert gqa % _WMMA_M == 0 or _WMMA_M % gqa == 0, (
+                f"gqa {gqa} must divide or be a multiple of {_WMMA_M}; a tile would "
+                f"otherwise straddle two sequences"
+            )
+            num_seq = max(1, _WMMA_M // gqa)
+            heads_per_tile = min(gqa, _WMMA_M)
+            if gqa > _WMMA_M:
+                # Tiles walk the head group, so pick up where this one starts inside it.
+                head0 = head0 + base_row % fx.Int32(gqa)
             off = (
                 fx.Int64(o_base_elems)
                 + fx.Int64(q_start + seq0) * fx.Int64(stride_o_seq)
@@ -1565,8 +1575,8 @@ class OManager16bV2:
                 fx.make_view(
                     gbase,
                     fx.make_layout(
-                        (num_seq, gqa, self.row_elems),
-                        (gqa * self.row_elems, self.row_elems, 1),
+                        (num_seq, heads_per_tile, self.row_elems),
+                        (heads_per_tile * self.row_elems, self.row_elems, 1),
                     ),
                 )
             )
@@ -1580,8 +1590,8 @@ class OManager16bV2:
                 fx.make_view(
                     lds_iter,
                     fx.make_layout(
-                        (num_seq, gqa, self.row_elems),
-                        (gqa * self.row_elems, self.row_elems, 1),
+                        (num_seq, heads_per_tile, self.row_elems),
+                        (heads_per_tile * self.row_elems, self.row_elems, 1),
                     ),
                 )
             )
