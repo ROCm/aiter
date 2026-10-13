@@ -885,6 +885,7 @@ def _compile_mxfp8_wmma_to_cache(
     cluster_m: int,
     cluster_n: int,
     a_preshuffle: bool = False,
+    a_scale_preshuffled: bool = False,
     persistent_n_tiles: int = 1,
     fused_splitk: bool = True,
     scale_block: int = SCALE_BLOCK_SIZE,
@@ -904,8 +905,8 @@ def _compile_mxfp8_wmma_to_cache(
 
     dev = torch.device("cpu")
     k_blocks = (k + scale_block - 1) // scale_block
-    if scale_block == MX32_BLOCK_K:  # m32k4 / n32k4
-        a_rows, b_rows = (m + 31) // 32 * 32, n
+    if scale_block == MX32_BLOCK_K:  # row-major or shuffled A; shuffled B
+        a_rows, b_rows = (((m + 31) // 32) * 32 if a_scale_preshuffled else m), n
     else:
         a_rows, b_rows = m, (n + 127) // 128
     xq = torch.empty((m, k), device=dev, dtype=torch.uint8)
@@ -966,6 +967,7 @@ def _compile_mxfp8_wmma_to_cache(
                         persistent_n_tiles,
                         fused,
                         bounded_m,
+                        a_scale_preshuffled,
                     )
             else:
                 launch(
@@ -976,6 +978,7 @@ def _compile_mxfp8_wmma_to_cache(
                     0,
                     1,
                     a_preshuffle,
+                    a_scale_preshuffled,
                 )
         if split_k > 1:
             compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(

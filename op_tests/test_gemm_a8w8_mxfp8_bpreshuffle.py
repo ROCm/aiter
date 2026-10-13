@@ -6,9 +6,8 @@ Runs every tuned (M, N, K) of this arch by default (an untuned gfx950 falls
 back to a default shape list), or the shapes given by -mnk, through
 gemm_a8w8_mxfp8_bpreshuffle and checks it against an fp32 reference.
 
-The 1x32 scales go in the layout each arch reads:
-  * gfx950:  x_scale [M, K/32] and w_scale [N, K/32], row-major, unshuffled.
-  * gfx1250: x_scale m32k4 / w_scale n32k4.
+Both gfx950 and gfx1250 read row-major x_scale [M, K/32]. gfx950 reads
+row-major w_scale [N, K/32]; gfx1250 reads 32x4 shuffled w_scale.
 """
 
 import argparse
@@ -23,7 +22,7 @@ from aiter.jit.utils.chip_info import get_cu_num
 from aiter.jit.utils.chip_info import get_gfx_runtime as get_gfx
 from aiter.ops.gemm_op_a8w8 import _get_mxfp8_bpreshuffle_config
 from aiter.ops.quant import per_group_quant_hip
-from aiter.ops.shuffle import shuffle_blockscale_to_mxfp8_scale, shuffle_weight
+from aiter.ops.shuffle import shuffle_mxfp8fp4_scale, shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, perftest
 
 # Shapes for a gfx950 without tuned rows: DeepSeek-V3 dense projections, ragged M included.
@@ -55,38 +54,17 @@ def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
 def test_gemm(m, n, k, dtype=dtypes.bf16):
     x = torch.randn(m, k, dtype=dtypes.bf16)
     weight = (torch.randn(n, k) * 0.02).to(dtypes.fp8)
-    if get_gfx() == "gfx950":
-        # 1x32 weight scales around 2^-3; both scales go in row-major as is
-        w_scale = torch.randint(122, 127, (n, k // 32), dtype=torch.uint8)
-        w_scale = w_scale.view(dtypes.fp8_e8m0)
-        xq, x_scale = per_group_quant_hip(
-            x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
-        )
-        ref = run_torch(xq, x_scale, weight, w_scale, (1, 32))
-        gemm_w_scale = w_scale
-    else:
-        # 128x128 block scales around 2^-3, as a checkpoint carries them
-        w_scale = torch.randint(122, 127, (n // 128, k // 128), dtype=torch.uint8)
-        w_scale = w_scale.view(dtypes.fp8_e8m0)
-        # the fused quant writes the m32k4 scale directly; the row-major twin feeds
-        # the reference
-        xq, x_scale = per_group_quant_hip(
-            x,
-            quant_dtype=dtypes.fp8,
-            group_size=32,
-            scale_type=dtypes.fp8_e8m0,
-            scale_layout_m32k4=True,
-        )
-        _, x_scale_row = per_group_quant_hip(
-            x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
-        )
-        ref = run_torch(xq, x_scale_row, weight, w_scale)
-        gemm_w_scale = shuffle_blockscale_to_mxfp8_scale(w_scale, n)
+    w_scale = torch.randint(122, 127, (n, k // 32), dtype=torch.uint8)
+    w_scale = w_scale.view(dtypes.fp8_e8m0)
+    xq, x_scale = per_group_quant_hip(
+        x, quant_dtype=dtypes.fp8, group_size=32, scale_type=dtypes.fp8_e8m0
+    )
+    ref = run_torch(xq, x_scale, weight, w_scale, (1, 32))
     out, us = run_gemm(
         xq,
         shuffle_weight(weight, layout=(16, 16)),
         x_scale,
-        gemm_w_scale,
+        shuffle_mxfp8fp4_scale(w_scale) if get_gfx() == "gfx1250" else w_scale,
         dtype,
     )
     err = checkAllclose(ref, out.float(), msg=f"M={m} N={n} K={k}: ")

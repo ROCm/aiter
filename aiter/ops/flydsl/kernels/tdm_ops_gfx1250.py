@@ -27,11 +27,13 @@ compute_warp_distribution = _tdm_ops.compute_warp_distribution
 
 __all__ = [
     "TDMDescriptor2D",
+    "clamp_tensor_descriptor_2d_inner_extent",
     "make_tensor_descriptor_2d",
     "tensor_load_2d",
     "tensor_wait",
     "update_tensor_descriptor_2d_addr64",
     "update_tensor_descriptor_2d_lds_addr",
+    "update_tensor_descriptor_2d_pred",
 ]
 
 
@@ -90,6 +92,19 @@ def _clamp_inner_extent(desc: TDMDescriptor2D, bound) -> TDMDescriptor2D:
     )
 
 
+def clamp_tensor_descriptor_2d_inner_extent(
+    desc: TDMDescriptor2D, bound, predicate=None
+) -> TDMDescriptor2D:
+    """Limit a 2-D load after advancing its global address along dim0."""
+    if predicate is not None:
+        g1 = Vec(desc.dgroup1)
+        old = (fx.Uint32(g1[_DIM0_LO_SGPR]) >> 16) | (
+            (fx.Uint32(g1[_DIM0_HI_SGPR]) & 0xFFFF) << 16
+        )
+        bound = predicate.select(fx.Int32(bound), fx.Int32(old))
+    return _clamp_inner_extent(desc, bound)
+
+
 def make_tensor_descriptor_2d(*args, oob_inner_bound=None, **kwargs) -> TDMDescriptor2D:
     """``tdm_ops.make_tensor_descriptor_2d`` accepting a Fly ``lds_memref``."""
     with _fly_aware_lds_extraction():
@@ -115,6 +130,18 @@ def update_tensor_descriptor_2d_lds_addr(
     return TDMDescriptor2D(
         dgroup0=Vec.from_elements(
             [g0[0], fx.Int32(new_lds_addr), g0[2], g0[3]], fx.Int32
+        ).ir_value(),
+        dgroup1=desc.dgroup1,
+    )
+
+
+@dsl_loc_tracing
+def update_tensor_descriptor_2d_pred(desc: TDMDescriptor2D, pred) -> TDMDescriptor2D:
+    """Enable one wave's TDM load only when its panel needs refilling."""
+    g0 = Vec(desc.dgroup0)
+    return TDMDescriptor2D(
+        dgroup0=Vec.from_elements(
+            [fx.Int32(pred), g0[1], g0[2], g0[3]], fx.Int32
         ).ir_value(),
         dgroup1=desc.dgroup1,
     )
