@@ -65,9 +65,9 @@ NEG_INF = float("-inf")
 # ---------------------------------------------------------------------------
 # One arch, one cache dtype, so what used to be an (arch, dtype) lookup is
 # eight constants. They describe the k-axis map: access block j spans BLOCK_K
-# of the head dim and lane group g takes LANE_BLOCK of it, so the four g-lanes
-# tile one 64 B line. The tests' `shuffle_cache` inverts exactly this map --
-# the two must agree, and a disagreement is silent wrong numbers, not a crash.
+# of the head dim and lane group g takes LANE_BLOCK of it, so the four
+# g-lanes tile one 64 B line. The prefill scorer reads the same cache and
+# must agree.
 MFMA_K = 32  # k per MFMA: 16x16x32 bf16, the widest gfx950 has
 LANE_K = 8  # k values one lane holds for one k-step
 KSTEPS = 4  # MFMA k-steps per 128-wide dot
@@ -269,7 +269,7 @@ _MAX_CHUNKS = 0x10000
 
 
 # Oversubscription the page loop may spend: below this the machine is short of
-# waves and a longer per-wave loop only makes it shorter. 4x mirrors
+# waves and a longer per-wave loop only makes it shorter. Mirrors
 # _auto_num_splits in mqa_logits/fp8_mqa_logits.py.
 _CTA_OVERSUBSCRIBE = 4
 
@@ -312,7 +312,8 @@ def geometry(batch, max_block, S=0, H=0, cp_world=1, cp_rank=0, device=None):
                     axis it duplicates no reads, costing one LDS round trip and
                     one barrier per page.
     spread          what costs is pages piling onto one CU, not the CTA count:
-                    a 257th CTA holding one page is free, holding four is 1.4 us.
+                    an extra CTA holding one page is nearly free, holding four
+                    is not.
     """
     if not isinstance(batch, int) or not 0 <= batch <= 0xFFFF:
         raise ValueError("batch must be in [0, 65535] for packed request IDs")
@@ -586,14 +587,12 @@ def build_index_score(S: int, H: int, geom):
         zero4 = fx.Vector.filled(4, 0.0, fx.Float32)
         neg_inf = fx.Float32(NEG_INF)
         # -- page ids and their buffer descriptors, one batch up front --------
-        # Issued with no dependant between them so they pipeline instead of
-        # costing a serial round trip per page, and strided by PAGE_SLOTS so a
-        # wavefront's loads stay inside one span of block_table. `limit` is
-        # where this CTA's pages end: the request's end, or a spread row's own
-        # span. Out-of-range entries are clamped rather than predicated -- the
-        # value only forms an address and the store it feeds is masked off --
-        # and the clamp is cmp+select, never maximumf/minimumf, which would
-        # compare these indices as bit patterns.
+        # Issued with no dependant between them so they pipeline instead of costing
+        # a serial round trip per page. `limit` is where this CTA's pages end: the
+        # request's end, or a spread row's own span. Out-of-range entries are
+        # clamped rather than predicated -- the value only forms an address and the
+        # store it feeds is masked off -- and the clamp is cmp+select, never
+        # maximumf, which would compare these indices as bit patterns.
         if const_expr(SPREAD):
             first = c
             end = c + span
@@ -702,11 +701,10 @@ def build_index_score(S: int, H: int, geom):
                         ok.select(fx.Float32(v[r]), neg_inf)
                     )
 
-        # A wave whose first page is out of range skips everything, or a short
-        # request streams chunks of K it can never use. At WAVES_PER_TOK > 1
-        # there is no guard -- it is wave-divergent and every wave must reach
-        # the epilogue's barrier -- so those waves run on a clamped page and
-        # drop the result at the store.
+        # A wave whose first page is out of range skips everything. At
+        # WAVES_PER_TOK > 1 there is no guard -- it would be wave-divergent and every
+        # wave must reach the epilogue's barrier -- so those waves run on a clamped
+        # page and drop the result at the store.
         _live = True if const_expr(WAVES_PER_TOK > 1) else (pages[0] < limit)
         if _live:
             carry = None
@@ -886,9 +884,9 @@ def _plan_spread_map(
 ):
     """Spread a ragged batch over CU rounds, so no CU draws a deep run.
 
-    What costs is pages piling onto one CU, not the CTA count: a 257th CTA
-    holding one page is free, holding four is 1.4 us. So the batch is cut into
-    runs of at most four pages, as few rows as will still spread the deep
+    What costs is pages piling onto one CU, not the CTA count: an extra CTA
+    holding one page is nearly free, holding four is not. So the batch is cut
+    into runs of at most four pages, as few rows as will still spread the deep
     requests, and the rest apportioned by integer prefixes -- which is what
     keeps rounding from overfilling the row budget.
 
@@ -1253,10 +1251,9 @@ def _validate_metadata(
     # A map built by the legacy two-argument `build_work_map` has no query
     # dimensions and so uses unsplit geometry. Honour such a map rather than
     # rejecting it, by scoring with the geometry it was actually built for.
-    # Ask `geometry` for that map's shape instead of open-coding one field of
+    # Ask `geometry` for that map's shape rather than open-coding one field of
     # it: S/H can change `spread` as well as `waves_per_tok`, and a rescue that
-    # only knew the wave split rejected every spread case -- `work_map_size(4,
-    # 1024)` is 1024 rows where S=4,H=1 wants 1028, one spare row per request.
+    # knows only the wave split rejects every spread case.
     if isinstance(work_map, torch.Tensor) and work_map.ndim == 2:
         legacy = geometry(batch, max_block, device=device, **cp)
         rows_legacy = batch * _grid_chunks(max_block, legacy)
@@ -1273,14 +1270,12 @@ def _validate_metadata(
         ):
             raise ValueError("block_table: invalid shape or layout")
         # Under CP the table is indexed by the GLOBAL block
-        # `p * cp_world + cp_rank`, so a rank with a non-empty shard needs
-        # columns well past `max_block`, its LOCAL count. That width is a
-        # function of seq_lens and this path is deliberately metadata-only, so
-        # it stays a caller contract. The worst case is NOT usable as a check:
-        # a caller whose shard is empty has no local page to state and passes
-        # the global count, and the kernel clamps its speculative block-table
-        # load to column 0 -- legal at any width, and pinned by
-        # `test_empty_cp_shard_narrow_table`.
+        # `p * cp_world + cp_rank`, so a rank with a non-empty shard needs columns
+        # well past `max_block`, its LOCAL count. That width is a function of
+        # seq_lens, which this metadata-only path never reads, so it stays a caller
+        # contract -- and the worst case is not usable as a check, since a rank with
+        # an empty shard legitimately passes the global count
+        # (`test_empty_cp_shard_narrow_table`).
     if seq_lens is not None:
         _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, device)
         if seq_lens.shape != (batch,) or seq_lens.stride() != (1,):

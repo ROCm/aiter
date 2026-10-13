@@ -525,13 +525,6 @@ def test_kernel_name_separates_every_code_changing_field():
     assert r0 != r2 and r2 not in seen
 
 
-# `shuffled` reorders the K bytes; it does not change how much work there is.
-# So it shares every geometry decision with the native layout and differs only
-# in the cache policy, which the layout inverts: natively each 128 B line is
-# requested twice and L1 turns the second into a hit, shuffled each line is
-# requested once and the fill buys nothing.
-
-
 # MiniMax-M3 decode launches, no CP, 1M-token capacity (8192 blocks):
 # TP4 MTP is S=4, H=1; the other served launch is S=8, H=4.
 @pytest.mark.parametrize(
@@ -578,17 +571,17 @@ def test_served_decode_dispatch(S, H, batch, ppw):
     )
 
 
-# The depth tables are keyed on batch, but depth only pays when there are
-# enough pages to fill the machine at that depth. A full batch of *short*
-# requests has a large batch and very little work, and the tabled depth then
-# strands CUs: bs32 at an 8K context is 2048 pages, 128 CTAs on 256 CUs.
+# Two things bound the depth, and both have to be in the answer: the tabled
+# ladder, and the occupancy cap -- depth only pays when there are enough pages
+# to fill the machine at that depth, and a full batch of *short* requests has a
+# large batch and very little work.
 @pytest.mark.parametrize(
     "S,H,batch,max_block,ppw,spread",
     [
-        # 8K context (64 blocks): the table wants 2 or more, occupancy caps it.
-        (4, 1, 8, 64, 1, 1),  # 512 pages
-        (4, 1, 16, 64, 1, 1),  # 1024 pages
-        (4, 1, 32, 64, 2, 0),  # 2048 pages: cap 2, table 4
+        # 8K context (64 blocks): the default is 2, occupancy caps it below that.
+        (4, 1, 8, 64, 1, 1),  # 512 pages: cap 1
+        (4, 1, 16, 64, 1, 1),  # 1024 pages: cap 1
+        (4, 1, 32, 64, 2, 0),  # 2048 pages: cap 2 == default
         (4, 1, 64, 64, 2, 0),  # 4096 pages: cap 4, default 2 binds
         (4, 1, 128, 64, 2, 0),  # 8192 pages: cap 8, default 2 binds
         (8, 4, 16, 64, 1, 1),  # table 3, cap 1
@@ -914,30 +907,6 @@ def test_cli_invalid_args(argv):
     assert exc.value.code == 2
 
 
-def force_arch(monkeypatch, arch):
-    """Report `arch` to the kernel while still running on this device.
-
-    CDNA4 kept both the 16x16x16 MFMA and `v_cvt_pk_f32_fp8`, so the entire
-    gfx942 code path -- offsets, loop counts, fragment widths, instruction
-    selection -- builds and executes correctly on a gfx950 box. What this
-    cannot answer is whether a gfx942 binary loads and runs on gfx942 silicon;
-    that needs the part. Everything above the ISA is checked here.
-
-    Only gcnArchName is substituted: the CU count has to stay real or
-    `_occupancy_depth_cap` would resolve a different config and the comparison
-    would no longer be about the arch.
-    """
-    real = torch.cuda.get_device_properties
-
-    def fake(device):
-        p = real(device)
-        return SimpleNamespace(
-            gcnArchName=arch, multi_processor_count=p.multi_processor_count
-        )
-
-    monkeypatch.setattr(torch.cuda, "get_device_properties", fake)
-
-
 def test_k_axis_map_is_a_bijection():
     """Every head-dim position reaches exactly one (k-step, lane group, slot).
 
@@ -1051,7 +1020,6 @@ def test_every_geometry_is_the_same_arithmetic(point):
 @requires_gfx950
 def test_arch_rejected(monkeypatch):
     """An arch with neither MFMA generation is refused before anything else."""
-    from types import SimpleNamespace
 
     q, k, bt, lens, mb = make_case(1, 1, 1, [128])
     monkeypatch.setattr(
@@ -1067,7 +1035,6 @@ def test_arch_rejected(monkeypatch):
 @pytest.mark.parametrize("operand", ["q", "out", "bt", "map"])
 @requires_gfx950
 def test_address_span_rejected_without_allocation(monkeypatch, operand):
-    from types import SimpleNamespace
 
     class MetadataTensor(torch.Tensor):
         @property
@@ -1159,7 +1126,6 @@ def test_scale_fp32_range(scale):
 
 
 def test_exact_size_uses_explicit_device(monkeypatch):
-    from types import SimpleNamespace
 
     from aiter.jit.utils import chip_info
 
@@ -1306,27 +1272,19 @@ def test_score(case, B, S, H, lens, layout, kwargs):
 # ==========================================================================
 # PREFILL
 #
+# The judge is aiter's own `pa_sparse_block_score_prefill`. Comparing against
+# it rather than a torch oracle is deliberate: the two implementations share no
+# code and the operator's numerics are a contract, so the comparison is exact
+# rather than tolerance-based.
 #
-# The judge is aiter's own `pa_sparse_block_score_prefill`, which computes the
-# same scores without the FlyDSL kernel's length limit. Comparing against it
-# rather than against a torch oracle is deliberate here: the two implementations
-# share no code, and the operator's numerics are a contract (Q is rounded down to
-# the cache's fp8, matching `tl.dot(q.to(k.dtype), k)`), so the comparison is
-# exact rather than tolerance-based.
+# Two properties of that contract shape every check below:
 #
-# Two properties of the contract shape every check below:
-#
-#   * `out` may be left untouched past a query's causal window. The kernel is
-#     only required to write the slots aiter marks finite, so the output buffer
-#     is sentinel-filled and compared only there. `alloc_score` hands back
-#     `torch.empty`, so a raw buffer diff would be comparing uninitialised
-#     memory -- which has produced false mismatches before.
+#   * `out` may be left untouched past a query's causal window, so the buffer is
+#     sentinel-filled and compared only where aiter marks it finite.
+#     `alloc_score` hands back `torch.empty`, so a raw diff would be comparing
+#     uninitialised memory.
 #   * every config arm must agree bit for bit. These are the same arithmetic in
 #     different geometries, not different approximations of it.
-#
-# Run:
-#     python op_tests/test_flydsl_minimax_m3_index_score_prefill.py
-# ==========================================================================
 
 
 def make_prefill_case(batch, q_len, ctx_len, heads=1, seed=0):
@@ -1543,13 +1501,10 @@ def test_trailing_empty_request_stays_in_bounds():
     past `idx_q`. The buffer view's num_records is the view maximum, not this
     tensor, so nothing caught it.
 
-    Be clear about what this pins and what it does not: the staged value is
-    discarded (no row of a dead tile passes `row < q_len`), so the read being
-    in bounds is NOT observable from here, and this test would have passed
-    before the clamp was added. What it does pin is the contract the clamp must
-    not break -- a trailing empty request changes no live score -- which is the
-    part a future rewrite could get wrong. The read itself is argued from the
-    addressing, not from this assertion.
+    What this pins is the contract -- a trailing empty request changes no live
+    score. The read being in bounds is NOT observable from here, since the
+    staged value is discarded either way, so this test would also have passed
+    before the clamp.
     """
     dev = "cuda"
     torch.manual_seed(0)

@@ -14,68 +14,30 @@ axis: decode's is (query token, head), at most 32 columns and memory bound,
 where prefill's is a query tile hundreds of rows wide multiplied against the
 same page, so arithmetic per page load is TILE_Q * 2 FLOP/byte.
 
-What decides this kernel's speed is the stores, not the GEMM. Removing them
-and leaving every load, MFMA and fold in place took q8192/ctx128K from 206.9
-us to 22.7, the floor for launching the grid and staging Q, so every other
-finding here is inside the remaining 5%. See `store_run` and `_auto_ppw`.
+What decides this kernel's speed is the stores, not the GEMM -- removing them
+and leaving every load, MFMA and fold in place leaves barely a tenth of the
+time. See `store_run` and `_auto_ppw`.
 
-The CTA is eight waves wide, not four: on the k_lds path the waves split the
-feature axis and SHARE one staged K page, so `waves` and `tile_q` are one
-knob. Double both and FEAT_TILES_PER_WAVE = tile_q/16/waves is unchanged --
-same Q fragments, same accumulators, same 112 VGPRs and 4 waves/SIMD -- while
-one page read covers twice the query rows, 65.5 -> 59.4 us at b1/q4096/ctx128K.
-FEAT_TILES_PER_WAVE is what costs registers, not tile_q: tile_q 256 at FOUR
-waves takes it to 4 and the register file to 206, the experiment that failed.
-Two things moved with it -- Q takes an LDS object of its own past tile_q 128
-(`stage_q_lds`), and `chunk_blocks` had to target WAVES rather than CTAs.
+The CTA is eight waves wide, not four: the waves split the feature axis and
+SHARE one staged K page, so `waves` and `tile_q` are one knob. Double both and
+FEAT_TILES_PER_WAVE = tile_q/16/waves is unchanged -- same Q fragments, same
+accumulators, same registers -- while one page read covers twice the query
+rows. FEAT_TILES_PER_WAVE is what costs registers, not tile_q. Two things move
+with it: Q takes an LDS object of its own past tile_q 128 (`stage_q_lds`), and
+`chunk_blocks` targets WAVES rather than CTAs.
 
-Register pressure, through occupancy. A lane has 512 VGPRs, so 256 is the line
-where a second wave per SIMD becomes possible:
-
-    tile_q                 64    128    192    256
-    VGPR, fp8 MFMA        161    220    282    332     waves/SIMD  3 / 2 / 1 / 1
-    VGPR, widen K to bf16 297    381    454    512     waves/SIMD  1 / 1 / 1 / 1
-    LDS,  fp8 MFMA        8 KB  16 KB  24 KB  32 KB
-
-LDS never binds -- gfx950 has 160 KB per CU. The bf16 widening did: 130 v_cvt
-per page, and the compiler holds the page's converted fragments live across
-the feature-tile loop, ~128 VGPRs on top of the 64 of raw K. Feeding the fp8
-MFMA directly (`fp8_mfma`) removes both, drops tile_q 128 from 462 VGPRs to
-220, and is worth 1.4x -- and it is what makes the shuffled layout pay, since
-at one wave per SIMD its coalescing win drowns in latency and at two it shows
-up as another 1.1x. It is a precision decision too, and the two agree: Triton
-does `tl.dot(q.to(k.dtype), k)`, so rounding Q down to fp8 IS the operator's
-reference numerics and the fp8 path reproduces Triton bit-exactly. The bf16
-path deviates by being more accurate (1.4e-06 against a high-precision oracle
-where Triton is 2.0e-01). Both are kept.
-
-What did not move it, b1/q4096/ctx128K fp8. Shrinking the K hoist to 4/2/1
-tok_tiles costs 210 -> 488/656/602 us, forcing 2 or 3 waves per SIMD on the
-bf16 path 179 -> 393/700, a tok_tile-outer loop with a 3-deep prefetch
-157 -> 177 at 446 VGPRs. And four ablations that are wrong but timed, all
-free: deleting the causal mask, halving the MFMAs, deleting the epilogue fold,
-and aiming every load at one page all land within 2%. Arithmetic free,
-epilogue free, and a 16 KB working set no faster than a 16 MB one -- not
-compute, not cache, not bandwidth. Two things that DID move it are not in the
-kernel body: a wave-uniform page id (`trip_pages`) and memoising the pure
-parts of `geometry`, which measured 1.5x a 21 us kernel uncached.
+What bounds the shape is register pressure, through occupancy; LDS never binds,
+since gfx950 has 160 KB per CU.
 
 Layout contract: this kernel and the decode scorer read the SAME cache and so
 must agree on the k-axis map. The shape constants come from that module rather
-than being restated here, but the LDS path's addressing is its own (`_ns_off`),
-so what pins the agreement is the bit-exact comparison against aiter in the
-tests, not a shared function. For an fp8 cache the map is not the natural one;
-a lane's
-16 B load covers k-elements 64i+16g..+16, a *permutation* of the MFMA's k
-axis, which is legal only because the dot sums over k and both operands use
-the same permutation. That is why Q goes through the same function. Get it
-wrong and the dot pairs the wrong elements: nothing faults, the scores are
-just wrong, so the tests check against Triton and a torch oracle rather than
-this file's own arithmetic. The map also lets the fp8 MFMA reuse the shuffled
-cache unchanged -- it wants 8 fp8 per lane per k-step, exactly half of the
-16 B access the bf16 path widens, so `k_operand` slices where `convert_k`
-converts and the cache layout, a contract with a producer in another
-component, does not move.
+than being restated here, but the LDS path's addressing is its own, so what
+pins the agreement is the bit-exact comparison against aiter in the tests, not
+a shared function. For an fp8 cache the map is not the natural one: a lane's
+16 B load covers k-elements 64i+16g..+16, a *permutation* of the MFMA's k axis,
+legal only because the dot sums over k and both operands use the same
+permutation. That is why Q goes through the same function. Get it wrong and the
+dot pairs the wrong elements -- nothing faults, the scores are just wrong.
 """
 
 import math
@@ -117,12 +79,9 @@ LOG2E = 1.4426950409
 # for why it is the dial onto arithmetic intensity and what bounds it.
 TILE_Q_CHOICES = (64, 128, 192, 256, 384, 512)
 _LDS_LIMIT = 64 * 1024
-# Largest tile worth using, per arithmetic path: the register file bounds
-# tile_q (see the header's VGPR table) and the two paths sit on opposite sides
-# of the occupancy cliff. fp8 stops at the largest tile that still gets two
-# waves per SIMD; bf16 cannot reach two at any size and takes the largest that
-# does not spill. At q4096/ctx128K fp8 runs 116.6 us at 128 against 179.1 at
-# 192, bf16 155.2 at 192.
+# Largest tile worth using, per arithmetic path. The register file bounds
+# tile_q: fp8 stops at the largest tile that still gets two waves per SIMD,
+# bf16 cannot reach two at any size and takes the largest that does not spill.
 _TILE_Q_REGISTER_BOUND = 128
 # Accelerator dies, each with its own L2, dispatched round-robin -- which is
 # what makes the grid order an L2 decision; see SWIZZLE. 8 on MI355X. A wrong
@@ -200,17 +159,12 @@ def _auto_ppw(
             return ppw
     return 1
 
+    # Blocks a CTA must own before the store merge is widened past 2, indexed by
+    # CHUNK depth rather than max_block. A CTA's output is tile_q rows of cb
+    # consecutive floats, so written a block at a time every row is a partial
+    # line; those coalesce only while the whole output still fits L2.
 
-# Blocks a CTA must own before the store merge is widened past 2. Indexed by
-# CHUNK depth -- not by max_block, where the same numbers read as
-# non-monotonic noise -- the PPW4/PPW2 ratio is monotone: 0.76 at cb 1, 0.92 at
-# 4, 1.01 at 16, 1.05 at 64, 1.34 at 128. The mechanism is write
-# amplification: a CTA's output is tile_q rows of cb consecutive floats, so
-# written a block at a time every row is a partial line that coalesces only
-# while the whole output survives in L2 -- which stops at this part's 32 MB
-# (partial writes go 29.1% at ctx128K to 89.0% at 1M, and past the knee each
-# store costs a read-modify-write of a 128 B line). Below cb 16 the PPW
-# rounding in `chunk_blocks` divides the grid's block axis and eats the win.
+
 _PPW4_MIN_CHUNK = 16
 
 
@@ -260,17 +214,9 @@ def geometry(max_query_len, batch, heads, max_block, device=None):
         else _auto_tile_q(max_query_len, batch, heads, max_block, True, device, waves)
     )
     ppw = _auto_ppw(max_query_len, batch, heads, max_block, tile_q, device, waves)
-    # Pair the 16-column feature tiles into 32x32x64 MFMAs: 124 VGPRs, four
-    # waves per SIMD, 1.05x geomean over the 16-wide path. The register file is
-    # the only thing that matters and it is NOT smooth; `.vgpr_count` from the
-    # code object (rocprof's VGPR_Count column disagrees and is wrong) against
-    # b1/q4096/ctx128K: 92 -> 5 waves, 69.64 us; 108 -> 4, 68.52; 118 -> 4,
-    # 69.44 (the 16-wide path); 124 -> 4, 65.30 (here); 132 -> 3, 80.90;
-    # 140 -> 3, 81.10. Everything at 4 waves is within 2% and there is no prize
-    # for reaching 5 -- 92 VGPRs gets it and is the SLOWEST 4-or-better config
-    # measured. The cliff is only at 128, costs 16%, and is one-sided. Needs an
-    # even FEAT_TILES_PER_WAVE so the 16-column tiles pair, which a narrow
-    # tile_q (64 over 4 waves gives 1) does not have.
+    # Pair the 16-column feature tiles into 32x32x64 MFMAs. What bounds this is
+    # the register file. Needs an even FEAT_TILES_PER_WAVE so the 16-column tiles
+    # pair, which a narrow tile_q does not have.
     ftpw = (tile_q // MFMA_N) // waves
     return {
         "tile_q": tile_q,
@@ -316,11 +262,8 @@ def chunk_blocks(
     chunks = max(1, want // max(1, q_tiles * batch * heads))
     chunks = min(1 << (chunks.bit_length() - 1), max(1, max_block))
     # A floor on the *count*, not on the oversubscription. The chunk axis also
-    # resolves the causal boundary -- a tile stops at its own page -- so with a
-    # handful of chunks a CTA either runs full or sits empty and the CU that
-    # drew the full ones sets the time: b2/q16384/ctx32K lands on 4 and
-    # measures 243 us against 130 at 8. Raising _CTA_OVERSUBSCRIBE fixes it and
-    # costs 1.2-1.7x everywhere else, since every extra CTA re-stages the tile.
+    # resolves the causal boundary, so with a handful of chunks a CTA either runs
+    # full or sits empty and the CU that drew the full ones sets the time.
     chunks = max(chunks, min(_MIN_CHUNKS, max(1, max_block)))
     return -(-max_block // chunks)
 
@@ -357,14 +300,11 @@ def build_prefill_score(g):
     PPW = g["pages_per_wave"]
     if lds_bytes(TILE_Q) > _LDS_LIMIT:
         raise ValueError(f"tile_q {TILE_Q} needs {lds_bytes(TILE_Q)} B of LDS")
-    # The waves of a CTA share one page and split the feature tiles between
-    # them. That is what lets tile_q grow: per wave Q costs FEAT_TILES_PER_WAVE
-    # fragments rather than FEAT_TILES, and K costs PER_THREAD staging
-    # registers rather than a page of MFMA fragments.
-    # The CTA width is not a free parameter: `stage_q_lds` assigns rows by
-    # `wave` and the LDS page buffers are sized for these two shapes only.
-    # `geometry` is the only producer, but it is worth stating here rather
-    # than leaving a wrong value to overrun the Q staging silently.
+        # The waves of a CTA share one page and split the feature tiles between them.
+        # That is what lets tile_q grow: per wave Q costs FEAT_TILES_PER_WAVE
+        # fragments rather than FEAT_TILES. The CTA width is not a free parameter --
+        # `stage_q_lds` assigns rows by `wave` and the LDS page buffers are sized for
+        # these two shapes only -- so a wrong value overruns the Q staging silently.
     if NWAVES not in (WAVES, _WIDE_CTA_WAVES):
         raise ValueError(f"waves must be {WAVES} or {_WIDE_CTA_WAVES}, got {NWAVES}")
     if FEAT_TILES % NWAVES:
@@ -372,21 +312,16 @@ def build_prefill_score(g):
             f"tile_q {TILE_Q} gives {FEAT_TILES} tiles, not a multiple of {NWAVES}"
         )
     FEAT_TILES_PER_WAVE = FEAT_TILES // NWAVES
-    # 32x32x64: same FLOP, same LDS bytes, same reduce count, HALF the MFMA
-    # instructions. The two k=64 halves chain into one accumulator, and that
-    # chain is BITWISE identical to the single k=128 instruction -- verified
-    # over 8192 elements, so there are no numerics to re-bless. It wins because
-    # this kernel is bound by the MFMA -> v_maximum3 edge, not the matrix pipe:
-    # each MFMA retires 16 C values instead of 4, so there are half as many.
+    # 32x32x64: same FLOP, same LDS bytes, half the MFMA instructions. The two
+    # k=64 halves chain into one accumulator, bitwise identical to the single
+    # k=128 instruction. It wins because this kernel is bound by the
+    # MFMA -> v_maximum3 edge, not the matrix pipe.
     #
     # K reaches LDS through a global -> VGPR -> ds_write bounce rather than a
-    # direct DMA, because `buffer_load ... offen lds` puts lane l at base+16*l
-    # and so pins LDS slot == memory chunk, leaving no room for the swizzle
-    # below. Unswizzled, bank_start is ((4i+g)*4) % 32 and takes four values,
-    # so 16 of 32 banks are never addressed and every ds_read is 2-way. The
-    # swizzle won by 30% at ctx8K and 2.1x past ctx128K (61.9 us vs 128.4).
-    # The staged fp8 Q tile, row major. One K page buffer holds it up to
-    # tile_q 128; past that it gets an LDS object of its own. See `stage_q_lds`.
+    # direct DMA, because `buffer_load ... offen lds` pins LDS slot == memory
+    # chunk and leaves no room for the swizzle below. Unswizzled, 16 of 32 banks
+    # are never addressed and every ds_read is 2-way.
+    # The staged fp8 Q tile, row major; see `stage_q_lds`.
     Q_STAGE_BYTES = TILE_Q * HEAD_DIM
     Q_OWN = Q_STAGE_BYTES > PAGE * HEAD_DIM
     # Pair the 16-column feature tiles into 32x32x64 MFMAs. Needs an even
@@ -405,15 +340,11 @@ def build_prefill_score(g):
     QS_ELEMS = 8
     QS_CHUNKS = HEAD_DIM // QS_ELEMS  # 8 for fp8 Q, 16 for bf16
     QS_ROWS = WAVE // QS_CHUNKS  # rows one pass of ONE WAVE covers
-    # Depth of the two queues, each in the unit it is paid in. 128 VGPRs is the
-    # line between four waves per SIMD and three and crossing it measured 16%,
-    # so a queue that cannot be bought in small enough increments cannot be
-    # bought at all. m32_ra 0 is no lookahead -- a tok_tile's two fragments are
-    # read straight before the MFMAs that consume them, into two reused tensors,
-    # the cheapest at 16 VGPRs; >=2 is a ring over flat k-steps at 8 VGPRs a
-    # slot, and even ra=2 is a real one-tok_tile lookahead (the refill lands in
-    # the slots the NEXT tok_tile reads) measuring 124 VGPRs against ra=0's
-    # 108. m32_fd is tok_tiles of accumulators held before folding, 16 each.
+    # Depth of the two queues, each in the unit it is paid in. Both are bought in
+    # registers and the occupancy cliff is close, so a queue that cannot be
+    # bought in small increments cannot be bought at all. m32_ra 0 is no
+    # lookahead; >= 2 is a ring over flat k-steps. m32_fd is tok_tiles of
+    # accumulators held before folding.
     if M32 and FEAT_TILES_PER_WAVE % 2:
         raise ValueError(
             f"m32 needs an even FEAT_TILES_PER_WAVE; tile_q {TILE_Q} gives {FEAT_TILES_PER_WAVE}"
@@ -423,11 +354,10 @@ def build_prefill_score(g):
     # Rows a wave owns, on both the 16- and 32-wide paths.
     QS_ROWS_PER_WAVE = FEAT_TILES_PER_WAVE * MFMA_N
     QS_PASSES = QS_ROWS_PER_WAVE // QS_ROWS
-    # Pages the k_lds loop walks per trip. The LDS side has two page buffers
-    # picked with `j % 2`, so that mapping only closes over an EVEN trip: at
-    # PPW=1 the next trip reads buffer 0 while the page it wants went to buffer
-    # 1, and every score after a chunk's first page is silently wrong. Auto
-    # never hits it; an explicit `pages_per_wave=1` with `k_lds=1` did.
+    # Pages the k_lds loop walks per trip. The two LDS page buffers are picked
+    # with `j % 2`, so that mapping only closes over an EVEN trip: at PPW=1 the
+    # next trip reads buffer 0 while the page it wants went to buffer 1, and
+    # every score after a chunk's first page is silently wrong.
     LDS_TRIP = PPW if PPW % 2 == 0 else 2 * PPW
     # Blocks one id batch advances by. A window holds WAVE ids from its first
     # block and the trip loop looks ahead to `base + LDS_TRIP`, so the batch
@@ -484,13 +414,10 @@ def build_prefill_score(g):
         kernel this replaces so the caller's chunk math is unchanged.
         """
         # ==================== PROLOGUE ====================
-        # Every query tile of one block chunk reads the same pages and wants to
-        # share an L2, but workgroups are dispatched round-robin over eight
-        # XCDs, which puts them on eight caches each pulling the whole working
-        # set. Re-map so a chunk's CTAs land on one XCD: take the XCD the
-        # hardware chose (the low bits of the linear id) and make the chunk
-        # follow it. A bijection only when the chunk count is a multiple of
-        # XCD_COUNT, which the host guarantees by rounding up.
+        # Every query tile of one block chunk reads the same pages and wants to share
+        # an L2, but workgroups are dispatched round-robin over eight XCDs. Re-map so
+        # a chunk's CTAs land on one XCD. A bijection only when the chunk count is a
+        # multiple of XCD_COUNT, which the host guarantees by rounding up.
         linear = fx.Int32(gpu.block_id("x")) + i32_q_tiles * (
             fx.Int32(gpu.block_id("y")) + i32_bh * fx.Int32(gpu.block_id("z"))
         )
@@ -523,14 +450,11 @@ def build_prefill_score(g):
             fx.add_offset(fx.get_iter(cu_buf), b + fx.Int32(1)).load(T.i32)
         )
         q_len = seq_next - seq_start
-        # Row this request's query block starts at, for the staging address.
-        # It is `seq_start` whenever the request HAS rows. When it does not,
-        # the `q < q_len` clamp below sends every row to q = 0 and so to
-        # `seq_start`, which for a TRAILING empty request is `total_q` -- one
-        # row past `idx_q`, and the buffer view's num_records is the view
-        # maximum rather than this tensor, so nothing catches it. Fold the
-        # correction into the origin instead of clamping each staged row: it is
-        # CTA-uniform and the per-row form cost 2-3% on every uniform batch.
+        # Row this request's query block starts at. It is `seq_start` whenever the
+        # request HAS rows; when it does not, the `q < q_len` clamp below would
+        # address `seq_start`, which for a TRAILING empty request is `total_q` --
+        # one row past `idx_q`, and the buffer view's num_records is the view
+        # maximum rather than this tensor, so nothing catches it.
         last_row = seq_next - fx.Int32(1)
         last_row = (last_row > fx.Int32(0)).select(last_row, fx.Int32(0))
         q_origin = (q_len > fx.Int32(0)).select(seq_start, last_row)
@@ -541,15 +465,12 @@ def build_prefill_score(g):
         # can contribute, and this chunk owns a slice of what is left.
         hi_tok = prefix_len + q_base + fx.Int32(TILE_Q)
         hi_tok = (hi_tok < seq_len).select(hi_tok, seq_len)
-        # The grid is sized by `max_query_len`, so a short request still gets
-        # every tile. A tile at or past its last query row stores nothing --
-        # `row < q_len` gates every writer -- but `hi_tok` is clamped only by
-        # `seq_len`, so it would still walk the whole causal window first. Mixed
-        # batches are where that bites: one request of (q 8192, prefix 0) next
-        # to one of (q 1, prefix 131071) gives the short request 64 tiles, each
-        # scanning about 1024 pages for nothing. `q_base < q_len` joins the
-        # page-range guard below rather than clamping `hi_tok`, which keeps it
-        # off the block arithmetic -- as a clamp it cost 3% at b4/q1024/ctx16K.
+        # The grid is sized by `max_query_len`, so a short request still gets every
+        # tile. A tile at or past its last query row stores nothing, but `hi_tok` is
+        # clamped only by `seq_len`, so without this it would walk the whole causal
+        # window first -- which is what costs in a mixed batch. The condition joins
+        # the page-range guard rather than clamping `hi_tok`, keeping it off the
+        # block arithmetic.
 
         blk_end = (hi_tok + fx.Int32(PAGE - 1)) // fx.Int32(PAGE)
         blk_lo = pid_chunk * i32_chunk_blocks
@@ -599,12 +520,11 @@ def build_prefill_score(g):
             live copy of every operand: 366 VGPRs against 220."""
             return lo.shuffle(hi, list(range(8)))
 
-        # Q lives in page buffer 1; see `stage_q_lds` for why not 0. Getting
-        # this wrong puts Q in buffer 0, which `commit_page(0, ...)` overwrites
-        # before the loop starts -- silent wrong scores. Past tile_q 128 the Q
-        # tile is larger than a page buffer and borrowing stops working (the
-        # overflow would land in buffer 0 and no compile-time buffer index
-        # exists to split it), so Q gets its own LDS object.
+            # Q lives in page buffer 1; see `stage_q_lds` for why not 0. In buffer 0
+            # `commit_page(0, ...)` would overwrite it before the loop starts -- silent
+            # wrong scores. Past tile_q 128 Q is larger than a page buffer and gets its
+            # own LDS object.
+
         Q_LDS_BASE = 0 if Q_OWN else K_PAGE_BYTES
 
         def _q_lds_base_ptr():
@@ -791,11 +711,10 @@ def build_prefill_score(g):
             """Page chunk `chunk`, through the swizzle."""
             return _lds_at(buf, _lds_slot(chunk))
 
-        # Row-major readback addresses, hoisted: sw() permutes only the low 3
-        # bits and a tok_tile step is 128 whole chunks, so the lane part
-        # factors out and the rest is a `ds_read` immediate. Inline, the
-        # compiler rebuilt the address per (tok_tile, i) -- 20 more v_lshl and
-        # 132 VGPRs, over the 128 wall and a wave per SIMD.
+            # Row-major readback addresses, hoisted: sw() permutes only the low 3 bits
+            # and a tok_tile step is 128 whole chunks, so the lane part factors out and
+            # the rest is a `ds_read` immediate.
+
         _sw = lambda b: b ^ (u & fx.Int32(7))
         _sw32 = lambda b: b ^ (r32 & fx.Int32(7))
         _ns_off = [
@@ -954,14 +873,9 @@ def build_prefill_score(g):
                         for i in range_constexpr(FEAT_TILES_PER_WAVE):
                             acc = fx.make_rmem_tensor(4, fx.Float32)
                             acc.store(zero4)
-                            # Priority raised over each MFMA, dropped straight
-                            # after. Both wider spellings lose: one pair around
-                            # the whole block is 0.8x, because it holds
-                            # priority across the reduce and starves the
-                            # sibling waves meant to fill this wave's MFMA
-                            # shadow, and no setprio at all is 0.82x and 68
-                            # VGPRs, because the pair is also the fence that
-                            # stops the scheduler pulling the fold onto it.
+                            # Priority raised over each MFMA and dropped straight after.
+                            # The pair is also the fence that stops the scheduler
+                            # pulling the fold onto the MFMA.
                             fx.rocdl.s_setprio(1)
                             fx.gemm(mma_atom, acc, a, q_reg[i], acc)
                             fx.rocdl.s_setprio(0)
@@ -990,16 +904,11 @@ def build_prefill_score(g):
                         accs.append(acc)
                     return accs
 
-                # The A-fragment ring is over FLAT K-STEPS, not tok_tiles: a
-                # tok_tile needs both of its k=64 fragments live, so a
-                # tok_tile-granular ring buys read-ahead in units of 16 VGPRs,
-                # and one step of it took this kernel from 108 registers to
-                # 140 -- past the 128 wall, to 3 waves per SIMD and 16% slower.
-                # Slot n % M32_RA holds step n = 2*tok_tile + kstep, refilled
-                # after the MFMAs have read it: step m is written at tok_tile
-                # (m - M32_RA)//2 and read at m//2, at least one tok_tile later
-                # for any M32_RA >= 2. M32_RA == 2 is degenerate, no
-                # read-ahead at all.
+                    # The ring is over FLAT K-STEPS, not tok_tiles: a tok_tile needs both of
+                    # its k=64 fragments live, so a tok_tile-granular ring would buy
+                    # read-ahead in units twice as large. Slot n % M32_RA holds step
+                    # n = 2*tok_tile + kstep, refilled after the MFMAs have read it.
+
                 NSTEPS = TOK_TILES32 * 2
 
                 def step_of(n):
@@ -1135,16 +1044,14 @@ def build_prefill_score(g):
 
                     _g_one()
 
-        # Every wave of the CTA walks the SAME pages -- one gmem read
-        # feeding all WAVES*FEAT_TILES_PER_WAVE feature tiles -- so the
-        # loop is over consecutive blocks, not strided. Per page: one
-        # barrier (this page's writes visible, everyone done with the
-        # buffer the next lands in), the next page's loads issued so they
-        # are in flight across this page's MFMAs, the consume, the commit.
-        # The block table read below is a plain load, not bounded by a
-        # descriptor, so the column has to be legal before it is issued.
-        # blk_lo/blk_hi are CTA-uniform here, unlike on the register path,
-        # so the guard is uniform and the barriers stay collective.
+            # Every wave of the CTA walks the SAME pages -- one gmem read feeding all
+            # WAVES*FEAT_TILES_PER_WAVE feature tiles -- so the loop is over consecutive
+            # blocks, not strided. Per page: barrier, issue the next page's loads so they
+            # are in flight across this page's MFMAs, consume, commit. The block table
+            # read below is a plain load, not bounded by a descriptor, so the column has
+            # to be legal before it is issued. blk_lo/blk_hi are CTA-uniform, so the
+            # guard is uniform and the barriers stay collective.
+
         def page_buf_of(blk):
             safe = (blk < blk_hi).select(blk, blk_lo)
             safe = (blk_lo < blk_hi).select(safe, fx.Int32(0))
@@ -1284,25 +1191,19 @@ def score_prefill_flydsl(
     _validate_tensor(cu_seqlens_q, "cu_seqlens_q", (torch.int32,), 1, dev)
     _validate_tensor(seq_lens, "seq_lens", (torch.int32,), 1, dev)
     _validate_tensor(prefix_lens, "prefix_lens", (torch.int32,), 1, dev)
-    # `cache` is validated unbounded because the whole tensor is addressed page
-    # by page, not as one span. A page descriptor's `num_records_bytes` is
-    # narrowed to int32 (see `k_unit`), so one page's byte stride has to fit --
-    # which it does for free: the cache is fp8, so a byte stride IS the element
-    # stride that `_validate_tensor` already bounds at 2**31-1.
-    # The grid is sized from these two and nothing downstream re-checks them:
-    # `max_query_len=0` launched an empty query grid and returned silently,
-    # and `max_seq_len=0` reached hipModuleLaunchKernel as a zero dimension and
-    # surfaced as `hipErrorInvalidValue`. The decode scorer already rejects its
-    # equivalents; this states the same contract.
+    # `cache` is validated unbounded because the whole tensor is addressed page by
+    # page, not as one span; one page's byte stride still has to fit int32, which
+    # it does for free since the cache is fp8.
+    # The grid is sized from max_query_len/max_seq_len and nothing downstream
+    # re-checks them, so a zero reaches the launch as an empty or invalid grid.
     if not isinstance(max_query_len, int) or max_query_len < 1:
         raise ValueError(f"max_query_len must be positive, got {max_query_len}")
     if not isinstance(max_seq_len, int) or max_seq_len < 1:
         raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
-    # The epilogue takes each page's MAX and only then multiplies by the scale
-    # (`folded[j][i] * f32_scale`), so the scale has to be order-preserving:
-    # for a negative one `max(dot) * scale` is not `max(dot * scale)` and every
-    # score is silently the wrong block's. Non-finite and sub-normal values
-    # reach the FP32 kernel argument as-is. Decode states the same contract.
+        # The epilogue takes each page's MAX and only then multiplies by the scale,
+        # so the scale must be order-preserving: for a negative one
+        # `max(dot) * scale` is not `max(dot * scale)` and every score is silently
+        # the wrong block's. Decode states the same contract.
     scaled = sm_scale * LOG2E
     if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
         raise ValueError(
@@ -1322,16 +1223,11 @@ def score_prefill_flydsl(
             f"cache needs contiguous pages: stride(1) must be {HEAD_DIM} and "
             f"stride(2) 1, got {cache.stride(1)} and {cache.stride(2)}"
         )
-    # Only stride(0)/stride(1) reach the kernel; every innermost index below is
-    # built as an element offset, so a non-unit feature stride is read as if it
-    # were 1 and silently scores the wrong features. Same contract the decode
-    # scorer states, and the reason it states it rather than threading the
-    # stride through every load.
-    # Overlap is not the only way to break this: `q_fp8_at` turns a bf16
-    # element offset into a dword offset with `off >> 1` and issues a vector
-    # load, so an ODD row or head stride lands the load off its natural
-    # boundary and drops a feature. `buf[T, H, 129][..., :128]` has no overlap
-    # and still reads head 1 from element 128. Decode states the same contract.
+        # Only stride(0)/stride(1) reach the kernel and every innermost index is an
+        # element offset, so a non-unit feature stride silently scores the wrong
+        # features. Alignment matters too, not just overlap: `q_fp8_at` turns a bf16
+        # element offset into a dword offset and vector-loads it, so an odd row or
+        # head stride drops a feature. Decode states the same contract.
     if idx_q.stride(2) != 1 or idx_q.stride(1) < HEAD_DIM:
         raise ValueError(
             f"idx_q: feature stride must be 1 and heads must not overlap, got "
@@ -1365,13 +1261,10 @@ def score_prefill_flydsl(
         raise ValueError(
             f"out: expected [{heads}, {total_q}, {max_block}], got {tuple(out.shape)}"
         )
-    # Contiguity of the block axis is not enough: positive strides that are too
-    # small make rows alias, and the kernel then overwrites scores it already
-    # wrote while this function reports success (measured 3.26 max abs error at
-    # row stride 1). Each axis must clear the whole extent below it. Padding
-    # above that is fine and is what the production layout uses -- this mirrors
-    # the decode scorer's check, minus its feature-contiguous arm, which this
-    # entry does not accept.
+        # Contiguity of the block axis is not enough: positive strides that are too
+        # small make rows alias, and the kernel then overwrites scores it already
+        # wrote while this function reports success. Each axis must clear the whole
+        # extent below it; padding above that is what the production layout uses.
     st = out.stride()
     if st[2] != 1 or st[1] < max_block or st[0] < total_q * st[1]:
         raise ValueError(
