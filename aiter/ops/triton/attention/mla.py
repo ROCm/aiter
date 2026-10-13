@@ -484,6 +484,15 @@ def mla_decode_fwd(
             num_seqs,
             max_seqlen_kv,
         )
+        if "BLOCK_M" in tuned:
+            # A smaller head tile needs less LDS, so the gate above still holds.
+            assert (
+                tuned["BLOCK_M"] <= BLOCK_M
+            ), f"tuned BLOCK_M {tuned['BLOCK_M']} exceeds the default {BLOCK_M}"
+            BLOCK_M = tuned.pop("BLOCK_M")
+            BLOCK_Q = max(BLOCK_M // num_queries_per_kv, 1)
+            NUM_HEAD_BLOCKS = (num_queries_per_kv + BLOCK_M - 1) // BLOCK_M
+            total_num_q_blocks = num_seqs * NUM_HEAD_BLOCKS
         if "NUM_SEGMENTS_PER_SEQ" in tuned:
             # The reduce kernel indexes segments with tl.arange: keep a power of 2.
             tuned["NUM_SEGMENTS_PER_SEQ"] = triton.next_power_of_2(
