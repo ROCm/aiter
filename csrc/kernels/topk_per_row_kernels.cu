@@ -4,6 +4,7 @@
 #include "aiter_hip_common.h"
 #include "aiter_tensor.h"
 #include "aiter_stream.h"
+#include "dpp_scan.h"
 #include "hip_reduce.h"
 #include "opus/opus.hpp"
 #include <hipcub/hipcub.hpp>
@@ -1350,57 +1351,6 @@ choose_bucket(Counter<T, IdxT>* counter, IdxT const* histogram, const IdxT k, in
  * before reading `counter`.
  */
 
-// x + the DPP-moved x. `old` is 0, so lanes the masks or the row edge exclude
-// contribute nothing.
-template <int ctrl, int row_mask, int bank_mask>
-__device__ __forceinline__ int dpp_add(int x)
-{
-    return x + opus::upd_dpp(0,
-                             x,
-                             opus::number<ctrl>{},
-                             opus::number<row_mask>{},
-                             opus::number<bank_mask>{},
-                             opus::bool_constant<false>{});
-}
-
-// Inclusive add-scan across one wave64, the GCN row_shr/row_bcast sequence.
-__device__ __forceinline__ int wave_inclusive_sum_dpp(int x)
-{
-    x = dpp_add<0x111, 0xf, 0xf>(x); // row_shr:1
-    x = dpp_add<0x112, 0xf, 0xf>(x); // row_shr:2
-    x = dpp_add<0x114, 0xf, 0xe>(x); // row_shr:4
-    x = dpp_add<0x118, 0xf, 0xc>(x); // row_shr:8
-    x = dpp_add<0x142, 0xa, 0xf>(x); // row_bcast:15
-    x = dpp_add<0x143, 0xc, 0xf>(x); // row_bcast:31
-    return x;
-}
-
-// Unsigned counterpart used when two independent 16-bit counts are packed
-// into one dword.  The total dword may set bit 31 even though neither field
-// carries, so unsigned addition is required for defined wrap-free C++
-// semantics.
-template <int ctrl, int row_mask, int bank_mask>
-__device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
-{
-    return x + opus::upd_dpp(0u,
-                             x,
-                             opus::number<ctrl>{},
-                             opus::number<row_mask>{},
-                             opus::number<bank_mask>{},
-                             opus::bool_constant<false>{});
-}
-
-__device__ __forceinline__ uint32_t wave_inclusive_sum_dpp_u32(uint32_t x)
-{
-    x = dpp_add_u32<0x111, 0xf, 0xf>(x); // row_shr:1
-    x = dpp_add_u32<0x112, 0xf, 0xf>(x); // row_shr:2
-    x = dpp_add_u32<0x114, 0xf, 0xe>(x); // row_shr:4
-    x = dpp_add_u32<0x118, 0xf, 0xc>(x); // row_shr:8
-    x = dpp_add_u32<0x142, 0xa, 0xf>(x); // row_bcast:15
-    x = dpp_add_u32<0x143, 0xc, 0xf>(x); // row_bcast:31
-    return x;
-}
-
 template <typename T, typename IdxT, int BitsPerPass, int BlockSize>
 __device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
                                      IdxT* histogram,
@@ -1462,10 +1412,7 @@ __device__ void choose_bucket_reduce(Counter<T, IdxT>* counter,
     if(wave == 0)
     {
         int t = lane < waves ? static_cast<int>(wave_sums[lane]) : 0;
-        t = dpp_add<0x111, 0xf, 0xf>(t); // row_shr:1
-        t = dpp_add<0x112, 0xf, 0xf>(t); // row_shr:2
-        t = dpp_add<0x114, 0xf, 0xe>(t); // row_shr:4
-        t = dpp_add<0x118, 0xf, 0xc>(t); // row_shr:8
+        t = row_inclusive_sum_dpp(t);
         if(lane < waves) wave_sums[lane] = static_cast<IdxT>(t);
     }
     __syncthreads();
@@ -2721,7 +2668,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             }
             sum = (sum & 0xffffu) + (sum >> 16);
             uint32_t const total = static_cast<uint32_t>(__builtin_amdgcn_readlane(
-                static_cast<int>(wave_inclusive_sum_dpp_u32(sum)), WARP_SIZE - 1));
+                static_cast<int>(wave_inclusive_sum_dpp(sum)), WARP_SIZE - 1));
             if(lane == 0) wave_sums[wave] = static_cast<IdxT>(total);
         }
         __syncthreads();
@@ -2731,10 +2678,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         {
             int const t = lane < waves ? static_cast<int>(wave_sums[lane]) : 0;
             int s = t;
-            s = dpp_add<0x111, 0xf, 0xf>(s); // row_shr:1
-            s = dpp_add<0x112, 0xf, 0xf>(s); // row_shr:2
-            s = dpp_add<0x114, 0xf, 0xe>(s); // row_shr:4
-            s = dpp_add<0x118, 0xf, 0xc>(s); // row_shr:8
+            s = row_inclusive_sum_dpp(s);
             IdxT const wave_before = static_cast<IdxT>(__builtin_amdgcn_readlane(s - t, wave));
             IdxT const wave_count  = static_cast<IdxT>(__builtin_amdgcn_readlane(t, wave));
             if(wave_before < k && k <= wave_before + wave_count)
@@ -2763,10 +2707,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                         ? static_cast<int>((lane & 1) ? (dword >> 16) : (dword & 0xffffu))
                         : 0;
                 int b = bin_count;
-                b = dpp_add<0x111, 0xf, 0xf>(b); // row_shr:1
-                b = dpp_add<0x112, 0xf, 0xf>(b); // row_shr:2
-                b = dpp_add<0x114, 0xf, 0xe>(b); // row_shr:4
-                b = dpp_add<0x118, 0xf, 0xc>(b); // row_shr:8
+                b = row_inclusive_sum_dpp(b);
                 bool const crossing = lane < lane_bins && slice_before + b - bin_count < k &&
                                       k <= slice_before + b;
                 uint64_t const crossing_mask = static_cast<uint64_t>(__ballot(crossing));
@@ -2806,7 +2747,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             }
             uint32_t const packed = static_cast<uint32_t>(__builtin_popcount(winner_mask)) |
                                     (static_cast<uint32_t>(__builtin_popcount(bin_mask)) << 16);
-            uint32_t const end = wave_inclusive_sum_dpp_u32(packed);
+            uint32_t const end = wave_inclusive_sum_dpp(packed);
             uint32_t base      = 0;
             if(lane == WARP_SIZE - 1) base = atomicAdd(control + 3, end);
             base = static_cast<uint32_t>(
@@ -3457,9 +3398,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
         uint32_t const dw = fine[(cw * WARP_SIZE + cl) * 4 + ((lane >> 1) & 3)];
         int const bc      = lane < 8 ? static_cast<int>((lane & 1) ? (dw >> 16) : (dw & 0xffffu)) : 0;
         int b             = bc;
-        b = dpp_add<0x111, 0xf, 0xf>(b); // row_shr:1
-        b = dpp_add<0x112, 0xf, 0xf>(b); // row_shr:2
-        b = dpp_add<0x114, 0xf, 0xe>(b); // row_shr:4
+        b = row_inclusive_sum_dpp<8>(b);
         int const bi = lane_before + b;
         int const be = bi - bc;
         int const bl = __builtin_ctzll(

@@ -13,6 +13,7 @@
 #include <numeric>
 #include <vector>
 
+#include "dpp_scan.h"
 #include "opus/opus.hpp"
 
 constexpr int WAVE_SIZE = opus::get_warp_size();
@@ -492,29 +493,12 @@ __device__ __forceinline__ void block_gather_topk(int c,
 // Byte offset of radix pass p (MSB first).
 __device__ __host__ __forceinline__ int radix_shift(int pass) { return 24 - 8 * pass; }
 
-template <int ctrl, int row_mask, int bank_mask>
-__device__ __forceinline__ uint32_t dpp_add_u32(uint32_t x)
-{
-    return x + opus::upd_dpp(0u,
-                             x,
-                             opus::number<ctrl>{},
-                             opus::number<row_mask>{},
-                             opus::number<bank_mask>{},
-                             opus::bool_constant<false>{});
-}
-// Inclusive suffix sum over one fully active wave64 (lane i: lanes i..63).
-// The prefix is the GCN row_shr/row_bcast DPP sequence aiter's plain top-k
-// ships (topk_per_row_kernels.cu, wave_inclusive_sum_dpp_u32), pure VALU;
-// the __shfl_down tree it replaces is six ds_bpermute + lgkmcnt(0) round trips.
+// Inclusive suffix sum over one fully active wave64 (lane i: lanes i..63), from
+// the DPP prefix scan in dpp_scan.h, pure VALU; the __shfl_down tree it replaces
+// is six ds_bpermute + lgkmcnt(0) round trips.
 __device__ __forceinline__ uint32_t wave_suffix_sum(uint32_t v)
 {
-    uint32_t x         = v;
-    x                  = dpp_add_u32<0x111, 0xf, 0xf>(x); // row_shr:1
-    x                  = dpp_add_u32<0x112, 0xf, 0xf>(x); // row_shr:2
-    x                  = dpp_add_u32<0x114, 0xf, 0xe>(x); // row_shr:4
-    x                  = dpp_add_u32<0x118, 0xf, 0xc>(x); // row_shr:8
-    x                  = dpp_add_u32<0x142, 0xa, 0xf>(x); // row_bcast:15
-    x                  = dpp_add_u32<0x143, 0xc, 0xf>(x); // row_bcast:31
+    const uint32_t x   = aiter::wave_inclusive_sum_dpp(v);
     const uint32_t tot = (uint32_t)__builtin_amdgcn_readlane((int)x, WAVE_SIZE - 1);
     return tot - x + v;
 }
