@@ -5050,7 +5050,7 @@ inline int topk_oneblock_num_xcd() { return topk_oneblock_device().num_xcd; }
 //    neutral.
 //  - Validated only in SPX / NPS1 mode on MI355X.
 // Correctness never depends on placement: each row maps to exactly one
-// workgroup.  Diagnosis: XCD start-skew report REPORT_XCD.md (2026-09-30).
+// workgroup.
 // With one XCD (CPX) or an unknown count, or outside those row counts, `rows`
 // is 0 and the launch is unplaced.
 inline TopkRowPlacement topk_oneblock_reg_placement(int batch_size)
