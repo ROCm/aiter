@@ -4,6 +4,7 @@
 import functools
 import os
 import re
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 
@@ -262,6 +263,41 @@ def _fused_decode_sort_quant(
 
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
+
+# Optional BM=16 sort metadata from a caller's fused route+sort kernel (e.g.
+# SGLang's radix-4 router), registered on the calling thread immediately before
+# fused_moe. CUDA-graph replay does not re-enter Python, so a captured fused_moe
+# keeps whichever sort launches it was captured with.
+_PRESORTED_MOE = threading.local()
+
+
+def register_presorted_moe(aux: dict | None) -> None:
+    """Hand the next fused_moe call on this thread a precomputed BM=16 sort.
+
+    ``aux`` holds the sort outputs (sorted_token_ids, sorted_weights,
+    sorted_expert_ids, num_valid_ids, m_indices, reverse_sorted) and the keys
+    they were computed for (topk_ids_ptr, M, block_m, num_experts, topk). Set
+    moe_buf_zeroed and moe_buf_ptr when the caller already zeroed the buffer it
+    will pass as ``output``. The next fused_moe consumes it whether or not it
+    matches, so a stale registration never applies to a later call.
+    """
+    _PRESORTED_MOE.aux = aux
+
+
+def _take_presorted_moe(topk_ids, *, block_m, num_experts, topk):
+    aux = getattr(_PRESORTED_MOE, "aux", None)
+    _PRESORTED_MOE.aux = None
+    if not aux:
+        return None
+    if (
+        int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
+        or int(aux.get("M", -1)) != int(topk_ids.shape[0])
+        or int(aux.get("block_m", -1)) != int(block_m)
+        or int(aux.get("num_experts", -1)) != int(num_experts)
+        or int(aux.get("topk", -1)) != int(topk)
+    ):
+        return None
+    return aux
 
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
@@ -1831,32 +1867,66 @@ def _fused_moe_impl(
         _stage2_kwargs = metadata.stage2.keywords
         _kn2 = _stage2_kwargs.get("kernelName2") or _stage2_kwargs.get("kernelName", "")
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
-        # BM16's adaptive sort already emits routes and zeroes the output without
-        # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        sorting_ret = moe_sorting(
+        presorted = _take_presorted_moe(
             topk_ids,
-            topk_weight,
-            global_E,
-            model_dim,
-            dtype,
-            block_size_M,
-            expert_mask,
-            num_local_tokens,
-            return_local_topk_ids=need_local_topk_ids,
-            accumulate=_atomic and not runtime_stage2_reduce,
-            output_aux=metadata.output_aux,
-            output=output,
+            block_m=block_size_M,
+            num_experts=global_E,
+            topk=topk,
         )
-        (
-            sorted_ids,
-            sorted_weights,
-            sorted_expert_ids,
-            num_valid_ids,
-            moe_buf,
-            sort_m_indices,
-            sort_reverse_sorted,
-        ) = sorting_ret[:7]
-        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+        # The presorted metadata has no expert mask applied.
+        if presorted is not None and expert_mask is None:
+            sorted_ids = presorted["sorted_token_ids"]
+            sorted_weights = presorted["sorted_weights"]
+            sorted_expert_ids = presorted["sorted_expert_ids"]
+            num_valid_ids = presorted["num_valid_ids"]
+            sort_m_indices = presorted["m_indices"]
+            sort_reverse_sorted = presorted["reverse_sorted"]
+            if _atomic and not runtime_stage2_reduce:
+                moe_buf = (
+                    output
+                    if output is not None
+                    else torch.empty(
+                        (M, model_dim), dtype=dtype, device=topk_ids.device
+                    )
+                )
+                # Atomic GEMM2 needs a zeroed destination; skip the zeroing only
+                # if the caller zeroed this exact buffer.
+                if not (
+                    presorted.get("moe_buf_zeroed")
+                    and int(presorted.get("moe_buf_ptr", 0)) == moe_buf.data_ptr()
+                ):
+                    moe_buf.zero_()
+            else:
+                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
+            local_topk_ids = None
+        else:
+            # BM16's adaptive sort already emits routes and zeroes the output
+            # without quantizing. Keep the Opus crossover for the configured aux
+            # pipeline.
+            sorting_ret = moe_sorting(
+                topk_ids,
+                topk_weight,
+                global_E,
+                model_dim,
+                dtype,
+                block_size_M,
+                expert_mask,
+                num_local_tokens,
+                return_local_topk_ids=need_local_topk_ids,
+                accumulate=_atomic and not runtime_stage2_reduce,
+                output_aux=metadata.output_aux,
+                output=output,
+            )
+            (
+                sorted_ids,
+                sorted_weights,
+                sorted_expert_ids,
+                num_valid_ids,
+                moe_buf,
+                sort_m_indices,
+                sort_reverse_sorted,
+            ) = sorting_ret[:7]
+            local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     elif fused_sort_quant:
         (
             sorted_ids,

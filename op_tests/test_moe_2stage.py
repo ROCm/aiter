@@ -761,6 +761,11 @@ parser.add_argument(
     help="Run only the deterministic BM16 tiled-scale boundary regression.",
 )
 parser.add_argument(
+    "--presorted-hook",
+    action="store_true",
+    help="Run only the register_presorted_moe() test.",
+)
+parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
@@ -1701,6 +1706,111 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
         "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
     )
 
+def test_presorted_moe_hook():
+    """register_presorted_moe() lets a caller's BM=16 route+sort replace fused_moe's.
+
+    Kimi-K3 A4W4 TP=8 decode (BM=16 aux sort). The registered sort must be used
+    instead of moe_sorting and give the same result. A registration that does
+    not match the call is ignored and still consumed, so it never leaks into a
+    later call. A caller-zeroed output buffer is used as is.
+    """
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip presorted MoE hook test on %s", get_gfx())
+        return
+    fm = aiter.fused_moe
+    torch.manual_seed(0)
+    E, topk, model_dim, inter_dim, token = 896, 16, 3584, 384, 1
+    dtype = dtypes.bf16
+    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+
+    def prep(w):
+        q, scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
+        q = q.view(*w.shape[:-1], w.shape[-1] // 2)
+        scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
+        rows = scale.shape[0] * scale.shape[1]
+        return (
+            shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
+            fp4_utils.e8m0_shuffle(scale.view(rows, -1)).view(*scale.shape[:2], -1),
+        )
+
+    w1, w1_scale = prep(torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10)
+    w2, w2_scale = prep(torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10)
+    hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+    gating = torch.randn((token, E), dtype=dtype)
+    topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+    kwargs = {
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Situv2,
+        "quant_dtype_a": dtypes.fp4x2,
+    }
+
+    def presort(moe_buf=None):
+        ids, weights, experts, num_valid, _, m_indices, reverse = fm._adaptive_moe_sort(
+            topk_ids, topk_weights, E, topk, 16, model_dim, emit_aux=True
+        )
+        return {
+            "sorted_token_ids": ids,
+            "sorted_weights": weights,
+            "sorted_expert_ids": experts,
+            "num_valid_ids": num_valid,
+            "m_indices": m_indices,
+            "reverse_sorted": reverse,
+            "topk_ids_ptr": topk_ids.data_ptr(),
+            "M": token,
+            "block_m": 16,
+            "num_experts": E,
+            "topk": topk,
+            "moe_buf_zeroed": moe_buf is not None,
+            "moe_buf_ptr": 0 if moe_buf is None else moe_buf.data_ptr(),
+        }
+
+    # Atomic bf16 accumulation alone moves fused_moe by up to ~2e-5 run to run.
+    def calc_diff(x, y):
+        x, y = x.double(), y.double()
+        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
+
+    real_sorting = fm.moe_sorting
+    sort_calls = []
+
+    def counting_sorting(*a, **kw):
+        sort_calls.append(1)
+        return real_sorting(*a, **kw)
+
+    try:
+        fm.moe_sorting = counting_sorting
+        ref = fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+        assert sort_calls, "the BM=16 aux sort path did not call moe_sorting"
+
+        sort_calls.clear()
+        fm.register_presorted_moe(presort())
+        out = fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+        assert not sort_calls, "registered presort was not used"
+        diff = calc_diff(ref, out)
+        assert diff < 1e-4, f"presorted vs fused_moe sort diff {diff}"
+
+        # The caller zeroed `output` itself and says so.
+        buf = torch.zeros((token, model_dim), dtype=dtype)
+        fm.register_presorted_moe(presort(moe_buf=buf))
+        out = fused_moe(hidden, w1, w2, topk_weights, topk_ids, output=buf, **kwargs)
+        assert out is buf and not sort_calls
+        diff = calc_diff(ref, out)
+        assert diff < 1e-4, f"caller-zeroed output diff {diff}"
+
+        # Registered for another topk_ids tensor: ignored, and consumed.
+        aux = presort()
+        aux["topk_ids_ptr"] = topk_ids.clone().data_ptr()
+        fm.register_presorted_moe(aux)
+        fused_moe(hidden, w1, w2, topk_weights, topk_ids, **kwargs)
+        assert len(sort_calls) == 1, "a mismatched presort was used"
+        assert getattr(fm._PRESORTED_MOE, "aux", None) is None, "not consumed"
+    finally:
+        fm.moe_sorting = real_sorting
+        fm.register_presorted_moe(None)
+    torch.cuda.synchronize()
+    aiter.logger.info("moe_2stage: presorted MoE hook passed")
+
 
 # ---------------------------------------------------------------------------
 # Run
@@ -1717,10 +1827,13 @@ _case_iters = []
 test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
+elif args.presorted_hook:
+    test_presorted_moe_hook()
 else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
+    test_presorted_moe_hook()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
