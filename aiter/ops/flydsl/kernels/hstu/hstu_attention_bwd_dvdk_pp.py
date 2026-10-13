@@ -563,7 +563,7 @@ def build_hstu_attention_bwd_dvdk_pp(
             return fire
 
         dma_q = make_dma(q, q_base_byte_offset, q_views, True)
-        dma_do = make_dma(do, do_base_byte_offset, do_views, False)
+        dma_do = make_dma(do, do_base_byte_offset, do_views, True)
 
         # ---- staging duty: LDS -> LDS transpose ----------------------------
         t_unit_row = grp_tid // fx.Int32(T_QGROUPS)
@@ -599,7 +599,7 @@ def build_hstu_attention_bwd_dvdk_pp(
             return run
 
         transpose_q = make_transpose(q_views, q_t_wr, True)
-        transpose_do = make_transpose(do_views, do_t_wr, False)
+        transpose_do = make_transpose(do_views, do_t_wr, True)
 
         def transpose_zero(t_slot):
             # The T_GPAD tail of each q-group is never read, so zeroing the
@@ -652,7 +652,11 @@ def build_hstu_attention_bwd_dvdk_pp(
                 MFMA_DA_LANE_K
             )
             view = do_views[rm_slot]
-            return view[q_row, col // fx.Int32(MFMA_DA_LANE_K), None].load().ir_value()
+            return (
+                view[q_row, q_swz_col(q_row, col) // fx.Int32(MFMA_DA_LANE_K), None]
+                .load()
+                .ir_value()
+            )
 
         def fmul_scalar(a, b):
             """Multiply that the backend cannot fold into `v_pk_mul_f32`.
@@ -745,9 +749,8 @@ def build_hstu_attention_bwd_dvdk_pp(
             # W <= 11 a later group's read lands in a slot whose occupant has
             # not been consumed yet -- at W=9, g12's read is issued at step 0
             # into g2's slot and g2 is not consumed until step 4, which gives
-            # silently wrong results with no compile error. Keyed by step, the
-            # slot reuse distance is exactly W+1 against a W lookahead, so
-            # every W is correct.
+            # silently wrong results. Keyed by step, the slot reuse distance is
+            # exactly W+1 against a W lookahead, so every W is correct.
             win = [None for _ in range_constexpr(PREFETCH_W + 1)]
             halves = {}
             for _s in range_constexpr(PREFETCH_W):
