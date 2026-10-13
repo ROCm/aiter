@@ -230,7 +230,6 @@ __all__ = [
     "pa_decode",
     "prepare_gemm_a16wfp4_weight",
     "prepare_pa_decode_plan",
-    "qsa_auto_uses_flydsl",
     "qsa_k1_block_ids",
     "qsa_k2",
     "qsa_layer",
