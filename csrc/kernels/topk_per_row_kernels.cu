@@ -5007,57 +5007,75 @@ void standalone_stable_radix_topk_one_block_(void* buf,
     }
 }
 
-// Runtime BPP dispatch for ob: CU >= 128 || LDS/CU >= 128KB selects BPP=12, otherwise BPP=11.
-inline bool topk_oneblock_use_large_bpp()
+// The properties the one-block dispatch decides on.  They are per device: one
+// process can drive GPUs of different architectures or partitions, and the
+// gfx950 kernels are not in other targets' code objects.  Every entry has made
+// the input's GPU current before dispatching.
+struct TopkOneblockDevice
 {
-    static const bool v = []() {
-        int dev = 0;
-        (void)hipGetDevice(&dev);
-        hipDeviceProp_t p{};
-        (void)hipGetDeviceProperties(&p, dev);
-        return p.multiProcessorCount >= 128 || p.sharedMemPerMultiprocessor >= 128 * 1024;
-    }();
-    return v;
+    int num_cu;
+    int num_xcd; // XCDs (XCCs) in the current compute partition; 1 when unknown
+    bool large_bpp;
+    bool gfx950;
+};
+
+inline TopkOneblockDevice topk_oneblock_read_device(int dev)
+{
+    hipDeviceProp_t p{};
+    (void)hipGetDeviceProperties(&p, dev);
+    int xcd = 0;
+    if(hipDeviceGetAttribute(&xcd, hipDeviceAttributeNumberOfXccs, dev) != hipSuccess)
+        xcd = 1;
+    return {p.multiProcessorCount,
+            xcd > 1 ? xcd : 1,
+            p.multiProcessorCount >= 128 || p.sharedMemPerMultiprocessor >= 128 * 1024,
+            std::strncmp(p.gcnArchName, "gfx950", 6) == 0};
 }
+
+// Read for every visible GPU once.  When they all agree, as on a node of one
+// GPU type, the answer needs no device query per call.
+inline TopkOneblockDevice topk_oneblock_device()
+{
+    constexpr int kMaxDevices = 64;
+    struct Table
+    {
+        int count    = 0;
+        bool uniform = true;
+        TopkOneblockDevice dev[kMaxDevices];
+    };
+    static const Table table = []() {
+        Table t;
+        if(hipGetDeviceCount(&t.count) != hipSuccess || t.count < 0)
+            t.count = 0;
+        t.count = t.count < kMaxDevices ? t.count : kMaxDevices;
+        for(int d = 0; d < t.count; ++d)
+        {
+            t.dev[d]                    = topk_oneblock_read_device(d);
+            TopkOneblockDevice const& a = t.dev[0];
+            TopkOneblockDevice const& b = t.dev[d];
+            t.uniform = t.uniform && a.num_cu == b.num_cu && a.num_xcd == b.num_xcd &&
+                        a.large_bpp == b.large_bpp && a.gfx950 == b.gfx950;
+        }
+        return t;
+    }();
+    if(table.uniform && table.count > 0)
+        return table.dev[0];
+    int dev = 0;
+    (void)hipGetDevice(&dev);
+    if(dev >= 0 && dev < table.count)
+        return table.dev[dev];
+    return topk_oneblock_read_device(dev);
+}
+
+// Runtime BPP dispatch for ob: CU >= 128 || LDS/CU >= 128KB selects BPP=12, otherwise BPP=11.
+inline bool topk_oneblock_use_large_bpp() { return topk_oneblock_device().large_bpp; }
 
 // The eight-wave 4K tuning is specific to CDNA4 scheduling and resources.
-inline bool topk_oneblock_is_gfx950()
-{
-    static const bool v = []() {
-        int dev = 0;
-        (void)hipGetDevice(&dev);
-        hipDeviceProp_t p{};
-        (void)hipGetDeviceProperties(&p, dev);
-        return std::strncmp(p.gcnArchName, "gfx950", 6) == 0;
-    }();
-    return v;
-}
+inline bool topk_oneblock_is_gfx950() { return topk_oneblock_device().gfx950; }
 
-inline int topk_oneblock_num_cu()
-{
-    static const int v = []() {
-        int dev = 0;
-        (void)hipGetDevice(&dev);
-        hipDeviceProp_t p{};
-        (void)hipGetDeviceProperties(&p, dev);
-        return p.multiProcessorCount;
-    }();
-    return v;
-}
+inline int topk_oneblock_num_cu() { return topk_oneblock_device().num_cu; }
 
-// XCDs (XCCs) in the device's current compute partition; 1 when the runtime
-// cannot tell.
-inline int topk_oneblock_num_xcd()
-{
-    static const int v = []() {
-        int dev = 0, n = 0;
-        if(hipGetDevice(&dev) != hipSuccess ||
-           hipDeviceGetAttribute(&n, hipDeviceAttributeNumberOfXccs, dev) != hipSuccess)
-            return 1;
-        return n > 1 ? n : 1;
-    }();
-    return v;
-}
+inline int topk_oneblock_num_xcd() { return topk_oneblock_device().num_xcd; }
 
 // XCD-subset placement.  On a cold dispatch (the launch reaches an idle GPU)
 // the XCDs do not start together: on MI355X, XCCs 0-3 start first and XCCs
@@ -5148,12 +5166,14 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
                                                 MainBits, TailBits, Wave, Wave, Wave, Wide>
                     <<<groups * static_cast<unsigned>(place.period), BlockSize, 0, stream>>>(
                         in, len, k, out, out_idx, select_min, place);
+                HIP_CALL_LAUNCH(hipGetLastError());
                 return true;
             }
         }
         radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT, MainBits,
                                         TailBits, Wave, Wave, Wave, Wide>
             <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
 }
@@ -5224,12 +5244,14 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, true, 270, true>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
     if(len <= kTopkPlainGfx950AnyRowsMaxLen)
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, true>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
     if(batch_size >= topk_oneblock_num_cu() && len <= kTopkPlainGfx950LdsTailMaxLen)
@@ -5237,6 +5259,7 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, false,
                                              4, 4608>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
+        HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
     return false;
