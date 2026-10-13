@@ -175,7 +175,22 @@ def _find_grouped_config(
     # as a value that matches nothing.
     def _cell(row, k):
         value = str(row.get(k) or "").strip()
-        return "" if value.lower() in ("nan", "none") else value
+        if value.lower() in ("nan", "none"):
+            return ""
+        # pandas/astype(str) turns int flags into "1.0"/"0.0"; keys use "1"/"0".
+        if value in ("1.0", "0.0") and k in (
+            "ep_fused",
+            "use_g1u1",
+            "doweight_stage1",
+        ):
+            return value[0]
+        try:
+            f = float(value)
+            if f == int(f):
+                return str(int(f))
+        except ValueError:
+            pass
+        return value
 
     def _matches(row, *, require_cu_num: bool):
         for k, v in keys.items():
