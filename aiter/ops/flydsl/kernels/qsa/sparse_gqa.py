@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL QSA K2 sparse paged GQA, shaped after the live AMD Triton kernel.
+"""FlyDSL QSA sparse paged GQA, shaped after the live AMD Triton kernel.
 
 One workgroup owns ``(row, kv_head, split)``.  Q is staged once, paged K/V
 are gathered in ``BLOCK_N`` tiles, QK and PV use BF16 MFMA, and online
@@ -17,13 +17,11 @@ visible so QK can run while V is in flight.  Softmax stays in registers
 Expand, partial RoPE, and the sigmoid output gate remain outside K2.
 
 The GQA shape is a build parameter: the caller's tensors supply it.
+Host dispatch lives in ``aiter.ops.flydsl.qsa``.
 """
-
-from functools import lru_cache
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-import torch
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl.expr import (
@@ -38,13 +36,7 @@ from flydsl.expr import (
 from flydsl.expr import math as fxmath
 
 from aiter.ops.flydsl.kernels.kernels_common import LOG2E, kernel_signature
-from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
-from aiter.ops.flydsl.kernels.qsa.paged import span_bytes
-from aiter.ops.flydsl.kernels.tensor_shim import (
-    _run_compiled,
-    buf_base_i64,
-    buf_copy_atom,
-)
+from aiter.ops.flydsl.kernels.tensor_shim import buf_base_i64, buf_copy_atom
 
 # 256 CUs on gfx950 times four BN32 prefill workgroups each. Unlike the decode
 # bands below this one does not move with head_dim: halving D halves the LDS
@@ -120,11 +112,9 @@ def _launch_config(
 ) -> tuple[int, int, int]:
     """Return ``(BLOCK_N, threads, splits)`` using the tuned policy."""
     base_programs = rows * n_kv_heads
-    # These bands used to mirror live AMD's (64 splits to base_programs 4,
-    # then 32) and were fitted only at D=256. Both ceilings measured too low
-    # at both head widths: 64 splits wins out to base_programs 12 at D=256
-    # and 16 at D=128, by 1.6-9.1%, and the 128-split band reaches 4 rather
-    # than 2 at D=128. BLOCK_N and the wave count did not move with D.
+    # Split bands follow head width: D<=128 uses (4, 16), and wider D uses
+    # (2, 12). The launch takes 128 splits, then 64, then 32, as
+    # ``base_programs`` crosses those ceilings.
     tiny_max, mid_max = (
         _DECODE_BANDS_NARROW if head_dim <= _NARROW_HEAD_DIM else _DECODE_BANDS_WIDE
     )
@@ -200,7 +190,7 @@ def _k2_coverage_reason(
     return None
 
 
-def build_qsa_k2_module(
+def build_qsa_sparse_gqa_module(
     n_q_heads: int,
     n_kv_heads: int,
     head_dim: int,
@@ -250,7 +240,7 @@ def build_qsa_k2_module(
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
     merge_threads = _merge_threads(head_dim, n_splits)
-    # Same predicate qsa_k2_serves applies to the selected launch. Raising
+    # Same predicate qsa_sparse_gqa_supported applies to the selected launch. Raising
     # here keeps a direct builder call from StopIteration on an empty gather
     # or from compiling a kernel that writes only a prefix of D.
     coverage = _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)
@@ -352,7 +342,7 @@ def build_qsa_k2_module(
         denominator: fx.Array[Float32, 1, 16]
 
     @flyc.kernel(
-        name="qsa_k2_split_"
+        name="qsa_sparse_gqa_split_"
         + kernel_signature(
             hq=n_q_heads,
             hk=n_kv_heads,
@@ -1259,7 +1249,7 @@ def build_qsa_k2_module(
             partial_lse[split, row, head] = lse
 
     @flyc.kernel(
-        name="qsa_k2_merge_"
+        name="qsa_sparse_gqa_merge_"
         + kernel_signature(ns=n_splits, blk=merge_threads, d=head_dim),
         known_block_size=[merge_threads, 1, 1],
     )
@@ -1368,235 +1358,3 @@ def build_qsa_k2_module(
         "unsafe_fp_math": True,
     }
     return launch
-
-
-@lru_cache(maxsize=32)
-def _plan(
-    n_q_heads: int,
-    n_kv_heads: int,
-    head_dim: int,
-    page_size: int,
-    use_k32: bool,
-    block_n: int,
-    block_threads: int,
-    n_splits: int,
-    wide_cache: bool,
-    kv_strides: tuple[int, int, int] | None = None,
-):
-    return build_qsa_k2_module(
-        n_q_heads,
-        n_kv_heads,
-        head_dim,
-        page_size,
-        use_k32,
-        block_n,
-        block_threads,
-        n_splits,
-        wide_cache,
-        kv_strides,
-    )
-
-
-def qsa_k2_serves(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    indices: torch.Tensor,
-    page_table: torch.Tensor,
-) -> str | None:
-    """Why this K2 kernel cannot serve these tensors, or None if it can."""
-    if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
-        return f"q and caches must be bfloat16, got {q.dtype} and {k_cache.dtype}"
-    if v_cache.dtype != k_cache.dtype or v_cache.shape != k_cache.shape:
-        return "v_cache must match k_cache dtype and shape"
-    if q.dim() != 3:
-        return f"q must be [M, Hq, D], got {tuple(q.shape)}"
-    if k_cache.dim() != 4:
-        return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
-    if k_cache.shape[3] != q.shape[2]:
-        return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
-    # The same geometries build_qsa_k2_module rejects for the launch
-    # _launch_config would compile from these tensors. A reason here keeps
-    # the caller from launching a kernel that raises or drops a tail of D.
-    # BLOCK_N and the workgroup still come from that policy.
-    n_q_heads = int(q.shape[1])
-    n_kv_heads = int(k_cache.shape[2])
-    head_dim = int(q.shape[2])
-    page_size = int(k_cache.shape[1])
-    if n_kv_heads < 1 or n_q_heads % n_kv_heads:
-        return f"{n_q_heads} query heads do not group over {n_kv_heads} KV heads"
-    if n_q_heads // n_kv_heads > 16:
-        return f"group must fit one MFMA M dim, got {n_q_heads // n_kv_heads}"
-    if head_dim % 32:
-        return f"head_dim must be a multiple of 32, got {head_dim}"
-    if page_size < 1:
-        return f"page_size must be positive, got {page_size}"
-    # Paged caches are read in place. A K|V-interleaved view (vLLM's
-    # [pages, page_size, H, 2 * D] split in two) is fine; a copy is not.
-    if k_cache.stride(3) != 1 or v_cache.stride(3) != 1:
-        return f"k_cache and v_cache need a unit D stride, got {k_cache.stride()}"
-    if k_cache.stride() != v_cache.stride():
-        return (
-            f"k_cache and v_cache strides differ: {k_cache.stride()} vs "
-            f"{v_cache.stride()}"
-        )
-    if any(s % 8 for s in k_cache.stride()[:3]):
-        return (
-            f"k_cache strides must be multiples of 8 elements, got {k_cache.stride()}"
-        )
-    if indices.dim() != 2 or indices.shape[0] != q.shape[0]:
-        return "indices must be [M, W]"
-    if indices.dtype != torch.int32:
-        return f"indices must be int32, got {indices.dtype}"
-    if page_table.dim() != 2 or page_table.dtype != torch.int32:
-        return (
-            f"page_table must be int32 [n_req, n_pages], got {tuple(page_table.shape)}"
-        )
-    block_n, block_threads, n_splits = _launch_config(
-        int(q.shape[0]), int(indices.shape[1]), n_kv_heads, head_dim
-    )
-    return _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)
-
-
-def _take_k2_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
-    """Return the caller pair, or raise if it cannot hold this split."""
-    if not isinstance(workspace, tuple) or len(workspace) != 2:
-        raise ValueError("workspace must be (partial_out, partial_lse)")
-    partial_out, partial_lse = workspace
-    out_shape = (n_splits, rows, n_q_heads, head_dim)
-    lse_shape = (n_splits, rows, n_q_heads)
-    if (
-        not isinstance(partial_out, torch.Tensor)
-        or partial_out.dtype != torch.float32
-        or tuple(partial_out.shape) != out_shape
-        or not partial_out.is_contiguous()
-        or partial_out.device != device
-    ):
-        raise ValueError(
-            f"partial_out must be contiguous float32 {out_shape} on {device}"
-        )
-    if (
-        not isinstance(partial_lse, torch.Tensor)
-        or partial_lse.dtype != torch.float32
-        or tuple(partial_lse.shape) != lse_shape
-        or not partial_lse.is_contiguous()
-        or partial_lse.device != device
-    ):
-        raise ValueError(
-            f"partial_lse must be contiguous float32 {lse_shape} on {device}"
-        )
-    return partial_out, partial_lse
-
-
-def qsa_k2(
-    q: torch.Tensor,
-    k_cache: torch.Tensor,
-    v_cache: torch.Tensor,
-    indices: torch.Tensor,
-    page_table: torch.Tensor,
-    token_to_req: torch.Tensor,
-    out: torch.Tensor | None = None,
-    softmax_scale: float | None = None,
-    workspace: tuple[torch.Tensor, torch.Tensor] | None = None,
-) -> torch.Tensor:
-    """Write sparse GQA ``o [M, Hq, D]`` from paged K/V.
-
-    ``workspace`` is ``(partial_out, partial_lse)`` for a split launch.
-    ``None`` allocates that pair. A one-split launch writes ``out``
-    directly and does not read ``workspace``.
-    """
-    reason = qsa_k2_serves(q, k_cache, v_cache, indices, page_table)
-    if reason is not None:
-        raise ValueError(f"[FlyDSL qsa_k2] {reason}")
-    rows = q.shape[0]
-    n_q_heads = int(q.shape[1])
-    head_dim = int(q.shape[2])
-    n_kv_heads = int(k_cache.shape[2])
-    if token_to_req.shape != (rows,) or token_to_req.dtype != torch.int32:
-        raise ValueError(f"token_to_req must be int32 [{rows}]")
-    if out is None:
-        # The plan cache keeps the first compile, and that compile bakes
-        # the output stride. empty_like would copy a non-contiguous q.
-        out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
-    elif out.shape != q.shape or out.dtype != q.dtype:
-        raise ValueError(f"out must match q, got {tuple(out.shape)} {out.dtype}")
-    elif not out.is_contiguous():
-        raise ValueError("out must be contiguous")
-    tensors = (q, k_cache, v_cache, indices, page_table, token_to_req, out)
-    if any(not tensor.is_cuda for tensor in tensors):
-        raise ValueError("every tensor must be on the GPU")
-    if any(tensor.device != q.device for tensor in tensors[1:]):
-        raise ValueError("every tensor must be on the same GPU")
-    arch = qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
-    if softmax_scale is None:
-        softmax_scale = head_dim**-0.5
-    if not rows or not indices.shape[1]:
-        return out.zero_()
-    # Nothing to gather. Clamping the index to 0 would still load, including
-    # a table that has columns but no request row for safe_req.
-    if k_cache.shape[0] == 0 or page_table.shape[0] == 0 or page_table.shape[1] == 0:
-        return out.zero_()
-
-    q = q.contiguous()
-    indices = indices.contiguous()
-    page_table = page_table.contiguous()
-    token_to_req = token_to_req.contiguous()
-    # Unsigned 32-bit V# span. Exactly 4 GiB still fits: the last byte
-    # offset is 2^32 - 1. Python ints do not wrap. A strided view spans
-    # more than its numel.
-    wide_cache = span_bytes(k_cache) > (1 << 32)
-    kv_strides = tuple(int(s) for s in k_cache.stride()[:3]) if wide_cache else None
-    page_size = k_cache.shape[1]
-    use_k32 = arch == "gfx950"
-    n_sel = int(indices.shape[1])
-    block_n, block_threads, n_splits = _launch_config(rows, n_sel, n_kv_heads, head_dim)
-    if n_splits == 1:
-        # The split kernel stores straight into out. A caller workspace
-        # is not a second buffer on this path.
-        partial_out = out
-        partial_lse = out
-    elif workspace is None:
-        partial_out = torch.empty(
-            (n_splits, rows, n_q_heads, head_dim), dtype=torch.float32, device=q.device
-        )
-        partial_lse = torch.empty(
-            (n_splits, rows, n_q_heads), dtype=torch.float32, device=q.device
-        )
-    else:
-        partial_out, partial_lse = _take_k2_workspace(
-            workspace, n_splits, rows, n_q_heads, head_dim, q.device
-        )
-
-    _run_compiled(
-        _plan(
-            n_q_heads,
-            n_kv_heads,
-            head_dim,
-            page_size,
-            use_k32,
-            block_n,
-            block_threads,
-            n_splits,
-            wide_cache,
-            kv_strides,
-        ),
-        q,
-        k_cache,
-        v_cache,
-        indices,
-        page_table,
-        token_to_req,
-        partial_out,
-        partial_lse,
-        out,
-        n_sel,
-        int(page_table.shape[0]),
-        int(page_table.shape[1]),
-        int(k_cache.shape[0]),
-        float(softmax_scale * LOG2E),
-        int(rows),
-        int(n_kv_heads),
-        int(n_q_heads),
-        torch.cuda.current_stream(q.device),
-    )
-    return out

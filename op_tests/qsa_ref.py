@@ -1,10 +1,22 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""fp32 QSA oracle: block-causal ReLU-sum -> top-k -> expand+tail -> sparse GQA.
+"""fp32 QSA reference and the paged-cache fixtures the tests build from it.
 
-Authoritative math: Qwen3.8-Next tech report §2.1 (QSA). This path *may*
-materialize ``[M, n_blocks]`` scores; FlyDSL K1 must not.
+The kernels do not import this module. Concrete Flash-Next and Gluon-parity numbers
+live in ``op_tests/qsa_shapes.py``.
+
+Authoritative math: Qwen3.8-Next tech report §2.1 (QSA). The oracle may
+materialize ``[M, n_blocks]`` scores. FlyDSL K1 does the same on every
+path except short-row emit: a private fp32 ``[M, n_columns]`` buffer,
+then top-512 block ids, and the scores are dropped. ``n_columns`` is
+the page-table capacity (``page_table.shape[1] * page_size``), so a
+padded ``max_model_len`` table pays full width. At compress ratio 4
+that buffer is 1 GiB for 128k tokens at M=8192 and 8 GiB for 1M tokens
+at the same M. The allocation is capacity-sized. Score traffic is
+live-bounded: both scorers skip tiles past the visible prefix. Fusing
+that buffer waits on 128k and 1M measurements. A caller may pass the
+buffer in; it is not a returned intermediate.
 
 Tie-break (locked to the live AMD HIP selector ``top_k_per_row_decode``): among
 equal finite scores, keep the **smaller block index**. Invalid / incomplete
@@ -15,6 +27,10 @@ blocks are ``-inf`` and never win. Selected ids are written in that sort order
 Expand+tail matches vLLM ``_expand_qsa_indices_kernel`` (PR 53896 / vLLM main):
 complete blocks expand to ``r`` tokens; the open group contributes at most
 ``r-1`` tail tokens after the expanded prefix; padding is ``-1``.
+
+Packed caches match live AMD ``qwen4_exp``: ``cache [n_pages, page_size, H, D]``
+and ``block_table [n_req, n_pages]``. Indexer K is one compressed block per
+logical slot; GQA K/V use uncompressed tokens.
 """
 
 from __future__ import annotations
@@ -24,7 +40,44 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from .shapes import QsaGqaSpec, QsaIndexerSpec
+
+@dataclass(frozen=True)
+class QsaIndexerSpec:
+    """Paged mean-pooled indexer (ReLU-sum over heads, no per-head ``w_h``)."""
+
+    n_heads: int
+    kv_heads: int
+    head_dim: int
+    compress_ratio: int
+    block_budget: int
+    dtype: torch.dtype = torch.bfloat16
+
+    @property
+    def token_budget(self) -> int:
+        return self.block_budget * self.compress_ratio
+
+    @property
+    def index_width(self) -> int:
+        # 512 blocks * 4 tokens + incomplete tail of 0..3.
+        return self.token_budget + self.compress_ratio - 1
+
+
+@dataclass(frozen=True)
+class QsaGqaSpec:
+    """Sparse GQA over uncompressed paged K/V at the expanded token ids."""
+
+    n_heads: int
+    kv_heads: int
+    head_dim: int
+    rope_dim: int
+    dtype: torch.dtype = torch.bfloat16
+    # The oracle does not apply the sigmoid output gate. Callers may
+    # multiply ``o * sigmoid(gate)`` outside.
+    sigmoid_gate: bool = True
+
+    @property
+    def group_size(self) -> int:
+        return self.n_heads // self.kv_heads
 
 
 def qsa_visible_blocks(
@@ -260,3 +313,80 @@ def qsa_oracle(
         indices=indices,
         output=output.to(out_dtype),
     )
+
+
+def pack_paged_cache(
+    dense: torch.Tensor,
+    page_size: int,
+    permute_pages: bool = True,
+    generator: torch.Generator | None = None,
+    physical: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Pack ``dense [S, H, D]`` into ``[n_pages, page_size, H, D]`` + table.
+
+    One request. Physical pages are shuffled when ``permute_pages`` is true so
+    a gather that ignores ``block_table`` cannot pass. Pass ``physical`` to
+    reuse an existing logical->physical map (GQA K and V must share a table).
+    """
+    if dense.ndim != 3:
+        raise ValueError(f"dense cache must be [S, H, D], got {tuple(dense.shape)}")
+    if page_size <= 0:
+        raise ValueError("page_size must be positive")
+    n_logical, n_heads, head_dim = dense.shape
+    n_pages = (n_logical + page_size - 1) // page_size
+    pad = n_pages * page_size - n_logical
+    if pad:
+        dense = torch.nn.functional.pad(dense, (0, 0, 0, 0, 0, pad))
+    packed = dense.view(n_pages, page_size, n_heads, head_dim).contiguous()
+    if n_pages == 0:
+        table = torch.empty(1, 0, dtype=torch.int32, device=dense.device)
+        return packed, table
+    if physical is None:
+        if permute_pages and n_pages > 1:
+            physical = torch.randperm(
+                n_pages, device=dense.device, generator=generator
+            ).to(torch.int32)
+        else:
+            physical = torch.arange(n_pages, dtype=torch.int32, device=dense.device)
+    elif physical.numel() != n_pages:
+        raise ValueError(f"physical map length {physical.numel()} != n_pages {n_pages}")
+    cache = packed.new_empty(packed.shape)
+    cache[physical.to(torch.int64)] = packed
+    table = physical.reshape(1, n_pages).contiguous()
+    return cache, table
+
+
+def gather_paged_cache(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    n_logical: int,
+    req: int = 0,
+) -> torch.Tensor:
+    """Gather ``n_logical`` rows back to dense ``[S, H, D]`` using the table."""
+    if cache.ndim != 4:
+        raise ValueError(
+            f"paged cache must be [n_pages, page_size, H, D], got {tuple(cache.shape)}"
+        )
+    page_size = cache.shape[1]
+    device = cache.device
+    logical = torch.arange(n_logical, device=device)
+    logical_page = logical // page_size
+    offset = logical % page_size
+    physical = block_table[req].index_select(0, logical_page).to(torch.int64)
+    return cache[physical, offset]
+
+
+def gather_qsa_caches(
+    index_cache: torch.Tensor,
+    index_table: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    kv_table: torch.Tensor,
+    n_blocks: int,
+    seq_len: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Unpack paged indexer K and GQA K/V to dense tensors for the oracle."""
+    k_bar = gather_paged_cache(index_cache, index_table, n_blocks)[:, 0, :]
+    k = gather_paged_cache(k_cache, kv_table, seq_len)
+    v = gather_paged_cache(v_cache, kv_table, seq_len)
+    return k_bar, k, v
