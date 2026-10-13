@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from unittest import mock
 
 import numpy as np
 import pandas as pd
@@ -443,14 +444,6 @@ def test_top_k_per_row_decode(
     return ret
 
 
-# A context-sized decode buffer that each call only partly fills, which is what
-# `max_row_len` is for. Every carried card's adaptive bands take these shapes;
-# test_decode_bound_gate() fails if a re-fitted table stops taking them.
-_BOUNDED_BATCH = (4, 16)
-_BOUNDED_CONTEXT = 131072
-_BOUNDED_KS = (512, 1024, 2048)
-
-
 def create_planted_logits(seq_lens: torch.Tensor, width: int, top_k: int):
     """Distinct logits whose top k sit at known positions inside each row's live
     length, with padding that outranks all of them, so a read past a row's end
@@ -686,30 +679,56 @@ def adaptive_band_cells(card):
                 yield min_rows, min_width, ks[i % len(ks)], stable
 
 
+def adaptive_ragged_cells(card):
+    """Per k group, a batch of 4 and of 16 rows at the bound of a band that takes
+    it, so ragged rows sit at different starts in one launch."""
+    for stable, per_group in topk._ADAPTIVE_BANDS_BY_K_GROUP[card].items():
+        for ks, bands in per_group.items():
+            for i, batch in enumerate((4, 16)):
+                band = next(b for b in bands if b[2] <= batch <= b[3])
+                yield batch, band[0], ks[i % len(ks)], stable
+
+
 def test_decode_bound_gate():
-    """Host-side rules of the decode gate, checked for every card the adaptive
-    table carries; no kernel runs."""
+    """Host-side rules of the decode gate: the band matcher on a synthetic table,
+    then every carried card's bands at their own corners; no kernel runs."""
+    synthetic = ((1000, 2000, 2, 4), (4096, None, 1, 8))
+    for width, rows, admitted in (
+        (1000, 2, True),
+        (2000, 4, True),
+        (999, 2, False),
+        (2001, 4, False),
+        (1500, 1, False),
+        (1500, 5, False),
+        (4096, 8, True),
+        (1 << 24, 1, True),
+        (1 << 24, 9, False),
+    ):
+        assert topk._in_bands(synthetic, width, rows) == admitted, (width, rows)
     table = topk._ADAPTIVE_BANDS_BY_K_GROUP
     for (arch, cu), per_emit in table.items():
         unmeasured = next(c for c in range(1, 1024) if (arch, c) not in table)
         for stable, per_group in per_emit.items():
-            for bands in per_group.values():
+            for ks, bands in per_group.items():
                 # Ascending and disjoint: a malformed band admits an unmeasured
                 # shape rather than failing.
                 seen_to = 0
                 for min_w, max_w, min_r, max_r in bands:
                     assert seen_to < min_w <= max_w and 0 < min_r <= max_r, bands
                     seen_to = max_w
-            for batch, k in itertools.product(_BOUNDED_BATCH, _BOUNDED_KS):
-                call = (stable, 4 * _BOUNDED_CONTEXT, batch, k, True)
-                cell = (arch, cu, *call)
-                bounded = topk._decode_backend(arch, cu, *call, _BOUNDED_CONTEXT)
-                assert bounded == topk.BACKEND_ADAPTIVE, cell
-                # A CU count the table does not carry never routes to the
-                # adaptive kernel, and `None` declines its bands and nothing else.
-                plain = topk._decode_backend(arch, unmeasured, *call, _BOUNDED_CONTEXT)
-                assert plain != topk.BACKEND_ADAPTIVE, cell
-                assert topk._decode_backend(arch, cu, *call, None) == plain, cell
+                corners = [
+                    (w, r) for b in bands for w, r in ((b[0], b[2]), (b[1], b[3]))
+                ]
+                for k, (bound, rows) in itertools.product(ks, corners):
+                    call = (stable, 4 * bound, rows, k, True)
+                    cell = (arch, cu, *call)
+                    bounded = topk._decode_backend(arch, cu, *call, bound)
+                    assert bounded == topk.BACKEND_ADAPTIVE, cell
+                    # A CU count the table does not carry never routes to the
+                    # adaptive kernel, and `None` declines its bands and nothing else.
+                    plain = topk._decode_backend(arch, unmeasured, *call, bound)
+                    assert plain != topk.BACKEND_ADAPTIVE, cell
+                    assert topk._decode_backend(arch, cu, *call, None) == plain, cell
     print(f"[decode_bound_gate] PASS: {len(table)} cards")
 
 
@@ -789,21 +808,15 @@ def test_decode_bound_entry_points(card):
         )[1],
         "flydsl_top_k_per_row_decode": flydsl_wrapper,
     }
-    run_adaptive = flydsl_decode_host._run_adaptive
-    launches = []
-
-    def record(*args, cfg_width, **kwargs):
-        launches.append(cfg_width)
-        return run_adaptive(*args, cfg_width=cfg_width, **kwargs)
-
     for name, call in entry_points.items():
-        launches.clear()
-        flydsl_decode_host._run_adaptive = record
-        try:
+        with mock.patch.object(
+            flydsl_decode_host,
+            "_run_adaptive",
+            wraps=flydsl_decode_host._run_adaptive,
+        ) as run_adaptive:
             indices = call()
-        finally:
-            flydsl_decode_host._run_adaptive = run_adaptive
         torch.cuda.synchronize()
+        launches = [c.kwargs["cfg_width"] for c in run_adaptive.call_args_list]
         assert launches == [
             context_len
         ], f"{name} launched the adaptive kernel as {launches}, not [{context_len}]"
@@ -1042,6 +1055,66 @@ def test_adaptive_ordered_early_stop(card):
     print(f"[adaptive_ordered_early_stop] PASS: cells={cells} k={top_k}")
 
 
+def test_adaptive_compact_cells(card):
+    """The compact builds no band corner reaches, stable, packed and both: stable
+    index for index the stable reference, unstable the set torch.topk picks."""
+    top_k = 2048
+    rows, width = next(
+        (m, n)
+        for m in (32, 64, 128)
+        for n in (131072, 262144)
+        if adaptive_kernel.decode_adaptive_config(m, n, top_k, cu_count=card[1])[
+            "compact"
+        ]
+    )
+    torch.manual_seed(0)
+    seq_lens = torch.randint(
+        top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
+    )
+    seq_lens[0] = width
+    live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+    row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    for data, stable, packed in (
+        ("ties", True, False),
+        ("random", False, True),
+        ("ties", True, True),
+    ):
+        if data == "ties":
+            logits = torch.randint(0, 50, (rows, width), device="cuda").float()
+        else:
+            logits = torch.randn(rows, width, device="cuda")
+        logits = torch.where(live, logits, 1e4)
+        masked = torch.where(live, logits, float("-inf"))
+        indices = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+        src, strides, packed_kw = logits, logits.stride(), {}
+        if packed:
+            flat, starts = pack_rows(logits, seq_lens)
+            src, strides = flat.as_strided((rows, flat.numel()), (0, 1)), (0, 1)
+            packed_kw = {"row_starts": starts, "plane_width": width}
+        flydsl_decode_host._decode_with_backend(
+            src,
+            1,
+            seq_lens,
+            indices,
+            rows,
+            *strides,
+            top_k,
+            stable,
+            None,
+            topk.BACKEND_ADAPTIVE,
+            width,
+            **packed_kw,
+        )
+        torch.cuda.synchronize()
+        if stable:
+            ok = torch.equal(indices.long(), stable_reference(masked, top_k))
+        else:
+            ref = masked.topk(top_k, dim=-1)[1]
+            ok = compare_topk_results(masked, indices, ref, row_starts, seq_lens, top_k)
+        assert ok, f"compact mismatch: {data} stable={stable} packed={packed}"
+    print(f"[adaptive_compact_cells] PASS: rows={rows} width={width} k={top_k}")
+
+
 def test_mb_workspace_reuse():
     """Regression for the persistent multi-block workspace + kernel self-reset.
 
@@ -1085,167 +1158,183 @@ def test_mb_workspace_reuse():
     print("[mb_workspace_reuse] PASS: 3 reused-buffer mb calls matched torch.topk")
 
 
-parser = argparse.ArgumentParser(
-    formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
-)
-parser.add_argument(
-    "-c",
-    "--context_len",
-    type=int,
-    default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
-    nargs="+",
-    help="""number of kv.
-    e.g.: -c 64""",
-)
+def build_parser():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="config input of test",
+    )
+    parser.add_argument(
+        "-c",
+        "--context_len",
+        type=int,
+        default=[8, 128, 1024, 3072, 4096, 8192, 16384, 32768, 65536, 90000, 128000],
+        nargs="+",
+        help="""number of kv.
+        e.g.: -c 64""",
+    )
 
-parser.add_argument(
-    "-k",
-    "--top_k",
-    type=int,
-    default=[512, 1024, 2048],
-    nargs="+",
-    help="""top-k elements per row. The radix backend supports any positive
-    int; the `_fast` ASM-kernel path only supports 2048 and is skipped
-    for other values.
-    e.g.: -k 512 1024 2048""",
-)
+    parser.add_argument(
+        "-k",
+        "--top_k",
+        type=int,
+        default=[512, 1024, 2048],
+        nargs="+",
+        help="""top-k elements per row. The radix backend supports any positive
+        int; the `_fast` ASM-kernel path only supports 2048 and is skipped
+        for other values.
+        e.g.: -k 512 1024 2048""",
+    )
 
-parser.add_argument(
-    "--num_prefix",
-    type=int,
-    default=[0],
-    nargs="+",
-    help="""top-k elements per row.
-    e.g.: --num_prefix 8000 16000 24000 32000 40000 48000 56000""",
-)
+    parser.add_argument(
+        "--num_prefix",
+        type=int,
+        default=[0],
+        nargs="+",
+        help="""top-k elements per row.
+        e.g.: --num_prefix 8000 16000 24000 32000 40000 48000 56000""",
+    )
 
-parser.add_argument(
-    "-b",
-    "--decode_batch_size",
-    type=int,
-    default=[4, 8, 16, 24],
-    nargs="+",
-    help="""decode_batch_size batch size.
-    e.g.: -b 4""",
-)
+    parser.add_argument(
+        "-b",
+        "--decode_batch_size",
+        type=int,
+        default=[4, 8, 16, 24],
+        nargs="+",
+        help="""decode_batch_size batch size.
+        e.g.: -b 4""",
+    )
 
-parser.add_argument(
-    "-n",
-    "--next_n",
-    type=int,
-    default=[1, 2, 3, 4],
-    nargs="+",
-    help="""next_n elements per sequence in a row.
-    e.g.: -n 4""",
-)
+    parser.add_argument(
+        "-n",
+        "--next_n",
+        type=int,
+        default=[1, 2, 3, 4],
+        nargs="+",
+        help="""next_n elements per sequence in a row.
+        e.g.: -n 4""",
+    )
 
-parser.add_argument(
-    "-d",
-    "--data_generation",
-    type=str,
-    default=["random"],
-    choices=["random", "10LSBits", "mixed"],
-    nargs="+",
-    help="""Specify method for generating logits.
-    e.g.: -d random""",
-)
+    parser.add_argument(
+        "-d",
+        "--data_generation",
+        type=str,
+        default=["random"],
+        choices=["random", "10LSBits", "mixed"],
+        nargs="+",
+        help="""Specify method for generating logits.
+        e.g.: -d random""",
+    )
 
-args = parser.parse_args()
-
-# Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
-test_mb_workspace_reuse()
-test_decode_bound_gate()
-test_decode_cu_count_mixed_node()
-
-
-# Ask each path which arches it serves rather than keeping a second copy
-# here: a copy drifts, and a test that drives a kernel production never
-# dispatches reports on something nobody runs.
-one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
-flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
-
-df = []
-for data_generation in args.data_generation:
-    for m in args.context_len:
-        for k in args.top_k:
-            for num_prefix in args.num_prefix:
-                ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
-                df.append(ret)
-                # Cover the one-block radix kernel directly, so a dispatch
-                # change cannot hide a kernel regression.
-                if not one_block_available:
-                    continue
-                for stable in (False, True):
-                    for write_values in (False, True):
-                        ret = test_top_k_per_row_prefill(
-                            m,
-                            num_prefix,
-                            k,
-                            data_generation,
-                            flydsl=True,
-                            stable=stable,
-                            write_values=write_values,
-                        )
-                        df.append(ret)
-
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
-assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
+    parser.add_argument(
+        "--sections",
+        type=str,
+        default=["prefill", "decode", "adaptive"],
+        choices=["prefill", "decode", "adaptive"],
+        nargs="+",
+        help="""Which parts to run; all of them by default.
+        e.g.: --sections adaptive""",
+    )
+    return parser
 
 
-df = []
-for data_generation in args.data_generation:
-    for m in args.decode_batch_size:
-        for ctx in args.context_len:
+def run_prefill(args):
+    # Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
+    test_mb_workspace_reuse()
+    # Ask each path which arches it serves rather than keeping a second copy
+    # here: a copy drifts, and a test that drives a kernel production never
+    # dispatches reports on something nobody runs.
+    one_block_available = get_gfx() in _FLYDSL_TOPK_ONE_BLOCK_ARCHES
+    df = []
+    for data_generation in args.data_generation:
+        for m in args.context_len:
             for k in args.top_k:
-                for n in args.next_n:
+                for num_prefix in args.num_prefix:
+                    ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
+                    df.append(ret)
+                    # Cover the one-block radix kernel directly, so a dispatch
+                    # change cannot hide a kernel regression.
+                    if not one_block_available:
+                        continue
                     for stable in (False, True):
                         for write_values in (False, True):
-                            ret = test_top_k_per_row_decode(
+                            ret = test_top_k_per_row_prefill(
                                 m,
-                                ctx,
+                                num_prefix,
                                 k,
-                                n,
                                 data_generation,
+                                flydsl=True,
                                 stable=stable,
                                 write_values=write_values,
                             )
                             df.append(ret)
-                            if flydsl_decode_available:
+
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_prefill summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"topk_per_row_prefill mismatch:\n{df_md}"
+
+
+def run_decode(args):
+    flydsl_decode_available = get_gfx() in _FLYDSL_TOPK_DECODE_GATES
+    df = []
+    for data_generation in args.data_generation:
+        for m in args.decode_batch_size:
+            for ctx in args.context_len:
+                for k in args.top_k:
+                    for n in args.next_n:
+                        for stable in (False, True):
+                            for write_values in (False, True):
                                 ret = test_top_k_per_row_decode(
                                     m,
                                     ctx,
                                     k,
                                     n,
                                     data_generation,
-                                    flydsl=True,
                                     stable=stable,
                                     write_values=write_values,
                                 )
                                 df.append(ret)
-                        # `_fast` ASM kernel hardcodes k=2048 and is not stable.
-                        if get_gfx() == "gfx942" and k == 2048 and not stable:
-                            ret = test_top_k_per_row_decode(
-                                m,
-                                ctx,
-                                k,
-                                n,
-                                data_generation,
-                                fast=True,
-                            )
-                            df.append(ret)
+                                if flydsl_decode_available:
+                                    ret = test_top_k_per_row_decode(
+                                        m,
+                                        ctx,
+                                        k,
+                                        n,
+                                        data_generation,
+                                        flydsl=True,
+                                        stable=stable,
+                                        write_values=write_values,
+                                    )
+                                    df.append(ret)
+                            # `_fast` ASM kernel hardcodes k=2048 and is not stable.
+                            if get_gfx() == "gfx942" and k == 2048 and not stable:
+                                ret = test_top_k_per_row_decode(
+                                    m,
+                                    ctx,
+                                    k,
+                                    n,
+                                    data_generation,
+                                    fast=True,
+                                )
+                                df.append(ret)
 
-df = pd.DataFrame(df)
-df_md = df.to_markdown(index=False)
-aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
-assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
+    df = pd.DataFrame(df)
+    df_md = df.to_markdown(index=False)
+    aiter.logger.info("topk_per_row_decode summary (markdown):\n%s", df_md)
+    assert df["all_close"].all(), f"topk_per_row_decode mismatch:\n{df_md}"
 
 
-device = torch.cuda.current_device()
-card = (topk._decode_arch(device), topk._decode_cu_count(device))
-if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
+def run_adaptive():
+    test_decode_bound_gate()
+    test_decode_cu_count_mixed_node()
+    device = torch.cuda.current_device()
+    card = (topk._decode_arch(device), topk._decode_cu_count(device))
+    if card not in topk._ADAPTIVE_BANDS_BY_K_GROUP:
+        aiter.logger.warning(
+            "%s at %d CU carries no adaptive decode bands; bounded decode skipped",
+            *card,
+        )
+        return
     # The table picks these shapes and k, not the command line: every band this
     # card ships runs once, at a corner small enough to allocate here.
     for name, run in (
@@ -1289,13 +1378,12 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
     torch.manual_seed(0)
     df = pd.DataFrame(
         [
-            run(batch, _BOUNDED_CONTEXT, k, stable, packed=True)
+            run(*cell, packed=True)
             for run in (
                 test_top_k_per_row_decode_bounded,
                 test_top_k_per_row_decode_bounded_graph,
             )
-            for batch, k in itertools.product(_BOUNDED_BATCH, _BOUNDED_KS)
-            for stable in (False, True)
+            for cell in adaptive_ragged_cells(card)
         ]
     )
     df_md = df.to_markdown(index=False)
@@ -1327,7 +1415,18 @@ if card in topk._ADAPTIVE_BANDS_BY_K_GROUP:
     test_adaptive_row_past_width(card)
     test_adaptive_nan_ranks_first(card)
     test_adaptive_ordered_early_stop(card)
-else:
-    aiter.logger.warning(
-        "%s at %d CU carries no adaptive decode bands; bounded decode skipped", *card
-    )
+    test_adaptive_compact_cells(card)
+
+
+def main():
+    args = build_parser().parse_args()
+    if "prefill" in args.sections:
+        run_prefill(args)
+    if "decode" in args.sections:
+        run_decode(args)
+    if "adaptive" in args.sections:
+        run_adaptive()
+
+
+if __name__ == "__main__":
+    main()

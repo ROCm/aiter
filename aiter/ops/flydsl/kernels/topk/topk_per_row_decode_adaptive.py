@@ -266,9 +266,7 @@ def decode_compact_uses_buffer(rows: int, seq: int) -> bool:
     return seq >= floor
 
 
-def decode_compact_compacts(
-    rows: int, seq: int, parts: int, short_max: int, ordered: bool = True
-) -> bool:
+def decode_compact_compacts(rows: int, seq: int, parts: int, short_max: int) -> bool:
     """Whether the passes behind the first read candidates back from the buffer.
 
     `COMPACT_MIN` on the row up to 32 rows, `COMPACT_SLICE` on each part past it;
@@ -348,7 +346,7 @@ def decode_adaptive_config(
     grid = decode_adaptive_grid(rows, decode_adaptive_want(rows, seq), seq, cu_count)
     if short_max is None:
         short_max = decode_adaptive_short_max(rows)
-    compact = decode_compact_compacts(rows, seq, parts, short_max, ordered=ordered)
+    compact = decode_compact_compacts(rows, seq, parts, short_max)
     kw = {
         "blocks_per_row": grid,
         "bits_per_pass": 11,
