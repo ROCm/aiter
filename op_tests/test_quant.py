@@ -316,12 +316,22 @@ def _assert_tiled_paths_covered(g32_shapes, g128_shapes):
     assert any(
         tile_path("fp4", m, n) and (n // 256) % 2 for m, n in g32_shapes
     ), f"no fp4 group-32 tile-path case has an odd tile count per row on {cu} CUs"
+
+    def tdm_tile_path(m, n):
+        if m % 16 or n % 512:
+            return False
+
+        def pad8(v):
+            return (v + 7) // 8 * 8
+
+        tiles, bands = n // 512, m // 16
+        return tiles * bands >= 4 * cu and all(
+            tiles * bands * 8 >= launched * 7
+            for launched in (pad8(tiles) * bands, tiles * pad8(bands))
+        )
+
     assert any(
-        m % 16 == 0
-        and n % 512 == 0
-        and n >= 7168
-        and (m // 16) * (n // 512) >= (2 if n >= 12288 else 3) * 4 * cu
-        for m, n in g128_shapes
+        tdm_tile_path(m, n) for m, n in g128_shapes
     ), f"no group-128 case reaches the TDM tile path on {cu} CUs"
 
 
@@ -418,7 +428,7 @@ d_quant_e8m0 = {
     "fp4_1x128_e8m0": dtypes.fp4x2,
 }
 d_quant_special = ["fp8_mx_nonfinite"]
-# Odd M, the paired-store and TDM tile paths (N a multiple of 4096 >= 12288).
+# Odd M, the paired-store and TDM tile paths.
 E8M0_SHAPES = [
     (1, 7168),
     (100, 1536),
@@ -480,9 +490,8 @@ for key in [k for k in args.quant if k in d_quant_e8m0]:
     aiter.logger.info("%s summary (markdown):\n%s", key, df.to_markdown(index=False))
 
 if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
-    # 32x8 scale tiles: 896 at (1024, 7168) reach the fp8 tile path; fp4 needs
-    # 1024, so (4096, 1536) stays generic, (4096, 2304) has nine tiles per row
-    # band, and (16384, 1536) and (32768, 1024) cover narrow rows.
+    # Group-32 shapes on both sides of the tile-path gates, an odd fp4 tile count
+    # per row band (4096, 2304), and narrow rows.
     g32_shapes = (
         (32, 256),
         (64, 768),
@@ -496,7 +505,6 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
         (16384, 1536),
         (32768, 1024),
     )
-    # 16x512 tiles: 3584 at (4096, 7168), 3072 at (2048, 12288).
     g128_shapes = ((4096, 7168), (2048, 12288))
     _assert_tiled_paths_covered(g32_shapes, g128_shapes)
     for m, n in g32_shapes:
