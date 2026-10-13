@@ -985,8 +985,8 @@ class CustomAllreduce:
             logger.debug("FlyDSL one-shot disabled: unsupported arch %s.", arch)
             return
 
-        link = fly_policy.detect_link()
         try:
+            link = fly_policy.detect_link()
             policy = fly_policy.resolve_family_policy(
                 world_size=self.world_size, arch=arch, link=link
             )
@@ -996,7 +996,7 @@ class CustomAllreduce:
         except ValueError as e:
             logger.warning("FlyDSL one-shot disabled: %s", e)
             return
-        
+
         window = policy.window(fly_policy.AllReduceAlgorithm.OneShot, quantized=False)
         if window is None:
             logger.debug("FlyDSL one-shot disabled by the policy.")
@@ -1334,6 +1334,8 @@ class CustomAllreduce:
         if inp.device.index != self.device.index:
             return False
         nbytes = inp.numel() * inp.element_size()
+        if nbytes > fly_policy.MAX_PAYLOAD_BYTES:
+            return False
         return self._fly_window.contains(nbytes)
 
     def should_custom_ar(self, inp: torch.Tensor, prefill_support: bool = False):

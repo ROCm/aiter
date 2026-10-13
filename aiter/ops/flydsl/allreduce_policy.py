@@ -35,6 +35,7 @@ On the payload axis, a policy reads::
 ``resolve_family_policy`` gives the policy for a given rank: the table row for the
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
 overrides applied.
+
 Level 2: which configuration
 ============================
 
@@ -55,6 +56,7 @@ import os
 from .kernels.comm.allreduce_shared import (
     BLOCK,
     LINKS,
+    MAX_PAYLOAD_BYTES,  # noqa: F401  -- re-exported for the dispatchers
     SUPPORTED_ARCHS,  # noqa: F401  -- re-exported for the dispatchers
     SUPPORTED_WORLDS,
     AllReduceAlgorithm,
@@ -459,16 +461,15 @@ def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
         )
         for alg, infix in _WINDOW_ENV.items()
     }
-    one_lo, one_hi = bounds[AllReduceAlgorithm.OneShot]
     return dataclasses.replace(
         policy,
-        oneshot=_override(policy.oneshot, one_lo, one_hi),
+        oneshot=_override(policy.oneshot, *bounds[AllReduceAlgorithm.OneShot]),
         mesh=_override(policy.mesh, *bounds[AllReduceAlgorithm.TwoShotMesh]),
         ring=_override(policy.ring, *bounds[AllReduceAlgorithm.TwoShotRing]),
-        exact_oneshot=(
-            None
-            if policy.exact_oneshot is None
-            else _override(policy.exact_oneshot, one_lo, one_hi)
+        exact_oneshot=_override(
+            policy.exact_oneshot,
+            _env_bound("AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES", is_max=False),
+            _env_bound("AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES", is_max=True),
         ),
     )
 
@@ -493,6 +494,10 @@ def detect_arch() -> str | None:
         return None
 
 
+# The environment variable that sets the interconnect type.
+LINK_ENV = "AITER_FLY_AR_LINK"
+
+
 def resolve_link(link: str | None) -> str:
     """*link*, or this host's when it is None. Raises on an unknown link."""
     if link is None:
@@ -503,16 +508,38 @@ def resolve_link(link: str | None) -> str:
 
 
 @functools.lru_cache(maxsize=1)
+def _probe_link() -> str | None:
+    from .allreduce_shared import probe_xgmi_peer_links
+
+    peer_link_type = probe_xgmi_peer_links()
+    return None if peer_link_type is None else "xgmi" if peer_link_type else "pcie"
+
+
 def detect_link() -> str:
-    """``"xgmi"`` or ``"pcie"`` for this host, probed once per process.
+    """``"xgmi"`` or ``"pcie"`` for this host.
 
-    Host-wide, not per group; see ``has_xgmi_peer_links`` for the uniform-node
-    assumption that makes that safe.
+    Try first reading from the KFD topology, once per process
+    (``probe_xgmi_peer_links``). Only when that is unreadable, fall back to the
+    env variable ``AITER_FLY_AR_LINK``.
+
+    Host-wide, not per group; see ``probe_xgmi_peer_links`` for the
+    uniform-node assumption that makes that safe.
     """
+    link = _probe_link()
 
-    from .allreduce_shared import has_xgmi_peer_links
+    if link is None:
+        raw = os.environ.get(LINK_ENV, "").strip().lower()
+        if raw:
+            if raw not in LINKS:
+                raise ValueError(f"{LINK_ENV} must be one of {LINKS}, got {raw!r}")
+            return raw
 
-    return "xgmi" if has_xgmi_peer_links() else "pcie"
+    if link is None:
+        raise ValueError(
+            f"cannot tell if this host has xGMI or PCIe links: the KFD topology "
+            f"is not readable. Set {LINK_ENV} to one of {LINKS}."
+        )
+    return link
 
 
 # Level 1: resolution

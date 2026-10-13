@@ -67,6 +67,22 @@ absolute value of the partial sum increases with each hop. For this reason,
 the ring needs INT6 on the reduce-scatter lap at TP8. The all-gather lap sends
 the received bytes without a change, so it adds only one quantization.
 
+After the all-gather, every rank holds the same bits. Each rank decodes every
+chunk from the packets that the lap sends, and the owner of a chunk decodes
+its own chunk from the packet that it sent.
+
+### Accuracy limits
+
+The kernels convert the bf16 payload to fp16 and do all arithmetic in packed
+fp16, for every wire format.
+
+* A magnitude above 65504 saturates to 65504. The `fp16` wire format is not 
+  lossless for bf16 values outside the fp16 range.
+* The group scale is an E4M3 byte with a largest magnitude of 480. A group
+  with an extremum above 480 clips at about 480, and NaN and Inf become finite
+  values. The ring requantizes the partial sum at each reduce-scatter hop, so a
+  sum of several values near 300 can also clip.
+
 ## Inbox memory
 
 Each kernel writes into an IPC inbox on each peer. The `inbox_memory` argument
@@ -77,9 +93,10 @@ selects the memory type of the inbox:
 * `finegrained`: The memory is cacheable. Each publish writes the payload back
   from L2 before the flag store. On PCIe, this mode is faster than `uncached`,
   because uncached peer writes become slow when the fanout is wide.
-* `auto` (default): `uncached` on xGMI hosts, `finegrained` on PCIe hosts. At
-  TP2, `auto` selects `uncached` on PCIe also, because there is only one
-  remote peer.
+* `auto` (default): `uncached` on xGMI hosts, `finegrained` on PCIe hosts. The
+  interconnect comes from the KFD topology or from `AITER_FLY_AR_LINK` if the KFD 
+  topology cannot be read. At TP2, `auto` selects `uncached` on PCIe also, because 
+  there is only one remote peer.
 
 The cache policy for each mode is in `_INBOX_POLICY` in `allreduce_shared.py`.
 
@@ -132,6 +149,21 @@ kernels need gfx942 or gfx950, a world size of 2, 4 or 8, and the `flydsl`
 package. These limits, and the other shared constants of the kernels, are in
 the "Limits" section of `aiter/ops/flydsl/kernels/comm/allreduce_shared.py`.
 
+### Set the interconnect type
+
+| Variable | Values | Effect |
+|---|---|---|
+| `AITER_FLY_AR_LINK` | `xgmi`, `pcie`, or not set | The interconnect between the GPUs of the node. |
+
+The interconnect selects the policy row, the tuning ladders and the inbox
+memory. An MI350X (xGMI) and an MI350P (PCIe) both report `gfx950`, so the
+arch does not tell them apart.
+
+* If the variable is set, the code uses it as a backup for reading the KFD topology.
+* If it is not set, the code reads the link types from
+  `/sys/class/kfd/kfd/topology/nodes`. One xGMI link anywhere on the host makes
+  the host xGMI.
+
 ### Change the payload-size windows
 
 These variables replace the bounds of the windows in `FAMILY_POLICIES`. Each
@@ -146,6 +178,8 @@ is not.
 | `AITER_FLY_AR_MESH_MAX_BYTES` | The maximum of the mesh window. |
 | `AITER_FLY_AR_RING_MIN_BYTES` | The minimum of the ring window. |
 | `AITER_FLY_AR_RING_MAX_BYTES` | The maximum of the ring window. |
+| `AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES` | The minimum of the one-shot window without quantization. |
+| `AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES` | The maximum of the one-shot window without quantization. |
 
 * If a variable is not set, is empty, or is `-1`, the code uses the value from
   the table.
@@ -154,16 +188,26 @@ is not.
   maximum also disables it.
 * If an algorithm has no window in the table, a variable creates one. The
   other bound is then `0` for the minimum, or no upper limit for the maximum.
-* The `ONESHOT` variables also change the one-shot window without
-  quantization (`exact_oneshot`).
+* The `ONESHOT` variables change only the one-shot window with quantization.
+  The `EXACT_ONESHOT` variables change the window of the exact one-shot
+  (`exact_oneshot`), which `CustomAllreduce` serves. Where a policy has no
+  `exact_oneshot` window, the exact one-shot uses the `oneshot` window, and
+  the `ONESHOT` variables change it. To disable the one-shot in all cases,
+  set both maximums to `0`.
 * If a value is not valid, the code logs a warning and uses the value from the
   table.
-* If the windows overlap after the change, the code logs a warning and does
-  not use the FlyDSL kernels.
+* If the `oneshot`, `mesh` and `ring` windows overlap after the change, the
+  code logs a warning and does not use the FlyDSL kernels.
+* The exact one-shot window can start and end anywhere, with one limit. With
+  quantization on, the mesh and the ring take their payloads first. A payload
+  of the exact window that is outside the `oneshot` window must be in the mesh
+  or the ring window. If it is not, the code logs a warning and does not use the
+  FlyDSL kernels. The mesh and the ring windows do not have to move with it.
 
 The windows are independent. To move the boundary between the one-shot and
 the mesh, set both `AITER_FLY_AR_ONESHOT_MAX_BYTES` and
-`AITER_FLY_AR_MESH_MIN_BYTES`.
+`AITER_FLY_AR_MESH_MIN_BYTES`. To change only the payloads that the exact
+one-shot serves, set `AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES`.
 
 ### Related aiter variables
 
@@ -197,6 +241,17 @@ what a test does:
 |---|---|---|
 | `op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py` | One-shot | `cdr` and `cdr_naive`, the `CustomAllreduce` kernels with `use_new` on and off, and `rccl` |
 | `op_tests/multigpu_tests/test_flydsl_quick_allreduce_int4.py` | Mesh and ring | `hip`, the HIP `QuickAllReduce` kernel at the INT4 regime |
+
+A test fails if the arch is not supported, or if a world size that you name
+with `--tp` needs more GPUs than the node has. The default sweep skips the world
+sizes that do not fit, and fails if none of them does; name a size that fits with
+`--tp` instead.
+
+The `verify` scenario drives the engines directly with `AITER_FLY_AR=0`, but it
+also includes a production-dispatch check. That check drives payloads across the policy
+window boundaries through `CudaCommunicator.all_reduce`. It verifies that
+`_init_fly_backend` / `_init_fly_oneshot` built the slot, that dispatch routes
+the in-window payloads to FlyDSL, and that the result is correct.
 
 ```bash
 python3 op_tests/multigpu_tests/test_flydsl_one_shot_allreduce.py --scenario bench --tp 4

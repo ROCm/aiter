@@ -222,9 +222,10 @@ class QuickAllReduce:
             return
 
         rs_codec, ag_codec = _FLY_REGIMES[self.qr_quant_level]
-        link = fly_policy.detect_link()
-        # The policy is identical on every rank, so all ranks decline together.
+        # The link and the policy are identical on every rank, so all ranks
+        # decline together.
         try:
+            link = fly_policy.detect_link()
             policy = fly_policy.resolve_family_policy(
                 world_size=self.world_size, arch=arch, link=link
             )
@@ -395,7 +396,7 @@ class QuickAllReduce:
         if inp.data_ptr() % 16:
             return False
         nbytes = inp.numel() * inp.element_size()
-        if nbytes % 16:
+        if nbytes % 16 or nbytes > fly_policy.MAX_PAYLOAD_BYTES:
             return False
         alg = self._fly_policy.select(nbytes, quantized=True)
         return alg in self._fly_engines

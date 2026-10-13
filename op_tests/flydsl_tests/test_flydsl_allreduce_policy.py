@@ -112,6 +112,15 @@ def test_exact_oneshot_must_extend_into_the_quantized_windows():
     assert p.select(512, quantized=False) == ONESHOT
     assert p.select(2048, quantized=False) is None
     assert p.window(MESH, quantized=False) is None
+    # The exact window is free to end below the quantized one-shot, or to start
+    # elsewhere inside it.
+    p = _policy(
+        oneshot=Window(0, 128),
+        mesh=Window(128, None),
+        ring=None,
+        exact_oneshot=Window(0, 64),
+    )
+    assert p.select(96, quantized=False) is None
     # The extension reaches a gap that CustomAllreduce would serve with the
     # one-shot while select() says cross_device_reduce: rejected.
     with pytest.raises(ValueError, match="do not cover"):
@@ -226,17 +235,23 @@ def test_oneshot_max_bytes_is_keyed_on_the_fabric(cell):
 def test_oneshot_max_bytes_follows_the_overrides():
     """The standalone default ceiling is the one CustomAllreduce serves."""
     kw = {"world_size": 4, "link": "pcie", "arch": "gfx950"}
+    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES="65536"):
+        assert resolve_oneshot_max_bytes(**kw) == 65536 - 1
+    # A maximum of 0 disables the one-shot.
+    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES="0"):
+        assert resolve_oneshot_max_bytes(**kw) == 0
+    # The quantized one-shot variables do not move the exact window.
     with _env(
         AITER_FLY_AR_ONESHOT_MAX_BYTES="65536", AITER_FLY_AR_MESH_MIN_BYTES="65536"
     ):
-        assert resolve_oneshot_max_bytes(**kw) == 65536 - 1
-    # A maximum of 0 disables the one-shot.
-    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="0"):
-        assert resolve_oneshot_max_bytes(**kw) == 0
+        assert resolve_oneshot_max_bytes(**kw) == 1 * 1024 * 1024 - 1
     # Invalid overrides raise, as they do in the dispatchers.
     with (
-        _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(1 << 20)),
-        pytest.raises(ValueError, match="overlaps"),
+        _env(
+            AITER_FLY_AR_RING_MAX_BYTES="0",
+            AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES=str(1 << 30),
+        ),
+        pytest.raises(ValueError, match="do not cover"),
     ):
         resolve_oneshot_max_bytes(**kw)
 
@@ -310,8 +325,8 @@ def test_window_overrides():
     ):
         p = _resolve()
         assert p.window(ONESHOT, quantized=True) == Window(0, 65536)
-        # The ONESHOT variables set the exact-mode window too.
-        assert p.window(ONESHOT, quantized=False) == Window(0, 65536)
+        # The ONESHOT variables leave the exact-mode window alone.
+        assert p.window(ONESHOT, quantized=False) == table.exact_oneshot
         assert p.window(MESH, quantized=True) == Window(65536, table.mesh.max)
     # No upper limit, and a maximum of 0 disables the ring.
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="inf", AITER_FLY_AR_RING_MAX_BYTES="0"):
@@ -322,6 +337,70 @@ def test_window_overrides():
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="None", AITER_FLY_AR_RING_MAX_BYTES="0"):
         p = _resolve(ws=8)
         assert p.window(MESH, quantized=True).max is None
+
+
+def test_exact_oneshot_has_its_own_overrides():
+    """Moving the exact window does not need the quantized windows to move, and
+    it does not disable the mesh or the ring."""
+    table = _row("pcie", 4, "gfx950")
+    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES=str(4 << 20)):
+        p = _resolve()
+        assert p.window(ONESHOT, quantized=False) == Window(0, 4 << 20)
+        for alg in (ONESHOT, MESH, RING):
+            assert p.window(alg, quantized=True) == table.window(alg, quantized=True)
+    # A maximum of 0 turns off the exact one-shot only.
+    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES="0"):
+        p = _resolve()
+        assert p.window(ONESHOT, quantized=False) is None
+        assert p.window(MESH, quantized=True) == table.mesh
+    # Where the table has no exact window, it creates one.
+    with _env(
+        AITER_FLY_AR_ONESHOT_MAX_BYTES=str(128 << 10),
+        AITER_FLY_AR_MESH_MIN_BYTES=str(128 << 10),
+        AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES=str(256 << 10),
+    ):
+        p = _resolve("xgmi", 4)
+        assert p.window(ONESHOT, quantized=False) == Window(0, 256 << 10)
+
+
+def test_link_variable_backs_up_an_unreadable_probe():
+    # The KFD probe comes first; the variable is only the backup. When the probe
+    # is unreadable the variable decides, and is stripped, lowercased and
+    # validated against LINKS.
+    probe = "aiter.ops.flydsl.allreduce_shared.probe_xgmi_peer_links"
+    P._probe_link.cache_clear()
+    with mock.patch(probe, return_value=None):
+        with _env(AITER_FLY_AR_LINK=" PCIe "):
+            assert P.detect_link() == "pcie"
+        with _env(AITER_FLY_AR_LINK="xgmi"):
+            assert P.detect_link() == "xgmi"
+            assert P.resolve_link(None) == "xgmi"
+        with _env(AITER_FLY_AR_LINK="nvlink"), pytest.raises(ValueError, match="LINK"):
+            P.detect_link()
+    P._probe_link.cache_clear()
+
+
+def test_unreadable_topology_needs_the_link_variable():
+    env = {k: v for k, v in os.environ.items() if k != "AITER_FLY_AR_LINK"}
+    probe = "aiter.ops.flydsl.allreduce_shared.probe_xgmi_peer_links"
+    for found, expected in ((True, "xgmi"), (False, "pcie")):
+        P._probe_link.cache_clear()
+        with (
+            mock.patch.dict(os.environ, env, clear=True),
+            mock.patch(probe, return_value=found),
+        ):
+            assert P.detect_link() == expected
+    P._probe_link.cache_clear()
+    with (
+        mock.patch.dict(os.environ, env, clear=True),
+        mock.patch(probe, return_value=None),
+    ):
+        with pytest.raises(ValueError, match="AITER_FLY_AR_LINK"):
+            P.detect_link()
+        # The variable replaces the probe, so an unreadable topology is fine.
+        with _env(AITER_FLY_AR_LINK="xgmi"):
+            assert P.detect_link() == "xgmi"
+    P._probe_link.cache_clear()
 
 
 def test_override_enables_a_disabled_algorithm():

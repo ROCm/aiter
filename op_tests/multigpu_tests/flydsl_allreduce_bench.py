@@ -238,6 +238,40 @@ def speedup(base_us: float | None, us: float | None) -> float | None:
     return base_us / us
 
 
+def select_world_sizes(
+    requested, *, explicit: bool, n_gpu: int, supported
+) -> list[int]:
+    """The world sizes of *requested* that can run on *n_gpu* GPUs.
+
+    A size that cannot run is skipped with a warning when the sweep is the
+    default one (*explicit* False); when it was named on the command line
+    (*explicit* True) it is an error, because the caller asked for it. An empty
+    result is also an error, because a run with no checks must not look like a
+    pass; name a size that fits with ``--tp`` instead.
+    """
+    import logging
+
+    log = logging.getLogger("aiter")
+    tps = []
+    for tp in requested:
+        reason = None
+        if tp not in supported:
+            reason = f"world_size={tp} is not supported (one of {tuple(supported)})"
+        elif n_gpu < tp:
+            reason = f"tp={tp} needs {tp} GPUs, have {n_gpu}"
+        if reason is None:
+            tps.append(tp)
+        elif explicit:
+            raise SystemExit(reason)
+        else:
+            log.warning("%s; skipping", reason)
+    if not tps:
+        raise SystemExit(
+            f"no world size can run on {n_gpu} GPUs, so nothing was checked"
+        )
+    return tps
+
+
 def add_bench_args(parser) -> None:
     """The command-line options of the ``bench`` scenario."""
     parser.add_argument(

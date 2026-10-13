@@ -192,8 +192,9 @@ class FamilyPolicy:
     We have three families of all-reduce kernels: one-shot, mesh and ring.
     Depending on the interconnect type (PCIe or xGMI), the one-shot is best for
     smaller messages, the mesh overtakes for bigger messages, and finally the
-    ring is the choice for very large messages on PCIe. On xGMI, the ring
-    algorithm is never used. The message sizes at which the transitions take
+    ring is the choice for very large messages. The ring is in the tables of
+    gfx942/xGMI, where it starts at 128 MiB, and of PCIe at TP4 and TP8. On
+    gfx950/xGMI the ring is off. The message sizes at which the transitions take
     place depend on the architecture, the world size and the interconnect type,
     so a policy belongs to one ``(arch, link, world_size)``.
 
@@ -248,17 +249,14 @@ class FamilyPolicy:
             quant = [w for _alg, w in live if _alg != AllReduceAlgorithm.OneShot]
             if one is None or one.is_empty:
                 extra = [(exact.min, exact.max)]
-            elif one.min != exact.min or not (
-                exact.max is None or (one.max is not None and one.max <= exact.max)
-            ):
-                raise ValueError(
-                    f"{self._cell()}: exact_oneshot {exact} must start where "
-                    f"oneshot {one} starts and end at or above it"
-                )
             else:
-                extra = [(one.max, exact.max)] if one.max != exact.max else []
+                extra = []
+                if exact.min < one.min:
+                    extra.append((exact.min, one.min))
+                if exact.max is None or (one.max is not None and exact.max > one.max):
+                    extra.append((max(exact.min, one.max), exact.max))
             for lo, hi in extra:
-                if not _covered(lo, hi, quant):
+                if (hi is None or lo < hi) and not _covered(lo, hi, quant):
                     raise ValueError(
                         f"{self._cell()}: exact_oneshot {exact} adds payloads "
                         f"[{_fmt_bytes(lo)}, {_fmt_bytes(hi)}) that the mesh "
@@ -335,13 +333,15 @@ _CM_SC1 = 16
 #   acquire  The sync scope of the acquire fence after the flag spin and
 #            before the payload loads.
 #   fanout   The axis of the (peer, sector) fanout that changes fastest
-#            between consecutive quads. Refer to the layouts in the mesh kernel.
+#            between consecutive quads.
 #   recv     The ``_CM_*`` cache-modifier bits on the payload loads of the
 #            reader.
 #
-# The store keyword arguments are tuples of ``(name, value)`` pairs, not dicts.
-# The kernel factories capture them. FlyDSL adds a captured tuple to the
-# compile-cache key, but it does not add a captured dict.
+# The table is the policy of the flag-based mesh. The ring uses its own
+# ``_RECV_POLICY`` instead of ``recv``. The one-shot has no flag and no
+# acquire: it polls the payload itself for a sentinel, and so it loads every
+# payload with ``_CM_SC0 | _CM_SC1`` on both memory types, and it does not use
+# the ``acquire`` or ``recv`` entries.
 #
 # On gfx942/gfx950, the stores lower as follows:
 #

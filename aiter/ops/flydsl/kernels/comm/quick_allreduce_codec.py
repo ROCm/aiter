@@ -10,6 +10,22 @@ on the 64 B fabric sector grid. FP16 is a passthrough wire format -- the
 thread's eight fp16 values verbatim, no quantization -- used to test the
 reduce-scatter/all-gather transport in isolation from the codec.
 
+Limitations
+--------------------
+
+The kernels convert the bf16 payload to fp16 on load and back on store, for
+every codec, and all in-kernel arithmetic is packed fp16. Two limits follow.
+
+* fp16 holds at most 65504. A larger magnitude saturates to 65504 (see
+  :func:`_clamp_fp16_overflow`), and a magnitude below fp16's resolution loses
+  mantissa bits that bf16 has. The FP16 wire format is therefore not lossless
+  for bf16 data outside the fp16 range.
+* The group scale is a signed E4M3 byte, whose largest magnitude is 480
+  (``1.875 * 2**8``). A group whose extremum is above 480 reconstructs with
+  its extremum clipped to about 480. NaN and Inf are not propagated: they
+  become finite values. The ring requantizes the running partial sum at every
+  reduce-scatter hop, so a sum of several values near 300 can also clip.
+
 ``block`` is a build parameter: it sets the tile width, and through it how
 many blocks a payload gets.
 
@@ -319,6 +335,8 @@ def _pair_signed_ext_f16(atom):
 
 
 def _atom_bf16_to_f16(atom):
+    """Convert a bf16 atom to fp16. Magnitudes above 65504 saturate, and values
+    that fp16 cannot represent as finely as bf16 lose mantissa bits."""
     return fx.Vector(atom).bitcast(fx.BFloat16).to(fx.Float16).bitcast(fx.Int32)
 
 

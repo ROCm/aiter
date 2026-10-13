@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
+from .allreduce_policy import resolve_link
 from .kernels.comm.allreduce_shared import (
     MAX_PAYLOAD_BYTES,
     PAYLOAD_ALIGN_BYTES,
@@ -38,7 +39,9 @@ def _cuda_index(device, *, owner: str) -> int:
     return int(device)
 
 
-def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
+def _resolve_inbox_flags(
+    mode: str, world_size: int, link: str | None = None
+) -> tuple[int, str]:
     """(hipExtMallocWithFlags mode, resolved name) for an ``inbox_memory``.
 
     ``"auto"`` is ``uncached`` on xGMI and ``finegrained`` on PCIe, except at
@@ -54,7 +57,9 @@ def _resolve_inbox_flags(mode: str, world_size: int) -> tuple[int, str]:
         )
     if mode == "auto":
         single_peer = int(world_size) == 2
-        mode = "uncached" if single_peer or has_xgmi_peer_links() else "finegrained"
+        mode = (
+            "uncached" if single_peer or resolve_link(link) == "xgmi" else "finegrained"
+        )
     flags = {
         "uncached": UncachedIpcHeap._HIP_DEVICE_MALLOC_UNCACHED,
         "finegrained": UncachedIpcHeap._HIP_DEVICE_MALLOC_FINEGRAINED,
@@ -90,49 +95,76 @@ class _StEngine:
         self._meta_ptr = None
         self._gpu_peer_ptrs = None
         self._colors = None
+        # Setup has two collectives, the handle exchange and a final agreement.
+        # A rank that fails must still take part in both, and report the
+        # failure through them. If it raised at once, its peers would wait in a
+        # collective that it never joins, and they would hang. The error is
+        # raised on every rank after the agreement.
+        error = None
         try:
             # The inbox is the only allocation peers write into, so it is the
             # only one whose memory type matters for fabric throughput.
             self._buf_ptr = UncachedIpcHeap.alloc(
                 self.buf_bytes, inbox_flags, fill=spec.get("inbox_fill", 0)
             )
-            my_handle = UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr)
-            all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(
-                group, (my_handle, 0)
-            )
-
-            peer_ptrs = [0] * world_size
-            for r in range(world_size):
-                handle, off = all_meta[r]
-                if r == rank:
-                    peer_ptrs[r] = self._buf_ptr + off
-                else:
-                    base = int(UncachedIpcHeap.open_mem_handle(bytes(handle)))
-                    self._peer_bases[r] = base
-                    peer_ptrs[r] = base + off
-
-            peer_bytes = world_size * 8
-            color_bytes = self.grid * 4
-            # Peer-pointer table and per-block colours: written by the host once
-            # and by this rank's own kernel, never by a peer. Stays uncached in
-            # every mode -- no cross-GPU visibility question, and it is a few
-            # KiB.
-            self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
-            self._gpu_peer_ptrs = self._meta_ptr
-            self._colors = self._meta_ptr + peer_bytes
-            UncachedIpcHeap.copy_host_to_device(
-                self._gpu_peer_ptrs,
-                (ctypes.c_int64 * world_size)(*peer_ptrs),
-                peer_bytes,
-            )
-            UncachedIpcHeap.copy_host_to_device(
-                self._colors,
-                (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
-                color_bytes,
-            )
+            my_meta = (UncachedIpcHeap.get_mem_handle_bytes(self._buf_ptr), 0)
+        except Exception as e:  # noqa: BLE001
+            error = e
+            my_meta = (None, 0)
+        try:
+            all_meta = UncachedIpcHeap.gather_object_list_via_broadcast(group, my_meta)
         except Exception:
             self.close()
             raise
+
+        if error is None:
+            try:
+                if any(handle is None for handle, _off in all_meta):
+                    raise RuntimeError(
+                        "a peer rank failed to allocate its inbox, which has "
+                        f"{self.buf_bytes} B"
+                    )
+                self._open_peers(all_meta, rank=rank, world_size=world_size)
+            except Exception as e:  # noqa: BLE001
+                error = e
+
+        ok = torch.tensor([0 if error is not None else 1], dtype=torch.int32)
+        dist.all_reduce(ok, op=dist.ReduceOp.MIN, group=group)
+        if error is not None or not ok.item():
+            self.close()
+            raise error or RuntimeError("a peer rank failed to set up its engine")
+
+    def _open_peers(self, all_meta, *, rank: int, world_size: int):
+        """Open the peers' inboxes and upload the pointer table and the colours."""
+        peer_ptrs = [0] * world_size
+        for r in range(world_size):
+            handle, off = all_meta[r]
+            if r == rank:
+                peer_ptrs[r] = self._buf_ptr + off
+            else:
+                base = int(UncachedIpcHeap.open_mem_handle(bytes(handle)))
+                self._peer_bases[r] = base
+                peer_ptrs[r] = base + off
+
+        peer_bytes = world_size * 8
+        color_bytes = self.grid * 4
+        # Peer-pointer table and per-block colours: written by the host once
+        # and by this rank's own kernel, never by a peer. Stays uncached in
+        # every mode -- no cross-GPU visibility question, and it is a few
+        # KiB.
+        self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
+        self._gpu_peer_ptrs = self._meta_ptr
+        self._colors = self._meta_ptr + peer_bytes
+        UncachedIpcHeap.copy_host_to_device(
+            self._gpu_peer_ptrs,
+            (ctypes.c_int64 * world_size)(*peer_ptrs),
+            peer_bytes,
+        )
+        UncachedIpcHeap.copy_host_to_device(
+            self._colors,
+            (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
+            color_bytes,
+        )
 
     def close(self):
         for b in self._peer_bases:
@@ -250,8 +282,9 @@ _HSA_IOLINK_TYPE_XGMI = 11
 _KFD_NODES = Path("/sys/class/kfd/kfd/topology/nodes")
 
 
-def has_xgmi_peer_links() -> bool:
-    """Whether any GPU-to-GPU link on this host is xGMI rather than PCIe.
+def probe_xgmi_peer_links() -> bool | None:
+    """Whether any GPU-to-GPU link on this host is xGMI rather than PCIe, from
+    the KFD topology. None when the topology cannot be read.
 
     Arch is not enough to make this call: an MI350X (xGMI) and an MI350P
     (PCIe-only) both report ``gfx950``, and the right inbox memory type is
@@ -266,32 +299,26 @@ def has_xgmi_peer_links() -> bool:
     ``inbox_memory="auto"`` to the fine-grained heap and silently costs the
     uncached fanout the kernel was designed around.
 
-    Returns True when the topology cannot be read, which keeps the historical
-    uncached allocation on any host we cannot classify -- the failure mode of
-    guessing "PCIe" on an xGMI box is a silent perf regression on hardware
-    where the current design is already optimal.
+    The function returns None, not False, when it finds no link ``properties``
+    file at all or cannot read one.
 
     The answer is per host, not per process group: one xGMI link anywhere
     classifies every group on the node as xGMI. That assumes a node is uniformly
     xGMI or uniformly PCIe, which holds for the single-node systems this targets.
-    On a mixed host, a group of PCIe-only peers would get the xGMI policy and an
-    uncached inbox; fixing that means classifying only the links between the
-    group's own devices.
     """
     try:
+        found = False
         for subdir in ("io_links", "p2p_links"):
             for props in _KFD_NODES.glob(f"*/{subdir}/*/properties"):
+                found = True
                 for line in props.read_text().splitlines():
                     field, _, value = line.partition(" ")
                     if field == "type" and int(value) == _HSA_IOLINK_TYPE_XGMI:
                         return True
-        return False
+        return False if found else None
     except (OSError, ValueError):
-        logger.debug(
-            "FlyDSL all-reduce: cannot read KFD topology; assuming xGMI",
-            exc_info=True,
-        )
-        return True
+        logger.debug("FlyDSL all-reduce: cannot read KFD topology", exc_info=True)
+        return None
 
 
 def kernel_symbol(launch) -> str:

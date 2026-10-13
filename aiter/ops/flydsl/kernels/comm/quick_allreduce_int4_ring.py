@@ -97,15 +97,12 @@ _RECV_POLICY = _CM_SC0 | _CM_SC1
 
 
 def _load_i32_at(ptr, elem_off, cache_modifier):
-    """One i32 from the buffer pointer *ptr* at an element offset, drained
-    before it is read.
+    """One i32 from the buffer pointer *ptr* at an element offset.
 
     The ring always has the inbox pointer in hand and only the offset
     varies, so its payload reads go through the one shared descriptor.
     """
-    val = _buffer_load(ptr, elem_off, 1, fx.Int32, cache_modifier)[0]
-    rocdl.s_waitcnt(vmcnt=0)
-    return val
+    return _buffer_load(ptr, elem_off, 1, fx.Int32, cache_modifier)[0]
 
 
 def ring_steps(world_size: int) -> int:
@@ -481,20 +478,24 @@ def make_quick_allreduce_int4_ring_kernel(
             elif const_expr(k == world_size):
                 # Last reduce, and the seam: c_in is the reduce-scatter codec,
                 # c_out the all-gather one. Every rank has now contributed, so
-                # this is the final sum for our own chunk: store it from the
-                # unquantized accumulator, since it never makes another wire
-                # hop. The same value is quantized once for the all-gather's
-                # first send, and that single quantization is the whole error
-                # the gather lap contributes.
+                # this is the final sum for our own chunk. Quantize it for the
+                # all-gather's first send, and write our own output from the
+                # packet that we just built. The other ranks decode the same packet, 
+                # so every rank ends with the same bits.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):
                     words_in, word_in = _recv_raw(c_in, k - 2, sub, j)
                     acc = _codec_dequant(
                         c_in, words_in, _scale_of(c_in, word_in), tid, atoms[j]
                     )
-                    _store_chunk_atom(tile, chunk, j, acc)
                     words, word, leader = _codec_quant(c_out, acc, lane, tid)
                     _lds_write_packet(c_out, j, words, word, leader)
+                    _store_chunk_atom(
+                        tile,
+                        chunk,
+                        j,
+                        _codec_dequant(c_out, words, _scale_of(c_out, word), tid),
+                    )
             elif const_expr(k < n_ops):
                 # All-gather: the chunk is already final, so decode it for our
                 # own output and forward the bytes we received unmodified. Not

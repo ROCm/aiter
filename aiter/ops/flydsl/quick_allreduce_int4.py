@@ -145,7 +145,14 @@ def _resolve_codecs(algo, world_size, rs_codec, ag_codec):
     A codec the selected schedule cannot build raises. The per-N *default*
     silently narrows to what the schedule supports -- the mesh has no INT6
     path, so TP8's INT6 reduce-scatter default does not leak into it.
+
+    The mesh has one wire format for both laps, so there ``rs_codec`` and
+    ``ag_codec`` follow each other: give either one and the other takes the
+    same value. Giving two different values raises when the kernel is built.
     """
+    if algo.name == "mesh" and (rs_codec is None) != (ag_codec is None):
+        rs_codec = ag_codec = rs_codec if rs_codec is not None else ag_codec
+
     rs_default = "int6" if world_size >= RS_INT6_MIN_WORLD else "int4"
 
     # The all-gather lap forwards bytes verbatim and so contributes exactly one
@@ -250,7 +257,9 @@ class QuickAllReduceInt4:
             ladder = algo.st_ladder(world_size=world_size, link=link, arch=arch)
         if not ladder:
             raise ValueError("ladder must have at least one rung")
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(
+            inbox_memory, world_size, link
+        )
         self._device_index = _cuda_index(device, owner="QuickAllReduceInt4")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
@@ -329,7 +338,8 @@ class QuickAllReduceInt4:
                     )
                     if spec["lds_bytes"] > lds_capacity:
                         raise ValueError(
-                            f"{algorithm} {rs_codec} at block={b} needs "
+                            f"{algorithm} (rs_codec={rs_codec}, ag_codec={ag_codec}) "
+                            f"at block={b} needs "
                             f"{spec['lds_bytes']} B of LDS, over the "
                             f"{lds_capacity} B {arch} has"
                         )

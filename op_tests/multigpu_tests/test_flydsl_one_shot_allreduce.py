@@ -16,7 +16,8 @@ the window the policy routes to the one-shot. ``--atoms``, ``--grid-cap``,
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
 
-1. The sum is right, against an fp32 reference, at the bf16 rounding floor.
+1. The sum is right, against an fp32 reference, at the bf16 rounding floor, and
+   bit for bit against the fp32 rank-order sum that the kernel computes.
 2. The result is **bit-identical on every rank**. The kernel accumulates in a
    fixed rank order for exactly this reason, and an SQNR check cannot see an
    ordering bug -- both answers would be equally "accurate".
@@ -272,8 +273,9 @@ def _parts(m: int, hidden: int, tp: int, seed: int, device) -> list[torch.Tensor
     ]
 
 
-def _metrics(out, ref, tp: int, group) -> dict:
-    """Accuracy against fp32, then bit-identity across ranks.
+def _metrics(out, ref, tp: int, group, exact=None) -> dict:
+    """Accuracy against fp32, bit-identity across ranks, and, when *exact* is
+    given, bit-identity with it (the rank-order reference).
 
     *group* is a gloo group: the bits are gathered on the host.
     """
@@ -292,6 +294,11 @@ def _metrics(out, ref, tp: int, group) -> dict:
         "sqnr_db": _sqnr_db(ref, out),
         "lanes_differing": lanes_differing,
         "err": float(err),
+        "exact_mismatches": (
+            0
+            if exact is None
+            else int((out.view(torch.int16) != exact.view(torch.int16)).sum())
+        ),
     }
 
 
@@ -340,6 +347,7 @@ def _worst(a: dict, b: dict) -> dict:
         "sqnr_db": min(a["sqnr_db"], b["sqnr_db"]),
         "lanes_differing": max(a["lanes_differing"], b["lanes_differing"]),
         "err": max(a["err"], b["err"]),
+        "exact_mismatches": max(a["exact_mismatches"], b["exact_mismatches"]),
     }
 
 
@@ -442,17 +450,20 @@ def _run_rank(
             parts = _parts(m, hidden, tp, 1234 + m * 8191 + hidden, device)
             inp = parts[rank].contiguous()
             ref = torch.stack(parts).float().sum(0)
+            # The kernel's own order, bit for bit. Every case is a production
+            # payload, so this covers both ends of every rung.
+            exact = _rank_order_sum(parts)
             out = torch.zeros_like(inp)
             eng.allreduce(inp, out)
             torch.cuda.synchronize()
-            res = _metrics(out, ref, tp, cpu_group)
+            res = _metrics(out, ref, tp, cpu_group, exact)
 
             g = fab.capture(lambda e=eng, src=inp, dst=out: e.allreduce(src, dst))
             for _ in range(GRAPH_REPLAYS):
                 out.zero_()
                 g.replay()
                 torch.cuda.synchronize()
-                res = _worst(res, _metrics(out, ref, tp, cpu_group))
+                res = _worst(res, _metrics(out, ref, tp, cpu_group, exact))
             nbytes = inp.numel() * inp.element_size()
             res["us"] = fab.time_graphs(
                 {"flydsl": g}, cpu_group, reps=reps, rounds=rounds
@@ -599,6 +610,81 @@ def _bench_rank(
     return rows
 
 
+def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of the production-dispatch spawn.
+
+    Unlike every other spawn here, this one does not build its own engine: it
+    stands up the real production ``CustomAllreduce`` with ``AITER_FLY_AR=1``
+    and drives payloads across the one-shot's dispatch range through the
+    top-level ``CudaCommunicator.all_reduce``, so the QR-before-CAR ordering and
+    ``should_custom_ar`` gate run on the way in. ``_init_fly_oneshot`` is what
+    builds the slot; ``_fly_oneshot_range`` is the byte range dispatch actually
+    routes to it (the policy window intersected with ``AITER_CUSTOM_AR_*``).
+    """
+    import torch.distributed as dist
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    # Enable the FlyDSL dispatch, and leave quick reduce off: NONE disables
+    # qr_comm, so the custom-AR slot is reached, which is also production's
+    # default for a plain bf16 all-reduce.
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "NONE"
+    set_custom_all_reduce(True)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    cpu_group = tp_group.cpu_group
+    comm = tp_group.device_communicator
+    ca = comm.ca_comm
+    if ca is not None and ca.disabled:
+        ca = None
+    built = ca is not None and ca._fly_oneshot is not None
+
+    probes = []
+    try:
+        if built:
+            lo, hi = ca._fly_oneshot_range(ca._fly_window)
+            # Whole-row payloads at both ends of the served range, one in its
+            # middle, and one row outside each end (expected to route elsewhere).
+            served_lo = -(-lo // _ROW_BYTES) * _ROW_BYTES
+            served_hi = hi // _ROW_BYTES * _ROW_BYTES
+            sizes = set()
+            if served_lo <= served_hi:
+                mid = (served_lo + served_hi) // 2 // _ROW_BYTES * _ROW_BYTES
+                sizes.update((served_lo, mid, served_hi))
+                below = served_lo - _ROW_BYTES
+                if below > 0:
+                    sizes.add(below)
+                sizes.add(served_hi + _ROW_BYTES)
+            for nbytes in sorted(sizes):
+                m = nbytes // _ROW_BYTES
+                parts = _parts(m, ROW, tp, 4242 + nbytes, device)
+                x = parts[rank].contiguous()
+                ref = torch.stack(parts).float().sum(0)
+                out = comm.all_reduce(x)
+                torch.cuda.synchronize()
+                served = ca.should_custom_ar(x) and ca._should_fly_oneshot(
+                    x, True, False
+                )
+                probes.append(
+                    {
+                        "nbytes": nbytes,
+                        "expect_served": served_lo <= nbytes <= served_hi,
+                        "served": bool(served),
+                        "sqnr_db": _sqnr_db(ref, out.float()),
+                    }
+                )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=cpu_group)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return {"built": built, "probes": probes}
+
+
 def _spawn(target, world_size: int, **kwds) -> list:
     """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
@@ -637,6 +723,9 @@ _CASES: dict[tuple, list[tuple]] = {}
 # checked, per spawn key.
 _WINDOWS: dict[tuple, tuple[int, int]] = {}
 _RESULTS: dict[tuple, list] = {}
+# Per-rank production-dispatch results, per world size. Keyed by tp alone: the
+# dispatch spawn builds the production communicator, not a knob-pinned engine.
+_DISPATCH: dict[int, list] = {}
 _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
@@ -673,6 +762,12 @@ def _ranks(key: tuple) -> list[dict]:
             window=_WINDOWS.get(key),
         )
     return _RESULTS[key]
+
+
+def _dispatch_ranks(tp: int) -> list[dict]:
+    if tp not in _DISPATCH:
+        _DISPATCH[tp] = _spawn(_dispatch_rank, tp)
+    return _DISPATCH[tp]
 
 
 def _bench_ranks(key: tuple) -> list[list[dict]]:
@@ -720,6 +815,11 @@ def test_one_shot_allreduce(
             fails.append(
                 f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between "
                 "ranks (accumulation order is not rank-stable)"
+            )
+        if row["exact_mismatches"]:
+            fails.append(
+                f"rank {rank}: {row['exact_mismatches']} bf16 lanes differ from "
+                "the rank-order reference"
             )
     _check(f"tp={tp} {tokens}x{hidden} {engine_kw}", fails)
     nbytes = tokens * hidden * 2
@@ -873,6 +973,45 @@ def test_one_shot_allreduce_coverage(tp, window):
     }
 
 
+@benchmark()
+def test_one_shot_allreduce_dispatch(tp):
+    """Production dispatch with ``AITER_FLY_AR=1``: the custom all-reduce slot
+    builds the FlyDSL one-shot and ``CudaCommunicator.all_reduce`` routes the 
+    payloads in its dispatch range to it.
+    """
+    ranks = _dispatch_ranks(tp)
+    fails = []
+    for rank, r in enumerate(ranks):
+        if not r["built"]:
+            fails.append(
+                f"rank {rank}: the FlyDSL one-shot was not built under AITER_FLY_AR=1"
+            )
+            continue
+        if not any(p["expect_served"] for p in r["probes"]):
+            fails.append(f"rank {rank}: no payload landed in the dispatch range")
+        for p in r["probes"]:
+            if p["served"] != p["expect_served"]:
+                fails.append(
+                    f"rank {rank}: {p['nbytes']} B routed to FlyDSL={p['served']}, "
+                    f"expected {p['expect_served']}"
+                )
+            if p["expect_served"] and p["sqnr_db"] < SQNR_FLOOR_DB:
+                fails.append(
+                    f"rank {rank}: {p['nbytes']} B SQNR {p['sqnr_db']:.2f} dB below "
+                    f"the {SQNR_FLOOR_DB} dB bf16 floor"
+                )
+    _check(f"tp={tp} dispatch", fails)
+    probes0 = ranks[0]["probes"]
+    served = [p for p in probes0 if p["expect_served"]]
+    return {
+        "gfx": ARCH,
+        "built": ranks[0]["built"],
+        "served_probes": len(served),
+        "total_probes": len(probes0),
+        "min_sqnr_db": min((p["sqnr_db"] for p in served), default=float("nan")),
+    }
+
+
 def _summarize(name: str, rows: list[dict]) -> None:
     if rows:
         df = pd.DataFrame(rows).drop(columns=list(KNOBS), errors="ignore")
@@ -934,6 +1073,11 @@ def _verify(args, tps, dts, configs, given, link) -> None:
             for tp, knobs, _shapes in spawns
         ],
     )
+    if ladder and given is None:
+        _summarize(
+            "flydsl one-shot allreduce production dispatch",
+            [test_one_shot_allreduce_dispatch(tp) for tp in tps],
+        )
 
 
 def _bench(args, tps, configs, given, link) -> None:
@@ -973,9 +1117,6 @@ def _bench(args, tps, configs, given, link) -> None:
 
 
 def main():
-    if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("OneShotAllReduce unsupported on %s; skipping", ARCH)
-        return
     n_gpu = torch.cuda.device_count()
 
     parser = argparse.ArgumentParser(
@@ -994,9 +1135,10 @@ def main():
         "--tp",
         type=int,
         nargs="*",
-        default=list(SUPPORTED_WORLDS),
-        help="World sizes to sweep (2, 4, 8). Default all; sizes with fewer\n"
-        "visible GPUs are skipped.\n    e.g.: --tp 2",
+        default=None,
+        help="World sizes to sweep (2, 4, 8). Default all, skipping sizes with\n"
+        "fewer visible GPUs. A size that is named but cannot run is an error.\n"
+        "    e.g.: --tp 2",
     )
     parser.add_argument(
         "-s",
@@ -1033,19 +1175,17 @@ def main():
     fab.add_bench_args(parser)
     args = parser.parse_args()
     fab.check_bench_args(parser, args)
+    if ARCH not in SUPPORTED_ARCHS:
+        raise SystemExit(f"OneShotAllReduce is unsupported on {ARCH}")
     global _TIMING
     _TIMING = (args.reps, args.rounds)
 
-    tps = []
-    for tp in args.tp:
-        if tp not in SUPPORTED_WORLDS:
-            aiter.logger.warning("unsupported world_size=%s; skipping", tp)
-        elif n_gpu < tp:
-            aiter.logger.warning(
-                "tp=%s needs %s GPUs, have %s; skipping", tp, tp, n_gpu
-            )
-        else:
-            tps.append(tp)
+    tps = fab.select_world_sizes(
+        args.tp or list(SUPPORTED_WORLDS),
+        explicit=bool(args.tp),
+        n_gpu=n_gpu,
+        supported=SUPPORTED_WORLDS,
+    )
     dts = [d for d in args.dtype if d == dtypes.bf16]
     if len(dts) != len(args.dtype):
         aiter.logger.warning("OneShotAllReduce payload is bf16; skipping others")

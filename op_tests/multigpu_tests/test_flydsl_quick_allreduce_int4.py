@@ -36,11 +36,18 @@ transport over a matrix of pinned ``super_tile``/``block``; and
 ``test_quick_allreduce_int4_pinned_codec`` -- the ring with its wire formats
 pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 
-Every mesh row also checks that all ranks wrote bit-identical output: each
-rank decodes every chunk from the same packets, its own included -- its own
-from the packet it sent, since it never round-trips through its own inbox.
-The ring's owner stores its chunk before the all-gather quantization, so
-its ranks legitimately differ and only report the count.
+Every row also checks that all ranks wrote bit-identical output: each rank
+decodes every chunk from the same packets, its own included -- its own from the
+packet it sent, since it never round-trips through its own inbox. The ring's
+owner decodes its chunk from the packet that it quantizes for the all-gather,
+as the mesh does, so the ring holds to the same check.
+
+``test_quick_allreduce_run_ahead`` makes ``RUN_AHEAD_ITERS`` back-to-back calls
+on the shipping engine, each on a new input and into its own output, with
+no barrier between them and rank 0 deliberately late. The sweeps above wait for
+all ranks after every call, so they never reuse a colour or an inbox slot while a
+peer is still reading it. A stale or overwritten slot is the wrong answer for a
+new input, and the SQNR and cross-rank identity checks see it.
 
 **bench** times each FlyDSL schedule (``mesh``, ``ring``) against the one
 stock kernel of the INT4 regime: ``hip``, aiter's HIP quick all-reduce
@@ -66,8 +73,10 @@ floor.
 
 The kernels see a flat payload, so the derived shapes use one width, 4096,
 whose rows land exactly on every policy and ladder boundary.
-QuickAllReduceInt4 runs on gfx942/gfx950 at TP in {2, 4, 8}; other archs skip,
-and ``main()`` skips a world size when fewer GPUs are visible than TP.
+QuickAllReduceInt4 runs on gfx942/gfx950 at TP in {2, 4, 8}; ``main()`` fails on
+an unsupported arch, and on a world size that is named with ``--tp`` but has
+fewer GPUs than ranks. The default sweep skips the world sizes that do not fit,
+and fails if none does.
 """
 
 from __future__ import annotations
@@ -178,6 +187,11 @@ HIP_SQNR_FLOOR_DB = 14.0
 # carries it across one.
 HIDDEN = 4096
 _ROW_BYTES = HIDDEN * 2
+
+# Back-to-back calls of ``test_quick_allreduce_run_ahead``, and the shape of each
+# (a 4 MiB payload).
+RUN_AHEAD_ITERS = 48
+RUN_AHEAD_SHAPE = (512, HIDDEN)
 
 # Where an unbounded dispatch window is cut for its production-scale row.
 TOP_PAYLOAD_BYTES = 64 << 20
@@ -309,6 +323,7 @@ def _make_inp(
         # multiple of 1/16, magnitude <= 4 -- 7 significant bits). Paired with
         # the fp16 wire this makes the whole reduce lossless, so the result is
         # bit-identical to the fp32 reference regardless of accumulation order.
+        # For the same reason, it cannot tell one accumulation order from another.
         src = torch.randint(-8, 8, shape, generator=gen).float() * (2.0**-4)
     elif fill in ("pos_underflow", "neg_underflow", "overflow_512", "zeros"):
         val = {
@@ -703,6 +718,43 @@ def _teardown(engines, gloo) -> None:
     destroy_distributed_environment()
 
 
+def _run_ahead_part(it: int, r: int, tokens: int, hidden: int, device) -> torch.Tensor:
+    """Rank *r*'s input of call *it*. Every rank can build every other rank's,
+    so the reference needs no collective."""
+    gen = torch.Generator(device=device).manual_seed(7000 + it * 16 + r)
+    x = torch.randn(tokens, hidden, generator=gen, device=device, dtype=torch.float32)
+    return (x * 0.1).to(torch.bfloat16)
+
+
+def _run_ahead(fly, rank: int, tp: int, device, tokens: int, hidden: int, group):
+    """``RUN_AHEAD_ITERS`` back-to-back calls with a new input each, into
+    separate outputs and with no host sync or barrier between them. Rank 0 is
+    dragged now and then so that the others run ahead into the next call.
+
+    Afterwards, every output is checked against its own fp32 reference, and
+    against the other ranks' outputs.
+    """
+    drag = torch.randn(2048, 2048, device=device, dtype=torch.float32)
+    outs = []
+    for it in range(RUN_AHEAD_ITERS):
+        if rank == 0 and it % 4 == 0:
+            drag = drag @ drag.T * 1e-6
+        inp = _run_ahead_part(it, rank, tokens, hidden, device)
+        out = torch.empty_like(inp)
+        fly.allreduce(inp, out)
+        outs.append(out)
+    torch.cuda.synchronize()
+    sqnr = float("inf")
+    lanes = 0
+    for it, out in enumerate(outs):
+        ref = sum(
+            _run_ahead_part(it, r, tokens, hidden, device).float() for r in range(tp)
+        )
+        sqnr = min(sqnr, _sqnr_db(out.float(), ref))
+        lanes = max(lanes, _lanes_differing(out, group))
+    return {"calls": len(outs), "sqnr_db": sqnr, "lanes_differing": lanes}
+
+
 def _run_rank(
     rank: int,
     tp: int,
@@ -738,6 +790,15 @@ def _run_rank(
     rows = []
     try:
         for ntok, hidden, fill, time_it in cases:
+            if fill == "run_ahead":
+                rows.append(
+                    {
+                        **_run_ahead(fly, rank, tp, device, ntok, hidden, group),
+                        "link": fly.link,
+                        "inbox_memory": fly.inbox_memory,
+                    }
+                )
+                continue
             inp = _make_inp(ntok, hidden, fill, rank=rank, device=device)
             ref = inp.to(torch.float32)
             dist.all_reduce(ref, group=group)
@@ -899,6 +960,82 @@ def _bench_rank(
     return rows
 
 
+def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
+    """One rank of the production-dispatch spawn.
+
+    Unlike every other spawn here, this one does not build its own engines: it
+    stands up the real production ``QuickAllReduce`` with ``AITER_FLY_AR=1`` and
+    ``AITER_QUICK_REDUCE_QUANTIZATION=INT4``, then drives payloads across each
+    schedule's dispatch window through the top-level ``CudaCommunicator.all_reduce``,
+    which tries quick reduce before custom all-reduce. ``_init_fly_backend`` builds
+    the engines; ``_should_fly`` is the gate ``quick_all_reduce`` applies to route a
+    payload to one.
+
+    Per probe it records which schedule the policy selects, whether ``_should_fly``
+    agrees, and the accuracy of the all-reduce the top-level actually returned.
+    """
+    import torch.distributed as dist
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    os.environ["AITER_FLY_AR"] = "1"
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = "INT4"
+    # No candidate here uses custom all-reduce; only the quick-reduce slot.
+    set_custom_all_reduce(False)
+    init_distributed_environment(
+        world_size=tp, rank=rank, distributed_init_method=init_method
+    )
+    ensure_model_parallel_initialized(tp, 1)
+    tp_group = get_tp_group()
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    comm = tp_group.device_communicator
+    qr = comm.qr_comm
+    built = qr is not None and qr._fly_policy is not None
+
+    probes = []
+    try:
+        if built:
+            # Whole-row payloads at both ends of every served window, plus one row
+            # below the smallest (expected to route to HIP or the fallback).
+            sizes = set()
+            lows = []
+            for alg in qr._fly_engines:
+                lo, hi = qr._fly_policy.window(alg, quantized=True).inclusive_range()
+                rlo = -(-lo // _ROW_BYTES) * _ROW_BYTES
+                rhi = hi // _ROW_BYTES * _ROW_BYTES
+                if rlo <= rhi:
+                    sizes.update((rlo, rhi))
+                    lows.append(rlo)
+            if lows:
+                below = min(lows) - _ROW_BYTES
+                if below > 0:
+                    sizes.add(below)
+            for nbytes in sorted(sizes):
+                m = nbytes // _ROW_BYTES
+                inp = _make_inp(m, HIDDEN, "normal", rank=rank, device=device)
+                ref = inp.to(torch.float32)
+                dist.all_reduce(ref, group=group)
+                out = comm.all_reduce(inp)
+                torch.cuda.synchronize()
+                alg = qr._fly_policy.select(nbytes, quantized=True)
+                probes.append(
+                    {
+                        "nbytes": nbytes,
+                        "algorithm": None if alg is None else alg.value,
+                        "expect_served": alg in qr._fly_engines,
+                        "served": bool(qr._should_fly(inp)),
+                        "sqnr_db": _sqnr_db(out.float(), ref),
+                    }
+                )
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier(group=gloo)
+        destroy_model_parallel()
+        destroy_distributed_environment()
+    return {"built": built, "probes": probes}
+
+
 def _spawn(target, world_size: int, **kwds) -> list:
     """*target* on every rank of a new spawn, with *kwds* and the rendezvous."""
     if world_size not in SUPPORTED_WORLDS:
@@ -939,6 +1076,9 @@ _CASES: dict[tuple, list[tuple]] = {}
 # checked, per spawn key.
 _WINDOWS: dict[tuple, tuple[int, int]] = {}
 _RESULTS: dict[tuple, dict[tuple, list[dict]]] = {}
+# Per-rank production-dispatch results, per world size. Keyed by tp alone: the
+# dispatch spawn builds the production communicator, not a knob-pinned engine.
+_DISPATCH: dict[int, list] = {}
 _FAILURES: list[str] = []
 # ``(reps, rounds)`` for every timed graph; set by ``main()``.
 _TIMING = (fab.DEFAULT_REPS, fab.DEFAULT_ROUNDS)
@@ -983,6 +1123,12 @@ def _result(key: tuple, case: tuple) -> list[dict]:
     return _RESULTS[key][case]
 
 
+def _dispatch_ranks(tp: int) -> list[dict]:
+    if tp not in _DISPATCH:
+        _DISPATCH[tp] = _spawn(_dispatch_rank, tp)
+    return _DISPATCH[tp]
+
+
 def _check(label: str, fails: list[str]) -> bool:
     if fails:
         msg = f"{label}: " + "; ".join(fails)
@@ -992,9 +1138,7 @@ def _check(label: str, fails: list[str]) -> bool:
 
 
 def _identity_fails(rows: list[dict], algorithm: str) -> list[str]:
-    """Cross-rank bit-identity, asserted for the mesh onlr."""
-    if algorithm != "mesh":
-        return []
+    """Cross-rank bit-identity, asserted for both schedules."""
     return [
         f"rank {rank}: {row['lanes_differing']} bf16 lanes differ between ranks"
         for rank, row in enumerate(rows)
@@ -1245,10 +1389,13 @@ def test_quick_allreduce_int4_pinned_codec(tokens, hidden, tp, rs_codec, ag_code
 def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, block):
     """fp16 wire, exact-grid input: bit-identical to the fp32 reference.
 
-    Exercises chunk/slot addressing, the flag protocol, the super-tile loop and
-    the accumulate order with the codec taken out of the picture. With
-    super_tile None the engine walks its ladder, and the ``*_used`` columns
-    name the geometry that ran; pinned, there is no selection to check.
+    Exercises chunk/slot addressing, the flag protocol and the super-tile loop
+    with the codec taken out of the picture. It does not check the accumulate
+    order: on the 1/16 grid every partial sum is exact, so any order gives the
+    same bits. The one-shot test checks its order against ``_rank_order_sum``,
+    and the codec tests cover the arithmetic. With super_tile None the engine
+    walks its ladder, and the ``*_used`` columns name the geometry that ran;
+    pinned, there is no selection to check.
     """
     rows = _result(
         _transport_key(tp, algorithm, super_tile, block),
@@ -1271,6 +1418,27 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, bl
         "block_used": rows[0]["block_used"],
         "n_mismatch": max(r["n_mismatch"] for r in rows),
         "max_abs_err": max(r["max_abs_err"] for r in rows),
+    }
+
+
+@benchmark()
+def test_quick_allreduce_run_ahead(tp, algorithm):
+    """Back-to-back calls with new inputs, under rank skew; correctness only."""
+    tokens, hidden = RUN_AHEAD_SHAPE
+    rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, "run_ahead", False))
+    fails = _identity_fails(rows, algorithm)
+    fails += [
+        f"rank {rank}: SQNR {row['sqnr_db']:.2f} dB < {SQNR_MIN_DB} over "
+        f"{row['calls']} calls"
+        for rank, row in enumerate(rows)
+        if row["sqnr_db"] < SQNR_MIN_DB
+    ]
+    _check(f"tp={tp} {algorithm} run-ahead", fails)
+    return {
+        "gfx": ARCH,
+        "calls": rows[0]["calls"],
+        "lanes_differing": max(r["lanes_differing"] for r in rows),
+        "sqnr_db": min(r["sqnr_db"] for r in rows),
     }
 
 
@@ -1300,6 +1468,45 @@ def test_quick_allreduce_int4_coverage(tp, algorithm, window):
         "gfx": ARCH,
         "production_kernels": sorted(production),
         "missing": missing,
+    }
+
+
+@benchmark()
+def test_quick_allreduce_dispatch(tp):
+    """Production dispatch with ``AITER_FLY_AR=1``: the quick-reduce slot builds the
+    FlyDSL mesh/ring engines and ``CudaCommunicator.all_reduce`` routes each payload
+    in a schedule's window to it, reducing it within the INT4 floor.
+    """
+    ranks = _dispatch_ranks(tp)
+    fails = []
+    for rank, r in enumerate(ranks):
+        if not r["built"]:
+            fails.append(
+                f"rank {rank}: the FlyDSL backend was not built under AITER_FLY_AR=1"
+            )
+            continue
+        if not any(p["expect_served"] for p in r["probes"]):
+            fails.append(f"rank {rank}: no payload landed in a dispatch window")
+        for p in r["probes"]:
+            if p["served"] != p["expect_served"]:
+                fails.append(
+                    f"rank {rank}: {p['nbytes']} B routed to FlyDSL={p['served']}, "
+                    f"expected {p['expect_served']} ({p['algorithm']})"
+                )
+            if p["expect_served"] and p["sqnr_db"] < SQNR_MIN_DB:
+                fails.append(
+                    f"rank {rank}: {p['nbytes']} B SQNR {p['sqnr_db']:.2f} dB below "
+                    f"the {SQNR_MIN_DB} dB floor"
+                )
+    _check(f"tp={tp} dispatch", fails)
+    probes0 = ranks[0]["probes"]
+    served = [p for p in probes0 if p["expect_served"]]
+    return {
+        "gfx": ARCH,
+        "built": ranks[0]["built"],
+        "served_probes": len(served),
+        "total_probes": len(probes0),
+        "min_sqnr_db": min((p["sqnr_db"] for p in served), default=float("nan")),
     }
 
 
@@ -1362,6 +1569,11 @@ def _verify(args, tps, algos, dts, link) -> None:
                 _ship_key(tp, algorithm, grid_cap, block),
                 (tokens, hidden, "normal", True),
             )
+    run_ahead = [(tp, algorithm) for tp, algorithm in plans]
+    for tp, algorithm in run_ahead:
+        _register(
+            _ship_key(tp, algorithm, None), (*RUN_AHEAD_SHAPE, "run_ahead", False)
+        )
     edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, tokens, hidden, fill in edge:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
@@ -1416,6 +1628,10 @@ def _verify(args, tps, algos, dts, link) -> None:
         _summarize("flydsl quick allreduce INT4 block", _int4_rows(knobs))
         _write_json(args.out, rows)
     _summarize(
+        "flydsl quick allreduce run-ahead",
+        [test_quick_allreduce_run_ahead(tp, algorithm) for tp, algorithm in run_ahead],
+    )
+    _summarize(
         "flydsl quick allreduce INT4 edge inputs",
         [
             test_quick_allreduce_int4_edge_inputs(tokens, hidden, tp, algorithm, fill)
@@ -1435,6 +1651,12 @@ def _verify(args, tps, algos, dts, link) -> None:
             test_quick_allreduce_transport(tokens, hidden, tp, algorithm, st, block)
             for tp, algorithm, tokens, hidden, st, block in transport
         ],
+    )
+    os.environ["AITER_QUICK_REDUCE_QUANTIZATION"] = HIP_QR_REGIME
+    aiter.qr_max_size()
+    _summarize(
+        "flydsl quick allreduce production dispatch",
+        [test_quick_allreduce_dispatch(tp) for tp in tps],
     )
 
 
@@ -1522,9 +1744,6 @@ def _write_json(path: str | None, rows: list[dict]) -> None:
 
 
 def main():
-    if ARCH not in SUPPORTED_ARCHS:
-        aiter.logger.warning("QuickAllReduceInt4 unsupported on %s; skipping", ARCH)
-        return
     n_gpu = torch.cuda.device_count()
 
     parser = argparse.ArgumentParser(
@@ -1543,9 +1762,10 @@ def main():
         "--tp",
         type=int,
         nargs="*",
-        default=list(SUPPORTED_WORLDS),
-        help="World sizes to sweep (2, 4, 8). Default all; sizes with fewer\n"
-        "visible GPUs are skipped.\n    e.g.: --tp 8",
+        default=None,
+        help="World sizes to sweep (2, 4, 8). Default all, skipping sizes with\n"
+        "fewer visible GPUs. A size that is named but cannot run is an error.\n"
+        "    e.g.: --tp 8",
     )
     parser.add_argument(
         "-a",
@@ -1601,19 +1821,17 @@ def main():
     fab.add_bench_args(parser)
     args = parser.parse_args()
     fab.check_bench_args(parser, args)
+    if ARCH not in SUPPORTED_ARCHS:
+        raise SystemExit(f"QuickAllReduceInt4 is unsupported on {ARCH}")
     global _TIMING
     _TIMING = (args.reps, args.rounds)
 
-    tps = []
-    for tp in args.tp:
-        if tp not in SUPPORTED_WORLDS:
-            aiter.logger.warning("unsupported world_size=%s; skipping", tp)
-        elif n_gpu < tp:
-            aiter.logger.warning(
-                "tp=%s needs %s GPUs, have %s; skipping", tp, tp, n_gpu
-            )
-        else:
-            tps.append(tp)
+    tps = fab.select_world_sizes(
+        args.tp or list(SUPPORTED_WORLDS),
+        explicit=bool(args.tp),
+        n_gpu=n_gpu,
+        supported=SUPPORTED_WORLDS,
+    )
     algos = args.algorithm
     dts = [d for d in args.dtype if d == dtypes.bf16]
     if len(dts) != len(args.dtype):
@@ -1651,4 +1869,4 @@ if __name__ == "__main__":
     start = perf_counter()
     main()
     end = perf_counter()
-    aiter.logger.info(f"Test execution took {end-start:.2f}s")
+    aiter.logger.info(f"Test execution took {end - start:.2f}s")

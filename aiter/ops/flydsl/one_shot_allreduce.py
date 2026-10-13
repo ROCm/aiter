@@ -95,7 +95,9 @@ class OneShotAllReduce:
             raise ValueError("ladder must have at least one rung")
         self._ladder = tuple(ladder)
 
-        inbox_flags, resolved_inbox = _resolve_inbox_flags(inbox_memory, world_size)
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(
+            inbox_memory, world_size, link
+        )
         self._device_index = _cuda_index(device, owner="OneShotAllReduce")
         self.group = group
         self.device = torch.device("cuda", self._device_index)
@@ -109,9 +111,10 @@ class OneShotAllReduce:
             else int(max_bytes)
         )
 
-        # One engine per distinct rung config, built in a fixed sorted order:
-        # each does its own IPC handle exchange, which is a collective, so ranks
-        # disagreeing on the order would deadlock.
+        # One engine per distinct rung config, built in ladder order: each does
+        # its own IPC handle exchange, which is a collective, so ranks
+        # disagreeing on the order would deadlock. The ladder is the same table
+        # on every rank, so the order is too.
         #
         # No ``clamp_grid_cap`` here, unlike the two-shot schedules: no rung
         # caps the grid above 128, which is more than an order of magnitude

@@ -521,6 +521,15 @@ def test_mesh_is_int4_at_every_world_size(world_size):
     assert _resolve("mesh", world_size) == ("int4", "int4")
 
 
+@pytest.mark.parametrize("world_size", (2, 4, 8))
+def test_mesh_has_one_wire_format_so_one_argument_sets_both(world_size):
+    """The mesh sends one wire format on both laps, so naming one of them is
+    enough. Two different values are still an error at build time."""
+    assert _resolve("mesh", world_size, rs="fp16") == ("fp16", "fp16")
+    assert _resolve("mesh", world_size, ag="fp16") == ("fp16", "fp16")
+    assert _resolve("mesh", world_size, rs="fp16", ag="fp16") == ("fp16", "fp16")
+
+
 @pytest.mark.parametrize("codec", ("int4", "int6"))
 def test_explicit_arguments_set_both_laps(codec):
     """Pinning a wire format is per-lap and explicit.
