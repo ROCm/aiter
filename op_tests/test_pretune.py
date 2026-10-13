@@ -11,6 +11,7 @@ logic only.  Run with:
 import json
 import logging
 import os
+import subprocess
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -25,13 +26,17 @@ CFG_PATH = os.path.join(REPO_DIR, "aiter", "jit", "optCompilerConfig.json")
 sys.path.insert(0, os.path.join(REPO_DIR, "aiter"))
 
 # Import through the lightweight utility package to avoid GPU/torch initialization.
+from utility import pretune
 from utility.pretune import (
     _SCRIPT_FALLBACK,
+    _SHAPE_KEYS,
     _all_tune_modules,
+    _inference_modules,
     _make_untune_csv,
     _parse_module_list,
     _resolve,
     run_pretune,
+    run_pretune_modules,
 )
 
 with open(CFG_PATH) as f:
@@ -107,16 +112,20 @@ EXPECTED = [
     ),
 ]
 
-# AITER_CONFIGS tune CSVs with expected shape key columns after _make_untune_csv.
+# AITER_CONFIGS tune CSVs paired with the untuned catalogue whose columns the
+# family's tuner indexes; _make_untune_csv must produce exactly those columns.
 # FMOE and BF16 GEMM are excluded — they have no tune module.
 TUNE_CONFIGS = [
-    ("a8w8_blockscale_tuned_gemm.csv", ["M", "N", "K"]),
-    ("a8w8_tuned_gemm.csv", ["M", "N", "K"]),
-    ("a4w4_blockscale_tuned_gemm.csv", ["M", "N", "K"]),
-    ("a8w8_bpreshuffle_tuned_gemm.csv", ["M", "N", "K"]),
-    ("a8w8_blockscale_bpreshuffle_tuned_gemm.csv", ["M", "N", "K"]),
-    ("a8w8_tuned_batched_gemm.csv", ["B", "M", "N", "K"]),
-    ("bf16_tuned_batched_gemm.csv", ["B", "M", "N", "K"]),
+    ("a8w8_blockscale_tuned_gemm.csv", "a8w8_blockscale_untuned_gemm.csv"),
+    ("a8w8_tuned_gemm.csv", "a8w8_untuned_gemm.csv"),
+    ("a4w4_blockscale_tuned_gemm.csv", "a4w4_blockscale_untuned_gemm.csv"),
+    ("a8w8_bpreshuffle_tuned_gemm.csv", "a8w8_bpreshuffle_untuned_gemm.csv"),
+    (
+        "a8w8_blockscale_bpreshuffle_tuned_gemm.csv",
+        "a8w8_blockscale_bpreshuffle_untuned_gemm.csv",
+    ),
+    ("a8w8_tuned_batched_gemm.csv", "a8w8_untuned_batched_gemm.csv"),
+    ("bf16_tuned_batched_gemm.csv", "bf16_untuned_batched_gemm.csv"),
 ]
 
 CONFIGS_DIR = os.path.join(REPO_DIR, "aiter", "configs")
@@ -201,17 +210,20 @@ def test_script_fallback_keys_in_config():
 def test_make_untune_csv():
     """_make_untune_csv retains shape keys, drops metadata columns, deduplicates."""
     print("\n=== test_make_untune_csv ===")
-    for csv_name, expected_shape_keys in TUNE_CONFIGS:
+    for csv_name, untuned_name in TUNE_CONFIGS:
         csv_path = os.path.join(CONFIGS_DIR, csv_name)
         if not os.path.exists(csv_path):
             print(f"  [SKIP] {csv_name}: file not present")
             continue
+        expected_shape_keys = list(
+            pd.read_csv(os.path.join(CONFIGS_DIR, untuned_name), nrows=0).columns
+        )
 
         orig = pd.read_csv(csv_path)
         present_keys = [k for k in expected_shape_keys if k in orig.columns]
         expected_unique = orig[present_keys].drop_duplicates().shape[0]
 
-        tmp = _make_untune_csv(csv_path, ["B", "M", "N", "K"])
+        tmp = _make_untune_csv(csv_path, _SHAPE_KEYS)
         try:
             df = pd.read_csv(tmp)
         finally:
@@ -359,15 +371,16 @@ def test_parse_pretune_modules():
 
 def _test_pretune_module_names(use_callback):
     """Both build paths must supply usable Python extension module names."""
+    config_attr = "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE"
+    inf_modules = _inference_modules(config_attr, CFG)
     for module_name in (
         "module_gemm_a8w8_blockscale_tune",
         "module_gemm_a8w8_blockscale_cktile_tune",
     ):
-        inference_name = "module_gemm_a8w8_blockscale"
-        for name_args, expected_name in (
-            ({"md_name": ""}, inference_name),
-            ({}, inference_name),
-            ({"md_name": "custom_inference_module"}, "custom_inference_module"),
+        for name_args in (
+            {"md_name": ""},
+            {},
+            {"md_name": "custom_inference_module"},
         ):
             with tempfile.TemporaryDirectory() as tmp:
                 tune_file = os.path.join(tmp, "tuned.csv")
@@ -383,7 +396,7 @@ def _test_pretune_module_names(use_callback):
                     "third_party": [],
                     **name_args,
                 }
-                original_build_args = dict(build_args)
+                original_build_args = {**build_args}
                 core = SimpleNamespace(
                     AITER_CONFIGS=SimpleNamespace(
                         AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE=tune_file
@@ -403,39 +416,43 @@ def _test_pretune_module_names(use_callback):
                         module_name, CFG, core, CSRC_DIR, REPO_DIR, build_one_module
                     )
                 assert build_args == original_build_args
+                custom_name = name_args.get("md_name") or None
+                if custom_name:
+                    expected_inf_names = [custom_name] * len(inf_modules)
+                else:
+                    expected_inf_names = list(inf_modules)
+                ops_names = [
+                    call.kwargs["ops_name"]
+                    for call in core.get_args_of_build.call_args_list
+                ]
                 if use_callback:
-                    assert core.get_args_of_build.call_count == 2
-                    assert [
-                        call.kwargs["ops_name"]
-                        for call in core.get_args_of_build.call_args_list
-                    ] == [module_name, inference_name]
+                    assert ops_names == [module_name, *inf_modules]
                     core.build_module.assert_not_called()
-                    assert build_one_module.call_count == 2
-                    expected_tune_name = name_args.get("md_name") or module_name
+                    expected_tune_name = custom_name or module_name
+                    expected_names = [expected_tune_name, *expected_inf_names]
+                    assert build_one_module.call_count == len(expected_names)
                     for build_call, expected in zip(
                         build_one_module.call_args_list,
-                        (expected_tune_name, expected_name),
+                        expected_names,
                     ):
                         assert build_call.args[0] is not build_args
                         actual = build_call.args[0]["md_name"]
-                        assert actual == expected
                         check(
                             f"{module_name} {name_args!r} callback name {expected}",
                             actual == expected,
                             f"got {actual!r}",
                         )
                 else:
-                    core.get_args_of_build.assert_called_once_with(
-                        ops_name=inference_name
-                    )
-                    core.build_module.assert_called_once()
-                    assert (
-                        core.build_module.call_args.kwargs["md_name"] == expected_name
-                    )
+                    assert ops_names == inf_modules
+                    assert core.build_module.call_count == len(inf_modules)
+                    actual_names = [
+                        call.kwargs["md_name"]
+                        for call in core.build_module.call_args_list
+                    ]
                     check(
-                        f"{module_name} {name_args!r} rebuild name",
-                        core.build_module.call_args.kwargs["md_name"] == expected_name,
-                        f"got {core.build_module.call_args.kwargs['md_name']!r}",
+                        f"{module_name} {name_args!r} rebuild names",
+                        actual_names == expected_inf_names,
+                        f"got {actual_names!r}",
                     )
 
 
@@ -447,6 +464,170 @@ def test_direct_inference_module_name():
 def test_callback_module_names():
     print("\n=== test_callback_module_names ===")
     _test_pretune_module_names(use_callback=True)
+
+
+def test_inference_modules():
+    """Every supported tune module's own inference module is rebuilt, and CK and
+    CKTile variants sharing a CSV are rebuilt together."""
+    print("\n=== test_inference_modules ===")
+    for module, _, config_attr, expect_skip in EXPECTED:
+        if expect_skip:
+            continue
+        inf = _inference_modules(config_attr, CFG)
+        own = module.removesuffix("_tune")
+        check(f"{module} rebuilds {own}", own in inf, f"got {inf}")
+        check(
+            f"{module} rebuilds no tune module",
+            not any(m.endswith("_tune") for m in inf),
+        )
+
+    for config_attr, expected in [
+        (
+            "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE",
+            {"module_gemm_a8w8_bpreshuffle", "module_gemm_a8w8_bpreshuffle_cktile"},
+        ),
+        (
+            "AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_FILE",
+            {"module_gemm_a8w8_blockscale", "module_gemm_a8w8_blockscale_cktile"},
+        ),
+    ]:
+        inf = set(_inference_modules(config_attr, CFG))
+        check(f"{config_attr} → CK and CKTile", inf == expected, f"got {inf}")
+
+
+class _FakeCore:
+    """Stands in for aiter.jit.core: records rebuilds instead of compiling."""
+
+    def __init__(self, config_attr: str, csv_path: str):
+        self.AITER_CONFIGS = SimpleNamespace(**{config_attr: csv_path})
+        setattr(self, config_attr.removesuffix("_FILE"), csv_path)
+        self.removed: list[str] = []
+        self.built: list[str] = []
+
+    def rm_module(self, name):
+        self.removed.append(name)
+
+    def clear_build(self, name):
+        pass
+
+    def get_args_of_build(self, ops_name):
+        # Like the real one for a single module: md_name is left empty.
+        return {
+            "md_name": "",
+            "srcs": ["fake.cu"],
+            "flags_extra_cc": [],
+            "flags_extra_hip": [],
+            "blob_gen_cmd": "",
+            "extra_include": [],
+            "third_party": [],
+        }
+
+    def build_module(self, md_name, **kwargs):
+        self.built.append(md_name)
+
+
+def _with_tuner_exit(returncode: int, fn):
+    """Run fn() with every tuner subprocess reporting returncode."""
+    real_run = pretune.subprocess.run
+    pretune.subprocess.run = lambda cmd, **kw: subprocess.CompletedProcess(
+        cmd, returncode
+    )
+    try:
+        return fn()
+    finally:
+        pretune.subprocess.run = real_run
+
+
+def _shape_csv() -> str:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+        pd.DataFrame({"M": [128], "N": [512], "K": [1024]}).to_csv(f.name, index=False)
+        return f.name
+
+
+def test_run_pretune_tuner_failure():
+    """A failing tuner raises and leaves every inference module untouched."""
+    print("\n=== test_run_pretune_tuner_failure ===")
+    module = "module_gemm_a8w8_bpreshuffle_cktile_tune"
+    attr = "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE"
+    csv_path = _shape_csv()
+    core = _FakeCore(attr, csv_path)
+    try:
+        raised = False
+        try:
+            _with_tuner_exit(
+                1, lambda: run_pretune(module, CFG, core, CSRC_DIR, REPO_DIR)
+            )
+        except RuntimeError:
+            raised = True
+        check("tuner exit 1 raises RuntimeError", raised)
+        check("no inference module removed", core.removed == [], f"got {core.removed}")
+        check("no inference module built", core.built == [], f"got {core.built}")
+    finally:
+        os.unlink(csv_path)
+
+
+def test_run_pretune_rebuilds_cktile():
+    """A successful CKTile pretune rebuilds the CKTile module, not only its CK parent."""
+    print("\n=== test_run_pretune_rebuilds_cktile ===")
+    module = "module_gemm_a8w8_bpreshuffle_cktile_tune"
+    attr = "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE"
+    csv_path = _shape_csv()
+    core = _FakeCore(attr, csv_path)
+    try:
+        _with_tuner_exit(0, lambda: run_pretune(module, CFG, core, CSRC_DIR, REPO_DIR))
+        expected = {
+            "module_gemm_a8w8_bpreshuffle",
+            "module_gemm_a8w8_bpreshuffle_cktile",
+        }
+        check(
+            "removed CK and CKTile",
+            set(core.removed) == expected,
+            f"got {core.removed}",
+        )
+        check(
+            "built CK and CKTile under their own names",
+            sorted(core.built) == sorted(expected),
+            f"got {core.built}",
+        )
+    finally:
+        os.unlink(csv_path)
+
+
+def test_run_pretune_modules_reports_failures():
+    """run_pretune_modules tries every module, then raises naming the failures."""
+    print("\n=== test_run_pretune_modules_reports_failures ===")
+    attr = "AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE"
+    csv_path = _shape_csv()
+    core = _FakeCore(attr, csv_path)
+    built: list[str] = []
+    try:
+        message = ""
+        try:
+            _with_tuner_exit(
+                1,
+                lambda: run_pretune_modules(
+                    "module_gemm_a8w8_bpreshuffle_tune",
+                    CFG,
+                    core,
+                    lambda args: built.append(args["md_name"]),
+                    CSRC_DIR,
+                    REPO_DIR,
+                ),
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+        check(
+            "raises naming the failed module",
+            "module_gemm_a8w8_bpreshuffle_tune" in message,
+            f"got {message!r}",
+        )
+        check(
+            "tune module built under its own name",
+            built == ["module_gemm_a8w8_bpreshuffle_tune"],
+            f"got {built}",
+        )
+    finally:
+        os.unlink(csv_path)
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -462,6 +643,10 @@ if __name__ == "__main__":
     test_parse_pretune_modules()
     test_direct_inference_module_name()
     test_callback_module_names()
+    test_inference_modules()
+    test_run_pretune_tuner_failure()
+    test_run_pretune_rebuilds_cktile()
+    test_run_pretune_modules_reports_failures()
 
     print(f"\n{'='*50}")
     print(f"Results: {_passed} passed, {_failed} failed")
