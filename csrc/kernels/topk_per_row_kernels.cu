@@ -5219,6 +5219,14 @@ inline bool topk_oneblock_plain_gfx950_serves(int64_t len, int k, bool ranged,
            topk_oneblock_is_gfx950();
 }
 
+// The kernels below serve calls with no row range (rowStarts == rowEnds ==
+// nullptr), which only topk_plain makes; module_topk_plain defines this. The
+// other module that builds this file passes row bounds on every call, so it
+// leaves them out rather than compile half of this file for nothing.
+#ifndef TOPK_PER_ROW_PLAIN_KERNELS
+#define TOPK_PER_ROW_PLAIN_KERNELS 0
+#endif
+
 // Thin wrapper dispatching to the correct BPP at runtime.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
           Phase phase = Phase::Prefill, bool STABLE = false>
@@ -5230,8 +5238,9 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
     // Keep the normal workspace query unchanged (buf == nullptr), and isolate
     // the extra LDS allocation in a separate kernel specialization.  This
     // avoids imposing its occupancy cost on any non-target shape.
-    if constexpr(std::is_same_v<T, float> && std::is_same_v<IdxT, int> && BlockSize == 1024 &&
-                 !WRITE_TOPK_VALUES && !STABLE && phase == Phase::Prefill)
+    if constexpr(TOPK_PER_ROW_PLAIN_KERNELS && std::is_same_v<T, float> &&
+                 std::is_same_v<IdxT, int> && BlockSize == 1024 && !WRITE_TOPK_VALUES && !STABLE &&
+                 phase == Phase::Prefill)
     {
         bool const specialized = buf != nullptr && topk_oneblock_use_large_bpp() &&
                                  in_idx == nullptr && rowStarts == nullptr &&

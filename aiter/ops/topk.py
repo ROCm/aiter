@@ -622,7 +622,9 @@ def top_k_per_row_prefill(
 
 
 @compile_ops(
-    "module_top_k_per_row", fc_name="top_k_per_row_prefill_sampled", develop=True
+    "module_top_k_per_row_sampled",
+    fc_name="top_k_per_row_prefill_sampled",
+    develop=True,
 )
 def _top_k_per_row_prefill_sampled(
     logits: torch.Tensor,
@@ -640,11 +642,11 @@ def _top_k_per_row_prefill_sampled(
 ) -> None: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row_sampled")
 def topk_sampled_workspace_size(numRows: int, stride0: int, k: int) -> int: ...
 
 
-@compile_ops("module_top_k_per_row")
+@compile_ops("module_top_k_per_row_sampled")
 def topk_sampled_supports(
     numRows: int, stride0: int, k: int, device_id: int = -1
 ) -> bool: ...
