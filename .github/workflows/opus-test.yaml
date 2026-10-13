@@ -6,11 +6,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - 'LICENSE'
-      - '.gitignore'
+    paths:
+      - '**'
+      - '!.github/workflows/**'
+      - '.github/workflows/opus-test.yaml'
+      - '.github/workflows/ci-config.yaml'
+      - '!**/*.md'
+      - '!docs/**'
+      - '!LICENSE'
+      - '!.gitignore'
 
   workflow_dispatch:
   schedule:
