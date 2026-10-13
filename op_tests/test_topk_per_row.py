@@ -629,8 +629,6 @@ for data_generation in args.data_generation:
     for m in args.context_len:
         for k in args.top_k:
             for num_prefix in args.num_prefix:
-                ret = test_top_k_per_row_prefill(m, num_prefix, k, data_generation)
-                df.append(ret)
                 for backend in args.prefill_backend:
                     # Both ways round, matching the decode loop: the value
                     # stores are a separate instantiation of the output
