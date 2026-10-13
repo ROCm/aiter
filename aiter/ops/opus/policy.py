@@ -808,16 +808,21 @@ def _heuristic_mxscale_bmm_kid(
 # 8000, GROUP_K=32 9000). The first of each band is what the tuned table picks
 # there most often at K=4096; the later ones only have to run where it cannot,
 # which is why each band ends in the 32-wide, 128-deep tiles that divide any N
-# and K the family accepts at all.
-# The launch plan does not model every family's prefetch depth (only flatmm's),
-# so the launcher can still reject a candidate for too few K tiles. The deepest
-# candidate prefetches 4 (the blds tile; the direct-B ones cap at 3), so a
-# candidate needs at least that many.
-_BPRESHUFFLE_FALLBACK_MIN_K_TILES = 4
+# and K the family accepts at all, and then in the compact tiles.
+#
+# K-tile sufficiency is not screened here. Every band family is in
+# launch_plan._A8W8_MXSCALE_BMM_PREFETCH_TAGS, so the plan call below already
+# rejects a candidate whose K cannot feed that instance's own prefetch depth.
+# Screening on a blanket bound instead denied a fallback to every K below four
+# of the shallowest band tile's 128, so K=128, 256 and 384 raised even where a
+# tile ran. The compact family sits outside that tag set because it consumes a
+# single K tile, which is what leaves it as the only candidate for a K no band
+# tile can prefetch; it goes last so it only answers shapes the bands drop.
+# GROUP_K=32 has no compact twin and so keeps the band tiles' K floor.
 _BPRESHUFFLE_FALLBACK_BANDS = (
-    (64, (179, 398, 171, 338)),
-    (512, (171, 175, 338, 398)),
-    (None, (205, 348, 175, 338, 398)),
+    (64, (179, 398, 171, 338, 483, 484)),
+    (512, (171, 175, 338, 398, 483, 484)),
+    (None, (205, 348, 175, 338, 398, 484, 483)),
 )
 
 
@@ -836,8 +841,6 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
     Per-row K32 scales prefer larger tiles for sufficiently large output grids.
     Every candidate is checked for admissibility; None when no candidate runs.
     """
-    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernels_list
-
     _validate_mxscale_bmm_group_size(group_size)
     group_n = group_size if group_n is None else group_n
     block = f"{group_n}x{group_size}"
@@ -870,8 +873,6 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
             and mxscale_bmm_kid_takes_b_layout(kid, True)
             and mxscale_bmm_kid_takes_plain_scales(kid)
             and mxscale_bmm_kid_runs_m(kid, m)
-            and k // a8w8_mxscale_bmm_kernels_list[kid].B_K
-            >= _BPRESHUFFLE_FALLBACK_MIN_K_TILES
         ):
             continue
         try:
