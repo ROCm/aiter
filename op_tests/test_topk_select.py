@@ -137,7 +137,7 @@ def test_zero_rows():
     cases = [
         # (name, dtype, width, k, kwargs)
         *(
-            (f"argmax {dt} n={n}", dt, n, 1, dict(tie="low"))
+            (f"argmax {dt} n={n}", dt, n, 1, {"tie": "low"})
             for dt in (dtypes.fp32, dtypes.bf16, dtypes.fp16)
             # 2048 takes the single-pass launch, 129280 the split one.
             for n in (2048, 129280)
@@ -150,19 +150,19 @@ def test_zero_rows():
             dtypes.fp32,
             129280,
             10,
-            dict(sorted=True, tie="low", return_value=True),
+            {"sorted": True, "tie": "low", "return_value": True},
         ),
         (
             "output_idx+offset+end",
             dtypes.fp32,
             2048,
             16,
-            dict(
-                output_idx=torch.empty(0, 16, dtype=i32),
-                output_idx_offset=torch.empty(0, dtype=i32),
-                end=torch.empty(0, dtype=i32),
-                sorted_index=True,
-            ),
+            {
+                "output_idx": torch.empty(0, 16, dtype=i32),
+                "output_idx_offset": torch.empty(0, dtype=i32),
+                "end": torch.empty(0, dtype=i32),
+                "sorted_index": True,
+            },
         ),
     ]
     failures = []
