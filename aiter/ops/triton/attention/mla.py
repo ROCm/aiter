@@ -90,7 +90,9 @@ def select_3d_config(
             attn_num_warps = 4
         reduce_num_warps = 4
         attn_waves_per_eu = 1
-        reduce_waves_per_eu = 1
+        # waves_per_eu=N pads the register allocation to cap occupancy at N; the
+        # reduce is latency-bound, so leave its occupancy to the compiler.
+        reduce_waves_per_eu = 0
         if shuffled_kv_cache and kv_dtype == torch.uint8:
             assert (
                 block_size == 128
