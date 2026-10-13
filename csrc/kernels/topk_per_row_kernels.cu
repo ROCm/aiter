@@ -107,14 +107,21 @@ __device__ constexpr unsigned calc_mask(int pass)
  * Uses (bits >> 31) instead of (key < 0) to correctly handle -0.0f,
  * whose sign bit is 1 but compares equal to +0.0f under IEEE 754.
  */
-template <typename T>
+// NanHigh ranks a NaN of either sign above +inf, as topk_select and torch.topk
+// do; otherwise a NaN ranks by its sign, a negative one below -inf.
+template <bool NanHigh = false, typename T>
 __device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
     static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
     // select_min never mattered for float: the mask below is symmetric, so the
     // ordering flip is handled by the comparison direction at the call sites.
     (void)select_min;
-    auto bits     = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    auto bits = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    if constexpr(NanHigh)
+    {
+        uint32_t const magnitude = bits & 0x7fffffffu;
+        bits                     = magnitude > 0x7f800000u ? magnitude : bits;
+    }
     uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
     return bits ^ mask;
 }
@@ -122,12 +129,12 @@ __device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool 
 // Compute bucket index using v_bfe_u32 (single-instruction bit field extract).
 // `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide
 // field, making the software mask redundant. Kept for interface compatibility.
-template <typename T, int BitsPerPass>
+template <typename T, int BitsPerPass, bool NanHigh = false>
 __device__ int calc_bucket(T x, int start_bit, unsigned /*mask*/, bool select_min)
 {
     static_assert(BitsPerPass <= sizeof(int) * 8 - 1,
                   "BitsPerPass is too large that the result type could not be int");
-    unsigned bits = twiddle_in(x, select_min);
+    unsigned bits = twiddle_in<NanHigh>(x, select_min);
     return __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(start_bit), static_cast<unsigned>(BitsPerPass));
 }
 
@@ -340,7 +347,8 @@ template <typename T,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
           bool prioritize_smaller_indice = false,
-          Phase phase                    = Phase::Prefill>
+          Phase phase                    = Phase::Prefill,
+          bool NanHigh                   = false>
 __global__ void radix_kernel_persistent(T const* in,
                                            IdxT const* in_idx,
                                            T* out,
@@ -452,7 +460,7 @@ __global__ void radix_kernel_persistent(T const* in,
 
             auto f_early = [select_min, kth_value_bits, previous_start_bit,
                             in_idx_buf, out_ptr, out_idx_ptr, p_out_cnt, rowStart](T value, IdxT i) {
-                const auto previous_bits = (twiddle_in(value, select_min) >> previous_start_bit)
+                const auto previous_bits = (twiddle_in<NanHigh>(value, select_min) >> previous_start_bit)
                                            << previous_start_bit;
                 if(previous_bits <= kth_value_bits)
                 {
@@ -467,7 +475,7 @@ __global__ void radix_kernel_persistent(T const* in,
         else if(pass == 0)
         {
             auto f = [p_hist, select_min, start_bit, mask](T value, IdxT) {
-                int bucket = calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
+                int bucket = calc_bucket<T, BitsPerPass, NanHigh>(value, start_bit, mask, select_min);
                 atomicAdd(p_hist + bucket, static_cast<IdxT>(1));
             };
             vectorized_process(global_tid, total_threads, in_buf, row_len, f);
@@ -480,7 +488,7 @@ __global__ void radix_kernel_persistent(T const* in,
             // Single twiddle_in extracts both prefix and bucket.
             auto hist_vec = [p_hist, select_min, start_bit, mask,
                              kth_value_bits, previous_start_bit](T value, IdxT) {
-                auto const bits = twiddle_in(value, select_min);
+                auto const bits = twiddle_in<NanHigh>(value, select_min);
                 auto const pb = (bits >> previous_start_bit) << previous_start_bit;
                 int bucket = __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(start_bit), static_cast<unsigned>(BitsPerPass));
                 if(pb == kth_value_bits)
@@ -589,7 +597,7 @@ __global__ void radix_kernel_persistent(T const* in,
             auto process_last = [select_min, kth_value_bits, start_bit,
                                  in_idx_buf, out_ptr, out_idx_ptr,
                                  p_out_cnt, p_out_back_cnt, kth_needed, k, rowStart](T value, IdxT i) {
-                auto const bits = (twiddle_in(value, select_min) >> start_bit) << start_bit;
+                auto const bits = (twiddle_in<NanHigh>(value, select_min) >> start_bit) << start_bit;
                 if(bits < kth_value_bits)
                 {
                     IdxT pos = atomicAdd(p_out_cnt, static_cast<IdxT>(1));
@@ -664,7 +672,8 @@ template <typename T,
           int BitsPerPass,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
-          Phase phase = Phase::Prefill>
+          Phase phase  = Phase::Prefill,
+          bool NanHigh = false>
 unsigned calc_grid_dim(int batch_size, IdxT len, int sm_cnt)
 {
     static_assert(VECTORIZED_READ_SIZE / sizeof(T) >= 1);
@@ -672,7 +681,8 @@ unsigned calc_grid_dim(int batch_size, IdxT len, int sm_cnt)
     int active_blocks;
     HIP_CALL(hipOccupancyMaxActiveBlocksPerMultiprocessor(
         &active_blocks,
-        radix_kernel_persistent<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase>,
+        radix_kernel_persistent<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase,
+                                NanHigh>,
         BlockSize,
         0));
     active_blocks *= sm_cnt;
@@ -752,7 +762,8 @@ template <typename T,
           int BitsPerPass,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
-          Phase phase = Phase::Prefill>
+          Phase phase  = Phase::Prefill,
+          bool NanHigh = false>
 void standalone_stable_radix_topk_multiblock_(void* buf,
                                                  size_t& buf_size,
                                                  T const* in,
@@ -810,7 +821,7 @@ void standalone_stable_radix_topk_multiblock_(void* buf,
 
     dim3 blocks(grid_dim, batch_size);
 
-    radix_kernel_persistent<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase>
+    radix_kernel_persistent<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase, NanHigh>
         <<<blocks, BlockSize, 0, stream>>>(in, in_idx, out, out_idx,
                                             counters, histograms, static_cast<IdxT>(len),
                                             rowStarts, rowEnds, k, static_cast<IdxT>(next_n),
@@ -832,7 +843,7 @@ inline bool topk_mulblocks_use_large_bpp()
 
 // Multi-block entry point with runtime BPP dispatch (MI308X=10, MI355X=11).
 template <typename T, typename IdxT, bool WRITE_TOPK_VALUES,
-          bool sorted = false, Phase phase = Phase::Prefill>
+          bool sorted = false, Phase phase = Phase::Prefill, bool NanHigh = false>
 void standalone_stable_radix_topk(void* buf,
                                     size_t& buf_size,
                                     T const* in,
@@ -854,8 +865,10 @@ void standalone_stable_radix_topk(void* buf,
     int sm_cnt = get_num_cu_func();
     unsigned grid_dim =
         large_bpp
-            ? calc_grid_dim<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES, phase>(batch_size, len, sm_cnt)
-            : calc_grid_dim<T, IdxT, 10, block_dim, WRITE_TOPK_VALUES, phase>(batch_size, len, sm_cnt);
+            ? calc_grid_dim<T, IdxT, 11, block_dim, WRITE_TOPK_VALUES, phase, NanHigh>(batch_size, len,
+                                                                                      sm_cnt)
+            : calc_grid_dim<T, IdxT, 10, block_dim, WRITE_TOPK_VALUES, phase, NanHigh>(batch_size, len,
+                                                                                      sm_cnt);
     // TOPK_FORCE_GRID: override heuristic grid_dim for experiments.
     if(const char* fg = std::getenv("TOPK_FORCE_GRID")) {
         int v = std::atoi(fg);
@@ -873,13 +886,13 @@ void standalone_stable_radix_topk(void* buf,
 
     if (large_bpp) {
         standalone_stable_radix_topk_multiblock_<T, IdxT, 11, block_dim,
-                                                     WRITE_TOPK_VALUES, phase>(
+                                                     WRITE_TOPK_VALUES, phase, NanHigh>(
             buf, buf_size, in, static_cast<IdxT*>(nullptr),
             batch_size, len, rowStarts, rowEnds, k, out, out_idx,
             !greater, grid_dim, stream, sorted, next_n, prezeroed);
     } else {
         standalone_stable_radix_topk_multiblock_<T, IdxT, 10, block_dim,
-                                                     WRITE_TOPK_VALUES, phase>(
+                                                     WRITE_TOPK_VALUES, phase, NanHigh>(
             buf, buf_size, in, static_cast<IdxT*>(nullptr),
             batch_size, len, rowStarts, rowEnds, k, out, out_idx,
             !greater, grid_dim, stream, sorted, next_n, prezeroed);
@@ -971,14 +984,21 @@ __device__ constexpr unsigned calc_mask(int pass)
 }
 
 // Map value to order-preserving unsigned bits; uses (bits >> 31) for correct -0.0f handling.
-template <typename T>
+// NanHigh ranks a NaN of either sign above +inf, as topk_select and torch.topk
+// do; otherwise a NaN ranks by its sign, a negative one below -inf.
+template <bool NanHigh = false, typename T>
 __device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool select_min)
 {
     static_assert(std::is_same_v<T, float>, "radix top-k only supports fp32");
     // select_min never mattered for float: the mask below is symmetric, so the
     // ordering flip is handled by the comparison direction at the call sites.
     (void)select_min;
-    auto bits     = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    auto bits = reinterpret_cast<typename aiter::radix_traits<T>::UnsignedBits&>(key);
+    if constexpr(NanHigh)
+    {
+        uint32_t const magnitude = bits & 0x7fffffffu;
+        bits                     = magnitude > 0x7f800000u ? magnitude : bits;
+    }
     uint32_t mask = (bits >> 31) ? 0 : 0x7fffffff;
     return bits ^ mask;
 }
@@ -986,12 +1006,12 @@ __device__ typename aiter::radix_traits<T>::UnsignedBits twiddle_in(T key, bool 
 // Compute bucket index using v_bfe_u32.
 // `mask` is unused: __builtin_amdgcn_ubfe extracts a fixed BitsPerPass-wide
 // field, making the software mask redundant. Kept for interface compatibility.
-template <typename T, int BitsPerPass>
+template <typename T, int BitsPerPass, bool NanHigh = false>
 __device__ int calc_bucket(T x, int start_bit, unsigned /*mask*/, bool select_min)
 {
     static_assert(BitsPerPass <= sizeof(int) * 8 - 1,
                   "BitsPerPass is too large that the result type could not be int");
-    unsigned bits = twiddle_in(x, select_min);
+    unsigned bits = twiddle_in<NanHigh>(x, select_min);
     return __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(start_bit), static_cast<unsigned>(BitsPerPass));
 }
 
@@ -1449,7 +1469,8 @@ template <typename T,
           typename IdxT,
           int BitsPerPass,
           bool WRITE_TOPK_VALUES,
-          bool prioritize_smaller_indice = false>
+          bool prioritize_smaller_indice = false,
+          bool NanHigh                   = false>
 __device__ void last_filter(T const* in_buf,
                             IdxT const* in_idx_buf,
                             T* out,
@@ -1469,7 +1490,7 @@ __device__ void last_filter(T const* in_buf,
     IdxT* p_out_back_cnt         = &counter->out_back_cnt;
 
     auto process_one = [&](T value, IdxT idx) {
-        Bits const full_bits = twiddle_in(value, select_min);
+        Bits const full_bits = twiddle_in<NanHigh>(value, select_min);
         Bits const bits = use_one_pass ? full_bits & ((1 << BitsPerPass) - 1)
                                        : (full_bits >> start_bit) << start_bit;
         if(bits < kth_value_bits)
@@ -2191,7 +2212,8 @@ __device__ void set_buf_pointers(T const* in,
  * out_buf == nullptr re-scans from the original input (pass 0, or a candidate
  * set too large to stage); otherwise the survivors are compacted into out_buf.
  */
-template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES, int BlockSize>
+template <typename T, typename IdxT, int BitsPerPass, bool WRITE_TOPK_VALUES, int BlockSize,
+          bool NanHigh = false>
 __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
                                                    IdxT const* in_idx_buf,
                                                    T* out_buf,
@@ -2228,7 +2250,7 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
     if(pass == 0)
     {
         auto f = [histogram, select_min, start_bit, mask](T value, IdxT) {
-            int bucket = calc_bucket<T, BitsPerPass>(value, start_bit, mask, select_min);
+            int bucket = calc_bucket<T, BitsPerPass, NanHigh>(value, start_bit, mask, select_min);
             atomicAdd(histogram + bucket, static_cast<IdxT>(1));
         };
         vectorized_process(threadIdx.x, blockDim.x, in_buf, previous_len, f);
@@ -2243,7 +2265,7 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
 
         auto hist_vec = [histogram, select_min, start_bit, mask,
                          kth_value_bits, previous_start_bit](T value, IdxT) {
-            auto const bits = twiddle_in(value, select_min);
+            auto const bits = twiddle_in<NanHigh>(value, select_min);
             auto const pb = (bits >> previous_start_bit) << previous_start_bit;
             int bucket = __builtin_amdgcn_ubfe(bits, static_cast<unsigned>(start_bit), static_cast<unsigned>(BitsPerPass));
             if(pb == kth_value_bits)
@@ -2301,7 +2323,7 @@ __device__ bool filter_and_histogram_for_one_block(T const* in_buf,
                 // stage_val / stage_idx / stage_cnt are __shared__, so they
                 // have static storage duration and are referenced directly
                 // rather than captured.
-                auto const bits = twiddle_in(value, select_min);
+                auto const bits = twiddle_in<NanHigh>(value, select_min);
                 auto const pb = (bits >> previous_start_bit) << previous_start_bit;
                 if(pb == kth_value_bits)
                 {
@@ -2429,7 +2451,7 @@ template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int 
           int MainBits = 12, int TailBits = 8,
           bool UseWaveWinnerReserve = false, bool CacheTwiddledBits = false,
           bool UseWaveBallotSelect = false,
-          bool WideFirstDigit = false, typename... Placement>
+          bool WideFirstDigit = false, bool NanHigh = false, typename... Placement>
 __global__ void radix_topk_one_block_reg_kernel(T const* in,
                                                 const int64_t len,
                                                 const IdxT k,
@@ -2612,7 +2634,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         }
         else if constexpr(CacheTwiddledBits)
         {
-            vals[j] = twiddle_in(value, select_min);
+            vals[j] = twiddle_in<NanHigh>(value, select_min);
         }
         else
         {
@@ -2648,7 +2670,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         for(int j = 0; j < ElemsPerThread; ++j)
         {
             IdxT const i = static_cast<IdxT>(threadIdx.x) + j * BlockSize;
-            vals[j] = twiddle_in(__builtin_bit_cast(T, vals[j]), select_min);
+            vals[j] = twiddle_in<NanHigh>(__builtin_bit_cast(T, vals[j]), select_min);
             if(is_valid_element(j, i))
             {
                 uint32_t const digit = vals[j] >> wide_start_bit;
@@ -2903,7 +2925,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             if constexpr(CacheTwiddledBits)
                 bits = vals[j];
             else
-                bits = twiddle_in(vals[j], select_min);
+                bits = twiddle_in<NanHigh>(vals[j], select_min);
             int const bucket = __builtin_amdgcn_ubfe(
                 bits,
                 static_cast<unsigned>(pass0_start_bit),
@@ -2938,7 +2960,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             if constexpr(CacheTwiddledBits)
                 bits = vals[j];
             else
-                bits = twiddle_in(vals[j], select_min);
+                bits = twiddle_in<NanHigh>(vals[j], select_min);
             auto const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
             if(prefix < high_prefix)
             {
@@ -3031,7 +3053,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                 IdxT key_index = 0;
                 if(lane < staged_len)
                 {
-                    key_bits  = twiddle_in(candidate_values[lane], select_min);
+                    key_bits  = twiddle_in<NanHigh>(candidate_values[lane], select_min);
                     key_index = candidate_indices[lane];
                 }
 
@@ -3152,7 +3174,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                 if constexpr(CacheTwiddledBits)
                     bits = vals[j];
                 else
-                    bits = twiddle_in(vals[j], select_min);
+                    bits = twiddle_in<NanHigh>(vals[j], select_min);
                 auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
                 if(prefix == pass1_prefix)
                 {
@@ -3166,7 +3188,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         choose_bucket_reduce<T, IdxT, TailBits, BlockSize>(
             &counter, histogram, wave_sums, pass2_k, 0);
         __syncthreads();
-        last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false>(
+        last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false, NanHigh>(
             in, static_cast<IdxT const*>(nullptr), out, out_idx, row_len, k, &counter, select_min,
             final_pass);
         return;
@@ -3182,7 +3204,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             static_cast<IdxT>(__builtin_amdgcn_readfirstlane(static_cast<int>(candidate_count)));
         for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
         {
-            Bits const bits = twiddle_in(candidate_values[i], select_min);
+            Bits const bits = twiddle_in<NanHigh>(candidate_values[i], select_min);
             auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
             if(prefix == middle_prefix)
             {
@@ -3190,7 +3212,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
             }
         }
         __syncthreads();
-        last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false>(
+        last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false, NanHigh>(
             candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter,
             select_min, final_pass);
         return;
@@ -3206,7 +3228,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
         __builtin_amdgcn_readfirstlane(static_cast<int>(counter.kth_value_bits)));
     for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
     {
-        Bits const bits = twiddle_in(candidate_values[i], select_min);
+        Bits const bits = twiddle_in<NanHigh>(candidate_values[i], select_min);
         auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
         if(prefix == middle_prefix)
         {
@@ -3219,7 +3241,7 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
     choose_bucket_reduce<T, IdxT, TailBits, BlockSize>(&counter, histogram, wave_sums, pass2_k, 0);
     __syncthreads();
 
-    last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false>(
+    last_filter<T, IdxT, MainBits, WRITE_TOPK_VALUES, false, NanHigh>(
         candidate_values, candidate_indices, out, out_idx, staged_len, k, &counter, select_min,
         final_pass);
 }
@@ -3240,7 +3262,8 @@ template <typename T,
           int BlockSize,
           int StageCapacity,
           int PoolCapacity,
-          int Batches>
+          int Batches,
+          bool NanHigh = false>
 __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
                                                          IdxT const row_len,
                                                          IdxT const skip,
@@ -3345,7 +3368,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
         samples += 4 * (second < 0 ? 0 : (second > BlockSize ? BlockSize : second));
     }
     auto sample_one = [&](T x) {
-        uint32_t const fbin = twiddle_in(x, false) >> FineShift;
+        uint32_t const fbin = twiddle_in<NanHigh>(x, false) >> FineShift;
         atomicAdd(fine + (fbin >> 1), (fbin & 1u) ? 0x10000u : 1u);
     };
     if(in_row(std::integral_constant<int, 0>{}, 0))
@@ -3487,7 +3510,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
                     IdxT const p = base + lane_rank(m[e]);
                     if(st[e])
                     {
-                        count_key(twiddle_in(w[q][e], false));
+                        count_key(twiddle_in<NanHigh>(w[q][e], false));
                         if(p < PoolCapacity)
                         {
                             pool_val[p] = __float_as_uint(w[q][e]);
@@ -3537,7 +3560,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
             IdxT const pt = base + __builtin_popcountll(mh) + lane_rank(mt);
             if(sh)
             {
-                count_key(twiddle_in(xh, false));
+                count_key(twiddle_in<NanHigh>(xh, false));
                 if(ph < PoolCapacity)
                 {
                     pool_val[ph] = __float_as_uint(xh);
@@ -3546,7 +3569,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
             }
             if(stl)
             {
-                count_key(twiddle_in(xt, false));
+                count_key(twiddle_in<NanHigh>(xt, false));
                 if(pt < PoolCapacity)
                 {
                     pool_val[pt] = __float_as_uint(xt);
@@ -3572,7 +3595,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
         {
             int const at = region_base + lane + j * WARP_SIZE;
             key_index[j] = stage_idx[at];
-            key[j]       = twiddle_in(__uint_as_float(stage_val[at]), false);
+            key[j]       = twiddle_in<NanHigh>(__uint_as_float(stage_val[at]), false);
             count_key(key[j]);
         }
     }
@@ -3592,7 +3615,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
         if((j - RegionLoads) * BlockSize < in_pool && at < in_pool)
         {
             key_index[j] = pool_idx[at];
-            key[j]       = twiddle_in(__uint_as_float(pool_val[at]), false);
+            key[j]       = twiddle_in<NanHigh>(__uint_as_float(pool_val[at]), false);
         }
     }
 
@@ -3773,7 +3796,8 @@ __device__ __forceinline__ bool lds_tail_sampled_stage_n(T const* in,
  * keys), its 2048-entry winner array (the digit window) and its candidate
  * arrays (the pool), plus 96 bytes here.
  */
-template <typename T, typename IdxT, int BlockSize, int StageCapacity, int PoolCapacity>
+template <typename T, typename IdxT, int BlockSize, int StageCapacity, int PoolCapacity,
+          bool NanHigh = false>
 __device__ __forceinline__ bool lds_tail_sampled_stage(T const* in,
                                                        IdxT const row_len,
                                                        IdxT const k,
@@ -3806,7 +3830,8 @@ __device__ __forceinline__ bool lds_tail_sampled_stage(T const* in,
     int const batches = static_cast<int>((len4 + 4 * BlockSize - 1) / (4 * BlockSize));
 #define TOPK_SAMPLED_STAGE_CASE(n)                                                             \
     case n:                                                                                    \
-        return lds_tail_sampled_stage_n<T, IdxT, BlockSize, StageCapacity, PoolCapacity, n>(   \
+        return lds_tail_sampled_stage_n<T, IdxT, BlockSize, StageCapacity, PoolCapacity, n,   \
+                                        NanHigh>(                                              \
             in, row_len, skip, len4, k, out_idx, histogram, staged_packed, window_histogram,   \
             candidate_values, candidate_indices, staged_count, per_wave, state)
     static_assert(kSampledMaxBatches == 5);
@@ -3843,7 +3868,7 @@ __device__ __forceinline__ bool lds_tail_sampled_stage(T const* in,
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
           bool UseGuardedFixedPredictor = false, int FixedSampleMin = 270,
           bool UseSampledStage = false,
-          int WideSampleVecs = 2, int WideStageCapacity = 4096>
+          int WideSampleVecs = 2, int WideStageCapacity = 4096, bool NanHigh = false>
 __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
                                                      const int64_t len,
                                                      const IdxT k,
@@ -3948,7 +3973,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     if constexpr(UseSampledStage)
     {
         if(!select_min &&
-           lds_tail_sampled_stage<T, IdxT, BlockSize, StageCapacity, CandidateCapacity>(
+           lds_tail_sampled_stage<T, IdxT, BlockSize, StageCapacity, CandidateCapacity, NanHigh>(
                in, row_len, k, out_idx, histogram, staged_packed, winner_indices,
                candidate_values, candidate_indices, &staged_count))
             return;
@@ -3969,7 +3994,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     PreBits pre_prefix = 0;
     IdxT* const pass0_histogram = histogram;
     auto histogram_one = [pass0_histogram, select_min](T value) {
-        auto const bits = twiddle_in(value, select_min);
+        auto const bits = twiddle_in<NanHigh>(value, select_min);
         int const bucket = __builtin_amdgcn_ubfe(
             bits, static_cast<unsigned>(pass0_start_bit), static_cast<unsigned>(BitsPerPass));
         atomicAdd(pass0_histogram + bucket, static_cast<IdxT>(1));
@@ -4191,7 +4216,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
             value[2 + j] = sample_values[j];
             index[2 + j] = tid + j * BlockSize;
             if(j < nsample)
-                mask |= static_cast<unsigned>(twiddle_in(sample_values[j], select_min) <=
+                mask |= static_cast<unsigned>(twiddle_in<NanHigh>(sample_values[j], select_min) <=
                                               stage_last)
                         << (2 + j);
         }
@@ -4237,7 +4262,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
                         p_out_cnt,
                         high_prefix,
                         select_min](T value, IdxT idx) {
-        auto const bits = twiddle_in(value, select_min);
+        auto const bits = twiddle_in<NanHigh>(value, select_min);
         auto const prefix = (bits >> pass0_start_bit) << pass0_start_bit;
         if(prefix < high_prefix)
         {
@@ -4322,7 +4347,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         auto const pass1_prefix = counter.kth_value_bits;
         IdxT* const pass2_histogram = histogram;
         auto build_pass2_histogram = [pass2_histogram, pass1_prefix, select_min](T value, IdxT) {
-            auto const bits = twiddle_in(value, select_min);
+            auto const bits = twiddle_in<NanHigh>(value, select_min);
             auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
             if(prefix == pass1_prefix)
             {
@@ -4336,7 +4361,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         choose_bucket_reduce<T, IdxT, BitsPerPass, BlockSize>(
             &counter, histogram, wave_sums, pass2_k, 0);
         __syncthreads();
-        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
+        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false, NanHigh>(
             in,
             static_cast<IdxT const*>(nullptr),
             out,
@@ -4360,7 +4385,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
         IdxT const staged_len     = candidate_count;
         for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
         {
-            auto const bits = twiddle_in(candidate_values[i], select_min);
+            auto const bits = twiddle_in<NanHigh>(candidate_values[i], select_min);
             auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
             if(prefix == middle_prefix)
             {
@@ -4368,7 +4393,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
             }
         }
         __syncthreads();
-        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(candidate_values,
+        last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false, NanHigh>(candidate_values,
                                                                     candidate_indices,
                                                                     out,
                                                                     out_idx,
@@ -4393,7 +4418,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     auto const middle_prefix   = counter.kth_value_bits;
     for(IdxT i = static_cast<IdxT>(threadIdx.x); i < staged_len; i += BlockSize)
     {
-        auto const bits = twiddle_in(candidate_values[i], select_min);
+        auto const bits = twiddle_in<NanHigh>(candidate_values[i], select_min);
         auto const prefix = (bits >> pass1_start_bit) << pass1_start_bit;
         if(prefix == middle_prefix)
         {
@@ -4406,7 +4431,7 @@ __global__ void radix_topk_one_block_lds_tail_kernel(T const* in,
     choose_bucket_reduce<T, IdxT, 8, BlockSize>(&counter, histogram, wave_sums, pass2_k, 0);
     __syncthreads();
 
-    last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(candidate_values,
+    last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false, NanHigh>(candidate_values,
                                                                 candidate_indices,
                                                                 out,
                                                                 out_idx,
@@ -4431,7 +4456,8 @@ template <typename T,
           bool prioritize_smaller_indice = false,
           Phase phase                    = Phase::Prefill,
           bool STABLE                    = false,
-          bool COMPACT                   = false>
+          bool COMPACT                   = false,
+          bool NanHigh                   = false>
 __global__ void radix_topk_one_block_kernel(T const* in,
                                             IdxT const* in_idx,
                                             const int64_t len,
@@ -4541,6 +4567,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
     // costs more than compaction saves -- measured at M=4096 it regressed every
     // N, e.g. N=131072 820us -> 1110us.
     constexpr bool kCompact = COMPACT && !STABLE;
+    static_assert(!(STABLE && NanHigh), "the stable emits rank a NaN by its sign");
     // The launcher chooses COMPACT on the padded length, which a ragged or
     // decode row can be far short of; such a row keeps the re-scan. Measured
     // per row on MI355X (k=2048, rows 2^12..2^15 long in a 163840 pitch), the
@@ -4591,7 +4618,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             }
         }
 
-        filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, BlockSize>(
+        filter_and_histogram_for_one_block<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, BlockSize, NanHigh>(
                 in_buf,
                 in_idx_buf,
                 out_buf,
@@ -4659,7 +4686,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             }
             else
             {
-                last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, prioritize_smaller_indice>(
+                last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, prioritize_smaller_indice, NanHigh>(
                     final_in, final_inidx, out, out_idx, final_len, k, &counter, select_min,
                     pass, false);
             }
@@ -4693,7 +4720,7 @@ __global__ void radix_topk_one_block_kernel(T const* in,
             }
             else
             {
-                last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false>(
+                last_filter<T, IdxT, BitsPerPass, WRITE_TOPK_VALUES, false, NanHigh>(
                     final_in, final_inidx, out, out_idx, final_len, k, &counter, select_min,
                     pass);
             }
@@ -4892,8 +4919,9 @@ template <typename T,
           int BitsPerPass,
           int BlockSize,
           bool WRITE_TOPK_VALUES,
-          Phase phase = Phase::Prefill,
-          bool STABLE = false>
+          Phase phase  = Phase::Prefill,
+          bool STABLE  = false,
+          bool NanHigh = false>
 void standalone_stable_radix_topk_one_block_(void* buf,
                                              size_t& buf_size,
                                              T const* in,
@@ -4949,14 +4977,14 @@ void standalone_stable_radix_topk_one_block_(void* buf,
         if(len >= 16384 && len >= int64_t(16) * k && topk_oneblock_is_gfx950())
         {
             radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES,
-                                        false, phase, STABLE, /*COMPACT=*/true>
+                                        false, phase, STABLE, /*COMPACT=*/true, NanHigh>
                 <<<batch_size, BlockSize, 0, stream>>>(
                     in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
             return;
         }
     }
     radix_topk_one_block_kernel<T, IdxT, BitsPerPass, BlockSize, WRITE_TOPK_VALUES, false, phase,
-                                STABLE, /*COMPACT=*/false>
+                                STABLE, /*COMPACT=*/false, NanHigh>
         <<<batch_size, BlockSize, 0, stream>>>(
             in, in_idx, len, rowStarts, rowEnds, k, out, out_idx, select_min, bufs, next_n);
 }
@@ -5092,7 +5120,7 @@ constexpr bool topk_oneblock_reg_wide_digit_fits(int elems_per_thread)
 // `WideDigit` families take the wide-first-digit form inside its lane range.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES, int MainBits,
           int TailBits, int MinEPT, int MaxEPT, bool WaveSelect, bool Placeable = false,
-          bool WideDigit = false>
+          bool WideDigit = false, bool NanHigh = false>
 inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream, T const* in,
                                      int64_t len, IdxT k, T* out, IdxT* out_idx, bool select_min)
 {
@@ -5105,7 +5133,7 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
         if(ept != MinEPT)
             return topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MainBits,
                                             TailBits, MinEPT + 1, MaxEPT, WaveSelect, Placeable,
-                                            WideDigit>(
+                                            WideDigit, NanHigh>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
         constexpr bool Wave = WaveSelect && topk_oneblock_reg_wave_select_fits(MinEPT);
         constexpr bool Wide = WideDigit && Wave && topk_oneblock_reg_wide_digit_fits(MinEPT);
@@ -5117,7 +5145,7 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
                 unsigned const width  = static_cast<unsigned>(place.width);
                 unsigned const groups = (static_cast<unsigned>(batch_size) + width - 1) / width;
                 radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT,
-                                                MainBits, TailBits, Wave, Wave, Wave, Wide>
+                                                MainBits, TailBits, Wave, Wave, Wave, Wide, NanHigh>
                     <<<groups * static_cast<unsigned>(place.period), BlockSize, 0, stream>>>(
                         in, len, k, out, out_idx, select_min, place);
                 HIP_CALL_LAUNCH(hipGetLastError());
@@ -5125,7 +5153,7 @@ inline bool topk_oneblock_reg_launch(int ept, int batch_size, hipStream_t stream
             }
         }
         radix_topk_one_block_reg_kernel<T, IdxT, BlockSize, WRITE_TOPK_VALUES, MinEPT, MainBits,
-                                        TailBits, Wave, Wave, Wave, Wide>
+                                        TailBits, Wave, Wave, Wave, Wide, NanHigh>
             <<<batch_size, BlockSize, 0, stream>>>(in, len, k, out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
@@ -5165,7 +5193,7 @@ constexpr int64_t kTopkPlainGfx950AnyRowsMinLen = 2 * 1024 + 1;
 constexpr int64_t kTopkPlainGfx950AnyRowsMaxLen = 80 * 1024;
 constexpr int64_t kTopkPlainGfx950LdsTailMaxLen = 128 * 1024 + 768;
 
-template <typename T, typename IdxT, bool WRITE_TOPK_VALUES>
+template <typename T, typename IdxT, bool WRITE_TOPK_VALUES, bool NanHigh = false>
 inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len, IdxT k, T* out,
                                        IdxT* out_idx, bool select_min, hipStream_t stream)
 {
@@ -5183,27 +5211,31 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
         if((batch_size > 2 * num_cu && len <= 12 * 1024) || batch_size > 4 * num_cu)
         {
             int const ept = static_cast<int>((len + 511) / 512);
-            return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, 5, 32, true>(
+            return topk_oneblock_reg_launch<T, IdxT, 512, WRITE_TOPK_VALUES, 11, 10, 5, 32, true,
+                                            false, false, NanHigh>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
         }
         int const ept = static_cast<int>((len + 1023) / 1024);
         if(2 * batch_size <= num_cu && len > 4 * 1024 && len <= 4 * 1024 + 768)
-            return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5, true>(
+            return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 11, 10, 5, 5, true,
+                                            false, false, NanHigh>(
                 ept, batch_size, stream, in, len, k, out, out_idx, select_min);
         return topk_oneblock_reg_launch<T, IdxT, 1024, WRITE_TOPK_VALUES, 12, 8, 3, 16, true, true,
-                                        true>(
+                                        true, NanHigh>(
             ept, batch_size, stream, in, len, k, out, out_idx, select_min);
     }
     if(len <= 22 * 1024)
     {
-        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, true, 270, true>
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, true, 270, true, 2,
+                                             4096, NanHigh>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
     }
     if(len <= kTopkPlainGfx950AnyRowsMaxLen)
     {
-        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, true>
+        radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, true, 2,
+                                             4096, NanHigh>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
@@ -5211,7 +5243,7 @@ inline bool dispatch_topk_plain_gfx950(T const* in, int batch_size, int64_t len,
     if(batch_size >= topk_oneblock_num_cu() && len <= kTopkPlainGfx950LdsTailMaxLen)
     {
         radix_topk_one_block_lds_tail_kernel<T, IdxT, 1024, WRITE_TOPK_VALUES, false, 270, false,
-                                             4, 4608>
+                                             4, 4608, NanHigh>
             <<<batch_size, 1024, 0, stream>>>(in, len, k, out, out_idx, select_min);
         HIP_CALL_LAUNCH(hipGetLastError());
         return true;
@@ -5244,7 +5276,7 @@ inline bool topk_oneblock_plain_gfx950_serves(int64_t len, int k, bool ranged,
 
 // Thin wrapper dispatching to the correct BPP at runtime.
 template <typename T, typename IdxT, int BlockSize, bool WRITE_TOPK_VALUES,
-          Phase phase = Phase::Prefill, bool STABLE = false>
+          Phase phase = Phase::Prefill, bool STABLE = false, bool NanHigh = false>
 inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, IdxT const* in_idx,
                                     int batch_size, int64_t len, IdxT* rowStarts, IdxT* rowEnds,
                                     IdxT k, T* out, IdxT* out_idx, bool select_min,
@@ -5262,7 +5294,7 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
                                  rowEnds == nullptr && !select_min && k == 2048;
         if(specialized && topk_oneblock_is_gfx950())
         {
-            if(dispatch_topk_plain_gfx950<T, IdxT, WRITE_TOPK_VALUES>(
+            if(dispatch_topk_plain_gfx950<T, IdxT, WRITE_TOPK_VALUES, NanHigh>(
                    in, batch_size, len, k, out, out_idx, select_min, stream))
                 return;
         }
@@ -5279,7 +5311,8 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
             if(len >= 4096 && len <= 8194 && get_warp_size_func() == 64)
             {
                 int const ept = static_cast<int>((len + BlockSize - 1) / BlockSize);
-                if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9, false>(
+                if(topk_oneblock_reg_launch<T, IdxT, BlockSize, WRITE_TOPK_VALUES, 12, 8, 4, 9, false,
+                                            false, false, NanHigh>(
                        ept, batch_size, stream, in, len, k, out, out_idx, select_min))
                     return;
             }
@@ -5288,11 +5321,13 @@ inline void dispatch_topk_oneblock(void* buf, size_t& buf_size, T const* in, Idx
     }
 
     if (topk_oneblock_use_large_bpp()) {
-        standalone_stable_radix_topk_one_block_<T, IdxT, 12, BlockSize, WRITE_TOPK_VALUES, phase, STABLE>(
+        standalone_stable_radix_topk_one_block_<T, IdxT, 12, BlockSize, WRITE_TOPK_VALUES, phase, STABLE,
+                                                NanHigh>(
             buf, buf_size, in, in_idx, batch_size, len, rowStarts, rowEnds,
             k, out, out_idx, select_min, stream, sorted, next_n);
     } else {
-        standalone_stable_radix_topk_one_block_<T, IdxT, 11, BlockSize, WRITE_TOPK_VALUES, phase, STABLE>(
+        standalone_stable_radix_topk_one_block_<T, IdxT, 11, BlockSize, WRITE_TOPK_VALUES, phase, STABLE,
+                                                NanHigh>(
             buf, buf_size, in, in_idx, batch_size, len, rowStarts, rowEnds,
             k, out, out_idx, select_min, stream, sorted, next_n);
     }
@@ -5517,12 +5552,13 @@ void radix_topk_dispatch(void* buf,
                          float* out,
                          int* out_idx,
                          bool greater,
-                         hipStream_t stream)
+                         hipStream_t stream,
+                         bool nan_high)
 {
     const bool select_min = !greater;
     const bool ranged     = rowStarts != nullptr || rowEnds != nullptr;
 
-    if (aiter::plain_should_use_mulblocks(batch_size, len, k, ranged, out != nullptr, select_min)) {
+    if (!nan_high && aiter::plain_should_use_mulblocks(batch_size, len, k, ranged, out != nullptr, select_min)) {
         if (out) {
             aiter::mb::standalone_stable_radix_topk<float, int, true, true,
                 aiter::mb::Phase::Prefill>(
@@ -5534,7 +5570,7 @@ void radix_topk_dispatch(void* buf,
                 buf, buf_size, in, batch_size, len,
                 rowStarts, rowEnds, k, nullptr, out_idx, greater, stream);
         }
-    } else {
+    } else if (!nan_high) {
         if (out) {
             aiter::ob::dispatch_topk_oneblock<float, int, 1024, true,
                 aiter::ob::Phase::Prefill>(
@@ -5548,6 +5584,25 @@ void radix_topk_dispatch(void* buf,
                 batch_size, len, rowStarts, rowEnds,
                 k, nullptr, out_idx, select_min, stream, true);
         }
+    } else {
+        // NaN of either sign above +inf, for topk_select: indices only, largest
+        // first, and only where topk_plain builds this file.
+        AITER_CHECK(out == nullptr && greater,
+                    "radix_topk_dispatch: nan_high selects indices only, largest first");
+#if TOPK_PER_ROW_PLAIN_KERNELS
+        if(aiter::plain_should_use_mulblocks(batch_size, len, k, ranged, false, false))
+            aiter::mb::standalone_stable_radix_topk<float, int, false, true,
+                                                    aiter::mb::Phase::Prefill, true>(
+                buf, buf_size, in, batch_size, len, rowStarts, rowEnds, k, nullptr, out_idx,
+                greater, stream);
+        else
+            aiter::ob::dispatch_topk_oneblock<float, int, 1024, false, aiter::ob::Phase::Prefill,
+                                              false, true>(
+                buf, buf_size, in, static_cast<int*>(nullptr), batch_size, len, rowStarts,
+                rowEnds, k, nullptr, out_idx, select_min, stream, true);
+#else
+        AITER_CHECK(false, "radix_topk_dispatch: nan_high is built into module_topk_plain only");
+#endif
     }
 }
 

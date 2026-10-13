@@ -78,7 +78,8 @@ extern void radix_topk_dispatch(void* buf,
                                 float* out,
                                 int* out_idx,
                                 bool greater,
-                                hipStream_t stream);
+                                hipStream_t stream,
+                                bool nan_high);
 
 // Forward declaration of workspace size calculation function (at global scope)
 template <typename T, aiter::Phase phase = aiter::Phase::Prefill>
@@ -102,7 +103,8 @@ void topk_per_row_kernel_launcher(const float* in,
                                   int stride1,
                                   int k,
                                   void* workspace,
-                                  hipStream_t stream);
+                                  hipStream_t stream,
+                                  bool nan_high = false);
 
 // Helper function to determine if topk_per_row kernel should be used
 // Based on: n + K log²K ≥ 3 × Factor(n) × n
@@ -2355,7 +2357,8 @@ void AdaptiveTopK(int batch_size,
                   T* __restrict__ out,
                   IdxT* __restrict__ out_idx,
                   void* workspace,
-                  hipStream_t stream = 0)
+                  hipStream_t stream = 0,
+                  bool nan_high      = false)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
 
@@ -2377,7 +2380,8 @@ void AdaptiveTopK(int batch_size,
                                                1,
                                                k,
                                                workspace,
-                                               stream);
+                                               stream,
+                                               nan_high);
 
             return;
         }
@@ -2421,7 +2425,8 @@ void AdaptiveTopK(int batch_size,
                   int64_t stride0,
                   int64_t stride1,
                   void* workspace,
-                  hipStream_t stream = 0)
+                  hipStream_t stream = 0,
+                  bool nan_high      = false)
 {
     assert(k <= buffer_load_helpers::MAX_CAPACITY);
 
@@ -2443,7 +2448,8 @@ void AdaptiveTopK(int batch_size,
                                                static_cast<int>(stride1),
                                                k,
                                                workspace,
-                                               stream);
+                                               stream,
+                                               nan_high);
 
             return;
         }
@@ -2493,7 +2499,8 @@ void topk_per_row_kernel_launcher(const float* in,
                                   int stride1,
                                   int k,
                                   void* workspace,
-                                  hipStream_t stream)
+                                  hipStream_t stream,
+                                  bool nan_high)
 {
     AITER_CHECK(workspace != nullptr,
                 "topk_plain: the radix top-k path requires a caller-provided workspace");
@@ -2513,7 +2520,8 @@ void topk_per_row_kernel_launcher(const float* in,
         const_cast<float*>(out),
         out_idx,
         is_largest,
-        stream);
+        stream,
+        nan_high);
 }
 
 // Map the hip runtime element type bound by the dispatch macro to the ck_tile
@@ -2532,7 +2540,8 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
                 std::optional<aiter_tensor_t> rowEnds,
                 int64_t stride0,
                 int64_t stride1,
-                std::optional<aiter_tensor_t> workspace)
+                std::optional<aiter_tensor_t> workspace,
+                bool nan_high)
 {
     const int32_t max_len = values.size(-1);
     const int32_t batch   = values.size(0);
@@ -2582,6 +2591,9 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
                          should_use_topk_radix<int64_t>(max_len, topk)),
                     "topk_plain: topk_out may only be omitted where "
                     "topk_plain_values_optional() is true");
+        // NaN of either sign above +inf: the radix build that writes no values.
+        AITER_CHECK(!nan_high || topk_out_kernel_ptr == nullptr,
+                    "topk_plain: nan_high is served with topk_out omitted only");
 
         if(use_variable_length)
         {
@@ -2602,7 +2614,8 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
                                                             stride0,
                                                             stride1,
                                                             ws_ptr,
-                                                            stream);
+                                                            stream,
+                                                            nan_high);
             }
             else
             {
@@ -2631,7 +2644,8 @@ void topk_plain(aiter_tensor_t& values,                  // [batch, len]
                                                             topk_out_kernel_ptr,
                                                             topk_ids_ptr,
                                                             ws_ptr,
-                                                            stream);
+                                                            stream,
+                                                            nan_high);
             }
             else
             {

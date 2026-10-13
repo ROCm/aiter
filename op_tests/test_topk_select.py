@@ -562,6 +562,130 @@ def test_terminal_window():
     return failures
 
 
+# One shape per kernel family, each forced onto the backend named; `True` gives
+# the rows an `end`.
+_NAN_ROUTES = (
+    ("argmax", 8, 4096, 1, False),
+    ("small_k", 8, 4096, 16, False),
+    ("stream", 64, 32768, 512, False),
+    ("decode", 4, 32768, 2048, False),
+    ("sampled", 64, 32768, 2048, False),
+    ("sampled", 64, 32768, 2048, True),
+    ("plain", 600, 6000, 2048, False),  # register copy, 512 threads
+    ("plain", 64, 4500, 2048, False),  # register copy, 11+11+10 bits
+    ("plain", 8, 4096, 2048, False),  # register copy, 4 per lane
+    ("plain", 64, 8192, 2048, False),  # register copy, wide first digit
+    ("plain", 8, 16384, 2048, False),  # LDS tail with the sampled stage
+    ("plain", 8, 32768, 2048, False),  # LDS tail
+    ("plain", 256, 100000, 2048, False),  # LDS tail, wide rows
+    ("plain", 64, 65536, 1024, False),  # generic radix, compacted rows
+    ("plain", 64, 8192, 1024, False),  # generic radix
+    ("plain", 64, 32768, 2048, True),  # generic radix, ranged
+    ("plain", 2, 262144, 2048, False),  # multi-block
+    ("plain", 2, 262144, 2048, True),  # multi-block, ranged
+)
+# Quiet and signalling NaNs of both signs, a payload, and all-ones.
+_NAN_BITS = (0x7FC00000, 0xFFC00000, 0x7F800001, 0xFF800001, 0x7FC00123, 0xFFFFFFFF)
+
+
+def _nan_rows(m, n, k, ends, seed):
+    """Rows holding fewer NaNs than `k`, more than `k`, only negative ones, and
+    none, among infinities and signed zeros; NaNs past a row's end too."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(m, n, dtype=dtypes.fp32, generator=g)
+    bits = x.view(dtypes.i32)
+    pattern = torch.tensor(
+        [b - (1 << 32) if b >= 1 << 31 else b for b in _NAN_BITS], dtype=dtypes.i32
+    )
+
+    def cols(count, live):
+        return torch.randperm(live, generator=g, device="cuda")[:count]
+
+    for r in range(m):
+        live = int(ends[r])
+        kind = r % 4
+        if kind == 0:
+            count = max(1, k // 4)
+        elif kind == 1:
+            count = min(live, k + max(1, k // 2))
+        elif kind == 2:
+            count = max(1, k // 2)
+            x[r, :live] = float("-inf")
+        else:
+            count = 0
+        if count:
+            at = cols(count, live)
+            if kind == 2:
+                bits[r, at] = pattern[1]
+            else:
+                bits[r, at] = pattern[torch.arange(count, device="cuda") % len(pattern)]
+        others = cols(min(live, 8), live)
+        x[r, others[:2]] = float("inf")
+        x[r, others[2:4]] = float("-inf")
+        x[r, others[4:6]] = -0.0
+        x[r, others[6:8]] = 0.0
+        if live < n:
+            bits[r, live:] = pattern[0]
+    return x
+
+
+def _nan_high_key(x):
+    """An int64 key whose order is the documented one: NaN of either sign
+    above +inf, -0.0 equal to 0.0."""
+    bits = x.view(dtypes.i32).long() & 0xFFFFFFFF
+    mag = bits & 0x7FFFFFFF
+    key = torch.where(bits >= 1 << 31, (1 << 31) - 1 - mag, bits + (1 << 31))
+    key = torch.where(mag == 0, torch.full_like(key, 1 << 31), key)
+    return torch.where(mag > 0x7F800000, torch.full_like(key, 1 << 33), key)
+
+
+def test_nan_order():
+    """Every backend ranks a NaN of either sign above +inf.
+
+    Checked as the property rather than against torch: indices in range and
+    distinct, and no unselected live element ranked above a selected one.
+    """
+    failures = []
+    for backend, m, n, k, ragged in _NAN_ROUTES:
+        tag = f"{backend} {m}x{n} k={k}{' end' if ragged else ''}"
+        if ragged:
+            g = torch.Generator(device="cuda").manual_seed(n + m)
+            ends = torch.randint(
+                n - n // 4, n + 1, (m,), dtype=dtypes.i32, generator=g, device="cuda"
+            )
+        else:
+            ends = torch.full((m,), n, dtype=dtypes.i32)
+        x = _nan_rows(m, n, k, ends, seed=m * n + k)
+        try:
+            idx = _run_single_backend(
+                x, ends, k, backend, end=ends if ragged else None
+            ).long()
+        except _NotServed:
+            # The routes are gfx950 shapes; elsewhere some are not served.
+            if get_gfx() == "gfx950":
+                failures.append(f"{tag}: not served")
+            continue
+        torch.cuda.synchronize()
+        live = torch.arange(n).view(1, n) < ends.view(m, 1)
+        if not bool(((idx >= 0) & (idx < ends.view(m, 1).long())).all()):
+            failures.append(f"{tag}: index outside the row")
+            continue
+        ordered = torch.sort(idx, dim=1).values
+        if k > 1 and not bool((ordered[:, 1:] != ordered[:, :-1]).all()):
+            failures.append(f"{tag}: an index repeats")
+            continue
+        key = _nan_high_key(x)
+        picked = torch.zeros_like(live).scatter_(1, idx, True)
+        floor = key.gather(1, idx).min(dim=1).values
+        rest = torch.where(live & ~picked, key, torch.full_like(key, -1))
+        bad = (rest.max(dim=1).values > floor).nonzero().flatten().tolist()
+        if bad:
+            failures.append(f"{tag}: rows {bad[:4]} rank a NaN or a value wrongly")
+    for label in failures:
+        aiter.logger.error("NAN ORDER FAILED: %s", label)
+    return failures
+
+
 def test_invariants(m, n, k):
     """The properties a value comparison cannot see."""
     failures = []
@@ -745,6 +869,11 @@ def main():
         "rejections: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"rejections: {len(bad)} failed"
+    bad = test_nan_order()
+    aiter.logger.info(
+        "NaN order: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"NaN order: {len(bad)} failed"
 
     df = [
         test_topk_argmax_half(m, n, dtype)

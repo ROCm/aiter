@@ -20,7 +20,8 @@ void topk_plain(aiter_tensor_t& values,
                 std::optional<aiter_tensor_t> rowEnds   = std::nullopt,
                 int64_t stride0                         = -1,
                 int64_t stride1                         = 1,
-                std::optional<aiter_tensor_t> workspace = std::nullopt);
+                std::optional<aiter_tensor_t> workspace = std::nullopt,
+                bool nan_high                           = false);
 
 // Whether the fp32 radix path takes its multi-block kernel for an indices-only,
 // largest-first call over `numRows` rows of `stride0` columns (the row pitch when

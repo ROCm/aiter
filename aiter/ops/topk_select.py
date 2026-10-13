@@ -70,7 +70,6 @@ from aiter.ops.topk import (
 )
 from aiter.ops.topk_plain import (
     topk_plain,
-    topk_plain_batches_ragged_rows,
     topk_plain_use_mulblocks,
     topk_plain_values_optional,
 )
@@ -640,12 +639,12 @@ def _available(
         return frozenset(out)
     if topk_per_row_small_k_serves(k, width, wave_size) is None:
         out.add("small_k")
-    if k <= _PLAIN_MAX_K and not (
-        ragged and not topk_plain_batches_ragged_rows(width, k)
-    ):
-        # Outside its batched regime, ranged rows put plain on a host-side loop
-        # of one call per row: 294918 launches at k=16, N=32768 where the batched
-        # form is one. The other three take a row length natively.
+    if k <= _PLAIN_MAX_K and topk_plain_values_optional(width, k):
+        # plain's radix path only: it is the build that writes no values and
+        # ranks a NaN of either sign above +inf, as the other backends do. The
+        # block-sort fallback does neither, and for ranged rows it is a
+        # host-side loop of one call per row: 294918 launches at k=16, N=32768
+        # where the batched form is one.
         out.add("plain")
     # decode was refused at 4 GiB when it built descriptors over the whole
     # tensor; it slices the row first now, so there is nothing left to ask.
@@ -1172,13 +1171,8 @@ def topk_select(
     selection under 74.3us of call, so the gather and the buffers around it were
     most of the time spent. Pass ``return_value=True`` to get them.
 
-    NaN: +nan ranks above +inf, as in ``torch.topk``. A NaN with the sign bit
-    set does too on ``argmax``, ``small_k``, ``stream``, ``decode`` and
-    ``sampled``, but ``plain`` (on its radix path) ranks it below -inf, so
-    there it is selected only when a row has fewer than ``topk`` other live
-    values.
-    Which of the two a row gets depends on its shape. Where ``plain`` falls
-    back to its block sort, NaN has no defined rank.
+    NaN: +nan ranks above +inf, as in ``torch.topk``, and a NaN with the sign
+    bit set does too, on every backend.
 
     Args:
         input: ``[rows, width]``, inner stride 1, any row stride. float32 at
@@ -1492,21 +1486,16 @@ def _dispatch(
         # The values are never read: whatever this entry returns is gathered
         # from `input` at `idx` below, because that is the only form that stays
         # consistent through the reorderings. So ask for the build that does not
-        # write them. Outside the radix path there is no such build and the
-        # buffer is real, left to the caching allocator rather than kept, the
-        # way `get_topk_scratch_workspace` argues for: a kept buffer would be
-        # shared across streams.
-        vals = (
-            None
-            if topk_plain_values_optional(input.shape[-1], topk)
-            else torch.empty_like(idx, dtype=input.dtype)
-        )
+        # write them, which `_available` admits plain only for, with NaN of
+        # either sign ranked above +inf.
         if ragged:
             starts = torch.zeros_like(row_lens)
-            topk_plain(input, idx, vals, topk, True, starts, row_lens, -1, 1)
+            topk_plain(
+                input, idx, None, topk, True, starts, row_lens, -1, 1, nan_high=True
+            )
         else:
             empty = _no_range(input.device)
-            topk_plain(input, idx, vals, topk, True, empty, empty, -1, 1)
+            topk_plain(input, idx, None, topk, True, empty, empty, -1, 1, nan_high=True)
     elif backend == "decode":
         # `stable` buys the smallest-index tie-break AND the selected set being
         # a function of the row, so both `tie='low'` and `deterministic` need

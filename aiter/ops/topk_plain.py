@@ -26,6 +26,7 @@ def _topk_plain(
     stride0: int = -1,
     stride1: int = 1,
     workspace: torch.Tensor | None = None,
+    nan_high: bool = False,
 ) -> None: ...
 
 
@@ -122,6 +123,7 @@ def topk_plain(
     rowEnds: torch.Tensor = None,
     stride0: int = -1,
     stride1: int = 1,
+    nan_high: bool = False,
 ) -> None:
     """Plain top-k over the last dim.
 
@@ -143,6 +145,11 @@ def topk_plain(
     selected only when fewer than `topk` other values exist. The block-sort
     fallback, which serves every other call, compares scores as floats and
     gives NaN no defined rank.
+
+    `nan_high` ranks a NaN of either sign above +inf instead, as `topk_select`
+    does. It is served by the radix build that writes no values, so it needs
+    `topk_out=None`, and with it a geometry `topk_plain_values_optional` holds
+    for.
     """
     if topk > _MAX_CAPACITY:
         # `AdaptiveTopK` asserts this at its entry, ahead of any dtype branch,
@@ -151,6 +158,10 @@ def topk_plain(
         # is why the bound is restated here rather than left to the C++ side.
         raise ValueError(
             f"topk={topk} exceeds this kernel's capacity of {_MAX_CAPACITY}"
+        )
+    if nan_high and topk_out is not None:
+        raise ValueError(
+            "topk_plain: nan_high selects indices only; pass topk_out=None"
         )
     if not x.is_contiguous():
         # Only the ranged form reads row r at `r * stride0`, and it also sizes
@@ -192,4 +203,5 @@ def topk_plain(
         stride0,
         stride1,
         workspace,
+        nan_high,
     )
