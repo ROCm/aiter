@@ -189,17 +189,27 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
     # The row-major reference kid, or at a K too short for it the 128-deep one.
     # Square only -- every 1x32 kid is preshuffled, so that block has no
     # row-major member to run here.
+    #
+    # Both candidates can be out of reach at once: the K-tile floor these kids
+    # carry is a function of K *and* split_k, so a short K at split_k > 1 leaves
+    # neither one dividing the shape (K=1024 split_k=2 is the case that used to
+    # take the whole sweep down). That is the same "absent from the row" as any
+    # skipped kid -- this one sets no tolerance, it is a reading aid, see the
+    # gate below -- so report it n/a and carry on. The refusal arrives as
+    # ValueError from the launch planner or RuntimeError from the kernel
+    # depending on which layer catches it, which is why both are caught here,
+    # matching the kid loop above.
     W_mx, _, _, scale_for_sq, ref_sq = data_for(group)
+    err_plain = None
+    plain_exc = None
     for cand in (kid_plain, kid_plain - KID_PLAIN + 8653):
         try:
             err_plain = _rel_err(_call(cand, W_mx, scale_for_sq), ref_sq)
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
             plain_exc = e
             continue
         kid_plain = cand
         break
-    else:
-        raise plain_exc
 
     # The public entry end to end: guarded custom op -> the preshuffle table
     # (the entry picks that one, nothing to set) -> the row's backend, opus or
@@ -221,7 +231,13 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
 
     row = f"G{group:<3} g={g:<3} m={m:<6} n={n:<6} k={k:<6} sk={split_k} "
     row += "  ".join(f"kid{kid}={e:.5f}" for kid, e in errs.items())
-    row += f"  kid{kid_plain}={err_plain:.5f}"
+    # Named even when absent: a silently missing reference reads as "nobody ran
+    # it", which is exactly how a real regression would look.
+    row += (
+        f"  kid{kid_plain}={err_plain:.5f}"
+        if err_plain is not None
+        else f"  kid{kid_plain}=n/a({type(plain_exc).__name__})"
+    )
     row += "  public=" + (
         "off"
         if not err_pub
@@ -254,9 +270,16 @@ def _run(g, m, n, k, ydt, bench, split_k=1, group=GROUP):
             f"kid{kid}={_time(kid, _data[kid_group_n[kid]][1], _data[kid_group_n[kid]][3]):.2f}us"
             for kid in errs
         ]
-        times.append(f"kid{kid_plain}={_time(kid_plain, W_mx, scale_for_sq):.2f}us")
+        # Same refusals as the correctness pass: a kid whose tile does not
+        # divide this shape is absent from the timings, not a crash. Timing a
+        # kid the pass above could not score would mean running it anyway.
+        if err_plain is not None:
+            times.append(f"kid{kid_plain}={_time(kid_plain, W_mx, scale_for_sq):.2f}us")
         for kid in KIDS_PLAIN_EXTRA:
-            times.append(f"kid{kid}={_time(kid, W_mx, scale_for_sq):.2f}us")
+            try:
+                times.append(f"kid{kid}={_time(kid, W_mx, scale_for_sq):.2f}us")
+            except (RuntimeError, ValueError):
+                pass
         row += "  |  " + "  ".join(times)
     print(row, flush=True)
     # Every kid is judged against the torch reference, not against the row-major
@@ -787,6 +810,115 @@ def test_cuda_graph_replay():
         torch.testing.assert_close(captured, eager, rtol=0, atol=0)
 
 
+def _splitk_kid(x, w, xs, ws, ref, split_k):
+    """First bpreshuffle kid that runs this shape at ``split_k``, or None.
+
+    Probed rather than hard-coded: which tiles divide a shape at a given split
+    is a property of the catalog, so a pinned kid would turn a retuning into a
+    failure here instead of a skip.
+    """
+    for kid in KIDS_BPRESHUFFLE:
+        y = torch.zeros_like(ref)
+        try:
+            _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+                x,
+                w,
+                y,
+                xs,
+                ws,
+                workspace=_mxscale_bmm_workspace(x, w, y, kid, split_k),
+                kid=kid,
+                split_k=split_k,
+            )
+        except (RuntimeError, ValueError):
+            continue
+        torch.cuda.synchronize()
+        if _rel_err(y, ref) <= _ERR_TOL:
+            return kid
+    return None
+
+
+def test_split_k_arrival_counters():
+    """The fused split-K arrival counters, which nothing else here reaches.
+
+    splitK > 1 is the only path that takes them, and the buffer is cached per
+    (device, stream) and reused for the life of the process, so its whole
+    contract is about what the *next* launch sees. Three things are checked,
+    cheapest first, because the cheap one fails earliest and reads clearest:
+
+    Repeat: the last split re-arms each counter, so a second launch on the
+    same buffer must agree with the first. Drop the re-arm and the second
+    launch finds every counter already at split_k, nobody recognises itself
+    as last, and Y is simply never written -- which is what this catches.
+
+    Capture: capture runs on a side stream, which owns no buffer unless it was
+    warmed, and allocating mid-capture is illegal. Unwarmed, the launcher must
+    fall back to the workspace + reducer path; warmed, the fused path itself
+    is captured. Both must produce the eager numbers, so a broken fallback and
+    an allocation escaping into capture both show up here.
+
+    Replay: replay re-runs the kernel with the captured pointer and no host
+    code in between, so a counter left dirty by replay N breaks replay N+1 --
+    invisible on a single replay, hence two.
+
+    Not parametrized on warm/unwarm: the counter buffer is process-wide static
+    state, so a failure in one parametrization perturbs the kid probe in the
+    next and the second run silently measures a different kernel.
+    """
+    split_k = 2
+    b, m, n, k = 2, 129, 512, 4608  # K deep enough to survive the split
+    x, w, xs, ws, ref = _compact_inputs(b, m, n, k, torch.bfloat16)
+    kid = _splitk_kid(x, w, xs, ws, ref, split_k)
+    if kid is None:
+        pytest.skip(f"no bpreshuffle kid runs {b}x{m}x{n}x{k} at split_k={split_k}")
+
+    y = torch.zeros_like(ref)
+    # Allocated once and reused: a workspace allocated inside the capture would
+    # land in the graph's private pool, making this a test of the pool rather
+    # than of the counters.
+    workspace = _mxscale_bmm_workspace(x, w, y, kid, split_k)
+
+    def launch():
+        _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+            x, w, y, xs, ws, workspace=workspace, kid=kid, split_k=split_k
+        )
+
+    def run_eager():
+        y.fill_(float("nan"))
+        launch()
+        torch.cuda.synchronize()
+        assert torch.isfinite(y).all(), "no workgroup reduced the partials"
+        return y.clone()
+
+    # Two launches, not one: the first only proves the kernel works on a clean
+    # buffer, which the probe above already did. The second is the one that
+    # meets a counter the first launch had to re-arm.
+    eager = run_eager()
+    assert _rel_err(eager, ref) <= _ERR_TOL, "eager split-K is already wrong"
+    torch.testing.assert_close(run_eager(), eager, rtol=0, atol=0)
+
+    for warm_capture_stream in (False, True):
+        side = torch.cuda.Stream()
+        if warm_capture_stream:
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side):
+                launch()
+            torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=side):
+            launch()
+        for _ in range(2):
+            y.fill_(float("nan"))
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.isfinite(
+                y
+            ).all(), f"replay left the buffer untouched (warm={warm_capture_stream})"
+            torch.testing.assert_close(y, eager, rtol=0, atol=0)
+
+
 def main():
     global KIDS_BPRESHUFFLE, KIDS_PLAIN_EXTRA
     p = argparse.ArgumentParser()
@@ -855,6 +987,13 @@ def main():
         test_public_entry_1x32()
         test_rejects_square_scale_shape_on_1x32_kid()
         test_cuda_graph_replay_1x32()
+        # Guarded by the same split_k == 1 as the rest of this block because
+        # it is a one-off structural check, not part of the sweep -- it pins
+        # its own split_k = 2 regardless of the flag.
+        print(
+            "split-K: arrival counters across launches, capture and replay", flush=True
+        )
+        test_split_k_arrival_counters()
     for group in groups:
         for k in ks:
             for m in [int(x) for x in args.sizes.split(",")]:

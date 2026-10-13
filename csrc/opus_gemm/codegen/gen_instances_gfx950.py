@@ -1663,43 +1663,37 @@ _BMM_MXSCALE_SPLITK_LAUNCHER_BODY = r"""
 #include <cstdlib>
 #include <map>
 #include <mutex>
-// Arrival counters for the same-XCD fused split-K, one int32 per (batch, tile),
-// zeroed once when allocated and re-armed by the kernel after every use, so a
-// launch pays no memset. One buffer per device, allocated on the first eager
-// launch and reused under graph capture -- torch.cuda.graph captures on a side
-// stream, so a per-stream buffer would never exist where it is needed.
-//
-// The buffer holds XCD_COUNTER_SLOTS slices and each launch takes the next, so
-// launches in flight at once on different streams (a two-batch overlap, say)
-// count in different slices; only XCD_COUNTER_SLOTS concurrent split-K launches
-// could collide. An outgrown buffer is kept rather than freed, since a kernel
-// still in flight may be counting in it. Returns nullptr when it would have to
-// allocate under graph capture; the caller then takes the workspace + reduce
-// path.
-constexpr int XCD_COUNTER_SLOTS = 8;
+// Arrival counters for the same-XCD fused split-K, one int32 per (batch, tile).
+// Like FlyDSL, cache one buffer per (device, stream). Initialization and all
+// eager uses are ordered on that stream; another stream gets its own buffer.
+// The last split re-arms each counter, so subsequent launches need no memset.
+// Keep outgrown buffers alive: in-flight kernels or captured graphs may still
+// reference them. If this stream needs allocation during capture, return nullptr
+// for the workspace + reducer path. Warm up on the capture stream to use fusion.
+// Graphs sharing a buffer must replay in order, even on different replay streams.
 inline int* opus_bmm_xcd_counters(size_t n, hipStream_t stream)
 {
   static const bool off = std::getenv("OPUS_BMM_NO_XCD_FUSE") != nullptr;
   if (off) return nullptr;
-  struct Buf { int* p = nullptr; size_t slice = 0; unsigned next = 0; };
+  struct Buf { int* p = nullptr; size_t capacity = 0; };
   static std::mutex mu;
-  static std::map<int, Buf> bufs;
+  static std::map<int, std::map<hipStream_t, Buf>> bufs;
   int dev = 0;
   HIP_CALL(hipGetDevice(&dev));
   std::lock_guard<std::mutex> lock(mu);
-  Buf& b = bufs[dev];
-  if (b.slice < n) {
+  Buf& b = bufs[dev][stream];
+  if (b.capacity < n) {
     hipStreamCaptureStatus capture = hipStreamCaptureStatusNone;
     HIP_CALL(hipStreamIsCapturing(stream, &capture));
     if (capture != hipStreamCaptureStatusNone) return nullptr;
-    const size_t slice = n > (size_t(1) << 14) ? n : (size_t(1) << 14);
+    const size_t capacity = n > (size_t(1) << 14) ? n : (size_t(1) << 14);
     int* p = nullptr;
-    HIP_CALL(hipMalloc(&p, slice * XCD_COUNTER_SLOTS * sizeof(int)));
-    HIP_CALL(hipMemsetAsync(p, 0, slice * XCD_COUNTER_SLOTS * sizeof(int), stream));
+    HIP_CALL(hipMalloc(&p, capacity * sizeof(int)));
+    HIP_CALL(hipMemsetAsync(p, 0, capacity * sizeof(int), stream));
     b.p = p;
-    b.slice = slice;
+    b.capacity = capacity;
   }
-  return b.p + (size_t)(b.next++ % XCD_COUNTER_SLOTS) * b.slice;
+  return b.p;
 }
 #endif
 // mmajor: O/Y are [M, batch, *] (dim0=M, dim1=batch); wo_a stays batch-major
@@ -1783,10 +1777,6 @@ void
   auto stream = aiter::getCurrentHIPStream();
 
   opus_gemm_scale_splitk_kargs_gfx950 kargs{};
-  {  // TEMP ablation probe: wave1 reads OPUS_WAVE1_ABL through m_per_wg
-    static const char* abl = std::getenv("OPUS_WAVE1_ABL");
-    kargs.m_per_wg = abl ? std::atoi(abl) : 0;
-  }
   kargs.ptr_a = O.data_ptr();
   kargs.ptr_b = wo_a.data_ptr();
   kargs.ptr_ws = nullptr;

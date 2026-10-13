@@ -11,9 +11,6 @@
 // With counters, D_OUT launches use same-XCD fused split-K reduction.
 // D_OUT=void launches write FP32 partials for the standalone reducer.
 #pragma once
-#ifndef OPUS_WAVE1_TIMING
-#define OPUS_WAVE1_TIMING 0  // TEMP: remove after the split-K timing probe
-#endif
 
 #include "opus_gemm_traits_a8w8_scale_gfx950.cuh"
 // The B-direct, scale-layout and scale-word helpers, and the split-K reduce.
@@ -138,19 +135,6 @@ OPUS_D void gemm_a8w8_mxscale_bpreshuffle_wave1_body(
 {
     using namespace opus;
     const int split_k = SPLIT_C > 0 ? SPLIT_C : kargs.split_k;
-    const int abl = kargs.m_per_wg;  // TEMP ablation: 1 entry, 2 no stores, 3 partial only
-    if (abl == 1) return;
-#if OPUS_WAVE1_TIMING  // TEMP debug: per-WG s_memrealtime stamps past the partials
-    const unsigned long long dbg_t0 = __builtin_amdgcn_s_memrealtime();
-    unsigned long long* dbg = reinterpret_cast<unsigned long long*>(
-        reinterpret_cast<float*>(kargs.ptr_ws)
-        + (size_t)split_k * kargs.batch * kargs.stride_ws_batch)
-        + ((size_t)opus::block_id_z() * 65536 + opus::block_id_x()) * 8;
-    auto dbg_put = [&](int i, unsigned long long v) {
-        if (opus::thread_id_x() == 0 && kargs.ptr_ws != nullptr) dbg[i] = v;
-    };
-    dbg_put(0, dbg_t0);
-#endif
 
     using T = opus::remove_cvref_t<Traits>;
     using D_A = typename T::D_A;
@@ -295,11 +279,6 @@ OPUS_D void gemm_a8w8_mxscale_bpreshuffle_wave1_body(
         });
     }
 
-#if OPUS_WAVE1_TIMING
-    dbg_put(1, __builtin_amdgcn_s_memrealtime());
-    dbg_put(6, ((unsigned long long)wgid << 32) | (unsigned)split_id);
-#endif
-    if (abl == 2) return;
     // Store. T_N == 1, so the generic swap_ab C partition is the right one.
     auto p_coord_c = opus::make_tuple(0, lane_id % mma.grpn_c, 0, lane_id / mma.grpn_c);
     auto store_c = [&](auto& g, const auto& vc, int stride) {
@@ -325,7 +304,6 @@ OPUS_D void gemm_a8w8_mxscale_bpreshuffle_wave1_body(
                  + (size_t)row * kargs.stride_ws + col;
     auto g_ws = make_gmem(tile_ws + (size_t)split_id * split_stride);
     store_c(g_ws, v_c, kargs.stride_ws);
-    if (abl == 3) return;
 
     if constexpr (!std::is_void_v<D_OUT>) {
         // Fused tail (xcd_fused holds here: the launcher never takes a D_OUT
@@ -335,18 +313,11 @@ OPUS_D void gemm_a8w8_mxscale_bpreshuffle_wave1_body(
         // sums the partials in split order -- the same order whichever split
         // that is -- writes Y, and re-arms the counter.
         s_waitcnt_vmcnt(0_I);
-#if OPUS_WAVE1_TIMING
-        dbg_put(2, __builtin_amdgcn_s_memrealtime());
-#endif
         int* counter = kargs.ptr_xcd_counters + batch_id * tiles_per_batch + wgid;
         int arrived = 0;
         if (lane_id == 0)
             arrived = __hip_atomic_fetch_add(counter, 1, __ATOMIC_RELAXED,
                                              __HIP_MEMORY_SCOPE_WORKGROUP);
-#if OPUS_WAVE1_TIMING
-        dbg_put(3, __builtin_amdgcn_s_memrealtime());
-        dbg_put(4, __builtin_amdgcn_readfirstlane(arrived) == split_k - 1);
-#endif
         if (__builtin_amdgcn_readfirstlane(arrived) != split_k - 1) return;
 
         auto u_gw = partition_layout_c<T::VEC_C>(mma,
@@ -395,9 +366,6 @@ OPUS_D void gemm_a8w8_mxscale_bpreshuffle_wave1_body(
         store_c(g_out, acc, kargs.stride_c);
         if (lane_id == 0)
             __hip_atomic_store(counter, 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
-#if OPUS_WAVE1_TIMING
-        dbg_put(5, __builtin_amdgcn_s_memrealtime());
-#endif
     }
 }
 #endif // __HIP_DEVICE_COMPILE__ && __gfx950__
