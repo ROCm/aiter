@@ -332,7 +332,12 @@ def geometry(batch, max_block, S=0, H=0, cp_world=1, cp_rank=0, device=None):
         served = False
     waves_per_tok, spread = 1, 0
     if served:
-        depth = 4
+        # Past the tabled batches the ladder's default of 4 is right only once
+        # a request is long enough to keep its own CTAs busy. Below that a
+        # shallower loop wins -- most of a page's cost is the K stream, and a
+        # deep per-wave loop just serialises more of it behind one CTA. The
+        # crossover was swept and sits above max_block 256.
+        depth = 2 if max_block <= 256 else 4
         for limit, tabled in _decode_depth_table(S, H):
             if batch <= limit:
                 depth = tabled

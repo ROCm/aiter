@@ -256,9 +256,13 @@ def test_capacity_threshold(monkeypatch):
     smaller = kernel.work_map_size(63, 16, 16, 4)
     assert smaller > exact  # reproduces the non-monotonic sizing cliff
     assert kernel.work_map_capacity(64, 16, 16, 4) >= smaller
-    # The depth tables are non-monotonic too (deeper at larger batches).
-    assert kernel.work_map_size(16, 16, 4, 1) > kernel.work_map_size(17, 16, 4, 1)
-    assert kernel.work_map_capacity(17, 16, 4, 1) >= kernel.work_map_size(16, 16, 4, 1)
+    # The depth ladder is non-monotonic too: past max_block 256 batch 17 takes
+    # the deepest rung where batch 16 is still on the tabled one, so the larger
+    # batch asks for fewer rows.
+    assert kernel.work_map_size(16, 512, 4, 1) > kernel.work_map_size(17, 512, 4, 1)
+    assert kernel.work_map_capacity(17, 512, 4, 1) >= kernel.work_map_size(
+        16, 512, 4, 1
+    )
 
 
 @requires_gfx950
@@ -585,12 +589,12 @@ def test_served_decode_dispatch(S, H, batch, ppw):
         (4, 1, 8, 64, 1, 1),  # 512 pages
         (4, 1, 16, 64, 1, 1),  # 1024 pages
         (4, 1, 32, 64, 2, 0),  # 2048 pages: cap 2, table 4
-        (4, 1, 64, 64, 4, 0),  # 4096 pages: cap 4 == table
-        (4, 1, 128, 64, 4, 0),  # 8192 pages: cap 8, table 4 wins
+        (4, 1, 64, 64, 2, 0),  # 4096 pages: cap 4, default 2 binds
+        (4, 1, 128, 64, 2, 0),  # 8192 pages: cap 8, default 2 binds
         (8, 4, 16, 64, 1, 1),  # table 3, cap 1
         (8, 4, 32, 64, 2, 0),  # table 4, cap 2
-        # Long context keeps the tabled depth: the cap is far above it.
-        (4, 1, 32, 256, 4, 0),
+        (4, 1, 32, 256, 2, 0),  # still the shallow default at max_block 256
+        # Past max_block 256 the ladder's deepest rung comes back, uncapped.
         (4, 1, 32, 4096, 4, 0),
         (8, 4, 32, 4096, 4, 0),
         (4, 1, 1, 4096, 1, 1),
