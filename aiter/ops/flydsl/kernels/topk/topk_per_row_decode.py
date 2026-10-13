@@ -166,6 +166,18 @@ def _row_length(row, row_ends, width, next_n):
     return (row_len > width).select(width, row_len)
 
 
+def _row_view(input, row_starts, row_ends, row, width, next_n, packed):
+    """Row ``row`` of the input: its row, or -- ``packed`` -- the run from
+    element row_starts[row] of a flat input, ending where the row does (past
+    it is the next row, or past the buffer)."""
+    if const_expr(packed):
+        return fx.make_view(
+            fx.add_offset(fx.get_iter(input), row_starts[row]),
+            fx.make_layout((_row_length(row, row_ends, width, next_n),), (1,)),
+        )
+    return fx.slice(input, (row, None))
+
+
 def _load_f32x4(tensor, vec_idx):
     src = fx.slice(tensor, (None, vec_idx))
     fragment = fx.make_fragment_like(src)
@@ -253,8 +265,13 @@ def build_topk_per_row_decode_module(
     wave_size: int,
     write_values: bool = False,
     chunks_per_row: int = _CHUNKS_PER_ROW,
+    packed_rows: bool = False,
 ):
-    """Build a multi-launch radix TopK with runtime row width and MTP geometry."""
+    """Build a multi-launch radix TopK with runtime row width and MTP geometry.
+
+    packed_rows: row r is read from element row_starts[r] of a flat input
+    (indices still relative to that start); otherwise from the input's row r
+    and row_starts is not read."""
     if wave_size not in (32, 64):
         raise ValueError("wave size must be 32 or 64")
     max_n_hist_bins = 1 << _RADIX_BITS
@@ -295,6 +312,7 @@ def build_topk_per_row_decode_module(
         wv=write_values,
         chunks=chunks_per_row,
         blk=block_threads,
+        **({"packed": 1} if packed_rows else {}),
     )
 
     # The histogram and reduce-select bodies are each instantiated once per
@@ -306,6 +324,7 @@ def build_topk_per_row_decode_module(
     # taken before the change cannot be compared with one taken after.
     def histogram_body(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -335,8 +354,9 @@ def build_topk_per_row_decode_module(
         # or past 4 GiB is unaddressable -- measured on the small-k selector,
         # which had the same shape: at exactly 4 GiB every row came back wrong
         # with nothing raised. A row is 4 MiB at the widest width here.
+        input_row = _row_view(input, row_starts, row_ends, row, n, next_n, packed_rows)
         input_rsrc = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(fx.slice(input, (row, None)), max_size=False),
+            fx.rocdl.make_buffer_tensor(input_row, max_size=False),
             fx.make_layout(_VEC, 1),
         )
         row_indices = fx.slice(indices, (row, None))
@@ -357,10 +377,12 @@ def build_topk_per_row_decode_module(
                     valid = out_pos < row_len
                     row_indices[out_pos] = valid.select(out_pos, fx.Int32(-1))
                     if const_expr(write_values):
-                        row_values[out_pos] = valid.select(
-                            input[row, out_pos],
-                            fx.Float32(float("-inf")),
-                        )
+                        # read only inside the row: a packed row's next
+                        # elements are another row's, or past the buffer
+                        value = fx.Float32(float("-inf"))
+                        if valid:
+                            value = input_row[out_pos]
+                        row_values[out_pos] = value
         storage = fx.SharedAllocator().allocate(
             _make_hist_storage(max_n_hist_bins, block_num_waves)
         )
@@ -578,6 +600,7 @@ def build_topk_per_row_decode_module(
     )
     def gather_kernel(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -597,8 +620,9 @@ def build_topk_per_row_decode_module(
         # or past 4 GiB is unaddressable -- measured on the small-k selector,
         # which had the same shape: at exactly 4 GiB every row came back wrong
         # with nothing raised. A row is 4 MiB at the widest width here.
+        input_row = _row_view(input, row_starts, row_ends, row, n, next_n, packed_rows)
         input_rsrc = fx.logical_divide(
-            fx.rocdl.make_buffer_tensor(fx.slice(input, (row, None)), max_size=False),
+            fx.rocdl.make_buffer_tensor(input_row, max_size=False),
             fx.make_layout(_VEC, 1),
         )
         row_len = _row_length(row, row_ends, n, next_n)
@@ -693,13 +717,13 @@ def build_topk_per_row_decode_module(
                     idx = s_above_idxs[local_pos]
                     row_indices[out_pos] = idx
                     if const_expr(write_values):
-                        row_values[out_pos] = input[row, idx]
+                        row_values[out_pos] = input_row[idx]
                 if local_pos < s_equal_count[0]:
                     out_pos = s_equal_base[0] + local_pos
                     idx = s_equal_idxs[local_pos]
                     row_indices[out_pos] = idx
                     if const_expr(write_values):
-                        row_values[out_pos] = input[row, idx]
+                        row_values[out_pos] = input_row[idx]
 
     @flyc.kernel(
         name=f"topk_per_row_decode_stable_count_prefix_{sig}",
@@ -770,6 +794,7 @@ def build_topk_per_row_decode_module(
     )
     def stable_write_kernel(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -795,7 +820,8 @@ def build_topk_per_row_decode_module(
         # with nothing raised. A row is 4 MiB at the widest width here.
         input_rsrc = fx.logical_divide(
             fx.rocdl.make_buffer_tensor(
-                fx.slice(input, (row_i32, None)), max_size=False
+                _row_view(input, row_starts, row_ends, row_i32, n, next_n, packed_rows),
+                max_size=False,
             ),
             fx.make_layout(_VEC, 1),
         )
@@ -966,6 +992,7 @@ def build_topk_per_row_decode_module(
     @flyc.jit
     def launch_topk_per_row_decode(
         input: fx.Tensor,
+        row_starts: fx.Tensor,
         row_ends: fx.Tensor,
         indices: fx.Tensor,
         values: fx.Tensor,
@@ -981,6 +1008,7 @@ def build_topk_per_row_decode_module(
             rp = _radix_pass(pass_idx)
             histogram = histogram_kernels[pass_idx](
                 input,
+                row_starts,
                 row_ends,
                 indices,
                 values,
@@ -1029,6 +1057,7 @@ def build_topk_per_row_decode_module(
             )
             stable_write = stable_write_kernel(
                 input,
+                row_starts,
                 row_ends,
                 indices,
                 values,
@@ -1047,6 +1076,7 @@ def build_topk_per_row_decode_module(
         else:
             gather = gather_kernel(
                 input,
+                row_starts,
                 row_ends,
                 indices,
                 values,

@@ -28,6 +28,7 @@ def ref_paged_attn(
     num_seqs = len(query_lens)
     block_tables = block_tables.cpu().numpy()
     _, block_size, num_kv_heads, head_size = key_cache.shape
+    v_head_size = value_cache.shape[-1]
     outputs: list[torch.Tensor] = []
     start_idx = 0
     query = query.to(torch.float32)
@@ -47,7 +48,7 @@ def ref_paged_attn(
         num_kv_blocks = (kv_len + block_size - 1) // block_size
         block_indices = block_tables[i, :num_kv_blocks]
         k = key_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
-        v = value_cache[block_indices].view(-1, num_kv_heads, head_size)[:kv_len]
+        v = value_cache[block_indices].view(-1, num_kv_heads, v_head_size)[:kv_len]
         if q.shape[1] != k.shape[1]:
             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)

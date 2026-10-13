@@ -6,13 +6,10 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
-from flydsl.expr.utils.arith import _to_raw as _raw
 
-from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.fmha_gfx950.pipeline import (
     DualwaveFp8KernelContext,
     _ds_read_tr8_b64_imm,
@@ -58,16 +55,11 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
             for pas in range_constexpr(traits.PAGED_BT_LDS_SIZE // traits.BLOCK_SIZE):
                 local_tile = self.tid + pas * traits.BLOCK_SIZE
                 if local_tile < staged_tiles:
-                    # Keep byte-addressed stores to preserve LDS address materialization
-                    # across the nested guards.
-                    dst = buffer_ops.get_element_ptr(
-                        self.lds_bt_base_ptr,
-                        byte_offset=_raw(fx.Int32(local_tile * 4)),
-                        elem_type=T.i8,
-                    )
+                    bt_ptr = fx.recast_iter(fx.Int32, self.lds.bt.ptr)
+                    dst = fx.add_offset(bt_ptr, fx.Int32(local_tile))
                     # Empty segments and rounded pipeline tiles still resolve to
                     # an in-bounds page before descriptor bounds zero their data.
-                    llvm.StoreOp(_raw(fx.Int32(0)), dst)
+                    fx.ptr_store(fx.Int32(0), dst)
                     tile = fx.Index(self.split_t0) + local_tile
                     if (local_tile < segment_tiles) & (tile < num_kv_tiles):
                         row = self.batch_idx * self.block_table_stride_v + tile
@@ -78,7 +70,7 @@ class DualwaveFp8PageIdLoader(DualwaveFp8KernelContext):
                             reg,
                         )
                         page = Vec(fx.memref_load_vec(reg))[0]
-                        llvm.StoreOp(_raw(page), dst)
+                        fx.ptr_store(fx.Int32(page), dst)
 
         _run()
 
@@ -181,9 +173,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
                     # descriptor bound cannot mask the logical K tail.
                     valid = n_in_tile + tile_start < self.seqlen_kv_v
                     src_elem = valid.select(src_elem, fx.Index(0x7FFFFFF0))
-                lds_addr = band_base + fx.Index(
-                    pas * traits.WARP_SIZE * traits.VEC_KV * eb
-                )
+                lds_addr = band_base + pas * traits.WARP_SIZE * traits.VEC_KV * eb
                 active = min(slots - pas * traits.WARP_SIZE, traits.WARP_SIZE)
                 if const_expr(active == traits.WARP_SIZE):
                     if const_expr(traits.PAGED):
@@ -255,7 +245,7 @@ class DualwaveFp8KvGmemToLdsLoader(DualwaveFp8PageIdLoader):
         for pas in range_constexpr(passes):
             dma_id = self.wave_id_uni + (pas * traits.NUM_WAVES)
             slot = dma_id * traits.WARP_SIZE + self.lane
-            lds_addr = aligned_base + fx.Index(buf_off) + dma_id * per_dma
+            lds_addr = aligned_base + buf_off + dma_id * per_dma
             grp = slot // slots_per_group
             rem = slot % slots_per_group
             dest_n = fx.Int32(grp * 8 + rem % 8)
@@ -321,7 +311,7 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 addr = (
                     k_base + traits.K_BAND_BASE[b] + row + traits.K_WS_OFF[ws] + d_base
                 )
-                out.append(self.read_i32x8_lds(self.lds_kv_base_ptr, addr))
+                out.append(self.read_i32x8_lds(self.lds.kv.ptr, addr))
             return out
 
         return (_read_strip(n_lo), _read_strip(n_hi))
@@ -377,16 +367,14 @@ class DualwaveFp8KvLdsToVgprLoader(DualwaveFp8KernelContext):
                 byte_off = fx.Int32(
                     tile_base + (lane_half + 2 * half) * traits.HEAD_DIM_V * 16 + d * 16
                 )
-                # The typed LDS view splits this aligned b128 load into read2_b32
-                # pairs and adds address arithmetic; keep the explicit alignment.
-                ptr = buffer_ops.get_element_ptr(
-                    self.lds_vt_base_ptr,
-                    byte_offset=_raw(byte_off - fx.Int32(self.lds_vt_base_idx)),
-                    elem_type=T.i8,
+                ptr_ty = fx.PointerType.get(
+                    fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=16
                 )
-                words = Vec(
-                    llvm.LoadOp(Vec.make_type(4, fx.Int32), ptr, alignment=16).result
+                vt_base = fx.recast_iter(ptr_ty, self.lds.vt.ptr)
+                ptr = fx.add_offset(
+                    vt_base, fx.Int32(byte_off - fx.Int32(self.lds_vt_base_idx))
                 )
+                words = fx.ptr_load(ptr, result_type=Vec.make_type(4, fx.Int32))
                 if const_expr(mask_tail):
                     # Integer masks remove invalid bytes without sanitizing valid NaNs.
                     words = words & Vec.from_elements(

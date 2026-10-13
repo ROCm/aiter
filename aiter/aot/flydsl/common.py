@@ -138,9 +138,10 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     """Collect fixed jobs or parse the configured CSVs for the selected family.
     Family imports may load FlyDSL in the parent process."""
     if kind is OpKind.MEGA_MOE:
-        from .mega_moe import default_jobs
+        from .mega_moe import production_jobs
 
-        return default_jobs()
+        # Ships both V4-Pro and Kimi-K3 so neither JITs online at serving time.
+        return production_jobs()
     if kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import default_jobs
 

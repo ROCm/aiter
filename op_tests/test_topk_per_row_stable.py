@@ -180,6 +180,47 @@ def check_decode(batch, ctx, k, next_n, tie_level):
     return det and ok_order and ok_ref
 
 
+def check_decode_packed(num_rows, width, k, tie_level):
+    """Packed rows (row_starts, width) against the same rows in a width-wide
+    plane: the same kernel, bit-identical indices and values. Lengths are
+    ragged (some under k, most not a multiple of 4), starts 64-element
+    aligned, NaN between rows so a read past a row's end shows."""
+    torch.manual_seed(7)
+    top = min(40000, width) + 1
+    lens = torch.randint(1, top, (num_rows,), dtype=torch.int32, device="cuda")
+    lens[0] = min(k // 2, width)
+    spans = (lens + 63) // 64 * 64
+    starts = (torch.cumsum(spans, 0) - spans).to(torch.int32)
+    values = make_logits(1, int(spans.sum()), tie_level, seed=11)[0]
+    plane = torch.full((num_rows, width), float("-inf"), device="cuda")
+    flat = torch.full((int(spans.sum()) + k,), float("nan"), device="cuda")
+    for r, (s, n) in enumerate(zip(starts.tolist(), lens.tolist())):
+        plane[r, :n] = values[s : s + n]
+        flat[s : s + n] = values[s : s + n]
+
+    def run(packed):
+        idx = torch.empty((num_rows, k), dtype=torch.int32, device="cuda")
+        val = torch.empty((num_rows, k), dtype=torch.float32, device="cuda")
+        if packed:
+            top_k_per_row_decode(
+                flat, 1, lens, idx, num_rows, 0, 1, k=k, stable=True, values=val,
+                row_starts=starts, plane_width=width,
+            )  # fmt: skip
+        else:
+            top_k_per_row_decode(
+                plane, 1, lens, idx, num_rows, width, 1, k=k, stable=True,
+                values=val,
+            )  # fmt: skip
+        torch.cuda.synchronize()
+        return idx, val
+
+    (want, want_val), (got, got_val) = run(False), run(True)
+    ok = torch.equal(want, got) and torch.equal(want_val, got_val)
+    tag = f"decode packed rows={num_rows} width={width} k={k} tie={tie_level}"
+    print(f"[{tag}] matches_plane={ok}")
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-k", type=int, default=None, help="top-k (default: sweep)")
@@ -201,6 +242,14 @@ def main():
         all_ok &= check_prefill(2, 16384, 4096, tie)
         all_ok &= check_decode(2, 16384, 4096, 1, tie)
     all_ok &= check_prefill_many_tied_rows()
+    # packed rows: few rows at a long width take the chunked kernel, many
+    # rows the one-block kernel, a short width the one-workgroup kernel, as
+    # their plane would
+    for tie in ("none", "heavy"):
+        for k in (512, 2048):
+            all_ok &= check_decode_packed(6, 262144, k, tie)
+            all_ok &= check_decode_packed(96, 262144, k, tie)
+            all_ok &= check_decode_packed(6, 16384, k, tie)
     print("\nRESULT:", "ALL PASS" if all_ok else "FAILURES PRESENT")
     assert all_ok, "stable top_k_per_row correctness failed"
 

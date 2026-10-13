@@ -176,6 +176,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
         BN = traits.BLOCK_N
         D_CHUNKS = traits.D_CHUNKS
         NPF = const_expr(traits.NUM_PREFETCH_K)
+        NPF_I = const_expr(fx.Index(NPF))
         t0 = ctx.split_t0
         t_end = ctx.split_t_end
 
@@ -247,7 +248,7 @@ def build_flash_attn_dualwave_swp_fp8_module(
                 )
             )
 
-        kv_gmem_to_lds.load_k(t0 * BN, t0 % fx.Index(NPF), pages[0])
+        kv_gmem_to_lds.load_k(t0 * BN, t0 % NPF_I, pages[0])
         if const_expr(traits.QLDS):
             q_loader.stage_q_to_lds()
             rocdl.s_waitcnt(0)
@@ -255,13 +256,13 @@ def build_flash_attn_dualwave_swp_fp8_module(
             rocdl.s_barrier()
             q_row, q_wide = _load_q_regs()
 
-        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF), pages[1])
-        kv_gmem_to_lds.load_v(t0 * BN, t0 % fx.Index(NPF), pages[0])
-        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % fx.Index(NPF), pages[1])
-        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF), pages[2])
-        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF), pages[3])
-        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % fx.Index(NPF), pages[2])
-        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % fx.Index(NPF), pages[3])
+        kv_gmem_to_lds.load_k((t0 + 1) * BN, (t0 + 1) % NPF_I, pages[1])
+        kv_gmem_to_lds.load_v(t0 * BN, t0 % NPF_I, pages[0])
+        kv_gmem_to_lds.load_v((t0 + 1) * BN, (t0 + 1) % NPF_I, pages[1])
+        kv_gmem_to_lds.load_k((t0 + 2) * BN, (t0 + 2) % NPF_I, pages[2])
+        kv_gmem_to_lds.load_k((t0 + 3) * BN, (t0 + 3) % NPF_I, pages[3])
+        kv_gmem_to_lds.load_v((t0 + 2) * BN, (t0 + 2) % NPF_I, pages[2])
+        kv_gmem_to_lds.load_v((t0 + 3) * BN, (t0 + 3) % NPF_I, pages[3])
         if const_expr(traits.QLDS):
             rocdl.s_waitcnt(0)
         else:
@@ -286,12 +287,10 @@ def build_flash_attn_dualwave_swp_fp8_module(
         l_row = ctx.c_zero_f
         v_o = [ctx.c_zero_v16f32 for _ in range_constexpr(D_CHUNKS)]
 
-        NPF_I = const_expr(fx.Index(NPF))
-
         def _ring_wrap(x):
             return (x >= NPF_I).select(x - NPF_I, x)
 
-        init_args = [m_row, l_row] + v_o + [t0 % fx.Index(NPF)]
+        init_args = [m_row, l_row] + v_o + [t0 % NPF_I]
         loop_results = init_args
         for j, loop_args in range(fx.Index(t0), t_end, 2, init=init_args):
             m_row = loop_args[0]

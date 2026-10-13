@@ -98,7 +98,7 @@ def _get_kernel(
 
 
 # FlyDSL pa_decode route for all-decode calls on the shuffled fp8 KV cache. The
-# partition count is a host-only static rule (no planner, no device sync).
+# partition cap is a host-only rule; the GPU planner refreshes task bounds.
 _PA_DECODE_TILE = 256  # pa_decode's fixed context_partition_size
 _PA_DECODE_MAX_NP = 32
 # Target workgroups per CU for one launch. Measured best on gfx950 for both
@@ -135,8 +135,13 @@ def _pa_decode_ok(max_seqlen_q, shuffled_kv_cache, out, num_seqs) -> bool:
         and max_seqlen_q == 1
         and shuffled_kv_cache
         and out.dtype in (torch.bfloat16, torch.float16)
-        and num_seqs > 0
+        and 0 < num_seqs <= 4096
     )
+
+
+# Serving creates fresh tensor views; geometry and stream retain graph-owned
+# pointers without cross-stream scratch sharing. Never evict captured buffers.
+_PA_DECODE_WORKSPACES = {}
 
 
 def _route_pa_decode(
@@ -158,12 +163,52 @@ def _route_pa_decode(
 ):
     """All-decode call -> FlyDSL pa_decode with fp8 Q. seqused_k is already the
     per-sequence context length, so no cumulative-offset conversion is needed."""
-    from .pa_decode import pa_decode
+    from .pa_decode import pa_decode, plan_pa_decode
 
     np_ = _pa_decode_num_partitions(
         num_seqs, num_kv_heads, int(max_seqlen_k), _num_cu(q.device)
     )
-    with torch.cuda.device(q.device.index):
+    with torch.cuda.device(q.device):
+        stream = torch.cuda.current_stream(q.device)
+        budget = num_seqs * num_kv_heads * np_
+        key = (
+            q.device.index,
+            stream.cuda_stream,
+            num_seqs,
+            num_kv_heads,
+            np_,
+            budget,
+            q.shape[1],
+            q.shape[2],
+            out.dtype,
+            1,
+            0,
+        )
+        workspace = _PA_DECODE_WORKSPACES.get(key)
+        if workspace is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            plan = plan_pa_decode(
+                seqused_k,
+                num_kv_heads,
+                max_partitions=np_,
+                workgroup_budget=budget,
+                query_length=1,
+            )
+            shape = (num_kv_heads, plan.capacity, q.shape[1] // num_kv_heads)
+            workspace = {
+                "plan": plan,
+                "exp_sums": torch.empty(shape, dtype=torch.float32, device=q.device),
+                "max_logits": torch.empty(shape, dtype=torch.float32, device=q.device),
+                "temporary_output": torch.empty(
+                    (*shape, q.shape[2]), dtype=out.dtype, device=q.device
+                ),
+            }
+            _PA_DECODE_WORKSPACES[key] = workspace
+        else:
+            plan = plan_pa_decode(
+                seqused_k, num_kv_heads, query_length=1, plan=workspace["plan"]
+            )
         pa_decode(
             out,
             q,
@@ -173,12 +218,16 @@ def _route_pa_decode(
             block_table,
             float(softmax_scale),
             1,
-            np_,
-            _PA_DECODE_TILE,
-            _FP8_DTYPE,
-            q_descale.reshape(-1),
-            k_descale.reshape(-1),
-            v_descale.reshape(-1),
+            context_partition_size=_PA_DECODE_TILE,
+            compute_type=_FP8_DTYPE,
+            query_scale=q_descale.reshape(-1),
+            key_scale=k_descale.reshape(-1),
+            value_scale=v_descale.reshape(-1),
+            work_plan=plan,
+            max_context_length=int(max_seqlen_k),
+            exp_sums=workspace["exp_sums"],
+            max_logits=workspace["max_logits"],
+            temporary_output=workspace["temporary_output"],
             sinks=sinks,
         )
     return out

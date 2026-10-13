@@ -5,6 +5,7 @@
 
 import functools
 import os
+from typing import NamedTuple
 
 import torch
 import triton
@@ -15,6 +16,14 @@ from aiter import dtypes
 from aiter.jit.core import is_experimental_enabled
 from aiter.jit.utils.asm_guard import require_gfx1250_asm
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx
+from aiter.ops.asm.asm_utils import get_gfx_from_device
+from aiter.ops.asm.mla_decode_v4 import (
+    is_mla_v4_fused_eligible,
+    mla_decode_v4_asm,
+    mla_decode_v4_fused_asm_gfx1250,
+    mla_decode_v4_ps_asm,
+    mla_v4_fused_slot_f32,
+)
 from aiter.ops.attention import get_mla_decode_fwd_max_splits
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
@@ -250,9 +259,10 @@ def _fwd_kernel_stage2_asm(
                 e_max = n_e_max
             offs_logic += stride_mid_ob
             offs_v += stride_mid_ob * Lv
+            # No valid split (empty sequence): e_sum == 0, define O = 0.
             tl.store(
                 O + cur_qo * stride_obs + cur_head * stride_oh + offs_d,
-                acc / e_sum,
+                tl.where(e_sum > 0, acc / e_sum, 0.0),
                 mask=mask_d,
             )
             if HAS_FINAL_LSE:
@@ -357,6 +367,123 @@ def get_meta_param(
     )
 
     return num_kv_splits, num_kv_splits_indptr
+
+
+# Per-arch v4 nm decode latency model used to pick `num_kv_splits`:
+#
+#   t(i) ~= L + W(i) * (C + A * kv_len / i) + [i > 1] * (S + D * num_seqs * i)
+#   W(i)  = ceil(num_seqs * tg_factor * i / cu_num)   (workgroup waves)
+#
+# A is the per-token KV cost of one workgroup, C the per-wave fixed cost, and
+# S + D * num_seqs * i the FP32 partial write + stage-2 merge that every split
+# launch pays. The occupancy-only pick (ignore_total_kv=1) instead rewards
+# filling whole multiples of cu_num, e.g. 13-16 splits for 49-119 seqs whose KV
+# fits one wave.
+#
+# gfx950: least-squares fit (relative error) on MI355X, gqa=128, qSeqLen=1,
+# CUDA-graph replay, 1..16 splits over uniform-KV shapes (7..448 seqs, kv_len
+# 192..8320). Archs without an entry keep the occupancy-only pick.
+_V4_NM_SPLIT_COST = {
+    "gfx950": (12.74, 3.21, 0.0300, 3.38, 0.076),  # L, C, A, S, D (us)
+}
+_V4_NM_MAX_SPLITS = 16
+
+
+@functools.lru_cache(maxsize=1024)
+def _v4_nm_pick_num_kv_splits(cost, num_seqs, tg_factor, kv_len, cu_num):
+    """Split count minimizing the latency model above with coefficients `cost`."""
+    L, C, A, S, D = cost
+    kv_len = max(1, kv_len)
+    best_cost, best_splits = None, 1
+    for i in range(1, _V4_NM_MAX_SPLITS + 1):
+        waves = -(-num_seqs * tg_factor * i // cu_num)
+        t = L + waves * (C + A * kv_len / i)
+        if i > 1:
+            t += S + D * num_seqs * i
+        if best_cost is None or t < best_cost:
+            best_cost, best_splits = t, i
+    return best_splits
+
+
+def get_mla_v4_nm_num_kv_splits(num_seqs, num_heads, kv_len) -> int:
+    """`num_kv_splits` for `mla_decode_fwd_v4_nm` (host only, no device work).
+
+    `num_seqs` / `num_heads` are the decode call's `qo_indptr.shape[0] - 1`
+    and `q.size(1)`; `kv_len` is the per-seq KV length to plan for (the
+    longest one the call can see). Minimizes the latency model above where
+    the arch has coefficients, and is the wrapper's own occupancy-only pick
+    elsewhere. The matching `split_indptr` is the uniform
+    `[0, s, 2s, ..., num_seqs * s]`; any prefix of a longer uniform buffer is
+    one, so callers can keep a constant buffer per split count and slice it
+    instead of writing one per call.
+    """
+    tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
+    cost = _V4_NM_SPLIT_COST.get(get_gfx())
+    if cost is not None:
+        num_kv_splits = _v4_nm_pick_num_kv_splits(
+            cost, num_seqs, tg_factor, int(kv_len), get_cu_num()
+        )
+    else:
+        num_kv_splits, _ = get_meta_param(
+            None,
+            num_seqs,
+            num_seqs * max(1, int(kv_len)),
+            num_heads,
+            1,
+            dtypes.fp8,
+            tg_factor,
+            1,  # ignore_total_kv, as in mla_decode_fwd_v4_nm
+        )
+    return num_kv_splits
+
+
+# Workspace of the persistent v4 nm decode kernel (mla_decode_v4_ps_asm).
+# cnt: [0, 2*65536) row counters, [2*65536, +16*512) reserved,
+# [.., +4*1024) group counters.
+_V4_NM_PS_CNT_INTS = 2 * 65536 + 16 * 512 + 4 * 1024
+_V4_NM_PS_ARANGE = 65537
+_V4_NM_PS_MAX_PARTITIONS = 1024
+
+
+class MlaV4NmPsWorkspace(NamedTuple):
+    """Scratch of `mla_decode_fwd_v4_nm_ps`; build it with
+    `get_mla_v4_nm_ps_workspace`. P = `desc.size(0)` partitions."""
+
+    o_acc: torch.Tensor  # [2P, 128, 512] fp32 split partials
+    lse_acc: torch.Tensor  # [2P, 128] fp32 split partials
+    desc: torch.Tensor  # [P, 8] int32 in-kernel plan
+    cnt: torch.Tensor  # int32 merge counters, zero at rest
+    arange: torch.Tensor  # int32 arange, read-only
+
+
+def get_mla_v4_nm_ps_workspace(device="cuda", num_partitions=128) -> MlaV4NmPsWorkspace:
+    """Allocate a workspace for `mla_decode_fwd_v4_nm_ps`.
+
+    One workspace may serve any number of calls that are ordered on the GPU
+    (same stream, or one CUDA graph replayed at a time); calls that can run
+    concurrently need one workspace each. Nothing carries over between calls,
+    so one workspace can be reused across batch sizes and graphs. Allocate it
+    outside CUDA-graph capture.
+    """
+    if not 1 <= num_partitions <= _V4_NM_PS_MAX_PARTITIONS:
+        raise ValueError(
+            f"num_partitions must be in [1, {_V4_NM_PS_MAX_PARTITIONS}], "
+            f"got {num_partitions}"
+        )
+    if torch.cuda.is_current_stream_capturing():
+        raise RuntimeError(
+            "get_mla_v4_nm_ps_workspace: allocate the workspace before "
+            "CUDA-graph capture"
+        )
+    P = num_partitions
+    i32 = {"dtype": dtypes.i32, "device": device}
+    return MlaV4NmPsWorkspace(
+        o_acc=torch.empty(2 * P, 128, 512, dtype=dtypes.fp32, device=device),
+        lse_acc=torch.empty(2 * P, 128, dtype=dtypes.fp32, device=device),
+        desc=torch.empty(P, 8, **i32),
+        cnt=torch.zeros(_V4_NM_PS_CNT_INTS, **i32),
+        arange=torch.arange(_V4_NM_PS_ARANGE, **i32),
+    )
 
 
 # Persistent MLA-decode kernel gate: the persistent kernel
@@ -604,6 +731,15 @@ def mla_decode_fwd(
             )
             else mgc
         )
+        # gfx950 fp8 qh64 (qt64) kernel interleaves SUB_KV=64 tiles across splits and
+        # skips splits without a tile, so only the first cdiv(kv, 64) splits are written.
+        if (
+            nhead == 64
+            and q.dtype == dtypes.fp8
+            and kv_buffer.dtype == dtypes.fp8
+            and max_seqlen_q == 1
+        ):
+            mgc = 64
 
         MAYBE_FINAL_OUT = True
 
@@ -1715,8 +1851,8 @@ def mla_decode_fwd_v4_nm(
 ):
     """v4 MLA decode forward.
 
-    Routes through the canonical aiter JIT C-ABI module
-    `module_mla_v4_asm` (csrc/py_itfs_cu/asm_mla_v4.cu). Returns
+    Loads and launches the shipped `.co` directly from Python
+    (aiter/ops/asm/mla_decode_v4.py). Returns
     `(logits, attn_lse)` -- both 4D, in **kernel-native layout**:
         logits:   [total_q, num_kv_splits, num_heads, v_head_dim]   FP32
         attn_lse: [total_q, num_kv_splits, num_heads, 1]            FP32
@@ -1738,6 +1874,10 @@ def mla_decode_fwd_v4_nm(
       for the kernel tile) -- identical to `mla_decode_fwd`'s non-persistent
       path. Pass an explicit int to override. Note V4 nm is always
       non-persistent, so only that branch of `get_meta_param` applies.
+      Callers that know their per-seq KV length (and CUDA-graph callers,
+      whose `kv_page_indices` is typically capacity-sized) should pick it
+      with `get_mla_v4_nm_num_kv_splits` and pass it with the uniform
+      `split_indptr` `[0, s, 2s, ...]`.
 
     Multi-pass mode (`num_kv_splits > 1`):
       1. If `split_indptr` is None, build a uniform one:
@@ -1751,6 +1891,20 @@ def mla_decode_fwd_v4_nm(
          FlashAttention LSE merge across the `num_kv_splits` axis and
          writes the merged result directly into the BF16 `output` tensor.
 
+    Fused multi-pass (gfx1250, `2 <= num_kv_splits <= 16`, variant listed in
+    `mla_v4_fused_asm.csv`, e.g. qh32 decode):
+      stage1 and the cross-split merge run in ONE cluster launch (no triton
+      stage2); the final BF16 result is written into `output`. The fp32
+      partial scratch uses a padded slot of `(num_heads + 1) * v_head_dim`
+      elements, so it is allocated here unless the caller passes `logits` in
+      that native shape `[total_q, num_kv_splits, (num_heads+1)*v_head_dim]`
+      (a caller `logits` in the regular 4D shape is ignored). The returned
+      `logits` / `attn_lse` are kernel scratch, viewed as
+      `[total_q, num_kv_splits, num_heads, v_head_dim]` / the regular lse
+      shape; read the result from `output`. `num_kv_splits > 16` keeps the
+      stage1 + stage2 path. Set `AITER_MLA_V4_FUSED=0` to force stage1 +
+      stage2 everywhere.
+
       `sink` (REQUIRED, keyword-only):
       Per-Q-head attention sink logit, total `num_heads` FP32 values
       (= `num_kv_heads * gqa_ratio`). Adds a virtual K-column of logit
@@ -1759,6 +1913,7 @@ def mla_decode_fwd_v4_nm(
 
     """
     require_gfx1250_asm("mla_decode_v4_asm")
+    runtime_gfx = get_gfx_from_device(q.device)
     num_seqs = qo_indptr.shape[0] - 1
     num_heads = q.size(1)
     v_head_dim = output.size(2)
@@ -1805,6 +1960,11 @@ def mla_decode_fwd_v4_nm(
     #       an explicit value back through get_meta_param's fp8 cap (which
     #       could shrink it and desync the buffer shapes). Only synthesize a
     #       uniform split_indptr if the caller didn't pass one.
+    # The fused kernel does not consume split_indptr and therefore only supports
+    # the uniform map synthesized below. Conservatively retain the two-stage
+    # path whenever the caller supplies a map; inspecting a CUDA tensor here
+    # would introduce a host synchronization and break graph capture.
+    fused_split_map_is_uniform = split_indptr is None
     total_kv = kv_page_indices.shape[0]
     if num_kv_splits is None or split_indptr is None:
         tg_factor = max(1, -(-num_heads // 64))  # ceil(num_heads / 64)
@@ -1851,6 +2011,59 @@ def mla_decode_fwd_v4_nm(
 
     expected_logits_shape = (total_q, num_kv_splits, num_heads, v_head_dim)
     expected_lse_shape = (total_q, num_kv_splits, num_heads, 1)
+
+    fused = (
+        is_mla_v4_fused_eligible(q, kv_buffer, max_seqlen_q, num_kv_splits)
+        if fused_split_map_is_uniform
+        else False
+    )
+    if fused:
+        slot = mla_v4_fused_slot_f32(num_heads, v_head_dim)
+        fused_logits_shape = (total_q, num_kv_splits, slot)
+        if logits is not None and tuple(logits.shape) == fused_logits_shape:
+            scratch = logits
+        elif logits is None or tuple(logits.shape) == expected_logits_shape:
+            # Write-only scratch: empty splits are never read back.
+            scratch = torch.empty(
+                fused_logits_shape, dtype=dtypes.fp32, device=q.device
+            )
+        else:
+            raise ValueError(
+                f"mla_decode_fwd_v4_nm: caller-provided `logits` has shape "
+                f"{tuple(logits.shape)}, expected {fused_logits_shape} (fused "
+                f"native) or {expected_logits_shape}."
+            )
+        if attn_lse is None:
+            attn_lse = torch.empty(
+                expected_lse_shape, dtype=dtypes.fp32, device=q.device
+            )
+        elif tuple(attn_lse.shape) != expected_lse_shape:
+            raise ValueError(
+                f"mla_decode_fwd_v4_nm: caller-provided `attn_lse` has shape "
+                f"{tuple(attn_lse.shape)}, expected {expected_lse_shape}."
+            )
+        mla_decode_v4_fused_asm_gfx1250(
+            q,
+            qrope,
+            kv_buffer,
+            kvrope,
+            qo_indptr,
+            kv_indptr,
+            kv_page_indices,
+            sink,
+            scratch,
+            attn_lse,
+            output,
+            max_seqlen_q,
+            int(num_kv_splits),
+            kv_last_page_lens,
+        )
+        logits = scratch.as_strided(
+            expected_logits_shape,
+            (num_kv_splits * slot, slot, v_head_dim, 1),
+        )
+        return logits, attn_lse
+
     if out_16_nosplit != 0:
         # V3-style zero-copy final output. When out_16_nosplit=1 (single-pass),
         # the kernel writes the final DENSELY-PACKED BF16 result into ptr_R
@@ -1898,7 +2111,7 @@ def mla_decode_fwd_v4_nm(
 
     use_valid_split_count_reduce = int(num_kv_splits > 1)
 
-    aiter.mla_decode_v4_asm(
+    mla_decode_v4_asm(
         q,
         qrope,
         kv_buffer,
@@ -1908,14 +2121,14 @@ def mla_decode_fwd_v4_nm(
         kv_page_indices,
         split_indptr,
         sink,
-        max_seqlen_q,
-        sm_scale_arg,
-        int(out_16_nosplit),
-        int(num_kv_splits),
         logits,
         attn_lse,
         output,
         valid_split_count,
+        max_seqlen_q,
+        sm_scale_arg,
+        int(out_16_nosplit),
+        int(num_kv_splits),
         use_valid_split_count_reduce,
         kv_last_page_lens,  # tail: unused on nm path, None -> nullptr
     )
@@ -1932,7 +2145,7 @@ def mla_decode_fwd_v4_nm(
         # ragged rebuild). Other archs keep the original mgc=64 for the gqa16/8
         # single-token tile.
         if max_seqlen_q == 1 and num_heads in (8, 16):
-            mgc = 32 if get_gfx() == "gfx950" else 64
+            mgc = 32 if runtime_gfx == "gfx950" else 64
         else:
             mgc = 16
 
@@ -1956,7 +2169,12 @@ def mla_decode_fwd_v4_nm(
             0,  # stride_lse_bs (unused, HAS_FINAL_LSE=False)
             page_size=1,  # v4 nm KV cache is page_size=1
             KV_INDPTR_IS_PAGE_LEVEL=False,  # page_size=1 -> token-level indptr
-            MAYBE_FINAL_OUT=True,
+            # The kernel only writes the packed-BF16 result in place when
+            # num_kv_splits == 1, which never reaches this merge. A
+            # caller-supplied split_indptr with one split per seq on a wider
+            # grid still gets FP32 partials, so the in-place copy (keyed on
+            # split_indptr[-1] == num_seqs) must stay off.
+            MAYBE_FINAL_OUT=False,
             HAS_FINAL_LSE=False,
             USE_VALID_SPLIT_COUNT_REDUCE=int(num_kv_splits > 1),
             BATCH_NUM=num_seqs,
@@ -1972,3 +2190,58 @@ def mla_decode_fwd_v4_nm(
         )
 
     return logits, attn_lse
+
+
+def mla_decode_fwd_v4_nm_ps(
+    q_packed,  # [N, 128, 512] FP8 packed Q+e8m0
+    q_rope,  # [N, 128, 64] BF16
+    kv_packed,  # [rows, ..., 512] FP8 packed KV pool, page_size 1
+    kv_rope,  # [rows, ..., 64] BF16
+    kv_indptr,  # [>= N+1] int32
+    kv_page_indices,  # [*] int32
+    sink,  # [128] FP32 attention sink logit
+    workspace: MlaV4NmPsWorkspace,
+    out=None,  # [N, 128, 512] BF16
+    return_lse=False,
+    lse=None,  # [N, 128] FP32, used when return_lse
+):
+    """v4 nm decode (128 heads, one query token per row) with the persistent
+    kernel: one launch that plans the KV split over the workspace's
+    partitions from `kv_indptr`, runs the attention and merges the split
+    partials, so no split plan or stage-2 merge is needed.
+
+    Same math and packed layouts as `mla_decode_fwd_v4_nm` with gqa=128 and
+    max_seqlen_q=1. N = `q_packed.size(0)` (N <= 32768); row j attends to pool
+    rows `kv_page_indices[kv_indptr[j] : kv_indptr[j + 1]]`, so `kv_indptr`
+    may hold more than N+1 entries and need not start at 0. Rows with an
+    empty KV range are left unwritten in `out` (and in the LSE).
+
+    `workspace` comes from `get_mla_v4_nm_ps_workspace`; see its sharing
+    rule. Returns `out`, or `(out, lse)` with the natural-log LSE [N, 128]
+    FP32 (sink included) when `return_lse`; `out` / `lse` are allocated
+    when not given.
+    """
+    require_gfx1250_asm("mla_decode_v4_ps_asm")
+    if out is None:
+        out = torch.empty(
+            (q_packed.size(0), 128, 512), dtype=dtypes.bf16, device=q_packed.device
+        )
+    if not return_lse:
+        lse = None
+    elif lse is None:
+        lse = torch.empty(
+            (q_packed.size(0), 128), dtype=dtypes.fp32, device=q_packed.device
+        )
+    mla_decode_v4_ps_asm(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        kv_indptr,
+        kv_page_indices,
+        sink,
+        *workspace,
+        out,
+        lse,
+    )
+    return (out, lse) if return_lse else out

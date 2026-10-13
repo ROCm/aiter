@@ -433,6 +433,145 @@ def test_mla_decode_fwd(
     )
 
 
+@pytest.mark.parametrize(
+    "output_kind,num_kv_heads",
+    [("padded", 2), ("strided", 1), ("offset", 1), ("fp8", 1)],
+)
+@torch.inference_mode()
+def test_mla_decode_fwd_lds_pipeline_ring_wraparound(
+    monkeypatch, output_kind: str, num_kv_heads: int
+):
+    if DEVICE_ARCH != "gfx1250":
+        pytest.skip("LDS pipeline requires gfx1250")
+
+    import aiter.ops.triton.attention.mla as mla_module
+
+    kernel = mla_module.gluon_mla_decode_fwd_kernel
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+                assert kwargs["USE_LDS_PIPELINE"]
+                assert kwargs["num_stages"] == 4
+                assert kwargs["num_warps"] == 4
+                return kernel[grid](*args, **kwargs)
+
+            return launch
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+
+    # Exercise the single-segment specialization with a small batch that also
+    # contains long sequences. The normal occupancy heuristic may split it.
+    select_config = mla_module.select_3d_config
+
+    def single_segment(*args, **kwargs):
+        attn, reduce = select_config(*args, **kwargs)
+        attn["NUM_SEGMENTS_PER_SEQ"] = 1
+        return attn, reduce
+
+    monkeypatch.setattr(mla_module, "select_3d_config", single_segment)
+    torch.manual_seed(0)
+    # Short paths, first buffer reuse, and repeated wraparound with a partial page.
+    lengths = [1, 64, 65, 128, 129, 192, 193, 256, 257, 4097]
+    batch_size, num_query_heads = len(lengths), 128 * num_kv_heads
+    seq_lens_kv = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device="cuda")
+    block_tables = torch.randint(
+        0, 128, (batch_size, 65), dtype=torch.int32, device="cuda"
+    )
+    kv_buffer = torch.randn(
+        (128, 64, num_kv_heads, 576), device="cuda", dtype=torch.bfloat16
+    ).to(e4m3_dtype)
+    query = torch.randn(
+        (batch_size, num_query_heads, 576), device="cuda", dtype=torch.bfloat16
+    ).to(e4m3_dtype)
+    if output_kind == "fp8":
+        # The one-token sequence exercises both saturation limits without
+        # amplifying rounding error near zero throughout the other sequences.
+        block_tables[0, 0] = 0
+        kv_buffer[0, 0, :, 0] = torch.finfo(e4m3_dtype).max
+        kv_buffer[0, 0, :, 1] = torch.finfo(e4m3_dtype).min
+    shuffled_kv_buffer = shuffle_kv_buffer(kv_buffer, 512)
+    q_descale = None if output_kind == "strided" else torch.tensor([0.3], device="cuda")
+    kv_descale = (
+        None if output_kind == "strided" else torch.tensor([0.4], device="cuda")
+    )
+    output_scale = torch.tensor([0.25 if output_kind == "fp8" else 0.7], device="cuda")
+    out_dtype = e4m3_dtype if output_kind == "fp8" else torch.bfloat16
+    width = 513 if output_kind == "strided" else 520
+    storage = torch.full(
+        (batch_size, num_query_heads, width), 16.0, device="cuda", dtype=out_dtype
+    )
+    offset = 1 if output_kind == "offset" else 0
+    output = storage[..., offset : offset + 512]
+
+    def run(skip_reduce=False):
+        return mla_decode_fwd(
+            q=query,
+            kv_buffer=shuffled_kv_buffer,
+            out=output,
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seq_lens_kv,
+            max_seqlen_kv=max(lengths),
+            block_tables=block_tables,
+            softmax_scale=576**-0.5,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            causal=True,
+            q_descale=q_descale,
+            kv_descale=kv_descale,
+            out_scale=output_scale,
+            shuffled_kv_cache=True,
+            skip_reduce=skip_reduce,
+        )
+
+    run()
+    actual = output.float().clone()
+    ref_output = torch_mla_extend(
+        query,
+        kv_buffer,
+        cu_seqlens_q,
+        seq_lens_kv,
+        block_tables,
+        512,
+        576**-0.5,
+        q_descale=q_descale,
+        kv_descale=kv_descale,
+        out_scale=output_scale,
+        o_dtype=torch.float32,
+    )
+    if output_kind == "fp8":
+        ref_output = ref_output.clamp(
+            torch.finfo(e4m3_dtype).min, torch.finfo(e4m3_dtype).max
+        )
+    ref_output = ref_output.to(out_dtype).float()
+    assert torch.isfinite(actual).all()
+    if output_kind == "fp8":
+        assert (actual[0, :, 0] == torch.finfo(e4m3_dtype).max).all()
+        assert (actual[0, :, 1] == torch.finfo(e4m3_dtype).min).all()
+    tol_err_ratio = 0.01
+    assert (
+        checkAllclose(
+            output.to(torch.bfloat16),
+            ref_output.to(torch.bfloat16),
+            atol=1.5e-1,
+            rtol=1.5e-1,
+            tol_err_ratio=tol_err_ratio,
+            msg="mla_decode_fwd LDS pipeline output",
+        )
+        <= tol_err_ratio
+    )
+    assert run(skip_reduce=True) is output
+    assert len(launches) == 2
+    torch.testing.assert_close(output.float(), actual, rtol=0, atol=0)
+    # TDM and direct stores must respect the output view, including its padding.
+    assert (storage[..., offset + 512 :].float() == 16).all()
+    if offset:
+        assert (storage[..., :offset].float() == 16).all()
+
+
 @pytest.mark.parametrize("batch_size", [1])
 @pytest.mark.parametrize("ctx_lens", [200])
 @pytest.mark.parametrize("num_heads", [(16, 1), (128, 1)])
@@ -646,3 +785,98 @@ def test_mla_gluon_decode_over_2gb(batch, ctx, nhead, kv_lora_rank, qk_rope_head
     assert torch.isfinite(o_big.float()).all(), "NaN/Inf in the >2 GB global_load path"
     # the two load paths read identical KV and reduce identically -> exact parity
     torch.testing.assert_close(o_big, o_ref, atol=0, rtol=0)
+
+
+@pytest.mark.parametrize(
+    "batch_size,ctx_lens,skip_reduce,wide_view,extra_tokens,expected_pipeline",
+    [
+        (128, 2048, False, None, 0, False),
+        (129, 2048, False, None, 0, True),
+        (4, 0, False, None, 0, False),
+        (4, 192, False, None, 0, True),
+        (4, 193, False, None, 0, False),
+        (4, 192, True, None, 0, False),
+        (512, 2048, False, "query", 0, False),
+        (512, 2048, False, "output", 0, False),
+        (512, 2048, False, "block_tables", 0, False),
+        (512, 2048, False, None, 1, False),
+    ],
+)
+def test_mla_decode_fwd_lds_pipeline_eligibility(
+    monkeypatch,
+    batch_size: int,
+    ctx_lens: int,
+    skip_reduce: bool,
+    wide_view: str | None,
+    extra_tokens: int,
+    expected_pipeline: bool,
+):
+    import aiter.ops.triton.attention.mla as mla_module
+
+    monkeypatch.setattr(mla_module, "DEVICE_ARCH", "gfx1250")
+    monkeypatch.setattr(mla_module, "IS_DEVICE_ARCH_GFX12", True)
+    monkeypatch.setattr(mla_module, "get_num_sms", lambda: 256)
+    launches = []
+
+    class CaptureLaunch:
+        def __getitem__(self, grid):
+            def launch(*args, **kwargs):
+                launches.append(kwargs)
+
+            return launch
+
+    class SkipLaunch:
+        def __getitem__(self, grid):
+            return lambda *args, **kwargs: None
+
+    monkeypatch.setattr(mla_module, "gluon_mla_decode_fwd_kernel", CaptureLaunch())
+    monkeypatch.setattr(mla_module, "triton_mla_decode_fwd_reduce_kernel", SkipLaunch())
+    # Metadata-only dispatch checks: no large allocation and no GPU launch.
+    query = torch.empty(
+        (batch_size + extra_tokens, 128, 576), dtype=e4m3_dtype, device="meta"
+    )
+    kv_buffer = torch.empty((64, 1, 64, 576), dtype=e4m3_dtype, device="meta")
+    output = torch.empty((batch_size + extra_tokens, 128, 512), device="meta")
+    block_tables = torch.empty((batch_size, 32), dtype=torch.int32, device="meta")
+    if wide_view:
+        tensors = {"query": query, "output": output, "block_tables": block_tables}
+        view = tensors[wide_view]
+        strides = list(view.stride())
+        strides[0] = 2**30  # fits i32 itself, but the sequence offset does not
+        tensors[wide_view] = torch.empty_strided(
+            view.shape, strides, dtype=view.dtype, device="meta"
+        )
+        query, output, block_tables = (
+            tensors["query"],
+            tensors["output"],
+            tensors["block_tables"],
+        )
+    cu_seqlens_q = torch.empty((batch_size + 1,), dtype=torch.int32, device="meta")
+    seq_lens_kv = torch.empty((batch_size,), dtype=torch.int32, device="meta")
+    result = mla_module.mla_decode_fwd(
+        q=query,
+        kv_buffer=kv_buffer,
+        out=output,
+        cu_seqlens_q=cu_seqlens_q,
+        seqused_k=seq_lens_kv,
+        max_seqlen_kv=ctx_lens,
+        block_tables=block_tables,
+        softmax_scale=576**-0.5,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        causal=True,
+        q_descale=None,
+        kv_descale=None,
+        shuffled_kv_cache=True,
+        skip_reduce=skip_reduce,
+    )
+    assert len(launches) == 1
+    assert launches[0].get("USE_LDS_PIPELINE", False) == expected_pipeline
+    if expected_pipeline:
+        assert launches[0]["num_stages"] == 4
+    else:
+        assert launches[0]["num_stages"] == 2
+    if skip_reduce and launches[0]["NUM_SEGMENTS_PER_SEQ"] > 1:
+        assert isinstance(result, tuple) and len(result) == 3
+    else:
+        assert result is output
