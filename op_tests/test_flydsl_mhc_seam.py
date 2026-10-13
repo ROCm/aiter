@@ -428,7 +428,10 @@ def main():
             "mhc seam config sweep (markdown):\n%s", sweep.to_markdown(index=False)
         )
         # fastest config per (T, H, NORM): the rows a policy table is made from
-        best = sweep.loc[sweep.groupby(["T", "H", "norm"])["graph us"].idxmin()]
+        if sweep.empty:
+            best = sweep
+        else:
+            best = sweep.loc[sweep.groupby(["T", "H", "norm"])["graph us"].idxmin()]
         aiter.logger.info(
             "mhc seam config sweep, best per T (markdown):\n%s",
             best.to_markdown(index=False),
