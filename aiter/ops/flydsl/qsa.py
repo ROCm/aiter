@@ -422,6 +422,7 @@ def qsa_layer(
         probe = indices
         if probe is None:
             probe = torch.empty(rows, width, dtype=torch.int32, device=q_indexer.device)
+            indices = probe
         selected = (
             "flydsl"
             if qsa_auto_uses_flydsl(
