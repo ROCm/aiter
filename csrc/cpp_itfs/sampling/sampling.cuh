@@ -469,9 +469,8 @@ __global__ void radix_topk_one_block_kernel(
     }
     __syncthreads();
 
-    // Point in/in_idx at the first element of the row window: every pass below
-    // scans [0, row_len) of it and emits row-local indices, which are shifted
-    // back to row coordinates by add_row_start() before each exit.
+    // Point in/in_idx at the row window. Indices stay row-local until
+    // add_row_start() shifts them back before each exit.
     in += batch_id * len + rowStart;
     if (out) out += batch_id * k;
     if (out_idx) out_idx += batch_id * k;
