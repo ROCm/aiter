@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""High-level API for fused KDA decode on gfx950 with 12 heads and dim 128."""
+"""High-level API for fused KDA decode on gfx950 with supported head counts."""
 
 from __future__ import annotations
 
@@ -14,9 +14,8 @@ from aiter.jit.utils.chip_info import get_gfx_runtime
 from .kernels.kda_decode_gfx950 import create_kda_decode_kernel
 from .kernels.tensor_shim import _run_compiled
 
-_HEADS = 12
+_SUPPORTED_HEADS = (8, 12, 16)
 _DIM = 128
-_CONV_CHANNELS = 3 * _HEADS * _DIM
 _CONV_WIDTH = 4
 _INT32_MAX = 2**31 - 1
 
@@ -108,6 +107,20 @@ def _check_dense_cache_slots(
         raise ValueError(f"`{name}` must have dense, non-overlapping cache slots.")
 
 
+def _check_conv_cache_slots(tensor: torch.Tensor) -> None:
+    """Accept channel-major and transposed width-major convolution envelopes."""
+    channels = tensor.shape[1]
+    channel_stride, width_stride = tensor.stride()[1:]
+    if width_stride == 1 and channel_stride >= _CONV_WIDTH - 1:
+        slot_span = (channels - 1) * channel_stride + _CONV_WIDTH - 1
+    elif channel_stride == 1 and width_stride >= channels:
+        slot_span = (_CONV_WIDTH - 2) * width_stride + channels
+    else:
+        raise ValueError("`conv_state` must have non-overlapping channel/width rows.")
+    if tensor.stride(0) < slot_span:
+        raise ValueError("`conv_state` must have non-overlapping cache slots.")
+
+
 def _check_i32_addressing(
     name: str,
     tensor: torch.Tensor,
@@ -154,16 +167,22 @@ def _validate_kda_inputs(
     output_gate: torch.Tensor,
     norm_weight: torch.Tensor,
     out: torch.Tensor | None,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, int]:
     """Validate operands shared by both explicit KDA specializations."""
     if not is_flydsl_kda_decode_supported(device):
         raise RuntimeError(f"`{api_name}` requires a gfx950 GPU.")
     if batch <= 0:
         raise ValueError(f"`{batch_source}` must have a non-empty batch dimension.")
-    if batch * _HEADS > _INT32_MAX:
+    if state.ndim != 4:
+        raise ValueError(f"`state` must have rank 4, got rank {state.ndim}.")
+    num_heads = state.shape[1]
+    if num_heads not in _SUPPORTED_HEADS:
+        raise ValueError(
+            f"`state` head count must be one of {_SUPPORTED_HEADS}, got {num_heads}."
+        )
+    conv_channels = 3 * num_heads * _DIM
+    if batch * num_heads > _INT32_MAX:
         raise ValueError("The KDA launch grid must fit int32 addressing.")
-    if conv_bias is not None:
-        raise ValueError("This specialization requires `conv_bias=None`.")
     if lower_bound is None:
         raise ValueError("This specialization requires the KDA lower-bound gate.")
 
@@ -182,10 +201,12 @@ def _validate_kda_inputs(
         ),
         device,
     )
+    if conv_bias is not None:
+        _check_same_device((("conv_bias", conv_bias),), device)
     _check_tensor(
         "x",
         x,
-        shape=(batch, _CONV_CHANNELS),
+        shape=(batch, conv_channels),
         dtype=torch.bfloat16,
         device=device,
         inner_strides=(1,),
@@ -193,32 +214,38 @@ def _validate_kda_inputs(
     _check_tensor(
         "conv_weight",
         conv_weight,
-        shape=(_CONV_CHANNELS, _CONV_WIDTH),
+        shape=(conv_channels, _CONV_WIDTH),
         dtype=torch.float32,
         device=device,
     )
+    if conv_bias is not None:
+        _check_tensor(
+            "conv_bias",
+            conv_bias,
+            shape=(conv_channels,),
+            dtype=torch.float32,
+            device=device,
+            inner_strides=(1,),
+        )
     if conv_state.ndim != 3 or conv_state.shape[1:] != (
-        _CONV_CHANNELS,
+        conv_channels,
         _CONV_WIDTH - 1,
     ):
         raise ValueError(
-            "`conv_state` must have shape [cache, 4608, 3], "
+            f"`conv_state` must have shape [cache, {conv_channels}, 3], "
             f"got {list(conv_state.shape)}."
         )
     if conv_state.dtype != torch.bfloat16:
         raise ValueError("`conv_state` must have dtype torch.bfloat16.")
-    # Channel-major [cache, 4608, 3], or the [cache, 3, 4608] width-major cache
-    # (SGLang's layout) viewed through transpose(-1, -2).
-    _check_dense_cache_slots(
-        "conv_state", conv_state, ((_CONV_WIDTH - 1, 1), (1, _CONV_CHANNELS))
-    )
-    if state.ndim != 4 or state.shape[1:] != (
-        _HEADS,
+    _check_conv_cache_slots(conv_state)
+    if state.shape[1:] != (
+        num_heads,
         _DIM,
         _DIM,
     ):
         raise ValueError(
-            f"`state` must have shape [cache, 12, 128, 128], got {list(state.shape)}."
+            f"`state` must have shape [cache, {num_heads}, 128, 128], "
+            f"got {list(state.shape)}."
         )
     if state.dtype != torch.float32:
         raise ValueError("`state` must have dtype torch.float32.")
@@ -226,7 +253,7 @@ def _validate_kda_inputs(
     _check_tensor(
         "raw_beta",
         raw_beta,
-        shape=(1, batch, _HEADS),
+        shape=(1, batch, num_heads),
         dtype=torch.bfloat16,
         device=device,
         inner_strides=(1,),
@@ -234,7 +261,7 @@ def _validate_kda_inputs(
     _check_tensor(
         "A_log",
         A_log,
-        shape=(_HEADS,),
+        shape=(num_heads,),
         dtype=torch.float32,
         device=device,
         inner_strides=(1,),
@@ -242,7 +269,7 @@ def _validate_kda_inputs(
     _check_tensor(
         "dt_bias",
         dt_bias,
-        shape=(_HEADS * _DIM,),
+        shape=(num_heads * _DIM,),
         dtype=torch.float32,
         device=device,
         inner_strides=(1,),
@@ -258,7 +285,7 @@ def _validate_kda_inputs(
     _check_tensor(
         "output_gate",
         output_gate,
-        shape=(batch, _HEADS, _DIM),
+        shape=(batch, num_heads, _DIM),
         dtype=torch.bfloat16,
         device=device,
         inner_strides=(1,),
@@ -285,10 +312,12 @@ def _validate_kda_inputs(
         ("norm_weight", norm_weight, 0),
     ):
         _check_i32_addressing(name, tensor, first_dim=first_dim)
+    if conv_bias is not None:
+        _check_i32_addressing("conv_bias", conv_bias)
 
     if out is None:
         out = torch.empty(
-            (1, batch, _HEADS, _DIM),
+            (1, batch, num_heads, _DIM),
             dtype=torch.bfloat16,
             device=device,
         )
@@ -296,17 +325,17 @@ def _validate_kda_inputs(
     _check_tensor(
         "out",
         out,
-        shape=(1, batch, _HEADS, _DIM),
+        shape=(1, batch, num_heads, _DIM),
         dtype=torch.bfloat16,
         device=device,
         inner_strides=(1,),
     )
     _check_i32_addressing("out", out, first_dim=1)
     # The final head need not include trailing padding in the batch stride.
-    head_span = (_HEADS - 1) * out.stride(2) + _DIM
+    head_span = (num_heads - 1) * out.stride(2) + _DIM
     if out.stride(2) < _DIM or (batch > 1 and out.stride(1) < head_span):
         raise ValueError("`out` must have non-overlapping batch and head rows.")
-    return out
+    return out, num_heads
 
 
 def flydsl_kda_decode(
@@ -328,7 +357,7 @@ def flydsl_kda_decode(
 ) -> torch.Tensor:
     """Fuse width-4 Q/K/V convolution, FP32 KDA updates, and BF16 output gating.
 
-    Requires gfx950, 12 heads, and 128-dim state (Kimi-K3 TP8). Check
+    Requires gfx950, a supported head count, and 128-dim state. Check
     :func:`is_flydsl_kda_decode_supported` before dispatch.
     Strides and byte spans must fit non-negative int32 buffer addressing,
     except cache slot strides, which are rebased in int64.
@@ -351,7 +380,7 @@ def flydsl_kda_decode(
         raise ValueError("`x` must be a CUDA tensor.")
     device = x.device
     batch = x.shape[0]
-    out = _validate_kda_inputs(
+    out, num_heads = _validate_kda_inputs(
         api_name="flydsl_kda_decode",
         batch_source="x",
         device=device,
@@ -374,7 +403,7 @@ def flydsl_kda_decode(
     _check_tensor(
         "raw_g",
         raw_g,
-        shape=(1, batch, _HEADS, _DIM),
+        shape=(1, batch, num_heads, _DIM),
         dtype=torch.bfloat16,
         device=device,
         inner_strides=(_DIM, 1),
@@ -382,9 +411,11 @@ def flydsl_kda_decode(
     _check_i32_addressing("raw_g", raw_g, first_dim=1)
 
     executable = create_kda_decode_kernel(
+        num_heads,
         float(norm_eps),
         float(lower_bound),
         fuse_f_b=False,
+        has_conv_bias=conv_bias is not None,
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
@@ -392,6 +423,7 @@ def flydsl_kda_decode(
             executable,
             x,
             conv_weight,
+            conv_bias if conv_bias is not None else A_log,
             conv_state,
             raw_g,
             raw_beta,
@@ -407,6 +439,7 @@ def flydsl_kda_decode(
             x.stride(0),
             conv_weight.stride(0),
             conv_weight.stride(1),
+            0 if conv_bias is None else conv_bias.stride(0),
             conv_state.stride(0),
             conv_state.stride(1),
             conv_state.stride(2),
@@ -463,17 +496,8 @@ def flydsl_kda_decode_with_f_b(
         device=device,
         inner_strides=(1,),
     )
-    _check_tensor(
-        "f_b_weight",
-        f_b_weight,
-        shape=(_HEADS, _DIM, _DIM),
-        dtype=torch.bfloat16,
-        device=device,
-        inner_strides=(_DIM, 1),
-    )
     _check_i32_addressing("f_a", f_a)
-    _check_i32_addressing("f_b_weight", f_b_weight)
-    out = _validate_kda_inputs(
+    out, num_heads = _validate_kda_inputs(
         api_name="flydsl_kda_decode_with_f_b",
         batch_source="f_a",
         device=device,
@@ -492,11 +516,22 @@ def flydsl_kda_decode_with_f_b(
         norm_weight=norm_weight,
         out=out,
     )
+    _check_tensor(
+        "f_b_weight",
+        f_b_weight,
+        shape=(num_heads, _DIM, _DIM),
+        dtype=torch.bfloat16,
+        device=device,
+        inner_strides=(_DIM, 1),
+    )
+    _check_i32_addressing("f_b_weight", f_b_weight)
 
     executable = create_kda_decode_kernel(
+        num_heads,
         float(norm_eps),
         float(lower_bound),
         fuse_f_b=True,
+        has_conv_bias=conv_bias is not None,
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
@@ -506,6 +541,7 @@ def flydsl_kda_decode_with_f_b(
             f_b_weight,
             x,
             conv_weight,
+            conv_bias if conv_bias is not None else A_log,
             conv_state,
             raw_beta,
             A_log,
@@ -523,6 +559,7 @@ def flydsl_kda_decode_with_f_b(
             x.stride(0),
             conv_weight.stride(0),
             conv_weight.stride(1),
+            0 if conv_bias is None else conv_bias.stride(0),
             conv_state.stride(0),
             conv_state.stride(1),
             conv_state.stride(2),

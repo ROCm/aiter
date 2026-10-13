@@ -43,6 +43,7 @@ _NORM_EPS = 1e-5
 class Inputs:
     x: torch.Tensor
     conv_weight: torch.Tensor
+    conv_bias: torch.Tensor | None
     conv_state: torch.Tensor
     raw_g: torch.Tensor
     raw_beta: torch.Tensor
@@ -55,20 +56,25 @@ class Inputs:
 
 
 def _make_inputs(
-    batch: int, seed: int = 20260728, conv_width_major: bool = False
+    batch: int,
+    seed: int = 20260728,
+    num_heads: int = _HEADS,
+    use_conv_bias: bool = False,
+    conv_width_major: bool = False,
 ) -> Inputs:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + batch)
     slots = batch + 2
+    channels = 3 * num_heads * _DIM
 
     x_storage = torch.randn(
-        (batch, _CHANNELS + 17),
+        (batch, channels + 17),
         dtype=torch.bfloat16,
         device=_DEVICE,
         generator=generator,
     )
-    x = x_storage[:, :_CHANNELS]
+    x = x_storage[:, :channels]
     conv_weight = 0.1 * torch.randn(
-        (_CHANNELS, _CONV_WIDTH),
+        (channels, _CONV_WIDTH),
         dtype=torch.float32,
         device=_DEVICE,
         generator=generator,
@@ -77,34 +83,34 @@ def _make_inputs(
     # Kimi's hybrid cache can pad the slot stride. Exercise that layout
     # explicitly while keeping each slot's inner dimensions contiguous.
     conv_storage = torch.randn(
-        (slots, _CHANNELS * (_CONV_WIDTH - 1) + 19),
+        (slots, channels * (_CONV_WIDTH - 1) + 19),
         dtype=torch.bfloat16,
         device=_DEVICE,
         generator=generator,
     )
-    conv_state = conv_storage[:, : _CHANNELS * (_CONV_WIDTH - 1)]
+    conv_state = conv_storage[:, : channels * (_CONV_WIDTH - 1)]
     if conv_width_major:
-        # SGLang keeps the cache as [slots, width - 1, channels] and passes
-        # conv_states.transpose(-1, -2), so the inner strides are (1, channels).
-        conv_state = conv_state.view(slots, _CONV_WIDTH - 1, _CHANNELS).transpose(1, 2)
+        conv_state = conv_state.view(slots, _CONV_WIDTH - 1, channels).transpose(1, 2)
     else:
-        conv_state = conv_state.view(slots, _CHANNELS, _CONV_WIDTH - 1)
+        conv_state = conv_state.view(slots, channels, _CONV_WIDTH - 1)
     state_storage = 0.01 * torch.randn(
-        (slots, _HEADS * _DIM * _DIM + 23),
+        (slots, num_heads * _DIM * _DIM + 23),
         dtype=torch.float32,
         device=_DEVICE,
         generator=generator,
     )
-    state = state_storage[:, : _HEADS * _DIM * _DIM].view(slots, _HEADS, _DIM, _DIM)
+    state = state_storage[:, : num_heads * _DIM * _DIM].view(
+        slots, num_heads, _DIM, _DIM
+    )
 
     raw_beta_storage = torch.randn(
-        (1, batch, _HEADS + 1),
+        (1, batch, num_heads + 1),
         dtype=torch.bfloat16,
         device=_DEVICE,
         generator=generator,
     )
     output_gate_storage = torch.randn(
-        (batch, _HEADS * _DIM + 7),
+        (batch, num_heads * _DIM + 7),
         dtype=torch.bfloat16,
         device=_DEVICE,
         generator=generator,
@@ -112,24 +118,35 @@ def _make_inputs(
     return Inputs(
         x=x,
         conv_weight=conv_weight,
+        conv_bias=(
+            0.05
+            * torch.randn(
+                (channels,),
+                dtype=torch.float32,
+                device=_DEVICE,
+                generator=generator,
+            )
+            if use_conv_bias
+            else None
+        ),
         conv_state=conv_state,
         raw_g=torch.randn(
-            (1, batch, _HEADS, _DIM),
+            (1, batch, num_heads, _DIM),
             dtype=torch.bfloat16,
             device=_DEVICE,
             generator=generator,
         ),
-        raw_beta=raw_beta_storage[:, :, :_HEADS],
+        raw_beta=raw_beta_storage[:, :, :num_heads],
         A_log=0.5
         * torch.randn(
-            (_HEADS,),
+            (num_heads,),
             dtype=torch.float32,
             device=_DEVICE,
             generator=generator,
         ),
         dt_bias=0.1
         * torch.randn(
-            (_HEADS * _DIM,),
+            (num_heads * _DIM,),
             dtype=torch.float32,
             device=_DEVICE,
             generator=generator,
@@ -141,7 +158,9 @@ def _make_inputs(
             dtype=torch.int32,
             device=_DEVICE,
         ),
-        output_gate=output_gate_storage[:, : _HEADS * _DIM].view(batch, _HEADS, _DIM),
+        output_gate=output_gate_storage[:, : num_heads * _DIM].view(
+            batch, num_heads, _DIM
+        ),
         norm_weight=torch.randn(
             (_DIM,),
             dtype=torch.bfloat16,
@@ -164,24 +183,46 @@ def _copy_inputs(inputs: Inputs) -> Inputs:
 
     return Inputs(
         **{
-            name: clone_preserving_strides(getattr(inputs, name))
+            name: (
+                clone_preserving_strides(getattr(inputs, name))
+                if getattr(inputs, name) is not None
+                else None
+            )
             for name in Inputs.__dataclass_fields__
         }
     )
 
 
+def _clone_with_storage_offset(tensor: torch.Tensor, offset: int = 17) -> torch.Tensor:
+    span = 1 + sum(
+        (size - 1) * stride for size, stride in zip(tensor.shape, tensor.stride())
+    )
+    storage = torch.empty(span + offset, dtype=tensor.dtype, device=tensor.device)
+    clone = torch.as_strided(
+        storage,
+        tensor.shape,
+        tensor.stride(),
+        storage_offset=offset,
+    )
+    clone.copy_(tensor)
+    return clone
+
+
 def _reference(inputs: Inputs) -> torch.Tensor:
     batch = inputs.x.shape[0]
+    num_heads = inputs.state.shape[1]
     output = torch.zeros(
-        (1, batch, _HEADS, _DIM),
+        (1, batch, num_heads, _DIM),
         dtype=torch.bfloat16,
         device=_DEVICE,
     )
-    dt_bias = inputs.dt_bias.view(_HEADS, _DIM)
+    dt_bias = inputs.dt_bias.view(num_heads, _DIM)
 
     for batch_idx in range(batch):
         state_idx = int(inputs.state_indices[batch_idx])
-        if state_idx <= 0:
+        if state_idx <= 0 or state_idx >= min(
+            inputs.state.shape[0], inputs.conv_state.shape[0]
+        ):
             continue
 
         history = inputs.conv_state[state_idx]
@@ -192,19 +233,20 @@ def _reference(inputs: Inputs) -> torch.Tensor:
             ),
             dim=-1,
         )
-        packed_qkv = F.silu((conv_values * inputs.conv_weight).sum(dim=-1)).to(
-            torch.bfloat16
-        )
+        packed_qkv = (conv_values * inputs.conv_weight).sum(dim=-1)
+        if inputs.conv_bias is not None:
+            packed_qkv = packed_qkv + inputs.conv_bias
+        packed_qkv = F.silu(packed_qkv).to(torch.bfloat16)
         history[:, 0].copy_(history[:, 1])
         history[:, 1].copy_(history[:, 2])
         history[:, 2].copy_(inputs.x[batch_idx])
 
         q, k, v = packed_qkv.view(
             3,
-            _HEADS,
+            num_heads,
             _DIM,
         ).unbind(0)
-        for head_idx in range(_HEADS):
+        for head_idx in range(num_heads):
             q_head = q[head_idx].float()
             k_head = k[head_idx].float()
             q_head = q_head * torch.rsqrt(q_head.square().sum() + 1e-6)
@@ -261,10 +303,12 @@ def _reference(inputs: Inputs) -> torch.Tensor:
     return output
 
 
-# Worst element error vs the fp32 reference over this file on gfx950: output
-# 1.2e-4 (|ref| up to 3.9, needs atol 9.7e-5 at rtol 1e-3), state 8.8e-8.
 _OUTPUT_TOL = {"atol": 1e-3, "rtol": 1e-3}
 _STATE_TOL = {"atol": 1e-6, "rtol": 1e-3}
+# Worst gfx950 element errors observed for the biased H8/H16 GLM cases:
+# output 1.953125e-3 and recurrent state 3.59e-5.
+_GLM_OUTPUT_TOL = {"atol": 2e-3, "rtol": 1e-3}
+_GLM_STATE_TOL = {"atol": 4e-5, "rtol": 1e-3}
 
 
 def _assert_close(
@@ -283,7 +327,7 @@ def _run(inputs: Inputs, out: torch.Tensor | None = None) -> torch.Tensor:
     return flydsl_kda_decode(
         x=inputs.x,
         conv_weight=inputs.conv_weight,
-        conv_bias=None,
+        conv_bias=inputs.conv_bias,
         conv_state=inputs.conv_state,
         raw_g=inputs.raw_g,
         raw_beta=inputs.raw_beta,
@@ -302,6 +346,8 @@ def _run(inputs: Inputs, out: torch.Tensor | None = None) -> torch.Tensor:
 def _make_fb_inputs(
     batch: int,
     seed: int = 20260728,
+    num_heads: int = _HEADS,
+    use_conv_bias: bool = False,
     conv_width_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Inputs]:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + 10_000 + batch)
@@ -315,18 +361,24 @@ def _make_fb_inputs(
     f_b_weight = (
         0.05
         * torch.randn(
-            (_HEADS, _DIM, _DIM),
+            (num_heads, _DIM, _DIM),
             dtype=torch.bfloat16,
             device=_DEVICE,
             generator=generator,
         )
     ).to(torch.bfloat16)
-    inputs = _make_inputs(batch, seed, conv_width_major)
+    inputs = _make_inputs(
+        batch,
+        seed,
+        num_heads=num_heads,
+        use_conv_bias=use_conv_bias,
+        conv_width_major=conv_width_major,
+    )
     projected = F.linear(
         f_a.float(),
-        f_b_weight.view(_HEADS * _DIM, _DIM).float(),
+        f_b_weight.view(num_heads * _DIM, _DIM).float(),
     ).to(torch.bfloat16)
-    inputs.raw_g.copy_(projected.view(1, batch, _HEADS, _DIM))
+    inputs.raw_g.copy_(projected.view(1, batch, num_heads, _DIM))
     return f_a, f_b_weight, inputs
 
 
@@ -341,7 +393,7 @@ def _run_with_f_b(
         f_b_weight=f_b_weight,
         x=inputs.x,
         conv_weight=inputs.conv_weight,
-        conv_bias=None,
+        conv_bias=inputs.conv_bias,
         conv_state=inputs.conv_state,
         raw_beta=inputs.raw_beta,
         A_log=inputs.A_log,
@@ -398,11 +450,147 @@ def test_kda_decode_matches_reference(batch: int, conv_width_major: bool) -> Non
     assert is_flydsl_kda_decode_supported(_DEVICE)
     assert not torch.isnan(actual).any()
     _assert_close(reference, actual, _OUTPUT_TOL, "output")
-    _assert_close(reference_inputs.state, actual_inputs.state, _STATE_TOL, "state")
+    _assert_close(
+        reference_inputs.state,
+        actual_inputs.state,
+        _STATE_TOL,
+        "state",
+    )
     assert torch.equal(
         reference_inputs.conv_state,
         actual_inputs.conv_state,
     )
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("batch", [1, 8, 16])
+def test_glm_kda_decode_matches_reference(batch: int, num_heads: int) -> None:
+    seed = _make_inputs(batch, num_heads=num_heads, use_conv_bias=True)
+    reference_inputs = _copy_inputs(seed)
+    actual_inputs = _copy_inputs(seed)
+
+    reference = _reference(reference_inputs)
+    actual = _run(actual_inputs)
+    torch.cuda.synchronize()
+
+    assert not torch.isnan(actual).any()
+    _assert_close(reference, actual, _GLM_OUTPUT_TOL, "GLM output")
+    _assert_close(
+        reference_inputs.state, actual_inputs.state, _GLM_STATE_TOL, "GLM state"
+    )
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+def test_glm_kda_decode_nonzero_storage_offsets(num_heads: int) -> None:
+    seed = _make_inputs(4, num_heads=num_heads, use_conv_bias=True)
+    actual_inputs = Inputs(
+        **{
+            name: (
+                _clone_with_storage_offset(getattr(seed, name))
+                if getattr(seed, name) is not None
+                else None
+            )
+            for name in Inputs.__dataclass_fields__
+        }
+    )
+    reference_inputs = _copy_inputs(seed)
+
+    reference = _reference(reference_inputs)
+    actual = _run(actual_inputs)
+    torch.cuda.synchronize()
+
+    _assert_close(reference, actual, _GLM_OUTPUT_TOL, "offset output")
+    _assert_close(
+        reference_inputs.state, actual_inputs.state, _GLM_STATE_TOL, "offset state"
+    )
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+def test_glm_kda_decode_transposed_conv_envelope(num_heads: int) -> None:
+    seed = _make_inputs(4, num_heads=num_heads, use_conv_bias=True)
+    channels = seed.conv_state.shape[1]
+    raw_conv = torch.empty(
+        seed.conv_state.shape[0],
+        _CONV_WIDTH - 1,
+        channels + 11,
+        dtype=seed.conv_state.dtype,
+        device=seed.conv_state.device,
+    )
+    conv_envelope = raw_conv[:, :, 5 : 5 + channels].transpose(-1, -2)
+    conv_envelope.copy_(seed.conv_state)
+    actual_inputs = _copy_inputs(seed)
+    actual_inputs.conv_state = conv_envelope
+    reference_inputs = _copy_inputs(seed)
+
+    reference = _reference(reference_inputs)
+    actual = _run(actual_inputs)
+    torch.cuda.synchronize()
+
+    _assert_close(reference, actual, _GLM_OUTPUT_TOL, "transposed output")
+    _assert_close(
+        reference_inputs.state,
+        actual_inputs.state,
+        _GLM_STATE_TOL,
+        "transposed state",
+    )
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("zero_state", [False, True])
+def test_glm_kda_decode_graph_replay_and_padding(
+    num_heads: int, zero_state: bool
+) -> None:
+    batch = 8
+    seed = _make_inputs(batch, num_heads=num_heads, use_conv_bias=True)
+    slots = seed.state.shape[0]
+    seed.state_indices.copy_(
+        torch.tensor(
+            [1, slots - 1, 0, -1, slots, slots + 7, 2, 3],
+            dtype=torch.int32,
+            device=_DEVICE,
+        )
+    )
+    if zero_state:
+        seed.state.zero_()
+
+    reference_inputs = _copy_inputs(seed)
+    reference = _reference(reference_inputs)
+    graph_inputs = _copy_inputs(seed)
+    out = torch.empty_like(reference)
+
+    # Compile before capture. The captured call must only launch the cached
+    # specialization and mutate the supplied static buffers.
+    warmup_inputs = _copy_inputs(seed)
+    _run(warmup_inputs)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run(graph_inputs, out=out)
+    torch.cuda.synchronize()
+
+    for _ in range(2):
+        graph_inputs.conv_state.copy_(seed.conv_state)
+        graph_inputs.state.copy_(seed.state)
+        out.fill_(torch.nan)
+        graph.replay()
+        torch.cuda.synchronize()
+
+        assert torch.isfinite(out).all()
+        _assert_close(reference, out, _GLM_OUTPUT_TOL, "graph output")
+        _assert_close(
+            reference_inputs.state,
+            graph_inputs.state,
+            _GLM_STATE_TOL,
+            "graph state",
+        )
+        assert torch.equal(reference_inputs.conv_state, graph_inputs.conv_state)
+        invalid = graph_inputs.state_indices <= 0
+        invalid |= graph_inputs.state_indices >= slots
+        assert torch.count_nonzero(out[0, invalid]) == 0
 
 
 def test_non_positive_slots_do_not_modify_caches() -> None:
@@ -433,9 +621,111 @@ def test_kda_decode_with_f_b_matches_reference(
     torch.cuda.synchronize()
 
     assert not torch.isnan(actual).any()
-    _assert_close(reference, actual, _OUTPUT_TOL, "output")
-    _assert_close(reference_inputs.state, actual_inputs.state, _STATE_TOL, "state")
+    _assert_close(reference, actual, _OUTPUT_TOL, "f_b output")
+    _assert_close(reference_inputs.state, actual_inputs.state, _STATE_TOL, "f_b state")
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("batch", [1, 8, 16])
+def test_glm_kda_decode_with_f_b_matches_reference(batch: int, num_heads: int) -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(
+        batch, num_heads=num_heads, use_conv_bias=True
+    )
+    reference_inputs = _copy_inputs(seed)
+    actual_inputs = _copy_inputs(seed)
+
+    reference = _reference(reference_inputs)
+    actual = _run_with_f_b(f_a, f_b_weight, actual_inputs)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(actual).all()
+    _assert_close(reference, actual, _GLM_OUTPUT_TOL, "GLM f_b output")
+    _assert_close(
+        reference_inputs.state,
+        actual_inputs.state,
+        _GLM_STATE_TOL,
+        "GLM f_b state",
+    )
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+@pytest.mark.parametrize("layout", ["offset", "transposed_conv"])
+def test_glm_kda_decode_with_f_b_strided_envelopes(num_heads: int, layout: str) -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(4, num_heads=num_heads, use_conv_bias=True)
+    reference_inputs = _copy_inputs(seed)
+    actual_inputs = _copy_inputs(seed)
+    if layout == "offset":
+        f_a = _clone_with_storage_offset(f_a)
+        f_b_weight = _clone_with_storage_offset(f_b_weight)
+        actual_inputs = Inputs(
+            **{
+                name: (
+                    _clone_with_storage_offset(getattr(seed, name))
+                    if getattr(seed, name) is not None
+                    else None
+                )
+                for name in Inputs.__dataclass_fields__
+            }
+        )
+    else:
+        channels = seed.conv_state.shape[1]
+        raw_conv = torch.empty(
+            seed.conv_state.shape[0],
+            _CONV_WIDTH - 1,
+            channels + 11,
+            dtype=seed.conv_state.dtype,
+            device=seed.conv_state.device,
+        )
+        actual_inputs.conv_state = raw_conv[:, :, 5 : 5 + channels].transpose(-1, -2)
+        actual_inputs.conv_state.copy_(seed.conv_state)
+
+    reference = _reference(reference_inputs)
+    actual = _run_with_f_b(f_a, f_b_weight, actual_inputs)
+    torch.cuda.synchronize()
+
+    _assert_close(reference, actual, _GLM_OUTPUT_TOL, "strided f_b output")
+    _assert_close(
+        reference_inputs.state,
+        actual_inputs.state,
+        _GLM_STATE_TOL,
+        "strided f_b state",
+    )
+    assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
+
+
+@pytest.mark.parametrize("num_heads", [8, 16])
+def test_glm_kda_decode_with_f_b_graph_replay(num_heads: int) -> None:
+    batch = 8
+    f_a, f_b_weight, seed = _make_fb_inputs(
+        batch, num_heads=num_heads, use_conv_bias=True
+    )
+    reference_inputs = _copy_inputs(seed)
+    reference = _reference(reference_inputs)
+    graph_inputs = _copy_inputs(seed)
+    out = torch.empty_like(reference)
+
+    _run_with_f_b(f_a, f_b_weight, _copy_inputs(seed))
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _run_with_f_b(f_a, f_b_weight, graph_inputs, out=out)
+
+    for _ in range(2):
+        graph_inputs.conv_state.copy_(seed.conv_state)
+        graph_inputs.state.copy_(seed.state)
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.isfinite(out).all()
+        _assert_close(reference, out, _GLM_OUTPUT_TOL, "f_b graph output")
+        _assert_close(
+            reference_inputs.state,
+            graph_inputs.state,
+            _GLM_STATE_TOL,
+            "f_b graph state",
+        )
+        assert torch.equal(reference_inputs.conv_state, graph_inputs.conv_state)
 
 
 def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
@@ -547,14 +837,14 @@ def test_large_cache_slot_offsets(fused_f_b: bool) -> None:
         actual = _run(actual_inputs)
     torch.cuda.synchronize()
 
-    _assert_close(reference, actual, _OUTPUT_TOL, "output")
+    _assert_close(reference, actual, _OUTPUT_TOL, "large-cache output")
     for batch_idx, slot in enumerate(slot_indices):
         small_slot = int(reference_inputs.state_indices[batch_idx])
         _assert_close(
             reference_inputs.state[small_slot],
             actual_inputs.state[slot],
             _STATE_TOL,
-            "state",
+            "large-cache state",
         )
         assert torch.equal(
             reference_inputs.conv_state[small_slot],
@@ -613,7 +903,7 @@ def test_api_rejects_unsafe_write_layouts(
 ) -> None:
     from aiter.ops.flydsl import kda_decode
 
-    def unexpected_compile(*args, **kwargs):
+    def unexpected_compile(*args):
         pytest.fail("Unsafe write layouts must be rejected before kernel compilation.")
 
     monkeypatch.setattr(kda_decode, "create_kda_decode_kernel", unexpected_compile)
@@ -664,8 +954,8 @@ def test_api_accepts_non_overlapping_write_layouts(
     torch.cuda.synchronize()
 
     assert actual is out
-    _assert_close(reference, actual, _OUTPUT_TOL, "output")
-    _assert_close(reference_inputs.state, inputs.state, _STATE_TOL, "state")
+    _assert_close(reference, actual, _OUTPUT_TOL, "strided output")
+    _assert_close(reference_inputs.state, inputs.state, _STATE_TOL, "strided state")
     assert torch.equal(reference_inputs.conv_state, inputs.conv_state)
 
 
@@ -699,7 +989,7 @@ def test_api_rejects_i32_address_overflow(
 ) -> None:
     from aiter.ops.flydsl import kda_decode
 
-    def unexpected_compile(*args, **kwargs):
+    def unexpected_compile(*args):
         pytest.fail("Unsafe addressing must be rejected before kernel compilation.")
 
     monkeypatch.setattr(kda_decode, "create_kda_decode_kernel", unexpected_compile)

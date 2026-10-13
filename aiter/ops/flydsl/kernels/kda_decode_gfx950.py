@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL fused KDA decode kernels on gfx950 with 12 heads and dim 128."""
+"""FlyDSL fused KDA decode kernels on gfx950 with supported head counts."""
 
 import functools
 
@@ -13,7 +13,6 @@ from flydsl.expr.typing import T
 from .kernels_common import LOG2E
 from .tensor_shim import GTensor
 
-_HEADS = 12
 _DIM = 128
 _SCALE = _DIM**-0.5
 _BLOCK_THREADS = 256
@@ -52,10 +51,17 @@ def _vector_sum(vec):
 
 
 # Each entry holds a JIT launcher and compiled module; keep only a few
-# (norm_eps, lower_bound, fuse_f_b) specializations alive.
+# (num_heads, norm_eps, lower_bound, fuse_f_b, has_conv_bias) specializations
+# alive.
 @functools.lru_cache(maxsize=_SPECIALIZATION_CACHE_SIZE)
-def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool):
-    """Build the fixed gfx950 BF16 KDA decode specialization.
+def create_kda_decode_kernel(
+    num_heads: int,
+    norm_eps: float,
+    lower_bound: float,
+    fuse_f_b: bool,
+    has_conv_bias: bool,
+):
+    """Build a fixed-head gfx950 BF16 KDA decode specialization.
 
     With ``fuse_f_b``, the kernel computes the head-local ``f_b`` projection
     instead of reading a precomputed raw gate from global memory.
@@ -76,6 +82,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
         gate_inputs,
         x_mem,
         weight_mem,
+        conv_bias_mem,
         conv_state_mem,
         raw_beta_mem,
         A_log_mem,
@@ -89,6 +96,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
         stride_x_token,
         stride_weight_channel,
         stride_weight_width,
+        stride_conv_bias,
         stride_conv_slot,
         stride_conv_channel,
         stride_conv_width,
@@ -101,6 +109,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
     ):
         x = GTensor(x_mem, dtype=T.bf16, shape=(-1,))
         weight = GTensor(weight_mem, dtype=T.f32, shape=(-1,))
+        conv_bias = GTensor(conv_bias_mem, dtype=T.f32, shape=(-1,))
         raw_beta = GTensor(raw_beta_mem, dtype=T.bf16, shape=(-1,))
         A_log = GTensor(A_log_mem, dtype=T.f32, shape=(-1,))
         dt_bias = GTensor(dt_bias_mem, dtype=T.f32, shape=(-1,))
@@ -119,8 +128,8 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
 
         tid = fx.thread_idx.x
         block = fx.block_idx.x
-        batch = block // _HEADS
-        head = block % _HEADS
+        batch = block // num_heads
+        head = block % num_heads
         lane = tid % _WARP_SIZE
         warp = tid // _WARP_SIZE
         lane_k = lane % _WARP_THREADS_K
@@ -198,6 +207,8 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             acc = acc + fx.Float32(current) * fx.Float32(
                 weight[w_base + 3 * stride_weight_width]
             )
+            if const_expr(has_conv_bias):
+                acc = acc + fx.Float32(conv_bias[channel * stride_conv_bias])
             conv_state.store(cs_base, fx.BFloat16(c1))
             conv_state.store(cs_base + stride_conv_width, fx.BFloat16(c2))
             conv_state.store(cs_base + 2 * stride_conv_width, current)
@@ -209,9 +220,9 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             # its (batch, head), so every cache entry is shifted exactly once.
             head_channel = head * _DIM + tid
             fx.ptr_store(convolve_channel(head_channel), q_lds + tid)
-            fx.ptr_store(convolve_channel(_HEADS * _DIM + head_channel), k_lds + tid)
+            fx.ptr_store(convolve_channel(num_heads * _DIM + head_channel), k_lds + tid)
             fx.ptr_store(
-                convolve_channel(2 * _HEADS * _DIM + head_channel), v_lds + tid
+                convolve_channel(2 * num_heads * _DIM + head_channel), v_lds + tid
             )
 
         def recurrent_update():
@@ -358,7 +369,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
     if fuse_f_b:
 
         @flyc.kernel(
-            name="kda_decode_fused_projection_bf16_gfx950",
+            name=f"kda_decode_h{num_heads}_fused_projection_bf16_gfx950",
             known_block_size=[_BLOCK_THREADS, 1, 1],
         )
         def kernel(
@@ -366,6 +377,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             f_b_weight_mem: fx.Tensor,
             x_mem: fx.Tensor,
             weight_mem: fx.Tensor,
+            conv_bias_mem: fx.Tensor,
             conv_state_mem: fx.Tensor,
             raw_beta_mem: fx.Tensor,
             A_log_mem: fx.Tensor,
@@ -382,6 +394,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             stride_x_token: fx.Int32,
             stride_weight_channel: fx.Int32,
             stride_weight_width: fx.Int32,
+            stride_conv_bias: fx.Int32,
             stride_conv_slot: fx.Int64,
             stride_conv_channel: fx.Int32,
             stride_conv_width: fx.Int32,
@@ -402,6 +415,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 ),
                 x_mem,
                 weight_mem,
+                conv_bias_mem,
                 conv_state_mem,
                 raw_beta_mem,
                 A_log_mem,
@@ -415,6 +429,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 stride_x_token,
                 stride_weight_channel,
                 stride_weight_width,
+                stride_conv_bias,
                 stride_conv_slot,
                 stride_conv_channel,
                 stride_conv_width,
@@ -432,6 +447,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             f_b_weight_mem: fx.Tensor,
             x_mem: fx.Tensor,
             weight_mem: fx.Tensor,
+            conv_bias_mem: fx.Tensor,
             conv_state_mem: fx.Tensor,
             raw_beta_mem: fx.Tensor,
             A_log_mem: fx.Tensor,
@@ -449,6 +465,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             stride_x_token: fx.Int32,
             stride_weight_channel: fx.Int32,
             stride_weight_width: fx.Int32,
+            stride_conv_bias: fx.Int32,
             stride_conv_slot: fx.Int64,
             stride_conv_channel: fx.Int32,
             stride_conv_width: fx.Int32,
@@ -465,6 +482,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 f_b_weight_mem,
                 x_mem,
                 weight_mem,
+                conv_bias_mem,
                 conv_state_mem,
                 raw_beta_mem,
                 A_log_mem,
@@ -481,6 +499,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 stride_x_token,
                 stride_weight_channel,
                 stride_weight_width,
+                stride_conv_bias,
                 stride_conv_slot,
                 stride_conv_channel,
                 stride_conv_width,
@@ -491,7 +510,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 stride_out_token,
                 stride_out_head,
             ).launch(
-                grid=(batch_size * _HEADS, 1, 1),
+                grid=(batch_size * num_heads, 1, 1),
                 block=(_BLOCK_THREADS, 1, 1),
                 stream=stream,
             )
@@ -499,12 +518,13 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
     else:
 
         @flyc.kernel(
-            name="kda_decode_bf16_gfx950",
+            name=f"kda_decode_h{num_heads}_bf16_gfx950",
             known_block_size=[_BLOCK_THREADS, 1, 1],
         )
         def kernel(
             x_mem: fx.Tensor,
             weight_mem: fx.Tensor,
+            conv_bias_mem: fx.Tensor,
             conv_state_mem: fx.Tensor,
             raw_g_mem: fx.Tensor,
             raw_beta_mem: fx.Tensor,
@@ -519,6 +539,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             stride_x_token: fx.Int32,
             stride_weight_channel: fx.Int32,
             stride_weight_width: fx.Int32,
+            stride_conv_bias: fx.Int32,
             stride_conv_slot: fx.Int64,
             stride_conv_channel: fx.Int32,
             stride_conv_width: fx.Int32,
@@ -534,6 +555,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 (raw_g_mem, stride_g_token),
                 x_mem,
                 weight_mem,
+                conv_bias_mem,
                 conv_state_mem,
                 raw_beta_mem,
                 A_log_mem,
@@ -547,6 +569,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 stride_x_token,
                 stride_weight_channel,
                 stride_weight_width,
+                stride_conv_bias,
                 stride_conv_slot,
                 stride_conv_channel,
                 stride_conv_width,
@@ -562,6 +585,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
         def launch(
             x_mem: fx.Tensor,
             weight_mem: fx.Tensor,
+            conv_bias_mem: fx.Tensor,
             conv_state_mem: fx.Tensor,
             raw_g_mem: fx.Tensor,
             raw_beta_mem: fx.Tensor,
@@ -577,6 +601,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             stride_x_token: fx.Int32,
             stride_weight_channel: fx.Int32,
             stride_weight_width: fx.Int32,
+            stride_conv_bias: fx.Int32,
             stride_conv_slot: fx.Int64,
             stride_conv_channel: fx.Int32,
             stride_conv_width: fx.Int32,
@@ -592,6 +617,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
             kernel(
                 x_mem,
                 weight_mem,
+                conv_bias_mem,
                 conv_state_mem,
                 raw_g_mem,
                 raw_beta_mem,
@@ -606,6 +632,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 stride_x_token,
                 stride_weight_channel,
                 stride_weight_width,
+                stride_conv_bias,
                 stride_conv_slot,
                 stride_conv_channel,
                 stride_conv_width,
@@ -617,7 +644,7 @@ def create_kda_decode_kernel(norm_eps: float, lower_bound: float, fuse_f_b: bool
                 stride_out_token,
                 stride_out_head,
             ).launch(
-                grid=(batch_size * _HEADS, 1, 1),
+                grid=(batch_size * num_heads, 1, 1),
                 block=(_BLOCK_THREADS, 1, 1),
                 stream=stream,
             )
