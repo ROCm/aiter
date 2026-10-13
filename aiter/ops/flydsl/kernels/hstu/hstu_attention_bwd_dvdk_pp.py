@@ -215,6 +215,7 @@ def build_hstu_attention_bwd_dvdk_pp(
     DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT = _arch_dma_params()
 
     elem_dtype = _dtype_to_elem_type(dtype_str)
+    ELEM_BYTES = DMA_BYTES // DMA_ELEMS
     is_bf16 = True
     has_window = max_attn_len > 0
     has_contextual = contextual_seq_len > 0
@@ -253,10 +254,7 @@ def build_hstu_attention_bwd_dvdk_pp(
     # what keeps each access provably inside one LDS global.
     UNROLL = RM_SLOTS
     assert UNROLL % RM_SLOTS == 0 and UNROLL % T_SLOTS == 0
-    T_PAD = MFMA_LANE_K
-    T_STRIDE = BLOCK_N + T_PAD
     RM_TILE_ELEMS = BLOCK_N * STRIDE
-    T_TILE_ELEMS = head_dim * T_STRIDE
 
     rm_tile_elems_per_pass = GRP_THREADS * DMA_ELEMS
     assert RM_TILE_ELEMS % rm_tile_elems_per_pass == 0
@@ -268,6 +266,37 @@ def build_hstu_attention_bwd_dvdk_pp(
     T_QGROUPS = BLOCK_N // MFMA_LANE_K
     T_UNITS = head_dim * T_QGROUPS
     assert T_UNITS == GRP_THREADS, "transpose must be exactly one pass per group"
+
+    # Transposed tile, laid out so one lane's FOUR chunk operands are one
+    # contiguous 32-byte run.
+    #
+    # The MFMA B operand for chunk c gives lane (m = lane%16, g = lane/16) the
+    # 4 bf16 at [d = c*16 + m][q = g*4 .. +3] -- 8 bytes.  Indexed the obvious
+    # way ([d][q], stride BLOCK_N+pad) the four chunks sit 16 rows apart, so
+    # feeding the burst costs 4 x `ds_read_b64` per tile, 8 across q_t + do_t.
+    #
+    # Order it [g][m][c][q] instead and those four 8-byte pieces become
+    # adjacent: 32 contiguous bytes per lane, 2 x `ds_read_b128`, 4 reads total.
+    # Nothing is permuted -- the run already decomposes into the four operands
+    # in chunk order, so the accumulator <-> dV/dK column mapping is unchanged
+    # and the epilogue does not move.  (`d` is the GEMM's output N dimension
+    # here, not its reduction axis; what makes this free is that each chunk's
+    # 8 bytes stays self-contained, not that the order would be summed away.)
+    T_B128_ELEMS = 16 // ELEM_BYTES  # one ds_read_b128
+    T_ROW_ELEMS = D_CHUNKS * MFMA_LANE_K  # all four chunks for one lane
+    assert T_ROW_ELEMS % T_B128_ELEMS == 0
+    T_HALVES = T_ROW_ELEMS // T_B128_ELEMS
+    CHUNKS_PER_B128 = T_B128_ELEMS // MFMA_LANE_K
+    PACK_DWORDS = MFMA_LANE_K * ELEM_BYTES // 4
+    # Pad each q-group by one b128 so that (a) every (g, m) start stays 16-byte
+    # aligned -- without which the backend cannot form a b128 at all -- and
+    # (b) the 64 lanes spread over all 32 banks.  Unpadded, lanes m and m+4
+    # share a bank quad and the read doubles to 16 dwords/bank.
+    T_GPAD = T_B128_ELEMS
+    T_GSTRIDE = MFMA_M * T_ROW_ELEMS + T_GPAD
+    assert (T_GSTRIDE * ELEM_BYTES) % 16 == 0
+    assert D_CHUNKS * MFMA_M == head_dim
+    T_TILE_ELEMS = T_QGROUPS * T_GSTRIDE
 
     N_ACC_DV = D_CHUNKS * KV_OWNED_SUBTILES
     N_ACC_DK = HC_CHUNKS * KV_OWNED_SUBTILES
@@ -398,14 +427,23 @@ def build_hstu_attention_bwd_dvdk_pp(
             (BLOCK_N, STRIDE // MFMA_LANE_K, MFMA_LANE_K),
             (STRIDE, MFMA_LANE_K, 1),
         )
-        t_layout = fx.make_layout(
-            (head_dim, T_STRIDE // MFMA_LANE_K, MFMA_LANE_K),
-            (T_STRIDE, MFMA_LANE_K, 1),
+        # Two views of the SAME array: the transpose writes one chunk's 4 bf16
+        # (`ds_write_b64`), the MFMA feed reads two chunks at a time
+        # (`ds_read_b128`).  Same global, so the aliasing is still exact.
+        t_wr_layout = fx.make_layout(
+            (T_QGROUPS, MFMA_M, D_CHUNKS, MFMA_LANE_K),
+            (T_GSTRIDE, T_ROW_ELEMS, MFMA_LANE_K, 1),
+        )
+        t_rd_layout = fx.make_layout(
+            (T_QGROUPS, MFMA_M, T_HALVES, T_B128_ELEMS),
+            (T_GSTRIDE, T_ROW_ELEMS, T_B128_ELEMS, 1),
         )
         q_views = [lds.q0.view(rm_layout), lds.q1.view(rm_layout)]
         do_views = [lds.do0.view(rm_layout), lds.do1.view(rm_layout)]
-        q_t_views = [lds.q_t0.view(t_layout), lds.q_t1.view(t_layout)]
-        do_t_views = [lds.do_t0.view(t_layout), lds.do_t1.view(t_layout)]
+        q_t_wr = [lds.q_t0.view(t_wr_layout), lds.q_t1.view(t_wr_layout)]
+        do_t_wr = [lds.do_t0.view(t_wr_layout), lds.do_t1.view(t_wr_layout)]
+        q_t_rd = [lds.q_t0.view(t_rd_layout), lds.q_t1.view(t_rd_layout)]
+        do_t_rd = [lds.do_t0.view(t_rd_layout), lds.do_t1.view(t_rd_layout)]
 
         def q_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
@@ -531,6 +569,10 @@ def build_hstu_attention_bwd_dvdk_pp(
         t_unit_row = grp_tid // fx.Int32(T_QGROUPS)
         t_unit_qg = grp_tid % fx.Int32(T_QGROUPS)
         t_unit_qbase = t_unit_qg * fx.Int32(MFMA_LANE_K)
+        # The unit's transposed row `d` splits into the chunk that owns it and
+        # the lane within that chunk -- which is exactly the [g][m][c] address.
+        t_unit_m = t_unit_row % fx.Int32(MFMA_M)
+        t_unit_c = t_unit_row // fx.Int32(MFMA_M)
 
         def make_transpose(rm_views_, t_views_, swizzled):
             def run(rm_slot, t_slot):
@@ -550,31 +592,51 @@ def build_hstu_attention_bwd_dvdk_pp(
                             col % fx.Int32(MFMA_LANE_K),
                         ]
                     )
-                t_views_[t_slot][t_unit_row, t_unit_qg, None].store(
+                t_views_[t_slot][t_unit_qg, t_unit_m, t_unit_c, None].store(
                     Vec.from_elements(elems, elem_dtype)
                 )
 
             return run
 
-        transpose_q = make_transpose(q_views, q_t_views, True)
-        transpose_do = make_transpose(do_views, do_t_views, False)
+        transpose_q = make_transpose(q_views, q_t_wr, True)
+        transpose_do = make_transpose(do_views, do_t_wr, False)
 
         def transpose_zero(t_slot):
+            # The T_GPAD tail of each q-group is never read, so zeroing the
+            # written footprint is enough to keep trip 0's 0 * x clean.
             z = Vec(c_zero_pack)
-            q_t_views[t_slot][t_unit_row, t_unit_qg, None].store(z)
-            do_t_views[t_slot][t_unit_row, t_unit_qg, None].store(z)
+            q_t_wr[t_slot][t_unit_qg, t_unit_m, t_unit_c, None].store(z)
+            do_t_wr[t_slot][t_unit_qg, t_unit_m, t_unit_c, None].store(z)
 
         # ---- the 16 MFMA operand groups ------------------------------------
         # g 0..3   GEMM1 dV: B = dO^T[tile i-1]        A = p_prev   (register)
         # g 4..7   GEMM3 dK: B = Q^T [tile i-1]        A = ds_prev  (register)
         # g 8..11  GEMM0 S : A = Q    [tile i]         B = k_packs  (register)
         # g 12..15 GEMM2 dA: A = dO   [tile i]         B = v_packs  (register)
-        def read_operand(g, rm_slot, t_slot):
+        def read_operand(g, rm_slot, t_slot, halves):
             if const_expr(g < 2 * D_CHUNKS):
-                views = do_t_views if const_expr(g < D_CHUNKS) else q_t_views
+                # One `ds_read_b128` serves CHUNKS_PER_B128 operand groups; the
+                # second group slices its 2 dwords out of the half the first
+                # one already loaded.  `halves` memoises at TRACE time, so the
+                # sharing is structural -- it does not depend on the backend
+                # CSE-ing two reads across the sched_barriers between them.
+                which = 0 if const_expr(g < D_CHUNKS) else 1
                 c = g if const_expr(g < D_CHUNKS) else g - D_CHUNKS
-                row = fx.Int32(c * MFMA_M) + lane_mod_16
-                return views[t_slot][row, lane_div_16, None].load().ir_value()
+                h, sub = c // CHUNKS_PER_B128, c % CHUNKS_PER_B128
+                key = (which, h, t_slot)
+                if key not in halves:
+                    views = do_t_rd if const_expr(which == 0) else q_t_rd
+                    halves[key] = (
+                        Vec(views[t_slot][lane_div_16, lane_mod_16, h, None].load())
+                        .bitcast(fx.Int32)
+                    )
+                v = halves[key]
+                words = [
+                    v[sub * PACK_DWORDS + i] for i in range_constexpr(PACK_DWORDS)
+                ]
+                return (
+                    Vec.from_elements(words, fx.Int32).bitcast(elem_dtype).ir_value()
+                )
             q_row = lane_mod_16
             if const_expr(g < 3 * D_CHUNKS):
                 col = fx.Int32((g - 2 * D_CHUNKS) * MFMA_QK_K) + lane_div_16 * fx.Int32(
@@ -682,9 +744,10 @@ def build_hstu_attention_bwd_dvdk_pp(
             # The last slot is filled at g == 0, before its first use at
             # g == PREFETCH_W.
             win = [None for _ in range_constexpr(PREFETCH_W + 1)]
+            halves = {}
             for _s in range_constexpr(PREFETCH_W):
                 _g = GROUP_ORDER[_s]
-                win[_g % (PREFETCH_W + 1)] = read_operand(_g, rm_cur, t_prev)
+                win[_g % (PREFETCH_W + 1)] = read_operand(_g, rm_cur, t_prev, halves)
 
             for step in range_constexpr(NUM_OPERAND_GROUPS):
                 g = GROUP_ORDER[step]
@@ -709,7 +772,9 @@ def build_hstu_attention_bwd_dvdk_pp(
                 sn = step + PREFETCH_W
                 if const_expr(sn < NUM_OPERAND_GROUPS):
                     gn = GROUP_ORDER[sn]
-                    win[gn % (PREFETCH_W + 1)] = read_operand(gn, rm_cur, t_prev)
+                    win[gn % (PREFETCH_W + 1)] = read_operand(
+                        gn, rm_cur, t_prev, halves
+                    )
 
                 # The DMA fire is spread through the burst's slack; it is VMEM,
                 # so it does not interact with the LDS retirement order below.
