@@ -6,6 +6,7 @@ import triton
 
 from aiter.ops.triton._triton_kernels.fusions.fused_indexed_gated_residual import (
     _fused_indexed_gated_residual_kernel,
+    _get_config,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -31,9 +32,9 @@ def fused_indexed_gated_residual(
     combination.
 
     Key parameters:
-    - residual: [M, N] residual stream
+    - residual: [M, N] residual stream, bf16/fp16/fp32
     - x: [M, N] branch output, same dtype as residual
-    - gate: [G, N] gate table, one row per index value
+    - gate: [G, N] gate table, one row per index value, same dtype as residual
     - indices: [M] int32/int64, one table row per token
     - out: optional [M, N] destination; may be ``residual`` (in-place update)
     - round_intermediate: round ``gate * x`` to the output dtype before the add,
@@ -43,7 +44,8 @@ def fused_indexed_gated_residual(
     written and re-read before the add. Fused, residual and x are read once, the
     table is read from cache, and out is written once.
 
-    All operands need unit stride along N; rows may be strided.
+    All operands are on one GPU and need unit stride along N; rows may be
+    strided.
 
     Returns:
     - out: [M, N], same dtype as residual
@@ -55,12 +57,18 @@ def fused_indexed_gated_residual(
         tuple(indices.shape),
     )
     assert residual.ndim == 2, f"residual must be 2-D, got {tuple(residual.shape)}"
+    assert residual.dtype in (
+        torch.bfloat16,
+        torch.float16,
+        torch.float32,
+    ), f"unsupported dtype: {residual.dtype}"
     M, N = residual.shape
     assert x.shape == residual.shape, f"x must be [{M}, {N}], got {tuple(x.shape)}"
     assert x.dtype == residual.dtype, "x and residual must have the same dtype"
     assert (
         gate.ndim == 2 and gate.shape[1] == N
     ), f"gate table must be [G, {N}], got {tuple(gate.shape)}"
+    assert gate.dtype == residual.dtype, "gate and residual must have the same dtype"
     assert indices.shape == (M,), f"indices must be [{M}], got {tuple(indices.shape)}"
     assert indices.dtype in (torch.int32, torch.int64), "indices must be int32/int64"
     assert indices.is_contiguous(), "indices must be contiguous"
@@ -69,14 +77,18 @@ def fused_indexed_gated_residual(
     else:
         assert out.shape == residual.shape, "out must match residual's shape"
         assert out.dtype == residual.dtype, "out must match residual's dtype"
+    assert residual.is_cuda, "residual must be a CUDA tensor"
+    for name, t in (("x", x), ("gate", gate), ("indices", indices), ("out", out)):
+        assert t.device == residual.device, f"{name} must be on {residual.device}"
     for name, t in (("residual", residual), ("x", x), ("gate", gate), ("out", out)):
         assert N <= 1 or t.stride(1) == 1, f"{name} must have unit stride along N"
     if M == 0 or N == 0:
         return out
 
-    # 5376 (MiniMax-H3) = 21 x 256: no masked tail tile.
-    BLOCK_N = 256 if N >= 256 else triton.next_power_of_2(N)
-    BLOCK_M = 16 if M >= 16 else triton.next_power_of_2(M)
+    config = _get_config()
+    # Shapes smaller than one tile shrink it rather than mask most lanes off.
+    BLOCK_N = min(config.pop("BLOCK_N"), triton.next_power_of_2(N))
+    BLOCK_M = min(config.pop("BLOCK_M"), triton.next_power_of_2(M))
 
     _fused_indexed_gated_residual_kernel[
         (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
@@ -95,7 +107,7 @@ def fused_indexed_gated_residual(
         ROUND_INTERMEDIATE=round_intermediate,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
-        num_warps=4,
+        **config,
         # With fusion the compiler may contract the rounded product back into an
         # fma, which silently drops round_intermediate.
         enable_fp_fusion=False,

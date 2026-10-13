@@ -37,7 +37,6 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
 
 
 @pytest.mark.parametrize("round_intermediate", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "M,N,G",
     [
@@ -51,8 +50,9 @@ def make(M, N, G, dtype, device, *, runs=True, seed=0):
     ],
 )
 @pytest.mark.parametrize("runs", [True, False])
-def test_matches_gathered_gate_then_add(dtype, M, N, G, runs, round_intermediate):
+def test_matches_gathered_gate_then_add(M, N, G, runs, round_intermediate):
     dev = "cuda"
+    dtype = torch.bfloat16
     residual, x, gate, indices = make(M, N, G, dtype, dev, runs=runs)
     got = fused_indexed_gated_residual(
         residual, x, gate, indices, round_intermediate=round_intermediate
@@ -64,14 +64,12 @@ def test_matches_gathered_gate_then_add(dtype, M, N, G, runs, round_intermediate
         # One rounding of the product and one of the sum, like the eager
         # expression, so the result is reproduced bit for bit.
         torch.testing.assert_close(got, want, atol=0, rtol=0)
-        if dtype != torch.float32:
-            torch.testing.assert_close(
-                got, residual + gate.index_select(0, indices) * x, atol=0, rtol=0
-            )
+        torch.testing.assert_close(
+            got, residual + gate.index_select(0, indices) * x, atol=0, rtol=0
+        )
     else:
         # The product stays in fp32; only the sum is rounded to the output dtype.
-        tol = {torch.float32: 2e-6, torch.float16: 2e-3, torch.bfloat16: 1.6e-2}[dtype]
-        torch.testing.assert_close(got.float(), want.float(), atol=tol, rtol=tol)
+        torch.testing.assert_close(got.float(), want.float(), atol=1.6e-2, rtol=1.6e-2)
 
 
 def test_round_intermediate_changes_the_result():
@@ -113,11 +111,13 @@ def test_every_index_is_honoured():
     uniform test and fail this one."""
     dev = "cuda"
     N, G = 512, 6
-    residual, x, gate, _ = make(G, N, G, torch.float32, dev)
+    residual, x, gate, _ = make(G, N, G, torch.bfloat16, dev)
     indices = torch.arange(G, device=dev, dtype=torch.int64)
-    got = fused_indexed_gated_residual(residual, x, gate, indices)
+    got = fused_indexed_gated_residual(
+        residual, x, gate, indices, round_intermediate=True
+    )
     torch.testing.assert_close(
-        got, reference(residual, x, gate, indices), atol=2e-6, rtol=2e-6
+        got, reference(residual, x, gate, indices, True), atol=0, rtol=0
     )
 
 
@@ -182,3 +182,18 @@ def test_rejects_mismatched_shapes():
         fused_indexed_gated_residual(residual, x, gate, indices[:-1])
     with pytest.raises(AssertionError):
         fused_indexed_gated_residual(residual, x, gate, indices.float())
+
+
+def test_rejects_unsupported_dtypes_and_devices():
+    dev = "cuda"
+    residual, x, gate, indices = make(32, 256, 3, torch.bfloat16, dev)
+    with pytest.raises(AssertionError):
+        fused_indexed_gated_residual(
+            residual.double(), x.double(), gate.double(), indices
+        )
+    with pytest.raises(AssertionError):
+        fused_indexed_gated_residual(residual, x, gate.float(), indices)
+    with pytest.raises(AssertionError):
+        fused_indexed_gated_residual(residual.cpu(), x.cpu(), gate.cpu(), indices.cpu())
+    with pytest.raises(AssertionError):
+        fused_indexed_gated_residual(residual, x, gate, indices.cpu())

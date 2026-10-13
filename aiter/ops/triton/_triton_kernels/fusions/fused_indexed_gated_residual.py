@@ -4,12 +4,22 @@
 import triton
 import triton.language as tl
 
+from aiter.ops.triton._triton_kernels.fusions.indexed_table import (
+    _gather_indexed_rows,
+    _load_block_indices,
+)
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
+from aiter.ops.triton.utils.config_utils import load_config_json, resolve_config_dir
 
 _fused_indexed_gated_residual_repr = make_kernel_repr(
     "_fused_indexed_gated_residual_kernel",
     ["BLOCK_M", "BLOCK_N", "ROUND_INTERMEDIATE"],
 )
+
+
+def _get_config() -> dict:
+    config_dir = resolve_config_dir("fusions", "FUSED_INDEXED_GATED_RESIDUAL")
+    return dict(load_config_json(f"{config_dir}/DEFAULT.json", required=True)["any"])
 
 
 @triton.jit(repr=_fused_indexed_gated_residual_repr)
@@ -44,27 +54,21 @@ def _fused_indexed_gated_residual_kernel(
     # M * N can exceed the int32 range for long sequences.
     rows64 = rows.to(tl.int64)
 
-    # The block's first row always exists, so its index is a safe fill for the
-    # tail lanes -- they must not make a uniform block look mixed.
-    first = tl.load(idx_ptr + row_block * BLOCK_M)
-    idx = tl.load(idx_ptr + rows, mask=row_mask, other=first)
-    if tl.min(idx) == tl.max(idx):
-        # Consecutive tokens usually share one gate row (runs of one modality),
-        # so load it once and broadcast it across the block.
-        gate = tl.broadcast_to(
-            tl.load(
-                gate_ptr + first.to(tl.int64) * stride_gate_row + cols,
-                mask=col_mask,
-                other=0.0,
-            ).to(tl.float32)[None, :],
-            (BLOCK_M, BLOCK_N),
-        )
-    else:
-        gate = tl.load(
-            gate_ptr + idx.to(tl.int64)[:, None] * stride_gate_row + cols[None, :],
-            mask=mask,
-            other=0.0,
-        ).to(tl.float32)
+    idx, first, uniform = _load_block_indices(
+        idx_ptr, row_block, rows, row_mask, BLOCK_M
+    )
+    gate = _gather_indexed_rows(
+        gate_ptr,
+        stride_gate_row,
+        idx,
+        first,
+        uniform,
+        cols,
+        row_mask,
+        col_mask,
+        BLOCK_M,
+        BLOCK_N,
+    )
 
     x = tl.load(
         x_ptr + rows64[:, None] * stride_x_row + cols[None, :], mask=mask, other=0.0
