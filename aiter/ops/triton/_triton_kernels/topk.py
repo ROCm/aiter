@@ -84,9 +84,7 @@ def _topk_kernel(
     # unrolled exactly K iterations -- no break/continue needed
     for j in core.static_range(0, K):
         vmax = tl.max(vals, axis=0)
-        # lowest index among the remaining candidates equal to the max. Compare
-        # bit patterns, not values, so that -0.0 and +0.0 are told apart and the
-        # stored value always comes from the element at the stored index.
+        # lowest remaining index equal to the max; bit patterns tell -0.0 from +0.0
         is_max = vals.to(tl.int32, bitcast=True) == vmax.to(tl.int32, bitcast=True)
         arg = tl.min(tl.where(valid & is_max, idxs, BLOCK), axis=0)
 
@@ -136,8 +134,6 @@ def topk_stage1_kernel(
         # )
         x_val = tl.load(x_ptr + cols, mask=mask, other=FILL_VALUE).to(tl.float32)
 
-    # Track candidates by index, not by value: a value sentinel cannot be told
-    # apart from a real input equal to it (e.g. -inf in masked logits).
     valid = (chunk_offset + cols) < N
     x_val = tl.where(valid, x_val, FILL_VALUE)
     for k_idx in range(k):
@@ -145,11 +141,8 @@ def topk_stage1_kernel(
             chunk_select_val = tl.max(x_val, axis=0)
         else:
             chunk_select_val = tl.min(x_val, axis=0)
-        # lowest index among the remaining candidates equal to the extremum.
-        # Only the last chunk can run out of candidates (CHUNK_SIZE >= k); it
-        # then yields CHUNK_SIZE, i.e. a global index >= N, which stage 2
-        # ranks below every in-range index of equal value. Bit patterns are
-        # compared so that -0.0 and +0.0 are told apart, as in _topk_kernel.
+        # as in _topk_kernel; an exhausted last chunk yields an index >= N, which
+        # stage 2 ranks below in-range entries of equal value
         is_sel = x_val.to(tl.int32, bitcast=True) == chunk_select_val.to(
             tl.int32, bitcast=True
         )
@@ -189,9 +182,8 @@ def _compare_and_swap(x, ids, flip, i: core.constexpr, n_dims: core.constexpr):
     else:
         raise ValueError("Unsupported dtype")
 
-    # Fetch the partner at 'stride' 2**(n_dims - i - 1) by xor-reducing the bit
-    # patterns of each pair: exact for every value, unlike slicing the floats
-    # with a 0/1 multiply, which turns -inf into NaN and -0.0 into +0.0.
+    # Fetch the partner by xor-reducing the bit patterns of each pair, which is
+    # exact for -inf and -0.0, unlike slicing with a 0/1 multiply.
     ix = x.to(idtype, bitcast=True)
     ix_pair = core.reshape(ix, shape)
     iy = ix_pair ^ tl.xor_sum(ix_pair, 1, keep_dims=True)
