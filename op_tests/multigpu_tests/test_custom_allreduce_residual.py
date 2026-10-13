@@ -67,7 +67,12 @@ def check_all_reduce_residual(ca, tp, rank, device, graphs):
 
         x_in = torch.zeros_like(x)
         graph, (gout,) = _run_graph(
-            ca, lambda: ca.custom_all_reduce_residual(x_in, residual), [x], [x_in]
+            ca,
+            lambda x_in=x_in, residual=residual: ca.custom_all_reduce_residual(
+                x_in, residual
+            ),
+            [x],
+            [x_in],
         )
         graphs.append((graph, x_in, gout))
         torch.testing.assert_close(gout, ref, rtol=0, atol=0, msg=f"graph {m=}")
@@ -87,7 +92,7 @@ def check_norm_rows_skip_residual(ca, tp, rank, device, graphs):
             r32 = reduced if skip else reduced + residual.float()
             ref_norm = _rms_ref(r32, w)[:norm_rows]
 
-            def call(inp):
+            def call(inp, x=x, residual=residual, norm_rows=norm_rows, skip=skip):
                 out = torch.full(
                     (norm_rows, HIDDEN), float("nan"), dtype=x.dtype, device=device
                 )
@@ -113,7 +118,9 @@ def check_norm_rows_skip_residual(ca, tp, rank, device, graphs):
             )
 
             x_in = torch.zeros_like(x)
-            graph, (gout, gres) = _run_graph(ca, lambda: call(x_in), [x], [x_in])
+            graph, (gout, gres) = _run_graph(
+                ca, lambda x_in=x_in: call(x_in), [x], [x_in]
+            )
             graphs.append((graph, x_in, gout, gres))
             torch.testing.assert_close(
                 gres.float(), r32, rtol=0, atol=0, msg=f"graph res_out {ctx}"
