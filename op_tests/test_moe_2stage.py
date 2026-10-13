@@ -1474,7 +1474,7 @@ def test_output_buffer_contract():
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
 
-# Rebuilt gfx950 fp8 block-scale SiLU kernels. The symbols are the tuned-CSV names.
+# gfx950 fp8 block-scale SiLU kernels.
 _FMOE_64XN = {
     "64x128": "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x128E",
     "64x256": "_ZN5aiter46fmoe_bf16_blockscaleFp8_g1u1_vs_ps_silu_64x256E",
@@ -1482,17 +1482,16 @@ _FMOE_64XN = {
 }
 
 
-def _run_blockscale_case(expect_symbol, force_symbol=None, **case):
-    """Run one per-128x128 SiLU case and require the rebuilt kernel to launch."""
+def _run_blockscale_case(symbol, **case):
+    """Run one SiLU case on the named kernel."""
     launched = []
     orig = aiter.fmoe_fp8_blockscale_g1u1
 
     def wrap(*args, **kwargs):
-        if force_symbol is not None:
-            if len(args) >= 13:
-                args = (*args[:12], force_symbol, *args[13:])
-            else:
-                kwargs["kernelName"] = force_symbol
+        if len(args) >= 13:
+            args = (*args[:12], symbol, *args[13:])
+        else:
+            kwargs["kernelName"] = symbol
         name = args[12] if len(args) >= 13 else kwargs.get("kernelName", "")
         launched.append(name)
         return orig(*args, **kwargs)
@@ -1511,44 +1510,66 @@ def _run_blockscale_case(expect_symbol, force_symbol=None, **case):
             doweight_stage1=False,
             strict_accuracy=True,
             check_aot_cache=False,
+            block_size_M=64,
             **case,
         )
     finally:
         aiter.fmoe_fp8_blockscale_g1u1 = orig
     assert launched, f"fp8 block-scale kernel was not launched for {case}"
     assert set(launched) == {
-        expect_symbol
-    }, f"dispatched {launched}, expected {expect_symbol} for {case}"
+        symbol
+    }, f"dispatched {launched}, expected {symbol} for {case}"
 
 
 def test_gfx950_blockscale_64xn():
-    """Correctness for the rebuilt 64x128 / 64x256 / 64x384 SiLU code objects.
-
-    Two tuned rows have inter_dim=1536, so the persistent launch's tile count
-    is not a multiple of 8 and is smaller than the CU count. Those rows name
-    the 64x256 kernel. model_dim=512 is the short-K case: no tuned row has
-    that K, so the kernel name and block size are passed in directly.
+    """Regression tests for issues found previously in the gfx950 fp8
+    block-scale SiLU kernels. Each case names its kernel, and the shape
+    exercises that path exactly.
     """
     if get_gfx() != "gfx950":
         return
 
-    for case in (
-        {"token": 256, "model_dim": 4096, "inter_dim": 1536, "E": 16, "topk": 8},
-        {"token": 1024, "model_dim": 3072, "inter_dim": 1536, "E": 64, "topk": 8},
-    ):
-        _run_blockscale_case(_FMOE_64XN["64x256"], **case)
+    # Dispatch must not consult a tuned config for these shapes.
+    get_2stage_cfgs.cache_clear()
+    try:
+        with override_env("AITER_BYPASS_TUNE_CONFIG", "1"):
+            # 64x256, inter_dim=1536: the persistent tile count is smaller
+            # than the launch grid and is not a multiple of the de-swizzle group.
+            for case in (
+                {
+                    "token": 256,
+                    "model_dim": 4096,
+                    "inter_dim": 1536,
+                    "E": 16,
+                    "topk": 8,
+                },
+                {
+                    "token": 1024,
+                    "model_dim": 3072,
+                    "inter_dim": 1536,
+                    "E": 64,
+                    "topk": 8,
+                },
+            ):
+                _run_blockscale_case(_FMOE_64XN["64x256"], **case)
 
-    for tile, inter_dim in (("64x128", 128), ("64x256", 256), ("64x384", 384)):
-        _run_blockscale_case(
-            _FMOE_64XN[tile],
-            force_symbol=_FMOE_64XN[tile],
-            token=64,
-            model_dim=512,
-            inter_dim=inter_dim,
-            E=8,
-            topk=2,
-            block_size_M=64,
-        )
+            # model_dim=512: one K step, so a second activation-scale advance
+            # reads past the scale tensor.
+            for tile, inter_dim in (
+                ("64x128", 128),
+                ("64x256", 256),
+                ("64x384", 384),
+            ):
+                _run_blockscale_case(
+                    _FMOE_64XN[tile],
+                    token=64,
+                    model_dim=512,
+                    inter_dim=inter_dim,
+                    E=8,
+                    topk=2,
+                )
+    finally:
+        get_2stage_cfgs.cache_clear()
     aiter.logger.info("moe_2stage: gfx950 block-scale 64xN coverage passed")
 
 
