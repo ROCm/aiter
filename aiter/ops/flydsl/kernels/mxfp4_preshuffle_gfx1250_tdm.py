@@ -10,7 +10,7 @@ from collections import namedtuple
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl.expr import arith, const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import arith, const_expr, range_constexpr, rocdl
 from flydsl.expr.arith import _to_raw as _raw
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
@@ -1478,7 +1478,7 @@ def launch_gemm_a8w4_tdm(
                     if const_expr(next_stage_on):
                         # Every rolled iteration reads the carry, so prime it here --
                         # outside ``dispatch_wave_job``, since every wave runs this once.
-                        tdm_ops.tensor_wait(TDM_PER * (num_buffers - 1))
+                        rocdl.s_wait_tensorcnt(TDM_PER * (num_buffers - 1))
                         workgroup_barrier()
                         first_lds_addr = calc_lds_addr(0)
                         rocdl.sched_barrier(0)
@@ -2197,7 +2197,7 @@ def launch_gemm_a8w4_tdm(
                             issue_scatter_group(group, scatter_vector, vector_pass)
                     else:
                         issue_scatter_group(group, scatter_vector, vector_pass)
-                tdm_ops.tensor_wait(0)
+                rocdl.s_wait_tensorcnt(0)
             else:
                 if const_expr(stage1_act):
                     out_divisor = 4 if is_fp4_quant else 2
@@ -2243,7 +2243,7 @@ def launch_gemm_a8w4_tdm(
                 fx.copy(atomC, src, gtC)
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
-                tdm_ops.tensor_wait(0)
+                rocdl.s_wait_tensorcnt(0)
 
         if const_expr(persistent_workers > 0):
             # Every wave must retire the output store before another wave

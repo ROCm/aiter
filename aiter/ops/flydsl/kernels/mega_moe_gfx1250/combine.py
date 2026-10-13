@@ -24,7 +24,7 @@
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import mori.cco.device.flydsl as cco
-from flydsl.expr import arith, range_constexpr, tdm_ops
+from flydsl.expr import arith, range_constexpr
 from flydsl.expr.rocdl import cvt_scale_pk8_f32_fp4, cvt_scale_pk8_f32_fp8
 from flydsl.expr.typing import Int32, Int64, T
 from flydsl.expr.typing import Vector as Vec
@@ -548,12 +548,12 @@ def _make_combine_fused_reduce(
             # this tile's own load, so its input buffer is readable, and the
             # store from two trips back, which is the one that owned the output
             # buffer about to be rewritten.
-            tdm_ops.tensor_wait(WAIT_N)
+            fx.rocdl.s_wait_tensorcnt(WAIT_N)
             workgroup_barrier()
             reduce_tile(buf)
             workgroup_barrier()
             store_tile(work, buf)
-        tdm_ops.tensor_wait(0)
+        fx.rocdl.s_wait_tensorcnt(0)
 
     @flyc.jit
     def run(

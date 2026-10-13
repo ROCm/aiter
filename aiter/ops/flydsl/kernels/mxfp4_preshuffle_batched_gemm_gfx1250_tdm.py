@@ -5,7 +5,7 @@
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
@@ -495,7 +495,7 @@ def launch_gemm_a8w4_tdm(
         fx.copy(
             atomC, _lv(fx.recast_iter(oc, base_ptr), (tile_m, tile_n), (tile_n, 1)), gtC
         )
-        tdm_ops.tensor_wait(0)
+        rocdl.s_wait_tensorcnt(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n

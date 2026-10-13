@@ -45,7 +45,7 @@ import math
 
 from flydsl._mlir import ir
 from flydsl.expr import arith
-from flydsl.expr.rocdl import readfirstlane, tdm_ops
+from flydsl.expr.rocdl import readfirstlane, s_wait_tensorcnt, tdm_ops
 from flydsl.expr.typing import T
 
 from . import vector
@@ -217,4 +217,4 @@ def tdm_wait(count=0):
     a partial wait releases the oldest transfers -- there is no way to wait on
     just the loads.
     """
-    tdm_ops.tensor_wait(count)
+    s_wait_tensorcnt(count)

@@ -33,7 +33,6 @@ Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import rocdl
-from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
@@ -961,7 +960,7 @@ def _tdm_load_views(
     """Build a LIST of ``(atom, g_view, lds_view)`` TDM global->LDS copies for one
     ``[n_rows, hdim]`` tile into a row-major padded (``hdim + pad_elems`` element row stride) LDS
     block — PURE (no memory op), issue each with ``fx.copy_atom_call(*view)`` then drain with
-    ``tensor_wait(0)``. hdim is split into power-of-two column segments (pad_interval must be pow2):
+    ``s_wait_tensorcnt(0)``. hdim is split into power-of-two column segments (pad_interval must be pow2):
     segment ``(c0, w)`` copies global cols ``[c0, c0+w)`` -> LDS cols ``[c0, c0+w)`` with
     ``pad_interval=w``, ``pad_amount=(hdim+pad_elems - w)`` so the LDS row still advances by the
     padded stride. One segment for pow2 hdim (128/256), two for 192. Src base = ``ptr_x[row0, head]``;
@@ -1118,14 +1117,14 @@ class QManager16bV2:
         self._lane_idx = lane_idx
 
     def load_q_to_vgpr_part2(self, *, scale):
-        """Drain this wave's Q TDM (``tensor_wait(0)``) and read its ``rows_per_warp x qk_hdim``
+        """Drain this wave's Q TDM (``s_wait_tensorcnt(0)``) and read its ``rows_per_warp x qk_hdim``
         tile into WMMA B-fragments (``scale`` folded). Returns a length-R list; entry ``qt`` is
         that q-tile's list of ``k_tiles`` v16-bf16 fragments (same as ``QManager16bV1``).
 
         Read collapses to 1 per-lane base + compile-time immediates (like K): lane ``l`` reads row
         ``l%16``, d-byte ``(l//16)*16``; fragment (qt, tile) = base + ``qt*16*row_bytes +
         tile*32*2`` (lo) and ``+ 16*2`` more (hi 8-col half)."""
-        tdm_ops.tensor_wait(0)
+        rocdl.s_wait_tensorcnt(0)
         v8_ty = fx.Vector.make_type(_CHUNK_ELEMS, self.elem_dtype)
         scale_bf16 = scale.to(self.elem_dtype)
         lane = self._lane_idx
@@ -1184,7 +1183,7 @@ class KManager16bV2:
         """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's K tile into the
         padded LDS at ``ptr_lds`` (fx.Int32 byte base) — one per pow2 hdim segment (1 for 128/256, 2
         for 192). Pure (hoistable); issue each with ``fx.copy_atom_call(*view)``, drain with
-        ``tdm_ops.tensor_wait(0)``."""
+        ``rocdl.s_wait_tensorcnt(0)``."""
         return _tdm_load_views(
             ptr_x=ptr_K,
             stride_seq=stride_k_seq,
@@ -1269,7 +1268,7 @@ class VManager16bV2:
     ):
         """Return a LIST of ``(atom, g_view, lds_view)`` TDM copies for this block's V tile (v_hdim=128
         is pow2 -> one copy). Pure; issue each with ``fx.copy_atom_call(*view)``, drain with
-        ``tdm_ops.tensor_wait(0)``."""
+        ``rocdl.s_wait_tensorcnt(0)``."""
         return _tdm_load_views(
             ptr_x=ptr_V,
             stride_seq=stride_v_seq,

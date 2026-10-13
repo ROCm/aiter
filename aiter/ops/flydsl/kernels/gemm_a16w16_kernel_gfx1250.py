@@ -6,7 +6,7 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.protocol import dsl_size_of
-from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, gpu, idx2crd, range_constexpr, rocdl
 from flydsl.expr.typing import T
 from flydsl.runtime.device import check_smem_capacity
 from flydsl.runtime.device import get_rocm_arch as get_hip_arch
@@ -671,7 +671,7 @@ def compile_gemm_a16w16(
 
         def _run_tile(accs_, ca, cb, cidx, lidx):
             issue_tdm_loads(lidx % num_buffers, lidx)
-            tdm_ops.tensor_wait(
+            rocdl.s_wait_tensorcnt(
                 0 if num_buffers == 2 else (num_buffers - 2) * _TDMS_PER_TILE
             )
             gpu.barrier()
@@ -689,7 +689,7 @@ def compile_gemm_a16w16(
         # Prologue:
         for i in range_constexpr(num_buffers - 1):
             issue_tdm_loads(i, i)
-        tdm_ops.tensor_wait((num_buffers - 2) * _TDMS_PER_TILE)
+        rocdl.s_wait_tensorcnt((num_buffers - 2) * _TDMS_PER_TILE)
         gpu.barrier()
         cur_a, cur_b = load_frags(A_SIDE, 0), load_frags(B_SIDE, 0)
 
@@ -740,7 +740,7 @@ def compile_gemm_a16w16(
             tile_idx = drain_base + j
             if const_expr(j < drain_count_d - 1):
                 next_tile = tile_idx + 1
-                tdm_ops.tensor_wait(
+                rocdl.s_wait_tensorcnt(
                     max(0, num_k_tiles - 1 - next_tile) * _TDMS_PER_TILE
                 )
                 gpu.barrier()

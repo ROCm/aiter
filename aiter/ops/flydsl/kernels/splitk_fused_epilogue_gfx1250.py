@@ -85,7 +85,7 @@ def emit_fused_splitk_epilogue(
         cache_modifier=CPOL_STORE_DEVICE,
     )
     fx.copy(store, fx.Tensor(fx.make_view(lds_partial, layout)), dst)
-    fx.rocdl.tdm_ops.tensor_wait(0)
+    fx.rocdl.s_wait_tensorcnt(0)
     cluster.cluster_barrier()
 
     output_base = (
@@ -211,4 +211,4 @@ def emit_fused_splitk_epilogue(
             num_warps=block // 32,
         )
         fx.copy(store_atom, fx.Tensor(fx.make_view(lds_out, out_layout)), tile_out)
-        fx.rocdl.tdm_ops.tensor_wait(0)
+        fx.rocdl.s_wait_tensorcnt(0)
