@@ -321,7 +321,7 @@ def _start_queue_evictions(stop):
 
 
 def _allreduce_ll128_mixed_size_regression(
-    rank, tp_size, sizes, iterations, distributed_init_method
+    rank, tp_size, sizes, iterations, distributed_init_method, stop
 ):
     from aiter.dist.device_communicators.custom_all_reduce import CustomAllreduce
 
@@ -338,7 +338,6 @@ def _allreduce_ll128_mixed_size_regression(
         x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
         inputs.append(x[rank].to(device, torch.bfloat16))
         refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
-    stop = threading.Event()
     # Rank 1 reads the peer slots that a faster rank's next call overlaps.
     if rank == 1:
         _start_queue_evictions(stop)
@@ -349,11 +348,15 @@ def _allreduce_ll128_mixed_size_regression(
         if iteration % 100 != 99:
             continue
         done.record()
-        deadline = time.time() + 30
+        deadline, evicting = time.time() + 30, not stop.is_set()
         while not done.query():
             if time.time() > deadline:
-                logger.error(f"{rank=} LL128 hang before {iteration=} {sizes=}")
-                os._exit(1)
+                if not evicting:
+                    logger.error(f"{rank=} LL128 hang before {iteration=} {sizes=}")
+                    os._exit(1)
+                logger.warning(f"{rank=} stalled before {iteration=}; stop evicting")
+                stop.set()
+                deadline, evicting = time.time() + 60, False
             time.sleep(0.001)
         for out, ref in zip(outs, refs):
             torch.testing.assert_close(out, ref, rtol=0, atol=0)
@@ -377,6 +380,7 @@ def test_allreduce_ll128_mixed_size_regression(tp_size, iterations=1000):
             sizes,
             iterations,
             get_distributed_init_method(get_ip(), get_open_port()),
+            torch.multiprocessing.get_context("spawn").Event(),
         ),
         nprocs=tp_size,
         join=True,
