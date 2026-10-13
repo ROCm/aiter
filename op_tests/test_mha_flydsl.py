@@ -554,6 +554,7 @@ THD_SHAPES = [
     ([341], [341], 8, 2),  # non-tile-multiple seq
     ([512], [512], 16, 4),
     ([128], [128], 32, 1),  # gqa 32: packed rows are a head SLICE, not whole seqs
+    ([128], [128], 48, 1),  # gqa 48: only num_q_tiles=1 packs it
     ([128], [512], 6, 3),  # non-power-of-two nheads
     ([128, 256], [256, 384], 8, 2),  # multi-batch, sq != sk
     ([72], [600], 32, 4),  # decode-like
@@ -592,6 +593,7 @@ BSHD_SHAPES = [
     (1, 341, 341, 8, 2),  # non-tile-multiple seq
     (2, 512, 512, 16, 4),
     (1, 128, 128, 32, 1),  # gqa 32: packed rows are a head SLICE, not whole seqs
+    (1, 128, 128, 48, 1),  # gqa 48: only num_q_tiles=1 packs it
     (1, 128, 512, 6, 3),  # non-power-of-two nheads, sq != sk
     (1, 16, 1024, 32, 4),  # decode-like
     (2, 1024, 1024, 32, 8),

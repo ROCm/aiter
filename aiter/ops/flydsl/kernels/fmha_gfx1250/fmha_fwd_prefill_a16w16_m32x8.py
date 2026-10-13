@@ -97,13 +97,22 @@ NUM_Q_TILES_CHOICES = (1, 2)
 # A wave owns WMMA_M * num_q_tiles contiguous packed (seq, q_head_in_group) rows, and Q/O
 # describe that tile with ONE rectangular TDM box. That only works when a head group is
 # never split across waves: either a wave holds whole groups, or it sits inside one.
-# num_q_tiles is chosen per call, so the ratio must satisfy it for every choice.
-def supports_gqa_ratio(gqa_ratio):
-    """True when the packed-row tiling never splits a head group, for any BLOCK_M."""
-    return all(
-        gqa_ratio % rows == 0 or rows % gqa_ratio == 0
-        for rows in (WMMA_M * n for n in NUM_Q_TILES_CHOICES)
+def supported_num_q_tiles(gqa_ratio):
+    """The num_q_tiles choices whose packed-row tile never splits a head group.
+
+    ``_pick_num_q_tiles`` picks only from these, so a ratio is servable as long as ONE
+    choice packs it -- gqa 48 straddles at rows_per_warp 32 but fits inside a group at 16.
+    """
+    return tuple(
+        n
+        for n in sorted(NUM_Q_TILES_CHOICES)
+        if gqa_ratio % (WMMA_M * n) == 0 or (WMMA_M * n) % gqa_ratio == 0
     )
+
+
+def supports_gqa_ratio(gqa_ratio):
+    """True when some BLOCK_M can tile this ratio; the routers gate on it."""
+    return bool(supported_num_q_tiles(gqa_ratio))
 
 
 # Causal work grows with the M index, so dispatch the heavy tiles first.
@@ -2956,11 +2965,12 @@ def _pick_num_q_tiles(num_kv_heads, batch, max_seqlen_q, gqa_ratio):
     per_tile = int(num_kv_heads) * int(batch)
     NUM_WGS_PER_CU = 1  # the >256 KB LDS footprint pins occupancy at one WG per CU
     resident = get_cu_num() * NUM_WGS_PER_CU
-    for num_tiles in sorted(NUM_Q_TILES_CHOICES):
+    ok = supported_num_q_tiles(gqa_ratio)
+    for num_tiles in ok:
         block_m = _block_m(num_tiles)
         if ((rows + block_m - 1) // block_m) * per_tile <= resident:
             return num_tiles
-    return max(NUM_Q_TILES_CHOICES)
+    return max(ok)
 
 
 def _ensure_thd_kernel(
