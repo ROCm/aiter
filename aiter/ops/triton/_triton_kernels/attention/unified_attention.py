@@ -375,11 +375,14 @@ def kernel_unified_attention_2d(
 
     for j in range(masked_tile_start, tile_end):
         seq_offset = j * TILE_SIZE + offs_t
-        # to reduce the masking effect when not needed
         if TILE_SIZE == BLOCK_SIZE:
+            # The score mask discards K-tail columns after QK, but an unmasked
+            # non-shuffled V tail can still poison PV through 0 * NaN/Inf.
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
+            v_tile_mask = seq_offset < seq_len
         else:
             tile_mask = seq_offset < max_seq_prefix_len
+            v_tile_mask = tile_mask
 
         k_mask = None
         v_mask = None
@@ -410,7 +413,7 @@ def kernel_unified_attention_2d(
                 + offs_vd[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = v_dim_mask[None, :] & tile_mask[:, None]
+            v_mask = v_dim_mask[None, :] & v_tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
@@ -791,9 +794,13 @@ def kernel_unified_attention_3d(
     ):
         seq_offset = j * TILE_SIZE + offs_t
         if TILE_SIZE == BLOCK_SIZE:
+            # The score mask discards K-tail columns after QK, but an unmasked
+            # non-shuffled V tail can still poison PV through 0 * NaN/Inf.
             tile_mask = tl.full((1,), 1, dtype=tl.int1)
+            v_tile_mask = seq_offset < seq_len
         else:
             tile_mask = seq_offset < max_seq_prefix_len
+            v_tile_mask = tile_mask
 
         k_mask = None
         v_mask = None
@@ -824,7 +831,7 @@ def kernel_unified_attention_3d(
                 + offs_vd[None, :] * stride_v_cache_3
                 + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
             )
-            v_mask = v_dim_mask[None, :] & tile_mask[:, None]
+            v_mask = v_dim_mask[None, :] & v_tile_mask[:, None]
 
             k_offset = (
                 physical_block_idx[None, :] * stride_k_cache_0
