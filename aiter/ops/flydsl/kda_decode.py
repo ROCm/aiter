@@ -5,10 +5,11 @@
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Iterable
 
 import torch
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .kernels.kda_decode_gfx950 import create_kda_decode_kernel
 from .kernels.tensor_shim import _run_compiled
@@ -18,13 +19,6 @@ _DIM = 128
 _CONV_CHANNELS = 3 * _HEADS * _DIM
 _CONV_WIDTH = 4
 _INT32_MAX = 2**31 - 1
-
-
-@functools.cache
-def _rocm_arch(device: torch.device) -> str | None:
-    properties = torch.cuda.get_device_properties(device)
-    arch = getattr(properties, "gcnArchName", None)
-    return arch.split(":", 1)[0] if arch is not None else None
 
 
 def is_flydsl_kda_decode_supported(
@@ -51,8 +45,10 @@ def is_flydsl_kda_decode_supported(
                     "cuda",
                     torch.cuda.current_device(),
                 )
-        return _rocm_arch(resolved) == "gfx950"
-    except (AssertionError, RuntimeError, TypeError, ValueError):
+        if not 0 <= resolved.index < torch.cuda.device_count():
+            return False
+        return get_gfx_runtime() == "gfx950"
+    except (AssertionError, KeyError, RuntimeError, TypeError, ValueError):
         return False
 
 

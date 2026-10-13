@@ -18,6 +18,7 @@ from aiter.ops.flydsl.kda_decode import (
     flydsl_kda_decode_with_f_b,
     is_flydsl_kda_decode_supported,
 )
+from aiter.test_common import checkAllclose
 
 
 def _gfx950_flydsl_available() -> bool:
@@ -254,14 +255,22 @@ def _reference(inputs: Inputs) -> torch.Tensor:
     return output
 
 
-def _relative_rmse(
+# Worst element error vs the fp32 reference over this file on gfx950: output
+# 1.2e-4 (|ref| up to 3.9, needs atol 9.7e-5 at rtol 1e-3), state 8.8e-8.
+_OUTPUT_TOL = {"atol": 1e-3, "rtol": 1e-3}
+_STATE_TOL = {"atol": 1e-6, "rtol": 1e-3}
+
+
+def _assert_close(
     reference: torch.Tensor,
     actual: torch.Tensor,
-) -> float:
-    delta = actual.float() - reference.float()
-    return float(
-        delta.square().mean().sqrt() / (reference.float().square().mean().sqrt() + 1e-8)
+    tol: dict[str, float],
+    msg: str,
+) -> None:
+    err = checkAllclose(
+        reference.float(), actual.float(), tol_err_ratio=0.0, msg=msg, **tol
     )
+    assert err == 0, f"{msg}: {err:.4%} of elements outside {tol}"
 
 
 def _run(inputs: Inputs, out: torch.Tensor | None = None) -> torch.Tensor:
@@ -380,14 +389,8 @@ def test_kda_decode_matches_reference(batch: int) -> None:
 
     assert is_flydsl_kda_decode_supported(_DEVICE)
     assert not torch.isnan(actual).any()
-    assert _relative_rmse(reference, actual) < 1e-3
-    assert (
-        _relative_rmse(
-            reference_inputs.state,
-            actual_inputs.state,
-        )
-        < 1e-3
-    )
+    _assert_close(reference, actual, _OUTPUT_TOL, "output")
+    _assert_close(reference_inputs.state, actual_inputs.state, _STATE_TOL, "state")
     assert torch.equal(
         reference_inputs.conv_state,
         actual_inputs.conv_state,
@@ -419,8 +422,8 @@ def test_kda_decode_with_f_b_matches_reference(batch: int) -> None:
     torch.cuda.synchronize()
 
     assert not torch.isnan(actual).any()
-    assert _relative_rmse(reference, actual) < 1e-3
-    assert _relative_rmse(reference_inputs.state, actual_inputs.state) < 1e-3
+    _assert_close(reference, actual, _OUTPUT_TOL, "output")
+    _assert_close(reference_inputs.state, actual_inputs.state, _STATE_TOL, "state")
     assert torch.equal(reference_inputs.conv_state, actual_inputs.conv_state)
 
 
@@ -533,15 +536,14 @@ def test_large_cache_slot_offsets(fused_f_b: bool) -> None:
         actual = _run(actual_inputs)
     torch.cuda.synchronize()
 
-    assert _relative_rmse(reference, actual) < 1e-3
+    _assert_close(reference, actual, _OUTPUT_TOL, "output")
     for batch_idx, slot in enumerate(slot_indices):
         small_slot = int(reference_inputs.state_indices[batch_idx])
-        assert (
-            _relative_rmse(
-                reference_inputs.state[small_slot],
-                actual_inputs.state[slot],
-            )
-            < 1e-3
+        _assert_close(
+            reference_inputs.state[small_slot],
+            actual_inputs.state[slot],
+            _STATE_TOL,
+            "state",
         )
         assert torch.equal(
             reference_inputs.conv_state[small_slot],
@@ -651,8 +653,8 @@ def test_api_accepts_non_overlapping_write_layouts(
     torch.cuda.synchronize()
 
     assert actual is out
-    assert _relative_rmse(reference, actual) < 1e-3
-    assert _relative_rmse(reference_inputs.state, inputs.state) < 1e-3
+    _assert_close(reference, actual, _OUTPUT_TOL, "output")
+    _assert_close(reference_inputs.state, inputs.state, _STATE_TOL, "state")
     assert torch.equal(reference_inputs.conv_state, inputs.conv_state)
 
 
