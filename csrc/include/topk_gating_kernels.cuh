@@ -902,9 +902,8 @@ __global__ void topk_gating_kernel(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
-    // The top-k selection below scans whole vectors only, so experts past the
-    // last full vector would never be picked. topk_gating_launch chooses f32vec
-    // so that vec_size divides num_experts; stop loudly if a caller does not.
+    // Top-k scans whole vectors only, so a partial last vector would be skipped.
+    // topk_gating_launch picks f32vec so that vec_size divides num_experts.
     if(num_experts % vec_size != 0)
         __builtin_trap();
 
@@ -1081,9 +1080,6 @@ __global__ void topk_gating_kernel_smem_n(
     static constexpr int vec_size = opus::vector_traits<f32vec>::size();
     using vec_i                   = opus::vector_t<cktype_i, vec_size>;
     const int num_experts_vec     = num_experts / vec_size;
-    // The top-k selection below scans whole vectors only, so experts past the
-    // last full vector would never be picked. topk_gating_launch chooses f32vec
-    // so that vec_size divides num_experts; stop loudly if a caller does not.
     if(num_experts % vec_size != 0)
         __builtin_trap();
 
