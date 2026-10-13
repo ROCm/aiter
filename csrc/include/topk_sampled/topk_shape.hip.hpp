@@ -627,8 +627,10 @@ static inline ShapeParams derive_shape_params(int M, int N, int K)
         p.geom_ok     = (K <= N);
         return p;
     }
-    float margin = auto_margin(K, derive_sample_s_for_n(M, N, K, 1.4f), N);
-    int S        = derive_sample_s_for_n(M, N, K, margin);
+    // Once: the S law does not read a margin, and the margin is taken from the
+    // final S below.
+    int S = derive_sample_s_for_n(M, N, K, 1.4f);
+    float margin;
     if(!sample_stride_exact(N, S))
     {
         const int chunks   = std::max(1, N / SAMPLE_CHUNK_ELEMS);

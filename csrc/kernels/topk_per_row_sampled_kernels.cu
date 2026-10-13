@@ -1556,7 +1556,9 @@ static bool sampled_device_ok(int device)
 // term it tests (the target, LDS residency, dwordx4 geometry, the Phase C LDS
 // cap) is a property of these kernels, not of the caller. device_id < 0 asks
 // about the current device.
-bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k, int64_t device_id = -1)
+// Everything topk_sampled_supports tests but the shape plan, which the entry
+// derives once for both the test and the launch.
+static bool sampled_args_ok(int64_t numRows, int64_t stride0, int64_t k, int64_t device_id)
 {
     if(!sampled_device_ok(static_cast<int>(device_id)))
         return false;
@@ -1566,15 +1568,19 @@ bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k, int64_t 
     // would not survive the narrowing below rather than serve a truncated shape.
     if(numRows > INT32_MAX || stride0 > INT32_MAX)
         return false;
-    if(k > PHASE_C_CAP_MAX)
-        return false;
+    return k <= PHASE_C_CAP_MAX;
+}
+
+bool topk_sampled_supports(int64_t numRows, int64_t stride0, int64_t k, int64_t device_id = -1)
+{
     // stride0 need not be a multiple of FP32_EPT. This entry always
     // instantiates RAGGED=true, where the vector count is n4_cover(len) and
     // load_row_f4 loads the final partial vector element-wise, so an odd pitch
     // only makes the row base unaligned -- which gfx950 serves natively.
-    return sampled::params_for(
+    return sampled_args_ok(numRows, stride0, k, device_id) &&
+           sampled::params_for(
                static_cast<int>(numRows), static_cast<int>(stride0), static_cast<int>(k))
-        .geom_ok;
+               .geom_ok;
 }
 
 // rowStarts[row] and rowEnds[row] bound [start, end); indices are absolute columns.
@@ -1638,7 +1644,13 @@ void top_k_per_row_prefill_sampled(
     AITER_CHECK(rowStarts.numel() >= static_cast<size_t>(numRows) &&
                     rowEnds.numel() >= static_cast<size_t>(numRows),
                 "top_k_per_row_prefill_sampled: rowStarts/rowEnds must have numRows entries");
-    AITER_CHECK(topk_sampled_supports(numRows, stride0, k, logits.device_id),
+    // topk_sampled_supports, with the shape plan derived once for the launch too.
+    const bool args_ok   = sampled_args_ok(numRows, stride0, k, logits.device_id);
+    const int M          = static_cast<int>(numRows);
+    const int N          = static_cast<int>(stride0);
+    const int K          = static_cast<int>(k);
+    const ShapeParams sp = args_ok ? sampled::params_for(M, N, K) : ShapeParams{};
+    AITER_CHECK(args_ok && sp.geom_ok,
                 "top_k_per_row_prefill_sampled: unsupported shape (numRows=",
                 numRows,
                 " stride0=",
@@ -1650,17 +1662,11 @@ void top_k_per_row_prefill_sampled(
                 "top_k_per_row_prefill_sampled requires a caller-provided workspace "
                 "(see top_k_per_row_prefill_sampled in topk.py)");
 
-    const int M = static_cast<int>(numRows);
-    const int N = static_cast<int>(stride0);
-    const int K = static_cast<int>(k);
-
     // A plain row whose width is not a multiple of FP32_EPT is safe on the fused
     // path: phase_b_filter_coop reads the tail, and the tests cover every N % 4
     // residue on both entries. topk_small_n truncates `pitch / FP32_EPT` with no
     // tail handling, so odd widths keep its bounds-checked instantiation.
     const hipStream_t stream = aiter::getCurrentHIPStream();
-
-    const ShapeParams sp = sampled::params_for(M, N, K);
 
     // The plain kernels select K of every row, which a row of N <= K does not
     // have; the bounded ones emit such a row whole, in column order, and pad
