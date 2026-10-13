@@ -124,6 +124,30 @@ def test_topk_argmax_half(m, n, dtype):
     return ret
 
 
+def test_zero_rows():
+    """An empty batch selects nothing and leaves no launch error behind.
+
+    Rows ride a grid dimension, so a zero-row call used to launch a zero-sized
+    grid: HIP rejected it, and the next kernel on the stream raised. The probe
+    after each call is that next kernel.
+    """
+    failures = []
+    for dtype in (dtypes.fp32, dtypes.bf16, dtypes.fp16):
+        # 2048 takes the single-pass launch, 129280 the split one.
+        for n in (2048, 129280):
+            name = f"{dtype} n={n}"
+            try:
+                _, idx = topk_select(torch.empty(0, n, dtype=dtype), 1, tie="low")
+                torch.ones(1).add_(1)
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{name}: {e!r}")
+                continue
+            if idx.shape != (0, 1):
+                failures.append(f"{name}: idx shape {tuple(idx.shape)}")
+    return failures
+
+
 def test_half_invariants(m, n):
     """What the half-format reduction promises beyond agreeing on random rows.
 
@@ -457,6 +481,10 @@ def main():
     bad = test_invariants(64, 32768, 512)
     aiter.logger.info(
         "invariants: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    bad = test_zero_rows()
+    aiter.logger.info(
+        "zero rows: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     bad = test_half_invariants(64, 32768)
     aiter.logger.info(

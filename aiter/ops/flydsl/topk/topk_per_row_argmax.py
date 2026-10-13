@@ -76,6 +76,9 @@ def topk_per_row_argmax(
             f"got {scores.dtype}"
         )
     rows, width = scores.shape
+    # Rows ride a grid dimension, and HIP rejects a zero-sized launch.
+    if rows == 0:
+        return
     vec = VEC_BY_ELEM[elem]
     splits = topk_per_row_argmax_splits(rows, width, vec)
     # The count goes in as an argument, not as a build parameter: it follows the
