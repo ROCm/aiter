@@ -303,13 +303,8 @@ def test_paged_attn_v2(
     assert v2_calls, "SEQ_LEN=4096 was expected to dispatch to the V2 kernels"
 
 
-# The kernels pad the KV block axis to next_power_of_2(KV_BLK_SZ). The padding
-# lanes of every non-last block have a token index below seq_len, so they must
-# be masked out of the softmax explicitly; otherwise each one adds exp(0 - max)
-# to the denominator and shrinks the output. The other tests only use
-# power-of-two block sizes, which have no padding lanes.
-# The V2 wrappers are called directly with a single partition: the public
-# dispatcher only picks V2 for multi-partition sequences.
+# Non-power-of-two KV block sizes: the padding lanes must stay out of the softmax.
+# V2 is called directly, as the dispatcher only picks it for multiple partitions.
 @pytest.mark.parametrize(
     "B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, NUM_BLK, version",
     [
