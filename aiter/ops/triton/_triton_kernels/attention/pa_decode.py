@@ -639,8 +639,6 @@ def _paged_attn_decode_v2_w_dot_kernel(
 
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
 
-    # KV_BLK_SZ need not divide SEQ_PARTITION_SZ, so the first and last block of a
-    # partition can straddle its boundaries; the mask below keeps only its tokens.
     kv_blk_start = seq_start_idx // KV_BLK_SZ
     num_kv_blks = tl.cdiv(seq_end_idx, KV_BLK_SZ) - kv_blk_start
 
@@ -1244,8 +1242,6 @@ def _paged_attn_decode_v2_wo_dot_kernel_per_token_quant(
 
     seq_start_idx = seq_part_idx * SEQ_PARTITION_SZ
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
-    # KV_BLK_SZ need not divide SEQ_PARTITION_SZ, so the first and last block of a
-    # partition can straddle its boundaries; the mask below keeps only its tokens.
     kv_blk_start = seq_start_idx // KV_BLK_SZ
     num_kv_blks = tl.cdiv(seq_end_idx, KV_BLK_SZ) - kv_blk_start
 
@@ -1521,8 +1517,6 @@ def _paged_attn_decode_v2_w_dot_kernel_per_token_quant(
 
     seq_end_idx = tl.minimum(seq_start_idx + SEQ_PARTITION_SZ, seq_len)
 
-    # KV_BLK_SZ need not divide SEQ_PARTITION_SZ, so the first and last block of a
-    # partition can straddle its boundaries; the mask below keeps only its tokens.
     kv_blk_start = seq_start_idx // KV_BLK_SZ
     num_kv_blks = tl.cdiv(seq_end_idx, KV_BLK_SZ) - kv_blk_start
 

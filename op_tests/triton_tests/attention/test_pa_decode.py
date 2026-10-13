@@ -590,13 +590,8 @@ def test_paged_attn_per_token_quant(
     torch.testing.assert_close(triton_output, torch_output, rtol=2.5e-1, atol=2.5e-1)
 
 
-# With multiple partitions, a KV block size that does not divide the
-# 1024-token partition size puts blocks across partition boundaries. Each
-# token must be counted in exactly one partition: none twice, none dropped.
-# B * H_Q <= 512 and SEQ_LEN > 1024, so the dispatcher picks the V2 kernels.
-# A few double-counted or dropped tokens out of thousands move the output by
-# only ~1e-3, below the 1e-2 bf16 tolerance of the single-partition test
-# above, so this test runs in fp32.
+# Multi-partition V2 with block sizes that do not divide the 1024-token partition.
+# Runs in fp32: bf16 tolerance would hide a few double-counted or dropped tokens.
 @pytest.mark.parametrize(
     "B, H_Q, H_KV, KV_BLK_SZ, SEQ_LEN, NUM_BLK",
     [
