@@ -20,7 +20,6 @@ def qsa_device_arch(gcn_arch_name: str) -> str:
     """Return ``gfx942`` or ``gfx950`` from a device ``gcnArchName``.
 
     Anything else raises; callers must not treat it as the gfx942 tile.
-    ``auto`` uses :func:`qsa_arch_is_supported` and stays on Triton instead.
     """
     name = gcn_arch_name.split(":", 1)[0]
     if not qsa_arch_is_supported(gcn_arch_name):
