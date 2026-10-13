@@ -875,7 +875,22 @@ def build_hstu_attention_bwd_dvdk_pp(
                 ]
                 base_tile = q_tile_start + fx.Int32(_outer) * fx.Int32(UNROLL)
 
+                # Loop rotated: the closing barrier of each gate phase is
+                # issued at the TOP of the next sub-trip rather than the bottom
+                # of this one. The scf.for back edge -- increment, 64-bit trip
+                # compare, branch -- therefore lands in the tail of the gate
+                # phase instead of at the head of the MFMA phase.
+                #
+                # It was costing 184 cy/exec there: the trip test needs the
+                # bound in a VGPR (v_cmp takes only one SGPR operand) and the
+                # allocator chose v[108:109], the registers `ds_read2_b64`
+                # overwrites a few instructions later, so the copy stalled on a
+                # WAR hazard. Ahead of the barrier that hazard resolves during
+                # the rendezvous wait, which is time the wave was spending
+                # anyway.
                 for u in range_constexpr(UNROLL):
+                    if const_expr(u == 0):
+                        phase_barrier()
                     q_tile = base_tile + fx.Int32(u)
                     # Literal slots: tile i lives in i % RM_SLOTS, its transpose
                     # in i % T_SLOTS, and GEMM1/GEMM3 read tile i-1's.
@@ -888,9 +903,14 @@ def build_hstu_attention_bwd_dvdk_pp(
                     )
                     phase_barrier()
                     p_prev, ds_prev = gate_phase(s_accs, da_accs, q_start)
-                    phase_barrier()
+                    if const_expr(u < UNROLL - 1):
+                        phase_barrier()
 
                 loop_results = yield (dv + dk + p_prev + ds_prev)
+
+            # Closes the last iteration's gate phase, which the rotation left
+            # without a trailing barrier inside the loop.
+            phase_barrier()
 
             if not is_g0:
                 phase_barrier()
