@@ -23,7 +23,9 @@ if "triton" not in sys.modules:
     except (ImportError, ModuleNotFoundError):
         _mock_triton = MagicMock()
         _mock_triton.cdiv = lambda a, b: (a + b - 1) // b
-        _mock_triton.next_power_of_2 = lambda n: 1 if n <= 1 else 2 ** (n - 1).bit_length()
+        _mock_triton.next_power_of_2 = lambda n: (
+            1 if n <= 1 else 2 ** (n - 1).bit_length()
+        )
         sys.modules.setdefault("triton", _mock_triton)
         sys.modules.setdefault("triton.language", MagicMock())
         sys.modules.setdefault("triton.runtime", MagicMock())

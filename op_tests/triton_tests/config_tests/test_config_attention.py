@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import os
+
 import pytest
 
 from aiter.ops.triton.utils import (
@@ -48,14 +49,19 @@ def test_attention_config_schema(path: str):
             for param in ("BLOCK_M", "BLOCK_N", "BLOCK_SIZE_M", "BLOCK_SIZE_N"):
                 if param in v:
                     val = v[param]
-                    assert is_power_of_two(val), (
-                        f"{rel_path(path)} [{k}]: {param}={val} must be a power of 2"
-                    )
+                    assert is_power_of_two(
+                        val
+                    ), f"{rel_path(path)} [{k}]: {param}={val} must be a power of 2"
             if "num_warps" in v:
                 warps = v["num_warps"]
-                assert warps in (1, 2, 4, 8, 16, 32), (
-                    f"{rel_path(path)} [{k}]: unexpected num_warps={warps}"
-                )
+                assert warps in (
+                    1,
+                    2,
+                    4,
+                    8,
+                    16,
+                    32,
+                ), f"{rel_path(path)} [{k}]: unexpected num_warps={warps}"
 
 
 @pytest.mark.parametrize("arch", ["gfx942", "gfx950", "gfx1250"])
@@ -73,7 +79,7 @@ def test_unified_attention_loader_resolves(arch: str):
 def test_tuned_kernel_loader_resolves():
     """Test _get_tuned_kernel_entry loads published kernel configs."""
     with set_test_arch("gfx950"):
-        fpath, entry = tuned_config_utils._get_tuned_kernel_entry(
+        _fpath, entry = tuned_config_utils._get_tuned_kernel_entry(
             "attention",
             "CHUNK_DELTA_ATTN",
             "chunk_gla_fwd_kernel_o",

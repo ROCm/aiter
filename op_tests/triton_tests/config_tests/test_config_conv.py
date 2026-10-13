@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+
 import pytest
 
 from aiter.ops.triton.utils import (
@@ -41,9 +42,9 @@ def test_conv_config_schema(path: str):
     has_any = "any" in table
     has_shapes = any(k in table for k in ("shapes", "shapes_nhwc", "shapes_nchw"))
     has_m_bounds = any(k.startswith("M_LEQ_") for k in table)
-    assert has_any or has_shapes or has_m_bounds, (
-        f"{rel_path(path)}: Conv table must have shapes, M_LEQ, or any"
-    )
+    assert (
+        has_any or has_shapes or has_m_bounds
+    ), f"{rel_path(path)}: Conv table must have shapes, M_LEQ, or any"
     check_no_mixed_geq_leq(table, path)
 
     # Validate tile parameters in entries
@@ -59,28 +60,44 @@ def test_conv_config_schema(path: str):
 
     for name, cfg in entries:
         assert len(cfg) > 0, f"{rel_path(path)} [{name}]: config entry cannot be empty"
-        for bkey in ("BLOCK_M", "BLOCK_N", "BLOCK_K", "BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K"):
+        for bkey in (
+            "BLOCK_M",
+            "BLOCK_N",
+            "BLOCK_K",
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_N",
+            "BLOCK_SIZE_K",
+        ):
             if bkey in cfg:
                 val = cfg[bkey]
-                assert is_power_of_two(val), (
-                    f"{rel_path(path)} [{name}]: {bkey}={val} must be a positive power of 2"
-                )
+                assert is_power_of_two(
+                    val
+                ), f"{rel_path(path)} [{name}]: {bkey}={val} must be a positive power of 2"
         if "num_warps" in cfg:
             warps = cfg["num_warps"]
-            assert warps in (1, 2, 4, 8, 16, 32), (
-                f"{rel_path(path)} [{name}]: unexpected num_warps={warps}"
-            )
+            assert warps in (
+                1,
+                2,
+                4,
+                8,
+                16,
+                32,
+            ), f"{rel_path(path)} [{name}]: unexpected num_warps={warps}"
 
 
 def _get_conv_families():
     families = []
     for arch in DISCOVERED_ARCHS:
-        conv_dir = os.path.join(config_utils.AITER_TRITON_CONFIGS_PATH, arch, "triton", "conv")
+        conv_dir = os.path.join(
+            config_utils.AITER_TRITON_CONFIGS_PATH, arch, "triton", "conv"
+        )
         if not os.path.isdir(conv_dir):
             continue
         for dtype_dir in os.listdir(conv_dir):
             fdir = os.path.join(conv_dir, dtype_dir)
-            if os.path.isdir(fdir) and os.path.exists(os.path.join(fdir, "DEFAULT.json")):
+            if os.path.isdir(fdir) and os.path.exists(
+                os.path.join(fdir, "DEFAULT.json")
+            ):
                 config_name = dtype_dir.upper().replace("_", "-")
                 families.append((arch, config_name, os.path.join(fdir, "DEFAULT.json")))
     return families
@@ -107,5 +124,7 @@ def test_conv_loader_resolves_family(arch, config_name, fpath):
         shapes = file_data.get("shapes", {})
         if shapes:
             shape_key = next(iter(shapes))
-            exact_cfg = conv_config_utils.get_conv_config(config_name, shape_key=shape_key)
+            exact_cfg = conv_config_utils.get_conv_config(
+                config_name, shape_key=shape_key
+            )
             assert exact_cfg == shapes[shape_key]

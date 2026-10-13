@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+
 import pytest
 
 from op_tests.triton_tests.config_tests.common import (
@@ -36,35 +37,47 @@ def test_config_files_accounting():
     Ensures 100% of discovered files are partitioned without orphans, while allowing
     legitimate future tuning additions without brittle exact-count breakage.
     """
-    assert len(ALL_CONFIG_FILES) >= 859, (
-        f"Expected at least 859 configuration files, found {len(ALL_CONFIG_FILES)}"
-    )
-    assert len(DISCOVERED_ARCHS) == 9, (
-        f"Expected 9 architectures, found {len(DISCOVERED_ARCHS)}: {DISCOVERED_ARCHS}"
-    )
+    assert (
+        len(ALL_CONFIG_FILES) >= 859
+    ), f"Expected at least 859 configuration files, found {len(ALL_CONFIG_FILES)}"
+    assert (
+        len(DISCOVERED_ARCHS) == 9
+    ), f"Expected 9 architectures, found {len(DISCOVERED_ARCHS)}: {DISCOVERED_ARCHS}"
 
     defaults = [p for p in ALL_CONFIG_FILES if p.endswith("DEFAULT.json")]
     non_defaults = [p for p in ALL_CONFIG_FILES if not p.endswith("DEFAULT.json")]
     assert len(defaults) + len(non_defaults) == len(ALL_CONFIG_FILES)
-    assert len(defaults) >= 296, f"Expected at least 296 DEFAULT.json files, found {len(defaults)}"
+    assert (
+        len(defaults) >= 296
+    ), f"Expected at least 296 DEFAULT.json files, found {len(defaults)}"
 
     gemm_spec = [p for p in non_defaults if f"{os.sep}gemm{os.sep}" in p]
-    assert len(gemm_spec) >= 546, f"Expected at least 546 specialized GEMM files, found {len(gemm_spec)}"
+    assert (
+        len(gemm_spec) >= 546
+    ), f"Expected at least 546 specialized GEMM files, found {len(gemm_spec)}"
 
     mhc_spec = [p for p in non_defaults if f"{os.sep}mhc{os.sep}" in p]
-    assert len(mhc_spec) >= 11, f"Expected at least 11 specialized MHC files, found {len(mhc_spec)}"
+    assert (
+        len(mhc_spec) >= 11
+    ), f"Expected at least 11 specialized MHC files, found {len(mhc_spec)}"
 
     fusions_spec = [p for p in non_defaults if f"{os.sep}fusions{os.sep}" in p]
-    assert len(fusions_spec) >= 5, f"Expected at least 5 specialized Fusions files, found {len(fusions_spec)}"
+    assert (
+        len(fusions_spec) >= 5
+    ), f"Expected at least 5 specialized Fusions files, found {len(fusions_spec)}"
 
     legacy_files = [p for p in non_defaults if p.endswith("mha.json")]
-    assert len(legacy_files) == 1, f"Expected exactly 1 legacy mha.json file, found {len(legacy_files)}"
+    assert (
+        len(legacy_files) == 1
+    ), f"Expected exactly 1 legacy mha.json file, found {len(legacy_files)}"
 
     # 100% complete accounting: every non-default file must belong to a known family
-    total_classified = len(gemm_spec) + len(mhc_spec) + len(fusions_spec) + len(legacy_files)
-    assert total_classified == len(non_defaults), (
-        f"Unaccounted non-default files found! Classified {total_classified} out of {len(non_defaults)}"
+    total_classified = (
+        len(gemm_spec) + len(mhc_spec) + len(fusions_spec) + len(legacy_files)
     )
+    assert total_classified == len(
+        non_defaults
+    ), f"Unaccounted non-default files found! Classified {total_classified} out of {len(non_defaults)}"
 
 
 def test_all_config_dirs_have_default():

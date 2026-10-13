@@ -13,6 +13,7 @@ Validates all 8 MoE configuration files across architectures:
 from __future__ import annotations
 
 import json
+
 import pytest
 
 from aiter.ops.triton.utils import (
@@ -41,17 +42,24 @@ def test_moe_config_schema(path: str):
         assert isinstance(cfg, dict), f"{rel_path(path)}: {key} must map to a dict"
         assert len(cfg) > 0, f"{rel_path(path)} [{key}]: config entry cannot be empty"
 
-        for bkey in ("block_n", "block_k", "BLOCK_SIZE_K", "BLOCK_SIZE_N", "BLOCK_M", "BLOCK_N"):
+        for bkey in (
+            "block_n",
+            "block_k",
+            "BLOCK_SIZE_K",
+            "BLOCK_SIZE_N",
+            "BLOCK_M",
+            "BLOCK_N",
+        ):
             if bkey in cfg:
                 val = cfg[bkey]
-                assert is_power_of_two(val), (
-                    f"{rel_path(path)} [{key}]: {bkey}={val} must be a positive power of 2"
-                )
+                assert is_power_of_two(
+                    val
+                ), f"{rel_path(path)} [{key}]: {bkey}={val} must be a positive power of 2"
         if "num_warps" in cfg:
             warps = cfg["num_warps"]
-            assert is_power_of_two(warps), (
-                f"{rel_path(path)} [{key}]: num_warps={warps} must be a positive power of 2"
-            )
+            assert is_power_of_two(
+                warps
+            ), f"{rel_path(path)} [{key}]: num_warps={warps} must be a positive power of 2"
     check_no_mixed_geq_leq(table, path)
 
 
@@ -68,15 +76,21 @@ def test_moe_config_schema(path: str):
 def test_moe_dispatch_loader_resolves(config_name: str, arch: str, backend: str):
     """Test get_moe_dispatch resolution for all published MOE dispatch tables."""
     with set_test_arch(arch):
-        dispatch = moe_config_utils.get_moe_dispatch(config_name, arch=arch, backend=backend)
+        dispatch = moe_config_utils.get_moe_dispatch(
+            config_name, arch=arch, backend=backend
+        )
         assert isinstance(dispatch, dict)
-        assert len(dispatch) > 0, f"MOE {config_name} {backend} dispatch empty on {arch}"
+        assert (
+            len(dispatch) > 0
+        ), f"MOE {config_name} {backend} dispatch empty on {arch}"
 
 
 def test_moe_unsupported_arch_returns_empty():
     """Verify that requesting an un-shipped MOE table falls back cleanly to empty dict."""
     with set_test_arch("gfx942"):
-        dispatch = moe_config_utils.get_moe_dispatch("A8W4", arch="gfx942", backend="triton")
+        dispatch = moe_config_utils.get_moe_dispatch(
+            "A8W4", arch="gfx942", backend="triton"
+        )
         assert dispatch == {}
 
 

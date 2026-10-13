@@ -26,7 +26,9 @@ if "triton" not in sys.modules:
     except (ImportError, ModuleNotFoundError):
         _mock_triton = MagicMock()
         _mock_triton.cdiv = lambda a, b: (a + b - 1) // b
-        _mock_triton.next_power_of_2 = lambda n: 1 if n <= 1 else 2 ** (n - 1).bit_length()
+        _mock_triton.next_power_of_2 = lambda n: (
+            1 if n <= 1 else 2 ** (n - 1).bit_length()
+        )
         sys.modules.setdefault("triton", _mock_triton)
         sys.modules.setdefault("triton.language", MagicMock())
         sys.modules.setdefault("triton.runtime", MagicMock())
@@ -42,8 +44,8 @@ _rocm_home = os.getenv("ROCM_PATH", "/opt/rocm")
 if not os.path.exists(_rocm_home) and not os.path.exists(f"{_rocm_home}/.info/version"):
     os.environ.setdefault("AITER_TRITON_ONLY", "1")
 
-from aiter.ops.triton.utils._triton import arch_info  # noqa: E402
-from aiter.ops.triton.utils import (  # noqa: E402
+from aiter.ops.triton import gmm
+from aiter.ops.triton.utils import (
     config_utils,
     conv_config_utils,
     gemm_config_utils,
@@ -55,7 +57,7 @@ from aiter.ops.triton.utils import (  # noqa: E402
     tuned_config_utils,
     unified_attention_utils,
 )
-import aiter.ops.triton.gmm as gmm  # noqa: E402
+from aiter.ops.triton.utils._triton import arch_info
 
 CONFIGS_PATH = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "../../../aiter/ops/triton/configs")
@@ -80,7 +82,8 @@ def discover_all_config_files() -> list[str]:
 def discover_architectures() -> list[str]:
     """Discover all valid target GPU architectures present in config tree."""
     return sorted(
-        d for d in os.listdir(CONFIGS_PATH)
+        d
+        for d in os.listdir(CONFIGS_PATH)
         if os.path.isdir(os.path.join(CONFIGS_PATH, d)) and not d.startswith(".")
     )
 
@@ -106,12 +109,11 @@ def check_no_mixed_geq_leq(data: dict, filepath: str) -> None:
        resolution order (LEQ ascending followed by GEQ descending) documented in configs/CLAUDE.md.
     """
     legacy_keys = [
-        k for k in data
-        if "_LE_" in k or "_GE_" in k or k.startswith("LE_") or k.startswith("GE_")
+        k for k in data if "_LE_" in k or "_GE_" in k or k.startswith(("LE_", "GE_"))
     ]
-    assert not legacy_keys, (
-        f"{rel_path(filepath)}: Non-canonical legacy LE/GE key format found: {legacy_keys}"
-    )
+    assert (
+        not legacy_keys
+    ), f"{rel_path(filepath)}: Non-canonical legacy LE/GE key format found: {legacy_keys}"
 
     m_leq = [
         int(k.split("_")[-1])
@@ -124,16 +126,18 @@ def check_no_mixed_geq_leq(data: dict, filepath: str) -> None:
         if "." not in k and k.startswith("M_GEQ_") and k.split("_")[-1].isdigit()
     ]
     if m_leq and m_geq:
-        assert max(m_leq) <= min(m_geq), (
-            f"{rel_path(filepath)}: Overlapping M_LEQ ({max(m_leq)}) and M_GEQ ({min(m_geq)}) ranges"
-        )
+        assert max(m_leq) <= min(
+            m_geq
+        ), f"{rel_path(filepath)}: Overlapping M_LEQ ({max(m_leq)}) and M_GEQ ({min(m_geq)}) ranges"
 
 
 def load_json_dict(filepath: str) -> dict:
     """Load JSON file and assert it is a non-empty dictionary."""
     with open(filepath, "r", encoding="utf-8") as f:
         data = json.load(f)
-    assert isinstance(data, dict), f"{rel_path(filepath)}: root JSON object must be a dict"
+    assert isinstance(
+        data, dict
+    ), f"{rel_path(filepath)}: root JSON object must be a dict"
     assert len(data) > 0, f"{rel_path(filepath)}: configuration dictionary is empty"
     return data
 
@@ -203,37 +207,42 @@ def validate_config_file_layout_and_naming(path: str) -> None:
     """
     rel = rel_path(path)
     parts = rel.split(os.sep)
-    assert len(parts) == 5, (
-        f"Path must have exactly 5 components (<arch>/<backend>/<op>/<dtype>/<filename>): {rel}"
-    )
+    assert (
+        len(parts) == 5
+    ), f"Path must have exactly 5 components (<arch>/<backend>/<op>/<dtype>/<filename>): {rel}"
 
     arch, backend, op, dtype = parts[0], parts[1], parts[2], parts[3]
     fname = parts[4]
 
-    assert config_utils._ARCH_SAFE_RE.fullmatch(arch), f"{rel}: invalid arch identifier '{arch}'"
-    assert backend in config_utils._VALID_BACKENDS, f"{rel}: invalid backend '{backend}'"
+    assert config_utils._ARCH_SAFE_RE.fullmatch(
+        arch
+    ), f"{rel}: invalid arch identifier '{arch}'"
+    assert (
+        backend in config_utils._VALID_BACKENDS
+    ), f"{rel}: invalid backend '{backend}'"
     assert config_utils._OP_RE.fullmatch(op), f"{rel}: invalid op identifier '{op}'"
     assert dtype == dtype.lower(), f"{rel}: dtype directory must be lowercase"
     assert "-" not in dtype, f"{rel}: dtype directory must not contain hyphens"
 
     # No architecture prefix in filenames
     for a in discover_architectures():
-        assert not fname.startswith(f"{a}_") and not fname.startswith(f"{a}-"), (
-            f"{rel}: filename must not have arch prefix '{a}'"
-        )
+        assert not fname.startswith(f"{a}_") and not fname.startswith(
+            f"{a}-"
+        ), f"{rel}: filename must not have arch prefix '{a}'"
 
     # Valid filename formats
     if fname not in ("DEFAULT.json", "mha.json"):
         assert fname.endswith(".json"), f"{rel}: specialized file must end with '.json'"
-        assert _SPECIALIZED_CONFIG_RE.fullmatch(fname), (
-            f"{rel}: specialized file '{fname}' must follow <CONFIG_NAME>-<suffix>.json format"
-        )
+        assert _SPECIALIZED_CONFIG_RE.fullmatch(
+            fname
+        ), f"{rel}: specialized file '{fname}' must follow <CONFIG_NAME>-<suffix>.json format"
         stem = fname[:-5]
         parts = stem.split("-")
         matching_splits = [
             ("-".join(parts[:i]), "-".join(parts[i:]))
             for i in range(1, len(parts))
-            if config_utils._dtype_dir("-".join(parts[:i])) == dtype and len("-".join(parts[i:])) > 0
+            if config_utils._dtype_dir("-".join(parts[:i])) == dtype
+            and len("-".join(parts[i:])) > 0
         ]
         assert len(matching_splits) == 1, (
             f"{rel}: specialized file '{fname}' must have exactly one valid decomposition "
@@ -257,9 +266,7 @@ def validate_gemm_config_table(
     - num_stages is a positive integer
     """
     display_path = rel_path(path) if os.path.isabs(path) else path
-    assert "any" in table, (
-        f"{display_path}: GEMM table must contain an 'any' fallback"
-    )
+    assert "any" in table, f"{display_path}: GEMM table must contain an 'any' fallback"
     check_no_mixed_geq_leq(table, path)
 
     if backend is None:
@@ -270,50 +277,72 @@ def validate_gemm_config_table(
                 backend = parts[1]
             else:
                 backend = "triton"
-        except Exception:
+        except (ValueError, IndexError, TypeError, AttributeError):
             backend = "triton"
 
     for key, cfg in table.items():
         if key in ("M_BOUNDS", "_note", "DEFAULT_FALLBACK"):
             continue
-        assert key == "any" or key.startswith("M_LEQ_") or key.startswith("M_GEQ_"), (
-            f"{display_path}: unexpected key '{key}'"
-        )
+        assert key == "any" or key.startswith(
+            ("M_LEQ_", "M_GEQ_")
+        ), f"{display_path}: unexpected key '{key}'"
         assert isinstance(cfg, dict), f"{display_path}: {key} must map to a dict"
         assert len(cfg) > 0, f"{display_path} [{key}]: config entry cannot be empty"
 
         # Validate backend-specific required parameter set
         if backend == "triton":
-            assert "BLOCK_SIZE_M" in cfg, f"{display_path} [{key}]: missing required 'BLOCK_SIZE_M'"
-            assert "BLOCK_SIZE_N" in cfg, f"{display_path} [{key}]: missing required 'BLOCK_SIZE_N'"
-            assert "num_warps" in cfg or "waves_per_eu" in cfg, (
-                f"{display_path} [{key}]: missing required 'num_warps' or 'waves_per_eu'"
-            )
+            assert (
+                "BLOCK_SIZE_M" in cfg
+            ), f"{display_path} [{key}]: missing required 'BLOCK_SIZE_M'"
+            assert (
+                "BLOCK_SIZE_N" in cfg
+            ), f"{display_path} [{key}]: missing required 'BLOCK_SIZE_N'"
+            assert (
+                "num_warps" in cfg or "waves_per_eu" in cfg
+            ), f"{display_path} [{key}]: missing required 'num_warps' or 'waves_per_eu'"
         elif backend == "gluon":
             has_m = "BLOCK_SIZE_M" in cfg or "BLOCK_M" in cfg
             has_n = "BLOCK_SIZE_N" in cfg or "BLOCK_N" in cfg
             has_warps = "num_warps" in cfg or "NUM_WARPS" in cfg
-            assert has_m, f"{display_path} [{key}]: Gluon entry missing 'BLOCK_SIZE_M' or 'BLOCK_M'"
-            assert has_n, f"{display_path} [{key}]: Gluon entry missing 'BLOCK_SIZE_N' or 'BLOCK_N'"
-            assert has_warps, f"{display_path} [{key}]: Gluon entry missing 'num_warps' or 'NUM_WARPS'"
+            assert (
+                has_m
+            ), f"{display_path} [{key}]: Gluon entry missing 'BLOCK_SIZE_M' or 'BLOCK_M'"
+            assert (
+                has_n
+            ), f"{display_path} [{key}]: Gluon entry missing 'BLOCK_SIZE_N' or 'BLOCK_N'"
+            assert (
+                has_warps
+            ), f"{display_path} [{key}]: Gluon entry missing 'num_warps' or 'NUM_WARPS'"
 
-        for param in ("BLOCK_SIZE_M", "BLOCK_SIZE_N", "BLOCK_SIZE_K", "BLOCK_M", "BLOCK_N", "BLOCK_K"):
+        for param in (
+            "BLOCK_SIZE_M",
+            "BLOCK_SIZE_N",
+            "BLOCK_SIZE_K",
+            "BLOCK_M",
+            "BLOCK_N",
+            "BLOCK_K",
+        ):
             if param in cfg:
                 val = cfg[param]
-                assert is_power_of_two(val), (
-                    f"{display_path} [{key}]: {param}={val} must be a positive power of 2"
-                )
+                assert is_power_of_two(
+                    val
+                ), f"{display_path} [{key}]: {param}={val} must be a positive power of 2"
 
         for w_param in ("num_warps", "NUM_WARPS"):
             if w_param in cfg:
                 warps = cfg[w_param]
-                assert warps in (1, 2, 4, 8, 16, 32), (
-                    f"{display_path} [{key}]: unexpected {w_param}={warps}"
-                )
+                assert warps in (
+                    1,
+                    2,
+                    4,
+                    8,
+                    16,
+                    32,
+                ), f"{display_path} [{key}]: unexpected {w_param}={warps}"
 
         for s_param in ("num_stages", "NUM_STAGES"):
             if s_param in cfg:
                 stages = cfg[s_param]
-                assert isinstance(stages, int) and stages > 0, (
-                    f"{display_path} [{key}]: {s_param} must be positive integer, got {stages}"
-                )
+                assert (
+                    isinstance(stages, int) and stages > 0
+                ), f"{display_path} [{key}]: {s_param} must be positive integer, got {stages}"

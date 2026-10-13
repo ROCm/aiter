@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import os
 import re
+
 import pytest
 
 from aiter.ops.triton.utils import (
@@ -40,10 +41,7 @@ def test_mhc_config_schema(path: str):
         table = json.load(f)
 
     has_valid_keys = any(
-        k in ("any", "default")
-        or k.startswith("M_LEQ_")
-        or k.startswith("C_")
-        or k.startswith("_mhc_")
+        k in ("any", "default") or k.startswith(("M_LEQ_", "C_", "_mhc_"))
         for k in table
     )
     assert has_valid_keys, f"{rel_path(path)}: MHC table missing standard keys"
@@ -54,21 +52,23 @@ def test_mhc_config_schema(path: str):
             for bkey in ("BLOCK_M", "BLOCK_K", "BLOCK_C", "TILE_K"):
                 if bkey in v:
                     val = v[bkey]
-                    assert is_power_of_two(val), (
-                        f"{rel_path(path)} [{k}]: {bkey}={val} must be a positive power of 2"
-                    )
+                    assert is_power_of_two(
+                        val
+                    ), f"{rel_path(path)} [{k}]: {bkey}={val} must be a positive power of 2"
             if "num_warps" in v:
                 warps = v["num_warps"]
-                assert is_power_of_two(warps), (
-                    f"{rel_path(path)} [{k}]: num_warps={warps} must be a positive power of 2"
-                )
+                assert is_power_of_two(
+                    warps
+                ), f"{rel_path(path)} [{k}]: num_warps={warps} must be a positive power of 2"
     check_no_mixed_geq_leq(table, path)
 
 
 def _get_mhc_c_specialized_files():
     files = []
     for arch in DISCOVERED_ARCHS:
-        mhc_dir = os.path.join(config_utils.AITER_TRITON_CONFIGS_PATH, arch, "triton", "mhc")
+        mhc_dir = os.path.join(
+            config_utils.AITER_TRITON_CONFIGS_PATH, arch, "triton", "mhc"
+        )
         if not os.path.isdir(mhc_dir):
             continue
         for root, _, fnames in os.walk(mhc_dir):
@@ -110,5 +110,7 @@ def test_mhc_loaders_default_resolution(arch: str):
         post_cfg = mhc_config_utils.get_mhc_post_config(M=1, C=512)
         assert isinstance(post_cfg, dict)
 
-        fused_post_cfg = mhc_config_utils.get_mhc_fused_post_pre_delayed_rmsnorm_config(M=1)
+        fused_post_cfg = mhc_config_utils.get_mhc_fused_post_pre_delayed_rmsnorm_config(
+            M=1
+        )
         assert isinstance(fused_post_cfg, dict)

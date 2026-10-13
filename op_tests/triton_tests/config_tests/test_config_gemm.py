@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import re
+
 import pytest
 
 from aiter.ops.triton.utils import (
@@ -92,10 +93,10 @@ GEMM_FAMILIES = _get_gemm_families()
 def test_gemm_family_default_resolution(arch, backend, config_name, dtype_dir):
     """Test get_gemm_config loads family defaults across all architectures without production changes."""
     with set_test_arch(arch):
-        cfg, _ = gemm_config_utils.get_gemm_config(
-            config_name, M=1, backend=backend
-        )
-        assert isinstance(cfg, dict), f"Failed resolving fallback for {config_name} on {arch}"
+        cfg, _ = gemm_config_utils.get_gemm_config(config_name, M=1, backend=backend)
+        assert isinstance(
+            cfg, dict
+        ), f"Failed resolving fallback for {config_name} on {arch}"
         assert "BLOCK_SIZE_M" in cfg or "num_warps" in cfg or "num_stages" in cfg
 
         computed = gemm_config_utils.compute_splitk_params(cfg, K=1024)
@@ -110,18 +111,19 @@ def test_gemm_specialized_file_resolution(path: str):
     every single specialized file is exercised and validated against its actual content.
     """
     rel = rel_path(path)
-    arch, backend, op, dtype_dir, fname = rel.split(os.sep)
+    arch, backend, _op, dtype_dir, fname = rel.split(os.sep)
     stem = fname[:-5]
 
     data = config_utils.load_config_json(path)
     m_val = 1
     expected = None
     for k in data:
-        if k.startswith("M_LEQ_") and k[6:].isdigit():
-            m_val = int(k[6:])
-            expected = data[k]
-            break
-        elif k.startswith("M_GEQ_") and k[6:].isdigit():
+        if (
+            k.startswith("M_LEQ_")
+            and k[6:].isdigit()
+            or k.startswith("M_GEQ_")
+            and k[6:].isdigit()
+        ):
             m_val = int(k[6:])
             expected = data[k]
             break
@@ -160,8 +162,10 @@ def test_gemm_specialized_file_resolution(path: str):
                 candidate = stem[:i]
                 if config_utils._dtype_dir(candidate) == dtype_dir:
                     matched_cfg_name = candidate
-            assert matched_cfg_name is not None, f"Could not deduce config_name for {fname}"
-            suffix = stem[len(matched_cfg_name) + 1:]
+            assert (
+                matched_cfg_name is not None
+            ), f"Could not deduce config_name for {fname}"
+            suffix = stem[len(matched_cfg_name) + 1 :]
             res, is_tuned = gemm_config_utils.get_gemm_config(
                 matched_cfg_name,
                 M=m_val,
@@ -169,13 +173,17 @@ def test_gemm_specialized_file_resolution(path: str):
                 backend=backend,
             )
         if any(k.startswith(("M_LEQ_", "M_GEQ_")) for k in data):
-            assert is_tuned is True, f"{rel}: expected is_tuned=True when resolving specialized file"
+            assert (
+                is_tuned is True
+            ), f"{rel}: expected is_tuned=True when resolving specialized file"
         else:
             # Per configs/CLAUDE.md: is_tuned is False when matching 'any' fallback
-            assert is_tuned is False, f"{rel}: expected is_tuned=False for any-only specialized file"
+            assert (
+                is_tuned is False
+            ), f"{rel}: expected is_tuned=False for any-only specialized file"
         assert isinstance(res, dict)
         if expected is not None:
             for param, val in expected.items():
-                assert res.get(param) == val, (
-                    f"{rel}: expected {param}={val}, got {res.get(param)}"
-                )
+                assert (
+                    res.get(param) == val
+                ), f"{rel}: expected {param}={val}, got {res.get(param)}"
