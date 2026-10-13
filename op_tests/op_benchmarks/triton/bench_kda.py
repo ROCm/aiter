@@ -74,9 +74,11 @@ def make_inputs(
 
     extra = {}
     if fused:
+        # spec decoding keeps vLLM's W-2+T tap window, read from num_accepted-1
+        taps = W - 1 if accepted is None else W - 2 + T
         extra = {
             "conv_state": torch.randn(
-                state.shape[0], 3 * H * D, W - 1, dtype=dtype, device=device
+                state.shape[0], 3 * H * D, taps, dtype=dtype, device=device
             ),
             "conv_weight": torch.randn(3, W, H * D, dtype=torch.float32, device=device)
             * 0.1,
@@ -328,8 +330,8 @@ def parse_args():
         "--gluon_configs",
         type=str,
         nargs="+",
-        default=["32,4,32"],
-        help="BV,NUM_WARPS,SK triples, one benchmark line each",
+        default=None,
+        help="BV,NUM_WARPS,SK triples, one benchmark line each (default per arch)",
     )
     parser.add_argument(
         "--num_buffers",
@@ -448,6 +450,10 @@ def parse_args():
 def run_bench(args):
     if arch_info.get_arch() not in ("gfx950", "gfx1250"):
         sys.exit(f"KDA gluon decode needs gfx950/gfx1250, got {arch_info.get_arch()}")
+    if args.gluon_configs is None:
+        # The gfx950 kernel holds the whole [V, K] state: BV == V.
+        gfx950 = arch_info.get_arch() == "gfx950"
+        args.gluon_configs = [f"{args.head_dim},4,16"] if gfx950 else ["32,4,32"]
     if "fla" in args.backends and not HAS_FLA:
         print("fla not importable -- dropping the upstream backend.")
         print("  PYTHONPATH=/path/to/flash-linear-attention to enable it")
