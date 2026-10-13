@@ -1639,11 +1639,13 @@ void top_k_per_row_prefill_sampled(
                     rowEnds.numel() >= static_cast<size_t>(numRows),
                 "top_k_per_row_prefill_sampled: rowStarts/rowEnds must have numRows entries");
     AITER_CHECK(topk_sampled_supports(numRows, stride0, k, logits.device_id),
-                "top_k_per_row_prefill_sampled: unsupported shape (numRows=%ld stride0=%ld k=%ld); "
-                "ask topk_sampled_supports() first",
-                (long)numRows,
-                (long)stride0,
-                (long)k);
+                "top_k_per_row_prefill_sampled: unsupported shape (numRows=",
+                numRows,
+                " stride0=",
+                stride0,
+                " k=",
+                k,
+                "); ask topk_sampled_supports() first");
     AITER_CHECK(workspace.has_value(),
                 "top_k_per_row_prefill_sampled requires a caller-provided workspace "
                 "(see top_k_per_row_prefill_sampled in topk.py)");
@@ -1703,9 +1705,11 @@ void top_k_per_row_prefill_sampled(
 
     const auto L = sampled::ws_layout(M, sp.cap);
     AITER_CHECK(workspace.value().numel() * workspace.value().element_size() >= L.total,
-                "top_k_per_row_prefill_sampled: workspace is %zu B, needs %zu B",
+                "top_k_per_row_prefill_sampled: workspace is ",
                 workspace.value().numel() * workspace.value().element_size(),
-                L.total);
+                " B, needs ",
+                L.total,
+                " B");
     Bufs b              = sampled::bind_bufs(workspace.value().data_ptr(), L, sp.cap);
     const LaunchPlan lp = plan_launch(M, N, sp);
     if(nan_high)

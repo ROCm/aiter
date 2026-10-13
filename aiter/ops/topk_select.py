@@ -729,28 +729,37 @@ def _sampled_takes(
     to plain's band when `yield_to_plain` -- uniform rows, plain available. The
     doors added for that k point the other way: rows in plain's band that its
     own dispatch hands to its multi-block kernel (`_plain_multiblock`, asked at
-    `stride0`, the row pitch plain reads ragged rows at, which defaults to the
-    width), and the few-row band's rows past its width, which decode served
-    1.47x-2.56x slower. See `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
+    the pitch plain reads at: `stride0` for ragged rows, the width otherwise,
+    since plain copies other strided rows dense), and the few-row band's rows
+    past its width, which decode served 1.47x-2.56x slower. See
+    `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
+
+    `stride0` is the row pitch `_dispatch` launches `sampled` at, so the
+    capability is asked at that pitch. The kernels bound each row by it, so rows
+    that overlap -- a pitch below the width, as a broadcast row's 0 is -- stay
+    out.
 
     Nothing below `_SAMPLED_MIN_K`, whatever the shape: see its definition.
     """
     if k < _SAMPLED_MIN_K:
         return False
+    pitch = width if stride0 is None else stride0
+    if pitch < width:
+        return False
     if device is None:
         device = torch.cuda.current_device()
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and _device_arch(device) == "gfx950":
         plain_band = _plain_takes(rows, width, k, device)
-        pitch = width if stride0 is None else stride0
-        if (plain_band and _plain_multiblock(rows, pitch, k, ragged, device)) or (
+        plain_pitch = pitch if ragged else width
+        if (plain_band and _plain_multiblock(rows, plain_pitch, k, ragged, device)) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
         ):
-            return _sampled_supports_cached(rows, width, k, device)
+            return _sampled_supports_cached(rows, pitch, k, device)
         if yield_to_plain and plain_band:
             return False
     if not (rows * width >= _SAMPLED_MIN_WORK or width >= _SAMPLED_MIN_WIDTH):
         return False
-    return _sampled_supports_cached(rows, width, k, device)
+    return _sampled_supports_cached(rows, pitch, k, device)
 
 
 def _stream_small_reject(rows: int, rejects: int) -> bool:
@@ -836,10 +845,12 @@ def topk_select_backend(
 
     `ragged` is whether the caller gave row ends. Ragged rows run plain's ranged
     form, so `sampled`'s work door does not yield to plain's gfx950 k=2048 band
-    for them; see `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`. That form reads a row-strided
-    view of more than one row in place, and `stride0` is then its row pitch,
-    which plain's launcher sizes its multi-block choice by; it defaults to the
-    width, the pitch every other call is read at.
+    for them; see `_PLAIN_K2048_LDS_TAIL_MIN_ROWS`.
+
+    `stride0` is the input's row pitch, the width for dense rows or a single
+    row, and the default. `sampled` reads every row in place at it; plain's
+    ranged form reads a row-strided view in place at it too, and plain's
+    launcher sizes its multi-block choice by the pitch it reads at.
 
     The shape of the answer: `plain` takes the many-row middle, where it is the
     only one that scales with rows rather than against them; the small-k selector
@@ -1127,11 +1138,10 @@ def topk_select(
         # caller's buffer at the end, like a reordered one.
         idx = torch.empty((rows, topk), dtype=torch.int32, device=input.device)
 
-    # The row pitch plain reads at: `topk_plain` reads ragged rows of a
-    # row-strided view in place, and every other call width apart.
-    stride0 = width
-    if end is not None and rows > 1 and strides[0] > width:
-        stride0 = strides[0]
+    # The row pitch the rows sit at in memory; a single row has none to speak
+    # of and reads as dense. `topk_select_backend` derives from it the pitch
+    # each backend that reads rows in place would launch at.
+    stride0 = strides[0] if rows > 1 else width
     backend = _choose(
         rows,
         width,
@@ -1312,10 +1322,11 @@ def _dispatch(
         #
         # topk_select built or checked every tensor here -- fp32 input with
         # inner stride 1, dense int32 [rows] bounds, a dense [rows, topk] output
-        # -- and `_choose` asked topk_sampled_supports for this device, so the
-        # entry's validation would only repeat it. The one thing not checked is
-        # the device of a caller's `end` (the default one is built on input's);
-        # the entry reports that one.
+        # -- and `_choose` asked topk_sampled_supports for this device at this
+        # pitch, so the entry's validation would only repeat it. The one thing
+        # not checked is the device of a caller's `end` (the default one is
+        # built on input's); the entry reports that one.
+        pitch = input.stride(0) if rows > 1 else input.shape[1]
         if not ragged or ends.get_device() == input.get_device():
             _sampled_run(
                 input,
@@ -1324,7 +1335,7 @@ def _dispatch(
                 idx,
                 None,
                 rows,
-                input.stride(0),
+                pitch,
                 input.stride(1),
                 topk,
                 None,
@@ -1339,7 +1350,7 @@ def _dispatch(
                 idx,
                 None,
                 rows,
-                input.stride(0),
+                pitch,
                 input.stride(1),
                 k=topk,
                 ragged=ragged,

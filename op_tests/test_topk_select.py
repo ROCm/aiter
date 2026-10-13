@@ -333,6 +333,52 @@ def test_strided_layouts():
     return failures
 
 
+def test_row_pitch():
+    """Rows whose pitch is not the width, through the dispatch.
+
+    A backend that reads rows in place must be routed on the pitch it is
+    launched at. `sampled` was routed on the width and launched at `stride(0)`:
+    a broadcast row (pitch 0) aborted the process, one row with a pitch of 1
+    came back as one index and -1s, and overlapping rows were read wrong. Each
+    shape here is wide enough for `sampled` on gfx950.
+    """
+    m, n, k = 64, 131072, 1024
+    torch.manual_seed(0)
+    flat = torch.randn(m * n // 2 + n)
+    layouts = {
+        "one row, pitch 1": torch.randn(n, 1).T,
+        "broadcast rows, pitch 0": torch.randn(n).expand(m, n),
+        "overlapping rows, pitch n/2": flat.as_strided((m, n), (n // 2, 1)),
+        "column slice, pitch n+64": torch.randn(m, n + 64)[:, :n],
+    }
+    failures = []
+    for layout, x in layouts.items():
+        rows = x.shape[0]
+        for ragged in (False, True):
+            lens = (
+                torch.randint(k, n + 1, (rows,), dtype=dtypes.i32)
+                if ragged
+                else torch.full((rows,), n, dtype=dtypes.i32)
+            )
+            label = f"{layout}{', ragged' if ragged else ''}"
+            try:
+                idx = topk_select(x, k, end=lens if ragged else None)[1]
+                torch.cuda.synchronize()
+            except Exception as e:  # noqa: BLE001
+                failures.append(f"{label}: {type(e).__name__}: {e}")
+                continue
+            ordered = idx.sort(dim=1).values
+            if not bool((ordered[:, 0] >= 0).all()) or bool(
+                (ordered[:, 1:] == ordered[:, :-1]).any()
+            ):
+                failures.append(f"{label}: an index is -1 or repeated")
+            elif not torch.equal(_sorted_values(x, idx), run_torch(x, lens, k)):
+                failures.append(f"{label}: wrong selection")
+    for label in failures:
+        aiter.logger.error("ROW PITCH FAILED: %s", label)
+    return failures
+
+
 def test_rejections():
     """A wrong rank or dtype is refused with the ValueError that names the rule.
 
@@ -613,6 +659,11 @@ def main():
         "strided layouts: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"strided layouts: {len(bad)} failed"
+    bad = test_row_pitch()
+    aiter.logger.info(
+        "row pitch: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"row pitch: {len(bad)} failed"
     bad = test_rejections()
     aiter.logger.info(
         "rejections: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
