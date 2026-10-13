@@ -57,9 +57,6 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
         AITER_CHECK(reverse.dtype() == AITER_DTYPE_i32 && reverse.is_contiguous() &&
                         reverse.numel() >= static_cast<int64_t>(num_tokens) * topk,
                     "reverse_sorted must be a contiguous int32 buffer for tokens * topk routes");
-        HIP_CALL(hipMemsetAsync(reverse.data_ptr(), 0xff,
-                               static_cast<size_t>(num_tokens) * topk * sizeof(int32_t),
-                               stream));
     }
 
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
