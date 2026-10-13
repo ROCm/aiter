@@ -31,6 +31,36 @@ WAN_SHAPES = (
     (9450, 13824, 5120),
     (9450, 5120, 13824),
 )
+FLUX_SHAPES = (
+    (3072, 3072, 8192),
+    (3072, 3072, 16384),
+    (3072, 3072, 32768),
+    (8192, 3072, 3072),
+    (8192, 3072, 9216),
+    (8192, 3072, 12288),
+    (9216, 3072, 8192),
+    (9216, 3072, 16384),
+    (9216, 3072, 32768),
+    (12288, 3072, 8192),
+    (12288, 3072, 16384),
+    (12288, 3072, 32768),
+    (16384, 3072, 3072),
+    (16384, 3072, 9216),
+    (16384, 3072, 12288),
+    (32768, 3072, 3072),
+    (32768, 3072, 9216),
+    (32768, 3072, 12288),
+    (8192, 9216, 3072),
+    (16384, 9216, 3072),
+    (32768, 9216, 3072),
+    (3072, 12288, 8192),
+    (3072, 12288, 16384),
+    (3072, 12288, 32768),
+    (8192, 12288, 3072),
+    (16384, 12288, 3072),
+    (32768, 12288, 3072),
+)
+DIFFUSION_SHAPES = WAN_SHAPES + FLUX_SHAPES
 
 
 def parse_shape(value):
@@ -176,8 +206,8 @@ def benchmark_shape(
             waves_per_eu=flydsl_config["waves_per_eu"],
             xcd_swizzle=flydsl_config["xcd_swizzle"],
             lds_stage=flydsl_config["lds_stage"],
-            enable_scheduler=True,
-            split_k=1,
+            enable_scheduler=flydsl_config["scheduler"],
+            split_k=flydsl_config["split_k"],
         )
 
     launches = {
@@ -254,9 +284,9 @@ def main():
     parser.add_argument("--seed", type=int, default=20261013)
     parser.add_argument("--bias", action="store_true")
     parser.add_argument(
-        "--no-wan",
+        "--no-diffusion",
         action="store_true",
-        help="Exclude the three Wan projection shapes from the default matrix.",
+        help="Exclude the Wan and Flux/diffusion shapes from the default matrix.",
     )
     parser.add_argument("--include-flydsl", action="store_true")
     parser.add_argument("--flydsl-tile", type=parse_shape, default=(128, 128, 128))
@@ -264,6 +294,10 @@ def main():
     parser.add_argument("--flydsl-waves-per-eu", type=int, default=0)
     parser.add_argument("--flydsl-xcd-swizzle", type=int, default=8)
     parser.add_argument("--flydsl-lds-stage", type=int, default=2)
+    parser.add_argument("--flydsl-split-k", type=int, default=1)
+    parser.add_argument(
+        "--flydsl-scheduler", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument(
@@ -283,8 +317,8 @@ def main():
         shapes = args.shape
     else:
         shapes = load_shapes(args.shapes_file)
-        if not args.no_wan:
-            shapes.extend(shape for shape in WAN_SHAPES if shape not in shapes)
+        if not args.no_diffusion:
+            shapes.extend(shape for shape in DIFFUSION_SHAPES if shape not in shapes)
     flydsl_config = {
         "tile_m": args.flydsl_tile[0],
         "tile_n": args.flydsl_tile[1],
@@ -293,6 +327,8 @@ def main():
         "waves_per_eu": args.flydsl_waves_per_eu,
         "xcd_swizzle": args.flydsl_xcd_swizzle,
         "lds_stage": args.flydsl_lds_stage,
+        "split_k": args.flydsl_split_k,
+        "scheduler": args.flydsl_scheduler,
     }
     rows = []
     for index, shape in enumerate(shapes):
