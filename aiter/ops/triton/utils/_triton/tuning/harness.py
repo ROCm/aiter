@@ -15,6 +15,7 @@ KERNEL_CONFIG_NAMES = {
     "gemm_a16w8_blockscale_preshuffle": "GEMM-A16W8_BLOCKSCALE_PRESHUFFLED",
     "gemm_a16wfp4": "GEMM-A16WFP4",
     "gemm_a8w8": "GEMM-A8W8",
+    "gemm_a8w8_bpreshuffle": "GEMM-A8W8_BPRESHUFFLE",
     "gemm_a8w8_blockscale": "GEMM-A8W8_BLOCKSCALE",
     "gemm_a8w8_blockscale_preshuffle": "GEMM-A8W8_BLOCKSCALE_PRESHUFFLED",
     "gemm_a8w8_per_token_scale": "GEMM-A8W8_PER_TOKEN_SCALE",
@@ -160,6 +161,43 @@ def get_kernel_runner(kernel, input_shape):
                 M, N, K, in_dtype=fp8_dtype, out_dtype=dtype, layout="TN", output=True
             )
             return partial(gemm_a8w8, x, w, x_scale, w_scale, None, dtype, y)
+
+        case "gemm_a8w8_bpreshuffle":
+            import torch
+
+            from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
+            from aiter.ops.triton.utils._triton.arch_info import get_arch
+            from aiter.ops.triton.utils.shuffle import shuffle_weight
+            from op_tests.triton_tests.gemm.basic.test_gemm_a8w8_bpreshuffle import (
+                generate_gemm_a8w8_bpreshuffle_inputs,
+                run_torch,
+            )
+
+            assert get_arch() == "gfx1201", "bpreshuffle tuning targets gfx1201"
+            x, w, sx, sw = generate_gemm_a8w8_bpreshuffle_inputs(
+                M, N, K, row_strided=True
+            )
+            y = torch.empty((M, N), dtype=torch.bfloat16, device=x.device)
+            reference = run_torch(x, w, sx, sw, y.dtype)
+            run = partial(
+                gemm_a8w8,
+                x,
+                shuffle_weight(w, pad_k_to=32),
+                sx,
+                sw.T,
+                y=y,
+                b_preshuffled=True,
+            )
+
+            def validate(config):
+                saved = dict(config) if config is not None else None
+                result = run(config=config)
+                assert result is y
+                assert config == saved, "candidate config was mutated"
+                torch.testing.assert_close(result, reference, rtol=0.02, atol=0.01)
+
+            run.validate = validate
+            return run
 
         case "gemm_a8w8_blockscale" | "gemm_a8w8_blockscale_preshuffle":
             import torch
@@ -321,10 +359,14 @@ def _prepare_config(kernel, K, config):
 
 
 def get_profile_functions(kernel, input_shape, config_list):
-    """Reuse one set of inputs across all configs, preparing each outside profiling."""
+    """Prepare and optionally validate each candidate before its profiling loop."""
     run = get_kernel_runner(kernel, input_shape)
     for config in config_list:
-        yield partial(run, config=_prepare_config(kernel, input_shape[2], config))
+        prepared = _prepare_config(kernel, input_shape[2], config)
+        validate = getattr(run, "validate", None)
+        if validate is not None:
+            validate(prepared)
+        yield partial(run, config=prepared)
 
 
 def main(argv=None):

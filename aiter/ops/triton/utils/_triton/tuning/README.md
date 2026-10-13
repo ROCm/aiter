@@ -95,3 +95,9 @@ and check the kernel name (with config suffix) and runtime to see if both kernel
 **Adding a harness**
 
 Add a `case` to `get_kernel_runner()` in `harness.py`: keep imports inside the case, generate inputs once, and return the kernel call with its inputs bound using `partial`. The shared `get_profile_functions()` loop supplies each config. Add any config adjustments to `_prepare_config()` so they run outside profiling. Add the kernel name to `KERNEL_CONFIG_NAMES` in the same file, using the `config_name` passed to `get_gemm_config`. No separate harness file is needed.
+
+The returned callable may expose `validate(config)` to check each candidate once before the profiling loop. The gfx1201 `gemm_a8w8_bpreshuffle` case uses this to compare against FP32 matmul and check output reuse and config immutability, including odd/padded K and row-strided inputs. Explicit split-K candidates belong here rather than in op unit tests. For example (the final value selects split-K):
+
+    python3 harness.py gemm_a8w8_bpreshuffle 3 80 513 16 64 256 1 4 2 1 16 1 3
+
+Omit the ten config values to exercise the installed defaults.

@@ -332,6 +332,11 @@ For adding a config, seeding a new arch, and the per-family key schemes, follow
 `configs/CLAUDE.md` (§5 and §6). For the manual tuning flow, see
 `utils/_triton/tuning/README.md`.
 
+Explicit candidate validation belongs in the tuning harness rather than op
+unit tests. A harness runner may expose `validate(config)`; the shared loop
+calls it once per candidate before profiling, keeping reference checks out
+of the timed call.
+
 ---
 
 ## Config-aware kernel names in traces (`kernel_repr`)
