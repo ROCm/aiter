@@ -18,6 +18,7 @@ import math
 
 import pytest
 import torch
+import triton
 
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_delta_attn_fwd
 from aiter.ops.triton._triton_kernels.kimi_delta_attn import chunk_fwd as _chunk_fwd
@@ -438,6 +439,28 @@ def test_published_k2_schedules_can_split_their_tile():
     for bw, nw in sorted(reached):
         assert bw % 16 == 0, f"BW={bw} is not a whole number of MFMA tiles"
         assert nw <= bw // 16, f"BW={bw} cannot be split {nw} ways"
+
+
+def test_k1_schedule_comes_from_the_config(monkeypatch):
+    """K1's occupancy hint is read from the published config, and a published
+    warp count its layouts were not built for is rejected, not launched."""
+    if not _flash_kda._gluon_k1_usable(FLASH_KDA_CHUNK, K_DIM):
+        pytest.skip("this arch never routes K1 to Gluon")
+    from aiter.ops.triton._gluon_kernels.gfx950.kimi_delta_attn import (
+        flash_kda_k1 as _g1,
+    )
+
+    assert _g1._k1_schedule()[0] == _g1._NUM_WARPS
+
+    wrong = triton.Config({"waves_per_eu": 0}, num_warps=2 * _g1._NUM_WARPS)
+    monkeypatch.setattr(_g1, "chunk_delta_attn_tuned_config", lambda *a, **kw: wrong)
+    _g1._k1_schedule.cache_clear()
+    try:
+        with pytest.raises(ValueError, match="num_warps"):
+            _g1._k1_schedule()
+    finally:
+        monkeypatch.undo()
+        _g1._k1_schedule.cache_clear()
 
 
 def _varlen(lens):

@@ -1,4 +1,8 @@
 {
+    "k1_prepare_gluon": {
+        "num_warps": 2,
+        "waves_per_eu": 3
+    },
     "k2_ab_fused_gluon_wide": {
         "BW": 64,
         "num_warps": 4,

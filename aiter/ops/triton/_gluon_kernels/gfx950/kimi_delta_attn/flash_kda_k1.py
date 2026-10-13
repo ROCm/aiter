@@ -1,11 +1,16 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
+import functools
 import math
 
+import triton
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
+from aiter.ops.triton._triton_kernels.kimi_delta_attn.chunk_delta_attn_utils import (
+    chunk_delta_attn_tuned_config,
+)
 from aiter.ops.triton._triton_kernels.kimi_delta_attn.fast_launch import fast_launch
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
@@ -364,9 +369,28 @@ def k1_prepare_gluon(
 
 
 _NUM_WARPS = math.prod(_MMA_F16.warps_per_cta)
-# Holds K1 to 168 VGPRs; left alone it lands at 170 and drops to 2 waves per
-# SIMD (0.85x).
-_WAVES_PER_EU = 3
+# No occupancy hint where none is published; the warp count is fixed by the
+# layouts above.
+_K1_FALLBACK = triton.Config({"waves_per_eu": 0}, num_warps=_NUM_WARPS)
+
+
+@functools.cache
+def _k1_schedule() -> tuple[int, int]:
+    """``(num_warps, waves_per_eu)`` for the Gluon K1, from the published config.
+
+    Only ``waves_per_eu`` is tunable: the layouts are built for ``_NUM_WARPS``,
+    so a published entry naming another warp count is rejected rather than
+    launched against them.
+    """
+    cfg = chunk_delta_attn_tuned_config(
+        "k1_prepare_gluon", _K1_FALLBACK, backend="gluon"
+    )
+    if cfg.num_warps != _NUM_WARPS:
+        raise ValueError(
+            f"k1_prepare_gluon is built for num_warps={_NUM_WARPS}, "
+            f"but the published config sets {cfg.num_warps}"
+        )
+    return cfg.num_warps, cfg.kwargs.get("waves_per_eu", 0)
 
 
 _k1_fast = fast_launch(k1_prepare_gluon)
@@ -400,6 +424,7 @@ def gluon_k1_prepare(
     CM_WS="",
     CM_LOAD=".cg",
 ):
+    num_warps, waves_per_eu = _k1_schedule()
     return _k1_fast[(TOTAL_TILES if cu_seqlens is not None else NT, B * H)](
         q=q,
         k=k,
@@ -429,6 +454,6 @@ def gluon_k1_prepare(
         STORE_BETA=ws_beta is not None,
         CM_WS=CM_WS,
         CM_LOAD=CM_LOAD,
-        num_warps=_NUM_WARPS,
-        waves_per_eu=_WAVES_PER_EU,
+        num_warps=num_warps,
+        waves_per_eu=waves_per_eu,
     )
