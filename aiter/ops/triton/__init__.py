@@ -107,6 +107,8 @@ _BACKWARD_COMPAT_MAP = {
     "fused_gemm_afp4wfp4_mul_add": "gemm.fused.fused_gemm_afp4wfp4_mul_add",
     "fused_gemm_afp4wfp4_split_cat": "gemm.fused.fused_gemm_afp4wfp4_split_cat",
     "fused_gemm_a8w8_blockscale_split_cat": "gemm.fused.fused_gemm_a8w8_blockscale_split_cat",
+    # Grouped GEMM modules (gemm/grouped/)
+    "gmm": "gemm.grouped.gmm",
     # Attention modules (attention/)
     "chunked_pa_prefill": "attention.chunked_pa_prefill",
     "extend_attention": "attention.extend_attention",
@@ -138,6 +140,7 @@ _BACKWARD_COMPAT_MAP = {
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
     "fused_rmsnorm_add": "normalization.fused_rmsnorm_add",
+    "fused_rmsnorm_add_rmsnorm": "normalization.fused_rmsnorm_add_rmsnorm",
     "norm": "normalization.norm",
     "rmsnorm": "normalization.rmsnorm",
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",

@@ -87,6 +87,9 @@ def init_compute_data(
 # ---------------
 
 
+_TUNED_ARCH = "gfx942"
+
+
 @dataclass
 class Case:
     m: int
@@ -118,6 +121,9 @@ class Case:
             Case(300, 400, 800, 8, 4),
             Case(1000, 704, 800, 8, 2),
             Case(4097, 1024, 1024, 128, 4),
+            # gfx942 tuned table: m=256 -> block_m=128, m=128 -> block_m=64
+            Case(256, 1536, 5120, 2, 1),
+            Case(128, 1536, 5120, 2, 1),
             Case(16, 32, 256, 2, 1, hbm_swizzling=True),
             Case(16, 256, 256, 8, 4, hbm_swizzling=True),
             Case(32, 6144, 3072, 128, 4, hbm_swizzling=True),
@@ -169,7 +175,7 @@ def test_op(
     ):
         pytest.skip("Test will take too long on FFM")
 
-    if not (arch_info.is_fp4_avail()):
+    if not (arch_info.is_fp4_avail() or arch_info.get_arch() == _TUNED_ARCH):
         pytest.skip("MXFP4 not supported on this architecture")
 
     if hbm_swizzling:

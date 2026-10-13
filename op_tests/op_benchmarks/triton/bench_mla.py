@@ -216,7 +216,7 @@ def benchmark(args):
             out = mla_prefill_fwd(
                 query,
                 kv_buffer,
-                out,
+                output,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_k=seq_lens_kv,
                 max_seqlen_kv=max_seqlen_kv,
@@ -239,7 +239,7 @@ def benchmark(args):
             * 2
             * kv_dtype.itemsize
         )
-        if decode_qlen > 0 and skip_reduce:
+        if decode_qlen > 0 and skip_reduce and isinstance(out, tuple):
             assert (
                 isinstance(out, tuple) and len(out) == 3
             ), "Output should be a tuple of 3 tensors for skip_reduce and decode_qlen > 0 1"
@@ -250,12 +250,13 @@ def benchmark(args):
                 + segm_expsum.numel() * segm_expsum.itemsize
             )
         else:
-            mem_out = out.numel() * query.itemsize
+            # A single segment returns the final tensor even with skip_reduce.
+            mem_out = out.numel() * out.itemsize
         mem = (mem_in + mem_out) * 1e-12
 
         def fn():
             if decode_qlen > 0:
-                out = mla_decode_fwd(
+                mla_decode_fwd(
                     query,
                     maybe_shuffled_kv_buffer,
                     output,
@@ -271,12 +272,13 @@ def benchmark(args):
                     kv_descale=kv_descale,
                     out_scale=out_scale,
                     shuffled_kv_cache=shuffled_kv_cache,
+                    skip_reduce=skip_reduce,
                 )
             else:
-                out = mla_prefill_fwd(
+                mla_prefill_fwd(
                     query,
                     kv_buffer,
-                    out,
+                    output,
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_k=seq_lens_kv,
                     max_seqlen_kv=max_seqlen_kv,
@@ -292,7 +294,7 @@ def benchmark(args):
                 )
 
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-        if "ms" in provider:
+        if provider == "time":
             return ms
         else:  # BW TB/s
             return mem / ms * 1e3
