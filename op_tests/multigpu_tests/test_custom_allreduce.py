@@ -464,7 +464,7 @@ parser.add_argument(
 parser.add_argument(
     "--regression",
     action="store_true",
-    help="run only tail correctness checks in both eager and graph modes",
+    help="run only the correctness checks: tail (eager and graph) and LL128",
 )
 parser.add_argument(
     "--iterations",
@@ -488,7 +488,10 @@ if __name__ == "__main__":
             shapes=[args.shape] if args.shape is not None else None,
         )
         if dtype == torch.bfloat16:
-            test_allreduce_ll128_mixed_size_regression(args.tp_size)
+            # CI runs this file at the default TP8, which has no LL128 range.
+            for tp in _LL128_MIXED_SIZES:
+                if tp <= args.tp_size:
+                    test_allreduce_ll128_mixed_size_regression(tp)
     if args.regression:
         raise SystemExit(0)
     with_graph = args.mode == "graph"

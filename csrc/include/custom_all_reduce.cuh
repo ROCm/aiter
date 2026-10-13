@@ -4530,7 +4530,7 @@ class CustomAllreduce
     // scratch reuses the meta buffer's post-Signal region (see
     // allreduce_ll_poc / allreduce_ll128_unroll2), which assumes the tmp region
     // (2 * max_size) comfortably exceeds the fast-path scratch (worst case
-    // ~18 MiB at tp2); true for the default max_size (1 GiB).
+    // ~38 MiB at tp4); true for the default max_size (1 GiB).
     //
     // `size` here is still the element count (numel); it is divided down to
     // 16-byte packs only after this block. Thresholds were measured on bf16, so
