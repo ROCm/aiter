@@ -131,17 +131,30 @@ def override_env(var_name: str, value: str | None) -> Iterator[None]:
             os.environ[var_name] = prev
 
 
+def replay_env(arch: str, workers: int | None = None) -> dict[str, str]:
+    """Environment of a process that replays the runtime for ``arch``. aiter
+    fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so
+    ``GPU_ARCHS`` must name ``arch`` before aiter is imported; the GPUs stay
+    hidden, and aiter is imported in full rather than in AOT mode."""
+    env = dict(os.environ)
+    env.pop("AITER_AOT_IMPORT", None)
+    env.update(
+        GPU_ARCHS=arch,
+        HIP_VISIBLE_DEVICES="-1",
+        ROCR_VISIBLE_DEVICES="-1",
+        CUDA_VISIBLE_DEVICES="-1",
+    )
+    if workers is not None:
+        env["AITER_FLYDSL_AOT_WORKERS"] = str(workers)
+    return env
+
+
 def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
     """Load DEFAULT_CSVS + parse_csv for the named kind and return its
     job list. Note: importing .gemm / .moe / .chunk_gdn_h here also
     runs their module-level imports, which pull in FlyDSL (e.g.
     ``flydsl.expr``). Job collection is therefore not free in the
     parent process, just shifted once out of every child."""
-    if kind is OpKind.MEGA_MOE:
-        from .mega_moe import production_jobs
-
-        # Ships both V4-Pro and Kimi-K3 so neither JITs online at serving time.
-        return production_jobs()
     if kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import default_jobs
 
@@ -158,9 +171,7 @@ def _collect_aot_jobs_for(kind: OpKind) -> list[dict[str, Any]]:
 
 
 def _compile_one_config_for(kind: OpKind) -> Callable[..., dict[str, Any]]:
-    if kind is OpKind.MEGA_MOE:
-        from .mega_moe import compile_one_config
-    elif kind is OpKind.FMHA_FP8:
+    if kind is OpKind.FMHA_FP8:
         from .fmha_fp8 import compile_one_config
     elif kind is OpKind.GEMM:
         from .gemm import compile_one_config
@@ -418,27 +429,34 @@ def run_aot(cache_dir: str) -> None:
     os.makedirs(cache_dir, exist_ok=True)
     os.environ["FLYDSL_RUNTIME_CACHE_DIR"] = cache_dir
 
-    # MoE replays the runtime itself, which needs aiter fully imported for each
-    # target arch, so it runs in per-arch processes of its own.
+    # MoE and MegaMoE replay the runtime itself, which needs aiter fully
+    # imported for the target arch, so they run in processes of their own.
+    from .mega_moe import run as run_mega_moe_replay
     from .moe import DEFAULT_CSVS as MOE_CSVS
     from .moe import run as run_moe_replay
 
+    replay_errors = []
     moe_failed_archs = run_moe_replay([p for p in MOE_CSVS if os.path.isfile(p)])
-    moe_errors = (
-        [f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)"]
-        if moe_failed_archs
-        else []
-    )
+    if moe_failed_archs:
+        replay_errors.append(
+            f"FlyDSL MOE replay failed for {moe_failed_archs} arch(es)"
+        )
+    if run_mega_moe_replay():
+        replay_errors.append("FlyDSL MEGA_MOE replay failed")
 
-    pooled_kinds = [kind for kind in OpKind if kind is not OpKind.MOE]
+    pooled_kinds = [
+        kind for kind in OpKind if kind not in (OpKind.MOE, OpKind.MEGA_MOE)
+    ]
     all_jobs: list[tuple[OpKind, dict[str, Any]]] = []
     for kind in pooled_kinds:
         for job in _collect_aot_jobs_for(kind):
             all_jobs.append((kind, job))
 
     if not all_jobs:
-        if moe_errors:
-            raise AssertionError(f"[aiter] FlyDSL AOT failures: {moe_errors[0]}")
+        if replay_errors:
+            raise AssertionError(
+                f"[aiter] FlyDSL AOT failures: {'; '.join(replay_errors)}"
+            )
         print("[aiter] FlyDSL AOT: no kernels to compile, skipping")
         return
 
@@ -478,7 +496,7 @@ def run_aot(cache_dir: str) -> None:
 
         ok_by_kind: dict[OpKind, int] = {k: 0 for k in pooled_kinds}
         fail_by_kind: dict[OpKind, int] = {k: 0 for k in pooled_kinds}
-        errors: list[str] = list(moe_errors)
+        errors: list[str] = list(replay_errors)
         for (kind, _job), result, spec in zip(all_jobs, raw, specs):
             label = spec[2]
             if result is not None and result.get("compile_time") is not None:

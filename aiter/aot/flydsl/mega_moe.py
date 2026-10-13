@@ -14,6 +14,10 @@ which the runtime allocates symmetric buffers and exchanges peer pointers, hands
 out FakeTensors and fake addresses, so no GPU or process group is needed. This
 module only owns the deployment profiles.
 
+aiter fixes some arch-dependent values at import (e.g. ``dtypes.fp8``), so like
+the MoE replay this one runs in a process of its own, with the GPUs hidden and
+``GPU_ARCHS`` naming gfx950 before aiter is imported.
+
 Usage:
     # Every profile the service ships (DeepSeek-V4-Pro and Kimi-K3)
     python -m aiter.aot.flydsl.mega_moe
@@ -26,6 +30,8 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import os
+import subprocess
 import sys
 import time
 from contextlib import contextmanager
@@ -34,7 +40,7 @@ from unittest import mock
 
 import torch
 
-from aiter.aot.flydsl.common import run_jobs_parallel
+from aiter.aot.flydsl.common import replay_env, run_jobs_parallel
 
 ARCH = "gfx950"
 # The combine launch geometry is tuned per GPU model, read from the device name.
@@ -242,6 +248,12 @@ def compile_one_config(**job):
     return result
 
 
+def run(argv: list[str] | None = None) -> int:
+    """Replay in a process of its own; returns its exit status."""
+    command = [sys.executable, "-m", "aiter.aot.flydsl.mega_moe", *(argv or [])]
+    return subprocess.run(command, env=replay_env(ARCH), check=False).returncode
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mtpr", type=int, nargs="+", default=list(DEFAULT_MTPRS))
@@ -267,6 +279,8 @@ def main():
         default=list(DEFAULT_QUANTS),
     )
     args = parser.parse_args()
+    if os.environ.get("GPU_ARCHS") != ARCH:
+        raise SystemExit(run(sys.argv[1:]))
     default_shape = (
         list(args.experts_per_rank) == list(DEFAULT_EXPERTS_PER_RANKS)
         and args.topk == TOPK
@@ -297,7 +311,10 @@ def main():
         )
     results = run_jobs_parallel(compile_one_config, jobs)
     failed = sum(result["compile_time"] is None for result in results)
-    print(f"Compiled: {len(results) - failed} ok, {failed} failed")
+    print(
+        f"[aiter] FlyDSL MegaMoE replay: {len(results) - failed} ok, {failed} failed",
+        flush=True,
+    )
     raise SystemExit(1 if failed else 0)
 
 

@@ -126,6 +126,10 @@ def dry_run(arch: str, cu_num: int, name: str | None = None) -> Iterator[None]:
                 "_pybind_develop_hooks_cache",
                 (convert, tensor_cls, lambda _index: 0, lambda: 0),
             ),
+            # Only host code of a C++ module runs, which any arch's build has.
+            # Rebuilding one for this arch would pull it from under replays of
+            # other archs that share it.
+            (jit_core, "_needs_arch_rebuild", lambda _md_name: False),
         ):
             stack.enter_context(mock.patch.object(owner, attribute, value))
         for module in _torch_guard_modules():

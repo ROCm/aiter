@@ -63,6 +63,7 @@ from aiter.aot.flydsl.common import (
     cu_num_to_arch,
     dedupe_jobs,
     get_max_workers,
+    replay_env,
     run_jobs_parallel,
 )
 from aiter.jit.core import AITER_CONFIGS
@@ -621,19 +622,6 @@ def _replay_arch(jobs: list[dict], arch: str) -> int:
     return failed + probes_failed
 
 
-def _arch_env(arch: str, workers: int) -> dict:
-    env = dict(os.environ)
-    env.pop("AITER_AOT_IMPORT", None)
-    env.update(
-        GPU_ARCHS=arch,
-        HIP_VISIBLE_DEVICES="-1",
-        ROCR_VISIBLE_DEVICES="-1",
-        CUDA_VISIBLE_DEVICES="-1",
-        AITER_FLYDSL_AOT_WORKERS=str(workers),
-    )
-    return env
-
-
 def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int:
     """Replay every FlyDSL row of ``csv_paths``, one process per target arch.
     Returns the number of archs whose replay failed."""
@@ -658,7 +646,7 @@ def run(csv_paths: list[str], *, edges: bool = True, check: bool = False) -> int
         if check:
             command.append("--check")
         share = max(1, round(workers * jobs_per_arch[arch] / len(jobs)))
-        replays.append(subprocess.Popen(command, env=_arch_env(arch, share)))
+        replays.append(subprocess.Popen(command, env=replay_env(arch, share)))
     return sum(replay.wait() != 0 for replay in replays)
 
 

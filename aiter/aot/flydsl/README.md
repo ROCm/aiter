@@ -72,6 +72,9 @@ variant of the profile's bundle plan.
   is tuned per GPU model.
 - `quantize()` is replayed too: `preload_aot_bundles()` leaves it out, but
   fixed-slot `forward` and the per-stage benchmarks call it.
+- Like the MoE replay, it runs in a process of its own, with the GPUs hidden
+  and `GPU_ARCHS=gfx950` set before aiter is imported; both
+  `python -m aiter.aot.flydsl.mega_moe` and `setup.py` start it that way.
 
 ---
 
@@ -163,9 +166,9 @@ python -m aiter.aot.flydsl.moe --csv /path/to/config.csv --check
 > and applied internally via `FLYDSL_GPU_ARCH`. That internal var is overwritten
 > for every job, so setting `ARCH` / `GPU_ARCHS` / `FLYDSL_GPU_ARCH` in your shell
 > does **not** change what gets built. To cross-compile, edit the `cu_num`
-> column in the CSV. `moe.py` additionally runs each target arch in its own
-> process with `GPU_ARCHS` pinned and the GPUs hidden, so it builds the same
-> kernels on a machine with or without GPUs.
+> column in the CSV. `moe.py` and `mega_moe.py` additionally run each target
+> arch in its own process with `GPU_ARCHS` pinned and the GPUs hidden, so they
+> build the same kernels on a machine with or without GPUs.
 
 Example:
 
