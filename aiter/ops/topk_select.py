@@ -479,15 +479,8 @@ def _whole_row_takes(
     )
 
 
-def _select_whole_rows(input, idx, with_values, device):
-    """One launch standing in for `_dispatch` and `_gather_selected`.
-
-    Triton launches on the current GPU, so `device`, the input's, is made
-    current when it is not.
-    """
-    if device != torch.cuda.current_device():
-        with torch.cuda.device(device):
-            return _select_whole_rows(input, idx, with_values, device)
+def _select_whole_rows(input, idx, with_values):
+    """One launch standing in for `_dispatch` and `_gather_selected`."""
     rows, topk = idx.shape
     out = (
         torch.empty((rows, topk), dtype=input.dtype, device=input.device)
@@ -582,28 +575,6 @@ def _stream_small_reject_kernel(
             col,
             mask=keep,
         )
-
-
-def _select_small_reject(input, idx, rejects, device):
-    """`_stream_small_reject_kernel` over every row.
-
-    Triton launches on the current GPU, so `device`, the input's, is made
-    current when it is not.
-    """
-    if device != torch.cuda.current_device():
-        with torch.cuda.device(device):
-            return _select_small_reject(input, idx, rejects, device)
-    _stream_small_reject_kernel[(input.shape[0],)](
-        input,
-        idx,
-        input.stride(0),
-        idx.stride(0),
-        WIDTH=input.shape[1],
-        REJECTS=rejects,
-        BLOCK_N=4096,
-        BLOCK_K=2048,
-        num_warps=4,
-    )
 
 
 @lru_cache(maxsize=256)
@@ -1229,6 +1200,27 @@ def topk_select(
     # Read once: every `input.device` builds a new device object.
     device = input.device
     dev = device.index
+    if dev is not None and dev != torch._C._cuda_getDevice():
+        # The Triton and FlyDSL selectors launch on the current GPU.
+        with torch.cuda.device(dev):
+            return topk_select(
+                input,
+                topk,
+                sorted=sorted,
+                begin=begin,
+                end=end,
+                indices_type=indices_type,
+                sorted_index=sorted_index,
+                hint=hint,
+                output_idx=output_idx,
+                output_idx_offset=output_idx_offset,
+                idx_oob_fill_value=idx_oob_fill_value,
+                value_oob_fill_value=value_oob_fill_value,
+                return_value=return_value,
+                abort_when_nan_found=abort_when_nan_found,
+                tie=tie,
+                deterministic=deterministic,
+            )
 
     if end is None:
         # Built in `_dispatch`, by the backends that read row ends.
@@ -1299,7 +1291,7 @@ def topk_select(
         return_value or sorted,
         dev,
     ):
-        gathered = _select_whole_rows(input, idx, return_value or sorted, dev)
+        gathered = _select_whole_rows(input, idx, return_value or sorted)
     else:
         _dispatch(
             backend,
@@ -1538,7 +1530,17 @@ def _dispatch(
             # generic path until this geometry is measured there as well.  The
             # row-dependent r limits retain at least a 1.10x win over generic
             # stream in the seed-0 MI355X ABBA crossover sweep.
-            _select_small_reject(input, idx, rejects, dev)
+            _stream_small_reject_kernel[(rows,)](
+                input,
+                idx,
+                input.stride(0),
+                idx.stride(0),
+                WIDTH=input.shape[1],
+                REJECTS=rejects,
+                BLOCK_N=4096,
+                BLOCK_K=2048,
+                num_warps=4,
+            )
             return
         if row_lens is None:
             _, row_lens = _default_bounds(rows, input.shape[1], dev)

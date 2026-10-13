@@ -17,7 +17,11 @@ and all three returned plausible tensors. Each has an assertion here.
 """
 
 import argparse
+import ast
 import itertools
+import os
+import subprocess
+import sys
 
 import pandas as pd
 import torch
@@ -686,6 +690,110 @@ def test_nan_order():
     return failures
 
 
+# One shape per route on gfx950: argmax, small_k, plain, decode, stream, sampled,
+# whole rows and the small-reject stream.
+_CROSS_DEVICE_SHAPES = (
+    (8, 4096, 1),
+    (8, 4096, 16),
+    (600, 6000, 2048),
+    (4, 32768, 2048),
+    (64, 32768, 512),
+    (64, 131072, 1024),
+    (64, 2048, 2048),
+    (64, 2050, 2048),
+)
+
+
+def test_cross_device():
+    """The input on a GPU that is not the current one.
+
+    Every launch has to land on the input's GPU, under every output option,
+    and the call has to leave the current device as it found it.
+
+    In a process of its own: a FlyDSL launcher keeps to the GPU of its first
+    launch, so a process that already ran these selectors on the current GPU
+    cannot run them on another one.
+    """
+    if torch.cuda.device_count() < 2:
+        return []
+    here = os.path.dirname(os.path.abspath(__file__))
+    script = (
+        f"import sys; sys.path.insert(0, {here!r}); import test_topk_select as t; "
+        "print('CROSS_DEVICE', repr(t._cross_device_failures()))"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script], capture_output=True, text=True, check=False
+    )
+    lines = [ln for ln in done.stdout.splitlines() if ln.startswith("CROSS_DEVICE ")]
+    if done.returncode != 0 or not lines:
+        tail = (done.stderr or done.stdout).strip().splitlines()[-3:]
+        return [f"exit {done.returncode}: {' | '.join(tail)}"]
+    failures = ast.literal_eval(lines[-1][len("CROSS_DEVICE ") :])
+    for label in failures:
+        aiter.logger.error("CROSS DEVICE FAILED: %s", label)
+    return failures
+
+
+def _cross_device_failures():
+    failures = []
+    home = torch.cuda.current_device()
+    other = (home + 1) % torch.cuda.device_count()
+    on = torch.device("cuda", other)
+    for m, n, k in _CROSS_DEVICE_SHAPES:
+        torch.manual_seed(m * n + k)
+        x = torch.randn(m, n, dtype=dtypes.fp32, device=on)
+        off = torch.arange(m, dtype=dtypes.i32, device=on) * n
+        for ragged in (False, True):
+            end = (
+                torch.randint(k, n + 1, (m,), dtype=dtypes.i32, device=on)
+                if ragged
+                else None
+            )
+            lens = end if ragged else torch.full((m,), n, dtype=dtypes.i32, device=on)
+            ref = run_torch(x, lens, k)
+            options = (
+                {},
+                {"return_value": True},
+                {"sorted": True, "return_value": True},
+                {"sorted_index": True, "return_value": True},
+                {"output_idx_offset": off, "return_value": True},
+                {"output_idx": torch.empty((m, k), dtype=dtypes.i32, device=on)},
+            )
+            for opts in options:
+                label = f"{m}x{n} k={k}{' end' if ragged else ''} {sorted(opts)}"
+                try:
+                    v, i = topk_select(x, k, end=end, **opts)
+                    torch.cuda.synchronize(on)
+                except Exception as e:  # noqa: BLE001
+                    failures.append(f"{label}: {type(e).__name__}: {e}")
+                    continue
+                if torch.cuda.current_device() != home:
+                    failures.append(
+                        f"{label}: left cuda:{torch.cuda.current_device()} current"
+                    )
+                    torch.cuda.set_device(home)
+                if i.device != on or (v is not None and v.device != on):
+                    failures.append(f"{label}: output on the wrong GPU")
+                    continue
+                if (
+                    "output_idx" in opts
+                    and i.data_ptr() != opts["output_idx"].data_ptr()
+                ):
+                    failures.append(f"{label}: not written to output_idx")
+                local = i - off.view(m, 1) if "output_idx_offset" in opts else i
+                if not torch.equal(_sorted_values(x, local), ref):
+                    failures.append(f"{label}: wrong selection")
+                elif v is not None and not torch.equal(v, x.gather(1, local.long())):
+                    failures.append(f"{label}: values do not pair with idx")
+                elif opts.get("sorted") and not bool((v[:, :-1] >= v[:, 1:]).all()):
+                    failures.append(f"{label}: values not descending")
+                elif opts.get("sorted_index") and not bool(
+                    (i[:, :-1] <= i[:, 1:]).all()
+                ):
+                    failures.append(f"{label}: indices not ascending")
+    return failures
+
+
 def test_invariants(m, n, k):
     """The properties a value comparison cannot see."""
     failures = []
@@ -874,6 +982,11 @@ def main():
         "NaN order: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
     )
     assert not bad, f"NaN order: {len(bad)} failed"
+    bad = test_cross_device()
+    aiter.logger.info(
+        "cross device: %s", "all hold" if not bad else f"{len(bad)} FAILED: {bad}"
+    )
+    assert not bad, f"cross device: {len(bad)} failed"
 
     df = [
         test_topk_argmax_half(m, n, dtype)
