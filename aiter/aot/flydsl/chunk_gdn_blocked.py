@@ -30,9 +30,8 @@ from aiter.ops.flydsl.kernels.gdr_prefill.chunk_gdn_carry_gfx950 import (
 )
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
 
-# AOT compiles without a device; identity work-group order. Runtime kernels
-# specialize on the queried XCD count, so they miss this cache entry.
-AOT_NUM_XCDS = 1
+# Matches the MI355X device query; a device reporting another count JIT-compiles on first use.
+AOT_NUM_XCDS = 8
 
 CHUNK_GDN_BLOCKED_AOT_ARCH_DEFAULT = "gfx950"
 _KERNEL_NAME = "chunk_gdn_blocked"
