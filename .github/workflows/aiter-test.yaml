@@ -96,7 +96,7 @@ jobs:
                 reason=matching_changed_files
                 break
                 ;;
-              *.md|docs/*|LICENSE|.gitignore|.github/scripts/sglang_downstream.py|.github/workflows/*|.claude/*)
+              *.md|docs/*|LICENSE|.gitignore|.github/actionlint.yaml|.github/scripts/sglang_downstream.py|.github/workflows/*|.claude/*|op_tests/windows/*)
                 ;;
               *)
                 run_tests=true
