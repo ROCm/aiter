@@ -310,6 +310,7 @@ def _adaptive_moe_sort(
     emit_aux=False,
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
+    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
@@ -323,11 +324,16 @@ def _adaptive_moe_sort(
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
     reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    moe_buf = (
-        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        if atomic
-        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
-    )
+    # Atomic GEMM2 accumulates into moe_buf, so the caller's buffer can stand in
+    # for it; it is zeroed below like a fresh one.
+    if atomic:
+        moe_buf = (
+            output
+            if output is not None
+            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        )
+    else:
+        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
     # BM16 sort fuses output zeroing; three-stage sort only sorts.
     # Atomic GEMM2 needs a zeroed destination on every invocation.
     if atomic and BM != 16:
@@ -377,7 +383,7 @@ def _adaptive_moe_sort(
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
+#     adaptive-aux sort (a4w4, atomic)          yes        output is the atomic moe_buf
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -594,7 +600,8 @@ def _moe_sorting_impl(
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         # It has no expert_mask support, so EP always takes the Opus aux sort.
-        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
+        # `output` becomes the atomic moe_buf. Stage1 also receives it, but only
+        # to zero it, so the caller's buffer is safe to use here.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -605,6 +612,7 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
+            output=output,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)

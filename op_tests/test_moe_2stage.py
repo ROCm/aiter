@@ -761,6 +761,11 @@ parser.add_argument(
     help="Run only the deterministic BM16 tiled-scale boundary regression.",
 )
 parser.add_argument(
+    "--adaptive-output",
+    action="store_true",
+    help="Run only the adaptive-sort in-place output test.",
+)
+parser.add_argument(
     "--swiglu-limit",
     "-sl",
     type=float,
@@ -1487,8 +1492,8 @@ def test_output_buffer_contract():
         kw["output"] = None
         return sort(*a, **kw)
 
-    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
-    # paths, which cannot take the caller's buffer and must copy their result into it.
+    # in_place=False stands in for FLAT and grouped gfx1250 paths, which cannot
+    # take the caller's buffer and must copy their result into it.
     for in_place in (True, False):
         try:
             if not in_place:
@@ -1701,6 +1706,87 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
         "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
     )
 
+def test_adaptive_sort_output_in_place():
+    """The a4w4 adaptive aux sort accumulates straight into the caller's output.
+
+    Kimi-K3 A4W4 TP=8 decode. The output buffer arrives dirty (NaN), must be
+    zeroed and written in place with no trailing copy, and must match the result
+    fused_moe returns without an output buffer.
+    """
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip adaptive-sort in-place output test on %s", get_gfx())
+        return
+    fm = aiter.fused_moe
+    torch.manual_seed(0)
+    E, topk, model_dim, inter_dim = 896, 16, 3584, 384
+    dtype = dtypes.bf16
+    torch_quant = aiter.get_torch_quant(aiter.QuantType.per_1x32)
+
+    def prep(w):
+        q, scale = torch_quant(w, quant_dtype=dtypes.fp4x2)
+        q = q.view(*w.shape[:-1], w.shape[-1] // 2)
+        scale = scale.view(*w.shape[:-1], w.shape[-1] // 32)
+        rows = scale.shape[0] * scale.shape[1]
+        return (
+            shuffle_weight(q.view(dtypes.fp4x2), (16, 16)),
+            fp4_utils.e8m0_shuffle(scale.view(rows, -1)).view(*scale.shape[:2], -1),
+        )
+
+    w1, w1_scale = prep(torch.randn((E, inter_dim * 2, model_dim), dtype=dtype) / 10)
+    w2, w2_scale = prep(torch.randn((E, model_dim, inter_dim), dtype=dtype) / 10)
+    kwargs = {
+        "w1_scale": w1_scale,
+        "w2_scale": w2_scale,
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Situv2,
+        "quant_dtype_a": dtypes.fp4x2,
+    }
+
+    # Atomic bf16 accumulation alone moves fused_moe by up to ~2e-5 run to run.
+    def calc_diff(x, y):
+        x, y = x.double(), y.double()
+        return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
+
+    real_adaptive = fm._adaptive_moe_sort
+    real_return = fm._return_output
+    adaptive_calls, copies = [], []
+
+    def tracking_adaptive(*a, **kw):
+        adaptive_calls.append(kw.get("output") is not None)
+        return real_adaptive(*a, **kw)
+
+    def tracking_return(ret, output):
+        if output is not None and ret is not output:
+            copies.append(1)
+        return real_return(ret, output)
+
+    try:
+        fm._adaptive_moe_sort = tracking_adaptive
+        fm._return_output = tracking_return
+        for token in (1, 4):
+            hidden = torch.randn((token, model_dim), dtype=dtype) / 10
+            gating = torch.randn((token, E), dtype=dtype)
+            topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+            args = (hidden, w1, w2, topk_weights, topk_ids)
+            ref = fused_moe(*args, **kwargs)
+
+            adaptive_calls.clear()
+            copies.clear()
+            buf = torch.full((token, model_dim), float("nan"), dtype=dtype)
+            out = fused_moe(*args, output=buf, **kwargs)
+            torch.cuda.synchronize()
+            assert adaptive_calls == [
+                True
+            ], f"token={token}: adaptive sort calls {adaptive_calls}"
+            assert out is buf and not copies, f"token={token}: output was copied"
+            assert not buf.isnan().any(), f"token={token}: output not zeroed"
+            diff = calc_diff(ref, buf)
+            assert diff < 1e-4, f"token={token}: in-place vs returned diff {diff}"
+    finally:
+        fm._adaptive_moe_sort = real_adaptive
+        fm._return_output = real_return
+    aiter.logger.info("moe_2stage: adaptive-sort in-place output passed")
+
 
 # ---------------------------------------------------------------------------
 # Run
@@ -1717,10 +1803,13 @@ _case_iters = []
 test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
+elif args.adaptive_output:
+    test_adaptive_sort_output_in_place()
 else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
+    test_adaptive_sort_output_in_place()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
