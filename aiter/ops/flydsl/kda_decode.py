@@ -94,11 +94,15 @@ def _num_cache_slots(state: torch.Tensor, conv_state: torch.Tensor) -> int:
 def _check_dense_cache_slots(
     name: str,
     tensor: torch.Tensor,
-    inner_strides: tuple[int, ...],
+    layouts: tuple[tuple[int, ...], ...],
 ) -> None:
-    """Require disjoint, dense cache slots while allowing padding between slots."""
+    """Require disjoint, dense cache slots while allowing padding between slots.
+
+    ``layouts`` lists the accepted inner strides; the kernel takes every stride
+    as an argument, so any dense ordering of a slot's elements works.
+    """
     if (
-        tensor.stride()[1:] != inner_strides
+        tensor.stride()[1:] not in layouts
         or tensor.stride(0) < tensor.shape[1:].numel()
     ):
         raise ValueError(f"`{name}` must have dense, non-overlapping cache slots.")
@@ -203,7 +207,11 @@ def _validate_kda_inputs(
         )
     if conv_state.dtype != torch.bfloat16:
         raise ValueError("`conv_state` must have dtype torch.bfloat16.")
-    _check_dense_cache_slots("conv_state", conv_state, (_CONV_WIDTH - 1, 1))
+    # Channel-major [cache, 4608, 3], or the [cache, 3, 4608] width-major cache
+    # (SGLang's layout) viewed through transpose(-1, -2).
+    _check_dense_cache_slots(
+        "conv_state", conv_state, ((_CONV_WIDTH - 1, 1), (1, _CONV_CHANNELS))
+    )
     if state.ndim != 4 or state.shape[1:] != (
         _HEADS,
         _DIM,
@@ -214,7 +222,7 @@ def _validate_kda_inputs(
         )
     if state.dtype != torch.float32:
         raise ValueError("`state` must have dtype torch.float32.")
-    _check_dense_cache_slots("state", state, (_DIM * _DIM, _DIM, 1))
+    _check_dense_cache_slots("state", state, ((_DIM * _DIM, _DIM, 1),))
     _check_tensor(
         "raw_beta",
         raw_beta,

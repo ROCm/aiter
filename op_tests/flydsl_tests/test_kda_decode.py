@@ -54,7 +54,9 @@ class Inputs:
     norm_weight: torch.Tensor
 
 
-def _make_inputs(batch: int, seed: int = 20260728) -> Inputs:
+def _make_inputs(
+    batch: int, seed: int = 20260728, conv_width_major: bool = False
+) -> Inputs:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + batch)
     slots = batch + 2
 
@@ -80,9 +82,13 @@ def _make_inputs(batch: int, seed: int = 20260728) -> Inputs:
         device=_DEVICE,
         generator=generator,
     )
-    conv_state = conv_storage[:, : _CHANNELS * (_CONV_WIDTH - 1)].view(
-        slots, _CHANNELS, _CONV_WIDTH - 1
-    )
+    conv_state = conv_storage[:, : _CHANNELS * (_CONV_WIDTH - 1)]
+    if conv_width_major:
+        # SGLang keeps the cache as [slots, width - 1, channels] and passes
+        # conv_states.transpose(-1, -2), so the inner strides are (1, channels).
+        conv_state = conv_state.view(slots, _CONV_WIDTH - 1, _CHANNELS).transpose(1, 2)
+    else:
+        conv_state = conv_state.view(slots, _CHANNELS, _CONV_WIDTH - 1)
     state_storage = 0.01 * torch.randn(
         (slots, _HEADS * _DIM * _DIM + 23),
         dtype=torch.float32,
@@ -296,6 +302,7 @@ def _run(inputs: Inputs, out: torch.Tensor | None = None) -> torch.Tensor:
 def _make_fb_inputs(
     batch: int,
     seed: int = 20260728,
+    conv_width_major: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, Inputs]:
     generator = torch.Generator(device=_DEVICE).manual_seed(seed + 10_000 + batch)
     f_a_storage = torch.randn(
@@ -314,7 +321,7 @@ def _make_fb_inputs(
             generator=generator,
         )
     ).to(torch.bfloat16)
-    inputs = _make_inputs(batch, seed)
+    inputs = _make_inputs(batch, seed, conv_width_major)
     projected = F.linear(
         f_a.float(),
         f_b_weight.view(_HEADS * _DIM, _DIM).float(),
@@ -377,9 +384,10 @@ def test_decode_module_exports() -> None:
     assert expected <= set(flydsl_ops.__all__)
 
 
+@pytest.mark.parametrize("conv_width_major", [False, True])
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kda_decode_matches_reference(batch: int) -> None:
-    seed = _make_inputs(batch)
+def test_kda_decode_matches_reference(batch: int, conv_width_major: bool) -> None:
+    seed = _make_inputs(batch, conv_width_major=conv_width_major)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
 
@@ -411,9 +419,12 @@ def test_non_positive_slots_do_not_modify_caches() -> None:
     assert torch.equal(inputs.state, state_before)
 
 
+@pytest.mark.parametrize("conv_width_major", [False, True])
 @pytest.mark.parametrize("batch", [1, 8, 16])
-def test_kda_decode_with_f_b_matches_reference(batch: int) -> None:
-    f_a, f_b_weight, seed = _make_fb_inputs(batch)
+def test_kda_decode_with_f_b_matches_reference(
+    batch: int, conv_width_major: bool
+) -> None:
+    f_a, f_b_weight, seed = _make_fb_inputs(batch, conv_width_major=conv_width_major)
     reference_inputs = _copy_inputs(seed)
     actual_inputs = _copy_inputs(seed)
 
