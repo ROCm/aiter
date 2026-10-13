@@ -83,10 +83,11 @@ def test_mismatch_does_not_fail_the_process():
     """A kernel that is wrong in every element still exits 0.
 
     This is the escape that makes the other two reachable: even when the
-    comparison does print ``failed!``, nothing downstream observes it. There
-    are 659 ``checkAllclose`` call sites under ``op_tests/``, and the
-    overwhelming majority discard the returned ratio, so the only record of the
-    failure is a line in a log that no CI job reads.
+    comparison does print ``failed!``, nothing downstream observes it. The
+    ``op_tests/test_*.py`` files CI collects hold hundreds of ``checkAllclose``
+    call sites and no ``assertAllclose`` at all, and the overwhelming majority
+    discard the returned ratio, so the only record of the failure is a line in
+    a log that no CI job reads.
 
     Only the stock side needs a subprocess: the exit code is the thing being
     measured and it cannot be observed in-process. That strict mode raises is

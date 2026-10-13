@@ -544,13 +544,14 @@ def checkAllclose(
     strict=None,
 ):
     """``strict`` raises on the same mismatch this function already reports as
-    ``failed!``, instead of only logging it.
+    ``failed!``, instead of only logging it. ``None`` defers to
+    ``AITER_STRICT_ALLCLOSE``.
 
-    ``strict=None`` defers to ``AITER_STRICT_ALLCLOSE``, and that default is
-    suppressed when ``printLog=False``: that is the tuner's ranking path, which
-    needs the ratio back rather than an exception. An explicit ``strict=True``
-    is honoured either way, including with ``printLog=False`` -- a caller that
-    asks for a raise gets one.
+    With ``printLog=False`` -- the tuner's ranking path, which needs the ratio
+    back rather than an exception -- the mismatch raise does not happen, for an
+    explicit ``strict=True`` as much as for the environment default. The
+    non-finite rejection below does still apply there, because it runs before
+    that early return.
 
     Strict mode also rejects NaN and Inf regardless of ``tol_err_ratio``.
     Neither is reliably visible to a ratio gate: on a 524,288-element MoE

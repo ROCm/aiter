@@ -142,7 +142,8 @@ def escape_3_cosine_dilution():
     out = ref.clone()
     out[:dropped] = 0.0
 
-    # Verbatim from csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py:286.
+    # Verbatim from cosine_diff_compare in
+    # csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py.
     x, y = ref.flatten(), out.flatten()
     cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
 
