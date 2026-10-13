@@ -3708,8 +3708,8 @@ def get_2stage_cfgs(
             get_block_m(),
             ksplit,
             run_1stage=False,
-            has_bias=True,
-            stage2_has_bias=True,
+            has_bias=has_stage1_bias,
+            stage2_has_bias=has_stage2_bias,
         )
     swiglu_mxfp4_bf16_cktile = (
         q_type == QuantType.per_1x32
@@ -4020,8 +4020,8 @@ def get_2stage_cfgs(
             _cktile_block_m,
             _split_k,
             run_1stage,
-            has_bias=True,
-            stage2_has_bias=True,
+            has_bias=has_stage1_bias,
+            stage2_has_bias=has_stage2_bias,
         )
 
     if (kernelName1 and "ck2stages" in kernelName1) or (

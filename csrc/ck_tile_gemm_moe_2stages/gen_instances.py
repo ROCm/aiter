@@ -278,15 +278,14 @@ template torch::Tensor
 
         def validate_and_format(template: str, mapping: dict) -> str:
             # check all format element in dict.
+            _, _sample_k = next(iter(mapping.items()))
             str_mapping = {
                 "(a_data_type)": dtype_dict[self.a_dtype],
                 "(b_data_type)": dtype_dict[self.b_dtype],
                 "(acc_data_type)": dtype_dict[self.acc_dtype],
                 "(c_data_type)": dtype_dict[self.c_dtype],
                 "(activation)": self.activation,
-                "(has_bias)": (
-                    "true" if self.activation == 2 and not self.is_split_k else "false"
-                ),
+                "(has_bias)": ("true" if _sample_k.HasBias else "false"),
                 "(split_k)": "true" if self.is_split_k else "false",
             }
             format_args = {str(key): value.name for key, value in mapping.items()}
@@ -653,8 +652,6 @@ if __name__ == "__main__":
     for a_type, c_dtype, act_type, is_split_k in itertools.product(
         a_types, c_dtypes, act_types, is_split_k_l
     ):
-        has_bias = act_type == "swiglu" and not is_split_k
-
         # a8w8 do not support
         if a_type in ["fp8", "bf8"] and is_split_k:
             continue
@@ -671,39 +668,42 @@ if __name__ == "__main__":
             is_split_k,
             False,
         )
-        # gen all instances for gemm1 and gemm2
-        _, gemm1_kernel_list = get_gemm1_kernels_list(
-            a_type,
-            b_type,
-            quant_type,
-            act_type,
-            False,
-            has_bias,
-            is_split_k,
-        )
-        tag, gemm2_kernel_list = get_gemm2_kernels_list(
-            a_type,
-            b_type,
-            quant_type,
-            "no",
-            True,
-            has_bias,
-        )
-        # merge gemm1/gemm2 dict with key = {stage, key}
-        kernel_dict_merge = {
-            **{(1, key): value for key, value in gemm1_kernel_list.items()},
-            **{(2, key): value for key, value in gemm2_kernel_list.items()},
-        }
-        dispatch_file, manifest_file = codegen.gen_instances(tag, kernel_dict_merge)
 
-        gen_dispatch_files.append(dispatch_file)
-        gen_manifest_files.append(manifest_file)
-
-        # Collect kernel names with their C++ type arguments for name dispatch
-        for k in kernel_dict_merge.values():
-            name_lookup_entries.append(
-                (k.name, codegen.a_dtype, "pk_fp4", codegen.acc_dtype, codegen.c_dtype)
+        has_bias_values = [True, False] if act_type == "swiglu" else [False]
+        for has_bias in has_bias_values:
+            # gen all instances for gemm1 and gemm2
+            _, gemm1_kernel_list = get_gemm1_kernels_list(
+                a_type,
+                b_type,
+                quant_type,
+                act_type,
+                False,
+                has_bias,
+                is_split_k,
             )
+            tag, gemm2_kernel_list = get_gemm2_kernels_list(
+                a_type,
+                b_type,
+                quant_type,
+                "no",
+                True,
+                has_bias,
+            )
+            # merge gemm1/gemm2 dict with key = {stage, key}
+            kernel_dict_merge = {
+                **{(1, key): value for key, value in gemm1_kernel_list.items()},
+                **{(2, key): value for key, value in gemm2_kernel_list.items()},
+            }
+            dispatch_file, manifest_file = codegen.gen_instances(tag, kernel_dict_merge)
+
+            gen_dispatch_files.append(dispatch_file)
+            gen_manifest_files.append(manifest_file)
+
+            # Collect kernel names with their C++ type arguments for name dispatch
+            for k in kernel_dict_merge.values():
+                name_lookup_entries.append(
+                    (k.name, codegen.a_dtype, "pk_fp4", codegen.acc_dtype, codegen.c_dtype)
+                )
 
     generate_common_header(args.working_path, gen_dispatch_files, gen_manifest_files)
 

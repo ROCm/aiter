@@ -15,6 +15,8 @@ import aiter
 from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fused_moe import (
+    cktile_moe_stage1,
+    cktile_moe_stage2,
     fused_moe,
     fused_topk,
     get_2stage_cfgs,
@@ -1470,6 +1472,79 @@ def test_output_buffer_contract():
 
     aiter.logger.info("moe_2stage: output buffer contract passed")
 
+def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
+    if get_gfx() != "gfx950":
+        aiter.logger.info(
+            "skip SwiGLU MXFP4 non-split no-bias dispatch test on %s", get_gfx()
+        )
+        return
+    token, model_dim, inter_dim, E, topk = 128, 6144, 1536, 129, 5
+    metadata = get_2stage_cfgs(
+        get_padded_M(token),
+        model_dim,
+        inter_dim,
+        E,
+        topk,
+        torch.bfloat16,
+        dtypes.bf16,
+        dtypes.fp4x2,
+        aiter.QuantType.per_1x32,
+        True,
+        aiter.ActivationType.Swiglu,
+        False,
+        0,
+        0,
+        True,
+        GateMode.INTERLEAVE.value,
+        has_stage1_bias=False,
+        has_stage2_bias=False,
+    )
+    stage1_func = getattr(metadata.stage1, "func", metadata.stage1)
+    stage2_func = getattr(metadata.stage2, "func", metadata.stage2)
+    assert stage1_func is cktile_moe_stage1, (
+        f"expected CK-Tile stage1, got {stage1_func!r}; this test no longer "
+        "exercises the swiglu_mxfp4_bf16_cktile dispatch path it was written for"
+    )
+    assert stage2_func is cktile_moe_stage2, (
+        f"expected CK-Tile stage2, got {stage2_func!r}; this test no longer "
+        "exercises the swiglu_mxfp4_bf16_cktile dispatch path it was written for"
+    )
+    assert metadata.ksplit <= 1, (
+        f"expected non-split (ksplit<=1), got ksplit={metadata.ksplit}; the "
+        "split_k>1 NoBias_swiglu_SplitK path was already generated before "
+        "this fix and is not what regressed"
+    )
+    assert metadata.has_bias is False, (
+        f"expected has_bias=False (from has_stage1_bias=False), got "
+        f"{metadata.has_bias}; get_2stage_cfgs() regressed to hardcoding bias"
+    )
+    assert metadata.stage2_has_bias is False, (
+        f"expected stage2_has_bias=False (from has_stage2_bias=False), got "
+        f"{metadata.stage2_has_bias}; get_2stage_cfgs() regressed to "
+        "hardcoding bias"
+    )
+    torch.manual_seed(0)
+    test_fmoe(
+        dtype=torch.bfloat16,
+        token=token,
+        model_dim=model_dim,
+        inter_dim=inter_dim,
+        E=E,
+        topk=topk,
+        actType=aiter.ActivationType.Swiglu,
+        gateMode=GateMode.INTERLEAVE.value,
+        qType=aiter.QuantType.per_1x32,
+        AQDType=dtypes.bf16,
+        WQDType=dtypes.fp4x2,
+        use_g1u1=True,
+        preshuffle=True,
+        strict_accuracy=False,
+        check_aot_cache=False,
+        disable_stage2_bias=True,
+    )
+    aiter.logger.info(
+        "moe_2stage: SwiGLU MXFP4 non-split no-bias dispatch regression test passed"
+    )
 
 # ---------------------------------------------------------------------------
 # Run
@@ -1488,6 +1563,7 @@ if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
 else:
     test_output_buffer_contract()
+    test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(
