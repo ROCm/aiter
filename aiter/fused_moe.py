@@ -3296,8 +3296,9 @@ def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
             f"native mxmoe gemm1 {kernelName1!r} needs model_dim % 256 == 0 and "
             f"2*inter_dim % 256 == 0, got model_dim={model_dim} inter_dim={inter_dim}"
         )
-    # Native mxmoe gemm2 encodes BN/BK in its name. Kimi-K3 TP8 uses BK=128
-    # because its native inter_dim=384 is not divisible by the legacy BK=256.
+    # Native mxmoe gemm2 encodes BN/BK in its name: K = inter_dim by BK and
+    # N = model_dim by BN. Kimi-K3 TP8 uses BK=128 because its native
+    # inter_dim=384 is not divisible by the legacy BK=256.
     if _is_mxfp4_kname(kernelName2):
         p2 = _parse_mxfp4_g2_kname(kernelName2)
         if p2["BN"] != 256 or p2["BK"] not in (128, 256):
@@ -3306,6 +3307,11 @@ def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
             return (
                 f"native mxmoe gemm2 {kernelName2!r} needs inter_dim % "
                 f"{p2['BK']} == 0, got {inter_dim}"
+            )
+        if model_dim % p2["BN"] != 0:
+            return (
+                f"native mxmoe gemm2 {kernelName2!r} needs model_dim % "
+                f"{p2['BN']} == 0, got {model_dim}"
             )
     # v2 layout gemm2 (mxmoe_dispatcher.mxfp4_moe_gemm2): K % tile_k and N % tile_n.
     if v2 is not None:
