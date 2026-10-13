@@ -6,7 +6,7 @@
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.moe.topk_gating import (
+from aiter.ops.triton._triton_kernels.moe.moe_routing.topk_gating import (
     _exact_sigmoid_biased_topk,
 )
 
