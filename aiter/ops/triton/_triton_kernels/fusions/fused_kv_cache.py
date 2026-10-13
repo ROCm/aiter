@@ -1247,33 +1247,6 @@ def _fused_qk_rope_cosine_cache_llama_kernel(
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
 
 
-@triton.jit
-def _rope_pe_tile(
-    x,
-    cos,
-    sin,
-    d_pe_offs,
-    IS_NEOX: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_D_pe: tl.constexpr,
-    BLOCK_D_HALF_pe: tl.constexpr,
-):
-    """RoPE on a loaded [BLOCK_H, BLOCK_D_pe] tile with per-token 1D cos/sin."""
-    if IS_NEOX:
-        x_rotated = _get_neox_rotated_x(
-            x,
-            (d_pe_offs < BLOCK_D_HALF_pe)[None, :],
-            BLOCK_H,
-            BLOCK_D_pe,
-            BLOCK_D_HALF_pe,
-        )
-    else:
-        x_rotated = _get_gptj_rotated_x(
-            x, (d_pe_offs % 2 == 0)[None, :], BLOCK_H, BLOCK_D_pe, BLOCK_D_HALF_pe
-        )
-    return x * cos[None, :] + x_rotated * sin[None, :]
-
-
 _fused_qpe_rope_and_cache_mla_kernel_repr = make_kernel_repr(
     "_fused_qpe_rope_and_cache_mla_kernel",
     [
@@ -1293,75 +1266,6 @@ _fused_qpe_rope_and_cache_mla_kernel_repr = make_kernel_repr(
         "num_warps",
     ],
 )
-
-
-@triton.jit
-def _store_mla_kv_cache_masked(
-    kv_cache_ptr,
-    pid_t_slot,
-    pid_blk,
-    mask,
-    kv_cache_stride_b,
-    kv_cache_stride_d,
-    k_nope,
-    k_pe,
-    BLOCK_D_nope: tl.constexpr,
-    BLOCK_D_pe: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,
-    SHUFFLED_KV_CACHE: tl.constexpr,
-):
-    """_store_mla_kv_cache for a single kv head and an fp8/bf16 cache, with a
-    store mask instead of a branch. k_nope may already be in the shuffled
-    [BLOCK_D_nope // K_WIDTH, K_WIDTH] shape."""
-    base = kv_cache_ptr + pid_t_slot * kv_cache_stride_b
-    if SHUFFLED_KV_CACHE:
-        if kv_cache_ptr.dtype.element_ty == tl.bfloat16:
-            K_WIDTH: tl.constexpr = 8
-        else:
-            K_WIDTH: tl.constexpr = 16
-        dn = tl.arange(0, BLOCK_D_nope // K_WIDTH).to(tl.int64)
-        dp = tl.arange(0, BLOCK_D_pe // K_WIDTH).to(tl.int64)
-        kw = tl.arange(0, K_WIDTH).to(tl.int64)
-        nope_offs = (
-            (pid_blk // 16) * BLOCK_D_nope * 16
-            + (pid_blk % 16) * K_WIDTH
-            + dn[:, None] * K_WIDTH * 16
-            + kw[None, :]
-        ) * kv_cache_stride_d
-        pe_offs = (
-            BLOCK_SIZE * BLOCK_D_nope
-            + (pid_blk // 16) * BLOCK_D_pe * 16
-            + (pid_blk % 16) * K_WIDTH
-            + dp[:, None] * K_WIDTH * 16
-            + kw[None, :]
-        ) * kv_cache_stride_d
-        tl.store(
-            base + nope_offs,
-            k_nope.reshape((BLOCK_D_nope // K_WIDTH, K_WIDTH)).to(
-                kv_cache_ptr.dtype.element_ty
-            ),
-            mask=mask,
-        )
-        tl.store(
-            base + pe_offs,
-            k_pe.reshape((BLOCK_D_pe // K_WIDTH, K_WIDTH)).to(
-                kv_cache_ptr.dtype.element_ty
-            ),
-            mask=mask,
-        )
-    else:
-        dn = tl.arange(0, BLOCK_D_nope).to(tl.int64)
-        dp = tl.arange(0, BLOCK_D_pe).to(tl.int64)
-        tl.store(
-            base + dn * kv_cache_stride_d,
-            k_nope.to(kv_cache_ptr.dtype.element_ty),
-            mask=mask,
-        )
-        tl.store(
-            base + (dp + BLOCK_D_nope) * kv_cache_stride_d,
-            k_pe.to(kv_cache_ptr.dtype.element_ty),
-            mask=mask,
-        )
 
 
 @triton.jit(repr=_fused_qpe_rope_and_cache_mla_kernel_repr)
@@ -1609,12 +1513,15 @@ def _fused_qpe_rope_and_cache_mla_kernel(
         k_nope = k_nope.to(tl.float32) * k_scale_rcprl
         k_pe = k_pe.to(tl.float32) * k_scale_rcprl
         if MASKED_STORE:
-            _store_mla_kv_cache_masked(
+            _store_mla_kv_cache(
                 kv_cache_ptr,
                 pid_t_slot,
+                0,
                 pid_blk,
-                has_slot,
+                d_nope_offs,
+                d_pe_offs,
                 kv_cache_stride_b,
+                kv_cache_stride_h,
                 kv_cache_stride_d,
                 k_nope,
                 k_pe,
@@ -1622,6 +1529,9 @@ def _fused_qpe_rope_and_cache_mla_kernel(
                 BLOCK_D_pe,
                 BLOCK_SIZE,
                 SHUFFLED_KV_CACHE,
+                SCALE_K_WIDTH_NOPE,
+                SCALE_K_WIDTH_ROPE,
+                mask=has_slot,
             )
         else:
             if has_slot:
