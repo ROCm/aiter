@@ -1516,9 +1516,9 @@ def _run_blockscale_case(expect_symbol, force_symbol=None, **case):
     finally:
         aiter.fmoe_fp8_blockscale_g1u1 = orig
     assert launched, f"fp8 block-scale kernel was not launched for {case}"
-    assert set(launched) == {expect_symbol}, (
-        f"dispatched {launched}, expected {expect_symbol} for {case}"
-    )
+    assert set(launched) == {
+        expect_symbol
+    }, f"dispatched {launched}, expected {expect_symbol} for {case}"
 
 
 def test_gfx950_blockscale_64xn():
@@ -1533,8 +1533,8 @@ def test_gfx950_blockscale_64xn():
         return
 
     for case in (
-        dict(token=256, model_dim=4096, inter_dim=1536, E=16, topk=8),
-        dict(token=1024, model_dim=3072, inter_dim=1536, E=64, topk=8),
+        {"token": 256, "model_dim": 4096, "inter_dim": 1536, "E": 16, "topk": 8},
+        {"token": 1024, "model_dim": 3072, "inter_dim": 1536, "E": 64, "topk": 8},
     ):
         _run_blockscale_case(_FMOE_64XN["64x256"], **case)
 
