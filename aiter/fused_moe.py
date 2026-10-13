@@ -3287,15 +3287,24 @@ def _mxmoe_cfg_shape_reason(kernelName1, kernelName2, model_dim, inter_dim):
     default heuristics, the same way ``_opus_a8w4.cfg_is_supported`` does for Opus.
     """
     v2 = parse_flydsl_v2_gemm2_kernel(kernelName2)
-    # Native mxmoe gemm1 (mxfp4_gemm1.py): K=model_dim and N_OUT=2*inter_dim
-    # against BN==BK==256.
-    if _is_mxfp4_kname(kernelName1) and (
-        model_dim % 256 != 0 or (2 * inter_dim) % 256 != 0
-    ):
-        return (
-            f"native mxmoe gemm1 {kernelName1!r} needs model_dim % 256 == 0 and "
-            f"2*inter_dim % 256 == 0, got model_dim={model_dim} inter_dim={inter_dim}"
-        )
+    # Native mxmoe gemm1 encodes BN/BK in its name: K = model_dim by BK (at most
+    # 32 K tiles for its B-scale addressing) and N_OUT = 2 * inter_dim by BN,
+    # matching mxfp4_gemm1_kernels._assert_supported.
+    if _is_mxfp4_kname(kernelName1):
+        p1 = _parse_mxfp4_g1_kname(kernelName1)
+        bn1, bk1 = p1["BN"], p1["BK"]
+        if bn1 not in (64, 128, 256):
+            return f"native mxmoe gemm1 {kernelName1!r} has unsupported BN={bn1}"
+        if model_dim % bk1 != 0 or model_dim // bk1 > 32:
+            return (
+                f"native mxmoe gemm1 {kernelName1!r} needs model_dim % {bk1} == 0 "
+                f"and model_dim // {bk1} <= 32, got model_dim={model_dim}"
+            )
+        if (2 * inter_dim) % bn1 != 0:
+            return (
+                f"native mxmoe gemm1 {kernelName1!r} needs 2*inter_dim % {bn1} "
+                f"== 0, got inter_dim={inter_dim}"
+            )
     # Native mxmoe gemm2 encodes BN/BK in its name: K = inter_dim by BK and
     # N = model_dim by BN. Kimi-K3 TP8 uses BK=128 because its native
     # inter_dim=384 is not divisible by the legacy BK=256.

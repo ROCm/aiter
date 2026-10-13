@@ -279,13 +279,10 @@ def test_shuffle_scale_standard_layout_initializes_padding(dtype, src_value, pad
     assert torch.all(padded == pad_value)
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 # Tuned MXMOE rows whose kernels cannot run the runtime shape. Kimi-K3 TP=8 has
 # model_dim 3584 and inter_dim 384, which only a BK=128 gemm2 contracts.
 _MXMOE_G1 = "flydsl_mxmoe_g1_a4w4_16x128x256_f16in_hpf_nt_situv2"
+_MXMOE_G1_BN256 = "flydsl_mxmoe_g1_a4w4_16x256x256_situv2"
 _MXMOE_G2_BK128 = "flydsl_mxmoe_g2_a4w4_16x256x128_atomic"
 _MXMOE_G2_BK256 = "flydsl_mxmoe_g2_a4w4_16x256x256_atomic"
 _V2_G2_K128 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x128x128_atomic_sbm16"
@@ -301,13 +298,17 @@ _V2_G2_N256 = "flydsl_moe2_layout_afp4_wfp4_bf16_t16x256x128_atomic_sbm16"
         (_MXMOE_G1, _MXMOE_G2_BK256, 3584, 512, None),
         (_MXMOE_G1, _V2_G2_K128, 3584, 384, None),
         ("", _V2_G2_N256, 3584, 384, None),
-        # Native gemm1: K = model_dim and N = 2 * inter_dim must be 256-aligned.
-        (_MXMOE_G1, _MXMOE_G2_BK128, 3712, 384, "native mxmoe gemm1"),
-        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 320, "native mxmoe gemm1"),
+        # Native gemm1 (_MXMOE_G1 is BN=128, BK=256): K = model_dim by BK, at most
+        # 32 K tiles, and N = 2 * inter_dim by BN.
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3712, 384, "model_dim % 256"),
+        (_MXMOE_G1, "", 8448, 384, "model_dim // 256 <= 32"),
+        (_MXMOE_G1, "", 3584, 320, None),
+        (_MXMOE_G1_BN256, "", 3584, 320, "2*inter_dim % 256"),
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 320, "inter_dim % 128"),
         # Native gemm2: inter_dim must be a multiple of its BK, model_dim of its
         # BN, and BN must be 256.
         (_MXMOE_G1, _MXMOE_G2_BK256, 3584, 384, "inter_dim % 256"),
-        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 448, "native mxmoe gemm1"),
+        (_MXMOE_G1, _MXMOE_G2_BK128, 3584, 448, "inter_dim % 128"),
         ("", _MXMOE_G2_BK128, 3584, 448, "inter_dim % 128"),
         ("", _MXMOE_G2_BK128, 3712, 384, "model_dim % 256"),
         ("", "flydsl_mxmoe_g2_a4w4_16x128x128_atomic", 3584, 384, "unsupported BN/BK"),
@@ -391,3 +392,7 @@ def test_stale_tuned_mxmoe_row_is_discarded(monkeypatch, kernel_name2, kept):
     discarded = any("discarding tuned config" in w for w in warnings)
     assert (used == kernel_name2) == kept, used
     assert discarded != kept, warnings
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
