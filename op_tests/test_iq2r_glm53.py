@@ -1,14 +1,23 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""GLM-5.3 IQ2R packed MoE (TP4/TP8, gfx950) against a dense Torch reference."""
+"""GLM-5.3 IQ2R packed MoE (TP4/TP8, gfx950) against a dense Torch reference.
 
+``python3 op_tests/test_iq2r_glm53.py`` times the tuned and default launch
+configs over a token sweep, prints a summary table, then runs the tests.
+"""
+
+import argparse
+import functools
+import itertools
+from dataclasses import astuple
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 import torch
 
+import aiter
 from aiter.iq2r_glm53 import (
     MAX_CHUNK_TOKENS,
     IQ2RGlm53Config,
@@ -22,7 +31,7 @@ from aiter.iq2r_glm53 import (
     iq2r_glm53_slice_gate,
 )
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 from aiter.ops.iq2r import iq2r_encode_device, iq2r_materialize_device
 from aiter.ops.iq2r_encoder import iq2r_initial_codebook
 from aiter.ops.iq2r_format import (
@@ -30,6 +39,9 @@ from aiter.ops.iq2r_format import (
     iq2r_slice_input_data,
     iq2r_slice_output_auxiliary,
 )
+from aiter.test_common import benchmark, checkAllclose, run_perftest
+
+SUPPORTED_GFX = ["gfx950"]
 
 _EXPERTS = 257
 _TOPK = 9
@@ -68,9 +80,8 @@ def _mxfp8(values: torch.Tensor) -> torch.Tensor:
     return quantized.flatten(-2)
 
 
-@pytest.fixture(scope="module", params=[256, 512], ids=["tp8", "tp4"])
-def glm53_layer(request):
-    intermediate = request.param
+@functools.lru_cache(maxsize=1)
+def _glm53_layer(intermediate: int):
     gate_metadata = IQ2RMetadata(logical_n=2 * intermediate, logical_k=_HIDDEN)
     down_metadata = IQ2RMetadata(logical_n=_HIDDEN, logical_k=intermediate)
     codebook = iq2r_initial_codebook("cuda")
@@ -117,6 +128,11 @@ def glm53_layer(request):
     return layer
 
 
+@pytest.fixture(scope="module", params=[256, 512], ids=["tp8", "tp4"])
+def glm53_layer(request):
+    return _glm53_layer(request.param)
+
+
 def _routing(tokens: int, seed: int):
     generator = torch.Generator(device="cuda").manual_seed(seed)
     scores = torch.rand((tokens, _EXPERTS - 1), generator=generator, device="cuda")
@@ -158,7 +174,10 @@ def _check_moe(actual: torch.Tensor, expected: torch.Tensor) -> None:
     assert cosine > 0.9995
 
 
-@pytest.mark.parametrize("tokens", [1, 2, 4, 8, 24, 64, 100, 128, 256, 2048, 3000])
+@pytest.mark.parametrize(
+    "tokens",
+    [1, 2, 4, 8, 16, 24, 32, 64, 100, 128, 256, 512, 1024, 2048, 3000, 4096],
+)
 def test_glm53_moe_matches_reference(glm53_layer, tokens):
     layer = glm53_layer
     hidden, topk_weights, topk_ids = _routing(tokens, 0x5300 + tokens)
@@ -167,6 +186,40 @@ def test_glm53_moe_matches_reference(glm53_layer, tokens):
     actual = torch.empty_like(hidden)
     workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
     iq2r_glm53_moe_out(hidden, *layer.packed, topk_weights, topk_ids, actual, workspace)
+    _check_moe(actual, expected)
+
+
+# Each gate and down kernel at grids and chunk counts the shipped table and
+# the defaults do not use. Configs a token count cannot run are skipped.
+_EXPLICIT_CONFIGS = [
+    IQ2RGlm53Config("nobarrier", 4, "route9", 4, 1),
+    IQ2RGlm53Config("decode", 1, "single", 2, 1),
+    IQ2RGlm53Config("nobarrier", 2, "single", 16, 1),
+    IQ2RGlm53Config("decode", 4, "ordered", 8, 1),
+    IQ2RGlm53Config("nobarrier", 8, "ordered", 1, 1),
+    IQ2RGlm53Config("nobarrier", 1, "packed", 8, 1),
+    IQ2RGlm53Config("prefill", 1, "prefill", 0, 2),
+    IQ2RGlm53Config("prefill", 8, "prefill", 0, 1),
+]
+
+
+@pytest.mark.parametrize(
+    "config", _EXPLICIT_CONFIGS, ids=lambda c: "-".join(map(str, astuple(c)))
+)
+@pytest.mark.parametrize("tokens", [4, 48, 1024])
+def test_glm53_moe_explicit_configs(glm53_layer, tokens, config):
+    layer = glm53_layer
+    problem = _config_problem(config, tokens, layer.intermediate)
+    if problem:
+        pytest.skip(problem)
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x5390 + tokens)
+    expected = _reference_moe(layer, hidden, topk_weights, topk_ids)
+
+    actual = torch.empty_like(hidden)
+    workspace = IQ2RGlm53Workspace.allocate(tokens, layer.intermediate, device="cuda")
+    iq2r_glm53_moe_out(
+        hidden, *layer.packed, topk_weights, topk_ids, actual, workspace, config
+    )
     _check_moe(actual, expected)
 
 
@@ -392,5 +445,93 @@ def test_glm53_tuned_table_checks(tmp_path):
         _tuned_table(str(path))
 
 
+@benchmark()
+def test_glm53_moe_perf(tokens: int = 8, inter_dim: int = 256):
+    """Time the tuned and the default launch config against the reference."""
+    layer = _glm53_layer(inter_dim)
+    hidden, topk_weights, topk_ids = _routing(tokens, 0x5300 + tokens)
+    expected = _reference_moe(layer, hidden, topk_weights, topk_ids).float()
+    workspace = IQ2RGlm53Workspace.allocate(tokens, inter_dim, device="cuda")
+    candidates = {
+        "tuned": iq2r_glm53_config(tokens, inter_dim),
+        "default": _default_config(tokens),
+    }
+
+    # Gate/up and down GEMMs over every route; each distinct expert's packed
+    # weights are read once.
+    flops = 6 * tokens * _TOPK * _HIDDEN * inter_dim
+    expert_bytes = sum(t.nbytes for t in layer.packed) // _EXPERTS
+    nbytes = topk_ids.unique().numel() * expert_bytes + 2 * hidden.nbytes
+    # Outputs are ~1e-2, so a fixed 1e-2 atol would accept anything.
+    atol = 0.1 * expected.square().mean().sqrt().item()
+
+    ret = {"gfx": get_gfx()}
+    for name, config in candidates.items():
+        output = torch.empty_like(hidden)
+        # run_perftest rotates copies of the tensor arguments, weights included,
+        # so each call reads cold weights as a serving step does across layers.
+        # Serving shares one workspace between layers; so do the copies here.
+        # The tuner times graph replays; here us is the summed kernel time.
+        moe = functools.partial(iq2r_glm53_moe_out, workspace=workspace, config=config)
+        _, us = run_perftest(moe, hidden, *layer.packed, topk_weights, topk_ids, output)
+        _check_moe(output, expected)
+        ret[f"{name} us"] = us
+        ret[f"{name} TFLOPS"] = flops / us / 1e6
+        ret[f"{name} TB/s"] = nbytes / us / 1e6
+        ret[f"{name} err"] = checkAllclose(
+            expected,
+            output.float(),
+            rtol=5e-2,
+            atol=atol,
+            msg=f"{name} M={tokens} I={inter_dim}: ",
+        )
+    return ret
+
+
+# main() runs the sweep; pytest collects only the correctness tests above.
+test_glm53_moe_perf.__test__ = False
+
+
+def main():
+    if get_gfx() not in SUPPORTED_GFX:
+        aiter.logger.warning("GLM-5.3 IQ2R MoE unsupported on %s; skipping", get_gfx())
+        return
+
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        description="Time the GLM-5.3 IQ2R MoE (hidden 6144, 257 experts, top-9)",
+    )
+    parser.add_argument(
+        "-t",
+        "--tokenNum",
+        type=int,
+        nargs="*",
+        default=[2**i for i in range(13)],
+        help="Token counts. Default: 1, 2, 4, ..., 4096.",
+    )
+    parser.add_argument(
+        "-i",
+        "--inter_dim",
+        type=int,
+        nargs="*",
+        default=[256, 512],
+        choices=[256, 512],
+        help="Expert intermediate size per rank: 256 (TP8), 512 (TP4).",
+    )
+    args = parser.parse_args()
+
+    rows = [
+        test_glm53_moe_perf(tokens, inter_dim)
+        for inter_dim, tokens in itertools.product(args.inter_dim, args.tokenNum)
+    ]
+    aiter.logger.info(
+        "GLM-5.3 IQ2R MoE summary (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+    pytest_status = pytest.main([__file__, "-v"])
+    if pytest_status != pytest.ExitCode.OK:
+        raise SystemExit(pytest_status)
+
+
 if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
+    main()

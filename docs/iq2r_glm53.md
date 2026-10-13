@@ -94,12 +94,23 @@ them, else `_default_config`.
 
 `AITER_CONFIG_IQ2R_GLM53` points the lookup at a different CSV. To tune
 new shapes, add them to `aiter/configs/iq2r_glm53_untuned.csv` and run
-`python3 csrc/kernels/iq2r/iq2r_glm53_tune.py`, which writes
-`iq2r_glm53_tuned.csv`. The tuner times each candidate by CUDA graph
-replay, as serving runs it; eager timing adds host overhead that hides the
-best small-M launches. The decode kernels accept up to 1024 tokens so the
-CSV can choose them for MTP verify batches, which are
+`python3 csrc/kernels/iq2r/iq2r_glm53_tune.py`, which adds them to
+`iq2r_glm53_tuned.csv`. The tuner uses the common aiter tuner flags:
+`--all` retunes every shape, `--run_config [CSV]` times the launch choices
+a CSV makes, and `-o2 FILE` keeps the timing of every candidate.
+
+The tuner checks each candidate against a dense reference, then times it
+by CUDA graph replay, as serving runs it; eager timing adds host overhead
+that hides the best small-M launches. Each call in the graph reads its own
+copy of the layer weights and its own routing, with at least 1 GiB of
+expert weights per replay, so the weights come from HBM as they do when a
+serving step walks the MoE layers. The decode kernels accept up to 1024
+tokens so the CSV can choose them for MTP verify batches, which are
 (1 + speculative tokens) x concurrency.
+
+`python3 op_tests/test_iq2r_glm53.py` times the tuned and default configs
+over a token sweep (`-t`, `-i` select the token counts and widths), prints
+a summary table, then runs the correctness tests.
 
 ## Results
 
