@@ -92,6 +92,20 @@ WMMA_ROW_PER_WAVE = 2  # Q WMMA tiles per wave (the "x2" step from m16x8 to m32x
 BLOCK_M = WMMA_M * WMMA_ROW_PER_WAVE * NUM_WAVES  # 256
 # 1 => BLOCK_M 128 ("m16x8"), 2 => BLOCK_M 256. Chosen per call by _pick_num_q_tiles.
 NUM_Q_TILES_CHOICES = (1, 2)
+
+
+# A wave owns WMMA_M * num_q_tiles contiguous packed (seq, q_head_in_group) rows, and Q/O
+# describe that tile with ONE rectangular TDM box. That only works when a head group is
+# never split across waves: either a wave holds whole groups, or it sits inside one.
+# num_q_tiles is chosen per call, so the ratio must satisfy it for every choice.
+def supports_gqa_ratio(gqa_ratio):
+    """True when the packed-row tiling never splits a head group, for any BLOCK_M."""
+    return all(
+        gqa_ratio % rows == 0 or rows % gqa_ratio == 0
+        for rows in (WMMA_M * n for n in NUM_Q_TILES_CHOICES)
+    )
+
+
 # Causal work grows with the M index, so dispatch the heavy tiles first.
 REVERSE_M_ORDER = True
 

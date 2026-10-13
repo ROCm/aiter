@@ -34,8 +34,7 @@ import torch
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
-    NUM_Q_TILES_CHOICES,
-    WMMA_M,
+    supports_gqa_ratio,
 )
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -614,19 +613,9 @@ def _rand_seqs(B, max_sq, max_sk, rng):
     return seqs_q, seqs_k
 
 
-# Q and O pack `rows_per_warp` = WMMA_M * num_q_tiles rows per wave, and the managers
-# require the GQA ratio and that tile to divide each other. BLOCK_M (hence num_q_tiles)
-# is picked per call, so a generated pair is only safe if it holds for every choice --
-# H_q % H_kv alone lets through e.g. 6/1, which asserts instead of running.
-_ROWS_PER_WARP = tuple(WMMA_M * n for n in NUM_Q_TILES_CHOICES)
-
-
 def _gqa_packs(H_q, H_kv):
-    """True when (H_q, H_kv) satisfies the Q/O packing invariant for every BLOCK_M."""
-    if H_q % H_kv:
-        return False
-    gqa = H_q // H_kv
-    return all(gqa % r == 0 or r % gqa == 0 for r in _ROWS_PER_WARP)
+    """True when the router will serve this head pair (same rule, same source)."""
+    return H_q % H_kv == 0 and supports_gqa_ratio(H_q // H_kv)
 
 
 # Per-axis values present in the built-in lists; an axis the user does not name
@@ -696,10 +685,9 @@ def _shape_lists(args):
             thd.append((seqs_q, seqs_k, H_q, H_kv))
     if skipped:
         aiter.logger.warning(
-            "skipped %d head combos the kernel cannot pack (nheads %% nheads_kv, or a "
-            "GQA ratio that neither divides nor is a multiple of %s)",
+            "skipped %d head combos the router declines (nheads %% nheads_kv, or a "
+            "GQA ratio whose head group would split across waves)",
             skipped,
-            " / ".join(str(r) for r in _ROWS_PER_WARP),
         )
     if not thd and not bshd:
         raise SystemExit(
