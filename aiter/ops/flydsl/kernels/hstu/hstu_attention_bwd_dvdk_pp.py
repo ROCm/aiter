@@ -592,6 +592,37 @@ def build_hstu_attention_bwd_dvdk_pp(
             view = do_views[rm_slot]
             return view[q_row, col // fx.Int32(MFMA_DA_LANE_K), None].load().ir_value()
 
+        def fmul_scalar(a, b):
+            """Multiply that the backend cannot fold into `v_pk_mul_f32`.
+
+            EXPERIMENT: `v_mul_legacy_f32` has no packed form, so a pair of them
+            stays two scalar VALU ops. Semantics differ from `fmul` only for
+            0 * inf / 0 * NaN (legacy gives 0); every operand here -- the score
+            accumulator, alpha, a sigmoid in (0,1], dA -- is finite, so the
+            results are identical.
+            """
+            return fx.Float32(
+                llvm.call_intrinsic(
+                    fx.Float32.ir_type,
+                    "llvm.amdgcn.fmul.legacy",
+                    [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
+                    [],
+                    [],
+                )
+            )
+
+        def rcp_scalar(x):
+            """Scalar reciprocal, kept off the packed datapath."""
+            return fx.Float32(
+                llvm.call_intrinsic(
+                    fx.Float32.ir_type,
+                    "llvm.amdgcn.rcp.f32",
+                    [fx.Float32(x).ir_value()],
+                    [],
+                    [],
+                )
+            )
+
         def pack_bf16_perm(vals):
             """Pack 4 fp32 lane values into a bf16 MFMA operand in 2 `v_perm_b32`.
 
@@ -764,19 +795,24 @@ def build_hstu_attention_bwd_dvdk_pp(
                 # serialised two multiplies at the head of a chain whose next
                 # link is a 16-cycle transcendental. Same op count, one less
                 # link, and the two multiplies now issue in parallel.
-                sc = [s[j] * c_alpha for j in rng]
-                emu = [exp2_f32(s[j] * c_alpha_neg_log2e) for j in rng]
-                sig = [c_one_f / (c_one_f + emu[j]) for j in rng]
-                silu = [sc[j] * sig[j] for j in rng]
+                sc = [fmul_scalar(s[j], c_alpha) for j in rng]
+                emu = [exp2_f32(fmul_scalar(s[j], c_alpha_neg_log2e)) for j in rng]
+                sig = [rcp_scalar(c_one_f + emu[j]) for j in rng]
+                silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
                 # The second form is a subtract plus an FMA, against the first
                 # form's sub/mul/add/mul -- 2 VALU per element instead of 4, and
                 # it reuses `silu`, which is already live.
-                grad = [sig[j] + silu[j] * (c_one_f - sig[j]) for j in rng]
+                # 1 - sig == emu * sig exactly, since sig = 1/(1+emu). Using
+                # the product keeps this off the packed add datapath too.
+                grad = [
+                    sig[j] + fmul_scalar(silu[j], fmul_scalar(emu[j], sig[j]))
+                    for j in rng
+                ]
                 # No `c_inv_n` here: dS is linear in it, so it rides along to the
                 # dK epilogue and is folded into that store's existing scale.
                 # Saves one multiply per element.
-                gated = [grad[j] * da[j] for j in rng]
+                gated = [fmul_scalar(grad[j], da[j]) for j in rng]
                 p_vals = [flat_keep[j].select(silu[j], c_zero_f) for j in rng]
                 ds_vals = [flat_keep[j].select(gated[j], c_zero_f) for j in rng]
             e = MFMA_ELEMS_PER_LANE
