@@ -14,6 +14,16 @@ DEVICE_ARCH = arch_info.get_arch()
 # ---------------------------------------------------------------------------
 
 
+def _gather_valid(pool, indices, start, end):
+    """Rows ``indices[start:end]`` of ``pool`` in fp32, with slots outside
+    ``[0, len(pool))`` zeroed and reported invalid."""
+    slots = indices[start:end].to(torch.int64)
+    valid = (slots >= 0) & (slots < pool.shape[0])
+    rows = torch.zeros(slots.numel(), pool.shape[1], device=pool.device)
+    rows[valid] = pool[slots[valid]].float()
+    return rows, valid
+
+
 def _sparse_prefill_attn_torch(
     q,
     unified_kv,
@@ -33,47 +43,35 @@ def _sparse_prefill_attn_torch(
         unified_kv:        [total_pages, D]
         kv_indices_prefix: [total_prefix] int32
         kv_indptr_prefix:  [T+1] int32
-        kv:                [total_tokens, D]
-        kv_indices_extend: [total_extend] int32
-        kv_indptr_extend:  [T+1] int32
-        attn_sink:         [H] fp32
+        kv:                [total_tokens, D] — ``None`` for no extend source
+        kv_indices_extend: [total_extend] int32 — ``None`` for no extend source
+        kv_indptr_extend:  [T+1] int32 — ``None`` for no extend source
+        attn_sink:         [H] fp32 — ``None`` for no sink
+    Slots outside ``[0, len(pool))`` (``-1`` sentinels or past the pool) are
+    masked out.
     Returns:
         [T, H, D]
     """
     T, H, D = q.shape
     device = q.device
+    has_extend = kv is not None
 
     p_indptr = kv_indptr_prefix.to(torch.int64)
-    e_indptr = kv_indptr_extend.to(torch.int64)
+    if has_extend:
+        e_indptr = kv_indptr_extend.to(torch.int64)
 
     out = torch.zeros(T, H, D, dtype=torch.float32, device=device)
 
     for t in range(T):
-        # Gather prefix KV
-        ps = int(p_indptr[t].item())
-        pe = int(p_indptr[t + 1].item())
-        p_slots = kv_indices_prefix[ps:pe].to(torch.int64)
-        p_valid = p_slots >= 0
-        p_safe = p_slots.clamp(min=0)
-        p_kv = unified_kv[p_safe]  # [P, D]
-        p_kv = torch.where(
-            p_valid[:, None], p_kv.float(), torch.zeros_like(p_kv.float())
+        all_kv, all_valid = _gather_valid(
+            unified_kv, kv_indices_prefix, p_indptr[t], p_indptr[t + 1]
         )
-
-        # Gather extend KV
-        es = int(e_indptr[t].item())
-        ee = int(e_indptr[t + 1].item())
-        e_slots = kv_indices_extend[es:ee].to(torch.int64)
-        e_valid = e_slots >= 0
-        e_safe = e_slots.clamp(min=0)
-        e_kv = kv[e_safe]  # [E, D]
-        e_kv = torch.where(
-            e_valid[:, None], e_kv.float(), torch.zeros_like(e_kv.float())
-        )
-
-        # Concatenate
-        all_kv = torch.cat([p_kv, e_kv], dim=0)  # [K, D]
-        all_valid = torch.cat([p_valid, e_valid], dim=0)  # [K]
+        if has_extend:
+            e_kv, e_valid = _gather_valid(
+                kv, kv_indices_extend, e_indptr[t], e_indptr[t + 1]
+            )
+            all_kv = torch.cat([all_kv, e_kv], dim=0)  # [K, D]
+            all_valid = torch.cat([all_valid, e_valid], dim=0)  # [K]
         K = all_kv.shape[0]
 
         if K == 0:
@@ -84,15 +82,16 @@ def _sparse_prefill_attn_torch(
         scores = scores.masked_fill(~all_valid[None, :], float("-inf"))
 
         # Add sink as virtual K with V=0
-        sink = attn_sink.float().unsqueeze(1)  # [H, 1]
-        combined = torch.cat([scores, sink], dim=-1)  # [H, K+1]
-        cmax = combined.amax(dim=-1, keepdim=True)
+        if attn_sink is not None:
+            sink = attn_sink.float().unsqueeze(1)  # [H, 1]
+            scores = torch.cat([scores, sink], dim=-1)  # [H, K+1]
+        cmax = scores.amax(dim=-1, keepdim=True)
         cmax = torch.where(
             cmax == float("-inf"),
             torch.zeros_like(cmax),
             cmax,
         )
-        weights = (combined - cmax).exp()
+        weights = (scores - cmax).exp()
         denom = weights.sum(dim=-1, keepdim=True).clamp(min=1e-30)
         weights = weights / denom
         weights_kv = weights[:, :K]  # [H, K]
@@ -469,34 +468,6 @@ def test_pa_prefill_sparse_gfx950(T, H, D, prefix_len):
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
 
-def _sparse_prefill_single_source_torch(q, kv, indices, indptr, attn_sink, scale):
-    """Vectorized fp32 reference for one KV pool: pads each row's ragged slot list
-    to the longest row and masks padding and slots outside ``[0, len(kv))``.
-    ``attn_sink=None`` means no sink."""
-    T, H, _ = q.shape
-    lens = (indptr[1:] - indptr[:-1]).long()
-    K = max(int(lens.max().item()), 1)
-    pos = torch.arange(K, device=q.device)
-    in_row = pos[None, :] < lens[:, None]
-    flat = (indptr[:-1].long()[:, None] + pos[None, :]).clamp(
-        max=max(indices.numel() - 1, 0)
-    )
-    slots = torch.where(in_row, indices.long()[flat] if indices.numel() else -1, -1)
-    valid = (slots >= 0) & (slots < kv.shape[0])
-    kv_g = kv.float()[slots.clamp(0, max(kv.shape[0] - 1, 0))]  # [T, K, D]
-    kv_g = kv_g.masked_fill(~valid[..., None], 0.0)  # invalid rows contribute nothing
-    scores = torch.einsum("thd,tkd->thk", q.float(), kv_g) * scale
-    scores = scores.masked_fill(~valid[:, None, :], float("-inf"))
-    if attn_sink is not None:
-        sink = attn_sink.float()[None, :, None].expand(T, H, 1)
-        scores = torch.cat([scores, sink], dim=-1)
-    cmax = scores.amax(dim=-1, keepdim=True)
-    cmax = torch.where(cmax == float("-inf"), torch.zeros_like(cmax), cmax)
-    w = (scores - cmax).exp()
-    w = w / w.sum(dim=-1, keepdim=True).clamp(min=1e-30)
-    return torch.einsum("thk,tkd->thd", w[..., :K], kv_g).to(q.dtype)
-
-
 def _inject_invalid_slots(indices, num_kv):
     """Mark slots invalid in place: 1/8 to -1, 1/32 to exactly num_kv (the
     first row past the pool) and 1/32 to far past it, up to the int32 max."""
@@ -552,7 +523,9 @@ def test_pa_prefill_sparse_single_source(T, H, max_len, sentinels, with_sink):
             indices[s : s + 16] = -1
     scale = D**-0.5
 
-    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    ref = _sparse_prefill_attn_torch(
+        q, kv, indices, indptr, None, None, None, sink, scale
+    )
     out = torch.full_like(q, float("nan"))
     ret = pa_prefill_sparse(
         q,
@@ -594,7 +567,9 @@ def test_pa_prefill_sparse_single_source_other_head_dims(D, sentinels):
         _inject_invalid_slots(indices, num_kv)
     scale = D**-0.5
 
-    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    ref = _sparse_prefill_attn_torch(
+        q, kv, indices, indptr, None, None, None, sink, scale
+    )
     out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
@@ -683,7 +658,9 @@ def test_pa_prefill_sparse_int64_indices(H):
     indices[perm[n // 8 + n // 16 : n // 8 + n // 8]] = 2**32 + 5
     indices[perm[n // 4 : n // 4 + n // 16]] = 2**32 + num_kv - 1
     scale = D**-0.5
-    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, scale)
+    ref = _sparse_prefill_attn_torch(
+        q, kv, indices, indptr, None, None, None, sink, scale
+    )
     out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, scale)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
@@ -727,7 +704,9 @@ def test_pa_prefill_sparse_one_row_pool():
     sink = torch.randn(H, dtype=torch.float32, device=dev)
     indptr = torch.arange(0, (T + 1) * 4, 4, dtype=torch.int32, device=dev)
     indices = torch.tensor([0, -1, 1, 0] * T, dtype=torch.int32, device=dev)
-    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    ref = _sparse_prefill_attn_torch(
+        q, kv, indices, indptr, None, None, None, sink, D**-0.5
+    )
     out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
 
@@ -748,7 +727,9 @@ def test_pa_prefill_sparse_nonfinite_row0_ignored_by_invalid_slots(H):
     indices = torch.randint(1, num_kv, (T * 48,), dtype=torch.int32, device=dev)
     indices[0::4] = -1
     indices[1::9] = num_kv + 3
-    ref = _sparse_prefill_single_source_torch(q, kv, indices, indptr, sink, D**-0.5)
+    ref = _sparse_prefill_attn_torch(
+        q, kv, indices, indptr, None, None, None, sink, D**-0.5
+    )
     out = pa_prefill_sparse(q, kv, indices, indptr, None, None, None, sink, D**-0.5)
     assert torch.isfinite(out).all()
     torch.testing.assert_close(out, ref, atol=1e-2, rtol=1e-2)
