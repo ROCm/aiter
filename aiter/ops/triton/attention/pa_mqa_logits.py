@@ -128,6 +128,7 @@ def deepgemm_fp8_paged_mqa_logits_ragged_k(
         out_logits.stride(0),
         max_model_len,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -179,6 +180,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1_ragged_k(
         out_qk.stride(1),
         max_model_len,
         **config,
+        enable_fp_fusion=True,
     )
 
 
@@ -253,6 +255,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
         waves_per_eu=WavePerEU,
         **config,
         KVBlockSize=block_size,
+        enable_fp_fusion=True,
     )
 
 
@@ -300,9 +303,11 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "stride_q_next_n": "i32",
         "stride_q_heads": "i32",
         "KV_buffer": gfx_fp8_pointer,
-        "stride_k_seq": "i32",
+        # The plain kernel forms per-token KV addresses from the page table, so
+        # a cache past 2 GiB overflows a 32-bit stride product.
+        "stride_k_seq": "i32" if Preshuffle else "i64",
         "scale_buffer": "*fp32",
-        "stride_scale_seq": "i32",
+        "stride_scale_seq": "i32" if Preshuffle else "i64",
         "context_len_ptr": "*i32",
         "kv_indices": "*i32",
         "weights": "*fp32",
@@ -335,6 +340,7 @@ def _compile_deepgemm_fp8_paged_mqa_logits(
         "waves_per_eu": effective_wave_per_eu,
         "num_stages": 2,
         "num_ctas": 1,
+        "enable_fp_fusion": True,
         "cluster_dims": [1, 1, 1],
         "arch": gfx_version,
         "backend_name": "hip",
@@ -456,6 +462,7 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
         align_power_of_2_batch,
         TryCount,
         waves_per_eu=schedule_waves_per_eu,
+        enable_fp_fusion=True,
     )
     return safe_chunks_per_cta
 
@@ -499,9 +506,19 @@ def deepgemm_fp8_paged_mqa_logits(
     assert ChunkK % KVBlockSize == 0 or KVBlockSize % ChunkK == 0
     assert block_Size == KVBlockSize
     if Preshuffle:
-        assert (
-            KVBlockSize % 16 == 0
-        ), f"Preshuffle mode only supports KVBlockSize aligned to 16. Got KVBlockSize={KVBlockSize}"
+        # The shuffled layout feeds the 16-token MFMA B tile directly, so a page
+        # normally holds whole tiles. Page 8 is shuffled in groups of its own
+        # length -- `shuffle_weight(kv, layout=(8, 16))` -- and the kernel
+        # assembles one tile from two pages. The addressing generalises to any
+        # page that divides 16, but 8 is the only such page a caller asks for
+        # and the only one swept, so it is the only one admitted.
+        assert KVBlockSize % 16 == 0 or KVBlockSize == 8, (
+            "Preshuffle needs the KV page to be a multiple of the 16-token MFMA "
+            f"tile, or to be 8. Got KVBlockSize={KVBlockSize}."
+        )
+        assert not (
+            KVBlockSize < 16 and get_gfx() == "gfx1250"
+        ), f"gfx1250 preshuffle (TDM block-load) needs KVBlockSize>=16; got {KVBlockSize}."
 
     kv_cache = kv_cache.view(-1, KVBlockSize * index_dim)
     num_block = kv_cache.shape[0]

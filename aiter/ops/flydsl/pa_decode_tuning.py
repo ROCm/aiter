@@ -1,1225 +1,567 @@
-# SPDX-License-Identifier: MIT
-# Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Offline PA-decode tuning backed by FlyDSL's Autotuner and config cache.
+"""Native FlyDSL autotuning and cached work-plan preparation for PA decode.
 
-Run this file with --help for the shape sweep options. --help and --dry-run
-need only Python. GPU runs search on a cache miss; FLYDSL_AUTOTUNE=1 forces
-a fresh search. FLYDSL_AUTOTUNE_CACHE_DIR controls FlyDSL's cache directory.
-
-Each candidate uses a fixed plan and a graph containing decode plus reduction.
-FlyDSL validates candidates, measures them, and caches the smallest budget
-within 97% of the fastest measured performance. Runtime lookup never benchmarks.
-Budgets are shared across context bounds, sample lengths and KV pool sizes.
-Pass lengths to benchmark shorter sequences within a large context bound.
+Run with: python -m aiter.ops.flydsl.pa_decode_tuning --help
 """
 
-from __future__ import annotations
-
 import argparse
-import hashlib
-import importlib
-import itertools
-import math
 import os
-import random
-import statistics
-import sys
 from contextlib import contextmanager
-from functools import lru_cache
+from copy import copy
+from functools import cache
+from hashlib import sha256
 from pathlib import Path
 
-ATOL = RTOL = 0.005
-NEAR_BEST = 0.97
-DEFAULT_BUDGETS = (128, 256, 512, 1024, 2048, 4096)
-KV_DTYPES = {
-    "gfx942": "float8_e4m3fnuz",
-    "gfx950": "float8_e4m3fn",
-    "gfx1250": "float8_e4m3fn",
-}
-STATIC_SHAPE_FIELDS = (
-    "batch_size",
-    "query_length",
-    "num_query_heads",
-    "num_kv_heads",
-    "query_group_size",
-    "head_dim",
-    "page_size",
-    "query_dtype",
-    "per_token_kv",
-    "trans_v",
-    "sliding_window",
-)
-LAYOUT_FIELDS = ("query_strides",)
-BENCHMARK_FIELDS = (
-    "context_length",
-    "length_mode",
-    "seed",
-    "lengths",
-    "kv_pool_pages",
-    "softmax_scale",
-)
+import torch
+from flydsl.autotune import Config, autotune
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.ops.flydsl.kernels.pa_decode import implementation_cache_tag
+from aiter.ops.flydsl.kernels.pa_decode_plan import PADecodePlan, plan_pa_decode
+from aiter.ops.flydsl.pa_decode import pa_decode
+
+_PA_DECODE_CONFIGS_PATH = Path(__file__).parent / "configs" / "pa"
 
 
-def positive_int(value, name, minimum=1):
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise TypeError(f"{name} must be an integer")
-    if value < minimum:
-        raise ValueError(f"{name} must be >= {minimum}")
-    return value
-
-
-def _strided_storage_size(shape, strides):
-    return 1 + sum((size - 1) * stride for size, stride in zip(shape, strides))
-
-
-def make_shape(
-    batch_size,
-    context_length,
-    query_length=1,
-    *,
-    num_query_heads,
-    num_kv_heads,
-    head_dim,
-    page_size=128,
-    dtype="bfloat16",
-    per_token=True,
-    trans_v=True,
-    window=0,
-    length_mode="uniform",
-    seed=0,
-    query_strides=None,
-    lengths=None,
-    kv_pool_pages=None,
-):
-    """Build a tuning shape with an upper bound and optional actual lengths.
-
-    One supplied length broadcasts to every sequence. Otherwise supply B lengths.
-    Pass query.stride() for Q layout and key_cache.shape[0] for a fixed KV pool.
-    Synthetic sequences use distinct pages, which must fit in the supplied pool.
-    """
-    num_query_heads = positive_int(num_query_heads, "num_query_heads")
-    num_kv_heads = positive_int(num_kv_heads, "num_kv_heads")
-    head_dim = positive_int(head_dim, "head_dim")
-    if num_query_heads % num_kv_heads:
-        raise ValueError("num_query_heads must be divisible by num_kv_heads")
-    if head_dim != 64 and (head_dim % 128 or not 128 <= head_dim <= 1024):
-        raise ValueError(
-            "Supported head dimensions: 64 or multiples of 128 through 1024"
-        )
-    batch_size = positive_int(batch_size, "batch_size")
-    context_length = positive_int(context_length, "context_length")
-    query_length = positive_int(query_length, "query_length")
-    page_size = positive_int(page_size, "page_size")
-    seed = positive_int(seed, "seed", 0)
-    if batch_size > 4096 or context_length >= 2**31 or seed >= 2**63:
-        raise ValueError("B<=4096, context<int32 max and seed<int64 max are required")
-    if query_length > context_length:
-        raise ValueError("Context lengths must include every query token")
-    if page_size not in (16, 64, 128) or dtype not in ("bfloat16", "float16"):
-        raise ValueError("Use page16/64/128 and bfloat16/float16 queries")
-    if query_strides is None:
-        query_strides = (num_query_heads * head_dim, head_dim, 1)
-    if not isinstance(query_strides, (tuple, list)):
-        raise TypeError("query_strides must be a tuple or list of three integers")
-    if len(query_strides) != 3:
-        raise ValueError("query_strides must contain row, head and head_dim strides")
-    query_strides = tuple(
-        positive_int(stride, f"query_strides[{axis}]", 0)
-        for axis, stride in enumerate(query_strides)
-    )
-    if query_strides[2] != 1:
-        raise ValueError("query_strides must keep the head_dim axis contiguous")
-    query_shape = (batch_size * query_length, num_query_heads, head_dim)
-    # Q buffer loads use dwords, so each accessed FP16/BF16 row starts at 4B.
-    if any(
-        size > 1 and stride % 2
-        for size, stride in zip(query_shape[:2], query_strides[:2])
-    ):
-        raise ValueError("query row/head strides must preserve 4-byte alignment")
-    if any(stride >= 2**31 for stride in query_strides) or (
-        2 * _strided_storage_size(query_shape, query_strides) > 2**31
-    ):
-        raise ValueError("query_strides exceed PA's signed int32 addressing range")
-    if type(per_token) is not bool or type(trans_v) is not bool:
-        raise TypeError("per_token and trans_v must be bool")
-    positive_int(window, "window", 0)
-    if length_mode not in ("uniform", "varlen", "explicit"):
-        raise ValueError("length_mode must be uniform, varlen or explicit")
-    if lengths is None:
-        if length_mode == "explicit":
-            raise ValueError("Explicit length mode requires lengths")
-        lengths = [context_length] * batch_size
-        if length_mode == "varlen" and batch_size > 1:
-            rng = random.Random(seed)
-            lengths = [rng.randint(query_length, context_length) for _ in lengths]
-            lengths[0], lengths[-1] = query_length, context_length
-    else:
-        if not isinstance(lengths, (list, tuple)):
-            raise TypeError("lengths must be a list or tuple of integers")
-        if len(lengths) not in (1, batch_size):
-            raise ValueError("Supply one length or exactly batch_size lengths")
-        lengths = [positive_int(n, "lengths entry", query_length) for n in lengths]
-        if any(n > context_length for n in lengths):
-            raise ValueError("Actual lengths must not exceed context_length")
-        if len(lengths) == 1:
-            lengths *= batch_size
-        length_mode = "explicit"
-    required_pages = sum((n + page_size - 1) // page_size for n in lengths)
-    if kv_pool_pages is None:
-        kv_pool_pages = required_pages
-    kv_pool_pages = positive_int(kv_pool_pages, "kv_pool_pages")
-    if kv_pool_pages > 2**31:
-        raise ValueError("KV pool page IDs must fit signed int32")
-    if kv_pool_pages < required_pages:
-        raise ValueError(
-            f"kv_pool_pages={kv_pool_pages} cannot hold {required_pages} distinct "
-            "pages; supply sample lengths that fit the pool"
-        )
-    shape = {
-        "num_query_heads": num_query_heads,
-        "num_kv_heads": num_kv_heads,
-        "query_group_size": num_query_heads // num_kv_heads,
-        "head_dim": head_dim,
-    }
-    shape.update(
-        batch_size=batch_size,
-        context_length=context_length,
-        query_length=query_length,
-        page_size=page_size,
-        query_dtype=dtype,
-        per_token_kv=per_token,
-        trans_v=trans_v,
-        sliding_window=window,
-        query_strides=query_strides,
-        length_mode=length_mode,
-        seed=seed,
-        lengths=lengths,
-        kv_pool_pages=kv_pool_pages,
-        softmax_scale=head_dim**-0.5,
-    )
-    return shape
-
-
-def _validate_shape(shape, *, benchmark=False):
-    """Validate static geometry, optionally including the benchmark sample."""
-    expected = make_shape(
-        shape["batch_size"],
-        shape["context_length"],
-        shape["query_length"],
-        num_query_heads=shape["num_query_heads"],
-        num_kv_heads=shape["num_kv_heads"],
-        head_dim=shape["head_dim"],
-        page_size=shape["page_size"],
-        dtype=shape["query_dtype"],
-        per_token=shape["per_token_kv"],
-        trans_v=shape["trans_v"],
-        window=shape["sliding_window"],
-        length_mode=shape["length_mode"],
-        seed=shape["seed"],
-        query_strides=shape["query_strides"],
-        lengths=shape["lengths"] if shape["length_mode"] == "explicit" else None,
-        kv_pool_pages=shape["kv_pool_pages"],
-    )
-    fields = STATIC_SHAPE_FIELDS + LAYOUT_FIELDS
-    if benchmark:
-        fields += BENCHMARK_FIELDS
-    if any(
-        type(shape[k]) is not type(expected[k]) or shape[k] != expected[k]
-        for k in fields
-    ):
-        raise ValueError("Shape fields must agree with make_shape")
-
-
-def make_key(shape, architecture, num_cu):
-    """Build a lookup key from the device and static attention geometry."""
-    if architecture not in KV_DTYPES:
-        raise ValueError(f"Supported architectures are {', '.join(KV_DTYPES)}")
-    positive_int(num_cu, "num_cu")
-    _validate_shape(shape)
-    return {
-        "architecture": architecture,
-        "num_cu": num_cu,
-        "kv_dtype": KV_DTYPES[architecture],
-        "shape": {k: shape[k] for k in STATIC_SHAPE_FIELDS},
-    }
-
-
-def candidate_groups(budgets, batch_size, kv_heads, num_cu):
-    """Deduplicate by final capacity, retaining every requested-budget alias."""
-    for value, name in ((batch_size, "B"), (kv_heads, "Hkv"), (num_cu, "CU")):
-        positive_int(value, name)
-    budgets = list(budgets)
-    if not budgets:
-        raise ValueError("At least one candidate budget is required")
-    for budget in budgets:
-        positive_int(budget, "budget")
-    baseline = 2 * num_cu
-    grouped = {}
-    for budget in sorted(set(budgets) | {baseline}):
-        capacity = min(
-            batch_size * num_cu, max(batch_size, (budget + kv_heads - 1) // kv_heads)
-        )
-        grouped.setdefault(capacity, []).append(budget)
-    return [
-        {
-            "capacity": capacity,
-            "budget_aliases": aliases,
-            "workgroup_budget": min(aliases),
-            "launch_budget": baseline if baseline in aliases else min(aliases),
-            "is_baseline": baseline in aliases,
-        }
-        for capacity, aliases in sorted(grouped.items())
-    ]
-
-
-def _finite(value):
-    try:
-        return (
-            not isinstance(value, bool)
-            and isinstance(value, (int, float))
-            and math.isfinite(value)
-        )
-    except OverflowError:
-        return False
-
-
-def _finite_positive(value):
-    return _finite(value) and value > 0
-
-
-def unique_kv_bytes(shape):
-    window, ql = shape["sliding_window"], shape["query_length"]
-    tokens = sum(min(n, window + ql - 1) if window else n for n in shape["lengths"])
-    return 2 * shape["num_kv_heads"] * shape["head_dim"] * tokens
-
-
-def _contiguous_strides(shape):
-    return tuple(math.prod(shape[i + 1 :]) for i in range(len(shape)))
-
-
-def _synthetic_storage_key(shape):
-    h, d, page = (shape[k] for k in ("num_kv_heads", "head_dim", "page_size"))
-    pages = shape["kv_pool_pages"]
-    vshape = (pages, h, page // 16, d, 16) if shape["trans_v"] else (pages, h, d, page)
-    scales = _contiguous_strides((pages, h, page)) if shape["per_token_kv"] else ()
-    return (
-        shape["query_strides"],
-        _contiguous_strides((pages, h, d // 16, page, 16)),
-        _contiguous_strides(vshape),
-        scales,
-        scales,
-    )
-
-
-def storage_key(query, key, value, key_scale, value_scale):
-    """Host-only layout specialization shared by search and lookup."""
-
-    def scale_strides(scale):
-        if scale.numel() == 1:
-            return ()
-        strides = tuple(scale.stride())
-        # pa_decode normalizes (..., page, 1) per-token scales with squeeze(-1).
-        return strides[:-1] if scale.ndim == 4 and scale.shape[-1] == 1 else strides
-
-    return (
-        tuple(query.stride()),
-        tuple(key.stride()),
-        tuple(value.stride()),
-        scale_strides(key_scale),
-        scale_strides(value_scale),
-    )
-
-
-@lru_cache(maxsize=1)
-def _implementation_hash():
-    # FlyDSL supplies compiler/environment fingerprints. Include the PA sources
-    # as well: a budget measured before a kernel/policy change must not be reused.
-    root = Path(__file__).resolve().parent
-    files = sorted((root / "kernels" / "pa_decode").glob("*.py"))
-    files += [root / "pa_decode.py", Path(__file__).resolve()]
-    files += [
-        root / "kernels" / name
-        for name in (
-            "pa_decode_kernel.py",
-            "pa_decode_reduce.py",
-            "pa_decode_plan.py",
-            "buffer_ops.py",
-            "tensor_shim.py",
-            "kernels_common.py",
-            "dpp_utils.py",
-            "utils.py",
-        )
-    ]
-    digest = hashlib.sha256()
-    for path in files:
-        digest.update(str(path.relative_to(root)).encode())
-        digest.update(path.read_bytes())
+@cache
+def _tuning_cache_tag():
+    """Invalidate tuning results when either kernels or tuning policy changes."""
+    digest = sha256(implementation_cache_tag().encode())
+    digest.update(Path(__file__).read_bytes())
     return digest.hexdigest()
 
 
-class _OfflineTuningRequired(RuntimeError):
-    pass
+class _PADecodeAutotuneResources:
+    """Prepare candidate plans and graphs outside FlyDSL's timed replay."""
+
+    def __init__(self, query, args, options, max_partitions):
+        self.query = query
+        self.args = args
+        self.options = options
+        self.max_partitions = max_partitions
+        self.outputs = {}
+        self.graphs = {}
+        self.plans = {}
+        self.workspaces = {}
+        self.reference = None
+
+    def prepare(self, workgroup_budget):
+        if workgroup_budget in self.graphs:
+            return
+        key, value, lengths, table, scale, query_length = self.args
+        if key.dtype != torch.bfloat16:
+            if (self.options["key_scale"] is None) != (
+                self.options["value_scale"] is None
+            ):
+                raise ValueError(
+                    "key_scale and value_scale must either both be provided or both be None"
+                )
+            for name in ("key_scale", "value_scale"):
+                kv_scale = self.options[name]
+                if not isinstance(kv_scale, torch.Tensor):
+                    # Scalar host-to-device copies must precede graph capture.
+                    self.options[name] = torch.tensor(
+                        [1.0 if kv_scale is None else float(kv_scale)],
+                        dtype=torch.float32,
+                        device=self.query.device,
+                    )
+        plan = plan_pa_decode(
+            lengths,
+            key.shape[1],
+            max_partitions=self.max_partitions,
+            workgroup_budget=workgroup_budget,
+            sliding_window=self.options["sliding_window"],
+            query_length=query_length,
+        )
+        rows = query_length * self.query.shape[1] // key.shape[1]
+        scalar_shape = (key.shape[1], plan.capacity, rows)
+        output = torch.full_like(
+            self.query, float("nan"), memory_format=torch.contiguous_format
+        )
+        workspace = {
+            "exp_sums": torch.empty(
+                scalar_shape, dtype=torch.float32, device=output.device
+            ),
+            "max_logits": torch.empty(
+                scalar_shape, dtype=torch.float32, device=output.device
+            ),
+            "temporary_output": torch.empty(
+                (*scalar_shape, self.query.shape[-1]),
+                dtype=output.dtype,
+                device=output.device,
+            ),
+        }
+
+        def launch():
+            pa_decode(
+                output,
+                self.query,
+                key,
+                value,
+                lengths,
+                table,
+                scale,
+                query_length,
+                work_plan=plan,
+                **self.options,
+                **workspace,
+            )
+
+        # Eager compilation and graph capture precede native autotune timing.
+        stream = torch.cuda.current_stream()
+        capture_stream = torch.cuda.Stream(device=output.device)
+        capture_stream.wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.stream(capture_stream):
+            launch()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                launch()
+        stream.wait_stream(capture_stream)
+        graph.replay()
+        stream.synchronize()
+        if not torch.isfinite(output).all().item():
+            raise ArithmeticError("PA autotune candidate produced nonfinite output")
+        self.outputs[workgroup_budget] = output
+        self.graphs[workgroup_budget] = graph
+        # Graph replay uses the original pointers, so retain all backing tensors.
+        self.plans[workgroup_budget] = plan
+        self.workspaces[workgroup_budget] = workspace
+        if self.reference is None:
+            self.reference = output.clone()
+        else:
+            torch.testing.assert_close(output, self.reference, atol=5e-3, rtol=5e-3)
 
 
-def _pa_decode_budget(
-    shape_key,
-    architecture,
-    num_cu,
-    implementation,
-    storage_key,
-    *,
-    workgroup_budget,
-    tuning_session=None,
-):
-    tuning_session.launch(workgroup_budget)
+def _pa_decode_configs(*args, resources, num_cu, **kwargs):
+    # Keep a validated 2*CU baseline; deduplicate identical plan capacities.
+    baseline = 2 * num_cu
+    resources.prepare(baseline)
+    batch = resources.args[2].numel()
+    kv_heads = resources.args[0].shape[1]
+    capacities = {}
+    for budget in [baseline, 128, 256, 512, 1024, 2048, 4096]:
+        capacity = min(
+            batch * resources.max_partitions,
+            max(batch, (budget + kv_heads - 1) // kv_heads),
+        )
+        capacities.setdefault(capacity, Config(workgroup_budget=budget))
+    return list(capacities.values())
 
 
-def _configs(*args, tuning_session=None, **kwargs):
-    if tuning_session is None:
-        # FLYDSL_AUTOTUNE bypasses even a runtime default. Keep budget lookup
-        # a lookup-only operation when that flag is inherited.
-        raise _OfflineTuningRequired("Run the offline PA tuner to measure budgets")
-    return tuning_session.configs()
-
-
-@contextmanager
-def _validate_config(arguments):
-    with arguments["tuning_session"].validate(arguments["workgroup_budget"]):
-        yield
-
-
-def _select_config(results):
-    """Prefer the smallest budget within the existing 97% performance band."""
-    best = min(elapsed for _, elapsed in results)
-    return min(
-        (
-            (config, elapsed)
-            for config, elapsed in results
-            if best / elapsed >= NEAR_BEST - 1e-12
-        ),
-        key=lambda pair: pair[0].kwargs["workgroup_budget"],
-    )
-
-
-def _default_config(*args, num_cu, **kwargs):
-    from flydsl.autotune import Config
-
+def _pa_decode_default(*args, num_cu, **kwargs):
     return Config(workgroup_budget=2 * num_cu)
 
 
-def _make_autotuner(session=None):
-    from flydsl.autotune import autotune
-
-    return autotune(
-        configs=_configs,
-        key=["shape_key", "architecture", "num_cu", "implementation", "storage_key"],
-        warmup=0,
-        rep=session.rounds if session is not None else 1,
-        validate_hook=_validate_config,
-        do_bench=session.benchmark if session is not None else None,
-        select_config=session.select if session is not None else _select_config,
-        default=None if session is not None else _default_config,
-    )(_pa_decode_budget)
-
-
-@lru_cache(maxsize=8)
-def _get_runtime_tuner(cache_dir):
-    return _make_autotuner()
-
-
-def _resolve_config(shape, architecture, num_cu, session=None, *, storage_key=None):
-    arguments = {
-        "shape_key": tuple(shape[field] for field in STATIC_SHAPE_FIELDS),
-        "architecture": architecture,
-        "num_cu": num_cu,
-        "implementation": _implementation_hash(),
-        "storage_key": (
-            _synthetic_storage_key(shape) if storage_key is None else storage_key
-        ),
-    }
-    cache_dir = os.environ.get("FLYDSL_AUTOTUNE_CACHE_DIR")
-    tuner = (
-        _get_runtime_tuner(cache_dir) if session is None else _make_autotuner(session)
-    )
-    config = tuner.resolve_config(**arguments, tuning_session=session)
-    values = config.all_kwargs()
-    if (
-        set(values) != {"workgroup_budget"}
-        or type(values["workgroup_budget"]) is not int
-        or values["workgroup_budget"] <= 0
-        or config.compiler_opts()
-        or config.pre_hook is not None
-    ):
-        raise ValueError(
-            "Invalid PA budget in FlyDSL cache; use FLYDSL_AUTOTUNE=1 to retune"
-        )
-    if session is not None:
-        # Both objects use FlyDSL's cache/key format. Make a completed search
-        # visible to a runtime resolver already constructed in this process.
-        _get_runtime_tuner(cache_dir).cache.update(tuner.cache)
-    return config
-
-
-def get_cached_budget(shape, architecture, num_cu, *, storage_key=None):
-    """Read FlyDSL's config cache, or use 2*CU; never compile or benchmark.
-
-    Call before graph capture when preparing an explicit work plan. Pass the
-    actual tensor storage key to match its layout. Otherwise use the shape's
-    query strides and contiguous KV/scale layouts. Use the current CUDA device.
-    """
-    try:
-        return _resolve_config(
-            shape, architecture, num_cu, storage_key=storage_key
-        ).kwargs["workgroup_budget"]
-    except (_OfflineTuningRequired, ValueError):
-        return 2 * num_cu
-
-
-def _make_inputs(torch, shape, device, fp8):
-    """Chunked random initialization avoids a second whole-cache FP32 allocation."""
-    b, ql, hq, h, d, page = (
-        shape[k]
-        for k in (
-            "batch_size",
-            "query_length",
-            "num_query_heads",
-            "num_kv_heads",
-            "head_dim",
-            "page_size",
-        )
-    )
-    counts = [(n + page - 1) // page for n in shape["lengths"]]
-    pages = shape["kv_pool_pages"]
-    generator = torch.Generator(device=device).manual_seed(shape["seed"])
-    query_shape = (b * ql, hq, d)
-    query_strides = shape["query_strides"]
-    query_storage = torch.empty(
-        _strided_storage_size(query_shape, query_strides),
-        dtype=getattr(torch, shape["query_dtype"]),
-        device=device,
-    )
-    # Initialize the backing storage once, including padding and aliased rows.
-    query_storage.uniform_(-0.5, 0.5, generator=generator)
-    query = query_storage.as_strided(query_shape, query_strides)
-    keys = torch.empty((pages, h, d // 16, page, 16), dtype=fp8, device=device)
-    vshape = (pages, h, page // 16, d, 16) if shape["trans_v"] else (pages, h, d, page)
-    values = torch.empty(vshape, dtype=fp8, device=device)
-    scale_shape = (pages, h, page, 1) if shape["per_token_kv"] else (1,)
-    ks = torch.empty(scale_shape, dtype=torch.float32, device=device)
-    vs = torch.empty_like(ks)
-    limit = torch.finfo(fp8).max
-    if not shape["per_token_kv"]:
-        ks.fill_(0.5 / limit)
-        vs.fill_(0.5 / limit)
-    for begin in range(0, pages, 64):
-        end = min(begin + 64, pages)
-        for kind, cache, scales in (("key", keys, ks), ("value", values, vs)):
-            raw = torch.empty(
-                (end - begin, h, page, d), dtype=torch.float32, device=device
-            )
-            raw.uniform_(-0.5, 0.5, generator=generator)
-            scale = (
-                raw.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12) / limit
-                if shape["per_token_kv"]
-                else scales
-            )
-            quant = (raw / scale).clamp(-limit, limit).to(fp8)
-            if shape["per_token_kv"]:
-                scales[begin:end].copy_(scale)
-            packed = (
-                quant.reshape(end - begin, h, page, d // 16, 16).permute(0, 1, 3, 2, 4)
-                if kind == "key"
-                else (
-                    quant.reshape(end - begin, h, page // 16, 16, d).permute(
-                        0, 1, 2, 4, 3
-                    )
-                    if shape["trans_v"]
-                    else quant.permute(0, 1, 3, 2)
-                )
-            )
-            cache[begin:end].copy_(packed)
-    # Preserve the scheduler's upper bound without allocating KV for padding.
-    table_pages = (shape["context_length"] + page - 1) // page
-    table = torch.zeros((b, table_pages), dtype=torch.int32, device=device)
-    start = 0
-    for seq, count in enumerate(counts):
-        table[seq, :count] = torch.arange(
-            start, start + count, dtype=torch.int32, device=device
-        )
-        start += count
-    return {
-        "query": query,
-        "key": keys,
-        "value": values,
-        "key_scale": ks,
-        "value_scale": vs,
-        "lengths": torch.tensor(shape["lengths"], dtype=torch.int32, device=device),
-        "table": table,
-    }
-
-
-def _reference(torch, inputs, shape, chunk_size=4096):
-    """Full FP32 dequantized attention, streamed over all visible keys."""
-    ql, h, g, d, page = (
-        shape[k]
-        for k in (
-            "query_length",
-            "num_kv_heads",
-            "query_group_size",
-            "head_dim",
-            "page_size",
-        )
-    )
-    query = inputs["query"].reshape(shape["batch_size"], ql, h, g, d).float()
-    output = torch.empty_like(query)
-    device, window = query.device, shape["sliding_window"]
-    for seq, length in enumerate(shape["lengths"]):
-        right = length - ql + 1 + torch.arange(ql, device=device)
-        maximum = torch.full((ql, h, g), -math.inf, dtype=torch.float32, device=device)
-        denominator = torch.zeros_like(maximum)
-        numerator = torch.zeros((ql, h, g, d), dtype=torch.float32, device=device)
-        first = max(0, length - ql + 1 - window) if window else 0
-        for begin in range(first, length, chunk_size):
-            tokens = torch.arange(begin, min(length, begin + chunk_size), device=device)
-            pages, offsets = inputs["table"][seq, tokens // page].long(), tokens % page
-            # Byte gathers also work on Torch builds without FP8 index kernels.
-            keys = inputs["key"].view(torch.uint8)[pages, :, :, offsets, :]
-            keys = keys.contiguous().view(inputs["key"].dtype).float().reshape(-1, h, d)
-            cache = inputs["value"].view(torch.uint8)
-            values = (
-                cache[pages, :, offsets // 16, :, offsets % 16]
-                if shape["trans_v"]
-                else cache[pages, :, :, offsets]
-            )
-            values = values.contiguous().view(inputs["value"].dtype).float()
-            if shape["per_token_kv"]:
-                keys *= inputs["key_scale"][pages, :, offsets, 0].unsqueeze(-1)
-                values *= inputs["value_scale"][pages, :, offsets, 0].unsqueeze(-1)
-            else:
-                keys *= inputs["key_scale"]
-                values *= inputs["value_scale"]
-            scores = (
-                torch.einsum("qhgd,thd->qhgt", query[seq], keys)
-                * shape["softmax_scale"]
-            )
-            mask = tokens[None, :] >= right[:, None]
-            if window:
-                mask |= tokens[None, :] < (right - window)[:, None]
-            scores.masked_fill_(mask[:, None, None, :], -math.inf)
-            next_max = torch.maximum(maximum, scores.amax(-1))
-            safe_max = torch.where(torch.isfinite(next_max), next_max, 0)
-            correction = torch.exp(maximum - safe_max)
-            weights = torch.exp(scores - safe_max[..., None])
-            numerator = numerator * correction[..., None] + torch.einsum(
-                "qhgt,thd->qhgd", weights, values
-            )
-            denominator = denominator * correction + weights.sum(-1)
-            maximum = next_max
-        output[seq] = numerator / denominator[..., None]
-    return output.reshape_as(inputs["query"])
-
-
-def _accuracy(torch, output, reference):
-    finite = bool(
-        torch.isfinite(output).all().item() and torch.isfinite(reference).all().item()
-    )
-    result = {
-        "finite": finite,
-        "passed": False,
-        "atol": ATOL,
-        "rtol": RTOL,
-        "elements": output.numel(),
-    }
-    if finite:
-        error = (output.float() - reference).abs()
-        tolerance = ATOL + RTOL * reference.abs()
-        result.update(
-            passed=bool((error <= tolerance).all().item()),
-            max_abs_error=float(error.max().item()),
-            max_tolerance_ratio=float((error / tolerance).max().item()),
-        )
-    return result
-
-
-def _prepare_candidate(
-    torch, pa, inputs, shape, candidate, reference, num_cu, iterations, warmup, stream
-):
-    plan = pa.plan_pa_decode(
-        inputs["lengths"],
-        shape["num_kv_heads"],
-        max_partitions=num_cu,
-        workgroup_budget=candidate["launch_budget"],
-        sliding_window=shape["sliding_window"],
-        query_length=shape["query_length"],
-    )
-    if plan.capacity != candidate["capacity"] or plan.max_partitions != num_cu:
-        raise RuntimeError("Native planner disagrees with the recorded capacity/CU cap")
-    work_before, reduce_before = plan.work_info.clone(), plan.reduce_info.clone()
-    scratch_shape = (
-        shape["num_kv_heads"],
-        plan.capacity,
-        shape["query_length"] * shape["query_group_size"],
-    )
-    output = torch.full_like(
-        inputs["query"], math.nan, memory_format=torch.contiguous_format
-    )
-    sums = torch.full(
-        scratch_shape, math.nan, dtype=torch.float32, device=output.device
-    )
-    maxima = torch.full_like(sums, math.nan)
-    partials = torch.full(
-        (*scratch_shape, shape["head_dim"]),
-        math.nan,
-        dtype=output.dtype,
-        device=output.device,
-    )
-
-    def launch():
-        pa.pa_decode(
-            output,
-            inputs["query"],
-            inputs["key"],
-            inputs["value"],
-            inputs["lengths"],
-            inputs["table"],
-            shape["softmax_scale"],
-            shape["query_length"],
-            compute_type=inputs["key"].dtype,
-            key_scale=inputs["key_scale"],
-            value_scale=inputs["value_scale"],
-            exp_sums=sums,
-            max_logits=maxima,
-            temporary_output=partials,
-            sliding_window=shape["sliding_window"],
-            work_plan=plan,
-            max_context_length=shape["context_length"],
-        )
-
-    launch()
-    torch.cuda.synchronize()
-    candidate["accuracy"] = _accuracy(torch, output, reference)
-    if not candidate["accuracy"]["passed"]:
-        raise ArithmeticError("eager accuracy failed")
-    for _ in range(warmup):
-        launch()
-    torch.cuda.synchronize()
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=stream):
-        for _ in range(iterations):
-            launch()
-    graph.replay()
-    torch.cuda.synchronize()
-    parts = plan.reduce_info[:, 1].cpu().tolist()
-    candidate["plan"] = {
-        "active_slots": sum(parts),
-        "parts_per_sequence": parts,
-        "max_parts": max(parts),
-    }
-    return {
-        "graph": graph,
-        "output": output,
-        "plan": plan,
-        "snapshots": (work_before, reduce_before),
-        "launch": launch,
-    }
-
-
-def _error_status(torch, exc):
-    if isinstance(exc, torch.cuda.OutOfMemoryError):
-        return "OOM"
-    return "FAIL" if isinstance(exc, ArithmeticError) else "ERROR"
-
-
 @contextmanager
-def _full_fp32(torch):
-    """Protect direct API callers as well as CLI users; restore global flags."""
-    flags = (
-        torch.backends.cuda.matmul.allow_tf32,
-        torch.backends.cudnn.allow_tf32,
-        torch.get_float32_matmul_precision(),
+def _validate_pa_decode_config(arguments):
+    resources = arguments["resources"]
+    budget = arguments["workgroup_budget"]
+    resources.prepare(budget)
+    resources.outputs[budget].fill_(float("nan"))
+    yield
+    torch.cuda.current_stream().synchronize()
+    torch.testing.assert_close(
+        resources.outputs[budget], resources.reference, atol=5e-3, rtol=5e-3
     )
-    try:
-        torch.set_float32_matmul_precision("highest")
-        torch.backends.cuda.matmul.allow_tf32 = False
-        torch.backends.cudnn.allow_tf32 = False
-        yield
-    finally:
-        torch.set_float32_matmul_precision(flags[2])
-        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = flags[
-            :2
-        ]
 
 
-class _BaselineFailed(ArithmeticError):
-    pass
-
-
-class _TuningSession:
-    """PA resources and correctness hooks for one FlyDSL config search."""
-
-    def __init__(
-        self, torch, pa, shape, info, candidates, rounds, iterations, warmup, stream
-    ):
-        self.torch, self.pa, self.problem, self.info = torch, pa, shape, info
-        self.candidates = {c["workgroup_budget"]: c for c in candidates}
-        self.rounds, self.iterations, self.warmup = rounds, iterations, warmup
-        self.stream = stream
-        self.resources = {}
-        self.current = None
-        self.baseline = next(c for c in candidates if c["is_baseline"])
-
-    def _prepare(self, candidate):
-        budget = candidate["workgroup_budget"]
-        try:
-            self.resources[budget] = _prepare_candidate(
-                self.torch,
-                self.pa,
-                self.inputs,
-                self.problem,
-                candidate,
-                self.reference,
-                self.info["num_cu"],
-                self.iterations,
-                self.warmup,
-                self.stream,
-            )
-            candidate["status"] = "READY"
-        except Exception as exc:
-            self._failure(candidate, exc)
-            raise
-
-    def _failure(self, candidate, exc):
-        candidate["status"] = _error_status(self.torch, exc)
-        candidate["errors"].append(f"{type(exc).__name__}: {exc}")
-
-    def configs(self):
-        from flydsl.autotune import Config
-
-        torch = self.torch
-        device = torch.device("cuda", self.info["device"])
-        fp8 = getattr(torch, KV_DTYPES[self.info["architecture"]])
-        self.inputs = _make_inputs(torch, self.problem, device, fp8)
-        actual = storage_key(
-            *(
-                self.inputs[name]
-                for name in ("query", "key", "value", "key_scale", "value_scale")
-            )
-        )
-        if actual != _synthetic_storage_key(self.problem):
-            raise RuntimeError("Synthetic storage key disagrees with allocated inputs")
-        self.reference = _reference(torch, self.inputs, self.problem)
-        if not bool(torch.isfinite(self.reference).all().item()):
-            raise RuntimeError("FP32 reference is nonfinite")
-        # A failed baseline aborts before FlyDSL starts searching other configs.
-        try:
-            self._prepare(self.baseline)
-        except Exception as exc:
-            raise _BaselineFailed("Baseline preparation failed") from exc
-        return [
-            Config(workgroup_budget=c["workgroup_budget"])
-            for c in sorted(
-                self.candidates.values(), key=lambda c: not c["is_baseline"]
-            )
-        ]
-
-    @contextmanager
-    def validate(self, budget):
-        candidate = self.candidates[budget]
-        self.current = candidate
-        if budget not in self.resources:
-            self._prepare(candidate)
-        try:
-            yield
-            self.torch.cuda.synchronize()
-            candidate["graph_accuracy"] = _accuracy(
-                self.torch, self.resources[budget]["output"], self.reference
-            )
-            if not candidate["graph_accuracy"]["passed"]:
-                raise ArithmeticError("graph accuracy failed")
-        except Exception as exc:
-            self._failure(candidate, exc)
-            raise
-
-    def launch(self, budget):
-        self.resources[budget]["graph"].replay()
-
-    def benchmark(self, fn, *, warmup, rep):
-        from flydsl.autotune import do_bench
-
-        candidate = self.current
-        try:
-            # Every replay contains iterations native decode+reduce calls.
-            # FlyDSL supplies the GPU backlog and event timing. Search order
-            # is owned by Autotuner; these are per-config repeated samples.
-            for _ in range(rep):
-                elapsed = do_bench(fn, warmup=warmup, rep=1) * 1000 / self.iterations
-                if not _finite_positive(elapsed):
-                    raise RuntimeError("Nonfinite or nonpositive FlyDSL timing")
-                candidate["samples_us"].append(elapsed)
-            resource = self.resources[candidate["workgroup_budget"]]
-            plan = resource["plan"]
-            candidate["plan_unchanged"] = bool(
-                self.torch.equal(plan.work_info, resource["snapshots"][0])
-                and self.torch.equal(plan.reduce_info, resource["snapshots"][1])
-            )
-            if not candidate["plan_unchanged"]:
-                raise ArithmeticError("Work plan changed during benchmarking")
-            samples = candidate["samples_us"]
-            candidate.update(
-                status="PASS",
-                median_us=statistics.median(samples),
-                min_us=min(samples),
-                max_us=max(samples),
-                unique_kv_tb_s=unique_kv_bytes(self.problem)
-                / statistics.median(samples)
-                / 1e6,
-            )
-            return candidate["median_us"] / 1000
-        except Exception as exc:
-            self._failure(candidate, exc)
-            raise
-
-    def select(self, results):
-        if not any(
-            config.kwargs["workgroup_budget"] == self.baseline["workgroup_budget"]
-            for config, _ in results
-        ):
-            raise _BaselineFailed("Baseline validation or measurement failed")
-        return _select_config(results)
-
-
-def tune_shape(
-    torch,
-    pa,
-    shape,
-    device_info,
-    budgets,
+@autotune(
+    configs=_pa_decode_configs,
+    key=[
+        "num_seqs",
+        "num_kv_heads",
+        "query_group_size",
+        "head_dim",
+        "block_size",
+        "query_length",
+        "query_dtype",
+        "kv_dtype",
+        "per_token_kv",
+        "trans_v",
+        "sink_dtype",
+        "sliding_window",
+        "max_partitions",
+        "num_cu",
+        "implementation",
+    ],
+    default=_pa_decode_default,
+    validate_hook=_validate_pa_decode_config,
+)
+def _pa_decode_autotuner(
+    num_seqs,
+    num_kv_heads,
+    query_group_size,
+    head_dim,
+    block_size,
+    query_length,
+    query_dtype,
+    kv_dtype,
+    per_token_kv,
+    trans_v,
+    sink_dtype,
+    sliding_window,
+    max_partitions,
+    num_cu,
+    implementation,
+    resources,
     *,
-    rounds=16,
-    iterations=100,
-    warmup=5,
+    workgroup_budget,
 ):
-    """Search on a FlyDSL cache miss; cached results allocate no benchmark data."""
-    for value, name, minimum in (
-        (rounds, "rounds", 1),
-        (iterations, "iterations", 1),
-        (warmup, "warmup", 0),
-    ):
-        positive_int(value, name, minimum)
-    _validate_shape(shape, benchmark=True)
-    key = make_key(shape, device_info["architecture"], device_info["num_cu"])
-    candidates = candidate_groups(
-        budgets, shape["batch_size"], shape["num_kv_heads"], device_info["num_cu"]
-    )
-    for candidate in candidates:
-        candidate.update(status="NOT_RUN", samples_us=[], errors=[])
-    record = {
-        "key": key,
-        "status": "RUNNING",
-        "candidates": candidates,
-        "selection": None,
-        "errors": [],
-    }
-    session = None
-    try:
-        device = torch.device("cuda", device_info["device"])
-        props = torch.cuda.get_device_properties(device)
+    resources.graphs[workgroup_budget].replay()
+
+
+@cache
+def _get_pa_decode_autotuner(arch, config_dir=None):
+    """Keep native PA tuning results in the target architecture's directory."""
+    if config_dir is None and "FLYDSL_AUTOTUNE_CACHE_DIR" in os.environ:
+        return _pa_decode_autotuner
+    config_root = _PA_DECODE_CONFIGS_PATH if config_dir is None else config_dir
+    tuner = copy(_pa_decode_autotuner)
+    tuner._cache_file = config_root / arch / "_pa_decode_autotuner.json"
+    # Each architecture owns its native in-memory and disk caches. Discard the
+    # template's default-directory entries before loading the selected file.
+    tuner.cache = {}
+    tuner._artifact_cache = {}
+    tuner._load_disk_cache()
+    return tuner
+
+
+def prepare_pa_decode_plan(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    context_lengths: torch.Tensor,
+    block_tables: torch.Tensor,
+    softmax_scale: float,
+    query_length: int,
+    *,
+    compute_type: torch.dtype | None = None,
+    key_scale: torch.Tensor | float | None = None,
+    value_scale: torch.Tensor | float | None = None,
+    sinks: torch.Tensor | None = None,
+    sliding_window: int = 0,
+    max_partitions: int | None = None,
+    max_context_length: int | None = None,
+    tune: bool = False,
+    config_dir: str | Path | None = None,
+) -> PADecodePlan:
+    """Select a work budget using native FlyDSL autotune, then build a plan.
+
+    Call outside graph capture with the actual decode tensors/options. Native
+    cache hits and misses with the 2*CU default do not launch candidates.
+    Set FLYDSL_AUTOTUNE=1 to prepare candidate workspaces/graphs and search with
+    FlyDSL's default benchmark and fastest-config selection. Candidates must
+    agree with the 2*CU baseline before timing.
+    Results are saved to configs/pa/<arch>/_pa_decode_autotuner.json under the
+    FlyDSL operator package. Set FLYDSL_AUTOTUNE_CACHE_DIR before importing this
+    module to override the native cache directory.
+
+    ``tune=True`` searches even when a result is cached and saves the winner.
+    ``config_dir`` selects a root containing per-architecture cache directories
+    and takes precedence over the environment's cache-directory override.
+
+    Cache by attention geometry and execution modes. Tensor strides, total KV
+    cache pages, block-table padding, and max_context_length do not partition
+    the tuning cache; max_context_length still bounds kernel scheduling.
+
+    Retain the returned plan for decode/graph replay. Refresh it with
+    plan_pa_decode(..., plan=plan) when context lengths change; decode never
+    invokes autotune. Workspace sizes follow the returned plan.capacity.
+    """
+    with torch.cuda.device(query.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("prepare_pa_decode_plan must run before graph capture")
+        properties = torch.cuda.get_device_properties(query.device)
+        num_cu = properties.multi_processor_count
+        limit = num_cu if max_partitions is None else max_partitions
+        # Validate plan geometry even when native autotune takes the default.
+        default_plan = plan_pa_decode(
+            context_lengths,
+            key_cache.shape[1],
+            max_partitions=limit,
+            sliding_window=sliding_window,
+            query_length=query_length,
+        )
+        options = {
+            "compute_type": compute_type,
+            "key_scale": key_scale,
+            "value_scale": value_scale,
+            "sinks": sinks,
+            "sliding_window": default_plan.sliding_window,
+            "max_context_length": max_context_length,
+        }
+        resources = _PADecodeAutotuneResources(
+            query,
+            (
+                key_cache,
+                value_cache,
+                context_lengths,
+                block_tables,
+                softmax_scale,
+                query_length,
+            ),
+            options,
+            limit,
+        )
+
+        arch = get_gfx_runtime()
+        config_dir = None if config_dir is None else Path(config_dir)
+        tuner = _get_pa_decode_autotuner(arch, config_dir)
+        tuning_args = {
+            "num_seqs": context_lengths.numel(),
+            "num_kv_heads": key_cache.shape[1],
+            "query_group_size": query.shape[1] // key_cache.shape[1],
+            "head_dim": query.shape[-1],
+            "block_size": key_cache.shape[3],
+            "query_length": query_length,
+            "query_dtype": str(query.dtype),
+            "kv_dtype": str(key_cache.dtype),
+            "per_token_kv": (
+                isinstance(key_scale, torch.Tensor) and key_scale.numel() > 1
+            ),
+            "trans_v": value_cache.ndim == 5,
+            "sink_dtype": None if sinks is None else str(sinks.dtype),
+            "sliding_window": default_plan.sliding_window,
+            "max_partitions": limit,
+            "num_cu": num_cu,
+            "implementation": _tuning_cache_tag(),
+            "resources": resources,
+        }
+        if tune:
+            # Search this shape without changing process-wide environment or
+            # the cached tuner's default policy. Preserve other shapes on disk.
+            search = copy(tuner)
+            search.cache = dict(tuner.cache)
+            search._artifact_cache = dict(tuner._artifact_cache)
+            search.default = None
+            search.cache.pop(search._make_key((), tuning_args), None)
+            config = search.resolve_config(**tuning_args)
+            tuner.cache.update(search.cache)
+        else:
+            config = tuner.resolve_config(**tuning_args)
+        budget = config.kwargs.get("workgroup_budget")
         if (
-            props.multi_processor_count != key["num_cu"]
-            or props.gcnArchName.split(":")[0] != key["architecture"]
+            set(config.all_kwargs()) != {"workgroup_budget"}
+            or type(budget) is not int
+            or budget < 1
+            or config.compiler_opts()
+            or config.pre_hook is not None
         ):
-            raise ValueError("Architecture/CU count must match the actual device")
-        stream = torch.cuda.Stream(device=device)
-        with _full_fp32(torch), torch.no_grad(), torch.cuda.device(
-            device
-        ), torch.cuda.stream(stream):
-            session = _TuningSession(
-                torch,
-                pa,
-                shape,
-                device_info,
-                candidates,
-                rounds,
-                iterations,
-                warmup,
-                stream,
-            )
-            config = _resolve_config(shape, key["architecture"], key["num_cu"], session)
-            record.update(
-                status="PASS",
-                cache_hit=not bool(session.resources),
-                selection={"workgroup_budget": config.kwargs["workgroup_budget"]},
-            )
-    except Exception as exc:  # noqa: BLE001 - Preserve the failed search report.
-        record["status"] = (
-            "BASELINE_FAILED"
-            if isinstance(exc, _BaselineFailed)
-            else _error_status(torch, exc)
+            raise ValueError("Invalid PA workgroup budget in FlyDSL autotune cache")
+        if budget == 2 * num_cu:
+            return default_plan
+        return plan_pa_decode(
+            context_lengths,
+            key_cache.shape[1],
+            max_partitions=limit,
+            workgroup_budget=budget,
+            sliding_window=default_plan.sliding_window,
+            query_length=query_length,
         )
-        record["errors"].append(f"{type(exc).__name__}: {exc}")
-    finally:
-        if session is not None:
-            session.resources.clear()
-    return record
 
 
-def _list_arg(text, converter=int, *, unique=True):
-    try:
-        result = [converter(item.strip()) for item in text.split(",")]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(str(exc)) from exc
-    if not result or (unique and len(result) != len(set(result))):
-        raise argparse.ArgumentTypeError("Provide a nonempty list without duplicates")
-    return result
+def _positive_int(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
 
 
-def _load_gpu(args):
-    torch = importlib.import_module("torch")
-    if not torch.cuda.is_available() or not torch.version.hip:
-        raise RuntimeError("GPU tuning requires a supported ROCm PyTorch device")
-    torch.cuda.set_device(args.device)
-    props = torch.cuda.get_device_properties(args.device)
-    architecture, cu = props.gcnArchName.split(":")[0], props.multi_processor_count
-    if (args.architecture and args.architecture != architecture) or (
-        args.num_cu and args.num_cu != cu
-    ):
-        raise ValueError(
-            "Explicit architecture/CU count disagrees with the actual device"
-        )
-    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    pa = importlib.import_module("aiter.ops.flydsl.pa_decode")
-    return (
-        torch,
-        pa,
-        {
-            "architecture": architecture,
-            "num_cu": cu,
-            "device": args.device,
-        },
+def _parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Tune a FlyDSL PA decode shape and save its native configuration."
     )
+    parser.add_argument("-b", "--batch-size", type=_positive_int, default=1)
+    parser.add_argument("--num-query-heads", type=_positive_int, default=16)
+    parser.add_argument("--num-kv-heads", type=_positive_int, default=1)
+    parser.add_argument("--head-dim", type=_positive_int, default=128)
+    parser.add_argument("-q", "--query-length", type=_positive_int, default=1)
+    parser.add_argument(
+        "-s",
+        "--context-length",
+        type=_positive_int,
+        nargs="+",
+        default=[4096],
+        help="Lengths include query tokens; supply one for all rows or one per row.",
+    )
+    parser.add_argument("--block-size", type=int, choices=(16, 64, 128), default=128)
+    parser.add_argument("--kv-dtype", choices=("fp8", "bf16"), default="fp8")
+    parser.add_argument("--query-dtype", choices=("bf16", "fp16"), default="bf16")
+    parser.add_argument(
+        "--scale-mode",
+        choices=("per-tensor", "per-token", "none"),
+        help="Default: per-token for FP8; none for BF16.",
+    )
+    parser.add_argument("--trans-v", type=int, choices=(0, 1), default=1)
+    parser.add_argument("--sliding-window", type=int, default=0)
+    parser.add_argument(
+        "--sink-dtype", choices=("none", "bf16", "fp16", "fp32"), default="none"
+    )
+    parser.add_argument("--max-partitions", type=_positive_int)
+    parser.add_argument("--device", type=int, default=0, help="Visible GPU index.")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        help="Save to DIR/<arch>/_pa_decode_autotuner.json; overrides cache env vars.",
+    )
+    args = parser.parse_args(argv)
+    if args.batch_size > 4096:
+        parser.error("--batch-size must be at most 4096")
+    if args.num_query_heads % args.num_kv_heads:
+        parser.error("--num-query-heads must be divisible by --num-kv-heads")
+    if not 64 <= args.head_dim <= 1024 or args.head_dim % 64:
+        parser.error("--head-dim must be a multiple of 64 in [64, 1024]")
+    if args.kv_dtype == "fp8" and args.head_dim != 64 and args.head_dim % 128:
+        parser.error("FP8 --head-dim must be 64 or a multiple of 128")
+    if args.scale_mode is None:
+        args.scale_mode = "per-token" if args.kv_dtype == "fp8" else "none"
+    if args.kv_dtype == "bf16" and args.scale_mode != "none":
+        parser.error("BF16 KV requires --scale-mode none")
+    if len(args.context_length) == 1:
+        args.context_length *= args.batch_size
+    elif len(args.context_length) != args.batch_size:
+        parser.error("--context-length must contain one length or --batch-size lengths")
+    if any(
+        length < args.query_length or length >= 2**31 for length in args.context_length
+    ):
+        parser.error("context lengths must include all query tokens and fit in int32")
+    if args.sliding_window < -1:
+        parser.error("--sliding-window must be -1, 0 or positive")
+    if args.device < 0:
+        parser.error("--device must be nonnegative")
+    return args
+
+
+def _quantize_kv(tensor, dtype, scale_mode):
+    if scale_mode == "none":
+        return tensor.to(dtype), None
+    values = tensor.float()
+    maximum = torch.finfo(dtype).max
+    if scale_mode == "per-token":
+        scale = values.abs().amax(dim=-1, keepdim=True)
+    else:
+        scale = values.abs().amax().reshape(1)
+    scale = (scale / maximum).clamp_min(torch.finfo(torch.float32).tiny)
+    quantized = (values / scale).clamp(-maximum, maximum).to(dtype)
+    return quantized, scale.contiguous()
+
+
+def _make_tuning_inputs(args, device, kv_dtype):
+    """Construct the requested shape with logical, vectorized K/V layouts."""
+    torch.manual_seed(args.seed)
+    query_dtype = torch.bfloat16 if args.query_dtype == "bf16" else torch.float16
+    page, dim, heads = args.block_size, args.head_dim, args.num_kv_heads
+    max_length = max(args.context_length)
+    pages_per_seq = (max_length + page - 1) // page
+    pages = args.batch_size * pages_per_seq
+    query = torch.empty(
+        (args.batch_size * args.query_length, args.num_query_heads, dim),
+        dtype=query_dtype,
+        device=device,
+    ).uniform_(-0.5, 0.5)
+    key = torch.empty(
+        (pages, heads, page, dim), dtype=torch.bfloat16, device=device
+    ).uniform_(-0.5, 0.5)
+    value = torch.empty_like(key).uniform_(-0.5, 0.5)
+    key_scale = value_scale = None
+    if args.kv_dtype == "fp8":
+        key, key_scale = _quantize_kv(key, kv_dtype, args.scale_mode)
+        value, value_scale = _quantize_kv(value, kv_dtype, args.scale_mode)
+    vector = 8 if args.kv_dtype == "bf16" else 16
+    key_cache = (
+        key.reshape(pages, heads, page, dim // vector, vector)
+        .permute(0, 1, 3, 2, 4)
+        .contiguous()
+    )
+    value_cache = (
+        value.reshape(pages, heads, page // vector, vector, dim)
+        .permute(0, 1, 2, 4, 3)
+        .contiguous()
+        if args.trans_v
+        else value.permute(0, 1, 3, 2).contiguous()
+    )
+    context = torch.tensor(args.context_length, dtype=torch.int32, device=device)
+    table = torch.randperm(pages, dtype=torch.int32, device=device).reshape(
+        args.batch_size, pages_per_seq
+    )
+    sinks = None
+    if args.sink_dtype != "none":
+        dtype = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}[
+            args.sink_dtype
+        ]
+        sinks = torch.empty(args.num_query_heads, dtype=dtype, device=device).uniform_(
+            -2, 2
+        )
+    return (
+        query,
+        key_cache,
+        value_cache,
+        context,
+        table,
+        dim**-0.5,
+        args.query_length,
+    ), {
+        "compute_type": kv_dtype,
+        "key_scale": key_scale,
+        "value_scale": value_scale,
+        "sinks": sinks,
+        "sliding_window": args.sliding_window,
+        "max_partitions": args.max_partitions,
+        "max_context_length": max_length,
+    }
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--shape",
-        type=lambda s: _list_arg(s, unique=False),
-        required=True,
-        metavar="Hq,Hkv,D",
-        help="Device-local query heads, KV heads, and head dimension",
-    )
-    parser.add_argument(
-        "--query-strides",
-        type=lambda s: _list_arg(s, unique=False),
-        metavar="ROW,HEAD,DIM",
-        help="Strides of the actual 3D query tensor in elements; default: contiguous",
-    )
-    for name, default in (
-        ("batch-sizes", [1]),
-        ("context-lengths", [4096]),
-        ("query-lengths", [1]),
-        ("windows", [0]),
-        ("page-sizes", [128]),
+    args = _parse_args(argv)
+    if not torch.cuda.is_available():
+        raise RuntimeError("PA decode tuning requires a ROCm GPU")
+    if args.device >= torch.cuda.device_count():
+        raise ValueError(f"visible GPU index {args.device} is unavailable")
+    torch.cuda.set_device(args.device)
+    device = torch.device("cuda", args.device)
+    properties = torch.cuda.get_device_properties(device)
+    arch = get_gfx_runtime()
+    if arch not in ("gfx942", "gfx950", "gfx1250"):
+        raise RuntimeError(
+            f"PA decode tuning only supports gfx942/gfx950/gfx1250, got {arch}"
+        )
+    if args.kv_dtype == "bf16":
+        if arch == "gfx1250":
+            if args.head_dim != 64 and args.head_dim % 128:
+                raise ValueError(
+                    "gfx1250 BF16 head-dim must be 64 or a multiple of 128"
+                )
+        elif args.query_dtype != "bf16" or not args.trans_v:
+            raise ValueError("BF16 KV requires BF16 queries and --trans-v 1 on gfx9")
+    if (
+        args.max_partitions is not None
+        and args.max_partitions > properties.multi_processor_count
     ):
-        parser.add_argument("--" + name, type=_list_arg, default=default)
-    parser.add_argument(
-        "--dtypes", type=lambda s: _list_arg(s, str), default=["bfloat16"]
-    )
-    parser.add_argument(
-        "--quant-modes", type=lambda s: _list_arg(s, str), default=["per_token"]
-    )
-    parser.add_argument("--trans-v", choices=("yes", "no", "both"), default="yes")
-    parser.add_argument(
-        "--length-mode", choices=("uniform", "varlen"), default="uniform"
-    )
-    parser.add_argument(
-        "--lengths",
-        type=lambda s: _list_arg(s, unique=False),
-        metavar="L[,L...]",
-        help="Actual sample lengths; one value broadcasts to B, overriding length-mode",
-    )
-    parser.add_argument(
-        "--kv-pool-pages",
-        type=int,
-        help="Physical KV pool pages; default: enough distinct pages for the sample",
-    )
-    parser.add_argument("--seed", type=int, default=0)
-    budgets = parser.add_mutually_exclusive_group()
-    budgets.add_argument("--budgets", type=_list_arg)
-    budgets.add_argument("--budget-cu", type=lambda s: _list_arg(s, float))
-    parser.add_argument(
-        "--rounds",
-        type=int,
-        default=16,
-        help="Repeated graph measurements per candidate",
-    )
-    parser.add_argument(
-        "--iterations",
-        type=int,
-        default=100,
-        help="Decode+reducer calls in each captured graph",
-    )
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--device", type=int, default=0)
-    parser.add_argument("--architecture", choices=tuple(KV_DTYPES))
-    parser.add_argument("--num-cu", type=int)
-    parser.add_argument(
-        "--dry-run", action="store_true", help="Preview shapes and candidate budgets"
-    )
-    args = parser.parse_args(argv)
-    try:
-        if len(args.shape) != 3:
-            raise ValueError("--shape requires exactly Hq,Hkv,D")
-        hq, hkv, dim = args.shape
-        if any(mode not in ("per_token", "per_tensor") for mode in args.quant_modes):
-            raise ValueError("quant-modes must be per_token and/or per_tensor")
-        layouts = [True, False] if args.trans_v == "both" else [args.trans_v == "yes"]
-        shapes = [
-            make_shape(
-                b,
-                ctx,
-                ql,
-                num_query_heads=hq,
-                num_kv_heads=hkv,
-                head_dim=dim,
-                page_size=page,
-                dtype=dtype,
-                per_token=quant == "per_token",
-                trans_v=layout,
-                window=window,
-                length_mode=args.length_mode,
-                seed=args.seed,
-                query_strides=args.query_strides,
-                lengths=args.lengths,
-                kv_pool_pages=args.kv_pool_pages,
-            )
-            for b, ctx, ql, window, page, dtype, quant, layout in itertools.product(
-                args.batch_sizes,
-                args.context_lengths,
-                args.query_lengths,
-                args.windows,
-                args.page_sizes,
-                args.dtypes,
-                args.quant_modes,
-                layouts,
-            )
-        ]
-        for value, name, minimum in (
-            (args.rounds, "rounds", 1),
-            (args.iterations, "iterations", 1),
-            (args.warmup, "warmup", 0),
-        ):
-            positive_int(value, name, minimum)
-        positive_int(args.device, "device", 0)
-        if args.num_cu is not None:
-            positive_int(args.num_cu, "num_cu")
-        for budget in args.budgets or DEFAULT_BUDGETS:
-            positive_int(budget, "budget")
-        if args.dry_run:
-            if args.num_cu is None or args.architecture is None:
-                raise ValueError(
-                    "--dry-run requires explicit --architecture and --num-cu; it never probes a GPU"
-                )
-            info = {"architecture": args.architecture, "num_cu": args.num_cu}
-        else:
-            torch, pa, info = _load_gpu(args)
-        default_budgets = DEFAULT_BUDGETS
-        if info["architecture"] == "gfx1250":
-            # Streaming PA needs more independent tasks than the small-batch
-            # defaults; these remain offline candidates, not launch defaults.
-            default_budgets += (8192, 16384)
-        candidates = args.budgets or list(default_budgets)
-        if args.budget_cu is not None:
-            scaled = [x * info["num_cu"] for x in args.budget_cu]
-            if any(not _finite_positive(x) or not x.is_integer() for x in scaled):
-                raise ValueError(
-                    "CU-multiple budgets must produce positive integer workgroup counts"
-                )
-            candidates = [int(x) for x in scaled]
-        preview = []
-        for shape in shapes:
-            key = make_key(shape, info["architecture"], info["num_cu"])
-            preview.append(
-                (
-                    key,
-                    candidate_groups(
-                        candidates,
-                        shape["batch_size"],
-                        shape["num_kv_heads"],
-                        info["num_cu"],
-                    ),
-                )
-            )
-    except (OSError, ValueError, TypeError, RuntimeError, ImportError) as exc:
-        parser.error(str(exc))
-    if args.dry_run:
-        for index, ((key, groups), shape) in enumerate(zip(preview, shapes), 1):
-            print(
-                f"SHAPE {index}/{len(preview)} architecture={key['architecture']} num_cu={key['num_cu']}"
-            )
-            print("  " + " ".join(f"{k}={v}" for k, v in key["shape"].items()))
-            print(
-                f"  context_length={shape['context_length']} "
-                f"query_strides={shape['query_strides']}"
-            )
-            kv_bytes = (
-                2
-                * shape["kv_pool_pages"]
-                * shape["num_kv_heads"]
-                * shape["head_dim"]
-                * shape["page_size"]
-            )
-            required_pages = sum(
-                (n + shape["page_size"] - 1) // shape["page_size"]
-                for n in shape["lengths"]
-            )
-            print(
-                f"  lengths_min={min(shape['lengths'])} "
-                f"lengths_max={max(shape['lengths'])} "
-                f"total_tokens={sum(shape['lengths'])} "
-                f"required_pages={required_pages} "
-                f"kv_pool_pages={shape['kv_pool_pages']} kv_bytes={kv_bytes}"
-            )
-            for candidate in groups:
-                print(
-                    f"  budget={candidate['workgroup_budget']} capacity={candidate['capacity']} "
-                    f"aliases={candidate['budget_aliases']} baseline={candidate['is_baseline']}"
-                )
-        return 0
-
-    all_passed = True
-    for index, shape in enumerate(shapes, 1):
-        print(
-            f"TUNE {index}/{len(shapes)} B={shape['batch_size']} L={shape['context_length']} QL={shape['query_length']}",
-            flush=True,
+        raise ValueError(
+            f"--max-partitions must be at most {properties.multi_processor_count}"
         )
-        result = tune_shape(
-            torch,
-            pa,
-            shape,
-            info,
-            candidates,
-            rounds=args.rounds,
-            iterations=args.iterations,
-            warmup=args.warmup,
-        )
-        all_passed &= result["status"] == "PASS"
-        print(
-            f"RESULT {result['status']} cache_hit={result.get('cache_hit', False)} {result['selection']}",
-            flush=True,
-        )
-        for candidate in result["candidates"]:
-            for error in candidate["errors"]:
-                print(
-                    f"ERROR budget={candidate['workgroup_budget']}: {error}",
-                    file=sys.stderr,
-                )
-        for error in result["errors"]:
-            print(f"ERROR {error}", file=sys.stderr)
-        torch.cuda.empty_cache()
-    return 0 if all_passed else 1
+    kv_dtype = torch.bfloat16
+    if args.kv_dtype == "fp8":
+        kv_dtype = torch.float8_e4m3fnuz if arch == "gfx942" else torch.float8_e4m3fn
+    print(
+        f"Tuning {arch}: batch={args.batch_size}, Q heads={args.num_query_heads}, "
+        f"KV heads={args.num_kv_heads}, dim={args.head_dim}, "
+        f"query length={args.query_length}, max context={max(args.context_length)}, "
+        f"page={args.block_size}, KV={args.kv_dtype}"
+    )
+    arguments, options = _make_tuning_inputs(args, device, kv_dtype)
+    plan = prepare_pa_decode_plan(
+        *arguments, **options, tune=True, config_dir=args.output_dir
+    )
+    cache_file = _get_pa_decode_autotuner(arch, args.output_dir)._cache_file
+    print(f"Saved configuration to {cache_file}")
+    print(
+        f"Selected plan capacity={plan.capacity}, max partitions={plan.max_partitions}"
+    )
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

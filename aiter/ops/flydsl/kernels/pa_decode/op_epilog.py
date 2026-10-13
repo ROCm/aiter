@@ -76,7 +76,7 @@ class PaDecodeEpilogue:
             l_row = o_final[self.traits.l_slot(m)]
             safe_l = (l_row > self.ctx.ZERO_F).select(l_row, fx.Float32(1.0))
             inv_l = fx.Float32(rcp_f32(safe_l))
-            if const_expr(self.traits.per_token_kv):
+            if const_expr(self.traits.per_token_kv or self.traits.is_bf16_kv):
                 o_scale = inv_l
             else:
                 o_scale = inv_l * (self.ctx.v_scale_f * inv_fp8)

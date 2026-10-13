@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MHC config loading: ``get_mhc_config()`` / ``get_mhc_post_config()``,
-with the documented gfx942 arch fallback, on top of the shared core in
-``config_utils``.
+"""MHC config loading: ``get_mhc_config()`` / ``get_mhc_post_config()`` /
+``get_mhc_fused_post_pre_delayed_rmsnorm_config()``, with the documented gfx942 arch fallback,
+and the gfx1250 Gluon ``get_mhc_post_pre_gluon_gfx1250_config()`` (no fallback), on top
+of the shared core in ``config_utils``.
 """
 
 import functools
@@ -20,6 +21,7 @@ from aiter.ops.triton.utils.config_utils import (
     USE_LRU_CACHE,
     load_config_json,
     resolve_config_dir,
+    select_leq_config,
 )
 
 _FALLBACK_DEV = "gfx942"
@@ -173,6 +175,58 @@ def get_mhc_post_config(M: int, C: int) -> dict:
         return dict(cfg["default"])
 
     raise KeyError(f"No matching config for M={M}, C={C} in 'MHC_POST'")
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_mhc_fused_post_pre_delayed_rmsnorm_config(M: int) -> dict:
+    """Pick the mhc_fused_post_pre_delayed_rmsnorm launch config for ``M`` tokens from the
+    arch's ``mhc_fused_post_pre_delayed_rmsnorm`` ``DEFAULT.json`` (gfx942 fallback).
+
+    Picks the smallest ``M_LEQ_<x>`` with ``M <= x``, else ``"any"``. The shipped
+    tables are for DeepSeek-V4.1 (hidden size 5120); the kernel requires
+    ``NUM_KSPLIT * TILE_K`` to divide the hidden size.
+    """
+    dev = arch_info.get_arch()
+    cfg = _load_with_fallback(
+        dev, "MHC_FUSED_POST_PRE_DELAYED_RMSNORM", "DEFAULT.json", required=True
+    )
+
+    m_bounds = sorted(
+        int(k[6:]) for k in cfg if k.startswith("M_LEQ_") and k[6:].isdigit()
+    )
+    for m_bound in m_bounds:
+        if M <= m_bound:
+            return dict(cfg[f"M_LEQ_{m_bound}"])
+
+    if "any" in cfg:
+        return dict(cfg["any"])
+
+    raise KeyError(
+        f"No matching config for M={M} in 'MHC_FUSED_POST_PRE_DELAYED_RMSNORM'"
+    )
+
+
+@functools.lru_cache(maxsize=1024 if USE_LRU_CACHE else 0)
+def get_mhc_post_pre_gluon_gfx1250_config(M: int) -> dict:
+    """Pick the gfx1250 Gluon ``mhc_post_pre`` launch config for ``M`` tokens from
+    the arch's ``gluon/mhc/mhc_post_pre/DEFAULT.json``: the smallest
+    ``M_LEQ_<x>`` with ``M <= x``, else ``"any"``. Gluon tables are not borrowed
+    from another arch, so there is no gfx942 fallback.
+
+    Keys: ``SPLIT_BLOCK_M`` / ``SPLIT_NUM_WARPS`` (1, 2 or 4) / ``SPLIT_NUM_STAGES``
+    for the post + split-K GEMM/sqrsum kernel; ``SPLIT_MAX_CTAS_PER_CU``, its LDS
+    residency (workgroups per CU), caps the split-K count to one round (see
+    ``_mhc_post_pre_gluon_split_k``) and gates the deeper ``SPLIT_DEEP_NUM_STAGES``
+    ring (see ``_gluon_split_num_stages``); ``RA_NORM_NUM_WARPS`` (fused
+    RMSNorm) and ``RA_ROWS`` / ``RA_NUM_WARPS`` / ``RA_CTAS_PER_CU`` (without it)
+    for the pre reduce/apply kernel. The split-K count is not here: it follows
+    the HIP ``get_mhc_fused_post_pre_config`` policy, capped as above.
+
+    The returned dict is cached and shared -- read-only.
+    """
+    cfg_dir = resolve_config_dir("mhc", "MHC_POST_PRE", backend="gluon")
+    cfg = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    return select_leq_config(cfg, M, prefix="M_LEQ_")
 
 
 def hip_post_dispatch_block(C: int, arch_id: str) -> int | None:

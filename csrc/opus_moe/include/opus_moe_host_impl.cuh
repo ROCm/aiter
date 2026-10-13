@@ -223,14 +223,13 @@ int select_a8w4_kernel_id(int requested_kernel_id, int block_m)
 
 void check_a8w4_output_layout(const aiter_tensor_t& out,
                               int selected_kernel_id,
+                              bool route_out_fp8,
                               int token_num,
                               int actual_topk,
                               int model_dim)
 {
     const bool route_out_mode =
         opus_moe::stage2_a8w4_kid_uses_route_out(selected_kernel_id);
-    const bool route_out_fp8 =
-        opus_moe::stage2_a8w4_kid_route_fp8(selected_kernel_id);
     const int expected_output_rows = route_out_mode ? token_num * actual_topk : token_num;
     if(route_out_fp8)
     {
@@ -502,12 +501,22 @@ void opus_moe_stage2_a8w4_decode_fwd(
                 expected_scale_cols,
                 "]");
 
-    const bool route_out_fp8 =
+    // Route-output kernels contain both BF16 and MXFP8 epilogues. Infer the
+    // runtime path from the workspace dtype so callers can force the lossless
+    // BF16 path without changing the tuned kid, sort block size, or schedule.
+    const bool route_out_mode =
+        opus_moe::stage2_a8w4_kid_uses_route_out(selected_kernel_id);
+    const bool kid_route_out_fp8 =
         opus_moe::stage2_a8w4_kid_route_fp8(selected_kernel_id);
+    const bool route_out_fp8 = route_out_mode && out.dtype() == AITER_DTYPE_u8;
+    AITER_CHECK(!route_out_fp8 || kid_route_out_fp8,
+                "uint8 MXFP8 route-out is only valid for an MXFP8 route-output kid; got ",
+                opus_moe::stage2_a8w4_kid_name(selected_kernel_id));
     AITER_CHECK(!route_out_fp8 || model_dim % 8 == 0,
                 "MXFP8 route-out requires model_dim to be a multiple of 8, got ",
                 model_dim);
-    check_a8w4_output_layout(out, selected_kernel_id, token_num, actual_topk, model_dim);
+    check_a8w4_output_layout(
+        out, selected_kernel_id, route_out_fp8, token_num, actual_topk, model_dim);
     AITER_CHECK(out.stride(1) == 1,
                 "Opus A8W4 stage2 expects contiguous columns in out, got stride(1)=",
                 out.stride(1));

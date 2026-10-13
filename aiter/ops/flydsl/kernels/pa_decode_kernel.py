@@ -1,22 +1,24 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""Paged-attention tile kernel with FP8 and gfx1250 native BF16 compute.
+"""FP8 and BF16 paged-attention tile kernel.
 
-For FP8 compute, K/V use e4m3 (FNUZ on gfx942, OCP on gfx950/gfx1250);
-BF16/FP16 Q and probabilities P are quantized to FP8.
-Q/key scales fold into QK, value scale and 1/FP8_MAX into
+K/V use e4m3 (FNUZ on gfx942, OCP on gfx950); BF16/FP16 Q and probabilities P
+are quantized to FP8. Q/key scales fold into QK, value scale and 1/FP8_MAX into
 the epilogue; softmax max/sum stay f32. Tuned gfx950 BF16 per-token MTP3/MTP4
 uses K128 MFMA instead of K32, preserving normalized Q/P and operand layouts.
-Every Q row uses absmax normalization; per-tensor and per-token K/V scales
+Every FP8-path Q row uses absmax normalization; per-tensor and per-token K/V scales
 retain range normalization for P.
+BF16 K/V use vector-8 caches and native BF16 Q/K/P/V MFMA operands, with
+f32 softmax state and accumulation. BF16 KV does not use quantization scales.
 
 Logical layouts (not preshuffled):
 
 * ``query``        [num_seqs * query_length, num_q_heads, head_dim]  f16/bf16
-* ``key_cache``    [num_blocks, num_kv_heads, head_dim//16, block_size, 16]  fp8
-* ``value_cache``  [num_blocks, num_kv_heads, block_size//16, head_dim, 16] (trans_v)
-                   or [num_blocks, num_kv_heads, head_dim, block_size] (plain), by rank
+* ``key_cache``    [num_blocks, num_kv_heads, head_dim//x, block_size, x]
+* ``value_cache``  [num_blocks, num_kv_heads, block_size//x, head_dim, x] (trans_v)
+                   or [num_blocks, num_kv_heads, head_dim, block_size] (FP8 plain)
+                   where x=16 for FP8 and x=8 for BF16
 * ``block_tables`` [num_seqs, max_blocks_per_seq]  int32
 * ``work_info``    [capacity, 4]  int32 sequence/tile bounds/context length
 * ``pmax``, ``psum`` [num_kv_heads, capacity, query_length * query_group_size] f32
@@ -24,14 +26,8 @@ Logical layouts (not preshuffled):
                    same dtype as query; normalized partition output
 * K/V scales      [1] per-tensor or [num_blocks, num_kv_heads, block_size] per-token
 
-Four-wave CTAs process 256-token plan tiles: QK splits tokens, PV splits head
-dim, and P passes through LDS to transpose ownership between the MMAs.
-gfx1250 uses wave32 WMMA and 64-/128-token subtiles with async K/V LDS staging.
-FP8 per-token D128/D256 transposed page128 caches with one query tile and full
-attention use 128-token staging and PV WMMA to amortize page/scale loads.
-FP8 per-token scales with power-of-two D128+ use TDM; other cases use vector DMA.
-Native BF16 uses eight-element cache packing, unquantized Q/P, no K/V scales,
-and K32 WMMA with FP32 accumulation. BF16 TDM supports power-of-two D64–512.
+Four-wave CTAs process 256-token blocks: QK splits tokens, PV splits head dim,
+and P passes through LDS to transpose ownership between the MMAs.
 
 The ``pa_decode`` package separates schedule/layout traits, CTA context, Q/K/V
 and LDS movement, MFMA, softmax and output operations. ``PaDecodePipeline``
@@ -43,7 +39,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.compiler.kernel_function import CompilationContext
 from flydsl.expr import const_expr, gpu
-from flydsl.runtime.device import get_rocm_arch
+
+from aiter.jit.utils.chip_info import get_gfx_runtime
 
 from .pa_decode import implementation_cache_tag
 from .pa_decode.context import PaDecodeContext
@@ -86,6 +83,7 @@ def compile_pa_decode_tile(
     num_partitions: int = 1,
     softmax_scale: float | None = None,
     query_dtype: str = "f16",
+    kv_dtype: str = "fp8",
     per_token_kv: bool = False,
     query_length: int = 1,
     trans_v: bool = True,
@@ -94,13 +92,15 @@ def compile_pa_decode_tile(
     query_splits: int | None = None,
     max_context_length: int | None = None,
     sliding_window: int = 0,
-    compute_dtype: str = "fp8",
     direct_output: bool = False,
 ):
     """Select and cache a PA-decode kernel and launch wrapper.
 
     ``query_splits=None`` selects from host-known grid bounds; an explicit
     count overrides splitting and selects the matching prefetch policy.
+    BF16 also selects the smallest query-length divisor that fits 64 KiB LDS;
+    for example D512/MTP4/GQA16 splits twice and D1024/MTP3/GQA16 splits three
+    ways. Explicit BF16 splits must fit that limit as well.
     ``max_context_length`` bounds dense planned work for scheduling only; it does not
     change the launch capacity, scratch layout, or single-tile guarantee.
     CTAs receive equal groups of MTP positions, flattened with GQA into 16-row
@@ -115,12 +115,12 @@ def compile_pa_decode_tile(
     slot's byte span fits signed i32, retaining the dtype's 2-byte alignment.
 
     ``work_capacity`` is a positive host integer matching the work plan.
-    ``compute_dtype`` is ``fp8`` by default; ``bf16`` requires native BF16
-    K/V on gfx1250 and disables quantization scales.
     Positive ``sliding_window`` includes the query token.
     Plans cover the MTP window union; scores are masked per query row.
-    All tasks write packed partials; the reducer applies sinks once and writes
-    final output, including when the plan allows only one partition.
+    gfx1250 uses wave32 WMMA, native BF16 or OCP FP8, and its larger LDS budget.
+    A one-partition gfx1250 plan can write final output directly when sinks
+    are absent and query/output strides match. Other tasks write packed partials
+    for the shared reducer, which applies sinks once.
 
     Masked V bytes must remain finite because ``0 * NaN == NaN`` in PV MFMA.
     Pages past the sequence are pinned to block 0; callers must leave the
@@ -128,7 +128,7 @@ def compile_pa_decode_tile(
     offsets at 2 GiB; ``kv_buffer_u32`` proves both FP8 caches are below 4 GiB
     and permits unsigned buffer offsets instead of i64.
     """
-    architecture = (architecture or get_rocm_arch()).split(":")[0]
+    architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture == "gfx1250":
         from .pa_decode.gfx1250 import compile_gfx1250_pa_decode
 
@@ -139,7 +139,7 @@ def compile_pa_decode_tile(
             # per CTA. Other shapes retain fused queries and their KV reuse.
             query_splits = (
                 4
-                if compute_dtype == "bf16"
+                if kv_dtype == "bf16"
                 and head_dim == 1024
                 and query_group_size == 16
                 and query_length == 4
@@ -158,18 +158,15 @@ def compile_pa_decode_tile(
             query_length=query_length,
             trans_v=trans_v,
             sliding_window=sliding_window,
-            compute_dtype=compute_dtype,
+            compute_dtype=kv_dtype,
             direct_output=direct_output,
             query_splits=query_splits,
         )
+    if architecture not in ("gfx942", "gfx950"):
+        raise NotImplementedError(f"PA decode does not support {architecture}")
     if direct_output:
         raise NotImplementedError("direct_output requires gfx1250")
-    if compute_dtype != "fp8":
-        raise NotImplementedError(
-            f"{compute_dtype} PA decode is only supported on gfx1250"
-        )
     schedule = PaDecodeSchedule.select(
-        architecture=architecture,
         head_dim=head_dim,
         query_group_size=query_group_size,
         block_size=block_size,
@@ -179,6 +176,7 @@ def compile_pa_decode_tile(
         num_partitions=num_partitions,
         softmax_scale=softmax_scale,
         query_dtype=query_dtype,
+        kv_dtype=kv_dtype,
         per_token_kv=per_token_kv,
         query_length=query_length,
         trans_v=trans_v,

@@ -169,11 +169,9 @@ void TileGemmComputeImpl(ck_tile::QuantGemmHostArgs& args)
         ck_tile::BaseGemmPipelineAgBgCrCompV3<GemmPipelineProblem>,
         ck_tile::BaseWeightPreshufflePipelineAGmemBGmemCRegV2<GemmPipelineProblem>>;
 
-    // const ck_tile::index_t K_split =
-    //     (args.K + GemmConfig::K_Tile_v - 1) / GemmConfig::K_Tile_v * GemmConfig::K_Tile_v;
-    // const ck_tile::index_t num_loop    = TilePartitioner::GetLoopNum(K_split);
-    // const bool has_hot_loop            = BaseGemmPipeline::BlockHasHotloop(num_loop);
-    const ck_tile::index_t K_split  = ck_tile::integer_least_multiple(args.K, GemmConfig::K_Tile_v);
+    // Each split runs its own K range, so pick the pipeline from the per-split loop count.
+    const ck_tile::index_t k_grain  = args.k_batch * GemmConfig::K_Tile_v;
+    const ck_tile::index_t K_split  = (args.K + k_grain - 1) / k_grain * GemmConfig::K_Tile_v;
     const ck_tile::index_t num_loop = TilePartitioner::GetLoopNum(K_split);
     const bool has_hot_loop         = BaseGemmPipeline::BlockHasHotloop(num_loop);
     const ck_tile::TailNumber tail_num = BaseGemmPipeline::GetBlockLoopTailNum(num_loop);

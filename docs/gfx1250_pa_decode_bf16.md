@@ -70,10 +70,11 @@ partitioned plan. Other layouts retain fused queries. See the
 for measurements and selection limits.
 
 Build the plan before graph capture and supply scratch buffers during capture.
-Refresh the plan after changing lengths, as for FP8. The current
-`pa_decode_tuning` CLI/cache generates FP8 workloads; use the default plan budget
-or an explicitly measured `workgroup_budget` for BF16. Timing results below
-search budgets without changing production defaults or installing cache entries.
+Refresh the plan after changing lengths, as for FP8. Main's native FlyDSL
+`pa_decode_tuning` CLI now supports FP8 and BF16 on gfx1250. Use
+`prepare_pa_decode_plan` before graph capture, or supply an explicitly measured
+`workgroup_budget` to `plan_pa_decode`. Timing results below search budgets
+without changing production defaults or installing cache entries.
 
 The original validation on gfx1250 passed 163 GPU cases: 114 FP8 cases and 49
 native BF16 cases. BF16 coverage includes both query dtypes and V layouts,

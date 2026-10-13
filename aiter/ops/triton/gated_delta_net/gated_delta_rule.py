@@ -21,13 +21,13 @@ from collections.abc import Sequence
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.gated_delta_rule import (
+from aiter.ops.triton._triton_kernels.gated_delta_net import (
     _fused_recurrent_gated_delta_rule_fwd_kernel,
     chunk_gated_delta_rule_fwd,
     chunk_gated_delta_rule_fwd_opt,
     chunk_gated_delta_rule_fwd_opt_vk,
 )
-from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
     GatedDeltaRulePrefillMetadata,
     l2norm_fwd,
 )

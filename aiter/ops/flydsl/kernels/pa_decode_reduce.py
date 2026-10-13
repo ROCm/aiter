@@ -9,6 +9,8 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr.typing import T
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .tensor_shim import buf_base_i64, buf_copy_load, ptr_buf_tensor
 from .utils import rcp_f32, udiv_const, urem_const
 
@@ -67,7 +69,7 @@ def is_pa_decode_ps_reduce_supported(
 @lru_cache(maxsize=256)
 def compile_pa_decode_ps_reduce(
     *,
-    architecture: str = "gfx950",
+    architecture: str | None = None,
     max_context_partition_num: int,
     head_size: int,
     output_dtype_str: str,
@@ -121,15 +123,25 @@ def compile_pa_decode_ps_reduce(
     logits_dtype = _DTYPE_MAP[logits_dtype_str]
     sink_dtype = _DTYPE_MAP[sink_dtype_str]
 
+    architecture = (architecture or get_gfx_runtime()).split(":", 1)[0]
     if architecture not in ("gfx942", "gfx950", "gfx1250"):
         raise NotImplementedError(f"PA decode reducer does not support {architecture}")
     warp_size = 32 if architecture == "gfx1250" else 64
     log2e = 1.4426950408889634
-    # Statistics must reach every output lane, including lanes that own no
-    # partition. Subgroup reductions leave those lanes with -inf/zero.
+    reduce_width = (
+        1
+        if max_context_partition_num == 1
+        else 1 << ((max_context_partition_num - 1).bit_length())
+    )
+    # Wave32 statistics must reach every output lane, including lanes that own
+    # no partition. Subgroup reductions leave those lanes with -inf/zero.
+    if architecture == "gfx1250":
+        reduce_width = warp_size
     reduce_shuffle_offsets = [
-        offset for offset in (32, 16, 8, 4, 2, 1) if offset < warp_size
+        offset for offset in (32, 16, 8, 4, 2, 1) if offset < reduce_width
     ]
+    short4_offsets = reduce_shuffle_offsets if architecture == "gfx1250" else (2, 1)
+    short8_offsets = reduce_shuffle_offsets if architecture == "gfx1250" else (4, 2, 1)
 
     use_parallel_lds = (
         head_size == 128 and max_context_partition_num > warp_size and not compact_plan
@@ -584,9 +596,9 @@ def compile_pa_decode_ps_reduce(
             if fx.const_expr(max_context_partition_num > 8):
                 # Count is CTA-uniform; keep short-path loads and math inside it.
                 if c_part_num <= c_four:
-                    acc = _reduce_planned_wave(4, reduce_shuffle_offsets)
+                    acc = _reduce_planned_wave(4, short4_offsets)
                 elif c_part_num <= fx.Int32(8):
-                    acc = _reduce_planned_wave(8, reduce_shuffle_offsets)
+                    acc = _reduce_planned_wave(8, short8_offsets)
                 else:
                     acc = _reduce_planned_wave(
                         max_context_partition_num, reduce_shuffle_offsets
@@ -599,11 +611,11 @@ def compile_pa_decode_ps_reduce(
             acc = zero_f
             if fx.const_expr(compact_plan) and c_part_num <= fx.Int32(32):
                 if c_part_num <= c_four:
-                    acc = _reduce_planned_wave(4, reduce_shuffle_offsets)
+                    acc = _reduce_planned_wave(4, short4_offsets)
                 elif c_part_num <= fx.Int32(8):
-                    acc = _reduce_planned_wave(8, reduce_shuffle_offsets)
+                    acc = _reduce_planned_wave(8, short8_offsets)
                 else:
-                    acc = _reduce_planned_wave(32, reduce_shuffle_offsets)
+                    acc = _reduce_planned_wave(32, (16, 8, 4, 2, 1))
             else:
                 acc = _reduce_striped()
 

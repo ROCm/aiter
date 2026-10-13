@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""PA score masking, online softmax, and FP8 probability staging."""
+"""PA score masking, online softmax, and BF16/FP8 probability staging."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -342,7 +342,9 @@ class PaDecodeSoftmax:
         for a in range_constexpr(self.traits.NCHUNK):
             Pa = fx.Vector(fx.exp2(masked_chunks[a] - m_new_b, fastmath="fast"))
             ls = ls + Pa.reduce(ReductionOp.ADD)
-            if const_expr(self.traits.per_token_kv):
+            if const_expr(self.traits.is_bf16_kv):
+                p_scaled = Pa
+            elif const_expr(self.traits.per_token_kv):
                 v_sc = (
                     self.kv.load_scale(self.traits.sVScale_off, a, cur_kv_buf)
                     if const_expr(self.traits.M_TILES >= 4)
@@ -351,21 +353,28 @@ class PaDecodeSoftmax:
                 p_scaled = Pa * v_sc * norm_factor_b
             else:
                 p_scaled = Pa * fx.Vector.filled(4, self.traits.FP8_MAX, fx.Float32)
-            words.append(self.gemm.fp8_words(p_scaled)[0])
+            words.append(
+                p_scaled.to(fx.BFloat16)
+                if const_expr(self.traits.is_bf16_kv)
+                else self.gemm.fp8_words(p_scaled)[0]
+            )
 
         p_off0 = (
             p_base
             + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-            + self.ctx.warp * self.traits.TOK_PER_WARP
-            + self.ctx.rgroup * 4
+            + (self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4)
+            * self.traits.QP_ELEM_BYTES
         )
         # Scatter P words in the interleave expected by PV reads.
         for a in range_constexpr(self.traits.NCHUNK):
-            self.lds.store(
-                p_off0 + a * (MFMA_MNK // 4) * self.traits.f32,
-                fx.Int32,
-                fx.Vector.from_elements([words[a]], dtype=fx.Int32),
-            )
+            if const_expr(self.traits.is_bf16_kv):
+                self.lds.store(p_off0 + a * MFMA_MNK * 2, fx.BFloat16, words[a])
+            else:
+                self.lds.store(
+                    p_off0 + a * MFMA_MNK,
+                    fx.Int32,
+                    fx.Vector.from_elements([words[a]], dtype=fx.Int32),
+                )
         for sh in (16, 32):
             ls = ls + ls.shuffle_xor(sh, WAVE)
         # Empty history must contribute exp2(-inf-safe_max)=0;
@@ -430,7 +439,9 @@ class PaDecodeSoftmax:
                     zero4_p,
                 )
             ls = ls + Pa.reduce(ReductionOp.ADD)
-            if const_expr(self.traits.per_token_kv):
+            if const_expr(self.traits.is_bf16_kv):
+                p_scaled = Pa
+            elif const_expr(self.traits.per_token_kv):
                 v_scale_this = (
                     self.kv.load_scale(self.traits.sVScale_off, a, cur_kv_buf)
                     if const_expr(self.traits.head_dim == 64)
@@ -439,19 +450,26 @@ class PaDecodeSoftmax:
                 p_scaled = Pa * v_scale_this * norm_factor_b
             else:
                 p_scaled = Pa * fx.Vector.filled(4, self.traits.FP8_MAX, fx.Float32)
-            words.append(self.gemm.fp8_words(p_scaled)[0])
+            words.append(
+                p_scaled.to(fx.BFloat16)
+                if const_expr(self.traits.is_bf16_kv)
+                else self.gemm.fp8_words(p_scaled)[0]
+            )
         p_off0 = (
             self.traits.sP_off
             + self.ctx.lane16 * self.traits.SP_ROW_BYTES
-            + self.ctx.warp * self.traits.TOK_PER_WARP
-            + self.ctx.rgroup * 4
+            + (self.ctx.warp * self.traits.TOK_PER_WARP + self.ctx.rgroup * 4)
+            * self.traits.QP_ELEM_BYTES
         )
         for a in range_constexpr(self.traits.NCHUNK):
-            self.lds.store(
-                p_off0 + a * (MFMA_MNK // 4) * self.traits.f32,
-                fx.Int32,
-                fx.Vector.from_elements([words[a]], dtype=fx.Int32),
-            )
+            if const_expr(self.traits.is_bf16_kv):
+                self.lds.store(p_off0 + a * MFMA_MNK * 2, fx.BFloat16, words[a])
+            else:
+                self.lds.store(
+                    p_off0 + a * MFMA_MNK,
+                    fx.Int32,
+                    fx.Vector.from_elements([words[a]], dtype=fx.Int32),
+                )
         if const_expr(self.traits.head_dim == 64):
             fx.rocdl.sched_dswr(self.traits.NCHUNK)
         for sh in (16, 32):

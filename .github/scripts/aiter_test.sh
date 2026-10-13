@@ -36,12 +36,12 @@ fi
 
 skip_tests=(
     "op_tests/multigpu_tests/bench_mega_moe_v2.py"
+    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/test_wide_ep_moe.py"
     "op_tests/multigpu_tests/test_dispatch_combine.py"
     "op_tests/multigpu_tests/test_communication.py"
     "op_tests/multigpu_tests/test_mori_all2all.py"
     "op_tests/multigpu_tests/test_fused_ar_rms.py"
-    "op_tests/multigpu_tests/test_mega_moe_v2.py"
     "op_tests/multigpu_tests/triton_test/test_reduce_scatter_all_gather.py"
     "op_tests/multigpu_tests/triton_test/test_fused_rs_rmsnorm_quant_ag.py"
 )
@@ -102,7 +102,8 @@ for file in "${sharded_files[@]}"; do
                     fi
                     exec env MORI_SHMEM_HEAP_SIZE=40G \
                         torchrun --standalone --nproc_per_node=8 "$test_file" \
-                        --combine fused --layers 2 --acc_verify 1
+                        --combine fused --dispatch_backend flydsl \
+                        --stage1_fused 1 --layers 2 --acc_verify 1
                 '
                 _ "$file"
             )
@@ -117,6 +118,28 @@ for file in "${sharded_files[@]}"; do
                 --standalone
                 --nproc_per_node=8
                 "$file"
+            )
+            ;;
+        op_tests/multigpu_tests/test_mega_moe_tp.py)
+            {
+                echo "Running MegaMoE TP (MiniMax-M3, GLM-5) on 4 GPUs when supported"
+            } | tee -a latest_test.log
+            test_cmd=(
+                timeout 60m
+                bash -c '
+                    set -euo pipefail
+                    test_file=$1
+                    arch=$(python3 -c \
+                        "from aiter.jit.utils.chip_info import get_gfx; print(get_gfx())")
+                    ngpu=$(python3 -c "import torch; print(torch.cuda.device_count())")
+                    if [[ "$arch" != "gfx950" || "$ngpu" -lt 4 ]]; then
+                        echo "Skipping $test_file: requires 4 gfx950 GPUs, got $ngpu x $arch"
+                        exit 0
+                    fi
+                    exec torchrun --standalone --nproc_per_node=4 "$test_file" \
+                        --models m3 glm5 --tokens 256 512 1024 2048
+                '
+                _ "$file"
             )
             ;;
         op_tests/test_mla_persistent.py|op_tests/test_mla_persistent_round_robin.py)
@@ -142,6 +165,12 @@ for file in "${sharded_files[@]}"; do
                 '
                 _ "$file"
             )
+            ;;
+        op_tests/test_gemm_a6w4.py|op_tests/test_gemm_a4w6.py)
+            {
+                echo "Running tuned dispatch, independent Wan references, and every mixed ASM kernel on fully padded M/N/K tails"
+            } | tee -a latest_test.log
+            test_cmd=(timeout 60m python3 "$file")
             ;;
     esac
     # Capture start time (nanoseconds since epoch)

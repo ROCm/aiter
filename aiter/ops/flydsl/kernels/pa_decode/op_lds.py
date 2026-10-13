@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright (C) 2025-2026 FlyDSL Project Contributors
 
-"""LDS views, query quantization and paged K/V/scale loads."""
+"""LDS views, query staging and paged K/V/scale loads."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -73,7 +73,7 @@ class PaDecodeLds:
 
 
 class PaDecodeQueryLoader:
-    """Load Q early, normalize to FP8 and retain its MFMA operands."""
+    """Load Q early and stage native BF16 or normalized FP8 MFMA operands."""
 
     def __init__(self, ctx, lds, gemm):
         self.ctx = ctx
@@ -167,12 +167,25 @@ class PaDecodeQueryLoader:
             )
 
     @flyc.jit
+    def stage_row(self, m, q_row_off, q_units):
+        if const_expr(self.traits.is_bf16_kv):
+            for u in range_constexpr(self.traits.N_QLOADS):
+                elem_off = (
+                    self.ctx.qh_local * self.traits.head_dim
+                    + self.ctx.lane16 * self.traits.QCHUNK
+                    + u * self.traits.QLOAD_UNIT
+                )
+                self.lds.store(q_row_off + elem_off * 2, fx.BFloat16, q_units[u])
+        else:
+            self.quantize_row(m, q_row_off, q_units)
+
+    @flyc.jit
     def stage(self, q_units_prefetched):
         for m in range_constexpr(self.traits.M_TILES):
             flat_idx = m * MFMA_MNK + self.ctx.qh_local
             qi = flat_idx // self.traits.query_group_size
             gs_head = flat_idx - qi * self.traits.query_group_size
-            q_row_off = m * MFMA_MNK * self.traits.head_dim
+            q_row_off = m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
             # Only the final M-tile can need a runtime row guard.
             if const_expr((m + 1) * MFMA_MNK <= self.traits.CTA_ROWS):
                 q_units = (
@@ -180,38 +193,55 @@ class PaDecodeQueryLoader:
                     if const_expr(self.traits.MTP4_FUSED)
                     else self.load_row(qi, gs_head)
                 )
-                self.quantize_row(m, q_row_off, q_units)
+                self.stage_row(m, q_row_off, q_units)
             elif flat_idx < self.traits.CTA_ROWS:
-                self.quantize_row(m, q_row_off, self.load_row(qi, gs_head))
+                self.stage_row(m, q_row_off, self.load_row(qi, gs_head))
             else:
-                self.lds.store_words(
-                    q_row_off
-                    + self.ctx.qh_local * self.traits.head_dim
-                    + self.ctx.lane16 * self.traits.QCHUNK,
-                    fx.Vector.filled(self.traits.QCHUNK // 4, 0, fx.Int32),
-                )
-                if self.ctx.lane16 == 0:
-                    self.lds.store_scalar(
-                        self.traits.sQscale_off,
-                        self.ctx.qh_local * self.traits.M_TILES + m,
-                        self.ctx.ZERO_F,
+                if const_expr(self.traits.is_bf16_kv):
+                    for u in range_constexpr(self.traits.N_QLOADS):
+                        elem_off = (
+                            self.ctx.qh_local * self.traits.head_dim
+                            + self.ctx.lane16 * self.traits.QCHUNK
+                            + u * self.traits.QLOAD_UNIT
+                        )
+                        self.lds.store(
+                            q_row_off + elem_off * 2,
+                            fx.BFloat16,
+                            fx.Vector.filled(self.traits.QLOAD_UNIT, 0.0, fx.BFloat16),
+                        )
+                else:
+                    self.lds.store_words(
+                        q_row_off
+                        + self.ctx.qh_local * self.traits.head_dim
+                        + self.ctx.lane16 * self.traits.QCHUNK,
+                        fx.Vector.filled(self.traits.QCHUNK // 4, 0, fx.Int32),
                     )
+                    if self.ctx.lane16 == 0:
+                        self.lds.store_scalar(
+                            self.traits.sQscale_off,
+                            self.ctx.qh_local * self.traits.M_TILES + m,
+                            self.ctx.ZERO_F,
+                        )
 
     def load_operands(self):
         # Match the head-dim permutation of PaDecodeKVLoader.load_k_chunk.
         q_ops_all = []
         for m in range_constexpr(self.traits.M_TILES):
-            q_row_off = m * MFMA_MNK * self.traits.head_dim
+            q_row_off = m * MFMA_MNK * self.traits.head_dim * self.traits.QP_ELEM_BYTES
             for qkhe in range_constexpr(self.traits.QKHE_LOOP):
                 he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
                 chunk = self.lds.load(
                     q_row_off
-                    + self.ctx.lane16 * self.traits.head_dim
-                    + he_idx * self.traits.QK_CHUNK_ELEMS,
+                    + (
+                        self.ctx.lane16 * self.traits.head_dim
+                        + he_idx * self.traits.QK_CHUNK_ELEMS
+                    )
+                    * self.traits.QP_ELEM_BYTES,
                     fx.Int64,
-                    2,
+                    4 if self.traits.is_bf16_kv else 2,
                 )
-                q_ops_all.extend([chunk[0], chunk[1]])
+                for qkr in range_constexpr(4 if self.traits.is_bf16_kv else 2):
+                    q_ops_all.append(chunk[qkr])
         return q_ops_all
 
 
@@ -254,11 +284,17 @@ class PaDecodeKVLoader:
         return _load
 
     def init_loaders(self):
-        self._k_load_fp8x16 = self._make_raw_flat_loader(
-            self.ctx.key_cache_ptr, self.traits.FP8, 16, self.traits.KV_EXTENT
+        self._k_load_vector = self._make_raw_flat_loader(
+            self.ctx.key_cache_ptr,
+            self.traits.KV_DTYPE,
+            self.traits.KV_VECTOR_WIDTH,
+            self.traits.KV_EXTENT,
         )
-        self._v_load_fp8x16 = self._make_raw_flat_loader(
-            self.ctx.value_cache_ptr, self.traits.FP8, 16, self.traits.KV_EXTENT
+        self._v_load_vector = self._make_raw_flat_loader(
+            self.ctx.value_cache_ptr,
+            self.traits.KV_DTYPE,
+            self.traits.KV_VECTOR_WIDTH,
+            self.traits.KV_EXTENT,
         )
 
     def kv_address(self, phys, page_elems, rest):
@@ -269,11 +305,11 @@ class PaDecodeKVLoader:
             return fx.Int64(phys) * fx.Int64(page_elems) + fx.Int64(rest)
         return phys * page_elems + rest
 
-    def load_k_vector(self, byte_off):
-        return self._k_load_fp8x16(byte_off).bitcast(fx.Int64)
+    def load_k_vector(self, elem_off):
+        return self._k_load_vector(elem_off).bitcast(fx.Int64)
 
-    def load_v_vector(self, byte_off):
-        return self._v_load_fp8x16(byte_off).bitcast(fx.Int64)
+    def load_v_vector(self, elem_off):
+        return self._v_load_vector(elem_off).bitcast(fx.Int64)
 
     def init_page_table(self):
         # A partial compute tile may read past block_tables; bounded loads
@@ -289,7 +325,7 @@ class PaDecodeKVLoader:
             unit_stride=1,
             num_records_bytes=bt_num_records_bytes,
         )
-        if const_expr(not self.traits.per_token_kv):
+        if const_expr(not self.traits.per_token_kv and not self.traits.is_bf16_kv):
             key_scale_buf = ptr_buf_tensor(self.ctx.key_scale_ptr, fx.Float32)
             value_scale_buf = ptr_buf_tensor(self.ctx.value_scale_ptr, fx.Float32)
             self.key_scale = fx.Float32(key_scale_buf[0])
@@ -476,28 +512,42 @@ class PaDecodeKVLoader:
         ops = []
         for qkhe in range_constexpr(self.traits.QKHE_LOOP):
             he_idx = qkhe * self.traits.RGROUP_QUARTERS + self.ctx.rgroup
-            base = self.kv_address(
-                phys,
-                self.ctx.n_kv
-                * (
-                    self.traits.QCHUNK
-                    * self.traits.block_size
-                    * self.traits.QK_CHUNK_ELEMS
-                ),
-                (
-                    (self.ctx.kv_h * self.traits.QCHUNK + he_idx)
-                    * self.traits.block_size
-                    + within_page_tok
+            if const_expr(self.traits.is_bf16_kv):
+                for qkr in range_constexpr(2):
+                    he8_idx = he_idx * 2 + qkr
+                    base = self.kv_address(
+                        phys,
+                        self.ctx.n_kv * self.traits.head_dim * self.traits.block_size,
+                        (
+                            (self.ctx.kv_h * (self.traits.head_dim // 8) + he8_idx)
+                            * self.traits.block_size
+                            + within_page_tok
+                        )
+                        * 8,
+                    )
+                    w = self.load_k_vector(base)
+                    ops.extend([w[0], w[1]])
+            else:
+                base = self.kv_address(
+                    phys,
+                    self.ctx.n_kv
+                    * (
+                        self.traits.QCHUNK
+                        * self.traits.block_size
+                        * self.traits.QK_CHUNK_ELEMS
+                    ),
+                    (
+                        (self.ctx.kv_h * self.traits.QCHUNK + he_idx)
+                        * self.traits.block_size
+                        + within_page_tok
+                    )
+                    * self.traits.QK_CHUNK_ELEMS,
                 )
-                * self.traits.QK_CHUNK_ELEMS,
-            )
-            w = self.load_k_vector(
-                base
-            )  # head[he_idx*16 : +16] -> two K32 operand packs
+                w = self.load_k_vector(base)
+                ops.extend([w[0], w[1]])
             if const_expr(self.traits.block_size == 16):
                 # Overlap page16 gathers.
                 fx.rocdl.sched_barrier(fx.rocdl.mask_vmem_rd)
-            ops.extend([w[0], w[1]])
         return ops  # N_SUBCHUNKS i64 operands
 
     def load_k_from_pages(self, phys_vec):
@@ -536,18 +586,22 @@ class PaDecodeKVLoader:
                 page_step = (
                     (self.ctx.rgroup * self.traits.TOK_PER_WARP)
                     % self.traits.block_size
-                ) // 16 + step
+                ) // self.traits.KV_VECTOR_WIDTH + step
                 if const_expr(self.traits.trans_v):
                     base = self.kv_address(
                         phys_row[sub],
                         self.ctx.n_kv
-                        * (self.traits.STEPS_PER_PAGE * self.traits.head_dim * 16),
+                        * (
+                            self.traits.STEPS_PER_PAGE
+                            * self.traits.head_dim
+                            * self.traits.KV_VECTOR_WIDTH
+                        ),
                         (
                             (self.ctx.kv_h * self.traits.STEPS_PER_PAGE + page_step)
                             * self.traits.head_dim
                             + head_element
                         )
-                        * 16,
+                        * self.traits.KV_VECTOR_WIDTH,
                     )
                 else:
                     base = self.kv_address(

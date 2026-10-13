@@ -36,6 +36,8 @@ _SUPPORTED_TOK_DTYPES = (
 )
 
 _SUPPORTED_QUANT_TYPES = ("none", "fp8_direct_cast")
+# "fp8_blockwise_1x32" is what the gfx1250 path calls combine_quant="mxfp8"
+# (mega_moe_gfx1250/mega_moe.py).
 _SUPPORTED_STAGE2_P2P_QUANT_TYPES = ("none", "fp8_blockwise_1x32")
 
 _MAX_INTRANODE_NPES = 8
@@ -1248,7 +1250,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         return cur_tok
 
     def _run_combine_kernel(
-        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream
+        self, cache, key, fn, inp_ptr, wts_ptr, prx_ptr, cur_tok, stream, tok_map=None
     ):
         """Compile once and reuse the cached combine launcher."""
         fixed = (
@@ -1256,7 +1258,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             self._fx_comb_out,
             self._fx_xdb_mem,
             self._fx_xdev_flag,
-            self._fx_tok_map,
+            self._fx_tok_map if tok_map is None else tok_map,
             self._fx_comb_bar,
             self._fx_trecv,
             self._fx_out_shmem_tok_id_to_src,
@@ -1323,6 +1325,12 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 f"Supported: {_SUPPORTED_STAGE2_P2P_QUANT_TYPES}"
             )
         blockwise_fp8 = skip_stage1 and p2p_quant == "fp8_blockwise_1x32"
+        # Fused-upstream combine: top-k ids mask never-dispatched (-1) slots.
+        mask_topk_ids = skip_stage1 and indices is not None and not cfg.zero_copy
+        if mask_topk_ids and (
+            indices.dtype != torch.int32 or not indices.is_contiguous()
+        ):
+            raise ValueError("combine_no_stage1 indices must be contiguous int32")
         if skip_stage1:
             # placeholder input: pre-cast to fp8 so the kernel dtype + out view match.
             if fp8_dc and input.dtype != torch.float8_e4m3fn:
@@ -1383,6 +1391,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             bn,
             wpb,
             bool(skip_stage1),
+            bool(mask_topk_ids),
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1403,6 +1412,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 blockwise_fp8_transport=bool(blockwise_fp8),
                 # Must match dispatch's encoding stride so tok_map decode lines up.
                 max_recv=self._effective_max_recv,
+                mask_topk_ids=bool(mask_topk_ids),
             )
             self._comb_jit_cache[key] = fn
         self._run_combine_kernel(
@@ -1414,6 +1424,8 @@ class FlyDSLDispatchCombineIntraNodeOp:
             prx_ptr,
             _cur_tok,
             stream,
+            # Masking reads the caller's top-k ids in place of the dispatch tok_map.
+            tok_map=fx.Int64(indices.data_ptr()) if mask_topk_ids else None,
         )
 
         mt = cfg.max_num_inp_token_per_rank
@@ -1460,7 +1472,11 @@ class FlyDSLDispatchCombineIntraNodeOp:
         enable_weights: bool = True,
         stage2_p2p_quant=None,
     ):
-        """Run combine after fused GEMM2 has populated the P2P input."""
+        """Run combine after fused GEMM2 has populated the P2P input.
+
+        ``indices``: optional int32 [cur_tok, topk] top-k ids; slots with id -1
+        (never dispatched) are skipped instead of summing a stale partial.
+        """
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
             raise NotImplementedError(
                 "combine_no_stage1 is reserved for the fused GEMM2+combine "
@@ -1486,6 +1502,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
         cur_tok,
         enable_weights: bool = False,
         stage2_p2p_quant=None,
+        mask_topk_ids: bool = False,
     ):
         """Compile and load one fused-Stage2 combine geometry without launching it."""
         if not type(self)._ENABLE_COMBINE_NO_STAGE1:
@@ -1523,6 +1540,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
             block_num,
             warp_num,
             True,
+            bool(mask_topk_ids),
         )
         fn = self._comb_jit_cache.get(key)
         if fn is None:
@@ -1542,6 +1560,7 @@ class FlyDSLDispatchCombineIntraNodeOp:
                 fp8_direct_cast=bool(fp8_dc),
                 blockwise_fp8_transport=bool(blockwise_fp8),
                 max_recv=self._effective_max_recv,
+                mask_topk_ids=bool(mask_topk_ids),
             )
             self._comb_jit_cache[key] = fn
         fixed = (

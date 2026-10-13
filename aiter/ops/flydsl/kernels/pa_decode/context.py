@@ -106,7 +106,7 @@ class PaDecodeContext:
         self.part_end = self.planned_end
 
     def init_scales(self, key_scale, value_scale):
-        if const_expr(self.traits.per_token_kv):
+        if const_expr(self.traits.per_token_kv or self.traits.is_bf16_kv):
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E)
         else:
             self.scale_qk = fx.Float32(self.traits.softmax_scale * LOG2E) * fx.Float32(

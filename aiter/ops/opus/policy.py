@@ -28,7 +28,7 @@ from csrc.opus_gemm.opus_gemm_common import (
 
 from ...jit.core import AITER_CONFIGS, AITER_LOG_TUNED_CONFIG
 from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
-from ..gemm_op_common import get_padded_m
+from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
     A16W16LaunchPlan,
@@ -612,6 +612,7 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
     missing = required.difference(df.columns)
     if missing:
         raise ValueError(f"MXFP8 BMM tuned CSV is missing columns {sorted(missing)}")
+    df = with_mxscale_w_scale_block(df, path)
 
     if libtype is not None and "libtype" in df.columns:
         df = df[df["libtype"] == libtype].copy()
@@ -667,7 +668,7 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         )
         df = df.loc[~invalid_opus_rows].copy()
 
-    shape_keys = ["gfx", "b", "m", "n", "k"]
+    shape_keys = ["gfx", "b", "m", "n", "k", "w_scale_block"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
         rows = df.loc[duplicate_shapes, shape_keys].drop_duplicates().to_dict("records")
@@ -682,25 +683,28 @@ def lookup_mxscale_bmm_config(
     n: int,
     k: int,
     *,
+    w_scale_block: str = "128x128",
     libtype: str | None = None,
 ):
-    """Return the exact or existing padded-M tuned row for one shape."""
+    """Return the exact or existing padded-M tuned row for one shape and
+    weight-scale block (OPUS kernels read 128x128)."""
     gfx = get_gfx()
     tuned = _load_mxscale_bmm_tuned(libtype)
     row, padded_m = None, m
     for gl in (None, 0, 1):
         padded_m = m if gl is None else get_padded_m(m, n, k, gl)
-        row = tuned.get((gfx, b, padded_m, n, k))
+        row = tuned.get((gfx, b, padded_m, n, k, w_scale_block))
         if row is not None:
             break
 
     if row is None:
         logger.info(
-            "shape B:%s M:%s N:%s K:%s has no MXFP8 BMM tuned row",
+            "shape B:%s M:%s N:%s K:%s w_scale %s has no MXFP8 BMM tuned row",
             b,
             m,
             n,
             k,
+            w_scale_block,
         )
         return None
     if AITER_LOG_TUNED_CONFIG:

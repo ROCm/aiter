@@ -264,7 +264,7 @@ def test_bf16_reject_scales(device):
 
     q, _k, _v, kc, vc, table, lengths = _inputs(device, 128, cache_dtype=torch.bfloat16)
     plan = plan_pa_decode(lengths, 1, max_partitions=1)
-    with pytest.raises(ValueError, match="does not use key_scale"):
+    with pytest.raises(ValueError, match="BF16 KV is unscaled"):
         pa_decode(
             torch.empty_like(q),
             q,
