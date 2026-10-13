@@ -16,6 +16,7 @@ from .conv3d_gfx950_utils import (
     OOB_SENTINEL_BYTES,
     OOB_SENTINEL_ELEM,
     TileConfig,
+    b_park_elems,
     dil,
     flat_buffer_view,
     gather_valid,
@@ -160,12 +161,8 @@ def make_im2col_plan(param, geom, cfg):
     # The KW B tiles per stage can push LDS past what keeps the default path's
     # blocks resident (128x192: 80 KB -> 96 KB, two blocks per CU -> one), and
     # measured on the VAE layers that loses more than the cut L2 traffic buys.
-    reuse_lds = (
-        KW_REUSE_STAGES
-        * BF16_BYTES
-        * (strip_ldg * cfg.block_threads * LDG_VEC + kw * cfg.tile_n * tile_k)
-    )
-    base_lds = BF16_BYTES * (cfg.lds_a_elems + cfg.lds_b_elems)
+    reuse_lds = _reuse_lds_bytes(cfg, strip_ldg, kw)
+    base_lds = _base_lds_bytes(cfg)
     keeps_occupancy = LDS_BYTES_PER_CU // reuse_lds >= LDS_BYTES_PER_CU // base_lds
     kw_reuse = kw_layer_ok and keeps_occupancy and not big_in and wo >= tile_m
 
@@ -220,6 +217,23 @@ def make_im2col_plan(param, geom, cfg):
 def strip_elems(plan):
     """Elements of one LDS strip stage, padded to whole DMA rounds."""
     return plan.strip_ldg * plan.cfg.block_threads * LDG_VEC
+
+
+def _base_lds_bytes(cfg):
+    return BF16_BYTES * (cfg.lds_a_elems + cfg.lds_b_elems + b_park_elems(cfg))
+
+
+def _reuse_lds_bytes(cfg, strip_ldg, kw):
+    strip = strip_ldg * cfg.block_threads * LDG_VEC
+    stage = strip + kw * cfg.tile_n * cfg.tile_k
+    return BF16_BYTES * (KW_REUSE_STAGES * stage + b_park_elems(cfg))
+
+
+def plan_lds_bytes(plan):
+    """LDS one block allocates under this plan (what make_shared_storage lays out)."""
+    if plan.kw_reuse:
+        return _reuse_lds_bytes(plan.cfg, plan.strip_ldg, plan.kw)
+    return _base_lds_bytes(plan.cfg)
 
 
 class StripGather:

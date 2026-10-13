@@ -202,8 +202,10 @@ def validate_launch_config(tile_m, tile_n, wave_m, wave_n):
     block_vecs = LDG_VEC * block_threads
     if (tile_m * TILE_K) % block_vecs:
         return f"A tile {tile_m}x{TILE_K} not a multiple of {block_vecs} vecs"
-    if (tile_n * TILE_K) % block_vecs:
-        return f"B tile {tile_n}x{TILE_K} not a multiple of {block_vecs} vecs"
+    # B's last DMA round may be partial: the waves past its end are parked
+    # (WeightLoader.stage), which needs the round to end on a wave boundary.
+    if (tile_n * TILE_K // LDG_VEC) % WARP_SIZE:
+        return f"B tile {tile_n}x{TILE_K} not a whole number of waves of vecs"
     return None
 
 
@@ -229,9 +231,11 @@ class TileConfig(NamedTuple):
     mi_m: int
     mi_n: int
 
-    # Vectors one block loads per K tile, per operand.
+    # DMA rounds one block issues per K tile, per operand.
     ldg_a_count: int
     ldg_b_count: int
+    # Threads that carry B in its last round when that round is partial, else 0.
+    b_tail_threads: int
 
     # LDS stages, and the elements each operand's staging buffer holds.
     pipe_stages: int
@@ -247,6 +251,7 @@ def make_tile_config(tile):
 
     block_threads = wave_m * wave_n * WARP_SIZE
     block_vecs = LDG_VEC * block_threads
+    b_vecs = tile_n * TILE_K // LDG_VEC
     pipe_stages = 2 * TILES_PER_BARRIER
     return TileConfig(
         tile_m=tile_m,
@@ -258,7 +263,8 @@ def make_tile_config(tile):
         mi_m=tile_m // wave_m // MFMA_M,
         mi_n=tile_n // wave_n // MFMA_N,
         ldg_a_count=tile_m * TILE_K // block_vecs,
-        ldg_b_count=tile_n * TILE_K // block_vecs,
+        ldg_b_count=-(-b_vecs // block_threads),
+        b_tail_threads=b_vecs % block_threads,
         pipe_stages=pipe_stages,
         lds_a_elems=pipe_stages * tile_m * TILE_K,
         lds_b_elems=pipe_stages * tile_n * TILE_K,
@@ -314,17 +320,37 @@ class WeightLoader:
                 g_off = in_group.select(g_off, fx.Int32(OOB_SENTINEL_ELEM))
             yield i, self._src, g_off
 
+    def stage(self, stager, lds, stage_tile, k_base):
+        """DMA the K tile at ``k_base`` into B's LDS stage at ``stage_tile``."""
+        cfg = self._cfg
+        for i, src, voff in self.taps(k_base):
+            if const_expr(cfg.b_tail_threads and i == cfg.ldg_b_count - 1):
+                # Waves past the end of a partial last round still issue the
+                # DMA (no branch), reading nothing and landing in the park.
+                live = self._tid < cfg.b_tail_threads
+                voff = live.select(voff, fx.Int32(OOB_SENTINEL_ELEM))
+                dst = stager.dst(lds.b, stage_tile, i, park=(live, lds.b_park))
+            else:
+                dst = stager.dst(lds.b, stage_tile, i)
+            stager.copy(src, dst, voff)
+
 
 # ---------------------------------------------------------------------------
 # LDS staging: the DMA that fills a stage, and the MMA that reads it back
 # ---------------------------------------------------------------------------
 
 
+def b_park_elems(cfg):
+    """LDS the parked waves of a partial last B round write to: one wave's DMA."""
+    return WARP_SIZE * LDG_VEC if cfg.b_tail_threads else 0
+
+
 def make_shared_storage(elem_ty, cfg, strip_stage_elems=0, kw=0):
     """The LDS struct one block allocates.
 
     Default: ``pipe_stages`` tiles of A and of B. kW reuse: two strip stages
-    for A and, per stage, the ``kw`` B tiles that strip feeds.
+    for A and, per stage, the ``kw`` B tiles that strip feeds. Plus the B park
+    when B's last DMA round is partial.
     """
     if strip_stage_elems:
         a_elems = KW_REUSE_STAGES * strip_stage_elems
@@ -332,10 +358,20 @@ def make_shared_storage(elem_ty, cfg, strip_stage_elems=0, kw=0):
     else:
         a_elems, b_elems = cfg.lds_a_elems, cfg.lds_b_elems
 
-    @fx.struct
-    class SharedStorage:
-        a: fx.Array[elem_ty, a_elems, 16]
-        b: fx.Array[elem_ty, b_elems, 16]
+    if b_park_elems(cfg):
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[elem_ty, a_elems, 16]
+            b: fx.Array[elem_ty, b_elems, 16]
+            b_park: fx.Array[elem_ty, b_park_elems(cfg), 16]
+
+    else:
+
+        @fx.struct
+        class SharedStorage:
+            a: fx.Array[elem_ty, a_elems, 16]
+            b: fx.Array[elem_ty, b_elems, 16]
 
     return SharedStorage
 
@@ -357,8 +393,12 @@ class LdsStager:
         )
         self._atom = fx.make_copy_atom(fx.rocdl.BufferCopyLDS128b(), dma_bytes * 8)
 
-    def dst(self, lds_array, stage_tile, i):
-        """The LDS address vector ``i`` of this stage writes to."""
+    def dst(self, lds_array, stage_tile, i, park=None):
+        """The LDS address vector ``i`` of this stage writes to.
+
+        ``park``: ``(live, array)``; a wave that is not ``live`` (wave-uniform)
+        writes to the start of ``array`` instead.
+        """
         # buffer_load_lds takes one wave-uniform LDS base and fans the wave's
         # lanes out from it, so the lane-0 address is the base the whole wave
         # writes from.
@@ -367,6 +407,9 @@ class LdsStager:
         ) * fx.Int64(LDG_VEC)
         base_bytes = off_elems * fx.Int64(BF16_BYTES)
         addr = fx.Int64(fx.ptrtoint(lds_array.ptr)) + fx.Int64(base_bytes)
+        if const_expr(park is not None):
+            live, park_array = park
+            addr = live.select(addr, fx.Int64(fx.ptrtoint(park_array.ptr)))
         return fx.make_view(
             fx.inttoptr(self._lds_ptr_ty, sgpr(addr)), fx.make_layout(1, 1)
         )
@@ -883,6 +926,30 @@ class BlockCoords(NamedTuple):
     k_off: object
 
 
+# gfx950 parts deal a dispatch's workgroups round-robin over this many XCDs,
+# each behind its own L2.
+NUM_XCDS = 8
+
+
+def _xcd_contiguous(pid, total):
+    """Renumber dispatch-order block ``pid`` of ``total`` so each XCD runs a contiguous range.
+
+    Round-robin dealing puts consecutive M tiles, which share input rows, in
+    different L2s that each fetch those rows again; renumbered, neighbouring
+    tiles run on one XCD at about the same time. Under split-K this holds for
+    the first split's slice; the others are only permuted. Int32 in and out:
+    64-bit block coordinates cost VGPRs downstream, enough to drop a tile at
+    the 256-VGPR edge to one wave per SIMD.
+    """
+    per = (total + (NUM_XCDS - 1)) // NUM_XCDS
+    # XCDs that receive `per` blocks; the rest receive per - 1.
+    tall = total - (per - 1) * NUM_XCDS
+    xcd = pid % NUM_XCDS
+    local = pid // NUM_XCDS
+    short = tall * per + (xcd - tall) * (per - 1) + local
+    return (xcd < tall).select(xcd * per + local, short)
+
+
 def block_coords(grid, grid_m=None):
     """Decode this block's tile. Pass runtime ``grid_m`` on the dyn_hw path."""
     if const_expr(grid_m is None):
@@ -894,8 +961,12 @@ def block_coords(grid, grid_m=None):
         ) * grid.tile_m
         n_tile = fx.Int32(gpu.block_id("y"))
     elif const_expr(grid.wgm > 1):
-        pid = fx.Int64(gpu.block_id("x")) + fx.Int64(gpu.block_id("y")) * fx.Int64(
-            grid_m
+        pid = fx.Int64(
+            _xcd_contiguous(
+                fx.Int32(gpu.block_id("x"))
+                + fx.Int32(gpu.block_id("y")) * fx.Int32(grid_m),
+                fx.Int32(grid_m) * grid.grid_y,
+            )
         )
         blocks_per_swizzle = fx.Int64(grid.wgm * grid.grid_y)
         swizzle_id = pid // blocks_per_swizzle
@@ -905,9 +976,20 @@ def block_coords(grid, grid_m=None):
         local = pid % blocks_per_swizzle
         m_offset = (first_m + (local % swizzle_rows)) * grid.tile_m
         n_tile = local // swizzle_rows
+    elif const_expr(grid.grid_y == 1):
+        m_offset = _xcd_contiguous(fx.Int32(gpu.block_id("x")), fx.Int32(grid_m))
+        m_offset = m_offset * grid.tile_m
+        n_tile = fx.Int32(0)
     else:
-        m_offset = fx.Int32(gpu.block_id("x")) * grid.tile_m
-        n_tile = fx.Int32(gpu.block_id("y"))
+        pid = _xcd_contiguous(
+            fx.Int32(gpu.block_id("x"))
+            + fx.Int32(gpu.block_id("y")) * fx.Int32(grid_m),
+            fx.Int32(grid_m) * grid.grid_y,
+        )
+        # N fastest: an M tile's N tiles run back to back on one XCD, sharing
+        # its A in that L2.
+        m_offset = (pid // grid.grid_y) * grid.tile_m
+        n_tile = pid % grid.grid_y
 
     if const_expr(grid.groups > 1):
         gi = n_tile // grid.tiles_per_group

@@ -39,11 +39,20 @@ from aiter.ops.flydsl.conv_kernels import (
     TUNED_LIBTYPE_COLUMN,
     TUNED_RESULT_COLUMNS,
     _check_supported_arch,
+    _implicit_param_from_problem,
     _is_matmul_fast_path,
     _pad_channels,
     _parse_tuned_bool,
 )
-from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import out_extent
+from aiter.ops.flydsl.kernels.conv.conv3d_gfx950_utils import (
+    make_conv_geometry,
+    make_tile_config,
+    out_extent,
+)
+from aiter.ops.flydsl.kernels.conv.conv3d_im2col import (
+    make_im2col_plan,
+    plan_lds_bytes,
+)
 from aiter.utility.base_tuner import TunerCommon
 from aiter.utility.mp_tuner import mp_tuner
 
@@ -322,8 +331,41 @@ class Conv3dTuner(TunerCommon):
         params = _row_params(kv)
         m_gemm, n_gemm, _k_gemm, _ = self._gemm_dims(keys)
 
+        # crs is built from the *padded* per-group channel count, matching what
+        # the kernel computes; splitK divisibility depends on it.
+        cgp = _pad_channels(c // groups)
+        crs = cgp * kt * kh * kw
+
+        def splitk_for(tile):
+            # num_cu explicitly, so the CU count behind the split is the same
+            # one the policy enumerated against and the tuned row is stamped
+            # with; the device probe it would fall back to is a second source.
+            return _resolve_splitk(
+                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
+            )
+
+        def lds_bytes_fn(tile):
+            # The LDS the runtime will allocate for this tile on this shape:
+            # the kW-reuse layout differs from the default path's.
+            param = _implicit_param_from_problem(
+                n, c, d, h, w, k, kt, kh, kw,
+                *params["stride"], *params["padding"], *params["dilation"],
+                groups, has_bias, splitk_for(tile), tile, 1, True,
+            )  # fmt: skip
+            cfg = make_tile_config(tile)
+            try:
+                plan = make_im2col_plan(param, make_conv_geometry(param), cfg)
+            except AssertionError:
+                return float("inf")  # the gather cannot reach this tile's span
+            return plan_lds_bytes(plan)
+
         configs = get_flydsl_conv3d_configs(
-            m_gemm, n_gemm, groups, self.get_cu_num(), max_configs=max_configs
+            m_gemm,
+            n_gemm,
+            groups,
+            self.get_cu_num(),
+            max_configs=max_configs,
+            lds_bytes_fn=lds_bytes_fn,
         )
         # BASELINE_TILES covers the heuristic default but not a borrowed one: a
         # tile tuned at another resolution of this layer can fall outside this
@@ -334,11 +376,6 @@ class Conv3dTuner(TunerCommon):
         )
         if borrowed is not None and (*borrowed[0], borrowed[1]) not in configs:
             configs.append((*borrowed[0], borrowed[1]))
-
-        # crs is built from the *padded* per-group channel count, matching what
-        # the kernel computes; splitK divisibility depends on it.
-        cgp = _pad_channels(c // groups)
-        crs = cgp * kt * kh * kw
 
         tasks = []
         for tile_m, tile_n, wave_m, wave_n, wgm in configs:
@@ -351,12 +388,7 @@ class Conv3dTuner(TunerCommon):
             # pinned rather than re-derived at dispatch, so the column records
             # the value that ran and AOT compiles the artifact the runtime asks
             # for.
-            # num_cu explicitly, so the CU count behind the split is the same
-            # one the policy enumerated against and the tuned row is stamped
-            # with; the device probe it would fall back to is a second source.
-            sk = _resolve_splitk(
-                None, m_gemm, crs, k, None, tile, groups, num_cu=self.get_cu_num()
-            )
+            sk = splitk_for(tile)
             info = (
                 keys,
                 tile_m,

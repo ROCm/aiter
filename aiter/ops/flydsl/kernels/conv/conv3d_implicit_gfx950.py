@@ -323,8 +323,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
             for kw_i in range_constexpr(KW):
                 k_base = ((kt_i * param.kh + kh_i) * KW + kw_i) * CGP + cc * cfg.tile_k
                 b_tile = b_stage(gs, kw_i) * cfg.tile_n * cfg.tile_k
-                for i, src, voff in weights.taps(k_base):
-                    stager.copy(src, stager.dst(lds.b, b_tile, i), voff)
+                weights.stage(stager, lds, b_tile, k_base)
 
         def read_tap(gs, kw_i):
             a = mma.read_a_at(a_offs, gs * STRIP_ELEMS + kw_i * param.dw * cfg.tile_k)
@@ -395,8 +394,7 @@ def compile_conv3d_implicit(param: Conv3dImplicitParam):
 
         def async_load_b_to_lds(k_tile, stage):
             stage_tile = fx.Int64(stage) * cfg.tile_n * cfg.tile_k
-            for i, src, voff in weights.taps(blk.k_off + k_tile * cfg.tile_k):
-                stager.copy(src, stager.dst(lds.b, stage_tile, i), voff)
+            weights.stage(stager, lds, stage_tile, blk.k_off + k_tile * cfg.tile_k)
 
         # Double-buffer TILES_PER_BARRIER K-tiles: prefetch, then compute
         # while issuing the next DMA.

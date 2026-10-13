@@ -216,8 +216,10 @@ def _implicit_param_from_problem(
 
 
 # Share one LDS strip across the kW taps of a (kt, kh, channel block) when the
-# layer allows it (see make_im2col_plan); part of the compile key.
-AITER_CONV3D_KW_REUSE = int(os.environ.get("AITER_CONV3D_KW_REUSE", "0"))
+# layer allows it (see make_im2col_plan); part of the compile key. The tuned
+# tables are tuned with it on: some of their tiles only fit two blocks per CU
+# in the reuse layout.
+AITER_CONV3D_KW_REUSE = int(os.environ.get("AITER_CONV3D_KW_REUSE", "1"))
 
 # Runtime D/H/W so one artifact serves every resolution. Set 0 to compile per
 # size (tiny fixed-shape workloads). BIG_IN/BIG_OUT/M-chunking stay static.
