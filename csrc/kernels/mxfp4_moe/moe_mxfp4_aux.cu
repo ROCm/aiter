@@ -74,7 +74,24 @@ Fn aux_find(const std::unordered_map<std::string, Fn>& table,
     return it->second;
 }
 
+std::string sort_quant_key(bool fp8_quant, int64_t NE, int64_t TOPK, int64_t MB, int64_t D_HIDDEN)
+{
+    return std::string(fp8_quant ? "aux_sort_quant_fp8_NE" : "aux_sort_quant_NE")
+        + std::to_string(NE) + "_TOPK" + std::to_string(TOPK)
+        + "_MB" + std::to_string(MB) + "_H" + std::to_string(D_HIDDEN);
+}
+
 }  // namespace
+
+bool mxfp4_moe_sort_quant_fp8_is_supported(
+    int64_t NE,
+    int64_t TOPK,
+    int64_t D_HIDDEN,
+    int64_t MB)
+{
+    const auto& table = sort_quant_lookup();
+    return table.find(sort_quant_key(true, NE, TOPK, MB, D_HIDDEN)) != table.end();
+}
 
 bool mxfp4_moe_sort_internal_is_supported(
     int64_t NE,
@@ -120,12 +137,18 @@ void mxfp4_moe_sort_quant_kernel(
     void* bf16_zero_ptr = (bf16_zero_out.numel() > 0) ? bf16_zero_out.data_ptr() : nullptr;
 
     const bool fp8_quant = a_quant.dtype() == AITER_DTYPE_fp8;
-    const std::string key = std::string(fp8_quant
-                                           ? "aux_sort_quant_fp8_NE"
-                                           : "aux_sort_quant_NE") +
-        std::to_string(NE)
-        + "_TOPK" + std::to_string(TOPK) + "_MB" + std::to_string(MB)
-        + "_H" + std::to_string(D_HIDDEN);
+    // The MXFP8 quant reads each row with 16-byte loads at token * input_stride;
+    // the MXFP4 quant ignores input_stride and needs dense rows.
+    AITER_CHECK(a_input.stride(1) == 1, "mxfp4_moe_sort_quant: a_input rows must be dense");
+    if (fp8_quant) {
+        AITER_CHECK(a_input.stride(0) % 8 == 0 &&
+                        reinterpret_cast<uintptr_t>(a_input.data_ptr()) % 16 == 0,
+                    "mxfp4_moe_sort_quant: MXFP8 a_input rows must be 16-byte aligned");
+    } else {
+        AITER_CHECK(a_input.stride(0) == D_HIDDEN,
+                    "mxfp4_moe_sort_quant: MXFP4 a_input must be contiguous");
+    }
+    const std::string key = sort_quant_key(fp8_quant, NE, TOPK, MB, D_HIDDEN);
     aux_find(sort_quant_lookup(), key, "mxfp4_moe_sort_quant")(
         stream, M,
         a_input.data_ptr(),

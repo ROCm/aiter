@@ -55,7 +55,10 @@ from aiter.ops.flydsl.mxfp4_kname import (
     parse_flydsl_v2_gemm2_kernel,
     parse_g2_kname_any,
 )
-from aiter.ops.moe_mxfp4_aux import _mxfp4_moe_sort_internal_is_supported
+from aiter.ops.moe_mxfp4_aux import (
+    _mxfp4_moe_sort_internal_is_supported,
+    _mxfp4_moe_sort_quant_fp8_is_supported,
+)
 from aiter.ops.opus import moe_stage2_a8w4 as _opus_a8w4
 from aiter.ops.opus.moe_stage1_a8w4 import (
     opus_a8w4_stage1_wrapper as _opus_a8w4_stage1_wrapper,
@@ -260,51 +263,15 @@ def _fused_decode_sort_quant(
     )
 
 # Fuse the a8w4 route sort with the per-token MXFP8 activation quant into one
-# launch, for the shapes the moe_aux codegen instantiates.
+# launch. The fused kernel sorts in one CTA, so above this many tokens it is no
+# faster than the separate launches (MI355X, Kimi-K3 A8W4 TP=8).
 _MOE_A8W4_FUSED_SORT_QUANT = (
     os.environ.get("AITER_MOE_A8W4_FUSED_SORT_QUANT", "1") == "1"
 )
-# (num_experts, topk, model_dim) with an MXFP8 sort_quant instance at block_m 32;
-# keep in sync with SORT_QUANT_FP8_SHAPES in moe_aux/codegen/gen_instances.py.
-_A8W4_SORT_QUANT_SHAPES = frozenset(
-    {
-        (896, 16, 3584),  # Kimi-K3 A8W4 TP=8
-    }
-)
-# The fused kernel sorts in one CTA, so it slows down as M grows. Above this many
-# tokens it is no faster than the separate launches (MI355X, Kimi-K3 A8W4 TP=8).
 _A8W4_SORT_QUANT_MAX_TOKENS = 32
 
 # Optional hook for collecting per-stage benchmark callables.
 kernel_bench_callable = None
-
-# Optional BM=16 sort metadata from a caller's fused route+sort kernel (e.g.
-# SGLang's radix-4 router). Registered on the same thread immediately before
-# fused_moe; CUDA-graph replay does not re-enter Python, so the skip is baked
-# into the captured launches.
-_PRESORTED_MOE = None
-
-
-def register_presorted_moe(aux: dict | None) -> None:
-    global _PRESORTED_MOE
-    _PRESORTED_MOE = aux
-
-
-def _take_presorted_moe(topk_ids, *, block_m, num_experts, topk):
-    global _PRESORTED_MOE
-    aux = _PRESORTED_MOE
-    _PRESORTED_MOE = None
-    if not aux:
-        return None
-    if (
-        int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
-        or int(aux.get("M", -1)) != int(topk_ids.shape[0])
-        or int(aux.get("block_m", -1)) != int(block_m)
-        or int(aux.get("num_experts", -1)) != int(num_experts)
-        or int(aux.get("topk", -1)) != int(topk)
-    ):
-        return None
-    return aux
 
 
 # FLAT 1stage asm kernels (manifest flat=1) ingest raw topk_ids /
@@ -341,6 +308,21 @@ def _moe_prepare_unsorted_input(topk_ids, topk_weights, model_dim, moebuf_dtype)
     return topk_ids_i32, topk_weights_f32, topk_ids_i32, topk_ids_i32, moe_buf
 
 
+def _alloc_aux_sort_buffers(M, num_experts, topk, block_m, device):
+    """Outputs of the moe_aux sort kernels, sized for the worst-case padding."""
+    active = min(num_experts, M * topk)
+    max_sorted = -(-(M * topk + active * (block_m - 1)) // block_m) * block_m
+    return (
+        max_sorted,
+        torch.empty(max_sorted, dtype=dtypes.i32, device=device),
+        torch.empty(max_sorted // block_m, dtype=dtypes.i32, device=device),
+        torch.empty(2, dtype=dtypes.i32, device=device),
+        torch.empty(max_sorted, dtype=dtypes.fp32, device=device),
+        torch.empty(M * topk, dtype=dtypes.i32, device=device),
+        torch.empty(max_sorted, dtype=dtypes.i32, device=device),
+    )
+
+
 def _adaptive_moe_sort(
     topk_ids,
     topk_weights,
@@ -353,34 +335,26 @@ def _adaptive_moe_sort(
     emit_aux=False,
     skip_quant=False,
     moebuf_dtype=dtypes.bf16,
-    output=None,
 ):
     device = topk_ids.device
     M = topk_ids.shape[0]
     BM = block_size
-    active = min(num_experts, M * topk)
-    max_sorted = (((M * topk + active * (BM - 1)) + BM - 1) // BM) * BM
-
-    sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
-    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
-    m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    # Atomic gemm2 accumulates into moe_buf, so handing it the caller's buffer
-    # saves the trailing copy. The sort kernel zeroes moe_buf before gemm2, so
-    # this is not a residual add.
-    if atomic:
-        moe_buf = (
-            output
-            if output is not None
-            else torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
-        )
-    else:
-        moe_buf = torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    (
+        _,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        sorted_weights,
+        reverse_sorted,
+        m_indices,
+    ) = _alloc_aux_sort_buffers(M, num_experts, topk, BM, device)
+    moe_buf = (
+        torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
+        if atomic
+        else torch.empty((0, 0), dtype=moebuf_dtype, device=device)
+    )
     # BM16 sort fuses output zeroing; three-stage sort only sorts.
-    # Atomic GEMM2 needs a zeroed destination on every invocation. With a
-    # caller-owned buffer this matters more, not less: it arrives dirty.
+    # Atomic GEMM2 needs a zeroed destination on every invocation.
     if atomic and BM != 16:
         moe_buf.zero_()
     empty_bf16 = _empty_bf16(device)
@@ -422,6 +396,11 @@ def _adaptive_moe_sort(
     return std
 
 
+@functools.cache
+def _a8w4_sort_quant_instance_supported(experts, topk, hidden, block_m):
+    return _mxfp4_moe_sort_quant_fp8_is_supported(experts, topk, hidden, block_m)
+
+
 def _a8w4_fused_sort_quant(
     hidden_states,
     topk_ids,
@@ -434,21 +413,23 @@ def _a8w4_fused_sort_quant(
     model_dim,
     dtype,
 ):
-    """Route sort + per-token MXFP8 activation quant in one HIP launch."""
+    """Route sort + per-token MXFP8 activation quant in one HIP launch.
+
+    Returns the moe_sorting outputs plus the fp8 activations and their scales,
+    already sorted into stage1's layout. The kernel also zeroes moe_buf for the
+    atomic stage2, which is why the caller's ``output`` can stand in for it.
+    """
     M = hidden_states.shape[0]
-    active = min(num_experts, M * topk)
-    max_sorted = (
-        ((M * topk + active * (block_m - 1)) + block_m - 1) // block_m
-    ) * block_m
     device = hidden_states.device
-    sorted_token_ids = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
-    sorted_expert_ids = torch.empty(
-        max_sorted // block_m, dtype=dtypes.i32, device=device
-    )
-    num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
-    sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
-    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
-    m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
+    (
+        max_sorted,
+        sorted_token_ids,
+        sorted_expert_ids,
+        num_valid_ids,
+        sorted_weights,
+        reverse_sorted,
+        m_indices,
+    ) = _alloc_aux_sort_buffers(M, num_experts, topk, block_m, device)
     a_quant = torch.empty((M, model_dim), dtype=dtypes.fp8, device=device)
     a_scale = torch.empty((M, model_dim // 32), dtype=torch.uint8, device=device)
     moe_buf = (
@@ -499,13 +480,61 @@ def _a8w4_fused_sort_quant(
     )
 
 
+def _use_a8w4_fused_sort_quant(
+    metadata,
+    hidden_states,
+    topk_ids,
+    topk_weight,
+    *,
+    quant_type,
+    q_dtype_a,
+    q_dtype_w,
+    block_m,
+    num_experts,
+    topk,
+    model_dim,
+    expert_mask,
+    num_local_tokens,
+):
+    M = hidden_states.shape[0]
+    return (
+        _MOE_A8W4_FUSED_SORT_QUANT
+        and M <= _A8W4_SORT_QUANT_MAX_TOKENS
+        and quant_type == QuantType.per_1x32
+        and q_dtype_a == dtypes.fp8
+        and q_dtype_w == dtypes.fp4x2
+        and block_m == 32
+        # The fused sort has no expert mask or EP token count.
+        and expert_mask is None
+        and num_local_tokens is None
+        and metadata.prequant
+        and not metadata.output_aux
+        and not metadata.flat
+        and not metadata.run_1stage
+        # The kernel zeroes moe_buf for an atomic stage2.
+        and not stage2_uses_route_reduce(metadata.stage2)
+        and hidden_states.dtype == dtypes.bf16
+        # 16-byte row loads; the kernel takes the row stride.
+        and hidden_states.stride(-1) == 1
+        and hidden_states.stride(0) % 8 == 0
+        and hidden_states.data_ptr() % 16 == 0
+        and topk_ids.dtype == dtypes.i32
+        and topk_ids.is_contiguous()
+        and topk_weight.dtype == dtypes.fp32
+        and topk_weight.is_contiguous()
+        # The MXFP8 conversion is gfx950-only.
+        and get_gfx() == "gfx950"
+        and _a8w4_sort_quant_instance_supported(num_experts, topk, model_dim, block_m)
+    )
+
+
 # `output`: caller-provided [M, model_dim] destination.
 #
 #     path                                      in-place?  why?
 #     opus / ck / flydsl sort + accumulate      yes        sort kernel zeroes what it is handed
 #     ... + reduce mode (non-EP)                yes        buffer is born in fused_moe_2stages
 #     FLAT 1stage (tuned flat=1/2)              no         kernel needs 8 spare bytes past the rows
-#     adaptive-aux sort (a4w4, atomic)          yes        output is the atomic moe_buf
+#     adaptive-aux sort (a4w4, atomic)          no         parameter not threaded yet
 #     grouped a4w4/a8w4 (gfx1250)               no         callee has no out param
 #
 # Not in-place => _return_output copies, so the contract holds either way;
@@ -722,8 +751,7 @@ def _moe_sorting_impl(
         # adaptive (fused) sort emits the a4w4 extras (m_indices + reverse_sorted)
         # plus the atomic zero-init; opus single-pass aux is the env-gated fallback.
         # It has no expert_mask support, so EP always takes the Opus aux sort.
-        # Thread `output` as moe_buf so atomic gemm2 writes in place; the sort
-        # zeroes it first.
+        # `output` not threaded here: this buffer also feeds stage1 as moe_buf.
         return _adaptive_moe_sort(
             topk_ids,
             topk_weights,
@@ -734,7 +762,6 @@ def _moe_sorting_impl(
             atomic=accumulate,
             emit_aux=True,
             moebuf_dtype=moebuf_dtype,
-            output=output,
         )
 
     max_num_tokens_padded = int(topk_ids.numel() + num_experts * block_size - topk)
@@ -1317,15 +1344,7 @@ def fused_moe(
             )
         from aiter.fhmoe import _fhmoe
 
-        # fhmoe has no output slot of its own, so honor `output` with a copy.
-        _validate_output_buffer_metadata(
-            output,
-            (topk_ids.shape[0], w2.shape[1]),
-            hidden_states.dtype if dtype is None else dtype,
-            hidden_states.device,
-        )
-        _validate_output_buffer_no_overlap(output, hidden_states)
-        fhmoe_out = _fhmoe(
+        return _fhmoe(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
@@ -1357,7 +1376,6 @@ def fused_moe(
             clamp_shared=clamp_shared,
             output=output,
         )
-        return _return_output(fhmoe_out, output)
     if not block_size_M:
         block_size_M = -1
     enable_ep_scatter = stage2_scatter is not None
@@ -1388,7 +1406,6 @@ def fused_moe(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
-        output=output,
         ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
         ep_combine_input_offset=(
             stage2_scatter.combine_input_offset if enable_ep_scatter else 0
@@ -1404,6 +1421,7 @@ def fused_moe(
             int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
         ),
         ep_source_token_map=scatter_source_map,
+        output=output,
         quant_type_a=None if quant_type_a is None else quant_type_a.value,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
@@ -1435,8 +1453,6 @@ def fused_moe_fake(
     bias1: torch.Tensor | None = None,
     bias2: torch.Tensor | None = None,
     swiglu_limit: float | None = None,
-    # Unused, but torch fills the fake positionally from fused_moe_'s schema,
-    # so the parameter lists must line up.
     beta: float | None = None,
     linear_beta: float | None = None,
     gate_mode: str = GateMode.SEPARATED.value,
@@ -1550,11 +1566,11 @@ def fused_moe_(
         beta=beta,
         linear_beta=linear_beta,
         gate_mode=gate_mode,
+        stage2_scatter=stage2_scatter,
         output=output,
         quant_type_a=quant_type_a,
         quant_dtype_a=quant_dtype_a,
         quant_dtype_a2=quant_dtype_a2,
-        stage2_scatter=stage2_scatter,
     )
 
 
@@ -1932,7 +1948,8 @@ def _fused_moe_impl(
         )
     prequantized_a1 = None
     prequantized_a1_scale = None
-    use_a8w4_fused_sort_quant = False
+    a1_sorted = None
+    a1_scale_sorted = None
     # The a4w4 aux-sort families already fuse activation quantization into GEMM1,
     # so the fused sort+quant kernel has nothing left to save there.
     fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
@@ -1958,35 +1975,29 @@ def _fused_moe_impl(
     # refactored mixed_moe_gemm_2stage_common); keep the fused sort+quant on
     # the expanded-scale path only.
     fused_compact_scale = False
-    use_fused_sort_quant = (
-        _MOE_A8W4_FUSED_SORT_QUANT
-        and not metadata.output_aux
-        and not metadata.flat
-        and not metadata.run_1stage
-        and expert_mask is None
-        and num_local_tokens is None
-        and quant_type == QuantType.per_1x32
-        and q_dtype_a == dtypes.fp8
-        and q_dtype_w == dtypes.fp4x2
-        and block_size_M == 32
-        and M <= _A8W4_SORT_QUANT_MAX_TOKENS
-        and (global_E, topk, model_dim) in _A8W4_SORT_QUANT_SHAPES
-        and hidden_states.dtype == dtypes.bf16
-        and topk_ids.dtype == dtypes.i32
-        and topk_ids.is_contiguous()
-        and topk_weight.dtype == dtypes.fp32
-        and topk_weight.is_contiguous()
-        and not runtime_stage2_reduce
-    )
-    if use_fused_sort_quant:
+    if _use_a8w4_fused_sort_quant(
+        metadata,
+        hidden_states,
+        topk_ids,
+        topk_weight,
+        quant_type=quant_type,
+        q_dtype_a=q_dtype_a,
+        q_dtype_w=q_dtype_w,
+        block_m=block_size_M,
+        num_experts=global_E,
+        topk=topk,
+        model_dim=model_dim,
+        expert_mask=expert_mask,
+        num_local_tokens=num_local_tokens,
+    ):
         (
             sorted_ids,
             sorted_weights,
             sorted_expert_ids,
             num_valid_ids,
             moe_buf,
-            prequantized_a1,
-            prequantized_a1_scale,
+            a1_sorted,
+            a1_scale_sorted,
         ) = _a8w4_fused_sort_quant(
             hidden_states,
             topk_ids,
@@ -1999,7 +2010,6 @@ def _fused_moe_impl(
             dtype=dtype,
         )
         local_topk_ids = None
-        use_a8w4_fused_sort_quant = True
     elif metadata.output_aux:
         # Only the layout-v2 scatter GEMM2 consumes the masked aux sort (remote
         # routes get reverse_sorted = -1). The MXMOE a4w4 port would silently
@@ -2017,62 +2027,30 @@ def _fused_moe_impl(
         _atomic = parse_g2_kname_any(_kn2)["atomic"]
         # BM16's adaptive sort already emits routes and zeroes the output without
         # quantizing. Keep the Opus crossover for the configured aux pipeline.
-        _presorted = _take_presorted_moe(
+        sorting_ret = moe_sorting(
             topk_ids,
-            block_m=block_size_M,
-            num_experts=global_E,
-            topk=topk,
+            topk_weight,
+            global_E,
+            model_dim,
+            dtype,
+            block_size_M,
+            expert_mask,
+            num_local_tokens,
+            return_local_topk_ids=need_local_topk_ids,
+            accumulate=_atomic and not runtime_stage2_reduce,
+            output_aux=metadata.output_aux,
+            output=output,
         )
-        # The presorted metadata has no expert mask applied.
-        if _presorted is not None and expert_mask is None:
-            sorted_ids = _presorted["sorted_token_ids"]
-            sorted_weights = _presorted["sorted_weights"]
-            sorted_expert_ids = _presorted["sorted_expert_ids"]
-            num_valid_ids = _presorted["num_valid_ids"]
-            sort_m_indices = _presorted["m_indices"]
-            sort_reverse_sorted = _presorted["reverse_sorted"]
-            if _atomic and not runtime_stage2_reduce:
-                moe_buf = (
-                    output
-                    if output is not None
-                    else torch.empty(
-                        (M, model_dim), dtype=dtype, device=topk_ids.device
-                    )
-                )
-                zeroed_ptr = int(_presorted.get("moe_buf_ptr", 0))
-                if not (
-                    _presorted.get("moe_buf_zeroed")
-                    and zeroed_ptr == int(moe_buf.data_ptr())
-                ):
-                    moe_buf.zero_()
-            else:
-                moe_buf = torch.empty((0, 0), dtype=dtype, device=topk_ids.device)
-            local_topk_ids = None
-        else:
-            sorting_ret = moe_sorting(
-                topk_ids,
-                topk_weight,
-                global_E,
-                model_dim,
-                dtype,
-                block_size_M,
-                expert_mask,
-                num_local_tokens,
-                return_local_topk_ids=need_local_topk_ids,
-                accumulate=_atomic and not runtime_stage2_reduce,
-                output_aux=metadata.output_aux,
-                output=output,
-            )
-            (
-                sorted_ids,
-                sorted_weights,
-                sorted_expert_ids,
-                num_valid_ids,
-                moe_buf,
-                sort_m_indices,
-                sort_reverse_sorted,
-            ) = sorting_ret[:7]
-            local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
+        (
+            sorted_ids,
+            sorted_weights,
+            sorted_expert_ids,
+            num_valid_ids,
+            moe_buf,
+            sort_m_indices,
+            sort_reverse_sorted,
+        ) = sorting_ret[:7]
+        local_topk_ids = sorting_ret[7] if need_local_topk_ids else None
     elif fused_sort_quant:
         (
             sorted_ids,
@@ -2158,7 +2136,7 @@ def _fused_moe_impl(
         return _return_output(_stage1_call(), output)
     else:
         ret = fused_moe_2stages(
-            prequantized_a1 if use_a8w4_fused_sort_quant else hidden_states,
+            hidden_states if a1_sorted is None else a1_sorted,
             w1,
             w2,
             topk,
@@ -2176,10 +2154,8 @@ def _fused_moe_impl(
             q_dtype_w=q_dtype_w,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
-            a1_scale=(
-                prequantized_a1_scale if use_a8w4_fused_sort_quant else a1_scale
-            ),
-            a1_scale_sorted=use_a8w4_fused_sort_quant,
+            a1_scale=a1_scale if a1_scale_sorted is None else a1_scale_sorted,
+            a1_scale_sorted=a1_scale_sorted is not None,
             a2_scale=a2_scale,
             num_local_tokens=num_local_tokens,
             # following for cktile support
@@ -2207,8 +2183,8 @@ def _fused_moe_impl(
             output=output,
             _stage2_override=_stage2_override,
             routing_num_experts=global_E,
-            prequantized_a1=None if use_a8w4_fused_sort_quant else prequantized_a1,
-            prequantized_a1_scale=None if use_a8w4_fused_sort_quant else prequantized_a1_scale,
+            prequantized_a1=prequantized_a1,
+            prequantized_a1_scale=prequantized_a1_scale,
         )
         return _return_output(ret, output)
 
@@ -4814,6 +4790,7 @@ def fused_moe_2stages(
     routing_num_experts: int | None = None,
     prequantized_a1: torch.Tensor | None = None,
     prequantized_a1_scale: torch.Tensor | None = None,
+    # hidden_states is already MXFP8 and a1_scale already in stage1's sorted layout.
     a1_scale_sorted: bool = False,
 ):
     quant_func = get_quant(quant_type)
@@ -4880,6 +4857,8 @@ def fused_moe_2stages(
         # Main's fused prequant already writes the E8M0 scale layout consumed by
         # replacement GEMM1 on the default Opus auxiliary path.
         metadata = replace(metadata, prequant=True)
+    if a1_scale_sorted and not metadata.prequant:
+        raise RuntimeError("a1_scale_sorted needs a GEMM1 that reads MXFP8 input")
     if prequantized_a1 is not None:
         if quant_type != QuantType.per_1x32:
             raise ValueError(
@@ -4919,7 +4898,6 @@ def fused_moe_2stages(
     ):
         # mxfp8 activations + mxfp4 weights (a8w4) OR mxfp8 weights (a8w8).
         if a1_scale_sorted:
-            # Fused sort+quant already produced fp8 activations and sorted scales.
             a1 = hidden_states
         elif _MOE_A8W4_BYPASS_QUANT:
             # Debug bypass: skip real quant, feed unit scales.

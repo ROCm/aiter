@@ -12,7 +12,6 @@ import pandas as pd
 import torch
 
 import aiter
-import aiter.fhmoe
 from aiter import dtypes
 from aiter.aot.flydsl.common import override_env, run_only_env
 from aiter.fhmoe_contract import FHMOE_BUFFER_MAX_BYTES
@@ -762,9 +761,9 @@ parser.add_argument(
     help="Run only the deterministic BM16 tiled-scale boundary regression.",
 )
 parser.add_argument(
-    "--mxfp8-passthrough",
+    "--a8w4-sort-quant",
     action="store_true",
-    help="Run only the MXFP8 pre-quantized input (fp8 + unsorted a1_scale) test.",
+    help="Run only the a8w4 fused route sort + MXFP8 quant tests.",
 )
 parser.add_argument(
     "--swiglu-limit",
@@ -1493,8 +1492,8 @@ def test_output_buffer_contract():
         kw["output"] = None
         return sort(*a, **kw)
 
-    # in_place=False stands in for FLAT, adaptive-aux atomic, grouped gfx1250,
-    # and fhmoe paths, which cannot take the caller's buffer and must copy.
+    # in_place=False stands in for FLAT, adaptive-aux atomic, and grouped gfx1250
+    # paths, which cannot take the caller's buffer and must copy their result into it.
     for in_place in (True, False):
         try:
             if not in_place:
@@ -1511,17 +1510,6 @@ def test_output_buffer_contract():
             assert eager[0] == eager[1] == ref.sum()
         finally:
             aiter.fused_moe._moe_sorting_impl = sort
-
-    # The fhmoe branch has no output slot of its own, so fused_moe copies for it.
-    real_fhmoe = aiter.fhmoe._fhmoe
-    fhmoe_out = torch.randn((token, model_dim), dtype=dtype)
-    try:
-        aiter.fhmoe._fhmoe = lambda **kwargs: fhmoe_out
-        buf = fresh_buffer()
-        assert fused_moe(*args, shared_expert_id=0, output=buf) is buf
-        assert torch.equal(buf, fhmoe_out), "fhmoe result not copied into buf"
-    finally:
-        aiter.fhmoe._fhmoe = real_fhmoe
 
     def expect_raise(described, **kwargs):
         try:
@@ -1717,15 +1705,101 @@ def test_swiglu_mxfp4_untagged_layout_dispatch():
     aiter.logger.info(
         "moe_2stage: SwiGLU MXFP4 untagged-layout dispatch regression test passed"
     )
-def test_mxfp8_prequant_passthrough():
-    """fp8 hidden_states + unsorted e8m0 a1_scale must match the bf16-input path.
+def test_a8w4_sort_quant_kernel():
+    """The MXFP8 sort+quant kernel at the Kimi-K3 A8W4 TP=8 shape.
 
-    Kimi-K3 A8W4 TP=8 shape, so the bf16 input also exercises the fused sort+quant
-    path at small M. The pre-quantized input (MXFP8 dispatch) must still get its
-    scales sorted by fused_moe.
+    Its sort must give the MXFP4 sort_quant's expert blocks and be a valid
+    routing (order within an expert block is not deterministic), its quant must
+    match per_1x32_f8_scale_f8_quant, it must read a row-strided input, and it
+    must zero moe_buf for the atomic stage2.
     """
     if get_gfx() != "gfx950":
-        aiter.logger.info("skip MXFP8 passthrough test on %s", get_gfx())
+        aiter.logger.info("skip a8w4 sort_quant kernel test on %s", get_gfx())
+        return
+    E, topk, model_dim, mb = 896, 16, 3584, 32
+    alloc = aiter.fused_moe._alloc_aux_sort_buffers
+
+    def run(hidden, topk_ids, topk_weights, quant_dtype):
+        M = hidden.shape[0]
+        _, *bufs = alloc(M, E, topk, mb, hidden.device)
+        sorted_ids, sorted_expert_ids, num_valid_ids, sorted_weights = bufs[:4]
+        reverse_sorted, m_indices = bufs[4:]
+        if quant_dtype == dtypes.fp8:
+            a_quant = torch.empty((M, model_dim), dtype=dtypes.fp8)
+        else:
+            a_quant = torch.empty((M, model_dim // 2), dtype=torch.uint8)
+        a_scale = torch.empty((M, model_dim // 32), dtype=torch.uint8)
+        moe_buf = torch.full((M, model_dim), float("nan"), dtype=dtypes.bf16)
+        aiter.mxfp4_moe_sort_quant(
+            a_input=hidden,
+            topk_ids=topk_ids,
+            topk_weight=topk_weights,
+            sorted_token_ids=sorted_ids,
+            sorted_expert_ids=sorted_expert_ids,
+            cumsum_tensor=num_valid_ids,
+            reverse_sorted=reverse_sorted,
+            sorted_weights=sorted_weights,
+            a_quant=a_quant,
+            a_scale=a_scale,
+            m_indices=m_indices,
+            bf16_zero_out=moe_buf,
+            NE=E,
+            TOPK=topk,
+            D_HIDDEN=model_dim,
+            MB=mb,
+        )
+        sort = (sorted_ids, sorted_weights, sorted_expert_ids, num_valid_ids)
+        return sort, reverse_sorted, m_indices, a_quant, a_scale, moe_buf
+
+    torch.manual_seed(0)
+    for M, row_stride in ((1, model_dim), (7, model_dim), (32, model_dim), (5, 4096)):
+        hidden = torch.randn((M, row_stride), dtype=dtypes.bf16)[:, :model_dim]
+        gating = torch.randn((M, E), dtype=dtypes.bf16)
+        topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+        sort8, rev, m_idx, q8, s8, buf8 = run(
+            hidden, topk_ids, topk_weights, dtypes.fp8
+        )
+        sort4, *_ = run(hidden.contiguous(), topk_ids, topk_weights, dtypes.fp4x2)
+        ids8, w8, experts8, nv8 = sort8
+        _, _, experts4, nv4 = sort4
+        n_valid = int(nv8[0].item())
+        assert torch.equal(nv8, nv4), f"M={M}: num_valid_ids differ"
+        n_blocks = n_valid // mb
+        assert torch.equal(
+            experts8[:n_blocks], experts4[:n_blocks]
+        ), f"M={M}: expert blocks differ"
+        # Every route lands once, in a block of its expert, with its weight.
+        route = rev[: M * topk].long()
+        tok = torch.arange(M).repeat_interleave(topk)
+        slot = torch.arange(topk).repeat(M)
+        assert torch.equal(ids8[route].long(), slot << 24 | tok), f"M={M}: bad ids"
+        assert torch.equal(w8[route], topk_weights.flatten()), f"M={M}: bad weights"
+        assert torch.equal(
+            experts8[route // mb].long(), topk_ids.flatten().long()
+        ), f"M={M}: route in the wrong expert block"
+        assert torch.equal(m_idx[route].long(), tok), f"M={M}: bad m_indices"
+        # The rest of the valid region is padding.
+        assert int((ids8[:n_valid] != M).sum()) == M * topk, f"M={M}: bad padding"
+        ref_q, ref_s = per_1x32_f8_scale_f8_quant(
+            hidden.contiguous(), quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        )
+        assert torch.equal(s8, ref_s.view(torch.uint8)), f"M={M}: e8m0 scales differ"
+        assert torch.equal(
+            q8.view(torch.uint8), ref_q.view(torch.uint8)
+        ), f"M={M}: fp8 activations differ"
+        assert torch.count_nonzero(buf8) == 0, f"M={M}: moe_buf not zeroed"
+    aiter.logger.info("moe_2stage: a8w4 sort_quant kernel passed")
+
+
+def test_a8w4_fused_sort_quant_e2e():
+    """fused_moe with the fused sort+quant against the separate launches.
+
+    Kimi-K3 A8W4 TP=8 shape. The fused path must be taken up to the token cap and
+    skipped above it, and must match the unfused path. fp8 input with an unsorted
+    e8m0 a1_scale (MXFP8 dispatch) must still get its scales sorted.
+    """
+    if get_gfx() != "gfx950":
+        aiter.logger.info("skip a8w4 fused sort_quant test on %s", get_gfx())
         return
     torch.manual_seed(0)
     E, topk, model_dim, inter_dim = 896, 16, 3584, 384
@@ -1739,44 +1813,60 @@ def test_mxfp8_prequant_passthrough():
     del w2
     w1_qt = shuffle_weight_a16w4(w1_qt.view(E, inter_dim * 2, model_dim // 2), 16, True)
     w2_qt = shuffle_weight_a16w4(w2_qt.view(E, model_dim, inter_dim // 2), 16, False)
-    kwargs = dict(
-        w1_scale=shuffle_scale_a16w4(w1_scale, E, True),
-        w2_scale=shuffle_scale_a16w4(w2_scale, E, False),
-        quant_type=aiter.QuantType.per_1x32,
-        activation=aiter.ActivationType.Situv2,
-        beta=DEFAULT_SITUV2_BETA,
-        linear_beta=DEFAULT_SITUV2_LINEAR_BETA,
-        gate_mode=GateMode.INTERLEAVE.value,
-    )
+    kwargs = {
+        "w1_scale": shuffle_scale_a16w4(w1_scale, E, True),
+        "w2_scale": shuffle_scale_a16w4(w2_scale, E, False),
+        "quant_type": aiter.QuantType.per_1x32,
+        "activation": aiter.ActivationType.Situv2,
+        "beta": DEFAULT_SITUV2_BETA,
+        "linear_beta": DEFAULT_SITUV2_LINEAR_BETA,
+        "gate_mode": GateMode.INTERLEAVE.value,
+    }
 
     def calc_diff(x, y):
         x, y = x.double(), y.double()
         return float(1 - 2 * (x * y).sum() / (x * x + y * y).sum())
 
+    fm = aiter.fused_moe
+    real_fused = fm._a8w4_fused_sort_quant
+    calls = []
+
+    def counting_fused(*a, **kw):
+        calls.append(a[0].shape[0])
+        return real_fused(*a, **kw)
+
+    cap = fm._A8W4_SORT_QUANT_MAX_TOKENS
     with override_env("AITER_SITUV2_A8W4", "1"):
-        for token in (1, 32, 256):
-            hidden = torch.randn((token, model_dim), dtype=dtype)
-            gating = torch.randn((token, E), dtype=dtype)
-            topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
-            out_bf16 = fused_moe(hidden, w1_qt, w2_qt, topk_weights, topk_ids, **kwargs)
-            a1, a1_scale = per_1x32_f8_scale_f8_quant(
-                hidden, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
-            )
-            out_fp8 = fused_moe(
-                a1,
-                w1_qt,
-                w2_qt,
-                topk_weights,
-                topk_ids,
-                a1_scale=a1_scale,
-                dtype=dtype,
-                **kwargs,
-            )
-            torch.cuda.synchronize()
-            assert not out_fp8.isnan().any(), f"token={token}: fp8 input gave NaN"
-            diff = calc_diff(out_bf16, out_fp8)
-            assert diff < 1e-3, f"token={token}: fp8 vs bf16 input diff {diff}"
-    aiter.logger.info("moe_2stage: MXFP8 pre-quantized passthrough passed")
+        try:
+            fm._a8w4_fused_sort_quant = counting_fused
+            for token in (1, cap, cap + 1):
+                hidden = torch.randn((token, model_dim), dtype=dtype)
+                gating = torch.randn((token, E), dtype=dtype)
+                topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
+                args = (w1_qt, w2_qt, topk_weights, topk_ids)
+
+                calls.clear()
+                out = fused_moe(hidden, *args, **kwargs)
+                assert calls == (
+                    [token] if token <= cap else []
+                ), f"token={token}: fused sort_quant calls {calls}"
+                fm._MOE_A8W4_FUSED_SORT_QUANT = False
+                try:
+                    out_unfused = fused_moe(hidden, *args, **kwargs)
+                finally:
+                    fm._MOE_A8W4_FUSED_SORT_QUANT = True
+                a1, a1_scale = per_1x32_f8_scale_f8_quant(
+                    hidden, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+                )
+                out_fp8 = fused_moe(a1, *args, a1_scale=a1_scale, dtype=dtype, **kwargs)
+                torch.cuda.synchronize()
+                for name, other in (("unfused", out_unfused), ("fp8 input", out_fp8)):
+                    assert not other.isnan().any(), f"token={token}: {name} gave NaN"
+                    diff = calc_diff(out, other)
+                    assert diff < 1e-3, f"token={token}: fused vs {name} diff {diff}"
+        finally:
+            fm._a8w4_fused_sort_quant = real_fused
+    aiter.logger.info("moe_2stage: a8w4 fused sort_quant passed")
 
 
 # ---------------------------------------------------------------------------
@@ -1794,13 +1884,15 @@ _case_iters = []
 test_route_workspace_token_capacity()
 if args.bm16_scale_boundary:
     test_bm16_tiled_scale_boundary()
-elif args.mxfp8_passthrough:
-    test_mxfp8_prequant_passthrough()
+elif args.a8w4_sort_quant:
+    test_a8w4_sort_quant_kernel()
+    test_a8w4_fused_sort_quant_e2e()
 else:
     test_output_buffer_contract()
     test_swiglu_mxfp4_nonsplit_nobias_dispatch()
     test_swiglu_mxfp4_untagged_layout_dispatch()
-    test_mxfp8_prequant_passthrough()
+    test_a8w4_sort_quant_kernel()
+    test_a8w4_fused_sort_quant_e2e()
     # Skip unrelated tuned-CSV validation for an explicit CLI quant sweep.
     if not args.no_flydsl_csv and args.quant is None:
         _case_iters.append(

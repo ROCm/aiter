@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 # (NE, D_HIDDEN, D_INTER, TOPK) that also get the MXFP8 (a8w4) sort_quant
-# variant. Keep in sync with _A8W4_SORT_QUANT_SHAPES in aiter/fused_moe.py.
+# variant. fused_moe probes for it with _mxfp4_moe_sort_quant_fp8_is_supported.
 SORT_QUANT_FP8_SHAPES = [
     (896, 3584, 384, 16),  # Kimi-K3 A8W4 TP=8
 ]
