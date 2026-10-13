@@ -10,7 +10,9 @@ from aiter.ops.triton._triton_kernels.attention.unified_attention import (
     kernel_unified_attention_3d,
     reduce_segments,
 )
-from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import get_arch
+from aiter.ops.triton._triton_kernels.attention.dao_ai.utils import (
+    get_arch,
+)
 from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.device_info import get_num_sms
 from aiter.ops.triton.utils.types import e4m3_dtype
