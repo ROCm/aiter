@@ -54,16 +54,29 @@ def is_fx_set_register_available():
 
 
 TDM_DESCRIPTOR_VERSION = 1
-DEFAULT_MMA_GROUP = int(os.environ.get("AITER_FLYDSL_MMA_GROUP", "10"))
-DEFAULT_MMA_FIRST_GROUP = int(
-    os.environ.get("AITER_FLYDSL_MMA_FIRST_GROUP", DEFAULT_MMA_GROUP)
-)
-DEFAULT_DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
-PREFILL_MMA_GROUP = int(os.environ.get("AITER_FLYDSL_PREFILL_MMA_GROUP", "11"))
-PREFILL_MMA_FIRST_GROUP = int(
-    os.environ.get("AITER_FLYDSL_PREFILL_MMA_FIRST_GROUP", "13")
-)
-PREFILL_DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_PREFILL_DS_FIRST_N", "16"))
+IGLP_PARAMS = {
+    "a8w4": {
+        "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
+        "prefill": {"mma_group": 15, "mma_first_group": 14, "ds_first_n": 15},
+    },
+    "a4w4": {
+        "default": {"mma_group": 10, "mma_first_group": 10, "ds_first_n": 0},
+        "prefill": {"mma_group": 11, "mma_first_group": 13, "ds_first_n": 16},
+    },
+}
+# Prefill means tile_m == tile_n == tile_k == 256 for either data format.
+for _format_params in IGLP_PARAMS.values():
+    for _params in _format_params.values():
+        for _name in _params:
+            _env_name = "AITER_FLYDSL_" + _name.upper()
+            _value = os.environ.get(_env_name)
+            if _value is not None:
+                _value = int(_value)
+                _minimum = 0 if _name == "ds_first_n" else 1
+                if _value < _minimum:
+                    raise ValueError(f"{_env_name} must be >= {_minimum}")
+                _params[_name] = _value
+
 EXPLICIT_VGPR_PARTITION = int(
     os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
 )
@@ -74,16 +87,6 @@ if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
 FORCE_1X4_CLUSTER = int(os.environ.get("AITER_FLYDSL_FORCE_1X4_CLUSTER", "0"))
 DISABLE_CLUSTER_SYNC = int(os.environ.get("AITER_FLYDSL_DISABLE_CLUSTER_SYNC", "0"))
-if DEFAULT_MMA_GROUP < 1 or DEFAULT_MMA_FIRST_GROUP < 1:
-    raise ValueError("AITER_FLYDSL_MMA_GROUP and MMA_FIRST_GROUP must be positive")
-if DEFAULT_DS_FIRST_N < 0:
-    raise ValueError("AITER_FLYDSL_DS_FIRST_N must be non-negative")
-if PREFILL_MMA_GROUP < 1 or PREFILL_MMA_FIRST_GROUP < 1:
-    raise ValueError(
-        "AITER_FLYDSL_PREFILL_MMA_GROUP and PREFILL_MMA_FIRST_GROUP must be positive"
-    )
-if PREFILL_DS_FIRST_N < 0:
-    raise ValueError("AITER_FLYDSL_PREFILL_DS_FIRST_N must be non-negative")
 if EXPLICIT_VGPR_PARTITION not in (0, 1):
     raise ValueError("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION must be 0 or 1")
 if PLANAR_LDS not in (0, 1):
@@ -245,15 +248,12 @@ def launch_gemm_a8w4_tdm(
     # Keep the experiment switch as an override while normal dispatch obtains
     # both cluster dimensions from the tuned configuration.
     cluster_m = 1 if FORCE_1X4_CLUSTER else cluster_m
-    # The prefill IGLP settings were tuned for the 256x256x256 tile only.
-    if const_expr(tile_m == 256 and tile_n == 256 and tile_k == 256):
-        sched_mma_group = PREFILL_MMA_GROUP
-        sched_first_group = PREFILL_MMA_FIRST_GROUP
-        sched_ds_first = PREFILL_DS_FIRST_N
-    else:
-        sched_mma_group = DEFAULT_MMA_GROUP
-        sched_first_group = DEFAULT_MMA_FIRST_GROUP
-        sched_ds_first = DEFAULT_DS_FIRST_N
+    iglp_params = IGLP_PARAMS["a4w4" if a_is_fp4 else "a8w4"][
+        "prefill" if tile_m == 256 and tile_n == 256 and tile_k == 256 else "default"
+    ]
+    sched_mma_group = iglp_params["mma_group"]
+    sched_first_group = iglp_params["mma_first_group"]
+    sched_ds_first = iglp_params["ds_first_n"]
     cache_tag = (
         K,
         tile_m,
