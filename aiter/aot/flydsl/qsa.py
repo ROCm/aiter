@@ -1,13 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT jobs for the family A QSA compiles this campaign already launches.
+"""AOT warm set for family A QSA at TP1.
 
-K1 is the page-16 emit kernel, the one-row long-row scorer (decode
-M=1 and M=8 share it), and the 16-row prefill scorer. K2 is the three
-bar launches. Family B, H=8, and the other sweep values are not here.
-The JIT wrappers stay the runtime path; this module is only imported
-by the AOT collector.
+Six jobs, not complete coverage. K1 is the page-16 emit kernel, the
+4-head one-row scorer (decode M=1 and M=8 share it), and the 4-head
+16-row prefill scorer. K2 is Hq=24, Hkv=2, D=256 at the three bar
+launches: M=1 (BLOCK_N 16, 128 splits), M=8 (BLOCK_N 16, 32 splits),
+and M=512 (BLOCK_N 32, one split). Those long-row jobs also compile
+the stable decode radix.
+
+Runtime JIT is required for every other compile. Not prebuilt: TP2/4/8
+((12, 256), (6, 256), (3, 256)), (10, 128), the 8-head scorers, the
+other split counts (M=2 is 64 splits, M=16 is BLOCK_N 32 with 32
+splits), every wide-cache stride, and the compact one-workgroup and
+streaming K1 selectors. This module is only imported by the AOT
+collector.
 """
 
 from __future__ import annotations
