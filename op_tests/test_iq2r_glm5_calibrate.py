@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from aiter.iq2r_glm5_calibrate import (
+from aiter.quantization.iq2r.glm5.calibrate import (
     DiagonalSecondMomentAccumulator,
     TargetSpec,
     capture_glm5_calibration,
@@ -18,7 +18,7 @@ from aiter.iq2r_glm5_calibrate import (
     shared_target,
     token_batches,
 )
-from aiter.iq2r_glm5_compile import GLM5Layout, load_glm5_importance
+from aiter.quantization.iq2r.glm5.compile import GLM5Layout, load_glm5_importance
 
 
 class _CharTokenizer:

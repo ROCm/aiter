@@ -23,7 +23,7 @@ rank with contiguous slices (`iq2r_glm53_slice_gate`, and the generic
 Two tools turn the block-FP8 GLM-5.3 checkpoint into the packed checkpoint
 ATOM serves.
 
-1. `aiter.iq2r_glm5_calibrate` runs the FP8 model in Hugging Face
+1. `aiter.quantization.iq2r.glm5.calibrate` runs the FP8 model in Hugging Face
    Transformers (5.16 or newer, plus `kernels` for the FP8 matmul) over a
    text corpus, prefill only. For every routed and shared expert projection
    it records the importance of each input channel k,
@@ -40,7 +40,7 @@ ATOM serves.
            f.writelines(json.dumps({"text": t}, ensure_ascii=False) + "\n" for t in texts)
        EOF
        # 23,767 rows, sha256 df1912f6b3c51b485ff7181cdde30f9ccd303c02031fea262179071ee1cbc1d4
-       python3 -m aiter.iq2r_glm5_calibrate --model-dir $FP8 \
+       python3 -m aiter.quantization.iq2r.glm5.calibrate --model-dir $FP8 \
            --text-file wikitext2-train.jsonl --output calibration.pt \
            --device-map balanced
 
@@ -50,7 +50,7 @@ ATOM serves.
    inputs, which the artifact records; any still unobserved is an error. On
    a host without Hugging Face Hub access, `--fp8-kernel-dir` loads a local
    build of `kernels-community/finegrained-fp8`.
-2. `aiter.iq2r_glm5_compile` writes the packed checkpoint
+2. `aiter.quantization.iq2r.glm5.compile` writes the packed checkpoint
    (`iq2r_layout` = `glm53-packed-v1`). For each MoE layer (3-77) it encodes
    the 256 routed experts and the shared expert, fused as expert 256, on the
    GPU, weighting every error term by the calibrated importance. It packs the
@@ -60,11 +60,11 @@ ATOM serves.
 
        SLICES=(3-12 13-22 23-32 33-42 43-51 52-60 61-69 70-77)
        for i in 0 1 2 3 4 5 6 7; do
-         python3 -m aiter.iq2r_glm5_compile --model-dir $FP8 \
+         python3 -m aiter.quantization.iq2r.glm5.compile --model-dir $FP8 \
              --output-dir $OUT --calibration-cache calibration.pt \
              --device cuda:$i --layers ${SLICES[$i]} --resume &
        done; wait
-       python3 -m aiter.iq2r_glm5_compile --model-dir $FP8 \
+       python3 -m aiter.quantization.iq2r.glm5.compile --model-dir $FP8 \
            --output-dir $OUT --calibration-cache calibration.pt --resume
 
    The last run covers every layer. Instead of re-encoding the existing layer

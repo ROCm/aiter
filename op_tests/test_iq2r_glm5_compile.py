@@ -11,8 +11,14 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-import aiter.iq2r_glm5_compile as compile_module
-from aiter.iq2r_glm5_compile import (
+import aiter.quantization.iq2r.glm5.compile as compile_module
+from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_pack
+from aiter.ops.iq2r_format import (
+    IQ2R_ACTIVATION_BASIS,
+    IQ2R_FORMAT_NAME,
+    IQ2RMetadata,
+)
+from aiter.quantization.iq2r.glm5.compile import (
     LAYOUT,
     GLM5Layout,
     _projection_metadata,
@@ -26,12 +32,6 @@ from aiter.iq2r_glm5_compile import (
     iq2r_glm5_shared_source_keys,
     iq2r_glm5_source_keys,
     load_glm5_importance,
-)
-from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_pack
-from aiter.ops.iq2r_format import (
-    IQ2R_ACTIVATION_BASIS,
-    IQ2R_FORMAT_NAME,
-    IQ2RMetadata,
 )
 
 _HIDDEN = 6144

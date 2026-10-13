@@ -10,8 +10,8 @@ last expert, are encoded to IQ2R on the GPU, packed with
 then copies the remaining FP8 tensors into new shards and writes the index,
 config.json and tokenizer files, so the output directory is a complete
 checkpoint. The MTP layer keeps its FP8 experts.
-A calibration artifact from ``aiter.iq2r_glm5_calibrate`` is required for a
-production build.
+A calibration artifact from ``aiter.quantization.iq2r.glm5.calibrate`` is
+required for a production build.
 Uniform importance is available only behind an explicit diagnostic flag and is
 recorded as not O0-quality in every layer file.
 """
@@ -33,10 +33,10 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import Tensor
 
-from .iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_pack
-from .ops.iq2r import iq2r_encode_device
-from .ops.iq2r_encoder import iq2r_learn_codebook
-from .ops.iq2r_format import (
+from aiter.iq2r_glm53 import iq2r_glm53_gate_bytes, iq2r_glm53_pack
+from aiter.ops.iq2r import iq2r_encode_device
+from aiter.ops.iq2r_encoder import iq2r_learn_codebook
+from aiter.ops.iq2r_format import (
     IQ2R_ACTIVATION_BASIS,
     IQ2R_FORMAT_NAME,
     IQ2RMetadata,
@@ -287,7 +287,7 @@ def load_glm5_importance(
         if not diagnostic_uniform_importance:
             raise ValueError(
                 "production IQ2R compilation requires a calibration cache from "
-                "aiter.iq2r_glm5_calibrate; "
+                "aiter.quantization.iq2r.glm5.calibrate; "
                 "use --diagnostic-uniform-importance only for kernel bring-up"
             )
         layers = layout.moe_layers

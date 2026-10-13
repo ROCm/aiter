@@ -14,7 +14,7 @@ x_t is the projection input of token t: the MoE input for gate/up and
 act(gate) * up for down. A routed expert sees the tokens routed to it, weighted
 by their routing weight r_t; the shared expert sees every token with r_t = 1.
 The output is an ``iq2r-calibration`` artifact for
-``aiter.iq2r_glm5_compile --calibration-cache``.
+``aiter.quantization.iq2r.glm5.compile --calibration-cache``.
 
 Needs Transformers with GLM MoE DSA support (5.16 or newer) and, for the FP8
 checkpoint, the ``kernels`` package.
@@ -38,12 +38,13 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor
 
-from .iq2r_glm5_compile import (
+from aiter.ops.iq2r_format import IQ2R_ACTIVATION_BASIS
+
+from .compile import (
     _CALIBRATION_FORMAT,
     _CALIBRATION_SCHEME,
     _CALIBRATION_VERSION,
 )
-from .ops.iq2r_format import IQ2R_ACTIVATION_BASIS
 
 _ROUTED_EXPERTS = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.experts$")
 _SHARED_EXPERTS = re.compile(r"(?:^|\.)layers\.(\d+)\.mlp\.shared_experts$")
