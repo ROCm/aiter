@@ -162,9 +162,10 @@ def _device_arch():
 def _mx_reference(x, G, q_dtype):
     """Expected (data bytes, [m, n / G] scale bytes) on the current device.
 
-    MXFP8 non-finite inputs: the amax skips NaN and an Inf makes the scale 0xff;
-    NaN elements and every element of a 0xff-scale group are NaN (0xff, 0x80 on
-    FNUZ), and finite data saturates to +-max.
+    MXFP8 non-finite inputs: the amax skips NaN and NaN elements are NaN (0xff,
+    0x80 on FNUZ). A group holding an Inf gets scale 2^127 (0xfe): its Inf turns
+    into NaN and its finite data is divided by 2^127 as usual. Compare against
+    _fp8_bytes(out).
     """
     m, n = x.shape
     fp4 = q_dtype == dtypes.fp4x2
@@ -177,15 +178,23 @@ def _mx_reference(x, G, q_dtype):
     )
     amax = torch.where(torch.isnan(xf), 0.0, xf.abs()).amax(-1).clamp(min=1e-10)
     ref_scale = f32_to_mx_e8m0_scale(amax, dtype=mx).view(torch.uint8)
+    if not fp4:
+        ref_scale = ref_scale.clamp(max=0xFE)
     xs = xf / (ref_scale.to(torch.int32) - 127).float().exp2()[..., None]
     if fp4:
         return f32_to_mxfp4(xs.view(m, n)).view(torch.uint8), ref_scale
     fp8 = torch.float8_e4m3fnuz if fnuz else torch.float8_e4m3fn
     fp8_max = torch.finfo(fp8).max
-    nan = torch.isnan(xf) | (ref_scale == 0xFF)[..., None]
     out = xs.nan_to_num(0.0).clamp(-fp8_max, fp8_max).to(fp8).view(torch.uint8)
-    out[nan] = 0x80 if fnuz else 0xFF
+    out[torch.isnan(xs) | torch.isinf(xs)] = 0x80 if fnuz else 0xFF
     return out.reshape(m, n), ref_scale
+
+
+def _fp8_bytes(out):
+    """fp8 output bytes with both e4m3fn NaNs (0x7f, 0xff) as 0xff: the NaN sign
+    an Inf converts to differs between archs."""
+    b = out.view(torch.uint8)
+    return b if _device_arch() == "gfx942" else b.masked_fill(b == 0x7F, 0xFF)
 
 
 def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided, pattern=None):
@@ -219,7 +228,8 @@ def test_quant_1x32_e8m0(m, n, q_dtype, h_dtype, shuffle, strided, pattern=None)
     ref_out, ref_scale = _mx_reference(x, G, q_dtype)
     got = scale[_mx32_indices(m, scale_n)] if shuffle else scale.view(m, scale_n)
     scale_err = int((got != ref_scale).sum())
-    out_err = int((out.view(torch.uint8) != ref_out).sum())
+    got_out = out.view(torch.uint8) if fp4 else _fp8_bytes(out)
+    out_err = int((got_out != ref_out).sum())
     assert (
         scale_err == 0 and out_err == 0
     ), f"{m=} {n=} {shuffle=} {strided=} {pattern=} {scale_err=} {out_err=}"
@@ -237,7 +247,7 @@ def test_mxfp8_nonfinite_g128(m, n, h_dtype, shuffle, pattern):
     ref_out, ref_scale = _mx_reference(x, G, dtypes.fp8)
     got = scale.view(n // G, m).t() if shuffle else scale.view(m, n // G)
     scale_err = int((got != ref_scale).sum())
-    out_err = int((out.view(torch.uint8) != ref_out).sum())
+    out_err = int((_fp8_bytes(out) != ref_out).sum())
     assert (
         scale_err == 0 and out_err == 0
     ), f"{m=} {n=} {shuffle=} {pattern=} {scale_err=} {out_err=}"
@@ -262,7 +272,7 @@ def test_mxfp8_m32k4(m, n, h_dtype, pattern=None):
     g = torch.arange(n // G)[None, :]
     idx = (r // 32) * n + (g // 4) * 128 + (r % 32) * 4 + g % 4
     scale_err = int((scale[idx] != expected).sum())
-    out_err = int((out.view(torch.uint8) != ref_out).sum())
+    out_err = int((_fp8_bytes(out) != ref_out).sum())
     assert (
         scale_err == 0 and out_err == 0
     ), f"{m=} {n=} {pattern=} {scale_err=} {out_err=}"
@@ -336,7 +346,8 @@ def _assert_tiled_paths_covered(g32_shapes, g128_shapes):
 
 
 def test_mxfp8_nonfinite(group_size, shuffle, h_dtype, pattern):
-    """NaN/Inf groups give the same MXFP8 bytes on every arch; see _mx_reference."""
+    """NaN/Inf groups give the same MXFP8 bytes on every arch up to the NaN sign;
+    see _mx_reference."""
     x = torch.ones((32, group_size * 8), dtype=h_dtype)
     x[:, 1] = -1.0
     for row in range(32):
@@ -365,7 +376,7 @@ def test_mxfp8_nonfinite(group_size, shuffle, h_dtype, pattern):
         expected_scale = shuffled
     elif shuffle:
         expected_scale = expected_scale.t().contiguous()
-    assert torch.equal(out.view(torch.uint8), expected), pattern
+    assert torch.equal(_fp8_bytes(out), expected), pattern
     assert torch.equal(scale.flatten(), expected_scale.flatten()), pattern
 
 
