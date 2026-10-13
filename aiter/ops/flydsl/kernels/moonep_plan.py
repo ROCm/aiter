@@ -16,13 +16,11 @@ further communication.
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm
 from flydsl.expr import ptrtoint, range_constexpr
 from flydsl.expr import rocdl as fly_rocdl
 from flydsl.expr.typing import Stream, T
 
 from . import communication_ops_utils as comm_ops
-from .kernels_common import create_llvm_ptr
 from .tensor_shim import _run_compiled, buf_copy_load, ptr_buf_tensor
 
 WAVE_SIZE = 64
@@ -39,20 +37,6 @@ def _lds_load(ptr, idx):
 
 def _lds_store(ptr, val, idx):
     fx.ptr_store(val, ptr + fx.Int64(idx))
-
-
-def _lds_atomic_add(base_i64, idx, val):
-    """Workgroup-scope ``atomicrmw add`` on an i32 LDS slot."""
-    ptr = create_llvm_ptr(base_i64 + fx.Int64(idx) * 4, address_space=3)
-    raw = val.ir_value() if hasattr(val, "ir_value") else val
-    return llvm.AtomicRMWOp(
-        llvm.AtomicBinOp.add,
-        ptr,
-        raw,
-        llvm.AtomicOrdering.monotonic,
-        syncscope="workgroup",
-        alignment=4,
-    ).result
 
 
 def _wave_argmax(val, idx, lane):
@@ -336,7 +320,11 @@ def emit_moonep_placement(
         moved = _lds_load(p_alloc, alloc_slot)
         if (owner != dest) & (~prefetched) & (moved > fx.Int32(0)):
             _lds_store(p_alloc, fx.Int32(0), alloc_slot)
-            _lds_atomic_add(alloc_base, expert * fx.Int32(R) + owner, moved)
+            owner_slot = expert * fx.Int32(R) + owner
+            comm_ops.atomic_add_lds(
+                alloc_base + fx.Int64(owner_slot) * 4,
+                moved,
+            )
 
     fx.barrier()
 
