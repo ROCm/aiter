@@ -159,11 +159,6 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
-AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
-    "AITER_CONFIG_COMM_FUSED_MOE",
-    f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
-)
-
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -322,14 +317,6 @@ class AITER_CONFIG:
     def AITER_CONFIG_FMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FMOE", AITER_CONFIG_FMOE, "tuned_fmoe"
-        )
-
-    @property
-    def AITER_CONFIG_COMM_FUSED_MOE_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_COMM_FUSED_MOE",
-            AITER_CONFIG_COMM_FUSED_MOE,
-            "tuned_comm_fused_moe",
         )
 
     @property
@@ -602,8 +589,9 @@ class AITER_CONFIG:
             if not op_tuned_file_list:
                 config_file = default_file
             else:
-                tuned_files = ":".join(str(p) for p in op_tuned_file_list)
-                tuned_files = default_file + ":" + tuned_files
+                tuned_files = os.pathsep.join(
+                    [default_file] + [str(p) for p in op_tuned_file_list]
+                )
                 logger.info(
                     f"merge tuned file under model_configs/ and configs/ {tuned_files}"
                 )

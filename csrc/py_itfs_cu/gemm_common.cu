@@ -9,7 +9,11 @@ static constexpr int nextPow2(unsigned int num)
   return 1 << (CHAR_BIT * sizeof(num) - __builtin_clz(num - 1));
 }
 
+#ifdef _WIN32
+extern "C" __declspec(dllexport)
+#else
 extern "C" __attribute__((visibility("default")))
+#endif
 int getPaddedM(int M, int N, int K, int gl) {
     int padded_m = M;
     // granularity level, gl = 0, Fine-grained search

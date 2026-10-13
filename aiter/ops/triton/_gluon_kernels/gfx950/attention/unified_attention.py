@@ -1202,14 +1202,15 @@ class AttentionProgram:
             )[:, None]
             query_mask_qk = gl.convert_layout(query_mask, cfg.qk_layout)
 
-        # Split-KV: carve [tile_start, tile_end) into NUM_SPLITS contiguous
-        # split_idx==0 / NUM_SPLITS==1 is a no-op
+        # Split-KV: carve the sequence as reduce_segments does, so every query
+        # block of a sequence agrees on the split boundaries
         if NUM_SPLITS > 1:
-            active_tiles = tile_end - tile_start
-            tiles_per_split = (active_tiles + NUM_SPLITS - 1) // NUM_SPLITS
-            split_start = tile_start + split_idx * tiles_per_split
+            split_len = NUM_SPLITS * cfg.TILE_SIZE
+            seq_len = context_len + cur_batch_query_len
+            tiles_per_split = (seq_len + split_len - 1) // split_len
+            split_start = split_idx * tiles_per_split
             tile_end = gl.minimum(split_start + tiles_per_split, tile_end)
-            tile_start = split_start
+            tile_start = gl.maximum(split_start, tile_start)
 
         safe_tile_end = gl.minimum(safe_tile_end, tile_end - 1)
         safe_tile_end = gl.maximum(safe_tile_end, tile_start)
@@ -1432,6 +1433,8 @@ class AttentionProgram:
         # row-max, so it needs whatever scale the softmax used.
         if not cfg.USE_SINKS:
             M = M * self.SM_scale
+        # no visible key in this split: keep the guarded 0 out of the reduce max
+        M = gl.where(L > 0.0, M, float("-inf"))
         layout: gl.constexpr = cfg.pv_layout
         offs_m = gl.arange(0, cfg.BLOCK_M, layout=gl.SliceLayout(1, layout))
         offs_d = gl.arange(0, cfg.HEAD_SIZE, layout=gl.SliceLayout(0, layout))
@@ -1904,8 +1907,26 @@ def _unified_attention_gluon_kernel(
         NUM_SPLITS,
     )
 
-    # This split owns no tiles
     if NUM_SPLITS > 1 and pgm.tile_start >= pgm.tile_end:
+        # past this block's causal edge, but reduce_segments still reads it
+        if pgm.tile_start * TILE_SIZE < seq_len:
+            empty = gl.zeros(
+                [BLOCK_M], dtype=gl.float32, layout=gl.SliceLayout(1, cfg.pv_layout)
+            )
+            pgm.store_partial(
+                empty,
+                empty,
+                gl.zeros([BLOCK_M, HEAD_SIZE], dtype=gl.float32, layout=cfg.pv_layout),
+                partial_m_ptr,
+                partial_l_ptr,
+                partial_acc_ptr,
+                split_idx,
+                q_block_local_idx,
+                cur_batch_in_all_start_index,
+                kv_head_idx,
+                cur_batch_query_len,
+                NUM_SPLITS,
+            )
         return
 
     # TILE_SIZE == BLOCK_SIZE: one page per tile (fast path). Otherwise gather

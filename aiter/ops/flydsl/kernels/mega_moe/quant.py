@@ -72,6 +72,45 @@ def emit_per_1x32_mx_fp8_group(in_buf, out_buf, scale_buf, group_id):
         )
 
 
+def emit_per_1x32_mx_fp4_group(in_buf, out_buf, scale_buf, group_id):
+    """Quantize one contiguous 32-BF16 group to packed FP4 plus E8M0 scale."""
+    in_vec = group_id * fx.Int32(GROUP * 2 // 16)
+    act = []
+    local_max = fx.Float32(1e-10)
+    for chunk in range_constexpr(GROUP // 8):
+        raw = _load_i32x4(in_buf, in_vec + fx.Int32(chunk))
+        values = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
+        local_max = local_max.maximumf(fmath.absf(values).reduce(ReductionOp.MAX))
+        for elem in range_constexpr(8):
+            act.append(values[elem])
+
+    working = (local_max * fx.Int32(_FP4_INV_MAX_POS_BITS).bitcast(fx.Float32)).bitcast(
+        fx.Int32
+    )
+    mantissa = working & fx.Int32(0x7FFFFF)
+    biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
+    e8m0 = (mantissa != fx.Int32(0)).select(biased_exp + fx.Int32(1), biased_exp)
+    e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
+    scale_buf[group_id] = e8m0.to(fx.Uint8)
+
+    dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
+    words = []
+    for word in range_constexpr(GROUP // 8):
+        packed = fx.Int32(0)
+        for pair in range_constexpr(4):
+            idx = word * 8 + pair * 2
+            packed = rocdl.cvt_scalef32_pk_fp4_f32(
+                T.i32,
+                packed,
+                act[idx],
+                act[idx + 1],
+                dequant_scale,
+                pair,
+            )
+        words.append(packed)
+    _store_i32x4(out_buf, group_id, fx.Vector.from_elements(words, fx.Int32))
+
+
 def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
     """Return a @flyc.jit launcher for 1x32 MX quant of a [m, n] bf16 matrix."""
     assert n % 32 == 0, f"n={n} must be divisible by 32"
@@ -81,7 +120,6 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
     ), f"quant_mode must be fp4|fp8, got {quant_mode!r}"
 
     scale_n = n // GROUP
-    inv_max_pos_bits = _FP4_INV_MAX_POS_BITS if need_fp4 else _FP8_E4M3_INV_MAX_POS_BITS
 
     @flyc.kernel(name=f"per_1x32_mx_quant_{quant_mode}_n{n}")
     def quant_kernel(x: fx.Tensor, y: fx.Tensor, scale: fx.Tensor, m: fx.Int32):
@@ -92,47 +130,7 @@ def build_per_1x32_mx_quant_module(n: int, quant_mode: str):
         group_id = fx.block_idx.x * fx.Int32(BLOCK) + fx.thread_idx.x
         if group_id < m * fx.Int32(scale_n):
             if const_expr(need_fp4):
-                in_vec = group_id * fx.Int32(GROUP * 2 // 16)
-                act = []
-                local_max = fx.Float32(1e-10)
-                for chunk in range_constexpr(GROUP // 8):
-                    raw = _load_i32x4(in_buf, in_vec + fx.Int32(chunk))
-                    values = fx.Vector(raw).bitcast(fx.BFloat16).to(fx.Float32)
-                    local_max = local_max.maximumf(
-                        fmath.absf(values).reduce(ReductionOp.MAX)
-                    )
-                    for elem in range_constexpr(8):
-                        act.append(values[elem])
-
-                working = (
-                    local_max * fx.Int32(inv_max_pos_bits).bitcast(fx.Float32)
-                ).bitcast(fx.Int32)
-                mantissa = working & fx.Int32(0x7FFFFF)
-                biased_exp = (working >> fx.Int32(23)) & fx.Int32(0xFF)
-                e8m0 = (mantissa != fx.Int32(0)).select(
-                    biased_exp + fx.Int32(1), biased_exp
-                )
-                e8m0 = (e8m0 > fx.Int32(255)).select(fx.Int32(255), e8m0)
-                scale_buf[group_id] = e8m0.to(fx.Uint8)
-
-                dequant_scale = (e8m0 << fx.Int32(23)).bitcast(fx.Float32)
-                words = []
-                for word in range_constexpr(GROUP // 8):
-                    packed = fx.Int32(0)
-                    for pair in range_constexpr(4):
-                        idx = word * 8 + pair * 2
-                        packed = rocdl.cvt_scalef32_pk_fp4_f32(
-                            T.i32,
-                            packed,
-                            act[idx],
-                            act[idx + 1],
-                            dequant_scale,
-                            pair,
-                        )
-                    words.append(packed)
-                _store_i32x4(
-                    out_buf, group_id, fx.Vector.from_elements(words, fx.Int32)
-                )
+                emit_per_1x32_mx_fp4_group(in_buf, out_buf, scale_buf, group_id)
             else:
                 emit_per_1x32_mx_fp8_group(in_buf, out_buf, scale_buf, group_id)
 
