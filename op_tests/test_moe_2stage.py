@@ -34,6 +34,7 @@ from aiter.ops.flydsl.moe_common import (
     DEFAULT_SITUV2_LINEAR_BETA,
     GateMode,
 )
+from aiter.ops.flydsl.moe_kernels import a8w4_gfx942_supported
 from aiter.ops.opus.moe_stage2_a8w4 import _route_workspace_token_capacity
 from aiter.ops.quant import per_1x32_f8_scale_f8_quant, per_1x32_i4_quant
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -872,6 +873,10 @@ def _iter_csv_cases():
             and "flydsl_" not in kernel_name2
             and not kernel_name1.startswith("opus_moe1_")
         ):
+            continue
+        # gfx942 a8w4 rows run on MI325X only (MI300X shares cu_num 304 and the
+        # a8w4 stage 1 raises there); test_flydsl_moe_a8w4_gfx942.py covers them.
+        if "_g942" in kernel_name1 and not a8w4_gfx942_supported():
             continue
         if args.csv_filter:
             _kn = kernel_name1 + " " + kernel_name2

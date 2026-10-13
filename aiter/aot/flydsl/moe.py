@@ -167,6 +167,11 @@ def parse_csv(csv_path: str):
                 if params is None:
                     print(f"  [WARN] Unknown kernel name: {name}, skipping")
                     continue
+                # gfx942 a8w4 stage 1 (`_g942`) is its own kernel
+                # (gemm1_a8w4_gfx942, JIT-compiled on first use); the stage-1
+                # compile below would build the gfx950 mixed-MoE kernel for it.
+                if params.get("in_dtype") == "a8w4_gfx942":
+                    continue
 
                 for enable_bias in enable_bias_options:
                     job = {
