@@ -159,15 +159,16 @@ def parse_csv(csv_path):
             kn2 = (row.get("kernelName2") or "").strip()
             v2_g2 = parse_flydsl_v2_gemm2_kernel(kn2)
             if v2_g2 is not None:
-                bk = v2_g2["tile_k"]
-                v2_d_inter = ((inter_dim + bk - 1) // bk) * bk
-                v2_d_inter_real = inter_dim if inter_dim != v2_d_inter else None
-            elif _is_mxfp4_kname(kn2):
-                native_bk = _parse_mxfp4_g2_kname(kn2)["BK"]
-                v2_d_inter = ((inter_dim + native_bk - 1) // native_bk) * native_bk
-                v2_d_inter_real = inter_dim if inter_dim != v2_d_inter else None
+                v2_d_inter = inter_dim
             else:
                 v2_d_inter = d_inter
+            # Native gemm2 pads K only up to its own BK (128 or 256).
+            native_d_inter, native_d_inter_real = d_inter, None
+            if _is_mxfp4_kname(kn2):
+                native_bk = _parse_mxfp4_g2_kname(kn2)["BK"]
+                native_d_inter = -(-inter_dim // native_bk) * native_bk
+                if native_d_inter != inter_dim:
+                    native_d_inter_real = inter_dim
 
             if _is_mxfp4_kname(kn1):
                 p1 = _parse_mxfp4_g1_kname(kn1)
@@ -291,8 +292,8 @@ def parse_csv(csv_path):
                             "epilog": _epilog_of(
                                 p2["atomic"], mxfp4out, p2["cshuffle"]
                             ),
-                            "D_INTER": v2_d_inter,
-                            "D_INTER_REAL": v2_d_inter_real,
+                            "D_INTER": native_d_inter,
+                            "D_INTER_REAL": native_d_inter_real,
                             "topk": topk,  # unused by the kernel; for the entry signature
                             "xcd_swizzle": p2["xcd_swizzle"],
                         }

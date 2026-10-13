@@ -17,7 +17,6 @@ from .mxfp4_gemm_common import (
     _gep1,
     _global_base_ptr1,
     _inline_dpp_quad_amax,
-    _lds_ptr3,
     _lds_swizzle_mask,
     _raw,
     _udiv,
@@ -50,34 +49,6 @@ def aq_bytes_for(max_m, k):
 
 def saq_slot_bytes(BM, KH_TILE):
     return BM * KH_TILE
-
-
-def tiling(BM, KH_TILE):
-    lanes_per_row = KH_TILE // 16
-    rows_per_call = 64 // lanes_per_row
-    n_load_waves = min(4, BM // rows_per_call)
-    rows_per_wave = BM // n_load_waves
-    return n_load_waves, rows_per_wave, rows_per_wave // rows_per_call
-
-
-def _issue_a_load_lds(
-    aq_rsrc, saq_base_i32, slot, kt, car, lane, slot_bytes, lds_row, KH_TILE, k_half
-):
-    lanes_per_row = KH_TILE // 16
-    lane_in_row = lane % fx.Int32(lanes_per_row)
-    mask = _lds_swizzle_mask(lds_row + (lane // fx.Int32(lanes_per_row)), KH_TILE)
-    voffset = ((lane_in_row * fx.Int32(16)) ^ mask) + car * fx.Int32(k_half)
-    off_i32 = fx.Int32(slot * slot_bytes) + lds_row * fx.Int32(KH_TILE)
-    lds_ptr = _lds_ptr3(saq_base_i32, off_i32)
-    rocdl.raw_ptr_buffer_load_lds(
-        aq_rsrc,
-        lds_ptr,
-        fx.Int32(16),
-        voffset,
-        fx.Int32(kt * KH_TILE),
-        fx.Int32(0),
-        fx.Int32(0),
-    )
 
 
 def compile_gemm2_a4w4_port(
@@ -513,6 +484,9 @@ def _gemm2_body(
                 i0 = sub * 2
                 i1 = sub * 2 + 1
                 for half in range_constexpr(_kHalves):
+                    # load_b_tile leaves the K-pad past D_INTER_REAL unloaded.
+                    if const_expr(kt * _kHalves + half >= _n_real_half):
+                        continue
                     carry0 = zero4 if const_expr(init and half == 0) else accm[i0][J]
                     accm[i0][J] = rocdl.mfma_scale_f32_16x16x128_f8f6f4(
                         mfma_res_ty,
