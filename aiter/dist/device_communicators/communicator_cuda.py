@@ -35,9 +35,10 @@ class CudaCommunicator(DeviceCommunicatorBase):
         device_group: ProcessGroup | None = None,
         unique_name: str = "",
         reuse_from: "CudaCommunicator | None" = None,
+        all2all_manager_created: bool = False,
     ):
         self._all2all_manager = None
-        self._all2all_manager_created = False
+        self._all2all_manager_created = all2all_manager_created
 
         super().__init__(cpu_group, device, device_group, unique_name)
         from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
