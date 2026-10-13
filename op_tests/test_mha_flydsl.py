@@ -33,6 +33,10 @@ import torch
 
 import aiter
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.kernels.fmha_gfx1250.fmha_fwd_prefill_a16w16_m32x8 import (
+    NUM_Q_TILES_CHOICES,
+    WMMA_M,
+)
 from aiter.ops.mha import flash_attn_func, flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 from aiter.utility import dtypes
@@ -600,9 +604,29 @@ BSHD_SHAPES = [
 
 def _rand_seqs(B, max_sq, max_sk, rng):
     """Random per-batch lengths with ``1 <= sq_i <= sk_i <= max_sk``."""
+    if min(max_sq, max_sk) < 1:
+        raise SystemExit(
+            f"--rand-seqlens draws in [1, len] and has no form at zero "
+            f"(got -sq {max_sq} -sk {max_sk})"
+        )
     seqs_k = [rng.randint(1, max_sk) for _ in range(B)]
     seqs_q = [rng.randint(1, min(max_sq, sk)) for sk in seqs_k]
     return seqs_q, seqs_k
+
+
+# Q and O pack `rows_per_warp` = WMMA_M * num_q_tiles rows per wave, and the managers
+# require the GQA ratio and that tile to divide each other. BLOCK_M (hence num_q_tiles)
+# is picked per call, so a generated pair is only safe if it holds for every choice --
+# H_q % H_kv alone lets through e.g. 6/1, which asserts instead of running.
+_ROWS_PER_WARP = tuple(WMMA_M * n for n in NUM_Q_TILES_CHOICES)
+
+
+def _gqa_packs(H_q, H_kv):
+    """True when (H_q, H_kv) satisfies the Q/O packing invariant for every BLOCK_M."""
+    if H_q % H_kv:
+        return False
+    gqa = H_q // H_kv
+    return all(gqa % r == 0 or r % gqa == 0 for r in _ROWS_PER_WARP)
 
 
 # Per-axis values present in the built-in lists; an axis the user does not name
@@ -644,7 +668,12 @@ def _shape_lists(args):
         return THD_SHAPES, BSHD_SHAPES
 
     def axis(name, given):
-        return given or _AXIS_DEFAULTS[name]
+        vals = given or _AXIS_DEFAULTS[name]
+        if args.rand_seqlens and not given and name.startswith("seqlen"):
+            # The curated empty-KV cases contribute 0, which has no random form; they
+            # stay covered by the built-in lists.
+            vals = [v for v in vals if v > 0]
+        return vals
 
     rng = random.Random(args.seed)
     thd, bshd, skipped = [], [], 0
@@ -655,7 +684,7 @@ def _shape_lists(args):
         axis("seqlen_q", args.seqlen_q),
         axis("seqlen_k", args.seqlen_k),
     ):
-        if H_q % H_kv:
+        if not _gqa_packs(H_q, H_kv):
             skipped += 1
             continue
         bshd.append((B, sq, sk, H_q, H_kv))
@@ -666,7 +695,16 @@ def _shape_lists(args):
                 seqs_q, seqs_k = [sq] * B, [sk] * B
             thd.append((seqs_q, seqs_k, H_q, H_kv))
     if skipped:
-        aiter.logger.warning("skipped %d combos where nheads %% nheads_kv", skipped)
+        aiter.logger.warning(
+            "skipped %d head combos the kernel cannot pack (nheads %% nheads_kv, or a "
+            "GQA ratio that neither divides nor is a multiple of %s)",
+            skipped,
+            " / ".join(str(r) for r in _ROWS_PER_WARP),
+        )
+    if not thd and not bshd:
+        raise SystemExit(
+            "no requested shape survives the head-packing invariant -- nothing to run"
+        )
     return thd, bshd
 
 
