@@ -260,9 +260,8 @@ def test_fused_qk_rope_cat_and_cache_mla(
     torch.testing.assert_close(torch_k_pe_og_dtype, triton_k_pe, atol=1e-1, rtol=1e-1)
 
 
-# The decode outputs (decode_q_pe_out, q_nope_zeros_out) only cover the first
-# num_decode_toks_for_zeros tokens. Check every (token, head) entry of them for
-# num_decode_toks_for_zeros < T, and that nothing is written past their last row.
+# Decode outputs with num_decode_toks_for_zeros < T, including that no row past
+# the last decode token is written.
 @pytest.mark.parametrize(
     "T, num_decode_toks_for_zeros",
     [(5, 2), (8, 3), (4, 1), (128, 37), (128, 127)],
@@ -315,9 +314,8 @@ def test_fused_qk_rope_cat_and_cache_mla_partial_decode_zeros(
         nope_first=False,
     ).squeeze(0)
 
-    # decode_q_pe_out is a view of the first rows of a NaN-filled buffer; the
-    # extra rows act as guard rows that must stay untouched. They cover every
-    # row up to T + 1, since a wrong gate can write any token row below T.
+    # decode_q_pe_out is a view into a NaN-filled buffer whose extra rows, up to
+    # T + 1, must stay untouched.
     num_guard_rows = T - num_decode_toks_for_zeros + 2
     decode_q_pe_buf = torch.full(
         (num_decode_toks_for_zeros + num_guard_rows, QH, D_pe),
