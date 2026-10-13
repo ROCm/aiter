@@ -357,17 +357,55 @@ def qsa_layer(
 ) -> torch.Tensor:
     """Run one QSA layer: indexer select, expand+tail, sparse GQA.
 
-    ``backend="auto"`` (the default) uses FlyDSL only when
-    ``qsa_auto_uses_flydsl`` is set, and Triton otherwise. A GQA query
-    that is not in the measured table logs once on this path. A GPU
-    outside gfx942/gfx950 also stays on Triton, as does a token budget
-    other than 512 blocks at compress ratio 4. ``backend="flydsl"`` is
-    K1 + vendored expand + K2. That override still raises on an
-    unsupported arch, and on any other selection budget.
-    ``backend="triton"`` is the live AMD path. Both backends multiply
-    indexer scores by ``score_scale`` and QK by ``softmax_scale``
-    (``None`` is ``head_dim**-0.5``). The MQA scorer takes the reciprocal
-    of ``score_scale`` because that API divides.
+    Returns the bf16 GQA tensor ``[M, Hq, D]``. A caller-provided ``out``
+    is that tensor.
+
+    ``backend`` is ``auto`` (the default, including ``None``), ``flydsl``,
+    or ``triton``. ``auto`` uses FlyDSL only when ``qsa_auto_uses_flydsl``
+    is set, and Triton otherwise. A GQA query missing from the measured
+    table logs once on this path. A GPU outside gfx942/gfx950 also stays
+    on Triton, as does a token budget other than 512 blocks at compress
+    ratio 4. ``flydsl`` is K1, the vendored expand, and K2, and raises on
+    an unsupported arch or any other budget. ``triton`` is the live AMD
+    path. Both backends multiply indexer scores by ``score_scale`` and QK
+    by ``softmax_scale``. ``None`` is ``head_dim**-0.5`` for that tensor.
+    The MQA scorer takes the reciprocal of ``score_scale`` because that
+    API divides.
+
+    Args:
+        q_indexer: bf16 ``[M, H, 128]``. FlyDSL accepts ``H`` of 4 or 8.
+        index_k_cache: bf16 ``[pages, page_size, 1, 128]``. The D stride
+            is 1. The page, token, and head strides are multiples of 8
+            elements. The cache is read in place.
+        index_page_table: int32 ``[n_req, n_pages]``.
+        q_gqa: bf16 ``[M, Hq, D]``, on the same GPU as the other tensors.
+        k_cache, v_cache: bf16 ``[pages, page_size, Hkv, D]``, matching
+            each other in shape and stride, with a unit D stride and the
+            same 8-element stride rule. ``Hq`` divides across ``Hkv`` in
+            a group of at most 16. ``D`` is a multiple of 32 and fills
+            the K2 gather, K LDS map, and PV tile.
+        kv_page_table: int32 ``[n_req, n_pages]``.
+        token_to_req, query_positions: int32 ``[M]``.
+        context_lens: 1-D int32, with no more rows than ``index_page_table``.
+        indices: optional int32 ``[M, token_topk + compress_ratio - 1]``
+            expand buffer. ``None`` allocates it.
+        block_ids: optional contiguous int32 ``[M, 512]`` K1 buffer. The
+            FlyDSL path writes it. The Triton path does not read it.
+        out: optional contiguous bf16 ``[M, Hq, D]`` matching ``q_gqa``.
+            ``None`` allocates it.
+        token_topk: selected tokens. The default is 2048, which is the
+            FlyDSL budget of 512 blocks.
+        compress_ratio: block size. The default, and the FlyDSL value, is 4.
+        score_scale, softmax_scale: see above.
+        backend: ``auto``, ``flydsl``, or ``triton``.
+
+    A span past 4 GiB on a cache selects the wide gather compile. An empty
+    query, cache, or page table writes ``-1`` block ids and a zero ``out``
+    and does not launch. K2 allocates its own split partials on a
+    multi-split launch. Sigmoid and partial RoPE stay outside this call.
+
+    Returns:
+        Sparse GQA output, bf16 ``[M, Hq, D]``.
     """
     selected = normalize_qsa_backend(backend)
     if selected == "flydsl":
