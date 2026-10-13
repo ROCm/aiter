@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from aiter import logger
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -992,12 +993,17 @@ def test_mha_backward_varlen(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize("impl", ["default", "dao_ai"])
-def test_mha_backward_varlen_very_negative_logits(impl: str):
+@pytest.mark.parametrize(
+    "impl, bwd_mode", [("default", None), ("dao_ai", "fused"), ("dao_ai", "split")]
+)
+def test_mha_backward_varlen_very_negative_logits(impl: str, bwd_mode, monkeypatch):
     # Rows whose logits are all very negative (logsumexp < -88) used to overflow exp(0 - lse) to inf
     # on the zero-loaded keys of the last partial key block of the unmasked dq loop, and inf * 0 put
     # NaN in dq. Seen on real Qwen2.5-1.5B activations. The sequence lengths are not block multiples
     # so that partial block exists.
+    if bwd_mode is not None:
+        # The dao_ai "fused" and "split" backward modes use different dq loops; monkeypatch restores the mode.
+        monkeypatch.setattr(flash_attn_2, "BWD_MODE", bwd_mode)
     torch.cuda.empty_cache()
     torch.manual_seed(0)
     mha_set_use_fused_bwd_kernel(False)
