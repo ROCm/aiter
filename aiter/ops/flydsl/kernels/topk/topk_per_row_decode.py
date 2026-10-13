@@ -41,12 +41,20 @@ _PART_ELEMENTS = 32_768
 _STABLE_PART_ELEMENTS = 65_536
 
 
-def topk_per_row_decode_parts(rows: int, width: int, num_cus: int, stable: bool) -> int:
+def _part_elements(k: int, stable: bool) -> int:
+    default = _STABLE_PART_ELEMENTS if stable else _PART_ELEMENTS
+    aligned_k = (k + _VEC - 1) // _VEC * _VEC
+    return max(default, aligned_k)
+
+
+def topk_per_row_decode_parts(
+    rows: int, width: int, k: int, num_cus: int, stable: bool
+) -> int:
     """Parts per long row: no more than fill the CUs or than the width can feed.
 
     Each row still takes as many as its own length supports, at run time.
     """
-    part_elements = _STABLE_PART_ELEMENTS if stable else _PART_ELEMENTS
+    part_elements = _part_elements(k, stable)
     cu_parts = 1 << (max(1, num_cus // max(1, rows)).bit_length() - 1)
     width_parts = max(1, width // part_elements)
     width_parts = 1 << (width_parts.bit_length() - 1)
@@ -80,8 +88,7 @@ def build_topk_per_row_decode_module(
         wave_size=wave_size,
         arch=arch,
     )
-    aligned_k = (k + _VEC - 1) // _VEC * _VEC
-    part_elements = max(_STABLE_PART_ELEMENTS if stable else _PART_ELEMENTS, aligned_k)
+    part_elements = _part_elements(k, stable)
 
     @fx.struct
     class ArrivalStorage:
@@ -296,6 +303,7 @@ def clear_topk_per_row_decode_workspace_cache() -> None:
 
 
 def launch_topk_per_row_decode(
+    *,
     logits: torch.Tensor,
     next_n: int,
     seq_lens: torch.Tensor,
@@ -312,7 +320,7 @@ def launch_topk_per_row_decode(
     stream: torch.cuda.Stream,
     packed_rows: bool,
 ) -> None:
-    parts = topk_per_row_decode_parts(rows, width, num_cus, stable)
+    parts = topk_per_row_decode_parts(rows, width, k, num_cus, stable)
     if parts == 1:
         launcher = build_radix_topk_one_block_module(
             k,

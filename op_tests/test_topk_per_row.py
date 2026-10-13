@@ -671,11 +671,22 @@ parser.add_argument(
     e.g.: -d random""",
 )
 
+parser.add_argument(
+    "--regressions",
+    choices=["mb-workspace-reuse", "flydsl-decode-split-reuse"],
+    nargs="*",
+    default=["mb-workspace-reuse", "flydsl-decode-split-reuse"],
+    help="""Regression checks to run before the configured sweep.
+    Pass --regressions with no values to skip both.""",
+)
+
 args = parser.parse_args()
 
 # Self-reset / persistent-workspace regression (runs in CI via `python3 <file>`).
-test_mb_workspace_reuse()
-test_flydsl_decode_split_reuse()
+if "mb-workspace-reuse" in args.regressions:
+    test_mb_workspace_reuse()
+if "flydsl-decode-split-reuse" in args.regressions:
+    test_flydsl_decode_split_reuse()
 
 
 # Ask each path which arches it serves rather than keeping a second copy

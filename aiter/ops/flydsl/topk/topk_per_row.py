@@ -17,9 +17,7 @@ from ..kernels.topk.radix_topk_one_block import (
     build_radix_topk_one_block_module,
 )
 from ..kernels.topk.topk_per_row_decode import (
-    clear_topk_per_row_decode_workspace_cache as _clear_decode_workspace_cache,
-)
-from ..kernels.topk.topk_per_row_decode import (
+    clear_topk_per_row_decode_workspace_cache,  # noqa: F401 -- public re-export
     launch_topk_per_row_decode,
 )
 from ..kernels.topk.topk_per_row_decode_persistent import (
@@ -29,10 +27,6 @@ from ..kernels.topk.topk_per_row_decode_persistent import (
 # Widths up to this value use the persistent one-workgroup kernel.
 _ONE_WORKGROUP_MAX_ROW_WIDTH = 20_000
 _SHORT_ROWS_1024_THREAD_MAX_ROWS = 256
-
-
-def clear_topk_per_row_decode_workspace_cache() -> None:
-    _clear_decode_workspace_cache()
 
 
 @lru_cache(maxsize=128)
@@ -394,21 +388,21 @@ def flydsl_top_k_per_row_decode(
     # Allocated width bounds every row, but a wide buffer may still hold short
     # rows: the kernel reads each row's length and splits only the long ones.
     launch_topk_per_row_decode(
-        logits,
-        next_n,
-        seq_lens,
-        starts,
-        indices,
-        rows,
-        width,
-        k,
-        stable,
-        values,
-        arch,
-        wave_size,
-        get_cu_num(),
-        stream,
-        packed,
+        logits=logits,
+        next_n=next_n,
+        seq_lens=seq_lens,
+        row_starts=starts,
+        indices=indices,
+        rows=rows,
+        width=width,
+        k=k,
+        stable=stable,
+        values=values,
+        arch=arch,
+        wave_size=wave_size,
+        num_cus=get_cu_num(),
+        stream=stream,
+        packed_rows=packed,
     )
 
 
@@ -429,7 +423,13 @@ def flydsl_radix_topk_one_block(
     plane_width: int | None = None,
     packed_rows: bool = False,
 ) -> None:
-    """Launch the one-block radix TopK kernel for one prefill or decode call."""
+    """Launch the one-block radix TopK kernel for one prefill or decode call.
+
+    With ``packed_rows`` in decode mode, row r starts at ``row_starts[r]`` in
+    the input's first row, while output indices remain relative to that start.
+    ``plane_width`` defaults to the logits width; it bounds every row and
+    selects the same kernel variant that an unpacked plane of that width uses.
+    """
     if packed_rows and (not is_decode or row_starts is None):
         raise ValueError("packed rows require decode mode and row_starts")
     if row_starts is None:
