@@ -78,6 +78,7 @@ converts and the cache layout, a contract with a producer in another
 component, does not move.
 """
 
+import math
 from functools import cache
 
 import flydsl.compiler as flyc
@@ -284,11 +285,15 @@ def geometry(max_query_len, batch, heads, max_block, device=None):
 def _cu_count(device=None) -> int:
     """CU count, memoised: the tile_q search asks for it once per candidate,
     and at a 22 us kernel that host-side query measured 1.7x the kernel."""
+    import os
+
     import torch
 
     from aiter.jit.utils.chip_info import get_cu_num
 
-    if device is None:
+    # `CU_NUM` wins over the device here too, or this module and the decode
+    # module resolve different geometries from the same bounds.
+    if device is None or os.environ.get("CU_NUM"):
         return get_cu_num()
     return torch.cuda.get_device_properties(device).multi_processor_count
 
@@ -518,6 +523,17 @@ def build_prefill_score(g):
             fx.add_offset(fx.get_iter(cu_buf), b + fx.Int32(1)).load(T.i32)
         )
         q_len = seq_next - seq_start
+        # Row this request's query block starts at, for the staging address.
+        # It is `seq_start` whenever the request HAS rows. When it does not,
+        # the `q < q_len` clamp below sends every row to q = 0 and so to
+        # `seq_start`, which for a TRAILING empty request is `total_q` -- one
+        # row past `idx_q`, and the buffer view's num_records is the view
+        # maximum rather than this tensor, so nothing catches it. Fold the
+        # correction into the origin instead of clamping each staged row: it is
+        # CTA-uniform and the per-row form cost 2-3% on every uniform batch.
+        last_row = seq_next - fx.Int32(1)
+        last_row = (last_row > fx.Int32(0)).select(last_row, fx.Int32(0))
+        q_origin = (q_len > fx.Int32(0)).select(seq_start, last_row)
         seq_len = fx.Int32(fx.add_offset(fx.get_iter(seq_buf), b).load(T.i32))
         prefix_len = fx.Int32(fx.add_offset(fx.get_iter(pre_buf), b).load(T.i32))
         q_base = pid_q * fx.Int32(TILE_Q)
@@ -525,6 +541,16 @@ def build_prefill_score(g):
         # can contribute, and this chunk owns a slice of what is left.
         hi_tok = prefix_len + q_base + fx.Int32(TILE_Q)
         hi_tok = (hi_tok < seq_len).select(hi_tok, seq_len)
+        # The grid is sized by `max_query_len`, so a short request still gets
+        # every tile. A tile at or past its last query row stores nothing --
+        # `row < q_len` gates every writer -- but `hi_tok` is clamped only by
+        # `seq_len`, so it would still walk the whole causal window first. Mixed
+        # batches are where that bites: one request of (q 8192, prefix 0) next
+        # to one of (q 1, prefix 131071) gives the short request 64 tiles, each
+        # scanning about 1024 pages for nothing. `q_base < q_len` joins the
+        # page-range guard below rather than clamping `hi_tok`, which keeps it
+        # off the block arithmetic -- as a clamp it cost 3% at b4/q1024/ctx16K.
+
         blk_end = (hi_tok + fx.Int32(PAGE - 1)) // fx.Int32(PAGE)
         blk_lo = pid_chunk * i32_chunk_blocks
         blk_hi = blk_lo + i32_chunk_blocks
@@ -636,7 +662,7 @@ def build_prefill_score(g):
                 q = q_base + row
                 q = (q < q_len).select(q, fx.Int32(0))
                 off = (
-                    (seq_start + q) * i32_stride_q_n
+                    (q_origin + q) * i32_stride_q_n
                     + head * i32_stride_q_h
                     + c * fx.Int32(QS_ELEMS)
                 )
@@ -1129,7 +1155,7 @@ def build_prefill_score(g):
             )
             return page_buffer(fx.Int32(fx.rocdl.readfirstlane(T.i32, page)))
 
-        if blk_lo < blk_hi:
+        if (blk_lo < blk_hi) & (q_base < q_len):
             # LDS_TRIP pages per trip -- PPW rounded up to even, because
             # the two page buffers are picked with `j % 2`. `store_run`
             # still sees runs of exactly PPW consecutive blocks.
@@ -1272,6 +1298,17 @@ def score_prefill_flydsl(
         raise ValueError(f"max_query_len must be positive, got {max_query_len}")
     if not isinstance(max_seq_len, int) or max_seq_len < 1:
         raise ValueError(f"max_seq_len must be positive, got {max_seq_len}")
+    # The epilogue takes each page's MAX and only then multiplies by the scale
+    # (`folded[j][i] * f32_scale`), so the scale has to be order-preserving:
+    # for a negative one `max(dot) * scale` is not `max(dot * scale)` and every
+    # score is silently the wrong block's. Non-finite and sub-normal values
+    # reach the FP32 kernel argument as-is. Decode states the same contract.
+    scaled = sm_scale * LOG2E
+    if not math.isfinite(scaled) or not 2**-149 <= scaled <= (2 - 2**-23) * 2**127:
+        raise ValueError(
+            f"sm_scale * LOG2E must be finite and positive in FP32, got {scaled}"
+        )
+    scaled_f32 = float(scaled)
     if heads < 1:
         raise ValueError(f"heads must be positive, got {heads}")
     batch = cu_seqlens_q.shape[0] - 1
@@ -1290,10 +1327,20 @@ def score_prefill_flydsl(
     # were 1 and silently scores the wrong features. Same contract the decode
     # scorer states, and the reason it states it rather than threading the
     # stride through every load.
+    # Overlap is not the only way to break this: `q_fp8_at` turns a bf16
+    # element offset into a dword offset with `off >> 1` and issues a vector
+    # load, so an ODD row or head stride lands the load off its natural
+    # boundary and drops a feature. `buf[T, H, 129][..., :128]` has no overlap
+    # and still reads head 1 from element 128. Decode states the same contract.
     if idx_q.stride(2) != 1 or idx_q.stride(1) < HEAD_DIM:
         raise ValueError(
             f"idx_q: feature stride must be 1 and heads must not overlap, got "
             f"stride {idx_q.stride()}"
+        )
+    if any(st * idx_q.element_size() % 16 for st in idx_q.stride()[:2]):
+        raise ValueError(
+            f"idx_q: rows and heads must be 16-byte aligned, got stride "
+            f"{idx_q.stride()} for a {idx_q.element_size()}-byte element"
         )
     # `block_table` reaches the kernel as `b * stride(0) + column`, so the
     # column axis is assumed packed; the three length arrays are indexed by
@@ -1379,7 +1426,7 @@ def score_prefill_flydsl(
             out.stride(1),
             out.stride(2),
             block_table.stride(0),
-            float(sm_scale * LOG2E),
+            scaled_f32,
             q_tiles,
             batch * heads,
             chunks,

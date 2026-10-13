@@ -240,7 +240,11 @@ def compare(got, ref):
 def test_metadata_rejects_cpu():
     q = torch.empty(1, 1, D, dtype=torch.bfloat16)
     k = torch.empty(1, P, D, dtype=torch.bfloat16)
-    assert not kernel.index_score_supported(q, k, 1, 1, 1)
+    bt = torch.zeros(1, 1, dtype=torch.int32)
+    lens = torch.zeros(1, dtype=torch.int32)
+    # Supplied so the refusal is about the device, not about the two tensors
+    # the predicate now requires in its own right.
+    assert not kernel.index_score_supported(q, k, 1, 1, 1, bt, seq_lens=lens)
 
 
 def test_capacity_threshold(monkeypatch):
@@ -271,7 +275,7 @@ def test_reject_misaligned_cache():
     k = torch.empty_strided(
         (1, P, D), (16512, 129, 1), dtype=torch.bfloat16, device="cuda"
     )
-    assert not kernel.index_score_supported(q, k, 1, 1, mb, bt)
+    assert not kernel.index_score_supported(q, k, 1, 1, mb, bt, seq_lens=_lens)
 
 
 @requires_gfx950
@@ -284,7 +288,7 @@ def test_narrow_block_table_rejected():
     q, k, bt, lens, mb = make_case(2, 4, 4, [4096, 4096])
     assert bt.shape[1] == mb > 1
     narrow = bt[:, : mb - 1].contiguous()
-    assert not kernel.index_score_supported(q, k, 4, 4, mb, narrow)
+    assert not kernel.index_score_supported(q, k, 4, 4, mb, narrow, seq_lens=lens)
     with pytest.raises(ValueError, match="block_table"):
         score_flydsl(q, k, narrow, lens, 4, 4, D**-0.5, mb)
 
@@ -556,6 +560,7 @@ def test_kernel_name_separates_every_code_changing_field():
         (16, 1, 17, 4),
     ],
 )
+@requires_gfx950
 def test_served_decode_dispatch(S, H, batch, ppw):
     resolved = geometry(batch, 8192, S, H)
     assert (
@@ -591,6 +596,7 @@ def test_served_decode_dispatch(S, H, batch, ppw):
         (4, 1, 1, 4096, 1, 1),
     ],
 )
+@requires_gfx950
 def test_served_depth_capped_by_occupancy(
     monkeypatch, S, H, batch, max_block, ppw, spread
 ):
@@ -606,6 +612,7 @@ def test_served_depth_capped_by_occupancy(
 
 
 @pytest.mark.parametrize("batch,max_block,tw", [(4, 64, 4), (4, 128, 2), (4, 129, 1)])
+@requires_gfx950
 def test_q1_token_split_regime_kept(monkeypatch, batch, max_block, tw):
     from aiter.jit.utils import chip_info
 
@@ -632,6 +639,7 @@ def test_q1_token_split_regime_kept(monkeypatch, batch, max_block, tw):
         (4, 1, 1, 1, 1),
     ],
 )
+@requires_gfx950
 def test_spread_dispatch(S, H, batch, max_block, spread):
     resolved = geometry(batch, max_block, S, H)
     assert resolved["spread"] == spread
@@ -641,6 +649,7 @@ def test_spread_dispatch(S, H, batch, max_block, spread):
     assert kernel.work_map_capacity(batch, max_block, S, H) >= rows
 
 
+@requires_gfx950
 def test_spread_declines_unpackable_bounds():
     """A spread row packs the first page in 16 bits and the page count in the
     top byte of the length word. Where that does not fit the selector takes the
@@ -1046,12 +1055,13 @@ def test_arch_rejected(monkeypatch):
         "get_device_properties",
         lambda device: SimpleNamespace(gcnArchName="gfx90a"),
     )
-    assert not kernel.index_score_supported(q, k, 1, 1, mb, bt)
+    assert not kernel.index_score_supported(q, k, 1, 1, mb, bt, seq_lens=lens)
     with pytest.raises(ValueError, match="requires gfx950"):
         score_flydsl(q, k, bt, lens, 1, 1, D**-0.5, mb)
 
 
 @pytest.mark.parametrize("operand", ["q", "out", "bt", "map"])
+@requires_gfx950
 def test_address_span_rejected_without_allocation(monkeypatch, operand):
     from types import SimpleNamespace
 
@@ -1087,7 +1097,10 @@ def test_address_span_rejected_without_allocation(monkeypatch, operand):
         bt = meta((2, 1), (1 << 30, 1), torch.int32)
     if operand == "map":
         wm = meta((2, 2), (1 << 30, 1), torch.int32)
-    assert not kernel.index_score_supported(q, k, 1, 1, 1, bt, out=out, work_map=wm)
+    lens = meta((1,), (1,), torch.int32)
+    assert not kernel.index_score_supported(
+        q, k, 1, 1, 1, bt, seq_lens=lens, out=out, work_map=wm
+    )
     with pytest.raises(ValueError, match="span"):
         kernel._validate_metadata(q, k, 1, 1, 1, bt, out=out, work_map=wm)
 
@@ -1146,6 +1159,9 @@ def test_exact_size_uses_explicit_device(monkeypatch):
 
     from aiter.jit.utils import chip_info
 
+    # An explicit device wins over the probed count -- but `CU_NUM` wins over
+    # both, so drop it or this asserts whatever the shell happened to export.
+    monkeypatch.delenv("CU_NUM", raising=False)
     monkeypatch.setattr(chip_info, "get_cu_num", lambda: 304)
     monkeypatch.setattr(
         torch.cuda,
@@ -1154,6 +1170,66 @@ def test_exact_size_uses_explicit_device(monkeypatch):
     )
     # S16 H4 takes the capacity estimate, which is what reads the CU count.
     assert kernel.work_map_size(16, 1024, 16, 4, device=torch.device("cuda", 0)) == 1024
+
+
+@requires_gfx950
+def test_cu_override_reaches_both_sizing_paths(monkeypatch):
+    """`work_map_size` has no tensor and resolves with `device=None`, while
+    `build_work_map` resolves from `seq_lens.device`. Read different counts and
+    the geometry differs: with `CU_NUM=64` on a 256-CU part one said 64 rows
+    and the other 128, so the buffer the first sized was refused by the second.
+    """
+    monkeypatch.setenv("CU_NUM", "64")
+    from aiter.jit.utils import chip_info
+
+    monkeypatch.setattr(chip_info, "get_cu_num", lambda: 64)
+    dev = torch.device("cuda", 0)
+    assert kernel.work_map_size(1, 128, 1, 1) == kernel.work_map_size(
+        1, 128, 1, 1, device=dev
+    )
+    lens = torch.full((1,), 128 * P, dtype=torch.int32, device="cuda")
+    rows = kernel.work_map_size(1, 128, 1, 1)
+    buf = torch.empty((rows, 2), dtype=torch.int32, device="cuda")
+    assert kernel.build_work_map(lens, 128, 1, 1, out=buf).shape[0] == rows
+
+
+@requires_gfx950
+@pytest.mark.parametrize("batch,mb,S,H", [(4, 1024, 4, 1), (1, 1024, 4, 1)])
+def test_legacy_map_is_honoured_under_spread(batch, mb, S, H):
+    """A map from the two-argument `build_work_map` has unsplit geometry.
+
+    The rescue that honours it only knew about `waves_per_tok`, so a geometry
+    that differs by `spread` instead was rejected: `work_map_size(4, 1024)` is
+    1024 rows where S=4,H=1 wants 1028 -- one spare row per request -- and the
+    scorer raised "expected exact grid slice" on a map it had just been told
+    how to read.
+    """
+    legacy = kernel.work_map_size(batch, mb)
+    split = kernel.work_map_size(batch, mb, S, H)
+    assert legacy != split, "pick a shape where the geometries actually differ"
+    lens = torch.full((batch,), mb * P, dtype=torch.int32, device="cuda")
+    wm = kernel.build_work_map(lens, mb)
+    assert wm.shape[0] == legacy
+    q, k, bt, _l, _mb = make_case(batch, S, H, [mb * P] * batch)
+    assert kernel.index_score_supported(q, k, S, H, mb, bt, seq_lens=lens, work_map=wm)
+
+
+def test_supported_answers_for_the_whole_entry_point():
+    """A dispatcher that trusts the predicate and routes here must not then
+    take a raise. `_validate_metadata` skips `block_table`/`seq_lens` when they
+    are None and never sees the scale, so the predicate has to check both
+    itself -- it used to return True and let `score_flydsl` raise."""
+    q = torch.empty(1, 1, D, dtype=torch.bfloat16)
+    k = torch.empty(1, P, D, dtype=torch.bfloat16)
+    bt = torch.zeros(1, 1, dtype=torch.int32)
+    lens = torch.zeros(1, dtype=torch.int32)
+    assert not kernel.index_score_supported(q, k, 1, 1, 1)
+    assert not kernel.index_score_supported(q, k, 1, 1, 1, bt)
+    assert not kernel.index_score_supported(q, k, 1, 1, 1, seq_lens=lens)
+    # And the scale, which the entry point rejects outside FP32's normal range.
+    assert not kernel.index_score_supported(
+        q, k, 1, 1, 1, bt, seq_lens=lens, sm_scale=1e39
+    )
 
 
 def test_auto_bounds_resolved_before_packing(monkeypatch):
@@ -1249,8 +1325,14 @@ def test_score(case, B, S, H, lens, layout, kwargs):
 # ==========================================================================
 
 
-def make_prefill_case(batch, q_len, ctx_len, seed=0):
-    """A uniform ragged batch: every request has q_len new tokens on ctx_len."""
+def make_prefill_case(batch, q_len, ctx_len, heads=1, seed=0):
+    """A uniform ragged batch: every request has q_len new tokens on ctx_len.
+
+    `heads` has to build the Q it promises: sizing the score buffer and the
+    geometry by it while Q keeps one head makes every head sweep either an
+    aiter shape rejection or an `out` rejection, so the axis reads as covered
+    and runs nothing.
+    """
     torch.manual_seed(seed)
     dev = "cuda"
     seq_lens = torch.full((batch,), ctx_len, dtype=torch.int32, device=dev)
@@ -1258,7 +1340,7 @@ def make_prefill_case(batch, q_len, ctx_len, seed=0):
     cu = torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32, device=dev)
     max_block = -(-ctx_len // P)
     npages = batch * max_block
-    q8 = (torch.randn(batch * q_len, 1, D, device=dev) / 4).to(dtypes.fp8)
+    q8 = (torch.randn(batch * q_len, heads, D, device=dev) / 4).to(dtypes.fp8)
     cache = (torch.randn(npages, P, D, device=dev) / 4).to(dtypes.fp8)
     # The block table is a permutation on purpose: a kernel that assumed pages
     # were visited in storage order would still pass on an identity table.
@@ -1286,7 +1368,8 @@ def make_prefill_case(batch, q_len, ctx_len, seed=0):
 
 def aiter_scores(c):
     """aiter's scores, and the mask of slots it considers live."""
-    ref = torch.full((1, c["q8"].shape[0], c["mb"]), -float("inf"), device="cuda")
+    heads = c["q8"].shape[1]
+    ref = torch.full((heads, c["q8"].shape[0], c["mb"]), -float("inf"), device="cuda")
     pa_sparse_block_score_prefill(
         c["q8"],
         c["cache"],
@@ -1301,8 +1384,9 @@ def aiter_scores(c):
 
 
 def run_prefill(c, cache=None, q=None, out=None):
+    heads = c["q8"].shape[1]
     if out is None:
-        out = prefill_alloc_score(c["q8"].shape[0], 1, c["mb"], "cuda")
+        out = prefill_alloc_score(c["q8"].shape[0], heads, c["mb"], "cuda")
     out.fill_(SENTINEL)
     score_prefill_flydsl(
         c["q_bf16"] if q is None else q,
@@ -1316,7 +1400,7 @@ def run_prefill(c, cache=None, q=None, out=None):
         1.0 / LOG2E,
         out=out,
     )
-    return out.reshape(1, c["q8"].shape[0], c["mb"])
+    return out.reshape(heads, c["q8"].shape[0], c["mb"])
 
 
 def assert_matches_aiter(got, ref, live, what):
@@ -1379,6 +1463,7 @@ def test_every_geometry_matches_aiter(shape):
     assert_matches_aiter(run_prefill(c), ref, live, f"{shape}")
 
 
+@requires_gfx950
 def test_geometry_arms_are_exhaustive():
     """Every prefill_geometry the selector can reach has an arm above.
 
@@ -1399,6 +1484,144 @@ def test_geometry_arms_are_exhaustive():
         g = prefill_geometry(q_len, batch, 1, -(-ctx // P), dev)
         covered.add((g["tile_q"], g["waves"], g["pages_per_wave"], g["m32"]))
     assert covered == reachable, f"uncovered: {sorted(reachable - covered)}"
+
+
+@requires_gfx950
+def test_mixed_query_lengths_match_aiter():
+    """A short request next to a long one, which is where a dead tile costs.
+
+    The grid is sized by `max_query_len`, so request B (one query row) gets as
+    many tiles as request A (8192). Those tiles store nothing either way; what
+    changed is that they now retire at the page-range guard instead of walking
+    B's whole causal window first. Correctness is the part that has to be
+    pinned here -- the saving is in the sweep.
+    """
+    dev = "cuda"
+    torch.manual_seed(0)
+    q_a, ctx_a, ctx_b = 1024, 1024, 16384
+    cu = torch.tensor([0, q_a, q_a + 1], dtype=torch.int32, device=dev)
+    seq = torch.tensor([ctx_a, ctx_b], dtype=torch.int32, device=dev)
+    prefix = torch.tensor([ctx_a - q_a, ctx_b - 1], dtype=torch.int32, device=dev)
+    mb = -(-ctx_b // P)
+    npages = 2 * mb
+    q8 = (torch.randn(q_a + 1, 1, D, device=dev) / 4).to(dtypes.fp8)
+    cache = (torch.randn(npages, P, D, device=dev) / 4).to(dtypes.fp8)
+    bt = torch.randperm(npages, device=dev, dtype=torch.int32).view(2, mb).contiguous()
+    ref = torch.full((1, q_a + 1, mb), -float("inf"), device=dev)
+    pa_sparse_block_score_prefill(
+        q8, cache, ref, bt, cu, seq, max_query_len=q_a, max_seq_len=ctx_b
+    )
+    live = torch.isfinite(ref)
+    out = prefill_alloc_score(q_a + 1, 1, mb, dev)
+    out.fill_(SENTINEL)
+    score_prefill_flydsl(
+        q8.float().bfloat16(),
+        cache,
+        bt,
+        cu,
+        seq,
+        prefix,
+        q_a,
+        ctx_b,
+        1.0 / LOG2E,
+        out=out,
+    )
+    got = out.reshape(1, q_a + 1, mb)
+    assert_matches_aiter(got, ref, live, "mixed query lengths")
+
+
+@requires_gfx950
+def test_trailing_empty_request_stays_in_bounds():
+    """`cu_seqlens_q[-2] == cu_seqlens_q[-1]`: the last request has no rows.
+
+    Its tiles still stage Q, and the `q < q_len` clamp sent them to row
+    `seq_start + 0`, which for a TRAILING empty request is `total_q` -- one row
+    past `idx_q`. The buffer view's num_records is the view maximum, not this
+    tensor, so nothing caught it.
+
+    Be clear about what this pins and what it does not: the staged value is
+    discarded (no row of a dead tile passes `row < q_len`), so the read being
+    in bounds is NOT observable from here, and this test would have passed
+    before the clamp was added. What it does pin is the contract the clamp must
+    not break -- a trailing empty request changes no live score -- which is the
+    part a future rewrite could get wrong. The read itself is argued from the
+    addressing, not from this assertion.
+    """
+    dev = "cuda"
+    torch.manual_seed(0)
+    q_len, ctx = 256, 2048
+    mb = -(-ctx // P)
+    q8 = (torch.randn(q_len, 1, D, device=dev) / 4).to(dtypes.fp8)
+    cache = (torch.randn(2 * mb, P, D, device=dev) / 4).to(dtypes.fp8)
+    bt = torch.randperm(2 * mb, device=dev, dtype=torch.int32).view(2, mb).contiguous()
+    seq = torch.tensor([ctx, ctx], dtype=torch.int32, device=dev)
+    prefix = torch.tensor([ctx - q_len, ctx], dtype=torch.int32, device=dev)
+    q = q8.float().bfloat16()
+
+    def run(cu):
+        out = prefill_alloc_score(q_len, 1, mb, dev)
+        out.fill_(SENTINEL)
+        score_prefill_flydsl(
+            q, cache, bt, cu, seq, prefix, q_len, ctx, 1.0 / LOG2E, out=out
+        )
+        return out.reshape(1, q_len, mb)
+
+    alone = run(torch.tensor([0, q_len], dtype=torch.int32, device=dev))
+    trailing = run(torch.tensor([0, q_len, q_len], dtype=torch.int32, device=dev))
+    assert torch.equal(alone, trailing)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("stride1", [129, 130])
+def test_prefill_refuses_misaligned_q_rows(stride1):
+    """Non-overlapping is not enough: `q_fp8_at` turns the bf16 element offset
+    into a dword offset and vector-loads it, so an odd or 2-mod-16 head stride
+    reads off its boundary. 129 is the reviewer's case -- it passes the
+    overlap check and still has head 1 starting at element 128."""
+    c = make_prefill_case(1, 128, 2048)
+    q = torch.empty_strided(
+        (c["q8"].shape[0], 2, D),
+        (2 * stride1, stride1, 1),
+        dtype=torch.bfloat16,
+        device="cuda",
+    )
+    out = prefill_alloc_score(c["q8"].shape[0], 2, c["mb"], "cuda")
+    with pytest.raises(ValueError, match="16-byte aligned"):
+        score_prefill_flydsl(
+            q,
+            c["cache"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            1.0 / LOG2E,
+            out=out,
+        )
+
+
+@requires_gfx950
+@pytest.mark.parametrize("scale", [-1.0, 0.0, float("nan"), float("inf"), 1e-50, 1e39])
+def test_prefill_scale_must_be_order_preserving(scale):
+    """The epilogue takes each page's max and only then multiplies by the
+    scale, so a negative one returns `max(dot) * scale`, not `max(dot * scale)`
+    -- the wrong block, silently. Decode already refused these."""
+    c = make_prefill_case(1, 128, 2048)
+    out = prefill_alloc_score(c["q8"].shape[0], 1, c["mb"], "cuda")
+    with pytest.raises(ValueError, match="sm_scale"):
+        score_prefill_flydsl(
+            c["q_bf16"],
+            c["cache"],
+            c["bt"],
+            c["cu"],
+            c["seq"],
+            c["prefix"],
+            c["max_q"],
+            c["max_seq"],
+            scale,
+            out=out,
+        )
 
 
 @requires_gfx950
@@ -1614,7 +1837,7 @@ def _prefill_work(batch, q_len, ctx_len):
 )
 @benchmark()
 def test_score_prefill_perf(batch, q_len, ctx_len, heads):
-    c = make_prefill_case(batch, q_len, ctx_len)
+    c = make_prefill_case(batch, q_len, ctx_len, heads)
     total_q = c["q8"].shape[0]
     cache = c["cache"]
     # aiter takes the fp8 Q straight; this kernel takes the same values as

@@ -275,11 +275,21 @@ _CTA_OVERSUBSCRIBE = 4
 
 
 def _cu_count(device=None) -> int:
+    """CU count, with `CU_NUM` winning over the device.
+
+    `work_map_size` has no tensor and so resolves with `device=None`, while
+    `build_work_map` resolves from `seq_lens.device`. If the two read different
+    counts the geometry differs and the buffer one sizes is rejected by the
+    other -- with `CU_NUM=64` on a 256-CU part that is 64 rows against 128. So
+    the override is honoured on both paths, not just the device-less one.
+    """
+    import os
+
     import torch
 
     from aiter.jit.utils.chip_info import get_cu_num
 
-    if device is None:
+    if device is None or os.environ.get("CU_NUM"):
         return get_cu_num()
     return torch.cuda.get_device_properties(device).multi_processor_count
 
@@ -1120,7 +1130,7 @@ def _make_map(seq_lens, max_block, geom, rows, out=None):
     if geom["spread"]:
         # `_spread_fits`, which `geometry` consults, already bounds the batch
         # the spread builder unrolls over.
-        cu = torch.cuda.get_device_properties(seq_lens.device).multi_processor_count
+        cu = _cu_count(seq_lens.device)
         return _run_spread_map(seq_lens, rows, cu, out, world, rank)
     return _run_chunk_map(
         seq_lens,
@@ -1238,14 +1248,15 @@ def _validate_metadata(
     # A map built by the legacy two-argument `build_work_map` has no query
     # dimensions and so uses unsplit geometry. Honour such a map rather than
     # rejecting it, by scoring with the geometry it was actually built for.
-    if (
-        geom["waves_per_tok"] > 1
-        and isinstance(work_map, torch.Tensor)
-        and work_map.ndim == 2
-        and work_map.shape[0] == batch * ((max_block + WAVES - 1) // WAVES)
-        and work_map.shape[0] != batch * max_block
-    ):
-        geom = {**geom, "waves_per_tok": 1}
+    # Ask `geometry` for that map's shape instead of open-coding one field of
+    # it: S/H can change `spread` as well as `waves_per_tok`, and a rescue that
+    # only knew the wave split rejected every spread case -- `work_map_size(4,
+    # 1024)` is 1024 rows where S=4,H=1 wants 1028, one spare row per request.
+    if isinstance(work_map, torch.Tensor) and work_map.ndim == 2:
+        legacy = geometry(batch, max_block, device=device, **cp)
+        rows_legacy = batch * _grid_chunks(max_block, legacy)
+        if work_map.shape[0] == rows_legacy != batch * _grid_chunks(max_block, geom):
+            geom = legacy
     rows = _validate_bounds(batch, max_block, geom)
     if block_table is not None:
         _validate_tensor(block_table, "block_table", (torch.int32,), 2, device)
@@ -1295,16 +1306,27 @@ def index_score_supported(
     block_table=None,
     *,
     seq_lens=None,
+    sm_scale=1.0,
     out=None,
     work_map=None,
     **cp,
 ) -> bool:
-    """Metadata-only predicate sharing the entry point's validation."""
+    """Metadata-only predicate sharing the entry point's validation.
+
+    It has to answer for everything `score_flydsl` would reject, or a
+    dispatcher that trusts it routes here and takes a raise instead of a
+    fallback. `_validate_metadata` skips `block_table`/`seq_lens` when they are
+    None -- the entry point requires them -- and never sees the scale, so both
+    are checked here.
+    """
+    if block_table is None or seq_lens is None:
+        return False
     try:
         _validate_metadata(
             idx_q, cache, S, H, max_block, block_table, seq_lens, out, work_map, **cp
         )
-        return True
+        scaled = sm_scale * LOG2E
+        return math.isfinite(scaled) and 2**-149 <= scaled <= (2 - 2**-23) * 2**127
     except (AttributeError, IndexError, TypeError, ValueError, ZeroDivisionError):
         return False
 
