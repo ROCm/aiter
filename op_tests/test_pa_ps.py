@@ -742,10 +742,12 @@ def test_pa_ps(
 gpu = torch.cuda.current_device()
 device_properties = torch.cuda.get_device_properties(gpu)
 cu_num = device_properties.multi_processor_count
+gpu_arch = device_properties.gcnArchName.split(":", 1)[0]
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,
-    description="config input of test",
+    description="PA_PS correctness and performance tests. Page16 COs currently "
+    "support gfx950 (MI350 series) only; other page sizes are unchanged.",
 )
 parser.add_argument(
     "-d",
@@ -815,7 +817,8 @@ parser.add_argument(
     type=int,
     nargs="*",
     default=[1024],
-    help="""Block size.
+    help="""KV page size. Page16 requires gfx950 (MI350 series);
+    page16 cases are skipped on other architectures, including gfx942 (MI300 series).
     e.g. --block_size 1024""",
 )
 parser.add_argument(
@@ -869,6 +872,20 @@ parser.add_argument(
     "--output", default="pa_ps.csv", help="Path for the benchmark CSV output."
 )
 args = parser.parse_args()
+
+if gpu_arch != "gfx950" and 16 in args.block_size:
+    aiter.logger.info(
+        "Skipping page16 PA_PS on %s: page16 COs are only provided for "
+        "gfx950 (MI350 series). Other requested page sizes will still run.",
+        gpu_arch,
+    )
+    args.block_size = [page_size for page_size in args.block_size if page_size != 16]
+    if not args.block_size:
+        aiter.logger.info(
+            "PA_PS skipped: no supported page sizes remain; "
+            "no cases ran and no result CSV was written."
+        )
+        raise SystemExit(0)
 
 df = []
 for dtype in args.dtype:
