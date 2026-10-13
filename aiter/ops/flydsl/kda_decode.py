@@ -10,12 +10,7 @@ from collections.abc import Iterable
 
 import torch
 
-from .kernels.kda_decode_fused_projection_gfx950 import (
-    create_kda_decode_fused_projection_kernel,
-)
-from .kernels.kda_decode_gfx950 import (
-    create_kda_decode_kernel,
-)
+from .kernels.kda_decode_gfx950 import create_kda_decode_kernel
 from .kernels.tensor_shim import _run_compiled
 
 _HEADS = 12
@@ -385,6 +380,7 @@ def flydsl_kda_decode(
     executable = create_kda_decode_kernel(
         float(norm_eps),
         float(lower_bound),
+        fuse_f_b=False,
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)
@@ -493,9 +489,10 @@ def flydsl_kda_decode_with_f_b(
         out=out,
     )
 
-    executable = create_kda_decode_fused_projection_kernel(
+    executable = create_kda_decode_kernel(
         float(norm_eps),
         float(lower_bound),
+        fuse_f_b=True,
     )
     with torch.cuda.device(device):
         stream = torch.cuda.current_stream(device)

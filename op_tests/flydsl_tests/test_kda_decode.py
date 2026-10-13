@@ -600,13 +600,10 @@ def test_api_rejects_unsafe_write_layouts(
 ) -> None:
     from aiter.ops.flydsl import kda_decode
 
-    def unexpected_compile(*args):
+    def unexpected_compile(*args, **kwargs):
         pytest.fail("Unsafe write layouts must be rejected before kernel compilation.")
 
     monkeypatch.setattr(kda_decode, "create_kda_decode_kernel", unexpected_compile)
-    monkeypatch.setattr(
-        kda_decode, "create_kda_decode_fused_projection_kernel", unexpected_compile
-    )
     with FakeTensorMode():
         f_a, f_b_weight, inputs = _make_fb_inputs(batch=2)
         out = torch.empty((1, 2, _HEADS, _DIM), dtype=torch.bfloat16, device=_DEVICE)
@@ -689,13 +686,10 @@ def test_api_rejects_i32_address_overflow(
 ) -> None:
     from aiter.ops.flydsl import kda_decode
 
-    def unexpected_compile(*args):
+    def unexpected_compile(*args, **kwargs):
         pytest.fail("Unsafe addressing must be rejected before kernel compilation.")
 
     monkeypatch.setattr(kda_decode, "create_kda_decode_kernel", unexpected_compile)
-    monkeypatch.setattr(
-        kda_decode, "create_kda_decode_fused_projection_kernel", unexpected_compile
-    )
     # Fake views exercise multi-GiB spans without allocating or accessing them.
     # 2**30 fits the launcher parameter but overflows the resulting byte span;
     # 2**31 also overflows the stride parameter itself.
