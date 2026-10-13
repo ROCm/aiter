@@ -1,88 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Pinned expand+tail from vLLM AMD QSA.
-
-Pin: vllm-project/vllm @ 836bb3839ffe (main, 2026-09-15). This module is the
-expand the FlyDSL layer calls. The paged MQA scorer, HIP top-k, and sparse
-GQA serving fallback are not in this build.
-"""
+"""Public launcher for the pinned vLLM AMD QSA expand."""
 
 from __future__ import annotations
 
 import torch
 import triton
-import triton.language as tl
 
-
-@triton.jit
-def _expand_qsa_indices_kernel(
-    block_indices_ptr,
-    query_positions_ptr,
-    sequence_lengths_ptr,
-    token_to_req_ptr,
-    output_ptr,
-    stride_blocks_row,
-    stride_blocks_column,
-    stride_output_row,
-    stride_output_column,
-    rows,
-    num_requests,
-    BLOCK_TOPK: tl.constexpr,
-    COMPRESS_RATIO: tl.constexpr,
-    TOKEN_TOPK: tl.constexpr,
-    OUTPUT_WIDTH: tl.constexpr,
-    COLUMN_BLOCK: tl.constexpr,
-) -> None:
-    row = tl.program_id(0)
-    columns = tl.program_id(1) * COLUMN_BLOCK + tl.arange(0, COLUMN_BLOCK)
-    query_position = tl.load(query_positions_ptr + row)
-    request = tl.load(token_to_req_ptr + row)
-    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
-    sequence_length = tl.load(
-        sequence_lengths_ptr + safe_request,
-        mask=(request >= 0) & (request < num_requests),
-        other=0,
-    )
-    complete_blocks = tl.minimum(
-        tl.minimum(
-            (query_position + 1) // COMPRESS_RATIO,
-            sequence_length // COMPRESS_RATIO,
-        ),
-        BLOCK_TOPK,
-    )
-    expanded_count = complete_blocks * COMPRESS_RATIO
-    tail_start = ((query_position + 1) // COMPRESS_RATIO) * COMPRESS_RATIO
-    tail_count = (query_position + 1) - tail_start
-
-    is_expanded = columns < expanded_count
-    block_rank = columns // COMPRESS_RATIO
-    offset = columns % COMPRESS_RATIO
-    safe_rank = tl.minimum(block_rank, BLOCK_TOPK - 1)
-    block = tl.load(
-        block_indices_ptr + row * stride_blocks_row + safe_rank * stride_blocks_column,
-        mask=(row < rows) & is_expanded,
-        other=-1,
-    )
-    expanded = block * COMPRESS_RATIO + offset
-    tail_offset = columns - expanded_count
-    is_tail = (
-        (columns >= expanded_count)
-        & (tail_offset < tail_count)
-        & (tail_offset < COMPRESS_RATIO - 1)
-    )
-    token = tl.where(is_expanded, expanded, tail_start + tail_offset)
-    valid = (
-        (row < rows)
-        & (columns < OUTPUT_WIDTH)
-        & (is_expanded | is_tail)
-        & (token >= 0)
-        & (token < sequence_length)
-    )
-    tl.store(
-        output_ptr + row * stride_output_row + columns * stride_output_column,
-        tl.where(valid, token, -1),
-        mask=(row < rows) & (columns < OUTPUT_WIDTH),
-    )
+from aiter.ops.triton._triton_kernels.attention.qsa_expand import (
+    QSA_EXPAND_PIN,
+    _expand_qsa_indices_kernel,
+)
 
 
 def _unit_stride_int32(
@@ -90,9 +18,9 @@ def _unit_stride_int32(
 ) -> torch.Tensor:
     """Return a contiguous int32 vector of ``length``.
 
-    The scorer and expand kernels load these as ``ptr + index`` and do not
-    take a stride. A view such as ``base[::2]`` would otherwise read the
-    neighboring element.
+    The expand kernel loads these as ``ptr + index`` and does not take a
+    stride. A view such as ``base[::2]`` would otherwise read the neighboring
+    element.
     """
     if tensor.dtype != torch.int32 or tensor.shape != (length,):
         raise ValueError(
@@ -103,7 +31,7 @@ def _unit_stride_int32(
     return tensor.contiguous()
 
 
-def expand_qsa_block_indices_cuda(
+def expand_qsa_block_indices(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
@@ -112,6 +40,22 @@ def expand_qsa_block_indices_cuda(
     token_topk: int,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    """Expand compressed block ids into token ids, plus the current tail.
+
+    ``block_indices`` is int32 ``[rows, token_topk // compress_ratio]`` on a
+    GPU, and its strides are honored. ``query_positions`` and ``token_to_req``
+    are contiguous int32 ``[rows]`` on that device. ``sequence_lengths`` is a
+    contiguous 1-D int32 vector on that device, indexed by ``token_to_req``.
+
+    ``compress_ratio`` and ``token_topk`` are positive, and ``compress_ratio``
+    divides ``token_topk``. Each kept block becomes ``compress_ratio``
+    consecutive token ids. The result is int32
+    ``[rows, token_topk + compress_ratio - 1]``. The extra
+    ``compress_ratio - 1`` columns hold the incomplete tail. An unused column,
+    a block id of ``-1``, or a token outside ``[0, sequence_length)`` is
+    stored as ``-1``. ``out`` is that buffer, and its strides are honored.
+    ``None`` allocates it. Zero rows return ``out`` without a launch.
+    """
     if compress_ratio <= 0:
         raise ValueError("QSA compression ratio must be positive")
     if token_topk <= 0:
@@ -184,9 +128,7 @@ def expand_qsa_block_indices_cuda(
     return out
 
 
-VLLM_AMD_QSA_PIN = "836bb3839ffe"
-
 __all__ = [
-    "VLLM_AMD_QSA_PIN",
-    "expand_qsa_block_indices_cuda",
+    "QSA_EXPAND_PIN",
+    "expand_qsa_block_indices",
 ]
