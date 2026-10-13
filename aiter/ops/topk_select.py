@@ -246,6 +246,22 @@ _PLAIN_K2048_MAX_WIDTH = 131071
 # test_plain_gfx950_widths holds the copy to it.
 _PLAIN_K2048_LDS_TAIL_MIN_ROWS = 3000
 _PLAIN_K2048_LDS_TAIL_MAX_WIDTH = 128 * 1024 + 768
+# Ragged rows at k=2048 on gfx950, which plain's band above does not take (see
+# `_plain_takes`). Every backend measured over 1..4096 rows of 2100..131071
+# columns with three row-end patterns -- uniform in [width/2, width], causal
+# (row r ends at width - rows + r + 1) and full -- on MI355X, randn, two
+# rounds, 288 cells. Below 8192 columns stream was the fastest on 47 of 48
+# cells (within 1.02x on the other); from 8192 to 16384 columns through 256
+# rows decode on 51 of 54 (geomean 1.005x, worst 1.23x); from 20000 columns on
+# `sampled` on 157 of 168 (geomean 1.010x, worst 1.44x, one row ending short of
+# its width). From 8192 to 16384 columns past 256 rows plain and `sampled`
+# traded wins (plain 0.82x-1.28x of `sampled`), so those rows keep the rules
+# below. The choice is 1.013x of the fastest backend over the 288 cells
+# (geomean) and 0.756x of the rules below alone; slower than them on one cell,
+# 1.13x (one row of 20000 columns ending in its second half).
+_RAGGED_K2048_STREAM_MAX_WIDTH = 8191
+_RAGGED_K2048_DECODE_MAX_WIDTH = 16384
+_RAGGED_K2048_DECODE_MAX_ROWS = 256
 # Rows that select all of their columns skip the backends (`_whole_row_takes`).
 # With the values wanted, one launch writing both replaces a selection and a
 # gather: 0.47x-0.78x of the fastest backend at every measured row count from
@@ -820,7 +836,7 @@ def _sampled_takes(
     if device is None:
         device = torch.cuda.current_device()
     if k == 2048 and width < _SAMPLED_MIN_WIDTH and _device_arch(device) == "gfx950":
-        plain_band = _plain_takes(rows, width, k, device)
+        plain_band = _plain_takes(rows, width, k, device, ragged)
         plain_pitch = pitch if ragged else width
         if (plain_band and _plain_multiblock(rows, plain_pitch, k, ragged, device)) or (
             rows <= _PLAIN_K2048_FEW_ROWS and width > _PLAIN_K2048_FEW_ROWS_MAX_WIDTH
@@ -848,11 +864,20 @@ def _device_cu_num(device: int) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def _plain_takes(rows: int, width: int, k: int, device: int | None = None) -> bool:
-    """Enough rows for the row-scaling selector, on a width it is tuned for."""
+def _plain_takes(
+    rows: int, width: int, k: int, device: int | None = None, ragged: bool = False
+) -> bool:
+    """Enough rows for the row-scaling selector, on a width it is tuned for.
+
+    The gfx950 k=2048 band is for uniform rows only: its kernels serve calls
+    without row bounds, and ragged rows run plain's generic kernel, which the
+    band was not measured on. Ragged, that kernel was the fastest backend on 2
+    of 288 measured cells and up to 3.09x off it on the others; see
+    `_RAGGED_K2048_STREAM_MAX_WIDTH`.
+    """
     if k == 2048 and device is None:
         device = torch.cuda.current_device()
-    if k == 2048 and _device_arch(device) == "gfx950":
+    if k == 2048 and not ragged and _device_arch(device) == "gfx950":
         if width < _PLAIN_K2048_NARROW_WIDTH:
             rejects = width - k
             return rejects > 0 and not (
@@ -892,6 +917,16 @@ def _plain_takes(rows: int, width: int, k: int, device: int | None = None) -> bo
                     return True
     lo, hi = _PLAIN_MANY_ROWS_BAND
     return rows >= _PLAIN_MANY_ROWS and k >= _PLAIN_MIN_K and lo <= width <= hi
+
+
+def _ragged_k2048_backend(rows: int, width: int) -> str | None:
+    """The backend for ragged k=2048 rows on gfx950, or None to leave them to
+    the general rules; see `_RAGGED_K2048_STREAM_MAX_WIDTH`."""
+    if width <= _RAGGED_K2048_STREAM_MAX_WIDTH:
+        return "stream"
+    if width <= _RAGGED_K2048_DECODE_MAX_WIDTH:
+        return "decode" if rows <= _RAGGED_K2048_DECODE_MAX_ROWS else None
+    return "sampled"
 
 
 def _decode_takes(rows: int, width: int, k: int) -> bool:
@@ -967,6 +1002,14 @@ def topk_select_backend(
         and _plain_k2048_lds_tail_takes(rows, width, k, device)
     ):
         return "plain"
+    if ragged and k == 2048 and _device_arch(device) == "gfx950":
+        want = _ragged_k2048_backend(rows, width)
+        pitch = width if stride0 is None else stride0
+        if want in available and (
+            want != "sampled"
+            or (pitch >= width and _sampled_supports_cached(rows, pitch, k, device))
+        ):
+            return want
     if "sampled" in available and _sampled_takes(
         rows,
         width,
@@ -977,7 +1020,7 @@ def topk_select_backend(
         stride0=stride0,
     ):
         return "sampled"
-    if "plain" in available and _plain_takes(rows, width, k, device):
+    if "plain" in available and _plain_takes(rows, width, k, device, ragged):
         return "plain"
     if "small_k" in available and k <= _SMALL_K_MAX_K:
         return "small_k"
