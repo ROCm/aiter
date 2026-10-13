@@ -255,7 +255,7 @@ def fused_reduce_act_mul_and_mxfp4_quant(
         if x is 2-dim,
             x: (M, 2*N1), dtype = fp16 or bf16.
             x2 must be None
-            the kernel is essentially identical to aiter.ops.triton.activation.act_mul_and_mxfp4_group_quant
+            the kernel is essentially identical to aiter.ops.triton.fusions.activation.act_mul_and_mxfp4_group_quant
 
         activation: activation function to apply before quantization.
             - It splits the features into two parts and applies the activation to the first part.

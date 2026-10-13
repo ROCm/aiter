@@ -384,7 +384,7 @@ All weight/scale pre-shuffle helpers are unified in
   vendored `_triton_kernels/flash_attn_triton_amd/`; a sub-package counts as
   a folder (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`).
   The few wrappers that still sit flat at `aiter/ops/triton/<op>.py`
-  (`activation.py`, `topk.py`, ...) keep their tests flat at the
+  (`topk.py`, `softmax.py`, ...) keep their tests flat at the
   `triton_tests/` root; `utils/` helpers are tested under
   `triton_tests/utils/`; `torch_compile/` and `triton_metadata_redirect/`
   are infrastructure suites, not op folders. Flag:
