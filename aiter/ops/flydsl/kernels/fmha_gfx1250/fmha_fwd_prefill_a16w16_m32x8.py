@@ -1482,7 +1482,12 @@ def _core_attention_multi_kv_tiles(
     _num_prefetch = _ring_num_prefetch(_num_v_frags + _num_k_frags, PVQK_RING, PVQK_LAG)
     # The lagging half opens its body with softmax, so its ring head is issued there and
     # consumed after the barrier -- within one body, nothing to carry.
-    _num_head_carry = 0 if _is_lagging_softmax else min(PVQK_HEAD_CARRY, _num_prefetch)
+    # The carry is issued a body early, where only V is resident, so it cannot run past V.
+    _num_head_carry = (
+        0
+        if _is_lagging_softmax
+        else min(PVQK_HEAD_CARRY, _num_prefetch, 2 * _num_v_frags)
+    )
     assert _num_head_carry <= 2 * _num_v_frags, "carried head must be V loads only"
     _head_carry_idx = len(_init)
     _seed_head = []
@@ -1624,10 +1629,15 @@ def _core_attention_multi_kv_tiles(
                     rocdl.sched_barrier(0)
             return out
 
+        def _vk_emit(j):
+            # The ring runs V then K; past the V loads the head continues into K, matching
+            # ``_pv_qk_gemm``'s emit. Both slots are resident, so either is issuable here.
+            return _v_emit(j) if j < 2 * _num_v_frags else _k_emit(j - 2 * _num_v_frags)
+
         def _pvqk_head():
             # The first _num_head_carry loads came from the previous body (issued under its softmax);
             # only the remainder is issued here.
-            return _issue_head(_v_emit, _num_head_carry, _num_prefetch, head_carry)
+            return _issue_head(_vk_emit, _num_head_carry, _num_prefetch, head_carry)
 
         def _softmax_phase(s_in, o_in):
             # This lane's query (tile q_tile_idx) attends [q_min, q_max] in batch-relative kv.

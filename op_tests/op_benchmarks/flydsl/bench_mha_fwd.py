@@ -8,11 +8,15 @@ the same public interface (``flash_attn_func`` / ``flash_attn_varlen_func`` in
 ``aiter/ops/mha.py``) but computes NO reference and checks NO correctness. It only
 times the kernel and reports latency / TFLOPS / TB-s.
 
-The m32x8 kernel (``fmha_fwd_prefill_a16w16_m32x8.py``, dispatched as ``*_m32x8``) serves the
-D_qk/D_v in {128/128, 192/128, 256/128, 64/64} bf16 path, gated behind
-``AITER_ENABLE_EXPERIMENTAL=1``.
-Without that env var the public wrappers fall through to CK, so this harness asserts
-the gate is on and spies on the dispatch entry to fail loudly on a silent fallthrough.
+The m32x8 kernel (``fmha_fwd_prefill_a16w16_m32x8.py``, dispatched as ``*_m32x8``) serves
+D_qk in {64, 128, 192, 256} against D_v in {64, 128} -- the routers gate the two
+independently, so all eight combinations dispatch here.
+
+``AITER_ENABLE_EXPERIMENTAL=1`` is NOT a blanket gate on m32x8: it only makes the
+gfx1250 ASM path decline the shapes it would otherwise claim (D_qk 64/128/192), yielding
+them here. Shapes the ASM path never claims route to m32x8 either way. This harness
+still asserts the env var and spies on the dispatch entry, so a silent fallthrough to
+another backend fails loudly rather than quietly timing the wrong kernel.
 
 Two modes:
 
@@ -25,7 +29,8 @@ Two modes:
      AITER_ENABLE_EXPERIMENTAL=1 python op_tests/op_benchmarks/flydsl/bench_mha_fwd.py --list   # show, don't run
 
 seqlen ranges 0..2^17; the cases sprinkle in odd (non-power-of-two) lengths. Each case
-shape is replayed at all three supported hdims: 128/128, 192/128 and 256/128.
+shape is replayed at the four hdim pairs in ``_HDIM_PAIRS`` (128/128, 192/128, 256/128,
+64/64); the other routed pairs are reachable from detailed args, not the case table.
 Defaults: --warmup 2 --repeat 5.
 """
 
@@ -100,8 +105,8 @@ def _verify_dispatch(layout):
         setattr(fk, name, orig)
     assert calls["n"] > 0, (
         f"m32x8 kernel ({name}) never dispatched for layout={layout}; the call fell "
-        f"through to CK. Run with AITER_ENABLE_EXPERIMENTAL=1 and a supported hdim "
-        f"(128/128, 192/128, 256/128 or 64/64)."
+        f"through to another backend. Run with AITER_ENABLE_EXPERIMENTAL=1 and a "
+        f"routed hdim (D_qk in 64/128/192/256, D_v in 64/128)."
     )
 
 

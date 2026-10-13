@@ -41,7 +41,16 @@ SUPPORTED_GFX = ["gfx1250"]
 
 # (d_qk, d_v) pairs the FlyDSL kernels can serve at all. Anything else is
 # rejected up front rather than silently falling through to CK/Triton.
-SUPPORTED_D_QK_V = [(256, 128), (192, 128), (128, 128), (64, 64)]
+SUPPORTED_D_QK_V = [
+    (256, 128),
+    (192, 128),
+    (128, 128),
+    (64, 64),
+    (256, 64),
+    (192, 64),
+    (128, 64),
+    (64, 128),
+]
 
 # Kernels that can be timed per case. "flydsl" is the path under test; "triton"
 # is an optional cross-check for plain (no sink / no window) thd configs.
