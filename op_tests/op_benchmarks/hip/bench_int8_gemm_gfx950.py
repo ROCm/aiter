@@ -26,6 +26,11 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SHAPES = ROOT / "aiter" / "configs" / "a8w8_bpreshuffle_untuned_gemm.csv"
+WAN_SHAPES = (
+    (9450, 5120, 5120),
+    (9450, 13824, 5120),
+    (9450, 5120, 13824),
+)
 
 
 def parse_shape(value):
@@ -248,6 +253,11 @@ def main():
     parser.add_argument("--repeats", type=int, default=15)
     parser.add_argument("--seed", type=int, default=20261013)
     parser.add_argument("--bias", action="store_true")
+    parser.add_argument(
+        "--no-wan",
+        action="store_true",
+        help="Exclude the three Wan projection shapes from the default matrix.",
+    )
     parser.add_argument("--include-flydsl", action="store_true")
     parser.add_argument("--flydsl-tile", type=parse_shape, default=(128, 128, 128))
     parser.add_argument("--flydsl-async-copy", type=int, choices=(0, 1), default=1)
@@ -269,7 +279,12 @@ def main():
     if get_cu_num() != 256:
         parser.error(f"initial baseline requires 256 CUs, got {get_cu_num()}")
 
-    shapes = args.shape or load_shapes(args.shapes_file)
+    if args.shape:
+        shapes = args.shape
+    else:
+        shapes = load_shapes(args.shapes_file)
+        if not args.no_wan:
+            shapes.extend(shape for shape in WAN_SHAPES if shape not in shapes)
     flydsl_config = {
         "tile_m": args.flydsl_tile[0],
         "tile_n": args.flydsl_tile[1],
