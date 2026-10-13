@@ -115,7 +115,7 @@ def ring_steps(world_size: int) -> int:
     return 2 * (world_size - 1)
 
 
-def make_quick_allreduce_int4_ring_kernel(
+def make_quick_allreduce_ring_kernel(
     *,
     world_size: int,
     rank: int,

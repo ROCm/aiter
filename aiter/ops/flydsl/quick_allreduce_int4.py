@@ -65,7 +65,7 @@ from .kernels.comm.quick_allreduce_int4_ring import (
     AG_CODECS,
     RING_SUPER_TILES,
     RS_CODECS,
-    make_quick_allreduce_int4_ring_kernel,
+    make_quick_allreduce_ring_kernel,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
@@ -123,7 +123,7 @@ ALGORITHMS = {
     ),
     "ring": _Algorithm(
         name="ring",
-        build=make_quick_allreduce_int4_ring_kernel,
+        build=make_quick_allreduce_ring_kernel,
         super_tiles=RING_SUPER_TILES,
         rs_codecs=RS_CODECS,
         ag_codecs=AG_CODECS,
