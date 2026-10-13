@@ -2,16 +2,34 @@
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 """FP8 paged MQA logits (DSA indexer decode scores), dispatched per call shape.
 
-``paged_mqa_logits`` takes the same tensors as the Gluon
-``deepgemm_fp8_paged_mqa_logits`` and picks the backend and its launch knobs
-from the tuned table ``AITER_CONFIG_PAGED_MQA_LOGITS``
-(``aiter/configs/paged_mqa_logits_tuned.csv``, plus any
-``model_configs/*paged_mqa_logits_tuned*.csv``). Tune new shapes with
+``paged_mqa_logits`` writes, for each query row, the indexer score of every
+cached token inside that row's causal bound. It takes:
+
+- ``q_fp8``: ``[B, next_n, H, D]`` FP8 E4M3 queries (``float8_e4m3fn`` on
+  gfx950, ``float8_e4m3fnuz`` on gfx942).
+- ``kv_cache``: ``[num_blocks, KVBlockSize, 1, D + 4]`` uint8. Each block holds
+  its ``KVBlockSize x D`` FP8 keys followed by ``KVBlockSize`` FP32 scales; the
+  keys are 16x16-preshuffled when ``Preshuffle``.
+- ``weights``: ``[B * next_n, H]`` float32 head weights.
+- ``out_logits``: ``[B * next_n, >= max_model_len]`` float32, written in place.
+  Columns outside a row's causal bound are left as they are.
+- ``context_lens``: ``[B]`` int32 sequence lengths on the GPU.
+- ``kv_indices``: ``[B, max_blocks]`` int32 block table.
+- ``max_model_len``: logical row width.
+
+It never reads device memory on the host, so it can be captured in a CUDA
+graph.
+
+The backend (Gluon or FlyDSL) and its launch knobs come from the tuned table
+``AITER_CONFIG_PAGED_MQA_LOGITS`` (``aiter/configs/paged_mqa_logits_tuned.csv``,
+plus any ``model_configs/*paged_mqa_logits_tuned*.csv``). Tune new shapes with
 ``csrc/paged_mqa_logits/paged_mqa_logits_tune.py``.
 
 Rows are keyed on ``(gfx, cu_num, batch_size, next_n, heads, head_dim,
 kv_block_size, preshuffle)``: everything a decode CUDA graph fixes at capture.
-Context length is not a key because reading it would need a host sync. A
+Rows also record the context lengths they were tuned over in ``context_len``,
+but dispatch does not key on it: the lengths live in a GPU tensor, and reading
+them on the host would sync and break graph capture. A
 batch size with no row uses the row of the largest tuned batch size below it;
 a shape with no row at all uses Gluon with ``ChunkK=256, WavePerEU=2``. A
 FlyDSL row the kernel cannot run uses that row's Gluon knobs, and those
