@@ -422,8 +422,15 @@ def _whole_row_takes(
     )
 
 
-def _select_whole_rows(input, idx, with_values):
-    """One launch standing in for `_dispatch` and `_gather_selected`."""
+def _select_whole_rows(input, idx, with_values, device):
+    """One launch standing in for `_dispatch` and `_gather_selected`.
+
+    Triton launches on the current GPU, so `device`, the input's, is made
+    current when it is not.
+    """
+    if device != torch.cuda.current_device():
+        with torch.cuda.device(device):
+            return _select_whole_rows(input, idx, with_values, device)
     rows, topk = idx.shape
     out = (
         torch.empty((rows, topk), dtype=input.dtype, device=input.device)
@@ -518,6 +525,28 @@ def _stream_small_reject_kernel(
             col,
             mask=keep,
         )
+
+
+def _select_small_reject(input, idx, rejects, device):
+    """`_stream_small_reject_kernel` over every row.
+
+    Triton launches on the current GPU, so `device`, the input's, is made
+    current when it is not.
+    """
+    if device != torch.cuda.current_device():
+        with torch.cuda.device(device):
+            return _select_small_reject(input, idx, rejects, device)
+    _stream_small_reject_kernel[(input.shape[0],)](
+        input,
+        idx,
+        input.stride(0),
+        idx.stride(0),
+        WIDTH=input.shape[1],
+        REJECTS=rejects,
+        BLOCK_N=4096,
+        BLOCK_K=2048,
+        num_warps=4,
+    )
 
 
 @lru_cache(maxsize=256)
@@ -1118,14 +1147,17 @@ def topk_select(
     rows, width = input.shape
     if not 1 <= topk <= width:
         raise ValueError(f"topk must be in [1, {width}], got {topk}")
+    # Read once: every `input.device` builds a new device object.
+    device = input.device
+    dev = device.index
 
-    row_lens = _full_rows(rows, width, input.device) if end is None else end
+    row_lens = _full_rows(rows, width, device) if end is None else end
     if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
         raise ValueError(f"end must be int32 [{rows}], got {tuple(row_lens.shape)}")
     # Every backend reads the row ends as one dense array.
     row_lens = row_lens.contiguous()
     idx = (
-        torch.empty((rows, topk), dtype=torch.int32, device=input.device)
+        torch.empty((rows, topk), dtype=torch.int32, device=device)
         if output_idx is None
         else output_idx
     )
@@ -1136,7 +1168,7 @@ def topk_select(
     if not idx.is_contiguous():
         # The backends write dense rows of `topk`; the answer is copied into the
         # caller's buffer at the end, like a reordered one.
-        idx = torch.empty((rows, topk), dtype=torch.int32, device=input.device)
+        idx = torch.empty((rows, topk), dtype=torch.int32, device=device)
 
     # The row pitch the rows sit at in memory; a single row has none to speak
     # of and reads as dense. `topk_select_backend` derives from it the pitch
@@ -1147,12 +1179,12 @@ def topk_select(
         width,
         stride0,
         topk,
-        wave_size_of(input.device.index),
+        wave_size_of(dev),
         end is not None,
         tie,
         deterministic,
         input.dtype is torch.float32,
-        input.device.index,
+        dev,
         True,
     )
     # Read only when `sampled` won: the lookup costs more than the memo hit, and
@@ -1166,12 +1198,12 @@ def topk_select(
             width,
             stride0,
             topk,
-            wave_size_of(input.device.index),
+            wave_size_of(dev),
             end is not None,
             tie,
             deterministic,
             input.dtype is torch.float32,
-            input.device.index,
+            dev,
             False,
         )
     gathered = None
@@ -1182,9 +1214,9 @@ def topk_select(
         topk,
         end is not None,
         return_value or sorted,
-        input.device.index,
+        dev,
     ):
-        gathered = _select_whole_rows(input, idx, return_value or sorted)
+        gathered = _select_whole_rows(input, idx, return_value or sorted, dev)
     else:
         _dispatch(
             backend,
@@ -1408,8 +1440,9 @@ def _dispatch(
             stable=tie == "low" or deterministic,
         )
     elif backend == "stream":
-        wave = wave_size_of(input.device.index)
-        arch = _device_arch(input.device.index)
+        dev = input.device.index
+        wave = wave_size_of(dev)
+        arch = _device_arch(dev)
         budgets = _lds_budgets(arch)
         rejects = input.shape[1] - topk
         small_reject = _stream_small_reject(rows, rejects)
@@ -1422,17 +1455,7 @@ def _dispatch(
             # generic path until this geometry is measured there as well.  The
             # row-dependent r limits retain at least a 1.10x win over generic
             # stream in the seed-0 MI355X ABBA crossover sweep.
-            _stream_small_reject_kernel[(rows,)](
-                input,
-                idx,
-                input.stride(0),
-                idx.stride(0),
-                WIDTH=input.shape[1],
-                REJECTS=rejects,
-                BLOCK_N=4096,
-                BLOCK_K=2048,
-                num_warps=4,
-            )
+            _select_small_reject(input, idx, rejects, dev)
             return
         parts = _stream_split_parts(rows, input.shape[1], topk, ragged)
         if parts > 1:
