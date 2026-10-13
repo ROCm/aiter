@@ -386,10 +386,10 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
             len(head) == num_prefetch
         ), f"head has {len(head)} loads, expected NP={num_prefetch}"
         for i, v in enumerate(head):
-            a[i] = schedule_bank(v, bank=1, reason="ring_frag")
+            a[i] = schedule_bank(v, bank=1, soft=True, reason="ring_frag")
     else:
         for i in range(num_prefetch):
-            a[i] = schedule_bank(emit(i), bank=1, reason="ring_frag")
+            a[i] = schedule_bank(emit(i), bank=1, soft=True, reason="ring_frag")
             rocdl.sched_barrier(0)
         rocdl.sched_barrier(0)  # pin the num_prefetch-deep burst above the stream
 
@@ -403,7 +403,9 @@ def _ring_drive(*, num_frag, emit, consume, ring, ring_lag, head=None, dies=None
         for k in range(2):
             j = 2 * i + num_prefetch + k
             if j < num_ld:
-                a[j % ring] = schedule_bank(emit(j), bank=1, reason="ring_frag")
+                a[j % ring] = schedule_bank(
+                    emit(j), bank=1, soft=True, reason="ring_frag"
+                )
                 rocdl.sched_barrier(0)
 
     def _release(i):
@@ -1254,7 +1256,7 @@ def schedule_bank(value, bank=0, soft=False, reason=None):
 
     reasons = {
         "oaccu": True,
-        "ring_frag": False,
+        "ring_frag": True,
         "ring_lds_addr": False,
     }
     func = schedule_bank.func
