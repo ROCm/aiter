@@ -104,6 +104,17 @@ OPUS_D decltype(auto) to_fp8_scalef32_x8(const S& s, float scale)
         r = __builtin_amdgcn_cvt_scalef32_pk8_fp8_f16(s, scale);
     return __builtin_bit_cast(vector_t<fp8_t, 8>, r);
 }
+
+// bf16x8 / fp16x8 -> 8 packed fp4 (gfx1250: v_cvt_scalef32_pk8_fp4_{bf16,f16}, 1 instr),
+// with the same scale operand as v_cvt_scalef32_pk8_fp4_f32.
+template <typename S, std::enable_if_t<is_any_of_v<S, bf16x8_t, fp16x8_t>, bool> = true>
+OPUS_D u32_t to_fp4_scalef32_x8(const S& s, float scale)
+{
+    if constexpr(std::is_same_v<S, bf16x8_t>)
+        return __builtin_amdgcn_cvt_scalef32_pk8_fp4_bf16(s, scale);
+    else
+        return __builtin_amdgcn_cvt_scalef32_pk8_fp4_f16(s, scale);
+}
 #endif
 
 // fp32x2 -> bf8x2 with scale + saturation clamp (E5M2)
@@ -704,9 +715,26 @@ template <typename D,
 OPUS_D decltype(auto) scaled_cast(const S& s, float inverted_scale)
 {
     constexpr index_t N = size<S>();
-    vector_t<fp32_t, N> fp32_vec;
-    static_for<N>([&](auto i) { fp32_vec[i.value] = static_cast<float>(s[i.value]); });
-    return scaled_cast<D>(fp32_vec, inverted_scale);
+#if defined(__gfx1250__)
+    // Eight values per convert straight from bf16/fp16, instead of widening to fp32 and
+    // converting two at a time.
+    if constexpr(is_any_of_v<get_value_t<S>, bf16_t, fp16_t> && N % 8 == 0)
+    {
+        vector_t<u32_t, N / 8> words;
+        static_for<N / 8>([&](auto i) {
+            vector_t<get_value_t<S>, 8> chunk;
+            static_for<8>([&](auto j) { chunk[j.value] = s[i.value * 8 + j.value]; });
+            words[i.value] = to_fp4_scalef32_x8(chunk, inverted_scale);
+        });
+        return __builtin_bit_cast(array<fp4_t, N>, words);
+    }
+    else
+#endif
+    {
+        vector_t<fp32_t, N> fp32_vec;
+        static_for<N>([&](auto i) { fp32_vec[i.value] = static_cast<float>(s[i.value]); });
+        return scaled_cast<D>(fp32_vec, inverted_scale);
+    }
 }
 
 // general fallback: fp32 source -> any non-quantized target with scale
