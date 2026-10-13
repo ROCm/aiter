@@ -13,6 +13,7 @@ import torch
 
 from aiter.jit.core import AITER_CONFIGS
 from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
+from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import flydsl_8wave_gemm_a8
 from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 from aiter.ops.gemm_op_a8w8 import (
     gemm_a8w8_ck,
@@ -128,6 +129,8 @@ def benchmark_shape(
     check_correctness,
     include_flydsl,
     flydsl_config,
+    include_8wave,
+    eight_wave_config,
 ):
     m, n, k = shape
     (
@@ -144,6 +147,10 @@ def benchmark_shape(
         if with_bias:
             raise RuntimeError("FlyDSL go/no-go candidate does not include bias")
         backend_names.append("flydsl_primary")
+    if include_8wave:
+        if with_bias:
+            raise RuntimeError("FlyDSL 8-wave candidate does not include bias")
+        backend_names.append("flydsl_8wave")
     outputs = {
         name: torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
         for name in backend_names
@@ -210,6 +217,19 @@ def benchmark_shape(
             split_k=flydsl_config["split_k"],
         )
 
+    def run_flydsl_8wave():
+        return flydsl_8wave_gemm_a8(
+            x,
+            weight_shuffled_native,
+            x_scale,
+            w_scale,
+            outputs["flydsl_8wave"],
+            block_m=eight_wave_config["block_m"],
+            block_n=eight_wave_config["block_n"],
+            waves_per_eu=eight_wave_config["waves_per_eu"],
+            xcd_swizzle=eight_wave_config["xcd_swizzle"],
+        )
+
     launches = {
         "ck": run_ck,
         "gluon": run_gluon,
@@ -217,6 +237,8 @@ def benchmark_shape(
     }
     if include_flydsl:
         launches["flydsl_primary"] = run_flydsl_primary
+    if include_8wave:
+        launches["flydsl_8wave"] = run_flydsl_8wave
     for launch in launches.values():
         launch()
     torch.cuda.synchronize()
@@ -230,6 +252,14 @@ def benchmark_shape(
         if include_flydsl:
             torch.testing.assert_close(
                 outputs["ck"], outputs["flydsl_primary"], atol=0.02, rtol=1e-2
+            )
+        if include_8wave and not torch.equal(outputs["gluon"], outputs["flydsl_8wave"]):
+            mismatch = torch.count_nonzero(
+                outputs["gluon"] != outputs["flydsl_8wave"]
+            ).item()
+            raise AssertionError(
+                f"8-wave output is not bit-exact to regular Gluon: "
+                f"{mismatch}/{m * n} BF16 elements differ"
             )
 
     for _ in range(warmup):
@@ -289,6 +319,7 @@ def main():
         help="Exclude the Wan and Flux/diffusion shapes from the default matrix.",
     )
     parser.add_argument("--include-flydsl", action="store_true")
+    parser.add_argument("--include-8wave", action="store_true")
     parser.add_argument("--flydsl-tile", type=parse_shape, default=(128, 128, 128))
     parser.add_argument("--flydsl-async-copy", type=int, choices=(0, 1), default=1)
     parser.add_argument("--flydsl-waves-per-eu", type=int, default=0)
@@ -297,6 +328,24 @@ def main():
     parser.add_argument("--flydsl-split-k", type=int, default=1)
     parser.add_argument(
         "--flydsl-scheduler", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument(
+        "--8wave-block-m", dest="eight_wave_block_m", type=int, default=128
+    )
+    parser.add_argument(
+        "--8wave-block-n", dest="eight_wave_block_n", type=int, default=256
+    )
+    parser.add_argument(
+        "--8wave-waves-per-eu",
+        dest="eight_wave_waves_per_eu",
+        type=int,
+        default=1,
+    )
+    parser.add_argument(
+        "--8wave-xcd-swizzle",
+        dest="eight_wave_xcd_swizzle",
+        type=int,
+        default=8,
     )
     parser.add_argument("--skip-correctness", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
@@ -330,6 +379,12 @@ def main():
         "split_k": args.flydsl_split_k,
         "scheduler": args.flydsl_scheduler,
     }
+    eight_wave_config = {
+        "block_m": args.eight_wave_block_m,
+        "block_n": args.eight_wave_block_n,
+        "waves_per_eu": args.eight_wave_waves_per_eu,
+        "xcd_swizzle": args.eight_wave_xcd_swizzle,
+    }
     rows = []
     for index, shape in enumerate(shapes):
         rows.extend(
@@ -343,6 +398,8 @@ def main():
                 not args.skip_correctness,
                 args.include_flydsl,
                 flydsl_config,
+                args.include_8wave,
+                eight_wave_config,
             )
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)

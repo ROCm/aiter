@@ -7,7 +7,7 @@ One operator, two pipelines, swept together under the same ``flydsl`` libtype so
 a single ``--libtype flydsl`` run picks one winner per shape:
 
 * ``preshuffle`` -- 4-wave MFMA, gfx942 + gfx950, fp8 or int8 weights.
-* ``8wave``      -- 8-wave CDNA4 ``MFMA_Scale``, gfx950 only, fp8 only.
+* ``8wave``      -- 8-wave CDNA4 MFMA, gfx950 only, fp8 or true int8.
 
 Each exposes the same pair -- a ``{kernelId: instance}`` table and a
 ``fits(ki, M, N, K)`` predicate -- and both are listed in :data:`PIPELINES`, so
@@ -484,9 +484,12 @@ class EightWaveKernelInstance:
 
     @property
     def name(self) -> str:
+        qa = _DTYPE_SHORT[self.q_dtype_a]
+        qw = _DTYPE_SHORT[self.q_dtype_w]
+        dt = _DTYPE_SHORT[self.dtype]
         return (
             f"{NAME_PREFIX_8WAVE}_{self.block_m}x{self.block_n}x{BLOCK_K_8WAVE}_"
-            f"F8_F8_B16_{self.waves_per_eu}x{self.xcd_swizzle}"
+            f"{qa}_{qw}_{dt}_{self.waves_per_eu}x{self.xcd_swizzle}"
         )
 
 
@@ -529,22 +532,35 @@ def is_8wave_enabled() -> bool:
     return get_gfx().startswith("gfx950")
 
 
-def _build_kernels_list_8wave() -> dict[int, EightWaveKernelInstance]:
+def _build_kernels_list_8wave(
+    q_dtype: str, start_idx: int
+) -> dict[int, EightWaveKernelInstance]:
     kl: dict[int, EightWaveKernelInstance] = {}
-    idx = KERNEL_ID_BASE_8WAVE
+    idx = start_idx
     for block_m, block_n in _TILES_8WAVE:
         if _lds_bytes_8wave(block_m, block_n) > LDS_BYTES_8WAVE:
             continue
         for wpe in _WAVES_PER_EU_8WAVE:
             for xcd in _XCD_SWIZZLE_VALS_8WAVE:
-                kl[idx] = EightWaveKernelInstance(block_m, block_n, wpe, xcd)
+                kl[idx] = EightWaveKernelInstance(
+                    block_m,
+                    block_n,
+                    wpe,
+                    xcd,
+                    q_dtype_a=q_dtype,
+                    q_dtype_w=q_dtype,
+                )
                 idx += 1
     return kl
 
 
-kernels_list_8wave: dict[int, EightWaveKernelInstance] = (
-    _build_kernels_list_8wave() if is_8wave_enabled() else {}
-)
+kernels_list_8wave: dict[int, EightWaveKernelInstance] = {}
+if is_8wave_enabled():
+    # Build FP8 first to keep all persisted FP8 kernel IDs stable.
+    kernels_list_8wave.update(_build_kernels_list_8wave("fp8", KERNEL_ID_BASE_8WAVE))
+    kernels_list_8wave.update(
+        _build_kernels_list_8wave("int8", max(kernels_list_8wave) + 1)
+    )
 
 
 # ===========================================================================
@@ -572,5 +588,5 @@ class Pipeline:
 # existed.
 PIPELINES: tuple[Pipeline, ...] = (
     Pipeline("preshuffle", kernels_list, kernel_fits_shape, ("fp8", "int8")),
-    Pipeline("8wave", kernels_list_8wave, kernel_fits_shape_8wave, ("fp8",)),
+    Pipeline("8wave", kernels_list_8wave, kernel_fits_shape_8wave, ("fp8", "int8")),
 )

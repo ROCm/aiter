@@ -752,9 +752,19 @@ def _compile_8wave_to_cache(
     block_n: int,
     waves_per_eu: int,
     xcd_swizzle: int,
+    q_dtype_a: str = "F8",
+    q_dtype_w: str = "F8",
+    dtype: str = "B16",
     **kwargs,
 ):
     del kwargs
+    if q_dtype_a != q_dtype_w or q_dtype_a not in ("F8", "I8"):
+        raise ValueError(
+            f"8-wave AOT requires matching F8_F8 or I8_I8, got {q_dtype_a}_{q_dtype_w}"
+        )
+    if dtype != "B16":
+        raise ValueError(f"8-wave AOT requires B16 output, got {dtype}")
+    q_dtype = "int8" if q_dtype_a == "I8" else "fp8"
 
     import torch
 
@@ -771,6 +781,7 @@ def _compile_8wave_to_cache(
         block_n=block_n,
         waves_per_eu=waves_per_eu,
         xcd_swizzle=int(xcd_swizzle),
+        q_dtype=q_dtype,
     )
     # NOTE: the 8-wave launcher takes (A, B, C, ...), not the preshuffle
     # launcher's (C, A, B, ...).

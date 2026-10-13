@@ -2,7 +2,7 @@
 # Copyright (c) 2025 FlyDSL Project Contributors
 # Modifications Copyright (C) 2026 Advanced Micro Devices, Inc.
 
-"""8-wave FP8 matmul with row-wise scaling for AMD CDNA4 (gfx950 only)."""
+"""8-wave FP8/INT8 matmul with row-wise scaling for AMD CDNA4 (gfx950 only)."""
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -15,6 +15,7 @@ from aiter.ops.flydsl.kernels.mfma_preshuffle_pipeline import split_row_major_2d
 
 
 def make_fp8_buffer_tensor(arg_i8, fp8_ir_t):
+    # The launcher uses int8 storage for both native INT8 and bitcast FP8.
     # max_size=False with no num_records_bytes: cosize(layout) becomes a
     # runtime expression because TensorAdaptor defaults to layout-dynamic
     # memref (post #554), so the descriptor adapts to the actual tensor
@@ -220,6 +221,38 @@ class StoreC:
                     self._store_bf16(scaled, col_valid.select(c_index, oob))
 
 
+class StoreCInt8(StoreC):
+    """INT32 accumulator epilogue for true INT8.
+
+    The integer dot product is converted once after the complete K reduction;
+    the row/column FP32 scales are then applied exactly once before BF16
+    conversion.
+    """
+
+    def store(self, c_frag, base_row, base_col):
+        a_scales = [
+            self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
+            for i in range_constexpr(self.n_tiles_a)
+        ]
+        b_scales = [
+            self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
+            for i in range_constexpr(self.n_tiles_b)
+        ]
+        for ti in range_constexpr(self.n_tiles_a):
+            row = base_row + ti * 16 + (self.lane_id // 16) * 4
+            for tj in range_constexpr(self.n_tiles_b):
+                col = base_col + tj * 16 + self.lane_id % 16
+                col_valid = col < self.c_cols
+                oob = fx.Int32(self.c_rows * self.c_cols)
+                vec_i32 = Vec(c_frag[self.c_idx_fn(ti, tj)])
+                for i in range_constexpr(4):
+                    scaled = (
+                        vec_i32[i].to(fx.Float32) * (a_scales[ti][i] * b_scales[tj])
+                    ).to(fx.BFloat16)
+                    c_index = (row + i) * self.c_cols + col
+                    self._store_bf16(scaled, col_valid.select(c_index, oob))
+
+
 class Mfma16x16x128:
     def __init__(self, n_tiles_a, n_tiles_b):
         self.atom = fx.make_mma_atom(
@@ -284,6 +317,73 @@ class Mfma16x16x128:
         return self._do_mma(a[i], b[j], c[self.idx(i, j)])
 
 
+class Mfma16x16x64Int8:
+    """Two true-INT8 K64 MFMAs for each K128 software tile."""
+
+    def __init__(self, n_tiles_a, n_tiles_b):
+        self.zero_value = Vec.filled(4, 0, fx.Int32)
+        self.n_tiles_a = n_tiles_a
+        self.n_tiles_b = n_tiles_b
+
+    def idx(self, i, j):
+        return i * self.n_tiles_b + j
+
+    def _operand_phase(self, value, phase):
+        value = Vec(value)
+        return Vec.from_elements(
+            [value[phase * 4 + i] for i in range_constexpr(4)], fx.Int32
+        )
+
+    def _do_mma(self, a, b, c):
+        a_raw = Vec(a).ir_value()
+        b_raw = Vec(b).ir_value()
+        c_raw = Vec(c).ir_value()
+        # FlyDSL 0.3.4.1 does not yet legalize its generic K64 INT8 MFMA atom
+        # on gfx950. Keep the operation typed as vector<4xi32> and tie src_c to
+        # the destination tuple so LLVM emits the native instruction directly.
+        return _llvm.inline_asm(
+            res=c_raw.type,
+            operands_=[a_raw, b_raw, c_raw],
+            asm_string="v_mfma_i32_16x16x64_i8 $0, $1, $2, $3",
+            constraints="=v,v,v,0",
+            has_side_effects=False,
+        )
+
+    def call(self, a, b, c, *, set_prio=True):
+        assert len(a) == self.n_tiles_a
+        assert len(b) == self.n_tiles_b
+        assert len(c) == self.n_tiles_a * self.n_tiles_b
+
+        c_values = [
+            Vec(c[idx]).ir_value()
+            for idx in range_constexpr(self.n_tiles_a * self.n_tiles_b)
+        ]
+        if const_expr(set_prio):
+            rocdl.s_setprio(1)
+        # S2RLoader returns the complete 32-byte K128 operand. Keep it resident
+        # while issuing the low/high K64 phases; phase-local fragments let the
+        # first set die before the second set is materialized.
+        for phase in range_constexpr(2):
+            a_values = [
+                self._operand_phase(a[idx], phase)
+                for idx in range_constexpr(self.n_tiles_a)
+            ]
+            b_values = [
+                self._operand_phase(b[idx], phase)
+                for idx in range_constexpr(self.n_tiles_b)
+            ]
+            for i in range_constexpr(self.n_tiles_a):
+                for j in range_constexpr(self.n_tiles_b):
+                    idx = self.idx(i, j)
+                    c_values[idx] = self._do_mma(
+                        a_values[i], b_values[j], c_values[idx]
+                    )
+        if const_expr(set_prio):
+            rocdl.s_setprio(0)
+            rocdl.s_barrier()
+        return c_values
+
+
 def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm):
     """XCD-aware tile remap that works for any workgroup count. This function is used to swizzle the tile indices to improve the L2 reuse."""
     NUM_XCDS = 8
@@ -316,8 +416,13 @@ def compile_fp8_gemm_8w(
     b_preshuffled: bool = False,
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
+    input_dtype: str = "fp8",
 ):
     BLOCK_K = 128
+
+    if input_dtype not in ("fp8", "int8"):
+        raise ValueError(f"input_dtype must be 'fp8' or 'int8', got {input_dtype!r}")
+    is_int8 = input_dtype == "int8"
 
     assert (
         BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
@@ -343,21 +448,25 @@ def compile_fp8_gemm_8w(
     b_lds_size = LDS_BLOCK_N * BLOCK_K
 
     _layout_tag = "bpreshuffle" if b_preshuffled else "rowmajor"
+    _input_tag = "I8" if is_int8 else "F8"
     _kname = (
-        f"flydsl_{_layout_tag}_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_F8_F8_B16_"
+        f"flydsl_{_layout_tag}_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
+        f"{_input_tag}_{_input_tag}_B16_"
         f"{waves_per_eu}x{xcd_swizzle}_k{K}"
     )
 
+    input_elem_t = fx.Int8 if is_int8 else fx.Float8E4M3FN
+
     @fx.struct
     class SharedStorage:
-        A_lds_cur_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_cur_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_next_0: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        A_lds_next_1: fx.Array[fx.Float8E4M3FN, a_lds_size, 16]
-        B_lds_cur_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_cur_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_next_0: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
-        B_lds_next_1: fx.Array[fx.Float8E4M3FN, b_lds_size, 16]
+        A_lds_cur_0: fx.Array[input_elem_t, a_lds_size, 16]
+        A_lds_cur_1: fx.Array[input_elem_t, a_lds_size, 16]
+        A_lds_next_0: fx.Array[input_elem_t, a_lds_size, 16]
+        A_lds_next_1: fx.Array[input_elem_t, a_lds_size, 16]
+        B_lds_cur_0: fx.Array[input_elem_t, b_lds_size, 16]
+        B_lds_cur_1: fx.Array[input_elem_t, b_lds_size, 16]
+        B_lds_next_0: fx.Array[input_elem_t, b_lds_size, 16]
+        B_lds_next_1: fx.Array[input_elem_t, b_lds_size, 16]
 
     @flyc.kernel(name=_kname, known_block_size=[512, 1, 1])
     def kernel_gemm(
@@ -369,7 +478,7 @@ def compile_fp8_gemm_8w(
         c_m: fx.Int32,
         c_n: fx.Int32,
     ):
-        F8_IR_t = fx.Float8E4M3FN.ir_type
+        input_ir_t = input_elem_t.ir_type
 
         n_blocks = ceildiv(c_n, BLOCK_N)
 
@@ -400,8 +509,8 @@ def compile_fp8_gemm_8w(
         B0_gl_offset = (block_n * BLOCK_N) * K
         B1_gl_offset = (block_n * BLOCK_N + LDS_BLOCK_N) * K
 
-        gA = make_fp8_buffer_tensor(A, F8_IR_t)
-        gB = make_fp8_buffer_tensor(B_T, F8_IR_t)
+        gA = make_fp8_buffer_tensor(A, input_ir_t)
+        gB = make_fp8_buffer_tensor(B_T, input_ir_t)
         a_div = fx.logical_divide(gA, fx.make_layout(1, 1))
         b_div = fx.logical_divide(gB, fx.make_layout(1, 1))
 
@@ -412,13 +521,20 @@ def compile_fp8_gemm_8w(
             lane_id, wave_id, K, N_LDS_ROUNDS, preshuffled=b_preshuffled
         )
 
-        mfma = Mfma16x16x128(N_TILES_A, N_TILES_B)
+        mfma = (
+            Mfma16x16x64Int8(N_TILES_A, N_TILES_B)
+            if is_int8
+            else Mfma16x16x128(N_TILES_A, N_TILES_B)
+        )
 
-        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, F8_IR_t, wave_id)
-        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, F8_IR_t, wave_id)
+        a_g2s = G2SLoader(a_div, gl_off_a, N_LDS_STEPS_A, input_ir_t, wave_id)
+        b_g2s = G2SLoader(b_div, gl_off_b, N_LDS_STEPS_B, input_ir_t, wave_id)
         a_s2r = S2RLoader(wave_m, N_TILES_A)
         b_s2r = S2RLoader(wave_n, N_TILES_B)
-        store_c = StoreC(A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B)
+        store_cls = StoreCInt8 if is_int8 else StoreC
+        store_c = store_cls(
+            A_scale, B_scale, C, c_m, c_n, mfma.idx, N_TILES_A, N_TILES_B
+        )
 
         # 2x2 config of 4x2 (instead of 4x4 in 4wave) 16x16 sub-tiles
         c00_frag = [mfma.zero_value] * N_ACCUMS

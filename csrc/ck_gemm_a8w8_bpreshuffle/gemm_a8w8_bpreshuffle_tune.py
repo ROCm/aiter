@@ -543,6 +543,13 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 # experimental LDS-stage-3 path) must not enter an fp8 tune.
                 if getattr(ki, "q_dtype_w", None) == "int8" and q_dtype_name != "int8":
                     continue
+                # Unlike the legacy preshuffle table, 8-wave names describe
+                # distinct typed executables and must match in both directions.
+                if (
+                    pipe.name == "8wave"
+                    and getattr(ki, "q_dtype_w", None) != q_dtype_name
+                ):
+                    continue
                 if not pipe.fits(ki, M, N, K):
                     continue
                 for ks in [1] + (

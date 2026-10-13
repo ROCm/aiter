@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""8-wave CDNA4 (gfx950) backend for the FlyDSL a8w8 ptpc bpreshuffle GEMM."""
+"""8-wave CDNA4 (gfx950) FP8/INT8 FlyDSL a8w8 bpreshuffle GEMM."""
 
 from __future__ import annotations
 
@@ -114,9 +114,14 @@ def compile_8wave_gemm(
     waves_per_eu: int,
     xcd_swizzle: int,
     b_preshuffled: bool = True,
+    q_dtype: str = "fp8",
 ):
     """Compile (and memoize) an 8-wave launcher."""
     _lazy_import()
+    if q_dtype not in ("fp8", "int8"):
+        raise ValueError(
+            f"[FlyDSL 8wave] q_dtype must be 'fp8' or 'int8', got {q_dtype!r}"
+        )
     _validate(K=K, block_m=block_m, block_n=block_n, waves_per_eu=waves_per_eu)
     return _compile_fp8_gemm_8w(
         K=K,
@@ -125,6 +130,7 @@ def compile_8wave_gemm(
         b_preshuffled=bool(b_preshuffled),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        input_dtype=q_dtype,
     )
 
 
@@ -151,6 +157,18 @@ def _as_i8(t: Tensor) -> Tensor:
     return t.view(torch.int8) if "float8" in str(t.dtype) else t
 
 
+def _canonical_q_dtype(XQ: Tensor, WQ: Tensor) -> str:
+    """Return the kernel dtype while enforcing the public A8/W8 contract."""
+    if XQ.dtype == torch.int8 and WQ.dtype == torch.int8:
+        return "int8"
+    if XQ.dtype == WQ.dtype and "float8" in str(XQ.dtype):
+        return "fp8"
+    raise ValueError(
+        "[FlyDSL 8wave] A/B must both be torch.int8 for true INT8, or both "
+        f"the same FP8 dtype; got {XQ.dtype} and {WQ.dtype}"
+    )
+
+
 def flydsl_8wave_gemm_a8(
     XQ: Tensor,
     WQ: Tensor,
@@ -165,9 +183,9 @@ def flydsl_8wave_gemm_a8(
 ) -> Tensor:
     """Run the 8-wave a8w8 ptpc GEMM; writes into ``Out`` and returns it.
 
-    XQ: ``(M, K)`` fp8 e4m3. WQ: ``(N, K)`` fp8 e4m3 in ``shuffle_weight``
-    ``(16, 16)`` layout. x_scale: per-token fp32. w_scale: per-channel fp32.
-    Out: ``(M, N)`` bf16.
+    XQ: ``(M, K)`` FP8 e4m3 or canonical ``torch.int8``. WQ: matching
+    ``(N, K)`` values in ``shuffle_weight(..., layout=(16, 16))`` layout.
+    x_scale: per-token fp32. w_scale: per-channel fp32. Out: ``(M, N)`` bf16.
 
     M need not be a multiple of ``block_m`` nor N of ``block_n``: out-of-range A
     and B reads return zero via the buffer descriptor's num_records, C row
@@ -180,11 +198,17 @@ def flydsl_8wave_gemm_a8(
         raise ValueError(
             f"[FlyDSL 8wave] A/B must be 2-D, got {tuple(XQ.shape)}, {tuple(WQ.shape)}"
         )
-    if XQ.element_size() != 1 or WQ.element_size() != 1:
-        raise ValueError("[FlyDSL 8wave] A/B must be 1-byte fp8 storage")
+    q_dtype = _canonical_q_dtype(XQ, WQ)
     if Out.dtype != torch.bfloat16:
         raise ValueError(
             f"[FlyDSL 8wave] only bf16 output is supported, got {Out.dtype}"
+        )
+    if q_dtype == "int8" and (
+        x_scale.dtype != torch.float32 or w_scale.dtype != torch.float32
+    ):
+        raise ValueError(
+            "[FlyDSL 8wave] true INT8 requires FP32 x_scale and w_scale, got "
+            f"{x_scale.dtype} and {w_scale.dtype}"
         )
 
     M, K = XQ.shape
@@ -216,6 +240,7 @@ def flydsl_8wave_gemm_a8(
         block_n=int(block_n),
         waves_per_eu=int(waves_per_eu),
         xcd_swizzle=int(xcd_swizzle),
+        q_dtype=q_dtype,
     )
 
     out_contig = Out.contiguous()
@@ -282,6 +307,25 @@ def run_gemm_a8w8_bpreshuffle_8wave(
         raise ValueError(
             f"[FlyDSL 8wave] kernelName says BLOCK_K={cfg['block_k']}, "
             f"but the kernel fixes it at {BLOCK_K}: {kernel_name!r}"
+        )
+    if cfg["q_dtype_a"] != cfg["q_dtype_w"] or cfg["q_dtype_a"] not in (
+        "F8",
+        "I8",
+    ):
+        raise ValueError(
+            "[FlyDSL 8wave] kernelName must use matching F8_F8 or I8_I8 inputs: "
+            f"{kernel_name!r}"
+        )
+    if cfg["dtype"] != "B16":
+        raise ValueError(
+            f"[FlyDSL 8wave] kernelName must request B16 output: {kernel_name!r}"
+        )
+    expected_q_dtype = "int8" if cfg["q_dtype_a"] == "I8" else "fp8"
+    actual_q_dtype = _canonical_q_dtype(XQ, WQ)
+    if actual_q_dtype != expected_q_dtype:
+        raise ValueError(
+            f"[FlyDSL 8wave] kernelName requests {expected_q_dtype}, but A/B are "
+            f"{XQ.dtype}/{WQ.dtype}"
         )
     return flydsl_8wave_gemm_a8(
         XQ,
