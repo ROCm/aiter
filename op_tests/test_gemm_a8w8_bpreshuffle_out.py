@@ -287,17 +287,17 @@ def _strided_row(t):
     return _row_strided(t).t()
 
 
-@pytest.mark.parametrize(
-    "arg,make",
-    [
-        pytest.param("XQ", lambda t: t.t().contiguous().t(), id="column-major-XQ"),
-        pytest.param("XQ", _row_strided, id="row-strided-XQ"),
-        pytest.param("WQ", _row_strided, id="row-strided-WQ"),
-        pytest.param("x_scale", _row_strided, id="strided-x_scale"),
-        pytest.param("w_scale", _row_strided, id="strided-w_scale"),
-        pytest.param("x_scale", _strided_row, id="strided-1xM-x_scale"),
-    ],
-)
+STRIDED_OPERANDS = [
+    pytest.param("XQ", lambda t: t.t().contiguous().t(), id="column-major-XQ"),
+    pytest.param("XQ", _row_strided, id="row-strided-XQ"),
+    pytest.param("WQ", _row_strided, id="row-strided-WQ"),
+    pytest.param("x_scale", _row_strided, id="strided-x_scale"),
+    pytest.param("w_scale", _row_strided, id="strided-w_scale"),
+    pytest.param("x_scale", _strided_row, id="strided-1xM-x_scale"),
+]
+
+
+@pytest.mark.parametrize("arg,make", STRIDED_OPERANDS)
 def test_strided_operand_matches_dense(arg, make):
     # The untuned CK path reads only row strides and would misread these as-is.
     m, n, k = 37, 1280, 512
@@ -309,6 +309,35 @@ def test_strided_operand_matches_dense(arg, make):
 
     aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
     assert torch.equal(out, ref)
+
+
+@pytest.mark.parametrize("arg,make", STRIDED_OPERANDS)
+def test_strided_operand_aliasing_out_matches_dense(arg, make):
+    # A strided input is copied before launch, so the kernel reads that copy
+    # and writing out cannot corrupt it: the overlap check only needs to see
+    # the dense tensors the kernel reads.
+    m, n, k = 37, 1280, 512
+    args = dict(zip(("XQ", "WQ", "x_scale", "w_scale"), _inputs(m, n, k)))
+    ref = aiter.gemm_a8w8_bpreshuffle(*args.values(), None, dtypes.bf16)
+    src = args[arg]
+    strided = make(src)
+    # One byte buffer holds the strided input's storage and, through a bf16
+    # view, out; both start at its first byte.
+    out_nbytes = m * n * dtypes.bf16.itemsize
+    nbytes = max(strided.untyped_storage().nbytes(), out_nbytes)
+    buf = torch.zeros(-(-nbytes // 4) * 4, dtype=torch.uint8, device="cuda")
+    args[arg] = buf.view(src.dtype).as_strided(
+        strided.shape, strided.stride(), strided.storage_offset()
+    )
+    args[arg].copy_(src.view(strided.shape))
+    out = buf[:out_nbytes].view(dtypes.bf16).view(m, n)
+    assert not args[arg].is_contiguous()
+    assert args[arg].data_ptr() == out.data_ptr()
+
+    aiter.gemm_a8w8_bpreshuffle_out(out, *args.values())
+    assert torch.equal(out, ref)
+    # The alias is real: writing out clobbered the input.
+    assert not torch.equal(args[arg], src.view(strided.shape))
 
 
 @pytest.mark.skipif(

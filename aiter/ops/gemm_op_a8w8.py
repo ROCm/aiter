@@ -837,10 +837,12 @@ def gemm_a8w8_bpreshuffle_out(
 
     XQ and WQ must be 2-D fp8, x_scale and w_scale fp32 with M and N elements,
     all tensors must be on one CUDA/HIP device, and ``out`` must be a contiguous
-    bf16 [M, N] tensor that does not overlap any input. Strided XQ, WQ and
-    scales are made contiguous before dispatch. A K-padded WQ (K_w > K) gets
-    gemm_a8w8_bpreshuffle's padded-K handling unchanged. Only bf16 is accepted:
-    the FlyDSL 8-wave kernels, which many tuned rows select, write bf16 only.
+    bf16 [M, N] tensor. Strided XQ, WQ and scales are made contiguous before
+    dispatch, and ``out`` must not overlap the dense tensors the kernel reads;
+    a strided input may alias ``out`` because the kernel reads its copy. A
+    K-padded WQ (K_w > K) gets gemm_a8w8_bpreshuffle's padded-K handling
+    unchanged. Only bf16 is accepted: the FlyDSL 8-wave kernels, which many
+    tuned rows select, write bf16 only.
     CK and CKTile write a dense row-major [M, N], so a strided ``out`` (e.g. a
     column slice of a wider buffer) is rejected instead of being written past
     its bounds. Every check runs before any kernel launch.
@@ -900,7 +902,8 @@ def gemm_a8w8_bpreshuffle_out(
         w_scale = w_scale.reshape(n, 1).contiguous()
     # Every operand is dense now, so [data_ptr, data_ptr + nbytes) is its exact
     # byte range. The kernel would overwrite an input it is still reading, and
-    # the schema tells torch.compile that only out is written.
+    # the schema tells torch.compile that only out is written. A strided input
+    # that aliased out was copied above, so the kernel reads a safe snapshot.
     out_begin, out_end = out.data_ptr(), out.data_ptr() + out.nbytes
     for name, t in (("XQ", XQ), ("WQ", WQ), ("x_scale", x_scale), ("w_scale", w_scale)):
         if t.data_ptr() < out_end and out_begin < t.data_ptr() + t.nbytes:
