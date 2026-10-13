@@ -27,6 +27,9 @@ Public surface:
     Test runners called by ``test_conv2d.py``. Each iterates a shape
     set and delegates to ``run_all_methods``.
 
+- ``conv2d_padding_reference``
+    PyTorch reference for zero and explicitly materialized nonzero padding.
+
 - ``COMMON_SHAPES``, ``get_edge_case_shapes()``
     Shared shape data — 3x3 stride-1 shapes routable by every kernel,
     and the 12-shape edge-case list respectively.
@@ -144,6 +147,27 @@ def apply_activation(y: torch.Tensor, activation: str):
     if activation == "gelu":
         return F.gelu(y, approximate="tanh")
     return y
+
+
+def conv2d_padding_reference(
+    source,
+    weight,
+    bias=None,
+    stride=(1, 1),
+    padding=(0, 0),
+    dilation=(1, 1),
+    padding_mode="zeros",
+):
+    """Match nn.Conv2d padding semantics without production padding helpers."""
+    if padding_mode != "zeros":
+        pad_height, pad_width = (
+            (padding, padding) if isinstance(padding, int) else padding
+        )
+        source = F.pad(
+            source, (pad_width, pad_width, pad_height, pad_height), mode=padding_mode
+        )
+        padding = (0, 0)
+    return F.conv2d(source, weight, bias, stride, padding, dilation)
 
 
 # -- Architecture gating ------------------------------------------------------

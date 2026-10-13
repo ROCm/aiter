@@ -84,7 +84,16 @@ from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
 from aiter.ops.triton._triton_kernels.conv.ncx_to_cblocked import (
     _ncx_to_cblocked_kernel,
 )
-from aiter.ops.triton.conv._utils import _winograd_transform_storage_dtype
+from aiter.ops.triton._triton_kernels.conv.padding import (
+    _get_config as _get_config_padding,
+)
+from aiter.ops.triton._triton_kernels.conv.padding import _pad_conv2d_kernel
+from aiter.ops.triton.conv._utils import (
+    _alloc_output,
+    _normalize_tuple,
+    _validate_conv2d_padding_mode,
+    _winograd_transform_storage_dtype,
+)
 from aiter.ops.triton.utils.conv_config_utils import (
     format_prepack_shape_key,
     format_prepack_shape_key_3d,
@@ -141,6 +150,64 @@ def _make_wino_output_grid(T, K_out):
         return (T, triton.cdiv(K_out, meta["BLOCK_K"]))
 
     return grid
+
+
+def _prepare_conv2d_padding(
+    source: torch.Tensor,
+    padding,
+    padding_mode: str = "zeros",
+    *,
+    layout: str = "nchw",
+) -> tuple[torch.Tensor, tuple[int, int]]:
+    """Return the input and effective padding for an existing Conv2D kernel.
+
+    Nonzero modes materialize a GPU tensor in the requested storage layout.
+    Zeros and zero-padding calls return the original tensor without allocation
+    or launch; layout conversion on those paths is the caller's responsibility.
+    The caller must select source.device before a materialized kernel launch.
+    This internal, forward-only primitive does not provide autograd support.
+    """
+    if source.ndim != 4:
+        raise ValueError(f"conv2d padding input must be 4-D NCHW, got {source.ndim}-D")
+    if layout not in ("nchw", "nhwc"):
+        raise ValueError(f"layout must be 'nchw' or 'nhwc', got {layout!r}")
+    padding = _normalize_tuple(padding, 2, "padding", allow_zero=True)
+    batch_size, channels, height, width = source.shape
+    _validate_conv2d_padding_mode(padding_mode, height, width, padding)
+    if padding_mode == "zeros" or padding == (0, 0):
+        return source, padding
+    if not source.is_cuda:
+        raise ValueError("materialized conv2d padding requires a CUDA/ROCm tensor")
+
+    pad_height, pad_width = padding
+    output = _alloc_output(
+        batch_size,
+        channels,
+        height + 2 * pad_height,
+        width + 2 * pad_width,
+        source,
+        layout,
+    )
+    if output.numel() == 0:
+        return output, (0, 0)
+
+    config = _get_config_padding(M=output.numel())
+    grid = (triton.cdiv(output.numel(), config["BLOCK_SIZE"]),)
+    _pad_conv2d_kernel[grid](
+        source,
+        output,
+        output.numel(),
+        channels,
+        height,
+        width,
+        pad_height,
+        pad_width,
+        *source.stride(),
+        PADDING_MODE=padding_mode,
+        CHANNELS_LAST=layout == "nhwc",
+        **config,
+    )
+    return output, (0, 0)
 
 
 def _launch_nchw_to_cblocked(x, x_blocked, N, C, H, W, C_pad, block_c):
