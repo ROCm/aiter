@@ -30,6 +30,22 @@ def apply_softcap(S, x):
 
 
 @triton.jit
+def blasst_tile_elided(s_max, M, log2_threshold, BLOCK_M: tl.constexpr):
+    """True when every row of this tile votes that it is negligible.
+
+    The decision is per TILE, not per row: a tile is dropped only when all
+    BLOCK_M rows agree, and one that survives the vote is computed as dense.
+
+    ``M`` must be the running maximum BEFORE this tile. Against the folded
+    maximum the test is equivalent below a threshold of 1.0, but above it
+    reduces to ``0 < log2_threshold`` -- true for every row, so even the tile
+    holding the maximum would be dropped.
+    """
+    skip = (s_max - M) < log2_threshold
+    return tl.sum(skip.to(tl.int32)) == BLOCK_M
+
+
+@triton.jit
 def find_seq_idx(
     query_start_len_ptr,
     target_idx,
@@ -172,24 +188,13 @@ def kernel_unified_attention_2d(
     )
 
     if DYNAMIC_SCHED:
-        # Claim a work item from a shared counter instead of deriving it from
-        # this workgroup's id.
-        #
+        # Claim work from a shared counter rather than from the workgroup id.
         # The grid is (num_kv_heads, total_num_q_blocks) and Triton linearises
-        # dim 0 fastest, so workgroup w = kv_head + num_kv_heads * q_block. The
-        # hardware places workgroup w on chiplet w % 8, which at 8 KV heads on 8
-        # chiplets means chiplet == kv_head exactly. Every workgroup for a head
-        # is then stuck on one chiplet, and head-dependent skipping becomes
-        # chiplet imbalance that the launch has to wait out.
-        #
-        # Head-major on purpose: consecutive tickets stay within one KV head for
-        # num_q_blocks draws, so the workgroups resident at any instant are
-        # nearly all on the same head and keep its K/V hot. The decode order is
-        # not arbitrary -- issuing tickets q-major instead measures slower.
-        #
-        # The grid still launches exactly one workgroup per work item, so
-        # tickets 0..N-1 are each drawn exactly once and no bounds check is
-        # needed here.
+        # dim 0 fastest, so at 8 KV heads each head lands entirely on one
+        # chiplet and head-dependent skipping becomes chiplet imbalance.
+        # Head-major decode on purpose: it keeps a head's K/V hot, and q-major
+        # measures slower. One workgroup per work item, so every ticket is
+        # drawn exactly once and needs no bounds check.
         ticket = tl.atomic_add(sched_counter_ptr, 1, sem="relaxed", scope="gpu")
         kv_head_idx = ticket // num_q_blocks
         q_block_raw = ticket % num_q_blocks
@@ -430,16 +435,7 @@ def kernel_unified_attention_2d(
             m_j = tl.maximum(M, s_max)
 
             if ENABLE_BLOCK_SKIP:
-                # The decision is per TILE, not per row: a tile is dropped only
-                # when every row agrees it is negligible. A tile that survives
-                # the vote is then computed exactly as dense.
-                #
-                # M is the running maximum BEFORE this tile. Comparing against
-                # the folded m_j is equivalent for thresholds below 1.0 but
-                # degenerates to `0 < log2(threshold)` above it, skipping every
-                # tile including the one holding the maximum.
-                skip = (s_max - M) < log2_threshold
-                all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+                all_skip = blasst_tile_elided(s_max, M, log2_threshold, BLOCK_M)
                 if COUNT_SKIPS:
                     n_tiles_seen += 1
                     n_tiles_elided += all_skip.to(tl.int32)
@@ -604,17 +600,7 @@ def kernel_unified_attention_2d(
         m_j = tl.maximum(M, s_max)
 
         if ENABLE_BLOCK_SKIP:
-            # Per-row votes, but a per-TILE decision: the tile is dropped only
-            # if every row agrees its scores here are negligible against the
-            # running maximum. A tile that survives the vote computes exactly
-            # as dense below.
-            #
-            # M is the maximum BEFORE this tile. Comparing against the folded
-            # m_j is equivalent below a threshold of 1.0, but above it reduces
-            # to `0 < log2(threshold)` -- true for every row, so even the tile
-            # holding the maximum is dropped.
-            skip = (s_max - M) < log2_threshold
-            all_skip = tl.sum(skip.to(tl.int32)) == BLOCK_M
+            all_skip = blasst_tile_elided(s_max, M, log2_threshold, BLOCK_M)
             if COUNT_SKIPS:
                 n_tiles_seen += 1
                 n_tiles_elided += all_skip.to(tl.int32)

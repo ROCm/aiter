@@ -161,23 +161,16 @@ def unified_attention(
     skip_reduce: bool = False,
     # backend
     backend: str | None = None,  # "triton" | "gluon"
-    # NOTE: these two come AFTER `backend` deliberately. This function is not
-    # keyword-only, so inserting them before it would re-bind an existing
-    # positional call that passed "triton"/"gluon" as the final argument -- the
-    # string would land in block_skip_threshold and fail the numeric comparison.
-    # New optional parameters go at the end.
+    # Block skipping (off at 0.0). A K/V tile is skipped when every query row
+    # has `tile_max - running_max < log2(threshold)`; only whole-tile skips
+    # save work, since the V load and P@V are per tile. The useful threshold is
+    # model- and length-dependent and must be calibrated, so there is no safe
+    # default. Skipping is approximate: it changes the output. Force-disabled
+    # on decode and sliding-window, and rejected on the Gluon backend.
     #
-    # Block skipping (off at 0.0). A K/V tile is skipped when every query row in
-    # the tile has `tile_max - running_max < log2(threshold)`, i.e. its softmax
-    # weights cannot contribute meaningfully. Only whole-tile skips save work,
-    # because the V load and the P@V matmul are per tile rather than per row.
-    #
-    # The useful threshold is model-, and sequence-length-dependent and
-    # has to be calibrated; there is no safe default, which is why this is off
-    # unless asked for. Skipping is approximate: it changes the output.
-    #
-    # Force-disabled on decode and on sliding-window attention, and rejected on
-    # the Gluon backend (see below).
+    # These come AFTER `backend` deliberately: the function is not keyword-only,
+    # so inserting them earlier would re-bind a positional call that passed
+    # "triton"/"gluon" last. New optional parameters go at the end.
     block_skip_threshold: float = 0.0,
     # Optional int64 tensor with at least 2 elements, accumulated in place as
     # [tiles visited, tiles elided]; their ratio is the achieved elision rate.
@@ -545,35 +538,23 @@ def _unified_attention_2d_triton(params: _UAParams):
     log2_threshold = (
         math.log2(params.block_skip_threshold) if ENABLE_BLOCK_SKIP else 0.0
     )
-    # Hoisting the V load is the right default, but it defeats the whole point
-    # when tiles are being skipped: a skipped tile should never touch V. Keep
-    # the hoist only when skipping is off.
-    #
-    # AITER_UA_BLASST_PRELOAD_V=1 keeps V hoisted even with skipping on, making
-    # the feature compute-saving only. A knob rather than a constant because the
-    # BLASST paper deliberately does NOT defer the V load in prefill -- it argues
-    # bandwidth is not the bottleneck there and that conditional loading costs
-    # more latency than it saves. We defer it. This is how that gets measured on
-    # a given shape rather than argued from either side.
+    # Hoisting the V load defeats the point when tiles are skipped: a skipped
+    # tile should never touch V. Keep the hoist only when skipping is off.
+    # AITER_UA_BLASST_PRELOAD_V=1 keeps it hoisted anyway, making the feature
+    # compute-saving only -- a knob because the BLASST paper does not defer the
+    # V load in prefill, and this is how the two get compared on a real shape.
     PRELOAD_V = (not ENABLE_BLOCK_SKIP) or os.environ.get(
         "AITER_UA_BLASST_PRELOAD_V", "0"
     ) == "1"
 
-    # Scheduling rides with skipping and only with skipping. The grid pins each
-    # KV head to one chiplet (workgroup w lands on chiplet w % 8, and w =
-    # kv_head + num_kv_heads * q_block), which costs nothing while every head
-    # does the same work. Skipping is what makes per-head cost data-dependent,
-    # so these two exist to repair a problem skipping introduces -- there is no
-    # reason to perturb the dense path with them.
+    # Scheduling rides with skipping and only with skipping: the grid pins each
+    # KV head to one chiplet, which costs nothing until skipping makes per-head
+    # cost data-dependent. It only permutes which workgroup computes which
+    # tile, so the result is bitwise identical either way.
     #
-    # They only permute which workgroup computes which tile, so the result is
-    # bitwise identical either way.
-    #
-    # AITER_UA_BLASST_SCHED=0 turns the scheduling off while leaving skipping
-    # on. It exists for two reasons: it is the rollback path if the reordering
-    # ever misbehaves on a shape we have not seen, and it is the only way to
-    # measure what the scheduling is worth, since otherwise the two are welded
-    # together. Not a tuning knob -- the default is the shipping configuration.
+    # AITER_UA_BLASST_SCHED=0 disables it while leaving skipping on -- a
+    # rollback path, and the only way to measure what the scheduling is worth.
+    # Not a tuning knob; the default is the shipping configuration.
     _sched = os.environ.get("AITER_UA_BLASST_SCHED", "1") == "1"
     DESCENDING_Q = ENABLE_BLOCK_SKIP and _sched
     DYNAMIC_SCHED = ENABLE_BLOCK_SKIP and _sched
