@@ -605,26 +605,55 @@ def _rand_seqs(B, max_sq, max_sk, rng):
     return seqs_q, seqs_k
 
 
+# Per-axis values present in the built-in lists; an axis the user does not name
+# inherits these, so a partial -b/-nh/-nhkv/-sq/-sk run is no longer silently ignored.
+_AXIS_DEFAULTS = {
+    "batch_size": sorted(
+        {len(sq) for sq, _, _, _ in THD_SHAPES} | {B for B, *_ in BSHD_SHAPES}
+    ),
+    "nheads": sorted(
+        {h for *_, h, _ in THD_SHAPES} | {h for _, _, _, h, _ in BSHD_SHAPES}
+    ),
+    "nheads_kv": sorted({k for *_, k in THD_SHAPES} | {k for *_, k in BSHD_SHAPES}),
+    "seqlen_q": sorted(
+        {x for sq, _, _, _ in THD_SHAPES for x in sq}
+        | {sq for _, sq, _, _, _ in BSHD_SHAPES}
+    ),
+    "seqlen_k": sorted(
+        {x for _, sk, _, _ in THD_SHAPES for x in sk}
+        | {sk for _, _, sk, _, _ in BSHD_SHAPES}
+    ),
+}
+
+
 def _shape_lists(args):
     """``(thd, bshd)`` shape lists for this run.
 
-    The ``-b/-nh/-nhkv/-sq/-sk`` axes replace the built-in lists when all of
-    ``-b/-nh/-sq/-sk`` are given, so a single shape can be driven from the CLI;
-    their cross product is the sweep. With ``--rand-seqlens N`` each combination
-    contributes N random varlen draws instead of one uniform ``[SQ]*B`` shape.
+    With no ``-b/-nh/-nhkv/-sq/-sk`` at all, the curated built-in lists run as-is.
+    Name any of them and the sweep becomes the cross product of those axes, each
+    unnamed axis taking the values it has in the built-in lists (``_AXIS_DEFAULTS``).
+    ``--max-cases`` then bounds what that product costs. With ``--rand-seqlens N``
+    each combination contributes N random varlen draws instead of one uniform shape.
     """
-    if not (args.batch_size and args.nheads and args.seqlen_q and args.seqlen_k):
+    named = [args.batch_size, args.nheads, args.nheads_kv, args.seqlen_q, args.seqlen_k]
+    if not any(named):
         if args.rand_seqlens:
             aiter.logger.warning(
-                "--rand-seqlens needs -b/-nh/-sq/-sk; using built-in shapes"
+                "--rand-seqlens needs one of -b/-nh/-nhkv/-sq/-sk; using built-in shapes"
             )
         return THD_SHAPES, BSHD_SHAPES
 
-    nheads_kv = args.nheads_kv or args.nheads
+    def axis(name, given):
+        return given or _AXIS_DEFAULTS[name]
+
     rng = random.Random(args.seed)
     thd, bshd, skipped = [], [], 0
     for B, H_q, H_kv, sq, sk in itertools.product(
-        args.batch_size, args.nheads, nheads_kv, args.seqlen_q, args.seqlen_k
+        axis("batch_size", args.batch_size),
+        axis("nheads", args.nheads),
+        axis("nheads_kv", args.nheads_kv),
+        axis("seqlen_q", args.seqlen_q),
+        axis("seqlen_k", args.seqlen_k),
     ):
         if H_q % H_kv:
             skipped += 1
@@ -718,18 +747,9 @@ def main():
         "--d_qk_v",
         type=_str2d_qk_v,
         nargs="*",
-        default=[(192, 128)],
-        help="(d_qk, d_v) for the thd suite.\n"
-        f"        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -s 192,128",
-    )
-    parser.add_argument(
-        "-bs",
-        "--batch_d_qk_v",
-        type=_str2d_qk_v,
-        nargs="*",
-        default=[(128, 128)],
-        help="(d_qk, d_v) for the bshd suite.\n"
-        f"        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -bs 128,128",
+        default=[],
+        help="(d_qk, d_v) for both suites. Empty (the default) runs every supported\n"
+        f"        pair.\n        Supported: {SUPPORTED_D_QK_V}.\n        e.g.: -s 192,128",
     )
     parser.add_argument(
         "-c",
@@ -813,7 +833,14 @@ def main():
         "--seed",
         type=int,
         default=42,
-        help="Seed for --rand-seqlens.\n        e.g.: --seed 7",
+        help="Seed for --rand-seqlens and --max-cases sampling.\n        e.g.: --seed 7",
+    )
+    parser.add_argument(
+        "--max-cases",
+        type=int,
+        default=256,
+        help="Cap each layout's sweep at N cases, sampled at random from the full\n"
+        "        cross product (0 = no cap).\n        e.g.: --max-cases 0",
     )
     parser.add_argument(
         "-w",
@@ -844,14 +871,40 @@ def main():
     sinks = [bool(n) for n in args.sink]
     windows = [tuple(w) for w in args.window]
     thd_shapes, bshd_shapes = _shape_lists(args)
+    # No -s: run every pair the kernel serves. With -b/-nh/-sq/-sk also unset that is
+    # the full default sweep CI runs; any explicit flag narrows only what it names.
+    d_qk_v = args.d_qk_v or SUPPORTED_D_QK_V
+    case_rng = random.Random(args.seed)
+
+    def _cases(hdims, shapes, label):
+        """The sweep for one layout, randomly thinned to --max-cases.
+
+        The axes multiply fast (hdim pairs x shapes x causal x lse x sink x window), so
+        sample the product rather than trim an axis: every combination stays reachable,
+        and a different --seed walks a different slice of it."""
+        cases = [
+            c
+            for c in itertools.product(
+                hdims, shapes, args.dtype, causals, lses, sinks, windows
+            )
+            if _flydsl_serves(c[0][0], c[0][1])
+        ]
+        if args.max_cases and len(cases) > args.max_cases:
+            aiter.logger.info(
+                "%s: sampling %d of %d cases (--seed %d; --max-cases 0 runs all)",
+                label,
+                args.max_cases,
+                len(cases),
+                args.seed,
+            )
+            cases = case_rng.sample(cases, args.max_cases)
+        return cases
 
     if "thd" in args.layout:
         rows = []
-        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
-            args.d_qk_v, thd_shapes, args.dtype, causals, lses, sinks, windows
+        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in _cases(
+            d_qk_v, thd_shapes, "thd"
         ):
-            if not _flydsl_serves(d_qk, d_v):
-                continue  # not a pair the FlyDSL kernel can serve
             seqs_q, seqs_k, H_q, H_kv = shape
             rows.append(
                 test_mha_flydsl_varlen(
@@ -873,11 +926,9 @@ def main():
 
     if "bshd" in args.layout:
         rows = []
-        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in itertools.product(
-            args.batch_d_qk_v, bshd_shapes, args.dtype, causals, lses, sinks, windows
+        for (d_qk, d_v), shape, dtype, causal, lse, sink, window in _cases(
+            d_qk_v, bshd_shapes, "bshd"
         ):
-            if not _flydsl_serves(d_qk, d_v):
-                continue
             B, sq, sk, H_q, H_kv = shape
             rows.append(
                 test_mha_flydsl_batch(
