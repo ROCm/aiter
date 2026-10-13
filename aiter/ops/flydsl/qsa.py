@@ -209,8 +209,13 @@ def qsa_layer(
         context_lens: 1-D int32, with no more rows than ``index_page_table``.
         indices: optional int32 ``[M, token_topk + compress_ratio - 1]``
             expand buffer. ``None`` allocates it.
-        block_ids: optional contiguous int32 ``[M, 512]`` K1 buffer. The
-            layer writes it.
+        block_ids: optional caller-owned contiguous int32 ``[M, 512]``.
+            Each call overwrites it. A row is a packed set of unique
+            compressed block ids, then ``-1`` through column 512. The
+            order is not a score ranking, and an exact tie keeps the
+            smaller index. ``-1`` is padding, including a row with no
+            visible block. The incomplete tail is not stored here; expand
+            writes those token ids into ``indices``.
         out: optional contiguous bf16 ``[M, Hq, D]`` matching ``q_gqa``.
             ``None`` allocates it.
         token_topk: selected tokens. The default is 2048, which is the
@@ -220,8 +225,10 @@ def qsa_layer(
 
     A span past 4 GiB on a cache selects the wide gather compile. An empty
     query, cache, or page table writes ``-1`` block ids and a zero ``out``
-    and does not launch. K2 allocates its own split partials on a
-    multi-split launch. Sigmoid and partial RoPE stay outside this call.
+    and does not launch. K2 gathers the token ids it is given and does not
+    check that they are causal. It allocates its own split partials on a
+    multi-split launch. The block ids are the selection for this call.
+    Sigmoid and partial RoPE stay outside this call.
 
     Returns:
         Sparse GQA output, bf16 ``[M, Hq, D]``.
