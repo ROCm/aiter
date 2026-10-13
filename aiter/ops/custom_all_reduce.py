@@ -311,6 +311,84 @@ def dispose_gfx1250(_fa: int) -> None: ...
 def meta_size_gfx1250() -> int: ...
 
 
+# LL128 / CAS staging. These buffers live outside the shared meta buffer, so each
+# rank allocates its own and the bases are exchanged in a second round trip.
+# The LL128 and CAS routing bands stay disabled until their peers are set up.
+@compile_ops(GFX1250_MD_NAME, fc_name="alloc_ll128_unroll2_scratch", develop=True)
+def alloc_ll128_unroll2_scratch_gfx1250(_fa: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_ll128_unroll2_peers", develop=True)
+def init_ll128_unroll2_peers_gfx1250(_fa: int, all_ptrs: list[int]) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_ll128_unroll2_peers_ipc", develop=True)
+def init_ll128_unroll2_peers_ipc_gfx1250(
+    _fa: int, ipc_handle_ptrs: list[int], offsets: list[int]
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="alloc_cas_flags", develop=True)
+def alloc_cas_flags_gfx1250(_fa: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_cas_peers", develop=True)
+def init_cas_peers_gfx1250(_fa: int, all_ptrs: list[int]) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_cas_peers_ipc", develop=True)
+def init_cas_peers_ipc_gfx1250(
+    _fa: int, ipc_handle_ptrs: list[int], offsets: list[int]
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="alloc_cas_scratch", develop=True)
+def alloc_cas_scratch_gfx1250(_fa: int) -> int: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_cas_scratch_peers", develop=True)
+def init_cas_scratch_peers_gfx1250(_fa: int, all_ptrs: list[int]) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="init_cas_scratch_peers_ipc", develop=True)
+def init_cas_scratch_peers_ipc_gfx1250(
+    _fa: int, ipc_handle_ptrs: list[int], offsets: list[int]
+) -> None: ...
+
+
+# Standalone single-kernel entry points, for benchmarking one kernel in
+# isolation. The routed all_reduce_gfx1250 picks kernels by size and never
+# calls these.
+@compile_ops(GFX1250_MD_NAME, fc_name="all_reduce_ll128_unroll2", develop=True)
+def all_reduce_ll128_unroll2_gfx1250(
+    _fa: int, inp: torch.Tensor, out: torch.Tensor, block_size: int = 1024
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="all_reduce_cas_2shot", develop=True)
+def all_reduce_cas_2shot_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+    block_size: int = 1024,
+    unroll_factor: int = 1,
+) -> None: ...
+
+
+@compile_ops(GFX1250_MD_NAME, fc_name="all_reduce_cas_2shot_scratch", develop=True)
+def all_reduce_cas_2shot_scratch_gfx1250(
+    _fa: int,
+    inp: torch.Tensor,
+    out: torch.Tensor,
+    reg_inp_ptr: int,
+    reg_inp_bytes: int,
+    block_size: int = 1024,
+    unroll_factor: int = 1,
+) -> None: ...
+
+
 @compile_ops(GFX1250_MD_NAME, fc_name="register_input_buffer", develop=True)
 def register_input_buffer_gfx1250(
     _fa: int, self_ptr: int, all_ptrs: list[int]
