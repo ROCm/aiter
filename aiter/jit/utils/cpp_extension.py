@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import warnings
 from pathlib import Path
 
@@ -1703,7 +1704,12 @@ def _rocm_sdk_for_compiler(hipcc: str):
                 Path(dist.locate_file("_" + name.replace("-", "_"))).resolve()
             ):
                 return dist
-        except (importlib.metadata.PackageNotFoundError, OSError, ValueError):
+        except (
+            importlib.metadata.PackageNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
             continue
     return None
 
@@ -1799,39 +1805,43 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        # Capture failures even in verbose mode while keeping live progress.
-        # Write to fd 1 because setuptools can detach sys.__stdout__ in AOT builds.
-        with subprocess.Popen(
+        # Keep successful build logs out of memory; read the full log on failure.
+        with tempfile.TemporaryFile() as log, subprocess.Popen(
             command,
-            stdout=subprocess.PIPE,
+            stdout=subprocess.PIPE if verbose else log,
             stderr=subprocess.STDOUT,
             cwd=build_directory,
             env=env,
         ) as process:
             try:
                 if verbose:
-                    chunks = []
-                    for line in process.stdout:
-                        chunks.append(line)
-                        os.write(1, line)
-                    output = b"".join(chunks)
-                    process.wait()
-                else:
-                    output, _ = process.communicate()
+                    while chunk := process.stdout.read1(64 * 1024):
+                        log.write(chunk)
+                        # Use fd 1 because setuptools can detach __stdout__.
+                        # A write may accept only part of the buffer.
+                        pending = memoryview(chunk)
+                        while pending:
+                            pending = pending[os.write(1, pending) :]
+                process.wait()
             except BaseException:
                 # Match subprocess.run's cleanup if streaming is interrupted.
                 process.kill()
                 raise
             if process.returncode:
+                log.seek(0)
                 raise subprocess.CalledProcessError(
-                    process.returncode, command, output=output
+                    process.returncode, command, output=log.read()
                 )
     except subprocess.CalledProcessError as e:
         message = error_prefix
         if e.output:
             output = e.output.decode(*SUBPROCESS_DECODE_ARGS, errors="replace")
             message += f": {output}"
-            message += _rocm_header_build_hint(output)
+            try:
+                message += _rocm_header_build_hint(output)
+            except Exception:  # noqa: BLE001,S110
+                # Optional diagnostics must never replace the compiler error.
+                pass
         raise RuntimeError(message) from e
 
 

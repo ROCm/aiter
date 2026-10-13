@@ -3,6 +3,7 @@
 
 import importlib.metadata
 import importlib.util
+import io
 import os
 import pathlib
 import shlex
@@ -10,10 +11,11 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tracemalloc
 import types
 import unittest
-from contextlib import ExitStack
-from unittest.mock import patch
+from contextlib import ExitStack, nullcontext
+from unittest.mock import Mock, patch
 
 
 def _load_cpp_extension():
@@ -246,7 +248,10 @@ class RocmHeaderDiagnosticsTest(RocmHeaderTestCase):
         (root / ".info").mkdir()
         (root / ".info" / "version").write_text("6.4.3")
         link = self.root / "hipcc"
-        link.symlink_to(compiler)
+        try:
+            link.symlink_to(compiler)
+        except OSError as error:
+            self.skipTest(f"Compiler symlinks unavailable: {error}")
         hint = self.cpp_extension._rocm_devel_install_hint(str(link))
         self.assertIn(f"6.4.3 (root: {root})", hint)
 
@@ -255,12 +260,20 @@ class RocmHeaderDiagnosticsTest(RocmHeaderTestCase):
         (root / ".info").mkdir(parents=True)
         for value in ("", "7.2", "not a release", "7.2.0\n7.1.0", "\ufffd"):
             with self.subTest(value=value):
-                (root / ".info" / "version").write_text(value)
+                (root / ".info" / "version").write_bytes(value.encode("utf-8"))
                 hint = self.cpp_extension._rocm_devel_install_hint(self.hipcc)
                 self.assertIn("Selected compiler ROCm release: unknown", hint)
                 self.assertNotIn("pip install", hint)
                 # The import-time HIP_VERSION is not a package release pin.
                 self.assertNotIn("7.15.0", hint)
+
+    def test_invalid_sdk_version_does_not_invent_package_pin(self):
+        site, _ = self.install_sdk_metadata(version="invalid")
+        hint = self.cpp_extension._rocm_devel_install_hint(
+            str(site.parent.parent / "bin" / "hipcc")
+        )
+        self.assertNotIn("pip install", hint)
+        self.assertIn("Selected compiler ROCm release: unknown", hint)
 
     def test_unreadable_metadata_keeps_missing_header_diagnostic(self):
         for error in (OSError("unreadable"), ValueError("invalid metadata")):
@@ -300,9 +313,19 @@ class RocmHeaderBuildTest(RocmHeaderTestCase):
                 self.cpp_extension, "get_cxx_compiler", return_value=self.hipcc
             )
         )
+        self.stream = self.stack.enter_context(tempfile.TemporaryFile())  # noqa: SIM115
+        self.real_write = os.write
+        self.write_limit = None
         self.output = self.stack.enter_context(
-            patch.object(self.cpp_extension.os, "write")
+            patch.object(
+                self.cpp_extension.os, "write", side_effect=self.forward_output
+            )
         )
+
+    def forward_output(self, fd, data):
+        self.assertEqual(fd, 1)
+        # Exercise a real file descriptor, including partial writes when requested.
+        return self.real_write(self.stream.fileno(), data[: self.write_limit])
 
     def build(self, *, verbose=False, flags=()):
         if self.obj.exists():
@@ -325,12 +348,15 @@ class RocmHeaderBuildTest(RocmHeaderTestCase):
         )
 
     def test_failed_build_reports_toolchain_in_quiet_and_verbose_modes(self):
-        for mode in ("quiet", "verbose", "env_verbose"):
+        for mode in ("quiet", "verbose", "env_verbose", "partial_write"):
             with self.subTest(mode=mode):
                 self.output.reset_mock()
+                self.stream.seek(0)
+                self.stream.truncate()
+                self.write_limit = 17 if mode == "partial_write" else None
                 os.environ["AITER_JIT_VERBOSE"] = "1" if mode == "env_verbose" else "0"
                 with self.assertRaises(RuntimeError) as error:
-                    self.build(verbose=mode == "verbose")
+                    self.build(verbose=mode in ("verbose", "partial_write"))
                 message = str(error.exception)
                 self.assertTrue(message.startswith("Error building header test"))
                 self.assert_header_diagnostic(message)
@@ -341,10 +367,19 @@ class RocmHeaderBuildTest(RocmHeaderTestCase):
                 if mode == "quiet":
                     self.output.assert_not_called()
                 else:
-                    streamed = b"".join(
-                        call.args[1] for call in self.output.call_args_list
+                    self.stream.seek(0)
+                    self.assertEqual(
+                        self.stream.read(), error.exception.__cause__.output
                     )
-                    self.assertIn(b"fatal error:", streamed)
+
+    def test_malformed_sdk_record_preserves_compiler_error(self):
+        _, dist = self.install_sdk_metadata()
+        dist._path.joinpath("RECORD").write_text("../../bin/hipcc,,,unexpected\n")
+        with self.assertRaises(RuntimeError) as error:
+            self.build()
+        self.assert_header_diagnostic(str(error.exception))
+        self.assertIn("fatal error:", str(error.exception))
+        self.assertIsInstance(error.exception.__cause__, subprocess.CalledProcessError)
 
     def test_explicit_include_configuration_succeeds_without_rocm_home_header(self):
         for mode in ("CPATH", "CPLUS_INCLUDE_PATH", "-I", "-isystem"):
@@ -376,6 +411,65 @@ class RocmHeaderBuildTest(RocmHeaderTestCase):
             self.assertIn("unrelated compiler failure", message)
             self.assertNotIn("Selected ROCM_HOME:", message)
             self.assertNotIn("rocm.docs.amd.com", message)
+
+
+class NinjaBuildProcessTest(RocmHeaderTestCase):
+    def test_empty_non_utf8_and_diagnostic_errors_preserve_build_failure(self):
+        for output in (b"", b"error: invalid byte \xff\n"):
+            with self.subTest(output=output):
+                process = Mock(returncode=1)
+
+                def popen(*args, stdout, output=output, process=process, **kwargs):
+                    stdout.write(output)
+                    return nullcontext(process)
+
+                with patch.object(
+                    self.cpp_extension.subprocess, "Popen", side_effect=popen
+                ), patch.object(
+                    self.cpp_extension, "_get_num_workers", return_value=None
+                ), patch.object(
+                    self.cpp_extension,
+                    "_rocm_header_build_hint",
+                    side_effect=RuntimeError("diagnostic lookup failed"),
+                ), self.assertRaises(
+                    RuntimeError
+                ) as error:
+                    self.cpp_extension._run_ninja_build(str(self.root), False, "build")
+                expected = "build" + (
+                    ": " + output.decode(errors="replace") if output else ""
+                )
+                self.assertEqual(str(error.exception), expected)
+                self.assertEqual(error.exception.__cause__.output, output)
+
+    def test_interruption_kills_child(self):
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                process = Mock()
+                operation = process.stdout.read1 if verbose else process.wait
+                operation.side_effect = KeyboardInterrupt()
+                with patch.object(
+                    self.cpp_extension.subprocess,
+                    "Popen",
+                    return_value=nullcontext(process),
+                ), self.assertRaises(KeyboardInterrupt):
+                    self.cpp_extension._run_ninja_build(
+                        str(self.root), verbose, "build"
+                    )
+                process.kill.assert_called_once()
+
+    def test_successful_verbose_log_uses_bounded_memory(self):
+        # Allocate the source before tracing: measure capture, not the test data.
+        process = Mock(stdout=io.BytesIO((b"x" * 4095 + b"\n") * 4096), returncode=0)
+        with patch.object(
+            self.cpp_extension.subprocess, "Popen", return_value=nullcontext(process)
+        ), patch.object(self.cpp_extension.os, "write", new=lambda fd, data: len(data)):
+            tracemalloc.start()
+            try:
+                self.cpp_extension._run_ninja_build(str(self.root), True, "build")
+                _, peak = tracemalloc.get_traced_memory()
+            finally:
+                tracemalloc.stop()
+        self.assertLess(peak, 2 * 1024 * 1024)  # 16 MiB log must not stay in memory.
 
 
 if __name__ == "__main__":
