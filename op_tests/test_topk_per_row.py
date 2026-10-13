@@ -962,8 +962,7 @@ def stable_reference(masked: torch.Tensor, top_k: int) -> torch.Tensor:
 def test_adaptive_ordered_early_stop(card):
     """Stable decode on rows that settle before the last pass and rows that do not,
     on a multi-part cell with the pass-0 certificate, one without it, and a
-    one-part cell: index for index the stable reference, and the same with early
-    stop off."""
+    one-part cell: index for index the stable reference."""
     top_k = 2048
 
     def cfg(rows, width):
@@ -1009,51 +1008,37 @@ def test_adaptive_ordered_early_stop(card):
         live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
         return torch.where(live, logits, 1e4)
 
-    es_env = os.environ.get(adaptive_kernel.EARLY_STOP_ENV)
-    try:
-        for rows, width in cells:
-            exits = set()
-            for data in ("planted", "duplicated", "random", "ties"):
-                torch.manual_seed(0)
-                seq_lens = torch.randint(
-                    top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
-                )
-                seq_lens[0] = width
-                logits = logits_for(data, seq_lens, width)
-                live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
-                masked = torch.where(live, logits, float("-inf"))
-                exits |= set(short_tier_exit_pass(masked, top_k).tolist())
-                out = {}
-                for es in ("1", "0"):
-                    os.environ[adaptive_kernel.EARLY_STOP_ENV] = es
-                    out[es] = torch.full(
-                        (rows, top_k), -7, dtype=torch.int32, device="cuda"
-                    )
-                    flydsl_decode_host._decode_with_backend(
-                        logits,
-                        1,
-                        seq_lens,
-                        out[es],
-                        rows,
-                        *logits.stride(),
-                        top_k,
-                        True,
-                        None,
-                        topk.BACKEND_ADAPTIVE,
-                        width,
-                    )
-                torch.cuda.synchronize()
-                where = f"{data} rows={rows} width={width}"
-                assert torch.equal(
-                    out["1"].long(), stable_reference(masked, top_k)
-                ), f"ordered early stop mismatch: {where}"
-                assert torch.equal(out["1"], out["0"]), f"early stop changed: {where}"
-            assert {1, 2} & exits and 3 in exits, f"exits {exits} at rows={rows}"
-    finally:
-        if es_env is None:
-            os.environ.pop(adaptive_kernel.EARLY_STOP_ENV, None)
-        else:
-            os.environ[adaptive_kernel.EARLY_STOP_ENV] = es_env
+    for rows, width in cells:
+        exits = set()
+        for data in ("planted", "duplicated", "random", "ties"):
+            torch.manual_seed(0)
+            seq_lens = torch.randint(
+                top_k + 1, width + 1, (rows,), dtype=torch.int32, device="cuda"
+            )
+            seq_lens[0] = width
+            logits = logits_for(data, seq_lens, width)
+            live = torch.arange(width, device="cuda")[None, :] < seq_lens[:, None]
+            masked = torch.where(live, logits, float("-inf"))
+            exits |= set(short_tier_exit_pass(masked, top_k).tolist())
+            out = torch.full((rows, top_k), -7, dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                out,
+                rows,
+                *logits.stride(),
+                top_k,
+                True,
+                None,
+                topk.BACKEND_ADAPTIVE,
+                width,
+            )
+            torch.cuda.synchronize()
+            assert torch.equal(
+                out.long(), stable_reference(masked, top_k)
+            ), f"ordered early stop mismatch: {data} rows={rows} width={width}"
+        assert {1, 2} & exits and 3 in exits, f"exits {exits} at rows={rows}"
     print(f"[adaptive_ordered_early_stop] PASS: cells={cells} k={top_k}")
 
 

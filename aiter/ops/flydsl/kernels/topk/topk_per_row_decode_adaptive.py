@@ -50,7 +50,6 @@ Constraints:
 """
 
 import math
-import os
 from functools import cache
 from typing import Any, Literal
 
@@ -160,18 +159,6 @@ SMEM_RUN_TIED = 5
 # Compact only: candidates this part wrote, and whether its slice overflowed.
 SMEM_RUN_COMPACT_COUNT = 6
 SMEM_RUN_COMPACT_SPILLED = 7
-
-
-EARLY_STOP_DEFAULT = True
-EARLY_STOP_ENV = "FLYDSL_TOPK_ADAPTIVE_ES"
-
-
-def early_stop_default() -> bool:
-    """Whether a config built with `early_stop=None` asks for the early stop."""
-    asked = os.environ.get(EARLY_STOP_ENV)
-    if asked is not None:
-        return asked not in ("0", "")
-    return EARLY_STOP_DEFAULT
 
 
 # --- the host-side rule -----------------------------------------------------
@@ -348,7 +335,7 @@ def decode_adaptive_config(
     compact_cap_mult: int = 16,
     short_max: int | None = None,
     ordered: bool = True,
-    early_stop: bool | None = None,
+    early_stop: bool = True,
     cu_count: int = FITTED_CU,
 ) -> dict:
     """Everything `create_topk_per_row_decode_adaptive_kernel` needs for a shape.
@@ -375,8 +362,6 @@ def decode_adaptive_config(
         # Poll with monotonic loads, then one acquire once the token lands.
         "poll_then_acquire": True,
     }
-    if early_stop is None:
-        early_stop = early_stop_default()
     # Left out where the build cannot reach it, which would only split the JIT cache.
     # The short tier reaches it under `compact` too, since it never uses the buffer;
     # `ordered` has no short tier, so there `compact` leaves nothing to reach.
