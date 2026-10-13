@@ -5,7 +5,8 @@
 with the separate RMSNorm.
 
 Same arguments and returns as the Triton seam
-``aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm``. A fused pass post-mixes the
+``aiter.ops.triton.fusions.mhc_fused_post_pre_delayed_rmsnorm`` for contiguous inputs: the
+Triton seam copies a strided one, this wrapper rejects it. A fused pass post-mixes the
 streams, stages the un-normalised collapse in ``layer_input`` and publishes the split-K gate
 projection and both sums of squares; a finish pass folds them, forms the gates and rescales
 ``layer_input`` in place. With ``NORM="separate"`` the kernels of
@@ -115,7 +116,7 @@ def _lds_bytes(arch: str) -> int:
 def _check_config(T: int, H: int, cfg: dict, arch: str) -> None:
     _require(
         cfg["NORM"] in _NORMS,
-        f"[flydsl_mhc_seam] NORM must be one of {_NORMS}, got {cfg['NORM']!r}",
+        f"NORM must be one of {_NORMS}, got {cfg['NORM']!r}",
     )
     if cfg["NORM"] == "separate":
         from aiter.ops.flydsl.kernels.mhc_seam_nonorm import check_config
@@ -147,8 +148,11 @@ def _pack_fn_nonorm(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
 
     Keyed on the tensor object (dropped when it is freed, so a new weight at a recycled
     address never hits a stale pack) and checked against its address and version counter, so
-    an in-place update repacks. Packing only runs eagerly: during capture it would be
-    recorded, not computed.
+    an in-place update repacks. A repack writes into the existing pack, whose address a
+    captured graph holds, so one eager call after an in-place update brings captured graphs
+    up to date too. Packing only runs eagerly: during capture it would be recorded, not
+    computed. The host waits for the pack once, so a call on another stream cannot read it
+    half written.
     """
     key = id(fn)
     hit = _FN_CACHE.get(key)
@@ -157,8 +161,8 @@ def _pack_fn_nonorm(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
         return hit[1]
     _require(
         not capturing,
-        "[flydsl_mhc_seam] fn is not packed for NORM='separate' during CUDA-graph capture: "
-        "run one eager call with the same fn before capturing",
+        "fn is not packed for NORM='separate' during CUDA-graph capture: run one eager "
+        "call with the same fn before capturing, and again after updating it in place",
         RuntimeError,
     )
     hi = fn.to(torch.bfloat16)
@@ -168,6 +172,15 @@ def _pack_fn_nonorm(fn: torch.Tensor, capturing: bool) -> torch.Tensor:
     packed = rows.view(3, 16, -1, 4, 4).permute(2, 0, 3, 1, 4).contiguous()
     if hit is None:
         weakref.finalize(fn, _FN_CACHE.pop, key, None)
+    else:
+        # A fresh buffer would leave captured graphs on the old one.
+        _require(
+            hit[1].shape == packed.shape,
+            "fn changed shape in place; the pack captured graphs hold cannot follow it",
+            RuntimeError,
+        )
+        packed = hit[1].copy_(packed)
+    torch.cuda.current_stream(fn.device).synchronize()
     _FN_CACHE[key] = (stamp, packed)
     return packed
 
@@ -224,15 +237,31 @@ def get_mhc_seam_config(
     * ``norm`` restricts the policy to one path, ``"fused"`` or ``"separate"``.
     * ``GATE_STEP`` and ``STAGE_NT`` of the fused-norm path from their rules (see
       ``_fused_norm_policy``).
+
+    Returns a copy of the memoized decision (``_policy``), so the caller may change it.
     """
-    from aiter.ops.flydsl.kernels.mhc_seam import gate_step
+    return dict(_policy(T, H, arch, cu_num, mode, norm))
+
+
+@functools.lru_cache(maxsize=512)
+def _policy(T: int, H: int, arch: str, cu_num: int, mode: str, norm) -> dict:
+    """``get_mhc_seam_config``'s decision, memoized: the table lookups, the split search and
+    the legality checks are per-call host cost otherwise. Every result passes
+    ``_check_config``, so a call on the policy skips it. Callers must not mutate the result.
+    """
+    from aiter.ops.flydsl.kernels.mhc_seam import MAX_FLAT_ELEMENTS, gate_step
 
     _require(arch in _GFX, f"unsupported arch {arch}", RuntimeError)
+    _require(
+        T * _N * H <= MAX_FLAT_ELEMENTS,
+        "residual exceeds the int32 element offsets the kernels use",
+    )
     _require(norm in (None, *_NORMS), f"norm must be one of {_NORMS}, got {norm!r}")
     _require(
         norm != "separate" or mode == "post",
         f"NORM='separate' serves the post mode only, got {mode!r}",
     )
+
     cfg = None
     if cfg is None and (
         norm == "separate"
@@ -241,8 +270,9 @@ def get_mhc_seam_config(
         cfg = _separate_norm_policy(T, H, arch, cu_num)
         _require(
             cfg is not None or norm != "separate",
-            f"[flydsl_mhc_seam] no legal NORM='separate' tile for H={H}",
+            f"no legal NORM='separate' tile for H={H}",
         )
+
     if cfg is None:
         cfg = _fused_norm_policy(T, H, arch, cu_num)
     if cfg["NORM"] == "fused":
@@ -346,7 +376,7 @@ def flydsl_mhc_seam(
     allocated per call from the caching allocator, so CUDA-graph capture of the fused-norm path
     needs no warm-up beyond the kernels' first compile. The separate path packs ``fn`` once per
     weight and refuses to pack during capture, so it needs one eager call with the same ``fn``
-    before capturing.
+    before capturing, and one after updating ``fn`` in place before replaying graphs.
     """
     import flydsl.compiler as flyc
     import flydsl.expr as fx
@@ -473,14 +503,16 @@ def flydsl_mhc_seam(
         return residual_out, post_out, comb_out, layer_input, next_pre
 
     if config is None:
-        cfg = get_mhc_seam_config(T, H, arch, _cu_num(), _mode(has_post, identity_pre))
+        # Read only below, so the memoized dict is used as is.
+        cfg = _policy(T, H, arch, _cu_num(), _mode(has_post, identity_pre), None)
     else:
         unknown = sorted(set(config) - set(MHC_SEAM_DEFAULTS))
         if unknown:
             raise ValueError(f"[flydsl_mhc_seam] unknown config keys: {unknown}")
         cfg = dict(MHC_SEAM_DEFAULTS)
         cfg.update(config)
-    _check_config(T, H, cfg, arch)
+        _check_config(T, H, cfg, arch)
+
     bm, splits = cfg["BLOCK_M"], cfg["SPLITS"]
     stream = torch.cuda.current_stream(device)
     bf16, f32 = fx.BFloat16, fx.Float32
@@ -492,7 +524,7 @@ def flydsl_mhc_seam(
 
         _require(
             has_post and not identity_pre,
-            "[flydsl_mhc_seam] NORM='separate' needs the post-mix and a carried pre_mix",
+            "NORM='separate' needs the post-mix and a carried pre_mix",
         )
         load_nt_x = cfg["CACHE_NT_X"]
         if load_nt_x is None:

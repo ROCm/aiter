@@ -15,7 +15,9 @@ Tables:
   test_mhc_seam_norm     the policy config with each NORM path forced, post mode (the one
                          the separate path serves): where the RMSNorm runs faster, in the
                          finish pass or as aiter.rms_norm after it.
-  test_mhc_seam_streams  two seams on two streams at once.
+  test_mhc_seam_streams  two seams on two streams at once, sharing one weight, either path.
+  test_mhc_seam_knobs    builds the policy does not reach at these sizes, forced.
+  test_mhc_seam_weight_update  a captured graph after an in-place update of fn.
   test_mhc_seam_errors   invalid inputs raise ValueError / TypeError.
 
 The reference, inputs and output checks are the Mega-mHC test's
@@ -138,8 +140,13 @@ def test_mhc_seam(T, H, mode):
     for name, op in ops.items():
         if not T:  # empty-batch edge case: the call must return, nothing to time
             out = op(*args, **kw)
-            ret[f"{name} err"] = 0.0 if out[3].shape == (0, H) else 1.0
+            shapes = [tuple(o.shape) for o in out]
+            want = [(0, 4, H), (0, 4, 1), (0, 4, 4), (0, H), (0, 4)]
+            ret[f"{name} err"] = 0.0 if shapes == want else 1.0
+            if shapes != want:
+                mega_ref._FAILURES.append(f"{name} T=0 {mode}: shapes {shapes}")
             continue
+
         # graph us: replayed CUDA graph, both launches and the gap between them;
         # kernel us: the profiler's summed kernel time of eager calls
         ret[f"{name} graph us"] = _graph_us(op, args, kw, T)
@@ -201,12 +208,29 @@ def test_mhc_seam_norm(T, H, mode, norms):
     return ret
 
 
-def test_mhc_seam_streams(T, H, splits):
+def _shared_fn_cases(T, H):
+    """Two post-mode seams with their own activations and gates and one weight, as two
+    streams of one model have: the separate path's first call packs it for both."""
+    first = _call_kwargs("post", T, H, seed=1)
+    fn = first[0][1]
+    residual, y, _, hc_scale, hc_base, post, comb, pre, w = mega_ref.make_inputs(
+        T, H, 2
+    )
+    kw = {"norm_weight": w, "norm_eps": mega_ref.NORM_EPS}
+    kw.update(sublayer_out=y, post_layer_mix=post, comb_res_mix=comb)
+    ref = mega_ref.run_torch(
+        residual, fn, hc_scale, hc_base, *mega_ref.ARGS, pre_mix=pre, **kw
+    )
+    kw.update(residual_out=torch.empty_like(residual), pre_mix=pre)
+    return [first, ((residual, fn, hc_scale, hc_base, *mega_ref.ARGS), kw, ref)]
+
+
+def test_mhc_seam_streams(T, H, splits, norm):
     """Two seams on two streams at once; each must match its own reference."""
     from aiter.ops.flydsl import flydsl_mhc_seam
 
-    cfg = {"SPLITS": splits}
-    cases = [_call_kwargs("post", T, H, seed=s) for s in (1, 2)]
+    cfg = {"SPLITS": splits, "NORM": norm}
+    cases = _shared_fn_cases(T, H)
     streams = [torch.cuda.Stream(), torch.cuda.Stream()]
     torch.cuda.synchronize()
     outs = [None, None]
@@ -217,11 +241,60 @@ def test_mhc_seam_streams(T, H, splits):
     torch.cuda.synchronize()
     errs = [
         check_outputs(
-            f"stream {i} splits={splits}", outs[i], cases[i][2], "bf16", "post"
+            f"stream {i} {norm} splits={splits}",
+            outs[i],
+            cases[i][2],
+            "bf16",
+            "post",
         )
         for i in range(2)
     ]
-    return {"gfx": get_gfx(), "T": T, "splits": splits, "err": max(errs)}
+    return {"gfx": get_gfx(), "T": T, "norm": norm, "splits": splits, "err": max(errs)}
+
+
+def test_mhc_seam_knobs(H):
+    """Builds the policy never reaches at the test's sizes, forced; each must match the
+    reference."""
+    from aiter.ops.flydsl import flydsl_mhc_seam
+
+    rows = []
+    for mode, cfg in (
+        ("no_post", {"STAGE_NT": True}),
+        ("post", {"NORM": "fused", "STAGE_NT": True, "GATE_STEP": False}),
+    ):
+        args, kw, ref = _call_kwargs(mode, 128, H)
+        out = flydsl_mhc_seam(*args, config=cfg, **kw)
+        err = check_outputs(f"forced {mode} {cfg}", out, ref, "bf16", mode)
+        rows.append({"gfx": get_gfx(), "mode": mode, "config": cfg, "err": err})
+    return rows
+
+
+def test_mhc_seam_weight_update(H):
+    """A graph captured on the separate path sees an in-place update of fn after one eager
+    call, as a weight sync into a running engine needs."""
+    from aiter.ops.flydsl import flydsl_mhc_seam
+
+    T = 256
+    args, kw, _ = _call_kwargs("post", T, H)
+    cfg = {"NORM": "separate"}
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        flydsl_mhc_seam(*args, config=cfg, **kw)
+    torch.cuda.synchronize()
+
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        out = flydsl_mhc_seam(*args, config=cfg, **kw)
+    args[1].mul_(2)
+    flydsl_mhc_seam(*args, config=cfg, **kw)  # the eager call that repacks
+    g.replay()
+    torch.cuda.synchronize()
+
+    want = flydsl_mhc_seam(*args, config=cfg, **kw)
+    same = all(torch.equal(a, b) for a, b in zip(out[1:5], want[1:5]))
+    if not same:
+        mega_ref._FAILURES.append("weight update: the replayed graph kept the old fn")
+    return {"gfx": get_gfx(), "T": T, "replay matches eager": same}
 
 
 def test_mhc_seam_errors(H):
@@ -362,15 +435,28 @@ def main():
         )
 
     rows = [
-        test_mhc_seam_streams(T, H, sp)
-        for T, H, sp in itertools.product(
+        test_mhc_seam_streams(T, H, sp, norm)
+        for T, H, sp, norm in itertools.product(
             [t for t in args.tokens if 0 < t <= 4096][-2:],
             args.hidden,
             args.stream_splits,
+            ("fused", "separate"),
         )
     ]
     aiter.logger.info(
         "mhc seam two-stream check (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    rows = [r for H in args.hidden for r in test_mhc_seam_knobs(H)]
+    aiter.logger.info(
+        "mhc seam forced-knob check (markdown):\n%s",
+        pd.DataFrame(rows).to_markdown(index=False),
+    )
+
+    rows = [test_mhc_seam_weight_update(H) for H in args.hidden]
+    aiter.logger.info(
+        "mhc seam weight-update check (markdown):\n%s",
         pd.DataFrame(rows).to_markdown(index=False),
     )
 
