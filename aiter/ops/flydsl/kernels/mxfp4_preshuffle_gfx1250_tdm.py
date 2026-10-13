@@ -61,7 +61,7 @@ DS_FIRST_N = int(os.environ.get("AITER_FLYDSL_DS_FIRST_N", "0"))
 # register budget, so leave a toggle to trade it for backend scheduling slack.
 PIN_SCALES = int(os.environ.get("AITER_FLYDSL_PIN_SCALES", "1"))
 EXPLICIT_VGPR_PARTITION = int(
-    os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "0")
+    os.environ.get("AITER_FLYDSL_EXPLICIT_VGPR_PARTITION", "1")
 )
 PLANAR_LDS = int(os.environ.get("AITER_FLYDSL_PLANAR_LDS", "0"))
 INTERLEAVED_LDS_LOAD = int(os.environ.get("AITER_FLYDSL_INTERLEAVED_LDS_LOAD", "0"))
@@ -77,6 +77,25 @@ INST_PREFETCH_EPILOGUE = int(
 # epilogue, which thrashes the still-resident hot code. Max PC+offset must stay
 # inside the kernel .text or s_prefetch_inst page-faults.
 INST_PREFETCH_START = int(os.environ.get("AITER_FLYDSL_INST_PREFETCH_START", "0"))
+# Roll the fused activation+quant epilogue: stage accumulators as bf16 into LDS
+# (same block as the C output, behind it), then loop-process them. Experiment to
+# study icache-miss behavior; 1 = rolled, 0 = legacy unrolled.
+ROLL_QUANT_EPILOGUE = int(os.environ.get("AITER_FLYDSL_ROLL_QUANT_EPILOGUE", "1"))
+# DIAGNOSTIC: deliberately swizzle the per-lane acc-staging offset so the 32
+# lanes collide 4-way in LDS banks (bijective within the same 512 B block, so
+# correctness and size are unchanged). Used to check whether ATT ds stall is
+# sensitive to bank conflicts. 0 = contiguous (lane*16), 1 = conflicting.
+ACC_SWIZZLE = int(os.environ.get("AITER_FLYDSL_ACC_SWIZZLE", "0"))
+# EXPERIMENT: prefetch the kernel body forward from the top of the compute (the
+# prologue), so the mainloop/epilogue code is warm as each workgroup arrives on
+# a CU (cold-starts the prologue every tile-group). Value = number of 4 KiB
+# chunks to prefetch ahead from the body start; 0 disables. Default 4 (=16 KiB)
+# warms most of the ~19 KiB roll-build GEMM1 body without overshooting .text;
+# measured to cut demand icache misses ~50% (device_time neutral on the fitting
+# build, not slower). Gated to GEMM1 (w1x4) at the prefetch site.
+INST_PREFETCH_PROLOGUE = int(
+    os.environ.get("AITER_FLYDSL_INST_PREFETCH_PROLOGUE", "4")
+)
 LDS_SOA_LOAD_INTERLEAVE = os.environ.get("LDS_SOA_LOAD_INTERLEAVE")
 if LDS_SOA_LOAD_INTERLEAVE is not None:
     LDS_SOA_LOAD_INTERLEAVE = int(LDS_SOA_LOAD_INTERLEAVE)
@@ -104,12 +123,12 @@ SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
 )
 
 
-def _emit_epilogue_inst_prefetch(n_chunks):
-    """EXPERIMENT: software L1 I-cache prefetch of the activation/quant epilogue.
+def _emit_inst_prefetch(n_chunks, start_chunk=0):
+    """EXPERIMENT: software L1 I-cache prefetch of code near the current PC.
     Takes the current PC via ``s_getpc`` and issues ``n_chunks`` scalar
     ``s_prefetch_inst`` (``llvm.amdgcn.s.prefetch.inst``, 4 KiB each, len=31) at
-    PC + i*4 KiB, so the epilogue code is warm by the time the drain's WMMA
-    compute finishes. Kernel .text (~35 KiB) overflows the 32 KiB L1 I-cache."""
+    PC + (start_chunk + i)*4 KiB, warming the kernel body that overflows the
+    32 KiB L1 I-cache. PC + max offset must stay inside .text or it faults."""
     from flydsl._mlir import ir
 
     code_ptr_ty = ir.Type.parse("!llvm.ptr<1>")
@@ -117,7 +136,7 @@ def _emit_epilogue_inst_prefetch(n_chunks):
         llvm_dialect.call_intrinsic(T.i64, "llvm.amdgcn.s.getpc", [], [], [])
     )
     for i in range(n_chunks):
-        off = 0x1000 * (INST_PREFETCH_START + i)
+        off = 0x1000 * (start_chunk + i)
         ptr = llvm_dialect.inttoptr(code_ptr_ty, _raw(pc + fx.Int64(off)))
         llvm_dialect.call_intrinsic(
             None,
@@ -440,6 +459,9 @@ def launch_gemm_a8w4_tdm(
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    if ROLL_QUANT_EPILOGUE and stage1_quant_out and stage1_act:
+        ACC_STAGE_B = num_waves * wmma_m_rep * output_n_rep * WAVE * 16
+        ARENA_B = max(ARENA_B, C_STORE_B + ACC_STAGE_B)
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -478,11 +500,18 @@ def launch_gemm_a8w4_tdm(
     _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
+    _rollq = (
+        "_rollq" if (ROLL_QUANT_EPILOGUE and stage1_quant_out and stage1_act) else ""
+    )
+    if _rollq and ACC_SWIZZLE:
+        _rollq += "_swz"
     _iprefetch = (
         f"_iprefetch{INST_PREFETCH_EPILOGUE}s{INST_PREFETCH_START}"
         if INST_PREFETCH_EPILOGUE
         else ""
     )
+    if INST_PREFETCH_PROLOGUE:
+        _iprefetch += f"_pfpro{INST_PREFETCH_PROLOGUE}"
     _kname = (
         f"a8w4_tdm_{_afp}"
         f"_t{tile_m}x{tile_n}x{tile_k}_w{m_warp}x{n_warp}"
@@ -492,7 +521,7 @@ def launch_gemm_a8w4_tdm(
         f"{_b_tdm_th}{_waves_per_tensor}{_ep}{_epq}"
         f"{_mma_group}{_ds_first}"
         f"{_explicit_vgpr_partition}{_planar_lds}"
-        f"{_interleaved_lds_load}{_persistent}{_drain}{_iprefetch}"
+        f"{_interleaved_lds_load}{_persistent}{_drain}{_rollq}{_iprefetch}"
     )
 
     # Compile the static path directly, preserving its launch ABI and the
@@ -537,6 +566,14 @@ def launch_gemm_a8w4_tdm(
         kgrp = lane // 16
         wave_m = wave // n_warp
         wave_n = wave % n_warp
+
+        # EXPERIMENT: warm the kernel body (mainloop + epilogue) at the top of
+        # the prologue. Gated to GEMM1 (w1x4); w2x2 is small and would fault on
+        # an over-run prefetch.
+        if const_expr(
+            INST_PREFETCH_PROLOGUE > 0 and m_warp == 1 and n_warp == 4
+        ):
+            _emit_inst_prefetch(INST_PREFETCH_PROLOGUE, 0)
 
         # DeepGEMM contiguous-M swizzle, run at physical-cluster granularity.
         TILES_PER_GROUP = 16
@@ -1730,16 +1767,27 @@ def launch_gemm_a8w4_tdm(
                     # I-cache; w2x2 is small, so prefetching past its .text
                     # page-faults. Gate to the big kernel.
                     if INST_PREFETCH_EPILOGUE > 0 and m_warp == 1 and n_warp == 4:
-                        _emit_epilogue_inst_prefetch(INST_PREFETCH_EPILOGUE)
+                        _emit_inst_prefetch(INST_PREFETCH_EPILOGUE, INST_PREFETCH_START)
                     drain_tiles = PRE - 1 if next_stage_on else PRE
                     if const_expr(rolled_drain):
-                        for j in range(drain_tiles):
+                        # Run every drain tile -- including the final one that is
+                        # peeled below for the unrolled path -- through the
+                        # runtime-trip loop, so each tile's stage slot is a
+                        # runtime induction var. That keeps the LDS operand base
+                        # in a register with ds ``offset:`` immediates, instead
+                        # of a constexpr-slot peel whose >64 KiB base folds into
+                        # a per-load ``v_add``. With next_stage_on the last tile
+                        # loads a wrapped, still-resident buffer (the carry it
+                        # writes is discarded after the loop) and its drain fence
+                        # resolves to outstanding 0 -- both harmless -- so it can
+                        # share the loop body.
+                        for j in range(PRE):
                             compute_drain_tile(j, bool(next_stage_on))
                     else:
                         for j in range_constexpr(drain_tiles):
                             compute_drain_tile(j, bool(next_stage_on))
-                    if const_expr(next_stage_on):
-                        compute_drain_tile(PRE - 1, False)
+                        if const_expr(next_stage_on):
+                            compute_drain_tile(PRE - 1, False)
 
             # This is a compile-time selection. The interleaved version has one
             # mainloop body and no wave-parity branch.
@@ -1804,7 +1852,59 @@ def launch_gemm_a8w4_tdm(
 
                 v2i32_ty = T.vec(2, T.i32)
                 N_MX_BLKS = output_n_rep // WN_PER_MX_BLOCK
-                for wm in range_constexpr(wmma_m_rep):
+
+                # Stage accumulators as bf16 into the same LDS block as the C
+                # output (just behind it). The wm loop then reads them with a
+                # runtime index via ds_load so it rolls into one scf.for; each
+                # lane owns a private slot (write then read on the same lane),
+                # so a dscnt wait suffices. Defined unconditionally because names
+                # set inside an AST-rewritten branch do not escape it.
+                ACC_WN_STRIDE = WAVE * 16
+                ACC_WM_STRIDE = output_n_rep * ACC_WN_STRIDE
+                ACC_WAVE_STRIDE = wmma_m_rep * ACC_WM_STRIDE
+                # Per-lane slot. The swizzle keeps all 32 lane slots distinct and
+                # inside the 512 B block, but forces 4-way LDS bank collisions:
+                # lanes {4k..4k+3} share banks (the *128 term is 32 dwords = a
+                # whole bank cycle, so it does not spread banks).
+                if const_expr(ACC_SWIZZLE):
+                    _lane_off = (lane % 4) * 128 + (lane // 4) * 16
+                else:
+                    _lane_off = lane * 16
+                acc_lane_base = C_STORE_B + wave * ACC_WAVE_STRIDE + _lane_off
+                if const_expr(ROLL_QUANT_EPILOGUE):
+                    # Keep the runtime lane/wave part in the base index so each
+                    # ds_write encodes its (wm, wn) step as an immediate offset
+                    # (the backend only folds a compile-time byte_offset into
+                    # ds offset:N), matching the compute body's base+imm stores.
+                    _acc_store_idx = stC_idx + acc_lane_base
+                    for _wm in range_constexpr(wmma_m_rep):
+                        for _wn in range_constexpr(output_n_rep):
+                            lds_store_b128(
+                                _acc_store_idx,
+                                _wm * ACC_WM_STRIDE + _wn * ACC_WN_STRIDE,
+                                Vec(accs[_wm * output_n_rep + _wn])
+                                .to(fx.BFloat16)
+                                .bitcast(fx.Int32),
+                            )
+                    rocdl.s_wait_dscnt(0)
+
+                # Runtime count of valid 16-row blocks (wmb + wm*16 < mn_oob).
+                # A RUNTIME upper bound is what keeps the loop rolled: LLVM fully
+                # unrolls a constant-trip scf.for, collapsing the roll, but cannot
+                # unroll an unknown trip count -- so the whole activation/quant
+                # body is emitted ONCE instead of wmma_m_rep times.
+                _d = mn_oob - wmb
+                _nvalid = (_d + 15) >> 4
+                _nvalid = (_d > fx.Int32(0)).select(_nvalid, fx.Int32(0))
+                _nvalid = (_nvalid < fx.Int32(wmma_m_rep)).select(
+                    _nvalid, fx.Int32(wmma_m_rep)
+                )
+                # Shared body for both the rolled (runtime bound) and the legacy
+                # unrolled (range_constexpr) dispatch below. range() must appear
+                # DIRECTLY in the for (the AST rewriter only turns
+                # `for x in range(...)` into an scf.for; assigning it to a
+                # variable falls back to Python's builtin range).
+                def _emit_quant_wm(wm):
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
                     # this costs one scalar branch instead of per-lane masking.
@@ -1830,6 +1930,15 @@ def launch_gemm_a8w4_tdm(
                         scale_lane = row_in_tile & 15
                         row_valid = row_rel < mn_oob
 
+                        if const_expr(ROLL_QUANT_EPILOGUE):
+                            # Fold the runtime lane/wave/wm part into the base so
+                            # each ds_read below encodes its wn step as an
+                            # immediate offset (compile-time byte_offset -> ds
+                            # offset:N), like the compute body's base+imm reads.
+                            _acc_row_idx = (
+                                stC_idx + acc_lane_base + wm * ACC_WM_STRIDE
+                            )
+
                         e8m0_bytes = []
                         mx_blk_is = []
                         for mx_blk in range_constexpr(N_MX_BLKS):
@@ -1837,7 +1946,21 @@ def launch_gemm_a8w4_tdm(
                             pairs = []
                             for sub_wn in range_constexpr(WN_PER_MX_BLOCK):
                                 wn = mx_blk * WN_PER_MX_BLOCK + sub_wn
-                                acc = Vec(accs[wm * output_n_rep + wn])
+                                # const_expr if (not a ternary): a ternary is
+                                # rewritten to scf.ifexp which evaluates BOTH
+                                # arms, and the register arm indexes the Python
+                                # ``accs`` list with the now-runtime ``wm``.
+                                if const_expr(ROLL_QUANT_EPILOGUE):
+                                    acc = (
+                                        lds_load_b128(
+                                            _acc_row_idx,
+                                            wn * ACC_WN_STRIDE,
+                                        )
+                                        .bitcast(fx.BFloat16)
+                                        .to(fx.Float32)
+                                    )
+                                else:
+                                    acc = Vec(accs[wm * output_n_rep + wn])
                                 for p in range_constexpr(4):
                                     pairs.append((acc[2 * p], acc[2 * p + 1]))
 
@@ -1950,6 +2073,15 @@ def launch_gemm_a8w4_tdm(
                                 dst_byte,
                                 mask=is_kgrp0,
                             )
+
+                if const_expr(ROLL_QUANT_EPILOGUE):
+                    # Runtime trip count keeps the scf.for rolled (LLVM cannot
+                    # fully unroll an unknown bound), folding the epilogue body.
+                    for wm in range(_nvalid):
+                        _emit_quant_wm(wm)
+                else:
+                    for wm in range_constexpr(wmma_m_rep):
+                        _emit_quant_wm(wm)
             else:
                 # bf16/f16 activation (or passthrough) -> stage to LDS.
                 if const_expr(has_bias):
@@ -2440,7 +2572,7 @@ def launch_gemm_a8w4_tdm(
 
 
 launch_gemm_a8w4_tdm.compile_hints["llvm_options"] = {
-    "amdgpu-expert-scheduling-mode": AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE,
+    "amdgpu-expert-scheduling-mode": True,
     "amdgpu-kernarg-preload": AITER_FLYDSL_KERNARG_PRELOAD,
     "amdgpu-kernarg-preload-count": AITER_FLYDSL_KERNARG_PRELOAD_COUNT,
 }
