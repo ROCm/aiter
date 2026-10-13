@@ -19,8 +19,9 @@ rename or tune a config file.
 4. Do not put the arch in a file name. The default file is `DEFAULT.json`.
 5. Move or rename files in a pure `git mv` commit. Change the contents in the
    next commit.
-6. Each family has its own key scheme. Do not mix GEMM `M_LEQ_<x>` keys, MOE
-   `bm...` keys, conv shape keys and MHC `C_` keys.
+6. Each family has its own key scheme. GEMM files use only `M_LEQ_<x>` keys
+   and `"any"` for M buckets. Do not mix GEMM keys, MOE `bm...` keys, conv
+   shape keys and MHC `C_` keys.
 7. Put `kpack` only in gfx942 configs. On gfx950, Triton gives a warning and
    sets `kpack = 1`, and Triton will remove the parameter. gfx1250 does not
    support it. On RDNA (gfx11xx, gfx120x), it has no effect.
@@ -103,8 +104,8 @@ get_gemm_config(config_name, M, N=None, K=None, bounds=None,
    exist.
 2. It uses a specialized file if one matches: `<CONFIG_NAME>-B=..-N=..-K=..`,
    then `<CONFIG_NAME>-N=..-K=..`, or `<CONFIG_NAME>-<specialized_filename>`.
-3. In the file it tries `M_LEQ_<x>` keys in increasing order, then `M_GEQ_<x>`
-   keys in decreasing order, then `"any"`.
+3. In the file it tries the `M_LEQ_<x>` keys in increasing order, then
+   `"any"`.
 
 `is_tuned` is `True` only when a specialized file matched. Keep it in the
 return value. The config is a new copy, so you can change it.
@@ -124,7 +125,7 @@ File format:
 ```json
 {
   "M_LEQ_64":   { "...": "..." },
-  "M_GEQ_4096": { "...": "..." },
+  "M_LEQ_4096": { "...": "..." },
   "any":        { "...": "..." }
 }
 ```
@@ -132,10 +133,12 @@ File format:
 - The bounds are `STANDARD_M_BOUNDS = (1, 4, 8, ..., 8192)`. A file can set
   its own `M_BOUNDS` list. A `bounds=` argument has priority.
 - Include `"any"`, unless the bounds cover all values of M.
-- Do not use the old `"small"` and `"large"` keys.
+- Use only `M_LEQ_<x>` keys and `"any"` for M buckets. Do not use the old
+  `"small"` and `"large"` keys.
 - Each entry has `BLOCK_SIZE_M`, `BLOCK_SIZE_N`, `BLOCK_SIZE_K`,
   `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
   `matrix_instr_nonkdim`, `cache_modifier` and `NUM_KSPLIT`.
+- You can use `cache_modifier` on all archs, also on gfx1250.
 
 Names:
 

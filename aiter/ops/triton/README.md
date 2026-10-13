@@ -40,44 +40,45 @@ rules are in [`configs/CLAUDE.md`](configs/CLAUDE.md).
 11. Put tuning values in the JSON files in `configs/`. Do not put tuning
     values in Python.
 12. Read configs only through the loaders in `utils/`.
-13. Use `autotune_configs()` for every `@triton.autotune` config list.
-14. Put `kpack` only in gfx942 configs.
+13. In GEMM configs, use only `M_LEQ_<x>` keys and `"any"` for M buckets.
+14. Use `autotune_configs()` for every `@triton.autotune` config list.
+15. Put `kpack` only in gfx942 configs.
 
 ### Tests and benchmarks
 
-15. Add a unit test in `op_tests/triton_tests/`. Use the folder that matches
+16. Add a unit test in `op_tests/triton_tests/`. Use the folder that matches
     the wrapper folder. See the
     [test rules](../../../op_tests/triton_tests/README.md).
-16. Add a benchmark: `op_tests/op_benchmarks/triton/bench_<op>.py`.
+17. Add a benchmark: `op_tests/op_benchmarks/triton/bench_<op>.py`.
 
 ### Comments and docs
 
-17. Keep comments short: one or two sentences that tell what the code does,
+18. Keep comments short: one or two sentences that tell what the code does,
     or why. Do not write long explanations.
-18. Give each public wrapper a docstring: what it computes, its arguments,
+19. Give each public wrapper a docstring: what it computes, its arguments,
     its return value and its limits.
-19. Use the aiter logger with `%` placeholders. Do not use `print` or
+20. Use the aiter logger with `%` placeholders. Do not use `print` or
     f-strings in log calls.
-20. Write docs, comments and PR descriptions in
+21. Write docs, comments and PR descriptions in
     [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English):
     short sentences, simple words, one instruction in each sentence.
     You can use technical terms.
 
 ### Pull requests
 
-21. Change one backend in each PR. Triton and Gluon are one backend.
-22. Keep PRs small: one problem in each PR. For work that depends on other
+22. Change one backend in each PR. Triton and Gluon are one backend.
+23. Keep PRs small: one problem in each PR. For work that depends on other
     work, use stacked PRs.
-23. Write the PR description with these parts: motivation, technical
+24. Write the PR description with these parts: motivation, technical
     details, test plan and test results.
-24. Assign the PR to yourself and answer the reviewers. Code owners can close
+25. Assign the PR to yourself and answer the reviewers. Code owners can close
     PRs that stay inactive.
-25. Make sure that the PR has the `Triton/Gluon` label. Add the
+26. Make sure that the PR has the `Triton/Gluon` label. Add the
     `ci:triton-300x` label when you change gfx942 code or configs.
-26. Review your PR yourself before you ask for a review.
-27. Open the PR from the `ROCm/aiter` repository. Use a fork only if you do
+27. Review your PR yourself before you ask for a review.
+28. Open the PR from the `ROCm/aiter` repository. Use a fork only if you do
     not have access.
-28. Remove the `Co-authored-by` lines of AI agents from your commits before
+29. Remove the `Co-authored-by` lines of AI agents from your commits before
     the merge.
 
 ## Reference

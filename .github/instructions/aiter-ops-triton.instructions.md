@@ -103,8 +103,8 @@ All tuned configs are in `configs/<arch>/<backend>/<op>/<d_type>/`. `<op>` is
 
 In GEMM configs, flag:
 
-- Top-level `"small"` or `"large"` keys. Use `M_LEQ_<x>`, `M_GEQ_<x>` and
-  `"any"`.
+- An M bucket key that is not `M_LEQ_<x>` or `"any"`, such as `"small"` or
+  `"large"`. Use only `M_LEQ_<x>` keys and `"any"` for M buckets.
 - A new file without `"any"`, when the bounds do not cover all values of M.
 - An entry without one of these keys: `BLOCK_SIZE_M`, `BLOCK_SIZE_N`,
   `BLOCK_SIZE_K`, `GROUP_SIZE_M`, `num_warps`, `num_stages`, `waves_per_eu`,
@@ -113,6 +113,9 @@ In GEMM configs, flag:
   table.
 - An `*AFP4WFP4*` file name with the packed K. The file name uses the logical
   K (`2 * K_bytes`).
+
+Do not flag a `cache_modifier` in a gfx1250 config. You can use cache
+modifiers on all archs, also on gfx1250.
 
 In MOE dispatch tables, flag:
 
