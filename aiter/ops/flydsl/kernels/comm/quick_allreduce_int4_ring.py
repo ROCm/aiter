@@ -75,30 +75,16 @@ from .quick_allreduce_codec import (
 
 # Super-tile values the ring accepts.
 #
-# The ring publishes 2(N-1) times per super-tile
+# The ring publishes 2(N-1) times per super-tile.
 # On a cacheable inbox every publish is a full L2 writeback. Publishes per rank
-# are ``num_tiles / ST * 2(N-1)`` -- independent of the block count, so ST is
-# the only tunable knob that reduces them, and it pays for them in parallelism:
-# ``_grid_x`` derives blocks from ``num_tiles / ST``.
-#
-# The optimum is payload-dependent, so it is not a single value -- see
-# ``RING_ST_LADDER`` in ``allreduce_policy``, which is what the host selects from. These
-# are the values a caller may pin with ``super_tile=``.
-#
-# The buffer size is
-# ``(N-1) * grid * (ST * rank_atoms * (rs_tile + ag_tile) + 128)`` bytes, so
-# ST=16 at the default cap of 1216 is ~269 MB per rank all-INT4, ~329 MB with
-# an INT6 reduce-scatter lap, against 28/35 MB at cap 128.
-# Pin ``grid_cap`` alongside ``super_tile``.
+# are ``num_tiles / ST * 2(N-1)``.
 RING_SUPER_TILES = (1, 8, 16, 32)
 
 # Wire formats accepted per lap.
 #
 # Both laps take the same set, but they are separate arguments because they are
-# separate decisions: the reduce-scatter lap requantizes ``N-1`` times and is
-# what INT6 is for, while the all-gather lap forwards the bytes it received
-# without touching them (see ``_op_substep``) and so contributes exactly one
-# quantization -- the one at op ``N``, where this rank's chunk is final.
+# separate decisions: the reduce-scatter lap requantizes ``N-1`` times, while
+# the all-gather lap forwards the bytes it received without touching them.
 RS_CODECS = ("int4", "int6", "fp16")
 AG_CODECS = ("int4", "int6", "fp16")
 
@@ -202,9 +188,7 @@ def make_quick_allreduce_int4_ring_kernel(
     # N-1 and is a compile-time property of the step index.
     step_codec = [rs] * (world_size - 1) + [ag] * (world_size - 1)
 
-    # Per-step geometry. All Python ints, so every use below folds at trace
-    # time -- the mixed-codec inbox costs no address arithmetic over the
-    # single-codec one it replaces.
+    # Per-step geometry.
     payload_i32 = [rank_atoms * c.rank_tile_i32 for c in step_codec]
     release_i32_off = [super_tile * p for p in payload_i32]
     wire_tile_i32 = [r + 16 for r in release_i32_off]  # + one 64 B handshake sector
@@ -275,10 +259,6 @@ def make_quick_allreduce_int4_ring_kernel(
         # The ring uses only two peers: this rank and its successor.
         self_base = peers[rank]
         next_base = peers[nxt]
-        # Bounded on purpose. Every ring access is in range by construction,
-        # so an out-of-range one is a bug -- and with num_records set the
-        # hardware returns zero instead of faulting, which turns a
-        # process-killing page fault into a wrong SQNR you can bisect.
         inbox = _buffer_ptr(_to_sgpr_i64(self_base), T.i32, 4, inbox_bytes)
 
         _load_atom, _store_atom = _payload_io(
@@ -296,14 +276,6 @@ def make_quick_allreduce_int4_ring_kernel(
 
         def _slot_i32(step, sub):
             """i32 offset of (*step*, this block, *sub*) inside the inbox.
-
-            Plain arithmetic rather than ``crd2idx`` over a layout. The natural
-            layout here is ``(steps, grid, super_tile)``, whose trailing mode has
-            extent **1** at ST=1; a unit mode gets coalesced away, after which a
-            three-coordinate lookup no longer lines up with the modes and
-            silently returns a *negative* index. ``step`` is a Python int, so the
-            first term folds to a constant at trace time and this is no more work
-            than the layout version.
 
             With two codecs the steps are no longer uniformly sized, so the base
             is a prefix sum rather than a product.
@@ -478,15 +450,6 @@ def make_quick_allreduce_int4_ring_kernel(
 
         def _op_substep(k, tile, sub):
             """One op of the ring, for one sub-tile. Stages LDS; does not send.
-
-            Written as one ``if/elif/else`` over the compile-time op number, with
-            **no early returns**. That is not a style choice: inside a
-            ``@flyc.kernel`` body the AST transform rewrites ``return`` away, so
-            ``if cond: ...; return`` falls through and emits the *following*
-            branch as well -- every op would run every body. ``if``/``elif``/
-            ``else`` on a Python-level condition is evaluated at trace time and
-            selects exactly one branch, so all compile-time branching here uses
-            that form.
 
             The codecs are compile-time too: an op reads the codec of the step
             it receives from (``k-2``) and writes the codec of the step it sends
