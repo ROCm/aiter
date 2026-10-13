@@ -7,9 +7,10 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.core import AITER_CONFIGS
-from aiter.jit.utils.chip_info import get_gfx_runtime
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
+from aiter.test_common import assertAllclose
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -249,7 +250,9 @@ _PADDED_K_CASES = [
     ids=[c[0] for c in _PADDED_K_CASES],
 )
 def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(backend, m, n, k, w_k):
-    if backend is not None and get_gfx_runtime() != "gfx950":
+    # Dispatch keys the tuned CSV with get_gfx(), and the untuned fallback is
+    # arch-specific too, so every row only holds for a gfx950 target.
+    if get_gfx() != "gfx950":
         pytest.skip("rows are picked from the gfx950 tuned tables")
     assert (
         _padded_k_backend(m, n, k, w_k) == backend
@@ -267,6 +270,14 @@ def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(backend, m, n, k, w_k)
         xq, wq_padded, x_scale, w_scale, dtype=torch.bfloat16
     )
 
-    # bf16 output rounding only; a misread weight is off by O(1) of the max.
-    err = (out.to(torch.float32) - ref).abs().max() / ref.abs().max()
-    assert err < 0.01, f"max error {err:.4f} of the reference max"
+    # Split-K sums bf16 partials, so small outputs pick up ~1 ulp of the row
+    # magnitude; a misread weight is still off by O(|ref|).
+    split_k = backend is not None and backend[1]
+    assertAllclose(
+        out,
+        ref.to(torch.bfloat16),
+        rtol=1e-2,
+        atol=1.0 if split_k else 1e-2,
+        msg=f"M={m} N={n} K={k}->{w_k}:",
+        catastrophic_check=True,
+    )
