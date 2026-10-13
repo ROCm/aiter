@@ -6,7 +6,7 @@ import flydsl.expr as fx
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import as_ir_value, gpu, rocdl
-from flydsl.expr.rocdl import cluster, tdm_ops
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import T
 
 from .act import sigmoid_f32
@@ -111,7 +111,7 @@ def pipeline_fence(outstanding=0, use_cluster=False):
 
     Issues ``s_wait_tensorcnt`` followed by the appropriate barrier.
     """
-    tdm_ops.tensor_wait(outstanding)
+    rocdl.s_wait_tensorcnt(outstanding)
     workgroup_barrier(use_cluster=use_cluster)
 
 
@@ -120,7 +120,7 @@ WGP_BARRIER_ID = -1
 
 def pipeline_fence_signal(outstanding=0, use_cluster=False):
     """Signal the first half of a split pipeline fence."""
-    tdm_ops.tensor_wait(outstanding)
+    rocdl.s_wait_tensorcnt(outstanding)
     rocdl.s_barrier_signal(WGP_BARRIER_ID)
     if use_cluster:
         cluster.cluster_signal_once_per_wg()

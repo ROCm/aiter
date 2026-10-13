@@ -21,7 +21,6 @@ import torch
 from flydsl.expr import const_expr, ptrtoint, range_constexpr
 from flydsl.expr import math as fmath
 from flydsl.expr.arith import FastMathFlags
-from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import Int32, ReductionOp, Stream, T
 
 from aiter.ops.flydsl.kernels import buffer_ops
@@ -2135,7 +2134,7 @@ def _build_kernel_w32_tdm(
                 # throughout lets a drain tile read an LDS buffer whose load has
                 # not landed; it stays latent only while the per-tile compute
                 # happens to outlast the load.
-                tdm_ops.tensor_wait(min(K - 1, CT - 1 - i))
+                fx.rocdl.s_wait_tensorcnt(min(K - 1, CT - 1 - i))
                 fx.rocdl.s_wait_dscnt(0)
                 if const_expr(do_hoist):
                     cosv, sinv = cs_cache[0], cs_cache[1]

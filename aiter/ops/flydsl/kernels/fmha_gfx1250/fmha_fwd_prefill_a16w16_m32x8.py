@@ -45,7 +45,6 @@ from flydsl.expr import arith, gpu, rocdl
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
 # config each manager needs through its constructor.
-from flydsl.expr.rocdl import tdm_ops
 from flydsl.expr.typing import T
 from flydsl.expr.utils.arith import _to_raw as _raw
 
@@ -255,7 +254,7 @@ def _lane_id():
 def _copy_wait(num_tensorcnt=-1, num_asynccnt=-1):
     """Retire this wave's copies to the given per-counter depths; -1 skips a counter."""
     if num_tensorcnt >= 0:
-        tdm_ops.tensor_wait(num_tensorcnt)
+        rocdl.s_wait_tensorcnt(num_tensorcnt)
     if num_asynccnt >= 0:
         rocdl.s_wait_asynccnt(num_asynccnt)
 
@@ -1215,11 +1214,11 @@ def _prologue_attention(
             if is_lo:
                 for _desc in _early[WarpType.LO]:
                     _desc.async_load()
-                tdm_ops.tensor_wait(sum(d.tensorcnt for d in _early[WarpType.LO]))
+                rocdl.s_wait_tensorcnt(sum(d.tensorcnt for d in _early[WarpType.LO]))
             else:
                 for _desc in _early[WarpType.HI]:
                     _desc.async_load()
-                tdm_ops.tensor_wait(sum(d.tensorcnt for d in _early[WarpType.HI]))
+                rocdl.s_wait_tensorcnt(sum(d.tensorcnt for d in _early[WarpType.HI]))
 
         _issue_early(_is_lo)
     q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
@@ -2155,7 +2154,7 @@ def _core_attention_one_kv_tile(
         # global latency overlaps Q's. Waves differ in how many copies they issued, so
         # part2 drains only down to the count EVERY wave has in flight.
         _issue_kv(_is_lo)
-        tdm_ops.tensor_wait(min(k_desc.tensorcnt, v_desc.tensorcnt))
+        rocdl.s_wait_tensorcnt(min(k_desc.tensorcnt, v_desc.tensorcnt))
         q_frags = q_mgr.load_q_to_vgpr_part2(scale=_q_scale)
     else:
         # V1 puts Q's own stage on asynccnt and part2 waits a depth counted over Q alone.

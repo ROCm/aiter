@@ -373,12 +373,12 @@ def launch_mla_pagesize1_fp8_fp8(
         @flyc.jit
         def wait_kv_tile(has_next, has_second_next):
             if has_second_next:
-                tdm_ops.tensor_wait(2)
+                rocdl.s_wait_tensorcnt(2)
             else:
                 if has_next:
-                    tdm_ops.tensor_wait(1)
+                    rocdl.s_wait_tensorcnt(1)
                 else:
-                    tdm_ops.tensor_wait(0)
+                    rocdl.s_wait_tensorcnt(0)
 
         def load_k_tile(raw_slot, n_tile):
             quarter_base = kv_quarter_base(raw_slot, n_tile)
@@ -927,7 +927,7 @@ def launch_mla_pagesize1_fp8_fp8(
             )
             output_scale = inv_sum * kv_descale
 
-            tdm_ops.tensor_wait(0)
+            rocdl.s_wait_tensorcnt(0)
             gpu.barrier()
 
             def stage_output_lds(as_bf16, accs, scale, q_valid):
@@ -1035,7 +1035,7 @@ def launch_mla_pagesize1_fp8_fp8(
                 # already the merged LSE; the reduce never revisits these rows.
                 if const_expr(write_final_lse):
                     write_lse(ptr_final_lse, qo_start, owns_output, lse_value)
-            tdm_ops.tensor_wait(0)
+            rocdl.s_wait_tensorcnt(0)
             gpu.barrier()
 
     kernel(

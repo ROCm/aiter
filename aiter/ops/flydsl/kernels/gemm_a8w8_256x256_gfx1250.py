@@ -538,7 +538,7 @@ def launch_gemm_a8w8_256x256(
 
         if const_expr(persistent_n_tiles > 1):
             rocdl.sched_barrier(0)
-            tdm_ops.tensor_wait(0)
+            rocdl.s_wait_tensorcnt(0)
         cluster.cluster_barrier()
         # Keep fragment displacements as DS immediates inside the K loop.
         stage_a_addr, stage_b_addr, stage_sa_addr, stage_sb_addr = (
@@ -1153,7 +1153,7 @@ def launch_gemm_a8w8_256x256(
                 gtC,
             )
             if const_expr(persistent_n_tiles == 1):
-                tdm_ops.tensor_wait(0)
+                rocdl.s_wait_tensorcnt(0)
 
     @flyc.kernel(name=kernel_name, known_block_size=[block, 1, 1])
     def kernel_gemm_a8w8_256x256(
@@ -1191,7 +1191,7 @@ def launch_gemm_a8w8_256x256(
                 fx.Int32(0), fx.Int32(persistent_n_tiles), fx.Int32(1)
             ):
                 _run_tile(*tile_args, tile_idx)
-            tdm_ops.tensor_wait(0)
+            rocdl.s_wait_tensorcnt(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n

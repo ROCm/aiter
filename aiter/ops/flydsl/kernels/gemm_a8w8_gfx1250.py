@@ -8,7 +8,7 @@ import math
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl.expr import const_expr, range_constexpr, rocdl
-from flydsl.expr.rocdl import cluster, tdm_ops
+from flydsl.expr.rocdl import cluster
 from flydsl.expr.typing import Constexpr, T
 from flydsl.expr.typing import Vector as Vec
 from flydsl.runtime.device import get_rocm_arch
@@ -442,7 +442,7 @@ def launch_gemm_a8w8(
                 _lv(fx.add_offset(panel_ptr, PANEL_A), SB_TDM_SHAPE, (SB_LDS_ROW, 1)),
                 fx.Int64(0),
             )
-            tdm_ops.tensor_wait(0)
+            rocdl.s_wait_tensorcnt(0)
             workgroup_barrier(use_cluster=False)
 
         def _scale_buf(pbuf, cur_kt):
@@ -891,7 +891,7 @@ def launch_gemm_a8w8(
             _lv(fx.recast_iter(out_cls, base_ptr), (tile_m, C_LDS_ROW), (C_LDS_ROW, 1)),
             gtC,
         )
-        tdm_ops.tensor_wait(0)
+        rocdl.s_wait_tensorcnt(0)
 
     gx = (i32_m + (tile_m - 1)) // tile_m
     gy = (N + (tile_n - 1)) // tile_n

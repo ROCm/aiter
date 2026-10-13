@@ -7,7 +7,7 @@ import math
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl.expr import const_expr, gpu, range_constexpr, rocdl, tdm_ops
+from flydsl.expr import const_expr, gpu, range_constexpr, rocdl
 from flydsl.expr import math as fmath
 from flydsl.expr.typing import T
 from flydsl.expr.typing import Vector as Vec
@@ -293,14 +293,14 @@ def launch_mla_pagesize64_fp8_fp8(
         @flyc.jit
         def wait_kv_page(has_next, has_second_next):
             if has_second_next:
-                tdm_ops.tensor_wait(2)
+                rocdl.s_wait_tensorcnt(2)
                 rocdl.s_wait_asynccnt(2 * ROPE_ASYNC_PER_PAGE)
             else:
                 if has_next:
-                    tdm_ops.tensor_wait(1)
+                    rocdl.s_wait_tensorcnt(1)
                     rocdl.s_wait_asynccnt(1 * ROPE_ASYNC_PER_PAGE)
                 else:
-                    tdm_ops.tensor_wait(0)
+                    rocdl.s_wait_tensorcnt(0)
                     rocdl.s_wait_asynccnt(0)
 
         second_page = split_page_begin + num_splits
@@ -858,7 +858,7 @@ def launch_mla_pagesize64_fp8_fp8(
                     output_lds,
                     output_global,
                 )
-                tdm_ops.tensor_wait(0)
+                rocdl.s_wait_tensorcnt(0)
             else:
                 for dv_tile in range_constexpr(PV_D_TILES):
                     for i in range_constexpr(PV_ACC_DWORDS):
