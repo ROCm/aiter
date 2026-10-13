@@ -10,7 +10,7 @@ from typing import NamedTuple
 
 import torch
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 
 from .kernels.gemm_a16wfp4 import compile_gemm_a16wfp4
@@ -110,7 +110,7 @@ def _select_k_wave(k: int, tile_k: int, max_k_wave: int = 4) -> int:
     return 1
 
 
-_TARGET_BLOCKS = 256  # gfx950 CU count
+_TARGET_BLOCKS = get_cu_num()
 
 
 def _decode_tile_n(m: int, n: int, k_wave: int) -> int:
@@ -146,7 +146,7 @@ def _decode_config(m: int, n: int, k: int) -> DenseGemmConfig:
         tile_n=_decode_tile_n(m, n, k_wave),
         tile_k=_TILE_K,
         k_wave=k_wave,
-        waves_per_eu=4 if n >= 4096 else 1,
+        waves_per_eu=2 if n >= 4096 else 1,
     )
 
 
@@ -309,6 +309,10 @@ def flydsl_gemm_a16wfp4(
     cfg = _select_gemm_config(m, prepared_weight.n, k) if config is None else config
     if not isinstance(cfg, DenseGemmConfig):
         raise TypeError(f"config must be DenseGemmConfig, got {type(cfg)!r}")
+    if not a16wfp4_config_legal(prepared_weight.n, k, cfg):
+        raise ValueError(
+            f"illegal A16WFP4 config for N={prepared_weight.n}, K={k}: {cfg}"
+        )
     launcher = compile_gemm_a16wfp4(
         N=prepared_weight.n,
         K=prepared_weight.k,

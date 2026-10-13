@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 pytest.importorskip("flydsl")
 
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_cu_num, get_gfx
 from aiter.ops.flydsl.gemm_a16wfp4 import (
     DenseGemmConfig,
     _select_gemm_config,
@@ -18,12 +18,11 @@ from aiter.ops.flydsl.gemm_a16wfp4 import (
     flydsl_gemm_a16wfp4,
     prepare_gemm_a16wfp4_weight,
 )
-from aiter.ops.flydsl.utils import is_flydsl_available
 from aiter.test_common import run_perftest
 from aiter.utility import fp4_utils
 
 _SKIP = pytest.mark.skipif(
-    get_gfx() != "gfx950" or not is_flydsl_available(),
+    get_gfx() != "gfx950",
     reason="gfx950 and FlyDSL are required",
 )
 
@@ -58,7 +57,14 @@ def _make_inputs(m: int, n: int, k: int, seed: int = 0):
         dtype=torch.uint8,
         generator=generator,
     )
-    scale = torch.full((n, k // 32), 0x7F, device="cuda", dtype=torch.uint8)
+    scale = torch.randint(
+        0x78,
+        0x87,
+        (n, k // 32),
+        device="cuda",
+        dtype=torch.uint8,
+        generator=generator,
+    )
     return a, packed, scale
 
 
@@ -72,6 +78,8 @@ def _assert_close_to_oracle(m: int, n: int, k: int, seed: int):
 
     torch.testing.assert_close(a, a_before, rtol=0, atol=0)
     torch.testing.assert_close(actual, expected, rtol=3e-2, atol=1.0)
+    rel_l2 = (actual.float() - expected.float()).norm() / expected.float().norm()
+    assert rel_l2 < 1e-3
 
 
 @_SKIP
@@ -83,7 +91,7 @@ def test_kimi_tp2_shapes(m: int, n: int, k: int):
 
 @_SKIP
 @pytest.mark.parametrize("n,k", list(_K3_SHAPES))
-@pytest.mark.parametrize("m", [1, 128])
+@pytest.mark.parametrize("m", [1, 37, 128, 600, 1100, 4097])
 def test_kimi_k3_shapes(m: int, n: int, k: int):
     _assert_close_to_oracle(m, n, k, seed=m + n + k)
 
@@ -218,8 +226,8 @@ def test_shape_and_dtype_validation():
     assert _select_gemm_config(2048, 1024, 512) == (32, 256, 256, 1, 1)
     assert _select_gemm_config(4095, 1024, 768) == (16, 128, 256, 1, 2)
     assert _select_gemm_config(1, 1024, 3584) == (16, 32, 256, 2, 1)
-    assert _select_gemm_config(1, 8448, 7168) == (16, 32, 256, 4, 4)
-    assert _select_gemm_config(32, 8448, 7168) == (16, 64, 256, 4, 4)
+    assert _select_gemm_config(1, 8448, 7168) == (16, 32, 256, 4, 2)
+    assert _select_gemm_config(32, 8448, 7168) == (16, 64, 256, 4, 2)
     assert _select_gemm_config(1, 1536, 7168) == (16, 16, 256, 4, 1)
     assert _select_gemm_config(1, 7168, 768) == (16, 128, 256, 1, 2)
     assert _select_gemm_config(128, 8448, 7168) == (32, 128, 256, 1, 1)
@@ -250,10 +258,22 @@ def test_shape_and_dtype_validation():
     with pytest.raises(ValueError, match="scale must have shape"):
         prepare_gemm_a16wfp4_weight(packed, scale[:, :-1])
 
+    overflow_a, overflow_packed, overflow_scale = _make_inputs(1, 1024, 3584)
+    overflow_prepared = prepare_gemm_a16wfp4_weight(
+        overflow_packed, overflow_scale
+    )
+    overflow_config = DenseGemmConfig(64, 128, 1792, 1, 1)
+    assert not a16wfp4_config_legal(1024, 3584, overflow_config)
+    with pytest.raises(ValueError, match="illegal A16WFP4 config"):
+        flydsl_gemm_a16wfp4(
+            overflow_a, overflow_prepared, config=overflow_config
+        )
+
 
 @_SKIP
 def test_decode_configs_fill_the_grid():
     """Decode is grid-bound: never idle a CU while a narrower legal tile exists."""
+    cu_num = get_cu_num()
     for n, k in ((8448, 7168), (1536, 7168), (7168, 768), (1024, 3584), (3584, 512)):
         for m in (1, 8, 16, 17, 32, 63):
             cfg = _select_gemm_config(m, n, k)
@@ -261,11 +281,11 @@ def test_decode_configs_fill_the_grid():
             blocks = ((m + cfg.block_m - 1) // cfg.block_m) * (n // cfg.tile_n)
             if cfg.k_wave == 1:
                 continue  # short K cannot hide the dispatch of a narrower tile
-            if blocks >= 256:
+            if blocks >= cu_num:
                 continue
             narrower = cfg._replace(tile_n=cfg.tile_n // 2)
             assert not a16wfp4_config_legal(n, k, narrower), (
-                f"({n},{k}) M={m} leaves {blocks} tiles for 256 CUs while "
+                f"({n},{k}) M={m} leaves {blocks} tiles for {cu_num} CUs while "
                 f"TILE_N={narrower.tile_n} is legal"
             )
 

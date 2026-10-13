@@ -157,7 +157,7 @@ def make_dense_operand_loaders(
         TILE_K=traits.tile_k,
         w_dtype="fp4",
         b_cache_mod=traits.b_cache_mod,
-        use_k16=False,
+        rocm_arch="gfx950",
     )
     a_loader = make_a_loader(
         lds,
