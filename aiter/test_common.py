@@ -544,10 +544,13 @@ def checkAllclose(
     strict=None,
 ):
     """``strict`` raises on the same mismatch this function already reports as
-    ``failed!``, instead of only logging it. ``None`` defers to
-    ``AITER_STRICT_ALLCLOSE``. It has no effect when ``printLog=False``: that is
-    the tuner's ranking path, which needs the ratio back rather than an
-    exception.
+    ``failed!``, instead of only logging it.
+
+    ``strict=None`` defers to ``AITER_STRICT_ALLCLOSE``, and that default is
+    suppressed when ``printLog=False``: that is the tuner's ranking path, which
+    needs the ratio back rather than an exception. An explicit ``strict=True``
+    is honoured either way, including with ``printLog=False`` -- a caller that
+    asks for a raise gets one.
 
     Strict mode also rejects NaN and Inf regardless of ``tol_err_ratio``.
     Neither is reliably visible to a ratio gate: on a 524,288-element MoE
