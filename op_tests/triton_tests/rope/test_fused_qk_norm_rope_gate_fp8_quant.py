@@ -628,18 +628,22 @@ def test_fused_qk_norm_rope_gate_fp8_quant_decode_prefix_multiple_suffix_sequenc
 
 
 def test_fused_qk_norm_rope_gate_fp8_quant_rejects_cpu_inputs():
-    q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM)
-    key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM)
+    # Pin CPU explicitly. The MI35X job's default device is CUDA by the time
+    # this runs, and torch.empty() would otherwise allocate on cuda:0. The
+    # device check is first, so those tensors then fail the later bf16 check.
+    cpu = torch.device("cpu")
+    q_gate = torch.empty(1, NUM_QUERY_HEADS * 2 * HEAD_DIM, device=cpu)
+    key = torch.empty(1, NUM_KV_HEADS * HEAD_DIM, device=cpu)
     with pytest.raises(ValueError, match="requires a CUDA/HIP device"):
         fused_qk_norm_rope_gate_fp8_quant(
             q_gate,
             key,
             key,
-            torch.empty(HEAD_DIM),
-            torch.empty(HEAD_DIM),
-            torch.empty(1, ROTARY_DIM),
-            torch.zeros(1, dtype=torch.int64),
-            torch.tensor([0, 1], dtype=torch.int32),
+            torch.empty(HEAD_DIM, device=cpu),
+            torch.empty(HEAD_DIM, device=cpu),
+            torch.empty(1, ROTARY_DIM, device=cpu),
+            torch.zeros(1, dtype=torch.int64, device=cpu),
+            torch.tensor([0, 1], dtype=torch.int32, device=cpu),
             num_actual_tokens=1,
             num_query_heads=NUM_QUERY_HEADS,
             num_kv_heads=NUM_KV_HEADS,
