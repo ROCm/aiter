@@ -1417,8 +1417,8 @@ def qsa_k2_serves(
         return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
     # The same geometries build_qsa_k2_module rejects for the launch
     # _launch_config would compile from these tensors. A reason here keeps
-    # auto on Triton instead of compiling a kernel that raises or drops a
-    # tail of D. BLOCK_N and the workgroup still come from that policy.
+    # the caller from launching a kernel that raises or drops a tail of D.
+    # BLOCK_N and the workgroup still come from that policy.
     n_q_heads = int(q.shape[1])
     n_kv_heads = int(k_cache.shape[2])
     head_dim = int(q.shape[2])
