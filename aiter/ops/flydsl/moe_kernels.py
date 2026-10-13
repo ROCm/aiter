@@ -559,14 +559,15 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
 
 # PCI device ids the gfx942 a8w4 stage1 is enabled on. MI300X (0x74A1) is the same
 # gfx942 / 304 CU part, so it shares the tuned CSV rows, but there a8w4 is slower than
-# a16w4 at large M (latency-bound stage 1; M >= 1024, M = 2048 inter 384 at 0.94x).
-_A8W4_GFX942_CHIP_IDS = {0x74A5}  # MI325X
+# a16w4 at large M (latency-bound stage 1; 0.81-0.89x at M >= 1024).
+_A8W4_GFX942_CHIP_IDS = {0x74A5, 0x74B9}  # MI325X, MI325X VF (SR-IOV guests)
 
 
 @functools.cache
 def _a8w4_gfx942_chip_id(device: int) -> int:
-    # sysfs rather than hipDeviceGetAttribute(PciChipId): that enum value moved
-    # between ROCm releases (10019 on 7.2, 10020 on 7.13).
+    # sysfs rather than hipDeviceGetAttribute(PciChipId) from Python: the enum value
+    # is not a stable number (chip_info.py hardcodes 10019, which returns 0x200 on
+    # ROCm 7.2.4 / 7.13 / 7.14; PciChipId is 10020 there).
     p = torch.cuda.get_device_properties(device)
     path = (
         f"/sys/bus/pci/devices/{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:"
@@ -1673,7 +1674,7 @@ def _flydsl_moe_stage1_impl(
             if not a8w4_gfx942_supported(dev):
                 raise NotImplementedError(
                     "gfx942 a8w4 stage1 is enabled on MI325X only: on MI300X it is "
-                    "slower than a16w4 at large M (M>=1024, M=2048 inter 384 0.94x); "
+                    "slower than a16w4 at large M (0.81-0.89x at M>=1024); "
                     "use a16w4"
                 )
             if _fuse_any_quant or _is_splitk or gate_up_interleave or bias is not None:
