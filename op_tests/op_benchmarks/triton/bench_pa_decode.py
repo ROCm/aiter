@@ -172,6 +172,9 @@ def paged_attn_decode(
 
         context_lens = context_lens.to(torch.int32)
         scale = torch.ones(1, dtype=torch.float32, device="cuda")
+        num_splits = get_recommended_splits(
+            BS, H_KV, max_context_length=int(max_context_len)
+        )
         return lambda: pa_decode_gluon(
             output=triton_output,
             query=query,
@@ -181,9 +184,7 @@ def paged_attn_decode(
             block_tables=block_tables,
             softmax_scale=attn_scale,
             query_length=1,
-            max_context_partition_num=get_recommended_splits(
-                BS, H_KV, max_context_length=max_context_len
-            ),
+            max_context_partition_num=num_splits,
             compute_type=compute_type,
             key_scale=scale,
             value_scale=scale,

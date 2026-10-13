@@ -118,7 +118,8 @@ def get_recommended_splits(
     ):
         return legacy
     context_tiles = triton.cdiv(max_context_length, 256)
-    return max(legacy, min(max_context_partition_num, context_tiles, 64))
+    # The C++ ps reduce is wrong above 32 partitions (cross-half ds_swizzle).
+    return max(legacy, min(max_context_partition_num, context_tiles, 32))
 
 
 DS_WRITE = gl.constexpr(0x200)

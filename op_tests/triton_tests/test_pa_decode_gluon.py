@@ -2257,7 +2257,9 @@ def sliding_window_performance_test():
     "num_seqs, num_kv_heads, kwargs, expected",
     [
         (1, 8, {}, 8),
-        (1, 8, {"max_context_length": 32768}, 64),
+        (1, 8, {"max_context_length": 32768}, 32),
+        (1, 8, {"max_context_length": 12000}, 32),
+        (1, 2, {"max_context_length": 4096}, 16),
         (1, 8, {"max_context_length": 1024}, 8),
         (2, 8, {"max_context_length": 32768}, 32),
         (1, 2, {"max_context_length": 8192}, 32),
@@ -2275,21 +2277,37 @@ def test_get_recommended_splits(monkeypatch, num_seqs, num_kv_heads, kwargs, exp
     assert get_recommended_splits(num_seqs, num_kv_heads, **kwargs) == expected
 
 
-def test_ps_recommended_splits_match_reference():
+@pytest.mark.parametrize(
+    "kv_heads, lengths",
+    [
+        (8, [8192]),
+        (8, [12000]),
+        (8, [32768]),
+        (4, [32768, 300]),
+        (2, [32768, 1000]),
+    ],
+)
+def test_ps_recommended_splits_match_reference(kv_heads, lengths):
     torch.manual_seed(0)
-    kv_heads, group, head_size, page, ctx_len, x = 8, 8, 64, 16, 8192, 8
-    pages = ctx_len // page
+    group, head_size, page, x = 8, 64, 16, 8
+    batch = len(lengths)
+    pages_per_seq = [triton.cdiv(n, page) for n in lengths]
+    max_pages = max(pages_per_seq)
+    total_pages = sum(pages_per_seq)
     kwargs = {"device": "cuda", "dtype": torch.bfloat16}
-    query = torch.randn(1, kv_heads * group, head_size, **kwargs)
-    key_cache = torch.randn(pages, kv_heads, head_size // x, page, x, **kwargs)
-    value_cache = torch.randn(pages, kv_heads, page // x, head_size, x, **kwargs)
-    context_lengths = torch.tensor([ctx_len], dtype=torch.int32, device="cuda")
-    block_tables = torch.arange(pages, dtype=torch.int32, device="cuda")[None]
+    query = torch.randn(batch, kv_heads * group, head_size, **kwargs)
+    key_cache = torch.randn(total_pages, kv_heads, head_size // x, page, x, **kwargs)
+    value_cache = torch.randn(total_pages, kv_heads, page // x, head_size, x, **kwargs)
+    context_lengths = torch.tensor(lengths, dtype=torch.int32, device="cuda")
+    block_tables = torch.zeros(batch, max_pages, dtype=torch.int32, device="cuda")
+    first_page = 0
+    for i, n in enumerate(pages_per_seq):
+        block_tables[i, :n] = torch.arange(first_page, first_page + n, device="cuda")
+        first_page += n
     scale = head_size**-0.5
 
-    splits = get_recommended_splits(1, kv_heads, max_context_length=ctx_len)
-    assert splits > 8
-    shape = (1, kv_heads, splits, group)
+    splits = get_recommended_splits(batch, kv_heads, max_context_length=max(lengths))
+    shape = (batch, kv_heads, splits, group)
     exp_sums = torch.empty(shape, dtype=torch.float32, device="cuda")
     max_logits = torch.empty_like(exp_sums)
     temporary_output = torch.empty((*shape, head_size), **kwargs)
@@ -2312,27 +2330,16 @@ def test_ps_recommended_splits_match_reference():
         ps=True,
     )
 
-    def unpack(cache, order):
-        return cache.permute(order).reshape(pages, kv_heads, page, head_size)
-
-    k = (
-        unpack(key_cache, (0, 1, 3, 2, 4))
-        .transpose(0, 1)
-        .reshape(kv_heads, -1, head_size)
-    )
-    v = (
-        unpack(value_cache, (0, 1, 2, 4, 3))
-        .transpose(0, 1)
-        .reshape(kv_heads, -1, head_size)
-    )
-    probs = torch.softmax(
-        query.view(kv_heads, group, head_size).float()
-        @ k.float().transpose(1, 2)
-        * scale,
-        dim=-1,
-    )
-    reference = (probs @ v.float()).reshape(1, kv_heads * group, head_size)
-    torch.testing.assert_close(output.float(), reference, atol=2e-2, rtol=2e-2)
+    # Per sequence: the short ones of a ragged batch also run with the batch-wide split count.
+    for i, n in enumerate(lengths):
+        table = block_tables[i, : pages_per_seq[i]].long()
+        k = key_cache[table].permute(1, 0, 3, 2, 4).reshape(kv_heads, -1, head_size)
+        v = value_cache[table].permute(1, 0, 2, 4, 3).reshape(kv_heads, -1, head_size)
+        k, v = k[:, :n].float(), v[:, :n].float()
+        q = query[i].view(kv_heads, group, head_size).float()
+        probs = torch.softmax(q @ k.transpose(1, 2) * scale, dim=-1)
+        reference = (probs @ v).reshape(kv_heads * group, head_size)
+        torch.testing.assert_close(output[i].float(), reference, atol=2e-2, rtol=2e-2)
 
 
 @pytest.mark.parametrize("case_set_name", CASE_SET_NAME_OPTIONS)
