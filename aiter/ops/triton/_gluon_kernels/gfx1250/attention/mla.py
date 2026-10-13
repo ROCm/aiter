@@ -660,7 +660,6 @@ class MLAProgram:
         stride_kv_buffer_2,
         stride_kv_buffer_3,
     ):
-        # cfg.SHUFFLED_KV_CACHE == 1
         # cfg.NUM_BLOCKS_GATHER_PER_TILE == 1:
         kv_lora_scales_desc = None
         k_rope_scales_desc = None
@@ -722,7 +721,7 @@ class MLAProgram:
                 ),
                 layout=cfg.K_ROPE_SHARED_LAYOUT,
             )
-        else:
+        elif cfg.SHUFFLED_KV_CACHE:
             kv_lora_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
                 base=kv_buffer_ptr,
                 shape=(
@@ -741,6 +740,26 @@ class MLAProgram:
                 ),
                 strides=(stride_kv_buffer_1, 1),
                 block_shape=(gl.constexpr(1), cfg.BLOCK_SIZE * cfg.QK_ROPE_HEAD_DIM),
+                layout=cfg.K_ROPE_SHARED_LAYOUT,
+            )
+        else:
+            # Pages are read as one [num_blocks * BLOCK_SIZE, token row] table,
+            # which requires stride_kv_buffer_0 == BLOCK_SIZE * stride_kv_buffer_1.
+            kv_row_size: gl.constexpr = cfg.NUM_KV_HEADS * (
+                cfg.KV_LORA_RANK + cfg.QK_ROPE_HEAD_DIM
+            )
+            kv_lora_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=kv_buffer_ptr,
+                shape=(num_blocks * cfg.BLOCK_SIZE, kv_row_size),
+                strides=(stride_kv_buffer_1, 1),
+                block_shape=(cfg.BLOCK_SIZE, cfg.KV_LORA_RANK),
+                layout=cfg.KV_LORA_SHARED_LAYOUT,
+            )
+            k_rope_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
+                base=kv_buffer_ptr,
+                shape=(num_blocks * cfg.BLOCK_SIZE, kv_row_size),
+                strides=(stride_kv_buffer_1, 1),
+                block_shape=(cfg.BLOCK_SIZE, cfg.QK_ROPE_HEAD_DIM),
                 layout=cfg.K_ROPE_SHARED_LAYOUT,
             )
 
@@ -938,9 +957,13 @@ class MLAProgram:
             PACK_FACTOR: gl.constexpr = 2
         else:
             PACK_FACTOR: gl.constexpr = 1
-        return (
-            self.kv_lora_shared.index(buffer_id)
-            .reshape(
+        # An unshuffled tile is already row-major [TILE_SIZE, KV_LORA_RANK] and is
+        # never nvfp4 (MLAConfig only accepts nvfp4 with a shuffled cache).
+        # A compile-time `return` would not skip the code after it, so the
+        # shuffled view is applied conditionally instead.
+        kv_lora = self.kv_lora_shared.index(buffer_id)
+        if self.cfg.SHUFFLED_KV_CACHE:
+            kv_lora = kv_lora.reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.BLOCK_SIZE // 16,
@@ -950,10 +973,10 @@ class MLAProgram:
                     self.cfg.K_WIDTH,
                 )
             )
-            .permute((0, 1, 4, 2, 3, 5))
-            .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // PACK_FACTOR))
-            .permute((1, 0))
-        )
+            kv_lora = kv_lora.permute((0, 1, 4, 2, 3, 5)).reshape(
+                (self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // PACK_FACTOR)
+            )
+        return kv_lora.permute((1, 0))
 
     @gluon.jit
     def lds_unshuffle_kv_lora_trans(self, buffer_id):
@@ -961,9 +984,11 @@ class MLAProgram:
             PACK_FACTOR: gl.constexpr = 2
         else:
             PACK_FACTOR: gl.constexpr = 1
-        return (
-            self.kv_lora_shared.index(buffer_id)
-            .reshape(
+        # An unshuffled tile is already row-major [TILE_SIZE, KV_LORA_RANK] and is
+        # never nvfp4 (MLAConfig only accepts nvfp4 with a shuffled cache).
+        kv_lora = self.kv_lora_shared.index(buffer_id)
+        if self.cfg.SHUFFLED_KV_CACHE:
+            kv_lora = kv_lora.reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.BLOCK_SIZE // 16,
@@ -973,9 +998,10 @@ class MLAProgram:
                     self.cfg.K_WIDTH,
                 )
             )
-            .permute((0, 1, 4, 2, 3, 5))
-            .reshape((self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // PACK_FACTOR))
-        )
+            kv_lora = kv_lora.permute((0, 1, 4, 2, 3, 5)).reshape(
+                (self.cfg.TILE_SIZE, self.cfg.KV_LORA_RANK // PACK_FACTOR)
+            )
+        return kv_lora
 
     @gluon.jit
     def lds_unshuffle_k_rope(self, buffer_id):
@@ -983,9 +1009,11 @@ class MLAProgram:
             PACK_FACTOR: gl.constexpr = 2
         else:
             PACK_FACTOR: gl.constexpr = 1
-        return (
-            self.k_rope_shared.index(buffer_id)
-            .reshape(
+        # An unshuffled tile is already row-major [TILE_SIZE, QK_ROPE_HEAD_DIM] and
+        # is never nvfp4 (MLAConfig only accepts nvfp4 with a shuffled cache).
+        k_rope = self.k_rope_shared.index(buffer_id)
+        if self.cfg.SHUFFLED_KV_CACHE:
+            k_rope = k_rope.reshape(
                 (
                     self.cfg.NUM_BLOCKS_GATHER_PER_TILE,
                     self.cfg.BLOCK_SIZE // 16,
@@ -996,10 +1024,10 @@ class MLAProgram:
                     self.cfg.K_WIDTH,
                 )
             )
-            .permute((0, 1, 4, 2, 3, 5))
-            .reshape((self.cfg.TILE_SIZE, self.cfg.QK_ROPE_HEAD_DIM // PACK_FACTOR))
-            .permute((1, 0))
-        )
+            k_rope = k_rope.permute((0, 1, 4, 2, 3, 5)).reshape(
+                (self.cfg.TILE_SIZE, self.cfg.QK_ROPE_HEAD_DIM // PACK_FACTOR)
+            )
+        return k_rope.permute((1, 0))
         # else:
         #     return (
         #         self.k_rope_shared.index(buffer_id)
@@ -1064,16 +1092,26 @@ class MLAProgram:
 
     @gluon.jit
     def get_kv_buffer_row_offsets(self, block_idx):
-        return (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32)
+        if self.cfg.SHUFFLED_KV_CACHE:
+            return (block_idx * self.cfg.NUM_KV_HEADS + self.kv_head_idx).to(gl.int32)
+        else:
+            return (block_idx * self.cfg.BLOCK_SIZE).to(gl.int32)
 
     @gluon.jit
     def tdm_load_global_to_shared_kv_lora(self, row_offsets, buffer_id):
-        offsets = [row_offsets, 0]
+        if self.cfg.SHUFFLED_KV_CACHE:
+            offsets = [row_offsets, 0]
+        else:
+            offsets = [
+                row_offsets,
+                (self.kv_head_idx * self.stride_kv_buffer_2).to(gl.int32),
+            ]
         gl.amd.gfx1250.tdm.async_load(
             self.kv_lora_desc,
             offsets,
             self.kv_lora_shared.index(buffer_id),
         )
+        # nvfp4 is shuffled-only (see MLAConfig), so these offsets are [row, 0].
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
             gl.amd.gfx1250.tdm.async_load(
                 self.kv_lora_scales_desc,
@@ -1083,10 +1121,19 @@ class MLAProgram:
 
     @gluon.jit
     def tdm_load_global_to_shared_k_rope(self, row_offsets, buffer_id):
-        offsets = [row_offsets, 0]
+        if self.cfg.SHUFFLED_KV_CACHE:
+            offsets = [row_offsets, 0]
+        else:
+            offsets = [
+                row_offsets,
+                (self.kv_head_idx * self.stride_kv_buffer_2 + self.cfg.KV_LORA_RANK).to(
+                    gl.int32
+                ),
+            ]
         gl.amd.gfx1250.tdm.async_load(
             self.k_rope_desc, offsets, self.k_rope_shared.index(buffer_id)
         )
+        # nvfp4 is shuffled-only (see MLAConfig), so these offsets are [row, 0].
         if self.cfg.KV_CACHE_DTYPE == "nvfp4":
             gl.amd.gfx1250.tdm.async_load(
                 self.k_rope_scales_desc,
@@ -1840,7 +1887,6 @@ def _mla_decode_fwd_kernel(
         query_stride_0 = query_stride_0.to(gl.int32)
         query_stride_1 = query_stride_1.to(gl.int32)
     else:
-        assert SHUFFLED_KV_CACHE
         assert num_stages == 2
 
     # Workgroup offsets

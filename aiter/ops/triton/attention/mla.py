@@ -36,6 +36,11 @@ except:  # noqa: E722
     gluon_mla_decode_fwd_reduce_kernel = None
 
 from aiter.ops.triton.utils._triton import arch_info
+from aiter.ops.triton.utils.config_utils import (
+    load_config_json,
+    resolve_config_dir,
+    select_leq_config,
+)
 from aiter.ops.triton.utils.types import e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
@@ -261,6 +266,37 @@ def mla_prefill_fwd(
     return out
 
 
+def _pipelined_unshuffled_lds_bytes(
+    block_size, block_m, kv_lora_rank, qk_rope_head_dim, kv_elem_size, q_elem_size
+):
+    # Two padded TDM stages of KV plus the padded Q tile; each row is padded by 8.
+    padded_row = (kv_lora_rank + 8) + (qk_rope_head_dim + 8)
+    return padded_row * (2 * block_size * kv_elem_size + block_m * q_elem_size)
+
+
+def _tuned_decode_config(
+    kernel, query_dtype, kv_cache_dtype, num_queries_per_kv, num_seqs, max_seqlen_kv
+):
+    """Measured overrides of select_3d_config's attention config, keyed on query
+    heads per KV head (H), sequences (B) and max_seqlen_kv (KV). Empty where
+    nothing was measured."""
+    # Zero means max_seqlen_kv is unknown (graph capture), not a short context.
+    if max_seqlen_kv == 0:
+        return {}
+    cfg_dir = resolve_config_dir("attention", "MLA-DECODE", backend="gluon")
+    table = load_config_json(f"{cfg_dir}/DEFAULT.json")
+    entries = table.get(kernel, {}).get(f"{query_dtype}_{kv_cache_dtype}")
+    if entries is None:
+        return {}
+    return select_leq_config(
+        entries,
+        axes=("H", "B", "KV"),
+        H=num_queries_per_kv,
+        B=num_seqs,
+        KV=max_seqlen_kv,
+    )
+
+
 def _fits_int32_offsets(tensor):
     # Kernels receive a pointer to the view origin, so storage_offset is not
     # part of the relative index. numel alone does not bound a strided view.
@@ -413,6 +449,52 @@ def mla_decode_fwd(
         and _fits_int32_offsets(out)
         and _fits_int32_offsets(block_tables)
     )
+    # The pipelined kernel reads unshuffled pages as tiles of one flat token
+    # table. Multi-token decode stays on the non-pipelined kernel: the pipelined
+    # epilogue always processes a tile, even in a segment past a query's prefix.
+    use_pipelined_unshuffled = (
+        IS_DEVICE_ARCH_GFX12
+        and not shuffled_kv_cache
+        and ALL_DECODE
+        and KV_CACHE_DTYPE in ("bf16", "fp8")
+        and block_size in (64, 128)
+        and kv_buffer.stride(3) == 1
+        and kv_buffer.stride(0) == block_size * kv_buffer.stride(1)
+        and (
+            num_kv_heads == 1 or kv_buffer.stride(2) == kv_lora_rank + qk_rope_head_dim
+        )
+        and num_blocks * block_size < 2**31
+        # Leave headroom in gfx1250's 320 KB LDS for layout-conversion scratch.
+        and _pipelined_unshuffled_lds_bytes(
+            block_size,
+            BLOCK_M,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            kv_buffer.element_size(),
+            q.element_size(),
+        )
+        <= 256 * 1024
+    )
+    if use_pipelined_unshuffled:
+        tuned = _tuned_decode_config(
+            "pipelined_unshuffled",
+            QUERY_DTYPE,
+            KV_CACHE_DTYPE,
+            num_queries_per_kv,
+            num_seqs,
+            max_seqlen_kv,
+        )
+        if "NUM_SEGMENTS_PER_SEQ" in tuned:
+            # The reduce kernel indexes segments with tl.arange: keep a power of 2.
+            tuned["NUM_SEGMENTS_PER_SEQ"] = triton.next_power_of_2(
+                min(
+                    tuned["NUM_SEGMENTS_PER_SEQ"],
+                    triton.cdiv(max_seqlen_kv, block_size),
+                )
+            )
+            reduce_config["NUM_SEGMENTS_PER_SEQ"] = tuned["NUM_SEGMENTS_PER_SEQ"]
+        attn_config.update(tuned)
+        selected_num_segments = attn_config["NUM_SEGMENTS_PER_SEQ"]
     NUM_SEGMENTS = 1 if use_lds_pipeline else selected_num_segments
     if NUM_SEGMENTS > 1:
         segm_output = torch.empty(
@@ -460,7 +542,7 @@ def mla_decode_fwd(
             ),
         )
     if IS_DEVICE_ARCH_GFX12:
-        if shuffled_kv_cache:
+        if shuffled_kv_cache or use_pipelined_unshuffled:
             impl = gluon_mla_decode_fwd_kernel
         else:
             impl = gluon_mla_decode_fwd_kernel_non_pipelined
