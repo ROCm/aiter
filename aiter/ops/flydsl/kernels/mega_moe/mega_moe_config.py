@@ -321,11 +321,8 @@ def _select_large_stage1(bucket: int, inter_dim: int) -> Stage1Config:
         # publisher counts by it (_initialize_section_ready).  Under uneven-rank
         # dynamic prefill each rank picks its own token bucket within this
         # MAX-MTPR (32768) class, so the value MUST be identical for every
-        # bucket or Stage1's equality wait deadlocks.  1536 is the value tuned
-        # for the largest bucket (16384): measured rank-invariant across the
-        # class it is a no-op on 2048/4096/8192 (within noise) while recovering
-        # ~14% e2e at bucket 16384 vs the 384 base, so it is the performant
-        # rank-invariant choice for the whole class.
+        # bucket or Stage1's equality wait deadlocks.  1536 is the rank-invariant
+        # choice for the class (tuned on the largest bucket).
         payload_chunk_rows=1536,
         prepare_quant_cu=prepare_quant_cu,
     )
@@ -499,11 +496,9 @@ def _tune_r1(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                 "mfma_amajor": True,
             }
         elif bucket == 64:
-            # bs=64 uses the SBM64+w8 base with synchronous A-copy: SBM64
-            # keeps the reg->LDS copy race-free without async (the race only
-            # bites SBM32+nw8), so async off is safe.  Pairs with the deep_a
-            # pipeline in Stage2 + dcu160.  work_shards 4->2 reduces the
-            # dispatch kernel's scheduling overhead.
+            # SBM64 keeps the reg->LDS copy race-free without async (the race
+            # only bites SBM32+nw8).  work_shards=2 reduces dispatch scheduling
+            # overhead; pairs with the Stage2 deep_a path below.
             stage1_patch = {
                 "sort_block_m": 64,
                 "num_waves": 8,
@@ -519,8 +514,7 @@ def _tune_r1(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
             }
         config = _replace_config(config, stage1=stage1_patch)
     if mtpr == 8192:
-        # num_dispatch_cu per token bucket (MI355X), retuned after the
-        # read-before-write fix: higher DCU + grid_mult=2 on small buckets.
+        # Per-bucket dispatch CU; small buckets also raise grid_mult.
         r1_dispatch_cu = {
             1: 192,
             2: 224,
@@ -537,16 +531,12 @@ def _tune_r1(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
             4096: 72,
             8192: 96,
         }[bucket]
-        # Latency-bound tiny buckets retuned on MI355X: bs1 dcu->192, bs2/4
-        # dcu->224, bs4 also grid_mult 1->2.  dcu224 is bucket-specific (it
-        # oversubscribes CUs at bs16), so it is set per bucket.
         stage1_patch = {"num_dispatch_cu": r1_dispatch_cu}
         if bucket in (2, 4, 8, 16, 32):
             stage1_patch["grid_mult"] = 2
         config = _replace_config(config, stage1=stage1_patch)
         if bucket == 2048:
-            # Raise the sort block to 128 (as 4096/8192 already use) with
-            # mfma_amajor for bucket 2048.
+            # Match the larger-bucket Stage1 geometry (SBM128 + mfma_amajor).
             config = _replace_config(
                 config,
                 stage1={
@@ -557,8 +547,7 @@ def _tune_r1(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                 },
             )
         if bucket == 64:
-            # bs=64 Stage2: deep_a pipeline on the SBM64+w8 base with bm64;
-            # pairs with the dcu160 set above.  block_n stays at 256.
+            # deep_a on the SBM64+w8 base with bm64.
             config = _replace_config(
                 config,
                 stage2={
@@ -568,9 +557,7 @@ def _tune_r1(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                 },
             )
         if bucket == 128:
-            # bs=128 Stage2: deep_a pipeline + bm64 (widen the M tile to fill
-            # the SBM64 sort block), mirroring V4-Pro's large-bucket recipe.
-            # bm64 is required; plain deep_a without it does nothing here.
+            # deep_a + bm64 to fill the SBM64 sort block.
             config = _replace_config(
                 config,
                 stage2={
@@ -580,12 +567,7 @@ def _tune_r1(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                 },
             )
         if bucket == 256:
-            # bs=256: BN256 + BM64 on the base SBM64/w8/async path.
-            # skew_cu=96 (the K3-style CU-skew that _select_large_stage2
-            # only gives buckets >=512); scoped to 256 since it does not help
-            # 512.  b_nt=0 caches the weights instead of streaming them past
-            # L2 (reused enough at 256 tokens); scoped to 256 since 128
-            # reuses them too little.
+            # Widen Stage2 and enable CU skew; b_nt=0 keeps weights in L2.
             config = _replace_config(
                 config,
                 stage1={"mfma_amajor": True, "b_nt": 0},
@@ -664,9 +646,7 @@ def _tune_v4_pro(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                     "sort_block_m": 32,
                     "tile_n": 256,
                     "num_waves": 4,
-                    # bs16/32/64 grid_mult 1->2 (with dcu128->224 below):
-                    # V4-Pro's epr=48 dispatch has enough work to use the extra
-                    # grid epoch.
+                    # Extra grid epoch on bs16/32/64; dispatch has enough work.
                     "grid_mult": 2 if bucket in (16, 32, 64) else 1,
                     "mfma_amajor": False,
                     "async_a_copy": False,
@@ -674,6 +654,7 @@ def _tune_v4_pro(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                 stage2={"block_m": 32},
             )
 
+        # Per-bucket dispatch CU. Larger compute-bound buckets are left alone.
         dispatch_cu = {
             2: 128,
             4: 128,
@@ -684,8 +665,6 @@ def _tune_v4_pro(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
             128: 128,
             256: 224,
             512: 160,
-            # bs1024 dcu32->96 (the only lever that moves it; 2048/4096/8192 are
-            # compute-bound and regress under every knob).
             1024: 96,
             4096: 72,
         }.get(bucket)
@@ -695,15 +674,13 @@ def _tune_v4_pro(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
                 stage1_patch["tile_n"] = 256
             config = _replace_config(config, stage1=stage1_patch)
 
-    # Stage2 fields that drifted away from the pre-rebase tuning; restore them.
-    # Two of them also unblock the deep Stage2 path below, which the drifted
-    # geometry was suppressing.  Scoped to the large-MTPR class, the regime
-    # these were tuned against.
+    # Restore Stage2 fields that drifted from the pre-rebase tuning, and unblock
+    # the deep Stage2 path below.  Scoped to the large-MTPR class.
     if ctx.mtpr_class == MAX_MTPR_CLASS:
         restore_stage2: dict[str, object] = {}
         if bucket == 256:
-            # bs256 (with dcu96->224 above): use_nt streams the GEMM2 down-proj
-            # weight past L2, and persist_cu 128->96 frees CUs for dispatch.
+            # use_nt streams GEMM2 weights past L2; lower persist_cu frees CUs
+            # for dispatch. Improves this bucket.
             restore_stage2 = {
                 "block_m": 64,
                 "block_n": 256,
@@ -756,42 +733,35 @@ def _tune_v4_pro(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
 def _tune_kimi_k3(config: MegaMoEConfig, ctx: _TuningContext) -> MegaMoEConfig:
     """Kimi-K3 (112 experts per rank) per-bucket tuning (both activation dtypes)."""
     bucket = ctx.bucket
-    # K3 packs 112 experts per rank, so the generic num_dispatch_cu=32
-    # (sized for 32-expert ranks) starves the dispatch.  Use 160 through the
-    # middle, 96 at the ends (bs=1 cannot fill 160; the largest buckets
-    # spend more on scheduling than they recover).
+    # Generic num_dispatch_cu=32 is sized for 32-expert ranks and starves K3
+    # dispatch (112 experts/rank). Raise it; keep the ends lower.
     config = _replace_config(
         config,
         stage1={"num_dispatch_cu": 96 if bucket == 1 or bucket >= 2048 else 160},
     )
-    # Stage2 persist_cu composes with the dispatch change (different phase):
-    # 192 at 2048/4096, 256 from 8192.  Nothing below 2048 is touched.
+    # Raise Stage2 persist_cu on large buckets (separate phase from dispatch).
     if bucket >= 2048:
         config = _replace_config(
             config,
             stage2={"persist_cu": 192 if bucket <= 4096 else 256},
         )
-    # Widen Stage2 to BN256 off the generic BN128 at this inter_dim.  Not
-    # the deep-A path the BN256 rule earlier in selection turns on: deep_a
-    # fails to build at 8192, and that rule runs before this branch so it
-    # does not see the BN256 set here.
+    # Widen Stage2 off the generic BN128. Not the earlier deep-A BN256 rule:
+    # deep_a fails to build at 8192, and that rule runs before this branch.
     if bucket >= 4096:
         config = _replace_config(
             config,
             stage2={"block_n": 256, "b2stage": True},
         )
     elif 256 <= bucket <= 2048:
-        # These buckets run Stage1 with sort_block_m 64 but take the generic
-        # M tile 32, so each Stage2 tile covers half a sort block; widen
-        # block_m to 64 to fill it.
+        # Stage1 uses SBM64 with a generic M tile of 32; widen block_m to 64
+        # so each Stage2 tile fills the sort block.
         config = _replace_config(
             config,
             stage2={"block_m": 64, "block_n": 256, "b2stage": True},
         )
     elif 8 <= bucket <= 128:
-        # BN256 extends the wider Stage2 N-tile down to bs 8-128 (block_n
-        # only; b2stage/deep_a add nothing here and SBM32 pins block_m=32).
-        # bs 1-4 stay BN128 (too few tokens to fill the wider tile).
+        # Wider Stage2 N-tile only; SBM32 keeps block_m=32. Tiny buckets stay
+        # on BN128.
         config = _replace_config(
             config,
             stage2={"block_n": 256},
