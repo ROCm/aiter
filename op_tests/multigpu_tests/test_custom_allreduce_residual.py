@@ -164,6 +164,19 @@ def check_norm_rows_skip_residual(ca, tp, rank, device, graphs):
                 logger.info("fused_ar_rms options passed: %s, TP%d", ctx, tp)
 
 
+def check_uses_1stage_ar_gfx1250(ca, rank, device):
+    """gfx1250 runs only one-shot allreduce kernels, at every size."""
+    big = torch.empty((4096, HIDDEN), dtype=torch.bfloat16, device=device)
+    saved = ca._is_gfx1250
+    try:
+        ca._is_gfx1250 = True
+        assert ca.uses_1stage_ar(big), "gfx1250 reported a 2-stage allreduce"
+    finally:
+        ca._is_gfx1250 = saved
+    if rank == 0:
+        logger.info("uses_1stage_ar gfx1250 check passed")
+
+
 def check_norm_rejects_short_buffers(ca, rank, device):
     """The native op checks buffer extents against m and num_norm_rows."""
     from aiter.ops import custom_all_reduce as ops
@@ -218,6 +231,17 @@ def check_1stage_rejects_options(ca, rank, device):
             pass
         else:
             raise AssertionError(f"use_1stage=True accepted {kwargs}")
+    # A padded output width takes the pad kernel, which has no row options,
+    # including when fused_ar_rms allocates that output itself.
+    for kwargs in ({"skip_residual": True}, {"num_norm_rows": 2}):
+        try:
+            ca.custom_fused_ar_rms(
+                x, x, w, EPS, False, out_hidden_dim=HIDDEN + 128, **kwargs
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"padded out_hidden_dim accepted {kwargs}")
     # The native op checks too, for callers that bypass the Python wrapper.
     out, res_out = torch.empty_like(x), torch.empty_like(x)
     try:
@@ -260,6 +284,7 @@ def _worker(rank, tp, init_method):
         assert not ca.disabled, "requires custom allreduce"
         check_all_reduce_residual(ca, tp, rank, device, graphs)
         check_residual_rejects_bad_out(ca, rank, device)
+        check_uses_1stage_ar_gfx1250(ca, rank, device)
         # The fused allreduce + RMSNorm op rejects TP6.
         if tp != 6:
             check_norm_rows_skip_residual(ca, tp, rank, device, graphs)

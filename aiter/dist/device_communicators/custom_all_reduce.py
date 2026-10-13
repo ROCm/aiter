@@ -1699,6 +1699,9 @@ class CustomAllreduce:
         """Match CustomAllreduce::allreduce 1-stage selection (TP<=8)."""
         if self.disabled:
             return False
+        if self._is_gfx1250:
+            # all_reduce_gfx1250 has only one-shot kernels (LL and naive).
+            return True
         nbytes = inp.numel() * inp.element_size()
         if self.world_size == 2:
             return True
@@ -2020,6 +2023,11 @@ class CustomAllreduce:
     ):
         valid_dim = w.numel()
         rows = inp.numel() // inp.shape[-1]
+        # Width of the output the call writes, including one it allocates below;
+        # a padded width takes the pad kernel, which has no row options.
+        out_dim = (
+            out.shape[-1] if out is not None else (out_hidden_dim or inp.shape[-1])
+        )
         if skip_residual or 0 <= num_norm_rows < rows:
             # Only the plain 2-stage kernels implement these options.
             if use_1stage:
@@ -2029,7 +2037,7 @@ class CustomAllreduce:
             if (
                 post_per_token_quant
                 or inp.shape[-1] != valid_dim
-                or (out is not None and out.shape[-1] != valid_dim)
+                or out_dim != valid_dim
             ):
                 raise ValueError(
                     "skip_residual and num_norm_rows are not supported with "
@@ -2043,7 +2051,6 @@ class CustomAllreduce:
         reg_bytes = 0 if registered else self._pool["input"].max_size
         if not post_per_token_quant:
             if out is None:
-                out_dim = out_hidden_dim or inp.shape[-1]
                 out = torch.empty(
                     inp.shape[:-1] + (out_dim,), dtype=inp.dtype, device=inp.device
                 )
