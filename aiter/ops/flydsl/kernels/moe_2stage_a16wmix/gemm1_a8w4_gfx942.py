@@ -50,6 +50,7 @@ from aiter.ops.flydsl.kernels.tensor_shim import _to_raw as _raw
 from .utils import (
     _FP4_E2M1_FP8_LUT_HI,
     _FP4_E2M1_FP8_LUT_LO,
+    _a16w4_swizzle_xor16,
     _buffer_i32_scalar_read,
     _e8m0_byte_to_f32,
     _global_i32_at,
@@ -303,7 +304,12 @@ def _gemm1_body_a8w4(
                 k_grp_base_bytes
                 + fx.Int32(slot * A_SLOT_BYTES)
                 + q_row[it] * fx.Int32(TILE_K)
-                + q_c8[it] * fx.Int32(8)
+                + _a16w4_swizzle_xor16(
+                    q_row[it],
+                    q_c8[it] * fx.Int32(8),
+                    fx.Int32(TILE_K // 16),
+                    enable=True,
+                )
             )
             sc_byte = (
                 xs_lds_base
@@ -534,10 +540,20 @@ def _gemm1_body_a8w4(
                 + fx.Int32(slot * A_SLOT_BYTES)
                 + row * fx.Int32(TILE_K)
             )
+            # _qi: the 16 rows of one 8-byte column are TILE_K bytes apart and hit the same
+            # LDS banks, so its in-kernel quant writes A XOR-swizzled by row in 16-byte
+            # columns (as gemm2) and the read applies the same swizzle. The other layouts
+            # keep the linear A of the shared loader.
             fr = [
                 lds_vec_load(
                     lds_base_i32,
-                    row_byte + fx.Int32(b * MX_BLOCK) + lane_div_16 * fx.Int32(8),
+                    row_byte
+                    + _a16w4_swizzle_xor16(
+                        row,
+                        fx.Int32(b * MX_BLOCK) + lane_div_16 * fx.Int32(8),
+                        fx.Int32(TILE_K // 16),
+                        enable=_qi,
+                    ),
                     T.i64,
                     T.i64,
                     align=8,
@@ -886,7 +902,7 @@ def compile_gemm1_a8w4_gfx942(
     x_scale="mx",
     k_wave=1,
     x_layout="a8w4",
-    rev="r14",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
+    rev="r17",  # bump on kernel changes: the FlyDSL cache key hashes this factory only
     rocm_arch,
 ):
     """Build the gfx942 a8w4 (MXFP8 A x MXFP4 W) fused stage1 (gate+up + act)."""

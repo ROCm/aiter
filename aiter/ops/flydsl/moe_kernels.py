@@ -557,6 +557,36 @@ def get_flydsl_stage1_kernels_int4_bf16(out_dtype: str) -> dict[str, dict]:
     return kernels
 
 
+# PCI device ids the gfx942 a8w4 stage1 is enabled on. MI300X (0x74A1) is the same
+# gfx942 / 304 CU part, so it shares the tuned CSV rows, but there a8w4 is slower than
+# a16w4 at large M (latency-bound stage 1; M >= 1024, M = 2048 inter 384 at 0.94x).
+_A8W4_GFX942_CHIP_IDS = {0x74A5}  # MI325X
+
+
+@functools.cache
+def _a8w4_gfx942_chip_id(device: int) -> int:
+    # sysfs rather than hipDeviceGetAttribute(PciChipId): that enum value moved
+    # between ROCm releases (10019 on 7.2, 10020 on 7.13).
+    p = torch.cuda.get_device_properties(device)
+    path = (
+        f"/sys/bus/pci/devices/{p.pci_domain_id:04x}:{p.pci_bus_id:02x}:"
+        f"{p.pci_device_id:02x}.0/device"
+    )
+    try:
+        with open(path) as f:
+            return int(f.read(), 16)
+    except OSError:
+        return 0x74A5 if "MI325" in p.name else 0
+
+
+def a8w4_gfx942_supported(device=None) -> bool:
+    """True on the gfx942 parts the a8w4 stage1 is enabled on (MI325X)."""
+    idx = device.index if isinstance(device, torch.device) else device
+    if idx is None:
+        idx = torch.cuda.current_device()
+    return _a8w4_gfx942_chip_id(int(idx)) in _A8W4_GFX942_CHIP_IDS
+
+
 def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
     """Return {kernelName: params} for the gfx942 a8w4 stage1 (MXFP8 A x MXFP4 W).
 
@@ -566,7 +596,9 @@ def get_flydsl_stage1_kernels_a8w4_gfx942() -> dict[str, dict]:
     ``flydsl_moe1_afp8_wfp4_bf16_t{M}x{N}x{K}_g942[_bnt0][_kw{n}][_qi]``.
     Standard (GGUU) gate/up layout; stage 2 is the a16w4 bf16-intermediate kernel.
     ``_qi``: the kernel quantises the bf16 x to MXFP8 itself (``x_layout="bf16"``), so
-    fused_moe skips the separate quant launch -- a win at the smallest M only.
+    fused_moe skips the separate quant launch -- a win at small M (the CSV uses it for
+    M <= 8).
+    Enabled on MI325X only (see ``a8w4_gfx942_supported``).
     """
     kernels = {}
 
@@ -1638,6 +1670,12 @@ def _flydsl_moe_stage1_impl(
                 flydsl_a8w4_gemm1_gfx942,
             )
 
+            if not a8w4_gfx942_supported(dev):
+                raise NotImplementedError(
+                    "gfx942 a8w4 stage1 is enabled on MI325X only: on MI300X it is "
+                    "slower than a16w4 at large M (M>=1024, M=2048 inter 384 0.94x); "
+                    "use a16w4"
+                )
             if _fuse_any_quant or _is_splitk or gate_up_interleave or bias is not None:
                 raise NotImplementedError(
                     "gfx942 a8w4 stage1: bf16 output, k_batch=1, separated gate/up, "

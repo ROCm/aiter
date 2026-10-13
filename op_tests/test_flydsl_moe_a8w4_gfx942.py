@@ -31,6 +31,7 @@ from aiter.ops.flydsl.kernels.moe_2stage_a16wmix.gemm1_a8w4_gfx942 import (
     shuffle_weight_a8w4_gfx942,
 )
 from aiter.ops.flydsl.moe_common import GateMode
+from aiter.ops.flydsl.moe_kernels import a8w4_gfx942_supported
 from aiter.ops.shuffle import shuffle_scale_a16w4, shuffle_weight_a16w4
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -186,6 +187,13 @@ def test_moe_a8w4_gfx942(token, model_dim, inter_dim, dtype):
 def main():
     if get_gfx() not in SUPPORTED_GFX:
         aiter.logger.warning("a8w4 gfx942 MoE unsupported on %s; skipping", get_gfx())
+        return
+    if not a8w4_gfx942_supported():
+        aiter.logger.warning(
+            "a8w4 gfx942 MoE is enabled on MI325X only (on MI300X it is slower than "
+            "a16w4 at large M); skipping on %s",
+            torch.cuda.get_device_name(),
+        )
         return
 
     parser = argparse.ArgumentParser(
