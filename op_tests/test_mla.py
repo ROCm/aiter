@@ -28,7 +28,8 @@ def check_support(dtype, kv_dtype, nhead):
 
 def check_asm_decode_rejects_unsupported_widths():
     """The gfx942/gfx950 decode kernels take no row width: they assume 576-wide
-    rows (656 bytes per packed byte-KV token) and 512-wide outputs."""
+    rows (656 bytes per packed byte-KV token, dense within a page) and 512-wide
+    outputs."""
     batch_size, nhead, ctx_lens = 4, 16, 300
     qo_indptr = torch.arange(batch_size + 1, dtype=torch.int)
     kv_indptr = qo_indptr * ctx_lens
@@ -68,6 +69,9 @@ def check_asm_decode_rejects_unsupported_widths():
     # 512 fp8 latent + 4 fp32 scales per token, without the 64 bf16 RoPE elements.
     with pytest.raises(RuntimeError, match="byte KV must be"):
         decode(q, torch.zeros((batch_size * ctx_lens, 528), dtype=torch.uint8))
+    # The right shape, but every page aliases a single byte.
+    with pytest.raises(RuntimeError, match=r"byte KV must be.*stride\(1\) 0 "):
+        decode(q, torch.zeros(1, dtype=torch.uint8).expand(batch_size * ctx_lens, 656))
 
     # mla_decode_fwd sizes splitData from the output, so only a direct call can
     # pair a 512-wide output with a narrower splitData.
