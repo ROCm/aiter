@@ -719,6 +719,32 @@ def build_hstu_attention_bwd_dvdk_pp(
                 )
             )
 
+        def fma_scalar(a, b, c):
+            """`a*b + c` as a scalar `v_fma_f32`, via inline asm.
+
+            Written with plain operators this contracts to `v_fma_f32` and is
+            then re-vectorised into `v_pk_fma_f32` -- a join on three chain
+            values, which is the stall this gate was restructured to avoid (it
+            also spilled 3 VGPRs). Inline asm pins it scalar.
+
+            `s_nop 0`: `c` is a `v_rcp_f32` result, and a VALU trans op needs
+            one software wait state before a consumer reads it. The hazard
+            recognizer cannot see into INLINEASM, so the asm supplies it.
+            """
+            from flydsl._mlir import ir
+            from flydsl._mlir.dialects import llvm as _llvm
+
+            return fx.Float32(
+                _llvm.inline_asm(
+                    ir.F32Type.get(),
+                    [fx.Float32(a).ir_value(), fx.Float32(b).ir_value(),
+                     fx.Float32(c).ir_value()],
+                    "s_nop 0\n\tv_fma_f32 $0, $1, $2, $3",
+                    "=v,v,v,v",
+                    has_side_effects=False,
+                )
+            )
+
         def rcp_scalar(x):
             """Scalar reciprocal, kept off the packed datapath."""
             return fx.Float32(
@@ -926,7 +952,7 @@ def build_hstu_attention_bwd_dvdk_pp(
                 # 1 - sig == emu * sig exactly, since sig = 1/(1+emu). Using
                 # the product keeps this off the packed add datapath too.
                 grad = [
-                    sig[j] + fmul_scalar(silu[j], fmul_scalar(emu[j], sig[j]))
+                    fma_scalar(silu[j], fmul_scalar(emu[j], sig[j]), sig[j])
                     for j in rng
                 ]
                 # No `c_inv_n` here: dS is linear in it, so it rides along to the
