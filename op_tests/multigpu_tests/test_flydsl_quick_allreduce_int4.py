@@ -20,9 +20,6 @@ sweep ends in a markdown table:
   ``AITER_FLY_AR_MESH_MAX_BYTES``.
 * ``test_quick_allreduce_int4_coverage`` -- the kernels those rows ran include
   every kernel the engine's own ``cfgs_for`` says the window selects.
-* ``test_quick_allreduce_int4`` again, as a second table -- the shipping INT4
-  ladder with ``block`` overridden on every rung, at the narrow blocks where a
-  VMEM store-data hazard once showed up.
 * ``test_quick_allreduce_int4_edge_inputs`` -- payloads that land on the E4M3
   scale's edge cases, and degenerate groups that must stay finite.
 * ``test_quick_allreduce_transport`` -- the ``fp16`` wire format, a lossless
@@ -32,8 +29,10 @@ sweep ends in a markdown table:
   ladder on the shipping payloads, so it covers the geometry that ships.
 
 ``--extended`` adds what production never selects: the legacy fixed shipping
-shapes, the full ``block`` sweep, the fp16 transport over a matrix of pinned
-``super_tile``/``block``, and
+shapes; ``test_quick_allreduce_int4`` again, as a second table, with ``block``
+overridden on every rung of the shipping ladder (``KNOB_CASES``), including
+the narrow blocks where a VMEM store-data hazard once showed up; the fp16
+transport over a matrix of pinned ``super_tile``/``block``; and
 ``test_quick_allreduce_int4_pinned_codec`` -- the ring with its wire formats
 pinned per lap: all-INT4 at TP8, and one lap lossless to isolate the other.
 
@@ -253,22 +252,17 @@ TRANSPORT_CASES = (
 TRANSPORT_GRID_CAP = 64
 
 # (tp, algorithm, tokens, hidden, block): the shipping INT4 ladder with
-# ``block`` overridden on every rung.
+# ``block`` overridden on every rung. ``--extended`` only: no production rung
+# uses most of these widths.
 #
 # The TP4 mesh rows at blocks 64 and 128 are where the VMEM store-data hazard in
 # ``_store_v4i32_peer`` was caught, back when the mesh still had a variant that
 # round-tripped through its own inbox: INT4's peer-major fanout at those widths
 # is where the register allocator recycles the store's data VGPRs. The fp16
-# transport rows at the same geometry never did. Those two run by default; no
-# production rung uses either width, but the hazard lives in code every mesh
-# rung shares.
+# transport rows at the same geometry never did.
 KNOB_CASES = (
     (4, "mesh", 512, 5120, 64),
     (4, "mesh", 512, 5120, 128),
-)
-
-# The rest of the knob sweep. ``--extended`` only.
-EXTENDED_KNOB_CASES = (
     (8, "mesh", 512, 5120, 128),
     (8, "ring", 512, 5120, 128),
     (4, "mesh", 9216, 4096, 128),
@@ -1353,15 +1347,13 @@ def _verify(args, tps, algos, dts, link) -> None:
             lo, hi = window
             label = f"[{_fmt_bytes(lo)}, {_fmt_bytes(hi)}]"
             coverage.append((tp, algorithm, label))
-    # Knob rows only in a default run: pinning --block already sweeps it over
+    # Knob rows with --extended, unless --block already sweeps the block over
     # the shipping shapes.
     knobs = []
-    if args.block == [None]:
+    if args.extended and args.block == [None]:
         knobs = [
             (tokens, hidden, tp, algorithm, None, block)
-            for tp, algorithm, tokens, hidden, block in (
-                KNOB_CASES + (EXTENDED_KNOB_CASES if args.extended else ())
-            )
+            for tp, algorithm, tokens, hidden, block in KNOB_CASES
             if tp in tps and algorithm in algos
         ]
     if dts:
@@ -1603,7 +1595,7 @@ def main():
         "--extended",
         action="store_true",
         help="Also run what production never selects: the legacy fixed\n"
-        "shipping shapes, the full block sweep, the pinned-codec ring and the\n"
+        "shipping shapes, the block sweep, the pinned-codec ring and the\n"
         "pinned-geometry fp16 transport matrix.",
     )
     fab.add_bench_args(parser)

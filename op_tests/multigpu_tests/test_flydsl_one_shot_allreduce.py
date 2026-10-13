@@ -10,10 +10,8 @@ kernel, and ``bench`` compares it with the stock kernels production runs today.
 drives the engine as production does -- no tuning knob pinned, so it walks
 ``ONESHOT_LADDER`` and picks a rung by payload size -- on payloads derived from
 ``allreduce_policy``: at every world size, both ends of each rung's slice of
-the window the policy routes to the one-shot. Next to it, a few spot checks
-run pinned configurations no shipped rung uses, one world size each.
-``--atoms``, ``--grid-cap``, ``--fanout`` or ``--block`` pin a configuration
-instead.
+the window the policy routes to the one-shot. ``--atoms``, ``--grid-cap``,
+``--fanout`` or ``--block`` pin a configuration instead.
 
 ``test_one_shot_allreduce`` checks three things per shape, and the second
 matters more than the first:
@@ -43,8 +41,9 @@ see a read of a stale inbox slot: the stale data is the right answer. The
 slots are re-armed rather than flagged, so the run also feeds the kernel the
 NaN pattern it uses as a sentinel.
 
-``--extended`` runs the spot-check configurations at every world size, and the
-spot-check shapes on the production engine too.
+``--extended`` adds what production does not run: spot checks of pinned
+configurations no shipped rung uses, at every world size, and the spot-check
+shapes on the production engine too.
 
 **bench** times the one-shot (``flydsl``) against the stock kernels on the
 same payloads, all exact:
@@ -177,11 +176,11 @@ STOCK_SQNR_FLOOR_DB = 40.0
 # bench: DeepSeek-V4 decode shapes, timed next to the policy-derived payloads.
 BENCH_SHAPES = [(m, HIDDEN) for m in (1, 2, 4, 8)]
 
-# (tp, knobs): pinned configurations a default run spot-checks next to the
-# shipped ladder, one world size each, for widths no shipped rung uses yet.
-# Block 512 is the widest workgroup; at atoms=4 it is a 32 KiB tile, so every
-# spot shape is a single partial tile. ``--extended`` runs each at every world
-# size.
+# (tp, knobs): pinned configurations that ``--extended`` spot-checks next to
+# the shipped ladder, for widths no shipped rung uses yet. It runs each at every
+# world size; the tp is the one each was written for. Block 512 is the widest
+# workgroup; at atoms=4 it is a 32 KiB tile, so every spot shape is a single
+# partial tile.
 SPOT_CONFIGS = (
     (
         4,
@@ -897,12 +896,10 @@ def _verify(args, tps, dts, configs, given, link) -> None:
         if ladder and given is None:
             _WINDOWS[_key(tp, {})] = window
             coverage.append((tp, f"{window[0]}..{window[1]} B"))
-    # Nothing pinned on the command line: the shipped ladder, plus spot checks
-    # of the widths it does not use yet.
-    if ladder:
-        spot = [(tp, knobs) for tp, knobs in SPOT_CONFIGS if tp in tps]
-        if args.extended:
-            spot = [(tp, knobs) for tp in tps for _tp, knobs in SPOT_CONFIGS]
+    # Nothing pinned on the command line: with --extended, spot checks of the
+    # widths the shipped ladder does not use, next to it.
+    if ladder and args.extended:
+        spot = [(tp, knobs) for tp in tps for _tp, knobs in SPOT_CONFIGS]
         spawns += [(tp, dict(knobs), given or SPOT_SHAPES) for tp, knobs in spot]
     rows = []
     for tp, knobs, shapes in spawns:
@@ -1029,8 +1026,9 @@ def main():
     parser.add_argument(
         "--extended",
         action="store_true",
-        help="verify: run the spot-check configurations at every world size,\n"
-        "and the spot-check shapes on the shipped ladder too.",
+        help="verify: also run what production does not: the spot-check\n"
+        "configurations at every world size, and the spot-check shapes on the\n"
+        "shipped ladder.",
     )
     fab.add_bench_args(parser)
     args = parser.parse_args()
