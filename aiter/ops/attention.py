@@ -546,6 +546,28 @@ def pa_reduce_v1(
     )
 
 
+@compile_ops(
+    "module_attention_ps_reduce_asm", fc_name="attention_ps_reduce", ffi_type="ctypes"
+)
+def _attention_ps_reduce_asm(
+    partial_output: torch.Tensor,
+    partial_lse: torch.Tensor,
+    reduce_indptr: torch.Tensor,
+    reduce_final_map: torch.Tensor,
+    reduce_partial_map: torch.Tensor,
+    max_seqlen_q: int,
+    final_output: torch.Tensor,
+    final_lse: torch.Tensor | None = None,
+) -> None:
+    """Merge compatible PS-mode split-attention outputs and LSE on gfx950.
+
+    Partial output/LSE must be contiguous FP32 tensors with compatible int32
+    reduction maps on the output device. Output is BF16/FP16 [queries, heads,
+    128]; optional final LSE is FP32. The producer must follow the same partial
+    layout and LSE convention. No paged-KV or causal-mask inputs are consumed.
+    """
+
+
 def pa_persistent_fwd(
     Q: torch.Tensor,  # [sum_qlen, kv_heads * gqa + kv_heads * 2, head_dim]
     K: torch.Tensor,  # [num_blocks, kv_heads, head_dim / x, block_size, x]
@@ -569,6 +591,13 @@ def pa_persistent_fwd(
     quant_type: QuantType = QuantType.per_Token,
     high_precision: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run persistent attention and merge only materialized partial outputs.
+
+    Work records with partial index -1 write directly to output. Their final
+    LSE remains NaN because the forward kernel does not produce it. Empty
+    reduction maps skip the reducer; preallocated GPU maps are handled on
+    device without reading metadata back to the host.
+    """
     device = Q.device
     total_s, nhead, v_head_dim = output.shape
     if softmax_scale is None:
@@ -583,7 +612,9 @@ def pa_persistent_fwd(
         dtype=dtypes.fp32,
         device=device,
     )
-    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
+    final_lse = torch.full(
+        (total_s, nhead), float("nan"), dtype=dtypes.fp32, device=device
+    )
 
     pa_ps_fwd_asm(
         Q,
@@ -606,7 +637,20 @@ def pa_persistent_fwd(
         high_precision=high_precision,
         quant_type=quant_type,
     )
-    pa_reduce_v1(
+    if reduce_partial_map.numel() == 0 or reduce_indptr.numel() == 1:
+        return logits, final_lse
+
+    reduce_fn = pa_reduce_v1
+    if (
+        K.shape[3] == 16
+        and v_head_dim == 128
+        and output.dtype in (dtypes.bf16, dtypes.fp16)
+        and reduce_final_map is not None
+        and torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
+        == "gfx950"
+    ):
+        reduce_fn = _attention_ps_reduce_asm
+    reduce_fn(
         logits,
         splitLse,
         reduce_indptr,
