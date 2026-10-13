@@ -91,7 +91,7 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1 \
     --data-format a8w4 \
     --experts 96 \
     --topk 6 \
-    --model-dim 7168 \
+    --model-dim 3072 \
     --inter-dim 3072 \
     --tokens 1 16 64 256 1024 4096 16384 \
   2>&1 | tee $LOGDIR/01_moe_flydsl_a8w4.log || true
@@ -109,7 +109,7 @@ AITER_FLYDSL_MOE_EXPERT_SCHEDULING_MODE=1 \
     --data-format a4w4 \
     --experts 96 \
     --topk 6 \
-    --model-dim 7168 \
+    --model-dim 3072 \
     --inter-dim 3072 \
     --tokens 1 16 64 256 1024 4096 16384 \
   2>&1 | tee $LOGDIR/02_moe_flydsl_a4w4.log || true
@@ -121,8 +121,13 @@ echo "=== [3/13] MoE decode (Gluon, a4w4) ==="
 HIP_VISIBLE_DEVICES=0 \
   python op_tests/op_benchmarks/triton/bench_moe_gemm_a4w4_cudagraph.py \
     --backend gluon \
-    --shape 2880 5760 \
-    --experts 128 4 \
+    --M 1 16 64 256 1024 4096 16384 \
+    --shape 3072 6144 \
+    --experts 96 6 \
+    --preshuffle \
+    --fused-quant \
+    --routed-experts 96 \
+    --balance \
   2>&1 | tee $LOGDIR/03_moe_gluon_a4w4.log || true
 echo "[3/13] exit=$?" >> $SUMMARY
 echo ""
@@ -197,14 +202,17 @@ HIP_VISIBLE_DEVICES=0 \
 echo "[8/13] exit=$?" >> $SUMMARY
 echo ""
 
-# 9. BMM bf16 (Gluon) — single GPU
-echo "=== [9/13] BMM bf16 (Gluon) ==="
+# 9. BMM bf16 (Gluon; time, throughput, bandwidth) — single GPU
+echo "=== [9/13] BMM bf16 (Gluon; time, throughput, bandwidth) ==="
 for b in 4 8 16; do
   for m in 1 16 64 256 1024 4096 16384; do
-    HIP_VISIBLE_DEVICES=0 \
-      python op_tests/op_benchmarks/triton/bench_batched_gemm_bf16.py \
-        --shape $b $m 1024 4096 \
-        --metric time || true
+    for metric in time throughput bandwidth; do
+      echo "--- B=$b M=$m N=1024 K=4096 metric=$metric ---"
+      HIP_VISIBLE_DEVICES=0 \
+        python op_tests/op_benchmarks/triton/bench_batched_gemm_bf16.py \
+          --shape $b $m 1024 4096 \
+          --metric $metric || true
+    done
   done
 done 2>&1 | tee $LOGDIR/09_bmm_gluon.log
 echo "[9/13] done" >> $SUMMARY
