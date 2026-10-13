@@ -108,6 +108,7 @@ def compile_mixed_fhmoe_gemm2(
     b_nt: int = 0,
     xcd_swizzle: int = 0,
     shared_expert_id: int,
+    use_global_a: bool = True,
 ):
     """Compile a stage2 kernel with an FP8 shared expert."""
     if shared_expert_id is None:
@@ -136,6 +137,7 @@ def compile_mixed_fhmoe_gemm2(
         sort_block_m=sort_block_m,
         waves_per_eu=waves_per_eu,
         use_async_copy=use_async_copy,
+        use_global_a=use_global_a,
         cu_num_mul=cu_num_mul,
         b_nt=b_nt,
         xcd_swizzle=xcd_swizzle,

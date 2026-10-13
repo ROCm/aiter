@@ -13,7 +13,7 @@ set -euo pipefail
 # Per-invocation scratch dir. Fixed /tmp paths collide: two reviews running at once
 # overwrite each other's pr.diff between the write and the read, and the second review
 # silently analyses the first one's diff under its own PR number. Observed.
-WORK=$(mktemp -d /tmp/review-pr-XXXXXX)
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/review-pr-XXXXXX")
 PROJECT_ROOT=$(git rev-parse --show-toplevel) || {
   echo "review-pr must run inside the repository that owns .claude/skills" >&2
   exit 1
@@ -905,9 +905,11 @@ rm -f "$WORK/.err"
 # breakage happens.
 git -C "$PROJECT_ROOT" cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null \
   || git -C "$PROJECT_ROOT" fetch -q "$REPO_URL" "$BASE_SHA" 2>/dev/null || true
-# Day-old worktrees are finished reviews; drop them, or this accumulates 182M each.
+# Day-old worktrees are finished reviews; drop them, or this accumulates 182M each. Scoped
+# to this box's scratch base (${TMPDIR:-/tmp}) so a user worktree merely named review-pr-*
+# elsewhere is never force-removed.
 git -C "$PROJECT_ROOT" worktree list --porcelain 2>/dev/null \
-  | sed -n 's|^worktree \(/tmp/review-pr-.*\)$|\1|p' \
+  | sed -n "s|^worktree \(${TMPDIR:-/tmp}/review-pr-.*\)\$|\1|p" \
   | while IFS= read -r w; do
       # `if`, not an `&&` chain: the chain's status is the loop's, so a worktree NEWER
       # than a day made the while return 1 and `set -euo pipefail` kill the script, before

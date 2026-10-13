@@ -6,7 +6,7 @@
 #pragma once
 
 #include "../opus_gemm_utils.cuh"
-#include "opus_gemm_traits_a16w16_gfx950.cuh"  // opus_splitk_ws_handle
+#include "opus_gemm_traits_a16w16_gfx950.cuh"
 
 template<int BLOCK_SIZE_,
         typename BLOCK_,
@@ -108,7 +108,7 @@ struct opus_gemm_scale_kargs_gfx950 {
 struct opus_gemm_scale_splitk_kargs_gfx950 {
     const void* __restrict__ ptr_a;
     const void* __restrict__ ptr_b;
-    const opus_splitk_ws_handle* __restrict__ ws_handle;
+    void* __restrict__ ptr_ws;
     int m;
     int n;
     int k;

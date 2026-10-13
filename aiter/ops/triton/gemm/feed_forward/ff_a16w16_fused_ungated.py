@@ -43,7 +43,10 @@ def ff_a16w16_fused_ungated(
     """
 
     _LOGGER.info(
-        f"FF_A16W16_FUSED_UNGATED: x={tuple(x.shape)} w_up={tuple(w_up.shape)} w_down={tuple(w_down.shape) }"
+        "FF_A16W16_FUSED_UNGATED: x=%s w_up=%s w_down=%s",
+        tuple(x.shape),
+        tuple(w_up.shape),
+        tuple(w_down.shape),
     )
 
     # Shape checks

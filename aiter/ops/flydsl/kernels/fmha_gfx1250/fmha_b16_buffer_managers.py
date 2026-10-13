@@ -30,19 +30,15 @@ Contents:
 Target: gfx1250 (MI400 / mi450), wave32, 8 waves per threadgroup (256 threads).
 """
 
+import flydsl.compiler as flyc
 import flydsl.expr as fx
-from flydsl._mlir.dialects import llvm as llvm_dialect
-from flydsl._mlir.dialects import rocdl as rocdl_dialect
-from flydsl.compiler.ast_rewriter import ReplaceIfWithDispatch
-from flydsl.expr import arith, rocdl
+from flydsl.expr import rocdl
 from flydsl.expr.rocdl import tdm_ops
 
 from aiter.ops.flydsl.kernels import buffer_ops
 
 from ..kernels_common import create_llvm_ptr
-
-_scf_if_dispatch = ReplaceIfWithDispatch.scf_if_dispatch
-
+from ..tensor_shim import _to_raw as _ir
 
 # ============================================================================
 # Manager-intrinsic tiling constants (private — not the caller's config).
@@ -143,10 +139,11 @@ ENABLE_SCHED_MODE2 = True
 
 # ===========================================================================
 # Memory ops are emitted inline via the plain flydsl/rocdl intrinsics
-# (``create_llvm_ptr`` + ``llvm_dialect.load``/``store`` /
+# (``fx.ptr_load``/``ptr_store`` on aligned LDS pointers /
 # ``rocdl.ds_load_tr16_b128`` / ``buffer_ops.buffer_store``). There are no
-# wrapper helpers: under mode 2 the ``amdgpu-expert-scheduling-mode`` LLVM hint
-# makes LLVM insert all DEP_MODE=2 depctr covers itself for these SSA-visible ops,
+# memory-op wrapper helpers: under mode 2 the ``amdgpu-expert-scheduling-mode``
+# LLVM hint makes LLVM insert all DEP_MODE=2 depctr covers itself for these
+# SSA-visible ops,
 # so the same code is correct in both modes. NOTE: LDS reads (``ds_load``) MUST be
 # these plain intrinsics — never opaque inline asm — or LLVM cannot see the RAW
 # against the opaque async global->LDS store and mis-orders it under DEP_MODE=2
@@ -154,9 +151,12 @@ ENABLE_SCHED_MODE2 = True
 # ===========================================================================
 
 
-def _ir(x):
-    """Unwrap an fx value to its raw MLIR ir.Value (pass-through if already raw)."""
-    return x.ir_value() if hasattr(x, "ir_value") else x
+def _lds_ptr_b128(addr):
+    """A 16-byte-aligned byte pointer for one LDS b128 access."""
+    ptr_ty = fx.PointerType.get(
+        fx.Int8.ir_type, fx.AddressSpace.Shared, alignment=_CHUNK_BYTES
+    )
+    return fx.inttoptr(ptr_ty, fx.Int32(addr))
 
 
 def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
@@ -191,13 +191,12 @@ def _async_load_to_lds(gptrs, lds_ptrs, *, cluster, imm_offs=None):
 
     for gptr, lds_ptr, imm in zip(gptrs, lds_ptrs, imm_offs):
         if cluster:
-            # FlyDSL 0.3.x b128 op takes (gptr, lds_ptr, offset, mask); its
-            # expr.rocdl.cluster_load_async_to_lds wrapper still passes the old
-            # positional order, so call the dialect op directly with a 0 mask.
+            # The generic wrapper in FlyDSL 0.3.2 uses an older argument order.
+            # The public b128 overload preserves (gptr, lds_ptr, offset, mask).
             mask0 = _ir(fx.Int32(0))
-            rocdl_dialect.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
+            rocdl.cluster_load_async_to_lds_b128(gptr, lds_ptr, imm, mask0)
         else:
-            rocdl_dialect.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
+            rocdl.global_load_async_to_lds_b128(gptr, lds_ptr, imm)
 
 
 # ============================================================================
@@ -336,7 +335,7 @@ class QManager16bV1:
 
     def ds_load_ptrs(self, *, lds_q_base, lane_idx):
         """LDS (address-space 3) pointers for EVERY ``ds_load_b128`` read of this warp's
-        Q tile, ready to hand to ``llvm_dialect.load`` with no further address math.
+        Q tile, ready to hand to ``fx.ptr_load`` with no further address math.
 
         Returns a flat list of ``k_tiles`` x 2 (lo, hi) = 8 / 12 / 16 read pointers:
         read ``2t`` is tile ``t``'s low 8-col half, read ``2t+1`` its high half; the
@@ -349,8 +348,8 @@ class QManager16bV1:
             slot = tile % self.lds_tiles  # match global_load_ptrs ring slot
             lo = lds_q_base + self._lds_byte(row, klane, slot)
             hi = lds_q_base + self._lds_byte(row, klane + 2, slot)
-            ptrs.append(create_llvm_ptr(lo, address_space=3))
-            ptrs.append(create_llvm_ptr(hi, address_space=3))
+            ptrs.append(_lds_ptr_b128(lo))
+            ptrs.append(_lds_ptr_b128(hi))
         return ptrs
 
     def load_q_to_vgpr_part1(
@@ -674,7 +673,7 @@ class KManager16bV1:
             chunk_base = (col_idx % _WMMA_K) // _CHUNK_ELEMS  # 0 or 2
             chunk = fx.Int32(chunk_base) + col_half
             off = ptr_lds + self._lds_byte(0, 0, row_in_tile, chunk)
-            bases.append(create_llvm_ptr(off, address_space=3))
+            bases.append(_lds_ptr_b128(off))
         return bases
 
     def load_k_to_reg(self, base_ptrs, lds_imm_offset=0):
@@ -694,8 +693,8 @@ class KManager16bV1:
                 for half in range(2):
                     p = base_ptrs[half]
                     if imm:
-                        p = buffer_ops.get_element_ptr(p, static_byte_offset=imm)
-                    out.append(fx.Vector(llvm_dialect.load(v8_ty, p)))
+                        p = fx.add_offset(p, imm)
+                    out.append(fx.ptr_load(p, result_type=v8_ty))
         return out
 
 
@@ -1135,20 +1134,16 @@ class QManager16bV2:
             + (lane % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base = create_llvm_ptr(lane_base, address_space=3)
+        base = _lds_ptr_b128(lane_base)
         q_frags_list = [[] for _ in range(self.q_tiles_per_wave)]
         for qt in range(self.q_tiles_per_wave):
             for tile in range(self.k_tiles):
                 imm_lo = qt * _WMMA_M * self.row_bytes + tile * _WMMA_K * _BF16_BYTES
                 imm_hi = imm_lo + _WMMA_M * _BF16_BYTES
-                p_lo = (
-                    base
-                    if imm_lo == 0
-                    else buffer_ops.get_element_ptr(base, static_byte_offset=imm_lo)
-                )
-                p_hi = buffer_ops.get_element_ptr(base, static_byte_offset=imm_hi)
-                lo = fx.Vector(llvm_dialect.load(v8_ty, p_lo))
-                hi = fx.Vector(llvm_dialect.load(v8_ty, p_hi))
+                p_lo = base if imm_lo == 0 else fx.add_offset(base, imm_lo)
+                p_hi = fx.add_offset(base, imm_hi)
+                lo = fx.ptr_load(p_lo, result_type=v8_ty)
+                hi = fx.ptr_load(p_hi, result_type=v8_ty)
                 q_frags_list[qt].append(lo.shuffle(hi, list(range(16))) * scale_bf16)
         return q_frags_list
 
@@ -1214,7 +1209,7 @@ class KManager16bV2:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        return [create_llvm_ptr(lane_base, address_space=3)]
+        return [_lds_ptr_b128(lane_base)]
 
     def load_k_to_reg(self, base_ptrs, lds_imm_offset=0):
         """Burst all K ``ds_load_b128`` from the row-major padded block, in ``_qk_gemm``
@@ -1235,8 +1230,8 @@ class KManager16bV2:
                     )
                     p = base
                     if imm:
-                        p = buffer_ops.get_element_ptr(base, static_byte_offset=imm)
-                    out.append(fx.Vector(llvm_dialect.load(v8_ty, p)))
+                        p = fx.add_offset(base, imm)
+                    out.append(fx.ptr_load(p, result_type=v8_ty))
         return out
 
 
@@ -1467,7 +1462,7 @@ class OManager16bV1:
             fx.Int64(q_start + q_len) * fx.Int64(stride_o_seq) * fx.Int64(_BF16_BYTES)
         )
         o_rsrc = buffer_ops.create_buffer_resource(
-            ptr_O, num_records_bytes=arith.unwrap(o_num_records_bytes)
+            ptr_O, num_records_bytes=_ir(o_num_records_bytes)
         )
         lds_warp = ptr_lds + warp_idx * self._warp_stride
         q_st = lane_idx % _WMMA_M
@@ -1504,8 +1499,8 @@ class OManager16bV1:
                 d_col = d_half + fx.Int32(kk * _WMMA_M)  # slot-local column
                 bf = o_frags[k].to(self.elem_dtype)
                 addr = lds_warp + self._lds_byte(slot, q_st, d_col)
-                lds_ptr = create_llvm_ptr(addr, address_space=3)
-                llvm_dialect.store(_ir(bf), lds_ptr, alignment=_CHUNK_BYTES)
+                lds_ptr = _lds_ptr_b128(addr)
+                fx.ptr_store(_ir(bf), lds_ptr)
                 last = issued
                 issued += 1
             unit_last_store[u] = last
@@ -1525,8 +1520,8 @@ class OManager16bV1:
                 q_out = f // G  # q-row within this warp [0,16)
                 d_local = (f % G) * _CHUNK_ELEMS
                 addr = lds_warp + self._lds_byte(slot, q_out, d_local)
-                lds_ptr = create_llvm_ptr(addr, address_space=3)
-                data = fx.Vector(llvm_dialect.load(v8_ty, lds_ptr))
+                lds_ptr = _lds_ptr_b128(addr)
+                data = fx.ptr_load(lds_ptr, result_type=v8_ty)
                 loaded.append((data, q_out, d_local))
                 gidxs.append(issued)
                 issued += 1
@@ -1644,16 +1639,12 @@ class OManager16bV2:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base_ptr = create_llvm_ptr(lane_base, address_space=3)
+        base_ptr = _lds_ptr_b128(lane_base)
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)
             imm = k * _WMMA_M * _BF16_BYTES
-            p = (
-                base_ptr
-                if imm == 0
-                else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
-            )
-            llvm_dialect.store(_ir(bf), p, alignment=_CHUNK_BYTES)
+            p = base_ptr if imm == 0 else fx.add_offset(base_ptr, imm)
+            fx.ptr_store(_ir(bf), p)
         rocdl.s_wait_dscnt(0)  # drain b128 stores so the TDM read sees coherent LDS
 
         # (2) TDM store: private padded LDS tile -> global O (HW OOB drop on the seq axis).
@@ -1738,8 +1729,8 @@ class OManager16bV3:
     Accumulator (d-tile k, lane l = ``O[q=l%16, d=16k+(l//16)*8+{0..7}]``) -> row-major PADDED LDS
     ``[16, v_hdim]`` (row stride v_hdim+_O_PAD_ELEMS). Then the 16 x (v_hdim/8) b128 chunks are stored
     LDS->global over ``n_rounds`` waves of 32 lanes: round r lane l -> chunk c=r*32+l, row=c//cpr,
-    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global). Rows with
-    seq>=q_len are EXEC-masked off (async store has no bounds; ``scf_if_dispatch`` per lane).
+    d_chunk=c%cpr (cpr = v_hdim/8) -> coalesced (consecutive lanes = consecutive global).
+    Rows at seq>=q_len are masked off because async stores have no bounds check.
     """
 
     def __init__(
@@ -1807,16 +1798,12 @@ class OManager16bV3:
             + (lane_idx % _WMMA_M) * fx.Int32(self.row_bytes)
             + (lane_idx // _WMMA_M) * fx.Int32(_CHUNK_ELEMS * _BF16_BYTES)
         )
-        base_ptr = create_llvm_ptr(lane_base, address_space=3)
+        base_ptr = _lds_ptr_b128(lane_base)
         ds_ops = []
         for k in range(self.d_tiles):
             bf = o_frags[k].to(self.elem_dtype)  # cvt
             imm = k * _WMMA_M * _BF16_BYTES
-            p = (
-                base_ptr
-                if imm == 0
-                else buffer_ops.get_element_ptr(base_ptr, static_byte_offset=imm)
-            )
+            p = base_ptr if imm == 0 else fx.add_offset(base_ptr, imm)
             ds_ops.append((bf, p))
         self._pending.append(ds_ops)
         if qtile == 0:
@@ -1842,7 +1829,7 @@ class OManager16bV3:
         rocdl.sched_barrier(0)
         for ds_ops in self._pending:
             for bf, p in ds_ops:
-                llvm_dialect.store(_ir(bf), p, alignment=_CHUNK_BYTES)
+                fx.ptr_store(_ir(bf), p)
         addrs, valid_rows = self._warp_addrs(
             self._warp_region, self._warp_base, **self._cfg
         )
@@ -1851,11 +1838,13 @@ class OManager16bV3:
             0
         )  # all ds_stores landed (every async row reads a full padded row)
 
-        def _burst(*_a):
-            for gdst, lsrc in addrs:
-                rocdl_dialect.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
+        @flyc.jit
+        def _burst():
+            if valid_rows > fx.Int32(0):
+                for gdst, lsrc in addrs:
+                    rocdl.global_store_async_from_lds_b128(_ir(gdst), _ir(lsrc), 0)
 
-        _scf_if_dispatch(valid_rows > fx.Int32(0), _burst)  # skip a fully-OOB warp
+        _burst()
         # No s_wait_asynccnt: HW drains the async stores' LDS reads at workgroup retire.
         self._pending = []
 

@@ -15,6 +15,17 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `test_asm_splitk_guard.py` | 1 | No | `GemmTuner.asm_gemm_all_solutions` SplitK semaphore grid guard |
 | `test_run_config.py` | 2 | Yes | Run --run_config on ALL existing tuned CSVs (configs + model_configs) |
 
+## CI coverage
+
+Fast deterministic tuning validation is part of the normal pull-request test
+sharding through `.github/scripts/split_tests.sh`. That gate includes CSV
+validation, shape-collision checks, and the mixed-MXFP tuner unit tests.
+
+The full Level 0+1 workflow repeats the broader CPU suite on its daily/manual
+schedule. GPU tuner-pipeline and all-shape `--run_config` validation remain
+scheduled/manual because they require gfx950 and have substantially longer
+runtime budgets.
+
 ## Tuner family coverage
 
 | Family | Tuner script | Tuned CSVs validated | run_config | pipeline |
@@ -29,6 +40,11 @@ Minimal test suite for validating the aiter tuning infrastructure.
 | `fmoe` | `csrc/ck_gemm_moe_2stages_codegen/gemm_moe_tune.py` | `tuned_fmoe.csv` + model_configs | ✓ | ✓ (bf16/fp8/int8/gelu) |
 | `gradlib_bf16` | `gradlib/gradlib/gemm_tuner.py` | `bf16_tuned_gemm.csv` | ✓ | ✓ (hipBLASLt/ASM/FlyDSL) |
 | `gdn_k5_opt` | `csrc/gdn_k5/chunk_gdn_h_opt_tune.py` | `model_configs/*_chunk_gdn_h_opt_tuned.csv` | ✓ | ✓ (shape-only varlen smoke) |
+
+Mixed-MXFP coverage is provided by
+`csrc/gemm_a6w4/gemm_a6w4_tune.py` and
+`csrc/gemm_a4w6/gemm_a4w6_tune.py`. Both families have static CSV validation,
+runtime-config validation, and single-/multi-GPU pipeline smoke tests.
 
 ## Config resolution
 
@@ -47,6 +63,7 @@ If `AITER_CONFIGS` is unavailable (e.g. aiter not installed), the test falls bac
 python3 -m unittest op_tests.tuning_tests.test_csv_validation \
   op_tests.tuning_tests.test_tuner_infra \
   op_tests.tuning_tests.test_mp_tuner_logic \
+  op_tests.tuning_tests.test_mixed_mxfp_tuning \
   op_tests.tuning_tests.test_online_tune -v
 
 # Level 2: pipeline smoke (~10min)
@@ -105,6 +122,9 @@ TUNE_TEST_CONFIG="aiter/configs/a8w8_blockscale_tuned_gemm.csv:aiter/configs/mod
 python3 -m unittest op_tests.tuning_tests.test_run_config.TestRunConfigCustom -v
 ```
 
-Available families: `a8w8`, `a8w8_bpreshuffle`, `a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`, `batched_a8w8`, `batched_bf16`, `fmoe`, `gradlib_bf16`, `gdn_k5_opt`
+Available families include `a8w8`, `a8w8_bpreshuffle`,
+`a8w8_blockscale`, `a8w8_blockscale_bpreshuffle`, `a4w4_blockscale`,
+`a6w4_asm`, `a4w6_asm`, `batched_a8w8`, `batched_bf16`,
+`fmoe`, `gradlib_bf16`, and `gdn_k5_opt`.
 
 The test checks both **exit code** and **per-shape status** — shapes with `ERROR` (kernel crash) or `MISMATCH` (accuracy exceeded errRatio) will fail the test.

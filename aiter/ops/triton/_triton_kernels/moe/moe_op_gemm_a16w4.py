@@ -129,6 +129,8 @@ def _moe_gemm_a16w4(
     ExptOffs,
     ExptOffsSum,
     ExptData,
+    # expert-parallel: global->local expert id map (-1 = not on this rank)
+    ExpertMap,
     # true grid size
     grid_m,
     grid_n,
@@ -140,6 +142,7 @@ def _moe_gemm_a16w4(
     SWIGLU_ADD_RESIDUAL: tl.constexpr,
     # MoE config
     N_EXPTS_ACT: tl.constexpr,
+    HAS_EXPERT_MAP: tl.constexpr,
     # optimization config
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
@@ -221,7 +224,17 @@ def _moe_gemm_a16w4(
     block_id = expt_data >> 16
     M = tl.load(ExptHist + expt_id)
     start_m = tl.load(ExptOffs + expt_id)
+    # Expert parallelism: routing metadata is global, weights are local to this
+    # rank. Remap the weight expert id; skip (-1) experts not on this rank (their
+    # output region stays 0, which the wrapper zero-inits, so combine is correct).
+    if HAS_EXPERT_MAP:
+        w_expt_id = tl.load(ExpertMap + expt_id)
+        if w_expt_id < 0:
+            return
+    else:
+        w_expt_id = expt_id
     expt_id, block_id = expt_id.to(index_type), block_id.to(index_type)
+    w_expt_id = w_expt_id.to(index_type)
     start_m = start_m.to(index_type)
     pid_n, pid_k = pid_n.to(index_type), pid_k.to(index_type)
 
@@ -247,7 +260,7 @@ def _moe_gemm_a16w4(
     PACKED_BLOCK_N_W: tl.constexpr = BLOCK_N // W_N_DIVISOR
     MX_SCALE_BLOCK_K: tl.constexpr = BLOCK_K // MX_PACK_DIVISOR
 
-    WMxScale += expt_id * stride_w_mx_e
+    WMxScale += w_expt_id * stride_w_mx_e
     if SWIZZLE_MX_SCALE == "CDNA4_SCALE":
         tl.static_assert(stride_w_mx_k is not None)
         tl.static_assert(stride_w_mx_n is not None)
@@ -276,7 +289,7 @@ def _moe_gemm_a16w4(
         PACKED_BLOCK_N_W,
     )
     offs_w_k = PACKED_BLOCK_K_W * pid_k + tl.arange(0, PACKED_BLOCK_K_W)
-    W += expt_id * stride_w_e
+    W += w_expt_id * stride_w_e
     WPtrs = W + (
         offs_w_k.to(index_type)[:, None] * stride_w_k
         + offs_w_n.to(index_type)[None, :] * stride_w_n
@@ -341,7 +354,7 @@ def _moe_gemm_a16w4(
     mask_m = offs_m < M
     mask_n = offs_y_n < N
     if B is not None:
-        BPtrs = B + expt_id * stride_b_e + offs_y_n
+        BPtrs = B + w_expt_id * stride_b_e + offs_y_n
         if pid_k == 0:
             bias = tl.load(BPtrs, mask=mask_n, other=0, cache_modifier=W_CACHE_MODIFIER)
         else:

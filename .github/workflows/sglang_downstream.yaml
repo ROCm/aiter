@@ -173,6 +173,7 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             -e AITER_USE_SYSTEM_TRITON=1 \
+            -e SGLANG_SET_CPU_AFFINITY=0 \
             "${MODEL_ENV_ARGS[@]}" \
             ${EXTRA_EXEC_ARGS} \
             ${TEST_COMMAND} || TEST_EXIT_CODE=$?

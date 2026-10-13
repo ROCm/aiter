@@ -9,7 +9,7 @@ import triton
 from torch import Tensor
 
 from ..jit.core import compile_ops
-from .triton._triton_kernels.gated_delta_rule.utils.prefill_metadata import (
+from .triton._triton_kernels.gated_delta_net.utils.prefill_metadata import (
     GatedDeltaRulePrefillMetadata,
     build_gated_delta_rule_prefill_metadata,
 )
@@ -297,7 +297,7 @@ def chunk_gated_delta_rule_fwd_h_hip_fn(
     )
 
     if is_varlen:
-        from aiter.ops.triton._triton_kernels.gated_delta_rule.utils import (
+        from aiter.ops.triton._triton_kernels.gated_delta_net.utils import (
             prepare_chunk_offsets,
             prepare_rebased_cu_seqlens,
         )

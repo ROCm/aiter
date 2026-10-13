@@ -187,6 +187,56 @@ def test_gelu_fast(m, n, dtype, output_dtype=None):
     return ret
 
 
+def torch_relu2_ref(x: torch.Tensor) -> torch.Tensor:
+    r = torch.nn.functional.relu(x.float())
+    return r * r
+
+
+def relu2_wrapper(input: torch.Tensor) -> torch.Tensor:
+    out = torch.empty_like(input)
+    aiter.relu2(out, input)
+    return out
+
+
+@benchmark()
+def test_relu2(m, n, dtype, output_dtype=None):
+    ret = {}
+    input = torch.randn(m, 1, n, dtype=dtype, device="cuda")
+    out_dtype = output_dtype if output_dtype is not None else dtype
+    if out_dtype != dtype:
+        raise ValueError(
+            "test_relu2 does not support output_dtype != dtype: relu2_wrapper "
+            "always allocates `out` with the same dtype as `input` "
+            "(torch.empty_like(input)), so a differing output_dtype would "
+            "silently compare a mis-cast reference against a same-dtype "
+            "kernel output."
+        )
+
+    out, us_aiter = run_perftest(relu2_wrapper, input)
+    ref, us_torch = run_perftest(torch_relu2_ref, input)
+
+    # Always cast the fp32 reference down to the kernel's output dtype
+    # before comparing (torch_relu2_ref computes in fp32 via x.float()).
+    ref = ref.to(out_dtype)
+
+    err = checkAllclose(ref, out)
+
+    dtype_map = {torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16"}
+    ret["input_dtype"] = dtype_map.get(dtype, str(dtype))
+    ret["output_dtype"] = dtype_map.get(out_dtype, str(out_dtype))
+    ret["M"] = m
+    ret["N"] = n
+    ret["us"] = us_aiter
+    ret["torch_us"] = us_torch
+    ret["speedup_vs_torch"] = us_torch / us_aiter
+    ret["perf_gain_vs_torch_pct"] = (us_torch - us_aiter) / us_torch * 100.0
+    ret["TB/s"] = (input.nbytes + out.nbytes) / us_aiter / 1e6
+    ret["RD TB/s"] = (input.nbytes) / us_aiter / 1e6
+    ret["WR TB/s"] = (out.nbytes) / us_aiter / 1e6
+    ret["err"] = err
+    return ret
+
+
 def _dequant_fp8_group(q, s, group_size):
     m, n = q.shape
     return (
@@ -492,22 +542,32 @@ if df:
     aiter.logger.info("silu_and_mul_quant (fp8) summary (markdown):\n%s", df_md)
 
 # silu_and_mul_quant with fp4 (group_size=32)
-df = []
-for dtype in args.dtype:
-    for m in args.m:
-        for n in args.n:
-            d = n // 2
-            gs = 32
-            if d >= gs and d % gs == 0:
-                ret = test_silu_and_mul_quant(
-                    m, n, dtype, group_size=gs, output_dtype=dtypes.fp4x2
-                )
-                df.append(ret)
-if df:
-    df = pd.DataFrame(df)
-    df = df[quant_cols]
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("silu_and_mul_quant (fp4) summary (markdown):\n%s", df_md)
+# FP4 (e2m1) output uses CDNA4-only MFMA and is compiled in only for
+# gfx950/gfx1250. On other archs (e.g. gfx942/MI300A) the kernel is not
+# built, so skip instead of aborting inside the C++ dispatch.
+_fp4_gfx = aiter.get_gfx()
+if _fp4_gfx not in ("gfx950", "gfx1250"):
+    aiter.logger.info(
+        "skip silu_and_mul_quant (fp4): fp4 output requires gfx950/gfx1250, got %s",
+        _fp4_gfx,
+    )
+else:
+    df = []
+    for dtype in args.dtype:
+        for m in args.m:
+            for n in args.n:
+                d = n // 2
+                gs = 32
+                if d >= gs and d % gs == 0:
+                    ret = test_silu_and_mul_quant(
+                        m, n, dtype, group_size=gs, output_dtype=dtypes.fp4x2
+                    )
+                    df.append(ret)
+    if df:
+        df = pd.DataFrame(df)
+        df = df[quant_cols]
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("silu_and_mul_quant (fp4) summary (markdown):\n%s", df_md)
 
 # silu_and_mul_quant with fp8 + limit=10
 df = []
@@ -552,3 +612,29 @@ df = df[
 ]
 df_md = df.to_markdown(index=False)
 aiter.logger.info("gelu_fast summary (markdown):\n%s", df_md)
+
+df = []
+for dtype in args.dtype:
+    for m in args.m:
+        for n in args.n:
+            ret = test_relu2(m, n, dtype)
+            df.append(ret)
+df = pd.DataFrame(df)
+df = df[
+    [
+        "M",
+        "N",
+        "input_dtype",
+        "output_dtype",
+        "us",
+        "torch_us",
+        "speedup_vs_torch",
+        "perf_gain_vs_torch_pct",
+        "TB/s",
+        "RD TB/s",
+        "WR TB/s",
+        "err",
+    ]
+]
+df_md = df.to_markdown(index=False)
+aiter.logger.info("relu2 summary (markdown):\n%s", df_md)

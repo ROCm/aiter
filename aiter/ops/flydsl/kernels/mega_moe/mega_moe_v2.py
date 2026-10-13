@@ -13,6 +13,7 @@ from ..flydsl_dispatch_combine_intranode_op import (
     FlyDSLDispatchCombineConfig,
     FlyDSLDispatchCombineIntraNodeOp,
 )
+from . import envs
 from .dispatch import DISPATCH_TABLE_SIZE, DispatchSlot
 from .mega_moe_config import (
     INDEXED_PAYLOAD_MIN_MTPR,
@@ -31,11 +32,15 @@ __all__ = ["MegaMoEV2"]
 class MegaMoEV2:
     """Fused dispatch, GEMM1, GEMM2, and combine with one in-flight launch per instance."""
 
+    # forward(mask_invalid_slots=...) is accepted: combine can skip -1 top-k slots.
+    supports_combine_mask = True
+
     # fmt: off
     def __init__(self, *, rank: int, world_size: int, model_dim: int, inter_dim: int, experts: int, topk: int,
         quant: str, w1: torch.Tensor, w1_scale: torch.Tensor, w2: torch.Tensor, w2_scale: torch.Tensor,
-        max_tok_per_rank: int, mega_scheme: str = "fixedslot", swiglu_limit: float = 0.0,
-        fanout_masks: tuple[int, ...] = ()):
+        max_tok_per_rank: int, mega_scheme: str = "fixedslot", stage2_p2p_quant: str = "auto",
+        swiglu_limit: float = 0.0, fanout_masks: tuple[int, ...] = (),
+        act: str = "silu", situ_beta: float = 1.0, situ_linear_beta: float = 1.0):
     # fmt: on
         if quant != "a8w4":
             raise ValueError("MegaMoEV2 currently supports quant='a8w4' only")
@@ -53,9 +58,20 @@ class MegaMoEV2:
         if not 0 < self.topk <= 16:
             raise ValueError(f"MegaMoEV2 topk must be in [1, 16], got {self.topk}")
         self.mtpr = int(max_tok_per_rank)
+        self._a_dtype = "fp8"
+        self._a_torch_dtype = torch.float8_e4m3fn
+        self._a_view_dim = self.model_dim
         self.swiglu_limit = float(swiglu_limit)
+        self.act = act
+        self.situ_beta = float(situ_beta)
+        self.situ_linear_beta = float(situ_linear_beta)
+        if self.act not in ("silu", "situv2"):
+            raise ValueError(f"MegaMoEV2 act must be 'silu' or 'situv2', got {self.act!r}")
+        if self.act == "situv2" and (self.situ_beta <= 0.0 or self.situ_linear_beta <= 0.0):
+            raise ValueError("situv2 requires positive situ_beta / situ_linear_beta")
         self._bundle_plan = build_mega_moe_bundle_plan(
             self.mtpr,
+            p2p_quant=stage2_p2p_quant,
             experts_per_rank=self.epr,
             model_dim=self.model_dim,
             inter_dim=self.inter_dim,
@@ -80,7 +96,7 @@ class MegaMoEV2:
         self.comb_cfg = FlyDSLDispatchCombineConfig(rank=self.rank, world_size=self.world_size,
             hidden_dim=self.model_dim, max_num_inp_token_per_rank=self.mtpr, num_experts_per_rank=self.epr,
             num_experts_per_token=self.topk, combine_dtype=torch.bfloat16,
-            dispatch_dtype=torch.float8_e4m3fn, scale_dim=self._s1_scale_dim, scale_type_size=1,
+            dispatch_dtype=self._a_torch_dtype, scale_dim=self._s1_scale_dim, scale_type_size=1,
             enable_std_moe=False, enable_group_major=True, gm_unit_size=capacity_tile_m,
             gm_scheme=mega_scheme, gm_compact=compact,
             gm_indexed_payload=compact and self.mtpr >= INDEXED_PAYLOAD_MIN_MTPR,
@@ -93,7 +109,7 @@ class MegaMoEV2:
         self.w2_scale = w2_scale if w2_scale.is_contiguous() else w2_scale.contiguous()
         self._build_fused_stage1(w1, w1_scale)
         self._build_fused_stage2()
-        if os.environ.get("AITER_MEGA_MOE_PRELOAD", "0") == "1":
+        if envs.AITER_MEGA_MOE_PRELOAD:
             self.preload_aot_bundles()
 
     def preload_aot_bundles(self):
@@ -113,6 +129,13 @@ class MegaMoEV2:
         )
 
         self.sort_block_m = 32
+        # Opt-in hardware bounds checking for the Stage1 control buffers.  Off
+        # by default so production keeps today's descriptors; turn it on while
+        # sweeping configurations, where an indexing mistake would otherwise
+        # page-fault and can leave a GPU needing a privileged reset.
+        self._s1_bounds_check = (
+            os.environ.get("AITER_MEGA_MOE_BOUNDS_CHECK", "0") == "1"
+        )
         self._s1_w1 = w1.contiguous().view(torch.uint8)
         self._s1_w1_scale = w1_scale.contiguous().view(torch.uint8)
         op = self.comb_op._gm
@@ -162,7 +185,9 @@ class MegaMoEV2:
 
         inter_dim = self.inter_dim
         a2rows = self._s1_nvm
-        self._s1_out = torch.zeros((a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev)
+        self._s1_out = torch.zeros(
+            (a2rows, inter_dim), dtype=torch.float8_e4m3fn, device=self.dev
+        )
         prows = ((a2rows + 255) // 256) * 256
         pcols = (((inter_dim // 32) + 7) // 8) * 8
         self._s1_osd = torch.zeros(prows * pcols + inter_dim, dtype=torch.uint8, device=self.dev)
@@ -380,8 +405,6 @@ class MegaMoEV2:
                 config.prepare_quant_cu,
                 (quant_groups + 511) // 512,
             )
-            # Preload fused-quant and prequantized-input variants so both public
-            # forward paths remain AOT-only after warmup.
             for preload_quant_blocks in sorted({0, quant_blocks}):
                 self._s1_preload_prepare(
                     fx.Int64(self._s1_disp.data_ptr()),
@@ -444,6 +467,7 @@ class MegaMoEV2:
             tile_state_stride=self._s1_tile_state_stride,
             variants=self._bundle_plan.stage1_variants,
             swiglu_limit=self.swiglu_limit,
+            act=self.act, situ_beta=self.situ_beta, situ_linear_beta=self.situ_linear_beta,
         )
 
     def _select_config(self, tokens: int) -> MegaMoEConfig:
@@ -532,10 +556,10 @@ class MegaMoEV2:
         cur_tok = int(x.shape[0])
         if cur_tok > self.mtpr:
             raise ValueError(f"run_tokens={cur_tok} > max_tok_per_rank={self.mtpr}")
-        if x.dtype != torch.float8_e4m3fn or not x.is_contiguous():
-            raise ValueError("x must be contiguous float8_e4m3fn")
-        if tuple(x.shape) != (cur_tok, self.model_dim):
-            raise ValueError(f"x must have shape ({cur_tok}, {self.model_dim})")
+        if x.dtype != self._a_torch_dtype or not x.is_contiguous():
+            raise ValueError(f"x must be contiguous {self._a_torch_dtype}")
+        if tuple(x.shape) != (cur_tok, self._a_view_dim):
+            raise ValueError(f"x must have shape ({cur_tok}, {self._a_view_dim})")
         if wts.dtype != torch.float32 or not wts.is_contiguous():
             raise ValueError("wts must be contiguous float32")
         if tuple(wts.shape) != (cur_tok, self.topk):
@@ -587,6 +611,10 @@ class MegaMoEV2:
             "fixed_slot_dispatch": self._s1_fixed_slot,
             "num_cu": self._s1_num_cu,
             "swiglu_limit": self.swiglu_limit,
+            "act": self.act,
+            "situ_beta": self.situ_beta,
+            "situ_linear_beta": self.situ_linear_beta,
+            "bounds_check": self._s1_bounds_check,
         }
         entry = self._active_bundle_entry
         use_bundle = (
@@ -632,7 +660,7 @@ class MegaMoEV2:
             # A zero-token rank still participates in the downstream
             # collectives, but HIP rejects a zero-grid quant kernel launch.
             return self._s1_quant_x[:0], self._s1_quant_scale[:0]
-        return per_1x32_mx_quant(x_bf16, quant_mode="fp8")
+        return per_1x32_mx_quant(x_bf16, quant_mode=self._a_dtype)
 
     def _run_joint(
         self,
@@ -646,9 +674,15 @@ class MegaMoEV2:
         *,
         config=None,
         prepared=False,
+        mask_invalid_slots=None,
     ):
         if config is None:
             config = self._select_config(run_tokens)
+        # Combine skips top-k slots with id -1 (never dispatched, so their partial
+        # is stale). The check costs prefill time, so it runs only when the
+        # caller says ids may be -1.
+        if mask_invalid_slots is None:
+            mask_invalid_slots = self._combine_mask
         self._run_fused_stage1(
             x,
             wts,
@@ -658,14 +692,20 @@ class MegaMoEV2:
             config=config.stage1,
             prepared=prepared,
         )
-        return self._run_stage2(run_tokens, stream, slice_output, config)
+        combine_ids = topk_ids if mask_invalid_slots else None
+        return self._run_stage2(run_tokens, stream, slice_output, config, combine_ids)
 
-    def _run_stage2(self, run_tokens, stream, slice_output, config: MegaMoEConfig):
+    def _run_stage2(
+        self, run_tokens, stream, slice_output, config: MegaMoEConfig, combine_ids=None
+    ):
+        """``combine_ids``: the top-k ids, when combine must skip their -1 slots."""
         if config.stage2.aligned_pair:
             return self._run_aligned_pair_stage2(
-                run_tokens, config, stream, slice_output
+                run_tokens, config, stream, slice_output, combine_ids
             )
-        ret = self._run_fused_stage2(run_tokens, config, stream)
+        ret = self._run_fused_stage2(
+            run_tokens, config, stream, combine_ids=combine_ids
+        )
         return self._stage2_output(ret, run_tokens, slice_output)
 
     def _stage2_output(self, result, run_tokens, slice_output):
@@ -681,7 +721,11 @@ class MegaMoEV2:
             )
         return out_tok[:run_tokens] if slice_output else out_tok
 
-    def forward(self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward(
+        self, x_bf16, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
+        """``mask_invalid_slots``: ids may contain -1 (skipped, contributing zero).
+        None defers to AITER_MEGA_COMBINE_MASK (default off)."""
         run_tokens = int(x_bf16.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
@@ -694,7 +738,8 @@ class MegaMoEV2:
         if self._s1_fixed_slot:
             x_q, scales = self.quantize(x_bf16)
             return self._run_joint(
-                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output
+                x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+                mask_invalid_slots=mask_invalid_slots,
             )
 
         config = self._select_config(run_tokens)
@@ -722,13 +767,19 @@ class MegaMoEV2:
             slice_output,
             config=config,
             prepared=True,
+            mask_invalid_slots=mask_invalid_slots,
         )
 
-    def forward_prequant(self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True):
+    def forward_prequant(
+        self, x_q, scales, wts, topk_ids, *, stream=None, slice_output=True, mask_invalid_slots=None
+    ):
         run_tokens = int(x_q.shape[0])
         if run_tokens > self.mtpr:
             raise ValueError(f"run_tokens={run_tokens} > max_tok_per_rank={self.mtpr}")
-        return self._run_joint(x_q, scales, wts, topk_ids, run_tokens, stream, slice_output)
+        return self._run_joint(
+            x_q, scales, wts, topk_ids, run_tokens, stream, slice_output,
+            mask_invalid_slots=mask_invalid_slots,
+        )
 
     forward_bf16 = forward
     __call__ = forward
@@ -744,6 +795,8 @@ class MegaMoEV2:
         )
 
         FlyDSLDispatchCombineIntraNodeOp._ENABLE_COMBINE_NO_STAGE1 = True
+        # Default of forward(mask_invalid_slots=...).
+        self._combine_mask = envs.AITER_MEGA_COMBINE_MASK
         comb_cfg = self.comb_cfg
         dev = torch.device("cuda", comb_cfg.rank)
         k = comb_cfg.num_experts_per_token
@@ -772,6 +825,7 @@ class MegaMoEV2:
                 "comb_inp_nbytes": int(comb_cfg.max_num_inp_token_per_rank) * int(k) * p2p_row_nbytes,
                 "HIDDEN_MAX": int(comb_cfg.hidden_dim), "INTER_MAX": int(self.inter_dim), "cu_num": int(cu_num),
                 "p2p_quant_type": p2p_quant, "fixed_slot_dispatch": bool(self._s1_fixed_slot),
+                "a_dtype": self._a_dtype,
             }
         self._g2_combine_placeholder = torch.empty(
             1, comb_cfg.hidden_dim, dtype=comb_cfg.combine_dtype, device=dev
@@ -808,8 +862,10 @@ class MegaMoEV2:
             BK=stage2.block_k,
             use_nt=stage2.use_nt,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
             g2_spart=stage2.spatial_partition,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
             persist=stage2.persist,
             persist_cu=stage2.persist_cu,
             persist_strided=stage2.persist_strided,
@@ -875,7 +931,10 @@ class MegaMoEV2:
             use_nt=stage2.use_nt,
             cu_num=stage2.pair_cu,
             g2_bhoist=stage2.b_hoist,
+            g2_b2stage=stage2.b2stage,
             g2_ascale_pf=stage2.ascale_prefetch,
+            g2_deep_a_pipeline=stage2.deep_a_pipeline,
+            a_dtype=str(invariants["a_dtype"]),
         )
 
     def _preload_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -906,12 +965,14 @@ class MegaMoEV2:
             )
             self._preload_aligned_pair_stage2(config, stream)
         for entry in self._bundle_plan.entries:
-            self.comb_op.preload_combine_no_stage1(
-                self._g2_combine_placeholder,
-                cur_tok=entry.token_bucket,
-                enable_weights=False,
-                stage2_p2p_quant=entry.config.p2p_quant,
-            )
+            for mask_topk_ids in (False, True):
+                self.comb_op.preload_combine_no_stage1(
+                    self._g2_combine_placeholder,
+                    cur_tok=entry.token_bucket,
+                    enable_weights=False,
+                    stage2_p2p_quant=entry.config.p2p_quant,
+                    mask_topk_ids=mask_topk_ids,
+                )
 
     def _run_fused_stage2(
         self,
@@ -922,6 +983,7 @@ class MegaMoEV2:
         runtime_pair_skip: bool = False,
         combine: bool = True,
         scatter_vec: int = 8,
+        combine_ids=None,
     ):
         comb_op = self.comb_op
         if stream is None:
@@ -940,8 +1002,8 @@ class MegaMoEV2:
         if not combine:
             return None
         return comb_op.combine_no_stage1(
-            self._g2_combine_placeholder, None, None, cur_tok=run_tokens, enable_weights=False,
-            stage2_p2p_quant=p2p_quant,
+            self._g2_combine_placeholder, None, combine_ids, cur_tok=run_tokens,
+            enable_weights=False, stage2_p2p_quant=p2p_quant,
         )
 
     def _launch_aligned_pair_stage2(self, config: MegaMoEConfig, stream):
@@ -960,6 +1022,7 @@ class MegaMoEV2:
         config: MegaMoEConfig,
         stream,
         slice_output: bool,
+        combine_ids=None,
     ):
         """Overlap the common-pair kernel with the residual Stage2 kernel."""
         main_stream = torch.cuda.current_stream() if stream is None else stream
@@ -986,7 +1049,7 @@ class MegaMoEV2:
         result = self.comb_op.combine_no_stage1(
             self._g2_combine_placeholder,
             None,
-            None,
+            combine_ids,
             cur_tok=run_tokens,
             enable_weights=False,
             stage2_p2p_quant=config.p2p_quant,

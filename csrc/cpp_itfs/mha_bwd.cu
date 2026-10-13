@@ -3,6 +3,8 @@
 #include "asm_fmha_v3_bwd_configs.hpp"
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -376,12 +378,29 @@ float mha_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 #endif
 }
 
+// _perf.co is a scope:cu rebuild of the dqdkdv kernel exposing the same symbol.
+std::string dqdkdv_co_name(const std::string& co_name, const std::string& arch_id)
+{
+    static const bool perf = []() {
+        const char* e = std::getenv("AITER_FMHA_BWD_PERF_CO");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+    const char* asm_dir = perf ? std::getenv("AITER_ASM_DIR") : nullptr;
+    if(asm_dir == nullptr)
+        return co_name;
+
+    std::string perf_co = co_name.substr(0, co_name.size() - 3) + "_perf.co";
+    std::string path    = std::string(asm_dir) + "/" + arch_id + "/" + perf_co;
+    return std::ifstream(path).good() ? perf_co : co_name;
+}
+
 float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 {
     std::string arch_id = get_gpu_arch();
     if((!a.use_asm_v3) || (a.hdim_q % 8 != 0) || (a.hdim_v % 8 != 0) || (a.has_dbias) ||
        (a.bias_type != 0) || (a.has_dropout) || (a.is_deterministic) ||
-       ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")))
+       ((arch_id != "gfx942") && (arch_id != "gfx950") && (arch_id != "gfx1250")) ||
+       (!is_gfx1250_asm_supported()))
     {
         return -1;
     }
@@ -460,6 +479,11 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
         AITER_LOG_WARNING("fmha_v3_bwd: unsupported mask type for asm kernels.");
         return -1;
     }
+    // gfx950 hd256: non-causal only, no GQA/MQA
+    if(arch_id == "gfx950" && a.hdim_q == 256 && (mt != 0 || a.nhead_q != a.nhead_k))
+    {
+        return -1;
+    }
     // On gfx942, a16 (atomic32=0) has no mask_type=2 (bottom-right causal) kernels,
     // only mask_type=1 (top-left causal). When seqlen_q == seqlen_k the two masks
     // are mathematically equivalent, so we can safely convert 2 → 1 to hit the
@@ -484,9 +508,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
                                                                          dqdkdv_cfgs,
                                                                          post_cfgs);
 
-    if((pre_kernel == "") || (dqdkdv_kernel == "") || (need_post_processing && (post_kernel == "")))
+    if((pre_kernel == "") || (dqdkdv_kernel == ""))
     {
         return -1;
+    }
+    if(need_post_processing && (post_kernel == ""))
+    {
+        need_post_processing = false;
     }
 
     int ts_odo;
@@ -519,13 +547,13 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
     auto it_dqdkdv = dqdkdv_cfgs->find(dqdkdv_kernel);
     if(it_dqdkdv != dqdkdv_cfgs->end())
     {
-        const auto& cfg     = it_dqdkdv->second;
-        const char* name    = cfg.knl_name.c_str();
-        const char* co_name = cfg.co_name.c_str();
-        ts_kv               = cfg.ts;
+        const auto& cfg           = it_dqdkdv->second;
+        const char* name          = cfg.knl_name.c_str();
+        const std::string co_name = dqdkdv_co_name(cfg.co_name, arch_id);
+        ts_kv                     = cfg.ts;
 
-        impl_ptr_dqdkdv =
-            &impl_ptr_map.get_or_create(name, [&]() { return AiterAsmKernel(name, co_name); });
+        impl_ptr_dqdkdv = &impl_ptr_map.get_or_create(
+            name, [&]() { return AiterAsmKernel(name, co_name.c_str()); });
     }
     else
     {
@@ -689,8 +717,12 @@ float fmha_v3_bwd(mha_bwd_args a, const ck_tile::stream_config& s)
 
     auto dqdkdv_kernel_launch = [&]() {
         arg_size                  = sizeof(dqdkdv_args);
-        int bdx = (arch_id == "gfx1250") ? 128 : 256;
+        int bdx = (arch_id == "gfx1250") ? 128 : (a.hdim_q == 256 ? 512 : 256);
         int gdx = (a.max_seqlen_k + ts_kv - 1) / ts_kv;
+        if (a.hdim_q == 256) {
+            int gdx_q = (a.max_seqlen_q + ts_kv - 1) / ts_kv;
+            gdx = std::max(gdx, gdx_q);
+        }
         int gdy = a.nhead_q;
         int gdz = a.batch;
 

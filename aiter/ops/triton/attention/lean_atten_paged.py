@@ -54,7 +54,13 @@ def persistent_lean_attention_paged(
         stacklevel=2,  # attributes warning to the caller
     )
     _LOGGER.info(
-        f"LEAN_ATTEN_PAGED: q={tuple(q.shape)}  k={tuple(k.shape)}  v={tuple(v.shape)} Mp={tuple(Mp.shape)} Lp={tuple(Lp.shape)}  Op={tuple(Op.shape)}"
+        "LEAN_ATTEN_PAGED: q=%s  k=%s  v=%s Mp=%s Lp=%s  Op=%s",
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        tuple(Mp.shape),
+        tuple(Lp.shape),
+        tuple(Op.shape),
     )
     # shape constraints
     HEAD_DIM_Q, HEAD_DIM_K, HEAD_DIM_V = q.shape[-1], k.shape[-1], v.shape[-1]
