@@ -164,6 +164,47 @@ def check_norm_rows_skip_residual(ca, tp, rank, device, graphs):
                 logger.info("fused_ar_rms options passed: %s, TP%d", ctx, tp)
 
 
+def check_norm_rejects_short_buffers(ca, rank, device):
+    """The native op checks buffer extents against m and num_norm_rows."""
+    from aiter.ops import custom_all_reduce as ops
+
+    m, norm_rows = 16, 4
+    x = torch.ones((m, HIDDEN), dtype=torch.bfloat16, device=device)
+    w = torch.ones(HIDDEN, dtype=torch.bfloat16, device=device)
+
+    def rows(k):
+        return torch.empty((k, HIDDEN), dtype=x.dtype, device=device)
+
+    cases = {
+        "out shorter than num_norm_rows": (x, rows(m), rows(norm_rows - 1), False),
+        "res_out shorter than m": (x, rows(m - 1), rows(norm_rows), False),
+        "res_inp shorter than m": (rows(m - 1), rows(m), rows(norm_rows), False),
+    }
+    for name, (res_inp, res_out, out, skip) in cases.items():
+        try:
+            ops.fused_allreduce_rmsnorm(
+                ca._ptr,
+                x,
+                res_inp,
+                res_out,
+                out,
+                w,
+                EPS,
+                ca._pool["input"].data_ptr,
+                ca._pool["input"].max_size,
+                False,
+                False,
+                norm_rows,
+                skip,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"fused_allreduce_rmsnorm accepted {name}")
+    if rank == 0:
+        logger.info("fused_ar_rms buffer extent checks passed")
+
+
 def check_1stage_rejects_options(ca, rank, device):
     from aiter.ops import custom_all_reduce as ops
 
@@ -223,6 +264,7 @@ def _worker(rank, tp, init_method):
         if tp != 6:
             check_norm_rows_skip_residual(ca, tp, rank, device, graphs)
             check_1stage_rejects_options(ca, rank, device)
+            check_norm_rejects_short_buffers(ca, rank, device)
         torch.cuda.synchronize()
         dist.barrier()
     finally:

@@ -635,6 +635,17 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         throw std::runtime_error(
             "fused allreduce rmsnorm requires residual input/output width == weight width");
     }
+    // The kernels write the first norm_rows rows of out and all m rows of
+    // res_out, and read all m rows of res_inp unless skip_residual.
+    const int64_t norm_rows =
+        (num_norm_rows < 0 || num_norm_rows > m) ? m : num_norm_rows;
+    const int64_t all_elems = static_cast<int64_t>(m) * n;
+    if(static_cast<int64_t>(out.numel()) < norm_rows * n)
+        throw std::runtime_error("fused allreduce rmsnorm: out is smaller than the normalized rows");
+    if(static_cast<int64_t>(res_out.numel()) < all_elems)
+        throw std::runtime_error("fused allreduce rmsnorm: res_out must hold every input row");
+    if(!skip_residual && static_cast<int64_t>(res_inp.numel()) < all_elems)
+        throw std::runtime_error("fused allreduce rmsnorm: res_inp must hold every input row");
 
     if(reg_ptr != 0)
     {
