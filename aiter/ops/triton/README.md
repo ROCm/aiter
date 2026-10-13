@@ -2,9 +2,10 @@
 
 This folder has the Triton and Gluon kernels of AITER and their Python
 wrappers. Every change in `aiter/ops/triton/` must obey the rules below.
-Copilot uses the same rules to review PRs
+Coding agents find these rules through [`AGENTS.md`](AGENTS.md). Copilot
+uses the same rules to review PRs
 (`.github/instructions/aiter-ops-triton.instructions.md`). The full config
-rules are in [`configs/CLAUDE.md`](configs/CLAUDE.md).
+rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
 
 ## Rules
 
@@ -140,7 +141,7 @@ def _get_config(M: int, N: int, K: int):
     return get_gemm_config("GEMM-A16W16", M, N, K)  # returns (config, is_tuned)
 ```
 
-[`configs/CLAUDE.md`](configs/CLAUDE.md) has the layout, the loaders, the
+[`configs/AGENTS.md`](configs/AGENTS.md) has the layout, the loaders, the
 JSON format and the steps to add a config. The manual tuning flow is in
 [`utils/_triton/tuning/README.md`](utils/_triton/tuning/README.md).
 

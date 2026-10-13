@@ -131,7 +131,7 @@ def resolve_config_dir(
 ) -> str:
     """Build the directory that holds one config family's JSON files.
 
-    The nested layout (see configs/CLAUDE.md) keys every family by
+    The nested layout (see configs/AGENTS.md) keys every family by
     architecture, backend, op and family:
     ``<configs>/<arch>/<backend>/<op>/<d_type>``, with the ``<d_type>`` leaf
     derived by ``_dtype_dir()`` (``GEMM-AFP4WFP4`` -> ``gemm_afp4wfp4``).

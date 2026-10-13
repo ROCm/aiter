@@ -66,7 +66,7 @@ def _get_tuned_kernel_entry(
     ``get_tuned_kernel_config()`` copies it before handing it out.
     """
     arch = arch_info.get_arch()
-    # Nested layout of configs/CLAUDE.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
+    # Nested layout of configs/AGENTS.md: <arch>/<backend>/<op>/<d_type>/DEFAULT.json,
     # <d_type> being the config name lowercased with dashes folded to underscores.
     dtype_dir = _dtype_dir(config_name)
     config_path = (

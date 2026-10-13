@@ -278,3 +278,7 @@ A PR that changes a convention under `aiter/ops/triton/` must update
 `aiter/ops/triton/README.md` and this file. Examples: a moved shared helper, a
 change to the config layout or the loaders, or new folders. Flag a PR that
 does not.
+
+Flag a new `CLAUDE.md` file. Put agent instructions in `AGENTS.md`, so that
+all coding agents read them. `aiter/ops/triton/CLAUDE.md` only imports the
+`AGENTS.md` files. Flag a new `AGENTS.md` file that it does not import.
