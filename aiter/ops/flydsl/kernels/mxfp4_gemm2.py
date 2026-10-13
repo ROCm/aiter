@@ -51,6 +51,17 @@ def saq_slot_bytes(BM, KH_TILE):
     return BM * KH_TILE
 
 
+def a_load_waves(BM, KH_TILE):
+    """Waves that issue_a_load_lds_dt needs to cover the BM x KH_TILE A tile once.
+
+    One call moves 64 // (KH_TILE // 16) rows. When a wave's BM // 4 rows are
+    fewer than that, the loader maps waves onto the tile modulo the call count,
+    so any further waves would only reload the same rows.
+    """
+    rows_per_call = 64 // (KH_TILE // 16)
+    return min(4, max(1, BM // rows_per_call))
+
+
 def compile_gemm2_a4w4_port(
     BM=32,
     use_nt=False,
@@ -81,6 +92,7 @@ def compile_gemm2_a4w4_port(
     ), f"D_INTER_REAL={_K_REAL} must be a multiple of 128 and in (0, {_K}]"
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
+    _a_load_waves = a_load_waves(BM, KH_TILE)
     _persistent = epilog in ("nonatomic", "nonatomic_mxfp4")
     _slot_bytes = saq_slot_bytes(BM, KH_TILE)
     _aStages = kStages if _K_TILES_TOTAL <= kStages else 3
@@ -157,6 +169,13 @@ def compile_gemm2_a4w4_port(
                     BM=BM,
                 )
 
+        def _issue_all_a_loads_gated(m_row0):
+            if const_expr(_a_load_waves < 4):
+                if wave < fx.Int32(_a_load_waves):
+                    _issue_all_a_loads(m_row0)
+            else:
+                _issue_all_a_loads(m_row0)
+
         def _run_tile(tile_i32):
             _gemm2_body(
                 lds_raw_ptr,
@@ -216,7 +235,7 @@ def compile_gemm2_a4w4_port(
 
             if bx_i32 < bound:
                 tile = _xcd(bx_i32)
-                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
+                _issue_all_a_loads_gated(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
                 rocdl.sched_barrier(0)
                 _run_tile(tile)
 
@@ -224,11 +243,11 @@ def compile_gemm2_a4w4_port(
                 wu = fx.Int32(iv)
                 gpu.barrier()
                 tile = _xcd(wu)
-                _issue_all_a_loads(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
+                _issue_all_a_loads_gated(_udiv(tile, _num_n_blocks) * fx.Int32(BM))
                 _run_tile(tile)
         else:
             m_row0 = _udiv(bx_i32, _num_n_blocks) * fx.Int32(BM)
-            _issue_all_a_loads(m_row0)
+            _issue_all_a_loads_gated(m_row0)
             rocdl.sched_barrier(0)
 
             cumsum0 = fx.ptr_load(global_typed_ptr(arg_cumsum, T.i32))
@@ -321,6 +340,7 @@ def _gemm2_body(
     _K = D_INTER
     _K_HALF = k_half_for(_K)
     _K_TILES_TOTAL = k_tiles_total_for(_K, BK)
+    _a_load_waves = a_load_waves(BM, KH_TILE)
     _K_REAL = D_INTER if D_INTER_REAL is None else D_INTER_REAL
     _n_real_half = (_K_REAL + 127) // 128
     _kUnroll = kunroll_for(_K, BK)
@@ -436,7 +456,7 @@ def _gemm2_body(
                 out[j][half] = Vec(frag)
         return out
 
-    def issue_a_load_lds(slot, kt):
+    def _issue_a_load_lds(slot, kt):
         issue_a_load_lds_dt(
             arg_aq,
             fx.Int64(i32_max_m_blocks) * fx.Int64(BM * _K_HALF),
@@ -451,6 +471,13 @@ def _gemm2_body(
             _K_HALF,
             BM=BM,
         )
+
+    def issue_a_load_lds(slot, kt):
+        if const_expr(_a_load_waves < 4):
+            if wave < fx.Int32(_a_load_waves):
+                _issue_a_load_lds(slot, kt)
+        else:
+            _issue_a_load_lds(slot, kt)
 
     def issue_a_ds_read(slot):
         lane_row = lane_mod_16
