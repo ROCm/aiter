@@ -34,7 +34,6 @@ def make(M, N, G, dtype, *, runs=True, seed=0):
 
 
 @pytest.mark.parametrize("round_intermediate", [False, True])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "M,N,G",
     [
@@ -47,8 +46,8 @@ def make(M, N, G, dtype, *, runs=True, seed=0):
     ],
 )
 @pytest.mark.parametrize("runs", [True, False])
-def test_matches_gathered_gate_then_add(dtype, M, N, G, runs, round_intermediate):
-    residual, x, gate, indices = make(M, N, G, dtype, runs=runs)
+def test_matches_gathered_gate_then_add(M, N, G, runs, round_intermediate):
+    residual, x, gate, indices = make(M, N, G, torch.bfloat16, runs=runs)
     got = fused_indexed_gated_residual(
         residual, x, gate, indices, round_intermediate=round_intermediate
     )
@@ -77,7 +76,7 @@ def test_round_intermediate_changes_the_result():
 
 def test_every_index_is_honoured():
     N, G = 512, 6
-    residual, x, gate, _ = make(G, N, G, torch.float32)
+    residual, x, gate, _ = make(G, N, G, torch.bfloat16)
     indices = torch.arange(G, device="cuda", dtype=torch.int64)
     got = fused_indexed_gated_residual(residual, x, gate, indices)
     torch.testing.assert_close(
@@ -163,6 +162,19 @@ def test_rejects_mismatched_inputs():
         fused_indexed_gated_residual(residual, x, gate.half(), indices)
     with pytest.raises(ValueError):
         fused_indexed_gated_residual(residual, x, gate, indices.float())
+
+
+def test_rejects_unsupported_dtypes_and_devices():
+    residual, x, gate, indices = make(32, 256, 3, torch.bfloat16)
+    for dtype in (torch.float16, torch.float32):
+        with pytest.raises(ValueError):
+            fused_indexed_gated_residual(
+                residual.to(dtype), x.to(dtype), gate.to(dtype), indices
+            )
+    with pytest.raises(ValueError):
+        fused_indexed_gated_residual(residual.cpu(), x.cpu(), gate.cpu(), indices.cpu())
+    with pytest.raises(ValueError):
+        fused_indexed_gated_residual(residual, x, gate, indices.cpu())
 
 
 if __name__ == "__main__":

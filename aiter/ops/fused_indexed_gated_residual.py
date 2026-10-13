@@ -36,14 +36,14 @@ def fused_indexed_gated_residual(
     ``gate[indices]`` is materialised at [M, N] and the product is written and
     re-read before the add.
 
-    - residual, x: [M, N] fp32/fp16/bf16, unit stride along N
+    - residual, x: [M, N] bf16, unit stride along N
     - gate: [G, N] gate table, same dtype
     - indices: [M] int32/int64, contiguous
     - out: optional [M, N] destination; may be ``residual`` (in-place update)
     - round_intermediate: round ``gate * x`` to the output dtype before the add,
       as the eager expression does; the result then matches it bit for bit
 
-    Returns ``out``.
+    All operands are on one GPU. Returns ``out``.
     """
     # Checked here so bad inputs raise; the kernel's own checks abort the process.
     if residual.ndim != 2:
@@ -59,8 +59,13 @@ def fused_indexed_gated_residual(
         raise ValueError(f"indices must be int32/int64 [{M}]")
     if M > 1 and indices.stride(0) != 1:
         raise ValueError("indices must be contiguous")
-    if residual.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+    if residual.dtype != torch.bfloat16:
         raise ValueError(f"unsupported dtype {residual.dtype}")
+    if not residual.is_cuda:
+        raise ValueError("residual must be a CUDA tensor")
+    for name, t in (("x", x), ("gate", gate), ("indices", indices), ("out", out)):
+        if t.device != residual.device:
+            raise ValueError(f"{name} must be on {residual.device}")
     for name, t in (("residual", residual), ("x", x), ("gate", gate), ("out", out)):
         if t.dtype != residual.dtype:
             raise ValueError(f"{name} must be {residual.dtype}, got {t.dtype}")

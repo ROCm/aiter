@@ -4,7 +4,6 @@
 #include "aiter_stream.h"
 #include "fused_indexed_gated_residual.h"
 
-#include <hip/hip_fp16.h>
 #include <hip/hip_runtime.h>
 
 #include <algorithm>
@@ -14,20 +13,6 @@
 namespace {
 
 constexpr int THREADS = 256;
-
-struct F32
-{
-    using raw = float;
-    __device__ static float load(raw v) { return v; }
-    __device__ static raw store(float f) { return f; }
-};
-
-struct F16
-{
-    using raw = __half;
-    __device__ static float load(raw v) { return __half2float(v); }
-    __device__ static raw store(float f) { return __float2half_rn(f); }
-};
 
 struct BF16
 {
@@ -179,12 +164,13 @@ void fused_indexed_gated_residual(const aiter_tensor_t& residual,
                 AiterDtype_to_str(indices.dtype()));
     AITER_CHECK(rows < 2 || indices.stride(0) == 1, "indices must be contiguous");
     const AiterDtype dtype = residual.dtype();
-    AITER_CHECK(dtype == AITER_DTYPE_fp32 || dtype == AITER_DTYPE_fp16 || dtype == AITER_DTYPE_bf16,
-                "residual must be fp32, fp16 or bf16, got ",
-                AiterDtype_to_str(dtype));
+    AITER_CHECK(dtype == AITER_DTYPE_bf16, "residual must be bf16, got ", AiterDtype_to_str(dtype));
+    AITER_CHECK(residual.is_gpu(), "residual must be a GPU tensor");
+    AITER_CHECK(indices.device_id == residual.device_id, "all operands must be on one device");
     for(const aiter_tensor_t* t : std::initializer_list<const aiter_tensor_t*>{&x, &gate, &out})
     {
         AITER_CHECK(t->dtype() == dtype, "residual, x, gate and out must share one dtype");
+        AITER_CHECK(t->device_id == residual.device_id, "all operands must be on one device");
         AITER_CHECK(cols < 2 || t->stride(1) == 1, "all operands need unit stride along N");
     }
     AITER_CHECK(residual.stride(1) == 1 || cols < 2, "all operands need unit stride along N");
@@ -193,10 +179,5 @@ void fused_indexed_gated_residual(const aiter_tensor_t& residual,
 
     HipDeviceGuard device_guard(residual.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
-    if(dtype == AITER_DTYPE_bf16)
-        dispatch_index<BF16>(residual, x, gate, indices, out, round_intermediate, stream);
-    else if(dtype == AITER_DTYPE_fp16)
-        dispatch_index<F16>(residual, x, gate, indices, out, round_intermediate, stream);
-    else
-        dispatch_index<F32>(residual, x, gate, indices, out, round_intermediate, stream);
+    dispatch_index<BF16>(residual, x, gate, indices, out, round_intermediate, stream);
 }
