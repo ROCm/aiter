@@ -10,6 +10,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+# CI executes this file directly; imports and fixtures must use this checkout.
+REPO_ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO_ROOT))
+
 
 class TestFastScanCliSafety(unittest.TestCase):
     def test_generic_fmoe_rejects_fast_scan_before_dispatch(self):
@@ -699,10 +703,7 @@ class TestMxfp4AccuracyFunnel(unittest.TestCase):
 
 class TestGlm53TunedArtifact(unittest.TestCase):
     def test_token_one_row_matches_validated_coupled_winner(self):
-        from csrc.ck_gemm_moe_2stages_codegen import gemm_moe_tune
-
-        repo = Path(gemm_moe_tune.__file__).parents[2]
-        config = repo / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
+        config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
         with config.open(newline="") as handle:
             rows = list(csv.DictReader(handle))
         token_one = next(row for row in rows if row["token"] == "1")
@@ -725,8 +726,7 @@ class TestGlm53TunedArtifact(unittest.TestCase):
     def test_in_memory_jobs_match_file_parser(self):
         from aiter.aot.flydsl.mxfp4_moe import _job_key, jobs_from_rows, parse_csv
 
-        repo = Path(__file__).resolve().parents[2]
-        config = repo / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
+        config = REPO_ROOT / "aiter/configs/model_configs/glm53_fp4_tuned_fmoe.csv"
         with config.open(newline="") as handle:
             rows = list(csv.DictReader(handle))
 
