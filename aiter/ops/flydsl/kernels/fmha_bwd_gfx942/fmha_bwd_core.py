@@ -25,20 +25,16 @@ import os
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from flydsl._mlir.dialects import llvm as _mlir_llvm
-from flydsl._mlir.dialects._llvm_enum_gen import AtomicBinOp as _LLVMBinOp
-from flydsl._mlir.dialects._llvm_enum_gen import AtomicOrdering as _LLVMOrd
 from flydsl.expr import range_constexpr
 from flydsl.expr.primitive import const_expr
 
-_LLVM_FADD = _LLVMBinOp.fadd
-_LLVM_MONOTONIC = _LLVMOrd.monotonic
+from ..kernels_common import LOG2E, ceildiv
 
 DQK = 192  # default build shape: the MLA-style d_qk
 DV = 128  # default build shape: the MLA-style d_v
 D_MIN = 64
 D_MAX = 192
 D_STEP = 8
-LOG2E = 1.4426950408889634
 
 ROWS_DELTA = 32  # rows reduced per delta workgroup (2 unrolled 16-row passes)
 NUM_THREADS = 512
@@ -122,10 +118,10 @@ class _Geom:
         assert supported_head_dim(d_v), f"unsupported d_v {d_v}"
         self.d_qk = d_qk
         self.d_v = d_v
-        self.qk_p = -(-d_qk // 16) * 16
-        self.v_p = -(-d_v // 16) * 16
-        self.qk_s = -(-d_qk // 64) * 64
-        self.v_s = -(-d_v // 64) * 64
+        self.qk_p = ceildiv(d_qk, 16) * 16
+        self.v_p = ceildiv(d_v, 16) * 16
+        self.qk_s = ceildiv(d_qk, 64) * 64
+        self.v_s = ceildiv(d_v, 64) * 64
 
         self.n_tiles_qk = self.qk_p // 16  # MFMA tiles along d_qk
         self.n_tiles_v = self.v_p // 16  # MFMA tiles along d_v
@@ -163,7 +159,7 @@ class _Geom:
         self.arena_dkdv = dkdv_end
         self.off_ds = dkdv_end
         # dQ d tiles per wave; more than one does not fit in registers at any supported head dim.
-        self.dq_tiles_per_wave = -(-self.n_tiles_qk // NUM_WAVES)
+        self.dq_tiles_per_wave = ceildiv(self.n_tiles_qk, NUM_WAVES)
         nt = self.n_tiles_qk + self.n_tiles_v
         self.est_vgpr = (
             VGPR_FIXED + 6 * nt + 2 * (self.n_qk_chunks + self.n_v_chunks) + 2
@@ -178,7 +174,7 @@ class _Geom:
         # 8 mod 16: the pack side stores 8 rows x 8 consecutive dwords per instruction, which that
         # stride spreads over all 32 banks.  At least `qk_p` wide so a half-real last d tile
         # stores into padding.
-        self.ld_dqs = 2 * (-(-(self.qk_p // 2 - 8) // 16) * 16 + 8)
+        self.ld_dqs = 2 * (ceildiv(self.qk_p // 2 - 8, 16) * 16 + 8)
         self.off_dqs = self.off_ds + QUERY_TILE * LD_DS
         fused_lds = (
             self.arena_dkdv + QUERY_TILE * (LD_DS + self.ld_dqs)
@@ -287,9 +283,7 @@ OPT_DQHALF = True
 # WIDE: issue every LDS read of the dQ flush before its first atomic.
 OPT_WFLBATCH = True
 
-# LLVM sched_barrier / sched_group_barrier mask bits.
-_SCHED_MFMA = 0x008
-_SCHED_DSRD = 0x100
+# LLVM sched_barrier mask bits.
 _SCHED_ALL = 0xFFF
 _SCHED_NO_VMEM_RD = _SCHED_ALL & ~(0x010 | 0x020)  # everything BUT VMEM reads may cross
 
@@ -308,10 +302,10 @@ def _sched_pipe(nread, nmfma, rm):
     r, m = rm
     if r <= 0 or m <= 0:
         return
-    ngrp = max(1, min((nread + r - 1) // r, (nmfma + m - 1) // m))
+    ngrp = max(1, min(ceildiv(nread, r), ceildiv(nmfma, m)))
     for _ in range_constexpr(ngrp):
-        fx.rocdl.sched_group_barrier(_SCHED_DSRD, r, 0)
-        fx.rocdl.sched_group_barrier(_SCHED_MFMA, m, 0)
+        fx.rocdl.sched_dsrd(r)
+        fx.rocdl.sched_mfma(m)
 
 
 # --------------------------------------------------------------------------- small helpers
@@ -325,7 +319,7 @@ def _mfma(a, b, acc):
     fx.memref_store_vec(a, fa)
     fx.memref_store_vec(b, fb)
     fx.memref_store_vec(acc, fc)
-    fx.mma_atom_call(mma, fc, fa, fb, fc)
+    fx.gemm(mma, fc, fa, fb, fc)
     return fx.memref_load_vec(fc)
 
 
@@ -400,14 +394,14 @@ def _atom(fx_dt, vec):
 def _ldv(buf, tile, fx_dt, vec):
     """``vec`` elements at element offset ``tile * vec``, as a raw vector value."""
     frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), fx_dt)
-    fx.copy_atom_call(_atom(fx_dt, vec), fx.slice(buf, (tile, None)), frag)
+    fx.copy(_atom(fx_dt, vec), fx.slice(buf, (tile, None)), frag)
     return frag.load().ir_value()
 
 
 def _ld1(buf, idx, fx_dt):
     """One ``fx_dt`` element at element index ``idx``, typed."""
     frag = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
-    fx.copy_atom_call(_atom(fx_dt, 1), fx.slice(buf, (idx, None)), frag)
+    fx.copy(_atom(fx_dt, 1), fx.slice(buf, (idx, None)), frag)
     return frag.load()[0]
 
 
@@ -415,14 +409,14 @@ def _stv(val, buf, tile, fx_dt, vec):
     """Store the ``vec``-wide vector ``val`` at element offset ``tile * vec``."""
     frag = fx.make_rmem_tensor(fx.make_layout(vec, 1), fx_dt)
     fx.memref_store_vec(val, frag)
-    fx.copy_atom_call(_atom(fx_dt, vec), frag, fx.slice(buf, (tile, None)))
+    fx.copy(_atom(fx_dt, vec), frag, fx.slice(buf, (tile, None)))
 
 
 def _st1(val, buf, idx, fx_dt):
     """Store one ``fx_dt`` value at element index ``idx``."""
     frag = fx.make_rmem_tensor(fx.make_layout(1, 1), fx_dt)
     fx.memref_store_vec(fx.Vector.from_elements([val], dtype=fx_dt), frag)
-    fx.copy_atom_call(_atom(fx_dt, 1), frag, fx.slice(buf, (idx, None)))
+    fx.copy(_atom(fx_dt, 1), frag, fx.slice(buf, (idx, None)))
 
 
 def _bf16x4(ptr):
@@ -437,20 +431,27 @@ def _global_bf16_ptr(tensor):
     )
 
 
-def _atompk2(v2, base, idx):
-    """``global_atomic_pk_add_bf16`` of one bf16 pair at element ``idx``.
+def _atomic_pk_add_bf16(ptr, v2):
+    """``global_atomic_pk_add_bf16`` of one bf16 pair at the align-4 global bf16 ``ptr``.
 
-    gfx942 has no buffer form of this atomic, so there is no out-of-range masking: callers steer
-    ``idx`` onto a valid slot and add +0.0 there.
+    Raw ``llvm.atomicrmw``: gfx942 has no buffer form of this atomic (``BufferAtomicPkAdd`` is
+    gfx950+), so it cannot go through a copy atom, and there is no out-of-range masking --
+    callers steer the address onto a valid slot and add +0.0 there.  Not ``fx.llvm.atomic_add``:
+    it takes the alignment from the pointer type, which ``base + idx`` weakens to 2 bytes.
     """
     _mlir_llvm.atomicrmw(
-        _LLVM_FADD,
-        fx.to_llvm_ptr(base + idx),
+        _mlir_llvm.AtomicBinOp.fadd,
+        fx.to_llvm_ptr(ptr),
         fx.Vector(v2).ir_value(),
-        _LLVM_MONOTONIC,
+        _mlir_llvm.AtomicOrdering.monotonic,
         syncscope="agent",
         alignment=4,
     )
+
+
+def _atompk2(v2, base, idx):
+    """``_atomic_pk_add_bf16`` at element ``idx`` of the bf16 pointer ``base``."""
+    _atomic_pk_add_bf16(base + idx, v2)
 
 
 _DPP_QUAD_1032 = 0xB1  # quad_perm:[1,0,3,2] -- swap lane l with lane l^1
@@ -618,7 +619,7 @@ def build(
     # workgroup's threads pair-fastest so one wave instruction covers whole contiguous rows.
     DQS_PAIRS = DQK // 2
     DQS_TOTAL = QUERY_TILE * DQS_PAIRS
-    DQS_PASSES = -(-DQS_TOTAL // NUM_THREADS)
+    DQS_PASSES = ceildiv(DQS_TOTAL, NUM_THREADS)
 
     # LDS storage layouts
     if FUSED:
@@ -648,12 +649,12 @@ def build(
     PASSES_PER_WG = ROWS_DELTA // ROWS_PER_PASS
     # 8-element tiles spanning one row of dO / O, and how many passes of 16 lanes that needs.
     TILES_PER_ROW_V = DV // 8
-    DELTA_CHUNKS = -(-TILES_PER_ROW_V // 16)
+    DELTA_CHUNKS = ceildiv(TILES_PER_ROW_V, 16)
 
     # The fused role adds into dq, so on the fused build k_delta also zeroes it.
     Z_TILES_PER_ROW = DQK // 8  # 8-element bf16 tiles per dq row
     Z_TILES_PER_WG = ROWS_DELTA * Z_TILES_PER_ROW
-    Z_PASSES = -(-Z_TILES_PER_WG // DELTA_THREADS)
+    Z_PASSES = ceildiv(Z_TILES_PER_WG, DELTA_THREADS)
 
     def _delta_body(DO, O, DEL, DQZ, Tlen, Hn):
         """D = rowsum(dO * O).
@@ -1343,27 +1344,21 @@ def build(
                                 v2 = fx.Vector.from_elements(
                                     [w], dtype=fx.Int32
                                 ).bitcast(fx.BFloat16)
-                            _mlir_llvm.atomicrmw(
-                                _LLVM_FADD,
-                                fx.to_llvm_ptr(
-                                    fx.inttoptr(
-                                        fx.PointerType.get(
-                                            fx.BFloat16.ir_type,
-                                            fx.AddressSpace.Global,
-                                            4,
-                                        ),
-                                        dq_base64
-                                        + fx.Int64(
-                                            fx.arith.extui(
-                                                fx.Int64.ir_type, voff.ir_value()
-                                            )
-                                        ),
-                                    )
+                            _atomic_pk_add_bf16(
+                                fx.inttoptr(
+                                    fx.PointerType.get(
+                                        fx.BFloat16.ir_type,
+                                        fx.AddressSpace.Global,
+                                        4,
+                                    ),
+                                    dq_base64
+                                    + fx.Int64(
+                                        fx.arith.extui(
+                                            fx.Int64.ir_type, voff.ir_value()
+                                        )
+                                    ),
                                 ),
-                                fx.Vector(v2).ir_value(),
-                                _LLVM_MONOTONIC,
-                                syncscope="agent",
-                                alignment=4,
+                                v2,
                             )
 
                 def _q_iter(state, q_base):

@@ -565,13 +565,9 @@ def flydsl_flash_attn_varlen_bwd(
     PRECONDITION: the caller has established this configuration is supported --
     causal varlen THD self-attention, ``64 <= d_v <= d_qk <= 192`` with both a
     multiple of 8, bf16, no GQA, contiguous, ``[H, T]`` fp32 LSE, no dropout /
-    sliding window / alibi / sink / padded cu_seqlens, on gfx942.  The authoritative gate is
-    ``can_impl_fmha_bwd_flydsl`` inside ``_flash_attn_varlen_backward`` in
-    ``aiter/ops/mha.py``; the screened feature arguments are absent from this
-    signature precisely because that gate has already established they are unset,
-    leaving no configuration for this function to branch on.
+    sliding window / alibi / sink / padded cu_seqlens, on gfx942.
     """
-    dq, dk, dv, softmax_d = flash_attn_varlen_bwd_gfx942(
+    return flash_attn_varlen_bwd_gfx942(
         dout,
         q,
         k,
@@ -587,4 +583,3 @@ def flydsl_flash_attn_varlen_bwd(
         dv=dv,
         deterministic=deterministic,
     )
-    return dq, dk, dv, softmax_d

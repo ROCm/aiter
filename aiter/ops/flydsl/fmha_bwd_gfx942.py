@@ -20,7 +20,7 @@ The launcher never synchronises with the device: the grid is sized purely from t
 ``max_seqlen_*`` (both host-side), and the per-sequence bounds are read from ``cu_seqlens`` on
 the GPU inside the kernels.
 
-Contract (asserted by the caller in ``aiter/ops/flydsl/fmha_kernels.py``):
+Contract (established by ``can_impl_fmha_bwd_flydsl`` in ``aiter/ops/mha.py``):
   * causal, bf16, ``64 <= d_qk, d_v <= 192`` with ``d % 8 == 0``
   * THD varlen self-attention -- one ``cu_seqlens`` for both q and k, ``nhead_q == nhead_k``
   * q, k contiguous ``[T, H, d_qk]``; v, out, dout contiguous ``[T, H, d_v]``;
@@ -31,7 +31,6 @@ Contract (asserted by the caller in ``aiter/ops/flydsl/fmha_kernels.py``):
 from __future__ import annotations
 
 import functools
-import os
 
 import torch
 
@@ -51,17 +50,13 @@ from .kernels.fmha_bwd_gfx942.fmha_bwd_core import (
     fused_role_enabled,
     supported_head_dim,
 )
+from .kernels.kernels_common import ceildiv
 from .kernels.tensor_shim import _run_compiled
 
 __all__ = [
     "flash_attn_varlen_bwd_gfx942",
     "flydsl_bwd_shape_supported",
 ]
-
-# Split-K factor override for workloads whose whole grid is co-resident (see `_split`).  A test
-# hook ONLY: `1` is the way to run the n_split == 1 (and therefore FUSED) kernel on the small
-# shapes the correctness tests use, which otherwise all take the split-K path.
-_NSPLIT_OVERRIDE = os.environ.get("AITER_FMHA_BWD_FLYDSL_NSPLIT")
 
 
 def flydsl_bwd_shape_supported(d_qk: int, d_v: int) -> bool:
@@ -108,8 +103,6 @@ def _split(interleave: int, est_wgs: int, d_qk: int, ncu: int) -> int:
     """
     if not interleave:
         return 1
-    if _NSPLIT_OVERRIDE:
-        return int(_NSPLIT_OVERRIDE)
     if d_qk <= 128:
         return 2
     return 1 if est_wgs > ncu else 3
@@ -149,7 +142,7 @@ def _fused_wgs_per_cu(d_qk: int, d_v: int) -> int:
     """Co-resident fused k_bwd workgroups per CU, from the register and LDS footprints."""
     g = _geom(d_qk, d_v)
     vgpr = _VGPR_FIT_BASE + _VGPR_FIT_PER_TILE * (g.n_tiles_qk + g.n_tiles_v)
-    vgpr = -(-int(vgpr) // 8) * 8  # allocation granule
+    vgpr = ceildiv(int(vgpr), 8) * 8  # allocation granule
     waves_per_simd = _VGPRS_PER_SIMD_LANE // vgpr
     by_vgpr = (waves_per_simd * _SIMDS_PER_CU) // _WAVES_PER_WG
     lds = (
@@ -176,9 +169,9 @@ def _ramp_bounds(lens, h: int, n_split: int, slots: int):
     longest = 0.0
     total = 0.0
     for s in lens:
-        for kb in range((s + KEYS_PER_WG - 1) // KEYS_PER_WG):
-            nt = -(-(s - kb * KEYS_PER_WG) // QUERY_TILE)
-            longest = max(longest, -(-nt // n_split) + _WG_FIXED_ITERS)
+        for kb in range(ceildiv(s, KEYS_PER_WG)):
+            nt = ceildiv(s - kb * KEYS_PER_WG, QUERY_TILE)
+            longest = max(longest, ceildiv(nt, n_split) + _WG_FIXED_ITERS)
             total += (nt + n_split * _WG_FIXED_ITERS) * h
     return longest, total / slots
 
@@ -231,8 +224,8 @@ def _plan(
     d_v: int,
     deterministic: bool,
 ):
-    n_dkdv_blocks = (max_seqlen_k + KEYS_PER_WG - 1) // KEYS_PER_WG
-    n_dq_blocks = (max_seqlen_q + QUERIES_PER_WG - 1) // QUERIES_PER_WG
+    n_dkdv_blocks = ceildiv(max_seqlen_k, KEYS_PER_WG)
+    n_dq_blocks = ceildiv(max_seqlen_q, QUERIES_PER_WG)
     est_wgs = _est_wgs(t, h, n_seqs, n_dkdv_blocks)
     interleave = _interleave(est_wgs, ncu)
     n_split = _split(interleave, est_wgs, d_qk, ncu)
@@ -248,14 +241,14 @@ def _plan(
         # half of the grid is deleted outright.
         n_dq_blocks = 0
     return (
-        (t * h + ROWS_DELTA - 1) // ROWS_DELTA,  # 0: k_delta grid
+        ceildiv(t * h, ROWS_DELTA),  # 0: k_delta grid
         # 1: dK/dV list length -- scaled by n_split so the split index rides the low digit
         n_dkdv_blocks * n_split,
         (n_dkdv_blocks + n_dq_blocks) * n_split,  # 2: total list length
         interleave,  # 3: grid-decode mode
         n_split,  # 4: split-K factor
         # 5: reduction grid.x, sized for the larger (dq/dk) tensor; grid.y picks dq/dk/dv
-        (t * h * d_qk + elems_per_red_blk - 1) // elems_per_red_blk,
+        ceildiv(t * h * d_qk, elems_per_red_blk),
         fused,  # 6: FUSED single-role kernel (split or not)
     )
 

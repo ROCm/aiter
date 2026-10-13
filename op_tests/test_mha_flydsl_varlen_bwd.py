@@ -28,11 +28,13 @@ import torch
 import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
+from aiter.ops.flydsl.fmha_bwd_gfx942 import _num_cu, _plan
 from aiter.ops.flydsl.fmha_kernels import flydsl_flash_attn_varlen_bwd
 from aiter.ops.flydsl.kernels.fmha_bwd_gfx942.fmha_bwd_core import (
     D_MAX,
     D_MIN,
     D_STEP,
+    _geom,
 )
 from aiter.ops.mha import flash_attn_varlen_func
 from aiter.test_common import benchmark, checkAllclose, run_perftest
@@ -256,6 +258,17 @@ def run_fmha_varlen_bwd(
         "gfx": get_gfx(),
         "total_tokens": sum(x.seqlens),
         "max_seqlen": x.max_seqlen,
+        "fused": _plan(
+            sum(x.seqlens),
+            nheads,
+            len(x.seqlens),
+            x.max_seqlen,
+            x.max_seqlen,
+            _num_cu(),
+            d_qk,
+            d_v,
+            deterministic,
+        )[6],
     }
     for name, fn in candidates.items():
         (got_dq, got_dk, got_dv), us = run_perftest(fn)
@@ -321,6 +334,11 @@ def test_fmha_varlen_bwd(case, nheads, d_qk, d_v, deterministic):
         assert rel <= TOL_MEAN_REL, f"{where}: d{tag} mean_rel {rel:.3e}"
     if deterministic:
         assert ret["bitwise repeatable"], f"{where}: two runs differ bitwise"
+        assert not ret["fused"], f"{where}: atomic-dQ fused kernel selected"
+    elif (case, nheads) == ("small", 16) and _geom(d_qk, d_v).fusable:
+        # The case that covers the fused kernel: its grid (est_wgs = 2208) is never
+        # co-resident on a gfx942 part, so the planner cannot route it to two-role split-K.
+        assert ret["fused"], f"{where}: fused kernel not selected"
 
 
 # Through the public entry point: `flash_attn_varlen_func` autograd ->
@@ -442,28 +460,31 @@ def main():
     parser.add_argument(
         "-hd",
         "--head_dim",
-        type=str,
+        type=dtypes.str2tuple,
         nargs="*",
-        default=[f"{HEAD_DIM_QK}x{HEAD_DIM_V}"],
-        help="head dims as d_qk or d_qk x d_v.\ne.g.: -hd 64 128 192x128",
+        default=[(HEAD_DIM_QK, HEAD_DIM_V)],
+        help="head dims as d (square) or d_qk,d_v.\ne.g.: -hd 64 128 192,128",
     )
     parser.add_argument(
+        "-det",
         "--deterministic",
-        action="store_true",
-        help="run the deterministic (two-role, no-atomic) kernel.",
+        type=dtypes.str2bool,
+        nargs="*",
+        default=[False, True],
+        help="deterministic (two-role, no-atomic) kernel, default is [False, True]."
+        "\ne.g.: -det true",
     )
     args = parser.parse_args()
 
-    head_dims = []
-    for hd in args.head_dim:
-        d_qk, _, d_v = hd.partition("x")
-        head_dims.append((int(d_qk), int(d_v or d_qk)))
+    head_dims = [
+        (hd, hd) if isinstance(hd, int) else (hd[0], hd[-1]) for hd in args.head_dim
+    ]
 
     for dtype in args.dtype:
         df = [
-            run_fmha_varlen_bwd(case, nheads, dtype, d_qk, d_v, args.deterministic)
-            for case, nheads, (d_qk, d_v) in itertools.product(
-                args.case, args.nheads, head_dims
+            run_fmha_varlen_bwd(case, nheads, dtype, d_qk, d_v, det)
+            for case, nheads, (d_qk, d_v), det in itertools.product(
+                args.case, args.nheads, head_dims, args.deterministic
             )
         ]
         aiter.logger.info(
