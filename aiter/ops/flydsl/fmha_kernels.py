@@ -223,6 +223,20 @@ def flydsl_flash_attn_func(
     return o_p
 
 
+def _check_out(out, q, v_hdim):
+    """Validate a caller-provided ``out`` for a request m32x8 is about to serve."""
+    if out is None:
+        return
+    assert torch.is_tensor(out), f"out must be a tensor, got {type(out).__name__}"
+    assert out.dtype == q.dtype, f"out dtype {out.dtype} != q dtype {q.dtype}"
+    assert out.device == q.device, f"out device {out.device} != q device {q.device}"
+    assert out.stride(-1) == 1, "out must have a contiguous last dimension"
+    want = (*tuple(q.shape[:-1]), v_hdim)
+    assert (
+        tuple(out.shape) == want
+    ), f"out shape {tuple(out.shape)} != expected {want} (v_hdim={v_hdim})"
+
+
 def _fp8_gfx950_supported(
     q,
     k,
@@ -400,6 +414,8 @@ def flydsl_flash_attn_varlen_func(
     if not supported:
         return None
 
+    _check_out(out, q, _v_hdim)
+
     # gfx1250 — varlen THD, bf16/fp16
     if out is None:
         # Slicing q cannot widen it: at qk_hdim < v_hdim, q[..., :v_hdim] clamps back
@@ -521,6 +537,8 @@ def flydsl_flash_attn_batch_func(
     # / deterministic), and flash_attn_func defaults it True — gating would reject all.
     if not supported:
         return None
+
+    _check_out(out, q, _v_hdim)
 
     return flash_attn_batch_m32x8(
         q,
