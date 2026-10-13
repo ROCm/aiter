@@ -371,6 +371,74 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
     }
 }
 
+// Naive two-stage AR with the replicated residual added in the all-gather, as in
+// cross_device_reduce_2stage_res. It has no per-rank warp split, so it covers
+// what that kernel cannot: TP6 (THREAD_NUM is not a multiple of 6) and inputs
+// whose packs do not divide evenly across ranks.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_naive_res(RankData* _input_dp,
+                                         RankData* _output_dp,
+                                         RankSignals sg,
+#ifndef USE_ROCM
+                                         volatile
+#endif
+                                         Signal* self_sg,
+                                         T* __restrict__ result,
+                                         const T* __restrict__ residual,
+                                         int rank,
+                                         int size)
+{
+    constexpr int pack_size = 16 / sizeof(T);
+    int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride              = gridDim.x * blockDim.x;
+    using P                 = typename opus::vector_t<T, pack_size>;
+    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
+    int part                = size / ngpus;
+    int start               = rank * part;
+    int end                 = rank == ngpus - 1 ? size : start + part;
+    int largest_part        = part + size % ngpus;
+    const P* ptrs[ngpus];
+    P* tmps[ngpus];
+#pragma unroll
+    for(int i = 0; i < ngpus; i++)
+    {
+        int target = (rank + i) % ngpus;
+        ptrs[i]    = (const P*)_input_dp->ptrs[target];
+        tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
+    }
+    auto tmp_out = tmps[0];
+    start_sync<ngpus>(sg, self_sg, rank);
+    // stage 1: reduce scatter
+    for(int idx = start + tid; idx < end; idx += stride)
+    {
+        tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
+    }
+    end_sync<ngpus>(sg, self_sg, rank);
+
+    // stage 2: allgather with the residual added after the reduced value has
+    // rounded to T. The tid must match stage 1 (see cross_device_reduce_2stage_naive).
+    for(int idx = tid; idx < largest_part; idx += stride)
+    {
+#pragma unroll
+        for(int i = 0; i < ngpus; i++)
+        {
+            int gather_from_rank = ((rank + i) % ngpus);
+            if(gather_from_rank == ngpus - 1 || idx < part)
+            {
+                int dst_idx = gather_from_rank * part + idx;
+                P reduced   = tmps[i][idx];
+                P res       = ((const P*)residual)[dst_idx];
+                P write_reg;
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    write_reg[j] = downcast_s<T>(upcast_s(reduced[j]) + upcast_s(res[j]));
+                ((P*)result)[dst_idx] = write_reg;
+            }
+        }
+    }
+}
+
 #define THREAD_NUM 512
 
 template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
@@ -5077,7 +5145,15 @@ class CustomAllreduce
 #define KL_RES(ngpus)                                                                      \
     do                                                                                     \
     {                                                                                      \
-        if(call_1stage && is_broadcast_reg_outptr)                                         \
+        /* The warp-split kernels need THREAD_NUM % ngpus == 0 (not TP6) and,              \
+           for 2-stage, an equal pack count per rank; the rest goes naive. */              \
+        if(ngpus == 6 || (!call_1stage && bytes % (ngpus * 16) != 0))                      \
+        {                                                                                  \
+            cross_device_reduce_2stage_naive_res<T, ngpus, false>                          \
+                <<<blocks, threads, 0, stream>>>(                                          \
+                    input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
+        }                                                                                  \
+        else if(call_1stage && is_broadcast_reg_outptr)                                   \
         {                                                                                  \
             cross_device_reduce_1stage_res<T, ngpus, true><<<blocks, threads, 0, stream>>>( \
                 input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size);    \
@@ -5088,7 +5164,7 @@ class CustomAllreduce
                 <<<blocks, threads, 0, stream>>>(                                          \
                     input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
         }                                                                                  \
-        else if(bytes % (ngpus * 16) == 0)                                                 \
+        else                                                                               \
         {                                                                                  \
             if(size % THREAD_NUM != 0)                                                    \
             {                                                                              \
@@ -5102,11 +5178,6 @@ class CustomAllreduce
                     <<<blocks, threads, 0, stream>>>(                                      \
                         input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
             }                                                                              \
-        }                                                                                  \
-        else                                                                               \
-        {                                                                                  \
-            throw std::runtime_error(                                                      \
-                "2-stage allreduce_residual requires vector-aligned input");              \
         }                                                                                  \
     } while(0)
 

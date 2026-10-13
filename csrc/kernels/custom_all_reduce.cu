@@ -474,10 +474,19 @@ void all_reduce_residual(fptr_t _fa,
     int64_t numel  = inp.numel();
     int64_t data_bytes = numel * inp.element_size();
 
+    // The kernels index out and residual by inp's extent, on inp's device.
     if(residual.numel() != numel)
         throw std::runtime_error("all_reduce_residual: residual numel must match input");
     if(residual.dtype() != dtype)
         throw std::runtime_error("all_reduce_residual: residual dtype must match input");
+    if(residual.device_id != inp.device_id)
+        throw std::runtime_error("all_reduce_residual: residual must be on the input's device");
+    if(out.numel() != numel)
+        throw std::runtime_error("all_reduce_residual: out numel must match input");
+    if(out.dtype() != dtype)
+        throw std::runtime_error("all_reduce_residual: out dtype must match input");
+    if(out.device_id != inp.device_id)
+        throw std::runtime_error("all_reduce_residual: out must be on the input's device");
     if(!use_new)
         throw std::runtime_error("all_reduce_residual requires use_new=true");
 

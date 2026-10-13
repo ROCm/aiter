@@ -57,13 +57,17 @@ def _run_graph(ca, fn, inputs_src, inputs_dst):
 
 
 def check_all_reduce_residual(ca, tp, rank, device, graphs):
-    # 1-stage below the size crossover, 2-stage above it.
-    for m in (1, 8, 64, 512):
-        x, reduced, residual = _int_inputs(m, tp, rank, (m, HIDDEN), device)
+    # 1-stage below the size crossover, 2-stage above it. The last shape is a
+    # 2-stage size whose 16-byte packs do not split evenly across ranks, so it
+    # takes the naive kernel (as does every size at TP6).
+    shapes = [(m, HIDDEN) for m in (1, 8, 64, 512)] + [(8 * (tp * 12800 + 1),)]
+    for shape in shapes:
+        m = shape[0]
+        x, reduced, residual = _int_inputs(m, tp, rank, shape, device)
         ref = (reduced + residual.float()).to(torch.bfloat16)
         out = ca.custom_all_reduce_residual(x, residual)
         torch.cuda.synchronize()
-        torch.testing.assert_close(out, ref, rtol=0, atol=0, msg=f"eager {m=}")
+        torch.testing.assert_close(out, ref, rtol=0, atol=0, msg=f"eager {shape=}")
 
         x_in = torch.zeros_like(x)
         graph, (gout,) = _run_graph(
@@ -75,9 +79,37 @@ def check_all_reduce_residual(ca, tp, rank, device, graphs):
             [x_in],
         )
         graphs.append((graph, x_in, gout))
-        torch.testing.assert_close(gout, ref, rtol=0, atol=0, msg=f"graph {m=}")
+        torch.testing.assert_close(gout, ref, rtol=0, atol=0, msg=f"graph {shape=}")
         if rank == 0:
-            logger.info("all_reduce_residual passed: m=%d, TP%d", m, tp)
+            logger.info("all_reduce_residual passed: shape=%s, TP%d", shape, tp)
+
+
+def check_residual_rejects_bad_out(ca, rank, device):
+    """The native op validates `out` before launching, not just `residual`."""
+    from aiter.ops import custom_all_reduce as ops
+
+    x = torch.ones((4, HIDDEN), dtype=torch.bfloat16, device=device)
+    bad_outs = {
+        "undersized": torch.empty((2, HIDDEN), dtype=x.dtype, device=device),
+        "wrong dtype": torch.empty(x.shape, dtype=torch.float32, device=device),
+    }
+    for name, out in bad_outs.items():
+        try:
+            ops.all_reduce_residual(
+                ca._ptr,
+                x,
+                out,
+                x,
+                True,
+                ca._pool["input"].data_ptr,
+                ca._pool["input"].max_size,
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError(f"all_reduce_residual accepted a {name} out")
+    if rank == 0:
+        logger.info("all_reduce_residual out checks passed")
 
 
 def check_norm_rows_skip_residual(ca, tp, rank, device, graphs):
@@ -186,8 +218,11 @@ def _worker(rank, tp, init_method):
         ca = CustomAllreduce(dist.group.WORLD, device)
         assert not ca.disabled, "requires custom allreduce"
         check_all_reduce_residual(ca, tp, rank, device, graphs)
-        check_norm_rows_skip_residual(ca, tp, rank, device, graphs)
-        check_1stage_rejects_options(ca, rank, device)
+        check_residual_rejects_bad_out(ca, rank, device)
+        # The fused allreduce + RMSNorm op rejects TP6.
+        if tp != 6:
+            check_norm_rows_skip_residual(ca, tp, rank, device, graphs)
+            check_1stage_rejects_options(ca, rank, device)
         torch.cuda.synchronize()
         dist.barrier()
     finally:
@@ -198,7 +233,7 @@ def _worker(rank, tp, init_method):
 
 
 parser = argparse.ArgumentParser(description="custom AR residual / norm-row options")
-parser.add_argument("-t", "--tp-size", type=int, choices=[2, 4, 8], default=8)
+parser.add_argument("-t", "--tp-size", type=int, choices=[2, 4, 6, 8], default=8)
 
 if __name__ == "__main__":
     args = parser.parse_args()
