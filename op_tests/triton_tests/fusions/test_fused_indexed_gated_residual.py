@@ -187,10 +187,11 @@ def test_rejects_mismatched_shapes():
 def test_rejects_unsupported_dtypes_and_devices():
     dev = "cuda"
     residual, x, gate, indices = make(32, 256, 3, torch.bfloat16, dev)
-    with pytest.raises(AssertionError):
-        fused_indexed_gated_residual(
-            residual.double(), x.double(), gate.double(), indices
-        )
+    for dtype in (torch.float16, torch.float32):
+        with pytest.raises(AssertionError):
+            fused_indexed_gated_residual(
+                residual.to(dtype), x.to(dtype), gate.to(dtype), indices
+            )
     with pytest.raises(AssertionError):
         fused_indexed_gated_residual(residual, x, gate.float(), indices)
     with pytest.raises(AssertionError):

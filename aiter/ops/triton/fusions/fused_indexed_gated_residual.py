@@ -32,7 +32,7 @@ def fused_indexed_gated_residual(
     combination.
 
     Key parameters:
-    - residual: [M, N] residual stream, bf16/fp16/fp32
+    - residual: [M, N] residual stream, bf16
     - x: [M, N] branch output, same dtype as residual
     - gate: [G, N] gate table, one row per index value, same dtype as residual
     - indices: [M] int32/int64, one table row per token
@@ -57,11 +57,7 @@ def fused_indexed_gated_residual(
         tuple(indices.shape),
     )
     assert residual.ndim == 2, f"residual must be 2-D, got {tuple(residual.shape)}"
-    assert residual.dtype in (
-        torch.bfloat16,
-        torch.float16,
-        torch.float32,
-    ), f"unsupported dtype: {residual.dtype}"
+    assert residual.dtype == torch.bfloat16, f"unsupported dtype: {residual.dtype}"
     M, N = residual.shape
     assert x.shape == residual.shape, f"x must be [{M}, {N}], got {tuple(x.shape)}"
     assert x.dtype == residual.dtype, "x and residual must have the same dtype"
