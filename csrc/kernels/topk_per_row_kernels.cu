@@ -2844,7 +2844,14 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                 uint64_t const valid_a = static_cast<uint64_t>(__ballot(lane < count));
                 uint64_t const valid_b =
                     static_cast<uint64_t>(__ballot(lane + WARP_SIZE < count));
-                uint64_t active_a = valid_a, active_b = valid_b;
+                // Liveness is kept per lane and balloted once after the walk:
+                // ROCm 7.1's clang has no __builtin_amdgcn_inverse_ballot_w64
+                // to read a wave mask back per lane, and reading its bit as
+                // (mask >> lane) & 1 costs VALU in every step. This equals a
+                // mask narrowed by a ballot per step only while every lane that
+                // takes the ballots above reaches the ones below: no lane may
+                // leave the walk on its own.
+                bool live_a = lane < count, live_b = lane + WARP_SIZE < count;
                 IdxT rank = needed;
                 IdxT live = count;
                 static_assert(wide_start_bit % 6 == 0);
@@ -2855,9 +2862,9 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                     // barrier, and Wave0's LDS operations complete in order.
                     wide[lane] = 0u;
                     __builtin_amdgcn_wave_barrier();
-                    if(__builtin_amdgcn_inverse_ballot_w64(active_a))
+                    if(live_a)
                         atomicAdd(wide + ((key_a >> shift) & 63u), 1u);
-                    if(__builtin_amdgcn_inverse_ballot_w64(active_b))
+                    if(live_b)
                         atomicAdd(wide + ((key_b >> shift) & 63u), 1u);
                     __builtin_amdgcn_wave_barrier();
                     int const bin   = static_cast<int>(wide[lane]);
@@ -2868,10 +2875,12 @@ __global__ void radix_topk_one_block_reg_kernel(T const* in,
                     live = static_cast<IdxT>(__builtin_amdgcn_readlane(bin, digit));
                     uint32_t const mask = 63u << shift;
                     uint32_t const want = static_cast<uint32_t>(digit) << shift;
-                    active_a &= static_cast<uint64_t>(__ballot((key_a & mask) == want));
-                    active_b &= static_cast<uint64_t>(__ballot((key_b & mask) == want));
+                    live_a = live_a && (key_a & mask) == want;
+                    live_b = live_b && (key_b & mask) == want;
                     __builtin_amdgcn_wave_barrier();
                 }
+                uint64_t const active_a = static_cast<uint64_t>(__ballot(live_a));
+                uint64_t const active_b = static_cast<uint64_t>(__ballot(live_b));
                 Bits const kth_bits =
                     active_a != 0
                         ? static_cast<Bits>(__builtin_amdgcn_readlane(
