@@ -1033,8 +1033,8 @@ def mla_decode_fwd(
             and get_gfx() == "gfx950"
             and page_size == 1
             and (
-                (q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16) or 
-                (q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8)
+                (q.dtype == dtypes.bf16 and kv_buffer.dtype == dtypes.bf16)
+                or (q.dtype == dtypes.fp8 and kv_buffer.dtype == dtypes.fp8)
             )
         )
 
