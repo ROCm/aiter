@@ -4,7 +4,10 @@
 import pytest
 import torch
 
+import aiter
 from aiter import dtypes
+from aiter.jit.core import AITER_CONFIGS
+from aiter.jit.utils.chip_info import get_gfx_runtime
 from aiter.ops import gemm_op_a8w8 as gemm_mod
 from aiter.ops.shuffle import shuffle_weight
 
@@ -52,7 +55,7 @@ def test_shuffle_weight_pad_k_to_pads_last_dim():
     assert shuffled.aiter_padded_k == 128
 
 
-def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_ck_config(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_ck(monkeypatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -66,6 +69,7 @@ def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_ck_config(monkeypatch):
     def fake_ck(XQ, WQ, x_scale, w_scale, Y, splitK):
         seen["x_shape"] = tuple(XQ.shape)
         seen["w_shape"] = tuple(WQ.shape)
+        seen["tail_is_zero"] = bool((XQ[:, 96:].to(torch.float32) == 0).all())
         return Y
 
     monkeypatch.setattr(gemm_mod, "get_GEMM_config_with_quant_type", fake_config)
@@ -76,11 +80,12 @@ def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_ck_config(monkeypatch):
     assert out.shape == (2, 16)
     assert out.dtype == torch.bfloat16
     assert seen["config_shape"] == (2, 16, 96)
-    assert seen["x_shape"] == (2, 96)
+    assert seen["x_shape"] == (2, 128)
     assert seen["w_shape"] == (16, 128)
+    assert seen["tail_is_zero"]
 
 
-def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_cktile_config(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_cktile(monkeypatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -94,6 +99,7 @@ def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_cktile_config(monkeypatch):
     def fake_cktile(XQ, WQ, x_scale, w_scale, Y, splitK):
         seen["x_shape"] = tuple(XQ.shape)
         seen["w_shape"] = tuple(WQ.shape)
+        seen["tail_is_zero"] = bool((XQ[:, 96:].to(torch.float32) == 0).all())
         return Y
 
     monkeypatch.setattr(gemm_mod, "get_GEMM_config_with_quant_type", fake_config)
@@ -104,8 +110,9 @@ def test_gemm_a8w8_bpreshuffle_uses_logical_k_for_cktile_config(monkeypatch):
     assert out.shape == (2, 16)
     assert out.dtype == torch.bfloat16
     assert seen["config_shape"] == (2, 16, 96)
-    assert seen["x_shape"] == (2, 96)
+    assert seen["x_shape"] == (2, 128)
     assert seen["w_shape"] == (16, 128)
+    assert seen["tail_is_zero"]
 
 
 def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
@@ -124,6 +131,7 @@ def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
     def fake_cktile(XQ, WQ, x_scale, w_scale, Y, splitK):
         seen["x_shape"] = tuple(XQ.shape)
         seen["w_shape"] = tuple(WQ.shape)
+        seen["tail_is_zero"] = bool((XQ[:, 96:].to(torch.float32) == 0).all())
         return Y
 
     monkeypatch.setattr(gemm_mod, "get_GEMM_config_with_quant_type", fake_config)
@@ -134,11 +142,12 @@ def test_gemm_a8w8_bpreshuffle_falls_back_to_padded_k_config(monkeypatch):
     assert out.shape == (2, 16)
     assert out.dtype == torch.bfloat16
     assert seen["config_shapes"] == [(2, 16, 96), (2, 16, 128)]
-    assert seen["x_shape"] == (2, 96)
+    assert seen["x_shape"] == (2, 128)
     assert seen["w_shape"] == (16, 128)
+    assert seen["tail_is_zero"]
 
 
-def test_gemm_a8w8_bpreshuffle_uses_cktile_for_untuned_padded_k(monkeypatch):
+def test_gemm_a8w8_bpreshuffle_pads_activation_for_untuned_cktile(monkeypatch):
     xq = torch.zeros((2, 96), device="cuda", dtype=dtypes.fp8)
     wq = torch.zeros((16, 128), device="cuda", dtype=dtypes.fp8)
     x_scale = torch.ones((2, 1), device="cuda", dtype=torch.float32)
@@ -151,6 +160,7 @@ def test_gemm_a8w8_bpreshuffle_uses_cktile_for_untuned_padded_k(monkeypatch):
     def fake_cktile(XQ, WQ, x_scale, w_scale, Y, splitK):
         seen["x_shape"] = tuple(XQ.shape)
         seen["w_shape"] = tuple(WQ.shape)
+        seen["tail_is_zero"] = bool((XQ[:, 96:].to(torch.float32) == 0).all())
         return Y
 
     def fake_ck(*args, **kwargs):
@@ -165,8 +175,9 @@ def test_gemm_a8w8_bpreshuffle_uses_cktile_for_untuned_padded_k(monkeypatch):
     assert out.shape == (2, 16)
     assert out.dtype == torch.bfloat16
     assert seen["config_shapes"] == [(2, 16, 96), (2, 16, 128)]
-    assert seen["x_shape"] == (2, 96)
+    assert seen["x_shape"] == (2, 128)
     assert seen["w_shape"] == (16, 128)
+    assert seen["tail_is_zero"]
 
 
 def test_gemm_a8w8_bpreshuffle_pads_activation_for_flydsl(monkeypatch):
@@ -205,3 +216,57 @@ def test_gemm_a8w8_bpreshuffle_rejects_short_weight_k():
 
     with pytest.raises(RuntimeError, match="WQ K >= XQ K"):
         gemm_mod.gemm_a8w8_bpreshuffle(xq, wq, x_scale, w_scale, dtype=torch.bfloat16)
+
+
+def _padded_k_backend(m, n, k, w_k):
+    """(libtype, split-K?) the dispatcher picks for a K-padded weight, or None."""
+    for kk in (k, w_k):
+        config = gemm_mod.get_GEMM_config_with_quant_type(
+            m, n, kk, dtypes.fp8, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_BPRESHUFFLE_FILE
+        )
+        if config is not None:
+            return config["libtype"], int(config["splitK"]) > 0
+    return None
+
+
+# gfx950 rows reaching each CK/CKTile/FlyDSL path with a K-padded weight, either
+# through the logical-K row or the padded-K fallback lookup, plus untuned shapes.
+_PADDED_K_CASES = [
+    ("untuned", None, 37, 1280, 448, 512),
+    ("untuned-half", None, 37, 1280, 256, 512),
+    ("ck-logical-k", ("ck", False), 1, 64, 4096, 4224),
+    ("ck-splitk-logical-k", ("ck", True), 4, 64, 4096, 4224),
+    ("cktile-logical-k", ("cktile", False), 1, 1536, 128, 256),
+    ("ck-padded-k-row", ("ck", False), 32, 384, 7040, 7168),
+    ("cktile-padded-k-row", ("cktile", False), 2048, 384, 7040, 7168),
+    ("flydsl-padded-k-row", ("flydsl", False), 512, 384, 7040, 7168),
+]
+
+
+@pytest.mark.parametrize(
+    "backend,m,n,k,w_k",
+    [c[1:] for c in _PADDED_K_CASES],
+    ids=[c[0] for c in _PADDED_K_CASES],
+)
+def test_gemm_a8w8_bpreshuffle_padded_k_matches_reference(backend, m, n, k, w_k):
+    if backend is not None and get_gfx_runtime() != "gfx950":
+        pytest.skip("rows are picked from the gfx950 tuned tables")
+    assert (
+        _padded_k_backend(m, n, k, w_k) == backend
+    ), f"M={m} N={n} K={k}->{w_k} no longer selects {backend}; pick another row"
+    torch.manual_seed(0)
+    x = torch.randn((m, k), dtype=dtypes.bf16, device="cuda")
+    w = torch.randn((n, k), dtype=dtypes.bf16, device="cuda")
+    xq, x_scale = aiter.pertoken_quant(x, quant_dtype=dtypes.fp8)
+    wq, w_scale = aiter.pertoken_quant(w, quant_dtype=dtypes.fp8)
+    ref = (xq.to(torch.float32) * x_scale) @ (wq.to(torch.float32) * w_scale).t()
+    wq_padded = shuffle_weight(wq, layout=(16, 16), pad_k_to=w_k)
+    assert wq_padded.shape == (n, w_k)
+
+    out = gemm_mod.gemm_a8w8_bpreshuffle(
+        xq, wq_padded, x_scale, w_scale, dtype=torch.bfloat16
+    )
+
+    # bf16 output rounding only; a misread weight is off by O(1) of the max.
+    err = (out.to(torch.float32) - ref).abs().max() / ref.abs().max()
+    assert err < 0.01, f"max error {err:.4f} of the reference max"
