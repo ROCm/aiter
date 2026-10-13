@@ -798,6 +798,7 @@ def rotation_smooth_qk(
         # = Q_rot x K_rot + q_mean x K_rot
         # = Q_rot x K_rot + delta_s
         grid_delta = (b * h_q, Q_NUM_BLKS, K_NUM_BLKS)
+        stride_rkb, stride_rkn, stride_rkh, stride_rkd = map_dims(K_rot.stride(), bshd)
         _compute_delta_s_kernel[grid_delta](
             q_mean,
             K_rot,
@@ -806,10 +807,10 @@ def rotation_smooth_qk(
             q_mean.stride(1),
             q_mean.stride(2),
             q_mean.stride(3),
-            stride_kb,
-            stride_kh,
-            stride_kn,
-            stride_kd,
+            stride_rkb,
+            stride_rkh,
+            stride_rkn,
+            stride_rkd,
             delta_s.stride(0),
             delta_s.stride(1),
             delta_s.stride(2),
