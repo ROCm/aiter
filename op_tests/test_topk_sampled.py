@@ -2,6 +2,7 @@
 row whose candidates overflow. `sampled` only offers a faster algorithm, so each
 test holds it to what the entry it serves already does."""
 
+import contextlib
 import os
 from unittest import mock
 
@@ -15,10 +16,19 @@ N = 131072
 K = 2048
 
 
+@contextlib.contextmanager
 def _use_sampled(on):
-    os.environ["AITER_DISABLE_TOPK_SAMPLED"] = "0" if on else "1"
-    S._available.cache_clear()
-    S._choose.cache_clear()
+    """AITER_DISABLE_TOPK_SAMPLED set for the block and restored after it, with
+    the memoised routing dropped on the way in and out."""
+    flag = {"AITER_DISABLE_TOPK_SAMPLED": "0" if on else "1"}
+    with mock.patch.dict(os.environ, flag):
+        S._available.cache_clear()
+        S._choose.cache_clear()
+        try:
+            yield
+        finally:
+            S._available.cache_clear()
+            S._choose.cache_clear()
 
 
 def _bounds(rows, width):
@@ -109,21 +119,19 @@ def test_sampled_layout_contract():
     # it: same writes, same untouched slots.
     out = {}
     for on in (True, False):
-        _use_sampled(on)
-        g = torch.full((rows, K + 17), -7, dtype=torch.int32, device="cuda")
-        T.top_k_per_row_prefill(x, rs, re, g[:, :K], None, rows, N, 1, K)
-        torch.cuda.synchronize()
-        out[on] = g.view(-1).sort().values
-    _use_sampled(True)
+        with _use_sampled(on):
+            g = torch.full((rows, K + 17), -7, dtype=torch.int32, device="cuda")
+            T.top_k_per_row_prefill(x, rs, re, g[:, :K], None, rows, N, 1, K)
+            torch.cuda.synchronize()
+            out[on] = g.view(-1).sort().values
     assert torch.equal(out[True], out[False]), "the router changed a strided call"
     out = {}
     for on in (True, False):
-        _use_sampled(on)
-        g = torch.full((rows, 2 * K), -7, dtype=torch.int32, device="cuda")
-        T.top_k_per_row_prefill(x, rs, re, g, None, rows, N, 1, K)
-        torch.cuda.synchronize()
-        out[on] = g.view(-1).sort().values
-    _use_sampled(True)
+        with _use_sampled(on):
+            g = torch.full((rows, 2 * K), -7, dtype=torch.int32, device="cuda")
+            T.top_k_per_row_prefill(x, rs, re, g, None, rows, N, 1, K)
+            torch.cuda.synchronize()
+            out[on] = g.view(-1).sort().values
     assert torch.equal(out[True], out[False]), "the router changed a [rows, 2k] call"
     print("[sampled_layout] PASS")
 
@@ -143,15 +151,15 @@ def test_sampled_nan_order():
         bits[:, 1000 * j + 7] = p
     nan_cols = torch.tensor([1000 * j + 7 for j in range(len(payloads))], device="cuda")
 
-    _use_sampled(True)
-    avail = S._available(
-        N, k, 64, False, True, T._sampled_on_device(0), T._device_arch(0)
-    )
-    assert (
-        S.topk_select_backend(rows, N, k, avail, device=0) == "sampled"
-    ), "this shape must exercise `sampled`"
-    vals, idx = aiter.topk_select(x, k, return_value=True)
-    torch.cuda.synchronize()
+    with _use_sampled(True):
+        avail = S._available(
+            N, k, 64, False, True, T._sampled_on_device(0), T._device_arch(0)
+        )
+        assert (
+            S.topk_select_backend(rows, N, k, avail, device=0) == "sampled"
+        ), "this shape must exercise `sampled`"
+        vals, idx = aiter.topk_select(x, k, return_value=True)
+        torch.cuda.synchronize()
     assert _selected_keys_match(x, idx, k, _nan_high_key), "topk_select NaN order"
     assert bool(torch.isin(nan_cols, idx).all()), "every NaN must be selected"
     assert torch.equal(
@@ -161,8 +169,9 @@ def test_sampled_nan_order():
     rs, re = _bounds(rows, N)
     pidx = torch.empty(rows, k, dtype=torch.int32, device="cuda")
     pval = torch.empty(rows, k, device="cuda")
-    T.top_k_per_row_prefill(x, rs, re, pidx, pval, rows, N, 1, k)
-    torch.cuda.synchronize()
+    with _use_sampled(True):
+        T.top_k_per_row_prefill(x, rs, re, pidx, pval, rows, N, 1, k)
+        torch.cuda.synchronize()
     assert _selected_keys_match(x, pidx, k, _sign_key), "prefill sign order"
     assert torch.equal(
         pval.view(torch.int32), x.gather(1, pidx.long()).view(torch.int32)
@@ -222,12 +231,12 @@ def test_sampled_eligibility_per_device():
         select = S._choose(rows, N, N, K, 64, False, None, False, True, dev, True)
         return prefill, select == "sampled"
 
-    _use_sampled(True)
     for order in ((0, 1), (1, 0)):
         reset()
         T._device_arch = S._device_arch = fake_arch
         try:
-            got = {dev: routes_to_sampled(dev) for dev in order}
+            with _use_sampled(True):
+                got = {dev: routes_to_sampled(dev) for dev in order}
         finally:
             T._device_arch = S._device_arch = real_arch
             reset()
