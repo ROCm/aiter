@@ -618,22 +618,24 @@ def deepgemm_fp8_paged_mqa_logits(
         if get_gfx() == "gfx1250":
             SplitKV = (max(1, TotalCuCount // TileQCount) + 4) // 5 * 5 * WavePerEU * 2
         else:
-            # Two workgroups per CU, with the context split evenly between
-            # them. Rounding SplitKV itself to a multiple of 5 leaves the grid
-            # at a fraction of the CU count -- 2.5 workgroups per CU at batch
-            # 16/32/64 -- so half the CUs run one more workgroup than the other
-            # half and the kernel waits for them. Sizing the grid instead of
-            # SplitKV keeps that from happening at any batch.
-            SplitKV = max(1, -(-2 * TotalCuCount // TileQCount))
-            chunks = max(1, -(-max_model_len // ChunkK))
-            # Two per CU stops being enough once a workgroup's share of the
+            # One full residency wave, with the context split evenly across it.
+            # waves_per_eu is passed to LLVM as both the minimum and the
+            # maximum, so WavePerEU 4-warp workgroups fit on a CU. Rounding
+            # SplitKV itself to a multiple of 5 leaves the grid at a fraction
+            # of that -- 2.5 workgroups per CU at batch 16/32/64 with the
+            # default WavePerEU=2 -- so half the CUs run one more workgroup
+            # than the other half and the kernel waits for them. Sizing the
+            # grid instead of SplitKV keeps that from happening at any batch.
+            SplitKV = max(1, triton.cdiv(WavePerEU * TotalCuCount, TileQCount))
+            chunks = max(1, triton.cdiv(max_model_len, ChunkK))
+            # One wave stops being enough once a workgroup's share of the
             # context passes ~32 chunks: at batch 128/256 it leaves each one
             # chewing 128-256 chunks with no queue behind it to rebalance
             # against. Split further there, by at most 2x -- `max_model_len` is
             # only an upper bound on the context, since the real lengths live in
             # a device tensor, and a loose bound must not over-split without
             # limit.
-            SplitKV = min(max(SplitKV, -(-chunks // 32)), SplitKV * 2)
+            SplitKV = min(max(SplitKV, triton.cdiv(chunks, 32)), SplitKV * 2)
             # Splits past the last chunk return immediately; don't launch them.
             SplitKV = min(SplitKV, chunks)
 
