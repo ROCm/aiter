@@ -527,7 +527,15 @@ def build_hstu_attention_bwd_dvdk_pp(
 
         def make_dma(tensor, base_byte_off, dst_views, swizzled):
             div = _rebased_buffer_div(
-                fx.get_iter(tensor), base_byte_off, max_seq_len * stride_qk_n
+                # num_records = THIS sequence's extent, not the tensor's. The
+                # buffer descriptor then does the row bound check in hardware:
+                # any voffset past the last valid token returns 0, so the
+                # explicit `(q_start + row) < seq_len` select below is not
+                # needed, and out-of-range rows arrive in LDS as ZERO rather
+                # than as a copy of token 0.
+                fx.get_iter(tensor),
+                base_byte_off,
+                seq_len * stride_qk_n,
             )
             rows, gcols = [], []
             for d in range_constexpr(NUM_DMA):
@@ -549,9 +557,7 @@ def build_hstu_attention_bwd_dvdk_pp(
 
             def fire(slot, q_start, d):
                 row = rows[d]
-                in_bounds = (q_start + row) < seq_len
-                local_tok = in_bounds.select(q_start + row, fx.Int32(0))
-                src_elem = local_tok * c_stride_n + gcols[d]
+                src_elem = (q_start + row) * c_stride_n + gcols[d]
                 lds_byte = fx.Int32(lane0[slot]) + fx.Int32(
                     d * GRP_THREADS * DMA_BYTES
                 )
@@ -600,6 +606,32 @@ def build_hstu_attention_bwd_dvdk_pp(
 
         transpose_q = make_transpose(q_views, q_t_wr, True)
         transpose_do = make_transpose(do_views, do_t_wr, True)
+
+        def rm_zero(owns_q):
+            """Zero this group's row-major Q/dO tiles once, in the prologue.
+
+            With the buffer descriptor sized to the sequence, a `buffer_load
+            ... lds` whose row is past the end does not write LDS at all -- it
+            does NOT deposit zero (measured: dropping the gate's
+            `q_raw < seq_len` on that assumption gave 13-35% mismatch). So the
+            tail rows of the last tile are simply left as they were. That is
+            fine from the second tile on, where they hold an earlier tile's
+            finite data and the gate masks them -- but on the first tile they
+            would be whatever the previous dispatch left, and a NaN there meets
+            a masked zero in GEMM1/GEMM3 and poisons dV/dK for the whole sweep.
+            Same hazard, and same fix, as `transpose_zero` above.
+
+            Each group zeroes ONLY the tensor it DMAs. Zeroing both would be
+            a cross-group race: `lgkmcnt` is per-wave, so g1's `ds_write` to
+            the Q tile can retire after g0's `buffer_load ... lds` has filled
+            it, erasing the tile. Measured as 0.7-1.4% mismatch.
+            """
+            z = Vec(c_zero_pack)
+            row = grp_tid // fx.Int32(STRIDE // MFMA_LANE_K)
+            colgrp = grp_tid % fx.Int32(STRIDE // MFMA_LANE_K)
+            views = q_views if const_expr(owns_q) else do_views
+            for slot in range_constexpr(RM_SLOTS):
+                views[slot][row, colgrp, None].store(z)
 
         def transpose_zero(t_slot):
             # The T_GPAD tail of each q-group is never read, so zeroing the
@@ -978,6 +1010,16 @@ def build_hstu_attention_bwd_dvdk_pp(
             # exist. Their A operands are zero, but `0 * NaN` is NaN and would
             # poison the accumulators for the whole sweep, so zero that slot.
             transpose_zero(1)
+            # Must retire BEFORE the tile-0 DMA is fired: these `ds_write`s and
+            # the `buffer_load ... lds` below target the same LDS, and without
+            # the fence the zeroing can land after the load and erase it.
+            # (`transpose_zero` needs no such fence -- it writes q_t/do_t,
+            # which the DMA never touches.)
+            if is_g0:
+                rm_zero(True)
+            else:
+                rm_zero(False)
+            rocdl.s_waitcnt(lgkmcnt=0)
             # Prime the pipeline with tile T0; the loop fires one tile ahead.
             _t0 = q_tile_start * fx.Int32(BLOCK_N)
             if is_g0:
