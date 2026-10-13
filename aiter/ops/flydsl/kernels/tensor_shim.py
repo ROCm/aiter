@@ -188,7 +188,16 @@ _FX_ELEM = {
 
 
 def _fx_elem(dtype):
-    """fx element class for an MLIR scalar type."""
+    """fx element class for an MLIR scalar type (or an fx numeric class).
+
+    GTensor callers pass fx numeric classes (``fx.Float32``, ``fx.BFloat16``,
+    ...) as well as MLIR scalar types (``T.f32``). An fx numeric class is already
+    the element class, so return it directly -- the MLIR-type path below would
+    instead try to instantiate it (``dtype()``), which fails because fx scalars
+    require a value argument.
+    """
+    if isinstance(dtype, type) and dtype in _FX_ELEM.values():
+        return dtype
     key = str(dtype() if callable(dtype) else dtype)
     try:
         return _FX_ELEM[key]

@@ -17,6 +17,8 @@ from aiter.jit.utils.chip_info import get_gfx
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
+from .kernels.gemm_a16w16_gfx942 import gemm_a16w16 as gemm_a16w16_gfx942
+from .kernels.gemm_a16w16_gfx942 import gfx942_auto_config
 from .kernels.gemm_a16w16_gfx950 import (
     SPLIT_K_SEMAPHORE_MAX_LEN,
     gemm_a16w16,
@@ -164,9 +166,45 @@ def flydsl_hgemm(
                 split_k=split_k,
                 main_loop_unroll=policy in ("ht", "hti"),
             )
+    if gfx == "gfx942":
+        if not a.is_contiguous():
+            a = a.contiguous()
+        if not b.is_contiguous():
+            b = b.contiguous()
+        # When the caller leaves tiling at the signature defaults, pick the
+        # best-known per-shape config (Phase-3 tuning); explicit overrides win.
+        untuned = (
+            block_m == 128 and block_n == 128 and block_k == 64 and stages == 2
+            and split_k == 1 and m_waves == 2 and n_waves == 2 and group_m == 0
+        )
+        if untuned:
+            user_kwargs = gfx942_auto_config(a.shape[0], b.shape[0], a.shape[1])
+        else:
+            user_kwargs = {
+                "block_m": block_m,
+                "block_n": block_n,
+                "block_k": block_k,
+                "stages": stages,
+                "split_k": split_k,
+                "m_waves": m_waves,
+                "n_waves": n_waves,
+                "k_waves": k_waves,
+                "group_m": group_m,
+            }
+        return gemm_a16w16_gfx942(
+            a,
+            b.t(),
+            out=out,
+            bias=bias,
+            user_kwargs=user_kwargs,
+            stream=launch_stream,
+            layout="nt",
+            out_dtype=out_dtype,
+        )
+
     if gfx != "gfx950":
         raise RuntimeError(
-            "The FlyDSL A16W16 kernel currently supports gfx950 and gfx1250 only"
+            "The FlyDSL A16W16 kernel currently supports gfx942, gfx950 and gfx1250 only"
         )
 
     if not a.is_contiguous():
