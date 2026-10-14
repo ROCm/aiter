@@ -30,9 +30,9 @@ ENTRIES = {
     "stage1": ("gfx942", "gfx950"),
 }
 GLUON_ENTRIES = ("gluon", "gluon_preshuffle", "gluon_varctx")
-# The stage1 and varctx kernels write whole ChunkK (256) tiles, so the output
-# row width is kept a multiple of it; a narrower row is overwritten by the
-# tail of the row before it.
+# stage1 and the varctx kernel write whole tail tiles past the end of the
+# output (known bug, separate fix): up to ChunkK (256) columns for stage1 and
+# up to KVBlockSize for varctx. Keep the row width a multiple of both until then.
 ROW_ALIGN = 256
 
 
@@ -154,12 +154,16 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
             atol=0,
         )
 
-    # A short [B], too few rows, no columns, a strided [B] or [B, n], a dtype
-    # other than int32, or a tensor on another device are rejected.
+    # A row count other than B, a column count other than 1 or next_n, a
+    # strided [B] or [B, n], a dtype other than int32, or a tensor on another
+    # device are rejected.
     for bad in (
         seq_lens[:-1],
+        torch.cat([seq_lens, seq_lens[:1]]),
         row_lens[:-1],
+        torch.cat([row_lens, row_lens[:1]]),
         row_lens[:, :0],
+        row_lens[:, 1:].contiguous(),
         row_lens[:, -1],
         row_lens.t().contiguous().t(),
         row_lens.long(),

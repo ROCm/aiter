@@ -83,13 +83,28 @@ else:
 
 
 def _context_lens_and_stride(
-    context_lens: torch.Tensor, batch_size: int, device: torch.device | None = None
+    context_lens: torch.Tensor,
+    batch_size: int,
+    next_n: int,
+    device: torch.device | None = None,
 ):
-    # The kernels read sequence b's length at b * stride + stride - 1: element b
-    # of [B], or the last entry of row b of a contiguous (B, n) per-row table.
-    # A strided input is rejected rather than copied: a hidden copy allocates on
-    # every call, and the kernels would otherwise read it as dense. The Gluon
-    # kernels take context_len_ptr as *i32, so other dtypes are rejected too.
+    """Check ``context_lens`` and return it with the stride the kernels read it at.
+
+    ``context_lens``: int32, contiguous, on the query's device (any GPU for the
+    schedule, which takes no query). Either
+
+    - ``[B]``: the full length ``L_b`` of request ``b``, including its ``next_n``
+      query tokens, or
+    - ``(B, next_n)``: row ``b`` is ``[L_b - next_n + 1, ..., L_b]``, the layout
+      vLLM builds. Only the last column is read: query row ``j``
+      (``0 <= j < next_n``) attends to KV positions ``[0, L_b - next_n + 1 + j)``,
+      so other row values are not supported.
+
+    ``(B, 1)`` is the same as ``[B]``. The kernels read request ``b``'s length at
+    ``b * stride + stride - 1``. Anything else raises ``ValueError``: a strided
+    tensor is rejected rather than copied (a hidden copy would allocate on every
+    call), and the Gluon kernels take ``context_len_ptr`` as ``*i32``.
+    """
     on_device = (
         context_lens.device == device
         if device is not None
@@ -107,10 +122,10 @@ def _context_lens_and_stride(
         )
     rows = context_lens.shape[0]
     cols = context_lens.shape[1] if context_lens.dim() == 2 else 1
-    if rows < batch_size or cols < 1:
+    if rows != batch_size or cols not in (1, next_n):
         raise ValueError(
-            f"context_lens needs at least B={batch_size} rows and, if 2D, one "
-            f"column, got shape {tuple(context_lens.shape)}"
+            f"context_lens must be [B] or (B, n) with B={batch_size} and n in "
+            f"(1, next_n={next_n}), got shape {tuple(context_lens.shape)}"
         )
     return context_lens, cols
 
@@ -245,7 +260,7 @@ def deepgemm_fp8_paged_mqa_logits_stage1(
     )
 
     context_lens, ctx_stride = _context_lens_and_stride(
-        context_lens, batch_size, q_fp8.device
+        context_lens, batch_size, next_n, q_fp8.device
     )
 
     TileQCount = batch_size * next_n * (heads // ChunkQ)
@@ -502,7 +517,9 @@ def deepgemm_fp8_paged_mqa_logits_schedule(
     grid = (TotalCuCount * schedule_waves_per_eu, 1, 1)
     TryCount = math.ceil(max_chunks / grid[0])
     align_power_of_2_batch = 1 << (batch_size - 1).bit_length()
-    context_lens, ctx_stride = _context_lens_and_stride(context_lens, batch_size)
+    context_lens, ctx_stride = _context_lens_and_stride(
+        context_lens, batch_size, next_n
+    )
 
     safe_chunks_per_cta = torch.empty(
         (1,),
@@ -633,7 +650,7 @@ def deepgemm_fp8_paged_mqa_logits(
     _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
     context_lens, ctx_stride = _context_lens_and_stride(
-        context_lens, batch_size, q_fp8.device
+        context_lens, batch_size, next_n, q_fp8.device
     )
 
     Persistent = PersistentSchedule is not None
