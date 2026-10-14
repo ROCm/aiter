@@ -966,8 +966,14 @@ def launch_mla_pagesize1_fp8_fp8(
             def copy_output_to_global(ptr_out, elem_ty, tile_base, q_len):
                 rows = q_tile_rows * num_q_heads
                 valid_rows = q_len * num_q_heads
-                layout = fx.make_layout((rows, V_HEAD_DIM), (V_HEAD_DIM, 1))
-                lds_view = fx.Tensor(
+                out_tile = (rows, V_HEAD_DIM)
+                global_view = fx.Tensor(
+                    fx.make_view(
+                        fx.add_offset(ptr_out, tile_base),
+                        fx.make_layout((valid_rows, V_HEAD_DIM), (V_HEAD_DIM, 1)),
+                    )
+                )
+                lds_box = fx.Tensor(
                     fx.make_view(
                         fx.recast_iter(
                             fx.PointerType.get(
@@ -977,22 +983,23 @@ def launch_mla_pagesize1_fp8_fp8(
                             ),
                             lds_base,
                         ),
-                        layout,
+                        fx.make_layout(
+                            (out_tile, 1), ((V_HEAD_DIM, 1), rows * V_HEAD_DIM)
+                        ),
                     )
                 )
-                global_view = fx.Tensor(
-                    fx.make_view(fx.add_offset(ptr_out, tile_base), layout)
-                )
-                fx.copy(
-                    fx.rocdl.make_tdm_atom(
-                        global_view,
-                        [valid_rows, None],
-                        strides=[V_HEAD_DIM, None],
-                        num_warps=NUM_WAVES,
-                    ),
-                    lds_view,
+                out_atom, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                    fx.rocdl.TensorStore(),
                     global_view,
+                    fx.make_layout(out_tile, (V_HEAD_DIM, 1)),
+                    out_tile,
+                    num_warps=NUM_WAVES,
                 )
+                out_blk = fx.zipped_divide(out_coord, out_tile)[None, (0, None)]
+                tOs, tOg = fx.rocdl.cdna5.tdm_partition(
+                    out_atom, wave_id, fx.make_layout(NUM_WAVES, 1), lds_box, out_blk
+                )
+                fx.copy(out_atom, tOs[None, 0], tOg[None, 0])
 
             lse_value = has_mass.select(
                 running_max + fmath.log(running_sum),
