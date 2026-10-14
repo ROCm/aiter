@@ -1,3 +1,5 @@
+import functools
+
 import triton.experimental.gluon.language as gl
 from triton._C.libtriton.gluon_ir import make_cga_layout
 from triton.experimental import gluon
@@ -22,6 +24,19 @@ def cluster_shape(num_ctas, BLOCK_M, BLOCK_N):
 
 
 def get_gemm_afp4wfp4_preshuffle_layouts(
+    num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+):
+    # Building the layouts costs ~1 ms of Python per call and depends only on
+    # these ints: build once per config, return a copy (callers may mutate it).
+    return dict(
+        _build_gemm_afp4wfp4_preshuffle_layouts(
+            num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
+        )
+    )
+
+
+@functools.cache
+def _build_gemm_afp4wfp4_preshuffle_layouts(
     num_warps, BLOCK_M, BLOCK_N, BLOCK_K, num_ctas
 ):
     # each CTA computes BLOCK_M // CTAS_M x BLOCK_N // CTAS_N of it.
@@ -178,6 +193,7 @@ def _issue_tdm_stage(
     off_b,
     off_as,
     off_bs,
+    NUM_WARPS: gl.constexpr,
 ):
     # Movbe all descriptors before the four copies then the compiler fuses all TDM copies
     a_desc = gl.amd.gfx1250.tdm.update_tensor_descriptor(a_desc, add_offsets=[0, off_a])
@@ -189,10 +205,23 @@ def _issue_tdm_stage(
         bs_desc, add_offsets=[0, off_bs]
     )
 
-    gl.amd.gfx1250.tdm.async_load(a_desc, dest=a_slot)
-    gl.amd.gfx1250.tdm.async_load(b_desc, dest=b_slot)
-    gl.amd.gfx1250.tdm.async_load(as_desc, dest=as_slot)
-    gl.amd.gfx1250.tdm.async_load(bs_desc, dest=bs_slot)
+    if NUM_WARPS == 2:
+        gl.amd.gfx1250.tdm.async_load_fused(
+            [(a_desc, a_slot, 0b01), (b_desc, b_slot, 0b10)]
+        )
+        gl.amd.gfx1250.tdm.async_load_fused(
+            [(as_desc, as_slot, 0b01), (bs_desc, bs_slot, 0b10)]
+        )
+    else:
+        W: gl.constexpr = ((1 << NUM_WARPS) - 1) // 0b1111
+        gl.amd.gfx1250.tdm.async_load_fused(
+            [
+                (a_desc, a_slot, W),
+                (b_desc, b_slot, W << 1),
+                (as_desc, as_slot, W << 2),
+                (bs_desc, bs_slot, W << 3),
+            ]
+        )
 
 
 _gemm_mxfp4_preshuffle_gfx1250_repr = make_kernel_repr(
@@ -395,7 +424,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         off_b = load_idx * BLOCK_K_BYTES * 16
         off_as = load_idx * K_GROUPS * A_PRESHUFFLE_FACTOR
         off_bs = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
-        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs)  # fmt: skip
+        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps)  # fmt: skip
         load_idx += 1
 
     # --- 2. Pre-load tile 0 from LDS into registers ---
@@ -438,7 +467,7 @@ def gemm_mxfp4_preshuffle_gfx1250(
         off_b = load_idx * BLOCK_K_BYTES * 16
         off_as = load_idx * K_GROUPS * A_PRESHUFFLE_FACTOR
         off_bs = load_idx * K_GROUPS * PRESHUFFLE_FACTOR
-        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs)  # fmt: skip
+        _issue_tdm_stage(a_desc, b_desc, as_desc, bs_desc, a_slot, b_slot, as_slot, bs_slot, off_a, off_b, off_as, off_bs, num_warps)  # fmt: skip
 
         gl.amd.gfx1250.tdm.async_wait((NUM_BUFFERS - 1) * TDM_OPS_PER_STAGE)
         load_idx += 1

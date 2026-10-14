@@ -628,7 +628,16 @@ def test_mla(
         and not (nhead == 64 and decode_qlen > 1)
     ):
         err, us_asm_decode = test_absorb_decode_bf16()
-    elif kvtype == dtypes.fp8 and nhead in [8, 16, 32, 128]:
+    elif kvtype == dtypes.fp8 and (
+        nhead in [8, 16, 32, 128]
+        # non-persistent qt64 kernel: gfx950 fp8/fp8 nhead=64 qlen=1 only
+        or (
+            nhead == 64
+            and dtype == dtypes.fp8
+            and decode_qlen == 1
+            and get_gfx() == "gfx950"
+        )
+    ):
         err, us_asm_decode = test_absorb_decode_fp8()
 
     ret["decode:err"] = err
@@ -877,34 +886,65 @@ parser.add_argument(
 )
 
 
-args = parser.parse_args()
+parser.add_argument(
+    "--softmax-underflow",
+    action="store_true",
+    help="Run gfx950 FP8 non-persistent uniform/long-tail checks (KV=2048, split=1).",
+)
 
-for nhead, decode_qlen in args.nhead:
-    df = []
-    for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
-        args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
-    ):
-        if check_support(dtype, kvtype, nhead):
-            ret = test_mla(
-                ctx_len,
-                batch_size,
-                nhead,
-                args.kv_lora_rank,
-                args.qk_nope_head_dim,
-                args.qk_rope_head_dim,
-                args.v_head_dim,
-                dtype,
-                kvtype,
-                args.block_size,
-                varlen=args.varlen,
-                decode_qlen=decode_qlen,
-                split_per_batch=split_per_batch,
-                return_lse=args.return_lse,
-                is_causal=args.causal,
-                sequential_page_indices=args.sequential_page_indices,
+
+def main():
+    args = parser.parse_args()
+    if args.softmax_underflow:
+        from op_tests.test_mla_persistent import test_mla_fp8_softmax_underflow
+
+        if not args.nhead or any(
+            nhead != 16 or q_len not in (1, 4) for nhead, q_len in args.nhead
+        ):
+            parser.error("For non-persistent underflow, specify -n 16,1 and/or 16,4")
+        if args.return_lse:
+            parser.error(
+                "Non-persistent single-split underflow checks do not return LSE"
             )
-            df.append(ret)
-    df = pd.DataFrame(df)
-    # df.to_csv(f"mla_nhead{nhead}decode_qlen{decode_qlen}.csv")
-    df_md = df.to_markdown(index=False)
-    aiter.logger.info("mla summary (markdown):\n%s", df_md)
+        for nhead, q_len in args.nhead:
+            test_mla_fp8_softmax_underflow(
+                nhead=nhead,
+                q_len=q_len,
+                persistent=False,
+                return_lse=False,
+                cp_world_size=1,
+            )
+        return
+    for nhead, decode_qlen in args.nhead:
+        df = []
+        for dtype, kvtype, ctx_len, batch_size, split_per_batch in itertools.product(
+            args.dtype, args.kv_dtype, args.ctxLen, args.batchSize, args.split_per_batch
+        ):
+            if check_support(dtype, kvtype, nhead):
+                ret = test_mla(
+                    ctx_len,
+                    batch_size,
+                    nhead,
+                    args.kv_lora_rank,
+                    args.qk_nope_head_dim,
+                    args.qk_rope_head_dim,
+                    args.v_head_dim,
+                    dtype,
+                    kvtype,
+                    args.block_size,
+                    varlen=args.varlen,
+                    decode_qlen=decode_qlen,
+                    split_per_batch=split_per_batch,
+                    return_lse=args.return_lse,
+                    is_causal=args.causal,
+                    sequential_page_indices=args.sequential_page_indices,
+                )
+                df.append(ret)
+        df = pd.DataFrame(df)
+        df_md = df.to_markdown(index=False)
+        aiter.logger.info("mla summary (markdown):\n%s", df_md)
+    return df if args.nhead else None
+
+
+if __name__ == "__main__":
+    df = main()

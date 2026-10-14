@@ -40,7 +40,8 @@ Always prefer reusing existing code over adding new code. Before a PR adds a
 helper, kernel, or utility, the existing ones should have been checked:
 `utils/` (`config_utils` and the per-family `*_config_utils` loaders,
 shuffling, arch info, logging, `kernel_repr`), `_triton_kernels/common/`
-(shared split-K reduce), and existing kernels and test helpers. Flag new code
+(shared split-K reduce, activation helpers, pid/XCD remapping, segment-tile
+lookup), and existing kernels and test helpers. Flag new code
 that duplicates functionality already in the tree, even partially — the fix is
 to extend or import the existing implementation, not to add a parallel copy.
 
@@ -48,14 +49,14 @@ to extend or import the existing implementation, not to add a parallel copy.
 (`resolve_config_dir`, `load_config_json`, `select_leq_config`, the path
 constants) and each family keeps its own loader module (`gemm_config_utils`,
 `conv_config_utils`, `mhc_config_utils`, `moe_config_utils`,
-`tuned_config_utils`) on top of it.
+`quant_config_utils`, `tuned_config_utils`) on top of it.
 Flag a function given a second home — a re-export, a wrapper that only
 forwards to another module, or a copy of a core helper inside a family module.
 
 ## Folder structure and imports
 
 The layout is: public wrapper modules in category folders
-(`gemm/{basic,batched,feed_forward,fused}/`, `attention/`, `moe/`,
+(`gemm/{basic,batched,feed_forward,fused,grouped}/`, `attention/`, `moe/`,
 `normalization/`, `quant/`, `rope/`, `fusions/`, `comms/`, `conv/`,
 `gated_delta_net/`, `kimi_delta_attn/`, `gluon/`), kernel bodies under
 `_triton_kernels/` at the same relative category path, or under
@@ -80,7 +81,10 @@ and tuned JSON in `configs/`. Flag:
   Do not flag code in it; flag any new mismatched directory. A kernel that
   wrappers in several folders reuse lives with the wrapper that owns it, or in
   `_triton_kernels/common/` when none does (`common/splitk_reduce.py`);
-  importing it across folders is fine. A PR that moves a wrapper into another
+  importing it across folders is fine. The same goes for `@triton.jit`
+  device helpers shared across folders (`common/activation.py`,
+  `common/pid_preprocessing.py`): flag new ones added to `utils/_triton/`
+  or to a category kernel module that does not own them. A PR that moves a wrapper into another
   folder moves its kernels too and updates every importer of the old module
   path (`grep -rn "_triton_kernels.<old>"`).
 - Generic helpers (config loading, shuffling, arch detection, logging)
@@ -101,7 +105,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 - `import torch`, `from torch import ...` or any `torch.` use added to a
   module under `utils/_triton/`. The torch-using half belongs in `utils/` —
   split the helper rather than duplicating it (`moe_common.py` already lives
-  on both sides). `utils/_triton/tuning/` is exempt: standalone tuning
+  on both sides: `_triton_kernels/common/` and `utils/`). `utils/_triton/tuning/` is exempt: standalone tuning
   harnesses, not importable library code.
 - torch newly introduced into config resolution (`utils/config_utils.py` or a
   `*_config_utils.py` family module) — loading a tuned config must not
@@ -118,7 +122,7 @@ their tuned configs can be imported by a framework that is not PyTorch
 Every tuned config lives in one nested layout:
 `configs/<arch>/<backend>/<op>/<d_type>/`, e.g.
 `configs/gfx950/triton/gemm/gemm_afp4wfp4/DEFAULT.json`. `<op>` is `gemm`,
-`moe`, `conv`, `mhc`, `attention`, `gmm` or `fusions`; `<d_type>` is
+`moe`, `conv`, `mhc`, `attention`, `gmm`, `fusions` or `quant`; `<d_type>` is
 `config_name.lower().replace("-", "_")`. The flat arch-prefixed directories
 and every fallback that reached them are gone. Flag:
 
@@ -143,11 +147,11 @@ and every fallback that reached them are gone. Flag:
   byte-identical and called out in the commit message. The one seeding rule in
   force is gfx950 → gfx1250, triton only — never into a gluon directory, never
   backwards into gfx950.
-- `kpack` newly added to a gfx950 config. Triton's AMD backend deprecates
-  `kpack` on CDNA4 — it warns and force-overrides `kpack = 1` there, and the
-  parameter is slated for removal. The gfx950 tree is clean of it; gfx942 may
-  still carry it, and existing RDNA (gfx1151/gfx1201/gfx1250) entries predate
-  the rule, so flag additions rather than the entries already there.
+- `kpack` in any config outside gfx942, whether added or already there.
+  Triton's AMD backend deprecates `kpack` on CDNA4 — it warns and
+  force-overrides `kpack = 1` on gfx950, and the parameter is slated for
+  removal — gfx1250 does not support it, and on the RDNA targets (gfx11xx,
+  gfx120x) it is a no-op. Only gfx942 configs may carry it.
 - Checked-in files under `configs/gemm/aot/` or `configs/paged_mqa_logits/aot/`
   — these are runtime AOT caches, never committed.
 
@@ -230,7 +234,8 @@ values for either backend live in JSON, never in Python. Flag:
   second place the layout is encoded, and it skips the argument validation
   that makes a wrong value fail closed.
 - A hand-written loop selecting the smallest matching `N_LEQ_*` (or another
-  upper-bound prefix) entry — use `select_leq_config()` so threshold ordering,
+  upper-bound prefix) entry, or a hand-written multi-axis bucket walk — use
+  `select_leq_config()` (`axes=` for several axes) so threshold ordering,
   fallback, and copying semantics have one implementation.
 - A second MOE config reader. `utils/moe_config_utils.py::get_moe_dispatch` is
   the only MOE fetcher; flag any new MOE path built by hand, any direct
@@ -379,7 +384,7 @@ All weight/scale pre-shuffle helpers are unified in
   vendored `_triton_kernels/flash_attn_triton_amd/`; a sub-package counts as
   a folder (`moe/moe_routing/routing.py` → `triton_tests/moe/moe_routing/`).
   The few wrappers that still sit flat at `aiter/ops/triton/<op>.py`
-  (`activation.py`, `topk.py`, ...) keep their tests flat at the
+  (`topk.py`, `softmax.py`, ...) keep their tests flat at the
   `triton_tests/` root; `utils/` helpers are tested under
   `triton_tests/utils/`; `torch_compile/` and `triton_metadata_redirect/`
   are infrastructure suites, not op folders. Flag:

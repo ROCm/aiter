@@ -37,9 +37,7 @@ from enum import IntEnum
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
-from flydsl._mlir.dialects import llvm as llvm_dialect
 from flydsl.expr import arith, gpu, rocdl
-from flydsl.expr import math as fmath
 
 # Q/K/V staging managers (own their LDS swizzles + async copy schedules). They are
 # self-contained: this kernel maintains its own arch constants below and passes the
@@ -51,7 +49,7 @@ from flydsl.expr.utils.arith import _to_raw as _raw
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 from aiter.ops.flydsl.kernels import buffer_ops
 
-from ..kernels_common import LOG2E, create_llvm_ptr
+from ..kernels_common import LOG2E
 from ..tensor_shim import _run_compiled
 
 # Single source of truth for gfx1250 Expert Scheduling Mode 2 (DEP_MODE=2). Lives
@@ -200,17 +198,13 @@ def _load_sink_logit(ptr_sink, q_head_idx, num_heads_q):
     ``[num_heads_q]`` fp32 ``sink`` — one extra ``exp(sink)`` term in the softmax
     denominator, in the scaled-score domain (same units as S).
 
-    Uses a flat ``llvm.load`` (not ``buffer_load``): ``buffer_load`` re-scales the
-    offset (``offset * element_bytes``) INTERNALLY, so a flat load keeps the address
-    arithmetic SSA-visible for LLVM to order/cover under sched mode 2. Safe without a
-    HW bounds check because ``q_head_idx = kv_head*gqa_ratio + row_idx%gqa_ratio`` is
-    always ``< num_heads_q`` (in-bounds by construction)."""
+    Uses a flat pointer load: ``buffer_load`` re-scales the offset
+    (``offset * element_bytes``) internally. The pointer offset is in f32 elements,
+    and its address arithmetic stays visible to LLVM under sched mode 2. Safe
+    without a HW bounds check because ``q_head_idx = kv_head*gqa_ratio +
+    row_idx%gqa_ratio`` is always ``< num_heads_q`` (in-bounds by construction)."""
     del num_heads_q  # in-bounds by construction; no buffer bounds check needed
-    sink_base_i64 = fx.Int64(fx.ptrtoint(fx.get_iter(ptr_sink)))
-    byte_off = fx.Int64(q_head_idx) * fx.Int64(4)
-    addr = sink_base_i64 + byte_off
-    gptr = create_llvm_ptr(addr, address_space=1)
-    return fx.Float32(llvm_dialect.load(T.f32, gptr))
+    return fx.Float32(fx.ptr_load(fx.get_iter(ptr_sink) + fx.Int64(q_head_idx)))
 
 
 def _packed_tile_indices(gqa_ratio, warp_idx, lane_idx):
@@ -394,10 +388,10 @@ def _softmax(
     log2e = fx.Float32(LOG2E)
 
     def fmax(a, b):
-        return fx.Float32(arith.MaxNumFOp(_raw(a), _raw(b), fastmath=fast).result)
+        return fx.maxnumf(a, b, fastmath=fast)
 
     def fadd(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=fast))
+        return a.addf(b, fastmath=fast)
 
     # fast-math WITHOUT reassoc: LLVM's Reassociate pass otherwise re-linearizes the
     # sum tree back into a serial chain (max survives — Reassociate ignores maxnum).
@@ -405,16 +399,18 @@ def _softmax(
     _no_reassoc = _FF.nnan | _FF.ninf | _FF.nsz | _FF.arcp | _FF.contract | _FF.afn
 
     def fadd_t(a, b):
-        return fx.Float32(arith.addf(_raw(a), _raw(b), fastmath=_no_reassoc))
+        return a.addf(b, fastmath=_no_reassoc)
 
     def fsub(a, b):
-        return fx.Float32(arith.subf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a - b
 
     def fmul(a, b):
-        return fx.Float32(arith.mulf(_raw(a), _raw(b), fastmath=fast))
+        with arith.fastmath(fast):
+            return a * b
 
     def exp2(x):
-        return fx.Float32(rocdl.exp2(f32, _raw(x)))
+        return fx.exp2(x, fastmath="afn")
 
     # permlanex16 selectors: identity cross-16 gather (nibbles 0..15) => lane l<->l^16.
     sel_lo, sel_hi = _raw(fx.Int32(0x76543210)), _raw(fx.Int32(0xFEDCBA98))
@@ -517,9 +513,7 @@ def _softmax(
             pe = []
             for i in range(8):
                 # exp2(s*log2e - m_new*log2e) via one fma.
-                pj = exp2(
-                    fx.Float32(fmath.fma(_raw(s_masked[idx]), _raw(log2e), _raw(neg_m)))
-                )
+                pj = exp2(fx.fma(s_masked[idx], log2e, neg_m))
                 pe.append(pj)
                 p_flat.append(pj)
                 idx += 1

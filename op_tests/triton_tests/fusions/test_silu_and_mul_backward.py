@@ -4,7 +4,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.activation import silu_and_mul_backward
+from aiter.ops.triton.fusions.activation import silu_and_mul_backward
 from aiter.ops.triton.utils import config_utils
 from aiter.ops.triton.utils._triton.arch_info import get_arch
 
