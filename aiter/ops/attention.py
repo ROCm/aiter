@@ -1987,4 +1987,7 @@ def opus_mla_decode_fwd(
     kv_scale: torch.Tensor | None = None,  # fp8: float[1] per-tensor descale
     max_seqlen_q: int = -1,  # fp8: required, picks the kernel; bf16: unused
     causal: bool = True,  # fp8: mask across the max_seqlen_q query tokens
+    g_kv_indptr: torch.Tensor | None = None,  # fp8 round-robin CP: GLOBAL kv_indptr
+    cp_world_size: int = 1,  # fp8 round-robin CP: number of ranks, 1 = no CP
+    cp_rank: int = 0,  # fp8 round-robin CP: this rank
 ) -> None: ...

@@ -562,7 +562,8 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
                          typename Traits::D_ACC& m_row,
                          typename Traits::D_ACC& l_row,
                          float temperature_scale,
-                         int causal_diagonal)
+                         int causal_diagonal,
+                         int cp_kv_off)
 {
     using namespace opus;
     using T     = opus::remove_cvref_t<Traits>;
@@ -580,9 +581,13 @@ mla_decode_fwd_pipelined(opus_mla_decode_kargs kargs,
     int lane_bound = mask_bound;
     if constexpr(T::CAUSAL)
     {
-        const int wave_diag = (warp_id * T::Q_TILE_SIZE) / kargs.H + causal_diagonal;
-        const int lane_diag =
-            (warp_id * T::Q_TILE_SIZE + lane_id % T::W_N) / kargs.H + causal_diagonal;
+        int wave_diag = (warp_id * T::Q_TILE_SIZE) / kargs.H + causal_diagonal;
+        int lane_diag = (warp_id * T::Q_TILE_SIZE + lane_id % T::W_N) / kargs.H + causal_diagonal;
+        if constexpr(T::CP_ROUND_ROBIN)
+        {
+            wave_diag = cp_local_bound(wave_diag, kargs.cp_world_size, cp_kv_off);
+            lane_diag = cp_local_bound(lane_diag, kargs.cp_world_size, cp_kv_off);
+        }
         mask_bound = wave_diag < mask_bound ? wave_diag : mask_bound;
         lane_bound = lane_diag < lane_bound ? lane_diag : lane_bound;
     }
@@ -1210,14 +1215,31 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
     if(num_kv_tiles == 0)
         return;
 
+    // A row's last visible column is its token index within the work item plus
+    // causal_diagonal. Under round-robin CP, causal_diagonal is instead the work item's first
+    // token's global position minus cp_rank, and cp_local_bound turns it into a local column.
     int causal_diagonal = 0;
+    int cp_kv_off       = 0;
     if constexpr(T::CAUSAL)
     {
-        // kv_end + kv_offset is the batch's KV end. kv_indptr[batch_idx + 1] is not: when
-        // mla.py folds the heads into pseudo-batches, batch_idx counts those and indexes the
-        // folded q_indptr, but kv_indptr stays per original batch.
-        causal_diagonal = q_len_ptr_s - kv_ind_ptr_s + kv_ind_ptr_e + work_item.kv_offset -
-                          __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
+        const int q_end = __builtin_amdgcn_readfirstlane(kargs.q_indptr[batch_idx + 1]);
+        if constexpr(T::CP_ROUND_ROBIN)
+        {
+            // Folded pseudo-batches keep a per-pseudo-batch g_kv_indptr and the original
+            // batch's local KV begin in kv_indptr[batch_idx] (mla.py), so both index here.
+            const int g_kv_len = __builtin_amdgcn_readfirstlane(kargs.g_kv_indptr[batch_idx + 1]) -
+                                 __builtin_amdgcn_readfirstlane(kargs.g_kv_indptr[batch_idx]);
+            causal_diagonal = g_kv_len - q_end + q_len_ptr_s - kargs.cp_rank;
+            cp_kv_off = kv_ind_ptr_s - __builtin_amdgcn_readfirstlane(kargs.kv_indptr[batch_idx]);
+        }
+        else
+        {
+            // kv_end + kv_offset is the batch's KV end. kv_indptr[batch_idx + 1] is not: when
+            // mla.py folds the heads into pseudo-batches, batch_idx counts those and indexes
+            // the folded q_indptr, but kv_indptr stays per original batch.
+            causal_diagonal =
+                q_len_ptr_s - kv_ind_ptr_s + kv_ind_ptr_e + work_item.kv_offset - q_end;
+        }
     }
 
     // Per-tensor descale folded into the two places it can be a single scalar multiply: QK's
@@ -1248,7 +1270,10 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
             v_o_tiles[d] = o_tile_t{0};
         }
     });
-    D_ACC m_row = opus::numeric_limits<D_ACC>::lowest();
+    // Finite on purpose: under -ffast-math max(lowest, x) folds to x, and a fully masked row
+    // (x = -inf, e.g. a CP rank holding none of the row's causal past) would turn every
+    // exp2(s - m) into NaN.
+    D_ACC m_row = -1e30f;
     D_ACC l_row = 0.0f;
     mla_decode_fwd_pipelined<Traits>(kargs,
                                      kv_ind_ptr_s,
@@ -1261,15 +1286,19 @@ __device__ __attribute__((always_inline)) void mla_decode_fwd_one_req(opus_mla_d
                                      m_row,
                                      l_row,
                                      qk_scale,
-                                     causal_diagonal);
+                                     causal_diagonal,
+                                     cp_kv_off);
 
     // Softmax normalisation and the V descale in one multiply. l == 0 means every score was
     // masked, so O must be 0 rather than NaN. O goes out a d-tile at a time: the whole of it
     // is 256 registers, more than one file holds.
     const D_ACC o_scale        = (l_row > D_ACC(0.0f)) ? (descale_k / l_row) : D_ACC(0.0f);
     constexpr float INV_LOG2_E = 0.69314718055994531f; // ln(2)
-    const D_ACC lse            = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E)
-                                                       : opus::numeric_limits<D_ACC>::lowest();
+    // A row that saw no token has l == 0 and O == 0. Its final LSE is -inf; a split partial
+    // keeps `lowest` so mla_reduce never takes -inf - (-inf).
+    const D_ACC lse_empty =
+        slot < 0 ? std::bit_cast<D_ACC>(0xff800000u) : opus::numeric_limits<D_ACC>::lowest();
+    const D_ACC lse = (l_row > D_ACC(0.0f)) ? ((m_row + log2f(l_row)) * INV_LOG2_E) : lse_empty;
     // The final-vs-partial choice is taken per d-tile rather than once around two whole stores:
     // split into two arms, all 256 O registers stay live across both and the allocator spills.
     const bool is_final     = slot < 0;

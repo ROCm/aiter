@@ -252,9 +252,11 @@ void opus_mla_decode_fp8(opus_mla_decode_kargs kargs,
                              static_cast<int64_t>(sizeof(fp8_t));
     const bool large_kv = kv_bytes >= (int64_t{1} << 32);
 
-    // The prebuilt builds: entry <name>_{nc,causal}[_large] of one code object each, every
-    // entry loaded once on first use.
+    // The prebuilt builds: entry <name>_{nc,causal}[_large][_cprr] of one code object each,
+    // every entry loaded once on first use.
     const bool use_causal = causal && max_seqlen_q > 1;
+    // With one query token every local KV token is in its causal past, CP or not.
+    const bool use_cprr = use_causal && kargs.cp_world_size > 1;
     size_t arg_size       = sizeof(kargs);
     auto launch_co        = [&](AiterAsmKernel& impl) {
         impl.launch_kernel({&kargs, &arg_size, num_workers, 1, 1, kFp8_co_block, 1, 1, stream});
@@ -271,10 +273,15 @@ void opus_mla_decode_fp8(opus_mla_decode_kargs kargs,
         static bool traced = false; /* first call only: the test loops the kernel */  \
         if(!traced && opus_env_flag("AITER_MLA_OPUS_TRACE") && (traced = true))        \
             fprintf(stderr,                                                            \
-                    "[opus_mla_decode_fp8] " name " co causal=%d large_kv=%d\n",       \
+                    "[opus_mla_decode_fp8] " name " co causal=%d large_kv=%d cprr=%d\n", \
                     use_causal,                                                        \
-                    large_kv);                                                         \
-        if(large_kv && use_causal)                                                     \
+                    large_kv,                                                          \
+                    use_cprr);                                                         \
+        if(large_kv && use_cprr)                                                       \
+            OPUS_FP8_CO_ENTRY(name, "causal_large_cprr", co);                          \
+        else if(use_cprr)                                                              \
+            OPUS_FP8_CO_ENTRY(name, "causal_cprr", co);                                \
+        else if(large_kv && use_causal)                                                \
             OPUS_FP8_CO_ENTRY(name, "causal_large", co);                               \
         else if(large_kv)                                                              \
             OPUS_FP8_CO_ENTRY(name, "nc_large", co);                                   \
@@ -328,6 +335,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      aiter_tensor_t* kv_scale,  // fp8: float[1] per-tensor descale; bf16: unused (nullable)
      int max_seqlen_q,          // fp8: required, picks the build; bf16: unused
      bool causal,               // fp8: apply the causal mask across the query tokens
+     aiter_tensor_t* g_kv_indptr, // fp8 round-robin CP: GLOBAL per-request kv_indptr (nullable)
+     int cp_world_size,           // fp8 round-robin CP: ranks; 1 = no CP
+     int cp_rank,                 // fp8 round-robin CP: this rank, global pos = j * W + rank
      hipStream_t stream),
     (q,
      kv,
@@ -346,6 +356,9 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
      kv_scale,
      max_seqlen_q,
      causal,
+     g_kv_indptr,
+     cp_world_size,
+     cp_rank,
      stream))
 {
     const std::string gfx = get_gpu_arch();
@@ -383,6 +396,24 @@ AITER_CTYPES_DEFINE_ENTRYPOINT_VOID(
     kargs.stride_o_b     = H * kHeadDimVo;
     kargs.stride_o_h     = kHeadDimVo;
     kargs.stride_kv_page = kHeadDimQk;
+    kargs.cp_world_size  = cp_world_size > 1 ? cp_world_size : 1;
+    if(kargs.cp_world_size > 1)
+    {
+        AITER_CHECK(q->dtype() == AITER_DTYPE_fp8,
+                    __func__,
+                    ": round-robin CP is supported by the fp8 builds only.");
+        AITER_CHECK(g_kv_indptr != nullptr && g_kv_indptr->numel() > 0,
+                    __func__,
+                    ": round-robin CP needs g_kv_indptr.");
+        AITER_CHECK(cp_rank >= 0 && cp_rank < cp_world_size,
+                    __func__,
+                    ": cp_rank ",
+                    cp_rank,
+                    " out of range for cp_world_size ",
+                    cp_world_size);
+        kargs.g_kv_indptr = static_cast<const int*>(g_kv_indptr->data_ptr());
+        kargs.cp_rank     = cp_rank;
+    }
 
     if(q->dtype() == AITER_DTYPE_bf16)
         opus_mla_decode_bf16(kargs, num_workers, stream);

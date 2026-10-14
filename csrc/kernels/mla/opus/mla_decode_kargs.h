@@ -48,6 +48,13 @@ struct opus_mla_decode_kargs
     const void* __restrict__ q_scale_ptr;
     const void* __restrict__ kv_scale_ptr;
     const int* __restrict__ kv_last_page_lens;
+    // Round-robin context parallel (fp8 only): this rank holds a request's local KV token j
+    // at global position j * cp_world_size + cp_rank, and g_kv_indptr is the GLOBAL
+    // per-request kv_indptr the causal mask is taken against. cp_world_size == 1 is plain
+    // decode, with g_kv_indptr null.
+    const int* __restrict__ g_kv_indptr;
+    int cp_world_size;
+    int cp_rank;
 };
 
 // The bf16 code objects have no source in this tree, so their prefix cannot move.
@@ -89,10 +96,11 @@ struct opus_mla_decode_mxfp8_kargs
 };
 
 static_assert(sizeof(opus_mla_decode_work_info) == 32);
-static_assert(sizeof(opus_mla_decode_kargs) == 144);
+static_assert(sizeof(opus_mla_decode_kargs) == 160);
 static_assert(offsetof(opus_mla_decode_kargs, work_info_set) == 80);
 static_assert(offsetof(opus_mla_decode_kargs, softmax_scale) == 116);
 static_assert(opus_mla_decode_bf16_kargs_bytes == 120);
+static_assert(offsetof(opus_mla_decode_kargs, cp_rank) == 156);
 static_assert(sizeof(opus_mla_decode_mxfp8_kargs) == 176);
 static_assert(offsetof(opus_mla_decode_mxfp8_kargs, work_info_set) == 112);
 static_assert(offsetof(opus_mla_decode_mxfp8_kargs, softmax_scale) == 172);

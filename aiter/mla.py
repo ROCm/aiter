@@ -1111,6 +1111,9 @@ def mla_decode_fwd(
                 kv_scale=kv_scale,
                 max_seqlen_q=max_seqlen_q,
                 causal=causal,
+                g_kv_indptr=g_kv_indptr,
+                cp_world_size=cp_world_size,
+                cp_rank=cp_rank,
             )
         elif use_hk:
             aiter.hk_mla_v32_decode_fwd(

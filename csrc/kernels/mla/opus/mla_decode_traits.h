@@ -110,6 +110,15 @@ struct opus_mla_decode_mxfp8_16mx8_32nx1_traits
 
 __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; }
 
+// Round-robin CP causal bound. `g` is the row's global query position minus cp_rank, so local
+// token j (global j * world + rank) is visible iff j * world <= g; returns the last visible
+// local index counted from `kv_off`, the work item's offset into the batch's local KV. g < 0
+// sees nothing.
+__host__ __device__ inline int cp_local_bound(int g, int world, int kv_off)
+{
+    return (g >= 0 ? g / world : -1) - kv_off;
+}
+
 // ============================================================================
 // Traits for the *combined* fp8 MLA decode kernel (mla_decode_fwd_16mx8_32nx1
 // mla_decode_fp8_16mx8_32nx1.hpp).
@@ -128,21 +137,21 @@ __host__ __device__ inline int ceil_div(int a, int b) { return (a + b - 1) / b; 
 //      fed to a plain fp8 PV MFMA; descale_k is applied once, on the output.
 //      This mirrors the SP3 kernel (v_cvt_pk_fp8_f32(S) + fp8 P*V).
 // ============================================================================
-template <int Q_TILE_SIZE_  = 16,
-          int KV_TILE_SIZE_ = 32,
-          int NUM_WARPS_    = 8,
-          typename D_Q_     = fp8_t,
-          typename D_K_     = fp8_t,
-          typename D_OUT_   = bf16_t,
-          bool CAUSAL_      = false,
+template <int Q_TILE_SIZE_        = 16,
+          int KV_TILE_SIZE_       = 32,
+          int NUM_WARPS_          = 8,
+          typename D_Q_           = fp8_t,
+          typename D_K_           = fp8_t,
+          typename D_OUT_         = bf16_t,
+          bool CAUSAL_            = false,
           bool LARGE_KV_          = false,
           bool WAVE_SPANS_TOKENS_ = false>
 struct opus_mla_decode_fp8_16mx8_32nx1_traits
 {
-    static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;
-    static constexpr int KV_TILE_SIZE = KV_TILE_SIZE_;
-    static constexpr int NUM_WARPS    = NUM_WARPS_;
-    static constexpr bool CAUSAL      = CAUSAL_;
+    static constexpr int Q_TILE_SIZE        = Q_TILE_SIZE_;
+    static constexpr int KV_TILE_SIZE       = KV_TILE_SIZE_;
+    static constexpr int NUM_WARPS          = NUM_WARPS_;
+    static constexpr bool CAUSAL            = CAUSAL_;
     static constexpr bool WAVE_SPANS_TOKENS = WAVE_SPANS_TOKENS_;
     // KV cache past the 4 GiB a buffer descriptor can address; see the KV load in
     // mla_decode_fp8_16mx8_32nx1.hpp. Costs ~1-2% and 3 spilled VGPR, so
@@ -430,15 +439,16 @@ struct opus_mla_decode_fp8_16mx1_16nx8_traits
 // 4 * (t / 32) + t % 4, row (t % 32) / 4 -- plus a 16 B-group swizzle: rows 4..7 of a block
 // hold their d-groups XORed by one, which takes the K read to conflict-free.
 // ============================================================================
-template <int Q_TILE_SIZE_  = 32,
-          int KV_TILE_SIZE_ = 64,
-          int NUM_WARPS_    = 4,
-          typename D_Q_     = fp8_t,
-          typename D_K_     = fp8_t,
-          typename D_OUT_   = bf16_t,
-          bool CAUSAL_      = false,
-          bool LARGE_KV_    = false,
-          int KV_SLOTS_     = 3>
+template <int Q_TILE_SIZE_     = 32,
+          int KV_TILE_SIZE_    = 64,
+          int NUM_WARPS_       = 4,
+          typename D_Q_        = fp8_t,
+          typename D_K_        = fp8_t,
+          typename D_OUT_      = bf16_t,
+          bool CAUSAL_         = false,
+          bool LARGE_KV_       = false,
+          int KV_SLOTS_        = 3,
+          bool CP_ROUND_ROBIN_ = false>
 struct opus_mla_decode_fp8_32mx4_64nx1_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;  // query rows one wave owns
@@ -446,7 +456,11 @@ struct opus_mla_decode_fp8_32mx4_64nx1_traits
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool CAUSAL      = CAUSAL_;
     static constexpr bool LARGE_KV    = LARGE_KV_;
-    static constexpr int PAGE_SIZE    = 1;
+    // Round-robin context parallel: the causal mask is taken on global positions (see
+    // cp_local_bound). Its own entry points, so plain causal carries none of it.
+    static constexpr bool CP_ROUND_ROBIN = CP_ROUND_ROBIN_;
+    static_assert(!CP_ROUND_ROBIN || CAUSAL, "CP only changes the causal mask");
+    static constexpr int PAGE_SIZE = 1;
     // Tile t-1 (PV reads V out of it this phase), t (QK now) and t+1 (in flight). V is too
     // big to stage in registers (128 per tile), so t-1's slot is busy until PV(t-1) is done
     // and the DMA runs one phase ahead: phase t issues tile t+1 right behind its barrier.
@@ -559,15 +573,16 @@ struct opus_mla_decode_fp8_32mx4_64nx1_traits
 // block 4 (t / 32) + t % 4, row (t % 32) / 4, rows 4..7 d-group-swizzled). Q is staged once per
 // work item through the same image, query row r in place of token r, in the third KV slot.
 // ============================================================================
-template <int Q_TILE_SIZE_  = 32,
-          int KV_TILE_SIZE_ = 64,
-          int NUM_WARPS_    = 4,
-          typename D_Q_     = fp8_t,
-          typename D_K_     = fp8_t,
-          typename D_OUT_   = bf16_t,
-          bool CAUSAL_      = false,
-          bool LARGE_KV_    = false,
-          int KV_SLOTS_     = 3>
+template <int Q_TILE_SIZE_     = 32,
+          int KV_TILE_SIZE_    = 64,
+          int NUM_WARPS_       = 4,
+          typename D_Q_        = fp8_t,
+          typename D_K_        = fp8_t,
+          typename D_OUT_      = bf16_t,
+          bool CAUSAL_         = false,
+          bool LARGE_KV_       = false,
+          int KV_SLOTS_        = 3,
+          bool CP_ROUND_ROBIN_ = false>
 struct opus_mla_decode_fp8_32mx2_32nx2_traits
 {
     static constexpr int Q_TILE_SIZE  = Q_TILE_SIZE_;  // query rows one wave pair owns
@@ -575,7 +590,11 @@ struct opus_mla_decode_fp8_32mx2_32nx2_traits
     static constexpr int NUM_WARPS    = NUM_WARPS_;
     static constexpr bool CAUSAL      = CAUSAL_;
     static constexpr bool LARGE_KV    = LARGE_KV_;
-    static constexpr int PAGE_SIZE    = 1;
+    // Round-robin context parallel: the causal mask is taken on global positions (see
+    // cp_local_bound). Its own entry points, so plain causal carries none of it.
+    static constexpr bool CP_ROUND_ROBIN = CP_ROUND_ROBIN_;
+    static_assert(!CP_ROUND_ROBIN || CAUSAL, "CP only changes the causal mask");
+    static constexpr int PAGE_SIZE = 1;
     // Tile t (QK now), t-1 (its V is read into registers during QK(t), so its slot is free
     // once the mid-phase barrier is passed and DMA(t+2) goes there), t+1 (in flight).
     static constexpr int KV_SLOTS = KV_SLOTS_;
@@ -595,8 +614,8 @@ struct opus_mla_decode_fp8_32mx2_32nx2_traits
     using D_OUT = D_OUT_;
     using D_ACC = float;
 
-    static constexpr int HALVES = 2;                  // waves per pair
-    static constexpr int PAIRS  = NUM_WARPS / HALVES; // 2
+    static constexpr int HALVES = 2;                   // waves per pair
+    static constexpr int PAIRS  = NUM_WARPS / HALVES;  // 2
     static constexpr int Q_ROWS = PAIRS * Q_TILE_SIZE; // 64 packed rows per work item
 
     // ----- 32x32x64 f8f6f4, both GEMMs: lane l holds row l % 32 and, byte b of its 32,
@@ -609,9 +628,9 @@ struct opus_mla_decode_fp8_32mx2_32nx2_traits
     static_assert(KV_TILE_SIZE == HALVES * W_M, "a wave's tokens are one MFMA M");
     static_assert(W_K == KV_TILE_SIZE, "one PV MFMA contracts the whole tile");
 
-    static constexpr int GEMM0_E_K = D_HEAD_SIZE / W_K;            // 9, rope is the last k-step
-    static constexpr int GEMM1_E_M = D_NOPE_SIZE / HALVES / W_M;   // 8 d-tiles per wave
-    static constexpr int WAVE_D    = D_NOPE_SIZE / HALVES;         // 256
+    static constexpr int GEMM0_E_K   = D_HEAD_SIZE / W_K;          // 9, rope is the last k-step
+    static constexpr int GEMM1_E_M   = D_NOPE_SIZE / HALVES / W_M; // 8 d-tiles per wave
+    static constexpr int WAVE_D      = D_NOPE_SIZE / HALVES;       // 256
     static constexpr int O_TILE_REGS = W_M * W_N / WARP_SIZE;      // 16
     static constexpr int OP_REGS     = W_M * W_K / WARP_SIZE / 4;  // 8, one operand
 
