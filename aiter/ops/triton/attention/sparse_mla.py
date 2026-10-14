@@ -83,9 +83,11 @@ FP8_ARCHS = ("gfx950",)
 FP8_SCALAR_ARCHS = ("gfx942", "gfx950")
 
 # The packed caches (fp8_dsv4_mla, fp8_g64) and the SWA+top-k two-loop do not
-# reach the kernel below: they route to pa_decode_sparse, whose packed driver is
-# gfx950-only. Everywhere else they land in its fallback path, which reads a
-# plain grouped fp8 pool rather than these records, so it rejects them on dtype.
+# run outside PACKED_ARCHS. Packed caches and a bf16 or dsv4 two-loop route to
+# pa_decode_sparse, whose driver is gfx950-only and whose fallback reads a plain
+# grouped fp8 pool rather than these records. An fp8_scalar two-loop would
+# instead launch the kernel below, so sparse_mla_fwd rejects every extra_kv
+# before that launch.
 PACKED_ARCHS = ("gfx950",)
 
 
@@ -108,8 +110,9 @@ def _get_config(arch: str | None = None, fp8_dots: bool = False) -> dict:
 def _check_packed_arch(arch: str) -> None:
     """Packed caches and the two-loop are gfx950-only, whatever SUPPORTED_ARCHS says.
 
-    Left alone these reach pa_decode_sparse and fail inside it on a cache dtype,
-    which says nothing about the arch being the reason.
+    The paged route fails inside pa_decode_sparse on a cache dtype, which says
+    nothing about the arch being the reason. An fp8_scalar two-loop never takes
+    that route, so sparse_mla_fwd calls this before launching the kernel below.
     """
     if arch not in PACKED_ARCHS:
         if arch in FP8_ARCHS:
@@ -557,10 +560,11 @@ def sparse_mla_fwd(
             denominator (and the LSE) as a virtual key. None means no sink,
             which is not the same as a zero sink.
         extra_kv, extra_indptr, extra_indices: a second segment attended in the
-            same pass, for the SWA-window + top-k two-loop. All three together.
-            Either both segments are fp8_scalar block caches (each with its own
-            [1] f32 scale; either dot_precision) or both are fp8_dsv4_mla / bf16
-            block caches (bf16 dots).
+            same pass, for the SWA-window + top-k two-loop. All three together,
+            and gfx950-only, including when both segments are fp8_scalar. Either
+            both segments are fp8_scalar block caches (each with its own [1] f32
+            scale; either dot_precision) or both are fp8_dsv4_mla / bf16 block
+            caches (bf16 dots).
         extra_kv_scale: the extra segment's [1] f32 scale when it is
             fp8_scalar; defaults to kv_scale.
         dot_precision: what the QK and PV matrix-core ops run in.
@@ -622,6 +626,11 @@ def sparse_mla_fwd(
     has_extra = all(a is not None for a in extra)
     if any(a is not None for a in extra) and not has_extra:
         raise ValueError("extra_kv, extra_indptr and extra_indices go together")
+    if has_extra and arch_info.get_arch() not in PACKED_ARCHS:
+        # fp8_scalar extra never reaches _forward_paged. Without this it launches
+        # the kernel below, which gfx942 could not reach until fp8 caches were
+        # accepted. The two-loop stays gfx950-only for every cache format.
+        _check_packed_arch(arch_info.get_arch())
     if has_extra:
         # The SWA-window + top-k two-loop: both segments are block caches the
         # dsv4 decoder reads. A flat main pool would silently drop the extra one.

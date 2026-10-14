@@ -189,6 +189,32 @@ def test_packed_cache_arch_gate(arch):
             smd._check_packed_arch(arch)
 
 
+def test_fp8_scalar_two_loop_rejected_off_packed_arch():
+    """fp8_scalar plus extra_kv used to skip the packed-arch gate and launch the
+    gluon kernel. The two-loop stays on the packed arch for every cache format.
+    Going through sparse_mla_fwd catches the gate losing that call site.
+    """
+    arch = arch_info.get_arch()
+    if arch not in SUPPORTED_ARCHS or arch in smd.PACKED_ARCHS:
+        pytest.skip(f"the two-loop runs on {arch}")
+    if arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"no fp8_scalar cache on {arch}")
+    q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
+    with pytest.raises(ValueError, match="two-loop"):
+        sparse_mla_fwd(
+            q,
+            cache,
+            ptr,
+            idx,
+            D_QK**-0.5,
+            kv_scale=ks,
+            extra_kv=cache,
+            extra_indptr=ptr,
+            extra_indices=idx,
+            extra_kv_scale=ks,
+        )
+
+
 @pytest.mark.parametrize("arch", SUPPORTED_ARCHS)
 def test_fp8_arch_gate(arch):
     """fp8 q and fp8 caches, for every arch, from any machine."""
@@ -407,13 +433,16 @@ def test_sparse_mla_rope_free(fmt, dots, tol, H, C, topk, ragged, pool):
 
 def test_fp8_dots_keep_the_softmax_tail():
     """Each query's first key scores 9 above the other 2047, which carry a fifth
-    of the output at p ~ 1e-4 each. That is below fnuz's smallest subnormal
-    unless P_SCALE lifts p before the PV dot, and with split-K off a single
-    program quantizes every tail p after the max.
+    of the output at p ~ 1e-4 each. That is below the smallest subnormal of both
+    e4m3 encodings (fnuz 2^-10, OCP 2^-9) unless P_SCALE lifts p before the PV
+    dot. With split-K off, one program quantizes every tail p after the max.
+
+    gfx942 scales by 128 and the tail survives. gfx950 leaves P_SCALE at 1, so
+    p is cast as itself and the tail flushes; the case still runs there.
     """
     arch = arch_info.get_arch()
-    if arch not in FNUZ_ARCHS:
-        pytest.skip(f"P_SCALE is 1 on {arch}")
+    if arch not in FP8_SCALAR_ARCHS:
+        pytest.skip(f"no fp8 dots on {arch}")
     C, H, topk, pool = 4, 16, 2048, 1 << 13
     sm = KV_LORA**-0.5
     g = torch.Generator().manual_seed(0)
@@ -452,4 +481,10 @@ def test_fp8_dots_keep_the_softmax_tail():
         kv_splits=1,
     )
     e = rel_err(out, ref)
-    assert e < 5e-2, f"softmax tail: rel-err {e:.3e}"
+    if arch in FNUZ_ARCHS:
+        assert e < 5e-2, f"softmax tail: rel-err {e:.3e}"
+    else:
+        # p * 1 underflows in OCP e4m3, so the tail's share of the output is
+        # zero and the max-rel error is the whole tail. A scale on this arch
+        # should tighten this to the fnuz bound above.
+        assert e > 0.5, f"unscaled tail should flush, rel-err {e:.3e}"

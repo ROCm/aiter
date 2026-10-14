@@ -7,6 +7,10 @@ Separated rope by default; --qk_rope_head_dim 0 runs the rope-free geometry.
 The cache is flushed between iterations by default. Leaving it warm lets the loop
 re-read its KV and flatters decode shapes badly.
 
+On an arch that takes the fp8_scalar cache the plot has three series: the bf16
+cache with bf16 dots, the fp8 cache with bf16 dots, and the fp8 cache with fp8
+dots. Elsewhere only the bf16 cache is run.
+
 Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_seqs 1 --num_tokens 8192
@@ -131,7 +135,8 @@ def build_case(
     indptr = torch.zeros(len(lens) + 1, dtype=torch.int32)
     indptr[1:] = torch.tensor(lens, dtype=torch.int32).cumsum(0)
 
-    # fp8 dots want the flat per-tensor format; bf16 dots read kv as it is.
+    # The two fp8-cache series read this per-tensor encoding. The bf16-cache
+    # series reads kv as it is.
     scale = (kv.float().abs().amax() / E4M3_MAX).clamp_min(1e-30).reshape(1)
     kv_fp8 = ((kv.float() / scale).clamp(-E4M3_MAX, E4M3_MAX).to(E4M3_DTYPE)).view(
         torch.uint8
@@ -161,19 +166,21 @@ def run_benchmark(args):
         for tokens in args.num_tokens
     ]
 
-    # sparse_mla_fwd raises on fp8 dots outside FP8_SCALAR_ARCHS, and triton's
-    # harness does not catch it, so drop the series instead.
+    # sparse_mla_fwd raises on an fp8 cache outside FP8_SCALAR_ARCHS, and
+    # triton's harness does not catch it, so drop those series instead.
+    # "bf16" is the bf16 cache. "fp8-bf16" is the fp8 cache with bf16 dots,
+    # the middle of the three; "fp8" is the fp8 cache with fp8 dots.
     dot_vals = ["bf16"]
-    dot_names = ["bf16 dots"]
+    dot_names = ["bf16 cache"]
     dot_styles = [("green", "-")]
     if arch_info.get_arch() in FP8_SCALAR_ARCHS:
-        dot_vals.append("fp8")
-        dot_names.append("fp8 dots")
-        dot_styles.append(("blue", "-"))
+        dot_vals += ["fp8-bf16", "fp8"]
+        dot_names += ["fp8 cache, bf16 dots", "fp8 cache, fp8 dots"]
+        dot_styles += [("darkorange", "-"), ("blue", "-")]
     else:
         print(
-            f"note: skipping the fp8-dot series, {arch_info.get_arch()} has no "
-            "fp8 dots"
+            f"note: skipping the fp8-cache series, {arch_info.get_arch()} has no "
+            "fp8 cache"
         )
 
     benchmark = triton.testing.Benchmark(
@@ -205,9 +212,11 @@ def run_benchmark(args):
             dtype=torch.bfloat16,
             device=q.device,
         )
-        if dots == "fp8":
+        fp8_cache = dots != "bf16"
+        precision = "fp8" if dots == "fp8" else "bf16"
+        if fp8_cache:
             cache, scale, q_scale = kv_fp8, kv_scale, None
-            if arch_info.get_arch() in FP8_ARCHS:
+            if precision == "fp8" and arch_info.get_arch() in FP8_ARCHS:
                 # Hand q over already quantized, the way production does. The
                 # other archs take bf16 q only and quantize it inside the kernel.
                 q_scale = (
@@ -228,7 +237,7 @@ def run_benchmark(args):
                 kv_scale=scale,
                 qk_rope_head_dim=rope,
                 q_scale=q_scale,
-                dot_precision=dots,
+                dot_precision=precision,
                 out=out,
             )
 
