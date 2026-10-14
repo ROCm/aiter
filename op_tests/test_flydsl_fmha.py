@@ -1992,8 +1992,31 @@ def test_public_varlen_descale_rejects_non_fp8_before_dispatch(monkeypatch, dtyp
     q, k, v = (torch.randn(L, H, D, dtype=dtype) for _ in range(3))
     s = torch.ones(1, dtype=torch.float32)
     cu = torch.tensor([0, L], dtype=torch.int32)
-    with pytest.raises(ValueError, match="must be float8_e4m3fn"):
+    with pytest.raises(ValueError, match="require FP8"):
         flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, q_descale=s)
+
+
+def _stub_varlen_backends(monkeypatch):
+    """Stub the CK and FlyDSL varlen entries; return the list of backends called."""
+    from aiter.ops import mha as mha_module
+    from aiter.ops.flydsl import fmha_kernels
+
+    calls = []
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            calls.append("ck")
+            return "ck"
+
+    def _flydsl_stub(*args, **kwargs):
+        calls.append("flydsl")
+        return "flydsl"
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
+    monkeypatch.setattr(fmha_kernels, "flydsl_flash_attn_varlen_func", _flydsl_stub)
+    return calls
 
 
 @pytest.mark.parametrize(
@@ -2014,24 +2037,8 @@ def test_public_varlen_descale_route(monkeypatch, total_q, qk_hdim, expected):
     Both backend entry points are stubbed, so the route is checked on every arch.
     """
     from aiter import flash_attn_varlen_func
-    from aiter.ops import mha as mha_module
-    from aiter.ops.flydsl import fmha_kernels
 
-    calls = []
-
-    class _CkStub:
-        @staticmethod
-        def apply(*args):
-            calls.append("ck")
-            return "ck"
-
-    def _flydsl_stub(*args, **kwargs):
-        calls.append("flydsl")
-        return "flydsl"
-
-    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
-    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
-    monkeypatch.setattr(fmha_kernels, "flydsl_flash_attn_varlen_func", _flydsl_stub)
+    calls = _stub_varlen_backends(monkeypatch)
     H = 1
     q = torch.empty(total_q, H, qk_hdim, dtype=torch.float8_e4m3fn)
     k = torch.empty(total_q, H, qk_hdim, dtype=torch.float8_e4m3fn)
@@ -2053,3 +2060,64 @@ def test_public_varlen_descale_route(monkeypatch, total_q, qk_hdim, expected):
     )
     assert out == expected
     assert calls == [expected]
+
+
+def test_public_varlen_descale_fnuz_reaches_ck(monkeypatch):
+    """e4m3fnuz (gfx942's native fp8) with descales is valid and goes to CK.
+
+    The real FlyDSL gate declines fnuz, so the FlyDSL stub declines it too.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops.flydsl import fmha_kernels
+
+    calls = _stub_varlen_backends(monkeypatch)
+    monkeypatch.setattr(
+        fmha_kernels,
+        "flydsl_flash_attn_varlen_func",
+        lambda *a, **kw: calls.append("flydsl"),
+    )
+    L, H, D = 1024, 1, 192
+    q = torch.empty(L, H, D, dtype=torch.float8_e4m3fnuz)
+    k = torch.empty(L, H, D, dtype=torch.float8_e4m3fnuz)
+    v = torch.empty(L, H, 128, dtype=torch.float8_e4m3fnuz)
+    s = torch.ones(1, dtype=torch.float32)
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    out = flash_attn_varlen_func(
+        q, k, v, cu, cu, L, L, causal=True, q_descale=s, k_descale=s, v_descale=s
+    )
+    assert out == "ck"
+    assert calls[-1] == "ck"
+
+
+@pytest.mark.parametrize("enable_ck", [True, False])
+@pytest.mark.parametrize("feature", ["logits_soft_cap", "cu_seqlens_padded"])
+def test_public_varlen_descale_route_skips_flydsl_for_ck_only_features(
+    monkeypatch, feature, enable_ck
+):
+    """FlyDSL has no soft-cap or padded cu_seqlens, so those descale calls skip it.
+
+    With CK they go to CK; without CK they raise instead of dropping the feature.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+
+    calls = _stub_varlen_backends(monkeypatch)
+    monkeypatch.setattr(mha_module, "ENABLE_CK", enable_ck)
+    L, H = 1024, 1
+    q = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn)
+    k = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn)
+    v = torch.empty(L, H, 128, dtype=torch.float8_e4m3fn)
+    s = torch.ones(1, dtype=torch.float32)
+    cu = torch.tensor([0, L], dtype=torch.int32)
+    if feature == "logits_soft_cap":
+        extra = {"logits_soft_cap": 30.0}
+    else:
+        extra = {"cu_seqlens_q_padded": cu, "cu_seqlens_k_padded": cu}
+    kwargs = dict(causal=True, q_descale=s, k_descale=s, v_descale=s, **extra)
+    if enable_ck:
+        assert flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs) == "ck"
+        assert calls == ["ck"]
+    else:
+        with pytest.raises(RuntimeError, match="requires ENABLE_CK=1"):
+            flash_attn_varlen_func(q, k, v, cu, cu, L, L, **kwargs)
+        assert calls == []

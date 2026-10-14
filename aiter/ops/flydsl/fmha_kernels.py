@@ -251,7 +251,6 @@ def _fp8_gfx950_reject_reason(
 
     from .kernels.flash_attn_func_fp8_gfx950 import (
         _fp8_config_reason,
-        _gpu_arch,
         _is_valid_softmax_scale,
         flydsl_flash_attn_fp8_supported,
     )
@@ -280,7 +279,12 @@ def _fp8_gfx950_reject_reason(
     if not flydsl_flash_attn_fp8_supported(
         q.device, nq, nkv, qk_hdim, v.shape[-1], dtype=q.dtype
     ):
-        arch = _gpu_arch(q.device)
+        from ...jit.utils.chip_info import get_gfx_runtime
+
+        try:
+            arch = get_gfx_runtime()
+        except (KeyError, RuntimeError):
+            arch = ""
         if arch != "gfx950":
             return f"the FlyDSL FP8 kernel needs gfx950, got {arch or 'unknown'}"
         reason = _fp8_config_reason(nq, nkv, qk_hdim, v.shape[-1])

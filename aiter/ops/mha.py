@@ -3693,6 +3693,21 @@ def _varlen_descale_reject_reason(q, k, v, **gate_kwargs) -> str:
 _FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS = 8192
 
 
+def _flydsl_varlen_ck_only_feature(
+    logits_soft_cap, cu_seqlens_q_padded, cu_seqlens_k_padded
+) -> str | None:
+    """A requested varlen feature flydsl_flash_attn_varlen_func cannot express.
+
+    Its gate already rejects dropout, window/sink, bias/alibi, block_table and
+    return_attn_probs; soft-cap and padded cu_seqlens never reach it.
+    """
+    if logits_soft_cap != 0.0:
+        return f"logits_soft_cap is not supported, got {logits_soft_cap}"
+    if cu_seqlens_q_padded is not None or cu_seqlens_k_padded is not None:
+        return "padded cu_seqlens (cu_seqlens_q/k_padded) are not supported"
+    return None
+
+
 def _prefer_flydsl_fp8_descale(q, v) -> bool:
     """Whether a descaled FP8 varlen call should try FlyDSL before CK."""
     head_dims = (q.shape[-1], v.shape[-1])
@@ -3799,6 +3814,44 @@ def flash_attn_varlen_func(
     descales = (q_descale, k_descale, v_descale)
     has_any_descale = any(descale is not None for descale in descales)
     has_all_descales = all(descale is not None for descale in descales)
+
+    ck_only_feature = _flydsl_varlen_ck_only_feature(
+        logits_soft_cap, cu_seqlens_q_padded, cu_seqlens_k_padded
+    )
+
+    def descale_reject_reason():
+        if ck_only_feature is not None:
+            return ck_only_feature
+        return _varlen_descale_reject_reason(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            dropout_p=dropout_p,
+            window_size=window_size,
+            bias=bias,
+            alibi_slopes=alibi_slopes,
+            sink=sink_ptr,
+            return_attn_probs=return_attn_probs,
+            block_table=block_table,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            out=out,
+        )
+
+    # Non-fp8 backends (e.g. the gfx1250 bf16 FlyDSL kernel) would ignore the
+    # descales, so reject them before any dispatch. Both FP8 encodings are valid
+    # here (e4m3fnuz is gfx942's native FP8); the FlyDSL gate declines fnuz and
+    # those calls take the CK descale route.
+    if has_any_descale and q.dtype not in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
+        raise ValueError(
+            "flash_attn_varlen_func: q/k/v_descale require FP8 inputs "
+            f"(float8_e4m3fn or float8_e4m3fnuz), got q {q.dtype}"
+        )
     if has_any_descale and not has_all_descales:
         raise ValueError(
             "FP8 attention requires q_descale, k_descale, and v_descale together"
@@ -3843,33 +3896,6 @@ def flash_attn_varlen_func(
             return sink_ptr is not None
         return sink_ptr is None
 
-    def descale_reject_reason():
-        return _varlen_descale_reject_reason(
-            q,
-            k,
-            v,
-            softmax_scale=softmax_scale,
-            dropout_p=dropout_p,
-            window_size=window_size,
-            bias=bias,
-            alibi_slopes=alibi_slopes,
-            sink=sink_ptr,
-            return_attn_probs=return_attn_probs,
-            block_table=block_table,
-            q_descale=q_descale,
-            k_descale=k_descale,
-            v_descale=v_descale,
-            out=out,
-        )
-
-    # Non-fp8 backends (e.g. the gfx1250 bf16 FlyDSL kernel) would ignore the
-    # descales, so reject them before any dispatch.
-    if has_any_descale and q.dtype != torch.float8_e4m3fn:
-        raise ValueError(
-            "flash_attn_varlen_func: q/k/v_descale require FP8 inputs "
-            f"({descale_reject_reason()})"
-        )
-
     if not has_all_descales and can_try_gfx1250_fmha_fwd_with_sink_varlen_asm():
         return FlashAttnVarlenFunc.apply(
             q,
@@ -3909,9 +3935,11 @@ def flash_attn_varlen_func(
     # Per-tensor Q/K/V descales: shapes where FlyDSL FP8 beats CK try it first
     # (see _prefer_flydsl_fp8_descale); the rest, and anything FlyDSL declines,
     # take the CK path, which also consumes the descales. Without CK, FlyDSL is
-    # the only backend that honors descales, so always try it.
-    try_flydsl = (
-        not has_all_descales or not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v)
+    # the only backend that honors descales, so always try it. Features FlyDSL
+    # cannot express (soft-cap, padded cu_seqlens) never take the descale route.
+    try_flydsl = not has_all_descales or (
+        ck_only_feature is None
+        and (not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v))
     )
     if try_flydsl and (len(window_size) < 3 or window_size[2] == 0):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
