@@ -2127,7 +2127,7 @@ _needs_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 
 
 def _fp8_misplaced_inputs(misplaced):
-    """GPU fp8 varlen q/k/v plus out/cu_seqlens, with one of them on the CPU."""
+    """GPU fp8 varlen q/k/v plus out/lse/cu_seqlens, with one of them on the CPU."""
     L, H = 256, 1
     q = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn, device="cuda")
     k = torch.empty(L, H, 192, dtype=torch.float8_e4m3fn, device="cuda")
@@ -2137,6 +2137,7 @@ def _fp8_misplaced_inputs(misplaced):
         "cu_seqlens_q": torch.tensor([0, L], dtype=torch.int32, device="cuda"),
         "cu_seqlens_k": torch.tensor([0, L], dtype=torch.int32, device="cuda"),
         "out": torch.empty(L, H, 128, dtype=torch.bfloat16, device="cuda"),
+        "lse": torch.empty(H, L, dtype=torch.float32, device="cuda"),
     }
     kw[misplaced] = kw[misplaced].cpu()
     return (q, k, v), s, kw
@@ -2191,9 +2192,9 @@ def test_public_varlen_descale_host_tensor_skips_flydsl(monkeypatch, misplaced):
 
 
 @_gfx950_only
-@pytest.mark.parametrize("misplaced", ["out", "cu_seqlens_q", "cu_seqlens_k"])
+@pytest.mark.parametrize("misplaced", ["out", "lse", "cu_seqlens_q", "cu_seqlens_k"])
 def test_fp8_kernel_rejects_host_tensors(misplaced):
-    """The kernel entry itself refuses a CPU out/cu_seqlens instead of launching."""
+    """The kernel entry itself refuses a CPU out/lse/cu_seqlens instead of launching."""
     from aiter.ops.flydsl.kernels.flash_attn_func_fp8_gfx950 import (
         flydsl_flash_attn_fp8_func,
     )
@@ -2215,6 +2216,8 @@ def test_fp8_kernel_rejects_host_tensors(misplaced):
             k_descale=s,
             v_descale=s,
             out=kw["out"],
+            return_lse=True,
+            lse=kw["lse"],
         )
 
 
