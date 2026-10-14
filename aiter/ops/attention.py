@@ -594,8 +594,8 @@ def pa_persistent_fwd(
     """Run persistent attention and merge only materialized partial outputs.
 
     Work records with partial index -1 write directly to output. Their final
-    LSE remains NaN because the forward kernel does not produce it. Empty
-    reduction maps skip the reducer; preallocated GPU maps are handled on
+    LSE is undefined and must not be read; the forward kernel does not produce it.
+    Empty reduction maps skip the reducer; preallocated GPU maps are handled on
     device without reading metadata back to the host.
     """
     device = Q.device
@@ -612,9 +612,7 @@ def pa_persistent_fwd(
         dtype=dtypes.fp32,
         device=device,
     )
-    final_lse = torch.full(
-        (total_s, nhead), float("nan"), dtype=dtypes.fp32, device=device
-    )
+    final_lse = torch.empty((total_s, nhead), dtype=dtypes.fp32, device=device)
 
     pa_ps_fwd_asm(
         Q,
