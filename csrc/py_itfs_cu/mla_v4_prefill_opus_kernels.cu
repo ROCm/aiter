@@ -203,7 +203,7 @@ void opus_mla_v4_prefill_a16w16_gfx950_split_fwd(aiter_tensor_t& q,
     // every thread one of the D columns. No sink: split 0 already counts it.
     auto reduce = [&](auto out_tag, auto parts) {
         using D_OUT = decltype(out_tag);
-        aiter::pa_decode_ps_reduce_hip_kernel<D_OUT, float, float, false, 512, 1, decltype(parts)::value>
+        aiter::pa_decode_ps_reduce_hip_kernel<D_OUT, float, float, false, false, 512, 1, decltype(parts)::value>
             <<<dim3(N, H, 1), 512, 0, stream>>>(
                 reinterpret_cast<D_OUT*>(out.data_ptr()),
                 split_kargs.partial_sum,
@@ -212,7 +212,8 @@ void opus_mla_v4_prefill_a16w16_gfx950_split_fwd(aiter_tensor_t& q,
                 nullptr,
                 kargs.stride_qo_n, 0, kargs.stride_qo_h, 0,
                 num_splits * H, 1, H,
-                num_splits * H * D, D, H * D, 0);
+                num_splits * H * D, D, H * D, 0,
+                nullptr);
         HIP_CALL_LAUNCH(hipGetLastError());
     };
     auto launch = [&](auto dtype_tag, auto out_tag) {
