@@ -697,6 +697,38 @@ def build_hstu_attention_bwd_dq_pp(
                 )
             )
 
+        def fmul_const_scalar(a, b):
+            """`a * b` as a scalar `v_mul_f32`, for a CONSTANT `b`.
+
+            `fmul_scalar`'s legacy trick leaks when the other operand is a
+            finite non-zero CONSTANT: `fmul_legacy` then equals `fmul`,
+            InstCombine drops the intrinsic, and SLP re-packs the pair. This is
+            the gate's last `v_pk_mul_f32` and the reason `-log2e` was folded
+            into Q instead.
+
+            NO `s_nop`, even though `a` is a GEMM1 accumulator needing 7 wait
+            states. Checked in the ISA rather than assumed: the gate's first
+            accumulator read sits after EIGHT further MFMAs plus `s_setprio`,
+            two `s_waitcnt` and `s_barrier`, and `phase_barrier`'s
+            `sched_barrier(0)` pins them there. The `16 x s_nop 6` that made
+            this unpacking look like a net loss were never required.
+
+            `b` takes the `s` constraint so the constant is read as VOP2 src0
+            and no VGPR holds it.
+            """
+            from flydsl._mlir import ir
+            from flydsl._mlir.dialects import llvm as _llvm
+
+            return fx.Float32(
+                _llvm.inline_asm(
+                    ir.F32Type.get(),
+                    [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
+                    "v_mul_f32 $0, $2, $1",
+                    "=v,v,s",
+                    has_side_effects=False,
+                )
+            )
+
         def addone_scalar(x):
             """`1 + x` as a scalar `v_add_f32`, via inline asm.
 
@@ -954,7 +986,7 @@ def build_hstu_attention_bwd_dq_pp(
                 # `sc` arrives already scaled from GEMM1 (alpha is folded into
                 # q_packs), so only the exp2 argument needs a multiply.
                 sc = s
-                emu = [exp2_f32(fmul_scalar(sc[j], c_neg_log2e)) for j in rng]
+                emu = [exp2_f32(fmul_const_scalar(sc[j], c_neg_log2e)) for j in rng]
                 sig = [rcp_scalar(addone_scalar(emu[j])) for j in rng]
                 silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
