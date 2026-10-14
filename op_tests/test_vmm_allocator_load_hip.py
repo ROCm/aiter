@@ -28,12 +28,15 @@ MAPS = (
 )
 
 
-def cdll_calls(maps: str) -> list:
-    """Import vmm_allocator with ``maps`` as /proc/self/maps; return the CDLL calls."""
+def cdll_calls(maps, load: bool = True) -> list:
+    """Import vmm_allocator with ``maps`` as /proc/self/maps (None: missing),
+    call load_hip_runtime() if ``load``, and return the CDLL calls."""
     real_open = open
 
     def fake_open(path, *args, **kwargs):
         if path == "/proc/self/maps":
+            if maps is None:
+                raise FileNotFoundError(path)
             return io.StringIO(maps)
         return real_open(path, *args, **kwargs)
 
@@ -43,6 +46,8 @@ def cdll_calls(maps: str) -> list:
         ctypes, "CDLL"
     ) as cdll:
         spec.loader.exec_module(module)
+        if load:
+            module.load_hip_runtime()
     return cdll.call_args_list
 
 
@@ -57,6 +62,12 @@ class LoadHipRuntimeTest(unittest.TestCase):
 
     def test_falls_back_to_the_soname(self):
         self.assertEqual(cdll_calls("")[0], mock.call("libamdhip64.so"))
+
+    def test_falls_back_to_the_soname_without_proc_maps(self):
+        self.assertEqual(cdll_calls(None)[0], mock.call("libamdhip64.so"))
+
+    def test_import_loads_nothing(self):
+        self.assertEqual(cdll_calls(MAPS, load=False), [])
 
 
 if __name__ == "__main__":

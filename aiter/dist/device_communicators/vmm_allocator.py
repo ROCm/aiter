@@ -11,6 +11,7 @@ which exports a POSIX fd that can be passed across processes via Unix sockets.
 
 import array
 import ctypes
+import functools
 import os
 import socket
 import struct
@@ -32,11 +33,15 @@ def load_hip_runtime() -> ctypes.CDLL:
     SGLang's vattn_asm) can bind the wrong one: their launches on torch
     streams fail with hipErrorContextIsDestroyed.
     """
-    with open("/proc/self/maps") as f:
-        for line in f:
-            path = line[line.find("/") :].strip().removesuffix(" (deleted)")
-            if "/" in line and os.path.basename(path).startswith("libamdhip64.so"):
-                return ctypes.CDLL(path)
+    try:
+        with open("/proc/self/maps") as f:
+            maps = f.readlines()
+    except OSError:
+        maps = []
+    for line in maps:
+        path = line[line.find("/") :].strip().removesuffix(" (deleted)")
+        if "/" in line and os.path.basename(path).startswith("libamdhip64.so"):
+            return ctypes.CDLL(path)
     candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
     last_err = None
     for name in candidates:
@@ -50,7 +55,12 @@ def load_hip_runtime() -> ctypes.CDLL:
     )
 
 
-_hip = load_hip_runtime()
+@functools.cache
+def _hip() -> ctypes.CDLL:
+    # Not at import: a module imported before torch maps its HIP runtime would
+    # find nothing in /proc/self/maps and map a second runtime by name.
+    return load_hip_runtime()
+
 
 # ---- HIP VMM ctypes structs ----
 
@@ -108,7 +118,7 @@ def _get_granularity(device_id: int) -> int:
     prop = _make_prop(device_id)
     gran = ctypes.c_size_t()
     _check(
-        _hip.hipMemGetAllocationGranularity(
+        _hip().hipMemGetAllocationGranularity(
             ctypes.byref(gran), ctypes.byref(prop), _RECOMMENDED
         ),
         "hipMemGetAllocationGranularity",
@@ -135,7 +145,7 @@ class VMMBuffer:
         prop = _make_prop(device_id)
         self._phys_handle = ctypes.c_void_p()
         _check(
-            _hip.hipMemCreate(
+            _hip().hipMemCreate(
                 ctypes.byref(self._phys_handle),
                 self._alloc_size,
                 ctypes.byref(prop),
@@ -146,7 +156,7 @@ class VMMBuffer:
 
         self._va = ctypes.c_void_p()
         _check(
-            _hip.hipMemAddressReserve(
+            _hip().hipMemAddressReserve(
                 ctypes.byref(self._va),
                 self._alloc_size,
                 self._gran,
@@ -157,7 +167,7 @@ class VMMBuffer:
         )
 
         _check(
-            _hip.hipMemMap(self._va, self._alloc_size, 0, self._phys_handle, 0),
+            _hip().hipMemMap(self._va, self._alloc_size, 0, self._phys_handle, 0),
             "hipMemMap",
         )
 
@@ -167,7 +177,9 @@ class VMMBuffer:
         for dev in device_ids:
             desc = _hipMemAccessDesc(_DEVICE, dev, _READ_WRITE)
             _check(
-                _hip.hipMemSetAccess(self._va, self._alloc_size, ctypes.byref(desc), 1),
+                _hip().hipMemSetAccess(
+                    self._va, self._alloc_size, ctypes.byref(desc), 1
+                ),
                 f"hipMemSetAccess dev={dev}",
             )
 
@@ -182,7 +194,7 @@ class VMMBuffer:
     def export_fd(self) -> int:
         fd = ctypes.c_int()
         _check(
-            _hip.hipMemExportToShareableHandle(
+            _hip().hipMemExportToShareableHandle(
                 ctypes.byref(fd), self._phys_handle, _POSIX_FD, 0
             ),
             "hipMemExportToShareableHandle",
@@ -205,7 +217,7 @@ class VMMBuffer:
 
         obj._phys_handle = ctypes.c_void_p()
         _check(
-            _hip.hipMemImportFromShareableHandle(
+            _hip().hipMemImportFromShareableHandle(
                 ctypes.byref(obj._phys_handle), ctypes.c_void_p(fd), _POSIX_FD
             ),
             "hipMemImportFromShareableHandle",
@@ -213,7 +225,7 @@ class VMMBuffer:
 
         obj._va = ctypes.c_void_p()
         _check(
-            _hip.hipMemAddressReserve(
+            _hip().hipMemAddressReserve(
                 ctypes.byref(obj._va),
                 alloc_size,
                 obj._gran,
@@ -224,7 +236,7 @@ class VMMBuffer:
         )
 
         _check(
-            _hip.hipMemMap(obj._va, alloc_size, 0, obj._phys_handle, 0),
+            _hip().hipMemMap(obj._va, alloc_size, 0, obj._phys_handle, 0),
             "hipMemMap (import)",
         )
 
@@ -233,11 +245,11 @@ class VMMBuffer:
 
     def close(self):
         if hasattr(self, "_va") and self._va.value:
-            _hip.hipMemUnmap(self._va, self._alloc_size)
-            _hip.hipMemAddressFree(self._va, self._alloc_size)
+            _hip().hipMemUnmap(self._va, self._alloc_size)
+            _hip().hipMemAddressFree(self._va, self._alloc_size)
             self._va = ctypes.c_void_p(0)
         if hasattr(self, "_phys_handle") and self._phys_handle.value:
-            _hip.hipMemRelease(self._phys_handle)
+            _hip().hipMemRelease(self._phys_handle)
             self._phys_handle = ctypes.c_void_p(0)
 
     def __del__(self):
