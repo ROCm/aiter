@@ -151,12 +151,36 @@ def moe_gemm_a8w8(
     swiglu_add_residual=True,
     unpadded_N=None,
     unpadded_K=None,
+    x_token_scale=None,
+    w_expt_scale=None,
 ):
     """
     Y[:, :] = 0.
     for e in num_experts:
         Y[idxs_y_m(e), :] += matmul(X[idxs_x_m(e), :], W[e, :, :])
+
+    x_token_scale: optional fp32 per-token activation scale, one entry per row
+        of x; applied to the accumulator before bias / activation.
+    w_expt_scale: optional fp32 per-expert weight scale [n_expts].
     """
+    if x_token_scale is not None:
+        assert (
+            x_token_scale.dtype == torch.float32
+        ), f"Expected fp32 x_token_scale, got {x_token_scale.dtype}"
+        x_token_scale = x_token_scale.reshape(-1).contiguous()
+        assert x_token_scale.numel() == x.shape[-2], (
+            f"x_token_scale must have one entry per row of x "
+            f"({x.shape[-2]}), got {x_token_scale.numel()}"
+        )
+    if w_expt_scale is not None:
+        assert (
+            w_expt_scale.dtype == torch.float32
+        ), f"Expected fp32 w_expt_scale, got {w_expt_scale.dtype}"
+        w_expt_scale = w_expt_scale.reshape(-1).contiguous()
+        assert w_expt_scale.numel() == w.shape[0], (
+            f"w_expt_scale must have one entry per expert "
+            f"({w.shape[0]}), got {w_expt_scale.numel()}"
+        )
     w_has_mx = w_scales is not None
     if w_has_mx:
         assert w.stride(-2) == 1, "`w` must be column-major when it has data-type mxfp"
@@ -250,6 +274,8 @@ def moe_gemm_a8w8(
         x_static_scale,
         w_static_scale,
         quant_static_scale,
+        x_token_scale,
+        w_expt_scale,
         bias,
         stride_bias,
         gammas,

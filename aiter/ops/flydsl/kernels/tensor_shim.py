@@ -157,21 +157,14 @@ def buf_scalar_load(t, index, cache_modifier=0):
 
     The layout API has no scalar spelling: ``t[i]`` and every ``BufferCopy*``
     atom lower to ``rocdl.raw.ptr.buffer.load`` (VGPR), and ROCDL exposes no
-    ``s.buffer.load`` op to wrap. Hence the raw intrinsic, whose resource
-    operand is a v4i32 rather than the opaque buffer descriptor pointer.
+    ``s.buffer.load`` op to wrap. Reuse the scalar buffer path, which emits the
+    intrinsic with its required v4i32 resource operand.
     """
-    rsrc = _to_raw(fx.rocdl.get_buffer_rsrc(fx.get_iter(t)))
-    rsrc_v4 = llvm.bitcast(
-        ir.VectorType.get([4], T.i32),
-        llvm.ptrtoint(ir.IntegerType.get_signless(128), rsrc),
-    )
-    return llvm.call_intrinsic(
-        T.i32,
-        "llvm.amdgcn.s.buffer.load.i32",
-        # The intrinsic offset is in bytes; `index` counts dwords.
-        [rsrc_v4, _to_raw(fx.Int32(index) * 4), _to_raw(fx.Int32(cache_modifier))],
-        [],
-        [],
+    from aiter.ops.flydsl.kernels import buffer_ops
+
+    rsrc = fx.rocdl.get_buffer_rsrc(fx.get_iter(t))
+    return buffer_ops.buffer_load(
+        rsrc, index, vec_width=1, is_scalar=True, cache_modifier=cache_modifier
     )
 
 

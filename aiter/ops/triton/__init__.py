@@ -107,6 +107,8 @@ _BACKWARD_COMPAT_MAP = {
     "fused_gemm_afp4wfp4_mul_add": "gemm.fused.fused_gemm_afp4wfp4_mul_add",
     "fused_gemm_afp4wfp4_split_cat": "gemm.fused.fused_gemm_afp4wfp4_split_cat",
     "fused_gemm_a8w8_blockscale_split_cat": "gemm.fused.fused_gemm_a8w8_blockscale_split_cat",
+    # Grouped GEMM modules (gemm/grouped/)
+    "gmm": "gemm.grouped.gmm",
     # Attention modules (attention/)
     "chunked_pa_prefill": "attention.chunked_pa_prefill",
     "extend_attention": "attention.extend_attention",
@@ -127,6 +129,8 @@ _BACKWARD_COMPAT_MAP = {
     "unified_attention_sparse_mla": "attention.unified_attention_sparse_mla",
     "unified_attention": "attention.unified_attention",
     # Fusions modules (fusions/)
+    "activation": "fusions.activation",
+    "_triton_kernels.activation": "_triton_kernels.fusions.activation",
     "fused_kv_cache": "fusions.fused_kv_cache",
     "fused_mul_add": "fusions.fused_mul_add",
     "fused_qk_concat": "fusions.fused_qk_concat",
@@ -138,8 +142,11 @@ _BACKWARD_COMPAT_MAP = {
     # Normalization modules (normalization/)
     "fused_add_rmsnorm_pad": "normalization.fused_add_rmsnorm_pad",
     "fused_rmsnorm_add": "normalization.fused_rmsnorm_add",
+    "fused_rmsnorm_add_rmsnorm": "normalization.fused_rmsnorm_add_rmsnorm",
     "norm": "normalization.norm",
     "rmsnorm": "normalization.rmsnorm",
+    # RoPE modules (rope/)
+    "fused_qkv_split_qk_norm_rope_cache": "rope.fused_qkv_split_qk_norm_rope_cache",
     "fused_qkv_split_qk_rope": "rope.fused_qkv_split_qk_rope",
     # Utils modules (utils/)
     "common_utils": "utils.common_utils",
@@ -147,7 +154,7 @@ _BACKWARD_COMPAT_MAP = {
     "device_info": "utils.device_info",
     "gmm_common": "utils.gmm_common",
     "logger": "utils.logger",
-    "mha_kernel_utils": "utils._triton.mha_kernel_utils",
+    "mha_kernel_utils": "_triton_kernels.common.mha_kernel_utils",
     "moe_common": "utils.moe_common",
     "types": "utils.types",
     # Quant modules (quant/)

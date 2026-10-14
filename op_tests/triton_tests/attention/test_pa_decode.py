@@ -7,8 +7,10 @@ import pytest
 import torch
 import triton.language as tl
 
+import aiter.ops.triton.attention.pa_decode as pa_decode_mod
 from aiter import logger, pertoken_quant
 from aiter.ops.triton.attention.pa_decode import paged_attention_decode
+from aiter.ops.triton.utils._triton.arch_info import get_arch
 
 
 def paged_attention_decode_ref(
@@ -293,6 +295,70 @@ def test_paged_attn_v2(
         output_type=output_type,
     )
     assert v2_calls, "SEQ_LEN=4096 was expected to dispatch to the V2 kernels"
+
+
+@pytest.mark.parametrize("B, H_Q, H_KV", [(1, 8, 1), (4, 16, 16), (64, 16, 16)])
+@pytest.mark.parametrize("SEQ_LEN", [2048, 8192])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_paged_attn_multi_partition_dispatch(B, H_Q, H_KV, SEQ_LEN, dtype, monkeypatch):
+    """Check output and V1/V2 choice for bf16/fp16 caches above 1024 tokens."""
+    head_size, kv_blk_sz = 128, 16
+    compute_type = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16}[dtype]
+    num_blocks = (SEQ_LEN + kv_blk_sz - 1) // kv_blk_sz
+    (
+        query,
+        triton_output,
+        key_cache,
+        value_cache,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        max_context_len,
+    ) = input_helper(
+        B, H_Q, H_KV, head_size, kv_blk_sz, SEQ_LEN, dtype, dtype, dtype, num_blocks
+    )
+
+    called = []
+    for name in ("paged_attn_decode_v1", "paged_attn_decode_v2"):
+        fn = getattr(pa_decode_mod, name)
+        monkeypatch.setattr(
+            pa_decode_mod,
+            name,
+            lambda *a, _fn=fn, _name=name, **k: (called.append(_name), _fn(*a, **k))[1],
+        )
+
+    paged_attention_decode(
+        triton_output,
+        query,
+        key_cache_tri,
+        value_cache_tri,
+        context_lens,
+        block_tables,
+        1.0 / head_size**0.5,
+        int(max_context_len),
+        compute_type,
+        k_scale=torch.tensor([1.0]),
+        v_scale=torch.tensor([1.0]),
+    )
+
+    num_partitions = -(-SEQ_LEN // pa_decode_mod._SEQ_PARTITION_SIZE)
+    rule = pa_decode_mod._get_dispatch_config(
+        {torch.bfloat16: "bf16", torch.float16: "fp16"}[dtype]
+    )
+    if rule is not None:
+        expect_v1 = num_partitions <= rule["v1_max_partitions"]
+    else:
+        expect_v1 = SEQ_LEN <= 8192 and (num_partitions == 1 or B * H_Q > 512)
+    if get_arch() == "gfx950":
+        assert rule is not None and not expect_v1, "gfx950 bf16/fp16 must use V2 here"
+    assert called == ["paged_attn_decode_v1" if expect_v1 else "paged_attn_decode_v2"]
+
+    torch_output = torch.zeros(B, H_Q, head_size, dtype=dtype, device="cuda")
+    paged_attention_decode_ref(
+        torch_output, query, key_cache, value_cache, block_tables, context_lens
+    )
+    torch.testing.assert_close(triton_output, torch_output, rtol=1e-02, atol=1e-02)
 
 
 @pytest.mark.parametrize("B", [1, 4, 57, 64])
