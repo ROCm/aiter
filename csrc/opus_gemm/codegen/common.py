@@ -66,6 +66,77 @@ _SPLITK_WORKSPACE_TYPES = {
 }
 
 
+_WRITTEN_PATHS = set()
+
+
+def write_if_changed(path, contents):
+    """Write ``contents`` to ``path`` only when the bytes differ.
+
+    The JIT deliberately keeps the blob staging tree across rebuilds so ninja
+    can be incremental, but a generator that rewrites every file defeats that:
+    each file comes back with a fresh mtime, so all 672 opus translation units
+    recompiled on every rebuild even when not a byte of their source had
+    changed. Leaving an identical file untouched restores the incremental
+    build -- an unrelated edit now costs only the TUs that actually depend on
+    it, instead of ~13s of full recompile.
+    """
+    import os as _os
+
+    path = _os.fspath(path)
+    _WRITTEN_PATHS.add(_os.path.abspath(path))
+    data = contents.encode()
+    try:
+        with open(path, "rb") as handle:
+            if handle.read() == data:
+                return False
+    except OSError:
+        pass
+    with open(path, "wb") as handle:
+        handle.write(data)
+    return True
+
+
+def open_if_changed(path):
+    """``with``-block that buffers a text file and writes it only if changed.
+
+    A drop-in for ``open(path, "w")`` where the body streams into a handle. An
+    exception inside the block propagates without touching the file on disk.
+    """
+    import contextlib
+    import io
+
+    @contextlib.contextmanager
+    def _buffered():
+        buffer = io.StringIO()
+        yield buffer
+        write_if_changed(path, buffer.getvalue())
+
+    return _buffered()
+
+
+def reset_written_paths():
+    """Start a new bookkeeping generation for :func:`prune_unwritten`."""
+    _WRITTEN_PATHS.clear()
+
+
+def prune_unwritten(directory):
+    """Delete files in ``directory`` that this run did not write.
+
+    The generated trees used to be ``rmtree``'d before every run so that a kid
+    dropped from the compile set could not leave a stale source behind. That
+    also guaranteed a full recompile. Pruning gives the same guarantee while
+    leaving the surviving files -- and their mtimes -- alone.
+    """
+    import os as _os
+
+    if not _os.path.isdir(directory):
+        return
+    for name in _os.listdir(directory):
+        path = _os.path.join(directory, name)
+        if _os.path.isfile(path) and _os.path.abspath(path) not in _WRITTEN_PATHS:
+            _os.remove(path)
+
+
 def splitk_workspace_type(k):
     """Return C++ storage, pointer, and Aiter dtype tokens declared by a kid."""
     dtype = k.splitk_workspace_dtype

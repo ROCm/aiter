@@ -27,6 +27,7 @@ op_tests/triton_tests/attention/test_pa_decode_sparse.py	31
 op_tests/triton_tests/attention/test_pa_mqa_logits_mxfp4.py	282
 op_tests/triton_tests/attention/test_pa_prefill.py	56
 op_tests/triton_tests/attention/test_pa_prefill_sparse.py	16
+op_tests/triton_tests/attention/test_paged_attention_output_gate.py	20
 op_tests/triton_tests/attention/test_prefill_attention.py	7
 op_tests/triton_tests/attention/test_sparse_attention_dsv4_bwd.py	5
 op_tests/triton_tests/attention/test_sparse_mla.py	26

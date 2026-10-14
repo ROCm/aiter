@@ -159,11 +159,6 @@ AITER_CONFIG_FMOE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fmoe.csv",
 )
 
-AITER_CONFIG_COMM_FUSED_MOE = os.getenv(
-    "AITER_CONFIG_COMM_FUSED_MOE",
-    f"{AITER_ROOT_DIR}/aiter/configs/comm_fused_moe.csv",
-)
-
 AITER_CONFIG_FHMOE = os.getenv(
     "AITER_CONFIG_FHMOE",
     f"{AITER_ROOT_DIR}/aiter/configs/tuned_fhmoe.csv",
@@ -212,6 +207,7 @@ AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE = os.getenv(
     f"{AITER_ROOT_DIR}/aiter/configs/batched_gemm_a8w8_blockscale_mxscale_tuned.csv",
 )
 
+# Separate configs for (16,16)-preshuffled B let both weight layouts coexist.
 AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE = os.getenv(
     "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
     f"{AITER_ROOT_DIR}/aiter/configs/"
@@ -325,14 +321,6 @@ class AITER_CONFIG:
         )
 
     @property
-    def AITER_CONFIG_COMM_FUSED_MOE_FILE(self):
-        return self.get_config_file(
-            "AITER_CONFIG_COMM_FUSED_MOE",
-            AITER_CONFIG_COMM_FUSED_MOE,
-            "tuned_comm_fused_moe",
-        )
-
-    @property
     def AITER_CONFIG_FHMOE_FILE(self):
         return self.get_config_file(
             "AITER_CONFIG_FHMOE", AITER_CONFIG_FHMOE, "tuned_fhmoe"
@@ -424,6 +412,8 @@ class AITER_CONFIG:
 
     @property
     def AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE_FILE(self):
+        # The name carries _bpreshuffle_ between mxscale and tuned, so the glob
+        # above cannot pick these files up and this one cannot pick those up.
         return self.get_config_file(
             "AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE",
             AITER_CONFIG_BATCHED_GEMM_A8W8_BLOCKSCALE_MXSCALE_BPRESHUFFLE,
