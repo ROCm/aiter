@@ -115,10 +115,8 @@ class FlyDSLAllReduceRMSNorm:
       records the caller's unfused path -- slower, but correct, and it cannot
       hang. That decision is rank-symmetric: ranks capture in lockstep and
       ``_ready`` only ever changes through collectives.
-    * The fused policy's windows are live (``resolve_fused_policy``; the
-      quantized ones only with ``AITER_FLY_AR_ACCURACY=fast``). Outside them
-      this path declines and the caller runs aiter's own fused kernel, which
-      at some shapes can be faster.
+    * The fused policy's windows are live. Outside them this path declines and 
+      the caller runs Aiter's other fused kernel.
     """
 
     _SUPPORTED_WORLD_SIZES: ClassVar[list[Any]] = [2, 4, 8]
