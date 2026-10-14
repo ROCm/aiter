@@ -87,9 +87,9 @@ def compile_reduce_kernel(
                 output_seq_len,
                 one_output_group_size,
                 head_size_pow2,
-                head_size != head_size_pow2,
                 context_partition_size,
                 use_sinks,
+                head_size != head_size_pow2,
             ),
         )
 
@@ -135,9 +135,9 @@ def compile_reduce_kernel(
             f"{output_seq_len}",  # OUTPUT_SEQ_LEN (constexpr)
             f"{one_output_group_size}",  # ONE_OUTPUT_GROUP_SIZE (constexpr)
             f"{head_size_pow2}",
-            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
             f"{context_partition_size}",
             f"{use_sinks}",
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
         ]
         signature = ",".join(signature_parts)
 

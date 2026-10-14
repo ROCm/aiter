@@ -315,9 +315,9 @@ def compile(
             f"{query_seq_len}",  # OUTPUT_SEQ_LEN (constexpr)
             f"{one_query_group_size}",  # ONE_OUTPUT_GROUP_SIZE (constexpr)
             f"{head_size_pow2}",
-            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
             f"{context_partition_size}",
             f"{use_sinks}",
+            f"{int(head_size != head_size_pow2)}",  # VALUE_HEAD_PADDED
         ]
         reduce_signature = ",".join(reduce_signature_parts)
         reduce_kernel_name = "paged_attention_decode_v2_reduce_kernel"
