@@ -229,15 +229,23 @@ class StoreCInt8(StoreC):
     conversion.
     """
 
-    def store(self, c_frag, base_row, base_col):
-        a_scales = [
+    def load_a_scales(self, base_row):
+        return [
             self._load_scale_vec4(base_row + i * 16 + (self.lane_id // 16) * 4)
             for i in range_constexpr(self.n_tiles_a)
         ]
-        b_scales = [
+
+    def load_b_scales(self, base_col):
+        return [
             self._load_scale_scalar(base_col + i * 16 + self.lane_id % 16)
             for i in range_constexpr(self.n_tiles_b)
         ]
+
+    def store(self, c_frag, base_row, base_col, a_scales=None, b_scales=None):
+        if const_expr(a_scales is None):
+            a_scales = self.load_a_scales(base_row)
+        if const_expr(b_scales is None):
+            b_scales = self.load_b_scales(base_col)
         for ti in range_constexpr(self.n_tiles_a):
             row = base_row + ti * 16 + (self.lane_id // 16) * 4
             for tj in range_constexpr(self.n_tiles_b):
@@ -417,12 +425,18 @@ def compile_fp8_gemm_8w(
     waves_per_eu: int = 2,
     xcd_swizzle: int = 0,
     input_dtype: str = "fp8",
+    int8_merged_phases: bool = True,
+    int8_balanced_tail: bool = True,
+    int8_early_scales: bool = True,
 ):
     BLOCK_K = 128
 
     if input_dtype not in ("fp8", "int8"):
         raise ValueError(f"input_dtype must be 'fp8' or 'int8', got {input_dtype!r}")
     is_int8 = input_dtype == "int8"
+    merged_phases = is_int8 and int8_merged_phases
+    balanced_tail = is_int8 and int8_balanced_tail
+    early_scales = is_int8 and int8_early_scales
 
     assert (
         BLOCK_M >= 128 and BLOCK_N >= 256 and BLOCK_M % 128 == 0 and BLOCK_N % 256 == 0
@@ -462,6 +476,8 @@ def compile_fp8_gemm_8w(
         f"flydsl_{_layout_tag}_8w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_"
         f"{_input_tag}_{_input_tag}_B16_"
         f"{waves_per_eu}x{xcd_swizzle}_k{K}"
+        f"{'_mp' if merged_phases else ''}{'_bt' if balanced_tail else ''}"
+        f"{'_es' if early_scales else ''}"
     )
 
     input_elem_t = fx.Int8 if is_int8 else fx.Float8E4M3FN
@@ -559,107 +575,178 @@ def compile_fp8_gemm_8w(
         if wave_m == 1:
             rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+        if const_expr(merged_phases):
+            # Two ping-pong phases of 32 MFMAs per K-tile instead of four of 16.
+            # wave_m == 0 runs one barrier ahead of wave_m == 1. Tile k + 1 is
+            # fetched during tile k's LDS-read phases, so the DMA issue hides
+            # behind the other half's MFMAs. Each stage is refilled only after
+            # the barrier that pairs with the other half's last MFMA use of it,
+            # and waited for before the barrier that pairs with its first reader.
+            wait_barrier(N_LDS_STEPS_A)
+            wait_barrier(N_LDS_STEPS_A)
+            for k in range_constexpr(K_ITERS):
+                prefetch = k + 1 < K_ITERS
+                b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
+                a0_frag = a_s2r.load(a_cur0)
+                b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+                if const_expr(prefetch):
+                    b_g2s.load(b_next0, B0_gl_offset + (k + 1) * B_K_STEP)
+                    a_g2s.load(a_next0, A0_gl_offset + (k + 1) * BLOCK_K)
+                    b_g2s.load(b_next1, B1_gl_offset + (k + 1) * B_K_STEP)
+                    wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+                else:
+                    wait_barrier(0)
 
-        b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
-        a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
-        b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
+                rocdl.s_setprio(1)
+                c00_frag = mfma.call(a0_frag, b0_frag, c00_frag, set_prio=False)
+                c01_frag = mfma.call(a0_frag, b1_frag, c01_frag, set_prio=False)
+                rocdl.s_setprio(0)
+                rocdl.s_barrier()
 
-        wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+                a1_frag = a_s2r.load(a_cur1)
+                if const_expr(prefetch):
+                    a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
+                    wait_barrier(N_LDS_STEPS_A)
+                else:
+                    rocdl.s_barrier()
 
-        for k in range_constexpr(K_ITERS - 2):
+                rocdl.s_setprio(1)
+                c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
+                c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
+                rocdl.s_setprio(0)
+                if const_expr(prefetch):
+                    rocdl.s_barrier()
+                    a_cur0, a_next0 = a_next0, a_cur0
+                    a_cur1, a_next1 = a_next1, a_cur1
+                    b_cur0, b_next0 = b_next0, b_cur0
+                    b_cur1, b_next1 = b_next1, b_cur1
+        else:
+            wait_barrier(N_LDS_STEPS_A + N_LDS_STEPS_B)
+
+            b_g2s.load(b_next0, B0_gl_offset + 1 * B_K_STEP)
+            a_g2s.load(a_next0, A0_gl_offset + 1 * BLOCK_K)
+            b_g2s.load(b_next1, B1_gl_offset + 1 * B_K_STEP)
+
+            wait_barrier(N_LDS_STEPS_A + 2 * N_LDS_STEPS_B)
+
+            for k in range_constexpr(K_ITERS - 2):
+                b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
+                a0_frag = a_s2r.load(a_cur0)
+                a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
+                rocdl.s_barrier()
+
+                c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+
+                b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+                b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
+                rocdl.s_barrier()
+
+                c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+
+                a1_frag = a_s2r.load(a_cur1)
+                a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
+                rocdl.s_barrier()
+
+                c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+
+                b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
+                wait_barrier(main_loop_vmcnt)
+
+                c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
+
+                # Swap cur and next
+                a_cur0, a_next0 = a_next0, a_cur0
+                a_cur1, a_next1 = a_next1, a_cur1
+                b_cur0, b_next0 = b_next0, b_cur0
+                b_cur1, b_next1 = b_next1, b_cur1
+
+            # Step k = K_ITERS - 2
+            k = K_ITERS - 2
             b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
             a0_frag = a_s2r.load(a_cur0)
-            a_g2s.load(a_next1, A1_gl_offset + (k + 1) * BLOCK_K)
             rocdl.s_barrier()
 
             c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
             b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-            b_g2s.load(b_cur0, B0_gl_offset + (k + 2) * B_K_STEP)
             rocdl.s_barrier()
 
             c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
 
             a1_frag = a_s2r.load(a_cur1)
-            a_g2s.load(a_cur0, A0_gl_offset + (k + 2) * BLOCK_K)
+            # Main loop prefetches a_next1 one step behind; issue the final
+            # K_ITERS - 1 tile here, otherwise c10 / c11 read stale A1 data.
+            a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
             rocdl.s_barrier()
 
             c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
 
-            b_g2s.load(b_cur1, B1_gl_offset + (k + 2) * B_K_STEP)
-            wait_barrier(main_loop_vmcnt)
+            b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
+            rocdl.s_barrier()
 
             c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-
             # Swap cur and next
             a_cur0, a_next0 = a_next0, a_cur0
             a_cur1, a_next1 = a_next1, a_cur1
             b_cur0, b_next0 = b_next0, b_cur0
             b_cur1, b_next1 = b_next1, b_cur1
 
-        # Step k = K_ITERS - 2
-        k = K_ITERS - 2
-        b0_frag = b_s2r.load(b_cur0, preshuffled=b_preshuffled)
-        a0_frag = a_s2r.load(a_cur0)
-        rocdl.s_barrier()
+            # Step k = K_ITERS - 1
+            k = K_ITERS - 1
+            a0_frag = a_s2r.load(a_cur0)
+            wait_barrier(0)
 
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
+            c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
 
-        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
+            b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
+            rocdl.s_barrier()
 
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
+            c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
 
-        a1_frag = a_s2r.load(a_cur1)
-        # Main loop prefetches a_next1 one step behind; issue the final
-        # K_ITERS - 1 tile here, otherwise c10 / c11 read stale A1 data.
-        a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
-        rocdl.s_barrier()
+            a1_frag = a_s2r.load(a_cur1)
+            rocdl.s_barrier()
 
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
+            rocdl.s_setprio(1)
+            c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
+            c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
+            rocdl.s_setprio(0)
 
-        b0_frag = b_s2r.load(b_next0, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
-
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag)
-        # Swap cur and next
-        a_cur0, a_next0 = a_next0, a_cur0
-        a_cur1, a_next1 = a_next1, a_cur1
-        b_cur0, b_next0 = b_next0, b_cur0
-        b_cur1, b_next1 = b_next1, b_cur1
-
-        # Step k = K_ITERS - 1
-        k = K_ITERS - 1
-        a0_frag = a_s2r.load(a_cur0)
-        wait_barrier(0)
-
-        c00_frag = mfma.call(a0_frag, b0_frag, c00_frag)
-
-        b1_frag = b_s2r.load(b_cur1, preshuffled=b_preshuffled)
-        rocdl.s_barrier()
-
-        c01_frag = mfma.call(a0_frag, b1_frag, c01_frag)
-
-        a1_frag = a_s2r.load(a_cur1)
-        rocdl.s_barrier()
-
-        rocdl.s_setprio(1)
-        c10_frag = mfma.call(a1_frag, b0_frag, c10_frag, set_prio=False)
-        c11_frag = mfma.call(a1_frag, b1_frag, c11_frag, set_prio=False)
-        rocdl.s_setprio(0)
-        rocdl.s_barrier()
-
-        # Scale and store back to gmem
         wave_n_offset = wave_n * (N_TILES_B * 16)
         wave_m_offset = wave_m * (N_TILES_A * 16)
         base_row = block_m * BLOCK_M + wave_m_offset
         base_col = block_n * BLOCK_N + wave_n_offset
+        row_lo, row_hi = base_row, base_row + LDS_BLOCK_M
+        col_lo, col_hi = base_col, base_col + LDS_BLOCK_N
+        sa_lo = sa_hi = sb_lo = sb_hi = None
+        if const_expr(early_scales):
+            # Each row/column scale vector is shared by two of the four stores:
+            # load it once, before the final barrier, so its latency overlaps
+            # the barrier and the first conversions.
+            sa_lo = store_c.load_a_scales(row_lo)
+            sb_lo = store_c.load_b_scales(col_lo)
+            sb_hi = store_c.load_b_scales(col_hi)
+            sa_hi = store_c.load_a_scales(row_hi)
 
-        store_c.store(c00_frag, base_row + 0, base_col + 0)
-        store_c.store(c01_frag, base_row + 0, base_col + LDS_BLOCK_N)
-        store_c.store(c10_frag, base_row + LDS_BLOCK_M, base_col + 0)
-        store_c.store(c11_frag, base_row + LDS_BLOCK_M, base_col + LDS_BLOCK_N)
+        if const_expr(balanced_tail):
+            # wave_m == 1 took one extra barrier in the prologue. Skipping its
+            # last one leaves both halves with equal barrier counts, so it does
+            # not wait for wave_m == 0 to exit before running its epilogue.
+            if wave_m == 0:
+                rocdl.s_barrier()
+        else:
+            rocdl.s_barrier()
+
+        # Scale and store back to gmem
+        if const_expr(early_scales):
+            store_c.store(c00_frag, row_lo, col_lo, sa_lo, sb_lo)
+            store_c.store(c01_frag, row_lo, col_hi, sa_lo, sb_hi)
+            store_c.store(c10_frag, row_hi, col_lo, sa_hi, sb_lo)
+            store_c.store(c11_frag, row_hi, col_hi, sa_hi, sb_hi)
+        else:
+            store_c.store(c00_frag, row_lo, col_lo)
+            store_c.store(c01_frag, row_lo, col_hi)
+            store_c.store(c10_frag, row_hi, col_lo)
+            store_c.store(c11_frag, row_hi, col_hi)
 
     @flyc.jit
     def launch_gemm(
