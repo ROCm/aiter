@@ -160,8 +160,9 @@ def _mori_unavailable(*_args, **_kwargs):
 @contextmanager
 def _fake_shmem(device):
     """mori shmem that hands out FakeTensors and fake peer addresses."""
-    if importlib.util.find_spec("mori") is None:
-        # The replay never reaches mori itself, so a build host need not have it.
+    if sys.modules.get("mori") is None and importlib.util.find_spec("mori") is None:
+        # The replay never reaches mori itself, so a build host need not have
+        # it. The stand-in then stays, since modules imported under it keep it.
         package, shmem = ModuleType("mori"), ModuleType("mori.shmem")
         package.shmem = shmem
         shmem.shmem_barrier_all = _mori_unavailable
