@@ -148,6 +148,47 @@ def test_blockscale(m, n, k, tm, tk, sk, tn):
         assert bad == 0, f"bad={bad}"
 
 
+@pytest.mark.parametrize("layout", ["quantizer", "column_major", "k_major"])
+def test_blockscale_quantizer_public_dispatch(monkeypatch, layout):
+    from aiter.ops import gemm_op_a8w8 as gemm_mod
+
+    m, n, k = 4, 256, 2176
+    g = torch.Generator(device="cuda").manual_seed(19)
+    a = torch.randn((m, k), generator=g, device="cuda", dtype=dtypes.bf16)
+    aq, xs = aiter.per_group_quant_hip(
+        a, quant_dtype=dtypes.fp8, group_size=128, transpose_scale=True
+    )
+    logical_xs = xs.view(k // 128, m).T
+    bq = (torch.rand((n, k), generator=g, device="cuda") - 0.5).to(dtypes.fp8)
+    ws = torch.linspace(0.5, 1.5, (n // 128) * (k // 128), device="cuda").reshape(
+        n // 128, k // 128
+    )
+    ref = (aq.float() * logical_xs.repeat_interleave(128, dim=1)) @ (
+        bq.float() * ws.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    ).T
+    if layout == "column_major":
+        xs = logical_xs
+    elif layout == "k_major":
+        xs = xs.view(k // 128, m)
+    monkeypatch.setattr(
+        gemm_mod,
+        "get_CKGEMM_config",
+        lambda *args: {
+            "libtype": "flydsl",
+            "kernelName": "flydsl_bpreshuflle_32x64x128_fp8_bf16_none_0x0x0x2_smbs",
+        },
+    )
+    out = torch.full((m, n), float("nan"), device="cuda", dtype=dtypes.bf16)
+    result = aiter.gemm_a8w8_blockscale_bpreshuffle(
+        aq, shuffle_weight(bq, layout=(16, 16)), xs, ws, dtypes.bf16, out=out
+    )
+    torch.cuda.synchronize()
+    assert result is out
+    tol = 5e-3 * ref.abs().max() + 1e-2 * ref.abs()
+    assert torch.isfinite(out).all()
+    assert (out.float() - ref).abs().le(tol).all()
+
+
 @pytest.mark.skipif(
     not torch.cuda.is_available() or get_gfx_runtime() != "gfx942",
     reason="gfx942 async-copy rejection",

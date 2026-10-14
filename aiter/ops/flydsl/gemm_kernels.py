@@ -306,8 +306,9 @@ def flydsl_preshuffle_gemm_a8(
 ) -> Tensor:
     """Run preshuffle GEMM with per-row/column or per-128-K FP32 scales.
 
-    Blockscale expects x_scale [K/128, M] (transposed) and
-    w_scale [ceil(N/128), K/128], with FP8 inputs on gfx942 or gfx950.
+    Blockscale reads x_scale in K-block-major storage: contiguous [K/128, M],
+    or [M, K/128] with quantizer-transposed storage or column-major strides.
+    w_scale is contiguous [ceil(N/128), K/128], with FP8 on gfx942 or gfx950.
     """
     compile_fn = _get_compile_fn()
     from aiter.utility import dtypes
@@ -362,8 +363,18 @@ def flydsl_preshuffle_gemm_a8(
             ("x_scale", x_scale, (k // 128, m)),
             ("w_scale", w_scale, ((n + 127) // 128, k // 128)),
         ):
-            if scale.dtype != torch.float32 or tuple(scale.shape) != shape:
-                raise ValueError(f"blockscale {name} must be FP32 {shape}")
+            valid_layout = tuple(scale.shape) == shape and scale.is_contiguous()
+            if name == "x_scale" and tuple(scale.shape) == (m, k // 128):
+                valid_layout = scale.is_contiguous() or all(
+                    extent == 1 or stride == expected
+                    for extent, stride, expected in zip(
+                        scale.shape, scale.stride(), (1, m)
+                    )
+                )
+            if scale.dtype != torch.float32 or not valid_layout:
+                raise ValueError(
+                    f"blockscale {name} must be FP32 {shape} in K-block-major storage"
+                )
             if (
                 scale.numel() * scale.element_size()
                 >= PRESHUFFLE_FLAT_BUFFER_LIMIT_BYTES
@@ -385,6 +396,12 @@ def flydsl_preshuffle_gemm_a8(
 
         x_scale = _norm_scale("x_scale", x_scale, m)
         w_scale = _norm_scale("w_scale", w_scale, n)
+
+    if scale_mode == "blockscale":
+        # Flatten storage, not logical metadata: contiguous() would reorder the
+        # supported column-major x-scale view instead of preserving kb*M+row.
+        x_scale = x_scale.as_strided((x_scale.numel(),), (1,))
+        w_scale = w_scale.view(-1)
 
     wpe = None if waves_per_eu <= 0 else waves_per_eu
 
