@@ -10,7 +10,6 @@ from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2
 from aiter.ops.triton.attention.mha import (
     flash_attn_func,
     flash_attn_varlen_func,
-    mha_set_impl,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
@@ -993,17 +992,12 @@ def test_mha_backward_varlen(
         torch.testing.assert_close(tri, ref.to(tri.dtype), atol=atol, rtol=rtol)
 
 
-@pytest.mark.parametrize(
-    "impl, bwd_mode", [("default", None), ("dao_ai", "fused"), ("dao_ai", "split")]
-)
-def test_mha_backward_varlen_very_negative_logits(impl: str, bwd_mode, monkeypatch):
+@pytest.mark.parametrize("bwd_mode", [None, "fused", "split"])
+def test_mha_backward_varlen_very_negative_logits(bwd_mode, monkeypatch):
     # Rows whose logits are all very negative (logsumexp < -88) used to overflow exp(0 - lse) to inf
     # on the zero-loaded keys of the last partial key block of the unmasked dq loop, and inf * 0 put
     # NaN in dq. Seen on real Qwen2.5-1.5B activations. The sequence lengths are not block multiples
     # so that partial block exists.
-    if bwd_mode is not None:
-        # The dao_ai "fused" and "split" backward modes use different dq loops; monkeypatch restores the mode.
-        monkeypatch.setattr(flash_attn_2, "BWD_MODE", bwd_mode)
     torch.cuda.empty_cache()
     torch.manual_seed(0)
     mha_set_use_fused_bwd_kernel(False)
@@ -1027,14 +1021,61 @@ def test_mha_backward_varlen_very_negative_logits(impl: str, bwd_mode, monkeypat
         [0, *torch.tensor(seqlens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
     )
 
-    mha_set_impl(impl)
-    try:
+    if bwd_mode is None:
         triton_out = flash_attn_varlen_func(
             q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens), causal=True
         )
         triton_dq, triton_dk, triton_dv = torch.autograd.grad(triton_out, (q, k, v), do)
-    finally:
-        mha_set_impl("default")
+    else:
+        # The flash_attn_2 backward has "fused" and "split" modes with different dq loops; monkeypatch restores the mode.
+        monkeypatch.setattr(flash_attn_2, "BWD_MODE", bwd_mode)
+        scale = HEAD_SZ**-0.5
+        out, lse, _, _ = flash_attn_2.varlen_fwd(
+            q,
+            k,
+            v,
+            None,
+            cu_seqlens,
+            cu_seqlens,
+            seqused_k=None,
+            leftpad_k=None,
+            block_table_=None,
+            alibi_slopes=None,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_k=max(seqlens),
+            dropout_p=0.0,
+            softmax_scale=scale,
+            zero_tensors=False,
+            causal=True,
+            window_size_left=-1,
+            window_size_right=-1,
+            softcap=0.0,
+            return_softmax=False,
+        )
+        triton_dq, triton_dk, triton_dv, _ = flash_attn_2.varlen_bwd(
+            do,
+            q,
+            k,
+            v,
+            out,
+            lse,
+            None,
+            None,
+            None,
+            cu_seqlens,
+            cu_seqlens,
+            None,
+            max_seqlen_q=max(seqlens),
+            max_seqlen_k=max(seqlens),
+            dropout_p=0.0,
+            softmax_scale=scale,
+            zero_tensors=False,
+            causal=True,
+            window_size_left=-1,
+            window_size_right=-1,
+            softcap=0.0,
+            deterministic=False,
+        )
 
     # Reference: fp32 attention per sequence.
     q_ref, k_ref, v_ref = (t.detach().float().requires_grad_(True) for t in (q, k, v))
