@@ -4,7 +4,7 @@ import torch
 import triton
 
 import aiter
-from aiter.ops.triton._triton_kernels.activation import (
+from aiter.ops.triton._triton_kernels.common.activation import (
     _get_activation_from_str,
 )
 from aiter.ops.triton._triton_kernels.quant.fused_fp8_quant import (
@@ -623,7 +623,7 @@ def fused_reduce_act_mul_fp8_group_quant(
         if x is 2-dim,
             x: (M, 2*N1), dtype = fp16 or bf16.
             x2 must be None
-            the kernel is essentially identical to aiter.ops.triton.activation.act_mul_and_fp8_group_quant
+            the kernel is essentially identical to aiter.ops.triton.fusions.activation.act_mul_and_fp8_group_quant
 
         activation: activation function to apply before quantization.
             - It splits the features into two parts and applies the activation to the first part.

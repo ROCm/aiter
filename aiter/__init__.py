@@ -76,10 +76,19 @@ def _has_rocm_toolchain() -> bool:
 # are the supported fallback without it. Linux keeps failing loudly instead,
 # where ROCm is a hard prerequisite and its absence is a broken install.
 if not AITER_TRITON_ONLY and sys.platform == "win32" and not _has_rocm_toolchain():
+    import importlib.util
+
     AITER_TRITON_ONLY = True
+    # rocm[devel] ships its toolchain as an archive that stays packed until
+    # `rocm-sdk init` runs, so an installed wheel is not yet a usable toolchain.
+    if importlib.util.find_spec("rocm_sdk_devel") is not None:
+        hint = "Run `rocm-sdk init` to unpack the rocm[devel] toolchain"
+    else:
+        hint = "Install rocm[devel] or the HIP SDK"
     logger.warning(
         "No ROCm install found; falling back to the Triton ops. "
-        "Install the HIP SDK and set HIP_PATH to build the C++/HIP ops."
+        "%s to build the C++/HIP ops.",
+        hint,
     )
 
 # Use bundled pre-compiled FlyDSL cache unless the user overrides via env var.
@@ -113,6 +122,7 @@ else:
     from .ops.quant import *
     from .ops.gemm_op_a8w8 import *
     from .ops.gemm_op_a16w16 import *
+    from .ops.gemm_op_a16w8 import *
     from .ops.gemm_op_a4w4 import *
     from .ops.gemm_op_a6w6 import *
     from .ops.gemm_op_a6w4 import *
@@ -143,10 +153,13 @@ else:
     from .ops.topk import *
     from .ops.topk_plain import topk_plain  # noqa: F401
 
-    # topk_select imports flydsl at module scope and flydsl publishes
-    # Linux-only wheels, so the op is unavailable on Windows.
+    # topk_select requires the optional, Linux-only FlyDSL package.
     if sys.platform != "win32":
-        from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+        try:
+            from .ops.topk_select import topk_select, topk_select_backend  # noqa: F401
+        except ModuleNotFoundError as exc:
+            if exc.name != "flydsl":
+                raise
 
     from .ops.mha import *
     from .ops.vsa_sparse_attention import vsa_sparse_attention  # noqa: F401

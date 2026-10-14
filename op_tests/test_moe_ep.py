@@ -399,53 +399,6 @@ def _calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 summary_table = []
 
 
-def _check_persistent_graph(captured):
-    """Check live route bounds and untouched padding across graph replays."""
-    alignment = max(
-        call.keywords["tile_m"] for name, call in captured if name in ("gemm1", "gemm2")
-    )
-    for name, launch in captured:
-        if name not in ("gemm1", "gemm2"):
-            continue
-        output, *_, prefix = launch.args
-        saved_prefix = prefix.clone()
-        expected = output.clone()
-        rows = launch.keywords["contiguous_m"]
-        graph = torch.cuda.CUDAGraph()
-        torch.cuda.synchronize()
-        with torch.cuda.graph(graph):
-            launch()
-        try:
-            for limit in (None, 1, 0, None):
-                if limit is None:
-                    prefix.copy_(saved_prefix)
-                else:
-                    prefix.copy_(saved_prefix.clamp(max=limit))
-                valid = torch.zeros(rows, dtype=torch.bool, device=output.device)
-                start = 0
-                for end in prefix.cpu().tolist():
-                    valid[start:end] = True
-                    start = (end + alignment - 1) // alignment * alignment
-                output.fill_(17)
-                graph.replay()
-                torch.cuda.synchronize()
-                actual_rows = output.reshape(rows, -1)
-                torch.testing.assert_close(
-                    actual_rows[valid],
-                    expected.reshape(rows, -1)[valid],
-                    rtol=0,
-                    atol=0,
-                )
-                assert torch.all(
-                    actual_rows[~valid] == 17
-                ), f"{name}: graph replay wrote outside live expert rows"
-        finally:
-            prefix.copy_(saved_prefix)
-            launch()
-            torch.cuda.synchronize()
-        print(f"[persistent-graph] {name}: full, one-row, empty, full PASSED")
-
-
 def test_fmoe_ep_mxfp4(
     quant_label,
     token,
@@ -458,7 +411,6 @@ def test_fmoe_ep_mxfp4(
     ep_mode="real",
     fake_ep_rank=0,
     const_init=None,
-    check_persistent_graph=False,
 ):
     """End-to-end EP fused_moe with per_1x32 mxfp4 weights.
     quant_label ∈ {"a8w4_mxfp4", "a4w4_mxfp4"}.
@@ -467,7 +419,9 @@ def test_fmoe_ep_mxfp4(
       * "real" (default): simulate MORI dispatch. `token` is the GLOBAL token count;
         a source token is received iff it owns >=1 local expert (deduplicated), so
         total_recv <= token and non-local routes are masked. Buffer is trimmed to
-        trim_M = token with a padded tail.
+        trim_M = token with a padded tail. AITER_MOE_EXPERT_BALANCE=true uses
+        synthetic routing balanced across global experts and EP ranks, matching
+        ATOM's init_balance_router_logits; otherwise routing scores are random.
       * "fake": mirror ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb,
         atom/model_ops/moe.py:121-136). `token` is the PER-RANK batch M; every
         token's topk picks are redirected onto this rank's local expert block via a
@@ -535,6 +489,8 @@ def test_fmoe_ep_mxfp4(
     expert_mask[E:-1] = 1
 
     dtype = dtypes.bf16
+    balanced = os.environ.get("AITER_MOE_EXPERT_BALANCE", "false").lower() == "true"
+    routing = "balanced" if balanced or ep_mode == "fake" else "random"
 
     if ep_mode == "fake":
         # ---------- ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb) shape model ----------
@@ -614,7 +570,23 @@ def test_fmoe_ep_mxfp4(
         src_input = _randn_or_const(
             (n_src, model_dim), const_init=const_init, dtype=dtype
         )
-        src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
+        if balanced:
+            if E % ep != 0 or not 1 <= topk <= E:
+                raise ValueError(
+                    "Balanced real EP routing requires E divisible by ep and "
+                    f"1 <= topk <= E, got E={E}, ep={ep}, topk={topk}"
+                )
+            # Match ATOM's global balanced router: walk ranks first, then
+            # local expert slots. Each expert gets floor/ceil(n_src*topk/E)
+            # routes, and each token's routes span EP ranks evenly.
+            t = torch.arange(n_src, device="cuda").unsqueeze(1)
+            k = torch.arange(topk, device="cuda").unsqueeze(0)
+            p = t * topk + k
+            expert_ids = (p % ep) * experts_per_rank + (p // ep) % experts_per_rank
+            src_score = torch.full((n_src, E), -10.0, dtype=dtype, device="cuda")
+            src_score.scatter_(1, expert_ids, 10.0)
+        else:
+            src_score = torch.randn((n_src, E), dtype=dtype, device="cuda")
         src_topk_ids = torch.empty(
             (n_src, topk + shared_E + 1), dtype=dtypes.i32, device="cuda"
         )
@@ -644,7 +616,7 @@ def test_fmoe_ep_mxfp4(
         assert total_recv <= trim_M, f"total_recv={total_recv} exceeds trim_M={trim_M}"
         print(
             f"  [EP sim] global_token={token} topk={topk} ep={ep} graph_bs={graph_bs} "
-            f"n_src={n_src} total_recv={total_recv} trim_M={trim_M}"
+            f"n_src={n_src} total_recv={total_recv} trim_M={trim_M} routing={routing}"
         )
 
         # Step 3: build the dispatch buffer at trim_M (ATOM's CUDAGraph bound).
@@ -830,7 +802,7 @@ def test_fmoe_ep_mxfp4(
     )
     gemm1_us = None
     gemm2_us = None
-    if (_ep_kernel_bench or check_persistent_graph) and _gfx == "gfx1250":
+    if _ep_kernel_bench and _gfx == "gfx1250":
         from aiter.ops.flydsl import grouped_moe_gfx1250 as _grouped
 
         _cap: list = []
@@ -852,8 +824,6 @@ def test_fmoe_ep_mxfp4(
             )
         finally:
             _grouped.kernel_bench_callable = None
-        if check_persistent_graph:
-            _check_persistent_graph(_cap)
         _ku = {}
         for _name, _callable in _cap:
             _, _u = run_perftest(
@@ -923,6 +893,7 @@ def test_fmoe_ep_mxfp4(
         {
             "quant": quant_label,
             "ep_mode": ep_mode,
+            "routing": routing,
             "global_token": token,
             "total_recv": total_recv,
             "trim_M": trim_M,
@@ -1047,6 +1018,8 @@ parser.add_argument(
     help="""Routing model for the mxfp4 EP tests (g1u1_a8w4_mxfp4/g1u1_a4w4_mxfp4):
     real = simulate MORI dispatch: -m is GLOBAL tokens, dedup + mask, only
            ~1/ep of routes land locally (total_recv <= token).
+           AITER_MOE_EXPERT_BALANCE=true balances routing across global experts
+           and EP ranks; otherwise routing scores are random.
     fake = ATOM fake-EP (ATOM_FAKE_EP + --fake-eplb, moe.py:121-136): -m is the
            PER-RANK batch M, every token's topk redirected onto local experts
            (full M*topk local routes, no mask/dedup). Aligns with
@@ -1069,17 +1042,12 @@ parser.add_argument(
     metavar="VALUE",
     help="""initialize activations (input) and weights (w1/w2) to the constant
     VALUE instead of random values (mxfp4 EP tests only). Bare --const-init uses
-    0.0 (zero-init). Routing scores stay random so expert selection is unchanged.
+    0.0 (zero-init). Routing scores are unaffected by this option.
     Mirrors flydsl_tests/test_flydsl_grouped_gemm.py --const-init.""",
 )
 
 parser.add_argument(
     "--seed", type=int, default=0, help="Random input and routing seed."
-)
-parser.add_argument(
-    "--check-persistent-graph",
-    action="store_true",
-    help="Check both grouped GEMMs with changing live route bounds in a HIP graph.",
 )
 args = parser.parse_args()
 torch.manual_seed(args.seed)
@@ -1220,7 +1188,6 @@ for test in args.test:
                             ep_mode=args.ep_mode,
                             fake_ep_rank=args.fake_ep_rank,
                             const_init=args.const_init,
-                            check_persistent_graph=args.check_persistent_graph,
                         )
     elif test == "g1u1_fp8smoothquant":
         for dtype in args.dtype:

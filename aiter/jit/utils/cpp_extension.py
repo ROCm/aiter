@@ -8,6 +8,7 @@
 import copy
 import importlib
 import importlib.abc
+import importlib.metadata
 import importlib.util
 import os
 import re
@@ -16,7 +17,9 @@ import shutil
 import subprocess
 import sys
 import sysconfig
+import tempfile
 import warnings
+from pathlib import Path
 
 import setuptools
 from _cpp_extension_versioner import ExtensionVersioner
@@ -1601,7 +1604,28 @@ def _prepare_ldflags(extra_ldflags, with_cuda, verbose, is_standalone, torch_exc
 
         extra_ldflags.append(f'-L{_posix_path(_join_rocm_home("lib"))}')
         extra_ldflags.append("-lamdhip64")
+    if IS_WINDOWS:
+        extra_ldflags = _resolve_mingw_import_libs(extra_ldflags)
     return extra_ldflags
+
+
+def _resolve_mingw_import_libs(ldflags):
+    # lld-link misses MinGW-style lib<name>.dll.a import libraries for -l<name>.
+    lib_dirs = [f[2:] for f in ldflags if f.startswith("-L")]
+    resolved = []
+    for flag in ldflags:
+        if flag.startswith("-l"):
+            name = flag[2:]
+            if not any(
+                os.path.isfile(os.path.join(d, f"{name}.lib")) for d in lib_dirs
+            ):
+                for d in lib_dirs:
+                    mingw_lib = os.path.join(d, f"lib{name}.dll.a")
+                    if os.path.isfile(mingw_lib):
+                        flag = _posix_path(mingw_lib)
+                        break
+        resolved.append(flag)
+    return resolved
 
 
 def _get_rocm_arch_flags(cflags: list[str] | None = None) -> list[str]:
@@ -1657,6 +1681,118 @@ def _get_num_workers(verbose: bool) -> int | None:
     return int(max_jobs)
 
 
+def _get_hipcc_path() -> str:
+    # Keep diagnostics and Ninja's compiler selection in sync, including Windows.
+    try:
+        return executable_path("hipcc")
+    except AssertionError:
+        return _join_rocm_home("bin", "hipcc")
+
+
+def _rocm_sdk_for_compiler(hipcc: str):
+    # Installed SDK metadata is relevant only if it owns the selected compiler.
+    # RECORD covers venv trampolines; the devel tree is expanded lazily by the SDK.
+    compiler = Path(hipcc).resolve()
+    for name in ("rocm-sdk-core", "rocm-sdk-devel"):
+        try:
+            dist = importlib.metadata.distribution(name)
+            if any(
+                Path(dist.locate_file(file)).resolve() == compiler
+                for file in dist.files or ()
+                if file.name in ("hipcc", "hipcc.exe", "hipcc.bat")
+            ) or compiler.is_relative_to(
+                Path(dist.locate_file("_" + name.replace("-", "_"))).resolve()
+            ):
+                return dist
+        except (
+            importlib.metadata.PackageNotFoundError,
+            OSError,
+            TypeError,
+            ValueError,
+        ):
+            continue
+    return None
+
+
+def _rocm_devel_install_hint(hipcc: str) -> str:
+    sdk = _rocm_sdk_for_compiler(hipcc)
+    if sdk is not None:
+        # Validate before putting metadata into a suggested shell command.
+        try:
+            version = str(Version(sdk.version))
+        except (TypeError, ValueError):
+            version = None
+        if version:
+            python = (
+                subprocess.list2cmdline([sys.executable])
+                if IS_WINDOWS
+                else shlex.quote(sys.executable)
+            )
+            return (
+                f"Selected Python SDK: {sdk.metadata['Name']}=={version}\n"
+                "Add the development extra at this exact SDK version, using the same "
+                "package index or wheel source as the installed SDK "
+                "(pip does not record the original index URL):\n"
+                f'  {python} -m pip install "rocm[devel]=={version}" '
+                '--index-url "<original-SDK-index-URL>"\n'
+                "Replace the index placeholder with the original SDK index.\n"
+                "After installation (or if already installed), initialize the "
+                "development package before retrying:\n"
+                f"  {python} -m rocm_sdk init\n"
+                f"  {python} -m rocm_sdk path --root\n"
+                "Set ROCM_HOME/ROCM_PATH to that SDK root and put its bin directory "
+                "first on PATH. Keep the SDK packages on the same full version.\n"
+                "Prebuilt SDK packages and initialization: "
+                "https://rocm.docs.amd.com/en/latest/install/rocm.html\n"
+                "Prebuilt nightly/preview packages and indexes: "
+                "https://github.com/ROCm/TheRock/blob/main/RELEASES.md"
+            )
+
+    # A HIP version (or torch.version.hip) is not a ROCm/package release pin.
+    # Read the release only from the selected compiler's installation.
+    root = Path(hipcc).resolve().parent.parent
+    if root.name == "hip":
+        root = root.parent
+    release = None
+    for name in ("version", "version-dev"):
+        try:
+            value = (root / ".info" / name).read_text().strip()
+        except (OSError, UnicodeError):
+            continue
+        if re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", value):
+            release = value
+            break
+    target = f"ROCm {release}" if release else "the selected ROCm release"
+    return (
+        f"Selected compiler ROCm release: {release or 'unknown'} (root: {root})\n"
+        f"Install the prebuilt development packages for {target} from the same "
+        "repository/build as that installation. For split system packages, "
+        "rocPRIM headers are in rocprim-dev (Debian/Ubuntu) or rocprim-devel (RPM); "
+        "for the combined Core SDK, use amdrocm-core-sdk. "
+        "rocPRIM package versions differ from ROCm release numbers; select the "
+        "package version from the matching release repository.\n"
+        "Ensure ROCM_HOME/ROCM_PATH and PATH select that complete installation.\n"
+        "Prebuilt ROCm installation: https://rocm.docs.amd.com/en/latest/install/rocm.html"
+    )
+
+
+def _rocm_header_build_hint(output: str) -> str:
+    # Diagnose a compiler failure, not a missing file under ROCM_HOME: the
+    # compiler may resolve headers through environment variables or build flags.
+    if not IS_HIP_EXTENSION or not re.search(
+        r"(?:fatal )?error:\s*['\"<]?rocprim[/\\]rocprim\.hpp['\">]?"
+        r"(?::|\s)\s*(?:file not found|No such file or directory)",
+        output,
+    ):
+        return ""
+    hipcc = _get_hipcc_path()
+    return (
+        "\nAITER: the selected ROCm compiler could not resolve 'rocprim/rocprim.hpp'.\n"
+        f"Selected ROCM_HOME: {ROCM_HOME}\n"
+        f"Selected hipcc: {hipcc}\n" + _rocm_devel_install_hint(hipcc)
+    )
+
+
 def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> None:
     # Stream compiler progress without changing the application logger format.
     verbose = verbose or os.getenv("AITER_JIT_VERBOSE", "0") == "1"
@@ -1669,36 +1805,43 @@ def _run_ninja_build(build_directory: str, verbose: bool, error_prefix: str) -> 
     try:
         sys.stdout.flush()
         sys.stderr.flush()
-        # Warning: don't pass stdout=None to subprocess.run to get output.
-        # subprocess.run assumes that sys.__stdout__ has not been modified and
-        # attempts to write to it by default.  However, when we call _run_ninja_build
-        # from ahead-of-time cpp extensions, the following happens:
-        # 1) If the stdout encoding is not utf-8, setuptools detachs __stdout__.
-        #    https://github.com/pypa/setuptools/blob/7e97def47723303fafabe48b22168bbc11bb4821/setuptools/dist.py#L1110
-        #    (it probably shouldn't do this)
-        # 2) subprocess.run (on POSIX, with no stdout override) relies on
-        #    __stdout__ not being detached:
-        #    https://github.com/python/cpython/blob/c352e6c7446c894b13643f538db312092b351789/Lib/subprocess.py#L1214
-        # To work around this, we pass in the fileno directly and hope that
-        # it is valid.
-        stdout_fileno = 1
-        subprocess.run(
+        # Keep successful build logs out of memory; read the full log on failure.
+        with tempfile.TemporaryFile() as log, subprocess.Popen(
             command,
-            stdout=stdout_fileno if verbose else subprocess.PIPE,
+            stdout=subprocess.PIPE if verbose else log,
             stderr=subprocess.STDOUT,
             cwd=build_directory,
-            check=True,
             env=env,
-        )
+        ) as process:
+            try:
+                if verbose:
+                    while chunk := process.stdout.read1(64 * 1024):
+                        log.write(chunk)
+                        # Use fd 1 because setuptools can detach __stdout__.
+                        # A write may accept only part of the buffer.
+                        pending = memoryview(chunk)
+                        while pending:
+                            pending = pending[os.write(1, pending) :]
+                process.wait()
+            except BaseException:
+                # Match subprocess.run's cleanup if streaming is interrupted.
+                process.kill()
+                raise
+            if process.returncode:
+                log.seek(0)
+                raise subprocess.CalledProcessError(
+                    process.returncode, command, output=log.read()
+                )
     except subprocess.CalledProcessError as e:
-        # Python 2 and 3 compatible way of getting the error object.
-        _, error, _ = sys.exc_info()
-        # error.output contains the stdout and stderr of the build attempt.
         message = error_prefix
-        # `error` is a CalledProcessError (which has an `output`) attribute, but
-        # mypy thinks it's Optional[BaseException] and doesn't narrow
-        if hasattr(error, "output") and error.output:  # type: ignore[union-attr]
-            message += f": {error.output.decode(*SUBPROCESS_DECODE_ARGS)}"  # type: ignore[union-attr]
+        if e.output:
+            output = e.output.decode(*SUBPROCESS_DECODE_ARGS, errors="replace")
+            message += f": {output}"
+            try:
+                message += _rocm_header_build_hint(output)
+            except Exception:  # noqa: BLE001,S110
+                # Optional diagnostics must never replace the compiler error.
+                pass
         raise RuntimeError(message) from e
 
 
@@ -1894,11 +2037,7 @@ def _write_ninja_file(
     config = ["ninja_required_version = 1.3"]
     config.append(f"cxx = {_posix_path(compiler)}")
     if with_cuda or cuda_dlink_post_cflags:
-        # Resolve through executable_path so Windows layouts (hipcc.exe) work.
-        try:
-            nvcc = executable_path("hipcc")
-        except AssertionError:
-            nvcc = _join_rocm_home("bin", "hipcc")
+        nvcc = _get_hipcc_path()
         config.append(f"nvcc = {_posix_path(nvcc)}")
 
     if IS_HIP_EXTENSION:

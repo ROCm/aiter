@@ -15,9 +15,11 @@ Standalone:
 import argparse
 import csv
 import glob
+import io
 import os
 import sys
 import time
+from contextlib import nullcontext
 
 from aiter.aot.flydsl.common import collect_aot_jobs, compile_only_env, override_env
 from aiter.jit.core import AITER_CONFIGS, AITER_ROOT_DIR
@@ -65,6 +67,7 @@ def _job_key(job: dict) -> tuple:
             job.get("enable_bias", False),
             job.get("g2_spart"),
             job.get("g2_bf16_lds"),
+            bool(job.get("use_valid_token_count", False) and job["epilog"] == "atomic"),
         )
     if job["stage"] == 1:
         return (
@@ -105,8 +108,13 @@ def _job_key(job: dict) -> tuple:
     )
 
 
-def parse_csv(csv_path: str):
-    """Parse a tuned CSV into unique MXMOE-port jobs for each stage and layout."""
+def parse_csv(csv_path):
+    """Parse tuned CSV rows into unique MXMOE-port jobs for each stage and
+    layout.
+
+    ``csv_path`` may be a filesystem path or an already-open text stream (used
+    by ``jobs_from_rows`` for in-memory tuner candidates).
+    """
     from aiter.ops.flydsl.moe_common import (
         DEFAULT_SITUV2_BETA,
         DEFAULT_SITUV2_LINEAR_BETA,
@@ -130,7 +138,13 @@ def parse_csv(csv_path: str):
         seen.add(key)
         jobs.append(job)
 
-    with open(csv_path, newline="") as f:
+    # ``csv_path`` is either a filesystem path or an already-open stream (the
+    # in-memory tuner candidate path), so the context manager is chosen inline.
+    with (
+        nullcontext(csv_path)
+        if hasattr(csv_path, "read")
+        else open(csv_path, newline="")
+    ) as f:
         for row in csv.DictReader(f):
             token = int(row["token"])
             topk = int(row["topk"])
@@ -211,33 +225,44 @@ def parse_csv(csv_path: str):
                     and row.get("dtype", "") in ("torch.bfloat16", "torch.float16")
                     and "float4_e2m1fn_x2" in row.get("q_dtype_w", "")
                 )
-                enable_bias_options = [False, True] if bias_supported else [False]
+                include_bias_variants = row.get("_include_bias_variants", "1") != "0"
+                enable_bias_options = (
+                    [False, True]
+                    if bias_supported and include_bias_variants
+                    else [False]
+                )
+                count_options = (
+                    (False, True) if v2_g2["epilog"] == "atomic" else (False,)
+                )
                 for enable_bias in enable_bias_options:
-                    _add(
-                        {
-                            "stage": 2,
-                            "v2_stage2": True,
-                            "kernel_name": kn2,
-                            "BM": bm,
-                            "BN": v2_g2["tile_n"],
-                            "BK": v2_g2["tile_k"],
-                            "use_nt": v2_g2["use_nt"],
-                            "NE": expert,
-                            "N_OUT": model_dim,
-                            "epilog": v2_g2["epilog"],
-                            "D_INTER": v2_d_inter,
-                            "topk": topk,
-                            "SBM": v2_g2["sort_block_m"] or bm,
-                            "persist": v2_g2["persist"] or v2_g2["epilog"] == "scatter",
-                            "cu_num": int(row.get("cu_num", "0") or "0"),
-                            "a_dtype": v2_g2["a_dtype"],
-                            "b_dtype": v2_g2["b_dtype"],
-                            "out_dtype": out_dtype,
-                            "enable_bias": enable_bias,
-                            "g2_spart": v2_g2["spart"],
-                            "g2_bf16_lds": v2_g2["bf16_lds"],
-                        }
-                    )
+                    for use_valid_token_count in count_options:
+                        _add(
+                            {
+                                "stage": 2,
+                                "v2_stage2": True,
+                                "kernel_name": kn2,
+                                "BM": bm,
+                                "BN": v2_g2["tile_n"],
+                                "BK": v2_g2["tile_k"],
+                                "use_nt": v2_g2["use_nt"],
+                                "NE": expert,
+                                "N_OUT": model_dim,
+                                "epilog": v2_g2["epilog"],
+                                "D_INTER": v2_d_inter,
+                                "topk": topk,
+                                "SBM": v2_g2["sort_block_m"] or bm,
+                                "persist": v2_g2["persist"]
+                                or v2_g2["epilog"] == "scatter",
+                                "cu_num": int(row.get("cu_num", "0") or "0"),
+                                "a_dtype": v2_g2["a_dtype"],
+                                "b_dtype": v2_g2["b_dtype"],
+                                "out_dtype": out_dtype,
+                                "enable_bias": enable_bias,
+                                "use_valid_token_count": use_valid_token_count,
+                                "g2_spart": v2_g2["spart"],
+                                "g2_bf16_lds": v2_g2["bf16_lds"],
+                            }
+                        )
             elif _is_mxfp4_kname(kn2):
                 p2 = _parse_mxfp4_g2_kname(kn2)
                 # An _f4out row falls back to the plain kernel whenever the
@@ -270,6 +295,23 @@ def parse_csv(csv_path: str):
                     )
 
     return jobs
+
+
+def jobs_from_rows(rows, *, include_bias_variants=True):
+    """Build deduplicated AOT jobs from in-memory tuner candidate rows."""
+    rows = [
+        dict(row, _include_bias_variants="1" if include_bias_variants else "0")
+        for row in rows
+    ]
+    if not rows:
+        return []
+    stream = io.StringIO()
+    fieldnames = sorted({key for row in rows for key in row})
+    writer = csv.DictWriter(stream, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+    stream.seek(0)
+    return parse_csv(stream)
 
 
 def _dummy(nbytes=256):
@@ -423,6 +465,9 @@ def _compile_v2_stage2(job):
         g2_spart=job.get("g2_spart"),
         g2_bf16_lds=job.get("g2_bf16_lds"),
         bias=bias if job.get("enable_bias", False) else None,
+        use_valid_token_count=bool(
+            job.get("use_valid_token_count", False) and job["epilog"] == "atomic"
+        ),
         stream=0,
     )
     if job["epilog"] == "reduce":
@@ -469,6 +514,17 @@ def compile_one_config(**job):
         print(f"  [FAIL] compile  stage{stage}  {shape_str}: {e}")
 
     return result
+
+
+def compile_job_batch(jobs):
+    """Compile a batch in one worker process to amortize AITER import cost."""
+    started = time.monotonic()
+    results = [compile_one_config(**job) for job in jobs]
+    return {
+        "kernel_name": f"mxfp4 batch ({len(jobs)} jobs)",
+        "compile_time": time.monotonic() - started,
+        "results": results,
+    }
 
 
 def main():

@@ -56,8 +56,8 @@ def _f32_to_ord(val):
     bits = val.bitcast(Int32)
     ords = bits ^ ((bits >> fx.Int32(31)) & fx.Int32(0x7FFFFFFF))
     abs_bits = bits & fx.Int32(0x7FFFFFFF)
-    is_nan = arith.cmpi(arith.CmpIPredicate.ugt, abs_bits, fx.Int32(0x7F800000))
-    return arith.select(is_nan, fx.Int32(uint32_to_int32(0x80000000)), ords)
+    is_nan = fx.Uint32(abs_bits) > fx.Uint32(0x7F800000)
+    return is_nan.select(fx.Int32(uint32_to_int32(0x80000000)), ords)
 
 
 def _make_storage():

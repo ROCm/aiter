@@ -117,22 +117,23 @@ std::string get_heuristic_kernel(std::string q_type,
 
     const std::vector<int> mtp_flags = (mtp > 0) ? std::vector<int>{mtp, 1} : std::vector<int>{0};
     const std::vector<int> gqa_flags = {gqa, (gqa + 7) / 8 * 8};
+    const std::vector<int> hp_flags = hp == 1 ? std::vector<int>{1, 0, 2} : std::vector<int>{hp};
     for(int mtp_ : mtp_flags)
     {
         for(int gqa_ : gqa_flags)
         {
-            // find exact match
-            for(const auto& el : *cfgs)
+            for(int hp_ : hp_flags)
             {
-                if (el.first.find(arch_id) != 0)
-                    continue;
-                const auto& cfg = el.second;
-                // hp is just distinct from uhp
-                if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
-                   cfg.Mtp == mtp_ && cfg.Msk == msk && (cfg.Hp == hp || hp == 1) &&
-                   cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type)
-
-                    return el.first;
+                for(const auto& el : *cfgs)
+                {
+                    if(el.first.find(arch_id) != 0)
+                        continue;
+                    const auto& cfg = el.second;
+                    if(cfg.qType == q_type && cfg.kvType == kv_type && cfg.Gqa == gqa_ &&
+                       cfg.Mtp == mtp_ && cfg.Msk == msk && cfg.Hp == hp_ &&
+                       cfg.blkSz == block_size && cfg.ps == ps && cfg.qTile == qTile && cfg.quant_type == quant_type)
+                        return el.first;
+                }
             }
         }
     }
@@ -429,10 +430,9 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
 
     // 3. "gqa_ratio"
     // 4. "mtp" , 5. "mask"
-    // We make mtp=0, gqa=0 to dispatch kernel, since we only focus on qTile
     msk = mask;
-    gqa = 0;
-    mtp = 0;
+    gqa = block_size == 16 ? gqa_ratio : 0;
+    mtp = block_size == 16 && max_qlen > 1 ? max_qlen + 10 : 0;
 
     // 6. "high_precision" , 7. "ultra_precision"
     switch(high_precision)
@@ -442,23 +442,28 @@ void pa_ps_fwd(aiter_tensor_t* Q,            //   [num_seqs, num_heads, head_siz
     default: hp = 0; break;
     };
 
-    // gqa_ratio * max_qlen <= qTile
-    int required_qTile = gqa_ratio * max_qlen;
-    std::vector<int> available_qTiles = {16, 32, 40, 48, 64};
-    int qTile = -1;
+    int qTile = 0;
+    if(block_size != 16)
+    {
+        int required_qTile = gqa_ratio * max_qlen;
+        std::vector<int> available_qTiles = {16, 32, 40, 48, 64};
+        qTile = -1;
 
-    for (int tile : available_qTiles) {
-        if (required_qTile <= tile) {
-            qTile = tile;
-            break;
+        for(int tile : available_qTiles)
+        {
+            if(required_qTile <= tile)
+            {
+                qTile = tile;
+                break;
+            }
         }
-    }
 
-    AITER_CHECK(qTile != -1,
-                __func__,
-                ": required qTile (gqa_ratio * max_qlen = ", gqa_ratio, " * ", max_qlen,
-                " = ", required_qTile,
-                ") exceeds maximum available qTile. Please reduce gqa_ratio or max_qlen.");
+        AITER_CHECK(qTile != -1,
+                    __func__,
+                    ": required qTile (gqa_ratio * max_qlen = ", gqa_ratio, " * ", max_qlen,
+                    " = ", required_qTile,
+                    ") exceeds maximum available qTile. Please reduce gqa_ratio or max_qlen.");
+    }
 
     CFG* config_map = &cfg_pa_asm; // only one config csv in hsa/<arch>/pa, now
     static SynchronizedCache<std::string_view, AiterAsmKernel> impl_ptr_map;
