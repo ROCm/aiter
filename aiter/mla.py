@@ -4,6 +4,7 @@
 # user interface
 
 import functools
+import math
 import os
 from typing import NamedTuple
 
@@ -24,7 +25,10 @@ from aiter.ops.asm.mla_decode_v4 import (
     mla_decode_v4_ps_asm,
     mla_v4_fused_slot_f32,
 )
-from aiter.ops.attention import get_mla_decode_fwd_max_splits
+from aiter.ops.attention import (
+    get_mla_decode_fwd_max_splits,
+    mla_ps64_qh128_fp8_asm_fwd,
+)
 
 _FLYDSL_MLA_REDUCE_TARGET_GFX = ("gfx942", "gfx950")
 _FLYDSL_MLA_REDUCE_TARGET_H = 16
@@ -637,6 +641,167 @@ def mla_decode_fwd_ds32(
     return o, (final_lse if return_lse else None)
 
 
+@functools.cache
+def _mla_cpu_scale_on_device(device_index: int, value: float) -> torch.Tensor:
+    # Keep these immutable tensors alive across calls and streams. Framework
+    # scales are normally fixed; a changed CPU value gets a separate entry.
+    with torch.cuda.device(device_index):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "Warm up mla_decode_fwd with these CPU scale values on the Q "
+                "device before CUDA graph capture, or pass GPU FP32 scales"
+            )
+        return torch.tensor([value], dtype=torch.float32, device=f"cuda:{device_index}")
+
+
+def _mla_scale_on_device(scale, q: torch.Tensor, name: str) -> torch.Tensor:
+    if scale is None:
+        return _mla_cpu_scale_on_device(q.device.index, 1.0)
+    if (
+        not isinstance(scale, torch.Tensor)
+        or scale.dtype != torch.float32
+        or scale.numel() != 1
+        or not scale.is_contiguous()
+    ):
+        raise ValueError(f"{name} must be a contiguous FP32 scalar tensor")
+    if scale.device.type == "cpu":
+        value = float(scale.item())  # CPU only; never synchronize GPU metadata.
+        if not math.isfinite(value):
+            raise ValueError(f"{name} must be finite")
+        return _mla_cpu_scale_on_device(q.device.index, value)
+    if scale.device != q.device:
+        raise ValueError(f"{name} must be on CPU or the Q device ({q.device})")
+    return scale
+
+
+def _check_mla_qh128_inputs(q, kv, out, seq_lens, page_table, lse):
+    """Validate the public contract without reading any GPU tensor contents."""
+    if get_gfx() != "gfx1250":
+        raise RuntimeError("kv_shuffled MLA ASM requires gfx1250")
+    if not isinstance(q, torch.Tensor) or not q.is_cuda:
+        raise RuntimeError("Q must be a GPU tensor")
+    if q.ndim != 3 or q.shape[1:] != (128, 576):
+        raise RuntimeError("Q must be [B,128,576]")
+    batch = q.shape[0]
+
+    def check(tensor, name, dtype, shape=None, contiguous=True):
+        if not isinstance(tensor, torch.Tensor) or tensor.device != q.device:
+            raise RuntimeError(f"{name} must be on the Q device")
+        if tensor.dtype != dtype:
+            raise RuntimeError(f"{name} has an unsupported dtype; expected {dtype}")
+        if shape is not None and tuple(tensor.shape) != shape:
+            raise RuntimeError(f"{name} must be {shape}, got {tuple(tensor.shape)}")
+        if contiguous and not tensor.is_contiguous():
+            raise RuntimeError(f"{name} must be contiguous")
+
+    check(q, "Q", torch.float8_e4m3fn, contiguous=False)
+    if (
+        q.stride(2) != 1
+        or q.stride(1) not in (576, 768)
+        or q.stride(0) != 128 * q.stride(1)
+    ):
+        raise RuntimeError("Q requires dense batches with head stride 576 or 768")
+    check(kv, "KV", torch.float8_e4m3fn)
+    if kv.ndim != 4 or kv.shape[1:] != (1, 64, 576) or kv.shape[0] == 0:
+        raise RuntimeError("KV must be contiguous [physical_pages,1,64,576]")
+    check(out, "out", torch.bfloat16, (batch, 128, 512))
+    if seq_lens is None or page_table is None:
+        raise ValueError("seq_lens and page_table are required")
+    check(seq_lens, "seq_lens", torch.int32, (batch,))
+    check(page_table, "page_table", torch.int32, contiguous=False)
+    if (
+        page_table.ndim != 2
+        or page_table.shape[0] != batch
+        or page_table.stride(1) != 1
+        or page_table.stride(0) <= 0
+    ):
+        raise RuntimeError("page_table requires [B,max_pages] with unit inner stride")
+    if lse is not None:
+        check(lse, "lse", torch.float32, (batch, 128))
+
+
+def mla_decode_fwd_qh128_asm(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    out: torch.Tensor,
+    *,
+    seq_lens: torch.Tensor,
+    page_table: torch.Tensor,
+    q_scale: torch.Tensor,
+    kv_scale: torch.Tensor,
+    softmax_scale: float,
+    lse: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decode gfx1250 QH128 FP8 MLA with kv-shuffled page64 KV.
+
+    Q is [B,128,576] FP8 E4M3FN, with head stride 576 or 768 bytes, and one
+    query per sequence. Writes preallocated contiguous BF16 out[B,128,512]
+    and optional natural-log FP32 lse[B,128]. Returns out.
+
+    Contiguous FP8 KV is [physical_pages,1,64,576], with separate NoPE/RoPE
+    planes tiled into 16-token x 16-dimension blocks. Provide GPU int32
+    contiguous seq_lens[B] and page_table[B,max_pages] with unit inner stride.
+    Invalid lengths/page IDs produce O=0 and LSE=-inf; unused KV/page-table
+    padding may be poisoned.
+
+    The cache writer must produce the kv-shuffled layout; shapes cannot
+    verify its bytes. Segmented page64 KV is not supported. This entry point
+    does not repack KV or convert metadata.
+
+    q_scale and kv_scale are required GPU FP32 scalar tensors on Q's device.
+    For unit scales, create tensors containing 1.0 once during initialization,
+    before graph capture, and reuse them for each call. Used inputs/scales
+    must be finite. Empty sequences produce O=0, LSE=-inf. No split-K,
+    partial logits, or host metadata synchronization. Warm up the native
+    module on the target device before graph capture. The native launcher
+    uses the Q device's current stream. Callers manage tensor lifetimes
+    and dependencies across streams.
+    """
+    require_gfx1250_asm("mla_decode_fwd_qh128_asm")
+    _check_mla_qh128_inputs(q, kv, out, seq_lens, page_table, lse)
+    if q_scale is None or kv_scale is None:
+        raise ValueError(
+            "q_scale and kv_scale are required; create and reuse FP32 [1] "
+            "tensors containing 1.0 for unit scales"
+        )
+    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
+        if (
+            not isinstance(scale, torch.Tensor)
+            or scale.device != q.device
+            or scale.dtype != torch.float32
+            or scale.numel() != 1
+            or not scale.is_contiguous()
+        ):
+            raise ValueError(f"{name} must be a GPU FP32 scalar on the Q device")
+    if not math.isfinite(softmax_scale):
+        raise ValueError("softmax_scale must be finite")
+    mla_ps64_qh128_fp8_asm_fwd(
+        q, kv, seq_lens, page_table, out, lse, q_scale, kv_scale, float(softmax_scale)
+    )
+    return out
+
+
+def _mla_decode_fwd_kv_shuffled(
+    q, kv, o, seq_lens, page_table, sm_scale, q_scale, kv_scale, return_lse
+):
+    require_gfx1250_asm("mla_ps64_qh128_fp8_asm_fwd")
+    _check_mla_qh128_inputs(q, kv, o, seq_lens, page_table, None)
+    q_scale = _mla_scale_on_device(q_scale, q, "q_scale")
+    kv_scale = _mla_scale_on_device(kv_scale, q, "kv_scale")
+    final_lse = (
+        torch.empty((q.shape[0], 128), dtype=torch.float32, device=q.device)
+        if return_lse
+        else None
+    )
+    softmax_scale = 576**-0.5 if sm_scale is None else float(sm_scale)
+    if not math.isfinite(softmax_scale):
+        raise ValueError("softmax_scale must be finite")
+    mla_ps64_qh128_fp8_asm_fwd(
+        q, kv, seq_lens, page_table, o, final_lse, q_scale, kv_scale, softmax_scale
+    )
+    return o, final_lse
+
+
 def mla_decode_fwd(
     q,
     kv_buffer,
@@ -672,7 +837,70 @@ def mla_decode_fwd(
     cp_world_size=1,
     cp_rank=0,
     causal=True,
+    kv_layout="token_major",
+    seq_lens=None,
+    page_table=None,
 ):
+    """MLA decode with explicit KV layout selection.
+
+    ``token_major`` preserves the existing dispatch, including gfx1250's
+    segmented page64 cache. ``kv_shuffled`` selects gfx1250 FP8 QH128 ASM:
+    one query per sequence, page64, BF16 O, and dense GPU int32
+    ``seq_lens[B]`` / ``page_table[B,max_pages]``. CSR arguments may be None
+    on that path. KV must already use the shuffled byte layout.
+
+    Shuffled decode returns ``(o, lse)`` with natural-log FP32 LSE when
+    ``return_lse=True``, otherwise ``(o, None)``. CPU FP32 scalar scales
+    (including 0-D tensors) are cached on Q's device by value; None means 1.
+    Warm up with the same device/values before graph capture, or supply GPU
+    FP32 scales. No MTP, KV splitting, persistent scheduling, or CP on this
+    path. ``causal`` has no effect for its single query per sequence.
+    """
+    # ATOM passes kv_indices=None for shuffled caches, so route before any
+    # CSR shape access, allocation, or default-layout metadata planning.
+    if kv_layout == "kv_shuffled":
+        if max_seqlen_q != 1 or page_size != 64 or nhead_kv != 1:
+            raise ValueError(
+                "kv_shuffled MLA ASM requires max_seqlen_q=1, page_size=64, "
+                "and nhead_kv=1"
+            )
+        if num_kv_splits not in (None, 1):
+            raise ValueError("kv_shuffled MLA ASM does not support KV splitting")
+        if return_logits:
+            raise ValueError("kv_shuffled MLA ASM does not return partial logits")
+        if logit_cap > 0:
+            raise ValueError("kv_shuffled MLA ASM does not support logit_cap")
+        if cp_world_size != 1 or cp_rank != 0 or g_kv_indptr is not None:
+            raise ValueError("kv_shuffled MLA ASM does not support context parallelism")
+        if intra_batch_mode or any(
+            metadata is not None
+            for metadata in (
+                num_kv_splits_indptr,
+                work_meta_data,
+                work_indptr,
+                work_info_set,
+                reduce_indptr,
+                reduce_final_map,
+                reduce_partial_map,
+            )
+        ):
+            raise ValueError(
+                "kv_shuffled MLA ASM does not use split/persistent metadata"
+            )
+        return _mla_decode_fwd_kv_shuffled(
+            q,
+            kv_buffer,
+            o,
+            seq_lens,
+            page_table,
+            sm_scale,
+            q_scale,
+            kv_scale,
+            return_lse,
+        )
+    if kv_layout != "token_major":
+        raise ValueError(f"unknown MLA kv_layout: {kv_layout!r}")
+
     device = q.device
     assert logit_cap <= 0, f"{logit_cap=} is not support yet"
     if kv_buffer.dtype != torch.uint8:
