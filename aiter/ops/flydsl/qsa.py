@@ -934,11 +934,13 @@ def qsa_layer(
     is that tensor.
 
     The layer is K1, the vendored expand, and K2. It raises on a token
-    budget other than 512 blocks at compress ratio 4. A rank-3 pair
-    missing from the measured table logs once and still runs. A query
-    that is not rank 3 does not log; K1 or K2 reports it. Indexer scores
-    are multiplied by ``score_scale`` and QK by ``softmax_scale``.
-    ``None`` is ``head_dim**-0.5`` for that tensor.
+    budget other than 512 blocks at compress ratio 4. The live GPU must
+    be gfx942 or gfx950. ``get_gfx_runtime`` decides that, and any other
+    architecture raises. A rank-3 pair missing from the measured table
+    logs once and still runs. A query that is not rank 3 does not log;
+    K1 or K2 reports it. Indexer scores are multiplied by ``score_scale``
+    and QK by ``softmax_scale``. ``None`` is ``head_dim**-0.5`` for that
+    tensor.
 
     Args:
         q_indexer: bf16 ``[M, H, 128]``. FlyDSL accepts ``H`` of 4 or 8.
