@@ -7,6 +7,7 @@ import triton
 import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
+from triton.experimental.gluon.language.amd.cdna5 import tdm
 
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 from aiter.ops.triton.utils._triton.pid_preprocessing import pid_grid
@@ -1616,9 +1617,7 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
     # Mirrors gemm_a16w16's compute_bound kernel: one copy of the loop body
     # ahead of the loop, which then runs one fewer time. Like a16w16, this
     # assumes NUM_K_ITER >= NUM_BUFFERS.
-    acc = gl.amd.gfx1250.wmma_scaled(
-        cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc
-    )
+    acc = gl.amd.gfx1250.wmma_scaled(cur_a, cur_as, "e4m3", cur_b, cur_bs, "e4m3", acc)
 
     slot = num_loads % NUM_BUFFERS
     gl.amd.gfx1250.tdm.async_load(
@@ -1802,7 +1801,1359 @@ def _gemm_mxfp8_preshuffle_compute_bound_kernel(
     gl.amd.gfx1250.tdm.async_wait(0)
 
 
+# --------------------------------------------------------------------------- #
+# 8-wave ping-pong (warp-pipeline) kernels
+# --------------------------------------------------------------------------- #
+# Source: copied from the ROCm/aiter branch ``comparison/upstream-warp-pipeline``
+# at fe29989af ("Flatten BK512 warp-pipeline tail ..."),
+#   aiter/ops/triton/_gluon_kernels/gfx1250/gemm/basic/gemm_warp_pipeline_cdna5.py
+#   aiter/ops/triton/_gluon_kernels/gfx1250/gemm/basic/warp_pipeline/{adapter,helpers}.py
+# which is itself derived from the upstream Triton example
+#   third_party/amd/python/examples/gluon/gemm_warp_pipeline_cdna5.py
+# added in triton-lang/triton 8262c9a9 (#12073). Needs a Triton with the CDNA5
+# warp-pipeline / PartitionedSharedLayout / async_load_fused APIs (upstream
+# 8262c9a9 or later).
+#
+# Only the BK256, non-flat MXFP8 path (``mxfp8_gemm_warp_pipeline`` there) is
+# copied: 256x256x256 per CTA, a square CTA cluster, 8 waves, native K128 E8M0
+# scales (A scales M-contiguous, B scales one byte per 128x128 block), and the
+# padded two-buffer output store. The BK512/BK1024 and "flat" variants are not.
+#
+# Everything below is the source verbatim apart from:
+#   - the kernel is renamed to _gemm_mxfp8_8wave_pingpong_kernel;
+#   - its body is _mxfp8_8wave_pingpong_body, shared with
+#     _gemm_mxfp8_preshuffle_8wave_pingpong_kernel through the B_PRESHUFFLED
+#     constexpr. That flag changes only B's TDM descriptor, its LDS
+#     shape/layout and how it is unshuffled after the LDS read (code marked
+#     "aiter:");
+#   - the host-side layout construction from adapter.py lives in
+#     make_8wave_pingpong_layouts.
+
+
+@gluon.jit
+def chiplet_transform(pid, num_workgroups, num_xcds: gl.constexpr):
+    """
+    Basic chiplet transformation for multi-XCD AMD GPUs.
+
+    Transforms program ID to distribute work evenly across chiplets (XCDs).
+    Each XCD gets a contiguous range of work items.
+    """
+    xcd = pid % num_xcds
+    pos_in_xcd = pid // num_xcds
+    min_per_xcd = num_workgroups // num_xcds
+    extra_sms = num_workgroups % num_xcds
+    offset = xcd * min_per_xcd + min(xcd, extra_sms)
+    return offset + pos_in_xcd
+
+
+@gluon.jit
+def _b2_advance_k(b_desc, B_PRESHUFFLED: gl.constexpr):
+    """aiter: step B's TDM descriptor one 256-wide K tile. The canonical
+    descriptor walks K directly; the shuffled one walks 16-element K quads
+    (16 of them per K tile, see _gemm_mxfp8_preshuffle_8wave_pingpong_kernel)."""
+    if B_PRESHUFFLED:
+        return tdm.update_tensor_descriptor(b_desc, add_offsets=[0, 0, 16, 0])
+    else:
+        return tdm.update_tensor_descriptor(b_desc, add_offsets=[0, 0, 256])
+
+
+@gluon.constexpr_function
+def _b2_shuffled_load_layout(b2_load_layout):
+    """aiter: B2_LOAD_LAYOUT re-expressed over a raw shuffled B slice.
+
+    B2_LOAD_LAYOUT distributes (128 k, CTA_N, 128 n). The preshuffle kernel
+    reads the same elements from LDS as (CTA_N, 8 n-groups, 8 k-quads, 256),
+    where the last dim is 16 n x 16 k -- shuffle_weight(layout=(16, 16)) keeps
+    16 rows x 16 k contiguous. Mapping every basis (k, c, n) to
+    (c, n // 16, k // 16, (n % 16) * 16 + k % 16) gives a layout whose
+    register/lane/warp ownership is identical, so the unshuffle afterwards is a
+    register reshape/permute and a trivial convert_layout.
+    """
+
+    def raw(bases):
+        return [[c, n // 16, k // 16, (n % 16) * 16 + k % 16] for k, c, n in bases]
+
+    k_size, cta_n, n_size = b2_load_layout.shape
+    return gl.DistributedLinearLayout(
+        reg_bases=raw(b2_load_layout.reg_bases),
+        lane_bases=raw(b2_load_layout.lane_bases),
+        warp_bases=raw(b2_load_layout.warp_bases),
+        block_bases=raw(b2_load_layout.block_bases),
+        shape=[cta_n, n_size // 16, k_size // 16, 256],
+    )
+
+
+@gluon.jit
+def _mxfp8_load_b2_shuffled(
+    buffer,
+    slot,
+    start_n: gl.constexpr,
+    start_k: gl.constexpr,
+    B2_LOAD_LAYOUT: gl.constexpr,
+):
+    """aiter: _mxfp8_load_b2_parent's rank-3 (128 k, CTA_N, 128 n) tile, read
+    from a slot holding the shuffled bytes as [CTA_N, 16, 16, 256]
+    (n-group, k-quad, 16 n x 16 k) and unshuffled in registers.
+
+    shuffle_weight(layout=(16, 16)) stores a 16-row group as
+    (K // 32, 2, 16 n, 16 k); its (K // 32, 2) pair is the k-quad index here.
+    The slices are on allocated dims, as in the canonical path.
+    """
+    cta_n: gl.constexpr = buffer.type.shape[1]
+    raw = (
+        buffer.index(slot)
+        .slice(start_n // 16, 8, 1)
+        .slice(start_k // 16, 8, 2)
+        .load(layout=_b2_shuffled_load_layout(B2_LOAD_LAYOUT))
+    )
+    rank3 = (
+        raw.reshape((cta_n, 8, 8, 16, 16))  # (c, n-group, k-quad, n16, k16)
+        .permute((2, 4, 0, 1, 3))  # (k-quad, k16, c, n-group, n16)
+        .reshape((128, cta_n, 128))
+    )
+    return gl.convert_layout(rank3, B2_LOAD_LAYOUT, assert_trivial=True)
+
+
+@gluon.jit
+def _get_xcd_swizzled_pids(
+    M,
+    N,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    GRID_MN: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+):
+    pid = gl.program_id(axis=0)
+    num_pid_m = gl.cdiv(M, BLOCK_M)
+    num_pid_n = gl.cdiv(N, BLOCK_N)
+    if NUM_XCDS != 1:
+        pid = chiplet_transform(pid, GRID_MN, NUM_XCDS)
+    num_pid_in_group = GROUP_SIZE_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_SIZE_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+    pid_m = first_pid_m + pid % num_pid_in_group % group_size_m
+    pid_n = pid % num_pid_in_group // group_size_m
+    return (pid_m, pid_n)
+
+
+@gluon.jit
+def _cluster_sync():
+    gl.amd.cdna5.cluster.arrive()
+    gl.amd.cdna5.cluster.wait()
+
+
+@triton.constexpr_function
+def _output_cga_layout(cga):
+    return tuple(tuple(b) + (0, 0) for b in cga)
+
+
+@triton.constexpr_function
+def _strip_output_cga(cga):
+    return tuple(tuple(b) + (0,) for b in cga)
+
+
+@gluon.jit
+def _tdm_store_row_grid(
+    c_ptr,
+    pid_m,
+    pid_n,
+    stride_cm,
+    stride_cn,
+    M,
+    N,
+    output,
+    OUTPUT_CGA: gl.constexpr,
+    CM: gl.constexpr,
+    CN: gl.constexpr,
+    cta_m: gl.constexpr,
+    cta_n: gl.constexpr,
+):
+    if cta_m == 64:
+        column_shape: gl.constexpr = [CM, CN, cta_m, cta_n // 32, 16]
+        column_cga: gl.constexpr = _strip_output_cga(OUTPUT_CGA)
+        column_layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[16, 8]], column_shape, [4, 3, 2, 1, 0], column_cga
+        )
+        c0 = gl.allocate_shared_memory(
+            c_ptr.type.element_ty, column_shape, column_layout
+        )
+        c1 = gl.allocate_shared_memory(
+            c_ptr.type.element_ty, column_shape, column_layout
+        )
+        column_output = output.reshape((CM, CN, cta_m, cta_n // 32, 2, 16))
+        column_slice: gl.constexpr = [CM, CN, cta_m, cta_n // 32, 1, 16]
+        o0 = gl.amd.slice(column_output, column_slice, [0, 0, 0, 0, 0, 0]).reshape(
+            column_shape
+        )
+        o1 = gl.amd.slice(column_output, column_slice, [0, 0, 0, 0, 1, 0]).reshape(
+            column_shape
+        )
+        desc_c = tdm.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M // cta_m, N // cta_n, cta_m, cta_n // 32, 32),
+            strides=(
+                cta_m * stride_cm,
+                cta_n * stride_cn,
+                stride_cm,
+                32 * stride_cn,
+                stride_cn,
+            ),
+            block_shape=column_shape,
+            layout=column_layout,
+        )
+        c0.store(o0)
+        tdm.async_store(desc_c, [pid_m * CM, pid_n * CN, 0, 0, 0], c0)
+        c1.store(o1)
+        tdm.async_store(desc_c, [pid_m * CM, pid_n * CN, 0, 0, 16], c1)
+        tdm.async_wait(0)
+        return
+    else:
+        STRIP: gl.constexpr = 16
+        output_cga: gl.constexpr = _strip_output_cga(OUTPUT_CGA)
+        shape: gl.constexpr = [CM, CN, cta_m // (2 * STRIP), STRIP, cta_n]
+        layout: gl.constexpr = gl.PaddedSharedLayout.with_identity_for(
+            [[cta_n, 8]], shape, [4, 3, 2, 1, 0], output_cga
+        )
+        shared0 = gl.allocate_shared_memory(c_ptr.type.element_ty, shape, layout)
+        shared1 = gl.allocate_shared_memory(c_ptr.type.element_ty, shape, layout)
+        output = output.reshape((CM, CN, cta_m // (2 * STRIP), 2, STRIP, cta_n))
+        slice_shape: gl.constexpr = [CM, CN, cta_m // (2 * STRIP), 1, STRIP, cta_n]
+        output0 = gl.amd.slice(output, slice_shape, [0, 0, 0, 0, 0, 0]).reshape(shape)
+        output1 = gl.amd.slice(output, slice_shape, [0, 0, 0, 1, 0, 0]).reshape(shape)
+        desc = tdm.make_tensor_descriptor(
+            base=c_ptr,
+            shape=(M // cta_m, N // cta_n, cta_m // (2 * STRIP), 2 * STRIP, cta_n),
+            strides=(
+                cta_m * stride_cm,
+                cta_n * stride_cn,
+                2 * STRIP * stride_cm,
+                stride_cm,
+                stride_cn,
+            ),
+            block_shape=shape,
+            layout=layout,
+        )
+        shared0.store(output0)
+        tdm.async_store(desc, [pid_m * CM, pid_n * CN, 0, 0, 0], shared0)
+        shared1.store(output1)
+        tdm.async_store(desc, [pid_m * CM, pid_n * CN, 0, STRIP, 0], shared1)
+        tdm.async_wait(0)
+
+
+@gluon.jit
+def _tdm_store_split_n2(
+    c_ptr,
+    pid_m,
+    pid_n,
+    stride_cm,
+    stride_cn,
+    M,
+    N,
+    acc0,
+    acc1,
+    OUTPUT_CGA_LAYOUT: gl.constexpr,
+    CTA_M: gl.constexpr,
+    CTA_N: gl.constexpr,
+):
+    o0 = (
+        acc0.to(c_ptr.type.element_ty)
+        .reshape((CTA_M, 256, CTA_N, 128))
+        .permute((0, 2, 1, 3))
+    )
+    o1 = (
+        acc1.to(c_ptr.type.element_ty)
+        .reshape((CTA_M, 256, CTA_N, 128))
+        .permute((0, 2, 1, 3))
+    )
+    output = gl.join(o0, o1).permute((0, 1, 2, 4, 3)).reshape((CTA_M, CTA_N, 256, 256))
+    _tdm_store_row_grid(
+        c_ptr,
+        pid_m,
+        pid_n,
+        stride_cm,
+        stride_cn,
+        M,
+        N,
+        output,
+        OUTPUT_CGA_LAYOUT,
+        CTA_M,
+        CTA_N,
+        256,
+        256,
+    )
+
+
+@triton.constexpr_function
+def _native_scale_broadcast_layout(layout, row_repeat, rows):
+    def split(bases):
+        return [[b[0] // row_repeat, b[0] % row_repeat, b[1]] for b in bases]
+
+    return gl.DistributedLinearLayout(
+        split(layout.reg_bases),
+        split(layout.lane_bases),
+        split(layout.warp_bases),
+        split(layout.block_bases),
+        [rows, row_repeat, 4],
+    )
+
+
+@gluon.jit
+def _load_mcontiguous_a(
+    buf, slot, start_k: gl.constexpr, target_layout: gl.constexpr, rows: gl.constexpr
+):
+    value = (
+        buf.index(slot)
+        .slice(start_k // 4, 1, 0)
+        .permute((1, 0))
+        .load(layout=target_layout)
+    )
+    return value + gl.full((rows, 4), 0, gl.uint8, target_layout)
+
+
+@triton.constexpr_function
+def _transpose_scale_cga(layout):
+    return tuple((b[1], b[0]) for b in layout.cga_layout)
+
+
+@gluon.jit
+def _mxfp8_load_native_scale(
+    buf, slot, start_k: gl.constexpr, target_layout: gl.constexpr, rows: gl.constexpr
+):
+    mcontiguous_rows: gl.constexpr = buf.type.shape[1]
+    row_repeat: gl.constexpr = rows // mcontiguous_rows
+    expanded_layout: gl.constexpr = _native_scale_broadcast_layout(
+        target_layout, row_repeat, mcontiguous_rows
+    )
+    load_layout: gl.constexpr = gl.SliceLayout(1, expanded_layout)
+    value = buf.index(slot).slice(start_k // 4, 1, 1).load(layout=load_layout)
+    value = value[:, None, :]
+    value = value + gl.full(
+        (mcontiguous_rows, row_repeat, 4), 0, gl.uint8, expanded_layout
+    )
+    return gl.convert_layout(
+        value.reshape((rows, 4)), target_layout, assert_trivial=True
+    )
+
+
+@gluon.jit
+def _mxfp8_native_scale_buffers(
+    a_scale_ptr,
+    b_scale_ptr,
+    M,
+    N,
+    K,
+    stride_as,
+    stride_bs,
+    pid_m,
+    pid_n,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    BK: gl.constexpr,
+    SLOTS: gl.constexpr,
+    SHARED_AS: gl.constexpr,
+    SHARED_BS: gl.constexpr,
+):
+    AS_LAYOUT: gl.constexpr = gl.SwizzledSharedLayout(
+        1, 1, 1, [1, 0], _transpose_scale_cga(SHARED_AS)
+    )
+    as_buf = gl.allocate_shared_memory(
+        a_scale_ptr.type.element_ty, [SLOTS, BK // 128, BLOCK_M], AS_LAYOUT
+    )
+    bs_buf = gl.allocate_shared_memory(
+        b_scale_ptr.type.element_ty, [SLOTS, BLOCK_N // 128, BK // 128], SHARED_BS
+    )
+    as_desc = tdm.make_tensor_descriptor(
+        base=a_scale_ptr + pid_m * BLOCK_M,
+        shape=(K // 128, M),
+        strides=(stride_as, 1),
+        block_shape=(BK // 128, BLOCK_M),
+        layout=AS_LAYOUT,
+    )
+    bs_desc = tdm.make_tensor_descriptor(
+        base=b_scale_ptr + pid_n * (BLOCK_N // 128) * stride_bs,
+        shape=(N // 128, K // 128),
+        strides=(stride_bs, 1),
+        block_shape=(BLOCK_N // 128, BK // 128),
+        layout=SHARED_BS,
+    )
+    return as_buf, bs_buf, as_desc, bs_desc
+
+
+@gluon.jit
+def _mxfp8_load_scale(
+    scale_buffer,
+    slot,
+    start_k: gl.constexpr,
+    LAYOUT: gl.constexpr,
+    BLOCK_NONK: gl.constexpr,
+    BK_SCALE: gl.constexpr,
+    SUBTILE_SCALE_K: gl.constexpr,
+):
+    if (
+        scale_buffer.type.shape[1] == BK_SCALE // 4
+        and scale_buffer.type.shape[-1] == BLOCK_NONK
+    ):
+        return _load_mcontiguous_a(scale_buffer, slot, start_k, LAYOUT, BLOCK_NONK)
+    elif scale_buffer.type.shape[-1] == 2:
+        return _mxfp8_load_native_scale(scale_buffer, slot, start_k, LAYOUT, BLOCK_NONK)
+    else:
+        scale_slice = (
+            scale_buffer.index(slot)
+            .reshape((BLOCK_NONK // 128, BK_SCALE // 4, 32, 4, 4))
+            .permute((0, 3, 2, 1, 4))
+            .reshape((BLOCK_NONK, BK_SCALE))
+        )
+        return (
+            scale_slice.slice(0, BLOCK_NONK, 0)
+            .slice(start_k, SUBTILE_SCALE_K, 1)
+            .load(layout=LAYOUT)
+        )
+
+
+@gluon.jit
+def _mxfp8_issue_b2_parent_data_without_update(a_desc, b_desc, a_buf, b_buf, slot):
+    tdm.async_load(a_desc, dest=a_buf.index(slot), warp_used_hint=15)
+    tdm.async_load(b_desc, dest=b_buf.index(slot), warp_used_hint=15)
+
+
+@gluon.jit
+def _mxfp8_issue_b2_parent_data(
+    a_desc, b_desc, a_buf, b_buf, slot, B_PRESHUFFLED: gl.constexpr
+):
+    _mxfp8_issue_b2_parent_data_without_update(a_desc, b_desc, a_buf, b_buf, slot)
+    a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, 256])
+    b_desc = _b2_advance_k(b_desc, B_PRESHUFFLED)
+    return (a_desc, b_desc)
+
+
+@gluon.jit
+def _mxfp8_load_b2_parent(
+    buffer,
+    slot,
+    start_n: gl.constexpr,
+    start_k: gl.constexpr,
+    B2_LOAD_LAYOUT: gl.constexpr,
+    DOT_B: gl.constexpr,
+    B_PRESHUFFLED: gl.constexpr,
+):
+    if B_PRESHUFFLED:
+        # aiter: the preshuffle kernel lands B in LDS in its shuffled order;
+        # everything after the unshuffle is unchanged.
+        rank3 = _mxfp8_load_b2_shuffled(buffer, slot, start_n, start_k, B2_LOAD_LAYOUT)
+    else:
+        rank3 = (
+            buffer.index(slot)
+            .slice(start_n, 128, 1)
+            .slice(start_k, 128, 2)
+            .permute([2, 0, 1])
+            .load(layout=B2_LOAD_LAYOUT)
+        )
+    rank2 = rank3.reshape((128, buffer.type.shape[1] * 128))
+    return gl.convert_layout(rank2, DOT_B)
+
+
+@gluon.jit
+def _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, slot):
+    tdm.async_load_fused(
+        [(as_desc, as_buf.index(slot), 3), (bs_desc, bs_buf.index(slot), 12)]
+    )
+    as_desc = tdm.update_tensor_descriptor(
+        as_desc, add_offsets=[as_buf.type.shape[1], 0]
+    )
+    bs_desc = tdm.update_tensor_descriptor(
+        bs_desc, add_offsets=[0, bs_buf.type.shape[-1]]
+    )
+    return (as_desc, bs_desc)
+
+
+@gluon.jit
+def _mxfp8_bk256_b2_consume_and_refill(
+    a_buf,
+    b_buf,
+    as_buf,
+    bs_buf,
+    data_slot,
+    scale_slot,
+    refill_scale_slot,
+    a_desc,
+    b_desc,
+    as_desc,
+    bs_desc,
+    acc0,
+    acc1,
+    DOT_A: gl.constexpr,
+    DOT_B: gl.constexpr,
+    B2_LOAD_LAYOUT: gl.constexpr,
+    SCALE_A_LAYOUT: gl.constexpr,
+    SCALE_A_LOAD: gl.constexpr,
+    SCALE_B_LAYOUT: gl.constexpr,
+    SCALE_B_LOAD: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CTA_N: gl.constexpr,
+    REFILL_SCALE: gl.constexpr,
+    DATA_SCALE_WAITCNT: gl.constexpr,
+    B_PRESHUFFLED: gl.constexpr,
+):
+    cta_n: gl.constexpr = 256
+    half_n: gl.constexpr = 128
+    packed_n: gl.constexpr = BLOCK_N // 2
+    tdm.async_wait(DATA_SCALE_WAITCNT)
+    next_a_desc = a_desc
+    next_b_desc = b_desc
+    next_as_desc = as_desc
+    next_bs_desc = bs_desc
+    with gl.amd.warp_pipeline_stage("mxfp8_stage0_load_low", phase_gap=1):
+        as0 = _mxfp8_load_scale(as_buf, scale_slot, 0, SCALE_A_LOAD, BLOCK_M, 8, 4)
+        as0 = gl.convert_layout(as0, SCALE_A_LAYOUT, assert_trivial=True)
+        bs0 = _mxfp8_load_scale(bs_buf, scale_slot, 0, SCALE_B_LOAD, BLOCK_N, 8, 4)
+        bs0_grid = bs0.reshape((CTA_N, cta_n, 4))
+        bs0_lo = gl.convert_layout(
+            gl.amd.slice(bs0_grid, [CTA_N, half_n, 4], [0, 0, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        bs0_hi = gl.convert_layout(
+            gl.amd.slice(bs0_grid, [CTA_N, half_n, 4], [0, half_n, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        a0 = (
+            a_buf.index(data_slot)
+            .slice(0, BLOCK_M, 0)
+            .slice(0, 128, 1)
+            .load(layout=DOT_A)
+        )
+        b0_lo = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 0, 0, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+        b0_hi = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 128, 0, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+    with gl.amd.warp_pipeline_stage("mxfp8_stage1_compute_low"):
+        acc0 = gl.amd.cdna5.wmma_scaled(a0, as0, "e4m3", b0_lo, bs0_lo, "e4m3", acc0)
+        acc1 = gl.amd.cdna5.wmma_scaled(a0, as0, "e4m3", b0_hi, bs0_hi, "e4m3", acc1)
+    with gl.amd.warp_pipeline_stage("mxfp8_stage2_load_high_advance"):
+        a1 = (
+            a_buf.index(data_slot)
+            .slice(0, BLOCK_M, 0)
+            .slice(128, 128, 1)
+            .load(layout=DOT_A)
+        )
+        as1 = _mxfp8_load_scale(as_buf, scale_slot, 4, SCALE_A_LOAD, BLOCK_M, 8, 4)
+        as1 = gl.convert_layout(as1, SCALE_A_LAYOUT, assert_trivial=True)
+        bs1 = _mxfp8_load_scale(bs_buf, scale_slot, 4, SCALE_B_LOAD, BLOCK_N, 8, 4)
+        bs1_grid = bs1.reshape((CTA_N, cta_n, 4))
+        bs1_lo = gl.convert_layout(
+            gl.amd.slice(bs1_grid, [CTA_N, half_n, 4], [0, 0, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        bs1_hi = gl.convert_layout(
+            gl.amd.slice(bs1_grid, [CTA_N, half_n, 4], [0, half_n, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        b1_lo = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 0, 128, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+        b1_hi = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 128, 128, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+        gl.amd.cdna5.cluster.arrive()
+        next_a_desc = tdm.update_tensor_descriptor(a_desc, add_offsets=[0, 256])
+        next_b_desc = _b2_advance_k(b_desc, B_PRESHUFFLED)
+        if REFILL_SCALE:
+            next_as_desc = tdm.update_tensor_descriptor(
+                as_desc, add_offsets=[as_buf.type.shape[1], 0]
+            )
+            next_bs_desc = tdm.update_tensor_descriptor(
+                bs_desc, add_offsets=[0, bs_buf.type.shape[-1]]
+            )
+    with gl.amd.warp_pipeline_stage("mxfp8_stage3_compute_high"):
+        acc0 = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1_lo, bs1_lo, "e4m3", acc0)
+        acc1 = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1_hi, bs1_hi, "e4m3", acc1)
+    with gl.amd.warp_pipeline_stage("mxfp8_stage4_wait_refill"):
+        gl.amd.cdna5.cluster.wait()
+        _mxfp8_issue_b2_parent_data_without_update(
+            a_desc, b_desc, a_buf, b_buf, data_slot
+        )
+        if REFILL_SCALE:
+            tdm.async_load_fused(
+                [
+                    (as_desc, as_buf.index(refill_scale_slot), 3),
+                    (bs_desc, bs_buf.index(refill_scale_slot), 12),
+                ]
+            )
+        a_desc = next_a_desc
+        b_desc = next_b_desc
+        as_desc = next_as_desc
+        bs_desc = next_bs_desc
+    return (a_desc, b_desc, as_desc, bs_desc, acc0, acc1)
+
+
+@gluon.jit
+def _mxfp8_bk256_b2_consume_tail(
+    a_buf,
+    b_buf,
+    as_buf,
+    bs_buf,
+    data_slot,
+    scale_slot,
+    acc0,
+    acc1,
+    DOT_A: gl.constexpr,
+    DOT_B: gl.constexpr,
+    B2_LOAD_LAYOUT: gl.constexpr,
+    SCALE_A_LAYOUT: gl.constexpr,
+    SCALE_A_LOAD: gl.constexpr,
+    SCALE_B_LAYOUT: gl.constexpr,
+    SCALE_B_LOAD: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CTA_N: gl.constexpr,
+    B_PRESHUFFLED: gl.constexpr,
+):
+    cta_n: gl.constexpr = 256
+    half_n: gl.constexpr = 128
+    packed_n: gl.constexpr = BLOCK_N // 2
+    with gl.amd.warp_pipeline_stage("b2_tail_load_low"):
+        a0 = (
+            a_buf.index(data_slot)
+            .slice(0, BLOCK_M, 0)
+            .slice(0, 128, 1)
+            .load(layout=DOT_A)
+        )
+        as0 = _mxfp8_load_scale(as_buf, scale_slot, 0, SCALE_A_LOAD, BLOCK_M, 8, 4)
+        as0 = gl.convert_layout(as0, SCALE_A_LAYOUT, assert_trivial=True)
+        bs0 = _mxfp8_load_scale(bs_buf, scale_slot, 0, SCALE_B_LOAD, BLOCK_N, 8, 4)
+        bs0_grid = bs0.reshape((CTA_N, cta_n, 4))
+        bs0_lo = gl.convert_layout(
+            gl.amd.slice(bs0_grid, [CTA_N, half_n, 4], [0, 0, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        bs0_hi = gl.convert_layout(
+            gl.amd.slice(bs0_grid, [CTA_N, half_n, 4], [0, half_n, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        b0_lo = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 0, 0, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+        b0_hi = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 128, 0, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+    with gl.amd.warp_pipeline_stage("b2_tail_compute_low"):
+        acc0 = gl.amd.cdna5.wmma_scaled(a0, as0, "e4m3", b0_lo, bs0_lo, "e4m3", acc0)
+        acc1 = gl.amd.cdna5.wmma_scaled(a0, as0, "e4m3", b0_hi, bs0_hi, "e4m3", acc1)
+    with gl.amd.warp_pipeline_stage("b2_tail_load_high"):
+        a1 = (
+            a_buf.index(data_slot)
+            .slice(0, BLOCK_M, 0)
+            .slice(128, 128, 1)
+            .load(layout=DOT_A)
+        )
+        as1 = _mxfp8_load_scale(as_buf, scale_slot, 4, SCALE_A_LOAD, BLOCK_M, 8, 4)
+        as1 = gl.convert_layout(as1, SCALE_A_LAYOUT, assert_trivial=True)
+        bs1 = _mxfp8_load_scale(bs_buf, scale_slot, 4, SCALE_B_LOAD, BLOCK_N, 8, 4)
+        bs1_grid = bs1.reshape((CTA_N, cta_n, 4))
+        bs1_lo = gl.convert_layout(
+            gl.amd.slice(bs1_grid, [CTA_N, half_n, 4], [0, 0, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        bs1_hi = gl.convert_layout(
+            gl.amd.slice(bs1_grid, [CTA_N, half_n, 4], [0, half_n, 0]).reshape(
+                (packed_n, 4)
+            ),
+            SCALE_B_LAYOUT,
+            assert_trivial=True,
+        )
+        b1_lo = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 0, 128, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+        b1_hi = _mxfp8_load_b2_parent(
+            b_buf, data_slot, 128, 128, B2_LOAD_LAYOUT, DOT_B, B_PRESHUFFLED
+        )
+    with gl.amd.warp_pipeline_stage("b2_tail_compute_high"):
+        acc0 = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1_lo, bs1_lo, "e4m3", acc0)
+        acc1 = gl.amd.cdna5.wmma_scaled(a1, as1, "e4m3", b1_hi, bs1_hi, "e4m3", acc1)
+    return (acc0, acc1)
+
+
+@gluon.jit
+def _mxfp8_8wave_pingpong_body(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    M,
+    N,
+    K: gl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_scale_a,
+    stride_scale_b,
+    GRID_MN: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B2: gl.constexpr,
+    SHARED_SCALE_A: gl.constexpr,
+    SHARED_SCALE_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    LOAD_WMMA_LAYOUT: gl.constexpr,
+    B2_LOAD_LAYOUT: gl.constexpr,
+    OUTPUT_CGA_LAYOUT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CTA_M: gl.constexpr,
+    CTA_N: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+    B_PRESHUFFLED: gl.constexpr,
+):
+    gl.static_assert(gl.num_ctas() == CTA_M * CTA_N)
+    # aiter: the source hard-codes NUM_XCDS=8, GROUP_SIZE_M=4; both are config keys.
+    pid_m, pid_n = _get_xcd_swizzled_pids(
+        M, N, BLOCK_M, BLOCK_N, GRID_MN, NUM_XCDS, GROUP_SIZE_M
+    )
+    dot_a: gl.constexpr = gl.DotOperandLayout(0, WMMA_LAYOUT, 16)
+    dot_b: gl.constexpr = gl.DotOperandLayout(1, WMMA_LAYOUT, 16)
+    dot_b_load: gl.constexpr = gl.DotOperandLayout(1, LOAD_WMMA_LAYOUT, 16)
+    scale_a_layout: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(
+        dot_a, [BLOCK_M, 4]
+    )
+    scale_b_layout: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(
+        dot_b, [BLOCK_N // 2, 4]
+    )
+    scale_b_load: gl.constexpr = gl.amd.cdna5.get_wmma_scale_layout(
+        dot_b_load, [BLOCK_N, 4]
+    )
+    a_buf = gl.allocate_shared_memory(
+        a_ptr.type.element_ty, [2, BLOCK_M, 256], SHARED_LAYOUT_A
+    )
+    # aiter: the only data-path difference between the two kernels is B --
+    # its TDM descriptor, its LDS shape/layout, and the register unshuffle in
+    # _mxfp8_load_b2_shuffled. The canonical kernel stores each slot as
+    # [CTA_N, 256 n, 256 k]; the preshuffle kernel stores the shuffled bytes
+    # unchanged as [CTA_N, 16 n-groups, 16 k-quads, 16 n x 16 k].
+    if B_PRESHUFFLED:
+        b_buf = gl.allocate_shared_memory(
+            b_ptr.type.element_ty, [2, CTA_N, 16, 16, 256], SHARED_LAYOUT_B2
+        )
+    else:
+        b_buf = gl.allocate_shared_memory(
+            b_ptr.type.element_ty, [2, CTA_N, 256, 256], SHARED_LAYOUT_B2
+        )
+    scale_slots: gl.constexpr = 3
+    a_desc = tdm.make_tensor_descriptor(
+        base=a_ptr + pid_m * BLOCK_M * stride_am,
+        shape=(M, K),
+        strides=(stride_am, stride_ak),
+        block_shape=(BLOCK_M, 256),
+        layout=SHARED_LAYOUT_A,
+    )
+    if B_PRESHUFFLED:
+        # b_ptr addresses the shuffled weight as (N // 16, K * 16): stride_bn is
+        # the stride between 16-row groups and stride_bk is 1. Each group row is
+        # K // 16 contiguous 256-byte "k-quads" (16 n x 16 k), so a 256-wide K
+        # tile of a CTA column's 256 rows is 16 groups x 16 k-quads.
+        b_base = b_ptr + pid_n * (BLOCK_N // 16) * stride_bn
+        b_desc = tdm.make_tensor_descriptor(
+            base=b_base,
+            shape=(CTA_N, N // 16 // CTA_N, K // 16, 256),
+            strides=(16 * stride_bn, stride_bn, 256 * stride_bk, stride_bk),
+            block_shape=(CTA_N, 16, 16, 256),
+            layout=SHARED_LAYOUT_B2,
+        )
+    else:
+        b_base = b_ptr + pid_n * BLOCK_N * stride_bn
+        b_desc = tdm.make_tensor_descriptor(
+            base=b_base,
+            shape=(CTA_N, N // CTA_N, K),
+            strides=(256 * stride_bn, stride_bn, stride_bk),
+            block_shape=(CTA_N, 256, 256),
+            layout=SHARED_LAYOUT_B2,
+        )
+    as_buf, bs_buf, as_desc, bs_desc = _mxfp8_native_scale_buffers(
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_scale_a,
+        stride_scale_b,
+        pid_m,
+        pid_n,
+        BLOCK_M,
+        BLOCK_N,
+        256,
+        scale_slots,
+        SHARED_SCALE_A,
+        SHARED_SCALE_B,
+    )
+    as_desc, bs_desc = _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, 0)
+    a_desc, b_desc = _mxfp8_issue_b2_parent_data(
+        a_desc, b_desc, a_buf, b_buf, 0, B_PRESHUFFLED
+    )
+    as_desc, bs_desc = _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, 1)
+    a_desc, b_desc = _mxfp8_issue_b2_parent_data(
+        a_desc, b_desc, a_buf, b_buf, 1, B_PRESHUFFLED
+    )
+    as_desc, bs_desc = _mxfp8_issue_leading4_scale(as_desc, bs_desc, as_buf, bs_buf, 2)
+    acc0 = gl.zeros((BLOCK_M, BLOCK_N // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
+    acc1 = gl.zeros((BLOCK_M, BLOCK_N // 2), dtype=gl.float32, layout=WMMA_LAYOUT)
+    iter_max = gl.cdiv(K, 256)
+    gl.assume(iter_max >= 4)
+    gl.assume(iter_max % 2 == 0)
+    data_scale_waitcnt: gl.constexpr = 4
+    for _ in range((iter_max - 4) // 6):
+        for inner in gl.static_range(6):
+            a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
+                _mxfp8_bk256_b2_consume_and_refill(
+                    a_buf,
+                    b_buf,
+                    as_buf,
+                    bs_buf,
+                    inner % 2,
+                    inner % 3,
+                    inner % 3,
+                    a_desc,
+                    b_desc,
+                    as_desc,
+                    bs_desc,
+                    acc0,
+                    acc1,
+                    dot_a,
+                    dot_b,
+                    B2_LOAD_LAYOUT,
+                    scale_a_layout,
+                    scale_a_layout,
+                    scale_b_layout,
+                    scale_b_load,
+                    BLOCK_M,
+                    BLOCK_N,
+                    CTA_N,
+                    True,
+                    data_scale_waitcnt,
+                    B_PRESHUFFLED,
+                )
+            )
+    for inner in gl.static_range(6):
+        if inner < (iter_max - 4) % 6:
+            a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = (
+                _mxfp8_bk256_b2_consume_and_refill(
+                    a_buf,
+                    b_buf,
+                    as_buf,
+                    bs_buf,
+                    inner % 2,
+                    inner % 3,
+                    inner % 3,
+                    a_desc,
+                    b_desc,
+                    as_desc,
+                    bs_desc,
+                    acc0,
+                    acc1,
+                    dot_a,
+                    dot_b,
+                    B2_LOAD_LAYOUT,
+                    scale_a_layout,
+                    scale_a_layout,
+                    scale_b_layout,
+                    scale_b_load,
+                    BLOCK_M,
+                    BLOCK_N,
+                    CTA_N,
+                    True,
+                    data_scale_waitcnt,
+                    B_PRESHUFFLED,
+                )
+            )
+    residual = iter_max - 4
+    s0 = residual % 3
+    s1 = (residual + 1) % 3
+    a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _mxfp8_bk256_b2_consume_and_refill(
+        a_buf,
+        b_buf,
+        as_buf,
+        bs_buf,
+        0,
+        s0,
+        s0,
+        a_desc,
+        b_desc,
+        as_desc,
+        bs_desc,
+        acc0,
+        acc1,
+        dot_a,
+        dot_b,
+        B2_LOAD_LAYOUT,
+        scale_a_layout,
+        scale_a_layout,
+        scale_b_layout,
+        scale_b_load,
+        BLOCK_M,
+        BLOCK_N,
+        CTA_N,
+        True,
+        data_scale_waitcnt,
+        B_PRESHUFFLED,
+    )
+    a_desc, b_desc, as_desc, bs_desc, acc0, acc1 = _mxfp8_bk256_b2_consume_and_refill(
+        a_buf,
+        b_buf,
+        as_buf,
+        bs_buf,
+        1,
+        s1,
+        s1,
+        a_desc,
+        b_desc,
+        as_desc,
+        bs_desc,
+        acc0,
+        acc1,
+        dot_a,
+        dot_b,
+        B2_LOAD_LAYOUT,
+        scale_a_layout,
+        scale_a_layout,
+        scale_b_layout,
+        scale_b_load,
+        BLOCK_M,
+        BLOCK_N,
+        CTA_N,
+        False,
+        data_scale_waitcnt,
+        B_PRESHUFFLED,
+    )
+    tdm.async_wait(3)
+    acc0, acc1 = _mxfp8_bk256_b2_consume_tail(
+        a_buf,
+        b_buf,
+        as_buf,
+        bs_buf,
+        0,
+        (iter_max - 2) % 3,
+        acc0,
+        acc1,
+        dot_a,
+        dot_b,
+        B2_LOAD_LAYOUT,
+        scale_a_layout,
+        scale_a_layout,
+        scale_b_layout,
+        scale_b_load,
+        BLOCK_M,
+        BLOCK_N,
+        CTA_N,
+        B_PRESHUFFLED,
+    )
+    tdm.async_wait(0)
+    acc0, acc1 = _mxfp8_bk256_b2_consume_tail(
+        a_buf,
+        b_buf,
+        as_buf,
+        bs_buf,
+        1,
+        (iter_max - 1) % 3,
+        acc0,
+        acc1,
+        dot_a,
+        dot_b,
+        B2_LOAD_LAYOUT,
+        scale_a_layout,
+        scale_a_layout,
+        scale_b_layout,
+        scale_b_load,
+        BLOCK_M,
+        BLOCK_N,
+        CTA_N,
+        B_PRESHUFFLED,
+    )
+    _cluster_sync()
+    a_buf._keep_alive()
+    b_buf._keep_alive()
+    as_buf._keep_alive()
+    bs_buf._keep_alive()
+    _tdm_store_split_n2(
+        c_ptr,
+        pid_m,
+        pid_n,
+        stride_cm,
+        stride_cn,
+        M,
+        N,
+        acc0,
+        acc1,
+        OUTPUT_CGA_LAYOUT,
+        CTA_M,
+        CTA_N,
+    )
+
+
+@gluon.jit
+def _gemm_mxfp8_8wave_pingpong_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    M,
+    N,
+    K: gl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_scale_a,
+    stride_scale_b,
+    GRID_MN: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B2: gl.constexpr,
+    SHARED_SCALE_A: gl.constexpr,
+    SHARED_SCALE_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    LOAD_WMMA_LAYOUT: gl.constexpr,
+    B2_LOAD_LAYOUT: gl.constexpr,
+    OUTPUT_CGA_LAYOUT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CTA_M: gl.constexpr,
+    CTA_N: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+):
+    """MXFP8 GEMM, 8-wave ping-pong (``mxfp8_gemm_warp_pipeline`` in the source).
+
+    C[M, N] = scaled(A[M, K]) @ scaled(B[N, K]).T with B in canonical row-major
+    [N, K]. A scales are M-contiguous (physically (K // 128, M)); B scales are
+    (N // 128, K // 128). BLOCK_M / BLOCK_N are the cluster tile.
+    """
+    _mxfp8_8wave_pingpong_body(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        stride_scale_a,
+        stride_scale_b,
+        GRID_MN,
+        SHARED_LAYOUT_A,
+        SHARED_LAYOUT_B2,
+        SHARED_SCALE_A,
+        SHARED_SCALE_B,
+        WMMA_LAYOUT,
+        LOAD_WMMA_LAYOUT,
+        B2_LOAD_LAYOUT,
+        OUTPUT_CGA_LAYOUT,
+        BLOCK_M,
+        BLOCK_N,
+        CTA_M,
+        CTA_N,
+        GROUP_SIZE_M,
+        NUM_XCDS,
+        False,
+    )
+
+
+@gluon.jit
+def _gemm_mxfp8_preshuffle_8wave_pingpong_kernel(
+    a_ptr,
+    b_ptr,
+    c_ptr,
+    a_scale_ptr,
+    b_scale_ptr,
+    M,
+    N,
+    K: gl.constexpr,
+    stride_am,
+    stride_ak,
+    stride_bk,
+    stride_bn,
+    stride_cm,
+    stride_cn,
+    stride_scale_a,
+    stride_scale_b,
+    GRID_MN: gl.constexpr,
+    SHARED_LAYOUT_A: gl.constexpr,
+    SHARED_LAYOUT_B2: gl.constexpr,
+    SHARED_SCALE_A: gl.constexpr,
+    SHARED_SCALE_B: gl.constexpr,
+    WMMA_LAYOUT: gl.constexpr,
+    LOAD_WMMA_LAYOUT: gl.constexpr,
+    B2_LOAD_LAYOUT: gl.constexpr,
+    OUTPUT_CGA_LAYOUT: gl.constexpr,
+    BLOCK_M: gl.constexpr,
+    BLOCK_N: gl.constexpr,
+    CTA_M: gl.constexpr,
+    CTA_N: gl.constexpr,
+    GROUP_SIZE_M: gl.constexpr,
+    NUM_XCDS: gl.constexpr,
+):
+    """_gemm_mxfp8_8wave_pingpong_kernel with a preshuffled B.
+
+    b_ptr addresses aiter.ops.shuffle.shuffle_weight(w, layout=(16, 16)) viewed
+    as (N // 16, K * 16). TDM copies the shuffled bytes into LDS unchanged and
+    the kernel unshuffles them in registers (_mxfp8_load_b2_shuffled); the
+    pipeline, scales, layouts of every other operand and the output path are
+    identical.
+    """
+    _mxfp8_8wave_pingpong_body(
+        a_ptr,
+        b_ptr,
+        c_ptr,
+        a_scale_ptr,
+        b_scale_ptr,
+        M,
+        N,
+        K,
+        stride_am,
+        stride_ak,
+        stride_bk,
+        stride_bn,
+        stride_cm,
+        stride_cn,
+        stride_scale_a,
+        stride_scale_b,
+        GRID_MN,
+        SHARED_LAYOUT_A,
+        SHARED_LAYOUT_B2,
+        SHARED_SCALE_A,
+        SHARED_SCALE_B,
+        WMMA_LAYOUT,
+        LOAD_WMMA_LAYOUT,
+        B2_LOAD_LAYOUT,
+        OUTPUT_CGA_LAYOUT,
+        BLOCK_M,
+        BLOCK_N,
+        CTA_M,
+        CTA_N,
+        GROUP_SIZE_M,
+        NUM_XCDS,
+        True,
+    )
+
+
+# The only CTA tile and K tile the copied BK256 path implements.
+_8WAVE_PINGPONG_CTA_TILE = 256
+_8WAVE_PINGPONG_BLOCK_K = 256
+
+
+def make_8wave_pingpong_layouts(cluster, b_preshuffled):
+    """Host-side constexpr layouts for the 8-wave ping-pong kernels.
+
+    Copied from prepare_gemm_warp_pipeline in warp_pipeline/adapter.py (see the
+    section header), restricted to its BK256 branch. ``cluster`` is the square
+    CTA cluster width (2 or 4). Returns the layout kwargs of the kernel launch.
+
+    aiter: for ``b_preshuffled`` only SHARED_LAYOUT_B2 differs. The canonical
+    kernel's B slot [CTA_N, 256, 256] is a PartitionedSharedLayout, split along
+    N into four 64-row pieces over two LDS partitions with a padded inner
+    layout. The shuffled slot [CTA_N, 16, 16, 256] gets the same split -- four
+    pieces of four 16-row groups -- and the same CGA (multicast) bases, over an
+    unswizzled inner layout: the shuffled bytes are already conflict-free for
+    the read (16 lanes x 16 B along n, then the k16 half, cover 512 contiguous
+    bytes per wave).
+
+    Unshuffling through memdesc views instead does not compile -- reshaping a
+    partitioned memdesc drops the partition-select bit ("Layout is expected to
+    be surjective"), and slicing a reshaped plain one trips
+    SharedLinearEncodingAttr's size check -- hence the register unshuffle in
+    _mxfp8_load_b2_shuffled. Unpartitioned, the slot also costs ~51 KB more
+    LDS (331768 B, over the 327680 B limit at 512x65536x1536): the output
+    staging buffers only alias freed space when B is in pieces.
+    """
+    # libtriton builtin: only ever called here, never from a kernel (see
+    # cga_bases above for why a kernel must not reference it).
+    from triton._C.libtriton.gluon_ir import make_cga_layout
+    from triton.experimental.gluon.language.amd.cdna5 import PartitionedSharedLayout
+
+    tile, block_k = _8WAVE_PINGPONG_CTA_TILE, _8WAVE_PINGPONG_BLOCK_K
+    # 1x1 does not compile: the pipeline's cluster.arrive/wait (the WAR guard
+    # before each TDM refill) requires num_ctas > 1.
+    assert cluster in (
+        2,
+        4,
+    ), f"8-wave ping-pong needs a 2x2 or 4x4 cluster, got {cluster}"
+    block_m = block_n = tile * cluster
+
+    # First derive the per-CTA WMMA ownership, then attach the cluster CGA bases.
+    cga = make_cga_layout([cluster, cluster], [cluster, cluster], [0, 1])
+    output_cga = tuple(tuple(basis) + (0, 0) for basis in cga)
+    slice_n = tile // 2  # BK256 splits N into two accumulators
+    local_a = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 16]], [block_m, block_k], [1, 0]
+    )
+    local_b = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 16]], [block_n, block_k], [1, 0]
+    )
+    _, _, local_wmma = gl.amd.cdna5.make_partitioned_dot_layouts(
+        block_m,
+        block_n,
+        local_a,
+        local_b,
+        8,
+        [16, 16, 128],
+        a_transposed=False,
+        b_transposed=True,
+        slice_m=tile,
+        slice_n=slice_n,
+    )
+    load_wmma = gl.amd.AMDWMMALayout(
+        3,
+        local_wmma.transposed,
+        local_wmma.warp_bases,
+        local_wmma.reg_bases,
+        local_wmma.instr_shape,
+        cga,
+    )
+    dot_a = gl.DotOperandLayout(0, load_wmma, 16)
+    dot_b = gl.DotOperandLayout(1, load_wmma, 16)
+    cga_a = dot_a.cga_layout
+    cga_b = tuple((basis[1], basis[0]) for basis in dot_b.cga_layout)
+    padded_a = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 16]], [block_m, block_k], [1, 0], cga_a
+    )
+    padded_b = gl.PaddedSharedLayout.with_identity_for(
+        [[block_k, 16]], [block_n, block_k], [1, 0], cga_b
+    )
+    shared_a, shared_b, _ = gl.amd.cdna5.make_partitioned_dot_layouts(
+        tile,
+        tile,
+        padded_a,
+        padded_b,
+        8,
+        [16, 16, 128],
+        a_transposed=False,
+        b_transposed=True,
+        slice_m=tile,
+        slice_n=slice_n,
+    )
+    # BK256 splits N into two accumulators.
+    packed_n = block_n // 2
+    local_b = gl.PaddedSharedLayout.with_identity_for(
+        [[256, 16]], [packed_n, 256], [1, 0]
+    )
+    _, _, local_wmma = gl.amd.cdna5.make_partitioned_dot_layouts(
+        block_m,
+        packed_n,
+        local_a,
+        local_b,
+        8,
+        [16, 16, 128],
+        a_transposed=False,
+        b_transposed=True,
+        slice_m=tile,
+        slice_n=slice_n,
+    )
+    wmma = gl.amd.AMDWMMALayout(
+        3,
+        local_wmma.transposed,
+        local_wmma.warp_bases,
+        local_wmma.reg_bases,
+        local_wmma.instr_shape,
+        cga,
+    )
+    # One parent B allocation contains both N halves for every CTA column.
+    inner = shared_b.partition_layout
+    parent_cga = tuple((basis[0], 0, basis[1]) for basis in inner.cga_layout)
+    if b_preshuffled:
+        b2_shared = PartitionedSharedLayout(
+            2,
+            2,
+            1,
+            gl.SwizzledSharedLayout(
+                1, 1, 1, [3, 2, 1, 0], tuple(b[:2] + (0,) + b[2:] for b in parent_cga)
+            ),
+        )
+    else:
+        padded = gl.PaddedSharedLayout.with_identity_for(
+            [[256, 16]], [cluster, 64, 256], [2, 1, 0], parent_cga
+        )
+        b2_shared = PartitionedSharedLayout(2, 2, 1, padded)
+    b2_load = gl.DistributedLinearLayout(
+        reg_bases=[
+            [1, 0, 0],
+            [2, 0, 0],
+            [4, 0, 0],
+            [8, 0, 0],
+            [32, 0, 0],
+            [64, 0, 0],
+            [0, 0, 16],
+            [0, 0, 32],
+        ],
+        lane_bases=[[0, 0, 1], [0, 0, 2], [0, 0, 4], [0, 0, 8], [16, 0, 0]],
+        warp_bases=[[0, 0, 64], [0, 0, 0], [0, 0, 0]],
+        block_bases=[[0, 0, 0]] * (cluster.bit_length() - 1)
+        + [[0, 1 << i, 0] for i in range(cluster.bit_length() - 1)],
+        shape=[128, cluster, 128],
+    )
+    # Native K128, M-contiguous scale layouts. (adapter.py first builds the
+    # packed K32 scale layouts in this branch and then overrides them with
+    # these; only the override is kept.)
+    mcontiguous_b_cga = tuple(
+        (basis[0] // max(1, 128 // tile), basis[1]) for basis in cga_b
+    )
+    shared_as = gl.PaddedSharedLayout.with_identity_for(
+        [[64, 8]], [block_m, block_k // 128], [1, 0], cga_a
+    )
+    shared_bs = gl.PaddedSharedLayout.with_identity_for(
+        [[64, 8]], [block_n // 128, block_k // 128], [1, 0], mcontiguous_b_cga
+    )
+    return {
+        "SHARED_LAYOUT_A": shared_a,
+        "SHARED_LAYOUT_B2": b2_shared,
+        "SHARED_SCALE_A": shared_as,
+        "SHARED_SCALE_B": shared_bs,
+        "WMMA_LAYOUT": wmma,
+        "LOAD_WMMA_LAYOUT": load_wmma,
+        "B2_LOAD_LAYOUT": b2_load,
+        "OUTPUT_CGA_LAYOUT": output_cga,
+        "BLOCK_M": block_m,
+        "BLOCK_N": block_n,
+        "CTA_M": cluster,
+        "CTA_N": cluster,
+    }
+
+
 _PRESHUFFLE_KERNEL_MAP = {
     "bandwidth_bound": _gemm_mxfp8_preshuffle_bandwidth_bound_kernel,
     "compute_bound": _gemm_mxfp8_preshuffle_compute_bound_kernel,
+    "8wave_pingpong": _gemm_mxfp8_preshuffle_8wave_pingpong_kernel,
 }

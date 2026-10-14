@@ -3,6 +3,7 @@
 
 
 import copy
+import functools
 import math
 
 import torch
@@ -111,6 +112,137 @@ def _resolve_x_scale_strides(
     return x_scales.stride(0), x_scales.stride(1)
 
 
+@functools.cache
+def _8wave_pingpong_layouts(cluster: int, b_preshuffled: bool) -> dict:
+    """Constexpr layouts for the 8-wave ping-pong kernels, built once per variant."""
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import (
+        make_8wave_pingpong_layouts,
+    )
+
+    return make_8wave_pingpong_layouts(cluster, b_preshuffled)
+
+
+def _gemm_afp8wfp8_8wave_pingpong(
+    x: torch.Tensor,
+    w: torch.Tensor,
+    x_scales: torch.Tensor,
+    w_scales: torch.Tensor,
+    y: torch.Tensor,
+    config: dict,
+    stride_asm: int,
+    stride_ask: int,
+    x_scale_group_size: int,
+    b_preshuffled: bool,
+) -> torch.Tensor:
+    """Launch the gluon 8-wave ping-pong kernel (kernel_type "8wave_pingpong").
+
+    ``w`` is the canonical (N, K) weight, or for ``b_preshuffled`` the
+    shuffle_weight(layout=(16, 16)) bytes viewed as (N // 16, K * 16). The
+    kernel is the BK256 path copied from the upstream warp-pipeline example
+    (see gemm_mxfp8.py), so its tile is fixed: 256x256x256 per CTA, a square
+    2x2 or 4x4 cluster, 8 waves, block-128 scales, BF16 output and no split-K.
+    Config keys keep the preshuffle-config meaning: BLOCK_SIZE_* is the per-CTA
+    tile and CTAS_* the cluster.
+    """
+    from aiter.ops.triton._gluon_kernels.gfx1250.gemm.basic.gemm_mxfp8 import (
+        _gemm_mxfp8_8wave_pingpong_kernel,
+        _gemm_mxfp8_preshuffle_8wave_pingpong_kernel,
+    )
+
+    M, K = x.shape
+    N = y.shape[1]
+    cluster = config["CTAS_M"]
+    assert config["CTAS_N"] == cluster and cluster in (
+        2,
+        4,
+    ), f"8wave_pingpong needs a square 2x2 or 4x4 cluster, got {config['CTAS_M']}x{config['CTAS_N']}"
+    tile = (config["BLOCK_SIZE_M"], config["BLOCK_SIZE_N"], config["BLOCK_SIZE_K"])
+    assert tile == (
+        256,
+        256,
+        256,
+    ), f"8wave_pingpong only has a 256x256x256 tile, got {tile}"
+    assert config["num_warps"] == 8, "8wave_pingpong runs 8 waves per CTA"
+    assert config.get("NUM_KSPLIT", 1) == 1, "8wave_pingpong has no split-K"
+    block = 256 * cluster
+    assert M % block == 0 and N % block == 0, (
+        f"8wave_pingpong with a {cluster}x{cluster} cluster needs M and N divisible "
+        f"by {block}, got M={M} N={N}"
+    )
+    # The pipeline keeps four K tiles in flight and consumes them in pairs.
+    assert (
+        K >= 1024 and K % 512 == 0
+    ), f"8wave_pingpong needs K >= 1024 and K % 512 == 0, got {K}"
+    assert x_scale_group_size == 128, "8wave_pingpong needs 1x128 activation scales"
+    assert y.dtype == torch.bfloat16, "8wave_pingpong writes BF16 output"
+    assert y.stride(1) == 1 and x.stride(1) == 1 and w.stride(1) == 1
+    assert w_scales.stride(1) == 1
+
+    # A scales are read M-contiguous, as physical (K // 128, M). The
+    # column-major buffer per_group_quant_hip(transpose_scale=True) emits is
+    # exactly that; a row-major one is transposed here, which costs a copy.
+    if stride_asm == 1:
+        a_scales = x_scales
+    else:
+        a_scales = torch.as_strided(
+            x_scales, (K // 128, M), (stride_ask, stride_asm)
+        ).contiguous()
+        stride_ask = M
+    # Native FP8 operand pointers: the kernel's layouts are built for e4m3.
+    # Views only when needed -- this runs on every launch.
+    if x.dtype != torch.float8_e4m3fn:
+        x = x.view(torch.float8_e4m3fn)
+    if w.dtype != torch.float8_e4m3fn:
+        w = w.view(torch.float8_e4m3fn)
+    if a_scales.dtype != torch.uint8:
+        a_scales = a_scales.view(torch.uint8)
+    if w_scales.dtype != torch.uint8:
+        w_scales = w_scales.view(torch.uint8)
+    layouts = _8wave_pingpong_layouts(cluster, b_preshuffled)
+    kernel = (
+        _gemm_mxfp8_preshuffle_8wave_pingpong_kernel
+        if b_preshuffled
+        else _gemm_mxfp8_8wave_pingpong_kernel
+    )
+    grid = (triton.cdiv(M, layouts["BLOCK_M"]) * triton.cdiv(N, layouts["BLOCK_N"]), 1)
+    _LOGGER.info(
+        "GEMM_AFP8WFP8%s [gluon/gfx1250]: x=%s w=%s kernel=8wave_pingpong cluster=%dx%d",
+        "_PRESHUFFLE" if b_preshuffled else "",
+        tuple(x.shape),
+        tuple(w.shape),
+        cluster,
+        cluster,
+    )
+    kernel[grid](
+        x,
+        w,
+        y,
+        a_scales,
+        w_scales,
+        M,
+        N,
+        K,
+        x.stride(0),
+        x.stride(1),
+        w.stride(1),
+        w.stride(0),
+        y.stride(0),
+        y.stride(1),
+        stride_ask,
+        w_scales.stride(0),
+        GRID_MN=grid[0],
+        **layouts,
+        # Program-id swizzle: NUM_XCDS-way chiplet spread, then GROUP_SIZE_M
+        # cluster rows per group.
+        GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        NUM_XCDS=config["NUM_XCDS"],
+        num_warps=config["num_warps"],
+        waves_per_eu=config["waves_per_eu"],
+        num_ctas=cluster * cluster,
+    )
+    return y
+
+
 def gemm_afp8wfp8(
     x: torch.Tensor,
     w: torch.Tensor,
@@ -124,6 +256,7 @@ def gemm_afp8wfp8(
     is_x_scale_transposed: bool = False,
     w_scale_group_size: tuple[int, int] = (128, 128),
     split_k: int | None = None,
+    backend: str | None = None,
 ) -> torch.Tensor:
     """Compute X @ W.T with E4M3 operands and compact E8M0 scales.
 
@@ -138,6 +271,11 @@ def gemm_afp8wfp8(
     partitions are aligned to whole kernel steps. ``skip_reduce`` disables
     fused reduction and returns FP32 partials when more than one split remains.
     Packed execution and fused reduction require gfx950.
+
+    ``backend="gluon"`` (gfx1250) instead reads the gluon config family and
+    runs the kernel its ``kernel_type`` names -- so far only
+    ``"8wave_pingpong"``, which needs 1x128 activation and 128x128 weight
+    scales, BF16 output and no split-K. ``None`` keeps the triton kernel.
     """
     assert x.ndim == w.ndim == 2, "Expected matrix operands"
     M, K = x.shape
@@ -174,6 +312,36 @@ def gemm_afp8wfp8(
         assert all(s > 0 for s in y.stride())
     if M == 0:
         return y if y is not None else torch.empty((M, N), dtype=dtype, device=x.device)
+    backend = "triton" if backend is None else backend.lower()
+    assert backend in ("triton", "gluon"), f"Unknown backend '{backend}'"
+    if backend == "gluon":
+        assert (
+            _is_gluon_available()
+        ), f"Gluon backend requires one of {_GLUON_SUPPORTED_ARCHS}, got '{get_arch()}'"
+        assert w_scale_group_size == (128, 128), "gluon needs 128x128 weight scales"
+        assert split_k is None, "gluon gemm_afp8wfp8 has no split-K"
+        if config is None:
+            config, _ = _get_config(
+                M, N, K, config_name="GEMM-AFP8WFP8", backend="gluon"
+            )
+        kernel_type = config.get("kernel_type")
+        assert (
+            kernel_type == "8wave_pingpong"
+        ), f"gluon gemm_afp8wfp8 only has kernel_type '8wave_pingpong', got {kernel_type!r}"
+        if y is None:
+            y = torch.empty((M, N), dtype=dtype, device=x.device)
+        return _gemm_afp8wfp8_8wave_pingpong(
+            x,
+            w,
+            x_scales,
+            w_scales,
+            y,
+            config,
+            stride_asm,
+            stride_ask,
+            x_scale_group_size,
+            b_preshuffled=False,
+        )
     if config is None:
         config_name = "GEMM-AFP8WFP8"
         if (x_scale_group_size, w_scale_group_size) != (128, (128, 128)):
@@ -377,8 +545,9 @@ def gemm_afp8wfp8_preshuffle(
             activations (default), 32 for MX activations.
         is_x_scale_transposed: x_scales bytes are column-major, i.e. logically
             (K // group, M). Default False (row-major).
-        kernel_type: [gluon only] Kernel variant. Only "bandwidth_bound" exists
-            so far.
+        kernel_type: [gluon only] Kernel variant: "bandwidth_bound",
+            "compute_bound" or "8wave_pingpong". A config's own kernel_type
+            wins over this argument.
         backend: "triton", "gluon", or None (auto-detect).
 
     Returns:
@@ -417,6 +586,27 @@ def gemm_afp8wfp8_preshuffle(
     if config is None:
         config, _ = _get_config(
             M, N, K, config_name="GEMM-AFP8WFP8_PRESHUFFLED", backend=backend
+        )
+
+    # The 8-wave ping-pong kernel has its own launch path: fixed tile, square
+    # cluster, layouts built on the host (see _gemm_afp8wfp8_8wave_pingpong).
+    if (
+        backend == "gluon"
+        and config.get("kernel_type", kernel_type) == "8wave_pingpong"
+    ):
+        if y is None:
+            y = torch.empty((M, N), dtype=dtype, device=x.device)
+        return _gemm_afp8wfp8_8wave_pingpong(
+            x,
+            w_view,
+            x_scales,
+            w_scales,
+            y,
+            config,
+            stride_asm,
+            stride_ask,
+            x_scale_group_size,
+            b_preshuffled=True,
         )
 
     # CTA-cluster (CGA) multicast, gluon only. CTAS_M x CTAS_N CTAs form one
