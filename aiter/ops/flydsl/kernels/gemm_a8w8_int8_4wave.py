@@ -30,6 +30,7 @@ from flydsl._mlir.dialects import llvm as _llvm
 from flydsl.expr import const_expr, range_constexpr, rocdl
 from flydsl.expr.typing import Vector as Vec
 
+from aiter.ops.flydsl.kernels import buffer_ops
 from aiter.ops.flydsl.kernels.gemm_a8w8_8wave import (
     S2RLoader,
     StoreC,
@@ -68,8 +69,8 @@ def _a_chunk_swizzle(row):
     return ((1 ^ (quad % 2) ^ (quad // 2)) << 2) | ((quad // 2) << 1) | ((row % 4) // 2)
 
 
-def _lane_offsets(lane_id, wave_id, K, preshuffled, block_row0, n_rows):
-    """Per-lane global offsets for the LDS-DMA steps of one region.
+def _lane_offset(lane_id, wave_id, K, preshuffled, block_row0, n_rows, step):
+    """Per-lane global offset for LDS-DMA step ``step`` of one region.
 
     Step ``s`` of wave ``w`` fills half ``s % 2`` (1 KB) of row block
     ``4 * w + s // 2``: rows ``(s % 2) * 8`` onwards for A, k16 chunks
@@ -77,25 +78,21 @@ def _lane_offsets(lane_id, wave_id, K, preshuffled, block_row0, n_rows):
     with chunk ``c`` at slot ``c ^ _a_chunk_swizzle(r)``, so every 8 lanes
     load one 128-byte row.
 
-    Offsets are from the operand base, for the block starting at row
+    The offset is from the operand base, for the block starting at row
     ``block_row0``. Nothing bounds a global load, so rows at or past
     ``n_rows`` (whole 16-row strips for B) read the last valid one instead;
     they only reach C rows and columns that are not stored.
     """
-    offsets = []
-    for step in range_constexpr(LOADS_PER_REGION):
-        row_block = wave_id * (LOADS_PER_REGION // 2) + step // 2
-        if const_expr(preshuffled):
-            strip = block_row0 // 16 + row_block
-            strip = (strip < n_rows // 16).select(strip, n_rows // 16 - 1)
-            offsets.append(strip * (16 * K) + (step % 2) * 1024 + lane_id * 16)
-        else:
-            row = (step % 2) * 8 + lane_id // 8
-            chunk = (lane_id % 8) ^ _a_chunk_swizzle(row)
-            g_row = block_row0 + row_block * 16 + row
-            g_row = (g_row < n_rows).select(g_row, n_rows - 1)
-            offsets.append(g_row * K + chunk * 16)
-    return offsets
+    row_block = wave_id * (LOADS_PER_REGION // 2) + step // 2
+    if const_expr(preshuffled):
+        strip = block_row0 // 16 + row_block
+        strip = (strip < n_rows // 16).select(strip, n_rows // 16 - 1)
+        return strip * (16 * K) + (step % 2) * 1024 + lane_id * 16
+    row = (step % 2) * 8 + lane_id // 8
+    chunk = (lane_id % 8) ^ _a_chunk_swizzle(row)
+    g_row = block_row0 + row_block * 16 + row
+    g_row = (g_row < n_rows).select(g_row, n_rows - 1)
+    return g_row * K + chunk * 16
 
 
 class G2SGlobal:
@@ -110,7 +107,8 @@ class G2SGlobal:
 
     The loads are inline asm because LLVM asserts on the intrinsic's negative
     LDS memory-operand offset. LLVM does not count them in vmcnt, so the K
-    loop waits for them explicitly and is drained before the epilogue's loads.
+    loop waits for them explicitly, and the epilogue's scale loads, which
+    persistent workgroups issue before the next block's, are asm as well.
     It does see M0 as an operand and writes it only when the value changes;
     ``m0_state``, shared by all instances, mirrors that in issue order so the
     hazard ``s_nop`` goes only after a change. Nothing else may use M0.
@@ -118,7 +116,7 @@ class G2SGlobal:
 
     CENTER = 4096
 
-    def __init__(self, tensor, lane_offsets, wave_id, block_stride, lds_pair, m0_state):
+    def __init__(self, tensor, wave_id, block_stride, lds_pair, m0_state):
         piece = [
             (s // 2) * block_stride + (s % 2) * 1024 for s in range(LOADS_PER_REGION)
         ]
@@ -126,9 +124,6 @@ class G2SGlobal:
         assert all(-4096 <= i <= self.CENTER for i in self.imm)
         # The VGPR offset is unsigned, so the SGPR base carries -CENTER.
         self.base = fx.Int64(fx.ptrtoint(fx.get_iter(tensor))) - self.CENTER
-        self.voffsets = [
-            off - imm + self.CENTER for off, imm in zip(lane_offsets, self.imm)
-        ]
         wave_off = wave_id * (LOADS_PER_REGION // 2) * block_stride + self.CENTER
         self.m0 = [
             rocdl.readfirstlane(
@@ -139,12 +134,16 @@ class G2SGlobal:
         ]
         self.m0_state = m0_state
 
-    def _load(self, buf, k_offset, step, m0_changes):
+    def voffset(self, step, lane_offset):
+        """VGPR offset of ``step`` for a lane at ``lane_offset`` from the base."""
+        return lane_offset - self.imm[step] + self.CENTER
+
+    def _load(self, voffset, buf, k_offset, step, m0_changes):
         nop = "s_nop 0\n" if m0_changes else ""
         _llvm.inline_asm(
             res=None,
             operands_=[
-                fx.Int32(self.voffsets[step]).ir_value(),
+                fx.Int32(voffset).ir_value(),
                 (self.base + fx.Int64(k_offset)).ir_value(),
                 fx.Int32(self.m0[buf]).ir_value(),
             ],
@@ -153,14 +152,15 @@ class G2SGlobal:
             has_side_effects=True,
         )
 
-    def ops(self, buf, k_offset, steps):
+    def ops(self, voffsets, buf, k_offset):
+        """One op per step, each loading at ``voffsets[step]``."""
         ops = []
-        for step in steps:
+        for step in range(LOADS_PER_REGION):
             m0_changes = self.m0_state[0] != (id(self), buf)
             self.m0_state[0] = (id(self), buf)
             ops.append(
                 lambda step=step, m0_changes=m0_changes: self._load(
-                    buf, k_offset, step, m0_changes
+                    voffsets[step], buf, k_offset, step, m0_changes
                 )
             )
         return ops
@@ -175,18 +175,49 @@ class StoreCInt8Rows(StoreC):
     Preshuffled B has N % 16 == 0: a store is fully inside C or past column N.
     """
 
-    def __init__(self, *args):
-        super().__init__(*args)
+    SCALE_LOADS = WAVE_TILES + 2
+
+    def __init__(self, A_scale, B_scale, C, c_rows, c_cols, *args):
+        super().__init__(A_scale, B_scale, C, c_rows, c_cols, *args)
         self.out_atom_8 = fx.make_copy_atom(fx.rocdl.BufferCopy128b(), fx.BFloat16)
         self.reg_bf16_8 = fx.make_rmem_tensor(fx.make_layout(8, 1), fx.BFloat16)
-
-    def _load_b_scale_vec4(self, col):
-        fx.copy(
-            self.scale_atom_4,
-            fx.slice(self.sb_div, (None, fx.Int32(col))),
-            self.reg_f32_4,
+        self.sa_rsrc = buffer_ops.create_buffer_resource(
+            A_scale, max_size=False, num_records_bytes=c_rows * 4
         )
-        return Vec(fx.memref_load_vec(self.reg_f32_4))
+        self.sb_rsrc = buffer_ops.create_buffer_resource(
+            B_scale, max_size=False, num_records_bytes=c_cols * 4
+        )
+
+    @staticmethod
+    def _load_f32x4(rsrc, byte_offset):
+        return _llvm.inline_asm(
+            res=ir.VectorType.get([4], ir.F32Type.get()),
+            operands_=[fx.Int32(byte_offset).ir_value(), rsrc],
+            asm_string="buffer_load_dwordx4 $0, $1, $2, 0 offen",
+            constraints="=v,v,s",
+            has_side_effects=True,
+        )
+
+    def scale_load_ops(self, row_base, col_base, scales):
+        """``SCALE_LOADS`` ops appending the scales for ``store_tiles``.
+
+        The loads are asm, so LLVM leaves them out of its vmcnt waits: an LLVM
+        wait for them would also wait for the LDS-DMA loads that follow them,
+        which it cannot count. The caller waits before the stores.
+        """
+
+        def op(rsrc, element):
+            return lambda: scales.append(self._load_f32x4(rsrc, element() * 4))
+
+        def row(i):
+            return row_base + (self.lane_id // 16) * 4 + i * TILE
+
+        def col(half):
+            return col_base + (self.lane_id % 16) * 8 + half * 4
+
+        return [op(self.sa_rsrc, lambda i=i: row(i)) for i in range(WAVE_TILES)] + [
+            op(self.sb_rsrc, lambda h=h: col(h)) for h in (0, 1)
+        ]
 
     def _store_bf16x8(self, values, c_index):
         fx.memref_store_vec(values, self.reg_bf16_8)
@@ -196,13 +227,12 @@ class StoreCInt8Rows(StoreC):
             fx.slice(self.c_div, (None, fx.Int32(c_index))),
         )
 
-    def store_tiles(self, accs, row_base, col_base):
+    def store_tiles(self, accs, row_base, col_base, scales):
+        """``scales`` comes from ``scale_load_ops`` and must have landed."""
         row0 = row_base + (self.lane_id // 16) * 4
         col = col_base + (self.lane_id % 16) * 8
-        a_scales = [
-            self._load_scale_vec4(row0 + i * TILE) for i in range_constexpr(WAVE_TILES)
-        ]
-        b_lo, b_hi = self._load_b_scale_vec4(col), self._load_b_scale_vec4(col + 4)
+        a_scales = [Vec(s) for s in scales[:WAVE_TILES]]
+        b_lo, b_hi = (Vec(s) for s in scales[WAVE_TILES:])
         b_scales = Vec.from_elements(
             [b_lo[j] for j in range(4)] + [b_hi[j] for j in range(4)], fx.Float32
         )
@@ -272,11 +302,21 @@ def _mfma_drain(accs):
     ]
 
 
-def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
+def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
+    """``num_cu > 0`` makes the kernel persistent over that many workgroups.
+
+    A persistent workgroup loads the first two K tiles of its next output
+    block during the last two of the current one, so the next block's K loop
+    starts while the epilogue runs. That needs an even number of K tiles, so
+    the next block's first tile lands in LDS buffer 0; otherwise each
+    workgroup takes one block.
+    """
     assert K % BLOCK_K == 0 and K >= 2 * BLOCK_K
     K_ITERS = K // BLOCK_K
     B_K_STEP = 16 * BLOCK_K  # bytes per K128 tile inside a preshuffled 16-row strip
     HALF = WAVE_TILES // 2
+    persistent = num_cu > 0 and K_ITERS % 2 == 0
+    assert not persistent or num_cu % 8 == 0
 
     # Quadrants of the wave's tile grid by (A half, B half).
     def quadrant(a_half, b_half):
@@ -310,12 +350,21 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
     # waves' loads do not crowd one phase. At phase 3's wait, the A loads are
     # the only ones issued after tile t + 1's.
     P3_VMCNT = LOADS_PER_REGION
+    # In a persistent workgroup, the previous block's epilogue (four stores
+    # per A tile) also comes between tile 1's loads and tile 0's phase 3 wait.
+    P3_VMCNT_TILE0 = P3_VMCNT + 4 * WAVE_TILES if persistent else P3_VMCNT
+    # The epilogue's scale loads go in phase 1 of tile K_ITERS - 2, ahead of
+    # the next block's LDS-DMA loads, and add to that tile's phase 3 wait.
+    # Tile K_ITERS - 1's phase 3 wait, or with no next block tile
+    # K_ITERS - 2's wait for everything, then covers them.
+    SCALE_LOADS = StoreCInt8Rows.SCALE_LOADS
+    assert P3_VMCNT_TILE0 + SCALE_LOADS <= 63
     # Phase 1's last A-hi reads must land before its barrier.
     P1_READS_END = len(PHASE_MFMAS[0]) - 6
 
     _kname = (
         f"flydsl_bpreshuffle_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_I8_I8_B16_"
-        f"1x{xcd_swizzle}_k{K}"
+        f"1x{xcd_swizzle}_k{K}" + (f"_p{num_cu}" if persistent else "")
     )
 
     @fx.struct
@@ -335,7 +384,9 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
         c_m: fx.Int32,
         c_n: fx.Int32,
     ):
+        m_blocks = ceildiv(c_m, BLOCK_M)
         n_blocks = ceildiv(c_n, BLOCK_N)
+        num_blocks = m_blocks * n_blocks
 
         lds = fx.SharedAllocator().allocate(SharedStorage).peek()
         a_lds = (lds.A_lds_0, lds.A_lds_1)
@@ -345,31 +396,42 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
         wave_id = fx.thread_idx.x // 64
         wave_m = wave_id // 2
         wave_n = wave_id % 2
-        if const_expr(xcd_swizzle > 0):
-            block_m, block_n = _xcd_swizzle_any(
-                ceildiv(c_m, BLOCK_M), n_blocks, wgm=xcd_swizzle
-            )
-        else:
-            block_m, block_n = split_row_major_2d(fx.block_idx.x, n_blocks)
+
+        def block_coords(block):
+            # A persistent grid is a multiple of 8 workgroups or covers all
+            # blocks, so block b runs on the XCD of workgroup b % 8.
+            if const_expr(xcd_swizzle > 0):
+                return _xcd_swizzle_any(m_blocks, n_blocks, xcd_swizzle, block)
+            return split_row_major_2d(block, n_blocks)
 
         m0_state = [None]
-        a_g2s = G2SGlobal(
-            A,
-            _lane_offsets(lane_id, wave_id, K, False, block_m * BLOCK_M, c_m),
-            wave_id,
-            A_BLOCK_STRIDE,
-            a_lds,
-            m0_state,
-        )
-        b_g2s = G2SGlobal(
-            B_T,
-            _lane_offsets(lane_id, wave_id, K, True, block_n * BLOCK_N, c_n),
-            wave_id,
-            B_BLOCK_STRIDE,
-            b_lds,
-            m0_state,
-        )
+        a_g2s = G2SGlobal(A, wave_id, A_BLOCK_STRIDE, a_lds, m0_state)
+        b_g2s = G2SGlobal(B_T, wave_id, B_BLOCK_STRIDE, b_lds, m0_state)
         s2r = S2RLoader(wave_m, WAVE_TILES)
+
+        def voffset_ops(coords, voffsets):
+            """Ops appending the block's A and B LDS-DMA offsets to ``voffsets``.
+
+            ``coords`` holds (block_m, block_n) by the time the first op runs.
+            """
+
+            def op(g2s, preshuffled, step):
+                def emit():
+                    row0, n_rows = (
+                        (coords[1] * BLOCK_N, c_n)
+                        if preshuffled
+                        else (coords[0] * BLOCK_M, c_m)
+                    )
+                    lane_offset = _lane_offset(
+                        lane_id, wave_id, K, preshuffled, row0, n_rows, step
+                    )
+                    voffsets[int(preshuffled)].append(g2s.voffset(step, lane_offset))
+
+                return emit
+
+            return [op(a_g2s, False, s) for s in range(LOADS_PER_REGION)] + [
+                op(b_g2s, True, s) for s in range(LOADS_PER_REGION)
+            ]
 
         # Operand (tile, kk): lane l reads k16 chunk kk * K_GROUPS + l // 16 of
         # A row l % 16 of the tile, or of B row 8 * (l % 16) + tile of the wave.
@@ -390,12 +452,13 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
         ]
 
         # K tile t lives in LDS buffer t % 2; ``buf`` is that parity, static
-        # even where t is the loop's runtime value.
-        def a_loads(tile_k, buf):
-            return a_g2s.ops(buf, tile_k * BLOCK_K, range(LOADS_PER_REGION))
-
-        def b_loads(tile_k, buf):
-            return b_g2s.ops(buf, tile_k * B_K_STEP, range(LOADS_PER_REGION))
+        # even where t is the loop's runtime value. ``voffsets`` (A, B) picks
+        # the output block.
+        def tile_loads(voffsets, tile_k, buf):
+            return (
+                a_g2s.ops(voffsets[0], buf, tile_k * BLOCK_K),
+                b_g2s.ops(voffsets[1], buf, tile_k * B_K_STEP),
+            )
 
         a_ops = [[None] * K_STEPS for _ in range(WAVE_TILES)]
         b_ops = [[None] * K_STEPS for _ in range(WAVE_TILES)]
@@ -457,8 +520,13 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
                 + [b_read(buf, j, kk) for kk in K_SECOND for j in range(HALF)]
             )
 
-        def k_tile(t, buf, refill, has_next):
-            """One K128 tile; ``refill`` loads tile t + 2 into the freed buffer."""
+        def k_tile(buf, refill, has_next, p3_vmcnt=P3_VMCNT, p1_ops=(), p3_ops=()):
+            """One K128 tile.
+
+            ``refill`` (voffsets, tile_k) loads the K tile two ahead into the
+            freed buffer; ``has_next`` reads the next one's lo operands.
+            ``p1_ops`` go after phase 1's reads, ``p3_ops`` over phase 3.
+            """
             a_hi_reads = [
                 a_read(buf, HALF + i, kk) for kk in ALL_K for i in range(HALF)
             ]
@@ -466,15 +534,12 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
                 b_read(buf, HALF + j, kk) for kk in ALL_K for j in range(HALF)
             ]
             p2_loads, p4_loads = [], []
-            if const_expr(refill):
-                p2_loads = a_loads(t + 2, buf)
-                p4_loads = b_loads(t + 2, buf)
+            if const_expr(refill is not None):
+                p2_loads, p4_loads = tile_loads(*refill, buf)
 
-            run_phase(
-                PHASE_MFMAS[0],
-                spread(a_hi_reads, 0, P1_READS_END),
-                wait=(None, 0),
-            )
+            p1_placed = spread(a_hi_reads, 0, P1_READS_END)
+            p1_placed += spread(list(p1_ops), P1_READS_END, len(PHASE_MFMAS[0]) - 1)
+            run_phase(PHASE_MFMAS[0], p1_placed, wait=(None, 0))
             rocdl.s_barrier()
             p2_ops = interleave(p2_loads, b_hi_reads)
             run_phase(
@@ -484,8 +549,9 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
             )
             rocdl.s_barrier()
             if const_expr(has_next):
-                p3_vmcnt = P3_VMCNT if refill else 0
-                run_phase(PHASE_MFMAS[2], [], wait=(p3_vmcnt, None))
+                p3_placed = spread(list(p3_ops), 0, len(PHASE_MFMAS[2]) - 2)
+                p3_wait = p3_vmcnt if refill is not None else 0
+                run_phase(PHASE_MFMAS[2], p3_placed, wait=(p3_wait, None))
                 rocdl.s_barrier()
                 p4_ops = interleave(p4_loads, lo_reads(1 - buf))
                 run_phase(PHASE_MFMAS[3], spread(p4_ops, 0, len(PHASE_MFMAS[3]) - 2))
@@ -493,20 +559,12 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
                 run_phase(PHASE_MFMAS[2], [])
                 run_phase(PHASE_MFMAS[3], [])
 
-        # Values live across a tile boundary: the accumulators and the next
-        # tile's lo operands.
-        def live_state():
-            return (
-                [accs[i][j] for i in range(WAVE_TILES) for j in range(WAVE_TILES)]
-                + [a_ops[i][kk] for i in range(HALF) for kk in ALL_K]
-                + [b_ops[j][kk] for j in range(HALF) for kk in ALL_K]
-            )
+        def lo_state():
+            return [a_ops[i][kk] for i in range(HALF) for kk in ALL_K] + [
+                b_ops[j][kk] for j in range(HALF) for kk in ALL_K
+            ]
 
-        def set_state(values):
-            values = list(values)
-            for i in range_constexpr(WAVE_TILES):
-                for j in range_constexpr(WAVE_TILES):
-                    accs[i][j] = values.pop(0)
+        def set_lo_state(values):
             for i in range_constexpr(HALF):
                 for kk in range_constexpr(K_STEPS):
                     a_ops[i][kk] = values.pop(0)
@@ -514,40 +572,135 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
                 for kk in range_constexpr(K_STEPS):
                     b_ops[j][kk] = values.pop(0)
 
-        # Prologue: tiles 0 and 1 in flight, wait for tile 0, read its lo operands.
-        for t in range_constexpr(2):
-            for op in a_loads(t, t) + b_loads(t, t):
-                op()
-        rocdl.s_waitcnt(vmcnt=2 * LOADS_PER_REGION)
-        rocdl.s_barrier()
-        for op in lo_reads(0):
-            op()
+        # Values live across a K tile boundary: the accumulators and the next
+        # tile's lo operands.
+        def live_state():
+            accs_flat = [
+                accs[i][j] for i in range(WAVE_TILES) for j in range(WAVE_TILES)
+            ]
+            return accs_flat + lo_state()
 
-        # Tiles 0 and 1 start the accumulators. A runtime loop then takes the
-        # tiles that refill, two per trip so the buffer parity is static; a
-        # fully unrolled K loop overflows the instruction cache.
-        n_pairs = max(0, (K_ITERS - 4) // 2)
-        for t in range_constexpr(2):
-            k_tile(t, t, t + 2 < K_ITERS, t + 1 < K_ITERS)
-        if const_expr(n_pairs > 0):
-            for pair, state in range(0, n_pairs, 1, init=live_state()):
-                set_state(state)
-                t0 = fx.Int32(pair) * 2 + 2
-                k_tile(t0, 0, True, True)
-                k_tile(t0 + 1, 1, True, True)
-                results = yield live_state()
-            set_state(results)
-        for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
-            k_tile(t, t % 2, t + 2 < K_ITERS, t + 1 < K_ITERS)
+        def set_state(values):
+            values = list(values)
+            for i in range_constexpr(WAVE_TILES):
+                for j in range_constexpr(WAVE_TILES):
+                    accs[i][j] = values.pop(0)
+            set_lo_state(values)
 
         store_c = StoreCInt8Rows(
             A_scale, B_scale, C, c_m, c_n, None, WAVE_TILES, WAVE_TILES
         )
-        store_c.store_tiles(
-            _mfma_drain(accs),
-            block_m * BLOCK_M + wave_m * WAVE_ROWS,
-            block_n * BLOCK_N + wave_n * WAVE_ROWS,
-        )
+
+        # Prologue: the first block's K tiles 0 and 1 in flight, wait for
+        # tile 0, read its lo operands. Tile 0's phase 3 wait in a persistent
+        # workgroup counts on an epilogue before it, so the first block also
+        # waits for tile 1 here.
+        block0 = fx.Int32(fx.block_idx.x)
+        coords = list(block_coords(block0))
+        voffsets = ([], [])
+        for op in voffset_ops(coords, voffsets):
+            op()
+        for t in range_constexpr(2):
+            a_loads, b_loads = tile_loads(voffsets, t, t)
+            for op in a_loads + b_loads:
+                op()
+        rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
+        rocdl.s_barrier()
+        for op in lo_reads(0):
+            op()
+
+        # Values live across an output block boundary: its coordinates and
+        # offsets, and the lo operands of its first K tile.
+        def block_state():
+            return coords + voffsets[0] + voffsets[1] + lo_state()
+
+        def set_block_state(values):
+            values = list(values)
+            coords[:] = [values.pop(0) for _ in range(2)]
+            for v in voffsets:
+                v[:] = [values.pop(0) for _ in range(LOADS_PER_REGION)]
+            set_lo_state(values)
+
+        def static_tile(t, next_voffsets, next_ops, scale_ops):
+            """K tile ``t`` of a block, outside the runtime K loop.
+
+            The last two refill from the next block at ``next_voffsets``;
+            tile 0 spreads ``next_ops`` over phase 3 and tile K_ITERS - 2
+            issues ``scale_ops``.
+            """
+            refill = None
+            if const_expr(t + 2 < K_ITERS):
+                refill = (voffsets, t + 2)
+            elif const_expr(persistent):
+                refill = (next_voffsets, t + 2 - K_ITERS)
+            p3_vmcnt = P3_VMCNT_TILE0 if t == 0 else P3_VMCNT
+            p1_ops = []
+            if const_expr(t == K_ITERS - 2):
+                p1_ops = scale_ops
+                p3_vmcnt += SCALE_LOADS
+            has_next = t + 1 < K_ITERS or persistent
+            p3_ops = next_ops if t == 0 else ()
+            k_tile(t % 2, refill, has_next, p3_vmcnt, p1_ops, p3_ops)
+
+        n_pairs = max(0, (K_ITERS - 4) // 2)
+        grid = fx.Int32(fx.grid_dim.x)
+        for block, bstate in range(block0, num_blocks, grid, init=block_state()):
+            set_block_state(bstate)
+            for i in range_constexpr(WAVE_TILES):
+                for j in range_constexpr(WAVE_TILES):
+                    accs[i][j] = None
+
+            # The next block's coordinates and offsets, computed during tile
+            # 0's phase 3 unless tile 0 already loads that block. The last
+            # block reloads itself; nothing reads those loads.
+            next_coords, next_voffsets, next_ops = [], ([], []), []
+            if const_expr(persistent):
+                this_block = fx.Int32(block)
+
+                def next_coords_op(this_block=this_block, next_coords=next_coords):
+                    nxt = this_block + grid
+                    nxt = (nxt < num_blocks).select(nxt, this_block)
+                    next_coords.extend(block_coords(nxt))
+
+                next_ops = [next_coords_op] + voffset_ops(next_coords, next_voffsets)
+                if const_expr(K_ITERS == 2):
+                    for op in next_ops:
+                        op()
+                    next_ops = []
+
+            row_base = coords[0] * BLOCK_M + wave_m * WAVE_ROWS
+            col_base = coords[1] * BLOCK_N + wave_n * WAVE_ROWS
+            scales = []
+            scale_ops = store_c.scale_load_ops(row_base, col_base, scales)
+            tile_args = (next_voffsets, next_ops, scale_ops)
+
+            # Tiles 0 and 1 start the accumulators. A runtime loop then takes
+            # the tiles that refill from this block, two per trip so the
+            # buffer parity is static; a fully unrolled K loop overflows the
+            # instruction cache.
+            static_tile(0, *tile_args)
+            static_tile(1, *tile_args)
+            if const_expr(n_pairs > 0):
+                for pair, state in range(0, n_pairs, 1, init=live_state()):
+                    set_state(state)
+                    t0 = fx.Int32(pair) * 2 + 2
+                    k_tile(0, (voffsets, t0 + 2), True)
+                    k_tile(1, (voffsets, t0 + 3), True)
+                    results = yield live_state()
+                set_state(results)
+            for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
+                static_tile(t, *tile_args)
+
+            store_c.store_tiles(_mfma_drain(accs), row_base, col_base, scales)
+            if const_expr(persistent):
+                coords[:] = next_coords
+                for v, nv in zip(voffsets, next_voffsets):
+                    v[:] = nv
+            _ = yield block_state()
+
+        if const_expr(persistent):
+            # LDS-DMA must not land in LDS that a later workgroup owns.
+            rocdl.s_waitcnt(vmcnt=0)
 
     @flyc.jit
     def launch_gemm(
@@ -561,6 +714,8 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
         stream: fx.Stream,
     ):
         grid_x = ceildiv(c_m, BLOCK_M) * ceildiv(c_n, BLOCK_N)
+        if const_expr(persistent):
+            grid_x = (grid_x > num_cu).select(fx.Int32(num_cu), grid_x)
         kernel_gemm(
             A,
             B_T,

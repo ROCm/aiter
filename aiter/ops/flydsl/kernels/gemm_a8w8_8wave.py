@@ -392,11 +392,16 @@ class Mfma16x16x64Int8:
         return c_values
 
 
-def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm):
-    """XCD-aware tile remap that works for any workgroup count. This function is used to swizzle the tile indices to improve the L2 reuse."""
+def _xcd_swizzle_any(num_pid_m, num_pid_n, wgm, wgid=None):
+    """XCD-aware tile remap that works for any workgroup count. This function is used to swizzle the tile indices to improve the L2 reuse.
+
+    ``wgid`` defaults to the workgroup index; a persistent kernel passes its
+    tile index, which must lie on the XCD of index ``wgid % 8``.
+    """
     NUM_XCDS = 8
 
-    wgid = fx.block_idx.x
+    if wgid is None:
+        wgid = fx.block_idx.x
     num_wg = num_pid_m * num_pid_n
 
     # Hardware dispatches workgroup i to XCD (i % NUM_XCDS). Invert that so
