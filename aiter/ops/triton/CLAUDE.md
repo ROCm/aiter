@@ -7,3 +7,4 @@ for example when the repository root has a `CLAUDE.md`.
 @configs/AGENTS.md
 @../../../op_tests/triton_tests/AGENTS.md
 @../../../op_tests/op_benchmarks/triton/AGENTS.md
+@utils/_triton/tuning/AGENTS.md

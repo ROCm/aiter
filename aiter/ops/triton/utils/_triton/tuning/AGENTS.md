@@ -1,7 +1,7 @@
 # Tuning scripts: rules for automated edits
 
 Scope: every file in `aiter/ops/triton/utils/_triton/tuning/`. The config tree these scripts write
-into has its own rulebook, `aiter/ops/triton/configs/CLAUDE.md`; read both before changing anything
+into has its own rulebook, `aiter/ops/triton/configs/AGENTS.md`; read both before changing anything
 here. Update this file in the same change as any behaviour change.
 
 ## File map
@@ -43,7 +43,7 @@ here. Update this file in the same change as any behaviour change.
    above the largest bound are not tuned. Every installed file ships an `any`: a copy of
    `DEFAULT.json`'s `any`, rewritten on every install (the one bucket copied from `DEFAULT.json`;
    a tuned small-M tile as fallback breaks kernels such as MXFP4 preshuffle at M >= 32).
-   `DEFAULT.json` is never written, so its `any` never changes; `M_GEQ_*` is never generated;
+   `DEFAULT.json` is never written, so its `any` never changes; only `M_LEQ_*` buckets are tuned;
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
    restored. Bucket collisions are resolved before writing (largest M wins).

@@ -11,6 +11,7 @@ them before you change or review code here.
 | ---- | --------- |
 | `aiter/ops/triton/README.md` | Kernels, configs, tests, benchmarks, comments and PRs |
 | `aiter/ops/triton/configs/AGENTS.md` | Config files and config loaders |
+| `aiter/ops/triton/utils/_triton/tuning/AGENTS.md` | Tuning scripts |
 | `op_tests/triton_tests/README.md` | Unit tests |
 | `.github/instructions/aiter-ops-triton.instructions.md` | Code review checks |
 
