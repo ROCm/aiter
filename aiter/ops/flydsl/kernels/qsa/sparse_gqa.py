@@ -271,7 +271,7 @@ def build_qsa_sparse_gqa_module(
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
     merge_threads = _merge_threads(head_dim, n_splits)
-    # Same predicate qsa_sparse_gqa_serves applies to the selected launch. Raising
+    # Same predicate qsa_sparse_gqa_supported applies to the selected launch. Raising
     # here keeps a direct builder call from StopIteration on an empty gather
     # or from compiling a kernel that writes only a prefix of D.
     coverage = _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)

@@ -4,7 +4,7 @@
 """FlyDSL indexer-select kernels for QSA.
 
 ``build_qsa_indexer_emit_module`` writes block ids when every row fits in the
-budget. ``build_qsa_indexer_scores_module`` and
+budget. ``build_qsa_indexer_decode_scores_module`` and
 ``build_qsa_indexer_prefill_scores_module`` are the one-row and 16-row BF16
 MFMA scorers. ``build_qsa_indexer_active_columns_module`` reports the widest
 visible column count. Host dispatch and top-512 selection live in
@@ -165,7 +165,7 @@ def _qk_mfma(qk_mma, qk_a, qk_b, qk_c, a_vec, b_vec, c_vec):
     return fx.memref_load_vec(qk_c)
 
 
-def build_qsa_indexer_scores_module(
+def build_qsa_indexer_decode_scores_module(
     page_size: int,
     use_k32: bool,
     block_n: int,

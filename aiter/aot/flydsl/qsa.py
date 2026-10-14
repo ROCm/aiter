@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""AOT warm set for family A QSA at TP1.
+"""AOT warm set for Flash-Next QSA at TP1.
 
 Six jobs, not complete coverage. The indexer is the page-16 emit kernel, the
 4-head one-row scorer (decode M=1 and M=8 share it), and the 4-head
@@ -31,17 +31,17 @@ from aiter.aot.flydsl.common import compile_only_env, override_env
 _QSA_ARCHS = ("gfx942", "gfx950")
 
 # (kernel_name, op, m, seq_len). Sparse GQA width and head counts are family A.
-_FAMILY_A_LAUNCHES = (
-    ("qsa_indexer_emit_family_a", "indexer", 1, 512),
-    ("qsa_indexer_long_row_family_a_decode", "indexer", 1, 32768),
-    ("qsa_indexer_long_row_family_a_prefill", "indexer", 512, 8192),
-    ("qsa_sparse_gqa_family_a_m1_l32768", "sparse_gqa", 1, 32768),
-    ("qsa_sparse_gqa_family_a_m8_l32768", "sparse_gqa", 8, 32768),
-    ("qsa_sparse_gqa_family_a_m512_l8192", "sparse_gqa", 512, 8192),
+_FLASH_NEXT_LAUNCHES = (
+    ("qsa_indexer_emit_flash_next", "indexer", 1, 512),
+    ("qsa_indexer_long_row_flash_next_decode", "indexer", 1, 32768),
+    ("qsa_indexer_long_row_flash_next_prefill", "indexer", 512, 8192),
+    ("qsa_sparse_gqa_flash_next_m1_l32768", "sparse_gqa", 1, 32768),
+    ("qsa_sparse_gqa_flash_next_m8_l32768", "sparse_gqa", 8, 32768),
+    ("qsa_sparse_gqa_flash_next_m512_l8192", "sparse_gqa", 512, 8192),
 )
 
 
-def default_jobs(launches=_FAMILY_A_LAUNCHES):
+def default_jobs(launches=_FLASH_NEXT_LAUNCHES):
     """One job per launch. An empty launch list is an empty job list."""
     jobs = []
     for kernel_name, op, rows, seq_len in launches:

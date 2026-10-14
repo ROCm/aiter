@@ -46,9 +46,9 @@ from .kernels.qsa.indexer_select import (
     _SCORE_SCALE,
     _STREAM_SELECT_MIN_COLUMNS,
     build_qsa_indexer_active_columns_module,
+    build_qsa_indexer_decode_scores_module,
     build_qsa_indexer_emit_module,
     build_qsa_indexer_prefill_scores_module,
-    build_qsa_indexer_scores_module,
 )
 from .kernels.qsa.sparse_gqa import (
     _TINY_SPLITS,
@@ -83,7 +83,7 @@ def _qsa_arch() -> str:
 # GQA query ``(n_q_heads, head_dim)`` -> the indexer head counts swept with
 # it. An unswept rank-3 pair still runs; the table only feeds the warning.
 # The measured thing is the pair.
-_MEASURED_QUERIES = {
+_FLYDSL_DISPATCH_TABLE = {
     (24, 256): (4, 8),  # Flash-Next / qwen4_exp, TP1
     (12, 256): (4, 8),  # Flash-Next TP2: 12 query heads, 1 KV head
     (6, 256): (4, 8),  # Flash-Next TP4: 6 query heads, 1 KV head
@@ -153,7 +153,7 @@ def _warn_unmeasured_query(q_indexer: torch.Tensor, q_gqa: torch.Tensor) -> None
     if pair is None:
         return
     gqa_key, index_heads = pair
-    allowed = _MEASURED_QUERIES.get(gqa_key)
+    allowed = _FLYDSL_DISPATCH_TABLE.get(gqa_key)
     if allowed is None or index_heads not in allowed:
         _log_unmeasured_gqa_query(gqa_key, index_heads)
 
@@ -181,9 +181,9 @@ def _expand_block_ids(
 ) -> torch.Tensor:
     # Phase 5 owns fusing expand into K1 or K2. Until then this is the
     # vendored expand+tail kernel.
-    from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices_cuda
+    from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices
 
-    return expand_qsa_block_indices_cuda(
+    return expand_qsa_block_indices(
         block_ids,
         query_positions,
         context_lens,
@@ -208,7 +208,7 @@ def _scores_plan(
     wide_cache: bool = False,
     k_strides: tuple[int, int, int] | None = None,
 ):
-    return build_qsa_indexer_scores_module(
+    return build_qsa_indexer_decode_scores_module(
         page_size, use_k32, block_n, n_heads, wide_cache, k_strides
     )
 
@@ -481,13 +481,13 @@ def qsa_indexer_score_and_select(
     return out
 
 
-def qsa_indexer_serves(
+def qsa_indexer_supported(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
     heads: tuple[int, ...] = _SCORE_HEADS,
 ) -> str | None:
-    """Why the indexer kernel cannot serve these tensors, or None if it can.
+    """Why the indexer kernel does not support these tensors, or None if it does.
 
     ``heads`` narrows the accepted indexer head count; pass ``(4,)`` to
     reject the 8-head variant. Every other check is the same either way.
@@ -521,7 +521,7 @@ def qsa_indexer_serves(
     return None
 
 
-def qsa_indexer_selection_serves(token_topk: int, compress_ratio: int) -> str | None:
+def qsa_indexer_selection_supported(token_topk: int, compress_ratio: int) -> str | None:
     """Why this token budget is outside the baked K1 contract, or None.
 
     K1 writes ``[_K]`` block ids and divides positions by ``_R``. Expand
@@ -568,7 +568,7 @@ def qsa_indexer_block_ids(
     ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
     narrow; the ``(4, 8)`` default also admits the 8-head indexer.
     """
-    reason = qsa_indexer_serves(q, k_cache, page_table, heads)
+    reason = qsa_indexer_supported(q, k_cache, page_table, heads)
     if reason is not None:
         raise ValueError(f"[FlyDSL qsa_indexer_block_ids] {reason}")
     m = q.shape[0]
@@ -697,14 +697,14 @@ def _plan(
     )
 
 
-def qsa_sparse_gqa_serves(
+def qsa_sparse_gqa_supported(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     indices: torch.Tensor,
     page_table: torch.Tensor,
 ) -> str | None:
-    """Why the sparse GQA kernel cannot serve these tensors, or None if it can."""
+    """Why the sparse GQA kernel does not support these tensors, or None if it does."""
     if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
         return f"q and caches must be bfloat16, got {q.dtype} and {k_cache.dtype}"
     if v_cache.dtype != k_cache.dtype or v_cache.shape != k_cache.shape:
@@ -811,7 +811,7 @@ def qsa_sparse_gqa(
     gather width, so a ``-1`` suffix is not scanned and does not launch
     an empty workgroup. A live token at or past ``n_sel`` is not read.
     """
-    reason = qsa_sparse_gqa_serves(q, k_cache, v_cache, indices, page_table)
+    reason = qsa_sparse_gqa_supported(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
         raise ValueError(f"[FlyDSL qsa_sparse_gqa] {reason}")
     rows = q.shape[0]
@@ -1007,7 +1007,7 @@ def qsa_layer(
     Returns:
         Sparse GQA output, bf16 ``[M, Hq, D]``.
     """
-    reason = qsa_indexer_selection_serves(token_topk, compress_ratio)
+    reason = qsa_indexer_selection_supported(token_topk, compress_ratio)
     if reason is not None:
         raise ValueError(reason)
     _warn_unmeasured_query(q_indexer, q_gqa)

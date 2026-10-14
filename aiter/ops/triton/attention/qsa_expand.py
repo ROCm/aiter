@@ -31,7 +31,7 @@ def _unit_stride_int32(
     return tensor.contiguous()
 
 
-def expand_qsa_block_indices_cuda(
+def expand_qsa_block_indices(
     block_indices: torch.Tensor,
     query_positions: torch.Tensor,
     sequence_lengths: torch.Tensor,
@@ -114,5 +114,5 @@ def expand_qsa_block_indices_cuda(
 
 __all__ = [
     "QSA_EXPAND_PIN",
-    "expand_qsa_block_indices_cuda",
+    "expand_qsa_block_indices",
 ]

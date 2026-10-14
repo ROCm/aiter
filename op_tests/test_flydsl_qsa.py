@@ -6,15 +6,15 @@
 Two layers:
   * Correctness (pytest): ``test_*`` unit cases. CI runs pytest on this
     file, then this script for the sweep. ``main`` only sweeps.
-  * Perf sweep (``__main__``): ``bench_qsa_family_a_k1`` (decode ``M<=8``
+  * Perf sweep (``__main__``): ``bench_qsa_flash_next_k1`` (decode ``M<=8``
     and a separate prefill table; HIP-graph select column for FlyDSL when
     the table is wider than 20000 columns and ``M<=64``),
-    ``bench_qsa_family_b_k1`` (H=8 emit; long-``L`` is H=8; the published
+    ``bench_qsa_gluon_parity_k1`` (H=8 emit; long-``L`` is H=8; the published
     page-size-8 point stays H=4),
-    ``bench_qsa_family_a_k2`` (3d decode ``M<=8`` and a separate prefill table),
-    ``bench_qsa_family_a_e2e`` / ``bench_qsa_family_b_e2e`` (indexer through
-    GQA; family B keeps both head counts),
-    ``bench_qsa_family_a_e2e_graph`` (HIP graph replay at decode).
+    ``bench_qsa_flash_next_k2`` (3d decode ``M<=8`` and a separate prefill table),
+    ``bench_qsa_flash_next_e2e`` / ``bench_qsa_gluon_parity_e2e`` (indexer through
+    GQA; Gluon-parity keeps both head counts),
+    ``bench_qsa_flash_next_e2e_graph`` (HIP graph replay at decode).
 
 Usage::
 
@@ -54,10 +54,10 @@ from aiter.ops.flydsl.qsa import (
     qsa_indexer_block_ids,
     qsa_layer,
     qsa_sparse_gqa,
-    qsa_sparse_gqa_serves,
+    qsa_sparse_gqa_supported,
     span_bytes,
 )
-from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices_cuda
+from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -75,12 +75,12 @@ from op_tests.qsa_ref import (
     qsa_sparse_gqa as sparse_gqa_ref,
 )
 from op_tests.qsa_shapes import (
-    FAMILY_A_GQA,
-    FAMILY_A_INDEXER,
-    FAMILY_A_SCORE_SCALE,
-    FAMILY_B_GQA,
-    FAMILY_B_INDEXER,
-    FAMILY_B_INDEXER_H8,
+    FLASH_NEXT_GQA,
+    FLASH_NEXT_INDEXER,
+    FLASH_NEXT_SCORE_SCALE,
+    GLUON_PARITY_GQA,
+    GLUON_PARITY_INDEXER,
+    GLUON_PARITY_INDEXER_H8,
 )
 
 SUPPORTED_GFX = ["gfx942", "gfx950"]
@@ -184,7 +184,7 @@ def test_wide_cache_layout_spans_past_4gib():
             raise
     else:
         raise AssertionError("an unknown cache layout was accepted")
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     page_size = 16
     for n_pages in (1, 3):
         n_blocks = n_pages * page_size
@@ -210,7 +210,7 @@ def test_wide_cache_layout_spans_past_4gib():
             raise AssertionError("wide view changed the packed pages")
         q = torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
         table = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
-        reason = qsa_k1_host.qsa_indexer_serves(q, view, table, (4,))
+        reason = qsa_k1_host.qsa_indexer_supported(q, view, table, (4,))
         if reason is not None:
             raise AssertionError(f"wide indexer cache was rejected: {reason}")
         if span_bytes(view.clone()) > _FOUR_GIB:
@@ -313,7 +313,7 @@ def test_topk_smaller_index_wins_ties():
     assert block_ids.tolist() == [[0, 1]]
 
     scaled = qsa_indexer_scores(
-        q, k_bar, qpos, slen, req, r, score_scale=FAMILY_A_SCORE_SCALE
+        q, k_bar, qpos, slen, req, r, score_scale=FLASH_NEXT_SCORE_SCALE
     )
     assert qsa_topk_blocks(scaled, k=2).tolist() == [[0, 1]]
 
@@ -353,10 +353,10 @@ def test_gqa_matches_dense_on_selected():
     assert abs(got[1][1] - expect_h1[1]) < 1e-5
 
 
-def test_family_a_shapes_smoke():
+def test_flash_next_shapes_smoke():
     """Family A ABI with a short context (8 blocks << 512)."""
-    idx = FAMILY_A_INDEXER
-    gqa = FAMILY_A_GQA
+    idx = FLASH_NEXT_INDEXER
+    gqa = FLASH_NEXT_GQA
     m = 1
     n_blocks = 8
     seq = n_blocks * idx.compress_ratio  # 32
@@ -457,7 +457,7 @@ def _selected_width(indices: torch.Tensor) -> float:
     return float((indices >= 0).sum().item()) / indices.shape[0]
 
 
-def _pack_family_a(k_bar, k, v, page_size, device):
+def _pack_flash_next(k_bar, k, v, page_size, device):
     gen_i = torch.Generator(device=device)
     gen_i.manual_seed(1)
     gen_kv = torch.Generator(device=device)
@@ -623,7 +623,7 @@ def _k1_ids_match_oracle(n_heads, m, seq_len, page_size, what, min_blocks=0):
     """Public K1 block ids for ``n_heads`` match the oracle on this shape."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER if n_heads == 4 else FAMILY_B_INDEXER_H8
+    idx = FLASH_NEXT_INDEXER if n_heads == 4 else GLUON_PARITY_INDEXER_H8
     if idx.n_heads != n_heads:
         raise AssertionError(f"indexer fixture has {idx.n_heads} heads, want {n_heads}")
     device = torch.device("cuda")
@@ -651,7 +651,7 @@ def _k1_ids_match_oracle(n_heads, m, seq_len, page_size, what, min_blocks=0):
             slen,
             token_to_req,
             idx.compress_ratio,
-            score_scale=FAMILY_A_SCORE_SCALE,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
         ),
         idx.block_budget,
     )
@@ -667,7 +667,7 @@ def _k1_ids_match_oracle(n_heads, m, seq_len, page_size, what, min_blocks=0):
     _assert_k1_block_ids(ref_ids, got, what)
 
 
-def test_k1_family_a_set_equality_short_decode():
+def test_k1_flash_next_set_equality_short_decode():
     """FlyDSL K1 block-id sets match the oracle on short decode, for H=4 and H=8."""
     for n_heads in (4, 8):
         _k1_ids_match_oracle(
@@ -675,7 +675,7 @@ def test_k1_family_a_set_equality_short_decode():
         )
 
 
-def test_k1_family_a_set_equality_two_tiles():
+def test_k1_flash_next_set_equality_two_tiles():
     """H=4 and H=8 match the oracle when n_blocks exceeds one 512-slot tile."""
     for n_heads in (4, 8):
         _k1_ids_match_oracle(
@@ -688,11 +688,11 @@ def test_k1_family_a_set_equality_two_tiles():
         )
 
 
-def test_k1_family_a_set_equality_wide_stream():
+def test_k1_flash_next_set_equality_wide_stream():
     """FlyDSL K1 matches the oracle on 128k rows that take streaming radix."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     m, seq_len, page_size = 1, 131072, 16
     n_blocks = seq_len // idx.compress_ratio
@@ -716,7 +716,7 @@ def test_k1_family_a_set_equality_wide_stream():
         slen,
         token_to_req,
         idx.compress_ratio,
-        score_scale=FAMILY_A_SCORE_SCALE,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
     got = qsa_indexer_block_ids(
@@ -733,7 +733,7 @@ def test_k1_family_a_set_equality_wide_stream():
     )
 
 
-def test_k1_family_a_set_equality_prefill():
+def test_k1_flash_next_set_equality_prefill():
     """Single-request prefill at M=512 matches the oracle for H=4 and H=8.
 
     H=8 is the 16-row tile on gfx950 and the one-row scorer on gfx942.
@@ -760,7 +760,7 @@ def test_k1_prefill_padded_page_table():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     m, context, page_size, n_real_pages, n_pad = 32, 4096, 16, 64, 4
     n_blocks = context // idx.compress_ratio
@@ -786,7 +786,7 @@ def test_k1_prefill_padded_page_table():
         slen,
         token_to_req,
         idx.compress_ratio,
-        score_scale=FAMILY_A_SCORE_SCALE,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
     for name, pad_value in (("zero", 0), ("negative", -1), ("huge", 100000)):
@@ -812,7 +812,7 @@ def test_k1_table_padded_to_max_model_len():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     page_size, max_pages, context = 16, 4096, 65536
     n_blocks = context // idx.compress_ratio
@@ -838,7 +838,7 @@ def test_k1_table_padded_to_max_model_len():
                 slen,
                 token_to_req,
                 idx.compress_ratio,
-                score_scale=FAMILY_A_SCORE_SCALE,
+                score_scale=FLASH_NEXT_SCORE_SCALE,
             ),
             idx.block_budget,
         )
@@ -909,7 +909,7 @@ def test_k1_padded_decode_graph_capture():
     )
     from aiter.ops.flydsl.topk.topk_per_row import _ONE_WORKGROUP_MAX_ROW_WIDTH
 
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     page_size, max_pages = 16, 4096
     # 81920 / compress_ratio 4 = 20480 visible columns, above the compact cutoff.
@@ -966,7 +966,7 @@ def test_k1_padded_decode_graph_capture():
                 slen[:n_varied],
                 t2r[:n_varied],
                 idx.compress_ratio,
-                score_scale=FAMILY_A_SCORE_SCALE,
+                score_scale=FLASH_NEXT_SCORE_SCALE,
             ),
             idx.block_budget,
         )
@@ -978,7 +978,7 @@ def test_k1_padded_decode_graph_capture():
                 slen[n_varied:],
                 tie_req,
                 idx.compress_ratio,
-                score_scale=FAMILY_A_SCORE_SCALE,
+                score_scale=FLASH_NEXT_SCORE_SCALE,
             ),
             idx.block_budget,
         )
@@ -1026,7 +1026,7 @@ def test_k1_decode_rejects_invalid_page_ids():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     m, page_size = 4, 16
 
@@ -1072,7 +1072,7 @@ def test_k1_decode_rejects_invalid_page_ids():
         slen,
         token_to_req,
         idx.compress_ratio,
-        score_scale=FAMILY_A_SCORE_SCALE,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
     )
     block0 = bad_page * page_size
     ref_scores = ref_scores.clone()
@@ -1125,7 +1125,7 @@ def test_k1_page_past_4gib():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     page_size = 16
     page_bytes = page_size * 1 * idx.head_dim * dtypes.bf16.itemsize
@@ -1165,7 +1165,7 @@ def test_k1_page_past_4gib():
             slen,
             token_to_req,
             idx.compress_ratio,
-            score_scale=FAMILY_A_SCORE_SCALE,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
         )
         ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
         got = qsa_indexer_block_ids(
@@ -1196,7 +1196,7 @@ def test_expand_rejects_out_that_cannot_hold_the_stores():
     token_to_req = torch.zeros(rows, dtype=torch.int32, device=device)
 
     def expand(out):
-        return expand_qsa_block_indices_cuda(
+        return expand_qsa_block_indices(
             block_indices,
             query_positions,
             sequence_lengths,
@@ -1225,7 +1225,7 @@ def test_expand_rejects_out_that_cannot_hold_the_stores():
         (0, token_topk // compress_ratio), dtype=torch.int32, device=device
     )
     empty_out = torch.empty((0, output_width), dtype=torch.int32, device=device)
-    got = expand_qsa_block_indices_cuda(
+    got = expand_qsa_block_indices(
         empty_rows,
         query_positions[:0],
         sequence_lengths,
@@ -1238,7 +1238,7 @@ def test_expand_rejects_out_that_cannot_hold_the_stores():
         raise AssertionError("a matching caller out was replaced")
 
 
-def test_k1_serves_padded_page_and_rejects_misaligned():
+def test_k1_supported_padded_page_and_rejects_misaligned():
     """A padded page stride is in contract; a 16-byte gather that cannot align is not.
 
     vLLM keeps D contiguous and the token stride at D, and pads the page
@@ -1251,32 +1251,32 @@ def test_k1_serves_padded_page_and_rejects_misaligned():
     q = torch.zeros(1, 4, d, dtype=torch.bfloat16)
     table = torch.zeros(1, 1, dtype=torch.int32)
     dense = torch.zeros(n_pages, page_size, 1, d, dtype=torch.bfloat16)
-    if qsa_k1_host.qsa_indexer_serves(q, dense, table, (4,)) is not None:
+    if qsa_k1_host.qsa_indexer_supported(q, dense, table, (4,)) is not None:
         raise AssertionError("a packed indexer cache was rejected")
     page_stride = page_elems + 256
     parent = torch.empty(n_pages, page_stride, dtype=torch.bfloat16)
     view = parent.as_strided((n_pages, page_size, 1, d), (page_stride, d, d, 1))
     if view.is_contiguous():
         raise AssertionError("padded page stride should not be contiguous")
-    if qsa_k1_host.qsa_indexer_serves(q, view, table, (4,)) is not None:
+    if qsa_k1_host.qsa_indexer_supported(q, view, table, (4,)) is not None:
         raise AssertionError(f"padded page stride was rejected: {view.stride()}")
     span = span_bytes(view)
     packed = view.numel() * view.element_size()
     if span <= packed:
         raise AssertionError(f"span {span} did not exceed packed bytes {packed}")
     bad = parent.as_strided((n_pages, page_size, 1, d), (page_elems + 4, d, d, 1))
-    reason = qsa_k1_host.qsa_indexer_serves(q, bad, table, (4,))
+    reason = qsa_k1_host.qsa_indexer_supported(q, bad, table, (4,))
     if reason is None or "multiples of 8" not in reason:
         raise AssertionError(f"misaligned page stride served: {reason}")
     wide = torch.empty(n_pages, page_size, 1, d * 2, dtype=torch.bfloat16)
     strided_d = wide.as_strided(
         dense.shape, (wide.stride(0), wide.stride(1), wide.stride(2), 2)
     )
-    reason = qsa_k1_host.qsa_indexer_serves(q, strided_d, table, (4,))
+    reason = qsa_k1_host.qsa_indexer_supported(q, strided_d, table, (4,))
     if reason is None or "unit D" not in reason:
         raise AssertionError(f"strided D was served: {reason}")
     zero_page = torch.zeros(1, 0, 1, d, dtype=torch.bfloat16)
-    reason = qsa_k1_host.qsa_indexer_serves(q, zero_page, table, (4,))
+    reason = qsa_k1_host.qsa_indexer_supported(q, zero_page, table, (4,))
     if reason is None or "page_size" not in reason:
         raise AssertionError(f"zero page size was served: {reason}")
 
@@ -1302,7 +1302,7 @@ def test_k1_padded_page_stride_matches_packed():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     page_size = 16
     n_blocks = 528
@@ -1317,7 +1317,7 @@ def test_k1_padded_page_stride_matches_packed():
     if gapped.is_contiguous():
         raise AssertionError("gapped indexer cache is contiguous")
     if (
-        qsa_k1_host.qsa_indexer_serves(
+        qsa_k1_host.qsa_indexer_supported(
             torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device),
             gapped,
             index_table,
@@ -1350,7 +1350,7 @@ def test_k1_wide_padded_page_does_not_alias():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     page_size = 16
     page_elems = page_size * idx.head_dim
@@ -1402,7 +1402,7 @@ def test_k1_wide_padded_page_does_not_alias():
             slen,
             token_to_req,
             idx.compress_ratio,
-            score_scale=FAMILY_A_SCORE_SCALE,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
         )
         ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
         got = qsa_indexer_block_ids(
@@ -1413,11 +1413,11 @@ def test_k1_wide_padded_page_does_not_alias():
         )
 
 
-def test_k2_family_a_decode_matches_oracle():
+def test_k2_flash_next_decode_matches_oracle():
     """Family A FlyDSL sparse GQA decode matches the fp32 oracle on paged K/V."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     m, seq_len, page_size, width = 2, 64, 16, 8
     torch.manual_seed(0)
@@ -1453,8 +1453,8 @@ def test_k2_live_prefix_matches_full_width():
     """Walking the packed live prefix matches walking the allocated -1 tail."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
-    gqa = FAMILY_A_GQA
+    idx = FLASH_NEXT_INDEXER
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     page_size = 16
     for m, seq_len in ((1, 512), (1, 2048), (1, 8192), (8, 512), (8, 8192)):
@@ -1474,7 +1474,7 @@ def test_k2_live_prefix_matches_full_width():
         qpos = _query_positions(m, seq_len, device)
         slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
         token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-        _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_family_a(
+        _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_flash_next(
             k_bar, k, v, page_size, device
         )
         ref = qsa_oracle(
@@ -1488,7 +1488,7 @@ def test_k2_live_prefix_matches_full_width():
             token_to_req,
             idx,
             gqa,
-            score_scale=FAMILY_A_SCORE_SCALE,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
             out_dtype=dtypes.fp32,
         )
         indices = ref.indices.contiguous()
@@ -1552,11 +1552,11 @@ def test_k2_live_prefix_matches_full_width():
             )
 
 
-def test_k2_family_a_prefill_matches_oracle():
+def test_k2_flash_next_prefill_matches_oracle():
     """The BLOCK_N=64/two-wave K2 specialization matches at prefill M=512."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     m, seq_len, page_size, width = 512, 64, 16, 8
     torch.manual_seed(0)
@@ -1598,7 +1598,7 @@ def test_k2_page_past_4gib():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     page_size = 16
     page_bytes = page_size * gqa.kv_heads * gqa.head_dim * dtypes.bf16.itemsize
@@ -1664,7 +1664,7 @@ def test_k2_interleaved_kv_view_matches_contiguous():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     seq_len, page_size, width = 256, 16, 64
     for n_heads, kv_heads in (
@@ -1709,7 +1709,7 @@ def test_k2_interleaved_kv_page_past_4gib():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     page_size = 16
     page_bytes = 2 * page_size * gqa.kv_heads * gqa.head_dim * dtypes.bf16.itemsize
@@ -1760,7 +1760,7 @@ def test_k2_interleaved_kv_page_past_4gib():
 
 def _k2_one_live_token(m, width, live_col):
     """Q/K zero, V one, every index -1 except ``live_col``."""
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     q = torch.zeros(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
     k_cache = torch.zeros(
@@ -1802,7 +1802,7 @@ def test_k2_default_out_ignores_query_strides():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     m, seq_len, page_size, width = 2, 64, 16, 8
     torch.manual_seed(0)
@@ -1976,7 +1976,7 @@ def test_qsa_k1_caller_score_workspace_matches_the_private_buffer():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     m, seq_len, page_size = 2, 4096, 16
     n_blocks = seq_len // idx.compress_ratio
@@ -2027,7 +2027,7 @@ def test_k2_empty_cache_or_table_returns_zeros():
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
 
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     q = torch.randn(1, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
     indices = torch.zeros(1, 4, dtype=dtypes.i32, device=device)
@@ -2075,7 +2075,7 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    gqa = FAMILY_A_GQA
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     m, seq_len, page_size, width = 1, 64, 16, 32
     torch.manual_seed(0)
@@ -2200,7 +2200,7 @@ def _flydsl_k1_select(
         sequence_lengths,
         heads=heads,
     )
-    indices = expand_qsa_block_indices_cuda(
+    indices = expand_qsa_block_indices(
         block_ids,
         query_positions,
         sequence_lengths,
@@ -2239,7 +2239,7 @@ def _pad_index_table(index_table, pad_pages):
 
 
 @benchmark()
-def bench_qsa_family_a_k1(
+def bench_qsa_flash_next_k1(
     m, seq_len, page_size, dtype, rotate=0, pad_pages=0, cache_layout="packed"
 ):
     """Family A FlyDSL K1 vs oracle set equality.
@@ -2264,7 +2264,7 @@ def bench_qsa_family_a_k1(
     decode: 263424 tokens fill 65856 columns, 168 pages of 392. Batches
     above 8 print in the prefill table.
     """
-    idx = FAMILY_A_INDEXER
+    idx = FLASH_NEXT_INDEXER
     device = torch.device("cuda")
     n_blocks = seq_len // idx.compress_ratio
     torch.manual_seed(0)
@@ -2289,7 +2289,7 @@ def bench_qsa_family_a_k1(
         slen,
         token_to_req,
         idx.compress_ratio,
-        score_scale=FAMILY_A_SCORE_SCALE,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
 
@@ -2344,7 +2344,7 @@ def bench_qsa_family_a_k1(
                 out=block_ids_g,
                 heads=(4,),
             )
-            expand_qsa_block_indices_cuda(
+            expand_qsa_block_indices(
                 block_ids_g,
                 qpos,
                 slen,
@@ -2368,7 +2368,7 @@ def bench_qsa_family_a_k1(
 
 
 @benchmark()
-def bench_qsa_family_a_k2(
+def bench_qsa_flash_next_k2(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
     """Family A FlyDSL K2 vs oracle GQA.
@@ -2381,8 +2381,8 @@ def bench_qsa_family_a_k2(
     ``cache_layout="wide"`` gives K and V the serving cache span. K2 reads
     V with K's strides, so the two views share one page stride.
     """
-    idx = FAMILY_A_INDEXER
-    gqa = FAMILY_A_GQA
+    idx = FLASH_NEXT_INDEXER
+    gqa = FLASH_NEXT_GQA
     device = torch.device("cuda")
     n_blocks = seq_len // idx.compress_ratio
     torch.manual_seed(0)
@@ -2398,7 +2398,7 @@ def bench_qsa_family_a_k2(
     qpos = _query_positions(m, seq_len, device)
     slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
     token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_family_a(
+    _index_cache, _index_table, k_cache, v_cache, kv_table = _pack_flash_next(
         k_bar, k, v, page_size, device
     )
     k_cache = _apply_cache_layout(k_cache.contiguous(), cache_layout)
@@ -2419,7 +2419,7 @@ def bench_qsa_family_a_k2(
         token_to_req,
         idx,
         gqa,
-        score_scale=FAMILY_A_SCORE_SCALE,
+        score_scale=FLASH_NEXT_SCORE_SCALE,
         out_dtype=dtypes.fp32,
     )
     indices = ref.indices.contiguous()
@@ -2459,14 +2459,14 @@ def bench_qsa_family_a_k2(
     return ret
 
 
-def test_k1_family_b_set_equality_published_indexer_point():
+def test_k1_gluon_parity_set_equality_published_indexer_point():
     """Published indexer point: M=32, H=4, D=128, page_size=8, n_blocks=512.
 
     ``pages=512`` is 512 compressed keys packed at ``page_size=8`` (64 pages).
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx = FAMILY_B_INDEXER
+    idx = GLUON_PARITY_INDEXER
     device = torch.device("cuda")
     m, seq_len, page_size = 32, 2048, 8
     n_blocks = seq_len // idx.compress_ratio
@@ -2510,7 +2510,7 @@ def test_k1_family_b_set_equality_published_indexer_point():
 
 
 @benchmark()
-def bench_qsa_family_b_k1(
+def bench_qsa_gluon_parity_k1(
     m,
     seq_len,
     page_size,
@@ -2529,7 +2529,7 @@ def bench_qsa_family_b_k1(
     packed to the context. ``cache_layout="wide"`` gives the indexer cache
     the serving span.
     """
-    idx = _family_b_indexer(index_heads)
+    idx = _gluon_parity_indexer(index_heads)
     device = torch.device("cuda")
     n_blocks = seq_len // idx.compress_ratio
     torch.manual_seed(0)
@@ -2594,11 +2594,11 @@ def bench_qsa_family_b_k1(
     return ret
 
 
-def _family_b_indexer(index_heads):
-    if index_heads == FAMILY_B_INDEXER.n_heads:
-        return FAMILY_B_INDEXER
-    if index_heads == FAMILY_B_INDEXER_H8.n_heads:
-        return FAMILY_B_INDEXER_H8
+def _gluon_parity_indexer(index_heads):
+    if index_heads == GLUON_PARITY_INDEXER.n_heads:
+        return GLUON_PARITY_INDEXER
+    if index_heads == GLUON_PARITY_INDEXER_H8.n_heads:
+        return GLUON_PARITY_INDEXER_H8
     raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
 
 
@@ -2783,7 +2783,7 @@ def test_qsa_metadata_strided_view_matches_packed():
     positions = torch.zeros(2, dtype=torch.int32)
     lengths = torch.zeros(2, dtype=torch.int32)
     try:
-        expand_qsa_block_indices_cuda(
+        expand_qsa_block_indices(
             blocks,
             positions,
             lengths,
@@ -2807,8 +2807,8 @@ def test_qsa_metadata_strided_view_matches_packed():
         raise AssertionError("the metadata fixture is already packed")
 
     blocks = torch.zeros(2, 1, dtype=torch.int32, device=device)
-    expanded = expand_qsa_block_indices_cuda(blocks, positions, lengths, requests, 4, 4)
-    expanded_ref = expand_qsa_block_indices_cuda(
+    expanded = expand_qsa_block_indices(blocks, positions, lengths, requests, 4, 4)
+    expanded_ref = expand_qsa_block_indices(
         blocks,
         positions.contiguous(),
         lengths.contiguous(),
@@ -2820,7 +2820,7 @@ def test_qsa_metadata_strided_view_matches_packed():
         raise AssertionError("strided expand disagreed with the packed metadata")
 
 
-def test_k2_serves_rejects_shapes_the_builder_rejects():
+def test_k2_supported_rejects_shapes_the_builder_rejects():
     """A geometry ``build_qsa_sparse_gqa_module`` raises on is a reason here.
 
     An indivisible group, a group past the MFMA M=16 tile, a head_dim that
@@ -2835,9 +2835,9 @@ def test_k2_serves_rejects_shapes_the_builder_rejects():
         table = torch.zeros(1, 1, dtype=torch.int32)
         return q, k, torch.zeros_like(k), indices, table
 
-    if qsa_sparse_gqa_serves(*tensors(24, 2, 256, 16)) is not None:
+    if qsa_sparse_gqa_supported(*tensors(24, 2, 256, 16)) is not None:
         raise AssertionError("family A GQA was rejected")
-    if qsa_sparse_gqa_serves(*tensors(16, 1, 128, 16)) is not None:
+    if qsa_sparse_gqa_supported(*tensors(16, 1, 128, 16)) is not None:
         raise AssertionError("a group of 16 at head_dim 128 was rejected")
     # (Hq, Hkv, D, page, rows, width, needle). D=32/D=96 are the decode
     # gather (BN16 x 128). D=192 at W=32 splits, so the merge runs and
@@ -2856,7 +2856,7 @@ def test_k2_serves_rejects_shapes_the_builder_rejects():
         (24, 2, 192, 16, 32, 8, "K LDS"),
     )
     for hq, hkv, d, page, rows, width, needle in rejected:
-        reason = qsa_sparse_gqa_serves(*tensors(hq, hkv, d, page, rows, width))
+        reason = qsa_sparse_gqa_supported(*tensors(hq, hkv, d, page, rows, width))
         if reason is None or needle not in reason:
             raise AssertionError(
                 f"Hq={hq} Hkv={hkv} D={d} page={page} rows={rows} "
@@ -2914,7 +2914,7 @@ def _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout="pac
     qpos = _query_positions(m, seq_len, device).contiguous()
     slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
     token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    index_cache, index_table, k_cache, v_cache, kv_table = _pack_family_a(
+    index_cache, index_table, k_cache, v_cache, kv_table = _pack_flash_next(
         k_bar, k, v, page_size, device
     )
     index_cache = _apply_cache_layout(index_cache.contiguous(), cache_layout)
@@ -2980,11 +2980,11 @@ def _layer_kwargs(idx, **extra):
     }
 
 
-def test_qsa_layer_family_a_matches_oracle():
+def test_qsa_layer_flash_next_matches_oracle():
     """The QSA layer matches the oracle on family A."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
     case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
     out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
     err = checkAllclose(
@@ -2998,11 +2998,11 @@ def test_qsa_layer_family_a_matches_oracle():
         raise AssertionError(f"QSA layer diverged from the oracle (err={err})")
 
 
-def test_qsa_layer_family_b_matches_oracle():
+def test_qsa_layer_gluon_parity_matches_oracle():
     """Family B FlyDSL layer matches the oracle (group 5, D=128)."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx, gqa = FAMILY_B_INDEXER, FAMILY_B_GQA
+    idx, gqa = GLUON_PARITY_INDEXER, GLUON_PARITY_GQA
     case = _prepare_qsa_layer(idx, gqa, 2, 128, 16, dtypes.bf16)
     out = qsa_layer(*_layer_args(case), **_layer_kwargs(idx))
     err = checkAllclose(
@@ -3042,7 +3042,7 @@ def test_qsa_layer_decode_graph_replays():
     """Decode capture of K1 + expand + K2 replays and still matches the oracle."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
-    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
     # n_blocks=1024 forces the long-row score buffer, not the emit fast path.
     case = _prepare_qsa_layer(idx, gqa, 1, 4096, 16, dtypes.bf16)
     device = case["q_gqa"].device
@@ -3109,7 +3109,7 @@ def _time_layer(case, idx, rotate):
 
 
 @benchmark()
-def bench_qsa_family_a_e2e(
+def bench_qsa_flash_next_e2e(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
     """One family A QSA layer: FlyDSL K1+expand+K2.
@@ -3119,7 +3119,7 @@ def bench_qsa_family_a_e2e(
     ``cache_layout="wide"`` is the serving span on the indexer cache and
     on K and V.
     """
-    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
@@ -3139,15 +3139,15 @@ def bench_qsa_family_a_e2e(
 
 
 @benchmark()
-def bench_qsa_family_b_e2e(
+def bench_qsa_gluon_parity_e2e(
     m, seq_len, page_size, dtype, index_heads, rotate=0, cache_layout="packed"
 ):
     """One family B QSA layer.
 
     Separate table from family A.
     """
-    idx = _family_b_indexer(index_heads)
-    gqa = FAMILY_B_GQA
+    idx = _gluon_parity_indexer(index_heads)
+    gqa = GLUON_PARITY_GQA
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
@@ -3168,13 +3168,13 @@ def bench_qsa_family_b_e2e(
 
 
 @benchmark()
-def bench_qsa_family_a_e2e_graph(m, seq_len, page_size, dtype, cache_layout="packed"):
+def bench_qsa_flash_next_e2e_graph(m, seq_len, page_size, dtype, cache_layout="packed"):
     """HIP graph replay of one family A decode layer. Not combined with rotate.
 
     Each candidate is captured once, then ``replay`` is timed hot. The
     output buffer after replay is the correctness check.
     """
-    idx, gqa = FAMILY_A_INDEXER, FAMILY_A_GQA
+    idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
     case = _prepare_qsa_layer(idx, gqa, m, seq_len, page_size, dtype, cache_layout)
     ref = case["ref"].output
     _w_alloc, w, flops, nbytes = _e2e_counts(case, idx, gqa, dtype)
@@ -3393,11 +3393,11 @@ def main():
                 seq_len,
                 page_size,
                 pad_pages,
-                FAMILY_A_INDEXER.compress_ratio,
+                FLASH_NEXT_INDEXER.compress_ratio,
                 "family A K1 decode",
             ):
                 continue
-            row = bench_qsa_family_a_k1(
+            row = bench_qsa_flash_next_k1(
                 m,
                 seq_len,
                 page_size,
@@ -3425,7 +3425,7 @@ def main():
         ):
             if _skip_m_past_seq(m, seq_len, "family A K2 decode"):
                 continue
-            row = bench_qsa_family_a_k2(
+            row = bench_qsa_flash_next_k2(
                 m, seq_len, page_size, dtype, rotate, cache_layout
             )
             _raise_if_k2_above_tolerance(row["flydsl_k2 err"], m, seq_len)
@@ -3459,11 +3459,11 @@ def main():
                 seq_len,
                 page_size,
                 pad_pages,
-                FAMILY_A_INDEXER.compress_ratio,
+                FLASH_NEXT_INDEXER.compress_ratio,
                 "family A K1 prefill",
             ):
                 continue
-            row = bench_qsa_family_a_k1(
+            row = bench_qsa_flash_next_k1(
                 m,
                 seq_len,
                 page_size,
@@ -3491,7 +3491,7 @@ def main():
         ):
             if _skip_m_past_seq(m, seq_len, "family A K2 prefill"):
                 continue
-            row = bench_qsa_family_a_k2(
+            row = bench_qsa_flash_next_k2(
                 m, seq_len, page_size, dtype, rotate, cache_layout
             )
             _raise_if_k2_above_tolerance(row["flydsl_k2 err"], m, seq_len)
@@ -3513,7 +3513,7 @@ def main():
             cache_layout,
         ) in itertools.product(
             args.batch,
-            [s for s in args.seq if s // FAMILY_B_INDEXER_H8.compress_ratio <= 512],
+            [s for s in args.seq if s // GLUON_PARITY_INDEXER_H8.compress_ratio <= 512],
             args.page_size,
             args.rotate,
             args.pad_pages,
@@ -3525,11 +3525,11 @@ def main():
                 seq_len,
                 page_size,
                 pad_pages,
-                FAMILY_B_INDEXER_H8.compress_ratio,
+                GLUON_PARITY_INDEXER_H8.compress_ratio,
                 "family B K1 H=8",
             ):
                 continue
-            row = bench_qsa_family_b_k1(
+            row = bench_qsa_gluon_parity_k1(
                 m, seq_len, page_size, dtype, 8, rotate, pad_pages, cache_layout
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
@@ -3550,11 +3550,11 @@ def main():
                 2048,
                 8,
                 pad_pages,
-                FAMILY_B_INDEXER.compress_ratio,
+                GLUON_PARITY_INDEXER.compress_ratio,
                 "family B K1 published",
             ):
                 continue
-            row = bench_qsa_family_b_k1(
+            row = bench_qsa_gluon_parity_k1(
                 32, 2048, 8, dtype, 4, rotate, pad_pages, cache_layout
             )
             _raise_if_k1_mismatch(row["flydsl_k1 err"], 32, 2048)
@@ -3577,7 +3577,7 @@ def main():
             cache_layout,
         ) in itertools.product(
             args.batch,
-            [s for s in args.seq if s // FAMILY_B_INDEXER.compress_ratio > 512],
+            [s for s in args.seq if s // GLUON_PARITY_INDEXER.compress_ratio > 512],
             args.page_size,
             (8,),
             args.rotate,
@@ -3590,11 +3590,11 @@ def main():
                 seq_len,
                 page_size,
                 pad_pages,
-                FAMILY_B_INDEXER.compress_ratio,
+                GLUON_PARITY_INDEXER.compress_ratio,
                 "family B K1 long-L",
             ):
                 continue
-            row = bench_qsa_family_b_k1(
+            row = bench_qsa_gluon_parity_k1(
                 m,
                 seq_len,
                 page_size,
@@ -3619,7 +3619,7 @@ def main():
         ):
             if m > seq_len:
                 continue
-            row = bench_qsa_family_a_e2e(
+            row = bench_qsa_flash_next_e2e(
                 m, seq_len, page_size, dtype, rotate, cache_layout
             )
             _raise_if_row_mismatch(row, m, seq_len)
@@ -3640,7 +3640,7 @@ def main():
         ):
             if m > seq_len:
                 continue
-            row = bench_qsa_family_a_e2e_graph(
+            row = bench_qsa_flash_next_e2e_graph(
                 m, seq_len, page_size, dtype, cache_layout
             )
             _raise_if_row_mismatch(row, m, seq_len)
@@ -3670,7 +3670,7 @@ def main():
         ):
             if m > seq_len:
                 continue
-            row = bench_qsa_family_b_e2e(
+            row = bench_qsa_gluon_parity_e2e(
                 m,
                 seq_len,
                 page_size,
