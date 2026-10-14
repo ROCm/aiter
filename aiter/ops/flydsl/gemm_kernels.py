@@ -13,7 +13,7 @@ import torch
 from torch import Tensor
 
 from aiter import logger
-from aiter.jit.utils.chip_info import get_gfx
+from aiter.jit.utils.chip_info import get_gfx, get_gfx_runtime
 from aiter.utility.graph_alloc import persistent_alloc
 
 from .gemm_a16w16_gfx1250 import gemm_a16w16 as gemm_a16w16_gfx1250
@@ -347,7 +347,7 @@ def flydsl_preshuffle_gemm_a8(
     if scale_mode not in ("epilogue", "blockscale"):
         raise ValueError(f"scale_mode must be epilogue/blockscale, got {scale_mode!r}")
     if scale_mode == "blockscale":
-        arch = torch.cuda.get_device_properties(XQ.device).gcnArchName.split(":")[0]
+        arch = get_gfx_runtime()
         if (
             in_dtype != "fp8"
             or WQ.dtype != XQ.dtype
