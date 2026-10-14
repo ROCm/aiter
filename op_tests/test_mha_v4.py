@@ -52,6 +52,7 @@ from aiter.ops.mha_v4_quant import (
     quantize_mxfp6_q,
     quantize_mxfp8_k,
     quantize_mxfp8_q,
+    quantize_v_fp8,
     quantize_v_mxfp4_fp6_p,
     quantize_v_mxfp6,
     quantize_v_mxfp6_fp6_p,
@@ -462,6 +463,19 @@ def test_mha_v4_fp8_quantization_matches_torch():
 
     assert torch.equal(actual, expected)
     assert torch.equal(scale, expected_scale.reshape(1))
+
+
+@pytest.mark.parametrize("sequence,heads", [(1, 1), (257, 3), (1024, 2)])
+def test_mha_v4_v_fp8_quantization_matches_torch(sequence, heads):
+    torch.manual_seed(29)
+    value = torch.randn((2, sequence, heads, 128), device="cuda", dtype=torch.bfloat16)
+    fp8_max = torch.finfo(dtypes.fp8).max
+    expected_scale = value.float().abs().amax(dim=1).clamp_min(1e-12) * (1.0 / fp8_max)
+
+    actual, scale = quantize_v_fp8(value)
+
+    assert torch.equal(scale, expected_scale)
+    assert torch.equal(actual, (value.float() / scale[:, None]).to(dtypes.fp8))
 
 
 @pytest.mark.skipif(

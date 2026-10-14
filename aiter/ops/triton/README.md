@@ -24,7 +24,8 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
    [Config-aware kernel names in traces](#config-aware-kernel-names-in-traces).
 6. Use the [shared helpers](#shared-helpers). Do not write local copies of
    common code, such as activations, shuffles or config loading. Put a new
-   shared helper in the shared module, not in a kernel file.
+   shared helper in the shared module, not in a kernel file. Shared
+   `@triton.jit` device helpers go in `_triton_kernels/common/`.
 7. Use architecture names (`gfx942`, `gfx950`, `gfx1250`) in code and folder
    names. Do not use product names such as MI300 or MI355.
 8. Allocate tensors on the device of the inputs (`device=x.device`). Do not
@@ -100,7 +101,8 @@ aiter/ops/triton/
 ├── gated_delta_net/   Gated DeltaNet ops
 ├── kimi_delta_attn/   Kimi Delta Attention
 ├── gluon/             Gluon wrappers
-├── _triton_kernels/   Triton kernel bodies, same paths as the wrappers
+├── _triton_kernels/   Triton kernel bodies, same paths as the wrappers;
+│                      shared device helpers in common/
 ├── _gluon_kernels/    Gluon kernel bodies: <arch>/ and the wrapper path
 ├── configs/           tuned JSON configs
 └── utils/             shared code
@@ -114,11 +116,13 @@ Tests use the same folders under `op_tests/triton_tests/`. Old flat imports
 
 | Need | Use |
 | ---- | --- |
-| Activations in a kernel | `_triton_kernels/activation.py` |
+| Activations in a kernel | `_triton_kernels/common/activation.py` |
 | Weight and scale shuffles | `utils/shuffle.py` |
 | Config loading | `utils/config_utils.py` and the `utils/*_config_utils.py` loaders |
 | Autotune config lists | `utils/tuned_config_utils.py::autotune_configs` |
 | Split-K second-stage reduce | `_triton_kernels/common/splitk_reduce.py` |
+| Program ID and XCD remapping | `_triton_kernels/common/pid_preprocessing.py` |
+| Tile lookup for ragged batches | `_triton_kernels/common/segment_tile.py` |
 | Architecture checks | `utils/_triton/arch_info.py::get_arch` |
 | Kernel names in traces | `utils/_triton/kernel_repr.py::make_kernel_repr` |
 | Logging | `from aiter import logger` |

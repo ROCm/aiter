@@ -65,6 +65,7 @@ from aiter.ops.flydsl.moe_kernels import (
     get_flydsl_stage2_kernels,
     get_flydsl_stage2_kernels_int4_bf16,
     get_flydsl_stage2_v2_kernels,
+    runtime_swiglu_limit,
 )
 from aiter.ops.flydsl.mxfp4_kname import (
     _parse_mxfp4_g1_kname,
@@ -283,7 +284,11 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
 
     x = _to_f64_flat(ref)
     y = _to_f64_flat(res)
-    cos_diff = 1 - 2 * (x * y).sum().item() / max((x * x + y * y).sum().item(), 1e-12)
+    # Keep the reduction and ratio on the accelerator. Only the final scalar is
+    # copied to the host, where Python needs it for immediate fail-fast control.
+    cos_diff = (
+        1 - 2 * (x * y).sum() / torch.clamp((x * x + y * y).sum(), min=1e-12)
+    ).item()
     if printLog:
         if cos_diff < COS_DIFF_THRESHOLD:
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[32mpassed~\033[0m]")
@@ -291,6 +296,125 @@ def cosine_diff_compare(ref, res, msg="", printLog=True):
             logger.info(f"{msg}[cosine_diff={cos_diff:.6f} \033[31mfailed!\033[0m]")
     # return real cos_diff (no flooring to 0) so small errors stay visible, not hidden
     return cos_diff
+
+
+class Mxfp4AccuracyError(RuntimeError):
+    """An MXFP4 candidate failed its numerical accuracy gate."""
+
+
+MXFP4_FINAL_GLOBAL_TIMING_GATE = 0.01
+
+
+def _parse_fast_scan_iters(value):
+    """Require enough profiler samples for ``get_trace_perf``."""
+    try:
+        value = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("must be an integer >= 2") from exc
+    if value < 2:
+        raise argparse.ArgumentTypeError("must be >= 2 for profiler timing")
+    return value
+
+
+def _normalized_latency_difference(latency, fastest_latency):
+    if fastest_latency > 0:
+        return (latency - fastest_latency) / fastest_latency
+    return 0.0 if latency == fastest_latency else math.inf
+
+
+def _parse_candidate_accuracy(value):
+    """Numeric accuracy ratio from a raw value; None when unavailable."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        percent = text.endswith("%")
+        try:
+            value = float(text[:-1] if percent else text)
+        except ValueError:
+            return None
+        if percent:
+            value /= 100.0
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) else None
+
+
+def _candidate_accuracy_error(candidate):
+    """Numeric accuracy error for funnel decisions.
+
+    ``_run_candidate`` records the raw ratio in the private ``_err`` key, while
+    the tuned CSV keeps upstream's percent string in ``err1``. Accept both so
+    funnel decisions never depend on the display format.
+    """
+    for key in ("_err", "err1"):
+        if key in candidate:
+            value = _parse_candidate_accuracy(candidate[key])
+            if value is not None:
+                return value
+    return math.inf
+
+
+def _select_mxfp4_performance_finalists(candidates, finalist_count):
+    """Select the lowest-latency coarse survivors, including the fastest one."""
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            float(candidate["us"]),
+            candidate["kernelName1"],
+            candidate["kernelName2"],
+        ),
+    )[:finalist_count]
+
+
+def _select_mxfp4_finalist(candidates, timing_gate=MXFP4_FINAL_GLOBAL_TIMING_GATE):
+    """Select the most accurate finalist inside a global fastest-latency band."""
+    if not candidates:
+        return None
+    fastest_latency = min(float(candidate["us"]) for candidate in candidates)
+    performance_equivalent = [
+        candidate
+        for candidate in candidates
+        if _normalized_latency_difference(float(candidate["us"]), fastest_latency)
+        <= timing_gate
+    ]
+    return min(
+        performance_equivalent,
+        key=lambda candidate: (
+            _candidate_accuracy_error(candidate),
+            float(candidate["us"]),
+            candidate["kernelName1"],
+            candidate["kernelName2"],
+        ),
+    )
+
+
+def _select_mxfp4_accuracy_promotion(candidates, performance_finalists):
+    """Promote the most accurate candidate not already selected for speed."""
+    selected = {
+        (candidate["kernelName1"], candidate["kernelName2"])
+        for candidate in performance_finalists
+    }
+    remaining = [
+        candidate
+        for candidate in candidates
+        if (candidate["kernelName1"], candidate["kernelName2"]) not in selected
+    ]
+    if not remaining:
+        return None
+    return min(
+        remaining,
+        key=lambda candidate: (
+            _candidate_accuracy_error(candidate),
+            float(candidate["us"]),
+            candidate["kernelName1"],
+            candidate["kernelName2"],
+        ),
+    )
 
 
 def _token_major_to_sorted_routes(
@@ -464,6 +588,8 @@ _GEN_DATA_1STAGE_KEYS = [
 
 
 class FmoeTuner(TunerCommon):
+    SUPPORTS_FAST_SCAN = False
+
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **TunerCommon.ARG_DEFAULTS,
         "verbose": False,
@@ -513,6 +639,10 @@ class FmoeTuner(TunerCommon):
 
     def parse_args(self) -> argparse.Namespace:
         args = super().parse_args()
+        if getattr(args, "fast_scan", False) and not self.SUPPORTS_FAST_SCAN:
+            self.parser.error("--fast-scan requires --mxfp4-flydsl")
+        if not hasattr(args, "fast_scan"):
+            args.fast_scan = False
         # None distinguishes an omitted mode from an explicit prune request.
         if args.mxfp4_search_mode is not None and (
             not args.mxfp4_flydsl
@@ -524,6 +654,10 @@ class FmoeTuner(TunerCommon):
             )
         args.mxfp4_search_mode = args.mxfp4_search_mode or "prune"
         return args
+
+    def _require_supported_fast_scan(self, args):
+        if getattr(args, "fast_scan", False) and not self.SUPPORTS_FAST_SCAN:
+            raise ValueError("--fast-scan requires --mxfp4-flydsl")
 
     @staticmethod
     def weight_quant(
@@ -5001,6 +5135,7 @@ class FmoeTuner(TunerCommon):
         tunedf,
         args,
     ):
+        self._require_supported_fast_scan(args)
         mp_num = args.mp
         blockMs = [16, 32, 64, 128]
         keys = self.keys
@@ -6388,6 +6523,7 @@ class GroupedFmoeTuner(FmoeTuner):
                 pass
 
     def tune(self, untunedf, tunedf, args):
+        self._require_supported_fast_scan(args)
         del tunedf
         rows = []
         for _, row in untunedf.iterrows():
@@ -6453,6 +6589,50 @@ class Mxfp4FlydslTuner(FmoeTuner):
     winner retention on unseen shapes require separate validation. Use
     --mxfp4-search-mode full to enumerate all statically supported GEMM1 variants.
     """
+
+    SUPPORTS_FAST_SCAN = True
+
+    def _setup_specific_arguments(self):
+        super()._setup_specific_arguments()
+        self.parser.add_argument(
+            "--fast-scan",
+            action="store_true",
+            required=False,
+            help="Scan every candidate with lightweight timing. Candidates are "
+            "accuracy-checked and scored by summed active GPU-kernel time; "
+            "inaccurate candidates are skipped, and only the fastest valid "
+            "candidates are retimed with --fast-scan-final-iters.",
+        )
+        self.parser.add_argument(
+            "--fast-scan-warmup-accuracy-checks",
+            type=int,
+            default=1,
+            help="Untimed warm-up launches whose outputs are accuracy-checked "
+            "before the coarse measurement (default: 1). Finalists reuse the "
+            "coarse-stage warm state without another warm-up.",
+        )
+        self.parser.add_argument(
+            "--fast-scan-iters",
+            type=_parse_fast_scan_iters,
+            default=10,
+            help="Profiled launches per candidate after the accuracy warm-up in "
+            "the coarse fast-scan pass (default: 10; must be >= 2).",
+        )
+        self.parser.add_argument(
+            "--fast-scan-final-iters",
+            type=_parse_fast_scan_iters,
+            default=100,
+            help="Profiled launches per finalist with no additional warm-up "
+            "(default: 100; must be >= 2).",
+        )
+        self.parser.add_argument(
+            "--fast-scan-finalists",
+            type=int,
+            default=5,
+            help="Performance candidates to retime with "
+            "--fast-scan-final-iters (default: 5). One additional non-duplicate "
+            "accuracy candidate is promoted when available.",
+        )
 
     ARG_DEFAULTS: ClassVar[dict[str, Any]] = {
         **FmoeTuner.ARG_DEFAULTS,
@@ -6831,7 +7011,16 @@ class Mxfp4FlydslTuner(FmoeTuner):
             doweight_stage1=False,
         )
 
-    def _run_candidate(self, row, candidate, args):
+    def _run_candidate(
+        self,
+        row,
+        candidate,
+        args,
+        data=None,
+        reference=None,
+        num_warmup=None,
+        num_iters=None,
+    ):
         from aiter.test_common import run_perftest
 
         ne, h, e = int(row["expert"]), int(row["model_dim"]), int(row["inter_dim"])
@@ -6845,23 +7034,101 @@ class Mxfp4FlydslTuner(FmoeTuner):
         }[self._row_act(row)]
         limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
         swiglu_limit = None if limit_env in (None, "") else float(limit_env)
-        data = self._prepare_case(token, h, e, ne, topk, dtype)
-        out = self._port_e2e(
-            data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
-        )
-        ref = self._torch_ref(data, topk, dtype, activation, swiglu_limit=swiglu_limit)
-        err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
-        # NaN must reject explicitly: `nan > errRatio` is False, so a candidate
-        # producing garbage would otherwise pass the gate and, being fast, win.
-        if err is None or not math.isfinite(float(err)) or float(err) > args.errRatio:
-            raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
-        _, us = run_perftest(
+        fast_scan = bool(getattr(args, "fast_scan", False))
+        # Never let a finalist retime erase a larger error already observed for
+        # this candidate during the coarse pass. `_err` holds the exact ratio;
+        # err1/err2 are the rounded display strings, so only fall back to them
+        # when the raw value is unavailable.
+        previously_observed_errors = []
+        raw_error = _parse_candidate_accuracy(candidate.get("_err"))
+        if raw_error is not None:
+            previously_observed_errors.append(raw_error)
+        else:
+            for field in ("err1", "err2"):
+                observed = _parse_candidate_accuracy(candidate.get(field))
+                if observed is not None:
+                    previously_observed_errors.append(observed)
+        if data is None:
+            data = self._prepare_case(token, h, e, ne, topk, dtype)
+        requested_warmup = int(args.warmup if num_warmup is None else num_warmup)
+        measured_iters = int(args.iters if num_iters is None else num_iters)
+
+        def validate_output(out, phase):
+            accuracy_error = cosine_diff_compare(
+                reference,
+                out,
+                msg=f"port[{kn1}+{kn2}]",
+                printLog=False,
+            )
+            # NaN must reject explicitly: `nan > errRatio` is False, so a
+            # candidate producing garbage would otherwise pass the gate and,
+            # being fast, win.
+            if (
+                accuracy_error is None
+                or not math.isfinite(float(accuracy_error))
+                or float(accuracy_error) > args.errRatio
+            ):
+                raise Mxfp4AccuracyError(
+                    f"{phase} cosine err_ratio {accuracy_error} > {args.errRatio}"
+                )
+            return float(accuracy_error)
+
+        if reference is not None:
+            # Fast scan: every untimed warm-up launch is validated against the
+            # shared reference before the coarse measurement starts.
+            accuracy_errors = []
+            for check_index in range(max(0, requested_warmup)):
+                out = self._port_e2e(
+                    data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+                )
+                accuracy_errors.append(
+                    validate_output(
+                        out,
+                        f"warmup-and-accuracy-check {check_index + 1}/"
+                        f"{requested_warmup}",
+                    )
+                )
+            # Warm-up launches have already run and been validated. Passing zero
+            # prevents run_perftest from launching a duplicate warm-up stage.
+            timed_warmup = 0
+        elif fast_scan:
+            err = 0.0
+            timed_warmup = requested_warmup
+        else:
+            out = self._port_e2e(
+                data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
+            )
+            ref = self._torch_ref(
+                data, topk, dtype, activation, swiglu_limit=swiglu_limit
+            )
+            err = cosine_diff_compare(ref, out, msg=f"port[{kn1}+{kn2}]")
+            if (
+                err is None
+                or not math.isfinite(float(err))
+                or float(err) > args.errRatio
+            ):
+                raise RuntimeError(f"cosine err_ratio {err} > {args.errRatio}")
+            timed_warmup = requested_warmup
+        timed_out, us = run_perftest(
             lambda: self._port_e2e(
                 data, kn1, kn2, topk, ne, h, dtype, swiglu_limit=swiglu_limit
             ),
-            num_warmup=int(args.warmup),
-            num_iters=int(args.iters),
+            num_warmup=timed_warmup,
+            num_iters=measured_iters,
+            # The MXFP4 funnel owns warm-up explicitly, and its closure has no
+            # rotating arguments. Count every requested profiler sample and skip
+            # the generic memory-probe launch.
+            profile_warm_iters=0 if fast_scan else 1,
+            num_rotate_args=1 if fast_scan else 0,
         )
+        if reference is not None:
+            # run_perftest synchronizes before returning. Validate its last
+            # output now, outside the profiler interval, to catch result
+            # instability without changing reported kernel-active latency.
+            accuracy_errors.append(validate_output(timed_out, "measured output"))
+            err = max(accuracy_errors)
+        if previously_observed_errors:
+            err = max(float(err), *previously_observed_errors)
         us = round(float(us), 4)
         # The pair is timed as one unit, so the fused-MoE estimate in calculate()
         # is the right roofline for it. Untuned rows keep dtypes as strings, while
@@ -6877,11 +7144,79 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 "us": us,
                 "err1": f"{float(err):.1%}",
                 "err2": f"{float(err):.1%}",
+                # Raw ratio for the fast-scan funnel; err1/err2 keep the
+                # upstream percent-string display format.
+                "_err": float(err),
                 "tflops": tflops,
                 "bw": bw,
             }
         )
         return us
+
+    @staticmethod
+    def _precompile_candidates(row, candidates):
+        """Populate the shared FlyDSL cache before GPU validation and timing.
+
+        Compile-only workers use CPU dummy tensors, so they neither duplicate
+        the shape fixture on the GPU nor inherit the parent's HIP context.  A
+        failed precompile is only an optimization miss: the parent scan keeps
+        its normal JIT fallback for that candidate.
+        """
+        try:
+            from aiter.aot.flydsl.common import get_max_workers, run_jobs_parallel
+            from aiter.aot.flydsl.mxfp4_moe import (
+                compile_job_batch,
+                jobs_from_rows,
+            )
+
+            candidate_rows = [dict(row, **candidate) for candidate in candidates]
+            jobs = jobs_from_rows(candidate_rows, include_bias_variants=False)
+            if not jobs:
+                return 0, 0
+            # jobs_from_rows always compiles the unclamped defaults (+inf for
+            # SiLU, 7.0 for SwiGLU). Runtime launches pass the tuned clamp
+            # instead, so without this the cache misses and the scan JITs
+            # during scoring.
+            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+            if limit_env not in (None, ""):
+                for job in jobs:
+                    if job["stage"] == 1:
+                        job["swiglu_limit"] = runtime_swiglu_limit(
+                            float(limit_env), job["act"]
+                        )
+            worker_count = get_max_workers(len(jobs))
+            batches = [jobs[index::worker_count] for index in range(worker_count)]
+            batch_results = run_jobs_parallel(
+                compile_job_batch,
+                [{"jobs": batch} for batch in batches],
+                # Runtime tuning can begin after a framework initialized HIP.
+                # Fork clean compile-only children from Python's dedicated
+                # fork server instead of inheriting the parent's accelerator
+                # state.  Do not hide devices while starting that persistent
+                # server: it would retain the temporary environment after the
+                # parent restored it.
+                start_method="forkserver",
+            )
+            failed = 0
+            for batch, batch_result in zip(batches, batch_results):
+                results = batch_result.get("results")
+                if not isinstance(results, list) or len(results) != len(batch):
+                    failed += len(batch)
+                    continue
+                failed += sum(result.get("compile_time") is None for result in results)
+            print(
+                f"[mxfp4-port] precompiled {len(jobs) - failed}/{len(jobs)} "
+                "deduplicated FlyDSL kernels",
+                flush=True,
+            )
+            return len(jobs), failed
+        except Exception as exc:  # noqa: BLE001
+            print(
+                f"[mxfp4-port] parallel precompile unavailable; "
+                f"falling back to runtime JIT: {exc}",
+                flush=True,
+            )
+            return 0, 0
 
     def _tune_one_shape(self, row, args):
         """Sweep all (g1, g2) candidates for one shape; return the best row dict.
@@ -6911,12 +7246,60 @@ class Mxfp4FlydslTuner(FmoeTuner):
         candidates = self._candidate_rows(
             row, full_search=getattr(args, "mxfp4_search_mode", "prune") == "full"
         )
-        best, failures = None, []
+        fast_scan = bool(getattr(args, "fast_scan", False))
+        best, failures, successful = None, [], []
+
+        # Candidate kernels for one shape consume the same immutable inputs and
+        # shuffled weights. In scan mode, prepare that fixture once instead of
+        # regenerating and reshuffling the full expert tensors for every pair.
+        scan_data = None
+        scan_reference = None
+        if fast_scan:
+            self._precompile_candidates(row, candidates)
+            scan_data = self._prepare_case(
+                int(row["token"]),
+                int(row["model_dim"]),
+                int(row["inter_dim"]),
+                int(row["expert"]),
+                int(row["topk"]),
+                dtypes.bf16,
+            )
+            activation = {
+                "situv2": ActivationType.Situv2,
+                "swiglu": ActivationType.Swiglu,
+                "silu": ActivationType.Silu,
+            }[self._row_act(row)]
+            limit_env = os.environ.get("AITER_MXFP4_TUNE_SWIGLU_LIMIT")
+            swiglu_limit = None if limit_env in (None, "") else float(limit_env)
+            # Build the expensive torch reference once per shape. Every coarse
+            # warm-up and every final measured output is checked against it.
+            # Apply the same swiglu clamp _run_candidate applies per candidate:
+            # a reference built without the limit would reject every candidate
+            # whenever AITER_MXFP4_TUNE_SWIGLU_LIMIT is set.
+            scan_reference = self._torch_ref(
+                scan_data,
+                int(row["topk"]),
+                dtypes.bf16,
+                activation,
+                swiglu_limit=swiglu_limit,
+            )
+        accuracy_checks = max(
+            0, int(getattr(args, "fast_scan_warmup_accuracy_checks", 1))
+        )
+        scan_iters = _parse_fast_scan_iters(getattr(args, "fast_scan_iters", 10))
         for candidate in candidates:
             if timeout > 0:
                 signal.alarm(timeout)
             try:
-                us = self._run_candidate(row, candidate, args)
+                us = self._run_candidate(
+                    row,
+                    candidate,
+                    args,
+                    data=scan_data,
+                    reference=scan_reference,
+                    num_warmup=accuracy_checks if fast_scan else None,
+                    num_iters=scan_iters if fast_scan else None,
+                )
                 print(
                     f"[mxfp4-port] token={row['token']} inter={row['inter_dim']} "
                     f"{candidate['kernelName1']} + {candidate['kernelName2']} us={us}",
@@ -6924,6 +7307,14 @@ class Mxfp4FlydslTuner(FmoeTuner):
                 )
                 if best is None or us < float(best["us"]):
                     best = candidate
+                if fast_scan:
+                    successful.append(candidate)
+            except Mxfp4AccuracyError as exc:
+                failures.append(
+                    f"{candidate['kernelName1']}/{candidate['kernelName2']}: "
+                    f"accuracy {exc}"
+                )
+                print(f"[mxfp4-port] candidate rejected: {failures[-1]}", flush=True)
             except Exception as exc:  # noqa: BLE001
                 failures.append(
                     f"{candidate['kernelName1']}/{candidate['kernelName2']}: {exc}"
@@ -6932,6 +7323,118 @@ class Mxfp4FlydslTuner(FmoeTuner):
             finally:
                 if timeout > 0:
                     signal.alarm(0)
+        if fast_scan and successful:
+            finalist_count = max(1, int(getattr(args, "fast_scan_finalists", 5)))
+            finalist_iters = _parse_fast_scan_iters(
+                getattr(args, "fast_scan_final_iters", 100)
+            )
+            # One stable latency ordering drives both the initial performance
+            # finalists and all later backfill. This preserves the fastest
+            # remaining coarse survivor when a finalist fails final validation;
+            # the separate accuracy promotion below covers the accuracy side.
+            performance_order = _select_mxfp4_performance_finalists(
+                successful, len(successful)
+            )
+            performance_finalists = performance_order[:finalist_count]
+            accuracy_promotion = _select_mxfp4_accuracy_promotion(
+                successful, performance_finalists
+            )
+            finalists = list(performance_finalists)
+            if accuracy_promotion is not None:
+                finalists.append(accuracy_promotion)
+            finalist_target = min(
+                len(successful),
+                finalist_count + int(accuracy_promotion is not None),
+            )
+            finalist_queue = []
+            finalist_keys = set()
+            # Accuracy promotion is tried once after the speed finalists. Any
+            # further replacement is strictly next-lowest-latency order; the
+            # accuracy-bucket rank is diagnostic only and must not reorder it.
+            for candidate in finalists + performance_order:
+                candidate_key = (
+                    candidate["kernelName1"],
+                    candidate["kernelName2"],
+                )
+                if candidate_key not in finalist_keys:
+                    finalist_keys.add(candidate_key)
+                    finalist_queue.append(candidate)
+            print(
+                f"[mxfp4-port] retiming {len(performance_finalists)} performance "
+                f"finalists + {int(accuracy_promotion is not None)} "
+                f"accuracy-promoted finalist with "
+                f"no additional warm-up + {finalist_iters} profiled iterations; "
+                f"backfilling to {finalist_target} successful retimes",
+                flush=True,
+            )
+            best = None
+            retimed = []
+            for candidate in finalist_queue:
+                if len(retimed) >= finalist_target:
+                    break
+                if timeout > 0:
+                    signal.alarm(timeout)
+                try:
+                    us = self._run_candidate(
+                        row,
+                        candidate,
+                        args,
+                        data=scan_data,
+                        reference=scan_reference,
+                        num_warmup=0,
+                        num_iters=finalist_iters,
+                    )
+                    print(
+                        f"[mxfp4-port] finalist token={row['token']} "
+                        f"{candidate['kernelName1']} + "
+                        f"{candidate['kernelName2']} us={us}",
+                        flush=True,
+                    )
+                    retimed.append(candidate)
+                except Mxfp4AccuracyError as exc:
+                    failures.append(
+                        f"finalist {candidate['kernelName1']}/"
+                        f"{candidate['kernelName2']}: accuracy {exc}"
+                    )
+                    print(
+                        f"[mxfp4-port] finalist rejected: {failures[-1]}",
+                        flush=True,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    failures.append(
+                        f"finalist {candidate['kernelName1']}/"
+                        f"{candidate['kernelName2']}: {exc}"
+                    )
+                    print(f"[mxfp4-port] candidate failed: {failures[-1]}", flush=True)
+                finally:
+                    if timeout > 0:
+                        signal.alarm(0)
+            if retimed:
+                fastest_us = min(float(candidate["us"]) for candidate in retimed)
+                best = _select_mxfp4_finalist(retimed)
+                ranked_finalists = [best] + sorted(
+                    (candidate for candidate in retimed if candidate is not best),
+                    key=lambda candidate: float(candidate["us"]),
+                )
+                for rank, candidate in enumerate(ranked_finalists, start=1):
+                    latency_us = float(candidate["us"])
+                    accuracy_error = _candidate_accuracy_error(candidate)
+                    normalized_difference = _normalized_latency_difference(
+                        latency_us, fastest_us
+                    )
+                    print(
+                        f"[mxfp4-port] finalist-summary rank={rank} "
+                        f"selected={int(candidate is best)} "
+                        f"inside_global_gate="
+                        f"{int(normalized_difference <= MXFP4_FINAL_GLOBAL_TIMING_GATE)} "
+                        f"us={latency_us:.4f} "
+                        f"normalized_diff={normalized_difference:.6f} "
+                        f"cosine_error={accuracy_error:.6f} "
+                        f"similarity_pct={(1.0 - accuracy_error) * 100:.4f} "
+                        f"kernel1={candidate['kernelName1']} "
+                        f"kernel2={candidate['kernelName2']}",
+                        flush=True,
+                    )
         if best is None:
             best = candidates[0]
             best["us"] = self.INVALID_TIME

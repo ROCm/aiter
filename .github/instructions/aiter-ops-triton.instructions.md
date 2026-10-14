@@ -34,8 +34,9 @@ breaks and how to fix it. The author can be new to these rules.
 
 - Flag new code that duplicates existing code, also in part. The fix is to
   extend or import the existing code. Look in `utils/`,
-  `_triton_kernels/common/`, `_triton_kernels/activation.py`, the existing
-  kernels and the test helpers.
+  `_triton_kernels/common/` (activations, program ID remapping, split-K
+  reduce, ragged-batch tile lookup), the existing kernels and the test
+  helpers.
 - Flag a function with a second home: a re-export, a wrapper that only
   forwards the call, or a copy of a core helper in a family loader.
 
@@ -53,6 +54,10 @@ breaks and how to fix it. The author can be new to these rules.
   `_triton_kernels/flash_attn_triton_amd/` folder (used by
   `attention/mha.py`). A kernel that wrappers in several folders use stays
   with the wrapper that owns it, or goes in `_triton_kernels/common/`.
+- Flag a new `@triton.jit` device helper that kernels in several folders use,
+  when it is not in `_triton_kernels/common/`. Examples:
+  `common/activation.py`, `common/pid_preprocessing.py`. Do not put such a
+  helper in `utils/_triton/` or in the kernel module of one category.
 - Flag a PR that moves a wrapper but not its kernels, or that does not update
   all importers of the old path.
 - Flag common helpers (config loading, shuffles, arch detection, logging)
@@ -238,7 +243,7 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   - `moe/moe_routing/routing.py` → `moe/moe_routing/`
   - `attention/mha.py` → `attention/`, also if its kernels are in
     `flash_attn_triton_amd/`
-  - flat wrappers (`activation.py`, `topk.py`) → the `triton_tests/` root
+  - flat wrappers (`topk.py`, `softmax.py`) → the `triton_tests/` root
   - `utils/` helpers → `triton_tests/utils/`
 
   `torch_compile/` and `triton_metadata_redirect/` are infrastructure suites.

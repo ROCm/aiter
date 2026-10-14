@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.activation import fused_silu_mul
+from aiter.ops.triton.fusions.activation import fused_silu_mul
 
 LOG2_E = 1.44269504089
 
