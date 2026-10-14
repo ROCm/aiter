@@ -100,23 +100,21 @@ class G2SGlobal:
 
     The instruction offset applies to both the global and the LDS address and
     is signed 13-bit, so with M0 4 KB into the wave's 8 KB of the region it
-    reaches all eight steps. Each M0 change costs an ``s_mov``, a hazard
-    ``s_nop`` and a load stall that a 16-cycle MFMA slot cannot hide; the
-    buffer form's unsigned 12-bit offset needs four changes per K tile, this
-    one two.
+    reaches all eight steps; the buffer form's unsigned 12-bit offset needs
+    four M0 changes per K tile, this one two.
 
     The loads are inline asm because LLVM asserts on the intrinsic's negative
     LDS memory-operand offset. LLVM does not count them in vmcnt, so the K
     loop waits for them explicitly, and the epilogue's scale loads, which
     persistent workgroups issue before the next block's, are asm as well.
-    It does see M0 as an operand and writes it only when the value changes;
-    ``m0_state``, shared by all instances, mirrors that in issue order so the
-    hazard ``s_nop`` goes only after a change. Nothing else may use M0.
+    M0 is written by ``set_m0`` ops, placed an MFMA slot ahead of the loads
+    so the write and its hazard ``s_nop`` stay off the loads' slots. LLVM
+    does not see M0 in use, so nothing else in the kernel may use it.
     """
 
     CENTER = 4096
 
-    def __init__(self, tensor, wave_id, block_stride, lds_pair, m0_state):
+    def __init__(self, tensor, wave_id, block_stride, lds_pair):
         piece = [
             (s // 2) * block_stride + (s % 2) * 1024 for s in range(LOADS_PER_REGION)
         ]
@@ -132,38 +130,39 @@ class G2SGlobal:
             )
             for region in lds_pair
         ]
-        self.m0_state = m0_state
 
     def voffset(self, step, lane_offset):
         """VGPR offset of ``step`` for a lane at ``lane_offset`` from the base."""
         return lane_offset - self.imm[step] + self.CENTER
 
-    def _load(self, voffset, buf, k_offset, step, m0_changes):
-        nop = "s_nop 0\n" if m0_changes else ""
+    def set_m0(self, buf):
+        """Point M0 at LDS buffer ``buf`` for the ``ops`` that follow."""
+        _llvm.inline_asm(
+            res=None,
+            operands_=[fx.Int32(self.m0[buf]).ir_value()],
+            asm_string="s_mov_b32 m0, $0\ns_nop 0",
+            constraints="s",
+            has_side_effects=True,
+        )
+
+    def _load(self, voffset, k_offset, step):
         _llvm.inline_asm(
             res=None,
             operands_=[
                 fx.Int32(voffset).ir_value(),
                 (self.base + fx.Int64(k_offset)).ir_value(),
-                fx.Int32(self.m0[buf]).ir_value(),
             ],
-            asm_string=f"{nop}global_load_lds_dwordx4 $0, $1 offset:{self.imm[step]}",
-            constraints="v,s,{m0}",
+            asm_string=f"global_load_lds_dwordx4 $0, $1 offset:{self.imm[step]}",
+            constraints="v,s",
             has_side_effects=True,
         )
 
-    def ops(self, voffsets, buf, k_offset):
+    def ops(self, voffsets, k_offset):
         """One op per step, each loading at ``voffsets[step]``."""
-        ops = []
-        for step in range(LOADS_PER_REGION):
-            m0_changes = self.m0_state[0] != (id(self), buf)
-            self.m0_state[0] = (id(self), buf)
-            ops.append(
-                lambda step=step, m0_changes=m0_changes: self._load(
-                    voffsets[step], buf, k_offset, step, m0_changes
-                )
-            )
-        return ops
+        return [
+            lambda step=step: self._load(voffsets[step], k_offset, step)
+            for step in range(LOADS_PER_REGION)
+        ]
 
 
 class StoreCInt8Rows(StoreC):
@@ -359,8 +358,11 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
     # K_ITERS - 2's wait for everything, then covers them.
     SCALE_LOADS = StoreCInt8Rows.SCALE_LOADS
     assert P3_VMCNT_TILE0 + SCALE_LOADS <= 63
-    # Phase 1's last A-hi reads must land before its barrier.
+    # Phase 1's last A-hi reads and phase 2's last B-hi reads must land
+    # before the phase's barrier. Phase 2's A loads do not count against that
+    # wait and run to the end of the phase.
     P1_READS_END = len(PHASE_MFMAS[0]) - 6
+    P2_READS_END = len(PHASE_MFMAS[1]) - 6
 
     _kname = (
         f"flydsl_bpreshuffle_4w_{BLOCK_M}x{BLOCK_N}x{BLOCK_K}_I8_I8_B16_"
@@ -404,9 +406,8 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
                 return _xcd_swizzle_any(m_blocks, n_blocks, xcd_swizzle, block)
             return split_row_major_2d(block, n_blocks)
 
-        m0_state = [None]
-        a_g2s = G2SGlobal(A, wave_id, A_BLOCK_STRIDE, a_lds, m0_state)
-        b_g2s = G2SGlobal(B_T, wave_id, B_BLOCK_STRIDE, b_lds, m0_state)
+        a_g2s = G2SGlobal(A, wave_id, A_BLOCK_STRIDE, a_lds)
+        b_g2s = G2SGlobal(B_T, wave_id, B_BLOCK_STRIDE, b_lds)
         s2r = S2RLoader(wave_m, WAVE_TILES)
 
         def voffset_ops(coords, voffsets):
@@ -454,10 +455,11 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
         # K tile t lives in LDS buffer t % 2; ``buf`` is that parity, static
         # even where t is the loop's runtime value. ``voffsets`` (A, B) picks
         # the output block.
-        def tile_loads(voffsets, tile_k, buf):
+        def tile_loads(voffsets, tile_k):
+            """A and B loads of a K tile; M0 must point at its buffer."""
             return (
-                a_g2s.ops(voffsets[0], buf, tile_k * BLOCK_K),
-                b_g2s.ops(voffsets[1], buf, tile_k * B_K_STEP),
+                a_g2s.ops(voffsets[0], tile_k * BLOCK_K),
+                b_g2s.ops(voffsets[1], tile_k * B_K_STEP),
             )
 
         a_ops = [[None] * K_STEPS for _ in range(WAVE_TILES)]
@@ -534,24 +536,24 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
                 b_read(buf, HALF + j, kk) for kk in ALL_K for j in range(HALF)
             ]
             p2_loads, p4_loads = [], []
+            p1_m0, p3_m0 = [], []
             if const_expr(refill is not None):
-                p2_loads, p4_loads = tile_loads(*refill, buf)
+                p2_loads, p4_loads = tile_loads(*refill)
+                p1_m0 = [(len(PHASE_MFMAS[0]) - 2, lambda: a_g2s.set_m0(buf))]
+                p3_m0 = [(len(PHASE_MFMAS[2]) - 2, lambda: b_g2s.set_m0(buf))]
 
             p1_placed = spread(a_hi_reads, 0, P1_READS_END)
             p1_placed += spread(list(p1_ops), P1_READS_END, len(PHASE_MFMAS[0]) - 1)
-            run_phase(PHASE_MFMAS[0], p1_placed, wait=(None, 0))
+            run_phase(PHASE_MFMAS[0], p1_placed + p1_m0, wait=(None, 0))
             rocdl.s_barrier()
-            p2_ops = interleave(p2_loads, b_hi_reads)
-            run_phase(
-                PHASE_MFMAS[1],
-                spread(p2_ops, 0, len(PHASE_MFMAS[1]) - 2),
-                wait=(None, 0),
-            )
+            p2_placed = spread(b_hi_reads, 0, P2_READS_END)
+            p2_placed += spread(p2_loads, 1, len(PHASE_MFMAS[1]) - 1)
+            run_phase(PHASE_MFMAS[1], p2_placed, wait=(None, 0))
             rocdl.s_barrier()
             if const_expr(has_next):
                 p3_placed = spread(list(p3_ops), 0, len(PHASE_MFMAS[2]) - 2)
                 p3_wait = p3_vmcnt if refill is not None else 0
-                run_phase(PHASE_MFMAS[2], p3_placed, wait=(p3_wait, None))
+                run_phase(PHASE_MFMAS[2], p3_placed + p3_m0, wait=(p3_wait, None))
                 rocdl.s_barrier()
                 p4_ops = interleave(p4_loads, lo_reads(1 - buf))
                 run_phase(PHASE_MFMAS[3], spread(p4_ops, 0, len(PHASE_MFMAS[3]) - 2))
@@ -601,9 +603,11 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8, num_cu: int = 0):
         for op in voffset_ops(coords, voffsets):
             op()
         for t in range_constexpr(2):
-            a_loads, b_loads = tile_loads(voffsets, t, t)
-            for op in a_loads + b_loads:
-                op()
+            a_loads, b_loads = tile_loads(voffsets, t)
+            for g2s, loads in ((a_g2s, a_loads), (b_g2s, b_loads)):
+                g2s.set_m0(t)
+                for op in loads:
+                    op()
         rocdl.s_waitcnt(vmcnt=0 if persistent else 2 * LOADS_PER_REGION)
         rocdl.s_barrier()
         for op in lo_reads(0):
