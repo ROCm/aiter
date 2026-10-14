@@ -12,6 +12,7 @@ import torch.profiler as tpf
 
 import aiter
 from aiter import dtypes, pertoken_quant
+from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.enum import QuantType
 from aiter.test_common import benchmark, checkAllclose, perftest
 
@@ -742,7 +743,7 @@ def test_pa_ps(
 gpu = torch.cuda.current_device()
 device_properties = torch.cuda.get_device_properties(gpu)
 cu_num = device_properties.multi_processor_count
-gpu_arch = device_properties.gcnArchName.split(":", 1)[0]
+gpu_arch = get_gfx()
 
 parser = argparse.ArgumentParser(
     formatter_class=argparse.RawTextHelpFormatter,

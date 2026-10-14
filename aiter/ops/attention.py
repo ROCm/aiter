@@ -21,7 +21,7 @@ from csrc.cpp_itfs.torch_utils import direct_register_custom_op
 
 from ..jit.core import compile_ops, is_experimental_enabled
 from ..jit.utils.asm_guard import require_gfx1250_asm
-from ..jit.utils.chip_info import get_cu_num, get_gfx
+from ..jit.utils.chip_info import get_cu_num, get_gfx, get_gfx_runtime
 
 MD_NAME = "module_attention"
 
@@ -366,6 +366,8 @@ def pa_ps_fwd_asm(
     quant_type: Enum | None = QuantType.per_Token.value,
 ) -> torch.Tensor:
     output = out_ if out_ is not None else torch.empty_like(Q)
+    if K.dtype in (dtypes.bf16, dtypes.fp16):
+        quant_type = QuantType.No.value
     _pa_ps_fwd_asm(
         Q,
         K,
@@ -644,8 +646,7 @@ def pa_persistent_fwd(
         and v_head_dim == 128
         and output.dtype in (dtypes.bf16, dtypes.fp16)
         and reduce_final_map is not None
-        and torch.cuda.get_device_properties(device).gcnArchName.split(":", 1)[0]
-        == "gfx950"
+        and get_gfx_runtime() == "gfx950"
     ):
         reduce_fn = _attention_ps_reduce_asm
     reduce_fn(
