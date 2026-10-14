@@ -242,6 +242,11 @@ def compile_preshuffle_gemm(
     num_waves = 4 if tile_n >= 64 else tile_n // 16
     n_per_wave = tile_n // num_waves
     num_acc_n = n_per_wave // 16
+    if num_acc_n * num_waves * 16 != tile_n:
+        raise ValueError(
+            f"tile_n={tile_n} is not fully covered by the MMA loop "
+            f"({num_acc_n * num_waves * 16} columns)"
+        )
     acc_size = m_repeat * num_acc_n * 4
 
     total_threads = num_waves * 64
