@@ -1764,14 +1764,16 @@ def test_a8w4_sort_quant_kernel(
     hidden = torch.randn((token, row_stride), dtype=dtypes.bf16)[:, :model_dim]
     gating = torch.randn((token, E), dtype=dtypes.bf16)
     topk_weights, topk_ids = fused_topk(hidden, gating, topk, True)
-    # Dense copy with stride(0) == model_dim. .contiguous() keeps a one-row
-    # view's stride, which the MXFP4 sort_quant rejects.
-    hidden_dense = torch.empty((token, model_dim), dtype=dtypes.bf16)
-    hidden_dense.copy_(hidden)
+    # The MXFP4 sort_quant needs dense rows. At token=1, .contiguous() keeps the
+    # row-strided one-row view, which it must still accept: one row has no
+    # row stride to honor.
+    hidden_mxfp4 = hidden.contiguous()
+    if token == 1:
+        assert hidden_mxfp4.stride(0) == row_stride
     ref_q, ref_s = per_1x32_f8_scale_f8_quant(
-        hidden_dense, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
+        hidden_mxfp4, quant_dtype=dtypes.fp8, scale_type=dtypes.fp8_e8m0
     )
-    bufs4 = launch(hidden_dense, topk_ids, topk_weights, alloc_bufs(dtypes.fp4x2))
+    bufs4 = launch(hidden_mxfp4, topk_ids, topk_weights, alloc_bufs(dtypes.fp4x2))
     experts4, nv4 = bufs4[1], bufs4[2]
 
     def check(bufs):

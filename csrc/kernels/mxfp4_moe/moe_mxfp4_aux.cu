@@ -138,14 +138,15 @@ void mxfp4_moe_sort_quant_kernel(
 
     const bool fp8_quant = a_quant.dtype() == AITER_DTYPE_fp8;
     // The MXFP8 quant reads each row with 16-byte loads at token * input_stride;
-    // the MXFP4 quant ignores input_stride and needs dense rows.
+    // the MXFP4 quant ignores input_stride and needs dense rows. A single row
+    // has no row stride to honor, so any stride(0) is fine when M <= 1.
     AITER_CHECK(a_input.stride(1) == 1, "mxfp4_moe_sort_quant: a_input rows must be dense");
     if (fp8_quant) {
-        AITER_CHECK(a_input.stride(0) % 8 == 0 &&
+        AITER_CHECK((M <= 1 || a_input.stride(0) % 8 == 0) &&
                         reinterpret_cast<uintptr_t>(a_input.data_ptr()) % 16 == 0,
                     "mxfp4_moe_sort_quant: MXFP8 a_input rows must be 16-byte aligned");
     } else {
-        AITER_CHECK(a_input.stride(0) == D_HIDDEN,
+        AITER_CHECK(M <= 1 || a_input.stride(0) == D_HIDDEN,
                     "mxfp4_moe_sort_quant: MXFP4 a_input must be contiguous");
     }
     const std::string key = sort_quant_key(fp8_quant, NE, TOPK, MB, D_HIDDEN);
