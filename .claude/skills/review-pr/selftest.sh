@@ -98,6 +98,48 @@ t "a budget refusal does not blame the agent timeout" \
 t "a real timeout still names the agent timeout" \
   "$(printf '%s' "$clock_msg" | grep -c AITER_AGENT_TIMEOUT)" "1"
 
+echo "[gates call site]"
+# Same bug as the refuter had: `python3 _gates.py ...` bare under `set -euo pipefail` exits the
+# script on a red gate, so the EXIT trap reports "exited unexpectedly with no classified
+# failure" -- while the log says plainly which gate went red. A reader gets the useless half.
+gates_site() {  # <rc from _gates.py> -> what the call site reported
+  local W; W=$(mktemp -d)
+  # the fixture must not be the file the code tees to: tee truncates it on open, and the
+  # stub's cat then races against that -- a test that passes or fails by timing is worse than none
+  printf '======== SEVEN GATES ========\n  \342\234\205 answers\n  \342\235\214 card         exit=1\n' > "$W/fixture.out"
+  { echo 'set -euo pipefail'
+    echo 'say() { :; }'
+    echo 'fail() { echo "$1 | $3"; exit 0; }'
+    printf 'W=%s\nSKILL=%s\nPROJ=/tmp\n' "$W" "$S"
+    printf 'python3() { cat "%s/fixture.out"; return %s; }\n' "$W" "$1"
+    sed -n '/^# 4) gates + collect/,/^python3 "\$SKILL\/_collect.py"/p' "$S/run_one.sh"
+    echo 'echo "REACHED-END"'
+  } | bash
+  rm -rf "$W"
+}
+t "a red gate is reported as a classified failure" \
+  "$(gates_site 1 | grep ' | ' | cut -d'|' -f1 | tr -d ' ')" "flow"
+t "the report names which gate went red" \
+  "$(gates_site 1 | grep ' | ' | grep -c card)" "1"
+t "green gates fall through to collect" "$(gates_site 0 | tail -1)" "REACHED-END"
+
+# A gate that prints more than one line carrying `exit=` must not be named twice: a reader
+# shown "card,card,ledger" learns less than one shown "card,ledger".
+gates_multi() {
+  local W; W=$(mktemp -d)
+  printf '   \342\235\214 card    exit=1\n   \342\235\214 card    exit=1\n   \342\235\214 ledger  exit=1\n' > "$W/fixture.out"
+  { echo 'set -euo pipefail'
+    echo 'say() { :; }'
+    echo 'fail() { echo "$3"; exit 0; }'
+    printf 'W=%s\nSKILL=%s\nPROJ=/tmp\n' "$W" "$S"
+    printf 'python3() { cat "%s/fixture.out"; return 1; }\n' "$W"
+    sed -n '/^# 4) gates + collect/,/^python3 "\$SKILL\/_collect.py"/p' "$S/run_one.sh"
+  } | bash | grep ' gate'
+  rm -rf "$W"
+}
+t "a gate red on several lines is named once" \
+  "$(gates_multi | grep -oE 'by the [a-z,]+ gate' | head -1)" "by the card,ledger gate"
+
 echo "[refuter call site]"
 # The harnesses above run run_agent in isolation under `set -uo pipefail`. The shipping script
 # runs under `set -euo pipefail`, where a bare `cmd; rc=$?` exits before rc is ever read -- so

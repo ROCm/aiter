@@ -51,6 +51,14 @@ void moe_sorting_opus_fwd(aiter_tensor_t& topk_ids,
     HipDeviceGuard device_guard(topk_ids.device_id);
     const hipStream_t stream = aiter::getCurrentHIPStream();
 
+    if(reverse_sorted.has_value())
+    {
+        auto& reverse = reverse_sorted.value();
+        AITER_CHECK(reverse.dtype() == AITER_DTYPE_i32 && reverse.is_contiguous() &&
+                        reverse.numel() >= static_cast<int64_t>(num_tokens) * topk,
+                    "reverse_sorted must be a contiguous int32 buffer for tokens * topk routes");
+    }
+
     void* ws_ptr = workspace.has_value() ? workspace.value().data_ptr() : nullptr;
 
     moe_sorting_opus(
