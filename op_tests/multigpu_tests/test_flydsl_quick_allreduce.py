@@ -67,11 +67,22 @@ end in one table each: SQNR against an fp32 oracle, bit-exactness of
 pinned-super-tile geometries), padded widths on the INT4 wire (SQNR), mesh
 rank agreement, and ``test_quick_allreduce_host_checks``.
 
+With ``--operation ar_rmsnorm``, bench times each fused schedule
+(``FlyQuickAllReduceRMSNorm`` as production builds it) against
+``FUSED_STOCK``: ``hip_fused``, the HIP quick all-reduce's own fused kernel,
+where its row constraint allows, and ``hip+norm``, the HIP quick all-reduce
+followed by ``rmsnorm2d_fwd_with_add``. ``route`` is the family the fused
+policy picks with ``AITER_FLY_AR_ACCURACY=fast``. Its default shapes are
+``FUSED_BENCH_SHAPES``.
+
 ``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
 The default payloads are the verify sweep's shipping payloads of both
 schedules; ``-s`` or ``--shape-csv`` replace them, ``-a`` picks the schedules,
-and ``--grid-cap`` and ``--block`` pin their geometry. ``--report``,
-``--csv`` and ``-o`` save the tables.
+and ``--grid-cap`` and ``--block`` pin their geometry. ``--candidates`` adds
+the pinned configurations of a candidate file
+(``flydsl_allreduce_bench.load_candidates``) as more columns of the same
+spawn, and ``--candidate-set`` selects its rows. ``--report``, ``--csv`` and
+``-o`` save the tables.
 
 Every rank is a ``multiprocessing`` spawn worker that builds its own engine.
 All rows that share an engine configuration ride one spawn. The oracle is an
@@ -189,6 +200,15 @@ GRAPH_INNER = fab.GRAPH_INNER
 # measures ~18.3 dB; the floor leaves ~4 dB of headroom.
 HIP_QR_REGIME = "INT4"
 HIP_SQNR_FLOOR_DB = 14.0
+# bench, ar_rmsnorm: the stock quantized fused paths. ``hip_fused`` is the HIP
+# quick all-reduce's own fused kernel (``qr_all_reduce_rmsnorm``), which takes
+# rows that divide its 32 KiB tile; ``hip+norm`` is the HIP quick all-reduce,
+# then ``rmsnorm2d_fwd_with_add``.
+FUSED_STOCK = ("hip_fused", "hip+norm")
+# bench, ar_rmsnorm: default shapes, decode to prefill at three model widths.
+FUSED_BENCH_SHAPES = [
+    (m, h) for h in (4096, 7168, 8192) for m in (16, 64, 256, 1024, 4096)
+]
 
 # Shipping payloads are derived from the dispatch policy (``_ship_payloads``)
 # and laid out at this width. A row is 8 KiB and every policy and ladder
@@ -900,13 +920,15 @@ def _bench_rank(
     engine_kw: dict,
     cases: list[tuple],
     timing: tuple[int, int],
+    extra: tuple = (),
 ) -> list[dict]:
     """One rank of one bench spawn: every candidate on every case.
 
     One engine per schedule in *algorithms*, each with *engine_kw*, and the
-    HIP quick all-reduce. A case is ``(tokens, hidden)``. Returns, per case,
-    whether production would run the HIP kernel on it and each candidate's
-    per-rank result.
+    HIP quick all-reduce. *extra* is ``(name, algorithm, knobs)`` per pinned
+    engine from ``--candidates``. A case is ``(tokens, hidden)``. Returns, per
+    case, whether production would run the HIP kernel on it and each
+    candidate's per-rank result.
     """
     import torch.distributed as dist
 
@@ -926,11 +948,15 @@ def _bench_rank(
         a: _engine(rank, tp, gloo, device, {"algorithm": a, **engine_kw})
         for a in algorithms
     }
+    for name, algorithm, knobs in extra:
+        engines[name] = _engine(
+            rank, tp, gloo, device, {"algorithm": algorithm, **dict(knobs)}
+        )
     reps, rounds = timing
 
     # The input and every candidate's output, for the whole spawn. Refer to
     # flydsl_allreduce_bench for why the addresses must not change.
-    names = (*algorithms, "hip")
+    names = (*engines, "hip")
     max_bytes = max(m * hidden * 2 for m, hidden in cases)
     bufs = {
         name: torch.empty(max_bytes, dtype=torch.uint8, device=device)
@@ -977,8 +1003,8 @@ def _bench_rank(
             times = fab.time_graphs(graphs, gloo, reps=reps, rounds=rounds)
             for name, us in times.items():
                 res[name]["us"] = us
-            for algorithm, eng in engines.items():
-                res[algorithm]["variant"] = eng.variant(nbytes)
+            for name, eng in engines.items():
+                res[name]["variant"] = eng.variant(nbytes)
             if "hip" in res:
                 wire = "fp16" if qr.use_fp16_kernels else "bf16"
                 res["hip"]["variant"] = f"{HIP_QR_REGIME.lower()}/{wire}"
@@ -1141,10 +1167,12 @@ def _result(key: tuple, case: tuple) -> list[dict]:
         cases = _CASES[key]
         kw = dict(key[1])
         if "algorithms" in kw:
+            op = kw.pop("op")
             ranks = _spawn(
-                _bench_rank,
+                _bench_rank if op == "ar" else _bench_fused_rank,
                 key[0],
                 algorithms=kw.pop("algorithms"),
+                extra=kw.pop("extra"),
                 engine_kw=kw,
                 cases=cases,
                 timing=_TIMING,
@@ -1319,8 +1347,8 @@ def test_quick_allreduce_int4(
     return ret
 
 
-def _bench_key(tp: int, algorithms, grid_cap, block) -> tuple:
-    kw = {"algorithms": tuple(algorithms)}
+def _bench_key(tp: int, algorithms, grid_cap, block, extra=(), op="ar") -> tuple:
+    kw = {"algorithms": tuple(algorithms), "extra": tuple(extra), "op": op}
     for name, val in (("grid_cap", grid_cap), ("block", block)):
         if val is not None:
             kw[name] = val
@@ -1336,15 +1364,19 @@ def bench_quick_allreduce_int4(
     route,
     grid_cap=None,
     block=None,
+    extra=(),
 ):
     """Each FlyDSL schedule against the HIP quick all-reduce.
 
     *route* is the algorithm production dispatch picks for the payload:
     ``mesh``, ``ring``, ``oneshot``, or ``fallback`` for
-    ``cross_device_reduce`` and RCCL.
+    ``cross_device_reduce`` and RCCL. *extra* are the ``--candidates``
+    engines, timed in the same spawn.
     """
-    rows = _result(_bench_key(tp, algorithms, grid_cap, block), (tokens, hidden))
-    names = [n for n in (*algorithms, "hip") if n in rows[0]["candidates"]]
+    key = _bench_key(tp, algorithms, grid_cap, block, extra)
+    rows = _result(key, (tokens, hidden))
+    pinned = tuple(name for name, _alg, _knobs in extra)
+    names = [n for n in (*algorithms, *pinned, "hip") if n in rows[0]["candidates"]]
     got = {n: fab.collapse([r["candidates"][n] for r in rows]) for n in names}
 
     fails = []
@@ -1359,6 +1391,7 @@ def bench_quick_allreduce_int4(
     hip_us = got["hip"]["us"] if "hip" in got else None
     ret = {
         "gfx": ARCH,
+        "operation": "ar",
         "KiB": tokens * hidden * 2 / 1024,
         "hip prod": rows[0]["hip prod"],
         "flydsl vs hip": (
@@ -2658,6 +2691,349 @@ def _verify_fused(tps, algos) -> None:
     )
 
 
+def _fused_applies(algorithm: str, knobs: dict, tp: int, hidden: int) -> bool:
+    """Whether a pinned fused mesh/ring builds exactly *knobs* at *hidden*.
+
+    ``atoms_per_row`` resolves to the nearest one a width has, and the column
+    would then time another build under this candidate's name; a ``grid_cap``
+    above the CU count is clamped away by the one-workgroup-per-CU rule. Both
+    leave the cell empty instead.
+    """
+    from aiter.ops.flydsl.quick_allreduce import (
+        ALGORITHMS as HOST_ALGORITHMS,
+    )
+    from aiter.ops.flydsl.quick_allreduce import (
+        FlyQuickAllReduceRMSNorm,
+        _resolve_codecs,
+    )
+
+    cap = knobs.get("grid_cap")
+    if (
+        cap is not None
+        and cap > torch.cuda.get_device_properties(0).multi_processor_count
+    ):
+        return False
+    apr = knobs.get("atoms_per_row")
+    if apr is not None and (8 // tp) % apr:
+        return False
+    algo = HOST_ALGORITHMS[algorithm]
+    eng = FlyQuickAllReduceRMSNorm.__new__(FlyQuickAllReduceRMSNorm)
+    eng.world_size = tp
+    eng._algo = algo
+    eng.rs_codec, _ag = _resolve_codecs(algo, tp, None, None)
+    eng.block = None
+    eng.atoms_per_row = apr
+    if not eng.supports_hidden(hidden):
+        return False
+    return apr is None or eng._geom_for(hidden)[1] == apr
+
+
+def _hip_fused_runs(qr, nbytes: int, hidden: int) -> bool:
+    """Whether the HIP fused kernel can run: ``_hip_runs``, and a row that
+    divides its 32 KiB tile (``should_quick_allreduce_rmsnorm``)."""
+    row = hidden * 2
+    return _hip_runs(qr, nbytes) and 0 < row <= 32768 and 32768 % row == 0
+
+
+def _fused_bench_thunks(engines, qr, level, outs, x, residual, weight, ar_buf, eps):
+    """The ``ar_rmsnorm`` bench thunks, by candidate name, for one case."""
+    from aiter import qr_all_reduce_rmsnorm, rmsnorm2d_fwd_with_add
+
+    thunks = {}
+    for name, eng in engines.items():
+
+        def _fly(e=eng, o=outs[name]):
+            e.allreduce_rmsnorm(x, residual, weight, eps, out=o[0], residual_out=o[1])
+
+        thunks[name] = _fly
+    nbytes = x.numel() * 2
+    hidden = x.shape[-1]
+    if _hip_fused_runs(qr, nbytes, hidden):
+
+        def _hip_fused(o=outs["hip_fused"]):
+            # As QuickAllReduce.quick_all_reduce_rmsnorm, into fixed outputs.
+            qr_all_reduce_rmsnorm(
+                qr._ptr,
+                x,
+                residual,
+                o[1],
+                o[0],
+                weight,
+                eps,
+                hidden,
+                level.value,
+                qr.use_fp16_kernels,
+            )
+
+        thunks["hip_fused"] = _hip_fused
+    if _hip_runs(qr, nbytes):
+
+        def _hip_norm(o=outs["hip+norm"]):
+            qr.qr_quant_level = level
+            qr.quick_all_reduce(x, out=ar_buf)
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks["hip+norm"] = _hip_norm
+    return thunks
+
+
+def _bench_fused_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    algorithms: tuple[str, ...],
+    engine_kw: dict,
+    cases: list[tuple],
+    timing: tuple[int, int],
+    extra: tuple = (),
+) -> list[dict]:
+    """One rank of one ``ar_rmsnorm`` bench spawn: every candidate on every case.
+
+    One ``FlyQuickAllReduceRMSNorm`` per schedule in *algorithms*, configured
+    as production builds it, the *extra* engines from ``--candidates``, and
+    ``FUSED_STOCK``. A case is ``(tokens, hidden)``. Returns, per case,
+    whether production would run the HIP fused kernel on it and each
+    candidate's per-rank result.
+    """
+    import torch.distributed as dist
+
+    from aiter.dist.device_communicators.quick_all_reduce import QuickReduceRegime
+    from aiter.ops.flydsl.quick_allreduce import FlyQuickAllReduceRMSNorm
+
+    del engine_kw  # the knobs come per candidate
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    tp_group = _init_dist(rank, tp, init_method, hip=True)
+    gloo = tp_group.cpu_group
+    group = tp_group.device_group
+    qr = tp_group.device_communicator.qr_comm
+    if qr is not None and qr.disabled:
+        qr = None
+    level = QuickReduceRegime[HIP_QR_REGIME]
+    link = fly_policy.detect_link()
+    # Built in a fixed order: each engine's IPC exchange is a collective, and
+    # so is each width's build (``preload`` below).
+    specs = [
+        (
+            a,
+            a,
+            {
+                "atoms_per_row": fly_policy.fused_qr_row_atoms(
+                    world_size=tp, algorithm=a, link=link
+                )
+            },
+        )
+        for a in algorithms
+    ]
+    specs += [(name, a, dict(knobs)) for name, a, knobs in extra]
+    engines = {}
+    for name, algorithm, knobs in specs:
+        engines[name] = FlyQuickAllReduceRMSNorm(
+            group=gloo,
+            device=device,
+            rank=rank,
+            world_size=tp,
+            algorithm=algorithm,
+            link=link,
+            min_bytes=0,
+            **knobs,
+        )
+    spec_of = {name: (algorithm, knobs) for name, algorithm, knobs in specs}
+    reps, rounds = timing
+    eps = fab.RMS_EPS
+
+    # The inputs and every candidate's outputs, for the whole spawn. Refer to
+    # flydsl_allreduce_bench for why the addresses must not change.
+    names = (*engines, *FUSED_STOCK)
+    max_bytes = max(m * hidden * 2 for m, hidden in cases)
+    bufs = {
+        name: torch.empty(max_bytes, dtype=torch.uint8, device=device)
+        for name in (
+            "inp",
+            "residual",
+            "ar",
+            *(f"{n}:{o}" for n in names for o in ("out", "res")),
+        )
+    }
+
+    def _view(name, m, hidden):
+        return bufs[name][: m * hidden * 2].view(torch.bfloat16).view(m, hidden)
+
+    rows = []
+    try:
+        for m, hidden in cases:
+            inp, residual_src, weight = _fused_inputs(m, hidden, rank, device)
+            x = _view("inp", m, hidden)
+            x.copy_(inp)
+            residual = _view("residual", m, hidden)
+            residual.copy_(residual_src)
+            total = x.to(torch.float32)
+            dist.all_reduce(total, group=group)
+            ref_out, ref_res = fab.fused_reference(total, residual, weight, eps)
+            nbytes = m * hidden * 2
+            outs = {
+                n: (_view(f"{n}:out", m, hidden), _view(f"{n}:res", m, hidden))
+                for n in names
+            }
+            # A --candidates engine whose pinned geometry this width does not
+            # have is left out: n/a.
+            live = {
+                name: eng
+                for name, eng in engines.items()
+                if name in algorithms or _fused_applies(*spec_of[name], tp, hidden)
+            }
+            for eng in live.values():
+                eng.preload(hidden)
+            thunks = _fused_bench_thunks(
+                live,
+                qr,
+                level,
+                outs,
+                x,
+                residual,
+                weight,
+                _view("ar", m, hidden),
+                eps,
+            )
+            hip_prod = False
+            if "hip_fused" in thunks:
+                qr.qr_quant_level = level
+                hip_prod = qr._should_hip(x)
+
+            graphs, res = {}, {}
+            for name, thunk in thunks.items():
+                graphs[name] = fab.capture(thunk)
+                out, res_out = fab.graded_replay(graphs[name], outs[name], gloo)
+                res[name] = {
+                    "sqnr_db": min(
+                        _sqnr_db(out.float(), ref_out.float()),
+                        _sqnr_db(res_out.float(), ref_res.float()),
+                    )
+                }
+            times = fab.time_graphs(graphs, gloo, reps=reps, rounds=rounds)
+            for name, us in times.items():
+                res[name]["us"] = us
+            for name, eng in live.items():
+                res[name]["variant"] = eng.variant(hidden, nbytes)
+            wire = "fp16" if qr is not None and qr.use_fp16_kernels else "bf16"
+            for name in FUSED_STOCK:
+                if name in res:
+                    res[name]["variant"] = f"{HIP_QR_REGIME.lower()}/{wire}"
+            rows.append({"hip prod": hip_prod, "candidates": res})
+            del graphs
+    finally:
+        _teardown(engines.values(), gloo)
+    return rows
+
+
+def _fused_route(policy, nbytes: int) -> str:
+    """The family the fused policy routes *nbytes* to with
+    ``AITER_FLY_AR_ACCURACY=fast``, or ``fallback``."""
+    alg = policy.select(nbytes, quantized=True)
+    return "fallback" if alg is None else alg.value
+
+
+@benchmark()
+def bench_quick_allreduce_rmsnorm(tokens, hidden, tp, algorithms, route, extra=()):
+    """Each fused FlyDSL schedule against the HIP quick all-reduce's fused
+    kernel and its two-launch form.
+
+    *route* is the family the fused policy picks for the payload. *extra* are
+    the ``--candidates`` engines, timed in the same spawn.
+    """
+    key = _bench_key(tp, algorithms, None, None, extra, "ar_rmsnorm")
+    rows = _result(key, (tokens, hidden))
+    pinned = tuple(name for name, _alg, _knobs in extra)
+    names = [
+        n for n in (*algorithms, *pinned, *FUSED_STOCK) if n in rows[0]["candidates"]
+    ]
+    got = {n: fab.collapse([r["candidates"][n] for r in rows]) for n in names}
+
+    fails = []
+    for name, c in got.items():
+        floor = HIP_SQNR_FLOOR_DB if name in FUSED_STOCK else FUSED_SQNR_MIN_DB
+        if c["SQNR dB"] < floor:
+            fails.append(f"{name}: SQNR {c['SQNR dB']:.2f} dB below {floor} dB")
+        if c["variant"] is not None and c["variant"].startswith("MIXED"):
+            fails.append(f"{name}: ranks ran different kernels: {c['variant']}")
+    _check(f"ar_rmsnorm tp={tp} {tokens}x{hidden}", fails)
+
+    base = "hip_fused" if "hip_fused" in got else "hip+norm"
+    base_us = got[base]["us"] if base in got else None
+    ret = {
+        "gfx": ARCH,
+        "operation": "ar_rmsnorm",
+        "KiB": tokens * hidden * 2 / 1024,
+        "route": route,
+        "hip prod": rows[0]["hip prod"],
+        "hip base": base if base in got else None,
+        "flydsl vs hip": (
+            fab.speedup(base_us, got[route]["us"]) if route in got else None
+        ),
+    }
+    for algorithm in algorithms:
+        ret[f"{algorithm} vs hip"] = fab.speedup(base_us, got[algorithm]["us"])
+    for name, c in got.items():
+        ret.update({f"{name} {field}": v for field, v in c.items()})
+    return ret
+
+
+def _bench_fused(args, tps, algos, link) -> None:
+    extra = _candidates(args, "ar_rmsnorm", algos)
+    shapes = (
+        FUSED_BENCH_SHAPES
+        if args.mnk is None
+        else [(int(t), int(h)) for t, h in args.mnk]
+    )
+    rows = []
+    for tp in tps:
+        policy = fly_policy.resolve_fused_policy(world_size=tp, link=link)
+        key = _bench_key(tp, algos, None, None, extra, "ar_rmsnorm")
+        for shape in shapes:
+            _register(key, shape)
+        rows += [
+            bench_quick_allreduce_rmsnorm(
+                tokens,
+                hidden,
+                tp,
+                algos,
+                route=_fused_route(policy, tokens * hidden * 2),
+                extra=extra,
+            )
+            for tokens, hidden in shapes
+        ]
+    rows = [{k: v for k, v in r.items() if k != "extra"} for r in rows]
+
+    tables = fab.bench_tables(
+        rows,
+        candidates=(*algos, *(name for name, _a, _k in extra), *FUSED_STOCK),
+        drop=["algorithms"],
+        title="flydsl quick allreduce + rmsnorm vs hip",
+    )
+    for title, df in tables:
+        aiter.logger.info("%s (markdown):\n%s", title, fab.to_markdown(df))
+    cast = os.environ.get("AITER_QUICK_REDUCE_CAST_BF16_TO_FP16", "1")
+    header = fab.provenance(
+        args,
+        link,
+        [
+            (
+                f"- hip: QuickAllReduce at {HIP_QR_REGIME}, "
+                f"AITER_QUICK_REDUCE_CAST_BF16_TO_FP16={cast}"
+            ),
+            (
+                "- `hip base` is `hip_fused` where its row constraint allows, "
+                "else `hip+norm`"
+            ),
+            "- `X vs hip` is `hip base us / X us`: above 1.0 the schedule is faster",
+        ],
+    )
+    fab.write_outputs(
+        args, "FlyDSL quick all-reduce + RMSNorm bench", header, tables, rows
+    )
+    _write_json(args.out, rows)
+
+
 def _route(policy, nbytes: int) -> str:
     """The algorithm production dispatch runs *nbytes* on with quantization
     on, or ``fallback`` for ``cross_device_reduce`` and RCCL."""
@@ -2665,8 +3041,27 @@ def _route(policy, nbytes: int) -> str:
     return "fallback" if alg is None else alg.value
 
 
+def _candidates(args, operation: str, algos) -> tuple:
+    """``(name, algorithm, knobs)`` of every ``--candidates`` row for *algos*."""
+    if args.candidates is None:
+        return ()
+    return tuple(
+        (c.name, c.algorithm, tuple(sorted(c.knobs.items())))
+        for c in fab.load_candidates(
+            args.candidates,
+            operation=operation,
+            algorithms=tuple(algos),
+            candidate_set=args.candidate_set,
+        )
+    )
+
+
 def _bench(args, tps, algos, link) -> None:
     algos = tuple(a for a in ALGORITHMS if a in algos)
+    if args.operation == "ar_rmsnorm":
+        _bench_fused(args, tps, algos, link)
+        return
+    extra = _candidates(args, "ar", algos)
     rows = []
     for tp in tps:
         if args.mnk is not None:
@@ -2678,7 +3073,7 @@ def _bench(args, tps, algos, link) -> None:
         for grid_cap, block in itertools.product(args.grid_cap, args.block):
             # Every case of a spawn is registered before its first result.
             for shape in shapes:
-                _register(_bench_key(tp, algos, grid_cap, block), shape)
+                _register(_bench_key(tp, algos, grid_cap, block, extra), shape)
             rows += [
                 bench_quick_allreduce_int4(
                     tokens,
@@ -2688,15 +3083,17 @@ def _bench(args, tps, algos, link) -> None:
                     route=_route(policy, tokens * hidden * 2),
                     grid_cap=grid_cap,
                     block=block,
+                    extra=extra,
                 )
                 for tokens, hidden in shapes
             ]
+    rows = [{k: v for k, v in r.items() if k != "extra"} for r in rows]
 
     drop = ["algorithms"]
     drop += [k for k in ("grid_cap", "block") if getattr(args, k) == [None]]
     tables = fab.bench_tables(
         rows,
-        candidates=(*algos, "hip"),
+        candidates=(*algos, *(name for name, _a, _k in extra), "hip"),
         drop=drop,
         title="flydsl quick allreduce INT4 vs hip",
     )

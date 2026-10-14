@@ -85,10 +85,23 @@ means the one-shot is faster:
 * ``flydsl vs best`` -- against the fastest stock kernel that clears its
   accuracy floor, which need not be the one production runs.
 
+``--operation ar_rmsnorm`` benches the fused one-shot instead
+(``OneShotAllReduceRMSNorm`` on its shipped ladder), against
+``FUSED_STOCK``: ``cdr_fused_1stage`` and ``cdr_fused_2stage``,
+``CustomAllreduce``'s fused kernel, and ``cdr+norm`` and ``rccl+norm``, each
+all-reduce followed by ``rmsnorm2d_fwd_with_add``. ``prod`` is what
+``CudaCommunicator.fused_allreduce_rmsnorm`` runs with the FlyDSL path off,
+and ``route``/``route exact`` the family the fused policy picks in each
+accuracy mode. Its default shapes are ``FUSED_BENCH_SHAPES``.
+
 ``flydsl_allreduce_bench.py`` describes how the comparison is kept unbiased.
 The default payloads are the verify sweep's plus the DeepSeek-V4 decode
 shapes; ``-s`` or ``--shape-csv`` replace them, and the knob options pin the
-one-shot's configuration. ``--report`` and ``--csv`` save the tables.
+one-shot's configuration. ``--candidates`` adds the pinned configurations of
+a candidate file (``flydsl_allreduce_bench.load_candidates``) as more columns
+of the same spawn, and ``--candidate-set`` selects its rows; the tuning suite
+in ``flydsl_allreduce_tuning/`` drives the bench that way. ``--report`` and
+``--csv`` save the tables.
 
 Every rank is a ``multiprocessing`` spawn worker; one spawn per engine
 configuration and world size runs every sweep. OneShotAllReduce runs on
@@ -194,6 +207,58 @@ STOCK = (*CDR_KERNELS, "rccl")
 STOCK_SQNR_FLOOR_DB = 40.0
 # bench: DeepSeek-V4 decode shapes, timed next to the policy-derived payloads.
 BENCH_SHAPES = [(m, HIDDEN) for m in (1, 2, 4, 8)]
+# bench, ar_rmsnorm: the stock fused paths, in the order each spawn captures
+# them. ``cdr_fused_*`` is ``CustomAllreduce``'s fused kernel at both stage
+# counts; ``<ar>+norm`` is that all-reduce and then ``rmsnorm2d_fwd_with_add``.
+FUSED_STOCK = ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm", "rccl+norm")
+# bench, ar_rmsnorm: the accuracy floor of every candidate, on ``out`` and on
+# ``residual_out``. ``out`` goes through an approximate rsqrt, so it sits well
+# below the plain all-reduce's floor.
+FUSED_BENCH_SQNR_FLOOR_DB = 30.0
+# bench, ar_rmsnorm: default shapes, decode to prefill at three model widths.
+FUSED_BENCH_SHAPES = [(m, h) for h in (4096, 7168, 8192) for m in (1, 4, 16, 64, 256)]
+# bench: the largest payload a ``--candidates`` one-shot engine is timed at.
+# Not a correctness limit -- the kernel is exact at every size -- but the
+# one-shot handshakes once per tile, so far past any policy window it costs
+# minutes per candidate to measure a size nothing routes to it.
+# AITER_BENCH_FLY1S_MAX_KB moves it for one run.
+CANDIDATE_MAX_BYTES = 64 << 20
+
+
+def _candidate_max_bytes() -> int:
+    kb = os.environ.get("AITER_BENCH_FLY1S_MAX_KB")
+    return int(kb) << 10 if kb else CANDIDATE_MAX_BYTES
+
+
+def _fused_applies(knobs: dict, hidden: int) -> bool:
+    """Whether a pinned fused one-shot builds exactly *knobs* at *hidden*.
+
+    A pinned ``block`` or ``split`` exists at only some widths. The engine
+    would fall back to the nearest geometry, and the column would then time
+    another build under this candidate's name, so the cell is left empty.
+    """
+    from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+        fused_block_options,
+        fused_hidden_supported,
+        fused_padded_block_options,
+        fused_split_options,
+    )
+
+    split, block = knobs.get("split"), knobs.get("block")
+    if split is not None and split > 1:
+        return any(
+            k == split and (block is None or b == block)
+            for k, b, _a in fused_split_options(hidden)
+        )
+    if block is not None:
+        return any(b == block for b, _a in fused_block_options(hidden)) or any(
+            b == block for b, _a, _h in fused_padded_block_options(hidden)
+        )
+    atoms = knobs.get("atoms", 1)
+    return fused_hidden_supported(hidden, atoms) or any(
+        a == atoms for _b, a, _h in fused_padded_block_options(hidden)
+    )
+
 
 # (tp, knobs): pinned configurations that ``--extended`` spot-checks next to
 # the shipped ladder, for widths no shipped rung uses yet. It runs each at every
@@ -607,11 +672,13 @@ def _bench_rank(
     engine_kw: dict,
     cases: list[tuple],
     timing: tuple[int, int],
+    extra: tuple = (),
 ) -> list[dict]:
     """One rank of one bench spawn: every candidate on every case.
 
-    A case is ``(tokens, hidden)``. Returns, per case, the production
-    candidate's name and each candidate's per-rank result.
+    A case is ``(tokens, hidden)``. *extra* is ``(name, knobs)`` per pinned
+    engine from ``--candidates``, timed next to ``flydsl``. Returns, per case,
+    the production candidate's name and each candidate's per-rank result.
     """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -625,6 +692,12 @@ def _bench_rank(
     if nccl is not None and nccl.disabled:
         nccl = None
     eng = _engine(rank, tp, cpu_group, device, engine_kw)
+    # Built in a fixed order: each engine's IPC exchange is a collective.
+    fly = {"flydsl": eng}
+    fly.update(
+        (name, _engine(rank, tp, cpu_group, device, dict(knobs)))
+        for name, knobs in extra
+    )
     reps, rounds = timing
 
     # The input and every candidate's output, for the whole spawn. Refer to
@@ -632,7 +705,7 @@ def _bench_rank(
     max_bytes = max(m * hidden * 2 for m, hidden in cases)
     bufs = {
         name: torch.empty(max_bytes, dtype=torch.uint8, device=device)
-        for name in ("inp", "flydsl", *STOCK)
+        for name in ("inp", *fly, *STOCK)
     }
 
     def _view(name, m, hidden):
@@ -658,9 +731,14 @@ def _bench_rank(
             x.copy_(parts[rank])
             ref = torch.stack(parts).float().sum(0)
             nbytes = m * hidden * 2
-            outs = {name: _view(name, m, hidden) for name in ("flydsl", *STOCK)}
+            outs = {name: _view(name, m, hidden) for name in (*fly, *STOCK)}
 
-            thunks = {"flydsl": lambda x=x, o=outs["flydsl"]: eng.allreduce(x, o)}
+            # A --candidates engine past its size cap is left out: n/a.
+            thunks = {
+                name: lambda x=x, o=outs[name], e=e: e.allreduce(x, o)
+                for name, e in fly.items()
+                if name == "flydsl" or nbytes <= _candidate_max_bytes()
+            }
             # The same gate production applies before it runs a cdr kernel;
             # where it rejects the payload, production runs RCCL.
             custom = ca is not None and ca.should_custom_ar(x)
@@ -687,7 +765,9 @@ def _bench_rank(
             times = fab.time_graphs(graphs, cpu_group, reps=reps, rounds=rounds)
             for name, us in times.items():
                 res[name]["us"] = us
-            res["flydsl"]["variant"] = eng.variant(nbytes)
+            for name, e in fly.items():
+                if name in res:
+                    res[name]["variant"] = e.variant(nbytes)
             for name, use_new in CDR_KERNELS.items():
                 if name in res:
                     res[name]["variant"] = fab.cdr_variant(
@@ -700,6 +780,9 @@ def _bench_rank(
             rows.append({"prod": "cdr" if custom else "rccl", "candidates": res})
             del graphs
     finally:
+        for name, e in fly.items():
+            if name != "flydsl":
+                e.close()
         _teardown(eng, cpu_group)
     return rows
 
@@ -874,14 +957,20 @@ def _dispatch_ranks(tp: int) -> list[dict]:
     return _DISPATCH[tp]
 
 
+def _bench_key(tp: int, engine_kw: dict, extra: tuple = (), op: str = "ar") -> tuple:
+    return (tp, tuple(sorted(engine_kw.items())), extra, op)
+
+
 def _bench_ranks(key: tuple) -> list[list[dict]]:
     if key not in _RESULTS:
+        tp, engine_kw, extra, op = key
         _RESULTS[key] = _spawn(
-            _bench_rank,
-            key[0],
-            engine_kw=dict(key[1]),
+            _bench_rank if op == "ar" else _bench_fused_rank,
+            tp,
+            **({"engine_kw": dict(engine_kw)} if op == "ar" else {}),
             cases=_CASES[key],
             timing=_TIMING,
+            extra=extra,
         )
     return _RESULTS[key]
 
@@ -952,19 +1041,24 @@ def bench_one_shot_allreduce(
     grid_cap=None,
     fanout=None,
     block=None,
+    extra=(),
 ):
-    """The one-shot against production's kernel and the best stock kernel."""
+    """The one-shot against production's kernel and the best stock kernel.
+
+    *extra* are the ``--candidates`` engines, timed in the same spawn.
+    """
     engine_kw = _engine_kw(atoms, grid_cap, fanout, block)
-    key = _key(tp, engine_kw)
+    key = _bench_key(tp, engine_kw, extra)
     i = _CASES[key].index((tokens, hidden))
     per_rank = [r[i] for r in _bench_ranks(key)]
-    names = [n for n in ("flydsl", *STOCK) if n in per_rank[0]["candidates"]]
+    pinned = tuple(name for name, _knobs in extra)
+    names = [n for n in ("flydsl", *pinned, *STOCK) if n in per_rank[0]["candidates"]]
     got = {n: fab.collapse([r["candidates"][n] for r in per_rank]) for n in names}
 
     label = f"tp={tp} {tokens}x{hidden} {engine_kw}"
     fails = []
     for name, c in got.items():
-        floor = SQNR_FLOOR_DB if name == "flydsl" else STOCK_SQNR_FLOOR_DB
+        floor = STOCK_SQNR_FLOOR_DB if name in STOCK else SQNR_FLOOR_DB
         if c["SQNR dB"] < floor:
             fails.append(f"{name}: SQNR {c['SQNR dB']:.2f} dB below {floor} dB")
         if c["variant"] is not None and c["variant"].startswith("MIXED"):
@@ -985,6 +1079,7 @@ def bench_one_shot_allreduce(
     best_us = got[best]["us"] if best else None
     ret = {
         "gfx": ARCH,
+        "operation": "ar",
         "KiB": tokens * hidden * 2 / 1024,
         "prod": _name(prod) if prod in got else prod,
         "prod us": prod_us,
@@ -2188,7 +2283,26 @@ def _verify_fused(tps) -> None:
         aiter.logger.info("fused tp=%s: %d failures", tp, len(fused_fails))
 
 
+def _candidates(args, operation: str) -> tuple:
+    """``(name, knobs)`` of every ``--candidates`` row for the one-shot."""
+    if args.candidates is None:
+        return ()
+    return tuple(
+        (c.name, tuple(sorted(c.knobs.items())))
+        for c in fab.load_candidates(
+            args.candidates,
+            operation=operation,
+            algorithms=("oneshot",),
+            candidate_set=args.candidate_set,
+        )
+    )
+
+
 def _bench(args, tps, configs, given, link) -> None:
+    if args.operation == "ar_rmsnorm":
+        _bench_fused(args, tps, given, link)
+        return
+    extra = _candidates(args, "ar")
     rows = []
     for tp, knobs in itertools.product(tps, configs):
         if given is None:
@@ -2199,12 +2313,15 @@ def _bench(args, tps, configs, given, link) -> None:
             )
         else:
             shapes = given
-        _CASES[_key(tp, _engine_kw(**knobs))] = list(shapes)
-        rows += [bench_one_shot_allreduce(t, h, tp, **knobs) for t, h in shapes]
+        _CASES[_bench_key(tp, _engine_kw(**knobs), extra)] = list(shapes)
+        rows += [
+            bench_one_shot_allreduce(t, h, tp, **knobs, extra=extra) for t, h in shapes
+        ]
+    rows = [{k: v for k, v in r.items() if k != "extra"} for r in rows]
 
     tables = fab.bench_tables(
         rows,
-        candidates=("flydsl", *STOCK),
+        candidates=("flydsl", *(name for name, _ in extra), *STOCK),
         drop=KNOBS,
         title="flydsl one-shot allreduce vs stock",
     )
@@ -2222,6 +2339,329 @@ def _bench(args, tps, configs, given, link) -> None:
         ],
     )
     fab.write_outputs(args, "FlyDSL one-shot all-reduce bench", header, tables, rows)
+
+
+def _fused_prod(ca, x, use_1stage: bool) -> str:
+    """The stock candidate ``CudaCommunicator.fused_allreduce_rmsnorm`` runs on
+    *x*, with the FlyDSL path off and quick reduce at its default (``NONE``).
+
+    Mirrors its gates: ``CustomAllreduce``'s fused kernel where it accepts the
+    payload, and otherwise the all-reduce production would run, then the norm.
+    """
+    nbytes = x.numel() * x.element_size()
+    hidden = x.shape[-1]
+    custom = ca is not None and ca.should_custom_ar(x)
+    if custom and hidden <= 16384 and nbytes < 8 * 1024 * 8192:
+        return "cdr_fused_1stage" if use_1stage else "cdr_fused_2stage"
+    return "cdr+norm" if custom else "rccl+norm"
+
+
+def _use_1stage(tp: int, nbytes: int) -> bool:
+    """``use_1stage`` of ``CudaCommunicator.fused_allreduce_rmsnorm``."""
+    from aiter.dist.device_communicators.communicator_cuda import CudaCommunicator
+
+    override = CudaCommunicator._ar_1stage_override
+    if override is not None:
+        return override
+    max_kb = CudaCommunicator._ar_1stage_max_kb
+    limit = max_kb if max_kb >= 0 else 128 * 7168 * 2 // tp
+    return nbytes <= limit
+
+
+def _bench_fused_rank(
+    rank: int,
+    tp: int,
+    init_method: str,
+    cases: list[tuple],
+    timing: tuple[int, int],
+    extra: tuple = (),
+) -> list[dict]:
+    """One rank of one ``ar_rmsnorm`` bench spawn: every candidate on every case.
+
+    ``flydsl`` is ``OneShotAllReduceRMSNorm`` on the shipped ladder, and
+    *extra* the ``--candidates`` engines; the stock candidates are
+    ``FUSED_STOCK``. A case is ``(tokens, hidden)``. Returns, per case, the
+    production candidate's name and each candidate's per-rank result.
+    """
+    from aiter.ops.flydsl.one_shot_allreduce import OneShotAllReduceRMSNorm
+
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+    tp_group = _init_dist(rank, tp, init_method, stock=True)
+    cpu_group = tp_group.cpu_group
+    comm = tp_group.device_communicator
+    ca = comm.ca_comm
+    if ca is not None and ca.disabled:
+        ca = None
+    nccl = comm.pynccl_comm
+    if nccl is not None and nccl.disabled:
+        nccl = None
+    # Built in a fixed order: each engine's IPC exchange is a collective, and so
+    # is each width's build (``preload`` below). The payload ceiling is a speed
+    # policy, so it is lifted, as in verify.
+    knobs_of = {"flydsl": {}, **{name: dict(knobs) for name, knobs in extra}}
+    fly = {
+        name: OneShotAllReduceRMSNorm(
+            group=cpu_group,
+            device=device,
+            rank=rank,
+            world_size=tp,
+            max_bytes=1 << 30,
+            **knobs,
+        )
+        for name, knobs in knobs_of.items()
+    }
+    reps, rounds = timing
+    eps = fab.RMS_EPS
+
+    # The inputs and every candidate's outputs, for the whole spawn. Refer to
+    # flydsl_allreduce_bench for why the addresses must not change.
+    names = (*fly, *FUSED_STOCK)
+    max_bytes = max(m * hidden * 2 for m, hidden in cases)
+    bufs = {
+        name: torch.empty(max_bytes, dtype=torch.uint8, device=device)
+        for name in (
+            "inp",
+            "residual",
+            "ar",
+            *(f"{n}:{o}" for n in names for o in ("out", "res")),
+        )
+    }
+
+    def _view(name, m, hidden):
+        return bufs[name][: m * hidden * 2].view(torch.bfloat16).view(m, hidden)
+
+    rows = []
+    try:
+        for m, hidden in cases:
+            parts, residual_src, weight = _fused_inputs(m, hidden, tp, device)
+            x = _view("inp", m, hidden)
+            x.copy_(parts[rank])
+            residual = _view("residual", m, hidden)
+            residual.copy_(residual_src)
+            ar_buf = _view("ar", m, hidden)
+            ref_out, ref_res = fab.fused_reference(
+                torch.stack(parts).float().sum(0), residual, weight, eps
+            )
+            nbytes = m * hidden * 2
+            use_1stage = _use_1stage(tp, nbytes)
+            outs = {
+                n: (_view(f"{n}:out", m, hidden), _view(f"{n}:res", m, hidden))
+                for n in names
+            }
+
+            # A --candidates engine whose pinned geometry this width does not
+            # have, or past its size cap, is left out: n/a.
+            live = {
+                name: e
+                for name, e in fly.items()
+                if name == "flydsl"
+                or (
+                    _fused_applies(knobs_of[name], hidden)
+                    and nbytes <= _candidate_max_bytes()
+                )
+            }
+            for e in live.values():
+                e.preload(hidden)
+            thunks = _fused_thunks(
+                live, ca, nccl, outs, x, residual, weight, ar_buf, eps
+            )
+            graphs, res = {}, {}
+            for name, thunk in thunks.items():
+                graphs[name] = fab.capture(thunk)
+                out, res_out = fab.graded_replay(graphs[name], outs[name], cpu_group)
+                res[name] = {
+                    "sqnr_db": min(
+                        _sqnr_db(ref_out.float(), out.float()),
+                        _sqnr_db(ref_res.float(), res_out.float()),
+                    ),
+                }
+            times = fab.time_graphs(graphs, cpu_group, reps=reps, rounds=rounds)
+            for name, us in times.items():
+                res[name]["us"] = us
+            for name, e in live.items():
+                res[name]["variant"] = e.variant(hidden, nbytes)
+            for name in ("cdr_fused_1stage", "cdr_fused_2stage", "cdr+norm"):
+                if name in res and not ca.enable_register_for_capturing:
+                    res[name]["variant"] = "staged"
+            rows.append({"prod": _fused_prod(ca, x, use_1stage), "candidates": res})
+            del graphs
+    finally:
+        for e in fly.values():
+            e.close()
+        _teardown_group(cpu_group)
+    return rows
+
+
+def _fused_thunks(fly, ca, nccl, outs, x, residual, weight, ar_buf, eps) -> dict:
+    """The ``ar_rmsnorm`` bench thunks, by candidate name, for one case.
+
+    Every thunk writes into its preallocated ``outs[name]``: ``fused_ar_rms``
+    allocates whatever it is not given, and an allocation inside a capture is
+    at best a surprise.
+    """
+    from aiter import rmsnorm2d_fwd_with_add
+
+    thunks = {}
+    for name, e in fly.items():
+
+        def _fly(e=e, o=outs[name]):
+            e.allreduce_rmsnorm(x, residual, weight, eps, out=o[0], residual_out=o[1])
+
+        thunks[name] = _fly
+
+    reg = ca is not None and ca.enable_register_for_capturing
+
+    def _registered():
+        # As CustomAllreduce: in place under capture, through its pool otherwise.
+        return reg and torch.cuda.is_current_stream_capturing()
+
+    custom = ca is not None and ca.should_custom_ar(x)
+    if custom and x.shape[-1] <= 16384:
+        for name, one in (("cdr_fused_1stage", True), ("cdr_fused_2stage", False)):
+
+            def _cdr_fused(o=outs[name], one=one):
+                ca.fused_ar_rms(
+                    x,
+                    residual,
+                    res_out=o[1],
+                    out=o[0],
+                    w=weight,
+                    eps=eps,
+                    registered=_registered(),
+                    use_1stage=one,
+                )
+
+            thunks[name] = _cdr_fused
+    if custom:
+
+        def _cdr_norm(o=outs["cdr+norm"]):
+            ca.all_reduce(x, out=ar_buf, registered_input=_registered())
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks["cdr+norm"] = _cdr_norm
+    if nccl is not None:
+
+        def _rccl_norm(o=outs["rccl+norm"]):
+            # What CudaCommunicator.all_reduce falls back to, then the norm.
+            nccl.all_reduce(x, ar_buf)
+            rmsnorm2d_fwd_with_add(o[0], ar_buf, residual, o[1], weight, eps)
+
+        thunks["rccl+norm"] = _rccl_norm
+    return thunks
+
+
+def _teardown_group(group) -> None:
+    import torch.distributed as dist
+
+    torch.cuda.synchronize()
+    dist.barrier(group=group)
+    destroy_model_parallel()
+    destroy_distributed_environment()
+
+
+def _fused_route(tp: int, link: str, nbytes: int) -> tuple[str, str]:
+    """The fused families the policy routes *nbytes* to, quantized and exact."""
+    policy = fly_policy.resolve_fused_policy(world_size=tp, link=link)
+    got = []
+    for quantized in (True, False):
+        alg = policy.select(nbytes, quantized=quantized)
+        got.append("fallback" if alg is None else alg.value)
+    return tuple(got)
+
+
+@benchmark()
+def bench_one_shot_allreduce_rmsnorm(tokens, hidden, tp, link, extra=()):
+    """The fused one-shot against production's fused path and the best stock
+    candidate. *extra* are the ``--candidates`` engines, timed in the same
+    spawn."""
+    key = _bench_key(tp, {}, extra, "ar_rmsnorm")
+    i = _CASES[key].index((tokens, hidden))
+    per_rank = [r[i] for r in _bench_ranks(key)]
+    pinned = tuple(name for name, _knobs in extra)
+    names = [
+        n for n in ("flydsl", *pinned, *FUSED_STOCK) if n in per_rank[0]["candidates"]
+    ]
+    got = {n: fab.collapse([r["candidates"][n] for r in per_rank]) for n in names}
+
+    label = f"ar_rmsnorm tp={tp} {tokens}x{hidden}"
+    fails = []
+    for name, c in got.items():
+        if c["SQNR dB"] < FUSED_BENCH_SQNR_FLOOR_DB:
+            fails.append(
+                f"{name}: SQNR {c['SQNR dB']:.2f} dB below "
+                f"{FUSED_BENCH_SQNR_FLOOR_DB} dB"
+            )
+        if c["variant"] is not None and c["variant"].startswith("MIXED"):
+            fails.append(f"{name}: ranks ran different kernels: {c['variant']}")
+    _check(label, fails)
+
+    fly_us = got["flydsl"]["us"]
+    prod = per_rank[0]["prod"]
+    prod_us = got[prod]["us"] if prod in got else None
+    passing = [
+        n
+        for n in FUSED_STOCK
+        if n in got and got[n]["SQNR dB"] >= FUSED_BENCH_SQNR_FLOOR_DB
+    ]
+    best = min(passing, key=lambda n: got[n]["us"], default=None)
+    best_us = got[best]["us"] if best else None
+    route, route_exact = _fused_route(tp, link, tokens * hidden * 2)
+    ret = {
+        "gfx": ARCH,
+        "operation": "ar_rmsnorm",
+        "KiB": tokens * hidden * 2 / 1024,
+        "route": route,
+        "route exact": route_exact,
+        "prod": prod,
+        "prod us": prod_us,
+        "flydsl vs prod": fab.speedup(prod_us, fly_us),
+        "best stock": best,
+        "best stock us": best_us,
+        "flydsl vs best": fab.speedup(best_us, fly_us),
+    }
+    for name, c in got.items():
+        ret.update({f"{name} {field}": v for field, v in c.items()})
+    return ret
+
+
+def _bench_fused(args, tps, given, link) -> None:
+    extra = _candidates(args, "ar_rmsnorm")
+    shapes = given or FUSED_BENCH_SHAPES
+    rows = []
+    for tp in tps:
+        _CASES[_bench_key(tp, {}, extra, "ar_rmsnorm")] = list(shapes)
+        rows += [
+            bench_one_shot_allreduce_rmsnorm(t, h, tp, link, extra=extra)
+            for t, h in shapes
+        ]
+    rows = [{k: v for k, v in r.items() if k not in ("extra", "link")} for r in rows]
+
+    tables = fab.bench_tables(
+        rows,
+        candidates=("flydsl", *(name for name, _ in extra), *FUSED_STOCK),
+        title="flydsl one-shot allreduce + rmsnorm vs stock",
+    )
+    for title, df in tables:
+        aiter.logger.info("%s (markdown):\n%s", title, fab.to_markdown(df))
+    header = fab.provenance(
+        args,
+        link,
+        [
+            (
+                "- prod: CudaCommunicator.fused_allreduce_rmsnorm with "
+                "AITER_FLY_AR=0 and AITER_QUICK_REDUCE_QUANTIZATION=NONE"
+            ),
+            (
+                "- `route`: the fused policy's family with "
+                "AITER_FLY_AR_ACCURACY=fast, `route exact` with exact"
+            ),
+            "- `flydsl vs X` is `X us / flydsl us`: above 1.0 the one-shot is faster",
+        ],
+    )
+    fab.write_outputs(
+        args, "FlyDSL one-shot all-reduce + RMSNorm bench", header, tables, rows
+    )
 
 
 def main():
