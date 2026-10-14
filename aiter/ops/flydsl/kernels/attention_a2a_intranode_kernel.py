@@ -1365,20 +1365,12 @@ def make_attention_a2a_kernel(
 
         @flyc.jit
         def transport_fp6_native(shared):
-            if const_expr(v4_output == "q"):
-                native_q_peer = fx.idx2crd(
-                    fx.Int32(global_warp_id),
-                    fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
-                )
-                peer_warp = fx.Int32(fx.get_scalar(fx.get(native_q_peer, 0)))
-                dest_pe = fx.Int32(fx.get_scalar(fx.get(native_q_peer, 1)))
-            else:
-                peer_coord = fx.idx2crd(
-                    fx.Int32(global_warp_id),
-                    fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
-                )
-                peer_warp = fx.Int32(fx.get_scalar(fx.get(peer_coord, 0)))
-                dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
+            peer_coord = fx.idx2crd(
+                fx.Int32(global_warp_id),
+                fx.make_layout((UNBOUNDED_OUTER_EXTENT, npes), (npes, 1)),
+            )
+            peer_warp = fx.Int32(fx.get_scalar(fx.get(peer_coord, 0)))
+            dest_pe = fx.Int32(fx.get_scalar(fx.get(peer_coord, 1)))
             peer_warps = global_warp_num // npes
             groups_per_row = head_dim // 32
             peer_groups = heads_local * seq_len * groups_per_row
