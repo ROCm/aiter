@@ -55,6 +55,11 @@ SHAPES = [
     (384, 7168, 256, 8),  # Kimi-K2 TP=8
     (512, 4096, 512, 10),  # Qwen3.5 TP=1
     (513, 4096, 512, 11),  # Qwen3.5 shared-expert variant
+    (512, 2048, 512, 10),  # Qwen3-Coder-Next TP=1
+    (256, 6144, 2048, 8),  # GLM-5.3 TP=1
+    (256, 6144, 3072, 6),  # Inkling TP=1
+    (384, 6144, 2048, 8),  # MiMo-V2.5-Pro TP=1
+    (288, 4096, 2048, 8),  # GLM-5.3-Flash / Step-3.5-Flash TP=1 aux key
 ]
 
 

@@ -225,6 +225,10 @@ def sage_quant_v_kernel(
     stride_kh,
     stride_kn,
     stride_kd,
+    stride_voz,
+    stride_voh,
+    stride_von,
+    stride_vod,
     stride_vsz,
     stride_vsh,
     BATCH,
@@ -249,9 +253,15 @@ def sage_quant_v_kernel(
         + offs_kn[:, None] * stride_kn
         + offs_d[None, :] * stride_kd
     )
+    v_out_offs = (
+        off_b * stride_voz
+        + off_h * stride_voh
+        + offs_kn[:, None] * stride_von
+        + offs_d[None, :] * stride_vod
+    )
 
     v_input_ptrs = V_Input + v_offs
-    v_output_ptrs = V_Output + v_offs
+    v_output_ptrs = V_Output + v_out_offs
 
     # just apply the per channel v_scales that have been computed outside
     v_scale_ptrs = V_Scale + off_b * stride_vsz + off_h * stride_vsh + offs_d[None, :]
@@ -1380,9 +1390,27 @@ def sage_quant_kernel(
     stride_qz,
     stride_qh,
     stride_qn,
+    stride_qd,
+    stride_qoz,
+    stride_qoh,
+    stride_qon,
+    stride_qod,
     stride_kz,
     stride_kh,
     stride_kn,
+    stride_kd,
+    stride_koz,
+    stride_koh,
+    stride_kon,
+    stride_kod,
+    stride_vz,
+    stride_vh,
+    stride_vn,
+    stride_vd,
+    stride_voz,
+    stride_voh,
+    stride_von,
+    stride_vod,
     stride_qsz,
     stride_qsh,
     stride_ksz,
@@ -1421,11 +1449,17 @@ def sage_quant_kernel(
             off_b * stride_qz
             + off_h * stride_qh
             + offs_qn[:, None] * stride_qn
-            + offs_d[None, :]
+            + offs_d[None, :] * stride_qd
+        )
+        q_out_offs = (
+            off_b * stride_qoz
+            + off_h * stride_qoh
+            + offs_qn[:, None] * stride_qon
+            + offs_d[None, :] * stride_qod
         )
 
         q_input_ptrs = Q_Input + q_offs
-        q_output_ptrs = Q_Output + q_offs
+        q_output_ptrs = Q_Output + q_out_offs
         q_scale_ptrs = Q_Scale + off_b * stride_qsz + off_h * stride_qsh + off_blk
 
         _general_quant_kernel(
@@ -1447,11 +1481,17 @@ def sage_quant_kernel(
             off_b * stride_kz
             + off_h * stride_kh
             + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
+            + offs_d[None, :] * stride_kd
+        )
+        k_out_offs = (
+            off_b * stride_koz
+            + off_h * stride_koh
+            + offs_kn[:, None] * stride_kon
+            + offs_d[None, :] * stride_kod
         )
 
         k_input_ptrs = K_Input + k_offs
-        k_output_ptrs = K_Output + k_offs
+        k_output_ptrs = K_Output + k_out_offs
         k_scale_ptrs = K_Scale + off_b * stride_ksz + off_h * stride_ksh + off_blk
 
         _general_quant_kernel(
@@ -1468,14 +1508,20 @@ def sage_quant_kernel(
         offs_kn = off_blk * BLK_K + offs_blk_k
 
         v_offs = (
-            off_b * stride_kz
-            + off_h * stride_kh
-            + offs_kn[:, None] * stride_kn
-            + offs_d[None, :]
+            off_b * stride_vz
+            + off_h * stride_vh
+            + offs_kn[:, None] * stride_vn
+            + offs_d[None, :] * stride_vd
+        )
+        v_out_offs = (
+            off_b * stride_voz
+            + off_h * stride_voh
+            + offs_kn[:, None] * stride_von
+            + offs_d[None, :] * stride_vod
         )
 
         v_input_ptrs = V_Input + v_offs
-        v_output_ptrs = V_Output + v_offs
+        v_output_ptrs = V_Output + v_out_offs
 
         # just apply the per channel v_scales that have been computed outside
         v_scale_ptrs = (
