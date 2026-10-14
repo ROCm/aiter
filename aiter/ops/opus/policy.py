@@ -31,6 +31,7 @@ from ...jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..gemm_op_common import get_padded_m, with_mxscale_w_scale_block
 from ._arch import GFX942, GFX950, GFX1250
 from .launch_plan import (
+    _A8W8_MXSCALE_BMM_PREFETCH_TAGS,
     A16W16LaunchPlan,
     _get_cached_a8w8_mxscale_bmm_plan,
     _get_cached_a16w16_launch_plan,
@@ -809,21 +810,38 @@ def _heuristic_mxscale_bmm_kid(
 # there most often at K=4096; the later ones only have to run where it cannot,
 # which is why each band ends in the 32-wide, 128-deep tiles that divide any N
 # and K the family accepts at all, and then in the compact tiles.
-#
-# K-tile sufficiency is not screened here. Every band family is in
-# launch_plan._A8W8_MXSCALE_BMM_PREFETCH_TAGS, so the plan call below already
-# rejects a candidate whose K cannot feed that instance's own prefetch depth.
-# Screening on a blanket bound instead denied a fallback to every K below four
-# of the shallowest band tile's 128, so K=128, 256 and 384 raised even where a
-# tile ran. The compact family sits outside that tag set because it consumes a
-# single K tile, which is what leaves it as the only candidate for a K no band
-# tile can prefetch; it goes last so it only answers shapes the bands drop.
-# GROUP_K=32 has no compact twin and so keeps the band tiles' K floor.
 _BPRESHUFFLE_FALLBACK_BANDS = (
     (64, (179, 398, 171, 338, 483, 484)),
     (512, (171, 175, 338, 398, 483, 484)),
     (None, (205, 348, 175, 338, 398, 484, 483)),
 )
+# A candidate whose K cannot feed its prefetch ring has to be screened out, and
+# which screen applies depends on the family. For the tags the launch plan
+# prefetch-validates -- the bdirect and blds tiles above -- it already checks K
+# against a8w8_mxscale_flatmm_prefetch_k_iter of that exact instance, which is both
+# authoritative and tighter than any bound here: 338 needs 3 tiles of 128, not the
+# 4 a blanket bound demands. The wave8n4 (175, 348) and wavetm1 (205) tiles are
+# not in that set and run their own kernels, so the helper's flatmm traits say
+# nothing about them; they keep the conservative 4-tile bound.
+#
+# Compact needs no screen at all, and shows why the helper cannot simply be
+# extended by tag: it reports a depth of 9 for 483, yet test_compact_mxscale_bmm
+# runs that tile at a K of one tile. Its pipeline consumes one K tile with no
+# cross-tile ring, which is what leaves it as the only candidate for a K no band
+# tile can prefetch. It goes last in each band so it only answers shapes the bands
+# drop. GROUP_K=32 has no compact twin and so keeps the band tiles' K floor.
+_BPRESHUFFLE_FALLBACK_MIN_K_TILES = 4
+_BPRESHUFFLE_NO_K_TILE_FLOOR = frozenset({"a8w8_mxscale_bmm_bpreshuffle_compact"})
+
+
+def _bpreshuffle_fallback_k_tiles_ok(inst, k: int) -> bool:
+    """False when nothing else will screen this candidate's K-tile count."""
+    if (
+        inst.kernel_tag in _A8W8_MXSCALE_BMM_PREFETCH_TAGS
+        or inst.kernel_tag in _BPRESHUFFLE_NO_K_TILE_FLOOR
+    ):
+        return True
+    return k // inst.B_K >= _BPRESHUFFLE_FALLBACK_MIN_K_TILES
 
 
 def _heuristic_mxscale_bmm_bpreshuffle_kid(
@@ -841,6 +859,8 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
     Per-row K32 scales prefer larger tiles for sufficiently large output grids.
     Every candidate is checked for admissibility; None when no candidate runs.
     """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernels_list
+
     _validate_mxscale_bmm_group_size(group_size)
     group_n = group_size if group_n is None else group_n
     block = f"{group_n}x{group_size}"
@@ -873,6 +893,7 @@ def _heuristic_mxscale_bmm_bpreshuffle_kid(
             and mxscale_bmm_kid_takes_b_layout(kid, True)
             and mxscale_bmm_kid_takes_plain_scales(kid)
             and mxscale_bmm_kid_runs_m(kid, m)
+            and _bpreshuffle_fallback_k_tiles_ok(a8w8_mxscale_bmm_kernels_list[kid], k)
         ):
             continue
         try:
