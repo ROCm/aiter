@@ -2064,7 +2064,6 @@ def _build_kernel_w32_tdm(
                 q_tile,
                 num_warps=1,
             )
-            # Row axis stays a rest: fx.copy below indexes it with an i32 tile number.
             q_blk = fx.zipped_divide(q_coord, q_tile)[None, (None, 0)]
 
             def row_of(tile_idx):
