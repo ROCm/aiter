@@ -771,9 +771,12 @@ def build_hstu_attention_bwd_dvdk_pp(
             values, which is the stall this gate was restructured to avoid (it
             also spilled 3 VGPRs). Inline asm pins it scalar.
 
-            `s_nop 0`: `c` is a `v_rcp_f32` result, and a VALU trans op needs
-            one software wait state before a consumer reads it. The hazard
-            recognizer cannot see into INLINEASM, so the asm supplies it.
+            No `s_nop` here, unlike `addone_scalar`. `c` is a `v_rcp_f32`
+            result and a VALU trans op does need one software wait state --
+            but the other two operands are computed FROM that same result
+            (`silu = sc*sig`, `b = emu*sig`), so this cannot issue until at
+            least two instructions after the rcp. The data dependency supplies
+            the wait state that the hazard recognizer cannot see.
             """
             from flydsl._mlir import ir
             from flydsl._mlir.dialects import llvm as _llvm
@@ -783,7 +786,7 @@ def build_hstu_attention_bwd_dvdk_pp(
                     ir.F32Type.get(),
                     [fx.Float32(a).ir_value(), fx.Float32(b).ir_value(),
                      fx.Float32(c).ir_value()],
-                    "s_nop 0\n\tv_fma_f32 $0, $1, $2, $3",
+                    "v_fma_f32 $0, $1, $2, $3",
                     "=v,v,v,v",
                     has_side_effects=False,
                 )
