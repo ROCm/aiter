@@ -1184,61 +1184,101 @@ def fused_moe(
     FlyDSL AOT cache.
 
     """
-    has_shared_expert = (
-        any(
-            tensor is not None
-            for tensor in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
-        )
-        or shared_expert_id != -1
-    )
-    if not clamp_shared and not has_shared_expert:
-        raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
-    if has_shared_expert:
-        routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
-        unsupported = []
-        if stage2_scatter is not None:
-            unsupported.append("stage2_scatter")
-        if quant_type_a is not None:
-            unsupported.append("quant_type_a")
-        fhmoe_quant_dtype_a = (
-            dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
-        )
-        if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
-            unsupported.append("quant_dtype_a")
-        if quant_dtype_a2 is not None:
-            unsupported.append("quant_dtype_a2")
-        # The MXFP8 path does not consume caller-prequantized activations and
-        # requires an explicit preshuffle marker. Preserve the existing DSV4
-        # MXFP4 path, which accepts activation scales and trusts its layout.
-        if routed_mxfp8 and a1_scale is not None:
-            unsupported.append("a1_scale")
-        if routed_mxfp8 and a2_scale is not None:
-            unsupported.append("a2_scale")
-        if unsupported:
-            raise NotImplementedError(
-                "FHMoE shared-expert dispatch does not support "
-                + ", ".join(unsupported)
+    # The custom op consumes a register_presorted_moe() registration at runtime;
+    # an error raised here first (e.g. a non-enum activation) would leave it live
+    # for a later call that reuses the same routing buffers, so drop it then.
+    try:
+        has_shared_expert = (
+            any(
+                tensor is not None
+                for tensor in (shared_w1, shared_w2, shared_w1_scale, shared_w2_scale)
             )
-        weights = (w1, w2, shared_w1, shared_w2)
-        if routed_mxfp8 and any(
-            weight is not None and not getattr(weight, "is_shuffled", False)
-            for weight in weights
-        ):
-            raise ValueError(
-                "FHMoE weights must be AITER-preshuffled and marked "
-                "is_shuffled=True; re-run the shuffle after tensor copies"
+            or shared_expert_id != -1
+        )
+        if not clamp_shared and not has_shared_expert:
+            raise ValueError("clamp_shared=False requires FHMoE shared-expert dispatch")
+        if has_shared_expert:
+            routed_mxfp8 = w1 is not None and w1.dtype == dtypes.fp8
+            unsupported = []
+            if stage2_scatter is not None:
+                unsupported.append("stage2_scatter")
+            if quant_type_a is not None:
+                unsupported.append("quant_type_a")
+            fhmoe_quant_dtype_a = (
+                dtypes.fp8 if GateMode(gate_mode) == GateMode.INTERLEAVE else dtypes.fp4x2
             )
-        from aiter.fhmoe import _fhmoe
+            if quant_dtype_a is not None and quant_dtype_a != fhmoe_quant_dtype_a:
+                unsupported.append("quant_dtype_a")
+            if quant_dtype_a2 is not None:
+                unsupported.append("quant_dtype_a2")
+            # The MXFP8 path does not consume caller-prequantized activations and
+            # requires an explicit preshuffle marker. Preserve the existing DSV4
+            # MXFP4 path, which accepts activation scales and trusts its layout.
+            if routed_mxfp8 and a1_scale is not None:
+                unsupported.append("a1_scale")
+            if routed_mxfp8 and a2_scale is not None:
+                unsupported.append("a2_scale")
+            if unsupported:
+                raise NotImplementedError(
+                    "FHMoE shared-expert dispatch does not support "
+                    + ", ".join(unsupported)
+                )
+            weights = (w1, w2, shared_w1, shared_w2)
+            if routed_mxfp8 and any(
+                weight is not None and not getattr(weight, "is_shuffled", False)
+                for weight in weights
+            ):
+                raise ValueError(
+                    "FHMoE weights must be AITER-preshuffled and marked "
+                    "is_shuffled=True; re-run the shuffle after tensor copies"
+                )
+            from aiter.fhmoe import _fhmoe
 
-        return _fhmoe(
+            return _fhmoe(
+                hidden_states=hidden_states,
+                w1=w1,
+                w2=w2,
+                topk_weight=topk_weight,
+                topk_ids=topk_ids,
+                expert_mask=expert_mask,
+                activation=activation,
+                quant_type=quant_type,
+                doweight_stage1=doweight_stage1,
+                w1_scale=w1_scale,
+                w2_scale=w2_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                block_size_M=block_size_M,
+                num_local_tokens=num_local_tokens,
+                moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
+                dtype=dtype,
+                hidden_pad=hidden_pad,
+                intermediate_pad=intermediate_pad,
+                bias1=bias1,
+                bias2=bias2,
+                swiglu_limit=swiglu_limit,
+                gate_mode=gate_mode,
+                shared_w1=shared_w1,
+                shared_w2=shared_w2,
+                shared_w1_scale=shared_w1_scale,
+                shared_w2_scale=shared_w2_scale,
+                shared_expert_id=shared_expert_id,
+                clamp_shared=clamp_shared,
+                output=output,
+            )
+        if not block_size_M:
+            block_size_M = -1
+        enable_ep_scatter = stage2_scatter is not None
+        scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
+        return fused_moe_(
             hidden_states=hidden_states,
             w1=w1,
             w2=w2,
             topk_weight=topk_weight,
             topk_ids=topk_ids,
             expert_mask=expert_mask,
-            activation=activation,
-            quant_type=quant_type,
+            activation=activation.value,
+            quant_type=quant_type.value,
             doweight_stage1=doweight_stage1,
             w1_scale=w1_scale,
             w2_scale=w2_scale,
@@ -1253,65 +1293,33 @@ def fused_moe(
             bias1=bias1,
             bias2=bias2,
             swiglu_limit=swiglu_limit,
+            beta=beta,
+            linear_beta=linear_beta,
             gate_mode=gate_mode,
-            shared_w1=shared_w1,
-            shared_w2=shared_w2,
-            shared_w1_scale=shared_w1_scale,
-            shared_w2_scale=shared_w2_scale,
-            shared_expert_id=shared_expert_id,
-            clamp_shared=clamp_shared,
+            ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
+            ep_combine_input_offset=(
+                stage2_scatter.combine_input_offset if enable_ep_scatter else 0
+            ),
+            ep_slot_stride_bytes=(
+                stage2_scatter.slot_stride_bytes if enable_ep_scatter else 0
+            ),
+            ep_max_tokens_per_rank=(
+                stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
+            ),
+            ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
+            ep_combine_quant=(
+                int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
+            ),
+            ep_source_token_map=scatter_source_map,
             output=output,
+            quant_type_a=None if quant_type_a is None else quant_type_a.value,
+            quant_dtype_a=quant_dtype_a,
+            quant_dtype_a2=quant_dtype_a2,
         )
-    if not block_size_M:
-        block_size_M = -1
-    enable_ep_scatter = stage2_scatter is not None
-    scatter_source_map = stage2_scatter.source_token_map if enable_ep_scatter else None
-    return fused_moe_(
-        hidden_states=hidden_states,
-        w1=w1,
-        w2=w2,
-        topk_weight=topk_weight,
-        topk_ids=topk_ids,
-        expert_mask=expert_mask,
-        activation=activation.value,
-        quant_type=quant_type.value,
-        doweight_stage1=doweight_stage1,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_size_M=block_size_M,
-        num_local_tokens=num_local_tokens,
-        moe_sorting_dispatch_policy=moe_sorting_dispatch_policy,
-        dtype=dtype,
-        hidden_pad=hidden_pad,
-        intermediate_pad=intermediate_pad,
-        bias1=bias1,
-        bias2=bias2,
-        swiglu_limit=swiglu_limit,
-        beta=beta,
-        linear_beta=linear_beta,
-        gate_mode=gate_mode,
-        ep_arena_handle=stage2_scatter.arena_handle if enable_ep_scatter else 0,
-        ep_combine_input_offset=(
-            stage2_scatter.combine_input_offset if enable_ep_scatter else 0
-        ),
-        ep_slot_stride_bytes=(
-            stage2_scatter.slot_stride_bytes if enable_ep_scatter else 0
-        ),
-        ep_max_tokens_per_rank=(
-            stage2_scatter.max_tokens_per_rank if enable_ep_scatter else 0
-        ),
-        ep_world_size=stage2_scatter.world_size if enable_ep_scatter else 0,
-        ep_combine_quant=(
-            int(stage2_scatter.combine_quant_bits) if enable_ep_scatter else 0
-        ),
-        ep_source_token_map=scatter_source_map,
-        output=output,
-        quant_type_a=None if quant_type_a is None else quant_type_a.value,
-        quant_dtype_a=quant_dtype_a,
-        quant_dtype_a2=quant_dtype_a2,
-    )
+
+    except BaseException:
+        _pop_presorted_moe()
+        raise
 
 
 def fused_moe_fake(
