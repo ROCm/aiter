@@ -13,6 +13,7 @@ one MegaMoE uses.  Outputs must match.
 """
 
 import argparse
+import os
 
 import torch
 import torch.distributed as dist
@@ -24,10 +25,12 @@ from aiter.ops.flydsl.kernels.moonep_plan import MoonEPPlanner
 from aiter.ops.flydsl.kernels.moonep_weights import MoonEPWeightPool
 
 MODEL_DIM, INTER_DIM, EXPERTS, TOPK = 7168, 3072, 384, 6
+# The dispatch wire must carry what the expert GEMM reads as its A operand.
+DISPATCH_WIRE = {"a4w4": "fp4", "a8w4": "fp8"}
 
 
 def _home_weights(layer, rank, epr, spec, device):
-    """This rank's shuffled a8w4 experts ``[w1, w1_scale, w2, w2_scale]``."""
+    """This rank's shuffled mxfp4 experts ``[w1, w1_scale, w2, w2_scale]``."""
     gen = torch.Generator(device=device).manual_seed(7 + 31 * layer + 1009 * rank)
 
     def w(*shape):
@@ -86,6 +89,12 @@ def main():
         help="weight pools sharing one instance, like model layers",
     )
     parser.add_argument(
+        "--quant",
+        choices=sorted(DISPATCH_WIRE),
+        default="a4w4",
+        help="activation dtype of the expert GEMM (gfx1250 defaults to a4w4)",
+    )
+    parser.add_argument(
         "--stage1-fused",
         action="store_true",
         help="MegaMoE's compact stage-1 plan (fused routing + dispatch)",
@@ -100,13 +109,26 @@ def main():
         action="store_true",
         help="negative control: all layers share one slot state",
     )
+    parser.add_argument(
+        "--same-routing",
+        action="store_true",
+        help="one hot routing for every step and layer: from step 1 on every "
+        "slot is a sticky hit, which --shared-state must then get wrong",
+    )
+    parser.add_argument(
+        "--aa",
+        action="store_true",
+        help="control: compare plain against itself (MegaMoE's own run-to-run noise)",
+    )
     args = parser.parse_args()
+    if args.quant == "a8w4":
+        os.environ["AITER_FORCE_A8W4"] = "1"
     ctx = Dist()
     rank, world = ctx.rank, ctx.world
     device = torch.device("cuda", ctx.local_rank)
     epr = EXPERTS // world
     B = args.slots
-    spec = resolve_spec("a8w4_mxfp4")
+    spec = resolve_spec(f"{args.quant}_mxfp4")
     mega_comm = moonep_comm = None
     try:
         mega_comm = _communicator(ctx, 16 * 1024**3)
@@ -130,7 +152,7 @@ def main():
             "activation": spec["activation"],
             "gate_mode": spec["gate_mode"].value,
             "quant_type": spec["aiter_qtype"],
-            "dispatch_wire": "fp8",
+            "dispatch_wire": DISPATCH_WIRE[args.quant],
             "dispatch_backend": "flydsl",
             "stage1_fused": args.stage1_fused,
         }
@@ -168,6 +190,9 @@ def main():
             ).clone()
 
         def run(layer, x, wts, ids, balance):
+            """``(output, ids the instance ran)``; ``--aa`` reruns plain instead."""
+            if args.aa:
+                return forward(plain, layer["home"], x, wts, ids), ids
             if balance:
                 virtual = planner.plan(ids, layer["state"])
                 if not args.skip_prefetch:
@@ -176,9 +201,20 @@ def main():
                     )
             else:
                 virtual = planner.home_ids(ids)
-            return forward(wide, layer["windows"], x, wts, virtual)
+            return forward(wide, layer["windows"], x, wts, virtual), virtual
 
-        ok = True
+        def rerun(layer, x, wts, ran):
+            """The same ids again, no new plan or prefetch."""
+            if args.aa:
+                return forward(plain, layer["home"], x, wts, ran)
+            return forward(wide, layer["windows"], x, wts, ran)
+
+        def compare(out, ref):
+            diff = (out.float() - ref.float()).abs()
+            scale = ref.float().abs().max().clamp(min=1e-6)
+            return float(diff.max() / scale), bool(torch.equal(out, ref))
+
+        ok, flakes = True, 0
         for step in range(args.steps):
             for index, layer in enumerate(layers):
                 for balance in (True, False) if step == 0 else (True,):
@@ -188,37 +224,67 @@ def main():
                         rank,
                         world,
                         epr,
-                        step + 5 * index,
+                        0 if args.same_routing else step + 5 * index,
                         device,
-                        hot=step % 2 == 0,
+                        hot=args.same_routing or step % 2 == 0,
                     )
                     ref = forward(plain, layer["home"], x, wts, ids)
                     dist.barrier()
-                    out = run(layer, x, wts, ids, balance)
+                    out, ran = run(layer, x, wts, ids, balance)
                     torch.cuda.synchronize(device)
                     dist.barrier()
-                    diff = (out.float() - ref.float()).abs()
-                    scale = ref.float().abs().max().clamp(min=1e-6)
-                    max_rel = float(diff.max() / scale)
-                    exact = bool(torch.equal(out, ref))
+                    max_rel, exact = compare(out, ref)
                     placed, prev = layer["state"]["placed"], layer["state"]["prev"]
                     prefetched = int((placed >= 0).sum())
                     kept = int(((placed >= 0) & (placed == prev)).sum())
-                    stats = ctx.gather_objects((max_rel, exact, prefetched, kept))
+                    # Every rank computes the same placement; the tables must agree.
+                    tables = tuple(layer["state"]["held"].flatten().tolist())
+                    stats = ctx.gather_objects(
+                        (max_rel, exact, prefetched, kept, tables)
+                    )
+                    rels = [s[0] for s in stats]
+                    step_ok = max(rels) < 2e-2
+                    agree = len({s[4] for s in stats}) == 1
+                    retry, flaky = "", False
+                    if not step_ok:
+                        # Same ids, no new plan: a pass means the plan and the
+                        # slots were right and the first run itself went wrong.
+                        # MegaMoEGfx1250 alone does that now and then (--aa),
+                        # so the reference is recomputed as well.
+                        ref = forward(plain, layer["home"], x, wts, ids)
+                        dist.barrier()
+                        again = compare(rerun(layer, x, wts, ran), ref)
+                        torch.cuda.synchronize(device)
+                        redo = ctx.gather_objects(again)
+                        flaky = max(m for m, _ in redo) < 2e-2
+                        retry = " retry=" + ",".join(
+                            f"r{r}:{'exact' if e else f'{m:.2e}'}"
+                            for r, (m, e) in enumerate(redo)
+                        )
                     if rank == 0:
-                        rels = [s[0] for s in stats]
                         exacts = sum(int(s[1]) for s in stats)
-                        step_ok = max(rels) < 2e-2
-                        ok &= step_ok
+                        ok &= (step_ok or flaky) and agree
+                        flakes += int(flaky)
+                        bad = [r for r, s in enumerate(stats) if s[0] >= 2e-2]
+                        verdict = (
+                            "OK"
+                            if step_ok and agree
+                            else (
+                                f"FLAKY ranks={bad}"
+                                if flaky and agree
+                                else f"FAIL ranks={bad}"
+                            )
+                        )
                         print(
                             f"step={step} layer={index} balance={balance} "
                             f"hot={step % 2 == 0} placed={stats[0][2]} "
-                            f"kept={stats[0][3]} exact_ranks={exacts}/{world} "
-                            f"max_rel={max(rels):.3e} -> "
-                            f"{'OK' if step_ok else 'FAIL'}",
+                            f"kept={stats[0][3]} tables_agree={agree} "
+                            f"exact_ranks={exacts}/{world} "
+                            f"max_rel={max(rels):.3e} -> {verdict}{retry}",
                             flush=True,
                         )
         if rank == 0:
+            print(f"flaky_steps={flakes}", flush=True)
             print("ALL_OK" if ok else "SOME_FAILED", flush=True)
     finally:
         torch.cuda.synchronize(device)
