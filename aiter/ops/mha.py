@@ -3684,6 +3684,26 @@ def _varlen_descale_reject_reason(q, k, v, **gate_kwargs) -> str:
     return reason
 
 
+# FP8 varlen with q/k/v_descale: FlyDSL FP8 vs the CK descale route, causal,
+# gfx950 (MI355X) GPU timings from PR #6266:
+# - qk/v head_dim 192/128: FlyDSL 1.42-1.74x faster at every measured shape.
+# - 128/128: FlyDSL 1.1-1.5x faster up to 4096 total q tokens; at 8192 tokens it
+#   is 0.82-0.98x with 12 heads (24 heads: still 1.03-1.11x), so hand off to CK
+#   from this many total q tokens.
+_FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS = 8192
+
+
+def _prefer_flydsl_fp8_descale(q, v) -> bool:
+    """Whether a descaled FP8 varlen call should try FlyDSL before CK."""
+    head_dims = (q.shape[-1], v.shape[-1])
+    if head_dims == (192, 128):
+        return True
+    if head_dims == (128, 128):
+        # Varlen q is [total_q_tokens, heads, head_dim].
+        return q.shape[0] < _FLYDSL_FP8_DESCALE_HD128_MAX_Q_TOKENS
+    return False
+
+
 def flash_attn_varlen_func(
     q,
     k,
@@ -3886,9 +3906,14 @@ def flash_attn_varlen_func(
     # FlyDSL path returns result if supported, None otherwise. window_size[2] (sink
     # size) is unsupported: the FlyDSL gate rejects it, and this screen keeps it off
     # the path so a sink-token request is never silently dropped.
-    # Per-tensor Q/K/V descales are consumed by the FlyDSL FP8 kernel; anything
-    # it declines falls back to the CK path, which also takes the descales.
-    if len(window_size) < 3 or window_size[2] == 0:
+    # Per-tensor Q/K/V descales: shapes where FlyDSL FP8 beats CK try it first
+    # (see _prefer_flydsl_fp8_descale); the rest, and anything FlyDSL declines,
+    # take the CK path, which also consumes the descales. Without CK, FlyDSL is
+    # the only backend that honors descales, so always try it.
+    try_flydsl = (
+        not has_all_descales or not ENABLE_CK or _prefer_flydsl_fp8_descale(q, v)
+    )
+    if try_flydsl and (len(window_size) < 3 or window_size[2] == 0):
         from .flydsl.fmha_kernels import flydsl_flash_attn_varlen_func
 
         _flydsl_result = flydsl_flash_attn_varlen_func(

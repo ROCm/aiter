@@ -1994,3 +1994,62 @@ def test_public_varlen_descale_rejects_non_fp8_before_dispatch(monkeypatch, dtyp
     cu = torch.tensor([0, L], dtype=torch.int32)
     with pytest.raises(ValueError, match="must be float8_e4m3fn"):
         flash_attn_varlen_func(q, k, v, cu, cu, L, L, causal=True, q_descale=s)
+
+
+@pytest.mark.parametrize(
+    "total_q, qk_hdim, expected",
+    [
+        (1024, 192, "flydsl"),
+        (16384, 192, "flydsl"),
+        (1024, 128, "flydsl"),
+        (8191, 128, "flydsl"),
+        (8192, 128, "ck"),
+        (16384, 128, "ck"),
+        (1024, 64, "ck"),
+    ],
+)
+def test_public_varlen_descale_route(monkeypatch, total_q, qk_hdim, expected):
+    """Descaled fp8 calls try FlyDSL only where it beats CK; the rest go to CK.
+
+    Both backend entry points are stubbed, so the route is checked on every arch.
+    """
+    from aiter import flash_attn_varlen_func
+    from aiter.ops import mha as mha_module
+    from aiter.ops.flydsl import fmha_kernels
+
+    calls = []
+
+    class _CkStub:
+        @staticmethod
+        def apply(*args):
+            calls.append("ck")
+            return "ck"
+
+    def _flydsl_stub(*args, **kwargs):
+        calls.append("flydsl")
+        return "flydsl"
+
+    monkeypatch.setattr(mha_module, "ENABLE_CK", True)
+    monkeypatch.setattr(mha_module, "FlashAttnVarlenFunc", _CkStub)
+    monkeypatch.setattr(fmha_kernels, "flydsl_flash_attn_varlen_func", _flydsl_stub)
+    H = 1
+    q = torch.empty(total_q, H, qk_hdim, dtype=torch.float8_e4m3fn)
+    k = torch.empty(total_q, H, qk_hdim, dtype=torch.float8_e4m3fn)
+    v = torch.empty(total_q, H, 128, dtype=torch.float8_e4m3fn)
+    s = torch.ones(1, dtype=torch.float32)
+    cu = torch.tensor([0, total_q], dtype=torch.int32)
+    out = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu,
+        cu,
+        total_q,
+        total_q,
+        causal=True,
+        q_descale=s,
+        k_descale=s,
+        v_descale=s,
+    )
+    assert out == expected
+    assert calls == [expected]
