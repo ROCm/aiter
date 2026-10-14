@@ -13,9 +13,19 @@ namespace aiter::mxfp4_moe::moe_scatter_reduce {
 
 using opus::i32x4_t;
 
+// Gather-reduce per token over TOPK sorted rows.
+//
+// reverse_sorted[token * TOPK + i] indexes into flat_out / sorted_weights.
+// A negative index means "skip" (EP remote / dropped route). Any index
+// >= max_sorted is also skipped: without that upper bound, a corrupt or
+// uninitialized reverse map + nontemporal loads (NT_HINTS) fault with
+// HSA_STATUS_ERROR_MEMORY_APERTURE_VIOLATION (seen on MiniMax-M3 TP4 at
+// M=32768 with the #5812 scatter epilog).
+
 template <int D_HIDDEN, int TOPK, int COLS_PER_THREAD, bool NT_HINTS>
 __global__ void scatter_reduce_kernel_impl(
     int M,
+    int max_sorted,
     const __hip_bfloat16 *__restrict__ flat_out,
     const int *__restrict__ reverse_sorted,
     const float *__restrict__ sorted_weights,
@@ -37,7 +47,8 @@ __global__ void scatter_reduce_kernel_impl(
     #pragma unroll
     for (int i = 0; i < TOPK; i++) {
         int sorted_pos = reverse_sorted[token * TOPK + i];
-        if (sorted_pos < 0) continue; // EP: route to a remote expert
+        // < 0: EP remote / dropped. >= max_sorted: corrupt reverse map.
+        if (sorted_pos < 0 || sorted_pos >= max_sorted) continue;
         const float w = sorted_weights[sorted_pos];
 
         #pragma unroll
@@ -85,7 +96,7 @@ __global__ void scatter_reduce_kernel_impl(
 
 template <int D_HIDDEN, int TOPK, int THREADS_PER_CTA, int COLS_PER_THREAD, bool NT_HINTS>
 inline void launch(
-    hipStream_t stream, int M,
+    hipStream_t stream, int M, int max_sorted,
     const __hip_bfloat16 *flat_out, const int32_t *reverse_sorted,
     const float *sorted_weights, __hip_bfloat16 *out)
 {
@@ -93,12 +104,14 @@ inline void launch(
     dim3 grid((D_HIDDEN + cols_per_block - 1) / cols_per_block, M);
 
     scatter_reduce_kernel_impl<D_HIDDEN, TOPK, COLS_PER_THREAD, NT_HINTS>
-        <<<grid, THREADS_PER_CTA, 0, stream>>>(M, flat_out, reverse_sorted, sorted_weights, out);
+        <<<grid, THREADS_PER_CTA, 0, stream>>>(
+            M, max_sorted, flat_out, reverse_sorted, sorted_weights, out);
 }
 
 template <int D_HIDDEN, int TOPK, int COLS_PER_THREAD, bool NT_HINTS>
 __global__ void scatter_reduce_mxfp4_kernel(
     int M,
+    int max_sorted,
     const uint8_t *__restrict__ flat_out_q,
     const uint8_t *__restrict__ flat_out_scale,
     const int *__restrict__ reverse_sorted,
@@ -125,7 +138,7 @@ __global__ void scatter_reduce_mxfp4_kernel(
     #pragma unroll
     for (int i = 0; i < TOPK; i++) {
         const int sorted_pos = reverse_sorted[token * TOPK + i];
-        if (sorted_pos < 0) continue; // EP: route to a remote expert
+        if (sorted_pos < 0 || sorted_pos >= max_sorted) continue;
         const float w = sorted_weights[sorted_pos];
         const uint32_t sw = *reinterpret_cast<const uint32_t*>(
             &flat_out_scale[(long long)sorted_pos * SCOLS + (blk & ~3)]);
@@ -154,7 +167,7 @@ __global__ void scatter_reduce_mxfp4_kernel(
 
 template <int D_HIDDEN, int TOPK, int THREADS_PER_CTA, int COLS_PER_THREAD, bool NT_HINTS>
 inline void launch_mxfp4(
-    hipStream_t stream, int M,
+    hipStream_t stream, int M, int max_sorted,
     const uint8_t *flat_out_q, const uint8_t *flat_out_scale,
     const int32_t *reverse_sorted, const float *sorted_weights, __hip_bfloat16 *out)
 {
@@ -163,7 +176,7 @@ inline void launch_mxfp4(
 
     scatter_reduce_mxfp4_kernel<D_HIDDEN, TOPK, COLS_PER_THREAD, NT_HINTS>
         <<<grid, THREADS_PER_CTA, 0, stream>>>(
-            M, flat_out_q, flat_out_scale, reverse_sorted, sorted_weights, out);
+            M, max_sorted, flat_out_q, flat_out_scale, reverse_sorted, sorted_weights, out);
 }
 
 } // namespace aiter::mxfp4_moe::moe_scatter_reduce

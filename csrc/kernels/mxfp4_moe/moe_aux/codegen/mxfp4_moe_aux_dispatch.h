@@ -101,6 +101,7 @@ using SortScalesFn = void (*)(
 using ScatterReduceFn = void (*)(
     hipStream_t stream,
     int            M,
+    int            max_sorted,
     const void*    flat_out,
     const int32_t* reverse_sorted,
     const float*   sorted_weights,
@@ -109,6 +110,7 @@ using ScatterReduceFn = void (*)(
 using ScatterReduceQFn = void (*)(
     hipStream_t stream,
     int            M,
+    int            max_sorted,
     const void*    flat_out_q,
     const void*    flat_out_scale,
     const int32_t* reverse_sorted,

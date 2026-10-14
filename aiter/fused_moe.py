@@ -167,7 +167,10 @@ def _adaptive_moe_sort(
     sorted_expert_ids = torch.empty(max_sorted // BM, dtype=dtypes.i32, device=device)
     num_valid_ids = torch.empty(2, dtype=dtypes.i32, device=device)
     sorted_weights = torch.empty(max_sorted, dtype=dtypes.fp32, device=device)
-    reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+    # -1 is the scatter_reduce "skip" sentinel (EP remote / dropped). Filling
+    # here means any slot the sort kernel does not overwrite stays safe for
+    # the gather rather than carrying an uninitialized index past flat_out.
+    reverse_sorted = torch.full((M * topk,), -1, dtype=dtypes.i32, device=device)
     m_indices = torch.empty(max_sorted, dtype=dtypes.i32, device=device)
     moe_buf = (
         torch.empty((M, model_dim), dtype=moebuf_dtype, device=device)
@@ -490,13 +493,11 @@ def _moe_sorting_impl(
             max_num_tokens_padded, dtype=dtypes.i32, device=device
         )
         # The sort writes local routes only; EP leaves remote routes at -1,
-        # which the scatter reduce skips.
-        if expert_mask is not None:
-            aux_reverse_sorted = torch.full(
-                (M * topk,), -1, dtype=dtypes.i32, device=device
-            )
-        else:
-            aux_reverse_sorted = torch.empty(M * topk, dtype=dtypes.i32, device=device)
+        # which the scatter reduce skips. Always start at -1 so any slot the
+        # sort does not overwrite stays a safe skip for scatter_reduce.
+        aux_reverse_sorted = torch.full(
+            (M * topk,), -1, dtype=dtypes.i32, device=device
+        )
 
     if use_opus:
         ws_size = aiter.moe_sorting_opus_get_workspace_size(

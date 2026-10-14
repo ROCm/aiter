@@ -168,12 +168,14 @@ AUX_SORT_SCALES_PARAMS = """    int            M,
     void*          a_scale_sorted_shuffled"""
 
 AUX_SCATTER_PARAMS = """    int            M,
+    int            max_sorted,
     const void*    flat_out,
     const int32_t* reverse_sorted,
     const float*   sorted_weights,
     void*          out"""
 
 AUX_SCATTER_Q_PARAMS = """    int            M,
+    int            max_sorted,
     const void*    flat_out_q,
     const void*    flat_out_scale,
     const int32_t* reverse_sorted,
@@ -258,7 +260,7 @@ def _aux_scatter_body(h, topk, nt):
     return (
         f"    aiter::mxfp4_moe::moe_scatter_reduce::launch<\n"
         f"        {h}, {topk}, kThreadsScatterReduce, kColsPerThread, {str(nt).lower()}>(\n"
-        f"            stream, M,\n"
+        f"            stream, M, max_sorted,\n"
         f"            reinterpret_cast<const __hip_bfloat16*>(flat_out),\n"
         f"            reverse_sorted, sorted_weights,\n"
         f"            reinterpret_cast<__hip_bfloat16*>(out));"
@@ -269,7 +271,7 @@ def _aux_scatter_q_body(h, topk, nt):
     return (
         f"    aiter::mxfp4_moe::moe_scatter_reduce::launch_mxfp4<\n"
         f"        {h}, {topk}, kThreadsScatterReduceQ, kColsPerThreadQ, {str(nt).lower()}>(\n"
-        f"            stream, M,\n"
+        f"            stream, M, max_sorted,\n"
         f"            reinterpret_cast<const uint8_t*>(flat_out_q),\n"
         f"            reinterpret_cast<const uint8_t*>(flat_out_scale),\n"
         f"            reverse_sorted, sorted_weights,\n"
