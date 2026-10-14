@@ -3193,6 +3193,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
     src_scale_bytes_per_row: int = 0,
     fuse_ep_psum: bool = False,
     row_major_scale: bool = False,
+    multidest: bool = False,
 ):
     from aiter.ops.flydsl.kernels.moe_fused_route_quant_scatter import (
         build_moe_fused_quant_preshuffle_route_ksplit_module,
@@ -3209,6 +3210,7 @@ def _get_compiled_fused_quant_preshuffle_route_ksplit(
         src_scale_bytes_per_row=src_scale_bytes_per_row,
         fuse_ep_psum=fuse_ep_psum,
         row_major_scale=row_major_scale,
+        multidest=multidest,
     )
 
 
@@ -3451,6 +3453,11 @@ def flydsl_moe_fused_quant_preshuffle(
         use_ksplit = (
             not row_major_scale and grid_blocks < _ROUTEKS_KSPLIT_GRID_THRESHOLD
         )
+        # An already quantized row needs no per-route work: one warp per source
+        # token loads it once and stores it to every local route.
+        use_pq_multidest = prequantized and not use_ksplit and int(source_topk) > 1
+        if use_pq_multidest:
+            grid_blocks = (token_num + warps_per_block - 1) // warps_per_block
         launch = _get_compiled_fused_quant_preshuffle_route_ksplit(
             feat_dim=feat_dim,
             wmma_rep=wmma_rep,
@@ -3464,6 +3471,7 @@ def flydsl_moe_fused_quant_preshuffle(
             ),
             fuse_ep_psum=fuse_ep_psum,
             row_major_scale=row_major_scale,
+            multidest=use_pq_multidest,
         )
         # Dead-tail skip (EP dynamic token count): routes >= num_valid_routes are
         # padding rows of the dispatch buffer and are not gathered/quantized. When
