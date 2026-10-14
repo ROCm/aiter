@@ -278,7 +278,13 @@ def parse_csv(csv_path: str):
                 if params is not None:
                     params = dict(params)
                     params["kind"] = "mxscale_preshuffle"
-                    params["blockscale"] = True
+                    # The scale block is a Constexpr -> a distinct binary, and
+                    # the kernelName deliberately does not spell it; the row's
+                    # w_scale_block does. A table from before the column holds
+                    # only 128x128 rows (as at runtime).
+                    params["w_scale_block"] = row.get(
+                        "w_scale_block", "128x128"
+                    ).strip()
             elif kernel_name.startswith("flydsl_bpreshuffle_8w_"):
                 params = parse_8wave_kernel_name(kernel_name)
                 if params is not None:
@@ -684,16 +690,18 @@ def _compile_mxscale_preshuffle_to_cache(
     b_dtype: str,
     out_dtype: str,
     waves_per_eu: int,
+    w_scale_block: str,
     xcd_swizzle: int = 0,
     split_k: int = 1,
-    blockscale: bool = True,
     **kwargs,
 ):
     """gfx950 MX-microscale preshuffle GEMM (``flydsl_mxpsh_*``).
 
-    ``blockscale`` selects the scale format; the two modes are distinct
-    Constexprs and therefore distinct binaries, so each is its own job. Keep
-    the CSV's logical M so the M<=16 fused split-K specializations are also AOT'd.
+    ``w_scale_block`` is the scale block; each is a distinct Constexpr and
+    therefore a distinct binary, so each is its own job. It has no default:
+    ``parse_csv`` always sets it, and a direct caller that forgets it should get
+    a TypeError rather than a silently-wrong binary. Keep the CSV's logical M so
+    the M<=16 fused split-K specializations are also AOT'd.
     """
     del kwargs
 
@@ -701,6 +709,7 @@ def _compile_mxscale_preshuffle_to_cache(
 
     from aiter.ops.flydsl.mxscale_preshuffle_kernels import (
         flydsl_mxscale_preshuffle_gemm,
+        mxpsh_scale_elems,
     )
 
     dev = torch.device("cpu")
@@ -712,16 +721,11 @@ def _compile_mxscale_preshuffle_to_cache(
     a = torch.empty((m, a_bytes), device=dev, dtype=torch.uint8)
     b = torch.empty((n, b_bytes), device=dev, dtype=torch.uint8)
     out = torch.empty((m, n), device=dev, dtype=out_torch_dtype)
-    if not blockscale:
-        raise NotImplementedError(
-            "mxscale preshuffle AOT covers the a8w8 blockscale mode only. "
-            "Enabling the per-1x32 MX scale layout needs matching tuner and "
-            "runner support (a4w4 / a6w4), not just dummy operands here."
-        )
-    rows = (m + 31) // 32 * 32
-    K1 = (k + 255) // 256
-    a_scale = torch.empty(rows * 2 * K1, device=dev, dtype=torch.uint8)
-    b_scale = torch.empty((n // 128) * 4 * K1, device=dev, dtype=torch.uint8)
+    # Only the addresses reach the kernel, but the sizes are what the runtime
+    # entry point validates, so build the buffers it would accept.
+    a_elems, b_elems = mxpsh_scale_elems(m, n, k, w_scale_block)
+    a_scale = torch.empty(a_elems, device=dev, dtype=torch.uint8)
+    b_scale = torch.empty(b_elems, device=dev, dtype=torch.uint8)
 
     with compile_only_env():
         flydsl_mxscale_preshuffle_gemm(
@@ -738,7 +742,7 @@ def _compile_mxscale_preshuffle_to_cache(
             waves_per_eu=waves_per_eu,
             xcd_swizzle=xcd_swizzle,
             split_k=split_k,
-            blockscale=blockscale,
+            w_scale_block=w_scale_block,
             stream=fx.Stream(0),
         )
 
