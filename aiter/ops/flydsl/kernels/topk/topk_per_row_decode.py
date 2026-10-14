@@ -18,6 +18,7 @@ import torch
 from flydsl.expr import const_expr, gpu, ptrtoint, range_constexpr, rocdl
 
 from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled
+from aiter.utility.graph_alloc import persistent_alloc
 
 from ..communication_ops_utils import (
     atomic_add_agent,
@@ -277,29 +278,39 @@ def build_topk_per_row_decode_module(
     return launch_topk_per_row_decode_kernel
 
 
-def _allocate_workspace(device, rows, columns):
+def _allocate_partials(device, rows, columns):
     return (
         torch.empty((rows, columns), device=device, dtype=torch.int32),
         torch.empty((rows, columns), device=device, dtype=torch.float32),
-        torch.zeros((rows,), device=device, dtype=torch.int32),
     )
 
 
 @lru_cache(maxsize=16)
-def _get_cached_workspace(device, stream_id, rows, columns):
-    return _allocate_workspace(device, rows, columns)
+def _get_cached_partials(device, stream_id, rows, columns):
+    return _allocate_partials(device, rows, columns)
+
+
+@cache
+def _get_cached_counter(device, stream_id, rows):
+    with persistent_alloc(device):
+        return torch.zeros((rows,), device=device, dtype=torch.int32)
 
 
 def _get_workspace(device, stream_id, rows, columns):
-    """Use process-cached eager storage and Graph-pool-owned capture storage."""
-    if torch.cuda.is_current_stream_capturing():
-        # The zero-fill is captured and replays before every kernel launch.
-        return _allocate_workspace(device, rows, columns)
-    return _get_cached_workspace(device, stream_id, rows, columns)
+    """Use stream-cached counters and eager- or Graph-owned partials."""
+    capturing = torch.cuda.is_current_stream_capturing()
+    partials = (
+        _allocate_partials(device, rows, columns)
+        if capturing
+        else _get_cached_partials(device, stream_id, rows, columns)
+    )
+    return (*partials, _get_cached_counter(device, stream_id, rows))
 
 
 def clear_topk_per_row_decode_workspace_cache() -> None:
-    _get_cached_workspace.cache_clear()
+    """Release cached partials/counters when no captured Graph still uses them."""
+    _get_cached_partials.cache_clear()
+    _get_cached_counter.cache_clear()
 
 
 def launch_topk_per_row_decode(

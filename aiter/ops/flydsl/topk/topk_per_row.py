@@ -347,6 +347,8 @@ def flydsl_top_k_per_row_decode(
     ``row_starts`` enables packed rows: row r starts at row_starts[r] in the
     input's first row, while output indices remain relative to that start.
     ``plane_width`` bounds every row and selects the launch geometry.
+    Before CUDAGraph capture, warm the split path on the capture stream so its
+    stream-local arrival counter is allocated and initialized.
     """
 
     _validate_flydsl_topk_call(

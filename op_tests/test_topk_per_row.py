@@ -444,8 +444,8 @@ def test_flydsl_decode_split_reuse():
     """Long rows split across CTAs and merge in the same launch.
 
     The per-row arrival counters rearm themselves; this drives repeated eager
-    calls, CUDA graph replays and two streams, stable and not, over a buffer
-    that mixes split rows with rows one CTA finishes.
+    calls, same-stream CUDA graph warmup/replay and two streams, stable and not,
+    over a buffer that mixes split rows with rows one CTA finishes.
     """
     if get_gfx() not in _FLYDSL_TOPK_DECODE_GATES:
         print("[flydsl_decode_split_reuse] FlyDSL decode not served here; skipping")
@@ -501,28 +501,40 @@ def test_flydsl_decode_split_reuse():
     for seed in (44, 55):
         logits = new_logits(seed)
         indices = torch.empty((num_rows, top_k), dtype=torch.int32)
-        run(logits, indices, False)
+        capture_stream = torch.cuda.Stream()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            run(logits, indices, False)
+        capture_stream.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, stream=capture_stream):
             run(logits, indices, False)
         graphs.append(graph)
-        buffers.append((logits, indices))
+        buffers.append((logits, indices, capture_stream))
     graph_buffers = list(zip(graphs, buffers))
     for replay in range(20):
         # Replay the second graph first once: capture order must not initialize
         # or otherwise affect another graph's counter.
         replay_order = reversed(graph_buffers) if replay == 0 else graph_buffers
-        for graph, (logits, indices) in replay_order:
+        for graph, (logits, indices, capture_stream) in replay_order:
             logits.copy_(new_logits(100 + replay))
-            graph.replay()
+            capture_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(capture_stream):
+                graph.replay()
+            capture_stream.synchronize()
             check(logits, indices, False, f"graph replay #{replay}")
 
-    # Reproduce a temporary output view captured without warmup, followed by
-    # ordinary eager allocations before the first replay.
+    # Warm the stream-local counter, then capture with a temporary output view.
     logits = new_logits(58)
     output_owner = torch.empty((num_rows + 1, top_k), dtype=torch.int32)
+    capture_stream = torch.cuda.Stream()
+    warmup_indices = torch.empty((num_rows, top_k), dtype=torch.int32)
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(capture_stream):
+        run(logits, warmup_indices, False)
+    capture_stream.synchronize()
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with torch.cuda.graph(graph, stream=capture_stream):
         run(logits, output_owner[:num_rows], False)
     victims = (
         torch.full((num_rows, 16 * top_k), 17, dtype=torch.int32),
@@ -536,8 +548,10 @@ def test_flydsl_decode_split_reuse():
         check(eager_logits, eager_indices, False, "eager after capture")
     for replay in range(3):
         logits.copy_(new_logits(80 + replay))
-        graph.replay()
-        torch.cuda.synchronize()
+        capture_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(capture_stream):
+            graph.replay()
+        capture_stream.synchronize()
         check(logits, output_owner[:num_rows], False, "temporary-view graph replay")
         assert bool((victims[0] == 17).all())
         assert bool((victims[1] == 19).all())
