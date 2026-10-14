@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL QSA K2 sparse paged GQA, shaped after the live AMD Triton kernel.
+"""FlyDSL QSA sparse paged GQA, shaped after the live AMD Triton kernel.
 
 One workgroup owns ``(row, kv_head, split)``.  Q is staged once, paged K/V
 are gathered in ``BLOCK_N`` tiles, QK and PV use BF16 MFMA, and online
@@ -221,7 +221,7 @@ def _gfx942_reg_qk(head_dim: int, block_n: int) -> bool:
     return gather_rounds // gather_chunk == 1
 
 
-def build_qsa_k2_module(
+def build_qsa_sparse_gqa_module(
     n_q_heads: int,
     n_kv_heads: int,
     head_dim: int,
@@ -271,7 +271,7 @@ def build_qsa_k2_module(
     merge_per_lane = (n_splits + 63) // 64
     merge_slots = merge_per_lane * 64
     merge_threads = _merge_threads(head_dim, n_splits)
-    # Same predicate qsa_k2_serves applies to the selected launch. Raising
+    # Same predicate qsa_sparse_gqa_serves applies to the selected launch. Raising
     # here keeps a direct builder call from StopIteration on an empty gather
     # or from compiling a kernel that writes only a prefix of D.
     coverage = _k2_coverage_reason(head_dim, block_n, block_threads, n_splits)
@@ -390,7 +390,7 @@ def build_qsa_k2_module(
         denominator: fx.Array[Float32, 1, 16]
 
     @flyc.kernel(
-        name="qsa_k2_split_"
+        name="qsa_sparse_gqa_split_"
         + kernel_signature(
             hq=n_q_heads,
             hk=n_kv_heads,
@@ -1523,7 +1523,7 @@ def build_qsa_k2_module(
             partial_lse[split, row, head] = lse
 
     @flyc.kernel(
-        name="qsa_k2_merge_"
+        name="qsa_sparse_gqa_merge_"
         + kernel_signature(ns=n_splits, blk=merge_threads, d=head_dim),
         known_block_size=[merge_threads, 1, 1],
     )

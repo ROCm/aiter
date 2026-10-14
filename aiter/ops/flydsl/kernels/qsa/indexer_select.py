@@ -1,12 +1,12 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""FlyDSL indexer-select kernels for QSA K1.
+"""FlyDSL indexer-select kernels for QSA.
 
-``build_qsa_k1_emit_module`` writes block ids when every row fits in the
-budget. ``build_qsa_k1_scores_module`` and
-``build_qsa_k1_prefill_scores_module`` are the one-row and 16-row BF16
-MFMA scorers. ``build_qsa_k1_active_columns_module`` reports the widest
+``build_qsa_indexer_emit_module`` writes block ids when every row fits in the
+budget. ``build_qsa_indexer_scores_module`` and
+``build_qsa_indexer_prefill_scores_module`` are the one-row and 16-row BF16
+MFMA scorers. ``build_qsa_indexer_active_columns_module`` reports the widest
 visible column count. Host dispatch and top-512 selection live in
 ``aiter.ops.flydsl.qsa``.
 
@@ -57,7 +57,7 @@ def _neg_inf():
     return Float32(float("-inf"))
 
 
-def build_qsa_k1_emit_module(page_size: int):
+def build_qsa_indexer_emit_module(page_size: int):
     """Build the short-context emit kernel.
 
     The kernel writes block ids from the query position and the context
@@ -70,10 +70,11 @@ def build_qsa_k1_emit_module(page_size: int):
         raise ValueError("block budget must be a multiple of block threads")
 
     @flyc.kernel(
-        name="qsa_k1_emit_" + kernel_signature(ps=page_size, k=_K, blk=_BLOCK_THREADS),
+        name="qsa_indexer_emit_"
+        + kernel_signature(ps=page_size, k=_K, blk=_BLOCK_THREADS),
         known_block_size=[_BLOCK_THREADS, 1, 1],
     )
-    def qsa_k1_emit_kernel(
+    def qsa_indexer_emit_kernel(
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
@@ -98,7 +99,7 @@ def build_qsa_k1_emit_module(page_size: int):
         block_ids[row, tid] = take.select(tid, neg_one)
 
     @flyc.jit
-    def launch_qsa_k1_emit(
+    def launch_qsa_indexer_emit(
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
@@ -108,7 +109,7 @@ def build_qsa_k1_emit_module(page_size: int):
         rows: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_emit_kernel(
+        qsa_indexer_emit_kernel(
             token_to_req,
             query_positions,
             context_lens,
@@ -121,7 +122,7 @@ def build_qsa_k1_emit_module(page_size: int):
             stream=stream,
         )
 
-    return launch_qsa_k1_emit
+    return launch_qsa_indexer_emit
 
 
 def _dense_indexer_strides(page_size: int) -> tuple[int, int, int]:
@@ -164,7 +165,7 @@ def _qk_mfma(qk_mma, qk_a, qk_b, qk_c, a_vec, b_vec, c_vec):
     return fx.memref_load_vec(qk_c)
 
 
-def build_qsa_k1_scores_module(
+def build_qsa_indexer_scores_module(
     page_size: int,
     use_k32: bool,
     block_n: int,
@@ -208,7 +209,7 @@ def build_qsa_k1_scores_module(
         c: fx.Array[Float32, n_subtiles * num_waves * 64 * 4, 16]
 
     @flyc.kernel(
-        name="qsa_k1_scores_"
+        name="qsa_indexer_scores_"
         + kernel_signature(
             ps=page_size,
             bn=block_n,
@@ -221,7 +222,7 @@ def build_qsa_k1_scores_module(
         ),
         known_block_size=[block_threads, 1, 1],
     )
-    def qsa_k1_scores_kernel(
+    def qsa_indexer_scores_kernel(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -407,7 +408,7 @@ def build_qsa_k1_scores_module(
                         )
 
     @flyc.jit
-    def launch_qsa_k1_scores(
+    def launch_qsa_indexer_scores(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -424,7 +425,7 @@ def build_qsa_k1_scores_module(
         tiles: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_scores_kernel(
+        qsa_indexer_scores_kernel(
             q,
             k_cache,
             page_table,
@@ -443,10 +444,10 @@ def build_qsa_k1_scores_module(
             stream=stream,
         )
 
-    return launch_qsa_k1_scores
+    return launch_qsa_indexer_scores
 
 
-def build_qsa_k1_prefill_scores_module(
+def build_qsa_indexer_prefill_scores_module(
     page_size: int,
     use_k32: bool,
     n_heads: int = _H,
@@ -490,7 +491,7 @@ def build_qsa_k1_prefill_scores_module(
         c: fx.Array[Float32, n_heads * n_subtiles * num_waves * 64 * 4, 16]
 
     @flyc.kernel(
-        name="qsa_k1_prefill_scores_"
+        name="qsa_indexer_prefill_scores_"
         + kernel_signature(
             ps=page_size,
             bm=block_m,
@@ -504,7 +505,7 @@ def build_qsa_k1_prefill_scores_module(
         ),
         known_block_size=[block_threads, 1, 1],
     )
-    def qsa_k1_prefill_scores_kernel(
+    def qsa_indexer_prefill_scores_kernel(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -715,7 +716,7 @@ def build_qsa_k1_prefill_scores_module(
                             )
 
     @flyc.jit
-    def launch_qsa_k1_prefill_scores(
+    def launch_qsa_indexer_prefill_scores(
         q: fx.Tensor,
         k_cache: fx.Tensor,
         page_table: fx.Tensor,
@@ -732,7 +733,7 @@ def build_qsa_k1_prefill_scores_module(
         tiles: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_prefill_scores_kernel(
+        qsa_indexer_prefill_scores_kernel(
             q,
             k_cache,
             page_table,
@@ -751,17 +752,17 @@ def build_qsa_k1_prefill_scores_module(
             stream=stream,
         )
 
-    return launch_qsa_k1_prefill_scores
+    return launch_qsa_indexer_prefill_scores
 
 
-def build_qsa_k1_active_columns_module():
+def build_qsa_indexer_active_columns_module():
     """One thread, the widest visible column count, matching the scorers."""
 
     @flyc.kernel(
-        name="qsa_k1_active_columns",
+        name="qsa_indexer_active_columns",
         known_block_size=[1, 1, 1],
     )
-    def qsa_k1_active_columns_kernel(
+    def qsa_indexer_active_columns_kernel(
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
@@ -790,7 +791,7 @@ def build_qsa_k1_active_columns_module():
         out[zero] = results
 
     @flyc.jit
-    def launch_qsa_k1_active_columns(
+    def launch_qsa_indexer_active_columns(
         token_to_req: fx.Tensor,
         query_positions: fx.Tensor,
         context_lens: fx.Tensor,
@@ -800,7 +801,7 @@ def build_qsa_k1_active_columns_module():
         rows: Int32,
         stream: fx.Stream,
     ):
-        qsa_k1_active_columns_kernel(
+        qsa_indexer_active_columns_kernel(
             token_to_req,
             query_positions,
             context_lens,
@@ -810,4 +811,4 @@ def build_qsa_k1_active_columns_module():
             rows,
         ).launch(grid=(1, 1, 1), block=(1, 1, 1), stream=stream)
 
-    return launch_qsa_k1_active_columns
+    return launch_qsa_indexer_active_columns

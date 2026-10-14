@@ -3,9 +3,9 @@
 
 """AOT warm set for family A QSA at TP1.
 
-Six jobs, not complete coverage. K1 is the page-16 emit kernel, the
+Six jobs, not complete coverage. The indexer is the page-16 emit kernel, the
 4-head one-row scorer (decode M=1 and M=8 share it), and the 4-head
-16-row prefill scorer. K2 is Hq=24, Hkv=2, D=256 at the three bar
+16-row prefill scorer. Sparse GQA is Hq=24, Hkv=2, D=256 at the three bar
 launches: M=1 (BLOCK_N 16, 128 splits), M=8 (BLOCK_N 16, 32 splits),
 and M=512 (BLOCK_N 32, one split). Those long-row jobs also compile
 the stable decode radix.
@@ -14,7 +14,7 @@ Runtime JIT is required for every other compile. Not prebuilt: TP2/4/8
 ((12, 256), (6, 256), (3, 256)), (10, 128), the 8-head scorers, the
 other split counts (M=2 is 64 splits, M=16 is BLOCK_N 32 with 32
 splits), every wide-cache stride, and the compact one-workgroup and
-streaming K1 selectors. This module is only imported by the AOT
+streaming indexer selectors. This module is only imported by the AOT
 collector.
 """
 
@@ -30,14 +30,14 @@ from aiter.aot.flydsl.common import compile_only_env, override_env
 
 _QSA_ARCHS = ("gfx942", "gfx950")
 
-# (kernel_name, op, m, seq_len). K2 width and head counts are family A.
+# (kernel_name, op, m, seq_len). Sparse GQA width and head counts are family A.
 _FAMILY_A_LAUNCHES = (
-    ("qsa_k1_emit_family_a", "k1", 1, 512),
-    ("qsa_k1_long_row_family_a_decode", "k1", 1, 32768),
-    ("qsa_k1_long_row_family_a_prefill", "k1", 512, 8192),
-    ("qsa_k2_family_a_m1_l32768", "k2", 1, 32768),
-    ("qsa_k2_family_a_m8_l32768", "k2", 8, 32768),
-    ("qsa_k2_family_a_m512_l8192", "k2", 512, 8192),
+    ("qsa_indexer_emit_family_a", "indexer", 1, 512),
+    ("qsa_indexer_long_row_family_a_decode", "indexer", 1, 32768),
+    ("qsa_indexer_long_row_family_a_prefill", "indexer", 512, 8192),
+    ("qsa_sparse_gqa_family_a_m1_l32768", "sparse_gqa", 1, 32768),
+    ("qsa_sparse_gqa_family_a_m8_l32768", "sparse_gqa", 8, 32768),
+    ("qsa_sparse_gqa_family_a_m512_l8192", "sparse_gqa", 512, 8192),
 )
 
 
@@ -45,11 +45,11 @@ def default_jobs(launches=_FAMILY_A_LAUNCHES):
     """One job per launch. An empty launch list is an empty job list."""
     jobs = []
     for kernel_name, op, rows, seq_len in launches:
-        if op == "k1":
+        if op == "indexer":
             jobs.append(
                 {
                     "kernel_name": kernel_name,
-                    "op": "k1",
+                    "op": "indexer",
                     "m": rows,
                     "seq_len": seq_len,
                     "heads": 4,
@@ -59,11 +59,11 @@ def default_jobs(launches=_FAMILY_A_LAUNCHES):
                     "compress_ratio": 4,
                 }
             )
-        elif op == "k2":
+        elif op == "sparse_gqa":
             jobs.append(
                 {
                     "kernel_name": kernel_name,
-                    "op": "k2",
+                    "op": "sparse_gqa",
                     "m": rows,
                     "seq_len": seq_len,
                     "hq": 24,
@@ -158,8 +158,8 @@ def _qsa_compile_device(arch: str, cu_num: int):
         ) = saved
 
 
-def _compile_k1(job):
-    from aiter.ops.flydsl.qsa import qsa_k1_block_ids
+def _compile_indexer(job):
+    from aiter.ops.flydsl.qsa import qsa_indexer_block_ids
 
     bf16, i32 = torch.bfloat16, torch.int32
     device = torch.device("cuda")
@@ -185,13 +185,13 @@ def _compile_k1(job):
             qpos = torch.zeros(rows, dtype=i32, device=device)
             slen = torch.full((1,), seq_len, dtype=i32, device=device)
             token_to_req = torch.zeros(rows, dtype=i32, device=device)
-            qsa_k1_block_ids(
+            qsa_indexer_block_ids(
                 q, k_cache, table, token_to_req, qpos, slen, heads=(heads,)
             )
 
 
-def _compile_k2(job):
-    from aiter.ops.flydsl.qsa import qsa_k2
+def _compile_sparse_gqa(job):
+    from aiter.ops.flydsl.qsa import qsa_sparse_gqa
 
     bf16, i32 = torch.bfloat16, torch.int32
     device = torch.device("cuda")
@@ -212,7 +212,7 @@ def _compile_k2(job):
             indices = torch.zeros(rows, width, dtype=i32, device=device)
             indices[:, -1] = -1
             token_to_req = torch.zeros(rows, dtype=i32, device=device)
-            qsa_k2(q, k_cache, v_cache, indices, table, token_to_req)
+            qsa_sparse_gqa(q, k_cache, v_cache, indices, table, token_to_req)
 
 
 def compile_one_config(**job) -> dict:
@@ -221,10 +221,10 @@ def compile_one_config(**job) -> dict:
     started = time.time()
     try:
         with compile_only_env():
-            if job["op"] == "k1":
-                _compile_k1(job)
-            elif job["op"] == "k2":
-                _compile_k2(job)
+            if job["op"] == "indexer":
+                _compile_indexer(job)
+            elif job["op"] == "sparse_gqa":
+                _compile_sparse_gqa(job)
             else:
                 raise ValueError(f"unknown QSA AOT op {job['op']!r}")
         result["compile_time"] = time.time() - started

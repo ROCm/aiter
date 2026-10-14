@@ -49,12 +49,12 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.flydsl import qsa as qsa_k1_host
-from aiter.ops.flydsl.kernels.qsa.sparse_gqa import build_qsa_k2_module
+from aiter.ops.flydsl.kernels.qsa.sparse_gqa import build_qsa_sparse_gqa_module
 from aiter.ops.flydsl.qsa import (
-    qsa_k1_block_ids,
-    qsa_k2,
-    qsa_k2_serves,
+    qsa_indexer_block_ids,
     qsa_layer,
+    qsa_sparse_gqa,
+    qsa_sparse_gqa_serves,
     span_bytes,
 )
 from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices_cuda
@@ -68,9 +68,11 @@ from op_tests.qsa_ref import (
     qsa_expand_tail,
     qsa_indexer_scores,
     qsa_oracle,
-    qsa_sparse_gqa,
     qsa_topk_blocks,
     qsa_visible_blocks,
+)
+from op_tests.qsa_ref import (
+    qsa_sparse_gqa as sparse_gqa_ref,
 )
 from op_tests.qsa_shapes import (
     FAMILY_A_GQA,
@@ -208,7 +210,7 @@ def test_wide_cache_layout_spans_past_4gib():
             raise AssertionError("wide view changed the packed pages")
         q = torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
         table = torch.zeros(1, 1, dtype=dtypes.i32, device=device)
-        reason = qsa_k1_host.qsa_k1_serves(q, view, table, (4,))
+        reason = qsa_k1_host.qsa_indexer_serves(q, view, table, (4,))
         if reason is not None:
             raise AssertionError(f"wide indexer cache was rejected: {reason}")
         if span_bytes(view.clone()) > _FOUR_GIB:
@@ -335,7 +337,7 @@ def test_gqa_matches_dense_on_selected():
     k = torch.tensor([[[1.0, 0.0]], [[0.0, 0.0]], [[0.0, 1.0]]])
     v = torch.tensor([[[2.0, 0.0]], [[0.0, 0.0]], [[0.0, 4.0]]])
     indices = torch.tensor([[0, 2]], dtype=dtypes.i32)
-    out = qsa_sparse_gqa(q, k, v, indices, softmax_scale=1.0)
+    out = sparse_gqa_ref(q, k, v, indices, softmax_scale=1.0)
 
     e = math.exp(1.0)
     p_hi = e / (e + 1.0)
@@ -653,7 +655,7 @@ def _k1_ids_match_oracle(n_heads, m, seq_len, page_size, what, min_blocks=0):
         ),
         idx.block_budget,
     )
-    got = qsa_k1_block_ids(
+    got = qsa_indexer_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -717,7 +719,7 @@ def test_k1_family_a_set_equality_wide_stream():
         score_scale=FAMILY_A_SCORE_SCALE,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
+    got = qsa_indexer_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -790,7 +792,7 @@ def test_k1_prefill_padded_page_table():
     for name, pad_value in (("zero", 0), ("negative", -1), ("huge", 100000)):
         pad = torch.full((1, n_pad), pad_value, dtype=dtypes.i32, device=device)
         table = torch.cat((index_table, pad), dim=1)
-        got = qsa_k1_block_ids(
+        got = qsa_indexer_block_ids(
             q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
         )
         _assert_k1_block_ids(
@@ -842,7 +844,7 @@ def test_k1_table_padded_to_max_model_len():
         )
         table = torch.zeros(n_req, max_pages, dtype=dtypes.i32, device=device)
         table[:, : index_table.shape[1]] = index_table
-        got = qsa_k1_block_ids(
+        got = qsa_indexer_block_ids(
             q, index_cache, table, token_to_req, qpos, slen, heads=(4,)
         )
         _assert_k1_block_ids(ref_ids, got, what)
@@ -986,7 +988,9 @@ def test_k1_padded_decode_graph_capture():
         return varied, tied
 
     def launch():
-        qsa_k1_block_ids(q, index_cache, table, t2r, qpos, slen, out=out, heads=(4,))
+        qsa_indexer_block_ids(
+            q, index_cache, table, t2r, qpos, slen, out=out, heads=(4,)
+        )
 
     launch()
     torch.cuda.synchronize()
@@ -1037,7 +1041,7 @@ def test_k1_decode_rejects_invalid_page_ids():
     qpos = torch.zeros(m, dtype=dtypes.i32, device=device)
     slen = torch.zeros(1, dtype=dtypes.i32, device=device)
     token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    got = qsa_k1_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
+    got = qsa_indexer_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
     _assert_k1_block_ids(
         torch.full_like(got, -1),
         got,
@@ -1074,7 +1078,7 @@ def test_k1_decode_rejects_invalid_page_ids():
     ref_scores = ref_scores.clone()
     ref_scores[:, block0 : block0 + page_size] = float("-inf")
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
+    got = qsa_indexer_block_ids(
         q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
     )
     _assert_k1_block_ids(ref_ids, got, "K1 decode kept a block whose page id is -1")
@@ -1164,7 +1168,9 @@ def test_k1_page_past_4gib():
             score_scale=FAMILY_A_SCORE_SCALE,
         )
         ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-        got = qsa_k1_block_ids(q, k_cache, table, token_to_req, qpos, slen, heads=(4,))
+        got = qsa_indexer_block_ids(
+            q, k_cache, table, token_to_req, qpos, slen, heads=(4,)
+        )
         _assert_k1_block_ids(
             ref_ids, got, f"K1 page past 4 GiB aliased page 0 at M={m}"
         )
@@ -1245,32 +1251,32 @@ def test_k1_serves_padded_page_and_rejects_misaligned():
     q = torch.zeros(1, 4, d, dtype=torch.bfloat16)
     table = torch.zeros(1, 1, dtype=torch.int32)
     dense = torch.zeros(n_pages, page_size, 1, d, dtype=torch.bfloat16)
-    if qsa_k1_host.qsa_k1_serves(q, dense, table, (4,)) is not None:
+    if qsa_k1_host.qsa_indexer_serves(q, dense, table, (4,)) is not None:
         raise AssertionError("a packed indexer cache was rejected")
     page_stride = page_elems + 256
     parent = torch.empty(n_pages, page_stride, dtype=torch.bfloat16)
     view = parent.as_strided((n_pages, page_size, 1, d), (page_stride, d, d, 1))
     if view.is_contiguous():
         raise AssertionError("padded page stride should not be contiguous")
-    if qsa_k1_host.qsa_k1_serves(q, view, table, (4,)) is not None:
+    if qsa_k1_host.qsa_indexer_serves(q, view, table, (4,)) is not None:
         raise AssertionError(f"padded page stride was rejected: {view.stride()}")
     span = span_bytes(view)
     packed = view.numel() * view.element_size()
     if span <= packed:
         raise AssertionError(f"span {span} did not exceed packed bytes {packed}")
     bad = parent.as_strided((n_pages, page_size, 1, d), (page_elems + 4, d, d, 1))
-    reason = qsa_k1_host.qsa_k1_serves(q, bad, table, (4,))
+    reason = qsa_k1_host.qsa_indexer_serves(q, bad, table, (4,))
     if reason is None or "multiples of 8" not in reason:
         raise AssertionError(f"misaligned page stride served: {reason}")
     wide = torch.empty(n_pages, page_size, 1, d * 2, dtype=torch.bfloat16)
     strided_d = wide.as_strided(
         dense.shape, (wide.stride(0), wide.stride(1), wide.stride(2), 2)
     )
-    reason = qsa_k1_host.qsa_k1_serves(q, strided_d, table, (4,))
+    reason = qsa_k1_host.qsa_indexer_serves(q, strided_d, table, (4,))
     if reason is None or "unit D" not in reason:
         raise AssertionError(f"strided D was served: {reason}")
     zero_page = torch.zeros(1, 0, 1, d, dtype=torch.bfloat16)
-    reason = qsa_k1_host.qsa_k1_serves(q, zero_page, table, (4,))
+    reason = qsa_k1_host.qsa_indexer_serves(q, zero_page, table, (4,))
     if reason is None or "page_size" not in reason:
         raise AssertionError(f"zero page size was served: {reason}")
 
@@ -1311,7 +1317,7 @@ def test_k1_padded_page_stride_matches_packed():
     if gapped.is_contiguous():
         raise AssertionError("gapped indexer cache is contiguous")
     if (
-        qsa_k1_host.qsa_k1_serves(
+        qsa_k1_host.qsa_indexer_serves(
             torch.empty(1, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device),
             gapped,
             index_table,
@@ -1325,10 +1331,10 @@ def test_k1_padded_page_stride_matches_packed():
         qpos = _query_positions(m, seq_len, device)
         slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
         token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-        packed = qsa_k1_block_ids(
+        packed = qsa_indexer_block_ids(
             q, index_cache, index_table, token_to_req, qpos, slen, heads=(4,)
         )
-        got = qsa_k1_block_ids(
+        got = qsa_indexer_block_ids(
             q, gapped, index_table, token_to_req, qpos, slen, heads=(4,)
         )
         if not torch.equal(packed, got):
@@ -1399,14 +1405,16 @@ def test_k1_wide_padded_page_does_not_alias():
             score_scale=FAMILY_A_SCORE_SCALE,
         )
         ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-        got = qsa_k1_block_ids(q, view, table, token_to_req, qpos, slen, heads=(4,))
+        got = qsa_indexer_block_ids(
+            q, view, table, token_to_req, qpos, slen, heads=(4,)
+        )
         _assert_k1_block_ids(
             ref_ids, got, f"K1 wide padded page aliased page 0 at M={m}"
         )
 
 
 def test_k2_family_a_decode_matches_oracle():
-    """Family A FlyDSL K2 decode matches qsa_sparse_gqa on paged K/V."""
+    """Family A FlyDSL sparse GQA decode matches the fp32 oracle on paged K/V."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     gqa = FAMILY_A_GQA
@@ -1428,8 +1436,8 @@ def test_k2_family_a_decode_matches_oracle():
     k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
     v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
     assert torch.equal(kv_table, kv_table_v)
-    ref = qsa_sparse_gqa(q, k, v, indices)
-    out = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    ref = sparse_gqa_ref(q, k, v, indices)
+    out = qsa_sparse_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
     err = checkAllclose(
         ref.to(dtypes.fp32),
         out.to(dtypes.fp32),
@@ -1487,13 +1495,15 @@ def test_k2_live_prefix_matches_full_width():
         live = _k2_live_n_sel(m, seq_len, idx.token_budget, idx.compress_ratio)
         if m == 1 and seq_len == 512:
             try:
-                qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=True)
+                qsa_sparse_gqa(
+                    q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=True
+                )
             except TypeError:
                 pass
             else:
                 raise AssertionError("bool n_sel was accepted")
             try:
-                qsa_k2(
+                qsa_sparse_gqa(
                     q,
                     k_cache,
                     v_cache,
@@ -1514,8 +1524,10 @@ def test_k2_live_prefix_matches_full_width():
             raise AssertionError(
                 f"a row is wider than n_sel={live} at M={m} L={seq_len}"
             )
-        full = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
-        short = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=live)
+        full = qsa_sparse_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+        short = qsa_sparse_gqa(
+            q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=live
+        )
         err = checkAllclose(
             full.to(dtypes.fp32),
             short.to(dtypes.fp32),
@@ -1563,8 +1575,8 @@ def test_k2_family_a_prefill_matches_oracle():
     k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
     v_cache, kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
     assert torch.equal(kv_table, kv_table_v)
-    ref = qsa_sparse_gqa(q, k, v, indices)
-    out = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
+    ref = sparse_gqa_ref(q, k, v, indices)
+    out = qsa_sparse_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
     err = checkAllclose(
         ref.to(dtypes.fp32),
         out.to(dtypes.fp32),
@@ -1623,7 +1635,7 @@ def test_k2_page_past_4gib():
         [[far_tok, 0], [far_tok, -1], [0, -1]], dtype=dtypes.i32, device=device
     )
     token_to_req = torch.zeros(3, dtype=dtypes.i32, device=device)
-    out = qsa_k2(q, k_cache, v_cache, indices, page_table, token_to_req)
+    out = qsa_sparse_gqa(q, k_cache, v_cache, indices, page_table, token_to_req)
     got = out.float()
     expect = (
         torch.tensor([1.5, 2.0, 1.0], dtype=torch.float32, device=device)
@@ -1678,8 +1690,8 @@ def test_k2_interleaved_kv_view_matches_contiguous():
             k_view, v_view = _interleave_kv(k_cache, v_cache)
             if k_view.is_contiguous():
                 raise AssertionError("interleaved K view should be strided")
-            ref = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
-            got = qsa_k2(q, k_view, v_view, indices, kv_table, token_to_req)
+            ref = qsa_sparse_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
+            got = qsa_sparse_gqa(q, k_view, v_view, indices, kv_table, token_to_req)
             if not torch.equal(ref, got):
                 diff = (ref.float() - got.float()).abs().max().item()
                 raise AssertionError(
@@ -1733,7 +1745,7 @@ def test_k2_interleaved_kv_page_past_4gib():
         [[far_tok, 0], [far_tok, -1], [0, -1]], dtype=dtypes.i32, device=device
     )
     token_to_req = torch.zeros(3, dtype=dtypes.i32, device=device)
-    got = qsa_k2(q, k_view, v_view, indices, page_table, token_to_req).float()
+    got = qsa_sparse_gqa(q, k_view, v_view, indices, page_table, token_to_req).float()
     expect = (
         torch.tensor([1.5, 2.0, 1.0], dtype=torch.float32, device=device)
         .view(3, 1, 1)
@@ -1759,7 +1771,7 @@ def _k2_one_live_token(m, width, live_col):
     indices = torch.full((m, width), -1, dtype=dtypes.i32, device=device)
     indices[:, live_col] = 0
     token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
-    return qsa_k2(q, k_cache, v_cache, indices, page_table, token_to_req)
+    return qsa_sparse_gqa(q, k_cache, v_cache, indices, page_table, token_to_req)
 
 
 def test_k2_empty_first_tile_keeps_later_token():
@@ -1817,9 +1829,9 @@ def test_k2_default_out_ignores_query_strides():
     gen.manual_seed(2)
     k_cache, kv_table = pack_paged_cache(k, page_size, generator=gen)
     v_cache, _kv_table_v = pack_paged_cache(v, page_size, physical=kv_table[0])
-    ref = qsa_sparse_gqa(q_contig, k, v, indices)
+    ref = sparse_gqa_ref(q_contig, k, v, indices)
     for name, q in (("contiguous", q_contig), ("heads-last", q_heads_last)):
-        out = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
+        out = qsa_sparse_gqa(q, k_cache, v_cache, indices, kv_table, token_to_req)
         err = checkAllclose(
             ref.to(dtypes.fp32),
             out.to(dtypes.fp32),
@@ -1847,7 +1859,7 @@ def test_k1_empty_or_short_request_geometry():
     positions = torch.zeros(1, dtype=torch.int32)
     requests = torch.zeros(1, dtype=torch.int32)
     try:
-        qsa_k1_host.qsa_k1_block_ids(
+        qsa_k1_host.qsa_indexer_block_ids(
             q, cache, short_table, requests, positions, context
         )
     except ValueError as exc:
@@ -1858,7 +1870,7 @@ def test_k1_empty_or_short_request_geometry():
     no_rows = torch.empty(0, 1, dtype=torch.int32)
     one_context = torch.zeros(1, dtype=torch.int32)
     try:
-        qsa_k1_host.qsa_k1_block_ids(
+        qsa_k1_host.qsa_indexer_block_ids(
             q, cache, no_rows, requests, positions, one_context
         )
     except ValueError as exc:
@@ -1896,7 +1908,7 @@ def test_k1_empty_or_short_request_geometry():
     try:
         for name, k_cache, page_table, lengths in cases:
             launched.clear()
-            out = qsa_k1_host.qsa_k1_block_ids(
+            out = qsa_k1_host.qsa_indexer_block_ids(
                 q, k_cache, page_table, requests, positions, lengths
             )
             if launched:
@@ -1925,7 +1937,7 @@ def test_qsa_k1_rejects_a_score_workspace_before_launch():
     )
     for scores in cases:
         try:
-            qsa_k1_block_ids(q, cache, table, rows, rows, rows, scores=scores)
+            qsa_indexer_block_ids(q, cache, table, rows, rows, rows, scores=scores)
         except ValueError as exc:
             if "scores" not in str(exc):
                 raise
@@ -1980,7 +1992,7 @@ def test_qsa_k1_caller_score_workspace_matches_the_private_buffer():
         k_bar.unsqueeze(1), page_size, generator=gen
     )
     n_columns = int(index_table.shape[1]) * page_size
-    private = qsa_k1_block_ids(
+    private = qsa_indexer_block_ids(
         q,
         index_cache,
         index_table,
@@ -1990,7 +2002,7 @@ def test_qsa_k1_caller_score_workspace_matches_the_private_buffer():
         heads=(idx.n_heads,),
     )
     workspace = torch.full((m, n_columns), float("nan"), device=device)
-    shared = qsa_k1_block_ids(
+    shared = qsa_indexer_block_ids(
         q,
         index_cache,
         index_table,
@@ -2038,14 +2050,14 @@ def test_k2_empty_cache_or_table_returns_zeros():
 
     def _record_launch(*_args, **_kwargs):
         launched.append(1)
-        raise AssertionError("qsa_k2 launched with no pages")
+        raise AssertionError("qsa_sparse_gqa launched with no pages")
 
     original = qsa_k1_host._run_compiled
     qsa_k1_host._run_compiled = _record_launch
     try:
         for name, k_cache, v_cache, page_table in cases:
             launched.clear()
-            out = qsa_k2(q, k_cache, v_cache, indices, page_table, token_to_req)
+            out = qsa_sparse_gqa(q, k_cache, v_cache, indices, page_table, token_to_req)
             if launched:
                 raise AssertionError(f"K2 launched for {name}")
             if not torch.equal(out, torch.zeros_like(out)):
@@ -2081,7 +2093,9 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
     v_cache, _ = pack_paged_cache(v, page_size, physical=kv_table[0])
     out_default = torch.empty_like(q)
     out_ws = torch.empty_like(q)
-    ref = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req, out=out_default)
+    ref = qsa_sparse_gqa(
+        q, k_cache, v_cache, indices, kv_table, token_to_req, out=out_default
+    )
     accepted = None
     for n_splits in range(2, 33):
         partial_out = torch.full(
@@ -2094,7 +2108,7 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
             (n_splits, m, gqa.n_heads), 3, dtype=torch.float32, device=device
         )
         try:
-            got = qsa_k2(
+            got = qsa_sparse_gqa(
                 q,
                 k_cache,
                 v_cache,
@@ -2121,7 +2135,7 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
         device=device,
     )
     try:
-        qsa_k2(
+        qsa_sparse_gqa(
             q,
             k_cache,
             v_cache,
@@ -2142,13 +2156,13 @@ def test_k2_caller_workspace_is_the_only_partial_buffer():
     indices1[:, -1] = -1
     token1 = torch.zeros(m1, dtype=dtypes.i32, device=device)
     out1 = torch.empty_like(q1)
-    ref1 = qsa_k2(q1, k_cache, v_cache, indices1, kv_table, token1, out=out1)
+    ref1 = qsa_sparse_gqa(q1, k_cache, v_cache, indices1, kv_table, token1, out=out1)
     ignored = (
         torch.empty(1, dtype=torch.float32, device=device),
         torch.empty(1, dtype=torch.float32, device=device),
     )
     out1b = torch.empty_like(q1)
-    got1 = qsa_k2(
+    got1 = qsa_sparse_gqa(
         q1,
         k_cache,
         v_cache,
@@ -2177,7 +2191,7 @@ def _flydsl_k1_select(
 
     Set equality uses the block ids.
     """
-    block_ids = qsa_k1_block_ids(
+    block_ids = qsa_indexer_block_ids(
         q,
         k_cache,
         page_table,
@@ -2320,7 +2334,7 @@ def bench_qsa_family_a_k1(
         indices_g = torch.empty(m, idx.index_width, dtype=dtypes.i32, device=device)
 
         def flydsl_graph():
-            qsa_k1_block_ids(
+            qsa_indexer_block_ids(
                 q_indexer,
                 index_cache,
                 index_table,
@@ -2418,7 +2432,7 @@ def bench_qsa_family_a_k2(
     ) * dtype.itemsize
     gqa_args = (q_gqa, k_cache, v_cache, indices, kv_table, token_to_req)
     candidates = {
-        "flydsl_k2": (qsa_k2, "flydsl K2 vs oracle GQA"),
+        "flydsl_k2": (qsa_sparse_gqa, "flydsl K2 vs oracle GQA"),
     }
     ret = {
         "gfx": get_gfx(),
@@ -2429,7 +2443,7 @@ def bench_qsa_family_a_k2(
     }
     live_n_sel = _k2_live_n_sel(m, seq_len, idx.token_budget, idx.compress_ratio)
     for name, (fn, msg) in candidates.items():
-        extra = {"n_sel": live_n_sel} if fn is qsa_k2 else {}
+        extra = {"n_sel": live_n_sel} if fn is qsa_sparse_gqa else {}
         out, us = _time(fn, *gqa_args, rotate=rotate, **extra)
         err = checkAllclose(
             ref.output,
@@ -2480,7 +2494,7 @@ def test_k1_family_b_set_equality_published_indexer_point():
         score_scale=idx.head_dim**-0.5,
     )
     ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
-    got = qsa_k1_block_ids(
+    got = qsa_indexer_block_ids(
         q_indexer,
         index_cache,
         index_table,
@@ -2556,7 +2570,7 @@ def bench_qsa_family_b_k1(
         slen,
     )
     candidates = {
-        "flydsl_k1": qsa_k1_block_ids,
+        "flydsl_k1": qsa_indexer_block_ids,
     }
     ret = {
         "gfx": get_gfx(),
@@ -2807,7 +2821,7 @@ def test_qsa_metadata_strided_view_matches_packed():
 
 
 def test_k2_serves_rejects_shapes_the_builder_rejects():
-    """A geometry ``build_qsa_k2_module`` raises on is a reason here.
+    """A geometry ``build_qsa_sparse_gqa_module`` raises on is a reason here.
 
     An indivisible group, a group past the MFMA M=16 tile, a head_dim that
     is not a multiple of 32, a head the selected gather or merge cannot
@@ -2821,9 +2835,9 @@ def test_k2_serves_rejects_shapes_the_builder_rejects():
         table = torch.zeros(1, 1, dtype=torch.int32)
         return q, k, torch.zeros_like(k), indices, table
 
-    if qsa_k2_serves(*tensors(24, 2, 256, 16)) is not None:
+    if qsa_sparse_gqa_serves(*tensors(24, 2, 256, 16)) is not None:
         raise AssertionError("family A GQA was rejected")
-    if qsa_k2_serves(*tensors(16, 1, 128, 16)) is not None:
+    if qsa_sparse_gqa_serves(*tensors(16, 1, 128, 16)) is not None:
         raise AssertionError("a group of 16 at head_dim 128 was rejected")
     # (Hq, Hkv, D, page, rows, width, needle). D=32/D=96 are the decode
     # gather (BN16 x 128). D=192 at W=32 splits, so the merge runs and
@@ -2842,14 +2856,14 @@ def test_k2_serves_rejects_shapes_the_builder_rejects():
         (24, 2, 192, 16, 32, 8, "K LDS"),
     )
     for hq, hkv, d, page, rows, width, needle in rejected:
-        reason = qsa_k2_serves(*tensors(hq, hkv, d, page, rows, width))
+        reason = qsa_sparse_gqa_serves(*tensors(hq, hkv, d, page, rows, width))
         if reason is None or needle not in reason:
             raise AssertionError(
                 f"Hq={hq} Hkv={hkv} D={d} page={page} rows={rows} "
                 f"width={width} -> {reason!r}"
             )
     try:
-        build_qsa_k2_module(16, 1, 32, 16, True, 16, 128, 1, False)
+        build_qsa_sparse_gqa_module(16, 1, 32, 16, True, 16, 128, 1, False)
     except ValueError as exc:
         if "gather" not in str(exc):
             raise AssertionError(f"builder D=32 reason was {exc}") from exc

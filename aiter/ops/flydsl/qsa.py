@@ -3,15 +3,15 @@
 
 """FlyDSL QSA public surface (SILOTIGER-1047).
 
-``qsa_k1_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
+``qsa_indexer_block_ids`` writes indexer ``block_ids [M, 512]`` from paged
 compressed K. Rows up to 512 blocks use the fused emit kernel; longer rows
 use tiled BLOCK_N=32 BF16 MFMA scoring plus the stable decode radix below
 32768 columns and streaming radix at or above that width. Single-request
 prefill scores 16 query rows per workgroup. The indexer head count is 4 or
 8, each a separate compile.
 
-``qsa_k2`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the selected
-token ids. ``n_sel`` is the packed live prefix; the default walks the
+``qsa_sparse_gqa`` writes sparse GQA ``o [M, Hq, D]`` from paged K/V at the
+selected token ids. ``n_sel`` is the packed live prefix; the default walks the
 allocated row. Decode runs a BLOCK_N=16 two-wave tile with split-K and an LSE
 merge; gfx942 widens that tile to four waves when the grid fits in the CUs.
 Prefill runs BLOCK_N=32 two waves and writes output directly once the grid
@@ -22,10 +22,10 @@ The fp32 reference and the paged-cache fixtures live in
 ``op_tests/qsa_ref.py``. The concrete shapes are in
 ``op_tests/qsa_shapes.py``.
 
-``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs K1, the vendored
-expand+tail, and K2. A rank-3 query pair missing from the measured
-table logs once. A query that is not rank 3 is not a table miss; K1
-or K2 reports it. Sigmoid and partial RoPE stay outside the layer.
+``qsa_layer`` is the ``qwen4_exp`` opt-in. It runs the indexer, the vendored
+expand+tail, and sparse GQA. A rank-3 query pair missing from the measured
+table logs once. A query that is not rank 3 is not a table miss; the indexer
+or sparse GQA reports it. Sigmoid and partial RoPE stay outside the layer.
 """
 
 import functools
@@ -45,17 +45,17 @@ from .kernels.qsa.indexer_select import (
     _SCORE_HEADS,
     _SCORE_SCALE,
     _STREAM_SELECT_MIN_COLUMNS,
-    build_qsa_k1_active_columns_module,
-    build_qsa_k1_emit_module,
-    build_qsa_k1_prefill_scores_module,
-    build_qsa_k1_scores_module,
+    build_qsa_indexer_active_columns_module,
+    build_qsa_indexer_emit_module,
+    build_qsa_indexer_prefill_scores_module,
+    build_qsa_indexer_scores_module,
 )
 from .kernels.qsa.sparse_gqa import (
     _TINY_SPLITS,
     _gfx942_reg_qk,
     _k2_coverage_reason,
     _launch_config,
-    build_qsa_k2_module,
+    build_qsa_sparse_gqa_module,
 )
 from .kernels.tensor_shim import _run_compiled
 from .kernels.topk.topk_per_row_decode_persistent import (
@@ -115,9 +115,9 @@ _MEASURED_QUERIES = {
 # 8-head by 1.27x to 3.34x.
 
 __all__ = [
-    "qsa_k1_block_ids",
-    "qsa_k2",
+    "qsa_indexer_block_ids",
     "qsa_layer",
+    "qsa_sparse_gqa",
     "span_bytes",
 ]
 
@@ -139,7 +139,7 @@ def _rank3_query_pair(
 ) -> tuple[tuple[int, int], int] | None:
     """``((Hq, D), indexer heads)`` when both queries are rank 3.
 
-    A scalar or any other rank is not a table key. K1 and K2 report that.
+    A scalar or any other rank is not a table key. The indexer and sparse GQA report that.
     """
     if q_indexer.dim() != 3 or q_gqa.dim() != 3:
         return None
@@ -196,7 +196,7 @@ def _expand_block_ids(
 
 @functools.lru_cache(maxsize=8)
 def _emit_plan(page_size: int):
-    return build_qsa_k1_emit_module(page_size)
+    return build_qsa_indexer_emit_module(page_size)
 
 
 @functools.lru_cache(maxsize=16)
@@ -208,7 +208,7 @@ def _scores_plan(
     wide_cache: bool = False,
     k_strides: tuple[int, int, int] | None = None,
 ):
-    return build_qsa_k1_scores_module(
+    return build_qsa_indexer_scores_module(
         page_size, use_k32, block_n, n_heads, wide_cache, k_strides
     )
 
@@ -221,7 +221,7 @@ def _prefill_scores_plan(
     wide_cache: bool = False,
     k_strides: tuple[int, int, int] | None = None,
 ):
-    return build_qsa_k1_prefill_scores_module(
+    return build_qsa_indexer_prefill_scores_module(
         page_size, use_k32, n_heads, wide_cache, k_strides
     )
 
@@ -264,7 +264,7 @@ def _k1_uses_prefill_scorer(
 
 @functools.lru_cache(maxsize=1)
 def _active_columns_plan():
-    return build_qsa_k1_active_columns_module()
+    return build_qsa_indexer_active_columns_module()
 
 
 def _k1_max_visible_columns(
@@ -317,7 +317,7 @@ def _check_k1_score_workspace(scores: torch.Tensor, rows: int, n_columns: int) -
         )
 
 
-def qsa_k1_score_and_select(
+def qsa_indexer_score_and_select(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -481,13 +481,13 @@ def qsa_k1_score_and_select(
     return out
 
 
-def qsa_k1_serves(
+def qsa_indexer_serves(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
     heads: tuple[int, ...] = _SCORE_HEADS,
 ) -> str | None:
-    """Why this K1 kernel cannot serve these tensors, or None if it can.
+    """Why the indexer kernel cannot serve these tensors, or None if it can.
 
     ``heads`` narrows the accepted indexer head count; pass ``(4,)`` to
     reject the 8-head variant. Every other check is the same either way.
@@ -521,7 +521,7 @@ def qsa_k1_serves(
     return None
 
 
-def qsa_k1_selection_serves(token_topk: int, compress_ratio: int) -> str | None:
+def qsa_indexer_selection_serves(token_topk: int, compress_ratio: int) -> str | None:
     """Why this token budget is outside the baked K1 contract, or None.
 
     K1 writes ``[_K]`` block ids and divides positions by ``_R``. Expand
@@ -538,7 +538,7 @@ def qsa_k1_selection_serves(token_topk: int, compress_ratio: int) -> str | None:
     return None
 
 
-def qsa_k1_block_ids(
+def qsa_indexer_block_ids(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     page_table: torch.Tensor,
@@ -568,9 +568,9 @@ def qsa_k1_block_ids(
     ``heads`` is the accepted head count. Pass ``(4,)`` to keep the contract
     narrow; the ``(4, 8)`` default also admits the 8-head indexer.
     """
-    reason = qsa_k1_serves(q, k_cache, page_table, heads)
+    reason = qsa_indexer_serves(q, k_cache, page_table, heads)
     if reason is not None:
-        raise ValueError(f"[FlyDSL qsa_k1] {reason}")
+        raise ValueError(f"[FlyDSL qsa_indexer_block_ids] {reason}")
     m = q.shape[0]
     if token_to_req.shape != (m,) or token_to_req.dtype != torch.int32:
         raise ValueError(f"token_to_req must be int32 [{m}]")
@@ -652,7 +652,7 @@ def qsa_k1_block_ids(
             torch.cuda.current_stream(q.device),
         )
     else:
-        qsa_k1_score_and_select(
+        qsa_indexer_score_and_select(
             q,
             k_cache,
             page_table,
@@ -683,7 +683,7 @@ def _plan(
     wide_cache: bool,
     kv_strides: tuple[int, int, int] | None = None,
 ):
-    return build_qsa_k2_module(
+    return build_qsa_sparse_gqa_module(
         n_q_heads,
         n_kv_heads,
         head_dim,
@@ -697,14 +697,14 @@ def _plan(
     )
 
 
-def qsa_k2_serves(
+def qsa_sparse_gqa_serves(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     indices: torch.Tensor,
     page_table: torch.Tensor,
 ) -> str | None:
-    """Why this K2 kernel cannot serve these tensors, or None if it can."""
+    """Why the sparse GQA kernel cannot serve these tensors, or None if it can."""
     if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
         return f"q and caches must be bfloat16, got {q.dtype} and {k_cache.dtype}"
     if v_cache.dtype != k_cache.dtype or v_cache.shape != k_cache.shape:
@@ -715,7 +715,7 @@ def qsa_k2_serves(
         return f"k_cache must be [pages, page_size, H, D], got {tuple(k_cache.shape)}"
     if k_cache.shape[3] != q.shape[2]:
         return f"k_cache D must be q's {q.shape[2]}, got {k_cache.shape[3]}"
-    # The same geometries build_qsa_k2_module rejects for the launch
+    # The same geometries build_qsa_sparse_gqa_module rejects for the launch
     # _launch_config would compile from these tensors. A reason here keeps
     # the caller from launching a kernel that raises or drops a tail of D.
     # BLOCK_N and the workgroup still come from that policy.
@@ -788,7 +788,7 @@ def _take_k2_workspace(workspace, n_splits, rows, n_q_heads, head_dim, device):
     return partial_out, partial_lse
 
 
-def qsa_k2(
+def qsa_sparse_gqa(
     q: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
@@ -811,9 +811,9 @@ def qsa_k2(
     gather width, so a ``-1`` suffix is not scanned and does not launch
     an empty workgroup. A live token at or past ``n_sel`` is not read.
     """
-    reason = qsa_k2_serves(q, k_cache, v_cache, indices, page_table)
+    reason = qsa_sparse_gqa_serves(q, k_cache, v_cache, indices, page_table)
     if reason is not None:
-        raise ValueError(f"[FlyDSL qsa_k2] {reason}")
+        raise ValueError(f"[FlyDSL qsa_sparse_gqa] {reason}")
     rows = q.shape[0]
     n_q_heads = int(q.shape[1])
     head_dim = int(q.shape[2])
@@ -1007,7 +1007,7 @@ def qsa_layer(
     Returns:
         Sparse GQA output, bf16 ``[M, Hq, D]``.
     """
-    reason = qsa_k1_selection_serves(token_topk, compress_ratio)
+    reason = qsa_indexer_selection_serves(token_topk, compress_ratio)
     if reason is not None:
         raise ValueError(reason)
     _warn_unmeasured_query(q_indexer, q_gqa)
@@ -1019,7 +1019,7 @@ def qsa_layer(
         extra["heads"] = (int(q_indexer.shape[1]),)
     if score_scale is not None:
         extra["score_scale"] = score_scale
-    block_ids = qsa_k1_block_ids(
+    block_ids = qsa_indexer_block_ids(
         q_indexer,
         index_k_cache,
         index_page_table,
@@ -1039,7 +1039,7 @@ def qsa_layer(
         token_topk,
         indices,
     )
-    return qsa_k2(
+    return qsa_sparse_gqa(
         q_gqa,
         k_cache,
         v_cache,
