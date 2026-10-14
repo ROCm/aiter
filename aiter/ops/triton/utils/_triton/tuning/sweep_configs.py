@@ -291,6 +291,8 @@ def run_worker(command, env, log_path, stall, setup_timeout, stop=STOP):
 
 def run_batch(spec, shape, backend, batch, out, gpu, args, screen):
     """One worker process on one GPU for these candidates; marks the candidate it died on."""
+    # the M's compile-ahead list (a final round has none, so its workers compile on their own)
+    pool = ["--pool", f"{out}.pre.todo.json"] if args.compile_procs else []
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
     todo_file, log_path = f"{out}.gpu{gpu}.todo.json", f"{out}.gpu{gpu}.log"
     with open(todo_file, "w") as f:
@@ -308,6 +310,7 @@ def run_batch(spec, shape, backend, batch, out, gpu, args, screen):
             str(args.cold_mb),
             "--screen",
             str(screen),
+            *pool,
             "--configs",
             todo_file,
             "--out",
@@ -414,11 +417,12 @@ def precompile_worker(spec, shape, backend, todo_file, out, slot, gpu, args, sto
         os.remove(log_path)
 
 
-def precompile_ahead(spec, args, plans, stop):
-    """Compile the unfinished candidates of every M, in sweep order, on the compile GPUs."""
+def pool_files(spec, args, plans):
+    """Write every M's compile-ahead list up front, so the timing workers of an M the pool has
+    not reached yet help it instead of compiling on their own. Returns {M: (out, todo, files)}.
+    """
+    pools = {}
     for M, plan_ in plans.items():
-        if stop.is_set() or STOP.is_set():
-            return
         shape = shape_from_args(args, spec.dims, M)
         out = results_path(
             args.runs_dir, plan_["arch"], plan_["backend"], spec.name, shape
@@ -433,8 +437,27 @@ def precompile_ahead(spec, args, plans, stop):
         todo_file = f"{out}.pre.todo.json"
         with open(todo_file, "w") as f:
             json.dump(todo, f)
-        with open(f"{todo_file}.next", "w") as f:
-            f.write("0")
+        for suffix, content in ((".next", "0"), (".done", "")):
+            with open(todo_file + suffix, "w") as f:
+                f.write(content)
+        pools[M] = (out, todo, todo_file)
+    return pools
+
+
+def remove_pool_files(todo_file):
+    for path in (todo_file + ".next", todo_file + ".done", todo_file):
+        if os.path.exists(path):
+            os.remove(path)
+
+
+def precompile_ahead(spec, args, plans, pools, stop):
+    """Compile the unfinished candidates of every M, in sweep order, on the compile GPUs."""
+    for M, plan_ in plans.items():
+        out, todo, todo_file = pools[M]
+        if stop.is_set() or STOP.is_set():
+            remove_pool_files(todo_file)
+            continue
+        shape = shape_from_args(args, spec.dims, M)
         slots = min(args.compile_procs, len(todo))
         gpus = args.compile_gpus
         with ThreadPoolExecutor(max(slots, 1)) as pool:
@@ -451,8 +474,8 @@ def precompile_ahead(spec, args, plans, stop):
                     args,
                     stop,
                 )
-        os.remove(todo_file)
-        os.remove(f"{todo_file}.next")
+        # the timing workers of this M now compile on their own
+        remove_pool_files(todo_file)
         print(f"  compile-ahead: M={M} done", flush=True)
 
 
@@ -519,8 +542,11 @@ def main(argv=None):
         check_settings(out, args)
 
     stop_precompile = threading.Event()
+    pools = pool_files(spec, args, plans) if args.compile_procs else {}
     precompiler = threading.Thread(
-        target=precompile_ahead, args=(spec, args, plans, stop_precompile), daemon=True
+        target=precompile_ahead,
+        args=(spec, args, plans, pools, stop_precompile),
+        daemon=True,
     )
     if args.compile_procs:
         precompiler.start()

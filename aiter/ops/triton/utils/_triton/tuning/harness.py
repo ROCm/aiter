@@ -39,7 +39,13 @@ import sys
 import time
 from collections import namedtuple
 
-from _utils import add_shape_args, append_record, read_records, shape_from_args
+from _utils import (
+    add_shape_args,
+    append_record,
+    config_key,
+    read_records,
+    shape_from_args,
+)
 from kernels import (
     check_backend,
     ensure_repo_on_path,
@@ -144,22 +150,99 @@ def compile_only(call, config, inputs):
     return [kernel for kernel in compiled if kernel is not None]
 
 
+def claim_index(counter_file):
+    """The next unclaimed index of a list that several workers share through counter_file."""
+    with open(counter_file, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        index = int(f.read() or 0)
+        f.seek(0)
+        f.truncate()
+        f.write(str(index + 1))
+    return index
+
+
 def claimed(candidates, counter_file):
     """The candidates this worker claims from a counter file it shares with the other workers."""
-    while True:
-        with open(counter_file, "r+") as f:
-            fcntl.flock(f, fcntl.LOCK_EX)
-            index = int(f.read() or 0)
-            f.seek(0)
-            f.truncate()
-            f.write(str(index + 1))
-        if index >= len(candidates):
-            return
+    while (index := claim_index(counter_file)) < len(candidates):
         yield candidates[index]
 
 
-def precompile(call, inputs, candidates, out, common):
-    """Compile every candidate into the Triton cache.
+def mark_compiled(done_file, candidate):
+    with open(done_file, "a") as f:
+        f.write(config_key(candidate) + "\n")
+
+
+class CompilePool:
+    """One M's compile-ahead pool as a timing worker sees it; the driver owns the files.
+
+    todo_file is the pool's list, todo_file.next its claim counter and todo_file.done the keys
+    it has finished. The pool is active while todo_file exists.
+    """
+
+    def __init__(self, todo_file):
+        self.todo_file, self.done_file = todo_file, f"{todo_file}.done"
+        self.compiled, self.offset, self.todo = set(), 0, None
+
+    def active(self):
+        return os.path.exists(self.todo_file)
+
+    def refresh(self):
+        try:
+            with open(self.done_file, "rb") as f:
+                f.seek(self.offset)
+                chunk = f.read()
+        except OSError:
+            return
+        whole = chunk[
+            : chunk.rfind(b"\n") + 1
+        ]  # a line being written waits for the next call
+        self.offset += len(whole)
+        self.compiled.update(whole.decode().splitlines())
+
+    def help_one(self, call, inputs):
+        """Compile the pool's next unclaimed candidate here; False when nothing is left."""
+        try:
+            if self.todo is None:
+                with open(self.todo_file) as f:
+                    self.todo = json.load(f)
+            index = claim_index(f"{self.todo_file}.next")
+        except OSError:  # the pool finished this M meanwhile
+            return False
+        if index >= len(self.todo):
+            return False
+        status = "helped the compile-ahead pool"
+        try:
+            compile_only(call, self.todo[index], inputs)
+        except Exception as e:  # noqa: BLE001
+            # the candidate's own worker records the error when it gets there
+            status += f" (failed: {type(e).__name__})"
+        mark_compiled(self.done_file, self.todo[index])
+        print(status, flush=True)
+        return True
+
+
+def next_ready(pending, pool, call, inputs):
+    """Pop the next candidate whose kernels the pool has compiled, so a timing GPU never waits
+    for a compile the pool is already doing; without an active pool, simply the next one.
+    While nothing is ready, help the pool compile; wait when there is nothing left to claim.
+    """
+    waited = 0
+    while True:
+        if pool is None or not pool.active():
+            return pending.pop(0)[1]
+        pool.refresh()
+        for i, (key, _) in enumerate(pending):
+            if key == "baseline" or key in pool.compiled:
+                return pending.pop(i)[1]
+        if not pool.help_one(call, inputs):
+            time.sleep(1)
+            waited += 1
+            if waited % 30 == 0:
+                print("waiting for the compile-ahead pool", flush=True)
+
+
+def precompile(call, inputs, candidates, out, common, done_file=None):
+    """Compile every candidate into the Triton cache and list it in done_file.
 
     A candidate that does not compile gets its error record here (compiling is deterministic),
     so the timing worker does not spend the same failed compile again.
@@ -186,6 +269,8 @@ def precompile(call, inputs, candidates, out, common):
                         dur_s=round(time.time() - t0, 1),
                     ),
                 )
+        if done_file:
+            mark_compiled(done_file, candidate)
         print(status, json.dumps(candidate), flush=True)
 
 
@@ -243,8 +328,11 @@ def benchmark(
     replays,
     cold_mb,
     screen,
+    pool_todo=None,
 ):
     keys, _, _ = load_defaults(spec, backend)
+    pool = CompilePool(pool_todo) if pool_todo else None
+    pending = [(config_key(c), c) for c in candidates]
     fastest = fastest_time(out) if screen else None
     copies = make_cold_copies(inputs, cold_mb)
     common = {
@@ -266,7 +354,8 @@ def benchmark(
         ),
     )
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
-    for candidate in candidates:
+    while pending:
+        candidate = next_ready(pending, pool, call, copies[0])
         is_baseline = candidate is None
         append_record(
             out, dict(common, status="start", baseline=is_baseline, config=candidate)
@@ -343,6 +432,10 @@ def main(argv=None):
         help="with --precompile: a counter file shared by several workers; each takes the "
         "next unclaimed candidate of --configs",
     )
+    parser.add_argument(
+        "--pool",
+        help="the compile-ahead pool's list for this M: time what it has compiled first",
+    )
     parser.add_argument("--space-out", help="where --plan writes the space (JSON)")
     parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
     parser.add_argument("--out", help="JSONL results file, appended")
@@ -383,9 +476,11 @@ def main(argv=None):
             "shape": shape,
             "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
         }
+        done_file = None
         if args.claim:
             candidates = claimed(candidates, args.claim)
-        precompile(call, inputs, candidates, args.out, common)
+            done_file = f"{args.configs}.done"
+        precompile(call, inputs, candidates, args.out, common, done_file)
         return 0
     benchmark(
         spec,
@@ -400,6 +495,7 @@ def main(argv=None):
         args.replays,
         args.cold_mb,
         args.screen,
+        args.pool,
     )
     return 0
 
