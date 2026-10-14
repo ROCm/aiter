@@ -95,7 +95,70 @@ def get_parser(kernel_name: str) -> argparse.ArgumentParser:
         default="throughput",
         help="metric to plot",
     )
+
+    parser.add_argument(
+        "--graph-warmup-iters",
+        type=int,
+        default=3,
+        help="do_bench_aiter_triton: untimed iterations before the CUDA graph is captured",
+    )
+    parser.add_argument(
+        "--graph-warmup-replays",
+        type=int,
+        default=3,
+        help="do_bench_aiter_triton: untimed graph replays before the timed ones",
+    )
+    parser.add_argument(
+        "--graph-kernels-per-graph",
+        type=int,
+        default=1000,
+        help="do_bench_aiter_triton: kernel calls captured per CUDA graph",
+    )
+    parser.add_argument(
+        "--graph-num-replays",
+        type=int,
+        default=10,
+        help="do_bench_aiter_triton: timed graph replays",
+    )
+    parser.add_argument(
+        "--rot-bufs-min-pool-len",
+        type=int,
+        default=4,
+        help="rotating buffers minimum pool length",
+    )
+    parser.add_argument(
+        "--rot-bufs-target-mb",
+        type=int,
+        default=256,
+        help="rotating buffers target size in MB",
+    )
+    parser.add_argument(
+        "--rot-bufs-print-info",
+        action="store_true",
+        default=False,
+        help="Print rotating buffers pool info (pool length, per-set and total bytes)",
+    )
+
     return parser
+
+
+def get_do_bench_graph_kwargs(args: argparse.Namespace) -> dict:
+    """do_bench_aiter_triton kwargs from the --graph-* flags added by get_parser()."""
+    return {
+        "warmup_iters": args.graph_warmup_iters,
+        "warmup_replays": args.graph_warmup_replays,
+        "kernels_per_graph": args.graph_kernels_per_graph,
+        "num_replays": args.graph_num_replays,
+    }
+
+
+def get_rot_bufs_kwargs(args: argparse.Namespace) -> dict:
+    """generate_rotating_buffers_pool kwargs from the --rot-bufs-* flags added by get_parser()."""
+    return {
+        "target_mb": args.rot_bufs_target_mb,
+        "min_pool_len": args.rot_bufs_min_pool_len,
+        "print_info": args.rot_bufs_print_info,
+    }
 
 
 def get_ff_args(
