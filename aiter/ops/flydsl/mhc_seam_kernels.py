@@ -339,6 +339,13 @@ def _validate_inputs(
         )
         _require(fn_packed.dtype == torch.bfloat16, "fn_packed must be bf16", TypeError)
         _require(fn_packed.is_contiguous(), "fn_packed must be contiguous")
+    else:
+        _require(
+            not fn.is_inference(),
+            "an inference-mode fn has no version counter to detect updates with: "
+            "pass fn_packed=flydsl_mhc_seam_pack_fn(fn)",
+            RuntimeError,
+        )
     _require(
         hc_scale.shape == (3,) and hc_base.shape == (24,),
         "hc_scale (3,) and hc_base (24,)",
@@ -751,9 +758,9 @@ def flydsl_mhc_seam(
 
     Scratch is allocated per call. Compile before CUDA-graph capture. Pass
     ``fn_packed=flydsl_mhc_seam_pack_fn(fn)``, repacked into the same buffer when
-    ``fn`` is reloaded. Without it, ``fn`` is packed on the first eager call, which
-    must precede capture, and repacked after an in-place update through ``fn`` but
-    not through ``fn.data``.
+    ``fn`` is reloaded; it is required for an inference-mode ``fn``. Without it, ``fn``
+    is packed on the first eager call, which must precede capture, and repacked after
+    an in-place update through ``fn`` but not through ``fn.data``.
     """
     T, H, arch = _validate_inputs(
         residual,

@@ -234,3 +234,19 @@ def test_fn_packed_skips_the_pack_cache(dispatch, norm):
         seam.flydsl_mhc_seam(**inputs, config={"NORM": norm}, fn_packed=packed[:-1])
     with pytest.raises(TypeError, match="fn_packed"):
         seam.flydsl_mhc_seam(**inputs, config={"NORM": norm}, fn_packed=packed.float())
+
+
+@pytest.mark.parametrize("norm", ["fused", "separate"])
+def test_inference_fn_needs_fn_packed(dispatch, norm):
+    inputs = _inputs()
+    with torch.inference_mode():
+        inputs["fn"] = torch.empty_like(inputs["fn"])
+    with pytest.raises(RuntimeError, match="fn_packed"):
+        seam.flydsl_mhc_seam(**inputs, config={"NORM": norm})
+    assert not dispatch.compiled and not dispatch.packs
+
+    packed = torch.empty(
+        seam._packed_fn_shape(512), dtype=torch.bfloat16, device="meta"
+    )
+    seam.flydsl_mhc_seam(**inputs, config={"NORM": norm}, fn_packed=packed)
+    assert dispatch.launches[0][1][5] is packed
