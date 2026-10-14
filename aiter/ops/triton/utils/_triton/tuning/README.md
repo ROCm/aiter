@@ -102,7 +102,10 @@ they are not comparable with the old rocprof logs.
 `--screen X` makes a far-off candidate cheap: after the first warm-up replay, one timed replay
 decides. A candidate slower than X times the fastest fully timed record of its M stops there,
 and that replay is its time (`screened` in the record). A candidate whose eager warm-up launch
-alone takes over 1 ms and 4 times that bound stops before the graph is replayed at all. Every candidate is still compiled and
+alone takes over 1 ms and 1.25 times that bound stops before the graph is replayed at all.
+`--screen 1` stops every candidate that is slower than the fastest one so far; the final round
+re-times the ten fastest records, screened ones included, so a candidate that a single noisy
+replay put just behind the leader still gets its full measurement. Every candidate is still compiled and
 timed; only the 25-replay measurement is kept for the ones that can win. The baseline and the
 final round are always timed in full. `--screen 1.5` cuts the GPU time of a full space several
 times, because most of a brute-force space is more than 1.5x slower than its best.

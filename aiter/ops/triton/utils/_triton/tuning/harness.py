@@ -93,8 +93,9 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25, abort_above
     Every launch gets a deep copy of config because the wrappers mutate it. With abort_above
     (microseconds per launch), one replay after the first warm-up replay decides: a candidate
     slower than that stops there (screened), so a far-off candidate costs a few launches. A
-    candidate whose eager warm-up alone takes over 1 ms and 4x abort_above stops right there:
-    at that length the launch overhead in the eager time does not matter.
+    candidate whose eager warm-up alone takes over 1 ms and 1.25x abort_above stops right
+    there: at that length the launch overhead in the eager time does not matter, and the
+    margin covers the cold caches of a first launch.
     """
     import torch
 
@@ -109,7 +110,7 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25, abort_above
         end.record()
         torch.cuda.synchronize()
         eager = start.elapsed_time(end) * 1e3
-        if abort_above is not None and eager > max(4 * abort_above, 1000):
+        if abort_above is not None and eager > max(1.25 * abort_above, 1000):
             return Timing(eager, eager, eager, True)
         graph = torch.cuda.CUDAGraph()
         gc.disable()
