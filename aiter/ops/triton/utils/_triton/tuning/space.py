@@ -193,6 +193,24 @@ def exceeds_registers(config, spec, arch):
     return acc_per_thread > MAX_ACC_PER_THREAD.get(arch, 256)
 
 
+def exceeds_operand_registers(config, spec, arch, backend):
+    """Triton only: True when one thread's dot operands plus accumulator need more than twice
+    its registers. Triton holds whole BLOCK_K operand tiles in registers for tl.dot; measured on
+    gfx1250, every such config spilled or overflowed LDS, and they are the slowest to compile.
+    Gluon kernels walk BLOCK_K in instruction-sized steps, so the rule does not apply there.
+    """
+    tile = cta_tile(config, spec)
+    if backend != "triton" or tile is None or "num_warps" not in config:
+        return False
+    block_m, block_n, block_k = tile
+    wave_size = 32 if arch.startswith("gfx1250") else 64
+    bits = block_m * block_n * 32 + block_k * (
+        block_m * spec.bits[0] + block_n * spec.bits[1]
+    )
+    registers_per_thread = bits / 32 / (config["num_warps"] * wave_size)
+    return registers_per_thread > 2 * MAX_ACC_PER_THREAD.get(arch, 256)
+
+
 def exceeds_lds(config, spec, arch, backend):
     """True when buffers x (A tile + B tile) cannot fit the LDS; such a config never compiles."""
     from aiter.ops.triton.utils._triton.arch_info import _LDS_CAP_BYTES
@@ -249,7 +267,13 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
 
     def prune(candidate_lists):
         configs = []
-        skipped = {"generic rules": 0, "LDS": 0, "registers": 0, "kernel rules": 0}
+        skipped = {
+            "generic rules": 0,
+            "LDS": 0,
+            "registers": 0,
+            "operand registers": 0,
+            "kernel rules": 0,
+        }
         for combination in itertools.product(*candidate_lists.values()):
             config = dict(zip(keys, combination))
             if should_skip_generic(shape, config, backend):
@@ -260,6 +284,9 @@ def build_space(spec, shape, backend, arch, kernel_should_skip):
                 continue
             if exceeds_registers(config, spec, arch):
                 skipped["registers"] += 1
+                continue
+            if exceeds_operand_registers(config, spec, arch, backend):
+                skipped["operand registers"] += 1
                 continue
             if kernel_should_skip is not None and kernel_should_skip(config):
                 skipped["kernel rules"] += 1

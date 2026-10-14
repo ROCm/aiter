@@ -425,8 +425,14 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args, 0)
 
 
+def unclaimed(todo_file, size):
+    with open(f"{todo_file}.next") as f:
+        return int(f.read() or 0) < size
+
+
 def precompile_worker(spec, shape, backend, todo_file, out, slot, gpu, args, stop):
-    """One compile-only worker; it claims the next candidate of todo_file until none is left."""
+    """One compile-only slot: a worker claims the next candidate of todo_file until none is
+    left; a worker killed on a huge compile is replaced, so the pool keeps its size."""
     log_path = f"{out}.pre{slot}.log"
     command = worker_command(
         spec,
@@ -435,11 +441,22 @@ def precompile_worker(spec, shape, backend, todo_file, out, slot, gpu, args, sto
         ["--precompile", "--configs", todo_file, "--claim", f"{todo_file}.next"],
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
-    outcome = run_worker(
-        command + ["--out", out], env, log_path, args.stall, args.setup_timeout, stop
-    )
-    if outcome == "finished":  # keep the log only when something went wrong
-        os.remove(log_path)
+    with open(todo_file) as f:
+        size = len(json.load(f))
+    while not stop.is_set():
+        outcome = run_worker(
+            command + ["--out", out],
+            env,
+            log_path,
+            4 * args.stall,  # a compile-only worker spends its time in one compile
+            args.setup_timeout,
+            stop,
+        )
+        if outcome == "finished":  # keep the log only when something went wrong
+            os.remove(log_path)
+            return
+        if outcome == "setup_failed" or not unclaimed(todo_file, size):
+            return
 
 
 def pool_files(spec, args, plans):

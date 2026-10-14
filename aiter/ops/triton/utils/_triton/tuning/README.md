@@ -65,7 +65,11 @@ exceed the arch's LDS is never compiled; each kernel declares its element widths
 and a kernel whose `num_ctas` splits the tile over a CTA cluster declares `cta_split`, so the
 check counts one CTA's share; and a register check: a config whose fp32 accumulator per thread,
 BLOCK_M x BLOCK_N / (num_warps x wave size), exceeds `MAX_ACC_PER_THREAD` (512 on gfx1250, 256
-elsewhere) only spills, so it is never run. On gfx1250 1024 per thread measured 16-19x slower)
+elsewhere) only spills, so it is never run. On gfx1250 1024 per thread measured 16-19x slower;
+and, for Triton kernels only, an operand check: `tl.dot` holds the whole BLOCK_K operand tiles in
+registers, so a config whose operands plus accumulator need more than twice `MAX_ACC_PER_THREAD`
+per thread is never compiled. On gfx1250 every such config spilled or overflowed LDS, and they
+took 1.5-3 minutes each to compile)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
 to reject. The LDS and register checks are estimates, so the worker also compiles each candidate
