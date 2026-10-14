@@ -42,14 +42,22 @@ def _gfx_from_text(text: str) -> str | None:
     return match.group(1).lower() if match else None
 
 
+def _current_device_properties():
+    """Properties of the current HIP device, as base_tuner.get_cu_num() reads."""
+    import torch
+
+    if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        return None
+    return torch.cuda.get_device_properties(torch.cuda.current_device())
+
+
 def _torch_gcn_arch() -> str | None:
     """Arch from the live HIP device. rocminfo can abort with empty stdout."""
     try:
-        import torch
-
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        props = _current_device_properties()
+        if props is None:
             return None
-        name = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+        name = getattr(props, "gcnArchName", "")
     except Exception:  # noqa: BLE001 device probing must allow CPU-only environments
         return None
     return _gfx_from_text(str(name))
@@ -66,11 +74,10 @@ def _explicit_gpu_arch() -> str | None:
 
 def _torch_cu_num() -> int | None:
     try:
-        import torch
-
-        if not torch.cuda.is_available() or torch.cuda.device_count() < 1:
+        props = _current_device_properties()
+        if props is None:
             return None
-        cu = int(torch.cuda.get_device_properties(0).multi_processor_count)
+        cu = int(props.multi_processor_count)
     except Exception:  # noqa: BLE001 device probing must allow CPU-only environments
         return None
     return cu if cu > 0 else None
