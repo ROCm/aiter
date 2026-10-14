@@ -354,7 +354,7 @@ def test_gqa_matches_dense_on_selected():
 
 
 def test_flash_next_shapes_smoke():
-    """Family A ABI with a short context (8 blocks << 512)."""
+    """Flash-Next ABI with a short context (8 blocks << 512)."""
     idx = FLASH_NEXT_INDEXER
     gqa = FLASH_NEXT_GQA
     m = 1
@@ -1414,7 +1414,7 @@ def test_k1_wide_padded_page_does_not_alias():
 
 
 def test_k2_flash_next_decode_matches_oracle():
-    """Family A FlyDSL sparse GQA decode matches the fp32 oracle on paged K/V."""
+    """Flash-Next FlyDSL sparse GQA decode matches the fp32 oracle on paged K/V."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     gqa = FLASH_NEXT_GQA
@@ -1591,7 +1591,7 @@ def test_k2_flash_next_prefill_matches_oracle():
 def test_k2_page_past_4gib():
     """A physical page at byte offset 2^32 must not alias page 0.
 
-    Family A pages are 16384 bytes (page 16, 2 KV heads, D=256, bf16), so
+    Flash-Next pages are 16384 bytes (page 16, 2 KV heads, D=256, bf16), so
     physical page 262144 starts at 4 GiB. Q is zero, so each live token
     contributes its V with equal weight. Page 0 is ones and the far page
     is twos. One row gathers both in a single tile.
@@ -1659,7 +1659,7 @@ def _interleave_kv(k_cache, v_cache):
 def test_k2_interleaved_kv_view_matches_contiguous():
     """K2 reads K|V-interleaved cache views in place, bit-equal to copies.
 
-    Covers family A and its TP2 shard (12 query heads over 1 KV head), at
+    Covers Flash-Next and its TP2 shard (12 query heads over 1 KV head), at
     decode and prefill M.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
@@ -2242,7 +2242,7 @@ def _pad_index_table(index_table, pad_pages):
 def bench_qsa_flash_next_k1(
     m, seq_len, page_size, dtype, rotate=0, pad_pages=0, cache_layout="packed"
 ):
-    """Family A FlyDSL K1 vs oracle set equality.
+    """Flash-Next FlyDSL indexer vs oracle set equality.
 
     2d: short rows use fused emit. Long rows use BLOCK_N=32 BF16 MFMA scoring
     into an fp32 score matrix. Selection is decode radix below 32768 columns
@@ -2371,14 +2371,14 @@ def bench_qsa_flash_next_k1(
 def bench_qsa_flash_next_k2(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
-    """Family A FlyDSL K2 vs oracle GQA.
+    """Flash-Next FlyDSL sparse GQA vs the oracle.
 
     3d: live-AMD-shaped BLOCK_N/threads/split policy, tiled MFMA QK/PV,
     log2 online softmax, direct output at one split, and a two-wave merge.
     Expand and sigmoid stay unfused. The FlyDSL column passes the packed
     live prefix as ``n_sel`` so the split grid follows filled columns.
     Same ``rotate`` on every GQA column.
-    ``cache_layout="wide"`` gives K and V the serving cache span. K2 reads
+    ``cache_layout="wide"`` gives K and V the serving cache span. Sparse GQA reads
     V with K's strides, so the two views share one page stride.
     """
     idx = FLASH_NEXT_INDEXER
@@ -2505,7 +2505,7 @@ def test_k1_gluon_parity_set_equality_published_indexer_point():
     _assert_k1_block_ids(
         ref_ids,
         got,
-        "family B K1 published-indexer block-id set diverged from the oracle",
+        "Gluon-parity published indexer block-id set diverged from the oracle",
     )
 
 
@@ -2520,11 +2520,11 @@ def bench_qsa_gluon_parity_k1(
     pad_pages=0,
     cache_layout="packed",
 ):
-    """Family B FlyDSL K1 vs oracle set equality.
+    """Gluon-parity FlyDSL indexer vs oracle set equality.
 
-    2e/2f: emit on ``n_blocks <= 512``. Longer rows use family A's MFMA
+    2e/2f: emit on ``n_blocks <= 512``. Longer rows use the Flash-Next MFMA
     scorer plus radix (``H=8`` is a second compile). ``H`` 4 and 8 emit
-    share one kernel. Separate table from family A. Expand is not fused.
+    share one kernel. Separate table from Flash-Next. Expand is not fused.
     ``pad_pages`` widens the block table every column sees; ``0`` keeps it
     packed to the context. ``cache_layout="wide"`` gives the indexer cache
     the serving span.
@@ -2599,7 +2599,7 @@ def _gluon_parity_indexer(index_heads):
         return GLUON_PARITY_INDEXER
     if index_heads == GLUON_PARITY_INDEXER_H8.n_heads:
         return GLUON_PARITY_INDEXER_H8
-    raise ValueError(f"family B indexer heads must be 4 or 8, got {index_heads}")
+    raise ValueError(f"Gluon-parity indexer heads must be 4 or 8, got {index_heads}")
 
 
 def test_qsa_layer_rejects_a_selection_k1_cannot_build():
@@ -2836,7 +2836,7 @@ def test_k2_supported_rejects_shapes_the_builder_rejects():
         return q, k, torch.zeros_like(k), indices, table
 
     if qsa_sparse_gqa_supported(*tensors(24, 2, 256, 16)) is not None:
-        raise AssertionError("family A GQA was rejected")
+        raise AssertionError("Flash-Next GQA was rejected")
     if qsa_sparse_gqa_supported(*tensors(16, 1, 128, 16)) is not None:
         raise AssertionError("a group of 16 at head_dim 128 was rejected")
     # (Hq, Hkv, D, page, rows, width, needle). D=32/D=96 are the decode
@@ -2981,7 +2981,7 @@ def _layer_kwargs(idx, **extra):
 
 
 def test_qsa_layer_flash_next_matches_oracle():
-    """The QSA layer matches the oracle on family A."""
+    """The QSA layer matches the oracle on Flash-Next."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     idx, gqa = FLASH_NEXT_INDEXER, FLASH_NEXT_GQA
@@ -2999,7 +2999,7 @@ def test_qsa_layer_flash_next_matches_oracle():
 
 
 def test_qsa_layer_gluon_parity_matches_oracle():
-    """Family B FlyDSL layer matches the oracle (group 5, D=128)."""
+    """Gluon-parity FlyDSL layer matches the oracle (group 5, D=128)."""
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
     idx, gqa = GLUON_PARITY_INDEXER, GLUON_PARITY_GQA
@@ -3010,10 +3010,10 @@ def test_qsa_layer_gluon_parity_matches_oracle():
         out.to(dtypes.fp32),
         rtol=1e-2,
         atol=1e-2,
-        msg="family B flydsl layer vs oracle",
+        msg="Gluon-parity flydsl layer vs oracle",
     )
     if err != 0:
-        raise AssertionError(f"family B QSA layer diverged (err={err})")
+        raise AssertionError(f"Gluon-parity QSA layer diverged (err={err})")
 
 
 def _capture_replay_us(fn) -> float:
@@ -3112,7 +3112,7 @@ def _time_layer(case, idx, rotate):
 def bench_qsa_flash_next_e2e(
     m, seq_len, page_size, dtype, rotate=0, cache_layout="packed"
 ):
-    """One family A QSA layer: FlyDSL K1+expand+K2.
+    """One Flash-Next QSA layer: FlyDSL indexer, expand, and sparse GQA.
 
     Expand stays the vendored Triton kernel. Oracle is not timed. Same
     ``rotate`` on every column. HIP graph replay is a separate table.
@@ -3142,9 +3142,9 @@ def bench_qsa_flash_next_e2e(
 def bench_qsa_gluon_parity_e2e(
     m, seq_len, page_size, dtype, index_heads, rotate=0, cache_layout="packed"
 ):
-    """One family B QSA layer.
+    """One Gluon-parity QSA layer.
 
-    Separate table from family A.
+    Separate table from Flash-Next.
     """
     idx = _gluon_parity_indexer(index_heads)
     gqa = GLUON_PARITY_GQA
@@ -3161,7 +3161,7 @@ def bench_qsa_gluon_parity_e2e(
     }
     out, us = _time_layer(case, idx, rotate)
     err = checkAllclose(
-        ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="family B e2e"
+        ref, out.to(dtypes.fp32), rtol=1e-2, atol=1e-2, msg="Gluon-parity e2e"
     )
     ret.update(_e2e_cells("flydsl_e2e", us, err, flops, nbytes))
     return ret
@@ -3169,7 +3169,7 @@ def bench_qsa_gluon_parity_e2e(
 
 @benchmark()
 def bench_qsa_flash_next_e2e_graph(m, seq_len, page_size, dtype, cache_layout="packed"):
-    """HIP graph replay of one family A decode layer. Not combined with rotate.
+    """HIP graph replay of one Flash-Next decode layer. Not combined with rotate.
 
     Each candidate is captured once, then ``replay`` is timed hot. The
     output buffer after replay is the correctness check.
@@ -3215,10 +3215,11 @@ def bench_qsa_flash_next_e2e_graph(m, seq_len, page_size, dtype, cache_layout="p
 
 
 def _k1_k2_sweep_batches(batches):
-    """Split requested M into the family A K1/K2 decode and prefill tables.
+    """Split requested M into the Flash-Next indexer and sparse-GQA decode
+    and prefill tables.
 
     Decode is ``M<=8``. Every larger M is prefill, so 64, 2048, and 8192
-    are run instead of dropped. Family B is not split this way: its tables
+    are run instead of dropped. Gluon-parity is not split this way: its tables
     are emit versus long-L, and every requested M runs in one of them.
     """
     decode = [m for m in batches if m <= 8]
@@ -3283,7 +3284,10 @@ def _raise_if_row_mismatch(row, m, seq_len):
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter,
-        description="Family A/B QSA sweeps, FlyDSL K1/K2, and the end-to-end layer opt-in",
+        description=(
+            "Flash-Next and Gluon-parity QSA sweeps, FlyDSL indexer and "
+            "sparse GQA, and the end-to-end layer opt-in"
+        ),
     )
     parser.add_argument(
         "-d",
@@ -3291,7 +3295,7 @@ def main():
         type=dtypes.str2Dtype,
         nargs="*",
         default=[dtypes.bf16],
-        help="activation dtype (family A is BF16)",
+        help="activation dtype (Flash-Next is BF16)",
     )
     parser.add_argument(
         "-b",
@@ -3299,8 +3303,11 @@ def main():
         type=int,
         nargs="*",
         default=[1, 8, 512],
-        help="flattened query tokens M. Family A K1/K2 report M<=8 as\n"
-        "decode and every larger M as prefill.",
+        help=(
+            "flattened query tokens M. Flash-Next indexer and sparse GQA "
+            "report M<=8 as\n"
+            "decode and every larger M as prefill."
+        ),
     )
     parser.add_argument(
         "-s",
@@ -3387,14 +3394,14 @@ def main():
             args.pad_pages,
             args.cache_layout,
         ):
-            if _skip_m_past_seq(m, seq_len, "family A K1 decode"):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next indexer decode"):
                 continue
             if _skip_pad_narrower_than_context(
                 seq_len,
                 page_size,
                 pad_pages,
                 FLASH_NEXT_INDEXER.compress_ratio,
-                "family A K1 decode",
+                "Flash-Next indexer decode",
             ):
                 continue
             row = bench_qsa_flash_next_k1(
@@ -3409,13 +3416,13 @@ def main():
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             if "flydsl_k1_graph err" in row:
                 _raise_if_k1_mismatch(
-                    row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL K1 graph"
+                    row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL indexer graph"
                 )
             rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family A FlyDSL K1 summary (markdown):\n%s",
+                "QSA Flash-Next FlyDSL indexer summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3423,7 +3430,7 @@ def main():
         for m, seq_len, page_size, rotate, cache_layout in itertools.product(
             decode_m, args.seq, args.page_size, args.rotate, args.cache_layout
         ):
-            if _skip_m_past_seq(m, seq_len, "family A K2 decode"):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next sparse GQA decode"):
                 continue
             row = bench_qsa_flash_next_k2(
                 m, seq_len, page_size, dtype, rotate, cache_layout
@@ -3433,7 +3440,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family A FlyDSL K2 decode summary (markdown):\n%s",
+                "QSA Flash-Next FlyDSL sparse GQA decode summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3453,14 +3460,14 @@ def main():
             args.pad_pages,
             args.cache_layout,
         ):
-            if _skip_m_past_seq(m, seq_len, "family A K1 prefill"):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next indexer prefill"):
                 continue
             if _skip_pad_narrower_than_context(
                 seq_len,
                 page_size,
                 pad_pages,
                 FLASH_NEXT_INDEXER.compress_ratio,
-                "family A K1 prefill",
+                "Flash-Next indexer prefill",
             ):
                 continue
             row = bench_qsa_flash_next_k1(
@@ -3475,13 +3482,13 @@ def main():
             _raise_if_k1_mismatch(row["flydsl_k1 err"], m, seq_len)
             if "flydsl_k1_graph err" in row:
                 _raise_if_k1_mismatch(
-                    row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL K1 graph"
+                    row["flydsl_k1_graph err"], m, seq_len, where="FlyDSL indexer graph"
                 )
             rows.append(row)
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family A FlyDSL K1 prefill summary (markdown):\n%s",
+                "QSA Flash-Next FlyDSL indexer prefill summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3489,7 +3496,7 @@ def main():
         for m, seq_len, page_size, rotate, cache_layout in itertools.product(
             prefill_m, args.seq, args.page_size, args.rotate, args.cache_layout
         ):
-            if _skip_m_past_seq(m, seq_len, "family A K2 prefill"):
+            if _skip_m_past_seq(m, seq_len, "Flash-Next sparse GQA prefill"):
                 continue
             row = bench_qsa_flash_next_k2(
                 m, seq_len, page_size, dtype, rotate, cache_layout
@@ -3499,7 +3506,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family A FlyDSL K2 prefill summary (markdown):\n%s",
+                "QSA Flash-Next FlyDSL sparse GQA prefill summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3519,14 +3526,14 @@ def main():
             args.pad_pages,
             args.cache_layout,
         ):
-            if _skip_m_past_seq(m, seq_len, "family B K1 H=8"):
+            if _skip_m_past_seq(m, seq_len, "Gluon-parity indexer H=8"):
                 continue
             if _skip_pad_narrower_than_context(
                 seq_len,
                 page_size,
                 pad_pages,
                 GLUON_PARITY_INDEXER_H8.compress_ratio,
-                "family B K1 H=8",
+                "Gluon-parity indexer H=8",
             ):
                 continue
             row = bench_qsa_gluon_parity_k1(
@@ -3537,7 +3544,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family B FlyDSL K1 H=8 summary (markdown):\n%s",
+                "QSA Gluon-parity FlyDSL indexer H=8 summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3551,7 +3558,7 @@ def main():
                 8,
                 pad_pages,
                 GLUON_PARITY_INDEXER.compress_ratio,
-                "family B K1 published",
+                "Gluon-parity indexer published",
             ):
                 continue
             row = bench_qsa_gluon_parity_k1(
@@ -3562,7 +3569,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family B FlyDSL K1 published indexer point (markdown):\n%s",
+                "QSA Gluon-parity FlyDSL published indexer point (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3584,14 +3591,14 @@ def main():
             args.pad_pages,
             args.cache_layout,
         ):
-            if _skip_m_past_seq(m, seq_len, "family B K1 long-L"):
+            if _skip_m_past_seq(m, seq_len, "Gluon-parity indexer long-L"):
                 continue
             if _skip_pad_narrower_than_context(
                 seq_len,
                 page_size,
                 pad_pages,
                 GLUON_PARITY_INDEXER.compress_ratio,
-                "family B K1 long-L",
+                "Gluon-parity indexer long-L",
             ):
                 continue
             row = bench_qsa_gluon_parity_k1(
@@ -3609,7 +3616,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family B FlyDSL K1 long-L summary (markdown):\n%s",
+                "QSA Gluon-parity FlyDSL indexer long-L summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3627,7 +3634,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family A end-to-end summary (markdown):\n%s",
+                "QSA Flash-Next end-to-end summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3648,7 +3655,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family A decode HIP-graph summary (markdown):\n%s",
+                "QSA Flash-Next decode HIP-graph summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 
@@ -3684,7 +3691,7 @@ def main():
         if rows:
             df = pd.DataFrame(rows)
             aiter.logger.info(
-                "QSA family B end-to-end summary (markdown):\n%s",
+                "QSA Gluon-parity end-to-end summary (markdown):\n%s",
                 df.to_markdown(index=False),
             )
 

@@ -30,7 +30,7 @@ from aiter.aot.flydsl.common import compile_only_env, override_env
 
 _QSA_ARCHS = ("gfx942", "gfx950")
 
-# (kernel_name, op, m, seq_len). Sparse GQA width and head counts are family A.
+# (kernel_name, op, m, seq_len). Sparse GQA width and head counts are Flash-Next.
 _FLASH_NEXT_LAUNCHES = (
     ("qsa_indexer_emit_flash_next", "indexer", 1, 512),
     ("qsa_indexer_long_row_flash_next_decode", "indexer", 1, 32768),
@@ -216,7 +216,7 @@ def _compile_sparse_gqa(job):
 
 
 def compile_one_config(**job) -> dict:
-    """Compile one family A launch. ``COMPILE_ONLY`` keeps the wrapper from launching."""
+    """Compile one Flash-Next launch. ``COMPILE_ONLY`` keeps the wrapper from launching."""
     result = {**job, "compile_time": None}
     started = time.time()
     try:

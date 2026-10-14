@@ -3,7 +3,7 @@
 
 """fp32 QSA reference and the paged-cache fixtures the tests build from it.
 
-The kernels do not import this module. Concrete family A and B numbers
+The kernels do not import this module. Concrete Flash-Next and Gluon-parity numbers
 live in ``op_tests/qsa_shapes.py``.
 
 Authoritative math: Qwen3.8-Next tech report ?2.1 (QSA). The oracle may
