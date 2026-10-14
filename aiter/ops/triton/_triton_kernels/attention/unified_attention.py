@@ -437,7 +437,7 @@ def kernel_unified_attention_2d(
                 .trans(1, 0)
             )
 
-        # V : (TILE_SIZE, HEAD_SIZE)
+        # V : (TILE_SIZE, HEAD_SIZE_V)
         V_load = tl.load(
             value_cache_ptr + v_offset,
             mask=v_mask,
@@ -512,14 +512,14 @@ def kernel_unified_attention_2d(
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc = acc * alpha[:, None]
 
         # update constants
         L = L * alpha + l_j
         M = m_j
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     # epilogue
@@ -851,7 +851,7 @@ def kernel_unified_attention_3d(
                 .trans(1, 0)
             )
 
-        # V : (TILE_SIZE, HEAD_SIZE)
+        # V : (TILE_SIZE, HEAD_SIZE_V)
         V_load = tl.load(
             value_cache_ptr + v_offset,
             mask=v_mask,
@@ -927,14 +927,14 @@ def kernel_unified_attention_3d(
         # alpha : (BLOCK_M, )
         alpha = tl.math.exp2(M - m_j)
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc = acc * alpha[:, None]
 
         # update constants
         L = L * alpha + l_j
         M = m_j
 
-        # acc : (BLOCK_M, HEAD_SIZE_PADDED)
+        # acc : (BLOCK_M, HEAD_SIZE_V_PADDED)
         acc = tl.dot(P.to(V.dtype), V, acc=acc)
 
     acc = acc * out_factor

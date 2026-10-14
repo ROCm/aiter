@@ -145,7 +145,7 @@ def generate_data(
     num_blocks=32768,
     block_size=32,
     head_size=64,
-    v_head_size=None,
+    head_size_v=None,
     num_heads=(16, 2),
     sliding_window=None,
     q_dtype=torch.bfloat16,
@@ -158,7 +158,7 @@ def generate_data(
     device="cpu",
 ):
     torch.manual_seed(0)
-    v_head_size = head_size if v_head_size is None else v_head_size
+    head_size_v = head_size if head_size_v is None else head_size_v
     num_seqs = len(seq_lens)
     query_lens = [x[0] for x in seq_lens]
     kv_lens = [x[1] for x in seq_lens]
@@ -210,7 +210,7 @@ def generate_data(
         num_blocks,
         block_size,
         num_kv_heads,
-        v_head_size,
+        head_size_v,
         dtype=torch.float32,
         device=device,
     )
@@ -245,7 +245,7 @@ def generate_data(
     sinks = torch.randn(num_query_heads, dtype=torch.float32, device=device)
 
     output = torch.empty(
-        sum(query_lens), num_query_heads, v_head_size, dtype=out_dtype, device=device
+        sum(query_lens), num_query_heads, head_size_v, dtype=out_dtype, device=device
     )
 
     # ---- descales / output scale ----
@@ -611,9 +611,9 @@ def test_triton_unified_attn(
     use_out_scale: bool,
     shuffled_kv_cache: bool,
     backend: str,  # "triton" | "gluon"
-    v_head_size: int | None = None,
+    head_size_v: int | None = None,
 ) -> None:
-    v_head_size = head_size if v_head_size is None else v_head_size
+    head_size_v = head_size if head_size_v is None else head_size_v
     if backend == "gluon" and not _is_gluon_available():
         pytest.skip(f"skip gluon backend, not available on {DEVICE_ARCH}")
     use_gluon_2d = is_2d_gluon_available(
@@ -624,7 +624,7 @@ def test_triton_unified_attn(
             use_qq_bias=False,
             use_alibi_slopes=False,
             head_size=head_size,
-            head_size_v=v_head_size,
+            head_size_v=head_size_v,
             shuffled_kv_cache=shuffled_kv_cache,
             block_size=block_size,
             k_width=16 // kv_dtype.itemsize,
@@ -663,7 +663,7 @@ def test_triton_unified_attn(
         num_blocks=num_blocks,
         block_size=block_size,
         head_size=head_size,
-        v_head_size=v_head_size,
+        head_size_v=head_size_v,
         num_heads=num_heads,
         sliding_window=sliding_window,
         q_dtype=q_dtype,
@@ -741,7 +741,9 @@ def test_triton_unified_attn(
 
 
 @pytest.mark.parametrize("sliding_window", [None, 128])
-def test_triton_unified_attn_asymmetric_qk_v(sliding_window):
+@pytest.mark.parametrize("head_size_v", [128, 96])
+@pytest.mark.parametrize("backend", ["triton", "gluon"])
+def test_unified_attn_asymmetric_qk_v(sliding_window, head_size_v, backend):
     test_triton_unified_attn(
         seq_lens=[(1, 1024)],
         num_heads=(16, 1),
@@ -757,6 +759,6 @@ def test_triton_unified_attn_asymmetric_qk_v(sliding_window):
         use_kv_descale=False,
         use_out_scale=False,
         shuffled_kv_cache=False,
-        backend="triton",
-        v_head_size=128,
+        backend=backend,
+        head_size_v=head_size_v,
     )
