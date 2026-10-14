@@ -12,8 +12,21 @@ from __future__ import annotations
 import triton
 import triton.language as tl
 
+from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
 
-@triton.jit
+_expand_qsa_indices_repr = make_kernel_repr(
+    "_expand_qsa_indices_kernel",
+    [
+        "BLOCK_TOPK",
+        "COMPRESS_RATIO",
+        "TOKEN_TOPK",
+        "OUTPUT_WIDTH",
+        "COLUMN_BLOCK",
+    ],
+)
+
+
+@triton.jit(repr=_expand_qsa_indices_repr)
 def _expand_qsa_indices_kernel(
     block_indices_ptr,
     query_positions_ptr,
