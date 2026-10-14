@@ -591,7 +591,7 @@ def create_topk_per_row_decode_adaptive_kernel(
     )
     kernel_name = (
         f"topk_per_row_decode_adaptive_k{top_k}_"
-        f"bpp{bits_per_pass}_g{blocks_per_row}_v2"
+        f"bpp{bits_per_pass}_g{blocks_per_row}"
         f"_stage{scan_stages}"
         f"_{tier_mode}"
         f"{_cap_tag}"
@@ -1889,13 +1889,8 @@ def create_topk_per_row_decode_adaptive_kernel(
             return next_k, next_len, next_bits
 
         def one_workgroup_short_tier():
-            # The standalone one-workgroup unordered radix-select algorithm
-            # (radix_topk_one_block.py), run entirely in part 0: LDS-only
-            # histograms, a hierarchical block scan, and an atomic-append write.
-            # Unlike the multi-block path it uses the
-            # standalone ascending key and total-k threshold convention, and its three
-            # 11/11/10-bit passes require a 2048-bin histogram (bits_per_pass == 11).
-            # Reuses the persistent kernel's LDS with no extra shared memory.
+            # Part 0 selects the whole row alone and emits unordered. Its keys ascend
+            # (`ordered_key`), the reverse of `radix_twiddle_key`, so the two never mix.
             c_shift = fx.Int32(32 - 11)
             c_mid_shift = fx.Int32(10)
             c_bin_mask = fx.Int32((1 << 11) - 1)
