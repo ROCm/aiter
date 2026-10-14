@@ -26,6 +26,7 @@ CPU only. No kernels, no GPU, no build.
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import torch
@@ -118,6 +119,73 @@ def test_strict_flag_raises_without_touching_the_call_site():
         pass
     else:
         raise AssertionError("strict=True should have raised")
+
+
+# A file that loops over shapes, as the real op_tests do. Every case is wrong,
+# so a strict mode that stopped at the first one would report a single failure
+# and never reach the summary line.
+_LOOPING_OP_TEST = """
+import torch
+from aiter.test_common import checkAllclose
+
+for shape in (8, 16, 32, 64):
+    ref = torch.ones(shape)
+    checkAllclose(ref * 10.0, ref, msg=f"shape={shape} ")
+
+print("op test summary table")
+"""
+
+
+def _run_looping_op_test(strict_value):
+    """Run the looping test as a real file, so argv[0] carries its name."""
+    path = Path(tempfile.gettempdir()) / "test_aiter_strict_loop.py"
+    path.write_text(_LOOPING_OP_TEST, encoding="utf-8")
+    env = dict(os.environ)
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    env.pop("AITER_STRICT_ALLCLOSE", None)
+    if strict_value is not None:
+        env["AITER_STRICT_ALLCLOSE"] = strict_value
+    return subprocess.run(
+        [sys.executable, str(path)],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+
+def test_strict_reports_every_failure_not_just_the_first():
+    """Deferred failure: the file runs to the end, then the process fails.
+
+    Raising at the first mismatch would hide the rest of a file that loops over
+    shapes, so a survey of what fails today would undercount and fixing them
+    would take one rerun per failure.
+
+    ``sys.exit`` and ``raise SystemExit`` do not work from an atexit handler --
+    both leave the exit code at 0 -- which is why the implementation uses
+    ``os._exit`` after flushing.
+    """
+    r = _run_looping_op_test("test_aiter_strict_loop.py")
+    out = r.stdout + r.stderr
+
+    assert (
+        r.returncode == 1
+    ), f"expected a failing exit, got {r.returncode}: {out[-500:]}"
+    assert out.count("failed!") == 4, "all four cases should have run and reported"
+    assert "op test summary table" in out, "the file's own summary should still print"
+    assert "4 comparison(s) failed" in out, "the summary should name the total"
+    for shape in (8, 16, 32, 64):
+        assert f"shape={shape}" in out, f"case {shape} missing from the report"
+
+
+def test_strict_opt_in_leaves_other_files_alone():
+    """The same looping file, with a different file named, is untouched."""
+    r = _run_looping_op_test("test_some_other_file.py")
+    out = r.stdout + r.stderr
+    assert r.returncode == 0, out[-500:]
+    assert out.count("failed!") == 4, "the comparisons still report as they do today"
+    assert "comparison(s) failed" not in out
 
 
 def test_strict_opt_in_is_per_file():
