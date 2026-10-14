@@ -179,11 +179,27 @@ def device_cu_count(device_index: int) -> int:
         return 256
 
 
-def _build_kernel():
+def _build_kernel(ctx_stride: int):
+    # ctx_stride is a build-time constant: 1 for a [B] context_lens (the
+    # pre-2D kernel and name), n for a (B, n) table (its own build and name).
     kernel_name = (
         "fp8_paged_mqa_logits_gfx950_H32_D128_bkv64_kvb64_"
         "nn8_w8_lds2_mfma16_ntg2l_flydsl"
     )
+    if ctx_stride != 1:
+        kernel_name += f"_cs{ctx_stride}"
+
+    # Chosen at build time, outside the kernel body: request b's length is
+    # element b of a [B], or the last entry of row b of a (B, ctx_stride) table.
+    if ctx_stride == 1:
+
+        def _context_len_index(pid_batch):
+            return pid_batch
+
+    else:
+
+        def _context_len_index(pid_batch):
+            return pid_batch * ctx_stride + (ctx_stride - 1)
 
     @fx.struct
     class SharedStorage:
@@ -205,7 +221,6 @@ def _build_kernel():
         stride_q_batch: fx.Int32,
         max_block_len: fx.Int32,
         stride_out: fx.Int32,
-        ctx_stride: fx.Int32,
     ):
         tid = fx.Int32(fx.thread_idx.x)
         wave = udiv(tid, 64)
@@ -229,7 +244,7 @@ def _build_kernel():
 
         ragged_nn = _imin(fx.Int32(nn_t[pid_batch]), rows_per_batch)
         nn = (has_next_n_lens != 0).select(ragged_nn, rows_per_batch)
-        context_len = fx.Int32(context_t[pid_batch * ctx_stride + ctx_stride - 1])
+        context_len = fx.Int32(context_t[_context_len_index(pid_batch)])
         page_count = uceildiv(context_len, fx.Int32(KV_BLOCK_SIZE))
         pages_per_split = uceildiv(page_count, split_kv)
         page_lo = pid_split * pages_per_split
@@ -439,7 +454,6 @@ def _build_kernel():
         stride_q_batch,
         max_block_len,
         stride_out,
-        ctx_stride,
         stream: fx.Stream = fx.Stream(None),  # noqa: B008
     ):
         kernel._func.__name__ = kernel_name
@@ -458,7 +472,6 @@ def _build_kernel():
             stride_q_batch,
             max_block_len,
             stride_out,
-            ctx_stride,
         ).launch(
             grid=(fx.Int64(grid_blocks), 1, 1),
             block=(THREADS, 1, 1),
@@ -470,9 +483,9 @@ def _build_kernel():
     return launch
 
 
-@lru_cache(maxsize=1)
-def _compile():
-    return _build_kernel()
+@lru_cache(maxsize=MAX_NN)
+def _compile(ctx_stride: int = 1):
+    return _build_kernel(ctx_stride)
 
 
 def flydsl_fp8_paged_mqa_logits(
@@ -590,7 +603,7 @@ def flydsl_fp8_paged_mqa_logits(
         split_kv = max(1, int(SplitKV))
 
     grid_blocks = batch_size * split_kv
-    launcher = _compile()
+    launcher = _compile(int(ctx_stride))
     launcher.compile_hints = dict(DEFAULT_COMPILE_HINTS)
     stream = stream or torch.cuda.current_stream(q_fp8.device)
     with torch.cuda.device(q_fp8.device.index):
@@ -611,7 +624,6 @@ def flydsl_fp8_paged_mqa_logits(
             int(q_fp8.stride(0)),
             int(max_block_len),
             int(out_logits.stride(0)),
-            int(ctx_stride),
             stream,
         )
     return out_logits
