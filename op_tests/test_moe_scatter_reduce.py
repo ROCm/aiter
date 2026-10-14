@@ -19,11 +19,10 @@ from __future__ import annotations
 import pytest
 import torch
 
-import aiter
-from aiter import dtypes
-
 if not torch.cuda.is_available() or torch.version.hip is None:
     pytest.skip("ROCm GPU required", allow_module_level=True)
+
+aiter = pytest.importorskip("aiter")
 
 pytest.importorskip("aiter.ops.moe_mxfp4_aux", reason="mxfp4 MoE aux module")
 
@@ -48,6 +47,19 @@ def _reference(flat_out, reverse_sorted, sorted_weights, M, topk, max_sorted):
             acc = acc + flat_out[sp].float() * float(sorted_weights[sp].item())
         out[t] = acc
     return out
+
+
+def _assert_bf16_matches(out, ref, *, exact=False):
+    assert torch.isfinite(out).all(), "output has non-finite values"
+    # Compare at the output precision. Weighted FP32 FMA can cross a BF16
+    # rounding midpoint relative to separate multiply/add, so allow one ULP.
+    # Unit-weight sums use the same FP32 additions and must match exactly.
+    torch.testing.assert_close(
+        out,
+        ref.to(out.dtype),
+        rtol=0 if exact else torch.finfo(out.dtype).eps,
+        atol=0 if exact else 1e-5,
+    )
 
 
 def _raise_pending_launch_error():
@@ -87,9 +99,7 @@ def test_scatter_reduce_matches_reference(M, mb):
 
     _run_scatter(flat, rs, weights, out, topk, mb)
     ref = _reference(flat, rs, weights, M, topk, max_sorted)
-    err = (out.float() - ref).abs().max().item()
-    assert torch.isfinite(out).all(), "output has non-finite values"
-    assert err < 2e-2, f"max abs err {err}"
+    _assert_bf16_matches(out, ref)
 
 
 @pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
@@ -132,9 +142,7 @@ def test_scatter_reduce_skips_negative_and_oob_indices(mb):
 
     _run_scatter(flat, rs, weights, out, topk, mb)
     ref = _reference(flat, rs, weights, M, topk, max_sorted)
-    err = (out.float() - ref).abs().max().item()
-    assert torch.isfinite(out).all()
-    assert err < 2e-2, f"max abs err {err}"
+    _assert_bf16_matches(out, ref, exact=True)
 
 
 @pytest.mark.parametrize("mb", (128,), ids=("nt1_bm128",))
@@ -153,3 +161,57 @@ def test_scatter_reduce_m3_warmup_shape_smoke(mb):
     out = torch.empty(M, D, dtype=torch.bfloat16, device="cuda")
     _run_scatter(flat, rs, weights, out, topk, mb)
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
+def test_scatter_reduce_mxfp4_bounds_and_reference(mb):
+    """Exercise packed FP4 data and varying E8M0 scales, including OOB skips."""
+    torch.manual_seed(mb)
+    M, rows, D, topk = 6, 32, M3_H, M3_TOPK
+    packed = torch.randint(0, 256, (rows, D // 2), dtype=torch.uint8, device="cuda")
+    scales = torch.randint(125, 130, (rows, D // 32), dtype=torch.uint8, device="cuda")
+    lut = torch.tensor(
+        [0, 0.5, 1, 1.5, 2, 3, 4, 6, 0, -0.5, -1, -1.5, -2, -3, -4, -6],
+        device="cuda",
+    )
+    decoded = torch.stack((lut[(packed & 15).long()], lut[(packed >> 4).long()]), -1)
+    decoded = decoded.reshape(rows, D) * torch.exp2(
+        scales.float() - 127
+    ).repeat_interleave(32, dim=1)
+    weights = torch.rand(rows, device="cuda")
+    rs = torch.arange(M * topk, dtype=torch.int32, device="cuda")
+    rs[:5] = torch.tensor([-1, -7, rows, rows + 7, 2**20], device="cuda")
+    rs[5] = rows - 1
+    out = torch.full((M, D), float("nan"), dtype=torch.bfloat16, device="cuda")
+    aiter.mxfp4_moe_scatter_reduce_q(
+        flat_out_q=packed,
+        flat_out_scale=scales,
+        reverse_sorted=rs,
+        sorted_weights=weights,
+        out=out,
+        NE=129,
+        TOPK=topk,
+        D_HIDDEN=D,
+        MB=mb,
+    )
+    _raise_pending_launch_error()
+    torch.cuda.synchronize()
+    _assert_bf16_matches(out, _reference(decoded, rs, weights, M, topk, rows))
+    assert torch.count_nonzero(out[0]) == 0
+
+
+@pytest.mark.parametrize("mb", (16, 128), ids=("nt0", "nt1"))
+def test_scatter_reduce_last_row_and_all_skipped(mb):
+    rows, D, topk = 32, M3_H, M3_TOPK
+    flat = torch.full((rows, D), float("nan"), dtype=torch.bfloat16, device="cuda")
+    flat[-1] = 2
+    weights = torch.ones(rows, device="cuda")
+    rs = torch.tensor(
+        [-1, -7, rows, rows + 7, 2**20, rows - 1, -1, rows, -1, -1],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    out = torch.full((2, D), float("nan"), dtype=torch.bfloat16, device="cuda")
+    _run_scatter(flat, rs, weights, out, topk, mb)
+    torch.testing.assert_close(out[0], torch.zeros_like(out[0]), rtol=0, atol=0)
+    torch.testing.assert_close(out[1], torch.full_like(out[1], 2), rtol=0, atol=0)
