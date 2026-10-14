@@ -14,6 +14,20 @@ from .kernels.tensor_shim import ptr_arg
 
 _SUPPORTED_CLUSTER_M = (1, 2, 4)
 _SUPPORTED_CLUSTER_N = (1, 2, 3, 4)
+_EP_POST_INDEX = {}
+
+
+def _ep_post_index(device, rows):
+    """The row -> scatter index array a posted-scale gemm2 fills.
+
+    Cached so a captured graph keeps one address. N tile 0 rewrites every row
+    of each tile it runs; the rows of tiles it skips are filtered by the send.
+    """
+    buf = _EP_POST_INDEX.get(device)
+    if buf is None or buf.numel() < rows:
+        buf = torch.empty(rows, dtype=torch.int32, device=device)
+        _EP_POST_INDEX[device] = buf
+    return buf
 
 
 def _select_bool_env(name: str, csv_value: int) -> int:
@@ -205,6 +219,28 @@ def flydsl_grouped_gemm_a8w4_masked(
                 f"keep the scale plane cache-line aligned, got N={N}"
             )
     ep_row_map_tensor = ep_row_map if ep_row_map is not None else out
+    # Send each row's e8m0 scales whole after the GEMM instead of one 8-byte
+    # remote write per row per N tile: worth it on the fp4 wire, whose scale
+    # writes are a larger share of the scatter.
+    ep_scale_post_row = 0
+    if (
+        enable_ep_scatter
+        and stage2_scatter.combine_quant_bits
+        and os.environ.get("AITER_FLYDSL_EP_SCALE_POST", "0") == "1"
+    ):
+        ep_scale_post_row = N // 32
+        if tile_n != 256 or ep_scale_post_row % 16:
+            raise ValueError(
+                "[grouped-moe tdm] AITER_FLYDSL_EP_SCALE_POST needs tile_n=256 and "
+                f"N % 512 == 0, got tile_n={tile_n} N={N}"
+            )
+        if out.numel() * out.element_size() < int(contiguous_m) * ep_scale_post_row:
+            raise ValueError(
+                "[grouped-moe tdm] the posted scale plane needs a full gemm2 output"
+            )
+        quant_scale_tensor = _ep_post_index(out.device, int(contiguous_m)).view(
+            torch.uint8
+        )
     launch_gemm_a8w4_tdm(
         out,
         ptr_arg(a),
@@ -260,5 +296,30 @@ def flydsl_grouped_gemm_a8w4_masked(
         lds_soa_load_interleave=int(lds_soa_load_interleave),
         persistent_workers=persistent_workers,
         rolled_drain=rolled_drain,
+        ep_scale_post_row=ep_scale_post_row,
     )
+    if ep_scale_post_row:
+        from .kernels.ep_scale_post_gfx1250 import (
+            BLOCK,
+            LANES_PER_ROW,
+            make_ep_scale_post,
+        )
+
+        make_ep_scale_post(
+            scale_row=ep_scale_post_row,
+            tile_m=tile_m,
+            n_experts=n_experts,
+            scale_plane_off=int(stage2_scatter.combine_input_offset)
+            + N * int(stage2_scatter.combine_quant_bits) // 8,
+            slot_stride=int(stage2_scatter.slot_stride_bytes),
+            world_size=int(stage2_scatter.world_size),
+        )(
+            int(stage2_scatter.arena_handle),
+            out.data_ptr(),
+            quant_scale_tensor.data_ptr(),
+            m_tile_map.data_ptr(),
+            int(contiguous_m),
+            -(-int(contiguous_m) * LANES_PER_ROW // BLOCK),
+            stream,
+        )
     return out

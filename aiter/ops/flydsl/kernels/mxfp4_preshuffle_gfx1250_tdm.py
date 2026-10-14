@@ -171,6 +171,7 @@ def launch_gemm_a8w4_tdm(
     lds_soa_load_interleave: Constexpr[int] = 0,
     persistent_workers: Constexpr[int] = 0,
     rolled_drain: Constexpr[int] = 0,
+    ep_scale_post_row: Constexpr[int] = 0,
 ):
     """Launch the grouped contiguous-M a8w4 MoE GEMM for gfx1250.
 
@@ -391,6 +392,14 @@ def launch_gemm_a8w4_tdm(
     _lds_row_bytes = _lds_pitch(C_ROW_BYTES)
     _lds_scale_row_bytes = _lds_pitch(EP_SCALE_ROW_BYTES) if ep_quant_bits else 0
     _ep_scale_lds_off = tile_m * _lds_row_bytes
+    # Posted scale plane (ep_scale_post_row = N/32 bytes a row): instead of each
+    # tile scattering its 8-byte slice of every row, tiles leave the slices in a
+    # local tile-major plane ([M tile][N tile][row] x 8 B) over arg_c, dead under
+    # the scatter, and N tile 0 records every row's scatter index in
+    # arg_quant_scale. ep_scale_post_gfx1250 then sends each row's scales whole.
+    _ep_post = bool(ep_scale_post_row and enable_ep_scatter and ep_quant_bits)
+    if _ep_post and EP_SCALE_ROW_BYTES != 8:
+        raise ValueError("the posted scale plane needs 8-byte scale slices")
     c_lds_pad_elems = (_lds_row_bytes - C_ROW_BYTES) // 2 if enable_ep_scatter else 0
     store_pad = c_lds_pad_elems if enable_ep_scatter else 16
     C_STORE_B = (
@@ -436,7 +445,7 @@ def launch_gemm_a8w4_tdm(
     _explicit_vgpr_partition = "_regpart" if SUPPORT_EXPLICIT_VGPR_PARTITION else ""
     _planar_lds = "_planarlds" if planar_lds_on else ""
     _interleaved_lds_load = "_interleavelds" if interleaved_lds_load_on else ""
-    _epq = f"_epq{ep_quant_bits}" if ep_quant_bits else ""
+    _epq = f"_epq{ep_quant_bits}{'_post' if _ep_post else ''}" if ep_quant_bits else ""
     _persistent = f"_pw{persistent_workers}" if persistent_workers else ""
     _drain = "_rolleddrain" if rolled_drain else ""
     _kname = (
@@ -1408,6 +1417,7 @@ def launch_gemm_a8w4_tdm(
                 # row zero and are replaced with the TDM OOB index below.
                 _rm_dst_lanes = []
                 _scatter_lane_valids = []
+                _scatter_row_lanes = []
                 for scatter_vector in range_constexpr(scatter_dst_vectors):
                     _scatter_pass_lane = lane // fx.Int32(
                         SCATTER_GROUP_ROWS
@@ -1427,6 +1437,7 @@ def launch_gemm_a8w4_tdm(
                     _scatter_safe_row = _scatter_lane_valid.select(
                         _scatter_row_lane, fx.Int32(0)
                     )
+                    _scatter_row_lanes.append(_scatter_row_lane)
                     _rm_dst_lanes.append(
                         fx.Int32(
                             fx.ptr_load(
@@ -2164,7 +2175,7 @@ def launch_gemm_a8w4_tdm(
                         global_byte_offset=_gboff,
                     )
                     tensor_store_gather(desc)
-                    if const_expr(ep_quant_bits):
+                    if const_expr(ep_quant_bits and not _ep_post):
                         # Same rows and slot stride as the payload store; only the
                         # plane base and the row width differ.
                         desc_s = make_tensor_gather_descriptor(
@@ -2185,6 +2196,49 @@ def launch_gemm_a8w4_tdm(
                             global_byte_offset=_gboff_s,
                         )
                         tensor_store_gather(desc_s)
+
+                if const_expr(_ep_post):
+                    # This tile's slice of the tile-major plane is one contiguous
+                    # tile_m x 8 B run; rows past the expert's end carry the OOB
+                    # index below, so ep_scale_post skips them.
+                    _post_ld64 = make_lds_copy_ops(64)[0]
+                    _post_plane = create_buffer_resource_from_addr(
+                        fx.Int64(fx.ptrtoint(arg_c))
+                    )
+                    for _pr0 in range_constexpr(0, tile_m, block):
+                        _prow = fx.Int32(tid) + fx.Int32(_pr0)
+                        _pslice = Vec(
+                            _post_ld64(
+                                stC_idx,
+                                fx.Int32(_ep_scale_lds_off)
+                                + _prow * fx.Int32(_lds_scale_row_bytes),
+                            )
+                        )
+                        _poff = (
+                            blk_m * fx.Int32(ep_scale_post_row)
+                            + blk_n // fx.Int32(tile_n) * fx.Int32(tile_m * 8)
+                            + _prow * fx.Int32(8)
+                        )
+                        if const_expr(tile_m % block):
+                            if _prow < fx.Int32(tile_m):
+                                buffer_store(
+                                    _pslice, _post_plane, _poff, offset_is_bytes=True
+                                )
+                        else:
+                            buffer_store(
+                                _pslice, _post_plane, _poff, offset_is_bytes=True
+                            )
+                    if blk_n == fx.Int32(0):
+                        _post_idx = create_buffer_resource_from_addr(
+                            fx.Int64(fx.ptrtoint(arg_quant_scale))
+                        )
+                        for _pv in range_constexpr(scatter_dst_vectors):
+                            buffer_store(
+                                fx.Int32(_scatter_idx_lanes[_pv]),
+                                _post_idx,
+                                blk_m + _scatter_row_lanes[_pv],
+                                mask=_scatter_row_lanes[_pv] < fx.Int32(tile_m),
+                            )
 
                 # Let every wave issue its own groups directly. This avoids
                 # cloning every descriptor behind a wave-selection branch.
