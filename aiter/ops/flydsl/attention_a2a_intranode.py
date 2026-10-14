@@ -194,6 +194,11 @@ class AttentionA2AIntraNodeOp:
     All ranks must use the same mode and serialize calls on one stream.
     Consumers must finish on that stream before the next call reusing their
     parity (two calls later); cross-stream consumers require an explicit join.
+
+    group is an optional torch.distributed ProcessGroup containing exactly the
+    MoRI participants. When given, construction verifies that all ranks agree on
+    the configuration and raises ValueError on every rank otherwise. When None,
+    no check is made and the caller must ensure ranks agree.
     """
 
     def __init__(
@@ -210,6 +215,7 @@ class AttentionA2AIntraNodeOp:
         softmax_scale=None,
         hadamard=None,
         valid_kv_len=None,
+        group=None,
     ):
         self._next_role = 0
         self._role_stream = None
@@ -394,6 +400,32 @@ class AttentionA2AIntraNodeOp:
                     f"{unsupported or 'BF16 return'}"
                 )
         self.valid_kv_len = valid_kv_len
+        if group is not None:
+            # Must run before any symmetric allocation: mismatched configs
+            # would otherwise hang in the shmem barrier instead of raising.
+            if group.size() != world_size:
+                raise ValueError(
+                    f"group size {group.size()} != world_size {world_size}"
+                )
+            config = (
+                tuple(shape),
+                tuple(self.codecs),
+                self.quant,
+                bool(return_packed),
+                int(self.v_pack),
+                bool(self.hadamard),
+                valid_kv_len,
+                block_num,
+                warp_num_per_block,
+                q_multiplier,
+                world_size,
+            )
+            configs = [None] * world_size
+            torch.distributed.all_gather_object(configs, config, group=group)
+            if any(c != configs[0] for c in configs):
+                raise ValueError(
+                    f"ranks disagree on AttentionA2AIntraNodeOp config: {configs}"
+                )
         role_sequences = (seq_full, valid_kv_len, valid_kv_len)
         role_numels = tuple(
             sequence * heads_local * shape[3] for sequence in role_sequences

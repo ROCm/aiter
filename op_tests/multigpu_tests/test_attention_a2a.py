@@ -689,6 +689,34 @@ def _check_valid_kv_rejections(rank, world_size, op_cls):
             raise AssertionError(f"accepted invalid valid_kv_len: {overrides}")
 
 
+def _check_group_disagreement(rank, world_size, op_cls):
+    """Differing configs must raise ValueError on every rank before any allocation."""
+    failure = None
+    try:
+        op_cls(
+            rank=rank,
+            world_size=world_size,
+            shape=(1, 64, 8, 128),
+            block_num=64 if rank == 0 else _DEFAULT_BLOCKS,
+        )
+        failure = "accepted a config that differs across ranks"
+    except ValueError as exc:
+        if "disagree" not in str(exc):
+            failure = f"wrong ValueError: {exc}"
+    except Exception as exc:  # noqa: BLE001
+        failure = f"{type(exc).__name__}: {exc}"
+    # Report cross-rank so one rank's failure is seen by all, not just itself.
+    flags = torch.zeros(world_size, dtype=torch.int32)
+    flags[rank] = failure is not None
+    dist.all_reduce(flags, group=_CTX.cpu_group)
+    failed = flags.nonzero().flatten().tolist()
+    if failed:
+        raise AssertionError(
+            f"group config-agreement check failed on rank(s) {failed}: {failure}"
+        )
+    _STATS.checks += 1
+
+
 def _check_e4m3_scale_rounding(
     op, rank, world_size, heads, sequence, device, v_input, quantize_fp8_rotated
 ):
@@ -1201,8 +1229,9 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
             else (torch.float8_e4m3fn, 448.0)
         )
         rows = []
-        _CTX.op_cls = AttentionA2AIntraNodeOp
-        _check_valid_kv_rejections(rank, world_size, AttentionA2AIntraNodeOp)
+        _CTX.op_cls = functools.partial(AttentionA2AIntraNodeOp, group=cpu_group)
+        _check_valid_kv_rejections(rank, world_size, _CTX.op_cls)
+        _check_group_disagreement(rank, world_size, _CTX.op_cls)
         for recipe, sequence, heads in itertools.product(
             recipes, sequences, heads_list
         ):
@@ -1222,7 +1251,9 @@ def _run_rank(rank, world_size, port, recipes, sequences, heads_list, valid_kv_l
             sequences[0],
         ):
             _CTX.op_cls = functools.partial(
-                AttentionA2AIntraNodeOp, block_num=_OVERSUBSCRIBED_BLOCKS
+                AttentionA2AIntraNodeOp,
+                group=cpu_group,
+                block_num=_OVERSUBSCRIBED_BLOCKS,
             )
             rows.append(
                 test_a2a(
