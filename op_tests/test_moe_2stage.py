@@ -105,6 +105,7 @@ def test_fmoe(
     beta=None,
     linear_beta=None,
     kernel_bench=False,
+    disable_stage1_bias=False,
     disable_stage2_bias=False,
     ref_dtype="bf16",
 ):
@@ -134,6 +135,8 @@ def test_fmoe(
     else:
         w1 = torch.randn((E, inter_dim, model_dim), dtype=dtype)
         exp_bias1 = torch.clamp(torch.randn((E * inter_dim), dtype=dtype), -1.0, 1.0)
+    if disable_stage1_bias:
+        exp_bias1 = None
     w2 = torch.randn((E, model_dim, inter_dim), dtype=dtype)
     if intermediate_pad != 0:
         w2[:, :, -intermediate_pad:] = 0
@@ -1510,10 +1513,15 @@ def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
         f"expected CK-Tile stage2, got {stage2_func!r}; this test no longer "
         "exercises the swiglu_mxfp4_bf16_cktile dispatch path it was written for"
     )
-    assert metadata.ksplit <= 1, (
-        f"expected non-split (ksplit<=1), got ksplit={metadata.ksplit}; the "
-        "split_k>1 NoBias_swiglu_SplitK path was already generated before "
-        "this fix and is not what regressed"
+    assert metadata.ksplit >= 2, (
+        f"expected split_k>=2 (NoBias_swiglu_SplitK path), got "
+        f"ksplit={metadata.ksplit}; get_2stage_cfgs() regressed back to "
+        "routing this shape to the split_k=1 fused gate-up CK-Tile kernel, "
+        "which produces incorrect results (logits_diff~0.98) for the "
+        "bf16-activation/fp4x2-weight/INTERLEAVE/Swiglu/no-bias combination "
+        "-- see PR discussion for the accuracy investigation that found "
+        "this. The split_k>=2 path applies SwiGLU after the GEMM in Python "
+        "instead of inside a fused CK-Tile epilogue, and is verified correct."
     )
     assert metadata.has_bias is False, (
         f"expected has_bias=False (from has_stage1_bias=False), got "
@@ -1539,8 +1547,9 @@ def test_swiglu_mxfp4_nonsplit_nobias_dispatch():
         WQDType=dtypes.fp4x2,
         use_g1u1=True,
         preshuffle=True,
-        strict_accuracy=False,
+        strict_accuracy=True,
         check_aot_cache=False,
+        disable_stage1_bias=True,
         disable_stage2_bias=True,
     )
     aiter.logger.info(

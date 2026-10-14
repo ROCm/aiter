@@ -3691,7 +3691,7 @@ def get_2stage_cfgs(
         and dtype in [dtypes.bf16, dtypes.fp16]
         and q_type == QuantType.per_1x32
         and activation == ActivationType.Swiglu
-        and q_dtype_w != dtypes.fp8
+        and q_dtype_w not in [dtypes.fp8, dtypes.fp4x2]
         and cktile_mxfp4_ok
     ):
         return MOEMetadata(
@@ -3733,7 +3733,7 @@ def get_2stage_cfgs(
         and not has_stage2_scatter
         and not has_activation_scales
         and bool(opus_weights_shuffled)
-        and get_gfx() == "gfx950"
+        and get_gfx_runtime() == "gfx950"
     ):
         _cktile_block_m = 16 if token < 2048 else 32 if token < 16384 else 64
         return MOEMetadata(
@@ -3989,8 +3989,8 @@ def get_2stage_cfgs(
             _cktile_block_m,
             _split_k,
             run_1stage,
-            has_bias=activation == ActivationType.Swiglu,
-            stage2_has_bias=activation == ActivationType.Swiglu,
+            has_bias=has_stage1_bias,
+            stage2_has_bias=has_stage2_bias,
         )
 
     if (
