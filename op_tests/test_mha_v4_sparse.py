@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Block-sparse MHA v4: LUT handling, work-table ordering, tile-count scaling, per-recipe
-geometry, and LSE.
+"""Block-sparse and Sol-Attn MHA v4: LUT handling, work-table ordering, tile-count scaling,
+per-recipe geometry, LSE, and the pooled Sol-Attn pass.
 
 Split out of test_mha_v4.py, which had grown past 2600 lines with the sparse cases forming
 one contiguous block of it. Absorbs the former test_mha_v4_sparse_tile_scaling.py.
@@ -10,11 +10,13 @@ one contiguous block of it. Absorbs the former test_mha_v4_sparse_tile_scaling.p
 
 import argparse
 import csv
+import functools
 import itertools
 import math
 import os
 import subprocess
 import sys
+from collections.abc import Callable
 from typing import NamedTuple
 
 import pandas as pd
@@ -27,8 +29,10 @@ from aiter import dtypes
 from aiter.jit.core import AITER_ROOT_DIR
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.mha_v4 import (
+    MHA_V4_SOL_MODE,
     MHA_V4_SPARSE_MODE,
     AttentionFormat,
+    AttentionPack,
     AttentionScaleMode,
     _resolve_raw_recipe,
     mha_v4,
@@ -39,16 +43,42 @@ from aiter.ops.mha_v4 import (
     mha_v4_operands,
     mha_v4_packed,
     mha_v4_ragged_kv,
+    mha_v4_sol,
     mha_v4_sparse_work_table,
     native_fp8_format,
     scale_modes_for_formats,
 )
 from aiter.ops.mha_v4_quant import (
+    MHA_V4_LOG2E,
+    mha_v4_q_multiplier,
+    mxfp4_k_view,
+    mxfp4_v_view,
+    mxfp6_k_view,
     quantize_fp8,
     quantize_fp8_rotated,
+    quantize_int8,
+    quantize_mxfp4_k,
+    quantize_mxfp4_q,
+    quantize_mxfp6_k,
+    quantize_mxfp6_q,
+    quantize_mxfp8_k,
+    quantize_mxfp8_q,
+    quantize_v_fp8,
+    quantize_v_mxfp4_fp6_p,
+    quantize_v_mxfp6_fp6_p,
+    rotate_activation_hd128,
 )
 from aiter.ops.triton.attention.utils import (
+    SOL_ATTN_TS_KV,
+    SOL_ATTN_TS_QO,
+    _e8m0_dequantize,
+    _e8m0_quantize,
+    _sol_attn_block_mean,
+    _sol_attn_block_variance,
+    _sol_attn_pool_mx,
+    _sol_attn_pool_reuse_descale,
     block_attn_mask_to_ragged_lut,
+    sol_prepare,
 )
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
@@ -90,7 +120,7 @@ SPARSE_RECIPES = {
     "mxfp4": (AttentionFormat.MXFP4, AttentionFormat.MXFP4, {}),
 }
 
-# The finer block-sparse geometry, beside each recipe's default 256-row one.
+# The finer geometry, which gfx950 serves for these recipes in both the sparse and Sol-Attn modes.
 _MHA_V4_FINE_TILE = (64, 64)
 
 
@@ -204,6 +234,18 @@ _FP6_P_FORMAT_PARAMS = [
         ("f6f4", AttentionFormat.MXFP6, AttentionFormat.MXFP4),
     )
 ]
+
+
+def _sol_attn_raw_inputs(sequence_k, heads=2, sequence_q=256, batch=1, seed=0):
+    """The BF16 operands the sparse and Sol-Attn tests quantize, so recipes see the same data."""
+    torch.manual_seed(seed)
+    q = torch.randn(
+        (batch, sequence_q, heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        (batch, sequence_k, heads, 128), device="cuda", dtype=torch.bfloat16
+    )
+    return q, k, torch.randn_like(k)
 
 
 def test_mha_v4_packed_rejects_partial_lut():
@@ -633,6 +675,9 @@ class _Operand(NamedTuple):
 
     quantized: torch.Tensor
     descale: torch.Tensor
+    # The pre-quantization tensor, kept only by the recipes whose stored codes are not element
+    # addressable: those cannot be pooled or dequantized from `quantized` at all.
+    source: torch.Tensor | None = None
 
 
 def _sparse_fp8_operands(sequence_k, heads=2, sequence_q=256, batch=1, seed=0):
@@ -641,14 +686,7 @@ def _sparse_fp8_operands(sequence_k, heads=2, sequence_q=256, batch=1, seed=0):
     Re-quantizing a KV slice would pick a different per-tensor amax, which shifts every
     value and hides whether the kernel read the KV blocks the LUT named.
     """
-    torch.manual_seed(seed)
-    q = torch.randn(
-        (batch, sequence_q, heads, 128), device="cuda", dtype=torch.bfloat16
-    )
-    k = torch.randn(
-        (batch, sequence_k, heads, 128), device="cuda", dtype=torch.bfloat16
-    )
-    v = torch.randn_like(k)
+    q, k, v = _sol_attn_raw_inputs(sequence_k, heads, sequence_q, batch, seed)
     return (
         _Operand(*quantize_fp8_rotated(q)),
         _Operand(*quantize_fp8_rotated(k)),
@@ -1186,6 +1224,1172 @@ def test_mha_v4_sparse_all_true_lut_matches_dense_bitwise(recipe_name):
         )
 
 
+_SOL_ATTN_SOFTMAX_SCALE = 128**-0.5
+
+
+class _SolAttnRecipe(NamedTuple):
+    """One mode-2 manifest row: its formats, its quantizers, and how to dequantize it again.
+
+    The recipes split on a single question -- whether an operand's scale varies along the sequence
+    axis that pooling reduces. A per-tensor descale does not, so the pooled operand reuses it
+    untouched and the kernarg's scale slots stay NULL. An E8M0 1x32 scale does, so that operand has
+    to pool in dequantized space and hand the kernel a pooled scale of its own, which is the only
+    reason those slots exist.
+    """
+
+    id: str
+    qk_format: AttentionFormat
+    qk_scale_mode: AttentionScaleMode
+    quantize_q: Callable
+    quantize_k: Callable
+    quantize_v: Callable = quantize_fp8
+    v_format: AttentionFormat = native_fp8_format()
+    v_scale_mode: AttentionScaleMode = AttentionScaleMode.F32_PER_TENSOR
+    # Named when the operands' stored codes are sub-byte and permuted, so neither pooling nor a
+    # reference can read them back; see SOL_ATTN_PACKED_FORMATS.
+    packed_format: str | None = None
+    # V's packed format when it differs from K's, which it does wherever V's name also carries its
+    # layout (the *_fp6_p ones), and the only packed operand of f8f6, whose FP8 Q/K are addressable.
+    # Left None, V inherits K's packing only if it has K's format.
+    v_packed_format: str | None = None
+    v_pack: AttentionPack = AttentionPack.DEFAULT
+    oracle_floor: float = 0.999
+    # How far the corrected oracle has to beat the uncorrected one. Any margin at all proves the
+    # correction reaches the output; a row whose exact pass is lossy enough to leave the correction
+    # a large share of the total can demand more.
+    keep_or_drop_margin: float = 0.0
+
+    @property
+    def k_carries_pooled_scale(self) -> bool:
+        return self.qk_scale_mode == AttentionScaleMode.E8M0_PER_1X32
+
+    @property
+    def v_carries_pooled_scale(self) -> bool:
+        return self.v_scale_mode == AttentionScaleMode.E8M0_PER_1X32
+
+    @property
+    def v_packed(self) -> str | None:
+        if self.v_packed_format is not None:
+            return self.v_packed_format
+        return self.packed_format if self.v_format == self.qk_format else None
+
+    @property
+    def ref_softmax_scale(self):
+        """The MX quantizers fold ``softmax_scale * log2(e)`` into Q.
+
+        A reference built from the dequantized operands therefore has to divide that back out
+        through its own softmax scale, rather than by rescaling the operand the kernel read.
+        """
+        return 1.0 / MHA_V4_LOG2E if self.k_carries_pooled_scale else None
+
+    def kv_tile(self):
+        """The KV tile this recipe's Sol-Attn row routes at.
+
+        Built from the recipe's own scale modes rather than derived from its formats, because
+        that is the whole difference between two rows here: FP8 and MXFP8 name the same three
+        formats and are told apart only by the scale modes, so deriving them would ask about
+        the wrong row.
+        """
+        return mha_v4_kv_tile(self.manifest_operands(), MHA_V4_SOL_MODE)
+
+    def manifest_operands(self):
+        """The manifest key this recipe's Sol-Attn row dispatches on."""
+        return mha_v4_operands(
+            self.qk_format,
+            self.qk_format,
+            self.v_format,
+            self.qk_scale_mode,
+            self.qk_scale_mode,
+            self.v_scale_mode,
+            self.v_pack,
+        )
+
+    def block_tile(self):
+        """The (q_tile, kv_tile) this recipe's Sol-Attn row dispatches at."""
+        return (256, self.kv_tile())
+
+    def operands(self, sequence_k, heads=2, sequence_q=256, batch=1, seed=0):
+        return self.quantize(
+            *_sol_attn_raw_inputs(sequence_k, heads, sequence_q, batch, seed)
+        )
+
+    def quantize(self, q, k, v):
+        # A packed operand carries its BF16 source along: pooling and the reference both have to
+        # work from what the packer was given, because the codes it produced cannot be read back.
+        keep_qk = self.packed_format is not None
+        keep_v = self.v_packed is not None
+        return (
+            _Operand(*self.quantize_q(q), q if keep_qk else None),
+            _Operand(*self.quantize_k(k), k if keep_qk else None),
+            _Operand(*self.quantize_v(v), v if keep_v else None),
+        )
+
+    def prepare(
+        self,
+        q,
+        k,
+        v,
+        beta,
+        heads,
+        block_tile=None,
+        force_block_mask=None,
+        k_variance=False,
+    ):
+        """Route and pool. K's scale goes in only when pooling cannot preserve it."""
+        packed = self.packed_format
+        tile_m, tile_n = self.block_tile() if block_tile is None else block_tile
+        return sol_prepare(
+            # Routing scores Q, and a packed Q is not element addressable either, so a packed
+            # recipe routes on its source. Scale invariance is what makes that equivalent.
+            q.source if packed is not None else q.quantized,
+            k.quantized,
+            v.quantized,
+            beta=beta,
+            num_heads=heads,
+            # sol_prepare defaults BLOCK_N to the gfx950 tile. Pooling has to match the row
+            # the launcher will pick or the pooled tensors are the wrong height outright, so take
+            # it from the manifest the way mha_v4_sol() does.
+            BLOCK_M=tile_m,
+            BLOCK_N=tile_n,
+            # A packed operand pools from its source and is quantized again, so it has no stored
+            # scale to pool and passing one is an error.
+            k_scale=(
+                k.descale if self.k_carries_pooled_scale and packed is None else None
+            ),
+            v_scale=(
+                v.descale
+                if self.v_carries_pooled_scale and self.v_packed is None
+                else None
+            ),
+            k_source=k.source,
+            v_source=v.source,
+            k_packed_format=packed,
+            v_packed_format=self.v_packed,
+            force_block_mask=force_block_mask,
+            k_variance=k_variance,
+        )
+
+    @staticmethod
+    def dequantize(quantized, descale):
+        """A per-tensor descale multiplies; an E8M0 image expands over channel groups first."""
+        if descale.dtype == torch.uint8:
+            return _e8m0_dequantize(quantized, descale)
+        if descale.dim() == 3:
+            # A per-channel descale is [batch, heads, d], shared by every token.
+            descale = descale.unsqueeze(1)
+        return quantized.float() * descale.float()
+
+    def reference_operands(self, q, k, v):
+        """The exact-pass operands a reference should score, in the space the kernel reads them.
+
+        An addressable recipe dequantizes the very codes the kernel was handed, which is what makes
+        a disagreement with its own oracle mean something. A packed one cannot: the codes are
+        sub-byte and permuted, and V's logical view is an aliased descriptor rather than an
+        indexable tensor. It scores the BF16 source instead, with Q carrying the
+        multiplier the packer folded into it -- for the addressable MX rows that multiplier comes
+        back out of the codes on dequantization, so only this branch reapplies it.
+        """
+        v_ref = (
+            self.dequantize(v.quantized, v.descale)
+            if self.v_packed is None
+            else v.source.float()
+        )
+        if self.packed_format is None:
+            return (
+                self.dequantize(q.quantized, q.descale),
+                self.dequantize(k.quantized, k.descale),
+                v_ref,
+            )
+        return (
+            q.source.float() * mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE),
+            k.source.float(),
+            v_ref,
+        )
+
+    def dequantize_pooled(self, plan, name, source):
+        """Dequantize a pooled operand with its own scale, or the source's when it has none."""
+        if (self.packed_format if name == "mean_k" else self.v_packed) is not None:
+            # Same unreadability as the exact-pass operands, so sol_prepare hands back the
+            # values it quantized rather than expecting them to be recovered from the packed pair.
+            return plan[f"{name}_pooled"].float()
+        pooled_scale = plan[f"{name}_scale"]
+        return self.dequantize(
+            plan[name], source.descale if pooled_scale is None else pooled_scale
+        )
+
+
+def _fp8_recipe():
+    return _SolAttnRecipe(
+        id="fp8",
+        qk_format=native_fp8_format(),
+        qk_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+        quantize_q=quantize_fp8_rotated,
+        quantize_k=quantize_fp8_rotated,
+    )
+
+
+# Built once at module scope rather than per call. _sol_attn_launch falls back to it from inside a
+# compiled region, and constructing the recipe there would make Dynamo materialize the field
+# defaults with no source to guard on -- which it cannot do for the torch custom-op objects the
+# quantizer fields hold.
+_FP8_SOL_ATTN_RECIPE = _fp8_recipe()
+
+
+def _quantize_bf16(t):
+    """Store a BF16 operand as-is.
+
+    The kernel's NONE scale mode makes the descale a placeholder it never reads, but the recipe's
+    dequantize() path multiplies by it unconditionally, so hand back a unit scalar rather than
+    special-casing the reference.
+    """
+    return t, torch.ones((), dtype=torch.float32, device=t.device)
+
+
+def _mxfp8_quantize_q(q):
+    return quantize_mxfp8_q(q, mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE))
+
+
+def _mxfp4_quantize_q(q):
+    return quantize_mxfp4_q(q, mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE))
+
+
+# The MXFP4 K and V packers emit a flat backing buffer plus its scale, and the kernel wants the
+# strided view over that buffer, so the recipe's quantizer hands back the view.
+def _mxfp4_quantize_k(k):
+    raw, scale = quantize_mxfp4_k(k)
+    return mxfp4_k_view(raw, scale), scale
+
+
+def _mxfp4_quantize_v_fp6_p(v):
+    raw, scale = quantize_v_mxfp4_fp6_p(v)
+    return mxfp4_v_view(raw, scale, v.shape[1]), scale
+
+
+def _mxfp6_quantize_q(q):
+    return quantize_mxfp6_q(q, mha_v4_q_multiplier(_SOL_ATTN_SOFTMAX_SCALE))
+
+
+def _mxfp6_quantize_k(k):
+    raw, scale = quantize_mxfp6_k(k)
+    return mxfp6_k_view(raw, scale, *k.shape[:3])
+
+
+_SOL_ATTN_RECIPES = [
+    _FP8_SOL_ATTN_RECIPE,
+    # The two BF16 Q/K rows. Neither pools anything it cannot reuse a source scale for -- bf16 has
+    # no scale at all and bf16fp8's V descale is per-tensor -- so both leave the kernarg's pooled
+    # scale slots NULL. They also tile KV at 64 while routing on 128-token blocks, which is the
+    # manifest's business rather than this test's: everything here reads the tile back from it.
+    _SolAttnRecipe(
+        id="bf16",
+        qk_format=AttentionFormat.BF16,
+        qk_scale_mode=AttentionScaleMode.NONE,
+        quantize_q=_quantize_bf16,
+        quantize_k=_quantize_bf16,
+        quantize_v=_quantize_bf16,
+        v_format=AttentionFormat.BF16,
+        v_scale_mode=AttentionScaleMode.NONE,
+    ),
+    _SolAttnRecipe(
+        id="bf16fp8",
+        qk_format=AttentionFormat.BF16,
+        qk_scale_mode=AttentionScaleMode.NONE,
+        quantize_q=_quantize_bf16,
+        quantize_k=_quantize_bf16,
+    ),
+    _SolAttnRecipe(
+        id="i8fp8",
+        qk_format=AttentionFormat.INT8,
+        qk_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+        quantize_q=quantize_int8,
+        quantize_k=quantize_int8,
+    ),
+    _SolAttnRecipe(
+        id="mxfp8",
+        qk_format=native_fp8_format(),
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp8_quantize_q,
+        quantize_k=quantize_mxfp8_k,
+    ),
+    # The FP6-P rows: all three operands E8M0, P quantized to FP6 and V packed in the token order
+    # that P contracts over, so V names its layout as well as its format. Every one of them
+    # declares LSE, ragged KV, KV ranges, the Jensen term and sorted dispatch. With all three
+    # E8M0, neither pooled operand can inherit a source descale, so both kernarg scale slots are
+    # exercised at once.
+    _SolAttnRecipe(
+        id="mxfp4_fp6p",
+        qk_format=AttentionFormat.MXFP4,
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp4_quantize_q,
+        quantize_k=_mxfp4_quantize_k,
+        quantize_v=_mxfp4_quantize_v_fp6_p,
+        v_format=AttentionFormat.MXFP4,
+        v_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        packed_format="mxfp4",
+        v_packed_format="mxfp4_fp6_p",
+        v_pack=AttentionPack.V_FOR_FP6_P,
+        # FP4 carries eight magnitude levels, so the exact pass alone only reaches ~0.98 of the
+        # oracle before Sol-Attn contributes anything; what separates working from broken on this
+        # row is the correction's distance to keep-or-drop, not the absolute cosine.
+        oracle_floor=0.97,
+        keep_or_drop_margin=0.05,
+    ),
+    _SolAttnRecipe(
+        id="mxfp6_fp6p",
+        qk_format=AttentionFormat.MXFP6,
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp6_quantize_q,
+        quantize_k=_mxfp6_quantize_k,
+        quantize_v=quantize_v_mxfp6_fp6_p,
+        v_format=AttentionFormat.MXFP6,
+        v_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        packed_format="mxfp6",
+        v_packed_format="mxfp6_fp6_p",
+        v_pack=AttentionPack.V_FOR_FP6_P,
+        oracle_floor=0.995,
+        keep_or_drop_margin=0.05,
+    ),
+    # f8f6's per-tensor FP8 Q/K pool and route on their codes like the fp8 row, so only V carries
+    # a pooled scale.
+    _SolAttnRecipe(
+        id="f8f6_fp6p",
+        qk_format=AttentionFormat.FP8,
+        qk_scale_mode=AttentionScaleMode.F32_PER_TENSOR,
+        quantize_q=quantize_fp8_rotated,
+        quantize_k=quantize_fp8_rotated,
+        quantize_v=quantize_v_mxfp6_fp6_p,
+        v_format=AttentionFormat.MXFP6,
+        v_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        v_packed_format="mxfp6_fp6_p",
+        v_pack=AttentionPack.V_FOR_FP6_P,
+        oracle_floor=0.995,
+        keep_or_drop_margin=0.05,
+    ),
+    _SolAttnRecipe(
+        id="f6f4_fp6p",
+        qk_format=AttentionFormat.MXFP6,
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp6_quantize_q,
+        quantize_k=_mxfp6_quantize_k,
+        quantize_v=_mxfp4_quantize_v_fp6_p,
+        v_format=AttentionFormat.MXFP4,
+        v_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        packed_format="mxfp6",
+        v_packed_format="mxfp4_fp6_p",
+        v_pack=AttentionPack.V_FOR_FP6_P,
+        # Only V is FP4, so it sits between the mxfp4 and mxfp6 floors (measured ~0.992).
+        oracle_floor=0.985,
+        keep_or_drop_margin=0.05,
+    ),
+]
+
+# Recipes whose only Sol-Attn row is the 64x64 one, so they have no default geometry to test at.
+# f6f8's MXFP6 Q/K pool like the mxfp6 row's; its V's per-channel FP8 descale does not vary along
+# the sequence, so pooled V reuses it the way a per-tensor one is reused.
+_SOL_ATTN_FINE_ONLY_RECIPES = [
+    _SolAttnRecipe(
+        id="f6f8",
+        qk_format=AttentionFormat.MXFP6,
+        qk_scale_mode=AttentionScaleMode.E8M0_PER_1X32,
+        quantize_q=_mxfp6_quantize_q,
+        quantize_k=_mxfp6_quantize_k,
+        quantize_v=quantize_v_fp8,
+        v_scale_mode=AttentionScaleMode.F32_PER_CHANNEL,
+        packed_format="mxfp6",
+        oracle_floor=0.995,
+    ),
+]
+
+
+def _sol_attn_geometry_params(ids=None):
+    """(recipe, block_tile) params: each recipe at its default geometry (None), then at 64x64
+    where it has a row there."""
+    recipes = [r for r in _SOL_ATTN_RECIPES if ids is None or r.id in ids]
+    fine_only = [r for r in _SOL_ATTN_FINE_ONLY_RECIPES if ids is None or r.id in ids]
+    return [pytest.param(r, None, id=r.id) for r in recipes] + [
+        pytest.param(
+            r,
+            _MHA_V4_FINE_TILE,
+            marks=_requires_sol_row(r, _MHA_V4_FINE_TILE),
+            id=f"{r.id}-64x64",
+        )
+        for r in recipes + fine_only
+    ]
+
+
+# mha_v4_sol() quantizes for you, and knows the per-tensor recipes and the FP6-P MX ones; the
+# other MX rows go through mha_v4_packed with operands the caller quantized.
+_SOL_ATTN_RAW_RECIPES = [
+    r
+    for r in _SOL_ATTN_RECIPES
+    if not r.k_carries_pooled_scale or r.v_pack == AttentionPack.V_FOR_FP6_P
+]
+
+
+# gfx942 carries mode-2 rows for the two per-tensor recipes only; the MX ones skip themselves on
+# the per-recipe manifest check below. Everything else in this section reads its geometry from
+# its recipe's own geometry, so it retiles from 256x128 to 256x64 without further arch branching.
+_MHA_V4_SOL_ATTN_ARCH = get_gfx() in ("gfx942", "gfx950")
+
+_SOL_ATTN_FP8 = next(r for r in _SOL_ATTN_RECIPES if r.id == "fp8")
+
+
+def _sol_attn_tiles(recipe):
+    """The Sol-Attn geometries the manifest serves a recipe at, or () if it has none."""
+    if not _MHA_V4_SOL_ATTN_ARCH:
+        return ()
+    return mha_v4_block_tiles(recipe.manifest_operands(), MHA_V4_SOL_MODE)
+
+
+def _sol_attn_row_missing(recipe, block_tile=None):
+    """Why the manifest cannot run `recipe` at block_tile (its default if None), or None if it can."""
+    tiles = _sol_attn_tiles(recipe)
+    if block_tile is None:
+        return None if tiles else f"no {recipe.id} Sol-Attn row on {get_gfx()}"
+    if tuple(block_tile) in tiles:
+        return None
+    q_tile, kv_tile = block_tile
+    return f"no {q_tile}x{kv_tile} {recipe.id} Sol-Attn row on {get_gfx()}"
+
+
+def _requires_sol_row(recipe, block_tile=None):
+    reason = _sol_attn_row_missing(recipe, block_tile)
+    return pytest.mark.skipif(reason is not None, reason=reason or "")
+
+
+def _skip_without_sol_row(recipe, block_tile=None):
+    reason = _sol_attn_row_missing(recipe, block_tile)
+    if reason is not None:
+        pytest.skip(reason)
+
+
+def _sol_attn_launch(
+    q,
+    k,
+    v,
+    plan,
+    mean_k=None,
+    mean_v=None,
+    block_bitmap=None,
+    recipe=None,
+    block_tile=None,
+    return_lse=False,
+    sorted_dispatch=None,
+    kv_range_tokens=0,
+    jensen=False,
+):
+    """Launch the Sol-Attn row over a sol_prepare() plan, overriding tensors if asked.
+
+    jensen passes the plan's mean_k_var (and its scale), so the plan must have been prepared with
+    k_variance=True.
+    """
+    recipe = _FP8_SOL_ATTN_RECIPE if recipe is None else recipe
+    return mha_v4_packed(
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        q.descale,
+        k.descale,
+        v.descale,
+        recipe.qk_format,
+        recipe.qk_format,
+        recipe.v_format,
+        recipe.qk_scale_mode,
+        recipe.qk_scale_mode,
+        recipe.v_scale_mode,
+        kv_block_indices=plan["kv_block_indices"],
+        lut_start=plan["lut_start"],
+        lut_count=plan["lut_count"],
+        mean_k=plan["mean_k"] if mean_k is None else mean_k,
+        mean_v=plan["mean_v"] if mean_v is None else mean_v,
+        block_bitmap=plan["block_bitmap"] if block_bitmap is None else block_bitmap,
+        mean_k_scale=plan["mean_k_scale"],
+        mean_v_scale=plan["mean_v_scale"],
+        block_tile=block_tile,
+        return_lse=return_lse,
+        sorted_dispatch=sorted_dispatch,
+        kv_range_tokens=kv_range_tokens,
+        mean_k_var=plan["mean_k_var"] if jensen else None,
+        mean_k_var_scale=plan["mean_k_var_scale"] if jensen else None,
+        v_pack=recipe.v_pack,
+    )
+
+
+def _select_all_plan(plan, batch, heads, q_tiles, kv_tiles, device):
+    """Replace a routed plan's selection with "every block exact", keeping its pooled tensors.
+
+    Sol-Attn then has to reduce to its own exact pass: every column of the approximate pass is
+    masked off, so the pooled tensors cannot reach the output at all.
+    """
+    mask = torch.ones(
+        (batch, heads, q_tiles, kv_tiles), device=device, dtype=torch.bool
+    )
+    indices, start, count = block_attn_mask_to_ragged_lut(
+        mask, num_heads=heads, return_none_if_dense=False
+    )
+    rows, bitmap_ds = plan["block_bitmap"].shape
+    return {
+        **plan,
+        "kv_block_indices": indices,
+        "lut_start": start,
+        "lut_count": count,
+        # All bits set: every block already computed exactly, including the padding bits above
+        # num_kv_blocks that clip the last tile's overhang.
+        "block_bitmap": torch.full(
+            (rows, bitmap_ds), 0xFFFFFFFF, device=device, dtype=torch.uint32
+        ),
+        "block_attn_mask": mask,
+    }
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@_requires_sol_row(_SOL_ATTN_FP8)
+def test_mha_v4_sol_select_all_ignores_the_pooled_tensors():
+    """The strongest host-path check that needs no tolerance and no oracle.
+
+    Under an all-True selection the approximate pass is masked column by column, so the output
+    must not depend on the pooled tensors at all. Any wrong kernarg offset, pooled stride, or
+    bitmap row pitch breaks that: the correction leaks in and the two runs diverge.
+    """
+    heads, batch = 2, 1
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_MODE)
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(
+        sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
+    )
+    routed = sol_prepare(
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        beta=0.4,
+        num_heads=heads,
+        BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_MODE),
+    )
+    plan = _select_all_plan(
+        routed, batch, heads, routed["num_q_tiles"], kv_tiles, q.quantized.device
+    )
+
+    with_pooled = _sol_attn_launch(q, k, v, plan)
+    # Same launch, but pooled K/V that would move the output by a lot if they were ever read.
+    scrambled = _sol_attn_launch(
+        q,
+        k,
+        v,
+        plan,
+        mean_k=torch.full_like(plan["mean_k"], 4.0),
+        mean_v=torch.full_like(plan["mean_v"], -4.0),
+    )
+    torch.cuda.synchronize()
+
+    assert torch.equal(with_pooled, scrambled)
+    assert torch.isfinite(with_pooled).all()
+    assert with_pooled.abs().sum() > 0
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@_requires_sol_row(_SOL_ATTN_FP8)
+@_requires_sparse_row("fp8")
+def test_mha_v4_sol_select_all_is_no_less_accurate_than_the_sparse_row():
+    """Cross-row check on the exact pass, against the oracle rather than against each other.
+
+    Under an all-True mask both rows compute plain dense attention over the same quantized bytes,
+    so the two are interchangeable in principle -- but not bit-for-bit: the deployed fp8 sparse
+    code object predates the PKNORM softmax the Sol-Attn one is built with, so they approximate
+    exp2 differently and land ~6e-4 of cosine apart. Asserting they agree to some tighter figure
+    would only be measuring that gap. What actually matters is that neither approximation is worse
+    than the other, so both are compared to the fp32 oracle instead; the shared ~4e-2 relative
+    error against it is fp8 quantization, which both rows carry equally.
+    """
+    from aiter.test_mha_common import sol_attn_ref
+
+    heads, batch = 2, 1
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_MODE)
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(
+        sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
+    )
+    routed = sol_prepare(
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        beta=0.4,
+        num_heads=heads,
+        BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_MODE),
+    )
+    plan = _select_all_plan(
+        routed, batch, heads, routed["num_q_tiles"], kv_tiles, q.quantized.device
+    )
+
+    sol = _sol_attn_launch(q, k, v, plan)
+    sparse = _sparse_fp8_launch(q, k, v, block_mask=plan["block_attn_mask"])
+    torch.cuda.synchronize()
+
+    oracle, _ = sol_attn_ref(
+        q.quantized.float() * q.descale.float(),
+        k.quantized.float() * k.descale.float(),
+        v.quantized.float() * v.descale.float(),
+        plan["block_attn_mask"],
+        plan["mean_k"].float() * k.descale.float(),
+        plan["mean_v"].float() * v.descale.float(),
+        BLOCK_M=SOL_ATTN_TS_QO,
+        BLOCK_N=kv_tile,
+    )
+
+    def error(actual):
+        return ((actual.float() - oracle.float()).norm() / oracle.float().norm()).item()
+
+    sol_error, sparse_error = error(sol), error(sparse)
+    assert sol_error < 0.05, f"Sol-Attn relative error {sol_error}"
+    assert sol_error < 1.1 * sparse_error, (
+        f"Sol-Attn is less accurate than the sparse row on the same mask: "
+        f"{sol_error} vs {sparse_error}"
+    )
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@pytest.mark.parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
+@pytest.mark.parametrize("tail", [0, 37])
+@pytest.mark.parametrize("beta", [0.4, 1.0])
+def test_mha_v4_sol_matches_the_oracle_and_beats_keep_or_drop(
+    beta, tail, recipe, block_tile
+):
+    """The correction has to both track the oracle and be worth having.
+
+    sol_attn_ref on the SAME routed mask is the accuracy target; the same oracle with
+    correction=False is plain block-sparse attention over that mask, which is what Sol-Attn is
+    supposed to improve on. Checking only the first would pass on a kernel that quietly dropped
+    the correction, since a well-routed mask is already close on its own. A nonzero tail leaves
+    the last KV block short, which the exact and pooled passes both have to bound.
+    """
+    _skip_without_sol_row(recipe, block_tile)
+    from aiter.test_mha_common import sol_attn_ref
+
+    heads, batch = 2, 1
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    kv_tiles = 16
+    q, k, v = recipe.operands(
+        sequence_k=kv_tiles * kv_tile + tail, heads=heads, sequence_q=512, batch=batch
+    )
+    plan = recipe.prepare(q, k, v, beta=beta, heads=heads, block_tile=block_tile)
+    fraction = plan["block_attn_mask"].float().mean().item()
+    assert 0.02 < fraction < 0.9, f"degenerate routing at beta={beta}: {fraction}"
+
+    sol = _sol_attn_launch(q, k, v, plan, recipe=recipe, block_tile=block_tile)
+    torch.cuda.synchronize()
+
+    # Score the oracle on the very values the kernel was handed, pooled tensors included: a
+    # per-tensor recipe reuses the source descale, a block-granular one reads the pooled scale
+    # instead, and getting that wrong here shows up as the kernel disagreeing with its own oracle.
+    ref_args = (
+        *recipe.reference_operands(q, k, v),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", k),
+        recipe.dequantize_pooled(plan, "mean_v", v),
+    )
+    ref_kwargs = {
+        "BLOCK_M": q_tile,
+        "BLOCK_N": kv_tile,
+        "softmax_scale": recipe.ref_softmax_scale,
+    }
+    reference, _ = sol_attn_ref(*ref_args, **ref_kwargs)
+    keep_or_drop, _ = sol_attn_ref(*ref_args, **ref_kwargs, correction=False)
+
+    def cosine(a, b):
+        return torch.nn.functional.cosine_similarity(
+            a.float().flatten(), b.float().flatten(), dim=0
+        ).item()
+
+    to_reference = cosine(sol, reference)
+    to_keep_or_drop = cosine(sol, keep_or_drop)
+    assert to_reference > recipe.oracle_floor, f"cosine to oracle {to_reference}"
+    # The kernel is nearer the corrected oracle than the uncorrected one, i.e. it really does
+    # carry the dropped blocks' zeroth-order mass rather than discarding it.
+    assert (
+        to_reference > to_keep_or_drop + recipe.keep_or_drop_margin
+    ), f"correction not observable: {to_reference} vs {to_keep_or_drop}"
+
+
+def test_mha_v4_packed_rejects_pooled_without_lut():
+    dummy = torch.empty(0)
+    fp8_format = native_fp8_format()
+    with pytest.raises(ValueError, match="needs the ragged LUT triple"):
+        mha_v4_packed(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            mean_k=dummy,
+            mean_v=dummy,
+            block_bitmap=dummy,
+        )
+
+
+def test_mha_v4_packed_rejects_partial_pooled_triple():
+    dummy = torch.empty(0)
+    fp8_format = native_fp8_format()
+    with pytest.raises(ValueError, match="all be set or all omitted"):
+        mha_v4_packed(
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            dummy,
+            fp8_format,
+            fp8_format,
+            fp8_format,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            AttentionScaleMode.F32_PER_TENSOR,
+            mean_k=dummy,
+            mean_v=dummy,
+        )
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@_requires_sol_row(_SOL_ATTN_FP8)
+@pytest.mark.skipif(
+    get_gfx() == "gfx942",
+    reason="gfx942 Sol-Attn writes zeros for an empty row instead of the pooled-only softmax: "
+    "with no exact block the row never establishes the online-softmax state the correction pass "
+    "normalizes against. sol_prepare keeps at least one exact block per row, so this is "
+    "unreachable through the routed path; a caller hand-building an empty row gets zeros.",
+)
+def test_mha_v4_sol_empty_lut_rows_fall_back_to_the_pooled_softmax():
+    """A row that selects nothing must degrade to the pooled-only answer, not to zeros or NaN.
+
+    Such a row leaves the exact pass with no running softmax max, and the approximate pass has to
+    recover one for the row to normalize at all. Every row is emptied here, so the whole output is
+    the fallback and no amount of correct rows can hide a broken one.
+    """
+    from aiter.test_mha_common import sol_attn_ref
+
+    heads, batch = 2, 1
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_MODE)
+    kv_tiles = 8
+    q, k, v = _sparse_fp8_operands(
+        sequence_k=kv_tiles * kv_tile, heads=heads, sequence_q=512, batch=batch
+    )
+    plan = sol_prepare(
+        q.quantized,
+        k.quantized,
+        v.quantized,
+        beta=0.4,
+        num_heads=heads,
+        BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_MODE),
+    )
+    # Empty every row, keeping the bitmap consistent with it: nothing is exact, so nothing is
+    # masked out of the approximate pass. The tail bits above num_kv_blocks stay set.
+    plan["block_attn_mask"] = torch.zeros_like(plan["block_attn_mask"])
+    plan["lut_count"] = torch.zeros_like(plan["lut_count"])
+    plan["lut_start"] = torch.zeros_like(plan["lut_start"])
+    rows, bitmap_ds = plan["block_bitmap"].shape
+    device = q.quantized.device
+    padding = (torch.arange(bitmap_ds * 32, device=device) >= kv_tiles).to(torch.int64)
+    packed = (padding.reshape(bitmap_ds, 32) << torch.arange(32, device=device)).sum(
+        dim=-1
+    )
+    plan["block_bitmap"] = (
+        (packed & 0xFFFFFFFF).to(torch.uint32).expand(rows, bitmap_ds).contiguous()
+    )
+
+    sol = _sol_attn_launch(q, k, v, plan)
+    torch.cuda.synchronize()
+
+    def dequant(operand):
+        return operand.quantized.float() * operand.descale.float()
+
+    reference, _ = sol_attn_ref(
+        dequant(q),
+        dequant(k),
+        dequant(v),
+        plan["block_attn_mask"],
+        plan["mean_k"].float() * k.descale.float(),
+        plan["mean_v"].float() * v.descale.float(),
+        BLOCK_M=SOL_ATTN_TS_QO,
+        BLOCK_N=kv_tile,
+    )
+    assert torch.isfinite(sol).all(), "an empty row produced a non-finite output"
+    assert (
+        sol.abs().sum() > 0
+    ), "an empty row produced a zero tile instead of the fallback"
+    cosine = torch.nn.functional.cosine_similarity(
+        sol.float().flatten(), reference.float().flatten(), dim=0
+    ).item()
+    assert cosine > 0.999, f"cosine to the pooled-only oracle {cosine}"
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@_requires_sol_row(_SOL_ATTN_FP8)
+def test_mha_v4_sol_compiles_without_graph_breaks():
+    """Routing and launch have to trace as one graph, which is why sol_prepare exists.
+
+    Every shape it returns is a function of the input shapes and no host-side branch reads device
+    data, so a caller can compile an attention layer around Sol-Attn without wrapping the routing
+    in an opaque custom op of their own. A graph break here would take that away.
+    """
+    heads, batch = 2, 1
+    kv_tile = _default_kv_tile(mode=MHA_V4_SOL_MODE)
+    kv_tiles = 4
+    q, k, v = _sparse_fp8_operands(
+        sequence_k=kv_tiles * kv_tile, heads=heads, batch=batch
+    )
+
+    def call():
+        plan = sol_prepare(
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            beta=0.4,
+            num_heads=heads,
+            BLOCK_N=_default_kv_tile(mode=MHA_V4_SOL_MODE),
+        )
+        return _sol_attn_launch(q, k, v, plan)
+
+    explained = torch._dynamo.explain(call)()
+    assert explained.break_reasons == [], [
+        str(reason.reason) for reason in explained.break_reasons
+    ]
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@pytest.mark.parametrize("recipe", _SOL_ATTN_RAW_RECIPES, ids=lambda r: r.id)
+@pytest.mark.parametrize("beta", [0.4, 1.0])
+def test_mha_v4_sol_raw_matches_quantizing_and_routing_by_hand(beta, recipe):
+    """All the raw entry point adds over the packed one is quantize-then-route, so pin exactly that.
+
+    Deliberately not compared against dense attention: on random Gaussian operands there is no
+    structure for any block mask to exploit, so every block carries similar mass and Sol-Attn sits
+    around 0.78 cosine of dense at beta=0.4 -- a fact about the data, not about the kernel. The
+    tests that do bound accuracy compare against sol_attn_ref on the mask the kernel was given.
+    """
+    _skip_without_sol_row(recipe)
+    heads, batch = 2, 1
+    kv_tile = recipe.kv_tile()
+    q, k, v = _sol_attn_raw_inputs(
+        sequence_k=16 * kv_tile, heads=heads, sequence_q=512, batch=batch, seed=3
+    )
+
+    sol = mha_v4_sol(
+        q, k, v, recipe.qk_format, recipe.qk_format, recipe.v_format, beta=beta
+    )
+
+    operands = recipe.quantize(q, k, v)
+    plan = recipe.prepare(*operands, beta=beta, heads=heads)
+    by_hand = _sol_attn_launch(*operands, plan, recipe=recipe)
+    torch.cuda.synchronize()
+
+    assert torch.equal(sol, by_hand)
+    assert torch.isfinite(sol).all()
+    # Routing has to be doing something: neither degenerate all-exact nor all-approximate.
+    fraction = plan["block_attn_mask"].float().mean().item()
+    assert 0.02 < fraction < 0.9, f"degenerate routing at beta={beta}: {fraction}"
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@pytest.mark.parametrize("recipe", _SOL_ATTN_RAW_RECIPES, ids=lambda r: r.id)
+def test_mha_v4_sol_raw_compile_parity(recipe):
+    """The raw entry point picks its quantizers off the format enums, which Dynamo has to fold away.
+
+    Those are host-side branches on Python values, so they specialize rather than break the graph --
+    but only as long as nothing in them reads a tensor, which is exactly what would regress if a
+    future recipe needed device-side routing to choose.
+    """
+    _skip_without_sol_row(recipe)
+    heads, batch = 2, 1
+    kv_tile = recipe.kv_tile()
+    q, k, v = _sol_attn_raw_inputs(
+        sequence_k=4 * kv_tile, heads=heads, batch=batch, seed=5
+    )
+    formats = (recipe.qk_format, recipe.qk_format, recipe.v_format)
+
+    eager = mha_v4_sol(q, k, v, *formats, beta=0.4)
+    compiled = torch.compile(mha_v4_sol, fullgraph=True)(q, k, v, *formats, beta=0.4)
+    torch.cuda.synchronize()
+
+    assert torch.equal(eager, compiled)
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@pytest.mark.parametrize("beta", [0.4, 1.0])
+def test_mha_v4_sol_mxfp4_fills_both_pooled_scale_slots(beta):
+    """mxfp4_fp6p has Q, K and V all E8M0, so neither pooled operand can inherit a source descale
+    and both kernarg scale slots are live at once.
+
+    Accuracy is covered by the recipe-parametrized oracle test. What is only checkable here is that
+    BOTH slots are read: a NULL one is not an error state, it just means "keep reading the source
+    image", so a fill that dropped either would still run and still look about as accurate. Only
+    perturbing one at a time separates them.
+    """
+    recipe = next(r for r in _SOL_ATTN_RECIPES if r.id == "mxfp4_fp6p")
+    _skip_without_sol_row(recipe)
+
+    heads, batch = 2, 1
+    q, k, v = recipe.operands(
+        sequence_k=16 * recipe.kv_tile(), heads=heads, sequence_q=512, batch=batch
+    )
+    plan = recipe.prepare(q, k, v, beta=beta, heads=heads)
+    assert (
+        plan["mean_k_scale"] is not None and plan["mean_v_scale"] is not None
+    ), "both operands are block-granular, so both slots should be filled"
+
+    baseline = _sol_attn_launch(q, k, v, plan, recipe=recipe)
+    torch.cuda.synchronize()
+    assert torch.isfinite(baseline).all()
+
+    def bumped(scale):
+        """Bump every exponent, keeping the slack the V scale is read into.
+
+        A plain elementwise copy would hand back a tightly sized allocation, which the V-scale read
+        can run past, so the perturbed run and not the kernel would be what fails.
+        """
+        backing = scale.new_zeros((scale.numel() + 512,))
+        backing[: scale.numel()] = (
+            (scale.reshape(-1).int() + 1).clamp(max=255).to(torch.uint8)
+        )
+        return torch.as_strided(backing, scale.shape, scale.stride())
+
+    for slot in ("mean_k_scale", "mean_v_scale"):
+        perturbed = _sol_attn_launch(
+            q, k, v, {**plan, slot: bumped(plan[slot])}, recipe=recipe
+        )
+        torch.cuda.synchronize()
+        assert not torch.equal(baseline, perturbed), f"{slot} is not being read"
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+def test_mha_v4_sol_reads_the_pooled_scale_it_was_given():
+    """A NULL pooled-scale slot is not an error state, it just means "keep reading K's own scale".
+
+    So a block-granular recipe that failed to pass one, or a kernarg fill that dropped it, would
+    still run and still look plausible -- the approximate pass would simply rescale its pooled K by
+    the wrong exponents. Perturbing the scale and requiring the output to move is what distinguishes
+    a slot that is read from one that is merely populated.
+    """
+    recipe = next(
+        r
+        for r in _SOL_ATTN_RECIPES
+        if r.k_carries_pooled_scale and not r.v_carries_pooled_scale
+    )
+    _skip_without_sol_row(recipe)
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(q, k, v, beta=0.4, heads=heads)
+    assert plan["mean_k_scale"] is not None
+    assert (
+        plan["mean_v_scale"] is None
+    ), "this recipe's V is per-tensor and pools for free"
+
+    baseline = _sol_attn_launch(q, k, v, plan, recipe=recipe)
+    bumped = dict(plan)
+    bumped["mean_k_scale"] = (
+        (plan["mean_k_scale"].int() + 1).clamp(max=255).to(torch.uint8)
+    )
+    perturbed = _sol_attn_launch(q, k, v, bumped, recipe=recipe)
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(baseline).all()
+    assert not torch.equal(baseline, perturbed), (
+        "doubling every pooled K exponent changed nothing, so the kernel is not reading "
+        "mean_k_scale"
+    )
+
+
+@pytest.mark.skipif(not _MHA_V4_SOL_ATTN_ARCH, reason="Sol-Attn validation")
+@pytest.mark.parametrize("recipe", _SOL_ATTN_RECIPES, ids=lambda r: r.id)
+def test_mha_v4_sol_pooled_scales_must_match_the_scale_modes(recipe):
+    """Which operands need a pooled scale follows from the scale modes, so it is not the caller's
+    to choose: supplying one for a per-tensor operand describes a read the kernel never does, and
+    omitting one for a block-granular operand leaves it reading unpooled exponents.
+    """
+    _skip_without_sol_row(recipe)
+    heads = 2
+    q, k, v = recipe.operands(sequence_k=8 * recipe.kv_tile(), heads=heads)
+    plan = recipe.prepare(q, k, v, beta=0.4, heads=heads)
+
+    def launch(**scales):
+        return mha_v4_packed(
+            q.quantized,
+            k.quantized,
+            v.quantized,
+            q.descale,
+            k.descale,
+            v.descale,
+            recipe.qk_format,
+            recipe.qk_format,
+            recipe.v_format,
+            recipe.qk_scale_mode,
+            recipe.qk_scale_mode,
+            recipe.v_scale_mode,
+            kv_block_indices=plan["kv_block_indices"],
+            lut_start=plan["lut_start"],
+            lut_count=plan["lut_count"],
+            mean_k=plan["mean_k"],
+            mean_v=plan["mean_v"],
+            block_bitmap=plan["block_bitmap"],
+            v_pack=recipe.v_pack,
+            **scales,
+        )
+
+    # Both directions of the contract, and both operands: whether a slot is required follows from
+    # that operand's scale mode alone, which is exactly what the plan already encodes -- a pooled
+    # scale is present when and only when the mode is block-granular. So the wrong call is to omit
+    # one the plan filled, or to supply one the plan left empty.
+    correct = {slot: plan[slot] for slot in ("mean_k_scale", "mean_v_scale")}
+    for slot, value in correct.items():
+        wrong = dict(correct)
+        wrong[slot] = None if value is not None else plan["mean_k"]
+        with pytest.raises(RuntimeError, match=slot):
+            launch(**wrong)
+            torch.cuda.synchronize()
+
+
+def test_mha_v4_sol_rejects_recipes_without_a_manifest_row():
+    dummy = torch.empty((1, 256, 1, 128), device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(NotImplementedError, match="f8f6 and f6f4 recipes only"):
+        mha_v4_sol(
+            dummy,
+            dummy,
+            dummy,
+            AttentionFormat.MXFP6,
+            AttentionFormat.MXFP6,
+            native_fp8_format(),
+        )
+
+
+def _e8m0_operand(batch, seqlen, heads, head_dim, decades=12.0, seed=0):
+    """(raw, data, scale) for an E8M0 operand whose exponent changes from token to token.
+
+    A flat-magnitude operand would hide the whole problem: pooling stored codes is only wrong
+    because the scale varies along the axis being pooled, so the test data has to vary along it.
+    """
+    torch.manual_seed(seed)
+    raw = torch.randn(batch, seqlen, heads, head_dim, device="cuda")
+    stagger = torch.exp2(
+        torch.arange(seqlen, device="cuda").float().remainder(decades) - decades / 2
+    )
+    raw = raw * stagger.view(1, seqlen, 1, 1)
+    data, scale = _e8m0_quantize(raw, dtypes.fp8)
+    return raw, data, scale
+
+
+def test_sol_attn_e8m0_quantization_round_trips():
+    raw, data, scale = _e8m0_operand(2, 128, 3, 128)
+    assert data.dtype == dtypes.fp8 and scale.dtype == torch.uint8
+    assert scale.shape == (2, 128, 3, 4)
+    # 255 is the E8M0 NaN encoding and must never be produced.
+    assert int(scale.max()) <= 254
+
+    back = _e8m0_dequantize(data, scale)
+    assert torch.isfinite(back).all()
+    cosine = torch.nn.functional.cosine_similarity(
+        back.flatten(), raw.flatten(), dim=0
+    ).item()
+    assert cosine > 0.999, f"round trip lost too much: cosine {cosine}"
+
+    # Iterating has to CONVERGE rather than drift. The first requantize is allowed to differ: it
+    # sees the rounded values, so a group whose max landed well below the format limit gets a
+    # tighter exponent than the raw data asked for, which is an improvement. The second cannot,
+    # because that group's max is now within a factor of two of the limit by construction.
+    once_data, once_scale = _e8m0_quantize(back, dtypes.fp8)
+    twice_data, twice_scale = _e8m0_quantize(
+        _e8m0_dequantize(once_data, once_scale), dtypes.fp8
+    )
+    assert torch.equal(twice_scale, once_scale)
+    assert torch.equal(twice_data.view(torch.uint8), once_data.view(torch.uint8))
+
+
+def test_sol_attn_pooling_a_block_granular_scale_must_not_pool_the_codes():
+    """The reason the mode-2 kernarg carries pooled scales at all.
+
+    For a per-tensor or per-channel descale, pooling the stored codes and reusing the descale is
+    exact, because neither varies along the sequence axis being pooled. An E8M0 1x32 scale does, so
+    the codes of one pooled row are not on a common footing and averaging them is meaningless --
+    measured here at roughly half the cosine of doing it properly.
+    """
+    _, data, scale = _e8m0_operand(1, 1024, 2, 128)
+    oracle = _sol_attn_block_mean(_e8m0_dequantize(data, scale), SOL_ATTN_TS_KV)
+    cos = lambda a, b: torch.nn.functional.cosine_similarity(
+        a.float().flatten(), b.float().flatten(), dim=0
+    ).item()
+
+    _, _, pooled = _sol_attn_pool_mx(data, scale, SOL_ATTN_TS_KV)
+    proper = cos(pooled, oracle)
+    naive = cos(_sol_attn_pool_reuse_descale(data, SOL_ATTN_TS_KV), oracle)
+
+    assert proper > 0.99, f"dequantize-pool-requantize only reached {proper}"
+    assert naive < 0.9, (
+        f"code pooling scored {naive} on a per-token scale, so this test is no longer "
+        "demonstrating why pooled scales are needed"
+    )
+
+
+def test_sol_attn_pooling_an_integer_operand_must_round_not_truncate():
+    """i8fp8 stores K as int8, and casting a float mean to an integer dtype truncates toward zero.
+
+    The float8 operands round on cast, so this only bites the integer recipes, and it bites them
+    quietly: every pooled row creeps toward zero, which shrinks the approximate pass's scores rather
+    than breaking anything outright.
+    """
+    codes = torch.randint(-128, 128, (1, 512, 2, 128), dtype=torch.int8, device="cuda")
+    exact = _sol_attn_block_mean(codes.float(), SOL_ATTN_TS_KV)
+    pooled = _sol_attn_pool_reuse_descale(codes, SOL_ATTN_TS_KV)
+
+    assert pooled.dtype == codes.dtype
+    assert torch.equal(pooled, exact.round().to(torch.int8))
+
+    rounded_err = (pooled.float() - exact).abs().mean().item()
+    truncated_err = (exact.to(torch.int8).float() - exact).abs().mean().item()
+    assert rounded_err < 0.75 * truncated_err, (
+        f"pooled codes are no better than truncation ({rounded_err} vs {truncated_err}), "
+        "so the rounding step is not doing anything"
+    )
+
+
+def test_sol_prepare_pools_scales_only_for_the_operands_that_need_them():
+    """K block-granular and V per-tensor is exactly the mxfp8 case."""
+    _, k_data, k_scale = _e8m0_operand(1, 512, 2, 128)
+    v_data = torch.randn(1, 512, 2, 128, device="cuda").to(dtypes.fp8)
+    q = torch.randn(1, 512, 2, 128, device="cuda", dtype=torch.bfloat16)
+
+    plan = sol_prepare(q, k_data, v_data, 0.5, num_heads=2, k_scale=k_scale)
+
+    num_kv_blocks = 512 // SOL_ATTN_TS_KV
+    assert plan["mean_k_scale"].shape == (1, num_kv_blocks, 2, 4)
+    assert plan["mean_k_scale"].dtype == torch.uint8
+    assert plan["mean_k"].shape == (1, num_kv_blocks, 2, 128)
+    # V reuses its source descale, so it must NOT get one, and the kernarg slot stays null.
+    assert plan["mean_v_scale"] is None
+
+    # Every operand per-tensor is the fp8 recipe, which must be unaffected by any of this.
+    per_tensor = sol_prepare(q, k_data, v_data, 0.5, num_heads=2)
+    assert per_tensor["mean_k_scale"] is None
+    assert per_tensor["mean_v_scale"] is None
+
+
+def test_sol_prepare_with_pooled_scales_compiles_without_graph_breaks():
+    _, k_data, k_scale = _e8m0_operand(1, 512, 2, 128)
+    v_data = torch.randn(1, 512, 2, 128, device="cuda").to(dtypes.fp8)
+    q = torch.randn(1, 512, 2, 128, device="cuda", dtype=torch.bfloat16)
+
+    def routed(q, k, v, s):
+        plan = sol_prepare(q, k, v, 0.5, num_heads=2, k_scale=s)
+        return plan["mean_k"], plan["mean_k_scale"], plan["block_bitmap"]
+
+    eager = routed(q, k_data, v_data, k_scale)
+    traced = torch.compile(routed, fullgraph=True)(q, k_data, v_data, k_scale)
+    for got, want in zip(traced, eager):
+        assert torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+
+
 # (id, Q/K format, V format, dense tolerance in nats). None is this GPU's FP8 encoding, which is
 # gfx-dependent, so it cannot be spelled at module scope.
 _LSE_ROWS = (
@@ -1364,6 +2568,354 @@ def test_mha_v4_sparse_lse_covers_only_the_selected_blocks(row_id, block_tile):
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+@pytest.mark.parametrize(
+    ("recipe_id", "tolerance"),
+    [
+        ("bf16", 0.05),
+        ("bf16fp8", 0.05),
+        ("fp8", 0.09),
+        ("i8fp8", 0.09),
+        pytest.param(
+            "mxfp8",
+            0.09,
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 MXFP8"),
+        ),
+        # Scored against the BF16 sources, so FP4's own Q/K rounding is in the residual.
+        pytest.param(
+            "mxfp4_fp6p",
+            0.2,
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 FP6-P rows"),
+        ),
+        *(
+            pytest.param(
+                recipe_id,
+                tolerance,
+                marks=pytest.mark.skipif(
+                    get_gfx() != "gfx950", reason="gfx950 FP6-P rows"
+                ),
+            )
+            for recipe_id, tolerance in (
+                ("mxfp6_fp6p", 0.09),
+                ("f8f6_fp6p", 0.09),
+                ("f6f4_fp6p", 0.09),
+            )
+        ),
+        # Its only Sol-Attn row is 64x64.
+        pytest.param(
+            "f6f8",
+            0.09,
+            marks=pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 64x64 rows"),
+        ),
+    ],
+)
+def test_mha_v4_sol_lse_is_the_joint_softmax_denominator(recipe_id, tolerance):
+    """It counts the pooled proxy columns as well as the exact ones, which is what makes it merge.
+
+    Checked against the reference's own joint logsumexp rather than against attention over the
+    selected blocks, because those are different numbers here and only the first one composes: a
+    ring merge adds numerators and denominators separately, so the proxy has to be in the
+    denominator for the same reason it is in the numerator. An LSE over the exact columns alone
+    would still look plausible and would silently misweight every merge.
+    """
+    from aiter.test_mha_common import sol_attn_ref
+
+    torch.manual_seed(37)
+    fine_only = {r.id for r in _SOL_ATTN_FINE_ONLY_RECIPES}
+    recipe = next(
+        r for r in _SOL_ATTN_RECIPES + _SOL_ATTN_FINE_ONLY_RECIPES if r.id == recipe_id
+    )
+    block_tile = _MHA_V4_FINE_TILE if recipe_id in fine_only else None
+    _skip_without_sol_row(recipe, block_tile)
+    heads, sequence = 2, 1024
+    q_tile, kv_tile = block_tile or recipe.block_tile()
+    operands = recipe.operands(sequence_k=sequence, heads=heads, sequence_q=sequence)
+    plan = recipe.prepare(*operands, beta=1.0, heads=heads, block_tile=block_tile)
+    fraction = plan["block_attn_mask"].float().mean().item()
+    assert 0.02 < fraction < 0.9, f"degenerate routing: {fraction}"
+
+    _, lse = _sol_attn_launch(
+        *operands, plan, recipe=recipe, block_tile=block_tile, return_lse=True
+    )
+    torch.cuda.synchronize()
+
+    q_op, k_op, v_op = operands
+    _, reference = sol_attn_ref(
+        *recipe.reference_operands(q_op, k_op, v_op),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", k_op),
+        recipe.dequantize_pooled(plan, "mean_v", v_op),
+        BLOCK_M=q_tile,
+        BLOCK_N=kv_tile,
+        softmax_scale=recipe.ref_softmax_scale,
+    )
+    assert lse.shape == reference.shape
+    assert (lse - reference.float()).abs().max() < tolerance
+
+
+@pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 rows declare sorted")
+@pytest.mark.parametrize(("recipe", "block_tile"), _sol_attn_geometry_params())
+def test_mha_v4_sol_sorted_dispatch_is_bitwise_raster(recipe, block_tile):
+    """Heavy-first dispatch reorders the workgroups, never their work.
+
+    The last query tile of every (batch, head) is forced all-exact, which puts its LUT a full
+    level above the routed rows, so the table genuinely permutes the grid. A decode that got a
+    head or batch field wrong would compute some tile into another's rows and break equality.
+    The raster launch is the one an XCD-swizzling row relabels, so this also pins the table
+    decode against the swizzle it bypasses.
+    """
+    _skip_without_sol_row(recipe, block_tile)
+    torch.manual_seed(41)
+    batch, heads, sequence = 2, 4, 1024
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    q_tiles, kv_tiles = sequence // q_tile, sequence // kv_tile
+    operands = recipe.operands(
+        sequence_k=sequence, heads=heads, sequence_q=sequence, batch=batch
+    )
+    heavy = torch.zeros((1, 1, q_tiles, kv_tiles), dtype=torch.bool, device="cuda")
+    heavy[..., -1, :] = True
+    plan = recipe.prepare(
+        *operands, beta=1.0, heads=heads, block_tile=block_tile, force_block_mask=heavy
+    )
+    counts = plan["lut_count"].view(batch, heads, q_tiles)
+    assert (counts[..., -1] == kv_tiles).all()
+    assert counts[..., :-1].float().mean() < 0.5 * kv_tiles, "degenerate routing"
+
+    launch = functools.partial(
+        _sol_attn_launch,
+        *operands,
+        plan,
+        recipe=recipe,
+        block_tile=block_tile,
+        return_lse=True,
+    )
+    raster = launch(sorted_dispatch=False)
+    ordered = launch(sorted_dispatch=True)
+    default = launch()
+    for launched in (ordered, default):
+        assert torch.equal(launched[0], raster[0])
+        assert torch.equal(launched[1], raster[1])
+
+
+# Every gfx950 Sol row declares the Jensen term, and all but the BF16 ones take KV ranges.
+_SOL_ATTN_GFX950_PARAMS = [
+    pytest.param(
+        *p.values,
+        marks=[
+            *p.marks,
+            pytest.mark.skipif(get_gfx() != "gfx950", reason="gfx950 Sol rows"),
+        ],
+        id=p.id,
+    )
+    for p in _sol_attn_geometry_params()
+]
+
+
+def _sol_attn_row_declares(recipe, block_tile, capability: str) -> bool:
+    """Whether the Sol-Attn row `recipe` dispatches at `block_tile` declares a manifest column.
+
+    Read from the CSV for the reason _mha_v4_lut_capacity gives: the launcher enforces these
+    capabilities, and there is no Python accessor to ask.
+    """
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    asm_dir = os.environ.get("AITER_ASM_DIR", os.path.join(AITER_ROOT_DIR, "hsa"))
+    manifest = os.path.join(asm_dir, get_gfx(), "fmha_v4_fwd", "fmha_v4_fwd.csv")
+    wanted = {
+        "q_format": recipe.qk_format,
+        "k_format": recipe.qk_format,
+        "v_format": recipe.v_format,
+        "v_pack": recipe.v_pack,
+        "q_scale_mode": recipe.qk_scale_mode,
+        "k_scale_mode": recipe.qk_scale_mode,
+        "v_scale_mode": recipe.v_scale_mode,
+        "mode": MHA_V4_SOL_MODE,
+        "ts_qo": q_tile,
+        "ts_kv": kv_tile,
+    }
+    with open(manifest, newline="") as handle:
+        for row in csv.DictReader(
+            filter(lambda line: not line.startswith("#"), handle)
+        ):
+            if all(int(row[column]) == int(value) for column, value in wanted.items()):
+                return bool(int(row[capability]))
+    raise LookupError(f"no Sol-Attn row for {recipe.id} at {q_tile}x{kv_tile}")
+
+
+def _rotated(x):
+    out = torch.empty_like(x)
+    rotate_activation_hd128(out, x.contiguous())
+    return out
+
+
+def _sol_attn_jensen_ref(
+    q, k, v, mask, mean_k, mean_v, block_tile, softmax_scale, jensen
+):
+    """sol_attn_ref over whole blocks, with the Jensen term on every pooled logit.
+
+    jensen is (q_rot, var_rot): Q and the per-block K variance in the basis the kernel holds them,
+    so the term is 0.5 * softmax_scale^2 * sum_d q_rot_d^2 * var_rot[d]. Returns (out, lse).
+    """
+    from aiter.test_mha_common import block_attn_mask_to_token_mask
+
+    q, k, v, mean_k, mean_v = (t.float() for t in (q, k, v, mean_k, mean_v))
+    block_m, block_n = block_tile
+    sequence_q, sequence_k = q.shape[1], k.shape[1]
+    assert sequence_k % block_n == 0, "whole blocks only"
+    exact = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
+    allowed = block_attn_mask_to_token_mask(
+        mask, sequence_q, sequence_k, block_m, block_n, q.device
+    )
+    exact = exact.masked_fill(~allowed, float("-inf"))
+    q_rot, var_rot = jensen
+    pooled = (
+        torch.einsum("bthd,bjhd->bhtj", q * softmax_scale, mean_k)
+        + math.log(block_n)
+        + 0.5
+        * softmax_scale**2
+        * torch.einsum("bthd,bjhd->bhtj", q_rot.float() ** 2, var_rot.float())
+    )
+    q_tile = torch.arange(sequence_q, device=q.device) // block_m
+    pooled = pooled.masked_fill(mask[:, :, q_tile, :], float("-inf"))
+    joint = torch.cat([exact, pooled], dim=-1)
+    weights = torch.softmax(joint, dim=-1)
+    out = torch.einsum("bhts,bshd->bthd", weights, torch.cat([v, mean_v], dim=1))
+    return out, torch.logsumexp(joint, dim=-1)
+
+
+@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+def test_mha_v4_sol_kv_ranges_merge_to_the_one_range_answer(recipe, block_tile):
+    """KV ranges split the softmax, not the result: each range's exact and pooled columns are
+    normalized on their own and merged by LSE, which is the joint softmax again. So the ranged
+    launch has to land on the one-range one, and both on the oracle, with a ragged last range.
+    A row that does not declare ranges has to refuse one rather than run unsplit."""
+    from aiter.test_mha_common import sol_attn_ref
+
+    _skip_without_sol_row(recipe, block_tile)
+    heads = 2
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    operands = recipe.operands(
+        sequence_k=80 * kv_tile + 37, heads=heads, sequence_q=512, seed=3
+    )
+    plan = recipe.prepare(*operands, beta=1.0, heads=heads, block_tile=block_tile)
+    launch = functools.partial(
+        _sol_attn_launch, *operands, plan, recipe=recipe, block_tile=block_tile
+    )
+    if not _sol_attn_row_declares(recipe, block_tile, "kv_range"):
+        with pytest.raises(RuntimeError, match="has no in-kernel KV range reset"):
+            launch(kv_range_tokens=32 * kv_tile)
+        return
+    one, one_lse = launch(return_lse=True)
+    ranged, ranged_lse = launch(return_lse=True, kv_range_tokens=32 * kv_tile)
+    torch.cuda.synchronize()
+
+    reference, reference_lse = sol_attn_ref(
+        *recipe.reference_operands(*operands),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", operands[1]),
+        recipe.dequantize_pooled(plan, "mean_v", operands[2]),
+        BLOCK_M=q_tile,
+        BLOCK_N=kv_tile,
+        softmax_scale=recipe.ref_softmax_scale,
+    )
+    assert torch.isfinite(ranged).all() and torch.isfinite(ranged_lse).all()
+    # Not bitwise: each range quantizes its P against its own running max.
+    assert _cosine(ranged, one) > 0.998
+    assert _cosine(ranged, reference) > recipe.oracle_floor
+    assert (ranged_lse - one_lse).abs().max() < 0.05
+    assert (ranged_lse - reference_lse.float()).abs().max() < 0.2
+
+
+@pytest.mark.parametrize(("recipe", "block_tile"), _SOL_ATTN_GFX950_PARAMS)
+def test_mha_v4_sol_jensen_term_is_the_block_k_variance(recipe, block_tile):
+    """sol_prepare(k_variance=True) hands the kernel the block variance of K in the basis the
+    kernel holds K in: rotated for the FP8 and MX recipes, as stored for BF16 and INT8. The kernel
+    output has to match the oracle's second-order term at its own weight rather than at none or
+    double it -- which is what a variance taken in the wrong basis, or read through the wrong
+    slot, would look like. All the row's options then go on at once: sorted dispatch and, where
+    the row takes them, KV ranges must not disturb it."""
+    _skip_without_sol_row(recipe, block_tile)
+    heads = 2
+    q_tile, kv_tile = recipe.block_tile() if block_tile is None else block_tile
+    operands = recipe.operands(
+        sequence_k=64 * kv_tile, heads=heads, sequence_q=512, seed=4
+    )
+    plan = recipe.prepare(
+        *operands, beta=1.0, heads=heads, block_tile=block_tile, k_variance=True
+    )
+    assert plan["mean_k_var"].shape == plan["mean_k"].shape
+    if recipe.k_carries_pooled_scale:
+        assert plan["mean_k_var_scale"].shape == plan["mean_k_scale"].shape
+    else:
+        assert plan["mean_k_var_scale"] is None
+    launch = functools.partial(
+        _sol_attn_launch, *operands, plan, recipe=recipe, block_tile=block_tile
+    )
+
+    plain = launch()
+    corrected, corrected_lse = launch(jensen=True, return_lse=True)
+    torch.cuda.synchronize()
+    assert not torch.equal(plain, corrected)
+
+    if recipe.packed_format is None:
+        # Addressable codes dequantize straight into the kernel's basis, along with any multiplier
+        # the quantizer folded into Q, which ref_softmax_scale then divides back out.
+        q_op, k_op = operands[0], operands[1]
+        q_rot = recipe.dequantize(q_op.quantized, q_op.descale)
+        var_rot = _sol_attn_block_variance(
+            recipe.dequantize(k_op.quantized, k_op.descale), kv_tile
+        )
+        softmax_scale = recipe.ref_softmax_scale or _SOL_ATTN_SOFTMAX_SCALE
+    else:
+        q_source, k_source = operands[0].source, operands[1].source
+        q_rot = _rotated(q_source).float() * mha_v4_q_multiplier(
+            _SOL_ATTN_SOFTMAX_SCALE
+        )
+        var_rot = _sol_attn_block_variance(_rotated(k_source).float(), kv_tile)
+        softmax_scale = recipe.ref_softmax_scale
+    ref_args = (
+        *recipe.reference_operands(*operands),
+        plan["block_attn_mask"],
+        recipe.dequantize_pooled(plan, "mean_k", operands[1]),
+        recipe.dequantize_pooled(plan, "mean_v", operands[2]),
+        (q_tile, kv_tile),
+        softmax_scale,
+    )
+    cosine = {
+        factor: _cosine(
+            corrected, _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot * factor))[0]
+        )
+        for factor in (0.0, 1.0, 2.0)
+    }
+    assert cosine[1.0] > max(cosine[0.0], cosine[2.0]), cosine
+    assert cosine[1.0] > recipe.oracle_floor, cosine
+    # Half or one and a half times the term already misses by about 0.33 nats.
+    reference_lse = _sol_attn_jensen_ref(*ref_args, (q_rot, var_rot))[1]
+    assert (corrected_lse - reference_lse).abs().max() < 0.15
+
+    everything = {"jensen": True, "return_lse": True}
+    if _sol_attn_row_declares(recipe, block_tile, "kv_range"):
+        everything["kv_range_tokens"] = 32 * kv_tile
+    raster = launch(sorted_dispatch=False, **everything)
+    ordered = launch(sorted_dispatch=True, **everything)
+    torch.cuda.synchronize()
+    assert torch.equal(raster[0], ordered[0]) and torch.equal(raster[1], ordered[1])
+    assert _cosine(ordered[0], corrected) > 0.999
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
+def test_mha_v4_sol_sorted_dispatch_needs_a_row_that_declares_it():
+    """Insisting on sorted dispatch fails loudly where it cannot be honoured.
+
+    Every gfx950 Sol row declares it, so only a non-Sol launch has none to honour.
+    """
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    bf16, none = AttentionFormat.BF16, AttentionScaleMode.NONE
+    with pytest.raises(ValueError, match="sorted_dispatch orders the Sol-Attn launch"):
+        mha_v4_packed(
+            q, q, q, q, q, q, bf16, bf16, bf16, none, none, none, sorted_dispatch=True
+        )
+
+
+@pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
 def test_mha_v4_block_tile_default_is_the_256_row_of_the_named_recipe():
     """Adding geometries must not move a recipe's default: its callers' masks are shaped for it.
 
@@ -1400,9 +2952,10 @@ def test_mha_v4_block_tile_refuses_to_guess_when_the_rows_disagree():
     "q_format, k_format, v_format, mode, expected",
     [
         ("fp8", "fp8", "fp8", MHA_V4_SPARSE_MODE, True),
-        ("BF16", "BF16", "BF16", MHA_V4_SPARSE_MODE, True),
-        ("MXFP4", "MXFP4", "MXFP4", MHA_V4_SPARSE_MODE, True),
-        ("FP8", "FP8", "MXFP6", MHA_V4_SPARSE_MODE, True),
+        ("fp8", "fp8", "fp8", MHA_V4_SOL_MODE, True),
+        ("BF16", "BF16", "BF16", MHA_V4_SOL_MODE, True),
+        ("MXFP4", "MXFP4", "MXFP4", MHA_V4_SOL_MODE, True),
+        ("FP8", "FP8", "MXFP6", MHA_V4_SOL_MODE, True),
         ("MXFP6", "MXFP6", "fp8", MHA_V4_SPARSE_MODE, True),
     ],
 )
@@ -1427,7 +2980,7 @@ def test_mha_v4_ragged_kv_is_false_on_gfx942():
     fp8 = native_fp8_format()
     per_tensor = AttentionScaleMode.F32_PER_TENSOR
     operands = mha_v4_operands(fp8, fp8, fp8, per_tensor, per_tensor, per_tensor)
-    assert not mha_v4_ragged_kv(operands, MHA_V4_SPARSE_MODE)
+    assert not mha_v4_ragged_kv(operands, MHA_V4_SOL_MODE)
 
 
 @pytest.mark.skipif(not _MHA_V4_SPARSE_ARCH, reason="gfx942/gfx950 manifest")
@@ -1541,6 +3094,48 @@ def test_mha_v4_sparse_64x64_honours_a_mask_that_varies_per_query_tile(reversed_
     assert _cosine(out, reference) > 0.999
 
 
+@_requires_sol_row(_SOL_ATTN_FP8, _MHA_V4_FINE_TILE)
+def test_mha_v4_sol_64x64_select_all_matches_dense():
+    """Selecting every block leaves the pooled pass with nothing to correct, so Sol-Attn at 64x64
+    has to reduce to its own exact pass. This is what catches a bitmap grouped for the wrong tile:
+    a misgrouped row would unmask blocks the exact pass already covered and double-count them.
+    """
+    torch.manual_seed(11)
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(k)
+    fp8 = native_fp8_format()
+    dense = mha_v4(q, k, v, fp8, fp8, fp8)
+    # beta=-inf keeps every block, since the threshold is mean + beta * std.
+    sol = mha_v4_sol(
+        q, k, v, fp8, fp8, fp8, beta=float("-inf"), block_tile=_MHA_V4_FINE_TILE
+    )
+    torch.cuda.synchronize()
+    assert torch.isfinite(sol).all()
+    assert _cosine(sol, dense) > 0.999
+
+
+@_requires_sol_row(_SOL_ATTN_FP8, _MHA_V4_FINE_TILE)
+def test_mha_v4_sol_64x64_compiles_without_graph_breaks():
+    """As for the default geometry: naming a non-default tile must not reintroduce the manifest
+    read onto the traced path."""
+    torch.manual_seed(17)
+    q = torch.randn((1, 512, 2, 128), device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(k)
+    fp8 = native_fp8_format()
+
+    def routed(q, k, v):
+        return mha_v4_sol(
+            q, k, v, fp8, fp8, fp8, beta=1.0, block_tile=_MHA_V4_FINE_TILE
+        )
+
+    eager = routed(q, k, v)
+    traced = torch.compile(routed, fullgraph=True)(q, k, v)
+    torch.cuda.synchronize()
+    assert _cosine(traced, eager) > 0.999
+
+
 def _mha_v4_lut_capacity(mode: int, q_tile: int, kv_tile: int) -> int:
     """The lut_max the manifest declares for one block-sparse geometry, or 0 if it has no row.
 
@@ -1562,6 +3157,51 @@ def _mha_v4_lut_capacity(mode: int, q_tile: int, kv_tile: int) -> int:
             ):
                 return int(row["lut_max"])
     return 0
+
+
+@_requires_sol_row(_SOL_ATTN_FP8, _MHA_V4_FINE_TILE)
+def test_mha_v4_sol_rejects_a_key_length_past_the_lut_capacity():
+    """The launcher refuses a key length past the row's lut_max, and accepts one exactly at it.
+
+    The boundary is checked from both sides, because the interesting failure is an off-by-one that
+    rejects a length the kernel handles: the capacity is exactly reachable, a row may select every
+    block, and the pass at capacity is what says so. This row walks its LUT from memory, so lut_max
+    is the manifest's placeholder rather than a staging capacity, and the pass at it is also the
+    longest walk the row can be handed.
+
+    Bounded by the shape rather than by the row's real maximum on purpose -- finding the latter
+    means reading lut_count back from the device on every launch -- so a sequence is refused when
+    any row COULD overrun, whatever this particular mask selected. That is also why one query tile
+    is enough: the bound is on the key length, and self-attention at the placeholder would build a
+    block mask of 2^32 entries.
+    """
+    q_tile, kv_tile = _MHA_V4_FINE_TILE
+    capacity = _mha_v4_lut_capacity(MHA_V4_SOL_MODE, q_tile, kv_tile)
+    assert capacity, "the 64x64 Sol-Attn row must declare a lut_max"
+
+    fp8 = native_fp8_format()
+
+    def run(blocks):
+        q = torch.randn((1, q_tile, 1, 128), device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(
+            (1, blocks * kv_tile, 1, 128), device="cuda", dtype=torch.bfloat16
+        )
+        try:
+            out = mha_v4_sol(
+                q, k, k, fp8, fp8, fp8, beta=1.0, block_tile=_MHA_V4_FINE_TILE
+            )
+            torch.cuda.synchronize()
+            return out
+        finally:
+            del q, k
+            torch.cuda.empty_cache()
+
+    assert torch.isfinite(
+        run(capacity)
+    ).all(), f"{capacity} blocks is exactly the declared capacity and has to run"
+
+    with pytest.raises(RuntimeError, match=f"holds {capacity} LUT entries"):
+        run(capacity + 1)
 
 
 _SPARSE_BENCH_GFX = ["gfx950"]

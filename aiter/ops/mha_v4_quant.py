@@ -55,9 +55,9 @@ MHA_V4_MXFP6_V_PACKED_ROW_BYTES = 96
 MHA_V4_MXFP6_V_TILE_BYTES = MHA_V4_MXFP6_V_TILE_TOKENS * MHA_V4_MXFP6_V_PACKED_ROW_BYTES
 MHA_V4_MXFP6_V_SCALE_TILE_BYTES = 512
 MHA_V4_MXFP6_V_BUFFER_SLACK_BYTES = 256
-# The FP6-P block-sparse kernels gather each V-scale tile one tile ahead through a raw pointer
-# with no record bound, so the last tile of the last (batch, head) reads past the image. A short
-# V is small enough for that read to leave its allocation, so it lands on zeroed slack.
+# The FP6-P block-sparse and Sol-Attn kernels gather each V-scale tile one tile ahead through a raw
+# pointer with no record bound, so the last tile of the last (batch, head) reads past the image.
+# A pooled V is small enough for that read to leave its allocation, so it lands on zeroed slack.
 MHA_V4_MXFP6_FP6_P_V_SCALE_SLACK_BYTES = 1024
 
 
