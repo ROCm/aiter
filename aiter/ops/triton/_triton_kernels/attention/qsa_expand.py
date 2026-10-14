@@ -84,9 +84,9 @@ def _expand_qsa_indices_kernel(
     )
 
 
-VLLM_AMD_QSA_PIN = "836bb3839ffe"
+QSA_EXPAND_PIN = "836bb3839ffe"
 
 __all__ = [
-    "VLLM_AMD_QSA_PIN",
+    "QSA_EXPAND_PIN",
     "_expand_qsa_indices_kernel",
 ]

@@ -181,7 +181,7 @@ def _expand_block_ids(
 ) -> torch.Tensor:
     # Phase 5 owns fusing expand into K1 or K2. Until then this is the
     # vendored expand+tail kernel.
-    from aiter.ops.triton.attention.qsa_vllm_amd import expand_qsa_block_indices_cuda
+    from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices_cuda
 
     return expand_qsa_block_indices_cuda(
         block_ids,

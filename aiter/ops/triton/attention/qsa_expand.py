@@ -7,8 +7,8 @@ from __future__ import annotations
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.attention.qsa_vllm_amd import (
-    VLLM_AMD_QSA_PIN,
+from aiter.ops.triton._triton_kernels.attention.qsa_expand import (
+    QSA_EXPAND_PIN,
     _expand_qsa_indices_kernel,
 )
 
@@ -113,6 +113,6 @@ def expand_qsa_block_indices_cuda(
 
 
 __all__ = [
-    "VLLM_AMD_QSA_PIN",
+    "QSA_EXPAND_PIN",
     "expand_qsa_block_indices_cuda",
 ]

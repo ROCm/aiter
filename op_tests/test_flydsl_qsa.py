@@ -57,7 +57,7 @@ from aiter.ops.flydsl.qsa import (
     qsa_layer,
     span_bytes,
 )
-from aiter.ops.triton.attention.qsa_vllm_amd import expand_qsa_block_indices_cuda
+from aiter.ops.triton.attention.qsa_expand import expand_qsa_block_indices_cuda
 from aiter.test_common import benchmark, checkAllclose, run_perftest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
