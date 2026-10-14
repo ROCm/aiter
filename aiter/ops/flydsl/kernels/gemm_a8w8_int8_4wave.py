@@ -208,8 +208,12 @@ def _mfma_i8(a, b, c):
     )
 
 
-def _mfma_drain():
-    # Covers the XDL-write -> v_accvgpr_read wait states of the last MFMA.
+def _mfma_drain(accs):
+    """Return ``accs`` readable after the XDL-write -> v_accvgpr_read wait states.
+
+    LLVM copies an accumulator out of its AGPRs right at the defining asm, so
+    each one passes through an empty asm placed after the nops.
+    """
     _llvm.inline_asm(
         res=None,
         operands_=[],
@@ -217,6 +221,19 @@ def _mfma_drain():
         constraints="",
         has_side_effects=True,
     )
+    return [
+        [
+            _llvm.inline_asm(
+                res=Vec(acc).ir_value().type,
+                operands_=[Vec(acc).ir_value()],
+                asm_string="",
+                constraints="=a,0",
+                has_side_effects=True,
+            )
+            for acc in row
+        ]
+        for row in accs
+    ]
 
 
 def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
@@ -488,12 +505,11 @@ def compile_int8_gemm_4w(*, K: int, xcd_swizzle: int = 8):
         for t in range_constexpr(2 + 2 * n_pairs, K_ITERS):
             k_tile(t, t % 2, t + 2 < K_ITERS, t + 1 < K_ITERS)
 
-        _mfma_drain()
         store_c = StoreCInt8Rows(
             A_scale, B_scale, C, c_m, c_n, None, WAVE_TILES, WAVE_TILES
         )
         store_c.store_tiles(
-            accs,
+            _mfma_drain(accs),
             block_m * BLOCK_M + wave_m * WAVE_ROWS,
             block_n * BLOCK_N + wave_n * WAVE_ROWS,
         )
