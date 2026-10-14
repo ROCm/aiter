@@ -449,6 +449,9 @@ def precompile_worker(
         ["--precompile", "--configs", todo_file, "--claim", f"{todo_file}.next"],
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
+    stop.wait(
+        0.2 * slot
+    )  # stagger the start: a burst of new GPU contexts strains the driver
     while not stop.is_set():
         outcome = run_worker(
             command + ["--out", out],
