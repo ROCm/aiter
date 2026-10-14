@@ -157,7 +157,7 @@ def make_gemm_a16w16_gfx942_param(
     if block_n % cshuffle_r2g_vec_size != 0:
         raise ValueError("block_n must be divisible by the cshuffle store vector size")
 
-    # LDS budget: two AB tiles per stage.
+    # LDS budget: A tile + B tile, per stage.
     smem_bytes = stages * (block_m + block_n) * block_k * in_dbytes
     if smem_bytes > SMEM_CAPACITY_GFX942:
         raise ValueError(
@@ -629,7 +629,11 @@ def gemm_a16w16_gfx942_kernel(
             rocdl.s_waitcnt(vmcnt=0)
             if const_expr(stages == 1):
                 # single LDS buffer: every wave must finish reading tile k
-                # before tile k+1's ds_write overwrites it.
+                # before tile k+1's ds_write overwrites it. Drain lgkmcnt first
+                # so all of *this* wave's ds_reads have landed (the MFMA issue
+                # only orders reads it consumes; at large block_k the barrier can
+                # otherwise race the ds_write against a not-yet-complete ds_read).
+                rocdl.s_waitcnt(lgkmcnt=0)
                 rocdl.s_barrier()
             # ds_write tile k+1 into LDS (the other buffer when double-buffered)
             commit_ab_to_lds(write_stage)
@@ -881,6 +885,25 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         # per-block occupancy -- not block count -- is the lever here: more blocks
         # (64x64, split-K) and deeper K/wider N were all pinned at ~257us, but
         # 4x4 waves drop it to ~220us (b32: -14%, gm8 marginally > gm16).
+        if k % 128 == 0:
+            # block_k=128 halves the per-tile s_barrier count (K/128 vs K/64),
+            # the dominant stall here. It fits 64 KB only single-buffered
+            # (1*(block_m+block_n)*128*2), so take the buffered (global->reg->LDS)
+            # path, which prefetches one tile ahead. Reverse-engineered from
+            # hipBLASLt's MT*x128 down kernel; MfmaUtil 28.8->36%, M8192 221->211us,
+            # M6144 204->188us (b37). Needs the stages==1 lgkmcnt drain for the
+            # single-buffer WAR hazard at large block_k.
+            if n % 96 == 0:
+                # block_n=96 (mw4 nw2, 512 threads) exactly tiles narrow N=384
+                # (4 n-blocks vs 3 for bn128 -> 256 vs 192 blocks, better fill)
+                # and matches hipBLASLt's MT128x96x128 down kernel. Reproducible
+                # M8192 206->200us, M6144 191->183us vs bn128 (b39, idle GPU6).
+                return dict(block_m=128, block_n=96, block_k=128, stages=1,
+                            split_k=1, m_waves=4, n_waves=2, group_m=8,
+                            buffered_load=True, async_load_bytes=16)
+            return dict(block_m=128, block_n=128, block_k=128, stages=1,
+                        split_k=1, m_waves=4, n_waves=4, group_m=8,
+                        buffered_load=True, async_load_bytes=16)
         return dict(block_m=128, block_n=128, block_k=bk, stages=2, split_k=1,
                     m_waves=4, n_waves=4, group_m=8)
 
