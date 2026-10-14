@@ -77,14 +77,65 @@ def get_occupancy():
     return 2
 
 
-def get_recommended_splits(num_sequences, num_kv_heads, split_kv_blocks=1):
+# Workgroups per CU of the PS decode kernels on gfx950, as reported by the
+# compiler, keyed by the bytes of one padded KV row (head size x element size).
+# Re-check after kernel changes.
+_CDNA4_PS_WORKGROUPS_PER_CU = {64: 4, 128: 3, 256: 2, 512: 1}
+# The PS reduce kernel returns wrong results above 32 partitions.
+_MAX_RECOMMENDED_SPLITS = 32
+
+
+def _floor_power_of_2(n):
+    return 1 << (max(n, 1).bit_length() - 1)
+
+
+def get_recommended_splits(
+    num_sequences,
+    num_kv_heads,
+    split_kv_blocks=1,
+    *,
+    head_size=None,
+    kv_cache_dtype=None,
+    max_context_length=None,
+    context_partition_size=256,
+):
+    """Split-KV partition count (``max_context_partition_num``) for pa_decode_gluon.
+
+    Without ``head_size`` and ``kv_cache_dtype``, or off CDNA4, the count fills
+    two workgroups per CU and is capped at 8.
+
+    With both on CDNA4 it is the larger of two powers of two: the largest that
+    keeps every workgroup resident at the kernel's occupancy for that KV row
+    size, and the count above rounded up, whose oversubscription evens out
+    batches with varied context lengths. The result is capped at 32 and, given
+    ``max_context_length``, at the number of context partitions the longest
+    sequence fills. Callers whose grid is fixed at CUDA-graph capture can omit
+    ``max_context_length``.
+    """
+    if (head_size is None) != (kv_cache_dtype is None):
+        raise ValueError("head_size and kv_cache_dtype must be given together")
     props = torch.cuda.get_device_properties()
-    num_sm = props.multi_processor_count * get_occupancy()
-    max_context_partition_num = triton.cdiv(
-        num_sm, num_sequences * num_kv_heads * split_kv_blocks
+    num_seq_heads = num_sequences * num_kv_heads * split_kv_blocks
+    original_splits = triton.cdiv(
+        props.multi_processor_count * get_occupancy(), num_seq_heads
     )
-    max_context_partition_num *= split_kv_blocks
-    return min(max_context_partition_num, 8)
+    if head_size is None or get_cdna_version() != 4:
+        return min(original_splits * split_kv_blocks, 8)
+
+    row_bytes = triton.next_power_of_2(head_size) * kv_cache_dtype.itemsize
+    occupancy = _CDNA4_PS_WORKGROUPS_PER_CU[min(max(row_bytes, 64), 512)]
+    resident_splits = props.multi_processor_count * occupancy // num_seq_heads
+    original_splits = min(original_splits, max(1, 8 // split_kv_blocks))
+    sequence_splits = max(
+        _floor_power_of_2(resident_splits), triton.next_power_of_2(original_splits)
+    )
+    limit = _MAX_RECOMMENDED_SPLITS // split_kv_blocks
+    if max_context_length is not None:
+        limit = min(
+            limit,
+            triton.cdiv(max_context_length, context_partition_size * split_kv_blocks),
+        )
+    return _floor_power_of_2(min(sequence_splits, limit)) * split_kv_blocks
 
 
 DS_WRITE = gl.constexpr(0x200)
@@ -1447,9 +1498,15 @@ def paged_attention_decode_sliding_window_head_1(
         sequence_partition_start_idx = local_partition_start_idx + block_split_idx
         sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
+        # Whole partitions per split: a partition shared by two splits would be
+        # loaded twice. Trailing splits may be empty and return early.
+        split_alignment: gl.constexpr = (
+            CONTEXT_PARTITION_SIZE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
         )
+        page_size = gl.cdiv(page_size, split_alignment) * split_alignment
         sequence_start_idx = page_size * sequence_split_idx
 
         sequence_end_idx = gl.minimum(context_length, page_size + sequence_start_idx)
@@ -2537,9 +2594,15 @@ def paged_attention_decode_sliding_window(
         sequence_partition_start_idx = local_partition_start_idx + block_split_idx
         sequence_partition_end_idx = local_partition_end_idx + block_split_idx
     else:
+        # Whole partitions per split: a partition shared by two splits would be
+        # loaded twice. Trailing splits may be empty and return early.
+        split_alignment: gl.constexpr = (
+            CONTEXT_PARTITION_SIZE * CONTEXT_PARTITION_SIZE_PER_BLOCK
+        )
         page_size = gl.cdiv(
             context_length, gl.num_programs(2) // CONTEXT_PARTITION_SIZE_PER_BLOCK
         )
+        page_size = gl.cdiv(page_size, split_alignment) * split_alignment
         sequence_start_idx = page_size * sequence_split_idx
 
         sequence_end_idx = gl.minimum(
