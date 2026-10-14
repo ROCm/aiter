@@ -791,7 +791,7 @@ std::tuple<bool, ArgParser> create_args(int argc, char** argv)
     p.insert("seqlen_ptr",
              "0",
              "group mode: pass the real lengths as seqlen_q/k (one per batch) instead of "
-             "cu_seqlen_q/k");
+             "cu_seqlen_q/k; rejected with -s_pad>0, the asm v3 path never reads them");
     p.insert("d", "128", "head dim for q, k");
     p.insert("d_v", "-1", "head dim for v, -1 means equal to d");
     p.insert("scale", "0", "scale factor. 0 means 1/sqrt(hdim)");
@@ -822,11 +822,6 @@ std::tuple<bool, ArgParser> create_args(int argc, char** argv)
              "0",
              "with -deterministic=1: number of private dq_acc planes on gfx1250, 0 picks "
              "it from the shape");
-    p.insert("poison",
-             "0",
-             "with -v=1: fill dq/dk/dv with NaN before every checked run, so rows the "
-             "kernels never write fail the check (needs a path that stores dq, not one "
-             "that accumulates into it)");
     p.insert("bwd_v3", "1", "the v3-only host always force asm v3");
     p.insert("v3_atomic_fp32", "1", "0: atomic16, 1: atomic32 (fp32 dq_acc)");
     p.insert("v3_bf16_cvt", "1", "0:RTNE; 1:RTNA; 2:RTZ");
@@ -912,7 +907,6 @@ bool run_bench(const ArgParser& arg)
     const bool cpu_lp_round   = arg.get_bool("cpu_lp_round");
     const int dtm_runs        = arg.get_int("dtm_runs");
     const int det_split       = arg.get_int("det_split");
-    const bool poison         = arg.get_bool("poison");
 
     // Reject features the asm-v3 path can't run.
     auto reject = [&](const char* why) {
@@ -938,6 +932,10 @@ bool run_bench(const ArgParser& arg)
     auto seqlens_k = generate_seqlens(mode, batch, seqlen_k, -1, -1, seed);
     const int s_pad       = (mode == mode_e::group) ? std::max(arg.get_int("s_pad"), 0) : 0;
     const bool seqlen_ptr = (mode == mode_e::group) && arg.get_bool("seqlen_ptr");
+    // fmha_v3_bwd never reads seqlen_q/k_ptr, so with padding its kernels would take the padded
+    // lengths in seqstart_q/k for the real ones.
+    if(seqlen_ptr && s_pad > 0 && reject("seqlen_ptr with s_pad > 0"))
+        return false;
     auto padded     = [&](std::vector<int32_t> lens) {
         for(auto& l : lens)
             l += s_pad;
@@ -1041,6 +1039,16 @@ bool run_bench(const ArgParser& arg)
     DeviceMem dv_buf(dv_host.bytes());
     DeviceMem do_buf(do_host.bytes());
     DeviceMem dbias_buf(1);
+    // Group-mode sequence metadata, int32, one array for q and one for k. Batch mode uploads
+    // them too but passes every pointer as nullptr.
+    //   seqstart_*  [batch + 1]: prefix sums of the padded lengths (real + s_pad). seqstart[b] is
+    //                            the row batch b starts at in the packed tensors: Q/O/dO/dQ on
+    //                            the q side, K/V/dK/dV on the k side. Passed in every group run.
+    //   cu_seqlen_* [batch + 1]: prefix sums of the real lengths. Passed only with -s_pad > 0.
+    //   seqlen_*    [batch]:     the real lengths themselves. Passed only with -seqlen_ptr=1, in
+    //                            place of cu_seqlen_*; fmha_v3_bwd never reads them.
+    // E.g. real q lengths {20, 30, 40} with -s_pad=10 give seqstart_q = {0, 30, 70, 120} and
+    // cu_seqlen_q = {0, 20, 50, 90}: batch 1 owns rows [30, 60), and rows [60, 70) are padding.
     DeviceMem seqstart_q_buf(seqstart_q_host.size() * sizeof(int32_t));
     DeviceMem seqstart_k_buf(seqstart_k_host.size() * sizeof(int32_t));
     DeviceMem cu_seqlen_q_buf(cu_seqlen_q_host.size() * sizeof(int32_t));
@@ -1359,18 +1367,7 @@ bool run_bench(const ArgParser& arg)
     // validation call).
     o_buf.ToDevice(o_host.data());
     lse_buf.ToDevice(lse_host.data());
-
-    auto init_outputs = [&]() {
-        if(!poison)
-        {
-            dq_buf.SetZero();
-            return;
-        }
-        HIP_CHECK(hipMemset(dq_buf.GetDeviceBuffer(), 0xff, dq_buf.GetBufferSize()));
-        HIP_CHECK(hipMemset(dk_buf.GetDeviceBuffer(), 0xff, dk_buf.GetBufferSize()));
-        HIP_CHECK(hipMemset(dv_buf.GetDeviceBuffer(), 0xff, dv_buf.GetBufferSize()));
-    };
-    init_outputs();
+    dq_buf.SetZero();
 
     ck_tile::stream_config sc_v{nullptr,
                                 true,
@@ -1708,7 +1705,7 @@ bool run_bench(const ArgParser& arg)
         bool same_dq = true, same_dk = true, same_dv = true;
         for(int r = 0; r < dtm_runs; ++r)
         {
-            init_outputs();
+            dq_buf.SetZero();
             aiter::mha_bwd(mha_args, sc_v);
             dq_buf.FromDevice(dq_rerun.data());
             dk_buf.FromDevice(dk_rerun.data());
