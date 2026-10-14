@@ -1,14 +1,21 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Host launch for the exact one-shot (1-stage) all-reduce."""
+"""Host launch for the exact one-shot (1-stage) all-reduce.
+
+Public types ``OneShotAllReduce`` (plain) and ``OneShotAllReduceRMSNorm``
+(fused with residual-add + RMSNorm). Decode-only by policy: one round and no
+grid-wide barrier, paid for with ``(N-1)*S`` of wire volume against the
+mesh's ``2(N-1)/N*S``.
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import torch
-from flydsl.expr.typing import Int32, Int64, Stream
+from flydsl.expr.typing import Float32, Int32, Int64, Stream
 
 from .allreduce_host_shared import (
     _cuda_index,
@@ -21,14 +28,34 @@ from .allreduce_host_shared import (
     payload_probes,
     require_arch,
 )
-from .allreduce_policy import oneshot_ladder, resolve_family_policy, resolve_link
+from .allreduce_policy import (
+    accuracy_mode,
+    fused_oneshot_ladder,
+    oneshot_ladder,
+    resolve_family_policy,
+    resolve_fused_policy,
+    resolve_link,
+)
 from .kernels.comm.allreduce_shared import (
     AllReduceAlgorithm,
+    FusedOneShotRung,
     OneShotRung,
     select_rung,
 )
 from .kernels.comm.one_shot_allreduce import (
+    DEFAULT_ATOMS,
+    DEFAULT_FANOUT,
+    DEFAULT_GRID_CAP,
+    DEFAULT_SPLIT,
+    SUPPORTED_ATOMS,
+    SUPPORTED_SPLITS,
+    fused_block_options,
+    fused_padded_block_options,
+    fused_split_options,
     make_one_shot_allreduce_kernel,
+)
+from .kernels.comm.quick_allreduce_fusions import (
+    PAD_MASK_MAX_BYTES as _PAD_MASK_MAX_BYTES,
 )
 from .kernels.tensor_shim import _preload_compiled, _run_compiled
 
@@ -46,6 +73,21 @@ def resolve_oneshot_max_bytes(
     window = resolve_family_policy(
         world_size=int(world_size), arch=arch, link=link
     ).window(AllReduceAlgorithm.OneShot, quantized=False)
+    return 0 if window is None else window.inclusive_range()[1]
+
+
+def resolve_fused_oneshot_max_bytes(
+    *, world_size: int, link: str | None = None, arch: str | None = None
+) -> int:
+    """Largest payload the fused one-shot should be asked to move, inclusive.
+
+    The maximum of the one-shot window of this rank's fused policy in the
+    current ``AITER_FLY_AR_ACCURACY`` mode, with the environment overrides
+    applied.
+    """
+    window = resolve_fused_policy(
+        world_size=int(world_size), arch=arch, link=link
+    ).window(AllReduceAlgorithm.OneShot, quantized=accuracy_mode() == "fast")
     return 0 if window is None else window.inclusive_range()[1]
 
 
@@ -196,6 +238,14 @@ class OneShotAllReduce:
             Int64(int(eng._gpu_peer_ptrs)),
             Int64(int(eng._colors)),
             Int32(grid_x),
+            # The fused epilogue's operands, then the split build's exchange
+            # state. One kernel signature serves both modes (see the factory),
+            # and a plain build's ``const_expr(fused)`` arms never read these.
+            Int64(0),
+            Int64(0),
+            Int64(0),
+            Float32(0.0),
+            Int64(0),
             stream,
         )
 
@@ -267,6 +317,535 @@ class OneShotAllReduce:
                 "override."
             )
         self._launch(inp, out, stream, live_bytes=live_bytes)
+
+    def close(self):
+        engines = getattr(self, "_by_cfg", None)
+        if not engines:
+            return
+        with torch.cuda.device(self._device_index):
+            if getattr(self, "_has_launched", False):
+                torch.cuda.synchronize(self._device_index)
+                self._has_launched = False
+            for eng, _ in engines.values():
+                eng.close()
+            engines.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:  # noqa: BLE001
+            # Destructors must not raise, especially during interpreter shutdown.
+            return
+
+
+class OneShotAllReduceRMSNorm:
+    """One-shot all-reduce fused with residual-add and RMSNorm.
+
+    Per token row:
+
+        acc = sum_r input_r            (fp32, rank order)
+        acc = float(bf16(acc))         (deliberate: matches the unfused path)
+        acc += residual_in
+        residual_out = bf16(acc)
+        out = bf16(acc * rsqrt(sum(acc^2)/hidden + eps) * weight)
+
+    Unlike ``OneShotAllReduce`` the wire layout depends on ``hidden``, because
+    the tile is pinned to one token row so the norm's reduction fits in one
+    workgroup. A new hidden therefore needs a new engine, and building one is a
+    collective (IPC handle exchange). Engines are built lazily on first use,
+    which is safe because TP ranks enter a collective with the same shape in
+    lockstep; pass ``hiddens=(...)`` to build them up front instead.
+
+    Same tuning surface as ``OneShotAllReduce`` with one difference. ``block``
+    is not free: the row has to fit one workgroup, so ``block * atoms * 8 ==
+    hidden`` and picking either of ``atoms``/``block`` picks the other.
+
+    ``split`` spreads each row over that many workgroups instead (``block *
+    atoms * 8 * split == hidden``), which joins the row's sum of squares through
+    one HBM exchange word; at decode sizes one workgroup per row leaves most of
+    the GPU idle. It overrides every ladder rung rather than pinning one. A width with no split geometry for the requested value takes
+    the nearest one it has, and a padded width runs unsplit.
+    """
+
+    def __init__(
+        self,
+        *,
+        group,
+        device,
+        rank: int,
+        world_size: int,
+        atoms: int | None = None,
+        grid_cap: int | None = None,
+        inbox_memory: str = "auto",
+        fanout: str | None = None,
+        block: int | None = None,
+        max_bytes: int | None = None,
+        link: str | None = None,
+        hiddens: tuple[int, ...] = (),
+        split: int | None = None,
+    ):
+        check_world_size(world_size)
+        link = resolve_link(link)
+        self.link = link
+        pinned = (
+            atoms is not None
+            or grid_cap is not None
+            or fanout is not None
+            or block is not None
+        )
+        if atoms is not None and atoms not in SUPPORTED_ATOMS:
+            raise ValueError(f"atoms must be one of {SUPPORTED_ATOMS}, got {atoms!r}")
+        if split is not None and int(split) not in SUPPORTED_SPLITS:
+            raise ValueError(f"split must be one of {SUPPORTED_SPLITS}, got {split!r}")
+        if block is not None and atoms is not None:
+            raise ValueError(
+                f"pin atoms or block, not both: block={block} and atoms={atoms} "
+                "are the same knob here (block * atoms * 8 == hidden)"
+            )
+        if grid_cap is not None and int(grid_cap) < 1:
+            raise ValueError(f"grid_cap must be positive, got {grid_cap}")
+        _validate_ipc_process_group(
+            group,
+            rank=int(rank),
+            world_size=world_size,
+            owner="OneShotAllReduceRMSNorm",
+        )
+        arch = require_arch(owner="OneShotAllReduceRMSNorm")
+
+        inbox_flags, resolved_inbox = _resolve_inbox_flags(
+            inbox_memory, world_size, link
+        )
+        self._device_index = _cuda_index(device, owner="OneShotAllReduceRMSNorm")
+        self.group = group
+        self.device = torch.device("cuda", self._device_index)
+        self._has_launched = False
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.inbox_memory = resolved_inbox
+        self._inbox_flags = inbox_flags
+        self.max_bytes = (
+            resolve_fused_oneshot_max_bytes(world_size=world_size, link=link, arch=arch)
+            if max_bytes is None
+            else int(max_bytes)
+        )
+        self.block = None if block is None else int(block)
+
+        # ``split`` overrides every rung, and ``grid_cap`` caps every rung.
+        k = None if split is None else int(split)
+        if pinned:
+            self._ladder = (
+                FusedOneShotRung(
+                    min_bytes=0,
+                    atoms=DEFAULT_ATOMS if atoms is None else int(atoms),
+                    grid_cap=DEFAULT_GRID_CAP if grid_cap is None else int(grid_cap),
+                    fanout=DEFAULT_FANOUT if fanout is None else fanout,
+                    split=DEFAULT_SPLIT if k is None else k,
+                ),
+            )
+        else:
+            self._ladder = tuple(
+                dataclasses.replace(
+                    rung,
+                    grid_cap=(
+                        rung.grid_cap
+                        if grid_cap is None
+                        else min(rung.grid_cap, int(grid_cap))
+                    ),
+                    split=rung.split if k is None else k,
+                )
+                for rung in fused_oneshot_ladder(
+                    world_size=world_size, link=link, arch=arch
+                )
+            )
+        self.split = self._ladder[0].split
+
+        # (hidden, atoms, grid_cap, fanout, h_pad, split) -> (engine, spec)
+        self._by_cfg: dict[tuple, tuple] = {}
+        try:
+            for h in sorted({int(x) for x in hiddens}):
+                self._build_hidden(h)
+        except Exception:
+            self.close()
+            raise
+
+    # -- engine construction -------------------------------------------------
+
+    @staticmethod
+    def _nearest(legal, want: int) -> int:
+        """*want* if legal, else the nearest legal value, ties to the smaller."""
+        want = int(want)
+        return want if want in legal else min(legal, key=lambda v: (abs(v - want), v))
+
+    def _split_geom_for(self, hidden: int, rung_atoms: int, rung_split: int):
+        """``(atoms, hidden, split)`` for a split rung, or None to run unsplit.
+
+        Only native widths split. The requested split resolves to the nearest
+        one this width has (7168 has {2, 7, 14}); then ``atoms`` resolves as in
+        ``_geom_for``, or from a pinned ``block``, which is then the slice's.
+        """
+        opts = [o for o in fused_split_options(hidden) if o[0] > 1]
+        if self.block:
+            opts = [o for o in opts if o[1] == self.block]
+        if not opts:
+            return None
+        split = self._nearest(sorted({k for k, _b, _a in opts}), rung_split)
+        atoms = self._nearest([a for k, _b, a in opts if k == split], rung_atoms)
+        return atoms, hidden, split
+
+    def _geom_for(
+        self, hidden: int, rung_atoms: int, rung_split: int = DEFAULT_SPLIT
+    ) -> tuple[int, int, int]:
+        """``(atoms, h_pad, split)`` for a rung at hidden dim.
+
+        A split rung takes a split geometry if the width has one
+        (``_split_geom_for``) and otherwise runs unsplit. Unsplit, a width with
+        a native geometry resolves exactly and ``h_pad == hidden``. A width that
+        native geometry cannot cover falls to the padded set, where the pad
+        leads. ``fused_padded_block_options`` is ordered by ascending ``h_pad``,
+        so this takes the least wire volume available and only then uses the
+        rung's ``atoms`` to break the tie.
+        """
+        hidden = int(hidden)
+        if int(rung_split) > 1:
+            geom = self._split_geom_for(hidden, rung_atoms, rung_split)
+            if geom is not None:
+                return geom
+        native = fused_block_options(hidden)
+        if self.block:
+            native_atoms = next((a for b, a in native if b == self.block), None)
+            if native_atoms is not None:
+                return native_atoms, hidden, 1
+        elif native:
+            return self._nearest([a for _b, a in native], rung_atoms), hidden, 1
+
+        opts = fused_padded_block_options(hidden)
+        if self.block:
+            pinned = [o for o in opts if o[0] == self.block]
+            if pinned:
+                return pinned[0][1], pinned[0][2], 1
+        elif opts:
+            least_pad = opts[0][2]
+            tied = [o for o in opts if o[2] == least_pad]
+            _b, atoms, h_pad = min(
+                tied, key=lambda o: (abs(o[1] - int(rung_atoms)), o[1])
+            )
+            return atoms, h_pad, 1
+
+        # No geometry at all -- or a pinned block padding cannot reach. Returning
+        # the rung's own atoms lets the build raise with the message that names
+        # the constraint that failed.
+        return int(rung_atoms), hidden, 1
+
+    def _cfg_key(self, hidden: int, rung: tuple) -> tuple:
+        """A ladder rung's engine key at *hidden*.
+
+        A split build's grid cap is rounded down to a multiple of its split --
+        a row group is ``split`` consecutive workgroups and all of them must be
+        launched -- so a cap of 64 runs 63 workgroups at split=7.
+        """
+        atoms, h_pad, split = self._geom_for(hidden, rung.atoms, rung.split)
+        cap = max(split, int(rung.grid_cap) // split * split)
+        return (int(hidden), atoms, cap, rung.fanout, h_pad, split)
+
+    def _build_hidden(self, hidden: int) -> None:
+        """Build every rung for hidden dim. Collective: all ranks must call it in
+        the same order,."""
+        for rung in self._ladder:
+            key = self._cfg_key(hidden, rung)
+            if key in self._by_cfg:
+                continue
+            spec = make_one_shot_allreduce_kernel(
+                world_size=self.world_size,
+                atoms=key[1],
+                grid=key[2],
+                inbox_memory=self.inbox_memory,
+                fanout=key[3],
+                rank=self.rank,
+                fusion="rmsnorm",
+                hidden=key[0],
+                h_pad=key[4],
+                split=key[5],
+            )
+            with torch.cuda.device(self._device_index):
+                self._by_cfg[key] = (
+                    _StEngine(
+                        spec=spec,
+                        group=self.group,
+                        rank=self.rank,
+                        world_size=self.world_size,
+                        inbox_flags=self._inbox_flags,
+                    ),
+                    spec,
+                )
+
+    def _pick_cfg(self, hidden: int, live_bytes: int) -> tuple:
+        key = self._cfg_key(hidden, select_rung(self._ladder, live_bytes))
+        if key not in self._by_cfg:
+            self._build_hidden(int(hidden))
+        return key
+
+    @property
+    def inbox_bytes(self) -> int:
+        """IPC inbox bytes this object holds on this rank, across every engine."""
+        return sum(eng.buf_bytes for eng, _ in self._by_cfg.values())
+
+    @property
+    def hiddens(self) -> tuple[int, ...]:
+        return tuple(sorted({k[0] for k in self._by_cfg}))
+
+    def supports_hidden(self, hidden: int) -> bool:
+        """Whether any build exists for hidden dim, padded and split ones included.
+
+        A split rung counts when ``_split_geom_for`` resolves it. With a pinned
+        ``block`` that is the slice's width, which the unsplit sets below need
+        not list: 4096 at ``block=64`` exists only as a split build.
+        """
+        hidden = int(hidden)
+        if any(
+            r.split > 1 and self._split_geom_for(hidden, r.atoms, r.split) is not None
+            for r in self._ladder
+        ):
+            return True
+        if self.block is not None:
+            if any(b == self.block for b, _ in fused_block_options(hidden)):
+                return True
+            return any(
+                b == self.block for b, _a, _h in fused_padded_block_options(hidden)
+            )
+        if fused_block_options(hidden):
+            return True
+        return bool(fused_padded_block_options(hidden))
+
+    def pads_hidden(self, hidden: int) -> int:
+        """``h_pad`` this width would run at, or hidden dim when it needs no padding."""
+        first = self._ladder[0]
+        return self._geom_for(int(hidden), first.atoms, first.split)[1]
+
+    # -- launch --------------------------------------------------------------
+
+    def _check(self, inp, residual_in, weight, out, residual_out):
+        tensors = {
+            "inp": inp,
+            "residual_in": residual_in,
+            "weight": weight,
+            "out": out,
+            "residual_out": residual_out,
+        }
+        for name, t in tensors.items():
+            if not isinstance(t, torch.Tensor):
+                raise TypeError(f"OneShotAllReduceRMSNorm requires a Tensor for {name}")
+            if t.dtype != torch.bfloat16:
+                raise ValueError(
+                    f"OneShotAllReduceRMSNorm is bf16-only, {name} is {t.dtype}"
+                )
+            if not t.is_cuda or t.device.index != self._device_index:
+                raise ValueError(
+                    f"{name} must be on cuda:{self._device_index}, got {t.device}"
+                )
+            if not t.is_contiguous():
+                raise ValueError(f"{name} must be contiguous")
+            if int(t.data_ptr()) % 16 != 0:
+                raise ValueError(f"{name} must be 16-byte aligned")
+
+        hidden = int(inp.shape[-1])
+        if weight.numel() != hidden:
+            raise ValueError(
+                f"weight width {weight.numel()} does not match input width {hidden}"
+            )
+        if tuple(residual_in.shape) != tuple(inp.shape):
+            raise ValueError(
+                f"residual_in shape {tuple(residual_in.shape)} != inp {tuple(inp.shape)}"
+            )
+        if tuple(out.shape) != tuple(inp.shape) or tuple(residual_out.shape) != tuple(
+            inp.shape
+        ):
+            raise ValueError("out/residual_out must have the input's shape")
+        if not self.supports_hidden(hidden):
+            pin = (
+                f"block={self.block}"
+                if self.block is not None
+                else f"atoms={[r.atoms for r in self._ladder]}"
+            )
+            raise ValueError(
+                f"no fused build for hidden={hidden} at {pin}: one block "
+                "covers one row, so hidden/(8*atoms) must be a multiple of 64 and "
+                f"at most 1024 -- the legal (block, atoms) pairs for this width "
+                f"are {fused_block_options(hidden)}"
+            )
+        live_bytes = int(inp.numel()) * 2
+        if live_bytes > 0xFFFFFFFF:
+            raise ValueError("payload must not exceed the 4 GiB buffer window")
+        if live_bytes > _PAD_MASK_MAX_BYTES and self.pads_hidden(hidden) != hidden:
+            raise ValueError(
+                f"a padded fused build (hidden={hidden} runs at "
+                f"h_pad={self.pads_hidden(hidden)}) masks its pad lanes with an "
+                f"offset of {_PAD_MASK_MAX_BYTES} B, so the payload must not "
+                f"exceed that; got {live_bytes} B"
+            )
+        # Distinct destinations: the kernel writes out and residual_out from the
+        # same thread and reads residual_in after, so aliasing any pair is a race.
+        spans = [
+            (int(t.data_ptr()), int(t.data_ptr()) + live_bytes)
+            for t in (inp, residual_in, out, residual_out)
+        ]
+        for i in range(len(spans)):
+            for j in range(i + 1, len(spans)):
+                if max(spans[i][0], spans[j][0]) < min(spans[i][1], spans[j][1]):
+                    raise ValueError(
+                        "inp/residual_in/out/residual_out must not overlap"
+                    )
+        return hidden, live_bytes
+
+    def _launch_args(self, eng, spec, ptrs, eps, stream, *, hidden, live_bytes):
+        """Kernel arguments. *ptrs* is ``(inp, out, residual_in, residual_out,
+        weight)`` as raw addresses."""
+        inp_ptr, out_ptr, res_in_ptr, res_out_ptr, w_ptr = ptrs
+        num_tiles, grid_x = self._tiles_and_grid(spec, hidden, live_bytes)
+        if stream is None:
+            stream = Stream(torch.cuda.current_stream(self._device_index))
+        elif not isinstance(stream, Stream):
+            stream = Stream(stream)
+        return (
+            Int32(self.rank),
+            Int64(live_bytes),
+            Int32(num_tiles),
+            Int64(inp_ptr),
+            Int64(out_ptr),
+            Int64(int(eng._gpu_peer_ptrs)),
+            Int64(int(eng._colors)),
+            Int32(grid_x),
+            Int64(res_in_ptr),
+            Int64(res_out_ptr),
+            Int64(w_ptr),
+            Float32(float(eps)),
+            Int64(int(eng._xchg)),
+            stream,
+        )
+
+    @staticmethod
+    def _tiles_and_grid(spec, hidden: int, live_bytes: int) -> tuple[int, int]:
+        """``(num_tiles, grid_x)`` for a launch.
+
+        A split build views the ``(M, hidden)`` operands as ``(M*split,
+        hidden/split)``, so it has ``split`` tiles per token, and launches whole
+        row groups: a group whose workgroups were not all launched would wait
+        forever on the missing ones' contributions.
+        """
+        split = int(spec.get("split", 1))
+        tokens = live_bytes // (int(hidden) * 2)
+        grid_x = max(1, min(tokens, spec["grid"] // split)) * split
+        assert grid_x % split == 0 and grid_x <= spec["grid"], (grid_x, split)
+        return tokens * split, grid_x
+
+    def _launch(
+        self,
+        inp,
+        residual_in,
+        weight,
+        eps,
+        out,
+        residual_out,
+        stream,
+        *,
+        hidden,
+        live_bytes,
+    ):
+        eng, spec = self._by_cfg[self._pick_cfg(hidden, live_bytes)]
+        ptrs = tuple(
+            int(t.data_ptr()) for t in (inp, out, residual_in, residual_out, weight)
+        )
+        args = self._launch_args(
+            eng, spec, ptrs, eps, stream, hidden=hidden, live_bytes=live_bytes
+        )
+        self._has_launched = True
+        with torch.cuda.device(self._device_index):
+            _run_compiled(eng.launch, *args)
+
+    def allreduce_rmsnorm(
+        self,
+        inp,
+        residual_in,
+        weight,
+        eps,
+        *,
+        out=None,
+        residual_out=None,
+        stream=None,
+    ):
+        """``(out, residual_out)``; both are allocated when not supplied."""
+        if out is None:
+            out = torch.empty_like(inp)
+        if residual_out is None:
+            residual_out = torch.empty_like(residual_in)
+        hidden, live_bytes = self._check(inp, residual_in, weight, out, residual_out)
+        if not self.is_beneficial(live_bytes):
+            raise ValueError(
+                f"OneShotAllReduceRMSNorm got a {live_bytes} B payload, above the "
+                f"{self.max_bytes} B ceiling: this schedule pushes the whole payload "
+                "to every peer, so its wire volume is (N-1)x the message. Pass "
+                "max_bytes to override."
+            )
+        self._launch(
+            inp,
+            residual_in,
+            weight,
+            eps,
+            out,
+            residual_out,
+            stream,
+            hidden=hidden,
+            live_bytes=live_bytes,
+        )
+        return out, residual_out
+
+    def cfgs_for(self, hidden: int, lo: int, hi: int) -> list[tuple]:
+        """``_by_cfg`` keys at hidden dim a payload of ``lo..hi`` bytes
+        (inclusive) can select, in build order. Builds the width if needed."""
+        hidden = int(hidden)
+        floors = [rung.min_bytes for rung in self._ladder]
+        picked = {self._pick_cfg(hidden, n) for n in payload_probes(floors, lo, hi)}
+        return [key for key in self._by_cfg if key in picked]
+
+    def preload(self, hidden: int, *, payload_range=None) -> None:
+        """Build hidden dim and JIT-compile its rung binaries without launching
+        any of them.
+
+        ``payload_range=(lo, hi)`` takes only the rungs ``allreduce_rmsnorm``
+        would run for a payload of ``lo..hi`` bytes (inclusive); ``None`` takes
+        every one. The build still covers the whole ladder: a width's engines
+        are built together.
+
+        A collective only when hidden dim is not built yet, since building
+        exchanges IPC handles, so every rank must call it with the same widths
+        in the same order. The compile itself is local. ``FlyDSLAllReduceRMSNorm``
+        calls it via ``preload_fly_engines`` to keep the JIT off the first real
+        call, which may be inside a HIP graph capture. The HIP module load
+        still happens on each binary's first launch.
+        """
+        hidden = int(hidden)
+        self._build_hidden(hidden)
+        if payload_range is None:
+            keys = [key for key in self._by_cfg if key[0] == hidden]
+        else:
+            keys = self.cfgs_for(hidden, *payload_range)
+        for key in keys:
+            eng, spec = self._by_cfg[key]
+            args = self._launch_args(
+                eng, spec, (0,) * 5, 0.0, None, hidden=hidden, live_bytes=0
+            )
+            _preload_compiled(eng.launch, *args)
+
+    def variant(self, hidden: int, nbytes: int) -> str:
+        """``<jit symbol>/g<grid_cap>/x<grid_x>`` for this (hidden, payload)."""
+        key = self._pick_cfg(int(hidden), int(nbytes))
+        eng, spec = self._by_cfg[key]
+        # The symbol names a split build (``_k<split>``); grid_x counts its
+        # workgroups, ``split`` per token.
+        _tiles, grid_x = self._tiles_and_grid(spec, int(hidden), int(nbytes))
+        return f"{kernel_symbol(eng.launch)}/g{key[2]}/x{grid_x}"
+
+    def is_beneficial(self, nbytes: int) -> bool:
+        return int(nbytes) <= self.max_bytes
 
     def close(self):
         engines = getattr(self, "_by_cfg", None)

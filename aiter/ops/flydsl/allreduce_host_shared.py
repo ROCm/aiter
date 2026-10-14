@@ -94,6 +94,8 @@ class _StEngine:
         self._meta_ptr = None
         self._gpu_peer_ptrs = None
         self._colors = None
+        # Split-build exchange state inside the meta block; 0 when there is none.
+        self._xchg = 0
         # Setup has two collectives, the handle exchange and a final agreement.
         # A rank that fails must still take part in both, and report the
         # failure through them. If it raised at once, its peers would wait in a
@@ -151,7 +153,15 @@ class _StEngine:
         # and by this rank's own kernel, never by a peer. Stays uncached in
         # every mode -- no cross-GPU visibility question, and it is a few
         # KiB.
-        self._meta_ptr = UncachedIpcHeap.alloc_uncached(peer_bytes + color_bytes)
+        #
+        # A split fused one-shot's exchange words and per-workgroup ``prev``
+        # values follow, line-aligned after the colours. Like them, only this
+        # rank's own kernel touches it; ``alloc`` zeroes it, and zero words with
+        # zero ``prev`` are a consistent start.
+        xchg_bytes = int(self.spec.get("xchg_bytes", 0))
+        xchg_off = (peer_bytes + color_bytes + 127) // 128 * 128
+        meta_bytes = xchg_off + xchg_bytes if xchg_bytes else peer_bytes + color_bytes
+        self._meta_ptr = UncachedIpcHeap.alloc_uncached(meta_bytes)
         self._gpu_peer_ptrs = self._meta_ptr
         self._colors = self._meta_ptr + peer_bytes
         UncachedIpcHeap.copy_host_to_device(
@@ -164,6 +174,8 @@ class _StEngine:
             (ctypes.c_int32 * self.grid)(*([1] * self.grid)),
             color_bytes,
         )
+        if xchg_bytes:
+            self._xchg = self._meta_ptr + xchg_off
 
     def close(self):
         for b in self._peer_bases:
@@ -181,6 +193,7 @@ class _StEngine:
             self._meta_ptr = None
             self._gpu_peer_ptrs = None
             self._colors = None
+            self._xchg = 0
         if self._buf_ptr:
             try:
                 UncachedIpcHeap.free_device_mem(self._buf_ptr)

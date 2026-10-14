@@ -13,13 +13,14 @@ node.
 | `quick_allreduce_ring.py` | The quantized two-shot **ring** kernel. |
 | `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `allreduce_shared.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
+| `quick_allreduce_fusions.py` | The fused residual-add + RMSNorm epilogue and the row-to-workgroup geometry. All three kernels use them when built with `fusion="rmsnorm"`. |
 
 The host classes are in `aiter/ops/flydsl/`:
 
 | File | Contents |
 |---|---|
-| `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
-| `quick_allreduce.py` | `FlyQuickAllReduce`, the host class for the mesh and the ring. |
+| `one_shot_allreduce.py` | `OneShotAllReduce` and `OneShotAllReduceRMSNorm`, the host classes for the one-shot kernel. |
+| `quick_allreduce.py` | `FlyQuickAllReduce` and `FlyQuickAllReduceRMSNorm`, the host classes for the mesh and the ring. |
 | `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders. |
 | `allreduce_host_shared.py` | IPC inbox setup, link detection and other host helpers. |
 

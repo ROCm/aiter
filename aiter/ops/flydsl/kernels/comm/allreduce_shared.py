@@ -30,6 +30,10 @@ SUPPORTED_WORLDS = (2, 4, 8)
 LINKS = ("pcie", "xgmi")
 # Threads per workgroup that every kernel can build. The block sets the tile.
 SUPPORTED_BLOCKS = (64, 128, 256, 512)
+# The fused schedules size a workgroup to one token row instead, on any
+# BLOCK_ALIGN multiple up to the hardware workgroup limit MAX_BLOCK.
+BLOCK_ALIGN = 128
+MAX_BLOCK = 1024
 # Payload and buffer address alignment, in bytes: one 16 B store per lane.
 PAYLOAD_ALIGN_BYTES = 16
 # Largest payload, in bytes: the window of a buffer descriptor.
@@ -41,8 +45,6 @@ WORLD = 8  # Default value for world size
 BLOCK = 256
 ATOMS = 8
 TILE_BYTES = BLOCK * ATOMS * 16
-TILE_I32 = TILE_BYTES // 4
-TILE_FP16 = TILE_BYTES // 2
 DEFAULT_GRID_CAP = 304 * 4
 WAVE = 64
 WAVES = BLOCK // WAVE
@@ -102,6 +104,35 @@ class TwoShotRung:
     super_tile: int
     grid_cap: int
     block: int
+
+
+@dataclass(frozen=True)
+class FusedOneShotRung:
+    """The fused (all-reduce + RMSNorm) one-shot configuration for payloads of
+    at least ``min_bytes``.
+
+    The fused tile is one token row, or one ``1/split`` slice of it, because
+    the RMSNorm reduces over the row. So ``atoms`` sets the block width
+    (``block = hidden / (split * 8 * atoms)``) instead of the tile, and there
+    is no ``block`` field. ``split`` spreads a row over that many workgroups.
+    """
+
+    min_bytes: int
+    atoms: int
+    grid_cap: int
+    fanout: str
+    split: int
+
+
+@dataclass(frozen=True)
+class FusedTwoShotRung:
+    """The fused mesh or ring configuration for payloads of at least
+    ``min_bytes``. As ``TwoShotRung``, without ``block``: a fused build sizes
+    its workgroup to the token row (``FUSED_QR_ROW_ATOMS``)."""
+
+    min_bytes: int
+    super_tile: int
+    grid_cap: int
 
 
 def select_rung(ladder, nbytes: int):
@@ -564,6 +595,25 @@ def _acquire_inbox(scope):
     fx.memory_fence(ordering=fx.AtomicOrdering.Acquire, syncscope=scope)
 
 
+def atom_bf16_to_f32(atom_i32):
+    """16 B of bf16 (8 values) -> 8 f32.
+
+    bf16 is the high half of f32, so this is a widening move, not a conversion
+    -- exact, no rounding.
+    """
+    return fx.Vector(atom_i32).bitcast(fx.BFloat16).to(fx.Float32)
+
+
+def atom_f32_to_bf16(acc_f32):
+    """8 f32 -> 16 B of bf16.
+
+    One rounding, at the end of whatever computed *acc_f32*, which is what makes
+    the exact schedules bit-comparable with ``cross_device_reduce``'s fp32
+    accumulate + single downcast.
+    """
+    return acc_f32.to(fx.BFloat16).bitcast(fx.Int32)
+
+
 def make_pack_storage(n_i32: int):
     """LDS staging for *n_i32* packed words, 16 B aligned."""
 
@@ -572,3 +622,29 @@ def make_pack_storage(n_i32: int):
         pack: fx.Array[fx.Int32, n_i32, 16]
 
     return PackStorage
+
+
+def make_hbm_operand(*, padded, nbytes, hbm_i32_ptr, hbm_layout):
+    """``operand(ptr, records=None)``: the handle the atom load/store helpers
+    address an HBM operand through, given its raw ``Int64`` base pointer.
+
+    A padded build hands the pointer back untouched: its pad lanes need a
+    *per-lane* bound, which a whole-tensor descriptor cannot express, so
+    ``make_rowbuf_atom_row`` builds a bounded descriptor per row from it. An
+    unpadded build hands back a tiled-copy tensor (layout + descriptor) whose
+    ``num_records_bytes`` is *records*, the live payload by default, so a
+    partial last tile reads 0 and its stores are dropped rather than faulting.
+
+    ``hbm_i32_ptr``/``hbm_layout`` are only read on the unpadded branch, so a
+    padded build may pass ``None`` for ``hbm_layout`` (it is never built there).
+    The one-shot, mesh and ring kernels all share this verbatim.
+    """
+
+    def _operand(ptr, records=None):
+        if padded:
+            return ptr
+        n = nbytes if records is None else records
+        view = fx.make_view(fx.inttoptr(hbm_i32_ptr, ptr), hbm_layout)
+        return rocdl.make_buffer_tensor(view, max_size=False, num_records_bytes=n)
+
+    return _operand
