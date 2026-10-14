@@ -227,7 +227,7 @@ class MegaMoeTP:
     def bigm(self):
         """The big-M kernel's host object (collective on first use: its SDMA window)."""
         if self._bigm is None:
-            from .kernels.mega_moe_tp.bigm_layer import MegaMoeTPBigM
+            from .kernels.mega_moe_tp.bigm_layer import PAD, MegaMoeTPBigM
 
             cfg, a = self.cfg, self._bigm_args
             self._bigm = MegaMoeTPBigM(
@@ -235,7 +235,8 @@ class MegaMoeTP:
                 inter=cfg.inter_dim,
                 experts=cfg.experts - 1,  # bigm counts the last expert apart (shared)
                 topk=cfg.topk - 1,
-                max_tokens=cfg.max_local_tokens * cfg.world_size,
+                # (the big-M kernel runs on local rows padded to a multiple of PAD)
+                max_tokens=-(-cfg.max_local_tokens // PAD) * PAD * cfg.world_size,
                 chunks=None,
                 eps=self.engine.tn_eps,
                 gemma=self.engine.tn_gemma,

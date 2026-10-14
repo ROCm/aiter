@@ -607,8 +607,9 @@ class MegaMoeTPEngine:
             elif tot <= self.dyn_max:
                 cfg = LaunchCfg(
                     self._fit_mt(tu.get("mt", 1 if tot <= 32 else 2 if tot <= 64 else 3)),
-                    ll=bool(tu.get("ll", tot <= 256 and fp8)),
-                    llr=bool(tu.get("llr", tot <= 128 and fp8)),
+                    # LL packets carry FP8 rows only (the tuned rows are fp8-comm tunings)
+                    ll=fp8 and bool(tu.get("ll", tot <= 256)),
+                    llr=fp8 and bool(tu.get("llr", tot <= 128)),
                     ag8=self.ar and bool(self.ag_auto) and tot >= self.ag_auto,
                 )
             else:

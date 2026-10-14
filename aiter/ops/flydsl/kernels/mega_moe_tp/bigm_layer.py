@@ -620,7 +620,7 @@ def compile_bigm_layer(
     ORDER_P = [x for x in ORDER if x[1] not in UKINDS] if NP else ORDER
     ORDER_U = [x for x in ORDER if x[1] in UKINDS] if NP else []
 
-    name = f"bigm_layer_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}_{fb(scale)}_{fb(shared_w)}" + ("_tl" if TLD else "") + f"_v20_i{io}{tailq}_c{CPU}g{GSPLIT}{G2N}p{NP}{RQU}_x{ext}h{NSBA}s{I8S}e{EORD}{'r' if RQE else ''}_q{QA}_o{ORD}g{AGATE}s{NSB}u{RUNR}r{RNS}{RNS1}a{UA}n{ZR}{NSUBR}{NSUBQ}d{RQD}r{R8}w{SXW}p{S2P}e{E4}b{BS2}x{S2E}c{CAUX}{'w' if UWB else ''}" + (f"_rd{RDBG}" if RDBG else "") + (f"_rb{RBDBG}" if RBDBG else "")
+    name = f"bigm_layer_h{H}_i{I}_e{E}k{K}_tp{tp}_c{C}_rg{RG}_{fb(eps)}{'g' if gemma else 'r'}_{fb(scale)}_{fb(shared_w)}" + ("_tl" if TLD else "") + f"_v22_i{io}{tailq}_c{CPU}g{GSPLIT}{G2N}p{NP}{RQU}_x{ext}h{NSBA}s{I8S}e{EORD}{'r' if RQE else ''}_q{QA}_o{ORD}g{AGATE}s{NSB}u{RUNR}r{RNS}{RNS1}a{UA}n{ZR}{NSUBR}{NSUBQ}d{RQD}r{R8}w{SXW}p{S2P}e{E4}b{BS2}x{S2E}c{CAUX}{'w' if UWB else ''}" + (f"_rd{RDBG}" if RDBG else "") + (f"_rb{RBDBG}" if RBDBG else "")
 
     @fx.struct
     class Shared:
@@ -861,11 +861,11 @@ def compile_bigm_layer(
 
     @flyc.kernel(name=name, known_block_size=[NTH, 1, 1])
     def kernel(
-        wb: fx.Int64,  # this rank's SDMA window (local address)
-        win: fx.Int64,  # window handle
+        wb: fx.Int64,  # this rank's data arena (SdmaComm: hipIpc, not a MORI window)
+        pbases: fx.Int64,  # [tp] int64 every rank's arena as mapped here (the put destinations)
         dc: fx.Int64,  # MORI device communicator
         consumed: fx.Int64,  # [tp][NQ] int32 puts awaited before this launch (persistent)
-        offs: fx.Int64,  # [10] int64 window region offsets
+        offs: fx.Int64,  # [10] int64 arena region offsets
         part: fx.Int64,  # [T, H] bf16 attention partial (every row); io: x [m, H] bf16 own rows
         resid: fx.Int64,  # [T, H] bf16 residual; io: ids [m, K1] int32
         wpost: fx.Int64,  # io: tw [m, K1] f32
@@ -955,15 +955,11 @@ def compile_bigm_layer(
         from .sdma import _mori
 
         bc = _mori()[3](6)
-        put_rsig = link_extern(
-            ffi(
-                "cco_sdma_put_rsig__thread",
-                ["uint64", "int32", "uint64", "uint64", "uint64", "uint64", "uint64", "int32", "int32"],
-                "int32",
-            ),
+        put_ptr = link_extern(
+            ffi("aiter_cco_sdma_put_ptr_rsig__thread", ["uint64", "int32", "uint64", "uint64", "uint64", "int32"], "int32"),
             bitcode_path=bc,
         )
-        sig_slot = link_extern(ffi("cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"), bitcode_path=bc)
+        sig_slot = link_extern(ffi("aiter_cco_sdma_signal_slot", ["uint64", "int32", "int32"], "uint64"), bitcode_path=bc)
 
         @flyc.jit
         def take_turn(q, nth):
@@ -977,18 +973,13 @@ def compile_bigm_layer(
         def give_turn(q, nth):
             g_st_sys(ca(i32(C_TURN + 32 * q)), nth + i32(1))
 
+        rpb = rsrc(pbases)
+
         def put(peer, dst_region, dst_off, src_region, src_off, nbytes, q):
-            put_rsig(
-                dc,
-                peer,
-                win,
-                a["off_" + dst_region] + fx.Int64(dst_off),
-                win,
-                a["off_" + src_region] + fx.Int64(src_off),
-                fx.Int64(nbytes),
-                i32(q),
-                0,
-            )
+            # region + offset of the peer's arena <- the same of ours (remote-signalled)
+            dst = fx.Int64(bld(rpb, peer * i32(8), 0, T.i64)) + a["off_" + dst_region] + fx.Int64(dst_off)
+            src = wb + a["off_" + src_region] + fx.Int64(src_off)
+            put_ptr(dc, peer, dst, src, fx.Int64(nbytes), i32(q))
 
         def wait_puts(q, n_per, k):
             # every peer's first (k + 1) * n_per puts on queue q of this launch landed
@@ -2179,7 +2170,7 @@ def compile_bigm_layer(
 
     @flyc.jit
     def launch(
-        wb: fx.Int64, win: fx.Int64, dc: fx.Int64, consumed: fx.Int64, offs: fx.Int64, part: fx.Int64,
+        wb: fx.Int64, pbases: fx.Int64, dc: fx.Int64, consumed: fx.Int64, offs: fx.Int64, part: fx.Int64,
         resid: fx.Int64, wpost: fx.Int64, wg: fx.Int64, bias: fx.Int64, wnext: fx.Int64, res: fx.Int64,
         normed: fx.Int64, resout: fx.Int64, ybuf: fx.Int64, routes: fx.Int64, lrix: fx.Int64,
         lwt: fx.Int64, utab: fx.Int64, w1: fx.Int64, w1s: fx.Int64, w2: fx.Int64, w2s: fx.Int64,
@@ -2187,7 +2178,7 @@ def compile_bigm_layer(
         rstride: fx.Int64, lstride: fx.Int32, grid: fx.Int32, stream: fx.Stream,
     ):
         kernel(
-            wb, win, dc, consumed, offs, part, resid, wpost, wg, bias, wnext, res, normed, resout,
+            wb, pbases, dc, consumed, offs, part, resid, wpost, wg, bias, wnext, res, normed, resout,
             ybuf, routes, lrix, lwt, utab, w1, w1s, w2, w2s, ctrl, chunks, logit, stab, inter, rank, m, ucap, rstride,
             lstride,
         ).launch(grid=(fx.Int64(grid), 1, 1), block=(NTH, 1, 1), stream=stream)
@@ -2230,6 +2221,8 @@ def bigm_tuned(*, model_dim, inter_dim, experts, topk, tp, tokens):
 
 
 CMAX = 7  # chunks per launch (ctrl layout)
+PAD = 64  # the kernel's local rows (and chunk rows) are multiples of this (moe() pads)
+GEOMS = ((128, 1),)  # (unit rows AITER_BIGM_RG, CTAs per CU AITER_BIGM_CPU) of the io path
 
 
 class MegaMoeTPBigM:
@@ -2266,6 +2259,7 @@ class MegaMoeTPBigM:
         self.C = CMAX if self.weights is None else len(self.weights)
         assert self.C <= CMAX
         self._plans = {}
+        self._pads = {}
         self.cfg = (float(eps), bool(gemma), float(scale), float(shared_w), float(swiglu_limit))
         self.opts = tuple(sorted((opts or {}).items()))  # tuned AITER_BIGM_* options
         od = dict(self.opts)
@@ -2337,18 +2331,37 @@ class MegaMoeTPBigM:
         self.cu = cu or torch.cuda.get_device_properties(dev).multi_processor_count
         # deepest A ring (dividing the GEMM1 chunk count) whose LDS fits a CU
 
-        kch = hidden // 256
-        self.nab = next(
-            n for n in (4, 3, 2)
-            if kch % n == 0 and self._unit_lds(n, inter) + 4096 <= 160 * 1024 // self.cpu
-        )
+        self._nabs = {}
+        self.nab = self._nab(self.rg, self.cpu)
 
-    def _unit_lds(self, n, inter):
+    def _nab(self, rg, cpu):
+        """deepest A ring (dividing the GEMM1 chunk count) whose LDS fits cpu CTAs in a CU"""
+        n_ = self._nabs.get((rg, cpu))
+        if n_ is None:
+            kch = self.H // 256
+            n_ = self._nabs[(rg, cpu)] = next(
+                n for n in (4, 3, 2) if kch % n == 0 and self._unit_lds(n, self.I, rg) + 4096 <= 160 * 1024 // cpu
+            )
+        return n_
+
+    def _geom(self, T):
+        """(unit rows RG, CTAs per CU, A ring depth) of batch T: its plan's AITER_BIGM_RG /
+        AITER_BIGM_CPU (the tuned csv), else the instance's"""
+        o = dict(self._plan(T)[1])
+        rg, cpu = int(o.get("AITER_BIGM_RG", self.rg)), int(o.get("AITER_BIGM_CPU", self.cpu))
+        # validated in this (io) path: 128-row units, one CTA per CU (64-row units: 16% slower at
+        # 16384 tokens and failing with two CTAs per CU / three chunks; 96 / 112: no LDS layout)
+        if (rg, cpu) not in GEOMS:
+            raise ValueError(f"MegaMoeTP big-M: AITER_BIGM_RG={rg} / AITER_BIGM_CPU={cpu} unsupported (have {GEOMS})")
+        return rg, cpu, self._nab(rg, cpu)
+
+    def _unit_lds(self, n, inter, rg=None):
         from .bigm_gemm import bigm_lds
 
+        rg = rg or self.rg
         if int(dict(self.opts).get("AITER_BIGM_GSPLIT", "0")):
-            return max(bigm_lds(self.rg, n, inter, MODE=3)["BYTES"], bigm_lds(self.rg, n, inter, MODE=4)["BYTES"])
-        return bigm_lds(self.rg, n, inter)["BYTES"]
+            return max(bigm_lds(rg, n, inter, MODE=3)["BYTES"], bigm_lds(rg, n, inter, MODE=4)["BYTES"])
+        return bigm_lds(rg, n, inter)["BYTES"]
 
     def poll_errors(self) -> int:
         """Nonzero if a wait on a peer inside the kernel gave up since the last clear."""
@@ -2379,8 +2392,10 @@ class MegaMoeTPBigM:
     def _split(self, m, w=None):
         w = w or self.weights or self._plan(m * self.tp)[0]
         tot = sum(w)
-        # multiples of 64 rows: whole router groups in every head sub-block (AITER_BIGM_NSBA <= 4)
-        g = 64 if m % 64 == 0 else 16
+        # multiples of 64 rows (moe() pads m to PAD): whole router groups in every head
+        # sub-block (AITER_BIGM_NSBA <= 4)
+        g = PAD
+        assert m % g == 0, (m, g)
         sizes = [max(g, (m * x // tot) // g * g) for x in w]
         sizes[w.index(max(w))] += m - sum(sizes)
         assert all(x > 0 and x % g == 0 for x in sizes) and sum(sizes) == m, (m, sizes)
@@ -2393,7 +2408,10 @@ class MegaMoeTPBigM:
         sizes = tuple(self._split(m))
         c = self.chunks_t.get((T, sizes))  # (the plan of T may be replaced: keyed by its sizes)
         if c is None:
-            assert self.uslots >= len(sizes) * self._ucap(T), "unit table"
+            need = len(sizes) * self._ucap(T)
+            if need > self.uslots:  # a smaller unit (the plan's AITER_BIGM_RG): a larger table
+                self.uslots = need
+                self.utab = torch.zeros(8 * need * 4, dtype=torch.int32, device=self.device)
             os_ = [sum(sizes[:i]) for i in range(len(sizes))]
             c = self.chunks_t[(T, sizes)] = torch.tensor([[o, s] for o, s in zip(os_, sizes)], dtype=torch.int32, device=self.device)
         return c
@@ -2405,7 +2423,7 @@ class MegaMoeTPBigM:
         self.w = (w1.view(torch.uint8), w1_scale.view(torch.uint8), w2.view(torch.uint8), w2_scale.view(torch.uint8))
 
     def _ucap(self, T):
-        return unit_cap(self.tp, max(self._split(T // self.tp)), self.K1, self.NE, self.rg)
+        return unit_cap(self.tp, max(self._split(T // self.tp)), self.K1, self.NE, self._geom(T)[0] if self.io else self.rg)
 
     def own_ids(self, T):
         import torch
@@ -2464,7 +2482,7 @@ class MegaMoeTPBigM:
 
         def args(ctrl, stab, ucap):
             return (
-                self.sd.base, self.sd.handle, self.sd.dev_comm.ptr, self.sd.consumed.data_ptr(),
+                self.sd.base, self.sd.bases.data_ptr(), self.sd.dev_comm.ptr, self.sd.consumed.data_ptr(),
                 self.offs.data_ptr(), part.data_ptr(), residual.data_ptr(), w_post.data_ptr(),
                 wg.data_ptr(), bias.data_ptr(), w_next.data_ptr(), self.res.data_ptr(),
                 self.normed.data_ptr(), self.resout.data_ptr(), self.ybuf.data_ptr(),
@@ -2504,17 +2522,61 @@ class MegaMoeTPBigM:
     def moe(self, x, topk_weights, topk_ids, out=None, tail=None, local=False):
         """io: the MoE of every rank's tokens (ag_rs): x [m, H] bf16 (this rank's rows, global
         rows rank * m + i), topk_weights f32 / topk_ids int32 [m, K1] (the shared expert E in
-        any column) -> y [m, H] bf16 = this rank's rows of sum_r MoE_r(every row); tail =
-        (res_in, res_out, norm_w): also res_out = y + res_in and the (Gemma)RMSNorm of res_out
-        as FP8 rows (+ f32 scales) of every rank -> (y, q [T, H] fp8 (uint8), scales [T]);
-        local: only this rank's q rows (rank * m ..) are written."""
+        any column; ids outside [0, experts] are no route) -> y [m, H] bf16 = this rank's rows of
+        sum_r MoE_r(every row); tail = (res_in, res_out, norm_w): also res_out = y + res_in and
+        the (Gemma)RMSNorm of res_out as FP8 rows (+ f32 scales) of every rank -> (y, q [T, H]
+        fp8 (uint8), scales [T]); local: only this rank's q rows (rank * m ..) are written.
+        Any m: the kernel runs on m rounded up to a multiple of 64 (PAD; the extra rows are zero,
+        with no routes), its results cut back to m rows."""
         import torch
 
         assert self.io
         m = x.shape[0]
-        T = m * self.tp
-        assert T <= self.Tmax and x.is_contiguous() and topk_ids.shape == (m, self.K1)
+        assert x.is_contiguous() and topk_ids.shape == (m, self.K1)
         assert topk_ids.dtype == torch.int32 and topk_weights.dtype == torch.float32
+        mp = -(-m // PAD) * PAD
+        assert mp * self.tp <= self.Tmax, (m, self.Tmax)
+        if mp == m:
+            return self._moe(x, topk_weights, topk_ids, out, tail, local)
+        pb = self._pads.get(mp)
+        if pb is None:  # rows m.. stay zero / no route: written once
+            H, K1, dev = self.H, self.K1, self.device
+            pb = self._pads[mp] = (
+                torch.zeros((mp, H), dtype=torch.bfloat16, device=dev),
+                torch.zeros((mp, K1), dtype=torch.float32, device=dev),
+                torch.full((mp, K1), -1, dtype=torch.int32, device=dev),
+                torch.zeros((mp, H), dtype=torch.bfloat16, device=dev),
+                torch.empty((self.tp * m, H), dtype=torch.uint8, device=dev),
+                torch.empty((self.tp * m,), dtype=torch.float32, device=dev),
+            )
+        xp, twp, idp, rp, qc, qsc = pb
+        xp[:m].copy_(x)
+        twp[:m].copy_(topk_weights)
+        idp[:m].copy_(topk_ids)
+        if tail is not None:
+            res_in, res_out, norm_w = tail
+            rp[:m].copy_(res_in)
+            y, q, qs = self._moe(xp, twp, idp, None, (rp, rp, norm_w), local)
+            res_out.copy_(rp[:m])
+            # q / scales as [rank][m] rows (the kernel's are [rank][mp])
+            src = [self.rank] if local else range(self.tp)
+            for r in src:
+                qc[r * m : (r + 1) * m].copy_(q[r * mp : r * mp + m])
+                qsc[r * m : (r + 1) * m].copy_(qs[r * mp : r * mp + m])
+            q, qs = qc, qsc
+        else:
+            y = self._moe(xp, twp, idp, None, None, local)
+        y = y[:m]
+        if out is not None:
+            y = out.copy_(y)
+        return y if tail is None else (y, q, qs)
+
+    def _moe(self, x, topk_weights, topk_ids, out, tail, local):
+        """moe() of m (a multiple of PAD) rows"""
+        import torch
+
+        m = x.shape[0]
+        T = m * self.tp
         eps, gemma, scale, shared_w, lim = self.cfg
         w1, w1s, w2, w2s = self.w
         y = self.normed[:m] if out is None else out
@@ -2523,24 +2585,26 @@ class MegaMoeTPBigM:
         else:
             res_in, res_out, norm_w = x, self.resout, x
         w_, opts = self._plan(T)
+        rg, cpu, nab = self._geom(T)
         order = 4 if self.tp * max(self._split(m)) >= 8192 else 3
         launch = compile_bigm_layer(
             self.H, self.I, self.E, self.K, self.tp, len(w_), eps, gemma, scale, shared_w, lim,
-            NAB=self.nab, order=order, opts=opts, RG=self.rg, CPU=self.cpu, io=1,
+            NAB=nab, order=order, opts=opts, RG=rg, CPU=cpu, io=1,
             tailq=0 if tail is None else 2 if local else 1,
         )
+        chunks = self._chunks(T)  # (first: it may grow the unit table)
         self.ctrl[:CTRL_INTS].zero_()
         self._run(
             launch,
             (
-                self.sd.base, self.sd.handle, self.sd.dev_comm.ptr, self.sd.consumed.data_ptr(),
+                self.sd.base, self.sd.bases.data_ptr(), self.sd.dev_comm.ptr, self.sd.consumed.data_ptr(),
                 self.offs.data_ptr(), x.data_ptr(), topk_ids.data_ptr(), topk_weights.data_ptr(),
                 x.data_ptr(), x.data_ptr(), norm_w.data_ptr(), res_in.data_ptr(),
                 y.data_ptr(), res_out.data_ptr(), self.ybuf.data_ptr(),
                 self.routes.data_ptr(), self.lrix.data_ptr(), self.lwt.data_ptr(), self.utab.data_ptr(),
                 w1.data_ptr(), w1s.data_ptr(), w2.data_ptr(), w2s.data_ptr(), self.ctrl.data_ptr(),
-                self._chunks(T).data_ptr(), self.logit.data_ptr(), 0, self.inter.data_ptr(), self.rank, m,
-                self._ucap(T), self.rstride, self.lstride, self.cu * self.cpu, torch.cuda.current_stream(),
+                chunks.data_ptr(), self.logit.data_ptr(), 0, self.inter.data_ptr(), self.rank, m,
+                self._ucap(T), self.rstride, self.lstride, self.cu * cpu, torch.cuda.current_stream(),
             ),
         )
         if tail is None:
