@@ -1,0 +1,18 @@
+{
+  "torch": "2.13.0+git733fca1",
+  "hip": "7.2.53211",
+  "triton": "3.8.0",
+  "vllm": "0.30.1rc1.dev648+g92044241a",
+  "flydsl": "0.3.4.1",
+  "common_settings": {
+    "mtp": false,
+    "prefix_caching": false,
+    "kv_dtype": "fp8",
+    "max_model_len": 4096,
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 8192,
+    "memory_utilization": 0.95
+  },
+  "flydsl_reference_commit": "21a3d1ee6ba2d6c0f33e3feb56e23cbf9e79c085",
+  "compiler_note": "Triton3.8 build with Gluon atomics and AMD .cv coherent loads is required. The stock image lacked Gluon atomics. Compiler binaries and model weights are not included."
+}

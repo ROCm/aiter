@@ -1,0 +1,87 @@
+--- a/vllm/models/kimi_k3/amd/linear.py
++++ b/vllm/models/kimi_k3/amd/linear.py
+@@ -61,6 +61,7 @@
+     make_layers,
+     maybe_prefix,
+ )
++from vllm.models.kimi_k3.amd.monokernel import CompleteMoE
+ from vllm.models.kimi_k3.amd.kda import KimiK3DeltaAttention
+ from vllm.models.kimi_k3.amd.latent_moe_runner import ROCmLatentMoERunner
+ from vllm.models.kimi_k3.amd.mla import KimiK3MultiHeadLatentAttentionWrapper
+@@ -576,6 +577,18 @@
+                 prefix=f"{prefix}.mlp_res_proj",
+             )
+ 
++        self.complete_moe = None
++        if (
++            isinstance(self.mlp, KimiMoE)
++            and self.hidden_size == 7168
++            and get_tensor_model_parallel_world_size() in (4, 8)
++            and self.use_attn_residuals
++            and config.rms_norm_eps == 1.e-5
++            and self.prev_valid_blocks + int(self.is_block_write_layer) <= 8
++            and torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.startswith("gfx950")
++        ):
++            self.complete_moe = CompleteMoE(self, isinstance(self.self_attn, KimiK3DeltaAttention))
++
+     def _run_self_attn(
+         self,
+         positions: torch.Tensor,
+@@ -640,6 +653,11 @@
+         if self.is_block_write_layer:
+             prefix_sum = None
+ 
++        if self.complete_moe is not None and self.complete_moe.projection and 1 <= hidden_states.shape[0] <= 8:
++            core = self.self_attn(hidden_states=hidden_states, positions=positions, defer_output_projection=True)
++            prefix_sum, hidden_states = self.complete_moe(core, prefix_sum, block_residual)
++            return prefix_sum, block_residual, hidden_states
++
+         hidden_states = self._run_self_attn(positions, hidden_states)
+ 
+         if prefix_sum is None:
+@@ -661,7 +679,10 @@
+             output_norm=self.post_attention_layernorm,
+         )
+ 
+-        hidden_states = self.mlp(hidden_states)
++        if self.complete_moe is not None and 1 <= hidden_states.shape[0] <= 8:
++            prefix_sum, hidden_states = self.complete_moe(hidden_states, prefix_sum)
++        else:
++            hidden_states = self.mlp(hidden_states)
+         return prefix_sum, block_residual, hidden_states
+ 
+ 
+@@ -833,12 +854,12 @@
+                 self._maybe_add_hidden_state(
+                     aux_hidden_states,
+                     layer_idx + 1,
+-                    hidden_states + prefix_delta,
++                    hidden_states if prefix_delta is None else hidden_states + prefix_delta,
+                     residual,
+                 )
+ 
+         if not get_pp_group().is_last_rank:
+-            hidden_states = hidden_states + prefix_delta
++            hidden_states = hidden_states if prefix_delta is None else hidden_states + prefix_delta
+             return IntermediateTensors(
+                 {"hidden_states": hidden_states, "residual": residual}
+             )
+--- a/vllm/models/kimi_k3/amd/kda.py
++++ b/vllm/models/kimi_k3/amd/kda.py
+@@ -304,6 +304,7 @@
+         self,
+         hidden_states: torch.Tensor,
+         positions: torch.Tensor,
++        defer_output_projection: bool = False,
+     ) -> torch.Tensor:
+         num_tokens = hidden_states.size(0)
+         projected_qkvgfab = self.in_proj_qkvgfab(hidden_states)[0]
+@@ -338,6 +339,8 @@
+             core_attn_out=core_attn_out,
+         )
+         core_attn_out = rearrange(core_attn_out, "1 n h d -> n (h d)")
++        if defer_output_projection:
++            return core_attn_out
+         return self.o_proj(core_attn_out)[0]
+ 
+     @eager_break_during_capture

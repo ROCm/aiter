@@ -1,0 +1,2 @@
+# Unified diff context lines contain a required leading space, including blanks.
+integration/vllm-kimi-k3.patch whitespace=-blank-at-eol

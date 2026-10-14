@@ -1,0 +1,1208 @@
+{
+  "k3_gluon/__init__.py": {
+    "source_sha256": "52ba0e721ec750b09a337a91f3ac2df0b3e7a3bc7ec1707f9896a889566f270c",
+    "source": "k3_gluon/__init__.py",
+    "exported_sha256": "52ba0e721ec750b09a337a91f3ac2df0b3e7a3bc7ec1707f9896a889566f270c",
+    "ast_unchanged": true
+  },
+  "k3_gluon/attnres.py": {
+    "source_sha256": "06fb89241aedc762cf44ee88bfd80b7c77f250caabe94ad6265ba0bb7b2a4939",
+    "source": "k3_gluon/attnres.py",
+    "exported_sha256": "3bda33124d7282dc565ecda5f1e35b64102243e52c23864703375b93e7757ae5",
+    "ast_unchanged": true
+  },
+  "k3_gluon/collectives.py": {
+    "source_sha256": "7c4b9a60016cf61bf1f621f2e7645761c581f32a627b400a75f0c2d88fc64a1f",
+    "source": "k3_gluon/collectives.py",
+    "exported_sha256": "70c9c3db1089405c3999afeab70b3c82c173609012503a850dbb5e999508e923",
+    "ast_unchanged": true
+  },
+  "k3_gluon/complete_host.py": {
+    "source_sha256": "2640e407c9a4c3c9079676a7983b652bb4bad3b17b772ad052ae3ebad0c3c888",
+    "source": "k3_gluon/complete_host.py",
+    "exported_sha256": "17b69d4f38fc187896a2b388730ee5857f956393eb89eb1ed1288e03529881fc",
+    "ast_unchanged": true
+  },
+  "k3_gluon/diagnostics.py": {
+    "source_sha256": "1df954e10554740c54383be0904e1b10b5add157e71902a228dfe4406f0b3b41",
+    "source": "k3_gluon/diagnostics.py",
+    "exported_sha256": "5c1049c0c33a391f08af98ff1e1948c0cd194d75dad21337284ef09e9469a40a",
+    "ast_unchanged": true
+  },
+  "k3_gluon/expert_up.py": {
+    "source_sha256": "83169f7afdc2177dac8a7475b31742b0540cacc854f3c5127d04db753a22d83f",
+    "source": "k3_gluon/expert_up.py",
+    "exported_sha256": "015eb2f7dc86b2cac721633f467f8a3c440960a1d658c1dd1688c9d8bca18193",
+    "ast_unchanged": true
+  },
+  "k3_gluon/moe_complete.py": {
+    "source_sha256": "7cf488e796d4edbbb026de058df518173c2c2d8e434d178e3e3ae001a6635233",
+    "source": "k3_gluon/moe_complete.py",
+    "exported_sha256": "9ea95c7e48b8d114c7609c6b8aa4d73b0813413518ba618f69348f6b882fdc6b",
+    "ast_unchanged": true
+  },
+  "k3_gluon/moe_front.py": {
+    "source_sha256": "d24de99e733ae9348ba3f2bf9a315c77a355339a2d763dee516a183e262a0706",
+    "source": "k3_gluon/moe_front.py",
+    "exported_sha256": "e0c508a9f2140f32fbbd6b3d03c960bf3e960c2db9072938733df3f15e98630c",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_chain.py": {
+    "source_sha256": "3cfc0e36f50d50187f0dd0be706e8a48640f86ebfe86ae16082e4234251f3a3f",
+    "source": "k3_gluon/perf_chain.py",
+    "exported_sha256": "516305cbcaa2c53dc76a97849fc874cbb18f9503ec81b4b8dbe8f44da957c2b8",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_front32.py": {
+    "source_sha256": "5d8a26393a69e5fa82db5d2b3a9285dc3a8645baaede0a91ef20de05e8979468",
+    "source": "k3_gluon/perf_front32.py",
+    "exported_sha256": "4b6051d5729fee32786d9c7d659be88fa22938fcb5ed6f46de58d7b5485cc628",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_native_front.py": {
+    "source_sha256": "a696d8e481dc120f7876cdfd684bd43ab0f4e942564b4cbff96d57e1f8525ec5",
+    "source": "k3_gluon/perf_native_front.py",
+    "exported_sha256": "0d6da81e3d90f265926f4606591d752b67f2e5ca53102965f30a6f1f428b3c28",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_packed_scale.py": {
+    "source_sha256": "1d5a1743e96b8ab233ea32e56aace0e9ab5de8999e24f1898237ca8b5edefc39",
+    "source": "k3_gluon/perf_packed_scale.py",
+    "exported_sha256": "38b9bc2b6f7b2396d1cdc6273e03a24f803eb90282545cf0c79a47d0e3202ac6",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_reference_chain.py": {
+    "source_sha256": "e513cda6cf0c7abff3d42bfd0b4c6cc125cc33f2b75928d5058c4f2f66ca5188",
+    "source": "k3_gluon/perf_reference_chain.py",
+    "exported_sha256": "240ddce2de57f1acab493fe9df3ad3d58e206c09a8377eefe9b8acc81372ab4c",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_reference_down.py": {
+    "source_sha256": "d160fc1ba9f0c955ac11a260aaee13b5036ffc03348a18812d87c66457d5558a",
+    "source": "k3_gluon/perf_reference_down.py",
+    "exported_sha256": "f644e59c52f0c2c685b5ad20252c7801cc2a3085bdef0a01fd2a5f96ad3ebbe8",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_reference_projection.py": {
+    "source_sha256": "7ef1e67648540231fc78c201c13034c83c98745d2ab1e156f5b8724541e973d4",
+    "source": "k3_gluon/perf_reference_projection.py",
+    "exported_sha256": "0e21ff3724dc452f7a5a7e4dead034f54c9c5012f6951d21c19ebddea7569fca",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_reference_stages.py": {
+    "source_sha256": "1768e52d48c254e66f7667a6ab8187173348b0bf72df094d076b120e0ad9a05a",
+    "source": "k3_gluon/perf_reference_stages.py",
+    "exported_sha256": "4354b57417cb3408e3e697fd11e43889ddd76c2dfd6f535130d013d828567dd3",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_reference_tail.py": {
+    "source_sha256": "d5c1cdb3db6dab26c3dd423a0afdb586d1d785322e1d59627dec91088191f254",
+    "source": "k3_gluon/perf_reference_tail.py",
+    "exported_sha256": "1c31708735648d7382a3c8e669770a129649569fd846f3614b9426b65906c1df",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_reference_up.py": {
+    "source_sha256": "c60392a6ecc0ec4fe7c919f1224426c5aa5fe6efa835be91f1a976266a349641",
+    "source": "k3_gluon/perf_reference_up.py",
+    "exported_sha256": "72b405558495645147a84b002c5c8126acd24e2e8754a3e72cb35eafb095a379",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_stages.py": {
+    "source_sha256": "4c52da965a80359894e4c792a8a9b2062ab88f72dda8a96633e2f64e0e1bd9b2",
+    "source": "k3_gluon/perf_stages.py",
+    "exported_sha256": "fd51cc9b9270c35ad21f1a7526d2581fdccd6984413a11de34b860c69abe5f86",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_timeline.py": {
+    "source_sha256": "1fe35d9e40df7f42eda87f282b26d5775576a3f18f4c14ff1be50ca71bfdd5bb",
+    "source": "k3_gluon/perf_timeline.py",
+    "exported_sha256": "170f6ee3206e00ca9696cd0aaaf887a6763c6ae14171a34f99787be2c01377d7",
+    "ast_unchanged": true
+  },
+  "k3_gluon/perf_tuned_up.py": {
+    "source_sha256": "f52f9cc51c4c1e0cdbeaf3c8f6733ee4daf582054de342f57c8ea1affe28c6aa",
+    "source": "k3_gluon/perf_tuned_up.py",
+    "exported_sha256": "fb0994a98de95aae6b4498300db2793135724c890290c08606043669ded23bc0",
+    "ast_unchanged": true
+  },
+  "k3_gluon/primitives.py": {
+    "source_sha256": "bb4ece82ddf88acea444c57c2c285ff7f6f88c0b95216572824e7416f344e0ac",
+    "source": "k3_gluon/primitives.py",
+    "exported_sha256": "f6308ceadb13e56c98e7677c143cebd38e7ff79bd8dc477ad9aab13f8bc5014a",
+    "ast_unchanged": true
+  },
+  "k3_gluon/projection.py": {
+    "source_sha256": "863d5ae0d9c9e3b2a487471f15852b955bdddd65191e481255c8e82f4b1970b1",
+    "source": "k3_gluon/projection.py",
+    "exported_sha256": "a18ab9f6e0c921fb7b2d4e9485acc152d358e122c0b3cbebc8efe4eb58c8a770",
+    "ast_unchanged": true
+  },
+  "k3_gluon/serving.py": {
+    "source_sha256": "30f191a9b5d5374160f4b6ee7ececb22767ea732e4f958ed6e48b248a9a50077",
+    "source": "k3_gluon/serving.py",
+    "exported_sha256": "dd356e5ba5ae8a01ffbd14fd79fefde9a09ae2d6e1c3a1964e3dc6909232403b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/__init__.py": {
+    "source_sha256": "bf9e408ce1b402e8c8156a56eca9b4948a3258b47bc143758d546853575f3622",
+    "source": "k3_gluon_serving_tuned/__init__.py",
+    "exported_sha256": "d1b6270835517bcbbd840d3eac534234b99660adef89b91757c23b97a75e7664",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/attnres.py": {
+    "source_sha256": "a888fca53b14e2548b7730c44b59137437d1bb5e1cdfb8359da95b4af9f8d084",
+    "source": "k3_gluon_serving_tuned/attnres.py",
+    "exported_sha256": "f83e8723b6d336b8645dab8b0caa0f035db164375e849c3a55737c06cc6a4711",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/coherent_memory.py": {
+    "source_sha256": "870a4ba5cc1eeab23fe7ebf7cee4a3f994abfdbfd4ce298667771b6fe49757af",
+    "source": "k3_gluon_serving_tuned/coherent_memory.py",
+    "exported_sha256": "1aeba018f71404b40b67761c1931d796810d9292da13422a62cd452c83170598",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/collectives.py": {
+    "source_sha256": "33247a117994da91b817025bcf17b26dbccb7d8228a8885dba76b238e1863844",
+    "source": "k3_gluon_serving_tuned/collectives.py",
+    "exported_sha256": "cb3dcef474efe3a231fcd4014f5f7ffc4baf911056e1f43005e44b2edf9b5323",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/complete_host.py": {
+    "source_sha256": "4aa6e99804113b560c399875d8f6c51f2cb23ff43b8ea979fb96ce68095ce9d7",
+    "source": "k3_gluon_serving_tuned/complete_host.py",
+    "exported_sha256": "187df25435ebe59de129d96b07dced772d4f50c9bfcd5c15f02152e5cb229b18",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/diagnostics.py": {
+    "source_sha256": "625adb84bba9b6b160f27b7fefa3cb51043ff4a7e7dc74c2d33bd0fc42a74347",
+    "source": "k3_gluon_serving_tuned/diagnostics.py",
+    "exported_sha256": "cc4c006c4a9d45323d1908516937d6c90b6c9bdad06d6dd75a43f5249381e4f2",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/expert_up.py": {
+    "source_sha256": "f9a6541835e8df418a8b09326f300f12bb9c80b8d86ba5652211c5398d8d1460",
+    "source": "k3_gluon_serving_tuned/expert_up.py",
+    "exported_sha256": "3110d21e75a64e239c390741131f51ab0abc5106579598a18371c66aef26f492",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/moe_complete.py": {
+    "source_sha256": "079df1a75c89f0ec4376f014bb5550addce9571c040d07056b4957d46decd95b",
+    "source": "k3_gluon_serving_tuned/moe_complete.py",
+    "exported_sha256": "ec35c1b8ac6d2149892828f1aadbb1772622f1406157ef63fa53cb4f72a311a5",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/moe_front.py": {
+    "source_sha256": "d11832b556ac878872818ca9e7d44b8ac47684a2c7c7d93595d61d5aa98a00a7",
+    "source": "k3_gluon_serving_tuned/moe_front.py",
+    "exported_sha256": "7fda5124f212bdfc6dd0e1a2cda50c1ae8455723ba2d3cfd51ddd68e6b204f11",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_chain.py": {
+    "source_sha256": "48d5c6ad9239fc1230a18abf387a3af57345e6ca827bc6bbbbb2bdd797389c38",
+    "source": "k3_gluon_serving_tuned/perf_chain.py",
+    "exported_sha256": "75278972de465c8d8bd679e1ffdbbd1bd03f3913ecc72c57f8138a11b4e8ec64",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_native_front.py": {
+    "source_sha256": "e392f1b0f2f4193d280cb31bff227342c3833f519c5efe16c958734040ae1afb",
+    "source": "k3_gluon_serving_tuned/perf_native_front.py",
+    "exported_sha256": "22fb29c87dc4d6d24620a419fbfcf750c76295523dc269cd5ed9d8c2ee12f5fd",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_packed_scale.py": {
+    "source_sha256": "faebc9a0c1e8c2e16bdb117bc544daee70fb6c1aa8698e9e79ed149478380b41",
+    "source": "k3_gluon_serving_tuned/perf_packed_scale.py",
+    "exported_sha256": "f5f33805af48ff1d105ca97137d3be060ca0dcfd7e89ec97bd9582578c84912c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_reference_chain.py": {
+    "source_sha256": "dd3ccbd4c9bbce751e31aeea82bddc37db5ff3103e563d1963fdfd3ca77e95c2",
+    "source": "k3_gluon_serving_tuned/perf_reference_chain.py",
+    "exported_sha256": "73eb4c67e676a8a3f024815e2e5e3be9d55ebd857b7fc5d3487627381e245c16",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_reference_down.py": {
+    "source_sha256": "cbe760c91dd51a3c88744421663428c6eae0a0c901f2502be42e692ffa70fc3c",
+    "source": "k3_gluon_serving_tuned/perf_reference_down.py",
+    "exported_sha256": "61c8221ec390986d8e750a34aec9b4cc80aa8b0f5093d78a3b0643fb02044e91",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_reference_projection.py": {
+    "source_sha256": "2b4f5e78e4441385d662f8874ecf9d7245a994cb569723f809d7fd7e5388a849",
+    "source": "k3_gluon_serving_tuned/perf_reference_projection.py",
+    "exported_sha256": "b351e25dab341384efe9ab1ecf41a34528e8b0f7ae1e23f293bc38ac23ceca02",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_reference_stages.py": {
+    "source_sha256": "ce07287e83eaf145fcd146701c24d3766ae274977dc8739dfd0446071230d798",
+    "source": "k3_gluon_serving_tuned/perf_reference_stages.py",
+    "exported_sha256": "794bd70994b24f3221816e1eef9bc48d91cfd090d4fa01adfe220003ca65b3e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_reference_tail.py": {
+    "source_sha256": "f493f7889a515b932ca68e7e028c440624bbca4ef55e01b57fda5f151b4c014b",
+    "source": "k3_gluon_serving_tuned/perf_reference_tail.py",
+    "exported_sha256": "14866137cc9047105418a3c9c3554cd0ea781e56c0e6ffee8c2fca066a112939",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_reference_up.py": {
+    "source_sha256": "87774fa056265ad3a6591648d13b5b9fcac9316b4055b07baf8bd092290b80d8",
+    "source": "k3_gluon_serving_tuned/perf_reference_up.py",
+    "exported_sha256": "9326c03a76c0552a26955a5cd472a425bd66d45bc038cd86f8cae85f8c9f79c0",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_stages.py": {
+    "source_sha256": "f11a791f68d54edf317085fd13be76da72162edf28c6d0f7abf4ae3e4b038cb5",
+    "source": "k3_gluon_serving_tuned/perf_stages.py",
+    "exported_sha256": "9c6cc4529dc9f931469c6be6f8b12b8be30826e45ac4d32b0848571bbf091427",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_timeline.py": {
+    "source_sha256": "0824cce224ac5c5ea42799fd1ae63e9467208f789dda0e003a547a0e96861bd1",
+    "source": "k3_gluon_serving_tuned/perf_timeline.py",
+    "exported_sha256": "cb194606f2ff8753e7d23b36978b571104c667c2da77006e2d11614956c8df2b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/perf_tuned_up.py": {
+    "source_sha256": "632a2280b55082ae717b2b025b17ca3e8eba3a49c92416535769d736c20841b5",
+    "source": "k3_gluon_serving_tuned/perf_tuned_up.py",
+    "exported_sha256": "22dfb60262f146d406a27fb46f89cacde8ae5f08cc555abe1414e4e2523520fa",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/primitives.py": {
+    "source_sha256": "1c5292d6e64759a3569be8089a798a5abf1ad683a3488f2d49fa85f1fbf0a810",
+    "source": "k3_gluon_serving_tuned/primitives.py",
+    "exported_sha256": "6d3b8c8c34f24a7e442d67a42db855189d3302aa36596007428e2d57934375f6",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/projection.py": {
+    "source_sha256": "93858b757551d83e428c7112effbcdd8d89fbba4cb600c6145cbedb1806d0150",
+    "source": "k3_gluon_serving_tuned/projection.py",
+    "exported_sha256": "92f738b3fbbf1a3bb837618ca90a1dece703f1890d9bd5c02fa3f7f9a649d29a",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_tuned/serving.py": {
+    "source_sha256": "07838dcc14272b4b8a471004054a3cbdb7e5ea7e37c1f5c35b7256d9fd4a31b8",
+    "source": "k3_gluon_serving_tuned/serving.py",
+    "exported_sha256": "e4612d4534fd112f35affaf4880655736a74167aad74a5fe4d7cb127e67fa996",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/__init__.py": {
+    "source_sha256": "bf9e408ce1b402e8c8156a56eca9b4948a3258b47bc143758d546853575f3622",
+    "source": "k3_gluon_serving_front32/__init__.py",
+    "exported_sha256": "d1b6270835517bcbbd840d3eac534234b99660adef89b91757c23b97a75e7664",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/attnres.py": {
+    "source_sha256": "a888fca53b14e2548b7730c44b59137437d1bb5e1cdfb8359da95b4af9f8d084",
+    "source": "k3_gluon_serving_front32/attnres.py",
+    "exported_sha256": "f83e8723b6d336b8645dab8b0caa0f035db164375e849c3a55737c06cc6a4711",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/coherent_memory.py": {
+    "source_sha256": "870a4ba5cc1eeab23fe7ebf7cee4a3f994abfdbfd4ce298667771b6fe49757af",
+    "source": "k3_gluon_serving_front32/coherent_memory.py",
+    "exported_sha256": "1aeba018f71404b40b67761c1931d796810d9292da13422a62cd452c83170598",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/collectives.py": {
+    "source_sha256": "33247a117994da91b817025bcf17b26dbccb7d8228a8885dba76b238e1863844",
+    "source": "k3_gluon_serving_front32/collectives.py",
+    "exported_sha256": "cb3dcef474efe3a231fcd4014f5f7ffc4baf911056e1f43005e44b2edf9b5323",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/complete_host.py": {
+    "source_sha256": "4aa6e99804113b560c399875d8f6c51f2cb23ff43b8ea979fb96ce68095ce9d7",
+    "source": "k3_gluon_serving_front32/complete_host.py",
+    "exported_sha256": "187df25435ebe59de129d96b07dced772d4f50c9bfcd5c15f02152e5cb229b18",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/diagnostics.py": {
+    "source_sha256": "625adb84bba9b6b160f27b7fefa3cb51043ff4a7e7dc74c2d33bd0fc42a74347",
+    "source": "k3_gluon_serving_front32/diagnostics.py",
+    "exported_sha256": "cc4c006c4a9d45323d1908516937d6c90b6c9bdad06d6dd75a43f5249381e4f2",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/expert_up.py": {
+    "source_sha256": "f9a6541835e8df418a8b09326f300f12bb9c80b8d86ba5652211c5398d8d1460",
+    "source": "k3_gluon_serving_front32/expert_up.py",
+    "exported_sha256": "3110d21e75a64e239c390741131f51ab0abc5106579598a18371c66aef26f492",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/moe_complete.py": {
+    "source_sha256": "079df1a75c89f0ec4376f014bb5550addce9571c040d07056b4957d46decd95b",
+    "source": "k3_gluon_serving_front32/moe_complete.py",
+    "exported_sha256": "ec35c1b8ac6d2149892828f1aadbb1772622f1406157ef63fa53cb4f72a311a5",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/moe_front.py": {
+    "source_sha256": "d11832b556ac878872818ca9e7d44b8ac47684a2c7c7d93595d61d5aa98a00a7",
+    "source": "k3_gluon_serving_front32/moe_front.py",
+    "exported_sha256": "7fda5124f212bdfc6dd0e1a2cda50c1ae8455723ba2d3cfd51ddd68e6b204f11",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_chain.py": {
+    "source_sha256": "48d5c6ad9239fc1230a18abf387a3af57345e6ca827bc6bbbbb2bdd797389c38",
+    "source": "k3_gluon_serving_front32/perf_chain.py",
+    "exported_sha256": "75278972de465c8d8bd679e1ffdbbd1bd03f3913ecc72c57f8138a11b4e8ec64",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_front32.py": {
+    "source_sha256": "b4ea93212718487d7649c1ce192a632cd16b93b901532f72876c6b5dbeae5826",
+    "source": "k3_gluon_serving_front32/perf_front32.py",
+    "exported_sha256": "b9860c01208c6b2ebc857463a34ca61619458fd5e1982502422cbbd89ef6f970",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_native_front.py": {
+    "source_sha256": "14e4394fa043f3ede4cf63f088d238b7f191bd7c824dd02dadddb42c4e56e317",
+    "source": "k3_gluon_serving_front32/perf_native_front.py",
+    "exported_sha256": "97744b2f2daa873e7a9c75f2f6dc7dfda8fc16d143757cad17d56d5c2363ce01",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_packed_scale.py": {
+    "source_sha256": "faebc9a0c1e8c2e16bdb117bc544daee70fb6c1aa8698e9e79ed149478380b41",
+    "source": "k3_gluon_serving_front32/perf_packed_scale.py",
+    "exported_sha256": "f5f33805af48ff1d105ca97137d3be060ca0dcfd7e89ec97bd9582578c84912c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_reference_chain.py": {
+    "source_sha256": "e783556c2781dff6cce6b4af5d1a27042c6ac5f1115d86b89765dcc9b868f49b",
+    "source": "k3_gluon_serving_front32/perf_reference_chain.py",
+    "exported_sha256": "cbe658819c311b085a18e4cffd1958c7cb498ece080c3e9c358e824aa80d2308",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_reference_down.py": {
+    "source_sha256": "cbe760c91dd51a3c88744421663428c6eae0a0c901f2502be42e692ffa70fc3c",
+    "source": "k3_gluon_serving_front32/perf_reference_down.py",
+    "exported_sha256": "61c8221ec390986d8e750a34aec9b4cc80aa8b0f5093d78a3b0643fb02044e91",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_reference_projection.py": {
+    "source_sha256": "2b4f5e78e4441385d662f8874ecf9d7245a994cb569723f809d7fd7e5388a849",
+    "source": "k3_gluon_serving_front32/perf_reference_projection.py",
+    "exported_sha256": "b351e25dab341384efe9ab1ecf41a34528e8b0f7ae1e23f293bc38ac23ceca02",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_reference_stages.py": {
+    "source_sha256": "ce07287e83eaf145fcd146701c24d3766ae274977dc8739dfd0446071230d798",
+    "source": "k3_gluon_serving_front32/perf_reference_stages.py",
+    "exported_sha256": "794bd70994b24f3221816e1eef9bc48d91cfd090d4fa01adfe220003ca65b3e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_reference_tail.py": {
+    "source_sha256": "a810e53607e94933595de9d73e8f047cb4308d084b3c0361cb13cacc61a19692",
+    "source": "k3_gluon_serving_front32/perf_reference_tail.py",
+    "exported_sha256": "7b5de8a492be4a49bc4c7fc5f08610d9e62dc8e7b3dc75d1e8754b62e9b6b79f",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_reference_up.py": {
+    "source_sha256": "387a1436336fc012e8f29c1199659077e07bc70c5fbb5bfe93f46cd861322420",
+    "source": "k3_gluon_serving_front32/perf_reference_up.py",
+    "exported_sha256": "7a1c86ec203a70e32197ebace6c63c98020f79df110894a5e5ab51445b051e7f",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_stages.py": {
+    "source_sha256": "f11a791f68d54edf317085fd13be76da72162edf28c6d0f7abf4ae3e4b038cb5",
+    "source": "k3_gluon_serving_front32/perf_stages.py",
+    "exported_sha256": "9c6cc4529dc9f931469c6be6f8b12b8be30826e45ac4d32b0848571bbf091427",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_timeline.py": {
+    "source_sha256": "0824cce224ac5c5ea42799fd1ae63e9467208f789dda0e003a547a0e96861bd1",
+    "source": "k3_gluon_serving_front32/perf_timeline.py",
+    "exported_sha256": "cb194606f2ff8753e7d23b36978b571104c667c2da77006e2d11614956c8df2b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/perf_tuned_up.py": {
+    "source_sha256": "632a2280b55082ae717b2b025b17ca3e8eba3a49c92416535769d736c20841b5",
+    "source": "k3_gluon_serving_front32/perf_tuned_up.py",
+    "exported_sha256": "22dfb60262f146d406a27fb46f89cacde8ae5f08cc555abe1414e4e2523520fa",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/primitives.py": {
+    "source_sha256": "1c5292d6e64759a3569be8089a798a5abf1ad683a3488f2d49fa85f1fbf0a810",
+    "source": "k3_gluon_serving_front32/primitives.py",
+    "exported_sha256": "6d3b8c8c34f24a7e442d67a42db855189d3302aa36596007428e2d57934375f6",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/projection.py": {
+    "source_sha256": "8f4eaaf5256f78f0745878ed622bb7d7e8e70731d8c72c3f2668ecbbea95041c",
+    "source": "k3_gluon_serving_front32/projection.py",
+    "exported_sha256": "62e7b264383a2533e548066dcf4ea7f7300fb26102179166fe910c721b9b22e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_front32/serving.py": {
+    "source_sha256": "07838dcc14272b4b8a471004054a3cbdb7e5ea7e37c1f5c35b7256d9fd4a31b8",
+    "source": "k3_gluon_serving_front32/serving.py",
+    "exported_sha256": "e4612d4534fd112f35affaf4880655736a74167aad74a5fe4d7cb127e67fa996",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/__init__.py": {
+    "source_sha256": "bf9e408ce1b402e8c8156a56eca9b4948a3258b47bc143758d546853575f3622",
+    "source": "k3_gluon_serving_b4tiles/__init__.py",
+    "exported_sha256": "d1b6270835517bcbbd840d3eac534234b99660adef89b91757c23b97a75e7664",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/attnres.py": {
+    "source_sha256": "58a0cd47aa97333f771df566106e23a579bb0203b9a78ff22c3b527a259f9e6f",
+    "source": "k3_gluon_serving_b4tiles/attnres.py",
+    "exported_sha256": "8c253f7892d23bd6d67116e6aa08b2604a33ca303b33ecfa1aa760372668967b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/coherent_memory.py": {
+    "source_sha256": "870a4ba5cc1eeab23fe7ebf7cee4a3f994abfdbfd4ce298667771b6fe49757af",
+    "source": "k3_gluon_serving_b4tiles/coherent_memory.py",
+    "exported_sha256": "1aeba018f71404b40b67761c1931d796810d9292da13422a62cd452c83170598",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/collectives.py": {
+    "source_sha256": "3a4c715a03d619442c72da6892b47e0029f450412d17ea531766414f3baec8b6",
+    "source": "k3_gluon_serving_b4tiles/collectives.py",
+    "exported_sha256": "cb3dcef474efe3a231fcd4014f5f7ffc4baf911056e1f43005e44b2edf9b5323",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/complete_host.py": {
+    "source_sha256": "402c33de9bfb78d998928f5364049595efe0394413e966bd128bd923af2d4faa",
+    "source": "k3_gluon_serving_b4tiles/complete_host.py",
+    "exported_sha256": "5d6ee15300e5b607b80f4e46190367012e90578782644c266e8380e80abeffe1",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/diagnostics.py": {
+    "source_sha256": "3745a7d2f566e66f8435335bfbd3e2e72f05a0e9410b870d8421dd1e552188d7",
+    "source": "k3_gluon_serving_b4tiles/diagnostics.py",
+    "exported_sha256": "cc4c006c4a9d45323d1908516937d6c90b6c9bdad06d6dd75a43f5249381e4f2",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/expert_up.py": {
+    "source_sha256": "f9a6541835e8df418a8b09326f300f12bb9c80b8d86ba5652211c5398d8d1460",
+    "source": "k3_gluon_serving_b4tiles/expert_up.py",
+    "exported_sha256": "3110d21e75a64e239c390741131f51ab0abc5106579598a18371c66aef26f492",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/moe_complete.py": {
+    "source_sha256": "61d2949fa275db9648c8c0c6d5d5339a8585c2bb61d778373dfda84fb52051c4",
+    "source": "k3_gluon_serving_b4tiles/moe_complete.py",
+    "exported_sha256": "ec35c1b8ac6d2149892828f1aadbb1772622f1406157ef63fa53cb4f72a311a5",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/moe_front.py": {
+    "source_sha256": "8919a6c62f939f6abfd754eff525b9f84842b1d473230c4257c53a8baeb8c6b5",
+    "source": "k3_gluon_serving_b4tiles/moe_front.py",
+    "exported_sha256": "265c8991bfab72db173a6f21505bcfd236ec2788e28dc92fcb5aba02633bed43",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_chain.py": {
+    "source_sha256": "48d5c6ad9239fc1230a18abf387a3af57345e6ca827bc6bbbbb2bdd797389c38",
+    "source": "k3_gluon_serving_b4tiles/perf_chain.py",
+    "exported_sha256": "75278972de465c8d8bd679e1ffdbbd1bd03f3913ecc72c57f8138a11b4e8ec64",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_front32.py": {
+    "source_sha256": "7cb1bbd3fc41a40004ff2e4a27187e2e9309d98931f47b89d75ea08233e3330e",
+    "source": "k3_gluon_serving_b4tiles/perf_front32.py",
+    "exported_sha256": "910139738a07b503cf1d372f1c8d801b3f0d8f1dd4ab5dca5f5010749047a331",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_native_front.py": {
+    "source_sha256": "3bbcb7a6b794c6a83523add084ded188c2cce89a9f70bb3f42a24d523e1319a0",
+    "source": "k3_gluon_serving_b4tiles/perf_native_front.py",
+    "exported_sha256": "be2d7e4214325c0a4f48d30b891b1b942a4eacdd949bc4dffb350c2e6e3d8bc4",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_packed_scale.py": {
+    "source_sha256": "9addf744088f6b245230b412fe3a729d111a68109e102eb4ab975222adb68775",
+    "source": "k3_gluon_serving_b4tiles/perf_packed_scale.py",
+    "exported_sha256": "f5f33805af48ff1d105ca97137d3be060ca0dcfd7e89ec97bd9582578c84912c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_reference_chain.py": {
+    "source_sha256": "c1a73e18534cd5185ea07ec1da0684ec8c6f4f33000e577df065e663361753da",
+    "source": "k3_gluon_serving_b4tiles/perf_reference_chain.py",
+    "exported_sha256": "1a0007045615423a2a65aeaa172421167d51471e0b8111bf2466ba9045899620",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_reference_down.py": {
+    "source_sha256": "cbe760c91dd51a3c88744421663428c6eae0a0c901f2502be42e692ffa70fc3c",
+    "source": "k3_gluon_serving_b4tiles/perf_reference_down.py",
+    "exported_sha256": "61c8221ec390986d8e750a34aec9b4cc80aa8b0f5093d78a3b0643fb02044e91",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_reference_projection.py": {
+    "source_sha256": "2b4f5e78e4441385d662f8874ecf9d7245a994cb569723f809d7fd7e5388a849",
+    "source": "k3_gluon_serving_b4tiles/perf_reference_projection.py",
+    "exported_sha256": "b351e25dab341384efe9ab1ecf41a34528e8b0f7ae1e23f293bc38ac23ceca02",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_reference_stages.py": {
+    "source_sha256": "ce07287e83eaf145fcd146701c24d3766ae274977dc8739dfd0446071230d798",
+    "source": "k3_gluon_serving_b4tiles/perf_reference_stages.py",
+    "exported_sha256": "794bd70994b24f3221816e1eef9bc48d91cfd090d4fa01adfe220003ca65b3e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_reference_tail.py": {
+    "source_sha256": "828e004f63f32f5050f6ed97c885c7812c4d32af70a351028953bd1737d2f6ff",
+    "source": "k3_gluon_serving_b4tiles/perf_reference_tail.py",
+    "exported_sha256": "ab04960e8836544081b5e3ee1219d530c5df796fb5e1acc723e739fca92f44ab",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_reference_up.py": {
+    "source_sha256": "387a1436336fc012e8f29c1199659077e07bc70c5fbb5bfe93f46cd861322420",
+    "source": "k3_gluon_serving_b4tiles/perf_reference_up.py",
+    "exported_sha256": "7a1c86ec203a70e32197ebace6c63c98020f79df110894a5e5ab51445b051e7f",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_stages.py": {
+    "source_sha256": "f11a791f68d54edf317085fd13be76da72162edf28c6d0f7abf4ae3e4b038cb5",
+    "source": "k3_gluon_serving_b4tiles/perf_stages.py",
+    "exported_sha256": "9c6cc4529dc9f931469c6be6f8b12b8be30826e45ac4d32b0848571bbf091427",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_timeline.py": {
+    "source_sha256": "c38b79aaa3897d923c77a876519fa489f0aa2c0a3a80353e3e2cea8c35491c30",
+    "source": "k3_gluon_serving_b4tiles/perf_timeline.py",
+    "exported_sha256": "dc4ca3f6290982aea34481dcbde97ca99ef235f378a7dbebd44a741df0e5f92c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/perf_tuned_up.py": {
+    "source_sha256": "632a2280b55082ae717b2b025b17ca3e8eba3a49c92416535769d736c20841b5",
+    "source": "k3_gluon_serving_b4tiles/perf_tuned_up.py",
+    "exported_sha256": "22dfb60262f146d406a27fb46f89cacde8ae5f08cc555abe1414e4e2523520fa",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/primitives.py": {
+    "source_sha256": "5970045c0bcb62eaee00f85b039702da248a1489b843e93e119b09f6a3056976",
+    "source": "k3_gluon_serving_b4tiles/primitives.py",
+    "exported_sha256": "6d3b8c8c34f24a7e442d67a42db855189d3302aa36596007428e2d57934375f6",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/projection.py": {
+    "source_sha256": "3fe29ba36b0c84fded29df454e5c37e06e8c3c33207d244d14db03c5ec6cd421",
+    "source": "k3_gluon_serving_b4tiles/projection.py",
+    "exported_sha256": "6ae3b7181c7ee374561c994445b0f5d4838cb97d88750fd01b8749649eeafe4c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4tiles/serving.py": {
+    "source_sha256": "07838dcc14272b4b8a471004054a3cbdb7e5ea7e37c1f5c35b7256d9fd4a31b8",
+    "source": "k3_gluon_serving_b4tiles/serving.py",
+    "exported_sha256": "e4612d4534fd112f35affaf4880655736a74167aad74a5fe4d7cb127e67fa996",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/__init__.py": {
+    "source_sha256": "bf9e408ce1b402e8c8156a56eca9b4948a3258b47bc143758d546853575f3622",
+    "source": "k3_gluon_serving_b4grid512/__init__.py",
+    "exported_sha256": "d1b6270835517bcbbd840d3eac534234b99660adef89b91757c23b97a75e7664",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/attnres.py": {
+    "source_sha256": "58a0cd47aa97333f771df566106e23a579bb0203b9a78ff22c3b527a259f9e6f",
+    "source": "k3_gluon_serving_b4grid512/attnres.py",
+    "exported_sha256": "8c253f7892d23bd6d67116e6aa08b2604a33ca303b33ecfa1aa760372668967b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/coherent_memory.py": {
+    "source_sha256": "870a4ba5cc1eeab23fe7ebf7cee4a3f994abfdbfd4ce298667771b6fe49757af",
+    "source": "k3_gluon_serving_b4grid512/coherent_memory.py",
+    "exported_sha256": "1aeba018f71404b40b67761c1931d796810d9292da13422a62cd452c83170598",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/collectives.py": {
+    "source_sha256": "3a4c715a03d619442c72da6892b47e0029f450412d17ea531766414f3baec8b6",
+    "source": "k3_gluon_serving_b4grid512/collectives.py",
+    "exported_sha256": "cb3dcef474efe3a231fcd4014f5f7ffc4baf911056e1f43005e44b2edf9b5323",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/complete_host.py": {
+    "source_sha256": "402c33de9bfb78d998928f5364049595efe0394413e966bd128bd923af2d4faa",
+    "source": "k3_gluon_serving_b4grid512/complete_host.py",
+    "exported_sha256": "5d6ee15300e5b607b80f4e46190367012e90578782644c266e8380e80abeffe1",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/diagnostics.py": {
+    "source_sha256": "3745a7d2f566e66f8435335bfbd3e2e72f05a0e9410b870d8421dd1e552188d7",
+    "source": "k3_gluon_serving_b4grid512/diagnostics.py",
+    "exported_sha256": "cc4c006c4a9d45323d1908516937d6c90b6c9bdad06d6dd75a43f5249381e4f2",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/expert_up.py": {
+    "source_sha256": "f9a6541835e8df418a8b09326f300f12bb9c80b8d86ba5652211c5398d8d1460",
+    "source": "k3_gluon_serving_b4grid512/expert_up.py",
+    "exported_sha256": "3110d21e75a64e239c390741131f51ab0abc5106579598a18371c66aef26f492",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/moe_complete.py": {
+    "source_sha256": "61d2949fa275db9648c8c0c6d5d5339a8585c2bb61d778373dfda84fb52051c4",
+    "source": "k3_gluon_serving_b4grid512/moe_complete.py",
+    "exported_sha256": "ec35c1b8ac6d2149892828f1aadbb1772622f1406157ef63fa53cb4f72a311a5",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/moe_front.py": {
+    "source_sha256": "8919a6c62f939f6abfd754eff525b9f84842b1d473230c4257c53a8baeb8c6b5",
+    "source": "k3_gluon_serving_b4grid512/moe_front.py",
+    "exported_sha256": "265c8991bfab72db173a6f21505bcfd236ec2788e28dc92fcb5aba02633bed43",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_chain.py": {
+    "source_sha256": "48d5c6ad9239fc1230a18abf387a3af57345e6ca827bc6bbbbb2bdd797389c38",
+    "source": "k3_gluon_serving_b4grid512/perf_chain.py",
+    "exported_sha256": "75278972de465c8d8bd679e1ffdbbd1bd03f3913ecc72c57f8138a11b4e8ec64",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_front32.py": {
+    "source_sha256": "7cb1bbd3fc41a40004ff2e4a27187e2e9309d98931f47b89d75ea08233e3330e",
+    "source": "k3_gluon_serving_b4grid512/perf_front32.py",
+    "exported_sha256": "910139738a07b503cf1d372f1c8d801b3f0d8f1dd4ab5dca5f5010749047a331",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_native_front.py": {
+    "source_sha256": "3bbcb7a6b794c6a83523add084ded188c2cce89a9f70bb3f42a24d523e1319a0",
+    "source": "k3_gluon_serving_b4grid512/perf_native_front.py",
+    "exported_sha256": "be2d7e4214325c0a4f48d30b891b1b942a4eacdd949bc4dffb350c2e6e3d8bc4",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_packed_scale.py": {
+    "source_sha256": "9addf744088f6b245230b412fe3a729d111a68109e102eb4ab975222adb68775",
+    "source": "k3_gluon_serving_b4grid512/perf_packed_scale.py",
+    "exported_sha256": "f5f33805af48ff1d105ca97137d3be060ca0dcfd7e89ec97bd9582578c84912c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_reference_chain.py": {
+    "source_sha256": "c1a73e18534cd5185ea07ec1da0684ec8c6f4f33000e577df065e663361753da",
+    "source": "k3_gluon_serving_b4grid512/perf_reference_chain.py",
+    "exported_sha256": "1a0007045615423a2a65aeaa172421167d51471e0b8111bf2466ba9045899620",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_reference_down.py": {
+    "source_sha256": "cbe760c91dd51a3c88744421663428c6eae0a0c901f2502be42e692ffa70fc3c",
+    "source": "k3_gluon_serving_b4grid512/perf_reference_down.py",
+    "exported_sha256": "61c8221ec390986d8e750a34aec9b4cc80aa8b0f5093d78a3b0643fb02044e91",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_reference_projection.py": {
+    "source_sha256": "2b4f5e78e4441385d662f8874ecf9d7245a994cb569723f809d7fd7e5388a849",
+    "source": "k3_gluon_serving_b4grid512/perf_reference_projection.py",
+    "exported_sha256": "b351e25dab341384efe9ab1ecf41a34528e8b0f7ae1e23f293bc38ac23ceca02",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_reference_stages.py": {
+    "source_sha256": "ce07287e83eaf145fcd146701c24d3766ae274977dc8739dfd0446071230d798",
+    "source": "k3_gluon_serving_b4grid512/perf_reference_stages.py",
+    "exported_sha256": "794bd70994b24f3221816e1eef9bc48d91cfd090d4fa01adfe220003ca65b3e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_reference_tail.py": {
+    "source_sha256": "69daffbc87e8e554d19e86d1773f187aa2c55a8c0a2e10cb0acd45d7c1ed1e0f",
+    "source": "k3_gluon_serving_b4grid512/perf_reference_tail.py",
+    "exported_sha256": "da3111152e35c38ba834a27947ba41afb10682961264e7e14ec48ecf3a360989",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_reference_up.py": {
+    "source_sha256": "95a00129991a2090d3341ffdeda0f485eefa5e4fd1a3530177468601192a29a3",
+    "source": "k3_gluon_serving_b4grid512/perf_reference_up.py",
+    "exported_sha256": "fb45caf51422ee21f48cf883dd4da2d028461987ee7253ed4d086c7ae3e2e588",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_stages.py": {
+    "source_sha256": "f11a791f68d54edf317085fd13be76da72162edf28c6d0f7abf4ae3e4b038cb5",
+    "source": "k3_gluon_serving_b4grid512/perf_stages.py",
+    "exported_sha256": "9c6cc4529dc9f931469c6be6f8b12b8be30826e45ac4d32b0848571bbf091427",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_timeline.py": {
+    "source_sha256": "e05b94f5b306920076acefb28f13a1283549300815bb12b2a16151089ddc9171",
+    "source": "k3_gluon_serving_b4grid512/perf_timeline.py",
+    "exported_sha256": "fca471c196682d57866bc69606880e47f2da46b56a76d0ebaa2ebf8e07ea4e8d",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/perf_tuned_up.py": {
+    "source_sha256": "632a2280b55082ae717b2b025b17ca3e8eba3a49c92416535769d736c20841b5",
+    "source": "k3_gluon_serving_b4grid512/perf_tuned_up.py",
+    "exported_sha256": "22dfb60262f146d406a27fb46f89cacde8ae5f08cc555abe1414e4e2523520fa",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/primitives.py": {
+    "source_sha256": "5970045c0bcb62eaee00f85b039702da248a1489b843e93e119b09f6a3056976",
+    "source": "k3_gluon_serving_b4grid512/primitives.py",
+    "exported_sha256": "6d3b8c8c34f24a7e442d67a42db855189d3302aa36596007428e2d57934375f6",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/projection.py": {
+    "source_sha256": "3fe29ba36b0c84fded29df454e5c37e06e8c3c33207d244d14db03c5ec6cd421",
+    "source": "k3_gluon_serving_b4grid512/projection.py",
+    "exported_sha256": "6ae3b7181c7ee374561c994445b0f5d4838cb97d88750fd01b8749649eeafe4c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b4grid512/serving.py": {
+    "source_sha256": "07838dcc14272b4b8a471004054a3cbdb7e5ea7e37c1f5c35b7256d9fd4a31b8",
+    "source": "k3_gluon_serving_b4grid512/serving.py",
+    "exported_sha256": "e4612d4534fd112f35affaf4880655736a74167aad74a5fe4d7cb127e67fa996",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/__init__.py": {
+    "source_sha256": "bf9e408ce1b402e8c8156a56eca9b4948a3258b47bc143758d546853575f3622",
+    "source": "k3_gluon_serving_b8grid512/__init__.py",
+    "exported_sha256": "d1b6270835517bcbbd840d3eac534234b99660adef89b91757c23b97a75e7664",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/attnres.py": {
+    "source_sha256": "58a0cd47aa97333f771df566106e23a579bb0203b9a78ff22c3b527a259f9e6f",
+    "source": "k3_gluon_serving_b8grid512/attnres.py",
+    "exported_sha256": "8c253f7892d23bd6d67116e6aa08b2604a33ca303b33ecfa1aa760372668967b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/coherent_memory.py": {
+    "source_sha256": "870a4ba5cc1eeab23fe7ebf7cee4a3f994abfdbfd4ce298667771b6fe49757af",
+    "source": "k3_gluon_serving_b8grid512/coherent_memory.py",
+    "exported_sha256": "1aeba018f71404b40b67761c1931d796810d9292da13422a62cd452c83170598",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/collectives.py": {
+    "source_sha256": "3a4c715a03d619442c72da6892b47e0029f450412d17ea531766414f3baec8b6",
+    "source": "k3_gluon_serving_b8grid512/collectives.py",
+    "exported_sha256": "cb3dcef474efe3a231fcd4014f5f7ffc4baf911056e1f43005e44b2edf9b5323",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/complete_host.py": {
+    "source_sha256": "402c33de9bfb78d998928f5364049595efe0394413e966bd128bd923af2d4faa",
+    "source": "k3_gluon_serving_b8grid512/complete_host.py",
+    "exported_sha256": "5d6ee15300e5b607b80f4e46190367012e90578782644c266e8380e80abeffe1",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/diagnostics.py": {
+    "source_sha256": "3745a7d2f566e66f8435335bfbd3e2e72f05a0e9410b870d8421dd1e552188d7",
+    "source": "k3_gluon_serving_b8grid512/diagnostics.py",
+    "exported_sha256": "cc4c006c4a9d45323d1908516937d6c90b6c9bdad06d6dd75a43f5249381e4f2",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/expert_up.py": {
+    "source_sha256": "f9a6541835e8df418a8b09326f300f12bb9c80b8d86ba5652211c5398d8d1460",
+    "source": "k3_gluon_serving_b8grid512/expert_up.py",
+    "exported_sha256": "3110d21e75a64e239c390741131f51ab0abc5106579598a18371c66aef26f492",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/moe_complete.py": {
+    "source_sha256": "61d2949fa275db9648c8c0c6d5d5339a8585c2bb61d778373dfda84fb52051c4",
+    "source": "k3_gluon_serving_b8grid512/moe_complete.py",
+    "exported_sha256": "ec35c1b8ac6d2149892828f1aadbb1772622f1406157ef63fa53cb4f72a311a5",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/moe_front.py": {
+    "source_sha256": "8919a6c62f939f6abfd754eff525b9f84842b1d473230c4257c53a8baeb8c6b5",
+    "source": "k3_gluon_serving_b8grid512/moe_front.py",
+    "exported_sha256": "265c8991bfab72db173a6f21505bcfd236ec2788e28dc92fcb5aba02633bed43",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_chain.py": {
+    "source_sha256": "48d5c6ad9239fc1230a18abf387a3af57345e6ca827bc6bbbbb2bdd797389c38",
+    "source": "k3_gluon_serving_b8grid512/perf_chain.py",
+    "exported_sha256": "75278972de465c8d8bd679e1ffdbbd1bd03f3913ecc72c57f8138a11b4e8ec64",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_front32.py": {
+    "source_sha256": "200fcb82642ae8a578f2e5efc42c2dbe9e4f7d5c627481af3a90f5af3a870887",
+    "source": "k3_gluon_serving_b8grid512/perf_front32.py",
+    "exported_sha256": "11f16b61748f6adae458a02788a4c851ec8e3a54adc766ed7990c91186259722",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_native_front.py": {
+    "source_sha256": "3bbcb7a6b794c6a83523add084ded188c2cce89a9f70bb3f42a24d523e1319a0",
+    "source": "k3_gluon_serving_b8grid512/perf_native_front.py",
+    "exported_sha256": "be2d7e4214325c0a4f48d30b891b1b942a4eacdd949bc4dffb350c2e6e3d8bc4",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_packed_scale.py": {
+    "source_sha256": "9addf744088f6b245230b412fe3a729d111a68109e102eb4ab975222adb68775",
+    "source": "k3_gluon_serving_b8grid512/perf_packed_scale.py",
+    "exported_sha256": "f5f33805af48ff1d105ca97137d3be060ca0dcfd7e89ec97bd9582578c84912c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_reference_chain.py": {
+    "source_sha256": "c1a73e18534cd5185ea07ec1da0684ec8c6f4f33000e577df065e663361753da",
+    "source": "k3_gluon_serving_b8grid512/perf_reference_chain.py",
+    "exported_sha256": "1a0007045615423a2a65aeaa172421167d51471e0b8111bf2466ba9045899620",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_reference_down.py": {
+    "source_sha256": "cbe760c91dd51a3c88744421663428c6eae0a0c901f2502be42e692ffa70fc3c",
+    "source": "k3_gluon_serving_b8grid512/perf_reference_down.py",
+    "exported_sha256": "61c8221ec390986d8e750a34aec9b4cc80aa8b0f5093d78a3b0643fb02044e91",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_reference_projection.py": {
+    "source_sha256": "2b4f5e78e4441385d662f8874ecf9d7245a994cb569723f809d7fd7e5388a849",
+    "source": "k3_gluon_serving_b8grid512/perf_reference_projection.py",
+    "exported_sha256": "b351e25dab341384efe9ab1ecf41a34528e8b0f7ae1e23f293bc38ac23ceca02",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_reference_stages.py": {
+    "source_sha256": "ce07287e83eaf145fcd146701c24d3766ae274977dc8739dfd0446071230d798",
+    "source": "k3_gluon_serving_b8grid512/perf_reference_stages.py",
+    "exported_sha256": "794bd70994b24f3221816e1eef9bc48d91cfd090d4fa01adfe220003ca65b3e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_reference_tail.py": {
+    "source_sha256": "69daffbc87e8e554d19e86d1773f187aa2c55a8c0a2e10cb0acd45d7c1ed1e0f",
+    "source": "k3_gluon_serving_b8grid512/perf_reference_tail.py",
+    "exported_sha256": "da3111152e35c38ba834a27947ba41afb10682961264e7e14ec48ecf3a360989",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_reference_up.py": {
+    "source_sha256": "95a00129991a2090d3341ffdeda0f485eefa5e4fd1a3530177468601192a29a3",
+    "source": "k3_gluon_serving_b8grid512/perf_reference_up.py",
+    "exported_sha256": "fb45caf51422ee21f48cf883dd4da2d028461987ee7253ed4d086c7ae3e2e588",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_stages.py": {
+    "source_sha256": "f11a791f68d54edf317085fd13be76da72162edf28c6d0f7abf4ae3e4b038cb5",
+    "source": "k3_gluon_serving_b8grid512/perf_stages.py",
+    "exported_sha256": "9c6cc4529dc9f931469c6be6f8b12b8be30826e45ac4d32b0848571bbf091427",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_timeline.py": {
+    "source_sha256": "e05b94f5b306920076acefb28f13a1283549300815bb12b2a16151089ddc9171",
+    "source": "k3_gluon_serving_b8grid512/perf_timeline.py",
+    "exported_sha256": "fca471c196682d57866bc69606880e47f2da46b56a76d0ebaa2ebf8e07ea4e8d",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/perf_tuned_up.py": {
+    "source_sha256": "632a2280b55082ae717b2b025b17ca3e8eba3a49c92416535769d736c20841b5",
+    "source": "k3_gluon_serving_b8grid512/perf_tuned_up.py",
+    "exported_sha256": "22dfb60262f146d406a27fb46f89cacde8ae5f08cc555abe1414e4e2523520fa",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/primitives.py": {
+    "source_sha256": "5970045c0bcb62eaee00f85b039702da248a1489b843e93e119b09f6a3056976",
+    "source": "k3_gluon_serving_b8grid512/primitives.py",
+    "exported_sha256": "6d3b8c8c34f24a7e442d67a42db855189d3302aa36596007428e2d57934375f6",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/projection.py": {
+    "source_sha256": "3fe29ba36b0c84fded29df454e5c37e06e8c3c33207d244d14db03c5ec6cd421",
+    "source": "k3_gluon_serving_b8grid512/projection.py",
+    "exported_sha256": "6ae3b7181c7ee374561c994445b0f5d4838cb97d88750fd01b8749649eeafe4c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_serving_b8grid512/serving.py": {
+    "source_sha256": "07838dcc14272b4b8a471004054a3cbdb7e5ea7e37c1f5c35b7256d9fd4a31b8",
+    "source": "k3_gluon_serving_b8grid512/serving.py",
+    "exported_sha256": "e4612d4534fd112f35affaf4880655736a74167aad74a5fe4d7cb127e67fa996",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/__init__.py": {
+    "source_sha256": "bf9e408ce1b402e8c8156a56eca9b4948a3258b47bc143758d546853575f3622",
+    "source": "k3_gluon_hybrid_b8/__init__.py",
+    "exported_sha256": "d1b6270835517bcbbd840d3eac534234b99660adef89b91757c23b97a75e7664",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/attnres.py": {
+    "source_sha256": "58a0cd47aa97333f771df566106e23a579bb0203b9a78ff22c3b527a259f9e6f",
+    "source": "k3_gluon_hybrid_b8/attnres.py",
+    "exported_sha256": "8c253f7892d23bd6d67116e6aa08b2604a33ca303b33ecfa1aa760372668967b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/coherent_memory.py": {
+    "source_sha256": "870a4ba5cc1eeab23fe7ebf7cee4a3f994abfdbfd4ce298667771b6fe49757af",
+    "source": "k3_gluon_hybrid_b8/coherent_memory.py",
+    "exported_sha256": "1aeba018f71404b40b67761c1931d796810d9292da13422a62cd452c83170598",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/collectives.py": {
+    "source_sha256": "3a4c715a03d619442c72da6892b47e0029f450412d17ea531766414f3baec8b6",
+    "source": "k3_gluon_hybrid_b8/collectives.py",
+    "exported_sha256": "cb3dcef474efe3a231fcd4014f5f7ffc4baf911056e1f43005e44b2edf9b5323",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/complete_host.py": {
+    "source_sha256": "402c33de9bfb78d998928f5364049595efe0394413e966bd128bd923af2d4faa",
+    "source": "k3_gluon_hybrid_b8/complete_host.py",
+    "exported_sha256": "5d6ee15300e5b607b80f4e46190367012e90578782644c266e8380e80abeffe1",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/diagnostics.py": {
+    "source_sha256": "3745a7d2f566e66f8435335bfbd3e2e72f05a0e9410b870d8421dd1e552188d7",
+    "source": "k3_gluon_hybrid_b8/diagnostics.py",
+    "exported_sha256": "cc4c006c4a9d45323d1908516937d6c90b6c9bdad06d6dd75a43f5249381e4f2",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/expert_up.py": {
+    "source_sha256": "f9a6541835e8df418a8b09326f300f12bb9c80b8d86ba5652211c5398d8d1460",
+    "source": "k3_gluon_hybrid_b8/expert_up.py",
+    "exported_sha256": "3110d21e75a64e239c390741131f51ab0abc5106579598a18371c66aef26f492",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/host.py": {
+    "source_sha256": "916460d3f8ef25d895284f87095b9fa9819026a92aecdd0cb03cb61e2647866b",
+    "source": "k3_gluon_hybrid_b8/host.py",
+    "exported_sha256": "ab3a2d0824638e99635020aba6ea15d39092e4e5aea8067816de787f467b0d3a",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/moe_complete.py": {
+    "source_sha256": "61d2949fa275db9648c8c0c6d5d5339a8585c2bb61d778373dfda84fb52051c4",
+    "source": "k3_gluon_hybrid_b8/moe_complete.py",
+    "exported_sha256": "ec35c1b8ac6d2149892828f1aadbb1772622f1406157ef63fa53cb4f72a311a5",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/moe_front.py": {
+    "source_sha256": "8919a6c62f939f6abfd754eff525b9f84842b1d473230c4257c53a8baeb8c6b5",
+    "source": "k3_gluon_hybrid_b8/moe_front.py",
+    "exported_sha256": "265c8991bfab72db173a6f21505bcfd236ec2788e28dc92fcb5aba02633bed43",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_chain.py": {
+    "source_sha256": "48d5c6ad9239fc1230a18abf387a3af57345e6ca827bc6bbbbb2bdd797389c38",
+    "source": "k3_gluon_hybrid_b8/perf_chain.py",
+    "exported_sha256": "75278972de465c8d8bd679e1ffdbbd1bd03f3913ecc72c57f8138a11b4e8ec64",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_front32.py": {
+    "source_sha256": "200fcb82642ae8a578f2e5efc42c2dbe9e4f7d5c627481af3a90f5af3a870887",
+    "source": "k3_gluon_hybrid_b8/perf_front32.py",
+    "exported_sha256": "11f16b61748f6adae458a02788a4c851ec8e3a54adc766ed7990c91186259722",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_native_front.py": {
+    "source_sha256": "3bbcb7a6b794c6a83523add084ded188c2cce89a9f70bb3f42a24d523e1319a0",
+    "source": "k3_gluon_hybrid_b8/perf_native_front.py",
+    "exported_sha256": "be2d7e4214325c0a4f48d30b891b1b942a4eacdd949bc4dffb350c2e6e3d8bc4",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_packed_scale.py": {
+    "source_sha256": "9addf744088f6b245230b412fe3a729d111a68109e102eb4ab975222adb68775",
+    "source": "k3_gluon_hybrid_b8/perf_packed_scale.py",
+    "exported_sha256": "f5f33805af48ff1d105ca97137d3be060ca0dcfd7e89ec97bd9582578c84912c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_reference_chain.py": {
+    "source_sha256": "a92418dd37dca2fdf0803e319f606edd8248a7bc08c96740d8bd1af985e521f3",
+    "source": "k3_gluon_hybrid_b8/perf_reference_chain.py",
+    "exported_sha256": "f825d8dd293a3ebfdaed8c80d70045930b12906673e1a8c8c3f09e31a5900763",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_reference_down.py": {
+    "source_sha256": "cbe760c91dd51a3c88744421663428c6eae0a0c901f2502be42e692ffa70fc3c",
+    "source": "k3_gluon_hybrid_b8/perf_reference_down.py",
+    "exported_sha256": "61c8221ec390986d8e750a34aec9b4cc80aa8b0f5093d78a3b0643fb02044e91",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_reference_projection.py": {
+    "source_sha256": "2b4f5e78e4441385d662f8874ecf9d7245a994cb569723f809d7fd7e5388a849",
+    "source": "k3_gluon_hybrid_b8/perf_reference_projection.py",
+    "exported_sha256": "b351e25dab341384efe9ab1ecf41a34528e8b0f7ae1e23f293bc38ac23ceca02",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_reference_stages.py": {
+    "source_sha256": "ce07287e83eaf145fcd146701c24d3766ae274977dc8739dfd0446071230d798",
+    "source": "k3_gluon_hybrid_b8/perf_reference_stages.py",
+    "exported_sha256": "794bd70994b24f3221816e1eef9bc48d91cfd090d4fa01adfe220003ca65b3e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_reference_tail.py": {
+    "source_sha256": "01c6bfa331002df1c272f03411bfebd6e3c7b951f896b5da49974f780e43d4c9",
+    "source": "k3_gluon_hybrid_b8/perf_reference_tail.py",
+    "exported_sha256": "e1c9c662874e9813f9f6a5cbb9ecb971fd9e58f1bdbb0339a863422eb9fbcd06",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_reference_up.py": {
+    "source_sha256": "95a00129991a2090d3341ffdeda0f485eefa5e4fd1a3530177468601192a29a3",
+    "source": "k3_gluon_hybrid_b8/perf_reference_up.py",
+    "exported_sha256": "fb45caf51422ee21f48cf883dd4da2d028461987ee7253ed4d086c7ae3e2e588",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_stages.py": {
+    "source_sha256": "f11a791f68d54edf317085fd13be76da72162edf28c6d0f7abf4ae3e4b038cb5",
+    "source": "k3_gluon_hybrid_b8/perf_stages.py",
+    "exported_sha256": "9c6cc4529dc9f931469c6be6f8b12b8be30826e45ac4d32b0848571bbf091427",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_timeline.py": {
+    "source_sha256": "e05b94f5b306920076acefb28f13a1283549300815bb12b2a16151089ddc9171",
+    "source": "k3_gluon_hybrid_b8/perf_timeline.py",
+    "exported_sha256": "fca471c196682d57866bc69606880e47f2da46b56a76d0ebaa2ebf8e07ea4e8d",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/perf_tuned_up.py": {
+    "source_sha256": "632a2280b55082ae717b2b025b17ca3e8eba3a49c92416535769d736c20841b5",
+    "source": "k3_gluon_hybrid_b8/perf_tuned_up.py",
+    "exported_sha256": "22dfb60262f146d406a27fb46f89cacde8ae5f08cc555abe1414e4e2523520fa",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/primitives.py": {
+    "source_sha256": "5970045c0bcb62eaee00f85b039702da248a1489b843e93e119b09f6a3056976",
+    "source": "k3_gluon_hybrid_b8/primitives.py",
+    "exported_sha256": "6d3b8c8c34f24a7e442d67a42db855189d3302aa36596007428e2d57934375f6",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/projection.py": {
+    "source_sha256": "3fe29ba36b0c84fded29df454e5c37e06e8c3c33207d244d14db03c5ec6cd421",
+    "source": "k3_gluon_hybrid_b8/projection.py",
+    "exported_sha256": "6ae3b7181c7ee374561c994445b0f5d4838cb97d88750fd01b8749649eeafe4c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_b8/serving.py": {
+    "source_sha256": "07838dcc14272b4b8a471004054a3cbdb7e5ea7e37c1f5c35b7256d9fd4a31b8",
+    "source": "k3_gluon_hybrid_b8/serving.py",
+    "exported_sha256": "e4612d4534fd112f35affaf4880655736a74167aad74a5fe4d7cb127e67fa996",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/__init__.py": {
+    "source_sha256": "bf9e408ce1b402e8c8156a56eca9b4948a3258b47bc143758d546853575f3622",
+    "source": "k3_gluon_hybrid_sort_b8/__init__.py",
+    "exported_sha256": "d1b6270835517bcbbd840d3eac534234b99660adef89b91757c23b97a75e7664",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/attnres.py": {
+    "source_sha256": "58a0cd47aa97333f771df566106e23a579bb0203b9a78ff22c3b527a259f9e6f",
+    "source": "k3_gluon_hybrid_sort_b8/attnres.py",
+    "exported_sha256": "8c253f7892d23bd6d67116e6aa08b2604a33ca303b33ecfa1aa760372668967b",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/coherent_memory.py": {
+    "source_sha256": "870a4ba5cc1eeab23fe7ebf7cee4a3f994abfdbfd4ce298667771b6fe49757af",
+    "source": "k3_gluon_hybrid_sort_b8/coherent_memory.py",
+    "exported_sha256": "1aeba018f71404b40b67761c1931d796810d9292da13422a62cd452c83170598",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/collectives.py": {
+    "source_sha256": "3a4c715a03d619442c72da6892b47e0029f450412d17ea531766414f3baec8b6",
+    "source": "k3_gluon_hybrid_sort_b8/collectives.py",
+    "exported_sha256": "cb3dcef474efe3a231fcd4014f5f7ffc4baf911056e1f43005e44b2edf9b5323",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/complete_host.py": {
+    "source_sha256": "402c33de9bfb78d998928f5364049595efe0394413e966bd128bd923af2d4faa",
+    "source": "k3_gluon_hybrid_sort_b8/complete_host.py",
+    "exported_sha256": "5d6ee15300e5b607b80f4e46190367012e90578782644c266e8380e80abeffe1",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/diagnostics.py": {
+    "source_sha256": "3745a7d2f566e66f8435335bfbd3e2e72f05a0e9410b870d8421dd1e552188d7",
+    "source": "k3_gluon_hybrid_sort_b8/diagnostics.py",
+    "exported_sha256": "cc4c006c4a9d45323d1908516937d6c90b6c9bdad06d6dd75a43f5249381e4f2",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/expert_up.py": {
+    "source_sha256": "f9a6541835e8df418a8b09326f300f12bb9c80b8d86ba5652211c5398d8d1460",
+    "source": "k3_gluon_hybrid_sort_b8/expert_up.py",
+    "exported_sha256": "3110d21e75a64e239c390741131f51ab0abc5106579598a18371c66aef26f492",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/host.py": {
+    "source_sha256": "c6a1343fc8eaa7dacbcd5036ba4024935f51ea0d7bd488a4832484058c04873d",
+    "source": "k3_gluon_hybrid_sort_b8/host.py",
+    "exported_sha256": "f202d95997fce15261f073d54d5ff29a4e14099813eaf85a864f3c6896bfb018",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/moe_complete.py": {
+    "source_sha256": "61d2949fa275db9648c8c0c6d5d5339a8585c2bb61d778373dfda84fb52051c4",
+    "source": "k3_gluon_hybrid_sort_b8/moe_complete.py",
+    "exported_sha256": "ec35c1b8ac6d2149892828f1aadbb1772622f1406157ef63fa53cb4f72a311a5",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/moe_front.py": {
+    "source_sha256": "8919a6c62f939f6abfd754eff525b9f84842b1d473230c4257c53a8baeb8c6b5",
+    "source": "k3_gluon_hybrid_sort_b8/moe_front.py",
+    "exported_sha256": "265c8991bfab72db173a6f21505bcfd236ec2788e28dc92fcb5aba02633bed43",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_chain.py": {
+    "source_sha256": "48d5c6ad9239fc1230a18abf387a3af57345e6ca827bc6bbbbb2bdd797389c38",
+    "source": "k3_gluon_hybrid_sort_b8/perf_chain.py",
+    "exported_sha256": "75278972de465c8d8bd679e1ffdbbd1bd03f3913ecc72c57f8138a11b4e8ec64",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_front32.py": {
+    "source_sha256": "200fcb82642ae8a578f2e5efc42c2dbe9e4f7d5c627481af3a90f5af3a870887",
+    "source": "k3_gluon_hybrid_sort_b8/perf_front32.py",
+    "exported_sha256": "11f16b61748f6adae458a02788a4c851ec8e3a54adc766ed7990c91186259722",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_native_front.py": {
+    "source_sha256": "3bbcb7a6b794c6a83523add084ded188c2cce89a9f70bb3f42a24d523e1319a0",
+    "source": "k3_gluon_hybrid_sort_b8/perf_native_front.py",
+    "exported_sha256": "be2d7e4214325c0a4f48d30b891b1b942a4eacdd949bc4dffb350c2e6e3d8bc4",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_packed_scale.py": {
+    "source_sha256": "9addf744088f6b245230b412fe3a729d111a68109e102eb4ab975222adb68775",
+    "source": "k3_gluon_hybrid_sort_b8/perf_packed_scale.py",
+    "exported_sha256": "f5f33805af48ff1d105ca97137d3be060ca0dcfd7e89ec97bd9582578c84912c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_reference_chain.py": {
+    "source_sha256": "e6763c85b97bcfdfb1f1a3a2ee25f21d8c0a15f6c9f2f5c5c76a1728fe40053f",
+    "source": "k3_gluon_hybrid_sort_b8/perf_reference_chain.py",
+    "exported_sha256": "d2ec7d51bb424ca99830fdd725406151462651b62cd4740090c0a669c2822ac7",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_reference_down.py": {
+    "source_sha256": "cbe760c91dd51a3c88744421663428c6eae0a0c901f2502be42e692ffa70fc3c",
+    "source": "k3_gluon_hybrid_sort_b8/perf_reference_down.py",
+    "exported_sha256": "61c8221ec390986d8e750a34aec9b4cc80aa8b0f5093d78a3b0643fb02044e91",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_reference_projection.py": {
+    "source_sha256": "2b4f5e78e4441385d662f8874ecf9d7245a994cb569723f809d7fd7e5388a849",
+    "source": "k3_gluon_hybrid_sort_b8/perf_reference_projection.py",
+    "exported_sha256": "b351e25dab341384efe9ab1ecf41a34528e8b0f7ae1e23f293bc38ac23ceca02",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_reference_stages.py": {
+    "source_sha256": "ce07287e83eaf145fcd146701c24d3766ae274977dc8739dfd0446071230d798",
+    "source": "k3_gluon_hybrid_sort_b8/perf_reference_stages.py",
+    "exported_sha256": "794bd70994b24f3221816e1eef9bc48d91cfd090d4fa01adfe220003ca65b3e3",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_reference_tail.py": {
+    "source_sha256": "01c6bfa331002df1c272f03411bfebd6e3c7b951f896b5da49974f780e43d4c9",
+    "source": "k3_gluon_hybrid_sort_b8/perf_reference_tail.py",
+    "exported_sha256": "e1c9c662874e9813f9f6a5cbb9ecb971fd9e58f1bdbb0339a863422eb9fbcd06",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_reference_up.py": {
+    "source_sha256": "95a00129991a2090d3341ffdeda0f485eefa5e4fd1a3530177468601192a29a3",
+    "source": "k3_gluon_hybrid_sort_b8/perf_reference_up.py",
+    "exported_sha256": "fb45caf51422ee21f48cf883dd4da2d028461987ee7253ed4d086c7ae3e2e588",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_stages.py": {
+    "source_sha256": "f11a791f68d54edf317085fd13be76da72162edf28c6d0f7abf4ae3e4b038cb5",
+    "source": "k3_gluon_hybrid_sort_b8/perf_stages.py",
+    "exported_sha256": "9c6cc4529dc9f931469c6be6f8b12b8be30826e45ac4d32b0848571bbf091427",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_timeline.py": {
+    "source_sha256": "e05b94f5b306920076acefb28f13a1283549300815bb12b2a16151089ddc9171",
+    "source": "k3_gluon_hybrid_sort_b8/perf_timeline.py",
+    "exported_sha256": "fca471c196682d57866bc69606880e47f2da46b56a76d0ebaa2ebf8e07ea4e8d",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/perf_tuned_up.py": {
+    "source_sha256": "632a2280b55082ae717b2b025b17ca3e8eba3a49c92416535769d736c20841b5",
+    "source": "k3_gluon_hybrid_sort_b8/perf_tuned_up.py",
+    "exported_sha256": "22dfb60262f146d406a27fb46f89cacde8ae5f08cc555abe1414e4e2523520fa",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/primitives.py": {
+    "source_sha256": "5970045c0bcb62eaee00f85b039702da248a1489b843e93e119b09f6a3056976",
+    "source": "k3_gluon_hybrid_sort_b8/primitives.py",
+    "exported_sha256": "6d3b8c8c34f24a7e442d67a42db855189d3302aa36596007428e2d57934375f6",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/projection.py": {
+    "source_sha256": "3fe29ba36b0c84fded29df454e5c37e06e8c3c33207d244d14db03c5ec6cd421",
+    "source": "k3_gluon_hybrid_sort_b8/projection.py",
+    "exported_sha256": "6ae3b7181c7ee374561c994445b0f5d4838cb97d88750fd01b8749649eeafe4c",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/serving.py": {
+    "source_sha256": "07838dcc14272b4b8a471004054a3cbdb7e5ea7e37c1f5c35b7256d9fd4a31b8",
+    "source": "k3_gluon_hybrid_sort_b8/serving.py",
+    "exported_sha256": "e4612d4534fd112f35affaf4880655736a74167aad74a5fe4d7cb127e67fa996",
+    "ast_unchanged": true
+  },
+  "k3_gluon_hybrid_sort_b8/sort_metadata.py": {
+    "source_sha256": "4db9bb9e0ce425f2d93da1125a1e86df306981682a94c9c8207b7cc2ce005656",
+    "source": "k3_gluon_hybrid_sort_b8/sort_metadata.py",
+    "exported_sha256": "c6839fc5158b48abde398b6bf5f385636da13f15e0eb288a2203f73f5d9f0b43",
+    "ast_unchanged": true
+  }
+}
