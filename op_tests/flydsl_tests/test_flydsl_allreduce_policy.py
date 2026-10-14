@@ -225,7 +225,9 @@ def test_oneshot_max_bytes_follows_the_overrides():
         assert resolve_oneshot_max_bytes(**kw) == 0
     # The mesh variables do not move the one-shot window.
     with _env(AITER_FLY_AR_MESH_MIN_BYTES="65536"):
-        assert resolve_oneshot_max_bytes(**kw) == 1 * 1024 * 1024 - 1
+        assert (
+            resolve_oneshot_max_bytes(**kw) == _row("pcie", 4, "gfx950").oneshot.max - 1
+        )
     # Invalid overrides raise, as they do in the dispatchers.
     with (
         _env(AITER_FLY_AR_MESH_MAX_BYTES="inf"),

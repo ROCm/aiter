@@ -143,15 +143,15 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="pcie",
         world_size=4,
-        oneshot=Window(0, 1 * MiB),
-        mesh=Window(128 * KiB, 16 * MiB),
-        ring=Window(16 * MiB, None),
+        oneshot=Window(0, 896 * KiB),
+        mesh=Window(128 * KiB, 18 * MiB),
+        ring=Window(18 * MiB, None),
     ),
     FamilyPolicy(
         arch="gfx950",
         link="pcie",
         world_size=8,
-        oneshot=Window(0, 1 * MiB),
+        oneshot=Window(0, 1216 * KiB),
         mesh=Window(96 * KiB, 24 * MiB),
         ring=Window(24 * MiB, None),
     ),
@@ -195,7 +195,7 @@ _POLICY_BY_KEY = _index(FAMILY_POLICIES)
 #                            the 32 KiB tile, over the rest of the exact-mode
 #                            window, which runs to 64 MiB.
 #     TP4  b128 a1 cap128 -- the 2 KiB tile to 96 KiB, then b512 a2 cap64, the
-#                            16 KiB tile, to the 1 MiB exact-mode ceiling.
+#                            16 KiB tile, to the 896 KiB exact-mode ceiling.
 #     TP8  b64 a1 cap64   -- the 1 KiB tile, except b256 a1 cap64, the 4 KiB
 #                            tile, from 48 to 192 KiB.
 #
