@@ -307,42 +307,87 @@ def _assert_tiled_paths_covered(g32_shapes, g128_shapes):
     cu = torch.cuda.get_device_properties(torch.cuda.current_device())
     cu = cu.multi_processor_count
 
-    def tile_path(q, m, n):
-        if q == "fp8":
-            per_cu = 2
-        elif m >= 512:
-            per_cu = 4 if m >= 1024 else 8
-        else:
-            return False
+    def pad8(v):
+        return (v + 7) // 8 * 8
+
+    # fp4 / fp8 32x512 TDM tiles, ahead of the mx32 tiles.
+    def tdm32_path(m, n):
+        return m % 32 == 0 and n % 512 == 0 and (m // 16) * (n // 512) * 2 >= cu
+
+    # A single step (32x512 shuffled, 16x512 row-major) while every block is
+    # resident: 4 blocks of 512 threads or 8 of 256 per CU. Row-major fp8 keeps
+    # the generic kernel there.
+    def tdm32_single(m, n, shuffle):
+        if shuffle:
+            return tdm32_path(m, n) and (n // 512) * (m // 32) <= 4 * cu
+        return tdm32_path(m, n) and (n // 512) * pad8(m // 16) <= 8 * cu
+
+    for shuffle in (True, False):
+        layout = "shuffled" if shuffle else "row-major"
+        assert any(
+            tdm32_single(m, n, shuffle) for m, n in g32_shapes
+        ), f"no group-32 {layout} case takes the single-step TDM tile on {cu} CUs"
+        assert any(
+            tdm32_path(m, n) and not tdm32_single(m, n, shuffle) for m, n in g32_shapes
+        ), f"no group-32 {layout} case takes the two-step TDM tile on {cu} CUs"
+    # Row-major bands are padded to a multiple of 8; the padding blocks exit early.
+    assert any(
+        tdm32_single(m, n, False) and (m // 16) % 8 for m, n in g32_shapes
+    ), f"no fp4 group-32 row-major TDM case has padded bands on {cu} CUs"
+    assert any(
+        tdm32_path(m, n) and not tdm32_single(m, n, False) and (m // 32) % 8
+        for m, n in g32_shapes
+    ), f"no group-32 row-major two-step TDM case has padded bands on {cu} CUs"
+
+    def mx32_tiles(m, n):
+        return (m // 32) * (n // 256)
+
+    # Shuffled group-32 shapes the TDM tiles leave to the mx32 tiles.
+    def mx32_path(q, m, n):
+        min_tiles = 2 * cu if q == "fp8" else cu // 2
         return (
-            m % 32 == 0 and (n // 32) % 8 == 0 and (m // 32) * (n // 256) >= per_cu * cu
+            m % 32 == 0
+            and (n // 32) % 8 == 0
+            and mx32_tiles(m, n) >= min_tiles
+            and not tdm32_path(m, n)
         )
+
+    # fp4 takes a block per tile while all of them are resident (8 blocks of 256
+    # threads per CU), two tiles along the row beyond that.
+    def fp4_paired(m, n):
+        return mx32_path("fp4", m, n) and mx32_tiles(m, n) > 8 * cu
 
     for q in ("fp8", "fp4"):
         assert any(
-            tile_path(q, m, n) for m, n in g32_shapes
-        ), f"no {q} group-32 case reaches the tile path on {cu} CUs"
-    # fp4 blocks cover two tiles along the row; an odd count leaves a half block.
+            mx32_path(q, m, n) for m, n in g32_shapes
+        ), f"no {q} group-32 case reaches the mx32 tile path on {cu} CUs"
     assert any(
-        tile_path("fp4", m, n) and (n // 256) % 2 for m, n in g32_shapes
-    ), f"no fp4 group-32 tile-path case has an odd tile count per row on {cu} CUs"
+        mx32_path("fp4", m, n) and not fp4_paired(m, n) for m, n in g32_shapes
+    ), f"no fp4 group-32 case takes a block per tile on {cu} CUs"
+    # An odd tile count per row leaves the last paired block half full.
+    assert any(
+        fp4_paired(m, n) and (n // 256) % 2 for m, n in g32_shapes
+    ), f"no fp4 group-32 paired-tile case has an odd tile count per row on {cu} CUs"
 
     def tdm_tile_path(m, n):
         if m % 16 or n % 512:
             return False
-
-        def pad8(v):
-            return (v + 7) // 8 * 8
-
         tiles, bands = n // 512, m // 16
         return tiles * bands >= 4 * cu and all(
             tiles * bands * 8 >= launched * 7
             for launched in (pad8(tiles) * bands, tiles * pad8(bands))
         )
 
+    # Single-step tiles (16x256 for fp8) while every block is resident: 16 per CU.
+    def tdm_single_step(m, n):
+        return tdm_tile_path(m, n) and pad8(n // 256) * (m // 16) <= 16 * cu
+
     assert any(
-        tdm_tile_path(m, n) for m, n in g128_shapes
-    ), f"no group-128 case reaches the TDM tile path on {cu} CUs"
+        tdm_tile_path(m, n) and not tdm_single_step(m, n) for m, n in g128_shapes
+    ), f"no group-128 case reaches the two-step TDM tile path on {cu} CUs"
+    assert any(
+        tdm_single_step(m, n) for m, n in g128_shapes
+    ), f"no group-128 case reaches the single-step TDM tile path on {cu} CUs"
 
 
 def test_mxfp8_nonfinite(group_size, shuffle, h_dtype, pattern):
@@ -501,8 +546,9 @@ for key in [k for k in args.quant if k in d_quant_e8m0]:
     aiter.logger.info("%s summary (markdown):\n%s", key, df.to_markdown(index=False))
 
 if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
-    # Group-32 shapes on both sides of the tile-path gates, an odd fp4 tile count
-    # per row band (4096, 2304), and narrow rows.
+    # Group-32 shapes on both sides of the tile-path gates, odd fp4 tile counts per
+    # row band for both mx32 block shapes (4096, 2304) and (8192, 2304), padded TDM
+    # bands for one and two steps (1056, 7168) and (3104, 7168), and narrow rows.
     g32_shapes = (
         (32, 256),
         (64, 768),
@@ -510,13 +556,16 @@ if "fp8_mx_nonfinite" in args.quant and get_gfx() in ("gfx950", "gfx1250"):
         (40, 320),
         (32, 160),
         (1024, 7168),
+        (1056, 7168),
+        (3104, 7168),
         (4096, 7168),
         (4096, 1536),
         (4096, 2304),
+        (8192, 2304),
         (16384, 1536),
         (32768, 1024),
     )
-    g128_shapes = ((4096, 7168), (2048, 12288))
+    g128_shapes = ((4096, 7168), (2048, 12288), (1536, 7168))
     _assert_tiled_paths_covered(g32_shapes, g128_shapes)
     for m, n in g32_shapes:
         for q_dtype, h_dtype, shuffle, strided in itertools.product(
