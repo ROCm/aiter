@@ -3,8 +3,6 @@
 
 # from __future__ import annotations
 
-import os
-
 import pytest
 import torch
 import triton
@@ -152,7 +150,7 @@ def _make_inputs(
 def _wrapper_main_kernel_params(T: int, H: int, D: int):
     """Reproduce the (use_exp2, block_k) the wrapper picks for the main kernel.
 
-    Must stay in sync with ``pa_decode_sparse``'s USE_EXP2 and block_k logic.
+    Must stay in sync with ``pa_decode_sparse``'s (always exp2) block_k logic.
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
     use_exp2 = True
@@ -574,13 +572,18 @@ def v4_pack_unified(packed_2buff, rope, block_size):
 @pytest.mark.parametrize("H", [16, 128])
 @pytest.mark.parametrize("kv_len", [136, 384])
 @pytest.mark.parametrize("block_size", [256, 64])
-def test_pa_decode_sparse_v4_unified_vs_2buff(T, H, kv_len, block_size):
+@pytest.mark.parametrize("pooled", [False, True])
+def test_pa_decode_sparse_v4_unified_vs_2buff(T, H, kv_len, block_size, pooled):
     """vLLM's unified paged cache against ATOM's two-buffer pool.
 
     Both are packed from one set of KV rows, so they hold the same quantized
     bytes and the two kernels must agree to the bit -- anything else is the
-    unified path's slot -> row addressing or its 8 -> 16 scale expansion. The
-    dense reference then pins both to the actual attention.
+    unified path's slot -> row addressing. The dense reference then pins both
+    to the actual attention.
+
+    ``pooled`` hands the cache over as one layer's view of a multi-layer pool,
+    the way vLLM does, so the page stride spans more rows than a page holds and
+    the slot -> row mapping is not the identity.
     """
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
@@ -597,6 +600,8 @@ def test_pa_decode_sparse_v4_unified_vs_2buff(T, H, kv_len, block_size):
     kv_packed, kv_rope = v4_pack_2buff(ukv_bf16)
     q_packed, q_rope = v4_pack_2buff(q_bf16)
     unified = v4_pack_unified(kv_packed, kv_rope, block_size)
+    if pooled:
+        unified = as_pooled_layer(unified)
 
     out_unified = pa_decode_sparse(
         q_packed,
@@ -756,6 +761,23 @@ def widen_to_int32_overflow(cache, kv_deq):
     return view, kv_deq
 
 
+def as_pooled_layer(cache, layers=3, layer=1):
+    """``cache`` re-laid as layer ``layer`` of a ``[nb, layers, block, row]``
+    pool -- how vLLM hands a per-layer cache over. Contiguous inside a page,
+    but each page steps by the whole pool's page stride, so the page stride
+    spans ``layers * block`` rows rather than ``block``. The other layers are
+    filled with garbage so a wrong row lands on bytes that cannot pass."""
+    nb, block, row = cache.shape
+    nbytes = row * cache.element_size()
+    pool = torch.full(
+        (nb, layers, block, nbytes), 0x7F, dtype=torch.uint8, device=cache.device
+    ).view(cache.dtype)
+    view = pool[:, layer]
+    view.copy_(cache)
+    assert view.stride(0) == layers * block * row
+    return view
+
+
 def two_loop_reference(
     q,
     main_deq,
@@ -792,23 +814,25 @@ def two_loop_reference(
     )
 
 
-# @pytest.mark.parametrize("T", [1, 32, 64, 128, 2437])
-@pytest.mark.parametrize("T", [128, 2437])
-@pytest.mark.parametrize("H", [128])
+@pytest.mark.parametrize("T", [1, 32, 128, 2437])
+@pytest.mark.parametrize("H", [16, 128])
 @pytest.mark.parametrize("D", [512])
 @pytest.mark.parametrize("main_len", [128])
 @pytest.mark.parametrize("extra_len", [8, 256])
 @pytest.mark.parametrize("dtype", ["bf16", "fp8"])
 @pytest.mark.parametrize("strided_cache", [False, True])
 @pytest.mark.parametrize("page_size", [64, 256])
+@pytest.mark.parametrize("pooled", [False, True])
 def test_pa_decode_sparse_with_extra(
-    T, H, D, main_len, extra_len, dtype, strided_cache, page_size
+    T, H, D, main_len, extra_len, dtype, strided_cache, page_size, pooled
 ):
     """SWA (main) + top-k (extra) attended in one pass, on gfx950 and gfx1250.
 
-    Both backends read the SAME cache -- ``[nb, block, 640]`` uint8, 448 B fp8
-    NoPE | 128 B bf16 RoPE per token then a per-block trailer of 8 UE8M0 scale
-    bytes -- so one construction and one reference serve both.
+    The two archs read different fp8 records -- gfx950 the 584 B trailer
+    cache, gfx1250 the 640 B aligned one (see the Formats section of
+    ``pa_decode_sparse``) -- built from the same values, so one reference
+    serves both. ``pooled`` hands both streams over as one layer's view of a
+    multi-layer pool, as vLLM does.
 
     They differ in Q, and **each supports exactly one form for now**:
 
@@ -837,6 +861,8 @@ def test_pa_decode_sparse_with_extra(
         # -- rather than paying it on all combinations.
         if dtype != "fp8" or T != 128:
             pytest.skip("strided-cache case is pinned to the fp8 T=128 shape")
+        if pooled:
+            pytest.skip("the strided pool is already a non-contiguous view")
         if torch.cuda.mem_get_info()[0] < 4 * 1024**3:
             pytest.skip("needs ~3 GiB free for the >2 GiB strided pool")
 
@@ -867,6 +893,9 @@ def test_pa_decode_sparse_with_extra(
     )
     if strided_cache:
         extra_cache, extra_deq = widen_to_int32_overflow(extra_cache, extra_deq)
+    if pooled:
+        main_cache = as_pooled_layer(main_cache)
+        extra_cache = as_pooled_layer(extra_cache)
     extra_idx = torch.randint(
         0, extra_pool, (T, extra_len), device=device, dtype=torch.int32
     ).reshape(-1)
@@ -886,21 +915,6 @@ def test_pa_decode_sparse_with_extra(
         kwargs["has_invalid"] = False
     else:
         q_in, q_ref = q, q
-    # ATT A/B hook. main_is_window puts the SWA stream on async_load instead of
-    # async_gather, and lives on _pa_decode_sparse_v4 -- the public wrapper does
-    # not forward it. Setting MAIN_IS_WINDOW to 0 or 1 sends BOTH arms down that
-    # same entry point, so the two captures differ in one constexpr and nothing
-    # else. Unset, this is the ordinary public call.
-    # The main cache here is paged 256 and main_idx is contiguous, so the window
-    # contract holds.
-    _decode = pa_decode_sparse
-    _win = os.environ.get("MAIN_IS_WINDOW")
-    if _win is not None:
-        from aiter.ops.triton.attention.pa_decode_sparse import (
-            _pa_decode_sparse_v4 as _decode,
-        )
-
-        kwargs["main_is_window"] = _win == "1"
 
     ref = two_loop_reference(
         q_ref,
@@ -913,7 +927,7 @@ def test_pa_decode_sparse_with_extra(
         attn_sink,
         softmax_scale,
     )
-    out = _decode(
+    out = pa_decode_sparse(
         q_in,
         main_cache,
         main_idx,
@@ -1047,3 +1061,175 @@ def test_pa_decode_sparse_inv_rope_mxfp8_epilogue(T, H, mxfp8):
     else:
         out = pa_decode_sparse(*args, **kw)
         torch.testing.assert_close(out.float(), ref, atol=1e-2, rtol=1e-2)
+
+
+# ---------------------------------------------------------------------------
+# Regressions for the review of the gfx1250 fp8 path. "fp8" is the gfx1250
+# 640 B path (packed Q); "bf16" is the flat pool, on every arch.
+# ---------------------------------------------------------------------------
+
+
+def _decode_inputs(path, T, H, kv_len, seed=0):
+    """(q_arg, kv_arg, kwargs, q_ref, kv_ref, indices, indptr, sink, scale) for
+    one flat pool of ``T * kv_len`` rows, in the form ``path`` reads."""
+    D = _V4_DIM_QK
+    q, ukv, indices, indptr, sink, scale = _make_inputs(
+        T, H, D, kv_len, T * kv_len, seed=seed
+    )
+    if path == "bf16":
+        return q, ukv, {}, q, ukv, indices, indptr, sink, scale
+    kv_packed, kv_rope = v4_pack_2buff(ukv)
+    q_packed, q_rope = v4_pack_2buff(q)
+    kwargs = {"unified_kv_rope": kv_rope, "q_rope": q_rope}
+    return (
+        q_packed,
+        kv_packed,
+        kwargs,
+        v4_unpack_2buff(q_packed, q_rope),
+        v4_unpack_2buff(kv_packed, kv_rope),
+        indices,
+        indptr,
+        sink,
+        scale,
+    )
+
+
+def _skip_path(path):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    if path == "fp8" and arch_info.get_arch() != "gfx1250":
+        pytest.skip("the gfx1250 fp8 path is gfx1250-only")
+
+
+@pytest.mark.parametrize("path", ["bf16", "fp8"])
+@pytest.mark.parametrize("kv_splits", [1, None])
+def test_pa_decode_sparse_empty_tokens(path, kv_splits):
+    """Tokens with no keys come back as zeros on the single-split path too.
+
+    Split, the reduce writes them; with one split nothing did, so ``out`` kept
+    whatever was in it. ``out`` starts as NaN here so a skipped row shows."""
+    _skip_path(path)
+    T, H, kv_len = 64, 128, 256
+    q, kv, kw, q_ref, kv_ref, idx, indptr, sink, scale = _decode_inputs(
+        path, T, H, kv_len
+    )
+    # Every 4th token gets no keys: drop its span from the index list.
+    lens = (indptr[1:] - indptr[:-1]).long()
+    lens[::4] = 0
+    keep = torch.repeat_interleave(lens > 0, (indptr[1:] - indptr[:-1]).long())
+    idx = idx[keep].contiguous()
+    indptr = torch.zeros_like(indptr)
+    indptr[1:] = lens.cumsum(0).to(torch.int32)
+
+    out = torch.full(
+        (T, H, _V4_DIM_QK), float("nan"), dtype=torch.bfloat16, device="cuda"
+    )
+    res = pa_decode_sparse(
+        q,
+        kv,
+        idx,
+        indptr,
+        sink,
+        scale,
+        kv_splits=kv_splits,
+        has_invalid=False,
+        out=out,
+        **kw,
+    )
+    ref = pa_decode_sparse_reference(
+        q_ref, kv_ref.to(q_ref.dtype), idx, indptr, sink, scale
+    )
+    assert not torch.isnan(res).any()
+    assert (res[::4] == 0).all()
+    torch.testing.assert_close(res.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+@pytest.mark.parametrize("path", ["bf16", "fp8"])
+def test_pa_decode_sparse_split_starts_on_dead_tile(path):
+    """A split whose FIRST tile has no valid key (all -1) must not go NaN.
+
+    m is still -inf there, so exp2(scores - m_new) was exp2(-inf - -inf); the
+    next valid tile then made m finite and the reduce took the NaN as live."""
+    _skip_path(path)
+    T, H, kv_len = 8, 128, 512
+    q, kv, kw, q_ref, kv_ref, idx, indptr, sink, scale = _decode_inputs(
+        path, T, H, kv_len
+    )
+    # Two splits of 256 keys; the first 64 of each are sentinels, which covers
+    # a whole leading tile at every BLOCK_K the drivers pick (<= 64).
+    pos = torch.arange(idx.numel(), device=idx.device) % kv_len
+    idx = torch.where((pos % 256) < 64, -1, idx).to(torch.int32)
+    res = pa_decode_sparse(
+        q, kv, idx, indptr, sink, scale, kv_splits=2, has_invalid=True, **kw
+    )
+    ref = pa_decode_sparse_reference(
+        q_ref, kv_ref.to(q_ref.dtype), idx, indptr, sink, scale
+    )
+    assert not torch.isnan(res).any()
+    torch.testing.assert_close(res.float(), ref.float(), atol=1e-2, rtol=1e-2)
+
+
+def test_pa_decode_sparse_fp8_block_h16_single_split():
+    """H=16 at large T picks BLOCK_H=16 and, by occupancy, one split -- the
+    pairing upstream Triton 3.8.0 miscompiles. The driver must move it onto two
+    splits, and refuse an explicit kv_splits=1 there."""
+    _skip_path("fp8")
+    T, H, kv_len = 1024, 16, 64
+    q, kv, kw, q_ref, kv_ref, idx, indptr, sink, scale = _decode_inputs(
+        "fp8", T, H, kv_len
+    )
+    res = pa_decode_sparse(q, kv, idx, indptr, sink, scale, has_invalid=False, **kw)
+    ref = pa_decode_sparse_reference(q_ref, kv_ref, idx, indptr, sink, scale)
+    torch.testing.assert_close(res.float(), ref.float(), atol=1e-2, rtol=1e-2)
+    with pytest.raises(ValueError, match="kv_splits=1 with BLOCK_H=16"):
+        pa_decode_sparse(
+            q, kv, idx, indptr, sink, scale, kv_splits=1, has_invalid=False, **kw
+        )
+
+
+def test_pa_decode_sparse_rejects_partial_extra():
+    """extra_indices / extra_indptr without extra_cache used to be dropped."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    q, kv, _, _, _, idx, indptr, sink, scale = _decode_inputs("bf16", 2, 16, 32)
+    with pytest.raises(ValueError, match="go together"):
+        pa_decode_sparse(
+            q, kv, idx, indptr, sink, scale, extra_indices=idx, extra_indptr=indptr
+        )
+
+
+def test_pa_decode_sparse_fp8_rejects_unsupported():
+    """The gfx1250 fp8 path used to return before the guard that rejects the
+    gfx950-only epilogue, so the epilogue arguments were silently ignored; and
+    it reads the extra stream with the main stream's row strides."""
+    _skip_path("fp8")
+    T, H, kv_len, block = 4, 128, 64, 64
+    q, kv, kw, _, _, idx, indptr, sink, scale = _decode_inputs("fp8", T, H, kv_len)
+    unified = v4_pack_unified(kv, kw["unified_kv_rope"], block)
+    q_kw = {"q_rope": kw["q_rope"]}
+
+    data = torch.empty(T, H * _V4_DIM_QK, dtype=torch.float8_e4m3fn, device="cuda")
+    scl = torch.empty(T, H * _V4_DIM_QK // 32, dtype=torch.uint8, device="cuda")
+    with pytest.raises(NotImplementedError, match="gfx950 gluon only"):
+        pa_decode_sparse(
+            q, unified, idx, indptr, sink, scale, out_mxfp8=(data, scl), **q_kw
+        )
+
+    # Same records, but every row 1280 B apart instead of 640.
+    nb = unified.shape[0]
+    wide = torch.zeros(nb, block, 2 * _V4_REC_ALIGNED, dtype=torch.uint8, device="cuda")
+    extra = wide[..., :_V4_REC_ALIGNED]
+    extra.copy_(unified)
+    with pytest.raises(RuntimeError, match="same row strides"):
+        pa_decode_sparse(
+            q,
+            unified,
+            idx,
+            indptr,
+            sink,
+            scale,
+            extra_cache=extra,
+            extra_indices=idx,
+            extra_indptr=indptr,
+            **q_kw,
+        )

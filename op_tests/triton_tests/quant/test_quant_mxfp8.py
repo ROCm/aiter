@@ -929,6 +929,131 @@ def test_fused_deepseek_v4_k_cache_contract():
         fused_deepseek_v4_quantize_and_insert_k_cache(
             torch.zeros(4, _QK, dtype=torch.float16, device="cuda"), cache, slot, 64
         )
+    # strided columns: rows may be strided, the 512 values in a row may not
+    with pytest.raises(AssertionError, match="contiguous"):
+        fused_deepseek_v4_quantize_and_insert_k_cache(
+            torch.zeros(_QK, 4, dtype=torch.bfloat16, device="cuda").t(),
+            cache,
+            slot,
+            64,
+        )
+
+
+def test_fused_deepseek_v4_gather_sliced_block_table():
+    """A column slice of the block table is addressed by its row stride.
+
+    ``block_table[:, :n]`` -- what CUDA-graph padding hands the reader -- has
+    rows wider than its shape. Every request here is a whole number of blocks,
+    so the slice holds no padding entries, and the columns past it hold real
+    but WRONG pages: a reader that strides by the width reads valid memory and
+    gathers the wrong tokens, rather than faulting.
+    """
+    _skip_without_fp8()
+    block = 64
+    seq_lens = [128, 128, 128]
+    k, cache, slot, block_table = _build_paged_k(seq_lens, _REC, block)
+    fused_deepseek_v4_quantize_and_insert_k_cache(k, cache, slot, block)
+
+    n = block_table.shape[1]
+    wide = torch.empty(len(seq_lens), n + 5, dtype=block_table.dtype, device="cuda")
+    wide[:, :n] = block_table
+    wide[:, n:] = block_table[0, 0]  # request 0's page, wrong for every other
+    sliced = wide[:, :n]
+    assert not sliced.is_contiguous()
+
+    seq = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
+    shape = (len(seq_lens), max(seq_lens), _QK)
+    got = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    fused_deepseek_v4_dequantize_and_gather_k_cache(
+        got, cache, seq, None, sliced, block, 0
+    )
+    want = torch.zeros(shape, dtype=torch.bfloat16, device="cuda")
+    fused_deepseek_v4_dequantize_and_gather_k_cache(
+        want, cache, seq, None, sliced.contiguous(), block, 0
+    )
+    torch.testing.assert_close(got, want, **_EXACT)
+
+    decoded = _torch_decode_cache(cache, block, _REC)
+    ref = _gather_reference(decoded, seq_lens, slot, None, 0, shape)
+    torch.testing.assert_close(got, ref, **_ULP)
+
+
+@pytest.mark.parametrize(
+    "rec_bytes", [_PACKED_REC, _REC], ids=["packed584", "aligned640"]
+)
+def test_fused_deepseek_v4_k_cache_insert_strided_k(rec_bytes):
+    """K given as a column slice of a wider tensor is read by its row stride.
+
+    ``kv[:, :512]`` of a wider projection output is a valid [T, 512] bf16
+    tensor, so shape and dtype checks pass it; only the row stride tells it
+    apart from a contiguous one.
+    """
+    _skip_without_fp8()
+    block = 64
+    _, cache, slot, _ = _build_paged_k([17, 70], rec_bytes, block)
+    wide = torch.randn(slot.shape[0], _QK + 128, dtype=torch.bfloat16, device="cuda")
+    view = wide[:, :_QK]
+    assert view.stride(0) != _QK
+
+    got, want = cache.clone(), cache.clone()
+    fused_deepseek_v4_quantize_and_insert_k_cache(view, got, slot, block)
+    fused_deepseek_v4_quantize_and_insert_k_cache(view.contiguous(), want, slot, block)
+    torch.testing.assert_close(got, want, **_EXACT)
+
+
+@pytest.mark.parametrize(
+    "rec_bytes", [_PACKED_REC, _REC], ids=["packed584", "aligned640"]
+)
+def test_fused_deepseek_v4_k_cache_insert_skips_unmapped(rec_bytes):
+    """``slot == -1`` writes nothing: not the record, and on the packed layout
+    not the token's bytes in the per-block scale region either.
+
+    Compared byte for byte against inserting only the mapped tokens, into a
+    cache pre-filled with 0xCD so an unwanted write cannot match by accident.
+    """
+    _skip_without_fp8()
+    block = 64
+    k, cache, slot, _ = _build_paged_k([130, 65], rec_bytes, block)
+    cache.fill_(0xCD)
+    slot[1::2] = -1
+    live = slot >= 0
+
+    got, want = cache.clone(), cache.clone()
+    fused_deepseek_v4_quantize_and_insert_k_cache(k, got, slot, block)
+    fused_deepseek_v4_quantize_and_insert_k_cache(k[live], want, slot[live], block)
+    torch.testing.assert_close(got, want, **_EXACT)
+    assert (got == 0xCD).any(), "every byte was written; nothing was skipped"
+
+
+@pytest.mark.parametrize("use_fnuz", [False, True], ids=["ocp", "fnuz"])
+def test_fused_deepseek_v4_kv_writers_agree(use_fnuz):
+    """Both KV writers store the same aligned record for the same KV.
+
+    The fused producer and the standalone insert must quantize with the same
+    fp8_max -- for FNUZ that is 224, vLLM's ROCm convention, not finfo's 240
+    -- or a token's scale depends on which of them wrote it. One group is
+    planted with amax 230, which takes exponent 1 at 224 and 0 at 240, so
+    the bytes differ whenever the two disagree.
+
+    No FNUZ hardware is needed: the fnuz cast is software-emulated off CDNA3,
+    so the bytes are the same on every arch. cos = 1, sin = 0 makes the
+    producer's RoPE the identity, so its RoPE half matches the insert's
+    verbatim copy and the whole record compares.
+    """
+    _skip_without_fp8()
+    q, kv, cache, slot, pos, _ = _make_inputs(8, 16, 16, nb=2, block=64)
+    kv[0, 0] = 230.0
+    half = _ROPE // 2
+    cs = torch.cat([torch.ones(256, half), torch.zeros(256, half)], dim=-1).to("cuda")
+
+    a, b = cache.clone(), cache.clone()
+    fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        q, kv, a, slot, pos, cs, 64, 1e-6, 16, use_fnuz=use_fnuz
+    )
+    fused_deepseek_v4_quantize_and_insert_k_cache(
+        kv, b, slot.long(), 64, use_fnuz=use_fnuz
+    )
+    torch.testing.assert_close(a, b, **_EXACT)
 
 
 # --------------------------------------------------------------------------- #
@@ -1078,6 +1203,197 @@ def test_compress_norm_rope_store_two_stage_matches_single_pass(tokens):
             for s in live
         ]
     ].any()
+
+
+def torch_compressor_ref(a):
+    """The compressor's output per written token, from the format's definition.
+
+    A token emits when ``(position + 1) % compress_ratio == 0`` and both of its
+    slots are live. It softmax-pools its window of state rows, RMSNorms the
+    result, and stores NoPE as UE8M0 fp8 in groups of 64 and RoPE as bf16,
+    GPT-J-rotated at the COMPRESSED position. With ``overlap`` the window is
+    two ratios long and its newer half reads the state's second head-sized
+    column block.
+
+    Returns ``{kv_slot: (nope [448] fp32, exponents [7] int32, rope [64] fp32)}``
+    where ``nope`` is what the stored fp8 should dequantize back to.
+    """
+    hd, rd, cr = a.head_dim, a.rope_head_dim, a.compress_ratio
+    nope_dim, half = hd - rd, rd // 2
+    win = (1 + int(a.overlap)) * cr
+    dev = a.state_cache.device
+    w = a.rms_norm_weight.float()
+    rows = torch.arange(win, device=dev)
+    cols = (rows >= cr).long()[:, None] * hd + torch.arange(hd, device=dev)[None, :]
+    out = {}
+    for t in range(a.num_actual):
+        kv_slot = int(a.k_cache_metadata.slot_mapping[t])
+        p = int(a.positions[t])
+        if int(a.slot_mapping[t]) < 0 or kv_slot < 0 or (p + 1) % cr:
+            continue
+        req = int(a.token_to_req_indices[t])
+        pos = p - win + 1 + rows
+        valid = (pos >= 0)[:, None]
+        pc = pos.clamp(min=0)
+        blk = a.block_table[req, pc // a.block_size].long()
+        state = a.state_cache[blk, pc % a.block_size]  # [win, 2 * state_width]
+        kv = state.gather(1, cols).masked_fill(~valid, 0.0)
+        score = state.gather(1, a.state_width + cols).masked_fill(~valid, float("-inf"))
+        c = (kv * score.softmax(dim=0)).sum(dim=0)
+        normed = c * torch.rsqrt(c.pow(2).mean() + a.rms_norm_eps) * w
+
+        # the kernel quantizes the bf16-rounded value
+        nope = normed[:nope_dim].to(torch.bfloat16).float()
+        amax = nope.reshape(-1, _GROUP).abs().amax(-1).clamp_min(1e-4)
+        exps = torch.ceil(torch.log2(amax * (1.0 / 448.0))).to(torch.int32)
+
+        cp = (p // cr) * cr
+        cos, sin = a.cos_sin_cache[cp, :half], a.cos_sin_cache[cp, half:rd]
+        x = normed[nope_dim:]
+        rope = torch.empty_like(x)
+        rope[0::2] = x[0::2] * cos - x[1::2] * sin
+        rope[1::2] = x[1::2] * cos + x[0::2] * sin
+        out[kv_slot] = (nope, exps, rope)
+    return out
+
+
+def _compressor_record(backing, a, kv_slot):
+    """The bytes the compressor stored for ``kv_slot``, read off ``backing``.
+
+    Returns ``(fp8 [448] fp32, scale bytes, rope [64] fp32, written spans)``.
+    The scale bytes are the aligned record's 14 (each group twice) or the
+    packed region's 8 (7 groups + the pad byte).
+    """
+    ts, page = a.token_stride, a.kv_cache.shape[1]
+    blk, r = divmod(kv_slot, page)
+    blk_base = blk * a.kv_cache.stride(0)
+    base = blk_base + r * ts
+    if ts == _REC:
+        sc_lo, sc_n, rope_lo = base + _SC_IN_REC, 2 * _NUM_TILES, base + _ROPE_IN_REC
+    else:  # packed: scales in a region after the block's token data
+        sc_lo, sc_n, rope_lo = blk_base + page * ts + r * a.scale_dim, 8, base + _NOPE
+    flat = backing.view(-1)
+    fp8 = flat[base : base + _NOPE].clone().view(torch.float8_e4m3fn).float()
+    sc = flat[sc_lo : sc_lo + sc_n].to(torch.int32)
+    rope = flat[rope_lo : rope_lo + 2 * _ROPE].clone().view(torch.bfloat16).float()
+    spans = [
+        (base, base + _NOPE),
+        (sc_lo, sc_lo + sc_n),
+        (rope_lo, rope_lo + 2 * _ROPE),
+    ]
+    return fp8, sc, rope, spans
+
+
+_COMPRESSOR_BASE_CFG = {
+    "head_dim": 512,
+    "rope_dim": 64,
+    "quant_block": 64,
+    "scale_dim": 8,
+    "block_size": 8,
+    "state_mid": 8,
+    "kv_page": 2,
+    "rows_per_block": 64,
+    "block_table_width": 64,
+    "cos_sin_rows": 4096,
+    "rms_eps": 1e-6,
+}
+
+
+@pytest.mark.parametrize("launcher", ["single_pass", "two_stage"])
+@pytest.mark.parametrize("token_stride", [_REC, 576], ids=["aligned640", "packed584"])
+@pytest.mark.parametrize(
+    "compress_ratio,overlap", [(128, False), (4, True)], ids=["cr128", "cr4_overlap"]
+)
+def test_compress_norm_rope_store_matches_reference(
+    compress_ratio, overlap, token_stride, launcher
+):
+    """Both compressor launchers against an independent torch reference.
+
+    The A/B test above cannot catch a mistake the two routes share -- they
+    share the whole norm/quant/RoPE/store tail. This checks the stored bytes
+    against the format instead, on both record layouts, with overlap, with
+    real block-table translation, and with ``-1`` on each of the two slot
+    maps. The cache is pre-filled with 0xCD and every byte outside the
+    expected records must keep it.
+
+    fp32 pooling and rsqrt can differ from torch in the last bit, which can
+    move a bf16 value and so an fp8 step or, at a binade edge, an exponent;
+    so values are compared dequantized and exponents to within one. The norm
+    weight is scaled 8x per NoPE group, putting neighbouring groups' exponents
+    3 apart, so a scale stored for the wrong group still fails.
+    """
+    _skip_without_fp8()
+    if launcher == "two_stage" and overlap:
+        pytest.skip("the two-stage split is the no-overlap path only")
+    dev = "cuda"
+    hd = _COMPRESSOR_BASE_CFG["head_dim"]
+    cfg = {
+        **_COMPRESSOR_BASE_CFG,
+        "compress_ratio": compress_ratio,
+        "overlap": overlap,
+        # with overlap the state row is [kv | score], each two heads wide
+        "state_width": hd * (1 + int(overlap)),
+        "token_stride": token_stride,
+    }
+    tokens = 8
+    backing, a = _compressor_inputs(tokens, cfg, seed=3)
+    backing.fill_(0xCD)
+
+    # Real translation, kept in bounds: every request row and page exists.
+    a.token_to_req_indices = torch.randint(
+        0, a.block_table.shape[0], (tokens,), dtype=torch.int32, device=dev
+    )
+    a.block_table = torch.randint(
+        0, a.state_cache.shape[0], a.block_table.shape, dtype=torch.int32, device=dev
+    )
+    grp = torch.arange(hd, device=dev) // _GROUP
+    gain = torch.where(grp < _NUM_TILES, torch.exp2(3.0 * (grp - 3)), 1.0)
+    a.rms_norm_weight = ((torch.rand(hd, device=dev) * 0.5 + 0.75) * gain).to(
+        torch.bfloat16
+    )
+    # -1 on each map separately: they are checked at different points
+    a.slot_mapping = a.slot_mapping.clone()
+    a.slot_mapping[1] = -1
+    a.k_cache_metadata.slot_mapping = a.k_cache_metadata.slot_mapping.clone()
+    a.k_cache_metadata.slot_mapping[2] = -1
+
+    if launcher == "single_pass":
+        fused_deepseek_v4_compress_norm_rope_store(**vars(a))
+    else:
+        fused_deepseek_v4_compress_norm_rope_store_two_stage(
+            **vars(a),
+            num_decode_tokens=0,
+            compress_scratch=torch.zeros(tokens, hd, dtype=torch.float32, device=dev),
+        )
+    torch.cuda.synchronize()
+
+    want = torch_compressor_ref(a)
+    # kv slot == token index here, so this pins which tokens may write
+    assert sorted(want) == [s for s in range(tokens) if s not in (1, 2)]
+
+    written = torch.zeros(backing.numel(), dtype=torch.bool, device=dev)
+    for s, (nope_ref, exps_ref, rope_ref) in want.items():
+        fp8, sc, rope, spans = _compressor_record(backing, a, s)
+        for lo, hi in spans:
+            written[lo:hi] = True
+        if token_stride == _REC:
+            torch.testing.assert_close(sc[0::2], sc[1::2], **_EXACT)
+            sc = sc[0::2]
+        else:
+            assert sc[_NUM_TILES] == 0, "the packed region's pad byte is unwritten"
+            sc = sc[:_NUM_TILES]
+        torch.testing.assert_close(sc - 127, exps_ref, atol=1, rtol=0)
+
+        groups = nope_ref.reshape(_NUM_TILES, _GROUP)
+        deq = fp8.reshape(_NUM_TILES, _GROUP) * torch.exp2((sc - 127).float())[:, None]
+        amax = groups.abs().amax(-1, keepdim=True)
+        # one e4m3 step at the group's scale, as in the round-trip test
+        assert ((deq - groups).abs() <= amax / 8 + 1e-6).all(), f"slot {s}"
+        torch.testing.assert_close(rope, rope_ref.to(torch.bfloat16).float(), **_ULP)
+
+    assert (
+        backing.view(-1)[~written] == 0xCD
+    ).all(), "a byte outside the records moved"
 
 
 @pytest.mark.parametrize("M, K", [(1, 3072), (40, 4096), (4100, 4096)])

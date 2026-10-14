@@ -23,10 +23,10 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse as gluon_pa_decode_sparse,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
+    _pa_decode_sparse_fp8 as gluon_pa_decode_sparse_fp8,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse_fp8 as gluon_pa_decode_sparse_fp8,
+    _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
@@ -96,7 +96,6 @@ def pa_decode_sparse(
     has_invalid: bool | None = True,
     skip_reduce: bool | None = False,
     use_lru_cache_partials: bool = False,
-    USE_EXP2: bool | None = None,
     *,
     extra_cache: torch.Tensor | None = None,
     extra_indices: torch.Tensor | None = None,
@@ -140,7 +139,8 @@ def pa_decode_sparse(
            ``fused_deepseek_v4_mxfp8_quant_q_pack``. bf16 Q is not accepted.
       ``kv_scales`` must be None (the scales are inside the row). ``extra_*``
       is supported (same record). Output ``[N, H, 512]`` bf16. The
-      ``inv_rope_positions`` / ``out_mxfp8`` epilogue is NOT implemented here.
+      ``inv_rope_positions`` / ``out_mxfp8`` epilogue is not implemented here
+      and is rejected.
 
     gfx1250, bf16:
       KV   ``unified_kv`` ``[P, D]`` flat pool (page size 1), same dtype as Q.
@@ -230,9 +230,11 @@ def pa_decode_sparse(
             the MX kernel a lot (130.4 -> 83.7us) and the un-TDM'd stage kernel
             at short kv_len, but HURTS the stage kernel once ``q_tdm`` has
             removed its spills (72.2 -> 97.9us).
-            UNVERIFIED/SUSPECT: ``cluster.arrive``/``wait`` need every CTA of a
-            cluster co-resident; the large per-CTA LDS of the ``q_tdm`` path
-            may prevent that and hang. Re-verify before enabling.
+            UNVERIFIED: the cluster barriers around the multicast refills were
+            reordered (see the fp8 kernel's main-loop note) but not re-tested,
+            and ``cluster.arrive``/``wait`` need every CTA of a cluster
+            co-resident; the large per-CTA LDS of the ``q_tdm`` path may prevent
+            that and hang. Re-verify before enabling.
         num_warps: override the warp count. The default ties warps to
             ``block_h`` so the per-thread accumulator is
             ``block_h * D / (num_warps * 32)`` = 256 VGPRs at every block_h;
@@ -241,9 +243,8 @@ def pa_decode_sparse(
         q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q, required on the gfx1250
             fp8 path, where ``q`` is the packed fp8 ``[N, H, 512]`` Q.
         inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
-            the output epilogue (see _pa_decode_sparse_gfx950_gluon). The
-            gfx1250 fp8 path returns before the guard below and ignores
-            them; see _pa_decode_sparse_fp8.
+            the output epilogue (see _pa_decode_sparse_gfx950_gluon). Rejected
+            everywhere else.
 
     Returns:
         ``[N, H, D]`` attention output, same dtype as ``q``. When
@@ -261,6 +262,14 @@ def pa_decode_sparse(
     """
     if not q.is_cuda:
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
+    # Every path takes the second stream whole or not at all; a partial set
+    # would otherwise be dropped without a word.
+    _extra = (extra_cache, extra_indices, extra_indptr)
+    if any(x is not None for x in _extra) and any(x is None for x in _extra):
+        raise ValueError(
+            "extra_cache, extra_indices and extra_indptr go together: pass all "
+            "three or none"
+        )
 
     # gfx1250 fp8: a [nb, block, 640] cache is split into the two views the
     # kernel reads (see Formats). Gated on the arch: gfx950 has no 640 B path,
@@ -284,7 +293,17 @@ def pa_decode_sparse(
 
     v4_2buff = unified_kv_rope is not None
     if v4_2buff:
-        return _pa_decode_sparse_fp8(
+        if (
+            inv_rope_positions is not None
+            or inv_rope_cos_sin_cache is not None
+            or out_mxfp8 is not None
+        ):
+            raise NotImplementedError(
+                "inv_rope_positions / inv_rope_cos_sin_cache / out_mxfp8 (the "
+                "output epilogue) are gfx950 gluon only; the gfx1250 fp8 path "
+                "returns bf16 without the inverse RoPE"
+            )
+        return _pa_decode_sparse_gfx1250_fp8(
             q,
             unified_kv,
             unified_kv_rope,
@@ -449,7 +468,6 @@ def pa_decode_sparse(
     # mismatches between 2D (m/l) and 3D (acc) loads.
     reduce_num_warps = 1 if use_gluon else 4
     reduce_waves_per_eu = 4 if use_gluon else 1
-    USE_EXP2 = True
 
     # Infer KV_SPLITS from inputs when caller doesn't override.
     # Fill ~512 total CTAs (MI300X has 304 CUs) while never splitting K into
@@ -540,7 +558,6 @@ def pa_decode_sparse(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         HAS_INVALID=has_invalid,
-        USE_EXP2=USE_EXP2,
         num_warps=attn_num_warps,
         num_stages=num_stages,
         waves_per_eu=waves_per_eu,
@@ -568,7 +585,6 @@ def pa_decode_sparse(
         attn_sink,
         kv_indptr,
         kv_indptr,
-        kv_indices,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -589,10 +605,7 @@ def pa_decode_sparse(
         BLOCK_H=block_h_reduce,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
-        USE_EXP2=USE_EXP2,
         HAS_EXTRA=False,
-        MAIN_IS_WINDOW=False,
-        MAIN_BLOCK_SIZE_RED=1,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )
@@ -1116,6 +1129,12 @@ def _v4_2buff_geometry(kv: torch.Tensor, rope: torch.Tensor, name: str):
     stride across pages, so the kernel needs both the page size and the number
     of record-rows that stride spans.
     """
+    # The TDM descriptors take the inner stride as 1.
+    if kv.stride(-1) != 1 or rope.stride(-1) != 1:
+        raise RuntimeError(
+            f"{name} and its rope plane must be contiguous along the last dim, "
+            f"got strides {kv.stride()} / {rope.stride()}"
+        )
     if kv.dim() == 2:
         if kv.shape[1] != _V4_DIM_QK:
             raise RuntimeError(
@@ -1170,7 +1189,7 @@ def _v4_decode_partials(t_cap, kv_splits, h_padded, d, device_index):
     return m, l, acc
 
 
-def _pa_decode_sparse_fp8(
+def _pa_decode_sparse_gfx1250_fp8(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     unified_kv_rope: torch.Tensor,
@@ -1200,22 +1219,12 @@ def _pa_decode_sparse_fp8(
     Returns ``[N, H, 512]`` bf16 (MLA's V is the whole row: dequantized NoPE
     followed by the bf16 RoPE half).
 
-    NOT IMPLEMENTED HERE -- the fused output epilogue
-    ``inv_rope_positions`` / ``inv_rope_cos_sin_cache`` / ``out_mxfp8``.
-    ``pa_decode_sparse`` dispatches to this driver *before* the assert that
-    rejects them for non-gfx950 paths, and this signature does not take them,
-    so a caller that passes them gets them SILENTLY IGNORED: the output comes
-    back un-rotated and in bf16 rather than MXFP8, with no error. No caller
-    does that today (the epilogue is a gfx950 gluon path), which is why it is
-    documented rather than guarded.
-
-    TODO: implement the epilogue on this path -- inverse GPT-J RoPE over the
-    trailing rope lanes and the optional MXFP8 quant -- and wire the three
-    arguments through from ``pa_decode_sparse``. Until then, either add the
-    guard at the ``v4_2buff`` branch in ``pa_decode_sparse`` or keep this note
-    in step with it. See ``_pa_decode_sparse_gfx950_gluon`` for the reference
-    implementation and ``test_pa_decode_sparse_inv_rope_mxfp8_epilogue`` for
-    the expected numerics.
+    TODO: the fused output epilogue (``inv_rope_positions`` /
+    ``inv_rope_cos_sin_cache`` / ``out_mxfp8``) -- inverse GPT-J RoPE over the
+    trailing rope lanes and the optional MXFP8 quant. ``pa_decode_sparse``
+    rejects those arguments on this path until it exists. See
+    ``_pa_decode_sparse_gfx950_gluon`` for the reference implementation and
+    ``test_pa_decode_sparse_inv_rope_mxfp8_epilogue`` for the expected numerics.
     """
     if DEVICE_ARCH != "gfx1250":
         raise RuntimeError(
@@ -1251,6 +1260,16 @@ def _pa_decode_sparse_fp8(
             extra_block_size,
             extra_slots,
         ) = _v4_2buff_geometry(extra_cache, extra_cache_rope, "extra_cache")
+        # One pair of row strides (kv_stride_n / kvr_stride_n) serves both
+        # streams' descriptors, so the extra stream must share the main's.
+        if extra_cache.stride(-2) != unified_kv.stride(-2) or extra_cache_rope.stride(
+            -2
+        ) != unified_kv_rope.stride(-2):
+            raise RuntimeError(
+                "extra_cache must have the same row strides as unified_kv: "
+                f"{extra_cache.stride(-2)}/{extra_cache_rope.stride(-2)} vs "
+                f"{unified_kv.stride(-2)}/{unified_kv_rope.stride(-2)}"
+            )
         assert extra_indices.dtype == torch.int32 and extra_indices.is_contiguous()
         assert extra_indptr.dtype == torch.int32 and extra_indptr.is_contiguous()
     else:
@@ -1311,6 +1330,7 @@ def _pa_decode_sparse_fp8(
             # writing, giving ~1e38 garbage (plan section 27 / 30.4). BLOCK_H=32
             # is clean on both compilers, so pin it until the compiler fix
             # lands, then restore: block_h = 32 if T >= 256 else 16
+            # The other H that land on 16 are covered after kv_splits is known.
             block_h = 32
         else:
             block_h = triton.next_power_of_2(H)
@@ -1367,8 +1387,8 @@ def _pa_decode_sparse_fp8(
     # (BLOCK_H=16) / 604 (BLOCK_H=32), leaving room for the ~64 VGPR Q tile.
     reduce_num_warps = 1
     reduce_waves_per_eu = 4
-    USE_EXP2 = True
 
+    kv_splits_requested = kv_splits
     if kv_splits is None:
         # PER TOKEN: the split is per token, so the ceiling is the tile count
         # ONE token has. kv_indices.shape[0] is every token's indices together,
@@ -1404,9 +1424,20 @@ def _pa_decode_sparse_fp8(
     # reduce writing `out` from the partials. That path is CORRECT -- an
     # earlier comment here called it a race, which it is not. It is
     # miscompiled by upstream Triton 3.8.0 at BLOCK_H=16 only (the
-    # `s_wait_dscnt` before `tensor_store_from_lds` is dropped), and BLOCK_H
-    # is pinned to 32 above precisely so that tile is unreachable. The
-    # internal build is correct at every BLOCK_H.
+    # `s_wait_dscnt` before `tensor_store_from_lds` is dropped). The pin above
+    # only covers 32 <= H < 64; H < 32 (16 at TP8) and H in [64, 128) at T < 32
+    # still pick BLOCK_H=16, and at large T the heuristic then gives one split.
+    # Two splits move that output onto the reduce instead -- an empty second
+    # split just exits. The internal build is correct at every BLOCK_H; drop
+    # this with the pin once the compiler fix lands.
+    if block_h == 16 and kv_splits == 1:
+        if kv_splits_requested is not None:
+            raise ValueError(
+                "kv_splits=1 with BLOCK_H=16 hits a Triton 3.8.0 miscompile of "
+                "the single-split output store on gfx1250; use kv_splits >= 2 "
+                "or block_h >= 32"
+            )
+        kv_splits = 2
     if kv_splits > 8:
         reduce_num_warps = 4
         reduce_waves_per_eu = 1
@@ -1516,7 +1547,6 @@ def _pa_decode_sparse_fp8(
         Q_IN_VGPR=(attn_num_warps <= 4),
         HAS_INVALID=bool(has_invalid),
         Q_TDM=bool(q_tdm),
-        USE_EXP2=USE_EXP2,
         CTAS_H=ctas_h,
         MAIN_BLOCK_SIZE=main_block_size,
         EXTRA_BLOCK_SIZE=extra_block_size,
@@ -1543,7 +1573,6 @@ def _pa_decode_sparse_fp8(
         attn_sink,
         kv_indptr,
         extra_indptr,
-        kv_indices,
         out,
         m_partial.stride(0),
         m_partial.stride(1),
@@ -1564,13 +1593,10 @@ def _pa_decode_sparse_fp8(
         BLOCK_H=block_h_reduce,
         BLOCK_D=block_d,
         BLOCK_K=block_k,
-        USE_EXP2=USE_EXP2,
         # The reduce counts a token's live segments in TILES, and with two
         # streams that count is main_tiles + extra_tiles -- it has to see the
         # extra stream's indptr or it scrubs the wrong segments.
         HAS_EXTRA=has_extra,
-        MAIN_IS_WINDOW=False,
-        MAIN_BLOCK_SIZE_RED=1,
         num_warps=reduce_num_warps,
         waves_per_eu=reduce_waves_per_eu,
     )

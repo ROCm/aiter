@@ -37,6 +37,17 @@ _V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE
 _FP8_GROUP_SIZE = 64
 _V4_NUM_TILES = _V4_DIM_NOPE // _FP8_GROUP_SIZE
 
+# The fp8_max every DSv4 writer quantizes with. All writers of one cache must
+# agree, or the same KV gets a different scale depending on which wrote it.
+# FNUZ is 224, not finfo's 240: vLLM's ROCm convention
+# (``224.0 if is_fp8_fnuz()``), which these caches have to match.
+_FP8_MAX_OCP = float(torch.finfo(torch.float8_e4m3fn).max)  # 448
+_FP8_MAX_FNUZ = 224.0
+
+
+def _v4_fp8_max(use_fnuz: bool) -> float:
+    return _FP8_MAX_FNUZ if use_fnuz else _FP8_MAX_OCP
+
 
 def fused_rms_mxfp8_quant(
     x: torch.Tensor,
@@ -264,7 +275,7 @@ def fused_deepseek_v4_mxfp8_quant_q_pack(q: torch.Tensor):
         q,
         packed,
         rope,
-        float(torch.finfo(torch.float8_e4m3fn).max),
+        _FP8_MAX_OCP,
         _V4_DIM_NOPE,
         _V4_DIM_ROPE,
         _V4_DIM_QK,
@@ -371,7 +382,7 @@ def fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         # unused under PACK_Q=False, but the launch still has to typecheck
         q_packed = q_rope = q_out
 
-    fp8_max = 224.0 if use_fnuz else float(torch.finfo(torch.float8_e4m3fn).max)
+    fp8_max = _v4_fp8_max(use_fnuz)
     # One extra slot along dim 1 carries the KV row for the token.
     _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel[(t, padded_heads + 1)](
         q,
@@ -455,6 +466,8 @@ def fused_deepseek_v4_quantize_and_insert_k_cache(
         k.dim() == 2 and k.shape[1] == 512
     ), f"K must be [num_tokens, 512], got {k.shape}"
     assert k.dtype == torch.bfloat16, f"K must be bf16, got {k.dtype}"
+    # rows may be strided (a column slice of a wider tensor); columns may not
+    assert k.stride(1) == 1, f"K rows must be contiguous, got strides {k.stride()}"
     assert is_ue8m0, "Only support ue8m0 quantization."
 
     # NOTE: When using DP, slot_mapping.shape[0] can be less than k.shape[0] due to
@@ -466,12 +479,7 @@ def fused_deepseek_v4_quantize_and_insert_k_cache(
     TOKEN_BF16_DIM = 64
     TOKEN_SCALE_DIM = 8
     QUANT_BLOCK_SIZE = 64
-    if use_fnuz:
-        if not True:
-            raise ValueError("use_fnuz=True requires a platform using FNUZ FP8")
-        FP8_MAX = 240.0
-    else:
-        FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+    FP8_MAX = _v4_fp8_max(use_fnuz)
     _REC_B, _SC_OFF, _ROPE_OFF, _SC_STEP = _rec_geometry(k_cache)
     TOKEN_DATA_SIZE = TOKEN_FP8_DIM + TOKEN_BF16_DIM * 2
 
@@ -482,6 +490,7 @@ def fused_deepseek_v4_quantize_and_insert_k_cache(
         slot_mapping,
         k_cache,
         num_tokens,
+        k.stride(0),
         input_dim=512,
         fp8_dim=TOKEN_FP8_DIM,
         bf16_dim=TOKEN_BF16_DIM,
@@ -523,10 +532,16 @@ def fused_deepseek_v4_dequantize_and_gather_k_cache(
             packed).
         seq_lens: ``[num_reqs]`` sequence lengths.
         gather_lens: ``[num_reqs]`` gather counts, or None to use seq_lens.
-        block_table: ``[num_reqs, max_blocks_per_seq]``.
+        block_table: ``[num_reqs, max_blocks_per_seq]``. Rows may be strided:
+            a column slice ``block_table[:, :n]`` -- CUDA-graph padding makes
+            one -- is addressed by its row stride, not its width.
         offset: first token position to read.
         use_fnuz: fp8 flavour of the cache's encoder.
     """
+    assert (
+        block_table.stride(1) == 1
+    ), f"block_table rows must be contiguous, got strides {block_table.stride()}"
+    assert out.stride(2) == 1, f"out rows must be contiguous, got {out.stride()}"
     num_reqs = seq_lens.shape[0]
     rec_bytes, sc_in_rec, rope_in_rec, sc_step = _rec_geometry(k_cache)
     _fused_deepseek_v4_dequant_gather_k_cache_kernel[
@@ -538,9 +553,9 @@ def fused_deepseek_v4_dequantize_and_gather_k_cache(
         k_cache,
         seq_lens,
         block_table,
+        block_table.stride(0),
         offset,
         gather_lens,
-        max_blocks_per_seq=block_table.shape[-1],
         fp8_dim=448,
         bf16_dim=64,
         scale_dim=8,
@@ -553,7 +568,7 @@ def fused_deepseek_v4_dequantize_and_gather_k_cache(
         sc_step=sc_step,
         block_stride=k_cache.stride(0),
         output_dim=512,
-        fp8_max=float(torch.finfo(torch.float8_e4m3fn).max),
+        fp8_max=_v4_fp8_max(use_fnuz),  # unused by the reader
         n_quant_blocks=7,
         use_fnuz=use_fnuz,
     )
@@ -649,7 +664,7 @@ def fused_deepseek_v4_compress_norm_rope_store(
         COMPRESS_RATIO=compress_ratio,
         OVERLAP=overlap,
         ROPE_HEAD_DIM=rope_head_dim,
-        FP8_MAX=448.0,
+        FP8_MAX=_FP8_MAX_OCP,  # the compressor writes OCP e4m3 only
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
         SC_IN_REC=448 if token_stride == 640 else 0,
@@ -750,7 +765,7 @@ def _launch_two_stage_sparse_attn_compressor(
         TRITON_BLOCK_SIZE=triton.next_power_of_2(head_dim),
         COMPRESS_RATIO=compress_ratio,
         ROPE_HEAD_DIM=rope_head_dim,
-        FP8_MAX=448.0,
+        FP8_MAX=_FP8_MAX_OCP,  # the compressor writes OCP e4m3 only
         QUANT_BLOCK=quant_block,
         TOKEN_STRIDE=token_stride,
         SC_IN_REC=448 if token_stride == 640 else 0,

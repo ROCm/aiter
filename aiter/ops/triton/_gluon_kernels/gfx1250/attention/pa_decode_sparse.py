@@ -70,7 +70,6 @@ def _pa_decode_sparse(
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
     HAS_INVALID: gl.constexpr,
-    USE_EXP2: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     WARP_SIZE: gl.constexpr = 32
@@ -173,10 +172,9 @@ def _pa_decode_sparse(
         mask=h_mask_q[:, None],
         other=0.0,
     )
-    # When USE_EXP2, fold log2(e) into q so QK scores land in the base-2
-    # domain and per-element softmax uses the bare exp2 HW instruction.
-    # Otherwise stay in the natural-exp domain (softmax_scale only).
-    qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
+    # Fold log2(e) into q so QK scores land in the base-2 domain and the
+    # per-element softmax uses the bare exp2 HW instruction.
+    qk_scale = softmax_scale * LOG2E
     mfma_q = gl.convert_layout(q, dot_q_layout)
     mfma_q = mfma_q.to(gl.float32) * qk_scale
     mfma_q = mfma_q.to(q_ptr.dtype.element_ty)
@@ -187,6 +185,20 @@ def _pa_decode_sparse(
 
     tiles_per_segment = gl.cdiv(kv_len, KV_SPLITS * BLOCK_K)
     if pid_k * tiles_per_segment * BLOCK_K >= kv_len:
+        if KV_SPLITS == 1:
+            # A token with no keys. Split, the reduce writes it as zeros; the
+            # single-CTA path has no reduce behind it, so it must do the same.
+            gl.amd.cdna4.buffer_store(
+                gl.zeros(
+                    [BLOCK_H, BLOCK_D], out_ptr.dtype.element_ty, Q_BLOCKED_LAYOUT
+                ),
+                ptr=out_ptr + t * out_stride_t,
+                offsets=(
+                    h_offs_q_eff[:, None] * out_stride_h
+                    + d_offs_q[None, :] * out_stride_d
+                ).to(gl.int32),
+                mask=h_mask_q[:, None],
+            )
         return
     num_tiles = gl.cdiv(kv_len, BLOCK_K)
     tile_start = pid_k * tiles_per_segment
@@ -204,19 +216,10 @@ def _pa_decode_sparse(
             mask=h_mask_mma_row,
             other=float("-inf"),
         ).to(gl.float32)
-        if USE_EXP2:
-            sink = sink * LOG2E
+        sink = sink * LOG2E
         sink = gl.convert_layout(sink, gl.SliceLayout(1, QK_WMMA_LAYOUT))
         m_i = sink
-        if USE_EXP2:
-            l_i = gl.exp2(sink - m_i)
-        else:
-            l_i = gl.full(
-                [BLOCK_H],
-                1.0,
-                dtype=gl.float32,
-                layout=gl.SliceLayout(1, QK_WMMA_LAYOUT),
-            )
+        l_i = gl.exp2(sink - m_i)
     else:
         m_i = gl.full(
             [BLOCK_H],
@@ -346,12 +349,12 @@ def _pa_decode_sparse(
 
         m_block = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_block)
-        if USE_EXP2:
-            alpha = gl.exp2(m_i - m_new)
-            p = gl.exp2(scores - m_new[:, None])
-        else:
-            alpha = gl.exp(m_i - m_new)
-            p = gl.exp(scores - m_new[:, None])
+        # A tile with no valid key, before any earlier tile set m (a split's
+        # first tile), leaves m_new == -inf and exp2(-inf - -inf) is NaN.
+        # Rebasing on 0 there makes the tile a no-op: alpha and p are both 0.
+        m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = gl.exp2(m_i - m_safe)
+        p = gl.exp2(scores - m_safe[:, None])
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
         kv_for_acc = kv_smem_cur.load(dot_v_layout)
@@ -396,13 +399,11 @@ def _pa_decode_sparse(
 
     m_block = gl.max(scores, axis=1)
     m_new = gl.maximum(m_i, m_block)
-    if USE_EXP2:
-        alpha = gl.exp2(m_i - m_new)
-        p = gl.exp2(scores - m_new[:, None])
-        p = gl.where(valid_col[None, :], p, 0.0)
-    else:
-        alpha = gl.exp(m_i - m_new)
-        p = gl.exp(scores - m_new[:, None])
+    # See the loop body: an all-invalid tile must not turn into NaN.
+    m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
+    alpha = gl.exp2(m_i - m_safe)
+    p = gl.exp2(scores - m_safe[:, None])
+    p = gl.where(valid_col[None, :], p, 0.0)
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
     kv_for_acc = kv_bufs.index(buf_idx).load(dot_v_layout)
@@ -497,7 +498,6 @@ def _pa_decode_sparse_reduce(
     attn_sink_ptr,  # [H]
     kv_indptr_ptr,  # [N+1] int32 — used to derive per-token kv_len
     extra_indptr_ptr,  # [N+1] int32 — the extra stream's, when HAS_EXTRA
-    main_indices_ptr,  # [nnz] int32 — only read for its run start, MAIN_IS_WINDOW
     out_ptr,  # [N, H, D]
     mp_stride_t: gl.constexpr,
     mp_stride_k: gl.constexpr,
@@ -518,10 +518,7 @@ def _pa_decode_sparse_reduce(
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
-    USE_EXP2: gl.constexpr,
     HAS_EXTRA: gl.constexpr,
-    MAIN_IS_WINDOW: gl.constexpr,
-    MAIN_BLOCK_SIZE_RED: gl.constexpr,
     num_warps: gl.constexpr,
 ):
     """Gluon reduce for pa_decode_sparse: combine KV_SPLITS partials, fold in
@@ -529,7 +526,7 @@ def _pa_decode_sparse_reduce(
 
     Grid: (T, cdiv(H, BLOCK_H)). Each CTA handles BLOCK_H heads and reduces
     KV_SPLITS segments in-register (no cross-wave communication on the segment
-    axis). The gluon main kernel emits natural-exp partials (USE_EXP2=False).
+    axis). The main kernels emit base-2 partials (scores pre-scaled by log2(e)).
     """
     t = gl.program_id(0)
     pid_h = gl.program_id(1)
@@ -562,12 +559,12 @@ def _pa_decode_sparse_reduce(
 
     h_offs_out = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, L_HD))
     h_offs_out_eff = h_off_base + h_offs_out
-    # h_mask_out = h_offs_out_eff < H
+    h_mask_out = h_offs_out_eff < H
     sink = gl.amd.cdna4.buffer_load(
         ptr=attn_sink_ptr,
         offsets=h_offs_out_eff.to(gl.int32),
-        # mask=h_mask_out,
-        # other=float("-inf"),
+        mask=h_mask_out,
+        other=float("-inf"),
     )
 
     # m_partial/l_partial are [N, KV_SPLITS, H_padded]; per-token slab at
@@ -621,27 +618,11 @@ def _pa_decode_sparse_reduce(
         extra_tiles = gl.cdiv(extra_end - extra_start, BLOCK_K)
     else:
         extra_tiles = 0
-    if MAIN_IS_WINDOW:
-        # Counted exactly as the main kernel counts: the span is page-aligned,
-        # so it starts off0 positions before the window, and the leading
-        # off0 // BLOCK_K tiles precede the window and are skipped.
-        win_off0 = gl.load(main_indices_ptr + kv_start) % MAIN_BLOCK_SIZE_RED
-        main_t0 = win_off0 // BLOCK_K
-        main_tiles = gl.cdiv(win_off0 + kv_len, BLOCK_K) - main_t0
-        # Each stream is split on its OWN tile count, so a segment is live if
-        # EITHER gave it work.
-        tps_main = gl.cdiv(main_tiles, KV_SPLITS)
-        tps_extra = gl.cdiv(extra_tiles, KV_SPLITS)
-        act_num_segments = gl.maximum(
-            gl.cdiv(main_tiles, gl.maximum(tps_main, 1)),
-            gl.cdiv(extra_tiles, gl.maximum(tps_extra, 1)),
-        )
-    else:
-        num_tiles = gl.cdiv(kv_len, BLOCK_K) + extra_tiles
-        tiles_per_segment = gl.cdiv(num_tiles, KV_SPLITS)
-        # maximum() only guards a token with no keys at all, which the caller is
-        # free to hand us: every segment is then inactive and the output is zero.
-        act_num_segments = gl.cdiv(num_tiles, gl.maximum(tiles_per_segment, 1))
+    num_tiles = gl.cdiv(kv_len, BLOCK_K) + extra_tiles
+    tiles_per_segment = gl.cdiv(num_tiles, KV_SPLITS)
+    # maximum() only guards a token with no keys at all, which the caller is
+    # free to hand us: every segment is then inactive and the output is zero.
+    act_num_segments = gl.cdiv(num_tiles, gl.maximum(tiles_per_segment, 1))
     seg_active = offs_k[:, None] < act_num_segments
     neg_inf = gl.full([KV_SPLITS, BLOCK_H], float("-inf"), gl.float32, layout=L_KH)
     zero_kh = gl.full([KV_SPLITS, BLOCK_H], 0.0, gl.float32, layout=L_KH)
@@ -659,10 +640,7 @@ def _pa_decode_sparse_reduce(
     is_dead = m_p == float("-inf")  # [KV_SPLITS, BLOCK_H]
     m_max = gl.max(m_p, axis=0)  # [BLOCK_H]
 
-    if USE_EXP2:
-        alpha_split = gl.where(is_dead, 0.0, gl.exp2(m_p - m_max[None, :]))
-    else:
-        alpha_split = gl.where(is_dead, 0.0, gl.exp(m_p - m_max[None, :]))
+    alpha_split = gl.where(is_dead, 0.0, gl.exp2(m_p - m_max[None, :]))
 
     is_dead_3d = gl.convert_layout(is_dead, L_KH)[:, :, None]
 
@@ -676,18 +654,13 @@ def _pa_decode_sparse_reduce(
     )  # [BLOCK_H, BLOCK_D]
 
     LOG2E: gl.constexpr = 1.4426950408889634
-    sink_scale = LOG2E if USE_EXP2 else 1.0
-    sink = sink.to(gl.float32) * sink_scale
+    sink = sink.to(gl.float32) * LOG2E
 
     m_max_hd = gl.convert_layout(m_max, gl.SliceLayout(1, L_HD))
     m_final = gl.maximum(m_max_hd, sink)
 
-    if USE_EXP2:
-        alpha_kv = gl.exp2(m_max_hd - m_final)
-        alpha_sink = gl.exp2(sink - m_final)
-    else:
-        alpha_kv = gl.exp(m_max_hd - m_final)
-        alpha_sink = gl.exp(sink - m_final)
+    alpha_kv = gl.exp2(m_max_hd - m_final)
+    alpha_sink = gl.exp2(sink - m_final)
 
     l_combined_hd = gl.convert_layout(l_combined, gl.SliceLayout(1, L_HD))
     l_final = l_combined_hd * alpha_kv + alpha_sink
@@ -704,7 +677,7 @@ def _pa_decode_sparse_reduce(
         offsets=(
             h_offs_out_eff[:, None] * out_stride_h + d_offs_out[None, :] * out_stride_d
         ).to(gl.int32),
-        # mask=h_mask_out[:, None],
+        mask=h_mask_out[:, None],
     )
 
 
@@ -1334,7 +1307,6 @@ def _pa_decode_sparse_fp8(
     Q_IN_VGPR: gl.constexpr,
     HAS_INVALID: gl.constexpr,
     Q_TDM: gl.constexpr,
-    USE_EXP2: gl.constexpr,
     CTAS_H: gl.constexpr,
     MAIN_BLOCK_SIZE: gl.constexpr,  # paged page size; 1 for a flat ATOM pool
     EXTRA_BLOCK_SIZE: gl.constexpr,
@@ -1550,7 +1522,8 @@ def _pa_decode_sparse_fp8(
     kv_end = gl.load(kv_indptr_ptr + t + 1)
 
     # ---- Q (once per program): stays e4m3, its E8M0 block is the scale operand ----
-    qk_scale = softmax_scale * LOG2E if USE_EXP2 else softmax_scale
+    # Scores are base-2 (log2(e) folded into the scale) so the softmax is exp2.
+    qk_scale = softmax_scale * LOG2E
     if Q_TDM:
         # Descriptor loads instead of masked buffer_loads plus convert_layouts.
         # The value descriptor is declared NOPE_DIM wide while a BLOCK_D block
@@ -1656,6 +1629,14 @@ def _pa_decode_sparse_fp8(
         extra_start = 0
         extra_len = 0
         num_tiles = main_tiles
+    # Also used by the output epilogue at the bottom.
+    OUT_BLOCKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
+        size_per_thread=[1, 8],
+        threads_per_warp=[WARP_SIZE // GRP_D_THREADS, GRP_D_THREADS],
+        warps_per_cta=[num_warps, 1],
+        order=[1, 0],
+        cga_layout=CGA_H,
+    )
     tiles_per_segment = gl.cdiv(num_tiles, KV_SPLITS)
     if pid_k * tiles_per_segment >= num_tiles:
         # Q's TDM loads are still in flight here and nothing downstream waits
@@ -1664,6 +1645,26 @@ def _pa_decode_sparse_fp8(
         # releasing. Only early-exiting CTAs pay it.
         if Q_TDM:
             gl.amd.gfx1250.tdm.async_wait(0)
+        if KV_SPLITS == 1:
+            # A token with no keys in either stream. Split, the reduce writes
+            # it as zeros; the single-CTA path has no reduce behind it, so it
+            # must do the same or `out` keeps whatever was in it.
+            h_offs_z = h_off_base + gl.arange(
+                0, BLOCK_H, layout=gl.SliceLayout(1, OUT_BLOCKED_LAYOUT)
+            )
+            d_offs_z = gl.arange(
+                0, BLOCK_D, layout=gl.SliceLayout(0, OUT_BLOCKED_LAYOUT)
+            )
+            gl.amd.cdna4.buffer_store(
+                gl.zeros(
+                    [BLOCK_H, BLOCK_D], out_ptr.dtype.element_ty, OUT_BLOCKED_LAYOUT
+                ),
+                ptr=out_ptr + t * out_stride_t,
+                offsets=(
+                    h_offs_z[:, None] * out_stride_h + d_offs_z[None, :] * out_stride_d
+                ).to(gl.int32),
+                mask=(h_offs_z < H)[:, None],
+            )
         return
     tile_start = pid_k * tiles_per_segment
     tile_end = gl.minimum((pid_k + 1) * tiles_per_segment, num_tiles)
@@ -1678,18 +1679,9 @@ def _pa_decode_sparse_fp8(
             mask=h_offs_mma_row_eff < H,
             other=float("-inf"),
         ).to(gl.float32)
-        if USE_EXP2:
-            sink = sink * LOG2E
+        sink = sink * LOG2E
         m_i = sink
-        if USE_EXP2:
-            l_i = gl.exp2(sink - m_i)
-        else:
-            l_i = gl.full(
-                [BLOCK_H],
-                1.0,
-                dtype=gl.float32,
-                layout=gl.SliceLayout(1, QK_WMMA_LAYOUT),
-            )
+        l_i = gl.exp2(sink - m_i)
     else:
         m_i = gl.full(
             [BLOCK_H],
@@ -1702,7 +1694,8 @@ def _pa_decode_sparse_fp8(
         )
 
     # 448 = 256 + 128 + 64, the power-of-two decomposition of the lora half,
-    # plus RoPE: four accumulators tiling the same [BLOCK_H, D] output.
+    # plus RoPE, staged as one [BLOCK_K, D] V tile; PV accumulates into two
+    # [BLOCK_H, D/2] halves.
     PV0: gl.constexpr = 256
     PV1: gl.constexpr = 128
     PV2: gl.constexpr = NOPE_DIM - PV0 - PV1
@@ -1710,9 +1703,8 @@ def _pa_decode_sparse_fp8(
     a0 = gl.zeros([BLOCK_H, PV_HALF], gl.float32, layout=PV_WMMA_LAYOUT)
     a1 = gl.zeros([BLOCK_H, PV_HALF], gl.float32, layout=PV_WMMA_LAYOUT)
 
-    # 3-deep gather ring plus a 2-deep bf16 staging ring, as in the bf16
-    # kernel: a tile is gathered two iterations ahead of its use, and tile
-    # i+1's dequant writes one staging buffer while tile i's PV reads the other.
+    # 2-deep gather ring and a single bf16 staging tile; see the note above
+    # the main loop for why it is two-deep.
     NUM_BUFFERS: gl.constexpr = 2
     NUM_STAGE: gl.constexpr = 1
     kv_bufs = gl.allocate_shared_memory(
@@ -1886,8 +1878,20 @@ def _pa_decode_sparse_fp8(
     # iteration i: exactly 4 outstanding -- slot(i+1) in flight and
     # KV/RoPE/MXS(i) in flight.
 
+    #
+    # CTAS_H > 1: the KV, RoPE, scale and slot buffers are multicast, so a peer
+    # CTA's gather writes into OUR buffers. Two cluster barriers keep that safe:
+    #   a. before step 1 -- tile i+1 goes into the buffer tile i-1 used, so every
+    #      CTA must have finished reading tile i-1 before anyone refills it;
+    #   b. after step 2's async_wait -- async_wait only retires a CTA's OWN
+    #      TDM ops, so a CTA may read tile i only once every peer has seen its
+    #      share land. Arriving before the wait would let peers read early.
+
     gl.assume(num_iters >= 1)
     for i in tl.range(0, num_iters - 1):
+        if CTAS_H > 1:
+            gl.amd.gfx1250.cluster.arrive()
+            gl.amd.gfx1250.cluster.wait()
         # 1. retire slot(i+1), read it, gather tile i+1 one iteration ahead
         gl.amd.gfx1250.tdm.async_wait(3)
         next_row, next_is_main, next_valid = _v4_2buff_tile(
@@ -1953,10 +1957,9 @@ def _pa_decode_sparse_fp8(
         )
 
         # 2. retire KV/RoPE/MXS(i), gathered one iteration ago
-        if CTAS_H > 1:
-            gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.tdm.async_wait(4)
         if CTAS_H > 1:
+            gl.amd.gfx1250.cluster.arrive()
             gl.amd.gfx1250.cluster.wait()
 
         # ---- QK ----
@@ -2044,16 +2047,15 @@ def _pa_decode_sparse_fp8(
 
         m_block = gl.max(scores, axis=1)
         m_new = gl.maximum(m_i, m_block)
-        if USE_EXP2:
-            # A tile with no valid key at all (every column a -1 sentinel or out
-            # of range) leaves m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf)
-            # = NaN, and with l_i/acc still 0 it survives as 0*NaN and poisons the
-            # whole row. Treat such a tile as a no-op, as the gfx950 kernel does.
-            alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new))
-            p = gl.exp2(scores - m_new[:, None])
-        else:
-            alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp(m_i - m_new))
-            p = gl.exp(scores - m_new[:, None])
+        # A tile with no valid key at all (every column a -1 sentinel or out of
+        # range), before any earlier tile set m -- a split's first tile, say a
+        # short SWA window -- leaves m_new == -inf, and exp2(-inf - -inf) is NaN
+        # in BOTH alpha and p. NaN in p poisons l_i/acc, and the next valid tile
+        # makes m finite, so the reduce would take the split as live. Rebasing
+        # on 0 makes such a tile a no-op: alpha and p both come out 0.
+        m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
+        alpha = gl.exp2(m_i - m_safe)
+        p = gl.exp2(scores - m_safe[:, None])
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
         alpha_pv = gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
@@ -2075,10 +2077,10 @@ def _pa_decode_sparse_fp8(
             cur_valid = next_valid
 
     # ---- Epilogue: final (possibly partial) tile ----
-    if CTAS_H > 1:
-        gl.amd.gfx1250.cluster.arrive()
+    # Barrier b. of the loop; nothing is refilled after this, so no a.
     gl.amd.gfx1250.tdm.async_wait(0)
     if CTAS_H > 1:
+        gl.amd.gfx1250.cluster.arrive()
         gl.amd.gfx1250.cluster.wait()
     # Under MASK_TILE, cur_valid already carries this tile's range check as
     # well as its slot validity (see _v4_2buff_tile) and there is nothing left
@@ -2173,17 +2175,11 @@ def _pa_decode_sparse_fp8(
 
     m_block = gl.max(scores, axis=1)
     m_new = gl.maximum(m_i, m_block)
-    if USE_EXP2:
-        # A tile with no valid key at all (every column a -1 sentinel or out
-        # of range) leaves m_new == -inf, so exp(m_i - m_new) = exp(-inf + inf)
-        # = NaN, and with l_i/acc still 0 it survives as 0*NaN and poisons the
-        # whole row. Treat such a tile as a no-op, as the gfx950 kernel does.
-        alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp2(m_i - m_new))
-        p = gl.exp2(scores - m_new[:, None])
-        p = gl.where(valid_col[None, :], p, 0.0)
-    else:
-        alpha = gl.where(m_new == float("-inf"), 1.0, gl.exp(m_i - m_new))
-        p = gl.exp(scores - m_new[:, None])
+    # See the loop body: an all-invalid tile must not turn into NaN.
+    m_safe = gl.where(m_new == float("-inf"), 0.0, m_new)
+    alpha = gl.exp2(m_i - m_safe)
+    p = gl.exp2(scores - m_safe[:, None])
+    p = gl.where(valid_col[None, :], p, 0.0)
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
     alpha_pv = gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
@@ -2201,14 +2197,7 @@ def _pa_decode_sparse_fp8(
     m_i = m_new
     l_i = l_new
 
-    # ---- Output: the eight accumulators tile the head dim ----
-    OUT_BLOCKED_LAYOUT: gl.constexpr = gl.BlockedLayout(
-        size_per_thread=[1, 8],
-        threads_per_warp=[WARP_SIZE // GRP_D_THREADS, GRP_D_THREADS],
-        warps_per_cta=[num_warps, 1],
-        order=[1, 0],
-        cga_layout=CGA_H,
-    )
+    # ---- Output: the two accumulator halves tile the head dim ----
     h_offs_o = gl.arange(0, BLOCK_H, layout=gl.SliceLayout(1, OUT_BLOCKED_LAYOUT))
     h_offs_o_eff = h_off_base + h_offs_o
     h_mask_o = h_offs_o_eff < H
@@ -2216,8 +2205,8 @@ def _pa_decode_sparse_fp8(
     if KV_SPLITS == 1:
         inv = gl.convert_layout(1.0 / l_i[:, None], layout=PV_WMMA_LAYOUT)
         oty: gl.constexpr = out_ptr.dtype.element_ty
-        # Out by descriptor: the four accumulators are reassembled in LDS and
-        # leave as one block. The descriptor's row extent is H, so out-of-range
+        # Out by descriptor: the two accumulator halves are reassembled in LDS
+        # and leave as one block. The descriptor's row extent is H, so out-of-range
         # heads clip and the head mask goes away.
         out_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
             base=out_ptr + t * out_stride_t,

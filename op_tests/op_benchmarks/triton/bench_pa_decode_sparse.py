@@ -574,7 +574,6 @@ def bench_fn(
     timer="wall",
     extra_len=0,
     extra_page=DEFAULT_PAGE,
-    main_is_window=False,
     pool="paged",
 ):
     inp = build_inputs(
@@ -589,7 +588,6 @@ def bench_fn(
         pool=pool,
     )
     inp["block_k"] = block_k
-    inp["main_is_window"] = main_is_window
     made = _make_fn(provider, inp, T, H, D)
     if made is None:
         return float("nan")
@@ -691,7 +689,6 @@ def run_benchmark(args):
             f"-{args.timer}"
             f"{f'-x{args.extra_len}' if args.extra_len else ''}"
             f"{f'-k{args.block_k}' if args.block_k else ''}"
-            f"{'-window' if args.main_is_window else ''}"
             f"{'-flat' if args.pool == 'flat' else ''}"
             f"{'-cudagraph' if args.cudagraph else ''}"
             f"{'-varlen' if args.var_len else ''}"
@@ -717,7 +714,6 @@ def run_benchmark(args):
             args.timer,
             extra_len,
             args.extra_page,
-            args.main_is_window,
             args.pool,
         )
 
@@ -801,18 +797,7 @@ def parse_args(argv=None):
         type=int,
         default=None,
         help="Override the KV tile size for v4_a8w8. The driver ties "
-        "it to block_h (16, or 64 at block_h=128); under the window path a "
-        "32-row tile is often better, because async_load costs one TDM "
-        "instruction whatever the tile while an int32 gather costs "
-        "ceil(BLOCK_K/8).",
-    )
-    p.add_argument(
-        "--main-is-window",
-        action="store_true",
-        help="Attend the MAIN stream as a sliding window: read each page's "
-        "first slot and async_load the tile, instead of async_gather over a "
-        "slot vector. Only v4_a8w8 supports it, and it requires --block-k to "
-        "divide --page. Off by default, which is the driver's default.",
+        "it to block_h (16, or 64 at block_h=128).",
     )
     p.add_argument(
         "--var_len",

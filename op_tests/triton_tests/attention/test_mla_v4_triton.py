@@ -289,7 +289,7 @@ def bench_mla_v4_triton_perf(
 def _wrapper_main_kernel_params(T: int, H: int, D: int):
     """Reproduce the (use_exp2, block_k) the wrapper picks for the main kernel.
 
-    Must stay in sync with ``pa_decode_sparse``'s USE_EXP2 and block_k logic.
+    Must stay in sync with ``pa_decode_sparse``'s (always exp2) block_k logic.
     """
     use_gluon = arch_info.get_arch() == "gfx1250"
     use_exp2 = True

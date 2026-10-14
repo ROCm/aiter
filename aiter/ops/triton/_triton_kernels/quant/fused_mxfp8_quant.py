@@ -310,7 +310,8 @@ def _fused_deepseek_v4_mxfp8_quant_q_pack_kernel(
       [462, 512) zero
     plus the RoPE plane, which is never quantized.
     """
-    row = tl.program_id(0)
+    # int64: rows * QK passes 2^31 at 4M (token, head) rows -- a long prefill
+    row = tl.program_id(0).to(tl.int64)
     src = q_ptr + row * QK
     dst = packed_ptr + row * QK
 
@@ -441,7 +442,10 @@ def _fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert_kernel(
     not tidiness: an unwritten scale byte of 0xFF is E8M0 NaN, and the decode
     kernel multiplies a masked score by it, so 0 * NaN would poison the row.
     """
-    tok = tl.program_id(0)
+    # int64, so every token-scaled offset below is: (tok * padded_heads + h) *
+    # HEAD passes 2^31 once T * padded_heads reaches 4M, e.g. a 32K prefill
+    # at 128 heads
+    tok = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
     d = tl.arange(0, HEAD)
     half: tl.constexpr = ROPE // 2
@@ -590,6 +594,7 @@ def _fused_deepseek_v4_quantize_and_insert_k_kernel(
     k_cache_ptr,  # [num_blocks, block_bytes] as uint8 (flattened view)
     # Dimensions
     num_tokens,
+    k_row_stride,  # elements between K rows; a column slice is wider than 512
     input_dim: tl.constexpr,  # 512
     fp8_dim: tl.constexpr,  # 448
     bf16_dim: tl.constexpr,  # 64
@@ -632,8 +637,9 @@ def _fused_deepseek_v4_quantize_and_insert_k_kernel(
     block_idx = slot_idx // cache_block_size
     pos_in_block = slot_idx % cache_block_size
 
-    # Input pointer for this token
-    input_row_ptr = k_ptr + pid * input_dim
+    # Input pointer for this token. The row stride, not input_dim: K may be a
+    # column slice of a wider projection output.
+    input_row_ptr = k_ptr + pid.to(tl.int64) * k_row_stride
 
     # int64: block_idx * block_stride can exceed 2^31 with many KV-cache blocks
     # (e.g. >= 57K at block_stride ~37K). Matches gather path below.
@@ -748,10 +754,10 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
     k_cache_ptr,
     seq_lens_ptr,
     block_table_ptr,
+    block_table_stride,  # row stride; a column slice is wider than its shape
     offset,
     gather_lens_ptr,
     # Constants
-    max_blocks_per_seq: tl.constexpr,
     fp8_dim: tl.constexpr,  # 448
     bf16_dim: tl.constexpr,  # 64
     scale_dim: tl.constexpr,  # 8
@@ -789,7 +795,7 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
         pos_in_block = pos % cache_block_size
 
         # Get physical block index from block table
-        block_table_row_ptr = block_table_ptr + batch_idx * max_blocks_per_seq
+        block_table_row_ptr = block_table_ptr + batch_idx * block_table_stride
         physical_block_idx = tl.load(block_table_row_ptr + block_in_seq)  # int32
 
         # int64: physical_block_idx * block_stride can exceed 2^31 with many
@@ -814,7 +820,10 @@ def _fused_deepseek_v4_dequant_gather_k_cache_kernel(
         token_bf16_ptr = token_data_ptr + rope_in_rec
 
         # Output pointer for this token (flattened)
-        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
+        # int64: num_reqs * max_len * 512 passes 2^31 on a long batch
+        output_row_ptr = (
+            out_ptr + batch_idx.to(tl.int64) * out_stride0 + (offset + i) * out_stride1
+        )
 
         # ========== Dequantize FP8 portion using UE8M0 ==========
         for qblock_idx in tl.static_range(n_quant_blocks):
