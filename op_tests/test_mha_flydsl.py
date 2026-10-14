@@ -666,12 +666,15 @@ def _shape_lists(args):
             vals = [v for v in vals if v > 0]
         return vals
 
+    # -nhkv unset falls back to -nh (plain MHA) as the flag documents; only with neither
+    # given does it take the built-in values.
+    kv_heads = args.nheads_kv or args.nheads or _AXIS_DEFAULTS["nheads_kv"]
     rng = random.Random(args.seed)
     thd, bshd, skipped = [], [], 0
     for B, H_q, H_kv, sq, sk in itertools.product(
         axis("batch_size", args.batch_size),
         axis("nheads", args.nheads),
-        axis("nheads_kv", args.nheads_kv),
+        kv_heads,
         axis("seqlen_q", args.seqlen_q),
         axis("seqlen_k", args.seqlen_k),
     ):
@@ -909,24 +912,37 @@ def main():
 
         The axes multiply fast (hdim pairs x shapes x causal x lse x sink x window), so
         sample the product rather than trim an axis: every combination stays reachable,
-        and a different --seed walks a different slice of it."""
-        cases = [
-            c
-            for c in itertools.product(
-                hdims, shapes, args.dtype, causals, lses, sinks, windows
-            )
-            if _flydsl_serves(c[0][0], c[0][1])
+        and a different --seed walks a different slice of it. The sample is drawn over
+        product INDICES -- materializing millions of tuples to keep a few hundred costs
+        hundreds of MB on a partial-axis run. ``_flydsl_serves`` depends only on the hdim
+        axis, so filtering it up front leaves the index space exact."""
+        axes = [
+            [h for h in hdims if _flydsl_serves(*h)],
+            shapes,
+            args.dtype,
+            causals,
+            lses,
+            sinks,
+            windows,
         ]
-        if args.max_cases and len(cases) > args.max_cases:
-            aiter.logger.info(
-                "%s: sampling %d of %d cases (--seed %d; --max-cases 0 runs all)",
-                label,
-                args.max_cases,
-                len(cases),
-                args.seed,
-            )
-            cases = case_rng.sample(cases, args.max_cases)
-        return cases
+        total = math.prod(len(a) for a in axes)
+        if not args.max_cases or total <= args.max_cases:
+            return list(itertools.product(*axes))
+        aiter.logger.info(
+            "%s: sampling %d of %d cases (--seed %d; --max-cases 0 runs all)",
+            label,
+            args.max_cases,
+            total,
+            args.seed,
+        )
+        picked = []
+        for idx in case_rng.sample(range(total), args.max_cases):
+            combo = []
+            for a in reversed(axes):
+                idx, j = divmod(idx, len(a))
+                combo.append(a[j])
+            picked.append(tuple(reversed(combo)))
+        return picked
 
     if "thd" in args.layout:
         rows = []
