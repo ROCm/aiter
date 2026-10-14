@@ -391,18 +391,28 @@ def run_input_generator(gen: Callable[[], tuple], fields: Sequence[str]) -> dict
         )
     return {name: val for name, val in zip(fields, values) if name != "_"}
 
-def generate_rotating_buffers_pool(gen: Callable, out_vals_keys: tuple, target_mb: int, min_pool_len: int):
-    kwargs = run_input_generator(gen, out_vals_keys)
-    per_set_bytes = sum(
-        v.numel() * v.element_size()
-        for v in kwargs.values()
-        if isinstance(v, torch.Tensor)
-    )
+def generate_rotating_buffers_pool(
+    gens: Sequence[Callable],
+    out_vals_keys: Sequence[Sequence[str]],
+    target_mb: int,
+    min_pool_len: int,
+):
+    per_set_bytes = 0
+    for gen, fields in zip(gens, out_vals_keys):
+        kwargs = run_input_generator(gen, fields)
+        per_set_bytes += sum(
+            v.numel() * v.element_size()
+            for v in kwargs.values()
+            if isinstance(v, torch.Tensor)
+        )
 
-    pool_len = max(min_pool_len, math.ceil(target_mb *1024 * 1024 / per_set_bytes))
+    pool_len = max(min_pool_len, math.ceil(target_mb * 1024 * 1024 / per_set_bytes))
     pool = []
     for _ in range(pool_len):
-        pool.append(run_input_generator(gen, out_vals_keys))
+        entry = {}
+        for gen, fields in zip(gens, out_vals_keys):
+            entry.update(run_input_generator(gen, fields))
+        pool.append(entry)
 
     return pool
 
