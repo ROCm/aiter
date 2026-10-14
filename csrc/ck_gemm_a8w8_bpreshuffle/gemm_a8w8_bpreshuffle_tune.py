@@ -538,13 +538,8 @@ class GemmA8W8BpreShuffleTuner(GemmCommonTuner):
                 continue
             for i in sorted(pipe.kernels_list.keys()):
                 ki = pipe.kernels_list[i]
-                # Existing preshuffle instances are dtype-generic despite their
-                # legacy fp8 name tokens.  Explicit INT8-only instances (the
-                # experimental LDS-stage-3 path) must not enter an fp8 tune.
-                if getattr(ki, "q_dtype_w", None) == "int8" and q_dtype_name != "int8":
-                    continue
-                # Unlike the legacy preshuffle table, 8-wave names describe
-                # distinct typed executables and must match in both directions.
+                # 8-wave names describe distinct typed executables (F8_F8 vs
+                # I8_I8), so they must match the tuned dtype in both directions.
                 if (
                     pipe.name == "8wave"
                     and getattr(ki, "q_dtype_w", None) != q_dtype_name
