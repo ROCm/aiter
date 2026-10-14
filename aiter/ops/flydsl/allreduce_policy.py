@@ -30,7 +30,11 @@ On the payload axis, a policy reads::
       0 --- oneshot ---)    (gap)    [--- mesh ---)[--- ring --->
 
     exact (quick reduce off):
-      0 --- exact_oneshot ---)    cross_device_reduce / RCCL --->
+      0 --- oneshot ---)    cross_device_reduce / RCCL --->
+
+The one-shot window may overlap the mesh and the ring windows: 
+``QuickAllReduce`` runs before ``CustomAllreduce``, and with quantization on, 
+the mesh and the ring take their payloads first.
 
 ``resolve_family_policy`` gives the policy for a given rank: the table row for the
 host's arch and link, with the ``AITER_FLY_AR_<ALG>_{MIN,MAX}_BYTES``
@@ -81,10 +85,9 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx942",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 384 * KiB),
+        oneshot=Window(0, 1536 * KiB),
         mesh=Window(384 * KiB, 128 * MiB),
         ring=Window(128 * MiB, None),
-        exact_oneshot=Window(0, 1536 * KiB),
     ),
     FamilyPolicy(
         arch="gfx942",
@@ -107,10 +110,9 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="xgmi",
         world_size=2,
-        oneshot=Window(0, 448 * KiB),
+        oneshot=Window(0, 3 * MiB),
         mesh=Window(448 * KiB, None),
         ring=None,
-        exact_oneshot=Window(0, 3 * MiB),
     ),
     FamilyPolicy(
         arch="gfx950",
@@ -133,28 +135,25 @@ FAMILY_POLICIES: tuple[FamilyPolicy, ...] = (
         arch="gfx950",
         link="pcie",
         world_size=2,
-        oneshot=Window(0, 384 * KiB),
+        oneshot=Window(0, 64 * MiB),
         mesh=Window(384 * KiB, None),
         ring=None,
-        exact_oneshot=Window(0, 64 * MiB),
     ),
     FamilyPolicy(
         arch="gfx950",
         link="pcie",
         world_size=4,
-        oneshot=Window(0, 128 * KiB),
+        oneshot=Window(0, 1 * MiB),
         mesh=Window(128 * KiB, 16 * MiB),
         ring=Window(16 * MiB, None),
-        exact_oneshot=Window(0, 1 * MiB),
     ),
     FamilyPolicy(
         arch="gfx950",
         link="pcie",
         world_size=8,
-        oneshot=Window(0, 96 * KiB),
+        oneshot=Window(0, 1 * MiB),
         mesh=Window(96 * KiB, 24 * MiB),
         ring=Window(24 * MiB, None),
-        exact_oneshot=Window(0, 1 * MiB),
     ),
 )
 
@@ -461,17 +460,11 @@ def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
         )
         for alg, infix in _WINDOW_ENV.items()
     }
-    oneshot = _override(policy.oneshot, *bounds[AllReduceAlgorithm.OneShot])
     return dataclasses.replace(
         policy,
-        oneshot=oneshot,
+        oneshot=_override(policy.oneshot, *bounds[AllReduceAlgorithm.OneShot]),
         mesh=_override(policy.mesh, *bounds[AllReduceAlgorithm.TwoShotMesh]),
         ring=_override(policy.ring, *bounds[AllReduceAlgorithm.TwoShotRing]),
-        exact_oneshot=_override(
-            policy.exact_oneshot if policy.exact_oneshot is not None else oneshot,
-            _env_bound("AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES", is_max=False),
-            _env_bound("AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES", is_max=True),
-        ),
     )
 
 

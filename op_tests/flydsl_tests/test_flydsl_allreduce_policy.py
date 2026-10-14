@@ -87,9 +87,9 @@ def test_window_bounds():
         Window(-16, None)
 
 
-def test_windows_must_not_overlap():
+def test_mesh_and_ring_windows_must_not_overlap():
     with pytest.raises(ValueError, match="overlaps"):
-        _policy(oneshot=Window(0, 256), mesh=Window(128, None), ring=None)
+        _policy(oneshot=None, mesh=Window(0, 256), ring=Window(128, None))
     with pytest.raises(ValueError, match="overlaps"):
         # An unbounded window must be the last one.
         _policy(oneshot=None, mesh=Window(0, None), ring=Window(1 << 20, None))
@@ -100,36 +100,19 @@ def test_windows_must_not_overlap():
     assert p.select(96, quantized=True) is None
 
 
-def test_exact_oneshot_must_extend_into_the_quantized_windows():
-    # The extension lies in the mesh window: fine.
-    p = _policy(
-        oneshot=Window(0, 128),
-        mesh=Window(128, None),
-        ring=None,
-        exact_oneshot=Window(0, 1024),
-    )
-    assert p.select(512, quantized=True) == MESH
-    assert p.select(512, quantized=False) == ONESHOT
+def test_mesh_and_ring_take_precedence_over_the_one_shot():
+    """The one-shot window may overlap the quantized windows. With quantization
+    on, ``QuickAllReduce`` serves the mesh and the ring first, and ``select``
+    follows it. With quantization off, the one-shot serves its whole window."""
+    p = _policy(oneshot=Window(0, 1024), mesh=Window(128, 512), ring=Window(512, None))
+    assert p.select(64, quantized=True) == ONESHOT
+    assert p.select(256, quantized=True) == MESH
+    assert p.select(768, quantized=True) == RING
+    assert p.select(256, quantized=False) == ONESHOT
+    assert p.select(768, quantized=False) == ONESHOT
     assert p.select(2048, quantized=False) is None
     assert p.window(MESH, quantized=False) is None
-    # The exact window is free to end below the quantized one-shot, or to start
-    # elsewhere inside it.
-    p = _policy(
-        oneshot=Window(0, 128),
-        mesh=Window(128, None),
-        ring=None,
-        exact_oneshot=Window(0, 64),
-    )
-    assert p.select(96, quantized=False) is None
-    # The extension reaches a gap that CustomAllreduce would serve with the
-    # one-shot while select() says cross_device_reduce: rejected.
-    with pytest.raises(ValueError, match="do not cover"):
-        _policy(
-            oneshot=Window(0, 128),
-            mesh=Window(512, None),
-            ring=None,
-            exact_oneshot=Window(0, 1024),
-        )
+    assert p.window(ONESHOT, quantized=True) == p.window(ONESHOT, quantized=False)
 
 
 @pytest.mark.parametrize("cell", CELLS)
@@ -235,23 +218,18 @@ def test_oneshot_max_bytes_is_keyed_on_the_fabric(cell):
 def test_oneshot_max_bytes_follows_the_overrides():
     """The standalone default ceiling is the one CustomAllreduce serves."""
     kw = {"world_size": 4, "link": "pcie", "arch": "gfx950"}
-    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES="65536"):
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
         assert resolve_oneshot_max_bytes(**kw) == 65536 - 1
     # A maximum of 0 disables the one-shot.
-    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES="0"):
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="0"):
         assert resolve_oneshot_max_bytes(**kw) == 0
-    # The quantized one-shot variables do not move the exact window.
-    with _env(
-        AITER_FLY_AR_ONESHOT_MAX_BYTES="65536", AITER_FLY_AR_MESH_MIN_BYTES="65536"
-    ):
+    # The mesh variables do not move the one-shot window.
+    with _env(AITER_FLY_AR_MESH_MIN_BYTES="65536"):
         assert resolve_oneshot_max_bytes(**kw) == 1 * 1024 * 1024 - 1
     # Invalid overrides raise, as they do in the dispatchers.
     with (
-        _env(
-            AITER_FLY_AR_RING_MAX_BYTES="0",
-            AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES=str(1 << 30),
-        ),
-        pytest.raises(ValueError, match="do not cover"),
+        _env(AITER_FLY_AR_MESH_MAX_BYTES="inf"),
+        pytest.raises(ValueError, match="overlaps"),
     ):
         resolve_oneshot_max_bytes(**kw)
 
@@ -259,12 +237,7 @@ def test_oneshot_max_bytes_follows_the_overrides():
 @pytest.mark.parametrize("cell", CELLS)
 def test_ladder_rungs_fall_inside_their_dispatch_window(cell):
     """A rung above its algorithm's window is an engine and an IPC inbox built
-    for payloads that can never arrive.
-
-    This is the bug the windowed refit removed: fitted over the whole sweep,
-    the TP8 one-shot ladder wanted a second rung at 192 KiB, four times above
-    anything that schedule is dispatched at.
-    """
+    for payloads that can never arrive."""
     link, ws, _arch = cell
     row = _row(*cell)
     one = row.window(ONESHOT, quantized=False)
@@ -319,15 +292,29 @@ def test_no_overrides_is_the_table():
 
 def test_window_overrides():
     table = _row("pcie", 4, "gfx950")
-    # Move the one-shot/mesh boundary: it takes both variables.
-    with _env(
-        AITER_FLY_AR_ONESHOT_MAX_BYTES="65536", AITER_FLY_AR_MESH_MIN_BYTES="65536"
-    ):
+    # The ONESHOT variables move the window CustomAllreduce serves, in both
+    # modes, and leave the mesh and the ring alone.
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
         p = _resolve()
-        assert p.window(ONESHOT, quantized=True) == Window(0, 65536)
-        # The ONESHOT variables leave the exact-mode window alone.
-        assert p.window(ONESHOT, quantized=False) == table.exact_oneshot
-        assert p.window(MESH, quantized=True) == Window(65536, table.mesh.max)
+        for quantized in (False, True):
+            assert p.window(ONESHOT, quantized=quantized) == Window(0, 65536)
+        assert p.window(MESH, quantized=True) == table.mesh
+        assert p.window(RING, quantized=True) == table.ring
+        # Between the one-shot and the mesh, cross_device_reduce.
+        assert p.select(96 << 10, quantized=True) is None
+    # A maximum of 0 disables only the one-shot.
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="0"):
+        p = _resolve()
+        assert p.window(ONESHOT, quantized=False) is None
+        assert p.window(MESH, quantized=True) == table.mesh
+    # Lowering the mesh floor alone moves the boundary with quantization on.
+    with _env(AITER_FLY_AR_MESH_MIN_BYTES="65536"):
+        p = _resolve()
+        assert p.select(96 << 10, quantized=True) == MESH
+        assert p.select(96 << 10, quantized=False) == ONESHOT
+    # A minimum alone keeps the table maximum.
+    with _env(AITER_FLY_AR_ONESHOT_MIN_BYTES="1024"):
+        assert _resolve().oneshot == Window(1024, table.oneshot.max)
     # No upper limit, and a maximum of 0 disables the ring.
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="inf", AITER_FLY_AR_RING_MAX_BYTES="0"):
         p = _resolve()
@@ -337,43 +324,6 @@ def test_window_overrides():
     with _env(AITER_FLY_AR_MESH_MAX_BYTES="None", AITER_FLY_AR_RING_MAX_BYTES="0"):
         p = _resolve(ws=8)
         assert p.window(MESH, quantized=True).max is None
-
-
-def test_exact_oneshot_has_its_own_overrides():
-    """Moving the exact window does not need the quantized windows to move, and
-    it does not disable the mesh or the ring."""
-    table = _row("pcie", 4, "gfx950")
-    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES=str(4 << 20)):
-        p = _resolve()
-        assert p.window(ONESHOT, quantized=False) == Window(0, 4 << 20)
-        for alg in (ONESHOT, MESH, RING):
-            assert p.window(alg, quantized=True) == table.window(alg, quantized=True)
-    # A maximum of 0 turns off the exact one-shot only.
-    with _env(AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES="0"):
-        p = _resolve()
-        assert p.window(ONESHOT, quantized=False) is None
-        assert p.window(MESH, quantized=True) == table.mesh
-    # Where the table has no exact window, it creates one.
-    with _env(
-        AITER_FLY_AR_ONESHOT_MAX_BYTES=str(128 << 10),
-        AITER_FLY_AR_MESH_MIN_BYTES=str(128 << 10),
-        AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES=str(256 << 10),
-    ):
-        p = _resolve("xgmi", 4)
-        assert p.window(ONESHOT, quantized=False) == Window(0, 256 << 10)
-    # It starts from the window the exact one-shot ran in, the quantized
-    # one-shot's, so a minimum alone does not make the window unbounded.
-    one = _row("xgmi", 4, "gfx942").oneshot
-    with _env(AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES="1024"):
-        p = _resolve("xgmi", 4, "gfx942")
-        assert p.window(ONESHOT, quantized=False) == Window(1024, one.max)
-    with _env(
-        AITER_FLY_AR_ONESHOT_MAX_BYTES=str(128 << 10),
-        AITER_FLY_AR_MESH_MIN_BYTES=str(128 << 10),
-        AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES="1024",
-    ):
-        p = _resolve("xgmi", 4, "gfx942")
-        assert p.window(ONESHOT, quantized=False) == Window(1024, 128 << 10)
 
 
 def test_link_variable_backs_up_an_unreadable_probe():
@@ -447,12 +397,15 @@ def test_ignored_overrides():
 
 
 def test_overlapping_overrides_raise():
-    # Raising the one-shot ceiling without moving the mesh floor.
+    # Raising the mesh ceiling without moving the ring floor.
     with (
-        _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(1 << 20)),
+        _env(AITER_FLY_AR_MESH_MAX_BYTES=str(64 << 20)),
         pytest.raises(ValueError, match="overlaps"),
     ):
         _resolve()
+    # Raising the one-shot ceiling into the mesh window is fine.
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES=str(64 << 20)):
+        assert _resolve().select(32 << 20, quantized=True) == RING
     # A mesh floor above the mesh ceiling.
     with _env(AITER_FLY_AR_MESH_MIN_BYTES=str(1 << 30)), pytest.raises(ValueError):
         _resolve()

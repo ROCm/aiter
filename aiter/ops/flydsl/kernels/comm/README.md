@@ -8,9 +8,9 @@ node.
 
 | File | Contents |
 |---|---|
-| `one_shot_allreduce.py` | The exact one-shot kernel and its tuning ladder. |
-| `quick_allreduce_int4.py` | The quantized two-shot **mesh** kernel and its tuning ladder. |
-| `quick_allreduce_int4_ring.py` | The quantized two-shot **ring** kernel and its tuning ladder. |
+| `one_shot_allreduce.py` | The exact one-shot kernel. |
+| `quick_allreduce_int4.py` | The quantized two-shot **mesh** kernel. |
+| `quick_allreduce_int4_ring.py` | The quantized two-shot **ring** kernel. |
 | `quick_allreduce_codec.py` | The INT4, INT6 and FP16 wire codecs. The mesh and the ring use them. |
 | `allreduce_shared.py` | Tile geometry, the inbox cache policy, and the peer store and load primitives. All three kernels use them. |
 
@@ -20,7 +20,7 @@ The host classes are in `aiter/ops/flydsl/`:
 |---|---|
 | `one_shot_allreduce.py` | `OneShotAllReduce`, the host class for the one-shot kernel. |
 | `quick_allreduce_int4.py` | `QuickAllReduceInt4`, the host class for the mesh and the ring. |
-| `allreduce_policy.py` | The payload-size boundaries between the three kernels. |
+| `allreduce_policy.py` | The payload-size boundaries between the three kernels, and the tuning ladders. |
 | `allreduce_shared.py` | IPC inbox setup, link detection and other host helpers. |
 
 ## Kernels
@@ -120,14 +120,11 @@ levels:
    window for each algorithm (`AllReduceAlgorithm`): `oneshot`, `mesh` and
    `ring`. A window includes its minimum and excludes its maximum, and a
    maximum of `None` means no upper limit. A missing or empty window disables
-   the algorithm. The windows do not overlap, and a payload that is in no
-   window goes to `cross_device_reduce` or RCCL. `FamilyPolicy.select()` gives
-   the algorithm for a payload size.
+   the algorithm. A payload that is in no window goes to `cross_device_reduce`
+   or RCCL. `FamilyPolicy.select()` gives the algorithm for a payload size.
 
-   These windows apply with the INT4 quantization regime. Without it, only
-   the one-shot runs, in the `exact_oneshot` window if the policy has one.
-   This window can be larger, because without the mesh the one-shot is the
-   fastest kernel up to a larger payload.
+   The mesh and the ring run only with the INT4 quantization regime, and their
+   windows do not overlap. The one-shot is exact and runs in both modes. With quantization on, the mesh/ring takes those payloads first.
 2. Which configuration of that algorithm runs. Each algorithm has a tuning
    ladder for each arch, link type and world size: `ONESHOT_LADDER`,
    `MESH_ST_LADDER` and `RING_ST_LADDER`.
@@ -178,8 +175,6 @@ is not.
 | `AITER_FLY_AR_MESH_MAX_BYTES` | The maximum of the mesh window. |
 | `AITER_FLY_AR_RING_MIN_BYTES` | The minimum of the ring window. |
 | `AITER_FLY_AR_RING_MAX_BYTES` | The maximum of the ring window. |
-| `AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES` | The minimum of the one-shot window without quantization. |
-| `AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES` | The maximum of the one-shot window without quantization. |
 
 * If a variable is not set, is empty, or is `-1`, the code uses the value from
   the table.
@@ -188,28 +183,16 @@ is not.
   maximum also disables it.
 * If an algorithm has no window in the table, a variable creates one. The
   other bound is then `0` for the minimum, or no upper limit for the maximum.
-* The `ONESHOT` variables change only the one-shot window with quantization.
-  The `EXACT_ONESHOT` variables change the window of the exact one-shot
-  (`exact_oneshot`), which `CustomAllreduce` serves. Where a policy has no
-  `exact_oneshot` window, the exact one-shot uses the `oneshot` window, and
-  the `ONESHOT` variables change it. An `EXACT_ONESHOT` variable then creates
-  an `exact_oneshot` window from the `oneshot` window, so a minimum alone keeps
-  the `oneshot` maximum. To disable the one-shot in all cases, set both
-  maximums to `0`.
 * If a value is not valid, the code logs a warning and uses the value from the
   table.
-* If the `oneshot`, `mesh` and `ring` windows overlap after the change, the
-  code logs a warning and does not use the FlyDSL kernels.
-* The exact one-shot window can start and end anywhere, with one limit. With
-  quantization on, the mesh and the ring take their payloads first. A payload
-  of the exact window that is outside the `oneshot` window must be in the mesh
-  or the ring window. If it is not, the code logs a warning and does not use the
-  FlyDSL kernels. The mesh and the ring windows do not have to move with it.
+* If the mesh and the ring windows overlap after the change, the code logs a
+  warning and does not use the FlyDSL kernels.
 
-The windows are independent. To move the boundary between the one-shot and
-the mesh, set both `AITER_FLY_AR_ONESHOT_MAX_BYTES` and
-`AITER_FLY_AR_MESH_MIN_BYTES`. To change only the payloads that the exact
-one-shot serves, set `AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES`.
+The windows are independent. The one-shot window can overlap the mesh and the
+ring windows, because with quantization on the mesh and the ring take their
+payloads first. To move the boundary between the one-shot and the mesh with
+quantization on, set `AITER_FLY_AR_MESH_MIN_BYTES`. To change the payloads that
+the one-shot serves without quantization, set `AITER_FLY_AR_ONESHOT_MAX_BYTES`.
 
 ### Related aiter variables
 

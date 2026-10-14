@@ -11,7 +11,6 @@ dataclass definitions for heuristics, i.e., policy definitions for kernel select
 import enum
 import logging
 from dataclasses import dataclass
-from itertools import pairwise
 
 import flydsl.expr as fx
 from flydsl.expr import rocdl
@@ -172,19 +171,6 @@ def _fmt_bytes(nbytes: int | None) -> str:
     return f"{nbytes} B"
 
 
-def _covered(lo: int, hi: int | None, windows) -> bool:
-    """Whether the union of *windows* covers ``[lo, hi)``."""
-    cur = lo
-    for w in sorted(windows, key=lambda w: w.min):
-        if hi is not None and cur >= hi:
-            return True
-        if w.min <= cur and (w.max is None or cur < w.max):
-            if w.max is None:
-                return True
-            cur = w.max
-    return hi is not None and cur >= hi
-
-
 @dataclass(frozen=True)
 class FamilyPolicy:
     """Which algorithm runs which payload sizes, on one platform.
@@ -199,15 +185,15 @@ class FamilyPolicy:
     so a policy belongs to one ``(arch, link, world_size)``.
 
     Each algorithm has a ``Window`` of payload sizes. ``None`` or an empty
-    window disables the algorithm. The windows do not overlap. A payload in no
-    window goes to ``cross_device_reduce`` or RCCL.
+    window disables the algorithm. A payload in no window goes to
+    ``cross_device_reduce`` or RCCL.
 
-    ``oneshot``, ``mesh`` and ``ring`` apply with quantization on
-    (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``). With quantization off, only
-    the one-shot runs, in ``exact_oneshot``, or in ``oneshot`` when
-    ``exact_oneshot`` is None. ``exact_oneshot`` exists because the one-shot
-    beats ``cross_device_reduce`` well past the point where the mesh takes
-    over.
+    The mesh and the ring are quantized, so they run only with quantization on
+    (``AITER_QUICK_REDUCE_QUANTIZATION=INT4``), and their windows do not
+    overlap. The one-shot is exact and runs in both modes. ``QuickAllReduce``
+    serves the mesh and the ring before ``CustomAllreduce`` serves the
+    one-shot, and when enabled, the mesh and the ring take the payloads
+    of their windows first.
     """
 
     arch: str
@@ -216,7 +202,6 @@ class FamilyPolicy:
     oneshot: Window | None
     mesh: Window | None
     ring: Window | None
-    exact_oneshot: Window | None = None
 
     def __post_init__(self):
         if self.arch not in SUPPORTED_ARCHS:
@@ -229,60 +214,31 @@ class FamilyPolicy:
             raise ValueError(
                 f"world_size must be one of {SUPPORTED_WORLDS}, got {self.world_size}"
             )
-        live = sorted(
-            (
-                (alg, w)
-                for alg, w in self._quantized_windows()
-                if w is not None and not w.is_empty
-            ),
-            key=lambda aw: aw[1].min,
-        )
-        for (a, wa), (b, wb) in pairwise(live):
-            if wa.max is None or wa.max > wb.min:
-                raise ValueError(
-                    f"{self._cell()}: the {a.value} window {wa} overlaps the "
-                    f"{b.value} window {wb}"
-                )
-        exact = self.exact_oneshot
-        if exact is not None and not exact.is_empty:
-            one = self.oneshot
-            quant = [w for _alg, w in live if _alg != AllReduceAlgorithm.OneShot]
-            if one is None or one.is_empty:
-                extra = [(exact.min, exact.max)]
-            else:
-                extra = []
-                if exact.min < one.min:
-                    extra.append((exact.min, one.min))
-                if exact.max is None or (one.max is not None and exact.max > one.max):
-                    extra.append((max(exact.min, one.max), exact.max))
-            for lo, hi in extra:
-                if (hi is None or lo < hi) and not _covered(lo, hi, quant):
-                    raise ValueError(
-                        f"{self._cell()}: exact_oneshot {exact} adds payloads "
-                        f"[{_fmt_bytes(lo)}, {_fmt_bytes(hi)}) that the mesh "
-                        "and ring windows do not cover"
-                    )
+        mesh, ring = self.mesh, self.ring
+        if mesh is None or mesh.is_empty or ring is None or ring.is_empty:
+            return
+        lo, hi = sorted((mesh, ring), key=lambda w: w.min)
+        if lo.max is None or lo.max > hi.min:
+            raise ValueError(
+                f"{self._cell()}: the mesh window {mesh} overlaps the ring "
+                f"window {ring}"
+            )
 
     def _cell(self) -> str:
         return f"{self.arch}/{self.link}/TP{self.world_size}"
-
-    def _quantized_windows(self):
-        return (
-            (AllReduceAlgorithm.OneShot, self.oneshot),
-            (AllReduceAlgorithm.TwoShotMesh, self.mesh),
-            (AllReduceAlgorithm.TwoShotRing, self.ring),
-        )
 
     def window(
         self, algorithm: AllReduceAlgorithm, *, quantized: bool
     ) -> Window | None:
         """The window of *algorithm*, or None if it is disabled."""
-        if quantized:
-            w = dict(self._quantized_windows())[algorithm]
-        elif algorithm == AllReduceAlgorithm.OneShot:
-            w = self.exact_oneshot if self.exact_oneshot is not None else self.oneshot
-        else:
+        if algorithm == AllReduceAlgorithm.OneShot:
+            w = self.oneshot
+        elif not quantized:
             w = None
+        elif algorithm == AllReduceAlgorithm.TwoShotMesh:
+            w = self.mesh
+        else:
+            w = self.ring
         return None if w is None or w.is_empty else w
 
     def algorithms(self, *, quantized: bool) -> tuple[AllReduceAlgorithm, ...]:
@@ -296,9 +252,15 @@ class FamilyPolicy:
 
     def select(self, nbytes: int, *, quantized: bool) -> AllReduceAlgorithm | None:
         """The algorithm that runs *nbytes*, or None for
-        ``cross_device_reduce`` or RCCL."""
-        for alg in self.algorithms(quantized=quantized):
-            if self.window(alg, quantized=quantized).contains(nbytes):
+        ``cross_device_reduce`` or RCCL. The mesh and the ring come first, as
+        in dispatch."""
+        for alg in (
+            AllReduceAlgorithm.TwoShotMesh,
+            AllReduceAlgorithm.TwoShotRing,
+            AllReduceAlgorithm.OneShot,
+        ):
+            w = self.window(alg, quantized=quantized)
+            if w is not None and w.contains(nbytes):
                 return alg
         return None
 

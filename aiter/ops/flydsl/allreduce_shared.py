@@ -47,9 +47,8 @@ def _resolve_inbox_flags(
     ``"auto"`` is ``uncached`` on xGMI and ``finegrained`` on PCIe, except at
     TP2, where it is ``uncached`` on PCIe too. The PCIe rule exists because
     uncached peer writes serialize per destination and collapse as the fanout
-    widens. At TP2 every schedule rites to a single remote peer,
-    so there is nothing to collapse, and an uncached inbox skips the L2 writeback
-    a cacheable one pays at every publish.
+    widens. At TP2 every schedule writes to a single remote peer,
+    so there is nothing to collapse, and an uncached inbox skips the L2 writeback.
     """
     if mode not in INBOX_MEMORY_MODES:
         raise ValueError(
