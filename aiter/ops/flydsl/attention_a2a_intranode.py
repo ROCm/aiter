@@ -613,8 +613,9 @@ class AttentionA2AIntraNodeOp:
         self.xdb_flag = torch.ones(1, dtype=torch.int64, device=device)
 
         # The MoRI barrier is host-only: peers must not publish into our flags
-        # before our zeroing has completed on the device.
-        torch.cuda.synchronize(self.device)
+        # before our zeroing has completed on the device. The zeroing is enqueued
+        # on the current stream, so syncing it avoids waiting on unrelated work.
+        torch.cuda.current_stream(self.device).synchronize()
         ms.shmem_barrier_all()
         self.p2p_outputs_sets = tuple(
             tuple(
