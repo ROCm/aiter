@@ -725,8 +725,9 @@ def test_fp8_paged_mqa_logits_2d_context_lens(batch, next_n, kv_len, split_kv):
             run(context_lens), expected, rtol=0, atol=0, tol_err_ratio=0, msg=msg
         )
         assert err == 0, f"{msg}{err:.2%} of the logits differ"
-    # Wrong row count, no columns, a strided [B] or [B, n], a dtype other than
-    # int32, or a tensor on another device are rejected.
+    # Wrong row count, a column count other than 1 or next_n, a strided [B] or
+    # [B, n], a dtype other than int32, or a tensor on another device are
+    # rejected.
     bad_inputs = [
         row_lens[:-1],
         torch.cat([row_lens, row_lens[:1]]),
@@ -735,7 +736,11 @@ def test_fp8_paged_mqa_logits_2d_context_lens(batch, next_n, kv_len, split_kv):
         row_lens.cpu(),
     ]
     if next_n > 1:
-        bad_inputs += [row_lens[:, -1], row_lens.t().contiguous().t()]
+        bad_inputs += [
+            row_lens[:, -1],
+            row_lens.t().contiguous().t(),
+            row_lens[:, 1:].contiguous(),
+        ]
     for bad in bad_inputs:
         try:
             run(bad)

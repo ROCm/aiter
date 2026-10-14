@@ -495,6 +495,18 @@ def flydsl_fp8_paged_mqa_logits(
 
     ``next_n`` may be 1..8. The compiled kernel reserves LDS for eight rows;
     ``next_n_lens`` optionally selects fewer live rows per sequence.
+
+    ``context_lens``: int32, contiguous, on ``q_fp8``'s device. Either
+
+    - ``[B]``: the full length ``L_b`` of request ``b``, including its ``next_n``
+      query tokens, or
+    - ``(B, next_n)``: row ``b`` is ``[L_b - next_n + 1, ..., L_b]``, the layout
+      vLLM builds. Only the last column is read: query row ``j``
+      (``0 <= j < next_n``) attends to KV positions ``[0, L_b - next_n + 1 + j)``,
+      so other row values are not supported.
+
+    ``(B, 1)`` is the same as ``[B]``. Anything else raises ``ValueError``; a
+    strided tensor is rejected rather than copied.
     """
     if get_gfx() != _GFX950:
         raise RuntimeError(f"gfx950 kernel requested on {get_gfx()}")
@@ -527,8 +539,7 @@ def flydsl_fp8_paged_mqa_logits(
     if out_logits.shape[0] != batch_size * next_n:
         raise ValueError(f"out_logits first dimension must be {batch_size * next_n}")
 
-    # The kernel reads sequence b's length at b * ctx_stride + ctx_stride - 1:
-    # element b of [B], or the last entry of row b of a (B, n) per-row table.
+    # The kernel reads request b's length at b * ctx_stride + ctx_stride - 1.
     # A strided input is rejected rather than copied: a hidden copy allocates on
     # every call, and the kernel would otherwise read it as dense.
     if context_lens.dtype != torch.int32 or context_lens.device != q_fp8.device:
@@ -540,12 +551,12 @@ def flydsl_fp8_paged_mqa_logits(
         context_lens.dim() not in (1, 2)
         or not context_lens.is_contiguous()
         or context_lens.shape[0] != batch_size
-        or (context_lens.dim() == 2 and context_lens.shape[1] < 1)
+        or (context_lens.dim() == 2 and context_lens.shape[1] not in (1, next_n))
     ):
         raise ValueError(
-            f"context_lens must be a contiguous [B] or [B, n] with B={batch_size} "
-            f"and n >= 1, got shape {tuple(context_lens.shape)} with strides "
-            f"{context_lens.stride()}"
+            f"context_lens must be a contiguous [B] or [B, n] with B={batch_size}, "
+            f"n in (1, next_n={next_n}), got shape {tuple(context_lens.shape)} "
+            f"with strides {context_lens.stride()}"
         )
     ctx_stride = context_lens.shape[1] if context_lens.dim() == 2 else 1
     context_lens = context_lens.reshape(-1)
