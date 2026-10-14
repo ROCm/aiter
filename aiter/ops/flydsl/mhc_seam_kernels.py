@@ -36,10 +36,12 @@ _MALL_BYTES = 256 * 1024 * 1024
 # Split-K of the fused pass: the largest legal split that keeps the grid within
 # _SPLIT_TARGET_BLOCKS workgroups or _MAX_SPLITS splits, whichever allows more, preferring one
 # whose last round of workgroups is at least _MIN_ROUND_FILL full -- a nearly empty last round
-# costs most of a full one.
+# costs most of a full one. Never more than _MAX_FOLD: each finish lane folds one partial per
+# split, one after another, and that chain outgrows what a fuller grid saves.
 _MIN_ROUND_FILL = 0.73
 _SPLIT_TARGET_BLOCKS = 512
 _MAX_SPLITS = 8
+_MAX_FOLD = 64
 
 # Defaults for both the launch policy and explicit config overrides.
 MHC_SEAM_DEFAULTS = {
@@ -153,7 +155,9 @@ def _splits(T: int, H: int, bm: int, cc: int, cu_num: int) -> int:
     blocks = ceildiv(T, bm)
     target = max(_SPLIT_TARGET_BLOCKS, blocks * _MAX_SPLITS)
     fitting = [
-        s for s in range(1, chunks + 1) if chunks % s == 0 and blocks * s <= target
+        s
+        for s in range(1, min(chunks, _MAX_FOLD) + 1)
+        if chunks % s == 0 and blocks * s <= target
     ]
     full = [s for s in fitting if _round_fill(blocks * s, cu_num) >= _MIN_ROUND_FILL]
     return max(full or fitting)
