@@ -283,7 +283,8 @@ def register_presorted_moe(aux: dict | None) -> None:
     already zeroed the buffer it will pass as ``output``. The next fused_moe
     consumes it on every path, whether or not it matches or is used, so a stale
     registration never applies to a later call. It is only used when the call
-    runs with block_m == 16; other block sizes run fused_moe's own sort.
+    runs with block_m == 16 and without expert_mask or num_local_tokens; other
+    calls run fused_moe's own sort.
     """
     _PRESORTED_MOE.aux = aux
 
@@ -294,8 +295,22 @@ def _pop_presorted_moe():
     return aux
 
 
-def _match_presorted_moe(aux, topk_ids, topk_weight, *, block_m, num_experts, topk):
+def _match_presorted_moe(
+    aux,
+    topk_ids,
+    topk_weight,
+    *,
+    block_m,
+    num_experts,
+    topk,
+    expert_mask=None,
+    num_local_tokens=None,
+):
     if not aux or int(block_m) != _PRESORTED_MOE_BLOCK_M:
+        return None
+    # The presort has no expert mask applied and covers every row of topk_ids;
+    # moe_sorting honors both, so a masked or row-limited call must re-sort.
+    if expert_mask is not None or num_local_tokens is not None:
         return None
     if (
         int(aux.get("topk_ids_ptr", 0)) != int(topk_ids.data_ptr())
@@ -1895,9 +1910,10 @@ def _fused_moe_impl(
             block_m=block_size_M,
             num_experts=global_E,
             topk=topk,
+            expert_mask=expert_mask,
+            num_local_tokens=num_local_tokens,
         )
-        # The presorted metadata has no expert mask applied.
-        if presorted is not None and expert_mask is None:
+        if presorted is not None:
             sorted_ids = presorted["sorted_token_ids"]
             sorted_weights = presorted["sorted_weights"]
             sorted_expert_ids = presorted["sorted_expert_ids"]

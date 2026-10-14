@@ -1497,6 +1497,39 @@ def test_presorted_moe_block_m():
     aiter.logger.info("moe_2stage: presorted MoE block_m contract passed")
 
 
+def test_presorted_moe_masked_call():
+    """A presort is ignored when the call passes expert_mask or num_local_tokens.
+
+    The presort covers every row of topk_ids with no expert mask, while
+    moe_sorting honors both, so such calls must fall back to moe_sorting.
+    CPU-only: checks the matcher fused_moe uses, no kernel launch.
+    """
+    fm = aiter.fused_moe
+    M, E, topk = 4, 8, 2
+    ids = torch.zeros((M, topk), dtype=torch.int32)
+    weights = torch.zeros((M, topk))
+    aux = {
+        "topk_ids_ptr": ids.data_ptr(),
+        "topk_weights_ptr": weights.data_ptr(),
+        "M": M,
+        "block_m": 16,
+        "num_experts": E,
+        "topk": topk,
+    }
+
+    def match(**kw):
+        return fm._match_presorted_moe(
+            aux, ids, weights, block_m=16, num_experts=E, topk=topk, **kw
+        )
+
+    assert match() is not None, "a matching unmasked presort was rejected"
+    limit = torch.tensor([M - 1], dtype=torch.int32)
+    assert match(num_local_tokens=limit) is None, "presort used with num_local_tokens"
+    mask = torch.ones((E,), dtype=torch.int32)
+    assert match(expert_mask=mask) is None, "presort used with expert_mask"
+    aiter.logger.info("moe_2stage: presorted MoE masked-call contract passed")
+
+
 def test_bm16_tiled_scale_boundary():
     """Validate tuned BM16 dispatch and the 33-row scale boundary."""
     if get_gfx() != "gfx950":
@@ -1846,6 +1879,7 @@ else:
         _case_iters.append(_iter_legacy_cases())
     test_presorted_moe_wrapper_error()
     test_presorted_moe_block_m()
+    test_presorted_moe_masked_call()
     if get_gfx() == "gfx950":
         test_presorted_moe_hook()
     else:
