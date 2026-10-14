@@ -84,15 +84,10 @@ def _install_stubs():
         ),
         "aiter.ops": _make_stub("aiter.ops"),
         "aiter.ops.flydsl": _make_stub("aiter.ops.flydsl"),
-        "aiter.ops.flydsl.gemm_a16w16_policy": _make_stub(
-            "aiter.ops.flydsl.gemm_a16w16_policy",
-            get_flydsl_a16w16_configs=_empty_flydsl_catalog,
-        ),
         "aiter.ops.flydsl.gemm_kernels": _make_stub(
             "aiter.ops.flydsl.gemm_kernels",
-            SPLIT_K_SEMAPHORE_MAX_LEN=1024,
             flydsl_hgemm=lambda *a, **kw: None,
-            flydsl_hgemm_kernel_name=lambda *a, **kw: "",
+            get_flydsl_splitk_hgemm_kernels=_empty_flydsl_catalog,
         ),
         "aiter.ops.gemm_op_a16w16": _make_stub(
             "aiter.ops.gemm_op_a16w16",

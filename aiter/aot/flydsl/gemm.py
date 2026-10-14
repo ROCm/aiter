@@ -13,7 +13,7 @@ way as runtime JIT config lookup.
 Supported kernel families:
   - ``flydsl_hgemm_*``                        gfx950 A16W16 GEMM kernels
   - ``flydsl_hgemm_*_gfx1250``                gfx1250 A16W16 GEMM kernels
-  - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels (``_smbs`` suffix: gfx950 blockscale)
+  - ``flydsl_bpreshuflle_*``                  a8w8 preshuffle GEMM kernels (``_smbs`` suffix: blockscale)
   - ``flydsl_bpreshuffle_8w_*``               gfx950 8-wave a8w8 ptpc GEMM kernels
   - ``flydsl_bpreshuffle_wmma_*``             gfx1250 a8w8 ptpc GEMM kernels
   - ``flydsl_mxfp8_128_bpreshuffle_wmma_*``   gfx1250 mxfp8_128 GEMM kernels
@@ -347,25 +347,8 @@ def parse_csv(csv_path: str):
                     f"  [WARN] Unknown FlyDSL GEMM kernel name: {kernel_name}, skipping"
                 )
                 continue
-            if (
-                params.get("kind") == "hgemm"
-                and int(row.get("splitK", "0")) != params["split_k"]
-            ):
-                raise ValueError("FlyDSL HGEMM CSV splitK does not match kernel name")
-            if params.get("kind") == "hgemm" and params.get("target_gfx") != gfx:
-                raise ValueError(
-                    "FlyDSL HGEMM CSV architecture does not match kernel name"
-                )
-            if (
-                params.get("kind") == "hgemm"
-                and params.get("n") is not None
-                and params.get("k") is not None
-                and (params.get("n"), params.get("k")) != (n, k)
-            ):
-                raise ValueError("FlyDSL HGEMM CSV N/K does not match kernel name")
 
             job = {
-                **params,
                 "kernel_name": kernel_name,
                 "m": m,
                 "n": n,
@@ -373,6 +356,7 @@ def parse_csv(csv_path: str):
                 "cu_num": cu_num,
                 "gfx": gfx,
                 "has_bias": _parse_bool(row.get("bias")),
+                **params,
             }
             key = job_identity(job)
             if key in seen:
@@ -1057,11 +1041,11 @@ def _compile_ptpc_wmma_to_cache(
 
     with compile_only_env():
         launch_gemm_a8w8(
-            ptr_arg(out),
-            ptr_arg(xq),
-            ptr_arg(wq),
-            ptr_arg(scale_a),
-            ptr_arg(scale_b),
+            _ptr_view_safe(out),
+            _ptr_view_safe(xq),
+            _ptr_view_safe(wq),
+            _ptr_view_safe(scale_a),
+            _ptr_view_safe(scale_b),
             m,
             stream,
             n,

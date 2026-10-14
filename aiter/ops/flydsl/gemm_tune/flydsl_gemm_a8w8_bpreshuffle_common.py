@@ -157,7 +157,7 @@ def _tune_arch(arch: str | None = None) -> str:
         return arch
     try:
         return get_gfx_runtime()
-    except Exception:
+    except (RuntimeError, KeyError):
         return get_gfx()
 
 
@@ -283,9 +283,12 @@ def kernel_fits_shape(
     # masks the extra rows; verified for M=1/4/16 on 32-row tiles). Taller tiles
     # would waste more than half the rows and stay excluded. tile_m is always a
     # multiple of the 16-row MFMA granule in the tables.
-    if M < 2048 and _padded_m(M) % ki.tile_m != 0:
-        if not (M <= 16 and ki.tile_m <= 32 and ki.tile_m % 16 == 0):
-            return False
+    if (
+        M < 2048
+        and _padded_m(M) % ki.tile_m != 0
+        and not (M <= 16 and ki.tile_m <= 32 and ki.tile_m % 16 == 0)
+    ):
+        return False
     num_ctas = ((M + ki.tile_m - 1) // ki.tile_m) * ((N + ki.tile_n - 1) // ki.tile_n)
     if num_ctas < max(4, min(16, N // 64)):
         return False
@@ -487,10 +490,9 @@ kernels_list_950.update(
 )
 # fmt: on
 
-# Blockscale candidates: the gfx950 per-token tiles with tile_k % 128 == 0 plus
-# narrow tile_k=128 decode tiles (the per-token set only has tile_k >= 256 for
-# M=16, which cannot divide K such as 2176 = 17 * 128). gfx942 shares the tile
-# set but only its LDS-legal, non-async entries (see _blockscale_list).
+# Blockscale candidates: the shared and gfx950-extra tiles with tile_k % 128 == 0
+# (the scale block spans 128 K elements). gfx942 uses the same tile set but only
+# its LDS-legal, non-async entries (see _blockscale_list).
 # kernel_fits_shape (incl. the async-copy gate) applies via ki.scale_mode.
 _base_tiles_blockscale = list(
     dict.fromkeys(
