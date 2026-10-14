@@ -1,28 +1,15 @@
-# zizmor minimal configuration
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# zizmor configuration
 # Reference: https://docs.zizmor.sh/configuration/
+# Local scan: zizmor --config .github/scan_tools_configs/zizmor.yml .
 #
-# The default for repositories that ship no zizmor config of their own.
-# A repository that ships one (`.github/zizmor.yml`, `.github/zizmor.yaml`,
-# `zizmor.yml` or `zizmor.yaml`) replaces this file wholesale rather than
-# layering onto it, so suppressions that belong to a single repository
-# belong there. What goes here is what should hold for a repository that
-# has said nothing.
+# Zizmor configuration for this repository's security scans.
 #
-# Per-rule ignore lists and tuning live under `rules:`, as
-# `<rule-id>: { ignore: [file.yml:line:col] }`, which keeps a suppression
-# reviewable in one place rather than scattered as inline comments
-# across workflows.
-rules:
-  dangerous-triggers:
-    ignore:
-      # Metadata-only PR automation; these workflows don't checkout or run PR code.
-      - aiter-triton-board.yaml:24
-      - extended-test.yaml:5
-      - pr-title-tags.yaml:30
-      - pr-welcome-comment.yaml:3
-  github-app:
-    ignore:
-      # Scoped GitHub App tokens are required for project board, release, and split-test PR automation.
-      - aiter-triton-board.yaml:51
-      - release-automation.yaml:60
-      - update-split-tests.yaml:75
+# This file defines the complete scanner policy;
+# Keep repository-specific suppressions and tuning here.
+#
+# Add rule-specific settings and suppressions under `rules:`.
+
+rules: {}
