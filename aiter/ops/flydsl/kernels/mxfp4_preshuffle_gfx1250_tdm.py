@@ -645,11 +645,6 @@ def launch_gemm_a8w4_tdm(
             addr = fx.Int32(lds_base_idx) + fx.Int32(byte_offset)
             fx.ptr_store(fx.Int16(data), fx.inttoptr(i16_lds_ptr_ty, addr))
 
-        def make_tdm_store(gt, outer, stride):
-            return fx.rocdl.make_tdm_atom(
-                gt, [outer, None], strides=[stride, None], num_warps=num_waves
-            )
-
         gA_base = fx.recast_iter(fx.Int8, arg_a)
         gB_base = fx.recast_iter(fx.Int8, arg_b)
         gSA_base = fx.recast_iter(fx.Int32, arg_scale_a)
@@ -2214,15 +2209,27 @@ def launch_gemm_a8w4_tdm(
                     c_iter = fx.recast_iter(oc, arg_c)
                 c_off_rt = c_outer_off * fx.Int64(out_stride) + out_col_off
                 if const_expr(STORE_PAD == 0):
+                    c_tile = (tile_m, STORE_N)
                     gtC = tensor_view(
-                        c_iter + c_off_rt, (tile_m, STORE_N), (STORE_N, 1)
+                        c_iter + c_off_rt, (mn_oob, STORE_N), (out_stride, 1)
                     )
-                    atomC = make_tdm_store(gtC, mn_oob, out_stride)
+                    atomC, coordC = fx.rocdl.cdna5.make_tiled_tdm_atom(
+                        fx.rocdl.TensorStore(),
+                        gtC,
+                        fx.make_layout(c_tile, (STORE_N, 1)),
+                        c_tile,
+                        num_warps=num_waves,
+                    )
+                    blkC = fx.zipped_divide(coordC, c_tile)[None, (0, None)]
                     src = tensor_view(
                         fx.recast_iter(oc_store, base_ptr),
-                        (tile_m, STORE_N),
-                        (STORE_N, 1),
+                        (c_tile, 1),
+                        ((STORE_N, 1), tile_m * STORE_N),
                     )
+                    tCs, tCg = fx.rocdl.cdna5.tdm_partition(
+                        atomC, wave, fx.make_layout(num_waves, 1), src, blkC
+                    )
+                    fx.copy(atomC, tCs[None, 0], tCg[None, 0])
                 else:
                     # The LDS tile is (tile_m, STORE_PITCH) dense; the per-dim OOB
                     # extent clamps the inner axis to STORE_N so the pad never lands.
@@ -2240,7 +2247,7 @@ def launch_gemm_a8w4_tdm(
                         (tile_m, STORE_PITCH),
                         (STORE_PITCH, 1),
                     )
-                fx.copy(atomC, src, gtC)
+                    fx.copy(atomC, src, gtC)
                 if const_expr(stage1_quant_out and stage1_act):
                     rocdl.s_wait_storecnt(0)
                 rocdl.s_wait_tensorcnt(0)
