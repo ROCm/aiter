@@ -11,7 +11,7 @@ import torch
 from flydsl.expr.typing import Int32, Int64, Stream
 
 from .allreduce_policy import oneshot_ladder, resolve_family_policy, resolve_link
-from .allreduce_shared import (
+from .allreduce_host_shared import (
     _cuda_index,
     _resolve_inbox_flags,
     _StEngine,

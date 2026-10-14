@@ -330,7 +330,7 @@ def test_link_variable_backs_up_an_unreadable_probe():
     # The KFD probe comes first; the variable is only the backup. When the probe
     # is unreadable the variable decides, and is stripped, lowercased and
     # validated against LINKS.
-    probe = "aiter.ops.flydsl.allreduce_shared.probe_xgmi_peer_links"
+    probe = "aiter.ops.flydsl.allreduce_host_shared.probe_xgmi_peer_links"
     P._probe_link.cache_clear()
     with mock.patch(probe, return_value=None):
         with _env(AITER_FLY_AR_LINK=" PCIe "):
@@ -345,7 +345,7 @@ def test_link_variable_backs_up_an_unreadable_probe():
 
 def test_unreadable_topology_needs_the_link_variable():
     env = {k: v for k, v in os.environ.items() if k != "AITER_FLY_AR_LINK"}
-    probe = "aiter.ops.flydsl.allreduce_shared.probe_xgmi_peer_links"
+    probe = "aiter.ops.flydsl.allreduce_host_shared.probe_xgmi_peer_links"
     for found, expected in ((True, "xgmi"), (False, "pcie")):
         P._probe_link.cache_clear()
         with (

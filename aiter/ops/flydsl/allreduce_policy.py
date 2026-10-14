@@ -503,7 +503,7 @@ def resolve_link(link: str | None) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _probe_link() -> str | None:
-    from .allreduce_shared import probe_xgmi_peer_links
+    from .allreduce_host_shared import probe_xgmi_peer_links
 
     peer_link_type = probe_xgmi_peer_links()
     return None if peer_link_type is None else "xgmi" if peer_link_type else "pcie"
