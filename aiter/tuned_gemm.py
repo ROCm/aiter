@@ -17,6 +17,7 @@
 
 import functools
 import os
+import re
 
 import pandas as pd
 import torch
@@ -643,6 +644,59 @@ def opus_gemm(
     return Y
 
 
+GLUON_KERNEL_NAME = re.compile(
+    r"^gluon_(?P<kernel_type>[a-z_]+)_(?P<bm>\d+)x(?P<bn>\d+)$"
+)
+
+
+def gluon_kernel_name(kernel_type: str, tile: tuple[int, int]) -> str:
+    """The kernelName of a tuned gluon row: the kernel and the tile it runs with."""
+    return f"gluon_{kernel_type}_{tile[0]}x{tile[1]}"
+
+
+def parse_gluon_kernel_name(name) -> tuple[str, dict | None]:
+    """(kernel_type, config with BLOCK_M/BLOCK_N) from a gluon kernelName; the
+    default kernel and tile when the row has no name."""
+    if name is None or (isinstance(name, float) and pd.isna(name)) or name == "":
+        return "compute_bound", None
+    m = GLUON_KERNEL_NAME.match(str(name))
+    assert m, f"unrecognized gluon kernelName {name!r}"
+    return m["kernel_type"], {"BLOCK_M": int(m["bm"]), "BLOCK_N": int(m["bn"])}
+
+
+def gluon_gemm(
+    inp: Tensor,
+    weights: Tensor,
+    solidx: int,
+    bias: Tensor | None = None,
+    otype: torch.dtype | None = None,
+    scale_a: Tensor | None = None,
+    scale_b: Tensor | None = None,
+    scale_c: Tensor | None = None,
+    bpreshuffle: bool | None = False,
+    config: dict | None = None,
+):
+    """Run a tuned gluon row: kernelName names the kernel and its tile."""
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
+
+    assert (
+        scale_a is None and scale_b is None and scale_c is None
+    ), "gluon gemm_a16w16 does not support scaling yet"
+    assert not bpreshuffle, "gluon gemm_a16w16 does not support bpreshuffle yet."
+    kernel_type, tile = parse_gluon_kernel_name(
+        config.get("kernelName") if config else None
+    )
+    return gemm_a16w16(
+        inp,
+        weights,
+        bias=bias,
+        dtype=otype,
+        backend="gluon",
+        kernel_type=kernel_type,
+        config=tile,
+    )
+
+
 def triton_gemm(
     inp: Tensor,
     weights: Tensor,
@@ -672,6 +726,7 @@ solMap = {
     "triton": triton_gemm,
     "flydsl": flydsl_gemm,
     "opus": opus_gemm,
+    "gluon": gluon_gemm,
 }
 
 

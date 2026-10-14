@@ -23,6 +23,7 @@ from aiter.ops.triton.utils.common_utils import deserialize_str, serialize_dict
 from aiter.ops.triton.utils.gemm_config_utils import (
     compute_splitk_params,
     get_gemm_config,
+    pick_gemm_tile,
 )
 from aiter.ops.triton.utils.logger import AiterTritonLogger
 
@@ -87,7 +88,7 @@ def gemm_a16w16_(
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
     On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
-    takes a tile of 256, 128 or 64 per side (config BLOCK_M/BLOCK_N, or a default) and
+    runs the tile its gluon config picks for the shape (sides 256, 128 or 64) and
     needs M, N multiples of the tile and K a multiple of 128.
 
     Args:
@@ -144,15 +145,20 @@ def gemm_a16w16_(
         assert not skip_reduce, "gfx950 gluon a16w16 has no split-K (skip_reduce)"
         if activation:
             raise ValueError("gfx950 gluon a16w16: no activation support yet")
-        M, _ = x.shape
+        M, K = x.shape
         N, _ = w.shape
         if y is None:
             y = torch.empty((M, N), dtype=dtype, device=x.device)
-        # The tuner picks the tile per shape through the config; without one the
-        # kernel picks its default (see choose_tile).
-        tile = None
-        if config is not None and "BLOCK_M" in config:
-            tile = (int(config["BLOCK_M"]), int(config["BLOCK_N"]))
+        # The tile comes from the config: a tuned one names BLOCK_M/BLOCK_N, the
+        # default one carries the candidates and the rule (see pick_gemm_tile).
+        if config is None or "BLOCK_M" not in config:
+            config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+        tile = pick_gemm_tile(
+            config,
+            M,
+            N,
+            torch.cuda.get_device_properties(x.device).multi_processor_count,
+        )
         _LOGGER.info(
             "GEMM_A16W16 [gluon/gfx950]: x=%s w=%s kernel=%s tile=%s",
             x.shape,
@@ -621,7 +627,7 @@ def gemm_a16w16(
     and the triton backend everywhere else. Pass ``backend`` to force a choice.
     On gfx950, ``backend="gluon"`` with ``kernel_type="compute_bound"`` runs the
     gfx950 gluon compute-bound kernel (scheduled by Triton's MFMA scheduler); it
-    takes a tile of 256, 128 or 64 per side (config BLOCK_M/BLOCK_N, or a default) and
+    runs the tile its gluon config picks for the shape (sides 256, 128 or 64) and
     needs M, N multiples of the tile and K a multiple of 128.
     See ``gemm_a16w16_`` for the full argument description; ``config`` is a dict
     here and is serialized before dispatch so the op is torch.compile-traceable.

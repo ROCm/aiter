@@ -15,11 +15,13 @@ brought the scheduler; ``mfma(..., cd_regclass=)`` (triton-lang/triton#11792) wa
 already there. The tutorial explains every step:
 https://github.com/ROCm/gfx950-gluon-tutorials/tree/main/kernels/gemm/intra_wave/a16w16
 
-The tile is 256x256x64 by default and can be any (BLOCK_M, BLOCK_N) in ``TILES``,
-with BLOCK_K 64; every layout is derived from it. Nothing is masked, so the kernel
-needs a TN problem (x row-major, w row-major (N, K)) with M and N multiples of the
-tile and K a multiple of 128 of at least 256. ``unsupported_reason`` says why a
-problem is outside that, and ``choose_tile`` picks the default tile for a shape.
+The tile is any (BLOCK_M, BLOCK_N) with sides 64, 128 or 256, with BLOCK_K 64; every
+layout is derived from it. Which tile a shape runs with comes from the gluon GEMM
+config (``configs/gfx950/gluon/gemm/gemm_a16w16``): a tuned config names it, the
+default config's rule picks the largest tile that fills the GPU once. Nothing is
+masked, so the kernel needs a TN problem (x row-major, w row-major (N, K)) with M
+and N multiples of the tile and K a multiple of 128 of at least 256.
+``unsupported_reason`` says why a problem is outside that.
 """
 
 import functools
@@ -32,19 +34,14 @@ from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.amd import cdna4 as ttgl_cdna4
 from triton.runtime.jit import constexpr_function
 
+from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config, pick_gemm_tile
+
 BLOCK_K = 64
-# (BLOCK_M, BLOCK_N), largest first; choose_tile keeps this order among equal areas.
-TILES = [
-    (256, 256),
-    (256, 128),
-    (128, 256),
-    (128, 128),
-    (256, 64),
-    (64, 256),
-    (128, 64),
-    (64, 128),
-    (64, 64),
-]
+TILE_SIDES = (
+    64,
+    128,
+    256,
+)  # the BLOCK_M and BLOCK_N the derived layouts are validated for
 NUM_WARPS = 4
 NUM_XCDS = 8
 GROUP_SIZE_M = 4
@@ -494,43 +491,34 @@ def schedule_hint():
     return "" if os.environ.get("AITER_MFMA_SCHED", "1") == "0" else MFMA_SCHEDULE_HINT
 
 
-def supported_tiles(M, N):
-    """The tiles that divide M and N, largest first."""
-    return [(bm, bn) for bm, bn in TILES if M % bm == 0 and N % bn == 0]
-
-
 @functools.cache
-def _cu_count(device_index):
-    return torch.cuda.get_device_properties(device_index).multi_processor_count
+def _cu_count(device):
+    return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def choose_tile(M, N, device=None):
-    """The default tile for a shape: the largest tile that gives at least one
-    workgroup per CU, else the one that gives the most workgroups. The tuner is
-    meant to override it per shape through the config (BLOCK_M, BLOCK_N)."""
-    tiles = supported_tiles(M, N)
-    if not tiles:
-        return None
-    cus = _cu_count(torch.cuda.current_device() if device is None else device)
-    for bm, bn in tiles:
-        if (M // bm) * (N // bn) >= cus:
-            return (bm, bn)
-    return tiles[-1]
+def default_tile(M, N, K, device=None):
+    """The tile the gluon GEMM config picks for a shape: a tuned config names it, the
+    default config's rule picks the largest tile that fills the GPU once (see
+    ``pick_gemm_tile``). None when no tile divides M and N."""
+    config, _ = get_gemm_config("GEMM-A16W16", M, N, K, backend="gluon")
+    device = torch.cuda.current_device() if device is None else device
+    return pick_gemm_tile(config, M, N, _cu_count(device))
 
 
 def unsupported_reason(M, N, K, x=None, w=None, bias=None, activation=None, tile=None):
-    """Why this kernel cannot run the problem, or None if it can. ``tile`` checks a
-    specific (BLOCK_M, BLOCK_N); None asks whether any tile fits."""
+    """Why this kernel cannot run the problem, or None if it can. ``tile`` is the
+    (BLOCK_M, BLOCK_N) to check; None checks the config's pick for the shape."""
     if activation:
         return "no activation support yet"
-    if tile is not None:
-        if tuple(tile) not in TILES:
-            return f"tile {tuple(tile)} is not one of {TILES}"
-        bm, bn = tile
-        if M % bm or N % bn:
-            return f"M and N must be multiples of the {bm}x{bn} tile (got M={M}, N={N})"
-    elif not supported_tiles(M, N):
-        return f"M and N must be multiples of one tile in {TILES} (got M={M}, N={N})"
+    if tile is None:
+        tile = default_tile(M, N, K)
+        if tile is None:
+            return f"no tile with sides in {TILE_SIDES} divides M={M}, N={N}"
+    bm, bn = tile
+    if bm not in TILE_SIDES or bn not in TILE_SIDES:
+        return f"tile {bm}x{bn} has a side outside {TILE_SIDES}"
+    if M % bm or N % bn:
+        return f"M and N must be multiples of the {bm}x{bn} tile (got M={M}, N={N})"
     if K % (2 * BLOCK_K) or K < 4 * BLOCK_K:
         return f"K must be a multiple of {2 * BLOCK_K} and at least {4 * BLOCK_K} (got K={K})"
     if x is not None and x.stride(1) != 1:
@@ -544,13 +532,15 @@ def unsupported_reason(M, N, K, x=None, w=None, bias=None, activation=None, tile
 
 def gemm_a16w16_compute_bound(x, w, y, bias=None, tile=None):
     """y = x @ w.T (+ bias) with x (M, K) and w (N, K), both row-major; y (M, N).
-    ``tile`` is (BLOCK_M, BLOCK_N) from TILES; None picks ``choose_tile``."""
+    ``tile`` is (BLOCK_M, BLOCK_N); None takes the config's pick for the shape."""
     M, K = x.shape
     N, _ = w.shape
+    if tile is None:
+        tile = default_tile(M, N, K, x.device)
     reason = unsupported_reason(M, N, K, x, w, tile=tile)
     if reason is not None:
         raise ValueError(f"gfx950 gluon compute_bound a16w16: {reason}")
-    bm, bn = choose_tile(M, N, x.device) if tile is None else tile
+    bm, bn = tile
     b = w.T  # (K, N) view, K contiguous: the layout the kernel loads
     grid_mn = (M // bm) * (N // bn)
     _gemm_a16w16_compute_bound_kernel[(grid_mn, 1)](

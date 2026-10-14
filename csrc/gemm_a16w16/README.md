@@ -1,6 +1,6 @@
 # GEMM A16W16 (BF16) Tune
 
-Multi-backend bf16 GEMM tuner. Searches across asm, opus, flydsl, triton, skinny, and torch backends by default. hipblaslt can be included with `--with-hipblaslt`.
+Multi-backend bf16 GEMM tuner. Searches across asm, opus, flydsl, triton, gluon (gfx950), skinny, and torch backends by default. hipblaslt can be included with `--with-hipblaslt`.
 
 For hipblaslt-only tuning, use `gradlib/gradlib/gemm_tuner.py` instead.
 
@@ -59,8 +59,8 @@ If you have built kernels before tuning, add `AITER_REBUILD=1` to rebuild with n
 ### `--libtype`
 - **Type**: Comma-separated string
 - **Default**: `all`
-- **Choices**: `all`, `asm`, `hipblaslt`, `triton`, `flydsl`, `torch`, `skinny`, `opus`
-- **Description**: Choose which backends to tune. hipblaslt requires **both** `--libtype all` (or `--libtype hipblaslt`) **and** `--with-hipblaslt` to run.
+- **Choices**: `all`, `asm`, `hipblaslt`, `triton`, `flydsl`, `torch`, `skinny`, `opus`, `gluon`
+- **Description**: Choose which backends to tune. `gluon` is the gfx950 compute-bound Gluon kernel, one candidate per tile that fits the shape; the tuned row's `kernelName` (`gluon_compute_bound_<BLOCK_M>x<BLOCK_N>`) carries the tile. hipblaslt requires **both** `--libtype all` (or `--libtype hipblaslt`) **and** `--with-hipblaslt` to run.
 
 **Example**:
 ```bash

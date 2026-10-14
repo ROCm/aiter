@@ -5,7 +5,7 @@
 Multi-backend bf16 / a16w16 GEMM tuner.
 
 Follows the csrc tuner pattern (like ck_gemm_a8w8, ck_gemm_a8w8_blockscale).
-Backends: asm, opus, flydsl, triton, skinny, torch.
+Backends: asm, opus, flydsl, triton, gluon, skinny, torch.
 hipblaslt is opt-in via --with-hipblaslt (imports from gradlib).
 """
 
@@ -195,6 +195,12 @@ def run_gemm_bf16_asm(
 
 def run_triton_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16):
     return triton_gemm_a16w16(input, weight, bias=bias, dtype=otype)
+
+
+def run_gluon_gemm_bf16(input, weight, bias=None, otype=dtypes.bf16, kernelName=None):
+    from aiter.tuned_gemm import gluon_gemm
+
+    return gluon_gemm(input, weight, 0, bias, otype, config={"kernelName": kernelName})
 
 
 _opus_max_delta_checked = set()
@@ -390,6 +396,7 @@ ALL_LIBTYPES = [
     "torch",
     "skinny",
     "opus",
+    "gluon",
 ]
 
 
@@ -828,6 +835,50 @@ class GemmA16W16Tuner(GemmCommonTuner):
             )
         ]
 
+    def _get_gluon_tasks(
+        self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
+    ):
+        """One candidate per tile of the gfx950 gluon compute-bound kernel that
+        fits the shape; the winning row's kernelName carries the tile."""
+        if scaleAB or is_shuffle or indtype != dtypes.bf16 or get_gfx() != "gfx950":
+            return []
+        from aiter.ops.triton._gluon_kernels.gfx950.gemm.basic.gemm_a16w16 import (
+            unsupported_reason,
+        )
+        from aiter.ops.triton.utils.gemm_config_utils import get_gemm_config
+        from aiter.tuned_gemm import gluon_kernel_name
+
+        M, N, K = info_keys[2], info_keys[3], info_keys[4]
+        rtol, _ = _default_tol(outdtype)
+        config, _ = get_gemm_config("GEMM-A16W16", M, backend="gluon")
+        tasks = []
+        for solidx, (bm, bn) in enumerate(config["TILES"], start=1):
+            if unsupported_reason(M, N, K, tile=(bm, bn)) is not None:
+                continue
+            kernelName = gluon_kernel_name("compute_bound", (bm, bn))
+            info = (info_keys, solidx, 0, kernelName, "gluon", is_shuffle)
+            tasks.append(
+                (
+                    info,
+                    generate_data,
+                    (M, N, K, indtype, outdtype, scaleAB, is_shuffle, 0, has_bias),
+                    run_gluon_gemm_bf16,
+                    (["inp", "weights", "bias"], outdtype, kernelName),
+                    dict(run_kwargs),
+                    get_gemm_ref,
+                    (
+                        ["inp", "weights", "bias", "x_scale", "w_scale"],
+                        indtype,
+                        outdtype,
+                    ),
+                    {},
+                    None,
+                    rtol,
+                    rtol,
+                )
+            )
+        return tasks
+
     def _get_triton_tasks(
         self, info_keys, has_bias, indtype, outdtype, scaleAB, is_shuffle, run_kwargs
     ):
@@ -965,6 +1016,8 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(self._get_torch_tasks(*common))
             if "all" in libtype or "triton" in libtype:
                 task.extend(self._get_triton_tasks(*common))
+            if "all" in libtype or "gluon" in libtype:
+                task.extend(self._get_gluon_tasks(*common))
             if "all" in libtype or "opus" in libtype:
                 opus_tasks = self._get_opus_tasks(*common)
                 if opus_tasks and _opus_ensure_kids_compiled is not None:
@@ -977,7 +1030,15 @@ class GemmA16W16Tuner(GemmCommonTuner):
                 task.extend(opus_tasks)
 
             shape_kernel_nums = len(task) - prev_count
-            tasks_data.append((shape_kernel_nums, ()))
+            if shape_kernel_nums == 0:
+                # A shape none of the selected backends can run (e.g. --libtype
+                # gluon on an unaligned shape): no task group, so no data entry,
+                # or mp_tuner's per-shape grouping miscounts.
+                logger.warning(
+                    f"no candidate for M={M}, N={N}, K={K} with libtype {libtype}"
+                )
+            else:
+                tasks_data.append((shape_kernel_nums, ()))
 
             if with_hipblaslt and ("all" in libtype or "hipblaslt" in libtype):
                 hipblaslt_rets.extend(self._run_hipblaslt(ds, args))

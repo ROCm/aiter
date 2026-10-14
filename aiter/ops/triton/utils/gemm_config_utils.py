@@ -301,3 +301,39 @@ def pick_gemm_num_stages(
         block_m, block_n, block_k, bits_a, bits_b, 2, use_async_padding
     )
     return 2 if lds <= cap else 1
+
+
+def pick_gemm_tile(
+    config: dict, M: int, N: int, cu_count: int
+) -> tuple[int, int] | None:
+    """
+    The (BLOCK_M, BLOCK_N) tile a gluon GEMM runs a shape with.
+
+    A tuned config names its tile (``BLOCK_M``, ``BLOCK_N``). A default config
+    carries the candidate ``TILES`` (largest first) and ``WORKGROUPS_PER_CU``:
+    the pick is the largest tile that divides M and N and launches at least
+    ``WORKGROUPS_PER_CU`` workgroups per CU, else the dividing tile that
+    launches the most workgroups.
+
+    Args:
+        config: a gluon GEMM config, as returned by ``get_gemm_config``.
+        M, N: the output shape.
+        cu_count: compute units of the device.
+
+    Returns:
+        (BLOCK_M, BLOCK_N), or None when no tile divides the shape.
+    """
+    if "BLOCK_M" in config and "BLOCK_N" in config:
+        return int(config["BLOCK_M"]), int(config["BLOCK_N"])
+    tiles = [
+        (int(bm), int(bn))
+        for bm, bn in config["TILES"]
+        if M % int(bm) == 0 and N % int(bn) == 0
+    ]
+    if not tiles:
+        return None
+    target = cu_count * int(config.get("WORKGROUPS_PER_CU", 1))
+    for bm, bn in tiles:
+        if (M // bm) * (N // bn) >= target:
+            return bm, bn
+    return max(tiles, key=lambda t: (M // t[0]) * (N // t[1]))

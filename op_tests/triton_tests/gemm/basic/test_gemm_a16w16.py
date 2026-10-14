@@ -358,3 +358,52 @@ def test_gemm_a16_w16_gluon_compute_bound_tiles(tile, bias):
     for kernel in compiled:
         assert "llvm.amdgcn.sched.barrier" in kernel.asm["llir"]
         assert "sched_barrier" in kernel.asm["amdgcn"]
+
+
+def test_gemm_a16_w16_gluon_pick_gemm_tile():
+    """The default gluon config picks the largest tile that fills the GPU once;
+    a tuned config names its tile."""
+    from aiter.ops.triton.utils.gemm_config_utils import pick_gemm_tile
+
+    default = {
+        "TILES": [
+            [256, 256],
+            [256, 128],
+            [128, 256],
+            [128, 128],
+            [256, 64],
+            [64, 256],
+            [128, 64],
+            [64, 128],
+            [64, 64],
+        ],
+        "WORKGROUPS_PER_CU": 1,
+    }
+    assert pick_gemm_tile(default, 4096, 4096, 256) == (256, 256)
+    assert pick_gemm_tile(default, 4096, 2048, 256) == (256, 128)
+    assert pick_gemm_tile(default, 2048, 2048, 256) == (128, 128)
+    assert pick_gemm_tile(default, 1024, 1024, 256) == (64, 64)
+    # Nothing fills the GPU: the tile with the most workgroups.
+    assert pick_gemm_tile(default, 256, 256, 256) == (64, 64)
+    assert pick_gemm_tile(default, 100, 4096, 256) is None
+    assert pick_gemm_tile({"BLOCK_M": 128, "BLOCK_N": 256}, 4096, 4096, 256) == (
+        128,
+        256,
+    )
+
+
+@pytest.mark.parametrize(
+    "kernel_name", ["gluon_compute_bound_256x256", "gluon_compute_bound_128x64", None]
+)
+def test_gemm_a16_w16_gluon_tuned_gemm(kernel_name):
+    """tuned_gemm's gluon libtype runs the tile named by the tuned row, or the
+    config's pick when the row has no name."""
+    M, N, K = 1024, 2048, 512
+    _skip_unsupported_gluon("gluon", "compute_bound", M, N, K)
+    from aiter.tuned_gemm import gluon_gemm
+
+    x, w, _, out_dtype, _ = generate_gemm_a16w16_inputs(
+        M, N, K, torch.bfloat16, output=False
+    )
+    out = gluon_gemm(x, w, 0, None, out_dtype, config={"kernelName": kernel_name})
+    torch.testing.assert_close(out, F.linear(x, w), atol=1e-1, rtol=1e-2)
