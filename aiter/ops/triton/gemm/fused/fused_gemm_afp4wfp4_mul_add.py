@@ -161,6 +161,11 @@ def fused_gemm_afp4wfp4_mul_add(
         config["SPLITK_BLOCK_SIZE"] = 2 * K
         y_pp = None
 
+    # The scale loads are unmasked, so BLOCK_SIZE_K must not run past K.
+    if config["BLOCK_SIZE_K"] >= 2 * K:
+        config["BLOCK_SIZE_K"] = triton.next_power_of_2(2 * K)
+        config["SPLITK_BLOCK_SIZE"] = 2 * K
+
     grid = lambda META: (
         (
             META["NUM_KSPLIT"]
