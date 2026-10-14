@@ -4,9 +4,7 @@
 import pytest
 import torch
 
-from aiter.ops.triton.moe.moe_routing.topk_gating import (
-    exact_sigmoid_biased_topk,
-)
+from aiter.ops import topk as topk_ops
 
 
 def _is_gfx1250() -> bool:
@@ -58,7 +56,8 @@ def _torch_reference(
     ids = torch.stack(selected_ids, dim=1).to(torch.int32)
     weights = torch.stack(selected_weights, dim=1)
     if need_renorm:
-        weights *= scale / weights.sum(dim=1, keepdim=True)
+        weight_sum = weights.sum(dim=1, keepdim=True)
+        weights *= torch.where(weight_sum > 0.0, scale / weight_sum, 0.0)
     else:
         weights *= scale
     return weights, ids
@@ -69,6 +68,7 @@ def _torch_reference(
     [
         (512, 4, 1, "random", True, 1.0),
         (768, 8, 8, "ties", True, 1.0),
+        (768, 8, 2, "small_scores", True, 1.0),
         (896, 16, 32, "random", False, 2.5),
         (900, 8, 8, "nan", True, 1.0),
         (1024, 16, 128, "extreme", False, 0.75),
@@ -88,6 +88,10 @@ def test_exact_sigmoid_topk_matches_torch(
 
     if case == "ties":
         logits.zero_()
+        bias.zero_()
+    elif case == "small_scores":
+        logits[0].fill_(-100)
+        logits[1].fill_(-50)
         bias.zero_()
     elif case == "nan":
         logits[:, ::113] = float("nan")
@@ -123,19 +127,47 @@ def test_exact_sigmoid_topk_matches_torch(
         device="cuda",
     )
 
-    exact_sigmoid_biased_topk(
+    assert topk_ops._can_use_gfx1250_exact_sigmoid_topk(
         logits,
         bias,
         weights,
         ids,
+    )
+    topk_ops.biased_grouped_topk(
+        logits,
+        bias,
+        weights,
+        ids,
+        1,
+        1,
+        need_renorm,
+        scale,
+    )
+    hip_weights = torch.empty_like(weights)
+    hip_ids = torch.empty_like(ids)
+    topk_ops.biased_grouped_topk_hip(
+        logits,
+        bias,
+        hip_weights,
+        hip_ids,
+        1,
+        1,
         need_renorm,
         scale,
     )
 
     assert torch.equal(ids, expected_ids)
+    assert torch.equal(ids, hip_ids)
     torch.testing.assert_close(
         weights,
         expected_weights,
+        atol=2e-5,
+        rtol=2e-5,
+        equal_nan=True,
+    )
+    torch.testing.assert_close(
+        weights,
+        hip_weights,
         atol=2e-5,
         rtol=2e-5,
         equal_nan=True,

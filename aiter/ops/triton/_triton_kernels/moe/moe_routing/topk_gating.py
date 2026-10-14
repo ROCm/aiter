@@ -59,7 +59,9 @@ def _exact_sigmoid_biased_topk(
         choice = tl.where(cols == idx, float("-inf"), choice)
 
     if NEED_RENORM:
-        selected_weights *= routed_scaling / tl.sum(selected_weights, axis=0)
+        weight_sum = tl.sum(selected_weights, axis=0)
+        norm_scale = tl.where(weight_sum > 0.0, routed_scaling / weight_sum, 0.0)
+        selected_weights *= norm_scale
     else:
         selected_weights *= routed_scaling
 

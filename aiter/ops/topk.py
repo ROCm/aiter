@@ -110,6 +110,48 @@ def _gfx1250_exact_sigmoid_topk(
     )
 
 
+_FLYDSL_USE_HERD = os.environ.get("AITER_FLYDSL_USE_HERD", "0") == "1"
+_FLYDSL_HERD_MIN_M = int(
+    os.environ.get(
+        "AITER_FLYDSL_HERD_MIN_M", os.environ.get("AITER_TRITON_HERD_MIN_M", "16")
+    )
+)
+_FLYDSL_HERD_MAX_M = int(
+    os.environ.get(
+        "AITER_FLYDSL_HERD_MAX_M", os.environ.get("AITER_TRITON_HERD_MAX_M", "128")
+    )
+)
+
+
+def _use_flydsl_herd(
+    topk_weights: torch.Tensor,
+    topk_indices: torch.Tensor,
+    gating_output: torch.Tensor,
+    correction_bias: torch.Tensor,
+    score_func: str,
+) -> bool:
+    """Whether this call matches an opt-in HERD model profile."""
+    if not _FLYDSL_USE_HERD:
+        return False
+    if gating_output.dim() != 2:
+        return False
+    tokens = gating_output.shape[0]
+    if get_gfx() not in ("gfx950", "gfx1250") or not (
+        _FLYDSL_HERD_MIN_M <= tokens <= _FLYDSL_HERD_MAX_M
+    ):
+        return False
+
+    from .flydsl.herd_topk import herd_topk_gating_supported
+
+    return herd_topk_gating_supported(
+        topk_weights,
+        topk_indices,
+        gating_output,
+        correction_bias,
+        score_func,
+    )
+
+
 def _valid_bias_dtypes(gating_dtype: torch.dtype) -> tuple[torch.dtype, ...]:
     """Bias dtypes instantiated for this gating dtype; see _AITER_TOPK_GATING_SLICE.
 
@@ -163,20 +205,21 @@ def topk_gating(
             f"correction_bias dtype {correction_bias.dtype} is not supported for "
             f"{gating_output.dtype} gating_output, expected one of {valid}"
         )
-    if score_func == "sigmoid" and _can_use_gfx1250_exact_sigmoid_topk(
-        gating_output,
-        correction_bias,
-        topk_weights,
-        topk_indices,
+    if _use_flydsl_herd(
+        topk_weights, topk_indices, gating_output, correction_bias, score_func
     ):
-        return _gfx1250_exact_sigmoid_topk(
-            gating_output,
-            correction_bias,
+        from .flydsl.herd_topk import herd_topk_gating
+
+        herd_topk_gating(
             topk_weights,
             topk_indices,
+            gating_output,
+            correction_bias,
             need_renorm,
             routed_scaling_factor,
+            score_func,
         )
+        return
     topk_gating_fwd(
         topk_weights,
         topk_indices,
@@ -293,6 +336,29 @@ def biased_grouped_topk(
 ):
     token_num = gating_output.shape[0]
     num_experts = gating_output.shape[1]
+    if (
+        num_expert_group == 1
+        and topk_group == 1
+        and _use_flydsl_herd(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias,
+            "sigmoid",
+        )
+    ):
+        from .flydsl.herd_topk import herd_topk_gating
+
+        herd_topk_gating(
+            topk_weights,
+            topk_ids,
+            gating_output,
+            correction_bias,
+            need_renorm,
+            routed_scaling_factor,
+            "sigmoid",
+        )
+        return
     if (
         num_expert_group == 1
         and topk_group == 1

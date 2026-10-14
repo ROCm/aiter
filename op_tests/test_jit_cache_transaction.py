@@ -1538,8 +1538,13 @@ class TestOpusRequestedKids(unittest.TestCase):
                         dispatch = _read(
                             os.path.join(tmp, "opus_bmm_mxscale_kid_dispatch.h")
                         )
+                        # Anchor on the kernel pointer, not on "{ <int>,":
+                        # the header carries a second table mapping each kid to
+                        # its { GROUP_N, GROUP_K }, whose inner braces the bare
+                        # pattern reads as kids and so reports 1 / 32 / 128 as
+                        # spurious extras.
                         emitted = {
-                            int(kid) for kid in re.findall(r"\{\s*(\d+),", dispatch)
+                            int(kid) for kid in re.findall(r"\{\s*(\d+),\s*&", dispatch)
                         }
                         self.assertEqual(emitted, set(bmm_kids))
                 else:
