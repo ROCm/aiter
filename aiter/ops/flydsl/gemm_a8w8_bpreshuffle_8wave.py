@@ -87,8 +87,13 @@ def _validate(
     # read MIN_K/lds_bytes on hosts that cannot compile.
     from flydsl.runtime.device import get_rocm_arch
 
+    arch = get_rocm_arch().split(":", 1)[0]
+    if arch != "gfx950":
+        raise ValueError(
+            f"[FlyDSL 8wave] kernel is gfx950-only (CDNA4 MFMA/LDS DMA), got {arch}"
+        )
     need = lds_bytes(block_m, block_n)
-    have = get_lds_capacity_bytes(get_rocm_arch().split(":", 1)[0])
+    have = get_lds_capacity_bytes(arch)
     if need > have:
         raise ValueError(
             f"[FlyDSL 8wave] {block_m}x{block_n} needs {need} B of LDS, limit is {have} B"

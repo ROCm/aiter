@@ -742,6 +742,56 @@ def gemm_a8w8_bpreshuffle_fake(
     return torch.empty(XQ.shape[0], WQ.shape[0], dtype=dtype, device=XQ.device)
 
 
+# Default kernel for INT8 shapes with no tuned row (same tile as the tuned rows).
+_INT8_UNTUNED_KERNEL = "flydsl_bpreshuffle_8w_256x256x128_I8_I8_B16_1x8"
+
+
+def _check_int8_bpreshuffle_contract(
+    XQ: Tensor,
+    WQ: Tensor,
+    x_scale: Tensor,
+    w_scale: Tensor,
+    dtype: torch.dtype,
+) -> None:
+    """Reject INT8 calls that fall outside the frozen ABI before any dispatch.
+
+    The tuned INT8 rows are all ``..._I8_I8_B16_...`` FlyDSL kernels, so a call
+    that violates the contract would otherwise fail deep inside the launcher
+    (or, for FP16 output, only after a tuned row has been selected).
+    """
+    if dtype != dtypes.bf16:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle with INT8 inputs only supports BF16 output, "
+            f"got {dtype}"
+        )
+    if XQ.dim() != 2 or WQ.dim() != 2:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires 2-D XQ (M, K) and WQ (N, K), got "
+            f"{tuple(XQ.shape)} and {tuple(WQ.shape)}"
+        )
+    if not XQ.is_contiguous() or not WQ.is_contiguous():
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires contiguous XQ and a contiguous "
+            "(16, 16) preshuffled WQ"
+        )
+    if x_scale.dtype != torch.float32 or w_scale.dtype != torch.float32:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires FP32 x_scale/w_scale, got "
+            f"{x_scale.dtype} and {w_scale.dtype}"
+        )
+    if x_scale.numel() != XQ.shape[0] or w_scale.numel() != WQ.shape[0]:
+        raise ValueError(
+            "gemm_a8w8_bpreshuffle INT8 requires per-row x_scale (M elements) and "
+            f"per-column w_scale (N elements); got {x_scale.numel()} for M="
+            f"{XQ.shape[0]} and {w_scale.numel()} for N={WQ.shape[0]}"
+        )
+    devices = {XQ.device, WQ.device, x_scale.device, w_scale.device}
+    if len(devices) != 1:
+        raise ValueError(
+            f"gemm_a8w8_bpreshuffle INT8 operands must share a device, got {devices}"
+        )
+
+
 @torch_compile_guard(gen_fake=gemm_a8w8_bpreshuffle_fake)
 def gemm_a8w8_bpreshuffle(
     XQ: Tensor,
@@ -752,6 +802,41 @@ def gemm_a8w8_bpreshuffle(
     dtype: torch.dtype = dtypes.bf16,
     check: bool = False,
 ) -> Tensor:
+    """Per-token/per-channel quantized GEMM with a pre-shuffled weight.
+
+    ``Y = (XQ @ WQ.T) * x_scale * w_scale`` with ``XQ`` of shape ``(M, K)`` and
+    ``WQ`` of shape ``(N, K)`` in ``shuffle_weight(..., layout=(16, 16))`` order.
+
+    FP8 follows the existing CK/CKTile/FlyDSL tuned paths.
+
+    Frozen signed-INT8 ABI (gfx950, 256 CUs, FlyDSL 8-wave kernels):
+
+    * ``XQ`` and ``WQ`` are contiguous ``torch.int8`` (signed, true INT8 MFMA with
+      INT32 accumulation); both must have the same dtype.
+    * ``x_scale`` is FP32 per row (``M`` elements), ``w_scale`` is FP32 per
+      output column (``N`` elements); shapes ``(M, 1)``/``(1, N)`` or flat.
+    * ``WQ`` is the ``(16, 16)`` preshuffled layout and must be contiguous.
+    * Output is BF16 only (``dtype=torch.bfloat16``); FP16 is rejected.
+    * ``K`` is a multiple of 128 and at least 256.
+    * ``bias`` is not fused; callers add it after the GEMM (xDiT does so).
+    * Tuned shapes live in ``a8w8_bpreshuffle_tuned_gemm.csv`` and are keyed on
+      ``(gfx, cu_num, M, N, K, q_dtype_w)``. Untuned INT8 shapes run the same
+      8-wave kernel at its default 256x256 tile (correct, unvalidated for
+      speed) and log a warning; non-gfx950 INT8 raises ``NotImplementedError``.
+      The CK/CKTile bpreshuffle fallbacks are FP8-only and are never used for
+      INT8.
+    """
+    if XQ.dtype == dtypes.i8 or WQ.dtype == dtypes.i8:
+        if XQ.dtype != WQ.dtype:
+            raise ValueError(
+                "activation and weight quantized dtypes must match, got "
+                f"{XQ.dtype} and {WQ.dtype}"
+            )
+        if bias is not None:
+            raise ValueError(
+                "gemm_a8w8_bpreshuffle does not support bias; add it after the GEMM"
+            )
+        _check_int8_bpreshuffle_contract(XQ, WQ, x_scale, w_scale, dtype)
     assert dtype in [
         torch.bfloat16,
         torch.float16,
@@ -809,6 +894,26 @@ def gemm_a8w8_bpreshuffle(
             if w_k > k:
                 XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
             return gemm_a8w8_bpreshuffle_flydsl(XQ, WQ, x_scale, w_scale, Y, config)
+
+    if q_dtype == dtypes.i8:
+        # The CK/CKTile bpreshuffle fallbacks below are FP8-only: fed INT8 they
+        # reinterpret the bytes as FP8 and return NaN/garbage. Untuned INT8
+        # shapes therefore use the (correct for any M/N, K%128==0) 8-wave
+        # kernel at its default tile, or fail loudly.
+        if get_gfx() != "gfx950":
+            raise NotImplementedError(
+                f"gemm_a8w8_bpreshuffle INT8 is only supported on gfx950, got "
+                f"{get_gfx()} (M={m}, N={n}, K={k})"
+            )
+        logger.warning(
+            f"[gfx950] gemm_a8w8_bpreshuffle INT8 untuned M={m}, N={n}, K={k}; "
+            f"falling back to '{_INT8_UNTUNED_KERNEL}' (correct, not tuned)."
+        )
+        if w_k > k:
+            XQ = F.pad(XQ.contiguous(), (0, w_k - k), value=0)
+        return gemm_a8w8_bpreshuffle_flydsl(
+            XQ, WQ, x_scale, w_scale, Y, {"kernelName": _INT8_UNTUNED_KERNEL}
+        )
 
     if get_gfx() == "gfx1250":
         from ..ops.flydsl.gemm_tune.flydsl_gemm_a8w8_bpreshuffle_wmma_common import (
