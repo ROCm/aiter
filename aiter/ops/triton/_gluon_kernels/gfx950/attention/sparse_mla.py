@@ -49,8 +49,8 @@ from triton.language.core import PropagateNan
 from triton.language.core import _aggregate as aggregate
 from triton.language.target_info import is_hip_cdna4
 
+from aiter.ops.triton._triton_kernels.common.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils._triton.kernel_repr import make_kernel_repr
-from aiter.ops.triton.utils._triton.pid_preprocessing import remap_xcd
 from aiter.ops.triton.utils.common_utils import strip_annotate
 
 # Triton's default max ignores NaN, which on AMD costs a canonicalize per

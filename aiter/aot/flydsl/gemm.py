@@ -906,13 +906,15 @@ def _compile_mxfp8_wmma_to_cache(
                     a_preshuffle,
                 )
         if split_k > 1:
-            compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
+            compile_gemm_a8w8_splitk_reduce(
+                split_k=split_k, out_dtype_str="bf16", partial_dtype_str="f32"
+            )(
                 _ptr_view_safe(out),
                 _ptr_view_safe(out),
                 m * n,
                 1,
                 n,
-                m * n * 2,
+                m * n * 4,
                 stream,
             )
 
@@ -978,13 +980,15 @@ def _compile_ptpc_wmma_to_cache(
             split_k,
         )
         if split_k > 1:
-            compile_gemm_a8w8_splitk_reduce(split_k=split_k, out_dtype_str="bf16")(
+            compile_gemm_a8w8_splitk_reduce(
+                split_k=split_k, out_dtype_str="bf16", partial_dtype_str="f32"
+            )(
                 _ptr_view_safe(out),
                 _ptr_view_safe(out),
                 m * n,
                 1,
                 n,
-                m * n * 2,
+                m * n * 4,
                 stream,
             )
 
