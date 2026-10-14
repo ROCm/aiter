@@ -16,6 +16,7 @@ from aiter.jit.utils.chip_info import get_cu_num, get_gfx_runtime
 from aiter.ops.flydsl.gemm_a8w8_bpreshuffle_8wave import flydsl_8wave_gemm_a8
 from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 from aiter.ops.gemm_op_a8w8 import (
+    gemm_a8w8_asm,
     gemm_a8w8_ck,
     get_GEMM_config_with_quant_type,
 )
@@ -24,6 +25,9 @@ from aiter.ops.triton.gemm.basic.gemm_a8w8 import (
     gemm_a8w8 as gluon_gemm_a8w8,
 )
 from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8_preshuffle
+
+ASM_KERNEL_TILES = (16, 32, 48, 64, 80, 96, 128, 160)
+ASM_KERNEL_TEMPLATE = "_ZN5aiter{length}I8gemm_bf16_perTokenI8_BpreShuffle_{tile}x128E"
 
 ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_SHAPES = ROOT / "aiter" / "configs" / "a8w8_bpreshuffle_untuned_gemm.csv"
@@ -131,6 +135,7 @@ def benchmark_shape(
     flydsl_config,
     include_8wave,
     eight_wave_config,
+    include_asm=False,
 ):
     m, n, k = shape
     (
@@ -151,10 +156,17 @@ def benchmark_shape(
         if with_bias:
             raise RuntimeError("FlyDSL 8-wave candidate does not include bias")
         backend_names.append("flydsl_8wave")
+    if include_asm:
+        if with_bias:
+            raise RuntimeError("ASM comparison does not include bias")
+        backend_names.append("asm_best")
     outputs = {
         name: torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
         for name in backend_names
     }
+    asm_kernel = {"name": None, "weight": None}
+    # The upstream ASM kernel requires an explicit (zero) FP32 bias row.
+    asm_bias = torch.zeros((1, n), dtype=torch.float32, device="cuda")
 
     ck_config = get_GEMM_config_with_quant_type(
         m,
@@ -230,6 +242,51 @@ def benchmark_shape(
             xcd_swizzle=eight_wave_config["xcd_swizzle"],
         )
 
+    def run_asm():
+        return gemm_a8w8_asm(
+            x,
+            asm_kernel["weight"],
+            x_scale,
+            w_scale,
+            outputs["asm_best"],
+            asm_kernel["name"],
+            asm_bias,
+            True,
+            1,
+        )
+
+    def select_asm_kernel():
+        """Pick the fastest ASM tile that runs and agrees with CK (setup only)."""
+        best = None
+        for layout in ((32, 16), (16, 16)):
+            asm_kernel["weight"] = shuffle_weight(weight, layout=layout)
+            for tile in ASM_KERNEL_TILES:
+                name = ASM_KERNEL_TEMPLATE.format(
+                    length=len(f"I8gemm_bf16_perTokenI8_BpreShuffle_{tile}x128"),
+                    tile=tile,
+                )
+                asm_kernel["name"] = name
+                try:
+                    run_asm()
+                    torch.cuda.synchronize()
+                    if not torch.allclose(
+                        outputs["asm_best"], outputs["ck"], atol=0.02, rtol=1e-2
+                    ):
+                        continue
+                    run_asm()
+                    us = event_time_us(run_asm, 20)
+                except Exception:  # noqa: BLE001 - tile unsupported for this shape
+                    continue
+                if best is None or us < best[0]:
+                    best = (us, name, layout)
+            if best is not None:
+                break
+        if best is None:
+            raise RuntimeError(f"no ASM INT8 kernel runs correctly for {shape}")
+        asm_kernel["name"] = best[1]
+        asm_kernel["weight"] = shuffle_weight(weight, layout=best[2])
+        print(f"{shape}: asm_best={best[1]} layout={best[2]}", flush=True)
+
     launches = {
         "ck": run_ck,
         "gluon": run_gluon,
@@ -239,6 +296,11 @@ def benchmark_shape(
         launches["flydsl_primary"] = run_flydsl_primary
     if include_8wave:
         launches["flydsl_8wave"] = run_flydsl_8wave
+    if include_asm:
+        run_ck()
+        torch.cuda.synchronize()
+        select_asm_kernel()
+        launches["asm_best"] = run_asm
     for launch in launches.values():
         launch()
     torch.cuda.synchronize()
@@ -291,6 +353,7 @@ def benchmark_shape(
                 "max_us": max(values),
                 "samples_us": ";".join(f"{value:.6f}" for value in values),
                 "ck_split_k": ck_split_k if name == "ck" else "",
+                "kernel": asm_kernel["name"] if name == "asm_best" else "",
                 "bias": with_bias,
             }
         )
@@ -320,6 +383,11 @@ def main():
     )
     parser.add_argument("--include-flydsl", action="store_true")
     parser.add_argument("--include-8wave", action="store_true")
+    parser.add_argument(
+        "--include-asm",
+        action="store_true",
+        help="Also benchmark the fastest upstream gfx950 INT8 ASM tile per shape.",
+    )
     parser.add_argument("--flydsl-tile", type=parse_shape, default=(128, 128, 128))
     parser.add_argument("--flydsl-async-copy", type=int, choices=(0, 1), default=1)
     parser.add_argument("--flydsl-waves-per-eu", type=int, default=0)
@@ -400,6 +468,7 @@ def main():
                 flydsl_config,
                 args.include_8wave,
                 eight_wave_config,
+                args.include_asm,
             )
         )
     args.output.parent.mkdir(parents=True, exist_ok=True)
