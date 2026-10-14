@@ -807,8 +807,9 @@ def test_k1_table_padded_to_max_model_len():
     request's pages, so K1 sees tens of thousands of columns no row can see.
     The table here is 4096 pages of 16 wide, which also crosses into the
     streaming selector. Every request shares one packed cache and differs in
-    its length. Covers the one-row scorer (decode, and decode mixed with a
-    prefill chunk) and the 16-row scorer (one request).
+    its length. Covers the one-row scorer (decode, decode mixed with a
+    prefill chunk, and two prefill prompts) and the 16-row scorer (one
+    request). The 16-row scorer launches only for a single request.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
@@ -874,6 +875,29 @@ def test_k1_table_padded_to_max_model_len():
         mixed_t2r,
         mixed_pos,
         "K1 mixed prefill+decode on a max_model_len table diverged",
+    )
+
+    # Two prefill prompts. Eight rows end the long context and twenty-four
+    # end a short one, so the selected sets differ. Two context lengths keep
+    # this on one row per workgroup.
+    left, right, short = 8, 24, 4096
+    two_pos = torch.cat(
+        (
+            torch.arange(context - left, context, dtype=dtypes.i32, device=device),
+            torch.arange(short - right, short, dtype=dtypes.i32, device=device),
+        )
+    )
+    two_t2r = torch.cat(
+        (
+            torch.zeros(left, dtype=dtypes.i32, device=device),
+            torch.ones(right, dtype=dtypes.i32, device=device),
+        )
+    )
+    run(
+        [context, short],
+        two_t2r,
+        two_pos,
+        "K1 two-prompt prefill on a max_model_len table diverged",
     )
 
     # Within a 16-row block the last row sees 4 blocks more than the first.
@@ -1626,6 +1650,90 @@ def test_k2_flash_next_prefill_matches_oracle():
     )
     if err != 0:
         raise AssertionError(f"K2 prefill diverged from the oracle (err={err})")
+
+
+def test_k2_two_prompt_prefill_matches_oracle():
+    """Two prefill prompts gather through different page-table rows.
+
+    Sixteen query rows each, so ``M=32`` takes the prefill launch. The
+    prompts have different V, and each row's token ids stay inside its own
+    sequence.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    gqa = FLASH_NEXT_GQA
+    device = torch.device("cuda")
+    page_size = 16
+    rows_each = 16
+    width = 8
+    torch.manual_seed(0)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(2)
+    prompts = []
+    for seq_len, value in ((64, 1.0), (96, 2.0)):
+        k = torch.randn(
+            seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        v = torch.full(
+            (seq_len, gqa.kv_heads, gqa.head_dim),
+            value,
+            dtype=dtypes.bf16,
+            device=device,
+        )
+        q = torch.randn(
+            rows_each, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
+        )
+        indices = torch.randint(
+            0, seq_len, (rows_each, width), dtype=dtypes.i32, device=device
+        )
+        indices[:, -1] = -1
+        k_cache, table = pack_paged_cache(k, page_size, generator=gen)
+        v_cache, table_v = pack_paged_cache(v, page_size, physical=table[0])
+        if not torch.equal(table, table_v):
+            raise AssertionError("K and V page tables diverged")
+        prompts.append((q, k, v, k_cache, v_cache, table, indices))
+    page_offset = 0
+    page_width = max(prompt[5].shape[1] for prompt in prompts)
+    table = torch.zeros(len(prompts), page_width, dtype=dtypes.i32, device=device)
+    k_pages = []
+    v_pages = []
+    for req, (_q, _k, _v, k_cache, v_cache, prompt_table, _indices) in enumerate(
+        prompts
+    ):
+        n_pages = prompt_table.shape[1]
+        table[req, :n_pages] = prompt_table[0] + page_offset
+        page_offset += k_cache.shape[0]
+        k_pages.append(k_cache)
+        v_pages.append(v_cache)
+    q = torch.cat([prompt[0] for prompt in prompts], dim=0)
+    indices = torch.cat([prompt[6] for prompt in prompts], dim=0)
+    token_to_req = torch.cat(
+        [
+            torch.full((rows_each,), req, dtype=dtypes.i32, device=device)
+            for req in range(len(prompts))
+        ]
+    )
+    k_cache = torch.cat(k_pages, dim=0)
+    v_cache = torch.cat(v_pages, dim=0)
+    ref = torch.cat(
+        [
+            sparse_gqa_ref(prompt[0], prompt[1], prompt[2], prompt[6])
+            for prompt in prompts
+        ],
+        dim=0,
+    )
+    out = qsa_sparse_gqa(q, k_cache, v_cache, indices, table, token_to_req)
+    err = checkAllclose(
+        ref.to(dtypes.fp32),
+        out.to(dtypes.fp32),
+        rtol=1e-2,
+        atol=1e-2,
+        msg="flydsl K2 two-prompt prefill vs oracle GQA",
+    )
+    if err != 0:
+        raise AssertionError(
+            f"K2 two-prompt prefill diverged from the oracle (err={err})"
+        )
 
 
 def test_k2_page_past_4gib():
