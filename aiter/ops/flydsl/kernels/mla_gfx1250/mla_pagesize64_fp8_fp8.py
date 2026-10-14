@@ -238,7 +238,6 @@ def launch_mla_pagesize64_fp8_fp8(
                     wave_id * LDS_WAVE_BYTES + kv_stage * KV_STAGE_BYTES,
                 ),
             )
-            # The size-1 rest keeps mode-0 the nested box tdm_partition cuts.
             kv_lds = fx.Tensor(
                 fx.make_view(
                     kv_lds_ptr,

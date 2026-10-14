@@ -87,7 +87,6 @@ def emit_fused_splitk_epilogue(
         num_warps=block // 32,
     )
     out_blk = fx.zipped_divide(out_coord, out_tile)[None, (0, None)]
-    # The size-1 rest keeps mode-0 the nested box tdm_partition cuts.
     lds_box = fx.Tensor(
         fx.make_view(
             lds_partial,
