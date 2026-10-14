@@ -34,7 +34,7 @@ Re-tune the DeepSeek-V4.1-Flash rows on one gfx942 GPU with:
 python3 csrc/gemm_a16w8_mxfp8/gemm_a16w8_mxfp8_tune.py \
     -i aiter/configs/model_configs/dsv41_a16w8_mxfp8_asm_untuned_gemm.csv \
     -o aiter/configs/model_configs/dsv41_a16w8_mxfp8_asm_tuned_gemm.csv \
-    --all --shape_grouped
+    --all --shape_grouped --min-gain-pct 5
 ```
 
 Without `-i` / `-o` the tuner reads and writes the default files. For every
@@ -57,7 +57,10 @@ shape it:
 
 Kernels of a few microseconds vary between runs by a few percent, so close
 candidates (for example two split counts of one kernel) can swap between runs.
-Expect comparable results, not identical ones.
+Expect comparable results, not identical ones. For the same reason the shipped
+rows require a 5 % margin over BF16: three runs of the command above kept the
+same shapes. The table also leaves out 5120 x 2048 at M = 24, which passed by
+5.0 to 5.8 % but is 0.97x of BF16 in `op_tests/test_gemm_a16w8_mxfp8_asm.py`.
 
 Useful options:
 

@@ -43,7 +43,7 @@ Rows use AITER's tuned-GEMM columns `gfx,cu_num,M,N,K,kernelId,splitK,us,kernelN
 (`kernelId` is the row of the kernel in the registry csv, `us` the graph-timed kernel time, `bw`
 GB/s including the scale bytes). A call uses the entry with the smallest tuned M at or above its
 row count for its `(gfx, cu_num, N, K)`. A row is listed only where the kernel beat BF16 hipBLASLt on
-the dequantized weights. Engines should gate on `is_gemm_a16w8_mxfp8_tuned`; other shapes run the
+the dequantized weights by more than 5 % in CUDA-graph time. Engines should gate on `is_gemm_a16w8_mxfp8_tuned`; other shapes run the
 default kernel `tr<ceil(M/16)>_tn1_nw4`, which is correct but not tuned. `kernelName` / `splitK`
 override the choice.
 
