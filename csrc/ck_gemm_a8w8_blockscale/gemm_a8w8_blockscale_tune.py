@@ -60,6 +60,21 @@ except ImportError as _flydsl_import_err:
     kernels_list_flydsl = {}
     fits_shape_flydsl = None
 
+try:
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        kernel_fits_shape as fits_shape_flydsl_gfx1250,
+    )
+    from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxfp8_128_bpreshuffle_wmma_common import (
+        kernels_list as kernels_list_flydsl_gfx1250,
+    )
+except ImportError as _flydsl_gfx1250_import_err:
+    print(
+        f"[FlyDSL] gfx1250 mxfp8_128 catalog unavailable "
+        f"({_flydsl_gfx1250_import_err}); gfx1250 --libtype flydsl disabled"
+    )
+    kernels_list_flydsl_gfx1250 = {}
+    fits_shape_flydsl_gfx1250 = None
+
 
 block_shape = (128, 128)
 
@@ -211,7 +226,27 @@ def run_gemm_a8w8_blockscale_flydsl(
     )
 
 
-def generate_data_e8m0(m, n, k, seed, device="cuda"):
+def run_gemm_a8w8_blockscale_flydsl_gfx1250(
+    x, weight_shuffle, x_scale, w_scale, out, kernel_name
+):
+    from aiter.ops.gemm_op_a8w8 import gemm_a8w8_mxfp8_128_bpreshuffle_flydsl
+
+    return gemm_a8w8_mxfp8_128_bpreshuffle_flydsl(
+        x, weight_shuffle, x_scale, w_scale, out, {"kernelName": kernel_name}
+    )
+
+
+def generate_data_e8m0_gfx1250(m, n, k, seed, device="cuda"):
+    """gfx1250 mxfp8_128 operands as the model passes them: x_scale (M, K//128)
+    e8m0 with column-major bytes (per_group_quant_hip(transpose_scale=True)),
+    w_scale the raw (N//128, K//128) e8m0 block scale."""
+    gd = generate_data_e8m0(m, n, k, seed, device, shuffle_scales=False)
+    xs = gd.pop("x_scale")
+    gd["x_scale_cm"] = xs.transpose(0, 1).contiguous().view(*xs.shape)
+    return gd
+
+
+def generate_data_e8m0(m, n, k, seed, device="cuda", shuffle_scales=True):
     """Data for the FlyDSL MX backend, kept separate from generate_data()."""
     torch.manual_seed(seed)
     block_shape_n, block_shape_k = block_shape
@@ -233,13 +268,19 @@ def generate_data_e8m0(m, n, k, seed, device="cuda"):
         .repeat_interleave(block_shape_n, dim=0)
         .repeat_interleave(block_shape_k, dim=1)[:n, :k]
     )
+    if not shuffle_scales:
+        scales = {"x_scale": x_scale, "w_scale": w_scale}
+    else:
+        # Scales are shuffled caller-side (like shuffle_weight), so the shuffle
+        # is prep, not part of the timed GEMM -- same split the model uses.
+        scales = {
+            "x_scale_shuf": shuffle_scale_blockscale_a(x_scale, k),
+            "w_scale_shuf": shuffle_scale_blockscale_b(w_scale, n, k),
+        }
     return {
         "x": x,
         "weight_shuffle": shuffle_weight(weight, layout=(16, 16)),
-        # Scales are shuffled caller-side (like shuffle_weight), so the shuffle is
-        # prep, not part of the timed GEMM -- same split the model uses.
-        "x_scale_shuf": shuffle_scale_blockscale_a(x_scale, k),
-        "w_scale_shuf": shuffle_scale_blockscale_b(w_scale, n, k),
+        **scales,
         "out": torch.empty(m, n, dtype=dtypes.bf16, device=device),
         "x_deq": x.to(dtypes.fp32) * xs,
         "w_deq": weight.to(dtypes.fp32) * ws,
@@ -693,18 +734,32 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
         run_kwargs,
     ):
         gfx, _, M, N, K, *_ = info_keys
-        if not preshuffleB or gfx != "gfx950":
+        if not preshuffleB or gfx not in ("gfx950", "gfx1250"):
             return []
-        if not kernels_list_flydsl or fits_shape_flydsl is None:
+        if gfx == "gfx1250":
+            catalog, fits = kernels_list_flydsl_gfx1250, fits_shape_flydsl_gfx1250
+            gen, runner = (
+                generate_data_e8m0_gfx1250,
+                run_gemm_a8w8_blockscale_flydsl_gfx1250,
+            )
+            gemm_keys = ["x", "weight_shuffle", "x_scale_cm", "w_scale", "out"]
+        else:
+            catalog, fits = kernels_list_flydsl, fits_shape_flydsl
+            gen, runner = generate_data_e8m0, run_gemm_a8w8_blockscale_flydsl
+            gemm_keys = ["x", "weight_shuffle", "x_scale_shuf", "w_scale_shuf", "out"]
+        if not catalog or fits is None:
             return []
 
-        gemm_keys = ["x", "weight_shuffle", "x_scale_shuf", "w_scale_shuf", "out"]
         ref_args = (["x_deq", "w_deq"], dtypes.bf16)
         tasks_flydsl = []
-        for kernel_id, ki in kernels_list_flydsl.items():
-            if (ki.a_dtype, ki.b_dtype) != ("fp8", "fp8"):
+        for kernel_id, ki in catalog.items():
+            if gfx == "gfx1250":
+                # the dispatch feeds a row-major A: no A-preshuffle kernels
+                if ki.a_preshuffle:
+                    continue
+            elif (ki.a_dtype, ki.b_dtype) != ("fp8", "fp8"):
                 continue
-            if not fits_shape_flydsl(ki, M, N, K):
+            if not fits(ki, M, N, K):
                 continue
             # kernelName carries the full launch config (incl. split-K), so
             # dispatch never needs kernelId -- it is recorded for reference only.
@@ -712,9 +767,9 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             tasks_flydsl.append(
                 (
                     info,
-                    generate_data_e8m0,
+                    gen,
                     (M, N, K, seed),
-                    run_gemm_a8w8_blockscale_flydsl,
+                    runner,
                     (gemm_keys, ki.name),
                     dict(run_kwargs),
                     run_torch_e8m0,
@@ -755,13 +810,16 @@ class GemmA8W8BlockScaleTuner(GemmCommonTuner):
             )
             try:
                 if is_preshuffle and self._mxscale:
-                    gd = generate_data_e8m0(M, N, K, 0)
+                    gfx1250 = self.get_gfx() == "gfx1250"
+                    gd = (
+                        generate_data_e8m0_gfx1250 if gfx1250 else generate_data_e8m0
+                    )(M, N, K, 0)
                     out, us = run_perftest(
                         gemm_a8w8_blockscale_bpreshuffle,
                         gd["x"],
                         gd["weight_shuffle"],
-                        gd["x_scale_shuf"],
-                        gd["w_scale_shuf"],
+                        gd["x_scale_cm" if gfx1250 else "x_scale_shuf"],
+                        gd["w_scale" if gfx1250 else "w_scale_shuf"],
                         **run_kwargs,
                     )
                     ref = run_torch_e8m0(gd["x_deq"], gd["w_deq"])
