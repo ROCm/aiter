@@ -6363,7 +6363,7 @@ class GroupedFmoeTuner(FmoeTuner):
         rk = torch.arange(topk, device="cuda").view(1, topk)
         ids = ((tok * topk + rk) % experts).to(torch.int32)
         weights = torch.full((token_num, topk), 1.0 / topk, device="cuda")
-        return ids, weights.to(torch.bfloat16)
+        return ids, weights
 
     @staticmethod
     def _full_scale(experts: int, rows: int, k_blocks: int):
