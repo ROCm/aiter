@@ -15,7 +15,12 @@ import pandas as pd
 import torch
 
 from aiter.jit.utils.chip_info import get_gfx_runtime
-from aiter.ops.mega_mhc import _counter_state_ok, mega_mhc, prepare_mega_mhc
+from aiter.ops.mega_mhc import (
+    _counter_state_ok,
+    mega_mhc,
+    mega_mhc_shuffle_fn,
+    prepare_mega_mhc,
+)
 from aiter.test_common import benchmark, run_perftest
 
 # rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult, sinkhorn_repeat
@@ -190,7 +195,7 @@ def benchmark_bytes(m, hidden_size, mode, out_dtype="bf16"):
 
 
 class _BenchmarkBackend:
-    """Prepare each rotated weight/workspace before run_perftest starts timing."""
+    """Pack rotated weights and prepare scratch before run_perftest timing."""
 
     def __init__(self, name, tokens, scalar_args, out_dtype="bf16"):
         self.name = name
@@ -200,7 +205,8 @@ class _BenchmarkBackend:
         self.out_dtype = out_dtype
         if name == "triton" and out_dtype != "bf16":
             raise ValueError("Triton Mega-MHC has no fused mxfp8 output")
-        self.workspaces = {}
+        self.workspace = None
+        self.packed_weights = {}
         self.prepared_addresses = set()
         self.used_addresses = set()
 
@@ -217,17 +223,24 @@ class _BenchmarkBackend:
             "residual_out": residual_out,
         }
         if self.name == "hip":
-            kw["workspace"] = self.workspaces[id(fn)]
+            kw["workspace"] = self.workspace
+            kw["w_preshuffle_bf16"] = True
+            fn = self.packed_weights[id(fn)]
         if self.name != "triton":
             kw["out_dtype"] = self.out_dtype
         return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
 
     def prepare(self, *rotated):
         # Called before profiling for the original tensors and every copy.
-        # HIP owns a workspace per fn; FlyDSL warms its per-weight cache here.
+        # HIP shares scratch across weights; FlyDSL warms its weight cache here.
         self.prepared_addresses.add(rotated[0].data_ptr())
         if self.name == "hip":
-            self.workspaces[id(rotated[1])] = prepare_mega_mhc(rotated[1], self.tokens)
+            residual, fn = rotated[:2]
+            self.packed_weights[id(fn)] = mega_mhc_shuffle_fn(fn)
+            if self.workspace is None:
+                self.workspace = prepare_mega_mhc(
+                    residual.device, self.tokens, residual.shape[-1]
+                )
         self(*rotated)
         self.used_addresses.discard(rotated[0].data_ptr())
 
@@ -291,9 +304,8 @@ def benchmark_mega_mhc(
                 assert caller.used_addresses == caller.prepared_addresses
             result[f"{name}_us"] = us
             result[f"{name}_TB/s"] = num_bytes / us / 1e6
-        for workspace in caller.workspaces.values():
-            assert _counter_state_ok(workspace)
-        caller.workspaces.clear()
+        if caller.workspace is not None:
+            assert _counter_state_ok(caller.workspace)
     result["status"] = (
         "PASS" if any(result[name] == "PASS" for name in backends) else "SKIP"
     )

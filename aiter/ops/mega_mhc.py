@@ -3,6 +3,7 @@
 """HIP delayed Mega-mHC with BF16 or fused MXFP8 output in a single launch."""
 
 import os
+import threading
 from dataclasses import dataclass
 from functools import cache
 
@@ -12,7 +13,7 @@ from torch import Tensor
 from ..jit.core import compile_ops
 from ..jit.utils.chip_info import get_gfx_runtime
 
-__all__ = ["MegaMHCWorkspace", "mega_mhc", "prepare_mega_mhc"]
+__all__ = ["MegaMHCWorkspace", "mega_mhc", "mega_mhc_shuffle_fn", "prepare_mega_mhc"]
 
 
 _STREAM_HIDDEN_SIZES = (4096, 5120, 6144, 7168)
@@ -76,12 +77,16 @@ def _select_stream_variant(tokens, hidden=5120):
     return "large", 1
 
 
-def _pack_stream_fn(fn):
+def mega_mhc_shuffle_fn(fn):
     """[H/32, stream, operand, lane, 8] BF16; the last operand packs hi/lo.
 
     The first 16 projection rows use two operands; rows 16..23 use the two
     halves of one operand. This reduces four MFMA instructions to three.
     """
+    if not fn.is_cuda or fn.dtype != torch.float32 or fn.ndim != 2:
+        raise ValueError("fn must be a GPU FP32 matrix")
+    if fn.shape[0] != 24 or fn.shape[1] % 128 or not fn.is_contiguous():
+        raise ValueError("fn must be contiguous (24, 4*H), H divisible by 32")
     with torch.no_grad():
         hidden = fn.shape[1] // 4
         hi = fn.to(torch.bfloat16)
@@ -163,20 +168,15 @@ def _native_launcher(hidden=5120, arch="gfx950"):
 
 @dataclass(frozen=True)
 class MegaMHCWorkspace:
-    """Owns the weight pack and scratch for one shape on one stream.
+    """Scratch and dispatch configuration for one shape on one device/stream.
 
-    Keep this object alive for the lifetime of any graph capturing it. Reuse on
-    its preparation stream only; prepare another workspace for another stream.
-    Updating fn requires preparing a new workspace. Inference tensors have no
-    version counter, so callers must keep those weights immutable. No scratch is grown/freed
-    behind already captured graphs, and no process-global scratch is shared.
+    Contains no weights; serial calls with different packs can share it.
+    Explicitly prepared workspaces own private buffers. Keep them alive for any
+    graph capturing them and reuse only on their preparation device/stream.
     For automatic tuning, split_k records scratch capacity: post kernels may
     use fewer splits. The same workspace supports both post and no-post calls.
     """
 
-    fn: Tensor
-    fn_version: int | None
-    fn_packed: Tensor
     partials: Tensor
     counters: Tensor
     tokens: int
@@ -195,38 +195,84 @@ def _require_tensor(x, name, shape, dtype, device):
         raise ValueError(f"{name} must be contiguous {dtype} on {device}")
 
 
-def _fn_version(fn):
-    return None if fn.is_inference() else fn._version
+class _Scratch:
+    """Weight-independent scratch shared by serial calls on one device/stream.
+
+    Kernels re-arm counters themselves. Only allocation/growth clears them.
+    Keep replaced buffers alive for captured graphs; geometric growth bounds
+    retained storage. Graphs using the same scratch must also replay serially.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.buffers = {}
+        self.retired = []
+
+    def get(self, device, n_partials, n_counters):
+        key = (device, torch.cuda.current_stream(device).cuda_stream)
+        with self.lock:
+            part, cnt = self.buffers.get(key, (None, None))
+            grow_part = part is None or part.numel() < n_partials
+            grow_cnt = cnt is None or cnt.shape[1] < n_counters
+            if (grow_part or grow_cnt) and torch.cuda.is_current_stream_capturing():
+                raise RuntimeError(
+                    "Warm up Mega-MHC scratch on the capture stream before capture"
+                )
+            if grow_part:
+                capacity = max(n_partials, 32 if part is None else 2 * part.numel())
+                if part is not None:
+                    self.retired.append(part)
+                part = torch.empty(capacity, device=device, dtype=torch.float32)
+            if grow_cnt:
+                capacity = max(n_counters, 32 if cnt is None else 2 * cnt.shape[1])
+                if cnt is not None:
+                    self.retired.append(cnt)
+                # Generic and generation-tagged protocols need separate counters.
+                cnt = torch.zeros((2, capacity), device=device, dtype=torch.int32)
+            self.buffers[key] = (part, cnt)
+            return part[:n_partials], cnt[0, :n_counters], cnt[1, :n_counters]
 
 
-def prepare_mega_mhc(fn: Tensor, tokens: int, *, split_k: int | None = None):
-    """Pack FP32 fn and initialize per-stream scratch outside graph capture.
+_SCRATCH = _Scratch()
+
+
+def prepare_mega_mhc(
+    device: torch.device,
+    tokens: int,
+    hidden: int,
+    *,
+    split_k: int | None = None,
+):
+    """Prepare private scratch from dimensions on the current stream of device.
 
     H=4096/5120/6144/7168 on gfx950 uses the tuned stream kernels. Explicit split_k,
     other H and gfx942 select the portable generic kernel with the same weight
     layout. The workspace also supports non-default Sinkhorn repeats via the
-    generic path, sharing the weight pack without allocating in capture.
+    generic path. It never receives or stores weights. Prepare before graph
+    capture; pass the packed weight separately to each mega_mhc call.
     """
-    if not fn.is_cuda or fn.dtype != torch.float32 or fn.ndim != 2:
-        raise ValueError("fn must be a GPU FP32 matrix")
-    if fn.shape[0] != 24 or fn.shape[1] % 128 or not fn.is_contiguous():
-        raise ValueError("fn must be contiguous (24, 4*H), H divisible by 32")
-    hidden = fn.shape[1] // 4
+    with torch.cuda.device(device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("prepare_mega_mhc must run before graph capture")
+        return _prepare_scratch(device, tokens, hidden, split_k, reuse_scratch=False)
+
+
+def _prepare_scratch(device, tokens, hidden, split_k=None, *, reuse_scratch=True):
+    """Select the kernel and obtain its buffers from dimensions only."""
     if (
         not isinstance(tokens, int)
         or tokens < 0
         or tokens > (2**31 - 1) // 32
         or not 0 < hidden <= 65536
+        or hidden % 32
     ):
         raise ValueError("unsupported T or H")
-    with torch.cuda.device(fn.device):
-        if torch.cuda.is_current_stream_capturing():
-            raise RuntimeError("prepare_mega_mhc must run before graph capture")
+    with torch.cuda.device(device):
         arch = get_gfx_runtime()
         if arch not in ("gfx950", "gfx942"):
             raise RuntimeError(f"mega_mhc requires gfx950 or gfx942, got {arch}")
         blocks = (tokens + 15) // 16
-        cu = torch.cuda.get_device_properties(fn.device).multi_processor_count
+        cu = torch.cuda.get_device_properties(device).multi_processor_count
         if arch == "gfx950" and hidden in _STREAM_HIDDEN_SIZES:
             variant, selected_split = _select_stream_variant(tokens, hidden)
         else:
@@ -256,28 +302,36 @@ def prepare_mega_mhc(fn: Tensor, tokens: int, *, split_k: int | None = None):
         # still keep the tuned grid at no more than one WG per CU.
         if distributed and ((blocks + 7) // 8) * split_k > 32:
             raise ValueError("distributed split grid exceeds one workgroup per CU")
-        generic_partials = torch.empty(
-            (split_k, blocks, 16, 32), device=fn.device, dtype=torch.float32
-        )
+        if reuse_scratch:
+            storage, generic_counters, distributed_counters = _SCRATCH.get(
+                device, split_k * blocks * 16 * 32, blocks * 32
+            )
+            generic_partials = storage.view(split_k, blocks, 16, 32)
+            counters = distributed_counters if distributed else generic_counters
+        else:
+            generic_partials = torch.empty(
+                (split_k, blocks, 16, 32), device=device, dtype=torch.float32
+            )
+            # Initialize both protocols in one operation for a private workspace.
+            counter_storage = torch.zeros(
+                (2 if distributed else 1, blocks * 32),
+                device=device,
+                dtype=torch.int32,
+            )
+            counters = counter_storage[0]
+            generic_counters = counter_storage[1] if distributed else counters
         partials = (
             generic_partials.view(-1)[: split_k * tokens * 32]
             if distributed
             else generic_partials
         )
-        counters = torch.zeros(blocks * 32, device=fn.device, dtype=torch.int32)
-        # Generation-tagged counters cannot be reused by the generic
-        # zero-based arrival protocol. Both sets belong to this workspace.
-        generic_counters = torch.zeros_like(counters) if distributed else counters
         return MegaMHCWorkspace(
-            fn,
-            _fn_version(fn),
-            _pack_stream_fn(fn),
             partials,
             counters,
             tokens,
             hidden,
             split_k,
-            torch.cuda.current_stream(fn.device).cuda_stream,
+            torch.cuda.current_stream(device).cuda_stream,
             variant,
             generic_partials,
             generic_counters,
@@ -323,6 +377,7 @@ def mega_mhc(
     *,
     residual_out: Tensor | None = None,
     workspace: MegaMHCWorkspace | None = None,
+    w_preshuffle_bf16: bool = False,
     out_dtype: str = "bf16",
 ):
     """Delayed post/pre/RMSNorm seam, returning (R, post, comb, norm, next_pre).
@@ -331,9 +386,14 @@ def mega_mhc(
     specializes to stream 0; sublayer_out=None skips post-mix. RMS/gates and
     MFMA accumulation use FP32; activation/weight operands use BF16 hi/lo.
 
-    With a prepared workspace this launches exactly one HIP kernel. Without
-    one, this convenience wrapper also packs fn and initializes scratch on
-    every call. Prepare once and warm up on the capture stream before capture.
+    Pack fn once after loading with mega_mhc_shuffle_fn and pass
+    w_preshuffle_bf16=True. The wrapper reuses weight-independent scratch per
+    device/stream and launches one HIP kernel after warmup. Warm up on the
+    capture stream with sufficient scratch capacity before graph capture.
+    Calls and graphs sharing that scratch must execute serially. The read-only
+    pack can be shared across streams after the loading stream has finished.
+    Pass an explicit workspace to own private scratch instead. Raw FP32 fn is
+    not accepted; w_preshuffle_bf16 must be True, with or without a workspace.
     H=4096/5120/6144/7168 on gfx950 uses stream dispatch for Sinkhorn=20; other
     positive repeat counts use the generic stream kernel with the same pack.
 
@@ -344,6 +404,7 @@ def mega_mhc(
     scale bytes with .view(torch.float8_e8m0fnu) for consumers requiring E8M0.
     The same workspace supports both output modes, including graph replay.
     """
+    assert w_preshuffle_bf16, "mega_mhc requires w_preshuffle_bf16=True"
     if not residual.is_cuda or residual.ndim != 3 or residual.shape[1] != 4:
         raise ValueError("residual must be a GPU (T, 4, H) tensor")
     t, _, h = residual.shape
@@ -351,7 +412,7 @@ def mega_mhc(
     if out_dtype not in ("bf16", "mxfp8"):
         raise ValueError("out_dtype must be 'bf16' or 'mxfp8'")
     _require_tensor(residual, "residual", (t, 4, h), torch.bfloat16, device)
-    _require_tensor(fn, "fn", (24, 4 * h), torch.float32, device)
+    _require_tensor(fn, "fn", (h // 32, 4, 3, 4, 16, 4), torch.int32, device)
     _require_tensor(hc_scale, "hc_scale", (3,), torch.float32, device)
     _require_tensor(hc_base, "hc_base", (24,), torch.float32, device)
     _require_tensor(norm_weight, "norm_weight", (h,), torch.bfloat16, device)
@@ -397,15 +458,16 @@ def mega_mhc(
         if out_dtype == "mxfp8" and get_gfx_runtime() != "gfx950":
             raise RuntimeError("Mega-MHC mxfp8 requires gfx950")
         if workspace is None:
-            workspace = prepare_mega_mhc(fn, t)
-        if (
-            workspace.fn is not fn
-            or workspace.fn_version != _fn_version(fn)
-            or (workspace.tokens, workspace.hidden) != (t, h)
-        ):
-            raise ValueError("workspace must match fn, its version, and (T, H)")
-        if workspace.stream != torch.cuda.current_stream(device).cuda_stream:
-            raise ValueError("prepare a separate workspace on the current stream")
+            scratch = _prepare_scratch(device, t, h)
+        else:
+            if workspace.partials.device != device or (
+                workspace.tokens,
+                workspace.hidden,
+            ) != (t, h):
+                raise ValueError("workspace must match residual device and (T, H)")
+            if workspace.stream != torch.cuda.current_stream(device).cuda_stream:
+                raise ValueError("prepare a separate workspace on the current stream")
+            scratch = workspace
         post_out = torch.empty((t, 4, 1), device=device, dtype=torch.float32)
         comb_out = torch.empty((t, 4, 4), device=device, dtype=torch.float32)
         norm = torch.empty((t, h), device=device, dtype=torch.bfloat16)
@@ -417,13 +479,13 @@ def mega_mhc(
             quant_out = torch.empty((t, h), device=device, dtype=torch.float8_e4m3fn)
             quant_scale = torch.empty((t, h // 32), device=device, dtype=torch.uint8)
             layer_input = (norm, quant_out, quant_scale)
-        partials, counters = workspace.partials, workspace.counters
-        variant = workspace.variant
+        partials, counters = scratch.partials, scratch.counters
+        variant = scratch.variant
         if sinkhorn_repeat != 20:
             variant = "generic"
             partials, counters = (
-                workspace.generic_partials,
-                workspace.generic_counters,
+                scratch.generic_partials,
+                scratch.generic_counters,
             )
         launch = _native_launcher(h, get_gfx_runtime())
         launch(
@@ -435,7 +497,7 @@ def mega_mhc(
             quant_scale,
             next_pre,
             residual,
-            workspace.fn_packed,
+            fn,
             hc_scale,
             hc_base,
             pre_mix if pre_mix is not None else dummy,
@@ -451,7 +513,7 @@ def mega_mhc(
             hc_post_mult_value,
             norm_eps,
             sinkhorn_repeat,
-            workspace.split_k,
+            scratch.split_k,
             has_post,
             pre_mix is None,
             _STREAM_VARIANTS.index(variant),
