@@ -67,7 +67,7 @@ def bench_gemm_fn(
         kernel_fn = gemm_a16w16
 
     #create rotating buffers pool
-    rot_bufs = generate_rotating_buffers_pool(_p_gen, _out_vals_keys, target_mb=256, min_pool_len=4)
+    rot_bufs = generate_rotating_buffers_pool([_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4)
 
     # flops
     flops = 2.0 * M * N * K

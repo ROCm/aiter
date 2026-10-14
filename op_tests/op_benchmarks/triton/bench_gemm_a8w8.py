@@ -46,7 +46,7 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: boo
     _out_vals_keys = ["x", "_", "w", "x_scale", "w_scale", "bias", "y"] #keys for outputs from the gen function
 
     #create rotating buffers pool
-    rot_bufs = generate_rotating_buffers_pool(_p_gen, _out_vals_keys, target_mb=256, min_pool_len=4)
+    rot_bufs = generate_rotating_buffers_pool([_p_gen], [_out_vals_keys], target_mb=256, min_pool_len=4)
 
     #Kernel FLOPS and Mem Accesses(bytes)
     flops = 2.0 * M * N * K
