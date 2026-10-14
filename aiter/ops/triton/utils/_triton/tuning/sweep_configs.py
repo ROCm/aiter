@@ -397,17 +397,19 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args, 0)
 
 
-def precompile_slice(spec, shape, backend, candidates, out, slot, gpu, args, stop):
-    """One compile-only worker for a slice of one M's candidates; its failures are the sweep's."""
-    todo_file, log_path = f"{out}.pre{slot}.todo.json", f"{out}.pre{slot}.log"
-    with open(todo_file, "w") as f:
-        json.dump(candidates, f)
+def precompile_worker(spec, shape, backend, todo_file, out, slot, gpu, args, stop):
+    """One compile-only worker; it claims the next candidate of todo_file until none is left."""
+    log_path = f"{out}.pre{slot}.log"
     command = worker_command(
-        spec, shape, backend, ["--precompile", "--configs", todo_file, "--out", out]
+        spec,
+        shape,
+        backend,
+        ["--precompile", "--configs", todo_file, "--claim", f"{todo_file}.next"],
     )
     env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
-    outcome = run_worker(command, env, log_path, args.stall, args.setup_timeout, stop)
-    os.remove(todo_file)
+    outcome = run_worker(
+        command + ["--out", out], env, log_path, args.stall, args.setup_timeout, stop
+    )
     if outcome == "finished":  # keep the log only when something went wrong
         os.remove(log_path)
 
@@ -427,24 +429,30 @@ def precompile_ahead(spec, args, plans, stop):
             for c in [None] + plan_["configs"]
             if records.get(config_key(c), {}).get("status") not in FINAL_STATUSES
         ]
+        # one shared list, claimed in order: a slow compile holds up only its own candidate
+        todo_file = f"{out}.pre.todo.json"
+        with open(todo_file, "w") as f:
+            json.dump(todo, f)
+        with open(f"{todo_file}.next", "w") as f:
+            f.write("0")
         slots = min(args.compile_procs, len(todo))
         gpus = args.compile_gpus
         with ThreadPoolExecutor(max(slots, 1)) as pool:
-            for slot in range(
-                slots
-            ):  # strided slices: the workers advance in sweep order
+            for slot in range(slots):
                 pool.submit(
-                    precompile_slice,
+                    precompile_worker,
                     spec,
                     shape,
                     plan_["backend"],
-                    todo[slot::slots],
+                    todo_file,
                     out,
                     slot,
                     gpus[slot % len(gpus)],
                     args,
                     stop,
                 )
+        os.remove(todo_file)
+        os.remove(f"{todo_file}.next")
         print(f"  compile-ahead: M={M} done", flush=True)
 
 

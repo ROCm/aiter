@@ -31,6 +31,7 @@ Record fields:
 
 import argparse
 import copy
+import fcntl
 import gc
 import json
 import os
@@ -141,6 +142,20 @@ def compile_only(call, config, inputs):
     finally:
         jit.JITFunction.run = launch
     return [kernel for kernel in compiled if kernel is not None]
+
+
+def claimed(candidates, counter_file):
+    """The candidates this worker claims from a counter file it shares with the other workers."""
+    while True:
+        with open(counter_file, "r+") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            index = int(f.read() or 0)
+            f.seek(0)
+            f.truncate()
+            f.write(str(index + 1))
+        if index >= len(candidates):
+            return
+        yield candidates[index]
 
 
 def precompile(call, inputs, candidates, out, common):
@@ -323,6 +338,11 @@ def main(argv=None):
         help="only compile the --configs candidates into the Triton cache (no launch); "
         "a candidate that does not compile gets its error record in --out",
     )
+    parser.add_argument(
+        "--claim",
+        help="with --precompile: a counter file shared by several workers; each takes the "
+        "next unclaimed candidate of --configs",
+    )
     parser.add_argument("--space-out", help="where --plan writes the space (JSON)")
     parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
     parser.add_argument("--out", help="JSONL results file, appended")
@@ -363,6 +383,8 @@ def main(argv=None):
             "shape": shape,
             "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
         }
+        if args.claim:
+            candidates = claimed(candidates, args.claim)
         precompile(call, inputs, candidates, args.out, common)
         return 0
     benchmark(
