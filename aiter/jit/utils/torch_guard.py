@@ -124,6 +124,8 @@ def generate_schema(func, mutates_args: list[str] | str = "unknown") -> str:
                 type_str = "Tensor?"
         elif param_type in (torch.SymInt, int):
             type_str = "SymInt"
+        elif param_type == (int | None):
+            type_str = "SymInt?"
         elif param_type in (float, bool, str):
             type_str = param_type.__name__
         elif param_type == (torch.Generator | None):
