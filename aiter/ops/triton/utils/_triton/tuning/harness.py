@@ -12,8 +12,9 @@ Flow: set the kernel up once (inputs, call, should_skip), then
 config=None (the installed config). Records are appended as soon as a candidate finishes.
 
 Record fields:
-  status    ready (worker is set up), start (candidate began), ok, error, skipped (the
-            compiled kernels overflow LDS or spill registers; reason says which)
+  status    ready (worker is set up), reference (us: the installed config on this GPU, timed
+            before the candidates), start (candidate began), ok, error, skipped (the compiled
+            kernels overflow LDS or spill registers; reason says which)
   baseline  true for the installed config
   config    the raw candidate, never the mutated copy; for the baseline the installed config
             (launched through the wrapper's own config=None path unless keys DEFAULT.json does
@@ -21,8 +22,10 @@ Record fields:
   gpu       HIP_VISIBLE_DEVICES of the worker
   is_tuned  baseline only: a specialized file served this shape
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
-  screened  true when one replay was already slower than --screen x the fastest fully timed
-            record of this M on this GPU: the candidate stopped there and us is that replay
+  rel       us / the reference (the installed config on the same GPU): GPUs differ by a few
+            percent, so screening and the final-round shortlist compare rel, not us
+  screened  true when one replay was already above --screen x the lowest rel of this M (the
+            reference is 1): the candidate stopped there and us is that replay
   error     the exception text when status is error
   dur_s     wall time of the candidate
 """
@@ -183,14 +186,26 @@ def plan(spec, shape, backend, arch, should_skip, space_out):
     return 0
 
 
-def fastest_time(out, gpu):
-    """Fastest fully timed ok record of this GPU in this results file, or None."""
-    times = [
-        r["us"]
+def fastest_rel(out):
+    """Lowest rel of the fully timed ok records of this results file (all GPUs), or None."""
+    rels = [
+        r["rel"]
         for r in read_records(out).values()
-        if r["status"] == "ok" and not r.get("screened") and r.get("gpu") == gpu
+        if r["status"] == "ok" and not r.get("screened") and "rel" in r
     ]
-    return min(times, default=None)
+    return min(rels, default=None)
+
+
+def reference_time(spec, shape, backend, keys, call, copies, calls, replays):
+    """This GPU's time for the installed config, or None when it does not run."""
+    installed, _ = resolve_installed(spec, shape, backend)
+    config = None
+    if any(k not in keys for k in installed):  # launch it as the baseline record does
+        config = {k: v for k, v in installed.items() if k in keys}
+    try:
+        return time_with_cuda_graph(call, config, copies, calls, replays).median
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def benchmark(
@@ -216,8 +231,6 @@ def benchmark(
         "shape": shape,
         "gpu": os.environ.get("HIP_VISIBLE_DEVICES"),
     }
-    # the local best: a candidate is screened against the fastest time of this GPU
-    fastest = fastest_time(out, common["gpu"]) if screen else None
     append_record(
         out,
         dict(
@@ -229,6 +242,10 @@ def benchmark(
             cold_mb=cold_mb,
         ),
     )
+    reference = reference_time(spec, shape, backend, keys, call, copies, calls, replays)
+    append_record(out, dict(common, status="reference", us=reference))
+    # the best rel so far: the installed config is 1, and rel makes every GPU's records count
+    best_rel = min(fastest_rel(out) or 1.0, 1.0) if screen and reference else None
     print("ready", flush=True)  # the driver's watchdog reads the worker's log
     for candidate in candidates:
         is_baseline = candidate is None
@@ -254,8 +271,10 @@ def benchmark(
                 if reason:
                     record.update(status="skipped", reason=reason)
             if record["status"] == "ok":
-                # the baseline is never screened; nor is anything before a first full timing
-                abort_above = screen * fastest if fastest and not is_baseline else None
+                # the baseline is never screened
+                abort_above = None
+                if best_rel and not is_baseline:
+                    abort_above = screen * best_rel * reference  # in this GPU's us
                 timing = time_with_cuda_graph(
                     call, candidate, copies, calls, replays, abort_above
                 )
@@ -265,10 +284,12 @@ def benchmark(
                     us_max=round(timing.high, 3),
                     tflops=round(flops(shape) / timing.median / 1e6, 2),
                 )
+                if reference:
+                    record["rel"] = round(timing.median / reference, 4)
                 if timing.screened:
                     record["screened"] = True
-                elif screen:
-                    fastest = min(fastest or timing.median, timing.median)
+                elif best_rel:
+                    best_rel = min(best_rel, record["rel"])
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
@@ -310,8 +331,8 @@ def main(argv=None):
         "--screen",
         type=float,
         default=0,
-        help="stop a candidate after one replay when it is slower than this x the fastest "
-        "on this GPU (0: off)",
+        help="stop a candidate after one replay when its rel is above this x the lowest rel "
+        "so far (0: off)",
     )
     args = parser.parse_args(argv)
 

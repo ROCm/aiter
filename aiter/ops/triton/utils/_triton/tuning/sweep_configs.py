@@ -95,9 +95,9 @@ def parse_args(argv=None):
         "--screen",
         type=float,
         default=0,
-        help="stop a candidate after one replay when it is slower than this x the fastest "
-        "fully timed record of its M on the same GPU (0: off); the final round always "
-        "times fully",
+        help="stop a candidate after one replay when its time relative to the installed "
+        "config on its GPU (rel) is above this x the lowest rel of its M (0: off); the final "
+        "round always times fully",
     )
     parser.add_argument("--replays", type=int, default=25)
     parser.add_argument("--calls", type=int, default=24)
@@ -357,14 +357,14 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     """Re-time the baseline and the fastest current candidates on one GPU into the final-round file."""
     records = read_records(out)
     current = {config_key(c) for c in candidates}  # records of an older plan stay out
-    ok = sorted(  # screened records too: one slow replay must not drop a near-tie
-        (
-            r
-            for key, r in records.items()
-            if key in current and r["status"] == "ok" and not r.get("baseline")
-        ),
-        key=lambda r: r["us"],
-    )
+    ok = [  # screened records too: one slow replay must not drop a near-tie
+        r
+        for key, r in records.items()
+        if key in current and r["status"] == "ok" and not r.get("baseline")
+    ]
+    # rel compares candidates timed on different GPUs; records without it fall back to us
+    by_rel = all("rel" in r for r in ok)
+    ok.sort(key=lambda r: r["rel"] if by_rel else r["us"])
     fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
     final_out = final_results_path(out)
     if os.path.exists(final_out):
@@ -399,8 +399,9 @@ def summarize(out, candidates):
         key=lambda r: r["us"],
     )
     for record in ok[:10]:
+        gain = f"{1 / record['rel'] - 1:+7.1%} vs installed" if "rel" in record else ""
         print(
-            f"  {record['us']:10.3f} us  {record['tflops']:8.1f} TFLOPS  {json.dumps(record['config'])}"
+            f"  {record['us']:10.3f} us  {gain}  {record['tflops']:8.1f} TFLOPS  {json.dumps(record['config'])}"
         )
     print(f"  {counts}, screened: {screened}", flush=True)
 
