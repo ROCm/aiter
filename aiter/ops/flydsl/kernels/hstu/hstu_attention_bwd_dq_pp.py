@@ -284,7 +284,38 @@ def build_hstu_attention_bwd_dq_pp(
     WAVES_PER_EU = waves_per_eu
     MFMA_QK_K, MFMA_QK_LANE_K, _ = _mfma_params_for_dim(head_dim)
     MFMA_DA_K, MFMA_DA_LANE_K, _ = _mfma_params_for_dim(hidden_dim)
-    DMA_BYTES, DMA_ELEMS, K_SWZ_ROWS, K_SWZ_SHIFT = _arch_dma_params()
+    DMA_BYTES, DMA_ELEMS, _ARCH_SWZ_ROWS, _ARCH_SWZ_SHIFT = _arch_dma_params()
+
+    # ---- K/V swizzle: 8-element period, not the arch default's 4 ------------
+    # The arch default for gfx942 is (ROWS=16, SHIFT=2), i.e. the XOR term is
+    # `(row & 15) << 2` -- a multiple of 4. A 4-element run survives that
+    # (`(base+i) ^ X == (base^X)+i` when both are 4-aligned) but an 8-element
+    # one does not: for odd `row & 15`, bit 2 of X swaps the two halves. That
+    # caps the operand feed at `ds_read_b64` and is the only reason this kernel
+    # could not use `ds_read_b128`.
+    #
+    # (ROWS=8, SHIFT=3) makes X a multiple of 8, so an 8-element run survives.
+    # ROWS must drop to 8 at the same time: the XOR has to stay inside the row,
+    # and `15 << 3 = 120` would run past STRIDE=64 while `7 << 3 = 56` does not.
+    #
+    # Still conflict-free for the GEMM1/GEMM2 read, which is the one that
+    # matters. Row stride is head_dim = 64 elements = 32 dwords = exactly the
+    # bank count, so the row contributes nothing and the bank is set by the
+    # column alone. Lane (m, L) reads 8 elements at `(L*16 + h*8) ^ ((m&7)*8)`;
+    # over m = 0..15 that is 8 distinct starts, each a multiple of 4 dwords,
+    # covering all 32 banks twice, and over the four L groups every bank is hit
+    # exactly 8 times -- the conflict-free floor for 64 lanes x 4 dwords.
+    #
+    # This tile is written and read entirely within this kernel, so the swizzle
+    # is private to it; `_arch_dma_params` still supplies the DMA width.
+    K_SWZ_ROWS, K_SWZ_SHIFT = _ARCH_SWZ_ROWS, _ARCH_SWZ_SHIFT
+    # V gets its OWN swizzle, 8-aligned so a b128 run survives the XOR.
+    # K keeps the arch default: widening K's period costs 2.6 ms on the
+    # GEMM3 gather, and the gather never reads V, so V pays none of it.
+    V_SWZ_ROWS, V_SWZ_SHIFT = 8, 3
+    B128_ELEMS = 8
+    CHUNKS_PER_B128 = B128_ELEMS // MFMA_LANE_K   # 2 chunks per wide read
+    PACK_DWORDS = MFMA_LANE_K // 2                # bf16: 4 elements = 2 dwords
 
     elem_dtype = _dtype_to_elem_type(dtype_str)
     has_window = max_attn_len > 0
@@ -463,6 +494,12 @@ def build_hstu_attention_bwd_dq_pp(
             (BLOCK_N, STRIDE // MFMA_LANE_K, MFMA_LANE_K),
             (STRIDE, MFMA_LANE_K, 1),
         )
+        # Same storage, viewed 8 elements (one b128) at a time for the GEMM1 /
+        # GEMM2 operand feed. See `read_operand`.
+        wide_layout = fx.make_layout(
+            (BLOCK_N, STRIDE // B128_ELEMS, B128_ELEMS),
+            (STRIDE, B128_ELEMS, 1),
+        )
         k_views = [
             lds.k0.view(tile_layout),
             lds.k1.view(tile_layout),
@@ -473,9 +510,35 @@ def build_hstu_attention_bwd_dq_pp(
             lds.v1.view(tile_layout),
             lds.v2.view(tile_layout),
         ]
+        v_wide = [lds.v0.view(wide_layout), lds.v1.view(wide_layout),
+                  lds.v2.view(wide_layout)]  # fmt: skip
 
         def k_swz_col(tile_row, col):
             return swz_col(tile_row, col, K_SWZ_ROWS, K_SWZ_SHIFT)
+
+        def v_swz_col(tile_row, col):
+            return swz_col(tile_row, col, V_SWZ_ROWS, V_SWZ_SHIFT)
+
+        def red_col(step):
+            """head-dim column that (chunk `step`, this lane) covers in GEMM1/2.
+
+            The MFMA hands lane (m = lane%16, L = lane/16) four reduction
+            elements per chunk. The natural mapping is `d = step*16 + L*4 + i`,
+            which puts a lane's four chunks 16 elements apart -- four separate
+            `ds_read_b64`. Transposing it to `d = L*16 + step*4 + i` makes them
+            ADJACENT, so chunks {0,1} and {2,3} are each one 8-element run.
+
+            head_dim is the REDUCTION dimension of GEMM1 (S^T = K.Q^T) and
+            GEMM2 (dA = V.dO^T), so permuting it is free as long as both
+            operands move together -- which is why this is the single source of
+            the mapping, used by the LDS read and by the register-resident
+            q_packs/do_packs alike. GEMM3 is untouched: there head_dim is the
+            OUTPUT dimension, it reads the same unmodified tile with its own
+            mapping, and the dQ epilogue does not move.
+            """
+            return lane_div_16 * fx.Int32(head_dim // MFMA_LANE_K) + fx.Int32(
+                step * MFMA_LANE_K
+            )
 
         # ---- Owned Q rows / bounds per query sub-tile ----
         q_wave_base = q_tile_idx * fx.Int32(BLOCK_M) + wave_id * fx.Int32(ROWS_PER_WAVE)
@@ -519,7 +582,7 @@ def build_hstu_attention_bwd_dq_pp(
 
         do_packs = []  # do_packs[ks][qg], B operand of GEMM2
         for ks in range_constexpr(DK_STEPS):
-            d_col = fx.Int32(ks * MFMA_DA_K) + lane_div_16 * fx.Int32(MFMA_DA_LANE_K)
+            d_col = red_col(ks)  # matches the LDS read's remap, see red_col
             per_qg = []
             for qg in range_constexpr(Q_OWNED_SUBTILES):
                 safe = q_in_bounds[qg].select(seq_start + q_rows[qg], seq_start)
@@ -569,7 +632,7 @@ def build_hstu_attention_bwd_dq_pp(
         c_dma_elems = fx.Int32(DMA_ELEMS)
         c_pairs_per_row = fx.Int32(PAIRS_PER_ROW)
 
-        def make_dma(tensor, base_byte_off, dst_views, swizzled):
+        def make_dma(tensor, base_byte_off, dst_views, swz_fn):
             # num_records spans the whole tensor, and the row clamp below folds
             # every out-of-range row onto token 0. That is deliberately NOT the
             # dV/dK twin's seq-len-bounded descriptor: an out-of-range
@@ -587,7 +650,7 @@ def build_hstu_attention_bwd_dq_pp(
                 row = pair // c_pairs_per_row
                 col = (pair % c_pairs_per_row) * c_dma_elems
                 rows.append(row)
-                gcols.append(k_swz_col(row, col) if const_expr(swizzled) else col)
+                gcols.append(swz_fn(row, col) if const_expr(swz_fn is not None) else col)
             # The DMA destination must be wave-uniform in an SGPR, so it is the
             # one LDS address that still goes through `inttoptr` -- that is how
             # `m0` is written. One base per slot, so the slot never becomes a
@@ -616,8 +679,8 @@ def build_hstu_attention_bwd_dq_pp(
 
         # K is column-swizzled for the MFMA reads; V stays row-major, exactly as
         # in the shipping kernel.
-        dma_k = make_dma(k, k_base_byte_offset, k_views, True)
-        dma_v = make_dma(v, k_base_byte_offset, v_views, SWIZZLE_V)
+        dma_k = make_dma(k, k_base_byte_offset, k_views, k_swz_col)
+        dma_v = make_dma(v, k_base_byte_offset, v_views, v_swz_col)
 
         def k_zero(slot):
             """Zero the one K slot trip 0's GEMM3 reads but no DMA ever fills.
@@ -637,7 +700,7 @@ def build_hstu_attention_bwd_dq_pp(
         # g 0..3   GEMM3 dQ: B = K[kv, hc] tile i-1 (gather)  A = ds_prev (reg)
         # g 4..7   GEMM1 S^T: A = K[kv, d]  tile i            B = q_packs  (reg)
         # g 8..11  GEMM2 dA : A = V[kv, d]  tile i            B = do_packs (reg)
-        def read_operand(g, k_cur, k_prev):
+        def read_operand(g, k_cur, k_prev, halves):
             if const_expr(g < HC_CHUNKS):
                 # GEMM3's B operand wants B[k = kv, n = hc]: lane (m = lane%16,
                 # grp = lane/16) supplies hc = c*16 + lane%16 at the four kv
@@ -662,6 +725,9 @@ def build_hstu_attention_bwd_dq_pp(
                 return Vec.from_elements(elems, elem_dtype).ir_value()
             row = lane_mod_16
             if const_expr(g < 2 * HC_CHUNKS):
+                # GEMM1 stays on `ds_read_b64`. Widening it needs an 8-element
+                # swizzle period, and that measured +2.6 ms on the GEMM3 gather
+                # -- more than the wider read saves. See the K_SWZ note.
                 col = fx.Int32((g - HC_CHUNKS) * MFMA_QK_K) + lane_div_16 * fx.Int32(
                     MFMA_QK_LANE_K
                 )
@@ -671,13 +737,23 @@ def build_hstu_attention_bwd_dq_pp(
                     .load()
                     .ir_value()
                 )
-            col = fx.Int32((g - 2 * HC_CHUNKS) * MFMA_DA_K) + lane_div_16 * fx.Int32(
-                MFMA_DA_LANE_K
-            )
-            view = v_views[k_cur]
-            if const_expr(SWIZZLE_V):
-                col = k_swz_col(row, col)
-            return view[row, col // fx.Int32(MFMA_DA_LANE_K), None].load().ir_value()
+            # GEMM2's V tile is NOT swizzled, so a lane's four chunks are one
+            # 16-element run under `red_col` and two `ds_read_b128` replace four
+            # `ds_read_b64` -- with none of the swizzle cost GEMM1 would pay.
+            # One wide load serves TWO operand groups; `halves` memoises at
+            # TRACE time because the window brackets every unit with
+            # `sched_barrier(0)` and the backend cannot CSE across those.
+            c = g - 2 * HC_CHUNKS
+            h, sub = c // CHUNKS_PER_B128, c % CHUNKS_PER_B128
+            key = (h, k_cur)
+            if key not in halves:
+                pos = v_swz_col(row, red_col(h * CHUNKS_PER_B128))
+                halves[key] = Vec(
+                    v_wide[k_cur][row, pos // fx.Int32(B128_ELEMS), None].load()
+                ).bitcast(fx.Int32)
+            v = halves[key]
+            words = [v[sub * PACK_DWORDS + i] for i in range_constexpr(PACK_DWORDS)]
+            return Vec.from_elements(words, fx.Int32).bitcast(elem_dtype).ir_value()
 
         def fmul_scalar(a, b):
             """Multiply that the backend cannot fold into `v_pk_mul_f32`.
@@ -891,10 +967,14 @@ def build_hstu_attention_bwd_dq_pp(
             # occupant has not been consumed yet, which is silently wrong.
             # Keyed by step, the reuse distance is exactly W+1 against a W
             # lookahead, so every W is correct.
+            # One memo per M phase: the wide loads it caches are only valid
+            # for this phase's `k_cur`, and a stale entry would feed the
+            # previous tile's data to the MFMAs.
+            halves = {}
             win = [None for _ in range_constexpr(PREFETCH_W + 1)]
             for _s in range_constexpr(PREFETCH_W):
                 win[_s % (PREFETCH_W + 1)] = read_operand(
-                    GROUP_ORDER[_s], k_cur, k_prev
+                    GROUP_ORDER[_s], k_cur, k_prev, halves
                 )
 
             for step in range_constexpr(NUM_OPERAND_GROUPS):
@@ -917,7 +997,7 @@ def build_hstu_attention_bwd_dq_pp(
                 sn = step + PREFETCH_W
                 if const_expr(sn < NUM_OPERAND_GROUPS):
                     win[sn % (PREFETCH_W + 1)] = read_operand(
-                        GROUP_ORDER[sn], k_cur, k_prev
+                        GROUP_ORDER[sn], k_cur, k_prev, halves
                     )
 
                 # The DMA fire is spread through the burst's slack; it is VMEM,
