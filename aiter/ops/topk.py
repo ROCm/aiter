@@ -830,8 +830,7 @@ def decode_adaptive_width(width: int, max_row_len: int) -> int:
     take the same value: gating on one length and configuring for another is
     how a band admits a shape that then runs the wrong kernel for it.
 
-    `max_row_len` must be at least every `seq_lens` entry; if not, the result is
-    wrong. `top_k_per_row_decode` holds the full contract. It is required here:
+    `top_k_per_row_decode` holds the `max_row_len` contract. It is required here:
     the gate declines the adaptive path when the caller states no bound (see
     `decode_backend_for_call`), so `None` reaching this function is a bug. The
     physical width is not a fallback, because the bands were admitted assuming
@@ -966,21 +965,14 @@ def top_k_per_row_decode(
     with -1 and the score with -inf, so the padding sorts below every real
     candidate and a consumer that ranks these scores needs no extra mask.
 
-    `max_row_len` is an upper bound on every entry of `seqLens`, for callers
-    whose `logits` is a context-sized buffer that decode only partly fills. It
-    is what opts a call into the adaptive path, whose kernel is configured from
-    it rather than from the physical width. `None` means the caller states no
-    bound, and the gate then **declines the adaptive path only**, leaving the
-    call on the kernel it runs without this argument. The caller assembling the
-    batch already knows the value: it is `max(seqLens)`.
+    `max_row_len` is an upper bound on every `seqLens` entry, for a `logits`
+    buffer sized to a maximum context that decode only partly fills. Stating it
+    opts the call into the adaptive path; `None` declines that path only.
 
-    **It is a guarantee, not a hint.** Some of what it selects is compiled in,
-    so a bound below the longest live row does not merely give up performance,
-    it launches a kernel that cannot read those rows to the end and returns
-    wrong indices. It cannot be checked here: `seqLens` is device-resident and
-    reading it would sync, which this path may be inside a graph capture for.
-    Pass `None` rather than an estimate; `None` declines, an estimate can be
-    wrong.
+    It sizes the kernel, never the read: rows are still read to `seqLens`. A
+    bound below a live row stays exact but runs slower; one far above builds a
+    larger kernel than needed. Under graph capture pass the model's maximum
+    context, since a bound that picks a new config compiles on its first call.
 
     Packed rows: ``logits`` is a flat buffer, row r's scores at element
     ``row_starts[r]`` [numRows] i32 (``stride0`` / ``stride1`` unused), the

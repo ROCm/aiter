@@ -551,18 +551,9 @@ def topk_select(
             Weaker than ``tie`` and cheaper than it: it only excludes ``plain``,
             keeping the small-k selector that ``tie='low'`` has to give up. Costs
             up to 1.9x where ``plain`` would have won.
-        max_row_len: an upper bound on every entry of ``end``, for an ``input``
-            sized to a maximum context that a given call only partly fills. It
-            opts a call into the adaptive decode kernel, which is then sized
-            from the live length rather than from the buffer -- worth up to
-            1.21x median on a 1M buffer. ``None`` declines that one kernel and
-            moves nothing else: the outer selector (``topk_select_backend``)
-            and the other decode kernels read the physical width either way.
-            It never changes a result.
-
-            **A guarantee, not a hint**: part of what it selects is compiled in,
-            so a value below the longest live row returns wrong indices rather
-            than merely slower ones. ``None``, the default, is always correct.
+        max_row_len: an upper bound on every entry of ``end``. It opts the call
+            into the adaptive decode kernel and changes only its speed, never
+            the result (see ``top_k_per_row_decode``). ``None`` declines it.
 
     Returns:
         ``(values, indices)``; ``values`` is None when ``return_value`` is False.
@@ -585,12 +576,6 @@ def topk_select(
     rows, width = input.shape
     if not 1 <= topk <= width:
         raise ValueError(f"topk must be in [1, {width}], got {topk}")
-    if end is None and max_row_len is not None and max_row_len < width:
-        raise ValueError(
-            f"max_row_len={max_row_len} is below width={width}, which every row "
-            "has when end is omitted"
-        )
-
     row_lens = _full_rows(rows, width, input.device) if end is None else end
     if row_lens.shape != (rows,) or row_lens.dtype != torch.int32:
         raise ValueError(f"end must be int32 [{rows}], got {tuple(row_lens.shape)}")

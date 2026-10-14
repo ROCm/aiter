@@ -565,7 +565,7 @@ def test_top_k_per_row_decode_bounded_graph(
             *call_args, k=top_k, stable=stable, max_row_len=context_len, **call_kw
         )
 
-    # Compile outside the capture, which cannot record a JIT build.
+    # Warm up outside the capture so the build is not in the captured time.
     side = torch.cuda.Stream()
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
@@ -921,6 +921,43 @@ def test_adaptive_row_past_width(card):
             masked, indices, torch_indices, row_starts, row_ends, top_k, stable=stable
         ), f"row past width mismatch at {cell}"
     print("[adaptive_row_past_width] PASS")
+
+
+def test_adaptive_bound_below_rows(card):
+    """A `max_row_len` below the live rows only shrinks the config; rows are still
+    read to `seq_lens`, so the planted top k past the bound are found."""
+    for rows, width, top_k, stable in adaptive_band_cells(card):
+        seq_lens = torch.full((rows,), width, dtype=torch.int32, device="cuda")
+        logits = create_planted_logits(seq_lens, width, top_k)
+        torch_indices = logits.topk(top_k, dim=-1)[1]
+        row_starts = torch.zeros(rows, dtype=torch.int32, device="cuda")
+        for bound in sorted({top_k + 1, max(top_k + 1, width // 4)}):
+            indices = torch.empty((rows, top_k), dtype=torch.int32, device="cuda")
+            flydsl_decode_host._decode_with_backend(
+                logits,
+                1,
+                seq_lens,
+                indices,
+                rows,
+                *logits.stride(),
+                top_k,
+                stable,
+                None,
+                topk.BACKEND_ADAPTIVE,
+                bound,
+            )
+            torch.cuda.synchronize()
+            cell = f"rows={rows} width={width} k={top_k} stable={stable} bound={bound}"
+            assert compare_topk_results(
+                logits,
+                indices,
+                torch_indices,
+                row_starts,
+                seq_lens,
+                top_k,
+                stable=stable,
+            ), f"bound below rows mismatch at {cell}"
+    print("[adaptive_bound_below_rows] PASS")
 
 
 def test_adaptive_nan_ranks_first(card):
@@ -1413,6 +1450,7 @@ def run_adaptive():
     test_decode_bound_entry_points(card)
     test_adaptive_compact_garbage(card)
     test_adaptive_row_past_width(card)
+    test_adaptive_bound_below_rows(card)
     test_adaptive_nan_ranks_first(card)
     test_adaptive_ordered_early_stop(card)
     test_adaptive_compact_cells(card)
