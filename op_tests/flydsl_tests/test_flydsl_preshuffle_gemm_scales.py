@@ -78,9 +78,7 @@ def test_wrong_length_scale_raises():
 
 
 BLOCKSCALE_CONFIGS = [
-    (m, 2048, k, 32, 128, 1)
-    for m in (1, 4, 16)
-    for k in (2176, 7168)
+    (m, 2048, k, 32, 128, 1) for m in (1, 4, 16) for k in (2176, 7168)
 ] + [
     (1, 2048, 2176, 32, 128, 6),
     (4, 2048, 7168, 32, 256, 1),
@@ -90,8 +88,12 @@ BLOCKSCALE_CONFIGS = [
 ]
 
 
-@pytest.mark.parametrize("m,n,k,tm,tk,sk", BLOCKSCALE_CONFIGS)
-def test_blockscale(m, n, k, tm, tk, sk):
+@pytest.mark.parametrize(
+    "m,n,k,tm,tk,sk,tn",
+    [(*config, 64) for config in BLOCKSCALE_CONFIGS]
+    + [(4, 256, 256, 32, 128, 1, tn) for tn in (16, 32, 128)],
+)
+def test_blockscale(m, n, k, tm, tk, sk, tn):
     from aiter.ops.flydsl.gemm_kernels import flydsl_preshuffle_gemm_a8
 
     g = torch.Generator(device="cuda").manual_seed(123)
@@ -118,7 +120,7 @@ def test_blockscale(m, n, k, tm, tk, sk):
             ws,
             out,
             tm,
-            64,
+            tn,
             tk,
             0,
             0,
@@ -146,9 +148,7 @@ def test_gfx942_async_copy_raises():
     aq, xs, wq, ws, _ = _make(1, N, K)
     out = torch.empty((1, N), device="cuda", dtype=dtypes.bf16)
     with pytest.raises(ValueError, match="LDS-direct loads unavailable on gfx942"):
-        flydsl_preshuffle_gemm_a8(
-            aq, wq, xs, ws, out, 32, 64, 128, use_async_copy=1
-        )
+        flydsl_preshuffle_gemm_a8(aq, wq, xs, ws, out, 32, 64, 128, use_async_copy=1)
 
 
 @pytest.mark.parametrize(

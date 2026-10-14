@@ -641,12 +641,19 @@ def compile_preshuffle_gemm(
             )
             zero_padding(frag_B_stages[stage], k_global)
 
+        def _epi_read1(tiles, idx, elem_ty, atom):
+            r = fx.make_rmem_tensor(fx.make_layout(1, 1), elem_ty)
+            fx.copy(atom, fx.slice(tiles, (None, fx.Int32(idx))), r)
+            return fx.Vector(fx.memref_load_vec(r))[0]
+
         if const_expr(is_blockscale):
             frag_blk = thr_mma.make_fragment_C(tC)
-            bs_bx_m = bid_x * tile_m
-            bs_by_n = bid_y * tile_n
-            bs_wave = tid // 64
-            bs_lane_div_16 = (tid % 64) // 16
+            bs_rows = thr_mma.partition_C(
+                fx.make_view(0, fx.make_layout((tile_m, tile_n), (1, 0)))
+            )
+            bs_cols = thr_mma.partition_C(
+                fx.make_view(0, fx.make_layout((tile_m, tile_n), (0, 1)))
+            )
             bs_a_elems = fx.Int32(i32_m) * scale_k
             bs_b_elems = ((N + 127) // 128) * scale_k
             bs_a = fx.logical_divide(
@@ -665,36 +672,30 @@ def compile_preshuffle_gemm(
             )
             bs_copy = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
 
-            def bs_read(tiles, idx):
-                r = fx.make_rmem_tensor(fx.make_layout(1, 1), fx.Float32)
-                fx.copy(bs_copy, fx.slice(tiles, (None, fx.Int32(idx))), r)
-                return fx.Float32(Vec(fx.memref_load_vec(r))[0])
-
             def block_scale_vec(kb):
                 safe_kb = kb
                 if const_expr(is_ragged):
                     safe_kb = (kb < scale_k).select(kb, fx.Int32(0))
-                s_b = []
-                for ni in range_constexpr(num_acc_n):
-                    col = bs_by_n + (ni * num_waves + bs_wave) * 16
-                    idx = fx.Int32(col // 128) * scale_k + safe_kb
-                    idx = (col < N).select(idx, fx.Int32(bs_b_elems))
-                    s_b.append(bs_read(bs_b, idx))
-                s_a = []
-                for mi in range_constexpr(m_repeat):
-                    rows = []
-                    # M need not be divisible by four: each K block starts at kb*M.
-                    for ii in range_constexpr(4):
-                        row = bs_bx_m + mi * 16 + bs_lane_div_16 * 4 + ii
-                        idx = safe_kb * fx.Int32(i32_m) + fx.Int32(row)
-                        idx = (row < i32_m).select(idx, bs_a_elems)
-                        rows.append(bs_read(bs_a, idx))
-                    s_a.append(Vec.from_elements(rows, fx.Float32))
                 elems = []
+                coord_order = fx.make_ordered_layout(bs_rows.shape, 0)
                 for p in range_constexpr(acc_size):
-                    ni = p // (m_repeat * 4)
-                    mi = (p // 4) % m_repeat
-                    scale = s_a[mi][p % 4] * s_b[ni]
+                    coord = fx.idx2crd(p, coord_order)
+                    row = bid_x * tile_m + fx.Int32(
+                        fx.get_scalar(fx.get_iter(bs_rows))
+                        + fx.get_scalar(fx.crd2idx(coord, bs_rows.layout))
+                    )
+                    col = bid_y * tile_n + fx.Int32(
+                        fx.get_scalar(fx.get_iter(bs_cols))
+                        + fx.get_scalar(fx.crd2idx(coord, bs_cols.layout))
+                    )
+                    # Each K block starts at kb*M, including ragged M.
+                    a_idx = safe_kb * i32_m + row
+                    a_idx = (row < i32_m).select(a_idx, bs_a_elems)
+                    b_idx = (col // 128) * scale_k + safe_kb
+                    b_idx = (col < N).select(b_idx, fx.Int32(bs_b_elems))
+                    scale = _epi_read1(bs_a, a_idx, fx.Float32, bs_copy) * _epi_read1(
+                        bs_b, b_idx, fx.Float32, bs_copy
+                    )
                     if const_expr(is_ragged):
                         scale = (kb < scale_k).select(scale, fx.Float32(0.0))
                     elems.append(scale)
@@ -867,11 +868,6 @@ def compile_preshuffle_gemm(
                 arg, max_size=max_size, num_records_bytes=num_records_bytes
             )
             return fx.logical_divide(view, fx.make_layout(tile_elems, 1))
-
-        def _epi_read1(tiles, idx, elem_ty, atom):
-            r = fx.make_rmem_tensor(fx.make_layout(1, 1), elem_ty)
-            fx.copy(atom, fx.slice(tiles, (None, fx.Int32(idx))), r)
-            return fx.Vector(fx.memref_load_vec(r))[0]
 
         def load_epi_operands():
             s_a = s_b = bias = None
