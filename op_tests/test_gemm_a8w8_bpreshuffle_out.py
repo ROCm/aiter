@@ -381,12 +381,21 @@ def run_torch(xq, wq, x_scale, w_scale):
     return (x @ w.t()).to(dtypes.bf16)
 
 
+# Kimi-K3 routed_expert_hidden_size: width of the MoE latent that precedes the
+# shared-expert output in SGLang's one-collective [latent | shared] buffer.
+KIMI_K3_LATENT = 3584
+
+
 @benchmark()
 def bench_out(m, n, k):
     xq, wq, x_scale, w_scale = _quantized(m, n, k)
     wq_shuffled = shuffle_weight(wq, layout=(16, 16))
     ref = run_torch(xq, wq, x_scale, w_scale)
-    out = torch.empty((m, n), dtype=dtypes.bf16, device="cuda")
+    # As in SGLang's Kimi-K3 ROCm MoE: out is a dense view past the latent in a
+    # caller-owned flat buffer, buf[M * latent:].view(M, N).
+    latent_numel = m * KIMI_K3_LATENT
+    buf = torch.empty(latent_numel + m * n, dtype=dtypes.bf16, device="cuda")
+    out = buf[latent_numel:].view(m, n)
 
     def run_out():
         aiter.gemm_a8w8_bpreshuffle_out(out, xq, wq_shuffled, x_scale, w_scale)
@@ -399,7 +408,12 @@ def bench_out(m, n, k):
         "bpreshuffle_out": run_out,
     }
     flops = 2 * m * n * k
-    nbytes = m * k * xq.element_size() + n * k * wq.element_size() + m * n * 2
+    nbytes = (
+        m * k * xq.element_size()
+        + n * k * wq.element_size()
+        + (m + n) * x_scale.element_size()
+        + m * n * out.element_size()
+    )
 
     ret = {"gfx": get_gfx(), "backend": _backend(m, n, k)}
     for name, fn in candidates.items():
@@ -427,17 +441,20 @@ def main():
     )
     parser.add_argument(
         "-m",
+        "--m",
         type=int,
         nargs="*",
         default=[1, 16, 64, 256, 1024, 4096],
         help="M (tokens). e.g.: -m 1 4 16",
     )
+    # (7168, 768) is the Kimi-K3 shared-expert down projection at TP=8:
+    # N = hidden_size 7168, K = num_shared_experts 2 * moe_intermediate_size 3072 / 8.
     parser.add_argument(
         "-s",
         "--nk",
         type=dtypes.str2tuple,
         nargs="*",
-        default=[(4096, 4096), (7168, 2048), (2112, 7168), (8192, 1024)],
+        default=[(7168, 768), (4096, 4096), (7168, 2048), (2112, 7168), (8192, 1024)],
         help="N,K pairs. e.g.: -s 4096,4096",
     )
     args = parser.parse_args()
