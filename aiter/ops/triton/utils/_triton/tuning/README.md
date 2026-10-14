@@ -95,6 +95,13 @@ carries keys that `DEFAULT.json` does not have are those stripped and the rest p
 (`dropped_keys` in the record). The numbers include dispatch gaps and both split-K kernels, so
 they are not comparable with the old rocprof logs.
 
+`--screen X` makes a far-off candidate cheap: after the first warm-up replay, one timed replay
+decides. A candidate slower than X times the fastest fully timed record of its M stops there,
+and that replay is its time (`screened` in the record). Every candidate is still compiled and
+timed; only the 25-replay measurement is kept for the ones that can win. The baseline and the
+final round are always timed in full. `--screen 1.5` cuts the GPU time of a full space several
+times, because most of a brute-force space is more than 1.5x slower than its best.
+
 ## Results, resume, failures
 
 Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` (worker output in
