@@ -103,7 +103,9 @@ def workgroup_barrier(use_cluster=False):
     if use_cluster:
         cluster.cluster_barrier()
     else:
-        gpu.barrier()
+        # gpu.barrier()
+        rocdl.s_barrier_signal(WGP_BARRIER_ID)
+        rocdl.s_barrier_wait(WGP_BARRIER_ID)
 
 
 def pipeline_fence(outstanding=0, use_cluster=False):
