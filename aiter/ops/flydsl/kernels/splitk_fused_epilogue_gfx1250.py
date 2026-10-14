@@ -75,16 +75,33 @@ def emit_fused_splitk_epilogue(
     # Each scratch plane holds only the rotated peer rows, including on an M
     # tail; the output descriptor discards the invalid logical rows.
     partial_out = partial_base + fx.Int64(split_idx) * plane
-    layout = fx.make_layout((peer_m, c_lds_row), (c_lds_row, 1))
-    dst = fx.Tensor(fx.make_view(partial_out, layout))
-    store = fx.rocdl.make_tdm_atom(
-        dst,
-        [peer_m, tile_n],
-        strides=[fx.Int64(tile_n), None],
-        num_warps=block // 32,
-        cache_modifier=CPOL_STORE_DEVICE,
+    out_tile = (peer_m, tile_n)
+    dst = fx.Tensor(
+        fx.make_view(partial_out, fx.make_layout(out_tile, (fx.Int64(tile_n), 1)))
     )
-    fx.copy(store, fx.Tensor(fx.make_view(lds_partial, layout)), dst)
+    store, out_coord = fx.rocdl.cdna5.make_tiled_tdm_atom(
+        fx.rocdl.TensorStore(cache_modifier=CPOL_STORE_DEVICE),
+        dst,
+        fx.make_layout(out_tile, (c_lds_row, 1)),
+        out_tile,
+        num_warps=block // 32,
+    )
+    out_blk = fx.zipped_divide(out_coord, out_tile)[None, (0, None)]
+    # The size-1 rest keeps mode-0 the nested box tdm_partition cuts.
+    lds_box = fx.Tensor(
+        fx.make_view(
+            lds_partial,
+            fx.make_layout((out_tile, 1), ((c_lds_row, 1), peer_m * c_lds_row)),
+        )
+    )
+    tOs, tOg = fx.rocdl.cdna5.tdm_partition(
+        store,
+        fx.rocdl.wave_id(),
+        fx.make_layout(block // 32, 1),
+        lds_box,
+        out_blk,
+    )
+    fx.copy(store, tOs[None, 0], tOg[None, 0])
     fx.rocdl.s_wait_tensorcnt(0)
     cluster.cluster_barrier()
 
