@@ -1346,7 +1346,9 @@ def test_k1_wide_padded_page_does_not_alias():
 
     Doubling the page stride puts view page ``alias / 2`` on the byte at
     2^32. The view's packed byte count stays under 4 GiB, which is the
-    decision ``numel()`` would have made.
+    decision ``numel()`` would have made. A second view is the shared-pool
+    stride: 33 pages, with the last page just past 4 GiB, so the stride
+    itself is many times one page.
     """
     if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
         return
@@ -1410,6 +1412,44 @@ def test_k1_wide_padded_page_does_not_alias():
         )
         _assert_k1_block_ids(
             ref_ids, got, f"K1 wide padded page aliased page 0 at M={m}"
+        )
+
+    del parent, view
+    packed_cache = torch.zeros(
+        n_logical, page_size, 1, idx.head_dim, dtype=dtypes.bf16, device=device
+    )
+    packed_cache[far_logical].fill_(1)
+    pool = _widen_cache(packed_cache)
+    if pool.stride(0) <= 2 * page_elems:
+        raise AssertionError(
+            f"pool page stride {pool.stride(0)} is not larger than 2x the page"
+        )
+    span = span_bytes(pool)
+    packed = pool.numel() * pool.element_size()
+    if span <= (1 << 32) or packed > (1 << 32):
+        raise AssertionError(f"span {span} packed {packed} is not the wide-view case")
+    table = torch.zeros(1, n_logical, dtype=dtypes.i32, device=device)
+    table[0, far_logical] = far_logical
+    for m in (4, 16):
+        q = torch.ones(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+        qpos = torch.full((m,), context - 1, dtype=dtypes.i32, device=device)
+        slen = torch.full((1,), context, dtype=dtypes.i32, device=device)
+        token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+        ref_scores = qsa_indexer_scores(
+            q,
+            k_bar,
+            qpos,
+            slen,
+            token_to_req,
+            idx.compress_ratio,
+            score_scale=FLASH_NEXT_SCORE_SCALE,
+        )
+        ref_ids = qsa_topk_blocks(ref_scores, idx.block_budget)
+        got = qsa_indexer_block_ids(
+            q, pool, table, token_to_req, qpos, slen, heads=(4,)
+        )
+        _assert_k1_block_ids(
+            ref_ids, got, f"K1 pool page stride aliased page 0 at M={m}"
         )
 
 
