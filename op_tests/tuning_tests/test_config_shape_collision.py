@@ -279,6 +279,39 @@ class TestConfigShapeCollision(unittest.TestCase):
             "batched_gemm_a8w8_blockscale_mxscale_bpreshuffle_tuned",
         )
 
+    def test_mxscale_merge_legacy_and_group32_preserves_sources(self):
+        from pathlib import Path
+
+        name = "batched_gemm_a8w8_blockscale_mxscale_tuned"
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / "aiter/configs"
+            cfg.mkdir(parents=True)
+            (cfg / name.replace("tuned", "untuned")).with_suffix(".csv").write_text(
+                "gfx,b,m,n,k\n"
+            )
+            old, new = cfg / "old.csv", cfg / "new.csv"
+            old.write_text(
+                "gfx,b,m,n,k,kernelId,splitK,us\ngfx950,2,128,1024,4096,653,1,20\n"
+            )
+            new.write_text(
+                "gfx,b,m,n,k,w_scale_block,kernelId,splitK,us\n"
+                "gfx950,2,128,1024,4096,32x32,9653,1,22\n"
+            )
+            before = [p.read_bytes() for p in (old, new)]
+            try:
+                core.AITER_ROOT_DIR = tmp
+                merged = core.AITER_CONFIGS.update_config_files(f"{old}:{new}", name)
+                with open(merged, newline="") as f:
+                    rows = list(csv.DictReader(f))
+                self.assertEqual(
+                    {r["w_scale_block"] for r in rows}, {"32x32", "128x128"}
+                )
+                self.assertEqual(len(rows), 2)
+                self.assertEqual(before, [p.read_bytes() for p in (old, new)])
+            finally:
+                core.AITER_ROOT_DIR = self._tmp
+                _cache_clear()
+
     def test_bf16(self):
         self._check_family("AITER_CONFIG_GEMM_BF16", "bf16_tuned_gemm")
 

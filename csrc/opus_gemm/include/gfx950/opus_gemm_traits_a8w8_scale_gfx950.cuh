@@ -68,6 +68,33 @@ struct opus_gemm_a8w8_scale_traits_gfx950 {
     static constexpr int GROUP_K = opus::get<2>(GROUP{});
 
     static_assert(VEC_A == 16 / sizeof(D_A));
+
+    // MX blocks inside one MFMA's K extent, and why GROUP_K=32 costs this family
+    // no extra scale register: a 16x16x128 fragment hands each lane
+    // W_M*W_K/warp_size == 32 elements, exactly one MX block, so the lane
+    // supplies its own scale byte. The SF_PER_MFMA_K blocks of one MFMA are told
+    // apart by lane_id / W_M in the scale *address*, not by a wider register
+    // tile -- the same scheme the flatmm split-K traits below already use.
+    // At GROUP_K=128 SF_PER_MFMA_K is 1, the lane term is a literal 0 and
+    // SF_LANE_SCALES_PER_BK == B_K/GROUP_K, so the 128 path keeps the register
+    // count and the address it always had.
+    static_assert(W_K % GROUP_K == 0, "an MFMA K extent must hold whole scale blocks");
+    static constexpr int SF_PER_MFMA_K = W_K / GROUP_K;
+    static constexpr int SF_LANE_K_QUARTERS = opus::get_warp_size() / W_M;
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx950__)
+    static_assert(SF_LANE_K_QUARTERS % SF_PER_MFMA_K == 0,
+                  "lane quarters must divide evenly among an MFMA's scale blocks");
+#endif
+    // Clamped so the wave32 host pass (where this is never used, and where the
+    // quarters count is half) cannot make it zero and turn the divide below
+    // into a compile-time division by zero.
+    static constexpr int SF_LANE_K_DIV =
+        SF_LANE_K_QUARTERS >= SF_PER_MFMA_K ? SF_LANE_K_QUARTERS / SF_PER_MFMA_K : 1;
+    // Scale bytes one lane actually holds per K tile: the tile's blocks divided
+    // by the ones the lanes cover between them.
+    static constexpr int SF_LANE_SCALES_PER_BK = (B_K / GROUP_K) / SF_PER_MFMA_K;
+    static_assert(SF_LANE_SCALES_PER_BK >= 1);
+
     static constexpr int smem_linear_wave = opus::get_warp_size() * 16 / sizeof(D_A);
     static constexpr int smem_sub = smem_linear_wave / B_K;
     static constexpr int smem_m_rep = HALF_B_M / smem_sub;
@@ -78,8 +105,13 @@ struct opus_gemm_a8w8_scale_traits_gfx950 {
     static constexpr int b_buffer_load_insts = HALF_B_N * B_K / (BLOCK_SIZE * VEC_B);
     static constexpr int a_ds_read_insts = (E_M * E_K * W_M * W_K) / (opus::get_warp_size() * VEC_A);
     static constexpr int b_ds_read_insts = (E_N * E_K * W_N * W_K) / (opus::get_warp_size() * VEC_B);
-    static constexpr int sfa_buffer_load_insts = E_M * (B_K / GROUP_K);
-    static constexpr int sfb_buffer_load_insts = (HALF_B_N / GROUP_N) * (B_K / GROUP_K);
+    // Counted per lane, not per tile: at GROUP_K=32 the tile's extra K blocks are
+    // covered by the other lane quarters, not by extra loads on this one. These
+    // feed the steady-state vmcnt thresholds, so over-counting them would retire
+    // a wait early and release the barrier with A/B still in flight.
+    static constexpr int sfa_buffer_load_insts = E_M * SF_LANE_SCALES_PER_BK;
+    static constexpr int sfb_buffer_load_insts =
+        (HALF_B_N / GROUP_N) * SF_LANE_SCALES_PER_BK;
 };
 
 struct opus_gemm_scale_kargs_gfx950 {
@@ -202,9 +234,34 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int GROUP_M = opus::get<0>(GROUP{});
     static constexpr int GROUP_N = opus::get<1>(GROUP{});
     static constexpr int GROUP_K = opus::get<2>(GROUP{});
-    static_assert(GROUP_M == 1 && GROUP_N == 128 && GROUP_K == 128);
+    // A and B quantise on the same block: DSv4's 128, or MX's 32, on both axes.
+    static_assert(GROUP_M == 1);
+    static_assert(GROUP_N == 128 || GROUP_N == 32);
+    static_assert(GROUP_K == 128 || GROUP_K == 32);
     static_assert(B_K % GROUP_K == 0,
-                  "flatmm K tile must contain whole DSv4 scale blocks");
+                  "flatmm K tile must contain whole scale blocks");
+    // MX blocks inside one MFMA's K extent, and the reason GROUP_K=32 costs no
+    // extra scale instruction: a 16x16x128 fragment hands each lane
+    // W_M*W_K/warp_size == 32 elements, which is exactly one MX block, and the
+    // lane supplies its own scale byte. So the SF_PER_MFMA_K blocks of one MFMA
+    // are told apart by lane_id / W_M in the scale *address*, not by
+    // scale_op_sel -- that selects one byte per MFMA for the whole wave (see
+    // pack_e8m0x4's note). Measured, not assumed: a probe feeding the four
+    // quarters 2^0..2^3 on an all-ones 16x16x128 reads back 32*(1+2+4+8), not
+    // the 128 a shared byte would give. At GROUP_K=128 this is 1, every lane
+    // term below folds away, and the 128 path stays bit-identical.
+    static_assert(W_K % GROUP_K == 0);
+    static constexpr int SF_PER_MFMA_K = W_K / GROUP_K;
+    // One MFMA fragment splits its K over warp_size / W_M lane quarters, each
+    // owning W_K / that many elements -- 32 at W_K=128 on wave64, which is why
+    // GROUP_K=32 lands exactly one MX block per lane. SF_LANE_K_DIV is how many
+    // quarters share a scale, so the lane's block index is
+    // (lane_id / W_M) / SF_LANE_K_DIV, and at GROUP_K=128 the divisor is all
+    // four quarters and the term collapses to zero.
+    static constexpr int SF_LANE_K_QUARTERS = opus::get_warp_size() / W_M;
+    static_assert(SF_LANE_K_QUARTERS % SF_PER_MFMA_K == 0,
+                  "an MX block must not span part of a lane's K range");
+    static constexpr int SF_LANE_K_DIV = SF_LANE_K_QUARTERS / SF_PER_MFMA_K;
 
     // async group load geometry; fp8-specific B_K=128 path uses one MFMA per
     // LOAD_GROUP_K, unlike a16w16 flatmm where LOAD_GROUP_K=W_K*2.
@@ -222,7 +279,11 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int NUM_LOAD_GROUPS_PER_BK = B_K / LOAD_GROUP_K;
     static_assert(NUM_LOAD_GROUPS_PER_BM * LOAD_GROUP_M == B_M);
     static_assert(NUM_LOAD_GROUPS_PER_BN * LOAD_GROUP_N == B_N);
-    static_assert(NUM_LOAD_GROUPS_PER_BK == B_K / GROUP_K);
+    // Scale granularity is not load granularity. The two were the same number
+    // while GROUP_K == LOAD_GROUP_K == 128, and conflating them is the first
+    // thing a GROUP_K=32 instance trips over: its K tile carries SF_PER_MFMA_K
+    // times as many scales as it has A/B load groups.
+    static_assert(NUM_LOAD_GROUPS_PER_BK * SF_PER_MFMA_K == B_K / GROUP_K);
 
     static constexpr int COM_REP_M = B_M / (W_M * T_M);
     static constexpr int COM_REP_N = B_N / (W_N * T_N);
@@ -235,12 +296,54 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static_assert(!IS_TILE_N || (B_N % (W_N * T_N) == 0),
                   "tileN requires B_N divisible by W_N*T_N (=32)");
     static_assert(COM_REP_K == NUM_LOAD_GROUPS_PER_BK);
-    static_assert(B_N <= 2 * GROUP_N,
-                  "mxscale flatmm splitK supports up to two 128-column B scale blocks");
+    // B_N <= 2 * GROUP_N used to stand here. Nothing structural was behind it:
+    // every consumer loops static_for<N_SCALE_GROUPS> and addresses group ng at
+    // ng * stride_sfb, so the group count was already free. It recorded the range
+    // that had been exercised, and at GROUP_N=32 it would have capped B_N at 64.
     static_assert(GROUP_N % B_N == 0 || B_N % GROUP_N == 0,
-                  "B tile must align with 128-column B scale blocks");
+                  "B tile must align with the B scale blocks");
+    // Distinct scales a K tile holds, which is what the global buffers and the
+    // LDS panels are sized by -- SF_PER_MFMA_K times larger at GROUP_K=32.
     static constexpr int SCALES_PER_BK = B_K / GROUP_K;
+    // What one lane needs in registers: one byte per MFMA, whatever GROUP_K is,
+    // because the lane owns one MX block of every MFMA it issues. The two
+    // coincide at GROUP_K=128, which is why the pipeline sizes its scale vector
+    // by SCALES_PER_BK; at 32 that would over-allocate by SF_PER_MFMA_K and
+    // index past the lane's own bytes.
+    static constexpr int SF_LANE_SCALES_PER_BK = COM_REP_K;
+    static_assert(SCALES_PER_BK == SF_LANE_SCALES_PER_BK * SF_PER_MFMA_K,
+                  "T_K > 1 would break the one-block-per-lane-per-MFMA identity");
+    // How wide the per-lane scale fetch can vectorise. At GROUP_K=128 a lane's
+    // COM_REP_K bytes are the tile's whole K-scale run, contiguous, and this
+    // stays the single b32 load it has always been. At 32 they are the lane's
+    // own block out of each MFMA, so consecutive ones sit SF_PER_MFMA_K apart
+    // and the run is not vectorisable -- one ubyte load per MFMA instead. That
+    // stride is the buffer's, not the hardware's: a K order grouped by lane
+    // quarter would make them adjacent again.
+    static constexpr int SF_LANE_LOAD_VEC = SF_PER_MFMA_K == 1 ? SF_LANE_SCALES_PER_BK : 1;
     static constexpr int N_SCALE_GROUPS = (B_N + GROUP_N - 1) / GROUP_N;
+    // N subtiles sharing one B scale group: GROUP_N columns per group over W_N
+    // per subtile. T_N is deliberately absent. It used to be in this denominator
+    // and does not belong -- T_N partitions subtiles across consumer waves, it
+    // does not widen a subtile -- and the error was invisible while a tile held
+    // one group, because both forms then floor to 0.
+    static_assert(GROUP_N % W_N == 0, "a B scale group must be whole subtiles");
+    static constexpr int SFB_REP_N = GROUP_N / W_N;
+    // A consumer N-wave owns COM_REP_N contiguous subtiles, so it needs this
+    // many groups, starting at wave_id_n * COM_REP_N / SFB_REP_N. Holding only
+    // its own share is what lets the subtile loop keep indexing v_sfb locally.
+    static_assert(COM_REP_N % SFB_REP_N == 0 || SFB_REP_N % COM_REP_N == 0,
+                  "an N-wave must not straddle a partial B scale group");
+    static constexpr int SFB_GROUPS_PER_WAVE =
+        COM_REP_N >= SFB_REP_N ? COM_REP_N / SFB_REP_N : 1;
+    // The bound the old B_N <= 2 * GROUP_N was standing in for. What a finer
+    // GROUP_N really costs is v_sfb, one byte per (group, MFMA) in the lane:
+    // 2 bytes for today's widest 128-column kid, 8 for a B_N=128 tile at
+    // GROUP_N=GROUP_K=32. Sized against the lane's share, not SCALES_PER_BK,
+    // which is why separating the two mattered.
+    static_assert(SFB_GROUPS_PER_WAVE * SF_LANE_SCALES_PER_BK <= 64,
+                  "the B scale vector would cost more than 16 VGPRs a lane");
+
 
     static_assert(VEC_A == 16 / sizeof(D_A));
     static_assert(VEC_B == 16 / sizeof(D_B));
@@ -257,9 +360,90 @@ struct opus_gemm_a8w8_mxscale_flatmm_splitk_traits_gfx950 {
     static constexpr int per_block_iter_lds_size =
         (NUM_LOAD_GROUPS_PER_BM + NUM_LOAD_GROUPS_PER_BN)
         * NUM_LOAD_GROUPS_PER_BK * smem_per_group_load_size;
-    static constexpr int prefetch_k_iter = max_lds_size_per_wg / per_block_iter_lds_size;
+    // ---- SF_RING: the scale ring the producer stages -------------------------
+    // One slot per prefetch_k_iter K tile, each holding that tile's SFA rows and
+    // SFB groups. The point is that LDS stops scaling with K, which the
+    // whole-split panel could not do: its rows cost SFA_K_MAX/GROUP_K bytes
+    // each, four times as much at GROUP_K=32, and the large tiles asked for
+    // 168,960 to 185,344 of a CU's 163,840. A slot is SF_RING_SLOT bytes -- 528
+    // for the widest tile at 32/32 -- so the whole ring is a couple of KiB.
+    //
+    // Staged by the producer beside the A/B tiles rather than filled up front,
+    // which is what keeps it prefetched: the barrier that publishes a tile's
+    // A/B publishes its scales, so the prefetch distance and the synchronisation
+    // are the ones already there. No new barrier, which is the part that would
+    // have risked a hang rather than a wrong answer.
+    // Which staging a PRELOAD_SF_LDS kid gets. The whole-split panel cannot hold
+    // a GROUP_K=32 split, so those take the ring; GROUP_K=128 keeps the panel,
+    // untouched. Decided here rather than by a template flag on purpose: the
+    // codegen and every existing instantiation stay exactly as they are, and the
+    // gate is precisely "the kids the panel cannot serve".
+    static constexpr bool SF_USE_RING = SF_PER_MFMA_K > 1;
+    // The two producer waves share the fill, the same split a_buffer_load_insts
+    // makes with its slots / 2.
+    static constexpr int SF_RING_PROD_LANES = 2 * opus::get_warp_size();
+    // Widest per-lane chunk the prefetch depth can afford.
+    //
+    // Wider wastes fewer instructions on the small B side but pads more, and
+    // the padding is charged to every prefetch slot -- so the choice is not
+    // free, it trades vm instructions against depth. Tried widest-first, so a
+    // tile only pays the narrow form when its budget is genuinely tight:
+    // kid 9319 has 40,960 bytes for a 12,672-byte stage, where a 1,024-byte
+    // slot drops the depth to 2 and the pipeline needs 3.
+    //
+    // A chunk must also stay inside one row and keep its source offset
+    // naturally aligned, hence dividing the row width.
+    static constexpr int sf_ring_slot_for(int vec) {
+        const int chunk = SF_RING_PROD_LANES * vec;
+        return ((B_M / GROUP_M * SCALES_PER_BK + chunk - 1) / chunk
+                + (N_SCALE_GROUPS * SCALES_PER_BK + chunk - 1) / chunk) * chunk;
+    }
+    static constexpr int sf_ring_depth_for(int vec) {
+        return max_lds_size_per_wg / (per_block_iter_lds_size + sf_ring_slot_for(vec));
+    }
+    static constexpr int SF_RING_VEC =
+        (SCALES_PER_BK % 4 == 0 && sf_ring_depth_for(4) >= 3) ? 4
+        : (SCALES_PER_BK % 2 == 0 && sf_ring_depth_for(2) >= 3) ? 2
+        : 1;
+    static constexpr int SF_RING_CHUNK = SF_RING_PROD_LANES * SF_RING_VEC;
+    // Each side is padded to a whole number of chunks, and the two are separate
+    // because they come from different global buffers -- a lane's chunk must not
+    // span the boundary.
+    //
+    // The padding is what makes the instruction count exact. Predicating the
+    // tail instead would let a producer wave whose lanes are all out of range
+    // skip the instruction entirely, so the two producer waves would issue
+    // different numbers of vm loads while executing the same
+    // s_waitcnt_vmcnt(number<mb * p>) -- the wave that issued fewer would be
+    // allowing more in flight than it has accounted for, and barrier before its
+    // LDS writes landed. With padding every lane always issues; the out-of-range
+    // global reads return zero through the buffer's num_records bound and land
+    // in slot padding nobody reads.
+    static constexpr int SF_RING_A_BYTES =
+        (B_M / GROUP_M * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK
+        * SF_RING_CHUNK;
+    static constexpr int SF_RING_B_BYTES =
+        (N_SCALE_GROUPS * SCALES_PER_BK + SF_RING_CHUNK - 1) / SF_RING_CHUNK
+        * SF_RING_CHUNK;
+    static constexpr int SF_RING_SLOT = SF_RING_A_BYTES + SF_RING_B_BYTES;
+    // Counted rather than estimated because mb feeds every
+    // s_waitcnt_vmcnt(number<mb * p>) in the producer, and being off by one
+    // there is a race, not a wrong number.
+    static constexpr int sf_ring_load_insts =
+        SF_RING_A_BYTES / SF_RING_CHUNK + SF_RING_B_BYTES / SF_RING_CHUNK;
+
+    // A scale ring slot is charged to every prefetch slot, so the depth is
+    // solved against their sum rather than the ring being added afterwards.
+    // Added afterwards is exactly how the whole-split panel overran a CU:
+    // this division is integer, so the A/B staging already claims the whole
+    // budget and the slack it leaves can be nothing. SF_RING_SLOT does not
+    // depend on the depth, so there is no circularity.
+    static constexpr int prefetch_k_iter =
+        max_lds_size_per_wg / (per_block_iter_lds_size + (SF_USE_RING ? SF_RING_SLOT : 0));
     static_assert(prefetch_k_iter >= 3,
                   "flatmm splitK pipeline requires at least 3 LDS prefetch slots");
+    static constexpr int SF_RING_LDS = prefetch_k_iter * SF_RING_SLOT;
+
 
     static constexpr int a_buffer_load_insts = NUM_LOAD_GROUPS_PER_BM * NUM_LOAD_GROUPS_PER_BK * slots / 2;
     static constexpr int b_buffer_load_insts = NUM_LOAD_GROUPS_PER_BN * NUM_LOAD_GROUPS_PER_BK * slots / 2;

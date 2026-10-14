@@ -576,7 +576,12 @@ def resolve_a16w16_caller_candidate(
 # ---- gfx950 MXFP8 BMM tuned-row and heuristic policy ---------------------
 
 _MXSCALE_BMM_KID_OFFSET = 8000
-_MXSCALE_BMM_LOCAL_KID_MAX = 653
+# Upper end of the pre-globalisation id space a tuned CSV may still be written
+# in. Raised past 653 for the GROUP_N=GROUP_K=32 twins, which sit at their
+# mirror's id plus 1000. Still unambiguous: every local id stays below the 8000
+# offset, so widening the window only admits ids that would otherwise have been
+# rejected outright.
+_MXSCALE_BMM_LOCAL_KID_MAX = 1653
 _TUNED_PERF_COLUMNS = ("us", "tflops", "bw", "errRatio")
 _C_INT_MAX = (1 << 31) - 1
 
@@ -635,6 +640,9 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         kid = int(opus_kids.at[index])
         arch = str(df.at[index, "gfx"]).lower().split(":", 1)[0]
         try:
+            w_scale_block = df.at[index, "w_scale_block"]
+            _validate_mxscale_bmm_w_scale_block(w_scale_block)
+            _validate_mxscale_bmm_kid_group(arch, kid, w_scale_block)
             split_k = _parse_mxscale_bmm_tuned_split_k(df.at[index, "splitK"])
             batch, m, n, k = (
                 int(df.at[index, column]) for column in ("b", "m", "n", "k")
@@ -668,6 +676,8 @@ def _load_mxscale_bmm_tuned(libtype: str | None = None) -> dict:
         )
         df = df.loc[~invalid_opus_rows].copy()
 
+    # The same shape can have separate 128x128 and 32x32 launches. Keep the
+    # scale block in the key so lookup cannot return a kid for the other layout.
     shape_keys = ["gfx", "b", "m", "n", "k", "w_scale_block"]
     duplicate_shapes = df.duplicated(subset=shape_keys, keep=False)
     if duplicate_shapes.any():
@@ -686,8 +696,13 @@ def lookup_mxscale_bmm_config(
     w_scale_block: str = "128x128",
     libtype: str | None = None,
 ):
-    """Return the exact or existing padded-M tuned row for one shape and
-    weight-scale block (OPUS kernels read 128x128)."""
+    """Return the exact or existing padded-M tuned row for one shape.
+
+    ``w_scale_block`` is the block the caller's weight scales are in, and it
+    selects among kids rather than describing them: a row tuned for one block is
+    meaningless for the other. OPUS kernels read 128x128 and 32x32.
+    """
+    _validate_mxscale_bmm_w_scale_block(w_scale_block)
     gfx = get_gfx()
     tuned = _load_mxscale_bmm_tuned(libtype)
     row, padded_m = None, m
@@ -723,8 +738,40 @@ def lookup_mxscale_bmm_config(
     return row
 
 
-def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
+# The OPUS kids cover the square blocks; 1x32 and 1x128 in
+# MXSCALE_W_SCALE_BLOCKS describe A-scale layouts no kid is keyed on.
+_OPUS_W_SCALE_BLOCKS = ("128x128", "32x32")
+
+
+def _validate_mxscale_bmm_w_scale_block(w_scale_block: str) -> None:
+    if w_scale_block not in _OPUS_W_SCALE_BLOCKS:
+        raise ValueError(
+            f"w_scale_block must be one of {_OPUS_W_SCALE_BLOCKS}, "
+            f"got {w_scale_block!r}"
+        )
+
+
+def _mxscale_bmm_blocks(w_scale_block: str) -> tuple[int, int]:
+    n_block, _, k_block = str(w_scale_block).partition("x")
+    return int(n_block), int(k_block)
+
+
+def _validate_mxscale_bmm_kid_group(arch: str, kid: int, w_scale_block: str) -> None:
+    instance = get_kernel_instance(arch, "a8w8_mxscale_bmm", kid)
+    if instance is None or (instance.GROUP_N, instance.GROUP_K) != _mxscale_bmm_blocks(
+        w_scale_block
+    ):
+        raise ValueError(
+            f"MXFP8 BMM kid {kid} does not support w_scale_block={w_scale_block}"
+        )
+
+
+def _heuristic_mxscale_bmm_kid(
+    g: int, m: int, n: int, k: int, *, w_scale_block: str = "128x128"
+) -> int:
     """Choose a final global kid only when the tuned table has no usable row."""
+    _validate_mxscale_bmm_w_scale_block(w_scale_block)
+    offset = 1000 if w_scale_block == "32x32" else 0
 
     def divisible(value: int, divisor: int) -> bool:
         return value % divisor == 0
@@ -734,14 +781,14 @@ def _heuristic_mxscale_bmm_kid(g: int, m: int, n: int, k: int) -> int:
         and divisible(k, 128)
         and (m >= 2048 or (m >= 1024 and g >= 8))
     ):
-        return 8158 if 4096 <= k <= 8192 else 8150
+        return offset + (8158 if 4096 <= k <= 8192 else 8150)
     if m < 64:
-        return 8640 if divisible(n, 64) and divisible(k, 256) else 8653
+        return offset + (8640 if divisible(n, 64) and divisible(k, 256) else 8653)
     if m <= 256 and k <= 1024 and divisible(n, 32) and divisible(k, 256):
-        return 8320
+        return offset + 8320
     if divisible(n, 64) and divisible(k, 128):
-        return 8653
-    return 8000
+        return offset + 8653
+    return offset + 8000
 
 
 def resolve_a8w8_mxscale_bmm_plan(
@@ -749,9 +796,12 @@ def resolve_a8w8_mxscale_bmm_plan(
     m: int,
     n: int,
     k: int,
+    *,
+    w_scale_block: str = "128x128",
 ) -> tuple[int, int]:
-    """Resolve one final global kid/split pair for the high-level caller."""
-    config = lookup_mxscale_bmm_config(g, m, n, k)
+    """Resolve one final global kid/split pair for the caller's scale blocks."""
+    _validate_mxscale_bmm_w_scale_block(w_scale_block)
+    config = lookup_mxscale_bmm_config(g, m, n, k, w_scale_block=w_scale_block)
     libtype = config.get("libtype", "opus") if config is not None else "opus"
     if libtype != "opus":
         raise NotImplementedError(
@@ -761,6 +811,7 @@ def resolve_a8w8_mxscale_bmm_plan(
     if config is not None:
         try:
             kid = int(config["kernelId"])
+            _validate_mxscale_bmm_kid_group(get_gfx(), kid, w_scale_block)
             split_k = _parse_mxscale_bmm_tuned_split_k(config["splitK"])
             plan = _get_cached_a8w8_mxscale_bmm_plan(
                 get_gfx(),
@@ -788,7 +839,7 @@ def resolve_a8w8_mxscale_bmm_plan(
         else:
             return plan.resolved_kid, plan.abi_split_k
 
-    kid = _heuristic_mxscale_bmm_kid(g, m, n, k)
+    kid = _heuristic_mxscale_bmm_kid(g, m, n, k, w_scale_block=w_scale_block)
     return kid, 1
 
 
