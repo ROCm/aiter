@@ -22,11 +22,13 @@ from aiter.ops.mha import (
     flash_attn_func,
 )
 from aiter.ops.mha_v4 import (
+    MHA_V4_SPARSE_MODE,
     AttentionFormat,
     AttentionPack,
     AttentionScaleMode,
     mha_v4,
     mha_v4_kv_tile,
+    mha_v4_operands,
     mha_v4_packed,
     native_fp8_format,
     scale_modes_for_formats,
@@ -789,10 +791,21 @@ def load_block_mask_from_json(
 
 
 def kernel_block_sizes(kernel: str) -> tuple[int, int]:
-    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs
-    # below: 256x128 on gfx950 but 256x64 on gfx942.
+    # MHA v4's sparse tile is set by its manifest row, not by the Triton configs below, and the
+    # row is per recipe as well as per arch: on gfx950 BF16 and BF16/FP8 route on a 64-token block
+    # and the quantized recipes on 128, while gfx942 is 64 throughout. Only the BF16-QK recipes
+    # differ from the rest here, so per-tensor FP8 stands for every other mha4_ kernel.
     if kernel.startswith("mha4_"):
-        return 256, mha_v4_kv_tile()
+        bf16 = AttentionFormat.BF16
+        fp8 = native_fp8_format()
+        formats = {
+            "mha4_bf16": (bf16, bf16, bf16),
+            "mha4_bf16fp8": (bf16, bf16, fp8),
+        }.get(kernel, (fp8, fp8, fp8))
+        return 256, mha_v4_kv_tile(
+            mha_v4_operands(*formats, *scale_modes_for_formats(*formats)),
+            MHA_V4_SPARSE_MODE,
+        )
     if kernel == "sage_mxfp4":
         cfg = get_sage_fwd_configs_mxfp4()
     else:
