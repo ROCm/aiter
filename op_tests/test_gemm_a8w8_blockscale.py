@@ -26,7 +26,7 @@ from aiter.ops.shuffle import (
     shuffle_scale_blockscale_b,
     shuffle_weight,
 )
-from aiter.test_common import benchmark, checkAllclose, perftest
+from aiter.test_common import benchmark, checkAllclose, perftest, run_perftest
 from aiter.utility import fp4_utils
 
 block_shape = (128, 128)
@@ -62,19 +62,16 @@ def run_torch(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale(x, weight, x_scale, w_scale, dtype)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_bpreshuffle(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16):
     return aiter.gemm_a8w8_blockscale_bpreshuffle(
         x, weightshuffle, x_scale, w_scale, dtype
     )
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
 def run_gemm_abpreshuffle(
     x_shuffled, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16
 ):
@@ -83,7 +80,6 @@ def run_gemm_abpreshuffle(
     )
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
 def run_triton(x, weightshuffle, x_scale, w_scale, dtype=dtypes.bf16, backend=None):
     # Direct call into the triton preshuffle kernel, mirroring the dispatch in
     # gemm_a8w8_blockscale_bpreshuffle: reshape the (n, k) preshuffled weight to
@@ -115,8 +111,33 @@ def test_gemm(
     scale_init="auto",
     seed=0,
     apre=False,
+    num_iters=TEST_NUM_ITERS,
+    test_graph=False,
+    num_rotate=0,
+    graph_replays=1,
 ):
     ret = {}
+
+    def timed(tag, fn, *fn_args):
+        """run_perftest in this case's timing mode. Graph runs also record
+        CUDA-event wall time per call (launch gaps included), which the
+        profiler-summed ``us`` leaves out."""
+        stats = {}
+        out, us = run_perftest(
+            fn,
+            *fn_args,
+            num_iters=num_iters,
+            testGraph=test_graph,
+            num_rotate_args=num_rotate,
+            num_graph_replays=graph_replays,
+            perf_stats=stats,
+        )
+        ret.setdefault("rotate copies", stats["num_rotate_args"])
+        if test_graph:
+            ret[f"{tag} eager wall us"] = stats["eager_wall_us"]
+            ret[f"{tag} graph wall us"] = stats["graph_wall_us"]
+        return out, us
+
     block_shape_n, block_shape_k = block_shape
     scale_m = m
     scale_n = (n + block_shape_n - 1) // block_shape_n
@@ -167,7 +188,7 @@ def test_gemm(
         gemm_x_scale = x_scale_t if ck_preshuffle else x_scale
         gemm_w_scale = w_scale
     run_func = run_gemm_bpreshuffle if ck_preshuffle else run_gemm
-    b, avg_b = run_func(x, gemm_weight, gemm_x_scale, gemm_w_scale, dtype)
+    b, avg_b = timed("ck", run_func, x, gemm_weight, gemm_x_scale, gemm_w_scale, dtype)
 
     err_ck = checkAllclose(a, b, msg="ck", catastrophic_check=True)
     if ck_preshuffle and not use_flydsl_fp8_scale:
@@ -195,8 +216,14 @@ def test_gemm(
             x_apre[:m] = x
         else:
             x_apre = x
-        e, avg_e = run_gemm_abpreshuffle(
-            shuffle_mxfp8fp4_a(x_apre), gemm_weight, gemm_x_scale, w_scale, dtype
+        e, avg_e = timed(
+            "apre",
+            run_gemm_abpreshuffle,
+            shuffle_mxfp8fp4_a(x_apre),
+            gemm_weight,
+            gemm_x_scale,
+            w_scale,
+            dtype,
         )
         ret["apre us"] = avg_e
         ret["apre TFLOPS"] = m * n * k * 2 / avg_e / 1e6
@@ -207,7 +234,7 @@ def test_gemm(
     if not use_flydsl_fp8_scale:
         tag = "asm"
         weight_asm = shuffle_weight(weight, layout=(16, 16))
-        c, avg_c = run_asm(x, weight_asm, x_scale_t, w_scale, dtype)
+        c, avg_c = timed(tag, run_asm, x, weight_asm, x_scale_t, w_scale, dtype)
 
         err_asm = checkAllclose(a, c, msg=f"{tag}", catastrophic_check=True)
         ret[f"{tag} us"] = avg_c
@@ -219,7 +246,9 @@ def test_gemm(
         # Triton path requires a preshuffled weight. When not preshuffled we simply omit
         # these columns; pd.DataFrame NaN-fills them for those rows in the summary.
         if ck_preshuffle:
-            d, avg_d = run_triton(x, gemm_weight, x_scale_t, w_scale, dtype)
+            d, avg_d = timed(
+                "triton", run_triton, x, gemm_weight, x_scale_t, w_scale, dtype
+            )
             err_triton = checkAllclose(a, d, msg="triton", catastrophic_check=True)
             ret["triton us"] = avg_d
             ret["triton TFLOPS"] = m * n * k * 2 / avg_d / 1e6
@@ -250,7 +279,6 @@ def run_torch2(x, weight, x_scale, w_scale, dtype=dtypes.bf16):
     return out.to(dtype)
 
 
-@perftest(num_iters=TEST_NUM_ITERS)
 def run_asm(x, weight, x_scale, w_scale, dtype=dtypes.bf16, kernel_name=None):
     m, _k = x.shape
     n, _ = weight.shape
@@ -431,6 +459,40 @@ parser.add_argument(
         or --apre True False""",
 )
 parser.add_argument(
+    "--iters",
+    type=int,
+    default=TEST_NUM_ITERS,
+    help=f"""timed calls per kernel (run_perftest num_iters; default
+    {TEST_NUM_ITERS}). With --graph also the calls captured per graph.
+    e.g.: --iters 500""",
+)
+parser.add_argument(
+    "--graph",
+    action="store_true",
+    help="""also time via HIP graph replay (run_perftest testGraph). us stays
+    summed GPU kernel time per call (launch gaps excluded, as in eager);
+    the added "eager wall us" / "graph wall us" columns are CUDA-event wall
+    time per call, so their difference is the launch overhead removed.""",
+)
+parser.add_argument(
+    "--graph-replays",
+    type=int,
+    default=1,
+    help="""timed launches of each captured graph with --graph (run_perftest
+    num_graph_replays), after one untimed warm-up replay. Use >= 5 for
+    stable numbers: a single replay of short kernels can vary by ~20%%.
+    e.g.: --graph --graph-replays 10""",
+)
+parser.add_argument(
+    "--rotate",
+    type=int,
+    default=0,
+    help="""rotating input-buffer copies to defeat the L2 hot-cache
+    (run_perftest num_rotate_args); 0 = auto-size from L2 (capped at
+    --iters), 1 = no rotation. The count used is the "rotate copies" column.
+    e.g.: --rotate 1""",
+)
+parser.add_argument(
     "--csv",
     type=str,
     default=None,
@@ -460,6 +522,20 @@ parser.add_argument(
 )
 
 args = parser.parse_args()
+if args.iters < 2:
+    parser.error("--iters must be >= 2")
+if args.rotate < 0:
+    parser.error("--rotate must be >= 0")
+if args.graph_replays < 1:
+    parser.error("--graph-replays must be >= 1")
+if args.graph_replays > 1 and not args.graph:
+    parser.error("--graph-replays requires --graph")
+perf_mode = {
+    "num_iters": args.iters,
+    "test_graph": args.graph,
+    "num_rotate": args.rotate,
+    "graph_replays": args.graph_replays,
+}
 
 data_init_list = args.data_init or ["constant", "uniform"]
 scale_init_list = args.scale_init or ["constant", "auto"]
@@ -503,6 +579,7 @@ if args.csv is not None:
                             scale_init=scale_init,
                             seed=args.seed,
                             apre=apre,
+                            **perf_mode,
                         )
                         df.append(ret)
 else:
@@ -523,6 +600,7 @@ else:
                                 scale_init=scale_init,
                                 seed=args.seed,
                                 apre=apre,
+                                **perf_mode,
                             )
                             df.append(ret)
 

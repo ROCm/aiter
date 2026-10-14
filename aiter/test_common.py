@@ -53,7 +53,20 @@ def perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    num_graph_replays=1,
+    perf_stats=None,
 ):
+    """Time ``func`` and return ``(last output, avg us per call)``.
+
+    avg is the summed GPU kernel time per call from the torch profiler, so it
+    excludes launch gaps; with ``testGraph`` it is taken over
+    ``num_graph_replays`` replays of one graph holding ``num_iters`` calls.
+
+    ``perf_stats``: optional dict, filled with ``num_rotate_args`` (input
+    copies actually rotated) and, with ``testGraph``, ``eager_wall_us`` /
+    ``graph_wall_us``: CUDA-event wall time per call, launch gaps included.
+    """
+
     def decorator(func):
         def wrapper(*args, **kwargs):
             num = num_rotate_args
@@ -76,6 +89,8 @@ def perftest(
             rotate_args = [
                 (copy.deepcopy(args), copy.deepcopy(kwargs)) for _ in range(num - 1)
             ] + [(args, kwargs)]
+            if perf_stats is not None:
+                perf_stats["num_rotate_args"] = num
             run_iters(num_warmup, func, *args, **kwargs)
             torch.cuda.synchronize()
             if int(os.environ.get("AITER_LOG_MORE", "0")) or use_cuda_event:
@@ -114,15 +129,28 @@ def perftest(
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
                     data = run_iters_rotate(num_iters, func, rotate_args)
+                # The first replay of a fresh graph is slower (one-time setup);
+                # keep it out of the timing.
+                graph.replay()
+                torch.cuda.synchronize()
                 with tpf.profile(
                     activities=[tpf.ProfilerActivity.CPU, tpf.ProfilerActivity.CUDA],
                     profile_memory=True,
                     with_stack=True,
                     with_modules=True,
                 ) as prof:
-                    run_iters(1, graph.replay)
-                avg = get_trace_perf(prof, num_iters)
+                    run_iters(num_graph_replays, graph.replay)
+                avg = get_trace_perf(prof, num_iters * num_graph_replays)
                 logger.info(f"avg: {avg} us/iter with hipgraph")
+                if perf_stats is not None:
+                    perf_stats["eager_wall_us"] = wall_us_per_call(
+                        lambda: run_iters_rotate(num_iters, func, rotate_args),
+                        num_iters,
+                    )
+                    perf_stats["graph_wall_us"] = wall_us_per_call(
+                        lambda: run_iters(num_graph_replays, graph.replay),
+                        num_iters * num_graph_replays,
+                    )
 
             if os.environ.get("AITER_SMI_MONITOR", "0") == "1":
                 # Import lazily: normal library/test use has no amdsmi dependency.
@@ -229,6 +257,18 @@ def run_iters(num_iters, func, *args, **kwargs):
     return data
 
 
+def wall_us_per_call(fn, num_calls):
+    """CUDA-event wall time of ``fn()`` in us, divided by ``num_calls``."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    torch.cuda.synchronize()
+    start.record()
+    fn()
+    end.record()
+    end.synchronize()
+    return start.elapsed_time(end) * 1000 / num_calls
+
+
 def run_iters_rotate(num_iters, func, rotate_args):
     data = None
     num_rotate_args = len(rotate_args)
@@ -248,6 +288,8 @@ def run_perftest(
     num_rotate_args=0,
     needTrace=False,
     use_cuda_event=False,
+    num_graph_replays=1,
+    perf_stats=None,
     **kwargs,
 ):
     @perftest(
@@ -257,6 +299,8 @@ def run_perftest(
         num_rotate_args=num_rotate_args,
         needTrace=needTrace,
         use_cuda_event=use_cuda_event,
+        num_graph_replays=num_graph_replays,
+        perf_stats=perf_stats,
     )
     @wraps(func)
     def worker(*args, **kwargs):
