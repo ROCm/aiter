@@ -15,6 +15,9 @@ Every kernel function has the same layout: imports -> inputs -> call -> optional
   should_skip(config)    True for a candidate the kernel would reject: its own asserts, or a
                          buffer count its wrapper clamps so the candidate only repeats another
                          one. None when the kernel has no rule of its own.
+  check(out, *inputs)    optional 4th element: None when the output matches a torch reference,
+                         else the mismatch. The final round runs it on every candidate, so a
+                         fast config that computes wrong results never wins (output_check).
 
 K is the logical element count everywhere, as the input generators take it: fp4 tensors hold
 K // 2 bytes and the config files of fp4 families are named by the logical K.
@@ -169,6 +172,28 @@ def family_bounds(spec, backend, shape_nk):
     )
 
 
+def output_check(reference, atol, rtol):
+    """check(out, *inputs): None when out matches reference(*inputs), else the mismatch text.
+
+    The reference is computed once per input tuple.
+    """
+    expected = {}
+
+    def check(out, *inputs):
+        import torch
+
+        key = tuple(id(a) for a in inputs)
+        if key not in expected:
+            expected[key] = reference(*inputs)
+        try:
+            torch.testing.assert_close(out, expected[key], atol=atol, rtol=rtol)
+        except AssertionError as e:
+            return " ".join(str(e).split())[:300]
+        return None
+
+    return check
+
+
 def add_splitk_block_size(config, K):
     """Mutates config: the triton a16w16-style kernels read SPLITK_BLOCK_SIZE, which the JSON lacks.
 
@@ -265,7 +290,10 @@ def gemm_a16w16(shape, backend):
             return num_buffers > k_tiles - 2  # the wrapper clamps it there anyway
         return num_buffers > k_tiles  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    check = output_check(
+        lambda x, w, bias, y: torch.nn.functional.linear(x, w, bias), 1e-1, 1e-2
+    )
+    return call, (x, w, bias, y), should_skip, check
 
 
 @kernel(
@@ -310,7 +338,10 @@ def gemm_a16w16_persistent(shape, backend):
             return True  # the wrapper raises it to 2 anyway
         return num_buffers > k_tiles + 1  # the wrapper clamps it there anyway
 
-    return call, (x, w, bias, y), should_skip
+    check = output_check(
+        lambda x, w, bias, y: torch.nn.functional.linear(x, w, bias), 1e-1, 1e-2
+    )
+    return call, (x, w, bias, y), should_skip, check
 
 
 @kernel("GEMM-A16W16-ATOMIC", backend_kwarg=False)

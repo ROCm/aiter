@@ -47,7 +47,7 @@ def main(argv=None):
     print(f"backend {backend}, arch {arch}, shape {shape}, is_tuned {is_tuned}")
     print(f"config: {json.dumps(config)}")
 
-    call, inputs, _ = spec.setup(shape, backend)
+    call, inputs, *_ = spec.setup(shape, backend)
     copies = make_cold_copies(inputs, args.cold_mb)
     timing = time_with_cuda_graph(call, None, copies, args.calls, args.replays)
     print(

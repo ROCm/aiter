@@ -130,6 +130,13 @@ def parse_args(argv=None):
         help="stop a candidate after one replay when it is slower than this x the fastest "
         "record of its M (0: off); the final round always times fully",
     )
+    parser.add_argument(
+        "--verify",
+        type=int,
+        default=3,
+        help="final round: check each candidate's output against the kernel's reference "
+        "this many times; a wrong one cannot win (0: off)",
+    )
     parser.add_argument("--replays", type=int, default=25)
     parser.add_argument("--calls", type=int, default=24)
     parser.add_argument("--cold-mb", type=int, default=1024)
@@ -326,7 +333,7 @@ def run_worker(command, env, log_path, stall, setup_timeout, stop=STOP):
     return "failed" if ready or became_ready() else "setup_failed"
 
 
-def run_batch(spec, shape, backend, batch, out, gpu, args, screen):
+def run_batch(spec, shape, backend, batch, out, gpu, args, screen, verify=0):
     """One worker process on one GPU for these candidates; marks the candidate it died on."""
     # the M's compile-ahead list (a final round has none, so its workers compile on their own)
     pool = ["--pool", f"{out}.pre.todo.json"] if args.compile_procs else []
@@ -347,6 +354,8 @@ def run_batch(spec, shape, backend, batch, out, gpu, args, screen):
             str(args.cold_mb),
             "--screen",
             str(screen),
+            "--verify",
+            str(verify),
             *pool,
             "--configs",
             todo_file,
@@ -377,7 +386,7 @@ def run_batch(spec, shape, backend, batch, out, gpu, args, screen):
             print(f"  gpu {gpu}: {status}: {json.dumps(candidate)}", flush=True)
 
 
-def sweep_shard(spec, shape, backend, candidates, out, gpu, args, screen):
+def sweep_shard(spec, shape, backend, candidates, out, gpu, args, screen, verify=0):
     """Run every candidate of this shard that has no final record yet, in batches, on one GPU."""
     while not STOP.is_set():
         records = read_records(out)
@@ -393,7 +402,9 @@ def sweep_shard(spec, shape, backend, candidates, out, gpu, args, screen):
             f"running {min(len(todo), args.batch)}",
             flush=True,
         )
-        run_batch(spec, shape, backend, todo[: args.batch], out, gpu, args, screen)
+        run_batch(
+            spec, shape, backend, todo[: args.batch], out, gpu, args, screen, verify
+        )
 
 
 def sweep(spec, shape, backend, candidates, out, gpus, args):
@@ -426,15 +437,24 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
         ),
         key=lambda r: r["us"],
     )
-    fastest = [r["config"] for r in ok[:FINAL_ROUND_SIZE]]
     final_out = final_results_path(out)
     if os.path.exists(final_out):
         os.remove(final_out)
-    print(
-        f"  final round on gpu {gpu}: re-timing the baseline and the {len(fastest)} fastest",
-        flush=True,
-    )
-    sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args, 0)
+    # the next ten while every candidate so far computed wrong results (at most 100)
+    for start in range(0, min(len(ok), 10 * FINAL_ROUND_SIZE), FINAL_ROUND_SIZE):
+        batch = [r["config"] for r in ok[start : start + FINAL_ROUND_SIZE]]
+        print(
+            f"  final round on gpu {gpu}: re-timing the baseline and the fastest "
+            f"{start + 1}-{start + len(batch)}",
+            flush=True,
+        )
+        lead = [None] if start == 0 else []
+        sweep_shard(
+            spec, shape, backend, lead + batch, final_out, gpu, args, 0, args.verify
+        )
+        final = read_records(final_out).values()
+        if any(r["status"] == "ok" and not r.get("baseline") for r in final):
+            return
 
 
 def record_compile_timeout(log_path, out, todo_file, timeout):

@@ -50,7 +50,8 @@ here. Update this file in the same change as any behaviour change.
    `kpack` is dropped outside gfx942 and `persistent` always. After writing, clear both loader
    caches and re-resolve every swept M; `is_tuned` must be True, otherwise the previous file is
    restored. Bucket collisions are resolved before writing (largest M wins).
-6. Data contracts: a kernel function returns `(call, inputs, should_skip)`; a result
+6. Data contracts: a kernel function returns `(call, inputs, should_skip)` or, with a torch
+   reference, `(call, inputs, should_skip, check)` (`output_check`); a result
    record's fields are listed in the `harness.py` docstring; the plan JSON carries the family's
    `bounds`; the worker prints `ready` and one line per candidate for the driver's watchdog;
    the plan is kept per (arch, backend, kernel, shape) in the runs dir and the installer only
@@ -66,7 +67,9 @@ here. Update this file in the same change as any behaviour change.
    the baseline and the ten fastest candidates of the current plan on the first GPU into
    `<results>.final.jsonl`, with the same crash/hang recovery as the sweep; when that file exists
    the installer uses only it, so a later run (even on one GPU) always refreshes it, and an M timed
-   on several GPUs without it is skipped. Never two drivers on one GPU. `--compile-procs` workers
+   on several GPUs without it is skipped; the final round also checks each candidate's output
+   `--verify` times against the kernel's `check` and records a mismatch as `wrong`, which never
+   wins (it moves on to the next ten while all of them are wrong). Never two drivers on one GPU. `--compile-procs` workers
    (`harness.py --precompile --claim`) only compile, never launch, and run on `--compile-gpus`,
    which must not be timing GPUs because their input set-up runs kernels; timing workers get
    `--pool` and time what the pool has compiled first, so they never duplicate its compiles. `--screen X` stops a candidate after

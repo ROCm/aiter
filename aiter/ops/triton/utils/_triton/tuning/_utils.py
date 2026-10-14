@@ -7,7 +7,7 @@ import hashlib
 import json
 import os
 
-FINAL_STATUSES = ("ok", "error", "crashed", "hung", "skipped")
+FINAL_STATUSES = ("ok", "error", "crashed", "hung", "skipped", "wrong")
 TOP_BUCKET_M = 8192  # --all-buckets sweeps the family's M_LEQ buckets up to here
 
 

@@ -25,6 +25,8 @@ Record fields:
   us, us_min, us_max, tflops   per-launch time from graph replay (median, min, max)
   screened  true when one replay was already slower than --screen x the fastest record of
             this M: the candidate stopped there and us is that replay
+  wrong     status of a candidate whose output did not match the kernel's reference in one of
+            --verify launches (final round); error has the mismatch
   error     the exception text when status is error
   dur_s     wall time of the candidate
 """
@@ -142,6 +144,22 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25, abort_above
     torch.cuda.synchronize()
     times = sorted(timed_replay() for _ in range(replays))
     return Timing(times[len(times) // 2], times[0], times[-1], False)
+
+
+def verify_output(call, config, inputs, check, launches):
+    """The first mismatch of `launches` runs against the kernel's reference, or None.
+
+    Several launches, because a race in a kernel shows up only now and then.
+    """
+    import torch
+
+    for _ in range(launches):
+        out = call(copy.deepcopy(config), *inputs)
+        torch.cuda.synchronize()
+        wrong = check(out, *inputs)
+        if wrong:
+            return wrong
+    return None
 
 
 def compile_only(call, config, inputs):
@@ -369,6 +387,8 @@ def benchmark(
     cold_mb,
     screen,
     pool_todo=None,
+    verify=0,
+    check=None,
 ):
     keys, _, _ = load_defaults(spec, backend)
     pool = CompilePool(pool_todo) if pool_todo else None
@@ -434,6 +454,10 @@ def benchmark(
                     record["screened"] = True
                 elif screen:
                     fastest = min(fastest or timing.median, timing.median)
+                if verify and check is not None:
+                    wrong = verify_output(call, candidate, copies[0], check, verify)
+                    if wrong:
+                        record.update(status="wrong", error=wrong)
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
@@ -473,6 +497,12 @@ def main(argv=None):
         "next unclaimed candidate of --configs",
     )
     parser.add_argument(
+        "--verify",
+        type=int,
+        default=0,
+        help="check each timed candidate's output against the reference this many times",
+    )
+    parser.add_argument(
         "--pool",
         help="the compile-ahead pool's list for this M: time what it has compiled first",
     )
@@ -503,7 +533,8 @@ def main(argv=None):
     arch = arch_info.get_arch()
     backend = args.backend or spec.default_backend(arch)
     check_backend(spec, arch, backend)
-    call, inputs, should_skip = spec.setup(shape, backend)
+    call, inputs, should_skip, *rest = spec.setup(shape, backend)
+    check = rest[0] if rest else None
 
     if args.plan:
         return plan(spec, shape, backend, arch, should_skip, args.space_out)
@@ -537,6 +568,8 @@ def main(argv=None):
         args.cold_mb,
         args.screen,
         args.pool,
+        args.verify,
+        check,
     )
     return 0
 
