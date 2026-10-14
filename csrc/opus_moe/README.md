@@ -5,16 +5,19 @@ Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
 # Opus MoE
 
-This directory contains Opus MoE stage2 kernels and their Python bindings. The
-current code is gfx950-only and intentionally narrow: fused MoE enablement is
-case-gated through tuned A8W4 stage2 configs.
+This directory owns gfx950 Opus MoE: A8W4 forward Stage1/Stage2 and the native
+BF16 backward implementation in [moe_backward](moe_backward/README.md).
+Forward enablement is gated by supported tuned A8W4 contracts; backward is a
+separate saved-state API, not an automatic replacement for forward dispatch.
 
-There is one active fused MoE path:
+The forward path contains two stages:
 
 - A8W4 decode stage2 kernels selected by public algorithm ids plus generated
   effective inter-dim specializations. Runtime `logical_inter_dim` and
   `inter_dim_pad` select the effective-K specialization; `topk`, `hidden`, and
   `experts` remain runtime values.
+- A8W4 Stage1 gate/up projection with fused activation/quantization, using
+  registered pair-kwave or group-split pipelines and a matching tuned contract.
 
 The same public A8W4 algorithm ids dispatch the matching specialization by
 effective inter dim; K is not encoded into separate public kid ranges.
@@ -91,6 +94,12 @@ Optional tuned CSV metadata columns `route_bucket`, `expected_sorted_blocks`,
 after sorting.
 
 ## File Layout
+
+Repository-wide ownership is documented in the
+[Opus architecture map](../../aiter/ops/opus/README.md). Keep forward here and
+backward in `moe_backward/`; they have different tensor contracts, registries
+and compilation units. Share low-level Opus primitives rather than forcing
+their launchers or metadata into one generic dispatcher.
 
 Host and shared code:
 
