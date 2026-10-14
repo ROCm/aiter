@@ -107,6 +107,12 @@ def _mla_gluon(
     # --- dsv4-prefill knobs ---
     HAS_PE: gl.constexpr,
     HAS_ATTN_SINK: gl.constexpr,
+    # --- optional regime select (REGIME_SEL) ---
+    Sel_buf,  # int32 [sel_bs + 2]: alt-kernel kv_indptr (or zeros) + use_alt flag
+    sel_bs,
+    sel_thresh,
+    SEL_P2: gl.constexpr,
+    REGIME_SEL: gl.constexpr,
 ):
     # Grid mapping: bh64 uses 3-D XCD-aware multi-batch; bh16bn64 and bh16bn128
     # use 2-D (batch, split) — for batch_size=1 this is (1, NUM_KV_SPLITS).
@@ -140,6 +146,28 @@ def _mla_gluon(
     else:
         batch_page_start = gl.load(B_seq_len + cur_batch)
         cur_batch_seq_len = gl.load(B_seq_len + cur_batch + 1) - batch_page_start
+
+    # REGIME_SEL: every program evaluates eff = sel_bs * max_b(L_b) and exits when
+    # eff >= sel_thresh, leaving the batch to a caller-provided alternative kernel.
+    # Program (0, 0, 0) publishes that kernel's kv_indptr (zeros when this kernel
+    # runs, so every alternative program early-exits) and the flag.
+    if REGIME_SEL:
+        # The prologue reads per-batch lengths as kv_indptr deltas.
+        gl.static_assert(
+            USE_2D_VIEW == 0, "REGIME_SEL requires USE_2D_VIEW=False (kv_indptr)"
+        )
+        sel_lay: gl.constexpr = gl.BlockedLayout([1], [64], [4], [0])
+        offs_sel = gl.arange(0, SEL_P2, layout=sel_lay)
+        ip_lo = gl.load(B_seq_len + offs_sel, mask=offs_sel <= sel_bs, other=0)
+        ip_hi = gl.load(B_seq_len + offs_sel + 1, mask=offs_sel < sel_bs, other=0)
+        sel_max_len = gl.max(gl.where(offs_sel < sel_bs, ip_hi - ip_lo, 0), axis=0)
+        use_alt = sel_max_len * sel_bs >= sel_thresh
+        if (gl.program_id(0) == 0) & (gl.program_id(1) == 0) & (gl.program_id(2) == 0):
+            flag_v = gl.where(offs_sel == sel_bs + 1, use_alt.to(gl.int32), 0)
+            sel_v = gl.where(offs_sel <= sel_bs, gl.where(use_alt, ip_lo, 0), flag_v)
+            gl.store(Sel_buf + offs_sel, sel_v, mask=offs_sel < sel_bs + 2)
+        if use_alt:
+            return
 
     # NUM_KV_SPLITS is a launch-time budget only. 
     # the partition is derived here from the runtime per-batch KV length.
@@ -1089,6 +1117,11 @@ def mla_gluon(
         QLEN=qlen,
         HAS_PE=has_pe,
         HAS_ATTN_SINK=has_attn_sink,
+        Sel_buf=None,
+        sel_bs=0,
+        sel_thresh=0,
+        SEL_P2=1,
+        REGIME_SEL=False,
     )
 
     if NUM_KV_SPLITS == 1:
