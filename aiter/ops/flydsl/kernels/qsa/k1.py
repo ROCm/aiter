@@ -425,6 +425,9 @@ def build_qsa_k1_scores_module(
                         score = score + fx.max(dot, Float32(0.0))
                     if out_col < n_columns:
                         live = live_lds[Int32(ng * 16) + lane_m] != zero
+                        # ``scores`` must keep a dynamic row stride: a static
+                        # layout, use_32bit_stride=True, or an Int32 linear
+                        # index would wrap.
                         scores[row, out_col] = live.select(
                             score * score_scale, _neg_inf()
                         )
@@ -730,6 +733,9 @@ def build_qsa_k1_prefill_scores_module(
                             score = score + fx.max(dot, Float32(0.0))
                         if (row < rows) & (out_col < n_columns):
                             live = out_col < visible_lds[row_local]
+                            # ``scores`` must keep a dynamic row stride: a static
+                            # layout, use_32bit_stride=True, or an Int32 linear
+                            # index would wrap.
                             scores[row, out_col] = live.select(
                                 score * score_scale, _neg_inf()
                             )
@@ -935,6 +941,23 @@ def _k1_max_visible_columns(
     return int(scratch.item())
 
 
+def _check_k1_score_workspace(scores: torch.Tensor, rows: int, n_columns: int) -> None:
+    """Reject a score buffer that is not fp32 ``[rows, n_columns]``.
+
+    The column stride stays 1 so a narrowed prefix is contiguous in each
+    row. The row stride is the caller's.
+    """
+    if scores.dtype != torch.float32 or tuple(scores.shape) != (rows, n_columns):
+        raise ValueError(
+            f"scores must be float32 [{rows}, {n_columns}], "
+            f"got {scores.dtype} {tuple(scores.shape)}"
+        )
+    if scores.stride(-1) != 1:
+        raise ValueError(
+            f"scores needs a unit column stride, got {tuple(scores.stride())}"
+        )
+
+
 def qsa_k1_score_and_select(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -948,6 +971,7 @@ def qsa_k1_score_and_select(
     n_heads: int,
     live_columns: int | None = None,
     row_bounded: bool = False,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Score long rows into ``[M, n_columns]`` and write top-512 ids into ``out``.
 
@@ -963,17 +987,27 @@ def qsa_k1_score_and_select(
     runs the one-workgroup decode radix on the full width instead: it
     stops at each row's ``row_lens``, so it needs no readback of the
     widest row.
+
+    ``scores`` is an optional fp32 ``[M, n_columns]`` workspace with a
+    unit column stride. ``None`` allocates it. The buffer is overwritten
+    and is not returned.
     """
     if n_heads not in _SCORE_HEADS:
         raise ValueError(f"score heads must be {_SCORE_HEADS}, got {n_heads}")
     if q.shape[1] != n_heads:
         raise ValueError(f"q must have {n_heads} heads, got {tuple(q.shape)}")
+    m = int(q.shape[0])
+    n_columns = int(n_columns)
+    if scores is not None:
+        _check_k1_score_workspace(scores, m, n_columns)
+        if scores.device != q.device:
+            raise ValueError("scores must be on the same device as q")
     arch = qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
     use_k32 = arch == "gfx950"
-    m = q.shape[0]
     page_size = k_cache.shape[1]
     score_block_n = 32
-    scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
+    if scores is None:
+        scores = torch.empty(m, n_columns, dtype=torch.float32, device=q.device)
     row_lens = torch.empty(m, dtype=torch.int32, device=q.device)
     score_tiles = (n_columns + score_block_n - 1) // score_block_n
     # numel() is the packed page. A vLLM layer view pads the page stride,
@@ -1155,13 +1189,18 @@ def qsa_k1_block_ids(
     out: torch.Tensor | None = None,
     score_scale: float = _SCORE_SCALE,
     heads: tuple[int, ...] = _SCORE_HEADS,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Write indexer ``block_ids [M, 512]`` from paged compressed K.
 
     Rows no wider than 512 use the fused emit path. Longer rows materialize
-    scores with a BLOCK_N=32 MFMA writer. Single-request prefill batches
-    16 query rows, except gfx942 H=8; other inputs use one row per
-    workgroup. Selection is the stable decode radix below 32768 columns
+    scores with a BLOCK_N=32 MFMA writer. ``scores`` is an optional fp32
+    ``[M, n_columns]`` workspace for that writer, with a unit column
+    stride. ``n_columns`` is ``page_table.shape[1] * page_size``. ``None``
+    allocates it. Emit does not read it. The buffer is overwritten and is
+    not returned. Single-request prefill batches 16 query rows, except
+    gfx942 H=8; other inputs use one row per workgroup. Selection is the
+    stable decode radix below 32768 columns
     and streaming radix (``tie='low'``) at or above that width.
     Expand+tail is still separate. An empty context, cache, or page table
     writes ``-1`` and does not launch. A page table with fewer request
@@ -1191,7 +1230,13 @@ def qsa_k1_block_ids(
         raise ValueError(f"out must be int32 [{m}, {_K}], got {tuple(out.shape)}")
     elif not out.is_contiguous():
         raise ValueError("out must be contiguous")
+    if scores is not None:
+        _check_k1_score_workspace(
+            scores, m, int(page_table.shape[1]) * int(k_cache.shape[1])
+        )
     tensors = (q, k_cache, page_table, token_to_req, query_positions, context_lens, out)
+    if scores is not None:
+        tensors = tensors + (scores,)
     if any(not t.is_cuda for t in tensors):
         raise ValueError("every tensor must be on the GPU")
     if any(t.device != q.device for t in tensors[1:]):
@@ -1261,5 +1306,6 @@ def qsa_k1_block_ids(
             int(q.shape[1]),
             live_columns=live_columns,
             row_bounded=row_bounded,
+            scores=scores,
         )
     return out

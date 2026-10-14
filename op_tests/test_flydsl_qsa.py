@@ -413,9 +413,7 @@ def _query_positions(m: int, seq_len: int, device) -> torch.Tensor:
     return torch.arange(seq_len - m, seq_len, device=device, dtype=dtypes.i32)
 
 
-def _k2_live_n_sel(
-    m: int, seq_len: int, token_budget: int, compress_ratio: int
-) -> int:
+def _k2_live_n_sel(m: int, seq_len: int, token_budget: int, compress_ratio: int) -> int:
     """Widest packed prefix expand fills for this bench batch.
 
     Query positions are ``seq_len - m .. seq_len - 1`` in one request of
@@ -1452,9 +1450,7 @@ def test_k2_live_prefix_matches_full_width():
             m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device
         )
         k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
-        q = torch.randn(
-            m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
-        )
+        q = torch.randn(m, gqa.n_heads, gqa.head_dim, dtype=dtypes.bf16, device=device)
         k = torch.randn(
             seq_len, gqa.kv_heads, gqa.head_dim, dtype=dtypes.bf16, device=device
         )
@@ -1485,9 +1481,7 @@ def test_k2_live_prefix_matches_full_width():
         live = _k2_live_n_sel(m, seq_len, idx.token_budget, idx.compress_ratio)
         if m == 1 and seq_len == 512:
             try:
-                qsa_k2(
-                    q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=True
-                )
+                qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=True)
             except TypeError:
                 pass
             else:
@@ -1511,11 +1505,11 @@ def test_k2_live_prefix_matches_full_width():
         if int((indices[:, live:] >= 0).any().item()):
             raise AssertionError(f"live token past n_sel={live} at M={m} L={seq_len}")
         if int((indices >= 0).sum(dim=1).max().item()) > live:
-            raise AssertionError(f"a row is wider than n_sel={live} at M={m} L={seq_len}")
+            raise AssertionError(
+                f"a row is wider than n_sel={live} at M={m} L={seq_len}"
+            )
         full = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req)
-        short = qsa_k2(
-            q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=live
-        )
+        short = qsa_k2(q, k_cache, v_cache, indices, kv_table, token_to_req, n_sel=live)
         err = checkAllclose(
             full.to(dtypes.fp32),
             short.to(dtypes.fp32),
@@ -1901,6 +1895,104 @@ def test_k1_empty_or_short_request_geometry():
                 raise AssertionError(f"K1 {name} output was not -1")
     finally:
         k1_kernel._run_compiled = original
+
+
+def test_qsa_k1_rejects_a_score_workspace_before_launch():
+    """A provided score buffer is fp32 ``[M, n_columns]`` with unit columns.
+
+    The check runs on the host, including the emit path, which does not
+    read the buffer. A wrong buffer does not launch.
+    """
+    q = torch.zeros(1, 4, 128, dtype=torch.bfloat16)
+    cache = torch.zeros(1, 16, 1, 128, dtype=torch.bfloat16)
+    table = torch.zeros(1, 8, dtype=torch.int32)
+    rows = torch.zeros(1, dtype=torch.int32)
+    n_columns = int(table.shape[1]) * int(cache.shape[1])
+    cases = (
+        torch.empty(1, n_columns - 1),
+        torch.empty(1, n_columns, dtype=torch.float16),
+        torch.empty(1, n_columns * 2)[:, ::2],
+    )
+    for scores in cases:
+        try:
+            qsa_k1_block_ids(q, cache, table, rows, rows, rows, scores=scores)
+        except ValueError as exc:
+            if "scores" not in str(exc):
+                raise
+        else:
+            raise AssertionError(
+                f"scores shape {tuple(scores.shape)} dtype {scores.dtype} "
+                f"stride {tuple(scores.stride())} was accepted"
+            )
+    q_gqa = torch.zeros(1, 24, 256, dtype=torch.bfloat16)
+    k_cache = torch.zeros(1, 16, 2, 256, dtype=torch.bfloat16)
+    try:
+        qsa_layer(
+            q,
+            cache,
+            table,
+            q_gqa,
+            k_cache,
+            k_cache,
+            table,
+            rows,
+            rows,
+            rows,
+            scores=torch.empty(1, 4),
+        )
+    except ValueError as exc:
+        if "scores must be float32" not in str(exc):
+            raise
+    else:
+        raise AssertionError("qsa_layer accepted a short score workspace")
+
+
+def test_qsa_k1_caller_score_workspace_matches_the_private_buffer():
+    """A caller-owned score buffer selects the same block ids.
+
+    The long-row path writes that buffer and still returns only the ids.
+    """
+    if not torch.cuda.is_available() or get_gfx() not in SUPPORTED_GFX:
+        return
+    idx = FAMILY_A_INDEXER
+    device = torch.device("cuda")
+    m, seq_len, page_size = 2, 4096, 16
+    n_blocks = seq_len // idx.compress_ratio
+    torch.manual_seed(0)
+    q = torch.randn(m, idx.n_heads, idx.head_dim, dtype=dtypes.bf16, device=device)
+    k_bar = torch.randn(n_blocks, idx.head_dim, dtype=dtypes.bf16, device=device)
+    qpos = _query_positions(m, seq_len, device)
+    slen = torch.full((1,), seq_len, dtype=dtypes.i32, device=device)
+    token_to_req = torch.zeros(m, dtype=dtypes.i32, device=device)
+    gen = torch.Generator(device=device)
+    gen.manual_seed(1)
+    index_cache, index_table = pack_paged_cache(
+        k_bar.unsqueeze(1), page_size, generator=gen
+    )
+    n_columns = int(index_table.shape[1]) * page_size
+    private = qsa_k1_block_ids(
+        q,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        heads=(idx.n_heads,),
+    )
+    workspace = torch.full((m, n_columns), float("nan"), device=device)
+    shared = qsa_k1_block_ids(
+        q,
+        index_cache,
+        index_table,
+        token_to_req,
+        qpos,
+        slen,
+        heads=(idx.n_heads,),
+        scores=workspace,
+    )
+    _assert_k1_block_ids(private, shared, "caller score workspace")
+    if not torch.isfinite(workspace).any():
+        raise AssertionError("caller score workspace was not written")
 
 
 def test_k2_empty_cache_or_table_returns_zeros():
@@ -2548,7 +2640,9 @@ def test_qsa_layer_warns_once_for_an_unswept_pair():
 
     def _layer_tensors(hq, index_heads, gqa_rows=1, indexer_rows=1):
         q_indexer = torch.zeros(indexer_rows, index_heads, 128, dtype=torch.bfloat16)
-        q_gqa = torch.zeros(gqa_rows, hq, 256 if hq != 16 else 128, dtype=torch.bfloat16)
+        q_gqa = torch.zeros(
+            gqa_rows, hq, 256 if hq != 16 else 128, dtype=torch.bfloat16
+        )
         return q_indexer, q_gqa
 
     def _run(q_indexer, q_gqa):
@@ -2604,7 +2698,9 @@ def test_qsa_layer_warns_once_for_an_unswept_pair():
 
         messages.clear()
         _expect(*_layer_tensors(24, 4), "every tensor must be on the GPU")
-        _expect(*_layer_tensors(24, 8, indexer_rows=2), "every tensor must be on the GPU")
+        _expect(
+            *_layer_tensors(24, 8, indexer_rows=2), "every tensor must be on the GPU"
+        )
         if messages:
             raise AssertionError(f"a measured pair logged {messages}")
 

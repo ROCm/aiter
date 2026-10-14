@@ -179,6 +179,7 @@ def qsa_layer(
     compress_ratio: int = 4,
     score_scale: float | None = None,
     softmax_scale: float | None = None,
+    scores: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one QSA layer: indexer select, expand+tail, sparse GQA.
 
@@ -216,6 +217,11 @@ def qsa_layer(
             smaller index. ``-1`` is padding, including a row with no
             visible block. The incomplete tail is not stored here; expand
             writes those token ids into ``indices``.
+        scores: optional fp32 ``[M, n_columns]`` workspace for the long-row
+            scorer. ``n_columns`` is ``index_page_table.shape[1] *
+            page_size``. The column stride is 1. ``None`` allocates it.
+            The layer overwrites it and does not return it. Emit ignores
+            a buffer of that shape.
         out: optional contiguous bf16 ``[M, Hq, D]`` matching ``q_gqa``.
             ``None`` allocates it.
         token_topk: selected tokens. The default is 2048, which is the
@@ -253,6 +259,7 @@ def qsa_layer(
         query_positions,
         context_lens,
         out=block_ids,
+        scores=scores,
         **extra,
     )
     indices = _expand_block_ids(

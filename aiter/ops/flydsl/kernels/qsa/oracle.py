@@ -3,8 +3,17 @@
 
 """fp32 QSA oracle: block-causal ReLU-sum -> top-k -> expand+tail -> sparse GQA.
 
-Authoritative math: Qwen3.8-Next tech report §2.1 (QSA). This path *may*
-materialize ``[M, n_blocks]`` scores; FlyDSL K1 must not.
+Authoritative math: Qwen3.8-Next tech report ?2.1 (QSA). The oracle may
+materialize ``[M, n_blocks]`` scores. FlyDSL K1 does the same on every
+path except short-row emit: a private fp32 ``[M, n_columns]`` buffer,
+then top-512 block ids, and the scores are dropped. ``n_columns`` is
+the page-table capacity (``page_table.shape[1] * page_size``), so a
+padded ``max_model_len`` table pays full width. At compress ratio 4
+that buffer is 1 GiB for 128k tokens at M=8192 and 8 GiB for 1M tokens
+at the same M. The allocation is capacity-sized. Score traffic is
+live-bounded: both scorers skip tiles past the visible prefix. Fusing
+that buffer waits on 128k and 1M measurements. A caller may pass the
+buffer in; it is not a returned intermediate.
 
 Tie-break (locked to the live AMD HIP selector ``top_k_per_row_decode``): among
 equal finite scores, keep the **smaller block index**. Invalid / incomplete
