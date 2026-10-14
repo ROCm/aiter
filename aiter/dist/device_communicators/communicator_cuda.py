@@ -12,7 +12,7 @@ from aiter.dist.parallel_state import is_global_first_rank
 from aiter.ops.enum import QuantType
 from aiter.utility.dtypes import fp8
 
-from .base_device_communicator import DeviceCommunicatorBase
+from .base_device_communicator import All2AllManagerBase, DeviceCommunicatorBase
 
 should_nccl_symm_mem_allreduce = False
 
@@ -37,7 +37,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         reuse_from: "CudaCommunicator | None" = None,
     ):
         self._all2all_manager = None
-        self._all2all_manager_created = False
+        self._all2all_manager_backend = None
 
         super().__init__(cpu_group, device, device_group, unique_name)
         from aiter.dist.parallel_state import _ENABLE_CUSTOM_ALL_REDUCE
@@ -135,61 +135,92 @@ class CudaCommunicator(DeviceCommunicatorBase):
             #     # currently be an MI300 series.
             self.qr_comm = QuickAllReduce(group=self.cpu_group, device=self.device)
 
-    @property
-    def all2all_manager(self):
-        # Lazily create all2all_manager to avoid tp/dp/ep group haven't been created yet
-        if not self._all2all_manager_created and self.use_all2all:
-            self._all2all_manager_created = True
+    def _create_all2all_manager(self, backend: str) -> All2AllManagerBase:
+        if backend == "naive":
+            from .all2all import NaiveAll2AllManager
 
-            if self.all2all_backend == "naive":
-                from .all2all import NaiveAll2AllManager
+            return NaiveAll2AllManager(self.cpu_group)
+        if backend == "allgather_reducescatter":
+            from .all2all import AgRsAll2AllManager
 
-                self._all2all_manager = NaiveAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "allgather_reducescatter":
-                from .all2all import AgRsAll2AllManager
+            return AgRsAll2AllManager(self.cpu_group)
+        if backend == "pplx":
+            from .all2all import PPLXAll2AllManager
 
-                self._all2all_manager = AgRsAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "pplx":
-                from .all2all import PPLXAll2AllManager
+            return PPLXAll2AllManager(self.cpu_group)
+        if backend == "deepep_high_throughput":
+            from .all2all import DeepEPHTAll2AllManager
 
-                self._all2all_manager = PPLXAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "deepep_high_throughput":
-                from .all2all import DeepEPHTAll2AllManager
+            return DeepEPHTAll2AllManager(self.cpu_group)
+        if backend == "deepep_low_latency":
+            from .all2all import DeepEPLLAll2AllManager
 
-                self._all2all_manager = DeepEPHTAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "deepep_low_latency":
-                from .all2all import DeepEPLLAll2AllManager
+            return DeepEPLLAll2AllManager(self.cpu_group)
+        if backend == "mori":
+            from .all2all import MoriAll2AllManager
 
-                self._all2all_manager = DeepEPLLAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "mori":
-                from .all2all import MoriAll2AllManager
+            return MoriAll2AllManager(self.cpu_group)
+        if backend == "flydsl":
+            from .all2all import FlyDSLAll2AllManager
 
-                self._all2all_manager = MoriAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "flydsl":
-                from .all2all import FlyDSLAll2AllManager
+            return FlyDSLAll2AllManager(self.cpu_group)
+        if backend == "flashinfer_all2allv":
+            from .all2all import FlashInferAllToAllManager
 
-                self._all2all_manager = FlyDSLAll2AllManager(self.cpu_group)
-            elif self.all2all_backend == "flashinfer_all2allv":
-                from .all2all import FlashInferAllToAllManager
+            return FlashInferAllToAllManager(self.cpu_group)
+        raise ValueError(f"Unknown all2all backend: {backend}")
 
-                self._all2all_manager = FlashInferAllToAllManager(self.cpu_group)
-            else:
-                raise ValueError(f"Unknown all2all backend: {self.all2all_backend}")
+    def get_or_create_all2all_manager(
+        self, backend: str | None = None
+    ) -> All2AllManagerBase:
+        """Return the requested all-to-all manager, creating it on demand.
 
-            if is_global_first_rank():
-                logger.info(
-                    "Using %s all2all manager.",
-                    self._all2all_manager.__class__.__name__,
+        Callers that require a particular transport should name it explicitly.
+        Constructing a manager also initializes all resources owned by that
+        backend; callers that use a different communication path should not call
+        this method.
+        """
+        if not self.use_all2all:
+            raise RuntimeError(
+                f"{self.unique_name} is not an expert-parallel communicator"
+            )
+
+        requested_backend = backend or self.all2all_backend
+        manager = self._all2all_manager
+        if manager is not None:
+            if self._all2all_manager_backend != requested_backend:
+                raise RuntimeError(
+                    "all2all manager is already initialized with backend "
+                    f"{self._all2all_manager_backend!r}; cannot switch to "
+                    f"{requested_backend!r}"
                 )
-        # if self._all2all_manager is None:
-        #     raise ValueError(f"all2all_manager is None for {self.unique_name}")
-        return self._all2all_manager
+            return manager
+
+        # Assign only after construction succeeds. A failed collective/backend
+        # initialization must not leave the communicator permanently marked as
+        # initialized with a missing or partially constructed manager.
+        manager = self._create_all2all_manager(requested_backend)
+        self._all2all_manager = manager
+        self._all2all_manager_backend = requested_backend
+
+        if is_global_first_rank():
+            logger.info("Using %s all2all manager.", manager.__class__.__name__)
+        return manager
+
+    @property
+    def all2all_manager(self) -> All2AllManagerBase | None:
+        # Backward-compatible accessor. New callers should explicitly request
+        # the backend they need through get_or_create_all2all_manager().
+        if not self.use_all2all:
+            return None
+        return self.get_or_create_all2all_manager()
 
     @all2all_manager.setter
-    def all2all_manager(self, value):
+    def all2all_manager(self, value: All2AllManagerBase | None):
         self._all2all_manager = value
-        if value is not None:
-            self._all2all_manager_created = True
+        self._all2all_manager_backend = (
+            self.all2all_backend if value is not None else None
+        )
 
     def all_reduce(
         self,
@@ -917,6 +948,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         if self._all2all_manager is not None:
             self._all2all_manager.destroy()
             self._all2all_manager = None
+            self._all2all_manager_backend = None
 
     def all_gatherv(
         self,
@@ -972,8 +1004,8 @@ class CudaCommunicator(DeviceCommunicatorBase):
         router_logits: torch.Tensor,
         is_sequence_parallel: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        assert self.all2all_manager is not None
-        hidden_states, router_logits = self.all2all_manager.dispatch(
+        manager = self.get_or_create_all2all_manager()
+        hidden_states, router_logits = manager.dispatch(
             hidden_states, router_logits, is_sequence_parallel
         )
         return hidden_states, router_logits
@@ -981,8 +1013,6 @@ class CudaCommunicator(DeviceCommunicatorBase):
     def combine(
         self, hidden_states: torch.Tensor, is_sequence_parallel: bool = False
     ) -> torch.Tensor:
-        assert self.all2all_manager is not None
-        hidden_states = self.all2all_manager.combine(
-            hidden_states, is_sequence_parallel
-        )
+        manager = self.get_or_create_all2all_manager()
+        hidden_states = manager.combine(hidden_states, is_sequence_parallel)
         return hidden_states
