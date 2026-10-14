@@ -345,26 +345,32 @@ def b_park_elems(cfg):
     return WARP_SIZE * LDG_VEC if cfg.b_tail_threads else 0
 
 
-def make_shared_storage(elem_ty, cfg, strip_stage_elems=0, kw=0):
+def make_shared_storage(
+    elem_ty, cfg, strip_stage_elems=0, kw=0, patch_stage_elems=0, patch_park=False
+):
     """The LDS struct one block allocates.
 
     Default: ``pipe_stages`` tiles of A and of B. kW reuse: two strip stages
-    for A and, per stage, the ``kw`` B tiles that strip feeds. Plus the B park
-    when B's last DMA round is partial.
+    for A and, per stage, the ``kw`` B tiles that strip feeds. kH x kW reuse:
+    two patch stages for A and the default ``pipe_stages`` B tiles. Plus the
+    park when B's (or the patch's) last DMA round is partial.
     """
-    if strip_stage_elems:
+    if patch_stage_elems:
+        a_elems = KW_REUSE_STAGES * patch_stage_elems
+        b_elems = cfg.lds_b_elems
+    elif strip_stage_elems:
         a_elems = KW_REUSE_STAGES * strip_stage_elems
         b_elems = KW_REUSE_STAGES * kw * cfg.tile_n * cfg.tile_k
     else:
         a_elems, b_elems = cfg.lds_a_elems, cfg.lds_b_elems
 
-    if b_park_elems(cfg):
+    if b_park_elems(cfg) or patch_park:
 
         @fx.struct
         class SharedStorage:
             a: fx.Array[elem_ty, a_elems, 16]
             b: fx.Array[elem_ty, b_elems, 16]
-            b_park: fx.Array[elem_ty, b_park_elems(cfg), 16]
+            b_park: fx.Array[elem_ty, WARP_SIZE * LDG_VEC, 16]
 
     else:
 
@@ -839,6 +845,9 @@ class LaunchGrid(NamedTuple):
     tile_m: int
     row_chk: bool
     wgm: int
+    # (rows, cols) when a block owns a 2D patch of output pixels (kH x kW
+    # reuse), else None: M tiles are then N * Do * ceil(Ho/rows) * ceil(Wo/cols).
+    out_block: object
 
     # N: per-group tiling, and whether the last tile of a group is partial.
     tile_n: int
@@ -855,8 +864,12 @@ class LaunchGrid(NamedTuple):
     use_splitk: bool
 
 
-def make_launch_grid(param, geom, cfg):
-    """The LaunchGrid for one problem and launch config, or an assertion."""
+def make_launch_grid(param, geom, cfg, out_block=None):
+    """The LaunchGrid for one problem and launch config, or an assertion.
+
+    ``out_block``: ``Im2colPlan.out_block`` -- (rows, cols) of the 2D output
+    patch a block owns under kH x kW reuse, or None for consecutive rows.
+    """
     tile_m, tile_n, tile_k = cfg.tile_m, cfg.tile_n, cfg.tile_k
     block_threads = cfg.block_threads
     k, groups = param.k, param.groups
@@ -877,7 +890,16 @@ def make_launch_grid(param, geom, cfg):
     )
     tiles_per_split = k_tiles // splitk
 
-    grid_m = (npq + tile_m - 1) // tile_m
+    if out_block is None:
+        grid_m = (npq + tile_m - 1) // tile_m
+        m_tail = npq % tile_m != 0
+    else:
+        rows, cols = out_block
+        assert (
+            rows * cols == tile_m
+        ), f"out_block {out_block} does not cover TILE_M={tile_m}"
+        grid_m = param.n * geom.do * (-(-geom.ho // rows)) * (-(-geom.wo // cols))
+        m_tail = geom.ho % rows != 0 or geom.wo % cols != 0
     max_grid_x = 0xFFFFFFFF // block_threads
     grid_x = min(grid_m, max_grid_x)
     m_chunks = (grid_m + grid_x - 1) // grid_x
@@ -899,10 +921,11 @@ def make_launch_grid(param, geom, cfg):
         tile_m=tile_m,
         # The last M tile is partial, or chunking over-provisioned the x axis:
         # either way some block owns rows past npq and must not write them.
-        row_chk=(npq % tile_m != 0) or (grid_x * m_chunks > grid_m),
+        row_chk=m_tail or (grid_x * m_chunks > grid_m),
         # Chunked M already uses z, so a swizzle over x/y would reorder blocks
         # that are no longer adjacent in M. WGM only applies to the flat case.
         wgm=1 if m_chunks > 1 else max(1, int(param.wgm)),
+        out_block=out_block,
         tile_n=tile_n,
         tiles_per_group=tiles_per_group,
         n_tail=n_tail,
@@ -1109,11 +1132,14 @@ def make_output_scatter_plan(param, geom, cfg, grid):
         # branch, but only where the store goes through a buffer descriptor:
         # split-K atomics and the 64-bit BIG_OUT path have no such address.
         route_store=need_chk and not use_splitk and not big_out,
+        # Under a 2D output block four consecutive tile rows are four pixels
+        # of one image row; Wo % 4 keeps them on one side of the W tail too.
         vec_store=(
             (not use_splitk)
             and (dhw % MFMA_C_VALUES == 0)
             and (not big_out)
             and (not out_ndhwc)
+            and (grid.out_block is None or geom.wo % MFMA_C_VALUES == 0)
         ),
     )
 
@@ -1166,12 +1192,28 @@ class OutputScatter:
             elem_ty.ir_type, fx.AddressSpace.Global, BF16_BYTES
         )
 
-    def store(self, acc, *, m_offset, n_offset, n_local, c_row, c_col):
+    def store(
+        self,
+        acc,
+        *,
+        m_offset,
+        n_offset,
+        n_local,
+        c_row,
+        c_col,
+        row_of=None,
+        row_ok=None,
+    ):
         """Write this block's accumulator out.
 
         ``c_row`` / ``c_col`` are the tile-local coordinates of the
         accumulator's elements, taken from the same tiled_mma that owns
         ``acc`` so the epilogue cannot drift from the MMA's own partitioning.
+
+        A 2D output block (kH x kW reuse) passes ``row_of(local)``, the GEMM
+        row of tile-local row ``local`` (rows local..local+3 stay consecutive),
+        and ``row_ok(local)``, whether that row is inside the output, which
+        replaces the ``row < npq`` tail test.
         """
         plan = self._plan
         elem_ty = self._elem_ty
@@ -1182,7 +1224,13 @@ class OutputScatter:
             bias_vals = self._load_bias(n_offset, n_local, c_col)
 
         for mi in range_constexpr(plan.mi_m):
-            row_base = m_offset + fx.get_scalar(c_row[MFMA_C_VALUES * mi])
+            local = fx.get_scalar(c_row[MFMA_C_VALUES * mi])
+            if const_expr(row_of is None):
+                row_base = m_offset + local
+                rv_base = None
+            else:
+                row_base = row_of(local)
+                rv_base = row_ok
             for ni in range_constexpr(plan.mi_n):
                 col, col_loc = self._cols(ni, n_offset, n_local, c_col)
                 a = fx.Vector(acc[None, mi, ni].load())
@@ -1191,6 +1239,7 @@ class OutputScatter:
 
                 if const_expr(plan.vec_store):
                     row0 = fx.Int64(row_base)
+                    rv0 = None if rv_base is None else rv_base(local)
                     off_nk0 = self._off_nk(row0, col, None)
 
                     def _emit_vec():
@@ -1207,12 +1256,12 @@ class OutputScatter:
                             self._y_reg_4,
                             fx.slice(
                                 self._y_div,
-                                (None, self._route(off_nk0, row0, col_loc)),
+                                (None, self._route(off_nk0, row0, col_loc, rv0)),
                             ),
                         )
 
                     if const_expr(plan.need_chk and not plan.route_store):
-                        if self._valid(row0, col_loc):
+                        if self._valid(row0, col_loc, rv0):
                             _emit_vec()
                     else:
                         _emit_vec()
@@ -1220,6 +1269,7 @@ class OutputScatter:
 
                 for i in range_constexpr(MFMA_C_VALUES):
                     row = fx.Int64(row_base + i)
+                    rv = None if rv_base is None else rv_base(local + i)
                     off_sk = row * plan.k + col
                     off_nk = self._off_nk(row, col, off_sk)
 
@@ -1245,12 +1295,12 @@ class OutputScatter:
                                     self._y_reg_1,
                                     fx.slice(
                                         self._y_div,
-                                        (None, self._route(off_nk, row, col_loc)),
+                                        (None, self._route(off_nk, row, col_loc, rv)),
                                     ),
                                 )
 
                     if const_expr(plan.need_chk and not plan.route_store):
-                        if self._valid(row, col_loc):
+                        if self._valid(row, col_loc, rv):
                             _emit()
                     else:
                         _emit()
@@ -1287,18 +1337,20 @@ class OutputScatter:
         n_idx, row_in_sample = ext.div_dhw.divmod(row)
         return n_idx * (fx.Int64(plan.k) * dhw) + col * dhw + row_in_sample
 
-    def _valid(self, row, col_loc):
+    def _valid(self, row, col_loc, row_valid=None):
         plan = self._plan
+        if const_expr(row_valid is None):
+            row_valid = row < fx.Int64(self._ext.npq)
         if const_expr(plan.row_chk and plan.n_tail):
-            return (row < fx.Int64(self._ext.npq)) & (col_loc < fx.Int64(plan.kg))
+            return row_valid & (col_loc < fx.Int64(plan.kg))
         if const_expr(plan.row_chk):
-            return row < fx.Int64(self._ext.npq)
+            return row_valid
         return col_loc < fx.Int64(plan.kg)
 
-    def _route(self, off, row, col_loc):
+    def _route(self, off, row, col_loc, row_valid=None):
         if const_expr(not self._plan.route_store):
             return fx.Int32(off)
-        return self._valid(row, col_loc).select(
+        return self._valid(row, col_loc, row_valid).select(
             fx.Int32(off), fx.Int32(OOB_SENTINEL_ELEM)
         )
 
