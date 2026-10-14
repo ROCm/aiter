@@ -195,25 +195,20 @@ def benchmark_bytes(m, hidden_size, mode, out_dtype="bf16"):
 
 
 class _BenchmarkBackend:
-    """Pack rotated weights and prepare scratch before run_perftest timing."""
+    """Call one backend with its native weights and shared scratch."""
 
-    def __init__(self, name, tokens, scalar_args, out_dtype="bf16"):
+    def __init__(self, name, scalar_args, out_dtype="bf16", workspace=None):
         self.name = name
         self.backend = backend_function(name)
-        self.tokens = tokens
         self.scalar_args = scalar_args
         self.out_dtype = out_dtype
         if name == "triton" and out_dtype != "bf16":
             raise ValueError("Triton Mega-MHC has no fused mxfp8 output")
-        self.workspace = None
-        self.packed_weights = {}
-        self.prepared_addresses = set()
-        self.used_addresses = set()
+        self.workspace = workspace
 
     def __call__(
         self, r, fn, scale, base, pre, sublayer, post, comb, weight, residual_out
     ):
-        self.used_addresses.add(r.data_ptr())
         kw = {
             "pre_mix": pre,
             "sublayer_out": sublayer,
@@ -225,24 +220,9 @@ class _BenchmarkBackend:
         if self.name == "hip":
             kw["workspace"] = self.workspace
             kw["w_preshuffle_bf16"] = True
-            fn = self.packed_weights[id(fn)]
         if self.name != "triton":
             kw["out_dtype"] = self.out_dtype
         return self.backend(r, fn, scale, base, *self.scalar_args, **kw)
-
-    def prepare(self, *rotated):
-        # Called before profiling for the original tensors and every copy.
-        # HIP shares scratch across weights; FlyDSL warms its weight cache here.
-        self.prepared_addresses.add(rotated[0].data_ptr())
-        if self.name == "hip":
-            residual, fn = rotated[:2]
-            self.packed_weights[id(fn)] = mega_mhc_shuffle_fn(fn)
-            if self.workspace is None:
-                self.workspace = prepare_mega_mhc(
-                    residual.device, self.tokens, residual.shape[-1]
-                )
-        self(*rotated)
-        self.used_addresses.discard(rotated[0].data_ptr())
 
 
 @benchmark()
@@ -284,9 +264,15 @@ def benchmark_mega_mhc(
                 result[name] = "SKIP"
                 result[f"{name}_us"] = result[f"{name}_TB/s"] = float("nan")
                 continue
-        caller = _BenchmarkBackend(name, m, args[4:], out_dtype)
-        caller.prepare(*tensors)
-        out = caller(*tensors)
+        backend_tensors = tensors
+        workspace = None
+        if name == "hip":
+            # Rotate already-packed weights; deepcopy preserves their layout.
+            fn_packed = mega_mhc_shuffle_fn(args[1])
+            backend_tensors = (tensors[0], fn_packed, *tensors[2:])
+            workspace = prepare_mega_mhc(args[0].device, m, hidden_size)
+        caller = _BenchmarkBackend(name, args[4:], out_dtype, workspace)
+        out = caller(*backend_tensors)
         check(out, reference)
         result[name] = "PASS"
         if not check_only:
@@ -294,14 +280,14 @@ def benchmark_mega_mhc(
             if m:
                 out, us = run_perftest(
                     caller,
-                    *tensors,
+                    *backend_tensors,
                     num_iters=num_iters,
-                    prepare_func=caller.prepare,
+                    # FlyDSL accepts FP32 weights and caches its pack per tensor.
+                    prepare_func=caller if name == "flydsl" else None,
                 )
                 if not math.isfinite(us) or us <= 0:
                     raise RuntimeError(f"{name} returned an invalid GPU timing: {us}")
                 check(out, reference)
-                assert caller.used_addresses == caller.prepared_addresses
             result[f"{name}_us"] = us
             result[f"{name}_TB/s"] = num_bytes / us / 1e6
         if caller.workspace is not None:
