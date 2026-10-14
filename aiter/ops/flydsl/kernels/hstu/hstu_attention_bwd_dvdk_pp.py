@@ -471,7 +471,19 @@ def build_hstu_attention_bwd_dvdk_pp(
                 raw = k_load(
                     fx.Int64(safe), head_idx, k_col // fx.Int32(MFMA_QK_LANE_K)
                 ).ir_value()
-                per_og.append(kv_in_bounds[og].select(raw, c_zero_qk_pack))
+                # Fold `alpha` into K once, here, so GEMM0 yields the SCALED
+                # score and the gate's `sc = s * alpha` disappears -- 12
+                # element-multiplies per gate phase, 6 v_pk_mul. Only GEMM0
+                # reads k_packs, and dK's chain rule is unchanged: sc =
+                # Q.(aK)^T still gives d(sc)/dK = a.Q, which the epilogue's
+                # `c_dk_scale = alpha/N` already applies.
+                #
+                # The cost is that K is bf16, so bf16(alpha*K) rounds a second
+                # time -- an error the fp32 reference does not have.
+                scaled = (Vec(raw).to(fx.Float32) * fx.Float32(alpha)).to(elem_dtype)
+                per_og.append(
+                    kv_in_bounds[og].select(scaled.ir_value(), c_zero_qk_pack)
+                )
             k_packs.append(per_og)
 
         v_packs = []
@@ -973,8 +985,10 @@ def build_hstu_attention_bwd_dvdk_pp(
                 # serialised two multiplies at the head of a chain whose next
                 # link is a 16-cycle transcendental. Same op count, one less
                 # link, and the two multiplies now issue in parallel.
-                sc = [fmul_scalar(s[j], c_alpha) for j in rng]
-                emu = [exp2_f32(fmul_scalar(s[j], c_alpha_neg_log2e)) for j in rng]
+                # `sc` arrives already scaled from GEMM0 (alpha is folded into
+                # k_packs), so only the exp2 argument needs a multiply.
+                sc = s
+                emu = [exp2_f32(fmul_scalar(sc[j], c_neg_log2e)) for j in rng]
                 sig = [rcp_scalar(addone_scalar(emu[j])) for j in rng]
                 silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
