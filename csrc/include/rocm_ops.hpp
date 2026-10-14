@@ -746,16 +746,16 @@ namespace py = pybind11;
           py::arg("kernelName")  = std::nullopt, \
           py::arg("bpreshuffle") = false);
 
-#define GEMM_A4W4_BLOCKSCALE_PYBIND  \
-    m.def("gemm_a4w4_blockscale",    \
-          &gemm_a4w4_blockscale,     \
-          "fp4 blockscale gemm",     \
-          py::arg("XQ"),             \
-          py::arg("WQ"),             \
-          py::arg("x_scale"),        \
-          py::arg("w_scale"),        \
-          py::arg("Out"),            \
-          py::arg("splitK")     = 0, \
+#define GEMM_A4W4_BLOCKSCALE_PYBIND                 \
+    m.def("gemm_a4w4_blockscale",                   \
+          &aiter::torch_itfs::gemm_a4w4_blockscale, \
+          "fp4 blockscale gemm",                    \
+          py::arg("XQ"),                            \
+          py::arg("WQ"),                            \
+          py::arg("x_scale"),                       \
+          py::arg("w_scale"),                       \
+          py::arg("Out"),                           \
+          py::arg("splitK")     = 0,                \
           py::arg("kernelName") = "");
 
 #define GEMM_A8W8_BLOCKSCALE_PYBIND  \
@@ -856,16 +856,16 @@ namespace py = pybind11;
           py::arg("splitK")      = 0,                       \
           py::arg("preshuffleB") = true);
 
-#define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND \
-    m.def("gemm_a4w4_blockscale_tune",   \
-          &gemm_a4w4_blockscale_tune,    \
-          "gemm_a4w4_blockscale_tune",   \
-          py::arg("XQ"),                 \
-          py::arg("WQ"),                 \
-          py::arg("x_scale"),            \
-          py::arg("w_scale"),            \
-          py::arg("Out"),                \
-          py::arg("kernelId") = 0,       \
+#define GEMM_A4W4_BLOCKSCALE_TUNE_PYBIND                 \
+    m.def("gemm_a4w4_blockscale_tune",                   \
+          &aiter::torch_itfs::gemm_a4w4_blockscale_tune, \
+          "gemm_a4w4_blockscale_tune",                   \
+          py::arg("XQ"),                                 \
+          py::arg("WQ"),                                 \
+          py::arg("x_scale"),                            \
+          py::arg("w_scale"),                            \
+          py::arg("Out"),                                \
+          py::arg("kernelId") = 0,                       \
           py::arg("splitK")   = 0);
 
 #define GEMM_A8W8_PYBIND                    \

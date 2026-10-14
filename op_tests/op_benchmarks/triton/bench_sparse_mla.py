@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Benchmark for sparse_mla_fwd (gluon, separated-rope MLA; gfx950 and gfx942).
+"""Benchmark for sparse_mla_fwd (gluon MLA; gfx950 and gfx942).
 
+Separated rope by default; --qk_rope_head_dim 0 runs the rope-free geometry.
 The cache is flushed between iterations by default. Leaving it warm lets the loop
 re-read its KV and flatters decode shapes badly.
 
@@ -10,6 +11,7 @@ Usage:
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_seqs 1 --num_tokens 8192
   python op_tests/op_benchmarks/triton/bench_sparse_mla.py --num_seqs 64 --metric bandwidth
+  python op_tests/op_benchmarks/triton/bench_sparse_mla.py --qk_rope_head_dim 0
 """
 
 import argparse
@@ -74,20 +76,22 @@ def device_time_ms(func, warmup=25, rep=100, flush=True):
     return total / rep / 1e3
 
 
-def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes):
+def bytes_moved(num_tokens, num_heads, nnz, kv_elem_bytes, d_qk=D_QK):
     """Bytes the launch actually moves, counting rows as gathered.
 
     Split-K partials are left out: the split count is the kernel's own decision,
     so when it does split, that traffic lands in the time but not here.
     """
-    kv = nnz * D_QK * kv_elem_bytes  # the gather, and the bulk of it
+    kv = nnz * d_qk * kv_elem_bytes  # the gather, and the bulk of it
     idx = nnz * 4  # int32 index stream, read once
-    q = num_tokens * num_heads * D_QK * kv_elem_bytes
+    q = num_tokens * num_heads * d_qk * kv_elem_bytes
     out = num_tokens * num_heads * KV_LORA_RANK * 2
     return kv + idx + q + out
 
 
-def build_case(num_seqs, num_tokens, num_heads, context, topk, device="cuda"):
+def build_case(
+    num_seqs, num_tokens, num_heads, context, topk, d_qk=D_QK, device="cuda"
+):
     """Build one launch the way vLLM's sparse-MLA path lays it out.
 
     Every sequence owns its own slice of the pool, so there is no cross-request
@@ -98,12 +102,12 @@ def build_case(num_seqs, num_tokens, num_heads, context, topk, device="cuda"):
     gen = torch.Generator().manual_seed(1)
     pool = num_seqs * context
 
-    kv = torch.randn(pool, D_QK, dtype=torch.bfloat16, device=device) * 0.125
+    kv = torch.randn(pool, d_qk, dtype=torch.bfloat16, device=device) * 0.125
     q = (
         torch.randn(
             num_seqs * num_tokens,
             num_heads,
-            D_QK,
+            d_qk,
             dtype=torch.bfloat16,
             device=device,
         )
@@ -187,10 +191,12 @@ def run_benchmark(args):
     def bench_sparse_mla(
         phase, num_seqs, num_tokens, num_heads, context, topk, dots, metric, **kwargs
     ):
+        rope = args.qk_rope_head_dim
+        d_qk = KV_LORA_RANK + rope
         q, kv, kv_fp8, kv_scale, indices, indptr = build_case(
-            num_seqs, num_tokens, num_heads, context, topk
+            num_seqs, num_tokens, num_heads, context, topk, d_qk=d_qk
         )
-        sm_scale = D_QK**-0.5
+        sm_scale = d_qk**-0.5
         out = torch.empty(
             q.shape[0],
             num_heads,
@@ -215,6 +221,7 @@ def run_benchmark(args):
                 indices,
                 sm_scale,
                 kv_scale=scale,
+                qk_rope_head_dim=rope,
                 q_scale=q_scale,
                 dot_precision=dots,
                 out=out,
@@ -225,8 +232,10 @@ def run_benchmark(args):
         nnz = int(indptr[-1].item())
         num_tokens = q.shape[0]
         # QK reads the whole row, PV only the latent half
-        flops = 2.0 * num_heads * nnz * (D_QK + KV_LORA_RANK)
-        moved = bytes_moved(num_tokens, num_heads, nnz, 1 if dots == "fp8" else 2)
+        flops = 2.0 * num_heads * nnz * (d_qk + KV_LORA_RANK)
+        moved = bytes_moved(
+            num_tokens, num_heads, nnz, 1 if dots == "fp8" else 2, d_qk=d_qk
+        )
 
         if metric == "time":
             return time_ms
@@ -260,6 +269,12 @@ def main():
     parser.add_argument("--num_heads", type=int, default=16, help="q heads (TP4=16)")
     parser.add_argument("--context", type=int, default=8192, help="context length")
     parser.add_argument("--topk", type=int, default=2048, help="indexer top-k")
+    parser.add_argument(
+        "--qk_rope_head_dim",
+        type=int,
+        default=QK_ROPE_HEAD_DIM,
+        help="appended rope width; 0 is the rope-free geometry",
+    )
     parser.add_argument(
         "--no_flush_l2",
         action="store_true",
