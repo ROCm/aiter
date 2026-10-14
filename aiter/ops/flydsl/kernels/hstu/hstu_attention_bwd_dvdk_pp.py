@@ -734,6 +734,39 @@ def build_hstu_attention_bwd_dvdk_pp(
                 )
             )
 
+        def fmul_const_scalar(a, b):
+            """`a * b` as a scalar `v_mul_f32`, for a CONSTANT `b`.
+
+            `fmul_scalar`'s legacy trick leaks here. `fmul_legacy` differs from
+            `fmul` only on 0*inf and 0*NaN, so when the other operand is a
+            finite non-zero CONSTANT the two are provably identical, InstCombine
+            drops the intrinsic, and SLP re-packs the pair. Measured: this one
+            call site was every `v_pk_mul_f32` left in the loop (12 of them,
+            24 elements) while the three `fmul_scalar` calls with two SSA
+            operands all stayed `v_mul_legacy_f32`.
+
+            `b` takes the `s` constraint so the constant lands in an SGPR and
+            is read as VOP2 src0 -- no VGPR is burned to hold it.
+
+            No `s_nop`, unlike `addone_scalar`: `a` is a GEMM0 accumulator, and
+            an MFMA result needs 7 wait states before a VALU reads it, but the
+            transpose tail, `s_setprio`, `s_waitcnt` and `s_barrier` all sit
+            between the two phases and `phase_barrier`'s `sched_barrier(0)`
+            pins them there. (Checked in the ISA, not assumed.)
+            """
+            from flydsl._mlir import ir
+            from flydsl._mlir.dialects import llvm as _llvm
+
+            return fx.Float32(
+                _llvm.inline_asm(
+                    ir.F32Type.get(),
+                    [fx.Float32(a).ir_value(), fx.Float32(b).ir_value()],
+                    "v_mul_f32 $0, $2, $1",
+                    "=v,v,s",
+                    has_side_effects=False,
+                )
+            )
+
         def addone_scalar(x):
             """`1 + x` as a scalar `v_add_f32`, via inline asm.
 
@@ -1004,7 +1037,7 @@ def build_hstu_attention_bwd_dvdk_pp(
                 # `sc` arrives already scaled from GEMM0 (alpha is folded into
                 # k_packs), so only the exp2 argument needs a multiply.
                 sc = s
-                emu = [exp2_f32(fmul_scalar(sc[j], c_neg_log2e)) for j in rng]
+                emu = [exp2_f32(fmul_const_scalar(sc[j], c_neg_log2e)) for j in rng]
                 sig = [rcp_scalar(addone_scalar(emu[j])) for j in rng]
                 silu = [fmul_scalar(sc[j], sig[j]) for j in rng]
                 # silu'(z) = sig*(1 + z*(1 - sig)) = sig + silu*(1 - sig).
