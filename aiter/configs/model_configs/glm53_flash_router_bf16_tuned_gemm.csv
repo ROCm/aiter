@@ -1,6 +1,9 @@
 gfx,cu_num,M,N,K,bias,dtype,outdtype,scaleAB,bpreshuffle,libtype,solidx,splitK,us,kernelName,err_ratio,tflops,bw
 gfx950,256,1,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,315,8,4.2365,flydsl_hgemm_abf16_wbf16_bf16_t16x32x64x8_ks8_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0174,0.56,558.97
+gfx950,256,2,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,327,8,4.1487,flydsl_hgemm_abf16_wbf16_bf16_t16x32x64x9_ks8_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0122,1.14,572.91
+gfx950,256,4,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,327,8,4.1438,flydsl_hgemm_abf16_wbf16_bf16_t16x32x64x9_ks8_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0208,2.28,577.82
 gfx950,256,8,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,315,8,4.3318,flydsl_hgemm_abf16_wbf16_bf16_t16x32x64x8_ks8_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.02,4.36,560.84
+gfx950,256,16,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,327,8,4.2982,flydsl_hgemm_abf16_wbf16_bf16_t16x32x64x9_ks8_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0197,8.78,581.54
 gfx950,256,24,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1357,8,4.6063,flydsl_hgemm_abf16_wbf16_bf16_t32x32x64x8_ks8_w1x2x1_bias0_ktail0_gm0_pft_gfx950,0.0191,12.29,557.87
 gfx950,256,32,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,1303,8,4.7353,flydsl_hgemm_abf16_wbf16_bf16_t32x32x64x6_ks8_w2x1x1_bias0_ktail0_gm0_pft_gfx950,0.0188,15.94,557.49
 gfx950,256,40,288,4096,False,torch.bfloat16,torch.bfloat16,False,False,flydsl,2956,8,4.9942,flydsl_hgemm_abf16_wbf16_bf16_t64x32x64x8_ks8_w4x1x1_bias0_ktail0_gm0_pft_gfx950,0.0194,18.9,542.63
