@@ -5,7 +5,6 @@ GEMM2 units claimed by whichever CTA is free)."""
 
 from __future__ import annotations
 
-import os
 import functools
 
 import flydsl.compiler as flyc
@@ -622,8 +621,7 @@ def build_schedule(kc: KernelCtx) -> dict:
 
     @flyc.jit
     def lb_g1_tile(L, tid, a, ent, i0, icnt, rows):
-        # [exp] SOL probe: every tile on expert 0's weights (wrong results)
-        e = i32(0) if os.environ.get("AITER_MEGAMOE_TP_SOL_B1") == "1" else ent & i32(0xFFFF)
+        e = ent & i32(0xFFFF)
         if const_expr(TL):
             t0 = now()
             gemm1(L, tid, a, e, i0, icnt // i32(128), rows)

@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -39,7 +38,7 @@ def _u(v):
 
 # s_sleep of the LDS-flag spin loops (0: back-to-back polls that compete with the
 # GEMM's LDS reads and the co-resident compute wave's issue slots)
-LDS_NAP = int(os.environ.get("AITER_MEGAMOE_TP_LDS_NAP", "0"))
+LDS_NAP = 0
 
 
 def i32(v):

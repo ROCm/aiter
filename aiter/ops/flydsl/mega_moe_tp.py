@@ -30,22 +30,23 @@ Contract:
 * The symmetric memory uses hipIpc handles; in containers on the host network ROCm 7.1
   needs ``HSA_ENABLE_IPC_MODE_LEGACY=1``.
 
-Large batches (ag_rs, Swiglu, from ``bigm_min_tokens`` global tokens, default 8192;
-``AITER_MEGAMOE_TP_BIGM_MIN``, 0 disables) run the big-M kernel (bigm_layer: chunked, SDMA,
-per-batch tuned configs from configs/mega_moe_tp_bigm_tuned.csv) behind the same
-``forward``; it needs MORI SDMA (``AITER_MORI_PATH``). The small-batch engine then only
-holds up to ``bigm_min_tokens / world_size - 1`` local tokens.
+Large batches (ag_rs, Swiglu, fp4, from ``bigm_min_tokens`` global tokens, default 8192, 0
+disables) run the big-M kernel (bigm_layer: chunked, SDMA, per-batch tuned configs from
+configs/mega_moe_tp_bigm_tuned.csv) behind the same ``forward``; it needs MORI built with
+SDMA (importable, or its install directory in ``AITER_MORI_PATH``). ``max_local_tokens`` must
+then cover the largest batch (e.g. 8192 for 32768 tokens on tp4); the small-batch engine
+only holds up to ``bigm_min_tokens / world_size - 1`` of them.
 
 Schedules (planned in the kernel from the routing): up to 256 global tokens the dynamic
 one, from ``lb_min`` (default 256) global tokens up the large-batch (LB) one; its row tile
 is 16 * ``lb_mt`` rows (``"T1:N1,...,N"``: up to Ti tokens Ni), 16 * ``lb_mt_small`` up to
 ``lb_small_max`` tokens; ``lb_npp`` GEMM1 column blocks per A pass; ``lb_q`` output column
-chunks per GEMM2 unit. Unset fields fall back to ``AITER_MEGAMOE_TP_LB_*``.
+chunks per GEMM2 unit. Unset fields use the per-batch tuned configs
+(configs/mega_moe_tp_tuned.csv), else the defaults (lb_min 256, lb_mt 5, lb_npp 2, lb_q 3).
 """
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 import torch
@@ -106,8 +107,7 @@ class MegaMoeTPConfig:
     # the fused tail's norm: GemmaRMSNorm (scale 1 + w) or RMSNorm (w), and its eps
     tail_eps: float = 1e-6
     tail_gemma: bool = True
-    # global tokens from which forward runs the big-M kernel (None: AITER_MEGAMOE_TP_BIGM_MIN
-    # or 8192; 0: never)
+    # global tokens from which forward runs the big-M kernel (None: 8192; 0: never)
     bigm_min_tokens: int | None = None
 
 
@@ -134,9 +134,7 @@ class MegaMoeTP:
             raise ValueError(f"MegaMoeTP: unknown comm_mode {cfg.comm_mode!r}")
         situ = act == "situv2"
         self.cfg = cfg
-        bmin = cfg.bigm_min_tokens
-        if bmin is None:
-            bmin = int(os.environ.get("AITER_MEGAMOE_TP_BIGM_MIN", "8192"))
+        bmin = 8192 if cfg.bigm_min_tokens is None else cfg.bigm_min_tokens
         big_ok = (
             cfg.comm_mode == "ag_rs"
             and cfg.activation == ActivationType.Swiglu
@@ -202,12 +200,26 @@ class MegaMoeTP:
         FP8 rows (+ fp32 scales; bf16: + the bf16 rows) of the norm of res_out: returns
         (y, q, scale[, rows])."""
         if self._big(x_local.shape[0]):
-            if bf16:
-                raise ValueError("MegaMoeTP: the big-M path has no bf16 tail rows")
-            return self.bigm().moe(
-                x_local, topk_weights, topk_ids, out=out, tail=tail, local=bool(self.engine.tn_local)
-            )
+            local = bool(self.engine.tn_local)
+            res = self.bigm().moe(x_local, topk_weights, topk_ids, out=out, tail=tail, local=local)
+            if tail is not None and bf16:
+                res = (*res, self._bigm_rows(tail[1], tail[2], local))
+            return res
         return self.engine(x_local, topk_weights, topk_ids, out, tail=tail, bf16=bf16)
+
+    def _bigm_rows(self, res_out, norm_w, local):
+        """the big-M tail's bf16 rows: (Gemma)RMSNorm of res_out, this rank's (local) or every
+        rank's rows (the kernel writes the FP8 rows only)"""
+        import torch.distributed as dist
+
+        r = res_out.float()
+        w = norm_w.float() + 1.0 if self.engine.tn_gemma else norm_w.float()
+        rows = (r * torch.rsqrt(r.pow(2).mean(-1, keepdim=True) + float(self.engine.tn_eps)) * w).to(torch.bfloat16)
+        if local:
+            return rows
+        out = torch.empty((rows.shape[0] * self.cfg.world_size, rows.shape[1]), dtype=rows.dtype, device=rows.device)
+        dist.all_gather_into_tensor(out, rows, group=self._bigm_args["group"])
+        return out
 
     def _big(self, local_tokens: int) -> bool:
         return bool(self.bigm_m) and local_tokens >= self.bigm_m
@@ -237,6 +249,8 @@ class MegaMoeTP:
                 group=a["group"],
                 device=a["device"],
                 io=True,
+                # comm_dtype "bf16" (the accurate mode): bf16 route rows (MXFP8 otherwise)
+                opts={"AITER_BIGM_R8": "0"} if cfg.comm_dtype == "bf16" else None,
             )
         b = self._bigm
         # the tail norm's eps / Gemma flag (settable on the engine after construction)
@@ -270,13 +284,29 @@ class MegaMoeTP:
     ) -> None:
         """Collective: compile, arm and (warmup) run once and check the launch configs
         of these local token counts (tail / tail_bf16: their fused-tail variants); counts on
-        the big-M path set up its SDMA window (its kernels compile on their first forward)."""
+        the big-M path set up its SDMA window and (warmup) compile and run its kernels once
+        (a first launch inside CUDA graph capture could not)."""
         ts = [local_tokens] if isinstance(local_tokens, int) else list(local_tokens)
         small = [t for t in ts if not self._big(t)]
         if small:
             self.engine.prepare(small, tail, tail_bf16, warmup)
-        if len(small) < len(ts):
+        big = [t for t in ts if self._big(t)]
+        if big:
             self.bigm()
+        for m in big if warmup else ():
+            cfg, dev = self.cfg, self.bigm().device
+            x = torch.zeros((m, cfg.model_dim), dtype=torch.bfloat16, device=dev)
+            # balanced routing: token i's slot j to expert (i (topk - 1) + j) % (experts - 1),
+            # the shared expert (experts - 1) last
+            r = torch.arange(m, device=dev)[:, None] * (cfg.topk - 1) + torch.arange(cfg.topk - 1, device=dev)
+            ids = torch.cat([r % (cfg.experts - 1), torch.full((m, 1), cfg.experts - 1, device=dev)], 1)
+            ids = ids.to(torch.int32).contiguous()
+            tw = torch.full((m, cfg.topk), 1.0 / cfg.topk, dtype=torch.float32, device=dev)
+            self.forward(x, tw, ids)
+            if tail or tail_bf16:
+                res = torch.zeros_like(x)
+                self.forward(x, tw, ids, tail=(res, res, x[0]), bf16=tail_bf16)
+            torch.cuda.synchronize()
 
     @property
     def max_local_tokens(self) -> int:
@@ -297,14 +327,22 @@ class MegaMoeTP:
 
     def poll_errors(self) -> int:
         """Nonzero if a wait inside the kernel gave up (a peer never arrived)."""
-        return self.engine.poll_errors()
+        e = self.engine.poll_errors()
+        if not e and self._bigm is not None:
+            e = self._bigm.poll_errors()
+        return e
 
     def check_errors(self) -> None:
         """Raise RuntimeError (and clear) if a wait gave up since the last check."""
+        if self._bigm is not None and self._bigm.poll_errors():
+            self._bigm.clear_errors()
+            raise RuntimeError("MegaMoeTP: a big-M wait on a peer gave up (results invalid)")
         self.engine.check_errors()
 
     def clear_errors(self) -> None:
         self.engine.clear_errors()
+        if self._bigm is not None:
+            self._bigm.clear_errors()
 
     def reset(self) -> None:
         """Collective: restart the cross-rank state (after a timeout / desync)."""

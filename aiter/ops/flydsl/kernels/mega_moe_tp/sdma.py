@@ -21,7 +21,6 @@ import flydsl.compiler as flyc
 import flydsl.expr as fx
 import torch
 import torch.distributed as dist
-from flydsl.expr import range_constexpr
 from flydsl.expr.typing import Int64
 
 from ..tensor_shim import _run_compiled
@@ -242,7 +241,7 @@ class SdmaComm:
 
     def post(self, tab: torch.Tensor, n: int, tag: str = "") -> None:
         """tag: suffix of the post kernel's name (profiling)."""
-        if n and "nocomm" not in os.environ.get("XL_ABL", ""):
+        if n:
             k = self._k(tag)
             _run_compiled(
                 k[2] if tab.data_ptr() in self._serial else k[0],
@@ -254,24 +253,7 @@ class SdmaComm:
             )
 
     def wait(self, tab: torch.Tensor, n: int, tag: str = "") -> None:
-        if os.environ.get("XL_DBGW"):  # [dbg] per-wait elapsed via events, printed by dbg_flush
-            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            e0.record()
-            self._wait(tab, n, tag)
-            e1.record()
-            self.__dict__.setdefault("_dbg", []).append((f"{tag}@{tab.data_ptr():x}", tab.tolist(), e0, e1))
-            return
-        self._wait(tab, n, tag)
-
-    def dbg_flush(self, rank):
-        torch.cuda.synchronize()
-        for tag, rows, e0, e1 in self.__dict__.pop("_dbg", []):
-            ms = e0.elapsed_time(e1)
-            if ms > 100:
-                print(f"[dbgw r{rank}] wait {tag} {rows} {ms:.1f} ms", flush=True)
-
-    def _wait(self, tab: torch.Tensor, n: int, tag: str = "") -> None:
-        if n and "nocomm" not in os.environ.get("XL_ABL", ""):
+        if n:
             _run_compiled(
                 self._k(tag)[1],
                 self.dev_comm.ptr,

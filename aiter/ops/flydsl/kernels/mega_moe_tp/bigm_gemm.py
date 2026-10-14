@@ -18,7 +18,6 @@ counts are compile-time (see the issue order notes at each wait).
 """
 
 
-import os as _os
 
 import flydsl.compiler as flyc
 import flydsl.expr as fx
@@ -38,7 +37,6 @@ from .common import (
     i32,
     lds_ld,
     lds_ld_i32,
-    lds_ptr,
     lds_st,
     mfma,
     pack_bf16x2,
@@ -46,7 +44,6 @@ from .common import (
     swap16,
     swap32,
     fp8x4_pack,
-    uni,
     wait_lgkm0,
     wait_vm,
 )
@@ -100,7 +97,7 @@ def bigm_lds(RG, NAB, I, NW=NW, MODE=0, KCK=2, PFD=0):
 
 def build_bigm_unit(
     H, I, TOPK, RG=128, NAB=4, BST=3, BS2=3, act="swiglu", swiglu_limit=7.0, dbg=0, st_aux=0, ISPL=1,
-    PACKED=0, NWU=NW, NRS=1, UNRP=0, SWZ=0, LRG=None, MODE=0, G2N=1, PFD=0, R8=0, KCK=2,
+    PACKED=0, NWU=NW, NRS=1, UNRP=0, SWZ=0, LRG=None, MODE=0, G2N=1, PFD=0, R8=0, KCK=2, CAUX=AUX_SYS,
 ):
     """The fused unit device function: unit_body(L, tid, e, r0, rows, rr, rwt, rx, rxs, w1,
     w2, rws1, rws2, r_routes, oob): rows rr / rwt[r0 : r0 + rows] (route index, weight) of expert
@@ -133,7 +130,7 @@ def build_bigm_unit(
     MTEW = MTE // NRS  # 16-row tiles per wave
     PASSES = I // (NW * 32) // ISPL  # GEMM1 passes of this slice
     # G2W: GEMM2 groups of G2W x 64 columns per wave (fewer groups: fewer A re-reads / store bursts)
-    G2W = int(_os.environ.get("BIGM_G2W", "1"))
+    G2W = 1
     assert G2W in (1, 2) and (MODE != 4 or G2W == 1)
     NG2 = H // (NW * 64 * G2W)  # GEMM2 column groups per wave
     KS2 = I // 128 // ISPL  # GEMM2 k-steps of this slice
@@ -145,7 +142,7 @@ def build_bigm_unit(
     ISS = lay["ISS"]
     P1 = MODE == 3  # LDS intermediate holds one pass (columns relative to the pass)
     LA, LAS, LRIX, LWT = lay["LA"], lay["LAS"], lay["LRIX"], lay["LWT"]
-    SIS, LINT, LINTS, LCTL = lay["SIS"], lay["LINT"], lay["LINTS"], lay["LCTL"]
+    SIS, LINT, LINTS = lay["SIS"], lay["LINT"], lay["LINTS"]
     LPF = lay["LPF"]
     AR = RG // NWT  # A rows per wave (DMA)
     assert AR in (8, 16, 32, 64) and AR * KCK <= 64 and 64 % (AR * KCK) == 0
@@ -156,24 +153,26 @@ def build_bigm_unit(
     NB = 4 * KCK + 2 + (1 if PFD else 0)
     # sched barriers after the GEMM issue groups (the static vmcnt waits count loads in issue order;
     # needed by the straight-line item paths): 1 nothing crosses, 2 only VMEM is held
-    SCB = int(_os.environ.get("BIGM_SCB", "1" if MODE in (3, 4) else "0"))
+    SCB = 1 if MODE in (3, 4) else 0
     SCM = 0 if SCB == 1 else 0x38F
-    G2OPQ = _os.environ.get("BIGM_G2OPQ", "1") == "1"
-    SCB2 = _os.environ.get("BIGM_SCB2", "1") == "1"
-    RSAUX = int(_os.environ.get("BIGM_RSAUX", "0"))  # route-row store cache policy (2: nt)  # sched barriers after the GEMM2 B issue groups
+    G2OPQ = True
+    SCB2 = True  # sched barriers after the GEMM2 B issue groups
+    # route rows written through (sc0 sc1): the topk sums read them on other XCDs, whose L2s do
+    # not see this XCD's dirty lines (write-back stores left stale / uninitialized rows there)
+    RSAUX = CAUX
     NB2 = 6 * G2W  # GEMM2 B ops per k-step: 4 tiles + 2 scale words per 64 columns
     # STG (R8): a group's MXFP8 route rows staged in LDS (the A ring, idle in GEMM2; 2 buffers), then
     # stored as whole 256-column row segments: 8 + 1 stores per wave (full lines) instead of 2 x MTEW
-    STG = _os.environ.get("BIGM_STG", "0") == "1" and R8 and G2W == 1 and MODE in (0, 2) and NRS == 1
+    STG = False
     STGB = RG * NW * 64 + RG * NW * 2  # one staging buffer: codes [RG][NW x 64] + scales [RG][2 NW]
     assert not STG or (RG * NW * 64) % (NTHU * 16) == 0 and (RG * NW * 2) % (NTHU * 4) == 0
     assert not STG or lay["LRIX"] - lay["LA"] >= 2 * STGB, "STG: the A ring + scales hold 2 buffers"
     NST2 = (RG * NW * 64 // (NTHU * 16) + RG * NW * 2 // (NTHU * 4)) if STG else 2 * MTEW * G2W  # route stores per wave per group
     # steady-state GEMM1 issue order per chunk c: B(c + BST), then A(c + NAB - 1)
     WAIT1 = min(NA + (NA + NB) * (BST - 1), (NA + NB) * (NAB - 2))
-    VSP = _os.environ.get("BIGM_VSP", "0") == "1" and MODE != 3
-    PINB = _os.environ.get("BIGM_PINB", "1") == "1"  # sched barriers around the GEMM1 chunk barrier
-    VSPM = int(_os.environ.get("BIGM_VSPM", "3"))  # MFMAs per spread VMEM load
+    VSP = False
+    PINB = True  # sched barriers around the GEMM1 chunk barrier
+    VSPM = 3  # MFMAs per spread VMEM load
     # (spread: a chunk's A / B loads in any order within it -> one group fewer counted for B)
     WAIT1V = min((NA + NB) * (BST - 1), (NA + NB) * (NAB - 2))
     assert WAIT1 <= 63
@@ -193,7 +192,7 @@ def build_bigm_unit(
     WAIT2 = [_wait2(kk) for kk in range(KS2)]
     # EPP: the previous group's route-row epilogue split by row tile over this group's k-steps (its
     # VALU / stores issue while this group's MFMAs execute); per step: MFMAs, epilogue slice, B2 issue
-    EPP = _os.environ.get("BIGM_EPP", "0") == "1" and G2W == 1 and not STG
+    EPP = False
     MSPL = [tuple(range(kk * MTEW // KS2, (kk + 1) * MTEW // KS2)) for kk in range(KS2)]
     STK = [2 * len(MSPL[kk]) for kk in range(KS2)]  # route stores of step kk's slice
 
@@ -202,7 +201,6 @@ def build_bigm_unit(
 
     if EPP:
         WAIT2 = [_wait2e(kk) for kk in range(KS2)]
-    ST_AUX = st_aux
 
 
     def act_batch(gs, us):
@@ -232,8 +230,7 @@ def build_bigm_unit(
         q4 = lane // i32(16)
         zero = fx.Vector.filled(4, 0.0, fx.Float32)
         pg0 = ih * i32(PASSES)  # this slice's first GEMM1 pass (global)
-        kg0 = ih * i32(KS2)  # and GEMM2 k-step
-        if const_expr(MODE >= 3 and _os.environ.get("BIGM_DRAIN") == "1"):  # [dbg]
+        if const_expr(False):  # [dbg] drain
             # item units: the previous item's outstanding stores drained before the GEMM1
             # pipeline's static vmcnt waits (they assume only this item's loads are in flight)
             wait_vm(0)
@@ -273,7 +270,7 @@ def build_bigm_unit(
         # AFC: one per-lane base + compile-time offsets (row tile m, k-step, ring buffer) for the A
         # fragment / scale reads (one wave's rows are every row: the swizzle depends on the lane
         # only), instead of per-tile address registers (spilled under the register pressure)
-        AFC = NRS == 1 and AR % 16 == 0 and _os.environ.get("BIGM_AFC", "1") == "1"
+        AFC = NRS == 1 and AR % 16 == 0
         if const_expr(AFC):
             l16 = lane % i32(16)
             swz = ((l16 >> i32(1)) if const_expr(SWZ) else l16) & i32(LPR - 1)
@@ -327,7 +324,7 @@ def build_bigm_unit(
                 rocdl.sched_barrier(SCM)
             return b
 
-        APF = _os.environ.get("BIGM_APF", "0") == "1"  # [exp] both k-steps' A reads before the MFMAs
+        APF = False  # [exp] both k-steps' A reads before the MFMAs
 
         def g1_chunk(acc, bq, buf, c=0):
             # c: the chunk (compile time; KCK 1: its k-step's half of the scale words)
@@ -482,7 +479,6 @@ def build_bigm_unit(
         rb = (w // i32(NW)) * i32(RG // NRS)  # first row of this wave's tiles
         q4 = lane // i32(16)
         zero = fx.Vector.filled(4, 0.0, fx.Float32)
-        pg0 = ih * i32(PASSES)  # this slice's first GEMM1 pass (global)
         kg0 = ih * i32(KS2)  # and GEMM2 k-step
         # ---- GEMM2 from the LDS intermediate: NG2 groups x KS2 k-steps, B ring BS2 ----
         rw2 = rsrc(fx.Int64(w2) + fx.Int64(e) * fx.Int64(H * (I // 2)))
@@ -622,7 +618,6 @@ def build_bigm_unit(
         init2 = [v for b in b2pre for v in b] + ([zero] * (4 * MTEW) if EPP else [])
         for gi_, st2 in range(glo, ghi, i32(1), init=init2):
             gi = i32(gi_)
-            sbuf = L + i32(LA) + (gi & i32(1)) * i32(STGB)  # STG: this group's staging buffer
             ring2 = [list(st2[s * NB2 : (s + 1) * NB2]) for s in range(BS2)]
             accp = list(st2[BS2 * NB2 :]) if EPP else None  # EPP: the previous group's accumulators
             acc = [zero] * (4 * MTEW * G2W)

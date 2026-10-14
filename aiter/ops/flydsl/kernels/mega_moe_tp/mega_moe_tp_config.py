@@ -6,7 +6,6 @@ KernelCtx shared by the parts of the fused TP MegaMoE kernel."""
 from __future__ import annotations
 
 import functools
-import os
 import math
 import struct
 import types
@@ -71,10 +70,10 @@ NCHLB_MAX = 2048
 
 
 def _lds_nap():
-    return int(os.environ.get("AITER_MEGAMOE_TP_LDS_NAP", "0"))
+    return 0
 
 # LB intermediate row pad: 16 keeps every row 16B-aligned for the 128-bit LDS ops (8: unaligned stalls)
-_SIPAD = int(os.environ.get("AITER_MEGAMOE_TP_SIPAD", "16"))
+_SIPAD = 16
 G1C_STRIDE = 16
 CTRL_LBSEQ = CTRL_CLM + 2 * LRDY_STRIDE
 CTRL_LBR = CTRL_LBSEQ + LRDY_STRIDE
@@ -341,18 +340,13 @@ def kernel_config(
     XLPR = (256 if a8 else 128) // 16
     assert agr <= 64 // XLPR
     AUX_RT = AUX_SYS if lb else AUX_SC1
-    if os.environ.get("AITER_MEGAMOE_TP_AUXRT"):  # [exp] route-row store cache policy
-        AUX_RT = int(os.environ["AITER_MEGAMOE_TP_AUXRT"])
     ADEPTH = min(ALOAD_DEPTH, NAB - 1) if lb and NAB > 3 else ALOAD_DEPTH
     LBPF = bool(lb and c["B1_FITS"] and lbpf)
     MTSKIP = lb and MT >= 4
-    TL = os.environ.get("AITER_MEGAMOE_TP_TL", "0") == "1"  # phase timestamps
+    TL = False  # [dbg] phase timestamps
     CTRL_INTS_ = CTRL_INTS
-    # [exp] A-scale loads of the A loader through the caches (like the A rows)
-    ASC_CACHED = os.environ.get("AITER_MEGAMOE_TP_ASCC", "0") == "1"
-    # [exp] speed-of-light probes (wrong results): AITER_MEGAMOE_TP_SOL_<X>=1
-    SOL = sorted(k[len("AITER_MEGAMOE_TP_SOL_"):] for k, v in os.environ.items()
-                 if k.startswith("AITER_MEGAMOE_TP_SOL_") and v == "1")
+    ASC_CACHED = False  # A-scale loads of the A loader through the caches (like the A rows)
+    SOL = []  # [dbg] speed-of-light probes (wrong results)
     # tail rows stay local (no peer writes / waits): the caller gathers q itself
     TNL = TN and tn_local
     name = (
@@ -386,7 +380,6 @@ def kernel_config(
         + ("_tl" if TL else "")
         + ("_tnl" if TNL else "")
         + "".join(f"_sol{k.lower()}" for k in SOL)
-        + (f"_aux{AUX_RT}" if os.environ.get("AITER_MEGAMOE_TP_AUXRT") else "")
         + (f"_sip{_SIPAD}" if _SIPAD != 16 else "")
         + ("_ascc" if ASC_CACHED else "")
         + (f"_nap{_lds_nap()}" if _lds_nap() else "")
