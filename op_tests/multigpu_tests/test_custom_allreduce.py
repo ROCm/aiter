@@ -338,8 +338,10 @@ def _allreduce_ll128_mixed_size_regression(
         x = torch.randint(-8, 9, (tp_size, n), generator=generator, dtype=torch.int16)
         inputs.append(x[rank].to(device, torch.bfloat16))
         refs.append(x.sum(dim=0, dtype=torch.float32).to(device, torch.bfloat16))
+    # Opt-in: how the evictions behave depends on the host's KFD driver.
+    evict = os.environ.get("AITER_TEST_LL128_EVICT") == "1"
     # Rank 1 reads the peer slots that a faster rank's next call overlaps.
-    if rank == 1:
+    if evict and rank == 1:
         _start_queue_evictions(stop)
     dist.barrier()
     done = torch.cuda.Event()
@@ -348,7 +350,7 @@ def _allreduce_ll128_mixed_size_regression(
         if iteration % 100 != 99:
             continue
         done.record()
-        deadline, evicting = time.time() + 30, not stop.is_set()
+        deadline, evicting = time.time() + 30, evict and not stop.is_set()
         while not done.query():
             if time.time() > deadline:
                 if not evicting:
