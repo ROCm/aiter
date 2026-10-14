@@ -76,6 +76,7 @@ class GemmA16W16Gfx942Param:
     mma_n: fx.Constexpr[int]
     mma_k: fx.Constexpr[int]
     buffered_load: fx.Constexpr[bool]
+    direct_store: fx.Constexpr[bool]
     # derived
     async_load_bytes: fx.Constexpr[int]
     in_data_bytes: fx.Constexpr[int]
@@ -121,6 +122,7 @@ def make_gemm_a16w16_gfx942_param(
     mma_k: int = 16,
     async_load_bytes: int = 4,
     buffered_load: bool = False,
+    direct_store: bool = False,
 ) -> GemmA16W16Gfx942Param:
     if in_dtype_id != GEMM_A16W16_DTYPE_BF16:
         raise ValueError(f"gfx942 kernel is bf16-only for now (got in_dtype_id={in_dtype_id})")
@@ -141,6 +143,8 @@ def make_gemm_a16w16_gfx942_param(
         raise ValueError("gfx942 kernel supports k_waves=1 only (use split_k for K parallelism)")
     if split_k < 1:
         raise ValueError("split_k must be >= 1")
+    if direct_store and split_k != 1:
+        raise ValueError("direct_store currently supports split_k=1 only")
     if m_waves <= 0 or n_waves <= 0:
         raise ValueError("m_waves and n_waves must be positive")
     if m_waves * n_waves > 16:
@@ -163,6 +167,12 @@ def make_gemm_a16w16_gfx942_param(
         raise ValueError(
             f"staged LDS buffers exceed 64 KB: stages={stages}, block_m={block_m}, "
             f"block_n={block_n}, block_k={block_k}, smem_bytes={smem_bytes}"
+        )
+    c_smem_bytes = block_m * block_n * in_dbytes
+    if not direct_store and c_smem_bytes > SMEM_CAPACITY_GFX942:
+        raise ValueError(
+            f"cshuffle tile exceeds 64 KB: block_m={block_m}, block_n={block_n}, "
+            f"smem_bytes={c_smem_bytes}; use direct_store for aligned output tiles"
         )
 
     # Async global->LDS DMA: async_load_bytes per lane (4 => 32-bit, 16 => 128-bit).
@@ -215,6 +225,7 @@ def make_gemm_a16w16_gfx942_param(
         mma_n=mma_n,
         mma_k=mma_k,
         buffered_load=buffered_load,
+        direct_store=direct_store,
         async_load_bytes=async_load_bytes,
         in_data_bytes=in_dbytes,
         out_data_bytes=out_dbytes,
@@ -230,11 +241,12 @@ def make_gemm_a16w16_gfx942_kernel_name(param: GemmA16W16Gfx942Param) -> str:
     out_suffix = "_fp32" if param.out_dtype_id == GEMM_A16W16_DTYPE_FP32 else ""
     sk = "_ksd" if param.is_split_k else "_ks1"
     dma = f"buf{param.async_load_bytes}" if param.buffered_load else str(param.async_load_bytes)
+    store = "_r2g" if param.direct_store else ""
     return (
         f"hgemm_bf16{out_suffix}_gfx942_"
         f"t{param.block_m}x{param.block_n}x{param.block_k}x{param.stages}{sk}_"
         f"w{param.m_waves}x{param.n_waves}x{param.k_waves}_"
-        f"gm{param.group_m}_dma{dma}"
+        f"gm{param.group_m}_dma{dma}{store}"
     )
 
 
@@ -328,6 +340,7 @@ def gemm_a16w16_gfx942_kernel(
     ldg_a_iters = param.ldg_a_iters
     ldg_b_iters = param.ldg_b_iters
     cshuffle_r2g_vec_size = param.cshuffle_r2g_vec_size
+    direct_store = param.direct_store
     elem_dtype = fx.BFloat16
     global_output_dtype = (
         fx.Float32
@@ -372,7 +385,7 @@ def gemm_a16w16_gfx942_kernel(
     @fx.union
     class SharedStorage:
         ab: SharedABStorage
-        c: fx.Array[elem_dtype, block_m * block_n, 16]
+        c: fx.Array[elem_dtype, 1 if direct_store else block_m * block_n, 16]
 
     storage = fx.SharedAllocator().allocate(SharedStorage)
     smem_a = storage.ab.a.peek().ptr
@@ -423,6 +436,12 @@ def gemm_a16w16_gfx942_kernel(
     frag_C = thr_mma.make_fragment_C(gC)
     frag_A_ret = thr_copy_A.retile(frag_A)
     frag_B_ret = thr_copy_B.retile(frag_B)
+    if const_expr(direct_store):
+        if const_expr(is_fp32_output):
+            c_r2g_atom = fx.make_copy_atom(fx.rocdl.BufferCopy32b(), fx.Float32)
+        else:
+            c_r2g_atom = fx.make_copy_atom(fx.rocdl.BufferCopy16b(), elem_dtype)
+        thr_copy_C_direct = fx.make_tiled_copy_C(c_r2g_atom, tiled_mma).get_slice(tid)
     # Register double-buffer (stages>=3): a second A/B fragment pair holds the
     # next K-tile's LDS->reg read while frag_A/frag_B feed the current MFMAs.
     if const_expr(stages >= 3):
@@ -721,47 +740,66 @@ def gemm_a16w16_gfx942_kernel(
                 frag_B.store(frag_pf_B.load())
             rocdl.sched_barrier(0)
 
-    # Epilogue: stage the f32 accumulator (as bf16) through LDS, then do coalesced
-    # vector stores to global. Split-K partitions atomically accumulate.
-    frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
-    frag_C_out.store(frag_C.load().to(elem_dtype))
-    gpu.barrier()
-    for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
-        row = fx.get_scalar(thr_mma_cRow[i])
-        col = fx.get_scalar(thr_mma_cCol[i])
-        sC_write[row, col] = frag_C_out[i]
-
-    if const_expr(is_split_k):
-        splitk_protocol.wait_until_initialized()
+    if const_expr(direct_store):
+        # Aligned, non-split tiles can store the MMA fragment directly. This
+        # removes the full-tile LDS cshuffle/barrier and, more importantly,
+        # allows macro-tiles whose C footprint exceeds the 64 KB LDS capacity.
+        if const_expr(is_fp32_output):
+            fx.copy(
+                c_r2g_atom,
+                thr_copy_C_direct.retile(frag_C),
+                thr_copy_C_direct.partition_S(gC),
+            )
+        else:
+            frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
+            frag_C_out.store(frag_C.load().to(elem_dtype))
+            fx.copy(
+                c_r2g_atom,
+                thr_copy_C_direct.retile(frag_C_out),
+                thr_copy_C_direct.partition_S(gC),
+            )
     else:
+        # General epilogue: stage through LDS for coalescing, boundary masking,
+        # split-K atomics, and optional f32 conversion.
+        frag_C_out = fx.make_fragment_like(frag_C, elem_dtype)
+        frag_C_out.store(frag_C.load().to(elem_dtype))
         gpu.barrier()
+        for i in range_constexpr(fx.size(frag_C_out.shape).unpack()):
+            row = fx.get_scalar(thr_mma_cRow[i])
+            col = fx.get_scalar(thr_mma_cCol[i])
+            sC_write[row, col] = frag_C_out[i]
 
-    cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
-    cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
-    cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
-    for i in range_constexpr(cshuffle_iters):
-        vector_idx = block_threads * i + tid
-        if vector_idx < cshuffle_vectors:
-            local_row = vector_idx // cshuffle_r2g_x_threads
-            local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
-            global_row = block_m_offset + local_row
-            global_col = block_n_offset + local_col
-            if (global_row < m) and (global_col < n):
-                c_vec = fx.ptr_load(
-                    smem_c + local_row * block_n + local_col,
-                    result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
-                )
-                global_offset = global_row * n + global_col
-                write_cshuffle_vec_to_global(
-                    out,
-                    out_buf,
-                    global_offset,
-                    c_vec,
-                    is_split_k,
-                    is_fp32_output,
-                )
-    if const_expr(is_split_k):
-        splitk_protocol.finish_split(split_k)
+        if const_expr(is_split_k):
+            splitk_protocol.wait_until_initialized()
+        else:
+            gpu.barrier()
+
+        cshuffle_r2g_x_threads = block_n // cshuffle_r2g_vec_size
+        cshuffle_vectors = block_m * block_n // cshuffle_r2g_vec_size
+        cshuffle_iters = (cshuffle_vectors + block_threads - 1) // block_threads
+        for i in range_constexpr(cshuffle_iters):
+            vector_idx = block_threads * i + tid
+            if vector_idx < cshuffle_vectors:
+                local_row = vector_idx // cshuffle_r2g_x_threads
+                local_col = vector_idx % cshuffle_r2g_x_threads * cshuffle_r2g_vec_size
+                global_row = block_m_offset + local_row
+                global_col = block_n_offset + local_col
+                if (global_row < m) and (global_col < n):
+                    c_vec = fx.ptr_load(
+                        smem_c + local_row * block_n + local_col,
+                        result_type=fx.Vector.make_type(cshuffle_r2g_vec_size, elem_dtype),
+                    )
+                    global_offset = global_row * n + global_col
+                    write_cshuffle_vec_to_global(
+                        out,
+                        out_buf,
+                        global_offset,
+                        c_vec,
+                        is_split_k,
+                        is_fp32_output,
+                    )
+        if const_expr(is_split_k):
+            splitk_protocol.finish_split(split_k)
 
 
 @flyc.jit
@@ -850,6 +888,13 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
 
     narrow_n = n <= 1024
     short_k = k <= 1024
+    large_rect_blocks = ((m + 255) // 256) * ((n + 127) // 128)
+    use_large_rect_tile = (
+        k >= 1024
+        and m % 256 == 0
+        and n % 128 == 0
+        and large_rect_blocks >= 256
+    )
 
     # Small square problems are a grid-fill regime, not the long-K narrow-N
     # regime below.  In particular, 512^3 already has 256 independent 32x32
@@ -952,6 +997,14 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
         # 2x2 (4x4 over-subdivides the smaller tile, as on the 64x64 down branch).
         bm = 128 if m >= 256 else 64
         waves = 4 if bm == 128 else 2
+        if use_large_rect_tile:
+            # Four-wave hipBLASLt-class tiles reduce LDS instructions but leave
+            # too little latency hiding in FlyDSL. Eight waves (64x64 per wave)
+            # retain the reuse win: 2048x4096x1024 57.1->50.7us and its
+            # transpose 59.1->54.5us.
+            return dict(block_m=256, block_n=128, block_k=64, stages=1,
+                        split_k=1, m_waves=4, n_waves=2,
+                        buffered_load=True, async_load_bytes=16)
         if m >= 1024 and k % 128 == 0 and m % 128 == 0 and n % 128 == 0:
             # With enough output tiles to fill the machine, bk128 halves the
             # K-loop barriers and b40's write-under-compute schedule hides the
@@ -964,6 +1017,16 @@ def gfx942_auto_config(m: int, n: int, k: int) -> dict:
                     m_waves=waves, n_waves=waves)
 
     # square / general compute-bound
+    if use_large_rect_tile:
+        # Large output grids amortize a 256x128 macro-tile while eight waves
+        # preserve FlyDSL's required latency hiding. On square 4096 the direct
+        # R2G epilogue saves another ~4% (355->340us); it is safe here because
+        # the auto-config only selects exact M/N tile multiples.
+        use_direct_store = m == n and m >= 4096
+        return dict(block_m=256, block_n=128, block_k=64, stages=1,
+                    split_k=1, m_waves=4, n_waves=2,
+                    buffered_load=True, async_load_bytes=16,
+                    direct_store=use_direct_store)
     if k % 128 == 0 and m % 128 == 0 and n % 128 == 0:
         # Same barrier-halving/write-overlap win as large-M down, now that the
         # grid is naturally full.  It improves square 2048/4096 by 6/4% and
@@ -1060,6 +1123,12 @@ def gemm_a16w16(
     if k % kwargs["block_k"] != 0:
         raise ValueError(
             f"K={k} must be divisible by block_k={kwargs['block_k']} (K-tail unsupported)"
+        )
+    if kwargs.get("direct_store", False) and (
+        m % kwargs["block_m"] != 0 or n % kwargs["block_n"] != 0
+    ):
+        raise ValueError(
+            "direct_store requires M and N to be exact block_m/block_n multiples"
         )
     if split_k > 1:
         # Keep every split-K partition an exact, block_k-aligned slice (no K-tail).
