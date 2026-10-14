@@ -1432,6 +1432,28 @@ def _lds_poll_ge(addr_i64, target):
 _lds_poll_ge = traced(_lds_poll_ge)
 
 
+def _lds_read_volatile(addr_i32):
+    """A uniform LDS word, read by an asm load the compiler can neither hoist
+    nor merge -- lighter than an LDS atomic."""
+    from flydsl._mlir.dialects import llvm as _llvm
+
+    v = _llvm.InlineAsmOp(
+        res=T.i32, operands_=[_raw(fx.Int32(addr_i32))],
+        asm_string="ds_load_b32 $0, $1\ns_wait_dscnt 0x0",
+        constraints="=v,v", has_side_effects=True, is_align_stack=False).result
+    return fx.Int32(rocdl.readfirstlane(T.i32, v))
+
+
+def _lds_poll_ge_fast(addr_i32, target):
+    v = _lds_read_volatile(addr_i32)
+    while v < target:
+        rocdl.s_sleep(1)
+        v = _lds_read_volatile(addr_i32)
+
+
+_lds_poll_ge_fast = traced(_lds_poll_ge_fast)
+
+
 def build_dedup_pair_push_module(
     *,
     arena_handle,
@@ -1812,7 +1834,7 @@ SP_RESV = int(os.environ.get("AITER_EP_DEDUP_SP_RESV", "28"))
 # SP_SENDER=1: waves 0-2 load and sum, wave 3 only sends. Then a worker's
 # tensorcnt holds just its loads, and the sender frees a worker's output tile
 # once its store, SW_LAG rounds back, has retired; SW_NOUT tiles per worker.
-SP_SENDER = int(os.environ.get("AITER_EP_DEDUP_SP_SENDER", "0"))
+SP_SENDER = int(os.environ.get("AITER_EP_DEDUP_SP_SENDER", "0"))  # sender waves: 0, 1 or 2
 SW_NOUT = int(os.environ.get("AITER_EP_DEDUP_SW_NOUT", "4"))
 SW_LAG = int(os.environ.get("AITER_EP_DEDUP_SW_LAG", "2"))
 # SP_FIXED=F: a slot's first F rows sit at fixed tile rows (constant offsets in
@@ -1835,6 +1857,21 @@ SP_SUMBATCH = int(os.environ.get("AITER_EP_DEDUP_SP_SUMBATCH", "4"))
 # with transposing LDS loads from input tiles padded 16 B a row.
 SP_WMMA = int(os.environ.get("AITER_EP_DEDUP_SP_WMMA", "0"))
 SP_WMMA_BATCH = int(os.environ.get("AITER_EP_DEDUP_SP_WMMA_BATCH", "8"))  # 16-column blocks per batch
+SP_MAXS = int(os.environ.get("AITER_EP_DEDUP_SP_MAXS", "0"))  # step cap per wave; 0 = worst case
+SP_ROT = int(os.environ.get("AITER_EP_DEDUP_SP_ROT", "0"))  # rotate the chunk order per block
+# Worker <-> sender handoff every SW_GROUP steps: one ready per group, the sender
+# sends the group's stores back to back and frees the group's tiles at once.
+SW_GROUP = int(os.environ.get("AITER_EP_DEDUP_SW_GROUP", "1"))
+# Sender loop: poll flags with plain asm LDS loads, and hold every step's dests
+# in VGPRs instead of reading them from LDS per store.
+SW_FAST = int(os.environ.get("AITER_EP_DEDUP_SW_FAST", "1"))
+# Timing only: every row of a store goes to one rank, (block + worker) % world.
+SW_ONEPE = int(os.environ.get("AITER_EP_DEDUP_SW_ONEPE", "0"))
+# SW_OOO=1: the sender sends whichever worker's next step is ready instead of
+# round by round, keeping its last SW_RING stores in an LDS ring; when the ring
+# is full (or nothing is ready) it retires the oldest and frees that tile.
+SW_OOO = int(os.environ.get("AITER_EP_DEDUP_SW_OOO", "0"))
+SW_RING = int(os.environ.get("AITER_EP_DEDUP_SW_RING", "9"))
 _SP_PROF_PHASES = ("issue loads", "wait loads", "wait free tile", "sum", "lds drain+flag")
 
 
@@ -1855,6 +1892,14 @@ def _sp_prof_buffer(n_words):
 
     def report():
         t = buf.view(-1, 4, 8).cpu().double()
+        snd = t[:, 3]  # the sender wave, with one sender
+        s_alive = snd[:, 7] > 0
+        if s_alive.any():
+            s = snd[s_alive]
+            names = ("poll ready", "build+issue stores", "wait stores", "free flags")
+            print(f"[step-push prof] rank={os.environ.get('RANK')} sender rounds {s[:, 7].mean():.1f}; "
+                  + ", ".join(f"{n} {s[:, i].mean() / 100:.1f}" for i, n in enumerate(names))
+                  + f"; total {s[:, :4].sum(1).mean() / 100:.1f} us", flush=True)
         work = t[:, :3]  # the worker waves
         alive = work[..., 7] > 0
         if not alive.any():
@@ -1884,9 +1929,17 @@ def build_dedup_step_push_module(
     from .tdm_gather_shim import tensor_load_gather
 
     assert SP_NIN == SP_NOUT == 2  # tiles alternate by step parity
-    assert SP_SENDER in (0, 1) and 1 <= SW_LAG < SW_NOUT
+    assert SP_SENDER in (0, 1, 2) and 1 <= SW_LAG < SW_NOUT
     waves = 4
     workers = waves - SP_SENDER
+    # Sender j sends for workers j, j + SP_SENDER, ...
+    per_sender = workers // SP_SENDER if SP_SENDER else 0
+    assert not SP_SENDER or workers % SP_SENDER == 0
+    grp = SW_GROUP
+    assert SW_NOUT % grp == 0 and (grp == 1 or SP_SENDER)
+    # Groups of stores left in flight before a group's tiles are freed.
+    lag_g = SW_LAG if grp == 1 else min(max(1, SW_LAG // grp), SW_NOUT // grp - 1)
+    assert lag_g >= 1
     nouts = SW_NOUT if SP_SENDER else SP_NOUT  # output tiles per worker
     lanes = waves * WAVE
     tmax = 8  # slots per step: the rows of one gather store
@@ -1915,6 +1968,10 @@ def build_dedup_step_push_module(
     # Every step holds at least this many slots, which bounds the step count.
     per_step_min = max(1, SP_OV // (topk - fixed)) if fixed else resv // topk
     maxs = (tw_max + per_step_min - 1) // per_step_min
+    if SP_MAXS:
+        # Experiment: a tighter cap frees LDS. Past it, steps share the last
+        # slot and the sums go wrong (the accuracy check shows it), not memory.
+        maxs = min(maxs, SP_MAXS)
     # Per slot: its local rows first then out_rows, count, dest, a scratch word.
     tm_w = topk + 3
     t_cnt, t_dst, t_junk = topk, topk + 1, topk + 2
@@ -1929,17 +1986,24 @@ def build_dedup_step_push_module(
     assert s_dst + tmax <= s_maxc
     tm_b = ((tb_max * tm_w * 4 + 511) // 512) * 512
     sm_b = workers * maxs * sm_w * 4
+    # With a sender, a barrier ends the packing before any tile is loaded, so
+    # the slot metadata can live in the tiles. The zero row is the packed sum's.
+    tm_in_tiles = bool(SP_SENDER) and tm_b <= workers * (SP_NIN * in_b + nouts * out_b)
+    need_zero = not fixed
     # Per worker ready[nouts], free[nouts]; then each wave's step count.
     f_ready, f_free, f_nsw = 0, nouts, 2 * nouts
     fl_w = 2 * nouts
-    flags_b = ((workers * fl_w + waves) * 4 + 15) // 16 * 16
+    f_ring = workers * fl_w + waves  # SW_OOO: the sender's ring of (worker << 16 | step)
+    assert not SW_OOO or (SP_SENDER == 1 and grp == 1 and 1 <= SW_RING <= 10)
+    flags_b = ((f_ring + SW_RING) * 4 + 15) // 16 * 16
     knobs = KNOBS_TAG
     prof_addr = _sp_prof_buffer(block_num * waves * 8).data_ptr() if SP_PROF else 0
 
     @flyc.kernel(
         name=f"ep_dedup_spushb_{knobs}_i{SP_NIN}o{nouts}r{rrows}v{resv}"
         f"s{SP_SENDER}g{SW_LAG}f{fixed}t{SP_RTOK}h{SP_BF16ACC}w{SP_LSTRIDE}p{SP_PROF}"
-        f"b{SP_SUMBATCH}m{SP_WMMA}x{SP_WMMA_BATCH}"
+        f"b{SP_SUMBATCH}m{SP_WMMA}x{SP_WMMA_BATCH}c{maxs}o{SP_ROT}q{grp}z{SW_FAST}e{SW_ONEPE}"
+        f"k{SW_OOO}{SW_RING}"
         f"l{int(PP_NO_LOAD)}r{int(PP_NO_REDUCE)}_b{block_num}",
         known_block_size=[lanes, 1, 1],
     )
@@ -1958,13 +2022,13 @@ def build_dedup_step_push_module(
         lds_load_b128, lds_store_b128 = make_lds_copy_ops(128)
         smem = fx.SharedAllocator(static=False)
         tiles_base = smem.allocate(workers * wave_b)._ptr
-        zero_base = smem.allocate(row_b)._ptr
-        tm_base = smem.allocate(tm_b)._ptr
+        zero_base = smem.allocate(row_b)._ptr if need_zero else None
+        tm_base = tiles_base if tm_in_tiles else smem.allocate(tm_b)._ptr
         sm_base = smem.allocate(sm_b)._ptr
         flag_base = smem.allocate(flags_b)._ptr
         tm_idx = fx.Int32(fx.ptrtoint(tm_base))
         sm_idx = fx.Int32(fx.ptrtoint(sm_base))
-        zero_idx = fx.Int32(fx.ptrtoint(zero_base))
+        zero_idx = fx.Int32(fx.ptrtoint(zero_base)) if need_zero else fx.Int32(0)
         flag_idx = fx.Int32(fx.ptrtoint(flag_base))
         is_worker = wave < fx.Int32(workers)
         # The sender owns no tiles; clamp so its (unused) addresses stay in range.
@@ -2027,8 +2091,9 @@ def build_dedup_step_push_module(
             in_pack = (f >= fx.Int32(s_pack)) & (f < fx.Int32(s_off))
             in_dst = (f >= fx.Int32(s_dst)) & (f < fx.Int32(s_dst + tmax))
             put(sm_idx, i, in_pack.select(out_rows, in_dst.select(oob, fx.Int32(0))))
-        for i in range(tid, row_b // 4, lanes):
-            put(zero_idx, i, fx.Int32(0))
+        if const_expr(need_zero):
+            for i in range(tid, row_b // 4, lanes):
+                put(zero_idx, i, fx.Int32(0))
         rocdl.s_wait_dscnt(0)
         gpu.barrier()
 
@@ -2059,6 +2124,7 @@ def build_dedup_step_push_module(
             full = (nt == fx.Int32(tmax)) | (used + takes > fx.Int32(cap))
             new = live & full & (nt > fx.Int32(0))
             st = new.select(st + fx.Int32(1), st)
+            st = (st > fx.Int32(maxs - 1)).select(fx.Int32(maxs - 1), st)
             nt = new.select(fx.Int32(0), nt)
             used = new.select(fx.Int32(0), used)
             mc = new.select(fx.Int32(0), mc)
@@ -2117,11 +2183,19 @@ def build_dedup_step_push_module(
 
         n_sw_safe = (n_sw > fx.Int32(0)).select(n_sw, fx.Int32(1))
 
+        def chunk_col(ch):
+            """First column of the ch-th chunk this block visits. SP_ROT starts
+            each block at a different chunk, so the blocks' peer stores spread
+            over the slot rows instead of all hitting one 1 KB column slice."""
+            if const_expr(SP_ROT):
+                ch = (ch + fx.Int32(bid)) % fx.Int32(iters)
+            return ch * fx.Int32(row_e)
+
         def step_coords(s):
             """Step s: column chunk s // n_sw (the order flags would come in),
             packed step s % n_sw of this wave."""
             ch = s // n_sw_safe
-            return s - ch * n_sw_safe, ch * fx.Int32(row_e)
+            return s - ch * n_sw_safe, chunk_col(ch)
 
         def pick(v, i):
             return fx.Int32(rocdl.readlane(T.i32, _raw(v), _raw(fx.Int32(i))))
@@ -2318,14 +2392,27 @@ def build_dedup_step_push_module(
             rocdl.s_wait_dscnt(0)
             store_step(s)
 
-        def send(w, n_sw_w, t, ob, live):
-            """Worker w's step t (of its n_sw_w per chunk), from its output tile ob."""
+        def send(w, n_sw_w, t, ob, live, dst_regs=None):
+            """Worker w's step t (of its n_sw_w per chunk), from its output tile ob.
+            ``dst_regs``: the worker's dests, step k's slot j in lane (k % 4) * 8 + j
+            of register k // 4."""
             nsafe = (n_sw_w > fx.Int32(0)).select(n_sw_w, fx.Int32(1))
             ch = t // nsafe
             k = t - ch * nsafe
-            e0 = ch * fx.Int32(row_e)
+            e0 = chunk_col(ch)
             wsm = sm_idx + fx.Int32(w * maxs * sm_w * 4)
-            if const_expr(STORE_LOCAL):
+            if const_expr(dst_regs is not None and not STORE_LOCAL):
+                h = k // fx.Int32(4)
+                reg = dst_regs[0]
+                for hh in range_constexpr(1, len(dst_regs)):
+                    reg = (h == fx.Int32(hh)).select(dst_regs[hh], reg)
+                lane0 = (k - h * fx.Int32(4)) * fx.Int32(tmax)
+                idx = [live.select(fx.Int32(rocdl.readlane(T.i32, _raw(reg), _raw(lane0 + fx.Int32(j)))),
+                                   oob) for j in range_constexpr(tmax)]
+                if const_expr(SW_ONEPE):
+                    pe1 = (fx.Int32(bid) + fx.Int32(w)) % fx.Int32(world_size)
+                    idx = [(x < oob).select(pe1 * k_slots + x % k_slots, oob) for x in idx]
+            elif const_expr(STORE_LOCAL):
                 packed = lane_words(k, s_pack, resv, wsm)
                 oc = lane_words(k, s_off, 2 * tmax, wsm)
                 idx = [(live & (pick(oc, tmax + j) > fx.Int32(0))).select(
@@ -2347,6 +2434,13 @@ def build_dedup_step_push_module(
             )
             if const_expr(not NO_STORE):
                 tensor_store_gather(desc)
+
+        def poll_flag(w, f, i, target):
+            if const_expr(SW_FAST):
+                _lds_poll_ge_fast(
+                    flag_idx + (fx.Int32(w) * fx.Int32(fl_w) + fx.Int32(f) + i) * fx.Int32(4), target)
+            else:
+                _lds_poll_ge(flag(w, f, i), target)
 
         if const_expr(SP_SENDER):
             if is_worker:
@@ -2373,8 +2467,13 @@ def build_dedup_step_push_module(
                     tdm_ops.tensor_wait(loads_per_step)
                     t_ = tick(t_, 1)
                     ob = s % fx.Int32(nouts)
-                    # The tile's previous use, nouts steps back, has been sent.
-                    _lds_poll_ge(flag(wave, f_free, ob), s // fx.Int32(nouts))
+                    # The tile's previous use, nouts steps back, has been sent. A
+                    # group's tiles go free together, flagged on its first tile.
+                    if const_expr(grp == 1):
+                        poll_flag(wave, f_free, ob, s // fx.Int32(nouts))
+                    else:
+                        if s % fx.Int32(grp) == fx.Int32(0):
+                            poll_flag(wave, f_free, ob, s // fx.Int32(nouts))
                     t_ = tick(t_, 2)
                     if const_expr(PP_NO_REDUCE):
                         pass
@@ -2384,8 +2483,14 @@ def build_dedup_step_push_module(
                         reduce_step(s, ob)
                     t_ = tick(t_, 3)
                     rocdl.s_wait_dscnt(0)
-                    if lane == fx.Int32(0):
-                        store_i32_lds(flag(wave, f_ready, ob), s + fx.Int32(1))
+                    if const_expr(grp == 1):
+                        if lane == fx.Int32(0):
+                            store_i32_lds(flag(wave, f_ready, ob), s + fx.Int32(1))
+                    else:
+                        # One ready per group, on its first tile, once its last step is in.
+                        g_end = (s % fx.Int32(grp) == fx.Int32(grp - 1)) | (s + fx.Int32(1) == n_steps)
+                        if (lane == fx.Int32(0)) & g_end:
+                            store_i32_lds(flag(wave, f_ready, ob - s % fx.Int32(grp)), s + fx.Int32(1))
                     t_ = tick(t_, 4)
                 tdm_ops.tensor_wait(0)
                 if const_expr(SP_PROF):
@@ -2398,28 +2503,152 @@ def build_dedup_step_push_module(
                                      create_buffer_resource_from_addr(fx.Int64(prof_addr).ir_value()),
                                      (bid * fx.Int32(waves) + wave) * fx.Int32(8) + lane)
             else:
+                # Sender j serves workers w with w % SP_SENDER == j, per_sender of them.
+                me = wave - fx.Int32(workers)
+                mine = [fx.Int32(w % SP_SENDER) == me for w in range_constexpr(workers)]
                 nsw = [get(flag_idx, fx.Int32(workers * fl_w + w)) for w in range_constexpr(workers)]
                 nst = [x * fx.Int32(iters) for x in nsw]
-                rounds = nst[0]
-                for w in range_constexpr(1, workers):
-                    rounds = (nst[w] > rounds).select(nst[w], rounds)
-                # Round t sends every worker's step t (a dead one sends no rows,
-                # keeping the count); stores retire in order, so after round t
-                # the ones SW_LAG rounds back have, and their tiles go free.
-                for t in range(rounds):
-                    t_ob = t % fx.Int32(nouts)
+                rounds = fx.Int32(0)
+                for w in range_constexpr(workers):
+                    rounds = (mine[w] & (nst[w] > rounds)).select(nst[w], rounds)
+                dst_regs = [None] * workers
+                if const_expr(SW_FAST and not STORE_LOCAL):
+                    # Lane l of register h: step h * 4 + l // 8, slot l % 8.
+                    n_regs = (maxs + 3) // 4
                     for w in range_constexpr(workers):
-                        if t < nst[w]:
-                            _lds_poll_ge(flag(w, f_ready, t_ob), t + fx.Int32(1))
-                        send(w, nsw[w], t, t_ob, t < nst[w])
-                    if t >= fx.Int32(SW_LAG):
-                        tdm_ops.tensor_wait(workers * SW_LAG)
-                        t_done = t - fx.Int32(SW_LAG)
+                        regs = []
+                        for h in range_constexpr(n_regs):
+                            k_l = fx.Int32(h * 4) + lane // fx.Int32(tmax)
+                            k_l = (k_l < fx.Int32(maxs)).select(k_l, fx.Int32(maxs - 1))
+                            word = (fx.Int32(w * maxs) + k_l) * fx.Int32(sm_w) + fx.Int32(s_dst) \
+                                + lane % fx.Int32(tmax)
+                            regs.append(fx.Int32(lds_load_b32(sm_idx, word * fx.Int32(4))[0]))
+                        dst_regs[w] = regs
+                    rocdl.s_wait_dscnt(0)
+
+                def poll_ready(w, ob, target):
+                    poll_flag(w, f_ready, ob, target)
+
+                # Round t sends each of its workers' step t (a dead one sends no
+                # rows, keeping the count); stores retire in order, so after
+                # round t the ones SW_LAG rounds back have, and their tiles go free.
+                # With SW_GROUP > 1 a round is a group of grp steps: one ready
+                # wait per worker, grp stores back to back, one free.
+                n_groups_s = (rounds + fx.Int32(grp - 1)) // fx.Int32(grp)
+                if const_expr(SP_PROF):
+                    sprof = fx.make_rmem_tensor(8, fx.Int32)
+                    sprof.store(fx.constant_vector(0, T.vec(8, T.i32)))
+
+                def stick(prev, i):
+                    if const_expr(not SP_PROF):
+                        return prev
+                    now = _realtime_lo()
+                    v = Vec(sprof.load())
+                    sprof.store(Vec.from_elements(
+                        [v[j] + (now - prev if j == i else fx.Int32(0)) for j in range(8)],
+                        fx.Int32).ir_value())
+                    return now
+
+                if const_expr(SW_OOO):
+                    # Per worker its next step to send; then issued and retired counts.
+                    ooo_total = fx.Int32(0)
+                    for w in range_constexpr(workers):
+                        ooo_total = ooo_total + nst[w]
+                    ring_idx = flag_idx + fx.Int32(f_ring * 4)
+
+                    def free_entry(q_old):
+                        """Store number q_old has retired: free its worker's tile."""
+                        ooo_e = _lds_read_volatile(ring_idx + (q_old % fx.Int32(SW_RING)) * fx.Int32(4))
+                        ooo_w = ooo_e >> fx.Int32(16)
+                        ooo_t = ooo_e & fx.Int32(0xFFFF)
+                        if lane == fx.Int32(0):
+                            store_i32_lds(
+                                flag_addr + fx.Int64((ooo_w * fx.Int32(fl_w) + fx.Int32(f_free)
+                                                      + ooo_t % fx.Int32(nouts)) * fx.Int32(4)),
+                                ooo_t // fx.Int32(nouts) + fx.Int32(1))
+
+                    def try_send(w, n_w, q, qf, n_sent):
+                        """Send worker w's step n_w if it is ready. State goes in and
+                        out as values; the branches only hold side effects."""
+                        safe_n = (n_w < nst[w]).select(n_w, fx.Int32(0))
+                        ooo_r = _lds_read_volatile(
+                            flag_idx + (fx.Int32(w * fl_w + f_ready) + safe_n % fx.Int32(nouts))
+                            * fx.Int32(4))
+                        rdy = (n_w < nst[w]) & (ooo_r > n_w)
+                        if rdy:
+                            send(w, nsw[w], safe_n, safe_n % fx.Int32(nouts), rdy, dst_regs[w])
+                            if lane == fx.Int32(0):
+                                store_i32_lds(
+                                    fx.Int64(ring_idx + (q % fx.Int32(SW_RING)) * fx.Int32(4)),
+                                    fx.Int32(w << 16) | safe_n)
+                        q2 = rdy.select(q + fx.Int32(1), q)
+                        # In issue order: at most SW_RING left means the oldest is done.
+                        full = rdy & (q2 - qf > fx.Int32(SW_RING))
+                        if full:
+                            tdm_ops.tensor_wait(SW_RING)
+                            free_entry(qf)
+                        return (rdy.select(n_w + fx.Int32(1), n_w), q2,
+                                full.select(qf + fx.Int32(1), qf),
+                                n_sent + rdy.select(fx.Int32(1), fx.Int32(0)))
+
+                    assert workers == 3
+                    o_n0 = fx.Int32(0)
+                    o_n1 = fx.Int32(0)
+                    o_n2 = fx.Int32(0)
+                    o_q = fx.Int32(0)
+                    o_qf = fx.Int32(0)
+                    while o_qf < ooo_total:
+                        o_any = fx.Int32(0)
+                        o_n0, o_q, o_qf, o_any = try_send(0, o_n0, o_q, o_qf, o_any)
+                        o_n1, o_q, o_qf, o_any = try_send(1, o_n1, o_q, o_qf, o_any)
+                        o_n2, o_q, o_qf, o_any = try_send(2, o_n2, o_q, o_qf, o_any)
+                        # Nothing was ready: let the oldest store retire, and free it.
+                        o_inf = o_q - o_qf
+                        o_ret = (o_any == fx.Int32(0)) & (o_inf > fx.Int32(0))
+                        if o_ret:
+                            for v in range_constexpr(SW_RING):
+                                if o_inf == fx.Int32(v + 1):
+                                    tdm_ops.tensor_wait(v)
+                            free_entry(o_qf)
+                        if (o_any == fx.Int32(0)) & (o_inf == fx.Int32(0)):
+                            rocdl.s_sleep(1)
+                        o_qf = o_ret.select(o_qf + fx.Int32(1), o_qf)
+                    tdm_ops.tensor_wait(0)
+                    n_groups_s = fx.Int32(0)  # skip the round loop below
+
+                for tg in range(n_groups_s):
+                    t0 = tg * fx.Int32(grp)
+                    t_ob = t0 % fx.Int32(nouts)
+                    st_ = _realtime_lo() if SP_PROF else fx.Int32(0)
+                    for w in range_constexpr(workers):
+                        if mine[w]:
+                            if t0 < nst[w]:
+                                g_last = (t0 + fx.Int32(grp) > nst[w]).select(nst[w], t0 + fx.Int32(grp))
+                                poll_ready(w, t_ob, g_last)
+                            st_ = stick(st_, 0)
+                            for g in range_constexpr(grp):
+                                send(w, nsw[w], t0 + fx.Int32(g), t_ob + fx.Int32(g),
+                                     t0 + fx.Int32(g) < nst[w], dst_regs[w])
+                            st_ = stick(st_, 1)
+                    if tg >= fx.Int32(lag_g):
+                        tdm_ops.tensor_wait(per_sender * grp * lag_g)
+                        st_ = stick(st_, 2)
+                        t_done = (tg - fx.Int32(lag_g)) * fx.Int32(grp)
                         for w in range_constexpr(workers):
-                            if (lane == fx.Int32(0)) & (t_done < nst[w]):
+                            if (lane == fx.Int32(0)) & mine[w] & (t_done < nst[w]):
                                 store_i32_lds(flag(w, f_free, t_done % fx.Int32(nouts)),
                                               t_done // fx.Int32(nouts) + fx.Int32(1))
+                        st_ = stick(st_, 3)
                 tdm_ops.tensor_wait(0)
+                if const_expr(SP_PROF):
+                    v = Vec(sprof.load())
+                    if lane < fx.Int32(8):
+                        pv = (lane == fx.Int32(7)).select(n_groups_s, fx.Int32(0))
+                        for j in range_constexpr(4):
+                            pv = (lane == fx.Int32(j)).select(v[j], pv)
+                        buffer_store(pv.ir_value(),
+                                     create_buffer_resource_from_addr(fx.Int64(prof_addr).ir_value()),
+                                     (bid * fx.Int32(waves) + wave) * fx.Int32(8) + lane)
         else:
             load_step(fx.Int32(0))
             # In issue order, step s's loads are followed by the previous step's
