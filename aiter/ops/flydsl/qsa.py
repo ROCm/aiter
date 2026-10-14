@@ -31,6 +31,8 @@ import functools
 
 import torch
 
+from aiter.jit.utils.chip_info import get_gfx_runtime
+
 from .kernels.kernels_common import LOG2E, get_warp_size
 from .kernels.qsa import (
     QsaGqaSpec,
@@ -46,7 +48,6 @@ from .kernels.qsa import (
     qsa_topk_blocks,
     qsa_visible_blocks,
 )
-from .kernels.qsa.arch import qsa_device_arch
 from .kernels.qsa.indexer_select import (
     _D,
     _DECODE_MAX_ROWS,
@@ -78,6 +79,20 @@ from .topk.topk_per_row import (
     _ONE_WORKGROUP_MAX_ROW_WIDTH,
     flydsl_top_k_per_row_decode,
 )
+
+_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+
+def _qsa_arch() -> str:
+    """Live GPU arch, or raise when it is not gfx942 or gfx950.
+
+    ``get_gfx_runtime`` ignores ``GPU_ARCHS`` and returns the bare token.
+    """
+    arch = get_gfx_runtime()
+    if arch not in _SUPPORTED_ARCHS:
+        raise ValueError(f"QSA supports {', '.join(_SUPPORTED_ARCHS)}, got {arch}")
+    return arch
+
 
 # GQA query ``(n_q_heads, head_dim)`` -> the indexer head counts swept with
 # it. An unswept rank-3 pair still runs; the table only feeds the warning.
@@ -359,7 +374,7 @@ def qsa_k1_score_and_select(
         _check_k1_score_workspace(scores, m, n_columns)
         if scores.device != q.device:
             raise ValueError("scores must be on the same device as q")
-    arch = qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
+    arch = _qsa_arch()
     use_k32 = arch == "gfx950"
     page_size = k_cache.shape[1]
     score_block_n = 32
@@ -598,7 +613,7 @@ def qsa_k1_block_ids(
         raise ValueError("every tensor must be on the GPU")
     if any(t.device != q.device for t in tensors[1:]):
         raise ValueError("every tensor must be on the same GPU")
-    qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
+    _qsa_arch()
     # The scorers clamp a missing request or page to 0 and still load it.
     # An empty axis has no such element, and every selection is -1.
     if (
@@ -831,7 +846,7 @@ def qsa_k2(
         raise ValueError("every tensor must be on the GPU")
     if any(tensor.device != q.device for tensor in tensors[1:]):
         raise ValueError("every tensor must be on the same GPU")
-    arch = qsa_device_arch(torch.cuda.get_device_properties(q.device).gcnArchName)
+    arch = _qsa_arch()
     if softmax_scale is None:
         softmax_scale = head_dim**-0.5
     width = int(indices.shape[1])

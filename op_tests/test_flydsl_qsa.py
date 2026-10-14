@@ -1078,27 +1078,30 @@ def test_k1_decode_rejects_invalid_page_ids():
     _assert_k1_block_ids(ref_ids, got, "K1 decode kept a block whose page id is -1")
 
 
-def test_qsa_arch_allowlist():
-    """qsa_device_arch accepts gfx942 and gfx950, including an ISA suffix.
+def test_qsa_arch_allowlist(monkeypatch):
+    """_qsa_arch accepts the live gfx942 and gfx950 tokens.
 
-    A name that does not start with gfx950 used to take the gfx942 tile.
-    Anything else raises.
+    ``get_gfx_runtime`` returns the bare arch. A longer token such as
+    gfx9420 raises, as does any other arch. The AOT compile context
+    substitutes the job arch for that lookup.
     """
-    from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
+    from aiter.aot.flydsl.qsa import _qsa_compile_device
+    from aiter.ops.flydsl import qsa as qsa_mod
 
-    accepted = {
-        "gfx942": "gfx942",
-        "gfx950": "gfx950",
-        "gfx942:sramecc+:xnack-": "gfx942",
-        "gfx950:sramecc+:xnack-": "gfx950",
-    }
-    for raw, want in accepted.items():
-        got = qsa_device_arch(raw)
-        if got != want:
-            raise AssertionError(f"{raw!r} resolved to {got!r}, want {want!r}")
+    for arch, cu_num in (("gfx942", 304), ("gfx950", 256)):
+        with _qsa_compile_device(arch, cu_num):
+            got = qsa_mod._qsa_arch()
+        if got != arch:
+            raise AssertionError(f"compile context {arch!r} resolved to {got!r}")
+    for arch in ("gfx942", "gfx950"):
+        monkeypatch.setattr(qsa_mod, "get_gfx_runtime", lambda arch=arch: arch)
+        got = qsa_mod._qsa_arch()
+        if got != arch:
+            raise AssertionError(f"{arch!r} resolved to {got!r}")
     for bad in ("gfx1100", "gfx1250", "gfx90a", "gfx9420", "GFX950", ""):
+        monkeypatch.setattr(qsa_mod, "get_gfx_runtime", lambda bad=bad: bad)
         try:
-            qsa_device_arch(bad)
+            qsa_mod._qsa_arch()
         except ValueError:
             continue
         raise AssertionError(f"{bad!r} was accepted")

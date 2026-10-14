@@ -100,10 +100,9 @@ def _qsa_aot_targets() -> list[tuple[str, int]]:
         return [(arch, GFX_CU_NUM_MAP[arch]) for arch in archs]
     if torch.cuda.is_available():
         from aiter.jit.utils.chip_info import get_cu_num
-        from aiter.ops.flydsl.kernels.qsa.arch import qsa_device_arch
+        from aiter.ops.flydsl.qsa import _qsa_arch
 
-        arch = qsa_device_arch(torch.cuda.get_device_properties(0).gcnArchName)
-        return [(arch, int(get_cu_num()))]
+        return [(_qsa_arch(), int(get_cu_num()))]
     return [(arch, GFX_CU_NUM_MAP[arch]) for arch in _QSA_ARCHS]
 
 
@@ -111,12 +110,15 @@ def _qsa_aot_targets() -> list[tuple[str, int]]:
 def _qsa_compile_device(arch: str, cu_num: int):
     """Present ``arch`` to the QSA wrappers without allocating a device buffer.
 
-    The wrappers read ``gcnArchName`` and, on gfx942, the CU count. Fake
-    tensors satisfy the CUDA checks. ``COMPILE_ONLY`` never launches, so
-    the stream is only a value the launcher records.
+    The wrappers call ``get_gfx_runtime``. This substitutes the job arch for
+    that call, and on gfx942 they also read the CU count. Fake tensors
+    satisfy the CUDA checks. The fake ``gcnArchName`` covers helpers that
+    still read device properties. ``COMPILE_ONLY`` never launches, so the
+    stream is only a value the launcher records.
     """
     from torch._subclasses.fake_tensor import FakeTensorMode
 
+    import aiter.ops.flydsl.qsa as qsa_mod
     from aiter.jit.utils.chip_info import get_cu_num
 
     class _Props:
@@ -125,15 +127,17 @@ def _qsa_compile_device(arch: str, cu_num: int):
     class _Stream:
         cuda_stream = 0
 
+    saved_runtime = qsa_mod.get_gfx_runtime
     saved = (
         torch.cuda.get_device_properties,
         torch.cuda.current_stream,
         torch.cuda.is_current_stream_capturing,
     )
-    torch.cuda.get_device_properties = lambda device=None: _Props()
-    torch.cuda.current_stream = lambda device=None: _Stream()
-    torch.cuda.is_current_stream_capturing = lambda: False
     try:
+        qsa_mod.get_gfx_runtime = lambda: arch
+        torch.cuda.get_device_properties = lambda device=None: _Props()
+        torch.cuda.current_stream = lambda device=None: _Stream()
+        torch.cuda.is_current_stream_capturing = lambda: False
         with (
             FakeTensorMode(),
             override_env("ARCH", arch),
@@ -146,6 +150,7 @@ def _qsa_compile_device(arch: str, cu_num: int):
             finally:
                 get_cu_num.cache_clear()
     finally:
+        qsa_mod.get_gfx_runtime = saved_runtime
         (
             torch.cuda.get_device_properties,
             torch.cuda.current_stream,
