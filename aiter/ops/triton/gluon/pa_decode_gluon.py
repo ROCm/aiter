@@ -11,12 +11,6 @@ from triton.language.extra.hip import libdevice as hip_libdevice
 import aiter
 from aiter.ops.triton.utils._triton import arch_info
 
-_FLYDSL_REDUCE_DTYPE_NAMES = {
-    torch.float32: "f32",
-    torch.float16: "f16",
-    torch.bfloat16: "bf16",
-}
-
 CXX_PS_REDUCE_AVAILABLE = True
 try:
     from csrc.cpp_itfs.pa.pa_ps import (
@@ -25,19 +19,6 @@ try:
 except Exception:  # noqa: BLE001
     CXX_PS_REDUCE_AVAILABLE = False
     launch_pa_decode_ps_reduce_cxx = None
-
-FLYDSL_PS_REDUCE_AVAILABLE = True
-try:
-    from aiter.ops.flydsl.kernels.pa_decode_reduce import (
-        is_pa_decode_ps_reduce_supported,
-    )
-    from aiter.ops.flydsl.pa_decode import (
-        launch_pa_decode_ps_reduce as launch_pa_decode_ps_reduce_flydsl,
-    )
-except Exception:  # noqa: BLE001
-    FLYDSL_PS_REDUCE_AVAILABLE = False
-    launch_pa_decode_ps_reduce_flydsl = None
-    is_pa_decode_ps_reduce_supported = None
 
 GLUON_JIT_KERNEL_ENABLED = True
 try:
@@ -4513,15 +4494,7 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
     PS=False,
     context_partition_num=1,
 ):
-    """
-    Wrapper function for paged attention reduction kernel with kernel selection.
-
-    This wrapper selects between Gluon and Triton kernel implementations
-    based on configuration and launches the appropriate kernel.
-
-    Args:
-        All parameters from the reduction kernel plus execution grid configuration
-    """
+    """Dispatch partition reduction to C++ or Triton."""
     if PS:
         if CXX_PS_REDUCE_AVAILABLE:
             try:
@@ -4550,49 +4523,6 @@ def _paged_attention_decode_v2_reduce_kernel_wrapper(
                 return
             except ImportError:
                 pass
-        output_dtype_str = _FLYDSL_REDUCE_DTYPE_NAMES.get(output_ptr.dtype)
-        logits_dtype_str = _FLYDSL_REDUCE_DTYPE_NAMES.get(logits_ptr.dtype)
-        sink_dtype_str = _FLYDSL_REDUCE_DTYPE_NAMES.get(
-            output_ptr.dtype if sink_token_ptr is None else sink_token_ptr.dtype
-        )
-        flydsl_supported = (
-            FLYDSL_PS_REDUCE_AVAILABLE
-            and output_dtype_str is not None
-            and logits_dtype_str is not None
-            and sink_dtype_str is not None
-            and is_pa_decode_ps_reduce_supported(
-                max_context_partition_num=context_partition_num,
-                head_size=head_size,
-                output_dtype_str=output_dtype_str,
-                logits_dtype_str=logits_dtype_str,
-                sink_dtype_str=sink_dtype_str,
-            )
-        )
-        if flydsl_supported:
-            launch_pa_decode_ps_reduce_flydsl(
-                output_ptr,
-                exp_sums_ptr,
-                max_logits_ptr,
-                logits_ptr,
-                sink_token_ptr,
-                stride_output_bs,
-                stride_output_len,
-                stride_output_kv_head,
-                stride_output_group_size,
-                stride_exp_sums_seq,
-                stride_exp_sums_head,
-                stride_exp_sums_part,
-                stride_logits_seq,
-                stride_logits_head,
-                stride_logits_part,
-                stride_logits_group,
-                query_seq_len=query_seq_len,
-                query_group_size=query_group_size,
-                head_size=head_size,
-                context_partition_num=context_partition_num,
-                stream=torch.cuda.current_stream(output_ptr.device),
-            )
-            return
         ps_reduce_grid = (grid[0], grid[1], query_seq_len * query_group_size)
         paged_attention_decode_ps_reduce_kernel[ps_reduce_grid](
             output_ptr,
