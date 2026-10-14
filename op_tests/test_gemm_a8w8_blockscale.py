@@ -161,7 +161,7 @@ def test_gemm(
         gemm_x_scale = shuffle_scale_blockscale_a(x_scale, k)
         gemm_w_scale = shuffle_scale_blockscale_b(w_scale, n, k)
     elif use_flydsl_fp8_scale:
-        gemm_x_scale = x_scale
+        gemm_x_scale = x_scale_t if get_gfx() == "gfx1250" else x_scale
         gemm_w_scale = w_scale
     else:
         gemm_x_scale = x_scale_t if ck_preshuffle else x_scale

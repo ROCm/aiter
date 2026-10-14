@@ -35,6 +35,12 @@ target-version = "py310"
 # against the root-relative path, so the setuptools output directory stays
 # excluded while aiter/dist/ is now checked (+348 pre-existing findings).
 exclude = [
+    # The review bot's tooling. It is not part of the package, and this repo's style tools have
+    # never seen it: `.gitignore` hid `.claude/` wholesale, and both ruff and black skip what git
+    # ignores. Narrowing that ignore -- so a new skill file can actually be committed instead of
+    # vanishing silently -- must not also drag an unrelated 174-finding burndown into every PR
+    # that touches the bot. The skill has its own check (review-bot-selftest.yml).
+    ".claude",
     ".bzr",
     ".direnv",
     ".eggs",
@@ -86,3 +92,10 @@ tag_regex = "^(?:[\\w-]+-)?(?P<version>[vV]?\\d+(?:\\.\\d+){0,2}[^-+]*(?:-(?:pre
 filterwarnings = [
     "ignore:`torch.jit.script_method` is deprecated:DeprecationWarning",
 ]
+
+[tool.black]
+# Same reason as ruff's `.claude` exclude above: narrowing .gitignore made the bot's tooling
+# visible to the formatter for the first time, and reformatting it is not this change.
+extend-exclude = '''
+/\.claude/
+'''

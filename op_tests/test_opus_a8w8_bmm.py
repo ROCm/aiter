@@ -31,11 +31,22 @@ import aiter
 from aiter import dtypes
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.ops.opus import opus_bmm
+from aiter.ops.opus.gemm_op_a8w8 import (
+    _opus_gemm_a8w8_mxscale_bmm_launch_raw,
+)
 from aiter.ops.opus.policy import lookup_mxscale_bmm_config
+from aiter.ops.shuffle import shuffle_weight
 from aiter.test_common import benchmark, checkAllclose, run_perftest
+from csrc.opus_gemm.opus_gemm_common import (
+    a8w8_mxscale_bmm_kernels_list,
+)
 
 SUPPORTED_GFX = ["gfx950"]  # fp8 e8m0 mxscale flatmm is gfx950-only
-GROUP = 128  # GROUP_N == GROUP_K == 128; GROUP_M == 1 (per-token)
+# Default quantisation block. GROUP_M is always 1 (per token); GROUP_N and
+# GROUP_K move together, since A and B quantise on the same block -- DSv4's 128
+# or MX's 32. The helpers below take it as an argument so one shape can be
+# generated at either granularity and handed to the kid tuned for it.
+GROUP = 128
 _DT = {"fp32": dtypes.fp32, "bf16": dtypes.bf16}
 
 
@@ -63,6 +74,57 @@ def _run_opus(
     return out
 
 
+def _preshuffled_kids():
+    """Kids whose B must be shuffle_weight(w, layout=(16, 16)).
+
+    Imported lazily for the same reason as _align_kids: the helpers here are
+    reused by scripts that must not need the codegen package on sys.path.
+    """
+    from csrc.opus_gemm.opus_gemm_common import a8w8_mxscale_bmm_kernel_lists
+
+    return {
+        int(kid)
+        for fam in a8w8_mxscale_bmm_kernel_lists
+        for kid, inst in fam.items()
+        if inst.needs_preshuffled_b
+    }
+
+
+def _scale_picker(xs_mx, ws_mx, n, k):
+    """Return kid -> the (A, B) scale buffers that kid reads.
+
+    Every built kid reads ordinary per-token / per-block scales; only A is
+    flipped token-major to match the launcher. Kept as a picker so a kid that
+    wants a different scale layout has one place to say so.
+    """
+    scales = (xs_mx.transpose(0, 1), ws_mx)
+
+    def pick(kid):
+        return scales
+
+    return pick
+
+
+def _weight_picker(W_mx):
+    """Return kid -> the B buffer that kid reads, shuffling at most once.
+
+    A preshuffled kid handed the row-major buffer does not raise, it just
+    computes the wrong answer against the same reference, so the choice cannot
+    be left to the caller.
+    """
+    preshuffled = _preshuffled_kids()
+    cache = {}
+
+    def pick(kid):
+        if kid not in preshuffled:
+            return W_mx
+        if "sh" not in cache:
+            cache["sh"] = shuffle_weight(W_mx, layout=(16, 16))
+        return cache["sh"]
+
+    return pick
+
+
 def _to_e8m0_scale(scale):
     # Round scale up to a power of two so quantized fp8 values stay in range.
     e = torch.ceil(torch.log2(scale.to(dtypes.fp32))).to(torch.int32) + 127
@@ -71,38 +133,40 @@ def _to_e8m0_scale(scale):
     return e, scale_pow2
 
 
-def _quant_per_token_e8m0(x_bf16):
-    """[G,M,K] bf16 -> fp8 + e8m0 x_scale [G,M,K/128] + fp32 scale."""
+def _quant_per_token_e8m0(x_bf16, group=GROUP):
+    """[G,M,K] bf16 -> fp8 + e8m0 x_scale [G,M,K/group] + fp32 scale."""
     G, M, K = x_bf16.shape
-    xb = x_bf16.to(dtypes.fp32).view(G, M, K // GROUP, GROUP)
+    xb = x_bf16.to(dtypes.fp32).view(G, M, K // group, group)
     raw = xb.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / 448.0
     e8m0, scale = _to_e8m0_scale(raw)
     q = (xb / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
     return q.view(G, M, K), e8m0.squeeze(-1), scale.squeeze(-1)
 
 
-def _quant_block_e8m0(w_bf16):
-    """[G,N,K] bf16 -> fp8 + e8m0 w_scale [G,N/128,K/128] + fp32 scale."""
+def _quant_block_e8m0(w_bf16, group=GROUP, group_n=None):
+    """[G,N,K] bf16 -> fp8 + e8m0 w_scale [G,N/group,K/group] + fp32 scale."""
     G, N, K = w_bf16.shape
-    wb = w_bf16.to(dtypes.fp32).view(G, N // GROUP, GROUP, K // GROUP, GROUP)
+    group_n = group if group_n is None else group_n
+    wb = w_bf16.to(dtypes.fp32).view(G, N // group_n, group_n, K // group, group)
     raw = wb.abs().amax(dim=(2, 4), keepdim=True).clamp(min=1e-8) / 448.0
     e8m0, scale = _to_e8m0_scale(raw)
     q = (wb / scale).clamp(-448.0, 448.0).to(dtypes.fp8)
     return (
         q.view(G, N, K),
-        e8m0.view(G, N // GROUP, K // GROUP),
-        scale.view(G, N // GROUP, K // GROUP),
+        e8m0.view(G, N // group_n, K // group),
+        scale.view(G, N // group_n, K // group),
     )
 
 
-def run_torch(O_fp8, W_fp8, x_scale, w_scale):
+def run_torch(O_fp8, W_fp8, x_scale, w_scale, group=GROUP, group_n=None):
     """Reference: dequant fp8 -> fp32 einsum -> [G,M,N]. Not timed."""
     G, M, K = O_fp8.shape
     N = W_fp8.shape[1]
-    act = O_fp8.to(dtypes.fp32).view(G, M, K // GROUP, GROUP)
+    group_n = group if group_n is None else group_n
+    act = O_fp8.to(dtypes.fp32).view(G, M, K // group, group)
     act = (act * x_scale.unsqueeze(-1)).view(G, M, K)
-    W = W_fp8.to(dtypes.fp32).view(G, N // GROUP, GROUP, K // GROUP, GROUP)
-    W = (W * w_scale.view(G, N // GROUP, 1, K // GROUP, 1)).view(G, N, K)
+    W = W_fp8.to(dtypes.fp32).view(G, N // group_n, group_n, K // group, group)
+    W = (W * w_scale.view(G, N // group_n, 1, K // group, 1)).view(G, N, K)
     return torch.einsum("gmk,gnk->gmn", act, W).to(dtypes.fp32)
 
 
@@ -139,9 +203,20 @@ def test_mxscale_bmm(g, m, n, k, dtype):
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)  # [m,g,n]
     y_shape = (m, g, n)
 
+    weight_for = _weight_picker(W_mx)
+
     def _call(kid):
         Y = torch.empty(y_shape, dtype=ydt)
-        _run_opus(O_in, W_mx, Y, xs_in, ws_mx, kid)
+        _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+            O_in,
+            weight_for(kid),
+            Y,
+            xs_in,
+            ws_mx,
+            workspace=None,
+            kid=kid,
+            split_k=1,
+        )
         return Y
 
     # Correctness-focused: global kid 8000 is a fixed baseline with no
@@ -211,11 +286,22 @@ def test_mxscale_bmm_batch_first(g, m, n, k, dtype):
     xs_in = xs_mx.transpose(0, 1)  # [m, g, k/128] view
     ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32)  # [g, m, n] batch-major
 
+    weight_for = _weight_picker(W_mx)
+
     def _call_raw(kid):
         # Batch-major output buffer; hand the kernel its [m, g, n] view so the
         # store lands at Y.stride(1) (batch) = m*n (outermost), N contiguous.
         Yb = torch.empty((g, m, n), dtype=ydt)
-        _run_opus(O_in, W_mx, Yb.transpose(0, 1), xs_in, ws_mx, kid)
+        _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+            O_in,
+            weight_for(kid),
+            Yb.transpose(0, 1),
+            xs_in,
+            ws_mx,
+            workspace=None,
+            kid=kid,
+            split_k=1,
+        )
         return Yb  # [g, m, n]
 
     def _call_auto():
@@ -275,45 +361,207 @@ test_mxscale_bmm_batch_first.__test__ = False
 
 
 # --- tileN column-map regression guard ------------------------------------
-# These COM_REP_N>1 kernels previously transposed output column groups. Keep
-# them out of the narrow perf table, but always exercise both output layouts
-# with signed, varied-block-scale data so the bug cannot silently return.
-_TILEN_REGRESSION_KIDS = (8312, 8313)
-_TILEN_REGRESSION_SHAPE = (2, 16, 128, 1024)  # G, M, N, K; accepts both kids
+# kid8312/8313 are COM_REP_N>1 kernels that previously transposed output column
+# groups. Keep them out of the narrow perf table, but always exercise both
+# output layouts with signed, varied-block-scale data so the bug cannot
+# silently return.
+#
+# kid8388/8389/8390 are here for the adjacent reason: they reach the T_M=1 / T_N=2
+# grid because they asked for it (TILE_N_) rather than because B_M == 16 left
+# them no choice, so they are the first to run that column map with an M axis
+# spanning more than one tile. The shape is deliberately not tile-aligned (100
+# rows over a 64-row tile) because an aligned one hides the M mask, which is the
+# other thing a grid change can break. Plain-scale, so this checks the grid
+# alone; the shuffled layout has its own guards.
+_TILEN_REGRESSION_CASES = (
+    # (G, M, N, K),        kids sharing that shape
+    ((2, 16, 128, 1024), (8312, 8313)),
+    ((2, 100, 128, 1024), (8388, 8389, 8390)),
+)
 _TILEN_REGRESSION_ERR_TOL = 0.003
 
 
 def check_tilen_column_map():
-    """Check global kids 8312/8313 for both output memory layouts."""
-    g, m, n, k = _TILEN_REGRESSION_SHAPE
-    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
-    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
-    O_in = O_mx.transpose(0, 1)
-    xs_in = xs_mx.transpose(0, 1)
-    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
+    """Check tileN-grid kids' column mapping for token- and batch-major output."""
     failures = []
+    checked = 0
 
-    for kid in _TILEN_REGRESSION_KIDS:
-        for layout in ("token-major", "batch-major"):
-            if layout == "token-major":
-                out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
-            else:
-                out = torch.full((g, m, n), float("nan"), dtype=dtypes.bf16).transpose(
-                    0, 1
-                )
-            _run_opus(O_in, W_mx, out, xs_in, ws_mx, kid)
-            torch.cuda.synchronize()
-            delta = (out.to(dtypes.fp32) - ref).abs()
-            rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
-            err = rows.max().item()
-            if not (err <= _TILEN_REGRESSION_ERR_TOL):
-                failures.append(
-                    f"kid {kid} {layout}: worst row rel err {err:.4f} "
-                    f"> {_TILEN_REGRESSION_ERR_TOL}"
-                )
+    for (g, m, n, k), kids in _TILEN_REGRESSION_CASES:
+        O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(_block_varied((g, m, k), k))
+        W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(_block_varied((g, n, k), k))
+        O_in = O_mx.transpose(0, 1)
+        xs_in = xs_mx.transpose(0, 1)
+        ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32).transpose(0, 1)
+        # Must go through the picker: kid8388/8389/8390 are bpreshuffle kids, and a
+        # preshuffled kid handed the row-major buffer does not raise, it just
+        # returns a wrong answer. kid8312/8313 predate this and are row-major, so
+        # the guard used to pass W_mx directly and was correct only by accident.
+        weight_for = _weight_picker(W_mx)
 
+        for kid in kids:
+            for layout in ("token-major", "batch-major"):
+                if layout == "token-major":
+                    out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
+                else:
+                    out = torch.full(
+                        (g, m, n), float("nan"), dtype=dtypes.bf16
+                    ).transpose(0, 1)
+                _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+                    O_in,
+                    weight_for(kid),
+                    out,
+                    xs_in,
+                    ws_mx,
+                    workspace=None,
+                    kid=kid,
+                    split_k=1,
+                )
+                torch.cuda.synchronize()
+                delta = (out.to(dtypes.fp32) - ref).abs()
+                rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+                err = rows.max().item()
+                checked += 1
+                if not (err <= _TILEN_REGRESSION_ERR_TOL):
+                    failures.append(
+                        f"kid {kid} g{g}/m{m}/n{n}/k{k} {layout}: "
+                        f"worst row rel err {err:.4f} > {_TILEN_REGRESSION_ERR_TOL}"
+                    )
+
+    expected = sum(len(kids) for _, kids in _TILEN_REGRESSION_CASES) * 2
+    assert checked == expected, f"guard ran {checked} of {expected} cases"
     assert not failures, "tileN column-map regression:\n  " + "\n  ".join(failures)
-    return len(_TILEN_REGRESSION_KIDS) * 2
+    return checked
+
+
+# --- GROUP_N == GROUP_K == 32 (the MX block) ------------------------------
+# These are the only kids quantised on the 32-element block, and they are the
+# only thing that instantiates the per-lane scale addressing at all: every 128
+# kid has SF_PER_MFMA_K == 1, so `if constexpr` discards the lane arms of
+# load_sfb_lane and sf_scale_word and collapses the scale layout's lane p dim to
+# extent 1. This check is therefore both the numerical guard on MX quantisation
+# and the only compile coverage those arms get -- without it they are dead code
+# the compiler never instantiates.
+#
+# Every flatmm_splitk tile that has an MX twin is checked here: they are
+# generated from the 128 table, so listing a subset would leave the rest to be
+# discovered broken by whoever tuned them. A twin's id is its mirror's plus
+# 1000, hence 8321 / 9321 for one geometry at two granularities.
+#
+# One shape serves all of them. N=256 is a whole number of every B_N
+# (32 / 64 / 128 / 256) and K=4096 of every B_K (128 / 256 / 512). K has to be
+# this large for a reason beyond divisibility: these pipelines prime several K
+# tiles before the steady state and reject a launch that cannot fill the
+# prefetch, so K=1024 left the B_K=256 tiles with four tiles against the six
+# they want. At 4096 the deepest tiling still has eight. It is also the
+# production K.
+# Derived, not listed. The twins are generated from the 128 tables, so a listed
+# subset goes stale the moment one is added or dropped -- a new twin would go
+# unchecked until whoever tuned it found out, and the three clang cannot
+# register-allocate would have to be remembered here as well as there. Reading
+# the catalog makes both automatic.
+#
+# GROUP_N is part of the filter, not just GROUP_K: the 1x32 kids share the
+# 32-element K block but scale per N row, so the square w_scale built below has
+# the wrong shape for them and their launcher refuses it. Every 1x32 kid is
+# preshuffled, so they are covered in the bpreshuffle file, which quantises a
+# per-N-row weight for them; keeping the split on GROUP_N is what stops the two
+# from drifting into each other.
+_MX32_GROUP = 32
+_MX32_SHAPE = (2, 128, 256, 4096)  # G, M, N, K
+_MX32_ERR_TOL = 0.003
+_MX32_KIDS = tuple(
+    sorted(
+        kid
+        for kid, inst in a8w8_mxscale_bmm_kernels_list.items()
+        if inst.GROUP_K == _MX32_GROUP and inst.GROUP_N == _MX32_GROUP
+    )
+)
+
+
+def check_mx32_kids():
+    """Check the GROUP_N=GROUP_K=32 kids against a 32-block reference."""
+    g, m, n, k = _MX32_SHAPE
+    O_mx, xs_mx, xs_fp32 = _quant_per_token_e8m0(
+        _block_varied((g, m, k), k), group=_MX32_GROUP
+    )
+    W_mx, ws_mx, ws_fp32 = _quant_block_e8m0(
+        _block_varied((g, n, k), k), group=_MX32_GROUP
+    )
+    O_in = O_mx.transpose(0, 1)
+    ref = run_torch(O_mx, W_mx, xs_fp32, ws_fp32, group=_MX32_GROUP).transpose(0, 1)
+    failures = []
+    # Route B and the scales through the pickers rather than passing the
+    # row-major buffers. A preshuffled kid handed row-major B does not raise, it
+    # quietly computes against the same reference, so skipping the pickers turns
+    # every bpreshuffle twin in this set into a silent numerical failure.
+    weight_for = _weight_picker(W_mx)
+    scale_for = _scale_picker(xs_mx, ws_mx, n, k)
+
+    for kid in _MX32_KIDS:
+        out = torch.full((m, g, n), float("nan"), dtype=dtypes.bf16)
+        sfa, sfb = scale_for(kid)
+        try:
+            _run_opus(O_in, weight_for(kid), out, sfa, sfb, kid)
+            torch.cuda.synchronize()
+        except RuntimeError as exc:
+            # A launcher refusing the shape -- too few K tiles to prime the
+            # pipeline, say -- is a result about that kid, not a reason to stop
+            # reporting the others.
+            failures.append(f"kid {kid}: launch refused: {str(exc).strip()[-120:]}")
+            continue
+        delta = (out.to(dtypes.fp32) - ref).abs()
+        rows = delta.flatten(1).mean(1) / (ref.abs().flatten(1).mean(1) + 1e-9)
+        err = rows.max().item()
+        if not (err <= _MX32_ERR_TOL):
+            failures.append(f"kid {kid}: worst row rel err {err:.4f} > {_MX32_ERR_TOL}")
+
+    assert not failures, "GROUP_K=32 kids:\n  " + "\n  ".join(failures)
+    return len(_MX32_KIDS)
+
+
+# --- wave1 bpreshuffle, GROUP_N == GROUP_K == 128 -------------------------
+# The wave1 tiles are the only single-wave bpreshuffle pipeline in the family,
+# so nothing else instantiates their B-fragment addressing. M=17 is deliberate:
+# the guard is the unaligned tail, which an aligned M would let a wrong
+# fragment stride pass.
+_WAVE1_KIDS = tuple(range(8440, 8450))
+_WAVE1_SPLITS = (1, 2)
+
+
+def check_wave1_group128():
+    """Check the wave1 bpreshuffle tiles against a dequantized reference."""
+    torch.manual_seed(89)
+    g, m, n, k = 2, 17, 128, 1024
+    x, xs, xf = _quant_per_token_e8m0(torch.randn(g, m, k))
+    w, ws, wf = _quant_block_e8m0(torch.randn(g, n, k))
+    xd = x.to(dtypes.fp32) * xf.repeat_interleave(GROUP, -1)
+    wd = w.to(dtypes.fp32) * wf.repeat_interleave(GROUP, 1).repeat_interleave(GROUP, -1)
+    ref = torch.bmm(xd, wd.transpose(1, 2)).to(dtypes.bf16)
+    w_sh = shuffle_weight(w, layout=(16, 16))
+    checks = 0
+    # Calls opus_bmm directly rather than through _run_opus. That helper exists
+    # to model the DSV4 mmajor path and so transposes what it is given; these
+    # buffers are already batch-major, so routing them through it would mean
+    # transposing them first only for the helper to transpose them back -- the
+    # round trip is an identity on both shape and stride, leaving nothing but a
+    # double negation to read past.
+    for kid in _WAVE1_KIDS:
+        for split in _WAVE1_SPLITS:
+            out = torch.empty_like(ref)
+            opus_bmm(
+                x,
+                w_sh,
+                out,
+                kid=int(kid),
+                layout="mxscale_bmm",
+                x_scale=xs,
+                w_scale=ws,
+                split_k=int(split),
+            )
+            torch.cuda.synchronize()
+            torch.testing.assert_close(out, ref, rtol=0.02, atol=0.03)
+            checks += 1
+    return checks
 
 
 def check_splitk_workspace():
@@ -399,21 +647,30 @@ def _align_inputs(m, n, k):
         _ALIGN_INPUTS[key] = (
             O_mx.transpose(0, 1),
             W_mx,
-            xs_mx.transpose(0, 1),
-            ws_mx,
+            shuffle_weight(W_mx, layout=(16, 16)),
+            # The pickers are cached with the buffers they relay out, so each
+            # layout is built once per shape rather than once per kid and M.
+            _scale_picker(xs_mx, ws_mx, n, k),
             ref,
         )
     return _ALIGN_INPUTS[key]
 
 
-def _align_run(kid, m, n, k):
+def _align_run(kid, inst, m, n, k):
     """Return (ok, rel_err). ok False means the launcher refused the shape."""
-    O_in, W_mx, xs_in, ws_mx, ref = _align_inputs(m, n, k)
+    O_in, W_mx, W_sh, scale_for, ref = _align_inputs(m, n, k)
+    # A preshuffled kid reading the row-major buffer does not fail, it just
+    # returns a wrong answer, so the weight has to follow the kid -- and so must
+    # the scales.
+    W_in = W_sh if inst.needs_preshuffled_b else W_mx
+    xs_in, ws_mx = scale_for(kid)
     # NaN-filled so a row the kernel never writes shows up as nan, not as a
     # plausible value that a mean error would dilute.
     Y = torch.full((m, _ALIGN_G, n), float("nan"), dtype=dtypes.bf16)
     try:
-        _run_opus(O_in, W_mx, Y, xs_in, ws_mx, kid)
+        _opus_gemm_a8w8_mxscale_bmm_launch_raw(
+            O_in, W_in, Y, xs_in, ws_mx, workspace=None, kid=kid, split_k=1
+        )
         torch.cuda.synchronize()
     except (RuntimeError, ValueError):
         # The launcher's AITER_CHECK on M surfaces here. Deliberately not a
@@ -430,7 +687,7 @@ def _align_pick_shape(kid, inst):
     for n, k in _ALIGN_SHAPES:
         if n % inst.B_N or k % inst.B_K:
             continue
-        if _align_run(kid, max(inst.m_align, inst.B_M), n, k)[0]:
+        if _align_run(kid, inst, max(inst.m_align, inst.B_M), n, k)[0]:
             return n, k
     return None
 
@@ -449,6 +706,10 @@ def check_m_align():
     the declaration accepts, the launch must succeed and match the dequantized
     fp32 reference; at an M it rejects, the launch must raise. Kids are never
     silently skipped -- an unrunnable kid is reported.
+
+    Each kid gets the B buffer and the scale layout its family reads, so the
+    reference check is a real correctness gate for the preshuffled and
+    rearranged-scale kids too, and not an m_align check riding on a wrong answer.
     """
     kids = _align_kids()
     failures, unrunnable = [], []
@@ -461,7 +722,7 @@ def check_m_align():
         n, k = shape
         align = inst.m_align
         for m in _ALIGN_MS:
-            ok, err = _align_run(kid, m, n, k)
+            ok, err = _align_run(kid, inst, m, n, k)
             if m % align == 0:
                 if not ok:
                     failures.append(f"kid {kid}: m_align={align} but M={m} rejected")
@@ -548,6 +809,12 @@ def main():
     n_workspace_checks = check_splitk_workspace()
     aiter.logger.info(
         "MXFP8 BMM split-K workspace checks passed (%d paths)", n_workspace_checks
+    )
+    n_mx32_kids = check_mx32_kids()
+    aiter.logger.info("GROUP_K=32 MX quantisation passed for %d kids", n_mx32_kids)
+    n_wave1 = check_wave1_group128()
+    aiter.logger.info(
+        "wave1 bpreshuffle group128 passed for %d kid/split pairs", n_wave1
     )
 
     if args.check_m_align:
