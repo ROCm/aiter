@@ -154,6 +154,12 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
         group=gloo, device=device, rank=rank, world_size=tp, grid_cap=grid_cap
     )
     rows = []
+    # compile_rmsnorm must cover every fused build the cases pick: a case that
+    # adds one to the cache compiled it on its first call.
+    for hidden, gemma_norm in sorted({(c[1], c[2]) for c in cases}):
+        for mxfp4 in (False, True) if fly.supports_mxfp4 else (False,):
+            fly.compile_rmsnorm(hidden, EPS, gemma_norm=gemma_norm, mxfp4=mxfp4)
+    warmed = [set(e._norm_launch) for e in fly._by_st.values()]
     try:
         for ntok, hidden, gemma_norm, inplace in cases:
             gen = torch.Generator().manual_seed(1234 + rank)
@@ -273,6 +279,8 @@ def _run_rank(rank, tp, init_method, cases, time_it, grid_cap):
                     )
             rows.append(row)
             dist.barrier(group=group)
+        if [set(e._norm_launch) for e in fly._by_st.values()] != warmed:
+            raise AssertionError("a case compiled a fused build compile_rmsnorm missed")
     finally:
         fly.close()
         dist.destroy_process_group()
@@ -353,6 +361,7 @@ def main():
     if bench:
         ranks = _spawn(args.tp, bench, time_it=True, grid_cap=args.grid_cap)
         _assert_valid(ranks, bench)
+        has_mxfp4 = ARCH == "gfx950"
         df = pd.DataFrame(
             [
                 {
@@ -360,9 +369,15 @@ def main():
                     "hidden": c[1],
                     "fused_us": max(r[i]["fused_us"] for r in ranks),
                     "unfused_us": max(r[i]["unfused_us"] for r in ranks),
-                    "mxfp4_us": max(r[i]["mxfp4_us"] or 0.0 for r in ranks),
-                    "unfused_mxfp4_us": max(
-                        r[i]["unfused_mxfp4_us"] or 0.0 for r in ranks
+                    **(
+                        {
+                            "mxfp4_us": max(r[i]["mxfp4_us"] for r in ranks),
+                            "unfused_mxfp4_us": max(
+                                r[i]["unfused_mxfp4_us"] for r in ranks
+                            ),
+                        }
+                        if has_mxfp4
+                        else {}
                     ),
                     "sqnr_out_db": min(r[i]["sqnr_out_db"] for r in ranks),
                 }
@@ -370,7 +385,8 @@ def main():
             ]
         )
         df["speedup"] = df["unfused_us"] / df["fused_us"]
-        df["mxfp4_speedup"] = df["unfused_mxfp4_us"] / df["mxfp4_us"]
+        if has_mxfp4:
+            df["mxfp4_speedup"] = df["unfused_mxfp4_us"] / df["mxfp4_us"]
         aiter.logger.info("bench tp=%s:\n%s", args.tp, df.to_markdown(index=False))
 
 

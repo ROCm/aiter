@@ -360,15 +360,78 @@ class QuickAllReduceInt4:
             _run_compiled(eng.launch if launch is None else launch, *args)
 
     def compile(self, inp, out, stream=None) -> None:
-        """Eager-JIT every ST binary.
+        """Eager-JIT every ST binary of the plain all-reduce.
 
         Default ST=8 also builds an ST=1 engine for small payloads.
         Every rank must call this with the same ``inp``/``out`` shape.
-        ``out`` is overwritten.
+        ``out`` is overwritten. The fused RMSNorm builds are compiled by
+        ``compile_rmsnorm``.
         """
         live_bytes = self._check_payload(inp, out)
         for eng in self._by_st.values():
             self._launch_eng(eng, inp, out, stream, live_bytes=live_bytes)
+
+    def compile_rmsnorm(
+        self,
+        hidden: int,
+        eps: float,
+        *,
+        gemma_norm: bool = False,
+        mxfp4: bool = False,
+        stream=None,
+    ) -> None:
+        """Eager-JIT every fused build ``allreduce_rmsnorm`` can pick for ``hidden``.
+
+        Without this the first ``allreduce_rmsnorm`` call of each build pays its
+        FlyDSL compile: the low-latency and the occupancy-pinned build of the
+        ST=1 engine, and the pinned build of the ST=8 engine, are separate
+        binaries. Each is launched once on a zero one-row payload, so every rank
+        must call this with the same arguments.
+
+        Args:
+            hidden: row width; 2048, 4096, 8192 or 16384.
+            eps: RMSNorm epsilon of the calls to warm.
+            gemma_norm: warm the ``1 + weight`` builds.
+            mxfp4: warm the ``allreduce_rmsnorm_mxfp4`` builds (gfx950).
+            stream: ``None`` uses the current PyTorch stream on this device.
+        """
+        live_bytes = int(hidden) * 2
+        self._check_rmsnorm_hidden(hidden, live_bytes)
+        if mxfp4 and not self.supports_mxfp4:
+            raise RuntimeError("fused MXFP4 quant needs gfx950")
+        dev = torch.device("cuda", self._device_index)
+        inp, out, residual, residual_out, weight = (
+            torch.zeros(hidden, dtype=torch.bfloat16, device=dev) for _ in range(5)
+        )
+        mxfp4_bufs = ()
+        if mxfp4:
+            mxfp4_bufs = (
+                torch.empty(hidden // 2, dtype=torch.uint8, device=dev),
+                torch.empty(
+                    mxfp4_scale_shape(1, hidden), dtype=torch.uint8, device=dev
+                ),
+            )
+        norm_ptrs = (
+            int(residual.data_ptr()),
+            int(residual_out.data_ptr()),
+            int(weight.data_ptr()),
+            *(int(t.data_ptr()) for t in mxfp4_bufs),
+        )
+        norm_ptrs += (0,) * (5 - len(norm_ptrs))
+        for st, eng in self._by_st.items():
+            for latency in (True, False) if st == 1 else (False,):
+                self._launch_eng(
+                    eng,
+                    inp,
+                    out,
+                    stream,
+                    live_bytes=live_bytes,
+                    launch=eng.norm_launch(hidden, eps, gemma_norm, latency, mxfp4),
+                    norm_ptrs=norm_ptrs,
+                )
+        # The dummy tensors go out of scope here; the launches may be on a
+        # stream other than the one that allocated them.
+        torch.cuda.synchronize(self._device_index)
 
     def close(self):
         engines = getattr(self, "_by_st", None)
@@ -409,6 +472,15 @@ class QuickAllReduceInt4:
     def mxfp4_scale_shape(rows: int, hidden: int) -> tuple[int, int]:
         """Shape of the e8m0 ``mxfp4_scale`` buffer for ``rows x hidden``."""
         return mxfp4_scale_shape(rows, hidden)
+
+    def _check_rmsnorm_hidden(self, hidden: int, live_bytes: int) -> None:
+        if not self.supports_rmsnorm(hidden, live_bytes):
+            # Atom byte offsets travel in the signed 32-bit soffset.
+            raise ValueError(
+                "fused RMSNorm supports hidden in (2048, 4096, 8192, 16384) "
+                f"and payloads under 2 GiB, got hidden={hidden}, "
+                f"{live_bytes} bytes"
+            )
 
     def allreduce_rmsnorm(
         self,
@@ -498,13 +570,7 @@ class QuickAllReduceInt4:
     ):
         live_bytes = self._check_payload(inp, out)
         hidden = int(weight.numel())
-        if not self.supports_rmsnorm(hidden, live_bytes):
-            # Atom byte offsets travel in the signed 32-bit soffset.
-            raise ValueError(
-                "fused RMSNorm supports hidden in (2048, 4096, 8192, 16384) "
-                f"and payloads under 2 GiB, got hidden={hidden}, "
-                f"{live_bytes} bytes"
-            )
+        self._check_rmsnorm_hidden(hidden, live_bytes)
         if int(inp.numel()) % hidden != 0:
             raise ValueError("numel must be a multiple of hidden")
         for name, t in (
