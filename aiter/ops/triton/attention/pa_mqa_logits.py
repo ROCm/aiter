@@ -569,6 +569,17 @@ def deepgemm_fp8_paged_mqa_logits_persistent_schedule(
         raise ValueError(
             "batch_size, next_n and ChunkK must be positive; max_model_len >= 0"
         )
+    if context_lens.ndim == 2:
+        # The (B, next_n) table vLLM builds: row b ends with request b's length.
+        if context_lens.shape[0] != batch_size or context_lens.shape[1] not in (
+            1,
+            next_n,
+        ):
+            raise ValueError(
+                "a 2D context_lens must have shape (batch_size, 1) or "
+                "(batch_size, next_n)"
+            )
+        context_lens = context_lens[:, -1]
     if context_lens.ndim != 1 or context_lens.numel() != batch_size:
         raise ValueError("context_lens must have shape [batch_size]")
     if not context_lens.is_cuda or context_lens.dtype not in (torch.int32, torch.int64):
@@ -649,11 +660,15 @@ def deepgemm_fp8_paged_mqa_logits(
     batch_size, next_n, heads, hidden_dim = q_fp8.size()
     _, block_Size, _, index_dim = kv_cache.size()
     _, max_block_len = kv_indices.size()
-    context_lens, ctx_stride = _context_lens_and_stride(
-        context_lens, batch_size, next_n, q_fp8.device
-    )
-
     Persistent = PersistentSchedule is not None
+    if Persistent:
+        # The kernels take each row's length from PersistentSchedule, so
+        # context_lens is not read here.
+        ctx_stride = 1
+    else:
+        context_lens, ctx_stride = _context_lens_and_stride(
+            context_lens, batch_size, next_n, q_fp8.device
+        )
     if Persistent:
         if VarCtxSchedule is not None:
             raise ValueError(

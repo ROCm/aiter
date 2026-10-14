@@ -8,11 +8,14 @@ must reject layouts it would read wrongly.
 
 import pytest
 import torch
+import triton
+from packaging.version import Version
 
 from aiter import dtypes
 from aiter.ops.triton.attention import pa_mqa_logits as pa_mqa_logits_module
 from aiter.ops.triton.attention.pa_mqa_logits import (
     deepgemm_fp8_paged_mqa_logits,
+    deepgemm_fp8_paged_mqa_logits_persistent_schedule,
     deepgemm_fp8_paged_mqa_logits_schedule,
     deepgemm_fp8_paged_mqa_logits_stage1,
     enable_jit_gluon_pa_mqa_logits_kernel,
@@ -26,10 +29,11 @@ ENTRIES = {
     "gluon": ("gfx942", "gfx950"),
     "gluon_preshuffle": ("gfx942", "gfx950", "gfx1250"),
     "gluon_varctx": ("gfx942", "gfx950"),
+    "gluon_persistent": ("gfx942", "gfx950"),
     "triton": ("gfx942", "gfx950"),
     "stage1": ("gfx942", "gfx950"),
 }
-GLUON_ENTRIES = ("gluon", "gluon_preshuffle", "gluon_varctx")
+GLUON_ENTRIES = ("gluon", "gluon_preshuffle", "gluon_varctx", "gluon_persistent")
 # stage1 and the varctx kernel write whole tail tiles past the end of the
 # output (known bug, separate fix): up to ChunkK (256) columns for stage1 and
 # up to KVBlockSize for varctx. Keep the row width a multiple of both until then.
@@ -44,6 +48,8 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
         pytest.skip(f"{entry} is not covered on {arch}")
     if entry in GLUON_ENTRIES and not enable_jit_gluon_pa_mqa_logits_kernel:
         pytest.skip("Requires the Gluon JIT paged MQA kernel")
+    if entry == "gluon_persistent" and Version(triton.__version__) < Version("3.5.0"):
+        pytest.skip("PersistentSchedule requires Triton >= 3.5")
     if entry == "triton":
         # The Triton kernel is the fallback when Gluon is off.
         monkeypatch.setattr(pa_mqa_logits_module, "enable_gluon_pa_mqa_logits", False)
@@ -119,9 +125,13 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
                 ChunkQ=heads,
             )
             return out
-        schedule = None
+        schedule = persistent = None
         if entry == "gluon_varctx":
             schedule = deepgemm_fp8_paged_mqa_logits_schedule(
+                batch, next_n, context_lens, max_model_len
+            )
+        if entry == "gluon_persistent":
+            persistent = deepgemm_fp8_paged_mqa_logits_persistent_schedule(
                 batch, next_n, context_lens, max_model_len
             )
         out = torch.full((batch * next_n, max_model_len), float("-inf"), device=device)
@@ -136,6 +146,7 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
             Preshuffle=preshuffle,
             KVBlockSize=block_size,
             VarCtxSchedule=schedule,
+            PersistentSchedule=persistent,
         )
         return out
 
@@ -154,20 +165,25 @@ def test_paged_mqa_logits_2d_context_lens(entry: str, monkeypatch) -> None:
             atol=0,
         )
 
-    # A row count other than B, a column count other than 1 or next_n, a
-    # strided [B] or [B, n], a dtype other than int32, or a tensor on another
-    # device are rejected.
-    for bad in (
+    # A row count other than B, a column count other than 1 or next_n, or a
+    # tensor on another device are rejected. The persistent schedule makes its
+    # own contiguous int32 copy; every other entry also rejects a strided [B]
+    # or [B, n] and a dtype other than int32.
+    bad_inputs = [
         seq_lens[:-1],
         torch.cat([seq_lens, seq_lens[:1]]),
         row_lens[:-1],
         torch.cat([row_lens, row_lens[:1]]),
         row_lens[:, :0],
         row_lens[:, 1:].contiguous(),
-        row_lens[:, -1],
-        row_lens.t().contiguous().t(),
-        row_lens.long(),
         row_lens.cpu(),
-    ):
+    ]
+    if entry != "gluon_persistent":
+        bad_inputs += [
+            row_lens[:, -1],
+            row_lens.t().contiguous().t(),
+            row_lens.long(),
+        ]
+    for bad in bad_inputs:
         with pytest.raises(ValueError):
             run(bad)
