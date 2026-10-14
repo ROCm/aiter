@@ -7,6 +7,7 @@
 
 #include "aiter_hip_common.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <hip/hip_runtime.h>
 
@@ -56,7 +57,90 @@ struct WeightBwdKernelArgs
     int64_t stride_b_row;
     int64_t stride_c_expert;
     int64_t stride_c_m;
+    float* __restrict__ workspace;
+    const int32_t* __restrict__ split_metadata;
+    int split_rows;
+    int split_capacity;
+    int64_t stride_workspace_split;
 };
+
+constexpr int kHotSplitRouteThreshold = 32768;
+constexpr int kHotSplitRows = 12288;
+constexpr int kHotSplitMetadataHeaderInts = 64;
+constexpr int kHotSplitHotIdsOffset = 2;
+constexpr int kHotSplitExpertOffsetsOffset = 18;
+constexpr int kHotSplitRecordsOffset = kHotSplitMetadataHeaderInts;
+constexpr int kHotSplitRecordInts = 2;
+
+__global__ void build_hot_split_metadata_kernel_gfx950(
+    RouteMetadata route,
+    int split_rows,
+    int split_capacity,
+    int32_t* split_metadata)
+{
+#ifdef __HIP_DEVICE_COMPILE__
+    if(blockIdx.x != 0 || threadIdx.x != 0)
+        return;
+
+    int descriptor_count = 0;
+    int hot_count = 0;
+    split_metadata[kHotSplitExpertOffsetsOffset] = 0;
+    for(int expert = 0; expert < route.num_experts; ++expert)
+    {
+        const int route_start = route.expert_offsets[expert];
+        const int route_count =
+            route.expert_offsets[expert + 1] - route_start;
+        if(route_count > kHotSplitRouteThreshold)
+        {
+            split_metadata[kHotSplitHotIdsOffset + hot_count] = expert;
+            ++hot_count;
+            const int splits = (route_count + split_rows - 1) / split_rows;
+            for(int split = 0; split < splits; ++split)
+            {
+                if(descriptor_count >= split_capacity)
+                    break;
+                const int record = kHotSplitRecordsOffset +
+                                   descriptor_count * kHotSplitRecordInts;
+                split_metadata[record] = expert;
+                split_metadata[record + 1] = split;
+                ++descriptor_count;
+            }
+        }
+        split_metadata[kHotSplitExpertOffsetsOffset + expert + 1] =
+            descriptor_count;
+    }
+    split_metadata[0] = descriptor_count;
+    split_metadata[1] = hot_count;
+#else
+    (void)route;
+    (void)split_rows;
+    (void)split_capacity;
+    (void)split_metadata;
+#endif
+}
+
+inline void build_hot_split_metadata_gfx950(const RouteMetadata& route,
+                                            int split_rows,
+                                            int split_capacity,
+                                            int32_t* split_metadata,
+                                            hipStream_t stream)
+{
+    AITER_CHECK(route.num_experts == 16,
+                "hot split-K currently requires exactly 16 experts");
+    AITER_CHECK(split_rows > 0 && split_rows % 64 == 0,
+                "hot split-K rows must be positive and divisible by 64");
+    AITER_CHECK(split_capacity > 0 && split_metadata != nullptr,
+                "hot split-K requires descriptor storage");
+    hipLaunchKernelGGL(build_hot_split_metadata_kernel_gfx950,
+                       dim3(1),
+                       dim3(1),
+                       0,
+                       stream,
+                       route,
+                       split_rows,
+                       split_capacity,
+                       split_metadata);
+}
 
 // One CTA covers 32 sorted rows by 256 model columns.  Each thread moves four
 // naturally aligned BF16x8 vectors, while the first wave decodes one token id
@@ -211,7 +295,126 @@ inline __device__ void weight_bwd_store_wide(Accum& accum,
     });
 }
 
+template<typename T, typename Accum>
+inline __device__ void weight_bwd_store_partial_fp32(
+    Accum& accum,
+    const WeightBwdKernelArgs& kargs,
+    int descriptor,
+    int output_m_base,
+    int output_n_base,
+    int wave_id_m,
+    int wave_id_n,
+    int lane_id)
+{
+    static_assert(T::VEC_C == 4);
+    static_assert(T::W_M == 32 && T::W_N == 32);
+
+    opus::static_for<T::E_M>([&](auto em) {
+        opus::static_for<T::E_N>([&](auto en) {
+            opus::static_for<2>([&](auto sub) {
+                constexpr int native_tile = em.value * T::E_N + en.value;
+                constexpr int accum_base = native_tile * 16 + sub.value * 8;
+                uint32_t raw[8];
+#pragma unroll
+                for(int i = 0; i < 4; ++i)
+                {
+                    const float lo =
+                        static_cast<float>(accum[accum_base + i]);
+                    const float hi =
+                        static_cast<float>(accum[accum_base + i + 4]);
+                    const auto swapped = __builtin_amdgcn_permlane32_swap(
+                        __builtin_bit_cast(uint32_t, lo),
+                        __builtin_bit_cast(uint32_t, hi),
+                        false,
+                        true);
+                    raw[i] = swapped[0];
+                    raw[i + 4] = swapped[1];
+                }
+
+                const int output_m =
+                    output_m_base +
+                    (em.value * T::T_M + wave_id_m) * T::W_M +
+                    lane_id % T::W_M;
+                const int output_n =
+                    output_n_base +
+                    (en.value * T::T_N + wave_id_n) * T::W_N +
+                    (lane_id / T::W_M) * 8 + sub.value * 16;
+                if(output_m < kargs.output_m && output_n + 8 <= kargs.output_n)
+                {
+                    const int64_t base =
+                        static_cast<int64_t>(descriptor) *
+                            kargs.stride_workspace_split +
+                        static_cast<int64_t>(output_m) * kargs.output_n +
+                        output_n;
+#pragma unroll
+                    for(int i = 0; i < 8; ++i)
+                        kargs.workspace[base + i] =
+                            __builtin_bit_cast(float, raw[i]);
+                }
+            });
+        });
+    });
+}
+
 #endif
+
+__global__ __launch_bounds__(256, 2)
+void finalize_hot_split_weight_kernel_gfx950(WeightBwdKernelArgs kargs)
+{
+#ifdef __HIP_DEVICE_COMPILE__
+    const int hot_slot = static_cast<int>(blockIdx.x);
+    const int hot_count = kargs.split_metadata[1];
+    if(hot_slot >= hot_count)
+        return;
+    const int expert =
+        kargs.split_metadata[kHotSplitHotIdsOffset + hot_slot];
+    const int descriptor_begin =
+        kargs.split_metadata[kHotSplitExpertOffsetsOffset + expert];
+    const int descriptor_end =
+        kargs.split_metadata[kHotSplitExpertOffsetsOffset + expert + 1];
+    const int output_elements = kargs.output_m * kargs.output_n;
+    constexpr int grid_blocks = 1024;
+    for(int linear = static_cast<int>(blockIdx.y) * blockDim.x + threadIdx.x;
+        linear < output_elements;
+        linear += grid_blocks * blockDim.x)
+    {
+        float value = 0.0f;
+        for(int descriptor = descriptor_begin; descriptor < descriptor_end;
+            ++descriptor)
+            value += kargs.workspace[
+                static_cast<int64_t>(descriptor) *
+                    kargs.stride_workspace_split +
+                linear];
+        const int output_m = linear / kargs.output_n;
+        const int output_n = linear - output_m * kargs.output_n;
+        const int64_t output_offset =
+            static_cast<int64_t>(expert) * kargs.stride_c_expert +
+            static_cast<int64_t>(output_m) * kargs.stride_c_m + output_n;
+        kargs.c[output_offset] = hip_bfloat16(value);
+    }
+#else
+    (void)kargs;
+#endif
+}
+
+inline void finalize_hot_split_weight_gfx950(const WeightBwdKernelArgs& kargs,
+                                             hipStream_t stream)
+{
+    constexpr int threads = 256;
+    constexpr int grid_blocks = 1024;
+    const int max_hot_experts = std::min(
+        kargs.route.num_experts,
+        kargs.route.sorted_capacity / (kHotSplitRouteThreshold + 1));
+    AITER_CHECK(max_hot_experts > 0,
+                "hot split-K finalize requires a possible hot expert");
+    hipLaunchKernelGGL(finalize_hot_split_weight_kernel_gfx950,
+                       dim3(static_cast<unsigned int>(max_hot_experts),
+                            grid_blocks),
+                       dim3(threads),
+                       0,
+                       stream,
+                       kargs);
+}
 
 
 // Compact gfx950 K32 dW1 path.  A 64x32 dZ slab occupies 4 KiB and a
@@ -249,6 +452,11 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     constexpr bool prefetch_reduction_a = []() constexpr {
         if constexpr(requires { T::PREFETCH_REDUCTION_A; })
             return T::PREFETCH_REDUCTION_A;
+        return false;
+    }();
+    constexpr bool hot_split_k = []() constexpr {
+        if constexpr(requires { T::HOT_SPLIT_K; })
+            return T::HOT_SPLIT_K;
         return false;
     }();
     constexpr bool prefetch_reduction_ab = []() constexpr {
@@ -383,9 +591,24 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
                        triple_buffer),
                   "native B-M32 swizzle requires a sorted-row K32 path");
     int expert;
+    int split_descriptor = -1;
+    int split_index = 0;
     int output_m_base;
     int output_n_base;
-    if constexpr(T::EXPERT_COHORT > 0)
+    if constexpr(hot_split_k)
+    {
+        split_descriptor = static_cast<int>(blockIdx.x);
+        const int descriptor_count = kargs.split_metadata[0];
+        if(split_descriptor >= descriptor_count)
+            return;
+        const int record = kHotSplitRecordsOffset +
+                           split_descriptor * kHotSplitRecordInts;
+        expert = kargs.split_metadata[record];
+        split_index = kargs.split_metadata[record + 1];
+        output_m_base = static_cast<int>(blockIdx.y) * BM;
+        output_n_base = static_cast<int>(blockIdx.z) * BN;
+    }
+    else if constexpr(T::EXPERT_COHORT > 0)
     {
         // Keep a bounded cohort of experts resident in the dispatch stream.
         // M tiles vary first so gathered X rows are reused immediately; the
@@ -477,9 +700,25 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
         output_m_base = static_cast<int>(blockIdx.y) * BM;
         output_n_base = static_cast<int>(blockIdx.z) * BN;
     }
-    const int route_start = kargs.route.expert_offsets[expert];
-    const int route_end = kargs.route.expert_offsets[expert + 1];
+    int route_start = kargs.route.expert_offsets[expert];
+    int route_end = kargs.route.expert_offsets[expert + 1];
+    if constexpr(hot_split_k)
+    {
+        route_start += split_index * kargs.split_rows;
+        const int split_end = route_start + kargs.split_rows;
+        route_end = route_end < split_end ? route_end : split_end;
+    }
     const int route_count = route_end - route_start;
+    if constexpr(!hot_split_k && requires { T::MIN_ROUTE_COUNT; })
+    {
+        if(route_count < T::MIN_ROUTE_COUNT)
+            return;
+    }
+    if constexpr(!hot_split_k && requires { T::MAX_ROUTE_COUNT; })
+    {
+        if(route_count > T::MAX_ROUTE_COUNT)
+            return;
+    }
     const int tid = static_cast<int>(thread_id_x());
     if constexpr(T::EMPTY_M_TILES_PER_CTA > 1)
     {
@@ -1496,14 +1735,24 @@ weight_bwd_k32_process_tile_gfx950(WeightBwdKernelArgs kargs)
     }
     __syncthreads();
 
-    weight_bwd_store_wide<T>(v_c,
-                             kargs,
-                             expert,
-                             output_m_base,
-                             output_n_base,
-                             wave_id_m,
-                             wave_id_n,
-                             lane_id);
+    if constexpr(hot_split_k)
+        weight_bwd_store_partial_fp32<T>(v_c,
+                                         kargs,
+                                         split_descriptor,
+                                         output_m_base,
+                                         output_n_base,
+                                         wave_id_m,
+                                         wave_id_n,
+                                         lane_id);
+    else
+        weight_bwd_store_wide<T>(v_c,
+                                 kargs,
+                                 expert,
+                                 output_m_base,
+                                 output_n_base,
+                                 wave_id_m,
+                                 wave_id_n,
+                                 lane_id);
 #else
     (void)kargs;
 #endif
@@ -1546,6 +1795,11 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
             return T::PREFETCH_REDUCTION_A;
         return false;
     }();
+    constexpr bool hot_split_k = []() constexpr {
+        if constexpr(requires { T::HOT_SPLIT_K; })
+            return T::HOT_SPLIT_K;
+        return false;
+    }();
     static_assert((BM == 64 || BM == 128 || BM == 256) &&
                   (BN == 64 || BN == 128) && BK == 64);
     static_assert((T::BLOCK_SIZE == 256 || T::BLOCK_SIZE == 512) && VEC == 8);
@@ -1559,9 +1813,24 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
     static_assert((BM == 64 && BN == 64) || T::DUAL_OPERAND_LDS,
                   "wide K5 tiles require dual-operand LDS");
     int expert;
+    int split_descriptor = -1;
+    int split_index = 0;
     int output_m_base;
     int output_n_base;
-    if constexpr(T::EXPERT_COHORT > 0)
+    if constexpr(hot_split_k)
+    {
+        split_descriptor = static_cast<int>(blockIdx.x);
+        const int descriptor_count = kargs.split_metadata[0];
+        if(split_descriptor >= descriptor_count)
+            return;
+        const int record = kHotSplitRecordsOffset +
+                           split_descriptor * kHotSplitRecordInts;
+        expert = kargs.split_metadata[record];
+        split_index = kargs.split_metadata[record + 1];
+        output_m_base = static_cast<int>(blockIdx.y) * BM;
+        output_n_base = static_cast<int>(blockIdx.z) * BN;
+    }
+    else if constexpr(T::EXPERT_COHORT > 0)
     {
         constexpr int cohort = T::EXPERT_COHORT;
         const int m_tiles = kargs.output_m / BM;
@@ -1584,26 +1853,32 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         output_m_base = static_cast<int>(blockIdx.y) * BM;
         output_n_base = static_cast<int>(blockIdx.z) * BN;
     }
-    const int route_start = kargs.route.expert_offsets[expert];
-    const int route_end = kargs.route.expert_offsets[expert + 1];
+    int route_start = kargs.route.expert_offsets[expert];
+    int route_end = kargs.route.expert_offsets[expert + 1];
+    if constexpr(hot_split_k)
+    {
+        route_start += split_index * kargs.split_rows;
+        const int split_end = route_start + kargs.split_rows;
+        route_end = route_end < split_end ? route_end : split_end;
+    }
     const int route_count = route_end - route_start;
-    if constexpr(requires { T::MIN_ROUTE_COUNT; })
+    if constexpr(!hot_split_k && requires { T::MIN_ROUTE_COUNT; })
     {
         if(route_count < T::MIN_ROUTE_COUNT)
             return;
     }
-    if constexpr(requires { T::MAX_ROUTE_COUNT; })
+    if constexpr(!hot_split_k && requires { T::MAX_ROUTE_COUNT; })
     {
         if(route_count > T::MAX_ROUTE_COUNT)
             return;
     }
-    if constexpr(requires { T::MIN_GLOBAL_ROUTE_COUNT; })
+    if constexpr(!hot_split_k && requires { T::MIN_GLOBAL_ROUTE_COUNT; })
     {
         if(kargs.route.max_padded_routes == nullptr ||
            *kargs.route.max_padded_routes < T::MIN_GLOBAL_ROUTE_COUNT)
             return;
     }
-    if constexpr(requires { T::MAX_GLOBAL_ROUTE_COUNT; })
+    if constexpr(!hot_split_k && requires { T::MAX_GLOBAL_ROUTE_COUNT; })
     {
         if(kargs.route.max_padded_routes != nullptr &&
            *kargs.route.max_padded_routes > T::MAX_GLOBAL_ROUTE_COUNT)
@@ -2086,14 +2361,24 @@ weight_bwd_k64_process_tile_gfx950(WeightBwdKernelArgs kargs)
         run_tile(full_loops, opus::number<0>{});
     __syncthreads();
 
-    weight_bwd_store_wide<T>(v_c,
-                             kargs,
-                             expert,
-                             output_m_base,
-                             output_n_base,
-                             wave_id_m,
-                             wave_id_n,
-                             lane_id);
+    if constexpr(hot_split_k)
+        weight_bwd_store_partial_fp32<T>(v_c,
+                                         kargs,
+                                         split_descriptor,
+                                         output_m_base,
+                                         output_n_base,
+                                         wave_id_m,
+                                         wave_id_n,
+                                         lane_id);
+    else
+        weight_bwd_store_wide<T>(v_c,
+                                 kargs,
+                                 expert,
+                                 output_m_base,
+                                 output_n_base,
+                                 wave_id_m,
+                                 wave_id_n,
+                                 lane_id);
 #else
     (void)kargs;
 #endif
@@ -2114,8 +2399,44 @@ inline void dw1_launch_gfx950(const Dw1Kargs& kargs, hipStream_t stream)
 {
     using T = opus::remove_cvref_t<Traits>;
     static_assert(T::B_K == 32, "dw1 registers the K32 kernel");
-    AITER_CHECK(kargs.split_k == 1,
-                "dw1: first Opus instance requires split_k=1");
+    if constexpr(requires { T::ADAPTIVE_HOT_SPLIT_K; })
+    {
+        static_assert(T::ADAPTIVE_HOT_SPLIT_K);
+        AITER_CHECK(kargs.split_k > 1 && kargs.workspace != nullptr &&
+                        kargs.split_metadata != nullptr,
+                    "dw1 hot split-K requires workspace and metadata");
+        build_hot_split_metadata_gfx950(kargs.route,
+                                        kargs.split_rows,
+                                        kargs.split_k,
+                                        kargs.split_metadata,
+                                        stream);
+        Dw1Kargs cold = kargs;
+        cold.split_k = 1;
+        dw1_launch_gfx950<
+            Dw1Bf16Gfx950Bm256Bn128Bk32BlockedG2ColdLe32768>(cold, stream);
+        dw1_launch_gfx950<
+            Dw1Bf16Gfx950Bm256Bn128Bk32BlockedG2HotSplitK>(kargs, stream);
+
+        WeightBwdKernelArgs finalize{};
+        finalize.route = kargs.route;
+        finalize.c = kargs.d_w1;
+        finalize.output_m = 2 * kargs.inter_dim;
+        finalize.output_n = kargs.model_dim;
+        finalize.stride_c_expert = kargs.stride_dw1_e;
+        finalize.stride_c_m = kargs.stride_dw1_i;
+        finalize.workspace = kargs.workspace;
+        finalize.split_metadata = kargs.split_metadata;
+        finalize.stride_workspace_split = kargs.stride_workspace_split;
+        finalize_hot_split_weight_gfx950(finalize, stream);
+        return;
+    }
+    constexpr bool hot_split_k = []() constexpr {
+        if constexpr(requires { T::HOT_SPLIT_K; })
+            return T::HOT_SPLIT_K;
+        return false;
+    }();
+    AITER_CHECK(hot_split_k ? kargs.split_k > 1 : kargs.split_k == 1,
+                "dw1 split-K contract does not match the selected kernel");
     AITER_CHECK(2 * kargs.inter_dim % T::B_M == 0 &&
                     kargs.model_dim % T::B_N == 0,
                 "dw1: first instance requires 2I%32==0 and D%128==0");
@@ -2130,8 +2451,19 @@ inline void dw1_launch_gfx950(const Dw1Kargs& kargs, hipStream_t stream)
     args.stride_b_row = kargs.stride_x_t;
     args.stride_c_expert = kargs.stride_dw1_e;
     args.stride_c_m = kargs.stride_dw1_i;
+    args.workspace = kargs.workspace;
+    args.split_metadata = kargs.split_metadata;
+    args.split_rows = kargs.split_rows;
+    args.split_capacity = kargs.split_k;
+    args.stride_workspace_split = kargs.stride_workspace_split;
     dim3 grid;
-    if constexpr(T::EXPERT_COHORT > 0)
+    if constexpr(hot_split_k)
+    {
+        grid = dim3(static_cast<unsigned int>(kargs.split_k),
+                    static_cast<unsigned int>(args.output_m / T::B_M),
+                    static_cast<unsigned int>(args.output_n / T::B_N));
+    }
+    else if constexpr(T::EXPERT_COHORT > 0)
     {
         constexpr int cohort = T::EXPERT_COHORT;
         const int padded_experts =
@@ -2175,8 +2507,44 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
     using T = opus::remove_cvref_t<Traits>;
     static_assert(T::B_K == 32 || T::B_K == 64,
                   "dw2 registers a K32 or K64 kernel");
-    AITER_CHECK(kargs.split_k == 1,
-                "dw2: first Opus instance requires split_k=1");
+    if constexpr(requires { T::ADAPTIVE_HOT_SPLIT_K; })
+    {
+        static_assert(T::ADAPTIVE_HOT_SPLIT_K);
+        AITER_CHECK(kargs.split_k > 1 && kargs.workspace != nullptr &&
+                        kargs.split_metadata != nullptr,
+                    "dw2 hot split-K requires workspace and metadata");
+        build_hot_split_metadata_gfx950(kargs.route,
+                                        kargs.split_rows,
+                                        kargs.split_k,
+                                        kargs.split_metadata,
+                                        stream);
+        Dw2Kargs cold = kargs;
+        cold.split_k = 1;
+        dw2_launch_gfx950<Dw2Bf16Gfx950Bm128Bn64Bk64ColdLe32768>(cold,
+                                                                  stream);
+        dw2_launch_gfx950<Dw2Bf16Gfx950Bm128Bn128Bk64HotSplitK>(kargs,
+                                                                 stream);
+
+        WeightBwdKernelArgs finalize{};
+        finalize.route = kargs.route;
+        finalize.c = kargs.d_w2;
+        finalize.output_m = kargs.model_dim;
+        finalize.output_n = kargs.inter_dim;
+        finalize.stride_c_expert = kargs.stride_dw2_e;
+        finalize.stride_c_m = kargs.stride_dw2_d;
+        finalize.workspace = kargs.workspace;
+        finalize.split_metadata = kargs.split_metadata;
+        finalize.stride_workspace_split = kargs.stride_workspace_split;
+        finalize_hot_split_weight_gfx950(finalize, stream);
+        return;
+    }
+    constexpr bool hot_split_k = []() constexpr {
+        if constexpr(requires { T::HOT_SPLIT_K; })
+            return T::HOT_SPLIT_K;
+        return false;
+    }();
+    AITER_CHECK(hot_split_k ? kargs.split_k > 1 : kargs.split_k == 1,
+                "dw2 split-K contract does not match the selected kernel");
     if constexpr(requires { T::ADAPTIVE_ROUTE_SPLIT; })
     {
         static_assert(T::ADAPTIVE_ROUTE_SPLIT);
@@ -2209,8 +2577,19 @@ inline void dw2_launch_gfx950(const Dw2Kargs& kargs, hipStream_t stream)
     args.stride_b_row = kargs.stride_a_scaled_r;
     args.stride_c_expert = kargs.stride_dw2_e;
     args.stride_c_m = kargs.stride_dw2_d;
+    args.workspace = kargs.workspace;
+    args.split_metadata = kargs.split_metadata;
+    args.split_rows = kargs.split_rows;
+    args.split_capacity = kargs.split_k;
+    args.stride_workspace_split = kargs.stride_workspace_split;
     dim3 grid;
-    if constexpr(T::EXPERT_COHORT > 0)
+    if constexpr(hot_split_k)
+    {
+        grid = dim3(static_cast<unsigned int>(kargs.split_k),
+                    static_cast<unsigned int>(args.output_m / T::B_M),
+                    static_cast<unsigned int>(args.output_n / T::B_N));
+    }
+    else if constexpr(T::EXPERT_COHORT > 0)
     {
         constexpr int cohort = T::EXPERT_COHORT;
         const int padded_experts =

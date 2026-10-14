@@ -252,7 +252,7 @@ def _select_saved_x_dw1_kernel(
 def _reject_sorted_x_dw1_without_cache(kernel_id: int) -> None:
     """Keep the direct-row K4 instance away from token-major X."""
 
-    if int(kernel_id) in (14, 15, 18, 25):
+    if int(kernel_id) in (14, 15, 18, 25, 26):
         raise ValueError("direct sorted-X K4 kernel_id requires saved_x_sorted")
 
 
@@ -260,6 +260,8 @@ def _select_blocked_g2_full_pipeline(
     inter_dim: int,
     model_dim: int,
     sorted_capacity: int,
+    num_experts: int,
+    topk: int,
     down_kernel_id: int,
     route_dx_kernel_id: int,
     route_reduce_kernel_id: int,
@@ -294,6 +296,17 @@ def _select_blocked_g2_full_pipeline(
         and route_output_bytes > 0xFFFFFFFF
     ):
         raise ValueError("route kernel_id=21 requires a d_x_route buffer below 4 GiB")
+    hot_split_dw1_kernel_id = 26
+    hot_split_supported = (
+        num_experts == 16
+        and topk == 1
+        and inter_dim == 768
+        and model_dim == 2048
+        and sorted_capacity > 32_768
+    )
+    blocked_dw1_kernel_id = (
+        hot_split_dw1_kernel_id if hot_split_supported else 25
+    )
     selected = (
         mubuf_down_kernel_id if dz_bytes <= 0xFFFFFFFF else flat_down_kernel_id,
         (
@@ -302,7 +315,7 @@ def _select_blocked_g2_full_pipeline(
             else flat_route_dx_kernel_id
         ),
         route_reduce_kernel_id_selected,
-        25,
+        blocked_dw1_kernel_id,
     )
     requested = (
         int(down_kernel_id),
@@ -326,15 +339,20 @@ def _select_blocked_g2_full_pipeline(
                 f"blocked-G2 full pipeline requires {name}={expected}, " f"got {value}"
             )
     requested_dw1 = requested[3]
-    if requested_dw1 not in (-1, 25):
+    if requested_dw1 not in (-1, 25, 26):
         raise ValueError(
-            "blocked-G2 full pipeline requires dw1_kernel_id=25, "
+            "blocked-G2 full pipeline requires dw1_kernel_id=25/26, "
             f"got {requested_dw1}"
+        )
+    if requested_dw1 == hot_split_dw1_kernel_id and not hot_split_supported:
+        raise ValueError(
+            "dw1_kernel_id=26 requires E16/H2048/I768/K1 cached geometry "
+            "with sorted capacity above 32768"
         )
     selected_down = requested[0] if requested[0] in (18, 19) else selected[0]
     selected_route_dx = requested[1] if requested[1] in (20, 21) else selected[1]
     return (selected_down, selected_route_dx, selected[2]) + (
-        requested_dw1 if requested_dw1 == 25 else selected[3],
+        requested_dw1 if requested_dw1 in (25, 26) else selected[3],
     )
 
 
@@ -1706,6 +1724,7 @@ def opus_moe_backward(
         d_out, x, z_sorted, w1, w2, route_weights, metadata, b1, b2
     )
     sorted_capacity = metadata.sorted_token_ids.numel()
+    topk = int(route_weights.shape[1])
     if token_num == 0:
         if saved_a_scaled is not None:
             _validate_saved_a_scaled(
@@ -1766,6 +1785,8 @@ def opus_moe_backward(
                 inter_dim,
                 model_dim,
                 sorted_capacity,
+                num_experts,
+                topk,
                 down_kernel_id,
                 route_dx_kernel_id,
                 route_reduce_kernel_id,

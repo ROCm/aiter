@@ -387,6 +387,17 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
         "Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredSoffsetGrid3D",
     ),
     _instance(
+        26,
+        "dw1_bf16_gfx950_blocked_g2_adaptive_hot_splitk",
+        OpusMoeBackwardFamily.DW1,
+        OpusMoeBackwardRouteLayout.SORTED_ROUTE_MAJOR,
+        (256, 128, 32),
+        256,
+        1,
+        False,
+        "Dw1Bf16Gfx950BlockedG2AdaptiveHotSplitK",
+    ),
+    _instance(
         18,
         (
             "dw1_bf16_gfx950_bm256_bn128_bk32_wave4_reverse_cohort4_"
@@ -562,6 +573,17 @@ OPUS_MOE_BACKWARD_INSTANCES: tuple[OpusMoeBackwardInstance, ...] = (
         1,
         False,
         "Dw2Bf16Gfx950AdaptiveHotExpertRoutes",
+    ),
+    _instance(
+        20,
+        "dw2_bf16_gfx950_adaptive_hot_splitk",
+        OpusMoeBackwardFamily.DW2,
+        OpusMoeBackwardRouteLayout.SORTED_ROUTE_MAJOR,
+        (128, 64, 64),
+        256,
+        2,
+        False,
+        "Dw2Bf16Gfx950AdaptiveHotSplitK",
     ),
     _instance(
         5,

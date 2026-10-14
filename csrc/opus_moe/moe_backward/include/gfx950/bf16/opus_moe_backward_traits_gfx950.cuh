@@ -735,6 +735,25 @@ struct Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredSoffsetGrid3D
     static constexpr bool ISSUE_AFTER_LDS_READS = true;
 };
 
+struct Dw1Bf16Gfx950Bm256Bn128Bk32BlockedG2ColdLe32768
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredSoffsetGrid3D
+{
+    static constexpr int MAX_ROUTE_COUNT = 32768;
+};
+
+struct Dw1Bf16Gfx950Bm256Bn128Bk32BlockedG2HotSplitK
+    : Dw1Bf16Gfx950Bm256Bn128Bk32Wave4BlockedG2FactoredSoffsetGrid3D
+{
+    static constexpr int EXPERT_COHORT = 0;
+    static constexpr bool HOT_SPLIT_K = true;
+};
+
+struct Dw1Bf16Gfx950BlockedG2AdaptiveHotSplitK
+    : Dw1Bf16Gfx950Bm256Bn128Bk32BlockedG2ColdLe32768
+{
+    static constexpr bool ADAPTIVE_HOT_SPLIT_K = true;
+};
+
 // K5: dO^T x (S*A), 64x64 output with K64 and swizzled LDS reuse.
 struct Dw2Bf16Gfx950Bm64Bn64Bk64Swizzled
     : Bf16Traits<Family::Dw2, 64, 64, 64, 256, 2, false>
@@ -1114,6 +1133,25 @@ struct Dw2Bf16Gfx950AdaptiveHotExpertRoutes
     : Dw2Bf16Gfx950Bm256Bn128Bk64GlobalRouteLe1536
 {
     static constexpr bool ADAPTIVE_HOT_EXPERT_SPLIT = true;
+};
+
+struct Dw2Bf16Gfx950Bm128Bn64Bk64ColdLe32768
+    : Dw2Bf16Gfx950Bm128Bn64Bk64SwizzledCohort1DualLds
+{
+    static constexpr int MAX_ROUTE_COUNT = 32768;
+};
+
+struct Dw2Bf16Gfx950Bm128Bn128Bk64HotSplitK
+    : Dw2Bf16Gfx950Bm128Bn128Bk64SwizzledCohort1DualLdsWave2x2
+{
+    static constexpr int EXPERT_COHORT = 0;
+    static constexpr bool HOT_SPLIT_K = true;
+};
+
+struct Dw2Bf16Gfx950AdaptiveHotSplitK
+    : Dw2Bf16Gfx950Bm128Bn64Bk64ColdLe32768
+{
+    static constexpr bool ADAPTIVE_HOT_SPLIT_K = true;
 };
 
 struct Dw1VarlenBf16Gfx950Bm64Bn128Bk32Swizzled

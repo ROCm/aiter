@@ -1667,6 +1667,7 @@ void opus_moe_weight_bwd(aiter_tensor_t& x,
     dw1_args.model_dim = model_dim;
     dw1_args.inter_dim = inter_dim;
     dw1_args.split_k = 1;
+    dw1_args.split_rows = 0;
     dw1_args.stride_x_t = x.stride(0);
     dw1_args.stride_dz_r = d_z.stride(0);
     dw1_args.stride_dw1_e = d_w1.stride(0);
@@ -1682,6 +1683,7 @@ void opus_moe_weight_bwd(aiter_tensor_t& x,
     dw2_args.model_dim = model_dim;
     dw2_args.inter_dim = inter_dim;
     dw2_args.split_k = 1;
+    dw2_args.split_rows = 0;
     dw2_args.a_scaled_padding_zero = false;
     dw2_args.stride_do_t = d_out.stride(0);
     dw2_args.stride_a_scaled_r = a_scaled.stride(0);
@@ -2068,7 +2070,8 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
                 "z must have shape [sorted_capacity,2I]");
     const bool uses_sorted_x =
         dw1_kernel_id == 14 || dw1_kernel_id == 15 ||
-        dw1_kernel_id == 18 || dw1_kernel_id == 25;
+        dw1_kernel_id == 18 || dw1_kernel_id == 25 ||
+        dw1_kernel_id == 26;
     AITER_CHECK(x_dw1.size(0) ==
                         (uses_sorted_x ? sorted_capacity : token_num) &&
                     x_dw1.size(1) == model_dim,
@@ -2221,6 +2224,75 @@ void opus_moe_full_bwd(aiter_tensor_t& d_out,
     dw2_args.stride_a_scaled_r = a_scaled.stride(0);
     dw2_args.stride_dw2_e = d_w2.stride(0);
     dw2_args.stride_dw2_d = d_w2.stride(1);
+
+    constexpr int hot_split_dw1_kid = 26;
+    if(dw1_kernel_id == hot_split_dw1_kid)
+    {
+        constexpr int hot_split_threshold =
+            opus_moe_backward::gfx950::kHotSplitRouteThreshold;
+        constexpr int hot_split_rows =
+            opus_moe_backward::gfx950::kHotSplitRows;
+        AITER_CHECK(num_experts == 16 && model_dim == 2048 &&
+                        inter_dim == 768 && topk == 1,
+                    "hot split-K requires E16/H2048/I768/K1");
+        const int max_hot_experts =
+            sorted_capacity / (hot_split_threshold + 1);
+        const int split_capacity =
+            (sorted_capacity + hot_split_rows - 1) / hot_split_rows +
+            max_hot_experts;
+        constexpr uint64_t hot_split_metadata_header_ints =
+            opus_moe_backward::gfx950::kHotSplitMetadataHeaderInts;
+        constexpr uint64_t hot_split_record_ints =
+            opus_moe_backward::gfx950::kHotSplitRecordInts;
+        constexpr uint64_t hot_split_metadata_alignment = 256;
+        const uint64_t hot_split_metadata_raw_bytes =
+            (hot_split_metadata_header_ints +
+             hot_split_record_ints * static_cast<uint64_t>(split_capacity)) *
+            sizeof(int32_t);
+        const uint64_t hot_split_metadata_bytes =
+            (hot_split_metadata_raw_bytes +
+             hot_split_metadata_alignment - 1) &
+            ~(hot_split_metadata_alignment - 1);
+        const uint64_t dw1_partial_elements =
+            static_cast<uint64_t>(split_capacity) *
+            static_cast<uint64_t>(2 * inter_dim) * model_dim;
+        const uint64_t dw2_partial_elements =
+            static_cast<uint64_t>(split_capacity) * model_dim * inter_dim;
+        const uint64_t dw1_scratch_bytes =
+            hot_split_metadata_bytes + dw1_partial_elements * sizeof(float);
+        const uint64_t dw2_scratch_bytes =
+            hot_split_metadata_bytes + dw2_partial_elements * sizeof(float);
+        const uint64_t route_scratch_bytes =
+            static_cast<uint64_t>(d_x_route.numel()) * sizeof(hip_bfloat16);
+        const uint64_t dz_scratch_bytes =
+            static_cast<uint64_t>(d_z.numel()) * sizeof(hip_bfloat16);
+        AITER_CHECK(max_hot_experts > 0 && split_capacity > 1,
+                    "hot split-K requires a possible >32K expert");
+        AITER_CHECK(dw1_scratch_bytes <= route_scratch_bytes,
+                    "d_x_route is too small for hot dW1 split-K scratch");
+        AITER_CHECK(dw2_scratch_bytes <= dz_scratch_bytes,
+                    "d_z is too small for hot dW2 split-K scratch");
+
+        auto* dw1_scratch = reinterpret_cast<char*>(d_x_route.data_ptr());
+        dw1_args.split_metadata =
+            reinterpret_cast<int32_t*>(dw1_scratch);
+        dw1_args.workspace = reinterpret_cast<float*>(
+            dw1_scratch + hot_split_metadata_bytes);
+        dw1_args.split_k = split_capacity;
+        dw1_args.split_rows = hot_split_rows;
+        dw1_args.stride_workspace_split =
+            static_cast<int64_t>(2 * inter_dim) * model_dim;
+
+        auto* dw2_scratch = reinterpret_cast<char*>(d_z.data_ptr());
+        dw2_args.split_metadata =
+            reinterpret_cast<int32_t*>(dw2_scratch);
+        dw2_args.workspace = reinterpret_cast<float*>(
+            dw2_scratch + hot_split_metadata_bytes);
+        dw2_args.split_k = split_capacity;
+        dw2_args.split_rows = hot_split_rows;
+        dw2_args.stride_workspace_split =
+            static_cast<int64_t>(model_dim) * inter_dim;
+    }
 
     const hipStream_t stream = aiter::getCurrentHIPStream();
     HipDeviceGuard guard(d_out.device_id);

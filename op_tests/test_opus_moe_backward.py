@@ -307,6 +307,29 @@ def test_invalid_cache_contract():
         )
 
 
+def test_blocked_g2_hot_split_selector_scope():
+    def select(*, experts=16, topk=1, capacity=40000, kid=-1):
+        return opus._select_blocked_g2_full_pipeline(
+            768,
+            2048,
+            capacity,
+            experts,
+            topk,
+            -1,
+            -1,
+            -1,
+            kid,
+        )[3]
+
+    assert select() == 26
+    assert select(experts=8) == 25
+    assert select(topk=2) == 25
+    assert select(capacity=32768) == 25
+    assert select(kid=25) == 25
+    with pytest.raises(ValueError, match="dw1_kernel_id=26 requires"):
+        select(topk=2, kid=26)
+
+
 @pytest.mark.parametrize("kid", [13, 16, 18, 19])
 def test_no_store_down_requires_cache(kid):
     x, dout, w1, w2, scores, z, md, _ = make_case()

@@ -736,6 +736,8 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     constexpr int blocked_route_dx_kid = 20;
     constexpr int blocked_route_dx_mubuf_store_kid = 21;
     constexpr int blocked_dw1_kid = 25;
+    constexpr int blocked_hot_split_dw1_kid = 26;
+    constexpr int hot_split_dw2_kid = 20;
     const bool blocked_down = down_kernel_id == blocked_down_sparse_owner_kid ||
                               down_kernel_id == blocked_down_mubuf_store_kid;
     if(down_kernel_id == blocked_down_mubuf_store_kid)
@@ -761,9 +763,11 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
                     "fixed full pipeline: MUBUF route output store requires "
                     "d_x_route below 4 GiB");
     }
-    const bool blocked_dw1 = dw1_kernel_id == blocked_dw1_kid;
+    const bool hot_split_dw1 = dw1_kernel_id == blocked_hot_split_dw1_kid;
+    const bool blocked_dw1 =
+        dw1_kernel_id == blocked_dw1_kid || hot_split_dw1;
     AITER_CHECK(x_dw1_blocked_g2 == blocked_dw1,
-                "fixed full pipeline: blocked-G2 sorted-X requires K4 kernel 25");
+                "fixed full pipeline: blocked-G2 sorted-X requires K4 kernel 25/26");
     const bool any_blocked_dz = blocked_down || blocked_route_dx || blocked_dw1;
     AITER_CHECK(!any_blocked_dz ||
                     (blocked_down && blocked_route_dx && blocked_dw1),
@@ -923,6 +927,39 @@ inline void launch_fixed_pipeline(const DownBwdKargs& down,
     const bool launch_saved_dw2_before_down =
         mid_width_d && uses_saved_a_and_sorted_x &&
         dz_bytes >= dz_k5_before_route_min_bytes;
+
+    if(hot_split_dw1)
+    {
+        AITER_CHECK(dw2_kernel_id == kKernelAuto ||
+                        dw2_kernel_id == hot_split_dw2_kid,
+                    "hot split-K K4 requires auto or split-K K5 kernel 20");
+        // K4 temporarily owns d_x_route as FP32 partial storage.  Consume and
+        // finalize it before K2 writes the real route gradients.  Once K2/K3
+        // finish, d_z is dead and can serve the same bounded scratch contract
+        // for K5 without adding another persistent allocation.
+        invoke(gfx950::dispatch_down_bwd(
+                   select_fixed_down_kernel_id(down, down_kernel_id)),
+               down,
+               stream,
+               Family::DownBwd);
+        invoke(gfx950::dispatch_dw1(blocked_hot_split_dw1_kid),
+               dw1,
+               stream,
+               Family::Dw1);
+        invoke(gfx950::dispatch_route_dx(selected_route_dx),
+               route_dx,
+               stream,
+               Family::RouteDx);
+        invoke(gfx950::dispatch_route_reduce(selected_route_reduce),
+               route_reduce,
+               stream,
+               Family::RouteReduce);
+        invoke(gfx950::dispatch_dw2(hot_split_dw2_kid),
+               dw2,
+               stream,
+               Family::Dw2);
+        return;
+    }
 
     // With both forward-owned caches, K5 is independent of K1.  Run it first
     // for the largest working sets so K1, K4, and K2 can consume dZ back to
