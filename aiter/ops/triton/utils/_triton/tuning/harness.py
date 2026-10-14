@@ -274,6 +274,8 @@ def precompile(call, inputs, candidates, out, common, done_file=None):
     for candidate in candidates:
         if STOPPING:
             return
+        # the driver reads this line to record a compile it had to stop
+        print("compiling", json.dumps(candidate), flush=True)
         t0 = time.time()
         try:
             compile_only(call, candidate, inputs)

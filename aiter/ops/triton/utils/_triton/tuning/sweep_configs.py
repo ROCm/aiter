@@ -111,6 +111,12 @@ def parse_args(argv=None):
         help="compile-only workers that fill the Triton cache ahead of the sweep (0: off)",
     )
     parser.add_argument(
+        "--compile-timeout",
+        type=int,
+        default=300,
+        help="seconds one compile-ahead compile may take; a longer one becomes an error record",
+    )
+    parser.add_argument(
         "--compile-gpus",
         type=int,
         nargs="+",
@@ -431,6 +437,24 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args, 0)
 
 
+def record_compile_timeout(log_path, out, todo_file, timeout):
+    """The candidate a killed compile-only worker was compiling gets an error record."""
+    with open(log_path) as f:
+        compiling = [line for line in f if line.startswith("compiling ")]
+    if not compiling:
+        return
+    candidate = json.loads(compiling[-1][len("compiling ") :])
+    if candidate is None:
+        return  # the baseline is always left to the sweep
+    error = f"compile took over {timeout} s (compile-ahead)"
+    append_record(
+        out, {"status": "error", "baseline": False, "config": candidate, "error": error}
+    )
+    with open(f"{todo_file}.done", "a") as f:
+        f.write(config_key(candidate) + "\n")
+    print(f"  compile-ahead: {error}: {json.dumps(candidate)}", flush=True)
+
+
 def unclaimed(todo_file, size):
     with open(f"{todo_file}.next") as f:
         return int(f.read() or 0) < size
@@ -457,13 +481,15 @@ def precompile_worker(
             command + ["--out", out],
             env,
             log_path,
-            4 * args.stall,  # a compile-only worker spends its time in one compile
+            args.compile_timeout,  # the worker prints a line before every compile
             args.setup_timeout,
             stop,
         )
         if outcome == "finished":  # keep the log only when something went wrong
             os.remove(log_path)
             return
+        if outcome == "timed_out":
+            record_compile_timeout(log_path, out, todo_file, args.compile_timeout)
         if outcome == "setup_failed" or not unclaimed(todo_file, size):
             return
 

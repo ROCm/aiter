@@ -132,7 +132,9 @@ compile holds up only its own candidate. The driver writes every M's list up fro
 the candidates the pool has finished first: a timing GPU never waits for a compile that the pool
 is already doing. When nothing is ready, the timing worker compiles the pool's next candidate
 itself; when the pool has finished an M, its files go and the timing workers compile on their own. A candidate that does not compile gets its `error` record from the pool
-(`compile_ahead` in the record), so its failed compile is not repeated. The compile GPUs only hold the inputs; they must not be in `--gpu`. The
+(`compile_ahead` in the record), so its failed compile is not repeated. A compile that runs
+longer than `--compile-timeout` (300 s) is stopped and recorded as an error: such kernels are
+huge, spill, and only hold a pool slot. The compile GPUs only hold the inputs; they must not be in `--gpu`. The
 timing workers compile what the pool has not reached yet, so the results do not change.
 
     python3 sweep_configs.py gemm_a16w16 --all-buckets --N 5120 --K 2880 --gpu 0 1 2 \
