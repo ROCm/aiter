@@ -57,6 +57,7 @@ _LAZY_IMPORTS = {
     "flydsl_gdr_decode": (
         ".linear_attention_kernels",
         "flydsl_gdr_decode",
+    ),
     "flydsl_fp8_paged_mqa_logits": (
         ".kernels.mqa_logits.fp8_paged_mqa_logits_gfx950",
         "flydsl_fp8_paged_mqa_logits",
