@@ -1696,22 +1696,18 @@ class CustomAllreduce:
         return out
 
     def uses_1stage_ar(self, inp: torch.Tensor) -> bool:
-        """Match CustomAllreduce::allreduce 1-stage selection (TP<=8)."""
+        """Whether custom_all_reduce(inp) runs a one-shot kernel.
+
+        Mirrors CustomAllreduce::select_ar_stage; gfx1250 has only one-shot
+        kernels (LL and naive).
+        """
         if self.disabled:
             return False
-        if self._is_gfx1250:
-            # all_reduce_gfx1250 has only one-shot kernels (LL and naive).
+        if self._is_gfx1250 or self.world_size == 2:
             return True
         nbytes = inp.numel() * inp.element_size()
-        if self.world_size == 2:
-            return True
-        if not self.fully_connected:
-            return False
-        if self.world_size <= 4:
-            return nbytes < 160 * 1024
-        if self.world_size <= 8:
-            return nbytes < 80 * 1024
-        return False
+        limit = 160 * 1024 if self.world_size <= 4 else 80 * 1024
+        return self.fully_connected and nbytes < limit
 
     def all_reduce_residual(
         self,
@@ -1721,15 +1717,12 @@ class CustomAllreduce:
         out: torch.Tensor | None = None,
         registered_input: bool = False,
     ):
-        """Out-of-place all-reduce with a fused residual add.
+        """Out-of-place all reduce followed by ``+ residual``.
 
         ``residual`` must be identical on every rank. Uses the same 1-/2-stage
-        crossover as plain custom all-reduce.
+        crossover as all_reduce.
         """
-        if self.disabled or self._ops_all_reduce_residual is None:
-            return None
-        if residual.shape != inp.shape or residual.dtype != inp.dtype:
-            return None
+        assert residual.shape == inp.shape, "residual must match the input shape"
         if out is None:
             out = torch.empty_like(inp)
         assert is_weak_contiguous(out), "output tensor is not weak-contiguous"
@@ -1737,20 +1730,19 @@ class CustomAllreduce:
         reg_inp = 0 if registered_input else self._pool["input"].data_ptr
         reg_inp_bytes = 0 if registered_input else self._pool["input"].max_size
         self._ops_all_reduce_residual(
-            self._ptr,
-            inp,
-            out,
-            residual,
-            True,
-            reg_inp,
-            reg_inp_bytes,
+            self._ptr, inp, out, residual, reg_inp, reg_inp_bytes
         )
         return out
 
     def custom_all_reduce_residual(
         self, input: torch.Tensor, residual: torch.Tensor
     ) -> torch.Tensor | None:
-        if self.disabled or not self.should_custom_ar(input):
+        # None when custom allreduce is disabled or has no residual kernel (gfx1250)
+        if (
+            self.disabled
+            or self._ops_all_reduce_residual is None
+            or not self.should_custom_ar(input)
+        ):
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():

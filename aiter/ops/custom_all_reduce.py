@@ -41,7 +41,6 @@ def all_reduce_residual(
     inp: torch.Tensor,
     out: torch.Tensor,
     residual: torch.Tensor,
-    use_new: bool,
     reg_inp_ptr: int,
     reg_inp_bytes: int,
 ) -> None: ...

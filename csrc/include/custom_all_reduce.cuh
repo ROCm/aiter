@@ -312,17 +312,21 @@ DINLINE P* get_tmp_buf(volatile Signal* sg)
     return (P*)(((Signal*)sg) + 1);
 }
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankData* _input_dp,
-                                                                           RankData* _output_dp,
-                                                                           RankSignals sg,
+// HAS_RESIDUAL adds residual (identical on every rank) to the reduced value
+// after it has rounded to T, matching all-reduce followed by a separate add.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool HAS_RESIDUAL = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage_naive(RankData* _input_dp,
+                                     RankData* _output_dp,
+                                     RankSignals sg,
 #ifndef USE_ROCM
-                                                                           volatile
+                                     volatile
 #endif
-                                                                           Signal* self_sg,
-                                                                           T* __restrict__ result,
-                                                                           int rank,
-                                                                           int size)
+                                     Signal* self_sg,
+                                     T* __restrict__ result,
+                                     int rank,
+                                     int size,
+                                     const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
@@ -364,76 +368,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage_naive(RankD
             int gather_from_rank = ((rank + i) % ngpus);
             if(gather_from_rank == ngpus - 1 || idx < part)
             {
-                int dst_idx           = gather_from_rank * part + idx;
-                ((P*)result)[dst_idx] = tmps[i][idx];
-            }
-        }
-    }
-}
-
-// Naive two-stage AR with the replicated residual added in the all-gather, as in
-// cross_device_reduce_2stage_res. It has no per-rank warp split, so it covers
-// what that kernel cannot: TP6 (THREAD_NUM is not a multiple of 6) and inputs
-// whose packs do not divide evenly across ranks.
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_2stage_naive_res(RankData* _input_dp,
-                                         RankData* _output_dp,
-                                         RankSignals sg,
-#ifndef USE_ROCM
-                                         volatile
-#endif
-                                         Signal* self_sg,
-                                         T* __restrict__ result,
-                                         const T* __restrict__ residual,
-                                         int rank,
-                                         int size)
-{
-    constexpr int pack_size = 16 / sizeof(T);
-    int tid                 = blockIdx.x * blockDim.x + threadIdx.x;
-    int stride              = gridDim.x * blockDim.x;
-    using P                 = typename opus::vector_t<T, pack_size>;
-    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    int part                = size / ngpus;
-    int start               = rank * part;
-    int end                 = rank == ngpus - 1 ? size : start + part;
-    int largest_part        = part + size % ngpus;
-    const P* ptrs[ngpus];
-    P* tmps[ngpus];
-#pragma unroll
-    for(int i = 0; i < ngpus; i++)
-    {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
-        tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
-    }
-    auto tmp_out = tmps[0];
-    start_sync<ngpus>(sg, self_sg, rank);
-    // stage 1: reduce scatter
-    for(int idx = start + tid; idx < end; idx += stride)
-    {
-        tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
-    }
-    end_sync<ngpus>(sg, self_sg, rank);
-
-    // stage 2: allgather with the residual added after the reduced value has
-    // rounded to T. The tid must match stage 1 (see cross_device_reduce_2stage_naive).
-    for(int idx = tid; idx < largest_part; idx += stride)
-    {
-#pragma unroll
-        for(int i = 0; i < ngpus; i++)
-        {
-            int gather_from_rank = ((rank + i) % ngpus);
-            if(gather_from_rank == ngpus - 1 || idx < part)
-            {
                 int dst_idx = gather_from_rank * part + idx;
                 P reduced   = tmps[i][idx];
-                P res       = ((const P*)residual)[dst_idx];
-                P write_reg;
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                    write_reg[j] = downcast_s<T>(upcast_s(reduced[j]) + upcast_s(res[j]));
-                ((P*)result)[dst_idx] = write_reg;
+                if constexpr(HAS_RESIDUAL)
+                    packed_assign_add<T, pack_size>(reduced, ((const P*)residual)[dst_idx]);
+                ((P*)result)[dst_idx] = reduced;
             }
         }
     }
@@ -441,17 +380,21 @@ __global__ void __launch_bounds__(512, 1)
 
 #define THREAD_NUM 512
 
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
+// HAS_RESIDUAL adds residual (identical on every rank) in fp32 before the
+// single rounding to T.
+template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool HAS_RESIDUAL = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_1stage(RankData* _input_dp,
+                               RankData* _output_dp,
+                               RankSignals sg,
 #ifndef USE_ROCM
-                                                                     volatile
+                               volatile
 #endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                               Signal* self_sg,
+                               T* __restrict__ result,
+                               int rank,
+                               int size,
+                               const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -522,6 +465,14 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
                     acc[j] += upcast_s(vg[j]);
             }
 
+            if constexpr(HAS_RESIDUAL)
+            {
+                P res = ((const P*)residual)[cur_idx];
+#pragma unroll
+                for(int j = 0; j < pack_size; ++j)
+                    acc[j] += upcast_s(res[j]);
+            }
+
             // store result
             P out;
 #pragma unroll
@@ -548,116 +499,24 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage(RankData* _
     end_sync<ngpus, true>(sg, self_sg, rank);
 }
 
-// Element-parallel 1-stage AR with a fused residual add at the fp32 writeback.
-// Requires a residual that is identical on every rank, i.e. already fully
-// reduced. Separate kernel so the default 1-stage signature is unchanged.
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_1stage_res(RankData* _input_dp,
-                                                                        RankData* _output_dp,
-                                                                        RankSignals sg,
+// HAS_RESIDUAL: see cross_device_reduce_2stage_naive.
+template <typename T,
+          int ngpus,
+          bool is_broadcast_reg_outptr = false,
+          bool has_tail                = false,
+          bool HAS_RESIDUAL            = false>
+__global__ void __launch_bounds__(512, 1)
+    cross_device_reduce_2stage(RankData* _input_dp,
+                               RankData* _output_dp,
+                               RankSignals sg,
 #ifndef USE_ROCM
-                                                                        volatile
+                               volatile
 #endif
-                                                                        Signal* self_sg,
-                                                                        T* __restrict__ result,
-                                                                        const T* __restrict__ residual,
-                                                                        int rank,
-                                                                        int size)
-{
-    constexpr int pack_size = 16 / sizeof(T);
-    using P                 = typename opus::vector_t<T, pack_size>;
-    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-
-    constexpr int tnum_gpu = THREAD_NUM / ngpus;
-    auto dp     = *_input_dp;
-    int warp_id = threadIdx.x / tnum_gpu;
-    int lane_id = threadIdx.x % tnum_gpu;
-
-    __shared__ P tmp_smem[2][tnum_gpu * ngpus];
-
-    const int step  = gridDim.x * tnum_gpu;
-    const int start = blockIdx.x * tnum_gpu + lane_id;
-
-    start_sync<ngpus>(sg, self_sg, rank);
-
-    const int first = blockIdx.x * tnum_gpu;
-    int iters       = 0;
-    {
-        int rem = size - first;
-        iters   = rem > 0 ? (rem + step - 1) / step : 0;
-    }
-
-    int buf  = 0;
-    int idx0 = start;
-
-    if(idx0 < size)
-    {
-        P val                                       = ((const P**)&dp.ptrs[0])[warp_id][idx0];
-        tmp_smem[buf][warp_id * tnum_gpu + lane_id] = val;
-    }
-    __syncthreads();
-
-    for(int it = 0; it < iters; ++it)
-    {
-        const int cur_idx  = idx0 + it * step;
-        const int next_idx = cur_idx + step;
-        const int next_buf = buf ^ 1;
-
-        if(warp_id == 0 && cur_idx < size)
-        {
-            P v0 = tmp_smem[buf][0 * tnum_gpu + lane_id];
-
-            A acc;
-#pragma unroll
-            for(int j = 0; j < pack_size; ++j)
-                acc[j] = upcast_s(v0[j]);
-
-#pragma unroll
-            for(int g = 1; g < ngpus; ++g)
-            {
-                P vg = tmp_smem[buf][g * tnum_gpu + lane_id];
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                    acc[j] += upcast_s(vg[j]);
-            }
-
-            P res = ((const P*)residual)[cur_idx];
-#pragma unroll
-            for(int j = 0; j < pack_size; ++j)
-                acc[j] += upcast_s(res[j]);
-
-            P out;
-#pragma unroll
-            for(int j = 0; j < pack_size; ++j)
-                out[j] = downcast_s<T>(acc[j]);
-
-            ((P*)result)[cur_idx] = out;
-        }
-
-        if(next_idx < size)
-        {
-            P nxt = ((const P**)&dp.ptrs[0])[warp_id][next_idx];
-            tmp_smem[next_buf][warp_id * tnum_gpu + lane_id] = nxt;
-        }
-
-        __syncthreads();
-
-        buf = next_buf;
-    }
-    end_sync<ngpus, true>(sg, self_sg, rank);
-}
-
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool has_tail = false>
-__global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _input_dp,
-                                                                     RankData* _output_dp,
-                                                                     RankSignals sg,
-#ifndef USE_ROCM
-                                                                     volatile
-#endif
-                                                                     Signal* self_sg,
-                                                                     T* __restrict__ result,
-                                                                     int rank,
-                                                                     int size)
+                               Signal* self_sg,
+                               T* __restrict__ result,
+                               int rank,
+                               int size,
+                               const T* __restrict__ residual = nullptr)
 {
     constexpr int pack_size = 16 / sizeof(T);
     constexpr int tnum_gpu  = THREAD_NUM / ngpus;
@@ -742,109 +601,11 @@ __global__ void __launch_bounds__(512, 1) cross_device_reduce_2stage(RankData* _
     // ranks.
     for(int idx = tid; idx < largest_part; idx += stride)
     {
-        int dst_idx           = (warp_id + rank) % ngpus * part + idx;
-        ((P*)result)[dst_idx] = tmps[warp_id][idx];
-    }
-}
-
-// Two-stage AR with the replicated residual folded into the all-gather
-// writeback. Stage 1 is identical to cross_device_reduce_2stage; stage 2 adds
-// the destination element after the reduced value has rounded to T, matching
-// split AR followed by the aggregation kernel's residual add.
-template <typename T, int ngpus, bool is_broadcast_reg_outptr = false, bool has_tail = false>
-__global__ void __launch_bounds__(512, 1)
-    cross_device_reduce_2stage_res(RankData* _input_dp,
-                                   RankData* _output_dp,
-                                   RankSignals sg,
-#ifndef USE_ROCM
-                                   volatile
-#endif
-                                   Signal* self_sg,
-                                   T* __restrict__ result,
-                                   const T* __restrict__ residual,
-                                   int rank,
-                                   int size)
-{
-    constexpr int pack_size = 16 / sizeof(T);
-    constexpr int tnum_gpu  = THREAD_NUM / ngpus;
-    using P                 = typename opus::vector_t<T, pack_size>;
-    using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
-    int warp_id             = threadIdx.x / tnum_gpu;
-    int lane_id             = threadIdx.x % tnum_gpu;
-    int tid                 = blockIdx.x * tnum_gpu + lane_id;
-    int stride              = gridDim.x * tnum_gpu;
-    int part                = size / ngpus;
-    int start               = rank * part;
-    int end                 = rank == ngpus - 1 ? size : start + part;
-    int largest_part        = part + size % ngpus;
-    __shared__ T tmp_smem[tnum_gpu * ngpus * pack_size];
-    const P* ptrs[ngpus];
-    P* tmps[ngpus];
-#pragma unroll
-    for(int i = 0; i < ngpus; i++)
-    {
-        int target = (rank + i) % ngpus;
-        ptrs[i]    = (const P*)_input_dp->ptrs[target];
-        tmps[i]    = get_tmp_buf<P>(sg.signals[target]);
-    }
-    auto tmp_out = tmps[0];
-    start_sync<ngpus>(sg, self_sg, rank);
-    int loop_end = end;
-    if constexpr(has_tail)
-    {
-        loop_end -= (end - start) % tnum_gpu;
-    }
-    int idx = start + tid;
-    for(; idx < loop_end; idx += stride)
-    {
-        *(reinterpret_cast<P*>(&tmp_smem[0]) + threadIdx.x) = ptrs[warp_id][idx];
-        __syncthreads();
-        if(warp_id == 0)
-        {
-            A add_reg;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-                add_reg[i] = upcast_s(tmp_smem[pack_size * threadIdx.x + i]);
-            constexpr int smem_gpu_loop_stride = tnum_gpu * pack_size;
-#pragma unroll
-            for(int i = 1; i < ngpus; ++i)
-            {
-#pragma unroll
-                for(int j = 0; j < pack_size; ++j)
-                    add_reg[j] +=
-                        upcast_s(tmp_smem[i * smem_gpu_loop_stride + pack_size * threadIdx.x + j]);
-            }
-            P write_reg;
-#pragma unroll
-            for(int i = 0; i < pack_size; ++i)
-                write_reg[i] = downcast_s<T>(add_reg[i]);
-            tmp_out[idx - start] = write_reg;
-        }
-        __syncthreads();
-    }
-    if constexpr(has_tail)
-    {
-        if(warp_id == 0 && idx < end)
-        {
-            tmp_out[idx - start] = packed_reduce<P, ngpus, A>(ptrs, idx);
-        }
-    }
-    end_sync<ngpus>(sg, self_sg, rank);
-
-    for(int idx = tid; idx < largest_part; idx += stride)
-    {
         int dst_idx = (warp_id + rank) % ngpus * part + idx;
         P reduced   = tmps[warp_id][idx];
-        P res       = ((const P*)residual)[dst_idx];
-        A add_reg;
-#pragma unroll
-        for(int i = 0; i < pack_size; ++i)
-            add_reg[i] = upcast_s(reduced[i]) + upcast_s(res[i]);
-        P write_reg;
-#pragma unroll
-        for(int i = 0; i < pack_size; ++i)
-            write_reg[i] = downcast_s<T>(add_reg[i]);
-        ((P*)result)[dst_idx] = write_reg;
+        if constexpr(HAS_RESIDUAL)
+            packed_assign_add<T, pack_size>(reduced, ((const P*)residual)[dst_idx]);
+        ((P*)result)[dst_idx] = reduced;
     }
 }
 
@@ -1668,7 +1429,8 @@ DINLINE void smemReduceSum(float* smem_addr)
  * and should be divided by 2048 with dtype fp32
  * */
 // ROW_OPTS=false keeps the plain path (residual add, every row normalized).
-// ROW_OPTS=true honors skip_residual and num_norm_rows.
+// ROW_OPTS=true skips the residual add if skip_residual and normalizes only the
+// first norm_rows rows; residual_out still gets every row.
 template <typename T, int tnum, int n_loop, bool GEMMA_NORM = false, bool ROW_OPTS = false>
 __global__ void __launch_bounds__(tnum, 1)
     local_device_load_rmsnorm_naive(RankSignals sg,
@@ -1680,15 +1442,14 @@ __global__ void __launch_bounds__(tnum, 1)
                                     int rank,
                                     int m,
                                     int n,
-                                    int num_norm_rows = -1,
-                                    int skip_residual = 0)
+                                    int norm_rows      = 0,
+                                    bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
     __shared__ float smem[tnum];
     P* tmps = get_tmp_buf<P>(sg.signals[rank]);
-    int norm_rows = (num_norm_rows < 0 || num_norm_rows > m) ? m : num_norm_rows;
 
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
@@ -1782,8 +1543,8 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
                                                                      int m,
                                                                      int n,
                                                                      int out_hidden_dim,
-                                                                     int num_norm_rows = -1,
-                                                                     int skip_residual = 0)
+                                                                     int norm_rows      = 0,
+                                                                     bool skip_residual = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     using P                 = typename opus::vector_t<T, pack_size>;
@@ -1793,7 +1554,6 @@ __global__ void __launch_bounds__(tnum, 1) local_device_load_rmsnorm(RankSignals
     int in_pack_count   = n / pack_size;
     int out_pack_count  = out_hidden_dim / pack_size;
     int tail_pack_count = out_pack_count - in_pack_count;
-    int norm_rows       = (num_norm_rows < 0 || num_norm_rows > m) ? m : num_norm_rows;
 
     for(int bid = blockIdx.x; bid < m; bid += gridDim.x)
     {
@@ -3139,15 +2899,12 @@ __global__ void __launch_bounds__(1024, 1)
                                    int hidden_dim,
                                    float eps,
                                    T* __restrict__ bf16_output = nullptr,
-                                   int num_norm_rows           = -1,
-                                   int skip_residual           = 0)
+                                   int norm_rows               = 0,
+                                   bool skip_residual          = false)
 {
     constexpr int pack_size = 16 / sizeof(T);
     int block_size          = hidden_dim / pack_size;
     int tnum_gpu            = block_size / ngpus;
-    int n_rows              = size / hidden_dim;
-    int norm_rows =
-        (num_norm_rows < 0 || num_norm_rows > n_rows) ? n_rows : num_norm_rows;
     using P                 = typename opus::vector_t<T, pack_size>;
     using OP                = opus::vector_t<OutT, 16 / sizeof(T)>;
     using A                 = typename opus::vector_t<opus::fp32_t, pack_size>;
@@ -3245,13 +3002,15 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                              int hidden_dim,
                                              float eps,
                                              hipStream_t stream,
-                                             T* bf16_output    = nullptr,
-                                             int num_norm_rows = -1,
-                                             int skip_residual = 0)
+                                             T* bf16_output     = nullptr,
+                                             int num_norm_rows  = -1,
+                                             bool skip_residual = false)
 {
     constexpr int PACK_SIZE = 16 / sizeof(T);
     int BLOCK_SIZE          = hidden_dim / PACK_SIZE;
     int token_num           = size / hidden_dim;
+    // num_norm_rows < 0 normalizes every row.
+    int norm_rows = (num_norm_rows < 0 || num_norm_rows > token_num) ? token_num : num_norm_rows;
     dim3 threadsPerBlock(BLOCK_SIZE);
     token_num = std::min(token_num, kMaxBlocks);
     dim3 numBlocks(token_num);
@@ -3270,7 +3029,7 @@ void allreduce_fusion_kernel_2stage_launcher(RankData* _dp,
                                                             hidden_dim,
                                                             eps,
                                                             bf16_output,
-                                                            num_norm_rows,
+                                                            norm_rows,
                                                             skip_residual);
 }
 
@@ -4852,6 +4611,16 @@ class CustomAllreduce
 #undef LAUNCH_LL128_UNROLL2
     }
 
+    // 1-/2-stage crossover of the use_new kernels. Neither is set when the peers
+    // are not fully connected.
+    void select_ar_stage(size_t bytes, bool& call_1stage, bool& call_2stage) const
+    {
+        call_1stage =
+            world_size_ == 2 || (full_nvlink_ && ((world_size_ <= 4 && bytes < 160 * 1024) ||
+                                                  (world_size_ <= 8 && bytes < 80 * 1024)));
+        call_2stage = !call_1stage && full_nvlink_;
+    }
+
     template <typename T>
     void allreduce(hipStream_t stream,
                    T* input,
@@ -4951,24 +4720,9 @@ class CustomAllreduce
         std::string arch    = dev_prop.gcnArchName;
         bool use_write_mode = false;
 
-        int blocks       = 16;
-        bool call_1stage = false;
-        bool call_2stage = false;
-        if(world_size_ == 2)
-        {
-            call_1stage = true;
-        }
-        else if(full_nvlink_)
-        {
-            if((world_size_ <= 4 && bytes < 160 * 1024) || (world_size_ <= 8 && bytes < 80 * 1024))
-            {
-                call_1stage = true;
-            }
-            else
-            {
-                call_2stage = true;
-            }
-        }
+        int blocks = 16;
+        bool call_1stage, call_2stage;
+        select_ar_stage(bytes, call_1stage, call_2stage);
         if(call_1stage)
         {
             blocks = std::min(kMaxBlocks,
@@ -5092,117 +4846,72 @@ class CustomAllreduce
 #undef KL
 }
 
-    // Custom AR with a fused residual add. Uses the same 1-/2-stage crossover
-    // as plain allreduce; the 2-stage path folds the add into all-gather.
-    template <typename T>
-    void allreduce_residual(hipStream_t stream,
-                            T* input,
-                            T* output,
-                            const T* residual,
-                            int size,
-                            bool is_broadcast_reg_outptr = false,
-                            int threads                  = 512)
+// allreduce plus a residual that is identical on every rank. Same 1-/2-stage
+// crossover as allreduce, without its LL and write-mode variants.
+template <typename T>
+void allreduce_residual(hipStream_t stream,
+                        T* input,
+                        T* output,
+                        const T* residual,
+                        int size,
+                        bool is_broadcast_reg_outptr = false,
+                        int threads                  = 512)
+{
+    auto d = 16 / sizeof(T);
+    if(size % d != 0)
+        throw std::runtime_error(
+            "custom allreduce residual requires input length to be multiple of " +
+            std::to_string(d));
+
+    RankData* input_ptrs  = get_buffer_RD(stream, input);
+    RankData* output_ptrs = nullptr;
+    if(is_broadcast_reg_outptr)
+        output_ptrs = get_output_buffer_RD(stream, output);
+
+    auto bytes = size * sizeof(T);
+    size /= d;
+
+    bool call_1stage, call_2stage;
+    select_ar_stage(bytes, call_1stage, call_2stage);
+    if(!call_1stage && !call_2stage)
+        throw std::runtime_error("allreduce_residual requires fully connected peers");
+    int per_rank = call_1stage ? size : size / world_size_;
+    int blocks =
+        std::min(kMaxBlocks, (per_rank + (threads / world_size_) - 1) / (threads / world_size_));
+
+#define KL_RES(ngpus, name, ...)                                    \
+name<T, ngpus, false, __VA_ARGS__><<<blocks, threads, 0, stream>>>( \
+    input_ptrs, output_ptrs, sg_, self_sg_, output, rank_, size, residual)
+
+    // The warp-split kernels need THREAD_NUM % ngpus == 0 (not TP6) and, for
+    // 2-stage, the same pack count on every rank; the rest go naive.
+#define RESIDUAL_CASE(ngpus)                                     \
+case ngpus: {                                                    \
+    if(ngpus == 6 || (call_2stage && bytes % (ngpus * 16) != 0)) \
+        KL_RES(ngpus, cross_device_reduce_2stage_naive, true);   \
+    else if(call_1stage)                                         \
+        KL_RES(ngpus, cross_device_reduce_1stage, true);         \
+    else if(size % THREAD_NUM != 0)                              \
+        KL_RES(ngpus, cross_device_reduce_2stage, true, true);   \
+    else                                                         \
+        KL_RES(ngpus, cross_device_reduce_2stage, false, true);  \
+    break;                                                       \
+}
+
+    switch(world_size_)
     {
-        auto d = 16 / sizeof(T);
-        if(size % d != 0)
-            throw std::runtime_error(
-                "custom allreduce residual requires input length to be multiple of " +
-                std::to_string(d));
-        if(residual == nullptr)
-            throw std::runtime_error("allreduce_residual requires a residual pointer");
-
-        RankData* input_ptrs  = get_buffer_RD(stream, input);
-        RankData* output_ptrs = nullptr;
-        if(is_broadcast_reg_outptr)
-            output_ptrs = get_output_buffer_RD(stream, output);
-
-        auto bytes = size * sizeof(T);
-        size /= d;
-
-        bool call_1stage = false;
-        bool call_2stage = false;
-        if(world_size_ == 2)
-            call_1stage = true;
-        else if(full_nvlink_)
-        {
-            if((world_size_ <= 4 && bytes < 160 * 1024) ||
-               (world_size_ <= 8 && bytes < 80 * 1024))
-                call_1stage = true;
-            else
-                call_2stage = true;
-        }
-        if(!call_1stage && !call_2stage)
-            throw std::runtime_error(
-                "allreduce_residual requires fully connected peers");
-
-        int blocks = call_1stage
-                         ? std::min(kMaxBlocks,
-                                    (size + (threads / world_size_) - 1) /
-                                        (threads / world_size_))
-                         : std::min(kMaxBlocks,
-                                    (size / world_size_ + (threads / world_size_) - 1) /
-                                        (threads / world_size_));
-#define KL_RES(ngpus)                                                                      \
-    do                                                                                     \
-    {                                                                                      \
-        /* The warp-split kernels need THREAD_NUM % ngpus == 0 (not TP6) and,              \
-           for 2-stage, an equal pack count per rank; the rest goes naive. */              \
-        if(ngpus == 6 || (!call_1stage && bytes % (ngpus * 16) != 0))                      \
-        {                                                                                  \
-            cross_device_reduce_2stage_naive_res<T, ngpus, false>                          \
-                <<<blocks, threads, 0, stream>>>(                                          \
-                    input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
-        }                                                                                  \
-        else if(call_1stage && is_broadcast_reg_outptr)                                   \
-        {                                                                                  \
-            cross_device_reduce_1stage_res<T, ngpus, true><<<blocks, threads, 0, stream>>>( \
-                input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size);    \
-        }                                                                                  \
-        else if(call_1stage)                                                               \
-        {                                                                                  \
-            cross_device_reduce_1stage_res<T, ngpus, false>                                \
-                <<<blocks, threads, 0, stream>>>(                                          \
-                    input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
-        }                                                                                  \
-        else                                                                               \
-        {                                                                                  \
-            if(size % THREAD_NUM != 0)                                                    \
-            {                                                                              \
-                cross_device_reduce_2stage_res<T, ngpus, false, true>                      \
-                    <<<blocks, threads, 0, stream>>>(                                      \
-                        input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
-            }                                                                              \
-            else                                                                           \
-            {                                                                              \
-                cross_device_reduce_2stage_res<T, ngpus, false>                            \
-                    <<<blocks, threads, 0, stream>>>(                                      \
-                        input_ptrs, output_ptrs, sg_, self_sg_, output, residual, rank_, size); \
-            }                                                                              \
-        }                                                                                  \
-    } while(0)
-
-        switch(world_size_)
-        {
-        case 2:
-            KL_RES(2);
-            break;
-        case 4:
-            KL_RES(4);
-            break;
-        case 6:
-            KL_RES(6);
-            break;
-        case 8:
-            KL_RES(8);
-            break;
-        default:
-            throw std::runtime_error(
-                "custom allreduce only supports num gpus in (2,4,6,8). Actual num "
-                "gpus = " +
-                std::to_string(world_size_));
-        }
-#undef KL_RES
+        RESIDUAL_CASE(2)
+        RESIDUAL_CASE(4)
+        RESIDUAL_CASE(6)
+        RESIDUAL_CASE(8)
+    default:
+        throw std::runtime_error("custom allreduce only supports num gpus in (2,4,6,8). Actual num "
+                                 "gpus = " +
+                                 std::to_string(world_size_));
     }
+#undef RESIDUAL_CASE
+#undef KL_RES
+}
 
 // reduce_scatter dispatch. Python wrapper is responsible for:
 //   - normalizing dim < 0
@@ -5388,14 +5097,8 @@ void dispatchAllGather(
 // per row with the grid capped at kMaxBlocks, so above kMaxBlocks rows blocks
 // loop over rows and reduce-scatter + local RMSNorm is faster. MI355X TP4,
 // bf16, hidden 7168: 1.08-1.10x at <= 80 rows, 0.94x at 88, 0.79x at 8192.
-// Re-check per world size (TP2/TP8 use the TP4 value until measured).
-static inline int fusedArRmsSingleKernel2StageMaxRows(int world_size)
-{
-    switch(world_size)
-    {
-    default: return kMaxBlocks;
-    }
-}
+// TP2/TP8 use the TP4 value until measured.
+static constexpr int kFusedArRms2StageMaxRows = kMaxBlocks;
 
 template <typename T>
 void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
@@ -5412,13 +5115,13 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
                                    bool use_1stage,
                                    bool gemma_norm    = false,
                                    int num_norm_rows  = -1,
-                                   int skip_residual  = 0)
+                                   bool skip_residual = false)
 {
     // The 1-stage kernel always adds the residual and normalizes every row.
     if(use_1stage && (skip_residual || (num_norm_rows >= 0 && num_norm_rows < m)))
     {
-        throw std::runtime_error(
-            "fused allreduce rmsnorm: skip_residual and num_norm_rows < m require use_1stage=false");
+        throw std::runtime_error("fused allreduce rmsnorm: skip_residual and num_norm_rows < m "
+                                 "require use_1stage=false");
     }
     if(num_norm_rows < 0 || num_norm_rows > m)
         num_norm_rows = m;
@@ -5494,59 +5197,36 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     }
 
     // Single-kernel 2-stage fused AR+RMSNorm: each block owns complete tokens
-    // in both stages, so RMSNorm folds into the allgather. Shapes that do not
-    // satisfy the guards below fall through to reduce-scatter + local RMSNorm.
-    if(!use_1stage && out_n == n && input_hidden_dim == n &&
-       m <= fusedArRmsSingleKernel2StageMaxRows(world_size_))
-    {
-        int fused_block_size = n / static_cast<int>(pack_size);
-        if(fused_block_size >= world_size_ && (fused_block_size % world_size_) == 0 &&
-           fused_block_size <= 1024)
-        {
-#define LAUNCH_FUSED_2S(NGPUS, GEMMA)                                                      \
-            allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, GEMMA>(                   \
-                ptrs,                                                                      \
-                sg_,                                                                       \
-                self_sg_,                                                                  \
-                rank_,                                                                     \
-                residual_inp,                                                              \
-                residual_out,                                                              \
-                output,                                                                    \
-                weight,                                                                    \
-                nullptr,                                                                   \
-                size,                                                                      \
-                n,                                                                         \
-                eps,                                                                       \
-                stream,                                                                    \
-                nullptr,                                                                   \
-                num_norm_rows,                                                             \
-                skip_residual)
-            bool launched = false;
-            if(gemma_norm)
-            {
-                switch(world_size_)
-                {
-                case 8: LAUNCH_FUSED_2S(8, true); launched = true; break;
-                case 4: LAUNCH_FUSED_2S(4, true); launched = true; break;
-                case 2: LAUNCH_FUSED_2S(2, true); launched = true; break;
-                default: break;
-                }
-            }
-            else
-            {
-                switch(world_size_)
-                {
-                case 8: LAUNCH_FUSED_2S(8, false); launched = true; break;
-                case 4: LAUNCH_FUSED_2S(4, false); launched = true; break;
-                case 2: LAUNCH_FUSED_2S(2, false); launched = true; break;
-                default: break;
-                }
-            }
-#undef LAUNCH_FUSED_2S
-            if(launched)
-                return;
-        }
-    }
+    // in both stages, so RMSNorm folds into the allgather. Other shapes take
+    // reduce-scatter + local RMSNorm below.
+    const int fused_block_size  = n / pack_size;
+    const bool use_fused_2stage = !use_1stage && out_n == n && input_hidden_dim == n &&
+                                  m <= kFusedArRms2StageMaxRows &&
+                                  fused_block_size >= world_size_ &&
+                                  fused_block_size % world_size_ == 0 && fused_block_size <= 1024;
+#define MAYBE_DISPATCH_2S_KERNEL(NGPUS)                                                       \
+if(use_fused_2stage)                                                                          \
+{                                                                                             \
+    auto launcher = gemma_norm ? allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, true>   \
+                               : allreduce_fusion_kernel_2stage_launcher<T, T, NGPUS, false>; \
+    launcher(ptrs,                                                                            \
+             sg_,                                                                             \
+             self_sg_,                                                                        \
+             rank_,                                                                           \
+             residual_inp,                                                                    \
+             residual_out,                                                                    \
+             output,                                                                          \
+             weight,                                                                          \
+             nullptr,                                                                         \
+             size,                                                                            \
+             n,                                                                               \
+             eps,                                                                             \
+             stream,                                                                          \
+             nullptr,                                                                         \
+             num_norm_rows,                                                                   \
+             skip_residual);                                                                  \
+    return;                                                                                   \
+}
 
     // step 1, run reduce-scatter + allgather cross device save
     dim3 block(512);
@@ -5556,16 +5236,19 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     {
     case 8:
         MAYBE_DISPATCH_1S_KERNEL(8);
+        MAYBE_DISPATCH_2S_KERNEL(8);
         reduce_scatter_cross_device_store<T, 8>
             <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     case 4:
         MAYBE_DISPATCH_1S_KERNEL(4);
+        MAYBE_DISPATCH_2S_KERNEL(4);
         reduce_scatter_cross_device_store<T, 4>
             <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
     case 2:
         MAYBE_DISPATCH_1S_KERNEL(2);
+        MAYBE_DISPATCH_2S_KERNEL(2);
         reduce_scatter_cross_device_store<T, 2>
             <<<grid, block, 0, stream>>>(ptrs, sg_, self_sg_, rank_, m, n, input_hidden_dim);
         break;
@@ -5573,6 +5256,7 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     }
 
 #undef MAYBE_DISPATCH_1S_KERNEL
+#undef MAYBE_DISPATCH_2S_KERNEL
 
     // step 2, run allgather local device load + rmsnorm
     int n_bytes  = n * sizeof(T);
@@ -5583,32 +5267,46 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
     };
 
     // Plain callers use the ROW_OPTS=false kernels (main's code path).
-    const bool row_opts = skip_residual || num_norm_rows < m;
+    const bool row_opts       = skip_residual || num_norm_rows < m;
     auto launch_local_rmsnorm = [&](auto kernel, int naive_grid_size, auto... dims) {
         setGrid(naive_grid_size, reinterpret_cast<const void*>(kernel));
-        hipLaunchKernelGGL(kernel, grid, block, 0, stream, sg_, residual_inp, residual_out,
-                           output, weight, eps, rank_, m, n, dims..., num_norm_rows,
+        hipLaunchKernelGGL(kernel,
+                           grid,
+                           block,
+                           0,
+                           stream,
+                           sg_,
+                           residual_inp,
+                           residual_out,
+                           output,
+                           weight,
+                           eps,
+                           rank_,
+                           m,
+                           n,
+                           dims...,
+                           num_norm_rows,
                            skip_residual);
     };
-#define LAUNCH_LOCAL_RMSNORM(KERNEL, TNUM, NLOOP, ...)                                          \
-    do                                                                                         \
-    {                                                                                          \
-        if(row_opts)                                                                           \
-        {                                                                                      \
-            if(gemma_norm)                                                                     \
-                launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, true, true>,                       \
-                                     naive_grid_size __VA_OPT__(, ) __VA_ARGS__);              \
-            else                                                                               \
-                launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, false, true>,                      \
-                                     naive_grid_size __VA_OPT__(, ) __VA_ARGS__);              \
-        }                                                                                      \
-        else if(gemma_norm)                                                                    \
-            launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, true, false>,                          \
-                                 naive_grid_size __VA_OPT__(, ) __VA_ARGS__);                  \
-        else                                                                                   \
-            launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, false, false>,                         \
-                                 naive_grid_size __VA_OPT__(, ) __VA_ARGS__);                  \
-    } while(0)
+#define LAUNCH_LOCAL_RMSNORM(KERNEL, TNUM, NLOOP, ...)                        \
+do                                                                            \
+{                                                                             \
+    if(row_opts)                                                              \
+    {                                                                         \
+        if(gemma_norm)                                                        \
+            launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, true, true>,          \
+                                 naive_grid_size __VA_OPT__(, ) __VA_ARGS__); \
+        else                                                                  \
+            launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, false, true>,         \
+                                 naive_grid_size __VA_OPT__(, ) __VA_ARGS__); \
+    }                                                                         \
+    else if(gemma_norm)                                                       \
+        launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, true, false>,             \
+                             naive_grid_size __VA_OPT__(, ) __VA_ARGS__);     \
+    else                                                                      \
+        launch_local_rmsnorm(KERNEL<T, TNUM, NLOOP, false, false>,            \
+                             naive_grid_size __VA_OPT__(, ) __VA_ARGS__);     \
+} while(0)
 
     // n_packs = number of vectorized elements per row
     constexpr int ar_pack_size = 16 / sizeof(T);
@@ -5621,18 +5319,10 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             int naive_grid_size = m;
             switch(n_loop)
             {
-            case 1:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n);
-                break;
-            case 2:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n);
-                break;
-            case 3:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n);
-                break;
-            case 4:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n);
-                break;
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n); break;
             default:
                 throw std::runtime_error(
                     "fused allreduce rmsnorm pad: n too large, m=" + std::to_string(m) +
@@ -5646,12 +5336,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             int naive_grid_size = m;
             switch(n_loop)
             {
-            case 1:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n);
-                break;
-            case 2:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 2, out_n);
-                break;
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 2, out_n); break;
             default:
                 throw std::runtime_error(
                     "fused allreduce rmsnorm pad: n too large for tnum=256, m=" +
@@ -5680,18 +5366,10 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             // exact fit -> use naive (no bounds check, slightly faster)
             switch(n_loop)
             {
-            case 1:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 1);
-                break;
-            case 2:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 2);
-                break;
-            case 3:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 3);
-                break;
-            case 4:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 4);
-                break;
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 1); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 2); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 3); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 512, 4); break;
             default:
                 throw std::runtime_error(
                     "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
@@ -5703,18 +5381,10 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
             // non-exact -> use bounds-checked version
             switch(n_loop)
             {
-            case 1:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n);
-                break;
-            case 2:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n);
-                break;
-            case 3:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n);
-                break;
-            case 4:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n);
-                break;
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 2, out_n); break;
+            case 3: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 3, out_n); break;
+            case 4: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 512, 4, out_n); break;
             default:
                 throw std::runtime_error(
                     "fused allreduce rmsnorm: n too large, m=" + std::to_string(m) +
@@ -5731,12 +5401,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         {
             switch(n_loop)
             {
-            case 1:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 256, 1);
-                break;
-            case 2:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 256, 2);
-                break;
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 256, 1); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm_naive, 256, 2); break;
             default:
                 throw std::runtime_error(
                     "fused allreduce rmsnorm: n too large for tnum=256, m=" + std::to_string(m) +
@@ -5747,12 +5413,8 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
         {
             switch(n_loop)
             {
-            case 1:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n);
-                break;
-            case 2:
-                LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 2, out_n);
-                break;
+            case 1: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 1, out_n); break;
+            case 2: LAUNCH_LOCAL_RMSNORM(local_device_load_rmsnorm, 256, 2, out_n); break;
             default:
                 throw std::runtime_error(
                     "fused allreduce rmsnorm: n too large for tnum=256, m=" + std::to_string(m) +

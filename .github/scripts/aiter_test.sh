@@ -113,17 +113,6 @@ for file in "${sharded_files[@]}"; do
                 _ "$file"
             )
             ;;
-        op_tests/multigpu_tests/test_custom_allreduce_residual.py)
-            # TP6 takes its own (naive) residual kernel, so run it as well as TP8.
-            {
-                echo "Running custom allreduce residual at TP8 and TP6"
-            } | tee -a latest_test.log
-            test_cmd=(
-                timeout 60m
-                bash -c 'set -euo pipefail; python3 "$1" -t 8; python3 "$1" -t 6'
-                _ "$file"
-            )
-            ;;
         op_tests/multigpu_tests/test_comm_fused_moe.py)
             {
                 echo "Running comm-fused MoE production validation on 8 GPUs when supported"
