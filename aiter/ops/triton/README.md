@@ -62,14 +62,15 @@ handed to the same `@triton.jit` kernel.
 
 | Layer | May import `torch`? |
 | ----- | ------------------- |
-| `utils/_triton/` — arch info, `kernel_repr`, pid preprocessing, kernel-side helpers | **No** |
+| `utils/_triton/` — arch info, `kernel_repr`, tuning harnesses | **No** |
 | Config loading (`utils/config_utils.py`, the `*_config_utils.py` family modules) and `configs/*.json` | **No** |
-| Kernel modules under `_triton_kernels/` and `_gluon_kernels/` | **No** for new modules — a jit body cannot call torch anyway; keep host-side allocation and dtype glue in the wrapper. Modules that already import torch are grandfathered. |
+| Kernel modules under `_triton_kernels/` (including the shared `@triton.jit` device helpers in `_triton_kernels/common/`) and `_gluon_kernels/` | **No** for new modules — a jit body cannot call torch anyway; keep host-side allocation and dtype glue in the wrapper. Modules that already import torch are grandfathered. |
 | `utils/` torch helpers (`shuffle.py`, `types.py`, `common_utils.py`, ...) and every public wrapper | **Yes** — this is where torch belongs |
 
 - A helper both sides need is split, not duplicated: the torch-free part under
-  `utils/_triton/`, the torch part in `utils/`. `moe_common.py` exists in both
-  places for exactly this reason.
+  `utils/_triton/` (or `_triton_kernels/common/` when it is `@triton.jit`
+  code), the torch part in `utils/`. `moe_common.py` exists in both
+  `_triton_kernels/common/` and `utils/` for exactly this reason.
 - `utils/_triton/tuning/` is exempt — those are standalone tuning harnesses
   that run in a PyTorch environment, not part of the importable surface.
 - Non-PyTorch users still write their own wrappers. Their framework creates

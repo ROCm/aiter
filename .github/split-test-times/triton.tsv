@@ -38,6 +38,7 @@ op_tests/triton_tests/conv/test_causal_conv1d.py	727
 op_tests/triton_tests/conv/test_causal_conv1d_update_single_token.py	7
 op_tests/triton_tests/conv/test_conv2d.py	96
 op_tests/triton_tests/conv/test_conv3d.py	207
+op_tests/triton_tests/fusions/test_activation.py	56
 op_tests/triton_tests/fusions/test_attn_res.py	34
 op_tests/triton_tests/fusions/test_fused_bmm_rope_kv_cache.py	68
 op_tests/triton_tests/fusions/test_fused_clamp_act_mul.py	15
@@ -48,6 +49,7 @@ op_tests/triton_tests/fusions/test_fused_qk_concat.py	8
 op_tests/triton_tests/fusions/test_fused_reduce_qk_norm_rope_swa_write.py	23
 op_tests/triton_tests/fusions/test_fused_rmsnorm_indexed_adaln.py	4
 op_tests/triton_tests/fusions/test_fused_sigmoid_mul.py	1
+op_tests/triton_tests/fusions/test_fused_silu_mul.py	2
 op_tests/triton_tests/fusions/test_mhc.py	180
 op_tests/triton_tests/fusions/test_mhc_fused_post_pre_delayed_rmsnorm.py	5
 op_tests/triton_tests/fusions/test_silu_and_mul_backward.py	4
@@ -118,9 +120,7 @@ op_tests/triton_tests/rope/test_fused_qk_norm_rope_gate_fp8_quant.py	53
 op_tests/triton_tests/rope/test_fused_qkv_split_qk_rope.py	238
 op_tests/triton_tests/rope/test_rope.py	163
 op_tests/triton_tests/rope/test_rope_mxfp4.py	3
-op_tests/triton_tests/test_activation.py	56
 op_tests/triton_tests/test_cross_entropy.py	4
-op_tests/triton_tests/test_fused_silu_mul.py	2
 op_tests/triton_tests/test_gather_kv_b_proj.py	38
 op_tests/triton_tests/test_kv_cache.py	1
 op_tests/triton_tests/test_pa_decode_gluon.py	396

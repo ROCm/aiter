@@ -6,7 +6,7 @@ import warnings
 import torch
 import triton
 
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.gemm.feed_forward.ff_a16w16_fused_gated import (
     _ff_a16w16_fused_gated,
     _get_config,
