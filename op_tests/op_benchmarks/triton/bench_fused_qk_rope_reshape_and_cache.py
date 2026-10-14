@@ -260,7 +260,6 @@ def parse_int_or_list(value):
 
 def parse_args(args: list[str] | None = None):
     parser = get_parser(kernel_name="fused_qk_rope_reshape_and_cache")
-    parser.set_defaults(metric="time")
     parser.add_argument(
         "-M",
         type=parse_int_or_list,
