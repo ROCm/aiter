@@ -23,6 +23,9 @@ from aiter.dist.device_communicators.custom_all_reduce import (
 from aiter.dist.device_communicators.quick_all_reduce import QuickAllReduce
 from aiter.ops.flydsl import allreduce_policy as P
 from aiter.ops.flydsl.allreduce_policy import (
+    fused_mesh_st_ladder,
+    fused_oneshot_ladder,
+    fused_ring_st_ladder,
     mesh_st_ladder,
     oneshot_ladder,
     ring_st_ladder,
@@ -33,10 +36,16 @@ from aiter.ops.flydsl.kernels.comm.allreduce_shared import (
     FamilyPolicy,
     Window,
 )
-from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import SUPPORTED_ATOMS
+from aiter.ops.flydsl.kernels.comm.one_shot_allreduce import (
+    SUPPORTED_ATOMS,
+    SUPPORTED_SPLITS,
+)
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_mesh import SUPER_TILES
 from aiter.ops.flydsl.kernels.comm.quick_allreduce_ring import RING_SUPER_TILES
-from aiter.ops.flydsl.one_shot_allreduce import resolve_oneshot_max_bytes
+from aiter.ops.flydsl.one_shot_allreduce import (
+    resolve_fused_oneshot_max_bytes,
+    resolve_oneshot_max_bytes,
+)
 
 WORLDS = P.SUPPORTED_WORLDS
 ARCHES = P.SUPPORTED_ARCHS
@@ -466,3 +475,160 @@ def test_selectors_reject_non_contiguous():
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# Fused all-reduce + RMSNorm
+# ==========================
+#
+# The fused kernels have tables of their own, read by the same ``FamilyPolicy``
+# and ``select_rung`` machinery. ``AITER_FLY_AR_ACCURACY`` picks the quantized
+# (``fast``) or the exact windows, and the overrides carry a ``FUSED`` infix.
+
+
+def _fused_row(link, ws, arch):
+    return P.fused_family_policy(arch=arch, link=link, world_size=ws)
+
+
+def _resolve_fused(link="pcie", ws=4, arch="gfx950"):
+    return P.resolve_fused_policy(world_size=ws, arch=arch, link=link)
+
+
+def test_every_platform_has_one_fused_policy():
+    keys = sorted((r.arch, r.link, r.world_size) for r in P.FUSED_FAMILY_POLICIES)
+    assert keys == sorted((a, link, ws) for link, ws, a in CELLS)
+
+
+def test_every_platform_has_one_fused_ladder_per_algorithm():
+    keys = sorted((a, link, ws) for link, ws, a in CELLS)
+    for table in (
+        P.FUSED_ONESHOT_LADDER,
+        P.FUSED_MESH_ST_LADDER,
+        P.FUSED_RING_ST_LADDER,
+    ):
+        assert sorted(table) == keys
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_dispatch_is_monotone(cell):
+    row = _fused_row(*cell)
+    order = {ONESHOT: 0, None: 1, MESH: 2, RING: 3}
+    for quantized in (False, True):
+        sizes = [1 << k for k in range(4, 33)]
+        seen = [order[row.select(n, quantized=quantized)] for n in sizes]
+        # Past the last window everything falls back, so drop the tail.
+        while seen and seen[-1] == order[None]:
+            seen.pop()
+        assert seen == sorted(seen), quantized
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_exact_mode_runs_only_the_one_shot(cell):
+    assert _fused_row(*cell).algorithms(quantized=False) == (ONESHOT,)
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_fast_mode_reaches_past_the_one_shot(cell):
+    """Quantization pays above the one-shot on every platform, so ``fast``
+    always has a quantized window, and it is unbounded above."""
+    row = _fused_row(*cell)
+    algs = row.algorithms(quantized=True)
+    assert algs[0] == ONESHOT and len(algs) >= 2, algs
+    assert row.window(algs[-1], quantized=True).max is None
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_ladders_are_well_formed(cell):
+    """The fused ladders obey the rules of the plain ones, with no ``block``:
+    a fused build sizes its workgroup to the token row."""
+    link, ws, arch = cell
+    kw = {"world_size": ws, "link": link, "arch": arch}
+    for name, rungs, valid_st in (
+        ("mesh", fused_mesh_st_ladder(**kw), SUPER_TILES),
+        ("ring", fused_ring_st_ladder(**kw), RING_SUPER_TILES),
+    ):
+        assert rungs and rungs[0].min_bytes == 0, name
+        floors = [r.min_bytes for r in rungs]
+        assert floors == sorted(floors), name
+        for r in rungs:
+            assert r.super_tile in valid_st, (name, r)
+            assert r.grid_cap >= 1, (name, r)
+
+    one = fused_oneshot_ladder(**kw)
+    assert one and one[0].min_bytes == 0
+    floors = [r.min_bytes for r in one]
+    assert floors == sorted(floors)
+    for r in one:
+        assert r.atoms in SUPPORTED_ATOMS, r
+        assert r.grid_cap >= 1, r
+        assert r.fanout in ("peer", "atom"), r
+        assert r.split in SUPPORTED_SPLITS, r
+
+
+def test_fused_row_atoms_divide_the_chunk():
+    """Every ``FUSED_QR_ROW_ATOMS`` entry divides a rank's reduce-scatter
+    chunk, ``8 // world_size`` atoms, and names a platform that exists."""
+    platforms = {(a, link, ws) for link, ws, a in CELLS}
+    for (arch, link, ws, algorithm), atoms in P.FUSED_QR_ROW_ATOMS.items():
+        assert (arch, link, ws) in platforms, (arch, link, ws)
+        assert algorithm in ("mesh", "ring"), algorithm
+        assert atoms >= 1 and (8 // ws) % atoms == 0, (arch, link, ws, atoms)
+
+
+def test_fused_ladder_lookup_rejects_unknown_keys():
+    for ladder in (fused_oneshot_ladder, fused_mesh_st_ladder, fused_ring_st_ladder):
+        with pytest.raises(P.NoPolicyError):
+            ladder(world_size=4, link="pcie", arch="gfx942")
+        with pytest.raises(ValueError):
+            ladder(world_size=4, link="nosuchlink", arch="gfx950")
+
+
+@pytest.mark.parametrize("cell", CELLS)
+def test_fused_oneshot_max_bytes_follows_the_accuracy_mode(cell):
+    link, ws, arch = cell
+    row = _fused_row(*cell)
+    kw = {"world_size": ws, "link": link, "arch": arch}
+    for mode, quantized in (("exact", False), ("fast", True)):
+        with _env(AITER_FLY_AR_ACCURACY=mode):
+            want = row.window(ONESHOT, quantized=quantized).max - 1
+            assert resolve_fused_oneshot_max_bytes(**kw) == want, mode
+
+
+def test_accuracy_mode_env():
+    with _env(AITER_FLY_AR_ACCURACY=""):
+        assert P.accuracy_mode() == P.DEFAULT_ACCURACY == "exact"
+    with _env(AITER_FLY_AR_ACCURACY="FAST"):
+        assert P.accuracy_mode() == "fast"
+    with _env(AITER_FLY_AR_ACCURACY="lossy"):
+        assert P.accuracy_mode() == P.DEFAULT_ACCURACY
+
+
+def test_fused_overrides_are_separate_from_the_plain_ones():
+    plain = _resolve()
+    fused = _resolve_fused()
+    with _env(AITER_FLY_AR_ONESHOT_MAX_BYTES="65536"):
+        assert _resolve_fused() == fused
+    with _env(
+        AITER_FLY_AR_FUSED_ONESHOT_MAX_BYTES="65536",
+        AITER_FLY_AR_FUSED_MESH_MIN_BYTES="65536",
+    ):
+        got = _resolve_fused()
+        assert got.window(ONESHOT, quantized=True) == Window(0, 65536)
+        assert got.window(ONESHOT, quantized=False) == Window(0, 65536)
+        assert got.window(MESH, quantized=True).min == 65536
+        assert _resolve() == plain
+
+
+def test_fused_hiddens_env():
+    with _env(AITER_FLY_AR_FUSED_HIDDENS=""):
+        assert P.fused_hiddens((4096, 0, 4096)) == (4096,)
+    with _env(AITER_FLY_AR_FUSED_HIDDENS="7168, 2048,x,-1"):
+        assert P.fused_hiddens((4096,)) == (2048, 4096, 7168)
+
+
+def test_resolve_fused_rejects_unknown_keys():
+    with pytest.raises(ValueError):
+        _resolve_fused(link="infiniband")
+    with pytest.raises(ValueError):
+        _resolve_fused(ws=3)
+    with pytest.raises(P.NoPolicyError):
+        _resolve_fused(link="pcie", arch="gfx942")
