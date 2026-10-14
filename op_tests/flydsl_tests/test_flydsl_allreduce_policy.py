@@ -361,6 +361,19 @@ def test_exact_oneshot_has_its_own_overrides():
     ):
         p = _resolve("xgmi", 4)
         assert p.window(ONESHOT, quantized=False) == Window(0, 256 << 10)
+    # It starts from the window the exact one-shot ran in, the quantized
+    # one-shot's, so a minimum alone does not make the window unbounded.
+    one = _row("xgmi", 4, "gfx942").oneshot
+    with _env(AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES="1024"):
+        p = _resolve("xgmi", 4, "gfx942")
+        assert p.window(ONESHOT, quantized=False) == Window(1024, one.max)
+    with _env(
+        AITER_FLY_AR_ONESHOT_MAX_BYTES=str(128 << 10),
+        AITER_FLY_AR_MESH_MIN_BYTES=str(128 << 10),
+        AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES="1024",
+    ):
+        p = _resolve("xgmi", 4, "gfx942")
+        assert p.window(ONESHOT, quantized=False) == Window(1024, 128 << 10)
 
 
 def test_link_variable_backs_up_an_unreadable_probe():

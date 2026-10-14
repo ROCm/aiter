@@ -480,7 +480,7 @@ def make_quick_allreduce_ring_kernel(
                 # c_out the all-gather one. Every rank has now contributed, so
                 # this is the final sum for our own chunk. Quantize it for the
                 # all-gather's first send, and write our own output from the
-                # packet that we just built. The other ranks decode the same packet, 
+                # packet that we just built. The other ranks decode the same packet,
                 # so every rank ends with the same bits.
                 atoms = _load_chunk_atoms(tile, chunk)
                 for j in range_constexpr(rank_atoms):

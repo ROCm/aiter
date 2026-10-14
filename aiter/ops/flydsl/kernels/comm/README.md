@@ -76,7 +76,7 @@ its own chunk from the packet that it sent.
 The kernels convert the bf16 payload to fp16 and do all arithmetic in packed
 fp16, for every wire format.
 
-* A magnitude above 65504 saturates to 65504. The `fp16` wire format is not 
+* A magnitude above 65504 saturates to 65504. The `fp16` wire format is not
   lossless for bf16 values outside the fp16 range.
 * The group scale is an E4M3 byte with a largest magnitude of 480. A group
   with an extremum above 480 clips at about 480, and NaN and Inf become finite
@@ -94,8 +94,8 @@ selects the memory type of the inbox:
   from L2 before the flag store. On PCIe, this mode is faster than `uncached`,
   because uncached peer writes become slow when the fanout is wide.
 * `auto` (default): `uncached` on xGMI hosts, `finegrained` on PCIe hosts. The
-  interconnect comes from the KFD topology or from `AITER_FLY_AR_LINK` if the KFD 
-  topology cannot be read. At TP2, `auto` selects `uncached` on PCIe also, because 
+  interconnect comes from the KFD topology or from `AITER_FLY_AR_LINK` if the KFD
+  topology cannot be read. At TP2, `auto` selects `uncached` on PCIe also, because
   there is only one remote peer.
 
 The cache policy for each mode is in `_INBOX_POLICY` in `allreduce_shared.py`.
@@ -192,8 +192,10 @@ is not.
   The `EXACT_ONESHOT` variables change the window of the exact one-shot
   (`exact_oneshot`), which `CustomAllreduce` serves. Where a policy has no
   `exact_oneshot` window, the exact one-shot uses the `oneshot` window, and
-  the `ONESHOT` variables change it. To disable the one-shot in all cases,
-  set both maximums to `0`.
+  the `ONESHOT` variables change it. An `EXACT_ONESHOT` variable then creates
+  an `exact_oneshot` window from the `oneshot` window, so a minimum alone keeps
+  the `oneshot` maximum. To disable the one-shot in all cases, set both
+  maximums to `0`.
 * If a value is not valid, the code logs a warning and uses the value from the
   table.
 * If the `oneshot`, `mesh` and `ring` windows overlap after the change, the

@@ -461,13 +461,14 @@ def apply_env_overrides(policy: FamilyPolicy) -> FamilyPolicy:
         )
         for alg, infix in _WINDOW_ENV.items()
     }
+    oneshot = _override(policy.oneshot, *bounds[AllReduceAlgorithm.OneShot])
     return dataclasses.replace(
         policy,
-        oneshot=_override(policy.oneshot, *bounds[AllReduceAlgorithm.OneShot]),
+        oneshot=oneshot,
         mesh=_override(policy.mesh, *bounds[AllReduceAlgorithm.TwoShotMesh]),
         ring=_override(policy.ring, *bounds[AllReduceAlgorithm.TwoShotRing]),
         exact_oneshot=_override(
-            policy.exact_oneshot,
+            policy.exact_oneshot if policy.exact_oneshot is not None else oneshot,
             _env_bound("AITER_FLY_AR_EXACT_ONESHOT_MIN_BYTES", is_max=False),
             _env_bound("AITER_FLY_AR_EXACT_ONESHOT_MAX_BYTES", is_max=True),
         ),

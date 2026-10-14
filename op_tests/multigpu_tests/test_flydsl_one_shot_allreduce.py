@@ -646,6 +646,14 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     probes = []
     try:
         if built:
+            eng = ca._fly_oneshot
+            calls = [0]
+
+            def allreduce(*args, _run=eng.allreduce, **kw):
+                calls[0] += 1
+                return _run(*args, **kw)
+
+            eng.allreduce = allreduce
             lo, hi = ca._fly_oneshot_range(ca._fly_window)
             # Whole-row payloads at both ends of the served range, one in its
             # middle, and one row outside each end (expected to route elsewhere).
@@ -664,17 +672,19 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
                 parts = _parts(m, ROW, tp, 4242 + nbytes, device)
                 x = parts[rank].contiguous()
                 ref = torch.stack(parts).float().sum(0)
+                before = calls[0]
                 out = comm.all_reduce(x)
                 torch.cuda.synchronize()
-                served = ca.should_custom_ar(x) and ca._should_fly_oneshot(
-                    x, True, False
-                )
+                exact = _rank_order_sum(parts)
                 probes.append(
                     {
                         "nbytes": nbytes,
                         "expect_served": served_lo <= nbytes <= served_hi,
-                        "served": bool(served),
+                        "served": calls[0] > before,
                         "sqnr_db": _sqnr_db(ref, out.float()),
+                        "bit_mismatches": int(
+                            (out.view(torch.int16) != exact.view(torch.int16)).sum()
+                        ),
                     }
                 )
     finally:
@@ -976,7 +986,7 @@ def test_one_shot_allreduce_coverage(tp, window):
 @benchmark()
 def test_one_shot_allreduce_dispatch(tp):
     """Production dispatch with ``AITER_FLY_AR=1``: the custom all-reduce slot
-    builds the FlyDSL one-shot and ``CudaCommunicator.all_reduce`` routes the 
+    builds the FlyDSL one-shot and ``CudaCommunicator.all_reduce`` routes the
     payloads in its dispatch range to it.
     """
     ranks = _dispatch_ranks(tp)
@@ -999,6 +1009,11 @@ def test_one_shot_allreduce_dispatch(tp):
                 fails.append(
                     f"rank {rank}: {p['nbytes']} B SQNR {p['sqnr_db']:.2f} dB below "
                     f"the {SQNR_FLOOR_DB} dB bf16 floor"
+                )
+            if p["served"] and p["bit_mismatches"]:
+                fails.append(
+                    f"rank {rank}: {p['nbytes']} B differs from the rank-order "
+                    f"sum in {p['bit_mismatches']} lanes"
                 )
     _check(f"tp={tp} dispatch", fails)
     probes0 = ranks[0]["probes"]

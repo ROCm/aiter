@@ -189,7 +189,8 @@ HIDDEN = 4096
 _ROW_BYTES = HIDDEN * 2
 
 # Back-to-back calls of ``test_quick_allreduce_run_ahead``, and the shape of each
-# (a 4 MiB payload).
+# (a 4 MiB payload). ``_run_ahead_shape`` moves it into the schedule's dispatch
+# window when it is outside it.
 RUN_AHEAD_ITERS = 48
 RUN_AHEAD_SHAPE = (512, HIDDEN)
 
@@ -509,6 +510,22 @@ def _ship_payloads(
     by_cfg = _kernel_payloads(world_size, algorithm, link, lo, MAX_PAYLOAD_BYTES)
     first = _ladder(algorithm, world_size, link)[0]
     return [by_cfg.get((first.super_tile, first.block), min(by_cfg.values()))], None
+
+
+def _run_ahead_shape(window: tuple[int, int] | None) -> tuple[int, int]:
+    """``RUN_AHEAD_SHAPE``, moved to the nearest whole-row payload of *window*,
+    the inclusive dispatch range of the schedule, so the run-ahead runs a kernel
+    that production dispatches. The top of an unbounded window is cut at
+    ``TOP_PAYLOAD_BYTES``; a window starting above that runs at its start.
+    """
+    tokens, hidden = RUN_AHEAD_SHAPE
+    if window is None:
+        return RUN_AHEAD_SHAPE
+    lo, hi = window
+    rlo = -(-lo // _ROW_BYTES) * _ROW_BYTES
+    rhi = max(min(hi, TOP_PAYLOAD_BYTES) // _ROW_BYTES * _ROW_BYTES, rlo)
+    nbytes = min(max(tokens * hidden * 2, rlo), rhi)
+    return nbytes // _ROW_BYTES, HIDDEN
 
 
 def _fmt_bytes(nbytes: int) -> str:
@@ -971,8 +988,10 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     the engines; ``_should_fly`` is the gate ``quick_all_reduce`` applies to route a
     payload to one.
 
-    Per probe it records which schedule the policy selects, whether ``_should_fly``
-    agrees, and the accuracy of the all-reduce the top-level actually returned.
+    Per probe it records which schedule the policy selects, which engine actually
+    ran (a wrapper on each engine's ``allreduce`` records it), and the accuracy of
+    the all-reduce the top-level returned. Unbounded windows are cut at
+    ``TOP_PAYLOAD_BYTES``, as everywhere else in this file.
     """
     import torch.distributed as dist
 
@@ -996,6 +1015,14 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
     probes = []
     try:
         if built:
+            ran = []
+            for alg, eng in qr._fly_engines.items():
+
+                def allreduce(*args, _run=eng.allreduce, _alg=alg, **kw):
+                    ran.append(_alg)
+                    return _run(*args, **kw)
+
+                eng.allreduce = allreduce
             # Whole-row payloads at both ends of every served window, plus one row
             # below the smallest (expected to route to HIP or the fallback).
             sizes = set()
@@ -1003,7 +1030,7 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
             for alg in qr._fly_engines:
                 lo, hi = qr._fly_policy.window(alg, quantized=True).inclusive_range()
                 rlo = -(-lo // _ROW_BYTES) * _ROW_BYTES
-                rhi = hi // _ROW_BYTES * _ROW_BYTES
+                rhi = min(hi, TOP_PAYLOAD_BYTES) // _ROW_BYTES * _ROW_BYTES
                 if rlo <= rhi:
                     sizes.update((rlo, rhi))
                     lows.append(rlo)
@@ -1016,6 +1043,7 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
                 inp = _make_inp(m, HIDDEN, "normal", rank=rank, device=device)
                 ref = inp.to(torch.float32)
                 dist.all_reduce(ref, group=group)
+                ran.clear()
                 out = comm.all_reduce(inp)
                 torch.cuda.synchronize()
                 alg = qr._fly_policy.select(nbytes, quantized=True)
@@ -1024,7 +1052,8 @@ def _dispatch_rank(rank: int, tp: int, init_method: str) -> dict:
                         "nbytes": nbytes,
                         "algorithm": None if alg is None else alg.value,
                         "expect_served": alg in qr._fly_engines,
-                        "served": bool(qr._should_fly(inp)),
+                        "served": bool(ran),
+                        "ran": [a.value for a in ran],
                         "sqnr_db": _sqnr_db(out.float(), ref),
                     }
                 )
@@ -1422,9 +1451,8 @@ def test_quick_allreduce_transport(tokens, hidden, tp, algorithm, super_tile, bl
 
 
 @benchmark()
-def test_quick_allreduce_run_ahead(tp, algorithm):
+def test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm):
     """Back-to-back calls with new inputs, under rank skew; correctness only."""
-    tokens, hidden = RUN_AHEAD_SHAPE
     rows = _result(_ship_key(tp, algorithm, None), (tokens, hidden, "run_ahead", False))
     fails = _identity_fails(rows, algorithm)
     fails += [
@@ -1492,6 +1520,11 @@ def test_quick_allreduce_dispatch(tp):
                 fails.append(
                     f"rank {rank}: {p['nbytes']} B routed to FlyDSL={p['served']}, "
                     f"expected {p['expect_served']} ({p['algorithm']})"
+                )
+            elif p["served"] and p["ran"] != [p["algorithm"]]:
+                fails.append(
+                    f"rank {rank}: {p['nbytes']} B ran {p['ran']}, expected "
+                    f"[{p['algorithm']!r}]"
                 )
             if p["expect_served"] and p["sqnr_db"] < SQNR_MIN_DB:
                 fails.append(
@@ -1569,11 +1602,12 @@ def _verify(args, tps, algos, dts, link) -> None:
                 _ship_key(tp, algorithm, grid_cap, block),
                 (tokens, hidden, "normal", True),
             )
-    run_ahead = [(tp, algorithm) for tp, algorithm in plans]
-    for tp, algorithm in run_ahead:
-        _register(
-            _ship_key(tp, algorithm, None), (*RUN_AHEAD_SHAPE, "run_ahead", False)
-        )
+    run_ahead = [
+        (tp, algorithm, *_run_ahead_shape(window))
+        for (tp, algorithm), (_payloads, window) in plans.items()
+    ]
+    for tp, algorithm, tokens, hidden in run_ahead:
+        _register(_ship_key(tp, algorithm, None), (tokens, hidden, "run_ahead", False))
     edge = [c for c in EDGE_CASES if c[0] in tps and c[1] in algos]
     for tp, algorithm, tokens, hidden, fill in edge:
         _register(_ship_key(tp, algorithm, None), (tokens, hidden, fill, False))
@@ -1629,7 +1663,10 @@ def _verify(args, tps, algos, dts, link) -> None:
         _write_json(args.out, rows)
     _summarize(
         "flydsl quick allreduce run-ahead",
-        [test_quick_allreduce_run_ahead(tp, algorithm) for tp, algorithm in run_ahead],
+        [
+            test_quick_allreduce_run_ahead(tokens, hidden, tp, algorithm)
+            for tp, algorithm, tokens, hidden in run_ahead
+        ],
     )
     _summarize(
         "flydsl quick allreduce INT4 edge inputs",
