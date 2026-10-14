@@ -35,8 +35,13 @@ jobs:
     # Cheap pre-filter (a PR comment carrying the phrase); the real, quote-aware + allowlist
     # check runs in the step below on this free GitHub-hosted runner, so an unauthorized comment
     # never starts a job on the single self-hosted box.
+    # The bot's own comments are issue_comment events too, so every card, queue notice and
+    # failure report used to start a run of this workflow -- gated off a moment later, but only
+    # after taking a hosted-runner slot that the real requests are queueing for. Eighteen reviews
+    # produced thirty-six such runs competing with themselves.
     if: >
       github.event.issue.pull_request &&
+      github.event.comment.user.login != 'aiter-bot' &&
       contains(github.event.comment.body, '@aiter-bot review')
     runs-on: ubuntu-latest
     # A few API calls and, on the rare stalled-queue path, one 60s pause. Without this the
