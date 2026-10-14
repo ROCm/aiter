@@ -251,3 +251,9 @@ def test_inference_fn_needs_fn_packed(dispatch, norm):
     )
     seam.flydsl_mhc_seam(**inputs, config={"NORM": norm}, fn_packed=packed)
     assert dispatch.launches[0][1][5] is packed
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
