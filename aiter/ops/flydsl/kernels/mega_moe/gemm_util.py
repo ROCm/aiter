@@ -428,10 +428,12 @@ class AScaleLoader:
             fragment.store(v)
             fx.copy(fx.make_copy_atom(fx.UniversalCopy128b(), fx.Int32), fragment, dst)
 
-        if const_expr(self._indexed_input and self._sort_block_m >= 128):
+        if const_expr(self._indexed_input):
             groups_per_row = self._n_scale // 16
-            # Preserve the tuned 16-slot geometry for current models while
-            # covering every 16-byte scale group for model_dim > 8192.
+            # indexed_slots scales with sort_block_m and the 16-lane subgroup
+            # geometry is independent of it, so every indexed sort_block_m
+            # (32/64/128) gathers correctly; padding to 16 groups also covers
+            # model_dim > 8192.
             padded_groups_per_row = max(16, groups_per_row)
             indexed_slots = self._sort_block_m * padded_groups_per_row
 
