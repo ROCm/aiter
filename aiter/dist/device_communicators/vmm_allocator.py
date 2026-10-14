@@ -24,10 +24,11 @@ def load_hip_runtime() -> ctypes.CDLL:
     Split rocm-sdk pip layouts (e.g. `_rocm_sdk_core/lib`) ship only the
     versioned soname `libamdhip64.so.N` on the runtime path; the unversioned
     `libamdhip64.so` symlink lives in the -devel package which need not be on
-    LD_LIBRARY_PATH at runtime. Try the plain name first, then versioned
-    sonames so it works regardless of which package is present.
+    LD_LIBRARY_PATH at runtime.
 
-    If a HIP runtime is already mapped (torch's), bind to that copy instead.
+    If a HIP runtime is already mapped (torch's), bind to that copy. Otherwise
+    try the plain name, then the versioned sonames.
+
     When -devel is on LD_LIBRARY_PATH, the plain name maps a second runtime,
     and other ctypes HIP users that pick the copy from /proc/self/maps (e.g.
     SGLang's vattn_asm) can bind the wrong one: their launches on torch
@@ -43,7 +44,10 @@ def load_hip_runtime() -> ctypes.CDLL:
         path = line[line.find("/") :].rstrip("\n").removesuffix(" (deleted)")
         path = path.replace("\\012", "\n")
         if "/" in line and os.path.basename(path).startswith("libamdhip64.so"):
-            return ctypes.CDLL(path)
+            try:
+                return ctypes.CDLL(path)
+            except OSError:
+                pass
     candidates = ["libamdhip64.so", "libamdhip64.so.7", "libamdhip64.so.6"]
     last_err = None
     for name in candidates:
