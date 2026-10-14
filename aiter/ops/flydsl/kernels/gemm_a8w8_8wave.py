@@ -492,9 +492,10 @@ def compile_fp8_gemm_8w(
         a_g2s.load(a_next1, A1_gl_offset + (K_ITERS - 1) * BLOCK_K)
         # Every wave loads a slice of each LDS tile, and waves 4..7 run one
         # barrier behind waves 0..3. Drain the K_ITERS - 1 b0/a0/b1 tiles here
-        # (only the a_next1 load above stays in flight), two barriers before
-        # waves 0..3 read them; otherwise they can read LDS that waves 4..7
-        # have not finished filling.
+        # (only the a_next1 load above stays in flight); otherwise waves 0..3
+        # can read LDS that waves 4..7 have not finished filling. mfma.call
+        # ends in a barrier, so waves 0..3 pass c10's -- and then read
+        # b_next0 -- only once waves 4..7 have executed this wait.
         wait_barrier(N_LDS_STEPS_A)
 
         c10_frag = mfma.call(a1_frag, b0_frag, c10_frag)
