@@ -145,10 +145,11 @@ def launch_gemm_a8w8(
     SA_LDS_ROW = SB_LDS_ROW = preload_ks if preload else K_WS
     SA_TDM_SHAPE = (tile_m, preload_ks) if preload else SA_SHAPE
     SB_TDM_SHAPE = (N_BLOCKS, preload_ks) if preload else SB_SHAPE
-    out_cls = fx.Float16 if out_is_f16 else fx.BFloat16
+    out_cls = fx.Float32 if split_k > 1 else (fx.Float16 if out_is_f16 else fx.BFloat16)
+    c_bytes = 4 if split_k > 1 else 2
     C_PAD = 8 if tile_n >= 128 else 0
     C_LDS_ROW = tile_n + C_PAD
-    C_STORE_B = (tile_m * C_LDS_ROW * 2 + 127) // 128 * 128
+    C_STORE_B = (tile_m * C_LDS_ROW * c_bytes + 127) // 128 * 128
     ARENA_B = max(PANEL_OFF + PANEL_A + PANEL_B, C_STORE_B)
     # The compile target, not the host: AOT cross-compiles these gfx1250
     # kernels under FLYDSL_GPU_ARCH, which get_rocm_arch() honours.
@@ -767,7 +768,8 @@ def launch_gemm_a8w8(
                 col_rel = wnb + wn * 16 + kgrp * 8
                 h = accs[wm * wmma_n_rep + wn].to(out_cls)
                 fx.ptr_store(
-                    h.bitcast(fx.Int8), base_ptr + (row_rel * C_LDS_ROW + col_rel) * 2
+                    h.bitcast(fx.Int8),
+                    base_ptr + (row_rel * C_LDS_ROW + col_rel) * c_bytes,
                 )
         workgroup_barrier(use_cluster=False)
         c_off_rt = blk_m64 * ldc64 + blk_n64

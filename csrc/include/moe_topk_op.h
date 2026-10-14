@@ -12,6 +12,7 @@ void topk_gating(aiter_tensor_t& topk_weights,
                  aiter_tensor_t& correction_bias,
                  bool need_renorm,
                  float routed_scaling_factor = 1.0,
-                 const std::string& score_func = "sqrtsoftplus");
+                 const std::string& score_func = "sqrtsoftplus",
+                 int num_shared_experts = 0);
 
 } // namespace aiter

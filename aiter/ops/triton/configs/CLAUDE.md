@@ -145,6 +145,7 @@ exactly one home; there is no facade or re-export layer.
 | `utils/gemm_config_utils.py` | `get_gemm_config`, `add_default_gemm_config_params`, `compute_splitk_params`, `pick_gemm_num_stages`, `STANDARD_M_BOUNDS` | `<arch>/<backend>/gemm/<d_type>/` |
 | `utils/conv_config_utils.py` | `get_conv_config`, `has_conv_config`, `has_exact_conv_config`, `conv_config_uses_exact_routes`, `format_shape_key`, `format_prepack_shape_key`, `CONV_STANDARD_M_BOUNDS` | `<arch>/triton/conv/<d_type>/` |
 | `utils/mhc_config_utils.py` | `get_mhc_config`, `get_mhc_post_config`, `hip_post_dispatch_block` | `<arch>/triton/mhc/<d_type>/` (gfx942 fallback) |
+| `utils/mhc_config_utils.py` | `get_mhc_post_pre_gluon_gfx1250_config` | `gfx1250/gluon/mhc/mhc_post_pre/DEFAULT.json` (no fallback) |
 | `utils/moe_config_utils.py` | `get_moe_dispatch` | `<arch>/<backend>/moe/<d_type>/` |
 | `utils/tuned_config_utils.py` | `get_tuned_kernel_config` | `<arch>/<backend>/<op>/<d_type>/DEFAULT.json` |
 | `utils/quant_config_utils.py` | `get_quant_config` | `<arch>/gluon/quant/<d_type>/DEFAULT.json` |

@@ -5,7 +5,7 @@ import torch
 import triton
 
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.triton._triton_kernels.activation import _get_activation_from_str
+from aiter.ops.triton._triton_kernels.common.activation import _get_activation_from_str
 from aiter.ops.triton._triton_kernels.common.splitk_reduce import (
     _gemm_splitk_reduce_kernel,
 )
