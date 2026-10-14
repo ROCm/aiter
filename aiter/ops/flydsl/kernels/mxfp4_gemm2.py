@@ -148,7 +148,6 @@ def compile_gemm2_a4w4_port(
         _aq_num = arith.index_cast(T.index, _raw(i32_max_m_blocks)) * fx.Index(
             BM * _K_HALF
         )
-        aq_rsrc = _buffer_rsrc(arg_aq, _aq_num)
         lds_raw_ptr = fx.SharedAllocator().allocate(SharedStorage).peek().raw.ptr
         saq_base_i32 = fx.Int32(fx.ptrtoint(lds_raw_ptr))
 
@@ -198,7 +197,6 @@ def compile_gemm2_a4w4_port(
                 N_OUT,
                 epilog,
                 arg_aq=arg_aq,
-                aq_rsrc=aq_rsrc,
                 D_INTER=_K,
                 D_INTER_REAL=_K_REAL,
                 aStages=_aStages,
@@ -325,8 +323,7 @@ def _gemm2_body(
     N_OUT,
     epilog,
     *,
-    arg_aq=None,
-    aq_rsrc=None,
+    arg_aq,
     D_INTER,
     D_INTER_REAL=None,
     aStages=kStages,
