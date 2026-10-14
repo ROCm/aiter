@@ -109,6 +109,13 @@ def test_mesh_and_ring_windows_must_not_overlap():
     assert p.select(96, quantized=True) is None
 
 
+def test_unbounded_one_shot_window():
+    """A one-shot that wins at every size, in both modes, is a valid policy."""
+    row = _policy(oneshot=Window(0, None), mesh=None, ring=None)
+    assert row.select(1 << 30, quantized=True) == ONESHOT
+    assert row.select(1 << 30, quantized=False) == ONESHOT
+
+
 def test_mesh_and_ring_take_precedence_over_the_one_shot():
     """The one-shot window may overlap the quantized windows. With quantization
     on, ``QuickAllReduce`` serves the mesh and the ring first, and ``select``
