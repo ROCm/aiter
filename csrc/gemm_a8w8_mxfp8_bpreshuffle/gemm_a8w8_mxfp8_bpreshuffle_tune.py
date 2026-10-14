@@ -22,15 +22,22 @@ from aiter import dtypes, logger
 from aiter.ops.flydsl.gemm_tune.flydsl_gemm_mxscale_preshuffle_common import (
     MXFP8_ROW_PIPELINES,
 )
+from aiter.ops.gemm_op_common import with_mxscale_w_scale_block
 from aiter.ops.shuffle import shuffle_weight
 from aiter.utility.base_tuner import GemmCommonTuner
 from aiter.utility.mp_tuner import mp_tuner
 
 TUNED_FILE = "aiter/configs/model_configs/dsv4_a8w8_mxfp8_bpreshuffle_tuned_gemm.csv"
+# The block of a shape list without a w_scale_block column, and of a tuned
+# table from before the column.
+W_SCALE_BLOCK = "1x32"
+# w_scale block -> the pipelines tuned for it.
+PIPELINES_BY_W_SCALE_BLOCK = {"1x32": MXFP8_ROW_PIPELINES}
 
 
-def generate_data(m, n, k, seed, device="cuda"):
+def generate_data(m, n, k, seed, w_scale_block=W_SCALE_BLOCK, device="cuda"):
     """fp8 operands with per-1x32 e8m0 scales around 2^-3..2^3, unshuffled."""
+    assert w_scale_block == "1x32", f"no {w_scale_block} w_scale data"
     torch.manual_seed(seed)
     x = (torch.randn((m, k), device=device) * 2).to(dtypes.fp8)
     weight = (torch.randn((n, k), device=device) * 2).to(dtypes.fp8)
@@ -85,11 +92,35 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         from aiter.ops import gemm_op_a8w8 as _op
 
         _op._get_mxfp8_bpreshuffle_config.cache_clear()
+        _op._load_mxfp8_bpreshuffle_tuned.cache_clear()
         _op._CKGEMM_CONFIG_CACHE.clear()
         _op._CKGEMM_HAS_GFX.clear()
 
     def _setup_specific_arguments(self):
         pass
+
+    def get_untuned_gemm_list(self, untuned_gemm_file):
+        # A plain M,N,K shape list is a 1x32 one (as is a blank cell of a
+        # tuned table --all retunes); pre_process slices untunedf down to
+        # self.keys.
+        df = super().get_untuned_gemm_list(untuned_gemm_file)
+        if "w_scale_block" not in df.columns:
+            df["w_scale_block"] = W_SCALE_BLOCK
+        df["w_scale_block"] = df["w_scale_block"].fillna(W_SCALE_BLOCK)
+        unknown = set(df["w_scale_block"]) - set(PIPELINES_BY_W_SCALE_BLOCK)
+        if unknown:
+            raise ValueError(
+                f"{untuned_gemm_file}: no gfx950 mxfp8 kernels tuned for w_scale "
+                f"block {sorted(unknown)}; tunable: {sorted(PIPELINES_BY_W_SCALE_BLOCK)}"
+            )
+        return df
+
+    def get_tuned_gemm_list(self, tuned_gemm_file, columns=None):
+        df = super().get_tuned_gemm_list(tuned_gemm_file, columns)
+        df = with_mxscale_w_scale_block(df, tuned_gemm_file, default=W_SCALE_BLOCK)
+        # A table from before the column gets it where the tuner writes it.
+        rest = [c for c in df.columns if c not in self.keys]
+        return df[[c for c in self.keys if c in df.columns] + rest]
 
     def calculate(self, results, bpes=(1, 1, 2)):
         return super().calculate(results, bpes=(1, 1, 2))
@@ -102,10 +133,11 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
         for i in range(len(self.untunedf)):
             row = self.untunedf.iloc[i]
             M, N, K = int(row["M"]), int(row["N"]), int(row["K"])
-            shape_str = f"({M}, {N}, {K})"
+            block = row.get("w_scale_block", W_SCALE_BLOCK)
+            shape_str = f"({M}, {N}, {K}, {block})"
             allowed, allowed_desc = self._get_run_config_err_ratio_limit(row, args)
             try:
-                d = generate_data(M, N, K, 0)
+                d = generate_data(M, N, K, 0, block)
                 out, us = run_perftest(
                     gemm_a8w8_mxfp8_bpreshuffle,
                     d["x"],
@@ -153,11 +185,12 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
             M = int(untunedf.loc[i, "M"])
             N = int(untunedf.loc[i, "N"])
             K = int(untunedf.loc[i, "K"])
-            info_keys = (gfx, cu_num, M, N, K)
-            # One pass per pipeline, in MXFP8_ROW_PIPELINES order.
+            block = str(untunedf.loc[i, "w_scale_block"])
+            info_keys = (gfx, cu_num, M, N, K, block)
+            # One pass per pipeline of the block, in their order.
             cands = [
                 (kernel_id, ki)
-                for pipe in MXFP8_ROW_PIPELINES
+                for pipe in PIPELINES_BY_W_SCALE_BLOCK[block]
                 for kernel_id, ki in pipe.kernels_list.items()
                 if pipe.fits(ki, M, N, K)
             ]
@@ -170,7 +203,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     (
                         info,
                         generate_data,
-                        (M, N, K, seed),
+                        (M, N, K, seed, block),
                         run_gemm_flydsl,
                         (gemm_keys, ki.name),
                         dict(run_kwargs),
@@ -186,7 +219,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
                     )
                 )
             if not cands:
-                logger.warning(f"no mxfp8 1x32 kernel fits M={M} N={N} K={K}")
+                logger.warning(f"no mxfp8 {block} kernel fits M={M} N={N} K={K}")
             tasks_data.append((len(cands), ()))
 
         if not task:
@@ -237,7 +270,7 @@ class GemmA8W8MXFP8BpreshuffleTuner(GemmCommonTuner):
 
 if __name__ == "__main__":
     # Same columns as the table the gfx1250 rows already live in.
-    key = ["gfx", "cu_num", "M", "N", "K"]
+    key = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
     resultList = [
         "libtype",
         "kernelId",

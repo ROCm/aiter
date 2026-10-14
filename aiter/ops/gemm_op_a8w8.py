@@ -27,6 +27,7 @@ from ..ops.gemm_op_common import (
     find_padded_m_row,
     get_padded_m,
     mxscale_w_scale_block,
+    with_mxscale_w_scale_block,
 )
 from ..utility import dtypes
 from ..utility.graph_alloc import persistent_alloc
@@ -2244,26 +2245,59 @@ def _mxfp8_32_fallback_kernel_name(M: int, N: int, K: int) -> str | None:
     return None
 
 
-@functools.lru_cache(maxsize=1024)
-def _get_mxfp8_bpreshuffle_config(M: int, N: int, K: int):
-    """(libtype, kernelName, splitK) serving this shape.
+# The w_scale block of every gemm_a8w8_mxfp8_bpreshuffle row so far (gfx1250's
+# 32x4-shuffled and gfx950's row-major scale alike), and of a table from before
+# the w_scale_block key column.
+_MXFP8_W_SCALE_BLOCK = "1x32"
+_MXFP8_TUNED_KEYS = ["gfx", "cu_num", "M", "N", "K", "w_scale_block"]
 
-    A FlyDSL tuned row wins; an untuned shape uses the FlyDSL heuristic.
+
+@functools.lru_cache(maxsize=1)
+def _load_mxfp8_bpreshuffle_tuned(tuned_file: str) -> dict:
+    """{(gfx, cu_num, M, N, K, w_scale_block): row} of the mxfp8 tuned CSV."""
+    try:
+        df = pd.read_csv(tuned_file).drop_duplicates()
+    except (OSError, pd.errors.EmptyDataError):
+        return {}  # no tuned shapes on this install
+    df = with_mxscale_w_scale_block(df, tuned_file, default=_MXFP8_W_SCALE_BLOCK)
+    return df.set_index(_MXFP8_TUNED_KEYS).to_dict("index")
+
+
+@functools.lru_cache(maxsize=1024)
+def _get_mxfp8_bpreshuffle_config(
+    M: int, N: int, K: int, w_scale_block: str = _MXFP8_W_SCALE_BLOCK
+):
+    """(libtype, kernelName, splitK) serving this shape and w_scale block.
+
+    A FlyDSL tuned row wins (exact M, else a padded M, the walk
+    get_CKGEMM_config makes); an untuned shape uses the FlyDSL heuristic.
     gfx950 rows are FlyDSL mxpsh kernels; an untuned gfx950 shape runs the
     mxpsh heuristic tile.
     """
-    config = get_CKGEMM_config(
-        M, N, K, AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
+    tuned_file = AITER_CONFIGS.AITER_CONFIG_GEMM_A8W8_MXFP8_BPRESHUFFLE_FILE
+    gfx, cu_num = get_gfx(), get_cu_num()
+    config, padded_m = find_padded_m_row(
+        _load_mxfp8_bpreshuffle_tuned(tuned_file),
+        lambda pm: (gfx, cu_num, pm, N, K, w_scale_block),
+        M,
+        N,
+        K,
     )
-    if get_gfx() == "gfx950":
+    if config is not None and AITER_LOG_TUNED_CONFIG:
+        logger.info(
+            f"shape is M:{M}, N:{N}, K:{K}, w_scale {w_scale_block}, found padded_M: "
+            f"{padded_m} tuned on cu_num = {cu_num} in {tuned_file}, kernel name is "
+            f"{config['kernelName']}!"
+        )
+    if gfx == "gfx950":
         if config is not None and config["libtype"] == "flydsl":
             return "flydsl", str(config["kernelName"]), int(config["splitK"])
         from .flydsl.mxscale_preshuffle_kernels import pick_mxfp8_kernel_name_gfx950
 
         name = pick_mxfp8_kernel_name_gfx950(M, N, K)
         logger.warning(
-            f"[gfx950] gemm_a8w8_mxfp8_bpreshuffle untuned M={M}, N={N}, K={K}; "
-            f"falling back to flydsl kernel '{name}'."
+            f"[gfx950] gemm_a8w8_mxfp8_bpreshuffle untuned M={M}, N={N}, K={K}, "
+            f"w_scale {w_scale_block}; falling back to flydsl kernel '{name}'."
         )
         return "flydsl", name, 1 if name is None else int(name.rsplit("_sk", 1)[1])
     if config is not None and config["libtype"] == "flydsl":
@@ -2325,7 +2359,12 @@ def gemm_a8w8_mxfp8_bpreshuffle(
     Y = torch.empty(M, N, dtype=dtype, device=XQ.device) if out is None else out
     if M == 0:
         return Y
-    _, kernel_name, _ = _get_mxfp8_bpreshuffle_config(M, N, K)
+    # gfx950 reads the block off the row-major w_scale's shape (as
+    # run_gemm_a8w8_mxfp8 does); gfx1250's 32x4-shuffled w_scale is 1x32 only.
+    w_scale_block = _MXFP8_W_SCALE_BLOCK
+    if gfx == "gfx950" and w_scale.dim() == 2:
+        w_scale_block = mxscale_w_scale_block(tuple(w_scale.shape), N, K)
+    _, kernel_name, _ = _get_mxfp8_bpreshuffle_config(M, N, K, w_scale_block)
     if gfx == "gfx950":
         from .flydsl.gemm_a8w8_mxfp8 import run_gemm_a8w8_mxfp8
 

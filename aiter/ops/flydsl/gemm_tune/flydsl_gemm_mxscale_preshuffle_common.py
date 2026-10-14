@@ -38,6 +38,9 @@ _TILE_K = (128, 256)
 # the bytes in flight per trip, for the latency-bound small-M tiles. Appended
 # after the rest of the catalog so the existing kernel ids keep their numbers.
 _TILE_K_512_TILE_M = (16, 32, 64)
+# The fp8/fp8/bf16 split-K tiles again with fused_split_k (_fsk), appended last
+# with their ids offset past the 8-wave range (dispatch is by kernelName).
+KERNEL_ID_BASE_FSK = 2_000_000
 # Occupancy hints, following the (0, 2, 4) selection
 # flydsl/kernels/small_m_hgemm.py already uses: 0 (no hint) is a distinct mode,
 # and the odd values in between duplicate their neighbours rather than adding
@@ -283,8 +286,11 @@ def fits_shape(
     LDS next to A."""
     if K % 128 != 0:
         return False
-    if ki.tile_k == 512 and (a_scale_layout, b_scale_layout) != ("row", "row"):
+    row_row = (a_scale_layout, b_scale_layout) == ("row", "row")
+    if ki.tile_k == 512 and not row_row:
         return False  # a mfma_tile scale word spans 256 K: tile_k <= 256
+    if ki.fused_split_k and not row_row:
+        return False  # the in-kernel reduce reads row-layout scales' fp32 partials
     if (
         "row" in (a_scale_layout, b_scale_layout)
         and estimated_lds_bytes(ki, a_scale_layout, b_scale_layout) > _max_lds_bytes()
@@ -348,6 +354,9 @@ def _build_kernels_list():
                         if instance_valid(ki):
                             out[idx] = ki
                             idx += 1
+    for i, ki in list(out.items()):
+        if ki.split_k > 1 and (ki.a_dtype, ki.b_dtype) == ("fp8", "fp8"):
+            out[KERNEL_ID_BASE_FSK + i] = replace(ki, fused_split_k=True)
     return out
 
 
@@ -449,19 +458,9 @@ def _fits_mxpsh_row(ki: kernelInstance, M: int, N: int, K: int) -> bool:
     )
 
 
-# The split-K a8w8 mxpsh tiles again, reducing in-kernel (fused_split_k, _fsk).
-# Ids are offset past the 8-wave range; dispatch is by kernelName.
-KERNEL_ID_BASE_FSK = 2_000_000
-kernels_list_fsk = {
-    KERNEL_ID_BASE_FSK + i: replace(ki, fused_split_k=True)
-    for i, ki in kernels_list.items()
-    if ki.split_k > 1
-    and (ki.a_dtype, ki.b_dtype, ki.out_dtype) == ("fp8", "fp8", "bf16")
-}
-
-# Order is the order candidates are emitted per shape.
+# Order is the order candidates are emitted per shape. mxpsh's _fsk variants
+# are kernels_list entries (fused_split_k), not a pipeline of their own.
 MXFP8_ROW_PIPELINES: tuple[Pipeline, ...] = (
     Pipeline("mxpsh", kernels_list, _fits_mxpsh_row),
-    Pipeline("mxpsh_fsk", kernels_list_fsk, _fits_mxpsh_row),
     Pipeline("8wave", kernels_list_8wave, fits_shape_8wave),
 )

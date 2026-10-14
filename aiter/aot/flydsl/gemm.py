@@ -265,6 +265,9 @@ def parse_csv(csv_path: str):
             k = int(row["K"])
             cu_num = int(row.get("cu_num", "0"))
             gfx = row.get("gfx", "").strip()
+            # Its kernels read 1x32 row scales; a row from before the column is one.
+            if mxfp8_table and (row.get("w_scale_block") or "1x32").strip() != "1x32":
+                continue
 
             if row.get("kernelId", "").strip() == "bmm":  # the batched GEMM, B = 1
                 # A 128-wide GEMM x_scale is column-major (blockscale), read by

@@ -38,7 +38,7 @@ _OUT_DTYPE_STR = {torch.bfloat16: "bf16", torch.float16: "fp16"}
 
 
 @functools.cache
-def _gemm_exe(_cfg, fused, _multi_row, _scale_layouts=None):
+def _gemm_exe(fused):
     import flydsl.compiler as flyc
 
     from .kernels.gemm.mxscale_preshuffle import launch_gemm, launch_gemm_fused
@@ -48,7 +48,7 @@ def _gemm_exe(_cfg, fused, _multi_row, _scale_layouts=None):
 
 
 @functools.cache
-def _reduce_exe(_cfg):
+def _reduce_exe():
     import flydsl.compiler as flyc
 
     from .kernels.gemm.mxscale_preshuffle import launch_splitk_reduce
@@ -263,7 +263,9 @@ def flydsl_mxscale_preshuffle_gemm(
     )
     multi_row = int(tile_m) == 16 and M > 1
     layouts = (a_scale_layout, b_scale_layout)  # launch_gemm's last Constexprs
-    gemm_exe = _gemm_exe(cfg, splitk_fused, multi_row, layouts)
+    gemm_exe = _gemm_exe(splitk_fused)
+    # launch_gemm's Constexpr tail but fused_split_k, which each launch appends.
+    spec = (*cfg, multi_row, *layouts)
     # Build each runtime pointer wrapper once per op.  The fused ABI carries two
     # additional pointer slots; re-wrapping Out (or the split workspace) for
     # those aliases measurably increases launch gaps on very short decode GEMMs.
@@ -284,10 +286,9 @@ def flydsl_mxscale_preshuffle_gemm(
             M,
             N,
             st,
-            *cfg,
-            multi_row,
-            *layouts,
+            *spec,
             False,  # fused_split_k
+            specialization_key=(*spec, False),
         )
         return Out
 
@@ -327,10 +328,9 @@ def flydsl_mxscale_preshuffle_gemm(
             M,
             N,
             st,
-            *cfg,
-            multi_row,
-            *layouts,
+            *spec,
             fused_f32,  # fused_split_k
+            specialization_key=(*spec, fused_f32),
         )
         return Out
 
@@ -349,13 +349,12 @@ def flydsl_mxscale_preshuffle_gemm(
         M,
         N,
         st,
-        *cfg,
-        multi_row,
-        *layouts,
+        *spec,
         False,  # fused_split_k
+        specialization_key=(*spec, False),
     )
     _run_compiled(
-        _reduce_exe((split_k, out_dtype)),
+        _reduce_exe(),
         tmp_ptr,
         out_ptr,
         (M * N) // 2,  # n_out_dw (2 out elems per dword)
@@ -363,6 +362,7 @@ def flydsl_mxscale_preshuffle_gemm(
         st,
         split_k,
         out_dtype,
+        specialization_key=(split_k, out_dtype),
     )
     return Out
 
@@ -391,11 +391,12 @@ def _heuristic_tile(a_dtype, b_dtype, M, N, K, scales=()):
 
     # scales: candidates_for's scale kwargs as sorted (name, value) pairs, which
     # keep the call hashable for the cache; () is the blockscale default.
-    # tile_k=512 is a tuned-only option: the heuristic keeps its untuned picks.
+    # tile_k=512 and _fsk are tuned-only options: the heuristic keeps its
+    # untuned picks.
     cands = [
         ki
         for _, ki in candidates_for(a_dtype, b_dtype, M, N, K, **dict(scales))
-        if ki.tile_k <= 256
+        if ki.tile_k <= 256 and not ki.fused_split_k
     ]
     if not cands:
         return None
