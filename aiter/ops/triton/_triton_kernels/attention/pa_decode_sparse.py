@@ -51,8 +51,7 @@ _pa_decode_sparse_repr = make_kernel_repr(
 @triton.jit(repr=_pa_decode_sparse_repr)
 def _pa_decode_sparse(
     q_ptr,  # [N, H, D]
-    unified_kv_ptr,  # [total_pages, D] bf16/fp16, or fp8 when QUANT_KV
-    kv_scales_ptr,  # [total_pages, NUM_GROUPS] fp32 when QUANT_KV (dummy otherwise)
+    unified_kv_ptr,  # [total_pages, D] bf16/fp16
     kv_indices_ptr,  # [total_indices] int32
     kv_indptr_ptr,  # [N+1] int32
     m_partial_ptr,  # [N, KV_SPLITS, H_padded] fp32 (unused when KV_SPLITS==1)
@@ -66,7 +65,6 @@ def _pa_decode_sparse(
     q_stride_d: tl.constexpr,
     kv_stride_n: tl.constexpr,
     kv_stride_d: tl.constexpr,
-    ks_stride_n: tl.constexpr,
     mp_stride_t: tl.constexpr,
     mp_stride_k: tl.constexpr,
     mp_stride_h: tl.constexpr,
@@ -88,9 +86,6 @@ def _pa_decode_sparse(
     BLOCK_D: tl.constexpr,
     BLOCK_K: tl.constexpr,
     HAS_INVALID: tl.constexpr,
-    QUANT_KV: tl.constexpr,
-    GROUP_SIZE: tl.constexpr,
-    NUM_GROUPS: tl.constexpr,
     USE_EXP2: tl.constexpr,
     num_warps: tl.constexpr,
 ):
@@ -165,8 +160,6 @@ def _pa_decode_sparse(
     acc = tl.zeros((BLOCK_H, BLOCK_D), dtype=tl.float32)
 
     k_offs = tl.arange(0, BLOCK_K)
-    if QUANT_KV:
-        g_idx_per_d = d_offs // GROUP_SIZE
     for j in tl.range(tile_start, tile_end, num_stages=2):
         k_start = j * BLOCK_K
         k_pos = k_start + k_offs
@@ -190,22 +183,13 @@ def _pa_decode_sparse(
         # from a wrapped address -- silently, since the wrapped offset still
         # lands inside the same allocation.
         slot_off = slot.to(tl.int64)
-        kv_raw = tl.load(
+        kv = tl.load(
             unified_kv_ptr
             + slot_off[:, None] * kv_stride_n
             + d_offs[None, :] * kv_stride_d,
             mask=valid[:, None] & d_mask[None, :],
             other=0.0,
         )
-        if QUANT_KV:
-            scales_full = tl.load(
-                kv_scales_ptr + slot_off[:, None] * ks_stride_n + g_idx_per_d[None, :],
-                mask=valid[:, None] & d_mask[None, :],
-                other=0.0,
-            )
-            kv = (kv_raw.to(tl.float32) * scales_full).to(q_ptr.dtype.element_ty)
-        else:
-            kv = kv_raw
 
         scores = tl.dot(q, tl.trans(kv))
         scores = tl.where(h_mask[:, None] & valid[None, :], scores, float("-inf"))

@@ -26,7 +26,7 @@ from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
     _pa_decode_sparse_reduce as gluon_pa_decode_sparse_reduce,
 )
 from aiter.ops.triton._gluon_kernels.gfx1250.attention.pa_decode_sparse import (
-    _pa_decode_sparse_v4_2buff as gluon_pa_decode_sparse_v4_2buff,
+    _pa_decode_sparse_fp8 as gluon_pa_decode_sparse_fp8,
 )
 from aiter.ops.triton._triton_kernels.attention.pa_decode_sparse import (
     _pa_decode_sparse as triton_pa_decode_sparse,
@@ -38,7 +38,6 @@ from aiter.ops.triton.utils._triton import arch_info
 from aiter.ops.triton.utils.common_utils import max_addressable_bytes
 from aiter.ops.triton.utils.device_info import get_num_sms, get_num_xcds
 from aiter.ops.triton.utils.logger import AiterTritonLogger
-from aiter.ops.triton.utils.types import get_fp8_e4m3_dtype
 
 DEVICE_ARCH = arch_info.get_arch()
 
@@ -54,7 +53,6 @@ _LOGGER = AiterTritonLogger()
 
 
 _FP8_GROUP_SIZE = 64
-_FP8_DTYPE = get_fp8_e4m3_dtype()
 
 # Launches of at least this many rows get the prefill config. Row count is the
 # only signal, and decode is slower with it, so this sits above decode batch sizes.
@@ -75,47 +73,14 @@ def _check_out(out, q, dtype):
     return out
 
 
-# ---------------------------------------------------------------------------
-# DSv4 "2buff" packed-fp8 KV layout, byte-identical to what the gfx1250 MLA-v4
-# asm decode kernel (aiter.mla.mla_decode_fwd_v4_nm ->
-# _ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE) consumes. See
-# ATOM atom/model_ops/v4_kernels/v4_quant.py (V4_* constants) and
-# aiter op_tests/test_mla_v4_kargpreld.py::_native_to_2buff_for_asm.
-#
-#   row = [ NoPE 448 x fp8-e4m3 | 14 E8M0 scale bytes | 50 pad ] = 512 B
-#         + a separate bf16 RoPE plane of 64 elements (128 B)
-# ---------------------------------------------------------------------------
+# DSv4 head geometry and the gfx1250 640 B record. The byte layouts themselves
+# are documented once, in the "Formats" section of pa_decode_sparse below.
 _V4_DIM_NOPE = 448
 _V4_DIM_ROPE = 64
 _V4_DIM_QK = _V4_DIM_NOPE + _V4_DIM_ROPE  # 512, the logical head dim
 _V4_PACKED_FP8_DTYPES = (torch.float8_e4m3fn, torch.uint8)
-
-# ---------------------------------------------------------------------------
-# DSv4 unified paged cache, the layout vLLM's own allocator produces
-# (``fp8_ds_mla``; csrc/.../fused_deepseek_v4_qnorm_rope_kv_insert_kernel.cu):
-# per paged block of block_size tokens,
-#   [0,       bs*576)         token data, 448 B fp8 NoPE | 128 B bf16 RoPE
-#   [bs*576,  bs*576 + bs*8)  UE8M0 scales, 7 real + 1 pad per token
-# so a record is 584 B and the scales sit in a per-block TRAILER, not beside
-# their row. _V4_DATA_UNIT / _V4_SC_UNIT are gcd(bs*584, 576) and
-# gcd(bs*584, 8): the units that make the gather row indices integral.
-# ---------------------------------------------------------------------------
-_V4_ROW_BYTES = _V4_DIM_NOPE + 2 * _V4_DIM_ROPE  # 576
-_V4_NUM_TILES = _V4_DIM_NOPE // _FP8_GROUP_SIZE  # 7 quant groups
-_V4_SC_RAW = _V4_DIM_NOPE // _FP8_GROUP_SIZE + 1  # 7 real + 1 pad = 8
-_V4_REC_BYTES = _V4_ROW_BYTES + _V4_SC_RAW  # 584, the packed record
-# The ALIGNED record is the same content padded to a 128-byte multiple, so
-# each token's scales sit inside it and every token starts 128-B aligned
-# (TDM then takes the direct global->L2->LDS path). 584 -> 640.
-#
-# Its first 512 bytes are byte-identical to an ATOM 2buff row --
-# 448 NoPE | 14 duplicated UE8M0 scales | 50 pad -- and [512, 640) is the 2buff
-# RoPE row, so the same packing serves Q and KV.
-_V4_REC_ALIGNED = ((_V4_REC_BYTES + 127) // 128) * 128
-# Where the RoPE half sits inside that record: after the 2buff row.
-_V4_ROPE_IN_REC = 512
-_V4_DATA_UNIT = 64
-_V4_SC_UNIT = _V4_SC_RAW
+_V4_REC_ALIGNED = 640  # 5 * 128: every token starts 128 B aligned for TDM
+_V4_ROPE_IN_REC = 512  # the RoPE row follows the 512 B packed row
 
 
 def pa_decode_sparse(
@@ -148,15 +113,77 @@ def pa_decode_sparse(
 ) -> torch.Tensor:
     """Sparse paged-decode attention with split-K + widened BLOCK_H.
 
+    Formats
+    -------
+    What each arch / precision accepts. The path is chosen from the arch and
+    the cache's shape and dtype. DSv4 has D = 512 = 448 NoPE + 64 RoPE.
+    ``N`` = query rows, ``P`` = pool rows, ``nb`` = pages, ``block`` = page
+    size (a power of two on every paged cache).
+
+    gfx1250, fp8 (a8w8) -- the 640 B "aligned" record, one per token:
+
+        bytes [  0, 448)  NoPE, 448 x fp8 e4m3 (OCP)
+        bytes [448, 462)  14 E8M0 scales: one per 64-element group, each
+                          written twice (s0,s0,s1,s1,...,s6,s6), because the
+                          scaled WMMA takes one scale per 32 elements
+        bytes [462, 512)  50 B pad
+        bytes [512, 640)  RoPE, 64 x bf16, never quantized
+
+      KV   ``unified_kv`` ``[nb, block, 640]`` uint8 / fp8 -- vLLM's gfx1250
+           paged cache. It is sliced into its [0, 512) and [512, 640) halves
+           as views (no copy). Or pass the halves yourself: ``unified_kv``
+           ``[P, 512]`` fp8 + ``unified_kv_rope`` ``[P, 64]`` bf16 (ATOM's
+           "2buff" pool; byte-identical to what the gfx1250 MLA-v4 asm decode
+           kernel ``mla_decode_fwd_v4_nm`` reads).
+      Q    ``q`` ``[N, H, 512]`` fp8, packed like bytes [0, 512) of the record,
+           plus ``q_rope`` ``[N, H, 64]`` bf16; see
+           ``fused_deepseek_v4_mxfp8_quant_q_pack``. bf16 Q is not accepted.
+      ``kv_scales`` must be None (the scales are inside the row). ``extra_*``
+      is supported (same record). Output ``[N, H, 512]`` bf16. The
+      ``inv_rope_positions`` / ``out_mxfp8`` epilogue is NOT implemented here.
+
+    gfx1250, bf16:
+      KV   ``unified_kv`` ``[P, D]`` flat pool (page size 1), same dtype as Q.
+      Q    ``q`` ``[N, H, D]`` bf16/fp16, D a power of two.
+      No ``kv_scales``, no ``extra_*``.
+
+    gfx950, fp8 (a16w8) -- vLLM's default ``fp8_ds_mla`` "trailer" cache:
+      KV   ``unified_kv`` ``[nb, block, 584]`` uint8. Each page holds
+           ``block`` x 576 B of token data -- [0, 448) NoPE fp8 e4m3 |
+           [448, 576) RoPE 64 x bf16 -- followed by a trailer of ``block`` x
+           8 B scales (7 UE8M0, one per 64-element group, + 1 pad). 584 is the
+           per-token size; tokens themselves sit at a 576 B stride.
+           Also accepted: a flat ``[P, D]`` fp8 e4m3 / uint8 pool with
+           ``kv_scales`` ``[P, D // 64]`` fp32 (single stream only).
+      Q    ``q`` ``[N, H, 512]`` bf16 only (the kernel has no Q scale input).
+      ``extra_*`` is supported on the 584 B cache. The ``inv_rope_positions``
+      / ``out_mxfp8`` output epilogue is supported.
+
+    gfx950, bf16:
+      KV   ``unified_kv`` ``[nb, block, 512]`` bf16 paged cache (``extra_*``
+           supported), or a flat ``[P, D]`` bf16 pool.
+      Q    ``q`` ``[N, H, D]`` bf16.
+
+    Anything else -- other arches, fp16 Q or an explicit ``block_h`` on
+    gfx950 -- takes the Triton kernel: bf16/fp16 flat ``[P, D]`` pool, KV in
+    Q's dtype, no ``kv_scales``, no ``extra_*``.
+
+    The two fp8 records are NOT interchangeable: gfx1250 keeps the scales
+    inside each 640 B row, gfx950 keeps them in a per-page trailer behind 576 B
+    rows. Feeding gfx950 the 640 B record is not detected and reads the pad as
+    exponents (all-NaN output).
+
     Args:
-        q: ``[N, H, D]`` decode queries, bf16/fp16.
-        unified_kv: ``[total_pages, D]`` shared KV pool (page_size=1), same dtype as ``q``.
+        q: ``[N, H, D]`` decode queries; dtype per arch, see Formats.
+        unified_kv: the KV cache; shape and dtype per arch, see Formats.
         kv_indices: ``[total_indices]`` int32 — per-token slot lists, flat.
             Per-token entries live in ``kv_indices[kv_indptr[t] : kv_indptr[t+1]]``.
             ``-1`` entries are skipped (sentinel for unused tail).
         kv_indptr: ``[N+1]`` int32 — true prefix sum.
         attn_sink: ``[H]`` per-head learnable softmax-denom bias (fp32).
         softmax_scale: scalar softmax scale.
+        kv_scales: gfx950 only -- ``[P, D // 64]`` fp32 scales for a flat fp8
+            pool. Must be None everywhere else.
         block_h: override ``BLOCK_H`` for the split kernel. Default picks
             ``next_pow2(min(H, 64))``, rounded up to the AMD MFMA min tile (16).
         kv_splits: override ``KV_SPLITS`` for the split-K grid axis. Default
@@ -184,21 +211,12 @@ def pa_decode_sparse(
             is its ``main_cache`` = ``swa_k_cache``, the sliding-window keys,
             and this one is its ``extra_cache`` = ``kv_cache``, the compressed
             keys the sparse top-k selects. The two hold the identical record.
-            Supported on the gfx950 packed path and on the gfx1250 vLLM
-            ``fp8_ds_mla`` path; must be None otherwise.
-
-            Both read the same KV format, but each takes ONE Q form for now:
-            gfx950 bf16 Q (a16w8), gfx1250 packed fp8 Q plus ``q_rope``
-            (a8w8). gfx950's kernel has no Q-side scale operand and gfx1250's
-            has no bf16 Q path, so the two are not interchangeable.
-        unified_kv_rope: gfx1250-only — ``[total_pages, 64]`` bf16 RoPE plane.
-            Supplying it selects the DSv4 "2buff" packed-fp8 path, in which
-            ``unified_kv`` is the ``[total_pages, 512]`` fp8 pool laid out
-            exactly as the MLA-v4 asm decode kernel expects
-            (448 fp8 NoPE | 14 duplicated E8M0 group scales | 50 pad), so the
-            same pool can be handed to either kernel with no repacking.
-            ``kv_scales`` must be None (the scales are inline) and ``q_rope``
-            is required (Q is packed the same way).
+            Supported on the gfx950 paged caches and the gfx1250 fp8 path;
+            must be None otherwise. See Formats.
+        unified_kv_rope: gfx1250 only -- ``[P, 64]`` bf16 RoPE plane. Supplying
+            it selects the gfx1250 fp8 path with ``unified_kv`` as the
+            ``[P, 512]`` packed half (see Formats); ``q_rope`` is then
+            required.
         q_tdm: DEFAULT ON. Load Q by TDM descriptor into LDS instead of masked
             buffer_loads. Worth 90.4 -> 71.7us (kv_len 384) and
             58.9 -> 43.5us (kv_len 136), and it takes VGPR spills 146 -> 0 on
@@ -220,19 +238,12 @@ def pa_decode_sparse(
             ``block_h * D / (num_warps * 32)`` = 256 VGPRs at every block_h;
             overriding it is the only way to shrink the accumulator's register
             footprint.
-        q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q, required on the 2buff
-            path: ``q`` is then the packed fp8 ``[N, H, 512]`` Q — i.e. full
-            a8w8 parity with the asm kernel.
+        q_rope: ``[N, H, 64]`` bf16 RoPE plane for Q, required on the gfx1250
+            fp8 path, where ``q`` is the packed fp8 ``[N, H, 512]`` Q.
         inv_rope_positions/inv_rope_cos_sin_cache/out_mxfp8: gfx950 gluon only —
             the output epilogue (see _pa_decode_sparse_gfx950_gluon). The
-            gfx1250 2buff path returns before the guard below and ignores
-            them; see _pa_decode_sparse_v4_2buff.
-
-    On gfx950 the DSv4 gluon driver handles this: a 3D ``unified_kv`` selects the
-    packed fp8_dsv4_mla (584 B rows) / bf16 block cache (``extra_*`` = the
-    two-loop), a 2D one the
-    uniform pool (``kv_scales`` present = fp8). ``kv_splits``/``skip_reduce`` are
-    honored; ``block_h`` and fp16 ``q`` fall through to the triton path.
+            gfx1250 fp8 path returns before the guard below and ignores
+            them; see _pa_decode_sparse_fp8.
 
     Returns:
         ``[N, H, D]`` attention output, same dtype as ``q``. When
@@ -251,23 +262,11 @@ def pa_decode_sparse(
     if not q.is_cuda:
         raise RuntimeError("pa_decode_sparse requires CUDA/HIP tensors")
 
-    # An aligned record is 448 NoPE | 14 duplicated UE8M0 | 50 pad | 128 RoPE.
-    # Its first 512 bytes are byte-identical to an ATOM 2buff row and the last
-    # 128 are its RoPE row, so a one-tensor paged cache is simply sliced into
-    # the two buffers the 2buff kernel already reads -- no separate kernel.
-    #
-    # gfx1250 ONLY, and the arch test is load-bearing: gfx950's packed path
-    # takes a cache in the SAME layout (3-D, 640-byte rows, fp8/uint8 -- see
-    # op_tests/.../test_pa_decode_sparse.py::make_packed_cache, which serves
-    # both). Shape and dtype therefore cannot tell the two apart. Without the
-    # arch test this sniff claims every gfx950 fp8 call and routes it into
-    # _pa_decode_sparse_v4_2buff, which raises "gfx1250-only" -- that is what
-    # broke the gfx950 CI, including upstream's own
-    # test_pa_decode_sparse_inv_rope_mxfp8_epilogue.
-    #
-    # Only the implicit sniff is gated. An explicit unified_kv_rope on gfx950
-    # still reaches the raise below, which is right: that is a caller asking
-    # for the 2buff path by name on an arch that has no such kernel.
+    # gfx1250 fp8: a [nb, block, 640] cache is split into the two views the
+    # kernel reads (see Formats). Gated on the arch: gfx950 has no 640 B path,
+    # and without the gate this would also claim gfx950 calls and raise
+    # "gfx1250-only". An explicit unified_kv_rope on gfx950 still reaches that
+    # raise, which is right -- the caller asked for this path by name.
     if (
         DEVICE_ARCH == "gfx1250"
         and unified_kv_rope is None
@@ -285,7 +284,7 @@ def pa_decode_sparse(
 
     v4_2buff = unified_kv_rope is not None
     if v4_2buff:
-        return _pa_decode_sparse_v4_2buff(
+        return _pa_decode_sparse_fp8(
             q,
             unified_kv,
             unified_kv_rope,
@@ -364,37 +363,21 @@ def pa_decode_sparse(
             )
 
     assert extra_cache is None and extra_indices is None and extra_indptr is None, (
-        "extra_cache/extra_indices/extra_indptr need the gfx950 packed path or "
-        "the gfx1250 fp8_ds_mla path"
+        "extra_cache/extra_indices/extra_indptr need a gfx950 paged cache or "
+        "the gfx1250 fp8 path"
     )
     assert (
         inv_rope_positions is None and out_mxfp8 is None
     ), "the output epilogue is gfx950 gluon-only"
-
-    quant_kv = kv_scales is not None
-    if quant_kv:
-        assert unified_kv.dtype == _FP8_DTYPE, (
-            f"kv_scales supplied but unified_kv is {unified_kv.dtype}, "
-            f"expected {_FP8_DTYPE}"
+    if kv_scales is not None:
+        raise RuntimeError(
+            "kv_scales (a flat fp8 pool with fp32 scales) is gfx950-only, with "
+            "bf16 q and no block_h; on gfx1250 use the 640 B fp8 record"
         )
-        assert (
-            kv_scales.dtype == torch.float32
-        ), f"kv_scales must be fp32, got {kv_scales.dtype}"
-        D_check = unified_kv.shape[-1]
-        assert (
-            D_check % _FP8_GROUP_SIZE == 0
-        ), f"D={D_check} must be divisible by GROUP_SIZE={_FP8_GROUP_SIZE}"
-        expected_g = D_check // _FP8_GROUP_SIZE
-        assert kv_scales.shape == (unified_kv.shape[0], expected_g), (
-            f"kv_scales shape {tuple(kv_scales.shape)} does not match "
-            f"expected ({unified_kv.shape[0]}, {expected_g})"
+    if unified_kv.dtype != q.dtype:
+        raise RuntimeError(
+            f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
         )
-        assert kv_scales.is_contiguous()
-    else:
-        if unified_kv.dtype != q.dtype:
-            raise RuntimeError(
-                f"unified_kv dtype mismatch: kv={unified_kv.dtype}, q={q.dtype}"
-            )
 
     T, H, D = q.shape
 
@@ -512,15 +495,6 @@ def pa_decode_sparse(
         lp_strides = l_partial.stride()
         ap_strides = acc_partial.stride()
 
-    if quant_kv:
-        kv_scales_arg = kv_scales
-        ks_stride_n_arg = kv_scales.stride(0)
-        num_groups_arg = D // _FP8_GROUP_SIZE
-    else:
-        kv_scales_arg = q.new_empty(1, dtype=torch.float32)
-        ks_stride_n_arg = 1
-        num_groups_arg = 1
-
     if use_gluon:
         impl = gluon_pa_decode_sparse
         reduce_impl = gluon_pa_decode_sparse_reduce
@@ -532,7 +506,6 @@ def pa_decode_sparse(
     impl[grid_attn](
         q,
         unified_kv,
-        kv_scales_arg,
         kv_indices,
         kv_indptr,
         m_partial,
@@ -546,7 +519,6 @@ def pa_decode_sparse(
         q.stride(2),
         unified_kv.stride(0),
         unified_kv.stride(1),
-        ks_stride_n_arg,
         mp_strides[0],
         mp_strides[1],
         mp_strides[2],
@@ -568,9 +540,6 @@ def pa_decode_sparse(
         BLOCK_D=block_d,
         BLOCK_K=block_k,
         HAS_INVALID=has_invalid,
-        QUANT_KV=quant_kv,
-        GROUP_SIZE=_FP8_GROUP_SIZE,
-        NUM_GROUPS=num_groups_arg,
         USE_EXP2=USE_EXP2,
         num_warps=attn_num_warps,
         num_stages=num_stages,
@@ -1201,7 +1170,7 @@ def _v4_decode_partials(t_cap, kv_splits, h_padded, d, device_index):
     return m, l, acc
 
 
-def _pa_decode_sparse_v4_2buff(
+def _pa_decode_sparse_fp8(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
     unified_kv_rope: torch.Tensor,
@@ -1225,17 +1194,8 @@ def _pa_decode_sparse_v4_2buff(
     use_lru_cache_partials: bool = False,
     out: torch.Tensor | None = None,
 ):
-    """gfx1250 driver for the DSv4 "2buff" packed-fp8 KV pool.
-
-    Byte-for-byte the layout ``aiter.mla.mla_decode_fwd_v4_nm`` (the
-    ``mla_a8w8_qh64_1tg_16mx4_64nx1_sparse`` asm kernel) reads, so ATOM's
-    ``unified_kv`` / ``unified_kv_rope`` / ``q_packed`` / ``q_rope`` buffers go
-    straight in with no repacking:
-
-      unified_kv      [P, 512]    fp8 e4m3 (or uint8): 448 NoPE | 14 dup E8M0 | 50 pad
-      unified_kv_rope [P, 64]     bf16
-      q               [N, H, 512] fp8 packed
-      q_rope          [N, H, 64]  bf16
+    """gfx1250 fp8 driver. Q / KV layouts: "gfx1250, fp8" in the Formats
+    section of ``pa_decode_sparse``.
 
     Returns ``[N, H, 512]`` bf16 (MLA's V is the whole row: dequantized NoPE
     followed by the bf16 RoPE half).
@@ -1499,7 +1459,7 @@ def _pa_decode_sparse_v4_2buff(
     # H=16 when it was unguarded). See plan section 27.
     _tdm_partials = T <= 16 and block_h != 16
     grid_attn = (T, n_head_blocks, kv_splits)
-    gluon_pa_decode_sparse_v4_2buff[grid_attn](
+    gluon_pa_decode_sparse_fp8[grid_attn](
         q,
         q_u8,
         q_rope,

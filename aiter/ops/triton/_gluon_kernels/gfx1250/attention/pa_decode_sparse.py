@@ -36,7 +36,6 @@ _pa_decode_sparse_repr = make_kernel_repr(
 def _pa_decode_sparse(
     q_ptr,
     unified_kv_ptr,
-    kv_scales_ptr,
     kv_indices_ptr,
     kv_indptr_ptr,
     m_partial_ptr,
@@ -50,7 +49,6 @@ def _pa_decode_sparse(
     q_stride_d: gl.constexpr,
     kv_stride_n: gl.constexpr,
     kv_stride_d: gl.constexpr,
-    ks_stride_n: gl.constexpr,
     mp_stride_t: gl.constexpr,
     mp_stride_k: gl.constexpr,
     mp_stride_h: gl.constexpr,
@@ -72,9 +70,6 @@ def _pa_decode_sparse(
     BLOCK_D: gl.constexpr,
     BLOCK_K: gl.constexpr,
     HAS_INVALID: gl.constexpr,
-    QUANT_KV: gl.constexpr,
-    GROUP_SIZE: gl.constexpr,
-    NUM_GROUPS: gl.constexpr,
     USE_EXP2: gl.constexpr,
     num_warps: gl.constexpr,
 ):
@@ -155,10 +150,6 @@ def _pa_decode_sparse(
     # Slot tiles are staged through LDS via TDM async_load (1 row x BLOCK_K
     # contiguous int32), then read back to registers to feed async_gather.
     slot_shared: gl.constexpr = gl.SwizzledSharedLayout(
-        vec=1, per_phase=1, max_phase=1, order=[1, 0]
-    )
-    # FP8 dequant scales [BLOCK_K, BLOCK_D] fp32, loaded via cdna4 async_copy.
-    scales_shared: gl.constexpr = gl.SwizzledSharedLayout(
         vec=1, per_phase=1, max_phase=1, order=[1, 0]
     )
     valid_col_mma: gl.constexpr = gl.SliceLayout(0, QK_WMMA_LAYOUT)
@@ -255,17 +246,6 @@ def _pa_decode_sparse(
         [NUM_SLOT_BUFFERS, 1, BLOCK_K],
         slot_shared,
     )
-    if QUANT_KV:
-        scales_smem = gl.allocate_shared_memory(
-            gl.float32,
-            [BLOCK_K, BLOCK_D],
-            scales_shared,
-        )
-        scale_d_groups = (
-            gl.arange(0, BLOCK_D, layout=gl.SliceLayout(0, Q_BLOCKED_LAYOUT))
-            // GROUP_SIZE
-        ).to(gl.int32)
-
     # TDM tensor descriptor over unified_kv [pages, D].
     kv_desc = gl.amd.gfx1250.tdm.make_tensor_descriptor(
         base=unified_kv_ptr,
@@ -310,14 +290,6 @@ def _pa_decode_sparse(
     else:
         safe_slot_cur = slot_reg
     gl.amd.gfx1250.tdm.async_gather(kv_desc, safe_slot_cur, kv_bufs.index(0))
-    if QUANT_KV:
-        cur_safe_slot = safe_slot_cur
-        _safe_sl = gl.convert_layout(cur_safe_slot, gl.SliceLayout(1, Q_BLOCKED_LAYOUT))
-        _sc_ptrs = kv_scales_ptr + (
-            _safe_sl[:, None] * ks_stride_n + scale_d_groups[None, :]
-        )
-        gl.amd.cdna4.async_copy.global_load_to_shared(scales_smem, _sc_ptrs)
-        gl.amd.cdna4.async_copy.commit_group()
 
     buf_idx: gl.int32 = 0
 
@@ -356,17 +328,10 @@ def _pa_decode_sparse(
         # Wait for KV[i] (the FIFO ordering guarantees it is older than the
         # ops we want to keep in flight).
         gl.amd.gfx1250.tdm.async_wait(2)
-        if QUANT_KV:
-            gl.amd.cdna4.async_copy.wait_group(0)
 
         # ---- Math for tile (tile_start + i) using kv_bufs[buf_idx] ----
         kv_smem_cur = kv_bufs.index(buf_idx)
-        if QUANT_KV:
-            kv_k_raw = kv_smem_cur.permute([1, 0]).load(dot_k_layout)
-            scales_k = scales_smem.permute([1, 0]).load(dot_k_layout)
-            kv_t = (kv_k_raw.to(gl.float32) * scales_k).to(q_ptr.dtype.element_ty)
-        else:
-            kv_t = kv_smem_cur.permute([1, 0]).load(dot_k_layout)
+        kv_t = kv_smem_cur.permute([1, 0]).load(dot_k_layout)
 
         scores = gl.amd.gfx1250.wmma(
             mfma_q,
@@ -389,42 +354,22 @@ def _pa_decode_sparse(
             p = gl.exp(scores - m_new[:, None])
         l_new = l_i * alpha + gl.sum(p, axis=1)
 
-        if QUANT_KV:
-            kv_v_raw = kv_smem_cur.load(dot_v_layout)
-            scales_v = scales_smem.load(dot_v_layout)
-            kv_for_acc = (kv_v_raw.to(gl.float32) * scales_v).to(q_ptr.dtype.element_ty)
-        else:
-            kv_for_acc = kv_smem_cur.load(dot_v_layout)
+        kv_for_acc = kv_smem_cur.load(dot_v_layout)
 
         p_dot = gl.convert_layout(p.to(q_ptr.dtype.element_ty), dot_p_layout)
         acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
         acc = gl.amd.gfx1250.wmma(p_dot, kv_for_acc, acc)
 
-        # Issue scale load for next tile (overlaps with rotation / next iter).
-        if QUANT_KV:
-            _safe_sl = gl.convert_layout(
-                safe_next_slot, gl.SliceLayout(1, Q_BLOCKED_LAYOUT)
-            )
-            _sc_ptrs = kv_scales_ptr + (
-                _safe_sl[:, None] * ks_stride_n + scale_d_groups[None, :]
-            )
-            gl.amd.cdna4.async_copy.global_load_to_shared(scales_smem, _sc_ptrs)
-            gl.amd.cdna4.async_copy.commit_group()
-
         m_i = m_new
         l_i = l_new
 
-        # Rotate. slot_reg / cur_valid / cur_safe_slot now describe slot[i+1].
+        # Rotate. slot_reg / cur_valid now describe slot[i+1].
         if HAS_INVALID:
             cur_valid = next_valid
-        if QUANT_KV:
-            cur_safe_slot = safe_next_slot
         buf_idx = async_idx
 
     # ---- Epilogue: process final tile (tile_end - 1) ----
     gl.amd.gfx1250.tdm.async_wait(0)
-    if QUANT_KV:
-        gl.amd.cdna4.async_copy.wait_group(0)
 
     j_final = tile_end - 1
     # The final tile can be partial, so the in-range mask is always needed; the
@@ -436,12 +381,7 @@ def _pa_decode_sparse(
     else:
         final_valid = final_in_range
 
-    if QUANT_KV:
-        kv_k_raw = kv_bufs.index(buf_idx).permute([1, 0]).load(dot_k_layout)
-        scales_k = scales_smem.permute([1, 0]).load(dot_k_layout)
-        kv_t = (kv_k_raw.to(gl.float32) * scales_k).to(q_ptr.dtype.element_ty)
-    else:
-        kv_t = kv_bufs.index(buf_idx).permute([1, 0]).load(dot_k_layout)
+    kv_t = kv_bufs.index(buf_idx).permute([1, 0]).load(dot_k_layout)
 
     scores = gl.amd.gfx1250.wmma(
         mfma_q,
@@ -465,12 +405,7 @@ def _pa_decode_sparse(
         p = gl.exp(scores - m_new[:, None])
     l_new = l_i * alpha + gl.sum(p, axis=1)
 
-    if QUANT_KV:
-        kv_v_raw = kv_bufs.index(buf_idx).load(dot_v_layout)
-        scales_v = scales_smem.load(dot_v_layout)
-        kv_for_acc = (kv_v_raw.to(gl.float32) * scales_v).to(q_ptr.dtype.element_ty)
-    else:
-        kv_for_acc = kv_bufs.index(buf_idx).load(dot_v_layout)
+    kv_for_acc = kv_bufs.index(buf_idx).load(dot_v_layout)
 
     p_dot = gl.convert_layout(p.to(q_ptr.dtype.element_ty), dot_p_layout)
     acc = acc * gl.convert_layout(alpha[:, None], layout=PV_WMMA_LAYOUT)
@@ -776,48 +711,22 @@ def _pa_decode_sparse_reduce(
 # ---------------------------------------------------------------------------
 # DSv4 "2buff" packed-fp8 KV variant (asm-compatible layout)
 # ---------------------------------------------------------------------------
-# Consumes exactly the buffers the gfx1250 MLA-v4 asm decode kernel
-# (``_ZN5aiter35mla_a8w8_qh64_1tg_16mx4_64nx1_sparseE``, dispatched by
-# ``aiter.mla.mla_decode_fwd_v4_nm``) reads -- no repacking on the host:
+# The Q / KV byte layouts this kernel reads are documented once, at the API:
+# see the "Formats" section of ``pa_decode_sparse`` in
+# aiter/ops/triton/attention/pa_decode_sparse.py.
 #
-#   unified_kv     [P, 512] fp8 e4m3 : per token
-#                    bytes [  0, 448) NoPE, fp8, per-64-element E8M0 group scale
-#                    bytes [448, 462) 14 E8M0 scale bytes, each group's scale
-#                                     written TWICE (s0,s0,s1,s1,...,s6,s6)
-#                    bytes [462, 512) 50 bytes of pad
-#   unified_kv_rope[P, 64]  bf16     : the RoPE half, never quantized
+# The driver hands the kernel a 640 B record as two views on the same base --
+# [0, 512) as the packed row, [512, 640) as the bf16 RoPE row -- both keeping the
+# 640 B row stride, so nothing is copied. A per-layer view of a paged pool is
+# contiguous inside a page but jumps by the pooled block stride across pages,
+# so a slot is mapped to a descriptor row (see _v4_2buff_row); a flat pool
+# passes page size 1 and that mapping is the identity.
 #
-# and the same packing for Q:
-#   q    [T, H, 512] fp8   q_rope [T, H, 64] bf16
-#
-# The logical head is D = NOPE_DIM + ROPE_DIM = 448 + 64 = 512, and MLA's V is
-# the whole 512-wide row, so the output is [T, H, 512] bf16.
-#
-# vLLM hands over ONE tensor per layer instead, [nb, BLOCK_SIZE, 640] uint8,
-# holding the same bytes per token with the RoPE half appended:
-#
-#   [0, 512)    the 2buff row, exactly as above
-#   [512, 640)  the bf16 RoPE row
-#
-# so the driver slices it in two and this kernel reads both as views -- same
-# base, same 640-byte row stride, nothing copied or repacked. Paging is the
-# only other difference: a per-layer view of vLLM's pool is contiguous inside a
-# page but jumps by the pooled block stride across pages, so a slot is mapped
-# to a descriptor row (see _v4_2buff_row); a flat ATOM pool passes page size 1
-# and that mapping is the identity.
-#
-# TWO STREAMS. vLLM attends over two caches per token, and the names here are
-# its own (`rocm_sparse_attn_decode`):
-#
-#     main  = swa_k_cache : the sliding-window keys
-#     extra = kv_cache    : the compressed keys the sparse top-k selects
-#
-# Note which way round that is -- HAS_EXTRA is the TOP-K stream, not the SWA
-# one, and the tensor vLLM calls `kv_cache` is the one we take as extra. Both
-# hold the IDENTICAL record, so only the base pointer, the row bound and the
-# paged block size differ and one pipeline walks both. The kernel requires only
-# that a tile never straddles the boundary, which holds because each stream's
-# tile count is rounded up on its own.
+# TWO STREAMS (main = SWA keys, extra = top-k keys; see ``extra_cache`` at the
+# API) hold the identical record, so only the base pointer, the row bound and
+# the paged block size differ and one pipeline walks both. The kernel requires
+# only that a tile never straddles the boundary, which holds because each
+# stream's tile count is rounded up on its own.
 
 
 # --------------------------------------------------------------------------- #
@@ -1351,8 +1260,8 @@ def _v4_2buff_gather(
         gl.amd.gfx1250.tdm.async_gather(mxs_desc, row, sc_buf)
 
 
-_pa_decode_sparse_v4_2buff_repr = make_kernel_repr(
-    "_pa_decode_sparse_v4_2buff",
+_pa_decode_sparse_fp8_repr = make_kernel_repr(
+    "_pa_decode_sparse_fp8",
     [
         "BLOCK_H",
         "BLOCK_D",
@@ -1367,8 +1276,8 @@ _pa_decode_sparse_v4_2buff_repr = make_kernel_repr(
 )
 
 
-@gluon.jit(repr=_pa_decode_sparse_v4_2buff_repr)
-def _pa_decode_sparse_v4_2buff(
+@gluon.jit(repr=_pa_decode_sparse_fp8_repr)
+def _pa_decode_sparse_fp8(
     q_ptr,  # [T, H, D] packed e4m3
     q_u8_ptr,  # uint8 alias of q_ptr, for its E8M0 block
     q_rope_ptr,  # [T, H, ROPE_DIM] bf16
