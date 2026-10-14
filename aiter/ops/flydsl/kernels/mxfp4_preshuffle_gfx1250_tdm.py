@@ -86,6 +86,17 @@ ROLL_QUANT_EPILOGUE = int(os.environ.get("AITER_FLYDSL_ROLL_QUANT_EPILOGUE", "1"
 # correctness and size are unchanged). Used to check whether ATT ds stall is
 # sensitive to bank conflicts. 0 = contiguous (lane*16), 1 = conflicting.
 ACC_SWIZZLE = int(os.environ.get("AITER_FLYDSL_ACC_SWIZZLE", "0"))
+# EXPERIMENT: 32 KiB-align each wave's f32 acc-staging slab. Each wave already
+# owns exactly ACC_WAVE_STRIDE == 32 KiB, but the slabs sit at base C_STORE_B
+# (not a 32 KiB boundary). Rounding the staging base up to 32 KiB puts every
+# wave's slab on a clean boundary, to isolate wave-to-wave LDS traffic. Costs up
+# to 32 KiB of padding; still fits the LDS budget. 0 = base C_STORE_B.
+ACC_ALIGN32K = int(os.environ.get("AITER_FLYDSL_ACC_ALIGN32K", "1"))
+# EXPERIMENT: software-pipeline the rolled f32 readback loop. The whole half is
+# resident in LDS before the loop, so prefetch fragment i+1's b128 loads while
+# computing fragment i's silu/cvt/store, hiding the ds_load latency. 0 = inline
+# load (each iteration loads then immediately computes).
+ROLLQ_DSPREFETCH = int(os.environ.get("AITER_FLYDSL_ROLLQ_DSPREFETCH", "1"))
 # EXPERIMENT: prefetch the kernel body forward from the top of the compute (the
 # prologue), so the mainloop/epilogue code is warm as each workgroup arrives on
 # a CU (cold-starts the prologue every tile-group). Value = number of 4 KiB
@@ -117,6 +128,10 @@ if FORCE_1X4_CLUSTER not in (0, 1):
     raise ValueError("AITER_FLYDSL_FORCE_1X4_CLUSTER must be 0 or 1")
 if DISABLE_CLUSTER_SYNC not in (0, 1):
     raise ValueError("AITER_FLYDSL_DISABLE_CLUSTER_SYNC must be 0 or 1")
+if ACC_ALIGN32K not in (0, 1):
+    raise ValueError("AITER_FLYDSL_ACC_ALIGN32K must be 0 or 1")
+if ROLLQ_DSPREFETCH not in (0, 1):
+    raise ValueError("AITER_FLYDSL_ROLLQ_DSPREFETCH must be 0 or 1")
 
 SUPPORT_EXPLICIT_VGPR_PARTITION = bool(
     EXPLICIT_VGPR_PARTITION and is_fx_set_register_available()
@@ -461,6 +476,12 @@ def launch_gemm_a8w4_tdm(
     AS_FULL_OFF = INPUT_LDS_B
     AS_FULL_B = ceildiv(AS_SUPERS * AS_FULL_INNER * 4, 128) * 128
     ARENA_B = max(AS_FULL_OFF + (AS_FULL_B if tdm_as_in_prologue else 0), C_STORE_B)
+    # Base of the f32 acc-staging arena (behind the C output). Each wave's slab is
+    # exactly ACC_WAVE_STRIDE == 32 KiB; ACC_ALIGN32K rounds this base up to a
+    # 32 KiB boundary so every slab lands on one (up to 32 KiB of padding).
+    ACC_STAGE_OFF = (
+        ((C_STORE_B + 32767) // 32768) * 32768 if ACC_ALIGN32K else C_STORE_B
+    )
     if ROLL_QUANT_EPILOGUE and stage1_quant_out and stage1_act:
         # f32 staging keeps full accumulator precision (no bf16 round-trip), but
         # a full tile of f32 is 2x the LDS of bf16. Split tile_m into two halves
@@ -468,7 +489,7 @@ def launch_gemm_a8w4_tdm(
         # passes: HALF fragments * f32 (32 B/lane) == wmma_m_rep * bf16 (16 B/
         # lane), so the footprint is unchanged.
         ACC_STAGE_B = num_waves * HALF_WMMA_M_REP * output_n_rep * WAVE * 32
-        ARENA_B = max(ARENA_B, C_STORE_B + ACC_STAGE_B)
+        ARENA_B = max(ARENA_B, ACC_STAGE_OFF + ACC_STAGE_B)
 
     # Quant epilogue compile-time constants.
     QUANT_ROWS_PER_TILE = quant_wmma_rep * 16
@@ -514,6 +535,10 @@ def launch_gemm_a8w4_tdm(
     )
     if _rollq and ACC_SWIZZLE:
         _rollq += "_swz"
+    if _rollq and ACC_ALIGN32K:
+        _rollq += "_align32k"
+    if _rollq and ROLLQ_DSPREFETCH:
+        _rollq += "_dspf"
     _iprefetch = (
         f"_iprefetch{INST_PREFETCH_EPILOGUE}s{INST_PREFETCH_START}"
         if INST_PREFETCH_EPILOGUE
@@ -1883,19 +1908,22 @@ def launch_gemm_a8w4_tdm(
                     _lane_off = (lane % 4) * 256 + (lane // 4) * 32
                 else:
                     _lane_off = lane * 32
-                acc_lane_base = C_STORE_B + wave * ACC_WAVE_STRIDE + _lane_off
+                acc_lane_base = ACC_STAGE_OFF + wave * ACC_WAVE_STRIDE + _lane_off
                 # Shared body for both the rolled (runtime bound) and the legacy
                 # unrolled (range_constexpr) dispatch below. range() must appear
                 # DIRECTLY in the for (the AST rewriter only turns
                 # `for x in range(...)` into an scf.for; assigning it to a
                 # variable falls back to Python's builtin range).
-                def _emit_quant_wm(wm, wm_lds=None):
+                def _emit_quant_wm(wm, wm_lds=None, preloaded=None):
                     # ``wm`` is the GLOBAL fragment index (row/scale/activation
                     # math); ``wm_lds`` is its slot WITHIN the current half's
                     # staged region (rolled readback offset). They differ because
                     # the two halves reuse one LDS region: half 1's fragment wm=8
                     # lives at slot 0. The unrolled path reads registers and
-                    # leaves wm_lds unused.
+                    # leaves wm_lds unused. ``preloaded`` (ROLLQ_DSPREFETCH) is a
+                    # per-wn list of already-shuffled f32 acc vecs loaded one
+                    # iteration ahead, so the ds_load latency hides behind the
+                    # previous fragment's silu/cvt.
                     # A 16-row block entirely past this expert's valid rows has its
                     # output OOB-clamped away, so skip its work. Wave-uniform, so
                     # this costs one scalar branch instead of per-lane masking.
@@ -1941,7 +1969,11 @@ def launch_gemm_a8w4_tdm(
                                 # rewritten to scf.ifexp which evaluates BOTH
                                 # arms, and the register arm indexes the Python
                                 # ``accs`` list with the now-runtime ``wm``.
-                                if const_expr(ROLL_QUANT_EPILOGUE):
+                                if const_expr(preloaded is not None):
+                                    # Prefetched one iteration ahead; the b128
+                                    # loads + shuffle already issued in _load_frag.
+                                    acc = preloaded[wn]
+                                elif const_expr(ROLL_QUANT_EPILOGUE):
                                     # Each f32 fragment is vec(8,f32) == two b128
                                     # (lo/hi, 16 B apart). Read both and shuffle
                                     # back to vec(8,f32) -- exact, no bf16 cast.
@@ -2084,6 +2116,33 @@ def launch_gemm_a8w4_tdm(
                     # because staging indexes the Python ``accs`` list; the inner
                     # trip count is runtime so the activation/quant body stays
                     # rolled (LLVM cannot fully unroll an unknown bound).
+                    def _load_raw(_sl):
+                        # Issue ONLY the b128 ds_loads (lo/hi per wn), no shuffle.
+                        # The shuffle is the first *use* of the loaded data, so it
+                        # must NOT sit next to the load issue or the waitcnt lands
+                        # right here and nothing overlaps. Returning the raw loads
+                        # lets the caller carry them across the loop backedge and
+                        # shuffle one iteration later, behind the compute. All of
+                        # this half is resident, so slot ``_sl`` (even ``_nv``, one
+                        # past the tail) reads allocated LDS and is discarded.
+                        _ri = stC_idx + acc_lane_base + _sl * ACC_WM_STRIDE
+                        out = []
+                        for _wn in range_constexpr(output_n_rep):
+                            out.append(Vec(lds_load_b128(_ri, _wn * ACC_WN_STRIDE)))
+                            out.append(
+                                Vec(lds_load_b128(_ri, _wn * ACC_WN_STRIDE + 16))
+                            )
+                        return out
+
+                    def _shuffle_raw(_raw):
+                        # raw[2*wn]=lo, raw[2*wn+1]=hi -> vec(8,f32) per wn.
+                        return [
+                            _raw[2 * _wn]
+                            .shuffle(_raw[2 * _wn + 1], list(range(8)))
+                            .bitcast(fx.Float32)
+                            for _wn in range_constexpr(output_n_rep)
+                        ]
+
                     for half in range_constexpr(2):
                         wm_lo = half * HALF_WMMA_M_REP
                         n_this = (
@@ -2129,8 +2188,35 @@ def launch_gemm_a8w4_tdm(
                         _nv = (_nv < fx.Int32(n_this)).select(
                             _nv, fx.Int32(n_this)
                         )
-                        for wm_local in range(_nv):
-                            _emit_quant_wm(wm_lo + wm_local, wm_local)
+                        if const_expr(ROLLQ_DSPREFETCH):
+                            # Software pipeline: carry the RAW b128 loads across the
+                            # backedge. Each iteration shuffles the loads issued the
+                            # previous iteration (their latency already hidden by the
+                            # previous compute), then issues i+1's loads so this
+                            # iteration's silu/cvt hides them. The prologue primes
+                            # fragment 0's loads. Carried iter_args come back as raw
+                            # vec<4xi32> ir values -> re-wrap as Vec.
+                            _raw0 = _load_raw(fx.Int32(0))
+                            _nraw = 2 * output_n_rep
+                            for _iv, _st in range(
+                                fx.Int32(0), _nv, fx.Int32(1), init=_raw0
+                            ):
+                                _ivi = fx.Int32(_iv)
+                                # Issue i+1's loads FIRST so they stay ahead of the
+                                # compute in program order; the shuffle below then
+                                # waits only for the carried (older) loads, leaving
+                                # these in flight behind silu/cvt. Count = 2 b128 per
+                                # wn.
+                                _raw_nxt = _load_raw(_ivi + fx.Int32(1))
+                                _raw_cur = [
+                                    Vec(_st[_j]) for _j in range_constexpr(_nraw)
+                                ]
+                                _cur = _shuffle_raw(_raw_cur)
+                                _emit_quant_wm(wm_lo + _ivi, _ivi, preloaded=_cur)
+                                yield _raw_nxt
+                        else:
+                            for wm_local in range(_nv):
+                                _emit_quant_wm(wm_lo + wm_local, wm_local)
                 else:
                     for wm in range_constexpr(wmma_m_rep):
                         _emit_quant_wm(wm)
