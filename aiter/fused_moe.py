@@ -105,31 +105,16 @@ def _aux_uses_opus(output_aux, block_size, routed_rows=None, num_experts=None):
 _ACT_TYPE_DISABLED_KEY = "__ignore__"
 _SWIGLU_MXFP4_BF16_BOUND = int(os.environ.get("GPTOSS_SWIGLU_MXFP4_BF16_BOUND", "256"))
 _MOE_A8W4_BYPASS_QUANT = os.environ.get("AITER_MOE_A8W4_BYPASS_QUANT", "0") == "1"
-_FUSED_DECODE_SORT_QUANT_ENV = "SGLANG_AITER_FUSED_DECODE_SORT_QUANT"
 # (num_experts, topk) pairs the HIP kernel is instantiated for; must stay in
 # sync with AITER_MXFP4_SORT_QUANT_ROUTES in moe_sorting_opus_kernels.cu.
 _FUSED_DECODE_SORT_QUANT_ROUTES = {(512, 10), (513, 11)}
 _FUSED_DECODE_SORT_QUANT_MAX_M = 128
 
-
-def _fused_decode_sort_quant_requested() -> bool:
-    mode = os.environ.get(_FUSED_DECODE_SORT_QUANT_ENV, "").strip().lower()
-    return mode in ("auto", "1", "true", "on", "yes")
-
-
-_fused_decode_sort_quant_warned = False
-
-
-def _warn_fused_decode_sort_quant_bypassed() -> None:
-    global _fused_decode_sort_quant_warned
-    if _fused_decode_sort_quant_warned or not _fused_decode_sort_quant_requested():
-        return
-    _fused_decode_sort_quant_warned = True
-    logger.warning(
-        f"[fused_moe] {_FUSED_DECODE_SORT_QUANT_ENV} is set but the tuned stage-1 "
-        "kernel uses the aux-sort a4w4 path, which already fuses activation "
-        "quantization into GEMM1; the fused sort+quant kernel is not used."
-    )
+# Internal benchmark/test hook (not a public switch): set True to force the
+# generic sort+quant path so base-vs-head latency can be measured from one
+# build. Production leaves this False and selects the fused kernel purely from
+# the hardware/shape/dtype/route gate below.
+_fused_decode_sort_quant_disabled = False
 
 
 def _is_fused_decode_sort_quant_enabled(
@@ -158,10 +143,10 @@ def _is_fused_decode_sort_quant_enabled(
     ``block_m=32``, ``M`` in ``[1, 128]``, an instantiated ``(E, topk)``
     route). The remaining conditions are integration requirements: they
     describe the stage-1 path whose activation quantization this kernel
-    replaces. ``1``/``true``/``on``/``yes`` behave like ``auto`` so a
-    microbenchmark can pin the path; none of them widen it.
+    replaces. The fused path is selected automatically whenever every
+    condition matches; it falls back to the generic sort + quant otherwise.
     """
-    if not _fused_decode_sort_quant_requested():
+    if _fused_decode_sort_quant_disabled:
         return False
     try:
         runtime_is_gfx950 = get_gfx_runtime() == "gfx950"
@@ -1606,11 +1591,8 @@ def _fused_moe_impl(
     sort_reverse_sorted = None
     prequantized_a1 = None
     prequantized_a1_scale = None
-    if metadata.output_aux:
-        # The a4w4 aux-sort families already fuse activation quantization into
-        # GEMM1, so the fused sort+quant kernel has nothing left to save. Say so
-        # once: otherwise enabling the env var looks like it did nothing.
-        _warn_fused_decode_sort_quant_bypassed()
+    # The a4w4 aux-sort families already fuse activation quantization into GEMM1,
+    # so the fused sort+quant kernel has nothing left to save there.
     fused_sort_quant = not metadata.output_aux and _is_fused_decode_sort_quant_enabled(
         hidden_states,
         topk_ids,
