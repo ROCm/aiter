@@ -3,15 +3,19 @@
 """Worker: plans the search space (--plan) or benchmarks candidate configs on one GPU.
 
 Flow: set the kernel up once (inputs, call, should_skip), then
-  --plan     build the space (space.build_space) and write it as JSON for the driver
-  --configs  for each candidate: warm up (compiles) -> capture a CUDA graph over cold input
-             copies -> replay -> append one record to --out
+  --plan        build the space (space.build_space) and write it as JSON for the driver
+  --configs     for each candidate: compile without launching -> skip it when the compiled
+                kernels overflow LDS or spill registers -> warm up -> capture a CUDA graph over
+                cold input copies -> replay -> append one record to --out
+  --precompile  only compile the --configs candidates (no launch, no records): fills the Triton
+                cache ahead of the timing workers
 
 --configs is a JSON list of config dicts; null is the baseline, the wrapper called with
 config=None (the installed config). Records are appended as soon as a candidate finishes.
 
 Record fields:
-  status    ready (worker is set up), start (candidate began), ok, error
+  status    ready (worker is set up), start (candidate began), ok, error, skipped (the
+            compiled kernels overflow LDS or spill registers; reason says which)
   baseline  true for the installed config
   config    the raw candidate, never the mutated copy; for the baseline the installed config
             (launched through the wrapper's own config=None path unless keys DEFAULT.json does
@@ -40,7 +44,12 @@ from kernels import (
     get_spec,
     resolve_installed,
 )
-from space import UnknownConfigKey, build_space, load_defaults
+from space import (
+    UnknownConfigKey,
+    build_space,
+    exceeds_compiled_resources,
+    load_defaults,
+)
 
 
 def make_cold_copies(inputs, cold_mb):
@@ -98,6 +107,38 @@ def time_with_cuda_graph(call, config, copies, calls=24, replays=25):
         times.append(start.elapsed_time(end) * 1e3 / n_calls)
     times.sort()
     return times[len(times) // 2], times[0], times[-1]
+
+
+def compile_only(call, config, inputs):
+    """Run the wrapper with every kernel launch turned into a compile; returns the compiled kernels."""
+    from triton.runtime import jit
+
+    compiled = []
+    launch = jit.JITFunction.run
+
+    def compile_instead(self, *args, grid, warmup, **kwargs):
+        kernel = launch(self, *args, grid=grid, warmup=True, **kwargs)
+        compiled.append(kernel)
+        return kernel
+
+    jit.JITFunction.run = compile_instead
+    try:
+        call(copy.deepcopy(config), *inputs)
+    finally:
+        jit.JITFunction.run = launch
+    return [kernel for kernel in compiled if kernel is not None]
+
+
+def precompile(call, inputs, candidates):
+    """Compile every candidate into the Triton cache; a candidate that fails is left to the sweep."""
+    print("ready", flush=True)  # the driver's watchdog reads the worker's log
+    for candidate in candidates:
+        try:
+            compile_only(call, candidate, inputs)
+            status = "compiled"
+        except Exception as e:  # noqa: BLE001
+            status = f"failed {type(e).__name__}"
+        print(status, json.dumps(candidate), flush=True)
 
 
 def gpu_alive():
@@ -171,15 +212,23 @@ def benchmark(
                     record["dropped_keys"] = dropped
                     candidate = record["config"]
                 # otherwise candidate stays None: the wrapper's own installed-config path
-            median, low, high = time_with_cuda_graph(
-                call, candidate, copies, calls, replays
-            )
-            record.update(
-                us=round(median, 3),
-                us_min=round(low, 3),
-                us_max=round(high, 3),
-                tflops=round(flops(shape) / median / 1e6, 2),
-            )
+            else:
+                # the baseline is always timed; a candidate only when its kernels fit
+                reason = exceeds_compiled_resources(
+                    compile_only(call, candidate, copies[0])
+                )
+                if reason:
+                    record.update(status="skipped", reason=reason)
+            if record["status"] == "ok":
+                median, low, high = time_with_cuda_graph(
+                    call, candidate, copies, calls, replays
+                )
+                record.update(
+                    us=round(median, 3),
+                    us_min=round(low, 3),
+                    us_max=round(high, 3),
+                    tflops=round(flops(shape) / median / 1e6, 2),
+                )
         except Exception as e:  # noqa: BLE001
             # a failing candidate is a result, not a crash
             record.update(
@@ -207,6 +256,11 @@ def main(argv=None):
     parser.add_argument(
         "--plan", action="store_true", help="only build the search space"
     )
+    parser.add_argument(
+        "--precompile",
+        action="store_true",
+        help="only compile the --configs candidates into the Triton cache (no launch, no records)",
+    )
     parser.add_argument("--space-out", help="where --plan writes the space (JSON)")
     parser.add_argument("--configs", help="JSON list of candidates, null = baseline")
     parser.add_argument("--out", help="JSONL results file, appended")
@@ -233,6 +287,9 @@ def main(argv=None):
         return plan(spec, shape, backend, arch, should_skip, args.space_out)
     with open(args.configs) as f:
         candidates = json.load(f)
+    if args.precompile:
+        precompile(call, inputs, candidates)
+        return 0
     benchmark(
         spec,
         shape,

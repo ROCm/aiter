@@ -26,7 +26,8 @@ SEARCH_SPACE = {
     "num_stages": [1, 2],
     "waves_per_eu": [1, 2, 4, 6, 8],
     "matrix_instr_nonkdim": [16],
-    "cache_modifier": [".cg", None],
+    # gfx1250 load policies: None (= .ca) CU+RT, .cg DEV+RT, .cs CU+NT, .cv SYS+bypass
+    "cache_modifier": [None, ".cg", ".cs", ".cv"],
     "NUM_KSPLIT": [1, 3, 4, 7, 8, 14, 16, 28],
     "NUM_BUFFERS": [1, 2, 3, 4, 6, 8],
     "kernel_type": ["bandwidth_bound", "compute_bound"],
@@ -210,6 +211,24 @@ def exceeds_lds(config, spec, arch, backend):
         block_m * block_k * spec.bits[0] + block_n * block_k * spec.bits[1]
     ) / 8
     return buffers * tile_bytes > _LDS_CAP_BYTES.get(arch, 64 * 1024)
+
+
+def exceeds_compiled_resources(kernels):
+    """Why the compiled kernels of a candidate cannot run well, or None (truthy = reject).
+
+    The static LDS and register checks above are estimates; this reads what the compiler
+    produced: shared memory above the device's (loading the kernel raises), or spilled registers.
+    """
+    from triton.runtime.errors import OutOfResources
+
+    for kernel in kernels:
+        try:
+            kernel._init_handles()  # loads the binary, no launch
+        except OutOfResources as e:
+            return f"LDS: {' '.join(str(e).split())[:120]}"
+        if kernel.n_spills:
+            return f"spills {kernel.n_spills} registers"
+    return None
 
 
 def build_space(spec, shape, backend, arch, kernel_should_skip):

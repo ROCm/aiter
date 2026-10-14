@@ -29,7 +29,9 @@ here. Update this file in the same change as any behaviour change.
    shape filters, `should_skip_generic`, `exceeds_lds` and `exceeds_registers` (fp32 accumulator per
    thread above `MAX_ACC_PER_THREAD`: 512 on gfx1250, 256 elsewhere) in `space.py`, then the kernel's own
    `should_skip(config)`. Every rule returns True to reject; `build_space` reads as separate
-   `if ...: continue` checks. When the kernel rejects every tile that fits the shape, `build_space`
+   `if ...: continue` checks. The worker then compiles each candidate without a launch and
+   records it as `skipped` (with the `reason`) when the compiled kernels overflow LDS or spill
+   registers (`exceeds_compiled_resources`); the baseline is always timed. When the kernel rejects every tile that fits the shape, `build_space`
    allows block sizes above the shape for that M (`oversized_tiles_allowed` in the plan). `gluon_candidates` is only for a key whose meaning differs under
    gluon (gfx1250 a8w8 blockscale `num_stages` is `NUM_BUFFERS`).
 4. Results always install into `resolve_config_dir(op, config_name, backend)`. No export directory,
@@ -63,7 +65,9 @@ here. Update this file in the same change as any behaviour change.
    the baseline and the ten fastest candidates of the current plan on the first GPU into
    `<results>.final.jsonl`, with the same crash/hang recovery as the sweep; when that file exists
    the installer uses only it, so a later run (even on one GPU) always refreshes it, and an M timed
-   on several GPUs without it is skipped. Never two drivers on one GPU.
+   on several GPUs without it is skipped. Never two drivers on one GPU. `--compile-procs` workers
+   (`harness.py --precompile`) only compile, never launch, and run on `--compile-gpus`, which must
+   not be timing GPUs because their input set-up runs kernels.
 9. Call the public wrappers (`aiter.ops.triton.gemm...`) only, never `_triton_kernels` or
    `_gluon_kernels`; pass `backend=` where the wrapper takes it and refuse a backend the wrapper
    cannot select (`KernelSpec.supports`).

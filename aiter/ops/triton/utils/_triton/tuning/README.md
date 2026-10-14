@@ -68,7 +68,10 @@ BLOCK_M x BLOCK_N / (num_warps x wave size), exceeds `MAX_ACC_PER_THREAD` (512 o
 elsewhere) only spills, so it is never run. On gfx1250 1024 per thread measured 16-19x slower)
 and the kernel's own `should_skip(config)` in `kernels.py` (what the kernel asserts, and buffer
 counts its wrapper clamps so they would only repeat another candidate). Every rule returns True
-to reject. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
+to reject. The LDS and register checks are estimates, so the worker also compiles each candidate
+without a launch and skips it when the compiled kernels use more LDS than the device has or spill
+registers (`exceeds_compiled_resources`). `cache_modifier` sweeps the four distinct gfx1250 load
+policies: `None` (the same as `.ca`), `.cg`, `.cs` and `.cv`. If the kernel rejects every tile that fits the shape (a kernel that needs 64-row tiles
 at M=16), block sizes above the shape are allowed for that M and the plan says so.
 There are no command-line overrides: edit the table. A one-value list pins a key. Keys the wrapper
 never reads (`ignored_keys` in the spec) and `matrix_instr_nonkdim`/`kpack` under gluon stay at
@@ -96,7 +99,8 @@ they are not comparable with the old rocprof logs.
 
 Results go to `runs/sweep-<arch>-<backend>-<kernel>-[B=..-]M=..-N=..-K=..jsonl` (worker output in
 `<that file>.gpu<g>.log`), one JSON line per config: `config` (the raw candidate), `status` `ok` (`us`, `us_min`, `us_max`, `tflops`), `error`
-(the exception; the sweep continues), `crashed` or `hung` (the worker died or stalled on it; the
+(the exception; the sweep continues), `skipped` (the compiled kernels overflow LDS or spill
+registers; `reason` says which), `crashed` or `hung` (the worker died or stalled on it; the
 driver restarts the worker on the remaining configs). The baseline record carries `is_tuned`.
 The full field list is in the `harness.py` docstring. Re-running the same command skips configs that already have a record, provided `--calls` and
 `--replays` are unchanged (otherwise it refuses); `--fresh` discards them. The plan of each M is
@@ -104,6 +108,17 @@ kept as `runs/plan-<arch>-<backend>-<kernel>-<shape>.json`, and only its candida
 baseline) can win at install time. Ctrl-C kills the workers before the driver exits. `--batch` is the number of configs per worker process, `--stall` the
 seconds a worker may spend on one candidate (a huge tile can compile for minutes) before it is
 killed, `--setup-timeout` the time allowed before a worker is ready.
+
+## Compile ahead
+
+Compiling is most of the time per candidate, and it uses only the CPU. With
+`--compile-procs N --compile-gpus G ...` the driver plans every M first, then N compile-only
+workers (`harness.py --precompile`) fill the Triton cache M by M, in sweep order, while the
+timing workers run. The compile GPUs only hold the inputs; they must not be in `--gpu`. The
+timing workers compile what the pool has not reached yet, so the results do not change.
+
+    python3 sweep_configs.py gemm_a16w16 --all-buckets --N 5120 --K 2880 --gpu 0 1 2 \
+        --compile-gpus 3 --compile-procs 160
 
 ## Install
 

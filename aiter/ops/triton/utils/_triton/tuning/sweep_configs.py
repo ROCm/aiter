@@ -12,6 +12,11 @@ Per M:   plan            harness.py --plan: load defaults, generate combinations
          summarize
 Then:    install         write_best_configs.py: select winners, merge buckets, validate, write
 
+With --compile-procs N, every M is planned first and N compile-only workers (harness.py
+--precompile) on the --compile-gpus fill the Triton cache in sweep order while the timing
+workers run, so the timing GPUs spend their time timing. The timing workers still compile
+anything the pool has not reached; the results are the same with or without the pool.
+
 --all-buckets sweeps every M bucket of the family up to TOP_BUCKET_M (8192); the installer
 sets "any" to a copy of DEFAULT.json's "any". The driver never imports torch or aiter: every
 step is a subprocess that sees HIP_VISIBLE_DEVICES=<gpu>. It resumes from the records in --runs-dir.
@@ -91,6 +96,19 @@ def parse_args(argv=None):
         default=600,
         help="seconds allowed for planning and for a worker to become ready",
     )
+    parser.add_argument(
+        "--compile-procs",
+        type=int,
+        default=0,
+        help="compile-only workers that fill the Triton cache ahead of the sweep (0: off)",
+    )
+    parser.add_argument(
+        "--compile-gpus",
+        type=int,
+        nargs="+",
+        default=[],
+        help="GPUs for the compile-only workers, not in --gpu (their input set-up runs kernels)",
+    )
     parser.add_argument("--replays", type=int, default=25)
     parser.add_argument("--calls", type=int, default=24)
     parser.add_argument("--cold-mb", type=int, default=1024)
@@ -104,6 +122,10 @@ def parse_args(argv=None):
         parser.error("--gpu values must be distinct: one worker per GPU")
     if bool(args.M) == args.all_buckets:
         parser.error("give --M values or --all-buckets, not both")
+    if args.compile_procs and not args.compile_gpus:
+        parser.error("--compile-procs needs --compile-gpus")
+    if set(args.compile_gpus) & set(args.gpu):
+        parser.error("--compile-gpus must not be timing GPUs (--gpu)")
     return args
 
 
@@ -212,13 +234,13 @@ def terminate(proc):
     proc.wait()
 
 
-def run_worker(command, env, log_path, stall, setup_timeout):
+def run_worker(command, env, log_path, stall, setup_timeout, stop=STOP):
     """Run one worker to its end, or kill it.
 
     The worker prints "ready" once it is set up and one line per finished candidate. Until
     "ready" the limit is setup_timeout (imports, inputs, first compile), afterwards stall seconds
     per candidate. Returns "finished", "failed" (died after it was ready), "setup_failed",
-    "timed_out" or "cancelled" (STOP was set).
+    "timed_out" or "cancelled" (stop was set).
     """
 
     def size():
@@ -246,7 +268,7 @@ def run_worker(command, env, log_path, stall, setup_timeout):
                 if size() != last:
                     last, t_last = size(), time.time()
                     ready = ready or became_ready()
-                if STOP.is_set():
+                if stop.is_set():
                     terminate(proc)
                     return "cancelled"
                 if time.time() - t_last > (stall if ready else setup_timeout):
@@ -364,6 +386,54 @@ def final_round(spec, shape, backend, candidates, out, gpu, args):
     sweep_shard(spec, shape, backend, [None] + fastest, final_out, gpu, args)
 
 
+def precompile_slice(spec, shape, backend, candidates, out, slot, gpu, args, stop):
+    """One compile-only worker for a slice of one M's candidates; its failures are the sweep's."""
+    todo_file, log_path = f"{out}.pre{slot}.todo.json", f"{out}.pre{slot}.log"
+    with open(todo_file, "w") as f:
+        json.dump(candidates, f)
+    command = worker_command(
+        spec, shape, backend, ["--precompile", "--configs", todo_file]
+    )
+    env = dict(os.environ, HIP_VISIBLE_DEVICES=str(gpu))
+    run_worker(command, env, log_path, args.stall, args.setup_timeout, stop)
+
+
+def precompile_ahead(spec, args, plans, stop):
+    """Compile the unfinished candidates of every M, in sweep order, on the compile GPUs."""
+    for M, plan_ in plans.items():
+        if stop.is_set() or STOP.is_set():
+            return
+        shape = shape_from_args(args, spec.dims, M)
+        out = results_path(
+            args.runs_dir, plan_["arch"], plan_["backend"], spec.name, shape
+        )
+        records = read_records(out)
+        todo = [
+            c
+            for c in [None] + plan_["configs"]
+            if records.get(config_key(c), {}).get("status") not in FINAL_STATUSES
+        ]
+        slots = min(args.compile_procs, len(todo))
+        gpus = args.compile_gpus
+        with ThreadPoolExecutor(max(slots, 1)) as pool:
+            for slot in range(
+                slots
+            ):  # strided slices: the workers advance in sweep order
+                pool.submit(
+                    precompile_slice,
+                    spec,
+                    shape,
+                    plan_["backend"],
+                    todo[slot::slots],
+                    out,
+                    slot,
+                    gpus[slot % len(gpus)],
+                    args,
+                    stop,
+                )
+        print(f"  compile-ahead: M={M} done", flush=True)
+
+
 def summarize(out, candidates):
     records = read_records(out)
     counts = {}
@@ -413,25 +483,42 @@ def main(argv=None):
     spec, gpus = args.kernel, args.gpu
     os.makedirs(args.runs_dir, exist_ok=True)
 
+    plans = {}
     for M in args.M or all_bucket_ms(spec, args, gpus[0]):
         shape = shape_from_args(args, spec.dims, M)
-        plan_ = plan(
+        plans[M] = plan(
             spec, shape, args.backend, gpus[0], args.runs_dir, args.setup_timeout
         )
-        backend = plan_["backend"]
-        print_plan(plan_, shape)
-
-        out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
+        out = results_path(
+            args.runs_dir, plans[M]["arch"], plans[M]["backend"], spec.name, shape
+        )
         if args.fresh:
             discard(out)
         check_settings(out, args)
-        print(f"  results: {out}", flush=True)
-        candidates = [None] + plan_["configs"]  # None is the installed baseline
-        sweep(spec, shape, backend, candidates, out, gpus, args)
-        # the installer prefers a final-round file, so an existing one is always refreshed
-        if len(gpus) > 1 or os.path.exists(final_results_path(out)):
-            final_round(spec, shape, backend, candidates, out, gpus[0], args)
-        summarize(out, candidates)
+
+    stop_precompile = threading.Event()
+    precompiler = threading.Thread(
+        target=precompile_ahead, args=(spec, args, plans, stop_precompile), daemon=True
+    )
+    if args.compile_procs:
+        precompiler.start()
+    try:
+        for M, plan_ in plans.items():
+            shape = shape_from_args(args, spec.dims, M)
+            backend = plan_["backend"]
+            print_plan(plan_, shape)
+            out = results_path(args.runs_dir, plan_["arch"], backend, spec.name, shape)
+            print(f"  results: {out}", flush=True)
+            candidates = [None] + plan_["configs"]  # None is the installed baseline
+            sweep(spec, shape, backend, candidates, out, gpus, args)
+            # the installer prefers a final-round file, so an existing one is always refreshed
+            if len(gpus) > 1 or os.path.exists(final_results_path(out)):
+                final_round(spec, shape, backend, candidates, out, gpus[0], args)
+            summarize(out, candidates)
+    finally:
+        stop_precompile.set()
+        if precompiler.is_alive():
+            precompiler.join()
 
     return install(spec, args, backend, gpus[0])
 
