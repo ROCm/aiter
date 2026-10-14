@@ -24,12 +24,12 @@ SEARCH_SPACE = {
     "GROUP_SIZE_M": [1, 4, 8, 16],
     "num_warps": [1, 2, 4, 8],
     "num_stages": [1, 2],
-    "waves_per_eu": [1, 2, 4, 6, 8],
+    "waves_per_eu": [0, 1, 2, 4, 6, 8],  # 0: no occupancy hint, the compiler decides
     "matrix_instr_nonkdim": [16],
     # gfx1250 load policies: None (= .ca) CU+RT, .cg DEV+RT, .cs CU+NT, .cv SYS+bypass
     "cache_modifier": [None, ".cg", ".cs", ".cv"],
     "NUM_KSPLIT": [1, 3, 4, 7, 8, 14, 16, 28],
-    "NUM_BUFFERS": [1, 2, 3, 4, 6, 8],
+    "NUM_BUFFERS": [1, 2, 3, 4, 5, 6, 7, 8],
     "kernel_type": ["bandwidth_bound", "compute_bound"],
     "num_ctas": [1, 2, 4, 8, 16],
     "CTAS_M": [1, 2, 4],
