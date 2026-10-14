@@ -2965,23 +2965,30 @@ __global__ void __launch_bounds__(1024, 1)
         idx += gridDim.x * hidden_dim, tidx += gridDim.x)
     {
         P vec = tmps[rank][idx / pack_size];
+        // Add the residual in fp32 and normalize that sum, as the 1-stage kernel
+        // does; only residual_out is rounded to T.
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            acc[v] = upcast_s(vec[v]);
+        }
         if(!skip_residual)
         {
             P res = *reinterpret_cast<P*>(residual_inp + idx);
 #pragma unroll
             for(int v = 0; v < pack_size; ++v)
             {
-                vec[v] += res[v];
+                acc[v] += upcast_s(res[v]);
             }
+        }
+#pragma unroll
+        for(int v = 0; v < pack_size; ++v)
+        {
+            vec[v] = downcast_s<T>(acc[v]);
         }
         *reinterpret_cast<P*>(residual_out + idx) = vec;
         if(tidx >= norm_rows)
             continue;
-#pragma unroll
-        for(int v = 0; v < pack_size; ++v)
-        {
-            acc[v] = upcast_s(vec[v]);
-        }
         ar_fusion_epilogue<P, A, T, OutT, pack_size, GEMMA_NORM>(
             acc, weight_p, hidden_dim, eps, idx, tidx, block_size, output, scale_out,
             /*active=*/true, bf16_output);
@@ -5198,12 +5205,13 @@ void dispatchFusedAllReduceRMSNorm(hipStream_t stream,
 
     // Single-kernel 2-stage fused AR+RMSNorm: each block owns complete tokens
     // in both stages, so RMSNorm folds into the allgather. Other shapes take
-    // reduce-scatter + local RMSNorm below.
-    const int fused_block_size  = n / pack_size;
-    const bool use_fused_2stage = !use_1stage && out_n == n && input_hidden_dim == n &&
-                                  m <= kFusedArRms2StageMaxRows &&
-                                  fused_block_size >= world_size_ &&
-                                  fused_block_size % world_size_ == 0 && fused_block_size <= 1024;
+    // reduce-scatter + local RMSNorm below. The block must be whole 32-lane
+    // groups: ar_fusion_epilogue_block_reduce drops a partial one.
+    const int fused_block_size = n / pack_size;
+    const bool use_fused_2stage =
+        !use_1stage && out_n == n && input_hidden_dim == n && m <= kFusedArRms2StageMaxRows &&
+        fused_block_size >= world_size_ && fused_block_size % world_size_ == 0 &&
+        fused_block_size % 32 == 0 && fused_block_size <= 1024;
 #define MAYBE_DISPATCH_2S_KERNEL(NGPUS)                                                       \
 if(use_fused_2stage)                                                                          \
 {                                                                                             \

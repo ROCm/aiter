@@ -135,7 +135,8 @@ def test_fused_ar_rms_rows(ca, tp, rank, m, n, norm_div, skip_residual, dtype, g
     numel = m * n
     flops = numel * tp + norm_rows * n * 4
     nbytes = (3 * numel + norm_rows * n) * x.element_size()
-    us, err = run_case(ca, fused, x, [out_ref, res_ref], [(2e-2, 2e-2), (0, 0)], graphs)
+    # 5e-3 is above bf16 output rounding (~0.4%) but catches a ~1% RMS scale error.
+    us, err = run_case(ca, fused, x, [out_ref, res_ref], [(5e-3, 5e-3), (0, 0)], graphs)
     return {
         "norm_rows": norm_rows,
         "fused us": us,
@@ -232,6 +233,11 @@ def check_rejections(ca):
         RuntimeError,
         "res_inp shorter than m",
         lambda: native_ar_rms(rows(m - 1), rows(m), rows(norm_rows)),
+    )
+    expect_error(
+        RuntimeError,
+        "fp32 out",
+        lambda: native_ar_rms(x, rows(m), rows(norm_rows, dtypes.fp32)),
     )
     # num_norm_rows == m is the default behavior, so 1-stage accepts it.
     ca.custom_fused_ar_rms(x, x, w, EPS, True, num_norm_rows=m)
@@ -346,8 +352,9 @@ def main():
         type=dtypes.str2tuple,
         nargs="*",
         # 16 rows take the single-kernel 2-stage path, 160 rows
-        # reduce-scatter + local RMSNorm.
-        default=[(16, 7168), (160, 7168)],
+        # reduce-scatter + local RMSNorm. n=2880 (360 lanes, not whole 32-lane
+        # groups) must also fall back to reduce-scatter + local RMSNorm.
+        default=[(16, 7168), (160, 7168), (32, 2880)],
         help="fused AR+RMSNorm shapes m,n",
     )
     parser.add_argument(

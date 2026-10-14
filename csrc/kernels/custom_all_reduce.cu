@@ -624,6 +624,18 @@ void fused_allreduce_rmsnorm(fptr_t _fa,
         throw std::runtime_error("fused allreduce rmsnorm: res_out must hold every input row");
     if(!skip_residual && static_cast<int64_t>(res_inp.numel()) < all_elems)
         throw std::runtime_error("fused allreduce rmsnorm: res_inp must hold every input row");
+    // The dispatcher casts every buffer by inp's dtype, on inp's device.
+    for(auto [t, name] : {std::pair{&out, "out"},
+                          std::pair{&res_out, "res_out"},
+                          std::pair{&res_inp, "res_inp"},
+                          std::pair{&w, "w"}})
+    {
+        if(t == &res_inp && skip_residual)
+            continue;
+        if(t->dtype() != dtype || t->device_id != inp.device_id)
+            throw std::runtime_error(std::string("fused allreduce rmsnorm: ") + name +
+                                     " must match the input's dtype and device");
+    }
 
     if(reg_ptr != 0)
     {
