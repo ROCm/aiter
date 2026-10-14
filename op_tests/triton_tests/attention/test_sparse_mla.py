@@ -193,6 +193,10 @@ def test_fp8_scalar_two_loop_rejected_off_packed_arch():
     """fp8_scalar plus extra_kv used to skip the packed-arch gate and launch the
     gluon kernel. The two-loop stays on the packed arch for every cache format.
     Going through sparse_mla_fwd catches the gate losing that call site.
+
+    Both segments are a real 3-D block pool. A 2-D cache fails the shape check
+    with an error that also says "two-loop", so it would still pass if the
+    arch gate were removed.
     """
     arch = arch_info.get_arch()
     if arch not in SUPPORTED_ARCHS or arch in smd.PACKED_ARCHS:
@@ -200,7 +204,9 @@ def test_fp8_scalar_two_loop_rejected_off_packed_arch():
     if arch not in FP8_SCALAR_ARCHS:
         pytest.skip(f"no fp8_scalar cache on {arch}")
     q, cache, ks, idx, ptr, _ = _build("tensor", 1, 16, 64, 1024, ragged=False)
-    with pytest.raises(ValueError, match="two-loop"):
+    block = 64
+    cache = cache.view(cache.shape[0] // block, block, cache.shape[-1])
+    with pytest.raises(ValueError, match=f"have no implementation on {arch}"):
         sparse_mla_fwd(
             q,
             cache,
