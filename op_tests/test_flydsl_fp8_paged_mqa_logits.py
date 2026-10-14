@@ -429,13 +429,23 @@ def _time_candidates(candidates, ref, flops, nbytes, msg):
     return ret
 
 
+def _context_lens_arg(context_lens, next_n, layout):
+    """``[B]`` lengths as the kernel takes them: ``1d`` as is, ``2d`` as the
+    ``(B, next_n)`` table vLLM builds (row ``b`` = ``[L_b - next_n + 1, ..., L_b]``)."""
+    if layout == "1d":
+        return context_lens
+    offsets = torch.arange(next_n, dtype=torch.int32, device=context_lens.device)
+    return context_lens[:, None] - next_n + 1 + offsets
+
+
 @benchmark()
-def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
+def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype, ctx_lens):
     q_dtype = _Q_DTYPE[dtype]
     inp = _build_inputs(
         batch, next_n, HEADS, HEAD_DIM, kv_len, q_dtype, block_size=KV_BLOCK_SIZE
     )
     kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
+    fly_context_lens = _context_lens_arg(inp.context_lens, next_n, ctx_lens)
     ref = run_torch(
         inp.q,
         inp.kv_cache_fp8,
@@ -455,7 +465,7 @@ def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
             kv_cache_kernel,
             inp.weights,
             out,
-            inp.context_lens,
+            fly_context_lens,
             inp.block_tables,
             inp.max_model_len,
             Preshuffle=True,
@@ -465,8 +475,9 @@ def test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype):
 
     candidates = {"flydsl": (flydsl, out)}
     # Gluon is a real kernel under test, not the torch reference. It only
-    # accepts a launch-wide next_n = Q.shape[1], so it is compact-only.
-    if deepgemm_fp8_paged_mqa_logits is not None:
+    # accepts a launch-wide next_n = Q.shape[1], so it is compact-only, and it
+    # runs on 1D lengths only: its 2D support is a separate change.
+    if deepgemm_fp8_paged_mqa_logits is not None and ctx_lens == "1d":
         out_g = out.clone()
 
         def gluon():
@@ -677,9 +688,9 @@ def _summarize(name, rows):
     aiter.logger.info("%s summary (markdown):\n%s", name, table)
 
 
-def test_fp8_paged_mqa_logits_2d_context_lens(batch, next_n, kv_len, split_kv):
-    """A (B, next_n) per-row table, the layout DeepGEMM takes and vLLM passes,
-    gives the same logits as the per-sequence lengths it ends with."""
+def test_fp8_paged_mqa_logits_bad_context_lens(next_n=3, kv_len=3000):
+    """Layouts the kernel would read wrongly raise ``ValueError``."""
+    batch = 4
     inp = _build_inputs(
         batch,
         next_n,
@@ -691,72 +702,38 @@ def test_fp8_paged_mqa_logits_2d_context_lens(batch, next_n, kv_len, split_kv):
         var_ratio=0.9,
     )
     kv_cache_kernel, out = _kernel_inputs(inp, batch, next_n, HEAD_DIM)
-    seq_lens = inp.context_lens
-    row_lens = (
-        seq_lens[:, None]
-        - next_n
-        + 1
-        + torch.arange(next_n, dtype=torch.int32, device="cuda")
-    )
-
-    def run(context_lens):
-        out.fill_(float("-inf"))
-        flydsl_fp8_paged_mqa_logits(
-            inp.q_fp8,
-            kv_cache_kernel,
-            inp.weights,
-            out,
-            context_lens,
-            inp.block_tables,
-            inp.max_model_len,
-            Preshuffle=True,
-            KVBlockSize=KV_BLOCK_SIZE,
-            SplitKV=_split_arg(split_kv),
-        )
-        return out.clone()
-
-    expected = run(seq_lens)
-    for name, context_lens in (
-        ("(B, next_n)", row_lens),
-        ("(B, 1)", seq_lens[:, None]),
-    ):
-        msg = f"2d context_lens {name} vs [B]: "
-        err = checkAllclose(
-            run(context_lens), expected, rtol=0, atol=0, tol_err_ratio=0, msg=msg
-        )
-        assert err == 0, f"{msg}{err:.2%} of the logits differ"
+    row_lens = _context_lens_arg(inp.context_lens, next_n, "2d")
     # Wrong row count, a column count other than 1 or next_n, a strided [B] or
-    # [B, n], a dtype other than int32, or a tensor on another device are
-    # rejected.
+    # [B, n], a dtype other than int32, or a tensor on another device.
     bad_inputs = [
         row_lens[:-1],
         torch.cat([row_lens, row_lens[:1]]),
         row_lens[:, :0],
+        row_lens[:, 1:].contiguous(),
+        row_lens[:, -1],
+        row_lens.t().contiguous().t(),
         row_lens.long(),
         row_lens.cpu(),
     ]
-    if next_n > 1:
-        bad_inputs += [
-            row_lens[:, -1],
-            row_lens.t().contiguous().t(),
-            row_lens[:, 1:].contiguous(),
-        ]
     for bad in bad_inputs:
         try:
-            run(bad)
+            flydsl_fp8_paged_mqa_logits(
+                inp.q_fp8,
+                kv_cache_kernel,
+                inp.weights,
+                out,
+                bad,
+                inp.block_tables,
+                inp.max_model_len,
+                Preshuffle=True,
+                KVBlockSize=KV_BLOCK_SIZE,
+            )
         except ValueError:
             continue
         raise AssertionError(
             f"context_lens {bad.dtype} {tuple(bad.shape)} on {bad.device} was accepted"
         )
-    aiter.logger.info(
-        "fp8_paged_mqa_logits 2d context_lens ok: batch=%d next_n=%d kv_len=%d "
-        "split_kv=%d",
-        batch,
-        next_n,
-        kv_len,
-        split_kv,
-    )
+    aiter.logger.info("fp8_paged_mqa_logits bad context_lens rejected: ok")
 
 
 def main():
@@ -807,6 +784,16 @@ def main():
         nargs="*",
         default=[0],
         help="SplitKV; 0 = auto occupancy mapping.\n    e.g.: --split-kv 0 1 4",
+    )
+    parser.add_argument(
+        "-c",
+        "--ctx_lens",
+        type=str,
+        nargs="*",
+        default=["1d", "2d"],
+        choices=["1d", "2d"],
+        help="context_lens layout: [B] (1d) or the (B, next_n) table vLLM "
+        "builds (2d).\n    e.g.: -c 2d",
     )
     parser.add_argument(
         "--ragged-batch",
@@ -882,15 +869,18 @@ def main():
     )
     args = parser.parse_args()
 
-    for next_n, split_kv in itertools.product((1, 3), (0, 3)):
-        test_fp8_paged_mqa_logits_2d_context_lens(4, next_n, 3000, split_kv)
-
     compact = [
-        test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype)
-        for dtype, batch, next_n, kv_len, split_kv in itertools.product(
-            args.dtype, args.batch, args.next_n, args.kv_len, args.split_kv
+        test_fp8_paged_mqa_logits(batch, next_n, kv_len, split_kv, dtype, ctx_lens)
+        for dtype, batch, next_n, kv_len, split_kv, ctx_lens in itertools.product(
+            args.dtype,
+            args.batch,
+            args.next_n,
+            args.kv_len,
+            args.split_kv,
+            args.ctx_lens,
         )
     ]
+    test_fp8_paged_mqa_logits_bad_context_lens()
     if compact:
         _summarize("fp8_paged_mqa_logits", compact)
 
