@@ -32,8 +32,8 @@ On the payload axis, a policy reads::
     exact (quick reduce off):
       0 --- oneshot ---)    cross_device_reduce / RCCL --->
 
-The one-shot window may overlap the mesh and the ring windows: 
-``QuickAllReduce`` runs before ``CustomAllreduce``, and with quantization on, 
+The one-shot window may overlap the mesh and the ring windows:
+``QuickAllReduce`` runs before ``CustomAllreduce``, and with quantization on,
 the mesh and the ring take their payloads first.
 
 ``resolve_family_policy`` gives the policy for a given rank: the table row for the

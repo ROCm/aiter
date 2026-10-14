@@ -29,13 +29,6 @@ from flydsl.expr.typing import Int32, Int64, Stream
 
 from aiter.jit.utils.chip_info import get_lds_capacity_bytes
 
-from .allreduce_policy import (
-    MIN_BATCH_BLOCKS,
-    RS_INT6_MIN_WORLD,
-    mesh_st_ladder,
-    resolve_link,
-    ring_st_ladder,
-)
 from .allreduce_host_shared import (
     _cuda_index,
     _resolve_inbox_flags,
@@ -46,6 +39,13 @@ from .allreduce_host_shared import (
     kernel_symbol,
     payload_probes,
     require_arch,
+)
+from .allreduce_policy import (
+    MIN_BATCH_BLOCKS,
+    RS_INT6_MIN_WORLD,
+    mesh_st_ladder,
+    resolve_link,
+    ring_st_ladder,
 )
 from .kernels.comm.allreduce_shared import (
     ATOMS,
