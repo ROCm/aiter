@@ -24,6 +24,10 @@ from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd import (
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dq import (
     build_hstu_attention_bwd_dq,
 )
+from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dq_pp import (
+    build_hstu_attention_bwd_dq_pp,
+    validate_hstu_attention_bwd_dq_pp,
+)
 from aiter.ops.flydsl.kernels.hstu.hstu_attention_bwd_dvdk_pp import (
     build_hstu_attention_bwd_dvdk_pp,
     validate_hstu_attention_bwd_dvdk_pp,
@@ -503,11 +507,30 @@ _BWD_KERNEL_DQ = "dq"
 # development. It is never a default or a fallback, so a shape with no such row
 # keeps the shipping `dvdk` kernel.
 _BWD_KERNEL_DVDK_PP = "dvdk_pp"
-_BWD_KERNELS = (_BWD_KERNEL_DVDK, _BWD_KERNEL_DQ, _BWD_KERNEL_DVDK_PP)
+# Ping-pong dQ variant, reached on the same opt-in terms as `dvdk_pp` and with
+# its own independent discriminator and env var -- the two halves of the
+# backward are separate dispatches and are enabled separately.
+_BWD_KERNEL_DQ_PP = "dq_pp"
+_BWD_KERNELS = (
+    _BWD_KERNEL_DVDK,
+    _BWD_KERNEL_DQ,
+    _BWD_KERNEL_DVDK_PP,
+    _BWD_KERNEL_DQ_PP,
+)
 # The only tile the ping-pong kernel is built for: 8 waves give 2 per SIMD
 # inside one barrier domain, and 384 keeps 48 KV rows per wave.
 _BWD_PINGPONG_TILES = {
     "block_m": 384,
+    "block_n": 16,
+    "num_waves": 8,
+    "waves_per_eu": 2,
+}
+
+# The dQ twin: 8 waves again, and 512 keeps 64 query rows per wave. Halving
+# that to 32 measured 39-55% slower -- each streamed K/V tile then amortizes
+# over half the math while every per-tile cost is unchanged.
+_BWD_DQ_PINGPONG_TILES = {
+    "block_m": 512,
     "block_n": 16,
     "num_waves": 8,
     "waves_per_eu": 2,
@@ -830,8 +853,38 @@ def _compile_bwd_launcher(
             dvdk_builder = build_hstu_attention_bwd_dvdk_pp
             dvdk_config = pp_config
 
+    # Opt-in ping-pong dQ, on the same terms and independently of dV/dK.
+    dq_builder = build_hstu_attention_bwd_dq
+    dq_pp_tuned = _get_bwd_tuned_config(
+        kernel=_BWD_KERNEL_DQ_PP,
+        dtype_str=dtype_str,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        hidden_dim=hidden_dim,
+        batch=batch,
+        max_seq_len=max_seq_len,
+        max_attn_len=max_attn_len,
+        contextual_seq_len=contextual_seq_len,
+        has_targets=has_targets,
+    )
+    if dq_pp_tuned or os.environ.get("AITER_HSTU_BWD_DQ_PINGPONG", "") in (
+        "1",
+        "true",
+    ):
+        dq_pp_config = {**_BWD_DQ_PINGPONG_TILES, **dq_pp_tuned, **custom_config}
+        try:
+            validate_hstu_attention_bwd_dq_pp(
+                **{k: v for k, v in common_kwargs.items() if k != "has_perm"},
+                **dq_pp_config,
+            )
+        except ValueError as exc:
+            logger.warning("hstu bwd dq ping-pong not applicable, using dq: %s", exc)
+        else:
+            dq_builder = build_hstu_attention_bwd_dq_pp
+            dq_config = dq_pp_config
+
     dvdk_launcher = dvdk_builder(**common_kwargs, **dvdk_config)
-    dq_launcher = build_hstu_attention_bwd_dq(**common_kwargs, **dq_config)
+    dq_launcher = dq_builder(**common_kwargs, **dq_config)
     return dvdk_launcher, dq_launcher
 
 
