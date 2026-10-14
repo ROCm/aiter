@@ -59,8 +59,9 @@ rules are in [`configs/AGENTS.md`](configs/AGENTS.md).
     or why. Do not write long explanations.
 19. Give each public wrapper a docstring: what it computes, its arguments,
     its return value and its limits.
-20. Use the aiter logger with `%` placeholders. Do not use `print` or
-    f-strings in log calls.
+20. Log with `%` placeholders. Library code uses `AiterTritonLogger()`, and
+    tests and benchmarks use `from aiter import logger`. Do not use `print`
+    or f-strings in log calls.
 21. Write docs, comments and PR descriptions in
     [ASD-STE100](https://www.asd-ste100.org/) (Simplified Technical English):
     short sentences, simple words, one instruction in each sentence.
@@ -125,7 +126,8 @@ Tests use the same folders under `op_tests/triton_tests/`. Old flat imports
 | Tile lookup for ragged batches | `_triton_kernels/common/segment_tile.py` |
 | Architecture checks | `utils/_triton/arch_info.py::get_arch` |
 | Kernel names in traces | `utils/_triton/kernel_repr.py::make_kernel_repr` |
-| Logging | `from aiter import logger` |
+| Logging in library code | `utils/logger.py::AiterTritonLogger`, level from `AITER_TRITON_LOG_LEVEL` |
+| Logging in tests and benchmarks | `from aiter import logger`, level from `AITER_LOG_LEVEL` |
 
 ### Configs
 

@@ -32,6 +32,9 @@
    AITER_LOG_LEVEL=DEBUG pytest op_tests/triton_tests/rope/test_rope.py -s
    ```
 
+   Library code logs through `AiterTritonLogger`. To see its detail, set
+   `AITER_TRITON_LOG_LEVEL=DEBUG` and add `--log-cli-level=DEBUG` to pytest.
+
    Do not call `logger.setLevel(...)` or `logging.basicConfig(...)`.
 5. Log failure detail at WARNING or higher, or put it in the assert message.
    CI does not show INFO. A test that only logs a result and does not assert

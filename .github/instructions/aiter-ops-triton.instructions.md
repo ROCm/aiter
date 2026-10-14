@@ -229,6 +229,9 @@ All weight and scale shuffles are in `utils/shuffle.py`. Flag:
   tests can use `"cuda"`.
 - Flag a new public wrapper without a docstring. The docstring tells what the
   kernel computes, the arguments, the return value and the limits.
+- Flag `print(...)` or a new logger in library code. Use
+  `_LOGGER = AiterTritonLogger()` from `aiter.ops.triton.utils.logger`, with
+  `%` placeholders. Tests and benchmarks use `from aiter import logger`.
 
 ## Comments and docs
 
