@@ -6,6 +6,7 @@ import torch
 from torch import Tensor
 
 from ..jit.core import ENABLE_CK, compile_ops
+from ..jit.utils.chip_info import get_gfx_runtime as get_gfx
 from ..jit.utils.torch_guard import torch_compile_guard
 
 MD_NAME = "module_norm"
@@ -146,6 +147,10 @@ def _triton_add_rows(
     )
 
 
+def _use_triton() -> bool:
+    return not ENABLE_CK or get_gfx() == "gfx1250"
+
+
 # The CK binding rejects None for weight / bias; reject it the same way here.
 def _check_affine(weight: Tensor | None, bias: Tensor | None) -> None:
     if weight is None or bias is None:
@@ -160,7 +165,7 @@ def layer_norm(
     epsilon: float = 1e-5,
     x_bias: Tensor | None = None,
 ) -> Tensor:
-    if not ENABLE_CK:
+    if _use_triton():
         _check_affine(weight, bias)
         from .triton.normalization.norm import layer_norm as layer_norm_triton
 
@@ -177,7 +182,7 @@ def layernorm2d_fwd(
     epsilon: float = 1e-5,
     x_bias: Tensor | None = None,
 ) -> Tensor:
-    if not ENABLE_CK:
+    if _use_triton():
         _check_affine(weight, bias)
         from .triton.normalization.norm import layer_norm as layer_norm_triton
 
@@ -197,7 +202,7 @@ def layernorm2d_fwd_with_add(
     epsilon: float,
     x_bias: Tensor | None = None,
 ) -> None:
-    if not ENABLE_CK:
+    if _use_triton():
         _check_affine(weight, bias)
         from .triton.normalization.norm import (
             layernorm2d_fwd_with_add as layernorm2d_fwd_with_add_triton,
@@ -225,7 +230,7 @@ def layernorm2d_fwd_with_smoothquant(
     epsilon: float,
     x_bias: Tensor | None = None,
 ) -> None:
-    if not ENABLE_CK:
+    if _use_triton():
         _check_affine(weight, bias)
         from .triton.normalization.norm import (
             layernorm2d_fwd_with_smoothquant as layernorm2d_fwd_with_smoothquant_triton,
@@ -261,7 +266,7 @@ def layernorm2d_fwd_with_add_smoothquant(
     epsilon: float,
     x_bias: Tensor | None = None,
 ) -> None:
-    if not ENABLE_CK:
+    if _use_triton():
         _check_affine(weight, bias)
         from .triton.normalization.norm import (
             layernorm2d_fwd_with_add_smoothquant as layernorm2d_fwd_with_add_smoothquant_triton,

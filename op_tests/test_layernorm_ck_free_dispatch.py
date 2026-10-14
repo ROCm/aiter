@@ -3,7 +3,8 @@
 """Checks which backend the LayerNorm entry points in aiter.ops.norm call.
 
 The CK bindings and the Triton kernels are replaced by recorders, so module_norm
-is not built, no kernel is launched, and the inputs are CPU tensors.
+is not built, no kernel is launched, and the inputs are CPU tensors. The GPU
+arch is pinned to gfx950 unless a test sets gfx1250.
 """
 
 import pytest
@@ -128,6 +129,11 @@ def _call(entry, t, x_bias, api=norm):
             x_bias,
         )
     return None, out
+
+
+@pytest.fixture(autouse=True)
+def gfx950(monkeypatch):
+    monkeypatch.setattr(norm, "get_gfx", lambda: "gfx950")
 
 
 @pytest.fixture
@@ -425,6 +431,24 @@ def test_ck_calls_ck(monkeypatch, entry):
     assert [c[0] for c in rec.calls] == [entry]
     _, args, _ = rec.calls[0]
     assert args[-1] is t["x_bias"]
+
+
+@pytest.mark.parametrize("api", ["python", "custom_op"])
+@pytest.mark.parametrize("enable_ck", [False, True])
+@pytest.mark.parametrize("entry", ENTRY_POINTS)
+def test_gfx1250_calls_triton(monkeypatch, triton_recorder, entry, enable_ck, api):
+    monkeypatch.setattr(norm, "get_gfx", lambda: "gfx1250")
+    monkeypatch.setattr(norm, "ENABLE_CK", enable_ck)
+    for name in ENTRY_POINTS:
+        monkeypatch.setattr(norm, f"{name}_ck", _forbid(f"{name}_ck"))
+
+    ret, out = _call(
+        entry, _make_inputs(), None, api=norm if api == "python" else torch.ops.aiter
+    )
+
+    assert [c[0] for c in triton_recorder.calls] == [TRITON_NAME[entry]]
+    result = ret if out is None else out
+    assert bool((result == MARK).all())
 
 
 if __name__ == "__main__":
