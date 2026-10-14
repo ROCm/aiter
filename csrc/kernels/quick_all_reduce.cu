@@ -25,29 +25,17 @@ void validate_qr_rank(int64_t rank, int64_t world_size)
         throw std::invalid_argument("invalid rank passed in");
 }
 
-int validate_qr_quant_level(int64_t quant_level)
-{
-    if(quant_level < static_cast<int64_t>(QuickReduceQuantLevel::F16) ||
-       quant_level > static_cast<int64_t>(QuickReduceQuantLevel::INT3))
-        throw std::invalid_argument("invalid QuickReduce quantization level");
-    return static_cast<int>(quant_level);
-}
 } // namespace
 
-fptr_t init_custom_qr_configured(int64_t rank,
-                                 int64_t world_size,
-                                 std::optional<int64_t> qr_max_size,
-                                 std::optional<int64_t> quant_level)
+fptr_t init_custom_qr(int64_t rank,
+                      int64_t world_size,
+                      std::optional<int64_t> qr_max_size,
+                      std::optional<int64_t> quant_level)
 {
     validate_qr_rank(rank, world_size);
     auto fptr = std::make_unique<DeviceComms>();
     fptr->init(world_size, rank, qr_max_size, quant_level);
     return reinterpret_cast<fptr_t>(fptr.release());
-}
-
-fptr_t init_custom_qr(int64_t rank, int64_t world_size, std::optional<int64_t> qr_max_size)
-{
-    return init_custom_qr_configured(rank, world_size, qr_max_size, std::nullopt);
 }
 
 void qr_destroy(fptr_t _fa)
@@ -61,13 +49,6 @@ bool qr_uses_pull_q4(fptr_t _fa)
     if(!_fa)
         return false;
     return reinterpret_cast<DeviceComms*>(_fa)->use_pull_q4;
-}
-
-bool qr_uses_pull_q4_bulk(fptr_t _fa)
-{
-    if(!_fa)
-        return false;
-    return reinterpret_cast<DeviceComms*>(_fa)->use_pull_q4_bulk;
 }
 
 void qr_get_handle(fptr_t _fa, int64_t out_ptr)
@@ -98,7 +79,7 @@ void qr_all_reduce(fptr_t _fa,
                    bool cast_bf2half)
 {
     auto fa                         = reinterpret_cast<DeviceComms*>(_fa);
-    const int validated_quant_level = validate_qr_quant_level(quant_level);
+    const int validated_quant_level = quick_reduce_validate_quant_level(quant_level);
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
 
@@ -111,9 +92,7 @@ void qr_all_reduce(fptr_t _fa,
     const int64_t input_bytes = static_cast<int64_t>(out.numel() * out.element_size());
     if(input_bytes > fa->kMaxProblemSize)
         throw std::invalid_argument("qr_all_reduce: input bytes exceed kMaxProblemSize");
-    const bool pull_q4 = validated_quant_level == static_cast<int>(QuickReduceQuantLevel::INT4) &&
-                         fa->use_pull_q4 && (fa->world_size == 2 || fa->world_size == 4);
-    if(input_bytes % 16 != 0 && !pull_q4)
+    if(input_bytes % 16 != 0 && !fa->use_pull_q4)
         throw std::invalid_argument(
             "qr_all_reduce: input bytes must be divisible by 16 outside PullQ4");
 
@@ -163,7 +142,7 @@ void qr_all_reduce_rmsnorm(fptr_t _fa,
                            bool cast_bf2half)
 {
     auto fa                         = reinterpret_cast<DeviceComms*>(_fa);
-    const int validated_quant_level = validate_qr_quant_level(quant_level);
+    const int validated_quant_level = quick_reduce_validate_quant_level(quant_level);
     HipDeviceGuard device_guard(inp.device_id);
     hipStream_t stream = aiter::getCurrentHIPStream();
 

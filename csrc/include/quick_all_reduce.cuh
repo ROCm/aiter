@@ -2,10 +2,7 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 #include "quick_all_reduce_base.h"
-#include <algorithm>
-#include <cctype>
 #include <cstdio>
-#include <cstdlib>
 #include <string>
 #include <vector>
 #define caltime
@@ -180,11 +177,16 @@ struct CodecQ4 : public CodecBase
         int* qs_ptr       = reinterpret_cast<int*>(atom_ptr + kRankTileScaleOffset) + (thread / 8);
 
         int32_t qw = __builtin_nontemporal_load(qw_ptr);
-        int qs     = 0;
+#if defined(__gfx1250__)
+        // One scale load per quantization group, broadcast within the wave32.
+        int qs = 0;
         if(threadIdx.x == group_leader)
             qs = __builtin_nontemporal_load(qs_ptr);
         const int leader_lane = ((threadIdx.x % warpSize) / kThreadGroupSize) * kThreadGroupSize;
         qs                    = __shfl(qs, leader_lane);
+#else
+        int qs = __builtin_nontemporal_load(qs_ptr);
+#endif
 
         // Unpack q4 into f16x8_t
         int32x4_t w;
@@ -1462,14 +1464,12 @@ enum QuickReduceQuantLevel
     INT3 = 4,
 };
 
-inline int quick_reduce_configured_quant_level(std::optional<int64_t> quant_level)
+inline int quick_reduce_validate_quant_level(int64_t quant_level)
 {
-    if(!quant_level.has_value())
-        return -1;
-    if(quant_level.value() < static_cast<int64_t>(QuickReduceQuantLevel::F16) ||
-       quant_level.value() > static_cast<int64_t>(QuickReduceQuantLevel::INT3))
+    if(quant_level < static_cast<int64_t>(QuickReduceQuantLevel::F16) ||
+       quant_level > static_cast<int64_t>(QuickReduceQuantLevel::INT3))
         throw std::invalid_argument("invalid QuickReduce quantization level");
-    return static_cast<int>(quant_level.value());
+    return static_cast<int>(quant_level);
 }
 
 } // namespace aiter
@@ -1490,10 +1490,9 @@ struct DeviceComms
     // Max TP-8
     static int constexpr kMaxWorldSize = 8;
 
-    bool initialized               = false;
-    uint32_t* d_flag_color         = nullptr;
-    uint32_t* d_pull_q4_flag_color = nullptr;
-    uint32_t* d_pull_q4_bulk_epoch = nullptr;
+    bool initialized          = false;
+    uint32_t* d_flag_color    = nullptr;
+    uint32_t* d_pull_q4_epoch = nullptr;
     int world_size;
     int rank;
 
@@ -1503,22 +1502,14 @@ struct DeviceComms
     std::vector<hipIpcMemHandle_t> all_buffer_ipc_handles;
     std::vector<uint8_t*> buffer_list;
     uint32_t data_offset;
-    bool use_pull_q4           = false;
-    bool use_pull_q4_bulk      = false;
-    int configured_quant_level = -1;
+    // A PullQ4 communicator is bound to INT4 and sizes its data region for the
+    // PullQ4 layout only, so it rejects every legacy two-shot route.
+    bool use_pull_q4 = false;
 
     // Calls on one DeviceComms must be submitted in identical order on one
     // stream on every rank. Concurrent streams share epochs and payload slots.
     DeviceComms() : initialized(false), world_size(1), rank(0) {}
     ~DeviceComms() noexcept { destroy(); }
-
-    void configure_pull_q4(const hipDeviceProp_t& prop)
-    {
-        const QuickReduceGfx1250Route route =
-            quick_reduce_gfx1250_route(prop, configured_quant_level);
-        use_pull_q4      = route.use_pull_q4;
-        use_pull_q4_bulk = route.use_pull_q4_bulk;
-    }
 
     void init(int world_size,
               int rank,
@@ -1526,10 +1517,11 @@ struct DeviceComms
               std::optional<int64_t> quant_level      = std::nullopt)
     {
         destroy();
-        this->world_size       = world_size;
-        this->rank             = rank;
-        kMaxProblemSize        = kAbsoluteMaxProblemSize;
-        configured_quant_level = quick_reduce_configured_quant_level(quant_level);
+        this->world_size = world_size;
+        this->rank       = rank;
+        kMaxProblemSize  = kAbsoluteMaxProblemSize;
+        const int configured_quant_level =
+            quant_level.has_value() ? quick_reduce_validate_quant_level(quant_level.value()) : -1;
         if(max_problem_size.has_value() && max_problem_size.value() > 0)
         {
             if(max_problem_size.value() > kAbsoluteMaxProblemSize)
@@ -1542,14 +1534,13 @@ struct DeviceComms
         int device = 0;
         HIP_CHECK(hipGetDevice(&device));
         HIP_CHECK(hipGetDeviceProperties(&prop, device));
-        configure_pull_q4(prop);
-        // Allocate buffer size for worst case: F16 2-stage buffer.
-        const uint64_t logical_tile_count = divceil(this->kMaxProblemSize, kTileSize);
-        const uint64_t legacy_flags_per_phase =
-            world_size * std::max<uint64_t>(kMaxNumBlocks, logical_tile_count) * sizeof(uint32_t);
-        const uint64_t pull_flags_per_phase = logical_tile_count * sizeof(uint32_t);
-        uint32_t flags_buffer_size = 2ull * (legacy_flags_per_phase + pull_flags_per_phase);
-        int64_t data_buffer_size   = quick_reduce_data_buffer_size(this->kMaxProblemSize);
+        use_pull_q4 = quick_reduce_use_pull_q4(prop, world_size, configured_quant_level);
+        // Legacy communicators size the data region for the worst case, the F16
+        // two-stage buffer; PullQ4 communicators use the compact PullQ4 layout.
+        uint32_t flags_buffer_size = 2 * world_size * kMaxNumBlocks * sizeof(uint32_t);
+        int64_t data_buffer_size   = use_pull_q4
+                                         ? quick_reduce_pull_q4_buffer_size(this->kMaxProblemSize)
+                                         : quick_reduce_data_buffer_size(this->kMaxProblemSize);
         int64_t total_buffer_size  = flags_buffer_size + data_buffer_size;
         data_offset                = flags_buffer_size;
         HIP_CHECK(
@@ -1557,26 +1548,24 @@ struct DeviceComms
 
         // Clear the flags buffer.
         HIP_CHECK(hipMemset(dbuffer, 0, flags_buffer_size));
-        HIP_CHECK(
-            hipMemset(dbuffer + data_offset + 4 * pull_q4_size_per_phase, 0, 2 * sizeof(uint32_t)));
-
-        // PullQ4 uses one graph-safe epoch per logical tile. Other paths use
-        // the leading kMaxNumBlocks entries as physical-block epochs.
-        const int64_t flag_color_count =
-            std::max<int64_t>(kMaxNumBlocks, divceil(this->kMaxProblemSize, kTileSize));
-        HIP_CHECK(hipMalloc(&d_flag_color, flag_color_count * sizeof(uint32_t)));
-        HIP_CHECK(hipMalloc(&d_pull_q4_flag_color, flag_color_count * sizeof(uint32_t)));
-        HIP_CHECK(hipMalloc(&d_pull_q4_bulk_epoch, sizeof(uint32_t)));
-        HIP_CHECK(hipMemset(d_pull_q4_bulk_epoch, 0, sizeof(uint32_t)));
+        if(use_pull_q4)
         {
-            std::vector<uint32_t> init_color(flag_color_count, 1u);
+            HIP_CHECK(hipMemset(dbuffer + data_offset +
+                                    quick_reduce_pull_q4_flags_offset(this->kMaxProblemSize),
+                                0,
+                                2 * sizeof(uint32_t)));
+            HIP_CHECK(hipMalloc(&d_pull_q4_epoch, sizeof(uint32_t)));
+            HIP_CHECK(hipMemset(d_pull_q4_epoch, 0, sizeof(uint32_t)));
+        }
+
+        // Per-block flag color counter (device-side; see kernel). Init to 1,
+        // since 0 would collide with the just-memset'd flags buffer.
+        HIP_CHECK(hipMalloc(&d_flag_color, kMaxNumBlocks * sizeof(uint32_t)));
+        {
+            std::vector<uint32_t> init_color(kMaxNumBlocks, 1u);
             HIP_CHECK(hipMemcpy(d_flag_color,
                                 init_color.data(),
-                                flag_color_count * sizeof(uint32_t),
-                                hipMemcpyHostToDevice));
-            HIP_CHECK(hipMemcpy(d_pull_q4_flag_color,
-                                init_color.data(),
-                                flag_color_count * sizeof(uint32_t),
+                                kMaxNumBlocks * sizeof(uint32_t),
                                 hipMemcpyHostToDevice));
         }
 
@@ -1615,15 +1604,10 @@ struct DeviceComms
             cleanup_hip(hipFree(d_flag_color), "hipFree(d_flag_color)");
             d_flag_color = nullptr;
         }
-        if(d_pull_q4_flag_color)
+        if(d_pull_q4_epoch)
         {
-            cleanup_hip(hipFree(d_pull_q4_flag_color), "hipFree(d_pull_q4_flag_color)");
-            d_pull_q4_flag_color = nullptr;
-        }
-        if(d_pull_q4_bulk_epoch)
-        {
-            cleanup_hip(hipFree(d_pull_q4_bulk_epoch), "hipFree(d_pull_q4_bulk_epoch)");
-            d_pull_q4_bulk_epoch = nullptr;
+            cleanup_hip(hipFree(d_pull_q4_epoch), "hipFree(d_pull_q4_epoch)");
+            d_pull_q4_epoch = nullptr;
         }
         if(initialized)
         {
@@ -1692,25 +1676,35 @@ struct DeviceComms
         uint32_t num_blocks = divceil(msg_size, kTileSize);
         uint32_t grid       = min(kMaxNumBlocks, num_blocks);
         auto quant_level_   = static_cast<QuickReduceQuantLevel>(quant_level);
-        if(configured_quant_level >= 0 && quant_level != configured_quant_level)
-            throw std::runtime_error(
-                "QuickReduce call quantization does not match communicator configuration");
-        if(use_pull_q4 && quant_level_ != QuickReduceQuantLevel::INT4)
-            throw std::runtime_error(
-                "PullQ4 communicator cannot mix legacy QuickReduce payload routes");
-        if(quant_level_ == QuickReduceQuantLevel::INT4 && use_pull_q4 &&
-           (world_size == 2 || world_size == 4))
+        if(use_pull_q4)
         {
-            if(use_pull_q4_bulk && msg_size >= 1024 * 1024)
+            if(quant_level_ != QuickReduceQuantLevel::INT4)
+                throw std::runtime_error(
+                    "PullQ4 communicator cannot mix legacy QuickReduce payload routes");
+            // Production routes BF16 through the FP16 codec; other input
+            // combinations are not instantiated for PullQ4.
+            if constexpr(std::is_same<T, half>::value && cast_bf2half)
             {
-                PULL_Q4_BULK_DISPATCH()
+                quick_reduce_dispatch_pull_q4<T, cast_bf2half>(world_size,
+                                                               A,
+                                                               B,
+                                                               N,
+                                                               num_blocks,
+                                                               grid,
+                                                               rank,
+                                                               dbuffer_list,
+                                                               data_offset,
+                                                               d_pull_q4_epoch,
+                                                               pull_q4_size_per_phase,
+                                                               stream);
+                HIP_CHECK(hipGetLastError());
+                return;
             }
             else
             {
-                PULL_Q4_DISPATCH()
+                throw std::runtime_error(
+                    "PullQ4 communicator requires BF16 input with BF16-to-FP16 casting");
             }
-            HIP_CHECK(hipGetLastError());
-            return;
         }
         switch(quant_level_)
         {
@@ -1760,9 +1754,6 @@ struct DeviceComms
         uint32_t num_blocks = divceil(msg_size, kTileSize);
         uint32_t grid       = min(kMaxNumBlocks, num_blocks);
         auto quant_level_   = static_cast<QuickReduceQuantLevel>(quant_level);
-        if(configured_quant_level >= 0 && quant_level != configured_quant_level)
-            throw std::runtime_error(
-                "QuickReduce call quantization does not match communicator configuration");
         if(quant_level_ == QuickReduceQuantLevel::INT3)
             throw std::runtime_error("QuickReduce fused RMSNorm does not support INT3");
         switch(quant_level_)

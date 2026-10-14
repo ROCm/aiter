@@ -28,10 +28,6 @@ def qr_uses_pull_q4(fa: int) -> bool: ...
 
 
 @compile_ops("module_quick_all_reduce", develop=True)
-def qr_uses_pull_q4_bulk(fa: int) -> bool: ...
-
-
-@compile_ops("module_quick_all_reduce", develop=True)
 def qr_all_reduce(
     fa: int,
     inp: torch.Tensor,

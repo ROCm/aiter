@@ -81,6 +81,7 @@ NONE_WRAPPED_OP = [
     "qr_destroy",
     "qr_open_handles",
     "qr_get_handle",
+    "qr_uses_pull_q4",
     # These take pybind aiter_tensor_t, not torch.Tensor -- incompatible with torch.compile
     "all_reduce",
     "reduce_scatter",

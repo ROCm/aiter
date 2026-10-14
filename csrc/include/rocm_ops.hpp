@@ -1857,7 +1857,7 @@ namespace py = pybind11;
 #define QUICK_ALL_REDUCE_PYBIND                                                            \
     AITER_SET_STREAM_PYBIND;                                                               \
     m.def("init_custom_qr",                                                                \
-          &aiter::init_custom_qr_configured,                                               \
+          &aiter::init_custom_qr,                                                          \
           py::arg("rank"),                                                                 \
           py::arg("world_size"),                                                           \
           py::arg("qr_max_size") = std::nullopt,                                           \
@@ -1866,10 +1866,6 @@ namespace py = pybind11;
     m.def("qr_uses_pull_q4",                                                               \
           &aiter::qr_uses_pull_q4,                                                         \
           "qr_uses_pull_q4(int fa) -> bool",                                               \
-          py::arg("fa"));                                                                  \
-    m.def("qr_uses_pull_q4_bulk",                                                          \
-          &aiter::qr_uses_pull_q4_bulk,                                                    \
-          "qr_uses_pull_q4_bulk(int fa) -> bool",                                          \
           py::arg("fa"));                                                                  \
     m.def("qr_all_reduce",                                                                 \
           &aiter::qr_all_reduce,                                                           \

@@ -340,8 +340,11 @@ __quickreduce_device_inline__ float T2float_cast(__hip_bfloat16 a) { return __bf
 template <typename T>
 __quickreduce_device_inline__ int group_abs_max(int32x4_t atom)
 {
-    const int lane         = threadIdx.x % warpSize;
-    const int group_leader = (lane / kThreadGroupSize) * kThreadGroupSize;
+#if defined(__gfx1250__)
+    const int group_leader = ((threadIdx.x % warpSize) / kThreadGroupSize) * kThreadGroupSize;
+#else
+    const int group_leader = (threadIdx.x / kThreadGroupSize) * kThreadGroupSize;
+#endif
 
     int wmax, wmin, wblockmax;
     int a, b;
